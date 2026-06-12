@@ -1,0 +1,39 @@
+# ─── SECRETS — never commit ──────────────────────────────────────────────
+# Operator credentials + hardware details for the implementation agent.
+# This file is intentionally gitignored and lives ONLY on the dev machine.
+CREDENTIALS.local.md
+*.local.md
+.env
+.env.*
+secrets/
+*.key
+*.pem
+id_ed25519*
+
+# ─── Python ──────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.python-version
+
+# ─── Tooling caches ──────────────────────────────────────────────────────
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+uv.lock.bak
+
+# ─── Editor / OS ───────────────────────────────────────────────────────────
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Internal working artifacts (operator-local; not part of the public tree)
+docs/claude/
