@@ -85,6 +85,13 @@ in practice they read `update.brilliant_<panel>_bridge`,
 `binary_sensor.brilliant_<panel>_bridge_health`, and
 `button.brilliant_<panel>_repair_bridge`.
 
+> **Two version numbers, on purpose.** The **HACS package version** (this
+> integration, e.g. `0.2.0`) and the **on-panel agent version** are independent.
+> The Bridge **update** entity tracks only the *agent* (the version the panel
+> reports vs. the version this integration bundles), so it can read e.g. `0.1.0`
+> with "no update available" while HACS shows the integration at `0.2.0` — that
+> is expected, not a fault.
+
 ## Services
 
 All three target devices (`target: device → integration: brilliant_mqtt`) and
@@ -196,6 +203,15 @@ deployed via the update entity / `redeploy`), not a repair.
 - The integration only ever writes the paths it owns on the panel:
   `/var/brilliant-mqtt/**`, `/etc/brilliant-mqtt.env` (mode `0600`), and
   `/etc/systemd/system/brilliant-mqtt.service`.
+
+> **Adopting a hand-deployed panel:** the integration lowercases the panel slug
+> and writes a matching lowercase `BRILLIANT_PANEL` into the env file, so any
+> panel it deploys is self-consistent. If you *manually* deployed the agent first
+> (per [INSTALL.md](../INSTALL.md)), make sure that `BRILLIANT_PANEL` is already
+> lowercase `^[a-z0-9_-]+$` — the agent publishes its MQTT topics verbatim from
+> that value, so a capitalized slug won't match the integration's lowercase
+> subscriptions until the first repair/redeploy rewrites the env and converges
+> them.
 
 See also [ARCHITECTURE.md](ARCHITECTURE.md) and
 [reference/deployment.md](reference/deployment.md).
