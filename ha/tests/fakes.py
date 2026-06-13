@@ -14,10 +14,12 @@ class FakeShell:
         self,
         responses: dict[str, RunResult] | None = None,
         connect_error: Exception | None = None,
+        put_dir_error: Exception | None = None,
         pinned: str | None = "ssh-ed25519 FAKEKEY",
     ) -> None:
         self.responses = dict(responses or {})
         self.connect_error = connect_error
+        self.put_dir_error = put_dir_error
         self._pinned = pinned
         self.connected = False
         self.commands: list[str] = []
@@ -52,4 +54,8 @@ class FakeShell:
 
     async def put_dir(self, local_dir: str, remote_dir: str) -> None:
         self._require_connected()
+        if self.put_dir_error is not None:
+            # Models a mid-transfer SFTP failure; recorded only on success so
+            # tests can assert nothing destructive ran after a failed upload.
+            raise self.put_dir_error
         self.dir_uploads.append((local_dir, remote_dir))
