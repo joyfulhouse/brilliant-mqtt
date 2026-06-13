@@ -124,9 +124,23 @@ which is the only interpreter that can import the on-box message-bus client.
 
 ## Install on a panel
 
+Pilot **one** panel first and let it soak before touching the rest.
+
+### Option A — HACS companion integration (recommended)
+
+Install the **Home Assistant companion integration** and deploy/update/repair
+every panel from the HA UI — no per-panel shell work, and a panel that loses its
+agent after a firmware OTA is repaired automatically. Install it via HACS (custom
+repository `joyfulhouse/brilliant-mqtt`, category Integration) or the release
+zip, then add one panel per config entry (per-panel root password, mesh priority,
+broker credentials).
+
+See **[docs/ha-integration.md](docs/ha-integration.md)** for the full guide.
+
+### Option B — manual deploy
+
 The full manual steps (vendoring wheels, copying the app, env file, foreground
 smoke-run, enabling the unit) are in [`deploy/README.md`](deploy/README.md).
-Pilot **one** panel first and let it soak before touching the rest.
 
 For a fleet, automate the same layout with your configuration management of
 choice (Ansible, etc.): render `/var/brilliant-mqtt/`, `/etc/brilliant-mqtt.env`
