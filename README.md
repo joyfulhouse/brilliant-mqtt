@@ -26,6 +26,27 @@ The panels expose no public API, no maintained HA integration, and no Matter,
 so this is built from first principles on the panel's own client library — see
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
+## Why this over HomeKit Controller?
+
+Brilliant panels *can* be paired into Home Assistant via **HomeKit Controller**,
+but that path is fragile and shallow. This bridge taps the panel's own message
+bus directly and publishes everything as native MQTT-Discovery entities:
+
+| | HomeKit Controller | brilliant-mqtt |
+|---|---|---|
+| **Stability in HA** | Entities stick in `setup_retry`; pairings drop across HA restarts | Retained MQTT discovery + state — entities recover instantly across HA restarts |
+| **Connection resilience** | Opaque HAP/BLE link; manual re-pair when it wedges | Auto-reconnect + re-reconcile, a ~2 s diff-poll, a stale-stream watchdog, periodic resync, and a reconnect-storm circuit breaker |
+| **Loads exposed** | Lights, switches, faceplate motion/occupancy | All of that **plus** per-circuit power (incl. always-on gangs), dimmer/internal temperatures, and fault sensors |
+| **BLE-mesh loads** | Each panel re-exposes them → duplicate entities | One **elected publisher** → a single clean set, with heartbeat failover |
+| **Mesh-load motion** | Not exposed | Each mesh dimmer/switch's integrated **PIR motion** (+ score, thresholds) as `binary_sensor`s |
+| **Panel internals** | None | Mic mute, screen on/brightness, volumes, night mode, child lock, identify, in-use occupancy, camera/privacy, CPU temp, firmware, Wi-Fi/Internet/NTP diagnostics |
+| **Integration model** | Closed HAP accessory | Standard MQTT — retained, observable, scriptable, per-panel availability/LWT |
+| **Responsiveness** | BLE/HAP round-trips | Direct bus tap + optimistic command echo + hot diff-poll |
+
+It isn't a destructive replacement: the bridge uses the **same bus APIs**
+Brilliant's own HomeKit peripheral does and runs alongside it, so you can **keep
+HomeKit paired as a fallback** while migrating automations onto the MQTT entities.
+
 ## Features
 
 As implemented and verified live on real panels:
