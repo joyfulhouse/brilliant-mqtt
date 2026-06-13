@@ -76,3 +76,5 @@ addition to the panel's own site-packages it already exposes).
   paired) remains the control path.
 - Discovery topics are retained — to fully remove an entity from HA, publish an
   empty retained payload to its `homeassistant/<component>/<unique_id>/config`.
+- When decommissioning a panel entirely, also clear its retained
+  `brilliant/<panel>/bridge` meta topic the same way.
