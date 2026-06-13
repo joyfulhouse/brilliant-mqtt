@@ -262,6 +262,48 @@ the whole session when no push arrives at all.
 > dead stream is indistinguishable from a never-pushed variable. The
 > optimistic echo + hot poll cover that class either way.
 
+### 8c. Mesh-load motion subsystem (live-verified 2026-06-13)
+
+**Method:** read-only `get_device("ble_mesh")` via a second bus client (no
+writes, no commands). Probe panel: panel-1.local.
+
+**Peripheral breakdown** — the `ble_mesh` virtual device carries 40
+peripherals total:
+
+- 11 × **LIGHT** (PeripheralType 27) — mesh dimmers/switches
+- 1 × **GENERIC_ON_OFF** (45 → `DeviceKind.SWITCH`)
+- 8 × **ALWAYS_ON** (46)
+- 20 × SWITCH_CONFIGURATION (infrastructure — not entities)
+
+Every one of the 20 load peripherals (LIGHT + GENERIC_ON_OFF + ALWAYS_ON)
+carries these five motion variables:
+
+| Variable | `externally_settable` | Meaning |
+|---|---|---|
+| `movement_detected` | no | live PIR motion state (`"0"`/`"1"`) |
+| `motion_score` | no | continuous motion-intensity score |
+| `enable_motion_score` | yes | toggle: report the score |
+| `motion_high_threshold` | yes | detection hysteresis high bound (observed `"70"`) |
+| `motion_low_threshold` | yes | detection hysteresis low bound (observed `"20"`) |
+
+Key facts:
+
+- Motion lives **directly on the load peripheral** — not a separate
+  `MOTION_SENSOR` peripheral like on panel faceplates.
+- There is **no `lux`/illuminance variable** on mesh loads; panels have it,
+  mesh does not.
+- **Variable names differ from the faceplate's** PIR variables: `motion_score`
+  (mesh) vs `pir_motion_score` (faceplate); `motion_high_threshold` /
+  `motion_low_threshold` (mesh) vs `pir_motion_detection_high_threshold` /
+  `pir_motion_detection_low_threshold` (faceplate). Only `movement_detected`
+  is shared.
+- The 0–100 range for the threshold variables is **assumed** (no firmware
+  documentation found; observed values 70/20).
+
+Implementation: `_MOTION_AUX` tuple in `mapping.py` is concatenated onto
+`_LOAD_AUX` for `LIGHT`, `SWITCH`, and `ALWAYS_ON`. Panel loads lack these
+variables so the specs auto-gate (no special-casing needed).
+
 ## 9. Runtime / vendoring / OTA facts
 
 - venv `sys.path` = stdlib + `/data/switch-embedded/env/lib/python3.10/site-packages`
