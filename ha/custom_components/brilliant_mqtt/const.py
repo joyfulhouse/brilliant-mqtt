@@ -2,20 +2,27 @@
 
 from __future__ import annotations
 
+from homeassistant.const import Platform
+
 DOMAIN = "brilliant_mqtt"
-PLATFORMS = ["binary_sensor", "button", "update"]
+PLATFORMS: list[Platform] = [Platform.BINARY_SENSOR, Platform.BUTTON, Platform.UPDATE]
 
 # Config entry data keys (one entry per panel; each stores ITS OWN root password).
 CONF_HOST = "host"
 CONF_ROOT_PASSWORD = "root_password"
 CONF_PANEL = "panel"
 CONF_MESH_PRIORITY = "mesh_priority"
+# Broker credentials written into the panel's env file (PANEL_ENV_FILE) over SSH at
+# deploy/repair — the integration itself talks to MQTT only via HA's mqtt integration
+# (see manifest dependencies).
 CONF_MQTT_HOST = "mqtt_host"
 CONF_MQTT_PORT = "mqtt_port"
 CONF_MQTT_USERNAME = "mqtt_username"
 CONF_MQTT_PASSWORD = "mqtt_password"
-CONF_SSH_HOST_KEY = "ssh_host_key"  # TOFU-pinned on first successful connect
-CONF_LAST_FIRMWARE = "last_firmware"  # persisted so panel_updated survives HA restarts
+
+# Internally managed config-entry state (never shown in a config-flow form).
+DATA_SSH_HOST_KEY = "ssh_host_key"  # TOFU-pinned on first successful connect
+DATA_LAST_FIRMWARE = "last_firmware"  # persisted so panel_updated survives HA restarts
 
 # Options keys + defaults.
 OPT_AUTO_REPAIR = "auto_repair"
