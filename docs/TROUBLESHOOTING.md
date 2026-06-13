@@ -54,6 +54,27 @@ Common problems with brilliant-mqtt and how to resolve them.
   anyone (verify by watching `movement_detected` on the bus); illuminance
   reads 0 while `enable_lux=0` on the panel (the default everywhere).
 
+### Panel load spikes / availability flaps `offline` (reconnect storm)
+
+- Symptom: a panel's `brilliant/<panel>/availability` flips to `offline` (then
+  back) on the broker, the journal floods with `Lost connection to peer` /
+  `Backing off after failed connection` lines (many per second), and the panel
+  load average climbs well above its ~1.0 baseline — yet `systemctl is-active`
+  still shows `active`. The panel bus server (a `uwsgi` vassal) gets briefly
+  saturated, drops the bridge's peer, the lib auto-reconnects aggressively, and
+  each reconnect's re-reconcile feeds the load back in — a self-reinforcing loop
+  (incident 2026-06-13). The stale watchdog does **not** catch this: every
+  reconnect resets its push clock, so the session never looks stale.
+- Built-in fix: the reconnect-storm breaker rebuilds the session (after the
+  supervisor backoff, giving the bus server a breather) once it reconnects
+  `RECONNECT_STORM_THRESHOLD` times within `RECONNECT_STORM_WINDOW_SECONDS`
+  (defaults 20 / 60 s; set the threshold to `0` to disable). Confirm recovery
+  via the broker availability topic returning to `online` and the load draining.
+- If a panel storms repeatedly, the underlying cause is the panel's own
+  switch-embedded stack being overloaded (compare `top`/`uptime` against a
+  healthy panel) — that is an operator/panel issue, not the bridge; the breaker
+  only stops the bridge from amplifying it.
+
 ### Bridge broken after a panel firmware update
 
 - Firmware OTA replaces `/data/switch-embedded` — including the closed-source

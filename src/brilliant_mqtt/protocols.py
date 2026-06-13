@@ -47,6 +47,16 @@ class BusClient(Protocol):
         """
         ...
 
+    def recent_reconnects(self, window_s: float) -> int:
+        """Number of bus reconnects within the last *window_s* seconds.
+
+        Lets the run loop detect a reconnect STORM (the lib auto-reconnecting
+        many times/sec when the panel bus server drops the peer under load) —
+        invisible to seconds_since_last_push because each reconnect resets the
+        push clock — and rebuild the session instead of amplifying the storm.
+        """
+        ...
+
     async def set_variables(self, device_id: str, peripheral_id: str, sets: list[VarSet]) -> None:
         """Write one or more variable values to the given peripheral.
 

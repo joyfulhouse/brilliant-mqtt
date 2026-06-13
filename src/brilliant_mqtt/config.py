@@ -36,6 +36,14 @@ class Settings:
     # is the leader's liveness cadence.
     mesh_priority: int = 0
     mesh_heartbeat_seconds: float = 10.0
+    # Reconnect-storm circuit breaker: when the bus auto-reconnects this many
+    # times within the window, the session is torn down and rebuilt (after the
+    # supervisor backoff) instead of churning. This catches a failure mode the
+    # stale watchdog cannot — a reconnect storm keeps resetting the push clock,
+    # so the session never looks "stale" (incident 2026-06-13, panel-2). 0
+    # disables the breaker.
+    reconnect_storm_threshold: int = 20
+    reconnect_storm_window_seconds: float = 60.0
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -46,7 +54,10 @@ class Settings:
                   LOG_LEVEL (default "INFO"), HOT_POLL_SECONDS (default 2.0),
                   BUS_STALE_SECONDS (default 900), MESH_PRIORITY (default 0:
                   never participate in mesh publishing),
-                  MESH_HEARTBEAT_SECONDS (default 10.0).
+                  MESH_HEARTBEAT_SECONDS (default 10.0),
+                  RECONNECT_STORM_THRESHOLD (default 20: reconnects within the
+                  window that trip a session rebuild; 0 disables),
+                  RECONNECT_STORM_WINDOW_SECONDS (default 60).
 
         Raises KeyError when a required variable is absent.
         """
@@ -66,6 +77,8 @@ class Settings:
         bus_stale_seconds = float(env.get("BUS_STALE_SECONDS", "900"))
         mesh_priority = int(env.get("MESH_PRIORITY", "0"))
         mesh_heartbeat_seconds = float(env.get("MESH_HEARTBEAT_SECONDS", "10.0"))
+        reconnect_storm_threshold = int(env.get("RECONNECT_STORM_THRESHOLD", "20"))
+        reconnect_storm_window_seconds = float(env.get("RECONNECT_STORM_WINDOW_SECONDS", "60"))
 
         return cls(
             panel=panel,
@@ -79,4 +92,6 @@ class Settings:
             bus_stale_seconds=bus_stale_seconds,
             mesh_priority=mesh_priority,
             mesh_heartbeat_seconds=mesh_heartbeat_seconds,
+            reconnect_storm_threshold=reconnect_storm_threshold,
+            reconnect_storm_window_seconds=reconnect_storm_window_seconds,
         )
