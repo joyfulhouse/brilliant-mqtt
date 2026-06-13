@@ -18,11 +18,44 @@ from .const import (
     PANEL_VERSION_FILE,
     SERVICE_NAME,
 )
-from .shell import PanelShell
+from .shell import PanelShell, RunResult
 
 _STAGING_DIR = f"{PANEL_VAR_DIR}.staging"
 _STAGED_UNIT = f"{PANEL_STAGED_DIR}/{SERVICE_NAME}.service"
 _STAGED_ENV = f"{PANEL_STAGED_DIR}/{SERVICE_NAME}.env"
+
+
+class PanelOpError(RuntimeError):
+    """A panel shell command exited non-zero."""
+
+
+async def _checked(shell: PanelShell, command: str) -> RunResult:
+    """Run a STATE-MUTATING command, raising if it fails.
+
+    Without this a failed `systemctl`/`mv`/`rm` would vanish silently and the
+    only symptom would be a 10-minute LWT availability timeout. Read-only probes
+    and best-effort teardown steps deliberately stay on the plain `shell.run`.
+    """
+    result = await shell.run(command)
+    if result.exit_status != 0:
+        raise PanelOpError(f"`{command}` exited {result.exit_status}: {result.stderr.strip()}")
+    return result
+
+
+def _env_quote(value: str) -> str:
+    """Double-quote a string value for a systemd EnvironmentFile.
+
+    systemd parses the env file line-by-line and exports each into the
+    root-running unit's environment. Unquoted, a newline injects extra vars
+    (`LD_PRELOAD=…` → root RCE), a trailing backslash splices lines, and a
+    leading `#` comments the var out. We fail closed on control chars and quote
+    everything else so the value round-trips byte-for-byte.
+    """
+    if "\n" in value or "\r" in value or "\x00" in value:
+        raise ValueError("control characters are not allowed in env values")
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
 
 # One composite probe so inspection is a single round-trip. Key=0/1 lines, then
 # (optionally) the deployed payload version as the last line.
@@ -80,13 +113,17 @@ def render_env(
     mqtt_username: str,
     mqtt_password: str,
 ) -> str:
-    """Render /etc/brilliant-mqtt.env — exactly what the agent's config.py reads."""
+    """Render /etc/brilliant-mqtt.env — exactly what the agent's config.py reads.
+
+    String values are quoted via _env_quote (user-typed broker passwords routinely
+    contain `#`, quotes, `$`, backslash); the int fields are safe and stay bare.
+    """
     return (
-        f"BRILLIANT_PANEL={panel}\n"
-        f"MQTT_HOST={mqtt_host}\n"
+        f"BRILLIANT_PANEL={_env_quote(panel)}\n"
+        f"MQTT_HOST={_env_quote(mqtt_host)}\n"
         f"MQTT_PORT={mqtt_port}\n"
-        f"MQTT_USERNAME={mqtt_username}\n"
-        f"MQTT_PASSWORD={mqtt_password}\n"
+        f"MQTT_USERNAME={_env_quote(mqtt_username)}\n"
+        f"MQTT_PASSWORD={_env_quote(mqtt_password)}\n"
         f"MESH_PRIORITY={mesh_priority}\n"
         f"LOG_LEVEL=INFO\n"
     )
@@ -98,20 +135,20 @@ async def ensure_configs(shell: PanelShell, unit_content: str, env_content: str)
     The staged copies are the OTA-proof restore source: /var survives firmware
     updates, /etc may not. Env files carry the broker password → 0600 both places.
     """
-    await shell.run(f"mkdir -p {PANEL_STAGED_DIR}")
+    await _checked(shell, f"mkdir -p {PANEL_STAGED_DIR}")
     await shell.put_bytes(unit_content.encode(), PANEL_UNIT_FILE, 0o644)
     await shell.put_bytes(env_content.encode(), PANEL_ENV_FILE, 0o600)
     await shell.put_bytes(unit_content.encode(), _STAGED_UNIT, 0o644)
     await shell.put_bytes(env_content.encode(), _STAGED_ENV, 0o600)
-    await shell.run("systemctl daemon-reload")
+    await _checked(shell, "systemctl daemon-reload")
 
 
 async def enable_now(shell: PanelShell) -> None:
-    await shell.run(f"systemctl enable --now {SERVICE_NAME}")
+    await _checked(shell, f"systemctl enable --now {SERVICE_NAME}")
 
 
 async def restart(shell: PanelShell) -> None:
-    await shell.run(f"systemctl restart {SERVICE_NAME}")
+    await _checked(shell, f"systemctl restart {SERVICE_NAME}")
 
 
 def journal_command(lines: int) -> str:
@@ -127,23 +164,43 @@ async def deploy_payload(shell: PanelShell, local_payload_dir: str, version: str
 
     *local_payload_dir* must contain app/ and vendor/ (built by
     scripts/build_payload.sh). Full upload into a staging dir first so a failed
-    transfer never half-replaces a working install.
+    transfer never half-replaces a working install; the in-place swap moves the
+    current app/vendor aside (not rm) so a mid-swap mv failure stays recoverable.
     """
     await shell.run(f"rm -rf {_STAGING_DIR}")
     await shell.put_dir(local_payload_dir, _STAGING_DIR)
-    await shell.run(
-        f"mkdir -p {PANEL_VAR_DIR} && "
-        f"rm -rf {PANEL_VAR_DIR}/app {PANEL_VAR_DIR}/vendor && "
-        f"mv {_STAGING_DIR}/app {PANEL_VAR_DIR}/app && "
-        f"mv {_STAGING_DIR}/vendor {PANEL_VAR_DIR}/vendor && "
-        f"rm -rf {_STAGING_DIR}"
-    )
+    await _checked(shell, _swap_command())
     await shell.put_bytes(version.encode(), PANEL_VERSION_FILE, 0o644)
 
 
+def _swap_command() -> str:
+    """The move-aside swap. Old dirs go to *.bak before the new ones land; the
+    backups are removed only once both new moves succeed, so any single failed
+    mv leaves a restorable .bak rather than an app-less panel.
+    """
+    return " && ".join(
+        [
+            f"mkdir -p {PANEL_VAR_DIR}",
+            f"rm -rf {PANEL_VAR_DIR}/app.bak {PANEL_VAR_DIR}/vendor.bak",
+            f"{{ [ -e {PANEL_VAR_DIR}/app ] && "
+            f"mv {PANEL_VAR_DIR}/app {PANEL_VAR_DIR}/app.bak; true; }}",
+            f"{{ [ -e {PANEL_VAR_DIR}/vendor ] && "
+            f"mv {PANEL_VAR_DIR}/vendor {PANEL_VAR_DIR}/vendor.bak; true; }}",
+            f"mv {_STAGING_DIR}/app {PANEL_VAR_DIR}/app",
+            f"mv {_STAGING_DIR}/vendor {PANEL_VAR_DIR}/vendor",
+            f"rm -rf {PANEL_VAR_DIR}/app.bak {PANEL_VAR_DIR}/vendor.bak {_STAGING_DIR}",
+        ]
+    )
+
+
 async def uninstall(shell: PanelShell) -> None:
-    """Stop + disable + remove everything the integration owns on the panel."""
+    """Stop + disable + remove everything the integration owns on the panel.
+
+    The disable step is best-effort (`|| true`) — the unit may already be gone —
+    but the removals and the reload must actually succeed or we'd leave orphaned
+    files behind a "removed" config entry.
+    """
     await shell.run(f"systemctl disable --now {SERVICE_NAME} 2>/dev/null || true")
-    await shell.run(f"rm -f {PANEL_UNIT_FILE} {PANEL_ENV_FILE}")
-    await shell.run(f"rm -rf {PANEL_VAR_DIR} {_STAGING_DIR}")
-    await shell.run("systemctl daemon-reload")
+    await _checked(shell, f"rm -f {PANEL_UNIT_FILE} {PANEL_ENV_FILE}")
+    await _checked(shell, f"rm -rf {PANEL_VAR_DIR} {_STAGING_DIR}")
+    await _checked(shell, "systemctl daemon-reload")
