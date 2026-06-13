@@ -18,6 +18,7 @@ import asyncio
 
 from brilliant_mqtt.bus import RpcBusAdapter
 from brilliant_mqtt.model import BrilliantDevice
+from tests.fakes import FakeClock
 
 
 class TestPushLiveness:
@@ -101,6 +102,38 @@ class TestReconnectFanout:
         age = adapter.seconds_since_last_push()
         assert age is not None
         assert age < 5.0
+
+
+class TestReconnectRate:
+    """The adapter counts processor reconnects in a sliding window so the run
+    loop can trip a circuit breaker on a reconnect STORM — a failure mode the
+    stale watchdog misses because every reconnect also resets the push clock
+    (incident 2026-06-13, adu-main: ~5 reconnects/sec masked staleness)."""
+
+    def test_no_reconnects_yet_is_zero(self) -> None:
+        adapter = RpcBusAdapter()
+        assert adapter.recent_reconnects(60.0) == 0
+
+    async def test_counts_reconnects_within_window(self) -> None:
+        clock = FakeClock()
+        adapter = RpcBusAdapter(clock=clock)
+        for _ in range(5):
+            adapter._on_proc_reconnect()
+            clock.advance(1.0)
+        await asyncio.gather(*adapter._pending_tasks)
+        # All five landed within the last 60s (now t=5).
+        assert adapter.recent_reconnects(60.0) == 5
+
+    async def test_excludes_reconnects_older_than_window(self) -> None:
+        clock = FakeClock()
+        adapter = RpcBusAdapter(clock=clock)
+        adapter._on_proc_reconnect()  # t=0 — ages out
+        clock.advance(100.0)
+        adapter._on_proc_reconnect()  # t=100
+        adapter._on_proc_reconnect()  # t=100
+        await asyncio.gather(*adapter._pending_tasks)
+        # Window is 60s back from now (t=100): only the two at t=100 count.
+        assert adapter.recent_reconnects(60.0) == 2
 
 
 class TestExtraDeviceIds:

@@ -21,6 +21,8 @@ configuration management; keep credentials out of git).
 | `RESYNC_SECONDS` | no | `300` | Period of the full discovery + state re-sync |
 | `HOT_POLL_SECONDS` | no | `2.0` | Cadence of the scoped state poll that bounds staleness even when bus pushes silently die; only changed payloads are published. `0` disables |
 | `BUS_STALE_SECONDS` | no | `900` | Rebuild the bus session when no push arrived for this long (half-dead stream watchdog). `0` disables |
+| `RECONNECT_STORM_THRESHOLD` | no | `20` | Rebuild the bus session when it reconnects at least this many times within the window — breaks a reconnect storm the stale watchdog can't see (each reconnect resets its push clock). `0` disables |
+| `RECONNECT_STORM_WINDOW_SECONDS` | no | `60` | Sliding window for `RECONNECT_STORM_THRESHOLD` |
 | `MESH_PRIORITY` | no | `0` | Participate in BLE-mesh leader election with this priority (lower number wins; ties broken by panel name). `0` = never publish the mesh |
 | `MESH_HEARTBEAT_SECONDS` | no | `10` | Mesh leadership heartbeat; a claim is stale (failover triggers) after 3× this |
 | `LOG_LEVEL` | no | `INFO` | Python log level (`DEBUG` for troubleshooting) |

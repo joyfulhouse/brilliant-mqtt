@@ -17,6 +17,7 @@ from brilliant_mqtt.config import Settings
 from brilliant_mqtt.mesh_leader import MeshLeader
 from brilliant_mqtt.model import BrilliantDevice
 from brilliant_mqtt.mqttio import AioMqttAdapter
+from brilliant_mqtt.protocols import BusClient
 
 log = logging.getLogger(__name__)
 
@@ -32,6 +33,27 @@ _MESH_DEVICE_ID = "ble_mesh"
 
 class BusStaleError(RuntimeError):
     """No bus push for longer than BUS_STALE_SECONDS — session presumed dead."""
+
+
+class BusReconnectStormError(RuntimeError):
+    """Bus reconnected past the rate threshold — session torn down to break the
+    self-reinforcing storm (incident 2026-06-13, adu-main)."""
+
+
+def _is_reconnect_storm(bus: BusClient, settings: Settings) -> bool:
+    """True when bus reconnects in the window meet/exceed the threshold.
+
+    A reconnect storm — the lib auto-reconnecting many times/sec when the panel
+    bus server drops the peer under load — is invisible to the stale watchdog
+    because every reconnect also resets the push clock. It is detected by RATE
+    instead, and the proven recovery is a full session rebuild after backoff
+    (what a manual ``systemctl restart`` did on adu-main). Threshold <= 0
+    disables the breaker.
+    """
+    if settings.reconnect_storm_threshold <= 0:
+        return False
+    count = bus.recent_reconnects(settings.reconnect_storm_window_seconds)
+    return count >= settings.reconnect_storm_threshold
 
 
 def _is_panel_device(device: BrilliantDevice) -> bool:
@@ -111,6 +133,16 @@ async def _run_session(settings: Settings) -> None:
                     raise BusStaleError(
                         f"no bus push for {age:.0f}s (threshold {settings.bus_stale_seconds:.0f}s)"
                     )
+
+            # Reconnect-storm breaker: a saturated panel bus server drops our
+            # peer repeatedly; the lib's aggressive auto-reconnect + our
+            # re-reconcile feed the loop (incident 2026-06-13). Tear the session
+            # down so the supervisor backoff gives the bus server a breather.
+            if _is_reconnect_storm(bus, settings):
+                raise BusReconnectStormError(
+                    f"bus reconnected >={settings.reconnect_storm_threshold} times in "
+                    f"{settings.reconnect_storm_window_seconds:.0f}s — rebuilding session"
+                )
 
             if participating:
                 await leader.tick()

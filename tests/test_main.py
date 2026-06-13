@@ -11,13 +11,29 @@ from __future__ import annotations
 
 import json
 
-from brilliant_mqtt.__main__ import _is_panel_device
+from brilliant_mqtt.__main__ import _is_panel_device, _is_reconnect_storm
 from brilliant_mqtt.bridge import Bridge
+from brilliant_mqtt.config import Settings
 from brilliant_mqtt.mesh_leader import MESH_LEADER_TOPIC, MeshLeader
 from brilliant_mqtt.model import BrilliantDevice, DeviceKind, Variable
 from tests.fakes import FakeBus, FakeClock, FakeMqtt
 
 HB = 10.0
+
+
+def _settings(
+    reconnect_storm_threshold: int = 20,
+    reconnect_storm_window_seconds: float = 60.0,
+) -> Settings:
+    """A Settings with required fields filled and the breaker knobs overridable."""
+    return Settings(
+        panel="office",
+        mqtt_host="h",
+        mqtt_username="u",
+        mqtt_password="p",
+        reconnect_storm_threshold=reconnect_storm_threshold,
+        reconnect_storm_window_seconds=reconnect_storm_window_seconds,
+    )
 
 
 def _mesh_dimmer() -> BrilliantDevice:
@@ -52,6 +68,33 @@ class TestPanelScopePredicate:
 
     def test_mesh_device_out_of_scope(self) -> None:
         assert _is_panel_device(_mesh_dimmer()) is False
+
+
+class TestReconnectStormBreaker:
+    """The run loop trips a session rebuild when the bus reconnects too many
+    times in the window — the breaker the stale watchdog can't be (a storm
+    keeps resetting the push clock). Threshold <= 0 disables it."""
+
+    def test_trips_at_threshold(self) -> None:
+        bus = FakeBus([])
+        bus.reconnect_count = 20
+        assert _is_reconnect_storm(bus, _settings(reconnect_storm_threshold=20)) is True
+
+    def test_below_threshold_does_not_trip(self) -> None:
+        bus = FakeBus([])
+        bus.reconnect_count = 19
+        assert _is_reconnect_storm(bus, _settings(reconnect_storm_threshold=20)) is False
+
+    def test_zero_threshold_disables_breaker(self) -> None:
+        bus = FakeBus([])
+        bus.reconnect_count = 10_000
+        assert _is_reconnect_storm(bus, _settings(reconnect_storm_threshold=0)) is False
+
+    def test_queries_the_configured_window(self) -> None:
+        bus = FakeBus([])
+        bus.reconnect_count = 20
+        _is_reconnect_storm(bus, _settings(reconnect_storm_window_seconds=42.0))
+        assert bus.reconnect_window_queried == 42.0
 
 
 def _data_topics(mqtt: FakeMqtt) -> list[str]:
