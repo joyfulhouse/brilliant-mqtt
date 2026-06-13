@@ -154,3 +154,41 @@ class TestSettings:
         assert isinstance(s.mesh_priority, int)
         assert s.mesh_heartbeat_seconds == 5.5
         assert isinstance(s.mesh_heartbeat_seconds, float)
+
+    def test_reconnect_storm_defaults(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Default breaker: 20 reconnects within a 60s window trips a rebuild."""
+        monkeypatch.setenv("BRILLIANT_PANEL", "office")
+        monkeypatch.setenv("MQTT_HOST", "10.0.0.1")
+        monkeypatch.setenv("MQTT_USERNAME", "brilliant")
+        monkeypatch.setenv("MQTT_PASSWORD", "s3cr3t")
+        monkeypatch.delenv("RECONNECT_STORM_THRESHOLD", raising=False)
+        monkeypatch.delenv("RECONNECT_STORM_WINDOW_SECONDS", raising=False)
+
+        s = Settings.from_env()
+        assert s.reconnect_storm_threshold == 20
+        assert s.reconnect_storm_window_seconds == 60.0
+
+    def test_reconnect_storm_overrides_parsed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("BRILLIANT_PANEL", "office")
+        monkeypatch.setenv("MQTT_HOST", "10.0.0.1")
+        monkeypatch.setenv("MQTT_USERNAME", "brilliant")
+        monkeypatch.setenv("MQTT_PASSWORD", "s3cr3t")
+        monkeypatch.setenv("RECONNECT_STORM_THRESHOLD", "5")
+        monkeypatch.setenv("RECONNECT_STORM_WINDOW_SECONDS", "30")
+
+        s = Settings.from_env()
+        assert s.reconnect_storm_threshold == 5
+        assert isinstance(s.reconnect_storm_threshold, int)
+        assert s.reconnect_storm_window_seconds == 30.0
+        assert isinstance(s.reconnect_storm_window_seconds, float)
+
+    def test_reconnect_storm_zero_disables(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """ "0" parses cleanly; the disable semantics live in the run loop."""
+        monkeypatch.setenv("BRILLIANT_PANEL", "office")
+        monkeypatch.setenv("MQTT_HOST", "10.0.0.1")
+        monkeypatch.setenv("MQTT_USERNAME", "brilliant")
+        monkeypatch.setenv("MQTT_PASSWORD", "s3cr3t")
+        monkeypatch.setenv("RECONNECT_STORM_THRESHOLD", "0")
+
+        s = Settings.from_env()
+        assert s.reconnect_storm_threshold == 0

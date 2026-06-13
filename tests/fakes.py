@@ -29,6 +29,10 @@ class FakeBus:
         self.commands: list[tuple[str, str, list[VarSet]]] = []
         # Returned verbatim by seconds_since_last_push (None = no pushes yet).
         self.last_push_age: float | None = None
+        # Returned verbatim by recent_reconnects; the window it was queried with
+        # is recorded so tests can assert the run loop forwards the config value.
+        self.reconnect_count: int = 0
+        self.reconnect_window_queried: float | None = None
 
     async def start(self) -> None:
         pass
@@ -44,6 +48,10 @@ class FakeBus:
 
     def seconds_since_last_push(self) -> float | None:
         return self.last_push_age
+
+    def recent_reconnects(self, window_s: float) -> int:
+        self.reconnect_window_queried = window_s
+        return self.reconnect_count
 
     async def set_variables(self, device_id: str, peripheral_id: str, sets: list[VarSet]) -> None:
         self.commands.append((device_id, peripheral_id, list(sets)))
