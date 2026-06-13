@@ -1,0 +1,6 @@
+{
+  "name": "Brilliant MQTT",
+  "zip_release": true,
+  "filename": "brilliant_mqtt.zip",
+  "homeassistant": "2026.6.0"
+}
