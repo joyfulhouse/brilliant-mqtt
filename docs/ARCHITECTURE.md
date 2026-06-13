@@ -62,6 +62,11 @@ bidirectional control.
 - **Availability:** `brilliant/<panel>/availability` with an MQTT LWT —
   `offline` the moment the agent dies; systemd restarts it; reconnect
   re-reconciles.
+- **Bridge meta:** retained `brilliant/<panel>/bridge` JSON
+  (`{"agent_version", "panel_firmware"}`), republished on every reconcile. The
+  machine contract for the companion HA integration (OTA detection + agent-update
+  entity); the firmware tag is also exposed as a per-panel diagnostic sensor.
+  Never published for the reserved `mesh` pseudo-panel.
 - **Self-healing:** the panel lib's notification stream can die *silently*
   while the process lives, freezing both pushes and the observer's
   `get_all()` mirror (live pilot finding). Three layers compensate: the

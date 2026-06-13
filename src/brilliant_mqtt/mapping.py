@@ -38,7 +38,7 @@ class AuxSpec:
     var: str
     component: str  # "sensor" | "binary_sensor" | "switch" | "number" | "button"
     name: str
-    value_kind: str  # "bool" | "int" | "float"
+    value_kind: str  # "bool" | "int" | "float" | "str"
     payload_key: str | None = None
     device_class: str | None = None
     unit: str | None = None
@@ -212,6 +212,19 @@ AUX_SPECS: dict[DeviceKind, tuple[AuxSpec, ...]] = {
             value_kind="bool",
             entity_category="diagnostic",
             enabled_by_default=False,
+        ),
+        # Panel firmware tag (e.g. "v26.05.20.2") — read-only diagnostic string.
+        # Machine consumers should prefer the brilliant/<panel>/bridge meta topic;
+        # this entity exists for humans and user automations.
+        # A blank tag means "unknown" — gated to match _sw_version_from (bridge.py),
+        # the other reader of this variable.
+        AuxSpec(
+            var="current_release_tag",
+            component="sensor",
+            name="Firmware",
+            value_kind="str",
+            entity_category="diagnostic",
+            skip_values=("",),
         ),
     ),
     DeviceKind.UI: (
@@ -435,6 +448,8 @@ def _render_aux(var: Variable, value_kind: str, invert: bool) -> object | None:
         return var.as_int()
     if value_kind == "float":
         return var.as_float()
+    if value_kind == "str":
+        return var.value
     return None
 
 

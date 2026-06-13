@@ -1,0 +1,66 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Add a Brilliant panel",
+        "data": {
+          "host": "Panel IP / hostname",
+          "root_password": "Panel root password (stored per panel)",
+          "panel": "Panel slug (e.g. office)",
+          "mesh_priority": "Mesh priority (0 = never publishes the BLE mesh)",
+          "mqtt_host": "Broker host (for the on-panel agent)",
+          "mqtt_port": "Broker port",
+          "mqtt_username": "Broker username",
+          "mqtt_password": "Broker password"
+        }
+      },
+      "reconfigure": {
+        "title": "Update panel connection",
+        "data": {
+          "host": "Panel IP / hostname",
+          "root_password": "Panel root password"
+        }
+      }
+    },
+    "error": {
+      "reserved_panel": "\"mesh\" is the reserved whole-home pseudo-panel and cannot be managed.",
+      "invalid_panel": "Use only lowercase letters, digits, hyphens, and underscores for the panel slug.",
+      "invalid_value": "Control characters are not allowed in this field.",
+      "cannot_connect": "SSH connection failed — check the host and the root password.",
+      "host_key_changed": "The panel's SSH host key changed since it was added. If this is expected (e.g. the panel was reflashed), remove and re-add the panel to re-pin it. Otherwise it may indicate a man-in-the-middle, so do not proceed until you have confirmed the host."
+    },
+    "abort": {
+      "already_configured": "This panel is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Panel manager behavior",
+        "data": {
+          "auto_repair": "Automatically repair the bridge after an outage",
+          "offline_grace_minutes": "Minutes offline before acting",
+          "repair_cooldown_minutes": "Minimum minutes between automatic repairs",
+          "trust_host_key_changes": "Trust host-key changes (auto-re-pin on reflash)"
+        },
+        "data_description": {
+          "trust_host_key_changes": "When on, repair auto-trusts a changed SSH host key so a firmware update that rotates the panel's keys recovers hands-off. This offers the root password to whatever host answers at the panel's address, so only enable on a trusted/isolated network (e.g. a firewalled IoT VLAN). Each automatic re-pin fires a host_key_repinned event you can alert on. Default off: a changed key instead surfaces repair_failed (host_key_changed) and asks you to Reconfigure to re-pin."
+        }
+      }
+    }
+  },
+  "services": {
+    "repair": {
+      "name": "Repair bridge",
+      "description": "Restore the unit/env from known-good sources and start the agent."
+    },
+    "redeploy": {
+      "name": "Redeploy agent",
+      "description": "Force-push the bundled agent payload and restart the bridge."
+    },
+    "uninstall": {
+      "name": "Uninstall agent",
+      "description": "Stop, disable, and remove the agent from the panel (explicit only)."
+    }
+  }
+}

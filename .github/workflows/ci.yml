@@ -1,0 +1,35 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  agent:
+    # The on-panel agent (repo root) — Python 3.10 ONLY (panel-locked runtime).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v7
+      - run: uv python install 3.10
+      - run: uv sync
+      - run: uv run ruff check
+      - run: uv run ruff format --check
+      - run: uv run mypy --strict src tests
+      - run: uv run pytest
+
+  ha-integration:
+    # The HACS companion integration (ha/) — Python 3.14.2+ (HA 2026.6.2 requires it).
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ha
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v7
+      - run: uv python install 3.14
+      - run: uv sync
+      - run: uv run ruff check
+      - run: uv run ruff format --check
+      - run: uv run mypy --strict custom_components tests
+      - run: uv run pytest

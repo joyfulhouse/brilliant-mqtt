@@ -40,6 +40,17 @@ def availability_topic(panel: str) -> str:
     return f"brilliant/{panel}/availability"
 
 
+def meta_topic(panel: str) -> str:
+    """Return the retained bridge meta topic (agent_version + panel_firmware).
+
+    Machine contract for the companion HA integration: it watches this topic to
+    detect firmware OTAs and to drive the agent-update entity. (The Bridge skips
+    publishing it for the reserved "mesh" pseudo-panel — no single host behind
+    it; see Bridge.reconcile.)
+    """
+    return f"brilliant/{panel}/bridge"
+
+
 # ---------------------------------------------------------------------------
 # Discovery payload builder
 # ---------------------------------------------------------------------------
