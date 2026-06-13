@@ -28,9 +28,13 @@ DATA_LAST_FIRMWARE = "last_firmware"  # persisted so panel_updated survives HA r
 OPT_AUTO_REPAIR = "auto_repair"
 OPT_OFFLINE_GRACE_MINUTES = "offline_grace_minutes"
 OPT_REPAIR_COOLDOWN_MINUTES = "repair_cooldown_minutes"
+OPT_TRUST_HOST_KEY_CHANGES = "trust_host_key_changes"
 DEFAULT_AUTO_REPAIR = True
 DEFAULT_OFFLINE_GRACE_MINUTES = 10
 DEFAULT_REPAIR_COOLDOWN_MINUTES = 60
+# Opt-in, default OFF: let repair/update auto-re-pin a rotated SSH host key on the
+# already-adopted same-host panel (offers the root password to the new-key host).
+DEFAULT_TRUST_HOST_KEY_CHANGES = False
 
 # The reserved whole-home pseudo-panel — never manageable (no host behind it).
 MESH_PANEL = "mesh"
@@ -71,3 +75,6 @@ EVENT_REPAIR_SUCCEEDED = "repair_succeeded"
 EVENT_REPAIR_FAILED = "repair_failed"
 EVENT_NEEDS_ATTENTION = "needs_attention"
 EVENT_AGENT_UPDATED = "agent_updated"
+# Fired when a rotated SSH host key was auto-trusted during repair/update (opt-in
+# OPT_TRUST_HOST_KEY_CHANGES). Extra data: new_host_key. Auditable security event.
+EVENT_HOST_KEY_REPINNED = "host_key_repinned"

@@ -18,7 +18,13 @@ from pytest_homeassistant_custom_component.common import (
 )
 from pytest_homeassistant_custom_component.typing import MqttMockHAClient
 
-from custom_components.brilliant_mqtt.const import DOMAIN, EVENT_TYPE
+from custom_components.brilliant_mqtt.const import (
+    DATA_SSH_HOST_KEY,
+    DOMAIN,
+    EVENT_TYPE,
+    OPT_TRUST_HOST_KEY_CHANGES,
+)
+from tests.conftest import REPIN_NEW_KEY, RepinShells
 from tests.fakes import FakeShell
 from tests.test_init import ENTRY_DATA
 
@@ -652,3 +658,161 @@ async def test_shutdown_during_inflight_repair_connect_fail_leaks_no_timer(
     # The connect-fail branch must NOT have armed the unreachable-recheck timer.
     assert manager._grace_cancel is None
     assert manager._recovery_cancel is None
+
+
+async def test_repair_host_key_changed_without_optin_escalates_and_never_repins(
+    hass: HomeAssistant,
+    payload_dir: Path,
+    repin_shells: RepinShells,
+) -> None:
+    """SECURITY: auto-re-pin OFF (default). A rotated host key (pinned connect raises
+    HostKeyNotVerifiable) must escalate as repair_failed:host_key_changed WITHOUT ever
+    constructing an unpinned shell — the root password is NEVER offered to the new-key
+    host — and must NOT silently re-pin or arm a recheck (a rotated key won't un-rotate).
+
+    Built directly (no mqtt_mock) under the strict timer guard so a leaked recheck timer
+    would fail loudly. async_repair swallows (button/timer context), so no raise here.
+    """
+    import asyncio
+
+    from custom_components.brilliant_mqtt.manager import PanelManager
+
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    manager = PanelManager(hass, entry, asyncio.Lock())
+    events = _capture_events(hass)
+
+    await manager.async_repair(trigger="button")
+
+    assert _types(events) == ["repair_started", "repair_failed", "needs_attention"]
+    failed = next(e for e in events if e.data["type"] == "repair_failed")
+    assert failed.data["reason"] == "host_key_changed"
+    assert manager.problem is True
+    # The pin is UNCHANGED — no silent re-pin (the TOFU bypass).
+    assert entry.data[DATA_SSH_HOST_KEY] == "ssh-ed25519 PINNED"
+    # SECURITY INVARIANT: an unpinned shell was NEVER constructed (the factory only ever
+    # saw the stored pin, never None), so the password was never offered to a new-key host.
+    assert repin_shells.unpinned_shell is None
+    assert None not in repin_shells.pins_seen
+    # A rotated key needs operator action; no recheck timer was armed.
+    assert manager._grace_cancel is None
+    assert manager._recovery_cancel is None
+
+
+async def test_repair_host_key_changed_with_optin_repins_and_proceeds(
+    hass: HomeAssistant,
+    payload_dir: Path,
+    repin_shells: RepinShells,
+) -> None:
+    """Opt-in ON: a rotated key is auto-trusted. The pinned connect raises
+    HostKeyNotVerifiable, one UNPINNED connect captures the new key, the entry pin is
+    updated, host_key_repinned fires (with new_host_key), the repair PROCEEDS on the
+    re-pinned shell (ensure_configs/enable run), and a recovery timer is armed.
+
+    Built directly under the strict guard; shutdown at the end cancels the recovery timer
+    so nothing lingers.
+    """
+    import asyncio
+
+    from custom_components.brilliant_mqtt.manager import PanelManager
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="office",
+        data=ENTRY_DATA,
+        options={OPT_TRUST_HOST_KEY_CHANGES: True},
+    )
+    entry.add_to_hass(hass)
+    manager = PanelManager(hass, entry, asyncio.Lock())
+    events = _capture_events(hass)
+
+    await manager.async_repair(trigger="button")
+
+    # Re-pinned: the entry now stores the NEW key, and an auditable event fired.
+    assert entry.data[DATA_SSH_HOST_KEY] == REPIN_NEW_KEY
+    repinned = next(e for e in events if e.data["type"] == "host_key_repinned")
+    assert repinned.data["new_host_key"] == REPIN_NEW_KEY
+    # The repair PROCEEDED on the re-pinned (unpinned) shell.
+    assert repin_shells.unpinned_shell is not None
+    assert "systemctl enable --now brilliant-mqtt" in repin_shells.unpinned_shell.commands
+    assert "repair_failed" not in _types(events)
+    # Success path armed a recovery timer.
+    assert manager._recovery_cancel is not None
+
+    await manager.async_shutdown()
+    assert manager._recovery_cancel is None
+
+
+async def test_repair_repin_connect_failure_is_unreachable(
+    hass: HomeAssistant,
+    payload_dir: Path,
+    repin_shells: RepinShells,
+) -> None:
+    """Opt-in ON but the unpinned re-pin connect itself fails (panel genuinely down on
+    the second attempt) → the OSError propagates to the unreachable handler:
+    repair_failed:unreachable, and the entry pin is left UNCHANGED (nothing to pin).
+
+    Built directly under the strict guard; the unreachable branch arms a recheck timer,
+    so shutdown at the end cancels it.
+    """
+    import asyncio
+
+    from custom_components.brilliant_mqtt.manager import PanelManager
+
+    repin_shells.unpinned_connect_error = OSError("unreachable on re-pin")
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="office",
+        data=ENTRY_DATA,
+        options={OPT_TRUST_HOST_KEY_CHANGES: True},
+    )
+    entry.add_to_hass(hass)
+    manager = PanelManager(hass, entry, asyncio.Lock())
+    events = _capture_events(hass)
+
+    await manager.async_repair(trigger="button")
+
+    failed = next(e for e in events if e.data["type"] == "repair_failed")
+    assert failed.data["reason"] == "unreachable"
+    assert "host_key_repinned" not in _types(events)
+    # The re-pin attempt failed before any key could be persisted → pin UNCHANGED.
+    assert entry.data[DATA_SSH_HOST_KEY] == "ssh-ed25519 PINNED"
+
+    await manager.async_shutdown()
+    assert manager._grace_cancel is None
+
+
+async def test_update_host_key_changed_without_optin_raises(
+    hass: HomeAssistant,
+    payload_dir: Path,
+    repin_shells: RepinShells,
+) -> None:
+    """SECURITY: async_update_agent with auto-re-pin OFF. A rotated host key must raise
+    HomeAssistantError carrying the reconfigure guidance AND escalate, WITHOUT ever
+    offering the password to the new-key host (no unpinned shell constructed) and without
+    touching the stored pin.
+    """
+    import asyncio
+
+    from homeassistant.exceptions import HomeAssistantError
+
+    from custom_components.brilliant_mqtt.manager import PanelManager
+
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    manager = PanelManager(hass, entry, asyncio.Lock())
+    events = _capture_events(hass)
+
+    with pytest.raises(HomeAssistantError, match="host key changed"):
+        await manager.async_update_agent()
+
+    assert _types(events)[-1] == "needs_attention"
+    assert manager.problem is True
+    assert "agent_updated" not in _types(events)
+    # SECURITY INVARIANT: no unpinned shell → password never offered to a new-key host.
+    assert repin_shells.unpinned_shell is None
+    assert None not in repin_shells.pins_seen
+    assert entry.data[DATA_SSH_HOST_KEY] == "ssh-ed25519 PINNED"
+    assert manager._recovery_cancel is None
+    assert manager._repairing is False

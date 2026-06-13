@@ -23,11 +23,13 @@ from .const import (
     DEFAULT_AUTO_REPAIR,
     DEFAULT_OFFLINE_GRACE_MINUTES,
     DEFAULT_REPAIR_COOLDOWN_MINUTES,
+    DEFAULT_TRUST_HOST_KEY_CHANGES,
     DOMAIN,
     MESH_PANEL,
     OPT_AUTO_REPAIR,
     OPT_OFFLINE_GRACE_MINUTES,
     OPT_REPAIR_COOLDOWN_MINUTES,
+    OPT_TRUST_HOST_KEY_CHANGES,
 )
 from .shell import AsyncsshShell
 
@@ -228,6 +230,10 @@ class BrilliantMqttOptionsFlow(OptionsFlow):
                     OPT_REPAIR_COOLDOWN_MINUTES,
                     default=opts.get(OPT_REPAIR_COOLDOWN_MINUTES, DEFAULT_REPAIR_COOLDOWN_MINUTES),
                 ): vol.All(vol.Coerce(int), vol.Range(min=5, max=1440)),
+                vol.Required(
+                    OPT_TRUST_HOST_KEY_CHANGES,
+                    default=opts.get(OPT_TRUST_HOST_KEY_CHANGES, DEFAULT_TRUST_HOST_KEY_CHANGES),
+                ): bool,
             }
         )
         return self.async_show_form(step_id="init", data_schema=schema)
