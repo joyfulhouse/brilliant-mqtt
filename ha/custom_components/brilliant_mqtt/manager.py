@@ -23,6 +23,7 @@ from homeassistant.components import mqtt, persistent_notification
 from homeassistant.components.mqtt.models import ReceiveMessage
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.event import async_call_later
 
@@ -274,33 +275,51 @@ class PanelManager:
     async def async_update_agent(self) -> None:
         """Push the bundled agent payload, refresh configs, restart, verify via LWT.
 
-        Mirrors async_repair's hardening: a failed SSH step escalates (problem +
-        notification) instead of escaping silently, and the recovery timer is only
-        armed when the work succeeded AND we are not shutting down — checked with no
-        await before the schedule so async_shutdown's cancel can't be raced.
+        Takes the SAME _repairing mutex as async_repair (C1): a concurrent repair (or
+        a second update) early-returns, and — critically — while this holds it the
+        restart-induced `offline` LWT cannot arm a grace timer (facet b), so one panel
+        never runs grace + recovery at once. The recovery timer is armed only on
+        success and only when not shutting down (no await before the schedule so
+        async_shutdown's cancel can't be raced), and any prior _recovery_cancel handle
+        is cancelled first so an update inside a repair's recovery window can't orphan
+        a timer that would outlive shutdown (facet a).
+
+        Unlike async_repair (timers/button → swallow + escalate), this runs only from
+        the update.install service call, so on failure it escalates AND re-raises as
+        HomeAssistantError (I4) — otherwise HA reports the install "done" while the
+        agent is broken.
         """
-        version = (
-            await self.hass.async_add_executor_job((_payload_dir() / "VERSION").read_text)
-        ).strip()
-        async with self._ssh_lock:
-            shell = self._shell()
-            try:
-                await shell.connect()
-                await panel_ops.deploy_payload(shell, str(_payload_dir()), version)
-                unit, env = await self._config_contents()
-                await panel_ops.ensure_configs(shell, unit, env)
-                await panel_ops.restart(shell)
-            except (OSError, asyncssh.Error, PanelOpError) as err:
-                self._escalate(f"agent update failed: {err}")
-                return
-            finally:
-                await shell.close()
-        self._fire(EVENT_AGENT_UPDATED, {"version": version})
-        if self._shutting_down:
-            return  # entry torn down mid-update: do not re-arm a timer
-        self._recovery_cancel = async_call_later(
-            self.hass, _RECOVERY_SECONDS, self._recovery_timeout
-        )
+        if self._repairing:
+            raise HomeAssistantError("a repair or update is already in progress")
+        self._repairing = True
+        try:
+            version = (
+                await self.hass.async_add_executor_job((_payload_dir() / "VERSION").read_text)
+            ).strip()
+            async with self._ssh_lock:
+                shell = self._shell()
+                try:
+                    await shell.connect()
+                    await panel_ops.deploy_payload(shell, str(_payload_dir()), version)
+                    unit, env = await self._config_contents()
+                    await panel_ops.ensure_configs(shell, unit, env)
+                    await panel_ops.restart(shell)
+                except (OSError, asyncssh.Error, PanelOpError) as err:
+                    self._escalate(f"agent update failed: {err}")
+                    raise HomeAssistantError(f"agent update failed: {err}") from err
+                finally:
+                    await shell.close()
+            self._fire(EVENT_AGENT_UPDATED, {"version": version})
+            if self._shutting_down:
+                return  # entry torn down mid-update: do not re-arm a timer
+            # Cancel any prior recovery handle (e.g. a repair's, if this update lands in
+            # its window) BEFORE re-arming, so the old TimerHandle can't be orphaned.
+            self._cancel("_recovery_cancel")
+            self._recovery_cancel = async_call_later(
+                self.hass, _RECOVERY_SECONDS, self._recovery_timeout
+            )
+        finally:
+            self._repairing = False
 
     async def _recovery_timeout(self, _now: datetime) -> None:
         self._recovery_cancel = None

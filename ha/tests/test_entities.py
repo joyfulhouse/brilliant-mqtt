@@ -74,6 +74,35 @@ async def test_entities_attach_to_the_mqtt_discovery_device(
 
 
 @pytest.mark.allow_lingering_timers
+async def test_entities_attach_when_discovery_arrives_after_entry(
+    hass: HomeAssistant, mqtt_mock: MqttMockHAClient, fake_shell: FakeShell, payload_dir: Path
+) -> None:
+    """The riskier ordering: OUR entry sets up first (creating the device under the
+    ("mqtt", ...) identifier), THEN the agent's MQTT discovery claims the same
+    identifier. Both must land on ONE device — our management entities and the
+    discovery device sharing it — not split into two cards.
+    """
+    entry = await _setup(hass)
+    registry = dr.async_get(hass)
+    ours = registry.async_get_device(identifiers={("mqtt", "brilliant_panel_office")})
+    assert ours is not None  # our entity created the device under the mqtt identifier
+
+    # Now MQTT discovery for the panel arrives and claims the same identifier.
+    mqtt_entry = hass.config_entries.async_entries("mqtt")[0]
+    discovered = registry.async_get_or_create(
+        config_entry_id=mqtt_entry.entry_id,
+        identifiers={("mqtt", "brilliant_panel_office")},
+        name="Brilliant Office",
+    )
+    assert discovered.id == ours.id  # merged onto the same device, not a second one
+    # And the device now carries BOTH config entries (ours + mqtt) on one page.
+    assert mqtt_entry.entry_id in discovered.config_entries
+    assert entry.entry_id in discovered.config_entries
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
 async def test_repair_button_runs_manual_repair(
     hass: HomeAssistant, mqtt_mock: MqttMockHAClient, fake_shell: FakeShell, payload_dir: Path
 ) -> None:

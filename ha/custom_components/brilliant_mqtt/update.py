@@ -40,4 +40,12 @@ class AgentUpdate(BrilliantPanelEntity, UpdateEntity):
         return meta.get("agent_version") if meta else None
 
     async def async_install(self, version: str | None, backup: bool, **kwargs: Any) -> None:
-        await self._manager.async_update_agent()
+        # Engage HA's re-entrancy guard and show a spinner on the card for the duration
+        # of the deploy; async_update_agent re-raises on failure so HA surfaces it.
+        self._attr_in_progress = True
+        self.async_write_ha_state()
+        try:
+            await self._manager.async_update_agent()
+        finally:
+            self._attr_in_progress = False
+            self.async_write_ha_state()
