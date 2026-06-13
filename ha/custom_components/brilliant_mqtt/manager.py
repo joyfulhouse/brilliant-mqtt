@@ -321,6 +321,33 @@ class PanelManager:
         finally:
             self._repairing = False
 
+    async def async_uninstall(self) -> None:
+        """Remove the agent from the panel (explicit service — never on entry removal).
+
+        Service-call context (like async_update_agent): on failure escalate AND
+        re-raise as HomeAssistantError so the operator sees it, rather than letting a
+        half-removed panel report success. Schedules no timer, so _shutting_down needs
+        no special handling here.
+        """
+        async with self._ssh_lock:
+            shell = self._shell()
+            try:
+                await shell.connect()
+                await panel_ops.uninstall(shell)
+            except (OSError, asyncssh.Error, PanelOpError) as err:
+                self._escalate(f"agent uninstall failed: {err}")
+                raise HomeAssistantError(f"agent uninstall failed: {err}") from err
+            finally:
+                await shell.close()
+        persistent_notification.async_create(
+            self.hass,
+            f"Agent removed from panel `{self.panel}`. Delete the config entry to stop "
+            "managing it; retained MQTT discovery topics are cleaned per "
+            "docs/reference/deployment.md (Rollback).",
+            title="Brilliant MQTT",
+            notification_id=f"{EVENT_TYPE}_{self.panel}",
+        )
+
     async def _recovery_timeout(self, _now: datetime) -> None:
         self._recovery_cancel = None
         if self._shutting_down:

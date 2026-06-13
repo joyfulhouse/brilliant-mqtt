@@ -5,13 +5,20 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+import voluptuous as vol
+from homeassistant.config_entries import ConfigEntry, ConfigEntryState
+from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.helpers.service import async_extract_config_entry_ids
+from homeassistant.helpers.typing import ConfigType
 
 from .const import DOMAIN, PLATFORMS
 from .manager import PanelManager
 
 type BrilliantMqttConfigEntry = ConfigEntry[PanelManager]
+
+_SERVICE_SCHEMA = vol.Schema(
+    {vol.Required("device_id"): vol.Any(str, [str])}, extra=vol.ALLOW_EXTRA
+)
 
 
 def _fleet_lock(hass: HomeAssistant) -> asyncio.Lock:
@@ -19,6 +26,40 @@ def _fleet_lock(hass: HomeAssistant) -> asyncio.Lock:
     domain_data: dict[str, Any] = hass.data.setdefault(DOMAIN, {})
     lock: asyncio.Lock = domain_data.setdefault("ssh_lock", asyncio.Lock())
     return lock
+
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Register domain services once (entries come and go; services persist)."""
+
+    async def _managers_for(call: ServiceCall) -> list[PanelManager]:
+        managers: list[PanelManager] = []
+        # In this HA version async_extract_config_entry_ids reads hass off the call.
+        for entry_id in await async_extract_config_entry_ids(call):
+            entry = hass.config_entries.async_get_entry(entry_id)
+            if (
+                entry is not None
+                and entry.domain == DOMAIN
+                and entry.state is ConfigEntryState.LOADED
+            ):
+                managers.append(entry.runtime_data)
+        return managers
+
+    async def _repair(call: ServiceCall) -> None:
+        for manager in await _managers_for(call):
+            await manager.async_repair(trigger="service")
+
+    async def _redeploy(call: ServiceCall) -> None:
+        for manager in await _managers_for(call):
+            await manager.async_update_agent()
+
+    async def _uninstall(call: ServiceCall) -> None:
+        for manager in await _managers_for(call):
+            await manager.async_uninstall()
+
+    hass.services.async_register(DOMAIN, "repair", _repair, schema=_SERVICE_SCHEMA)
+    hass.services.async_register(DOMAIN, "redeploy", _redeploy, schema=_SERVICE_SCHEMA)
+    hass.services.async_register(DOMAIN, "uninstall", _uninstall, schema=_SERVICE_SCHEMA)
+    return True
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: BrilliantMqttConfigEntry) -> bool:
