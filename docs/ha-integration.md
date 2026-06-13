@@ -65,7 +65,10 @@ On submit the integration makes **one** SSH connection to validate the host and
 an unpinned/impostor host on later connects.
 
 To rotate a panel's host or root password later, use **Reconfigure** on the
-entry (the slug is immutable). Behavior knobs are under **Configure** (Options).
+entry (the slug is immutable); this re-validates over SSH and **re-pins the host
+key** — capturing a fresh key from the new host, replacing the old TOFU pin — so
+pointing the entry at a different host is safe. Behavior knobs are under
+**Configure** (Options).
 
 ## Entities
 
@@ -73,9 +76,9 @@ Each panel's device gains three management entities (all diagnostic):
 
 | Entity | What it is |
 |---|---|
-| `update.<panel>_bridge` | Agent **update** entity. Installed version comes from the panel's retained bridge-meta (`agent_version`); latest comes from the bundled payload's `VERSION`. Installing pushes the bundled payload and restarts the agent. Also the **first-deploy** path to a bare panel. |
-| `binary_sensor.<panel>_bridge_health` | Bridge **health** (device class `problem`). `on` = needs attention (offline past grace with auto-repair off, a repair step failed, or a repair ran but the bridge stayed offline). Attributes: `reason`, `availability`. |
-| `button.<panel>_repair_bridge` | **Manual repair** — restores the unit/env and starts the agent, bypassing the auto-repair cooldown. |
+| `update.brilliant_<panel>_bridge` | Agent **update** entity. Installed version comes from the panel's retained bridge-meta (`agent_version`); latest comes from the bundled payload's `VERSION`. Installing pushes the bundled payload and restarts the agent. Also the **first-deploy** path to a bare panel. |
+| `binary_sensor.brilliant_<panel>_bridge_health` | Bridge **health** (device class `problem`). `on` = needs attention (offline past grace with auto-repair off, a repair step failed, or a repair ran but the bridge stayed offline). Attributes: `reason`, `availability`. |
+| `button.brilliant_<panel>_repair_bridge` | **Manual repair** — restores the unit/env and starts the agent, bypassing the auto-repair cooldown. |
 
 Entity ids are derived from the panel's HA device name (`Brilliant <panel>`), so
 in practice they read `update.brilliant_<panel>_bridge`,
