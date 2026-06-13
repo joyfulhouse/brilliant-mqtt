@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from custom_components.brilliant_mqtt.shell import RunResult
 
 _OK = RunResult(0, "", "")
@@ -15,13 +17,22 @@ class FakeShell:
         responses: dict[str, RunResult] | None = None,
         connect_error: Exception | None = None,
         put_dir_error: Exception | None = None,
+        connect_gate: asyncio.Event | None = None,
         pinned: str | None = "ssh-ed25519 FAKEKEY",
     ) -> None:
         self.responses = dict(responses or {})
         self.connect_error = connect_error
         self.put_dir_error = put_dir_error
+        # When set, connect() blocks on this event — lets a test wedge a repair
+        # inside the ssh_lock to exercise the shutdown-mid-repair interleaving.
+        self.connect_gate = connect_gate
+        # Set the instant connect() is entered (before it blocks on the gate) so a
+        # test can deterministically await "the repair is now inside connect()"
+        # rather than busy-waiting on a flag.
+        self.connect_entered = asyncio.Event()
         self._pinned = pinned
         self.connected = False
+        self.connect_count = 0  # how many times connect() was entered (gate/error or not)
         self.commands: list[str] = []
         self.uploads: list[tuple[str, bytes, int]] = []
         self.dir_uploads: list[tuple[str, str]] = []
@@ -30,6 +41,10 @@ class FakeShell:
         return self._pinned
 
     async def connect(self) -> None:
+        self.connect_count += 1
+        self.connect_entered.set()
+        if self.connect_gate is not None:
+            await self.connect_gate.wait()
         if self.connect_error is not None:
             raise self.connect_error
         self.connected = True

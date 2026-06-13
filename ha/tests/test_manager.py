@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from homeassistant.core import Event, HomeAssistant
@@ -173,8 +174,6 @@ async def test_unreachable_panel_reports_and_schedules_recheck(
     mqtt_mock: MqttMockHAClient,
     payload_dir: Path,
 ) -> None:
-    from unittest.mock import patch
-
     shell = FakeShell(connect_error=OSError("unreachable"))
     with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
         entry = await _setup(hass)
@@ -184,13 +183,22 @@ async def test_unreachable_panel_reports_and_schedules_recheck(
         async_fire_time_changed(hass, dt_util.utcnow() + timedelta(minutes=11))
         await hass.async_block_till_done()
 
-    assert _types(events) == ["repair_started", "repair_failed"]
-    assert events[-1].data["reason"] == "unreachable"
-    assert entry.runtime_data.problem is True
+        assert _types(events) == ["repair_started", "repair_failed"]
+        assert events[-1].data["reason"] == "unreachable"
+        assert entry.runtime_data.problem is True
+        assert shell.connect_count == 1  # one real SSH attempt so far
 
-    # The failed repair scheduled an unreachable-recheck timer; unloading the
-    # entry must cancel it so it does not linger past the test (the marker only
-    # excuses mqtt's own timer, never a manager timer).
+        # I1: the connect-fail path recorded the cooldown. When the 5-min recheck
+        # fires _grace_expired, the panel is still offline but within the cooldown,
+        # so it must ESCALATE (needs_attention) — NOT open a second SSH connection
+        # (which would re-offer the root password to a flapping host → lockout).
+        async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=301))
+        await hass.async_block_till_done()
+        assert shell.connect_count == 1  # bounded: no SSH storm on the recheck cadence
+        assert _types(events)[-1] == "needs_attention"
+
+    # The recheck timer was consumed by the escalate path; nothing scheduled a new
+    # one (cooldown holds), so unloading the entry leaves no manager timer.
     assert await hass.config_entries.async_unload(entry.entry_id)
 
 
@@ -226,3 +234,82 @@ async def test_unload_cancels_pending_timers(hass: HomeAssistant) -> None:
 
     await manager.async_shutdown()
     assert manager._grace_cancel is None  # cancelled on shutdown — nothing lingers
+
+
+@pytest.mark.allow_lingering_timers
+async def test_repair_step_failure_escalates_and_sets_problem(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    payload_dir: Path,
+) -> None:
+    """C2: a checked SSH step failing mid-repair must escalate, not fail silently.
+
+    Connect succeeds, then `systemctl enable --now` exits non-zero → panel_ops
+    raises PanelOpError out of enable_now. The repair must fire repair_failed +
+    needs_attention and set problem=True — never fall through to repair_succeeded
+    (the panel is half-broken; showing it green would be the real hazard).
+    """
+    from custom_components.brilliant_mqtt.shell import RunResult
+
+    shell = FakeShell(responses={"systemctl enable --now brilliant-mqtt": RunResult(1, "", "boom")})
+    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+        entry = await _setup(hass)
+        events = _capture_events(hass)
+
+        async_fire_mqtt_message(hass, "brilliant/office/availability", "offline")
+        await hass.async_block_till_done()
+        async_fire_time_changed(hass, dt_util.utcnow() + timedelta(minutes=11))
+        await hass.async_block_till_done()
+
+    assert "repair_started" in _types(events)
+    assert "repair_failed" in _types(events)
+    assert "needs_attention" in _types(events)
+    assert "repair_succeeded" not in _types(events)
+    failed = next(e for e in events if e.data["type"] == "repair_failed")
+    assert failed.data["reason"] == "repair_step_failed"
+    assert entry.runtime_data.problem is True
+
+    # No recovery timer was scheduled (we returned before the success path), and the
+    # cooldown was recorded so a retry within it would be gated — unloading is clean.
+    assert entry.runtime_data._recovery_cancel is None
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_shutdown_during_inflight_repair_leaks_no_timer(hass: HomeAssistant) -> None:
+    """C1: shutdown while a repair is wedged inside the ssh_lock leaks no timer.
+
+    NOT marked allow_lingering_timers: runs under the strict guard. Without the
+    _shutting_down flag, the repair resumes after async_shutdown's single up-front
+    cancel and schedules a recovery timer that fires on a torn-down entry (SSHing a
+    removed panel). Built without mqtt_mock so the only timer that could linger is the
+    manager's. The repair is wedged by gating FakeShell.connect on an event.
+    """
+    import asyncio
+
+    from custom_components.brilliant_mqtt.manager import PanelManager
+
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+
+    gate = asyncio.Event()
+    shell = FakeShell(connect_gate=gate)
+    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+        manager = PanelManager(hass, entry, asyncio.Lock())
+
+        repair = hass.async_create_task(manager.async_repair(trigger="auto"))
+        # Deterministically wait until the repair is wedged inside connect() (gated)
+        # — at which point _repairing is already True and it holds the ssh_lock.
+        await shell.connect_entered.wait()
+        assert manager._repairing is True
+
+        # Entry torn down mid-repair.
+        await manager.async_shutdown()
+        assert manager._shutting_down is True
+
+        # Let the wedged repair resume and run to completion.
+        gate.set()
+        await repair
+
+    # The resumed repair must NOT have scheduled a recovery timer on the dead entry.
+    assert manager._recovery_cancel is None
+    assert manager._grace_cancel is None
