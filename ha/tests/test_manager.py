@@ -498,6 +498,90 @@ async def test_update_during_repair_recovery_window_leaks_no_timer(
     assert manager._recovery_cancel is None
 
 
+async def test_repair_cancels_pending_grace_timer(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """A button/service repair while a grace timer is pending must cancel that timer.
+
+    Otherwise the grace timer later fires _grace_expired → within-cooldown (the repair
+    set _last_repair_mono) → a SPURIOUS needs_attention during the very recovery window
+    the repair opened. We assert the grace TimerHandle is genuinely cancelled (not just
+    overtaken) so it cannot fire, distinct from the repair's own recovery timer.
+
+    Built directly (no mqtt_mock) so the offline LWT goes straight to _on_availability
+    and the only timers in flight are the manager's; NOT allow_lingering_timers — the
+    strict guard proves we leak nothing once the recovery timer is cancelled at shutdown.
+    """
+    import asyncio
+
+    from homeassistant.components.mqtt.models import ReceiveMessage
+
+    from custom_components.brilliant_mqtt.manager import PanelManager
+
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+
+    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=FakeShell()):
+        manager = PanelManager(hass, entry, asyncio.Lock())
+
+        offline = ReceiveMessage(
+            topic="brilliant/office/availability",
+            payload="offline",
+            qos=0,
+            retain=True,
+            subscribed_topic="brilliant/office/availability",
+            timestamp=dt_util.utcnow().timestamp(),
+        )
+        await manager._on_availability(offline)
+        assert manager._grace_cancel is not None  # grace armed by the offline LWT
+        pending_grace = manager._grace_cancel
+        assert _timer_cancelled(pending_grace) is False
+
+        # A manual repair starts: it must cancel the pending grace timer so it can never
+        # fire the within-cooldown spurious escalation.
+        await manager.async_repair(trigger="button")
+        assert manager._grace_cancel is None
+        assert _timer_cancelled(pending_grace) is True  # killed, not orphaned/overtaken
+        # The repair armed its own recovery timer (success path) — a different timer.
+        assert manager._recovery_cancel is not None
+
+    await manager.async_shutdown()
+    assert manager._recovery_cancel is None  # strict guard: nothing lingers
+
+
+async def test_on_availability_ignored_after_shutdown(hass: HomeAssistant) -> None:
+    """Defense-in-depth: an offline LWT arriving after async_shutdown arms no grace timer.
+
+    Constructed directly like the other shutdown-race tests; under the strict timer
+    guard a leaked grace timer would fail the test. No mqtt_mock so the only possible
+    timer is the manager's.
+    """
+    import asyncio
+
+    from homeassistant.components.mqtt.models import ReceiveMessage
+
+    from custom_components.brilliant_mqtt.manager import PanelManager
+
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    manager = PanelManager(hass, entry, asyncio.Lock())
+
+    await manager.async_shutdown()
+    assert manager._shutting_down is True
+
+    offline = ReceiveMessage(
+        topic="brilliant/office/availability",
+        payload="offline",
+        qos=0,
+        retain=True,
+        subscribed_topic="brilliant/office/availability",
+        timestamp=dt_util.utcnow().timestamp(),
+    )
+    await manager._on_availability(offline)
+    assert manager._grace_cancel is None  # no timer armed post-shutdown
+
+
 async def test_shutdown_during_inflight_repair_connect_fail_leaks_no_timer(
     hass: HomeAssistant,
 ) -> None:

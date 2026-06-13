@@ -61,9 +61,17 @@ def _has_control_char(value: str) -> bool:
     return any(ord(c) < 32 for c in value)
 
 
-async def _validate_ssh(hass: HomeAssistant, host: str, password: str) -> str:
-    """One TOFU connect; returns the captured host public key. Raises on failure."""
-    shell = AsyncsshShell(host, password)
+async def _validate_ssh(
+    hass: HomeAssistant, host: str, password: str, pinned_key: str | None = None
+) -> str:
+    """One SSH connect; returns the captured/verified host public key. Raises on failure.
+
+    With `pinned_key=None` this is a trust-on-first-use connect (new endpoint). With
+    `pinned_key` set, asyncssh verifies the server host key BEFORE auth, so the root
+    password is never offered to a host whose key no longer matches the pin (a mismatch
+    raises asyncssh.HostKeyNotVerifiable instead of authenticating).
+    """
+    shell = AsyncsshShell(host, password, pinned_key)
     try:
         await shell.connect()
     finally:
@@ -159,10 +167,24 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
                 if _has_control_char(user_input[key]):
                     errors[key] = "invalid_value"
             if not errors:
+                # Same host → verify the rotated password against the STORED pin
+                # (key checked before auth, so the password is never offered to a
+                # changed/impostor host). Different host → a new endpoint/hardware,
+                # so fresh TOFU like adding a panel.
+                host_unchanged = user_input[CONF_HOST] == entry.data[CONF_HOST]
+                pinned_key = entry.data.get(DATA_SSH_HOST_KEY) if host_unchanged else None
                 try:
                     host_key = await _validate_ssh(
-                        self.hass, user_input[CONF_HOST], user_input[CONF_ROOT_PASSWORD]
+                        self.hass,
+                        user_input[CONF_HOST],
+                        user_input[CONF_ROOT_PASSWORD],
+                        pinned_key=pinned_key,
                     )
+                except asyncssh.HostKeyNotVerifiable:
+                    # Same known-good host but its key no longer matches the pin: a
+                    # reflash — or a MITM. Surface it; never silently re-pin (that is
+                    # the TOFU bypass). The stored pin and password are left untouched.
+                    errors["base"] = "host_key_changed"
                 except (OSError, asyncssh.Error):
                     errors["base"] = "cannot_connect"
                 else:

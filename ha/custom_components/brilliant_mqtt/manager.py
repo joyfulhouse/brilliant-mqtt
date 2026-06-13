@@ -155,6 +155,8 @@ class PanelManager:
             setattr(self, attr, None)
 
     async def _on_availability(self, msg: ReceiveMessage) -> None:
+        if self._shutting_down:
+            return  # defense-in-depth: never arm a timer on a torn-down entry
         payload = str(msg.payload)
         self.availability = payload
         if payload == AVAILABILITY_ONLINE:
@@ -226,6 +228,10 @@ class PanelManager:
         if self._repairing:
             return
         self._repairing = True
+        # A grace timer may be pending (armed by _on_availability on offline). Cancel it
+        # so it can't later fire _grace_expired → within-cooldown → a spurious
+        # needs_attention during the recovery window this repair opens.
+        self._cancel("_grace_cancel")
         self._fire(EVENT_REPAIR_STARTED, {"trigger": trigger})
         try:
             async with self._ssh_lock:
@@ -292,6 +298,9 @@ class PanelManager:
         if self._repairing:
             raise HomeAssistantError("a repair or update is already in progress")
         self._repairing = True
+        # Cancel any pending grace timer (as async_repair does) so an outage that armed
+        # it can't fire a spurious needs_attention during this update's recovery window.
+        self._cancel("_grace_cancel")
         try:
             version = (
                 await self.hass.async_add_executor_job((_payload_dir() / "VERSION").read_text)
@@ -372,6 +381,8 @@ class PanelManager:
         )
 
     async def _on_meta(self, msg: ReceiveMessage) -> None:
+        if self._shutting_down:
+            return  # defense-in-depth: don't spawn a staged-copy task on a dead entry
         try:
             meta = json.loads(str(msg.payload))
         except ValueError:

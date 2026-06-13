@@ -65,10 +65,13 @@ On submit the integration makes **one** SSH connection to validate the host and
 an unpinned/impostor host on later connects.
 
 To rotate a panel's host or root password later, use **Reconfigure** on the
-entry (the slug is immutable); this re-validates over SSH and **re-pins the host
-key** — capturing a fresh key from the new host, replacing the old TOFU pin — so
-pointing the entry at a different host is safe. Behavior knobs are under
-**Configure** (Options).
+entry (the slug is immutable); this re-validates over SSH. If the **host is
+unchanged**, it verifies the new password against the **stored** host key (key
+checked before auth — a mismatch is rejected with `host_key_changed`, never a
+silent re-pin), so rotating a password can't be used to accept a swapped key. If
+the **host changes**, it does a fresh trust-on-first-use connect and **re-pins**
+to the new host's key, so pointing the entry at different hardware is safe.
+Behavior knobs are under **Configure** (Options).
 
 ## Entities
 
@@ -196,6 +199,12 @@ deployed via the update entity / `redeploy`), not a repair.
 - **TOFU host-key pinning.** The first successful connect captures and pins the
   panel's SSH host key; every later connect verifies it **before** authenticating,
   so the root password is never offered to an impostor host.
+  - **OTA host-key rotation caveat.** Because `async_repair` (and Reconfigure on the
+    same host) connects using that pin, a firmware OTA that regenerates the panel's
+    SSH host key would make repair connects fail host-key verification — surfacing as
+    `repair_failed: unreachable` exactly when a repair is needed. Operators should
+    verify on the pilot whether the OSTree OTA rotates `/etc/ssh` host keys; if it
+    does, re-pin via remove + re-add (a future enhancement may add re-pin-on-mismatch).
 - **Single auth attempt.** SSH is password-only with `client_keys=None`,
   `preferred_auth=("password",)`, and keyboard-interactive disabled — exactly one
   credentialed attempt per connect, so a wrong password can't burn through a
