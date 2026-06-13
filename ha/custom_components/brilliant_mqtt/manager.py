@@ -43,6 +43,7 @@ from .const import (
     DEFAULT_AUTO_REPAIR,
     DEFAULT_OFFLINE_GRACE_MINUTES,
     DEFAULT_REPAIR_COOLDOWN_MINUTES,
+    EVENT_AGENT_UPDATED,
     EVENT_NEEDS_ATTENTION,
     EVENT_PANEL_UPDATED,
     EVENT_REPAIR_FAILED,
@@ -269,6 +270,37 @@ class PanelManager:
             )
         finally:
             self._repairing = False
+
+    async def async_update_agent(self) -> None:
+        """Push the bundled agent payload, refresh configs, restart, verify via LWT.
+
+        Mirrors async_repair's hardening: a failed SSH step escalates (problem +
+        notification) instead of escaping silently, and the recovery timer is only
+        armed when the work succeeded AND we are not shutting down — checked with no
+        await before the schedule so async_shutdown's cancel can't be raced.
+        """
+        version = (
+            await self.hass.async_add_executor_job((_payload_dir() / "VERSION").read_text)
+        ).strip()
+        async with self._ssh_lock:
+            shell = self._shell()
+            try:
+                await shell.connect()
+                await panel_ops.deploy_payload(shell, str(_payload_dir()), version)
+                unit, env = await self._config_contents()
+                await panel_ops.ensure_configs(shell, unit, env)
+                await panel_ops.restart(shell)
+            except (OSError, asyncssh.Error, PanelOpError) as err:
+                self._escalate(f"agent update failed: {err}")
+                return
+            finally:
+                await shell.close()
+        self._fire(EVENT_AGENT_UPDATED, {"version": version})
+        if self._shutting_down:
+            return  # entry torn down mid-update: do not re-arm a timer
+        self._recovery_cancel = async_call_later(
+            self.hass, _RECOVERY_SECONDS, self._recovery_timeout
+        )
 
     async def _recovery_timeout(self, _now: datetime) -> None:
         self._recovery_cancel = None
