@@ -1273,14 +1273,14 @@ class TestM11MeshEndToEnd:
 # ---------------------------------------------------------------------------
 
 
-def _hardware_device() -> BrilliantDevice:
+def _hardware_device(tag: str = "v26.05.20.2") -> BrilliantDevice:
     return BrilliantDevice(
         device_id="device_hw",
         peripheral_id="hardware_peripheral_0",
         name="Hardware",
         kind=DeviceKind.HARDWARE,
         variables={
-            "current_release_tag": Variable("current_release_tag", "v26.05.20.2"),
+            "current_release_tag": Variable("current_release_tag", tag),
         },
     )
 
@@ -1315,3 +1315,32 @@ async def test_mesh_bridge_publishes_no_meta(dimmer: BrilliantDevice) -> None:
     await Bridge(bus, mqtt, "mesh").reconcile()
 
     assert not any(t == "brilliant/mesh/bridge" for (t, _p, _r) in mqtt.published)
+
+
+async def test_reconcile_republishes_meta_on_firmware_change(dimmer: BrilliantDevice) -> None:
+    """The contract the companion integration exists for: reconcile re-reads the
+    firmware tag every pass, so an OTA between reconciles updates the meta."""
+    bus = FakeBus([dimmer, _hardware_device()])
+    mqtt = FakeMqtt()
+    bridge = Bridge(bus, mqtt, PANEL)
+    await bridge.reconcile()
+
+    bus.set_devices([dimmer, _hardware_device(tag="v26.07.01.1")])
+    await bridge.reconcile()
+
+    meta = [p for (t, p, _r) in mqtt.published if t == f"brilliant/{PANEL}/bridge"]
+    assert len(meta) == 2
+    assert json.loads(meta[-1]) == {
+        "agent_version": __version__,
+        "panel_firmware": "v26.07.01.1",
+    }
+
+
+async def test_reconcile_meta_published_with_zero_devices() -> None:
+    """agent_version is always present, even when the bus enumerates nothing."""
+    bus = FakeBus([])
+    mqtt = FakeMqtt()
+    await Bridge(bus, mqtt, PANEL).reconcile()
+
+    payload = next(p for (t, p, _r) in mqtt.published if t == f"brilliant/{PANEL}/bridge")
+    assert json.loads(payload) == {"agent_version": __version__}
