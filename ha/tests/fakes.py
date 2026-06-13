@@ -35,12 +35,21 @@ class FakeShell:
     async def close(self) -> None:
         self.connected = False
 
+    def _require_connected(self) -> None:
+        # Mirrors AsyncsshShell's contract so consumer tests can't pass with
+        # a connect-ordering bug.
+        if not self.connected:
+            raise RuntimeError("not connected — call connect() first")
+
     async def run(self, command: str) -> RunResult:
+        self._require_connected()
         self.commands.append(command)
         return self.responses.get(command, _OK)
 
     async def put_bytes(self, data: bytes, remote_path: str, mode: int) -> None:
+        self._require_connected()
         self.uploads.append((remote_path, data, mode))
 
     async def put_dir(self, local_dir: str, remote_dir: str) -> None:
+        self._require_connected()
         self.dir_uploads.append((local_dir, remote_dir))

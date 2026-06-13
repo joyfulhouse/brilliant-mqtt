@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 import asyncssh
+from asyncssh import SFTPAttrs
 
 _CONNECT_TIMEOUT = 15
 _LOGIN_TIMEOUT = 15
@@ -57,26 +58,43 @@ class AsyncsshShell:
         return self._pinned
 
     async def connect(self) -> None:
+        if self._conn is not None:
+            # The manager constructs a fresh shell per operation; a second
+            # connect() here is a bug and would leak the prior connection.
+            raise RuntimeError("already connected")
         known_hosts: asyncssh.SSHKnownHosts | None = (
             asyncssh.import_known_hosts(known_hosts_line(self._host, self._pinned))
             if self._pinned is not None
             else None  # first contact: trust-on-first-use, key captured below
         )
-        self._conn = await asyncssh.connect(
+        # asyncssh's defaults allow the password-over-keyboard-interactive
+        # fallback, so one connect() could burn TWO credentialed attempts
+        # against panels that lock out — preferred_auth restricts auth to
+        # exactly one method; kbdint_auth=False is the explicit belt-and-braces.
+        conn = await asyncssh.connect(
             self._host,
             username="root",
             password=self._password,
             known_hosts=known_hosts,
             client_keys=None,  # password only — never offer keys (panel lockout caution)
+            preferred_auth=("password",),
+            kbdint_auth=False,
             connect_timeout=_CONNECT_TIMEOUT,
             login_timeout=_LOGIN_TIMEOUT,
         )
         if self._pinned is None:
-            key = self._conn.get_server_host_key()
-            if key is not None:
-                # export_public_key() returns e.g. b"ssh-ed25519 AAAA...\n"
-                # Strip trailing whitespace to get a clean single-line token.
-                self._pinned = key.export_public_key().decode().strip()
+            key = conn.get_server_host_key()
+            if key is None:
+                # Fail closed: an unpinned shell must never stay usable, or
+                # every future connect would offer the password unverified.
+                # Close first so the connection isn't leaked.
+                conn.close()
+                await conn.wait_closed()
+                raise RuntimeError(f"no server host key captured for {self._host}; refusing to pin")
+            # export_public_key() returns e.g. b"ssh-ed25519 AAAA...\n"
+            # Strip trailing whitespace to get a clean single-line token.
+            self._pinned = key.export_public_key().decode().strip()
+        self._conn = conn
 
     async def close(self) -> None:
         if self._conn is not None:
@@ -84,9 +102,15 @@ class AsyncsshShell:
             await self._conn.wait_closed()
             self._conn = None
 
+    def _require_conn(self) -> asyncssh.SSHClientConnection:
+        # Intentional contract, not a debug check — must hold under -O too.
+        if self._conn is None:
+            raise RuntimeError("not connected — call connect() first")
+        return self._conn
+
     async def run(self, command: str) -> RunResult:
-        assert self._conn is not None, "connect() first"
-        result = await self._conn.run(command, check=False)
+        conn = self._require_conn()
+        result = await conn.run(command, check=False)
         return RunResult(
             exit_status=result.exit_status or 0,
             stdout=str(result.stdout or ""),
@@ -94,14 +118,16 @@ class AsyncsshShell:
         )
 
     async def put_bytes(self, data: bytes, remote_path: str, mode: int) -> None:
-        assert self._conn is not None, "connect() first"
+        conn = self._require_conn()
         # asyncssh.SFTPClient is itself an async context manager (not start_sftp_client)
-        async with await self._conn.start_sftp_client() as sftp:
-            async with await sftp.open(remote_path, "wb") as f:
+        async with await conn.start_sftp_client() as sftp:
+            # Create the file WITH the target permissions (it may carry the
+            # broker password) — never write-then-chmod, which would leave a
+            # window where the secret sits with default-umask permissions.
+            async with await sftp.open(remote_path, "wb", attrs=SFTPAttrs(permissions=mode)) as f:
                 await f.write(data)
-            await sftp.chmod(remote_path, mode)
 
     async def put_dir(self, local_dir: str, remote_dir: str) -> None:
-        assert self._conn is not None, "connect() first"
-        async with await self._conn.start_sftp_client() as sftp:
+        conn = self._require_conn()
+        async with await conn.start_sftp_client() as sftp:
             await sftp.put(local_dir, remote_dir, recurse=True)
