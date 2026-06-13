@@ -18,6 +18,9 @@ from custom_components.brilliant_mqtt.const import (
     CONF_ROOT_PASSWORD,
     DATA_SSH_HOST_KEY,
     DOMAIN,
+    OPT_AUTO_REPAIR,
+    OPT_OFFLINE_GRACE_MINUTES,
+    OPT_REPAIR_COOLDOWN_MINUTES,
 )
 
 USER_INPUT = {
@@ -114,3 +117,28 @@ async def test_reconfigure_rejects_control_character(hass: HomeAssistant) -> Non
         )
     assert result["type"] == "form"
     assert result["errors"] == {CONF_ROOT_PASSWORD: "invalid_value"}
+
+
+async def test_options_flow_saves_behavior_knobs(hass: HomeAssistant) -> None:
+    """The options flow is registered and persists the manager's behavior knobs."""
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data={CONF_PANEL: "office"})
+    entry.add_to_hass(hass)
+
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    assert result["type"] == "form"
+    assert result["step_id"] == "init"
+
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        {
+            OPT_AUTO_REPAIR: False,
+            OPT_OFFLINE_GRACE_MINUTES: 5,
+            OPT_REPAIR_COOLDOWN_MINUTES: 30,
+        },
+    )
+    assert result["type"] == "create_entry"
+    assert entry.options == {
+        OPT_AUTO_REPAIR: False,
+        OPT_OFFLINE_GRACE_MINUTES: 5,
+        OPT_REPAIR_COOLDOWN_MINUTES: 30,
+    }

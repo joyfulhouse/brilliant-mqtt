@@ -62,3 +62,12 @@ SERVICE_NAME = "brilliant-mqtt"
 
 EVENT_TYPE = "brilliant_mqtt_event"
 SIGNAL_PANEL_STATE = f"{DOMAIN}_panel_state"  # dispatcher: f"{SIGNAL_PANEL_STATE}_{entry_id}"
+
+# `brilliant_mqtt_event` subtypes (the event's data["type"]) — the public automation
+# contract documented in docs/ha-integration.md.
+EVENT_PANEL_UPDATED = "panel_updated"
+EVENT_REPAIR_STARTED = "repair_started"
+EVENT_REPAIR_SUCCEEDED = "repair_succeeded"
+EVENT_REPAIR_FAILED = "repair_failed"
+EVENT_NEEDS_ATTENTION = "needs_attention"
+EVENT_AGENT_UPDATED = "agent_updated"
