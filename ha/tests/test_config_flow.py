@@ -181,6 +181,35 @@ async def test_reconfigure_same_host_key_mismatch_shows_error_and_keeps_pin(
     assert entry.data[CONF_ROOT_PASSWORD] == "oldpass"
 
 
+async def test_reconfigure_same_host_missing_pin_fails_closed(hass: HomeAssistant) -> None:
+    """Defense-in-depth: same host with NO stored pin must NOT fall back to an unpinned
+    connect (which would re-open the bypass). It fails closed with host_key_changed and
+    never offers the password — _validate_ssh is not called at all."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="office",
+        data={
+            CONF_PANEL: "office",
+            CONF_HOST: "192.168.1.10",
+            CONF_ROOT_PASSWORD: "oldpass",
+            # No DATA_SSH_HOST_KEY — models a future schema where the pin is absent.
+        },
+    )
+    entry.add_to_hass(hass)
+    result = await entry.start_reconfigure_flow(hass)
+
+    with patch(VALIDATE, return_value="ssh-ed25519 NEW") as validate:
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {CONF_HOST: "192.168.1.10", CONF_ROOT_PASSWORD: "newpass"},
+        )
+
+    assert result["type"] == "form"
+    assert result["errors"] == {"base": "host_key_changed"}
+    validate.assert_not_called()  # no connect, pinned or unpinned → password not sent
+    assert entry.data[CONF_ROOT_PASSWORD] == "oldpass"  # nothing written
+
+
 async def test_reconfigure_different_host_does_fresh_tofu(hass: HomeAssistant) -> None:
     """A changed host is a new endpoint → _validate_ssh is called with pinned_key=None
     (fresh TOFU) and the entry re-pins to the new host's key."""
