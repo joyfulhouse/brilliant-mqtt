@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.service import async_extract_config_entry_ids
 from homeassistant.helpers.typing import ConfigType
 
@@ -44,17 +46,36 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
                 managers.append(entry.runtime_data)
         return managers
 
+    async def _apply_to_all(
+        call: ServiceCall, op: Callable[[PanelManager], Awaitable[None]]
+    ) -> None:
+        """Run op against every targeted panel, then raise ONE aggregated error.
+
+        async_update_agent/async_uninstall raise HomeAssistantError per panel; a bare
+        loop would abort on the first failure and silently skip the remaining targets
+        (a fleet footgun). Each panel is already escalated individually by the manager,
+        so state stays coherent — here we just make sure every target is attempted and
+        surface a single error naming all that failed.
+        """
+        failures: list[str] = []
+        for manager in await _managers_for(call):
+            try:
+                await op(manager)
+            except HomeAssistantError as err:
+                failures.append(f"{manager.panel}: {err}")
+        if failures:
+            raise HomeAssistantError("; ".join(failures))
+
     async def _repair(call: ServiceCall) -> None:
+        # async_repair swallows failures and escalates, so a plain loop is correct.
         for manager in await _managers_for(call):
             await manager.async_repair(trigger="service")
 
     async def _redeploy(call: ServiceCall) -> None:
-        for manager in await _managers_for(call):
-            await manager.async_update_agent()
+        await _apply_to_all(call, lambda m: m.async_update_agent())
 
     async def _uninstall(call: ServiceCall) -> None:
-        for manager in await _managers_for(call):
-            await manager.async_uninstall()
+        await _apply_to_all(call, lambda m: m.async_uninstall())
 
     hass.services.async_register(DOMAIN, "repair", _repair, schema=_SERVICE_SCHEMA)
     hass.services.async_register(DOMAIN, "redeploy", _redeploy, schema=_SERVICE_SCHEMA)
