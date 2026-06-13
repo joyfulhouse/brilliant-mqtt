@@ -25,10 +25,11 @@ from .const import (
 )
 from .shell import AsyncsshShell
 
-# Entry-data keys whose values pre-fill the NEXT add-panel form (fleets commonly
-# share broker creds and often the root password); host/slug are always blank.
+# Entry-data keys whose values pre-fill the NEXT add-panel form. Only the broker
+# creds are genuinely fleet-shared; the root password is deliberately excluded —
+# the operator runs per-controller root passwords, so reusing one by accident is
+# both the likeliest mistake and the costliest. Host/slug are always blank too.
 _PREFILL_KEYS = (
-    CONF_ROOT_PASSWORD,
     CONF_MQTT_HOST,
     CONF_MQTT_PORT,
     CONF_MQTT_USERNAME,
@@ -143,17 +144,21 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
         entry = self._get_reconfigure_entry()
         errors: dict[str, str] = {}
         if user_input is not None:
-            try:
-                host_key = await _validate_ssh(
-                    self.hass, user_input[CONF_HOST], user_input[CONF_ROOT_PASSWORD]
-                )
-            except (OSError, asyncssh.Error):
-                errors["base"] = "cannot_connect"
-            else:
-                return self.async_update_reload_and_abort(
-                    entry,
-                    data={**entry.data, **user_input, DATA_SSH_HOST_KEY: host_key},
-                )
+            for key in (CONF_HOST, CONF_ROOT_PASSWORD):
+                if _has_control_char(user_input[key]):
+                    errors[key] = "invalid_value"
+            if not errors:
+                try:
+                    host_key = await _validate_ssh(
+                        self.hass, user_input[CONF_HOST], user_input[CONF_ROOT_PASSWORD]
+                    )
+                except (OSError, asyncssh.Error):
+                    errors["base"] = "cannot_connect"
+                else:
+                    return self.async_update_reload_and_abort(
+                        entry,
+                        data={**entry.data, **user_input, DATA_SSH_HOST_KEY: host_key},
+                    )
         schema = vol.Schema(
             {
                 vol.Required(CONF_HOST, default=entry.data[CONF_HOST]): str,

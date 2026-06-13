@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 from homeassistant.core import HomeAssistant
 from homeassistant.loader import async_get_integration
 from pytest_homeassistant_custom_component.common import MockConfigEntry
@@ -43,6 +44,7 @@ ENTRY_DATA = {
 }
 
 
+@pytest.mark.allow_lingering_timers
 async def test_entry_sets_up_and_tracks_availability(
     hass: HomeAssistant, mqtt_mock: MqttMockHAClient
 ) -> None:
@@ -67,5 +69,25 @@ async def test_entry_sets_up_and_tracks_availability(
     )
     await hass.async_block_till_done()
     assert manager.meta == {"agent_version": "0.2.0", "panel_firmware": "v26.05.20.2"}
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_non_object_meta_is_ignored(hass: HomeAssistant, mqtt_mock: MqttMockHAClient) -> None:
+    """Valid JSON that isn't an object must not be stored (Task 9 entities do .get())."""
+    from pytest_homeassistant_custom_component.common import async_fire_mqtt_message
+
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    manager = entry.runtime_data
+    assert manager.meta is None
+
+    async_fire_mqtt_message(hass, "brilliant/office/bridge", "42")
+    await hass.async_block_till_done()
+    assert manager.meta is None  # non-object payload left meta unchanged
 
     assert await hass.config_entries.async_unload(entry.entry_id)
