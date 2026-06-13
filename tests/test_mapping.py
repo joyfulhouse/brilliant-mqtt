@@ -884,3 +884,20 @@ def test_hardware_without_release_tag_has_no_firmware_entries() -> None:
         d.unique_id.endswith("_current_release_tag") for d in entities_for(bare, "office")
     )
     assert "current_release_tag" not in payload_fields(bare)
+
+
+def test_hardware_blank_release_tag_has_no_firmware_entries() -> None:
+    """A blank tag means "unknown" — matches _sw_version_from's gate on the same var."""
+    blank = BrilliantDevice(
+        device_id="dev-hw3",
+        peripheral_id="hardware_peripheral_2",
+        name="Hardware",
+        kind=DeviceKind.HARDWARE,
+        variables={
+            "current_release_tag": Variable(name="current_release_tag", value=""),
+        },
+    )
+    assert not any(
+        d.unique_id.endswith("_current_release_tag") for d in entities_for(blank, "office")
+    )
+    assert "current_release_tag" not in payload_fields(blank)
