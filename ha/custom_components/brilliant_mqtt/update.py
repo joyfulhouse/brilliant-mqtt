@@ -8,9 +8,8 @@ from homeassistant.components.update import UpdateEntity, UpdateEntityFeature
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from . import BrilliantMqttConfigEntry
+from . import BrilliantMqttConfigEntry, manager
 from .entity import BrilliantPanelEntity
-from .manager import _payload_dir
 
 
 async def async_setup_entry(
@@ -18,8 +17,11 @@ async def async_setup_entry(
     entry: BrilliantMqttConfigEntry,
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
+    # Late binding: resolve manager._payload_dir at call time so a test (or a future
+    # caller) that patches it on the manager module is honored — a module-level
+    # `from .manager import _payload_dir` would freeze the original in this namespace.
     latest = await hass.async_add_executor_job(
-        lambda: (_payload_dir() / "VERSION").read_text().strip()
+        lambda: (manager._payload_dir() / "VERSION").read_text().strip()
     )
     async_add_entities([AgentUpdate(entry, latest)])
 
