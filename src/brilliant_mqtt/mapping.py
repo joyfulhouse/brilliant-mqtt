@@ -95,12 +95,74 @@ _LOAD_AUX: tuple[AuxSpec, ...] = (
 )
 
 
+# Integrated motion-sensing subsystem present on every mesh load peripheral
+# (LIGHT/SWITCH/ALWAYS_ON on the virtual ble_mesh device).
+# Live-verified on office.iot, 2026-06-13 via get_device("ble_mesh") — all 20
+# load peripherals (11 LIGHT, 1 GENERIC_ON_OFF→SWITCH, 8 ALWAYS_ON) carry
+# these five variables. Panel loads lack them, so these specs auto-no-op there.
+# Note: variable names differ from the faceplate's PIR variables
+# (e.g. "motion_score" vs "pir_motion_score") — only "movement_detected" is
+# shared. No lux/illuminance variable exists on mesh loads.
+_MOTION_AUX: tuple[AuxSpec, ...] = (
+    AuxSpec(
+        var="movement_detected",
+        component="binary_sensor",
+        name="Motion",
+        value_kind="bool",
+        payload_key="motion",
+        device_class="motion",
+    ),
+    AuxSpec(
+        var="motion_score",
+        component="sensor",
+        name="Motion Score",
+        value_kind="int",
+        state_class="measurement",
+        entity_category="diagnostic",
+        enabled_by_default=False,
+    ),
+    AuxSpec(
+        var="enable_motion_score",
+        component="switch",
+        name="Motion Score Reporting",
+        value_kind="bool",
+        entity_category="config",
+        enabled_by_default=False,
+    ),
+    # 0–100 range is ASSUMED (bus did not document valid bounds; observed
+    # values 70 high / 20 low on 2026-06-13 live probe). Revisit if firmware
+    # documents an explicit range.
+    AuxSpec(
+        var="motion_high_threshold",
+        component="number",
+        name="Motion High Threshold",
+        value_kind="int",
+        entity_category="config",
+        min_value=0,
+        max_value=100,
+        step=1,
+        enabled_by_default=False,
+    ),
+    AuxSpec(
+        var="motion_low_threshold",
+        component="number",
+        name="Motion Low Threshold",
+        value_kind="int",
+        entity_category="config",
+        min_value=0,
+        max_value=100,
+        step=1,
+        enabled_by_default=False,
+    ),
+)
+
+
 # The variable-entity table. Keyed by DeviceKind; each entry is the tuple of
 # auxiliary entities that kind contributes (in addition to any primary entity).
 AUX_SPECS: dict[DeviceKind, tuple[AuxSpec, ...]] = {
-    DeviceKind.LIGHT: _LOAD_AUX,
-    DeviceKind.SWITCH: _LOAD_AUX,
-    DeviceKind.ALWAYS_ON: _LOAD_AUX,
+    DeviceKind.LIGHT: _LOAD_AUX + _MOTION_AUX,
+    DeviceKind.SWITCH: _LOAD_AUX + _MOTION_AUX,
+    DeviceKind.ALWAYS_ON: _LOAD_AUX + _MOTION_AUX,
     DeviceKind.BINARY_SENSOR: (
         AuxSpec(
             var="led_on",
