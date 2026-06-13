@@ -120,9 +120,10 @@ carries `panel`, `entry_id`, and a `type`; the table lists the per-type extras:
 | `panel_updated` | Panel **firmware** changed (seen on the bridge-meta topic). | `old_firmware`, `new_firmware` |
 | `repair_started` | A repair began. | `trigger` (`auto` / `button` / `service`) |
 | `repair_succeeded` | The bridge came back online after a repair. | — |
-| `repair_failed` | A repair could not complete or the bridge stayed offline. | `reason` (`unreachable` / `repair_step_failed` / `still_offline`), plus `error` or `journal` |
+| `repair_failed` | A repair could not complete or the bridge stayed offline. | `reason` (`unreachable` / `host_key_changed` / `repair_step_failed` / `still_offline`), plus `error` or `journal` |
 | `needs_attention` | The panel needs a human (escalation). | `reason` |
 | `agent_updated` | The agent was updated to a new version. | `version` |
+| `host_key_repinned` | A panel's SSH host key changed and was **auto-trusted** during repair/update (only when **Trust host-key changes** is on). | `new_host_key` |
 
 Example — notify on anything that needs a human, and on repair outcomes:
 
@@ -167,6 +168,7 @@ no reload is needed:
 | **Auto-repair** (`auto_repair`) | `true` | When on, an outage past the grace period triggers an automatic repair. When off, an outage only notifies. |
 | **Offline grace minutes** (`offline_grace_minutes`) | `10` | How long a panel may stay `offline` before repair/escalation kicks in. |
 | **Repair cooldown minutes** (`repair_cooldown_minutes`) | `60` | Minimum gap between automatic repairs, so a flapping panel is not repaired in a tight loop. (The manual repair button bypasses this.) |
+| **Trust host-key changes** (`trust_host_key_changes`) | `false` | When **off** (default), a panel whose SSH host key changed (e.g. a key-rotating firmware OTA) fails the pinned connect and surfaces as `repair_failed: host_key_changed` with guidance to **Reconfigure** to re-pin — the root password is never offered to the new-key host. When **on**, repair/update **auto-re-pins** the changed key on the same-host panel so a key-rotating OTA recovers hands-off; this **does** offer the root password to whatever host answers at the panel's address and fires an auditable `host_key_repinned` event, so only enable it on a trusted/isolated network. |
 
 ## The OTA repair state machine
 
@@ -199,12 +201,22 @@ deployed via the update entity / `redeploy`), not a repair.
 - **TOFU host-key pinning.** The first successful connect captures and pins the
   panel's SSH host key; every later connect verifies it **before** authenticating,
   so the root password is never offered to an impostor host.
-  - **OTA host-key rotation caveat.** Because `async_repair` (and Reconfigure on the
-    same host) connects using that pin, a firmware OTA that regenerates the panel's
-    SSH host key would make repair connects fail host-key verification — surfacing as
-    `repair_failed: unreachable` exactly when a repair is needed. Operators should
-    verify on the pilot whether the OSTree OTA rotates `/etc/ssh` host keys; if it
-    does, re-pin via remove + re-add (a future enhancement may add re-pin-on-mismatch).
+  - **OTA host-key rotation.** Because `async_repair` / `async_update_agent` (and
+    Reconfigure on the same host) connect using that pin, a firmware OTA that
+    regenerates the panel's `/etc/ssh` host keys makes those connects fail host-key
+    verification — exactly when a repair is needed. The integration handles this in
+    two modes:
+    - **Default — detect + guide.** A changed key is distinguished from a dead panel
+      and surfaces as `repair_failed: host_key_changed` + a `needs_attention`
+      escalation telling you to **Reconfigure** to re-pin. The root password is
+      **never** offered to the new-key host, and the key is never silently re-pinned.
+    - **Opt-in — hands-off auto-re-pin.** Turn on **Trust host-key changes** in
+      Options to let repair/update auto-trust and re-pin a changed key on the
+      already-adopted same-host panel, so a key-rotating OTA recovers without a visit.
+      This **does** offer the root password to whatever host answers at the panel's
+      address (the documented tradeoff) and fires an auditable `host_key_repinned`
+      event (`new_host_key`) — only enable it on a trusted/isolated network such as a
+      firewalled IoT VLAN.
 - **Single auth attempt.** SSH is password-only with `client_keys=None`,
   `preferred_auth=("password",)`, and keyboard-interactive disabled — exactly one
   credentialed attempt per connect, so a wrong password can't burn through a

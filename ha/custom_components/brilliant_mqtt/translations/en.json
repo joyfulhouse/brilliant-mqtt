@@ -40,7 +40,11 @@
         "data": {
           "auto_repair": "Automatically repair the bridge after an outage",
           "offline_grace_minutes": "Minutes offline before acting",
-          "repair_cooldown_minutes": "Minimum minutes between automatic repairs"
+          "repair_cooldown_minutes": "Minimum minutes between automatic repairs",
+          "trust_host_key_changes": "Trust host-key changes (auto-re-pin on reflash)"
+        },
+        "data_description": {
+          "trust_host_key_changes": "When on, repair auto-trusts a changed SSH host key so a firmware update that rotates the panel's keys recovers hands-off. This offers the root password to whatever host answers at the panel's address, so only enable on a trusted/isolated network (e.g. a firewalled IoT VLAN). Each automatic re-pin fires a host_key_repinned event you can alert on. Default off: a changed key instead surfaces repair_failed (host_key_changed) and asks you to Reconfigure to re-pin."
         }
       }
     }

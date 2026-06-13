@@ -44,7 +44,9 @@ from .const import (
     DEFAULT_AUTO_REPAIR,
     DEFAULT_OFFLINE_GRACE_MINUTES,
     DEFAULT_REPAIR_COOLDOWN_MINUTES,
+    DEFAULT_TRUST_HOST_KEY_CHANGES,
     EVENT_AGENT_UPDATED,
+    EVENT_HOST_KEY_REPINNED,
     EVENT_NEEDS_ATTENTION,
     EVENT_PANEL_UPDATED,
     EVENT_REPAIR_FAILED,
@@ -54,6 +56,7 @@ from .const import (
     OPT_AUTO_REPAIR,
     OPT_OFFLINE_GRACE_MINUTES,
     OPT_REPAIR_COOLDOWN_MINUTES,
+    OPT_TRUST_HOST_KEY_CHANGES,
     SIGNAL_PANEL_STATE,
     availability_topic,
     meta_topic,
@@ -65,6 +68,10 @@ _LOGGER = logging.getLogger(__name__)
 
 _RECOVERY_SECONDS = 60.0
 _UNREACHABLE_RECHECK_SECONDS = 300.0
+
+
+class _HostKeyChanged(Exception):
+    """Pinned SSH host key no longer matches and auto-re-pin is disabled."""
 
 
 def _payload_dir() -> Path:
@@ -105,6 +112,49 @@ class PanelManager:
             self.entry.data[CONF_ROOT_PASSWORD],
             self.entry.data.get(DATA_SSH_HOST_KEY),
         )
+
+    def _shell_unpinned(self) -> PanelShell:
+        # Mirrors _shell() but with NO pinned key: this connect WILL offer the root
+        # password to whatever host answers. Used only after an explicit opt-in to
+        # re-pin a rotated host key (see _connect_for_repair).
+        return AsyncsshShell(self.entry.data[CONF_HOST], self.entry.data[CONF_ROOT_PASSWORD], None)
+
+    async def _connect_for_repair(self) -> PanelShell:
+        """Connect for a management op, honoring the host-key trust policy.
+
+        Pinned connect (verify-before-auth) normally. On a rotated host key
+        (HostKeyNotVerifiable):
+          - auto-re-pin OFF (default): raise _HostKeyChanged — the password is NEVER
+            offered to the new-key host.
+          - auto-re-pin ON: one fresh UNPINNED connect (which DOES offer the password to
+            the host presenting the new key — the opt-in tradeoff), persist the new key
+            to the entry, fire EVENT_HOST_KEY_REPINNED, return the connected shell.
+        Any other connect failure propagates unchanged to the caller's handler.
+        """
+        shell = self._shell()
+        try:
+            await shell.connect()
+        except asyncssh.HostKeyNotVerifiable:
+            # Caught BEFORE any generic asyncssh.Error (this is the only except here,
+            # so every other connect failure propagates to the caller's handler).
+            await shell.close()
+            if not self._opt(OPT_TRUST_HOST_KEY_CHANGES, DEFAULT_TRUST_HOST_KEY_CHANGES):
+                raise _HostKeyChanged from None
+            repinned = self._shell_unpinned()
+            await repinned.connect()  # unpinned: captures the new key (offers the password)
+            new_key = repinned.pinned_host_key()
+            if new_key is None:
+                await repinned.close()
+                # A fresh failure (the unpinned connect succeeded but exposed no key),
+                # not caused by the host-key mismatch — chain to None, and it reaches
+                # the caller's (OSError, asyncssh.Error) handler as "unreachable".
+                raise OSError("no host key captured on re-pin") from None
+            self.hass.config_entries.async_update_entry(
+                self.entry, data={**self.entry.data, DATA_SSH_HOST_KEY: new_key}
+            )
+            self._fire(EVENT_HOST_KEY_REPINNED, {"new_host_key": new_key})
+            return repinned
+        return shell
 
     async def async_setup(self) -> None:
         self._unsubs.append(
@@ -235,9 +285,21 @@ class PanelManager:
         self._fire(EVENT_REPAIR_STARTED, {"trigger": trigger})
         try:
             async with self._ssh_lock:
-                shell = self._shell()
                 try:
-                    await shell.connect()
+                    shell = await self._connect_for_repair()
+                except _HostKeyChanged:
+                    # A rotated host key with auto-re-pin OFF. Distinct from "unreachable":
+                    # the password was NOT offered to the new-key host, and a recheck would
+                    # just hit the same mismatch — so escalate for operator action and
+                    # arm NO timer. _escalate already sets problem.
+                    self._fire(EVENT_REPAIR_FAILED, {"reason": "host_key_changed"})
+                    self._escalate(
+                        "panel SSH host key changed (likely a firmware reflash) — open "
+                        "Reconfigure to re-pin, or enable 'Trust host-key changes' in "
+                        "options for hands-off repair"
+                    )
+                    self._last_repair_mono = time.monotonic()
+                    return  # needs operator action; a recheck would just hit the same mismatch
                 except (OSError, asyncssh.Error, PanelOpError) as err:
                     self._fire(EVENT_REPAIR_FAILED, {"reason": "unreachable"})
                     self._set_problem(True, f"panel unreachable: {err}")
@@ -306,9 +368,22 @@ class PanelManager:
                 await self.hass.async_add_executor_job((_payload_dir() / "VERSION").read_text)
             ).strip()
             async with self._ssh_lock:
-                shell = self._shell()
                 try:
-                    await shell.connect()
+                    shell = await self._connect_for_repair()
+                except _HostKeyChanged as err:
+                    # A rotated host key with auto-re-pin OFF: never offer the password to
+                    # the new-key host. Service-call context → escalate AND raise so HA
+                    # reports the install as failed (not a false success).
+                    msg = (
+                        "panel SSH host key changed — Reconfigure to re-pin, or enable "
+                        "'Trust host-key changes' in options"
+                    )
+                    self._escalate(msg)
+                    raise HomeAssistantError(msg) from err
+                except (OSError, asyncssh.Error) as err:
+                    self._escalate(f"agent update failed: {err}")
+                    raise HomeAssistantError(f"agent update failed: {err}") from err
+                try:
                     await panel_ops.deploy_payload(shell, str(_payload_dir()), version)
                     unit, env = await self._config_contents()
                     await panel_ops.ensure_configs(shell, unit, env)

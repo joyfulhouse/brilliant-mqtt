@@ -22,6 +22,7 @@ from custom_components.brilliant_mqtt.const import (
     OPT_AUTO_REPAIR,
     OPT_OFFLINE_GRACE_MINUTES,
     OPT_REPAIR_COOLDOWN_MINUTES,
+    OPT_TRUST_HOST_KEY_CHANGES,
 )
 
 USER_INPUT = {
@@ -254,6 +255,7 @@ async def test_options_flow_saves_behavior_knobs(hass: HomeAssistant) -> None:
             OPT_AUTO_REPAIR: False,
             OPT_OFFLINE_GRACE_MINUTES: 5,
             OPT_REPAIR_COOLDOWN_MINUTES: 30,
+            OPT_TRUST_HOST_KEY_CHANGES: True,
         },
     )
     assert result["type"] == "create_entry"
@@ -261,4 +263,5 @@ async def test_options_flow_saves_behavior_knobs(hass: HomeAssistant) -> None:
         OPT_AUTO_REPAIR: False,
         OPT_OFFLINE_GRACE_MINUTES: 5,
         OPT_REPAIR_COOLDOWN_MINUTES: 30,
+        OPT_TRUST_HOST_KEY_CHANGES: True,
     }
