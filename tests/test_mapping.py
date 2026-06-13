@@ -942,6 +942,21 @@ def _always_on_with_motion() -> BrilliantDevice:
     return device
 
 
+def _switch_with_motion() -> BrilliantDevice:
+    """_switch() + the five live-verified motion variables (mesh GENERIC_ON_OFF)."""
+    device = _switch()
+    device.variables.update(
+        {
+            "movement_detected": Variable("movement_detected", "0"),
+            "motion_score": Variable("motion_score", "0"),
+            "enable_motion_score": Variable("enable_motion_score", "0"),
+            "motion_high_threshold": Variable("motion_high_threshold", "70"),
+            "motion_low_threshold": Variable("motion_low_threshold", "20"),
+        }
+    )
+    return device
+
+
 # --- Motion binary_sensor descriptor ----------------------------------------
 
 
@@ -981,6 +996,11 @@ def test_mesh_motion_binary_sensor_command_var_none() -> None:
     assert d.command_var is None
 
 
+def test_mesh_motion_binary_sensor_entity_category_none() -> None:
+    by_uid = _by_uid(entities_for(_mesh_dimmer_with_motion(), "mesh"))
+    assert by_uid[f"brilliant_mesh_{MESH_PID}_movement_detected"].entity_category is None
+
+
 # --- Motion Score sensor -----------------------------------------------------
 
 
@@ -1000,6 +1020,11 @@ def test_mesh_motion_score_entity_category_diagnostic() -> None:
     by_uid = _by_uid(entities_for(_mesh_dimmer_with_motion(), "mesh"))
     d = by_uid[f"brilliant_mesh_{MESH_PID}_motion_score"]
     assert d.entity_category == "diagnostic"
+
+
+def test_mesh_motion_score_state_class_measurement() -> None:
+    by_uid = _by_uid(entities_for(_mesh_dimmer_with_motion(), "mesh"))
+    assert by_uid[f"brilliant_mesh_{MESH_PID}_motion_score"].state_class == "measurement"
 
 
 def test_mesh_motion_score_disabled_by_default() -> None:
@@ -1168,6 +1193,17 @@ def test_always_on_with_motion_motion_name_prefixed() -> None:
     by_uid = _by_uid(entities_for(_always_on_with_motion(), "office"))
     d = by_uid["brilliant_office_gangbox_peripheral_1_movement_detected"]
     assert d.name == "Backyard Lamps Motion"
+
+
+# --- SWITCH cross-kind coverage ---------------------------------------------
+
+
+def test_switch_with_motion_has_motion_binary_sensor() -> None:
+    """Motion specs apply to SWITCH loads too (mesh GENERIC_ON_OFF)."""
+    by_uid = _by_uid(entities_for(_switch_with_motion(), "office"))
+    motion_uid = "brilliant_office_gangbox_peripheral_2_movement_detected"
+    assert motion_uid in by_uid
+    assert by_uid[motion_uid].device_class == "motion"
 
 
 # --- Regression: panel loads WITHOUT motion vars are unaffected --------------
