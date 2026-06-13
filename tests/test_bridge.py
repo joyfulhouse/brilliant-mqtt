@@ -1344,3 +1344,130 @@ async def test_reconcile_meta_published_with_zero_devices() -> None:
 
     payload = next(p for (t, p, _r) in mqtt.published if t == f"brilliant/{PANEL}/bridge")
     assert json.loads(payload) == {"agent_version": __version__}
+
+
+# ===========================================================================
+# Mesh motion aux — bridge-level end-to-end command round-trips
+# ===========================================================================
+#
+# The three writable motion entities (enable_motion_score, motion_high_threshold,
+# motion_low_threshold) write to real BLE-mesh hardware via the virtual "ble_mesh"
+# bus device.  The two read-only entities (movement_detected, motion_score) must
+# NOT get command topics.  This block proves the full round-trip: HA publishes to
+# brilliant/mesh/<pid>/set_<var>  →  bus.set_variables("ble_mesh", pid, [VarSet(...)]).
+
+
+@pytest.fixture()
+def mesh_load_with_motion() -> BrilliantDevice:
+    """Mesh LIGHT on the virtual ble_mesh bus device with all five motion vars.
+
+    Variables mirror the live-verified shape from office.iot (2026-06-13):
+    on/intensity/display_name are the primary load vars; the five motion vars
+    are the new BLE-mesh motion subsystem.  No power var (sentinel gate not
+    relevant here; omitting keeps the fixture minimal).
+    """
+    return BrilliantDevice(
+        device_id="ble_mesh",
+        peripheral_id=MESH_PID,
+        name="Office Desk Lights",
+        kind=DeviceKind.LIGHT,
+        peripheral_type=27,
+        variables={
+            "on": Variable("on", "0"),
+            "intensity": Variable("intensity", "600"),
+            "display_name": Variable("display_name", "Office Desk Lights"),
+            "movement_detected": Variable("movement_detected", "1"),
+            "motion_score": Variable("motion_score", "0"),
+            "enable_motion_score": Variable("enable_motion_score", "0"),
+            "motion_high_threshold": Variable("motion_high_threshold", "70"),
+            "motion_low_threshold": Variable("motion_low_threshold", "20"),
+        },
+    )
+
+
+class TestMeshMotionAuxCommands:
+    """Bridge-level end-to-end coverage for writable mesh motion aux entities."""
+
+    async def test_writable_motion_topics_subscribed(
+        self, mesh_load_with_motion: BrilliantDevice
+    ) -> None:
+        """After reconcile the bridge subscribes the three writable motion vars."""
+        bus = FakeBus([mesh_load_with_motion])
+        mqtt = FakeMqtt()
+        bridge = Bridge(bus, mqtt, MESH_PANEL, include=_is_mesh)
+        await bridge.reconcile()
+
+        assert f"brilliant/{MESH_PANEL}/{MESH_PID}/set_enable_motion_score" in mqtt.subscriptions
+        assert f"brilliant/{MESH_PANEL}/{MESH_PID}/set_motion_high_threshold" in mqtt.subscriptions
+        assert f"brilliant/{MESH_PANEL}/{MESH_PID}/set_motion_low_threshold" in mqtt.subscriptions
+
+    async def test_readonly_motion_topics_not_subscribed(
+        self, mesh_load_with_motion: BrilliantDevice
+    ) -> None:
+        """Read-only motion entities (binary_sensor, sensor) must NOT be subscribed."""
+        bus = FakeBus([mesh_load_with_motion])
+        mqtt = FakeMqtt()
+        bridge = Bridge(bus, mqtt, MESH_PANEL, include=_is_mesh)
+        await bridge.reconcile()
+
+        assert f"brilliant/{MESH_PANEL}/{MESH_PID}/set_movement_detected" not in mqtt.subscriptions
+        assert f"brilliant/{MESH_PANEL}/{MESH_PID}/set_motion_score" not in mqtt.subscriptions
+
+    async def test_switch_on_routes_to_ble_mesh(
+        self, mesh_load_with_motion: BrilliantDevice
+    ) -> None:
+        """ON on set_enable_motion_score → VarSet("enable_motion_score", "1") routed to ble_mesh."""
+        bus = FakeBus([mesh_load_with_motion])
+        mqtt = FakeMqtt()
+        bridge = Bridge(bus, mqtt, MESH_PANEL, include=_is_mesh)
+        await bridge.reconcile()
+
+        await mqtt.inject(f"brilliant/{MESH_PANEL}/{MESH_PID}/set_enable_motion_score", "ON")
+
+        assert bus.commands == [("ble_mesh", MESH_PID, [VarSet("enable_motion_score", "1")])]
+
+    async def test_number_high_threshold_routes_to_ble_mesh(
+        self, mesh_load_with_motion: BrilliantDevice
+    ) -> None:
+        """Numeric payload on set_motion_high_threshold → VarSet routed to ble_mesh."""
+        bus = FakeBus([mesh_load_with_motion])
+        mqtt = FakeMqtt()
+        bridge = Bridge(bus, mqtt, MESH_PANEL, include=_is_mesh)
+        await bridge.reconcile()
+
+        await mqtt.inject(f"brilliant/{MESH_PANEL}/{MESH_PID}/set_motion_high_threshold", "85")
+
+        assert bus.commands == [("ble_mesh", MESH_PID, [VarSet("motion_high_threshold", "85")])]
+
+    async def test_number_low_threshold_routes_to_ble_mesh(
+        self, mesh_load_with_motion: BrilliantDevice
+    ) -> None:
+        """Numeric payload on set_motion_low_threshold → VarSet routed to ble_mesh."""
+        bus = FakeBus([mesh_load_with_motion])
+        mqtt = FakeMqtt()
+        bridge = Bridge(bus, mqtt, MESH_PANEL, include=_is_mesh)
+        await bridge.reconcile()
+
+        await mqtt.inject(f"brilliant/{MESH_PANEL}/{MESH_PID}/set_motion_low_threshold", "15")
+
+        assert bus.commands == [("ble_mesh", MESH_PID, [VarSet("motion_low_threshold", "15")])]
+
+    async def test_sequential_motion_commands_each_route_correctly(
+        self, mesh_load_with_motion: BrilliantDevice
+    ) -> None:
+        """Three distinct motion writes all route to ble_mesh independently."""
+        bus = FakeBus([mesh_load_with_motion])
+        mqtt = FakeMqtt()
+        bridge = Bridge(bus, mqtt, MESH_PANEL, include=_is_mesh)
+        await bridge.reconcile()
+
+        await mqtt.inject(f"brilliant/{MESH_PANEL}/{MESH_PID}/set_enable_motion_score", "ON")
+        assert bus.commands[-1] == ("ble_mesh", MESH_PID, [VarSet("enable_motion_score", "1")])
+
+        bus.commands.clear()
+        await mqtt.inject(f"brilliant/{MESH_PANEL}/{MESH_PID}/set_motion_high_threshold", "85")
+        assert bus.commands[-1] == ("ble_mesh", MESH_PID, [VarSet("motion_high_threshold", "85")])
+
+        bus.commands.clear()
+        await mqtt.inject(f"brilliant/{MESH_PANEL}/{MESH_PID}/set_motion_low_threshold", "15")
+        assert bus.commands[-1] == ("ble_mesh", MESH_PID, [VarSet("motion_low_threshold", "15")])
