@@ -121,10 +121,12 @@ class AsyncsshShell:
         conn = self._require_conn()
         # asyncssh.SFTPClient is itself an async context manager (not start_sftp_client)
         async with await conn.start_sftp_client() as sftp:
-            # Create the file WITH the target permissions (it may carry the
-            # broker password) — never write-then-chmod, which would leave a
-            # window where the secret sits with default-umask permissions.
+            # The secret must never sit with wrong permissions: attrs sets the
+            # mode on fresh creates, but asyncssh ignores attrs when the file
+            # already exists ("wb" truncates, keeps old perms) — so also chmod
+            # the open (truncated-empty) handle BEFORE the data lands.
             async with await sftp.open(remote_path, "wb", attrs=SFTPAttrs(permissions=mode)) as f:
+                await f.chmod(mode)  # converge pre-existing files; no-op on fresh creates
                 await f.write(data)
 
     async def put_dir(self, local_dir: str, remote_dir: str) -> None:
