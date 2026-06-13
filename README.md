@@ -57,9 +57,20 @@ As implemented and verified live on real panels:
 See **[INSTALL.md](INSTALL.md)** for the complete guide, including enabling
 **root SSH** on the panel (an official, opt-in Brilliant feature) and **MQTT
 broker setup** (standalone, or Home Assistant's Mosquitto add-on if you have no
-broker). The bridge deploys to each panel (documented manual path; automate it
-with your own configuration management) — it is not a pip-installable library
-and has no release yet.
+broker). The bridge deploys to each panel either via the companion integration
+below or the documented manual path.
+
+## Home Assistant companion integration
+
+An optional **HACS custom integration** manages the agent's lifecycle across
+your fleet from the Home Assistant UI — first deploy to a panel, version
+**updates** (OTA), automatic **repair** after a panel firmware update, and
+removal — while the devices themselves stay native MQTT-Discovery entities
+published by the agent. Install it via HACS (custom repository
+`joyfulhouse/brilliant-mqtt`, category Integration) or the release zip; add one
+panel per config entry (per-panel root password, TOFU host-key pinning).
+
+See **[docs/ha-integration.md](docs/ha-integration.md)** for the full guide.
 
 ## Quick Start (development)
 

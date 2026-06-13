@@ -21,6 +21,9 @@ dist/
 venv/
 .python-version
 
+# Build artifact bundled into the HACS zip (scripts/build_payload.sh)
+ha/custom_components/brilliant_mqtt/agent_payload/
+
 # ─── Tooling caches ──────────────────────────────────────────────────────
 .pytest_cache/
 .ruff_cache/

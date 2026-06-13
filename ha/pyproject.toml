@@ -30,6 +30,11 @@ select = ["E", "F", "I", "UP", "B", "ASYNC"]
 python_version = "3.14"
 strict = true
 explicit_package_bases = true
+# agent_payload/ is a gitignored build artifact (scripts/build_payload.sh): the
+# py3.10 agent package + vendored third-party MQTT wheels. It is not integration
+# source — exclude it from this (py3.14) type-check; the agent gate at the repo
+# root type-checks the agent itself. (mypy, unlike ruff, ignores .gitignore.)
+exclude = ["/agent_payload/"]
 
 # The pytest HA harness ships no py.typed marker.
 [[tool.mypy.overrides]]
