@@ -87,6 +87,10 @@ class PanelManager:
         self._recovery_cancel: CALLBACK_TYPE | None = None
         self._last_repair_mono: float | None = None
         self._repairing = False
+        # Set true by async_shutdown. A repair already awaiting inside the ssh_lock
+        # resumes AFTER shutdown's one-shot cancel; this flag stops it re-arming a
+        # timer that would then fire on a torn-down entry and SSH a removed panel.
+        self._shutting_down = False
 
     @property
     def signal(self) -> str:
@@ -111,6 +115,9 @@ class PanelManager:
         )
 
     async def async_shutdown(self) -> None:
+        # Latch shutdown FIRST: a repair wedged in the ssh_lock checks this flag
+        # before (re-)arming a timer, so it cannot schedule one past this cancel.
+        self._shutting_down = True
         # Cancel any in-flight timers BEFORE dropping the subscriptions so an entry
         # unload (or reload) never leaves a grace/recovery callback dangling.
         self._cancel("_grace_cancel")
@@ -166,6 +173,8 @@ class PanelManager:
 
     async def _grace_expired(self, _now: datetime) -> None:
         self._grace_cancel = None
+        if self._shutting_down:
+            return
         if self.availability != AVAILABILITY_OFFLINE:
             return
         if not self._opt(OPT_AUTO_REPAIR, DEFAULT_AUTO_REPAIR):
@@ -224,6 +233,11 @@ class PanelManager:
                 except (OSError, asyncssh.Error, PanelOpError) as err:
                     self._fire(EVENT_REPAIR_FAILED, {"reason": "unreachable"})
                     self._set_problem(True, f"panel unreachable: {err}")
+                    # Record the cooldown so the recheck does not re-offer the root
+                    # password to a flapping host every few minutes forever.
+                    self._last_repair_mono = time.monotonic()
+                    if self._shutting_down:
+                        return  # entry torn down mid-repair: do not re-arm a timer
                     self._grace_cancel = async_call_later(
                         self.hass, _UNREACHABLE_RECHECK_SECONDS, self._grace_expired
                     )
@@ -233,9 +247,23 @@ class PanelManager:
                     unit, env = await self._config_contents()
                     await panel_ops.ensure_configs(shell, unit, env)
                     await panel_ops.enable_now(shell)
+                except (OSError, asyncssh.Error, PanelOpError) as err:
+                    # A checked step (mkdir/daemon-reload/systemctl) exited non-zero.
+                    # The panel is half-broken; surface it loudly instead of letting
+                    # the exception escape (silent + entry shows GREEN) or falling
+                    # through to the success path (no recovery timer would ever fire).
+                    self._fire(
+                        EVENT_REPAIR_FAILED,
+                        {"reason": "repair_step_failed", "error": str(err)},
+                    )
+                    self._escalate(f"repair step failed: {err}")
+                    self._last_repair_mono = time.monotonic()  # gate any retry
+                    return
                 finally:
                     await shell.close()
             self._last_repair_mono = time.monotonic()
+            if self._shutting_down:
+                return  # entry torn down mid-repair: do not re-arm a timer
             self._recovery_cancel = async_call_later(
                 self.hass, _RECOVERY_SECONDS, self._recovery_timeout
             )
@@ -244,6 +272,8 @@ class PanelManager:
 
     async def _recovery_timeout(self, _now: datetime) -> None:
         self._recovery_cancel = None
+        if self._shutting_down:
+            return
         if self.availability == AVAILABILITY_ONLINE:
             return
         journal = ""
