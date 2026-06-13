@@ -164,8 +164,12 @@ class RpcBusAdapter:
         self,
         my_name: str = "brilliant_mqtt",
         extra_device_ids: tuple[str, ...] = (),
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._my_name = my_name
+        # Injectable monotonic clock (tests drive it deterministically); backs
+        # both the push-liveness clock and the reconnect-rate window.
+        self._clock = clock
         # Extra bus device ids to subscribe/fetch beyond the panel's own
         # CONTROL device — e.g. the virtual "ble_mesh" device carrying the
         # home's plug-in mesh switches/dimmers (Milestone 11).
@@ -183,6 +187,10 @@ class RpcBusAdapter:
         self._resubscribe: Callable[[], Awaitable[None]] | None = None
         # monotonic timestamp of the last inbound push (None: none yet).
         self._last_push: float | None = None
+        # Monotonic timestamps of recent processor reconnects (newest last);
+        # recent_reconnects() prunes anything outside the queried window so the
+        # list stays bounded. Feeds the run loop's reconnect-storm breaker.
+        self._reconnect_times: list[float] = []
         # Retain fired callback tasks so they are not garbage-collected mid-flight
         # (asyncio holds only weak references to tasks). Done-callback discards.
         self._pending_tasks: set[asyncio.Task[None]] = set()
@@ -299,13 +307,27 @@ class RpcBusAdapter:
 
     def _note_push(self) -> None:
         """Record that an inbound push arrived (stale-stream watchdog clock)."""
-        self._last_push = time.monotonic()
+        self._last_push = self._clock()
 
     def seconds_since_last_push(self) -> float | None:
         """Seconds since the last inbound push; None before the first one."""
         if self._last_push is None:
             return None
-        return time.monotonic() - self._last_push
+        return self._clock() - self._last_push
+
+    def _note_reconnect(self) -> None:
+        """Record that the processor reconnected (reconnect-rate clock)."""
+        self._reconnect_times.append(self._clock())
+
+    def recent_reconnects(self, window_s: float) -> int:
+        """Count processor reconnects within the last *window_s* seconds.
+
+        Prunes older timestamps as a side effect so the buffer stays bounded
+        even through a sustained storm (the run loop queries every tick).
+        """
+        cutoff = self._clock() - window_s
+        self._reconnect_times = [t for t in self._reconnect_times if t >= cutoff]
+        return len(self._reconnect_times)
 
     def on_reconnect(self, cb: Callable[[], Awaitable[None]]) -> None:
         """Register the callback fired after the bus session reconnects."""
@@ -321,6 +343,7 @@ class RpcBusAdapter:
         """
         logger.warning("bus processor reconnected; re-subscribing and re-reconciling")
         self._note_push()
+        self._note_reconnect()
         self._spawn(self._after_reconnect())
 
     async def _after_reconnect(self) -> None:
