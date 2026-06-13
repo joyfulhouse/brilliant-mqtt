@@ -67,6 +67,12 @@ publishes them — under the reserved `mesh` pseudo-panel and one
   returns).
 - Mesh loads whose `power` reports the `-1` sentinel (uncalibrated) get no
   power sensor; the entity appears automatically once real wattage shows up.
+- Each mesh load also exposes a **`Motion` binary_sensor** (device_class:
+  motion, enabled by default). Additional disabled-by-default entities:
+  `Motion Score` (diagnostic sensor), `Motion Score Reporting` (config
+  switch), and `Motion High Threshold` / `Motion Low Threshold` (config
+  numbers, 0–100 assumed range). Panel loads are unaffected — these entities
+  only appear when the backing bus variables are present.
 
 ## Entities per panel
 

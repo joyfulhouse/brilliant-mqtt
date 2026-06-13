@@ -901,3 +901,293 @@ def test_hardware_blank_release_tag_has_no_firmware_entries() -> None:
         d.unique_id.endswith("_current_release_tag") for d in entities_for(blank, "office")
     )
     assert "current_release_tag" not in payload_fields(blank)
+
+
+# ===========================================================================
+# Mesh-load motion subsystem (live-verified panel-1.local, 2026-06-13)
+# ===========================================================================
+#
+# Every mesh load peripheral (LIGHT/SWITCH/ALWAYS_ON on the virtual ble_mesh
+# device) carries five motion variables. Because aux specs gate on variable
+# presence, panel loads (which lack these variables) are unaffected.
+
+
+def _mesh_dimmer_with_motion() -> BrilliantDevice:
+    """_mesh_dimmer() + the five live-verified motion variables."""
+    device = _mesh_dimmer()
+    device.variables.update(
+        {
+            "movement_detected": Variable("movement_detected", "1"),
+            "motion_score": Variable("motion_score", "0"),
+            "enable_motion_score": Variable("enable_motion_score", "0"),
+            "motion_high_threshold": Variable("motion_high_threshold", "70"),
+            "motion_low_threshold": Variable("motion_low_threshold", "20"),
+        }
+    )
+    return device
+
+
+def _always_on_with_motion() -> BrilliantDevice:
+    """_always_on() + the five live-verified motion variables."""
+    device = _always_on()
+    device.variables.update(
+        {
+            "movement_detected": Variable("movement_detected", "0"),
+            "motion_score": Variable("motion_score", "0"),
+            "enable_motion_score": Variable("enable_motion_score", "0"),
+            "motion_high_threshold": Variable("motion_high_threshold", "70"),
+            "motion_low_threshold": Variable("motion_low_threshold", "20"),
+        }
+    )
+    return device
+
+
+# --- Motion binary_sensor descriptor ----------------------------------------
+
+
+def test_mesh_motion_binary_sensor_component() -> None:
+    by_uid = _by_uid(entities_for(_mesh_dimmer_with_motion(), "mesh"))
+    d = by_uid[f"brilliant_mesh_{MESH_PID}_movement_detected"]
+    assert d.component == "binary_sensor"
+
+
+def test_mesh_motion_binary_sensor_device_class() -> None:
+    by_uid = _by_uid(entities_for(_mesh_dimmer_with_motion(), "mesh"))
+    d = by_uid[f"brilliant_mesh_{MESH_PID}_movement_detected"]
+    assert d.device_class == "motion"
+
+
+def test_mesh_motion_binary_sensor_value_key() -> None:
+    by_uid = _by_uid(entities_for(_mesh_dimmer_with_motion(), "mesh"))
+    d = by_uid[f"brilliant_mesh_{MESH_PID}_movement_detected"]
+    assert d.value_key == "motion"
+
+
+def test_mesh_motion_binary_sensor_name() -> None:
+    by_uid = _by_uid(entities_for(_mesh_dimmer_with_motion(), "mesh"))
+    d = by_uid[f"brilliant_mesh_{MESH_PID}_movement_detected"]
+    assert d.name == "Office Desk Lights Motion"
+
+
+def test_mesh_motion_binary_sensor_enabled_by_default() -> None:
+    by_uid = _by_uid(entities_for(_mesh_dimmer_with_motion(), "mesh"))
+    d = by_uid[f"brilliant_mesh_{MESH_PID}_movement_detected"]
+    assert d.enabled_by_default is True
+
+
+def test_mesh_motion_binary_sensor_command_var_none() -> None:
+    by_uid = _by_uid(entities_for(_mesh_dimmer_with_motion(), "mesh"))
+    d = by_uid[f"brilliant_mesh_{MESH_PID}_movement_detected"]
+    assert d.command_var is None
+
+
+# --- Motion Score sensor -----------------------------------------------------
+
+
+def test_mesh_motion_score_sensor_component() -> None:
+    by_uid = _by_uid(entities_for(_mesh_dimmer_with_motion(), "mesh"))
+    d = by_uid[f"brilliant_mesh_{MESH_PID}_motion_score"]
+    assert d.component == "sensor"
+
+
+def test_mesh_motion_score_value_kind_int() -> None:
+    by_uid = _by_uid(entities_for(_mesh_dimmer_with_motion(), "mesh"))
+    d = by_uid[f"brilliant_mesh_{MESH_PID}_motion_score"]
+    assert d.value_kind == "int"
+
+
+def test_mesh_motion_score_entity_category_diagnostic() -> None:
+    by_uid = _by_uid(entities_for(_mesh_dimmer_with_motion(), "mesh"))
+    d = by_uid[f"brilliant_mesh_{MESH_PID}_motion_score"]
+    assert d.entity_category == "diagnostic"
+
+
+def test_mesh_motion_score_disabled_by_default() -> None:
+    by_uid = _by_uid(entities_for(_mesh_dimmer_with_motion(), "mesh"))
+    d = by_uid[f"brilliant_mesh_{MESH_PID}_motion_score"]
+    assert d.enabled_by_default is False
+
+
+def test_mesh_motion_score_command_var_none() -> None:
+    by_uid = _by_uid(entities_for(_mesh_dimmer_with_motion(), "mesh"))
+    d = by_uid[f"brilliant_mesh_{MESH_PID}_motion_score"]
+    assert d.command_var is None
+
+
+def test_mesh_motion_score_name() -> None:
+    by_uid = _by_uid(entities_for(_mesh_dimmer_with_motion(), "mesh"))
+    d = by_uid[f"brilliant_mesh_{MESH_PID}_motion_score"]
+    assert d.name == "Office Desk Lights Motion Score"
+
+
+# --- Enable Motion Score switch ----------------------------------------------
+
+
+def test_mesh_enable_motion_score_switch_component() -> None:
+    by_uid = _by_uid(entities_for(_mesh_dimmer_with_motion(), "mesh"))
+    d = by_uid[f"brilliant_mesh_{MESH_PID}_enable_motion_score"]
+    assert d.component == "switch"
+
+
+def test_mesh_enable_motion_score_command_var() -> None:
+    by_uid = _by_uid(entities_for(_mesh_dimmer_with_motion(), "mesh"))
+    d = by_uid[f"brilliant_mesh_{MESH_PID}_enable_motion_score"]
+    assert d.command_var == "enable_motion_score"
+
+
+def test_mesh_enable_motion_score_entity_category_config() -> None:
+    by_uid = _by_uid(entities_for(_mesh_dimmer_with_motion(), "mesh"))
+    d = by_uid[f"brilliant_mesh_{MESH_PID}_enable_motion_score"]
+    assert d.entity_category == "config"
+
+
+def test_mesh_enable_motion_score_disabled_by_default() -> None:
+    by_uid = _by_uid(entities_for(_mesh_dimmer_with_motion(), "mesh"))
+    d = by_uid[f"brilliant_mesh_{MESH_PID}_enable_motion_score"]
+    assert d.enabled_by_default is False
+
+
+def test_mesh_enable_motion_score_name() -> None:
+    by_uid = _by_uid(entities_for(_mesh_dimmer_with_motion(), "mesh"))
+    d = by_uid[f"brilliant_mesh_{MESH_PID}_enable_motion_score"]
+    assert d.name == "Office Desk Lights Motion Score Reporting"
+
+
+# --- Motion High Threshold number -------------------------------------------
+
+
+def test_mesh_motion_high_threshold_component() -> None:
+    by_uid = _by_uid(entities_for(_mesh_dimmer_with_motion(), "mesh"))
+    d = by_uid[f"brilliant_mesh_{MESH_PID}_motion_high_threshold"]
+    assert d.component == "number"
+
+
+def test_mesh_motion_high_threshold_value_kind_int() -> None:
+    by_uid = _by_uid(entities_for(_mesh_dimmer_with_motion(), "mesh"))
+    d = by_uid[f"brilliant_mesh_{MESH_PID}_motion_high_threshold"]
+    assert d.value_kind == "int"
+
+
+def test_mesh_motion_high_threshold_command_var() -> None:
+    by_uid = _by_uid(entities_for(_mesh_dimmer_with_motion(), "mesh"))
+    d = by_uid[f"brilliant_mesh_{MESH_PID}_motion_high_threshold"]
+    assert d.command_var == "motion_high_threshold"
+
+
+def test_mesh_motion_high_threshold_min_max_step() -> None:
+    by_uid = _by_uid(entities_for(_mesh_dimmer_with_motion(), "mesh"))
+    d = by_uid[f"brilliant_mesh_{MESH_PID}_motion_high_threshold"]
+    assert d.min_value == 0
+    assert d.max_value == 100
+    assert d.step == 1
+
+
+def test_mesh_motion_high_threshold_entity_category_config() -> None:
+    by_uid = _by_uid(entities_for(_mesh_dimmer_with_motion(), "mesh"))
+    d = by_uid[f"brilliant_mesh_{MESH_PID}_motion_high_threshold"]
+    assert d.entity_category == "config"
+
+
+def test_mesh_motion_high_threshold_disabled_by_default() -> None:
+    by_uid = _by_uid(entities_for(_mesh_dimmer_with_motion(), "mesh"))
+    d = by_uid[f"brilliant_mesh_{MESH_PID}_motion_high_threshold"]
+    assert d.enabled_by_default is False
+
+
+# --- Motion Low Threshold number --------------------------------------------
+
+
+def test_mesh_motion_low_threshold_component() -> None:
+    by_uid = _by_uid(entities_for(_mesh_dimmer_with_motion(), "mesh"))
+    d = by_uid[f"brilliant_mesh_{MESH_PID}_motion_low_threshold"]
+    assert d.component == "number"
+
+
+def test_mesh_motion_low_threshold_value_kind_int() -> None:
+    by_uid = _by_uid(entities_for(_mesh_dimmer_with_motion(), "mesh"))
+    d = by_uid[f"brilliant_mesh_{MESH_PID}_motion_low_threshold"]
+    assert d.value_kind == "int"
+
+
+def test_mesh_motion_low_threshold_command_var() -> None:
+    by_uid = _by_uid(entities_for(_mesh_dimmer_with_motion(), "mesh"))
+    d = by_uid[f"brilliant_mesh_{MESH_PID}_motion_low_threshold"]
+    assert d.command_var == "motion_low_threshold"
+
+
+def test_mesh_motion_low_threshold_min_max_step() -> None:
+    by_uid = _by_uid(entities_for(_mesh_dimmer_with_motion(), "mesh"))
+    d = by_uid[f"brilliant_mesh_{MESH_PID}_motion_low_threshold"]
+    assert d.min_value == 0
+    assert d.max_value == 100
+    assert d.step == 1
+
+
+def test_mesh_motion_low_threshold_entity_category_config() -> None:
+    by_uid = _by_uid(entities_for(_mesh_dimmer_with_motion(), "mesh"))
+    d = by_uid[f"brilliant_mesh_{MESH_PID}_motion_low_threshold"]
+    assert d.entity_category == "config"
+
+
+def test_mesh_motion_low_threshold_disabled_by_default() -> None:
+    by_uid = _by_uid(entities_for(_mesh_dimmer_with_motion(), "mesh"))
+    d = by_uid[f"brilliant_mesh_{MESH_PID}_motion_low_threshold"]
+    assert d.enabled_by_default is False
+
+
+# --- payload_fields with motion vars ----------------------------------------
+
+
+def test_mesh_dimmer_with_motion_payload_fields() -> None:
+    """Exact payload including power sentinel (gated) and all motion fields."""
+    payload = payload_fields(_mesh_dimmer_with_motion())
+    assert payload == {
+        "state": "OFF",
+        "brightness": 153,
+        "motion": True,
+        "motion_score": 0,
+        "enable_motion_score": False,
+        "motion_high_threshold": 70,
+        "motion_low_threshold": 20,
+    }
+
+
+# --- ALWAYS_ON cross-kind coverage ------------------------------------------
+
+
+def test_always_on_with_motion_has_motion_binary_sensor() -> None:
+    """Motion specs apply to ALWAYS_ON loads too (not just LIGHT)."""
+    by_uid = _by_uid(entities_for(_always_on_with_motion(), "office"))
+    motion_uid = "brilliant_office_gangbox_peripheral_1_movement_detected"
+    assert motion_uid in by_uid
+    assert by_uid[motion_uid].device_class == "motion"
+
+
+def test_always_on_with_motion_motion_name_prefixed() -> None:
+    """ALWAYS_ON is a load kind — motion entity name is prefixed with load name."""
+    by_uid = _by_uid(entities_for(_always_on_with_motion(), "office"))
+    d = by_uid["brilliant_office_gangbox_peripheral_1_movement_detected"]
+    assert d.name == "Backyard Lamps Motion"
+
+
+# --- Regression: panel loads WITHOUT motion vars are unaffected --------------
+
+
+def test_panel_light_full_still_yields_exactly_four_entities() -> None:
+    """_light_full() has no motion vars — still 4 entities (light+power+temp+fault)."""
+    result = entities_for(_light_full(), "office")
+    assert len(result) == 4
+
+
+def test_panel_light_full_no_motion_uid() -> None:
+    """Panel LIGHT with no motion vars must not mint a movement_detected entity."""
+    uids = {d.unique_id for d in entities_for(_light_full(), "office")}
+    assert "brilliant_office_gangbox_peripheral_0_movement_detected" not in uids
+
+
+def test_mesh_dimmer_sentinel_no_motion_vars_still_one_entity() -> None:
+    """_mesh_dimmer() (without motion vars) still yields exactly one entity."""
+    result = entities_for(_mesh_dimmer(), "mesh")
+    assert [d.component for d in result] == ["light"]
+    uids = {d.unique_id for d in result}
+    assert f"brilliant_mesh_{MESH_PID}_movement_detected" not in uids
