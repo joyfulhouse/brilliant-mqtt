@@ -22,6 +22,11 @@ markers = ["allow_lingering_timers: tolerate the core mqtt integration's recurri
 [tool.ruff]
 target-version = "py313"  # ruff has no py314 target yet; bump when ruff adds support
 line-length = 100
+# agent_payload/ is a gitignored build artifact (vendored py3.10 third-party
+# wheels). ruff honours .gitignore for bare invocations, but an explicit-path
+# run (`ruff check custom_components`) descends into it — exclude it so the lint
+# result is identical however ruff is invoked, matching the mypy exclude below.
+extend-exclude = ["agent_payload"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ASYNC"]
