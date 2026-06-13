@@ -82,5 +82,8 @@ class PanelManager:
         except ValueError:
             _LOGGER.warning("%s: unparseable bridge meta payload: %r", self.panel, msg.payload)
             return
+        if not isinstance(meta, dict):
+            _LOGGER.warning("%s: bridge meta is not a JSON object: %r", self.panel, msg.payload)
+            return
         self.meta = meta
         self._notify()

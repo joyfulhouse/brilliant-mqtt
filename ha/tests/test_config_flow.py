@@ -95,3 +95,22 @@ async def test_ssh_failure_shows_cannot_connect(hass: HomeAssistant) -> None:
         result = await hass.config_entries.flow.async_configure(result["flow_id"], USER_INPUT)
     assert result["type"] == "form"
     assert result["errors"] == {"base": "cannot_connect"}
+
+
+async def test_reconfigure_rejects_control_character(hass: HomeAssistant) -> None:
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="office",
+        data={CONF_PANEL: "office", CONF_HOST: "10.100.0.10", CONF_ROOT_PASSWORD: "panelpass"},
+    )
+    entry.add_to_hass(hass)
+    result = await entry.start_reconfigure_flow(hass)
+    assert result["type"] == "form"
+
+    with patch(VALIDATE, return_value="ssh-ed25519 PINNED"):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {CONF_HOST: "10.100.0.10", CONF_ROOT_PASSWORD: "bad\npass"},
+        )
+    assert result["type"] == "form"
+    assert result["errors"] == {CONF_ROOT_PASSWORD: "invalid_value"}
