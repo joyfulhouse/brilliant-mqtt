@@ -7,8 +7,8 @@ from typing import Any
 
 import asyncssh
 import voluptuous as vol
-from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
-from homeassistant.core import HomeAssistant
+from homeassistant.config_entries import ConfigEntry, ConfigFlow, ConfigFlowResult, OptionsFlow
+from homeassistant.core import HomeAssistant, callback
 
 from .const import (
     CONF_HOST,
@@ -20,8 +20,14 @@ from .const import (
     CONF_PANEL,
     CONF_ROOT_PASSWORD,
     DATA_SSH_HOST_KEY,
+    DEFAULT_AUTO_REPAIR,
+    DEFAULT_OFFLINE_GRACE_MINUTES,
+    DEFAULT_REPAIR_COOLDOWN_MINUTES,
     DOMAIN,
     MESH_PANEL,
+    OPT_AUTO_REPAIR,
+    OPT_OFFLINE_GRACE_MINUTES,
+    OPT_REPAIR_COOLDOWN_MINUTES,
 )
 from .shell import AsyncsshShell
 
@@ -72,6 +78,11 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
     """Add one Brilliant panel per entry."""
 
     VERSION = 1
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry: ConfigEntry) -> OptionsFlow:
+        return BrilliantMqttOptionsFlow()
 
     def _schema(self) -> vol.Schema:
         defaults: dict[str, Any] = {}
@@ -166,3 +177,28 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
             }
         )
         return self.async_show_form(step_id="reconfigure", data_schema=schema, errors=errors)
+
+
+class BrilliantMqttOptionsFlow(OptionsFlow):
+    """Per-panel behavior knobs; read live by the manager (no reload needed)."""
+
+    async def async_step_init(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        if user_input is not None:
+            return self.async_create_entry(data=user_input)
+        opts = self.config_entry.options
+        schema = vol.Schema(
+            {
+                vol.Required(
+                    OPT_AUTO_REPAIR, default=opts.get(OPT_AUTO_REPAIR, DEFAULT_AUTO_REPAIR)
+                ): bool,
+                vol.Required(
+                    OPT_OFFLINE_GRACE_MINUTES,
+                    default=opts.get(OPT_OFFLINE_GRACE_MINUTES, DEFAULT_OFFLINE_GRACE_MINUTES),
+                ): vol.All(vol.Coerce(int), vol.Range(min=2, max=120)),
+                vol.Required(
+                    OPT_REPAIR_COOLDOWN_MINUTES,
+                    default=opts.get(OPT_REPAIR_COOLDOWN_MINUTES, DEFAULT_REPAIR_COOLDOWN_MINUTES),
+                ): vol.All(vol.Coerce(int), vol.Range(min=5, max=1440)),
+            }
+        )
+        return self.async_show_form(step_id="init", data_schema=schema)

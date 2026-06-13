@@ -1,30 +1,73 @@
-"""PanelManager — per-entry runtime: MQTT watchers and (Task 8) the OTA state machine."""
+"""PanelManager — per-entry runtime: MQTT watchers and the OTA state machine.
+
+State machine (one panel): the availability LWT and the retained bridge meta drive
+everything. offline → (grace timer) → auto-repair (restore unit/env, enable) →
+(recovery timer) → online ? repair_succeeded : escalate. A repair cooldown stops a
+flapping panel from being repaired in a tight loop; auto-repair can be turned off
+per panel, in which case an outage only notifies. A firmware change on the meta topic
+fires panel_updated and re-stages the OTA-proof config copies.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import time
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
-from homeassistant.components import mqtt
+import asyncssh
+from homeassistant.components import mqtt, persistent_notification
 from homeassistant.components.mqtt.models import ReceiveMessage
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.helpers.event import async_call_later
 
+from . import panel_ops
 from .const import (
+    AVAILABILITY_OFFLINE,
+    AVAILABILITY_ONLINE,
     CONF_HOST,
+    CONF_MESH_PRIORITY,
+    CONF_MQTT_HOST,
+    CONF_MQTT_PASSWORD,
+    CONF_MQTT_PORT,
+    CONF_MQTT_USERNAME,
     CONF_PANEL,
     CONF_ROOT_PASSWORD,
+    DATA_LAST_FIRMWARE,
     DATA_SSH_HOST_KEY,
+    DEFAULT_AUTO_REPAIR,
+    DEFAULT_OFFLINE_GRACE_MINUTES,
+    DEFAULT_REPAIR_COOLDOWN_MINUTES,
+    EVENT_NEEDS_ATTENTION,
+    EVENT_PANEL_UPDATED,
+    EVENT_REPAIR_FAILED,
+    EVENT_REPAIR_STARTED,
+    EVENT_REPAIR_SUCCEEDED,
+    EVENT_TYPE,
+    OPT_AUTO_REPAIR,
+    OPT_OFFLINE_GRACE_MINUTES,
+    OPT_REPAIR_COOLDOWN_MINUTES,
     SIGNAL_PANEL_STATE,
     availability_topic,
     meta_topic,
 )
+from .panel_ops import PanelOpError
 from .shell import AsyncsshShell, PanelShell
 
 _LOGGER = logging.getLogger(__name__)
+
+_RECOVERY_SECONDS = 60.0
+_UNREACHABLE_RECHECK_SECONDS = 300.0
+
+
+def _payload_dir() -> Path:
+    """The bundled agent payload (built by scripts/build_payload.sh / release CI)."""
+    return Path(__file__).parent / "agent_payload"
 
 
 class PanelManager:
@@ -40,6 +83,10 @@ class PanelManager:
         self.problem = False
         self.problem_reason: str | None = None
         self._unsubs: list[Any] = []
+        self._grace_cancel: CALLBACK_TYPE | None = None
+        self._recovery_cancel: CALLBACK_TYPE | None = None
+        self._last_repair_mono: float | None = None
+        self._repairing = False
 
     @property
     def signal(self) -> str:
@@ -64,6 +111,10 @@ class PanelManager:
         )
 
     async def async_shutdown(self) -> None:
+        # Cancel any in-flight timers BEFORE dropping the subscriptions so an entry
+        # unload (or reload) never leaves a grace/recovery callback dangling.
+        self._cancel("_grace_cancel")
+        self._cancel("_recovery_cancel")
         for unsub in self._unsubs:
             unsub()
         self._unsubs.clear()
@@ -72,9 +123,145 @@ class PanelManager:
     def _notify(self) -> None:
         async_dispatcher_send(self.hass, self.signal)
 
-    async def _on_availability(self, msg: ReceiveMessage) -> None:
-        self.availability = str(msg.payload)
+    def _opt(self, key: str, default: Any) -> Any:
+        return self.entry.options.get(key, default)
+
+    def _fire(self, event_type: str, data: dict[str, Any] | None = None) -> None:
+        self.hass.bus.async_fire(
+            EVENT_TYPE,
+            {"type": event_type, "panel": self.panel, "entry_id": self.entry.entry_id}
+            | (data or {}),
+        )
+
+    @callback
+    def _set_problem(self, problem: bool, reason: str | None) -> None:
+        self.problem = problem
+        self.problem_reason = reason
         self._notify()
+
+    def _cancel(self, attr: str) -> None:
+        cancel: CALLBACK_TYPE | None = getattr(self, attr)
+        if cancel is not None:
+            cancel()
+            setattr(self, attr, None)
+
+    async def _on_availability(self, msg: ReceiveMessage) -> None:
+        payload = str(msg.payload)
+        self.availability = payload
+        if payload == AVAILABILITY_ONLINE:
+            self._cancel("_grace_cancel")
+            if self._recovery_cancel is not None:
+                self._cancel("_recovery_cancel")
+                self._fire(EVENT_REPAIR_SUCCEEDED)
+            self._set_problem(False, None)
+        elif (
+            payload == AVAILABILITY_OFFLINE
+            and self._grace_cancel is None
+            and self._recovery_cancel is None
+            and not self._repairing
+        ):
+            grace_s = self._opt(OPT_OFFLINE_GRACE_MINUTES, DEFAULT_OFFLINE_GRACE_MINUTES) * 60
+            self._grace_cancel = async_call_later(self.hass, grace_s, self._grace_expired)
+        self._notify()
+
+    async def _grace_expired(self, _now: datetime) -> None:
+        self._grace_cancel = None
+        if self.availability != AVAILABILITY_OFFLINE:
+            return
+        if not self._opt(OPT_AUTO_REPAIR, DEFAULT_AUTO_REPAIR):
+            self._escalate("bridge offline past grace period (auto-repair is off)")
+            return
+        cooldown_s = self._opt(OPT_REPAIR_COOLDOWN_MINUTES, DEFAULT_REPAIR_COOLDOWN_MINUTES) * 60
+        if (
+            self._last_repair_mono is not None
+            and time.monotonic() - self._last_repair_mono < cooldown_s
+        ):
+            self._escalate("bridge offline again within the repair cooldown")
+            return
+        await self.async_repair(trigger="auto")
+
+    def _escalate(self, reason: str) -> None:
+        self._fire(EVENT_NEEDS_ATTENTION, {"reason": reason})
+        persistent_notification.async_create(
+            self.hass,
+            f"Panel `{self.panel}`: {reason}. See docs/ha-integration.md.",
+            title="Brilliant MQTT needs attention",
+            notification_id=f"{EVENT_TYPE}_{self.panel}",
+        )
+        self._set_problem(True, reason)
+
+    async def _config_contents(self) -> tuple[str, str]:
+        """(unit, env): unit from the bundled payload, env re-rendered from entry data.
+
+        Always regenerated from known-good sources — never read back from the
+        panel — so a repair also heals config drift.
+        """
+        unit = await self.hass.async_add_executor_job(
+            (_payload_dir() / "brilliant-mqtt.service").read_text
+        )
+        data = self.entry.data
+        env = panel_ops.render_env(
+            panel=self.panel,
+            mesh_priority=data[CONF_MESH_PRIORITY],
+            mqtt_host=data[CONF_MQTT_HOST],
+            mqtt_port=data[CONF_MQTT_PORT],
+            mqtt_username=data[CONF_MQTT_USERNAME],
+            mqtt_password=data[CONF_MQTT_PASSWORD],
+        )
+        return unit, env
+
+    async def async_repair(self, trigger: str = "manual") -> None:
+        """Restore unit/env + enable; recovery is confirmed by the availability LWT."""
+        if self._repairing:
+            return
+        self._repairing = True
+        self._fire(EVENT_REPAIR_STARTED, {"trigger": trigger})
+        try:
+            async with self._ssh_lock:
+                shell = self._shell()
+                try:
+                    await shell.connect()
+                except (OSError, asyncssh.Error, PanelOpError) as err:
+                    self._fire(EVENT_REPAIR_FAILED, {"reason": "unreachable"})
+                    self._set_problem(True, f"panel unreachable: {err}")
+                    self._grace_cancel = async_call_later(
+                        self.hass, _UNREACHABLE_RECHECK_SECONDS, self._grace_expired
+                    )
+                    return
+                try:
+                    await panel_ops.inspect_panel(shell)  # logged context (journal on fail)
+                    unit, env = await self._config_contents()
+                    await panel_ops.ensure_configs(shell, unit, env)
+                    await panel_ops.enable_now(shell)
+                finally:
+                    await shell.close()
+            self._last_repair_mono = time.monotonic()
+            self._recovery_cancel = async_call_later(
+                self.hass, _RECOVERY_SECONDS, self._recovery_timeout
+            )
+        finally:
+            self._repairing = False
+
+    async def _recovery_timeout(self, _now: datetime) -> None:
+        self._recovery_cancel = None
+        if self.availability == AVAILABILITY_ONLINE:
+            return
+        journal = ""
+        try:
+            async with self._ssh_lock:
+                shell = self._shell()
+                await shell.connect()
+                try:
+                    journal = await panel_ops.collect_journal(shell, 50)
+                finally:
+                    await shell.close()
+        except (OSError, asyncssh.Error, PanelOpError):
+            _LOGGER.warning("%s: could not collect journal after failed repair", self.panel)
+        self._fire(EVENT_REPAIR_FAILED, {"reason": "still_offline", "journal": journal})
+        self._escalate(
+            "repair ran but the bridge did not come back — probable bus-lib API drift "
+            "after the firmware update; the agent needs a code fix"
+        )
 
     async def _on_meta(self, msg: ReceiveMessage) -> None:
         try:
@@ -86,4 +273,32 @@ class PanelManager:
             _LOGGER.warning("%s: bridge meta is not a JSON object: %r", self.panel, msg.payload)
             return
         self.meta = meta
+        firmware = meta.get("panel_firmware")
+        previous = self.entry.data.get(DATA_LAST_FIRMWARE)
+        if firmware and firmware != previous:
+            self.hass.config_entries.async_update_entry(
+                self.entry, data={**self.entry.data, DATA_LAST_FIRMWARE: firmware}
+            )
+            if previous is not None:
+                self._fire(
+                    EVENT_PANEL_UPDATED,
+                    {"old_firmware": previous, "new_firmware": firmware},
+                )
+                self.entry.async_create_background_task(
+                    self.hass, self._refresh_staged_copies(), name=f"{self.panel}-staged"
+                )
         self._notify()
+
+    async def _refresh_staged_copies(self) -> None:
+        """Post-OTA hygiene when the bridge survived: re-write /etc + staged copies."""
+        try:
+            async with self._ssh_lock:
+                shell = self._shell()
+                await shell.connect()
+                try:
+                    unit, env = await self._config_contents()
+                    await panel_ops.ensure_configs(shell, unit, env)
+                finally:
+                    await shell.close()
+        except (OSError, asyncssh.Error, PanelOpError):
+            _LOGGER.warning("%s: staged-copy refresh failed; will retry next reconcile", self.panel)
