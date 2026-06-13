@@ -216,12 +216,15 @@ AUX_SPECS: dict[DeviceKind, tuple[AuxSpec, ...]] = {
         # Panel firmware tag (e.g. "v26.05.20.2") — read-only diagnostic string.
         # Machine consumers should prefer the brilliant/<panel>/bridge meta topic;
         # this entity exists for humans and user automations.
+        # A blank tag means "unknown" — gated to match _sw_version_from (bridge.py),
+        # the other reader of this variable.
         AuxSpec(
             var="current_release_tag",
             component="sensor",
             name="Firmware",
             value_kind="str",
             entity_category="diagnostic",
+            skip_values=("",),
         ),
     ),
     DeviceKind.UI: (
