@@ -15,6 +15,7 @@ import json
 
 import pytest
 
+from brilliant_mqtt import __version__
 from brilliant_mqtt.bridge import Bridge, _state_payload
 from brilliant_mqtt.commands import VarSet
 from brilliant_mqtt.model import BrilliantDevice, DeviceKind, Variable
@@ -1265,3 +1266,52 @@ class TestM11MeshEndToEnd:
         assert bus.commands == [
             ("ble_mesh", MESH_PID, [VarSet("on", "1"), VarSet("intensity", "1000")])
         ]
+
+
+# ---------------------------------------------------------------------------
+# Bridge meta topic (agent_version + panel_firmware), Milestone 12
+# ---------------------------------------------------------------------------
+
+
+def _hardware_device() -> BrilliantDevice:
+    return BrilliantDevice(
+        device_id="device_hw",
+        peripheral_id="hardware_peripheral_0",
+        name="Hardware",
+        kind=DeviceKind.HARDWARE,
+        variables={
+            "current_release_tag": Variable("current_release_tag", "v26.05.20.2"),
+        },
+    )
+
+
+async def test_reconcile_publishes_bridge_meta(dimmer: BrilliantDevice) -> None:
+    bus = FakeBus([dimmer, _hardware_device()])
+    mqtt = FakeMqtt()
+    await Bridge(bus, mqtt, PANEL).reconcile()
+
+    meta = [(t, p, r) for (t, p, r) in mqtt.published if t == f"brilliant/{PANEL}/bridge"]
+    assert len(meta) == 1
+    _topic, payload, retain = meta[0]
+    assert retain is True
+    assert json.loads(payload) == {
+        "agent_version": __version__,
+        "panel_firmware": "v26.05.20.2",
+    }
+
+
+async def test_reconcile_meta_omits_firmware_when_unknown(dimmer: BrilliantDevice) -> None:
+    bus = FakeBus([dimmer])
+    mqtt = FakeMqtt()
+    await Bridge(bus, mqtt, PANEL).reconcile()
+
+    payload = next(p for (t, p, _r) in mqtt.published if t == f"brilliant/{PANEL}/bridge")
+    assert json.loads(payload) == {"agent_version": __version__}
+
+
+async def test_mesh_bridge_publishes_no_meta(dimmer: BrilliantDevice) -> None:
+    bus = FakeBus([dimmer])
+    mqtt = FakeMqtt()
+    await Bridge(bus, mqtt, "mesh").reconcile()
+
+    assert not any(t == "brilliant/mesh/bridge" for (t, _p, _r) in mqtt.published)
