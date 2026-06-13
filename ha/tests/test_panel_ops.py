@@ -16,7 +16,7 @@ from tests.fakes import FakeShell
 
 _FULL_INSPECT = RunResult(
     0,
-    "unit=1\nenv=1\nenabled=1\nactive=1\nsunit=1\nsenv=1\n0.2.0\n",
+    "unit=1\nenv=1\nenabled=1\nactive=1\nsunit=1\nsenv=1\n9.9.9\n",
     "",
 )
 
@@ -36,17 +36,17 @@ async def test_inspect_parses_healthy_panel() -> None:
         active=True,
         staged_unit_present=True,
         staged_env_present=True,
-        payload_version="0.2.0",
+        payload_version="9.9.9",
     )
 
 
 async def test_inspect_parses_wiped_etc() -> None:
-    wiped = RunResult(0, "unit=0\nenv=0\nenabled=0\nactive=0\nsunit=1\nsenv=1\n0.2.0\n", "")
+    wiped = RunResult(0, "unit=0\nenv=0\nenabled=0\nactive=0\nsunit=1\nsenv=1\n9.9.9\n", "")
     shell = await _connected(FakeShell(responses={panel_ops.INSPECT_COMMAND: wiped}))
     state = await panel_ops.inspect_panel(shell)
     assert not state.unit_present and not state.env_present
     assert state.staged_unit_present and state.staged_env_present
-    assert state.payload_version == "0.2.0"
+    assert state.payload_version == "9.9.9"
 
 
 async def test_inspect_handles_pre_integration_install() -> None:
@@ -210,11 +210,11 @@ _EXPECTED_SWAP = " && ".join(
 
 async def test_deploy_payload_uploads_tree_then_swaps() -> None:
     shell = await _connected(FakeShell())
-    await panel_ops.deploy_payload(shell, "/local/payload", version="0.2.0")
+    await panel_ops.deploy_payload(shell, "/local/payload", version="9.9.9")
     assert shell.commands[0] == "rm -rf /var/brilliant-mqtt.staging"
     assert shell.dir_uploads == [("/local/payload", "/var/brilliant-mqtt.staging")]
     assert _EXPECTED_SWAP in shell.commands
-    assert ("/var/brilliant-mqtt/VERSION", b"0.2.0", 0o644) in shell.uploads
+    assert ("/var/brilliant-mqtt/VERSION", b"9.9.9", 0o644) in shell.uploads
 
 
 async def test_deploy_payload_failed_upload_records_no_destructive_swap() -> None:
@@ -222,7 +222,7 @@ async def test_deploy_payload_failed_upload_records_no_destructive_swap() -> Non
     # pre-stage `rm -rf <staging>` may run before put_dir; nothing after.
     shell = await _connected(FakeShell(put_dir_error=OSError("transfer aborted")))
     with pytest.raises(OSError, match="transfer aborted"):
-        await panel_ops.deploy_payload(shell, "/local/payload", version="0.2.0")
+        await panel_ops.deploy_payload(shell, "/local/payload", version="9.9.9")
     assert shell.commands == ["rm -rf /var/brilliant-mqtt.staging"]
     assert shell.uploads == []  # VERSION not written
 
@@ -232,7 +232,7 @@ async def test_deploy_payload_raises_and_skips_version_when_swap_fails() -> None
     # so a panel that failed to swap is never stamped with the new version.
     shell = await _connected(FakeShell(responses={_EXPECTED_SWAP: RunResult(1, "", "mv failed\n")}))
     with pytest.raises(panel_ops.PanelOpError, match="exited 1"):
-        await panel_ops.deploy_payload(shell, "/local/payload", version="0.2.0")
+        await panel_ops.deploy_payload(shell, "/local/payload", version="9.9.9")
     assert shell.uploads == []  # VERSION not written
 
 
