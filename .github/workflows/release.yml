@@ -21,7 +21,7 @@ jobs:
       - name: Build the bundled agent payload
         run: ./scripts/build_payload.sh
       - name: Build zip (manifest.json at the zip root, as HACS extracts it)
-        run: cd ha/custom_components/brilliant_mqtt && zip -r ../../../brilliant_mqtt.zip .
+        run: cd ha/custom_components/brilliant_mqtt && zip -r ../../../brilliant_mqtt.zip . -x "*/__pycache__/*" -x "__pycache__/*"
       - name: Upload the zip to the release
         run: gh release upload "$GITHUB_REF_NAME" brilliant_mqtt.zip --clobber
         env:
