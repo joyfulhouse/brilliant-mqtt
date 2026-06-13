@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
+import asyncssh
 from homeassistant.core import HomeAssistant
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
@@ -117,6 +118,96 @@ async def test_reconfigure_rejects_control_character(hass: HomeAssistant) -> Non
         )
     assert result["type"] == "form"
     assert result["errors"] == {CONF_ROOT_PASSWORD: "invalid_value"}
+
+
+async def test_reconfigure_same_host_verifies_against_stored_pin(hass: HomeAssistant) -> None:
+    """Same host → _validate_ssh is called WITH the stored pin so the password is
+    verified against the known-good key before being offered (no fresh TOFU)."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="office",
+        data={
+            CONF_PANEL: "office",
+            CONF_HOST: "10.100.0.10",
+            CONF_ROOT_PASSWORD: "oldpass",
+            DATA_SSH_HOST_KEY: "ssh-ed25519 STORED",
+        },
+    )
+    entry.add_to_hass(hass)
+    result = await entry.start_reconfigure_flow(hass)
+
+    with patch(VALIDATE, return_value="ssh-ed25519 STORED") as validate:
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {CONF_HOST: "10.100.0.10", CONF_ROOT_PASSWORD: "newpass"},
+        )
+
+    assert result["type"] == "abort"
+    assert result["reason"] == "reconfigure_successful"
+    # The same-host path must pass the STORED pin (verify-before-auth), never None.
+    assert validate.call_args.kwargs["pinned_key"] == "ssh-ed25519 STORED"
+    assert entry.data[CONF_ROOT_PASSWORD] == "newpass"
+    assert entry.data[DATA_SSH_HOST_KEY] == "ssh-ed25519 STORED"
+
+
+async def test_reconfigure_same_host_key_mismatch_shows_error_and_keeps_pin(
+    hass: HomeAssistant,
+) -> None:
+    """Same host where the pinned connect fails host-key verification → form with
+    host_key_changed and the stored pin is UNCHANGED (no silent re-pin / TOFU bypass)."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="office",
+        data={
+            CONF_PANEL: "office",
+            CONF_HOST: "10.100.0.10",
+            CONF_ROOT_PASSWORD: "oldpass",
+            DATA_SSH_HOST_KEY: "ssh-ed25519 STORED",
+        },
+    )
+    entry.add_to_hass(hass)
+    result = await entry.start_reconfigure_flow(hass)
+
+    with patch(VALIDATE, side_effect=asyncssh.HostKeyNotVerifiable("changed")):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {CONF_HOST: "10.100.0.10", CONF_ROOT_PASSWORD: "newpass"},
+        )
+
+    assert result["type"] == "form"
+    assert result["errors"] == {"base": "host_key_changed"}
+    # No silent re-pin, and the rotated password was NOT written to the entry.
+    assert entry.data[DATA_SSH_HOST_KEY] == "ssh-ed25519 STORED"
+    assert entry.data[CONF_ROOT_PASSWORD] == "oldpass"
+
+
+async def test_reconfigure_different_host_does_fresh_tofu(hass: HomeAssistant) -> None:
+    """A changed host is a new endpoint → _validate_ssh is called with pinned_key=None
+    (fresh TOFU) and the entry re-pins to the new host's key."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="office",
+        data={
+            CONF_PANEL: "office",
+            CONF_HOST: "10.100.0.10",
+            CONF_ROOT_PASSWORD: "oldpass",
+            DATA_SSH_HOST_KEY: "ssh-ed25519 STORED",
+        },
+    )
+    entry.add_to_hass(hass)
+    result = await entry.start_reconfigure_flow(hass)
+
+    with patch(VALIDATE, return_value="ssh-ed25519 NEWHOST") as validate:
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {CONF_HOST: "10.100.0.99", CONF_ROOT_PASSWORD: "oldpass"},
+        )
+
+    assert result["type"] == "abort"
+    assert result["reason"] == "reconfigure_successful"
+    assert validate.call_args.kwargs["pinned_key"] is None  # fresh TOFU for the new host
+    assert entry.data[CONF_HOST] == "10.100.0.99"
+    assert entry.data[DATA_SSH_HOST_KEY] == "ssh-ed25519 NEWHOST"
 
 
 async def test_options_flow_saves_behavior_knobs(hass: HomeAssistant) -> None:
