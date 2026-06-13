@@ -327,6 +327,79 @@ async def test_shutdown_during_inflight_repair_leaks_no_timer(
     assert manager._grace_cancel is None
 
 
+@pytest.mark.allow_lingering_timers
+async def test_agent_update_step_failure_escalates_and_arms_no_timer(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    payload_dir: Path,
+) -> None:
+    """async_update_agent mirrors the C2 repair fix: a failed SSH step escalates.
+
+    `systemctl restart` exits non-zero → panel_ops raises PanelOpError out of
+    restart(). The update must escalate (needs_attention + problem) instead of
+    letting the exception escape, and must NOT arm a recovery timer (we returned
+    before the success path) — so unloading is clean.
+    """
+    from custom_components.brilliant_mqtt.shell import RunResult
+
+    shell = FakeShell(responses={"systemctl restart brilliant-mqtt": RunResult(1, "", "boom")})
+    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+        entry = await _setup(hass)
+        events = _capture_events(hass)
+        await entry.runtime_data.async_update_agent()
+        await hass.async_block_till_done()
+
+    assert "agent_updated" not in _types(events)
+    assert _types(events)[-1] == "needs_attention"
+    assert entry.runtime_data.problem is True
+    assert entry.runtime_data.problem_reason is not None
+    assert "agent update failed" in entry.runtime_data.problem_reason
+    assert shell.dir_uploads  # payload reached the panel before the failing restart
+    assert entry.runtime_data._recovery_cancel is None  # no timer armed on the failure path
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_shutdown_during_inflight_agent_update_leaks_no_timer(
+    hass: HomeAssistant, payload_dir: Path
+) -> None:
+    """C1 (success site) for async_update_agent: shutdown mid-update arms no timer.
+
+    NOT marked allow_lingering_timers: runs under the strict guard. The update is
+    wedged inside the gated connect(); async_shutdown latches _shutting_down while it
+    is held in the ssh_lock, then the resumed update runs the full SUCCESS path and
+    the _shutting_down guard (no await before the schedule) must suppress the recovery
+    timer. No mqtt_mock → the only timer that could linger is the manager's.
+    """
+    import asyncio
+
+    from custom_components.brilliant_mqtt.manager import PanelManager
+
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+
+    gate = asyncio.Event()
+    shell = FakeShell(connect_gate=gate)
+    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+        manager = PanelManager(hass, entry, asyncio.Lock())
+
+        update = hass.async_create_task(manager.async_update_agent())
+        await shell.connect_entered.wait()  # wedged inside connect(), holding the ssh_lock
+
+        await manager.async_shutdown()
+        assert manager._shutting_down is True
+
+        gate.set()
+        await update
+
+    # Reached the success path (payload + configs written, service restarted) ...
+    assert shell.dir_uploads
+    assert "systemctl restart brilliant-mqtt" in shell.commands
+    # ... but did NOT arm a recovery timer on the torn-down entry.
+    assert manager._recovery_cancel is None
+    assert manager._grace_cancel is None
+
+
 async def test_shutdown_during_inflight_repair_connect_fail_leaks_no_timer(
     hass: HomeAssistant,
 ) -> None:
