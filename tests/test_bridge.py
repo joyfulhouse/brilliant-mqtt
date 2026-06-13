@@ -15,6 +15,7 @@ import json
 
 import pytest
 
+from brilliant_mqtt import __version__
 from brilliant_mqtt.bridge import Bridge, _state_payload
 from brilliant_mqtt.commands import VarSet
 from brilliant_mqtt.model import BrilliantDevice, DeviceKind, Variable
@@ -1265,3 +1266,81 @@ class TestM11MeshEndToEnd:
         assert bus.commands == [
             ("ble_mesh", MESH_PID, [VarSet("on", "1"), VarSet("intensity", "1000")])
         ]
+
+
+# ---------------------------------------------------------------------------
+# Bridge meta topic (agent_version + panel_firmware), Milestone 12
+# ---------------------------------------------------------------------------
+
+
+def _hardware_device(tag: str = "v26.05.20.2") -> BrilliantDevice:
+    return BrilliantDevice(
+        device_id="device_hw",
+        peripheral_id="hardware_peripheral_0",
+        name="Hardware",
+        kind=DeviceKind.HARDWARE,
+        variables={
+            "current_release_tag": Variable("current_release_tag", tag),
+        },
+    )
+
+
+async def test_reconcile_publishes_bridge_meta(dimmer: BrilliantDevice) -> None:
+    bus = FakeBus([dimmer, _hardware_device()])
+    mqtt = FakeMqtt()
+    await Bridge(bus, mqtt, PANEL).reconcile()
+
+    meta = [(t, p, r) for (t, p, r) in mqtt.published if t == f"brilliant/{PANEL}/bridge"]
+    assert len(meta) == 1
+    _topic, payload, retain = meta[0]
+    assert retain is True
+    assert json.loads(payload) == {
+        "agent_version": __version__,
+        "panel_firmware": "v26.05.20.2",
+    }
+
+
+async def test_reconcile_meta_omits_firmware_when_unknown(dimmer: BrilliantDevice) -> None:
+    bus = FakeBus([dimmer])
+    mqtt = FakeMqtt()
+    await Bridge(bus, mqtt, PANEL).reconcile()
+
+    payload = next(p for (t, p, _r) in mqtt.published if t == f"brilliant/{PANEL}/bridge")
+    assert json.loads(payload) == {"agent_version": __version__}
+
+
+async def test_mesh_bridge_publishes_no_meta(dimmer: BrilliantDevice) -> None:
+    bus = FakeBus([dimmer])
+    mqtt = FakeMqtt()
+    await Bridge(bus, mqtt, "mesh").reconcile()
+
+    assert not any(t == "brilliant/mesh/bridge" for (t, _p, _r) in mqtt.published)
+
+
+async def test_reconcile_republishes_meta_on_firmware_change(dimmer: BrilliantDevice) -> None:
+    """The contract the companion integration exists for: reconcile re-reads the
+    firmware tag every pass, so an OTA between reconciles updates the meta."""
+    bus = FakeBus([dimmer, _hardware_device()])
+    mqtt = FakeMqtt()
+    bridge = Bridge(bus, mqtt, PANEL)
+    await bridge.reconcile()
+
+    bus.set_devices([dimmer, _hardware_device(tag="v26.07.01.1")])
+    await bridge.reconcile()
+
+    meta = [p for (t, p, _r) in mqtt.published if t == f"brilliant/{PANEL}/bridge"]
+    assert len(meta) == 2
+    assert json.loads(meta[-1]) == {
+        "agent_version": __version__,
+        "panel_firmware": "v26.07.01.1",
+    }
+
+
+async def test_reconcile_meta_published_with_zero_devices() -> None:
+    """agent_version is always present, even when the bus enumerates nothing."""
+    bus = FakeBus([])
+    mqtt = FakeMqtt()
+    await Bridge(bus, mqtt, PANEL).reconcile()
+
+    payload = next(p for (t, p, _r) in mqtt.published if t == f"brilliant/{PANEL}/bridge")
+    assert json.loads(payload) == {"agent_version": __version__}

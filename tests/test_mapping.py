@@ -520,9 +520,9 @@ def test_singleton_kind_aux_names_not_prefixed() -> None:
 # --- HARDWARE ---------------------------------------------------------------
 
 
-def test_hardware_yields_eight() -> None:
+def test_hardware_yields_nine() -> None:
     result = entities_for(_hardware(), "office")
-    assert len(result) == 8
+    assert len(result) == 9
 
 
 def test_hardware_screen_brightness_number() -> None:
@@ -564,7 +564,7 @@ def test_hardware_without_camera_yields_no_camera_descriptor() -> None:
     del device.variables["camera_on"]
     by_uid = _by_uid(entities_for(device, "office"))
     assert "brilliant_office_hardware_peripheral_camera_on" not in by_uid
-    assert len(by_uid) == 7
+    assert len(by_uid) == 8
 
 
 # --- UI ---------------------------------------------------------------------
@@ -684,6 +684,7 @@ def test_payload_fields_hardware() -> None:
         "cpu_temperature": 61.0,
         "camera_on": False,
         "privacy_toggle": False,
+        "current_release_tag": "v26.05.20.2",
     }
 
 
@@ -834,3 +835,69 @@ def test_sentinel_gate_leaves_other_specs_alone() -> None:
         "brilliant_office_gangbox_peripheral_1_temperature",
         "brilliant_office_gangbox_peripheral_1_is_safe",
     }
+
+
+# ---------------------------------------------------------------------------
+# Firmware diagnostic sensor (HARDWARE current_release_tag, value_kind="str")
+# ---------------------------------------------------------------------------
+
+
+def _hardware_with_release_tag() -> BrilliantDevice:
+    return BrilliantDevice(
+        device_id="dev-hw",
+        peripheral_id="hardware_peripheral_0",
+        name="Hardware",
+        kind=DeviceKind.HARDWARE,
+        variables={
+            "current_release_tag": Variable(name="current_release_tag", value="v26.05.20.2"),
+        },
+    )
+
+
+def test_hardware_firmware_sensor_descriptor() -> None:
+    descriptors = entities_for(_hardware_with_release_tag(), "office")
+    fw = [d for d in descriptors if d.unique_id.endswith("_current_release_tag")]
+    assert len(fw) == 1
+    d = fw[0]
+    assert d.component == "sensor"
+    assert d.name == "Firmware"
+    assert d.entity_category == "diagnostic"
+    assert d.value_kind == "str"
+    assert d.command_var is None  # read-only: sensors never mint a command topic
+    assert d.value_key == "current_release_tag"
+
+
+def test_hardware_firmware_payload_renders_string() -> None:
+    fields = payload_fields(_hardware_with_release_tag())
+    assert fields["current_release_tag"] == "v26.05.20.2"
+
+
+def test_hardware_without_release_tag_has_no_firmware_entries() -> None:
+    bare = BrilliantDevice(
+        device_id="dev-hw2",
+        peripheral_id="hardware_peripheral_1",
+        name="Hardware",
+        kind=DeviceKind.HARDWARE,
+        variables={},
+    )
+    assert not any(
+        d.unique_id.endswith("_current_release_tag") for d in entities_for(bare, "office")
+    )
+    assert "current_release_tag" not in payload_fields(bare)
+
+
+def test_hardware_blank_release_tag_has_no_firmware_entries() -> None:
+    """A blank tag means "unknown" — matches _sw_version_from's gate on the same var."""
+    blank = BrilliantDevice(
+        device_id="dev-hw3",
+        peripheral_id="hardware_peripheral_2",
+        name="Hardware",
+        kind=DeviceKind.HARDWARE,
+        variables={
+            "current_release_tag": Variable(name="current_release_tag", value=""),
+        },
+    )
+    assert not any(
+        d.unique_id.endswith("_current_release_tag") for d in entities_for(blank, "office")
+    )
+    assert "current_release_tag" not in payload_fields(blank)

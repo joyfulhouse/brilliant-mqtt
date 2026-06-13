@@ -50,9 +50,12 @@ in `CREDENTIALS.local.md`. For any new code tasks use
 
 ## Non-negotiables
 
-- **Python 3.10 only.** The panel interpreter is Python 3.10.9 and that is the
-  runtime. `requires-python = ">=3.10,<3.11"`. This deliberately overrides the
-  global "Python 3.13+" default — do not bump; do not use 3.11+ syntax.
+- **Python 3.10 only (agent, repo root).** The panel interpreter is Python
+  3.10.9 and that is the runtime. `requires-python = ">=3.10,<3.11"`. This
+  deliberately overrides the global "Python 3.13+" default — do not bump; do not
+  use 3.11+ syntax. The **`ha/` sub-project is separate** (companion HA
+  integration, Python 3.14, own `pyproject`/venv) — its gate is
+  `cd ha && uv run ruff check --fix && uv run ruff format && uv run mypy --strict custom_components tests && uv run pytest`.
 - **uv for everything.** `uv sync`, `uv run pytest`, `uv run ruff check --fix`,
   `uv run ruff format`, `uv run mypy --strict src tests`. **Never** `pip`/`pip3`.
 - **TDD.** Failing test → minimal impl → green → commit. Small, frequent commits.
@@ -80,7 +83,9 @@ in `CREDENTIALS.local.md`. For any new code tasks use
 ## Pre-commit gate
 
 `uv run ruff check --fix && uv run ruff format && uv run mypy --strict src tests && uv run pytest`
-— all green before any commit.
+— all green before any commit. **If you changed anything under `ha/`, also run
+the `ha/` gate** (`cd ha && uv run ruff check --fix && uv run ruff format && uv run mypy --strict custom_components tests && uv run pytest`)
+— BOTH must be green.
 
 ## Repo / deploy split
 

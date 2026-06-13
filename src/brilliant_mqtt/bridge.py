@@ -12,6 +12,7 @@ import logging
 from collections.abc import Callable
 from dataclasses import replace
 
+from brilliant_mqtt import __version__
 from brilliant_mqtt.commands import VarSet, translate_aux, translate_command
 from brilliant_mqtt.discovery import (
     aux_command_topic,
@@ -19,6 +20,7 @@ from brilliant_mqtt.discovery import (
     command_topic,
     config_payload,
     config_topic,
+    meta_topic,
     state_topic,
 )
 from brilliant_mqtt.mapping import EntityDescriptor, entities_for, payload_fields
@@ -26,6 +28,10 @@ from brilliant_mqtt.model import BrilliantDevice, DeviceKind, Variable
 from brilliant_mqtt.protocols import BusClient, MqttClient
 
 logger = logging.getLogger(__name__)
+
+# Reserved pseudo-panel slug — the mesh bridge instance publishes no meta topic
+# (there is no single host behind it; see discovery.config_payload's mesh branch).
+_MESH_PANEL = "mesh"
 
 
 def _state_payload(device: BrilliantDevice) -> str:
@@ -122,6 +128,18 @@ class Bridge:
         # Pre-pass: the panel firmware version (from the HARDWARE peripheral) is
         # attached to every entity's HA device block so the device page shows it.
         sw_version = _sw_version_from(devices)
+
+        # Bridge meta: the companion integration's machine contract. Retained and
+        # republished on every reconcile (idempotent, like discovery configs).
+        if self._panel != _MESH_PANEL:
+            meta: dict[str, str] = {"agent_version": __version__}
+            if sw_version is not None:
+                meta["panel_firmware"] = sw_version
+            await self._mqtt.publish(
+                meta_topic(self._panel),
+                json.dumps(meta, sort_keys=True),
+                retain=True,
+            )
 
         n_devices = n_entities = 0
         for device in devices:

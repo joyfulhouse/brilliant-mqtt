@@ -56,7 +56,10 @@ addition to the panel's own site-packages it already exposes).
   re-run a read-only bus smoke test (connect, `get_all()`, subscribe) on one
   panel to confirm the bus API is unchanged, then let the rest update.
 - If a unit in `/etc/systemd/system` does NOT survive OTA on your firmware,
-  re-install + re-enable it as a post-OTA step in your automation.
+  re-install + re-enable it as a post-OTA step. The companion HA integration
+  (see `docs/ha-integration.md`) automates exactly this: it watches the panel's
+  availability LWT + `brilliant/<panel>/bridge` meta topic, and restores the
+  unit/env from the copies it stages under `/var/brilliant-mqtt/system/`.
 
 ## Roll-out order
 
@@ -76,3 +79,5 @@ addition to the panel's own site-packages it already exposes).
   paired) remains the control path.
 - Discovery topics are retained — to fully remove an entity from HA, publish an
   empty retained payload to its `homeassistant/<component>/<unique_id>/config`.
+- When decommissioning a panel entirely, also clear its retained
+  `brilliant/<panel>/bridge` meta topic the same way.

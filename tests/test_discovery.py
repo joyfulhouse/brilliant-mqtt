@@ -11,6 +11,7 @@ from brilliant_mqtt.discovery import (
     command_topic,
     config_payload,
     config_topic,
+    meta_topic,
     state_topic,
 )
 from brilliant_mqtt.mapping import EntityDescriptor
@@ -645,3 +646,12 @@ def test_non_mesh_device_block_unchanged() -> None:
     data = json.loads(config_payload(_light_dimmer_descriptor()))
     assert data["device"]["name"] == "Brilliant Office"
     assert data["device"]["model"] == "Control"
+
+
+# ===========================================================================
+# M12 — bridge meta topic
+# ===========================================================================
+
+
+def test_meta_topic() -> None:
+    assert meta_topic("office") == "brilliant/office/bridge"
