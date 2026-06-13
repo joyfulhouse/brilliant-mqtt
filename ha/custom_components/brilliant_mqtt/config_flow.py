@@ -173,25 +173,32 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
                 # so fresh TOFU like adding a panel.
                 host_unchanged = user_input[CONF_HOST] == entry.data[CONF_HOST]
                 pinned_key = entry.data.get(DATA_SSH_HOST_KEY) if host_unchanged else None
-                try:
-                    host_key = await _validate_ssh(
-                        self.hass,
-                        user_input[CONF_HOST],
-                        user_input[CONF_ROOT_PASSWORD],
-                        pinned_key=pinned_key,
-                    )
-                except asyncssh.HostKeyNotVerifiable:
-                    # Same known-good host but its key no longer matches the pin: a
-                    # reflash — or a MITM. Surface it; never silently re-pin (that is
-                    # the TOFU bypass). The stored pin and password are left untouched.
+                if host_unchanged and pinned_key is None:
+                    # Defense-in-depth: same host but no stored pin (not reachable today
+                    # — every entry-write pins — but robust against a future schema
+                    # change). Fail closed: an unpinned connect here would re-offer the
+                    # root password to an unverified host, re-opening the bypass.
                     errors["base"] = "host_key_changed"
-                except (OSError, asyncssh.Error):
-                    errors["base"] = "cannot_connect"
                 else:
-                    return self.async_update_reload_and_abort(
-                        entry,
-                        data={**entry.data, **user_input, DATA_SSH_HOST_KEY: host_key},
-                    )
+                    try:
+                        host_key = await _validate_ssh(
+                            self.hass,
+                            user_input[CONF_HOST],
+                            user_input[CONF_ROOT_PASSWORD],
+                            pinned_key=pinned_key,
+                        )
+                    except asyncssh.HostKeyNotVerifiable:
+                        # Same known-good host but its key no longer matches the pin: a
+                        # reflash — or a MITM. Surface it; never silently re-pin (that is
+                        # the bypass). The stored pin and password are left untouched.
+                        errors["base"] = "host_key_changed"
+                    except (OSError, asyncssh.Error):
+                        errors["base"] = "cannot_connect"
+                    else:
+                        return self.async_update_reload_and_abort(
+                            entry,
+                            data={**entry.data, **user_input, DATA_SSH_HOST_KEY: host_key},
+                        )
         schema = vol.Schema(
             {
                 vol.Required(CONF_HOST, default=entry.data[CONF_HOST]): str,

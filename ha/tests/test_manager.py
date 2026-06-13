@@ -582,6 +582,38 @@ async def test_on_availability_ignored_after_shutdown(hass: HomeAssistant) -> No
     assert manager._grace_cancel is None  # no timer armed post-shutdown
 
 
+async def test_on_meta_ignored_after_shutdown(hass: HomeAssistant) -> None:
+    """Defense-in-depth parity with _on_availability: a bridge-meta message arriving
+    after async_shutdown must be ignored — the guard returns before storing meta (so it
+    also can't spawn a staged-copy task on a torn-down entry).
+
+    Constructed directly like the other shutdown tests; no mqtt_mock.
+    """
+    import asyncio
+
+    from homeassistant.components.mqtt.models import ReceiveMessage
+
+    from custom_components.brilliant_mqtt.manager import PanelManager
+
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    manager = PanelManager(hass, entry, asyncio.Lock())
+
+    await manager.async_shutdown()
+    assert manager._shutting_down is True
+
+    meta = ReceiveMessage(
+        topic="brilliant/office/bridge",
+        payload='{"agent_version": "0.2.0", "panel_firmware": "v1"}',
+        qos=0,
+        retain=True,
+        subscribed_topic="brilliant/office/bridge",
+        timestamp=dt_util.utcnow().timestamp(),
+    )
+    await manager._on_meta(meta)
+    assert manager.meta is None  # guard returned before storing
+
+
 async def test_shutdown_during_inflight_repair_connect_fail_leaks_no_timer(
     hass: HomeAssistant,
 ) -> None:
