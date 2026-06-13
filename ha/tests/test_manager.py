@@ -275,14 +275,22 @@ async def test_repair_step_failure_escalates_and_sets_problem(
     assert await hass.config_entries.async_unload(entry.entry_id)
 
 
-async def test_shutdown_during_inflight_repair_leaks_no_timer(hass: HomeAssistant) -> None:
-    """C1: shutdown while a repair is wedged inside the ssh_lock leaks no timer.
+async def test_shutdown_during_inflight_repair_leaks_no_timer(
+    hass: HomeAssistant, payload_dir: Path
+) -> None:
+    """C1 (success site): shutdown mid-repair must not arm the recovery timer.
 
     NOT marked allow_lingering_timers: runs under the strict guard. Without the
     _shutting_down flag, the repair resumes after async_shutdown's single up-front
-    cancel and schedules a recovery timer that fires on a torn-down entry (SSHing a
-    removed panel). Built without mqtt_mock so the only timer that could linger is the
-    manager's. The repair is wedged by gating FakeShell.connect on an event.
+    cancel and schedules a recovery timer (manager.py success site, ~267) that fires
+    on a torn-down entry and SSHes a removed panel. Built without mqtt_mock so the only
+    timer that could linger is the manager's. The repair is wedged by gating
+    FakeShell.connect on an event.
+
+    `payload_dir` is REQUIRED: it makes _config_contents() succeed so the gated repair
+    traverses the SUCCESS path to the recovery-timer schedule site. Without it,
+    _config_contents() raises FileNotFoundError, the C2 step handler returns first, and
+    the success-site guard is never reached (the bug the re-review caught).
     """
     import asyncio
 
@@ -306,10 +314,54 @@ async def test_shutdown_during_inflight_repair_leaks_no_timer(hass: HomeAssistan
         await manager.async_shutdown()
         assert manager._shutting_down is True
 
-        # Let the wedged repair resume and run to completion.
+        # Let the wedged repair resume and run to completion down the SUCCESS path.
         gate.set()
         await repair
 
-    # The resumed repair must NOT have scheduled a recovery timer on the dead entry.
+    # Prove the repair genuinely reached the success path (so the success-site guard,
+    # not the C2 handler, is what suppressed the schedule) ...
+    assert shell.uploads  # ensure_configs wrote unit/env → success path was traversed
+    assert "systemctl enable --now brilliant-mqtt" in shell.commands
+    # ... and that it did NOT arm a recovery timer on the dead entry.
     assert manager._recovery_cancel is None
     assert manager._grace_cancel is None
+
+
+async def test_shutdown_during_inflight_repair_connect_fail_leaks_no_timer(
+    hass: HomeAssistant,
+) -> None:
+    """C1 (connect-fail site): shutdown mid-repair must not arm the recheck timer.
+
+    NOT marked allow_lingering_timers: runs under the strict guard. The gated connect
+    RAISES once released, so the repair takes the connect-fail branch (manager.py ~241)
+    whose recheck schedule into _grace_cancel must be suppressed by the success-of-the-
+    other-kind _shutting_down guard. No mqtt_mock → the only timer that could linger is
+    the manager's. No payload_dir needed: this path never renders config.
+    """
+    import asyncio
+
+    from custom_components.brilliant_mqtt.manager import PanelManager
+
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+
+    gate = asyncio.Event()
+    # Wedge inside connect() (connect_entered fires before the gate), then fail once
+    # released — so _shutting_down is already True when the connect-fail branch runs.
+    shell = FakeShell(connect_gate=gate, connect_error=OSError("unreachable"))
+    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+        manager = PanelManager(hass, entry, asyncio.Lock())
+
+        repair = hass.async_create_task(manager.async_repair(trigger="auto"))
+        await shell.connect_entered.wait()
+        assert manager._repairing is True
+
+        await manager.async_shutdown()
+        assert manager._shutting_down is True
+
+        gate.set()
+        await repair
+
+    # The connect-fail branch must NOT have armed the unreachable-recheck timer.
+    assert manager._grace_cancel is None
+    assert manager._recovery_cancel is None
