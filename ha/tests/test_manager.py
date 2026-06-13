@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import timedelta
 from pathlib import Path
+from typing import Any, cast
 from unittest.mock import patch
 
 import pytest
@@ -37,6 +39,18 @@ def _capture_events(hass: HomeAssistant) -> list[Event]:
 
 def _types(events: list[Event]) -> list[str]:
     return [e.data["type"] for e in events]
+
+
+def _timer_cancelled(cancel: object) -> bool:
+    """Whether the asyncio.TimerHandle behind an async_call_later() cancel is cancelled.
+
+    async_call_later returns `loop.call_at(...).cancel` — a bound method whose
+    __self__ is the TimerHandle. We reach it through an Any cast so the manager's
+    _recovery_cancel can keep its narrow CALLBACK_TYPE annotation (it really is a bound
+    method at runtime) without a type: ignore.
+    """
+    handle: asyncio.TimerHandle = cast(Any, cancel).__self__
+    return handle.cancelled()
 
 
 @pytest.mark.allow_lingering_timers
@@ -155,7 +169,10 @@ async def test_firmware_change_fires_event_and_refreshes_staged_copies(
     async_fire_mqtt_message(
         hass, "brilliant/office/bridge", '{"agent_version": "0.2.0", "panel_firmware": "v2"}'
     )
-    await hass.async_block_till_done()
+    # I3: _refresh_staged_copies runs via entry.async_create_background_task; the plain
+    # async_block_till_done() does NOT await background tasks, so fake_shell.uploads was
+    # racily empty (~1-in-4). wait_background_tasks=True makes the SSH assertion stable.
+    await hass.async_block_till_done(wait_background_tasks=True)
     assert _types(events) == ["panel_updated"]
     assert events[0].data["old_firmware"] == "v1"
     assert events[0].data["new_firmware"] == "v2"
@@ -328,25 +345,30 @@ async def test_shutdown_during_inflight_repair_leaks_no_timer(
 
 
 @pytest.mark.allow_lingering_timers
-async def test_agent_update_step_failure_escalates_and_arms_no_timer(
+async def test_agent_update_step_failure_escalates_and_raises(
     hass: HomeAssistant,
     mqtt_mock: MqttMockHAClient,
     payload_dir: Path,
 ) -> None:
-    """async_update_agent mirrors the C2 repair fix: a failed SSH step escalates.
+    """I4: async_update_agent runs from the update.install service, so a failed step
+    must escalate AND raise so HA surfaces "install failed" (not a false success).
 
     `systemctl restart` exits non-zero → panel_ops raises PanelOpError out of
-    restart(). The update must escalate (needs_attention + problem) instead of
-    letting the exception escape, and must NOT arm a recovery timer (we returned
-    before the success path) — so unloading is clean.
+    restart(). The update must escalate (needs_attention + problem) and re-raise as
+    HomeAssistantError, and must NOT arm a recovery timer (we returned before the
+    success path) — so unloading is clean. (async_repair, called from timers/button,
+    stays swallow+escalate; only the service-call entry point raises.)
     """
+    from homeassistant.exceptions import HomeAssistantError
+
     from custom_components.brilliant_mqtt.shell import RunResult
 
     shell = FakeShell(responses={"systemctl restart brilliant-mqtt": RunResult(1, "", "boom")})
     with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
         entry = await _setup(hass)
         events = _capture_events(hass)
-        await entry.runtime_data.async_update_agent()
+        with pytest.raises(HomeAssistantError, match="agent update failed"):
+            await entry.runtime_data.async_update_agent()
         await hass.async_block_till_done()
 
     assert "agent_updated" not in _types(events)
@@ -356,6 +378,7 @@ async def test_agent_update_step_failure_escalates_and_arms_no_timer(
     assert "agent update failed" in entry.runtime_data.problem_reason
     assert shell.dir_uploads  # payload reached the panel before the failing restart
     assert entry.runtime_data._recovery_cancel is None  # no timer armed on the failure path
+    assert entry.runtime_data._repairing is False  # mutex released even though we raised
 
     assert await hass.config_entries.async_unload(entry.entry_id)
 
@@ -398,6 +421,81 @@ async def test_shutdown_during_inflight_agent_update_leaks_no_timer(
     # ... but did NOT arm a recovery timer on the torn-down entry.
     assert manager._recovery_cancel is None
     assert manager._grace_cancel is None
+
+
+async def test_update_during_repair_recovery_window_leaks_no_timer(
+    hass: HomeAssistant, payload_dir: Path
+) -> None:
+    """C1: an update during a repair's recovery window must not orphan a timer.
+
+    NOT marked allow_lingering_timers: runs under the strict guard. Two facets of the
+    same bug, both closed by giving async_update_agent the _repairing mutex + a
+    _recovery_cancel cancel before re-arming:
+
+    (a) ORPHAN: a repair arms _recovery_cancel; an update soon after re-arms it. Without
+        cancelling the prior handle first, the original TimerHandle is overwritten and
+        survives async_shutdown (which only cancels the *current* handle), firing
+        _recovery_timeout on a torn-down entry → SSH to a removed panel. We assert the
+        prior handle is cancelled, exactly one live recovery timer remains, and shutdown
+        leaves nothing (the strict guard fails if the orphan lives).
+    (b) CONCURRENT GRACE: during the update's restart the agent goes offline; without the
+        mutex held, _on_availability arms a grace timer (grace + recovery for one panel).
+        We fire an offline LWT while the update is wedged in its SSH section and assert
+        _grace_cancel stays None.
+    """
+    import asyncio
+
+    from homeassistant.components.mqtt.models import ReceiveMessage
+
+    from custom_components.brilliant_mqtt.manager import PanelManager
+
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    manager = PanelManager(hass, entry, asyncio.Lock())
+
+    # First a clean repair so we are genuinely inside its recovery window.
+    repair_shell = FakeShell()
+    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=repair_shell):
+        await manager.async_repair(trigger="manual")
+    assert manager._recovery_cancel is not None  # recovery timer armed by the repair
+    prior_recovery = manager._recovery_cancel
+    assert _timer_cancelled(prior_recovery) is False  # the repair's timer is live
+
+    # Now an update lands inside that window. Gate its connect so we can prove facet (b)
+    # (an offline LWT mid-update arms NO grace timer) before letting it finish.
+    gate = asyncio.Event()
+    update_shell = FakeShell(connect_gate=gate)
+    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=update_shell):
+        update = hass.async_create_task(manager.async_update_agent())
+        await update_shell.connect_entered.wait()  # wedged: _repairing True, holds ssh_lock
+        assert manager._repairing is True
+
+        # Facet (b): the restart-induced offline arrives mid-update → must NOT arm grace.
+        offline = ReceiveMessage(
+            topic="brilliant/office/availability",
+            payload="offline",
+            qos=0,
+            retain=True,
+            subscribed_topic="brilliant/office/availability",
+            timestamp=dt_util.utcnow().timestamp(),
+        )
+        await manager._on_availability(offline)
+        assert manager._grace_cancel is None  # mutex held → no concurrent grace timer
+
+        gate.set()
+        await update
+
+    # Facet (a): the repair's recovery handle was cancelled before the update re-armed,
+    # so exactly ONE live recovery timer remains (the update's, a NEW handle).
+    assert _timer_cancelled(prior_recovery) is True  # old timer killed, not orphaned
+    assert manager._recovery_cancel is not None
+    assert manager._recovery_cancel is not prior_recovery  # a fresh handle
+    assert _timer_cancelled(manager._recovery_cancel) is False  # the update's timer is live
+    assert manager._grace_cancel is None
+
+    # Shutdown cancels the one live timer; the strict guard proves nothing lingers.
+    await manager.async_shutdown()
+    assert manager._recovery_cancel is None
 
 
 async def test_shutdown_during_inflight_repair_connect_fail_leaks_no_timer(
