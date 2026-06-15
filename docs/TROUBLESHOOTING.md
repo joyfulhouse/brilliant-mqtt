@@ -54,6 +54,26 @@ Common problems with brilliant-mqtt and how to resolve them.
   anyone (verify by watching `movement_detected` on the bus); illuminance
   reads 0 while `enable_lux=0` on the panel (the default everywhere).
 
+### Mesh-load motion always reads `off` (or read a stuck `on`)
+
+- A BLE-mesh load's **Motion** `binary_sensor` only reflects live presence
+  while that device's motion-scoring subsystem is enabled. With scoring **off**
+  (`enable_motion_score=0`, the device default) the bus value `movement_detected`
+  is a **frozen latch** that never tracks presence — so the bridge publishes
+  `motion=off` rather than the stale value (live-verified 2026-06-14: with
+  scoring off, mesh sensors latched a permanent `occupied` with nobody home).
+  This is why mesh Motion sensors read `off` out of the box.
+- To get **real** mesh presence on a device: enable its **Motion Score
+  Reporting** switch (`enable_motion_score`; a `config`, disabled-by-default
+  entity — enable it in HA first), then tune the thresholds (also disabled-by-
+  default `number` entities, default high 70 / low 20). `movement_detected`
+  trips when `motion_score` rises above **Motion High Threshold** and clears
+  when it falls below **Motion Low Threshold** — so raise the **low** threshold
+  above the device's idle `motion_score` noise floor (sample it with scoring on;
+  if the idle floor sits above the low threshold the sensor never clears).
+- The panel **faceplate** occupancy sensor is a separate subsystem and is not
+  affected by any of the above.
+
 ### Panel load spikes / availability flaps `offline` (reconnect storm)
 
 - Symptom: a panel's `brilliant/<panel>/availability` flips to `offline` (then
