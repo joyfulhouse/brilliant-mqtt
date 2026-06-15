@@ -1220,6 +1220,15 @@ def test_mesh_motion_gated_false_when_enable_var_absent() -> None:
     assert payload_fields(device)["motion"] is False
 
 
+def test_mesh_motion_descriptor_minted_when_enable_var_absent() -> None:
+    """The gate is value-only: the motion entity descriptor is still minted even when
+    enable_motion_score is absent (so HA keeps the sensor; it just reads off)."""
+    device = _mesh_dimmer()
+    device.variables["movement_detected"] = Variable("movement_detected", "1")
+    uids = {d.unique_id for d in entities_for(device, "mesh")}
+    assert f"brilliant_mesh_{MESH_PID}_movement_detected" in uids
+
+
 def test_mesh_motion_gated_false_for_nonmatching_gate_value() -> None:
     """as_bool() is strict (== "1"): a non-"1" gate value (e.g. "true") gates to False."""
     assert payload_fields(_mesh_motion("1", "true"))["motion"] is False
