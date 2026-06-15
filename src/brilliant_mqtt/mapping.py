@@ -563,9 +563,14 @@ def payload_fields(device: BrilliantDevice) -> dict[str, object]:
         rendered = _render_aux(var, spec.value_kind, spec.invert)
         if rendered is None:
             continue
-        # Gate: a reading that is only valid while a sibling variable is enabled
-        # collapses to False when that gate is absent or off (stale subsystem).
+        # Gate: a bool reading that is only valid while a sibling variable is
+        # enabled collapses to a concrete False when that gate is absent or off
+        # (stale subsystem). Only the VALUE is forced — the payload key is still
+        # emitted, so descriptor/payload-key lockstep is preserved.
         if spec.gate_var is not None:
+            assert spec.value_kind == "bool", (
+                f"gate_var supports value_kind='bool' only, not {spec.value_kind!r}"
+            )
             gate = device.variables.get(spec.gate_var)
             if gate is None or not gate.as_bool():
                 rendered = False

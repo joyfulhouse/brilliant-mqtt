@@ -1220,6 +1220,41 @@ def test_mesh_motion_gated_false_when_enable_var_absent() -> None:
     assert payload_fields(device)["motion"] is False
 
 
+def test_mesh_motion_gated_false_for_nonmatching_gate_value() -> None:
+    """as_bool() is strict (== "1"): a non-"1" gate value (e.g. "true") gates to False."""
+    assert payload_fields(_mesh_motion("1", "true"))["motion"] is False
+
+
+def test_mesh_motion_gate_does_not_leak_to_other_aux() -> None:
+    """The gate forces only the gated key — a sibling bool aux (fault) is untouched."""
+    device = _mesh_motion("1", "0")
+    device.variables["is_safe"] = Variable("is_safe", "0")  # fault aux: unsafe -> fault True
+    payload = payload_fields(device)
+    assert payload["motion"] is False  # gated
+    assert payload["fault"] is True  # NOT gated
+
+
+def test_always_on_motion_gated_false_when_scoring_disabled() -> None:
+    """ALWAYS_ON load: a stale movement_detected latch is gated off when scoring is disabled."""
+    device = _always_on_with_motion()
+    device.variables["movement_detected"] = Variable("movement_detected", "1")
+    assert payload_fields(device)["motion"] is False
+
+
+def test_switch_motion_gated_false_when_scoring_disabled() -> None:
+    """SWITCH load: a stale movement_detected latch is gated off when scoring is disabled."""
+    device = _switch_with_motion()
+    device.variables["movement_detected"] = Variable("movement_detected", "1")
+    assert payload_fields(device)["motion"] is False
+
+
+def test_faceplate_motion_not_gated_by_enable_motion_score() -> None:
+    """The faceplate BINARY_SENSOR motion path is separate and must NOT be gated."""
+    device = _faceplate_full()  # DeviceKind.BINARY_SENSOR, no enable_motion_score var
+    device.variables["movement_detected"] = Variable("movement_detected", "1")
+    assert payload_fields(device)["motion"] is True
+
+
 # --- ALWAYS_ON cross-kind coverage ------------------------------------------
 
 
