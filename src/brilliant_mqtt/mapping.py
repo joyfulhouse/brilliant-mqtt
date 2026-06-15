@@ -55,8 +55,21 @@ class AuxSpec:
     # ``movement_detected`` latch when motion-scoring is off) and the payload is
     # forced to a concrete False rather than publishing the stale value. Only
     # the entity DESCRIPTOR is unaffected — the sensor still exists, it just
-    # reads "off" until the subsystem is enabled. Applies to ``value_kind="bool"``.
+    # reads "off" until the subsystem is enabled. Supported for ``value_kind=
+    # "bool"`` only (enforced in ``__post_init__``), since the disabled-state
+    # value is a boolean False.
     gate_var: str | None = None
+
+    def __post_init__(self) -> None:
+        # Validate the static spec table once at construction (import time)
+        # rather than per-render: a gated reading collapses to boolean False, so
+        # gate_var is meaningful only on bool specs. A non-bool gated spec would
+        # publish a type-wrong False, so reject it loudly at the source.
+        if self.gate_var is not None and self.value_kind != "bool":
+            raise ValueError(
+                f"gate_var is only supported for value_kind='bool', "
+                f"not {self.value_kind!r} (spec var={self.var!r})"
+            )
 
     @property
     def key(self) -> str:
@@ -566,11 +579,9 @@ def payload_fields(device: BrilliantDevice) -> dict[str, object]:
         # Gate: a bool reading that is only valid while a sibling variable is
         # enabled collapses to a concrete False when that gate is absent or off
         # (stale subsystem). Only the VALUE is forced — the payload key is still
-        # emitted, so descriptor/payload-key lockstep is preserved.
+        # emitted, so descriptor/payload-key lockstep is preserved. (gate_var is
+        # validated bool-only in AuxSpec.__post_init__.)
         if spec.gate_var is not None:
-            assert spec.value_kind == "bool", (
-                f"gate_var supports value_kind='bool' only, not {spec.value_kind!r}"
-            )
             gate = device.variables.get(spec.gate_var)
             if gate is None or not gate.as_bool():
                 rendered = False

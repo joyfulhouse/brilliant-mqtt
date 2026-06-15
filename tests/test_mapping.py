@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from brilliant_mqtt.mapping import EntityDescriptor, entities_for, payload_fields
+from brilliant_mqtt.mapping import AuxSpec, EntityDescriptor, entities_for, payload_fields
 from brilliant_mqtt.model import BrilliantDevice, DeviceKind, Variable
 
 # ---------------------------------------------------------------------------
@@ -1253,6 +1253,17 @@ def test_faceplate_motion_not_gated_by_enable_motion_score() -> None:
     device = _faceplate_full()  # DeviceKind.BINARY_SENSOR, no enable_motion_score var
     device.variables["movement_detected"] = Variable("movement_detected", "1")
     assert payload_fields(device)["motion"] is True
+
+
+def test_gate_var_rejected_on_non_bool_spec() -> None:
+    """gate_var collapses to bool False, so it is only valid on a bool spec.
+
+    Validated at construction (import time) so the static AUX_SPECS table can
+    never carry a type-wrong gated spec.
+    """
+    AuxSpec(var="x", component="binary_sensor", name="X", value_kind="bool", gate_var="g")  # ok
+    with pytest.raises(ValueError, match="value_kind='bool'"):
+        AuxSpec(var="y", component="sensor", name="Y", value_kind="int", gate_var="g")
 
 
 # --- ALWAYS_ON cross-kind coverage ------------------------------------------
