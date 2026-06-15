@@ -9,6 +9,18 @@ Documentation for brilliant-mqtt.
 | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) | Common problems and fixes |
 | [DEVELOPMENT.md](DEVELOPMENT.md) | Development environment, quality gates, testing rules |
 
+## Installing
+
+Start at the [install overview](../INSTALL.md), which walks the three steps and
+links these focused guides:
+
+- [install/root-ssh.md](install/root-ssh.md) — enabling Brilliant's official
+  root SSH on a panel, with the caveats to read first.
+- [install/mqtt-broker.md](install/mqtt-broker.md) — standalone Mosquitto or the
+  Home Assistant Mosquitto add-on, plus the dedicated user and ACL.
+- [ha-integration.md](ha-integration.md) — the HACS companion integration that
+  deploys/updates/repairs panels from the HA UI.
+
 ## Reference
 
 - [reference/message-bus-api.md](reference/message-bus-api.md) — the
