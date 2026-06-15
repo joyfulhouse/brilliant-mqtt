@@ -50,6 +50,13 @@ class AuxSpec:
     max_value: float | None = None
     step: float | None = None
     skip_values: tuple[str, ...] = ()
+    # When set, this aux's reading is only meaningful while the named sibling
+    # variable is enabled ("1"). Otherwise the bus value is stale (e.g. a frozen
+    # ``movement_detected`` latch when motion-scoring is off) and the payload is
+    # forced to a concrete False rather than publishing the stale value. Only
+    # the entity DESCRIPTOR is unaffected — the sensor still exists, it just
+    # reads "off" until the subsystem is enabled. Applies to ``value_kind="bool"``.
+    gate_var: str | None = None
 
     @property
     def key(self) -> str:
@@ -111,6 +118,10 @@ _MOTION_AUX: tuple[AuxSpec, ...] = (
         value_kind="bool",
         payload_key="motion",
         device_class="motion",
+        # movement_detected only tracks live presence while motion-scoring is on;
+        # with it off the bus reports a frozen latch (live-verified office.iot
+        # 2026-06-14), so gate the published value on enable_motion_score.
+        gate_var="enable_motion_score",
     ),
     AuxSpec(
         var="motion_score",
@@ -552,6 +563,12 @@ def payload_fields(device: BrilliantDevice) -> dict[str, object]:
         rendered = _render_aux(var, spec.value_kind, spec.invert)
         if rendered is None:
             continue
+        # Gate: a reading that is only valid while a sibling variable is enabled
+        # collapses to False when that gate is absent or off (stale subsystem).
+        if spec.gate_var is not None:
+            gate = device.variables.get(spec.gate_var)
+            if gate is None or not gate.as_bool():
+                rendered = False
         data[spec.key] = rendered
 
     return data

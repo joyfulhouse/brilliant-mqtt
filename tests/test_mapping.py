@@ -1164,17 +1164,60 @@ def test_mesh_motion_low_threshold_disabled_by_default() -> None:
 
 
 def test_mesh_dimmer_with_motion_payload_fields() -> None:
-    """Exact payload including power sentinel (gated) and all motion fields."""
+    """Exact payload: motion is gated to False because enable_motion_score is "0".
+
+    Live-verified (office.iot, 2026-06-14): with motion-scoring disabled the
+    bus reports a *frozen* ``movement_detected`` latch (here "1") that never
+    tracks real presence — so the published ``motion`` must read False, not the
+    stale latch.
+    """
     payload = payload_fields(_mesh_dimmer_with_motion())
     assert payload == {
         "state": "OFF",
         "brightness": 153,
-        "motion": True,
+        "motion": False,
         "motion_score": 0,
         "enable_motion_score": False,
         "motion_high_threshold": 70,
         "motion_low_threshold": 20,
     }
+
+
+def _mesh_motion(movement: str, enable: str) -> BrilliantDevice:
+    """_mesh_dimmer() carrying the five motion vars with the given movement/enable."""
+    device = _mesh_dimmer()
+    device.variables.update(
+        {
+            "movement_detected": Variable("movement_detected", movement),
+            "motion_score": Variable("motion_score", "0"),
+            "enable_motion_score": Variable("enable_motion_score", enable),
+            "motion_high_threshold": Variable("motion_high_threshold", "70"),
+            "motion_low_threshold": Variable("motion_low_threshold", "20"),
+        }
+    )
+    return device
+
+
+def test_mesh_motion_gated_false_when_scoring_disabled() -> None:
+    """movement_detected="1" but enable_motion_score="0" -> motion False (stale latch)."""
+    assert payload_fields(_mesh_motion("1", "0"))["motion"] is False
+
+
+def test_mesh_motion_passes_through_when_scoring_enabled() -> None:
+    """movement_detected="1" with enable_motion_score="1" -> motion True (live)."""
+    assert payload_fields(_mesh_motion("1", "1"))["motion"] is True
+
+
+def test_mesh_motion_false_when_scoring_enabled_but_no_movement() -> None:
+    """enable_motion_score="1" with movement_detected="0" -> motion False."""
+    assert payload_fields(_mesh_motion("0", "1"))["motion"] is False
+
+
+def test_mesh_motion_gated_false_when_enable_var_absent() -> None:
+    """No enable_motion_score variable at all -> motion gated to False, not the latch."""
+    device = _mesh_dimmer()
+    device.variables["movement_detected"] = Variable("movement_detected", "1")
+    assert payload_fields(device)["motion"] is False
 
 
 # --- ALWAYS_ON cross-kind coverage ------------------------------------------
