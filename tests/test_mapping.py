@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from brilliant_mqtt.mapping import EntityDescriptor, entities_for, payload_fields
+from brilliant_mqtt.mapping import AuxSpec, EntityDescriptor, entities_for, payload_fields
 from brilliant_mqtt.model import BrilliantDevice, DeviceKind, Variable
 
 # ---------------------------------------------------------------------------
@@ -1164,17 +1164,115 @@ def test_mesh_motion_low_threshold_disabled_by_default() -> None:
 
 
 def test_mesh_dimmer_with_motion_payload_fields() -> None:
-    """Exact payload including power sentinel (gated) and all motion fields."""
+    """Exact payload: motion is gated to False because enable_motion_score is "0".
+
+    Live-verified (office.iot, 2026-06-14): with motion-scoring disabled the
+    bus reports a *frozen* ``movement_detected`` latch (here "1") that never
+    tracks real presence — so the published ``motion`` must read False, not the
+    stale latch.
+    """
     payload = payload_fields(_mesh_dimmer_with_motion())
     assert payload == {
         "state": "OFF",
         "brightness": 153,
-        "motion": True,
+        "motion": False,
         "motion_score": 0,
         "enable_motion_score": False,
         "motion_high_threshold": 70,
         "motion_low_threshold": 20,
     }
+
+
+def _mesh_motion(movement: str, enable: str) -> BrilliantDevice:
+    """_mesh_dimmer() carrying the five motion vars with the given movement/enable."""
+    device = _mesh_dimmer()
+    device.variables.update(
+        {
+            "movement_detected": Variable("movement_detected", movement),
+            "motion_score": Variable("motion_score", "0"),
+            "enable_motion_score": Variable("enable_motion_score", enable),
+            "motion_high_threshold": Variable("motion_high_threshold", "70"),
+            "motion_low_threshold": Variable("motion_low_threshold", "20"),
+        }
+    )
+    return device
+
+
+def test_mesh_motion_gated_false_when_scoring_disabled() -> None:
+    """movement_detected="1" but enable_motion_score="0" -> motion False (stale latch)."""
+    assert payload_fields(_mesh_motion("1", "0"))["motion"] is False
+
+
+def test_mesh_motion_passes_through_when_scoring_enabled() -> None:
+    """movement_detected="1" with enable_motion_score="1" -> motion True (live)."""
+    assert payload_fields(_mesh_motion("1", "1"))["motion"] is True
+
+
+def test_mesh_motion_false_when_scoring_enabled_but_no_movement() -> None:
+    """enable_motion_score="1" with movement_detected="0" -> motion False."""
+    assert payload_fields(_mesh_motion("0", "1"))["motion"] is False
+
+
+def test_mesh_motion_gated_false_when_enable_var_absent() -> None:
+    """No enable_motion_score variable at all -> motion gated to False, not the latch."""
+    device = _mesh_dimmer()
+    device.variables["movement_detected"] = Variable("movement_detected", "1")
+    assert payload_fields(device)["motion"] is False
+
+
+def test_mesh_motion_descriptor_minted_when_enable_var_absent() -> None:
+    """The gate is value-only: the motion entity descriptor is still minted even when
+    enable_motion_score is absent (so HA keeps the sensor; it just reads off)."""
+    device = _mesh_dimmer()
+    device.variables["movement_detected"] = Variable("movement_detected", "1")
+    uids = {d.unique_id for d in entities_for(device, "mesh")}
+    assert f"brilliant_mesh_{MESH_PID}_movement_detected" in uids
+
+
+def test_mesh_motion_gated_false_for_nonmatching_gate_value() -> None:
+    """as_bool() is strict (== "1"): a non-"1" gate value (e.g. "true") gates to False."""
+    assert payload_fields(_mesh_motion("1", "true"))["motion"] is False
+
+
+def test_mesh_motion_gate_does_not_leak_to_other_aux() -> None:
+    """The gate forces only the gated key — a sibling bool aux (fault) is untouched."""
+    device = _mesh_motion("1", "0")
+    device.variables["is_safe"] = Variable("is_safe", "0")  # fault aux: unsafe -> fault True
+    payload = payload_fields(device)
+    assert payload["motion"] is False  # gated
+    assert payload["fault"] is True  # NOT gated
+
+
+def test_always_on_motion_gated_false_when_scoring_disabled() -> None:
+    """ALWAYS_ON load: a stale movement_detected latch is gated off when scoring is disabled."""
+    device = _always_on_with_motion()
+    device.variables["movement_detected"] = Variable("movement_detected", "1")
+    assert payload_fields(device)["motion"] is False
+
+
+def test_switch_motion_gated_false_when_scoring_disabled() -> None:
+    """SWITCH load: a stale movement_detected latch is gated off when scoring is disabled."""
+    device = _switch_with_motion()
+    device.variables["movement_detected"] = Variable("movement_detected", "1")
+    assert payload_fields(device)["motion"] is False
+
+
+def test_faceplate_motion_not_gated_by_enable_motion_score() -> None:
+    """The faceplate BINARY_SENSOR motion path is separate and must NOT be gated."""
+    device = _faceplate_full()  # DeviceKind.BINARY_SENSOR, no enable_motion_score var
+    device.variables["movement_detected"] = Variable("movement_detected", "1")
+    assert payload_fields(device)["motion"] is True
+
+
+def test_gate_var_rejected_on_non_bool_spec() -> None:
+    """gate_var collapses to bool False, so it is only valid on a bool spec.
+
+    Validated at construction (import time) so the static AUX_SPECS table can
+    never carry a type-wrong gated spec.
+    """
+    AuxSpec(var="x", component="binary_sensor", name="X", value_kind="bool", gate_var="g")  # ok
+    with pytest.raises(ValueError, match="value_kind='bool'"):
+        AuxSpec(var="y", component="sensor", name="Y", value_kind="int", gate_var="g")
 
 
 # --- ALWAYS_ON cross-kind coverage ------------------------------------------

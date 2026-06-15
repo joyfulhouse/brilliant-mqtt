@@ -50,6 +50,26 @@ class AuxSpec:
     max_value: float | None = None
     step: float | None = None
     skip_values: tuple[str, ...] = ()
+    # When set, this aux's reading is only meaningful while the named sibling
+    # variable is enabled ("1"). Otherwise the bus value is stale (e.g. a frozen
+    # ``movement_detected`` latch when motion-scoring is off) and the payload is
+    # forced to a concrete False rather than publishing the stale value. Only
+    # the entity DESCRIPTOR is unaffected — the sensor still exists, it just
+    # reads "off" until the subsystem is enabled. Supported for ``value_kind=
+    # "bool"`` only (enforced in ``__post_init__``), since the disabled-state
+    # value is a boolean False.
+    gate_var: str | None = None
+
+    def __post_init__(self) -> None:
+        # Validate the static spec table once at construction (import time)
+        # rather than per-render: a gated reading collapses to boolean False, so
+        # gate_var is meaningful only on bool specs. A non-bool gated spec would
+        # publish a type-wrong False, so reject it loudly at the source.
+        if self.gate_var is not None and self.value_kind != "bool":
+            raise ValueError(
+                f"gate_var is only supported for value_kind='bool', "
+                f"not {self.value_kind!r} (spec var={self.var!r})"
+            )
 
     @property
     def key(self) -> str:
@@ -111,6 +131,10 @@ _MOTION_AUX: tuple[AuxSpec, ...] = (
         value_kind="bool",
         payload_key="motion",
         device_class="motion",
+        # movement_detected only tracks live presence while motion-scoring is on;
+        # with it off the bus reports a frozen latch (live-verified office.iot
+        # 2026-06-14), so gate the published value on enable_motion_score.
+        gate_var="enable_motion_score",
     ),
     AuxSpec(
         var="motion_score",
@@ -552,6 +576,15 @@ def payload_fields(device: BrilliantDevice) -> dict[str, object]:
         rendered = _render_aux(var, spec.value_kind, spec.invert)
         if rendered is None:
             continue
+        # Gate: a bool reading that is only valid while a sibling variable is
+        # enabled collapses to a concrete False when that gate is absent or off
+        # (stale subsystem). Only the VALUE is forced — the payload key is still
+        # emitted, so descriptor/payload-key lockstep is preserved. (gate_var is
+        # validated bool-only in AuxSpec.__post_init__.)
+        if spec.gate_var is not None:
+            gate = device.variables.get(spec.gate_var)
+            if gate is None or not gate.as_bool():
+                rendered = False
         data[spec.key] = rendered
 
     return data
