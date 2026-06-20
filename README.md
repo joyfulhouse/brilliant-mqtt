@@ -7,6 +7,7 @@ panel's own internal message bus.
 [![License][license-shield]](LICENSE)
 [![HACS][hacs-shield]][hacs]
 [![CI][ci-shield]][ci]
+[![Quality Scale][quality-shield]][quality]
 [![Project Maintenance][maintenance-shield]][maintenance]
 [![GitHub Sponsors][sponsors-shield]][sponsors]
 [![Ko-fi][kofi-shield]][kofi]
@@ -152,6 +153,8 @@ for details.
 [hacs]: https://github.com/hacs/integration
 [ci-shield]: https://img.shields.io/github/actions/workflow/status/joyfulhouse/brilliant-mqtt/ci.yml?style=for-the-badge&label=CI
 [ci]: https://github.com/joyfulhouse/brilliant-mqtt/actions
+[quality-shield]: https://img.shields.io/badge/Quality%20Scale-Platinum-5c2d91.svg?style=for-the-badge
+[quality]: https://developers.home-assistant.io/docs/core/integration-quality-scale/
 [maintenance-shield]: https://img.shields.io/badge/maintainer-%40btli-blue.svg?style=for-the-badge
 [maintenance]: https://github.com/btli
 [sponsors-shield]: https://img.shields.io/badge/sponsor-GitHub-EA4AAA.svg?style=for-the-badge&logo=githubsponsors&logoColor=white
