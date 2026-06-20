@@ -1,0 +1,159 @@
+name: Quality Scale
+
+# Asserts the brilliant_mqtt HA integration (ha/custom_components/brilliant_mqtt)
+# actually carries the markers for each quality-scale tier it claims, as a cascade:
+# bronze → silver → gold → platinum (each tier needs the previous one to pass).
+# Lint / type-check / tests are NOT duplicated here — ci.yml already runs the full
+# ruff + mypy --strict + pytest gate. These jobs are pure checkout + grep/JSON
+# assertions, so they need no Python/uv toolchain.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  COMP: ha/custom_components/brilliant_mqtt
+
+jobs:
+  bronze:
+    name: Bronze Tier
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: manifest.json is valid and config-flow capable
+        run: |
+          python3 - <<'PY'
+          import json, os
+          comp = os.environ["COMP"]
+          with open(f"{comp}/manifest.json") as f:
+              m = json.load(f)
+          for key in ("domain", "name", "codeowners", "config_flow", "version", "requirements", "iot_class"):
+              assert key in m, f"manifest.json missing {key}"
+          assert m["config_flow"] is True, "config_flow must be true"
+          assert m["codeowners"], "codeowners must be non-empty"
+          print("OK manifest.json")
+          PY
+
+      - name: Base entity sets has_entity_name; runtime-data + unique config in place
+        run: |
+          python3 - <<'PY'
+          import os
+          comp = os.environ["COMP"]
+          assert "has_entity_name = True" in open(f"{comp}/entity.py").read(), "entity.py: missing has_entity_name"
+          init = open(f"{comp}/__init__.py").read()
+          assert "entry.runtime_data" in init, "__init__.py: missing runtime_data usage"
+          cf = open(f"{comp}/config_flow.py").read()
+          assert "async_set_unique_id" in cf, "config_flow.py: missing async_set_unique_id"
+          assert "_abort_if_unique_id_configured" in cf, "config_flow.py: missing _abort_if_unique_id_configured"
+          print("OK entity/runtime-data/unique-config")
+          PY
+
+      - name: quality_scale.yaml present with no todo rules
+        run: |
+          python3 - <<'PY'
+          import os, re
+          comp = os.environ["COMP"]
+          text = open(f"{comp}/quality_scale.yaml").read()
+          todos = re.findall(r"status:\s*todo", text)
+          assert not todos, f"quality_scale.yaml still has {len(todos)} todo rule(s)"
+          print("OK quality_scale.yaml has zero todo")
+          PY
+
+  silver:
+    name: Silver Tier
+    runs-on: ubuntu-latest
+    needs: [bronze]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: PARALLEL_UPDATES declared on every platform
+        run: |
+          for f in binary_sensor button update; do
+            grep -q "^PARALLEL_UPDATES = 0" "$COMP/$f.py" || { echo "$f.py: missing PARALLEL_UPDATES = 0"; exit 1; }
+          done
+          echo "OK PARALLEL_UPDATES"
+
+      - name: log-when-unavailable + translated action exceptions
+        run: |
+          python3 - <<'PY'
+          import os
+          comp = os.environ["COMP"]
+          mgr = open(f"{comp}/manager.py").read()
+          assert "_LOGGER.info" in mgr and "unavailable" in mgr, "manager.py: missing offline log line"
+          # service errors must be translated, not raw strings
+          assert "translation_key=" in mgr, "manager.py: exceptions not translated"
+          print("OK silver reliability markers")
+          PY
+
+  gold:
+    name: Gold Tier
+    runs-on: ubuntu-latest
+    needs: [silver]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: manifest loggers + diagnostics platform
+        run: |
+          python3 - <<'PY'
+          import json, os
+          comp = os.environ["COMP"]
+          m = json.load(open(f"{comp}/manifest.json"))
+          assert m.get("loggers"), "manifest.json: missing loggers"
+          assert os.path.exists(f"{comp}/diagnostics.py"), "missing diagnostics.py"
+          assert "async_get_config_entry_diagnostics" in open(f"{comp}/diagnostics.py").read()
+          print("OK loggers + diagnostics")
+          PY
+
+      - name: entity + exception translations present in strings and en.json
+        run: |
+          python3 - <<'PY'
+          import json, os
+          comp = os.environ["COMP"]
+          for path in (f"{comp}/strings.json", f"{comp}/translations/en.json"):
+              d = json.load(open(path))
+              assert "entity" in d, f"{path}: missing entity block"
+              assert "exceptions" in d, f"{path}: missing exceptions block"
+              assert "issues" in d, f"{path}: missing issues block"
+          # entity translation keys are wired up in code
+          assert '_attr_translation_key = "bridge_health"' in open(f"{comp}/binary_sensor.py").read()
+          assert '_attr_translation_key = "repair_bridge"' in open(f"{comp}/button.py").read()
+          assert '_attr_translation_key = "bridge"' in open(f"{comp}/update.py").read()
+          print("OK entity/exception/issue translations")
+          PY
+
+      - name: repair-issues via issue_registry (not persistent_notification escalation)
+        run: |
+          python3 - <<'PY'
+          import os
+          comp = os.environ["COMP"]
+          mgr = open(f"{comp}/manager.py").read()
+          assert "issue_registry" in mgr, "manager.py: not using issue_registry"
+          assert "async_create_issue" in mgr, "manager.py: missing async_create_issue"
+          assert "async_delete_issue" in mgr, "manager.py: missing async_delete_issue (recovery clear)"
+          print("OK repair-issues surface")
+          PY
+
+  platinum:
+    name: Platinum Tier
+    runs-on: ubuntu-latest
+    needs: [gold]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: py.typed marker present
+        run: |
+          test -f "$COMP/py.typed" || { echo "missing py.typed"; exit 1; }
+          echo "OK py.typed"
+
+      - name: manifest declares quality_scale platinum
+        run: |
+          python3 - <<'PY'
+          import json, os
+          comp = os.environ["COMP"]
+          m = json.load(open(f"{comp}/manifest.json"))
+          assert m.get("quality_scale") == "platinum", f"quality_scale is {m.get('quality_scale')!r}, expected 'platinum'"
+          print("OK quality_scale: platinum")
+          PY
