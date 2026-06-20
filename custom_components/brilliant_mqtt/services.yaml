@@ -2,17 +2,17 @@ repair:
   name: Repair bridge
   description: Restore the unit/env from known-good sources and start the agent.
   target:
-    device:
+    entity:
       integration: brilliant_mqtt
 redeploy:
   name: Redeploy agent
   description: Force-push the bundled agent payload and restart the bridge.
   target:
-    device:
+    entity:
       integration: brilliant_mqtt
 uninstall:
   name: Uninstall agent
   description: Stop, disable, and remove the agent from the panel (explicit only).
   target:
-    device:
+    entity:
       integration: brilliant_mqtt

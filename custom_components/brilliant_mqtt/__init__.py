@@ -7,9 +7,13 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 import voluptuous as vol
+from homeassistant.components import mqtt
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
+from homeassistant.const import ATTR_AREA_ID, ATTR_DEVICE_ID, ATTR_ENTITY_ID
 from homeassistant.core import HomeAssistant, ServiceCall
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import ConfigEntryNotReady, HomeAssistantError
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.service import async_extract_config_entry_ids
 from homeassistant.helpers.typing import ConfigType
 
@@ -18,8 +22,21 @@ from .manager import PanelManager
 
 type BrilliantMqttConfigEntry = ConfigEntry[PanelManager]
 
+# This integration is config-entry only (it registers services in async_setup but takes
+# no YAML configuration), so declare the standard config-entry-only schema for hassfest.
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+
+# Target services: HA merges entity/device/area target ids into the call data, and the
+# handlers resolve config entries from any of them via async_extract_config_entry_ids.
+# services.yaml targets by `entity` (hassfest), so a UI call supplies entity_id, NOT
+# device_id — requiring device_id rejected those calls before they reached the handler.
 _SERVICE_SCHEMA = vol.Schema(
-    {vol.Required("device_id"): vol.Any(str, [str])}, extra=vol.ALLOW_EXTRA
+    {
+        vol.Optional(ATTR_ENTITY_ID): vol.Any(str, [str]),
+        vol.Optional(ATTR_DEVICE_ID): vol.Any(str, [str]),
+        vol.Optional(ATTR_AREA_ID): vol.Any(str, [str]),
+    },
+    extra=vol.ALLOW_EXTRA,
 )
 
 
@@ -84,6 +101,10 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: BrilliantMqttConfigEntry) -> bool:
+    # Every panel surface (retained state/LWT subscriptions, command publishes) rides
+    # HA's mqtt integration, so don't set up "green" against a broker that isn't up yet.
+    if not await mqtt.async_wait_for_mqtt_client(hass):
+        raise ConfigEntryNotReady("MQTT integration is not available")
     manager = PanelManager(hass, entry, _fleet_lock(hass))
     entry.runtime_data = manager
     await manager.async_setup()
@@ -95,3 +116,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: BrilliantMqttConfigEntr
     if unloaded := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
         await entry.runtime_data.async_shutdown()
     return unloaded
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: BrilliantMqttConfigEntry) -> None:
+    """Delete the panel's repair issue when its config entry is removed."""
+    ir.async_delete_issue(hass, DOMAIN, f"needs_attention_{entry.entry_id}")
