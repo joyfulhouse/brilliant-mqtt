@@ -1,17 +1,23 @@
 # Default HACS Store Submission Guide
 
-## ARTWORK CAVEAT
+## Brand assets — provenance & trademark
 
-**The icon and logo files in `custom_integrations/brilliant_mqtt/` are UNOFFICIAL
-PLACEHOLDERS generated as drafts.** They are a generic wall-panel / signal-wave
-glyph and plain wordmark — they do not reproduce Brilliant's trademarked artwork.
+The icon and logo in `custom_integrations/brilliant_mqtt/` are the **official
+Brilliant brand assets**, included to identify the integration consistent with
+`home-assistant/brands` conventions (that repo hosts third-party brand marks for
+integration identification):
 
-Before submitting any external PR, replace these files with operator-approved
-artwork. Ideally this means the official Brilliant icon used with explicit
-permission from Brilliant NextGen, Inc., or a custom icon designed by the
-operator. The placeholder art is deliberately generic so there is zero trademark
-risk if it is accidentally published, but it is not suitable for a default-store
-submission aimed at end-users.
+- `icon.png` / `icon@2x.png` — the official **Brilliant app icon** (teal rounded
+  square, white house/"b" mark, orange node), sourced from the Brilliant app
+  listing (`tech.brilliant.brilliant`).
+- `logo.png` / `logo@2x.png` — the official **"brilliant — SMART HOME SYSTEM"**
+  wordmark (`#00729D`), rendered from the logo on https://www.brilliant.tech.
+
+**BRILLIANT, the Brilliant logo, and the app icon are trademarks of Brilliant
+NextGen, Inc.**, included solely to identify the third-party product this
+integration works with. Submitting a product's marks to `home-assistant/brands`
+is standard for integration entries, but confirm you are comfortable doing so
+before opening the PR — it is the operator's call.
 
 ---
 
@@ -30,7 +36,7 @@ submission aimed at end-users.
   brand assets are not yet in the `home-assistant/brands` repo. Once the brands
   PR is merged (step below), remove `ignore: brands` from
   `.github/workflows/validate.yml` and confirm the HACS job still passes.
-- [ ] Replace placeholder artwork with approved icons (see caveat above)
+- [ ] Confirm you are comfortable submitting Brilliant's trademarked marks (see provenance note above)
 - [ ] `home-assistant/brands` PR merged (step 1 below)
 - [ ] Then open `hacs/default` PR (step 2 below)
 
@@ -44,8 +50,8 @@ submission aimed at end-users.
 |------|-----------|-------|
 | `icon.png` | 256 × 256 px | Required; square; PNG; transparent background; trimmed |
 | `icon@2x.png` | 512 × 512 px | Recommended hDPI version |
-| `logo.png` | landscape; shortest side 128–256 px | Optional wordmark |
-| `logo@2x.png` | landscape; shortest side 256–512 px | Optional hDPI wordmark |
+| `logo.png` | landscape, ≤512 px longest side (here 256 × 113) | Optional wordmark |
+| `logo@2x.png` | landscape, ≤512 px longest side (here 512 × 225) | Optional hDPI wordmark |
 
 All files: PNG only, lossless-compressed, interlaced preferred, transparency
 preferred, trimmed of surrounding whitespace. Custom integrations must NOT use
@@ -57,8 +63,7 @@ Home Assistant branded images. Symlinks are not allowed.
 2. In your fork, create the directory:
    `custom_integrations/brilliant_mqtt/`
 3. Copy the four files from `docs/brands/custom_integrations/brilliant_mqtt/`
-   in this repo into that directory (replacing placeholder art with approved
-   art first).
+   in this repo into that directory.
 4. Commit with a short message such as:
    `Add brilliant_mqtt custom integration brand assets`
 5. Open a PR against `home-assistant/brands` `master` branch.
@@ -83,8 +88,8 @@ Add brilliant_mqtt custom integration brand assets
 
 - `custom_integrations/brilliant_mqtt/icon.png` — 256 × 256 px, transparent PNG
 - `custom_integrations/brilliant_mqtt/icon@2x.png` — 512 × 512 px, transparent PNG
-- `custom_integrations/brilliant_mqtt/logo.png` — 400 × 120 px, transparent PNG
-- `custom_integrations/brilliant_mqtt/logo@2x.png` — 800 × 240 px, transparent PNG
+- `custom_integrations/brilliant_mqtt/logo.png` — 256 × 113 px, transparent PNG
+- `custom_integrations/brilliant_mqtt/logo@2x.png` — 512 × 225 px, transparent PNG
 
 ### Checklist
 
