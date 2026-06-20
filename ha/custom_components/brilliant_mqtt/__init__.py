@@ -7,9 +7,10 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 import voluptuous as vol
+from homeassistant.components import mqtt
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.core import HomeAssistant, ServiceCall
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import ConfigEntryNotReady, HomeAssistantError
 from homeassistant.helpers.service import async_extract_config_entry_ids
 from homeassistant.helpers.typing import ConfigType
 
@@ -84,6 +85,10 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: BrilliantMqttConfigEntry) -> bool:
+    # Every panel surface (retained state/LWT subscriptions, command publishes) rides
+    # HA's mqtt integration, so don't set up "green" against a broker that isn't up yet.
+    if not await mqtt.async_wait_for_mqtt_client(hass):
+        raise ConfigEntryNotReady("MQTT integration is not available")
     manager = PanelManager(hass, entry, _fleet_lock(hass))
     entry.runtime_data = manager
     await manager.async_setup()

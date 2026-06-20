@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import pytest
+from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant
 from homeassistant.loader import async_get_integration
 from pytest_homeassistant_custom_component.common import MockConfigEntry
@@ -91,3 +94,25 @@ async def test_non_object_meta_is_ignored(hass: HomeAssistant, mqtt_mock: MqttMo
     assert manager.meta is None  # non-object payload left meta unchanged
 
     assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_setup_retries_when_mqtt_unavailable(
+    hass: HomeAssistant, mqtt_mock: MqttMockHAClient
+) -> None:
+    """If the MQTT client isn't ready, setup must raise ConfigEntryNotReady.
+
+    The config-entries machinery catches ConfigEntryNotReady and parks the entry in
+    SETUP_RETRY, so assert on that terminal state (test-before-setup quality rule).
+    """
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+
+    with patch(
+        "homeassistant.components.mqtt.async_wait_for_mqtt_client",
+        return_value=False,
+    ):
+        assert not await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    assert entry.state is ConfigEntryState.SETUP_RETRY
