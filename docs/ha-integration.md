@@ -1,5 +1,7 @@
 # Home Assistant companion integration
 
+> **Which Brilliant?** This integration is for **Brilliant Smart Home Control** — the in-wall touchscreen control panels (1–4 switch and plug-in models) made by **Brilliant NextGen, Inc.** ([brilliant.tech](https://www.brilliant.tech), San Mateo, CA). It is **not** affiliated with the Australian **"Brilliant Smart"** lighting brand (smart plugs/bulbs/cameras) or any other "Brilliant" product. It replaces the panel's HomeKit-Controller path with a local MQTT / Home Assistant bridge.
+
 A small Home Assistant **custom integration** that manages the lifecycle of the
 on-panel `brilliant-mqtt` agent across your fleet — deploy, OTA-survival repair,
 version updates, and removal — all from the HA UI. It lives in this repo under
