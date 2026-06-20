@@ -25,7 +25,7 @@ rules:
 
   brands:
     status: exempt
-    comment: HACS custom integration; brand assets are not submitted to the core home-assistant/brands repository.
+    comment: HACS custom integration; brand assets are bundled in brand/ (HA 2026.3 brands proxy API), not submitted to the core home-assistant/brands repo.
 
   common-modules:
     status: done
