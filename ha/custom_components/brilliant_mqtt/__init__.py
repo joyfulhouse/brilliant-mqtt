@@ -9,6 +9,7 @@ from typing import Any
 import voluptuous as vol
 from homeassistant.components import mqtt
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
+from homeassistant.const import ATTR_AREA_ID, ATTR_DEVICE_ID, ATTR_ENTITY_ID
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.exceptions import ConfigEntryNotReady, HomeAssistantError
 from homeassistant.helpers import config_validation as cv
@@ -25,8 +26,17 @@ type BrilliantMqttConfigEntry = ConfigEntry[PanelManager]
 # no YAML configuration), so declare the standard config-entry-only schema for hassfest.
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
+# Target services: HA merges entity/device/area target ids into the call data, and the
+# handlers resolve config entries from any of them via async_extract_config_entry_ids.
+# services.yaml targets by `entity` (hassfest), so a UI call supplies entity_id, NOT
+# device_id — requiring device_id rejected those calls before they reached the handler.
 _SERVICE_SCHEMA = vol.Schema(
-    {vol.Required("device_id"): vol.Any(str, [str])}, extra=vol.ALLOW_EXTRA
+    {
+        vol.Optional(ATTR_ENTITY_ID): vol.Any(str, [str]),
+        vol.Optional(ATTR_DEVICE_ID): vol.Any(str, [str]),
+        vol.Optional(ATTR_AREA_ID): vol.Any(str, [str]),
+    },
+    extra=vol.ALLOW_EXTRA,
 )
 
 
