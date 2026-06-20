@@ -1,0 +1,236 @@
+# Integration Quality Scale Tracking
+# https://developers.home-assistant.io/docs/core/integration-quality-scale
+#
+# Status values: done, todo, exempt
+# For exempt rules, include a comment explaining why.
+#
+# This integration is a HACS custom component that manages the lifecycle of the
+# on-panel brilliant-mqtt agent. The devices themselves are native MQTT-Discovery
+# entities published by that agent; this integration adds per-panel management
+# entities (bridge-health binary_sensor, repair button, agent update) plus the
+# OTA repair state machine, talking to MQTT (state/LWT) and the panel over SSH.
+
+rules:
+  # =============================================================================
+  # Bronze Tier (Baseline Requirements)
+  # =============================================================================
+
+  action-setup:
+    status: done
+    comment: repair/redeploy/uninstall registered in async_setup (not async_setup_entry).
+
+  appropriate-polling:
+    status: exempt
+    comment: Push-based (local_push) — state comes from retained MQTT topics, refreshed via a dispatcher signal; nothing polls.
+
+  brands:
+    status: exempt
+    comment: HACS custom integration; brand assets are not submitted to the core home-assistant/brands repository.
+
+  common-modules:
+    status: done
+    comment: Shared base entity in entity.py (BrilliantPanelEntity); per-entry runtime in manager.py (PanelManager).
+
+  config-flow:
+    status: done
+    comment: Full config flow in config_flow.py (config_flow:true); one config entry per panel.
+
+  config-flow-test-coverage:
+    status: done
+    comment: tests/test_config_flow.py covers the user, reconfigure, and options flows including error paths.
+
+  dependency-transparency:
+    status: done
+    comment: The single runtime dependency (asyncssh, pinned) is declared in manifest requirements.
+
+  docs-actions:
+    status: done
+    comment: repair/redeploy/uninstall documented in services.yaml, strings.json, and docs/ha-integration.md (Services).
+
+  docs-high-level-description:
+    status: done
+    comment: README and docs/ha-integration.md describe what the integration does.
+
+  docs-installation-instructions:
+    status: done
+    comment: INSTALL.md and docs/ha-integration.md (Install) cover HACS and manual install.
+
+  docs-removal-instructions:
+    status: done
+    comment: docs/ha-integration.md and docs/reference/deployment.md (Rollback) cover removal/uninstall and discovery cleanup.
+
+  entity-event-setup:
+    status: done
+    comment: Entities subscribe to the manager's dispatcher signal in async_added_to_hass and unsubscribe via async_on_remove.
+
+  entity-unique-id:
+    status: done
+    comment: Every entity sets _attr_unique_id (f"{entry_id}_<role>").
+
+  has-entity-name:
+    status: done
+    comment: BrilliantPanelEntity sets _attr_has_entity_name = True.
+
+  runtime-data:
+    status: done
+    comment: PanelManager is stored in entry.runtime_data (typed BrilliantMqttConfigEntry).
+
+  test-before-configure:
+    status: done
+    comment: The config flow opens an SSH connection (_validate_ssh) before creating the entry.
+
+  test-before-setup:
+    status: done
+    comment: async_setup_entry gates on mqtt.async_wait_for_mqtt_client → ConfigEntryNotReady if the broker isn't ready.
+
+  unique-config-entry:
+    status: done
+    comment: The config flow sets the panel slug as unique_id and calls _abort_if_unique_id_configured().
+
+  # =============================================================================
+  # Silver Tier (Reliability & Robustness)
+  # =============================================================================
+
+  action-exceptions:
+    status: done
+    comment: Service handlers raise HomeAssistantError (translated) on failure; multi-target ops aggregate per-panel failures into one error.
+
+  config-entry-unloading:
+    status: done
+    comment: async_unload_entry unloads platforms and calls PanelManager.async_shutdown (cancels timers, drops MQTT subscriptions).
+
+  docs-configuration-parameters:
+    status: done
+    comment: Options (auto-repair, grace, cooldown, trust-host-key-changes) documented in strings.json and docs/ha-integration.md (Options).
+
+  docs-installation-parameters:
+    status: done
+    comment: Add-panel form fields documented in strings.json and docs/ha-integration.md (The add-panel form).
+
+  entity-unavailable:
+    status: exempt
+    comment: These are local management entities whose purpose is to stay operable during an outage (the repair button must remain pressable when the panel is offline); panel availability is surfaced via the bridge-health PROBLEM sensor + its availability attribute and the agent's own MQTT-discovery LWT.
+
+  integration-owner:
+    status: done
+    comment: "@btli is listed in manifest codeowners."
+
+  log-when-unavailable:
+    status: done
+    comment: PanelManager._on_availability logs (info) the offline→grace transition.
+
+  parallel-updates:
+    status: done
+    comment: PARALLEL_UPDATES = 0 in binary_sensor.py, button.py, and update.py (push-only platforms; SSH is serialized by a fleet-wide lock).
+
+  reauthentication-flow:
+    status: exempt
+    comment: No cloud/OAuth credentials. The only secret is the panel root password, rotated via the reconfigure flow (verified against the pinned host key before auth).
+
+  test-coverage:
+    status: done
+    comment: The pytest suite covers the manager state machine, services, config flow, entities, diagnostics, shell, and repair issues.
+
+  # =============================================================================
+  # Gold Tier (Premium User Experience)
+  # =============================================================================
+
+  devices:
+    status: done
+    comment: Entities attach to the panel's device via DeviceInfo in entity.py (claims the agent's mqtt-discovery identifier).
+
+  diagnostics:
+    status: done
+    comment: diagnostics.py implements async_get_config_entry_diagnostics with secrets redacted.
+
+  discovery:
+    status: exempt
+    comment: Panels are added manually (one config entry per panel); they expose no network discovery protocol for this management surface.
+
+  discovery-update-info:
+    status: exempt
+    comment: No discovery (see discovery); host/credentials are updated via the reconfigure flow.
+
+  docs-data-update:
+    status: done
+    comment: docs/ha-integration.md and docs/ARCHITECTURE.md describe the push (MQTT retained state + LWT) model and the OTA repair state machine.
+
+  docs-examples:
+    status: done
+    comment: docs/ha-integration.md (Events) includes automation examples for needs_attention and repair outcomes.
+
+  docs-known-limitations:
+    status: done
+    comment: docs/ha-integration.md ("What it manages (and what it does not)") states the limitations.
+
+  docs-supported-devices:
+    status: done
+    comment: README documents the supported Brilliant Smart Home Control panels (and which "Brilliant" products are not supported).
+
+  docs-supported-functions:
+    status: done
+    comment: docs/ha-integration.md (Entities, Services, Events) documents every entity, service, and event.
+
+  docs-troubleshooting:
+    status: done
+    comment: docs/TROUBLESHOOTING.md covers common problems and fixes.
+
+  docs-use-cases:
+    status: done
+    comment: README (Why this over HomeKit Controller) and docs/ha-integration.md (Events) cover the use cases.
+
+  dynamic-devices:
+    status: exempt
+    comment: Exactly one device per config entry, fixed at setup; no devices appear or disappear at runtime.
+
+  entity-category:
+    status: done
+    comment: The bridge-health sensor and repair button use EntityCategory.DIAGNOSTIC.
+
+  entity-device-class:
+    status: done
+    comment: The bridge-health binary_sensor uses BinarySensorDeviceClass.PROBLEM.
+
+  entity-disabled-by-default:
+    status: exempt
+    comment: All three are management entities (health, repair, update) that are always relevant; none are noisy enough to disable by default.
+
+  entity-translations:
+    status: done
+    comment: Each entity sets _attr_translation_key with an "entity" block in strings.json and translations/en.json.
+
+  exception-translations:
+    status: done
+    comment: User-surfaced HomeAssistantErrors raise with translation_domain/translation_key; messages in the "exceptions" block.
+
+  icon-translations:
+    status: exempt
+    comment: Entities rely on device-class default icons (PROBLEM binary_sensor, button, update); no per-state custom icons are needed.
+
+  reconfiguration-flow:
+    status: done
+    comment: config_flow.async_step_reconfigure rotates a panel's host/root password (slug immutable).
+
+  repair-issues:
+    status: done
+    comment: Escalations create an issue_registry repair issue (translation_key needs_attention) and delete it on recovery.
+
+  stale-devices:
+    status: exempt
+    comment: One device per config entry; the device is removed when its entry is unloaded/removed.
+
+  # =============================================================================
+  # Platinum Tier (Technical Excellence)
+  # =============================================================================
+
+  async-dependency:
+    status: done
+    comment: asyncssh (the only dependency) is fully async; all panel I/O is awaited.
+
+  inject-websession:
+    status: exempt
+    comment: No HTTP — the integration talks to the panel over SSH (asyncssh) and to the broker via HA's mqtt integration, so there is no aiohttp session to inject.
+
+  strict-typing:
+    status: done
+    comment: py.typed marker present; mypy --strict passes over custom_components and tests.

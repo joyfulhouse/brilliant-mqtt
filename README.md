@@ -3,10 +3,16 @@
 Bridge Brilliant Control in-wall panels to MQTT / Home Assistant over each
 panel's own internal message bus.
 
-[![License: MIT][license-shield]](LICENSE)
-[![Python 3.10][python-shield]](docs/DEVELOPMENT.md)
+[![GitHub Release][releases-shield]][releases]
+[![License][license-shield]](LICENSE)
+[![HACS][hacs-shield]][hacs]
+[![CI][ci-shield]][ci]
+[![Quality Scale][quality-shield]][quality]
+[![Project Maintenance][maintenance-shield]][maintenance]
 [![GitHub Sponsors][sponsors-shield]][sponsors]
 [![Ko-fi][kofi-shield]][kofi]
+
+> **Which Brilliant?** This integration is for **Brilliant Smart Home Control** — the in-wall touchscreen control panels (1–4 switch and plug-in models) made by **Brilliant NextGen, Inc.** ([brilliant.tech](https://www.brilliant.tech), San Mateo, CA). It is **not** affiliated with the Australian **"Brilliant Smart"** lighting brand (smart plugs/bulbs/cameras) or any other "Brilliant" product. It replaces the panel's HomeKit-Controller path with a local MQTT / Home Assistant bridge.
 
 > **Status:** implemented and **verified live on real hardware**: HA
 > discovery, telemetry, bidirectional control, and LWT/auto-restart all
@@ -81,6 +87,8 @@ broker setup** (standalone, or Home Assistant's Mosquitto add-on if you have no
 broker). The bridge deploys to each panel either via the companion integration
 below or the documented manual path.
 
+[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=joyfulhouse&repository=brilliant-mqtt&category=integration)
+
 ## Home Assistant companion integration
 
 An optional **HACS custom integration** manages the agent's lifecycle across
@@ -138,8 +146,17 @@ This project is licensed under the **MIT** License — see [LICENSE](LICENSE)
 for details.
 
 <!-- Badge links -->
-[license-shield]: https://img.shields.io/badge/license-MIT-blue.svg?style=for-the-badge
-[python-shield]: https://img.shields.io/badge/python-3.10-3776AB.svg?style=for-the-badge&logo=python&logoColor=white
+[releases-shield]: https://img.shields.io/github/release/joyfulhouse/brilliant-mqtt.svg?style=for-the-badge
+[releases]: https://github.com/joyfulhouse/brilliant-mqtt/releases
+[license-shield]: https://img.shields.io/github/license/joyfulhouse/brilliant-mqtt.svg?style=for-the-badge
+[hacs-shield]: https://img.shields.io/badge/HACS-Custom-41BDF5.svg?style=for-the-badge
+[hacs]: https://github.com/hacs/integration
+[ci-shield]: https://img.shields.io/github/actions/workflow/status/joyfulhouse/brilliant-mqtt/ci.yml?style=for-the-badge&label=CI
+[ci]: https://github.com/joyfulhouse/brilliant-mqtt/actions
+[quality-shield]: https://img.shields.io/badge/Quality%20Scale-Platinum-5c2d91.svg?style=for-the-badge
+[quality]: https://developers.home-assistant.io/docs/core/integration-quality-scale/
+[maintenance-shield]: https://img.shields.io/badge/maintainer-%40btli-blue.svg?style=for-the-badge
+[maintenance]: https://github.com/btli
 [sponsors-shield]: https://img.shields.io/badge/sponsor-GitHub-EA4AAA.svg?style=for-the-badge&logo=githubsponsors&logoColor=white
 [sponsors]: https://github.com/sponsors/btli
 [kofi-shield]: https://img.shields.io/badge/Ko--fi-donate-FF5E5B.svg?style=for-the-badge&logo=ko-fi&logoColor=white

@@ -11,6 +11,10 @@ from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from . import BrilliantMqttConfigEntry, manager
 from .entity import BrilliantPanelEntity
 
+# Push-only entity (installed version comes from the bridge meta topic); install
+# serializes panel SSH via the fleet-wide lock, so no parallel-update limit is needed.
+PARALLEL_UPDATES = 0
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -28,7 +32,7 @@ async def async_setup_entry(
 
 class AgentUpdate(BrilliantPanelEntity, UpdateEntity):
     _attr_supported_features = UpdateEntityFeature.INSTALL
-    _attr_name = "Bridge"
+    _attr_translation_key = "bridge"
     _attr_title = "brilliant-mqtt agent"
 
     def __init__(self, entry: BrilliantMqttConfigEntry, latest: str) -> None:
