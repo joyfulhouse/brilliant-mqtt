@@ -11,6 +11,7 @@ from homeassistant.components import mqtt
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.exceptions import ConfigEntryNotReady, HomeAssistantError
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.service import async_extract_config_entry_ids
 from homeassistant.helpers.typing import ConfigType
@@ -19,6 +20,10 @@ from .const import DOMAIN, PLATFORMS
 from .manager import PanelManager
 
 type BrilliantMqttConfigEntry = ConfigEntry[PanelManager]
+
+# This integration is config-entry only (it registers services in async_setup but takes
+# no YAML configuration), so declare the standard config-entry-only schema for hassfest.
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 _SERVICE_SCHEMA = vol.Schema(
     {vol.Required("device_id"): vol.Any(str, [str])}, extra=vol.ALLOW_EXTRA
