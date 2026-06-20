@@ -272,6 +272,7 @@ class PanelManager:
             severity=ir.IssueSeverity.ERROR,
             translation_key="needs_attention",
             translation_placeholders={"panel": self.panel, "reason": reason},
+            learn_more_url="https://github.com/joyfulhouse/brilliant-mqtt/blob/main/docs/ha-integration.md",
         )
         self._set_problem(True, reason)
 

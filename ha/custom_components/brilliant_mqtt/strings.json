@@ -97,7 +97,7 @@
   "issues": {
     "needs_attention": {
       "title": "Brilliant panel needs attention",
-      "description": "Panel `{panel}` needs attention: {reason}. See the [Home Assistant integration guide](https://github.com/joyfulhouse/brilliant-mqtt/blob/main/docs/ha-integration.md). This issue clears automatically once the bridge recovers."
+      "description": "Panel `{panel}` needs attention: {reason}. This issue clears automatically once the bridge recovers."
     }
   }
 }
