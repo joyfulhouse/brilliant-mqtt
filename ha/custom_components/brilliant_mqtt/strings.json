@@ -62,5 +62,42 @@
       "name": "Uninstall agent",
       "description": "Stop, disable, and remove the agent from the panel (explicit only)."
     }
+  },
+  "entity": {
+    "binary_sensor": {
+      "bridge_health": {
+        "name": "Bridge health"
+      }
+    },
+    "button": {
+      "repair_bridge": {
+        "name": "Repair bridge"
+      }
+    },
+    "update": {
+      "bridge": {
+        "name": "Bridge"
+      }
+    }
+  },
+  "exceptions": {
+    "already_in_progress": {
+      "message": "A repair or update is already in progress for this panel."
+    },
+    "host_key_changed": {
+      "message": "The panel SSH host key changed. Open Reconfigure to re-pin it, or enable \"Trust host-key changes\" in options for hands-off repair."
+    },
+    "update_failed": {
+      "message": "Agent update failed: {error}"
+    },
+    "uninstall_failed": {
+      "message": "Agent uninstall failed: {error}"
+    }
+  },
+  "issues": {
+    "needs_attention": {
+      "title": "Brilliant panel needs attention",
+      "description": "Panel `{panel}` needs attention: {reason}. See the [Home Assistant integration guide](https://github.com/joyfulhouse/brilliant-mqtt/blob/main/docs/ha-integration.md). This issue clears automatically once the bridge recovers."
+    }
   }
 }
