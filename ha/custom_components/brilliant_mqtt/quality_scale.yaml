@@ -80,8 +80,8 @@ rules:
     comment: The config flow opens an SSH connection (_validate_ssh) before creating the entry.
 
   test-before-setup:
-    status: exempt
-    comment: Nothing remote is contacted at setup — the integration subscribes to the (mqtt-dependency-guaranteed) retained state/LWT topics; panel reachability is reported via the LWT and the bridge-health sensor, and SSH happens only on demand.
+    status: done
+    comment: async_setup_entry gates on mqtt.async_wait_for_mqtt_client → ConfigEntryNotReady if the broker isn't ready.
 
   unique-config-entry:
     status: done
