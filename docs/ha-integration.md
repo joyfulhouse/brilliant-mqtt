@@ -5,7 +5,8 @@
 A small Home Assistant **custom integration** that manages the lifecycle of the
 on-panel `brilliant-mqtt` agent across your fleet — deploy, OTA-survival repair,
 version updates, and removal — all from the HA UI. It lives in this repo under
-[`ha/custom_components/brilliant_mqtt/`](../ha/custom_components/brilliant_mqtt).
+[`custom_components/brilliant_mqtt/`](../custom_components/brilliant_mqtt) (at the
+repo root for HACS compliance; its py3.14 tooling and tests are in `ha/`).
 
 ## What it manages (and what it does not)
 

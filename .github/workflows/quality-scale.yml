@@ -1,6 +1,6 @@
 name: Quality Scale
 
-# Asserts the brilliant_mqtt HA integration (ha/custom_components/brilliant_mqtt)
+# Asserts the brilliant_mqtt HA integration (custom_components/brilliant_mqtt)
 # actually carries the markers for each quality-scale tier it claims, as a cascade:
 # bronze → silver → gold → platinum (each tier needs the previous one to pass).
 # Lint / type-check / tests are NOT duplicated here — ci.yml already runs the full
@@ -14,7 +14,7 @@ on:
   workflow_dispatch:
 
 env:
-  COMP: ha/custom_components/brilliant_mqtt
+  COMP: custom_components/brilliant_mqtt
 
 jobs:
   bronze:

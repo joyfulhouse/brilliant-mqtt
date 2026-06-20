@@ -17,8 +17,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Stage integration at repo root (monorepo keeps it in ha/)
-        run: cp -r ha/custom_components ./custom_components
       - uses: home-assistant/actions/hassfest@master
 
   hacs:
@@ -26,8 +24,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Stage integration at repo root (monorepo keeps it in ha/)
-        run: cp -r ha/custom_components ./custom_components
       - uses: hacs/action@main
         with:
           category: integration

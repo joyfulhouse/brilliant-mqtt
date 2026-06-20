@@ -19,17 +19,18 @@ jobs:
       - run: uv run pytest
 
   ha-integration:
-    # The HACS companion integration (ha/) — Python 3.14.2+ (HA 2026.6.2 requires it).
+    # The HACS companion integration — Python 3.14.2+ (HA 2026.6.2 requires it).
+    # The integration now lives at the repo ROOT (custom_components/) for HACS
+    # tree-compliance; the py3.14 tooling + tests still live in ha/. Run the gate
+    # from the repo root with the ha/ env + config so `custom_components` is a
+    # top-level package and `tests` resolves to ha/tests.
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: ha
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v7
       - run: uv python install 3.14
-      - run: uv sync
-      - run: uv run ruff check
-      - run: uv run ruff format --check
-      - run: uv run mypy --strict custom_components tests
-      - run: uv run pytest
+      - run: uv sync --project ha
+      - run: uv run --project ha ruff check --config ha/pyproject.toml custom_components/brilliant_mqtt ha/tests
+      - run: uv run --project ha ruff format --check --config ha/pyproject.toml custom_components/brilliant_mqtt ha/tests
+      - run: uv run --project ha mypy --strict --config-file ha/pyproject.toml custom_components/brilliant_mqtt ha/tests
+      - run: uv run --project ha pytest -c ha/pyproject.toml ha/tests
