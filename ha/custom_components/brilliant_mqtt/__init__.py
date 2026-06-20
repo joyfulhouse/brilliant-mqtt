@@ -11,6 +11,7 @@ from homeassistant.components import mqtt
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.exceptions import ConfigEntryNotReady, HomeAssistantError
+from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.service import async_extract_config_entry_ids
 from homeassistant.helpers.typing import ConfigType
 
@@ -100,3 +101,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: BrilliantMqttConfigEntr
     if unloaded := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
         await entry.runtime_data.async_shutdown()
     return unloaded
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: BrilliantMqttConfigEntry) -> None:
+    """Delete the panel's repair issue when its config entry is removed."""
+    ir.async_delete_issue(hass, DOMAIN, f"needs_attention_{entry.entry_id}")

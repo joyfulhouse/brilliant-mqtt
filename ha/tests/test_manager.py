@@ -111,7 +111,7 @@ async def test_repair_timeout_escalates_and_cooldown_blocks_retry(
 
     # No "online" arrives → recovery deadline passes → escalation. The recovery
     # timeout fires repair_failed (the mechanical "deadline passed" signal) AND
-    # escalates with needs_attention (the human-facing alert + persistent notice).
+    # escalates with needs_attention (the human-facing alert + repair issue).
     async_fire_time_changed(hass, dt_util.utcnow() + timedelta(minutes=13))
     await hass.async_block_till_done()
     assert _types(events) == ["repair_started", "repair_failed", "needs_attention"]
