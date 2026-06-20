@@ -85,6 +85,35 @@ async def test_escalation_raises_repair_issue_and_recovery_clears_it(
     assert await hass.config_entries.async_unload(entry.entry_id)
 
 
+@pytest.mark.allow_lingering_timers
+async def test_removing_entry_deletes_its_repair_issue(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    payload_dir: Path,
+) -> None:
+    """Deleting a config entry with an active repair issue must not orphan the issue."""
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    hass.config_entries.async_update_entry(entry, options={"auto_repair": False})
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    registry = ir.async_get(hass)
+    issue_id = f"needs_attention_{entry.entry_id}"
+
+    # Drive an escalation so the repair issue exists.
+    async_fire_mqtt_message(hass, "brilliant/office/availability", "offline")
+    await hass.async_block_till_done()
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(minutes=11))
+    await hass.async_block_till_done()
+    assert registry.async_get_issue(DOMAIN, issue_id) is not None
+
+    # Removing the entry must clean the issue up (async_remove_entry).
+    assert await hass.config_entries.async_remove(entry.entry_id)
+    await hass.async_block_till_done()
+    assert registry.async_get_issue(DOMAIN, issue_id) is None
+
+
 async def test_update_already_in_progress_raises_translated_error(
     hass: HomeAssistant, payload_dir: Path
 ) -> None:
@@ -148,6 +177,9 @@ async def test_uninstall_failure_raises_translated_uninstall_failed(
     assert err.value.translation_key == "uninstall_failed"
     assert err.value.translation_placeholders is not None
     assert "unreachable" in err.value.translation_placeholders["error"]
+    # The same failure was surfaced as a repair issue.
+    issue = ir.async_get(hass).async_get_issue(DOMAIN, f"needs_attention_{entry.entry_id}")
+    assert issue is not None
 
 
 async def test_update_host_key_changed_raises_translated_error(

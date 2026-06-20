@@ -96,6 +96,7 @@ async def test_non_object_meta_is_ignored(hass: HomeAssistant, mqtt_mock: MqttMo
     assert await hass.config_entries.async_unload(entry.entry_id)
 
 
+# HA parks the entry in SETUP_RETRY with its own internal retry timer (not ours).
 @pytest.mark.allow_lingering_timers
 async def test_setup_retries_when_mqtt_unavailable(
     hass: HomeAssistant, mqtt_mock: MqttMockHAClient
