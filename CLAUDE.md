@@ -53,9 +53,11 @@ in `CREDENTIALS.local.md`. For any new code tasks use
 - **Python 3.10 only (agent, repo root).** The panel interpreter is Python
   3.10.9 and that is the runtime. `requires-python = ">=3.10,<3.11"`. This
   deliberately overrides the global "Python 3.13+" default — do not bump; do not
-  use 3.11+ syntax. The **`ha/` sub-project is separate** (companion HA
-  integration, Python 3.14, own `pyproject`/venv) — its gate is
-  `cd ha && uv run ruff check --fix && uv run ruff format && uv run mypy --strict custom_components tests && uv run pytest`.
+  use 3.11+ syntax. The **integration is separate** (companion HA integration,
+  Python 3.14, own tooling/tests in `ha/`). For HACS tree-compliance it now lives
+  at the repo ROOT (`custom_components/brilliant_mqtt/`); the py3.14 `pyproject` +
+  tests stay in `ha/`. Run its gate from the repo root with the `ha/` env+config:
+  `uv run --project ha ruff check --fix --config ha/pyproject.toml custom_components/brilliant_mqtt ha/tests && uv run --project ha ruff format --config ha/pyproject.toml custom_components/brilliant_mqtt ha/tests && uv run --project ha mypy --strict --config-file ha/pyproject.toml custom_components/brilliant_mqtt ha/tests && uv run --project ha pytest -c ha/pyproject.toml ha/tests`.
 - **uv for everything.** `uv sync`, `uv run pytest`, `uv run ruff check --fix`,
   `uv run ruff format`, `uv run mypy --strict src tests`. **Never** `pip`/`pip3`.
 - **TDD.** Failing test → minimal impl → green → commit. Small, frequent commits.
@@ -83,8 +85,9 @@ in `CREDENTIALS.local.md`. For any new code tasks use
 ## Pre-commit gate
 
 `uv run ruff check --fix && uv run ruff format && uv run mypy --strict src tests && uv run pytest`
-— all green before any commit. **If you changed anything under `ha/`, also run
-the `ha/` gate** (`cd ha && uv run ruff check --fix && uv run ruff format && uv run mypy --strict custom_components tests && uv run pytest`)
+— all green before any commit. **If you changed the integration
+(`custom_components/brilliant_mqtt/`) or its tests (`ha/tests/`), also run the
+integration gate** (`uv run --project ha ruff check --fix --config ha/pyproject.toml custom_components/brilliant_mqtt ha/tests && uv run --project ha ruff format --config ha/pyproject.toml custom_components/brilliant_mqtt ha/tests && uv run --project ha mypy --strict --config-file ha/pyproject.toml custom_components/brilliant_mqtt ha/tests && uv run --project ha pytest -c ha/pyproject.toml ha/tests`)
 — BOTH must be green.
 
 ## Repo / deploy split
