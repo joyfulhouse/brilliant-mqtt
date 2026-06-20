@@ -31,7 +31,7 @@ before opening the PR — it is the operator's call.
   for default-store listing; HACS requires a tagged release. The operator chose
   automation-only distribution, so a release must be cut first (e.g. `v0.2.0`
   matching `manifest.json`). Run the `release.yml` workflow or push a `v*` tag.
-- [ ] `hassfest` CI job passes green (checks `ha/custom_components/`)
+- [ ] `hassfest` CI job passes green (checks `custom_components/`)
 - [ ] `hacs` CI job passes green — currently runs with `ignore: brands` because
   brand assets are not yet in the `home-assistant/brands` repo. Once the brands
   PR is merged (step below), remove `ignore: brands` from

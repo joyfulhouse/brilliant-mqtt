@@ -25,6 +25,13 @@ testpaths = ["tests"]
 [tool.ruff]
 target-version = "py310"
 line-length = 100
+# The HA integration now lives at the repo root (custom_components/) but is a
+# SEPARATE py3.14 sub-project linted/typed by the ha/ tooling. Exclude it — and
+# the ha/ test project that imports it as first-party — from the py3.10 agent
+# gate so the two runtimes' isort/format never contaminate each other. The
+# integration is covered by the ha/ gate. (mypy below is already scoped to
+# src/tests, so this exclude only affects ruff.)
+extend-exclude = ["custom_components", "ha"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ASYNC"]

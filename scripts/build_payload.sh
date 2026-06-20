@@ -2,7 +2,7 @@
 # Assemble the agent payload the HA integration bundles (deploy/update/repair source).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-DEST="$ROOT/ha/custom_components/brilliant_mqtt/agent_payload"
+DEST="$ROOT/custom_components/brilliant_mqtt/agent_payload"
 WHEELS="$(mktemp -d)"
 
 rm -rf "$DEST"

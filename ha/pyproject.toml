@@ -17,6 +17,12 @@ dev = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# The integration now lives at the repo root (custom_components/), one level up
+# from this test project. Put the repo root on sys.path so `import
+# custom_components` resolves while `tests` still maps to ha/tests. ".." is the
+# repo root whether pytest runs from the root (-c ha/pyproject.toml → rootdir=ha)
+# or from inside ha/ (rootdir=ha) — both make ".." the repo root.
+pythonpath = [".."]
 markers = ["allow_lingering_timers: tolerate the core mqtt integration's recurring timer"]
 
 [tool.ruff]
@@ -35,6 +41,11 @@ select = ["E", "F", "I", "UP", "B", "ASYNC"]
 python_version = "3.14"
 strict = true
 explicit_package_bases = true
+# Run from the repo root (custom_components/ is a top-level package there). Put
+# `ha` on the search path FIRST so `tests` resolves to ha/tests — not the
+# agent's repo-root ./tests, which is a different py3.10 package mypy must never
+# pull into this py3.14 check. (custom_components resolves from the cwd root.)
+mypy_path = ["ha"]
 # agent_payload/ is a gitignored build artifact (scripts/build_payload.sh): the
 # py3.10 agent package + vendored third-party MQTT wheels. It is not integration
 # source — exclude it from this (py3.14) type-check; the agent gate at the repo
