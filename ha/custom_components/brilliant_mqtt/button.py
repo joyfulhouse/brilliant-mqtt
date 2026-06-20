@@ -10,6 +10,10 @@ from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from . import BrilliantMqttConfigEntry
 from .entity import BrilliantPanelEntity
 
+# Push-only entity (its state never polls); the press handler serializes panel SSH
+# via the fleet-wide lock, so no per-platform parallel-update limit is needed.
+PARALLEL_UPDATES = 0
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -21,7 +25,7 @@ async def async_setup_entry(
 
 class RepairButton(BrilliantPanelEntity, ButtonEntity):
     _attr_entity_category = EntityCategory.DIAGNOSTIC
-    _attr_name = "Repair bridge"
+    _attr_translation_key = "repair_bridge"
 
     def __init__(self, entry: BrilliantMqttConfigEntry) -> None:
         super().__init__(entry.runtime_data)

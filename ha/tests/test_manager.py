@@ -373,9 +373,10 @@ async def test_agent_update_step_failure_escalates_and_raises(
     with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
         entry = await _setup(hass)
         events = _capture_events(hass)
-        with pytest.raises(HomeAssistantError, match="agent update failed"):
+        with pytest.raises(HomeAssistantError) as err:
             await entry.runtime_data.async_update_agent()
         await hass.async_block_till_done()
+    assert err.value.translation_key == "update_failed"
 
     assert "agent_updated" not in _types(events)
     assert _types(events)[-1] == "needs_attention"
@@ -804,8 +805,9 @@ async def test_update_host_key_changed_without_optin_raises(
     manager = PanelManager(hass, entry, asyncio.Lock())
     events = _capture_events(hass)
 
-    with pytest.raises(HomeAssistantError, match="host key changed"):
+    with pytest.raises(HomeAssistantError) as err:
         await manager.async_update_agent()
+    assert err.value.translation_key == "host_key_changed"
 
     assert _types(events)[-1] == "needs_attention"
     assert manager.problem is True

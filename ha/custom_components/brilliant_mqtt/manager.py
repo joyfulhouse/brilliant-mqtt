@@ -24,6 +24,7 @@ from homeassistant.components.mqtt.models import ReceiveMessage
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.event import async_call_later
 
@@ -45,6 +46,7 @@ from .const import (
     DEFAULT_OFFLINE_GRACE_MINUTES,
     DEFAULT_REPAIR_COOLDOWN_MINUTES,
     DEFAULT_TRUST_HOST_KEY_CHANGES,
+    DOMAIN,
     EVENT_AGENT_UPDATED,
     EVENT_HOST_KEY_REPINNED,
     EVENT_NEEDS_ATTENTION,
@@ -105,6 +107,11 @@ class PanelManager:
     def signal(self) -> str:
         """Dispatcher signal entities subscribe to for state refreshes."""
         return f"{SIGNAL_PANEL_STATE}_{self.entry.entry_id}"
+
+    @property
+    def _issue_id(self) -> str:
+        """Stable issue-registry id for this panel's 'needs attention' repair issue."""
+        return f"needs_attention_{self.entry.entry_id}"
 
     def _shell(self) -> PanelShell:
         return AsyncsshShell(
@@ -196,6 +203,10 @@ class PanelManager:
     def _set_problem(self, problem: bool, reason: str | None) -> None:
         self.problem = problem
         self.problem_reason = reason
+        if not problem:
+            # The panel recovered (or the problem otherwise cleared): drop any open
+            # "needs attention" repair issue so it doesn't linger after recovery.
+            ir.async_delete_issue(self.hass, DOMAIN, self._issue_id)
         self._notify()
 
     def _cancel(self, attr: str) -> None:
@@ -222,6 +233,11 @@ class PanelManager:
             and not self._repairing
         ):
             grace_s = self._opt(OPT_OFFLINE_GRACE_MINUTES, DEFAULT_OFFLINE_GRACE_MINUTES) * 60
+            _LOGGER.info(
+                "%s: bridge is unavailable (LWT offline); starting %d-minute grace period",
+                self.panel,
+                grace_s // 60,
+            )
             self._grace_cancel = async_call_later(self.hass, grace_s, self._grace_expired)
         self._notify()
 
@@ -245,11 +261,17 @@ class PanelManager:
 
     def _escalate(self, reason: str) -> None:
         self._fire(EVENT_NEEDS_ATTENTION, {"reason": reason})
-        persistent_notification.async_create(
+        # Surface as a repair issue (was a persistent_notification). _set_problem(True)
+        # below records the same problem/reason the binary_sensor reads; _set_problem(
+        # False) on recovery deletes this issue.
+        ir.async_create_issue(
             self.hass,
-            f"Panel `{self.panel}`: {reason}. See docs/ha-integration.md.",
-            title="Brilliant MQTT needs attention",
-            notification_id=f"{EVENT_TYPE}_{self.panel}",
+            DOMAIN,
+            self._issue_id,
+            is_fixable=False,
+            severity=ir.IssueSeverity.ERROR,
+            translation_key="needs_attention",
+            translation_placeholders={"panel": self.panel, "reason": reason},
         )
         self._set_problem(True, reason)
 
@@ -358,7 +380,9 @@ class PanelManager:
         agent is broken.
         """
         if self._repairing:
-            raise HomeAssistantError("a repair or update is already in progress")
+            raise HomeAssistantError(
+                translation_domain=DOMAIN, translation_key="already_in_progress"
+            )
         self._repairing = True
         # Cancel any pending grace timer (as async_repair does) so an outage that armed
         # it can't fire a spurious needs_attention during this update's recovery window.
@@ -374,15 +398,20 @@ class PanelManager:
                     # A rotated host key with auto-re-pin OFF: never offer the password to
                     # the new-key host. Service-call context → escalate AND raise so HA
                     # reports the install as failed (not a false success).
-                    msg = (
+                    self._escalate(
                         "panel SSH host key changed — Reconfigure to re-pin, or enable "
                         "'Trust host-key changes' in options"
                     )
-                    self._escalate(msg)
-                    raise HomeAssistantError(msg) from err
+                    raise HomeAssistantError(
+                        translation_domain=DOMAIN, translation_key="host_key_changed"
+                    ) from err
                 except (OSError, asyncssh.Error) as err:
                     self._escalate(f"agent update failed: {err}")
-                    raise HomeAssistantError(f"agent update failed: {err}") from err
+                    raise HomeAssistantError(
+                        translation_domain=DOMAIN,
+                        translation_key="update_failed",
+                        translation_placeholders={"error": str(err)},
+                    ) from err
                 try:
                     await panel_ops.deploy_payload(shell, str(_payload_dir()), version)
                     unit, env = await self._config_contents()
@@ -390,7 +419,11 @@ class PanelManager:
                     await panel_ops.restart(shell)
                 except (OSError, asyncssh.Error, PanelOpError) as err:
                     self._escalate(f"agent update failed: {err}")
-                    raise HomeAssistantError(f"agent update failed: {err}") from err
+                    raise HomeAssistantError(
+                        translation_domain=DOMAIN,
+                        translation_key="update_failed",
+                        translation_placeholders={"error": str(err)},
+                    ) from err
                 finally:
                     await shell.close()
             self._fire(EVENT_AGENT_UPDATED, {"version": version})
@@ -420,7 +453,11 @@ class PanelManager:
                 await panel_ops.uninstall(shell)
             except (OSError, asyncssh.Error, PanelOpError) as err:
                 self._escalate(f"agent uninstall failed: {err}")
-                raise HomeAssistantError(f"agent uninstall failed: {err}") from err
+                raise HomeAssistantError(
+                    translation_domain=DOMAIN,
+                    translation_key="uninstall_failed",
+                    translation_placeholders={"error": str(err)},
+                ) from err
             finally:
                 await shell.close()
         persistent_notification.async_create(
