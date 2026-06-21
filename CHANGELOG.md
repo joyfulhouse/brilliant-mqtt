@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Smarter panel onboarding (HA integration)**: the config flow is now
+  **detection-first** — step 1 asks only for the panel **IP + root password**,
+  connects once (TOFU host-key pin), and **adopts** an already-installed agent by
+  reading its config back (name, broker, mesh priority) with no further questions
+  and no changes to the panel. A not-yet-installed panel continues to an **MQTT
+  broker** step (pre-filled from the most recent panel) and a **Panel Name** step
+  (free-form, slugified for MQTT topics, e.g. "Office Bath" → `office-bath`). The
+  **Reconfigure** flow is broadened to edit host / root password / broker / mesh
+  priority and **push the change to the panel** (re-render env + restart); the
+  panel name stays immutable. Reconfigure refuses to write to a host already
+  running a **different** panel's agent (guards a mistyped IP from clobbering
+  another controller). The repair path is unchanged — it still always regenerates
+  the env from entry data and never reads it back.
+
 ### Added
 
 - **BLE mesh loads via elected publisher (Milestone 11)**: Brilliant's

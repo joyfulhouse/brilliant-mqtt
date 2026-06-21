@@ -2,31 +2,60 @@
   "config": {
     "step": {
       "user": {
-        "title": "Add a Brilliant panel",
+        "title": "Connect to the Brilliant panel",
+        "description": "Enter the panel's IP and root password. If the bridge agent is already installed, its settings are adopted automatically — you're done after this step.",
         "data": {
           "host": "Panel IP / hostname",
-          "root_password": "Panel root password (stored per panel)",
-          "panel": "Panel slug (e.g. office)",
-          "mesh_priority": "Mesh priority (0 = never publishes the BLE mesh)",
-          "mqtt_host": "Broker host (for the on-panel agent)",
+          "root_password": "Panel root password"
+        },
+        "data_description": {
+          "host": "The panel's address on your network (e.g. 192.168.1.10).",
+          "root_password": "Stored per panel — each controller can have its own root password."
+        }
+      },
+      "broker": {
+        "title": "MQTT broker",
+        "description": "The broker the on-panel agent publishes to. Pre-filled from your most recently added panel.",
+        "data": {
+          "mqtt_host": "Broker host",
           "mqtt_port": "Broker port",
           "mqtt_username": "Broker username",
           "mqtt_password": "Broker password"
         }
       },
+      "script": {
+        "title": "Panel settings",
+        "data": {
+          "name": "Panel Name",
+          "mesh_priority": "Mesh priority"
+        },
+        "data_description": {
+          "name": "A friendly name, e.g. \"Office Bath\". A lowercase id is derived for MQTT topics (\"Office Bath\" → office-bath).",
+          "mesh_priority": "0 = this panel never publishes the BLE mesh. Among positive values the LOWEST wins leader election (1 = primary, 2/3 = standbys)."
+        }
+      },
       "reconfigure": {
-        "title": "Update panel connection",
+        "title": "Reconfigure panel",
+        "description": "Edit this panel's connection, broker, and mesh priority. Changes are pushed to the panel and the agent is restarted. The panel name can't be changed.",
         "data": {
           "host": "Panel IP / hostname",
-          "root_password": "Panel root password"
+          "root_password": "Panel root password",
+          "mqtt_host": "Broker host",
+          "mqtt_port": "Broker port",
+          "mqtt_username": "Broker username",
+          "mqtt_password": "Broker password",
+          "mesh_priority": "Mesh priority"
         }
       }
     },
     "error": {
       "reserved_panel": "\"mesh\" is the reserved whole-home pseudo-panel and cannot be managed.",
-      "invalid_panel": "Use only lowercase letters, digits, hyphens, and underscores for the panel slug.",
+      "invalid_name": "Enter a name with at least one letter or digit.",
       "invalid_value": "Control characters are not allowed in this field.",
       "cannot_connect": "SSH connection failed — check the host and the root password.",
+      "cannot_read_config": "The agent is installed but its configuration could not be read. Try Reconfigure, or remove and re-add the panel.",
+      "cannot_apply": "Connected, but writing the new settings to the panel failed. Check the agent and try Repair.",
+      "wrong_panel": "That host already runs a different Brilliant panel's agent. Check the IP — applying here would overwrite and restart the wrong panel.",
       "host_key_changed": "The panel's SSH host key changed since it was added. If this is expected (e.g. the panel was reflashed), remove and re-add the panel to re-pin it. Otherwise it may indicate a man-in-the-middle, so do not proceed until you have confirmed the host."
     },
     "abort": {

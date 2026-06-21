@@ -1,15 +1,27 @@
-"""Config flow: one entry per panel — each panel stores ITS OWN root password."""
+"""Config flow: one entry per panel — each panel stores ITS OWN root password.
+
+Onboarding is detection-first: step 1 connects (the only required inputs) and, if the
+agent is already installed, ADOPTS the panel by reading its config back — no further
+questions, no changes to the panel. A not-yet-installed panel continues to the MQTT
+broker (pre-filled from a prior panel) and the panel-settings step. Reconfigure edits
+every mutable setting and pushes the change to the panel; the slug is immutable.
+"""
 
 from __future__ import annotations
 
 import re
+from collections.abc import AsyncIterator, Mapping
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import Any
 
 import asyncssh
 import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry, ConfigFlow, ConfigFlowResult, OptionsFlow
+from homeassistant.const import CONF_NAME
 from homeassistant.core import HomeAssistant, callback
 
+from . import _fleet_lock, panel_ops
 from .const import (
     CONF_HOST,
     CONF_MESH_PRIORITY,
@@ -31,21 +43,18 @@ from .const import (
     OPT_REPAIR_COOLDOWN_MINUTES,
     OPT_TRUST_HOST_KEY_CHANGES,
 )
-from .shell import AsyncsshShell
+from .shell import AsyncsshShell, PanelShell
 
-# Entry-data keys whose values pre-fill the NEXT add-panel form. Only the broker
-# creds are genuinely fleet-shared; the root password is deliberately excluded —
-# the operator runs per-controller root passwords, so reusing one by accident is
-# both the likeliest mistake and the costliest. Host/slug are always blank too.
+# Entry-data keys whose values pre-fill the NEXT add-panel MQTT step. Only the broker
+# creds are genuinely fleet-shared; the root password is deliberately excluded — the
+# operator runs per-controller root passwords, so reusing one by accident is both the
+# likeliest mistake and the costliest. Host/name are always blank too.
 _PREFILL_KEYS = (
     CONF_MQTT_HOST,
     CONF_MQTT_PORT,
     CONF_MQTT_USERNAME,
     CONF_MQTT_PASSWORD,
 )
-
-# Slug grammar: the panel name doubles as the MQTT topic segment and unique_id.
-_PANEL_SLUG = re.compile(r"[a-z0-9_-]+")
 
 # Free-text fields that flow into the on-panel env file / SSH; a control char here
 # corrupts the env file (panel_ops `_env_quote` rejects it as a hard backstop), so
@@ -58,155 +67,369 @@ _NO_CONTROL_CHARS = (
     CONF_MQTT_PASSWORD,
 )
 
+_SLUG_SEPARATORS = re.compile(r"[\s.]+")
+_SLUG_INVALID = re.compile(r"[^a-z0-9_-]+")
+_SLUG_DASH_RUNS = re.compile(r"-{2,}")
+
+
+class _WrongPanelError(Exception):
+    """A reconfigure connected to a host already running a DIFFERENT panel's agent.
+
+    Guards against a mistyped host (e.g. another controller's IP in a multi-panel
+    fleet): pushing this entry's env there would overwrite that panel's identity and
+    restart it. Carries the foreign panel slug found on the box.
+    """
+
 
 def _has_control_char(value: str) -> bool:
     return any(ord(c) < 32 for c in value)
 
 
-async def _validate_ssh(
-    hass: HomeAssistant, host: str, password: str, pinned_key: str | None = None
-) -> str:
-    """One SSH connect; returns the captured/verified host public key. Raises on failure.
+def _control_char_errors(user_input: dict[str, Any], keys: tuple[str, ...]) -> dict[str, str]:
+    """Per-field ``invalid_value`` errors for any *keys* whose value has a control char."""
+    return {key: "invalid_value" for key in keys if _has_control_char(user_input[key])}
 
-    With `pinned_key=None` this is a trust-on-first-use connect (new endpoint). With
-    `pinned_key` set, asyncssh verifies the server host key BEFORE auth, so the root
-    password is never offered to a host whose key no longer matches the pin (a mismatch
-    raises asyncssh.HostKeyNotVerifiable instead of authenticating).
+
+def _mqtt_schema_fields(source: Mapping[str, Any]) -> dict[Any, Any]:
+    """The four broker fields shared by the add-broker and reconfigure steps.
+
+    Defaults come from *source* (prior-entry prefill, or the entry being reconfigured);
+    the three string fields fall back to blank, the port to 1883.
     """
-    shell = AsyncsshShell(host, password, pinned_key)
+    return {
+        vol.Required(CONF_MQTT_HOST, default=source.get(CONF_MQTT_HOST, vol.UNDEFINED)): str,
+        vol.Required(CONF_MQTT_PORT, default=source.get(CONF_MQTT_PORT, 1883)): vol.All(
+            vol.Coerce(int), vol.Range(min=1, max=65535)
+        ),
+        vol.Required(
+            CONF_MQTT_USERNAME, default=source.get(CONF_MQTT_USERNAME, vol.UNDEFINED)
+        ): str,
+        vol.Required(
+            CONF_MQTT_PASSWORD, default=source.get(CONF_MQTT_PASSWORD, vol.UNDEFINED)
+        ): str,
+    }
+
+
+def _slugify(name: str) -> str:
+    """Free-form panel name → the slug stored as CONF_PANEL / MQTT topic id.
+
+    "Office Bath" → "office-bath". Lowercases, turns whitespace/dots into hyphens,
+    drops anything outside ``[a-z0-9_-]``, collapses repeats, trims. May return ""
+    (the caller rejects that as invalid_name). HA humanizes the slug back for display
+    (entity.py: "office-bath" → "Office Bath"), so the original name need not be stored.
+    """
+    slug = _SLUG_SEPARATORS.sub("-", name.strip().lower())
+    slug = _SLUG_INVALID.sub("", slug)
+    return _SLUG_DASH_RUNS.sub("-", slug).strip("-_")
+
+
+def _adopt_data(env: dict[str, str]) -> dict[str, Any] | None:
+    """Map an installed agent's parsed env file to entry data; None if unusable.
+
+    The slug is trusted from the device but still gated to the SAME canonical form
+    the typed path produces: a hand-deployed env with BRILLIANT_PANEL="mesh", empty,
+    or any non-canonical value (spaces, uppercase, leading/trailing or doubled
+    separators like "-office") must NOT become a config entry — it would collide with
+    the reserved pseudo-panel or break the MQTT topic contract. Same for an
+    out-of-range port. All of these surface as cannot_read_config.
+    """
     try:
-        await shell.connect()
-    finally:
-        await shell.close()
-    key = shell.pinned_host_key()
-    if key is None:
-        raise OSError("no host key captured")
-    return key
+        panel = env[panel_ops.ENV_PANEL]
+        # Require the adopted slug to be exactly what _slugify would produce, so the
+        # adopt and typed-name paths can never disagree on what a valid slug is.
+        if not panel or panel == MESH_PANEL or _slugify(panel) != panel:
+            return None
+        # MQTT_PORT and MESH_PRIORITY are OPTIONAL in the agent's env contract
+        # (config.py defaults them to 1883 / 0), so a valid hand-deployed env may omit
+        # them — mirror those defaults rather than refusing to adopt. The broker host +
+        # credentials ARE required by the agent, so a missing one (KeyError) correctly
+        # blocks adoption (a half-configured panel isn't safe to adopt).
+        port = int(env.get(panel_ops.ENV_MQTT_PORT, "1883"))
+        if not 1 <= port <= 65535:
+            raise ValueError("mqtt port out of range")
+        return {
+            CONF_PANEL: panel,
+            CONF_MESH_PRIORITY: int(env.get(panel_ops.ENV_MESH_PRIORITY, "0")),
+            CONF_MQTT_HOST: env[panel_ops.ENV_MQTT_HOST],
+            CONF_MQTT_PORT: port,
+            CONF_MQTT_USERNAME: env[panel_ops.ENV_MQTT_USERNAME],
+            CONF_MQTT_PASSWORD: env[panel_ops.ENV_MQTT_PASSWORD],
+        }
+    except (KeyError, ValueError):
+        return None
+
+
+@dataclass(frozen=True)
+class _PanelProbe:
+    """What one onboarding probe of a panel found."""
+
+    host_key: str
+    config: dict[str, str] | None  # parsed env file when the agent is already installed
+
+
+@asynccontextmanager
+async def _panel_session(
+    hass: HomeAssistant, host: str, password: str, pinned_key: str | None
+) -> AsyncIterator[PanelShell]:
+    """One serialized SSH session (fleet lock held), connected and always closed.
+
+    With `pinned_key` set the server key is verified BEFORE auth (a rotated/impostor
+    host never receives the root password); `pinned_key=None` is trust-on-first-use.
+    """
+    async with _fleet_lock(hass):
+        shell = AsyncsshShell(host, password, pinned_key)
+        try:
+            await shell.connect()
+            yield shell
+        finally:
+            await shell.close()
+
+
+async def _probe_panel(hass: HomeAssistant, host: str, password: str) -> _PanelProbe:
+    """Connect (TOFU), capture the host key, and read the agent's config if installed.
+
+    "Installed" requires BOTH the systemd unit AND the env file — the unit is what
+    actually runs the agent, so a lone leftover env file (no unit) is NOT mistaken
+    for a running agent; it falls through to the normal not-installed setup path.
+    """
+    async with _panel_session(hass, host, password, None) as shell:
+        key = shell.pinned_host_key()
+        if key is None:
+            raise OSError("no host key captured")
+        state = await panel_ops.inspect_panel(shell)
+        installed = state.unit_present and state.env_present
+        config = await panel_ops.read_env(shell) if installed else None
+        return _PanelProbe(host_key=key, config=config)
+
+
+async def _apply_config(
+    hass: HomeAssistant,
+    host: str,
+    password: str,
+    *,
+    pinned_key: str | None,
+    env_content: str,
+    expected_panel: str,
+) -> str:
+    """Verify/capture the host key; if the agent is installed, push env + restart.
+
+    Returns the (pinned/verified) host key. A not-yet-installed panel skips the push —
+    the entry update still lands and the next deploy renders the new values.
+
+    Before overwriting, it refuses to clobber a DIFFERENT panel: if the box already
+    runs an agent whose env names another slug than *expected_panel* (e.g. the host
+    was mistyped to another controller in the fleet), it raises _WrongPanelError
+    instead of stamping this entry's identity onto that panel and restarting it.
+    """
+    async with _panel_session(hass, host, password, pinned_key) as shell:
+        key = shell.pinned_host_key()
+        if key is None:
+            raise OSError("no host key captured")
+        state = await panel_ops.inspect_panel(shell)
+        if state.unit_present:
+            if state.env_present:
+                found = (await panel_ops.read_env(shell)).get(panel_ops.ENV_PANEL)
+                if found and found != expected_panel:
+                    raise _WrongPanelError(found)
+            await panel_ops.write_env(shell, env_content)
+            await panel_ops.restart(shell)
+        return key
 
 
 class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
-    """Add one Brilliant panel per entry."""
+    """Add one Brilliant panel per entry (detection-first; adopts installed agents)."""
 
     VERSION = 1
+
+    def __init__(self) -> None:
+        # Carried across the not-installed onboarding steps (user → mqtt → script).
+        self._connect: dict[str, Any] = {}
+        self._mqtt: dict[str, Any] = {}
 
     @staticmethod
     @callback
     def async_get_options_flow(config_entry: ConfigEntry) -> OptionsFlow:
         return BrilliantMqttOptionsFlow()
 
-    def _schema(self) -> vol.Schema:
-        defaults: dict[str, Any] = {}
-        if entries := self._async_current_entries():
-            data = entries[-1].data
-            defaults = {k: data[k] for k in _PREFILL_KEYS if k in data}
-        return vol.Schema(
-            {
-                vol.Required(CONF_HOST): str,
-                vol.Required(
-                    CONF_ROOT_PASSWORD,
-                    default=defaults.get(CONF_ROOT_PASSWORD, vol.UNDEFINED),
-                ): str,
-                vol.Required(CONF_PANEL): str,
-                vol.Required(CONF_MESH_PRIORITY, default=0): vol.All(
-                    vol.Coerce(int), vol.Range(min=0, max=99)
-                ),
-                vol.Required(
-                    CONF_MQTT_HOST, default=defaults.get(CONF_MQTT_HOST, vol.UNDEFINED)
-                ): str,
-                vol.Required(CONF_MQTT_PORT, default=defaults.get(CONF_MQTT_PORT, 1883)): vol.All(
-                    vol.Coerce(int), vol.Range(min=1, max=65535)
-                ),
-                vol.Required(
-                    CONF_MQTT_USERNAME,
-                    default=defaults.get(CONF_MQTT_USERNAME, vol.UNDEFINED),
-                ): str,
-                vol.Required(
-                    CONF_MQTT_PASSWORD,
-                    default=defaults.get(CONF_MQTT_PASSWORD, vol.UNDEFINED),
-                ): str,
-            }
-        )
-
     async def async_step_user(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        """Step 1 — connect (IP + root password, the only required inputs).
+
+        Adopts the panel outright if the agent is already installed; otherwise
+        continues to the MQTT broker step.
+        """
         errors: dict[str, str] = {}
         if user_input is not None:
-            panel = user_input[CONF_PANEL].strip().lower()
-            if panel == MESH_PANEL:
-                errors[CONF_PANEL] = "reserved_panel"
-            elif not _PANEL_SLUG.fullmatch(panel):
-                errors[CONF_PANEL] = "invalid_panel"
-            for key in _NO_CONTROL_CHARS:
-                if _has_control_char(user_input[key]):
-                    errors[key] = "invalid_value"
+            # Reject control chars on the RAW host first (a leading/trailing \n/\r/\t must
+            # fail, not be silently stripped), THEN drop benign surrounding whitespace so a
+            # stray space can't store a dirty value or, on a later reconfigure, read as a
+            # "different" host and silently re-TOFU.
+            errors = _control_char_errors(user_input, (CONF_HOST, CONF_ROOT_PASSWORD))
             if not errors:
-                await self.async_set_unique_id(panel)
-                self._abort_if_unique_id_configured()
+                user_input = {**user_input, CONF_HOST: user_input[CONF_HOST].strip()}
                 try:
-                    host_key = await _validate_ssh(
+                    probe = await _probe_panel(
                         self.hass, user_input[CONF_HOST], user_input[CONF_ROOT_PASSWORD]
                     )
                 except (OSError, asyncssh.Error):
                     errors["base"] = "cannot_connect"
                 else:
-                    return self.async_create_entry(
-                        title=f"Brilliant {panel}",
-                        data={
-                            **user_input,
-                            CONF_PANEL: panel,
-                            DATA_SSH_HOST_KEY: host_key,
-                        },
-                    )
-        return self.async_show_form(step_id="user", data_schema=self._schema(), errors=errors)
+                    self._connect = {
+                        CONF_HOST: user_input[CONF_HOST],
+                        CONF_ROOT_PASSWORD: user_input[CONF_ROOT_PASSWORD],
+                        DATA_SSH_HOST_KEY: probe.host_key,
+                    }
+                    if probe.config is None:
+                        return await self.async_step_broker()
+                    adopted = _adopt_data(probe.config)
+                    if adopted is None:
+                        errors["base"] = "cannot_read_config"
+                    else:
+                        await self.async_set_unique_id(adopted[CONF_PANEL])
+                        self._abort_if_unique_id_configured()
+                        return self.async_create_entry(
+                            title=f"Brilliant {adopted[CONF_PANEL]}",
+                            data={**self._connect, **adopted},
+                        )
+        schema = vol.Schema(
+            {
+                vol.Required(
+                    CONF_HOST, default=(user_input or {}).get(CONF_HOST, vol.UNDEFINED)
+                ): str,
+                vol.Required(CONF_ROOT_PASSWORD): str,
+            }
+        )
+        return self.async_show_form(step_id="user", data_schema=schema, errors=errors)
+
+    async def async_step_broker(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        """Step 2 — MQTT broker the on-panel agent connects to (pre-filled from a prior panel)."""
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            errors = _control_char_errors(
+                user_input, (CONF_MQTT_HOST, CONF_MQTT_USERNAME, CONF_MQTT_PASSWORD)
+            )
+            if not errors:
+                self._mqtt = dict(user_input)
+                return await self.async_step_script()
+        defaults: dict[str, Any] = {}
+        if entries := self._async_current_entries():
+            prior = entries[-1].data
+            defaults = {k: prior[k] for k in _PREFILL_KEYS if k in prior}
+        schema = vol.Schema(_mqtt_schema_fields(defaults))
+        # On an error redisplay, show what the operator just typed (not the prior-panel
+        # prefill); the prefill is only the first-time default.
+        if user_input is not None:
+            schema = self.add_suggested_values_to_schema(schema, user_input)
+        return self.async_show_form(step_id="broker", data_schema=schema, errors=errors)
+
+    async def async_step_script(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        """Step 3 — name the panel + mesh priority (only for a not-yet-installed panel)."""
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            slug = _slugify(user_input[CONF_NAME])
+            if slug == MESH_PANEL:
+                errors[CONF_NAME] = "reserved_panel"
+            elif not slug:
+                errors[CONF_NAME] = "invalid_name"
+            if not errors:
+                await self.async_set_unique_id(slug)
+                self._abort_if_unique_id_configured()
+                return self.async_create_entry(
+                    title=f"Brilliant {slug}",
+                    data={
+                        **self._connect,
+                        **self._mqtt,
+                        CONF_PANEL: slug,
+                        CONF_MESH_PRIORITY: user_input[CONF_MESH_PRIORITY],
+                    },
+                )
+        schema = vol.Schema(
+            {
+                vol.Required(CONF_NAME): str,
+                vol.Required(CONF_MESH_PRIORITY, default=0): vol.All(
+                    vol.Coerce(int), vol.Range(min=0, max=99)
+                ),
+            }
+        )
+        # Preserve the operator's name + mesh choice across an invalid-name redisplay.
+        if user_input is not None:
+            schema = self.add_suggested_values_to_schema(schema, user_input)
+        return self.async_show_form(step_id="script", data_schema=schema, errors=errors)
 
     async def async_step_reconfigure(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Rotate host/root password for one panel (slug is immutable)."""
+        """Edit host/password/broker/mesh for one panel and push it (slug is immutable)."""
         entry = self._get_reconfigure_entry()
         errors: dict[str, str] = {}
         if user_input is not None:
-            for key in (CONF_HOST, CONF_ROOT_PASSWORD):
-                if _has_control_char(user_input[key]):
-                    errors[key] = "invalid_value"
+            # Reject control chars on the RAW input first, THEN strip benign surrounding
+            # whitespace — otherwise a stray trailing space would read as a "different"
+            # host and downgrade the same-host pinned check to a fresh TOFU.
+            errors = _control_char_errors(user_input, _NO_CONTROL_CHARS)
             if not errors:
-                # Same host → verify the rotated password against the STORED pin
-                # (key checked before auth, so the password is never offered to a
-                # changed/impostor host). Different host → a new endpoint/hardware,
-                # so fresh TOFU like adding a panel.
+                user_input = {**user_input, CONF_HOST: user_input[CONF_HOST].strip()}
+                # Same host → verify the rotated password against the STORED pin (key
+                # checked before auth, so the password is never offered to a changed/
+                # impostor host). Different host → new endpoint/hardware → fresh TOFU.
                 host_unchanged = user_input[CONF_HOST] == entry.data[CONF_HOST]
                 pinned_key = entry.data.get(DATA_SSH_HOST_KEY) if host_unchanged else None
                 if host_unchanged and pinned_key is None:
                     # Defense-in-depth: same host but no stored pin (not reachable today
-                    # — every entry-write pins — but robust against a future schema
-                    # change). Fail closed: an unpinned connect here would re-offer the
-                    # root password to an unverified host, re-opening the bypass.
+                    # — every entry-write pins). Fail closed: an unpinned connect here
+                    # would re-offer the root password to an unverified host.
                     errors["base"] = "host_key_changed"
                 else:
+                    env = panel_ops.render_env(
+                        panel=entry.data[CONF_PANEL],
+                        mesh_priority=user_input[CONF_MESH_PRIORITY],
+                        mqtt_host=user_input[CONF_MQTT_HOST],
+                        mqtt_port=user_input[CONF_MQTT_PORT],
+                        mqtt_username=user_input[CONF_MQTT_USERNAME],
+                        mqtt_password=user_input[CONF_MQTT_PASSWORD],
+                    )
                     try:
-                        host_key = await _validate_ssh(
+                        host_key = await _apply_config(
                             self.hass,
                             user_input[CONF_HOST],
                             user_input[CONF_ROOT_PASSWORD],
                             pinned_key=pinned_key,
+                            env_content=env,
+                            expected_panel=entry.data[CONF_PANEL],
                         )
+                    except _WrongPanelError:
+                        # The host runs a DIFFERENT panel's agent (likely a mistyped
+                        # address): refuse rather than overwrite + restart that panel.
+                        errors["base"] = "wrong_panel"
                     except asyncssh.HostKeyNotVerifiable:
                         # Same known-good host but its key no longer matches the pin: a
-                        # reflash — or a MITM. Surface it; never silently re-pin (that is
-                        # the bypass). The stored pin and password are left untouched.
+                        # reflash — or a MITM. Surface it; never silently re-pin. The
+                        # stored pin and entry data are left untouched.
                         errors["base"] = "host_key_changed"
                     except (OSError, asyncssh.Error):
                         errors["base"] = "cannot_connect"
+                    except panel_ops.PanelOpError:
+                        # Connected fine, but writing the env / restarting failed.
+                        errors["base"] = "cannot_apply"
                     else:
                         return self.async_update_reload_and_abort(
                             entry,
                             data={**entry.data, **user_input, DATA_SSH_HOST_KEY: host_key},
                         )
+        data = entry.data
         schema = vol.Schema(
             {
-                vol.Required(CONF_HOST, default=entry.data[CONF_HOST]): str,
+                vol.Required(CONF_HOST, default=data[CONF_HOST]): str,
                 vol.Required(CONF_ROOT_PASSWORD): str,
+                **_mqtt_schema_fields(data),
+                vol.Required(CONF_MESH_PRIORITY, default=data.get(CONF_MESH_PRIORITY, 0)): vol.All(
+                    vol.Coerce(int), vol.Range(min=0, max=99)
+                ),
             }
         )
+        # Keep the operator's just-made edits across an error redisplay (a transient
+        # cannot_connect / wrong_panel shouldn't wipe all six fields back to the old config).
+        if user_input is not None:
+            schema = self.add_suggested_values_to_schema(schema, user_input)
         return self.async_show_form(step_id="reconfigure", data_schema=schema, errors=errors)
 
 
