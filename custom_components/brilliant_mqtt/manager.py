@@ -296,6 +296,12 @@ class PanelManager:
         )
         return unit, env
 
+    async def _payload_version(self) -> str:
+        """The bundled agent payload's version string (read off-thread; blocking IO)."""
+        return (
+            await self.hass.async_add_executor_job((_payload_dir() / "VERSION").read_text)
+        ).strip()
+
     async def async_repair(self, trigger: str = "manual") -> None:
         """Restore unit/env + enable; recovery is confirmed by the availability LWT."""
         if self._repairing:
@@ -336,8 +342,18 @@ class PanelManager:
                     )
                     return
                 try:
-                    await panel_ops.inspect_panel(shell)  # logged context (journal on fail)
+                    state = await panel_ops.inspect_panel(shell)
                     unit, env = await self._config_contents()
+                    # Bootstrap a code-less panel (never installed, or its /var code was
+                    # lost): lay the agent payload down BEFORE enabling the unit, so the
+                    # Repair button / auto-repair can install from scratch rather than
+                    # enable a unit whose ExecStart points at code that isn't there. An
+                    # already-installed panel (the common OTA-wiped-/etc case) keeps the
+                    # light path — rewrite config + enable, no re-upload.
+                    if not state.payload_present:
+                        await panel_ops.deploy_payload(
+                            shell, str(_payload_dir()), await self._payload_version()
+                        )
                     await panel_ops.ensure_configs(shell, unit, env)
                     await panel_ops.enable_now(shell)
                 except (OSError, asyncssh.Error, PanelOpError) as err:
@@ -389,9 +405,7 @@ class PanelManager:
         # it can't fire a spurious needs_attention during this update's recovery window.
         self._cancel("_grace_cancel")
         try:
-            version = (
-                await self.hass.async_add_executor_job((_payload_dir() / "VERSION").read_text)
-            ).strip()
+            version = await self._payload_version()
             async with self._ssh_lock:
                 try:
                     shell = await self._connect_for_repair()
