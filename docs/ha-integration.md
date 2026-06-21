@@ -70,7 +70,12 @@ Adding the integration walks a short, **detection-first** flow:
 3. **Panel settings** *(only when not installed)* — a free-text **Panel Name**
    (e.g. "Office Bath"; a lowercase id is derived for MQTT topics → `office-bath`)
    and the **Mesh priority** (`MESH_PRIORITY`: 0 = never lead; 1 = primary; 2/3 =
-   standbys). `mesh` is **reserved** and rejected.
+   standbys). `mesh` is **reserved** and rejected. **On submit the integration
+   installs the agent on the panel over SSH** — pushes the bundled payload, writes
+   the systemd unit + env, and enables the service — *then* creates the entry. If
+   the install fails, the step stays open with `cannot_install` and **no entry is
+   created**, so you can fix the panel and retry. Once the agent starts it
+   publishes MQTT discovery and the panel's controls fill in the same device.
 
 The derived slug doubles as the MQTT topic segment and the entry's unique id, so
 it is **immutable** after creation (renaming = remove + re-add).
@@ -91,9 +96,9 @@ Each panel's device gains three management entities (all diagnostic):
 
 | Entity | What it is |
 |---|---|
-| `update.brilliant_<panel>_bridge` | Agent **update** entity. Installed version comes from the panel's retained bridge-meta (`agent_version`); latest comes from the bundled payload's `VERSION`. Installing pushes the bundled payload and restarts the agent. Also the **first-deploy** path to a bare panel. |
+| `update.brilliant_<panel>_bridge` | Agent **update** entity. Installed version comes from the panel's retained bridge-meta (`agent_version`); latest comes from the bundled payload's `VERSION`. Installing pushes the bundled payload and restarts the agent. |
 | `binary_sensor.brilliant_<panel>_bridge_health` | Bridge **health** (device class `problem`). `on` = needs attention (offline past grace with auto-repair off, a repair step failed, or a repair ran but the bridge stayed offline). Attributes: `reason`, `availability`. |
-| `button.brilliant_<panel>_repair_bridge` | **Manual repair** — restores the unit/env and starts the agent, bypassing the auto-repair cooldown. |
+| `button.brilliant_<panel>_repair_bridge` | **Manual repair** — restores the unit/env and starts the agent (and **installs the agent code first if it is missing**), bypassing the auto-repair cooldown. |
 
 Entity ids are derived from the panel's HA device name (`Brilliant <panel>`), so
 in practice they read `update.brilliant_<panel>_bridge`,
@@ -187,9 +192,10 @@ no reload is needed:
 The availability LWT and the retained bridge-meta drive everything for one
 panel. Going `offline` arms a **grace timer**; if the panel is still offline when
 it expires and auto-repair is on (and the repair cooldown has elapsed), the
-integration SSHes in, **rewrites the unit + env from known-good sources** (always
-regenerated, never read back — so a repair also heals config drift), re-stages
-the OTA-proof copies under `/var`, and `enable --now`s the service; a **recovery
+integration SSHes in, **(re)installs the agent code if it is missing**, **rewrites
+the unit + env from known-good sources** (always regenerated, never read back — so
+a repair also heals config drift), re-stages the OTA-proof copies under `/var`, and
+`enable --now`s the service; a **recovery
 timer** then waits for the availability LWT to flip back to `online`
 (→ `repair_succeeded`) or escalates (→ `repair_failed` + `needs_attention`). A
 firmware change on the bridge-meta topic fires `panel_updated` and re-stages the
