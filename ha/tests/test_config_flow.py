@@ -258,6 +258,22 @@ async def test_installed_unreadable_config_shows_error(hass: HomeAssistant) -> N
     assert result["errors"] == {"base": "cannot_read_config"}
 
 
+@pytest.mark.parametrize("bad_panel", ["mesh", "Office Bath", "office/bath", ""])
+async def test_installed_rejects_unsafe_adopted_slug(hass: HomeAssistant, bad_panel: str) -> None:
+    """A hand-deployed BRILLIANT_PANEL that is reserved/empty/non-slug must not be adopted."""
+    result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": "user"})
+    with patch(PROBE, return_value=_installed(_env(panel=bad_panel))):
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], CONNECT_INPUT)
+    assert result["type"] == "form" and result["errors"] == {"base": "cannot_read_config"}
+
+
+async def test_installed_rejects_out_of_range_port(hass: HomeAssistant) -> None:
+    result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": "user"})
+    with patch(PROBE, return_value=_installed(_env(panel="office", mqtt_port=0))):
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], CONNECT_INPUT)
+    assert result["type"] == "form" and result["errors"] == {"base": "cannot_read_config"}
+
+
 # --- reconfigure -----------------------------------------------------------
 
 

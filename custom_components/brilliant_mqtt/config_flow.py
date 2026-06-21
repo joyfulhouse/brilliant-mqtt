@@ -70,6 +70,9 @@ _NO_CONTROL_CHARS = (
 _SLUG_SEPARATORS = re.compile(r"[\s.]+")
 _SLUG_INVALID = re.compile(r"[^a-z0-9_-]+")
 _SLUG_DASH_RUNS = re.compile(r"-{2,}")
+# The slug grammar — the panel name doubles as the MQTT topic segment and unique_id.
+# _slugify guarantees it for typed names; it also gates a slug ADOPTED from a panel.
+_PANEL_SLUG = re.compile(r"[a-z0-9_-]+")
 
 
 def _has_control_char(value: str) -> bool:
@@ -90,13 +93,25 @@ def _slugify(name: str) -> str:
 
 
 def _adopt_data(env: dict[str, str]) -> dict[str, Any] | None:
-    """Map an installed agent's parsed env file to entry data; None if unreadable."""
+    """Map an installed agent's parsed env file to entry data; None if unusable.
+
+    The slug is trusted from the device but still gated: a hand-deployed env with
+    BRILLIANT_PANEL="mesh", a non-slug value (spaces/uppercase), or an out-of-range
+    port must NOT become a config entry — it would collide with the reserved
+    pseudo-panel or break the MQTT topic contract. Those surface as cannot_read_config.
+    """
     try:
+        panel = env[panel_ops.ENV_PANEL]
+        if panel == MESH_PANEL or not _PANEL_SLUG.fullmatch(panel):
+            return None
+        port = int(env[panel_ops.ENV_MQTT_PORT])
+        if not 1 <= port <= 65535:
+            raise ValueError("mqtt port out of range")
         return {
-            CONF_PANEL: env[panel_ops.ENV_PANEL],
+            CONF_PANEL: panel,
             CONF_MESH_PRIORITY: int(env[panel_ops.ENV_MESH_PRIORITY]),
             CONF_MQTT_HOST: env[panel_ops.ENV_MQTT_HOST],
-            CONF_MQTT_PORT: int(env[panel_ops.ENV_MQTT_PORT]),
+            CONF_MQTT_PORT: port,
             CONF_MQTT_USERNAME: env[panel_ops.ENV_MQTT_USERNAME],
             CONF_MQTT_PASSWORD: env[panel_ops.ENV_MQTT_PASSWORD],
         }
@@ -123,18 +138,16 @@ async def _panel_session(
     """
     async with _fleet_lock(hass):
         shell = AsyncsshShell(host, password, pinned_key)
-        await shell.connect()
         try:
+            await shell.connect()
             yield shell
         finally:
             await shell.close()
 
 
-async def _probe_panel(
-    hass: HomeAssistant, host: str, password: str, pinned_key: str | None = None
-) -> _PanelProbe:
+async def _probe_panel(hass: HomeAssistant, host: str, password: str) -> _PanelProbe:
     """Connect (TOFU), capture the host key, and read the agent's config if installed."""
-    async with _panel_session(hass, host, password, pinned_key) as shell:
+    async with _panel_session(hass, host, password, None) as shell:
         key = shell.pinned_host_key()
         if key is None:
             raise OSError("no host key captured")

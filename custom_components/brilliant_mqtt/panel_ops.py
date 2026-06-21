@@ -189,8 +189,9 @@ async def write_env(shell: PanelShell, env_content: str) -> None:
     restarts the agent to pick it up.
     """
     await _checked(shell, f"mkdir -p {PANEL_STAGED_DIR}")
-    await shell.put_bytes(env_content.encode(), PANEL_ENV_FILE, 0o600)
-    await shell.put_bytes(env_content.encode(), _STAGED_ENV, 0o600)
+    env_bytes = env_content.encode()
+    await shell.put_bytes(env_bytes, PANEL_ENV_FILE, 0o600)
+    await shell.put_bytes(env_bytes, _STAGED_ENV, 0o600)
 
 
 async def ensure_configs(shell: PanelShell, unit_content: str, env_content: str) -> None:

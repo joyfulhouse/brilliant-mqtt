@@ -93,23 +93,6 @@ def _password_line(password: str) -> str:
     return lines[0]
 
 
-def _systemd_unquote(rendered_value: str) -> str:
-    r"""Reverse systemd's double-quote rules: strip the quotes, unescape \\ and \"."""
-    assert rendered_value.startswith('"') and rendered_value.endswith('"')
-    inner = rendered_value[1:-1]
-    out: list[str] = []
-    i = 0
-    while i < len(inner):
-        ch = inner[i]
-        if ch == "\\" and i + 1 < len(inner):
-            out.append(inner[i + 1])
-            i += 2
-        else:
-            out.append(ch)
-            i += 1
-    return "".join(out)
-
-
 @pytest.mark.parametrize("ctrl", ["pass\nword", "pass\rword", "pass\x00word"])
 def test_render_env_rejects_control_characters(ctrl: str) -> None:
     with pytest.raises(ValueError, match="control characters"):
@@ -137,9 +120,9 @@ def test_render_env_password_round_trips_through_systemd_quoting(password: str) 
     line = _password_line(password)
     key, _, value = line.partition("=")
     assert key == "MQTT_PASSWORD"
-    # The value is double-quoted and what systemd would parse back equals the input.
+    # The value is double-quoted and parse_env (production) recovers the original input.
     assert value.startswith('"') and value.endswith('"')
-    assert _systemd_unquote(value) == password
+    assert panel_ops.parse_env(line)["MQTT_PASSWORD"] == password
 
 
 def test_parse_env_round_trips_render_env() -> None:
