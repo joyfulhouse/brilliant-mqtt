@@ -69,8 +69,9 @@ async def test_inspect_detects_absent_payload() -> None:
     shell = await _connected(FakeShell(responses={panel_ops.INSPECT_COMMAND: fresh}))
     state = await panel_ops.inspect_panel(shell)
     assert state.payload_present is False
-    # The probe must actually ask about the payload dirs, not infer it.
-    assert f"test -d {PANEL_VAR_DIR}/app" in panel_ops.INSPECT_COMMAND
+    # The probe checks the actual entrypoint the unit runs (not just an app/ dir that
+    # could be empty) plus the vendored deps — not inferred.
+    assert f"{PANEL_VAR_DIR}/app/brilliant_mqtt/__main__.py" in panel_ops.INSPECT_COMMAND
     assert f"test -d {PANEL_VAR_DIR}/vendor" in panel_ops.INSPECT_COMMAND
 
 
