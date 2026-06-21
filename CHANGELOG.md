@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-06-21
+
+### Fixed
+
+- **Agent update now shows progress.** The bridge Update entity never declared
+  the `PROGRESS` feature, so Home Assistant ignored its in-progress state and the
+  install card showed nothing while the agent deployed. It now renders a
+  determinate progress bar through the deploy stages (connect → upload payload →
+  write config → restart).
+
 ## [0.2.3] - 2026-06-21
 
 ### Added
@@ -132,7 +142,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - JoyfulHouse OSS docs standard: LICENSE (MIT), INSTALL.md, CHANGELOG.md,
   FUNDING.yml, CODEOWNERS, and the canonical `docs/` set.
 
-[Unreleased]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.2.3...HEAD
+[Unreleased]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.2.4...HEAD
+[0.2.4]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.2.0...v0.2.1
