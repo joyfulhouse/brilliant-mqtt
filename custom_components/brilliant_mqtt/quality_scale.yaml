@@ -77,7 +77,7 @@ rules:
 
   test-before-configure:
     status: done
-    comment: The config flow opens an SSH connection (_validate_ssh) before creating the entry.
+    comment: The config flow opens an SSH connection (_probe_panel) before creating the entry.
 
   test-before-setup:
     status: done

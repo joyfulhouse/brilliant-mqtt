@@ -51,24 +51,33 @@ extract it into `config/custom_components/brilliant_mqtt/` so that
 `manifest.json` sits at the root of that folder. Restart Home Assistant and add
 the integration as above.
 
-## The add-panel form
+## Onboarding a panel
 
-Adding the integration opens a per-panel form:
+Adding the integration walks a short, **detection-first** flow:
 
-| Field | Notes |
-|---|---|
-| **Host** | Panel hostname or IP for SSH. |
-| **Root password** | The panel's **per-controller** root password. Deliberately **not** pre-filled from a previous panel — reusing one by accident is the costliest mistake. |
-| **Panel** | The panel slug — doubles as the MQTT topic segment and the entry's unique id. Must match `^[a-z0-9_-]+$`; lower-cased on submit. `mesh` is **reserved** (the whole-home pseudo-panel has no host behind it) and is rejected. |
-| **Mesh priority** | `MESH_PRIORITY` for BLE-mesh leader election (0 = never lead; 1 = primary; 2/3 = standbys). Written into the panel's env file. |
-| **MQTT host / port / username / password** | Broker credentials the agent uses; written into the panel's env file over SSH. The broker fields **are** pre-filled from the previous panel (fleet-shared). |
+1. **Connect** — enter the panel's **Host** (IP/hostname) and **Root password** —
+   the only required inputs. On submit the integration makes **one** SSH
+   connection, **pins the host key** (trust-on-first-use), and checks whether the
+   bridge agent is already installed.
+   - **Already installed →** the panel is **adopted**: its name, MQTT broker, and
+     mesh priority are read back from the running agent and the entry is created.
+     No more questions, and the panel itself is left untouched. (A hand-deployed
+     `BRILLIANT_PANEL` that isn't slug-form, or is the reserved `mesh`, is refused.)
+2. **MQTT broker** *(only when not installed)* — the broker host/port/username/
+   password the on-panel agent will use. **Pre-filled** from your most recently
+   added panel (the broker is fleet-shared); the root password is deliberately
+   never pre-filled.
+3. **Panel settings** *(only when not installed)* — a free-text **Panel Name**
+   (e.g. "Office Bath"; a lowercase id is derived for MQTT topics → `office-bath`)
+   and the **Mesh priority** (`MESH_PRIORITY`: 0 = never lead; 1 = primary; 2/3 =
+   standbys). `mesh` is **reserved** and rejected.
 
-On submit the integration makes **one** SSH connection to validate the host and
-**pin its host key** (trust-on-first-use). The root password is never offered to
-an unpinned/impostor host on later connects.
+The derived slug doubles as the MQTT topic segment and the entry's unique id, so
+it is **immutable** after creation (renaming = remove + re-add).
 
-To rotate a panel's host or root password later, use **Reconfigure** on the
-entry (the slug is immutable); this re-validates over SSH. If the **host is
+To change a panel's host, root password, broker, or mesh priority later, use
+**Reconfigure** on the entry; it re-validates over SSH and **pushes the change to
+the panel** (re-renders the env file and restarts the agent). If the **host is
 unchanged**, it verifies the new password against the **stored** host key (key
 checked before auth — a mismatch is rejected with `host_key_changed`, never a
 silent re-pin), so rotating a password can't be used to accept a swapped key. If
@@ -228,14 +237,14 @@ deployed via the update entity / `redeploy`), not a repair.
   `/var/brilliant-mqtt/**`, `/etc/brilliant-mqtt.env` (mode `0600`), and
   `/etc/systemd/system/brilliant-mqtt.service`.
 
-> **Adopting a hand-deployed panel:** the integration lowercases the panel slug
-> and writes a matching lowercase `BRILLIANT_PANEL` into the env file, so any
-> panel it deploys is self-consistent. If you *manually* deployed the agent first
-> (per [INSTALL.md](../INSTALL.md)), make sure that `BRILLIANT_PANEL` is already
-> lowercase `^[a-z0-9_-]+$` — the agent publishes its MQTT topics verbatim from
-> that value, so a capitalized slug won't match the integration's lowercase
-> subscriptions until the first repair/redeploy rewrites the env and converges
-> them.
+> **Adopting a hand-deployed panel:** when you add a panel whose agent is already
+> installed, onboarding **reads `BRILLIANT_PANEL` from the live env file and adopts
+> it verbatim** (along with the broker + mesh priority) — it does not rewrite the
+> panel. So if you *manually* deployed the agent first (per
+> [INSTALL.md](../INSTALL.md)), set `BRILLIANT_PANEL` to a lowercase slug
+> (`^[a-z0-9_-]+$`): the agent publishes its MQTT topics from that value, and
+> onboarding **refuses** to adopt a non-slug or reserved (`mesh`) value
+> (`cannot_read_config`) rather than create a mismatched entry.
 
 See also [ARCHITECTURE.md](ARCHITECTURE.md) and
 [reference/deployment.md](reference/deployment.md).
