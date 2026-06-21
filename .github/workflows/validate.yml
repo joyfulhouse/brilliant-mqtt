@@ -26,8 +26,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: hacs/action@main
         with:
+          # No `ignore: brands` needed: HACS validates the bundled
+          # custom_components/brilliant_mqtt/brand/ icon (HA 2026.3 proxy API),
+          # falling back to home-assistant/brands only if it is absent.
           category: integration
-          # Brand assets are bundled in custom_components/brilliant_mqtt/brand/
-          # (HA 2026.3+ brands proxy API). hacs/action still checks the brands CDN,
-          # which custom-integration bundled brands aren't on — so keep skipping it.
-          ignore: brands
