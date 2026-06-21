@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import time
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -379,8 +380,12 @@ class PanelManager:
         finally:
             self._repairing = False
 
-    async def async_update_agent(self) -> None:
+    async def async_update_agent(self, progress: Callable[[int], None] | None = None) -> None:
         """Push the bundled agent payload, refresh configs, restart, verify via LWT.
+
+        *progress*, when given, is called with a 0-100 percentage at each deploy stage
+        so the update entity can render a real progress bar (the service path passes
+        None).
 
         Takes the SAME _repairing mutex as async_repair (C1): a concurrent repair (or
         a second update) early-returns, and — critically — while this holds it the
@@ -404,7 +409,13 @@ class PanelManager:
         # Cancel any pending grace timer (as async_repair does) so an outage that armed
         # it can't fire a spurious needs_attention during this update's recovery window.
         self._cancel("_grace_cancel")
+
+        def _p(pct: int) -> None:
+            if progress is not None:
+                progress(pct)
+
         try:
+            _p(10)
             version = await self._payload_version()
             async with self._ssh_lock:
                 try:
@@ -427,11 +438,16 @@ class PanelManager:
                         translation_key="update_failed",
                         translation_placeholders={"error": str(err)},
                     ) from err
+                _p(25)
                 try:
+                    _p(40)
                     await panel_ops.deploy_payload(shell, str(_payload_dir()), version)
+                    _p(80)
                     unit, env = await self._config_contents()
                     await panel_ops.ensure_configs(shell, unit, env)
+                    _p(90)
                     await panel_ops.restart(shell)
+                    _p(95)
                 except (OSError, asyncssh.Error, PanelOpError) as err:
                     self._escalate(f"agent update failed: {err}")
                     raise HomeAssistantError(
@@ -441,6 +457,7 @@ class PanelManager:
                     ) from err
                 finally:
                     await shell.close()
+            _p(100)
             self._fire(EVENT_AGENT_UPDATED, {"version": version})
             if self._shutting_down:
                 return  # entry torn down mid-update: do not re-arm a timer
