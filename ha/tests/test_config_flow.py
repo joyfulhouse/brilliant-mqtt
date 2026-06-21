@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
@@ -129,7 +130,7 @@ def test_slugify(name: str, slug: str) -> None:
 # --- onboarding: not installed (three steps) -------------------------------
 
 
-async def test_not_installed_walks_three_steps(hass: HomeAssistant) -> None:
+async def test_not_installed_walks_three_steps(hass: HomeAssistant, payload_dir: Path) -> None:
     result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": "user"})
     assert result["type"] == "form" and result["step_id"] == "user"
 
@@ -140,7 +141,10 @@ async def test_not_installed_walks_three_steps(hass: HomeAssistant) -> None:
     result = await hass.config_entries.flow.async_configure(result["flow_id"], MQTT_INPUT)
     assert result["type"] == "form" and result["step_id"] == "script"
 
-    result = await hass.config_entries.flow.async_configure(result["flow_id"], SCRIPT_INPUT)
+    # Step 3 now INSTALLS the agent over SSH before the entry is created.
+    install_shell = FakeShell()
+    with patch.object(config_flow, "AsyncsshShell", return_value=install_shell):
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], SCRIPT_INPUT)
     assert result["type"] == "create_entry"
     assert result["title"] == "Brilliant office-bath"
     data = result["data"]
@@ -151,6 +155,55 @@ async def test_not_installed_walks_three_steps(hass: HomeAssistant) -> None:
     assert data[CONF_MQTT_HOST] == "192.168.1.250"
     assert data[CONF_MQTT_PASSWORD] == "mqttpass"
     assert data[CONF_MESH_PRIORITY] == 1
+
+    # The agent was actually installed: payload uploaded, unit/env written, service enabled.
+    assert install_shell.dir_uploads  # deploy_payload pushed app/+vendor/
+    assert "systemctl enable --now brilliant-mqtt" in install_shell.commands
+    env_blob = next(d for (p, d, _m) in install_shell.uploads if p == "/etc/brilliant-mqtt.env")
+    assert b'BRILLIANT_PANEL="office-bath"' in env_blob  # the slug the operator named
+    assert b'MQTT_HOST="192.168.1.250"' in env_blob  # the broker entered in step 2
+
+
+async def test_not_installed_install_failure_shows_error(
+    hass: HomeAssistant, payload_dir: Path
+) -> None:
+    """A failed SSH install keeps the script step open with cannot_install and creates
+    no entry, so the operator can fix the panel and retry."""
+    result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": "user"})
+    with patch(PROBE, return_value=_not_installed()):
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], CONNECT_INPUT)
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], MQTT_INPUT)
+
+    # enable --now exits non-zero → PanelOpError out of the install.
+    failing = FakeShell(
+        responses={"systemctl enable --now brilliant-mqtt": RunResult(1, "", "boom")}
+    )
+    with patch.object(config_flow, "AsyncsshShell", return_value=failing):
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], SCRIPT_INPUT)
+    assert result["type"] == "form" and result["step_id"] == "script"
+    assert result["errors"] == {"base": "cannot_install"}
+    assert not hass.config_entries.async_entries(DOMAIN)  # nothing was created
+
+
+async def test_not_installed_install_aborts_on_unreadable_bundle(
+    hass: HomeAssistant, tmp_path: Path
+) -> None:
+    """A missing/corrupt bundled payload (VERSION/unit unreadable) surfaces as
+    cannot_install rather than crashing the flow — the reads are inside the try."""
+    result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": "user"})
+    with patch(PROBE, return_value=_not_installed()):
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], CONNECT_INPUT)
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], MQTT_INPUT)
+
+    empty = tmp_path / "empty"  # no brilliant-mqtt.service / VERSION → read_text raises
+    empty.mkdir()
+    with (
+        patch("custom_components.brilliant_mqtt.manager._payload_dir", return_value=empty),
+        patch.object(config_flow, "AsyncsshShell", return_value=FakeShell()),
+    ):
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], SCRIPT_INPUT)
+    assert result["type"] == "form" and result["errors"] == {"base": "cannot_install"}
+    assert not hass.config_entries.async_entries(DOMAIN)
 
 
 async def test_step1_only_requires_host_and_password(hass: HomeAssistant) -> None:

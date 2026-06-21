@@ -25,6 +25,7 @@
       },
       "script": {
         "title": "Panel settings",
+        "description": "Name the panel and set its mesh priority. When you finish, the bridge agent is installed on the panel over SSH and started.",
         "data": {
           "name": "Panel Name",
           "mesh_priority": "Mesh priority"
@@ -55,6 +56,7 @@
       "cannot_connect": "SSH connection failed — check the host and the root password.",
       "cannot_read_config": "The agent is installed but its configuration could not be read. Try Reconfigure, or remove and re-add the panel.",
       "cannot_apply": "Connected, but writing the new settings to the panel failed. Check the agent and try Repair.",
+      "cannot_install": "Connected, but installing the agent on the panel failed. Check the panel and try again.",
       "wrong_panel": "That host already runs a different Brilliant panel's agent. Check the IP — applying here would overwrite and restart the wrong panel.",
       "host_key_changed": "The panel's SSH host key changed since it was added. If this is expected (e.g. the panel was reflashed), remove and re-add the panel to re-pin it. Otherwise it may indicate a man-in-the-middle, so do not proceed until you have confirmed the host."
     },
@@ -81,7 +83,7 @@
   "services": {
     "repair": {
       "name": "Repair bridge",
-      "description": "Restore the unit/env from known-good sources and start the agent."
+      "description": "Restore the unit/env from known-good sources, install the agent if it's missing, and start it."
     },
     "redeploy": {
       "name": "Redeploy agent",

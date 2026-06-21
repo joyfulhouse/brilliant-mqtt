@@ -16,7 +16,7 @@ from tests.fakes import FakeShell
 
 _FULL_INSPECT = RunResult(
     0,
-    "unit=1\nenv=1\nenabled=1\nactive=1\nsunit=1\nsenv=1\n9.9.9\n",
+    "unit=1\nenv=1\nenabled=1\nactive=1\nsunit=1\nsenv=1\npayload=1\n9.9.9\n",
     "",
 )
 
@@ -36,6 +36,7 @@ async def test_inspect_parses_healthy_panel() -> None:
         active=True,
         staged_unit_present=True,
         staged_env_present=True,
+        payload_present=True,
         payload_version="9.9.9",
     )
 
@@ -55,6 +56,23 @@ async def test_inspect_handles_pre_integration_install() -> None:
     state = await panel_ops.inspect_panel(shell)
     assert state.payload_version is None
     assert not state.staged_unit_present
+
+
+async def test_inspect_detects_absent_payload() -> None:
+    """A never-installed (or code-wiped) panel: no app/+vendor/ → payload_present False.
+
+    This is the signal async_repair uses to deploy the agent code before enabling the
+    unit, so the Repair button can bootstrap a code-less panel instead of enabling a
+    unit whose ExecStart points at nothing.
+    """
+    fresh = RunResult(0, "unit=0\nenv=0\nenabled=0\nactive=0\nsunit=0\nsenv=0\npayload=0\n", "")
+    shell = await _connected(FakeShell(responses={panel_ops.INSPECT_COMMAND: fresh}))
+    state = await panel_ops.inspect_panel(shell)
+    assert state.payload_present is False
+    # The probe checks the actual entrypoint the unit runs (not just an app/ dir that
+    # could be empty) plus the vendored deps — not inferred.
+    assert f"{PANEL_VAR_DIR}/app/brilliant_mqtt/__main__.py" in panel_ops.INSPECT_COMMAND
+    assert f"test -d {PANEL_VAR_DIR}/vendor" in panel_ops.INSPECT_COMMAND
 
 
 def test_render_env_matches_agent_config_contract() -> None:

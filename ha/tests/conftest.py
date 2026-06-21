@@ -78,8 +78,20 @@ def payload_dir(tmp_path: Path) -> Iterator[Path]:
 
 @pytest.fixture
 def fake_shell() -> Iterator[FakeShell]:
-    """Route every manager SSH op through one inspectable FakeShell."""
-    shell = FakeShell()
+    """Route every manager SSH op through one inspectable FakeShell.
+
+    Its inspect probe reports a fully-installed panel (agent code + unit + env all
+    present), so a repair takes the light path — rewrite config + enable, WITHOUT
+    re-uploading the payload. Tests exercising the code-absent install path script
+    their own shell with a ``payload=0`` inspect.
+    """
+    from custom_components.brilliant_mqtt import panel_ops
+    from custom_components.brilliant_mqtt.shell import RunResult
+
+    installed = RunResult(
+        0, "unit=1\nenv=1\nenabled=1\nactive=1\nsunit=1\nsenv=1\npayload=1\n0.2.0\n", ""
+    )
+    shell = FakeShell(responses={panel_ops.INSPECT_COMMAND: installed})
     with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
         yield shell
 

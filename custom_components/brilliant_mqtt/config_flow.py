@@ -21,7 +21,7 @@ from homeassistant.config_entries import ConfigEntry, ConfigFlow, ConfigFlowResu
 from homeassistant.const import CONF_NAME
 from homeassistant.core import HomeAssistant, callback
 
-from . import _fleet_lock, panel_ops
+from . import _fleet_lock, manager, panel_ops
 from .const import (
     CONF_HOST,
     CONF_MESH_PRIORITY,
@@ -236,6 +236,34 @@ async def _apply_config(
         return key
 
 
+async def _install_agent(
+    hass: HomeAssistant,
+    host: str,
+    password: str,
+    *,
+    pinned_key: str,
+    payload_dir: str,
+    version: str,
+    unit: str,
+    env: str,
+) -> None:
+    """First-install the agent over SSH for a not-yet-installed panel.
+
+    Pushes the bundled payload (deploy_payload), writes the systemd unit + env
+    (ensure_configs), and enables + starts the service (enable_now) — so adding the
+    integration actually sets the panel up instead of waiting for a separate repair.
+    The host key was pinned by the step-1 probe, so this connect verifies before auth.
+
+    Like the manager's deploy paths, this holds the fleet-wide SSH lock for the whole
+    session (the payload upload included). The upload is small (a few hundred KB) and
+    the lock is released when _panel_session exits, including on flow cancellation.
+    """
+    async with _panel_session(hass, host, password, pinned_key) as shell:
+        await panel_ops.deploy_payload(shell, payload_dir, version)
+        await panel_ops.ensure_configs(shell, unit, env)
+        await panel_ops.enable_now(shell)
+
+
 class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
     """Add one Brilliant panel per entry (detection-first; adopts installed agents)."""
 
@@ -322,7 +350,13 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
         return self.async_show_form(step_id="broker", data_schema=schema, errors=errors)
 
     async def async_step_script(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
-        """Step 3 — name the panel + mesh priority (only for a not-yet-installed panel)."""
+        """Step 3 — name + mesh, then INSTALL the agent (only for a not-yet-installed panel).
+
+        Installing here — push the payload, write the unit/env, enable the service — is
+        what makes "add the integration" actually set the panel up. The host key was
+        pinned in step 1. An install failure keeps this form open with cannot_install so
+        the operator can fix the panel and retry; the entry is created only on success.
+        """
         errors: dict[str, str] = {}
         if user_input is not None:
             slug = _slugify(user_input[CONF_NAME])
@@ -333,15 +367,46 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
             if not errors:
                 await self.async_set_unique_id(slug)
                 self._abort_if_unique_id_configured()
-                return self.async_create_entry(
-                    title=f"Brilliant {slug}",
-                    data={
-                        **self._connect,
-                        **self._mqtt,
-                        CONF_PANEL: slug,
-                        CONF_MESH_PRIORITY: user_input[CONF_MESH_PRIORITY],
-                    },
+                env = panel_ops.render_env(
+                    panel=slug,
+                    mesh_priority=user_input[CONF_MESH_PRIORITY],
+                    mqtt_host=self._mqtt[CONF_MQTT_HOST],
+                    mqtt_port=self._mqtt[CONF_MQTT_PORT],
+                    mqtt_username=self._mqtt[CONF_MQTT_USERNAME],
+                    mqtt_password=self._mqtt[CONF_MQTT_PASSWORD],
                 )
+                try:
+                    # Read the bundled payload (unit/VERSION) inside the try so a missing
+                    # or corrupt bundle surfaces as cannot_install, not an unhandled crash.
+                    payload_dir = manager._payload_dir()
+                    unit = await self.hass.async_add_executor_job(
+                        (payload_dir / "brilliant-mqtt.service").read_text
+                    )
+                    version = (
+                        await self.hass.async_add_executor_job((payload_dir / "VERSION").read_text)
+                    ).strip()
+                    await _install_agent(
+                        self.hass,
+                        self._connect[CONF_HOST],
+                        self._connect[CONF_ROOT_PASSWORD],
+                        pinned_key=self._connect[DATA_SSH_HOST_KEY],
+                        payload_dir=str(payload_dir),
+                        version=version,
+                        unit=unit,
+                        env=env,
+                    )
+                except (OSError, asyncssh.Error, panel_ops.PanelOpError):
+                    errors["base"] = "cannot_install"
+                else:
+                    return self.async_create_entry(
+                        title=f"Brilliant {slug}",
+                        data={
+                            **self._connect,
+                            **self._mqtt,
+                            CONF_PANEL: slug,
+                            CONF_MESH_PRIORITY: user_input[CONF_MESH_PRIORITY],
+                        },
+                    )
         schema = vol.Schema(
             {
                 vol.Required(CONF_NAME): str,
@@ -350,7 +415,7 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
                 ),
             }
         )
-        # Preserve the operator's name + mesh choice across an invalid-name redisplay.
+        # Preserve name + mesh across an invalid-name or failed-install redisplay.
         if user_input is not None:
             schema = self.add_suggested_values_to_schema(schema, user_input)
         return self.async_show_form(step_id="script", data_schema=schema, errors=errors)
