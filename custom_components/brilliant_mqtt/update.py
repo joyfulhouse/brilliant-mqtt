@@ -31,7 +31,7 @@ async def async_setup_entry(
 
 
 class AgentUpdate(BrilliantPanelEntity, UpdateEntity):
-    _attr_supported_features = UpdateEntityFeature.INSTALL
+    _attr_supported_features = UpdateEntityFeature.INSTALL | UpdateEntityFeature.PROGRESS
     _attr_translation_key = "bridge"
     _attr_title = "brilliant-mqtt agent"
 
@@ -46,12 +46,19 @@ class AgentUpdate(BrilliantPanelEntity, UpdateEntity):
         return meta.get("agent_version") if meta else None
 
     async def async_install(self, version: str | None, backup: bool, **kwargs: Any) -> None:
-        # Engage HA's re-entrancy guard and show a spinner on the card for the duration
-        # of the deploy; async_update_agent re-raises on failure so HA surfaces it.
+        # Render a determinate progress bar through the deploy stages (needs the
+        # PROGRESS feature, above); async_update_agent re-raises on failure so HA
+        # surfaces it.
+        def _progress(pct: int) -> None:
+            self._attr_update_percentage = pct
+            self.async_write_ha_state()
+
         self._attr_in_progress = True
+        self._attr_update_percentage = 0
         self.async_write_ha_state()
         try:
-            await self._manager.async_update_agent()
+            await self._manager.async_update_agent(progress=_progress)
         finally:
             self._attr_in_progress = False
+            self._attr_update_percentage = None
             self.async_write_ha_state()

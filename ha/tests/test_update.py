@@ -44,3 +44,26 @@ async def test_update_module_top_level_import_is_safe(
     assert state.attributes["latest_version"] == "0.2.0"
 
     assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_agent_update_declares_progress_feature(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    fake_shell: FakeShell,
+    payload_dir: Path,
+) -> None:
+    """PROGRESS must be in supported_features — without it HA ignores in_progress /
+    update_percentage, so the install card shows no progress (the reported bug)."""
+    from homeassistant.components.update import UpdateEntityFeature
+
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    state = hass.states.get(UPDATE)
+    assert state is not None
+    feats = state.attributes["supported_features"]
+    assert feats & UpdateEntityFeature.INSTALL
+    assert feats & UpdateEntityFeature.PROGRESS
+    assert await hass.config_entries.async_unload(entry.entry_id)

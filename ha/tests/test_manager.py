@@ -852,3 +852,24 @@ async def test_update_host_key_changed_without_optin_raises(
     assert entry.data[DATA_SSH_HOST_KEY] == "ssh-ed25519 PINNED"
     assert manager._recovery_cancel is None
     assert manager._repairing is False
+
+
+@pytest.mark.allow_lingering_timers
+async def test_agent_update_reports_progress(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    fake_shell: FakeShell,
+    payload_dir: Path,
+) -> None:
+    """async_update_agent drives the optional progress callback monotonically to 100,
+    so the update entity can show a real progress bar through the deploy stages."""
+    entry = await _setup(hass)
+    pcts: list[int] = []
+    await entry.runtime_data.async_update_agent(progress=pcts.append)
+    await hass.async_block_till_done()
+    assert pcts, "no progress reported"
+    assert pcts == sorted(pcts), f"progress must be monotonic: {pcts}"
+    assert pcts[-1] == 100
+    assert 0 <= min(pcts) and max(pcts) <= 100
+    assert fake_shell.dir_uploads  # the deploy actually ran
+    assert await hass.config_entries.async_unload(entry.entry_id)
