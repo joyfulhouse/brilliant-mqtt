@@ -11,5 +11,5 @@
   "loggers": ["asyncssh"],
   "quality_scale": "platinum",
   "requirements": ["asyncssh==2.23.1"],
-  "version": "0.2.2"
+  "version": "0.2.3"
 }

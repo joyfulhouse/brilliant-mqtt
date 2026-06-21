@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-06-21
+
+### Added
+
+- **Faceplate motion-detection controls (bundled on-panel agent → 0.2.0).** The
+  agent now exposes the panel faceplate's motion-detection subsystem as
+  **disabled-by-default** entities: switches for **Screen Motion Detection**,
+  **PIR Score Reporting**, and **Light Motion Detection**, plus **PIR Motion
+  High/Low Threshold** numbers. These let you pick a panel's motion source and
+  tune its sensitivity from Home Assistant (enable the ones you need under the
+  panel's device). `movement_detected` is driven by whichever detection mode is
+  enabled; the PIR thresholds take effect once PIR Score Reporting is on.
+
 ## [0.2.2] - 2026-06-21
 
 ### Fixed
@@ -119,7 +132,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - JoyfulHouse OSS docs standard: LICENSE (MIT), INSTALL.md, CHANGELOG.md,
   FUNDING.yml, CODEOWNERS, and the canonical `docs/` set.
 
-[Unreleased]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.2.3...HEAD
+[0.2.3]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/joyfulhouse/brilliant-mqtt/releases/tag/v0.2.0
