@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-06-21
+
+### Fixed
+
+- **Onboarding now installs the on-panel agent.** Adding a not-yet-installed
+  panel previously created the Home Assistant entry but never deployed the
+  agent — so the panel published nothing and only the management entities
+  appeared, leaving the bridge dark until a separate redeploy. The final
+  onboarding step now SSH-installs the agent (push payload → write unit/env →
+  enable) before the entry is created; on failure the step stays open with a
+  `cannot_install` error and no entry is created.
+- **The Repair button now lays down the agent code when it's missing.**
+  `inspect_panel` reports whether the agent's runnable code is present, and a
+  repair (button or auto-repair) deploys the payload before enabling the unit —
+  so it can bootstrap or heal a code-less panel instead of enabling a service
+  whose program isn't there. An already-installed panel keeps the light path
+  (restore unit/env + enable, no re-upload).
+
 ## [0.2.1] - 2026-06-21
 
 ### Changed
@@ -101,6 +119,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - JoyfulHouse OSS docs standard: LICENSE (MIT), INSTALL.md, CHANGELOG.md,
   FUNDING.yml, CODEOWNERS, and the canonical `docs/` set.
 
-[Unreleased]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/joyfulhouse/brilliant-mqtt/releases/tag/v0.2.0
