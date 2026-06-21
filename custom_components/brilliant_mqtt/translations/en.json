@@ -31,7 +31,7 @@
         },
         "data_description": {
           "name": "A friendly name, e.g. \"Office Bath\". A lowercase id is derived for MQTT topics (\"Office Bath\" → office-bath).",
-          "mesh_priority": "0 = this panel never publishes the BLE mesh. Higher wins leader election across the fleet."
+          "mesh_priority": "0 = this panel never publishes the BLE mesh. Among positive values the LOWEST wins leader election (1 = primary, 2/3 = standbys)."
         }
       },
       "reconfigure": {
@@ -55,6 +55,7 @@
       "cannot_connect": "SSH connection failed — check the host and the root password.",
       "cannot_read_config": "The agent is installed but its configuration could not be read. Try Reconfigure, or remove and re-add the panel.",
       "cannot_apply": "Connected, but writing the new settings to the panel failed. Check the agent and try Repair.",
+      "wrong_panel": "That host already runs a different Brilliant panel's agent. Check the IP — applying here would overwrite and restart the wrong panel.",
       "host_key_changed": "The panel's SSH host key changed since it was added. If this is expected (e.g. the panel was reflashed), remove and re-add the panel to re-pin it. Otherwise it may indicate a man-in-the-middle, so do not proceed until you have confirmed the host."
     },
     "abort": {

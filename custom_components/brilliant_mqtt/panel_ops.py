@@ -141,14 +141,20 @@ def render_env(
 
 
 def _env_unquote(raw: str) -> str:
-    r"""Reverse _env_quote: strip surrounding double-quotes, unescape \\ and \"."""
+    r"""Reverse _env_quote: strip surrounding double-quotes, unescape \\ and \".
+
+    _env_quote only ever escapes ``\`` and ``"``, so this unescapes ONLY those two
+    sequences — any other backslash run (e.g. a hand-deployed ``\n`` or ``\$``) is
+    left byte-for-byte intact rather than silently collapsed (``\n`` → ``n``), which
+    would corrupt the value when it is later re-rendered and pushed to the panel.
+    """
     if len(raw) >= 2 and raw[0] == '"' and raw[-1] == '"':
         inner = raw[1:-1]
         out: list[str] = []
         i = 0
         while i < len(inner):
             ch = inner[i]
-            if ch == "\\" and i + 1 < len(inner):
+            if ch == "\\" and i + 1 < len(inner) and inner[i + 1] in ('"', "\\"):
                 out.append(inner[i + 1])
                 i += 2
             else:

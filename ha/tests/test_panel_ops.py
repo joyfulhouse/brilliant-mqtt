@@ -167,6 +167,15 @@ def test_parse_env_skips_blank_and_comment_lines() -> None:
     assert parsed == {"BRILLIANT_PANEL": "office", "MQTT_PORT": "1883"}
 
 
+def test_parse_env_leaves_foreign_escapes_literal() -> None:
+    r"""_env_quote only emits \\ and \"; any other backslash run in a hand-deployed
+    file must round-trip byte-for-byte, not collapse (\n must stay \n, not become n)."""
+    assert panel_ops.parse_env(r'MQTT_PASSWORD="a\nb"') == {"MQTT_PASSWORD": r"a\nb"}
+    assert panel_ops.parse_env(r'X="v\$z"') == {"X": r"v\$z"}
+    # The two sequences we DO unescape still work.
+    assert panel_ops.parse_env(r'Y="a\\b\"c"') == {"Y": r'a\b"c'}
+
+
 async def test_read_env_cats_and_parses_the_live_env_file() -> None:
     env_text = panel_ops.render_env(
         panel="office",

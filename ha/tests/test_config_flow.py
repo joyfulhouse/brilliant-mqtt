@@ -12,8 +12,8 @@ from homeassistant.const import CONF_NAME
 from homeassistant.core import HomeAssistant
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.brilliant_mqtt import panel_ops
-from custom_components.brilliant_mqtt.config_flow import _PanelProbe, _slugify
+from custom_components.brilliant_mqtt import config_flow, panel_ops
+from custom_components.brilliant_mqtt.config_flow import _PanelProbe, _slugify, _WrongPanelError
 from custom_components.brilliant_mqtt.const import (
     CONF_HOST,
     CONF_MESH_PRIORITY,
@@ -29,7 +29,10 @@ from custom_components.brilliant_mqtt.const import (
     OPT_OFFLINE_GRACE_MINUTES,
     OPT_REPAIR_COOLDOWN_MINUTES,
     OPT_TRUST_HOST_KEY_CHANGES,
+    PANEL_ENV_FILE,
 )
+from custom_components.brilliant_mqtt.shell import RunResult
+from tests.fakes import FakeShell
 
 PROBE = "custom_components.brilliant_mqtt.config_flow._probe_panel"
 APPLY = "custom_components.brilliant_mqtt.config_flow._apply_config"
@@ -91,6 +94,18 @@ def _full_entry(hass: HomeAssistant, **over: Any) -> MockConfigEntry:
     entry = MockConfigEntry(domain=DOMAIN, unique_id=data[CONF_PANEL], data=data)
     entry.add_to_hass(hass)
     return entry
+
+
+def _suggested_values(result: Any) -> dict[str, Any]:
+    """The form's per-field suggested values (what add_suggested_values_to_schema set)."""
+    schema = result["data_schema"]
+    assert schema is not None
+    out: dict[str, Any] = {}
+    for marker in schema.schema:
+        desc = getattr(marker, "description", None)
+        if isinstance(desc, dict) and "suggested_value" in desc:
+            out[str(marker)] = desc["suggested_value"]
+    return out
 
 
 # --- slugify ---------------------------------------------------------------
@@ -163,6 +178,17 @@ async def test_step1_rejects_control_char_before_probing(hass: HomeAssistant) ->
     probe.assert_not_called()
 
 
+async def test_step1_rejects_control_char_in_host_not_strips_it(hass: HomeAssistant) -> None:
+    """A control char on the host edge is rejected, not silently stripped to a valid value."""
+    result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": "user"})
+    with patch(PROBE) as probe:
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {**CONNECT_INPUT, CONF_HOST: "10.100.0.10\n"}
+        )
+    assert result["errors"] == {CONF_HOST: "invalid_value"}
+    probe.assert_not_called()
+
+
 async def test_mqtt_step_rejects_control_char(hass: HomeAssistant) -> None:
     result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": "user"})
     with patch(PROBE, return_value=_not_installed()):
@@ -172,6 +198,21 @@ async def test_mqtt_step_rejects_control_char(hass: HomeAssistant) -> None:
     )
     assert result["type"] == "form" and result["step_id"] == "broker"
     assert result["errors"] == {CONF_MQTT_PASSWORD: "invalid_value"}
+
+
+async def test_broker_redisplay_preserves_typed_values(hass: HomeAssistant) -> None:
+    """An error on the broker step re-shows what the operator typed, not the prior prefill."""
+    _full_entry(hass, **{CONF_MQTT_HOST: "172.16.1.205", CONF_MQTT_PASSWORD: "shared"})
+    result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": "user"})
+    with patch(PROBE, return_value=_not_installed()):
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], CONNECT_INPUT)
+    typed = {**MQTT_INPUT, CONF_MQTT_HOST: "10.9.9.9", CONF_MQTT_PASSWORD: "bad\npass"}
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], typed)
+    assert result["step_id"] == "broker"
+    assert result["errors"] == {CONF_MQTT_PASSWORD: "invalid_value"}
+    suggested = _suggested_values(result)
+    assert suggested[CONF_MQTT_HOST] == "10.9.9.9"  # typed value, not the prior "172.16.1.205"
+    assert suggested[CONF_MQTT_USERNAME] == "brilliant"
 
 
 async def test_mqtt_step_prefills_from_prior_panel(hass: HomeAssistant) -> None:
@@ -258,9 +299,16 @@ async def test_installed_unreadable_config_shows_error(hass: HomeAssistant) -> N
     assert result["errors"] == {"base": "cannot_read_config"}
 
 
-@pytest.mark.parametrize("bad_panel", ["mesh", "Office Bath", "office/bath", ""])
+@pytest.mark.parametrize(
+    "bad_panel",
+    ["mesh", "Office Bath", "office/bath", "", "-office", "office-", "_", "--"],
+)
 async def test_installed_rejects_unsafe_adopted_slug(hass: HomeAssistant, bad_panel: str) -> None:
-    """A hand-deployed BRILLIANT_PANEL that is reserved/empty/non-slug must not be adopted."""
+    """A hand-deployed BRILLIANT_PANEL that isn't the canonical slug form must not adopt.
+
+    Includes the non-canonical cases _slugify can never produce (leading/trailing or
+    doubled separators) so the adopt gate stays in lockstep with the typed-name path.
+    """
     result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": "user"})
     with patch(PROBE, return_value=_installed(_env(panel=bad_panel))):
         result = await hass.config_entries.flow.async_configure(result["flow_id"], CONNECT_INPUT)
@@ -272,6 +320,103 @@ async def test_installed_rejects_out_of_range_port(hass: HomeAssistant) -> None:
     with patch(PROBE, return_value=_installed(_env(panel="office", mqtt_port=0))):
         result = await hass.config_entries.flow.async_configure(result["flow_id"], CONNECT_INPUT)
     assert result["type"] == "form" and result["errors"] == {"base": "cannot_read_config"}
+
+
+async def test_installed_adopts_with_default_port_and_mesh(hass: HomeAssistant) -> None:
+    """MQTT_PORT/MESH_PRIORITY are optional in the agent env; a hand-deployed file that
+    omits them must still adopt, defaulting to the agent's own 1883 / 0."""
+    minimal = panel_ops.parse_env(
+        'BRILLIANT_PANEL="office"\nMQTT_HOST="h"\nMQTT_USERNAME="u"\nMQTT_PASSWORD="p"\n'
+    )
+    result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": "user"})
+    with patch(PROBE, return_value=_installed(minimal)):
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], CONNECT_INPUT)
+    assert result["type"] == "create_entry"
+    assert result["data"][CONF_MQTT_PORT] == 1883
+    assert result["data"][CONF_MESH_PRIORITY] == 0
+
+
+def _inspect(unit: bool, env: bool, version: str = "9.9.9") -> RunResult:
+    flags = f"unit={int(unit)}\nenv={int(env)}\nenabled=0\nactive=0\nsunit=0\nsenv=0\n"
+    return RunResult(0, flags + (f"{version}\n" if version else ""), "")
+
+
+async def test_probe_panel_adopts_only_when_unit_and_env_present(hass: HomeAssistant) -> None:
+    """A lone env file with no systemd unit is NOT mistaken for a running agent."""
+    env_text = panel_ops.render_env(
+        panel="office",
+        mesh_priority=0,
+        mqtt_host="h",
+        mqtt_port=1883,
+        mqtt_username="u",
+        mqtt_password="p",
+    )
+    cat_resp = {f"cat {PANEL_ENV_FILE}": RunResult(0, env_text, "")}
+
+    # env present but unit absent → not adopted (config is None → fresh setup path).
+    shell = FakeShell(responses={panel_ops.INSPECT_COMMAND: _inspect(False, True), **cat_resp})
+    with patch.object(config_flow, "AsyncsshShell", return_value=shell):
+        probe = await config_flow._probe_panel(hass, "10.0.0.10", "pw")
+    assert probe.config is None
+
+    # unit AND env present → adopted (config parsed from the live env).
+    shell = FakeShell(responses={panel_ops.INSPECT_COMMAND: _inspect(True, True), **cat_resp})
+    with patch.object(config_flow, "AsyncsshShell", return_value=shell):
+        probe = await config_flow._probe_panel(hass, "10.0.0.10", "pw")
+    assert probe.config is not None and probe.config[panel_ops.ENV_PANEL] == "office"
+
+
+async def test_apply_config_refuses_to_clobber_a_different_panel(hass: HomeAssistant) -> None:
+    """Pushing to a host that already runs ANOTHER panel's agent must raise, not write."""
+    other = panel_ops.render_env(
+        panel="garage",
+        mesh_priority=0,
+        mqtt_host="h",
+        mqtt_port=1883,
+        mqtt_username="u",
+        mqtt_password="p",
+    )
+    shell = FakeShell(
+        responses={
+            panel_ops.INSPECT_COMMAND: _inspect(True, True),
+            f"cat {PANEL_ENV_FILE}": RunResult(0, other, ""),
+        }
+    )
+    with patch.object(config_flow, "AsyncsshShell", return_value=shell):
+        with pytest.raises(_WrongPanelError):
+            await config_flow._apply_config(
+                hass, "10.0.0.20", "pw", pinned_key=None, env_content="X", expected_panel="office"
+            )
+    assert shell.uploads == []  # nothing written to the wrong panel
+
+
+async def test_apply_config_pushes_when_panel_matches(hass: HomeAssistant) -> None:
+    same = panel_ops.render_env(
+        panel="office",
+        mesh_priority=0,
+        mqtt_host="h",
+        mqtt_port=1883,
+        mqtt_username="u",
+        mqtt_password="p",
+    )
+    shell = FakeShell(
+        responses={
+            panel_ops.INSPECT_COMMAND: _inspect(True, True),
+            f"cat {PANEL_ENV_FILE}": RunResult(0, same, ""),
+        }
+    )
+    with patch.object(config_flow, "AsyncsshShell", return_value=shell):
+        key = await config_flow._apply_config(
+            hass,
+            "10.0.0.10",
+            "pw",
+            pinned_key="ssh-ed25519 FAKEKEY",
+            env_content="NEWENV",
+            expected_panel="office",
+        )
+    assert key == "ssh-ed25519 FAKEKEY"
+    assert any(data == b"NEWENV" for (_path, data, _mode) in shell.uploads)
+    assert "systemctl restart brilliant-mqtt" in shell.commands
 
 
 # --- reconfigure -----------------------------------------------------------
@@ -288,6 +433,8 @@ async def test_reconfigure_same_host_applies_and_pushes(hass: HomeAssistant) -> 
     assert result["type"] == "abort" and result["reason"] == "reconfigure_successful"
     # Same host → STORED pin used (verify-before-auth), never None.
     assert apply.call_args.kwargs["pinned_key"] == "ssh-ed25519 STORED"
+    # The immutable slug is handed to the push as the clobber-guard identity.
+    assert apply.call_args.kwargs["expected_panel"] == "office"
     # The pushed env carries the NEW broker/mesh but the immutable slug.
     env = apply.call_args.kwargs["env_content"]
     assert 'BRILLIANT_PANEL="office"' in env
@@ -356,6 +503,45 @@ async def test_reconfigure_push_failure_shows_cannot_apply(hass: HomeAssistant) 
         result = await hass.config_entries.flow.async_configure(result["flow_id"], RECONFIG_INPUT)
     assert result["type"] == "form" and result["errors"] == {"base": "cannot_apply"}
     assert entry.data[CONF_MESH_PRIORITY] == 0  # nothing written
+
+
+async def test_reconfigure_wrong_panel_surfaces_error(hass: HomeAssistant) -> None:
+    """A host running a different panel's agent surfaces wrong_panel; entry untouched."""
+    entry = _full_entry(hass)
+    result = await entry.start_reconfigure_flow(hass)
+    with patch(APPLY, side_effect=_WrongPanelError("garage")):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {**RECONFIG_INPUT, CONF_HOST: "10.100.0.99"}
+        )
+    assert result["type"] == "form" and result["errors"] == {"base": "wrong_panel"}
+    assert entry.data[CONF_HOST] == "10.100.0.10"  # nothing written
+    assert entry.data[CONF_MQTT_PASSWORD] == "oldbroker"
+
+
+async def test_reconfigure_redisplay_preserves_edits(hass: HomeAssistant) -> None:
+    """A transient failure must not wipe the operator's six edited fields to old config."""
+    entry = _full_entry(hass)
+    result = await entry.start_reconfigure_flow(hass)
+    with patch(APPLY, side_effect=OSError("down")):
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], RECONFIG_INPUT)
+    assert result["type"] == "form" and result["errors"] == {"base": "cannot_connect"}
+    suggested = _suggested_values(result)
+    assert suggested[CONF_MQTT_PASSWORD] == "newbroker"  # the edit, not the old "oldbroker"
+    assert suggested[CONF_MESH_PRIORITY] == 5
+
+
+async def test_reconfigure_strips_host_whitespace_and_keeps_pin(hass: HomeAssistant) -> None:
+    """A trailing space on an unchanged host must not downgrade the same-host pin to TOFU."""
+    entry = _full_entry(hass)
+    result = await entry.start_reconfigure_flow(hass)
+    with patch(APPLY, return_value="ssh-ed25519 STORED") as apply:
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {**RECONFIG_INPUT, CONF_HOST: "  10.100.0.10  "}
+        )
+    assert result["type"] == "abort" and result["reason"] == "reconfigure_successful"
+    # Stripped → recognized as the SAME host → STORED pin used, not a fresh TOFU.
+    assert apply.call_args.kwargs["pinned_key"] == "ssh-ed25519 STORED"
+    assert entry.data[CONF_HOST] == "10.100.0.10"  # stored clean
 
 
 # --- options ---------------------------------------------------------------
