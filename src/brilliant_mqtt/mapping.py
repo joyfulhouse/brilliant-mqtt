@@ -211,6 +211,60 @@ AUX_SPECS: dict[DeviceKind, tuple[AuxSpec, ...]] = {
             entity_category="diagnostic",
             enabled_by_default=False,
         ),
+        # Faceplate motion-detection subsystem (live-probed; all externally
+        # settable). DISABLED-by-default — advanced tuning. movement_detected is
+        # driven by whichever detection mode(s) are enabled here; the PIR
+        # thresholds only take effect when enable_pir_motion_score is on, and
+        # screen-based detection (enable_screen_motion_detection) can register
+        # screen/ambient changes as motion independently of the PIR.
+        AuxSpec(
+            var="enable_screen_motion_detection",
+            component="switch",
+            name="Screen Motion Detection",
+            value_kind="bool",
+            entity_category="config",
+            enabled_by_default=False,
+        ),
+        AuxSpec(
+            var="enable_pir_motion_score",
+            component="switch",
+            name="PIR Score Reporting",
+            value_kind="bool",
+            entity_category="config",
+            enabled_by_default=False,
+        ),
+        AuxSpec(
+            var="enable_light_motion_detection",
+            component="switch",
+            name="Light Motion Detection",
+            value_kind="bool",
+            entity_category="config",
+            enabled_by_default=False,
+        ),
+        # 0–100 range ASSUMED (same as the mesh thresholds — no firmware bound
+        # documented; live-observed 25 high / 14 low on the faceplate).
+        AuxSpec(
+            var="pir_motion_detection_high_threshold",
+            component="number",
+            name="PIR Motion High Threshold",
+            value_kind="int",
+            entity_category="config",
+            min_value=0,
+            max_value=100,
+            step=1,
+            enabled_by_default=False,
+        ),
+        AuxSpec(
+            var="pir_motion_detection_low_threshold",
+            component="number",
+            name="PIR Motion Low Threshold",
+            value_kind="int",
+            entity_category="config",
+            min_value=0,
+            max_value=100,
+            step=1,
+            enabled_by_default=False,
+        ),
         AuxSpec(
             var="hottest_internal_temperature",
             component="sensor",
