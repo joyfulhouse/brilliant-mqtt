@@ -27,4 +27,7 @@ jobs:
       - uses: hacs/action@main
         with:
           category: integration
+          # Brand assets are bundled in custom_components/brilliant_mqtt/brand/
+          # (HA 2026.3+ brands proxy API). hacs/action still checks the brands CDN,
+          # which custom-integration bundled brands aren't on — so keep skipping it.
           ignore: brands
