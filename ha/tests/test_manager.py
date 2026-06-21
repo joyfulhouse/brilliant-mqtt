@@ -79,6 +79,9 @@ async def test_offline_grace_triggers_auto_repair_then_recovery(
     # Repair ran: inspect → configs to /etc + staged → daemon-reload → enable --now.
     assert any(c.startswith("test -f /etc/systemd") for c in fake_shell.commands)
     assert "systemctl enable --now brilliant-mqtt" in fake_shell.commands
+    # The panel's agent code is present (fake_shell inspect → payload=1), so a repair
+    # rewrites config + enables WITHOUT re-uploading the payload tree.
+    assert not fake_shell.dir_uploads
     etc_uploads = [p for (p, _d, _m) in fake_shell.uploads]
     assert "/etc/systemd/system/brilliant-mqtt.service" in etc_uploads
     assert "/etc/brilliant-mqtt.env" in etc_uploads
@@ -90,6 +93,37 @@ async def test_offline_grace_triggers_auto_repair_then_recovery(
     await hass.async_block_till_done()
     assert _types(events) == ["repair_started", "repair_succeeded"]
     assert entry.runtime_data.problem is False
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_repair_deploys_payload_when_code_absent(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    payload_dir: Path,
+) -> None:
+    """Repair on a code-less panel (no app/+vendor/) uploads the payload BEFORE
+    enabling the unit — so the Repair button bootstraps a never-installed panel
+    instead of enabling a unit whose ExecStart points at code that isn't there."""
+    from custom_components.brilliant_mqtt import panel_ops
+    from custom_components.brilliant_mqtt.shell import RunResult
+
+    code_absent = RunResult(
+        0, "unit=0\nenv=0\nenabled=0\nactive=0\nsunit=0\nsenv=0\npayload=0\n", ""
+    )
+    shell = FakeShell(responses={panel_ops.INSPECT_COMMAND: code_absent})
+    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+        entry = await _setup(hass)
+        await entry.runtime_data.async_repair(trigger="button")
+        await hass.async_block_till_done()
+
+    assert shell.dir_uploads  # deploy_payload uploaded app/+vendor/
+    assert ("/var/brilliant-mqtt/VERSION", b"0.2.0", 0o644) in shell.uploads
+    # The code is laid down (staging cleared first) before the unit is enabled.
+    assert shell.commands.index("rm -rf /var/brilliant-mqtt.staging") < shell.commands.index(
+        "systemctl enable --now brilliant-mqtt"
+    )
 
     assert await hass.config_entries.async_unload(entry.entry_id)
 
