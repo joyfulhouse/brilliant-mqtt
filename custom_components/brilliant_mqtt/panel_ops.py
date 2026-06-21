@@ -66,8 +66,8 @@ INSPECT_COMMAND = (
     f"systemctl is-active {SERVICE_NAME} >/dev/null 2>&1 && echo active=1 || echo active=0; "
     f"test -f {_STAGED_UNIT} && echo sunit=1 || echo sunit=0; "
     f"test -f {_STAGED_ENV} && echo senv=1 || echo senv=0; "
-    f"test -d {PANEL_VAR_DIR}/app && test -d {PANEL_VAR_DIR}/vendor "
-    f"&& echo payload=1 || echo payload=0; "
+    f"test -f {PANEL_VAR_DIR}/app/brilliant_mqtt/__main__.py "
+    f"&& test -d {PANEL_VAR_DIR}/vendor && echo payload=1 || echo payload=0; "
     f"cat {PANEL_VERSION_FILE} 2>/dev/null || true"
 )
 
@@ -82,7 +82,7 @@ class PanelState:
     active: bool
     staged_unit_present: bool
     staged_env_present: bool
-    payload_present: bool  # app/ + vendor/ both on the box (the runnable agent code)
+    payload_present: bool  # agent entrypoint (app/<pkg>/__main__.py) + vendor/ present
     payload_version: str | None  # None on pre-integration installs (no VERSION file)
 
 

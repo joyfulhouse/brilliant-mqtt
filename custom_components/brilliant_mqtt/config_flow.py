@@ -253,6 +253,10 @@ async def _install_agent(
     (ensure_configs), and enables + starts the service (enable_now) — so adding the
     integration actually sets the panel up instead of waiting for a separate repair.
     The host key was pinned by the step-1 probe, so this connect verifies before auth.
+
+    Like the manager's deploy paths, this holds the fleet-wide SSH lock for the whole
+    session (the payload upload included). The upload is small (a few hundred KB) and
+    the lock is released when _panel_session exits, including on flow cancellation.
     """
     async with _panel_session(hass, host, password, pinned_key) as shell:
         await panel_ops.deploy_payload(shell, payload_dir, version)
@@ -371,14 +375,16 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
                     mqtt_username=self._mqtt[CONF_MQTT_USERNAME],
                     mqtt_password=self._mqtt[CONF_MQTT_PASSWORD],
                 )
-                payload_dir = manager._payload_dir()
-                unit = await self.hass.async_add_executor_job(
-                    (payload_dir / "brilliant-mqtt.service").read_text
-                )
-                version = (
-                    await self.hass.async_add_executor_job((payload_dir / "VERSION").read_text)
-                ).strip()
                 try:
+                    # Read the bundled payload (unit/VERSION) inside the try so a missing
+                    # or corrupt bundle surfaces as cannot_install, not an unhandled crash.
+                    payload_dir = manager._payload_dir()
+                    unit = await self.hass.async_add_executor_job(
+                        (payload_dir / "brilliant-mqtt.service").read_text
+                    )
+                    version = (
+                        await self.hass.async_add_executor_job((payload_dir / "VERSION").read_text)
+                    ).strip()
                     await _install_agent(
                         self.hass,
                         self._connect[CONF_HOST],

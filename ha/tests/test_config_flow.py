@@ -185,6 +185,27 @@ async def test_not_installed_install_failure_shows_error(
     assert not hass.config_entries.async_entries(DOMAIN)  # nothing was created
 
 
+async def test_not_installed_install_aborts_on_unreadable_bundle(
+    hass: HomeAssistant, tmp_path: Path
+) -> None:
+    """A missing/corrupt bundled payload (VERSION/unit unreadable) surfaces as
+    cannot_install rather than crashing the flow — the reads are inside the try."""
+    result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": "user"})
+    with patch(PROBE, return_value=_not_installed()):
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], CONNECT_INPUT)
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], MQTT_INPUT)
+
+    empty = tmp_path / "empty"  # no brilliant-mqtt.service / VERSION → read_text raises
+    empty.mkdir()
+    with (
+        patch("custom_components.brilliant_mqtt.manager._payload_dir", return_value=empty),
+        patch.object(config_flow, "AsyncsshShell", return_value=FakeShell()),
+    ):
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], SCRIPT_INPUT)
+    assert result["type"] == "form" and result["errors"] == {"base": "cannot_install"}
+    assert not hass.config_entries.async_entries(DOMAIN)
+
+
 async def test_step1_only_requires_host_and_password(hass: HomeAssistant) -> None:
     """The first form asks for exactly host + root password — nothing else."""
     result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": "user"})
