@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-06-21
+
 ### Changed
 
 - **Smarter panel onboarding (HA integration)**: the config flow is now
@@ -22,6 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   running a **different** panel's agent (guards a mistyped IP from clobbering
   another controller). The repair path is unchanged — it still always regenerates
   the env from entry data and never reads it back.
+
+## [0.2.0] - 2026-06-21
 
 ### Added
 
@@ -97,4 +101,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - JoyfulHouse OSS docs standard: LICENSE (MIT), INSTALL.md, CHANGELOG.md,
   FUNDING.yml, CODEOWNERS, and the canonical `docs/` set.
 
-[Unreleased]: https://github.com/joyfulhouse/brilliant-mqtt/commits/main
+[Unreleased]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/joyfulhouse/brilliant-mqtt/releases/tag/v0.2.0
