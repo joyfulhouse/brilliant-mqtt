@@ -409,7 +409,7 @@ def _wifi() -> BrilliantDevice:
 
 
 def _faceplate_full() -> BrilliantDevice:
-    """MOTION_SENSOR faceplate with motion+lux AND the four aux variables."""
+    """MOTION_SENSOR faceplate with motion+lux AND all aux variables (live-probed)."""
     return BrilliantDevice(
         device_id="dev-fp",
         peripheral_id="faceplate_peripheral",
@@ -422,6 +422,15 @@ def _faceplate_full() -> BrilliantDevice:
             "led_on": Variable("led_on", "0"),
             "enable_lux": Variable("enable_lux", "0"),
             "pir_motion_score": Variable("pir_motion_score", "0"),
+            "enable_pir_motion_score": Variable("enable_pir_motion_score", "0"),
+            "enable_screen_motion_detection": Variable("enable_screen_motion_detection", "1"),
+            "enable_light_motion_detection": Variable("enable_light_motion_detection", "0"),
+            "pir_motion_detection_high_threshold": Variable(
+                "pir_motion_detection_high_threshold", "25"
+            ),
+            "pir_motion_detection_low_threshold": Variable(
+                "pir_motion_detection_low_threshold", "14"
+            ),
             "hottest_internal_temperature": Variable("hottest_internal_temperature", "42.70"),
         },
     )
@@ -612,15 +621,20 @@ def test_wifi_association_connectivity() -> None:
 # --- Faceplate with aux -----------------------------------------------------
 
 
-def test_faceplate_full_yields_motion_lux_plus_four_aux() -> None:
+def test_faceplate_full_yields_motion_lux_plus_nine_aux() -> None:
     result = entities_for(_faceplate_full(), "office")
-    assert len(result) == 6
+    assert len(result) == 11
     uids = {d.unique_id for d in result}
     assert "brilliant_office_faceplate_peripheral" in uids  # motion (unchanged id)
     assert "brilliant_office_faceplate_peripheral_lux" in uids  # lux (unchanged id)
     assert "brilliant_office_faceplate_peripheral_led_on" in uids
     assert "brilliant_office_faceplate_peripheral_enable_lux" in uids
     assert "brilliant_office_faceplate_peripheral_pir_motion_score" in uids
+    assert "brilliant_office_faceplate_peripheral_enable_pir_motion_score" in uids
+    assert "brilliant_office_faceplate_peripheral_enable_screen_motion_detection" in uids
+    assert "brilliant_office_faceplate_peripheral_enable_light_motion_detection" in uids
+    assert "brilliant_office_faceplate_peripheral_pir_motion_detection_high_threshold" in uids
+    assert "brilliant_office_faceplate_peripheral_pir_motion_detection_low_threshold" in uids
     assert "brilliant_office_faceplate_peripheral_hottest_internal_temperature" in uids
 
 
@@ -645,6 +659,61 @@ def test_faceplate_pir_score_disabled_by_default() -> None:
     pir = by_uid["brilliant_office_faceplate_peripheral_pir_motion_score"]
     assert pir.enabled_by_default is False
     assert pir.value_kind == "int"
+
+
+# --- Faceplate motion-detection tuning controls (disabled-by-default) --------
+
+
+def test_faceplate_screen_motion_detection_switch() -> None:
+    by_uid = _by_uid(entities_for(_faceplate_full(), "office"))
+    d = by_uid["brilliant_office_faceplate_peripheral_enable_screen_motion_detection"]
+    assert d.component == "switch"
+    assert d.command_var == "enable_screen_motion_detection"
+    assert d.entity_category == "config"
+    assert d.enabled_by_default is False
+    assert d.name == "Screen Motion Detection"
+
+
+def test_faceplate_pir_score_reporting_switch() -> None:
+    by_uid = _by_uid(entities_for(_faceplate_full(), "office"))
+    d = by_uid["brilliant_office_faceplate_peripheral_enable_pir_motion_score"]
+    assert d.component == "switch"
+    assert d.command_var == "enable_pir_motion_score"
+    assert d.entity_category == "config"
+    assert d.enabled_by_default is False
+
+
+def test_faceplate_light_motion_detection_switch() -> None:
+    by_uid = _by_uid(entities_for(_faceplate_full(), "office"))
+    d = by_uid["brilliant_office_faceplate_peripheral_enable_light_motion_detection"]
+    assert d.component == "switch"
+    assert d.command_var == "enable_light_motion_detection"
+    assert d.enabled_by_default is False
+
+
+def test_faceplate_pir_high_threshold_number() -> None:
+    by_uid = _by_uid(entities_for(_faceplate_full(), "office"))
+    d = by_uid["brilliant_office_faceplate_peripheral_pir_motion_detection_high_threshold"]
+    assert d.component == "number"
+    assert d.command_var == "pir_motion_detection_high_threshold"
+    assert d.value_kind == "int"
+    assert d.min_value == 0
+    assert d.max_value == 100
+    assert d.step == 1
+    assert d.entity_category == "config"
+    assert d.enabled_by_default is False
+    assert d.name == "PIR Motion High Threshold"
+
+
+def test_faceplate_pir_low_threshold_number() -> None:
+    by_uid = _by_uid(entities_for(_faceplate_full(), "office"))
+    d = by_uid["brilliant_office_faceplate_peripheral_pir_motion_detection_low_threshold"]
+    assert d.component == "number"
+    assert d.command_var == "pir_motion_detection_low_threshold"
+    assert d.min_value == 0
+    assert d.max_value == 100
+    assert d.step == 1
+    assert d.enabled_by_default is False
 
 
 # --- payload_fields ---------------------------------------------------------
@@ -715,6 +784,11 @@ def test_payload_fields_faceplate_includes_motion_lux_and_aux() -> None:
         "led_on": False,
         "enable_lux": False,
         "pir_motion_score": 0,
+        "enable_pir_motion_score": False,
+        "enable_screen_motion_detection": True,
+        "enable_light_motion_detection": False,
+        "pir_motion_detection_high_threshold": 25,
+        "pir_motion_detection_low_threshold": 14,
         "hottest_internal_temperature": 42.7,
     }
 
