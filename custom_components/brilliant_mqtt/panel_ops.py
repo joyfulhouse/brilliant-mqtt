@@ -105,6 +105,17 @@ async def inspect_panel(shell: PanelShell) -> PanelState:
     )
 
 
+# The on-panel agent's env-var contract (agent_payload/.../config.py Settings.from_env).
+# render_env writes these; parse_env/read_env recover them when adopting an
+# already-installed panel during onboarding.
+ENV_PANEL = "BRILLIANT_PANEL"
+ENV_MQTT_HOST = "MQTT_HOST"
+ENV_MQTT_PORT = "MQTT_PORT"
+ENV_MQTT_USERNAME = "MQTT_USERNAME"
+ENV_MQTT_PASSWORD = "MQTT_PASSWORD"
+ENV_MESH_PRIORITY = "MESH_PRIORITY"
+
+
 def render_env(
     panel: str,
     mesh_priority: int,
@@ -119,14 +130,67 @@ def render_env(
     contain `#`, quotes, `$`, backslash); the int fields are safe and stay bare.
     """
     return (
-        f"BRILLIANT_PANEL={_env_quote(panel)}\n"
-        f"MQTT_HOST={_env_quote(mqtt_host)}\n"
-        f"MQTT_PORT={mqtt_port}\n"
-        f"MQTT_USERNAME={_env_quote(mqtt_username)}\n"
-        f"MQTT_PASSWORD={_env_quote(mqtt_password)}\n"
-        f"MESH_PRIORITY={mesh_priority}\n"
+        f"{ENV_PANEL}={_env_quote(panel)}\n"
+        f"{ENV_MQTT_HOST}={_env_quote(mqtt_host)}\n"
+        f"{ENV_MQTT_PORT}={mqtt_port}\n"
+        f"{ENV_MQTT_USERNAME}={_env_quote(mqtt_username)}\n"
+        f"{ENV_MQTT_PASSWORD}={_env_quote(mqtt_password)}\n"
+        f"{ENV_MESH_PRIORITY}={mesh_priority}\n"
         f"LOG_LEVEL=INFO\n"
     )
+
+
+def _env_unquote(raw: str) -> str:
+    r"""Reverse _env_quote: strip surrounding double-quotes, unescape \\ and \"."""
+    if len(raw) >= 2 and raw[0] == '"' and raw[-1] == '"':
+        inner = raw[1:-1]
+        out: list[str] = []
+        i = 0
+        while i < len(inner):
+            ch = inner[i]
+            if ch == "\\" and i + 1 < len(inner):
+                out.append(inner[i + 1])
+                i += 2
+            else:
+                out.append(ch)
+                i += 1
+        return "".join(out)
+    return raw
+
+
+def parse_env(text: str) -> dict[str, str]:
+    """Parse a rendered env file back into ``{KEY: value}`` — reverse of render_env.
+
+    Quoted strings are unquoted; bare ints keep their string form; blank/comment
+    lines are skipped. Used ONLY by the config flow's adopt-installed path — repair
+    still always regenerates the env from entry data, never reads it back.
+    """
+    parsed: dict[str, str] = {}
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, _, raw = stripped.partition("=")
+        parsed[key.strip()] = _env_unquote(raw.strip())
+    return parsed
+
+
+async def read_env(shell: PanelShell) -> dict[str, str]:
+    """Read + parse the panel's live env file (adopt-installed onboarding path)."""
+    result = await shell.run(f"cat {PANEL_ENV_FILE}")
+    return parse_env(result.stdout)
+
+
+async def write_env(shell: PanelShell, env_content: str) -> None:
+    """(Re)write ONLY the env file to /etc + the /var staged copy (0600); no unit.
+
+    Reconfigure changes broker/mesh values on an already-installed panel where the
+    unit is unchanged, so this rewrites just the env in both locations; the caller
+    restarts the agent to pick it up.
+    """
+    await _checked(shell, f"mkdir -p {PANEL_STAGED_DIR}")
+    await shell.put_bytes(env_content.encode(), PANEL_ENV_FILE, 0o600)
+    await shell.put_bytes(env_content.encode(), _STAGED_ENV, 0o600)
 
 
 async def ensure_configs(shell: PanelShell, unit_content: str, env_content: str) -> None:

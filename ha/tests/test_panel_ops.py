@@ -142,6 +142,86 @@ def test_render_env_password_round_trips_through_systemd_quoting(password: str) 
     assert _systemd_unquote(value) == password
 
 
+def test_parse_env_round_trips_render_env() -> None:
+    """parse_env recovers every value render_env wrote (the adopt-installed path)."""
+    env = panel_ops.render_env(
+        panel="office-bath",
+        mesh_priority=7,
+        mqtt_host="172.16.1.205",
+        mqtt_port=8883,
+        mqtt_username="brilliant",
+        mqtt_password='p#a"s\\s',  # the hostile chars _env_quote escapes
+    )
+    assert panel_ops.parse_env(env) == {
+        "BRILLIANT_PANEL": "office-bath",
+        "MQTT_HOST": "172.16.1.205",
+        "MQTT_PORT": "8883",
+        "MQTT_USERNAME": "brilliant",
+        "MQTT_PASSWORD": 'p#a"s\\s',
+        "MESH_PRIORITY": "7",
+        "LOG_LEVEL": "INFO",
+    }
+
+
+@pytest.mark.parametrize(
+    "password",
+    ["trailing\\", 'has"quote', "#comment-like", "space sep arated", "dollar$VAR-ish"],
+)
+def test_parse_env_recovers_quoted_password(password: str) -> None:
+    env = panel_ops.render_env(
+        panel="office",
+        mesh_priority=0,
+        mqtt_host="h",
+        mqtt_port=1883,
+        mqtt_username="u",
+        mqtt_password=password,
+    )
+    assert panel_ops.parse_env(env)["MQTT_PASSWORD"] == password
+
+
+def test_parse_env_skips_blank_and_comment_lines() -> None:
+    parsed = panel_ops.parse_env('# a comment\n\nBRILLIANT_PANEL="office"\n   \nMQTT_PORT=1883\n')
+    assert parsed == {"BRILLIANT_PANEL": "office", "MQTT_PORT": "1883"}
+
+
+async def test_read_env_cats_and_parses_the_live_env_file() -> None:
+    env_text = panel_ops.render_env(
+        panel="office",
+        mesh_priority=2,
+        mqtt_host="h",
+        mqtt_port=1883,
+        mqtt_username="u",
+        mqtt_password="pw",
+    )
+    shell = await _connected(
+        FakeShell(responses={f"cat {PANEL_ENV_FILE}": RunResult(0, env_text, "")})
+    )
+    parsed = await panel_ops.read_env(shell)
+    assert parsed["BRILLIANT_PANEL"] == "office"
+    assert parsed["MESH_PRIORITY"] == "2"
+    assert shell.commands == [f"cat {PANEL_ENV_FILE}"]
+
+
+async def test_write_env_writes_only_env_to_etc_and_staged() -> None:
+    shell = await _connected(FakeShell())
+    await panel_ops.write_env(shell, "ENVDATA")
+    # Only the env file (no unit), both locations, 0600.
+    assert [(path, mode) for (path, _data, mode) in shell.uploads] == [
+        ("/etc/brilliant-mqtt.env", 0o600),
+        ("/var/brilliant-mqtt/system/brilliant-mqtt.env", 0o600),
+    ]
+    assert shell.commands[0] == "mkdir -p /var/brilliant-mqtt/system"
+
+
+async def test_write_env_raises_when_mkdir_fails() -> None:
+    shell = await _connected(
+        FakeShell(responses={"mkdir -p /var/brilliant-mqtt/system": RunResult(1, "", "denied\n")})
+    )
+    with pytest.raises(panel_ops.PanelOpError, match="exited 1"):
+        await panel_ops.write_env(shell, "ENVDATA")
+    assert shell.uploads == []
+
+
 async def test_ensure_configs_writes_etc_and_staged_copies_then_reloads() -> None:
     shell = await _connected(FakeShell())
     await panel_ops.ensure_configs(shell, unit_content="UNIT", env_content="ENV")
