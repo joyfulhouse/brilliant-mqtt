@@ -18,11 +18,22 @@ jobs:
           TAG="${GITHUB_REF_NAME#v}"
           MANIFEST="$(python -c 'import json; print(json.load(open("custom_components/brilliant_mqtt/manifest.json"))["version"])')"
           test "$TAG" = "$MANIFEST" || { echo "tag $TAG != manifest $MANIFEST"; exit 1; }
+      - name: Guard — the integration's VOICE_PAYLOAD_VERSION must match brilliant_voice
+        run: |
+          # The integration builds the voice asset's download URL from this const, so it
+          # MUST equal the version baked into the uploaded tarball, or panels 404 on it.
+          CONST="$(grep -oP 'VOICE_PAYLOAD_VERSION = "\K[^"]+' custom_components/brilliant_mqtt/const.py)"
+          VOICE="$(uv run python -c 'import brilliant_voice; print(brilliant_voice.__version__)')"
+          test "$CONST" = "$VOICE" || { echo "VOICE_PAYLOAD_VERSION $CONST != brilliant_voice $VOICE"; exit 1; }
       - name: Build the bundled agent payload
         run: ./scripts/build_payload.sh
       - name: Build zip (manifest.json at the zip root, as HACS extracts it)
-        run: cd custom_components/brilliant_mqtt && zip -r ../../brilliant_mqtt.zip . -x "*/__pycache__/*" -x "__pycache__/*"
-      - name: Upload the zip to the release
+        run: cd custom_components/brilliant_mqtt && zip -r ../../brilliant_mqtt.zip . -x "*/__pycache__/*" -x "__pycache__/*" -x "voice_payload/*"
+      - name: Build the voice payload (separate ~57 MB release asset; never in the HACS zip)
+        run: ./scripts/build_voice_payload.sh
+      - name: Upload the HACS zip + the voice payload to the release
         uses: softprops/action-gh-release@v2
         with:
-          files: brilliant_mqtt.zip
+          files: |
+            brilliant_mqtt.zip
+            custom_components/brilliant_mqtt/voice_payload/brilliant-voice-payload-*.tar.gz
