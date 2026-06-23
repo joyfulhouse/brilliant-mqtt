@@ -42,6 +42,7 @@ class PanelShell(Protocol):
     async def run(self, command: str) -> RunResult: ...
     async def put_bytes(self, data: bytes, remote_path: str, mode: int) -> None: ...
     async def put_dir(self, local_dir: str, remote_dir: str) -> None: ...
+    async def put_file(self, local_path: str, remote_path: str, mode: int) -> None: ...
     def pinned_host_key(self) -> str | None: ...
 
 
@@ -133,3 +134,9 @@ class AsyncsshShell:
         conn = self._require_conn()
         async with await conn.start_sftp_client() as sftp:
             await sftp.put(local_dir, remote_dir, recurse=True)
+
+    async def put_file(self, local_path: str, remote_path: str, mode: int) -> None:
+        conn = self._require_conn()
+        async with await conn.start_sftp_client() as sftp:
+            await sftp.put(local_path, remote_path)
+            await sftp.chmod(remote_path, mode)
