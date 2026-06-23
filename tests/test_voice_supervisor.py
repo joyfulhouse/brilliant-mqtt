@@ -5,7 +5,7 @@ All tests run off-panel — no real subprocesses, no real clocks.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+import dataclasses
 from dataclasses import dataclass, field
 
 import pytest
@@ -30,24 +30,34 @@ from brilliant_voice.supervisor import (
 # ---------------------------------------------------------------------------
 
 
-def _settings(*, enable_aec: bool = False, **overrides: object) -> VoiceSettings:
-    """Return a VoiceSettings with sensible defaults for tests."""
-    kwargs: dict[str, object] = dict(
+def _settings(
+    *,
+    enable_aec: bool = False,
+    name: str = "Brilliant office",
+    mic_device: str = "default",
+    snd_device: str = "plug:dmix_48000",
+    wake_word: str = "okay_nabu",
+    aec_mic_device: str = "plug:dsnoop_48000",
+    aec_delay_ms: int = 0,
+    aec_type: int = 1,
+) -> VoiceSettings:
+    """Return a VoiceSettings with test defaults, overriding only the fields the
+    supervisor reads. Every parameter is explicitly typed so construction is
+    well-typed (no ``# type: ignore``)."""
+    return VoiceSettings(
         panel="office",
-        name="Brilliant office",
+        name=name,
         api_port=6053,
-        wake_word="okay_nabu",
-        mic_device="default",
-        snd_device="plug:dmix_48000",
+        wake_word=wake_word,
+        mic_device=mic_device,
+        snd_device=snd_device,
         enable_aec=enable_aec,
-        aec_mic_device="plug:dsnoop_48000",
-        aec_delay_ms=0,
-        aec_type=1,
+        aec_mic_device=aec_mic_device,
+        aec_delay_ms=aec_delay_ms,
+        aec_type=aec_type,
         ha_host="",
         log_level="INFO",
     )
-    kwargs.update(overrides)
-    return VoiceSettings(**kwargs)  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
@@ -489,8 +499,14 @@ class TestSuperviseTwoChildren:
 
 def test_childspec_is_frozen() -> None:
     spec = ChildSpec(name="lva", argv=["lva"], env={})
-    with pytest.raises((AttributeError, TypeError)):
-        spec.name = "other"  # type: ignore[misc]
+    # A frozen-dataclass field assignment raises FrozenInstanceError at runtime.
+    # setattr() with a NON-constant attribute name keeps both checkers happy:
+    # mypy can't statically resolve the dynamic field, and ruff B010 only flags
+    # setattr() with a constant literal (which it would rewrite to spec.name = …,
+    # re-triggering mypy's misc error on the frozen field).
+    field_name = "name"
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        setattr(spec, field_name, "other")
 
 
 # ---------------------------------------------------------------------------
@@ -504,16 +520,3 @@ def test_child_specs_types() -> None:
         assert isinstance(spec.name, str)
         assert isinstance(spec.argv, list)
         assert isinstance(spec.env, dict)
-
-
-# ---------------------------------------------------------------------------
-# Iterator exhaustion guard (prevent accidental infinite loop in tests)
-# ---------------------------------------------------------------------------
-
-
-def _bounded(n: int) -> Iterator[bool]:
-    """Yield True n times then False forever."""
-    for _ in range(n):
-        yield True
-    while True:
-        yield False
