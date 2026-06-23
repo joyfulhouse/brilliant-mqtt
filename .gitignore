@@ -24,6 +24,9 @@ venv/
 # Build artifact bundled into the HACS zip (scripts/build_payload.sh)
 custom_components/brilliant_mqtt/agent_payload/
 
+# Voice payload build artifacts (scripts/build_voice_payload.sh)
+custom_components/brilliant_mqtt/voice_payload/
+
 # ─── Tooling caches ──────────────────────────────────────────────────────
 .pytest_cache/
 .ruff_cache/
