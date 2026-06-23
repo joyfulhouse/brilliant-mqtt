@@ -1,0 +1,37 @@
+[Unit]
+# Reference systemd unit for the on-panel VOICE agent (separate from the
+# message-bus bridge in brilliant-mqtt.service). It supervises two vendored
+# pure-Python Wyoming processes — wyoming-satellite (HA Assist satellite, mic +
+# speaker) and wyoming-openwakeword (on-panel wake word) — plus the system
+# tweaks they need (a panel-nftables accept for the satellite port, and
+# disabling the built-in Alexa vassal so we own the mic). Lives under /var so it
+# survives OTA; the Ansible role / HA integration re-installs it post-update.
+Description=Brilliant panel voice satellite (HA Assist + wake word)
+After=message_bus.service network-online.target
+Wants=message_bus.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/brilliant-voice.env
+# app = our brilliant_voice package; vendor = the vendored Wyoming/openWakeWord
+# stack + the cross-built-for-Cortex-A9 tflite_runtime + armv7 numpy + wake models.
+Environment=PYTHONPATH=/var/brilliant-voice/app:/var/brilliant-voice/vendor
+# The agent ensures the nftables accept for VOICE_SATELLITE_PORT and (when
+# DISABLE_ALEXA=1) tears down the Alexa vassal at startup — both need root, and
+# both must be re-applied here because /run + the panel nft config are tmpfs /
+# OTA-replaced. It then launches and supervises the satellite + wake subprocesses.
+ExecStart=/data/switch-embedded/env/bin/python3 -m brilliant_voice
+Restart=always
+RestartSec=5
+# Resource caps so always-on wake inference can never starve the touchscreen UI.
+# The wake stack measured ~82 MB RSS loaded; the satellite + supervisor add ~50 MB.
+# CPUQuota is the realtime-vs-UI tradeoff — tune against measured wake latency
+# once the XNNPACK-accelerated A9 tflite build is in (with reference (no-XNNPACK)
+# kernels wake is ~0.4x realtime and unusable; XNNPACK is required).
+Nice=5
+MemoryMax=220M
+CPUQuota=100%
+OOMScoreAdjust=500
+
+[Install]
+WantedBy=multi-user.target
