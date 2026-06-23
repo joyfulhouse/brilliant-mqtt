@@ -31,19 +31,27 @@ from .const import (
     CONF_MQTT_USERNAME,
     CONF_PANEL,
     CONF_ROOT_PASSWORD,
+    CONF_VOICE_ENABLED,
+    CONF_VOICE_HA_HOST,
+    CONF_VOICE_WAKE_WORD,
     DATA_SSH_HOST_KEY,
     DEFAULT_AUTO_REPAIR,
     DEFAULT_OFFLINE_GRACE_MINUTES,
     DEFAULT_REPAIR_COOLDOWN_MINUTES,
     DEFAULT_TRUST_HOST_KEY_CHANGES,
+    DEFAULT_VOICE_WAKE_WORD,
     DOMAIN,
     MESH_PANEL,
     OPT_AUTO_REPAIR,
     OPT_OFFLINE_GRACE_MINUTES,
     OPT_REPAIR_COOLDOWN_MINUTES,
     OPT_TRUST_HOST_KEY_CHANGES,
+    VOICE_PAYLOAD_VERSION,
+    VOICE_WAKE_WORDS,
+    panel_device_name,
 )
 from .shell import AsyncsshShell, PanelShell
+from .voice_payload import VoicePayloadError, async_fetch_voice_payload
 
 # Entry-data keys whose values pre-fill the NEXT add-panel MQTT step. Only the broker
 # creds are genuinely fleet-shared; the root password is deliberately excluded — the
@@ -107,6 +115,18 @@ def _mqtt_schema_fields(source: Mapping[str, Any]) -> dict[Any, Any]:
         vol.Required(
             CONF_MQTT_PASSWORD, default=source.get(CONF_MQTT_PASSWORD, vol.UNDEFINED)
         ): str,
+    }
+
+
+def _voice_schema_fields(source: Mapping[str, Any]) -> dict[Any, Any]:
+    """Voice opt-in fields for the onboarding script step."""
+    return {
+        vol.Required(CONF_VOICE_ENABLED, default=source.get(CONF_VOICE_ENABLED, False)): bool,
+        vol.Required(
+            CONF_VOICE_WAKE_WORD,
+            default=source.get(CONF_VOICE_WAKE_WORD, DEFAULT_VOICE_WAKE_WORD),
+        ): vol.In(list(VOICE_WAKE_WORDS)),
+        vol.Optional(CONF_VOICE_HA_HOST, default=source.get(CONF_VOICE_HA_HOST, "")): str,
     }
 
 
@@ -264,6 +284,26 @@ async def _install_agent(
         await panel_ops.enable_now(shell)
 
 
+async def _install_voice(
+    hass: HomeAssistant,
+    host: str,
+    password: str,
+    *,
+    pinned_key: str,
+    tarball: str,
+    env: str,
+) -> None:
+    """First-install the voice satellite over SSH (payload + unit/env + enable).
+
+    The host key was pinned in step 1, so this connect verifies before auth. Holds
+    the fleet SSH lock for the session (the tarball upload included).
+    """
+    async with _panel_session(hass, host, password, pinned_key) as shell:
+        await panel_ops.deploy_voice_payload(shell, tarball, VOICE_PAYLOAD_VERSION)
+        await panel_ops.ensure_voice_config(shell, env)
+        await panel_ops.enable_voice(shell)
+
+
 class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
     """Add one Brilliant panel per entry (detection-first; adopts installed agents)."""
 
@@ -350,12 +390,14 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
         return self.async_show_form(step_id="broker", data_schema=schema, errors=errors)
 
     async def async_step_script(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
-        """Step 3 — name + mesh, then INSTALL the agent (only for a not-yet-installed panel).
+        """Step 3 — name + mesh + voice opt-in, then INSTALL the agent (not-yet-installed only).
 
         Installing here — push the payload, write the unit/env, enable the service — is
         what makes "add the integration" actually set the panel up. The host key was
-        pinned in step 1. An install failure keeps this form open with cannot_install so
-        the operator can fix the panel and retry; the entry is created only on success.
+        pinned in step 1. An agent install failure keeps this form open with cannot_install;
+        a voice install failure (after the agent succeeded) uses cannot_install_voice — both
+        leave the entry uncreated so the operator can fix and retry. The agent install is
+        idempotent so a retry after a voice failure only re-runs the voice step.
         """
         errors: dict[str, str] = {}
         if user_input is not None:
@@ -364,6 +406,10 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
                 errors[CONF_NAME] = "reserved_panel"
             elif not slug:
                 errors[CONF_NAME] = "invalid_name"
+            # A control char in the HA host flows into render_voice_env → _env_quote, which
+            # raises ValueError (NOT caught by the voice except below) → the flow would
+            # crash. Reject at the boundary for a friendly per-field message instead.
+            errors.update(_control_char_errors(user_input, (CONF_VOICE_HA_HOST,)))
             if not errors:
                 await self.async_set_unique_id(slug)
                 self._abort_if_unique_id_configured()
@@ -398,24 +444,55 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
                 except (OSError, asyncssh.Error, panel_ops.PanelOpError):
                     errors["base"] = "cannot_install"
                 else:
-                    return self.async_create_entry(
-                        title=f"Brilliant {slug}",
-                        data={
-                            **self._connect,
-                            **self._mqtt,
-                            CONF_PANEL: slug,
-                            CONF_MESH_PRIORITY: user_input[CONF_MESH_PRIORITY],
-                        },
-                    )
+                    if user_input[CONF_VOICE_ENABLED]:
+                        try:
+                            tarball = await async_fetch_voice_payload(self.hass)
+                            voice_env = panel_ops.render_voice_env(
+                                panel=slug,
+                                name=panel_device_name(slug),
+                                api_port=6053,
+                                wake_word=user_input[CONF_VOICE_WAKE_WORD],
+                                ha_host=user_input[CONF_VOICE_HA_HOST],
+                                enable_aec=False,
+                            )
+                            await _install_voice(
+                                self.hass,
+                                self._connect[CONF_HOST],
+                                self._connect[CONF_ROOT_PASSWORD],
+                                pinned_key=self._connect[DATA_SSH_HOST_KEY],
+                                tarball=tarball,
+                                env=voice_env,
+                            )
+                        except (
+                            VoicePayloadError,
+                            OSError,
+                            asyncssh.Error,
+                            panel_ops.PanelOpError,
+                        ):
+                            errors["base"] = "cannot_install_voice"
+                    if not errors:
+                        return self.async_create_entry(
+                            title=f"Brilliant {slug}",
+                            data={
+                                **self._connect,
+                                **self._mqtt,
+                                CONF_PANEL: slug,
+                                CONF_MESH_PRIORITY: user_input[CONF_MESH_PRIORITY],
+                                CONF_VOICE_ENABLED: user_input[CONF_VOICE_ENABLED],
+                                CONF_VOICE_WAKE_WORD: user_input[CONF_VOICE_WAKE_WORD],
+                                CONF_VOICE_HA_HOST: user_input[CONF_VOICE_HA_HOST],
+                            },
+                        )
         schema = vol.Schema(
             {
                 vol.Required(CONF_NAME): str,
                 vol.Required(CONF_MESH_PRIORITY, default=0): vol.All(
                     vol.Coerce(int), vol.Range(min=0, max=99)
                 ),
+                **_voice_schema_fields({}),
             }
         )
-        # Preserve name + mesh across an invalid-name or failed-install redisplay.
+        # Preserve name + mesh + voice fields across an error redisplay.
         if user_input is not None:
             schema = self.add_suggested_values_to_schema(schema, user_input)
         return self.async_show_form(step_id="script", data_schema=schema, errors=errors)

@@ -38,7 +38,7 @@ addition to the panel's own site-packages it already exposes).
 
 - Any LAN-reachable Mosquitto-compatible broker works; if you have none, Home
   Assistant's official Mosquitto add-on does — full setup in
-  [INSTALL.md](../../INSTALL.md#set-up-the-mqtt-broker).
+  [INSTALL.md](../../INSTALL.md#step-2--set-up-the-mqtt-broker).
 - Use a dedicated `brilliant` user; keep its password in your secret store and
   inject it into `/etc/brilliant-mqtt.env` (mode 0600) at deploy time.
 - **ACL:** grant `brilliant` → `brilliant/#` (rw) + `homeassistant/#` (write, for

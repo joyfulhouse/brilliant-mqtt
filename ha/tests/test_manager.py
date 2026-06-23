@@ -19,6 +19,8 @@ from pytest_homeassistant_custom_component.common import (
 from pytest_homeassistant_custom_component.typing import MqttMockHAClient
 
 from custom_components.brilliant_mqtt.const import (
+    CONF_VOICE_ENABLED,
+    CONF_VOICE_WAKE_WORD,
     DATA_SSH_HOST_KEY,
     DOMAIN,
     EVENT_TYPE,
@@ -873,3 +875,455 @@ async def test_agent_update_reports_progress(
     assert 0 <= min(pcts) and max(pcts) <= 100
     assert fake_shell.dir_uploads  # the deploy actually ran
     assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+# ---------------------------------------------------------------------------
+# Voice satellite manager methods
+# ---------------------------------------------------------------------------
+
+_FETCH_PATCH = "custom_components.brilliant_mqtt.manager.async_fetch_voice_payload"
+_FAKE_TARBALL = "/tmp/voice.tar.gz"
+
+
+def _voice_entry_data() -> dict[str, object]:
+    return {**ENTRY_DATA, CONF_VOICE_ENABLED: True}
+
+
+def _make_voice_shell(payload_present: bool) -> FakeShell:
+    """FakeShell whose inspect probes respond correctly for both agent and voice."""
+    from custom_components.brilliant_mqtt import panel_ops
+    from custom_components.brilliant_mqtt.shell import RunResult
+
+    agent_installed = RunResult(
+        0, "unit=1\nenv=1\nenabled=1\nactive=1\nsunit=1\nsenv=1\npayload=1\n0.2.0\n", ""
+    )
+    voice_payload_flag = "1" if payload_present else "0"
+    voice_result = RunResult(
+        0, f"unit=0\nenv=0\nenabled=0\nactive=0\npayload={voice_payload_flag}\n", ""
+    )
+    return FakeShell(
+        responses={
+            panel_ops.INSPECT_COMMAND: agent_installed,
+            panel_ops.VOICE_INSPECT_COMMAND: voice_result,
+        }
+    )
+
+
+async def test_set_voice_enabled_true_payload_absent_deploys(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """enable=True when voice payload is absent → tarball uploaded, config written, enabled."""
+    import asyncio
+
+    from custom_components.brilliant_mqtt.manager import PanelManager
+
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+
+    shell = _make_voice_shell(payload_present=False)
+    with (
+        patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell),
+        patch(_FETCH_PATCH, return_value=_FAKE_TARBALL),
+    ):
+        manager = PanelManager(hass, entry, asyncio.Lock())
+        await manager.async_set_voice_enabled(True)
+
+    # Tarball uploaded to panel (deploy_voice_payload → put_file)
+    assert any(src == _FAKE_TARBALL for (src, _dst, _mode) in shell.file_uploads)
+    # Voice satellite was enabled
+    assert "systemctl enable --now brilliant-voice" in shell.commands
+    # Entry data persisted
+    assert entry.data[CONF_VOICE_ENABLED] is True
+
+
+async def test_set_voice_enabled_true_payload_present_skips_upload(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """enable=True when voice payload is already present → no tarball upload, but
+    ensure_voice_config + enable_voice still run."""
+    import asyncio
+
+    from custom_components.brilliant_mqtt.manager import PanelManager
+
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+
+    shell = _make_voice_shell(payload_present=True)
+    with (
+        patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell),
+        patch(_FETCH_PATCH, return_value=_FAKE_TARBALL),
+    ):
+        manager = PanelManager(hass, entry, asyncio.Lock())
+        await manager.async_set_voice_enabled(True)
+
+    # No tarball upload (deploy_voice_payload was skipped)
+    assert not shell.file_uploads
+    # Config + enable still ran
+    assert any("/etc/brilliant-voice.env" in p for (p, _d, _m) in shell.uploads)
+    assert "systemctl enable --now brilliant-voice" in shell.commands
+    assert entry.data[CONF_VOICE_ENABLED] is True
+
+
+async def test_set_voice_enabled_false_uninstalls(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """enable=False → uninstall_voice commands ran, CONF_VOICE_ENABLED=False, issue deleted."""
+    import asyncio
+
+    from homeassistant.helpers import issue_registry as ir
+
+    from custom_components.brilliant_mqtt.manager import PanelManager
+
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=_voice_entry_data())
+    entry.add_to_hass(hass)
+
+    # Pre-create the voice issue so we can assert it is deleted
+    registry = ir.async_get(hass)
+    voice_issue_id = f"voice_missing_{entry.entry_id}"
+    ir.async_create_issue(
+        hass,
+        DOMAIN,
+        voice_issue_id,
+        is_fixable=False,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key="voice_missing",
+        translation_placeholders={"panel": "office"},
+    )
+    assert registry.async_get_issue(DOMAIN, voice_issue_id) is not None
+
+    shell = _make_voice_shell(payload_present=True)
+    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+        manager = PanelManager(hass, entry, asyncio.Lock())
+        await manager.async_set_voice_enabled(False)
+
+    # disable + rm commands ran
+    assert any("disable --now" in c and "brilliant-voice" in c for c in shell.commands)
+    assert entry.data[CONF_VOICE_ENABLED] is False
+    # Voice issue cleared
+    assert registry.async_get_issue(DOMAIN, voice_issue_id) is None
+
+
+async def test_set_voice_wake_word_voice_enabled_restarts(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """Wake-word change with voice enabled → entry updated AND restart ran on panel."""
+    import asyncio
+
+    from custom_components.brilliant_mqtt.manager import PanelManager
+
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=_voice_entry_data())
+    entry.add_to_hass(hass)
+
+    shell = _make_voice_shell(payload_present=True)
+    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+        manager = PanelManager(hass, entry, asyncio.Lock())
+        await manager.async_set_voice_wake_word("hey_jarvis")
+
+    assert entry.data[CONF_VOICE_WAKE_WORD] == "hey_jarvis"
+    assert "systemctl restart brilliant-voice" in shell.commands
+
+
+async def test_set_voice_wake_word_voice_disabled_no_ssh(
+    hass: HomeAssistant,
+) -> None:
+    """Wake-word change with voice disabled → entry updated, NO SSH connection."""
+    import asyncio
+
+    from custom_components.brilliant_mqtt.manager import PanelManager
+
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+
+    shell = _make_voice_shell(payload_present=False)
+    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+        manager = PanelManager(hass, entry, asyncio.Lock())
+        await manager.async_set_voice_wake_word("hey_mycroft")
+
+    assert entry.data[CONF_VOICE_WAKE_WORD] == "hey_mycroft"
+    assert shell.connect_count == 0  # no SSH when voice is disabled
+
+
+@pytest.mark.allow_lingering_timers
+async def test_repair_fold_in_voice_enabled_absent_payload(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    payload_dir: Path,
+) -> None:
+    """Repair with CONF_VOICE_ENABLED=True + voice payload absent → voice is deployed
+    alongside the agent, voice issue absent after success."""
+    from homeassistant.helpers import issue_registry as ir
+
+    from custom_components.brilliant_mqtt import panel_ops
+    from custom_components.brilliant_mqtt.shell import RunResult
+
+    # Agent installed; voice payload absent
+    agent_ok = RunResult(
+        0, "unit=1\nenv=1\nenabled=1\nactive=1\nsunit=1\nsenv=1\npayload=1\n0.2.0\n", ""
+    )
+    voice_absent = RunResult(0, "unit=0\nenv=0\nenabled=0\nactive=0\npayload=0\n", "")
+    shell = FakeShell(
+        responses={
+            panel_ops.INSPECT_COMMAND: agent_ok,
+            panel_ops.VOICE_INSPECT_COMMAND: voice_absent,
+        }
+    )
+    with (
+        patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell),
+        patch(_FETCH_PATCH, return_value=_FAKE_TARBALL),
+    ):
+        entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=_voice_entry_data())
+        entry.add_to_hass(hass)
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+        await entry.runtime_data.async_repair(trigger="button")
+        await hass.async_block_till_done()
+
+    # Voice tarball uploaded and enabled
+    assert any(src == _FAKE_TARBALL for (src, _dst, _mode) in shell.file_uploads)
+    assert "systemctl enable --now brilliant-voice" in shell.commands
+    # Voice issue absent (repair succeeded)
+    registry = ir.async_get(hass)
+    assert registry.async_get_issue(DOMAIN, f"voice_missing_{entry.entry_id}") is None
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_repair_voice_failure_isolated_from_agent_repair(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    payload_dir: Path,
+) -> None:
+    """If the voice repair step fails, the voice issue is created but the agent
+    repair completes normally — no exception escapes async_repair."""
+    from homeassistant.helpers import issue_registry as ir
+
+    from custom_components.brilliant_mqtt import panel_ops
+    from custom_components.brilliant_mqtt.shell import RunResult
+
+    agent_ok = RunResult(
+        0, "unit=1\nenv=1\nenabled=1\nactive=1\nsunit=1\nsenv=1\npayload=1\n0.2.0\n", ""
+    )
+    # Payload present: deploy_voice_payload is skipped, _deploy_voice goes straight
+    # to ensure_voice_config. Fail ensure_voice_config's first _checked call so
+    # PanelOpError is raised inside the voice try/except without touching deploy_payload.
+    voice_present = RunResult(0, "unit=0\nenv=0\nenabled=0\nactive=0\npayload=1\n", "")
+    shell = FakeShell(
+        responses={
+            panel_ops.INSPECT_COMMAND: agent_ok,
+            panel_ops.VOICE_INSPECT_COMMAND: voice_present,
+            "mkdir -p /var/brilliant-voice/system": RunResult(1, "", "mkdir failed"),
+        }
+    )
+    events = _capture_events(hass)
+    with (
+        patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell),
+        patch(_FETCH_PATCH, return_value=_FAKE_TARBALL),
+    ):
+        entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=_voice_entry_data())
+        entry.add_to_hass(hass)
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+        # This must NOT raise — voice failure is isolated
+        await entry.runtime_data.async_repair(trigger="button")
+        await hass.async_block_till_done()
+
+    # Agent repair ran normally (enable_now executed)
+    assert "systemctl enable --now brilliant-mqtt" in shell.commands
+    # repair_failed NOT in events (agent part succeeded)
+    assert "repair_failed" not in _types(events)
+    # Voice issue was created (voice step failed)
+    registry = ir.async_get(hass)
+    voice_issue = registry.async_get_issue(DOMAIN, f"voice_missing_{entry.entry_id}")
+    assert voice_issue is not None
+    assert voice_issue.severity == ir.IssueSeverity.WARNING
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_remove_entry_deletes_voice_issue(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    fake_shell: FakeShell,
+    payload_dir: Path,
+) -> None:
+    """Removing a config entry must delete both the agent and voice issues."""
+    from homeassistant.helpers import issue_registry as ir
+
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=_voice_entry_data())
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    registry = ir.async_get(hass)
+    voice_issue_id = f"voice_missing_{entry.entry_id}"
+    ir.async_create_issue(
+        hass,
+        DOMAIN,
+        voice_issue_id,
+        is_fixable=False,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key="voice_missing",
+        translation_placeholders={"panel": "office"},
+    )
+    assert registry.async_get_issue(DOMAIN, voice_issue_id) is not None
+
+    assert await hass.config_entries.async_remove(entry.entry_id)
+    await hass.async_block_till_done()
+    assert registry.async_get_issue(DOMAIN, voice_issue_id) is None
+
+
+@pytest.mark.allow_lingering_timers
+async def test_repair_voice_prefetch_oserror_is_swallowed_and_repairing_resets(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    payload_dir: Path,
+) -> None:
+    """Bug A: an OSError from the voice pre-fetch during repair must be swallowed and
+    must not wedge _repairing=True forever.
+
+    Exercises BOTH halves of the fix end-to-end via the REAL async_fetch_voice_payload:
+    the cache-read executor job (_read_cached) raises OSError, which the hardened fetch
+    wraps as VoicePayloadError; the pre-fetch (now inside the outer try) catches it,
+    logs, and skips voice. The repair must not raise, must leave _repairing False (the
+    outer finally), and must still complete the agent repair.
+    """
+    shell = _make_voice_shell(payload_present=True)
+    with (
+        patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell),
+        patch(
+            "custom_components.brilliant_mqtt.voice_payload._read_cached",
+            side_effect=OSError("disk read error"),
+        ),
+    ):
+        entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=_voice_entry_data())
+        entry.add_to_hass(hass)
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+        # Must NOT raise even though the pre-fetch's executor file op raised OSError.
+        await entry.runtime_data.async_repair(trigger="button")
+        await hass.async_block_till_done()
+
+    # The mutex was released by the outer finally — not stuck True.
+    assert entry.runtime_data._repairing is False
+    # The agent repair still ran (voice was skipped, not fatal).
+    assert "systemctl enable --now brilliant-mqtt" in shell.commands
+    # Voice was never deployed (pre-fetch failed → tarball None).
+    assert not shell.file_uploads
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_fetch_voice_payload_wraps_oserror_as_voicepayloaderror(
+    hass: HomeAssistant,
+) -> None:
+    """Bug A (part 2): async_fetch_voice_payload raises ONLY VoicePayloadError.
+
+    A raw OSError from the cache-read executor job must be wrapped, so a repair caller can
+    swallow exactly one exception type and never leak an OSError that wedges _repairing.
+    """
+    from custom_components.brilliant_mqtt.voice_payload import (
+        VoicePayloadError,
+        async_fetch_voice_payload,
+    )
+
+    with (
+        patch(
+            "custom_components.brilliant_mqtt.voice_payload._read_cached",
+            side_effect=OSError("disk read error"),
+        ),
+        pytest.raises(VoicePayloadError),
+    ):
+        await async_fetch_voice_payload(hass)
+
+
+async def test_set_voice_wake_word_push_failure_keeps_old_word(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """Bug B: a failed SSH push must NOT persist the new wake word.
+
+    The push (restart_voice) fails with PanelOpError → async_set_voice_wake_word raises
+    HomeAssistantError(voice_failed) and entry.data[CONF_VOICE_WAKE_WORD] stays at the OLD
+    value, so the select keeps showing the word the panel is actually running.
+    """
+    import asyncio
+
+    from homeassistant.exceptions import HomeAssistantError
+
+    from custom_components.brilliant_mqtt.manager import PanelManager
+    from custom_components.brilliant_mqtt.shell import RunResult
+
+    old_word = "okay_nabu"
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="office",
+        data={**_voice_entry_data(), CONF_VOICE_WAKE_WORD: old_word},
+    )
+    entry.add_to_hass(hass)
+
+    shell = _make_voice_shell(payload_present=True)
+    shell.responses["systemctl restart brilliant-voice"] = RunResult(1, "", "restart boom")
+    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+        manager = PanelManager(hass, entry, asyncio.Lock())
+        with pytest.raises(HomeAssistantError) as err:
+            await manager.async_set_voice_wake_word("hey_jarvis")
+    assert err.value.translation_key == "voice_failed"
+    # The push used the NEW word (env rendered with it) ...
+    assert any("/etc/brilliant-voice.env" in p for (p, _d, _m) in shell.uploads)
+    # ... but because the push failed, the persisted word is UNCHANGED.
+    assert entry.data[CONF_VOICE_WAKE_WORD] == old_word
+
+
+async def test_set_voice_enabled_true_clears_stale_voice_issue(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """Bug C: a successful ENABLE clears a pre-existing voice_missing issue.
+
+    After enable the satellite is running, so the "voice enabled but not running" issue
+    must be deleted (previously it was deleted only on the disable path).
+    """
+    import asyncio
+
+    from homeassistant.helpers import issue_registry as ir
+
+    from custom_components.brilliant_mqtt.manager import PanelManager
+
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+
+    # Pre-create the voice issue so we can assert the successful enable clears it.
+    registry = ir.async_get(hass)
+    voice_issue_id = f"voice_missing_{entry.entry_id}"
+    ir.async_create_issue(
+        hass,
+        DOMAIN,
+        voice_issue_id,
+        is_fixable=False,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key="voice_missing",
+        translation_placeholders={"panel": "office"},
+    )
+    assert registry.async_get_issue(DOMAIN, voice_issue_id) is not None
+
+    shell = _make_voice_shell(payload_present=False)
+    with (
+        patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell),
+        patch(_FETCH_PATCH, return_value=_FAKE_TARBALL),
+    ):
+        manager = PanelManager(hass, entry, asyncio.Lock())
+        await manager.async_set_voice_enabled(True)
+
+    assert entry.data[CONF_VOICE_ENABLED] is True
+    assert "systemctl enable --now brilliant-voice" in shell.commands
+    # The stale issue is gone after a successful enable.
+    assert registry.async_get_issue(DOMAIN, voice_issue_id) is None

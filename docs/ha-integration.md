@@ -35,7 +35,7 @@ they appear on the existing per-panel device page.
    `joyfulhouse/brilliant-mqtt` with category **Integration**.
 2. Install **Brilliant MQTT Panel Manager**, then restart Home Assistant.
 3. Add it under **Settings → Devices & Services → Add Integration → Brilliant
-   MQTT** (one add per panel — see the add-panel form below).
+   MQTT** (one add per panel — see the onboarding flow below).
 
 HACS installs the release zip, whose contents extract straight into
 `config/custom_components/brilliant_mqtt/`. The zip bundles the agent payload
@@ -53,57 +53,48 @@ the integration as above.
 
 ## Onboarding a panel
 
-Adding the integration walks a short, **detection-first** flow:
+Adding the integration walks a **detection-first** flow. The path taken depends
+on whether the agent is already installed on the panel:
 
-1. **Connect** — enter the panel's **Host** (IP/hostname) and **Root password** —
-   the only required inputs. On submit the integration makes **one** SSH
-   connection, **pins the host key** (trust-on-first-use), and checks whether the
-   bridge agent is already installed.
-   - **Already installed →** the panel is **adopted**: its name, MQTT broker, and
-     mesh priority are read back from the running agent and the entry is created.
-     No more questions, and the panel itself is left untouched. (A hand-deployed
-     `BRILLIANT_PANEL` that isn't slug-form, or is the reserved `mesh`, is refused.)
-2. **MQTT broker** *(only when not installed)* — the broker host/port/username/
-   password the on-panel agent will use. **Pre-filled** from your most recently
-   added panel (the broker is fleet-shared); the root password is deliberately
-   never pre-filled.
-3. **Panel settings** *(only when not installed)* — a free-text **Panel Name**
-   (e.g. "Office Bath"; a lowercase id is derived for MQTT topics → `office-bath`)
-   and the **Mesh priority** (`MESH_PRIORITY`: 0 = never lead; 1 = primary; 2/3 =
-   standbys). `mesh` is **reserved** and rejected. **On submit the integration
-   installs the agent on the panel over SSH** — pushes the bundled payload, writes
-   the systemd unit + env, and enables the service — *then* creates the entry. If
-   the install fails, the step stays open with `cannot_install` and **no entry is
-   created**, so you can fix the panel and retry. Once the agent starts it
-   publishes MQTT discovery and the panel's controls fill in the same device.
+| Step | New panel (no agent) | Already has agent |
+|---|---|---|
+| **1. Connect** | Enter Host + Root password. Integration SSHes in, pins the host key (TOFU), detects no agent. | Enter Host + Root password. Integration SSHes in, detects the running agent. |
+| **2. MQTT broker** | Enter broker host / port / user / password. Pre-filled from the most recently added panel (broker is fleet-shared); root password is never pre-filled. | _Skipped_ — broker is read back from the live env file. |
+| **3. Panel settings** | Set Panel Name (e.g. "Office Bath" → slug `office-bath`) and Mesh priority (`MESH_PRIORITY`: 0 = never lead; 1 = primary; 2/3 = standbys). Optionally enable **Voice satellite** (see [Voice satellite](#voice-satellite)). On submit: agent is installed over SSH, then entry is created. | _Skipped_ — name + mesh priority + broker are adopted verbatim from the running agent. Panel is left untouched. |
+| **Result** | Agent installed; panel entities fill in after first MQTT publish. | Panel adopted; entry created immediately. |
 
-The derived slug doubles as the MQTT topic segment and the entry's unique id, so
-it is **immutable** after creation (renaming = remove + re-add).
+**Install failure:** if the SSH install fails at step 3, the step stays open
+with `cannot_install` and **no entry is created** — fix the panel and retry.
 
-To change a panel's host, root password, broker, or mesh priority later, use
-**Reconfigure** on the entry; it re-validates over SSH and **pushes the change to
-the panel** (re-renders the env file and restarts the agent). If the **host is
-unchanged**, it verifies the new password against the **stored** host key (key
-checked before auth — a mismatch is rejected with `host_key_changed`, never a
-silent re-pin), so rotating a password can't be used to accept a swapped key. If
-the **host changes**, it does a fresh trust-on-first-use connect and **re-pins**
-to the new host's key, so pointing the entry at different hardware is safe.
+**Adopting a hand-deployed panel:** onboarding reads `BRILLIANT_PANEL` from the
+live env file and adopts it verbatim. Set it to a lowercase slug
+(`^[a-z0-9_-]+$`) before adding — a non-slug or the reserved value `mesh` is
+refused (`cannot_read_config`). See [INSTALL.md](../INSTALL.md) for manual
+deploy steps.
+
+**Slug is immutable** after creation (rename = remove + re-add).
+
+**Reconfigure** lets you change host, root password, broker, or mesh priority
+later — it re-validates over SSH and pushes the change to the panel. If the host
+is unchanged, the new password is verified against the **stored** host key (key
+checked before auth), so rotating a password can't silently accept a swapped
+key. If the host changes, a fresh TOFU connect re-pins to the new host.
+
 Behavior knobs are under **Configure** (Options).
 
 ## Entities
 
-Each panel's device gains three management entities (all diagnostic):
+Each panel's device gains five management entities (three diagnostic, two control):
 
 | Entity | What it is |
 |---|---|
-| `update.brilliant_<panel>_bridge` | Agent **update** entity. Installed version comes from the panel's retained bridge-meta (`agent_version`); latest comes from the bundled payload's `VERSION`. Installing pushes the bundled payload and restarts the agent. |
+| `update.brilliant_<panel>_bridge` | Agent **update** entity. Installed version comes from the panel's retained bridge-meta (`agent_version`); latest from the bundled payload's `VERSION`. Installing pushes the bundled payload and restarts the agent. |
 | `binary_sensor.brilliant_<panel>_bridge_health` | Bridge **health** (device class `problem`). `on` = needs attention (offline past grace with auto-repair off, a repair step failed, or a repair ran but the bridge stayed offline). Attributes: `reason`, `availability`. |
-| `button.brilliant_<panel>_repair_bridge` | **Manual repair** — restores the unit/env and starts the agent (and **installs the agent code first if it is missing**), bypassing the auto-repair cooldown. |
+| `button.brilliant_<panel>_repair_bridge` | **Manual repair** — restores the unit/env and starts the agent (installs agent code first if missing), bypassing the auto-repair cooldown. |
+| `switch.brilliant_<panel>_voice_satellite` | **Voice satellite** — enable installs and starts the satellite; disable uninstalls it. |
+| `select.brilliant_<panel>_wake_word` | **Wake word** — choose `okay_nabu` (default), `hey_jarvis`, or `hey_mycroft`; changing it restarts the satellite. |
 
-Entity ids are derived from the panel's HA device name (`Brilliant <panel>`), so
-in practice they read `update.brilliant_<panel>_bridge`,
-`binary_sensor.brilliant_<panel>_bridge_health`, and
-`button.brilliant_<panel>_repair_bridge`.
+Entity ids follow the panel's HA device name (`Brilliant <panel>`).
 
 > **Two version numbers, on purpose.** The **HACS package version** (this
 > integration, e.g. `0.2.0`) and the **on-panel agent version** are independent.
@@ -177,80 +168,97 @@ automation:
 
 ## Options
 
-Per-panel behavior knobs (under **Configure**); the manager reads them live, so
-no reload is needed:
+Per-panel behavior knobs (under **Configure**); read live — no reload needed.
 
 | Option | Default | What it does |
 |---|---|---|
-| **Auto-repair** (`auto_repair`) | `true` | When on, an outage past the grace period triggers an automatic repair. When off, an outage only notifies. |
+| **Auto-repair** (`auto_repair`) | `true` | On: outage past the grace period triggers automatic repair. Off: outage only notifies. |
 | **Offline grace minutes** (`offline_grace_minutes`) | `10` | How long a panel may stay `offline` before repair/escalation kicks in. |
-| **Repair cooldown minutes** (`repair_cooldown_minutes`) | `60` | Minimum gap between automatic repairs, so a flapping panel is not repaired in a tight loop. (The manual repair button bypasses this.) |
-| **Trust host-key changes** (`trust_host_key_changes`) | `false` | When **off** (default), a panel whose SSH host key changed (e.g. a key-rotating firmware OTA) fails the pinned connect and surfaces as `repair_failed: host_key_changed` with guidance to **Reconfigure** to re-pin — the root password is never offered to the new-key host. When **on**, repair/update **auto-re-pins** the changed key on the same-host panel so a key-rotating OTA recovers hands-off; this **does** offer the root password to whatever host answers at the panel's address and fires an auditable `host_key_repinned` event, so only enable it on a trusted/isolated network. |
+| **Repair cooldown minutes** (`repair_cooldown_minutes`) | `60` | Minimum gap between automatic repairs, preventing tight-loop repairs on a flapping panel. The manual repair button bypasses this. |
+| **Trust host-key changes** (`trust_host_key_changes`) | `false` | **Off (default):** a changed SSH host key surfaces as `repair_failed: host_key_changed` with guidance to Reconfigure — the root password is never offered to the new-key host. **On:** repair/update auto-re-pins a changed key on the same-host panel so a key-rotating OTA recovers hands-off; fires an auditable `host_key_repinned` event. Only enable on a trusted/isolated network (e.g. a firewalled IoT VLAN). |
+
+## Voice satellite
+
+A Brilliant panel can act as a **Home Assistant ESPHome voice satellite**
+(on-panel wake word + mic + speaker). STT, the conversation agent, and TTS all
+run in your existing HA Assist pipeline — the panel is backend-agnostic.
+
+**Quick start:**
+1. During onboarding (step 3), toggle **Enable voice satellite**, choose a wake
+   word, and optionally set a HA host override. The integration installs the
+   satellite alongside the bridge agent.
+2. Alternatively, flip the **Voice satellite** switch on the device page at any
+   time (or use the **Wake word** select to change the wake word).
+3. HA auto-discovers the satellite over zeroconf — accept the ESPHome device
+   discovery, then assign an Assist pipeline under **Settings → Voice
+   assistants**. The resulting device is managed by HA's built-in **ESPHome**
+   integration; brilliant_mqtt remains MQTT-only and is not involved in the
+   voice data path.
+
+**Key facts:**
+- Wake words bundled: `okay_nabu` (default), `hey_jarvis`, `hey_mycroft`.
+- The satellite payload (~57 MB) is downloaded from the matching GitHub release
+  asset and installed under `/var/brilliant-voice/` (OTA-persistent). It is
+  cached after the first panel, so fleet installs are fast.
+- If voice is enabled and the satellite goes missing (e.g. after a filesystem
+  wipe), a `voice_missing` repair issue is raised — press **Repair** or the
+  repair button to redeploy.
+- `VOICE_HA_HOST`: only needed when the panel can't resolve your HA URL's
+  hostname (e.g. a segmented IoT VLAN). Format: `hostname=ip`. Blank = use the
+  panel's DNS.
+- AEC (echo cancellation) ships **off** — the mic is closed during TTS, so
+  normal use has no echo; AEC is only for barge-in.
+- Resource-capped (`Nice=5`, `MemoryMax=300M`, `CPUQuota=100%`,
+  `OOMScoreAdjust=500`) so wake inference can't starve the touchscreen UI.
+  Coexists with the panel's built-in Alexa via ALSA mic sharing.
+
+For the full guide (requirements, troubleshooting, advanced config) see
+[docs/voice.md](voice.md).
 
 ## The OTA repair state machine
 
-The availability LWT and the retained bridge-meta drive everything for one
-panel. Going `offline` arms a **grace timer**; if the panel is still offline when
-it expires and auto-repair is on (and the repair cooldown has elapsed), the
-integration SSHes in, **(re)installs the agent code if it is missing**, **rewrites
-the unit + env from known-good sources** (always regenerated, never read back — so
-a repair also heals config drift), re-stages the OTA-proof copies under `/var`, and
-`enable --now`s the service; a **recovery
-timer** then waits for the availability LWT to flip back to `online`
-(→ `repair_succeeded`) or escalates (→ `repair_failed` + `needs_attention`). A
-firmware change on the bridge-meta topic fires `panel_updated` and re-stages the
-config copies.
+**Summary:** going offline arms a grace timer → if still offline when it
+expires and auto-repair is on (cooldown elapsed) → SSH in, (re)install missing
+agent code, rewrite unit + env from known-good sources, `enable --now` the
+service → wait for LWT to flip back online → `repair_succeeded` or
+`repair_failed` + `needs_attention`.
 
-**Caveat — repair can't fix bus-lib drift.** Repair restores *configuration and
-the unit*; it does not change the agent's code. If a firmware OTA changed the
-on-panel message-bus API such that the agent can no longer talk to the bus, the
-service will start but the bridge will not come back online — the recovery timer
+**Key behaviors:**
+- Config is always **regenerated** from the stored entry, never read back from
+  the panel — so a repair also heals config drift.
+- A firmware change on the bridge-meta topic fires `panel_updated` and
+  re-stages the config copies under `/var`.
+
+**Caveat — repair can't fix bus-lib drift.** Repair restores configuration and
+the unit; it does not change the agent code. If a firmware OTA changed the
+on-panel message-bus API such that the agent can no longer communicate, the
+service will start but the bridge won't come back online. The recovery timer
 fires `repair_failed` (`reason: still_offline`, with a captured journal) and
-`needs_attention`, because the agent itself needs a code fix (a new release,
-deployed via the update entity / `redeploy`), not a repair.
+`needs_attention`, because the agent itself needs a code fix — deploy a new
+release via the update entity or `redeploy`.
 
 ## Security model
 
-- **Per-panel root password** is stored in the panel's HA **config entry**
-  (HA's config-entry store) — the **same exposure class as `secrets.yaml`**: it
-  is readable by anyone who can read HA's config/storage, so protect the HA host
-  accordingly. It is deliberately not shared between panels and is redacted from
-  diagnostics.
-- **TOFU host-key pinning.** The first successful connect captures and pins the
-  panel's SSH host key; every later connect verifies it **before** authenticating,
-  so the root password is never offered to an impostor host.
-  - **OTA host-key rotation.** Because `async_repair` / `async_update_agent` (and
-    Reconfigure on the same host) connect using that pin, a firmware OTA that
-    regenerates the panel's `/etc/ssh` host keys makes those connects fail host-key
-    verification — exactly when a repair is needed. The integration handles this in
-    two modes:
-    - **Default — detect + guide.** A changed key is distinguished from a dead panel
-      and surfaces as `repair_failed: host_key_changed` + a `needs_attention`
-      escalation telling you to **Reconfigure** to re-pin. The root password is
-      **never** offered to the new-key host, and the key is never silently re-pinned.
-    - **Opt-in — hands-off auto-re-pin.** Turn on **Trust host-key changes** in
-      Options to let repair/update auto-trust and re-pin a changed key on the
-      already-adopted same-host panel, so a key-rotating OTA recovers without a visit.
-      This **does** offer the root password to whatever host answers at the panel's
-      address (the documented tradeoff) and fires an auditable `host_key_repinned`
-      event (`new_host_key`) — only enable it on a trusted/isolated network such as a
-      firewalled IoT VLAN.
-- **Single auth attempt.** SSH is password-only with `client_keys=None`,
-  `preferred_auth=("password",)`, and keyboard-interactive disabled — exactly one
-  credentialed attempt per connect, so a wrong password can't burn through a
-  lockout threshold.
-- The integration only ever writes the paths it owns on the panel:
-  `/var/brilliant-mqtt/**`, `/etc/brilliant-mqtt.env` (mode `0600`), and
-  `/etc/systemd/system/brilliant-mqtt.service`.
+**Key points:**
+- Root password is stored in the HA config-entry store (same exposure class as
+  `secrets.yaml`). Protect the HA host accordingly. It is per-panel, never
+  shared, and redacted from diagnostics.
+- TOFU host-key pinning: first connect captures the host key; every later
+  connect verifies it **before** authenticating, so the root password is never
+  offered to an impostor.
+- Single auth attempt per connect (`client_keys=None`,
+  `preferred_auth=("password",)`, keyboard-interactive disabled) so a wrong
+  password can't burn through a lockout threshold.
+- The integration only writes paths it owns: `/var/brilliant-mqtt/**`,
+  `/var/brilliant-voice/**` (when voice is enabled), `/etc/brilliant-mqtt.env`
+  (mode `0600`), `/etc/brilliant-voice.env` (mode `0600`), and
+  `/etc/systemd/system/brilliant-mqtt.service` /
+  `/etc/systemd/system/brilliant-voice.service`.
 
-> **Adopting a hand-deployed panel:** when you add a panel whose agent is already
-> installed, onboarding **reads `BRILLIANT_PANEL` from the live env file and adopts
-> it verbatim** (along with the broker + mesh priority) — it does not rewrite the
-> panel. So if you *manually* deployed the agent first (per
-> [INSTALL.md](../INSTALL.md)), set `BRILLIANT_PANEL` to a lowercase slug
-> (`^[a-z0-9_-]+$`): the agent publishes its MQTT topics from that value, and
-> onboarding **refuses** to adopt a non-slug or reserved (`mesh`) value
-> (`cannot_read_config`) rather than create a mismatched entry.
+**OTA host-key rotation** is handled in two modes (see the **Trust host-key
+changes** option above): the default surfaces a changed key as a detectable
+failure and guides you to Reconfigure; the opt-in mode auto-re-pins on the
+same-host panel and fires an auditable event.
 
 See also [ARCHITECTURE.md](ARCHITECTURE.md) and
 [reference/deployment.md](reference/deployment.md).

@@ -9,7 +9,13 @@ from custom_components.brilliant_mqtt.const import (
     PANEL_ENV_FILE,
     PANEL_UNIT_FILE,
     PANEL_VAR_DIR,
+    PANEL_VOICE_ENV_FILE,
+    PANEL_VOICE_STAGED_DIR,
+    PANEL_VOICE_UNIT_FILE,
+    PANEL_VOICE_VAR_DIR,
+    PANEL_VOICE_VERSION_FILE,
     SERVICE_NAME,
+    VOICE_SERVICE_NAME,
 )
 from custom_components.brilliant_mqtt.shell import RunResult
 from tests.fakes import FakeShell
@@ -342,3 +348,216 @@ async def test_uninstall_sequence_and_paths() -> None:
         for token in command.split():
             if token.startswith("/"):
                 assert any(token.startswith(prefix) for prefix in owned), token
+
+
+# ---------------------------------------------------------------------------
+# Voice recipes
+# ---------------------------------------------------------------------------
+
+_FULL_VOICE_INSPECT = RunResult(
+    0,
+    "unit=1\nenv=1\nenabled=1\nactive=1\npayload=1\n0.1.0\n",
+    "",
+)
+
+_ABSENT_VOICE_INSPECT = RunResult(
+    0,
+    "unit=0\nenv=0\nenabled=0\nactive=0\npayload=0\n",
+    "",
+)
+
+
+async def test_inspect_voice_parses_fully_installed() -> None:
+    shell = await _connected(
+        FakeShell(responses={panel_ops.VOICE_INSPECT_COMMAND: _FULL_VOICE_INSPECT})
+    )
+    state = await panel_ops.inspect_voice(shell)
+    assert state == panel_ops.VoicePanelState(
+        unit_present=True,
+        env_present=True,
+        enabled=True,
+        active=True,
+        payload_present=True,
+        payload_version="0.1.0",
+    )
+
+
+async def test_inspect_voice_parses_all_absent() -> None:
+    shell = await _connected(
+        FakeShell(responses={panel_ops.VOICE_INSPECT_COMMAND: _ABSENT_VOICE_INSPECT})
+    )
+    state = await panel_ops.inspect_voice(shell)
+    assert state == panel_ops.VoicePanelState(
+        unit_present=False,
+        env_present=False,
+        enabled=False,
+        active=False,
+        payload_present=False,
+        payload_version=None,
+    )
+
+
+def test_render_voice_env_default_values() -> None:
+    env = panel_ops.render_voice_env(
+        panel="office",
+        name="Brilliant office",
+        api_port=6053,
+        wake_word="okay_nabu",
+        ha_host="192.168.1.10",
+        enable_aec=False,
+    )
+    assert env.splitlines() == [
+        'BRILLIANT_PANEL="office"',
+        'VOICE_NAME="Brilliant office"',
+        "VOICE_API_PORT=6053",
+        'VOICE_WAKE_WORD="okay_nabu"',
+        'VOICE_HA_HOST="192.168.1.10"',
+        "VOICE_ENABLE_AEC=0",
+        "LOG_LEVEL=INFO",
+    ]
+
+
+def test_render_voice_env_enable_aec_true() -> None:
+    env = panel_ops.render_voice_env(
+        panel="office",
+        name="Brilliant office",
+        api_port=6053,
+        wake_word="okay_nabu",
+        ha_host="",
+        enable_aec=True,
+    )
+    lines = {line.split("=", 1)[0]: line.split("=", 1)[1] for line in env.splitlines()}
+    assert lines["VOICE_ENABLE_AEC"] == "1"
+
+
+def test_render_voice_env_empty_ha_host() -> None:
+    env = panel_ops.render_voice_env(
+        panel="office",
+        name="Brilliant office",
+        api_port=6053,
+        wake_word="okay_nabu",
+        ha_host="",
+        enable_aec=False,
+    )
+    lines = {line.split("=", 1)[0]: line.split("=", 1)[1] for line in env.splitlines()}
+    assert lines["VOICE_HA_HOST"] == '""'
+
+
+def test_render_voice_env_quotes_special_chars() -> None:
+    env = panel_ops.render_voice_env(
+        panel='office"main',
+        name='My "Panel"',
+        api_port=6053,
+        wake_word="okay_nabu",
+        ha_host="",
+        enable_aec=False,
+    )
+    # The double-quote in panel/name must be escaped, not break the quoting.
+    assert 'BRILLIANT_PANEL="office\\"main"' in env
+    assert 'VOICE_NAME="My \\"Panel\\""' in env
+
+
+# The expected voice swap command spelled out independently of the impl's path
+# constants (so the assertion is independent of any accidental const change).
+_EXPECTED_VOICE_SWAP = " && ".join(
+    [
+        "mkdir -p /var/brilliant-voice.staging",
+        "tar xzf /var/brilliant-voice.staging.tar.gz"
+        " -C /var/brilliant-voice.staging --strip-components=1",
+        "rm -f /var/brilliant-voice.staging.tar.gz",
+        "rm -rf /var/brilliant-voice.bak",
+        "{ [ -e /var/brilliant-voice ] && "
+        "mv /var/brilliant-voice /var/brilliant-voice.bak; true; }",
+        "mv /var/brilliant-voice.staging /var/brilliant-voice",
+        "rm -rf /var/brilliant-voice.bak",
+    ]
+)
+
+
+async def test_deploy_voice_payload_uploads_tarball_then_swaps() -> None:
+    shell = await _connected(FakeShell())
+    await panel_ops.deploy_voice_payload(shell, "/local/voice.tar.gz", version="0.1.0")
+    # 1. Staging clear runs first.
+    assert shell.commands[0] == (
+        "rm -rf /var/brilliant-voice.staging /var/brilliant-voice.staging.tar.gz"
+    )
+    # 2. Tarball uploaded via put_file (not put_dir).
+    assert shell.file_uploads == [
+        ("/local/voice.tar.gz", "/var/brilliant-voice.staging.tar.gz", 0o644)
+    ]
+    # 3. Swap command ran.
+    assert _EXPECTED_VOICE_SWAP in shell.commands
+    # 4. VERSION file written.
+    assert (PANEL_VOICE_VERSION_FILE, b"0.1.0", 0o644) in shell.uploads
+
+
+async def test_deploy_voice_payload_skips_version_when_swap_fails() -> None:
+    shell = await _connected(
+        FakeShell(responses={_EXPECTED_VOICE_SWAP: RunResult(1, "", "mv failed\n")})
+    )
+    with pytest.raises(panel_ops.PanelOpError, match="exited 1"):
+        await panel_ops.deploy_voice_payload(shell, "/local/voice.tar.gz", version="0.1.0")
+    # VERSION must not be stamped after a failed swap.
+    assert shell.uploads == []
+
+
+async def test_ensure_voice_config_writes_unit_env_and_reloads() -> None:
+    shell = await _connected(FakeShell())
+    await panel_ops.ensure_voice_config(shell, env_content="ENVDATA")
+    # mkdir and cp unit commands precede the daemon-reload.
+    assert shell.commands[0] == f"mkdir -p {PANEL_VOICE_STAGED_DIR}"
+    assert shell.commands[1] == (
+        f"cp {PANEL_VOICE_VAR_DIR}/{VOICE_SERVICE_NAME}.service {PANEL_VOICE_UNIT_FILE}"
+    )
+    assert shell.commands[-1] == "systemctl daemon-reload"
+    # env written to /etc (0600) and staged copy (0600).
+    assert [(path, mode) for (path, _data, mode) in shell.uploads] == [
+        (PANEL_VOICE_ENV_FILE, 0o600),
+        (f"{PANEL_VOICE_STAGED_DIR}/{VOICE_SERVICE_NAME}.env", 0o600),
+    ]
+    # Both copies carry the same content.
+    for _path, data, _mode in shell.uploads:
+        assert data == b"ENVDATA"
+
+
+async def test_ensure_voice_config_raises_when_mkdir_fails() -> None:
+    shell = await _connected(
+        FakeShell(responses={f"mkdir -p {PANEL_VOICE_STAGED_DIR}": RunResult(1, "", "denied\n")})
+    )
+    with pytest.raises(panel_ops.PanelOpError, match="exited 1"):
+        await panel_ops.ensure_voice_config(shell, env_content="ENVDATA")
+    assert shell.uploads == []
+
+
+async def test_enable_voice_issues_systemctl_enable() -> None:
+    shell = await _connected(FakeShell())
+    await panel_ops.enable_voice(shell)
+    assert f"systemctl enable --now {VOICE_SERVICE_NAME}" in shell.commands
+
+
+async def test_restart_voice_issues_systemctl_restart() -> None:
+    shell = await _connected(FakeShell())
+    await panel_ops.restart_voice(shell)
+    assert f"systemctl restart {VOICE_SERVICE_NAME}" in shell.commands
+
+
+async def test_uninstall_voice_sequence_and_paths() -> None:
+    shell = await _connected(FakeShell())
+    await panel_ops.uninstall_voice(shell)
+    assert shell.commands == [
+        f"systemctl disable --now {VOICE_SERVICE_NAME} 2>/dev/null || true",
+        f"rm -f {PANEL_VOICE_UNIT_FILE} {PANEL_VOICE_ENV_FILE}",
+        f"rm -rf {PANEL_VOICE_VAR_DIR}"
+        " /var/brilliant-voice.staging /var/brilliant-voice.staging.tar.gz",
+        "systemctl daemon-reload",
+    ]
+
+
+async def test_fake_shell_put_file_records_call() -> None:
+    """put_file records (local_path, remote_path, mode) and requires connect."""
+    shell = FakeShell()
+    with pytest.raises(RuntimeError, match="not connected"):
+        await shell.put_file("/local/x.tar.gz", "/remote/x.tar.gz", 0o644)
+    await shell.connect()
+    await shell.put_file("/local/x.tar.gz", "/remote/x.tar.gz", 0o644)
+    assert shell.file_uploads == [("/local/x.tar.gz", "/remote/x.tar.gz", 0o644)]

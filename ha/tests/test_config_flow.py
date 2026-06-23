@@ -24,6 +24,9 @@ from custom_components.brilliant_mqtt.const import (
     CONF_MQTT_USERNAME,
     CONF_PANEL,
     CONF_ROOT_PASSWORD,
+    CONF_VOICE_ENABLED,
+    CONF_VOICE_HA_HOST,
+    CONF_VOICE_WAKE_WORD,
     DATA_SSH_HOST_KEY,
     DOMAIN,
     OPT_AUTO_REPAIR,
@@ -33,6 +36,7 @@ from custom_components.brilliant_mqtt.const import (
     PANEL_ENV_FILE,
 )
 from custom_components.brilliant_mqtt.shell import RunResult
+from custom_components.brilliant_mqtt.voice_payload import VoicePayloadError
 from tests.fakes import FakeShell
 
 PROBE = "custom_components.brilliant_mqtt.config_flow._probe_panel"
@@ -45,7 +49,15 @@ MQTT_INPUT = {
     CONF_MQTT_USERNAME: "brilliant",
     CONF_MQTT_PASSWORD: "mqttpass",
 }
-SCRIPT_INPUT = {CONF_NAME: "Office Bath", CONF_MESH_PRIORITY: 1}
+SCRIPT_INPUT = {
+    CONF_NAME: "Office Bath",
+    CONF_MESH_PRIORITY: 1,
+    CONF_VOICE_ENABLED: False,
+    CONF_VOICE_WAKE_WORD: "okay_nabu",
+    CONF_VOICE_HA_HOST: "",
+}
+
+FETCH_VOICE = "custom_components.brilliant_mqtt.config_flow.async_fetch_voice_payload"
 
 RECONFIG_INPUT = {
     CONF_HOST: "10.100.0.10",
@@ -310,6 +322,142 @@ async def test_not_installed_duplicate_name_aborts(hass: HomeAssistant) -> None:
     result = await hass.config_entries.flow.async_configure(result["flow_id"], MQTT_INPUT)
     result = await hass.config_entries.flow.async_configure(result["flow_id"], SCRIPT_INPUT)
     assert result["type"] == "abort" and result["reason"] == "already_configured"
+
+
+# --- onboarding: voice opt-in ----------------------------------------------
+
+
+async def test_voice_disabled_no_voice_install(hass: HomeAssistant, payload_dir: Path) -> None:
+    """Finishing onboarding with voice_enabled=False stores the flag and skips voice install."""
+    result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": "user"})
+    with patch(PROBE, return_value=_not_installed()):
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], CONNECT_INPUT)
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], MQTT_INPUT)
+
+    install_shell = FakeShell()
+    with (
+        patch.object(config_flow, "AsyncsshShell", return_value=install_shell),
+        patch(FETCH_VOICE) as mock_fetch,
+    ):
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], SCRIPT_INPUT)
+
+    assert result["type"] == "create_entry"
+    data = result["data"]
+    assert data[CONF_VOICE_ENABLED] is False
+    assert data[CONF_VOICE_WAKE_WORD] == "okay_nabu"
+    assert data[CONF_VOICE_HA_HOST] == ""
+    # Voice install was NOT triggered.
+    mock_fetch.assert_not_called()
+    assert not install_shell.file_uploads  # no voice tarball uploaded
+    assert not any("brilliant-voice" in cmd for cmd in install_shell.commands)
+
+
+async def test_voice_enabled_installs_satellite(hass: HomeAssistant, payload_dir: Path) -> None:
+    """Enabling voice installs the satellite and stores all three voice keys in entry data."""
+    result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": "user"})
+    with patch(PROBE, return_value=_not_installed()):
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], CONNECT_INPUT)
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], MQTT_INPUT)
+
+    install_shell = FakeShell()
+    voice_input = {
+        **SCRIPT_INPUT,
+        CONF_VOICE_ENABLED: True,
+        CONF_VOICE_WAKE_WORD: "hey_jarvis",
+        CONF_VOICE_HA_HOST: "192.168.1.10",
+    }
+    fake_tarball = "/tmp/brilliant-voice-payload-0.1.0.tar.gz"
+    with (
+        patch.object(config_flow, "AsyncsshShell", return_value=install_shell),
+        patch(FETCH_VOICE, return_value=fake_tarball),
+    ):
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], voice_input)
+
+    assert result["type"] == "create_entry"
+    data = result["data"]
+    assert data[CONF_VOICE_ENABLED] is True
+    assert data[CONF_VOICE_WAKE_WORD] == "hey_jarvis"
+    assert data[CONF_VOICE_HA_HOST] == "192.168.1.10"
+    # Voice tarball was uploaded via put_file.
+    assert install_shell.file_uploads, "expected voice tarball to be uploaded"
+    voice_upload_paths = [remote for (_local, remote, _mode) in install_shell.file_uploads]
+    assert any("brilliant-voice" in p for p in voice_upload_paths)
+    # Voice service was enabled.
+    assert "systemctl enable --now brilliant-voice" in install_shell.commands
+
+
+async def test_voice_install_failure_shows_error_no_entry(
+    hass: HomeAssistant, payload_dir: Path
+) -> None:
+    """A VoicePayloadError after the agent succeeds shows cannot_install_voice; no entry created."""
+    result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": "user"})
+    with patch(PROBE, return_value=_not_installed()):
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], CONNECT_INPUT)
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], MQTT_INPUT)
+
+    install_shell = FakeShell()
+    voice_input = {**SCRIPT_INPUT, CONF_VOICE_ENABLED: True, CONF_VOICE_WAKE_WORD: "okay_nabu"}
+    with (
+        patch.object(config_flow, "AsyncsshShell", return_value=install_shell),
+        patch(FETCH_VOICE, side_effect=VoicePayloadError("download failed")),
+    ):
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], voice_input)
+
+    assert result["type"] == "form" and result["step_id"] == "script"
+    assert result["errors"] == {"base": "cannot_install_voice"}
+    assert not hass.config_entries.async_entries(DOMAIN)  # nothing was created
+
+
+async def test_agent_install_failure_still_cannot_install(
+    hass: HomeAssistant, payload_dir: Path
+) -> None:
+    """An agent SSH failure still reports cannot_install (not cannot_install_voice)."""
+    result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": "user"})
+    with patch(PROBE, return_value=_not_installed()):
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], CONNECT_INPUT)
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], MQTT_INPUT)
+
+    failing = FakeShell(
+        responses={"systemctl enable --now brilliant-mqtt": RunResult(1, "", "boom")}
+    )
+    with (
+        patch.object(config_flow, "AsyncsshShell", return_value=failing),
+        patch(FETCH_VOICE) as mock_fetch,
+    ):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {**SCRIPT_INPUT, CONF_VOICE_ENABLED: True}
+        )
+    assert result["type"] == "form" and result["step_id"] == "script"
+    assert result["errors"] == {"base": "cannot_install"}
+    # Voice fetch never reached when agent install fails.
+    mock_fetch.assert_not_called()
+    assert not hass.config_entries.async_entries(DOMAIN)
+
+
+async def test_script_step_rejects_control_char_in_voice_ha_host(
+    hass: HomeAssistant, payload_dir: Path
+) -> None:
+    """Bug D: a control char in voice_ha_host re-shows the form with invalid_value and
+    creates NO entry — instead of crashing the flow when render_voice_env → _env_quote
+    raises ValueError (which the voice except does not catch)."""
+    result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": "user"})
+    with patch(PROBE, return_value=_not_installed()):
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], CONNECT_INPUT)
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], MQTT_INPUT)
+
+    bad_input = {**SCRIPT_INPUT, CONF_VOICE_ENABLED: True, CONF_VOICE_HA_HOST: "10.0.0.5\n"}
+    # No SSH/fetch should be reached: the control char is rejected before install.
+    with (
+        patch.object(config_flow, "AsyncsshShell", return_value=FakeShell()) as mock_shell,
+        patch(FETCH_VOICE) as mock_fetch,
+    ):
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], bad_input)
+
+    assert result["type"] == "form" and result["step_id"] == "script"
+    assert result["errors"] == {CONF_VOICE_HA_HOST: "invalid_value"}
+    mock_shell.assert_not_called()
+    mock_fetch.assert_not_called()
+    assert not hass.config_entries.async_entries(DOMAIN)
 
 
 # --- onboarding: already installed (adopt) ---------------------------------
