@@ -5,7 +5,13 @@ from __future__ import annotations
 from homeassistant.const import Platform
 
 DOMAIN = "brilliant_mqtt"
-PLATFORMS: list[Platform] = [Platform.BINARY_SENSOR, Platform.BUTTON, Platform.UPDATE]
+PLATFORMS: list[Platform] = [
+    Platform.BINARY_SENSOR,
+    Platform.BUTTON,
+    Platform.SELECT,
+    Platform.SWITCH,
+    Platform.UPDATE,
+]
 
 # Config entry data keys (one entry per panel; each stores ITS OWN root password).
 CONF_HOST = "host"

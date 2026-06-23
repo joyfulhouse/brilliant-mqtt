@@ -105,6 +105,16 @@
         "name": "Repair bridge"
       }
     },
+    "select": {
+      "voice_wake_word": {
+        "name": "Wake word"
+      }
+    },
+    "switch": {
+      "voice_enabled": {
+        "name": "Voice satellite"
+      }
+    },
     "update": {
       "bridge": {
         "name": "Bridge"
