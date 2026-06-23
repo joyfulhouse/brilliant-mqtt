@@ -29,13 +29,40 @@ def ensure_port_accept(port: int, *, run_nft: NftRunner = _default_run_nft) -> b
     """Idempotently accept inbound ``tcp/<port>`` on the panel filter-input chain.
 
     Returns ``True`` when a rule was added, ``False`` when an identical
-    single-port accept was already present. The presence check matches the whole
-    ``tcp dport <port> accept`` rule so a port inside an existing set (e.g. 22)
-    or a numeric superstring (10700 vs 1070) is never mistaken for our rule.
+    single-port accept was already present.
+
+    The presence check is token-aware per (non-comment) line, not a raw
+    substring: a line must contain the consecutive tokens
+    ``tcp dport <port> accept``.  This way a port inside an existing set
+    (``tcp dport { 22, 6053 } accept``), the same port with a different verb
+    (``tcp dport 6053 drop``), or — the case a broad substring gets WRONG — a
+    *commented-out* rule (``# tcp dport 6053 accept``) is never mistaken for a
+    live single-port accept.  Treating a disabled rule as active would skip the
+    add and leave the port closed (satellite unreachable); a numeric superstring
+    (``10700`` vs ``1070``) is likewise excluded.
     """
-    rule_text = f"tcp dport {port} accept"
     listing = run_nft(["list", "chain", *_TABLE, _CHAIN])
-    if rule_text in listing:
+    if _has_single_port_accept(listing, port):
         return False
     run_nft(["add", "rule", *_TABLE, _CHAIN, "tcp", "dport", str(port), "accept"])
     return True
+
+
+def _has_single_port_accept(listing: str, port: int) -> bool:
+    """True when ``listing`` already has a live ``tcp dport <port> accept`` rule.
+
+    Matches on token boundaries per line: the consecutive tokens
+    ``("tcp", "dport", str(port), "accept")`` must appear in some non-comment
+    line's whitespace-split tokens.  This tolerates nftables' variable spacing
+    while rejecting set members, numeric superstrings, other verbs, and
+    commented-out (disabled) rules.
+    """
+    target = ("tcp", "dport", str(port), "accept")
+    for line in listing.splitlines():
+        if line.lstrip().startswith("#"):
+            continue  # a disabled rule must not count as present
+        tokens = line.split()
+        for i in range(len(tokens) - len(target) + 1):
+            if tuple(tokens[i : i + len(target)]) == target:
+                return True
+    return False

@@ -15,6 +15,7 @@ no-op.
 
 from __future__ import annotations
 
+import unicodedata
 from collections.abc import Callable
 from pathlib import Path
 
@@ -24,6 +25,16 @@ HostsReader = Callable[[], str]
 HostsWriter = Callable[[str], None]
 
 _HOSTS_PATH = Path("/etc/hosts")
+
+
+def _is_control(ch: str) -> bool:
+    """True for a control character (Unicode category ``Cc``, e.g. NUL, DEL).
+
+    ``str.isspace()`` already covers tab/newline/space; this catches the
+    remaining non-printing controls (NUL ``\\x00`` … DEL ``\\x7f``) that are not
+    classed as whitespace but would still corrupt an ``/etc/hosts`` line.
+    """
+    return unicodedata.category(ch) == "Cc"
 
 
 def _default_read() -> str:
@@ -64,8 +75,9 @@ def ensure_host_mapping(
     Raises
     ------
     ValueError
-        When ``spec`` is non-empty but malformed (no ``=``, or either side of
-        the ``=`` is empty after stripping).
+        When ``spec`` is non-empty but malformed: no ``=``; either side of the
+        ``=`` empty after stripping; or either side contains internal whitespace
+        or a control character (which would corrupt the ``/etc/hosts`` line).
     """
     if not spec.strip():
         return False
@@ -81,6 +93,15 @@ def ensure_host_mapping(
         raise ValueError(f"VOICE_HA_HOST spec has empty hostname: {spec!r}")
     if not ip:
         raise ValueError(f"VOICE_HA_HOST spec has empty ip: {spec!r}")
+
+    # Reject internal whitespace or control characters: either would split or
+    # corrupt the appended "ip\thostname" line (e.g. inject a second field or a
+    # newline), so a malformed hand-written VOICE_HA_HOST can never write a bad
+    # /etc/hosts entry.
+    if any(c.isspace() or _is_control(c) for c in hostname):
+        raise ValueError(f"VOICE_HA_HOST hostname has whitespace/control chars: {spec!r}")
+    if any(c.isspace() or _is_control(c) for c in ip):
+        raise ValueError(f"VOICE_HA_HOST ip has whitespace/control chars: {spec!r}")
 
     current = read()
 
