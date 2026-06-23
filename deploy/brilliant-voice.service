@@ -20,6 +20,8 @@ Environment=PYTHONPATH=/var/brilliant-voice/app
 ExecStart=/data/switch-embedded/env/bin/python3 -m brilliant_voice
 Restart=always
 RestartSec=5
+# Creates /run/brilliant-voice (AEC FIFO dir) with correct ownership; auto-cleaned on stop.
+RuntimeDirectory=brilliant-voice
 # Resource caps so always-on wake inference can never starve the touchscreen UI.
 # Nice=5: higher priority than the bridge (Nice=10) but below the panel UI.
 # MemoryMax=300M: headroom for py3.11 LVA + numpy + optional AEC; measure RSS on

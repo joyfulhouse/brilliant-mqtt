@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass, field
+from subprocess import TimeoutExpired
 
 import pytest
 
@@ -190,16 +191,24 @@ class FakeProc:
     _poll_result: int | None = None
     terminate_calls: int = field(default=0, repr=False)
     wait_calls: int = field(default=0, repr=False)
+    kill_calls: int = field(default=0, repr=False)
+    # When True, the first wait() call raises TimeoutExpired; subsequent calls succeed.
+    wait_raises_timeout: bool = field(default=False, repr=False)
 
     def poll(self) -> int | None:
         return self._poll_result
 
     def wait(self, timeout: float | None = None) -> int:
         self.wait_calls += 1
+        if self.wait_raises_timeout and self.wait_calls == 1:
+            raise TimeoutExpired(cmd="fake", timeout=timeout or 5.0)
         return self._poll_result if self._poll_result is not None else 0
 
     def terminate(self) -> None:
         self.terminate_calls += 1
+
+    def kill(self) -> None:
+        self.kill_calls += 1
 
     def make_exit(self, code: int = 0) -> None:
         """Signal that this process has exited."""
@@ -520,3 +529,39 @@ def test_child_specs_types() -> None:
         assert isinstance(spec.name, str)
         assert isinstance(spec.argv, list)
         assert isinstance(spec.env, dict)
+
+
+# ---------------------------------------------------------------------------
+# supervise: SIGKILL fallback when wait() times out on stop
+# ---------------------------------------------------------------------------
+
+
+class TestSuperviseKillFallback:
+    """Verify that a child whose wait() raises TimeoutExpired gets kill()ed."""
+
+    def test_kill_called_after_timeout(self) -> None:
+        # A spawner that always returns a FakeProc configured to time out on
+        # the first wait() call (simulating a child that ignores SIGTERM).
+        lingering_proc: list[FakeProc] = []
+
+        def stubborn_spawn(spec: ChildSpec) -> FakeProc:
+            proc = FakeProc(name=spec.name, wait_raises_timeout=True)
+            lingering_proc.append(proc)
+            return proc
+
+        supervise(
+            [ChildSpec(name="lva", argv=["lva"], env={})],
+            spawn=stubborn_spawn,
+            clock=FakeClock(),
+            sleep=_fake_sleep,
+            keep_running=iter([True, False]).__next__,
+            inter_start_delay=0.0,
+            backoff=5.0,
+        )
+
+        assert len(lingering_proc) == 1
+        proc = lingering_proc[0]
+        assert proc.terminate_calls == 1, "terminate() must have been called"
+        assert proc.kill_calls == 1, "kill() must be called after TimeoutExpired"
+        # wait() should be called at least twice: once timing out, once after kill()
+        assert proc.wait_calls >= 2, "wait() must be called again after kill()"
