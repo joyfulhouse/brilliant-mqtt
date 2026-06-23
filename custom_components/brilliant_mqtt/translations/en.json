@@ -28,11 +28,17 @@
         "description": "Name the panel and set its mesh priority. When you finish, the bridge agent is installed on the panel over SSH and started.",
         "data": {
           "name": "Panel Name",
-          "mesh_priority": "Mesh priority"
+          "mesh_priority": "Mesh priority",
+          "voice_enabled": "Enable voice satellite",
+          "voice_wake_word": "Wake word",
+          "voice_ha_host": "Home Assistant host override (optional)"
         },
         "data_description": {
           "name": "A friendly name, e.g. \"Office Bath\". A lowercase id is derived for MQTT topics (\"Office Bath\" → office-bath).",
-          "mesh_priority": "0 = this panel never publishes the BLE mesh. Among positive values the LOWEST wins leader election (1 = primary, 2/3 = standbys)."
+          "mesh_priority": "0 = this panel never publishes the BLE mesh. Among positive values the LOWEST wins leader election (1 = primary, 2/3 = standbys).",
+          "voice_enabled": "Install a Home Assistant voice satellite on this panel (on-panel wake word + microphone + speaker). Speech-to-text, the conversation agent, and text-to-speech all run in your HA Assist pipeline — nothing voice-specific is configured on the panel.",
+          "voice_wake_word": "The on-panel wake word that activates the satellite.",
+          "voice_ha_host": "Only needed if the panel cannot resolve your Home Assistant URL's hostname (e.g. a segmented IoT VLAN). Format: hostname=ip, e.g. homeassistant.example=10.0.0.5. Leave blank to use the panel's own DNS."
         }
       },
       "reconfigure": {
@@ -57,6 +63,7 @@
       "cannot_read_config": "The agent is installed but its configuration could not be read. Try Reconfigure, or remove and re-add the panel.",
       "cannot_apply": "Connected, but writing the new settings to the panel failed. Check the agent and try Repair.",
       "cannot_install": "Connected, but installing the agent on the panel failed. Check the panel and try again.",
+      "cannot_install_voice": "The bridge agent installed, but installing the voice satellite failed (its payload may not be downloadable yet, or the panel rejected it). Untick \"Enable voice satellite\" to finish without it, or try again.",
       "wrong_panel": "That host already runs a different Brilliant panel's agent. Check the IP — applying here would overwrite and restart the wrong panel.",
       "host_key_changed": "The panel's SSH host key changed since it was added. If this is expected (e.g. the panel was reflashed), remove and re-add the panel to re-pin it. Otherwise it may indicate a man-in-the-middle, so do not proceed until you have confirmed the host."
     },
@@ -107,7 +114,12 @@
     },
     "select": {
       "voice_wake_word": {
-        "name": "Wake word"
+        "name": "Wake word",
+        "state": {
+          "okay_nabu": "Okay Nabu",
+          "hey_jarvis": "Hey Jarvis",
+          "hey_mycroft": "Hey Mycroft"
+        }
       }
     },
     "switch": {
@@ -133,12 +145,19 @@
     },
     "uninstall_failed": {
       "message": "Agent uninstall failed: {error}"
+    },
+    "voice_failed": {
+      "message": "Voice satellite operation failed: {error}"
     }
   },
   "issues": {
     "needs_attention": {
       "title": "Brilliant panel needs attention",
       "description": "Panel `{panel}` needs attention: {reason}. This issue clears automatically once the bridge recovers."
+    },
+    "voice_missing": {
+      "title": "Brilliant panel voice satellite not installed",
+      "description": "Panel `{panel}` has the voice satellite enabled but it isn't running. This issue clears automatically once the satellite is deployed (run Repair, or wait for the next automatic repair)."
     }
   }
 }
