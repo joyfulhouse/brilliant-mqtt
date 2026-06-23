@@ -119,5 +119,6 @@ async def async_unload_entry(hass: HomeAssistant, entry: BrilliantMqttConfigEntr
 
 
 async def async_remove_entry(hass: HomeAssistant, entry: BrilliantMqttConfigEntry) -> None:
-    """Delete the panel's repair issue when its config entry is removed."""
+    """Delete the panel's repair issues when its config entry is removed."""
     ir.async_delete_issue(hass, DOMAIN, f"needs_attention_{entry.entry_id}")
+    ir.async_delete_issue(hass, DOMAIN, f"voice_missing_{entry.entry_id}")
