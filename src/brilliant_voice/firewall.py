@@ -2,10 +2,10 @@
 
 The panel runs an nftables ``inet firewall`` / ``filter-input`` chain with
 ``policy drop`` that accepts only ``tcp dport {22, 5000-5010, 5455-5456, 6455,
-8554}`` and ``>= 32768`` — so the Wyoming satellite port (default 10700) is
+8554}`` and ``>= 32768`` — so the LVA ESPHome native API port (default 6053) is
 silently dropped until we add an explicit accept (live-verified: this, not the
-UniFi zone firewall, is what blocked HA→panel:10700). ``/etc/nftables`` is part
-of the OTA-replaced deployment, so the agent re-applies this rule at every
+UniFi zone firewall, is what blocked HA→panel connections). ``/etc/nftables`` is
+part of the OTA-replaced deployment, so the agent re-applies this rule at every
 startup rather than persisting it on disk.
 """
 
