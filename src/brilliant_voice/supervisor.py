@@ -16,7 +16,7 @@ SITE        = LVA's py3.11 dependencies
 LIBS        = vendored native libs (openblas, libstdc++)
 LVA_DIR     = forked linux_voice_assistant package directory
 AEC_SCRIPT  = aec_daemon.py script
-RUN_DIR     = FIFO directory on tmpfs (created by AEC daemon at start)
+RUN_DIR     = FIFO directory on tmpfs (provided by RuntimeDirectory; daemon makedirs defensively)
 
 Mid-run restart note
 --------------------
@@ -34,6 +34,7 @@ import subprocess
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from subprocess import TimeoutExpired
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
@@ -163,6 +164,8 @@ class Proc(Protocol):
 
     def terminate(self) -> None: ...
 
+    def kill(self) -> None: ...
+
 
 Spawn = Callable[[ChildSpec], Proc]
 
@@ -283,10 +286,17 @@ def supervise(
         except Exception:
             log.exception("error terminating child %s", child.spec.name)
 
-    # Best-effort wait for all children to exit cleanly.
+    # Best-effort wait for all children to exit cleanly; SIGKILL if they linger.
     for child in running:
         try:
             child.proc.wait(timeout=5.0)
+        except TimeoutExpired:
+            log.warning("child %s did not exit after 5 s — sending SIGKILL", child.spec.name)
+            try:
+                child.proc.kill()
+                child.proc.wait()
+            except Exception:
+                log.exception("error killing child %s", child.spec.name)
         except Exception:
             log.exception("error waiting for child %s to exit", child.spec.name)
 

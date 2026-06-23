@@ -67,6 +67,7 @@ def main() -> None:
                         format="%(asctime)s.%(msecs)03d aec %(message)s", datefmt="%H:%M:%S")
 
     for p in (args.ref_fifo, args.clean_fifo):
+        os.makedirs(os.path.dirname(p), exist_ok=True)
         if not os.path.exists(p):
             os.mkfifo(p)
 
