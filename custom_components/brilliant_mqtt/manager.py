@@ -41,12 +41,16 @@ from .const import (
     CONF_MQTT_USERNAME,
     CONF_PANEL,
     CONF_ROOT_PASSWORD,
+    CONF_VOICE_ENABLED,
+    CONF_VOICE_HA_HOST,
+    CONF_VOICE_WAKE_WORD,
     DATA_LAST_FIRMWARE,
     DATA_SSH_HOST_KEY,
     DEFAULT_AUTO_REPAIR,
     DEFAULT_OFFLINE_GRACE_MINUTES,
     DEFAULT_REPAIR_COOLDOWN_MINUTES,
     DEFAULT_TRUST_HOST_KEY_CHANGES,
+    DEFAULT_VOICE_WAKE_WORD,
     DOMAIN,
     EVENT_AGENT_UPDATED,
     EVENT_HOST_KEY_REPINNED,
@@ -61,11 +65,13 @@ from .const import (
     OPT_REPAIR_COOLDOWN_MINUTES,
     OPT_TRUST_HOST_KEY_CHANGES,
     SIGNAL_PANEL_STATE,
+    VOICE_PAYLOAD_VERSION,
     availability_topic,
     meta_topic,
 )
 from .panel_ops import PanelOpError
 from .shell import AsyncsshShell, PanelShell
+from .voice_payload import VoicePayloadError, async_fetch_voice_payload
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -113,6 +119,11 @@ class PanelManager:
     def _issue_id(self) -> str:
         """Stable issue-registry id for this panel's 'needs attention' repair issue."""
         return f"needs_attention_{self.entry.entry_id}"
+
+    @property
+    def _voice_issue_id(self) -> str:
+        """Issue-registry id for 'voice enabled but satellite not running'."""
+        return f"voice_missing_{self.entry.entry_id}"
 
     def _shell(self) -> PanelShell:
         return AsyncsshShell(
@@ -303,6 +314,30 @@ class PanelManager:
             await self.hass.async_add_executor_job((_payload_dir() / "VERSION").read_text)
         ).strip()
 
+    def _voice_env(self) -> str:
+        data = self.entry.data
+        display = self.panel.replace("_", " ").replace("-", " ").title()
+        return panel_ops.render_voice_env(
+            panel=self.panel,
+            name=f"Brilliant {display}",
+            api_port=6053,  # LVA ESPHome API; not exposed per-panel this phase
+            wake_word=data.get(CONF_VOICE_WAKE_WORD, DEFAULT_VOICE_WAKE_WORD),
+            ha_host=data.get(CONF_VOICE_HA_HOST, ""),
+            enable_aec=False,  # AEC ships OFF (barge-in tuning is a follow-up)
+        )
+
+    async def _deploy_voice(self, shell: PanelShell, tarball: str) -> None:
+        """Install/enable the voice satellite on a connected shell (idempotent).
+
+        Deploys the payload only when absent (an OTA wipes /etc but not /var, so the
+        common case just restores the unit/env from the surviving payload).
+        """
+        vstate = await panel_ops.inspect_voice(shell)
+        if not vstate.payload_present:
+            await panel_ops.deploy_voice_payload(shell, tarball, VOICE_PAYLOAD_VERSION)
+        await panel_ops.ensure_voice_config(shell, self._voice_env())
+        await panel_ops.enable_voice(shell)
+
     async def async_repair(self, trigger: str = "manual") -> None:
         """Restore unit/env + enable; recovery is confirmed by the availability LWT."""
         if self._repairing:
@@ -313,6 +348,12 @@ class PanelManager:
         # needs_attention during the recovery window this repair opens.
         self._cancel("_grace_cancel")
         self._fire(EVENT_REPAIR_STARTED, {"trigger": trigger})
+        voice_tarball: str | None = None
+        if self.entry.data.get(CONF_VOICE_ENABLED):
+            try:
+                voice_tarball = await async_fetch_voice_payload(self.hass)
+            except VoicePayloadError as err:
+                _LOGGER.warning("%s: could not fetch voice payload for repair: %s", self.panel, err)
         try:
             async with self._ssh_lock:
                 try:
@@ -357,6 +398,23 @@ class PanelManager:
                         )
                     await panel_ops.ensure_configs(shell, unit, env)
                     await panel_ops.enable_now(shell)
+                    if voice_tarball is not None:
+                        try:
+                            await self._deploy_voice(shell, voice_tarball)
+                        except (OSError, asyncssh.Error, PanelOpError) as err:
+                            _LOGGER.warning("%s: voice repair failed: %s", self.panel, err)
+                            ir.async_create_issue(
+                                self.hass,
+                                DOMAIN,
+                                self._voice_issue_id,
+                                is_fixable=False,
+                                severity=ir.IssueSeverity.WARNING,
+                                translation_key="voice_missing",
+                                translation_placeholders={"panel": self.panel},
+                                learn_more_url="https://github.com/joyfulhouse/brilliant-mqtt/blob/main/docs/ha-integration.md",
+                            )
+                        else:
+                            ir.async_delete_issue(self.hass, DOMAIN, self._voice_issue_id)
                 except (OSError, asyncssh.Error, PanelOpError) as err:
                     # A checked step (mkdir/daemon-reload/systemctl) exited non-zero.
                     # The panel is half-broken; surface it loudly instead of letting
@@ -500,6 +558,84 @@ class PanelManager:
             title="Brilliant MQTT",
             notification_id=f"{EVENT_TYPE}_{self.panel}",
         )
+
+    async def async_set_voice_enabled(self, enabled: bool) -> None:
+        """Enable (deploy+start) or disable (uninstall) the voice satellite on the panel."""
+        tarball: str | None = None
+        if enabled:
+            try:
+                tarball = await async_fetch_voice_payload(self.hass)
+            except VoicePayloadError as err:
+                raise HomeAssistantError(
+                    translation_domain=DOMAIN,
+                    translation_key="voice_failed",
+                    translation_placeholders={"error": str(err)},
+                ) from err
+        async with self._ssh_lock:
+            try:
+                shell = await self._connect_for_repair()
+            except _HostKeyChanged as err:
+                raise HomeAssistantError(
+                    translation_domain=DOMAIN, translation_key="host_key_changed"
+                ) from err
+            except (OSError, asyncssh.Error) as err:
+                raise HomeAssistantError(
+                    translation_domain=DOMAIN,
+                    translation_key="voice_failed",
+                    translation_placeholders={"error": str(err)},
+                ) from err
+            try:
+                if enabled:
+                    assert tarball is not None
+                    await self._deploy_voice(shell, tarball)
+                else:
+                    await panel_ops.uninstall_voice(shell)
+            except (OSError, asyncssh.Error, PanelOpError) as err:
+                raise HomeAssistantError(
+                    translation_domain=DOMAIN,
+                    translation_key="voice_failed",
+                    translation_placeholders={"error": str(err)},
+                ) from err
+            finally:
+                await shell.close()
+        self.hass.config_entries.async_update_entry(
+            self.entry, data={**self.entry.data, CONF_VOICE_ENABLED: enabled}
+        )
+        if not enabled:
+            ir.async_delete_issue(self.hass, DOMAIN, self._voice_issue_id)
+        self._notify()
+
+    async def async_set_voice_wake_word(self, wake_word: str) -> None:
+        """Persist the wake word; push it + restart the satellite if voice is enabled."""
+        self.hass.config_entries.async_update_entry(
+            self.entry, data={**self.entry.data, CONF_VOICE_WAKE_WORD: wake_word}
+        )
+        if self.entry.data.get(CONF_VOICE_ENABLED):
+            async with self._ssh_lock:
+                try:
+                    shell = await self._connect_for_repair()
+                except _HostKeyChanged as err:
+                    raise HomeAssistantError(
+                        translation_domain=DOMAIN, translation_key="host_key_changed"
+                    ) from err
+                except (OSError, asyncssh.Error) as err:
+                    raise HomeAssistantError(
+                        translation_domain=DOMAIN,
+                        translation_key="voice_failed",
+                        translation_placeholders={"error": str(err)},
+                    ) from err
+                try:
+                    await panel_ops.ensure_voice_config(shell, self._voice_env())
+                    await panel_ops.restart_voice(shell)
+                except (OSError, asyncssh.Error, PanelOpError) as err:
+                    raise HomeAssistantError(
+                        translation_domain=DOMAIN,
+                        translation_key="voice_failed",
+                        translation_placeholders={"error": str(err)},
+                    ) from err
+                finally:
+                    await shell.close()
+        self._notify()
 
     async def _recovery_timeout(self, _now: datetime) -> None:
         self._recovery_cancel = None
