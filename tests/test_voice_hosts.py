@@ -69,6 +69,41 @@ def test_empty_ip_raises() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Injection defense: internal whitespace / control chars → ValueError
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        "ha local=1.2.3.4",  # internal space in hostname
+        "ha\tlocal=1.2.3.4",  # internal tab in hostname
+        "ha.local=1.2.3.4 evil.host",  # extra field smuggled into ip side
+        "ha.local=1.2.3.4\t10.0.0.1",  # tab-separated second value in ip side
+        "ha\x00.local=1.2.3.4",  # NUL control char in hostname
+        "ha.local=1.2.3.4\x7f",  # DEL control char in ip
+    ],
+)
+def test_internal_whitespace_or_control_raises(spec: str) -> None:
+    """A hand-written VOICE_HA_HOST with internal whitespace/control chars must
+    be rejected so it can never corrupt the /etc/hosts line."""
+    fh = FakeHosts("127.0.0.1\tlocalhost\n")
+    with pytest.raises(ValueError, match="whitespace/control chars"):
+        ensure_host_mapping(spec, read=fh.read, write=fh.write)
+    # Nothing written — the bad spec never touches the file.
+    assert fh.written == []
+
+
+def test_embedded_newline_in_ip_raises() -> None:
+    """An embedded newline (line-injection attempt) is rejected, not written as a
+    second /etc/hosts line."""
+    fh = FakeHosts("127.0.0.1\tlocalhost\n")
+    with pytest.raises(ValueError, match="whitespace/control chars"):
+        ensure_host_mapping("ha.local=1.2.3.4\nevil 6.6.6.6", read=fh.read, write=fh.write)
+    assert fh.written == []
+
+
+# ---------------------------------------------------------------------------
 # New mapping appended
 # ---------------------------------------------------------------------------
 

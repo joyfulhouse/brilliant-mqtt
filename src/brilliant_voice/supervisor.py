@@ -191,14 +191,6 @@ Sleep = Callable[[float], None]
 KeepRunning = Callable[[], bool]
 
 
-@dataclass
-class _RunningChild:
-    """Tracks a live child process together with its spec."""
-
-    spec: ChildSpec
-    proc: Proc
-
-
 def supervise(
     specs: list[ChildSpec],
     *,
@@ -234,27 +226,31 @@ def supervise(
         log.warning("supervise called with empty spec list — nothing to run")
         return
 
-    # Initial start: launch all children in order with inter-start delays.
-    running: list[_RunningChild] = []
-    for i, spec in enumerate(specs):
-        log.info("starting child %s: %s", spec.name, spec.argv[0])
-        proc = spawn(spec)
-        running.append(_RunningChild(spec=spec, proc=proc))
-        if i < len(specs) - 1:
-            sleep(inter_start_delay)
-
-    # restart_after: keyed by list index; value is the monotonic time after
-    # which the child may be restarted. Set when the child first exits.
-    restart_after: dict[int, float] = {}
-
+    # ``running`` is index-aligned with ``specs``: running[idx] is the live Proc
+    # for specs[idx].  A restart reuses specs[idx] unchanged.  The whole body is
+    # wrapped so the teardown ALWAYS runs — including when a spawn() raises during
+    # the initial start or a restart, which must not orphan already-running
+    # children (the AEC daemon holding the mic, LVA holding the API port).
+    running: list[Proc] = []
     try:
+        # Initial start: launch all children in order with inter-start delays.
+        for i, spec in enumerate(specs):
+            log.info("starting child %s: %s", spec.name, spec.argv[0])
+            running.append(spawn(spec))
+            if i < len(specs) - 1:
+                sleep(inter_start_delay)
+
+        # restart_after: keyed by list index; value is the monotonic time after
+        # which the child may be restarted. Set when the child first exits.
+        restart_after: dict[int, float] = {}
+
         while keep_running():
             sleep(0.1)  # poll cadence — injected sleep makes tests instant
 
             now = clock()
 
-            for idx, child in enumerate(running):
-                rc = child.proc.poll()
+            for idx, proc in enumerate(running):
+                rc = proc.poll()
                 if rc is None:
                     # Child is still running.
                     continue
@@ -263,41 +259,49 @@ def supervise(
                 if idx not in restart_after:
                     log.warning(
                         "child %s exited with code %s; restarting after %.1fs backoff",
-                        child.spec.name,
+                        specs[idx].name,
                         rc,
                         backoff,
                     )
                     restart_after[idx] = now + backoff
 
                 if now >= restart_after[idx]:
-                    log.info("restarting child %s", child.spec.name)
-                    proc = spawn(child.spec)
-                    running[idx] = _RunningChild(spec=child.spec, proc=proc)
+                    log.info("restarting child %s", specs[idx].name)
+                    running[idx] = spawn(specs[idx])
                     del restart_after[idx]
 
     except KeyboardInterrupt:
         log.info("KeyboardInterrupt received — stopping supervisor")
-
-    # Stop: terminate all children (runs on clean stop OR KeyboardInterrupt).
-    log.info("stopping; terminating %d child(ren)", len(running))
-    for child in running:
-        try:
-            child.proc.terminate()
-        except Exception:
-            log.exception("error terminating child %s", child.spec.name)
-
-    # Best-effort wait for all children to exit cleanly; SIGKILL if they linger.
-    for child in running:
-        try:
-            child.proc.wait(timeout=5.0)
-        except TimeoutExpired:
-            log.warning("child %s did not exit after 5 s — sending SIGKILL", child.spec.name)
-            try:
-                child.proc.kill()
-                child.proc.wait()
-            except Exception:
-                log.exception("error killing child %s", child.spec.name)
-        except Exception:
-            log.exception("error waiting for child %s to exit", child.spec.name)
+    finally:
+        _teardown(running, specs)
 
     log.info("supervisor exited cleanly")
+
+
+def _teardown(running: list[Proc], specs: list[ChildSpec]) -> None:
+    """Terminate→wait→SIGKILL every started child, swallowing per-child errors.
+
+    Always runs (clean stop, KeyboardInterrupt, OR a spawn failure) so a partial
+    start never leaves a child orphaned.  ``running`` is index-aligned with
+    ``specs``; only children started so far are present.
+    """
+    log.info("stopping; terminating %d child(ren)", len(running))
+    for idx, proc in enumerate(running):
+        try:
+            proc.terminate()
+        except Exception:
+            log.exception("error terminating child %s", specs[idx].name)
+
+    # Best-effort wait for all children to exit cleanly; SIGKILL if they linger.
+    for idx, proc in enumerate(running):
+        try:
+            proc.wait(timeout=5.0)
+        except TimeoutExpired:
+            log.warning("child %s did not exit after 5 s — sending SIGKILL", specs[idx].name)
+            try:
+                proc.kill()
+                proc.wait()
+            except Exception:
+                log.exception("error killing child %s", specs[idx].name)
+        except Exception:
+            log.exception("error waiting for child %s to exit", specs[idx].name)

@@ -316,6 +316,9 @@ class TestSuperviseInitialStart:
         )
         # The inter-start delay (0.5) must appear before the poll sleep (0.1).
         assert 0.5 in sleep_calls
+        # AEC must be started BEFORE LVA so it can create the FIFOs first — the
+        # whole reason for the delay (it would be pointless in the wrong order).
+        assert spawner.spawn_log == ["aec", "lva"]
 
     def test_empty_specs_is_noop(self) -> None:
         spawner = FakeSpawner()
@@ -565,3 +568,91 @@ class TestSuperviseKillFallback:
         assert proc.kill_calls == 1, "kill() must be called after TimeoutExpired"
         # wait() should be called at least twice: once timing out, once after kill()
         assert proc.wait_calls >= 2, "wait() must be called again after kill()"
+
+
+# ---------------------------------------------------------------------------
+# supervise: a spawn failure must never orphan already-running children
+# ---------------------------------------------------------------------------
+
+
+class TestSuperviseSpawnFailureNoOrphan:
+    """A spawn() that raises (missing/corrupt bundled interpreter, fork failure
+    under MemoryMax) must tear down every child started so far before
+    propagating — otherwise the AEC daemon (mic) or LVA (API port) is orphaned,
+    defeating the no-leak teardown."""
+
+    def test_initial_spawn_failure_terminates_already_started_child(self) -> None:
+        started: list[FakeProc] = []
+
+        def spawn_fail_on_second(spec: ChildSpec) -> FakeProc:
+            # First child (aec) starts fine; second (lva) fails to spawn.
+            if spec.name == "lva":
+                raise OSError("cannot fork under MemoryMax / missing interpreter")
+            proc = FakeProc(name=spec.name)
+            started.append(proc)
+            return proc
+
+        specs = [
+            ChildSpec(name="aec", argv=["aec"], env={}),
+            ChildSpec(name="lva", argv=["lva"], env={}),
+        ]
+
+        # The spawn failure must propagate (systemd Restart=always recovers)…
+        with pytest.raises(OSError, match="cannot fork"):
+            supervise(
+                specs,
+                spawn=spawn_fail_on_second,
+                clock=FakeClock(),
+                sleep=_fake_sleep,
+                keep_running=lambda: True,  # never reached — spawn fails first
+                inter_start_delay=0.0,
+                backoff=5.0,
+            )
+
+        # …but only AFTER the already-running first child was torn down.
+        assert len(started) == 1
+        assert started[0].name == "aec"
+        assert started[0].terminate_calls == 1, "running child must be terminated, not orphaned"
+        assert started[0].wait_calls == 1, "running child must be waited on during teardown"
+
+    def test_restart_spawn_failure_terminates_surviving_child(self) -> None:
+        """If a restart spawn() raises, the OTHER still-running child must be torn
+        down (not orphaned) before the failure propagates."""
+        spawn_count: list[int] = [0]
+        procs: list[FakeProc] = []
+
+        def keep_running() -> bool:
+            return True  # loop until a spawn raises
+
+        def spawning(spec: ChildSpec) -> FakeProc:
+            spawn_count[0] += 1
+            # 1: aec (initial), 2: lva (initial). On lva's RESTART spawn, fail.
+            if spawn_count[0] == 3:
+                raise OSError("restart spawn failed")
+            proc = FakeProc(name=spec.name)
+            # Make LVA exit immediately so it gets restarted; AEC stays alive.
+            if spec.name == "lva":
+                proc.make_exit(1)
+            procs.append(proc)
+            return proc
+
+        specs = [
+            ChildSpec(name="aec", argv=["aec"], env={}),
+            ChildSpec(name="lva", argv=["lva"], env={}),
+        ]
+
+        with pytest.raises(OSError, match="restart spawn failed"):
+            supervise(
+                specs,
+                spawn=spawning,
+                clock=FakeClock(),  # time never advances past backoff=0 → restart immediate
+                sleep=_fake_sleep,
+                keep_running=keep_running,
+                inter_start_delay=0.0,
+                backoff=0.0,
+            )
+
+        # The surviving AEC child (first proc) must have been terminated.
+        aec = procs[0]
+        assert aec.name == "aec"
+        assert aec.terminate_calls == 1, "surviving child must be torn down on restart failure"
