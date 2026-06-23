@@ -4,7 +4,12 @@ Read from environment variables at startup (the ``brilliant-voice.service``
 ``EnvironmentFile``). The single required variable raises ``KeyError`` when
 absent; everything else falls back to the live-verified pilot defaults.
 
-Pure stdlib — no panel imports, no Wyoming/ML imports.
+This agent runs linux-voice-assistant (LVA) as the voice satellite, exposing
+an ESPHome-compatible native API so Home Assistant's ``esphome`` integration
+discovers it as an ``assist_satellite`` entity. LVA coexists with the panel's
+built-in Alexa vassal — no disable required in this phase.
+
+Pure stdlib — no panel imports, no ML imports.
 """
 
 from __future__ import annotations
@@ -29,11 +34,13 @@ class VoiceSettings:
     """Immutable voice-agent configuration sourced from environment variables."""
 
     panel: str
-    # Wyoming satellite the HA Wyoming integration connects IN to. The panel's
-    # nftables host firewall must accept this port (the agent ensures it).
-    satellite_port: int = 10700
-    # Local wyoming-openwakeword service the satellite calls for wake detection.
-    wake_port: int = 10400
+    # HA satellite display name. Derived from the panel slug when VOICE_NAME is
+    # unset; field default must be "" because a default referencing `panel` is
+    # not allowed in a dataclass (field ordering / forward-reference constraint).
+    name: str = ""
+    # LVA ESPHome native API port (HA connects IN to this port).
+    api_port: int = 6053
+    wake_word: str = "okay_nabu"
     # ALSA devices (live-verified on the pilot). Capture uses the panel's own
     # `default` device, which IS Brilliant's tuned wake-word chain:
     #   hw:2 mic -> dsnoop -> LADSPA dcRemove -> amp(x30) -> average-downmix mono
@@ -45,36 +52,51 @@ class VoiceSettings:
     # mixes our playback with the panel's other audio.
     mic_device: str = "default"
     snd_device: str = "plug:dmix_48000"
-    # Wake word: a model bundled with wyoming-openwakeword (dev) or a custom
-    # `.tflite` (production). `enable_wake=False` runs tap-to-talk only.
-    wake_word: str = "hey_jarvis"
-    wake_threshold: float = 0.5
-    enable_wake: bool = True
-    # Stop the built-in Alexa vassal so we own the mic (no double-trigger).
-    disable_alexa: bool = True
+    # AEC (Acoustic Echo Cancellation) via the panel's audio_dsp ctypes package.
+    # Default OFF — only needed for barge-in (continued conversation). When
+    # enabled, the AEC daemon reads the raw 2-mic tap and outputs clean audio.
+    enable_aec: bool = False
+    aec_mic_device: str = "plug:dsnoop_48000"
+    aec_delay_ms: int = 0
+    # AEC algorithm: 0=DSP_WIDGETS, 1=SPEEX, 2=WEBRTC
+    aec_type: int = 1
+    # Optional "hostname=ip" mapping added to /etc/hosts so the panel can
+    # resolve HA's TTS-URL host on segmented networks. Empty = rely on the
+    # panel's own DNS.
+    ha_host: str = ""
     log_level: str = "INFO"
 
     @classmethod
     def from_env(cls) -> VoiceSettings:
         """Construct VoiceSettings from environment variables.
 
-        Required: ``BRILLIANT_PANEL``. Optional: ``VOICE_SATELLITE_PORT``,
-        ``VOICE_WAKE_PORT``, ``VOICE_MIC_DEVICE``, ``VOICE_SND_DEVICE``,
-        ``VOICE_WAKE_WORD``, ``VOICE_WAKE_THRESHOLD``, ``VOICE_ENABLE_WAKE``,
-        ``VOICE_DISABLE_ALEXA``, ``LOG_LEVEL``.
+        Required: ``BRILLIANT_PANEL``. Optional: ``VOICE_NAME``,
+        ``VOICE_API_PORT``, ``VOICE_WAKE_WORD``, ``VOICE_MIC_DEVICE``,
+        ``VOICE_SND_DEVICE``, ``VOICE_ENABLE_AEC``, ``VOICE_AEC_MIC_DEVICE``,
+        ``VOICE_AEC_DELAY_MS``, ``VOICE_AEC_TYPE``, ``VOICE_HA_HOST``,
+        ``LOG_LEVEL``.
 
         Raises ``KeyError`` when ``BRILLIANT_PANEL`` is absent.
         """
         env = os.environ
+
+        # Required — intentionally use direct __getitem__ so KeyError propagates.
+        panel = env["BRILLIANT_PANEL"]
+
+        # Derive the HA satellite display name from the panel slug when unset.
+        name = env.get("VOICE_NAME") or f"Brilliant {panel}"
+
         return cls(
-            panel=env["BRILLIANT_PANEL"],
-            satellite_port=int(env.get("VOICE_SATELLITE_PORT", "10700")),
-            wake_port=int(env.get("VOICE_WAKE_PORT", "10400")),
+            panel=panel,
+            name=name,
+            api_port=int(env.get("VOICE_API_PORT", "6053")),
+            wake_word=env.get("VOICE_WAKE_WORD", "okay_nabu"),
             mic_device=env.get("VOICE_MIC_DEVICE", "default"),
             snd_device=env.get("VOICE_SND_DEVICE", "plug:dmix_48000"),
-            wake_word=env.get("VOICE_WAKE_WORD", "hey_jarvis"),
-            wake_threshold=float(env.get("VOICE_WAKE_THRESHOLD", "0.5")),
-            enable_wake=_env_bool(env, "VOICE_ENABLE_WAKE", True),
-            disable_alexa=_env_bool(env, "VOICE_DISABLE_ALEXA", True),
+            enable_aec=_env_bool(env, "VOICE_ENABLE_AEC", False),
+            aec_mic_device=env.get("VOICE_AEC_MIC_DEVICE", "plug:dsnoop_48000"),
+            aec_delay_ms=int(env.get("VOICE_AEC_DELAY_MS", "0")),
+            aec_type=int(env.get("VOICE_AEC_TYPE", "1")),
+            ha_host=env.get("VOICE_HA_HOST", ""),
             log_level=env.get("LOG_LEVEL", "INFO"),
         )
