@@ -1178,3 +1178,152 @@ async def test_remove_entry_deletes_voice_issue(
     assert await hass.config_entries.async_remove(entry.entry_id)
     await hass.async_block_till_done()
     assert registry.async_get_issue(DOMAIN, voice_issue_id) is None
+
+
+@pytest.mark.allow_lingering_timers
+async def test_repair_voice_prefetch_oserror_is_swallowed_and_repairing_resets(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    payload_dir: Path,
+) -> None:
+    """Bug A: an OSError from the voice pre-fetch during repair must be swallowed and
+    must not wedge _repairing=True forever.
+
+    Exercises BOTH halves of the fix end-to-end via the REAL async_fetch_voice_payload:
+    the cache-read executor job (_read_cached) raises OSError, which the hardened fetch
+    wraps as VoicePayloadError; the pre-fetch (now inside the outer try) catches it,
+    logs, and skips voice. The repair must not raise, must leave _repairing False (the
+    outer finally), and must still complete the agent repair.
+    """
+    shell = _make_voice_shell(payload_present=True)
+    with (
+        patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell),
+        patch(
+            "custom_components.brilliant_mqtt.voice_payload._read_cached",
+            side_effect=OSError("disk read error"),
+        ),
+    ):
+        entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=_voice_entry_data())
+        entry.add_to_hass(hass)
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+        # Must NOT raise even though the pre-fetch's executor file op raised OSError.
+        await entry.runtime_data.async_repair(trigger="button")
+        await hass.async_block_till_done()
+
+    # The mutex was released by the outer finally — not stuck True.
+    assert entry.runtime_data._repairing is False
+    # The agent repair still ran (voice was skipped, not fatal).
+    assert "systemctl enable --now brilliant-mqtt" in shell.commands
+    # Voice was never deployed (pre-fetch failed → tarball None).
+    assert not shell.file_uploads
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_fetch_voice_payload_wraps_oserror_as_voicepayloaderror(
+    hass: HomeAssistant,
+) -> None:
+    """Bug A (part 2): async_fetch_voice_payload raises ONLY VoicePayloadError.
+
+    A raw OSError from the cache-read executor job must be wrapped, so a repair caller can
+    swallow exactly one exception type and never leak an OSError that wedges _repairing.
+    """
+    from custom_components.brilliant_mqtt.voice_payload import (
+        VoicePayloadError,
+        async_fetch_voice_payload,
+    )
+
+    with (
+        patch(
+            "custom_components.brilliant_mqtt.voice_payload._read_cached",
+            side_effect=OSError("disk read error"),
+        ),
+        pytest.raises(VoicePayloadError),
+    ):
+        await async_fetch_voice_payload(hass)
+
+
+async def test_set_voice_wake_word_push_failure_keeps_old_word(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """Bug B: a failed SSH push must NOT persist the new wake word.
+
+    The push (restart_voice) fails with PanelOpError → async_set_voice_wake_word raises
+    HomeAssistantError(voice_failed) and entry.data[CONF_VOICE_WAKE_WORD] stays at the OLD
+    value, so the select keeps showing the word the panel is actually running.
+    """
+    import asyncio
+
+    from homeassistant.exceptions import HomeAssistantError
+
+    from custom_components.brilliant_mqtt.manager import PanelManager
+    from custom_components.brilliant_mqtt.shell import RunResult
+
+    old_word = "okay_nabu"
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="office",
+        data={**_voice_entry_data(), CONF_VOICE_WAKE_WORD: old_word},
+    )
+    entry.add_to_hass(hass)
+
+    shell = _make_voice_shell(payload_present=True)
+    shell.responses["systemctl restart brilliant-voice"] = RunResult(1, "", "restart boom")
+    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+        manager = PanelManager(hass, entry, asyncio.Lock())
+        with pytest.raises(HomeAssistantError) as err:
+            await manager.async_set_voice_wake_word("hey_jarvis")
+    assert err.value.translation_key == "voice_failed"
+    # The push used the NEW word (env rendered with it) ...
+    assert any("/etc/brilliant-voice.env" in p for (p, _d, _m) in shell.uploads)
+    # ... but because the push failed, the persisted word is UNCHANGED.
+    assert entry.data[CONF_VOICE_WAKE_WORD] == old_word
+
+
+async def test_set_voice_enabled_true_clears_stale_voice_issue(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """Bug C: a successful ENABLE clears a pre-existing voice_missing issue.
+
+    After enable the satellite is running, so the "voice enabled but not running" issue
+    must be deleted (previously it was deleted only on the disable path).
+    """
+    import asyncio
+
+    from homeassistant.helpers import issue_registry as ir
+
+    from custom_components.brilliant_mqtt.manager import PanelManager
+
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+
+    # Pre-create the voice issue so we can assert the successful enable clears it.
+    registry = ir.async_get(hass)
+    voice_issue_id = f"voice_missing_{entry.entry_id}"
+    ir.async_create_issue(
+        hass,
+        DOMAIN,
+        voice_issue_id,
+        is_fixable=False,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key="voice_missing",
+        translation_placeholders={"panel": "office"},
+    )
+    assert registry.async_get_issue(DOMAIN, voice_issue_id) is not None
+
+    shell = _make_voice_shell(payload_present=False)
+    with (
+        patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell),
+        patch(_FETCH_PATCH, return_value=_FAKE_TARBALL),
+    ):
+        manager = PanelManager(hass, entry, asyncio.Lock())
+        await manager.async_set_voice_enabled(True)
+
+    assert entry.data[CONF_VOICE_ENABLED] is True
+    assert "systemctl enable --now brilliant-voice" in shell.commands
+    # The stale issue is gone after a successful enable.
+    assert registry.async_get_issue(DOMAIN, voice_issue_id) is None

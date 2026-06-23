@@ -434,6 +434,32 @@ async def test_agent_install_failure_still_cannot_install(
     assert not hass.config_entries.async_entries(DOMAIN)
 
 
+async def test_script_step_rejects_control_char_in_voice_ha_host(
+    hass: HomeAssistant, payload_dir: Path
+) -> None:
+    """Bug D: a control char in voice_ha_host re-shows the form with invalid_value and
+    creates NO entry — instead of crashing the flow when render_voice_env → _env_quote
+    raises ValueError (which the voice except does not catch)."""
+    result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": "user"})
+    with patch(PROBE, return_value=_not_installed()):
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], CONNECT_INPUT)
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], MQTT_INPUT)
+
+    bad_input = {**SCRIPT_INPUT, CONF_VOICE_ENABLED: True, CONF_VOICE_HA_HOST: "10.0.0.5\n"}
+    # No SSH/fetch should be reached: the control char is rejected before install.
+    with (
+        patch.object(config_flow, "AsyncsshShell", return_value=FakeShell()) as mock_shell,
+        patch(FETCH_VOICE) as mock_fetch,
+    ):
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], bad_input)
+
+    assert result["type"] == "form" and result["step_id"] == "script"
+    assert result["errors"] == {CONF_VOICE_HA_HOST: "invalid_value"}
+    mock_shell.assert_not_called()
+    mock_fetch.assert_not_called()
+    assert not hass.config_entries.async_entries(DOMAIN)
+
+
 # --- onboarding: already installed (adopt) ---------------------------------
 
 
