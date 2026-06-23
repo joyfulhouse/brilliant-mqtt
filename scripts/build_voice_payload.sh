@@ -64,7 +64,8 @@ extract_deb() {
   local deb_dir="$TMP/deb_${name%.deb}"
   mkdir -p "$deb_dir"
   curl -fsSL "$url" -o "$deb_dir/${name}"
-  ar x "$deb_dir/${name}" --output="$deb_dir"
+  # cd into the deb's own dir so we don't need GNU-ar's --output flag (BSD/macOS ar lacks it).
+  (cd "$deb_dir" && ar x "$name")
   # data archive may be .tar.xz, .tar.gz, or .tar.zst
   local data_tar
   data_tar="$(find "$deb_dir" -maxdepth 1 -name 'data.tar.*' | head -1)"
@@ -79,11 +80,9 @@ extract_deb "${DEB_GFORTRAN}"
 extract_deb "${DEB_LIBSTDCXX}"
 
 # SONAME symlinks (match what LVA's numpy + tflite wake runtime dlopen via LD_LIBRARY_PATH)
-cd "$DEST/libs"
-ln -sf libopenblas_armv6p-r0.3.13.so  libopenblas.so.0
-ln -sf libgfortran.so.5.0.0            libgfortran.so.5
-ln -sf libstdc++.so.6.0.30             libstdc++.so.6
-cd "$ROOT"
+ln -sf libopenblas_armv6p-r0.3.13.so "$DEST/libs/libopenblas.so.0"
+ln -sf libgfortran.so.5.0.0          "$DEST/libs/libgfortran.so.5"
+ln -sf libstdc++.so.6.0.30           "$DEST/libs/libstdc++.so.6"
 
 # ── 4. LVA fork → lva/ ───────────────────────────────────────────────────────
 echo "==> [4/6] Cloning linux-voice-assistant @ ${LVA_REF}…"
