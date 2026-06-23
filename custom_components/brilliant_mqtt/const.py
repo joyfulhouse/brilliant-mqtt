@@ -54,6 +54,18 @@ AVAILABILITY_ONLINE = "online"
 AVAILABILITY_OFFLINE = "offline"
 
 
+def panel_device_name(slug: str) -> str:
+    """Display name for a panel slug — "office-bath" → "Brilliant Office Bath".
+
+    MUST stay byte-identical to the MQTT-discovery device name the agent publishes
+    (and to the management entities' device name) so both land on ONE device page.
+    Hoisted here so the config flow, the manager's voice env, and the base entity all
+    agree on exactly one transform.
+    """
+    display = slug.replace("_", " ").replace("-", " ").title()
+    return f"Brilliant {display}"
+
+
 def availability_topic(panel: str) -> str:
     """LWT availability topic published by the on-panel agent."""
     return f"brilliant/{panel}/availability"

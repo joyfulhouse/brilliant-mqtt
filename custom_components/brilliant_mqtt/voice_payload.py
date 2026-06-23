@@ -17,7 +17,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.storage import STORAGE_DIR
-from homeassistant.loader import async_get_integration
+from homeassistant.loader import LoaderError, async_get_integration
 
 from .const import DOMAIN, VOICE_PAYLOAD_VERSION, voice_asset_url
 
@@ -59,14 +59,23 @@ async def async_fetch_voice_payload(hass: HomeAssistant) -> str:
     """Return a local path to the voice payload tarball, downloading if needed.
 
     Cached by version: a second call (another panel, a repair) reuses the file.
-    Raises VoicePayloadError on any download failure.
+    Raises ONLY VoicePayloadError on any failure — the cache read/write executor
+    jobs (which can raise OSError) and the integration lookup are wrapped so a repair
+    caller can swallow exactly one exception type and never leak an OSError that would
+    leave it stuck (see manager.async_repair).
     """
     target = _cache_path(hass)
-    cached = await hass.async_add_executor_job(_read_cached, target)
+    try:
+        cached = await hass.async_add_executor_job(_read_cached, target)
+    except OSError as err:
+        raise VoicePayloadError(f"Could not read the cached voice payload: {err}") from err
     if cached is not None:
         return cached
 
-    integration = await async_get_integration(hass, DOMAIN)
+    try:
+        integration = await async_get_integration(hass, DOMAIN)
+    except (LoaderError, OSError) as err:
+        raise VoicePayloadError(f"Could not resolve the integration version: {err}") from err
     url = voice_asset_url(str(integration.version))
     _LOGGER.debug("Downloading voice payload from %s", url)
     session = async_get_clientsession(hass)
@@ -78,4 +87,7 @@ async def async_fetch_voice_payload(hass: HomeAssistant) -> str:
         raise VoicePayloadError(f"Could not download the voice payload from {url}: {err}") from err
     if not data:
         raise VoicePayloadError(f"Voice payload at {url} was empty")
-    return await hass.async_add_executor_job(_write_atomic, target, data)
+    try:
+        return await hass.async_add_executor_job(_write_atomic, target, data)
+    except OSError as err:
+        raise VoicePayloadError(f"Could not write the voice payload cache: {err}") from err

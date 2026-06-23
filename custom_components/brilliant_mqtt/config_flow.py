@@ -48,6 +48,7 @@ from .const import (
     OPT_TRUST_HOST_KEY_CHANGES,
     VOICE_PAYLOAD_VERSION,
     VOICE_WAKE_WORDS,
+    panel_device_name,
 )
 from .shell import AsyncsshShell, PanelShell
 from .voice_payload import VoicePayloadError, async_fetch_voice_payload
@@ -405,6 +406,10 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
                 errors[CONF_NAME] = "reserved_panel"
             elif not slug:
                 errors[CONF_NAME] = "invalid_name"
+            # A control char in the HA host flows into render_voice_env → _env_quote, which
+            # raises ValueError (NOT caught by the voice except below) → the flow would
+            # crash. Reject at the boundary for a friendly per-field message instead.
+            errors.update(_control_char_errors(user_input, (CONF_VOICE_HA_HOST,)))
             if not errors:
                 await self.async_set_unique_id(slug)
                 self._abort_if_unique_id_configured()
@@ -442,10 +447,9 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
                     if user_input[CONF_VOICE_ENABLED]:
                         try:
                             tarball = await async_fetch_voice_payload(self.hass)
-                            display = slug.replace("_", " ").replace("-", " ").title()
                             voice_env = panel_ops.render_voice_env(
                                 panel=slug,
-                                name=f"Brilliant {display}",
+                                name=panel_device_name(slug),
                                 api_port=6053,
                                 wake_word=user_input[CONF_VOICE_WAKE_WORD],
                                 ha_host=user_input[CONF_VOICE_HA_HOST],

@@ -14,7 +14,8 @@ import asyncio
 import json
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -68,6 +69,7 @@ from .const import (
     VOICE_PAYLOAD_VERSION,
     availability_topic,
     meta_topic,
+    panel_device_name,
 )
 from .panel_ops import PanelOpError
 from .shell import AsyncsshShell, PanelShell
@@ -314,14 +316,18 @@ class PanelManager:
             await self.hass.async_add_executor_job((_payload_dir() / "VERSION").read_text)
         ).strip()
 
-    def _voice_env(self) -> str:
+    def _voice_env(self, wake_word: str | None = None) -> str:
+        """Render the voice env. *wake_word* overrides the persisted value so a push can
+        use a NOT-YET-persisted word (async_set_voice_wake_word persists only on success).
+        """
         data = self.entry.data
-        display = self.panel.replace("_", " ").replace("-", " ").title()
         return panel_ops.render_voice_env(
             panel=self.panel,
-            name=f"Brilliant {display}",
+            name=panel_device_name(self.panel),
             api_port=6053,  # LVA ESPHome API; not exposed per-panel this phase
-            wake_word=data.get(CONF_VOICE_WAKE_WORD, DEFAULT_VOICE_WAKE_WORD),
+            wake_word=wake_word
+            if wake_word is not None
+            else data.get(CONF_VOICE_WAKE_WORD, DEFAULT_VOICE_WAKE_WORD),
             ha_host=data.get(CONF_VOICE_HA_HOST, ""),
             enable_aec=False,  # AEC ships OFF (barge-in tuning is a follow-up)
         )
@@ -348,13 +354,20 @@ class PanelManager:
         # needs_attention during the recovery window this repair opens.
         self._cancel("_grace_cancel")
         self._fire(EVENT_REPAIR_STARTED, {"trigger": trigger})
-        voice_tarball: str | None = None
-        if self.entry.data.get(CONF_VOICE_ENABLED):
-            try:
-                voice_tarball = await async_fetch_voice_payload(self.hass)
-            except VoicePayloadError as err:
-                _LOGGER.warning("%s: could not fetch voice payload for repair: %s", self.panel, err)
         try:
+            # Pre-fetch the voice tarball BEFORE taking the SSH lock (the download is slow
+            # and lock-free), but INSIDE this try so its finally always resets _repairing.
+            # async_fetch_voice_payload raises ONLY VoicePayloadError, but keep this defensive:
+            # any escape here would otherwise wedge _repairing=True forever (it is called from
+            # timers/the Repair button).
+            voice_tarball: str | None = None
+            if self.entry.data.get(CONF_VOICE_ENABLED):
+                try:
+                    voice_tarball = await async_fetch_voice_payload(self.hass)
+                except VoicePayloadError as err:
+                    _LOGGER.warning(
+                        "%s: could not fetch voice payload for repair: %s", self.panel, err
+                    )
             async with self._ssh_lock:
                 try:
                     shell = await self._connect_for_repair()
@@ -559,18 +572,14 @@ class PanelManager:
             notification_id=f"{EVENT_TYPE}_{self.panel}",
         )
 
-    async def async_set_voice_enabled(self, enabled: bool) -> None:
-        """Enable (deploy+start) or disable (uninstall) the voice satellite on the panel."""
-        tarball: str | None = None
-        if enabled:
-            try:
-                tarball = await async_fetch_voice_payload(self.hass)
-            except VoicePayloadError as err:
-                raise HomeAssistantError(
-                    translation_domain=DOMAIN,
-                    translation_key="voice_failed",
-                    translation_placeholders={"error": str(err)},
-                ) from err
+    @asynccontextmanager
+    async def _voice_ssh_session(self) -> AsyncIterator[PanelShell]:
+        """One voice SSH op: fleet lock → connect → yield → always close.
+
+        Maps failures to the SAME HomeAssistantError keys both voice methods used —
+        connect host-key rotation → host_key_changed; connect or op (OSError/asyncssh/
+        PanelOpError) → voice_failed — so callers just `async with` and run their ops.
+        """
         async with self._ssh_lock:
             try:
                 shell = await self._connect_for_repair()
@@ -585,11 +594,7 @@ class PanelManager:
                     translation_placeholders={"error": str(err)},
                 ) from err
             try:
-                if enabled:
-                    assert tarball is not None
-                    await self._deploy_voice(shell, tarball)
-                else:
-                    await panel_ops.uninstall_voice(shell)
+                yield shell
             except (OSError, asyncssh.Error, PanelOpError) as err:
                 raise HomeAssistantError(
                     translation_domain=DOMAIN,
@@ -598,43 +603,49 @@ class PanelManager:
                 ) from err
             finally:
                 await shell.close()
+
+    async def async_set_voice_enabled(self, enabled: bool) -> None:
+        """Enable (deploy+start) or disable (uninstall) the voice satellite on the panel."""
+        tarball: str | None = None
+        if enabled:
+            try:
+                tarball = await async_fetch_voice_payload(self.hass)
+            except VoicePayloadError as err:
+                raise HomeAssistantError(
+                    translation_domain=DOMAIN,
+                    translation_key="voice_failed",
+                    translation_placeholders={"error": str(err)},
+                ) from err
+        async with self._voice_ssh_session() as shell:
+            if enabled:
+                assert tarball is not None
+                await self._deploy_voice(shell, tarball)
+            else:
+                await panel_ops.uninstall_voice(shell)
         self.hass.config_entries.async_update_entry(
             self.entry, data={**self.entry.data, CONF_VOICE_ENABLED: enabled}
         )
-        if not enabled:
-            ir.async_delete_issue(self.hass, DOMAIN, self._voice_issue_id)
+        # Clear any stale "voice enabled but not running" issue: after a disable there is
+        # nothing to run, and after a successful enable the satellite IS running — either
+        # way the issue must not linger.
+        ir.async_delete_issue(self.hass, DOMAIN, self._voice_issue_id)
         self._notify()
 
     async def async_set_voice_wake_word(self, wake_word: str) -> None:
-        """Persist the wake word; push it + restart the satellite if voice is enabled."""
+        """Push the wake word + restart the satellite if enabled, THEN persist it.
+
+        Persisting only AFTER a successful push keeps the select and the running panel in
+        agreement: a failed push raises before the entry is updated, so the select still
+        shows the OLD word the panel is actually using. When voice is disabled there is no
+        panel to push to, so just persist.
+        """
+        if self.entry.data.get(CONF_VOICE_ENABLED):
+            async with self._voice_ssh_session() as shell:
+                await panel_ops.ensure_voice_config(shell, self._voice_env(wake_word=wake_word))
+                await panel_ops.restart_voice(shell)
         self.hass.config_entries.async_update_entry(
             self.entry, data={**self.entry.data, CONF_VOICE_WAKE_WORD: wake_word}
         )
-        if self.entry.data.get(CONF_VOICE_ENABLED):
-            async with self._ssh_lock:
-                try:
-                    shell = await self._connect_for_repair()
-                except _HostKeyChanged as err:
-                    raise HomeAssistantError(
-                        translation_domain=DOMAIN, translation_key="host_key_changed"
-                    ) from err
-                except (OSError, asyncssh.Error) as err:
-                    raise HomeAssistantError(
-                        translation_domain=DOMAIN,
-                        translation_key="voice_failed",
-                        translation_placeholders={"error": str(err)},
-                    ) from err
-                try:
-                    await panel_ops.ensure_voice_config(shell, self._voice_env())
-                    await panel_ops.restart_voice(shell)
-                except (OSError, asyncssh.Error, PanelOpError) as err:
-                    raise HomeAssistantError(
-                        translation_domain=DOMAIN,
-                        translation_key="voice_failed",
-                        translation_placeholders={"error": str(err)},
-                    ) from err
-                finally:
-                    await shell.close()
         self._notify()
 
     async def _recovery_timeout(self, _now: datetime) -> None:

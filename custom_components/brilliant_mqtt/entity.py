@@ -7,6 +7,7 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity import Entity
 
+from .const import panel_device_name
 from .manager import PanelManager
 
 
@@ -26,10 +27,9 @@ class BrilliantPanelEntity(Entity):
 
     def __init__(self, manager: PanelManager) -> None:
         self._manager = manager
-        display = manager.panel.replace("_", " ").replace("-", " ").title()
         self._attr_device_info = DeviceInfo(
             identifiers={("mqtt", f"brilliant_panel_{manager.panel}")},
-            name=f"Brilliant {display}",
+            name=panel_device_name(manager.panel),
             manufacturer="Brilliant",
         )
 
