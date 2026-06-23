@@ -36,6 +36,7 @@ class FakeShell:
         self.commands: list[str] = []
         self.uploads: list[tuple[str, bytes, int]] = []
         self.dir_uploads: list[tuple[str, str]] = []
+        self.file_uploads: list[tuple[str, str, int]] = []
 
     def pinned_host_key(self) -> str | None:
         return self._pinned
@@ -74,3 +75,7 @@ class FakeShell:
             # tests can assert nothing destructive ran after a failed upload.
             raise self.put_dir_error
         self.dir_uploads.append((local_dir, remote_dir))
+
+    async def put_file(self, local_path: str, remote_path: str, mode: int) -> None:
+        self._require_connected()
+        self.file_uploads.append((local_path, remote_path, mode))
