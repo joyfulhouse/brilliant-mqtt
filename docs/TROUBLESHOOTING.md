@@ -4,16 +4,37 @@ Common problems with brilliant-mqtt and how to resolve them.
 
 > **Status:** validated against a live pilot panel (2026-06-12).
 
-## Common Issues
+## Enabling Debug Logging
+
+Enable verbose output first — it is the primary diagnostic tool for almost every issue below.
+
+Set `LOG_LEVEL=DEBUG` in `/etc/brilliant-mqtt.env`, then:
+
+```bash
+systemctl restart brilliant-mqtt
+journalctl -u brilliant-mqtt -f
+```
+
+Reset to `LOG_LEVEL=INFO` when done.
+
+---
+
+## Install
 
 ### Entities never appear in Home Assistant
 
-- **Silent ACL denial** is the most likely cause: Mosquitto drops denied
-  publishes without any error. Verify the `brilliant` user's ACL grants
-  `homeassistant/#` (write) and `brilliant/#` (rw).
-- Confirm broker credentials in `/etc/brilliant-mqtt.env` and that the panel
-  VLAN is allowed to reach the broker (`<broker>:1883`).
-- Check the agent is running: `systemctl status brilliant-mqtt` on the panel.
+1. **Check the ACL first** — Mosquitto drops denied publishes silently, with no
+   error to the client. Verify the `brilliant` user has `homeassistant/#` write
+   and `brilliant/#` read+write. See
+   [Configuration → Broker user and ACL](CONFIGURATION.md#broker-user-and-acl)
+   for the required ACL lines.
+2. Confirm broker credentials in `/etc/brilliant-mqtt.env` and that the panel
+   VLAN can reach the broker on port 1883.
+3. Check the agent is running: `systemctl status brilliant-mqtt` on the panel.
+
+---
+
+## Connectivity
 
 ### Entities show as unavailable / panel `offline`
 
@@ -25,103 +46,180 @@ Common problems with brilliant-mqtt and how to resolve them.
 
 ### Commands from HA don't drive the load
 
-- Check the startup log line `reconcile: N devices -> M entities, K command
-  topics subscribed` (`journalctl -u brilliant-mqtt`). If it is missing, the
-  initial reconcile did not complete and no command subscriptions exist; the
-  periodic resync (default 5 min) re-runs reconcile and self-heals.
-- Verify the ACL allows the `brilliant` user to **read** `brilliant/#`
-  (subscriptions to `<...>/set` are silently denied otherwise).
-- Run with `LOG_LEVEL=DEBUG` and watch the full trace: mqtt receipt →
-  translated command → `SetVariableResponse` from the bus.
-- If the light turns on/off by itself right after a command, suspect the
-  panel's own motion logic or an HA automation (e.g. Adaptive Lighting)
-  re-asserting state — not the bridge.
+1. Check the startup log line `reconcile: N devices -> M entities, K command
+   topics subscribed` (`journalctl -u brilliant-mqtt`). If it is missing, the
+   initial reconcile did not complete; the periodic resync (default 5 min)
+   self-heals.
+2. Verify the `brilliant` ACL allows **read** on `brilliant/#` — see
+   [Configuration → Broker user and ACL](CONFIGURATION.md#broker-user-and-acl)
+   for the required rules.
+3. Run with `LOG_LEVEL=DEBUG` and watch the full trace: mqtt receipt →
+   translated command → `SetVariableResponse` from the bus.
+4. If the light turns on/off right after a command, suspect the panel's own
+   motion logic or an HA automation (e.g. Adaptive Lighting) re-asserting
+   state — not the bridge.
+
+---
+
+## Data quality
 
 ### Sensors lag or freeze (power/motion/occupancy stale for minutes)
 
-- The panel lib's notification stream can **die silently** while the process
-  keeps running — pushes stop and even the bridge's bus reads serve a frozen
-  in-process mirror (live pilot finding, 2026-06-12). Three mitigations are
-  built in: a fast scoped poll (`HOT_POLL_SECONDS`, default 2 s) that bounds
-  staleness, a reconnect hook that re-reconciles after bus gaps (look for
-  `bus processor reconnected` warnings in the journal), and a watchdog that
-  rebuilds the session when no push arrives for `BUS_STALE_SECONDS`.
-- If sensors still lag: confirm the deployed code includes the hot poll
-  (`journalctl` shows the version at deploy; `HOT_POLL_SECONDS=0` disables
-  it), then run with `LOG_LEVEL=DEBUG` and watch for `state publish` lines —
-  a healthy bridge emits one within a poll interval of any bus change.
-- A motion entity that never triggers may simply be a PIR that never sees
-  anyone (verify by watching `movement_detected` on the bus); illuminance
-  reads 0 while `enable_lux=0` on the panel (the default everywhere).
+**Why:** The panel bus's notification stream can die silently while the process
+keeps running — pushes stop and bus reads serve a frozen in-process mirror
+(live pilot finding, 2026-06-12).
+
+**Built-in fixes (all on by default):**
+- Hot poll (`HOT_POLL_SECONDS`, default 2 s) bounds staleness — only changed
+  payloads are published.
+- Reconnect hook re-reconciles after bus gaps (look for
+  `bus processor reconnected` warnings in the journal).
+- Stale watchdog (`BUS_STALE_SECONDS`, default 900 s) rebuilds the session
+  when no push arrives.
+
+**If sensors still lag:**
+1. Confirm the deployed version has the hot poll:
+   `journalctl -u brilliant-mqtt | grep version` — `HOT_POLL_SECONDS=0`
+   disables it.
+2. Run `LOG_LEVEL=DEBUG` and watch for `state publish` lines — a healthy bridge
+   emits one within a poll interval of any bus change.
+3. A motion entity that never triggers may simply be a PIR with no activity
+   (verify `movement_detected` on the bus). Illuminance reads `0` while
+   `enable_lux=0` on the panel (the default).
 
 ### Mesh-load motion always reads `off` (or read a stuck `on`)
 
-- A BLE-mesh load's **Motion** `binary_sensor` only reflects live presence
-  while that device's motion-scoring subsystem is enabled. With scoring **off**
-  (`enable_motion_score=0`, the device default) the bus value `movement_detected`
-  is a **frozen latch** that never tracks presence — so the bridge publishes
-  `motion=off` rather than the stale value (live-verified 2026-06-14: with
-  scoring off, mesh sensors latched a permanent `occupied` with nobody home).
-  This is why mesh Motion sensors read `off` out of the box.
-- To get **real** mesh presence on a device: enable its **Motion Score
-  Reporting** switch (`enable_motion_score`; a `config`, disabled-by-default
-  entity — enable it in HA first), then tune the thresholds (also disabled-by-
-  default `number` entities, default high 70 / low 20). `movement_detected`
-  trips when `motion_score` rises above **Motion High Threshold** and clears
-  when it falls below **Motion Low Threshold** — so raise the **low** threshold
-  above the device's idle `motion_score` noise floor (sample it with scoring on;
-  if the idle floor sits above the low threshold the sensor never clears).
-- The panel **faceplate** occupancy sensor is a separate subsystem and is not
-  affected by any of the above.
+**Why:** A BLE-mesh load's **Motion** binary_sensor only reflects live presence
+while the device's motion-scoring subsystem is enabled. With scoring **off**
+(`enable_motion_score=0`, the factory default), `movement_detected` is a frozen
+latch — so the bridge publishes `motion=off` rather than the stale value
+(live-verified 2026-06-14: with scoring off, mesh sensors latched a permanent
+`occupied` with nobody home).
+
+**Fix:** Enable real mesh presence in three steps:
+
+1. In HA, enable the device's **Motion Score Reporting** switch
+   (`enable_motion_score` — a `config`, disabled-by-default entity; enable it
+   in the entity settings first to make it visible).
+2. Enable the **Motion High Threshold** and **Motion Low Threshold** number
+   entities (also disabled by default, 0–100 range).
+3. Tune the thresholds: `movement_detected` trips when `motion_score` rises
+   above **High** and clears when it falls below **Low**. Sample the idle
+   `motion_score` noise floor with scoring on; raise the **Low** threshold
+   above that floor so the sensor clears when the space is empty.
+
+The panel **faceplate** occupancy sensor is a separate subsystem — these steps
+do not affect it.
+
+---
+
+## Advanced
 
 ### Panel load spikes / availability flaps `offline` (reconnect storm)
 
-- Symptom: a panel's `brilliant/<panel>/availability` flips to `offline` (then
-  back) on the broker, the journal floods with `Lost connection to peer` /
-  `Backing off after failed connection` lines (many per second), and the panel
-  load average climbs well above its ~1.0 baseline — yet `systemctl is-active`
-  still shows `active`. The panel bus server (a `uwsgi` vassal) gets briefly
-  saturated, drops the bridge's peer, the lib auto-reconnects aggressively, and
-  each reconnect's re-reconcile feeds the load back in — a self-reinforcing loop
-  (incident 2026-06-13). The stale watchdog does **not** catch this: every
-  reconnect resets its push clock, so the session never looks stale.
-- Built-in fix: the reconnect-storm breaker rebuilds the session (after the
-  supervisor backoff, giving the bus server a breather) once it reconnects
-  `RECONNECT_STORM_THRESHOLD` times within `RECONNECT_STORM_WINDOW_SECONDS`
-  (defaults 20 / 60 s; set the threshold to `0` to disable). Confirm recovery
-  via the broker availability topic returning to `online` and the load draining.
-- If a panel storms repeatedly, the underlying cause is the panel's own
-  switch-embedded stack being overloaded (compare `top`/`uptime` against a
-  healthy panel) — that is an operator/panel issue, not the bridge; the breaker
-  only stops the bridge from amplifying it.
+**Symptom:** `brilliant/<panel>/availability` flips `offline`/`online`
+repeatedly; the journal floods with `Lost connection to peer` / `Backing off
+after failed connection` lines (many per second); panel load climbs well above
+~1.0 baseline — yet `systemctl is-active` still shows `active`.
+
+**Why:** The panel bus server gets briefly saturated, drops the bridge's peer,
+the lib auto-reconnects aggressively, and each reconnect's re-reconcile feeds
+the load back — a self-reinforcing loop. The stale watchdog does not catch it:
+every reconnect resets its push clock so the session never looks stale.
+
+**Built-in fix:** The reconnect-storm breaker rebuilds the session (after a
+supervisor backoff that gives the bus server a breather) once it reconnects
+`RECONNECT_STORM_THRESHOLD` times within `RECONNECT_STORM_WINDOW_SECONDS`
+(defaults: 20 reconnects / 60 s window).
+
+**Confirm recovery:** Watch `brilliant/<panel>/availability` on the broker
+return to `online` and the journal's reconnect rate drop.
+
+**If it storms repeatedly:** The underlying cause is the panel's
+switch-embedded stack being overloaded — compare `top`/`uptime` against a
+healthy panel. The breaker only stops the bridge from amplifying the load; the
+root issue is an operator/panel concern.
 
 ### Bridge broken after a panel firmware update
 
-- Firmware OTA replaces `/data/switch-embedded` — including the closed-source
-  bus libraries the bridge imports. If their API drifted, the bridge can fail
-  at startup. Re-run the read-only PoC smoke checks and re-validate before
-  letting the rest of the fleet update — see
-  [reference/deployment.md](reference/deployment.md).
+Firmware OTA replaces `/data/switch-embedded` — including the closed-source bus
+libraries the bridge imports. If their API changed, the bridge can fail at
+startup.
+
+Re-run the read-only PoC smoke checks and re-validate before letting the rest
+of the fleet update — see [reference/deployment.md](reference/deployment.md).
 
 ### Panel UI feels sluggish
 
-- The unit is resource-capped (`MemoryMax`, `CPUQuota`, `Nice`) precisely so
-  the bridge cannot degrade the touchscreen. If caps were edited, restore them;
-  check `systemctl show brilliant-mqtt | grep -E 'Memory|CPU'`.
+The bridge unit is resource-capped (`MemoryMax`, `CPUQuota`, `Nice`) precisely
+to prevent it from degrading the touchscreen. If the caps were edited, restore
+them:
+
+```bash
+systemctl show brilliant-mqtt | grep -E 'Memory|CPU'
+```
+
+---
+
+## Voice
+
+> For the full voice setup guide, see [voice.md](voice.md).
+
+### Voice satellite not discovered by HA
+
+- The satellite advertises over zeroconf (`_esphomelib._tcp`). Confirm the
+  panel and HA are on the same network segment (or that mDNS is forwarded
+  between VLANs).
+- Port **6053** (`VOICE_API_PORT`) must be reachable from HA to the panel.
+  The integration opens this port in the panel firewall (`nftables`)
+  automatically — if you deployed manually, verify it.
+- Check that the satellite is running: `systemctl status brilliant-voice` on the
+  panel.
+
+### Wake word not detected
+
+- Try a different wake word: `okay_nabu`, `hey_jarvis`, or `hey_mycroft` are
+  bundled. Change it via the **Wake word** select entity on the panel's HA
+  device page (the change restarts the satellite automatically).
+- Confirm the satellite shows **Connected** in HA (*Settings → Voice assistants
+  → [your pipeline] → Satellite*). If it shows Disconnected, see
+  [satellite not discovered](#voice-satellite-not-discovered-by-ha) above.
+
+### No TTS audio / "panel can't reach HA"
+
+The panel must be able to reach your HA host to download TTS audio. If the
+panel is on an IoT VLAN with restricted DNS, set `VOICE_HA_HOST` in
+`/etc/brilliant-voice.env`:
+
+```
+VOICE_HA_HOST=homeassistant.local=10.0.0.5
+```
+
+Format: `hostname=ip`. This adds an `/etc/hosts` entry on the panel so the
+satellite can reach HA's TTS endpoint. The HA integration writes this for you
+when you set **Home Assistant host override** during onboarding.
+
+### `voice_missing` repair issue in HA
+
+This issue is raised when voice is enabled for a panel but the voice payload is
+not running. Press **Repair** in HA — the integration re-downloads the release
+asset from GitHub and re-deploys it over SSH. The GitHub release asset must
+exist for the installed version of brilliant-mqtt; if you are running from
+source or a dev build, deploy the payload manually per
+[deploy/voice/README.md](../deploy/voice/README.md).
+
+---
+
+## Cleanup
 
 ### Removing a panel's entities from HA
 
-- Discovery topics are retained: publish an **empty retained payload** to each
-  `homeassistant/<component>/<unique_id>/config` topic, then stop the unit.
+Discovery topics are retained — they must be explicitly cleared. Publish an
+**empty retained payload** to each
+`homeassistant/<component>/<unique_id>/config` topic, then stop the unit.
+HA removes the entities on the next restart or after the discovery timeout.
 
-## Enabling Debug Logging
-
-Set `LOG_LEVEL=DEBUG` in `/etc/brilliant-mqtt.env`, then:
-
-```bash
-systemctl restart brilliant-mqtt
-journalctl -u brilliant-mqtt -f
-```
+---
 
 ## Getting Help
 
