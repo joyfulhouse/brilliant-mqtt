@@ -8,7 +8,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from . import BrilliantMqttConfigEntry
-from .const import CONF_VOICE_ENABLED
+from .const import COMPONENT_VOICE, CONF_COMPONENTS
 from .entity import BrilliantPanelEntity
 
 # Push-only; toggling serializes panel SSH via the fleet-wide lock in the manager.
@@ -33,7 +33,8 @@ class VoiceSatelliteSwitch(BrilliantPanelEntity, SwitchEntity):
 
     @property
     def is_on(self) -> bool:
-        return bool(self._manager.entry.data.get(CONF_VOICE_ENABLED, False))
+        components = self._manager.entry.data.get(CONF_COMPONENTS, {})
+        return bool(components.get(COMPONENT_VOICE, False))
 
     async def async_turn_on(self, **kwargs: object) -> None:
         await self._manager.async_set_voice_enabled(True)
