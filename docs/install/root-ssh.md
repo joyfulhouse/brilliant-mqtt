@@ -1,9 +1,17 @@
 # Enabling root SSH on a Brilliant panel
 
+> **Read Brilliant's caveats before enabling.** Review the official
+> [RootSSH support article](https://support.brilliant.tech/hc/en-us/articles/23152790775195-RootSSH)
+> first. In short: it is intended for knowledgeable command-line users;
+> changes you make can break updates or functionality; once enabled, the device
+> is **permanently flagged as possibly manipulated** — don't enable it on a
+> device you plan to transfer; Brilliant will never ask you to enable it or to
+> share the credentials.
+
 The bridge runs **on the panel itself** — the message bus it reads is only
-reachable over a local unix socket — so each panel needs root SSH so you can
-deploy and manage the agent. Brilliant ships an **official, supported** way to
-enable it; no jailbreak is needed, but it is opt-in per device.
+reachable over a local unix socket — so each panel needs root SSH to deploy
+and manage the agent. Brilliant ships an **official, supported** way to enable
+it; no jailbreak is needed, but it is opt-in per device.
 
 ## Steps
 
@@ -25,17 +33,17 @@ enable it; no jailbreak is needed, but it is opt-in per device.
    `NumberOfPasswordPrompts=1` makes a wrong password fail fast instead of
    retrying (avoid lockouts).
 
-## Read Brilliant's caveats first
+## Verify
 
-Review the official
-[RootSSH support article](https://support.brilliant.tech/hc/en-us/articles/23152790775195-RootSSH)
-before enabling. In short:
+Confirm SSH is working before you try to deploy:
 
-- It is intended for knowledgeable command-line users.
-- Changes you make can break updates or functionality.
-- Once enabled, the device is **permanently flagged as possibly manipulated** —
-  don't enable it on a device you plan to transfer.
-- Brilliant will never ask you to enable it or to share the credentials.
+```bash
+SSHPASS='<root password>' sshpass -e ssh \
+  -o PreferredAuthentications=password -o PubkeyAuthentication=no \
+  -o NumberOfPasswordPrompts=1 root@<panel-ip> echo OK
+```
+
+A response of `OK` means you're ready to deploy.
 
 ## Treat the panel as production
 

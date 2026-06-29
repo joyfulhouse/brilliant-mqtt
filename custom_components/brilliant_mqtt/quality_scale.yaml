@@ -121,7 +121,7 @@ rules:
 
   parallel-updates:
     status: done
-    comment: PARALLEL_UPDATES = 0 in binary_sensor.py, button.py, and update.py (push-only platforms; SSH is serialized by a fleet-wide lock).
+    comment: PARALLEL_UPDATES = 0 in binary_sensor.py, button.py, update.py, switch.py, and select.py (push-only platforms; SSH is serialized by a fleet-wide lock).
 
   reauthentication-flow:
     status: exempt
@@ -193,7 +193,7 @@ rules:
 
   entity-disabled-by-default:
     status: exempt
-    comment: All three are management entities (health, repair, update) that are always relevant; none are noisy enough to disable by default.
+    comment: All are management/config entities (health, repair, update, voice-satellite switch, wake-word select) that are always relevant; none are noisy enough to disable by default.
 
   entity-translations:
     status: done
@@ -228,8 +228,8 @@ rules:
     comment: asyncssh (the only dependency) is fully async; all panel I/O is awaited.
 
   inject-websession:
-    status: exempt
-    comment: No HTTP — the integration talks to the panel over SSH (asyncssh) and to the broker via HA's mqtt integration, so there is no aiohttp session to inject.
+    status: done
+    comment: The only HTTP is the optional voice-payload download (voice_payload.py), which uses HA's shared session via async_get_clientsession(hass); panel I/O is SSH (asyncssh) and broker I/O is HA's mqtt integration.
 
   strict-typing:
     status: done

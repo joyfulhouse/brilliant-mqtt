@@ -5,7 +5,13 @@ from __future__ import annotations
 from homeassistant.const import Platform
 
 DOMAIN = "brilliant_mqtt"
-PLATFORMS: list[Platform] = [Platform.BINARY_SENSOR, Platform.BUTTON, Platform.UPDATE]
+PLATFORMS: list[Platform] = [
+    Platform.BINARY_SENSOR,
+    Platform.BUTTON,
+    Platform.SELECT,
+    Platform.SWITCH,
+    Platform.UPDATE,
+]
 
 # Config entry data keys (one entry per panel; each stores ITS OWN root password).
 CONF_HOST = "host"
@@ -19,6 +25,10 @@ CONF_MQTT_HOST = "mqtt_host"
 CONF_MQTT_PORT = "mqtt_port"
 CONF_MQTT_USERNAME = "mqtt_username"
 CONF_MQTT_PASSWORD = "mqtt_password"
+# Voice satellite feature keys.
+CONF_VOICE_ENABLED = "voice_enabled"
+CONF_VOICE_WAKE_WORD = "voice_wake_word"
+CONF_VOICE_HA_HOST = "voice_ha_host"
 
 # Internally managed config-entry state (never shown in a config-flow form).
 DATA_SSH_HOST_KEY = "ssh_host_key"  # TOFU-pinned on first successful connect
@@ -44,6 +54,18 @@ AVAILABILITY_ONLINE = "online"
 AVAILABILITY_OFFLINE = "offline"
 
 
+def panel_device_name(slug: str) -> str:
+    """Display name for a panel slug — "office-bath" → "Brilliant Office Bath".
+
+    MUST stay byte-identical to the MQTT-discovery device name the agent publishes
+    (and to the management entities' device name) so both land on ONE device page.
+    Hoisted here so the config flow, the manager's voice env, and the base entity all
+    agree on exactly one transform.
+    """
+    display = slug.replace("_", " ").replace("-", " ").title()
+    return f"Brilliant {display}"
+
+
 def availability_topic(panel: str) -> str:
     """LWT availability topic published by the on-panel agent."""
     return f"brilliant/{panel}/availability"
@@ -54,6 +76,29 @@ def meta_topic(panel: str) -> str:
     return f"brilliant/{panel}/bridge"
 
 
+GITHUB_REPO_SLUG = "joyfulhouse/brilliant-mqtt"
+
+
+def voice_asset_url(integration_version: str) -> str:
+    """GitHub release-asset URL for the voice payload matching this integration release.
+
+    Every release uploads brilliant-voice-payload-<VOICE_PAYLOAD_VERSION>.tar.gz to
+    its own tag, so the asset for the version the user installed always resolves.
+    """
+    return (
+        f"https://github.com/{GITHUB_REPO_SLUG}/releases/download/"
+        f"v{integration_version}/brilliant-voice-payload-{VOICE_PAYLOAD_VERSION}.tar.gz"
+    )
+
+
+# Voice payload version + selectable wake words.
+# Must equal src/brilliant_voice/__init__.py __version__ (a release-workflow guard
+# enforces the match). The integration downloads the matching release asset.
+VOICE_PAYLOAD_VERSION = "0.1.0"
+# Bundled microWakeWord models the wake-word select offers.
+VOICE_WAKE_WORDS = ("okay_nabu", "hey_jarvis", "hey_mycroft")
+DEFAULT_VOICE_WAKE_WORD = "okay_nabu"
+
 # On-panel paths owned by the integration (mirror docs/reference/deployment.md).
 PANEL_VAR_DIR = "/var/brilliant-mqtt"
 PANEL_APP_DIR = f"{PANEL_VAR_DIR}/app"
@@ -63,6 +108,14 @@ PANEL_VERSION_FILE = f"{PANEL_VAR_DIR}/VERSION"
 PANEL_ENV_FILE = "/etc/brilliant-mqtt.env"
 PANEL_UNIT_FILE = "/etc/systemd/system/brilliant-mqtt.service"
 SERVICE_NAME = "brilliant-mqtt"
+
+# On-panel voice paths.
+PANEL_VOICE_VAR_DIR = "/var/brilliant-voice"
+PANEL_VOICE_STAGED_DIR = f"{PANEL_VOICE_VAR_DIR}/system"
+PANEL_VOICE_VERSION_FILE = f"{PANEL_VOICE_VAR_DIR}/VOICE_VERSION"
+PANEL_VOICE_ENV_FILE = "/etc/brilliant-voice.env"
+PANEL_VOICE_UNIT_FILE = "/etc/systemd/system/brilliant-voice.service"
+VOICE_SERVICE_NAME = "brilliant-voice"
 
 EVENT_TYPE = "brilliant_mqtt_event"
 SIGNAL_PANEL_STATE = f"{DOMAIN}_panel_state"  # dispatcher: f"{SIGNAL_PANEL_STATE}_{entry_id}"

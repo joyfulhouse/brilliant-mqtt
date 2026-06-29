@@ -2,35 +2,40 @@
 
 The bridge publishes retained discovery/state and subscribes to command topics,
 so it needs an MQTT broker that **both the panels and Home Assistant can reach**,
-plus a dedicated user. If you already run a broker, just add the user and ACL
-from [Option A](#option-a--standalone-broker-recommended) and skip the rest.
+plus a dedicated user.
 
-## Option A — standalone broker (recommended, especially for many panels)
+If you already run a broker, just add the `brilliant` user and ACL —
+see [Configuration → Broker user and ACL](../CONFIGURATION.md#broker-user-and-acl)
+— then return to [INSTALL.md](../../INSTALL.md).
 
-Any Mosquitto (or compatible) broker works. Create a dedicated user and scope it
-with an ACL:
+> **Mosquitto ACL denials are silent.** If entities or commands never appear,
+> check the ACL first — see [Troubleshooting](../TROUBLESHOOTING.md).
+
+## Option A — standalone broker (recommended)
+
+Any Mosquitto (or compatible) broker works. Create a dedicated user, then add
+the ACL and restart the broker:
 
 ```bash
 mosquitto_passwd -b /etc/mosquitto/passwd brilliant '<password>'
 ```
 
-```
-# /etc/mosquitto/acl
-user brilliant
-topic readwrite brilliant/#
-topic write homeassistant/#
-```
-
 Reference the password and ACL files from `mosquitto.conf` (`password_file` /
-`acl_file`), then restart the broker.
-
-> **Mosquitto ACL denials are silent.** If entities or commands never appear,
-> check the ACL first — see [Troubleshooting](../TROUBLESHOOTING.md).
+`acl_file`). For the full ACL snippet and rationale, see
+[Configuration → Broker user and ACL](../CONFIGURATION.md#broker-user-and-acl).
 
 Connect Home Assistant to the same broker via the MQTT integration
 (*Settings → Devices & Services → Add Integration → MQTT*).
 
-## Option B — no broker yet: Home Assistant's Mosquitto add-on
+### Verify
+
+```bash
+mosquitto_pub -h <broker> -u brilliant -P '<password>' -t test/x -m hi
+```
+
+If it exits without error, the user and connection are working.
+
+## Option B — Home Assistant's Mosquitto add-on
 
 If you run Home Assistant OS or Supervised and don't have a standalone broker,
 use the official **Mosquitto broker** add-on:
@@ -48,14 +53,6 @@ use the official **Mosquitto broker** add-on:
 > Home Assistant **Container/Core** installs don't support add-ons — run any
 > Mosquitto instance ([Option A](#option-a--standalone-broker-recommended)) and
 > connect both Home Assistant and the bridge to it.
-
-## Why the dedicated user and ACL
-
-The bridge only ever needs `brilliant/#` (read+write, its own state/command
-namespace) and `homeassistant/#` (write, for MQTT Discovery configs). Scoping the
-user this way keeps a panel agent from touching unrelated topics. The full topic
-scheme and ACL rationale are in
-[Configuration → Broker user and ACL](../CONFIGURATION.md#broker-user-and-acl).
 
 ---
 

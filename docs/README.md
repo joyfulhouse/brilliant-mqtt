@@ -2,27 +2,32 @@
 
 Documentation for brilliant-mqtt.
 
-| Document | Description |
-|---|---|
-| [ARCHITECTURE.md](ARCHITECTURE.md) | How the bridge is structured and why |
-| [CONFIGURATION.md](CONFIGURATION.md) | Runtime configuration, MQTT topics, broker user/ACL |
-| [TROUBLESHOOTING.md](TROUBLESHOOTING.md) | Common problems and fixes |
-| [DEVELOPMENT.md](DEVELOPMENT.md) | Development environment, quality gates, testing rules |
+## Install
 
-## Installing
-
-Start at the [install overview](../INSTALL.md), which walks the three steps and
-links these focused guides:
+Start at the **[install overview](../INSTALL.md)**, which walks the
+prerequisites checklist and deploy choice, and links these focused guides:
 
 - [install/root-ssh.md](install/root-ssh.md) — enabling Brilliant's official
-  root SSH on a panel, with the caveats to read first.
-- [install/mqtt-broker.md](install/mqtt-broker.md) — standalone Mosquitto or the
-  Home Assistant Mosquitto add-on, plus the dedicated user and ACL.
-- [ha-integration.md](ha-integration.md) — the HACS companion integration that
-  deploys/updates/repairs panels from the HA UI.
+  root SSH on a panel, with caveats and a verify step.
+- [install/mqtt-broker.md](install/mqtt-broker.md) — standalone Mosquitto or
+  the Home Assistant Mosquitto add-on, plus the dedicated user and ACL.
+
+## User guides
+
+- [ha-integration.md](ha-integration.md) — the HACS companion integration:
+  onboarding flow, management entities, services, events, options, and repair.
+- [voice.md](voice.md) — voice satellite: enabling wake word + mic + speaker
+  on a panel, wake word choices, Assist pipeline assignment, and AEC.
+- [CONFIGURATION.md](CONFIGURATION.md) — env vars, MQTT topics, broker user/ACL
+  (the canonical ACL snippet lives here), mesh leader election.
+- [TROUBLESHOOTING.md](TROUBLESHOOTING.md) — problem → fix entries and debug
+  logging.
 
 ## Reference
 
+- [ARCHITECTURE.md](ARCHITECTURE.md) — how the bridge is structured and why.
+- [DEVELOPMENT.md](DEVELOPMENT.md) — development environment, quality gates,
+  testing rules.
 - [reference/message-bus-api.md](reference/message-bus-api.md) — the
   introspected on-box `RPCObserver` / ttypes API the bridge codes against.
 - [reference/deployment.md](reference/deployment.md) — on-panel runtime, OTA

@@ -1,0 +1,36 @@
+[Unit]
+# Reference systemd unit for the on-panel voice satellite supervisor. Supervises
+# the bundled py3.11 linux-voice-assistant (ESPHome-successor, mic + wake + speaker)
+# and, when VOICE_ENABLE_AEC=1, the panel-native py3.10 audio_dsp AEC daemon. The
+# ExecStart interpreter is the panel's own py3.10 (it runs brilliant_voice.supervisor);
+# the supervisor sets each child's own PYTHONPATH / LD_LIBRARY_PATH before spawning.
+# At startup the supervisor also re-applies the nftables accept for the ESPHome API
+# port (default 6053) and the optional /etc/hosts HA-host mapping — both must be
+# re-applied each boot because the panel's nft rules and /etc/hosts live on tmpfs /
+# are OTA-replaced. Lives under /var so it survives OTA; the HA integration
+# re-installs it post-update.
+Description=Brilliant panel voice satellite (Home Assistant ESPHome)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/brilliant-voice.env
+Environment=PYTHONPATH=/var/brilliant-voice/app
+ExecStart=/data/switch-embedded/env/bin/python3 -m brilliant_voice
+Restart=always
+RestartSec=5
+# Creates /run/brilliant-voice (AEC FIFO dir) with correct ownership; auto-cleaned on stop.
+RuntimeDirectory=brilliant-voice
+# Resource caps so always-on wake inference can never starve the touchscreen UI.
+# Nice=5: higher priority than the bridge (Nice=10) but below the panel UI.
+# MemoryMax=300M: headroom for py3.11 LVA + numpy + optional AEC; measure RSS on
+# the pilot and tighten once steady state is known.
+# CPUQuota=100%: tune against measured wake latency on the A9.
+Nice=5
+MemoryMax=300M
+CPUQuota=100%
+OOMScoreAdjust=500
+
+[Install]
+WantedBy=multi-user.target

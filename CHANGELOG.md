@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-06-23
+
+### Added
+
+- **On-panel voice satellite (opt-in, per panel).** A Brilliant panel can now run
+  a Home Assistant **ESPHome voice satellite** — on-panel wake word, microphone
+  capture, and speaker playback — which Home Assistant discovers automatically
+  over zeroconf. Speech-to-text, the conversation agent, and text-to-speech all
+  run in your HA Assist pipeline, so the panel stays backend-agnostic. Enable it
+  per panel during onboarding (a new **Enable voice satellite** toggle, with a
+  **Wake word** choice and an optional Home-Assistant-host override for segmented
+  networks), or later with the **Voice satellite** switch and **Wake word** select
+  on the panel's device. The integration downloads the voice payload from the
+  matching GitHub release asset and installs it over SSH under `/var`
+  (OTA-persistent); the Repair flow redeploys it if it goes missing. Acoustic echo
+  cancellation is bundled but ships **off** — it is needed only for barge-in, and
+  tuning it is a follow-up.
+
 ## [0.2.4] - 2026-06-21
 
 ### Fixed
