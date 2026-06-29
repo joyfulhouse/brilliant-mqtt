@@ -30,6 +30,12 @@ CONF_VOICE_ENABLED = "voice_enabled"
 CONF_VOICE_WAKE_WORD = "voice_wake_word"
 CONF_VOICE_HA_HOST = "voice_ha_host"
 
+# Per-panel component selection (see docs/claude/specs/2026-06-29-component-selection-design.md).
+CONF_COMPONENTS = "components"  # entry data: {component_id: bool}
+COMPONENT_BRIDGE = "bridge"
+COMPONENT_VOICE = "voice"
+COMPONENT_WIFI_WATCHDOG = "wifi_watchdog"
+
 # Internally managed config-entry state (never shown in a config-flow form).
 DATA_SSH_HOST_KEY = "ssh_host_key"  # TOFU-pinned on first successful connect
 DATA_LAST_FIRMWARE = "last_firmware"  # persisted so panel_updated survives HA restarts
