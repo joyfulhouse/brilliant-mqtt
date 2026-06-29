@@ -11,7 +11,11 @@ from homeassistant.loader import async_get_integration
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 from pytest_homeassistant_custom_component.typing import MqttMockHAClient
 
+from custom_components.brilliant_mqtt import async_migrate_entry
 from custom_components.brilliant_mqtt.const import (
+    COMPONENT_BRIDGE,
+    COMPONENT_VOICE,
+    CONF_COMPONENTS,
     CONF_HOST,
     CONF_MESH_PRIORITY,
     CONF_MQTT_HOST,
@@ -20,6 +24,7 @@ from custom_components.brilliant_mqtt.const import (
     CONF_MQTT_USERNAME,
     CONF_PANEL,
     CONF_ROOT_PASSWORD,
+    CONF_VOICE_ENABLED,
     DATA_SSH_HOST_KEY,
     DOMAIN,
 )
@@ -117,3 +122,25 @@ async def test_setup_retries_when_mqtt_unavailable(
         await hass.async_block_till_done()
 
     assert entry.state is ConfigEntryState.SETUP_RETRY
+
+
+async def test_migrate_v1_folds_voice_enabled_into_components(hass: HomeAssistant) -> None:
+    """v1 entry with voice_enabled=True must become v2 with components dict."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        version=1,
+        data={"panel": "office", CONF_VOICE_ENABLED: True},
+    )
+    entry.add_to_hass(hass)
+    assert await async_migrate_entry(hass, entry) is True
+    assert entry.version == 2
+    assert entry.data[CONF_COMPONENTS][COMPONENT_BRIDGE] is True
+    assert entry.data[CONF_COMPONENTS][COMPONENT_VOICE] is True
+
+
+async def test_migrate_v1_no_voice_defaults_components_off(hass: HomeAssistant) -> None:
+    """v1 entry without voice_enabled must produce bridge=True, voice=False."""
+    entry = MockConfigEntry(domain=DOMAIN, version=1, data={"panel": "kitchen"})
+    entry.add_to_hass(hass)
+    assert await async_migrate_entry(hass, entry) is True
+    assert entry.data[CONF_COMPONENTS] == {COMPONENT_BRIDGE: True, COMPONENT_VOICE: False}

@@ -307,7 +307,7 @@ async def _install_voice(
 class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
     """Add one Brilliant panel per entry (detection-first; adopts installed agents)."""
 
-    VERSION = 1
+    VERSION = 2
 
     def __init__(self) -> None:
         # Carried across the not-installed onboarding steps (user → mqtt → script).

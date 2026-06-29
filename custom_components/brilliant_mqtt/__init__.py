@@ -17,7 +17,14 @@ from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.service import async_extract_config_entry_ids
 from homeassistant.helpers.typing import ConfigType
 
-from .const import DOMAIN, PLATFORMS
+from .const import (
+    COMPONENT_BRIDGE,
+    COMPONENT_VOICE,
+    CONF_COMPONENTS,
+    CONF_VOICE_ENABLED,
+    DOMAIN,
+    PLATFORMS,
+)
 from .manager import PanelManager
 
 type BrilliantMqttConfigEntry = ConfigEntry[PanelManager]
@@ -109,6 +116,24 @@ async def async_setup_entry(hass: HomeAssistant, entry: BrilliantMqttConfigEntry
     entry.runtime_data = manager
     await manager.async_setup()
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    return True
+
+
+async def async_migrate_entry(hass: HomeAssistant, entry: BrilliantMqttConfigEntry) -> bool:
+    """v1 -> v2: fold the one-off voice_enabled flag into a components dict.
+
+    Optional components not represented in v1 data are simply omitted (treated as
+    not-selected), so migration never silently installs anything on an existing panel.
+    """
+    if entry.version > 2:
+        return False  # downgrade not supported
+    if entry.version == 1:
+        data = dict(entry.data)
+        data[CONF_COMPONENTS] = {
+            COMPONENT_BRIDGE: True,
+            COMPONENT_VOICE: bool(data.get(CONF_VOICE_ENABLED, False)),
+        }
+        hass.config_entries.async_update_entry(entry, data=data, version=2)
     return True
 
 
