@@ -16,6 +16,9 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from custom_components.brilliant_mqtt import config_flow, panel_ops
 from custom_components.brilliant_mqtt.config_flow import _PanelProbe, _slugify, _WrongPanelError
 from custom_components.brilliant_mqtt.const import (
+    COMPONENT_BRIDGE,
+    COMPONENT_VOICE,
+    CONF_COMPONENTS,
     CONF_HOST,
     CONF_MESH_PRIORITY,
     CONF_MQTT_HOST,
@@ -52,12 +55,12 @@ MQTT_INPUT = {
 SCRIPT_INPUT = {
     CONF_NAME: "Office Bath",
     CONF_MESH_PRIORITY: 1,
-    CONF_VOICE_ENABLED: False,
+    COMPONENT_VOICE: False,
     CONF_VOICE_WAKE_WORD: "okay_nabu",
     CONF_VOICE_HA_HOST: "",
 }
 
-FETCH_VOICE = "custom_components.brilliant_mqtt.config_flow.async_fetch_voice_payload"
+FETCH_VOICE = "custom_components.brilliant_mqtt.components.async_fetch_voice_payload"
 
 RECONFIG_INPUT = {
     CONF_HOST: "10.100.0.10",
@@ -362,7 +365,7 @@ async def test_voice_enabled_installs_satellite(hass: HomeAssistant, payload_dir
     install_shell = FakeShell()
     voice_input = {
         **SCRIPT_INPUT,
-        CONF_VOICE_ENABLED: True,
+        COMPONENT_VOICE: True,
         CONF_VOICE_WAKE_WORD: "hey_jarvis",
         CONF_VOICE_HA_HOST: "192.168.1.10",
     }
@@ -396,7 +399,7 @@ async def test_voice_install_failure_shows_error_no_entry(
     result = await hass.config_entries.flow.async_configure(result["flow_id"], MQTT_INPUT)
 
     install_shell = FakeShell()
-    voice_input = {**SCRIPT_INPUT, CONF_VOICE_ENABLED: True, CONF_VOICE_WAKE_WORD: "okay_nabu"}
+    voice_input = {**SCRIPT_INPUT, COMPONENT_VOICE: True, CONF_VOICE_WAKE_WORD: "okay_nabu"}
     with (
         patch.object(config_flow, "AsyncsshShell", return_value=install_shell),
         patch(FETCH_VOICE, side_effect=VoicePayloadError("download failed")),
@@ -425,7 +428,7 @@ async def test_agent_install_failure_still_cannot_install(
         patch(FETCH_VOICE) as mock_fetch,
     ):
         result = await hass.config_entries.flow.async_configure(
-            result["flow_id"], {**SCRIPT_INPUT, CONF_VOICE_ENABLED: True}
+            result["flow_id"], {**SCRIPT_INPUT, COMPONENT_VOICE: True}
         )
     assert result["type"] == "form" and result["step_id"] == "script"
     assert result["errors"] == {"base": "cannot_install"}
@@ -445,7 +448,7 @@ async def test_script_step_rejects_control_char_in_voice_ha_host(
         result = await hass.config_entries.flow.async_configure(result["flow_id"], CONNECT_INPUT)
     result = await hass.config_entries.flow.async_configure(result["flow_id"], MQTT_INPUT)
 
-    bad_input = {**SCRIPT_INPUT, CONF_VOICE_ENABLED: True, CONF_VOICE_HA_HOST: "10.0.0.5\n"}
+    bad_input = {**SCRIPT_INPUT, COMPONENT_VOICE: True, CONF_VOICE_HA_HOST: "10.0.0.5\n"}
     # No SSH/fetch should be reached: the control char is rejected before install.
     with (
         patch.object(config_flow, "AsyncsshShell", return_value=FakeShell()) as mock_shell,
@@ -743,6 +746,45 @@ async def test_reconfigure_strips_host_whitespace_and_keeps_pin(hass: HomeAssist
     # Stripped → recognized as the SAME host → STORED pin used, not a fresh TOFU.
     assert apply.call_args.kwargs["pinned_key"] == "ssh-ed25519 STORED"
     assert entry.data[CONF_HOST] == "10.100.0.10"  # stored clean
+
+
+# --- component-driven install (Task 6) ------------------------------------
+
+
+async def _drive_flow_to_script(hass: HomeAssistant) -> Any:
+    """Drive connect → broker steps and return the script-step result."""
+    result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": "user"})
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], CONNECT_INPUT)
+    assert result["step_id"] == "broker"
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], MQTT_INPUT)
+    assert result["step_id"] == "script"
+    return result
+
+
+@pytest.mark.asyncio
+async def test_install_step_persists_components(
+    hass: HomeAssistant,
+    not_installed_panel: None,
+    patch_installs: Any,
+) -> None:
+    """Enabling voice alongside bridge installs both and persists the components dict."""
+    result = await _drive_flow_to_script(hass)
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {
+            CONF_NAME: "Office",
+            CONF_MESH_PRIORITY: 0,
+            COMPONENT_VOICE: True,
+            CONF_VOICE_WAKE_WORD: "okay_nabu",
+            CONF_VOICE_HA_HOST: "",
+        },
+    )
+    assert result["type"] == "create_entry"
+    comps = result["data"][CONF_COMPONENTS]
+    assert comps[COMPONENT_BRIDGE] is True
+    assert comps[COMPONENT_VOICE] is True
+    assert patch_installs.called(COMPONENT_BRIDGE)
+    assert patch_installs.called(COMPONENT_VOICE)
 
 
 # --- options ---------------------------------------------------------------
