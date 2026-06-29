@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator, Mapping
 from dataclasses import dataclass, field
+from dataclasses import replace as _dc_replace
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import asyncssh
@@ -13,10 +15,16 @@ import pytest
 from homeassistant.core import HomeAssistant
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.brilliant_mqtt.const import DOMAIN
+from custom_components.brilliant_mqtt import components as _components
+from custom_components.brilliant_mqtt import config_flow as _config_flow
+from custom_components.brilliant_mqtt.config_flow import _PanelProbe
+from custom_components.brilliant_mqtt.const import COMPONENT_BRIDGE, COMPONENT_VOICE, DOMAIN
 from custom_components.brilliant_mqtt.manager import PanelManager
+from custom_components.brilliant_mqtt.shell import PanelShell
 from tests.fakes import FakeShell
 from tests.test_init import ENTRY_DATA
+
+_PROBE_PATH = "custom_components.brilliant_mqtt.config_flow._probe_panel"
 
 # The key an unpinned re-pin connect captures (mirrors the rotated server key).
 REPIN_NEW_KEY = "ssh-ed25519 NEWKEY"
@@ -131,3 +139,57 @@ def manager_with_fake_panel(hass: HomeAssistant) -> Iterator[PanelManager]:
         ),
     ):
         yield PanelManager(hass, entry, asyncio.Lock())
+
+
+@pytest.fixture
+def not_installed_panel() -> Iterator[None]:
+    """Patch the step-1 probe to return a fresh panel (agent not installed, key pinned)."""
+    probe = _PanelProbe(host_key="ssh-ed25519 PINNED", config=None)
+    with patch(_PROBE_PATH, return_value=probe):
+        yield
+
+
+class _PatchInstallsResult:
+    """Tracks which component IDs had install() called."""
+
+    def __init__(self, called_ids: set[str]) -> None:
+        self._called = called_ids
+
+    def called(self, cid: str) -> bool:
+        return cid in self._called
+
+
+@pytest.fixture
+def patch_installs() -> Iterator[_PatchInstallsResult]:
+    """Replace REGISTRY install callables with no-ops; track which IDs were invoked.
+
+    Also patches config_flow.AsyncsshShell so _panel_session does not attempt
+    real SSH — the mocked install functions do not use the shell.
+    """
+    called_ids: set[str] = set()
+
+    def _make_install(
+        cid: str,
+    ) -> Callable[[HomeAssistant, PanelShell, Mapping[str, Any]], Awaitable[None]]:
+        async def install(hass: HomeAssistant, shell: PanelShell, data: Mapping[str, Any]) -> None:
+            called_ids.add(cid)
+
+        return install
+
+    new_registry = {
+        COMPONENT_BRIDGE: _dc_replace(
+            _components.REGISTRY[COMPONENT_BRIDGE],
+            install=_make_install(COMPONENT_BRIDGE),
+        ),
+        COMPONENT_VOICE: _dc_replace(
+            _components.REGISTRY[COMPONENT_VOICE],
+            install=_make_install(COMPONENT_VOICE),
+        ),
+    }
+
+    install_shell = FakeShell()
+    with (
+        patch.dict(_components.REGISTRY, new_registry),
+        patch.object(_config_flow, "AsyncsshShell", return_value=install_shell),
+    ):
+        yield _PatchInstallsResult(called_ids)
