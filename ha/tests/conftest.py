@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -9,8 +10,13 @@ from unittest.mock import patch
 
 import asyncssh
 import pytest
+from homeassistant.core import HomeAssistant
+from pytest_homeassistant_custom_component.common import MockConfigEntry
 
+from custom_components.brilliant_mqtt.const import DOMAIN
+from custom_components.brilliant_mqtt.manager import PanelManager
 from tests.fakes import FakeShell
+from tests.test_init import ENTRY_DATA
 
 # The key an unpinned re-pin connect captures (mirrors the rotated server key).
 REPIN_NEW_KEY = "ssh-ed25519 NEWKEY"
@@ -103,3 +109,25 @@ def expected_lingering_timers(request: pytest.FixtureRequest) -> bool:
     Every other test keeps the harness's strict guard, so a leaked manager timer
     fails loudly instead of hiding here."""
     return request.node.get_closest_marker("allow_lingering_timers") is not None
+
+
+@pytest.fixture
+def manager_with_fake_panel(hass: HomeAssistant) -> Iterator[PanelManager]:
+    """PanelManager wired to a FakeShell with no pre-existing component selection.
+
+    Used by the generic component install/remove tests (Task 4).  Entry data is
+    plain ENTRY_DATA (no CONF_COMPONENTS key) so tests can verify the key is
+    created on first use.  The voice-payload fetch (inside components._voice_install)
+    is patched so no network call is made.
+    """
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    shell = FakeShell()
+    with (
+        patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell),
+        patch(
+            "custom_components.brilliant_mqtt.components.async_fetch_voice_payload",
+            return_value="/tmp/fake-voice.tar.gz",
+        ),
+    ):
+        yield PanelManager(hass, entry, asyncio.Lock())

@@ -19,6 +19,8 @@ from pytest_homeassistant_custom_component.common import (
 from pytest_homeassistant_custom_component.typing import MqttMockHAClient
 
 from custom_components.brilliant_mqtt.const import (
+    COMPONENT_VOICE,
+    CONF_COMPONENTS,
     CONF_VOICE_ENABLED,
     CONF_VOICE_WAKE_WORD,
     DATA_SSH_HOST_KEY,
@@ -26,6 +28,7 @@ from custom_components.brilliant_mqtt.const import (
     EVENT_TYPE,
     OPT_TRUST_HOST_KEY_CHANGES,
 )
+from custom_components.brilliant_mqtt.manager import PanelManager
 from tests.conftest import REPIN_NEW_KEY, RepinShells
 from tests.fakes import FakeShell
 from tests.test_init import ENTRY_DATA
@@ -882,6 +885,9 @@ async def test_agent_update_reports_progress(
 # ---------------------------------------------------------------------------
 
 _FETCH_PATCH = "custom_components.brilliant_mqtt.manager.async_fetch_voice_payload"
+# Patch path for fetch when it runs via components._voice_install (used by the
+# generic async_install_component path that async_set_voice_enabled now delegates to).
+_COMPONENTS_FETCH_PATCH = "custom_components.brilliant_mqtt.components.async_fetch_voice_payload"
 _FAKE_TARBALL = "/tmp/voice.tar.gz"
 
 
@@ -916,15 +922,13 @@ async def test_set_voice_enabled_true_payload_absent_deploys(
     """enable=True when voice payload is absent → tarball uploaded, config written, enabled."""
     import asyncio
 
-    from custom_components.brilliant_mqtt.manager import PanelManager
-
     entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
     entry.add_to_hass(hass)
 
     shell = _make_voice_shell(payload_present=False)
     with (
         patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell),
-        patch(_FETCH_PATCH, return_value=_FAKE_TARBALL),
+        patch(_COMPONENTS_FETCH_PATCH, return_value=_FAKE_TARBALL),
     ):
         manager = PanelManager(hass, entry, asyncio.Lock())
         await manager.async_set_voice_enabled(True)
@@ -937,15 +941,18 @@ async def test_set_voice_enabled_true_payload_absent_deploys(
     assert entry.data[CONF_VOICE_ENABLED] is True
 
 
-async def test_set_voice_enabled_true_payload_present_skips_upload(
+async def test_set_voice_enabled_true_always_deploys(
     hass: HomeAssistant,
     payload_dir: Path,
 ) -> None:
-    """enable=True when voice payload is already present → no tarball upload, but
-    ensure_voice_config + enable_voice still run."""
-    import asyncio
+    """enable=True always fully deploys: tarball uploaded, config written, enabled.
 
-    from custom_components.brilliant_mqtt.manager import PanelManager
+    The generic component install() method does not check presence before deploying —
+    it always installs to ensure idempotency. The "skip-if-present" optimisation lived
+    only in the repair path (_deploy_voice); the component registry install() is a
+    deliberate, unconditional install.
+    """
+    import asyncio
 
     entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
     entry.add_to_hass(hass)
@@ -953,13 +960,13 @@ async def test_set_voice_enabled_true_payload_present_skips_upload(
     shell = _make_voice_shell(payload_present=True)
     with (
         patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell),
-        patch(_FETCH_PATCH, return_value=_FAKE_TARBALL),
+        patch(_COMPONENTS_FETCH_PATCH, return_value=_FAKE_TARBALL),
     ):
         manager = PanelManager(hass, entry, asyncio.Lock())
         await manager.async_set_voice_enabled(True)
 
-    # No tarball upload (deploy_voice_payload was skipped)
-    assert not shell.file_uploads
+    # Tarball IS uploaded (no skip-if-present in the generic install path)
+    assert any(src == _FAKE_TARBALL for (src, _dst, _mode) in shell.file_uploads)
     # Config + enable still ran
     assert any("/etc/brilliant-voice.env" in p for (p, _d, _m) in shell.uploads)
     assert "systemctl enable --now brilliant-voice" in shell.commands
@@ -974,8 +981,6 @@ async def test_set_voice_enabled_false_uninstalls(
     import asyncio
 
     from homeassistant.helpers import issue_registry as ir
-
-    from custom_components.brilliant_mqtt.manager import PanelManager
 
     entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=_voice_entry_data())
     entry.add_to_hass(hass)
@@ -1296,8 +1301,6 @@ async def test_set_voice_enabled_true_clears_stale_voice_issue(
 
     from homeassistant.helpers import issue_registry as ir
 
-    from custom_components.brilliant_mqtt.manager import PanelManager
-
     entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
     entry.add_to_hass(hass)
 
@@ -1318,7 +1321,7 @@ async def test_set_voice_enabled_true_clears_stale_voice_issue(
     shell = _make_voice_shell(payload_present=False)
     with (
         patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell),
-        patch(_FETCH_PATCH, return_value=_FAKE_TARBALL),
+        patch(_COMPONENTS_FETCH_PATCH, return_value=_FAKE_TARBALL),
     ):
         manager = PanelManager(hass, entry, asyncio.Lock())
         await manager.async_set_voice_enabled(True)
@@ -1327,3 +1330,27 @@ async def test_set_voice_enabled_true_clears_stale_voice_issue(
     assert "systemctl enable --now brilliant-voice" in shell.commands
     # The stale issue is gone after a successful enable.
     assert registry.async_get_issue(DOMAIN, voice_issue_id) is None
+
+
+# ---------------------------------------------------------------------------
+# Generic component install / remove
+# ---------------------------------------------------------------------------
+
+
+async def test_install_component_records_selection(
+    manager_with_fake_panel: PanelManager,
+) -> None:
+    """async_install_component sets CONF_COMPONENTS[id]=True in entry data."""
+    mgr = manager_with_fake_panel
+    await mgr.async_install_component(COMPONENT_VOICE)
+    assert mgr.entry.data[CONF_COMPONENTS][COMPONENT_VOICE] is True
+
+
+async def test_remove_component_clears_selection(
+    manager_with_fake_panel: PanelManager,
+) -> None:
+    """async_remove_component sets CONF_COMPONENTS[id]=False in entry data."""
+    mgr = manager_with_fake_panel
+    await mgr.async_install_component(COMPONENT_VOICE)
+    await mgr.async_remove_component(COMPONENT_VOICE)
+    assert mgr.entry.data[CONF_COMPONENTS][COMPONENT_VOICE] is False
