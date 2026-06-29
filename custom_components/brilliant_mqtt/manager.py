@@ -34,6 +34,8 @@ from . import panel_ops
 from .const import (
     AVAILABILITY_OFFLINE,
     AVAILABILITY_ONLINE,
+    COMPONENT_VOICE,
+    CONF_COMPONENTS,
     CONF_HOST,
     CONF_MESH_PRIORITY,
     CONF_MQTT_HOST,
@@ -604,24 +606,78 @@ class PanelManager:
             finally:
                 await shell.close()
 
-    async def async_set_voice_enabled(self, enabled: bool) -> None:
-        """Enable (deploy+start) or disable (uninstall) the voice satellite on the panel."""
-        tarball: str | None = None
-        if enabled:
+    async def _set_component_flag(self, component_id: str, enabled: bool) -> None:
+        """Persist a component's selected state into entry data."""
+        components = dict(self.entry.data.get(CONF_COMPONENTS, {}))
+        components[component_id] = enabled
+        self.hass.config_entries.async_update_entry(
+            self.entry, data={**self.entry.data, CONF_COMPONENTS: components}
+        )
+
+    async def async_install_component(self, component_id: str) -> None:
+        """SSH-install a component, then record it as selected.
+
+        ``components.py`` imports ``manager`` at module top level, so REGISTRY is
+        imported lazily inside this method to avoid a circular import.
+        """
+        from .components import REGISTRY  # lazy: components imports manager
+
+        component = REGISTRY[component_id]
+        async with self._ssh_lock:
+            shell = await self._connect_for_repair()
             try:
-                tarball = await async_fetch_voice_payload(self.hass)
-            except VoicePayloadError as err:
-                raise HomeAssistantError(
-                    translation_domain=DOMAIN,
-                    translation_key="voice_failed",
-                    translation_placeholders={"error": str(err)},
-                ) from err
-        async with self._voice_ssh_session() as shell:
+                await component.install(self.hass, shell, self.entry.data)
+            finally:
+                await shell.close()
+        await self._set_component_flag(component_id, True)
+        self._notify()
+
+    async def async_remove_component(self, component_id: str) -> None:
+        """SSH-remove a component, then clear its selection.
+
+        ``components.py`` imports ``manager`` at module top level, so REGISTRY is
+        imported lazily inside this method to avoid a circular import.
+        """
+        from .components import REGISTRY  # lazy: components imports manager
+
+        component = REGISTRY[component_id]
+        async with self._ssh_lock:
+            shell = await self._connect_for_repair()
+            try:
+                await component.remove(shell)
+            finally:
+                await shell.close()
+        await self._set_component_flag(component_id, False)
+        self._notify()
+
+    async def async_set_voice_enabled(self, enabled: bool) -> None:
+        """Enable (deploy+start) or disable (uninstall) the voice satellite on the panel.
+
+        Delegates the SSH operation to the generic component methods, then applies
+        voice-specific persistence:
+        - ``CONF_VOICE_ENABLED`` (legacy field that switch.py reads for is_on state).
+        - Clearing the ``voice_missing_<entry_id>`` repair issue on success.
+
+        Errors from the SSH layer or the voice-payload fetch are mapped to the same
+        ``HomeAssistantError`` keys the voice switch has always expected, so the switch
+        still surfaces failures correctly.
+        """
+        try:
             if enabled:
-                assert tarball is not None
-                await self._deploy_voice(shell, tarball)
+                await self.async_install_component(COMPONENT_VOICE)
             else:
-                await panel_ops.uninstall_voice(shell)
+                await self.async_remove_component(COMPONENT_VOICE)
+        except _HostKeyChanged as err:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN, translation_key="host_key_changed"
+            ) from err
+        except (VoicePayloadError, OSError, asyncssh.Error, PanelOpError) as err:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="voice_failed",
+                translation_placeholders={"error": str(err)},
+            ) from err
+        # Legacy persistence: switch.py reads CONF_VOICE_ENABLED for is_on state.
         self.hass.config_entries.async_update_entry(
             self.entry, data={**self.entry.data, CONF_VOICE_ENABLED: enabled}
         )
@@ -629,6 +685,8 @@ class PanelManager:
         # nothing to run, and after a successful enable the satellite IS running — either
         # way the issue must not linger.
         ir.async_delete_issue(self.hass, DOMAIN, self._voice_issue_id)
+        # Second notify so entities see the updated CONF_VOICE_ENABLED (the first notify
+        # was fired inside async_install/remove_component after CONF_COMPONENTS updated).
         self._notify()
 
     async def async_set_voice_wake_word(self, wake_word: str) -> None:
