@@ -14,29 +14,24 @@ panel's own internal message bus.
 
 > **Which Brilliant?** This integration is for **Brilliant Smart Home Control** — the in-wall touchscreen control panels (1–4 switch and plug-in models) made by **Brilliant NextGen, Inc.** ([brilliant.tech](https://www.brilliant.tech), San Mateo, CA). It is **not** affiliated with the Australian **"Brilliant Smart"** lighting brand (smart plugs/bulbs/cameras) or any other "Brilliant" product. It replaces the panel's HomeKit-Controller path with a local MQTT / Home Assistant bridge.
 
-> **Status:** implemented and **verified live on real hardware**: HA
-> discovery, telemetry, bidirectional control, and LWT/auto-restart all
-> exercised against a production panel, broker, and Home Assistant. Agents
-> start at [CLAUDE.md](CLAUDE.md), humans at [docs/](docs/README.md).
+## Start here
+
+| What you want to do | Where to go |
+|---|---|
+| Install the bridge | **[INSTALL.md](INSTALL.md)** |
+| Add via HACS (recommended) | **[docs/ha-integration.md](docs/ha-integration.md)** |
+| Enable voice satellite | **[docs/voice.md](docs/voice.md)** |
+| Browse all docs | **[docs/README.md](docs/README.md)** |
 
 ## What It Does
 
-An on-panel Python 3.10 agent connects to the panel's internal Apache Thrift
-message bus — the same bus Brilliant's own HomeKit bridge is a client of — and
-mirrors device state to the home's central MQTT broker as Home Assistant
-MQTT-Discovery entities, translating HA commands back into bus calls. It
-replaces the unreliable HomeKit Controller path (entities stuck in
-`setup_retry`, lost across HA restarts) with robust local read + control.
-
-The panels expose no public API, no maintained HA integration, and no Matter,
-so this is built from first principles on the panel's own client library — see
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+- An on-panel Python agent connects to the **panel's own internal message bus** — the same bus Brilliant's HomeKit bridge uses — and mirrors state to your MQTT broker as **Home Assistant MQTT-Discovery entities**.
+- HA commands translate back into bus calls, giving you bidirectional control, live power monitoring, and full panel internals (screen, mic, volumes, occupancy…).
+- The bridge runs on the panel itself (Python 3.10, resource-capped systemd unit in `/var`) so it **survives firmware OTA** and co-exists with the panel's built-in Alexa and HomeKit.
 
 ## Why this over HomeKit Controller?
 
-Brilliant panels *can* be paired into Home Assistant via **HomeKit Controller**,
-but that path is fragile and shallow. This bridge taps the panel's own message
-bus directly and publishes everything as native MQTT-Discovery entities:
+Brilliant panels can pair into Home Assistant via **HomeKit Controller**, but that path is fragile and shallow. This bridge taps the panel's own bus directly:
 
 | | HomeKit Controller | brilliant-mqtt |
 |---|---|---|
@@ -55,53 +50,56 @@ HomeKit paired as a fallback** while migrating automations onto the MQTT entitie
 
 ## Features
 
-As implemented and verified live on real panels:
+### Reliability
+- Auto-reconnecting bus client with post-reconnect re-reconcile
+- Fast diff-publishing state poll (~2 s worst-case staleness even if bus pushes silently die)
+- Stale-stream watchdog + reconnect-storm circuit breaker
+- Retained discovery + state so HA restarts recover instantly
 
-- Live state: full `get_all()` snapshot plus push notifications, published as
-  retained MQTT state.
-- HA MQTT Discovery: entities appear automatically, grouped per panel, with
-  availability/LWT.
-- Bidirectional control: HA light/switch commands (including brightness
-  scaling) drive the physical loads.
-- Whole-home power monitoring: live per-circuit wattage (including always-on
-  gangs), dimmer temperatures, and fault sensors.
-- Panel controls and presence: microphone mute, screen on/brightness, volumes,
-  night mode, child lock, identify, panel-in-use occupancy, camera/privacy
-  state, and Wi-Fi diagnostics — tidied with HA entity categories.
-- BLE mesh loads: Brilliant plug-in switches and mesh dimmers house-wide,
-  published by a single elected panel (priority-based MQTT leader election
-  with heartbeat failover) — one stable set of HA entities, no per-panel
-  duplicates, no single point of failure.
-- Reliability first: auto-reconnecting bus client with post-reconnect
-  re-reconcile, a fast diff-publishing state poll (~2 s worst-case staleness
-  even if bus pushes silently die), a stale-stream watchdog, periodic full
-  re-sync, and retained discovery + state so HA restarts recover instantly.
-- Panel-safe: resource-capped systemd unit in `/var`, surviving firmware OTA;
-  HomeKit stays paired as fallback.
+### Visibility
+- Full snapshot (`get_all()`) plus push notifications, published as retained MQTT state
+- HA MQTT Discovery: entities appear automatically, grouped per panel, with availability/LWT
+- Whole-home power monitoring: live per-circuit wattage (including always-on gangs), dimmer temperatures, and fault sensors
+- Panel controls and presence: mic mute, screen on/brightness, volumes, night mode, child lock, identify, panel-in-use occupancy, camera/privacy state, Wi-Fi diagnostics
+
+### Control
+- Bidirectional: HA light/switch commands (including brightness scaling) drive the physical loads
+- BLE mesh loads: plug-in switches and mesh dimmers house-wide published by a single elected panel (priority-based MQTT leader election with heartbeat failover) — one stable set of HA entities, no per-panel duplicates, no single point of failure
+
+### Voice satellite (opt-in)
+Turn any panel into a **local wake-word voice satellite** — on-panel microphone,
+speaker, and wake word; STT, conversation agent, and TTS run in your own HA
+Assist pipeline. Enable per panel during onboarding or from the panel's device
+page. See **[docs/voice.md](docs/voice.md)**.
+
+For the full entity list and configuration options, see [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
 
 ## Installation
 
-See **[INSTALL.md](INSTALL.md)** for the complete guide, including enabling
-**root SSH** on the panel (an official, opt-in Brilliant feature) and **MQTT
-broker setup** (standalone, or Home Assistant's Mosquitto add-on if you have no
-broker). The bridge deploys to each panel either via the companion integration
-below or the documented manual path.
+Two ways to deploy and manage the agent:
+
+| Option | Best for | Guide |
+|---|---|---|
+| **HACS companion integration** *(recommended)* | Most users — guided onboarding, auto-repair after OTA, one-click updates, voice satellite | [docs/ha-integration.md](docs/ha-integration.md) |
+| **Manual deploy** | No Home Assistant, or shell/Ansible preference | [deploy/README.md](deploy/README.md) |
+
+**Start here: [INSTALL.md](INSTALL.md)** — prerequisites checklist, broker setup, then the deploy choice above.
 
 [![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=joyfulhouse&repository=brilliant-mqtt&category=integration)
 
-## Home Assistant companion integration
+## Documentation
 
-An optional **HACS custom integration** manages the agent's lifecycle across
-your fleet from the Home Assistant UI — first deploy to a panel, version
-**updates** (OTA), automatic **repair** after a panel firmware update, and
-removal — while the devices themselves stay native MQTT-Discovery entities
-published by the agent. Install it via HACS (custom repository
-`joyfulhouse/brilliant-mqtt`, category Integration) or the release zip; add one
-panel per config entry (per-panel root password, TOFU host-key pinning).
+| Document | What |
+|---|---|
+| [docs/README.md](docs/README.md) | Documentation index |
+| [INSTALL.md](INSTALL.md) | Full installation guide |
+| [docs/ha-integration.md](docs/ha-integration.md) | HACS integration — onboarding, updates, repair |
+| [docs/voice.md](docs/voice.md) | Voice satellite guide |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | How the bridge works and why |
+| [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | Env vars, MQTT topics, broker ACL |
+| [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Common problems and fixes |
 
-See **[docs/ha-integration.md](docs/ha-integration.md)** for the full guide.
-
-## Quick Start (development)
+## Development
 
 ```bash
 git clone https://github.com/joyfulhouse/brilliant-mqtt.git
@@ -110,24 +108,12 @@ uv sync
 uv run ruff check && uv run mypy --strict src tests && uv run pytest
 ```
 
+See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md). Python 3.10 (panel-locked), uv,
+ruff, mypy --strict, pytest; TDD with all bus/broker I/O behind Protocol seams
+so the unit suite runs on any machine.
+
 Implementation agents: read [CLAUDE.md](CLAUDE.md) for the required reading
 order, the non-negotiables, and what remains of the plan.
-
-## Documentation
-
-| Document | What |
-|---|---|
-| [docs/README.md](docs/README.md) | Documentation index |
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | How the bridge works and why |
-| [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | Env contract, MQTT topics, broker ACL |
-| [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Common problems and fixes |
-| [INSTALL.md](INSTALL.md) | Full installation guide |
-
-## Development
-
-See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md). Python 3.10 (panel-locked),
-uv, ruff, mypy --strict, pytest; TDD with all bus/broker I/O behind Protocol
-seams so the unit suite runs on any machine.
 
 ## Support
 

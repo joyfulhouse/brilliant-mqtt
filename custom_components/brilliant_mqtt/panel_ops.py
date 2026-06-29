@@ -16,13 +16,23 @@ from .const import (
     PANEL_UNIT_FILE,
     PANEL_VAR_DIR,
     PANEL_VERSION_FILE,
+    PANEL_VOICE_ENV_FILE,
+    PANEL_VOICE_STAGED_DIR,
+    PANEL_VOICE_UNIT_FILE,
+    PANEL_VOICE_VAR_DIR,
+    PANEL_VOICE_VERSION_FILE,
     SERVICE_NAME,
+    VOICE_SERVICE_NAME,
 )
 from .shell import PanelShell, RunResult
 
 _STAGING_DIR = f"{PANEL_VAR_DIR}.staging"
 _STAGED_UNIT = f"{PANEL_STAGED_DIR}/{SERVICE_NAME}.service"
 _STAGED_ENV = f"{PANEL_STAGED_DIR}/{SERVICE_NAME}.env"
+
+_VOICE_STAGING_DIR = f"{PANEL_VOICE_VAR_DIR}.staging"
+_VOICE_STAGING_TARBALL = f"{PANEL_VOICE_VAR_DIR}.staging.tar.gz"
+_VOICE_STAGED_ENV = f"{PANEL_VOICE_STAGED_DIR}/{VOICE_SERVICE_NAME}.env"
 
 
 class PanelOpError(RuntimeError):
@@ -278,4 +288,139 @@ async def uninstall(shell: PanelShell) -> None:
     await shell.run(f"systemctl disable --now {SERVICE_NAME} 2>/dev/null || true")
     await _checked(shell, f"rm -f {PANEL_UNIT_FILE} {PANEL_ENV_FILE}")
     await _checked(shell, f"rm -rf {PANEL_VAR_DIR} {_STAGING_DIR}")
+    await _checked(shell, "systemctl daemon-reload")
+
+
+# ---------------------------------------------------------------------------
+# Voice satellite recipes
+# ---------------------------------------------------------------------------
+
+VOICE_INSPECT_COMMAND = (
+    f"test -f {PANEL_VOICE_UNIT_FILE} && echo unit=1 || echo unit=0; "
+    f"test -f {PANEL_VOICE_ENV_FILE} && echo env=1 || echo env=0; "
+    f"systemctl is-enabled {VOICE_SERVICE_NAME} >/dev/null 2>&1"
+    f" && echo enabled=1 || echo enabled=0; "
+    f"systemctl is-active {VOICE_SERVICE_NAME} >/dev/null 2>&1"
+    f" && echo active=1 || echo active=0; "
+    f"test -f {PANEL_VOICE_VAR_DIR}/app/brilliant_voice/__main__.py "
+    f"&& test -d {PANEL_VOICE_VAR_DIR}/lva && test -d {PANEL_VOICE_VAR_DIR}/python "
+    f"&& echo payload=1 || echo payload=0; "
+    f"cat {PANEL_VOICE_VERSION_FILE} 2>/dev/null || true"
+)
+
+
+@dataclass(frozen=True)
+class VoicePanelState:
+    """Parsed result of one inspect_voice() probe."""
+
+    unit_present: bool
+    env_present: bool
+    enabled: bool
+    active: bool
+    payload_present: bool  # supervisor entry + lva/ + python/ all present
+    payload_version: str | None
+
+
+async def inspect_voice(shell: PanelShell) -> VoicePanelState:
+    """Probe voice install/health state in one shell round-trip."""
+    result = await shell.run(VOICE_INSPECT_COMMAND)
+    flags: dict[str, bool] = {}
+    version: str | None = None
+    for line in result.stdout.splitlines():
+        key, sep, value = line.partition("=")
+        if sep and key in ("unit", "env", "enabled", "active", "payload"):
+            flags[key] = value == "1"
+        elif line.strip():
+            version = line.strip()
+    return VoicePanelState(
+        unit_present=flags.get("unit", False),
+        env_present=flags.get("env", False),
+        enabled=flags.get("enabled", False),
+        active=flags.get("active", False),
+        payload_present=flags.get("payload", False),
+        payload_version=version,
+    )
+
+
+def render_voice_env(
+    panel: str,
+    name: str,
+    api_port: int,
+    wake_word: str,
+    ha_host: str,
+    enable_aec: bool,
+) -> str:
+    """Render /etc/brilliant-voice.env — exactly what brilliant_voice/config.py reads."""
+    return (
+        f"BRILLIANT_PANEL={_env_quote(panel)}\n"
+        f"VOICE_NAME={_env_quote(name)}\n"
+        f"VOICE_API_PORT={api_port}\n"
+        f"VOICE_WAKE_WORD={_env_quote(wake_word)}\n"
+        f"VOICE_HA_HOST={_env_quote(ha_host)}\n"
+        f"VOICE_ENABLE_AEC={1 if enable_aec else 0}\n"
+        f"LOG_LEVEL=INFO\n"
+    )
+
+
+async def deploy_voice_payload(shell: PanelShell, local_tarball_path: str, version: str) -> None:
+    """Upload the voice payload tarball and swap the extracted tree into place.
+
+    *local_tarball_path* is the downloaded brilliant-voice-payload-*.tar.gz (its top
+    dir is brilliant-voice/, stripped on extract). Stage+swap so a failed transfer
+    or extract never half-replaces a working install; the current tree is moved aside
+    (not rm) so a mid-swap mv failure stays recoverable.
+    """
+    await shell.run(f"rm -rf {_VOICE_STAGING_DIR} {_VOICE_STAGING_TARBALL}")
+    await shell.put_file(local_tarball_path, _VOICE_STAGING_TARBALL, 0o644)
+    await _checked(shell, _voice_swap_command())
+    await shell.put_bytes(version.encode(), PANEL_VOICE_VERSION_FILE, 0o644)
+
+
+def _voice_swap_command() -> str:
+    return " && ".join(
+        [
+            f"mkdir -p {_VOICE_STAGING_DIR}",
+            f"tar xzf {_VOICE_STAGING_TARBALL} -C {_VOICE_STAGING_DIR} --strip-components=1",
+            f"rm -f {_VOICE_STAGING_TARBALL}",
+            f"rm -rf {PANEL_VOICE_VAR_DIR}.bak",
+            f"{{ [ -e {PANEL_VOICE_VAR_DIR} ] && "
+            f"mv {PANEL_VOICE_VAR_DIR} {PANEL_VOICE_VAR_DIR}.bak; true; }}",
+            f"mv {_VOICE_STAGING_DIR} {PANEL_VOICE_VAR_DIR}",
+            f"rm -rf {PANEL_VOICE_VAR_DIR}.bak",
+        ]
+    )
+
+
+async def ensure_voice_config(shell: PanelShell, env_content: str) -> None:
+    """Install the voice unit (from the deployed payload) + write env to /etc + staged.
+
+    The systemd unit lives in /var (inside the payload, OTA-persistent); /etc is
+    OTA-replaced, so copy the unit into /etc and write the env to both /etc and the
+    /var staged copy. The env carries no secret but stays 0600 to match the bridge.
+    """
+    await _checked(shell, f"mkdir -p {PANEL_VOICE_STAGED_DIR}")
+    await _checked(
+        shell, f"cp {PANEL_VOICE_VAR_DIR}/{VOICE_SERVICE_NAME}.service {PANEL_VOICE_UNIT_FILE}"
+    )
+    env_bytes = env_content.encode()
+    await shell.put_bytes(env_bytes, PANEL_VOICE_ENV_FILE, 0o600)
+    await shell.put_bytes(env_bytes, _VOICE_STAGED_ENV, 0o600)
+    await _checked(shell, "systemctl daemon-reload")
+
+
+async def enable_voice(shell: PanelShell) -> None:
+    await _checked(shell, f"systemctl enable --now {VOICE_SERVICE_NAME}")
+
+
+async def restart_voice(shell: PanelShell) -> None:
+    await _checked(shell, f"systemctl restart {VOICE_SERVICE_NAME}")
+
+
+async def uninstall_voice(shell: PanelShell) -> None:
+    """Stop + disable + remove everything the voice feature owns on the panel."""
+    await shell.run(f"systemctl disable --now {VOICE_SERVICE_NAME} 2>/dev/null || true")
+    await _checked(shell, f"rm -f {PANEL_VOICE_UNIT_FILE} {PANEL_VOICE_ENV_FILE}")
+    await _checked(
+        shell, f"rm -rf {PANEL_VOICE_VAR_DIR} {_VOICE_STAGING_DIR} {_VOICE_STAGING_TARBALL}"
+    )
     await _checked(shell, "systemctl daemon-reload")
