@@ -194,6 +194,7 @@ class Bridge:
             n_entities,
             len(self._by_cmd_topic),
         )
+        await self._enforce_desired(devices)
 
     def _command_topic_for(self, peripheral_id: str, d: EntityDescriptor) -> str | None:
         """The command topic a descriptor subscribes to, or None if it has none."""
@@ -258,6 +259,56 @@ class Bridge:
             self._devices[device.peripheral_id] = device
             if payload_fields(device):
                 await self._publish_state(device, force=False)
+        await self._enforce_desired(devices)
+
+    async def _enforce_desired(self, devices: list[BrilliantDevice]) -> None:
+        """Re-assert drifted reconciled vars (firmware reverts the enable flags).
+
+        Per peripheral, batch every drifted desired var into ONE set_variables
+        call (avoids the same-peripheral rapid-write race). Rate-limit per
+        (pid, var) and cap the number of peripherals written per tick so a fleet
+        of drifted devices ramps gently instead of bursting the Thrift bus.
+        """
+        if self._desired is None:
+            return
+        now = self._clock()
+        writes = 0
+        for device in devices:
+            if not self._included(device):
+                continue
+            wanted = self._desired.wanted(device.peripheral_id)
+            if not wanted:
+                continue
+            drifted: list[VarSet] = []
+            for var, want in wanted.items():
+                cur = device.variables.get(var)
+                if cur is None or str(cur.value) == str(want):
+                    continue
+                last = self._last_reassert.get((device.peripheral_id, var))
+                if last is not None and (now - last) < self._reconcile_min_interval_s:
+                    continue
+                drifted.append(VarSet(var, want))
+            if not drifted:
+                continue
+            if writes >= self._reconcile_max_writes_per_tick:
+                return
+            for vs in drifted:
+                self._last_reassert[(device.peripheral_id, vs.name)] = now
+            writes += 1
+            try:
+                await self._bus.set_variables(device.device_id, device.peripheral_id, drifted)
+                logger.info(
+                    "reconcile-desired %s/%s: %s",
+                    device.device_id,
+                    device.peripheral_id,
+                    {vs.name: vs.value for vs in drifted},
+                )
+            except Exception:
+                logger.exception(
+                    "reconcile-desired write failed for %s/%s; continuing",
+                    device.device_id,
+                    device.peripheral_id,
+                )
 
     async def _publish_state(self, device: BrilliantDevice, *, force: bool) -> None:
         """Publish *device*'s shared state payload through the diff cache.
