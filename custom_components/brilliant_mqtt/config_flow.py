@@ -426,7 +426,10 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
     async def async_step_reconfigure(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Edit host/password/broker/mesh for one panel and push it (slug is immutable)."""
+        """Edit host/password/broker/mesh/components for one panel and push it.
+
+        The panel slug (CONF_PANEL) is immutable after onboarding.
+        """
         entry = self._get_reconfigure_entry()
         errors: dict[str, str] = {}
         if user_input is not None:
@@ -434,6 +437,11 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
             # whitespace — otherwise a stray trailing space would read as a "different"
             # host and downgrade the same-host pinned check to a fresh TOFU.
             errors = _control_char_errors(user_input, _NO_CONTROL_CHARS)
+            # voice_ha_host is now on this form; validate it for control chars too
+            # (a control char there crashes render_voice_env → _env_quote).
+            ha_host_val = str(user_input.get(CONF_VOICE_HA_HOST, ""))
+            if _has_control_char(ha_host_val):
+                errors[CONF_VOICE_HA_HOST] = "invalid_value"
             if not errors:
                 user_input = {**user_input, CONF_HOST: user_input[CONF_HOST].strip()}
                 # Same host → verify the rotated password against the STORED pin (key
@@ -479,10 +487,45 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
                         # Connected fine, but writing the env / restarting failed.
                         errors["base"] = "cannot_apply"
                     else:
-                        return self.async_update_reload_and_abort(
-                            entry,
-                            data={**entry.data, **user_input, DATA_SSH_HOST_KEY: host_key},
-                        )
+                        # Env push succeeded — now diff and apply component changes.
+                        current: dict[str, Any] = dict(entry.data.get(CONF_COMPONENTS) or {})
+                        desired = {
+                            c.id: bool(user_input.get(c.id, current.get(c.id, False)))
+                            for c in optional()
+                        }
+                        desired[COMPONENT_BRIDGE] = True
+                        new_data: dict[str, Any] = {
+                            **entry.data,
+                            **user_input,
+                            DATA_SSH_HOST_KEY: host_key,
+                            CONF_COMPONENTS: desired,
+                        }
+                        try:
+                            for c in optional():
+                                was: bool = bool(current.get(c.id, False))
+                                now: bool = desired[c.id]
+                                if now and not was:
+                                    async with _panel_session(
+                                        self.hass,
+                                        user_input[CONF_HOST],
+                                        user_input[CONF_ROOT_PASSWORD],
+                                        host_key,
+                                    ) as shell:
+                                        await REGISTRY[c.id].install(self.hass, shell, new_data)
+                                elif was and not now:
+                                    async with _panel_session(
+                                        self.hass,
+                                        user_input[CONF_HOST],
+                                        user_input[CONF_ROOT_PASSWORD],
+                                        host_key,
+                                    ) as shell:
+                                        await REGISTRY[c.id].remove(shell)
+                        except VoicePayloadError:
+                            errors["base"] = "cannot_install_voice"
+                        except (OSError, asyncssh.Error, panel_ops.PanelOpError):
+                            errors["base"] = "cannot_apply"
+                        else:
+                            return self.async_update_reload_and_abort(entry, data=new_data)
         data = entry.data
         schema = vol.Schema(
             {
@@ -492,6 +535,7 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
                 vol.Required(CONF_MESH_PRIORITY, default=data.get(CONF_MESH_PRIORITY, 0)): vol.All(
                     vol.Coerce(int), vol.Range(min=0, max=99)
                 ),
+                **_components_schema_fields(data),
             }
         )
         # Keep the operator's just-made edits across an error redisplay (a transient
