@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from brilliant_mqtt.bridge import Bridge
+from brilliant_mqtt.bridge import Bridge, WriteThrottle
 from brilliant_mqtt.commands import VarSet
 from brilliant_mqtt.desired_state import DesiredState
 from brilliant_mqtt.model import BrilliantDevice, DeviceKind, Variable
@@ -340,3 +340,53 @@ async def test_enforce_uses_persisted_desired_after_restart(tmp_path: Path) -> N
     await bridge._enforce_desired([dev])
 
     assert bus.commands == [("ble_mesh", "pidA", [_vs("enable_motion_score", "1")])]
+
+
+@pytest.mark.asyncio
+async def test_enforce_spacing_is_shared_across_bridges(tmp_path: Path) -> None:
+    """A WriteThrottle shared between two Bridge instances enforces bus-global
+    write-spacing: the second bridge must not write within the spacing window
+    after the first bridge wrote."""
+    dev_a = _mesh_light("pidA", enable_motion_score="0", on="0")
+    dev_b = _mesh_light("pidB", enable_motion_score="0", on="0")
+
+    bus_a = FakeBus([dev_a])
+    bus_b = FakeBus([dev_b])
+
+    ds_a = DesiredState(tmp_path / "ds_a.json")
+    ds_a.record("pidA", "enable_motion_score", "1")
+    ds_b = DesiredState(tmp_path / "ds_b.json")
+    ds_b.record("pidB", "enable_motion_score", "1")
+
+    clock = FakeClock()
+    throttle = WriteThrottle()
+
+    # Both bridges share one WriteThrottle and one FakeClock (time=0).
+    bridge1 = Bridge(
+        bus_a,
+        FakeMqtt(),
+        "panel",
+        include=None,
+        desired=ds_a,
+        reconcile_min_write_spacing_s=1.0,
+        clock=clock,
+        write_throttle=throttle,
+    )
+    bridge2 = Bridge(
+        bus_b,
+        FakeMqtt(),
+        "mesh",
+        include=None,
+        desired=ds_b,
+        reconcile_min_write_spacing_s=1.0,
+        clock=clock,
+        write_throttle=throttle,
+    )
+
+    # bridge1 writes pidA; throttle.last_ts is now set.
+    await bridge1._enforce_desired([dev_a])
+    assert len(bus_a.commands) == 1
+
+    # bridge2 must NOT write within the spacing window (clock still at 0).
+    await bridge2._enforce_desired([dev_b])
+    assert len(bus_b.commands) == 0

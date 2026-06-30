@@ -11,7 +11,7 @@ import json
 import logging
 import time
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 from brilliant_mqtt import __version__
 from brilliant_mqtt.commands import VarSet, translate_aux, translate_command
@@ -34,6 +34,14 @@ logger = logging.getLogger(__name__)
 # Reserved pseudo-panel slug — the mesh bridge instance publishes no meta topic
 # (there is no single host behind it; see discovery.config_payload's mesh branch).
 _MESH_PANEL = "mesh"
+
+
+@dataclass
+class WriteThrottle:
+    """Shared last-write timestamp so the reconciler's global write-spacing
+    bounds the rate on the shared bus across all Bridge instances."""
+
+    last_ts: float | None = None
 
 
 def _state_payload(device: BrilliantDevice) -> str:
@@ -84,6 +92,7 @@ class Bridge:
         reconcile_max_writes_per_tick: int = 4,
         reconcile_min_write_spacing_s: float = 0.5,
         clock: Callable[[], float] = time.monotonic,
+        write_throttle: WriteThrottle | None = None,
     ) -> None:
         self._bus = bus
         self._mqtt = mqtt
@@ -103,9 +112,11 @@ class Bridge:
         self._clock = clock
         # (peripheral_id, var) -> monotonic time of last re-assert attempt.
         self._last_reassert: dict[tuple[str, str], float] = {}
-        # Monotonic time of the last successful reconciler write (None = never).
-        # Bounds write rate across poll ticks independent of the poll cadence.
-        self._last_write_ts: float | None = None
+        # Shared write-spacing holder; if none is supplied each Bridge instance
+        # gets its own (existing tests and single-bridge deployments are unaffected).
+        # Pass the SAME WriteThrottle to both Bridge instances in a two-bridge
+        # process so the global min-write-spacing is enforced across the shared bus.
+        self._throttle = write_throttle if write_throttle is not None else WriteThrottle()
 
         # peripheral_id → most recent BrilliantDevice snapshot.
         self._devices: dict[str, BrilliantDevice] = {}
@@ -300,9 +311,12 @@ class Bridge:
             # Global min-spacing bounds the write rate across ticks, independent
             # of the poll cadence. A single tick writes at most one peripheral
             # when spacing > 0; the rest catch up on subsequent ticks.
+            # NOTE: the per-(pid,var) rate-limit (_last_reassert / min_interval_s)
+            # provides round-robin fairness across peripherals over time; keep
+            # reconcile_min_interval_s > 0 (the default 60 s) to preserve this.
             if (
-                self._last_write_ts is not None
-                and (now - self._last_write_ts) < self._reconcile_min_write_spacing_s
+                self._throttle.last_ts is not None
+                and (now - self._throttle.last_ts) < self._reconcile_min_write_spacing_s
             ):
                 return
             # Mark both the per-var rate-limit window and the global
@@ -310,11 +324,11 @@ class Bridge:
             # still consumes both — intentional: a persistently-failing
             # peripheral or bus is not hammered on every tick, and the spacing
             # window is anchored to the tick's `now` (not a post-await clock
-            # read) so the check `(now - _last_write_ts) < spacing` stays
+            # read) so the check `(now - _throttle.last_ts) < spacing` stays
             # non-negative and behaves correctly.
             for vs in drifted:
                 self._last_reassert[(device.peripheral_id, vs.name)] = now
-            self._last_write_ts = now
+            self._throttle.last_ts = now
             writes += 1
             try:
                 await self._bus.set_variables(device.device_id, device.peripheral_id, drifted)

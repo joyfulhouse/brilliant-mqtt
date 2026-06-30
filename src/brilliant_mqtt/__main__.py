@@ -12,7 +12,7 @@ import logging
 import time
 from pathlib import Path
 
-from brilliant_mqtt.bridge import Bridge
+from brilliant_mqtt.bridge import Bridge, WriteThrottle
 from brilliant_mqtt.bus import RpcBusAdapter
 from brilliant_mqtt.config import Settings
 from brilliant_mqtt.desired_state import DesiredState
@@ -89,6 +89,12 @@ async def _run_session(settings: Settings) -> None:
     mqtt = AioMqttAdapter(settings)
     bus = RpcBusAdapter(extra_device_ids=(_MESH_DEVICE_ID,) if participating else ())
     try:
+        # Shared write-throttle: both Bridge instances in this process use the
+        # same Thrift bus, so the global min-write-spacing must be enforced
+        # bus-wide, not per-bridge.  A single WriteThrottle shared here
+        # prevents the combined rate from exceeding the intended limit.
+        write_throttle = WriteThrottle()
+
         # Bridges register their bus/mqtt callbacks in __init__, BEFORE any I/O
         # starts — so no early change/command event is missed.
         panel_bridge = Bridge(
@@ -100,6 +106,7 @@ async def _run_session(settings: Settings) -> None:
             reconcile_min_interval_s=settings.motion_reconcile_min_interval_s,
             reconcile_max_writes_per_tick=settings.motion_reconcile_max_writes_per_tick,
             reconcile_min_write_spacing_s=settings.motion_reconcile_min_write_spacing_s,
+            write_throttle=write_throttle,
         )
 
         if participating:
@@ -121,6 +128,7 @@ async def _run_session(settings: Settings) -> None:
                 reconcile_min_interval_s=settings.motion_reconcile_min_interval_s,
                 reconcile_max_writes_per_tick=settings.motion_reconcile_max_writes_per_tick,
                 reconcile_min_write_spacing_s=settings.motion_reconcile_min_write_spacing_s,
+                write_throttle=write_throttle,
             )
             leader = MeshLeader(
                 mqtt,

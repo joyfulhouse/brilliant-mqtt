@@ -91,3 +91,15 @@ def test_record_resilient_to_save_error(tmp_path: Path, monkeypatch: pytest.Monk
     monkeypatch.setattr(ds, "save", _bad_save)
     ds.record("pid1", "enable_motion_score", "1")  # must not raise
     assert ds.wanted("pid1") == {"enable_motion_score": "1"}
+
+
+def test_load_normalizes_bool_values(tmp_path: Path) -> None:
+    """JSON booleans and string synonyms are normalized to bus strings on load."""
+    path = tmp_path / "d.json"
+    # JSON true -> "1", string "30" stays "30".
+    path.write_text(
+        json.dumps({"pidX": {"enable_motion_score": True, "motion_low_threshold": "30"}})
+    )
+    ds = DesiredState(path)
+    ds.load()
+    assert ds.wanted("pidX") == {"enable_motion_score": "1", "motion_low_threshold": "30"}

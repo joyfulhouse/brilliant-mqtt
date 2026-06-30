@@ -32,6 +32,26 @@ RECONCILED_VARS: frozenset[str] = frozenset(
     }
 )
 
+_TRUTHY = {"true", "on", "yes", "1"}
+_FALSY = {"false", "off", "no", "0"}
+
+
+def _normalize_value(v: object) -> str:
+    """Normalize a loaded JSON value to a bus string.
+
+    JSON booleans (``true``/``false``) and common string synonyms
+    (``"on"``/``"off"``/``"yes"``/``"no"``) are mapped to the canonical bus
+    strings ``"1"`` and ``"0"`` so that hand-edited state files do not cause
+    perpetual re-writes (the bus always returns ``"1"`` or ``"0"``, never
+    ``"True"`` or ``"on"``).  Numeric threshold values pass through unchanged.
+    """
+    s = str(v).strip().lower()
+    if s in _TRUTHY:
+        return "1"
+    if s in _FALSY:
+        return "0"
+    return str(v)
+
 
 class DesiredState:
     """peripheral_id -> {var: desired bus-string value}, persisted as JSON.
@@ -89,7 +109,9 @@ class DesiredState:
         for pid, vars_ in raw.items():
             if not isinstance(vars_, dict):
                 continue
-            filtered = {str(k): str(v) for k, v in vars_.items() if str(k) in RECONCILED_VARS}
+            filtered = {
+                str(k): _normalize_value(v) for k, v in vars_.items() if str(k) in RECONCILED_VARS
+            }
             if filtered:
                 self._state[str(pid)] = filtered
 
