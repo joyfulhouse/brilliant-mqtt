@@ -44,6 +44,14 @@ def test_load_corrupt_file_is_empty(tmp_path: Path) -> None:
     assert ds.wanted("pid1") == {}
 
 
+def test_load_non_dict_json_is_empty(tmp_path: Path) -> None:
+    path = tmp_path / "d.json"
+    path.write_text("[1, 2, 3]")
+    ds = DesiredState(path)
+    ds.load()
+    assert ds.wanted("anything") == {}
+
+
 def test_reconciled_vars_membership() -> None:
     assert "enable_motion_score" in RECONCILED_VARS
     assert "enable_pir_motion_score" in RECONCILED_VARS

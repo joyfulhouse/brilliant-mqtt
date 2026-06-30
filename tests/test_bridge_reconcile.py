@@ -184,6 +184,8 @@ async def test_enforce_continues_after_write_error(tmp_path: Path) -> None:
     await bridge._enforce_desired(devs)  # must not raise
 
     assert ("ble_mesh", "pidB", [_vs("enable_motion_score", "1")]) in bus.commands
+    # The failing write for pidA must not appear in the recorded commands.
+    assert all(p != "pidA" for _, p, _ in bus.commands)
 
 
 @pytest.mark.asyncio
@@ -210,3 +212,39 @@ async def test_reconcile_enforces(tmp_path: Path) -> None:
     await bridge.reconcile()
 
     assert ("ble_mesh", "pidA", [_vs("enable_motion_score", "1")]) in bus.commands
+
+
+@pytest.mark.asyncio
+async def test_enforce_restores_off_when_drifted_to_on(tmp_path: Path) -> None:
+    """Enforce re-asserts OFF, not just ON — drift in either direction is corrected."""
+    dev = _mesh_light("pidA", enable_motion_score="1", on="0")
+    bus = FakeBus([dev])
+    ds = DesiredState(tmp_path / "mesh.json")
+    ds.record("pidA", "enable_motion_score", "0")
+    bridge = Bridge(bus, FakeMqtt(), "mesh", desired=ds, clock=FakeClock())
+
+    await bridge._enforce_desired([dev])
+
+    assert bus.commands == [("ble_mesh", "pidA", [_vs("enable_motion_score", "0")])]
+
+
+@pytest.mark.asyncio
+async def test_enforce_uses_persisted_desired_after_restart(tmp_path: Path) -> None:
+    """Persisted desired state feeds enforcement after a process restart."""
+    path = tmp_path / "mesh.json"
+
+    # First "process": record desired and let it persist to disk.
+    ds_first = DesiredState(path)
+    ds_first.record("pidA", "enable_motion_score", "1")
+
+    # Simulate restart: new DesiredState instance loads from disk.
+    ds_loaded = DesiredState(path)
+    ds_loaded.load()
+
+    dev = _mesh_light("pidA", enable_motion_score="0", on="0")
+    bus = FakeBus([dev])
+    bridge = Bridge(bus, FakeMqtt(), "mesh", desired=ds_loaded, clock=FakeClock())
+
+    await bridge._enforce_desired([dev])
+
+    assert bus.commands == [("ble_mesh", "pidA", [_vs("enable_motion_score", "1")])]

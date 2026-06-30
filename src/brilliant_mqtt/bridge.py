@@ -292,6 +292,9 @@ class Bridge:
                 continue
             if writes >= self._reconcile_max_writes_per_tick:
                 return
+            # Mark the rate-limit window BEFORE the write.  If the write
+            # fails we still consume the window — intentional: a persistently-
+            # failing peripheral is not hammered on every tick.
             for vs in drifted:
                 self._last_reassert[(device.peripheral_id, vs.name)] = now
             writes += 1

@@ -58,10 +58,17 @@ class DesiredState:
         """Load from disk; a missing or unreadable file yields empty state."""
         try:
             raw = json.loads(self._path.read_text())
-        except (OSError, ValueError):
+        except (OSError, ValueError) as e:
+            if not isinstance(e, FileNotFoundError):
+                logger.warning(
+                    "could not load desired-state from %s (%s); starting empty",
+                    self._path,
+                    e,
+                )
             self._state = {}
             return
         if not isinstance(raw, dict):
+            logger.warning("desired-state file %s is not a JSON object; starting empty", self._path)
             self._state = {}
             return
         self._state = {
