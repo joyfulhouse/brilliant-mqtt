@@ -19,6 +19,10 @@ from pytest_homeassistant_custom_component.common import (
 from pytest_homeassistant_custom_component.typing import MqttMockHAClient
 
 from custom_components.brilliant_mqtt.const import (
+    COMPONENT_BRIDGE,
+    COMPONENT_VOICE,
+    COMPONENT_WIFI_WATCHDOG,
+    CONF_COMPONENTS,
     CONF_VOICE_ENABLED,
     CONF_VOICE_WAKE_WORD,
     DATA_SSH_HOST_KEY,
@@ -26,6 +30,7 @@ from custom_components.brilliant_mqtt.const import (
     EVENT_TYPE,
     OPT_TRUST_HOST_KEY_CHANGES,
 )
+from custom_components.brilliant_mqtt.manager import PanelManager
 from tests.conftest import REPIN_NEW_KEY, RepinShells
 from tests.fakes import FakeShell
 from tests.test_init import ENTRY_DATA
@@ -882,11 +887,14 @@ async def test_agent_update_reports_progress(
 # ---------------------------------------------------------------------------
 
 _FETCH_PATCH = "custom_components.brilliant_mqtt.manager.async_fetch_voice_payload"
+# Patch path for fetch when it runs via components._voice_install (used by the
+# generic async_install_component path that async_set_voice_enabled now delegates to).
+_COMPONENTS_FETCH_PATCH = "custom_components.brilliant_mqtt.components.async_fetch_voice_payload"
 _FAKE_TARBALL = "/tmp/voice.tar.gz"
 
 
 def _voice_entry_data() -> dict[str, object]:
-    return {**ENTRY_DATA, CONF_VOICE_ENABLED: True}
+    return {**ENTRY_DATA, CONF_COMPONENTS: {COMPONENT_BRIDGE: True, COMPONENT_VOICE: True}}
 
 
 def _make_voice_shell(payload_present: bool) -> FakeShell:
@@ -916,15 +924,13 @@ async def test_set_voice_enabled_true_payload_absent_deploys(
     """enable=True when voice payload is absent → tarball uploaded, config written, enabled."""
     import asyncio
 
-    from custom_components.brilliant_mqtt.manager import PanelManager
-
     entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
     entry.add_to_hass(hass)
 
     shell = _make_voice_shell(payload_present=False)
     with (
         patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell),
-        patch(_FETCH_PATCH, return_value=_FAKE_TARBALL),
+        patch(_COMPONENTS_FETCH_PATCH, return_value=_FAKE_TARBALL),
     ):
         manager = PanelManager(hass, entry, asyncio.Lock())
         await manager.async_set_voice_enabled(True)
@@ -933,19 +939,22 @@ async def test_set_voice_enabled_true_payload_absent_deploys(
     assert any(src == _FAKE_TARBALL for (src, _dst, _mode) in shell.file_uploads)
     # Voice satellite was enabled
     assert "systemctl enable --now brilliant-voice" in shell.commands
-    # Entry data persisted
-    assert entry.data[CONF_VOICE_ENABLED] is True
+    # Entry data persisted (CONF_COMPONENTS is the canonical key)
+    assert entry.data[CONF_COMPONENTS][COMPONENT_VOICE] is True
 
 
-async def test_set_voice_enabled_true_payload_present_skips_upload(
+async def test_set_voice_enabled_true_always_deploys(
     hass: HomeAssistant,
     payload_dir: Path,
 ) -> None:
-    """enable=True when voice payload is already present → no tarball upload, but
-    ensure_voice_config + enable_voice still run."""
-    import asyncio
+    """enable=True always fully deploys: tarball uploaded, config written, enabled.
 
-    from custom_components.brilliant_mqtt.manager import PanelManager
+    The generic component install() method does not check presence before deploying —
+    it always installs to ensure idempotency. The "skip-if-present" optimisation lived
+    only in the repair path (_deploy_voice); the component registry install() is a
+    deliberate, unconditional install.
+    """
+    import asyncio
 
     entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
     entry.add_to_hass(hass)
@@ -953,31 +962,29 @@ async def test_set_voice_enabled_true_payload_present_skips_upload(
     shell = _make_voice_shell(payload_present=True)
     with (
         patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell),
-        patch(_FETCH_PATCH, return_value=_FAKE_TARBALL),
+        patch(_COMPONENTS_FETCH_PATCH, return_value=_FAKE_TARBALL),
     ):
         manager = PanelManager(hass, entry, asyncio.Lock())
         await manager.async_set_voice_enabled(True)
 
-    # No tarball upload (deploy_voice_payload was skipped)
-    assert not shell.file_uploads
+    # Tarball IS uploaded (no skip-if-present in the generic install path)
+    assert any(src == _FAKE_TARBALL for (src, _dst, _mode) in shell.file_uploads)
     # Config + enable still ran
     assert any("/etc/brilliant-voice.env" in p for (p, _d, _m) in shell.uploads)
     assert "systemctl enable --now brilliant-voice" in shell.commands
-    assert entry.data[CONF_VOICE_ENABLED] is True
+    assert entry.data[CONF_COMPONENTS][COMPONENT_VOICE] is True
 
 
 async def test_set_voice_enabled_false_uninstalls(
     hass: HomeAssistant,
     payload_dir: Path,
 ) -> None:
-    """enable=False → uninstall_voice commands ran, CONF_VOICE_ENABLED=False, issue deleted."""
+    """enable=False → uninstall_voice commands ran, CONF_COMPONENTS[voice]=False, issue deleted."""
     import asyncio
 
     from homeassistant.helpers import issue_registry as ir
 
-    from custom_components.brilliant_mqtt.manager import PanelManager
-
-    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=_voice_entry_data())
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=_voice_entry_data(), version=2)
     entry.add_to_hass(hass)
 
     # Pre-create the voice issue so we can assert it is deleted
@@ -1001,7 +1008,7 @@ async def test_set_voice_enabled_false_uninstalls(
 
     # disable + rm commands ran
     assert any("disable --now" in c and "brilliant-voice" in c for c in shell.commands)
-    assert entry.data[CONF_VOICE_ENABLED] is False
+    assert entry.data[CONF_COMPONENTS][COMPONENT_VOICE] is False
     # Voice issue cleared
     assert registry.async_get_issue(DOMAIN, voice_issue_id) is None
 
@@ -1015,7 +1022,7 @@ async def test_set_voice_wake_word_voice_enabled_restarts(
 
     from custom_components.brilliant_mqtt.manager import PanelManager
 
-    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=_voice_entry_data())
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=_voice_entry_data(), version=2)
     entry.add_to_hass(hass)
 
     shell = _make_voice_shell(payload_present=True)
@@ -1053,7 +1060,7 @@ async def test_repair_fold_in_voice_enabled_absent_payload(
     mqtt_mock: MqttMockHAClient,
     payload_dir: Path,
 ) -> None:
-    """Repair with CONF_VOICE_ENABLED=True + voice payload absent → voice is deployed
+    """Repair with CONF_COMPONENTS[voice]=True + voice payload absent → voice is deployed
     alongside the agent, voice issue absent after success."""
     from homeassistant.helpers import issue_registry as ir
 
@@ -1075,7 +1082,9 @@ async def test_repair_fold_in_voice_enabled_absent_payload(
         patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell),
         patch(_FETCH_PATCH, return_value=_FAKE_TARBALL),
     ):
-        entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=_voice_entry_data())
+        entry = MockConfigEntry(
+            domain=DOMAIN, unique_id="office", data=_voice_entry_data(), version=2
+        )
         entry.add_to_hass(hass)
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
@@ -1125,7 +1134,9 @@ async def test_repair_voice_failure_isolated_from_agent_repair(
         patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell),
         patch(_FETCH_PATCH, return_value=_FAKE_TARBALL),
     ):
-        entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=_voice_entry_data())
+        entry = MockConfigEntry(
+            domain=DOMAIN, unique_id="office", data=_voice_entry_data(), version=2
+        )
         entry.add_to_hass(hass)
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
@@ -1157,7 +1168,7 @@ async def test_remove_entry_deletes_voice_issue(
     """Removing a config entry must delete both the agent and voice issues."""
     from homeassistant.helpers import issue_registry as ir
 
-    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=_voice_entry_data())
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=_voice_entry_data(), version=2)
     entry.add_to_hass(hass)
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
@@ -1203,7 +1214,9 @@ async def test_repair_voice_prefetch_oserror_is_swallowed_and_repairing_resets(
             side_effect=OSError("disk read error"),
         ),
     ):
-        entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=_voice_entry_data())
+        entry = MockConfigEntry(
+            domain=DOMAIN, unique_id="office", data=_voice_entry_data(), version=2
+        )
         entry.add_to_hass(hass)
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
@@ -1296,8 +1309,6 @@ async def test_set_voice_enabled_true_clears_stale_voice_issue(
 
     from homeassistant.helpers import issue_registry as ir
 
-    from custom_components.brilliant_mqtt.manager import PanelManager
-
     entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
     entry.add_to_hass(hass)
 
@@ -1318,12 +1329,187 @@ async def test_set_voice_enabled_true_clears_stale_voice_issue(
     shell = _make_voice_shell(payload_present=False)
     with (
         patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell),
-        patch(_FETCH_PATCH, return_value=_FAKE_TARBALL),
+        patch(_COMPONENTS_FETCH_PATCH, return_value=_FAKE_TARBALL),
     ):
         manager = PanelManager(hass, entry, asyncio.Lock())
         await manager.async_set_voice_enabled(True)
 
-    assert entry.data[CONF_VOICE_ENABLED] is True
+    assert entry.data[CONF_COMPONENTS][COMPONENT_VOICE] is True
     assert "systemctl enable --now brilliant-voice" in shell.commands
     # The stale issue is gone after a successful enable.
     assert registry.async_get_issue(DOMAIN, voice_issue_id) is None
+
+
+@pytest.mark.allow_lingering_timers
+async def test_repair_voice_disabled_via_components_skips_voice(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    payload_dir: Path,
+) -> None:
+    """Regression: after Reconfigure unchecks voice (CONF_COMPONENTS[voice]=False),
+    async_repair must NOT re-deploy voice.
+
+    The old bug: manager read CONF_VOICE_ENABLED for the voice-maintain gate.
+    Reconfigure only writes CONF_COMPONENTS, leaving the legacy CONF_VOICE_ENABLED=True
+    stale in entry data. On the next repair the old gate fired True and voice was
+    re-installed even though the user had just unchecked it.
+
+    The fix: gate reads CONF_COMPONENTS[voice] instead. This test constructs the
+    split-brain entry data (CONF_VOICE_ENABLED=True + CONF_COMPONENTS[voice]=False)
+    that Reconfigure would have produced under the old code and asserts that repair
+    does NOT deploy voice — it would FAIL against the old gate and PASS with the fix.
+    """
+    from custom_components.brilliant_mqtt import panel_ops
+    from custom_components.brilliant_mqtt.shell import RunResult
+
+    agent_ok = RunResult(
+        0, "unit=1\nenv=1\nenabled=1\nactive=1\nsunit=1\nsenv=1\npayload=1\n0.2.0\n", ""
+    )
+    # Voice absent on panel (was removed by Reconfigure)
+    voice_absent = RunResult(0, "unit=0\nenv=0\nenabled=0\nactive=0\npayload=0\n", "")
+    shell = FakeShell(
+        responses={
+            panel_ops.INSPECT_COMMAND: agent_ok,
+            panel_ops.VOICE_INSPECT_COMMAND: voice_absent,
+        }
+    )
+
+    # Split-brain entry data: CONF_VOICE_ENABLED=True (stale from initial install,
+    # NOT updated by Reconfigure) but CONF_COMPONENTS[voice]=False (written by Reconfigure).
+    # Old gate read CONF_VOICE_ENABLED → True → re-installed voice (the bug).
+    # New gate reads CONF_COMPONENTS[voice] → False → skips voice (the fix).
+    split_brain_data = {
+        **ENTRY_DATA,
+        CONF_VOICE_ENABLED: True,  # stale legacy value
+        CONF_COMPONENTS: {COMPONENT_BRIDGE: True, COMPONENT_VOICE: False},
+    }
+
+    with (
+        patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell),
+        patch(_FETCH_PATCH, return_value=_FAKE_TARBALL),
+    ):
+        entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=split_brain_data, version=2)
+        entry.add_to_hass(hass)
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+        await entry.runtime_data.async_repair(trigger="button")
+        await hass.async_block_till_done()
+
+    # Voice must NOT be re-deployed: no tarball upload, no enable command.
+    assert not any(src == _FAKE_TARBALL for (src, _dst, _mode) in shell.file_uploads)
+    assert "systemctl enable --now brilliant-voice" not in shell.commands
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+# ---------------------------------------------------------------------------
+# Generic component install / remove
+# ---------------------------------------------------------------------------
+
+
+async def test_install_component_records_selection(
+    manager_with_fake_panel: PanelManager,
+) -> None:
+    """async_install_component sets CONF_COMPONENTS[id]=True in entry data."""
+    mgr = manager_with_fake_panel
+    await mgr.async_install_component(COMPONENT_VOICE)
+    assert mgr.entry.data[CONF_COMPONENTS][COMPONENT_VOICE] is True
+
+
+async def test_remove_component_clears_selection(
+    manager_with_fake_panel: PanelManager,
+) -> None:
+    """async_remove_component sets CONF_COMPONENTS[id]=False in entry data."""
+    mgr = manager_with_fake_panel
+    await mgr.async_install_component(COMPONENT_VOICE)
+    await mgr.async_remove_component(COMPONENT_VOICE)
+    assert mgr.entry.data[CONF_COMPONENTS][COMPONENT_VOICE] is False
+
+
+# ---------------------------------------------------------------------------
+# Wi-Fi watchdog repair re-lay (Fix #1: OTA wipes /etc, unit must be re-laid)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.allow_lingering_timers
+async def test_repair_relays_watchdog_unit_when_selected(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    payload_dir: Path,
+) -> None:
+    """When wifi_watchdog is selected, async_repair re-lays the watchdog unit.
+
+    OTA wipes /etc/systemd/system/ so the unit file disappears after a firmware
+    update even though the watchdog code survives in /var.  The repair must call
+    ensure_wifi_watchdog_unit + enable_wifi_watchdog so the watchdog restarts
+    automatically on the next reboot / OTA.
+    """
+    from custom_components.brilliant_mqtt import panel_ops
+    from custom_components.brilliant_mqtt.shell import RunResult
+
+    agent_ok = RunResult(
+        0, "unit=1\nenv=1\nenabled=1\nactive=1\nsunit=1\nsenv=1\npayload=1\n0.2.0\n", ""
+    )
+    # Watchdog code lives in /var (OTA-persistent); /etc unit wiped by OTA.
+    wd_payload_ok = RunResult(0, "unit=0\nenabled=0\nactive=0\npayload=1\n", "")
+    shell = FakeShell(
+        responses={
+            panel_ops.INSPECT_COMMAND: agent_ok,
+            panel_ops.WIFI_WATCHDOG_INSPECT_COMMAND: wd_payload_ok,
+        }
+    )
+    entry_data = {
+        **ENTRY_DATA,
+        CONF_COMPONENTS: {COMPONENT_BRIDGE: True, COMPONENT_WIFI_WATCHDOG: True},
+    }
+    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+        entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=entry_data, version=2)
+        entry.add_to_hass(hass)
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        await entry.runtime_data.async_repair(trigger="button")
+        await hass.async_block_till_done()
+
+    # ensure_wifi_watchdog_unit wrote the unit to /etc and the staged copy.
+    assert any("brilliant-wifi-watchdog.service" in p for (p, _d, _m) in shell.uploads)
+    # enable_wifi_watchdog issued the systemctl command.
+    assert "systemctl enable --now brilliant-wifi-watchdog" in shell.commands
+    # Payload was present in /var → no redeploy of the watchdog code tree.
+    assert not any("wifi_watchdog" in local for (local, _remote) in shell.dir_uploads)
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_repair_skips_watchdog_when_not_selected(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    payload_dir: Path,
+) -> None:
+    """When wifi_watchdog is NOT in the selected components, repair must not touch it."""
+    from custom_components.brilliant_mqtt import panel_ops
+    from custom_components.brilliant_mqtt.shell import RunResult
+
+    agent_ok = RunResult(
+        0, "unit=1\nenv=1\nenabled=1\nactive=1\nsunit=1\nsenv=1\npayload=1\n0.2.0\n", ""
+    )
+    shell = FakeShell(responses={panel_ops.INSPECT_COMMAND: agent_ok})
+    entry_data = {
+        **ENTRY_DATA,
+        CONF_COMPONENTS: {COMPONENT_BRIDGE: True},
+    }
+    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+        entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=entry_data, version=2)
+        entry.add_to_hass(hass)
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        await entry.runtime_data.async_repair(trigger="button")
+        await hass.async_block_till_done()
+
+    # No watchdog commands or uploads must have run.
+    assert "systemctl enable --now brilliant-wifi-watchdog" not in shell.commands
+    assert not any("wifi-watchdog" in c or "wifi_watchdog" in c for c in shell.commands)
+    assert not any("brilliant-wifi-watchdog" in p for (p, _d, _m) in shell.uploads)
+
+    assert await hass.config_entries.async_unload(entry.entry_id)

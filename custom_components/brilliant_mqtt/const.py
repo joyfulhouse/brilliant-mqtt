@@ -30,6 +30,12 @@ CONF_VOICE_ENABLED = "voice_enabled"
 CONF_VOICE_WAKE_WORD = "voice_wake_word"
 CONF_VOICE_HA_HOST = "voice_ha_host"
 
+# Per-panel component selection (see docs/claude/specs/2026-06-29-component-selection-design.md).
+CONF_COMPONENTS = "components"  # entry data: {component_id: bool}
+COMPONENT_BRIDGE = "bridge"
+COMPONENT_VOICE = "voice"
+COMPONENT_WIFI_WATCHDOG = "wifi_watchdog"
+
 # Internally managed config-entry state (never shown in a config-flow form).
 DATA_SSH_HOST_KEY = "ssh_host_key"  # TOFU-pinned on first successful connect
 DATA_LAST_FIRMWARE = "last_firmware"  # persisted so panel_updated survives HA restarts
@@ -116,6 +122,11 @@ PANEL_VOICE_VERSION_FILE = f"{PANEL_VOICE_VAR_DIR}/VOICE_VERSION"
 PANEL_VOICE_ENV_FILE = "/etc/brilliant-voice.env"
 PANEL_VOICE_UNIT_FILE = "/etc/systemd/system/brilliant-voice.service"
 VOICE_SERVICE_NAME = "brilliant-voice"
+
+# On-panel Wi-Fi watchdog paths (stdlib script tree under the OTA-proof /var bridge dir).
+PANEL_WIFI_WATCHDOG_DIR = f"{PANEL_VAR_DIR}/wifi_watchdog"
+PANEL_WIFI_WATCHDOG_UNIT_FILE = "/etc/systemd/system/brilliant-wifi-watchdog.service"
+WIFI_WATCHDOG_SERVICE_NAME = "brilliant-wifi-watchdog"
 
 EVENT_TYPE = "brilliant_mqtt_event"
 SIGNAL_PANEL_STATE = f"{DOMAIN}_panel_state"  # dispatcher: f"{SIGNAL_PANEL_STATE}_{entry_id}"

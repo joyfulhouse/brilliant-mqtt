@@ -34,6 +34,9 @@ from . import panel_ops
 from .const import (
     AVAILABILITY_OFFLINE,
     AVAILABILITY_ONLINE,
+    COMPONENT_VOICE,
+    COMPONENT_WIFI_WATCHDOG,
+    CONF_COMPONENTS,
     CONF_HOST,
     CONF_MESH_PRIORITY,
     CONF_MQTT_HOST,
@@ -42,7 +45,6 @@ from .const import (
     CONF_MQTT_USERNAME,
     CONF_PANEL,
     CONF_ROOT_PASSWORD,
-    CONF_VOICE_ENABLED,
     CONF_VOICE_HA_HOST,
     CONF_VOICE_WAKE_WORD,
     DATA_LAST_FIRMWARE,
@@ -361,7 +363,7 @@ class PanelManager:
             # any escape here would otherwise wedge _repairing=True forever (it is called from
             # timers/the Repair button).
             voice_tarball: str | None = None
-            if self.entry.data.get(CONF_VOICE_ENABLED):
+            if self.entry.data.get(CONF_COMPONENTS, {}).get(COMPONENT_VOICE, False):
                 try:
                     voice_tarball = await async_fetch_voice_payload(self.hass)
                 except VoicePayloadError as err:
@@ -428,6 +430,28 @@ class PanelManager:
                             )
                         else:
                             ir.async_delete_issue(self.hass, DOMAIN, self._voice_issue_id)
+                    # Wi-Fi watchdog re-lay: re-write unit to /etc if selected.
+                    # OTA wipes /etc/systemd/system/ so the unit disappears after a
+                    # firmware update even though the code survives in /var.  Lay it
+                    # back down (and redeploy the code if /var was also wiped) so the
+                    # watchdog keeps running across OTAs.  Failure is logged and
+                    # swallowed — a watchdog outage must not block the bridge repair.
+                    from .components import selected_ids  # lazy: components imports manager
+
+                    if COMPONENT_WIFI_WATCHDOG in selected_ids(self.entry.data):
+                        try:
+                            wd_unit = await self.hass.async_add_executor_job(
+                                (_payload_dir() / "brilliant-wifi-watchdog.service").read_text
+                            )
+                            wd_state = await panel_ops.inspect_wifi_watchdog(shell)
+                            if not wd_state.payload_present:
+                                await panel_ops.deploy_wifi_watchdog(
+                                    shell, str(_payload_dir() / "wifi_watchdog")
+                                )
+                            await panel_ops.ensure_wifi_watchdog_unit(shell, wd_unit)
+                            await panel_ops.enable_wifi_watchdog(shell)
+                        except (OSError, asyncssh.Error, PanelOpError) as err:
+                            _LOGGER.warning("%s: watchdog repair failed: %s", self.panel, err)
                 except (OSError, asyncssh.Error, PanelOpError) as err:
                     # A checked step (mkdir/daemon-reload/systemctl) exited non-zero.
                     # The panel is half-broken; surface it loudly instead of letting
@@ -604,32 +628,80 @@ class PanelManager:
             finally:
                 await shell.close()
 
-    async def async_set_voice_enabled(self, enabled: bool) -> None:
-        """Enable (deploy+start) or disable (uninstall) the voice satellite on the panel."""
-        tarball: str | None = None
-        if enabled:
-            try:
-                tarball = await async_fetch_voice_payload(self.hass)
-            except VoicePayloadError as err:
-                raise HomeAssistantError(
-                    translation_domain=DOMAIN,
-                    translation_key="voice_failed",
-                    translation_placeholders={"error": str(err)},
-                ) from err
-        async with self._voice_ssh_session() as shell:
-            if enabled:
-                assert tarball is not None
-                await self._deploy_voice(shell, tarball)
-            else:
-                await panel_ops.uninstall_voice(shell)
+    async def _set_component_flag(self, component_id: str, enabled: bool) -> None:
+        """Persist a component's selected state into entry data."""
+        components = dict(self.entry.data.get(CONF_COMPONENTS, {}))
+        components[component_id] = enabled
         self.hass.config_entries.async_update_entry(
-            self.entry, data={**self.entry.data, CONF_VOICE_ENABLED: enabled}
+            self.entry, data={**self.entry.data, CONF_COMPONENTS: components}
         )
+
+    async def async_install_component(self, component_id: str) -> None:
+        """SSH-install a component, then record it as selected.
+
+        ``components.py`` imports ``manager`` at module top level, so REGISTRY is
+        imported lazily inside this method to avoid a circular import.
+        """
+        from .components import REGISTRY  # lazy: components imports manager
+
+        component = REGISTRY[component_id]
+        async with self._ssh_lock:
+            shell = await self._connect_for_repair()
+            try:
+                await component.install(self.hass, shell, self.entry.data)
+            finally:
+                await shell.close()
+        await self._set_component_flag(component_id, True)
+        self._notify()
+
+    async def async_remove_component(self, component_id: str) -> None:
+        """SSH-remove a component, then clear its selection.
+
+        ``components.py`` imports ``manager`` at module top level, so REGISTRY is
+        imported lazily inside this method to avoid a circular import.
+        """
+        from .components import REGISTRY  # lazy: components imports manager
+
+        component = REGISTRY[component_id]
+        async with self._ssh_lock:
+            shell = await self._connect_for_repair()
+            try:
+                await component.remove(shell)
+            finally:
+                await shell.close()
+        await self._set_component_flag(component_id, False)
+        self._notify()
+
+    async def async_set_voice_enabled(self, enabled: bool) -> None:
+        """Enable (deploy+start) or disable (uninstall) the voice satellite on the panel.
+
+        Delegates the SSH operation to the generic component methods (which update
+        ``CONF_COMPONENTS`` and fire a notify), then clears the
+        ``voice_missing_<entry_id>`` repair issue on success.
+
+        Errors from the SSH layer or the voice-payload fetch are mapped to the same
+        ``HomeAssistantError`` keys the voice switch has always expected, so the switch
+        still surfaces failures correctly.
+        """
+        try:
+            if enabled:
+                await self.async_install_component(COMPONENT_VOICE)
+            else:
+                await self.async_remove_component(COMPONENT_VOICE)
+        except _HostKeyChanged as err:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN, translation_key="host_key_changed"
+            ) from err
+        except (VoicePayloadError, OSError, asyncssh.Error, PanelOpError) as err:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="voice_failed",
+                translation_placeholders={"error": str(err)},
+            ) from err
         # Clear any stale "voice enabled but not running" issue: after a disable there is
         # nothing to run, and after a successful enable the satellite IS running — either
         # way the issue must not linger.
         ir.async_delete_issue(self.hass, DOMAIN, self._voice_issue_id)
-        self._notify()
 
     async def async_set_voice_wake_word(self, wake_word: str) -> None:
         """Push the wake word + restart the satellite if enabled, THEN persist it.
@@ -639,7 +711,7 @@ class PanelManager:
         shows the OLD word the panel is actually using. When voice is disabled there is no
         panel to push to, so just persist.
         """
-        if self.entry.data.get(CONF_VOICE_ENABLED):
+        if self.entry.data.get(CONF_COMPONENTS, {}).get(COMPONENT_VOICE, False):
             async with self._voice_ssh_session() as shell:
                 await panel_ops.ensure_voice_config(shell, self._voice_env(wake_word=wake_word))
                 await panel_ops.restart_voice(shell)
@@ -708,6 +780,27 @@ class PanelManager:
                 try:
                     unit, env = await self._config_contents()
                     await panel_ops.ensure_configs(shell, unit, env)
+                    # Wi-Fi watchdog: also re-lay its unit when selected — OTA wipes /etc
+                    # and the watchdog unit disappears even though the code in /var survives.
+                    from .components import selected_ids  # lazy: components imports manager
+
+                    if COMPONENT_WIFI_WATCHDOG in selected_ids(self.entry.data):
+                        try:
+                            wd_unit = await self.hass.async_add_executor_job(
+                                (_payload_dir() / "brilliant-wifi-watchdog.service").read_text
+                            )
+                            wd_state = await panel_ops.inspect_wifi_watchdog(shell)
+                            if not wd_state.payload_present:
+                                await panel_ops.deploy_wifi_watchdog(
+                                    shell, str(_payload_dir() / "wifi_watchdog")
+                                )
+                            await panel_ops.ensure_wifi_watchdog_unit(shell, wd_unit)
+                            await panel_ops.enable_wifi_watchdog(shell)
+                        except (OSError, asyncssh.Error, PanelOpError):
+                            _LOGGER.warning(
+                                "%s: watchdog refresh failed; will retry next reconcile",
+                                self.panel,
+                            )
                 finally:
                     await shell.close()
         except (OSError, asyncssh.Error, PanelOpError):

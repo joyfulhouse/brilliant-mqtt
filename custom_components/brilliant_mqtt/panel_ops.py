@@ -21,8 +21,11 @@ from .const import (
     PANEL_VOICE_UNIT_FILE,
     PANEL_VOICE_VAR_DIR,
     PANEL_VOICE_VERSION_FILE,
+    PANEL_WIFI_WATCHDOG_DIR,
+    PANEL_WIFI_WATCHDOG_UNIT_FILE,
     SERVICE_NAME,
     VOICE_SERVICE_NAME,
+    WIFI_WATCHDOG_SERVICE_NAME,
 )
 from .shell import PanelShell, RunResult
 
@@ -423,4 +426,116 @@ async def uninstall_voice(shell: PanelShell) -> None:
     await _checked(
         shell, f"rm -rf {PANEL_VOICE_VAR_DIR} {_VOICE_STAGING_DIR} {_VOICE_STAGING_TARBALL}"
     )
+    await _checked(shell, "systemctl daemon-reload")
+
+
+# ---------------------------------------------------------------------------
+# Wi-Fi watchdog recipes
+# ---------------------------------------------------------------------------
+
+_WATCHDOG_STAGING_DIR = f"{PANEL_WIFI_WATCHDOG_DIR}.staging"
+_WATCHDOG_STAGED_UNIT = f"{PANEL_WIFI_WATCHDOG_DIR}/{WIFI_WATCHDOG_SERVICE_NAME}.service"
+_WATCHDOG_LOG_FILE = f"{PANEL_VAR_DIR}/wifi-watchdog.log"
+_WATCHDOG_STATE_FILE = f"{PANEL_VAR_DIR}/wifi-watchdog.state"
+
+WIFI_WATCHDOG_INSPECT_COMMAND = (
+    f"test -f {PANEL_WIFI_WATCHDOG_UNIT_FILE} && echo unit=1 || echo unit=0; "
+    f"systemctl is-enabled {WIFI_WATCHDOG_SERVICE_NAME} >/dev/null 2>&1"
+    f" && echo enabled=1 || echo enabled=0; "
+    f"systemctl is-active {WIFI_WATCHDOG_SERVICE_NAME} >/dev/null 2>&1"
+    f" && echo active=1 || echo active=0; "
+    f"test -f {PANEL_WIFI_WATCHDOG_DIR}/brilliant_wifi_watchdog/run.py "
+    f"&& echo payload=1 || echo payload=0"
+)
+
+
+@dataclass(frozen=True)
+class WifiWatchdogState:
+    """Parsed result of one inspect_wifi_watchdog() probe."""
+
+    unit_present: bool
+    enabled: bool
+    active: bool
+    payload_present: bool  # run.py entrypoint present inside PANEL_WIFI_WATCHDOG_DIR
+
+
+async def inspect_wifi_watchdog(shell: PanelShell) -> WifiWatchdogState:
+    """Probe Wi-Fi watchdog install/health state in one shell round-trip."""
+    result = await shell.run(WIFI_WATCHDOG_INSPECT_COMMAND)
+    flags: dict[str, bool] = {}
+    for line in result.stdout.splitlines():
+        key, sep, value = line.partition("=")
+        if sep and key in ("unit", "enabled", "active", "payload"):
+            flags[key] = value == "1"
+    return WifiWatchdogState(
+        unit_present=flags.get("unit", False),
+        enabled=flags.get("enabled", False),
+        active=flags.get("active", False),
+        payload_present=flags.get("payload", False),
+    )
+
+
+async def deploy_wifi_watchdog(shell: PanelShell, local_dir: str) -> None:
+    """Upload local_dir (contains brilliant_wifi_watchdog/) and swap into place.
+
+    *local_dir* is the integration payload's agent_payload/wifi_watchdog/, which
+    contains the brilliant_wifi_watchdog/ package. Stage+swap via put_dir so a
+    failed transfer never half-replaces a working install; the current dir is moved
+    aside (.bak) so a mid-swap failure stays recoverable.
+
+    Result on panel: {PANEL_WIFI_WATCHDOG_DIR}/brilliant_wifi_watchdog/run.py.
+    """
+    await shell.run(f"rm -rf {_WATCHDOG_STAGING_DIR}")
+    await shell.put_dir(local_dir, _WATCHDOG_STAGING_DIR)
+    await _checked(shell, _watchdog_swap_command())
+
+
+def _watchdog_swap_command() -> str:
+    """Move-aside swap for the watchdog directory.
+
+    Ensures the parent /var/brilliant-mqtt exists (bridge already creates it, but
+    the watchdog may be deployed standalone), moves the current install aside to
+    .bak, puts the staged dir in place, then drops the backup.  A single failed
+    mv leaves a restorable .bak rather than a missing install.
+    """
+    return " && ".join(
+        [
+            f"mkdir -p {PANEL_VAR_DIR}",
+            f"rm -rf {PANEL_WIFI_WATCHDOG_DIR}.bak",
+            f"{{ [ -e {PANEL_WIFI_WATCHDOG_DIR} ] && "
+            f"mv {PANEL_WIFI_WATCHDOG_DIR} {PANEL_WIFI_WATCHDOG_DIR}.bak; true; }}",
+            f"mv {_WATCHDOG_STAGING_DIR} {PANEL_WIFI_WATCHDOG_DIR}",
+            f"rm -rf {PANEL_WIFI_WATCHDOG_DIR}.bak",
+        ]
+    )
+
+
+async def ensure_wifi_watchdog_unit(shell: PanelShell, unit_content: str) -> None:
+    """Write the watchdog unit to /etc and a staged OTA-proof copy, then reload.
+
+    The watchdog has no env file of its own; the systemd unit uses
+    EnvironmentFile=-/etc/brilliant-mqtt.env (optional, shared with the bridge).
+    """
+    await _checked(shell, f"mkdir -p {PANEL_WIFI_WATCHDOG_DIR}")
+    unit_bytes = unit_content.encode()
+    await shell.put_bytes(unit_bytes, PANEL_WIFI_WATCHDOG_UNIT_FILE, 0o644)
+    await shell.put_bytes(unit_bytes, _WATCHDOG_STAGED_UNIT, 0o644)
+    await _checked(shell, "systemctl daemon-reload")
+
+
+async def enable_wifi_watchdog(shell: PanelShell) -> None:
+    await _checked(shell, f"systemctl enable --now {WIFI_WATCHDOG_SERVICE_NAME}")
+
+
+async def uninstall_wifi_watchdog(shell: PanelShell) -> None:
+    """Stop + disable + remove everything the Wi-Fi watchdog owns on the panel.
+
+    Removes the unit file, the code directory (+ staging sibling), and the
+    watchdog's persistent log/state files that live as siblings to the bridge's
+    PANEL_VAR_DIR.  PANEL_VAR_DIR itself is NOT removed — it belongs to the bridge.
+    """
+    await shell.run(f"systemctl disable --now {WIFI_WATCHDOG_SERVICE_NAME} 2>/dev/null || true")
+    await _checked(shell, f"rm -f {PANEL_WIFI_WATCHDOG_UNIT_FILE}")
+    await _checked(shell, f"rm -rf {PANEL_WIFI_WATCHDOG_DIR} {_WATCHDOG_STAGING_DIR}")
+    await _checked(shell, f"rm -f {_WATCHDOG_LOG_FILE} {_WATCHDOG_STATE_FILE}")
     await _checked(shell, "systemctl daemon-reload")

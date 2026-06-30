@@ -16,6 +16,10 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from custom_components.brilliant_mqtt import config_flow, panel_ops
 from custom_components.brilliant_mqtt.config_flow import _PanelProbe, _slugify, _WrongPanelError
 from custom_components.brilliant_mqtt.const import (
+    COMPONENT_BRIDGE,
+    COMPONENT_VOICE,
+    COMPONENT_WIFI_WATCHDOG,
+    CONF_COMPONENTS,
     CONF_HOST,
     CONF_MESH_PRIORITY,
     CONF_MQTT_HOST,
@@ -24,7 +28,6 @@ from custom_components.brilliant_mqtt.const import (
     CONF_MQTT_USERNAME,
     CONF_PANEL,
     CONF_ROOT_PASSWORD,
-    CONF_VOICE_ENABLED,
     CONF_VOICE_HA_HOST,
     CONF_VOICE_WAKE_WORD,
     DATA_SSH_HOST_KEY,
@@ -52,12 +55,12 @@ MQTT_INPUT = {
 SCRIPT_INPUT = {
     CONF_NAME: "Office Bath",
     CONF_MESH_PRIORITY: 1,
-    CONF_VOICE_ENABLED: False,
+    COMPONENT_VOICE: False,
     CONF_VOICE_WAKE_WORD: "okay_nabu",
     CONF_VOICE_HA_HOST: "",
 }
 
-FETCH_VOICE = "custom_components.brilliant_mqtt.config_flow.async_fetch_voice_payload"
+FETCH_VOICE = "custom_components.brilliant_mqtt.components.async_fetch_voice_payload"
 
 RECONFIG_INPUT = {
     CONF_HOST: "10.100.0.10",
@@ -67,6 +70,10 @@ RECONFIG_INPUT = {
     CONF_MQTT_USERNAME: "brilliant",
     CONF_MQTT_PASSWORD: "newbroker",
     CONF_MESH_PRIORITY: 5,
+    COMPONENT_VOICE: False,
+    COMPONENT_WIFI_WATCHDOG: False,
+    CONF_VOICE_WAKE_WORD: "okay_nabu",
+    CONF_VOICE_HA_HOST: "",
 }
 
 
@@ -104,7 +111,7 @@ def _full_entry(hass: HomeAssistant, **over: Any) -> MockConfigEntry:
         DATA_SSH_HOST_KEY: "ssh-ed25519 STORED",
     }
     data.update(over)
-    entry = MockConfigEntry(domain=DOMAIN, unique_id=data[CONF_PANEL], data=data)
+    entry = MockConfigEntry(domain=DOMAIN, unique_id=data[CONF_PANEL], data=data, version=2)
     entry.add_to_hass(hass)
     return entry
 
@@ -343,7 +350,7 @@ async def test_voice_disabled_no_voice_install(hass: HomeAssistant, payload_dir:
 
     assert result["type"] == "create_entry"
     data = result["data"]
-    assert data[CONF_VOICE_ENABLED] is False
+    assert data[CONF_COMPONENTS][COMPONENT_VOICE] is False
     assert data[CONF_VOICE_WAKE_WORD] == "okay_nabu"
     assert data[CONF_VOICE_HA_HOST] == ""
     # Voice install was NOT triggered.
@@ -362,7 +369,7 @@ async def test_voice_enabled_installs_satellite(hass: HomeAssistant, payload_dir
     install_shell = FakeShell()
     voice_input = {
         **SCRIPT_INPUT,
-        CONF_VOICE_ENABLED: True,
+        COMPONENT_VOICE: True,
         CONF_VOICE_WAKE_WORD: "hey_jarvis",
         CONF_VOICE_HA_HOST: "192.168.1.10",
     }
@@ -375,7 +382,7 @@ async def test_voice_enabled_installs_satellite(hass: HomeAssistant, payload_dir
 
     assert result["type"] == "create_entry"
     data = result["data"]
-    assert data[CONF_VOICE_ENABLED] is True
+    assert data[CONF_COMPONENTS][COMPONENT_VOICE] is True
     assert data[CONF_VOICE_WAKE_WORD] == "hey_jarvis"
     assert data[CONF_VOICE_HA_HOST] == "192.168.1.10"
     # Voice tarball was uploaded via put_file.
@@ -396,7 +403,7 @@ async def test_voice_install_failure_shows_error_no_entry(
     result = await hass.config_entries.flow.async_configure(result["flow_id"], MQTT_INPUT)
 
     install_shell = FakeShell()
-    voice_input = {**SCRIPT_INPUT, CONF_VOICE_ENABLED: True, CONF_VOICE_WAKE_WORD: "okay_nabu"}
+    voice_input = {**SCRIPT_INPUT, COMPONENT_VOICE: True, CONF_VOICE_WAKE_WORD: "okay_nabu"}
     with (
         patch.object(config_flow, "AsyncsshShell", return_value=install_shell),
         patch(FETCH_VOICE, side_effect=VoicePayloadError("download failed")),
@@ -425,12 +432,35 @@ async def test_agent_install_failure_still_cannot_install(
         patch(FETCH_VOICE) as mock_fetch,
     ):
         result = await hass.config_entries.flow.async_configure(
-            result["flow_id"], {**SCRIPT_INPUT, CONF_VOICE_ENABLED: True}
+            result["flow_id"], {**SCRIPT_INPUT, COMPONENT_VOICE: True}
         )
     assert result["type"] == "form" and result["step_id"] == "script"
     assert result["errors"] == {"base": "cannot_install"}
     # Voice fetch never reached when agent install fails.
     mock_fetch.assert_not_called()
+    assert not hass.config_entries.async_entries(DOMAIN)
+
+
+async def test_voice_component_ssh_failure_shows_voice_error_no_entry(
+    hass: HomeAssistant, payload_dir: Path
+) -> None:
+    """An SSH/OSError during voice component install (after bridge succeeds) shows
+    cannot_install_voice and creates no entry."""
+    result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": "user"})
+    with patch(PROBE, return_value=_not_installed()):
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], CONNECT_INPUT)
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], MQTT_INPUT)
+
+    voice_input = {**SCRIPT_INPUT, COMPONENT_VOICE: True, CONF_VOICE_WAKE_WORD: "okay_nabu"}
+    with (
+        patch.object(config_flow, "AsyncsshShell", return_value=FakeShell()),
+        patch(FETCH_VOICE, return_value="/tmp/fake-voice.tar.gz"),
+        patch.object(panel_ops, "deploy_voice_payload", side_effect=OSError("ssh fail")),
+    ):
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], voice_input)
+
+    assert result["type"] == "form" and result["step_id"] == "script"
+    assert result["errors"] == {"base": "cannot_install_voice"}
     assert not hass.config_entries.async_entries(DOMAIN)
 
 
@@ -445,7 +475,7 @@ async def test_script_step_rejects_control_char_in_voice_ha_host(
         result = await hass.config_entries.flow.async_configure(result["flow_id"], CONNECT_INPUT)
     result = await hass.config_entries.flow.async_configure(result["flow_id"], MQTT_INPUT)
 
-    bad_input = {**SCRIPT_INPUT, CONF_VOICE_ENABLED: True, CONF_VOICE_HA_HOST: "10.0.0.5\n"}
+    bad_input = {**SCRIPT_INPUT, COMPONENT_VOICE: True, CONF_VOICE_HA_HOST: "10.0.0.5\n"}
     # No SSH/fetch should be reached: the control char is rejected before install.
     with (
         patch.object(config_flow, "AsyncsshShell", return_value=FakeShell()) as mock_shell,
@@ -745,6 +775,45 @@ async def test_reconfigure_strips_host_whitespace_and_keeps_pin(hass: HomeAssist
     assert entry.data[CONF_HOST] == "10.100.0.10"  # stored clean
 
 
+# --- component-driven install (Task 6) ------------------------------------
+
+
+async def _drive_flow_to_script(hass: HomeAssistant) -> Any:
+    """Drive connect → broker steps and return the script-step result."""
+    result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": "user"})
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], CONNECT_INPUT)
+    assert result["step_id"] == "broker"
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], MQTT_INPUT)
+    assert result["step_id"] == "script"
+    return result
+
+
+@pytest.mark.asyncio
+async def test_install_step_persists_components(
+    hass: HomeAssistant,
+    not_installed_panel: None,
+    patch_installs: Any,
+) -> None:
+    """Enabling voice alongside bridge installs both and persists the components dict."""
+    result = await _drive_flow_to_script(hass)
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {
+            CONF_NAME: "Office",
+            CONF_MESH_PRIORITY: 0,
+            COMPONENT_VOICE: True,
+            CONF_VOICE_WAKE_WORD: "okay_nabu",
+            CONF_VOICE_HA_HOST: "",
+        },
+    )
+    assert result["type"] == "create_entry"
+    comps = result["data"][CONF_COMPONENTS]
+    assert comps[COMPONENT_BRIDGE] is True
+    assert comps[COMPONENT_VOICE] is True
+    assert patch_installs.called(COMPONENT_BRIDGE)
+    assert patch_installs.called(COMPONENT_VOICE)
+
+
 # --- options ---------------------------------------------------------------
 
 
@@ -771,3 +840,155 @@ async def test_options_flow_saves_behavior_knobs(hass: HomeAssistant) -> None:
         OPT_REPAIR_COOLDOWN_MINUTES: 30,
         OPT_TRUST_HOST_KEY_CHANGES: True,
     }
+
+
+# --- Task 7: Reconfigure — editable component checkboxes (install/remove diff) ------
+
+
+async def start_reconfigure(hass: HomeAssistant, entry: MockConfigEntry) -> Any:
+    """Start the reconfigure flow for *entry* and return the initial form result."""
+    return await entry.start_reconfigure_flow(hass)
+
+
+def reconfigure_input(
+    entry: MockConfigEntry, *, voice: bool | None = None, wifi_watchdog: bool | None = None
+) -> dict[str, Any]:
+    """Build a full reconfigure user_input dict from entry data.
+
+    *voice* overrides the COMPONENT_VOICE checkbox; None keeps the stored value.
+    *wifi_watchdog* overrides the COMPONENT_WIFI_WATCHDOG checkbox; None keeps the stored value.
+    """
+    data = entry.data
+    comps: dict[str, bool] = dict(data.get(CONF_COMPONENTS) or {})
+    current_voice = bool(comps.get(COMPONENT_VOICE, False))
+    current_wd = bool(comps.get(COMPONENT_WIFI_WATCHDOG, False))
+    return {
+        CONF_HOST: data[CONF_HOST],
+        CONF_ROOT_PASSWORD: data[CONF_ROOT_PASSWORD],
+        CONF_MQTT_HOST: data[CONF_MQTT_HOST],
+        CONF_MQTT_PORT: data[CONF_MQTT_PORT],
+        CONF_MQTT_USERNAME: data[CONF_MQTT_USERNAME],
+        CONF_MQTT_PASSWORD: data[CONF_MQTT_PASSWORD],
+        CONF_MESH_PRIORITY: data.get(CONF_MESH_PRIORITY, 0),
+        COMPONENT_VOICE: voice if voice is not None else current_voice,
+        COMPONENT_WIFI_WATCHDOG: wifi_watchdog if wifi_watchdog is not None else current_wd,
+        CONF_VOICE_WAKE_WORD: data.get(CONF_VOICE_WAKE_WORD, "okay_nabu"),
+        CONF_VOICE_HA_HOST: data.get(CONF_VOICE_HA_HOST, ""),
+    }
+
+
+@pytest.mark.asyncio
+async def test_reconfigure_uncheck_voice_removes(
+    hass: HomeAssistant,
+    installed_voice_entry: MockConfigEntry,
+    patch_installs: Any,
+) -> None:
+    """Unchecking voice in reconfigure removes the component and persists the change."""
+    result = await start_reconfigure(hass, installed_voice_entry)
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], reconfigure_input(installed_voice_entry, voice=False)
+    )
+    assert result["type"] == "abort" and result["reason"] == "reconfigure_successful"
+    assert installed_voice_entry.data[CONF_COMPONENTS][COMPONENT_VOICE] is False
+    assert patch_installs.removed(COMPONENT_VOICE)
+
+
+@pytest.mark.asyncio
+async def test_reconfigure_check_voice_installs(
+    hass: HomeAssistant,
+    patch_installs: Any,
+) -> None:
+    """Checking voice in reconfigure installs the component and persists the change."""
+    entry = _full_entry(hass, **{CONF_COMPONENTS: {COMPONENT_BRIDGE: True, COMPONENT_VOICE: False}})
+    result = await start_reconfigure(hass, entry)
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], reconfigure_input(entry, voice=True)
+    )
+    assert result["type"] == "abort" and result["reason"] == "reconfigure_successful"
+    assert entry.data[CONF_COMPONENTS][COMPONENT_VOICE] is True
+    assert patch_installs.called(COMPONENT_VOICE)
+
+
+@pytest.mark.asyncio
+async def test_reconfigure_no_change_skips_install_remove(
+    hass: HomeAssistant,
+    patch_installs: Any,
+) -> None:
+    """When the component selection is unchanged, neither install nor remove fires."""
+    entry = _full_entry(hass, **{CONF_COMPONENTS: {COMPONENT_BRIDGE: True, COMPONENT_VOICE: False}})
+    result = await start_reconfigure(hass, entry)
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], reconfigure_input(entry, voice=False)
+    )
+    assert result["type"] == "abort" and result["reason"] == "reconfigure_successful"
+    assert not patch_installs.called(COMPONENT_VOICE)
+    assert not patch_installs.removed(COMPONENT_VOICE)
+
+
+@pytest.mark.asyncio
+async def test_reconfigure_rejects_control_char_in_voice_ha_host(
+    hass: HomeAssistant,
+) -> None:
+    """A control char in voice_ha_host surfaces invalid_value; no SSH attempted."""
+    entry = _full_entry(hass)
+    result = await start_reconfigure(hass, entry)
+    bad_input = {**reconfigure_input(entry), CONF_VOICE_HA_HOST: "10.0.0.5\n"}
+    with patch(APPLY) as apply:
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], bad_input)
+    assert result["type"] == "form"
+    assert result["errors"] == {CONF_VOICE_HA_HOST: "invalid_value"}
+    apply.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reconfigure_migrated_entry_watchdog_default_not_preselected(
+    hass: HomeAssistant,
+    patch_installs: Any,
+) -> None:
+    """Fix #2: an existing panel WITHOUT the wifi_watchdog key must show the checkbox
+    UNCHECKED on reconfigure, so a no-change Save does NOT install the watchdog.
+
+    Before the fix, _components_schema_fields used ``c.default_enabled`` (True for
+    wifi_watchdog) as the fallback for any key absent from CONF_COMPONENTS, making
+    the reconfigure form render the checkbox pre-checked on all 14 migrated panels.
+    A no-change Save would then drive was=False → now=True → install called.
+
+    After the fix (new_install=False on async_step_reconfigure), the fallback for
+    an absent key is False, so the box is unchecked and a no-change Save is a no-op.
+
+    This test FAILS against current code (schema default is True, not False) and
+    PASSES after the fix (schema default is False).
+    """
+    import voluptuous as vol
+
+    # Migrated entry: no wifi_watchdog key at all in CONF_COMPONENTS.
+    entry = _full_entry(
+        hass,
+        **{CONF_COMPONENTS: {COMPONENT_BRIDGE: True, COMPONENT_VOICE: False}},
+    )
+    result = await entry.start_reconfigure_flow(hass)
+    assert result["type"] == "form" and result["step_id"] == "reconfigure"
+
+    # The schema default for wifi_watchdog must be False for an existing entry that
+    # does not have the key (was True before the fix → pre-checked → auto-install bug).
+    schema = result["data_schema"]
+    assert schema is not None
+    wd_default: bool | None = None
+    for marker in schema.schema:
+        if str(marker) == COMPONENT_WIFI_WATCHDOG:
+            raw = marker.default
+            wd_default = raw() if raw is not vol.UNDEFINED and callable(raw) else raw
+            break
+    assert wd_default is False, (
+        f"wifi_watchdog reconfigure default must be False for a migrated entry "
+        f"(got {wd_default!r}; before the fix it was True)"
+    )
+
+    # A no-change submit (wifi_watchdog stays False) must not call install or remove.
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        reconfigure_input(entry),  # wifi_watchdog=False since not in entry.data
+    )
+    assert result["type"] == "abort" and result["reason"] == "reconfigure_successful"
+    assert not patch_installs.called(COMPONENT_WIFI_WATCHDOG)
+    assert not patch_installs.removed(COMPONENT_WIFI_WATCHDOG)

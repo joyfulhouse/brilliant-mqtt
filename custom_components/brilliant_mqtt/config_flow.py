@@ -21,8 +21,12 @@ from homeassistant.config_entries import ConfigEntry, ConfigFlow, ConfigFlowResu
 from homeassistant.const import CONF_NAME
 from homeassistant.core import HomeAssistant, callback
 
-from . import _fleet_lock, manager, panel_ops
+from . import _fleet_lock, panel_ops
+from .components import REGISTRY, optional
 from .const import (
+    COMPONENT_BRIDGE,
+    COMPONENT_VOICE,
+    CONF_COMPONENTS,
     CONF_HOST,
     CONF_MESH_PRIORITY,
     CONF_MQTT_HOST,
@@ -31,7 +35,6 @@ from .const import (
     CONF_MQTT_USERNAME,
     CONF_PANEL,
     CONF_ROOT_PASSWORD,
-    CONF_VOICE_ENABLED,
     CONF_VOICE_HA_HOST,
     CONF_VOICE_WAKE_WORD,
     DATA_SSH_HOST_KEY,
@@ -46,12 +49,10 @@ from .const import (
     OPT_OFFLINE_GRACE_MINUTES,
     OPT_REPAIR_COOLDOWN_MINUTES,
     OPT_TRUST_HOST_KEY_CHANGES,
-    VOICE_PAYLOAD_VERSION,
     VOICE_WAKE_WORDS,
-    panel_device_name,
 )
 from .shell import AsyncsshShell, PanelShell
-from .voice_payload import VoicePayloadError, async_fetch_voice_payload
+from .voice_payload import VoicePayloadError
 
 # Entry-data keys whose values pre-fill the NEXT add-panel MQTT step. Only the broker
 # creds are genuinely fleet-shared; the root password is deliberately excluded — the
@@ -118,16 +119,34 @@ def _mqtt_schema_fields(source: Mapping[str, Any]) -> dict[Any, Any]:
     }
 
 
-def _voice_schema_fields(source: Mapping[str, Any]) -> dict[Any, Any]:
-    """Voice opt-in fields for the onboarding script step."""
-    return {
-        vol.Required(CONF_VOICE_ENABLED, default=source.get(CONF_VOICE_ENABLED, False)): bool,
+def _components_schema_fields(
+    source: Mapping[str, Any], *, new_install: bool = True
+) -> dict[Any, Any]:
+    """One checkbox per OPTIONAL component (bridge is implicit/locked), plus voice sub-fields.
+
+    *new_install* controls the fallback default for keys absent from the entry's
+    CONF_COMPONENTS dict:
+
+    - ``True`` (new installs / script step): fall back to ``c.default_enabled`` so
+      default-on components (e.g. wifi_watchdog) render pre-checked on first setup.
+    - ``False`` (existing panels / reconfigure step): fall back to ``False`` so a
+      panel that was onboarded before the component existed does NOT accidentally get
+      it installed on a no-change reconfigure Save.
+    """
+    chosen: Mapping[str, Any] = source.get(CONF_COMPONENTS, {})
+    fields: dict[Any, Any] = {}
+    for c in optional():
+        default = chosen.get(c.id, c.default_enabled if new_install else False)
+        fields[vol.Required(c.id, default=default)] = bool
+    # Voice sub-config (meaningful only when voice is checked; validated leniently).
+    fields[
         vol.Required(
             CONF_VOICE_WAKE_WORD,
             default=source.get(CONF_VOICE_WAKE_WORD, DEFAULT_VOICE_WAKE_WORD),
-        ): vol.In(list(VOICE_WAKE_WORDS)),
-        vol.Optional(CONF_VOICE_HA_HOST, default=source.get(CONF_VOICE_HA_HOST, "")): str,
-    }
+        )
+    ] = vol.In(list(VOICE_WAKE_WORDS))
+    fields[vol.Optional(CONF_VOICE_HA_HOST, default=source.get(CONF_VOICE_HA_HOST, ""))] = str
+    return fields
 
 
 def _slugify(name: str) -> str:
@@ -256,58 +275,10 @@ async def _apply_config(
         return key
 
 
-async def _install_agent(
-    hass: HomeAssistant,
-    host: str,
-    password: str,
-    *,
-    pinned_key: str,
-    payload_dir: str,
-    version: str,
-    unit: str,
-    env: str,
-) -> None:
-    """First-install the agent over SSH for a not-yet-installed panel.
-
-    Pushes the bundled payload (deploy_payload), writes the systemd unit + env
-    (ensure_configs), and enables + starts the service (enable_now) — so adding the
-    integration actually sets the panel up instead of waiting for a separate repair.
-    The host key was pinned by the step-1 probe, so this connect verifies before auth.
-
-    Like the manager's deploy paths, this holds the fleet-wide SSH lock for the whole
-    session (the payload upload included). The upload is small (a few hundred KB) and
-    the lock is released when _panel_session exits, including on flow cancellation.
-    """
-    async with _panel_session(hass, host, password, pinned_key) as shell:
-        await panel_ops.deploy_payload(shell, payload_dir, version)
-        await panel_ops.ensure_configs(shell, unit, env)
-        await panel_ops.enable_now(shell)
-
-
-async def _install_voice(
-    hass: HomeAssistant,
-    host: str,
-    password: str,
-    *,
-    pinned_key: str,
-    tarball: str,
-    env: str,
-) -> None:
-    """First-install the voice satellite over SSH (payload + unit/env + enable).
-
-    The host key was pinned in step 1, so this connect verifies before auth. Holds
-    the fleet SSH lock for the session (the tarball upload included).
-    """
-    async with _panel_session(hass, host, password, pinned_key) as shell:
-        await panel_ops.deploy_voice_payload(shell, tarball, VOICE_PAYLOAD_VERSION)
-        await panel_ops.ensure_voice_config(shell, env)
-        await panel_ops.enable_voice(shell)
-
-
 class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
     """Add one Brilliant panel per entry (detection-first; adopts installed agents)."""
 
-    VERSION = 1
+    VERSION = 2
 
     def __init__(self) -> None:
         # Carried across the not-installed onboarding steps (user → mqtt → script).
@@ -413,83 +384,48 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
             if not errors:
                 await self.async_set_unique_id(slug)
                 self._abort_if_unique_id_configured()
-                env = panel_ops.render_env(
-                    panel=slug,
-                    mesh_priority=user_input[CONF_MESH_PRIORITY],
-                    mqtt_host=self._mqtt[CONF_MQTT_HOST],
-                    mqtt_port=self._mqtt[CONF_MQTT_PORT],
-                    mqtt_username=self._mqtt[CONF_MQTT_USERNAME],
-                    mqtt_password=self._mqtt[CONF_MQTT_PASSWORD],
-                )
+                components: dict[str, bool] = {COMPONENT_BRIDGE: True}
+                for c in optional():
+                    components[c.id] = bool(user_input.get(c.id, False))
+                entry_data: dict[str, Any] = {
+                    **self._connect,
+                    **self._mqtt,
+                    CONF_PANEL: slug,
+                    CONF_MESH_PRIORITY: user_input[CONF_MESH_PRIORITY],
+                    CONF_COMPONENTS: components,
+                    CONF_VOICE_WAKE_WORD: user_input[CONF_VOICE_WAKE_WORD],
+                    CONF_VOICE_HA_HOST: user_input[CONF_VOICE_HA_HOST],
+                }
+                current_cid: str | None = None
                 try:
-                    # Read the bundled payload (unit/VERSION) inside the try so a missing
-                    # or corrupt bundle surfaces as cannot_install, not an unhandled crash.
-                    payload_dir = manager._payload_dir()
-                    unit = await self.hass.async_add_executor_job(
-                        (payload_dir / "brilliant-mqtt.service").read_text
-                    )
-                    version = (
-                        await self.hass.async_add_executor_job((payload_dir / "VERSION").read_text)
-                    ).strip()
-                    await _install_agent(
-                        self.hass,
-                        self._connect[CONF_HOST],
-                        self._connect[CONF_ROOT_PASSWORD],
-                        pinned_key=self._connect[DATA_SSH_HOST_KEY],
-                        payload_dir=str(payload_dir),
-                        version=version,
-                        unit=unit,
-                        env=env,
-                    )
+                    for cid, selected in components.items():
+                        if not selected:
+                            continue
+                        current_cid = cid
+                        async with _panel_session(
+                            self.hass,
+                            self._connect[CONF_HOST],
+                            self._connect[CONF_ROOT_PASSWORD],
+                            self._connect[DATA_SSH_HOST_KEY],
+                        ) as shell:
+                            await REGISTRY[cid].install(self.hass, shell, entry_data)
+                except VoicePayloadError:
+                    errors["base"] = "cannot_install_voice"
                 except (OSError, asyncssh.Error, panel_ops.PanelOpError):
-                    errors["base"] = "cannot_install"
+                    errors["base"] = (
+                        "cannot_install_voice"
+                        if current_cid == COMPONENT_VOICE
+                        else "cannot_install"
+                    )
                 else:
-                    if user_input[CONF_VOICE_ENABLED]:
-                        try:
-                            tarball = await async_fetch_voice_payload(self.hass)
-                            voice_env = panel_ops.render_voice_env(
-                                panel=slug,
-                                name=panel_device_name(slug),
-                                api_port=6053,
-                                wake_word=user_input[CONF_VOICE_WAKE_WORD],
-                                ha_host=user_input[CONF_VOICE_HA_HOST],
-                                enable_aec=False,
-                            )
-                            await _install_voice(
-                                self.hass,
-                                self._connect[CONF_HOST],
-                                self._connect[CONF_ROOT_PASSWORD],
-                                pinned_key=self._connect[DATA_SSH_HOST_KEY],
-                                tarball=tarball,
-                                env=voice_env,
-                            )
-                        except (
-                            VoicePayloadError,
-                            OSError,
-                            asyncssh.Error,
-                            panel_ops.PanelOpError,
-                        ):
-                            errors["base"] = "cannot_install_voice"
-                    if not errors:
-                        return self.async_create_entry(
-                            title=f"Brilliant {slug}",
-                            data={
-                                **self._connect,
-                                **self._mqtt,
-                                CONF_PANEL: slug,
-                                CONF_MESH_PRIORITY: user_input[CONF_MESH_PRIORITY],
-                                CONF_VOICE_ENABLED: user_input[CONF_VOICE_ENABLED],
-                                CONF_VOICE_WAKE_WORD: user_input[CONF_VOICE_WAKE_WORD],
-                                CONF_VOICE_HA_HOST: user_input[CONF_VOICE_HA_HOST],
-                            },
-                        )
+                    return self.async_create_entry(title=f"Brilliant {slug}", data=entry_data)
         schema = vol.Schema(
             {
                 vol.Required(CONF_NAME): str,
                 vol.Required(CONF_MESH_PRIORITY, default=0): vol.All(
                     vol.Coerce(int), vol.Range(min=0, max=99)
                 ),
-                **_voice_schema_fields({}),
+                **_components_schema_fields({}),
             }
         )
         # Preserve name + mesh + voice fields across an error redisplay.
@@ -500,7 +436,10 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
     async def async_step_reconfigure(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Edit host/password/broker/mesh for one panel and push it (slug is immutable)."""
+        """Edit host/password/broker/mesh/components for one panel and push it.
+
+        The panel slug (CONF_PANEL) is immutable after onboarding.
+        """
         entry = self._get_reconfigure_entry()
         errors: dict[str, str] = {}
         if user_input is not None:
@@ -508,6 +447,11 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
             # whitespace — otherwise a stray trailing space would read as a "different"
             # host and downgrade the same-host pinned check to a fresh TOFU.
             errors = _control_char_errors(user_input, _NO_CONTROL_CHARS)
+            # voice_ha_host is now on this form; validate it for control chars too
+            # (a control char there crashes render_voice_env → _env_quote).
+            ha_host_val = str(user_input.get(CONF_VOICE_HA_HOST, ""))
+            if _has_control_char(ha_host_val):
+                errors[CONF_VOICE_HA_HOST] = "invalid_value"
             if not errors:
                 user_input = {**user_input, CONF_HOST: user_input[CONF_HOST].strip()}
                 # Same host → verify the rotated password against the STORED pin (key
@@ -553,10 +497,50 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
                         # Connected fine, but writing the env / restarting failed.
                         errors["base"] = "cannot_apply"
                     else:
-                        return self.async_update_reload_and_abort(
-                            entry,
-                            data={**entry.data, **user_input, DATA_SSH_HOST_KEY: host_key},
-                        )
+                        # Env push succeeded — now diff and apply component changes.
+                        current: dict[str, Any] = dict(entry.data.get(CONF_COMPONENTS) or {})
+                        desired = {
+                            c.id: bool(user_input.get(c.id, current.get(c.id, False)))
+                            for c in optional()
+                        }
+                        desired[COMPONENT_BRIDGE] = True
+                        # Strip optional-component checkbox ids (e.g. "voice") from
+                        # user_input before merging: those belong only in CONF_COMPONENTS,
+                        # not as top-level stray keys in entry data.
+                        _opt_ids = {c.id for c in optional()}
+                        clean_input = {k: v for k, v in user_input.items() if k not in _opt_ids}
+                        new_data: dict[str, Any] = {
+                            **entry.data,
+                            **clean_input,
+                            DATA_SSH_HOST_KEY: host_key,
+                            CONF_COMPONENTS: desired,
+                        }
+                        try:
+                            for c in optional():
+                                was: bool = bool(current.get(c.id, False))
+                                now: bool = desired[c.id]
+                                if now and not was:
+                                    async with _panel_session(
+                                        self.hass,
+                                        user_input[CONF_HOST],
+                                        user_input[CONF_ROOT_PASSWORD],
+                                        host_key,
+                                    ) as shell:
+                                        await REGISTRY[c.id].install(self.hass, shell, new_data)
+                                elif was and not now:
+                                    async with _panel_session(
+                                        self.hass,
+                                        user_input[CONF_HOST],
+                                        user_input[CONF_ROOT_PASSWORD],
+                                        host_key,
+                                    ) as shell:
+                                        await REGISTRY[c.id].remove(shell)
+                        except VoicePayloadError:
+                            errors["base"] = "cannot_install_voice"
+                        except (OSError, asyncssh.Error, panel_ops.PanelOpError):
+                            errors["base"] = "cannot_apply"
+                        else:
+                            return self.async_update_reload_and_abort(entry, data=new_data)
         data = entry.data
         schema = vol.Schema(
             {
@@ -566,6 +550,7 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
                 vol.Required(CONF_MESH_PRIORITY, default=data.get(CONF_MESH_PRIORITY, 0)): vol.All(
                     vol.Coerce(int), vol.Range(min=0, max=99)
                 ),
+                **_components_schema_fields(data, new_install=False),
             }
         )
         # Keep the operator's just-made edits across an error redisplay (a transient
