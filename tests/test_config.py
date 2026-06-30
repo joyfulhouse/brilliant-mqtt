@@ -192,3 +192,37 @@ class TestSettings:
 
         s = Settings.from_env()
         assert s.reconnect_storm_threshold == 0
+
+    def test_reconcile_defaults(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Default motion reconciler settings."""
+        monkeypatch.setenv("BRILLIANT_PANEL", "office")
+        monkeypatch.setenv("MQTT_HOST", "10.0.0.1")
+        monkeypatch.setenv("MQTT_USERNAME", "brilliant")
+        monkeypatch.setenv("MQTT_PASSWORD", "s3cr3t")
+        monkeypatch.delenv("MOTION_RECONCILE_ENABLED", raising=False)
+        monkeypatch.delenv("MOTION_RECONCILE_MIN_INTERVAL_S", raising=False)
+        monkeypatch.delenv("MOTION_RECONCILE_MAX_WRITES_PER_TICK", raising=False)
+        monkeypatch.delenv("MOTION_DESIRED_STATE_DIR", raising=False)
+
+        s = Settings.from_env()
+        assert s.motion_reconcile_enabled is True
+        assert s.motion_reconcile_min_interval_s == 60.0
+        assert s.motion_reconcile_max_writes_per_tick == 4
+        assert s.motion_desired_state_dir == "/var/brilliant-mqtt/state"
+
+    def test_reconcile_env_overrides(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Motion reconciler settings parsed from environment."""
+        monkeypatch.setenv("BRILLIANT_PANEL", "office")
+        monkeypatch.setenv("MQTT_HOST", "10.0.0.1")
+        monkeypatch.setenv("MQTT_USERNAME", "brilliant")
+        monkeypatch.setenv("MQTT_PASSWORD", "s3cr3t")
+        monkeypatch.setenv("MOTION_RECONCILE_ENABLED", "0")
+        monkeypatch.setenv("MOTION_RECONCILE_MIN_INTERVAL_S", "15")
+        monkeypatch.setenv("MOTION_RECONCILE_MAX_WRITES_PER_TICK", "8")
+        monkeypatch.setenv("MOTION_DESIRED_STATE_DIR", "/tmp/state")
+
+        s = Settings.from_env()
+        assert s.motion_reconcile_enabled is False
+        assert s.motion_reconcile_min_interval_s == 15.0
+        assert s.motion_reconcile_max_writes_per_tick == 8
+        assert s.motion_desired_state_dir == "/tmp/state"

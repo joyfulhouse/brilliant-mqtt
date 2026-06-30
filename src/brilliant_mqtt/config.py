@@ -44,6 +44,16 @@ class Settings:
     # disables the breaker.
     reconnect_storm_threshold: int = 20
     reconnect_storm_window_seconds: float = 60.0
+    # Motion reconciliation: periodically enforce desired motion state on panels
+    # (e.g., force motion to "no motion" when a timer or schedule says so).
+    # Enabled by default; "0" disables.
+    motion_reconcile_enabled: bool = True
+    # Minimum seconds between reconciliation ticks to avoid churn.
+    motion_reconcile_min_interval_s: float = 60.0
+    # Maximum writes per reconciliation tick to spread state updates.
+    motion_reconcile_max_writes_per_tick: int = 4
+    # Directory path where desired motion state is stored.
+    motion_desired_state_dir: str = "/var/brilliant-mqtt/state"
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -57,7 +67,11 @@ class Settings:
                   MESH_HEARTBEAT_SECONDS (default 10.0),
                   RECONNECT_STORM_THRESHOLD (default 20: reconnects within the
                   window that trip a session rebuild; 0 disables),
-                  RECONNECT_STORM_WINDOW_SECONDS (default 60).
+                  RECONNECT_STORM_WINDOW_SECONDS (default 60),
+                  MOTION_RECONCILE_ENABLED (default "1": "0" disables),
+                  MOTION_RECONCILE_MIN_INTERVAL_S (default 60.0),
+                  MOTION_RECONCILE_MAX_WRITES_PER_TICK (default 4),
+                  MOTION_DESIRED_STATE_DIR (default "/var/brilliant-mqtt/state").
 
         Raises KeyError when a required variable is absent.
         """
@@ -79,6 +93,12 @@ class Settings:
         mesh_heartbeat_seconds = float(env.get("MESH_HEARTBEAT_SECONDS", "10.0"))
         reconnect_storm_threshold = int(env.get("RECONNECT_STORM_THRESHOLD", "20"))
         reconnect_storm_window_seconds = float(env.get("RECONNECT_STORM_WINDOW_SECONDS", "60"))
+        motion_reconcile_enabled = env.get("MOTION_RECONCILE_ENABLED", "1") != "0"
+        motion_reconcile_min_interval_s = float(env.get("MOTION_RECONCILE_MIN_INTERVAL_S", "60"))
+        motion_reconcile_max_writes_per_tick = int(
+            env.get("MOTION_RECONCILE_MAX_WRITES_PER_TICK", "4")
+        )
+        motion_desired_state_dir = env.get("MOTION_DESIRED_STATE_DIR", "/var/brilliant-mqtt/state")
 
         return cls(
             panel=panel,
@@ -94,4 +114,8 @@ class Settings:
             mesh_heartbeat_seconds=mesh_heartbeat_seconds,
             reconnect_storm_threshold=reconnect_storm_threshold,
             reconnect_storm_window_seconds=reconnect_storm_window_seconds,
+            motion_reconcile_enabled=motion_reconcile_enabled,
+            motion_reconcile_min_interval_s=motion_reconcile_min_interval_s,
+            motion_reconcile_max_writes_per_tick=motion_reconcile_max_writes_per_tick,
+            motion_desired_state_dir=motion_desired_state_dir,
         )
