@@ -637,7 +637,7 @@ async def test_deploy_wifi_watchdog_failed_upload_records_no_destructive_swap() 
     with pytest.raises(OSError, match="transfer aborted"):
         await panel_ops.deploy_wifi_watchdog(shell, "/local/wifi_watchdog")
     assert shell.commands == ["rm -rf /var/brilliant-mqtt/wifi_watchdog.staging"]
-    assert shell.uploads == []
+    assert shell.dir_uploads == []  # the put_dir failed → staging dir was never uploaded
 
 
 async def test_deploy_wifi_watchdog_raises_when_swap_fails() -> None:

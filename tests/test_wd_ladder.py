@@ -33,6 +33,7 @@ def test_soft_then_restart_then_reboot_each_once() -> None:
     assert Action.RESTART_SERVICES in actions
     assert Action.GPIO_RESET_REBOOT in actions
     assert actions.count(Action.SOFT_RECONNECT) == 1
+    assert actions.count(Action.RESTART_SERVICES) == 1
     assert actions.count(Action.GPIO_RESET_REBOOT) == 1
 
 

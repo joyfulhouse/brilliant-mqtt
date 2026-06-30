@@ -23,7 +23,9 @@ def default_gateway(run: Callable[[list[str]], tuple[int, str]] = _run_out) -> s
     for line in out.splitlines():
         parts = line.split()
         if "via" in parts:
-            return parts[parts.index("via") + 1]
+            idx = parts.index("via") + 1
+            if idx < len(parts):  # guard: "default via" with no following token
+                return parts[idx]
     return None
 
 

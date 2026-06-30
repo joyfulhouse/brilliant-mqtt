@@ -45,9 +45,25 @@ def test_reboot_blocked_when_guard_denies() -> None:
 
 
 def test_reboot_runs_and_records_when_allowed() -> None:
-    g, rec = FakeGuard(True), FakeRecovery()
+    """Reboot guard is recorded BEFORE the reboot fires (crash-safe stamp ordering)."""
+    order: list[str] = []
+
+    class TrackingGuard(FakeGuard):
+        def record(self, now: float) -> None:
+            super().record(now)
+            order.append("record")
+
+    class TrackingRecovery(FakeRecovery):
+        def gpio_reset_and_reboot(self) -> None:
+            super().gpio_reset_and_reboot()
+            order.append("reboot")
+
+    g, rec = TrackingGuard(True), TrackingRecovery()
     run.handle(Action.GPIO_RESET_REBOOT, guard=g, now=5.0, recovery_mod=rec)
     assert rec.calls == ["reboot"] and g.recorded == [5.0]
+    # Stamp written to disk before the reboot command fires so a crash/power cut
+    # during reboot still counts against the cap (no infinite reboot loop).
+    assert order == ["record", "reboot"]
 
 
 # ---------------------------------------------------------------------------
