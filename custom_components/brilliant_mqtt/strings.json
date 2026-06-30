@@ -29,14 +29,14 @@
         "data": {
           "name": "Panel Name",
           "mesh_priority": "Mesh priority",
-          "voice_enabled": "Enable voice satellite",
+          "voice": "Enable voice satellite",
           "voice_wake_word": "Wake word",
           "voice_ha_host": "Home Assistant host override (optional)"
         },
         "data_description": {
           "name": "A friendly name, e.g. \"Office Bath\". A lowercase id is derived for MQTT topics (\"Office Bath\" → office-bath).",
           "mesh_priority": "0 = this panel never publishes the BLE mesh. Among positive values the LOWEST wins leader election (1 = primary, 2/3 = standbys).",
-          "voice_enabled": "Install a Home Assistant voice satellite on this panel (on-panel wake word + microphone + speaker). Speech-to-text, the conversation agent, and text-to-speech all run in your HA Assist pipeline — nothing voice-specific is configured on the panel.",
+          "voice": "Install a Home Assistant voice satellite on this panel (on-panel wake word + microphone + speaker). Speech-to-text, the conversation agent, and text-to-speech all run in your HA Assist pipeline — nothing voice-specific is configured on the panel.",
           "voice_wake_word": "The on-panel wake word that activates the satellite.",
           "voice_ha_host": "Only needed if the panel cannot resolve your Home Assistant URL's hostname (e.g. a segmented IoT VLAN). Format: hostname=ip, e.g. homeassistant.example=10.0.0.5. Leave blank to use the panel's own DNS."
         }
@@ -51,7 +51,15 @@
           "mqtt_port": "Broker port",
           "mqtt_username": "Broker username",
           "mqtt_password": "Broker password",
-          "mesh_priority": "Mesh priority"
+          "mesh_priority": "Mesh priority",
+          "voice": "Enable voice satellite",
+          "voice_wake_word": "Wake word",
+          "voice_ha_host": "Home Assistant host override (optional)"
+        },
+        "data_description": {
+          "voice": "Install a Home Assistant voice satellite on this panel (on-panel wake word + microphone + speaker). Speech-to-text, the conversation agent, and text-to-speech all run in your HA Assist pipeline — nothing voice-specific is configured on the panel.",
+          "voice_wake_word": "The on-panel wake word that activates the satellite.",
+          "voice_ha_host": "Only needed if the panel cannot resolve your Home Assistant URL's hostname (e.g. a segmented IoT VLAN). Format: hostname=ip, e.g. homeassistant.example=10.0.0.5. Leave blank to use the panel's own DNS."
         }
       }
     },
