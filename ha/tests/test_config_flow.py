@@ -437,6 +437,29 @@ async def test_agent_install_failure_still_cannot_install(
     assert not hass.config_entries.async_entries(DOMAIN)
 
 
+async def test_voice_component_ssh_failure_shows_voice_error_no_entry(
+    hass: HomeAssistant, payload_dir: Path
+) -> None:
+    """An SSH/OSError during voice component install (after bridge succeeds) shows
+    cannot_install_voice and creates no entry."""
+    result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": "user"})
+    with patch(PROBE, return_value=_not_installed()):
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], CONNECT_INPUT)
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], MQTT_INPUT)
+
+    voice_input = {**SCRIPT_INPUT, COMPONENT_VOICE: True, CONF_VOICE_WAKE_WORD: "okay_nabu"}
+    with (
+        patch.object(config_flow, "AsyncsshShell", return_value=FakeShell()),
+        patch(FETCH_VOICE, return_value="/tmp/fake-voice.tar.gz"),
+        patch.object(panel_ops, "deploy_voice_payload", side_effect=OSError("ssh fail")),
+    ):
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], voice_input)
+
+    assert result["type"] == "form" and result["step_id"] == "script"
+    assert result["errors"] == {"base": "cannot_install_voice"}
+    assert not hass.config_entries.async_entries(DOMAIN)
+
+
 async def test_script_step_rejects_control_char_in_voice_ha_host(
     hass: HomeAssistant, payload_dir: Path
 ) -> None:
