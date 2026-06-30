@@ -15,7 +15,8 @@ from pytest_homeassistant_custom_component.common import (
 from pytest_homeassistant_custom_component.typing import MqttMockHAClient
 
 from custom_components.brilliant_mqtt.const import (
-    CONF_VOICE_ENABLED,
+    COMPONENT_VOICE,
+    CONF_COMPONENTS,
     CONF_VOICE_WAKE_WORD,
     DEFAULT_VOICE_WAKE_WORD,
     DOMAIN,
@@ -145,7 +146,7 @@ async def test_update_install_deploys_payload_and_restarts(
 async def test_voice_switch_exists_and_reflects_entry_data(
     hass: HomeAssistant, mqtt_mock: MqttMockHAClient, fake_shell: FakeShell, payload_dir: Path
 ) -> None:
-    """Voice satellite switch reflects CONF_VOICE_ENABLED from entry.data."""
+    """Voice satellite switch reflects components dict from entry.data."""
     entry = await _setup(hass)
     manager = entry.runtime_data
 
@@ -155,7 +156,9 @@ async def test_voice_switch_exists_and_reflects_entry_data(
     assert state.state == "off"
 
     # Update entry data to enable voice; fire manager notify to push state refresh.
-    hass.config_entries.async_update_entry(entry, data={**entry.data, CONF_VOICE_ENABLED: True})
+    hass.config_entries.async_update_entry(
+        entry, data={**entry.data, CONF_COMPONENTS: {COMPONENT_VOICE: True}}
+    )
     manager._notify()
     await hass.async_block_till_done()
     state = hass.states.get(VOICE_SWITCH)
