@@ -123,6 +123,11 @@ PANEL_VOICE_ENV_FILE = "/etc/brilliant-voice.env"
 PANEL_VOICE_UNIT_FILE = "/etc/systemd/system/brilliant-voice.service"
 VOICE_SERVICE_NAME = "brilliant-voice"
 
+# On-panel Wi-Fi watchdog paths (stdlib script tree under the OTA-proof /var bridge dir).
+PANEL_WIFI_WATCHDOG_DIR = f"{PANEL_VAR_DIR}/wifi_watchdog"
+PANEL_WIFI_WATCHDOG_UNIT_FILE = "/etc/systemd/system/brilliant-wifi-watchdog.service"
+WIFI_WATCHDOG_SERVICE_NAME = "brilliant-wifi-watchdog"
+
 EVENT_TYPE = "brilliant_mqtt_event"
 SIGNAL_PANEL_STATE = f"{DOMAIN}_panel_state"  # dispatcher: f"{SIGNAL_PANEL_STATE}_{entry_id}"
 
