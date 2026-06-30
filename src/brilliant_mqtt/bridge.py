@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from collections.abc import Callable
 from dataclasses import replace
 
 from brilliant_mqtt import __version__
 from brilliant_mqtt.commands import VarSet, translate_aux, translate_command
+from brilliant_mqtt.desired_state import RECONCILED_VARS, DesiredState
 from brilliant_mqtt.discovery import (
     aux_command_topic,
     availability_topic,
@@ -77,6 +79,10 @@ class Bridge:
         panel: str,
         *,
         include: Callable[[BrilliantDevice], bool] | None = None,
+        desired: DesiredState | None = None,
+        reconcile_min_interval_s: float = 60.0,
+        reconcile_max_writes_per_tick: int = 4,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._bus = bus
         self._mqtt = mqtt
@@ -88,6 +94,13 @@ class Bridge:
         # so each bridge must drop out-of-scope devices before computing
         # entities or storing snapshots.
         self._include = include
+        # Desired-state reconciliation (None => disabled; behaves as before).
+        self._desired = desired
+        self._reconcile_min_interval_s = reconcile_min_interval_s
+        self._reconcile_max_writes_per_tick = reconcile_max_writes_per_tick
+        self._clock = clock
+        # (peripheral_id, var) -> monotonic time of last re-assert attempt.
+        self._last_reassert: dict[tuple[str, str], float] = {}
 
         # peripheral_id → most recent BrilliantDevice snapshot.
         self._devices: dict[str, BrilliantDevice] = {}
@@ -341,6 +354,8 @@ class Bridge:
         if value is None:
             logger.debug("aux command on %s (%r) did not translate; ignoring", topic, payload)
             return
+        if self._desired is not None and d.command_var in RECONCILED_VARS:
+            self._desired.record(peripheral_id, d.command_var, value)
         device = self._devices.get(peripheral_id)
         if device is None:
             # Without a snapshot we cannot know which bus device owns the
