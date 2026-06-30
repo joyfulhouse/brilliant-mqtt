@@ -35,7 +35,6 @@ from .const import (
     CONF_MQTT_USERNAME,
     CONF_PANEL,
     CONF_ROOT_PASSWORD,
-    CONF_VOICE_ENABLED,
     CONF_VOICE_HA_HOST,
     CONF_VOICE_WAKE_WORD,
     DATA_SSH_HOST_KEY,
@@ -381,8 +380,6 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
                     CONF_PANEL: slug,
                     CONF_MESH_PRIORITY: user_input[CONF_MESH_PRIORITY],
                     CONF_COMPONENTS: components,
-                    # Transitional backward-compat key so existing readers are unbroken.
-                    CONF_VOICE_ENABLED: components.get(COMPONENT_VOICE, False),
                     CONF_VOICE_WAKE_WORD: user_input[CONF_VOICE_WAKE_WORD],
                     CONF_VOICE_HA_HOST: user_input[CONF_VOICE_HA_HOST],
                 }
@@ -494,9 +491,14 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
                             for c in optional()
                         }
                         desired[COMPONENT_BRIDGE] = True
+                        # Strip optional-component checkbox ids (e.g. "voice") from
+                        # user_input before merging: those belong only in CONF_COMPONENTS,
+                        # not as top-level stray keys in entry data.
+                        _opt_ids = {c.id for c in optional()}
+                        clean_input = {k: v for k, v in user_input.items() if k not in _opt_ids}
                         new_data: dict[str, Any] = {
                             **entry.data,
-                            **user_input,
+                            **clean_input,
                             DATA_SSH_HOST_KEY: host_key,
                             CONF_COMPONENTS: desired,
                         }

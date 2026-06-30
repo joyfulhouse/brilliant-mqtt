@@ -44,7 +44,6 @@ from .const import (
     CONF_MQTT_USERNAME,
     CONF_PANEL,
     CONF_ROOT_PASSWORD,
-    CONF_VOICE_ENABLED,
     CONF_VOICE_HA_HOST,
     CONF_VOICE_WAKE_WORD,
     DATA_LAST_FIRMWARE,
@@ -363,7 +362,7 @@ class PanelManager:
             # any escape here would otherwise wedge _repairing=True forever (it is called from
             # timers/the Repair button).
             voice_tarball: str | None = None
-            if self.entry.data.get(CONF_VOICE_ENABLED):
+            if self.entry.data.get(CONF_COMPONENTS, {}).get(COMPONENT_VOICE, False):
                 try:
                     voice_tarball = await async_fetch_voice_payload(self.hass)
                 except VoicePayloadError as err:
@@ -653,10 +652,9 @@ class PanelManager:
     async def async_set_voice_enabled(self, enabled: bool) -> None:
         """Enable (deploy+start) or disable (uninstall) the voice satellite on the panel.
 
-        Delegates the SSH operation to the generic component methods, then applies
-        voice-specific persistence:
-        - ``CONF_VOICE_ENABLED`` (legacy field that switch.py reads for is_on state).
-        - Clearing the ``voice_missing_<entry_id>`` repair issue on success.
+        Delegates the SSH operation to the generic component methods (which update
+        ``CONF_COMPONENTS`` and fire a notify), then clears the
+        ``voice_missing_<entry_id>`` repair issue on success.
 
         Errors from the SSH layer or the voice-payload fetch are mapped to the same
         ``HomeAssistantError`` keys the voice switch has always expected, so the switch
@@ -677,17 +675,10 @@ class PanelManager:
                 translation_key="voice_failed",
                 translation_placeholders={"error": str(err)},
             ) from err
-        # Legacy persistence: switch.py reads CONF_VOICE_ENABLED for is_on state.
-        self.hass.config_entries.async_update_entry(
-            self.entry, data={**self.entry.data, CONF_VOICE_ENABLED: enabled}
-        )
         # Clear any stale "voice enabled but not running" issue: after a disable there is
         # nothing to run, and after a successful enable the satellite IS running — either
         # way the issue must not linger.
         ir.async_delete_issue(self.hass, DOMAIN, self._voice_issue_id)
-        # Second notify so entities see the updated CONF_VOICE_ENABLED (the first notify
-        # was fired inside async_install/remove_component after CONF_COMPONENTS updated).
-        self._notify()
 
     async def async_set_voice_wake_word(self, wake_word: str) -> None:
         """Push the wake word + restart the satellite if enabled, THEN persist it.
@@ -697,7 +688,7 @@ class PanelManager:
         shows the OLD word the panel is actually using. When voice is disabled there is no
         panel to push to, so just persist.
         """
-        if self.entry.data.get(CONF_VOICE_ENABLED):
+        if self.entry.data.get(CONF_COMPONENTS, {}).get(COMPONENT_VOICE, False):
             async with self._voice_ssh_session() as shell:
                 await panel_ops.ensure_voice_config(shell, self._voice_env(wake_word=wake_word))
                 await panel_ops.restart_voice(shell)
