@@ -27,7 +27,6 @@ from custom_components.brilliant_mqtt.const import (
     CONF_MQTT_USERNAME,
     CONF_PANEL,
     CONF_ROOT_PASSWORD,
-    CONF_VOICE_ENABLED,
     CONF_VOICE_HA_HOST,
     CONF_VOICE_WAKE_WORD,
     DATA_SSH_HOST_KEY,
@@ -346,7 +345,7 @@ async def test_voice_disabled_no_voice_install(hass: HomeAssistant, payload_dir:
 
     assert result["type"] == "create_entry"
     data = result["data"]
-    assert data[CONF_VOICE_ENABLED] is False
+    assert data[CONF_COMPONENTS][COMPONENT_VOICE] is False
     assert data[CONF_VOICE_WAKE_WORD] == "okay_nabu"
     assert data[CONF_VOICE_HA_HOST] == ""
     # Voice install was NOT triggered.
@@ -378,7 +377,7 @@ async def test_voice_enabled_installs_satellite(hass: HomeAssistant, payload_dir
 
     assert result["type"] == "create_entry"
     data = result["data"]
-    assert data[CONF_VOICE_ENABLED] is True
+    assert data[CONF_COMPONENTS][COMPONENT_VOICE] is True
     assert data[CONF_VOICE_WAKE_WORD] == "hey_jarvis"
     assert data[CONF_VOICE_HA_HOST] == "192.168.1.10"
     # Voice tarball was uploaded via put_file.
