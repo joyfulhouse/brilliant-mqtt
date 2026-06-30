@@ -10,8 +10,9 @@ stays registered after withdraw) publishes nothing on the mesh namespace.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
-from brilliant_mqtt.__main__ import _is_panel_device, _is_reconnect_storm
+from brilliant_mqtt.__main__ import _is_panel_device, _is_reconnect_storm, _make_desired
 from brilliant_mqtt.bridge import Bridge
 from brilliant_mqtt.config import Settings
 from brilliant_mqtt.mesh_leader import MESH_LEADER_TOPIC, MeshLeader
@@ -155,3 +156,30 @@ class TestLeadershipGate:
         await bus.emit(device)
         await mesh_bridge.poll_once()
         assert _data_topics(mqtt) == []
+
+
+def _desired_settings(
+    motion_reconcile_enabled: bool = True,
+    motion_desired_state_dir: str = "/var/brilliant-mqtt/state",
+) -> Settings:
+    """Build a minimal Settings for _make_desired tests."""
+    return Settings(
+        panel="office",
+        mqtt_host="h",
+        mqtt_username="u",
+        mqtt_password="p",
+        motion_reconcile_enabled=motion_reconcile_enabled,
+        motion_desired_state_dir=motion_desired_state_dir,
+    )
+
+
+def test_make_desired_disabled_returns_none(tmp_path: Path) -> None:
+    s = _desired_settings(motion_reconcile_enabled=False, motion_desired_state_dir=str(tmp_path))
+    assert _make_desired(s, "office-faceplate") is None
+
+
+def test_make_desired_enabled_builds_loaded_store(tmp_path: Path) -> None:
+    s = _desired_settings(motion_reconcile_enabled=True, motion_desired_state_dir=str(tmp_path))
+    ds = _make_desired(s, "mesh")
+    assert ds is not None
+    assert ds.wanted("any") == {}  # loaded (empty) without error

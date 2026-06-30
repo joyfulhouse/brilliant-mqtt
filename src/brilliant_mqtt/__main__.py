@@ -10,10 +10,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from pathlib import Path
 
 from brilliant_mqtt.bridge import Bridge
 from brilliant_mqtt.bus import RpcBusAdapter
 from brilliant_mqtt.config import Settings
+from brilliant_mqtt.desired_state import DesiredState
 from brilliant_mqtt.mesh_leader import MeshLeader
 from brilliant_mqtt.model import BrilliantDevice
 from brilliant_mqtt.mqttio import AioMqttAdapter
@@ -56,6 +58,15 @@ def _is_reconnect_storm(bus: BusClient, settings: Settings) -> bool:
     return count >= settings.reconnect_storm_threshold
 
 
+def _make_desired(settings: Settings, name: str) -> DesiredState | None:
+    """A loaded DesiredState for one bridge scope, or None when disabled."""
+    if not settings.motion_reconcile_enabled:
+        return None
+    ds = DesiredState(Path(settings.motion_desired_state_dir) / f"{name}.json")
+    ds.load()
+    return ds
+
+
 def _is_panel_device(device: BrilliantDevice) -> bool:
     """Panel-bridge scope: everything EXCEPT the virtual mesh device.
 
@@ -80,7 +91,15 @@ async def _run_session(settings: Settings) -> None:
     try:
         # Bridges register their bus/mqtt callbacks in __init__, BEFORE any I/O
         # starts — so no early change/command event is missed.
-        panel_bridge = Bridge(bus, mqtt, settings.panel, include=_is_panel_device)
+        panel_bridge = Bridge(
+            bus,
+            mqtt,
+            settings.panel,
+            include=_is_panel_device,
+            desired=_make_desired(settings, f"{settings.panel}-faceplate"),
+            reconcile_min_interval_s=settings.motion_reconcile_min_interval_s,
+            reconcile_max_writes_per_tick=settings.motion_reconcile_max_writes_per_tick,
+        )
 
         if participating:
 
@@ -92,7 +111,15 @@ async def _run_session(settings: Settings) -> None:
                 # after bus.start(), by which time it is assigned below.
                 return device.device_id == _MESH_DEVICE_ID and leader.is_leader
 
-            mesh_bridge = Bridge(bus, mqtt, "mesh", include=_mesh_in_scope)
+            mesh_bridge = Bridge(
+                bus,
+                mqtt,
+                "mesh",
+                include=_mesh_in_scope,
+                desired=_make_desired(settings, "mesh"),
+                reconcile_min_interval_s=settings.motion_reconcile_min_interval_s,
+                reconcile_max_writes_per_tick=settings.motion_reconcile_max_writes_per_tick,
+            )
             leader = MeshLeader(
                 mqtt,
                 settings.panel,
