@@ -18,6 +18,7 @@ from . import panel_ops
 from .const import (
     COMPONENT_BRIDGE,
     COMPONENT_VOICE,
+    COMPONENT_WIFI_WATCHDOG,
     CONF_COMPONENTS,
     CONF_MESH_PRIORITY,
     CONF_MQTT_HOST,
@@ -86,6 +87,20 @@ async def _voice_install(hass: HomeAssistant, shell: PanelShell, data: Mapping[s
     await panel_ops.enable_voice(shell)
 
 
+async def _wd_present(shell: PanelShell) -> bool:
+    return (await panel_ops.inspect_wifi_watchdog(shell)).payload_present
+
+
+async def _wd_install(hass: HomeAssistant, shell: PanelShell, data: Mapping[str, Any]) -> None:
+    payload_dir = _mgr._payload_dir()
+    unit = await hass.async_add_executor_job(
+        (payload_dir / "brilliant-wifi-watchdog.service").read_text
+    )
+    await panel_ops.deploy_wifi_watchdog(shell, str(payload_dir / "wifi_watchdog"))
+    await panel_ops.ensure_wifi_watchdog_unit(shell, unit)
+    await panel_ops.enable_wifi_watchdog(shell)
+
+
 REGISTRY: dict[str, Component] = {
     COMPONENT_BRIDGE: Component(
         id=COMPONENT_BRIDGE,
@@ -104,6 +119,15 @@ REGISTRY: dict[str, Component] = {
         present=_voice_present,
         install=_voice_install,
         remove=panel_ops.uninstall_voice,
+    ),
+    COMPONENT_WIFI_WATCHDOG: Component(
+        id=COMPONENT_WIFI_WATCHDOG,
+        label="Wi-Fi watchdog",
+        locked=False,
+        default_enabled=True,
+        present=_wd_present,
+        install=_wd_install,
+        remove=panel_ops.uninstall_wifi_watchdog,
     ),
 }
 
