@@ -3,6 +3,7 @@ from custom_components.brilliant_mqtt import const
 from custom_components.brilliant_mqtt.const import (
     COMPONENT_BRIDGE,
     COMPONENT_VOICE,
+    COMPONENT_WIFI_WATCHDOG,
     CONF_COMPONENTS,
 )
 
@@ -30,3 +31,20 @@ def test_selected_ids_includes_bridge_always() -> None:
     assert comp.selected_ids({}) == [COMPONENT_BRIDGE]
     sel = comp.selected_ids({CONF_COMPONENTS: {COMPONENT_VOICE: True}})
     assert COMPONENT_BRIDGE in sel and COMPONENT_VOICE in sel
+
+
+def test_wifi_watchdog_registry_row_default_enabled() -> None:
+    row = comp.REGISTRY[COMPONENT_WIFI_WATCHDOG]
+    assert row.default_enabled is True
+    assert row.locked is False
+
+
+def test_default_components_wifi_watchdog_on() -> None:
+    d = comp.default_components()
+    assert d[COMPONENT_WIFI_WATCHDOG] is True
+
+
+def test_optional_order_is_voice_then_wifi_watchdog() -> None:
+    opts = comp.optional()
+    ids = [c.id for c in opts]
+    assert ids == [COMPONENT_VOICE, COMPONENT_WIFI_WATCHDOG]

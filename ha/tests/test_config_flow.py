@@ -18,6 +18,7 @@ from custom_components.brilliant_mqtt.config_flow import _PanelProbe, _slugify, 
 from custom_components.brilliant_mqtt.const import (
     COMPONENT_BRIDGE,
     COMPONENT_VOICE,
+    COMPONENT_WIFI_WATCHDOG,
     CONF_COMPONENTS,
     CONF_HOST,
     CONF_MESH_PRIORITY,
@@ -69,6 +70,10 @@ RECONFIG_INPUT = {
     CONF_MQTT_USERNAME: "brilliant",
     CONF_MQTT_PASSWORD: "newbroker",
     CONF_MESH_PRIORITY: 5,
+    COMPONENT_VOICE: False,
+    COMPONENT_WIFI_WATCHDOG: False,
+    CONF_VOICE_WAKE_WORD: "okay_nabu",
+    CONF_VOICE_HA_HOST: "",
 }
 
 
@@ -845,13 +850,18 @@ async def start_reconfigure(hass: HomeAssistant, entry: MockConfigEntry) -> Any:
     return await entry.start_reconfigure_flow(hass)
 
 
-def reconfigure_input(entry: MockConfigEntry, *, voice: bool | None = None) -> dict[str, Any]:
+def reconfigure_input(
+    entry: MockConfigEntry, *, voice: bool | None = None, wifi_watchdog: bool | None = None
+) -> dict[str, Any]:
     """Build a full reconfigure user_input dict from entry data.
 
     *voice* overrides the COMPONENT_VOICE checkbox; None keeps the stored value.
+    *wifi_watchdog* overrides the COMPONENT_WIFI_WATCHDOG checkbox; None keeps the stored value.
     """
     data = entry.data
-    current_voice = bool((data.get(CONF_COMPONENTS) or {}).get(COMPONENT_VOICE, False))
+    comps: dict[str, bool] = dict(data.get(CONF_COMPONENTS) or {})
+    current_voice = bool(comps.get(COMPONENT_VOICE, False))
+    current_wd = bool(comps.get(COMPONENT_WIFI_WATCHDOG, False))
     return {
         CONF_HOST: data[CONF_HOST],
         CONF_ROOT_PASSWORD: data[CONF_ROOT_PASSWORD],
@@ -861,6 +871,7 @@ def reconfigure_input(entry: MockConfigEntry, *, voice: bool | None = None) -> d
         CONF_MQTT_PASSWORD: data[CONF_MQTT_PASSWORD],
         CONF_MESH_PRIORITY: data.get(CONF_MESH_PRIORITY, 0),
         COMPONENT_VOICE: voice if voice is not None else current_voice,
+        COMPONENT_WIFI_WATCHDOG: wifi_watchdog if wifi_watchdog is not None else current_wd,
         CONF_VOICE_WAKE_WORD: data.get(CONF_VOICE_WAKE_WORD, "okay_nabu"),
         CONF_VOICE_HA_HOST: data.get(CONF_VOICE_HA_HOST, ""),
     }

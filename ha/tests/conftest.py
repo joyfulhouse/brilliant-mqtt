@@ -21,6 +21,7 @@ from custom_components.brilliant_mqtt.config_flow import _PanelProbe
 from custom_components.brilliant_mqtt.const import (
     COMPONENT_BRIDGE,
     COMPONENT_VOICE,
+    COMPONENT_WIFI_WATCHDOG,
     CONF_COMPONENTS,
     CONF_HOST,
     CONF_MESH_PRIORITY,
@@ -102,6 +103,11 @@ def payload_dir(tmp_path: Path) -> Iterator[Path]:
     (tmp_path / "vendor").mkdir()
     (tmp_path / "VERSION").write_text("0.2.0")
     (tmp_path / "brilliant-mqtt.service").write_text("[Unit]\nDescription=test unit\n")
+    (tmp_path / "brilliant-wifi-watchdog.service").write_text(
+        "[Unit]\nDescription=test wifi watchdog unit\n"
+    )
+    (tmp_path / "wifi_watchdog" / "brilliant_wifi_watchdog").mkdir(parents=True)
+    (tmp_path / "wifi_watchdog" / "brilliant_wifi_watchdog" / "run.py").write_text("# stub\n")
     with patch("custom_components.brilliant_mqtt.manager._payload_dir", return_value=tmp_path):
         yield tmp_path
 
@@ -213,6 +219,11 @@ def patch_installs() -> Iterator[_PatchInstallsResult]:
             _components.REGISTRY[COMPONENT_VOICE],
             install=_make_install(COMPONENT_VOICE),
             remove=_make_remove(COMPONENT_VOICE),
+        ),
+        COMPONENT_WIFI_WATCHDOG: _dc_replace(
+            _components.REGISTRY[COMPONENT_WIFI_WATCHDOG],
+            install=_make_install(COMPONENT_WIFI_WATCHDOG),
+            remove=_make_remove(COMPONENT_WIFI_WATCHDOG),
         ),
     }
 
