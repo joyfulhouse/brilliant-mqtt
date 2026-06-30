@@ -281,6 +281,46 @@ async def test_enforce_min_write_spacing(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_enforce_spacing_backs_off_on_write_failure(tmp_path: Path) -> None:
+    """A failed write must still advance _last_write_ts so a second peripheral
+    is not attempted in the same tick (write-spacing backs off even on errors)."""
+
+    class AlwaysFailBus(FakeBus):
+        def __init__(self, devices: list[BrilliantDevice]) -> None:
+            super().__init__(devices)
+            self.attempts = 0
+
+        async def set_variables(
+            self, device_id: str, peripheral_id: str, sets: list[VarSet]
+        ) -> None:
+            self.attempts += 1
+            raise RuntimeError("bus down")
+
+    devs = [
+        _mesh_light("pidA", enable_motion_score="0", on="0"),
+        _mesh_light("pidB", enable_motion_score="0", on="0"),
+    ]
+    bus = AlwaysFailBus(devs)
+    ds = DesiredState(tmp_path / "mesh.json")
+    ds.record("pidA", "enable_motion_score", "1")
+    ds.record("pidB", "enable_motion_score", "1")
+    bridge = Bridge(
+        bus,
+        FakeMqtt(),
+        "mesh",
+        desired=ds,
+        reconcile_min_write_spacing_s=1.0,
+        clock=FakeClock(),
+    )
+
+    await bridge._enforce_desired(devs)  # must not raise
+
+    # The first write attempt (pidA) raises; _last_write_ts is still advanced
+    # (set before the try), so the spacing guard blocks pidB in the same tick.
+    assert bus.attempts == 1
+
+
+@pytest.mark.asyncio
 async def test_enforce_uses_persisted_desired_after_restart(tmp_path: Path) -> None:
     """Persisted desired state feeds enforcement after a process restart."""
     path = tmp_path / "mesh.json"

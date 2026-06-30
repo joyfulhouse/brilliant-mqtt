@@ -305,15 +305,19 @@ class Bridge:
                 and (now - self._last_write_ts) < self._reconcile_min_write_spacing_s
             ):
                 return
-            # Mark the rate-limit window BEFORE the write.  If the write
-            # fails we still consume the window — intentional: a persistently-
-            # failing peripheral is not hammered on every tick.
+            # Mark both the per-var rate-limit window and the global
+            # write-spacing window BEFORE the write attempt.  A failed write
+            # still consumes both — intentional: a persistently-failing
+            # peripheral or bus is not hammered on every tick, and the spacing
+            # window is anchored to the tick's `now` (not a post-await clock
+            # read) so the check `(now - _last_write_ts) < spacing` stays
+            # non-negative and behaves correctly.
             for vs in drifted:
                 self._last_reassert[(device.peripheral_id, vs.name)] = now
+            self._last_write_ts = now
             writes += 1
             try:
                 await self._bus.set_variables(device.device_id, device.peripheral_id, drifted)
-                self._last_write_ts = self._clock()
                 logger.info(
                     "reconcile-desired %s/%s: %s",
                     device.device_id,
