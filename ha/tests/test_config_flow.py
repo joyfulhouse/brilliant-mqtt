@@ -107,7 +107,7 @@ def _full_entry(hass: HomeAssistant, **over: Any) -> MockConfigEntry:
         DATA_SSH_HOST_KEY: "ssh-ed25519 STORED",
     }
     data.update(over)
-    entry = MockConfigEntry(domain=DOMAIN, unique_id=data[CONF_PANEL], data=data)
+    entry = MockConfigEntry(domain=DOMAIN, unique_id=data[CONF_PANEL], data=data, version=2)
     entry.add_to_hass(hass)
     return entry
 
@@ -836,3 +836,95 @@ async def test_options_flow_saves_behavior_knobs(hass: HomeAssistant) -> None:
         OPT_REPAIR_COOLDOWN_MINUTES: 30,
         OPT_TRUST_HOST_KEY_CHANGES: True,
     }
+
+
+# --- Task 7: Reconfigure — editable component checkboxes (install/remove diff) ------
+
+
+async def start_reconfigure(hass: HomeAssistant, entry: MockConfigEntry) -> Any:
+    """Start the reconfigure flow for *entry* and return the initial form result."""
+    return await entry.start_reconfigure_flow(hass)
+
+
+def reconfigure_input(entry: MockConfigEntry, *, voice: bool | None = None) -> dict[str, Any]:
+    """Build a full reconfigure user_input dict from entry data.
+
+    *voice* overrides the COMPONENT_VOICE checkbox; None keeps the stored value.
+    """
+    data = entry.data
+    current_voice = bool((data.get(CONF_COMPONENTS) or {}).get(COMPONENT_VOICE, False))
+    return {
+        CONF_HOST: data[CONF_HOST],
+        CONF_ROOT_PASSWORD: data[CONF_ROOT_PASSWORD],
+        CONF_MQTT_HOST: data[CONF_MQTT_HOST],
+        CONF_MQTT_PORT: data[CONF_MQTT_PORT],
+        CONF_MQTT_USERNAME: data[CONF_MQTT_USERNAME],
+        CONF_MQTT_PASSWORD: data[CONF_MQTT_PASSWORD],
+        CONF_MESH_PRIORITY: data.get(CONF_MESH_PRIORITY, 0),
+        COMPONENT_VOICE: voice if voice is not None else current_voice,
+        CONF_VOICE_WAKE_WORD: data.get(CONF_VOICE_WAKE_WORD, "okay_nabu"),
+        CONF_VOICE_HA_HOST: data.get(CONF_VOICE_HA_HOST, ""),
+    }
+
+
+@pytest.mark.asyncio
+async def test_reconfigure_uncheck_voice_removes(
+    hass: HomeAssistant,
+    installed_voice_entry: MockConfigEntry,
+    patch_installs: Any,
+) -> None:
+    """Unchecking voice in reconfigure removes the component and persists the change."""
+    result = await start_reconfigure(hass, installed_voice_entry)
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], reconfigure_input(installed_voice_entry, voice=False)
+    )
+    assert result["type"] == "abort" and result["reason"] == "reconfigure_successful"
+    assert installed_voice_entry.data[CONF_COMPONENTS][COMPONENT_VOICE] is False
+    assert patch_installs.removed(COMPONENT_VOICE)
+
+
+@pytest.mark.asyncio
+async def test_reconfigure_check_voice_installs(
+    hass: HomeAssistant,
+    patch_installs: Any,
+) -> None:
+    """Checking voice in reconfigure installs the component and persists the change."""
+    entry = _full_entry(hass, **{CONF_COMPONENTS: {COMPONENT_BRIDGE: True, COMPONENT_VOICE: False}})
+    result = await start_reconfigure(hass, entry)
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], reconfigure_input(entry, voice=True)
+    )
+    assert result["type"] == "abort" and result["reason"] == "reconfigure_successful"
+    assert entry.data[CONF_COMPONENTS][COMPONENT_VOICE] is True
+    assert patch_installs.called(COMPONENT_VOICE)
+
+
+@pytest.mark.asyncio
+async def test_reconfigure_no_change_skips_install_remove(
+    hass: HomeAssistant,
+    patch_installs: Any,
+) -> None:
+    """When the component selection is unchanged, neither install nor remove fires."""
+    entry = _full_entry(hass, **{CONF_COMPONENTS: {COMPONENT_BRIDGE: True, COMPONENT_VOICE: False}})
+    result = await start_reconfigure(hass, entry)
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], reconfigure_input(entry, voice=False)
+    )
+    assert result["type"] == "abort" and result["reason"] == "reconfigure_successful"
+    assert not patch_installs.called(COMPONENT_VOICE)
+    assert not patch_installs.removed(COMPONENT_VOICE)
+
+
+@pytest.mark.asyncio
+async def test_reconfigure_rejects_control_char_in_voice_ha_host(
+    hass: HomeAssistant,
+) -> None:
+    """A control char in voice_ha_host surfaces invalid_value; no SSH attempted."""
+    entry = _full_entry(hass)
+    result = await start_reconfigure(hass, entry)
+    bad_input = {**reconfigure_input(entry), CONF_VOICE_HA_HOST: "10.0.0.5\n"}
+    with patch(APPLY) as apply:
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], bad_input)
+    assert result["type"] == "form"
+    assert result["errors"] == {CONF_VOICE_HA_HOST: "invalid_value"}
+    apply.assert_not_called()

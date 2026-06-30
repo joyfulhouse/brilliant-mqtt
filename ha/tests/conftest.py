@@ -18,7 +18,23 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from custom_components.brilliant_mqtt import components as _components
 from custom_components.brilliant_mqtt import config_flow as _config_flow
 from custom_components.brilliant_mqtt.config_flow import _PanelProbe
-from custom_components.brilliant_mqtt.const import COMPONENT_BRIDGE, COMPONENT_VOICE, DOMAIN
+from custom_components.brilliant_mqtt.const import (
+    COMPONENT_BRIDGE,
+    COMPONENT_VOICE,
+    CONF_COMPONENTS,
+    CONF_HOST,
+    CONF_MESH_PRIORITY,
+    CONF_MQTT_HOST,
+    CONF_MQTT_PASSWORD,
+    CONF_MQTT_PORT,
+    CONF_MQTT_USERNAME,
+    CONF_PANEL,
+    CONF_ROOT_PASSWORD,
+    CONF_VOICE_HA_HOST,
+    CONF_VOICE_WAKE_WORD,
+    DATA_SSH_HOST_KEY,
+    DOMAIN,
+)
 from custom_components.brilliant_mqtt.manager import PanelManager
 from custom_components.brilliant_mqtt.shell import PanelShell
 from tests.fakes import FakeShell
@@ -150,23 +166,28 @@ def not_installed_panel() -> Iterator[None]:
 
 
 class _PatchInstallsResult:
-    """Tracks which component IDs had install() called."""
+    """Tracks which component IDs had install() or remove() called."""
 
-    def __init__(self, called_ids: set[str]) -> None:
+    def __init__(self, called_ids: set[str], removed_ids: set[str]) -> None:
         self._called = called_ids
+        self._removed = removed_ids
 
     def called(self, cid: str) -> bool:
         return cid in self._called
 
+    def removed(self, cid: str) -> bool:
+        return cid in self._removed
+
 
 @pytest.fixture
 def patch_installs() -> Iterator[_PatchInstallsResult]:
-    """Replace REGISTRY install callables with no-ops; track which IDs were invoked.
+    """Replace REGISTRY install/remove callables with no-ops; track which IDs were invoked.
 
     Also patches config_flow.AsyncsshShell so _panel_session does not attempt
-    real SSH — the mocked install functions do not use the shell.
+    real SSH — the mocked install/remove functions do not use the shell.
     """
     called_ids: set[str] = set()
+    removed_ids: set[str] = set()
 
     def _make_install(
         cid: str,
@@ -176,14 +197,22 @@ def patch_installs() -> Iterator[_PatchInstallsResult]:
 
         return install
 
+    def _make_remove(cid: str) -> Callable[[PanelShell], Awaitable[None]]:
+        async def remove(shell: PanelShell) -> None:
+            removed_ids.add(cid)
+
+        return remove
+
     new_registry = {
         COMPONENT_BRIDGE: _dc_replace(
             _components.REGISTRY[COMPONENT_BRIDGE],
             install=_make_install(COMPONENT_BRIDGE),
+            remove=_make_remove(COMPONENT_BRIDGE),
         ),
         COMPONENT_VOICE: _dc_replace(
             _components.REGISTRY[COMPONENT_VOICE],
             install=_make_install(COMPONENT_VOICE),
+            remove=_make_remove(COMPONENT_VOICE),
         ),
     }
 
@@ -192,4 +221,26 @@ def patch_installs() -> Iterator[_PatchInstallsResult]:
         patch.dict(_components.REGISTRY, new_registry),
         patch.object(_config_flow, "AsyncsshShell", return_value=install_shell),
     ):
-        yield _PatchInstallsResult(called_ids)
+        yield _PatchInstallsResult(called_ids, removed_ids)
+
+
+@pytest.fixture
+def installed_voice_entry(hass: HomeAssistant) -> MockConfigEntry:
+    """A config entry that already has the voice component installed."""
+    data: dict[str, Any] = {
+        CONF_PANEL: "office",
+        CONF_HOST: "192.168.1.10",
+        CONF_ROOT_PASSWORD: "panelpass",
+        CONF_MQTT_HOST: "192.168.1.250",
+        CONF_MQTT_PORT: 1883,
+        CONF_MQTT_USERNAME: "brilliant",
+        CONF_MQTT_PASSWORD: "mqttpass",
+        CONF_MESH_PRIORITY: 0,
+        DATA_SSH_HOST_KEY: "ssh-ed25519 STORED",
+        CONF_COMPONENTS: {COMPONENT_BRIDGE: True, COMPONENT_VOICE: True},
+        CONF_VOICE_WAKE_WORD: "okay_nabu",
+        CONF_VOICE_HA_HOST: "",
+    }
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=data, version=2)
+    entry.add_to_hass(hass)
+    return entry
