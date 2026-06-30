@@ -202,12 +202,14 @@ class TestSettings:
         monkeypatch.delenv("MOTION_RECONCILE_ENABLED", raising=False)
         monkeypatch.delenv("MOTION_RECONCILE_MIN_INTERVAL_S", raising=False)
         monkeypatch.delenv("MOTION_RECONCILE_MAX_WRITES_PER_TICK", raising=False)
+        monkeypatch.delenv("MOTION_RECONCILE_MIN_WRITE_SPACING_S", raising=False)
         monkeypatch.delenv("MOTION_DESIRED_STATE_DIR", raising=False)
 
         s = Settings.from_env()
         assert s.motion_reconcile_enabled is True
         assert s.motion_reconcile_min_interval_s == 60.0
         assert s.motion_reconcile_max_writes_per_tick == 4
+        assert s.motion_reconcile_min_write_spacing_s == 0.5
         assert s.motion_desired_state_dir == "/var/brilliant-mqtt/state"
 
     def test_reconcile_env_overrides(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -219,10 +221,13 @@ class TestSettings:
         monkeypatch.setenv("MOTION_RECONCILE_ENABLED", "0")
         monkeypatch.setenv("MOTION_RECONCILE_MIN_INTERVAL_S", "15")
         monkeypatch.setenv("MOTION_RECONCILE_MAX_WRITES_PER_TICK", "8")
+        monkeypatch.setenv("MOTION_RECONCILE_MIN_WRITE_SPACING_S", "0.25")
         monkeypatch.setenv("MOTION_DESIRED_STATE_DIR", "/tmp/state")
 
         s = Settings.from_env()
         assert s.motion_reconcile_enabled is False
         assert s.motion_reconcile_min_interval_s == 15.0
         assert s.motion_reconcile_max_writes_per_tick == 8
+        assert s.motion_reconcile_min_write_spacing_s == 0.25
+        assert isinstance(s.motion_reconcile_min_write_spacing_s, float)
         assert s.motion_desired_state_dir == "/tmp/state"

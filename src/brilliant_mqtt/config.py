@@ -52,6 +52,9 @@ class Settings:
     motion_reconcile_min_interval_s: float = 60.0
     # Maximum writes per reconciliation tick to spread state updates.
     motion_reconcile_max_writes_per_tick: int = 4
+    # Minimum seconds between consecutive reconciler writes across ticks.
+    # Bounds the write rate independently of the poll cadence. 0 disables.
+    motion_reconcile_min_write_spacing_s: float = 0.5
     # Directory path where desired motion state is stored.
     motion_desired_state_dir: str = "/var/brilliant-mqtt/state"
 
@@ -71,6 +74,7 @@ class Settings:
                   MOTION_RECONCILE_ENABLED (default "1": "0" disables),
                   MOTION_RECONCILE_MIN_INTERVAL_S (default 60.0),
                   MOTION_RECONCILE_MAX_WRITES_PER_TICK (default 4),
+                  MOTION_RECONCILE_MIN_WRITE_SPACING_S (default 0.5),
                   MOTION_DESIRED_STATE_DIR (default "/var/brilliant-mqtt/state").
 
         Raises KeyError when a required variable is absent.
@@ -98,6 +102,9 @@ class Settings:
         motion_reconcile_max_writes_per_tick = int(
             env.get("MOTION_RECONCILE_MAX_WRITES_PER_TICK", "4")
         )
+        motion_reconcile_min_write_spacing_s = float(
+            env.get("MOTION_RECONCILE_MIN_WRITE_SPACING_S", "0.5")
+        )
         motion_desired_state_dir = env.get("MOTION_DESIRED_STATE_DIR", "/var/brilliant-mqtt/state")
 
         return cls(
@@ -117,5 +124,6 @@ class Settings:
             motion_reconcile_enabled=motion_reconcile_enabled,
             motion_reconcile_min_interval_s=motion_reconcile_min_interval_s,
             motion_reconcile_max_writes_per_tick=motion_reconcile_max_writes_per_tick,
+            motion_reconcile_min_write_spacing_s=motion_reconcile_min_write_spacing_s,
             motion_desired_state_dir=motion_desired_state_dir,
         )

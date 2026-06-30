@@ -103,7 +103,11 @@ async def test_enforce_batches_multiple_vars_per_peripheral(tmp_path: Path) -> N
     ds = DesiredState(tmp_path / "mesh.json")
     ds.record("pidA", "enable_motion_score", "1")
     ds.record("pidA", "motion_low_threshold", "30")
-    bridge = Bridge(bus, FakeMqtt(), "mesh", desired=ds, clock=FakeClock())
+    # spacing=0.0: this test validates batching (one write per peripheral), not
+    # cross-tick rate limiting — disable spacing so it does not interfere.
+    bridge = Bridge(
+        bus, FakeMqtt(), "mesh", desired=ds, reconcile_min_write_spacing_s=0.0, clock=FakeClock()
+    )
 
     await bridge._enforce_desired([dev])
 
@@ -141,8 +145,15 @@ async def test_enforce_per_tick_cap(tmp_path: Path) -> None:
     ds = DesiredState(tmp_path / "mesh.json")
     for d in devs:
         ds.record(d.peripheral_id, "enable_motion_score", "1")
+    # spacing=0.0: this test validates the per-tick cap, not cross-tick spacing.
     bridge = Bridge(
-        bus, FakeMqtt(), "mesh", desired=ds, reconcile_max_writes_per_tick=2, clock=FakeClock()
+        bus,
+        FakeMqtt(),
+        "mesh",
+        desired=ds,
+        reconcile_max_writes_per_tick=2,
+        reconcile_min_write_spacing_s=0.0,
+        clock=FakeClock(),
     )
 
     await bridge._enforce_desired(devs)
@@ -179,7 +190,11 @@ async def test_enforce_continues_after_write_error(tmp_path: Path) -> None:
     ds = DesiredState(tmp_path / "mesh.json")
     ds.record("pidA", "enable_motion_score", "1")
     ds.record("pidB", "enable_motion_score", "1")
-    bridge = Bridge(bus, FakeMqtt(), "mesh", desired=ds, clock=FakeClock())
+    # spacing=0.0: this test validates error recovery across multiple writes,
+    # not cross-tick rate limiting — disable spacing so it does not interfere.
+    bridge = Bridge(
+        bus, FakeMqtt(), "mesh", desired=ds, reconcile_min_write_spacing_s=0.0, clock=FakeClock()
+    )
 
     await bridge._enforce_desired(devs)  # must not raise
 
@@ -226,6 +241,43 @@ async def test_enforce_restores_off_when_drifted_to_on(tmp_path: Path) -> None:
     await bridge._enforce_desired([dev])
 
     assert bus.commands == [("ble_mesh", "pidA", [_vs("enable_motion_score", "0")])]
+
+
+@pytest.mark.asyncio
+async def test_enforce_min_write_spacing(tmp_path: Path) -> None:
+    """Global min-spacing limits writes to one peripheral per tick across calls."""
+    devs = [
+        _mesh_light("pidA", enable_motion_score="0", on="0"),
+        _mesh_light("pidB", enable_motion_score="0", on="0"),
+    ]
+    bus = FakeBus(devs)
+    ds = DesiredState(tmp_path / "mesh.json")
+    ds.record("pidA", "enable_motion_score", "1")
+    ds.record("pidB", "enable_motion_score", "1")
+    clock = FakeClock()
+    bridge = Bridge(
+        bus,
+        FakeMqtt(),
+        "mesh",
+        desired=ds,
+        reconcile_min_write_spacing_s=1.0,
+        clock=clock,
+    )
+
+    # First call: pidA writes (no previous write), spacing blocks pidB.
+    await bridge._enforce_desired(devs)
+    assert len(bus.commands) == 1
+    assert bus.commands[0][1] == "pidA"
+
+    # Second call without advancing clock: spacing guard still fires, nothing written.
+    await bridge._enforce_desired(devs)
+    assert len(bus.commands) == 1
+
+    # After advancing past the spacing window, pidB (not yet rate-limited) writes.
+    clock.advance(1.0)
+    await bridge._enforce_desired(devs)
+    assert len(bus.commands) == 2
+    assert bus.commands[1][1] == "pidB"
 
 
 @pytest.mark.asyncio

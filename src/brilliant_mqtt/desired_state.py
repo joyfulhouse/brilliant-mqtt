@@ -46,16 +46,33 @@ class DesiredState:
         self._state: dict[str, dict[str, str]] = {}
 
     def record(self, peripheral_id: str, var: str, value: str) -> None:
-        """Set the desired value for (peripheral_id, var) and persist."""
+        """Set the desired value for (peripheral_id, var) and persist.
+
+        Updates in-memory state first so a disk error never prevents the
+        command from reaching the device on the same call stack.
+        """
         self._state.setdefault(peripheral_id, {})[var] = value
-        self.save()
+        try:
+            self.save()
+        except Exception as e:
+            logger.warning(
+                "could not persist desired-state to %s (%s); keeping in memory",
+                self._path,
+                e,
+            )
 
     def wanted(self, peripheral_id: str) -> dict[str, str]:
         """Desired vars for a peripheral (copy; empty if none)."""
         return dict(self._state.get(peripheral_id, {}))
 
     def load(self) -> None:
-        """Load from disk; a missing or unreadable file yields empty state."""
+        """Load from disk; a missing or unreadable file yields empty state.
+
+        Only RECONCILED_VARS are kept: stale or hand-edited files containing
+        non-motion vars (e.g. "on", "intensity") will not cause the reconciler
+        to re-assert them. Peripherals with no surviving vars are dropped.
+        """
+        self._state = {}
         try:
             raw = json.loads(self._path.read_text())
         except (OSError, ValueError) as e:
@@ -65,17 +82,16 @@ class DesiredState:
                     self._path,
                     e,
                 )
-            self._state = {}
             return
         if not isinstance(raw, dict):
             logger.warning("desired-state file %s is not a JSON object; starting empty", self._path)
-            self._state = {}
             return
-        self._state = {
-            str(pid): {str(k): str(v) for k, v in vars_.items()}
-            for pid, vars_ in raw.items()
-            if isinstance(vars_, dict)
-        }
+        for pid, vars_ in raw.items():
+            if not isinstance(vars_, dict):
+                continue
+            filtered = {str(k): str(v) for k, v in vars_.items() if str(k) in RECONCILED_VARS}
+            if filtered:
+                self._state[str(pid)] = filtered
 
     def save(self) -> None:
         """Atomically persist state (write temp + os.replace)."""

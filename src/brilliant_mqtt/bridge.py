@@ -82,6 +82,7 @@ class Bridge:
         desired: DesiredState | None = None,
         reconcile_min_interval_s: float = 60.0,
         reconcile_max_writes_per_tick: int = 4,
+        reconcile_min_write_spacing_s: float = 0.5,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._bus = bus
@@ -98,9 +99,13 @@ class Bridge:
         self._desired = desired
         self._reconcile_min_interval_s = reconcile_min_interval_s
         self._reconcile_max_writes_per_tick = reconcile_max_writes_per_tick
+        self._reconcile_min_write_spacing_s = reconcile_min_write_spacing_s
         self._clock = clock
         # (peripheral_id, var) -> monotonic time of last re-assert attempt.
         self._last_reassert: dict[tuple[str, str], float] = {}
+        # Monotonic time of the last successful reconciler write (None = never).
+        # Bounds write rate across poll ticks independent of the poll cadence.
+        self._last_write_ts: float | None = None
 
         # peripheral_id → most recent BrilliantDevice snapshot.
         self._devices: dict[str, BrilliantDevice] = {}
@@ -292,6 +297,14 @@ class Bridge:
                 continue
             if writes >= self._reconcile_max_writes_per_tick:
                 return
+            # Global min-spacing bounds the write rate across ticks, independent
+            # of the poll cadence. A single tick writes at most one peripheral
+            # when spacing > 0; the rest catch up on subsequent ticks.
+            if (
+                self._last_write_ts is not None
+                and (now - self._last_write_ts) < self._reconcile_min_write_spacing_s
+            ):
+                return
             # Mark the rate-limit window BEFORE the write.  If the write
             # fails we still consume the window — intentional: a persistently-
             # failing peripheral is not hammered on every tick.
@@ -300,6 +313,7 @@ class Bridge:
             writes += 1
             try:
                 await self._bus.set_variables(device.device_id, device.peripheral_id, drifted)
+                self._last_write_ts = self._clock()
                 logger.info(
                     "reconcile-desired %s/%s: %s",
                     device.device_id,

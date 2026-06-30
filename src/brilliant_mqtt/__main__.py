@@ -99,6 +99,7 @@ async def _run_session(settings: Settings) -> None:
             desired=_make_desired(settings, f"{settings.panel}-faceplate"),
             reconcile_min_interval_s=settings.motion_reconcile_min_interval_s,
             reconcile_max_writes_per_tick=settings.motion_reconcile_max_writes_per_tick,
+            reconcile_min_write_spacing_s=settings.motion_reconcile_min_write_spacing_s,
         )
 
         if participating:
@@ -119,6 +120,7 @@ async def _run_session(settings: Settings) -> None:
                 desired=_make_desired(settings, "mesh"),
                 reconcile_min_interval_s=settings.motion_reconcile_min_interval_s,
                 reconcile_max_writes_per_tick=settings.motion_reconcile_max_writes_per_tick,
+                reconcile_min_write_spacing_s=settings.motion_reconcile_min_write_spacing_s,
             )
             leader = MeshLeader(
                 mqtt,
