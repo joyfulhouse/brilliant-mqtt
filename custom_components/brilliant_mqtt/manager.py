@@ -35,6 +35,7 @@ from .const import (
     AVAILABILITY_OFFLINE,
     AVAILABILITY_ONLINE,
     COMPONENT_VOICE,
+    COMPONENT_WIFI_WATCHDOG,
     CONF_COMPONENTS,
     CONF_HOST,
     CONF_MESH_PRIORITY,
@@ -429,6 +430,28 @@ class PanelManager:
                             )
                         else:
                             ir.async_delete_issue(self.hass, DOMAIN, self._voice_issue_id)
+                    # Wi-Fi watchdog re-lay: re-write unit to /etc if selected.
+                    # OTA wipes /etc/systemd/system/ so the unit disappears after a
+                    # firmware update even though the code survives in /var.  Lay it
+                    # back down (and redeploy the code if /var was also wiped) so the
+                    # watchdog keeps running across OTAs.  Failure is logged and
+                    # swallowed — a watchdog outage must not block the bridge repair.
+                    from .components import selected_ids  # lazy: components imports manager
+
+                    if COMPONENT_WIFI_WATCHDOG in selected_ids(self.entry.data):
+                        try:
+                            wd_unit = await self.hass.async_add_executor_job(
+                                (_payload_dir() / "brilliant-wifi-watchdog.service").read_text
+                            )
+                            wd_state = await panel_ops.inspect_wifi_watchdog(shell)
+                            if not wd_state.payload_present:
+                                await panel_ops.deploy_wifi_watchdog(
+                                    shell, str(_payload_dir() / "wifi_watchdog")
+                                )
+                            await panel_ops.ensure_wifi_watchdog_unit(shell, wd_unit)
+                            await panel_ops.enable_wifi_watchdog(shell)
+                        except (OSError, asyncssh.Error, PanelOpError) as err:
+                            _LOGGER.warning("%s: watchdog repair failed: %s", self.panel, err)
                 except (OSError, asyncssh.Error, PanelOpError) as err:
                     # A checked step (mkdir/daemon-reload/systemctl) exited non-zero.
                     # The panel is half-broken; surface it loudly instead of letting
@@ -757,6 +780,27 @@ class PanelManager:
                 try:
                     unit, env = await self._config_contents()
                     await panel_ops.ensure_configs(shell, unit, env)
+                    # Wi-Fi watchdog: also re-lay its unit when selected — OTA wipes /etc
+                    # and the watchdog unit disappears even though the code in /var survives.
+                    from .components import selected_ids  # lazy: components imports manager
+
+                    if COMPONENT_WIFI_WATCHDOG in selected_ids(self.entry.data):
+                        try:
+                            wd_unit = await self.hass.async_add_executor_job(
+                                (_payload_dir() / "brilliant-wifi-watchdog.service").read_text
+                            )
+                            wd_state = await panel_ops.inspect_wifi_watchdog(shell)
+                            if not wd_state.payload_present:
+                                await panel_ops.deploy_wifi_watchdog(
+                                    shell, str(_payload_dir() / "wifi_watchdog")
+                                )
+                            await panel_ops.ensure_wifi_watchdog_unit(shell, wd_unit)
+                            await panel_ops.enable_wifi_watchdog(shell)
+                        except (OSError, asyncssh.Error, PanelOpError):
+                            _LOGGER.warning(
+                                "%s: watchdog refresh failed; will retry next reconcile",
+                                self.panel,
+                            )
                 finally:
                     await shell.close()
         except (OSError, asyncssh.Error, PanelOpError):

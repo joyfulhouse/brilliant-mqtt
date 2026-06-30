@@ -21,6 +21,7 @@ from pytest_homeassistant_custom_component.typing import MqttMockHAClient
 from custom_components.brilliant_mqtt.const import (
     COMPONENT_BRIDGE,
     COMPONENT_VOICE,
+    COMPONENT_WIFI_WATCHDOG,
     CONF_COMPONENTS,
     CONF_VOICE_ENABLED,
     CONF_VOICE_WAKE_WORD,
@@ -1424,3 +1425,91 @@ async def test_remove_component_clears_selection(
     await mgr.async_install_component(COMPONENT_VOICE)
     await mgr.async_remove_component(COMPONENT_VOICE)
     assert mgr.entry.data[CONF_COMPONENTS][COMPONENT_VOICE] is False
+
+
+# ---------------------------------------------------------------------------
+# Wi-Fi watchdog repair re-lay (Fix #1: OTA wipes /etc, unit must be re-laid)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.allow_lingering_timers
+async def test_repair_relays_watchdog_unit_when_selected(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    payload_dir: Path,
+) -> None:
+    """When wifi_watchdog is selected, async_repair re-lays the watchdog unit.
+
+    OTA wipes /etc/systemd/system/ so the unit file disappears after a firmware
+    update even though the watchdog code survives in /var.  The repair must call
+    ensure_wifi_watchdog_unit + enable_wifi_watchdog so the watchdog restarts
+    automatically on the next reboot / OTA.
+    """
+    from custom_components.brilliant_mqtt import panel_ops
+    from custom_components.brilliant_mqtt.shell import RunResult
+
+    agent_ok = RunResult(
+        0, "unit=1\nenv=1\nenabled=1\nactive=1\nsunit=1\nsenv=1\npayload=1\n0.2.0\n", ""
+    )
+    # Watchdog code lives in /var (OTA-persistent); /etc unit wiped by OTA.
+    wd_payload_ok = RunResult(0, "unit=0\nenabled=0\nactive=0\npayload=1\n", "")
+    shell = FakeShell(
+        responses={
+            panel_ops.INSPECT_COMMAND: agent_ok,
+            panel_ops.WIFI_WATCHDOG_INSPECT_COMMAND: wd_payload_ok,
+        }
+    )
+    entry_data = {
+        **ENTRY_DATA,
+        CONF_COMPONENTS: {COMPONENT_BRIDGE: True, COMPONENT_WIFI_WATCHDOG: True},
+    }
+    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+        entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=entry_data, version=2)
+        entry.add_to_hass(hass)
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        await entry.runtime_data.async_repair(trigger="button")
+        await hass.async_block_till_done()
+
+    # ensure_wifi_watchdog_unit wrote the unit to /etc and the staged copy.
+    assert any("brilliant-wifi-watchdog.service" in p for (p, _d, _m) in shell.uploads)
+    # enable_wifi_watchdog issued the systemctl command.
+    assert "systemctl enable --now brilliant-wifi-watchdog" in shell.commands
+    # Payload was present in /var → no redeploy of the watchdog code tree.
+    assert not any("wifi_watchdog" in local for (local, _remote) in shell.dir_uploads)
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_repair_skips_watchdog_when_not_selected(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    payload_dir: Path,
+) -> None:
+    """When wifi_watchdog is NOT in the selected components, repair must not touch it."""
+    from custom_components.brilliant_mqtt import panel_ops
+    from custom_components.brilliant_mqtt.shell import RunResult
+
+    agent_ok = RunResult(
+        0, "unit=1\nenv=1\nenabled=1\nactive=1\nsunit=1\nsenv=1\npayload=1\n0.2.0\n", ""
+    )
+    shell = FakeShell(responses={panel_ops.INSPECT_COMMAND: agent_ok})
+    entry_data = {
+        **ENTRY_DATA,
+        CONF_COMPONENTS: {COMPONENT_BRIDGE: True},
+    }
+    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+        entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=entry_data, version=2)
+        entry.add_to_hass(hass)
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        await entry.runtime_data.async_repair(trigger="button")
+        await hass.async_block_till_done()
+
+    # No watchdog commands or uploads must have run.
+    assert "systemctl enable --now brilliant-wifi-watchdog" not in shell.commands
+    assert not any("wifi-watchdog" in c or "wifi_watchdog" in c for c in shell.commands)
+    assert not any("brilliant-wifi-watchdog" in p for (p, _d, _m) in shell.uploads)
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
