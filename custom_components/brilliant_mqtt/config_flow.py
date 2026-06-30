@@ -119,12 +119,25 @@ def _mqtt_schema_fields(source: Mapping[str, Any]) -> dict[Any, Any]:
     }
 
 
-def _components_schema_fields(source: Mapping[str, Any]) -> dict[Any, Any]:
-    """One checkbox per OPTIONAL component (bridge is implicit/locked), plus voice sub-fields."""
+def _components_schema_fields(
+    source: Mapping[str, Any], *, new_install: bool = True
+) -> dict[Any, Any]:
+    """One checkbox per OPTIONAL component (bridge is implicit/locked), plus voice sub-fields.
+
+    *new_install* controls the fallback default for keys absent from the entry's
+    CONF_COMPONENTS dict:
+
+    - ``True`` (new installs / script step): fall back to ``c.default_enabled`` so
+      default-on components (e.g. wifi_watchdog) render pre-checked on first setup.
+    - ``False`` (existing panels / reconfigure step): fall back to ``False`` so a
+      panel that was onboarded before the component existed does NOT accidentally get
+      it installed on a no-change reconfigure Save.
+    """
     chosen: Mapping[str, Any] = source.get(CONF_COMPONENTS, {})
     fields: dict[Any, Any] = {}
     for c in optional():
-        fields[vol.Required(c.id, default=chosen.get(c.id, c.default_enabled))] = bool
+        default = chosen.get(c.id, c.default_enabled if new_install else False)
+        fields[vol.Required(c.id, default=default)] = bool
     # Voice sub-config (meaningful only when voice is checked; validated leniently).
     fields[
         vol.Required(
@@ -537,7 +550,7 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
                 vol.Required(CONF_MESH_PRIORITY, default=data.get(CONF_MESH_PRIORITY, 0)): vol.All(
                     vol.Coerce(int), vol.Range(min=0, max=99)
                 ),
-                **_components_schema_fields(data),
+                **_components_schema_fields(data, new_install=False),
             }
         )
         # Keep the operator's just-made edits across an error redisplay (a transient

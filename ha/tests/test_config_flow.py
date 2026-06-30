@@ -938,3 +938,57 @@ async def test_reconfigure_rejects_control_char_in_voice_ha_host(
     assert result["type"] == "form"
     assert result["errors"] == {CONF_VOICE_HA_HOST: "invalid_value"}
     apply.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reconfigure_migrated_entry_watchdog_default_not_preselected(
+    hass: HomeAssistant,
+    patch_installs: Any,
+) -> None:
+    """Fix #2: an existing panel WITHOUT the wifi_watchdog key must show the checkbox
+    UNCHECKED on reconfigure, so a no-change Save does NOT install the watchdog.
+
+    Before the fix, _components_schema_fields used ``c.default_enabled`` (True for
+    wifi_watchdog) as the fallback for any key absent from CONF_COMPONENTS, making
+    the reconfigure form render the checkbox pre-checked on all 14 migrated panels.
+    A no-change Save would then drive was=False → now=True → install called.
+
+    After the fix (new_install=False on async_step_reconfigure), the fallback for
+    an absent key is False, so the box is unchecked and a no-change Save is a no-op.
+
+    This test FAILS against current code (schema default is True, not False) and
+    PASSES after the fix (schema default is False).
+    """
+    import voluptuous as vol
+
+    # Migrated entry: no wifi_watchdog key at all in CONF_COMPONENTS.
+    entry = _full_entry(
+        hass,
+        **{CONF_COMPONENTS: {COMPONENT_BRIDGE: True, COMPONENT_VOICE: False}},
+    )
+    result = await entry.start_reconfigure_flow(hass)
+    assert result["type"] == "form" and result["step_id"] == "reconfigure"
+
+    # The schema default for wifi_watchdog must be False for an existing entry that
+    # does not have the key (was True before the fix → pre-checked → auto-install bug).
+    schema = result["data_schema"]
+    assert schema is not None
+    wd_default: bool | None = None
+    for marker in schema.schema:
+        if str(marker) == COMPONENT_WIFI_WATCHDOG:
+            raw = marker.default
+            wd_default = raw() if raw is not vol.UNDEFINED and callable(raw) else raw
+            break
+    assert wd_default is False, (
+        f"wifi_watchdog reconfigure default must be False for a migrated entry "
+        f"(got {wd_default!r}; before the fix it was True)"
+    )
+
+    # A no-change submit (wifi_watchdog stays False) must not call install or remove.
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        reconfigure_input(entry),  # wifi_watchdog=False since not in entry.data
+    )
+    assert result["type"] == "abort" and result["reason"] == "reconfigure_successful"
+    assert not patch_installs.called(COMPONENT_WIFI_WATCHDOG)
+    assert not patch_installs.removed(COMPONENT_WIFI_WATCHDOG)
