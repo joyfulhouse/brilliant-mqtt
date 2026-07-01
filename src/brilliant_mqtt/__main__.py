@@ -10,10 +10,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from pathlib import Path
 
-from brilliant_mqtt.bridge import Bridge
+from brilliant_mqtt.bridge import Bridge, WriteThrottle
 from brilliant_mqtt.bus import RpcBusAdapter
 from brilliant_mqtt.config import Settings
+from brilliant_mqtt.desired_state import DesiredState
 from brilliant_mqtt.mesh_leader import MeshLeader
 from brilliant_mqtt.model import BrilliantDevice
 from brilliant_mqtt.mqttio import AioMqttAdapter
@@ -56,6 +58,15 @@ def _is_reconnect_storm(bus: BusClient, settings: Settings) -> bool:
     return count >= settings.reconnect_storm_threshold
 
 
+def _make_desired(settings: Settings, name: str) -> DesiredState | None:
+    """A loaded DesiredState for one bridge scope, or None when disabled."""
+    if not settings.motion_reconcile_enabled:
+        return None
+    ds = DesiredState(Path(settings.motion_desired_state_dir) / f"{name}.json")
+    ds.load()
+    return ds
+
+
 def _is_panel_device(device: BrilliantDevice) -> bool:
     """Panel-bridge scope: everything EXCEPT the virtual mesh device.
 
@@ -66,21 +77,44 @@ def _is_panel_device(device: BrilliantDevice) -> bool:
     return device.device_id != _MESH_DEVICE_ID
 
 
-async def _run_session(settings: Settings) -> None:
+async def _run_session(
+    settings: Settings,
+    desired_panel: DesiredState | None,
+    desired_mesh: DesiredState | None,
+) -> None:
     """Run ONE bridge session: construct the adapters, serve forever, tear down.
 
     A module-level function (not a body inlined in :func:`run`'s while-loop)
     so the callbacks defined here close over stable function locals instead of
     loop variables (ruff B023). It owns the session's adapters end to end: the
     ``finally`` teardown runs on any exit, including cancellation.
+
+    The desired-state stores are constructed by :func:`run` (process scope)
+    and only wired here — see the comment there for why.
     """
     participating = settings.mesh_priority >= 1
     mqtt = AioMqttAdapter(settings)
     bus = RpcBusAdapter(extra_device_ids=(_MESH_DEVICE_ID,) if participating else ())
     try:
+        # Shared write-throttle: both Bridge instances in this process use the
+        # same Thrift bus, so the global min-write-spacing must be enforced
+        # bus-wide, not per-bridge.  A single WriteThrottle shared here
+        # prevents the combined rate from exceeding the intended limit.
+        write_throttle = WriteThrottle()
+
         # Bridges register their bus/mqtt callbacks in __init__, BEFORE any I/O
         # starts — so no early change/command event is missed.
-        panel_bridge = Bridge(bus, mqtt, settings.panel, include=_is_panel_device)
+        panel_bridge = Bridge(
+            bus,
+            mqtt,
+            settings.panel,
+            include=_is_panel_device,
+            desired=desired_panel,
+            reconcile_min_interval_s=settings.motion_reconcile_min_interval_s,
+            reconcile_max_writes_per_tick=settings.motion_reconcile_max_writes_per_tick,
+            reconcile_min_write_spacing_s=settings.motion_reconcile_min_write_spacing_s,
+            write_throttle=write_throttle,
+        )
 
         if participating:
 
@@ -92,7 +126,17 @@ async def _run_session(settings: Settings) -> None:
                 # after bus.start(), by which time it is assigned below.
                 return device.device_id == _MESH_DEVICE_ID and leader.is_leader
 
-            mesh_bridge = Bridge(bus, mqtt, "mesh", include=_mesh_in_scope)
+            mesh_bridge = Bridge(
+                bus,
+                mqtt,
+                "mesh",
+                include=_mesh_in_scope,
+                desired=desired_mesh,
+                reconcile_min_interval_s=settings.motion_reconcile_min_interval_s,
+                reconcile_max_writes_per_tick=settings.motion_reconcile_max_writes_per_tick,
+                reconcile_min_write_spacing_s=settings.motion_reconcile_min_write_spacing_s,
+                write_throttle=write_throttle,
+            )
             leader = MeshLeader(
                 mqtt,
                 settings.panel,
@@ -175,9 +219,16 @@ async def _run_session(settings: Settings) -> None:
 
 async def run(settings: Settings) -> None:
     """Supervise the bridge forever: (re)connect, reconcile, periodically resync."""
+    # Desired-state stores are PROCESS-lifetime, not session-lifetime: sessions
+    # rebuild routinely (stale watchdog / storm breaker), and a rebuild must not
+    # discard in-memory intent recorded while persistence was failing, nor
+    # resurrect stale disk state over the operator's last command — so load()
+    # runs exactly once, here.
+    desired_panel = _make_desired(settings, f"{settings.panel}-faceplate")
+    desired_mesh = _make_desired(settings, "mesh") if settings.mesh_priority >= 1 else None
     while True:
         try:
-            await _run_session(settings)
+            await _run_session(settings, desired_panel, desired_mesh)
         except asyncio.CancelledError:
             raise
         except Exception:

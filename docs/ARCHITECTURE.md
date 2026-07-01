@@ -43,7 +43,9 @@ bidirectional control.
 | `mapping.py` | Device → HA entity descriptor (component, capabilities). | unit |
 | `discovery.py` | HA MQTT-Discovery payloads + topic builders. | unit |
 | `commands.py` | Inbound MQTT command → bus variable-set translation. | unit |
-| `bridge.py` | Orchestrator: reconcile, change → state publish, command → bus. | unit (fakes) |
+| `desired_state.py` | Operator desired-state store for the motion vars (`RECONCILED_VARS`) — in-memory + durable JSON under `/var`; feeds the bridge's drift re-assertion. | unit |
+| `bridge.py` | Orchestrator: reconcile, change → state publish, command → bus, desired-state enforcement. | unit (fakes) |
+| `mesh_leader.py` | Fleet-wide mesh leader election over MQTT (retained priority claim + heartbeat); gates the mesh bridge's publishes and writes. | unit |
 | `config.py` | Env-driven settings. | unit |
 | `__main__.py` | Entry point: wire real adapters, run the loop. | thin |
 

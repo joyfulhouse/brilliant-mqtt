@@ -10,7 +10,24 @@ No panel imports, no MQTT library imports: pure stdlib only.
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
+
+# Recognized spellings for boolean env vars. Anything else raises ValueError at
+# startup — an operator writing "false" must never silently get "enabled".
+_ENV_TRUTHY = frozenset({"1", "true", "on", "yes"})
+_ENV_FALSY = frozenset({"0", "false", "off", "no"})
+
+
+def _env_bool(env: Mapping[str, str], key: str, default: str) -> bool:
+    raw = env.get(key, default).strip().lower()
+    if raw in _ENV_TRUTHY:
+        return True
+    if raw in _ENV_FALSY:
+        return False
+    raise ValueError(
+        f"{key} must be one of {sorted(_ENV_TRUTHY)} / {sorted(_ENV_FALSY)}, got {raw!r}"
+    )
 
 
 @dataclass(frozen=True)
@@ -44,6 +61,27 @@ class Settings:
     # disables the breaker.
     reconnect_storm_threshold: int = 20
     reconnect_storm_window_seconds: float = 60.0
+    # Motion desired-state reconciliation: re-assert the operator's
+    # last-commanded motion vars (RECONCILED_VARS — the enable flags plus
+    # thresholds) when the firmware reverts them; runtime enables reset to
+    # defaults within minutes while NVM thresholds persist. Falsy spellings
+    # ("0"/"false"/"off"/"no") disable.
+    motion_reconcile_enabled: bool = True
+    # Per-(peripheral, var) floor between re-assert attempts. Also what rotates
+    # the single write slot across peripherals over time (fairness) — keep > 0.
+    motion_reconcile_min_interval_s: float = 60.0
+    # Cap on reconciler bus writes per poll tick. NOTE: only effective when
+    # MOTION_RECONCILE_MIN_WRITE_SPACING_S is 0 — with spacing > 0 the spacing
+    # guard already limits every tick to ONE write, so spacing (not this cap)
+    # is the lever that tunes the catch-up ramp. Must be >= 1.
+    motion_reconcile_max_writes_per_tick: int = 4
+    # Minimum seconds between consecutive reconciler writes across ticks —
+    # bus-global (shared by both bridges), independent of the poll cadence.
+    # 0 disables spacing (the per-tick cap then governs).
+    motion_reconcile_min_write_spacing_s: float = 0.5
+    # Directory for the per-bridge desired-state JSON files. Must live under
+    # the OTA-persistent /var so desired state survives firmware updates.
+    motion_desired_state_dir: str = "/var/brilliant-mqtt/state"
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -57,9 +95,18 @@ class Settings:
                   MESH_HEARTBEAT_SECONDS (default 10.0),
                   RECONNECT_STORM_THRESHOLD (default 20: reconnects within the
                   window that trip a session rebuild; 0 disables),
-                  RECONNECT_STORM_WINDOW_SECONDS (default 60).
+                  RECONNECT_STORM_WINDOW_SECONDS (default 60),
+                  MOTION_RECONCILE_ENABLED (default "1"; "0"/"false"/"off"/"no"
+                  disable, "1"/"true"/"on"/"yes" enable, anything else raises),
+                  MOTION_RECONCILE_MIN_INTERVAL_S (default 60.0, must be >= 0),
+                  MOTION_RECONCILE_MAX_WRITES_PER_TICK (default 4, must be >= 1;
+                  only effective when the write spacing is 0),
+                  MOTION_RECONCILE_MIN_WRITE_SPACING_S (default 0.5, must be
+                  >= 0; 0 disables spacing — this is the catch-up ramp lever),
+                  MOTION_DESIRED_STATE_DIR (default "/var/brilliant-mqtt/state").
 
-        Raises KeyError when a required variable is absent.
+        Raises KeyError when a required variable is absent and ValueError when
+        a value fails validation — both crash startup loudly under systemd.
         """
         env = os.environ
 
@@ -79,6 +126,23 @@ class Settings:
         mesh_heartbeat_seconds = float(env.get("MESH_HEARTBEAT_SECONDS", "10.0"))
         reconnect_storm_threshold = int(env.get("RECONNECT_STORM_THRESHOLD", "20"))
         reconnect_storm_window_seconds = float(env.get("RECONNECT_STORM_WINDOW_SECONDS", "60"))
+        motion_reconcile_enabled = _env_bool(env, "MOTION_RECONCILE_ENABLED", "1")
+        motion_reconcile_min_interval_s = float(env.get("MOTION_RECONCILE_MIN_INTERVAL_S", "60"))
+        if motion_reconcile_min_interval_s < 0:
+            raise ValueError("MOTION_RECONCILE_MIN_INTERVAL_S must be >= 0")
+        motion_reconcile_max_writes_per_tick = int(
+            env.get("MOTION_RECONCILE_MAX_WRITES_PER_TICK", "4")
+        )
+        if motion_reconcile_max_writes_per_tick < 1:
+            # 0 would silently disable ALL enforcement while commands still
+            # record; MOTION_RECONCILE_ENABLED is the one way to turn it off.
+            raise ValueError("MOTION_RECONCILE_MAX_WRITES_PER_TICK must be >= 1")
+        motion_reconcile_min_write_spacing_s = float(
+            env.get("MOTION_RECONCILE_MIN_WRITE_SPACING_S", "0.5")
+        )
+        if motion_reconcile_min_write_spacing_s < 0:
+            raise ValueError("MOTION_RECONCILE_MIN_WRITE_SPACING_S must be >= 0 (0 disables)")
+        motion_desired_state_dir = env.get("MOTION_DESIRED_STATE_DIR", "/var/brilliant-mqtt/state")
 
         return cls(
             panel=panel,
@@ -94,4 +158,9 @@ class Settings:
             mesh_heartbeat_seconds=mesh_heartbeat_seconds,
             reconnect_storm_threshold=reconnect_storm_threshold,
             reconnect_storm_window_seconds=reconnect_storm_window_seconds,
+            motion_reconcile_enabled=motion_reconcile_enabled,
+            motion_reconcile_min_interval_s=motion_reconcile_min_interval_s,
+            motion_reconcile_max_writes_per_tick=motion_reconcile_max_writes_per_tick,
+            motion_reconcile_min_write_spacing_s=motion_reconcile_min_write_spacing_s,
+            motion_desired_state_dir=motion_desired_state_dir,
         )

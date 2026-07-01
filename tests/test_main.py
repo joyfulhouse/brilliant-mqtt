@@ -9,11 +9,17 @@ stays registered after withdraw) publishes nothing on the mesh namespace.
 
 from __future__ import annotations
 
+import asyncio
 import json
+from pathlib import Path
 
-from brilliant_mqtt.__main__ import _is_panel_device, _is_reconnect_storm
+import pytest
+
+import brilliant_mqtt.__main__ as main_mod
+from brilliant_mqtt.__main__ import _is_panel_device, _is_reconnect_storm, _make_desired
 from brilliant_mqtt.bridge import Bridge
 from brilliant_mqtt.config import Settings
+from brilliant_mqtt.desired_state import DesiredState
 from brilliant_mqtt.mesh_leader import MESH_LEADER_TOPIC, MeshLeader
 from brilliant_mqtt.model import BrilliantDevice, DeviceKind, Variable
 from tests.fakes import FakeBus, FakeClock, FakeMqtt
@@ -155,3 +161,111 @@ class TestLeadershipGate:
         await bus.emit(device)
         await mesh_bridge.poll_once()
         assert _data_topics(mqtt) == []
+
+
+def _desired_settings(
+    motion_reconcile_enabled: bool = True,
+    motion_desired_state_dir: str = "/var/brilliant-mqtt/state",
+) -> Settings:
+    """Build a minimal Settings for _make_desired tests."""
+    return Settings(
+        panel="office",
+        mqtt_host="h",
+        mqtt_username="u",
+        mqtt_password="p",
+        motion_reconcile_enabled=motion_reconcile_enabled,
+        motion_desired_state_dir=motion_desired_state_dir,
+    )
+
+
+def test_make_desired_disabled_returns_none(tmp_path: Path) -> None:
+    s = _desired_settings(motion_reconcile_enabled=False, motion_desired_state_dir=str(tmp_path))
+    assert _make_desired(s, "office-faceplate") is None
+
+
+def test_make_desired_enabled_builds_loaded_store(tmp_path: Path) -> None:
+    s = _desired_settings(motion_reconcile_enabled=True, motion_desired_state_dir=str(tmp_path))
+    ds = _make_desired(s, "mesh")
+    assert ds is not None
+    assert ds.wanted("any") == {}  # loaded (empty) without error
+
+
+class TestProcessLifetimeDesiredState:
+    """Desired-state stores are PROCESS-lifetime, not session-lifetime: a
+    session rebuild (stale watchdog / storm breaker — routine on this fleet)
+    must not discard in-memory intent recorded while persistence was failing,
+    nor resurrect stale disk state over the operator's last command."""
+
+    async def test_run_reuses_desired_state_across_session_rebuilds(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        loads: list[DesiredState] = []
+        orig_load = DesiredState.load
+
+        def counting_load(ds: DesiredState) -> None:
+            loads.append(ds)
+            orig_load(ds)
+
+        monkeypatch.setattr(DesiredState, "load", counting_load)
+        monkeypatch.setattr(main_mod, "_BACKOFF_S", 0)
+
+        seen: list[DesiredState | None] = []
+        calls = 0
+
+        async def fake_session(
+            settings: Settings,
+            desired_panel: DesiredState | None = None,
+            desired_mesh: DesiredState | None = None,
+        ) -> None:
+            nonlocal calls
+            calls += 1
+            seen.append(desired_panel)
+            seen.append(desired_mesh)
+            if calls == 1:
+                raise RuntimeError("session died (storm)")
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(main_mod, "_run_session", fake_session)
+
+        s = _desired_settings(motion_desired_state_dir=str(tmp_path))
+        with pytest.raises(asyncio.CancelledError):
+            await main_mod.run(s)
+
+        assert calls == 2
+        # The SAME store instance is handed to both sessions...
+        assert seen[0] is not None and seen[0] is seen[2]
+        assert seen[1] is seen[3]  # mesh not participating -> None both times
+        # ...and the disk was read exactly once, at process start — a rebuild
+        # must never re-load stale disk state over live in-memory intent.
+        assert len(loads) == 1
+
+    async def test_run_builds_separate_stores_when_mesh_participates(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(main_mod, "_BACKOFF_S", 0)
+        seen: list[DesiredState | None] = []
+
+        async def fake_session(
+            settings: Settings,
+            desired_panel: DesiredState | None = None,
+            desired_mesh: DesiredState | None = None,
+        ) -> None:
+            seen.append(desired_panel)
+            seen.append(desired_mesh)
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(main_mod, "_run_session", fake_session)
+
+        s = Settings(
+            panel="office",
+            mqtt_host="h",
+            mqtt_username="u",
+            mqtt_password="p",
+            mesh_priority=1,
+            motion_desired_state_dir=str(tmp_path),
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await main_mod.run(s)
+
+        assert seen[0] is not None and seen[1] is not None
+        assert seen[0] is not seen[1]  # faceplate and mesh stores stay separate
