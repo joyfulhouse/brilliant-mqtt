@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-07-01
+
+### Added
+
+- **Motion settings now stick.** The panel firmware silently reverts the motion
+  *enable* flags (mesh motion scoring; faceplate PIR / screen / light motion
+  detection) to defaults within minutes, so turning them on from Home Assistant
+  never lasted. The agent now remembers the last value you commanded for the
+  motion controls and re-asserts any that drift — batched per device,
+  rate-limited bus-wide, durable across panel reboots and firmware updates
+  (state lives under `/var`). Enabled by default; see the
+  [reconciler settings](docs/CONFIGURATION.md#motion-desired-state-reconciler)
+  to tune or disable it. Re-asserted values are echoed to Home Assistant
+  immediately, so motion switches no longer blip OFF in history each time the
+  firmware fights back.
+
 ## [0.3.0] - 2026-06-23
 
 ### Added

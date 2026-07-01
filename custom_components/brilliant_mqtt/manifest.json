@@ -1,15 +1,23 @@
 {
   "domain": "brilliant_mqtt",
   "name": "Brilliant MQTT Panel Manager",
-  "codeowners": ["@btli"],
+  "codeowners": [
+    "@btli"
+  ],
   "config_flow": true,
-  "dependencies": ["mqtt"],
+  "dependencies": [
+    "mqtt"
+  ],
   "documentation": "https://github.com/joyfulhouse/brilliant-mqtt",
   "integration_type": "device",
   "iot_class": "local_push",
   "issue_tracker": "https://github.com/joyfulhouse/brilliant-mqtt/issues",
-  "loggers": ["asyncssh"],
+  "loggers": [
+    "asyncssh"
+  ],
   "quality_scale": "platinum",
-  "requirements": ["asyncssh==2.23.1"],
-  "version": "0.3.0"
+  "requirements": [
+    "asyncssh==2.23.1"
+  ],
+  "version": "0.3.1"
 }

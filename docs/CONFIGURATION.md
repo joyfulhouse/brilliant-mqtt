@@ -44,6 +44,20 @@ configuration management; keep credentials out of git).
 | `MESH_PRIORITY` | no | `0` (never publish) | Participate in BLE-mesh leader election with this priority. Lower number wins; ties broken by panel name. `0` means this panel never publishes the mesh namespace. Set to `1` or higher on every panel that should be a standby. |
 | `MESH_HEARTBEAT_SECONDS` | no | `10` seconds | How often the elected leader heartbeats its retained claim. A claim older than 3× this triggers a standby takeover. |
 
+### Motion desired-state reconciler
+
+The firmware reverts the motion **enable** flags to defaults within minutes
+(thresholds persist in NVM; runtime enables reset). The reconciler records the
+last value you commanded for the motion vars and re-asserts any that drift.
+
+| Variable | Required | Default | Meaning |
+|---|---|---|---|
+| `MOTION_RECONCILE_ENABLED` | no | `1` | `0`/`false`/`off`/`no` disable re-assertion (commands still pass through); any other unrecognized value fails startup. |
+| `MOTION_RECONCILE_MIN_INTERVAL_S` | no | `60` seconds | Floor between re-assert attempts per (peripheral, variable). Also rotates the write slot across peripherals — keep above `0`. |
+| `MOTION_RECONCILE_MIN_WRITE_SPACING_S` | no | `0.5` seconds | Minimum gap between consecutive reconciler bus writes, shared across the panel and mesh bridges. **This is the lever that tunes the catch-up ramp** after a mass drift (e.g. a mesh-leader restart): with spacing above `0`, each poll tick writes at most one peripheral. `0` disables spacing. |
+| `MOTION_RECONCILE_MAX_WRITES_PER_TICK` | no | `4` | Cap on reconciler writes in a single poll tick. Only takes effect when the write spacing is `0` (see above). Must be at least `1`. |
+| `MOTION_DESIRED_STATE_DIR` | no | `/var/brilliant-mqtt/state` | Where the per-bridge desired-state JSON files live. Keep it under `/var` so the state survives firmware OTA updates. |
+
 Example `/etc/brilliant-mqtt.env`:
 
 ```

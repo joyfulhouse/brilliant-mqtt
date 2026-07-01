@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 from brilliant_mqtt import __version__
 from brilliant_mqtt.commands import VarSet, translate_aux, translate_command
+from brilliant_mqtt.desired_state import RECONCILED_VARS, DesiredState
 from brilliant_mqtt.discovery import (
     aux_command_topic,
     availability_topic,
@@ -32,6 +34,14 @@ logger = logging.getLogger(__name__)
 # Reserved pseudo-panel slug — the mesh bridge instance publishes no meta topic
 # (there is no single host behind it; see discovery.config_payload's mesh branch).
 _MESH_PANEL = "mesh"
+
+
+@dataclass
+class WriteThrottle:
+    """Shared last-write timestamp so the reconciler's global write-spacing
+    bounds the rate on the shared bus across all Bridge instances."""
+
+    last_ts: float | None = None
 
 
 def _state_payload(device: BrilliantDevice) -> str:
@@ -77,6 +87,12 @@ class Bridge:
         panel: str,
         *,
         include: Callable[[BrilliantDevice], bool] | None = None,
+        desired: DesiredState | None = None,
+        reconcile_min_interval_s: float = 60.0,
+        reconcile_max_writes_per_tick: int = 4,
+        reconcile_min_write_spacing_s: float = 0.5,
+        clock: Callable[[], float] = time.monotonic,
+        write_throttle: WriteThrottle | None = None,
     ) -> None:
         self._bus = bus
         self._mqtt = mqtt
@@ -88,6 +104,23 @@ class Bridge:
         # so each bridge must drop out-of-scope devices before computing
         # entities or storing snapshots.
         self._include = include
+        # Desired-state reconciliation (None => disabled; behaves as before).
+        self._desired = desired
+        self._reconcile_min_interval_s = reconcile_min_interval_s
+        self._reconcile_max_writes_per_tick = reconcile_max_writes_per_tick
+        self._reconcile_min_write_spacing_s = reconcile_min_write_spacing_s
+        self._clock = clock
+        # (peripheral_id, var) -> monotonic time of last re-assert attempt.
+        self._last_reassert: dict[tuple[str, str], float] = {}
+        # (peripheral_id, var) pairs already reported as not exposed by their
+        # snapshot — a peripheral that stops advertising a desired var exits
+        # reconciliation silently otherwise (log once, not every tick).
+        self._missing_var_logged: set[tuple[str, str]] = set()
+        # Shared write-spacing holder; if none is supplied each Bridge instance
+        # gets its own (existing tests and single-bridge deployments are unaffected).
+        # Pass the SAME WriteThrottle to both Bridge instances in a two-bridge
+        # process so the global min-write-spacing is enforced across the shared bus.
+        self._throttle = write_throttle if write_throttle is not None else WriteThrottle()
 
         # peripheral_id → most recent BrilliantDevice snapshot.
         self._devices: dict[str, BrilliantDevice] = {}
@@ -181,6 +214,7 @@ class Bridge:
             n_entities,
             len(self._by_cmd_topic),
         )
+        await self._enforce_desired(devices)
 
     def _command_topic_for(self, peripheral_id: str, d: EntityDescriptor) -> str | None:
         """The command topic a descriptor subscribes to, or None if it has none."""
@@ -245,6 +279,95 @@ class Bridge:
             self._devices[device.peripheral_id] = device
             if payload_fields(device):
                 await self._publish_state(device, force=False)
+        await self._enforce_desired(devices)
+
+    async def _enforce_desired(self, devices: list[BrilliantDevice]) -> None:
+        """Re-assert drifted reconciled vars (firmware reverts the enable flags).
+
+        Per peripheral, batch every drifted desired var into ONE set_variables
+        call (avoids the same-peripheral rapid-write race). Rate-limit per
+        (pid, var) and cap the number of peripherals written per tick so a fleet
+        of drifted devices ramps gently instead of bursting the Thrift bus.
+        """
+        if self._desired is None:
+            return
+        now = self._clock()
+        writes = 0
+        for device in devices:
+            if not self._included(device):
+                continue
+            wanted = self._desired.wanted(device.peripheral_id)
+            if not wanted:
+                continue
+            drifted: list[VarSet] = []
+            for var, want in wanted.items():
+                cur = device.variables.get(var)
+                if cur is None:
+                    key = (device.peripheral_id, var)
+                    if key not in self._missing_var_logged:
+                        self._missing_var_logged.add(key)
+                        logger.debug(
+                            "reconcile-desired: %s does not expose %s; will not re-assert it",
+                            device.peripheral_id,
+                            var,
+                        )
+                    continue
+                if str(cur.value) == str(want):
+                    continue
+                last = self._last_reassert.get((device.peripheral_id, var))
+                if last is not None and (now - last) < self._reconcile_min_interval_s:
+                    continue
+                drifted.append(VarSet(var, want))
+            if not drifted:
+                continue
+            if writes >= self._reconcile_max_writes_per_tick:
+                return
+            # Global min-spacing bounds the write rate across ticks, independent
+            # of the poll cadence. A single tick writes at most one peripheral
+            # when spacing > 0; the rest catch up on subsequent ticks.
+            # NOTE: the per-(pid,var) rate-limit (_last_reassert / min_interval_s)
+            # provides round-robin fairness across peripherals over time; keep
+            # reconcile_min_interval_s > 0 (the default 60 s) to preserve this.
+            # Fairness bound: the scan restarts from devices[0] each tick, so
+            # with more than ~min_interval_s / poll-cadence peripherals drifting
+            # PERSISTENTLY (~30 at defaults — only plausible with a frozen
+            # get_all mirror) the head devices re-enter their windows before the
+            # tail is reached; the stale-stream watchdog rebuild is the backstop
+            # in that regime.
+            if (
+                self._throttle.last_ts is not None
+                and (now - self._throttle.last_ts) < self._reconcile_min_write_spacing_s
+            ):
+                return
+            # Mark both the per-var rate-limit window and the global
+            # write-spacing window BEFORE the write attempt.  A failed write
+            # still consumes both — intentional: a persistently-failing
+            # peripheral or bus is not hammered on every tick, and the spacing
+            # window is anchored to the tick's `now` (not a post-await clock
+            # read) so the check `(now - _throttle.last_ts) < spacing` stays
+            # non-negative and behaves correctly.
+            for vs in drifted:
+                self._last_reassert[(device.peripheral_id, vs.name)] = now
+            self._throttle.last_ts = now
+            writes += 1
+            try:
+                await self._bus.set_variables(device.device_id, device.peripheral_id, drifted)
+                logger.info(
+                    "reconcile-desired %s/%s: %s",
+                    device.device_id,
+                    device.peripheral_id,
+                    {vs.name: vs.value for vs in drifted},
+                )
+                # Echo like the command path does: without it, HA shows the
+                # firmware's reverted value until the next poll — a phantom
+                # OFF blip in history/automations on every revert cycle.
+                await self._echo_state(device.peripheral_id, drifted)
+            except Exception:
+                logger.exception(
+                    "reconcile-desired write/echo failed for %s/%s; continuing",
+                    device.device_id,
+                    device.peripheral_id,
+                )
 
     async def _publish_state(self, device: BrilliantDevice, *, force: bool) -> None:
         """Publish *device*'s shared state payload through the diff cache.
@@ -341,6 +464,8 @@ class Bridge:
         if value is None:
             logger.debug("aux command on %s (%r) did not translate; ignoring", topic, payload)
             return
+        if self._desired is not None and d.command_var in RECONCILED_VARS:
+            self._desired.record(peripheral_id, d.command_var, value)
         device = self._devices.get(peripheral_id)
         if device is None:
             # Without a snapshot we cannot know which bus device owns the
