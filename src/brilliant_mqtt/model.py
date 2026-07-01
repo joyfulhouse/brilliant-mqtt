@@ -19,6 +19,9 @@ class DeviceKind(str, Enum):
     HARDWARE = "hardware"
     UI = "ui"
     WIFI = "wifi"
+    MOTION_CONFIG = "motion_config"
+    ART_CONFIG = "art_config"
+    DEVICE_CONFIG = "device_config"
     UNKNOWN = "unknown"
 
 
@@ -34,6 +37,9 @@ _PERIPHERAL_TYPE_MAP: dict[int, DeviceKind] = {
     22: DeviceKind.HARDWARE,  # HARDWARE (panel diagnostics + controls)
     12: DeviceKind.UI,  # UI (presence / child-lock / identify)
     29: DeviceKind.WIFI,  # WIFI (connectivity diagnostics)
+    20: DeviceKind.MOTION_CONFIG,  # MOTION_DETECTION_CONFIGURATION (screen wake-on-motion)
+    16: DeviceKind.ART_CONFIG,  # ART_CONFIGURATION (screensaver / lock widgets)
+    19: DeviceKind.DEVICE_CONFIG,  # DEVICE_CONFIGURATION (sliders / intercom broadcasts)
 }
 
 
