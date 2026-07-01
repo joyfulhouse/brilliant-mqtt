@@ -112,6 +112,10 @@ class Bridge:
         self._clock = clock
         # (peripheral_id, var) -> monotonic time of last re-assert attempt.
         self._last_reassert: dict[tuple[str, str], float] = {}
+        # (peripheral_id, var) pairs already reported as not exposed by their
+        # snapshot — a peripheral that stops advertising a desired var exits
+        # reconciliation silently otherwise (log once, not every tick).
+        self._missing_var_logged: set[tuple[str, str]] = set()
         # Shared write-spacing holder; if none is supplied each Bridge instance
         # gets its own (existing tests and single-bridge deployments are unaffected).
         # Pass the SAME WriteThrottle to both Bridge instances in a two-bridge
@@ -298,7 +302,17 @@ class Bridge:
             drifted: list[VarSet] = []
             for var, want in wanted.items():
                 cur = device.variables.get(var)
-                if cur is None or str(cur.value) == str(want):
+                if cur is None:
+                    key = (device.peripheral_id, var)
+                    if key not in self._missing_var_logged:
+                        self._missing_var_logged.add(key)
+                        logger.debug(
+                            "reconcile-desired: %s does not expose %s; will not re-assert it",
+                            device.peripheral_id,
+                            var,
+                        )
+                    continue
+                if str(cur.value) == str(want):
                     continue
                 last = self._last_reassert.get((device.peripheral_id, var))
                 if last is not None and (now - last) < self._reconcile_min_interval_s:
@@ -314,6 +328,12 @@ class Bridge:
             # NOTE: the per-(pid,var) rate-limit (_last_reassert / min_interval_s)
             # provides round-robin fairness across peripherals over time; keep
             # reconcile_min_interval_s > 0 (the default 60 s) to preserve this.
+            # Fairness bound: the scan restarts from devices[0] each tick, so
+            # with more than ~min_interval_s / poll-cadence peripherals drifting
+            # PERSISTENTLY (~30 at defaults — only plausible with a frozen
+            # get_all mirror) the head devices re-enter their windows before the
+            # tail is reached; the stale-stream watchdog rebuild is the backstop
+            # in that regime.
             if (
                 self._throttle.last_ts is not None
                 and (now - self._throttle.last_ts) < self._reconcile_min_write_spacing_s
@@ -338,9 +358,13 @@ class Bridge:
                     device.peripheral_id,
                     {vs.name: vs.value for vs in drifted},
                 )
+                # Echo like the command path does: without it, HA shows the
+                # firmware's reverted value until the next poll — a phantom
+                # OFF blip in history/automations on every revert cycle.
+                await self._echo_state(device.peripheral_id, drifted)
             except Exception:
                 logger.exception(
-                    "reconcile-desired write failed for %s/%s; continuing",
+                    "reconcile-desired write/echo failed for %s/%s; continuing",
                     device.device_id,
                     device.peripheral_id,
                 )
