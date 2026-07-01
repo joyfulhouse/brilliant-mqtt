@@ -425,6 +425,35 @@ AUX_SPECS: dict[DeviceKind, tuple[AuxSpec, ...]] = {
             enabled_by_default=False,
         ),
     ),
+    DeviceKind.MOTION_CONFIG: (
+        AuxSpec(
+            var="trigger_screen",
+            component="switch",
+            name="Wake Screen on Motion",
+            value_kind="bool",
+            entity_category="config",
+        ),
+        AuxSpec(
+            var="trigger_screen_off",
+            component="switch",
+            name="Sleep Screen After Motion Stops",
+            value_kind="bool",
+            entity_category="config",
+        ),
+        # 30–3600 s range is ASSUMED (bus documents no bounds; observed 600 on the
+        # pilot 2026-07-01). Same precedent as the motion thresholds' 0–100.
+        AuxSpec(
+            var="trigger_screen_off_timeout_sec",
+            component="number",
+            name="Screen Off Timeout",
+            value_kind="int",
+            unit="s",
+            entity_category="config",
+            min_value=30,
+            max_value=3600,
+            step=30,
+        ),
+    ),
 }
 
 # Aux components that accept inbound commands (carry a command_var).

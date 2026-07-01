@@ -1399,3 +1399,45 @@ def test_mesh_dimmer_sentinel_no_motion_vars_still_one_entity() -> None:
     assert [d.component for d in result] == ["light"]
     uids = {d.unique_id for d in result}
     assert f"brilliant_mesh_{MESH_PID}_movement_detected" not in uids
+
+
+# ===========================================================================
+# MOTION_CONFIG — screen wake-on-motion controls (Task 2)
+# ===========================================================================
+
+
+def _motion_config(**vars_: str) -> BrilliantDevice:
+    return BrilliantDevice(
+        device_id="device_001",
+        peripheral_id="motion_detection_config_peripheral",
+        name="Motion Detection Config",
+        kind=DeviceKind.MOTION_CONFIG,
+        variables={k: Variable(k, v, externally_settable=True) for k, v in vars_.items()},
+    )
+
+
+class TestMotionConfigEntities:
+    def test_mints_wake_sleep_switches_and_timeout_number(self) -> None:
+        dev = _motion_config(
+            trigger_screen="1", trigger_screen_off="1", trigger_screen_off_timeout_sec="600"
+        )
+        ents = {e.name: e for e in entities_for(dev, "office")}
+        assert ents["Wake Screen on Motion"].component == "switch"
+        assert ents["Sleep Screen After Motion Stops"].component == "switch"
+        timeout = ents["Screen Off Timeout"]
+        assert timeout.component == "number"
+        assert (timeout.min_value, timeout.max_value) == (30, 3600)
+
+    def test_payload_renders_all_three(self) -> None:
+        dev = _motion_config(
+            trigger_screen="1", trigger_screen_off="0", trigger_screen_off_timeout_sec="600"
+        )
+        assert payload_fields(dev) == {
+            "trigger_screen": True,
+            "trigger_screen_off": False,
+            "trigger_screen_off_timeout_sec": 600,
+        }
+
+    def test_absent_vars_mint_nothing(self) -> None:
+        assert entities_for(_motion_config(), "office") == []
+        assert payload_fields(_motion_config()) == {}
