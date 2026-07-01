@@ -37,19 +37,27 @@ _FALSY = {"false", "off", "no", "0"}
 
 
 def _normalize_value(v: object) -> str:
-    """Normalize a loaded JSON value to a bus string.
+    """Normalize a loaded JSON value to a canonical bus string.
 
     JSON booleans (``true``/``false``) and common string synonyms
-    (``"on"``/``"off"``/``"yes"``/``"no"``) are mapped to the canonical bus
-    strings ``"1"`` and ``"0"`` so that hand-edited state files do not cause
-    perpetual re-writes (the bus always returns ``"1"`` or ``"0"``, never
-    ``"True"`` or ``"on"``).  Numeric threshold values pass through unchanged.
+    (``"on"``/``"off"``/``"yes"``/``"no"``) map to the canonical bus strings
+    ``"1"``/``"0"``, and integral numerics (``30``, ``30.0``, ``"030"``) map to
+    their canonical integer string (``"30"``) — the bus only ever returns those
+    canonical forms, so a hand-edited value in any other spelling would never
+    compare equal and would re-write every min-interval forever. Non-integral
+    and non-numeric values pass through unchanged.
     """
     s = str(v).strip().lower()
     if s in _TRUTHY:
         return "1"
     if s in _FALSY:
         return "0"
+    try:
+        f = float(s)
+    except ValueError:
+        return str(v)
+    if f.is_integer():
+        return str(int(f))
     return str(v)
 
 
@@ -96,7 +104,10 @@ class DesiredState:
         try:
             raw = json.loads(self._path.read_text())
         except (OSError, ValueError) as e:
-            if not isinstance(e, FileNotFoundError):
+            if isinstance(e, FileNotFoundError):
+                # First boot looks identical to a vanished file without this line.
+                logger.info("no desired-state file at %s; starting empty", self._path)
+            else:
                 logger.warning(
                     "could not load desired-state from %s (%s); starting empty",
                     self._path,
@@ -108,16 +119,42 @@ class DesiredState:
             return
         for pid, vars_ in raw.items():
             if not isinstance(vars_, dict):
+                logger.warning(
+                    "desired-state %s: entry for %r is not an object; dropping it",
+                    self._path,
+                    pid,
+                )
                 continue
             filtered = {
                 str(k): _normalize_value(v) for k, v in vars_.items() if str(k) in RECONCILED_VARS
             }
             if filtered:
                 self._state[str(pid)] = filtered
+        logger.info(
+            "loaded desired-state from %s: %d peripheral(s), %d var(s)",
+            self._path,
+            len(self._state),
+            sum(len(v) for v in self._state.values()),
+        )
 
     def save(self) -> None:
-        """Atomically persist state (write temp + os.replace)."""
+        """Durably persist state: write temp, fsync, atomic rename, fsync dir.
+
+        ``os.replace`` alone gives atomicity but not durability — without the
+        fsyncs, a breaker power-cut shortly after a command could leave a
+        truncated file (ext4 delayed allocation) and silently drop the whole
+        desired config at next boot. Saves only happen on operator commands,
+        so the extra syncs cost nothing in steady state.
+        """
         self._path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self._path.with_name(self._path.name + ".tmp")
-        tmp.write_text(json.dumps(self._state))
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(json.dumps(self._state))
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, self._path)
+        dir_fd = os.open(self._path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
