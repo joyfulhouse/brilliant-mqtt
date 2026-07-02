@@ -58,6 +58,36 @@ last value you commanded for the motion vars and re-asserts any that drift.
 | `MOTION_RECONCILE_MAX_WRITES_PER_TICK` | no | `4` | Cap on reconciler writes in a single poll tick. Only takes effect when the write spacing is `0` (see above). Must be at least `1`. |
 | `MOTION_DESIRED_STATE_DIR` | no | `/var/brilliant-mqtt/state` | Where the per-bridge desired-state JSON files live. Keep it under `/var` so the state survives firmware OTA updates. |
 
+### Wi-Fi watchdog
+
+An optional standalone daemon (`brilliant_wifi_watchdog`) that recovers a
+panel's Wi-Fi when the gateway goes unreachable — escalating from a soft
+`connman` reconnect, to a `connman`/`wpa_supplicant` service restart, to a
+GPIO/SDIO Wi-Fi chip reset + reboot (guarded against reboot-looping).
+Installed separately from the bridge, via the HA integration's **Wi-Fi
+watchdog** switch (see [ha-integration.md → Entities](ha-integration.md#entities))
+or manually from
+[deploy/brilliant-wifi-watchdog.service](../deploy/brilliant-wifi-watchdog.service).
+It reads the same `/etc/brilliant-mqtt.env` as the bridge — there is no
+separate env file.
+
+| Variable | Required | Default | Meaning |
+|---|---|---|---|
+| `WIFI_WATCHDOG_INTERVAL` | no | `30` seconds | Probe loop cadence — how often the gateway is pinged. |
+| `WIFI_WATCHDOG_GATEWAY` | no | _(auto)_ | Gateway IP to probe. Blank auto-detects the default gateway from the routing table every cycle. |
+| `WIFI_WATCHDOG_SOFT_AFTER` | no | `90` seconds | Gateway unreachable this long triggers a soft `connman` reconnect (rung 1). |
+| `WIFI_WATCHDOG_RESTART_AFTER` | no | `180` seconds | Escalates to restarting the `connman` + `wpa_supplicant` services (rung 2). |
+| `WIFI_WATCHDOG_REBOOT_AFTER` | no | `360` seconds | Escalates to a GPIO/SDIO Wi-Fi chip reset + `systemctl reboot` (rung 3), subject to the reboot guard below. |
+| `WIFI_WATCHDOG_REBOOT_COOLDOWN` | no | `3600` seconds (1 h) | Minimum gap between guard-permitted reboots. |
+| `WIFI_WATCHDOG_REBOOT_CAP` | no | `3` reboots | Maximum reboots allowed inside the rolling window; the guard blocks further ones (logs only) past this. |
+| `WIFI_WATCHDOG_REBOOT_WINDOW` | no | `21600` seconds (6 h) | Rolling window the reboot cap is measured over. |
+| `WIFI_WATCHDOG_LOG` | no | `/var/brilliant-mqtt/wifi-watchdog.log` | Rotating log file (3 × 512 KB backups). |
+| `WIFI_WATCHDOG_STATE` | no | `/var/brilliant-mqtt/wifi-watchdog.state` | Where reboot timestamps persist, so the cooldown/cap survive a watchdog restart. |
+
+`MQTT_HOST` / `MQTT_PORT` (already set for the bridge) are reused to log
+broker reachability alongside the gateway probe — informational only; broker
+state never drives the escalation ladder.
+
 Example `/etc/brilliant-mqtt.env`:
 
 ```
@@ -157,7 +187,8 @@ HA device — elected by `MESH_PRIORITY`.
 
 ## Entities per panel
 
-Each panel exposes roughly 20–30 entities across these categories:
+Each panel exposes several dozen entities (many disabled by default) across
+these categories:
 
 - **Loads** (per gang): `light` (dimmer) or `switch`, with brightness where
   the hardware supports it.
@@ -166,10 +197,18 @@ Each panel exposes roughly 20–30 entities across these categories:
 - **Panel controls** (config category): `Microphone Mute`, `Screen`,
   `Screen Brightness` (0–10), `Volume` / `Alert Volume` (0–100),
   `Child Lock`, `Night Mode`, `Faceplate LED`, `Illuminance Sensor` enable,
-  and an `Identify` button.
+  and an `Identify` button. Disabled-by-default governance/audio extras: see
+  [Governance & audio switches](#governance--audio-switches).
+- **Screen, screensaver & sliders**: wake/sleep-on-motion, screensaver and
+  lock-screen widgets, touch-slider and intercom controls — see
+  [Screen, screensaver & slider controls](#screen-screensaver--slider-controls).
 - **Presence & privacy**: `In Use` (someone at the panel, occupancy),
   `Motion` + `Illuminance` (faceplate), `Camera` active and `Privacy Mode`
-  (read-only, diagnostic).
+  (read-only, diagnostic). Advanced motion-source tuning is disabled by
+  default — see
+  [Faceplate motion-detection controls](#faceplate-motion-detection-controls).
+
+  `In Use` reflects touchscreen interaction, not room presence.
 - **Voice** (when enabled): `Voice satellite` switch and `Wake word` select.
 - **Diagnostics**: `CPU Temperature`, `Wi-Fi` / `Internet` connectivity,
   `NTP Sync`, `PIR Score`, `Internal Temperature` (some disabled by default);
@@ -177,6 +216,56 @@ Each panel exposes roughly 20–30 entities across these categories:
 
 All entities are grouped under one HA device (`brilliant_panel_<panel>`), with
 availability tied to the panel's LWT topic.
+
+### Screen, screensaver & slider controls
+
+| Entity | Component | Bus var | Enabled by default |
+|---|---|---|---|
+| Wake Screen on Motion | switch | `trigger_screen` | Yes |
+| Sleep Screen After Motion Stops | switch | `trigger_screen_off` | Yes |
+| Screen Off Timeout | number (30–3600 s) | `trigger_screen_off_timeout_sec` | Yes |
+| Screensaver | switch | `on` (payload key `screensaver_on`) | Yes |
+| Show Time & Date | switch | `display_time_date` | Yes |
+| Weather Widget | switch | `weather_widget_on_lock` | No |
+| Music Widget | switch | `music_widget_on_lock` | No |
+| Device Status Widget | switch | `device_status_on_lock` | No |
+| Solar Savings Widget | switch | `solar_savings_on_lock` | No |
+| Touch Sliders | switch (inverted) | `disable_cap_touch_sliders` (payload key `touch_sliders_enabled`) | Yes |
+| Intercom Broadcasts | switch | `receive_intercom_broadcasts` | Yes |
+| Slider Double-Tap Timeout | number (100–1000 ms) | `slider_double_tap_timeout_ms` | No |
+
+`Touch Sliders` is inverted: the bus variable is a *disable* flag, but the
+switch (and its payload key) reads as "sliders usable" — ON means the touch
+sliders work.
+
+### Faceplate motion-detection controls
+
+Shipped in 0.2.3, disabled by default (advanced tuning). `movement_detected`
+is driven by whichever detection switch below is on; the PIR thresholds only
+take effect once **PIR Score Reporting** is on.
+
+| Entity | Component | Bus var | Enabled by default |
+|---|---|---|---|
+| Screen Motion Detection | switch | `enable_screen_motion_detection` | No |
+| PIR Score Reporting | switch | `enable_pir_motion_score` | No |
+| Light Motion Detection | switch | `enable_light_motion_detection` | No |
+| PIR Motion High Threshold | number (0–100) | `pir_motion_detection_high_threshold` | No |
+| PIR Motion Low Threshold | number (0–100) | `pir_motion_detection_low_threshold` | No |
+
+### Governance & audio switches
+
+Disabled by default — opt in per panel.
+
+| Entity | Component | Bus var | Enabled by default |
+|---|---|---|---|
+| Speaker Ducking | switch | `duck_speaker` | No |
+| Low Temperature Mode | switch | `low_temp_mode` | No |
+| Firmware Auto-Update | switch | `software_update_enabled` | No |
+| Remote Assistance | switch | `remote_assistance_enabled` | No |
+
+`Firmware Auto-Update` off stops the panel receiving vendor security patches;
+`Remote Assistance` on opens Brilliant's reverse-SSH support tunnel. Both are
+opt-in governance surfaces, not fleet-wide defaults.
 
 ---
 
