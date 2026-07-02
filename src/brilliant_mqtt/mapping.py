@@ -505,6 +505,39 @@ AUX_SPECS: dict[DeviceKind, tuple[AuxSpec, ...]] = {
             enabled_by_default=False,
         ),
     ),
+    DeviceKind.DEVICE_CONFIG: (
+        # Inverted like is_safe→Fault: the bus var is a DISABLE flag; the switch
+        # reads/writes "sliders usable", which is the state a human reasons about.
+        AuxSpec(
+            var="disable_cap_touch_sliders",
+            component="switch",
+            name="Touch Sliders",
+            value_kind="bool",
+            payload_key="touch_sliders_enabled",
+            entity_category="config",
+            invert=True,
+        ),
+        AuxSpec(
+            var="receive_intercom_broadcasts",
+            component="switch",
+            name="Intercom Broadcasts",
+            value_kind="bool",
+            entity_category="config",
+        ),
+        # 100–1000 ms range is ASSUMED (observed 400 on the pilot 2026-07-01).
+        AuxSpec(
+            var="slider_double_tap_timeout_ms",
+            component="number",
+            name="Slider Double-Tap Timeout",
+            value_kind="int",
+            unit="ms",
+            entity_category="config",
+            enabled_by_default=False,
+            min_value=100,
+            max_value=1000,
+            step=50,
+        ),
+    ),
 }
 
 # Aux components that accept inbound commands (carry a command_var).

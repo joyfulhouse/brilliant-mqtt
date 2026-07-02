@@ -1494,3 +1494,41 @@ def test_art_config_payload_uses_screensaver_on_key_not_bare_on() -> None:
     assert payload["screensaver_on"] is True
     assert "on" not in payload
     assert payload["display_time_date"] is False
+
+
+# ===========================================================================
+# DEVICE_CONFIG — touch-slider + intercom-broadcast controls (Task 4)
+# ===========================================================================
+#
+# Touch-slider and intercom-broadcast configuration peripheral.
+
+
+def _device_config(**vars_: str) -> BrilliantDevice:
+    """DEVICE_CONFIG peripheral with touch-slider and intercom-broadcast settings."""
+    return BrilliantDevice(
+        device_id="device_001",
+        peripheral_id="device_config_peripheral",
+        name="Device Config",
+        kind=DeviceKind.DEVICE_CONFIG,
+        variables={k: Variable(k, v, externally_settable=True) for k, v in vars_.items()},
+    )
+
+
+def test_device_config_touch_sliders_switch_is_inverted() -> None:
+    dev = _device_config(disable_cap_touch_sliders="0")
+    ents = {e.name: e for e in entities_for(dev, "office")}
+    sliders = ents["Touch Sliders"]
+    assert sliders.component == "switch"
+    assert sliders.invert is True
+    # disable=0 renders as ON (sliders usable) in the payload
+    assert payload_fields(dev)["touch_sliders_enabled"] is True
+
+
+def test_device_config_intercom_broadcasts_and_double_tap_timeout() -> None:
+    dev = _device_config(receive_intercom_broadcasts="1", slider_double_tap_timeout_ms="400")
+    ents = {e.name: e for e in entities_for(dev, "office")}
+    assert ents["Intercom Broadcasts"].component == "switch"
+    tt = ents["Slider Double-Tap Timeout"]
+    assert tt.component == "number"
+    assert tt.enabled_by_default is False
+    assert payload_fields(dev)["slider_double_tap_timeout_ms"] == 400
