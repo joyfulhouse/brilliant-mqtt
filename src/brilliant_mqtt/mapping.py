@@ -324,6 +324,42 @@ AUX_SPECS: dict[DeviceKind, tuple[AuxSpec, ...]] = {
             enabled_by_default=False,
         ),
         AuxSpec(
+            var="duck_speaker",
+            component="switch",
+            name="Speaker Ducking",
+            value_kind="bool",
+            entity_category="config",
+            enabled_by_default=False,
+        ),
+        AuxSpec(
+            var="low_temp_mode",
+            component="switch",
+            name="Low Temperature Mode",
+            value_kind="bool",
+            entity_category="config",
+            enabled_by_default=False,
+        ),
+        # Governance switches — deliberately opt-in (disabled by default):
+        # auto-update OFF means no security patches; remote assistance opens the
+        # vendor's reverse-ssh tunnel. Exposing them lets HA pin firmware around
+        # known-good releases (the 2026-06-26 silent OTA is the motivating case).
+        AuxSpec(
+            var="software_update_enabled",
+            component="switch",
+            name="Firmware Auto-Update",
+            value_kind="bool",
+            entity_category="config",
+            enabled_by_default=False,
+        ),
+        AuxSpec(
+            var="remote_assistance_enabled",
+            component="switch",
+            name="Remote Assistance",
+            value_kind="bool",
+            entity_category="config",
+            enabled_by_default=False,
+        ),
+        AuxSpec(
             var="cpu_temperature",
             component="sensor",
             name="CPU Temperature",
@@ -333,8 +369,9 @@ AUX_SPECS: dict[DeviceKind, tuple[AuxSpec, ...]] = {
             state_class="measurement",
             entity_category="diagnostic",
         ),
-        # Deliberately read-only binary_sensor — bus marks it settable, but write
-        # semantics were never verified; revisit if needed.
+        # Read-only by verification (2026-07-01, probe-pack): the bus ENFORCES
+        # externally_settable and rejects writes to this var with PermissionError —
+        # it can never be promoted to a switch.
         AuxSpec(
             var="camera_on",
             component="binary_sensor",
@@ -343,8 +380,9 @@ AUX_SPECS: dict[DeviceKind, tuple[AuxSpec, ...]] = {
             device_class="running",
             entity_category="diagnostic",
         ),
-        # Deliberately read-only binary_sensor — bus marks it settable, but write
-        # semantics were never verified; revisit if needed.
+        # Read-only by verification (2026-07-01, probe-pack): the bus ENFORCES
+        # externally_settable and rejects writes to this var with PermissionError —
+        # it can never be promoted to a switch.
         AuxSpec(
             var="privacy_toggle",
             component="binary_sensor",
@@ -368,8 +406,9 @@ AUX_SPECS: dict[DeviceKind, tuple[AuxSpec, ...]] = {
         ),
     ),
     DeviceKind.UI: (
-        # Deliberately read-only binary_sensor — bus marks it settable, but write
-        # semantics were never verified; revisit if needed.
+        # Read-only by verification (2026-07-01, probe-pack): the bus ENFORCES
+        # externally_settable and rejects writes to this var with PermissionError —
+        # it can never be promoted to a switch.
         AuxSpec(
             var="active",
             component="binary_sensor",

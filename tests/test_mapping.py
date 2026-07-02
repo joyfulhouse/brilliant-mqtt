@@ -355,25 +355,30 @@ def _always_on() -> BrilliantDevice:
     )
 
 
-def _hardware() -> BrilliantDevice:
-    """HARDWARE peripheral — full diagnostics + controls."""
+def _hardware(**kwargs: str) -> BrilliantDevice:
+    """HARDWARE peripheral — full diagnostics + controls.
+
+    Accepts keyword arguments to override variable values.
+    """
+    defaults = {
+        "muted": "0",
+        "screen_on": "1",
+        "screen_brightness": "7",
+        "output_volume": "100",
+        "alert_volume": "100",
+        "cpu_temperature": "61",
+        "camera_on": "0",
+        "privacy_toggle": "0",
+        "current_release_tag": "v26.05.20.2",
+    }
+    defaults.update(kwargs)
     return BrilliantDevice(
         device_id="dev-hw",
         peripheral_id="hardware_peripheral",
         name="Hardware",
         kind=DeviceKind.HARDWARE,
         peripheral_type=22,
-        variables={
-            "muted": Variable("muted", "0"),
-            "screen_on": Variable("screen_on", "1"),
-            "screen_brightness": Variable("screen_brightness", "7"),
-            "output_volume": Variable("output_volume", "100"),
-            "alert_volume": Variable("alert_volume", "100"),
-            "cpu_temperature": Variable("cpu_temperature", "61"),
-            "camera_on": Variable("camera_on", "0"),
-            "privacy_toggle": Variable("privacy_toggle", "0"),
-            "current_release_tag": Variable("current_release_tag", "v26.05.20.2"),
-        },
+        variables={var_name: Variable(var_name, value) for var_name, value in defaults.items()},
     )
 
 
@@ -574,6 +579,32 @@ def test_hardware_without_camera_yields_no_camera_descriptor() -> None:
     by_uid = _by_uid(entities_for(device, "office"))
     assert "brilliant_office_hardware_peripheral_camera_on" not in by_uid
     assert len(by_uid) == 8
+
+
+def test_hardware_extra_switches_minted_disabled_by_default() -> None:
+    dev = _hardware(
+        duck_speaker="0",
+        low_temp_mode="0",
+        software_update_enabled="1",
+        remote_assistance_enabled="0",
+    )
+    ents = {e.name: e for e in entities_for(dev, "office")}
+    for name in (
+        "Speaker Ducking",
+        "Low Temperature Mode",
+        "Firmware Auto-Update",
+        "Remote Assistance",
+    ):
+        assert ents[name].component == "switch"
+        assert ents[name].entity_category == "config"
+        assert ents[name].enabled_by_default is False
+
+
+def test_hardware_extra_payload_keys() -> None:
+    dev = _hardware(software_update_enabled="1", duck_speaker="0")
+    payload = payload_fields(dev)
+    assert payload["software_update_enabled"] is True
+    assert payload["duck_speaker"] is False
 
 
 # --- UI ---------------------------------------------------------------------
