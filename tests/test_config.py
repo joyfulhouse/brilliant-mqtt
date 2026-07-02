@@ -315,3 +315,56 @@ class TestSettings:
 
         with pytest.raises(ValueError):
             Settings.from_env()
+
+    def test_motion_derived_defaults(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Default: score-derived motion enabled, 60s hold."""
+        monkeypatch.setenv("BRILLIANT_PANEL", "office")
+        monkeypatch.setenv("MQTT_HOST", "10.0.0.1")
+        monkeypatch.setenv("MQTT_USERNAME", "brilliant")
+        monkeypatch.setenv("MQTT_PASSWORD", "s3cr3t")
+        monkeypatch.delenv("MOTION_DERIVED_ENABLED", raising=False)
+        monkeypatch.delenv("MOTION_DERIVED_HOLD_S", raising=False)
+
+        s = Settings.from_env()
+        assert s.motion_derived_enabled is True
+        assert s.motion_derived_hold_s == 60.0
+
+    def test_motion_derived_disabled_spellings(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("BRILLIANT_PANEL", "office")
+        monkeypatch.setenv("MQTT_HOST", "10.0.0.1")
+        monkeypatch.setenv("MQTT_USERNAME", "brilliant")
+        monkeypatch.setenv("MQTT_PASSWORD", "s3cr3t")
+
+        for raw in ("0", "false", "off", "no"):
+            monkeypatch.setenv("MOTION_DERIVED_ENABLED", raw)
+            assert Settings.from_env().motion_derived_enabled is False, raw
+
+    def test_motion_derived_bad_spelling_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("BRILLIANT_PANEL", "office")
+        monkeypatch.setenv("MQTT_HOST", "10.0.0.1")
+        monkeypatch.setenv("MQTT_USERNAME", "brilliant")
+        monkeypatch.setenv("MQTT_PASSWORD", "s3cr3t")
+        monkeypatch.setenv("MOTION_DERIVED_ENABLED", "maybe")
+
+        with pytest.raises(ValueError):
+            Settings.from_env()
+
+    def test_motion_derived_hold_zero_is_legal(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("BRILLIANT_PANEL", "office")
+        monkeypatch.setenv("MQTT_HOST", "10.0.0.1")
+        monkeypatch.setenv("MQTT_USERNAME", "brilliant")
+        monkeypatch.setenv("MQTT_PASSWORD", "s3cr3t")
+        monkeypatch.setenv("MOTION_DERIVED_HOLD_S", "0")
+
+        s = Settings.from_env()
+        assert s.motion_derived_hold_s == 0.0
+
+    def test_motion_derived_negative_hold_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("BRILLIANT_PANEL", "office")
+        monkeypatch.setenv("MQTT_HOST", "10.0.0.1")
+        monkeypatch.setenv("MQTT_USERNAME", "brilliant")
+        monkeypatch.setenv("MQTT_PASSWORD", "s3cr3t")
+        monkeypatch.setenv("MOTION_DERIVED_HOLD_S", "-1")
+
+        with pytest.raises(ValueError):
+            Settings.from_env()

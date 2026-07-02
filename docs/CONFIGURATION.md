@@ -58,6 +58,21 @@ last value you commanded for the motion vars and re-asserts any that drift.
 | `MOTION_RECONCILE_MAX_WRITES_PER_TICK` | no | `4` | Cap on reconciler writes in a single poll tick. Only takes effect when the write spacing is `0` (see above). Must be at least `1`. |
 | `MOTION_DESIRED_STATE_DIR` | no | `/var/brilliant-mqtt/state` | Where the per-bridge desired-state JSON files live. Keep it under `/var` so the state survives firmware OTA updates. |
 
+### Score-derived motion
+
+The firmware `movement_detected` latch on mesh loads never fires (verified
+live: scores of 255 with a threshold of 45 never tripped it), so the bridge
+derives the **Motion** sensor from the score stream instead: motion turns on
+when `motion_score` ≥ the device's **Motion High Threshold** and stays on
+until no qualifying spike has been seen for the hold window. Tune per room
+with the Motion High Threshold number entity (persists on the device);
+where **Motion Score Reporting** is off the sensor simply stays `off`.
+
+| Variable | Required | Default | Meaning |
+|---|---|---|---|
+| `MOTION_DERIVED_ENABLED` | no | `1` | `0`/`false`/`off`/`no` restore the raw firmware latch value (not recommended — it never fires); any other unrecognized value fails startup. |
+| `MOTION_DERIVED_HOLD_S` | no | `60` seconds | How long motion stays `on` after the last score spike at or above the threshold. `0` pulses only on the spike itself. Must be ≥ 0. |
+
 ### Wi-Fi watchdog
 
 An optional standalone daemon (`brilliant_wifi_watchdog`) that recovers a
