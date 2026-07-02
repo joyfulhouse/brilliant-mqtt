@@ -49,6 +49,15 @@ class TestKindForPeripheralType:
     def test_wifi(self) -> None:
         assert kind_for_peripheral_type(29) is DeviceKind.WIFI
 
+    def test_motion_detection_configuration_maps_to_motion_config(self) -> None:
+        assert kind_for_peripheral_type(20) is DeviceKind.MOTION_CONFIG
+
+    def test_art_configuration_maps_to_art_config(self) -> None:
+        assert kind_for_peripheral_type(16) is DeviceKind.ART_CONFIG
+
+    def test_device_configuration_maps_to_device_config(self) -> None:
+        assert kind_for_peripheral_type(19) is DeviceKind.DEVICE_CONFIG
+
     def test_large_unknown(self) -> None:
         assert kind_for_peripheral_type(9999) is DeviceKind.UNKNOWN
 
