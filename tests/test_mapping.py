@@ -1446,3 +1446,51 @@ def test_motion_config_payload_renders_all_three() -> None:
 def test_motion_config_absent_vars_mint_nothing() -> None:
     assert entities_for(_motion_config(), "office") == []
     assert payload_fields(_motion_config()) == {}
+
+
+# ===========================================================================
+# ART_CONFIG — screensaver + lock-widget configuration (Task 3)
+# ===========================================================================
+#
+# Screensaver and lock-screen widget configuration peripheral.
+
+
+def _art_config(**vars_: str) -> BrilliantDevice:
+    """ART_CONFIG peripheral with screensaver and widget display settings."""
+    return BrilliantDevice(
+        device_id="device_001",
+        peripheral_id="art_config_peripheral",
+        name="Art Config",
+        kind=DeviceKind.ART_CONFIG,
+        variables={k: Variable(k, v, externally_settable=True) for k, v in vars_.items()},
+    )
+
+
+def test_art_config_mints_screensaver_and_widget_switches() -> None:
+    dev = _art_config(
+        on="1",
+        display_time_date="1",
+        weather_widget_on_lock="0",
+        music_widget_on_lock="0",
+        device_status_on_lock="0",
+        solar_savings_on_lock="0",
+    )
+    ents = {e.name: e for e in entities_for(dev, "office")}
+    assert ents["Screensaver"].component == "switch"
+    assert ents["Show Time & Date"].component == "switch"
+    for name in (
+        "Weather Widget",
+        "Music Widget",
+        "Device Status Widget",
+        "Solar Savings Widget",
+    ):
+        assert ents[name].component == "switch"
+        assert ents[name].enabled_by_default is False
+
+
+def test_art_config_payload_uses_screensaver_on_key_not_bare_on() -> None:
+    dev = _art_config(on="1", display_time_date="0")
+    payload = payload_fields(dev)
+    assert payload["screensaver_on"] is True
+    assert "on" not in payload
+    assert payload["display_time_date"] is False

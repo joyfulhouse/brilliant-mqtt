@@ -454,6 +454,57 @@ AUX_SPECS: dict[DeviceKind, tuple[AuxSpec, ...]] = {
             step=30,
         ),
     ),
+    DeviceKind.ART_CONFIG: (
+        # The bus var is literally "on" — remap the payload key so it can never be
+        # confused with a load's primary state in the shared payload shape.
+        AuxSpec(
+            var="on",
+            component="switch",
+            name="Screensaver",
+            value_kind="bool",
+            payload_key="screensaver_on",
+            entity_category="config",
+        ),
+        AuxSpec(
+            var="display_time_date",
+            component="switch",
+            name="Show Time & Date",
+            value_kind="bool",
+            entity_category="config",
+        ),
+        AuxSpec(
+            var="weather_widget_on_lock",
+            component="switch",
+            name="Weather Widget",
+            value_kind="bool",
+            entity_category="config",
+            enabled_by_default=False,
+        ),
+        AuxSpec(
+            var="music_widget_on_lock",
+            component="switch",
+            name="Music Widget",
+            value_kind="bool",
+            entity_category="config",
+            enabled_by_default=False,
+        ),
+        AuxSpec(
+            var="device_status_on_lock",
+            component="switch",
+            name="Device Status Widget",
+            value_kind="bool",
+            entity_category="config",
+            enabled_by_default=False,
+        ),
+        AuxSpec(
+            var="solar_savings_on_lock",
+            component="switch",
+            name="Solar Savings Widget",
+            value_kind="bool",
+            entity_category="config",
+            enabled_by_default=False,
+        ),
+    ),
 }
 
 # Aux components that accept inbound commands (carry a command_var).
