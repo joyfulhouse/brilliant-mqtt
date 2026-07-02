@@ -324,6 +324,42 @@ AUX_SPECS: dict[DeviceKind, tuple[AuxSpec, ...]] = {
             enabled_by_default=False,
         ),
         AuxSpec(
+            var="duck_speaker",
+            component="switch",
+            name="Speaker Ducking",
+            value_kind="bool",
+            entity_category="config",
+            enabled_by_default=False,
+        ),
+        AuxSpec(
+            var="low_temp_mode",
+            component="switch",
+            name="Low Temperature Mode",
+            value_kind="bool",
+            entity_category="config",
+            enabled_by_default=False,
+        ),
+        # Governance switches — deliberately opt-in (disabled by default):
+        # auto-update OFF means no security patches; remote assistance opens the
+        # vendor's reverse-ssh tunnel. Exposing them lets HA pin firmware around
+        # known-good releases (the 2026-06-26 silent OTA is the motivating case).
+        AuxSpec(
+            var="software_update_enabled",
+            component="switch",
+            name="Firmware Auto-Update",
+            value_kind="bool",
+            entity_category="config",
+            enabled_by_default=False,
+        ),
+        AuxSpec(
+            var="remote_assistance_enabled",
+            component="switch",
+            name="Remote Assistance",
+            value_kind="bool",
+            entity_category="config",
+            enabled_by_default=False,
+        ),
+        AuxSpec(
             var="cpu_temperature",
             component="sensor",
             name="CPU Temperature",
@@ -333,8 +369,10 @@ AUX_SPECS: dict[DeviceKind, tuple[AuxSpec, ...]] = {
             state_class="measurement",
             entity_category="diagnostic",
         ),
-        # Deliberately read-only binary_sensor — bus marks it settable, but write
-        # semantics were never verified; revisit if needed.
+        # Read-only by verification (2026-07-01, probe-pack): the bus ENFORCES
+        # externally_settable (writes to set=False vars raise PermissionError —
+        # empirically proven on privacy_toggle) and this var reports set=False,
+        # so it can never be promoted to a switch.
         AuxSpec(
             var="camera_on",
             component="binary_sensor",
@@ -343,8 +381,10 @@ AUX_SPECS: dict[DeviceKind, tuple[AuxSpec, ...]] = {
             device_class="running",
             entity_category="diagnostic",
         ),
-        # Deliberately read-only binary_sensor — bus marks it settable, but write
-        # semantics were never verified; revisit if needed.
+        # Read-only by verification (2026-07-01, probe-pack): the bus ENFORCES
+        # externally_settable (writes to set=False vars raise PermissionError —
+        # empirically proven on privacy_toggle) and this var reports set=False,
+        # so it can never be promoted to a switch.
         AuxSpec(
             var="privacy_toggle",
             component="binary_sensor",
@@ -368,8 +408,10 @@ AUX_SPECS: dict[DeviceKind, tuple[AuxSpec, ...]] = {
         ),
     ),
     DeviceKind.UI: (
-        # Deliberately read-only binary_sensor — bus marks it settable, but write
-        # semantics were never verified; revisit if needed.
+        # Read-only by verification (2026-07-01, probe-pack): the bus ENFORCES
+        # externally_settable (writes to set=False vars raise PermissionError —
+        # empirically proven on privacy_toggle) and this var reports set=False,
+        # so it can never be promoted to a switch.
         AuxSpec(
             var="active",
             component="binary_sensor",
@@ -423,6 +465,119 @@ AUX_SPECS: dict[DeviceKind, tuple[AuxSpec, ...]] = {
             value_kind="bool",
             entity_category="diagnostic",
             enabled_by_default=False,
+        ),
+    ),
+    DeviceKind.MOTION_CONFIG: (
+        AuxSpec(
+            var="trigger_screen",
+            component="switch",
+            name="Wake Screen on Motion",
+            value_kind="bool",
+            entity_category="config",
+        ),
+        AuxSpec(
+            var="trigger_screen_off",
+            component="switch",
+            name="Sleep Screen After Motion Stops",
+            value_kind="bool",
+            entity_category="config",
+        ),
+        # 30–3600 s range is ASSUMED (bus documents no bounds; observed 600 on the
+        # pilot 2026-07-01). Same precedent as the motion thresholds' 0–100.
+        AuxSpec(
+            var="trigger_screen_off_timeout_sec",
+            component="number",
+            name="Screen Off Timeout",
+            value_kind="int",
+            unit="s",
+            entity_category="config",
+            min_value=30,
+            max_value=3600,
+            step=30,
+        ),
+    ),
+    DeviceKind.ART_CONFIG: (
+        # The bus var is literally "on" — remap the payload key so it can never be
+        # confused with a load's primary state in the shared payload shape.
+        AuxSpec(
+            var="on",
+            component="switch",
+            name="Screensaver",
+            value_kind="bool",
+            payload_key="screensaver_on",
+            entity_category="config",
+        ),
+        AuxSpec(
+            var="display_time_date",
+            component="switch",
+            name="Show Time & Date",
+            value_kind="bool",
+            entity_category="config",
+        ),
+        AuxSpec(
+            var="weather_widget_on_lock",
+            component="switch",
+            name="Weather Widget",
+            value_kind="bool",
+            entity_category="config",
+            enabled_by_default=False,
+        ),
+        AuxSpec(
+            var="music_widget_on_lock",
+            component="switch",
+            name="Music Widget",
+            value_kind="bool",
+            entity_category="config",
+            enabled_by_default=False,
+        ),
+        AuxSpec(
+            var="device_status_on_lock",
+            component="switch",
+            name="Device Status Widget",
+            value_kind="bool",
+            entity_category="config",
+            enabled_by_default=False,
+        ),
+        AuxSpec(
+            var="solar_savings_on_lock",
+            component="switch",
+            name="Solar Savings Widget",
+            value_kind="bool",
+            entity_category="config",
+            enabled_by_default=False,
+        ),
+    ),
+    DeviceKind.DEVICE_CONFIG: (
+        # Inverted like is_safe→Fault: the bus var is a DISABLE flag; the switch
+        # reads/writes "sliders usable", which is the state a human reasons about.
+        AuxSpec(
+            var="disable_cap_touch_sliders",
+            component="switch",
+            name="Touch Sliders",
+            value_kind="bool",
+            payload_key="touch_sliders_enabled",
+            entity_category="config",
+            invert=True,
+        ),
+        AuxSpec(
+            var="receive_intercom_broadcasts",
+            component="switch",
+            name="Intercom Broadcasts",
+            value_kind="bool",
+            entity_category="config",
+        ),
+        # 100–1000 ms range is ASSUMED (observed 400 on the pilot 2026-07-01).
+        AuxSpec(
+            var="slider_double_tap_timeout_ms",
+            component="number",
+            name="Slider Double-Tap Timeout",
+            value_kind="int",
+            unit="ms",
+            entity_category="config",
+            enabled_by_default=False,
+            min_value=100,
+            max_value=1000,
+            step=50,
         ),
     ),
 }
@@ -513,8 +668,9 @@ def entities_for(device: BrilliantDevice, panel: str) -> list[EntityDescriptor]:
 
     LIGHT / SWITCH yield their primary entity plus any present aux entities.
     BINARY_SENSOR yields the motion binary_sensor + the lux sensor (when present)
-    plus any present aux entities. ALWAYS_ON / HARDWARE / UI / WIFI yield ONLY
-    their aux entities. UNKNOWN and SENSOR yield [].
+    plus any present aux entities. Every other kind with an AUX_SPECS table
+    (ALWAYS_ON / HARDWARE / UI / WIFI / MOTION_CONFIG / ART_CONFIG /
+    DEVICE_CONFIG) yields ONLY its aux entities. UNKNOWN and SENSOR yield [].
     """
     base_uid = f"brilliant_{panel}_{device.peripheral_id}"
 
@@ -573,7 +729,8 @@ def entities_for(device: BrilliantDevice, panel: str) -> list[EntityDescriptor]:
         return descriptors
 
     if device.kind in AUX_SPECS:
-        # ALWAYS_ON / HARDWARE / UI / WIFI — aux entities only, no primary.
+        # Aux-only kinds (ALWAYS_ON / HARDWARE / UI / WIFI / the config
+        # peripherals) — aux entities only, no primary.
         return _aux_descriptors(device, panel)
 
     # UNKNOWN or SENSOR — deliberately not mapped to any HA entity.
@@ -600,7 +757,8 @@ def payload_fields(device: BrilliantDevice) -> dict[str, object]:
 
     - LIGHT / SWITCH: {"state": ...} (+ "brightness" when dimmable) + present aux.
     - BINARY_SENSOR: {"motion": bool} (+ "lux" when present) + present aux.
-    - ALWAYS_ON / HARDWARE / UI / WIFI: present aux only.
+    - Every other kind with an AUX_SPECS table (ALWAYS_ON / HARDWARE / UI /
+      WIFI / MOTION_CONFIG / ART_CONFIG / DEVICE_CONFIG): present aux only.
     - UNKNOWN / SENSOR: {}.
     """
     data: dict[str, object] = {}

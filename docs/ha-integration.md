@@ -84,7 +84,7 @@ Behavior knobs are under **Configure** (Options).
 
 ## Entities
 
-Each panel's device gains five management entities (three diagnostic, two control):
+Each panel's device gains six management entities (three diagnostic, three control):
 
 | Entity | What it is |
 |---|---|
@@ -93,6 +93,7 @@ Each panel's device gains five management entities (three diagnostic, two contro
 | `button.brilliant_<panel>_repair_bridge` | **Manual repair** — restores the unit/env and starts the agent (installs agent code first if missing), bypassing the auto-repair cooldown. |
 | `switch.brilliant_<panel>_voice_satellite` | **Voice satellite** — enable installs and starts the satellite; disable uninstalls it. |
 | `select.brilliant_<panel>_wake_word` | **Wake word** — choose `okay_nabu` (default), `hey_jarvis`, or `hey_mycroft`; changing it restarts the satellite. |
+| `switch.brilliant_<panel>_wi_fi_watchdog` | **Wi-Fi watchdog** — enable installs and starts the on-panel Wi-Fi watchdog daemon (auto-recovers lost Wi-Fi: reconnect → restart networking → reboot as a last resort, see [CONFIGURATION.md → Wi-Fi watchdog](CONFIGURATION.md#wi-fi-watchdog)); disable uninstalls it. |
 
 Entity ids follow the panel's HA device name (`Brilliant <panel>`).
 

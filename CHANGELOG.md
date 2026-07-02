@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-02
+
+### Added
+
+- **Screen wake-on-motion**: **Wake Screen on Motion** and **Sleep Screen
+  After Motion Stops** switches, plus a **Screen Off Timeout** number.
+- **Screensaver & lock-screen widgets**: **Screensaver** and **Show Time &
+  Date** switches, plus four widget toggles — **Weather Widget**, **Music
+  Widget**, **Device Status Widget**, **Solar Savings Widget** (disabled by
+  default).
+- **Touch-slider & intercom controls**: **Touch Sliders** and **Intercom
+  Broadcasts** switches, plus a **Slider Double-Tap Timeout** number (disabled
+  by default).
+- **Audio & governance switches** (all disabled by default — opt in per
+  panel): **Speaker Ducking**, **Low Temperature Mode**, **Firmware
+  Auto-Update**, and **Remote Assistance**.
+- **Wi-Fi watchdog install switch**: a new **Wi-Fi watchdog** switch on each
+  panel's device (parity with the voice satellite switch) installs and
+  removes the on-panel Wi-Fi watchdog daemon over SSH.
+
 ## [0.3.1] - 2026-07-01
 
 ### Added
@@ -176,7 +196,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - JoyfulHouse OSS docs standard: LICENSE (MIT), INSTALL.md, CHANGELOG.md,
   FUNDING.yml, CODEOWNERS, and the canonical `docs/` set.
 
-[Unreleased]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.2.4...HEAD
+[Unreleased]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.3.1...v0.4.0
+[0.3.1]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.2.4...v0.3.0
 [0.2.4]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.2.1...v0.2.2

@@ -137,6 +137,9 @@
     "switch": {
       "voice_enabled": {
         "name": "Voice satellite"
+      },
+      "wifi_watchdog_enabled": {
+        "name": "Wi-Fi watchdog"
       }
     },
     "update": {
@@ -160,6 +163,9 @@
     },
     "voice_failed": {
       "message": "Voice satellite operation failed: {error}"
+    },
+    "wifi_watchdog_failed": {
+      "message": "Wi-Fi watchdog operation failed: {error}"
     }
   },
   "issues": {

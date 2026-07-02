@@ -355,25 +355,30 @@ def _always_on() -> BrilliantDevice:
     )
 
 
-def _hardware() -> BrilliantDevice:
-    """HARDWARE peripheral — full diagnostics + controls."""
+def _hardware(**kwargs: str) -> BrilliantDevice:
+    """HARDWARE peripheral — full diagnostics + controls.
+
+    Accepts keyword arguments to override variable values.
+    """
+    defaults = {
+        "muted": "0",
+        "screen_on": "1",
+        "screen_brightness": "7",
+        "output_volume": "100",
+        "alert_volume": "100",
+        "cpu_temperature": "61",
+        "camera_on": "0",
+        "privacy_toggle": "0",
+        "current_release_tag": "v26.05.20.2",
+    }
+    defaults.update(kwargs)
     return BrilliantDevice(
         device_id="dev-hw",
         peripheral_id="hardware_peripheral",
         name="Hardware",
         kind=DeviceKind.HARDWARE,
         peripheral_type=22,
-        variables={
-            "muted": Variable("muted", "0"),
-            "screen_on": Variable("screen_on", "1"),
-            "screen_brightness": Variable("screen_brightness", "7"),
-            "output_volume": Variable("output_volume", "100"),
-            "alert_volume": Variable("alert_volume", "100"),
-            "cpu_temperature": Variable("cpu_temperature", "61"),
-            "camera_on": Variable("camera_on", "0"),
-            "privacy_toggle": Variable("privacy_toggle", "0"),
-            "current_release_tag": Variable("current_release_tag", "v26.05.20.2"),
-        },
+        variables={var_name: Variable(var_name, value) for var_name, value in defaults.items()},
     )
 
 
@@ -574,6 +579,32 @@ def test_hardware_without_camera_yields_no_camera_descriptor() -> None:
     by_uid = _by_uid(entities_for(device, "office"))
     assert "brilliant_office_hardware_peripheral_camera_on" not in by_uid
     assert len(by_uid) == 8
+
+
+def test_hardware_extra_switches_minted_disabled_by_default() -> None:
+    dev = _hardware(
+        duck_speaker="0",
+        low_temp_mode="0",
+        software_update_enabled="1",
+        remote_assistance_enabled="0",
+    )
+    ents = {e.name: e for e in entities_for(dev, "office")}
+    for name in (
+        "Speaker Ducking",
+        "Low Temperature Mode",
+        "Firmware Auto-Update",
+        "Remote Assistance",
+    ):
+        assert ents[name].component == "switch"
+        assert ents[name].entity_category == "config"
+        assert ents[name].enabled_by_default is False
+
+
+def test_hardware_extra_payload_keys() -> None:
+    dev = _hardware(software_update_enabled="1", duck_speaker="0")
+    payload = payload_fields(dev)
+    assert payload["software_update_enabled"] is True
+    assert payload["duck_speaker"] is False
 
 
 # --- UI ---------------------------------------------------------------------
@@ -1399,3 +1430,136 @@ def test_mesh_dimmer_sentinel_no_motion_vars_still_one_entity() -> None:
     assert [d.component for d in result] == ["light"]
     uids = {d.unique_id for d in result}
     assert f"brilliant_mesh_{MESH_PID}_movement_detected" not in uids
+
+
+# ===========================================================================
+# MOTION_CONFIG — screen wake-on-motion controls (Task 2)
+# ===========================================================================
+#
+# Screen wake-on-motion configuration peripheral with three settable controls.
+
+
+def _motion_config(**vars_: str) -> BrilliantDevice:
+    """MOTION_CONFIG peripheral with trigger_screen, trigger_screen_off, and timeout settings."""
+    return BrilliantDevice(
+        device_id="device_001",
+        peripheral_id="motion_detection_config_peripheral",
+        name="Motion Detection Config",
+        kind=DeviceKind.MOTION_CONFIG,
+        variables={k: Variable(k, v, externally_settable=True) for k, v in vars_.items()},
+    )
+
+
+def test_motion_config_mints_wake_sleep_switches_and_timeout_number() -> None:
+    dev = _motion_config(
+        trigger_screen="1", trigger_screen_off="1", trigger_screen_off_timeout_sec="600"
+    )
+    ents = {e.name: e for e in entities_for(dev, "office")}
+    assert ents["Wake Screen on Motion"].component == "switch"
+    assert ents["Sleep Screen After Motion Stops"].component == "switch"
+    timeout = ents["Screen Off Timeout"]
+    assert timeout.component == "number"
+    assert (timeout.min_value, timeout.max_value) == (30, 3600)
+    assert timeout.step == 30
+
+
+def test_motion_config_payload_renders_all_three() -> None:
+    dev = _motion_config(
+        trigger_screen="1", trigger_screen_off="0", trigger_screen_off_timeout_sec="600"
+    )
+    assert payload_fields(dev) == {
+        "trigger_screen": True,
+        "trigger_screen_off": False,
+        "trigger_screen_off_timeout_sec": 600,
+    }
+
+
+def test_motion_config_absent_vars_mint_nothing() -> None:
+    assert entities_for(_motion_config(), "office") == []
+    assert payload_fields(_motion_config()) == {}
+
+
+# ===========================================================================
+# ART_CONFIG — screensaver + lock-widget configuration (Task 3)
+# ===========================================================================
+#
+# Screensaver and lock-screen widget configuration peripheral.
+
+
+def _art_config(**vars_: str) -> BrilliantDevice:
+    """ART_CONFIG peripheral with screensaver and widget display settings."""
+    return BrilliantDevice(
+        device_id="device_001",
+        peripheral_id="art_config_peripheral",
+        name="Art Config",
+        kind=DeviceKind.ART_CONFIG,
+        variables={k: Variable(k, v, externally_settable=True) for k, v in vars_.items()},
+    )
+
+
+def test_art_config_mints_screensaver_and_widget_switches() -> None:
+    dev = _art_config(
+        on="1",
+        display_time_date="1",
+        weather_widget_on_lock="0",
+        music_widget_on_lock="0",
+        device_status_on_lock="0",
+        solar_savings_on_lock="0",
+    )
+    ents = {e.name: e for e in entities_for(dev, "office")}
+    assert ents["Screensaver"].component == "switch"
+    assert ents["Show Time & Date"].component == "switch"
+    for name in (
+        "Weather Widget",
+        "Music Widget",
+        "Device Status Widget",
+        "Solar Savings Widget",
+    ):
+        assert ents[name].component == "switch"
+        assert ents[name].enabled_by_default is False
+
+
+def test_art_config_payload_uses_screensaver_on_key_not_bare_on() -> None:
+    dev = _art_config(on="1", display_time_date="0")
+    payload = payload_fields(dev)
+    assert payload["screensaver_on"] is True
+    assert "on" not in payload
+    assert payload["display_time_date"] is False
+
+
+# ===========================================================================
+# DEVICE_CONFIG — touch-slider + intercom-broadcast controls (Task 4)
+# ===========================================================================
+#
+# Touch-slider and intercom-broadcast configuration peripheral.
+
+
+def _device_config(**vars_: str) -> BrilliantDevice:
+    """DEVICE_CONFIG peripheral with touch-slider and intercom-broadcast settings."""
+    return BrilliantDevice(
+        device_id="device_001",
+        peripheral_id="device_config_peripheral",
+        name="Device Config",
+        kind=DeviceKind.DEVICE_CONFIG,
+        variables={k: Variable(k, v, externally_settable=True) for k, v in vars_.items()},
+    )
+
+
+def test_device_config_touch_sliders_switch_is_inverted() -> None:
+    dev = _device_config(disable_cap_touch_sliders="0")
+    ents = {e.name: e for e in entities_for(dev, "office")}
+    sliders = ents["Touch Sliders"]
+    assert sliders.component == "switch"
+    assert sliders.invert is True
+    # disable=0 renders as ON (sliders usable) in the payload
+    assert payload_fields(dev)["touch_sliders_enabled"] is True
+
+
+def test_device_config_intercom_broadcasts_and_double_tap_timeout() -> None:
+    dev = _device_config(receive_intercom_broadcasts="1", slider_double_tap_timeout_ms="400")
+    ents = {e.name: e for e in entities_for(dev, "office")}
+    assert ents["Intercom Broadcasts"].component == "switch"
+    tt = ents["Slider Double-Tap Timeout"]
+    assert tt.component == "number"
+    assert tt.enabled_by_default is False
+    assert payload_fields(dev)["slider_double_tap_timeout_ms"] == 400
