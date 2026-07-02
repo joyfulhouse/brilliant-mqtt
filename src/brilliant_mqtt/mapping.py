@@ -243,8 +243,8 @@ AUX_SPECS: dict[DeviceKind, tuple[AuxSpec, ...]] = {
             entity_category="config",
             enabled_by_default=False,
         ),
-        # 0–100 range ASSUMED (same as the mesh thresholds — no firmware bound
-        # documented; live-observed 25 high / 14 low on the faceplate).
+        # 0–100 range ASSUMED (no firmware bound documented for the PIR path;
+        # live-observed 25 high / 14 low on the faceplate).
         AuxSpec(
             var="pir_motion_detection_high_threshold",
             component="number",
