@@ -190,7 +190,7 @@ HA device — elected by `MESH_PRIORITY`.
   motion, enabled by default). Additional disabled-by-default entities:
   `Motion Score` (diagnostic sensor), `Motion Score Reporting` (config
   switch), and `Motion High Threshold` / `Motion Low Threshold` (config
-  numbers, 0–100 assumed range). Panel loads are unaffected — these entities
+  numbers, 0–255 — the score is 8-bit). Panel loads are unaffected — these entities
   only appear when the backing bus variables are present.
 
 > For mesh motion to reflect real presence you must enable the device's
