@@ -370,8 +370,9 @@ AUX_SPECS: dict[DeviceKind, tuple[AuxSpec, ...]] = {
             entity_category="diagnostic",
         ),
         # Read-only by verification (2026-07-01, probe-pack): the bus ENFORCES
-        # externally_settable and rejects writes to this var with PermissionError —
-        # it can never be promoted to a switch.
+        # externally_settable (writes to set=False vars raise PermissionError —
+        # empirically proven on privacy_toggle) and this var reports set=False,
+        # so it can never be promoted to a switch.
         AuxSpec(
             var="camera_on",
             component="binary_sensor",
@@ -381,8 +382,9 @@ AUX_SPECS: dict[DeviceKind, tuple[AuxSpec, ...]] = {
             entity_category="diagnostic",
         ),
         # Read-only by verification (2026-07-01, probe-pack): the bus ENFORCES
-        # externally_settable and rejects writes to this var with PermissionError —
-        # it can never be promoted to a switch.
+        # externally_settable (writes to set=False vars raise PermissionError —
+        # empirically proven on privacy_toggle) and this var reports set=False,
+        # so it can never be promoted to a switch.
         AuxSpec(
             var="privacy_toggle",
             component="binary_sensor",
@@ -407,8 +409,9 @@ AUX_SPECS: dict[DeviceKind, tuple[AuxSpec, ...]] = {
     ),
     DeviceKind.UI: (
         # Read-only by verification (2026-07-01, probe-pack): the bus ENFORCES
-        # externally_settable and rejects writes to this var with PermissionError —
-        # it can never be promoted to a switch.
+        # externally_settable (writes to set=False vars raise PermissionError —
+        # empirically proven on privacy_toggle) and this var reports set=False,
+        # so it can never be promoted to a switch.
         AuxSpec(
             var="active",
             component="binary_sensor",
@@ -665,8 +668,9 @@ def entities_for(device: BrilliantDevice, panel: str) -> list[EntityDescriptor]:
 
     LIGHT / SWITCH yield their primary entity plus any present aux entities.
     BINARY_SENSOR yields the motion binary_sensor + the lux sensor (when present)
-    plus any present aux entities. ALWAYS_ON / HARDWARE / UI / WIFI yield ONLY
-    their aux entities. UNKNOWN and SENSOR yield [].
+    plus any present aux entities. Every other kind with an AUX_SPECS table
+    (ALWAYS_ON / HARDWARE / UI / WIFI / MOTION_CONFIG / ART_CONFIG /
+    DEVICE_CONFIG) yields ONLY its aux entities. UNKNOWN and SENSOR yield [].
     """
     base_uid = f"brilliant_{panel}_{device.peripheral_id}"
 
@@ -725,7 +729,8 @@ def entities_for(device: BrilliantDevice, panel: str) -> list[EntityDescriptor]:
         return descriptors
 
     if device.kind in AUX_SPECS:
-        # ALWAYS_ON / HARDWARE / UI / WIFI — aux entities only, no primary.
+        # Aux-only kinds (ALWAYS_ON / HARDWARE / UI / WIFI / the config
+        # peripherals) — aux entities only, no primary.
         return _aux_descriptors(device, panel)
 
     # UNKNOWN or SENSOR — deliberately not mapped to any HA entity.
@@ -752,7 +757,8 @@ def payload_fields(device: BrilliantDevice) -> dict[str, object]:
 
     - LIGHT / SWITCH: {"state": ...} (+ "brightness" when dimmable) + present aux.
     - BINARY_SENSOR: {"motion": bool} (+ "lux" when present) + present aux.
-    - ALWAYS_ON / HARDWARE / UI / WIFI: present aux only.
+    - Every other kind with an AUX_SPECS table (ALWAYS_ON / HARDWARE / UI /
+      WIFI / MOTION_CONFIG / ART_CONFIG / DEVICE_CONFIG): present aux only.
     - UNKNOWN / SENSOR: {}.
     """
     data: dict[str, object] = {}
