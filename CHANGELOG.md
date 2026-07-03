@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-02
+
+### Changed
+
+- **Mesh-load motion now actually works.** The firmware's motion latch on
+  BLE-mesh loads never fires (verified live: scores of 255 with a threshold
+  of 45 never tripped it), so the bridge now derives the **Motion** sensor
+  from the score stream: motion turns **on** when `motion_score` reaches the
+  device's **Motion High Threshold** and turns **off** after a configurable
+  hold window (`MOTION_DERIVED_HOLD_S`, default 60 s) with no new spikes.
+  Validated against mmwave ground truth (~85% episode recall with ~zero
+  false triggers in an 11 h pilot). Enabled by default and inert wherever
+  **Motion Score Reporting** is off; set `MOTION_DERIVED_ENABLED=0` to
+  restore the raw firmware value. **Motion Low Threshold** no longer affects
+  the published sensor (it still writes to the device).
+
+### Fixed
+
+- **Motion threshold range**: the **Motion High/Low Threshold** number
+  entities were capped at an assumed 0–100; the real scale is 8-bit
+  **0–255** (observed live during calibration).
+
 ## [0.4.0] - 2026-07-02
 
 ### Added
