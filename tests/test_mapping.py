@@ -1009,7 +1009,7 @@ def test_hardware_blank_release_tag_has_no_firmware_entries() -> None:
 
 
 # ===========================================================================
-# Mesh-load motion subsystem (live-verified panel-1.local, 2026-06-13)
+# Mesh-load motion subsystem (live-verified the pilot panel, 2026-06-13)
 # ===========================================================================
 #
 # Every mesh load peripheral (LIGHT/SWITCH/ALWAYS_ON on the virtual ble_mesh
@@ -1271,7 +1271,7 @@ def test_mesh_motion_low_threshold_disabled_by_default() -> None:
 def test_mesh_dimmer_with_motion_payload_fields() -> None:
     """Exact payload: motion is gated to False because enable_motion_score is "0".
 
-    Live-verified (panel-1.local, 2026-06-14): with motion-scoring disabled the
+    Live-verified (the pilot panel, 2026-06-14): with motion-scoring disabled the
     bus reports a *frozen* ``movement_detected`` latch (here "1") that never
     tracks real presence — so the published ``motion`` must read False, not the
     stale latch.

@@ -72,7 +72,7 @@ The unit caps memory/CPU (`Nice=5`, `MemoryMax=300M`, `CPUQuota=100%`,
 `OOMScoreAdjust=500`) so wake inference can never starve the touchscreen UI. The
 mic is shared via ALSA dsnoop, so LVA coexists with the panel's built-in Alexa.
 
-## Validated (pilot, panel-1.local 2026-06-23)
+## Validated (pilot, the pilot panel 2026-06-23)
 
 systemd `brilliant-voice` active → supervisor → LVA on :6053; nft accept + hosts
 mapping re-applied at startup; LVA connected to HA (`assist_satellite … = idle`).

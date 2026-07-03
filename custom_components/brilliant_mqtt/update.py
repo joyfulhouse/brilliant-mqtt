@@ -24,9 +24,18 @@ async def async_setup_entry(
     # Late binding: resolve manager._payload_dir at call time so a test (or a future
     # caller) that patches it on the manager module is honored — a module-level
     # `from .manager import _payload_dir` would freeze the original in this namespace.
-    latest = await hass.async_add_executor_job(
-        lambda: (manager._payload_dir() / "VERSION").read_text().strip()
-    )
+    def _read_latest() -> str | None:
+        # agent_payload/ is built into release zips only (see release.yml) — a raw
+        # git-clone install has no payload. Skip the update entity rather than crash
+        # platform setup; every other platform still loads.
+        try:
+            return (manager._payload_dir() / "VERSION").read_text().strip()
+        except OSError:
+            return None
+
+    latest = await hass.async_add_executor_job(_read_latest)
+    if latest is None:
+        return
     async_add_entities([AgentUpdate(entry, latest)])
 
 

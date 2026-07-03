@@ -1361,7 +1361,7 @@ async def test_reconcile_meta_published_with_zero_devices() -> None:
 def mesh_load_with_motion() -> BrilliantDevice:
     """Mesh LIGHT on the virtual ble_mesh bus device with all five motion vars.
 
-    Variables mirror the live-verified shape from panel-1.local (2026-06-13):
+    Variables mirror the live-verified shape from the pilot panel (2026-06-13):
     on/intensity/display_name are the primary load vars; the five motion vars
     are the new BLE-mesh motion subsystem.  No power var (sentinel gate not
     relevant here; omitting keeps the fixture minimal).

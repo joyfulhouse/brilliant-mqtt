@@ -47,6 +47,13 @@ then add one config entry per panel (root password, mesh priority, broker
 credentials). The integration deploys the agent over SSH, keeps it updated,
 and repairs it automatically after panel firmware OTAs.
 
+> **Install from HACS or a release zip — not a raw `git clone`.** The bundled
+> on-panel agent payload (`agent_payload/`) is built into release artifacts by
+> CI and does not exist in the git tree; a cloned copy cannot install the
+> agent. The broker connection also requires a **username and password** —
+> anonymous brokers are not supported (see
+> [broker setup](docs/CONFIGURATION.md#broker-user-and-acl)).
+
 [![Add via HACS](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=joyfulhouse&repository=brilliant-mqtt&category=integration)
 
 ### Manual deploy

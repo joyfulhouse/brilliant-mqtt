@@ -108,7 +108,7 @@ class TestReconnectRate:
     """The adapter counts processor reconnects in a sliding window so the run
     loop can trip a circuit breaker on a reconnect STORM — a failure mode the
     stale watchdog misses because every reconnect also resets the push clock
-    (incident 2026-06-13, panel-2: ~5 reconnects/sec masked staleness)."""
+    (live incident, 2026-06-13: ~5 reconnects/sec masked staleness)."""
 
     def test_no_reconnects_yet_is_zero(self) -> None:
         adapter = RpcBusAdapter()

@@ -57,7 +57,7 @@ class Settings:
     # times within the window, the session is torn down and rebuilt (after the
     # supervisor backoff) instead of churning. This catches a failure mode the
     # stale watchdog cannot — a reconnect storm keeps resetting the push clock,
-    # so the session never looks "stale" (incident 2026-06-13, panel-2). 0
+    # so the session never looks "stale" (live incident, 2026-06-13). 0
     # disables the breaker.
     reconnect_storm_threshold: int = 20
     reconnect_storm_window_seconds: float = 60.0

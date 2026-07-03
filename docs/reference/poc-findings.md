@@ -265,7 +265,7 @@ the whole session when no push arrives at all.
 ### 8c. Mesh-load motion subsystem (live-verified 2026-06-13)
 
 **Method:** read-only `get_device("ble_mesh")` via a second bus client (no
-writes, no commands). Probe panel: panel-1.local.
+writes, no commands). Probe panel: the pilot panel.
 
 **Peripheral breakdown** — the `ble_mesh` virtual device carries 40
 peripherals total:

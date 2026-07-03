@@ -153,7 +153,7 @@
       "message": "A repair or update is already in progress for this panel."
     },
     "host_key_changed": {
-      "message": "The panel SSH host key changed. Open Reconfigure to re-pin it, or enable \"Trust host-key changes\" in options for hands-off repair."
+      "message": "The panel SSH host key changed. If this is expected (e.g. a reflash), remove and re-add the panel to re-pin it, or enable \"Trust host-key changes\" in options for hands-off repair. If unexpected, investigate before proceeding."
     },
     "update_failed": {
       "message": "Agent update failed: {error}"

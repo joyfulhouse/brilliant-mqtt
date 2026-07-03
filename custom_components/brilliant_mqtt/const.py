@@ -30,7 +30,7 @@ CONF_VOICE_ENABLED = "voice_enabled"
 CONF_VOICE_WAKE_WORD = "voice_wake_word"
 CONF_VOICE_HA_HOST = "voice_ha_host"
 
-# Per-panel component selection (see docs/claude/specs/2026-06-29-component-selection-design.md).
+# Per-panel component selection (see docs/ha-integration.md — components/switches).
 CONF_COMPONENTS = "components"  # entry data: {component_id: bool}
 COMPONENT_BRIDGE = "bridge"
 COMPONENT_VOICE = "voice"

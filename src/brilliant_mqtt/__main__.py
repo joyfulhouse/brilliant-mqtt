@@ -40,7 +40,7 @@ class BusStaleError(RuntimeError):
 
 class BusReconnectStormError(RuntimeError):
     """Bus reconnected past the rate threshold — session torn down to break the
-    self-reinforcing storm (incident 2026-06-13, panel-2)."""
+    self-reinforcing storm (live incident, 2026-06-13)."""
 
 
 def _is_reconnect_storm(bus: BusClient, settings: Settings) -> bool:
@@ -50,7 +50,7 @@ def _is_reconnect_storm(bus: BusClient, settings: Settings) -> bool:
     bus server drops the peer under load — is invisible to the stale watchdog
     because every reconnect also resets the push clock. It is detected by RATE
     instead, and the proven recovery is a full session rebuild after backoff
-    (what a manual ``systemctl restart`` did on panel-2). Threshold <= 0
+    (what a manual ``systemctl restart`` did in that incident). Threshold <= 0
     disables the breaker.
     """
     if settings.reconnect_storm_threshold <= 0:

@@ -117,7 +117,7 @@ _LOAD_AUX: tuple[AuxSpec, ...] = (
 
 # Integrated motion-sensing subsystem present on every mesh load peripheral
 # (LIGHT/SWITCH/ALWAYS_ON on the virtual ble_mesh device).
-# Live-verified on panel-1.local, 2026-06-13 via get_device("ble_mesh") — all 20
+# Live-verified on the pilot panel, 2026-06-13 via get_device("ble_mesh") — all 20
 # load peripherals (11 LIGHT, 1 GENERIC_ON_OFF→SWITCH, 8 ALWAYS_ON) carry
 # these five variables. Panel loads lack them, so these specs auto-no-op there.
 # Note: variable names differ from the faceplate's PIR variables
@@ -132,7 +132,7 @@ _MOTION_AUX: tuple[AuxSpec, ...] = (
         payload_key="motion",
         device_class="motion",
         # movement_detected only tracks live presence while motion-scoring is on;
-        # with it off the bus reports a frozen latch (live-verified panel-1.local
+        # with it off the bus reports a frozen latch (live-verified the pilot panel
         # 2026-06-14), so gate the published value on enable_motion_score.
         # NOTE: when the bridge's MotionDeriver is active (default), the
         # published value is DERIVED from motion_score — the firmware latch

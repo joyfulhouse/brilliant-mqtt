@@ -244,22 +244,26 @@ release via the update entity or `redeploy`.
 - Root password is stored in the HA config-entry store (same exposure class as
   `secrets.yaml`). Protect the HA host accordingly. It is per-panel, never
   shared, and redacted from diagnostics.
-- TOFU host-key pinning: first connect captures the host key; every later
-  connect verifies it **before** authenticating, so the root password is never
-  offered to an impostor.
+- TOFU host-key pinning: the **first** connect trusts whatever host answers
+  and pins its key (trust-on-first-use — like the first `ssh` to a new
+  machine, the password is sent to an unverified host that one time; add
+  panels from a trusted network). Every **later** connect verifies the pinned
+  key **before** authenticating, so the root password is never offered to a
+  changed or impostor host afterwards.
 - Single auth attempt per connect (`client_keys=None`,
   `preferred_auth=("password",)`, keyboard-interactive disabled) so a wrong
   password can't burn through a lockout threshold.
-- The integration only writes paths it owns: `/var/brilliant-mqtt/**`,
-  `/var/brilliant-voice/**` (when voice is enabled), `/etc/brilliant-mqtt.env`
-  (mode `0600`), `/etc/brilliant-voice.env` (mode `0600`), and
+- The integration only writes paths it owns: `/var/brilliant-mqtt/**`
+  (including the Wi-Fi watchdog code, when enabled), `/var/brilliant-voice/**`
+  (when voice is enabled), `/etc/brilliant-mqtt.env` (mode `0600`),
+  `/etc/brilliant-voice.env` (mode `0600`), and the systemd units
   `/etc/systemd/system/brilliant-mqtt.service` /
-  `/etc/systemd/system/brilliant-voice.service`.
+  `brilliant-voice.service` / `brilliant-wifi-watchdog.service`.
 
 **OTA host-key rotation** is handled in two modes (see the **Trust host-key
 changes** option above): the default surfaces a changed key as a detectable
-failure and guides you to Reconfigure; the opt-in mode auto-re-pins on the
-same-host panel and fires an auditable event.
+failure (re-pin by removing and re-adding the panel); the opt-in mode
+auto-re-pins on the same-host panel and fires an auditable event.
 
 See also [ARCHITECTURE.md](ARCHITECTURE.md) and
 [reference/deployment.md](reference/deployment.md).
