@@ -18,6 +18,7 @@ from brilliant_mqtt.config import Settings
 from brilliant_mqtt.desired_state import DesiredState
 from brilliant_mqtt.mesh_leader import MeshLeader
 from brilliant_mqtt.model import BrilliantDevice
+from brilliant_mqtt.motion_derive import MotionDeriver
 from brilliant_mqtt.mqttio import AioMqttAdapter
 from brilliant_mqtt.protocols import BusClient
 
@@ -102,6 +103,15 @@ async def _run_session(
         # prevents the combined rate from exceeding the intended limit.
         write_throttle = WriteThrottle()
 
+        # ONE deriver per session, shared by both bridges like the throttle:
+        # hold state is keyed by peripheral_id and the two scopes never
+        # overlap, so sharing is safe and keeps construction symmetric.
+        deriver = (
+            MotionDeriver(settings.motion_derived_hold_s)
+            if settings.motion_derived_enabled
+            else None
+        )
+
         # Bridges register their bus/mqtt callbacks in __init__, BEFORE any I/O
         # starts — so no early change/command event is missed.
         panel_bridge = Bridge(
@@ -110,6 +120,7 @@ async def _run_session(
             settings.panel,
             include=_is_panel_device,
             desired=desired_panel,
+            deriver=deriver,
             reconcile_min_interval_s=settings.motion_reconcile_min_interval_s,
             reconcile_max_writes_per_tick=settings.motion_reconcile_max_writes_per_tick,
             reconcile_min_write_spacing_s=settings.motion_reconcile_min_write_spacing_s,
@@ -132,6 +143,7 @@ async def _run_session(
                 "mesh",
                 include=_mesh_in_scope,
                 desired=desired_mesh,
+                deriver=deriver,
                 reconcile_min_interval_s=settings.motion_reconcile_min_interval_s,
                 reconcile_max_writes_per_tick=settings.motion_reconcile_max_writes_per_tick,
                 reconcile_min_write_spacing_s=settings.motion_reconcile_min_write_spacing_s,

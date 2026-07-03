@@ -82,6 +82,16 @@ class Settings:
     # Directory for the per-bridge desired-state JSON files. Must live under
     # the OTA-persistent /var so desired state survives firmware updates.
     motion_desired_state_dir: str = "/var/brilliant-mqtt/state"
+    # Score-derived motion: the bridge computes movement_detected from the
+    # motion_score stream (score >= motion_high_threshold, held for the hold
+    # window) because the firmware latch never fires on mesh loads
+    # (live-verified 2026-07-02). Inert wherever enable_motion_score is off,
+    # so the default-on is safe fleet-wide. Falsy spellings disable.
+    motion_derived_enabled: bool = True
+    # Seconds motion stays on after the last qualifying spike (inclusive
+    # window; 0 pulses only on the spike tick). 60 is the calibration-
+    # validated sweet spot (dining, 2026-07-02).
+    motion_derived_hold_s: float = 60.0
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -103,7 +113,11 @@ class Settings:
                   only effective when the write spacing is 0),
                   MOTION_RECONCILE_MIN_WRITE_SPACING_S (default 0.5, must be
                   >= 0; 0 disables spacing — this is the catch-up ramp lever),
-                  MOTION_DESIRED_STATE_DIR (default "/var/brilliant-mqtt/state").
+                  MOTION_DESIRED_STATE_DIR (default "/var/brilliant-mqtt/state"),
+                  MOTION_DERIVED_ENABLED (default "1"; falsy spellings
+                  disable score-derived motion — firmware movement_detected
+                  passes through unchanged),
+                  MOTION_DERIVED_HOLD_S (default 60.0 seconds, must be >= 0),
 
         Raises KeyError when a required variable is absent and ValueError when
         a value fails validation — both crash startup loudly under systemd.
@@ -143,6 +157,10 @@ class Settings:
         if motion_reconcile_min_write_spacing_s < 0:
             raise ValueError("MOTION_RECONCILE_MIN_WRITE_SPACING_S must be >= 0 (0 disables)")
         motion_desired_state_dir = env.get("MOTION_DESIRED_STATE_DIR", "/var/brilliant-mqtt/state")
+        motion_derived_enabled = _env_bool(env, "MOTION_DERIVED_ENABLED", "1")
+        motion_derived_hold_s = float(env.get("MOTION_DERIVED_HOLD_S", "60"))
+        if motion_derived_hold_s < 0:
+            raise ValueError("MOTION_DERIVED_HOLD_S must be >= 0")
 
         return cls(
             panel=panel,
@@ -163,4 +181,6 @@ class Settings:
             motion_reconcile_max_writes_per_tick=motion_reconcile_max_writes_per_tick,
             motion_reconcile_min_write_spacing_s=motion_reconcile_min_write_spacing_s,
             motion_desired_state_dir=motion_desired_state_dir,
+            motion_derived_enabled=motion_derived_enabled,
+            motion_derived_hold_s=motion_derived_hold_s,
         )

@@ -1208,7 +1208,7 @@ def test_mesh_motion_high_threshold_min_max_step() -> None:
     by_uid = _by_uid(entities_for(_mesh_dimmer_with_motion(), "mesh"))
     d = by_uid[f"brilliant_mesh_{MESH_PID}_motion_high_threshold"]
     assert d.min_value == 0
-    assert d.max_value == 100
+    assert d.max_value == 255
     assert d.step == 1
 
 
@@ -1249,7 +1249,7 @@ def test_mesh_motion_low_threshold_min_max_step() -> None:
     by_uid = _by_uid(entities_for(_mesh_dimmer_with_motion(), "mesh"))
     d = by_uid[f"brilliant_mesh_{MESH_PID}_motion_low_threshold"]
     assert d.min_value == 0
-    assert d.max_value == 100
+    assert d.max_value == 255
     assert d.step == 1
 
 
@@ -1563,3 +1563,18 @@ def test_device_config_intercom_broadcasts_and_double_tap_timeout() -> None:
     assert tt.component == "number"
     assert tt.enabled_by_default is False
     assert payload_fields(dev)["slider_double_tap_timeout_ms"] == 400
+
+
+# ===========================================================================
+# Task 4: Motion threshold 0-255 range (M11 motion subsystem)
+# ===========================================================================
+
+
+def test_motion_threshold_numbers_cover_8bit_range() -> None:
+    """Motion thresholds are 8-bit values (0-255), matching live firmware observations."""
+    from brilliant_mqtt.mapping import AUX_SPECS
+
+    specs = {s.var: s for s in AUX_SPECS[DeviceKind.LIGHT]}
+    for var in ("motion_high_threshold", "motion_low_threshold"):
+        assert specs[var].min_value == 0
+        assert specs[var].max_value == 255  # score is 8-bit; 255 observed live

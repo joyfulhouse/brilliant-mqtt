@@ -134,6 +134,9 @@ _MOTION_AUX: tuple[AuxSpec, ...] = (
         # movement_detected only tracks live presence while motion-scoring is on;
         # with it off the bus reports a frozen latch (live-verified panel-1.local
         # 2026-06-14), so gate the published value on enable_motion_score.
+        # NOTE: when the bridge's MotionDeriver is active (default), the
+        # published value is DERIVED from motion_score — the firmware latch
+        # itself never fires on mesh loads (live-verified 2026-07-02).
         gate_var="enable_motion_score",
     ),
     AuxSpec(
@@ -153,9 +156,8 @@ _MOTION_AUX: tuple[AuxSpec, ...] = (
         entity_category="config",
         enabled_by_default=False,
     ),
-    # 0–100 range is ASSUMED (bus did not document valid bounds; observed
-    # values 70 high / 20 low on 2026-06-13 live probe). Revisit if firmware
-    # documents an explicit range.
+    # Range is 8-bit 0–255, live-verified 2026-07-02 (dining calibration:
+    # motion_score observed at 255; thresholds share the scale).
     AuxSpec(
         var="motion_high_threshold",
         component="number",
@@ -163,7 +165,7 @@ _MOTION_AUX: tuple[AuxSpec, ...] = (
         value_kind="int",
         entity_category="config",
         min_value=0,
-        max_value=100,
+        max_value=255,
         step=1,
         enabled_by_default=False,
     ),
@@ -174,7 +176,7 @@ _MOTION_AUX: tuple[AuxSpec, ...] = (
         value_kind="int",
         entity_category="config",
         min_value=0,
-        max_value=100,
+        max_value=255,
         step=1,
         enabled_by_default=False,
     ),
@@ -241,8 +243,8 @@ AUX_SPECS: dict[DeviceKind, tuple[AuxSpec, ...]] = {
             entity_category="config",
             enabled_by_default=False,
         ),
-        # 0–100 range ASSUMED (same as the mesh thresholds — no firmware bound
-        # documented; live-observed 25 high / 14 low on the faceplate).
+        # 0–100 range ASSUMED (no firmware bound documented for the PIR path;
+        # live-observed 25 high / 14 low on the faceplate).
         AuxSpec(
             var="pir_motion_detection_high_threshold",
             component="number",

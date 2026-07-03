@@ -96,17 +96,24 @@ latch — so the bridge publishes `motion=off` rather than the stale value
 (live-verified 2026-06-14: with scoring off, mesh sensors latched a permanent
 `occupied` with nobody home).
 
-**Fix:** Enable real mesh presence in three steps:
+**Why (published sensor):** The firmware `movement_detected` latch never
+fires, so the bridge derives the Motion binary_sensor from the `motion_score`
+stream instead: it turns **on** the moment `motion_score` >= **Motion High
+Threshold**, and turns **off** after `MOTION_DERIVED_HOLD_S` seconds (default
+60 s) with no qualifying spike. **Motion Low Threshold** does not affect this
+sensor — it only writes to the device NVM (kept for firmware/HomeKit parity).
+Both thresholds and `motion_score` are 8-bit, range 0–255.
+
+**Fix:** Enable real mesh presence in two steps:
 
 1. In HA, enable the device's **Motion Score Reporting** switch
    (`enable_motion_score` — a `config`, disabled-by-default entity; enable it
    in the entity settings first to make it visible).
-2. Enable the **Motion High Threshold** and **Motion Low Threshold** number
-   entities (also disabled by default, 0–100 range).
-3. Tune the thresholds: `movement_detected` trips when `motion_score` rises
-   above **High** and clears when it falls below **Low**. Sample the idle
-   `motion_score` noise floor with scoring on; raise the **Low** threshold
-   above that floor so the sensor clears when the space is empty.
+2. Enable the **Motion High Threshold** number entity (also disabled by
+   default, 0–255 range) and tune it: sample the idle `motion_score` noise
+   floor with scoring on, then set High above that floor so the sensor stays
+   off when the space is empty. Raise `MOTION_DERIVED_HOLD_S` (env,
+   default 60 s) if the sensor clears too eagerly between spikes.
 
 The panel **faceplate** occupancy sensor is a separate subsystem — these steps
 do not affect it.

@@ -27,6 +27,7 @@ from brilliant_mqtt.discovery import (
 )
 from brilliant_mqtt.mapping import EntityDescriptor, entities_for, payload_fields
 from brilliant_mqtt.model import BrilliantDevice, DeviceKind, Variable
+from brilliant_mqtt.motion_derive import MotionDeriver
 from brilliant_mqtt.protocols import BusClient, MqttClient
 
 logger = logging.getLogger(__name__)
@@ -88,6 +89,7 @@ class Bridge:
         *,
         include: Callable[[BrilliantDevice], bool] | None = None,
         desired: DesiredState | None = None,
+        deriver: MotionDeriver | None = None,
         reconcile_min_interval_s: float = 60.0,
         reconcile_max_writes_per_tick: int = 4,
         reconcile_min_write_spacing_s: float = 0.5,
@@ -106,6 +108,11 @@ class Bridge:
         self._include = include
         # Desired-state reconciliation (None => disabled; behaves as before).
         self._desired = desired
+        # Score-derived motion (None => firmware movement_detected passes
+        # through as before). Applied at the top of every snapshot path so
+        # the stored snapshot, payload_fields, and the diff cache all see
+        # the derived value.
+        self._deriver = deriver
         self._reconcile_min_interval_s = reconcile_min_interval_s
         self._reconcile_max_writes_per_tick = reconcile_max_writes_per_tick
         self._reconcile_min_write_spacing_s = reconcile_min_write_spacing_s
@@ -137,6 +144,10 @@ class Bridge:
     def _included(self, device: BrilliantDevice) -> bool:
         """True when *device* is in this bridge's scope (no filter = everything)."""
         return self._include is None or self._include(device)
+
+    def _derived(self, device: BrilliantDevice) -> BrilliantDevice:
+        """Apply score-derived motion to *device* (identity when disabled)."""
+        return device if self._deriver is None else self._deriver.apply(device)
 
     async def reconcile(self) -> None:
         """Publish availability, discovery configs, and initial state for all devices.
@@ -183,6 +194,7 @@ class Bridge:
             n_devices += 1
             n_entities += len(descriptors)
 
+            device = self._derived(device)
             self._devices[device.peripheral_id] = device
 
             # Publish one discovery config per entity descriptor.
@@ -257,6 +269,10 @@ class Bridge:
         self._by_cmd_topic.clear()
         self._last_state_payload.clear()
         self._devices.clear()
+        if self._deriver is not None:
+            # An ex-leader must not carry hold state into a re-acquisition;
+            # the new session starts cold (motion off until the next spike).
+            self._deriver.clear()
         logger.info("withdraw: %d command topics unsubscribed", unsubscribed)
 
     async def poll_once(self) -> None:
@@ -276,6 +292,7 @@ class Bridge:
                 continue
             if not entities_for(device, self._panel):
                 continue
+            device = self._derived(device)
             self._devices[device.peripheral_id] = device
             if payload_fields(device):
                 await self._publish_state(device, force=False)
@@ -400,6 +417,7 @@ class Bridge:
         if not descriptors:
             return
 
+        device = self._derived(device)
         self._devices[device.peripheral_id] = device
 
         if payload_fields(device):
