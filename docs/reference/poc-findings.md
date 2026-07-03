@@ -297,8 +297,18 @@ Key facts:
   `motion_low_threshold` (mesh) vs `pir_motion_detection_high_threshold` /
   `pir_motion_detection_low_threshold` (faceplate). Only `movement_detected`
   is shared.
-- The 0–100 range for the threshold variables is **assumed** (no firmware
-  documentation found; observed values 70/20).
+- The score/threshold scale is **8-bit 0–255**, live-verified 2026-07-02
+  during the dining calibration (`motion_score` observed at 255; the earlier
+  0–100 assumption from the 70/20 factory defaults was wrong).
+- **The firmware `movement_detected` latch never fires on mesh loads** —
+  live-verified 2026-07-02: with `enable_motion_score=1` and
+  `motion_high_threshold=45` confirmed on-device, real activity drove
+  `motion_score` to 221–255 repeatedly and the latch stayed `0` (zero fires
+  in 48 h of recorded history; consistent with Brilliant never exposing mesh
+  motion in their own app). Since agent v0.5.0 the bridge **derives** the
+  published Motion sensor from the score stream instead (`motion_derive.py`:
+  on at score ≥ high threshold, off after `MOTION_DERIVED_HOLD_S` with no
+  new spikes; `motion_low_threshold` is inert for the published sensor).
 
 Implementation: `_MOTION_AUX` tuple in `mapping.py` is concatenated onto
 `_LOAD_AUX` for `LIGHT`, `SWITCH`, and `ALWAYS_ON`. Panel loads lack these

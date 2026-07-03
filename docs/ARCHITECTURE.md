@@ -44,6 +44,7 @@ bidirectional control.
 | `discovery.py` | HA MQTT-Discovery payloads + topic builders. | unit |
 | `commands.py` | Inbound MQTT command → bus variable-set translation. | unit |
 | `desired_state.py` | Operator desired-state store for the motion vars (`RECONCILED_VARS`) — in-memory + durable JSON under `/var`; feeds the bridge's drift re-assertion. | unit |
+| `motion_derive.py` | Score-derived motion for mesh loads: rewrites `movement_detected` from `motion_score` ≥ high-threshold with a hold window (the firmware latch never fires — poc-findings §8c). Applied by the bridge in every snapshot path. | unit |
 | `bridge.py` | Orchestrator: reconcile, change → state publish, command → bus, desired-state enforcement. | unit (fakes) |
 | `mesh_leader.py` | Fleet-wide mesh leader election over MQTT (retained priority claim + heartbeat); gates the mesh bridge's publishes and writes. | unit |
 | `config.py` | Env-driven settings. | unit |
