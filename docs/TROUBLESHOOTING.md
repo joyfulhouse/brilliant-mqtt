@@ -147,6 +147,31 @@ switch-embedded stack being overloaded — compare `top`/`uptime` against a
 healthy panel. The breaker only stops the bridge from amplifying the load; the
 root issue is an operator/panel concern.
 
+### Panel rebooted on its own (bus-health watchdog)
+
+**Symptom:** A panel rebooted with nobody touching it, and its entities briefly
+went unavailable.
+
+**Why:** If you enabled the per-panel **Bus watchdog** switch, an independent
+daemon reboots the panel when the Brilliant message bus wedges — the bridge can
+no longer read the bus and only a reboot clears it — after the bus-liveness
+heartbeat has been stale for `BUS_WATCHDOG_STALE_AFTER` (default 30 min), and
+only while the bridge unit is still active and the gateway pings (a plain
+network outage is left to the Wi-Fi watchdog, so the two never fight).
+
+**Confirm it was the watchdog:** on the panel,
+
+```bash
+tail /var/brilliant-mqtt/bus-watchdog.log
+```
+
+a `— rebooting` line names the trigger. Reboots are rate-limited
+(`BUS_WATCHDOG_REBOOT_COOLDOWN` / `_CAP` / `_WINDOW`) so it can't reboot-loop.
+
+**If it reboots repeatedly:** the bus keeps wedging — capture
+`bus-watchdog.log` plus `journalctl -u brilliant-mqtt` and open an issue. Full
+settings in [CONFIGURATION.md → Bus-health watchdog](CONFIGURATION.md#bus-health-watchdog).
+
 ### Bridge broken after a panel firmware update
 
 Firmware OTA replaces `/data/switch-embedded` — including the closed-source bus

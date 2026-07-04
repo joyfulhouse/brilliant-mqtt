@@ -7,8 +7,22 @@ guide and `../INSTALL.md` for prerequisites including MQTT broker setup.
 
 ## Contents
 
-- `brilliant-mqtt.service` — the systemd unit (runs the bridge under the panel's
-  Python 3.10 with `/var`-based app + vendored deps; resource-capped).
+- `brilliant-mqtt.service` — the systemd unit for the bridge (runs under the
+  panel's Python 3.10 with `/var`-based app + vendored deps; resource-capped).
+- `brilliant-bus-watchdog.service` — optional bus-health watchdog: reboots the
+  panel if the Brilliant message bus wedges (heartbeat stale 30 min+, gated on
+  the bridge being active and the gateway reachable). See
+  [../docs/CONFIGURATION.md](../docs/CONFIGURATION.md#bus-health-watchdog).
+- `brilliant-wifi-watchdog.service` — optional Wi-Fi watchdog: recovers a panel
+  that drops off Wi-Fi (connman re-enable → restart → GPIO reset/reboot). See
+  [../docs/CONFIGURATION.md](../docs/CONFIGURATION.md#wi-fi-watchdog).
+- `brilliant-voice.service` — optional on-panel voice satellite. See
+  [../docs/voice.md](../docs/voice.md).
+
+The HA integration installs and enables these per panel automatically. To wire
+one up **manually**: drop the unit in `/etc/systemd/system/`, then
+`systemctl enable --now <unit>`. The watchdog units read their settings from the
+same `/etc/brilliant-mqtt.env`.
 
 ## Manual deploy (pilot one panel first)
 
