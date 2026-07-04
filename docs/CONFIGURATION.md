@@ -103,6 +103,44 @@ separate env file.
 broker reachability alongside the gateway probe — informational only; broker
 state never drives the escalation ladder.
 
+### Bus-health watchdog
+
+An optional standalone daemon (`brilliant_bus_watchdog`) that reboots the
+panel when the bridge has been unable to hold a Brilliant message-bus session
+for **30 minutes** (default) — a known wedge mode where the on-panel
+`message_bus` vassal accepts the socket but hangs mid-handshake, and only a
+reboot clears it (a bridge restart does not). Gated so it fires only for that
+specific failure: the bridge's systemd unit must still be **active** (never
+reboots a deliberately stopped or uninstalled bridge), and the network
+gateway must be **reachable** (a plain network outage is the
+[Wi-Fi watchdog](#wi-fi-watchdog)'s job — this watchdog defers while the
+gateway is down, so the two never race each other). Guarded against
+reboot-looping with its own cooldown/cap, tracked in its own state file,
+independent of the Wi-Fi watchdog's guard. Installed separately from the
+bridge, via the HA integration's **Bus watchdog** switch (see
+[ha-integration.md → Entities](ha-integration.md#entities)) or manually from
+[deploy/brilliant-bus-watchdog.service](../deploy/brilliant-bus-watchdog.service).
+It reads the same `/etc/brilliant-mqtt.env` as the bridge — there is no
+separate env file.
+
+The bridge stamps a heartbeat file after every successful bus read
+(`BUS_HEARTBEAT_FILE`, below) — a tmpfs path by default, so there is no flash
+wear. During a wedge, the bus read never completes, so the heartbeat naturally
+stops updating with no special wedge-detection needed in the bridge itself;
+the watchdog just measures how stale that one file is.
+
+| Variable | Required | Default | Meaning |
+|---|---|---|---|
+| `BUS_WATCHDOG_INTERVAL` | no | `60` seconds | Poll loop cadence. |
+| `BUS_WATCHDOG_STALE_AFTER` | no | `1800` seconds (30 min) | Heartbeat age that triggers a reboot, once the gating conditions above also hold. |
+| `BUS_HEARTBEAT_FILE` | no | `/run/brilliant-mqtt/bus-heartbeat` | **Shared with the bridge** (same variable name on both sides) — tmpfs path the bridge stamps and the watchdog reads. An empty value on the bridge disables emission; leave it set for the watchdog to have anything to check. |
+| `BUS_WATCHDOG_STATE` | no | `/var/brilliant-mqtt/bus-watchdog.state` | Where reboot timestamps persist (its own file — deliberately separate from the Wi-Fi watchdog's ledger, so the two guards never race on the same file). |
+| `BUS_WATCHDOG_LOG` | no | `/var/brilliant-mqtt/bus-watchdog.log` | Rotating log file (3 × 512 KB backups). |
+| `BUS_WATCHDOG_REBOOT_COOLDOWN` | no | `3600` seconds (1 h) | Minimum gap between guard-permitted reboots. |
+| `BUS_WATCHDOG_REBOOT_CAP` | no | `3` reboots | Maximum reboots allowed inside the rolling window; the guard blocks further ones (logs only) past this. |
+| `BUS_WATCHDOG_REBOOT_WINDOW` | no | `21600` seconds (6 h) | Rolling window the reboot cap is measured over. |
+| `BRIDGE_SERVICE` | no | `brilliant-mqtt` | systemd unit checked with `is-active` before a reboot — must be active for the watchdog to fire. |
+
 Example `/etc/brilliant-mqtt.env`:
 
 ```

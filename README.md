@@ -44,7 +44,7 @@ HomeKit without breaking them. It survives panel firmware updates.
 | Motion & presence | Motion from every mesh dimmer/switch and panel faceplate, plus panel-in-use occupancy |
 | Panel settings | 25+ entities per panel: screen, audio, privacy, governance switches |
 | Voice satellite | Local wake word → your own HA Assist pipeline (opt-in per panel) |
-| Reliability | Auto-reconnect, watchdogs, and retained MQTT state — entities survive HA restarts, panel reboots, and firmware updates |
+| Reliability | Auto-reconnect, watchdogs, and retained MQTT state — entities survive HA restarts, panel reboots, and firmware updates. A bus-health watchdog self-recovers a panel whose Brilliant bus stays wedged. |
 
 Compared to pairing the panels through HomeKit Controller (the usual
 workaround): no dropped pairings or `setup_retry`, far more entities (power,
