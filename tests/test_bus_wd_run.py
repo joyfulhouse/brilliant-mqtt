@@ -1,23 +1,9 @@
 from __future__ import annotations
 
-from typing import Any
+from types import SimpleNamespace
+from typing import NoReturn
 
-from brilliant_bus_watchdog.run import Config, handle, load_config, should_reboot
-
-
-def _cfg(**kw: Any) -> Config:
-    d: dict[str, Any] = dict(
-        interval=60.0,
-        stale_after=1800.0,
-        heartbeat_path="/hb",
-        state_path="/s",
-        log_path="/l",
-        bridge_service="brilliant-mqtt",
-        gateway=None,
-        policy=None,
-    )
-    d.update(kw)
-    return Config(**d)
+from brilliant_bus_watchdog.run import _service_active, handle, load_config, should_reboot
 
 
 def test_should_reboot_all_true() -> None:
@@ -90,3 +76,24 @@ def test_load_config_defaults() -> None:
 def test_load_config_overrides() -> None:
     c = load_config({"BUS_WATCHDOG_STALE_AFTER": "600", "BUS_HEARTBEAT_FILE": "/x"})
     assert c.stale_after == 600.0 and c.heartbeat_path == "/x"
+
+
+def test_service_active_true_when_stdout_active() -> None:
+    def run(argv: list[str]) -> SimpleNamespace:
+        return SimpleNamespace(stdout="active\n")
+
+    assert _service_active("brilliant-mqtt", run=run) is True
+
+
+def test_service_active_false_when_stdout_inactive() -> None:
+    def run(argv: list[str]) -> SimpleNamespace:
+        return SimpleNamespace(stdout="inactive")
+
+    assert _service_active("brilliant-mqtt", run=run) is False
+
+
+def test_service_active_false_when_runner_raises_oserror() -> None:
+    def run(argv: list[str]) -> NoReturn:
+        raise OSError("systemctl not found")
+
+    assert _service_active("brilliant-mqtt", run=run) is False
