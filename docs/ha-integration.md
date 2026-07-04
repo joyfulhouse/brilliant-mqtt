@@ -94,6 +94,7 @@ Each panel's device gains six management entities (three diagnostic, three contr
 | `switch.brilliant_<panel>_voice_satellite` | **Voice satellite** — enable installs and starts the satellite; disable uninstalls it. |
 | `select.brilliant_<panel>_wake_word` | **Wake word** — choose `okay_nabu` (default), `hey_jarvis`, or `hey_mycroft`; changing it restarts the satellite. |
 | `switch.brilliant_<panel>_wi_fi_watchdog` | **Wi-Fi watchdog** — enable installs and starts the on-panel Wi-Fi watchdog daemon (auto-recovers lost Wi-Fi: reconnect → restart networking → reboot as a last resort, see [CONFIGURATION.md → Wi-Fi watchdog](CONFIGURATION.md#wi-fi-watchdog)); disable uninstalls it. |
+| `switch.brilliant_<panel>_bus_watchdog` | **Bus watchdog** — enable installs and starts the on-panel bus-health watchdog daemon (reboots the panel if the Brilliant message bus stays wedged 30+ minutes, gated on the bridge being active and the network being up, see [CONFIGURATION.md → Bus-health watchdog](CONFIGURATION.md#bus-health-watchdog)); disable uninstalls it. |
 
 Entity ids follow the panel's HA device name (`Brilliant <panel>`).
 
@@ -254,11 +255,15 @@ release via the update entity or `redeploy`.
   `preferred_auth=("password",)`, keyboard-interactive disabled) so a wrong
   password can't burn through a lockout threshold.
 - The integration only writes paths it owns: `/var/brilliant-mqtt/**`
-  (including the Wi-Fi watchdog code, when enabled), `/var/brilliant-voice/**`
-  (when voice is enabled), `/etc/brilliant-mqtt.env` (mode `0600`),
-  `/etc/brilliant-voice.env` (mode `0600`), and the systemd units
+  (including the Wi-Fi watchdog code, and `/var/brilliant-mqtt/bus_watchdog/**`
+  for the bus watchdog, when enabled), `/var/brilliant-voice/**` (when voice is
+  enabled), `/etc/brilliant-mqtt.env` (mode `0600`), `/etc/brilliant-voice.env`
+  (mode `0600`), and the systemd units
   `/etc/systemd/system/brilliant-mqtt.service` /
-  `brilliant-voice.service` / `brilliant-wifi-watchdog.service`.
+  `brilliant-voice.service` / `brilliant-wifi-watchdog.service` /
+  `brilliant-bus-watchdog.service`. The running bridge itself (not the
+  integration) also stamps a liveness heartbeat to the tmpfs path
+  `/run/brilliant-mqtt/bus-heartbeat`, cleared on every reboot.
 
 **OTA host-key rotation** is handled in two modes (see the **Trust host-key
 changes** option above): the default surfaces a changed key as a detectable

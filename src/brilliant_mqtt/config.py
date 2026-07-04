@@ -92,6 +92,10 @@ class Settings:
     # window; 0 pulses only on the spike tick). 60 is the calibration-
     # validated sweet spot (dining, 2026-07-02).
     motion_derived_hold_s: float = 60.0
+    # Bus-liveness heartbeat: stamped on every successful bus read so the
+    # independent bus-watchdog can detect a wedged message_bus session. tmpfs
+    # default (no flash wear); empty disables emission.
+    bus_heartbeat_file: str = "/run/brilliant-mqtt/bus-heartbeat"
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -118,6 +122,8 @@ class Settings:
                   disable score-derived motion — firmware movement_detected
                   passes through unchanged),
                   MOTION_DERIVED_HOLD_S (default 60.0 seconds, must be >= 0),
+                  BUS_HEARTBEAT_FILE (default "/run/brilliant-mqtt/bus-heartbeat";
+                  empty disables),
 
         Raises KeyError when a required variable is absent and ValueError when
         a value fails validation — both crash startup loudly under systemd.
@@ -161,6 +167,7 @@ class Settings:
         motion_derived_hold_s = float(env.get("MOTION_DERIVED_HOLD_S", "60"))
         if motion_derived_hold_s < 0:
             raise ValueError("MOTION_DERIVED_HOLD_S must be >= 0")
+        bus_heartbeat_file = env.get("BUS_HEARTBEAT_FILE", "/run/brilliant-mqtt/bus-heartbeat")
 
         return cls(
             panel=panel,
@@ -183,4 +190,5 @@ class Settings:
             motion_desired_state_dir=motion_desired_state_dir,
             motion_derived_enabled=motion_derived_enabled,
             motion_derived_hold_s=motion_derived_hold_s,
+            bus_heartbeat_file=bus_heartbeat_file,
         )

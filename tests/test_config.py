@@ -368,3 +368,23 @@ class TestSettings:
 
         with pytest.raises(ValueError):
             Settings.from_env()
+
+    def test_bus_heartbeat_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("BRILLIANT_PANEL", "office")
+        monkeypatch.setenv("MQTT_HOST", "10.0.0.1")
+        monkeypatch.setenv("MQTT_USERNAME", "brilliant")
+        monkeypatch.setenv("MQTT_PASSWORD", "s3cr3t")
+        monkeypatch.delenv("BUS_HEARTBEAT_FILE", raising=False)
+
+        s = Settings.from_env()
+        assert s.bus_heartbeat_file == "/run/brilliant-mqtt/bus-heartbeat"
+
+    def test_bus_heartbeat_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("BRILLIANT_PANEL", "office")
+        monkeypatch.setenv("MQTT_HOST", "10.0.0.1")
+        monkeypatch.setenv("MQTT_USERNAME", "brilliant")
+        monkeypatch.setenv("MQTT_PASSWORD", "s3cr3t")
+        monkeypatch.setenv("BUS_HEARTBEAT_FILE", "/x")
+
+        s = Settings.from_env()
+        assert s.bus_heartbeat_file == "/x"

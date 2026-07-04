@@ -45,6 +45,7 @@ bidirectional control.
 | `commands.py` | Inbound MQTT command → bus variable-set translation. | unit |
 | `desired_state.py` | Operator desired-state store for the motion vars (`RECONCILED_VARS`) — in-memory + durable JSON under `/var`; feeds the bridge's drift re-assertion. | unit |
 | `motion_derive.py` | Score-derived motion for mesh loads: rewrites `movement_detected` from `motion_score` ≥ high-threshold with a hold window (the firmware latch never fires — poc-findings §8c). Applied by the bridge in every snapshot path. | unit |
+| `heartbeat.py` | Bus-liveness heartbeat: atomically stamps a tmpfs file after every successful `get_all()` so the independent `brilliant_bus_watchdog` package can detect a wedged bus session (see Data Flow). | unit |
 | `bridge.py` | Orchestrator: reconcile, change → state publish, command → bus, desired-state enforcement. | unit (fakes) |
 | `mesh_leader.py` | Fleet-wide mesh leader election over MQTT (retained priority claim + heartbeat); gates the mesh bridge's publishes and writes. | unit |
 | `config.py` | Env-driven settings. | unit |
@@ -76,6 +77,13 @@ bidirectional control.
   processor's reconnect callback triggers re-subscribe + full reconcile; the
   hot poll bounds staleness at its cadence; and a stale-stream watchdog
   rebuilds the whole session when no push arrives for `BUS_STALE_SECONDS`.
+- **Bus-health watchdog:** a separate `brilliant_bus_watchdog` package (own
+  systemd service, resource-capped, mirrors `brilliant_wifi_watchdog`) polls
+  the heartbeat file `heartbeat.py` writes and reboots the panel once it goes
+  stale ≥30 min *and* the bridge's systemd unit is still active *and* the
+  gateway is reachable — recovering a message-bus wedge that a bridge restart
+  alone cannot clear, without giving the resource-capped bridge process itself
+  the ability to reboot the panel.
 - **BLE mesh (elected publisher):** the bus's virtual `ble_mesh` device
   (Brilliant plug-in switches/mesh dimmers, whole-home) is published under the
   reserved `mesh` pseudo-panel by exactly one panel, elected via a retained

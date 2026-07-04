@@ -6,6 +6,9 @@ import pytest
 
 from custom_components.brilliant_mqtt import panel_ops
 from custom_components.brilliant_mqtt.const import (
+    BUS_WATCHDOG_SERVICE_NAME,
+    PANEL_BUS_WATCHDOG_DIR,
+    PANEL_BUS_WATCHDOG_UNIT_FILE,
     PANEL_ENV_FILE,
     PANEL_UNIT_FILE,
     PANEL_VAR_DIR,
@@ -702,3 +705,141 @@ async def test_fake_shell_put_file_records_call() -> None:
     await shell.connect()
     await shell.put_file("/local/x.tar.gz", "/remote/x.tar.gz", 0o644)
     assert shell.file_uploads == [("/local/x.tar.gz", "/remote/x.tar.gz", 0o644)]
+
+
+# ---------------------------------------------------------------------------
+# Bus-health watchdog recipes
+# ---------------------------------------------------------------------------
+
+_FULL_BUS_WATCHDOG_INSPECT = RunResult(
+    0,
+    "unit=1\nenabled=1\nactive=1\npayload=1\n",
+    "",
+)
+
+_ABSENT_BUS_WATCHDOG_INSPECT = RunResult(
+    0,
+    "unit=0\nenabled=0\nactive=0\npayload=0\n",
+    "",
+)
+
+
+async def test_inspect_bus_watchdog_parses_fully_installed() -> None:
+    shell = await _connected(
+        FakeShell(responses={panel_ops.BUS_WATCHDOG_INSPECT_COMMAND: _FULL_BUS_WATCHDOG_INSPECT})
+    )
+    state = await panel_ops.inspect_bus_watchdog(shell)
+    assert state == panel_ops.BusWatchdogState(
+        unit_present=True,
+        enabled=True,
+        active=True,
+        payload_present=True,
+    )
+
+
+async def test_inspect_bus_watchdog_parses_all_absent() -> None:
+    shell = await _connected(
+        FakeShell(responses={panel_ops.BUS_WATCHDOG_INSPECT_COMMAND: _ABSENT_BUS_WATCHDOG_INSPECT})
+    )
+    state = await panel_ops.inspect_bus_watchdog(shell)
+    assert state == panel_ops.BusWatchdogState(
+        unit_present=False,
+        enabled=False,
+        active=False,
+        payload_present=False,
+    )
+
+
+def test_bus_watchdog_inspect_command_checks_run_py_entrypoint() -> None:
+    """Probe checks the actual run.py entrypoint — not just the directory."""
+    assert (
+        f"{PANEL_BUS_WATCHDOG_DIR}/brilliant_bus_watchdog/run.py"
+        in panel_ops.BUS_WATCHDOG_INSPECT_COMMAND
+    )
+
+
+# The expected bus watchdog swap command spelled out independently of the impl's path
+# constants (so the assertion is independent of any accidental const change).
+_EXPECTED_BUS_WATCHDOG_SWAP = " && ".join(
+    [
+        "mkdir -p /var/brilliant-mqtt",
+        "rm -rf /var/brilliant-mqtt/bus_watchdog.bak",
+        "{ [ -e /var/brilliant-mqtt/bus_watchdog ] && "
+        "mv /var/brilliant-mqtt/bus_watchdog /var/brilliant-mqtt/bus_watchdog.bak; true; }",
+        "mv /var/brilliant-mqtt/bus_watchdog.staging /var/brilliant-mqtt/bus_watchdog",
+        "rm -rf /var/brilliant-mqtt/bus_watchdog.bak",
+    ]
+)
+
+
+async def test_deploy_bus_watchdog_uploads_tree_then_swaps() -> None:
+    shell = await _connected(FakeShell())
+    await panel_ops.deploy_bus_watchdog(shell, "/local/bus_watchdog")
+    assert shell.commands[0] == "rm -rf /var/brilliant-mqtt/bus_watchdog.staging"
+    assert shell.dir_uploads == [
+        ("/local/bus_watchdog", "/var/brilliant-mqtt/bus_watchdog.staging")
+    ]
+    assert _EXPECTED_BUS_WATCHDOG_SWAP in shell.commands
+
+
+async def test_deploy_bus_watchdog_failed_upload_records_no_destructive_swap() -> None:
+    """A failed put_dir must not trigger the swap — no partial-replace of working install."""
+    shell = await _connected(FakeShell(put_dir_error=OSError("transfer aborted")))
+    with pytest.raises(OSError, match="transfer aborted"):
+        await panel_ops.deploy_bus_watchdog(shell, "/local/bus_watchdog")
+    assert shell.commands == ["rm -rf /var/brilliant-mqtt/bus_watchdog.staging"]
+    assert shell.dir_uploads == []  # the put_dir failed → staging dir was never uploaded
+
+
+async def test_deploy_bus_watchdog_raises_when_swap_fails() -> None:
+    shell = await _connected(
+        FakeShell(responses={_EXPECTED_BUS_WATCHDOG_SWAP: RunResult(1, "", "mv failed\n")})
+    )
+    with pytest.raises(panel_ops.PanelOpError, match="exited 1"):
+        await panel_ops.deploy_bus_watchdog(shell, "/local/bus_watchdog")
+
+
+async def test_ensure_bus_watchdog_unit_writes_etc_and_staged_then_reloads() -> None:
+    shell = await _connected(FakeShell())
+    await panel_ops.ensure_bus_watchdog_unit(shell, "UNIT_CONTENT")
+    # mkdir runs first, daemon-reload last.
+    assert shell.commands[0] == f"mkdir -p {PANEL_BUS_WATCHDOG_DIR}"
+    assert shell.commands[-1] == "systemctl daemon-reload"
+    # Unit written to /etc (0644) and a staged copy under PANEL_BUS_WATCHDOG_DIR (0644).
+    assert [(path, mode) for (path, _data, mode) in shell.uploads] == [
+        (PANEL_BUS_WATCHDOG_UNIT_FILE, 0o644),
+        (f"{PANEL_BUS_WATCHDOG_DIR}/{BUS_WATCHDOG_SERVICE_NAME}.service", 0o644),
+    ]
+    for _path, data, _mode in shell.uploads:
+        assert data == b"UNIT_CONTENT"
+
+
+async def test_ensure_bus_watchdog_unit_raises_when_mkdir_fails() -> None:
+    shell = await _connected(
+        FakeShell(responses={f"mkdir -p {PANEL_BUS_WATCHDOG_DIR}": RunResult(1, "", "denied\n")})
+    )
+    with pytest.raises(panel_ops.PanelOpError, match="exited 1"):
+        await panel_ops.ensure_bus_watchdog_unit(shell, "UNIT_CONTENT")
+    assert shell.uploads == []
+
+
+async def test_enable_bus_watchdog_issues_systemctl_enable() -> None:
+    shell = await _connected(FakeShell())
+    await panel_ops.enable_bus_watchdog(shell)
+    assert f"systemctl enable --now {BUS_WATCHDOG_SERVICE_NAME}" in shell.commands
+
+
+async def test_uninstall_bus_watchdog_sequence_and_paths() -> None:
+    shell = await _connected(FakeShell())
+    await panel_ops.uninstall_bus_watchdog(shell)
+    assert shell.commands == [
+        f"systemctl disable --now {BUS_WATCHDOG_SERVICE_NAME} 2>/dev/null || true",
+        f"rm -f {PANEL_BUS_WATCHDOG_UNIT_FILE}",
+        "rm -rf /var/brilliant-mqtt/bus_watchdog /var/brilliant-mqtt/bus_watchdog.staging",
+        "rm -f /var/brilliant-mqtt/bus-watchdog.log /var/brilliant-mqtt/bus-watchdog.state",
+        "systemctl daemon-reload",
+    ]
+    # Uninstall must never rm the bridge's PANEL_VAR_DIR itself.
+    for cmd in shell.commands:
+        tokens = cmd.split()
+        assert PANEL_VAR_DIR not in tokens, f"Command removes PANEL_VAR_DIR itself: {cmd!r}"

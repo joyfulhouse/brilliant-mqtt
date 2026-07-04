@@ -34,6 +34,7 @@ from . import panel_ops
 from .const import (
     AVAILABILITY_OFFLINE,
     AVAILABILITY_ONLINE,
+    COMPONENT_BUS_WATCHDOG,
     COMPONENT_VOICE,
     COMPONENT_WIFI_WATCHDOG,
     CONF_COMPONENTS,
@@ -452,6 +453,26 @@ class PanelManager:
                             await panel_ops.enable_wifi_watchdog(shell)
                         except (OSError, asyncssh.Error, PanelOpError) as err:
                             _LOGGER.warning("%s: watchdog repair failed: %s", self.panel, err)
+                    # Bus watchdog re-lay: re-write unit to /etc if selected.
+                    # OTA wipes /etc/systemd/system/ so the unit disappears after a
+                    # firmware update even though the code survives in /var.  Lay it
+                    # back down (and redeploy the code if /var was also wiped) so the
+                    # watchdog keeps running across OTAs.  Failure is logged and
+                    # swallowed — a watchdog outage must not block the bridge repair.
+                    if COMPONENT_BUS_WATCHDOG in selected_ids(self.entry.data):
+                        try:
+                            bus_unit = await self.hass.async_add_executor_job(
+                                (_payload_dir() / "brilliant-bus-watchdog.service").read_text
+                            )
+                            bus_state = await panel_ops.inspect_bus_watchdog(shell)
+                            if not bus_state.payload_present:
+                                await panel_ops.deploy_bus_watchdog(
+                                    shell, str(_payload_dir() / "bus_watchdog")
+                                )
+                            await panel_ops.ensure_bus_watchdog_unit(shell, bus_unit)
+                            await panel_ops.enable_bus_watchdog(shell)
+                        except (OSError, asyncssh.Error, PanelOpError) as err:
+                            _LOGGER.warning("%s: bus watchdog repair failed: %s", self.panel, err)
                 except (OSError, asyncssh.Error, PanelOpError) as err:
                     # A checked step (mkdir/daemon-reload/systemctl) exited non-zero.
                     # The panel is half-broken; surface it loudly instead of letting
@@ -799,6 +820,25 @@ class PanelManager:
                         except (OSError, asyncssh.Error, PanelOpError):
                             _LOGGER.warning(
                                 "%s: watchdog refresh failed; will retry next reconcile",
+                                self.panel,
+                            )
+                    # Bus watchdog: also re-lay its unit when selected — OTA wipes /etc
+                    # and the watchdog unit disappears even though the code in /var survives.
+                    if COMPONENT_BUS_WATCHDOG in selected_ids(self.entry.data):
+                        try:
+                            bus_unit = await self.hass.async_add_executor_job(
+                                (_payload_dir() / "brilliant-bus-watchdog.service").read_text
+                            )
+                            bus_state = await panel_ops.inspect_bus_watchdog(shell)
+                            if not bus_state.payload_present:
+                                await panel_ops.deploy_bus_watchdog(
+                                    shell, str(_payload_dir() / "bus_watchdog")
+                                )
+                            await panel_ops.ensure_bus_watchdog_unit(shell, bus_unit)
+                            await panel_ops.enable_bus_watchdog(shell)
+                        except (OSError, asyncssh.Error, PanelOpError):
+                            _LOGGER.warning(
+                                "%s: bus watchdog refresh failed; will retry next reconcile",
                                 self.panel,
                             )
                 finally:

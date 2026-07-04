@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.5] - 2026-07-04
+
+### Added
+
+- **Bus-health watchdog.** A rare failure mode — the panel's internal
+  Brilliant message bus wedges mid-handshake, and only a reboot clears it, not
+  a bridge restart — now self-recovers instead of needing someone to notice
+  and reboot the panel by hand. The bridge now stamps a lightweight heartbeat
+  every time it successfully reads the bus, and a new, independent watchdog
+  daemon reboots the panel once that heartbeat has gone stale for **30
+  minutes** — but only while the bridge is still running and the network is
+  up (a plain network outage stays the existing Wi-Fi watchdog's job, so the
+  two never fight over the same reboot). Guarded against reboot-looping the
+  same way the Wi-Fi watchdog is. Opt in per panel with the new **Bus
+  watchdog** switch; see
+  [CONFIGURATION.md → Bus-health watchdog](docs/CONFIGURATION.md#bus-health-watchdog).
+
 ## [0.5.0] - 2026-07-02
 
 ### Changed
@@ -218,7 +235,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - JoyfulHouse OSS docs standard: LICENSE (MIT), INSTALL.md, CHANGELOG.md,
   FUNDING.yml, CODEOWNERS, and the canonical `docs/` set.
 
-[Unreleased]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.5.5...HEAD
+[0.5.5]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.5.0...v0.5.5
 [0.5.0]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.3.0...v0.3.1

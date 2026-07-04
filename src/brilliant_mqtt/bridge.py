@@ -90,6 +90,7 @@ class Bridge:
         include: Callable[[BrilliantDevice], bool] | None = None,
         desired: DesiredState | None = None,
         deriver: MotionDeriver | None = None,
+        heartbeat: Callable[[], None] | None = None,
         reconcile_min_interval_s: float = 60.0,
         reconcile_max_writes_per_tick: int = 4,
         reconcile_min_write_spacing_s: float = 0.5,
@@ -113,6 +114,9 @@ class Bridge:
         # the stored snapshot, payload_fields, and the diff cache all see
         # the derived value.
         self._deriver = deriver
+        # Bus-liveness heartbeat (None => no-op): stamped after every successful
+        # get_all so an independent watchdog can detect a wedged bus session.
+        self._heartbeat = heartbeat
         self._reconcile_min_interval_s = reconcile_min_interval_s
         self._reconcile_max_writes_per_tick = reconcile_max_writes_per_tick
         self._reconcile_min_write_spacing_s = reconcile_min_write_spacing_s
@@ -149,6 +153,10 @@ class Bridge:
         """Apply score-derived motion to *device* (identity when disabled)."""
         return device if self._deriver is None else self._deriver.apply(device)
 
+    def _beat(self) -> None:
+        if self._heartbeat is not None:
+            self._heartbeat()
+
     async def reconcile(self) -> None:
         """Publish availability, discovery configs, and initial state for all devices.
 
@@ -169,6 +177,7 @@ class Bridge:
         # through the shared get_all (ble_mesh has no HARDWARE peripheral, so
         # its sw_version is naturally None).
         devices = [d for d in await self._bus.get_all() if self._included(d)]
+        self._beat()
         # Pre-pass: the panel firmware version (from the HARDWARE peripheral) is
         # attached to every entity's HA device block so the device page shows it.
         sw_version = _sw_version_from(devices)
@@ -285,6 +294,7 @@ class Bridge:
         keeps the fast cadence from spamming identical retained payloads.
         """
         devices = await self._bus.get_all()
+        self._beat()
         for device in devices:
             # Same scope filter as reconcile: the shared get_all returns every
             # bus device, including the other bridge's.
