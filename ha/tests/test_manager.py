@@ -20,6 +20,7 @@ from pytest_homeassistant_custom_component.typing import MqttMockHAClient
 
 from custom_components.brilliant_mqtt.const import (
     COMPONENT_BRIDGE,
+    COMPONENT_BUS_WATCHDOG,
     COMPONENT_VOICE,
     COMPONENT_WIFI_WATCHDOG,
     CONF_COMPONENTS,
@@ -1511,5 +1512,181 @@ async def test_repair_skips_watchdog_when_not_selected(
     assert "systemctl enable --now brilliant-wifi-watchdog" not in shell.commands
     assert not any("wifi-watchdog" in c or "wifi_watchdog" in c for c in shell.commands)
     assert not any("brilliant-wifi-watchdog" in p for (p, _d, _m) in shell.uploads)
+
+
+# ---------------------------------------------------------------------------
+# Bus watchdog repair re-lay (Task 3: OTA wipes /etc, unit must be re-laid)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.allow_lingering_timers
+async def test_repair_relays_bus_watchdog_unit_when_selected(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    payload_dir: Path,
+) -> None:
+    """When bus_watchdog is selected, async_repair re-lays the watchdog unit.
+
+    OTA wipes /etc/systemd/system/ so the unit file disappears after a firmware
+    update even though the watchdog code survives in /var.  The repair must call
+    ensure_bus_watchdog_unit + enable_bus_watchdog so the watchdog restarts
+    automatically on the next reboot / OTA.
+    """
+    from custom_components.brilliant_mqtt import panel_ops
+    from custom_components.brilliant_mqtt.shell import RunResult
+
+    agent_ok = RunResult(
+        0, "unit=1\nenv=1\nenabled=1\nactive=1\nsunit=1\nsenv=1\npayload=1\n0.2.0\n", ""
+    )
+    # Watchdog code lives in /var (OTA-persistent); /etc unit wiped by OTA.
+    bwd_payload_ok = RunResult(0, "unit=0\nenabled=0\nactive=0\npayload=1\n", "")
+    shell = FakeShell(
+        responses={
+            panel_ops.INSPECT_COMMAND: agent_ok,
+            panel_ops.BUS_WATCHDOG_INSPECT_COMMAND: bwd_payload_ok,
+        }
+    )
+    entry_data = {
+        **ENTRY_DATA,
+        CONF_COMPONENTS: {COMPONENT_BRIDGE: True, COMPONENT_BUS_WATCHDOG: True},
+    }
+    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+        entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=entry_data, version=2)
+        entry.add_to_hass(hass)
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        await entry.runtime_data.async_repair(trigger="button")
+        await hass.async_block_till_done()
+
+    # ensure_bus_watchdog_unit wrote the unit to /etc and the staged copy.
+    assert any("brilliant-bus-watchdog.service" in p for (p, _d, _m) in shell.uploads)
+    # enable_bus_watchdog issued the systemctl command.
+    assert "systemctl enable --now brilliant-bus-watchdog" in shell.commands
+    # Payload was present in /var → no redeploy of the watchdog code tree.
+    assert not any("bus_watchdog" in local for (local, _remote) in shell.dir_uploads)
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_repair_skips_bus_watchdog_when_not_selected(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    payload_dir: Path,
+) -> None:
+    """When bus_watchdog is NOT in the selected components, repair must not touch it."""
+    from custom_components.brilliant_mqtt import panel_ops
+    from custom_components.brilliant_mqtt.shell import RunResult
+
+    agent_ok = RunResult(
+        0, "unit=1\nenv=1\nenabled=1\nactive=1\nsunit=1\nsenv=1\npayload=1\n0.2.0\n", ""
+    )
+    shell = FakeShell(responses={panel_ops.INSPECT_COMMAND: agent_ok})
+    entry_data = {
+        **ENTRY_DATA,
+        CONF_COMPONENTS: {COMPONENT_BRIDGE: True},
+    }
+    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+        entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=entry_data, version=2)
+        entry.add_to_hass(hass)
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        await entry.runtime_data.async_repair(trigger="button")
+        await hass.async_block_till_done()
+
+    # No bus watchdog commands or uploads must have run.
+    assert "systemctl enable --now brilliant-bus-watchdog" not in shell.commands
+    assert not any("bus-watchdog" in c or "bus_watchdog" in c for c in shell.commands)
+    assert not any("brilliant-bus-watchdog" in p for (p, _d, _m) in shell.uploads)
+
+
+# ---------------------------------------------------------------------------
+# Bus watchdog staged-copy refresh re-lay (same OTA gap, the non-outage path)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.allow_lingering_timers
+async def test_refresh_staged_copies_relays_bus_watchdog_unit_when_selected(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    payload_dir: Path,
+) -> None:
+    """When bus_watchdog is selected, a post-OTA staged-copy refresh re-lays its unit.
+
+    _refresh_staged_copies runs on every firmware-change sighting (the bridge stayed up
+    through the OTA), not just after an outage — so the bus watchdog's unit must be
+    re-laid there too, since the same OTA wipes /etc/systemd/system/ for it as well.
+    """
+    from custom_components.brilliant_mqtt import panel_ops
+    from custom_components.brilliant_mqtt.shell import RunResult
+
+    # Watchdog code lives in /var (OTA-persistent); /etc unit wiped by OTA.
+    bwd_payload_ok = RunResult(0, "unit=0\nenabled=0\nactive=0\npayload=1\n", "")
+    shell = FakeShell(responses={panel_ops.BUS_WATCHDOG_INSPECT_COMMAND: bwd_payload_ok})
+    entry_data = {
+        **ENTRY_DATA,
+        CONF_COMPONENTS: {COMPONENT_BRIDGE: True, COMPONENT_BUS_WATCHDOG: True},
+    }
+    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+        entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=entry_data, version=2)
+        entry.add_to_hass(hass)
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+        async_fire_mqtt_message(
+            hass, "brilliant/office/bridge", '{"agent_version": "0.2.0", "panel_firmware": "v1"}'
+        )
+        await hass.async_block_till_done()
+        async_fire_mqtt_message(
+            hass, "brilliant/office/bridge", '{"agent_version": "0.2.0", "panel_firmware": "v2"}'
+        )
+        # I3: _refresh_staged_copies runs via entry.async_create_background_task; the plain
+        # async_block_till_done() does NOT await background tasks — wait_background_tasks=True
+        # makes the SSH assertions below stable (see the bridge staged-copy test above).
+        await hass.async_block_till_done(wait_background_tasks=True)
+
+    # ensure_bus_watchdog_unit wrote the unit to /etc and the staged copy.
+    assert any("brilliant-bus-watchdog.service" in p for (p, _d, _m) in shell.uploads)
+    # enable_bus_watchdog issued the systemctl command.
+    assert "systemctl enable --now brilliant-bus-watchdog" in shell.commands
+    # Payload was present in /var → no redeploy of the watchdog code tree.
+    assert not any("bus_watchdog" in local for (local, _remote) in shell.dir_uploads)
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_refresh_staged_copies_skips_bus_watchdog_when_not_selected(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    payload_dir: Path,
+) -> None:
+    """When bus_watchdog is NOT selected, a staged-copy refresh must not touch it."""
+    shell = FakeShell()
+    entry_data = {
+        **ENTRY_DATA,
+        CONF_COMPONENTS: {COMPONENT_BRIDGE: True},
+    }
+    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+        entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=entry_data, version=2)
+        entry.add_to_hass(hass)
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+        async_fire_mqtt_message(
+            hass, "brilliant/office/bridge", '{"agent_version": "0.2.0", "panel_firmware": "v1"}'
+        )
+        await hass.async_block_till_done()
+        async_fire_mqtt_message(
+            hass, "brilliant/office/bridge", '{"agent_version": "0.2.0", "panel_firmware": "v2"}'
+        )
+        await hass.async_block_till_done(wait_background_tasks=True)
+
+    # No bus watchdog commands or uploads must have run.
+    assert "systemctl enable --now brilliant-bus-watchdog" not in shell.commands
+    assert not any("bus-watchdog" in c or "bus_watchdog" in c for c in shell.commands)
+    assert not any("brilliant-bus-watchdog" in p for (p, _d, _m) in shell.uploads)
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
 
     assert await hass.config_entries.async_unload(entry.entry_id)
