@@ -16,6 +16,7 @@ from brilliant_mqtt.bridge import Bridge, WriteThrottle
 from brilliant_mqtt.bus import RpcBusAdapter
 from brilliant_mqtt.config import Settings
 from brilliant_mqtt.desired_state import DesiredState
+from brilliant_mqtt.heartbeat import write_heartbeat
 from brilliant_mqtt.mesh_leader import MeshLeader
 from brilliant_mqtt.model import BrilliantDevice
 from brilliant_mqtt.motion_derive import MotionDeriver
@@ -112,6 +113,9 @@ async def _run_session(
             else None
         )
 
+        def _beat() -> None:
+            write_heartbeat(settings.bus_heartbeat_file, time.time)
+
         # Bridges register their bus/mqtt callbacks in __init__, BEFORE any I/O
         # starts — so no early change/command event is missed.
         panel_bridge = Bridge(
@@ -121,6 +125,7 @@ async def _run_session(
             include=_is_panel_device,
             desired=desired_panel,
             deriver=deriver,
+            heartbeat=_beat,
             reconcile_min_interval_s=settings.motion_reconcile_min_interval_s,
             reconcile_max_writes_per_tick=settings.motion_reconcile_max_writes_per_tick,
             reconcile_min_write_spacing_s=settings.motion_reconcile_min_write_spacing_s,
@@ -144,6 +149,7 @@ async def _run_session(
                 include=_mesh_in_scope,
                 desired=desired_mesh,
                 deriver=deriver,
+                heartbeat=_beat,
                 reconcile_min_interval_s=settings.motion_reconcile_min_interval_s,
                 reconcile_max_writes_per_tick=settings.motion_reconcile_max_writes_per_tick,
                 reconcile_min_write_spacing_s=settings.motion_reconcile_min_write_spacing_s,
