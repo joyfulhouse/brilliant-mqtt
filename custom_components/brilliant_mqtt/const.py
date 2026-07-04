@@ -35,6 +35,7 @@ CONF_COMPONENTS = "components"  # entry data: {component_id: bool}
 COMPONENT_BRIDGE = "bridge"
 COMPONENT_VOICE = "voice"
 COMPONENT_WIFI_WATCHDOG = "wifi_watchdog"
+COMPONENT_BUS_WATCHDOG = "bus_watchdog"
 
 # Internally managed config-entry state (never shown in a config-flow form).
 DATA_SSH_HOST_KEY = "ssh_host_key"  # TOFU-pinned on first successful connect
@@ -127,6 +128,11 @@ VOICE_SERVICE_NAME = "brilliant-voice"
 PANEL_WIFI_WATCHDOG_DIR = f"{PANEL_VAR_DIR}/wifi_watchdog"
 PANEL_WIFI_WATCHDOG_UNIT_FILE = "/etc/systemd/system/brilliant-wifi-watchdog.service"
 WIFI_WATCHDOG_SERVICE_NAME = "brilliant-wifi-watchdog"
+
+# On-panel bus-health watchdog paths (stdlib script tree under the OTA-proof /var bridge dir).
+PANEL_BUS_WATCHDOG_DIR = f"{PANEL_VAR_DIR}/bus_watchdog"
+PANEL_BUS_WATCHDOG_UNIT_FILE = "/etc/systemd/system/brilliant-bus-watchdog.service"
+BUS_WATCHDOG_SERVICE_NAME = "brilliant-bus-watchdog"
 
 EVENT_TYPE = "brilliant_mqtt_event"
 SIGNAL_PANEL_STATE = f"{DOMAIN}_panel_state"  # dispatcher: f"{SIGNAL_PANEL_STATE}_{entry_id}"

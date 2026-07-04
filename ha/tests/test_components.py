@@ -2,6 +2,7 @@ from custom_components.brilliant_mqtt import components as comp
 from custom_components.brilliant_mqtt import const
 from custom_components.brilliant_mqtt.const import (
     COMPONENT_BRIDGE,
+    COMPONENT_BUS_WATCHDOG,
     COMPONENT_VOICE,
     COMPONENT_WIFI_WATCHDOG,
     CONF_COMPONENTS,
@@ -13,6 +14,7 @@ def test_component_id_constants() -> None:
     assert const.COMPONENT_BRIDGE == "bridge"
     assert const.COMPONENT_VOICE == "voice"
     assert const.COMPONENT_WIFI_WATCHDOG == "wifi_watchdog"
+    assert const.COMPONENT_BUS_WATCHDOG == "bus_watchdog"
 
 
 def test_registry_has_bridge_and_voice() -> None:
@@ -44,7 +46,18 @@ def test_default_components_wifi_watchdog_on() -> None:
     assert d[COMPONENT_WIFI_WATCHDOG] is True
 
 
-def test_optional_order_is_voice_then_wifi_watchdog() -> None:
+def test_bus_watchdog_registry_row_default_enabled() -> None:
+    row = comp.REGISTRY[COMPONENT_BUS_WATCHDOG]
+    assert row.default_enabled is True
+    assert row.locked is False
+
+
+def test_default_components_bus_watchdog_on() -> None:
+    d = comp.default_components()
+    assert d[COMPONENT_BUS_WATCHDOG] is True
+
+
+def test_optional_order_is_voice_wifi_watchdog_bus_watchdog() -> None:
     opts = comp.optional()
     ids = [c.id for c in opts]
-    assert ids == [COMPONENT_VOICE, COMPONENT_WIFI_WATCHDOG]
+    assert ids == [COMPONENT_VOICE, COMPONENT_WIFI_WATCHDOG, COMPONENT_BUS_WATCHDOG]

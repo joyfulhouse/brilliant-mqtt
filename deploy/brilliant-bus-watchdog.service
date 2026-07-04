@@ -1,0 +1,19 @@
+[Unit]
+Description=Brilliant bus-health watchdog
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/brilliant-mqtt.env
+ExecStart=/usr/bin/python3.10 -m brilliant_bus_watchdog.run
+WorkingDirectory=/var/brilliant-mqtt/bus_watchdog
+Environment=PYTHONPATH=/var/brilliant-mqtt/bus_watchdog
+Restart=always
+RestartSec=10
+Nice=10
+MemoryMax=48M
+CPUQuota=10%
+
+[Install]
+WantedBy=multi-user.target

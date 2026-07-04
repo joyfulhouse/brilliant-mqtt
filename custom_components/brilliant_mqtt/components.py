@@ -17,6 +17,7 @@ from . import manager as _mgr
 from . import panel_ops
 from .const import (
     COMPONENT_BRIDGE,
+    COMPONENT_BUS_WATCHDOG,
     COMPONENT_VOICE,
     COMPONENT_WIFI_WATCHDOG,
     CONF_COMPONENTS,
@@ -101,6 +102,20 @@ async def _wd_install(hass: HomeAssistant, shell: PanelShell, data: Mapping[str,
     await panel_ops.enable_wifi_watchdog(shell)
 
 
+async def _bus_present(shell: PanelShell) -> bool:
+    return (await panel_ops.inspect_bus_watchdog(shell)).payload_present
+
+
+async def _bus_install(hass: HomeAssistant, shell: PanelShell, data: Mapping[str, Any]) -> None:
+    payload_dir = _mgr._payload_dir()
+    unit = await hass.async_add_executor_job(
+        (payload_dir / "brilliant-bus-watchdog.service").read_text
+    )
+    await panel_ops.deploy_bus_watchdog(shell, str(payload_dir / "bus_watchdog"))
+    await panel_ops.ensure_bus_watchdog_unit(shell, unit)
+    await panel_ops.enable_bus_watchdog(shell)
+
+
 REGISTRY: dict[str, Component] = {
     COMPONENT_BRIDGE: Component(
         id=COMPONENT_BRIDGE,
@@ -128,6 +143,15 @@ REGISTRY: dict[str, Component] = {
         present=_wd_present,
         install=_wd_install,
         remove=panel_ops.uninstall_wifi_watchdog,
+    ),
+    COMPONENT_BUS_WATCHDOG: Component(
+        id=COMPONENT_BUS_WATCHDOG,
+        label="Bus watchdog",
+        locked=False,
+        default_enabled=True,
+        present=_bus_present,
+        install=_bus_install,
+        remove=panel_ops.uninstall_bus_watchdog,
     ),
 }
 

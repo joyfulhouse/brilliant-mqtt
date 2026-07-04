@@ -32,7 +32,8 @@
           "voice": "Enable voice satellite",
           "voice_wake_word": "Wake word",
           "voice_ha_host": "Home Assistant host override (optional)",
-          "wifi_watchdog": "Enable Wi-Fi watchdog"
+          "wifi_watchdog": "Enable Wi-Fi watchdog",
+          "bus_watchdog": "Enable Bus watchdog"
         },
         "data_description": {
           "name": "A friendly name, e.g. \"Office Bath\". A lowercase id is derived for MQTT topics (\"Office Bath\" → office-bath).",
@@ -40,7 +41,8 @@
           "voice": "Install a Home Assistant voice satellite on this panel (on-panel wake word + microphone + speaker). Speech-to-text, the conversation agent, and text-to-speech all run in your HA Assist pipeline — nothing voice-specific is configured on the panel.",
           "voice_wake_word": "The on-panel wake word that activates the satellite.",
           "voice_ha_host": "Only needed if the panel cannot resolve your Home Assistant URL's hostname (e.g. a segmented IoT VLAN). Format: hostname=ip, e.g. homeassistant.example=10.0.0.5. Leave blank to use the panel's own DNS.",
-          "wifi_watchdog": "Auto-recovers lost Wi-Fi (reconnect → restart networking → reboot the panel as a last resort)."
+          "wifi_watchdog": "Auto-recovers lost Wi-Fi (reconnect → restart networking → reboot the panel as a last resort).",
+          "bus_watchdog": "Installs the on-panel daemon that reboots the panel if the Brilliant bus stays wedged for 30+ minutes."
         }
       },
       "reconfigure": {
@@ -57,13 +59,15 @@
           "voice": "Enable voice satellite",
           "voice_wake_word": "Wake word",
           "voice_ha_host": "Home Assistant host override (optional)",
-          "wifi_watchdog": "Enable Wi-Fi watchdog"
+          "wifi_watchdog": "Enable Wi-Fi watchdog",
+          "bus_watchdog": "Enable Bus watchdog"
         },
         "data_description": {
           "voice": "Install a Home Assistant voice satellite on this panel (on-panel wake word + microphone + speaker). Speech-to-text, the conversation agent, and text-to-speech all run in your HA Assist pipeline — nothing voice-specific is configured on the panel.",
           "voice_wake_word": "The on-panel wake word that activates the satellite.",
           "voice_ha_host": "Only needed if the panel cannot resolve your Home Assistant URL's hostname (e.g. a segmented IoT VLAN). Format: hostname=ip, e.g. homeassistant.example=10.0.0.5. Leave blank to use the panel's own DNS.",
-          "wifi_watchdog": "Auto-recovers lost Wi-Fi (reconnect → restart networking → reboot the panel as a last resort)."
+          "wifi_watchdog": "Auto-recovers lost Wi-Fi (reconnect → restart networking → reboot the panel as a last resort).",
+          "bus_watchdog": "Installs the on-panel daemon that reboots the panel if the Brilliant bus stays wedged for 30+ minutes."
         }
       }
     },
@@ -140,6 +144,9 @@
       },
       "wifi_watchdog_enabled": {
         "name": "Wi-Fi watchdog"
+      },
+      "bus_watchdog_enabled": {
+        "name": "Bus watchdog"
       }
     },
     "update": {
@@ -166,6 +173,9 @@
     },
     "wifi_watchdog_failed": {
       "message": "Wi-Fi watchdog operation failed: {error}"
+    },
+    "bus_watchdog_failed": {
+      "message": "Bus watchdog operation failed: {error}"
     }
   },
   "issues": {
