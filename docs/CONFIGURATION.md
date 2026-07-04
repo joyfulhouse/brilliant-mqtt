@@ -133,6 +133,7 @@ the watchdog just measures how stale that one file is.
 |---|---|---|---|
 | `BUS_WATCHDOG_INTERVAL` | no | `60` seconds | Poll loop cadence. |
 | `BUS_WATCHDOG_STALE_AFTER` | no | `1800` seconds (30 min) | Heartbeat age that triggers a reboot, once the gating conditions above also hold. |
+| `BUS_WATCHDOG_GATEWAY` | no | _(auto)_ | Gateway IP to probe for the network-up gate. Blank auto-detects the default gateway from the routing table every cycle. |
 | `BUS_HEARTBEAT_FILE` | no | `/run/brilliant-mqtt/bus-heartbeat` | **Shared with the bridge** (same variable name on both sides) — tmpfs path the bridge stamps and the watchdog reads. An empty value on the bridge disables emission; leave it set for the watchdog to have anything to check. |
 | `BUS_WATCHDOG_STATE` | no | `/var/brilliant-mqtt/bus-watchdog.state` | Where reboot timestamps persist (its own file — deliberately separate from the Wi-Fi watchdog's ledger, so the two guards never race on the same file). |
 | `BUS_WATCHDOG_LOG` | no | `/var/brilliant-mqtt/bus-watchdog.log` | Rotating log file (3 × 512 KB backups). |

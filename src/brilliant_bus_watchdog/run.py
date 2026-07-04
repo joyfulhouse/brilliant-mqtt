@@ -69,7 +69,7 @@ def handle(*, should: bool, guard: _GuardLike, now: float, reboot_fn: Any = _reb
     if not should:
         return
     if guard.can_reboot(now):
-        _LOG.error("bus session dead >=%.0fs, network up, bridge active — rebooting", now)
+        _LOG.error("bus session dead past threshold, network up, bridge active — rebooting")
         guard.record(now)
         reboot_fn()
     else:
