@@ -16,9 +16,33 @@ from __future__ import annotations
 
 import asyncio
 
-from brilliant_mqtt.bus import RpcBusAdapter
+from brilliant_mqtt.bus import RpcBusAdapter, _session_client_name
 from brilliant_mqtt.model import BrilliantDevice
 from tests.fakes import FakeClock
+
+
+class TestSessionClientName:
+    """The bus peer name (``<owning_device_id>.<my_name>``) must differ per
+    session, or a half-bound registration left by a connect that timed out
+    mid-handshake becomes a permanent ghost that rejects every later
+    connection with NameInUseError (adu-bath incident, 2026-07-05)."""
+
+    def test_suffix_appended_to_base(self) -> None:
+        name = _session_client_name("brilliant_mqtt")
+        assert name.startswith("brilliant_mqtt-")
+        assert name != "brilliant_mqtt"
+
+    def test_each_call_is_unique(self) -> None:
+        names = {_session_client_name("brilliant_mqtt") for _ in range(50)}
+        assert len(names) == 50
+
+    def test_adapter_gets_a_unique_client_name_per_session(self) -> None:
+        # Two sessions (run() builds a fresh adapter each loop) must not share a
+        # name, so a stale ghost from one can never lock out the next.
+        a = RpcBusAdapter()
+        b = RpcBusAdapter()
+        assert a._my_name.startswith("brilliant_mqtt-")
+        assert a._my_name != b._my_name
 
 
 class TestPushLiveness:

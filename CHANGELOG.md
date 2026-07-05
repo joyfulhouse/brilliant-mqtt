@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Bus client-name collision could lock a panel out of its message bus.** The
+  bridge registered on the panel's message bus under a fixed name, so a connect
+  that timed out mid-handshake could leave a stale "ghost" registration that
+  rejected every reconnect with `NameInUseError` — the bridge never recovered
+  (all bus-derived entities stuck `unavailable`) until the panel's `message_bus`
+  or the panel itself was restarted, and it re-formed on the next timeout. Each
+  bridge session now uses a unique client name, so a stale ghost can no longer
+  block reconnection and the bridge self-recovers on its normal reconnect.
+
 ## [0.5.5] - 2026-07-04
 
 ### Added
