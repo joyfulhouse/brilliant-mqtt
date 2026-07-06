@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.6] - 2026-07-05
+
 ### Fixed
 
 - **Bus client-name collision could lock a panel out of its message bus.** The
@@ -246,7 +248,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - JoyfulHouse OSS docs standard: LICENSE (MIT), INSTALL.md, CHANGELOG.md,
   FUNDING.yml, CODEOWNERS, and the canonical `docs/` set.
 
-[Unreleased]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.5.5...HEAD
+[Unreleased]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.5.6...HEAD
+[0.5.6]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.5.5...v0.5.6
 [0.5.5]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.5.0...v0.5.5
 [0.5.0]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.3.1...v0.4.0
