@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -31,6 +32,23 @@ _SOCKET_PATH = "/var/run/brilliant/server_socket"
 # connected in <1 s in practice; 10 s is a generous ceiling).
 _CONNECT_TIMEOUT_S = 10.0
 _CONNECT_POLL_S = 0.25
+
+
+def _session_client_name(base: str) -> str:
+    """Return a per-session bus client name: *base* plus a short random suffix.
+
+    The bus registers our peer under ``<owning_device_id>.<name>``. With a
+    constant name that key is fully deterministic, so a registration left
+    half-bound by a connect that timed out mid-handshake becomes a permanent
+    ghost: every later attempt (the lib's own retries, the supervisor's session
+    rebuilds, even a fresh process after a reboot) reuses the identical name and
+    is rejected by the server with ``NameInUseError``, locking the bridge out of
+    the bus until the panel's ``message_bus`` is restarted — and it re-forms on
+    the next load-induced timeout. A fresh suffix per session means a stale
+    ghost can never block a new session; the bridge self-recovers on its normal
+    reconnect (adu-bath incident, 2026-07-05).
+    """
+    return f"{base}-{secrets.token_hex(4)}"
 
 
 def normalize_peripheral(device_id: str, peripheral_id: str, raw: Any) -> BrilliantDevice:
@@ -166,7 +184,10 @@ class RpcBusAdapter:
         extra_device_ids: tuple[str, ...] = (),
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        self._my_name = my_name
+        # A UNIQUE name per session (see _session_client_name): the bus peer key
+        # is <owning_device_id>.<my_name>, so a constant name lets a half-bound
+        # ghost registration lock the bridge out forever with NameInUseError.
+        self._my_name = _session_client_name(my_name)
         # Injectable monotonic clock (tests drive it deterministically); backs
         # both the push-liveness clock and the reconnect-rate window.
         self._clock = clock
