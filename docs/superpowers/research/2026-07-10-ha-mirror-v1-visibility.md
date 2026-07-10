@@ -40,12 +40,25 @@ depends on home-wide visibility.
 
 - **GO:** proceed with the leader-election model unchanged. One elected panel
   hosting the HA mirrors on its own device makes them visible across the home.
-- **V2 follow-up (room assignment):** `room_assignment` on real peripherals is a
-  base64-encoded thrift structure (a list of room-id entries), **not** a plain
-  string. The mirror must construct the proper `room_assignment` thrift value to
-  place a mirrored entity in a specific room — resolve this format before the
-  orchestrator task (plan Task 6) rather than assuming a string room id. Visibility
-  itself does not depend on room assignment.
+- **V2 follow-up (room assignment) — structure now decoded:**
+  `room_assignment` is a thrift STRUCT (not a plain string), decoded from a real
+  peripheral's value:
+  - field id 1 = LIST of STRING (a peripheral can be assigned to multiple rooms).
+  - Each element is `"<room_id>:<assignment_timestamp_ms>"`, where `room_id` is a
+    20-hex-char id and the timestamp is milliseconds (e.g.
+    `b6f97347b34010df5d52:1683406303305`).
+  To room-assign a mirrored peripheral the mirror must (a) discover the target
+  Brilliant room's id and (b) set `room_assignment` to a struct whose field-1
+  list contains `"<room_id>:<now_ms>"`. TWO open sub-questions remain for the
+  orchestrator/host tasks (plan Tasks 6/8): **(1)** how to enumerate Brilliant
+  room ids + names (home-configuration lookup on the bus) to map an HA area name
+  → room id; **(2)** how `VariableSpec` represents a struct-typed variable (the
+  simple `int`/`str` var types proven so far do not cover a struct).
+  **Not a blocker:** V1 proved home-wide visibility WITHOUT any room assignment
+  (the test peripheral had none and was still visible on the other panel), so
+  room assignment is an enhancement layered on top of a working mirror, not a
+  prerequisite. Tier-1 can ship unassigned (or default-room) and add room
+  mapping once (1) and (2) are resolved.
 
 ## Safety notes
 
