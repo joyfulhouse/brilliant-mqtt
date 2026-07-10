@@ -1,5 +1,5 @@
 import pytest
-from thrift.Thrift import TType  # type: ignore[import-untyped]
+from thrift.Thrift import TType
 
 from brilliant_protocol_lab.thrift_wire import (
     WireField,

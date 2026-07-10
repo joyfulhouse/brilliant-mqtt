@@ -3,9 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, cast
 
-from thrift.protocol.TBinaryProtocol import TBinaryProtocol  # type: ignore[import-untyped]
-from thrift.Thrift import TType  # type: ignore[import-untyped]
-from thrift.transport.TTransport import TMemoryBuffer  # type: ignore[import-untyped]
+from thrift.protocol.TBinaryProtocol import TBinaryProtocol
+from thrift.Thrift import TType
+from thrift.transport.TTransport import TMemoryBuffer
 
 
 @dataclass(frozen=True)

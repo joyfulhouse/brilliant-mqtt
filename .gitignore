@@ -52,3 +52,6 @@ protocol_lab/private/
 *.pkcs12
 *.oracle.local.json
 *.profile.local.json
+
+# SDD scratch (ledger, briefs, reports, review diffs) — not part of the deliverable
+.superpowers/
