@@ -61,6 +61,7 @@ class MeshLeader:
         on_acquire: Callable[[], Awaitable[None]],
         on_lose: Callable[[], Awaitable[None]],
         clock: Callable[[], float] = time.monotonic,
+        claim_topic: str = MESH_LEADER_TOPIC,
     ) -> None:
         self._mqtt = mqtt
         self._panel = panel
@@ -69,6 +70,7 @@ class MeshLeader:
         self._on_acquire = on_acquire
         self._on_lose = on_lose
         self._clock = clock
+        self._claim_topic = claim_topic
 
         self._is_leader = False
         # Set while a claim awaits its confirmation heartbeat (PENDING state).
@@ -95,7 +97,7 @@ class MeshLeader:
         # Register BEFORE subscribing so the retained claim the broker
         # delivers on subscribe cannot race past us.
         self._mqtt.on_command(self._on_message)
-        await self._mqtt.subscribe(MESH_LEADER_TOPIC)
+        await self._mqtt.subscribe(self._claim_topic)
 
     async def _on_message(self, topic: str, payload: str) -> None:
         """Record another panel's claim.
@@ -103,7 +105,7 @@ class MeshLeader:
         The MQTT adapter fans EVERY inbound message to all registered
         callbacks, so anything off the claim topic is ignored here.
         """
-        if topic != MESH_LEADER_TOPIC:
+        if topic != self._claim_topic:
             return
         try:
             parsed = json.loads(payload)
@@ -203,7 +205,7 @@ class MeshLeader:
     async def _publish_claim(self) -> None:
         """Publish our retained claim (sorted keys keep the payload byte-stable)."""
         payload = json.dumps({"panel": self._panel, "priority": self._priority}, sort_keys=True)
-        await self._mqtt.publish(MESH_LEADER_TOPIC, payload, retain=True)
+        await self._mqtt.publish(self._claim_topic, payload, retain=True)
 
     async def _invoke(self, name: str, cb: Callable[[], Awaitable[None]]) -> None:
         """Await a transition callback, isolating its exceptions.
