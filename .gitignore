@@ -43,3 +43,12 @@ uv.lock.bak
 
 # Internal working artifacts (operator-local; not part of the public tree)
 docs/claude/
+
+# Private reverse-engineering inputs/outputs — never commit.
+protocol_lab/private/
+*.pcap
+*.pcapng
+*.p12
+*.pkcs12
+*.oracle.local.json
+*.profile.local.json
