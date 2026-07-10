@@ -8,8 +8,9 @@ runs deterministically without real sleeps.
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 
+from brilliant_ha_mirror.mapping import HaEntity, PeripheralSpec, ServiceCall
 from brilliant_mqtt.commands import VarSet
 from brilliant_mqtt.model import BrilliantDevice
 
@@ -127,3 +128,72 @@ class FakeMqtt:
         assert self._command_cbs, "on_command was never registered"
         for cb in list(self._command_cbs):
             await cb(topic, payload)
+
+
+class FakeHaClient:
+    """Fake Home Assistant client that exposes entities and records calls."""
+
+    def __init__(self, entities: list[HaEntity]) -> None:
+        self.entities = entities
+        self.calls: list[ServiceCall] = []
+        self._state_change_cb: Callable[[HaEntity], Awaitable[None]] | None = None
+
+    async def start(self) -> None:
+        pass
+
+    async def get_entities(self, label: str) -> list[HaEntity]:
+        return list(self.entities)
+
+    def on_state_change(self, cb: Callable[[HaEntity], Awaitable[None]]) -> None:
+        self._state_change_cb = cb
+
+    async def call_service(self, call: ServiceCall) -> None:
+        self.calls.append(call)
+
+    async def shutdown(self) -> None:
+        pass
+
+    async def emit_state(self, entity: HaEntity) -> None:
+        """Test helper: invoke the registered state-change callback."""
+        assert self._state_change_cb is not None, "on_state_change was never registered"
+        await self._state_change_cb(entity)
+
+
+class FakePeripheralHost:
+    """Fake peripheral host that records registrations, updates, and deletes."""
+
+    def __init__(self) -> None:
+        self.registered: list[str] = []
+        self.registered_types: list[int] = []
+        self.specs: dict[str, PeripheralSpec] = {}
+        self.variables: dict[str, dict[str, str]] = {}
+        self.commands: dict[str, Callable[[str, str], Awaitable[None]]] = {}
+        self.deleted: list[str] = []
+
+    async def start(self) -> None:
+        pass
+
+    async def register(
+        self,
+        name: str,
+        spec: PeripheralSpec,
+        on_command: Callable[[str, str], Awaitable[None]],
+    ) -> None:
+        self.registered.append(name)
+        self.registered_types.append(spec.peripheral_type)
+        self.specs[name] = spec
+        self.variables[name] = dict(spec.variables)
+        self.commands[name] = on_command
+
+    async def update_variables(self, name: str, values: Mapping[str, str]) -> None:
+        self.variables[name].update(values)
+
+    async def delete(self, name: str) -> None:
+        self.deleted.append(name)
+
+    async def shutdown(self) -> None:
+        pass
+
+    async def fire_command(self, name: str, var: str, value: str) -> None:
+        """Test helper: invoke the command callback registered for *name*."""
+        await self.commands[name](var, value)
