@@ -14,11 +14,12 @@ import asyncio
 import json
 import logging
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import asyncssh
 from homeassistant.components import mqtt, persistent_notification
@@ -98,6 +99,39 @@ class _HostKeyChanged(Exception):
 def _payload_dir() -> Path:
     """The bundled agent payload (built by scripts/build_payload.sh / release CI)."""
     return Path(__file__).parent / "agent_payload"
+
+
+class _PayloadState(Protocol):
+    @property
+    def payload_present(self) -> bool: ...
+
+
+@dataclass(frozen=True)
+class _WatchdogRelaySpec:
+    service_filename: str
+    payload_subdir: str
+    inspect: Callable[[PanelShell], Awaitable[_PayloadState]]
+    deploy: Callable[[PanelShell, str], Awaitable[None]]
+    ensure_unit: Callable[[PanelShell, str], Awaitable[None]]
+    enable: Callable[[PanelShell], Awaitable[None]]
+
+
+_WIFI_WATCHDOG_RELAY = _WatchdogRelaySpec(
+    service_filename="brilliant-wifi-watchdog.service",
+    payload_subdir="wifi_watchdog",
+    inspect=panel_ops.inspect_wifi_watchdog,
+    deploy=panel_ops.deploy_wifi_watchdog,
+    ensure_unit=panel_ops.ensure_wifi_watchdog_unit,
+    enable=panel_ops.enable_wifi_watchdog,
+)
+_BUS_WATCHDOG_RELAY = _WatchdogRelaySpec(
+    service_filename="brilliant-bus-watchdog.service",
+    payload_subdir="bus_watchdog",
+    inspect=panel_ops.inspect_bus_watchdog,
+    deploy=panel_ops.deploy_bus_watchdog,
+    ensure_unit=panel_ops.ensure_bus_watchdog_unit,
+    enable=panel_ops.enable_bus_watchdog,
+)
 
 
 class PanelManager:
@@ -354,6 +388,74 @@ class PanelManager:
         await panel_ops.ensure_voice_config(shell, self._voice_env())
         await panel_ops.enable_voice(shell)
 
+    async def _relay_watchdog(
+        self,
+        shell: PanelShell,
+        spec: _WatchdogRelaySpec,
+        *,
+        warning_message: str,
+        warning_includes_error: bool,
+    ) -> None:
+        """Restore one selected watchdog without blocking the bridge operation."""
+        try:
+            payload_dir = _payload_dir()
+            unit = await self.hass.async_add_executor_job(
+                (payload_dir / spec.service_filename).read_text
+            )
+            state = await spec.inspect(shell)
+            if not state.payload_present:
+                await spec.deploy(shell, str(payload_dir / spec.payload_subdir))
+            await spec.ensure_unit(shell, unit)
+            await spec.enable(shell)
+        except (OSError, asyncssh.Error, PanelOpError) as err:
+            if warning_includes_error:
+                _LOGGER.warning(warning_message, self.panel, err)
+            else:
+                _LOGGER.warning(warning_message, self.panel)
+
+    async def _relay_ha_mirror(
+        self,
+        shell: PanelShell,
+        *,
+        warning_message: str,
+        warning_includes_error: bool,
+    ) -> None:
+        """Restore the selected HA mirror without blocking the bridge operation."""
+        try:
+            payload_dir = _payload_dir()
+            unit = await self.hass.async_add_executor_job(
+                (payload_dir / "brilliant-ha-mirror.service").read_text
+            )
+            data = self.entry.data
+            env = panel_ops.render_ha_mirror_env(
+                panel=self.panel,
+                ha_ws_url=data[CONF_HA_MIRROR_WS_URL],
+                ha_token=data[CONF_HA_MIRROR_TOKEN],
+                mirror_label=data.get(CONF_HA_MIRROR_LABEL, DEFAULT_HA_MIRROR_LABEL),
+                leader_priority=data.get(
+                    CONF_HA_MIRROR_LEADER_PRIORITY,
+                    DEFAULT_HA_MIRROR_LEADER_PRIORITY,
+                ),
+                mqtt_host=data[CONF_MQTT_HOST],
+                mqtt_port=data[CONF_MQTT_PORT],
+                mqtt_username=data[CONF_MQTT_USERNAME],
+                mqtt_password=data[CONF_MQTT_PASSWORD],
+            )
+            await panel_ops.deploy_ha_mirror(shell, str(payload_dir / "ha_mirror"))
+            await panel_ops.ensure_ha_mirror_config(shell, unit, env)
+            await panel_ops.enable_ha_mirror(shell)
+        except (
+            KeyError,
+            ValueError,
+            OSError,
+            asyncssh.Error,
+            PanelOpError,
+        ) as err:
+            if warning_includes_error:
+                _LOGGER.warning(warning_message, self.panel, err)
+            else:
+                _LOGGER.warning(warning_message, self.panel)
+
     async def async_repair(self, trigger: str = "manual") -> None:
         """Restore unit/env + enable; recovery is confirmed by the availability LWT."""
         if self._repairing:
@@ -446,76 +548,35 @@ class PanelManager:
                     # swallowed — a watchdog outage must not block the bridge repair.
                     from .components import selected_ids  # lazy: components imports manager
 
-                    if COMPONENT_WIFI_WATCHDOG in selected_ids(self.entry.data):
-                        try:
-                            wd_unit = await self.hass.async_add_executor_job(
-                                (_payload_dir() / "brilliant-wifi-watchdog.service").read_text
-                            )
-                            wd_state = await panel_ops.inspect_wifi_watchdog(shell)
-                            if not wd_state.payload_present:
-                                await panel_ops.deploy_wifi_watchdog(
-                                    shell, str(_payload_dir() / "wifi_watchdog")
-                                )
-                            await panel_ops.ensure_wifi_watchdog_unit(shell, wd_unit)
-                            await panel_ops.enable_wifi_watchdog(shell)
-                        except (OSError, asyncssh.Error, PanelOpError) as err:
-                            _LOGGER.warning("%s: watchdog repair failed: %s", self.panel, err)
+                    selected = selected_ids(self.entry.data)
+                    if COMPONENT_WIFI_WATCHDOG in selected:
+                        await self._relay_watchdog(
+                            shell,
+                            _WIFI_WATCHDOG_RELAY,
+                            warning_message="%s: watchdog repair failed: %s",
+                            warning_includes_error=True,
+                        )
                     # Bus watchdog re-lay: re-write unit to /etc if selected.
                     # OTA wipes /etc/systemd/system/ so the unit disappears after a
                     # firmware update even though the code survives in /var.  Lay it
                     # back down (and redeploy the code if /var was also wiped) so the
                     # watchdog keeps running across OTAs.  Failure is logged and
                     # swallowed — a watchdog outage must not block the bridge repair.
-                    if COMPONENT_BUS_WATCHDOG in selected_ids(self.entry.data):
-                        try:
-                            bus_unit = await self.hass.async_add_executor_job(
-                                (_payload_dir() / "brilliant-bus-watchdog.service").read_text
-                            )
-                            bus_state = await panel_ops.inspect_bus_watchdog(shell)
-                            if not bus_state.payload_present:
-                                await panel_ops.deploy_bus_watchdog(
-                                    shell, str(_payload_dir() / "bus_watchdog")
-                                )
-                            await panel_ops.ensure_bus_watchdog_unit(shell, bus_unit)
-                            await panel_ops.enable_bus_watchdog(shell)
-                        except (OSError, asyncssh.Error, PanelOpError) as err:
-                            _LOGGER.warning("%s: bus watchdog repair failed: %s", self.panel, err)
+                    if COMPONENT_BUS_WATCHDOG in selected:
+                        await self._relay_watchdog(
+                            shell,
+                            _BUS_WATCHDOG_RELAY,
+                            warning_message="%s: bus watchdog repair failed: %s",
+                            warning_includes_error=True,
+                        )
                     # HA mirror re-lay: refresh its code, unit, and secret env whenever
                     # selected. Failure is isolated so it cannot block bridge recovery.
-                    if COMPONENT_HA_MIRROR in selected_ids(self.entry.data):
-                        try:
-                            mirror_unit = await self.hass.async_add_executor_job(
-                                (_payload_dir() / "brilliant-ha-mirror.service").read_text
-                            )
-                            mirror_env = panel_ops.render_ha_mirror_env(
-                                panel=self.panel,
-                                ha_ws_url=self.entry.data[CONF_HA_MIRROR_WS_URL],
-                                ha_token=self.entry.data[CONF_HA_MIRROR_TOKEN],
-                                mirror_label=self.entry.data.get(
-                                    CONF_HA_MIRROR_LABEL, DEFAULT_HA_MIRROR_LABEL
-                                ),
-                                leader_priority=self.entry.data.get(
-                                    CONF_HA_MIRROR_LEADER_PRIORITY,
-                                    DEFAULT_HA_MIRROR_LEADER_PRIORITY,
-                                ),
-                                mqtt_host=self.entry.data[CONF_MQTT_HOST],
-                                mqtt_port=self.entry.data[CONF_MQTT_PORT],
-                                mqtt_username=self.entry.data[CONF_MQTT_USERNAME],
-                                mqtt_password=self.entry.data[CONF_MQTT_PASSWORD],
-                            )
-                            await panel_ops.deploy_ha_mirror(
-                                shell, str(_payload_dir() / "ha_mirror")
-                            )
-                            await panel_ops.ensure_ha_mirror_config(shell, mirror_unit, mirror_env)
-                            await panel_ops.enable_ha_mirror(shell)
-                        except (
-                            KeyError,
-                            ValueError,
-                            OSError,
-                            asyncssh.Error,
-                            PanelOpError,
-                        ) as err:
-                            _LOGGER.warning("%s: HA mirror repair failed: %s", self.panel, err)
+                    if COMPONENT_HA_MIRROR in selected:
+                        await self._relay_ha_mirror(
+                            shell,
+                            warning_message="%s: HA mirror repair failed: %s",
+                            warning_includes_error=True,
+                        )
                 except (OSError, asyncssh.Error, PanelOpError) as err:
                     # A checked step (mkdir/daemon-reload/systemctl) exited non-zero.
                     # The panel is half-broken; surface it loudly instead of letting
@@ -848,80 +909,36 @@ class PanelManager:
                     # and the watchdog unit disappears even though the code in /var survives.
                     from .components import selected_ids  # lazy: components imports manager
 
-                    if COMPONENT_WIFI_WATCHDOG in selected_ids(self.entry.data):
-                        try:
-                            wd_unit = await self.hass.async_add_executor_job(
-                                (_payload_dir() / "brilliant-wifi-watchdog.service").read_text
-                            )
-                            wd_state = await panel_ops.inspect_wifi_watchdog(shell)
-                            if not wd_state.payload_present:
-                                await panel_ops.deploy_wifi_watchdog(
-                                    shell, str(_payload_dir() / "wifi_watchdog")
-                                )
-                            await panel_ops.ensure_wifi_watchdog_unit(shell, wd_unit)
-                            await panel_ops.enable_wifi_watchdog(shell)
-                        except (OSError, asyncssh.Error, PanelOpError):
-                            _LOGGER.warning(
-                                "%s: watchdog refresh failed; will retry next reconcile",
-                                self.panel,
-                            )
+                    selected = selected_ids(self.entry.data)
+                    if COMPONENT_WIFI_WATCHDOG in selected:
+                        await self._relay_watchdog(
+                            shell,
+                            _WIFI_WATCHDOG_RELAY,
+                            warning_message=(
+                                "%s: watchdog refresh failed; will retry next reconcile"
+                            ),
+                            warning_includes_error=False,
+                        )
                     # Bus watchdog: also re-lay its unit when selected — OTA wipes /etc
                     # and the watchdog unit disappears even though the code in /var survives.
-                    if COMPONENT_BUS_WATCHDOG in selected_ids(self.entry.data):
-                        try:
-                            bus_unit = await self.hass.async_add_executor_job(
-                                (_payload_dir() / "brilliant-bus-watchdog.service").read_text
-                            )
-                            bus_state = await panel_ops.inspect_bus_watchdog(shell)
-                            if not bus_state.payload_present:
-                                await panel_ops.deploy_bus_watchdog(
-                                    shell, str(_payload_dir() / "bus_watchdog")
-                                )
-                            await panel_ops.ensure_bus_watchdog_unit(shell, bus_unit)
-                            await panel_ops.enable_bus_watchdog(shell)
-                        except (OSError, asyncssh.Error, PanelOpError):
-                            _LOGGER.warning(
-                                "%s: bus watchdog refresh failed; will retry next reconcile",
-                                self.panel,
-                            )
+                    if COMPONENT_BUS_WATCHDOG in selected:
+                        await self._relay_watchdog(
+                            shell,
+                            _BUS_WATCHDOG_RELAY,
+                            warning_message=(
+                                "%s: bus watchdog refresh failed; will retry next reconcile"
+                            ),
+                            warning_includes_error=False,
+                        )
                     # HA mirror: refresh code plus live/staged secret env after OTA.
-                    if COMPONENT_HA_MIRROR in selected_ids(self.entry.data):
-                        try:
-                            mirror_unit = await self.hass.async_add_executor_job(
-                                (_payload_dir() / "brilliant-ha-mirror.service").read_text
-                            )
-                            mirror_env = panel_ops.render_ha_mirror_env(
-                                panel=self.panel,
-                                ha_ws_url=self.entry.data[CONF_HA_MIRROR_WS_URL],
-                                ha_token=self.entry.data[CONF_HA_MIRROR_TOKEN],
-                                mirror_label=self.entry.data.get(
-                                    CONF_HA_MIRROR_LABEL, DEFAULT_HA_MIRROR_LABEL
-                                ),
-                                leader_priority=self.entry.data.get(
-                                    CONF_HA_MIRROR_LEADER_PRIORITY,
-                                    DEFAULT_HA_MIRROR_LEADER_PRIORITY,
-                                ),
-                                mqtt_host=self.entry.data[CONF_MQTT_HOST],
-                                mqtt_port=self.entry.data[CONF_MQTT_PORT],
-                                mqtt_username=self.entry.data[CONF_MQTT_USERNAME],
-                                mqtt_password=self.entry.data[CONF_MQTT_PASSWORD],
-                            )
-                            await panel_ops.deploy_ha_mirror(
-                                shell, str(_payload_dir() / "ha_mirror")
-                            )
-                            await panel_ops.ensure_ha_mirror_config(shell, mirror_unit, mirror_env)
-                            await panel_ops.enable_ha_mirror(shell)
-                        except (
-                            KeyError,
-                            ValueError,
-                            OSError,
-                            asyncssh.Error,
-                            PanelOpError,
-                        ):
-                            _LOGGER.warning(
-                                "%s: HA mirror refresh failed; will retry next reconcile",
-                                self.panel,
-                            )
+                    if COMPONENT_HA_MIRROR in selected:
+                        await self._relay_ha_mirror(
+                            shell,
+                            warning_message=(
+                                "%s: HA mirror refresh failed; will retry next reconcile"
+                            ),
+                            warning_includes_error=False,
+                        )
                 finally:
                     await shell.close()
         except (OSError, asyncssh.Error, PanelOpError):
