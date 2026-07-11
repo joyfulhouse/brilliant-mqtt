@@ -9,7 +9,15 @@ rm -rf "$DEST"
 mkdir -p "$DEST/app" "$DEST/vendor"
 cp -R "$ROOT/src/brilliant_mqtt" "$DEST/app/brilliant_mqtt"
 find "$DEST/app" -name __pycache__ -type d -prune -exec rm -rf {} +
+
+# Bundle the HA mirror app into its own payload subtree.
+rm -rf "$DEST/ha_mirror"
+mkdir -p "$DEST/ha_mirror"
+cp -R "$ROOT/src/brilliant_ha_mirror" "$DEST/ha_mirror/brilliant_ha_mirror"
+find "$DEST/ha_mirror" -name __pycache__ -type d -prune -exec rm -rf {} +
+
 cp "$ROOT/deploy/brilliant-mqtt.service" "$DEST/brilliant-mqtt.service"
+cp "$ROOT/deploy/brilliant-ha-mirror.service" "$DEST/brilliant-ha-mirror.service"
 cp "$ROOT/deploy/brilliant-wifi-watchdog.service" "$DEST/brilliant-wifi-watchdog.service"
 cp "$ROOT/deploy/brilliant-bus-watchdog.service" "$DEST/brilliant-bus-watchdog.service"
 

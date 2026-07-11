@@ -28,6 +28,30 @@ Apply a **label** (default `brilliant`) to each Home Assistant entity you want
 on the panels — in Home Assistant: *Settings → entity → Labels*. Only labeled,
 supported entities are mirrored. Change the label name with `MIRROR_LABEL`.
 
+## Enable it (recommended: via the integration)
+
+The Brilliant MQTT integration installs and configures the mirror per panel — no
+manual SSH needed. In each panel's config entry (add or **Reconfigure**), tick
+**HA mirror** and fill in:
+
+| Field | Value |
+|---|---|
+| HA WebSocket URL | e.g. `ws://homeassistant.local:8123/api/websocket` |
+| Long-lived token | a Home Assistant long-lived access token |
+| Leader priority | election rank, **lower wins**, `0` = never lead — give each panel a distinct value |
+| Mirror label | entity label to mirror (default `brilliant`) |
+
+The integration ships the agent, writes `/etc/brilliant-ha-mirror.env` (0600),
+installs the systemd unit, and enables it — reusing the panel's existing broker
+credentials for the leader election. A per-panel **HA mirror** switch turns it on
+and off; a Repair re-installs the payload if it goes missing. The token is stored
+in the config entry like the broker password and is never logged.
+
+> The mirror requires the (always-installed) MQTT bridge on the same panel, which
+> the integration guarantees.
+
+The manual deploy below is the fallback for panels not managed by the integration.
+
 ## Configuration (`/etc/brilliant-ha-mirror.env`, mode 0600)
 
 | Variable | Required | Purpose |

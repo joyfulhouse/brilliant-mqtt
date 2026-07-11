@@ -33,7 +33,12 @@
           "voice_wake_word": "Wake word",
           "voice_ha_host": "Home Assistant host override (optional)",
           "wifi_watchdog": "Enable Wi-Fi watchdog",
-          "bus_watchdog": "Enable Bus watchdog"
+          "bus_watchdog": "Enable Bus watchdog",
+          "ha_mirror": "Enable HA mirror",
+          "ha_mirror_ws_url": "Home Assistant WebSocket URL",
+          "ha_mirror_token": "Home Assistant long-lived access token",
+          "ha_mirror_leader_priority": "HA mirror leader priority",
+          "ha_mirror_label": "HA mirror label"
         },
         "data_description": {
           "name": "A friendly name, e.g. \"Office Bath\". A lowercase id is derived for MQTT topics (\"Office Bath\" → office-bath).",
@@ -42,7 +47,12 @@
           "voice_wake_word": "The on-panel wake word that activates the satellite.",
           "voice_ha_host": "Only needed if the panel cannot resolve your Home Assistant URL's hostname (e.g. a segmented IoT VLAN). Format: hostname=ip, e.g. homeassistant.example=10.0.0.5. Leave blank to use the panel's own DNS.",
           "wifi_watchdog": "Auto-recovers lost Wi-Fi (reconnect → restart networking → reboot the panel as a last resort).",
-          "bus_watchdog": "Installs the on-panel daemon that reboots the panel if the Brilliant bus stays wedged for 30+ minutes."
+          "bus_watchdog": "Installs the on-panel daemon that reboots the panel if the Brilliant bus stays wedged for 30+ minutes.",
+          "ha_mirror": "Expose Home Assistant entities as native controllable devices on this panel.",
+          "ha_mirror_ws_url": "The Home Assistant WebSocket API URL, e.g. ws://homeassistant.local:8123/api/websocket.",
+          "ha_mirror_token": "A Home Assistant long-lived access token used by the on-panel mirror.",
+          "ha_mirror_leader_priority": "0 disables leadership. Among positive values the lowest priority wins leader election.",
+          "ha_mirror_label": "Label used to select the Home Assistant entities mirrored to Brilliant."
         }
       },
       "reconfigure": {
@@ -60,14 +70,24 @@
           "voice_wake_word": "Wake word",
           "voice_ha_host": "Home Assistant host override (optional)",
           "wifi_watchdog": "Enable Wi-Fi watchdog",
-          "bus_watchdog": "Enable Bus watchdog"
+          "bus_watchdog": "Enable Bus watchdog",
+          "ha_mirror": "Enable HA mirror",
+          "ha_mirror_ws_url": "Home Assistant WebSocket URL",
+          "ha_mirror_token": "Home Assistant long-lived access token",
+          "ha_mirror_leader_priority": "HA mirror leader priority",
+          "ha_mirror_label": "HA mirror label"
         },
         "data_description": {
           "voice": "Install a Home Assistant voice satellite on this panel (on-panel wake word + microphone + speaker). Speech-to-text, the conversation agent, and text-to-speech all run in your HA Assist pipeline — nothing voice-specific is configured on the panel.",
           "voice_wake_word": "The on-panel wake word that activates the satellite.",
           "voice_ha_host": "Only needed if the panel cannot resolve your Home Assistant URL's hostname (e.g. a segmented IoT VLAN). Format: hostname=ip, e.g. homeassistant.example=10.0.0.5. Leave blank to use the panel's own DNS.",
           "wifi_watchdog": "Auto-recovers lost Wi-Fi (reconnect → restart networking → reboot the panel as a last resort).",
-          "bus_watchdog": "Installs the on-panel daemon that reboots the panel if the Brilliant bus stays wedged for 30+ minutes."
+          "bus_watchdog": "Installs the on-panel daemon that reboots the panel if the Brilliant bus stays wedged for 30+ minutes.",
+          "ha_mirror": "Expose Home Assistant entities as native controllable devices on this panel.",
+          "ha_mirror_ws_url": "The Home Assistant WebSocket API URL, e.g. ws://homeassistant.local:8123/api/websocket.",
+          "ha_mirror_token": "A Home Assistant long-lived access token used by the on-panel mirror.",
+          "ha_mirror_leader_priority": "0 disables leadership. Among positive values the lowest priority wins leader election.",
+          "ha_mirror_label": "Label used to select the Home Assistant entities mirrored to Brilliant."
         }
       }
     },
@@ -75,6 +95,7 @@
       "reserved_panel": "\"mesh\" is the reserved whole-home pseudo-panel and cannot be managed.",
       "invalid_name": "Enter a name with at least one letter or digit.",
       "invalid_value": "Control characters are not allowed in this field.",
+      "ha_mirror_required": "Enter this value to enable HA mirror.",
       "cannot_connect": "SSH connection failed — check the host and the root password.",
       "cannot_read_config": "The agent is installed but its configuration could not be read. Try Reconfigure, or remove and re-add the panel.",
       "cannot_apply": "Connected, but writing the new settings to the panel failed. Check the agent and try Repair.",
@@ -147,6 +168,9 @@
       },
       "bus_watchdog_enabled": {
         "name": "Bus watchdog"
+      },
+      "ha_mirror": {
+        "name": "HA mirror"
       }
     },
     "update": {
@@ -176,6 +200,9 @@
     },
     "bus_watchdog_failed": {
       "message": "Bus watchdog operation failed: {error}"
+    },
+    "ha_mirror_failed": {
+      "message": "HA mirror operation failed: {error}"
     }
   },
   "issues": {

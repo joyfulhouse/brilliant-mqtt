@@ -7,9 +7,15 @@ import pytest
 from custom_components.brilliant_mqtt import panel_ops
 from custom_components.brilliant_mqtt.const import (
     BUS_WATCHDOG_SERVICE_NAME,
+    HA_MIRROR_SERVICE_NAME,
     PANEL_BUS_WATCHDOG_DIR,
     PANEL_BUS_WATCHDOG_UNIT_FILE,
     PANEL_ENV_FILE,
+    PANEL_HA_MIRROR_APP_DIR,
+    PANEL_HA_MIRROR_ENV_FILE,
+    PANEL_HA_MIRROR_STAGED_DIR,
+    PANEL_HA_MIRROR_UNIT_FILE,
+    PANEL_HA_MIRROR_VAR_DIR,
     PANEL_UNIT_FILE,
     PANEL_VAR_DIR,
     PANEL_VOICE_ENV_FILE,
@@ -555,6 +561,142 @@ async def test_uninstall_voice_sequence_and_paths() -> None:
         f"rm -f {PANEL_VOICE_UNIT_FILE} {PANEL_VOICE_ENV_FILE}",
         f"rm -rf {PANEL_VOICE_VAR_DIR}"
         " /var/brilliant-voice.staging /var/brilliant-voice.staging.tar.gz",
+        "systemctl daemon-reload",
+    ]
+
+
+# ---------------------------------------------------------------------------
+# HA mirror recipes
+# ---------------------------------------------------------------------------
+
+_FULL_HA_MIRROR_INSPECT = RunResult(
+    0,
+    "unit=1\nenabled=1\nactive=1\npayload=1\n",
+    "",
+)
+
+_ABSENT_HA_MIRROR_INSPECT = RunResult(
+    0,
+    "unit=0\nenabled=0\nactive=0\npayload=0\n",
+    "",
+)
+
+
+async def test_inspect_ha_mirror_parses_fully_installed() -> None:
+    shell = await _connected(
+        FakeShell(responses={panel_ops.HA_MIRROR_INSPECT_COMMAND: _FULL_HA_MIRROR_INSPECT})
+    )
+    state = await panel_ops.inspect_ha_mirror(shell)
+    assert state == panel_ops.HaMirrorState(
+        unit_present=True,
+        enabled=True,
+        active=True,
+        payload_present=True,
+    )
+
+
+async def test_inspect_ha_mirror_parses_all_absent() -> None:
+    shell = await _connected(
+        FakeShell(responses={panel_ops.HA_MIRROR_INSPECT_COMMAND: _ABSENT_HA_MIRROR_INSPECT})
+    )
+    state = await panel_ops.inspect_ha_mirror(shell)
+    assert state == panel_ops.HaMirrorState(
+        unit_present=False,
+        enabled=False,
+        active=False,
+        payload_present=False,
+    )
+
+
+def test_ha_mirror_inspect_command_checks_main_entrypoint() -> None:
+    assert (
+        f"{PANEL_HA_MIRROR_APP_DIR}/brilliant_ha_mirror/__main__.py"
+        in panel_ops.HA_MIRROR_INSPECT_COMMAND
+    )
+
+
+def test_render_ha_mirror_env_quotes_complete_contract() -> None:
+    env = panel_ops.render_ha_mirror_env(
+        panel='office"main',
+        ha_ws_url="ws://homeassistant.local:8123/api/websocket",
+        ha_token='secret"token',
+        mirror_label="brilliant",
+        leader_priority=7,
+        mqtt_host="192.168.1.250",
+        mqtt_port=1883,
+        mqtt_username="brilliant",
+        mqtt_password='p#a"ss',
+    )
+    assert env.splitlines() == [
+        'PANEL="office\\"main"',
+        'HA_WS_URL="ws://homeassistant.local:8123/api/websocket"',
+        'HA_TOKEN="secret\\"token"',
+        'MIRROR_LABEL="brilliant"',
+        'LEADER_PRIORITY="7"',
+        'MQTT_HOST="192.168.1.250"',
+        'MQTT_PORT="1883"',
+        'MQTT_USERNAME="brilliant"',
+        'MQTT_PASSWORD="p#a\\"ss"',
+        "LOG_LEVEL=INFO",
+    ]
+
+
+_EXPECTED_HA_MIRROR_SWAP = " && ".join(
+    [
+        "mkdir -p /var/brilliant-ha-mirror",
+        "rm -rf /var/brilliant-ha-mirror/app.bak",
+        "{ [ -e /var/brilliant-ha-mirror/app ] && "
+        "mv /var/brilliant-ha-mirror/app /var/brilliant-ha-mirror/app.bak; true; }",
+        "mv /var/brilliant-ha-mirror/app.staging /var/brilliant-ha-mirror/app",
+        "rm -rf /var/brilliant-ha-mirror/app.bak",
+    ]
+)
+
+
+async def test_deploy_ha_mirror_uploads_tree_then_swaps() -> None:
+    shell = await _connected(FakeShell())
+    await panel_ops.deploy_ha_mirror(shell, "/local/ha_mirror")
+    assert shell.commands[0] == "rm -rf /var/brilliant-ha-mirror/app.staging"
+    assert shell.dir_uploads == [("/local/ha_mirror", "/var/brilliant-ha-mirror/app.staging")]
+    assert _EXPECTED_HA_MIRROR_SWAP in shell.commands
+
+
+async def test_deploy_ha_mirror_failed_upload_does_not_swap() -> None:
+    shell = await _connected(FakeShell(put_dir_error=OSError("transfer aborted")))
+    with pytest.raises(OSError, match="transfer aborted"):
+        await panel_ops.deploy_ha_mirror(shell, "/local/ha_mirror")
+    assert shell.commands == ["rm -rf /var/brilliant-ha-mirror/app.staging"]
+    assert shell.dir_uploads == []
+
+
+async def test_ensure_ha_mirror_config_writes_secret_env_0600() -> None:
+    shell = await _connected(FakeShell())
+    await panel_ops.ensure_ha_mirror_config(shell, "UNIT_CONTENT", "ENV_CONTENT")
+    assert shell.commands[0] == f"mkdir -p {PANEL_HA_MIRROR_STAGED_DIR}"
+    assert shell.commands[-1] == "systemctl daemon-reload"
+    assert [(path, mode) for (path, _data, mode) in shell.uploads] == [
+        (PANEL_HA_MIRROR_UNIT_FILE, 0o644),
+        (PANEL_HA_MIRROR_ENV_FILE, 0o600),
+        (f"{PANEL_HA_MIRROR_STAGED_DIR}/{HA_MIRROR_SERVICE_NAME}.env", 0o600),
+    ]
+    assert shell.uploads[0][1] == b"UNIT_CONTENT"
+    assert shell.uploads[1][1] == b"ENV_CONTENT"
+    assert shell.uploads[2][1] == b"ENV_CONTENT"
+
+
+async def test_enable_ha_mirror_issues_systemctl_enable() -> None:
+    shell = await _connected(FakeShell())
+    await panel_ops.enable_ha_mirror(shell)
+    assert f"systemctl enable --now {HA_MIRROR_SERVICE_NAME}" in shell.commands
+
+
+async def test_uninstall_ha_mirror_sequence_and_paths() -> None:
+    shell = await _connected(FakeShell())
+    await panel_ops.uninstall_ha_mirror(shell)
+    assert shell.commands == [
+        f"systemctl disable --now {HA_MIRROR_SERVICE_NAME} 2>/dev/null || true",
+        f"rm -f {PANEL_HA_MIRROR_UNIT_FILE} {PANEL_HA_MIRROR_ENV_FILE}",
+        f"rm -rf {PANEL_HA_MIRROR_VAR_DIR}",
         "systemctl daemon-reload",
     ]
 

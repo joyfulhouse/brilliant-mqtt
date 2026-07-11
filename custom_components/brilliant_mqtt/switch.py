@@ -12,6 +12,7 @@ from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from . import BrilliantMqttConfigEntry
 from .const import (
     COMPONENT_BUS_WATCHDOG,
+    COMPONENT_HA_MIRROR,
     COMPONENT_VOICE,
     COMPONENT_WIFI_WATCHDOG,
     CONF_COMPONENTS,
@@ -31,7 +32,12 @@ async def async_setup_entry(
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     async_add_entities(
-        [VoiceSatelliteSwitch(entry), WifiWatchdogSwitch(entry), BusWatchdogSwitch(entry)]
+        [
+            VoiceSatelliteSwitch(entry),
+            WifiWatchdogSwitch(entry),
+            BusWatchdogSwitch(entry),
+            HaMirrorSwitch(entry),
+        ]
     )
 
 
@@ -140,5 +146,44 @@ class BusWatchdogSwitch(BrilliantPanelEntity, SwitchEntity):
             raise HomeAssistantError(
                 translation_domain=DOMAIN,
                 translation_key="bus_watchdog_failed",
+                translation_placeholders={"error": str(err)},
+            ) from err
+
+
+class HaMirrorSwitch(BrilliantPanelEntity, SwitchEntity):
+    """Install/remove the on-panel Home Assistant entity mirror."""
+
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_translation_key = "ha_mirror"
+
+    def __init__(self, entry: BrilliantMqttConfigEntry) -> None:
+        super().__init__(entry.runtime_data)
+        self._attr_unique_id = f"{entry.entry_id}_ha_mirror_enabled"
+
+    @property
+    def is_on(self) -> bool:
+        components = self._manager.entry.data.get(CONF_COMPONENTS, {})
+        return bool(components.get(COMPONENT_HA_MIRROR, False))
+
+    async def async_turn_on(self, **kwargs: object) -> None:
+        await self._toggle(True)
+
+    async def async_turn_off(self, **kwargs: object) -> None:
+        await self._toggle(False)
+
+    async def _toggle(self, enabled: bool) -> None:
+        try:
+            if enabled:
+                await self._manager.async_install_component(COMPONENT_HA_MIRROR)
+            else:
+                await self._manager.async_remove_component(COMPONENT_HA_MIRROR)
+        except _HostKeyChanged as err:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN, translation_key="host_key_changed"
+            ) from err
+        except (OSError, asyncssh.Error, PanelOpError) as err:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="ha_mirror_failed",
                 translation_placeholders={"error": str(err)},
             ) from err

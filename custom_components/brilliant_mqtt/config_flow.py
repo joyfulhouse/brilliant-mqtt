@@ -20,13 +20,19 @@ import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry, ConfigFlow, ConfigFlowResult, OptionsFlow
 from homeassistant.const import CONF_NAME
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.selector import TextSelector, TextSelectorConfig, TextSelectorType
 
 from . import _fleet_lock, panel_ops
 from .components import REGISTRY, optional
 from .const import (
     COMPONENT_BRIDGE,
+    COMPONENT_HA_MIRROR,
     COMPONENT_VOICE,
     CONF_COMPONENTS,
+    CONF_HA_MIRROR_LABEL,
+    CONF_HA_MIRROR_LEADER_PRIORITY,
+    CONF_HA_MIRROR_TOKEN,
+    CONF_HA_MIRROR_WS_URL,
     CONF_HOST,
     CONF_MESH_PRIORITY,
     CONF_MQTT_HOST,
@@ -39,6 +45,8 @@ from .const import (
     CONF_VOICE_WAKE_WORD,
     DATA_SSH_HOST_KEY,
     DEFAULT_AUTO_REPAIR,
+    DEFAULT_HA_MIRROR_LABEL,
+    DEFAULT_HA_MIRROR_LEADER_PRIORITY,
     DEFAULT_OFFLINE_GRACE_MINUTES,
     DEFAULT_REPAIR_COOLDOWN_MINUTES,
     DEFAULT_TRUST_HOST_KEY_CHANGES,
@@ -74,6 +82,9 @@ _NO_CONTROL_CHARS = (
     CONF_MQTT_HOST,
     CONF_MQTT_USERNAME,
     CONF_MQTT_PASSWORD,
+    CONF_HA_MIRROR_WS_URL,
+    CONF_HA_MIRROR_TOKEN,
+    CONF_HA_MIRROR_LABEL,
 )
 
 _SLUG_SEPARATORS = re.compile(r"[\s.]+")
@@ -97,6 +108,17 @@ def _has_control_char(value: str) -> bool:
 def _control_char_errors(user_input: dict[str, Any], keys: tuple[str, ...]) -> dict[str, str]:
     """Per-field ``invalid_value`` errors for any *keys* whose value has a control char."""
     return {key: "invalid_value" for key in keys if _has_control_char(user_input[key])}
+
+
+def _ha_mirror_required_errors(user_input: Mapping[str, Any]) -> dict[str, str]:
+    """Required HA mirror sub-fields, enforced only while the component is selected."""
+    if not user_input.get(COMPONENT_HA_MIRROR, False):
+        return {}
+    return {
+        key: "ha_mirror_required"
+        for key in (CONF_HA_MIRROR_WS_URL, CONF_HA_MIRROR_TOKEN)
+        if not str(user_input.get(key, "")).strip()
+    }
 
 
 def _mqtt_schema_fields(source: Mapping[str, Any]) -> dict[Any, Any]:
@@ -146,6 +168,32 @@ def _components_schema_fields(
         )
     ] = vol.In(list(VOICE_WAKE_WORDS))
     fields[vol.Optional(CONF_VOICE_HA_HOST, default=source.get(CONF_VOICE_HA_HOST, ""))] = str
+    # HA mirror sub-config. Defaults keep these lenient when the component is
+    # unchecked while still ensuring every created entry has the keys its installer reads.
+    fields[
+        vol.Required(
+            CONF_HA_MIRROR_WS_URL,
+            default=source.get(CONF_HA_MIRROR_WS_URL, ""),
+        )
+    ] = str
+    fields[
+        vol.Optional(
+            CONF_HA_MIRROR_TOKEN,
+            default=source.get(CONF_HA_MIRROR_TOKEN, ""),
+        )
+    ] = TextSelector(TextSelectorConfig(type=TextSelectorType.PASSWORD))
+    fields[
+        vol.Required(
+            CONF_HA_MIRROR_LEADER_PRIORITY,
+            default=source.get(CONF_HA_MIRROR_LEADER_PRIORITY, DEFAULT_HA_MIRROR_LEADER_PRIORITY),
+        )
+    ] = vol.All(vol.Coerce(int), vol.Range(min=0, max=99))
+    fields[
+        vol.Optional(
+            CONF_HA_MIRROR_LABEL,
+            default=source.get(CONF_HA_MIRROR_LABEL, DEFAULT_HA_MIRROR_LABEL),
+        )
+    ] = str
     return fields
 
 
@@ -380,7 +428,18 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
             # A control char in the HA host flows into render_voice_env → _env_quote, which
             # raises ValueError (NOT caught by the voice except below) → the flow would
             # crash. Reject at the boundary for a friendly per-field message instead.
-            errors.update(_control_char_errors(user_input, (CONF_VOICE_HA_HOST,)))
+            errors.update(
+                _control_char_errors(
+                    user_input,
+                    (
+                        CONF_VOICE_HA_HOST,
+                        CONF_HA_MIRROR_WS_URL,
+                        CONF_HA_MIRROR_TOKEN,
+                        CONF_HA_MIRROR_LABEL,
+                    ),
+                )
+            )
+            errors.update(_ha_mirror_required_errors(user_input))
             if not errors:
                 await self.async_set_unique_id(slug)
                 self._abort_if_unique_id_configured()
@@ -395,6 +454,10 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
                     CONF_COMPONENTS: components,
                     CONF_VOICE_WAKE_WORD: user_input[CONF_VOICE_WAKE_WORD],
                     CONF_VOICE_HA_HOST: user_input[CONF_VOICE_HA_HOST],
+                    CONF_HA_MIRROR_WS_URL: user_input[CONF_HA_MIRROR_WS_URL],
+                    CONF_HA_MIRROR_TOKEN: user_input[CONF_HA_MIRROR_TOKEN],
+                    CONF_HA_MIRROR_LEADER_PRIORITY: user_input[CONF_HA_MIRROR_LEADER_PRIORITY],
+                    CONF_HA_MIRROR_LABEL: user_input[CONF_HA_MIRROR_LABEL],
                 }
                 current_cid: str | None = None
                 try:
@@ -452,6 +515,7 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
             ha_host_val = str(user_input.get(CONF_VOICE_HA_HOST, ""))
             if _has_control_char(ha_host_val):
                 errors[CONF_VOICE_HA_HOST] = "invalid_value"
+            errors.update(_ha_mirror_required_errors(user_input))
             if not errors:
                 user_input = {**user_input, CONF_HOST: user_input[CONF_HOST].strip()}
                 # Same host → verify the rotated password against the STORED pin (key
@@ -519,7 +583,7 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
                             for c in optional():
                                 was: bool = bool(current.get(c.id, False))
                                 now: bool = desired[c.id]
-                                if now and not was:
+                                if now and (c.id == COMPONENT_HA_MIRROR or not was):
                                     async with _panel_session(
                                         self.hass,
                                         user_input[CONF_HOST],
