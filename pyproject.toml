@@ -8,6 +8,7 @@ license = "MIT"
 requires-python = ">=3.10,<3.11"
 dependencies = [
     "aiomqtt>=2.3", # async MQTT (wraps paho-mqtt); vendored to /var on the panel
+    "aiohttp>=3.14.1", # async HTTP/WebSocket client for the HA mirror (brilliant_ha_mirror)
 ]
 
 [dependency-groups]
@@ -43,14 +44,15 @@ strict = true
 # Panel libraries are closed-source on-panel Cython with no type stubs anywhere,
 # so missing-import errors are unavoidable and not a code defect.
 [[tool.mypy.overrides]]
-module = ["lib.*", "thrift_types.*"]
+module = ["lib.*", "thrift_types.*", "peripherals.*", "gflags"]
 ignore_missing_imports = true
 
-# bus.py subclasses the no-stub Cython RPCObserver (resolved as Any), which
-# --strict's disallow_subclassing_any rejects. Relaxing it for this one module is
-# the root-cause config for the closed-source base — not an inline suppression.
+# bus.py subclasses the no-stub Cython RPCObserver, and hosting.py subclasses the
+# no-stub Cython Peripheral (both resolved as Any), which --strict's
+# disallow_subclassing_any rejects. Relaxing it for these modules is the
+# root-cause config for the closed-source base — not an inline suppression.
 [[tool.mypy.overrides]]
-module = ["brilliant_mqtt.bus"]
+module = ["brilliant_mqtt.bus", "brilliant_ha_mirror.hosting"]
 disallow_subclassing_any = false
 
 [build-system]
@@ -58,4 +60,9 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/brilliant_mqtt", "src/brilliant_voice", "src/brilliant_bus_watchdog"]
+packages = [
+    "src/brilliant_mqtt",
+    "src/brilliant_voice",
+    "src/brilliant_bus_watchdog",
+    "src/brilliant_ha_mirror",
+]

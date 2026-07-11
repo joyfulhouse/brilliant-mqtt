@@ -18,6 +18,13 @@ guide and `../INSTALL.md` for prerequisites including MQTT broker setup.
   [../docs/CONFIGURATION.md](../docs/CONFIGURATION.md#wi-fi-watchdog).
 - `brilliant-voice.service` — optional on-panel voice satellite. See
   [../docs/voice.md](../docs/voice.md).
+- `brilliant-ha-mirror.service` — optional **reverse bridge**: reflect selected
+  Home Assistant entities (light, switch, lock, cover/shade, garage) as native,
+  controllable Brilliant panel devices. Runs on every panel but is active only
+  on the elected leader (one panel hosts the mirrors home-wide). Reads its own
+  `/etc/brilliant-ha-mirror.env` (a Home Assistant WebSocket URL + long-lived
+  token, the mirror label, the leader priority, and the broker creds for the
+  election). See [../docs/ha-mirror.md](../docs/ha-mirror.md).
 
 The HA integration installs and enables these per panel automatically. To wire
 one up **manually**: drop the unit in `/etc/systemd/system/`, then
