@@ -44,7 +44,7 @@ strict = true
 # Panel libraries are closed-source on-panel Cython with no type stubs anywhere,
 # so missing-import errors are unavoidable and not a code defect.
 [[tool.mypy.overrides]]
-module = ["lib.*", "thrift_types.*", "peripherals.*"]
+module = ["lib.*", "thrift_types.*", "peripherals.*", "gflags"]
 ignore_missing_imports = true
 
 # bus.py subclasses the no-stub Cython RPCObserver, and hosting.py subclasses the

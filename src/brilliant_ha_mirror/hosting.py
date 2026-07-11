@@ -118,6 +118,24 @@ class RpcPeripheralHost:
         """No global connection; each peripheral host connects on register."""
         return None
 
+    def _point_socket_flag_at_panel(self) -> None:
+        """Set the firmware bus-socket gflag to the configured socket.
+
+        A plain ``python -m brilliant_ha_mirror`` process never parses the
+        ``run_startable`` CLI flags, so ``message_bus_server_socket_path`` would
+        default to ``/tmp/server_socket``. This runs from :meth:`register` after
+        the host module (which defines the flag) has been imported, so every
+        peripheral host connects to the real bus.
+        """
+        import gflags
+
+        flags = gflags.FLAGS
+        try:
+            _ = flags.message_bus_server_socket_path
+        except gflags.UnparsedFlagAccessError:
+            flags([""])
+        flags.message_bus_server_socket_path = self._socket_path
+
     async def register(
         self,
         name: str,
@@ -132,6 +150,9 @@ class RpcPeripheralHost:
             PeripheralHost,
         )
 
+        # The peripheral_host import above defines the bus-socket gflag; point it
+        # at the real panel socket before building the host.
+        self._point_socket_flag_at_panel()
         peripheral_class = _make_peripheral_class(name, spec, on_command)
         startable_id = _slug(name)
         config = PeripheralConfig(startable_id, peripheral_class)
@@ -150,8 +171,20 @@ class RpcPeripheralHost:
         instance = _INSTANCES.get(name)
         if instance is None:
             return
+        from peripherals.lib.peripheral_service.peripheral import Peripheral
+
+        # Reflect HA state into the reported value via the framework's internal
+        # updater. The public set_value() routes through the external-set handler
+        # (it fires the command push_func and rejects unconfirmed values), which
+        # would create a HA->panel->HA feedback loop; _set_value_internal updates
+        # the reported value + notifies subscribers WITHOUT invoking push_func
+        # (verified on panel). Accessed via __dict__ (like the borrowed delete);
+        # it is a Cython coroutine, so its result is awaited.
+        update = Peripheral.__dict__["_set_value_internal"]
         for var, raw in values.items():
-            instance.set_value(var, _typed_value(var, raw), notify=True)
+            result = update(instance, var, _typed_value(var, raw), notify=True)
+            if hasattr(result, "__await__"):
+                await result
 
     async def delete(self, name: str) -> None:
         host = self._hosts.pop(name, None)
