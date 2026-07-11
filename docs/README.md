@@ -26,6 +26,9 @@ prerequisites checklist and deploy choice, and links these focused guides:
 ## Reference
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — how the bridge is structured and why.
+- [brilliant-panel/README.md](brilliant-panel/README.md) — reverse-engineered
+  panel software, UI/UX information architecture, cloud boundaries, complete
+  peripheral type catalog, HA support matrix, and validation runbook.
 - [DEVELOPMENT.md](DEVELOPMENT.md) — development environment, quality gates,
   testing rules.
 - [reference/message-bus-api.md](reference/message-bus-api.md) — the

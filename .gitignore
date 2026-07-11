@@ -43,3 +43,8 @@ uv.lock.bak
 
 # Internal working artifacts (operator-local; not part of the public tree)
 docs/claude/
+
+# Proprietary Brilliant panel corpus (raw /data and /var captures, extracted
+# binaries, decompiler projects, and analysis scratch space). Only sanitized
+# manifests and documentation belong in git.
+artifacts/brilliant-panel/
