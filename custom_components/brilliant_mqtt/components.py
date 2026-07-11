@@ -18,9 +18,14 @@ from . import panel_ops
 from .const import (
     COMPONENT_BRIDGE,
     COMPONENT_BUS_WATCHDOG,
+    COMPONENT_HA_MIRROR,
     COMPONENT_VOICE,
     COMPONENT_WIFI_WATCHDOG,
     CONF_COMPONENTS,
+    CONF_HA_MIRROR_LABEL,
+    CONF_HA_MIRROR_LEADER_PRIORITY,
+    CONF_HA_MIRROR_TOKEN,
+    CONF_HA_MIRROR_WS_URL,
     CONF_MESH_PRIORITY,
     CONF_MQTT_HOST,
     CONF_MQTT_PASSWORD,
@@ -29,6 +34,8 @@ from .const import (
     CONF_PANEL,
     CONF_VOICE_HA_HOST,
     CONF_VOICE_WAKE_WORD,
+    DEFAULT_HA_MIRROR_LABEL,
+    DEFAULT_HA_MIRROR_LEADER_PRIORITY,
     DEFAULT_VOICE_WAKE_WORD,
     VOICE_PAYLOAD_VERSION,
     panel_device_name,
@@ -116,6 +123,33 @@ async def _bus_install(hass: HomeAssistant, shell: PanelShell, data: Mapping[str
     await panel_ops.enable_bus_watchdog(shell)
 
 
+async def _hamirror_present(shell: PanelShell) -> bool:
+    return (await panel_ops.inspect_ha_mirror(shell)).payload_present
+
+
+async def _hamirror_install(
+    hass: HomeAssistant, shell: PanelShell, data: Mapping[str, Any]
+) -> None:
+    payload_dir = _mgr._payload_dir()
+    unit = await hass.async_add_executor_job(
+        (payload_dir / "brilliant-ha-mirror.service").read_text
+    )
+    env = panel_ops.render_ha_mirror_env(
+        panel=data[CONF_PANEL],
+        ha_ws_url=data[CONF_HA_MIRROR_WS_URL],
+        ha_token=data[CONF_HA_MIRROR_TOKEN],
+        mirror_label=data.get(CONF_HA_MIRROR_LABEL, DEFAULT_HA_MIRROR_LABEL),
+        leader_priority=data.get(CONF_HA_MIRROR_LEADER_PRIORITY, DEFAULT_HA_MIRROR_LEADER_PRIORITY),
+        mqtt_host=data[CONF_MQTT_HOST],
+        mqtt_port=data[CONF_MQTT_PORT],
+        mqtt_username=data[CONF_MQTT_USERNAME],
+        mqtt_password=data[CONF_MQTT_PASSWORD],
+    )
+    await panel_ops.deploy_ha_mirror(shell, str(payload_dir / "ha_mirror"))
+    await panel_ops.ensure_ha_mirror_config(shell, unit, env)
+    await panel_ops.enable_ha_mirror(shell)
+
+
 REGISTRY: dict[str, Component] = {
     COMPONENT_BRIDGE: Component(
         id=COMPONENT_BRIDGE,
@@ -152,6 +186,15 @@ REGISTRY: dict[str, Component] = {
         present=_bus_present,
         install=_bus_install,
         remove=panel_ops.uninstall_bus_watchdog,
+    ),
+    COMPONENT_HA_MIRROR: Component(
+        id=COMPONENT_HA_MIRROR,
+        label="HA mirror",
+        locked=False,
+        default_enabled=False,
+        present=_hamirror_present,
+        install=_hamirror_install,
+        remove=panel_ops.uninstall_ha_mirror,
     ),
 }
 

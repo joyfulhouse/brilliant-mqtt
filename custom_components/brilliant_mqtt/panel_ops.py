@@ -12,9 +12,15 @@ from dataclasses import dataclass
 
 from .const import (
     BUS_WATCHDOG_SERVICE_NAME,
+    HA_MIRROR_SERVICE_NAME,
     PANEL_BUS_WATCHDOG_DIR,
     PANEL_BUS_WATCHDOG_UNIT_FILE,
     PANEL_ENV_FILE,
+    PANEL_HA_MIRROR_APP_DIR,
+    PANEL_HA_MIRROR_ENV_FILE,
+    PANEL_HA_MIRROR_STAGED_DIR,
+    PANEL_HA_MIRROR_UNIT_FILE,
+    PANEL_HA_MIRROR_VAR_DIR,
     PANEL_STAGED_DIR,
     PANEL_UNIT_FILE,
     PANEL_VAR_DIR,
@@ -39,6 +45,9 @@ _STAGED_ENV = f"{PANEL_STAGED_DIR}/{SERVICE_NAME}.env"
 _VOICE_STAGING_DIR = f"{PANEL_VOICE_VAR_DIR}.staging"
 _VOICE_STAGING_TARBALL = f"{PANEL_VOICE_VAR_DIR}.staging.tar.gz"
 _VOICE_STAGED_ENV = f"{PANEL_VOICE_STAGED_DIR}/{VOICE_SERVICE_NAME}.env"
+
+_HA_MIRROR_STAGING_DIR = f"{PANEL_HA_MIRROR_APP_DIR}.staging"
+_HA_MIRROR_STAGED_ENV = f"{PANEL_HA_MIRROR_STAGED_DIR}/{HA_MIRROR_SERVICE_NAME}.env"
 
 
 class PanelOpError(RuntimeError):
@@ -429,6 +438,118 @@ async def uninstall_voice(shell: PanelShell) -> None:
     await _checked(
         shell, f"rm -rf {PANEL_VOICE_VAR_DIR} {_VOICE_STAGING_DIR} {_VOICE_STAGING_TARBALL}"
     )
+    await _checked(shell, "systemctl daemon-reload")
+
+
+# ---------------------------------------------------------------------------
+# HA mirror recipes
+# ---------------------------------------------------------------------------
+
+HA_MIRROR_INSPECT_COMMAND = (
+    f"test -f {PANEL_HA_MIRROR_UNIT_FILE} && echo unit=1 || echo unit=0; "
+    f"systemctl is-enabled {HA_MIRROR_SERVICE_NAME} >/dev/null 2>&1"
+    f" && echo enabled=1 || echo enabled=0; "
+    f"systemctl is-active {HA_MIRROR_SERVICE_NAME} >/dev/null 2>&1"
+    f" && echo active=1 || echo active=0; "
+    f"test -f {PANEL_HA_MIRROR_APP_DIR}/brilliant_ha_mirror/__main__.py "
+    f"&& echo payload=1 || echo payload=0"
+)
+
+
+@dataclass(frozen=True)
+class HaMirrorState:
+    """Parsed result of one inspect_ha_mirror() probe."""
+
+    unit_present: bool
+    enabled: bool
+    active: bool
+    payload_present: bool
+
+
+async def inspect_ha_mirror(shell: PanelShell) -> HaMirrorState:
+    """Probe HA mirror install/health state in one shell round-trip."""
+    result = await shell.run(HA_MIRROR_INSPECT_COMMAND)
+    flags: dict[str, bool] = {}
+    for line in result.stdout.splitlines():
+        key, sep, value = line.partition("=")
+        if sep and key in ("unit", "enabled", "active", "payload"):
+            flags[key] = value == "1"
+    return HaMirrorState(
+        unit_present=flags.get("unit", False),
+        enabled=flags.get("enabled", False),
+        active=flags.get("active", False),
+        payload_present=flags.get("payload", False),
+    )
+
+
+def render_ha_mirror_env(
+    *,
+    panel: str,
+    ha_ws_url: str,
+    ha_token: str,
+    mirror_label: str,
+    leader_priority: int,
+    mqtt_host: str,
+    mqtt_port: int,
+    mqtt_username: str,
+    mqtt_password: str,
+    log_level: str = "INFO",
+) -> str:
+    """Render the HA mirror env file, including secret and leader-election settings."""
+    return (
+        f"PANEL={_env_quote(panel)}\n"
+        f"HA_WS_URL={_env_quote(ha_ws_url)}\n"
+        f"HA_TOKEN={_env_quote(ha_token)}\n"
+        f"MIRROR_LABEL={_env_quote(mirror_label)}\n"
+        f"LEADER_PRIORITY={_env_quote(str(leader_priority))}\n"
+        f"MQTT_HOST={_env_quote(mqtt_host)}\n"
+        f"MQTT_PORT={_env_quote(str(mqtt_port))}\n"
+        f"MQTT_USERNAME={_env_quote(mqtt_username)}\n"
+        f"MQTT_PASSWORD={_env_quote(mqtt_password)}\n"
+        f"LOG_LEVEL={_env_quote(log_level)}\n"
+    )
+
+
+async def deploy_ha_mirror(shell: PanelShell, local_dir: str) -> None:
+    """Upload local_dir (contains brilliant_ha_mirror/) and swap its app into place."""
+    await shell.run(f"rm -rf {_HA_MIRROR_STAGING_DIR}")
+    await shell.put_dir(local_dir, _HA_MIRROR_STAGING_DIR)
+    await _checked(shell, _ha_mirror_swap_command())
+
+
+def _ha_mirror_swap_command() -> str:
+    """Move-aside swap for the HA mirror app directory."""
+    return " && ".join(
+        [
+            f"mkdir -p {PANEL_HA_MIRROR_VAR_DIR}",
+            f"rm -rf {PANEL_HA_MIRROR_APP_DIR}.bak",
+            f"{{ [ -e {PANEL_HA_MIRROR_APP_DIR} ] && "
+            f"mv {PANEL_HA_MIRROR_APP_DIR} {PANEL_HA_MIRROR_APP_DIR}.bak; true; }}",
+            f"mv {_HA_MIRROR_STAGING_DIR} {PANEL_HA_MIRROR_APP_DIR}",
+            f"rm -rf {PANEL_HA_MIRROR_APP_DIR}.bak",
+        ]
+    )
+
+
+async def ensure_ha_mirror_config(shell: PanelShell, unit_content: str, env_content: str) -> None:
+    """Write the HA mirror unit and live/staged secret env, then reload systemd."""
+    await _checked(shell, f"mkdir -p {PANEL_HA_MIRROR_STAGED_DIR}")
+    await shell.put_bytes(unit_content.encode(), PANEL_HA_MIRROR_UNIT_FILE, 0o644)
+    env_bytes = env_content.encode()
+    await shell.put_bytes(env_bytes, PANEL_HA_MIRROR_ENV_FILE, 0o600)
+    await shell.put_bytes(env_bytes, _HA_MIRROR_STAGED_ENV, 0o600)
+    await _checked(shell, "systemctl daemon-reload")
+
+
+async def enable_ha_mirror(shell: PanelShell) -> None:
+    await _checked(shell, f"systemctl enable --now {HA_MIRROR_SERVICE_NAME}")
+
+
+async def uninstall_ha_mirror(shell: PanelShell) -> None:
+    """Stop + disable + remove everything the HA mirror feature owns on the panel."""
+    await shell.run(f"systemctl disable --now {HA_MIRROR_SERVICE_NAME} 2>/dev/null || true")
+    await _checked(shell, f"rm -f {PANEL_HA_MIRROR_UNIT_FILE} {PANEL_HA_MIRROR_ENV_FILE}")
+    await _checked(shell, f"rm -rf {PANEL_HA_MIRROR_VAR_DIR}")
     await _checked(shell, "systemctl daemon-reload")
 
 

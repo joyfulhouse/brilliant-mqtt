@@ -29,6 +29,13 @@ CONF_MQTT_PASSWORD = "mqtt_password"
 CONF_VOICE_ENABLED = "voice_enabled"
 CONF_VOICE_WAKE_WORD = "voice_wake_word"
 CONF_VOICE_HA_HOST = "voice_ha_host"
+# HA mirror feature keys.
+CONF_HA_MIRROR_WS_URL = "ha_mirror_ws_url"
+CONF_HA_MIRROR_TOKEN = "ha_mirror_token"
+CONF_HA_MIRROR_LEADER_PRIORITY = "ha_mirror_leader_priority"
+CONF_HA_MIRROR_LABEL = "ha_mirror_label"
+DEFAULT_HA_MIRROR_LABEL = "brilliant"
+DEFAULT_HA_MIRROR_LEADER_PRIORITY = 0
 
 # Per-panel component selection (see docs/ha-integration.md — components/switches).
 CONF_COMPONENTS = "components"  # entry data: {component_id: bool}
@@ -36,6 +43,7 @@ COMPONENT_BRIDGE = "bridge"
 COMPONENT_VOICE = "voice"
 COMPONENT_WIFI_WATCHDOG = "wifi_watchdog"
 COMPONENT_BUS_WATCHDOG = "bus_watchdog"
+COMPONENT_HA_MIRROR = "ha_mirror"
 
 # Internally managed config-entry state (never shown in a config-flow form).
 DATA_SSH_HOST_KEY = "ssh_host_key"  # TOFU-pinned on first successful connect
@@ -123,6 +131,14 @@ PANEL_VOICE_VERSION_FILE = f"{PANEL_VOICE_VAR_DIR}/VOICE_VERSION"
 PANEL_VOICE_ENV_FILE = "/etc/brilliant-voice.env"
 PANEL_VOICE_UNIT_FILE = "/etc/systemd/system/brilliant-voice.service"
 VOICE_SERVICE_NAME = "brilliant-voice"
+
+# On-panel HA mirror paths.
+PANEL_HA_MIRROR_VAR_DIR = "/var/brilliant-ha-mirror"
+PANEL_HA_MIRROR_APP_DIR = f"{PANEL_HA_MIRROR_VAR_DIR}/app"
+PANEL_HA_MIRROR_STAGED_DIR = f"{PANEL_HA_MIRROR_VAR_DIR}/system"
+PANEL_HA_MIRROR_ENV_FILE = "/etc/brilliant-ha-mirror.env"
+PANEL_HA_MIRROR_UNIT_FILE = "/etc/systemd/system/brilliant-ha-mirror.service"
+HA_MIRROR_SERVICE_NAME = "brilliant-ha-mirror"
 
 # On-panel Wi-Fi watchdog paths (stdlib script tree under the OTA-proof /var bridge dir).
 PANEL_WIFI_WATCHDOG_DIR = f"{PANEL_VAR_DIR}/wifi_watchdog"
