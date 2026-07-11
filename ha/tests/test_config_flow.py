@@ -11,12 +11,14 @@ import pytest
 import voluptuous as vol
 from homeassistant.const import CONF_NAME
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.selector import TextSelector, TextSelectorType
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.brilliant_mqtt import config_flow, panel_ops
 from custom_components.brilliant_mqtt.config_flow import _PanelProbe, _slugify, _WrongPanelError
 from custom_components.brilliant_mqtt.const import (
     COMPONENT_BRIDGE,
+    COMPONENT_BUS_WATCHDOG,
     COMPONENT_HA_MIRROR,
     COMPONENT_VOICE,
     COMPONENT_WIFI_WATCHDOG,
@@ -861,6 +863,51 @@ async def test_install_step_collects_ha_mirror_config_and_installs(
     assert patch_installs.called(COMPONENT_HA_MIRROR)
 
 
+@pytest.mark.parametrize(
+    "blank_field",
+    [CONF_HA_MIRROR_WS_URL, CONF_HA_MIRROR_TOKEN],
+)
+async def test_install_step_requires_ha_mirror_url_and_token(
+    hass: HomeAssistant,
+    not_installed_panel: None,
+    patch_installs: Any,
+    blank_field: str,
+) -> None:
+    """A selected HA mirror cannot create an entry with either required field blank."""
+    result = await _drive_flow_to_script(hass)
+    user_input = {
+        **SCRIPT_INPUT,
+        CONF_NAME: "Office",
+        COMPONENT_HA_MIRROR: True,
+        CONF_HA_MIRROR_WS_URL: "ws://homeassistant.local:8123/api/websocket",
+        CONF_HA_MIRROR_TOKEN: "long-lived-token",
+    }
+    user_input[blank_field] = ""
+
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], user_input)
+
+    assert result["type"] == "form" and result["step_id"] == "script"
+    assert result["errors"] == {blank_field: "ha_mirror_required"}
+    assert not hass.config_entries.async_entries(DOMAIN)
+    assert not patch_installs.called(COMPONENT_HA_MIRROR)
+
+
+async def test_ha_mirror_token_uses_password_selector(
+    hass: HomeAssistant,
+    not_installed_panel: None,
+) -> None:
+    result = await _drive_flow_to_script(hass)
+    schema = result["data_schema"]
+    assert schema is not None
+    token_selector = next(
+        validator
+        for marker, validator in schema.schema.items()
+        if str(marker) == CONF_HA_MIRROR_TOKEN
+    )
+    assert isinstance(token_selector, TextSelector)
+    assert token_selector.config["type"] == TextSelectorType.PASSWORD
+
+
 @pytest.mark.parametrize("priority", [-1, 100])
 async def test_ha_mirror_leader_priority_rejects_out_of_range_values(
     hass: HomeAssistant, not_installed_panel: None, priority: int
@@ -922,6 +969,7 @@ def reconfigure_input(
     *,
     voice: bool | None = None,
     wifi_watchdog: bool | None = None,
+    bus_watchdog: bool | None = None,
     ha_mirror: bool | None = None,
 ) -> dict[str, Any]:
     """Build a full reconfigure user_input dict from entry data.
@@ -933,6 +981,7 @@ def reconfigure_input(
     comps: dict[str, bool] = dict(data.get(CONF_COMPONENTS) or {})
     current_voice = bool(comps.get(COMPONENT_VOICE, False))
     current_wd = bool(comps.get(COMPONENT_WIFI_WATCHDOG, False))
+    current_bus_wd = bool(comps.get(COMPONENT_BUS_WATCHDOG, False))
     current_ha_mirror = bool(comps.get(COMPONENT_HA_MIRROR, False))
     return {
         CONF_HOST: data[CONF_HOST],
@@ -944,6 +993,7 @@ def reconfigure_input(
         CONF_MESH_PRIORITY: data.get(CONF_MESH_PRIORITY, 0),
         COMPONENT_VOICE: voice if voice is not None else current_voice,
         COMPONENT_WIFI_WATCHDOG: wifi_watchdog if wifi_watchdog is not None else current_wd,
+        COMPONENT_BUS_WATCHDOG: (bus_watchdog if bus_watchdog is not None else current_bus_wd),
         COMPONENT_HA_MIRROR: ha_mirror if ha_mirror is not None else current_ha_mirror,
         CONF_VOICE_WAKE_WORD: data.get(CONF_VOICE_WAKE_WORD, "okay_nabu"),
         CONF_VOICE_HA_HOST: data.get(CONF_VOICE_HA_HOST, ""),
@@ -1027,7 +1077,13 @@ async def test_reconfigure_updates_ha_mirror_config(
     entry = _full_entry(
         hass,
         **{
-            CONF_COMPONENTS: {COMPONENT_BRIDGE: True, COMPONENT_HA_MIRROR: True},
+            CONF_COMPONENTS: {
+                COMPONENT_BRIDGE: True,
+                COMPONENT_VOICE: True,
+                COMPONENT_WIFI_WATCHDOG: True,
+                COMPONENT_BUS_WATCHDOG: True,
+                COMPONENT_HA_MIRROR: True,
+            },
             CONF_HA_MIRROR_WS_URL: "ws://old-ha:8123/api/websocket",
             CONF_HA_MIRROR_TOKEN: "old-secret",
             CONF_HA_MIRROR_LEADER_PRIORITY: 2,
@@ -1049,8 +1105,38 @@ async def test_reconfigure_updates_ha_mirror_config(
     assert entry.data[CONF_HA_MIRROR_TOKEN] == "new-secret"
     assert entry.data[CONF_HA_MIRROR_LEADER_PRIORITY] == 9
     assert entry.data[CONF_HA_MIRROR_LABEL] == "upstairs"
-    assert not patch_installs.called(COMPONENT_HA_MIRROR)
+    assert patch_installs.called(COMPONENT_HA_MIRROR)
     assert not patch_installs.removed(COMPONENT_HA_MIRROR)
+    assert not patch_installs.called(COMPONENT_VOICE)
+    assert not patch_installs.called(COMPONENT_WIFI_WATCHDOG)
+    assert not patch_installs.called(COMPONENT_BUS_WATCHDOG)
+
+
+@pytest.mark.parametrize(
+    "blank_field",
+    [CONF_HA_MIRROR_WS_URL, CONF_HA_MIRROR_TOKEN],
+)
+async def test_reconfigure_requires_selected_ha_mirror_url_and_token(
+    hass: HomeAssistant,
+    blank_field: str,
+) -> None:
+    entry = _full_entry(
+        hass,
+        **{
+            CONF_COMPONENTS: {COMPONENT_BRIDGE: True, COMPONENT_HA_MIRROR: True},
+            CONF_HA_MIRROR_WS_URL: "ws://homeassistant.local:8123/api/websocket",
+            CONF_HA_MIRROR_TOKEN: "long-lived-token",
+        },
+    )
+    result = await start_reconfigure(hass, entry)
+    user_input = {**reconfigure_input(entry), blank_field: ""}
+
+    with patch(APPLY) as apply:
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], user_input)
+
+    assert result["type"] == "form" and result["step_id"] == "reconfigure"
+    assert result["errors"] == {blank_field: "ha_mirror_required"}
+    apply.assert_not_called()
 
 
 @pytest.mark.asyncio

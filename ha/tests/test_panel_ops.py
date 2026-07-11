@@ -637,7 +637,7 @@ def test_render_ha_mirror_env_quotes_complete_contract() -> None:
         'MQTT_PORT="1883"',
         'MQTT_USERNAME="brilliant"',
         'MQTT_PASSWORD="p#a\\"ss"',
-        'LOG_LEVEL="INFO"',
+        "LOG_LEVEL=INFO",
     ]
 
 

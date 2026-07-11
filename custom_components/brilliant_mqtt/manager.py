@@ -488,7 +488,7 @@ class PanelManager:
                                 (_payload_dir() / "brilliant-ha-mirror.service").read_text
                             )
                             mirror_env = panel_ops.render_ha_mirror_env(
-                                panel=self.entry.data[CONF_PANEL],
+                                panel=self.panel,
                                 ha_ws_url=self.entry.data[CONF_HA_MIRROR_WS_URL],
                                 ha_token=self.entry.data[CONF_HA_MIRROR_TOKEN],
                                 mirror_label=self.entry.data.get(
@@ -891,7 +891,7 @@ class PanelManager:
                                 (_payload_dir() / "brilliant-ha-mirror.service").read_text
                             )
                             mirror_env = panel_ops.render_ha_mirror_env(
-                                panel=self.entry.data[CONF_PANEL],
+                                panel=self.panel,
                                 ha_ws_url=self.entry.data[CONF_HA_MIRROR_WS_URL],
                                 ha_token=self.entry.data[CONF_HA_MIRROR_TOKEN],
                                 mirror_label=self.entry.data.get(

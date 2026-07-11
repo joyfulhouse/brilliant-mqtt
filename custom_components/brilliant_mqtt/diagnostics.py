@@ -8,9 +8,9 @@ from homeassistant.components.diagnostics import async_redact_data
 from homeassistant.core import HomeAssistant
 
 from . import BrilliantMqttConfigEntry
-from .const import CONF_MQTT_PASSWORD, CONF_ROOT_PASSWORD
+from .const import CONF_HA_MIRROR_TOKEN, CONF_MQTT_PASSWORD, CONF_ROOT_PASSWORD
 
-_TO_REDACT = {CONF_ROOT_PASSWORD, CONF_MQTT_PASSWORD}
+_TO_REDACT = {CONF_ROOT_PASSWORD, CONF_MQTT_PASSWORD, CONF_HA_MIRROR_TOKEN}
 
 
 async def async_get_config_entry_diagnostics(

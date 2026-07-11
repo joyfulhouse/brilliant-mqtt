@@ -95,6 +95,7 @@
       "reserved_panel": "\"mesh\" is the reserved whole-home pseudo-panel and cannot be managed.",
       "invalid_name": "Enter a name with at least one letter or digit.",
       "invalid_value": "Control characters are not allowed in this field.",
+      "ha_mirror_required": "Enter this value to enable HA mirror.",
       "cannot_connect": "SSH connection failed — check the host and the root password.",
       "cannot_read_config": "The agent is installed but its configuration could not be read. Try Reconfigure, or remove and re-add the panel.",
       "cannot_apply": "Connected, but writing the new settings to the panel failed. Check the agent and try Repair.",

@@ -29,6 +29,7 @@ from custom_components.brilliant_mqtt.const import (
     CONF_HA_MIRROR_LEADER_PRIORITY,
     CONF_HA_MIRROR_TOKEN,
     CONF_HA_MIRROR_WS_URL,
+    CONF_PANEL,
     CONF_VOICE_ENABLED,
     CONF_VOICE_WAKE_WORD,
     DATA_SSH_HOST_KEY,
@@ -1733,11 +1734,18 @@ async def test_repair_relays_ha_mirror_when_selected(
         entry.add_to_hass(hass)
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
+        hass.config_entries.async_update_entry(
+            entry, data={**entry.data, CONF_PANEL: "entry-data-changed-after-manager-init"}
+        )
         await entry.runtime_data.async_repair(trigger="button")
         await hass.async_block_till_done()
 
     assert any("ha_mirror" in local for (local, _remote) in shell.dir_uploads)
     assert any(p == "/etc/brilliant-ha-mirror.env" for (p, _d, _m) in shell.uploads)
+    mirror_env = next(
+        data for (path, data, _mode) in shell.uploads if path == "/etc/brilliant-ha-mirror.env"
+    )
+    assert b'PANEL="office"' in mirror_env
     assert "systemctl enable --now brilliant-ha-mirror" in shell.commands
     assert await hass.config_entries.async_unload(entry.entry_id)
 
@@ -1814,6 +1822,9 @@ async def test_refresh_staged_copies_relays_ha_mirror_when_selected(
         entry.add_to_hass(hass)
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
+        hass.config_entries.async_update_entry(
+            entry, data={**entry.data, CONF_PANEL: "entry-data-changed-after-manager-init"}
+        )
         async_fire_mqtt_message(
             hass, "brilliant/office/bridge", '{"agent_version": "0.2.0", "panel_firmware": "v1"}'
         )
@@ -1825,6 +1836,10 @@ async def test_refresh_staged_copies_relays_ha_mirror_when_selected(
 
     assert any("ha_mirror" in local for (local, _remote) in shell.dir_uploads)
     assert any(p == "/etc/brilliant-ha-mirror.env" for (p, _d, _m) in shell.uploads)
+    mirror_env = next(
+        data for (path, data, _mode) in shell.uploads if path == "/etc/brilliant-ha-mirror.env"
+    )
+    assert b'PANEL="office"' in mirror_env
     assert "systemctl enable --now brilliant-ha-mirror" in shell.commands
     assert await hass.config_entries.async_unload(entry.entry_id)
 

@@ -1,6 +1,7 @@
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+import pytest
 from homeassistant.core import HomeAssistant
 
 from custom_components.brilliant_mqtt import components as comp
@@ -124,7 +125,7 @@ async def test_ha_mirror_install_drives_deploy_config_and_enable(
         'MQTT_PORT="1883"\n'
         'MQTT_USERNAME="brilliant"\n'
         'MQTT_PASSWORD="mqtt-secret"\n'
-        'LOG_LEVEL="INFO"\n'
+        "LOG_LEVEL=INFO\n"
     )
 
     with (
@@ -137,3 +138,39 @@ async def test_ha_mirror_install_drives_deploy_config_and_enable(
     deploy.assert_awaited_once_with(shell, str(payload_dir / "ha_mirror"))
     ensure.assert_awaited_once_with(shell, "MIRROR_UNIT", expected_env)
     enable.assert_awaited_once_with(shell)
+
+
+@pytest.mark.parametrize(
+    "mirror_config",
+    [
+        {},
+        {CONF_HA_MIRROR_WS_URL: "", CONF_HA_MIRROR_TOKEN: ""},
+        {
+            CONF_HA_MIRROR_WS_URL: "ws://homeassistant.local:8123/api/websocket",
+            CONF_HA_MIRROR_TOKEN: "",
+        },
+        {CONF_HA_MIRROR_WS_URL: "", CONF_HA_MIRROR_TOKEN: "long-lived-token"},
+    ],
+)
+async def test_ha_mirror_install_rejects_missing_or_blank_credentials(
+    hass: HomeAssistant,
+    payload_dir: Path,
+    mirror_config: dict[str, str],
+) -> None:
+    (payload_dir / "brilliant-ha-mirror.service").write_text("MIRROR_UNIT")
+    shell = FakeShell()
+    await shell.connect()
+    data = {
+        CONF_PANEL: "office",
+        CONF_MQTT_HOST: "192.168.1.250",
+        CONF_MQTT_PORT: 1883,
+        CONF_MQTT_USERNAME: "brilliant",
+        CONF_MQTT_PASSWORD: "mqtt-secret",
+        **mirror_config,
+    }
+
+    with pytest.raises(
+        panel_ops.PanelOpError,
+        match="HA mirror needs a Home Assistant WebSocket URL and long-lived token",
+    ):
+        await comp._hamirror_install(hass, shell, data)

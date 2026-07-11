@@ -493,7 +493,6 @@ def render_ha_mirror_env(
     mqtt_port: int,
     mqtt_username: str,
     mqtt_password: str,
-    log_level: str = "INFO",
 ) -> str:
     """Render the HA mirror env file, including secret and leader-election settings."""
     return (
@@ -506,7 +505,7 @@ def render_ha_mirror_env(
         f"MQTT_PORT={_env_quote(str(mqtt_port))}\n"
         f"MQTT_USERNAME={_env_quote(mqtt_username)}\n"
         f"MQTT_PASSWORD={_env_quote(mqtt_password)}\n"
-        f"LOG_LEVEL={_env_quote(log_level)}\n"
+        "LOG_LEVEL=INFO\n"
     )
 
 

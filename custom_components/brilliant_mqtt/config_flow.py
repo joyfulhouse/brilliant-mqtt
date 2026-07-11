@@ -20,11 +20,13 @@ import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry, ConfigFlow, ConfigFlowResult, OptionsFlow
 from homeassistant.const import CONF_NAME
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.selector import TextSelector, TextSelectorConfig, TextSelectorType
 
 from . import _fleet_lock, panel_ops
 from .components import REGISTRY, optional
 from .const import (
     COMPONENT_BRIDGE,
+    COMPONENT_HA_MIRROR,
     COMPONENT_VOICE,
     CONF_COMPONENTS,
     CONF_HA_MIRROR_LABEL,
@@ -108,6 +110,17 @@ def _control_char_errors(user_input: dict[str, Any], keys: tuple[str, ...]) -> d
     return {key: "invalid_value" for key in keys if _has_control_char(user_input[key])}
 
 
+def _ha_mirror_required_errors(user_input: Mapping[str, Any]) -> dict[str, str]:
+    """Required HA mirror sub-fields, enforced only while the component is selected."""
+    if not user_input.get(COMPONENT_HA_MIRROR, False):
+        return {}
+    return {
+        key: "ha_mirror_required"
+        for key in (CONF_HA_MIRROR_WS_URL, CONF_HA_MIRROR_TOKEN)
+        if not str(user_input.get(key, "")).strip()
+    }
+
+
 def _mqtt_schema_fields(source: Mapping[str, Any]) -> dict[Any, Any]:
     """The four broker fields shared by the add-broker and reconfigure steps.
 
@@ -168,7 +181,7 @@ def _components_schema_fields(
             CONF_HA_MIRROR_TOKEN,
             default=source.get(CONF_HA_MIRROR_TOKEN, ""),
         )
-    ] = str
+    ] = TextSelector(TextSelectorConfig(type=TextSelectorType.PASSWORD))
     fields[
         vol.Required(
             CONF_HA_MIRROR_LEADER_PRIORITY,
@@ -426,6 +439,7 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
                     ),
                 )
             )
+            errors.update(_ha_mirror_required_errors(user_input))
             if not errors:
                 await self.async_set_unique_id(slug)
                 self._abort_if_unique_id_configured()
@@ -501,6 +515,7 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
             ha_host_val = str(user_input.get(CONF_VOICE_HA_HOST, ""))
             if _has_control_char(ha_host_val):
                 errors[CONF_VOICE_HA_HOST] = "invalid_value"
+            errors.update(_ha_mirror_required_errors(user_input))
             if not errors:
                 user_input = {**user_input, CONF_HOST: user_input[CONF_HOST].strip()}
                 # Same host → verify the rotated password against the STORED pin (key
@@ -568,7 +583,7 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
                             for c in optional():
                                 was: bool = bool(current.get(c.id, False))
                                 now: bool = desired[c.id]
-                                if now and not was:
+                                if now and (c.id == COMPONENT_HA_MIRROR or not was):
                                     async with _panel_session(
                                         self.hass,
                                         user_input[CONF_HOST],

@@ -40,6 +40,7 @@ from .const import (
     VOICE_PAYLOAD_VERSION,
     panel_device_name,
 )
+from .panel_ops import PanelOpError
 from .shell import PanelShell
 from .voice_payload import async_fetch_voice_payload
 
@@ -130,14 +131,21 @@ async def _hamirror_present(shell: PanelShell) -> bool:
 async def _hamirror_install(
     hass: HomeAssistant, shell: PanelShell, data: Mapping[str, Any]
 ) -> None:
+    ha_ws_url = data.get(CONF_HA_MIRROR_WS_URL, "")
+    ha_token = data.get(CONF_HA_MIRROR_TOKEN, "")
+    if not ha_ws_url.strip() or not ha_token.strip():
+        raise PanelOpError(
+            "HA mirror needs a Home Assistant WebSocket URL and long-lived token — "
+            "set them via Reconfigure"
+        )
     payload_dir = _mgr._payload_dir()
     unit = await hass.async_add_executor_job(
         (payload_dir / "brilliant-ha-mirror.service").read_text
     )
     env = panel_ops.render_ha_mirror_env(
         panel=data[CONF_PANEL],
-        ha_ws_url=data[CONF_HA_MIRROR_WS_URL],
-        ha_token=data[CONF_HA_MIRROR_TOKEN],
+        ha_ws_url=ha_ws_url,
+        ha_token=ha_token,
         mirror_label=data.get(CONF_HA_MIRROR_LABEL, DEFAULT_HA_MIRROR_LABEL),
         leader_priority=data.get(CONF_HA_MIRROR_LEADER_PRIORITY, DEFAULT_HA_MIRROR_LEADER_PRIORITY),
         mqtt_host=data[CONF_MQTT_HOST],
