@@ -33,11 +33,7 @@ import time
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
 
-from brilliant_ha_mirror.mapping import PeripheralSpec
-
-# Tier-1 interface variables that are integer-typed on the bus (thrift BOOL and
-# I32 alike are represented as int); every other mirrored variable is text.
-_INT_VARS = frozenset({"on", "dimmable", "intensity", "locked", "position"})
+from brilliant_ha_mirror.mapping import INT_VARIABLES, PeripheralSpec
 
 # Live peripheral instances by name, so the adapter can push variable updates via
 # each instance's set_value(). The host instantiates the peripheral class, so the
@@ -50,17 +46,30 @@ _INT_VARS = frozenset({"on", "dimmable", "intensity", "locked", "position"})
 _INSTANCES: dict[str, Any] = {}
 
 
+async def _await_if_coroutine(result: Any) -> None:
+    """Await a borrowed firmware method's result when it is a coroutine.
+
+    The panel's ``set_value``-family methods are Cython methods whose
+    sync/async-ness is not reliably introspectable, so callers probe before
+    awaiting. Kept in one place so the reason lives in a single docstring.
+    """
+    if hasattr(result, "__await__"):
+        await result
+
+
 def _slug(name: str) -> str:
     """A stable peripheral_id slug derived from the display name."""
     return "ha_mirror_" + re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
 
 
 def _var_type(var: str) -> type:
-    return int if var in _INT_VARS else str
+    # INT_VARIABLES (defined in mapping.py alongside the variable vocabulary) is
+    # the single source of truth for which bus variables are integer-typed.
+    return int if var in INT_VARIABLES else str
 
 
 def _typed_value(var: str, raw: str) -> Any:
-    return int(raw) if var in _INT_VARS else raw
+    return int(raw) if var in INT_VARIABLES else raw
 
 
 def _make_peripheral_class(
@@ -169,7 +178,15 @@ class RpcPeripheralHost:
             raise_errors_for_lost_user_configured_data=False,
             message_bus_address_override=None,
         )
-        await host.start()
+        try:
+            await host.start()
+        except BaseException:
+            # The peripheral registered itself in _INSTANCES during __init__
+            # (inside host.start()); if start() fails after that, drop the stale
+            # entry so a later update_variables cannot write into a dead
+            # peripheral. _hosts was not yet set, so nothing else references it.
+            _INSTANCES.pop(name, None)
+            raise
         self._hosts[name] = host
 
     async def update_variables(self, name: str, values: Mapping[str, str]) -> None:
@@ -183,13 +200,10 @@ class RpcPeripheralHost:
         # (it fires the command push_func and rejects unconfirmed values), which
         # would create a HA->panel->HA feedback loop; _set_value_internal updates
         # the reported value + notifies subscribers WITHOUT invoking push_func
-        # (verified on panel). Accessed via __dict__ (like the borrowed delete);
-        # it is a Cython coroutine, so its result is awaited.
+        # (verified on panel). Accessed via __dict__ (like the borrowed delete).
         update = Peripheral.__dict__["_set_value_internal"]
         for var, raw in values.items():
-            result = update(instance, var, _typed_value(var, raw), notify=True)
-            if hasattr(result, "__await__"):
-                await result
+            await _await_if_coroutine(update(instance, var, _typed_value(var, raw), notify=True))
 
     async def delete(self, name: str) -> None:
         host = self._hosts.pop(name, None)
@@ -200,11 +214,14 @@ class RpcPeripheralHost:
         )
 
         delete_impl = ConditionalPeripheralHost.__dict__["delete_peripheral"]
-        result = delete_impl(host, name, int(time.time() * 1000))
-        if hasattr(result, "__await__"):
-            await result
-        _INSTANCES.pop(name, None)
-        await host.shutdown()
+        try:
+            await _await_if_coroutine(delete_impl(host, name, int(time.time() * 1000)))
+        finally:
+            # Always drop the module-global instance entry and best-effort shut
+            # the host down, even if delete_peripheral raised, so a failed delete
+            # cannot leak a stale _INSTANCES entry across the session rebuild.
+            _INSTANCES.pop(name, None)
+            await host.shutdown()
 
     async def shutdown(self) -> None:
         for name in list(self._hosts):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Awaitable, Callable
 
 from brilliant_ha_mirror.config import Settings
@@ -46,9 +47,7 @@ class Mirror:
         (globally unique), so the common case stays clean.
         """
         base = {e.entity_id: self._base_name(e) for e in entities}
-        counts: dict[str, int] = {}
-        for name in base.values():
-            counts[name] = counts.get(name, 0) + 1
+        counts = Counter(base.values())
         names: dict[str, str] = {}
         for entity_id, name in base.items():
             if counts[name] > 1:
@@ -89,12 +88,14 @@ class Mirror:
             if current == name:
                 await self._host.update_variables(name, state_to_variables(entity))
                 continue
+            # The unique name changed (a collision appeared or resolved), or this
+            # entity is new. Register the new peripheral BEFORE deleting the old
+            # one and only mutate the maps once registration succeeds, so a
+            # failed register cannot leave the entity deleted-but-still-tracked.
+            await self._host.register(name, spec, self._command_handler(entity_id))
             if current is not None:
-                # The unique name changed (a collision appeared or resolved) —
-                # replace the old peripheral so the bookkeeping stays consistent.
                 await self._host.delete(current)
                 del self._entity_by_name[current]
-            await self._host.register(name, spec, self._command_handler(entity_id))
             self._name_by_entity[entity_id] = name
             self._entity_by_name[name] = entity_id
 

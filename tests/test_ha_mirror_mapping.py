@@ -85,3 +85,15 @@ def test_garage_state_reflects_command_vocabulary() -> None:
     assert state_to_variables(_g("closing")) == {"event": "close"}
     assert state_to_variables(_g("open")) == {"event": "open"}
     assert state_to_variables(_g("opening")) == {"event": "open"}
+
+
+def test_int_variables_is_the_shared_type_source() -> None:
+    # hosting.py reads mapping.INT_VARIABLES for bus var typing — assert the
+    # single source covers exactly the integer-typed Tier-1 variables (DRY #3).
+    from brilliant_ha_mirror.mapping import INT_VARIABLES
+
+    assert INT_VARIABLES == frozenset({"on", "dimmable", "intensity", "locked", "position"})
+    # Every command var across Tier-1 specs that carries a numeric/bool value is
+    # int-typed here; the text-only display/event vars are not.
+    assert "display_name" not in INT_VARIABLES
+    assert "event" not in INT_VARIABLES

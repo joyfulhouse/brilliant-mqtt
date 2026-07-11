@@ -47,11 +47,16 @@ supported entities are mirrored. Change the label name with `MIRROR_LABEL`.
 
 ## Manual deploy (pilot one panel first)
 
+> **Prerequisite:** the panel must already run the main bridge — the mirror
+> reuses `brilliant_mqtt` (installed at `/var/brilliant-mqtt/app`) and its
+> vendored `aiomqtt` (`/var/brilliant-mqtt/vendor`) for the leader election.
+> `aiohttp` is part of the panel's own Python; nothing else needs vendoring.
+
 1. **Copy the app**: `scp -r src/brilliant_ha_mirror root@<panel-ip>:/var/brilliant-ha-mirror/app/`
 2. **Write** `/etc/brilliant-ha-mirror.env` (table above), mode 0600.
 3. **Smoke-run in the foreground** (watch logs):
    ```bash
-   PYTHONPATH=/var/brilliant-ha-mirror/app \
+   PYTHONPATH=/var/brilliant-ha-mirror/app:/var/brilliant-mqtt/app:/var/brilliant-mqtt/vendor:/data/switch-embedded \
      /data/switch-embedded/env/bin/python3 -m brilliant_ha_mirror
    ```
 4. Confirm the labeled entities appear on the panels and control works both ways.

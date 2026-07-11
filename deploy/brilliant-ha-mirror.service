@@ -18,7 +18,12 @@ Type=simple
 # LEADER_HEARTBEAT_SECONDS, ROOM_OVERRIDES, LOG_LEVEL, and the broker creds
 # MQTT_HOST / MQTT_USERNAME / MQTT_PASSWORD / MQTT_PORT (for leader election).
 EnvironmentFile=/etc/brilliant-ha-mirror.env
-Environment=PYTHONPATH=/var/brilliant-ha-mirror/app
+# PYTHONPATH must reach: the mirror app; the brilliant_mqtt bridge package (the
+# mirror reuses its MQTT adapter + leader election) and its vendored aiomqtt at
+# /var/brilliant-mqtt/{app,vendor}; and the panel firmware at /data/switch-embedded
+# (hosting.py imports lib.*/peripherals.*, and the panel's own aiohttp lives in
+# the interpreter's env). The panel bridge must be installed for the mirror to run.
+Environment=PYTHONPATH=/var/brilliant-ha-mirror/app:/var/brilliant-mqtt/app:/var/brilliant-mqtt/vendor:/data/switch-embedded
 ExecStart=/data/switch-embedded/env/bin/python3 -m brilliant_ha_mirror
 Restart=always
 RestartSec=5

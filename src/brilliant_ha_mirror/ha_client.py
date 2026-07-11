@@ -63,12 +63,20 @@ class _AiohttpTransport:
 # observed live), which would kill the reader with WSCloseCode 1009. HA is the
 # operator's own trusted instance, so lift the cap entirely.
 _WS_MAX_MSG_SIZE = 0  # 0 = no limit
+# aiohttp auto-pings every heartbeat and raises if no pong returns, so a
+# half-open connection (HA host vanishes without FIN/RST — NAT/LB idle drop) is
+# detected instead of blocking the reader on receive() forever.
+_WS_HEARTBEAT_SECONDS = 25.0
 
 
 async def _open_aiohttp_transport(url: str) -> _WsTransport:
     session = aiohttp.ClientSession()
     try:
-        socket = await session.ws_connect(url, max_msg_size=_WS_MAX_MSG_SIZE)
+        socket = await session.ws_connect(
+            url,
+            max_msg_size=_WS_MAX_MSG_SIZE,
+            heartbeat=_WS_HEARTBEAT_SECONDS,
+        )
     except BaseException:
         await session.close()
         raise
@@ -114,8 +122,7 @@ def labeled_entity_ids(
         label_id
         for label in label_registry
         if label.get("name") == label_name
-        for label_id in [label.get("label_id")]
-        if isinstance(label_id, str)
+        if isinstance(label_id := label.get("label_id"), str)
     }
     if not label_ids:
         return set()
@@ -222,11 +229,19 @@ class WsHaClient(HaClient):
             raise RuntimeError("Home Assistant client is already started")
         self._transport = await self._transport_factory(self._ws_url)
         try:
-            auth_required = await self._transport.receive()
+            # Bound the handshake: start() is awaited inline inside the leader
+            # election tick, so a socket that opens but never delivers
+            # auth_required (overloaded HA, a proxy holding the connection) would
+            # otherwise wedge the whole supervisor with no backoff.
+            auth_required = await asyncio.wait_for(
+                self._transport.receive(), _COMMAND_TIMEOUT_SECONDS
+            )
             if auth_required.get("type") != "auth_required":
                 raise RuntimeError("Home Assistant did not request authentication")
             await self._transport.send({"type": "auth", "access_token": self._token})
-            auth_result = await self._transport.receive()
+            auth_result = await asyncio.wait_for(
+                self._transport.receive(), _COMMAND_TIMEOUT_SECONDS
+            )
             auth_type = auth_result.get("type")
             if auth_type == "auth_invalid":
                 message = auth_result.get("message")
@@ -241,30 +256,30 @@ class WsHaClient(HaClient):
             await self.shutdown()
             raise
 
+    def is_running(self) -> bool:
+        """True while the background reader is alive and delivering events.
+
+        The supervisor polls this so a dead HA connection (e.g. HA restarted and
+        closed the socket) is surfaced as a session failure and rebuilt, rather
+        than leaving a leader that silently stops reflecting state.
+        """
+        return self._reader_task is not None and not self._reader_task.done()
+
+    async def _registry_list(self, command_type: str, field_name: str) -> list[dict[str, object]]:
+        """Fetch a registry/state listing under the long registry timeout."""
+        return _object_list(
+            await self._new_command({"type": command_type}, timeout=_REGISTRY_TIMEOUT_SECONDS),
+            field_name,
+        )
+
     async def get_entities(self, label: str) -> list[HaEntity]:
         """Fetch entities assigned to a label and attach their area names."""
-        states = _object_list(
-            await self._new_command({"type": "get_states"}, timeout=_REGISTRY_TIMEOUT_SECONDS),
-            "get_states result",
+        states = await self._registry_list("get_states", "get_states result")
+        entities = await self._registry_list(
+            "config/entity_registry/list", "entity registry result"
         )
-        entities = _object_list(
-            await self._new_command(
-                {"type": "config/entity_registry/list"}, timeout=_REGISTRY_TIMEOUT_SECONDS
-            ),
-            "entity registry result",
-        )
-        areas = _object_list(
-            await self._new_command(
-                {"type": "config/area_registry/list"}, timeout=_REGISTRY_TIMEOUT_SECONDS
-            ),
-            "area registry result",
-        )
-        labels = _object_list(
-            await self._new_command(
-                {"type": "config/label_registry/list"}, timeout=_REGISTRY_TIMEOUT_SECONDS
-            ),
-            "label registry result",
-        )
+        areas = await self._registry_list("config/area_registry/list", "area registry result")
+        labels = await self._registry_list("config/label_registry/list", "label registry result")
 
         labeled_ids = labeled_entity_ids(entities, labels, label)
         self._areas_by_entity = area_by_entity(entities, areas)

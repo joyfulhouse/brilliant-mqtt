@@ -155,6 +155,13 @@ async def run(
                     error = callback_error
                     callback_error = None
                     raise error
+                # Surface a silently dropped HA connection: when we are leader,
+                # the Home Assistant reader lives in a detached task whose death
+                # (e.g. HA restarted and closed the socket) is invisible to the
+                # leader/MQTT path. Treat it as a session failure so the finally
+                # block tears down and the loop rebuilds + re-reconciles.
+                if current_ha is not None and not current_ha.is_running():
+                    raise RuntimeError("Home Assistant connection lost")
                 if should_continue():
                     await sleep(settings.leader_heartbeat_seconds)
         except asyncio.CancelledError:

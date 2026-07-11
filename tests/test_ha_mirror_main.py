@@ -200,3 +200,38 @@ async def test_tick_failure_backs_off_rebuilds_and_continues() -> None:
     assert len(adapters.hosts) == 2
     assert adapters.hosts[0].deleted == ["HA Desk Light"]
     assert adapters.hosts[1].registered == ["HA Desk Light"]
+
+
+async def test_dead_ha_reader_triggers_session_rebuild() -> None:
+    # When the leader's HA connection dies silently (reader task ended, e.g. HA
+    # restarted), the supervisor must detect it and rebuild the session — the
+    # leader/MQTT path alone would never surface it (review finding I1/#1).
+    adapters = _adapters()
+    clock = FakeClock()
+    sleeps: list[float] = []
+    leaders = FakeLeaderFactory([["acquire", "idle"], ["acquire"]])
+
+    async def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock.advance(seconds)
+        # Kill the first session's HA connection during its post-acquire sleep;
+        # the next tick's liveness check should raise and force a rebuild.
+        if len(sleeps) == 1:
+            adapters.ha_clients[0].running = False
+
+    await main_module.run(
+        _settings(),
+        ha_factory=adapters.make_ha,
+        host_factory=adapters.make_host,
+        mqtt_factory=FakeMqttFactory(),
+        leader_factory=leaders,
+        clock=clock,
+        sleep=sleep,
+        should_continue=lambda: leaders.total_ticks < 3,
+    )
+
+    # Session 1's HA client + host were torn down and a fresh pair built.
+    assert len(adapters.ha_clients) == 2
+    assert len(adapters.hosts) == 2
+    assert adapters.hosts[0].deleted == ["HA Desk Light"]  # stale mirror cleaned up
+    assert main_module._BACKOFF_SECONDS in sleeps  # backed off before rebuild

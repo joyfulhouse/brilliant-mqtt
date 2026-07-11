@@ -70,3 +70,10 @@ def test_invalid_leader_priority_raises() -> None:
     }
     with pytest.raises(ValueError):
         Settings.from_env(env)
+
+
+def test_room_overrides_non_object_raises_valueerror() -> None:
+    with pytest.raises(ValueError, match="ROOM_OVERRIDES"):
+        Settings.from_env(
+            {"PANEL": "p", "HA_WS_URL": "ws://x", "HA_TOKEN": "t", "ROOM_OVERRIDES": "[1, 2]"}
+        )

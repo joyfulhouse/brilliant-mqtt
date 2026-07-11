@@ -450,3 +450,37 @@ async def test_get_entities_tolerates_slow_registry_pulls(
     entities = await client.get_entities("brilliant")
     assert any(e.entity_id == "light.kitchen" for e in entities)
     await client.shutdown()
+
+
+async def test_start_times_out_on_a_silent_handshake(monkeypatch: pytest.MonkeyPatch) -> None:
+    # start() runs inline inside the leader tick; a socket that opens but never
+    # sends auth_required must fail loudly (not wedge the supervisor) — review
+    # finding #2. Shrink the bound so the test is fast.
+    import brilliant_ha_mirror.ha_client as hc
+
+    monkeypatch.setattr(hc, "_COMMAND_TIMEOUT_SECONDS", 0.02)
+
+    class SilentTransport:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def send(self, message: dict[str, object]) -> None:
+            pass
+
+        async def receive(self) -> dict[str, object]:
+            await asyncio.sleep(3600)  # never delivers auth_required
+            raise AssertionError("unreachable")
+
+        async def close(self) -> None:
+            self.closed = True
+
+    transport = SilentTransport()
+
+    async def open_transport(url: str) -> SilentTransport:
+        return transport
+
+    client = hc.WsHaClient("ws://ha.local/api/websocket", "token", transport_factory=open_transport)
+    with pytest.raises(asyncio.TimeoutError):
+        await client.start()
+    assert transport.closed  # shutdown() closed the transport on failure
+    assert not client.is_running()

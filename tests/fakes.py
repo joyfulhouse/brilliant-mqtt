@@ -145,9 +145,14 @@ class FakeHaClient:
         self.entities = entities
         self.calls: list[ServiceCall] = []
         self._state_change_cb: Callable[[HaEntity], Awaitable[None]] | None = None
+        # Flip to False to simulate a dropped Home Assistant connection.
+        self.running = True
 
     async def start(self) -> None:
         pass
+
+    def is_running(self) -> bool:
+        return self.running
 
     async def get_entities(self, label: str) -> list[HaEntity]:
         return list(self.entities)

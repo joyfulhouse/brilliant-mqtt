@@ -40,6 +40,14 @@ class ServiceCall:
 
 SUPPORTED_DOMAINS: frozenset[str] = frozenset({"light", "switch", "lock", "cover"})
 
+# The mirrored peripheral variables that are integer-typed on the Brilliant bus
+# (thrift BOOL and I32 alike are represented as int); every other variable is
+# text. This is the single source of truth for variable bus-typing — the values
+# emitted here are always strings, and the host adapter (hosting.py) reads this
+# set to build each VariableSpec with the right Python type. Colocated with the
+# variable vocabulary so a new variable can only be added in one place.
+INT_VARIABLES: frozenset[str] = frozenset({"on", "dimmable", "intensity", "locked", "position"})
+
 
 def _domain(entity_id: str) -> str:
     return entity_id.partition(".")[0]
@@ -98,14 +106,11 @@ def command_to_service(entity_id: str, var: str, value: str) -> ServiceCall:
     domain = _domain(entity_id)
     entity_data: dict[str, object] = {"entity_id": entity_id}
 
-    if domain == "light" and var == "on" and value in {"0", "1"}:
+    if domain in {"light", "switch"} and var == "on" and value in {"0", "1"}:
         service = "turn_on" if value == "1" else "turn_off"
         return ServiceCall(domain, service, entity_data)
     if domain == "light" and var == "intensity":
         return ServiceCall(domain, "turn_on", {**entity_data, "brightness": int(value)})
-    if domain == "switch" and var == "on" and value in {"0", "1"}:
-        service = "turn_on" if value == "1" else "turn_off"
-        return ServiceCall(domain, service, entity_data)
     if domain == "lock" and var == "locked" and value in {"0", "1"}:
         service = "lock" if value == "1" else "unlock"
         return ServiceCall(domain, service, entity_data)

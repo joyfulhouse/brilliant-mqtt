@@ -15,6 +15,15 @@ class HaClient(Protocol):
         """Connect to Home Assistant and begin receiving state changes."""
         ...
 
+    def is_running(self) -> bool:
+        """True while the connection is alive and delivering state changes.
+
+        The supervisor polls this to detect a silently dropped connection and
+        rebuild the session instead of leaving a leader that no longer reflects
+        Home Assistant state.
+        """
+        ...
+
     async def get_entities(self, label: str) -> list[HaEntity]:
         """Return the Home Assistant entities assigned to *label*."""
         ...

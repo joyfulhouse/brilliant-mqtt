@@ -52,7 +52,10 @@ class Settings:
         mirror_label = env.get("MIRROR_LABEL", "brilliant")
         leader_priority = int(env.get("LEADER_PRIORITY", "0"))
         leader_heartbeat_seconds = float(env.get("LEADER_HEARTBEAT_SECONDS", "10.0"))
-        room_overrides: Mapping[str, str] = dict(json.loads(env.get("ROOM_OVERRIDES", "{}")))
+        parsed_overrides = json.loads(env.get("ROOM_OVERRIDES", "{}"))
+        if not isinstance(parsed_overrides, dict):
+            raise ValueError("ROOM_OVERRIDES must be a JSON object (area name -> room id)")
+        room_overrides: Mapping[str, str] = dict(parsed_overrides)
         log_level = env.get("LOG_LEVEL", "INFO")
 
         return cls(
