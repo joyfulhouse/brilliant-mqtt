@@ -20,6 +20,7 @@ class FakeTransport:
         auth_ok: bool = True,
         fail_service: bool = False,
         malformed: bool = False,
+        registry_delay: float = 0.0,
     ) -> None:
         self.incoming: asyncio.Queue[dict[str, object]] = asyncio.Queue()
         self.incoming.put_nowait({"type": "auth_required", "ha_version": "2026.7.0"})
@@ -28,10 +29,17 @@ class FakeTransport:
         self._auth_ok = auth_ok
         self._fail_service = fail_service
         self._malformed = malformed
+        self._registry_delay = registry_delay
 
     async def send(self, message: dict[str, object]) -> None:
         self.sent.append(message)
         message_type = message.get("type")
+        if (
+            self._registry_delay
+            and isinstance(message_type, str)
+            and (message_type == "get_states" or message_type.startswith("config/"))
+        ):
+            await asyncio.sleep(self._registry_delay)
         if message_type == "auth":
             if self._auth_ok:
                 await self.incoming.put({"type": "auth_ok", "ha_version": "2026.7.0"})
@@ -417,4 +425,28 @@ async def test_get_entities_skips_a_malformed_labeled_entity() -> None:
 
     assert "light.kitchen" in ids  # valid labeled entity still returned
     assert "light.broken" not in ids  # malformed one skipped without raising
+    await client.shutdown()
+
+
+async def test_get_entities_tolerates_slow_registry_pulls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A real get_states is multi-MiB and can take many seconds; the registry
+    # pulls must use the long timeout, not the short per-command one (pilot bug:
+    # a 7.5 MiB get_states blew the 10s command bound and churned the supervisor).
+    import brilliant_ha_mirror.ha_client as hc
+
+    assert hc._REGISTRY_TIMEOUT_SECONDS > hc._COMMAND_TIMEOUT_SECONDS
+    # Shrink the fast-command bound below the registry response delay: get_entities
+    # succeeds only because its pulls use the (unshrunk) registry timeout.
+    monkeypatch.setattr(hc, "_COMMAND_TIMEOUT_SECONDS", 0.01)
+    transport = FakeTransport(registry_delay=0.08)
+
+    async def open_transport(url: str) -> FakeTransport:
+        return transport
+
+    client = hc.WsHaClient("ws://ha.local/api/websocket", "token", transport_factory=open_transport)
+    await client.start()
+    entities = await client.get_entities("brilliant")
+    assert any(e.entity_id == "light.kitchen" for e in entities)
     await client.shutdown()

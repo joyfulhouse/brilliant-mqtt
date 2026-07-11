@@ -14,9 +14,15 @@ from brilliant_ha_mirror.protocols import HaClient
 
 logger = logging.getLogger(__name__)
 
-# Bound on how long a single WebSocket command waits for its result, so a panel
-# command driving call_service can never hang the peripheral push path.
+# Bound on how long a fast WebSocket command (e.g. call_service driven from a
+# panel push_func) waits for its result, so a panel command can never hang the
+# peripheral push path.
 _COMMAND_TIMEOUT_SECONDS = 10.0
+# The registry/state listing commands return large payloads (a real get_states
+# is several MiB and can take many seconds to transfer + serialize on a
+# resource-constrained panel), so they get a much longer bound than a fast
+# command while still failing a genuinely hung connection eventually.
+_REGISTRY_TIMEOUT_SECONDS = 60.0
 
 
 class _WsTransport(Protocol):
@@ -52,10 +58,17 @@ class _AiohttpTransport:
         await self._session.close()
 
 
+# aiohttp defaults the WebSocket max message size to 4 MiB, but a real Home
+# Assistant `get_states` dump (hundreds of entities) can exceed that (7.5 MiB
+# observed live), which would kill the reader with WSCloseCode 1009. HA is the
+# operator's own trusted instance, so lift the cap entirely.
+_WS_MAX_MSG_SIZE = 0  # 0 = no limit
+
+
 async def _open_aiohttp_transport(url: str) -> _WsTransport:
     session = aiohttp.ClientSession()
     try:
-        socket = await session.ws_connect(url)
+        socket = await session.ws_connect(url, max_msg_size=_WS_MAX_MSG_SIZE)
     except BaseException:
         await session.close()
         raise
@@ -231,19 +244,25 @@ class WsHaClient(HaClient):
     async def get_entities(self, label: str) -> list[HaEntity]:
         """Fetch entities assigned to a label and attach their area names."""
         states = _object_list(
-            await self._new_command({"type": "get_states"}),
+            await self._new_command({"type": "get_states"}, timeout=_REGISTRY_TIMEOUT_SECONDS),
             "get_states result",
         )
         entities = _object_list(
-            await self._new_command({"type": "config/entity_registry/list"}),
+            await self._new_command(
+                {"type": "config/entity_registry/list"}, timeout=_REGISTRY_TIMEOUT_SECONDS
+            ),
             "entity registry result",
         )
         areas = _object_list(
-            await self._new_command({"type": "config/area_registry/list"}),
+            await self._new_command(
+                {"type": "config/area_registry/list"}, timeout=_REGISTRY_TIMEOUT_SECONDS
+            ),
             "area registry result",
         )
         labels = _object_list(
-            await self._new_command({"type": "config/label_registry/list"}),
+            await self._new_command(
+                {"type": "config/label_registry/list"}, timeout=_REGISTRY_TIMEOUT_SECONDS
+            ),
             "label registry result",
         )
 
@@ -294,14 +313,21 @@ class WsHaClient(HaClient):
         self._next_id += 1
         return cmd_id
 
-    async def _new_command(self, command: dict[str, object]) -> object:
+    async def _new_command(
+        self,
+        command: dict[str, object],
+        *,
+        timeout: float = _COMMAND_TIMEOUT_SECONDS,
+    ) -> object:
         cmd_id = self._reserve_id()
-        return await self._send_command(cmd_id, {"id": cmd_id, **command})
+        return await self._send_command(cmd_id, {"id": cmd_id, **command}, timeout=timeout)
 
     async def _send_command(
         self,
         cmd_id: int,
         command: dict[str, object],
+        *,
+        timeout: float = _COMMAND_TIMEOUT_SECONDS,
     ) -> object:
         transport = self._transport
         reader_task = self._reader_task
@@ -318,7 +344,7 @@ class WsHaClient(HaClient):
             # the firmware awaits. Without a timeout, a dropped/never-answered
             # result id (reader alive but silent) would hang the command path
             # forever. _fail_pending only fires when the reader dies.
-            return await asyncio.wait_for(future, _COMMAND_TIMEOUT_SECONDS)
+            return await asyncio.wait_for(future, timeout)
         finally:
             self._pending.pop(cmd_id, None)
 
