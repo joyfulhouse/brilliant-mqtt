@@ -14,13 +14,20 @@ from brilliant_ha_mirror.mapping import HaEntity, ServiceCall
 
 
 class FakeTransport:
-    def __init__(self, *, auth_ok: bool = True, fail_service: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        auth_ok: bool = True,
+        fail_service: bool = False,
+        malformed: bool = False,
+    ) -> None:
         self.incoming: asyncio.Queue[dict[str, object]] = asyncio.Queue()
         self.incoming.put_nowait({"type": "auth_required", "ha_version": "2026.7.0"})
         self.sent: list[dict[str, object]] = []
         self.closed = False
         self._auth_ok = auth_ok
         self._fail_service = fail_service
+        self._malformed = malformed
 
     async def send(self, message: dict[str, object]) -> None:
         self.sent.append(message)
@@ -62,6 +69,10 @@ class FakeTransport:
                     "context": {"id": "context-2", "parent_id": None, "user_id": None},
                 },
             ]
+            if self._malformed:
+                # A LABELED but malformed state (non-string state) — must be
+                # skipped, not crash the whole listing.
+                result = [*result, {"entity_id": "light.broken", "state": 123, "attributes": {}}]
         elif message_type == "config/entity_registry/list":
             result = [
                 {
@@ -79,6 +90,17 @@ class FakeTransport:
                     "hidden_by": None,
                 },
             ]
+            if self._malformed:
+                result = [
+                    *result,
+                    {
+                        "entity_id": "light.broken",
+                        "area_id": None,
+                        "labels": ["label-brilliant"],
+                        "disabled_by": None,
+                        "hidden_by": None,
+                    },
+                ]
         elif message_type == "config/area_registry/list":
             result = [
                 {
@@ -377,4 +399,22 @@ async def test_client_raises_home_assistant_command_error() -> None:
     with pytest.raises(RuntimeError, match="not allowed"):
         await client.call_service(ServiceCall("lock", "unlock", {"entity_id": "lock.front_door"}))
 
+    await client.shutdown()
+
+
+async def test_get_entities_skips_a_malformed_labeled_entity() -> None:
+    # One malformed labeled state must be skipped, not abort the whole listing
+    # (review finding M7) — otherwise the supervisor loops on backoff forever.
+    transport = FakeTransport(malformed=True)
+
+    async def open_transport(url: str) -> FakeTransport:
+        return transport
+
+    client = WsHaClient("ws://ha.local/api/websocket", "token", transport_factory=open_transport)
+    await client.start()
+    entities = await client.get_entities("brilliant")
+    ids = {entity.entity_id for entity in entities}
+
+    assert "light.kitchen" in ids  # valid labeled entity still returned
+    assert "light.broken" not in ids  # malformed one skipped without raising
     await client.shutdown()

@@ -106,10 +106,23 @@ def _adapters() -> AdapterFactory:
     )
 
 
+class FakeMqttFactory:
+    """Record every fresh MQTT adapter the supervisor builds per session."""
+
+    def __init__(self) -> None:
+        self.created: list[FakeMqtt] = []
+
+    def __call__(self) -> FakeMqtt:
+        mqtt = FakeMqtt()
+        self.created.append(mqtt)
+        return mqtt
+
+
 async def _run_until_ticks(
     leader_factory: FakeLeaderFactory,
     adapters: AdapterFactory,
     tick_limit: int,
+    mqtt_factory: FakeMqttFactory | None = None,
 ) -> list[float]:
     clock = FakeClock()
     sleeps: list[float] = []
@@ -122,13 +135,33 @@ async def _run_until_ticks(
         _settings(),
         ha_factory=adapters.make_ha,
         host_factory=adapters.make_host,
-        mqtt=FakeMqtt(),
+        mqtt_factory=mqtt_factory or FakeMqttFactory(),
         leader_factory=leader_factory,
         clock=clock,
         sleep=sleep,
         should_continue=lambda: leader_factory.total_ticks < tick_limit,
     )
     return sleeps
+
+
+async def test_each_session_builds_and_disconnects_its_own_mqtt() -> None:
+    # Two sessions (a failure forces a rebuild). Each must get its OWN fresh
+    # MQTT adapter and disconnect it — a shared process-lifetime adapter would
+    # leak a MeshLeader election callback per reconnect (review finding I2).
+    adapters = _adapters()
+    mqtt_factory = FakeMqttFactory()
+    leaders = FakeLeaderFactory(
+        [
+            ["acquire", RuntimeError("transient failure")],
+            ["acquire"],
+        ]
+    )
+    await _run_until_ticks(leaders, adapters, 3, mqtt_factory=mqtt_factory)
+
+    assert len(mqtt_factory.created) == 2
+    for mqtt in mqtt_factory.created:
+        assert mqtt.connect_count == 1
+        assert mqtt.disconnect_count == 1
 
 
 async def test_acquire_starts_mirror_and_registers_labeled_entities() -> None:

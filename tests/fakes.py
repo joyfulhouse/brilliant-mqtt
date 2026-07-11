@@ -103,6 +103,14 @@ class FakeMqtt:
         self.unsubscriptions: list[str] = []
         # Multiple consumers may register (see FakeBus._change_cbs) — fan out.
         self._command_cbs: list[Callable[[str, str], Awaitable[None]]] = []
+        self.connect_count = 0
+        self.disconnect_count = 0
+
+    async def connect(self) -> None:
+        self.connect_count += 1
+
+    async def disconnect(self) -> None:
+        self.disconnect_count += 1
 
     async def publish(self, topic: str, payload: str, retain: bool = False) -> None:
         self.published.append((topic, payload, retain))

@@ -66,7 +66,12 @@ def state_to_variables(entity: HaEntity) -> dict[str, str]:
         return {"locked": "1" if entity.state == "locked" else "0"}
     if domain == "cover":
         if entity.attributes.get("device_class") == "garage":
-            return {"event": entity.state}
+            # Reflect into the command vocabulary the `event` variable accepts
+            # ("open"/"close"), not HA's state words ("closed"/"opening"/…).
+            # Garage reflection is not yet live-verified on panel — confirm the
+            # accepted values before relying on the displayed state.
+            opening = entity.state in {"open", "opening"}
+            return {"event": "open" if opening else "close"}
         position = min(100, max(0, _int_attribute(entity, "current_position")))
         return {"position": str(position)}
     return {}

@@ -111,3 +111,26 @@ async def test_command_handlers_bind_their_own_entity_ids() -> None:
         "switch.first",
         "switch.second",
     ]
+
+
+async def test_duplicate_friendly_names_get_unique_peripheral_names() -> None:
+    # Two entities sharing a friendly name must NOT collide to one peripheral
+    # (which would silently drop the second) — review finding I3.
+    ha = FakeHaClient(
+        entities=[
+            HaEntity("light.a", "on", {"friendly_name": "Lamp"}, "Kitchen"),
+            HaEntity("light.b", "on", {"friendly_name": "Lamp"}, "Bedroom"),
+        ]
+    )
+    host = FakePeripheralHost()
+    await Mirror(ha, host, _settings()).start()
+    assert len(host.registered) == 2
+    assert len(set(host.registered)) == 2  # distinct names, nothing dropped
+    assert all(name.startswith("HA Lamp") for name in host.registered)
+
+
+async def test_unique_friendly_name_stays_clean() -> None:
+    ha = FakeHaClient(entities=[HaEntity("light.k", "on", {"friendly_name": "Kitchen"}, "Kitchen")])
+    host = FakePeripheralHost()
+    await Mirror(ha, host, _settings()).start()
+    assert host.registered == ["HA Kitchen"]  # no disambiguation when unique

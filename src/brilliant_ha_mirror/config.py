@@ -18,13 +18,16 @@ class Settings:
 
     panel: str
     ha_ws_url: str
-    ha_token: str
+    # Long-lived access token — kept out of repr() so it cannot leak into logs
+    # or exception formatting.
+    ha_token: str = field(repr=False)
     mirror_label: str = "brilliant"
     # Leader election across panels (all panels see the same HA): priority ranks
     # panels; the heartbeat is the leader's liveness cadence.
     leader_priority: int = 0
     leader_heartbeat_seconds: float = 10.0
-    # HA area name -> Brilliant room id, parsed from a JSON object string.
+    # HA area name -> Brilliant room id. RESERVED for V2 room assignment — parsed
+    # but not yet applied (Tier-1 ships room-agnostic; see docs/ha-mirror.md).
     room_overrides: Mapping[str, str] = field(default_factory=dict)
     log_level: str = "INFO"
 

@@ -14,6 +14,10 @@ from brilliant_ha_mirror.protocols import HaClient
 
 logger = logging.getLogger(__name__)
 
+# Bound on how long a single WebSocket command waits for its result, so a panel
+# command driving call_service can never hang the peripheral push path.
+_COMMAND_TIMEOUT_SECONDS = 10.0
+
 
 class _WsTransport(Protocol):
     async def send(self, message: dict[str, object]) -> None: ...
@@ -245,12 +249,19 @@ class WsHaClient(HaClient):
 
         labeled_ids = labeled_entity_ids(entities, labels, label)
         self._areas_by_entity = area_by_entity(entities, areas)
-        return [
-            entity_from_state(state, self._areas_by_entity.get(entity_id))
-            for state in states
-            for entity_id in [_string_field(state, "entity_id")]
-            if entity_id in labeled_ids
-        ]
+        result: list[HaEntity] = []
+        for state in states:
+            # Skip (and log) a single malformed state rather than aborting the
+            # whole reconcile — one bad entity must not wedge the supervisor into
+            # a backoff/rebuild loop that never converges.
+            try:
+                entity_id = _string_field(state, "entity_id")
+                if entity_id not in labeled_ids:
+                    continue
+                result.append(entity_from_state(state, self._areas_by_entity.get(entity_id)))
+            except ValueError:
+                logger.warning("skipping malformed Home Assistant state: %r", state)
+        return result
 
     def on_state_change(self, cb: Callable[[HaEntity], Awaitable[None]]) -> None:
         """Register the callback for parsed state_changed events."""
@@ -303,7 +314,11 @@ class WsHaClient(HaClient):
         self._pending[cmd_id] = future
         try:
             await transport.send(command)
-            return await future
+            # Bound the wait: this runs from a panel command's push_func, which
+            # the firmware awaits. Without a timeout, a dropped/never-answered
+            # result id (reader alive but silent) would hang the command path
+            # forever. _fail_pending only fires when the reader dies.
+            return await asyncio.wait_for(future, _COMMAND_TIMEOUT_SECONDS)
         finally:
             self._pending.pop(cmd_id, None)
 

@@ -41,7 +41,12 @@ _INT_VARS = frozenset({"on", "dimmable", "intensity", "locked", "position"})
 
 # Live peripheral instances by name, so the adapter can push variable updates via
 # each instance's set_value(). The host instantiates the peripheral class, so the
-# instance registers itself here in __init__.
+# instance registers itself here in __init__. This is a MODULE global keyed by
+# display name; it is safe because the design runs exactly ONE elected leader
+# host at a time and the supervisor tears the old host down (delete() pops
+# _INSTANCES) before building a new one, and peripheral names are unique (the
+# orchestrator disambiguates collisions). It would need per-host keying only if
+# two hosts ever coexisted.
 _INSTANCES: dict[str, Any] = {}
 
 

@@ -32,28 +32,42 @@ class AioMqttAdapter:
     connect/disconnect lifecycle (beyond the Protocol) is available.
     """
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        identifier: str | None = None,
+        publish_availability: bool = True,
+    ) -> None:
         self._settings = settings
         # Multiple consumers (panel bridge + mesh publisher) each register a
         # command callback on this one shared connection — fan out to all.
         self._command_cbs: list[Callable[[str, str], Awaitable[None]]] = []
         self._reader_task: asyncio.Task[None] | None = None
         self._avail_topic = availability_topic(settings.panel)
+        # A distinct broker ClientID is REQUIRED for any second connection on the
+        # same panel: two clients sharing an id force the broker to disconnect the
+        # incumbent (MQTT-3.1.4-2), thrashing the connection. Availability
+        # ownership belongs to the main bridge only — a secondary consumer (e.g.
+        # the HA mirror using this purely for leader election) must not publish or
+        # will the panel's availability topic, or it would flip the panel offline
+        # in HA while the bridge is healthy.
+        self._identifier = identifier or f"brilliant-mqtt-{settings.panel}"
+        self._publish_availability = publish_availability
 
         # Last-Will-and-Testament: the broker publishes this retained "offline"
         # if we drop without a clean disconnect, so HA marks the panel offline.
-        will = aiomqtt.Will(
-            topic=self._avail_topic,
-            payload="offline",
-            qos=0,
-            retain=True,
+        will = (
+            aiomqtt.Will(topic=self._avail_topic, payload="offline", qos=0, retain=True)
+            if publish_availability
+            else None
         )
         self._client = aiomqtt.Client(
             hostname=settings.mqtt_host,
             port=settings.mqtt_port,
             username=settings.mqtt_username,
             password=settings.mqtt_password,
-            identifier=f"brilliant-mqtt-{settings.panel}",
+            identifier=self._identifier,
             will=will,
         )
 
@@ -101,20 +115,22 @@ class AioMqttAdapter:
 
         Publishing "offline" retained here (rather than relying on the broker's
         LWT) gives a deterministic offline marker on an orderly stop (plan M7
-        Step 3 — "clean LWT on exit").
+        Step 3 — "clean LWT on exit"). Skipped when this adapter does not own the
+        panel's availability topic (a secondary election-only consumer).
         """
-        try:
-            await self._client.publish(self._avail_topic, payload="offline", retain=True)
-        except aiomqtt.MqttError as exc:
-            # Ordinary when the link is already down (every runner reconnect
-            # cycle hits this): one quiet line, no traceback — the broker-side
-            # LWT publishes the retained "offline" for us. MqttCodeError is a
-            # subclass of MqttError, so this catch covers both.
-            logger.warning("clean offline publish failed (%s); broker-side LWT covers it", exc)
-        except Exception:
-            # Anything non-MQTT here is genuinely unexpected — keep the
-            # traceback, and keep disconnect() best-effort (never raise).
-            logger.exception("failed publishing clean offline availability")
+        if self._publish_availability:
+            try:
+                await self._client.publish(self._avail_topic, payload="offline", retain=True)
+            except aiomqtt.MqttError as exc:
+                # Ordinary when the link is already down (every runner reconnect
+                # cycle hits this): one quiet line, no traceback — the broker-side
+                # LWT publishes the retained "offline" for us. MqttCodeError is a
+                # subclass of MqttError, so this catch covers both.
+                logger.warning("clean offline publish failed (%s); broker-side LWT covers it", exc)
+            except Exception:
+                # Anything non-MQTT here is genuinely unexpected — keep the
+                # traceback, and keep disconnect() best-effort (never raise).
+                logger.exception("failed publishing clean offline availability")
 
         if self._reader_task is not None:
             self._reader_task.cancel()

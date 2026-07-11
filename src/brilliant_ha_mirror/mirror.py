@@ -30,11 +30,33 @@ class Mirror:
         self._name_by_entity: dict[str, str] = {}
         self._entity_by_name: dict[str, str] = {}
 
-    def _peripheral_name(self, entity: HaEntity) -> str:
+    def _base_name(self, entity: HaEntity) -> str:
         friendly = entity.attributes.get("friendly_name")
         if not isinstance(friendly, str) or not friendly:
             friendly = entity.entity_id
         return f"HA {friendly}"
+
+    def _assign_names(self, entities: list[HaEntity]) -> dict[str, str]:
+        """Map entity_id -> a unique peripheral name.
+
+        Peripheral names are the bus registry key AND the panel display label,
+        so two entities that share a friendly name would otherwise collide (the
+        second would be silently dropped). Base names that are unique are used
+        as-is; only colliding ones are disambiguated with the entity's object_id
+        (globally unique), so the common case stays clean.
+        """
+        base = {e.entity_id: self._base_name(e) for e in entities}
+        counts: dict[str, int] = {}
+        for name in base.values():
+            counts[name] = counts.get(name, 0) + 1
+        names: dict[str, str] = {}
+        for entity_id, name in base.items():
+            if counts[name] > 1:
+                object_id = entity_id.split(".", 1)[-1]
+                names[entity_id] = f"{name} ({object_id})"
+            else:
+                names[entity_id] = name
+        return names
 
     def _command_handler(
         self,
@@ -59,16 +81,22 @@ class Mirror:
             spec = spec_for(entity)
             if spec is not None:
                 supported[entity.entity_id] = (entity, spec)
+        names = self._assign_names([entity for entity, _ in supported.values()])
 
         for entity_id, (entity, spec) in supported.items():
-            name = self._name_by_entity.get(entity_id)
-            if name is None:
-                name = self._peripheral_name(entity)
-                await self._host.register(name, spec, self._command_handler(entity_id))
-                self._name_by_entity[entity_id] = name
-                self._entity_by_name[name] = entity_id
-            else:
+            name = names[entity_id]
+            current = self._name_by_entity.get(entity_id)
+            if current == name:
                 await self._host.update_variables(name, state_to_variables(entity))
+                continue
+            if current is not None:
+                # The unique name changed (a collision appeared or resolved) —
+                # replace the old peripheral so the bookkeeping stays consistent.
+                await self._host.delete(current)
+                del self._entity_by_name[current]
+            await self._host.register(name, spec, self._command_handler(entity_id))
+            self._name_by_entity[entity_id] = name
+            self._entity_by_name[name] = entity_id
 
         stale_entity_ids = self._name_by_entity.keys() - supported.keys()
         for entity_id in list(stale_entity_ids):

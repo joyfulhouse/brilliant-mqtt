@@ -73,3 +73,15 @@ def test_garage_cover() -> None:
 
 def test_unsupported_returns_none() -> None:
     assert spec_for(_e("climate.t", "heat")) is None
+
+
+def test_garage_state_reflects_command_vocabulary() -> None:
+    # state_to_variables must write the `event` command vocabulary, not HA's
+    # state words (review finding M5).
+    def _g(state: str) -> HaEntity:
+        return HaEntity("cover.g", state, {"device_class": "garage"}, "Garage")
+
+    assert state_to_variables(_g("closed")) == {"event": "close"}
+    assert state_to_variables(_g("closing")) == {"event": "close"}
+    assert state_to_variables(_g("open")) == {"event": "open"}
+    assert state_to_variables(_g("opening")) == {"event": "open"}
