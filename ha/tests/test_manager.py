@@ -21,9 +21,14 @@ from pytest_homeassistant_custom_component.typing import MqttMockHAClient
 from custom_components.brilliant_mqtt.const import (
     COMPONENT_BRIDGE,
     COMPONENT_BUS_WATCHDOG,
+    COMPONENT_HA_MIRROR,
     COMPONENT_VOICE,
     COMPONENT_WIFI_WATCHDOG,
     CONF_COMPONENTS,
+    CONF_HA_MIRROR_LABEL,
+    CONF_HA_MIRROR_LEADER_PRIORITY,
+    CONF_HA_MIRROR_TOKEN,
+    CONF_HA_MIRROR_WS_URL,
     CONF_VOICE_ENABLED,
     CONF_VOICE_WAKE_WORD,
     DATA_SSH_HOST_KEY,
@@ -1689,4 +1694,164 @@ async def test_refresh_staged_copies_skips_bus_watchdog_when_not_selected(
 
     assert await hass.config_entries.async_unload(entry.entry_id)
 
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+# ---------------------------------------------------------------------------
+# HA mirror repair / staged-copy re-lay
+# ---------------------------------------------------------------------------
+
+
+def _ha_mirror_entry_data() -> dict[str, Any]:
+    return {
+        **ENTRY_DATA,
+        CONF_COMPONENTS: {COMPONENT_BRIDGE: True, COMPONENT_HA_MIRROR: True},
+        CONF_HA_MIRROR_WS_URL: "ws://homeassistant.local:8123/api/websocket",
+        CONF_HA_MIRROR_TOKEN: "mirror-secret",
+        CONF_HA_MIRROR_LEADER_PRIORITY: 4,
+        CONF_HA_MIRROR_LABEL: "downstairs",
+    }
+
+
+@pytest.mark.allow_lingering_timers
+async def test_repair_relays_ha_mirror_when_selected(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    payload_dir: Path,
+) -> None:
+    from custom_components.brilliant_mqtt import panel_ops
+    from custom_components.brilliant_mqtt.shell import RunResult
+
+    agent_ok = RunResult(
+        0, "unit=1\nenv=1\nenabled=1\nactive=1\nsunit=1\nsenv=1\npayload=1\n0.2.0\n", ""
+    )
+    shell = FakeShell(responses={panel_ops.INSPECT_COMMAND: agent_ok})
+    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+        entry = MockConfigEntry(
+            domain=DOMAIN, unique_id="office", data=_ha_mirror_entry_data(), version=2
+        )
+        entry.add_to_hass(hass)
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        await entry.runtime_data.async_repair(trigger="button")
+        await hass.async_block_till_done()
+
+    assert any("ha_mirror" in local for (local, _remote) in shell.dir_uploads)
+    assert any(p == "/etc/brilliant-ha-mirror.env" for (p, _d, _m) in shell.uploads)
+    assert "systemctl enable --now brilliant-ha-mirror" in shell.commands
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_repair_skips_ha_mirror_when_not_selected(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    payload_dir: Path,
+) -> None:
+    from custom_components.brilliant_mqtt import panel_ops
+    from custom_components.brilliant_mqtt.shell import RunResult
+
+    agent_ok = RunResult(
+        0, "unit=1\nenv=1\nenabled=1\nactive=1\nsunit=1\nsenv=1\npayload=1\n0.2.0\n", ""
+    )
+    shell = FakeShell(responses={panel_ops.INSPECT_COMMAND: agent_ok})
+    entry_data = {**ENTRY_DATA, CONF_COMPONENTS: {COMPONENT_BRIDGE: True}}
+    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+        entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=entry_data, version=2)
+        entry.add_to_hass(hass)
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        await entry.runtime_data.async_repair(trigger="button")
+        await hass.async_block_till_done()
+
+    assert "systemctl enable --now brilliant-ha-mirror" not in shell.commands
+    assert not any("ha_mirror" in local for (local, _remote) in shell.dir_uploads)
+    assert not any("brilliant-ha-mirror" in p for (p, _d, _m) in shell.uploads)
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_repair_ha_mirror_failure_does_not_fail_bridge_repair(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    payload_dir: Path,
+) -> None:
+    from custom_components.brilliant_mqtt import panel_ops
+    from custom_components.brilliant_mqtt.shell import RunResult
+
+    agent_ok = RunResult(
+        0, "unit=1\nenv=1\nenabled=1\nactive=1\nsunit=1\nsenv=1\npayload=1\n0.2.0\n", ""
+    )
+    shell = FakeShell(
+        responses={panel_ops.INSPECT_COMMAND: agent_ok}, put_dir_error=OSError("mirror failed")
+    )
+    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+        entry = MockConfigEntry(
+            domain=DOMAIN, unique_id="office", data=_ha_mirror_entry_data(), version=2
+        )
+        entry.add_to_hass(hass)
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        await entry.runtime_data.async_repair(trigger="button")
+        await hass.async_block_till_done()
+
+    assert any("brilliant-ha-mirror/app.staging" in command for command in shell.commands)
+    assert entry.runtime_data._recovery_cancel is not None
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_refresh_staged_copies_relays_ha_mirror_when_selected(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    payload_dir: Path,
+) -> None:
+    shell = FakeShell()
+    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+        entry = MockConfigEntry(
+            domain=DOMAIN, unique_id="office", data=_ha_mirror_entry_data(), version=2
+        )
+        entry.add_to_hass(hass)
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        async_fire_mqtt_message(
+            hass, "brilliant/office/bridge", '{"agent_version": "0.2.0", "panel_firmware": "v1"}'
+        )
+        await hass.async_block_till_done()
+        async_fire_mqtt_message(
+            hass, "brilliant/office/bridge", '{"agent_version": "0.2.0", "panel_firmware": "v2"}'
+        )
+        await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert any("ha_mirror" in local for (local, _remote) in shell.dir_uploads)
+    assert any(p == "/etc/brilliant-ha-mirror.env" for (p, _d, _m) in shell.uploads)
+    assert "systemctl enable --now brilliant-ha-mirror" in shell.commands
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_refresh_staged_copies_skips_ha_mirror_when_not_selected(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    payload_dir: Path,
+) -> None:
+    shell = FakeShell()
+    entry_data = {**ENTRY_DATA, CONF_COMPONENTS: {COMPONENT_BRIDGE: True}}
+    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+        entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=entry_data, version=2)
+        entry.add_to_hass(hass)
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        async_fire_mqtt_message(
+            hass, "brilliant/office/bridge", '{"agent_version": "0.2.0", "panel_firmware": "v1"}'
+        )
+        await hass.async_block_till_done()
+        async_fire_mqtt_message(
+            hass, "brilliant/office/bridge", '{"agent_version": "0.2.0", "panel_firmware": "v2"}'
+        )
+        await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert "systemctl enable --now brilliant-ha-mirror" not in shell.commands
+    assert not any("ha_mirror" in local for (local, _remote) in shell.dir_uploads)
+    assert not any("brilliant-ha-mirror" in p for (p, _d, _m) in shell.uploads)
     assert await hass.config_entries.async_unload(entry.entry_id)

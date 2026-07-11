@@ -35,9 +35,14 @@ from .const import (
     AVAILABILITY_OFFLINE,
     AVAILABILITY_ONLINE,
     COMPONENT_BUS_WATCHDOG,
+    COMPONENT_HA_MIRROR,
     COMPONENT_VOICE,
     COMPONENT_WIFI_WATCHDOG,
     CONF_COMPONENTS,
+    CONF_HA_MIRROR_LABEL,
+    CONF_HA_MIRROR_LEADER_PRIORITY,
+    CONF_HA_MIRROR_TOKEN,
+    CONF_HA_MIRROR_WS_URL,
     CONF_HOST,
     CONF_MESH_PRIORITY,
     CONF_MQTT_HOST,
@@ -51,6 +56,8 @@ from .const import (
     DATA_LAST_FIRMWARE,
     DATA_SSH_HOST_KEY,
     DEFAULT_AUTO_REPAIR,
+    DEFAULT_HA_MIRROR_LABEL,
+    DEFAULT_HA_MIRROR_LEADER_PRIORITY,
     DEFAULT_OFFLINE_GRACE_MINUTES,
     DEFAULT_REPAIR_COOLDOWN_MINUTES,
     DEFAULT_TRUST_HOST_KEY_CHANGES,
@@ -473,6 +480,42 @@ class PanelManager:
                             await panel_ops.enable_bus_watchdog(shell)
                         except (OSError, asyncssh.Error, PanelOpError) as err:
                             _LOGGER.warning("%s: bus watchdog repair failed: %s", self.panel, err)
+                    # HA mirror re-lay: refresh its code, unit, and secret env whenever
+                    # selected. Failure is isolated so it cannot block bridge recovery.
+                    if COMPONENT_HA_MIRROR in selected_ids(self.entry.data):
+                        try:
+                            mirror_unit = await self.hass.async_add_executor_job(
+                                (_payload_dir() / "brilliant-ha-mirror.service").read_text
+                            )
+                            mirror_env = panel_ops.render_ha_mirror_env(
+                                panel=self.entry.data[CONF_PANEL],
+                                ha_ws_url=self.entry.data[CONF_HA_MIRROR_WS_URL],
+                                ha_token=self.entry.data[CONF_HA_MIRROR_TOKEN],
+                                mirror_label=self.entry.data.get(
+                                    CONF_HA_MIRROR_LABEL, DEFAULT_HA_MIRROR_LABEL
+                                ),
+                                leader_priority=self.entry.data.get(
+                                    CONF_HA_MIRROR_LEADER_PRIORITY,
+                                    DEFAULT_HA_MIRROR_LEADER_PRIORITY,
+                                ),
+                                mqtt_host=self.entry.data[CONF_MQTT_HOST],
+                                mqtt_port=self.entry.data[CONF_MQTT_PORT],
+                                mqtt_username=self.entry.data[CONF_MQTT_USERNAME],
+                                mqtt_password=self.entry.data[CONF_MQTT_PASSWORD],
+                            )
+                            await panel_ops.deploy_ha_mirror(
+                                shell, str(_payload_dir() / "ha_mirror")
+                            )
+                            await panel_ops.ensure_ha_mirror_config(shell, mirror_unit, mirror_env)
+                            await panel_ops.enable_ha_mirror(shell)
+                        except (
+                            KeyError,
+                            ValueError,
+                            OSError,
+                            asyncssh.Error,
+                            PanelOpError,
+                        ) as err:
+                            _LOGGER.warning("%s: HA mirror repair failed: %s", self.panel, err)
                 except (OSError, asyncssh.Error, PanelOpError) as err:
                     # A checked step (mkdir/daemon-reload/systemctl) exited non-zero.
                     # The panel is half-broken; surface it loudly instead of letting
@@ -839,6 +882,44 @@ class PanelManager:
                         except (OSError, asyncssh.Error, PanelOpError):
                             _LOGGER.warning(
                                 "%s: bus watchdog refresh failed; will retry next reconcile",
+                                self.panel,
+                            )
+                    # HA mirror: refresh code plus live/staged secret env after OTA.
+                    if COMPONENT_HA_MIRROR in selected_ids(self.entry.data):
+                        try:
+                            mirror_unit = await self.hass.async_add_executor_job(
+                                (_payload_dir() / "brilliant-ha-mirror.service").read_text
+                            )
+                            mirror_env = panel_ops.render_ha_mirror_env(
+                                panel=self.entry.data[CONF_PANEL],
+                                ha_ws_url=self.entry.data[CONF_HA_MIRROR_WS_URL],
+                                ha_token=self.entry.data[CONF_HA_MIRROR_TOKEN],
+                                mirror_label=self.entry.data.get(
+                                    CONF_HA_MIRROR_LABEL, DEFAULT_HA_MIRROR_LABEL
+                                ),
+                                leader_priority=self.entry.data.get(
+                                    CONF_HA_MIRROR_LEADER_PRIORITY,
+                                    DEFAULT_HA_MIRROR_LEADER_PRIORITY,
+                                ),
+                                mqtt_host=self.entry.data[CONF_MQTT_HOST],
+                                mqtt_port=self.entry.data[CONF_MQTT_PORT],
+                                mqtt_username=self.entry.data[CONF_MQTT_USERNAME],
+                                mqtt_password=self.entry.data[CONF_MQTT_PASSWORD],
+                            )
+                            await panel_ops.deploy_ha_mirror(
+                                shell, str(_payload_dir() / "ha_mirror")
+                            )
+                            await panel_ops.ensure_ha_mirror_config(shell, mirror_unit, mirror_env)
+                            await panel_ops.enable_ha_mirror(shell)
+                        except (
+                            KeyError,
+                            ValueError,
+                            OSError,
+                            asyncssh.Error,
+                            PanelOpError,
+                        ):
+                            _LOGGER.warning(
+                                "%s: HA mirror refresh failed; will retry next reconcile",
                                 self.panel,
                             )
                 finally:

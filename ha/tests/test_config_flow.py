@@ -17,9 +17,14 @@ from custom_components.brilliant_mqtt import config_flow, panel_ops
 from custom_components.brilliant_mqtt.config_flow import _PanelProbe, _slugify, _WrongPanelError
 from custom_components.brilliant_mqtt.const import (
     COMPONENT_BRIDGE,
+    COMPONENT_HA_MIRROR,
     COMPONENT_VOICE,
     COMPONENT_WIFI_WATCHDOG,
     CONF_COMPONENTS,
+    CONF_HA_MIRROR_LABEL,
+    CONF_HA_MIRROR_LEADER_PRIORITY,
+    CONF_HA_MIRROR_TOKEN,
+    CONF_HA_MIRROR_WS_URL,
     CONF_HOST,
     CONF_MESH_PRIORITY,
     CONF_MQTT_HOST,
@@ -31,6 +36,8 @@ from custom_components.brilliant_mqtt.const import (
     CONF_VOICE_HA_HOST,
     CONF_VOICE_WAKE_WORD,
     DATA_SSH_HOST_KEY,
+    DEFAULT_HA_MIRROR_LABEL,
+    DEFAULT_HA_MIRROR_LEADER_PRIORITY,
     DOMAIN,
     OPT_AUTO_REPAIR,
     OPT_OFFLINE_GRACE_MINUTES,
@@ -58,6 +65,11 @@ SCRIPT_INPUT = {
     COMPONENT_VOICE: False,
     CONF_VOICE_WAKE_WORD: "okay_nabu",
     CONF_VOICE_HA_HOST: "",
+    COMPONENT_HA_MIRROR: False,
+    CONF_HA_MIRROR_WS_URL: "",
+    CONF_HA_MIRROR_TOKEN: "",
+    CONF_HA_MIRROR_LEADER_PRIORITY: DEFAULT_HA_MIRROR_LEADER_PRIORITY,
+    CONF_HA_MIRROR_LABEL: DEFAULT_HA_MIRROR_LABEL,
 }
 
 FETCH_VOICE = "custom_components.brilliant_mqtt.components.async_fetch_voice_payload"
@@ -74,6 +86,11 @@ RECONFIG_INPUT = {
     COMPONENT_WIFI_WATCHDOG: False,
     CONF_VOICE_WAKE_WORD: "okay_nabu",
     CONF_VOICE_HA_HOST: "",
+    COMPONENT_HA_MIRROR: False,
+    CONF_HA_MIRROR_WS_URL: "",
+    CONF_HA_MIRROR_TOKEN: "",
+    CONF_HA_MIRROR_LEADER_PRIORITY: DEFAULT_HA_MIRROR_LEADER_PRIORITY,
+    CONF_HA_MIRROR_LABEL: DEFAULT_HA_MIRROR_LABEL,
 }
 
 
@@ -814,6 +831,56 @@ async def test_install_step_persists_components(
     assert patch_installs.called(COMPONENT_VOICE)
 
 
+@pytest.mark.asyncio
+async def test_install_step_collects_ha_mirror_config_and_installs(
+    hass: HomeAssistant,
+    not_installed_panel: None,
+    patch_installs: Any,
+) -> None:
+    result = await _drive_flow_to_script(hass)
+    token = "long-lived-secret-token"
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {
+            **SCRIPT_INPUT,
+            CONF_NAME: "Office",
+            COMPONENT_HA_MIRROR: True,
+            CONF_HA_MIRROR_WS_URL: "ws://homeassistant.local:8123/api/websocket",
+            CONF_HA_MIRROR_TOKEN: token,
+            CONF_HA_MIRROR_LEADER_PRIORITY: 7,
+            CONF_HA_MIRROR_LABEL: "downstairs",
+        },
+    )
+    assert result["type"] == "create_entry"
+    data = result["data"]
+    assert data[CONF_COMPONENTS][COMPONENT_HA_MIRROR] is True
+    assert data[CONF_HA_MIRROR_WS_URL] == "ws://homeassistant.local:8123/api/websocket"
+    assert data[CONF_HA_MIRROR_TOKEN] == token
+    assert data[CONF_HA_MIRROR_LEADER_PRIORITY] == 7
+    assert data[CONF_HA_MIRROR_LABEL] == "downstairs"
+    assert patch_installs.called(COMPONENT_HA_MIRROR)
+
+
+@pytest.mark.parametrize("priority", [-1, 100])
+async def test_ha_mirror_leader_priority_rejects_out_of_range_values(
+    hass: HomeAssistant, not_installed_panel: None, priority: int
+) -> None:
+    result = await _drive_flow_to_script(hass)
+    schema = result["data_schema"]
+    assert schema is not None
+    with pytest.raises(vol.Invalid) as err:
+        schema(
+            {
+                **SCRIPT_INPUT,
+                COMPONENT_HA_MIRROR: True,
+                CONF_HA_MIRROR_WS_URL: "ws://homeassistant.local:8123/api/websocket",
+                CONF_HA_MIRROR_TOKEN: "secret",
+                CONF_HA_MIRROR_LEADER_PRIORITY: priority,
+            }
+        )
+    assert err.value.path == [CONF_HA_MIRROR_LEADER_PRIORITY]
+
+
 # --- options ---------------------------------------------------------------
 
 
@@ -851,7 +918,11 @@ async def start_reconfigure(hass: HomeAssistant, entry: MockConfigEntry) -> Any:
 
 
 def reconfigure_input(
-    entry: MockConfigEntry, *, voice: bool | None = None, wifi_watchdog: bool | None = None
+    entry: MockConfigEntry,
+    *,
+    voice: bool | None = None,
+    wifi_watchdog: bool | None = None,
+    ha_mirror: bool | None = None,
 ) -> dict[str, Any]:
     """Build a full reconfigure user_input dict from entry data.
 
@@ -862,6 +933,7 @@ def reconfigure_input(
     comps: dict[str, bool] = dict(data.get(CONF_COMPONENTS) or {})
     current_voice = bool(comps.get(COMPONENT_VOICE, False))
     current_wd = bool(comps.get(COMPONENT_WIFI_WATCHDOG, False))
+    current_ha_mirror = bool(comps.get(COMPONENT_HA_MIRROR, False))
     return {
         CONF_HOST: data[CONF_HOST],
         CONF_ROOT_PASSWORD: data[CONF_ROOT_PASSWORD],
@@ -872,8 +944,15 @@ def reconfigure_input(
         CONF_MESH_PRIORITY: data.get(CONF_MESH_PRIORITY, 0),
         COMPONENT_VOICE: voice if voice is not None else current_voice,
         COMPONENT_WIFI_WATCHDOG: wifi_watchdog if wifi_watchdog is not None else current_wd,
+        COMPONENT_HA_MIRROR: ha_mirror if ha_mirror is not None else current_ha_mirror,
         CONF_VOICE_WAKE_WORD: data.get(CONF_VOICE_WAKE_WORD, "okay_nabu"),
         CONF_VOICE_HA_HOST: data.get(CONF_VOICE_HA_HOST, ""),
+        CONF_HA_MIRROR_WS_URL: data.get(CONF_HA_MIRROR_WS_URL, ""),
+        CONF_HA_MIRROR_TOKEN: data.get(CONF_HA_MIRROR_TOKEN, ""),
+        CONF_HA_MIRROR_LEADER_PRIORITY: data.get(
+            CONF_HA_MIRROR_LEADER_PRIORITY, DEFAULT_HA_MIRROR_LEADER_PRIORITY
+        ),
+        CONF_HA_MIRROR_LABEL: data.get(CONF_HA_MIRROR_LABEL, DEFAULT_HA_MIRROR_LABEL),
     }
 
 
@@ -937,6 +1016,54 @@ async def test_reconfigure_rejects_control_char_in_voice_ha_host(
         result = await hass.config_entries.flow.async_configure(result["flow_id"], bad_input)
     assert result["type"] == "form"
     assert result["errors"] == {CONF_VOICE_HA_HOST: "invalid_value"}
+    apply.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reconfigure_updates_ha_mirror_config(
+    hass: HomeAssistant,
+    patch_installs: Any,
+) -> None:
+    entry = _full_entry(
+        hass,
+        **{
+            CONF_COMPONENTS: {COMPONENT_BRIDGE: True, COMPONENT_HA_MIRROR: True},
+            CONF_HA_MIRROR_WS_URL: "ws://old-ha:8123/api/websocket",
+            CONF_HA_MIRROR_TOKEN: "old-secret",
+            CONF_HA_MIRROR_LEADER_PRIORITY: 2,
+            CONF_HA_MIRROR_LABEL: "old-label",
+        },
+    )
+    result = await start_reconfigure(hass, entry)
+    updated = {
+        **reconfigure_input(entry),
+        CONF_HA_MIRROR_WS_URL: "wss://new-ha.example/api/websocket",
+        CONF_HA_MIRROR_TOKEN: "new-secret",
+        CONF_HA_MIRROR_LEADER_PRIORITY: 9,
+        CONF_HA_MIRROR_LABEL: "upstairs",
+    }
+    with patch(APPLY, return_value="ssh-ed25519 STORED"):
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], updated)
+    assert result["type"] == "abort" and result["reason"] == "reconfigure_successful"
+    assert entry.data[CONF_HA_MIRROR_WS_URL] == "wss://new-ha.example/api/websocket"
+    assert entry.data[CONF_HA_MIRROR_TOKEN] == "new-secret"
+    assert entry.data[CONF_HA_MIRROR_LEADER_PRIORITY] == 9
+    assert entry.data[CONF_HA_MIRROR_LABEL] == "upstairs"
+    assert not patch_installs.called(COMPONENT_HA_MIRROR)
+    assert not patch_installs.removed(COMPONENT_HA_MIRROR)
+
+
+@pytest.mark.asyncio
+async def test_reconfigure_rejects_control_char_in_ha_mirror_token(
+    hass: HomeAssistant,
+) -> None:
+    entry = _full_entry(hass)
+    result = await start_reconfigure(hass, entry)
+    bad_input = {**reconfigure_input(entry), CONF_HA_MIRROR_TOKEN: "secret\nvalue"}
+    with patch(APPLY) as apply:
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], bad_input)
+    assert result["type"] == "form"
+    assert result["errors"] == {CONF_HA_MIRROR_TOKEN: "invalid_value"}
     apply.assert_not_called()
 
 
