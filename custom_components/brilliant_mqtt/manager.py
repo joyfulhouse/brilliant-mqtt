@@ -14,7 +14,7 @@ import asyncio
 import json
 import logging
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -99,6 +99,21 @@ class _HostKeyChanged(Exception):
 def _payload_dir() -> Path:
     """The bundled agent payload (built by scripts/build_payload.sh / release CI)."""
     return Path(__file__).parent / "agent_payload"
+
+
+def _ha_mirror_env_from_data(data: Mapping[str, Any]) -> str:
+    """Render the HA mirror env from config-entry data."""
+    return panel_ops.render_ha_mirror_env(
+        panel=data[CONF_PANEL],
+        ha_ws_url=data.get(CONF_HA_MIRROR_WS_URL, ""),
+        ha_token=data.get(CONF_HA_MIRROR_TOKEN, ""),
+        mirror_label=data.get(CONF_HA_MIRROR_LABEL, DEFAULT_HA_MIRROR_LABEL),
+        leader_priority=data.get(CONF_HA_MIRROR_LEADER_PRIORITY, DEFAULT_HA_MIRROR_LEADER_PRIORITY),
+        mqtt_host=data[CONF_MQTT_HOST],
+        mqtt_port=data[CONF_MQTT_PORT],
+        mqtt_username=data[CONF_MQTT_USERNAME],
+        mqtt_password=data[CONF_MQTT_PASSWORD],
+    )
 
 
 class _PayloadState(Protocol):
@@ -392,10 +407,7 @@ class PanelManager:
         self,
         shell: PanelShell,
         spec: _WatchdogRelaySpec,
-        *,
-        warning_message: str,
-        warning_includes_error: bool,
-    ) -> None:
+    ) -> Exception | None:
         """Restore one selected watchdog without blocking the bridge operation."""
         try:
             payload_dir = _payload_dir()
@@ -408,39 +420,17 @@ class PanelManager:
             await spec.ensure_unit(shell, unit)
             await spec.enable(shell)
         except (OSError, asyncssh.Error, PanelOpError) as err:
-            if warning_includes_error:
-                _LOGGER.warning(warning_message, self.panel, err)
-            else:
-                _LOGGER.warning(warning_message, self.panel)
+            return err
+        return None
 
-    async def _relay_ha_mirror(
-        self,
-        shell: PanelShell,
-        *,
-        warning_message: str,
-        warning_includes_error: bool,
-    ) -> None:
+    async def _relay_ha_mirror(self, shell: PanelShell) -> Exception | None:
         """Restore the selected HA mirror without blocking the bridge operation."""
         try:
             payload_dir = _payload_dir()
             unit = await self.hass.async_add_executor_job(
                 (payload_dir / "brilliant-ha-mirror.service").read_text
             )
-            data = self.entry.data
-            env = panel_ops.render_ha_mirror_env(
-                panel=self.panel,
-                ha_ws_url=data[CONF_HA_MIRROR_WS_URL],
-                ha_token=data[CONF_HA_MIRROR_TOKEN],
-                mirror_label=data.get(CONF_HA_MIRROR_LABEL, DEFAULT_HA_MIRROR_LABEL),
-                leader_priority=data.get(
-                    CONF_HA_MIRROR_LEADER_PRIORITY,
-                    DEFAULT_HA_MIRROR_LEADER_PRIORITY,
-                ),
-                mqtt_host=data[CONF_MQTT_HOST],
-                mqtt_port=data[CONF_MQTT_PORT],
-                mqtt_username=data[CONF_MQTT_USERNAME],
-                mqtt_password=data[CONF_MQTT_PASSWORD],
-            )
+            env = _ha_mirror_env_from_data({**self.entry.data, CONF_PANEL: self.panel})
             await panel_ops.deploy_ha_mirror(shell, str(payload_dir / "ha_mirror"))
             await panel_ops.ensure_ha_mirror_config(shell, unit, env)
             await panel_ops.enable_ha_mirror(shell)
@@ -451,10 +441,8 @@ class PanelManager:
             asyncssh.Error,
             PanelOpError,
         ) as err:
-            if warning_includes_error:
-                _LOGGER.warning(warning_message, self.panel, err)
-            else:
-                _LOGGER.warning(warning_message, self.panel)
+            return err
+        return None
 
     async def async_repair(self, trigger: str = "manual") -> None:
         """Restore unit/env + enable; recovery is confirmed by the availability LWT."""
@@ -476,9 +464,11 @@ class PanelManager:
             if self.entry.data.get(CONF_COMPONENTS, {}).get(COMPONENT_VOICE, False):
                 try:
                     voice_tarball = await async_fetch_voice_payload(self.hass)
-                except VoicePayloadError as err:
+                except VoicePayloadError as fetch_err:
                     _LOGGER.warning(
-                        "%s: could not fetch voice payload for repair: %s", self.panel, err
+                        "%s: could not fetch voice payload for repair: %s",
+                        self.panel,
+                        fetch_err,
                     )
             async with self._ssh_lock:
                 try:
@@ -496,9 +486,9 @@ class PanelManager:
                     )
                     self._last_repair_mono = time.monotonic()
                     return  # needs operator action; a recheck would just hit the same mismatch
-                except (OSError, asyncssh.Error, PanelOpError) as err:
+                except (OSError, asyncssh.Error, PanelOpError) as connect_err:
                     self._fire(EVENT_REPAIR_FAILED, {"reason": "unreachable"})
-                    self._set_problem(True, f"panel unreachable: {err}")
+                    self._set_problem(True, f"panel unreachable: {connect_err}")
                     # Record the cooldown so the recheck does not re-offer the root
                     # password to a flapping host every few minutes forever.
                     self._last_repair_mono = time.monotonic()
@@ -526,8 +516,8 @@ class PanelManager:
                     if voice_tarball is not None:
                         try:
                             await self._deploy_voice(shell, voice_tarball)
-                        except (OSError, asyncssh.Error, PanelOpError) as err:
-                            _LOGGER.warning("%s: voice repair failed: %s", self.panel, err)
+                        except (OSError, asyncssh.Error, PanelOpError) as voice_err:
+                            _LOGGER.warning("%s: voice repair failed: %s", self.panel, voice_err)
                             ir.async_create_issue(
                                 self.hass,
                                 DOMAIN,
@@ -550,12 +540,8 @@ class PanelManager:
 
                     selected = selected_ids(self.entry.data)
                     if COMPONENT_WIFI_WATCHDOG in selected:
-                        await self._relay_watchdog(
-                            shell,
-                            _WIFI_WATCHDOG_RELAY,
-                            warning_message="%s: watchdog repair failed: %s",
-                            warning_includes_error=True,
-                        )
+                        if err := await self._relay_watchdog(shell, _WIFI_WATCHDOG_RELAY):
+                            _LOGGER.warning("%s: watchdog repair failed: %s", self.panel, err)
                     # Bus watchdog re-lay: re-write unit to /etc if selected.
                     # OTA wipes /etc/systemd/system/ so the unit disappears after a
                     # firmware update even though the code survives in /var.  Lay it
@@ -563,30 +549,23 @@ class PanelManager:
                     # watchdog keeps running across OTAs.  Failure is logged and
                     # swallowed — a watchdog outage must not block the bridge repair.
                     if COMPONENT_BUS_WATCHDOG in selected:
-                        await self._relay_watchdog(
-                            shell,
-                            _BUS_WATCHDOG_RELAY,
-                            warning_message="%s: bus watchdog repair failed: %s",
-                            warning_includes_error=True,
-                        )
+                        if err := await self._relay_watchdog(shell, _BUS_WATCHDOG_RELAY):
+                            _LOGGER.warning("%s: bus watchdog repair failed: %s", self.panel, err)
                     # HA mirror re-lay: refresh its code, unit, and secret env whenever
                     # selected. Failure is isolated so it cannot block bridge recovery.
                     if COMPONENT_HA_MIRROR in selected:
-                        await self._relay_ha_mirror(
-                            shell,
-                            warning_message="%s: HA mirror repair failed: %s",
-                            warning_includes_error=True,
-                        )
-                except (OSError, asyncssh.Error, PanelOpError) as err:
+                        if err := await self._relay_ha_mirror(shell):
+                            _LOGGER.warning("%s: HA mirror repair failed: %s", self.panel, err)
+                except (OSError, asyncssh.Error, PanelOpError) as repair_err:
                     # A checked step (mkdir/daemon-reload/systemctl) exited non-zero.
                     # The panel is half-broken; surface it loudly instead of letting
                     # the exception escape (silent + entry shows GREEN) or falling
                     # through to the success path (no recovery timer would ever fire).
                     self._fire(
                         EVENT_REPAIR_FAILED,
-                        {"reason": "repair_step_failed", "error": str(err)},
+                        {"reason": "repair_step_failed", "error": str(repair_err)},
                     )
-                    self._escalate(f"repair step failed: {err}")
+                    self._escalate(f"repair step failed: {repair_err}")
                     self._last_repair_mono = time.monotonic()  # gate any retry
                     return
                 finally:
@@ -911,34 +890,26 @@ class PanelManager:
 
                     selected = selected_ids(self.entry.data)
                     if COMPONENT_WIFI_WATCHDOG in selected:
-                        await self._relay_watchdog(
-                            shell,
-                            _WIFI_WATCHDOG_RELAY,
-                            warning_message=(
-                                "%s: watchdog refresh failed; will retry next reconcile"
-                            ),
-                            warning_includes_error=False,
-                        )
+                        if await self._relay_watchdog(shell, _WIFI_WATCHDOG_RELAY):
+                            _LOGGER.warning(
+                                "%s: watchdog refresh failed; will retry next reconcile",
+                                self.panel,
+                            )
                     # Bus watchdog: also re-lay its unit when selected — OTA wipes /etc
                     # and the watchdog unit disappears even though the code in /var survives.
                     if COMPONENT_BUS_WATCHDOG in selected:
-                        await self._relay_watchdog(
-                            shell,
-                            _BUS_WATCHDOG_RELAY,
-                            warning_message=(
-                                "%s: bus watchdog refresh failed; will retry next reconcile"
-                            ),
-                            warning_includes_error=False,
-                        )
+                        if await self._relay_watchdog(shell, _BUS_WATCHDOG_RELAY):
+                            _LOGGER.warning(
+                                "%s: bus watchdog refresh failed; will retry next reconcile",
+                                self.panel,
+                            )
                     # HA mirror: refresh code plus live/staged secret env after OTA.
                     if COMPONENT_HA_MIRROR in selected:
-                        await self._relay_ha_mirror(
-                            shell,
-                            warning_message=(
-                                "%s: HA mirror refresh failed; will retry next reconcile"
-                            ),
-                            warning_includes_error=False,
-                        )
+                        if await self._relay_ha_mirror(shell):
+                            _LOGGER.warning(
+                                "%s: HA mirror refresh failed; will retry next reconcile",
+                                self.panel,
+                            )
                 finally:
                     await shell.close()
         except (OSError, asyncssh.Error, PanelOpError):

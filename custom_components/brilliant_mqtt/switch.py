@@ -62,22 +62,21 @@ class VoiceSatelliteSwitch(BrilliantPanelEntity, SwitchEntity):
 
 
 class _ComponentInstallSwitch(BrilliantPanelEntity, SwitchEntity):
-    """Install/remove an on-panel component through the manager registry."""
+    """Install/remove an on-panel component through the manager registry.
+
+    These components have no manager-level ``async_set_*_enabled`` wrappers, so
+    this switch maps SSH failures to ``HomeAssistantError`` in ``_toggle``. Voice
+    keeps that mapping in its manager wrapper instead.
+    """
 
     _attr_entity_category = EntityCategory.CONFIG
+    _component_id: str
+    _unique_id_suffix: str
+    _failure_translation_key: str
 
-    def __init__(
-        self,
-        entry: BrilliantMqttConfigEntry,
-        *,
-        component_id: str,
-        unique_id_suffix: str,
-        failure_translation_key: str,
-    ) -> None:
+    def __init__(self, entry: BrilliantMqttConfigEntry) -> None:
         super().__init__(entry.runtime_data)
-        self._component_id = component_id
-        self._failure_translation_key = failure_translation_key
-        self._attr_unique_id = f"{entry.entry_id}_{unique_id_suffix}"
+        self._attr_unique_id = f"{entry.entry_id}_{self._unique_id_suffix}"
 
     @property
     def is_on(self) -> bool:
@@ -112,45 +111,24 @@ class WifiWatchdogSwitch(_ComponentInstallSwitch):
     """Install/remove the on-panel Wi-Fi watchdog."""
 
     _attr_translation_key = "wifi_watchdog_enabled"
-
-    def __init__(self, entry: BrilliantMqttConfigEntry) -> None:
-        super().__init__(
-            entry,
-            component_id=COMPONENT_WIFI_WATCHDOG,
-            unique_id_suffix="wifi_watchdog_enabled",
-            failure_translation_key="wifi_watchdog_failed",
-        )
+    _component_id = COMPONENT_WIFI_WATCHDOG
+    _unique_id_suffix = "wifi_watchdog_enabled"
+    _failure_translation_key = "wifi_watchdog_failed"
 
 
 class BusWatchdogSwitch(_ComponentInstallSwitch):
-    """Install/remove the on-panel bus watchdog — mirrors the Wi-Fi watchdog switch.
-
-    Reboots the panel if the Brilliant bus stays wedged for 30+ minutes. Like the
-    Wi-Fi watchdog, there is no manager-level ``async_set_*_enabled`` wrapper for this
-    component, so the SSH-error-to-HomeAssistantError mapping happens here instead,
-    against the generic ``async_install_component``/``async_remove_component``.
-    """
+    """Reboots the panel if the Brilliant bus stays wedged for 30+ minutes."""
 
     _attr_translation_key = "bus_watchdog_enabled"
-
-    def __init__(self, entry: BrilliantMqttConfigEntry) -> None:
-        super().__init__(
-            entry,
-            component_id=COMPONENT_BUS_WATCHDOG,
-            unique_id_suffix="bus_watchdog_enabled",
-            failure_translation_key="bus_watchdog_failed",
-        )
+    _component_id = COMPONENT_BUS_WATCHDOG
+    _unique_id_suffix = "bus_watchdog_enabled"
+    _failure_translation_key = "bus_watchdog_failed"
 
 
 class HaMirrorSwitch(_ComponentInstallSwitch):
     """Install/remove the on-panel Home Assistant entity mirror."""
 
     _attr_translation_key = "ha_mirror"
-
-    def __init__(self, entry: BrilliantMqttConfigEntry) -> None:
-        super().__init__(
-            entry,
-            component_id=COMPONENT_HA_MIRROR,
-            unique_id_suffix="ha_mirror_enabled",
-            failure_translation_key="ha_mirror_failed",
-        )
+    _component_id = COMPONENT_HA_MIRROR
+    _unique_id_suffix = "ha_mirror_enabled"
+    _failure_translation_key = "ha_mirror_failed"
