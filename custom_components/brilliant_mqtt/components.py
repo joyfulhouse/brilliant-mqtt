@@ -22,8 +22,6 @@ from .const import (
     COMPONENT_VOICE,
     COMPONENT_WIFI_WATCHDOG,
     CONF_COMPONENTS,
-    CONF_HA_MIRROR_LABEL,
-    CONF_HA_MIRROR_LEADER_PRIORITY,
     CONF_HA_MIRROR_TOKEN,
     CONF_HA_MIRROR_WS_URL,
     CONF_MESH_PRIORITY,
@@ -34,8 +32,6 @@ from .const import (
     CONF_PANEL,
     CONF_VOICE_HA_HOST,
     CONF_VOICE_WAKE_WORD,
-    DEFAULT_HA_MIRROR_LABEL,
-    DEFAULT_HA_MIRROR_LEADER_PRIORITY,
     DEFAULT_VOICE_WAKE_WORD,
     VOICE_PAYLOAD_VERSION,
     panel_device_name,
@@ -100,14 +96,34 @@ async def _wd_present(shell: PanelShell) -> bool:
     return (await panel_ops.inspect_wifi_watchdog(shell)).payload_present
 
 
-async def _wd_install(hass: HomeAssistant, shell: PanelShell, data: Mapping[str, Any]) -> None:
+async def _install_watchdog(
+    hass: HomeAssistant,
+    shell: PanelShell,
+    *,
+    service_filename: str,
+    payload_subdir: str,
+    deploy: Callable[[PanelShell, str], Awaitable[None]],
+    ensure_unit: Callable[[PanelShell, str], Awaitable[None]],
+    enable: Callable[[PanelShell], Awaitable[None]],
+) -> None:
+    """Deploy and enable one watchdog from the bundled payload."""
     payload_dir = _mgr._payload_dir()
-    unit = await hass.async_add_executor_job(
-        (payload_dir / "brilliant-wifi-watchdog.service").read_text
+    unit = await hass.async_add_executor_job((payload_dir / service_filename).read_text)
+    await deploy(shell, str(payload_dir / payload_subdir))
+    await ensure_unit(shell, unit)
+    await enable(shell)
+
+
+async def _wd_install(hass: HomeAssistant, shell: PanelShell, data: Mapping[str, Any]) -> None:
+    await _install_watchdog(
+        hass,
+        shell,
+        service_filename="brilliant-wifi-watchdog.service",
+        payload_subdir="wifi_watchdog",
+        deploy=panel_ops.deploy_wifi_watchdog,
+        ensure_unit=panel_ops.ensure_wifi_watchdog_unit,
+        enable=panel_ops.enable_wifi_watchdog,
     )
-    await panel_ops.deploy_wifi_watchdog(shell, str(payload_dir / "wifi_watchdog"))
-    await panel_ops.ensure_wifi_watchdog_unit(shell, unit)
-    await panel_ops.enable_wifi_watchdog(shell)
 
 
 async def _bus_present(shell: PanelShell) -> bool:
@@ -115,13 +131,15 @@ async def _bus_present(shell: PanelShell) -> bool:
 
 
 async def _bus_install(hass: HomeAssistant, shell: PanelShell, data: Mapping[str, Any]) -> None:
-    payload_dir = _mgr._payload_dir()
-    unit = await hass.async_add_executor_job(
-        (payload_dir / "brilliant-bus-watchdog.service").read_text
+    await _install_watchdog(
+        hass,
+        shell,
+        service_filename="brilliant-bus-watchdog.service",
+        payload_subdir="bus_watchdog",
+        deploy=panel_ops.deploy_bus_watchdog,
+        ensure_unit=panel_ops.ensure_bus_watchdog_unit,
+        enable=panel_ops.enable_bus_watchdog,
     )
-    await panel_ops.deploy_bus_watchdog(shell, str(payload_dir / "bus_watchdog"))
-    await panel_ops.ensure_bus_watchdog_unit(shell, unit)
-    await panel_ops.enable_bus_watchdog(shell)
 
 
 async def _hamirror_present(shell: PanelShell) -> bool:
@@ -142,17 +160,7 @@ async def _hamirror_install(
     unit = await hass.async_add_executor_job(
         (payload_dir / "brilliant-ha-mirror.service").read_text
     )
-    env = panel_ops.render_ha_mirror_env(
-        panel=data[CONF_PANEL],
-        ha_ws_url=ha_ws_url,
-        ha_token=ha_token,
-        mirror_label=data.get(CONF_HA_MIRROR_LABEL, DEFAULT_HA_MIRROR_LABEL),
-        leader_priority=data.get(CONF_HA_MIRROR_LEADER_PRIORITY, DEFAULT_HA_MIRROR_LEADER_PRIORITY),
-        mqtt_host=data[CONF_MQTT_HOST],
-        mqtt_port=data[CONF_MQTT_PORT],
-        mqtt_username=data[CONF_MQTT_USERNAME],
-        mqtt_password=data[CONF_MQTT_PASSWORD],
-    )
+    env = _mgr._ha_mirror_env_from_data(data)
     await panel_ops.deploy_ha_mirror(shell, str(payload_dir / "ha_mirror"))
     await panel_ops.ensure_ha_mirror_config(shell, unit, env)
     await panel_ops.enable_ha_mirror(shell)

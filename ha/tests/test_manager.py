@@ -1607,6 +1607,53 @@ async def test_repair_skips_bus_watchdog_when_not_selected(
 
 
 # ---------------------------------------------------------------------------
+# Wi-Fi watchdog staged-copy refresh re-lay (same OTA gap, the non-outage path)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.allow_lingering_timers
+async def test_refresh_staged_copies_relays_wifi_watchdog_unit_when_selected(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    payload_dir: Path,
+) -> None:
+    """When wifi_watchdog is selected, a staged-copy refresh re-lays its unit."""
+    from custom_components.brilliant_mqtt import panel_ops
+    from custom_components.brilliant_mqtt.shell import RunResult
+
+    # Watchdog code lives in /var (OTA-persistent); /etc unit wiped by OTA.
+    wd_payload_ok = RunResult(0, "unit=0\nenabled=0\nactive=0\npayload=1\n", "")
+    shell = FakeShell(responses={panel_ops.WIFI_WATCHDOG_INSPECT_COMMAND: wd_payload_ok})
+    entry_data = {
+        **ENTRY_DATA,
+        CONF_COMPONENTS: {COMPONENT_BRIDGE: True, COMPONENT_WIFI_WATCHDOG: True},
+    }
+    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+        entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=entry_data, version=2)
+        entry.add_to_hass(hass)
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+        async_fire_mqtt_message(
+            hass, "brilliant/office/bridge", '{"agent_version": "0.2.0", "panel_firmware": "v1"}'
+        )
+        await hass.async_block_till_done()
+        async_fire_mqtt_message(
+            hass, "brilliant/office/bridge", '{"agent_version": "0.2.0", "panel_firmware": "v2"}'
+        )
+        await hass.async_block_till_done(wait_background_tasks=True)
+
+    # ensure_wifi_watchdog_unit wrote the unit to /etc and the staged copy.
+    assert any("brilliant-wifi-watchdog.service" in p for (p, _d, _m) in shell.uploads)
+    # enable_wifi_watchdog issued the systemctl command.
+    assert "systemctl enable --now brilliant-wifi-watchdog" in shell.commands
+    # Payload was present in /var → no redeploy of the watchdog code tree.
+    assert not any("wifi_watchdog" in local for (local, _remote) in shell.dir_uploads)
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+# ---------------------------------------------------------------------------
 # Bus watchdog staged-copy refresh re-lay (same OTA gap, the non-outage path)
 # ---------------------------------------------------------------------------
 
