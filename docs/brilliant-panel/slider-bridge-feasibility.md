@@ -14,11 +14,11 @@ discoverable, selectable, routable, persistent, or removable. Those properties
 depend on a real Virtual Control identity and peripheral owner.
 
 No live disposable Virtual-Control-owned HA-backed light exists in the Office
-home at the time of this finding, so native slider-picker admission and physical
-operation remain unconfirmed. Raw bus injection and physical-Control hosting
-are not substitutes: the former rendered transient state without an owner to
-accept commands, and the latter interfered with the real Control's ownership
-responsibilities.
+home at the time of this finding, so Virtual-Control slider-picker admission
+and physical operation remain unconfirmed. Raw bus injection and
+physical-Control hosting are not substitutes: the former rendered transient
+state without an owner to accept commands, and the latter interfered with the
+real Control's ownership responsibilities.
 
 ### 2026-07-13 legacy-tile observation
 
@@ -33,12 +33,17 @@ and that persisted records outlive their host. The offline badge is consistent
 with an absent owner/host rather than missing tile metadata.
 
 The operator confirmed that the three offline Backyard lights were visible on
-the ordinary Backyard room screen, not in the physical-slider target picker.
-This observation does **not** advance the Virtual Control or slider gates. The
-records have no live owner to accept slider writes, they are attached to the
-wrong device type for the proposed architecture, and their presence in a room
-view does not prove admission to the physical-slider target picker. No target
-was selected and no binding was changed.
+the ordinary Backyard room screen. In a later explicit slider-settings check,
+the same HA controls were offered as assignable slider targets. The operator
+did not save a binding and did not operate a slider. This live-confirms picker
+admission for the ordinary `LIGHT` schema even while these particular records
+are offline.
+
+This observation still does **not** advance the Virtual Control ownership,
+online routing, saved-binding, or physical-operation gates. The records have no
+live owner to accept slider writes and are attached to the wrong device type
+for the proposed architecture. Binding one would create a dead target reference
+without testing HA control, so it must remain unbound.
 
 ## Required data path
 

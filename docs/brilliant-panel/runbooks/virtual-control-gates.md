@@ -254,6 +254,10 @@ is authoritative and returns through the internal, non-commanding update path.
 Tile rendering and physical-slider assignability are separate gates. After one
 VC-hosted `LIGHT` renders:
 
+> Three offline physical-Control-owned legacy HA lights were offered as
+> assignable targets on 2026-07-13, but none was bound or operated. This proves
+> ordinary `LIGHT` picker admission only and does not satisfy VC5.
+
 1. Confirm it appears in the native physical-slider target picker. Absence is a
    blocked result; never bypass the picker with a hand-written `slider_config`.
 2. Snapshot the selected Office slider's complete binding and wired/default
