@@ -50,7 +50,12 @@ docs/claude/
 # binaries, decompiler projects, and analysis scratch space). Only sanitized
 # manifests and documentation belong in git.
 artifacts/
+artifacts/brilliant-panel/pilots/virtual-control/
+**/virtual-control-identity/
+**/vc-captures/
 *.gpr
 *.rep
+*.pcap
+*.pcapng
 pilot-logs/
 var-collections/
