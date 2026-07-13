@@ -26,6 +26,18 @@ from brilliant_mqtt.model import BrilliantDevice
 
 ALLOWED_ID_PREFIXES = ("ha_", "ha-pilot-", "zzz_mirror_")
 ALLOWED_NAME_PREFIXES = ("HA ", "HA_PILOT_", "ZZZ Mirror ")
+# The July 2026 room-assignment pilot used display labels as peripheral IDs.
+# Keep these fail-closed instead of broadening the ID prefix allowlist to every
+# user-visible name beginning with "HA ".
+EXACT_LEGACY_ID_NAMES = frozenset(
+    {
+        "HA Backyard Lamp 1",
+        "HA Backyard Lamp 2",
+        "HA Backyard Lamp 3",
+        "HA Balcony Lamp 1",
+        "HA Balcony Lamp 2",
+    }
+)
 SAFE_REPORT_ROOT = Path("/data/brilliant-mqtt/cleanup")
 
 _SOCKET_PATH = "/var/run/brilliant/server_socket"
@@ -107,12 +119,19 @@ def is_candidate(device: BrilliantDevice) -> bool:
     """Return true only when both case-sensitive allowlist dimensions match."""
     peripheral_id = device.peripheral_id
     name = device.name
-    return (
+    prefix_match = (
         isinstance(peripheral_id, str)
         and isinstance(name, str)
         and peripheral_id.startswith(ALLOWED_ID_PREFIXES)
         and name.startswith(ALLOWED_NAME_PREFIXES)
     )
+    exact_legacy_match = (
+        isinstance(peripheral_id, str)
+        and isinstance(name, str)
+        and peripheral_id == name
+        and peripheral_id in EXACT_LEGACY_ID_NAMES
+    )
+    return prefix_match or exact_legacy_match
 
 
 def select_candidates(devices: Sequence[BrilliantDevice]) -> tuple[BrilliantDevice, ...]:

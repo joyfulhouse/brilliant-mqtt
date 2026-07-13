@@ -71,6 +71,36 @@ def test_candidate_requires_any_allowlisted_prefix_on_both_dimensions(
 
 
 @pytest.mark.parametrize(
+    "label",
+    [
+        "HA Backyard Lamp 1",
+        "HA Backyard Lamp 2",
+        "HA Backyard Lamp 3",
+        "HA Balcony Lamp 1",
+        "HA Balcony Lamp 2",
+    ],
+)
+def test_candidate_recognizes_observed_room_assignment_remnants(label: str) -> None:
+    assert is_candidate(_device(label, label))
+
+
+@pytest.mark.parametrize(
+    ("peripheral_id", "name"),
+    [
+        ("HA Backyard Lamp 4", "HA Backyard Lamp 4"),
+        ("HA Balcony Lamp 3", "HA Balcony Lamp 3"),
+        ("HA Backyard Lamp 1 copy", "HA Backyard Lamp 1 copy"),
+        ("ha Backyard Lamp 1", "ha Backyard Lamp 1"),
+        ("HA Backyard Lamp 1", "HA Backyard Lamp 2"),
+    ],
+)
+def test_candidate_rejects_near_misses_for_observed_room_assignment_remnants(
+    peripheral_id: str, name: str
+) -> None:
+    assert not is_candidate(_device(peripheral_id, name))
+
+
+@pytest.mark.parametrize(
     ("peripheral_id", "name"),
     [
         ("gangbox_peripheral_0", "SHADE HA Sconce"),

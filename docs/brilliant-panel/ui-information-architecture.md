@@ -163,8 +163,10 @@ special `MUSIC` path. The persisted `CapTouchSliderConfig` names the target
 
 Consequently, DeviceType 6 (`VIRTUAL_CONTROL`) is not itself an eligibility
 blocker for a correctly owned `LIGHT`. Its admission to the native selector is
-still **not live-validated** because the Office home currently has no Virtual
-Control or hosted HA light. Tile visibility alone does not prove
+still **not live-validated** because the Office home currently has no live
+Virtual-Control-owned HA light. Five stale physical-Control-hosted mirror
+records do render in their assigned rooms, but show offline with their host
+absent. Tile visibility alone does not prove
 physical-slider assignability; the [slider feasibility analysis](slider-bridge-feasibility.md)
 and Virtual Control gates require native selection, operator-performed physical
 operation after separate approval, restart persistence, exact binding

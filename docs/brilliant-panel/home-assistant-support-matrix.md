@@ -85,6 +85,12 @@ callback or delete was observed. See the
 | Other native HA switch/lock/cover tiles | **Blocked research** | Physical-Control hosting rejected. Virtual Control must first pass provisioning, ownership, rendering, routing, WAN-isolation, resource, and cleanup gates with the single light. |
 | Room overrides | **Implemented manifest metadata** | Entity area precedes device area and explicit overrides are case-insensitive; metadata does not render a native tile. |
 
+On 2026-07-13, five stale legacy mirror `LIGHT` records rendered in their
+Backyard/Balcony rooms but showed offline because their physical-Control host
+was no longer running. This live-confirms native light rendering plus room
+placement for the deprecated ownership model. It does not confirm a Virtual
+Control, slider-picker eligibility, command routing, or HA feedback.
+
 ## What the current integration gets right
 
 1. **One source of truth for scalar auxiliary entities.** `AUX_SPECS` drives discovery, state rendering, and command translation together.

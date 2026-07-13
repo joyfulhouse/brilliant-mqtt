@@ -96,6 +96,13 @@ This layout allows an OTA to replace `/data/switch-embedded` and `/data/switch-u
 
 Live testing showed that peripherals hosted on a Control's own device can remain in persistent object-store state after the host process exits and across reboot. This explains why a crashed or replaced HA-mirror leader can leave native-UI phantoms.
 
+On 2026-07-13, five exact room-assignment pilot records were still present on
+Office's own physical-Control device and rendered in the Backyard/Balcony UI as
+offline lights even though the mirror unit, payload, environment, and process
+were absent. Their ordinary `LIGHT` variables and room metadata remained, but
+there was no active host to answer requests or refresh state. This confirms
+that tile visibility and owner liveness are separate conditions.
+
 Required lifecycle behavior:
 
 - use deterministic peripheral IDs;

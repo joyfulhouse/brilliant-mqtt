@@ -96,6 +96,13 @@ peripherals are excluded. If an eligible peripheral ID occurs more than once,
 every occurrence of that ID is excluded as ambiguous. Do not rename a record to
 make it pass.
 
+One fail-closed exception covers the exact five IDs from the July 2026
+room-assignment pilot: `HA Backyard Lamp 1` through `HA Backyard Lamp 3` and
+`HA Balcony Lamp 1` through `HA Balcony Lamp 2`. That pilot used each display
+label verbatim as its peripheral ID. The cleanup code requires an exact
+case-sensitive ID/name equality match for one of those five strings; it does
+not broaden the ID allowlist to arbitrary names beginning with `HA `.
+
 ### 1. Dry run
 
 Run this first on the panel with the exact deployed agent interpreter and module
