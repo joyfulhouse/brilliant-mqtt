@@ -14,10 +14,11 @@ discoverable, selectable, routable, persistent, or removable. Those properties
 depend on a real Virtual Control identity and peripheral owner.
 
 No live disposable Virtual-Control-owned HA-backed light exists in the Office
-home at the time of this finding, so the native selector and physical operation
-remain unconfirmed. Raw bus injection and physical-Control hosting are not substitutes:
-the former rendered transient state without an owner to accept commands, and
-the latter interfered with the real Control's ownership responsibilities.
+home at the time of this finding, so Virtual-Control picker admission and
+physical operation remain unconfirmed. Raw bus injection and physical-Control
+hosting are not substitutes: the former rendered transient state without an
+owner to accept commands, and the latter interfered with the real Control's
+ownership responsibilities.
 
 ### 2026-07-13 legacy-tile observation
 
@@ -31,10 +32,16 @@ tile renderer accepts the ordinary light schema and room-assignment metadata,
 and that persisted records outlive their host. The offline badge is consistent
 with an absent owner/host rather than missing tile metadata.
 
-This observation does **not** advance the Virtual Control or slider gates. The
-records have no live owner to accept slider writes, they are attached to the
-wrong device type for the proposed architecture, and their presence in a room
-view does not prove admission to the physical-slider target picker.
+The operator subsequently opened the Office physical-slider target picker
+without selecting or saving a binding and saw the three offline Backyard
+lights. This live-confirms that the picker admits these physical-Control-owned
+`LIGHT` records despite their offline state. It validates the target type and
+selector metadata more strongly than room rendering alone.
+
+This observation still does **not** advance the Virtual Control ownership,
+online routing, binding, or physical-operation gates. The records have no live
+owner to accept slider writes and are attached to the wrong device type for the
+proposed architecture. No target was selected and no binding was changed.
 
 ## Required data path
 
