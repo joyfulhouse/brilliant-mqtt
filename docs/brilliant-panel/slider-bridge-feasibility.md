@@ -1,5 +1,8 @@
 # Home Assistant entity to physical-slider feasibility
 
+For the current live evidence ledger and ordered remaining work, see
+[Native HA light and physical-slider validation status](native-ha-slider-validation-status.md).
+
 ## Current decision
 
 Bridging a Home Assistant light to a Brilliant physical cap-touch slider is
@@ -143,6 +146,28 @@ cannot echo into another command. A broker reconnect keeps the single native
 host but fences commands until retained HA authority is replayed; transient HA
 unavailability similarly shows safe `off` and remains fenced until recovery.
 
+Three additional repository-safe validators make the live acceptance criteria
+executable without granting them mutation authority:
+
+- `tools.brilliant_vc.slider_binding` reads only Office's own type-19
+  configuration peripheral, strictly decodes every slider target, stores an
+  exact private baseline, and later reports byte-identical restoration. It has
+  no bus-write method.
+- `tools.brilliant_vc.e2e_acceptance` analyzes a private passive transcript and
+  requires one command per operator gesture, a correlated accepted HA result,
+  an advancing state sequence, two-panel native convergence, no echo/snap-back,
+  and bounded latency. It opens no network or panel connection.
+- `tools.brilliant_vc.launcher_preflight` validates pinned firmware hashes,
+  the four-file provisioned identity contract, private isolated directories,
+  and collision-free socket/state/certificate/config paths. It intentionally
+  contains no start primitive and currently reports the official standalone
+  identity consumer unresolved.
+
+The detailed artifact schema and ordered procedure are in the
+[native slider E2E runbook](runbooks/native-slider-e2e.md). A reviewed passive
+multi-panel transcript collector remains topology-dependent work after a real
+VC exists; analyzer tests are not live evidence.
+
 ## Provisioning boundary
 
 The firmware ships
@@ -179,4 +204,5 @@ provisioned Virtual Control passes all of these checks:
 8. The light and Virtual Control are removed through supported paths, with two
    later snapshots showing no tile, owner, or stale slider reference.
 
-Until then, the accurate integration status is `source-eligible, live-blocked`.
+Until then, the accurate integration status is
+`legacy-picker-proven; virtual-control-live-blocked`.

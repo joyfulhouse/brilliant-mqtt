@@ -107,6 +107,85 @@ local socket, process-config directory, and device ID. VC3 is blocked until a
 dry-run preflight proves those paths and the official identity input contract;
 the mere presence of `--start_as_virtual_control` is not sufficient.
 
+### No-start launcher preflight
+
+`tools.brilliant_vc.launcher_preflight` implements the repository-safe portion
+of VC3. It has no panel-library import, subprocess call, socket connection,
+command builder, or start method. It validates:
+
+- the exact pinned firmware build and three module hashes above;
+- fresh no-follow SHA-256 reads of the three actual installed `.so` files,
+  matched against both the snapshot and pinned digests;
+- the required message-bus, runner, bootstrap, and virtual-control interfaces;
+- exactly four provisioner outputs (`device_id`, `pkcs12_certificate`,
+  `bootstrap`, and `metadata.json`) as root-owned mode-`0600` regular files;
+- device-ID/metadata consistency without opening the PKCS#12 or bootstrap
+  payloads;
+- real root-owned mode-`0700` identity, state, certificate, process-config,
+  persistent-root, and runtime directories;
+- empty state/certificate/process-config/runtime directories and a nonexistent
+  future socket path; and
+- canonical, distinct paths outside `/var/device_variables`,
+  `/var/run/brilliant`, `/var/brilliant`, `/data/switch-embedded`, and the
+  physical `/var/run/brilliant/server_socket`.
+
+Create a root-owned mode-`0600` sanitized introspection snapshot with this
+complete schema. It contains names and hashes only, never identity contents:
+
+```json
+{
+  "schema_version": 1,
+  "firmware_version": "v26.06.03.1",
+  "module_sha256": {
+    "bus.message_bus": "a85b7a2d0c2533db8d803a217027dbdd245bc104f221bf6955907dc0b8f6feb8",
+    "lib.runner": "4ba40ac7d7695dc239590defbc6efd3d22efbf296fc1c2b40f139fb6e1fe3cb0",
+    "peripherals.bootstrap.bootstrap_peripheral": "313d526a3fe1ad1879137a83eaa55096d9b0fb7a08cac30e37a79ea3632d57db"
+  },
+  "message_bus_parameters": [
+    "home_id",
+    "device_id",
+    "mb_state_dir",
+    "is_virtual_control"
+  ],
+  "runner_parameters": ["startable_config", "module_name_override"],
+  "bootstrap_fields": [
+    "target_home_id",
+    "server_authentication_token",
+    "wifi_variables"
+  ],
+  "virtual_control_flag": "start_as_virtual_control"
+}
+```
+
+After provisioning and before any runtime start, prepare empty dedicated
+directories and run:
+
+```text
+python -m tools.brilliant_vc.launcher_preflight \
+  --firmware-snapshot /data/brilliant-vc/evidence/firmware-launcher.json \
+  --persistent-root /data/brilliant-vc \
+  --identity-dir /data/brilliant-vc/identity \
+  --state-dir /data/brilliant-vc/state \
+  --certificate-dir /data/brilliant-vc/certificates \
+  --process-config-dir /data/brilliant-vc/process-config \
+  --runtime-dir /run/brilliant-vc \
+  --socket-path /run/brilliant-vc/server_socket
+```
+
+The current expected result is exit status 2 with all file/hash/path checks
+true, `identity_contract_complete=false`,
+`launcher_implementation_present=false`, `start_permitted=false`, and
+`blocked_reason=official_identity_consumer_unresolved`. This is a useful
+preflight result, not VC3 PASS.
+
+Static evidence has not yet identified a supported standalone callable that
+consumes the returned PKCS#12 and serialized `BootstrapParameters`, maps them to
+the isolated certificate/state/socket/config paths, and starts only the new VC
+message bus. `BootstrapPeripheral` is not accepted as that proof because it is
+part of the physical device bootstrap/reset path. Resolve and review that exact
+consumer contract before implementing any launcher. Do not weaken the
+preflight, invoke `run.py`, or convert its no-start plan into a guessed command.
+
 Once that preflight passes, attach the bounded monitor:
 
 ```text
@@ -269,3 +348,9 @@ VC-hosted `LIGHT` renders:
 5. Restore the exact original binding through the native UI. Two later
    snapshots must contain no VC/pilot reference before the hosted light and
    disposable Virtual Control are removed through the official workflow.
+
+The complete private snapshot, passive transcript, offline analyzer, restart,
+restoration, and artifact-handling procedure is in the
+[native slider E2E runbook](native-slider-e2e.md). The repository now contains
+the read-only binding verifier and offline analyzer; it does not yet contain a
+reviewed live multi-panel transcript collector.

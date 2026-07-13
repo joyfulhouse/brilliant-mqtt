@@ -12,6 +12,7 @@ The central finding is that the panel is not a collection of isolated integratio
 | [`/var` persistence map](var-persistence.md) | Native persistent state, community payloads, sensitive stores, and integration consequences |
 | [Software architecture](software-architecture.md) | OSTree, systemd, uWSGI services, message bus, device graph, and persistence |
 | [UI/UX information architecture](ui-information-architecture.md) | Home navigation, settings hierarchy, screen families, visual language, and interaction patterns |
+| [Native HA slider validation status](native-ha-slider-validation-status.md) | Exact live evidence, safety record, confirmed/unknown boundaries, implemented probes, and ordered remaining gates |
 | [HA entity to physical-slider feasibility](slider-bridge-feasibility.md) | Decompiled slider eligibility, required Virtual Control/light contract, provisioning boundary, and live acceptance gates |
 | [Peripheral and control surfaces](peripheral-surfaces.md) | Firmware type system, high-value variables, command paths, scenes, media, and sensors |
 | [Peripheral type catalog](peripheral-type-catalog.md) | Complete firmware `PeripheralType` enum for `v26.06.03.1` |
@@ -20,6 +21,7 @@ The central finding is that the panel is not a collection of isolated integratio
 | [Home Assistant control and scene bridge](home-assistant-integration.md) | Authoritative ownership model, configuration, MQTT contract, HA surfaces, safety, diagnostics, and migration |
 | [Validation runbook](validation-runbook.md) | Safe static, read-only, telemetry, and write-validation procedures |
 | [Office scene-bridge pilot](runbooks/scene-bridge-pilot.md) | Hardware acceptance, restart/replay checks, rollback, evidence, and legacy-removal gate |
+| [Native slider E2E runbook](runbooks/native-slider-e2e.md) | Private binding baseline, passive gesture transcript, exactly-once/two-panel analysis, restoration, and remaining blockers |
 
 Existing low-level references remain authoritative for the already-proven Python bus client contract:
 
