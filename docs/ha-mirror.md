@@ -98,10 +98,13 @@ make it pass.
 
 ### 1. Dry run
 
-Run this first in the deployed agent Python environment:
+Run this first on the panel with the exact deployed agent interpreter and module
+paths:
 
 ```bash
-python -m brilliant_mqtt.cleanup_legacy_mirror
+PYTHONPATH=/var/brilliant-mqtt/app:/var/brilliant-mqtt/vendor \
+  /data/switch-embedded/env/bin/python3 \
+  -m brilliant_mqtt.cleanup_legacy_mirror
 ```
 
 Dry run performs one scoped snapshot, no delete, no sleep, and no file write. It
@@ -116,16 +119,26 @@ credentials into the report. In dry run, candidates appear in
 `remaining_ids`; `success:true` means inventory completed, not that candidates
 were removed.
 
-Record and review the output. If every candidate is not unmistakably from an
-old HA mirror/pilot, stop. Keep the mirror inactive and investigate manually.
+Review the JSON only on-screen in an unrecorded terminal. Do not redirect it,
+copy it into the ignored pilot artifacts, or record `owning_device_id`, candidate
+IDs, or candidate names. Persist only a manually sanitized candidate count,
+success/failure outcome, and operator decision. If every candidate is not
+unmistakably from an old HA mirror/pilot, stop. Keep the mirror inactive and
+investigate manually.
 
 ### 2. Apply only after a fresh operator decision
 
-Apply is root-only and requires an absolute report path beneath the existing
-`/data/brilliant-mqtt/cleanup/` tree:
+Apply is root-only and requires an absolute report path beneath
+`/data/brilliant-mqtt/cleanup/`. Immediately before an approved apply, prove the
+effective user and create/normalize the private parent directory:
 
 ```bash
-python -m brilliant_mqtt.cleanup_legacy_mirror \
+test "$(id -u)" -eq 0
+install -d -m 0700 /data/brilliant-mqtt/cleanup
+
+PYTHONPATH=/var/brilliant-mqtt/app:/var/brilliant-mqtt/vendor \
+  /data/switch-embedded/env/bin/python3 \
+  -m brilliant_mqtt.cleanup_legacy_mirror \
   --apply \
   --snapshot /data/brilliant-mqtt/cleanup/legacy-mirror-<timestamp>.json
 ```
@@ -146,6 +159,18 @@ owning device, successful native-client shutdown, and a final atomic redacted
 report write. Verification/read/report/shutdown failure produces a nonzero exit
 and conservative `success:false` output. Re-running with no candidates is
 idempotent and performs no delete.
+
+The actual report contains identifiers and remains on-panel, mode 0600. Verify
+its mode and compute its digest without displaying the content:
+
+```bash
+test "$(stat -c %a /data/brilliant-mqtt/cleanup/legacy-mirror-<timestamp>.json)" = 600
+sha256sum /data/brilliant-mqtt/cleanup/legacy-mirror-<timestamp>.json
+```
+
+Only the report SHA-256, sanitized counts/outcome, exit status, and operator
+decision may be copied into the ignored pilot record. Never save the cleanup
+JSON itself in repository artifacts.
 
 ### Abort and rollback expectations
 

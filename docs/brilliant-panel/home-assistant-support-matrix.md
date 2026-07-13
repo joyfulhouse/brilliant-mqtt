@@ -41,8 +41,9 @@
 | Slider double-tap timeout | **Implemented + test** | Numeric mapping; verify native bounds |
 | Load calibration and electrical modes | **Research** | Writable but safety-critical; expert service only |
 | Mesh status-light brightness | **Research** | Live settable variable found on switch config |
-| Scene list/activation | **Research** | Catalog decoded; trigger write unverified |
-| Modes/groups/rooms | **Research** | Schema/UI understood; semantic HA mapping not designed |
+| Scene list/activation | **Implemented + off-panel test** | Scoped catalog/event/confirmed-command bridge; Office hardware acceptance pending |
+| Mode list/activation | **Implemented + off-panel test** | Separate catalog/event/confirmed-command bridge; live test needs a real configured mode |
+| Broader room/group semantics | **Research** | Schema/UI understood; HA room metadata does not render a tile and group lifecycle is not designed |
 | Music/media player | **Research** | Rich MUSIC schema and UI; no forward mapping |
 | Notification/announce | **Research** | UI rich, notification peripheral has no readable vars |
 | Camera/intercom | **Defer to subsystem** | Media/signaling/privacy/resource work, not core MQTT bridge |

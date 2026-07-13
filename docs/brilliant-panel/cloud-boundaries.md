@@ -14,7 +14,7 @@ The panel is local-first at the hardware/control layer but cloud-backed at the a
 | Rooms/groups/scenes/modes | Configuration virtual device + execution engine | Configuration may synchronize through Brilliant services/mobile app | Existing scene/mode execution uses a local bridge; Office hardware acceptance remains pending |
 | HomeKit | On-panel HAP vassal over LAN | None after pairing | Local fallback; failures observed in service lifecycle, not cloud transport |
 | MQTT bridge | On-panel bus client → local broker | None | Local community path |
-| HA scene/mode bridge | Existing panel bus/MQTT session → local HA | None beyond HA/broker availability for cached execution | Supported non-hosting reverse path; pending Office hardware acceptance |
+| HA scene/mode bridge | Existing panel bus/MQTT session → local HA | None beyond HA/broker availability for cached execution | Implemented and off-panel tested; Office hardware acceptance pending |
 | Native HA tiles | Physical hosting rejected; Virtual Control unproven | Virtual Control provisioning/runtime may require Brilliant cloud | Blocked behind explicit feasibility and WAN-isolation gates |
 | Native Alexa | Local wake word/audio plus Amazon OAuth/AVS | Amazon and Brilliant token exchange | Cloud-dependent assistant |
 | Google Assistant linking | UI/account linking and external assistant | Google/Brilliant account services | Cloud-dependent |

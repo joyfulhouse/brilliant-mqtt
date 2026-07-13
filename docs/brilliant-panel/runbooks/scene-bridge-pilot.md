@@ -59,7 +59,11 @@ summaries and protocol payloads known to contain no private data. Do not store a
 decrypted SOPS file, shell history, broad `/var` capture, environment dump, raw
 journal, MQTT credential, account/home identifier, network name, device ID,
 certificate, bootstrap material, HA credential, or panel password, even under
-this ignored directory.
+this ignored directory. Cleanup JSON is especially sensitive: review it only
+on-screen and unrecorded, then discard it. Never save or copy the dry-run or
+apply JSON, owning device ID, candidate IDs, or candidate names into the run
+directory. Persist only sanitized candidate counts/outcome, operator decision,
+exit status, and the private apply report's SHA-256 when applicable.
 
 Use the repository's approved SOPS/sealed-secret workflow to load the panel
 password directly into the temporary `SSHPASS` environment. Do not put the
@@ -138,6 +142,17 @@ uv run --project ha mypy --strict --config-file ha/pyproject.toml \
   custom_components/brilliant_mqtt ha/tests
 uv run --project ha pytest -c ha/pyproject.toml ha/tests
 
+# Syntax-check the embedded observer without executing or importing panel libs.
+PILOT_DOC=docs/brilliant-panel/runbooks/scene-bridge-pilot.md
+awk '/<!-- scoped-observer-shell-start -->/{inside=1; next}
+     /<!-- scoped-observer-shell-end -->/{inside=0}
+     inside' "$PILOT_DOC" | sed '1d;$d' | bash -n
+awk '/<!-- scoped-observer-shell-start -->/{inside=1; next}
+     /<!-- scoped-observer-shell-end -->/{inside=0}
+     inside' "$PILOT_DOC" | sed '1d;$d' |
+  awk '/<<.*PY/{python=1; next} /^PY$/{python=0} python' |
+  python3 -c 'import sys; compile(sys.stdin.read(), "scoped-observer", "exec")'
+
 git diff --exit-code
 ```
 
@@ -175,11 +190,11 @@ load average, free memory, bridge CPU/RSS, disk space, and service states.
 Expected baseline: `message_bus`, `switch_ui_app`, and `brilliant-mqtt` active;
 `brilliant-ha-mirror` inactive or absent.
 
-### 1.2 Panel environment key names only
+### 1.2 Panel environment key names and exact disabled proof
 
-The first command prints names, never values. The second rejects old direct HA
-keys without revealing whether any value existed. The third proves the old
-mirror environment is absent.
+The first command prints names, never values. The second command rejects old
+direct HA keys without revealing whether any value existed, and also proves the
+old mirror environment is absent.
 
 ```bash
 sshpass -e ssh root@<office-panel-ip> \
@@ -195,10 +210,29 @@ sshpass -e ssh root@<office-panel-ip> '
 '
 ```
 
-Record key names and pass/fail only. Expected before enable:
-`SCENE_BRIDGE_ENABLED` exists and is `0` when inspected through the integration's
-adopt/reconfigure state; never print the file to learn the value. The normal
-reconfigure flow is the authoritative value check.
+Prove the scene bridge is disabled without printing the environment file or the
+matched value. The agent defaults the flag to off when the key is absent, so
+either absence or exactly one `SCENE_BRIDGE_ENABLED=0` line is a valid disabled
+state:
+
+```bash
+sshpass -e ssh root@<office-panel-ip> '
+  count=$(grep -c "^SCENE_BRIDGE_ENABLED=" /etc/brilliant-mqtt.env || true)
+  if [ "$count" -eq 0 ]; then
+    echo "scene_bridge_disabled=true"
+  elif [ "$count" -eq 1 ] &&
+       grep -qx "SCENE_BRIDGE_ENABLED=0" /etc/brilliant-mqtt.env; then
+    echo "scene_bridge_disabled=true"
+  else
+    echo "scene_bridge_disabled=false"
+    exit 1
+  fi
+'
+```
+
+Record key names and the safe boolean result only. Run this exact disabled proof
+before the payload redeploy and again after it. Do not infer the state from the
+payload `VERSION`, the config-entry UI, or a service restart.
 
 ### 1.3 Retained MQTT and HA baseline
 
@@ -219,35 +253,168 @@ Brilliant UI.
 
 ### 1.4 Scoped bus observer and peer/host baseline
 
-Use the read-only observer recipe from
-[generic runbook section 3](../validation-runbook.md#3-read-only-bus-validation).
-It must:
+Run this exact on-panel observer. It uses the raw `RPCObserver` /
+`SinglePeerProcessor` path, a random client suffix, scoped reads only, bounded
+operation and shutdown waits, and a shell-level TERM/KILL fallback. It emits
+only counts and booleans. It does **not** print the owning device ID, peripheral
+IDs, variables, values, or names.
 
-1. use a unique, time-bounded client name;
-2. connect only to `/var/run/brilliant/server_socket`;
-3. read the Office owning device, its `execution_peripheral`, and the two scoped
-   configuration peripherals only;
-4. never construct `PeripheralHost`, call `register`, acquire/bid a lease, write a
-   variable, or use a whole-home unbounded host read; and
-5. shut down and prove its one temporary socket peer disappeared.
-
-Count server-socket connections with the same command immediately before the
-observer connects, while it is connected, and after it closes:
-
+<!-- scoped-observer-shell-start -->
 ```bash
 sshpass -e ssh root@<office-panel-ip> '
-  ss -xanp | awk "/\\/var\\/run\\/brilliant\\/server_socket/ {n++}
-                  END {print \"message_bus_socket_rows=\" n+0}"
+  timeout -k 5s 45s \
+    env PYTHONPATH=/data/switch-embedded \
+    /data/switch-embedded/env/bin/python3 - <<'"'"'PY'"'"'
+import asyncio
+import secrets
+
+try:
+    import lib.protocol.message_bus_peer_service as mbps
+    from lib.message_bus_api.observer_interface import RPCObserver
+    from lib.protocol.processor import SinglePeerProcessor
+except BaseException:
+    print("observer_ok=false")
+    raise SystemExit(1)
+
+SOCKET_PATH = "/var/run/brilliant/server_socket"
+
+
+class ReadOnlyObserver(RPCObserver):
+    async def handle_notification(self, notification):
+        del notification
+
+
+def socket_rows():
+    try:
+        with open("/proc/net/unix", encoding="ascii") as stream:
+            return sum(SOCKET_PATH in row for row in stream)
+    except OSError:
+        return -1
+
+
+async def bounded_shutdown(target):
+    if target is None:
+        return True
+    try:
+        await asyncio.wait_for(target.shutdown(), timeout=2.0)
+    except BaseException:
+        return False
+    return True
+
+
+async def probe():
+    loop = asyncio.get_running_loop()
+    observer = ReadOnlyObserver(loop)
+    processor = SinglePeerProcessor(
+        socket_path=SOCKET_PATH,
+        my_name=f"brilliant_scene_pilot_ro-{secrets.token_hex(4)}",
+        handler=mbps.PeripheralServer(observer),
+        client_class=mbps.MessageBusClient,
+        loop=loop,
+    )
+    before = socket_rows()
+    while_connected = -1
+    after = -1
+    own_device_read = False
+    own_peripheral_count = 0
+    execution_present = False
+    scene_present = False
+    mode_present = False
+    reads_ok = False
+    observer_closed = False
+    processor_closed = False
+
+    try:
+        await asyncio.wait_for(processor.start(), timeout=5.0)
+        deadline = loop.time() + 5.0
+        while not processor.is_connected():
+            if loop.time() >= deadline:
+                raise TimeoutError("message bus connection timed out")
+            await asyncio.sleep(0.1)
+        await asyncio.wait_for(observer.start(processor, None), timeout=5.0)
+        while_connected = socket_rows()
+
+        own_id = observer.get_owning_device_id()
+        own_device = await asyncio.wait_for(observer.get_device(own_id), timeout=5.0)
+        own_peripherals = getattr(own_device, "peripherals", None)
+        if own_peripherals is None:
+            raise RuntimeError("owning device snapshot unavailable")
+        own_peripherals = dict(own_peripherals)
+        own_device_read = True
+        own_peripheral_count = len(own_peripherals)
+        execution_present = "execution_peripheral" in own_peripherals
+
+        scene = await asyncio.wait_for(
+            observer.get_peripheral(
+                "configuration_virtual_device", "scene_configuration"
+            ),
+            timeout=5.0,
+        )
+        mode = await asyncio.wait_for(
+            observer.get_peripheral(
+                "configuration_virtual_device", "mode_configuration"
+            ),
+            timeout=5.0,
+        )
+        scene_present = scene is not None
+        mode_present = mode is not None
+        reads_ok = True
+    except BaseException:
+        reads_ok = False
+    finally:
+        observer_closed = await bounded_shutdown(observer)
+        processor_closed = await bounded_shutdown(processor)
+        for _ in range(20):
+            after = socket_rows()
+            if after == before:
+                break
+            await asyncio.sleep(0.1)
+
+    socket_restored = before >= 0 and after == before
+    observer_ok = (
+        reads_ok
+        and while_connected > before >= 0
+        and socket_restored
+        and observer_closed
+        and processor_closed
+    )
+    print(f"socket_rows_before={before}")
+    print(f"socket_rows_while={while_connected}")
+    print(f"socket_rows_after={after}")
+    print(f"socket_rows_restored={str(socket_restored).lower()}")
+    print(f"own_device_read={str(own_device_read).lower()}")
+    print(f"own_peripheral_count={own_peripheral_count}")
+    print(f"execution_peripheral_present={str(execution_present).lower()}")
+    print(f"scene_configuration_present={str(scene_present).lower()}")
+    print(f"mode_configuration_present={str(mode_present).lower()}")
+    print(f"observer_shutdown={str(observer_closed).lower()}")
+    print(f"processor_shutdown={str(processor_closed).lower()}")
+    print(f"observer_ok={str(observer_ok).lower()}")
+    return observer_ok
+
+
+try:
+    result = asyncio.run(asyncio.wait_for(probe(), timeout=35.0))
+except BaseException:
+    print("observer_ok=false")
+    raise SystemExit(1)
+raise SystemExit(0 if result else 1)
+PY
 '
 ```
+<!-- scoped-observer-shell-end -->
 
-This is a repeatable socket-row proxy, not a firmware API claim. Record the
-exact counting method and all three values. The observer should add its known
-temporary row(s) only; the post-close value must equal the pre-observer value.
-Record separately the own-device peripheral count, whether any allowlisted old
-mirror/pilot IDs are present, and that no extra host/manager is constructed.
-Use identical baseline and post-deployment procedures; method changes make the
-criterion `INCONCLUSIVE`.
+This observer calls only `get_owning_device_id()`, `get_device(own_id)`, and the
+two allowlisted `get_peripheral()` reads. It must never be modified to call
+`get_all()`, construct `PeripheralHost`, call `register`, acquire or bid a
+lease, invoke a write/delete method, or subscribe to the whole home graph.
+
+The `/proc/net/unix` count is a repeatable socket-row proxy, not a firmware API
+claim. Require `observer_ok=true`, the while-connected count greater than the
+pre-count, and the post-count exactly equal to the pre-count. Record the method
+and emitted counts/booleans only. Use this identical procedure at baseline and
+after deployment; changing the observer or counting method makes the criterion
+`INCONCLUSIVE`.
 
 ### 1.5 Logs and physical load baseline
 
@@ -277,25 +444,73 @@ calibration or electrical variables.
 
 ## Phase 2: Office-only deployment
 
-1. In Home Assistant, open the Office Brilliant MQTT config entry and choose
-   **Reconfigure**.
-2. Set HA control enabled to on, select `office` as the default scene panel, and
-   enter only the reviewed benign scene-action JSON.
-3. Keep native tiles blocked. There is no native-tile enable control and the
-   diagnostic must remain `blocked` / `validated:false`.
-4. Save through the normal integration flow. Do not use `scp`, a foreground
-   `PeripheralHost`, or the old mirror component.
-5. If the committed payload is not already installed, call the integration's
-   **Redeploy agent** action/service targeted only to the Office config entry.
-   Do not trigger fleet redeploy/repair during this pilot.
-6. Confirm the manager's retirement Repair is clear only after verified mirror
+Never enable a possibly stale payload. Install and prove the exact committed
+integration/payload while scene control remains disabled, then enable it:
+
+1. Through the approved HA integration deployment path, install the Brilliant
+   MQTT custom integration built from the exact Phase 0 commit. Restart or
+   reload HA as required by that path and record the installed commit. A
+   matching payload `VERSION` is necessary but is not source-parity proof.
+2. In Home Assistant, open the Office Brilliant MQTT config entry, choose
+   **Reconfigure**, and explicitly leave HA control disabled. Save through the
+   normal integration flow. Run the exact disabled proof from Phase 1.2 again;
+   require `scene_bridge_disabled=true` before continuing.
+3. Call the integration's **Redeploy agent** action/service targeted only to the
+   Office config entry. This step is mandatory even if the displayed version
+   matches. Do not use `scp` and do not trigger fleet redeploy/repair.
+4. From the exact clean Phase 0 checkout, compare the committed payload files
+   against the installed Office files. All three hashes must match:
+
+   ```bash
+   for name in scene_bridge.py scene_state.py ha_control_protocol.py; do
+     local_path="custom_components/brilliant_mqtt/agent_payload/app/brilliant_mqtt/$name"
+     panel_path="/var/brilliant-mqtt/app/brilliant_mqtt/$name"
+     local_sha=$(sha256sum "$local_path" | awk '{print $1}')
+     panel_sha=$(
+       sshpass -e ssh root@<office-panel-ip> "sha256sum '$panel_path'" |
+         awk '{print $1}'
+     )
+     if [ -z "$local_sha" ] || [ "$local_sha" != "$panel_sha" ]; then
+       echo "$name sha256_match=false"
+       exit 1
+     fi
+     echo "$name sha256_match=true sha256=$local_sha"
+   done
+   ```
+
+5. Run the exact disabled proof from Phase 1.2 after redeploy. Stop unless it
+   emits `scene_bridge_disabled=true`; do not proceed on UI state or version
+   evidence alone.
+6. Only after steps 1–5 pass, reconfigure the Office entry: turn HA control on,
+   select `office` as the default scene panel, and enter only the reviewed
+   benign scene-action JSON. Keep native tiles blocked; the diagnostic must
+   remain `blocked` / `validated:false`. Save through the normal integration
+   flow.
+7. Prove enablement without printing the environment file or matched value:
+
+   ```bash
+   sshpass -e ssh root@<office-panel-ip> '
+     count=$(grep -c "^SCENE_BRIDGE_ENABLED=" /etc/brilliant-mqtt.env || true)
+     if [ "$count" -eq 1 ] &&
+        grep -qx "SCENE_BRIDGE_ENABLED=1" /etc/brilliant-mqtt.env; then
+       echo "scene_bridge_enabled=true"
+     else
+       echo "scene_bridge_enabled=false"
+       exit 1
+     fi
+   '
+   ```
+
+8. Confirm the manager's retirement Repair is clear only after verified mirror
    uninstall. Never start the old service to test it.
 
 The settings are HA-global, but the hardware rollout remains Office-only:
 redeploy/reconfigure only Office. Other panels must not receive a payload restart
 during this gate.
 
-Repeat Phases 1.1–1.5 after deployment. Expected:
+After enablement, repeat Phase 1.1, the key-name/direct-HA/old-mirror checks in
+Phase 1.2, and Phases 1.3–1.5. Do **not** rerun the disabled proof while enabled;
+the Phase 2 `scene_bridge_enabled=true` proof is authoritative. Expected:
 
 - `brilliant-mqtt` active and `brilliant-ha-mirror` inactive/absent;
 - no direct HA key or old mirror environment on-panel;
@@ -419,16 +634,18 @@ Rollback disables only safe scene control:
 
 1. Reconfigure HA control enabled to off.
 2. Apply/redeploy only the Office agent through the integration.
-3. Confirm scene/mode subscriptions and service command availability are gone;
+3. Run the exact disabled proof from Phase 1.2 and require
+   `scene_bridge_disabled=true`.
+4. Confirm scene/mode subscriptions and service command availability are gone;
    retained catalogs/status may remain as broker history and must not be mistaken
    for a live subscription.
-4. Confirm `brilliant-mqtt` forward bridging remains active.
-5. Confirm `brilliant-ha-mirror` remains inactive/absent and no direct HA key is
+5. Confirm `brilliant-mqtt` forward bridging remains active.
+6. Confirm `brilliant-ha-mirror` remains inactive/absent and no direct HA key is
    present.
-6. Repeat the scoped own-device/peer snapshot and prove that no Brilliant
+7. Repeat the scoped own-device/peer snapshot and prove that no Brilliant
    peripheral was deleted or created by disable.
-7. Restore every affected load to its recorded baseline.
-8. Repeat physical control and regression checks.
+8. Restore every affected load to its recorded baseline.
+9. Repeat physical control and regression checks.
 
 Do not remove the whole forward agent as scene rollback. Do not enable the old
 mirror. If rollback cannot restore physical/load/bus baselines, stop and mark
@@ -443,25 +660,39 @@ action and recheck service/peer state.
 Only after scene acceptance is complete, run a cleanup dry run on Office:
 
 ```bash
-python -m brilliant_mqtt.cleanup_legacy_mirror
+PYTHONPATH=/var/brilliant-mqtt/app:/var/brilliant-mqtt/vendor \
+  /data/switch-embedded/env/bin/python3 \
+  -m brilliant_mqtt.cleanup_legacy_mirror
 ```
 
-Save only its fixed redacted JSON. If there are no candidates, record that and
-stop. If candidates exist, review every ID/name/type against the strict dual
-allowlist in the [retirement guide](../../ha-mirror.md). Apply is never automatic
-and is not part of enable/rollback.
+Review its JSON only on-screen in an unrecorded terminal. Never redirect, save,
+copy, or paste that JSON; it includes the owning ID and candidate identity.
+Persist only the sanitized candidate count, outcome, exit status, and operator
+decision. If there are no candidates, record that and stop. If candidates
+exist, review every ID/name/type against the strict dual allowlist in the
+[retirement guide](../../ha-mirror.md). Apply is never automatic and is not part
+of enable/rollback.
 
 A fresh operator decision is required immediately before deletion. If approved:
 
 ```bash
-python -m brilliant_mqtt.cleanup_legacy_mirror \
+test "$(id -u)" -eq 0
+install -d -m 0700 /data/brilliant-mqtt/cleanup
+PYTHONPATH=/var/brilliant-mqtt/app:/var/brilliant-mqtt/vendor \
+  /data/switch-embedded/env/bin/python3 \
+  -m brilliant_mqtt.cleanup_legacy_mirror \
   --apply \
   --snapshot /data/brilliant-mqtt/cleanup/legacy-mirror-<timestamp>.json
+test "$(stat -c %a /data/brilliant-mqtt/cleanup/legacy-mirror-<timestamp>.json)" = 600
+sha256sum /data/brilliant-mqtt/cleanup/legacy-mirror-<timestamp>.json
 ```
 
 Require exit zero, `success:true`, empty `remaining_ids`, fresh second-snapshot
-proof, clean native-client shutdown, and a private atomic report. On any failure
-stop; do not rerun or recreate a host.
+proof, clean native-client shutdown, and the mode-0600 private atomic report.
+Review command JSON only on-screen and unrecorded. Record only the report
+SHA-256, sanitized counts/outcome, exit status, and operator decision; never
+copy the report or command JSON into artifacts. On any failure stop; do not
+rerun or recreate a host.
 
 ## Final disposition and legacy-removal gate
 
