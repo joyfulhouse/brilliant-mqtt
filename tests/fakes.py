@@ -175,13 +175,17 @@ class FakeHaClient:
 class FakePeripheralHost:
     """Fake peripheral host that records registrations, updates, and deletes."""
 
-    def __init__(self) -> None:
+    def __init__(self, rooms: Mapping[str, str] | None = None) -> None:
         self.registered: list[str] = []
         self.registered_types: list[int] = []
         self.specs: dict[str, PeripheralSpec] = {}
         self.variables: dict[str, dict[str, str]] = {}
         self.commands: dict[str, Callable[[str, str], Awaitable[None]]] = {}
         self.deleted: list[str] = []
+        self.rooms = dict(rooms or {})
+        self.get_rooms_error: Exception | None = None
+        self.room_assignments: dict[str, list[str]] = {}
+        self.room_assignment_calls: list[tuple[str, list[str]]] = []
 
     async def start(self) -> None:
         pass
@@ -200,6 +204,16 @@ class FakePeripheralHost:
 
     async def update_variables(self, name: str, values: Mapping[str, str]) -> None:
         self.variables[name].update(values)
+
+    async def get_rooms(self) -> Mapping[str, str]:
+        if self.get_rooms_error is not None:
+            raise self.get_rooms_error
+        return dict(self.rooms)
+
+    async def set_room_assignment(self, name: str, room_ids: list[str]) -> None:
+        assignment = list(room_ids)
+        self.room_assignments[name] = assignment
+        self.room_assignment_calls.append((name, assignment))
 
     async def delete(self, name: str) -> None:
         self.deleted.append(name)

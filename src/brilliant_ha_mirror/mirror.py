@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections import Counter
 from collections.abc import Awaitable, Callable
 
@@ -10,10 +11,13 @@ from brilliant_ha_mirror.mapping import (
     HaEntity,
     PeripheralSpec,
     command_to_service,
+    resolve_room_id,
     spec_for,
     state_to_variables,
 )
 from brilliant_ha_mirror.protocols import HaClient, PeripheralHostClient
+
+logger = logging.getLogger(__name__)
 
 
 class Mirror:
@@ -30,6 +34,10 @@ class Mirror:
         self._settings = settings
         self._name_by_entity: dict[str, str] = {}
         self._entity_by_name: dict[str, str] = {}
+        self._rooms: dict[str, str] = {}
+        self._area_by_entity: dict[str, str | None] = {}
+        self._room_id_by_entity: dict[str, str | None] = {}
+        self._logged_unmatched: set[tuple[str, str | None]] = set()
 
     def _base_name(self, entity: HaEntity) -> str:
         friendly = entity.attributes.get("friendly_name")
@@ -81,6 +89,7 @@ class Mirror:
             if spec is not None:
                 supported[entity.entity_id] = (entity, spec)
         names = self._assign_names([entity for entity, _ in supported.values()])
+        registered_or_renamed: set[str] = set()
 
         for entity_id, (entity, spec) in supported.items():
             name = names[entity_id]
@@ -93,11 +102,58 @@ class Mirror:
             # one and only mutate the maps once registration succeeds, so a
             # failed register cannot leave the entity deleted-but-still-tracked.
             await self._host.register(name, spec, self._command_handler(entity_id))
+            registered_or_renamed.add(entity_id)
             if current is not None:
                 await self._host.delete(current)
                 del self._entity_by_name[current]
             self._name_by_entity[entity_id] = name
             self._entity_by_name[name] = entity_id
+
+        rooms: dict[str, str] | None = None
+        if supported:
+            try:
+                rooms = dict(await self._host.get_rooms())
+            except Exception:
+                logger.warning(
+                    "failed to read Brilliant room catalog; skipping room assignment this cycle",
+                    exc_info=True,
+                )
+
+        if rooms is not None:
+            catalog_changed = rooms != self._rooms
+            for entity_id, (entity, _) in supported.items():
+                room_id = resolve_room_id(entity.area, rooms, self._settings.room_overrides)
+                assignment_changed = (
+                    entity_id not in self._room_id_by_entity
+                    or self._room_id_by_entity[entity_id] != room_id
+                )
+                area_changed = (
+                    entity_id not in self._area_by_entity
+                    or self._area_by_entity[entity_id] != entity.area
+                )
+                if (
+                    entity_id in registered_or_renamed
+                    or catalog_changed
+                    or assignment_changed
+                    or area_changed
+                ):
+                    name = self._name_by_entity[entity_id]
+                    await self._host.set_room_assignment(
+                        name,
+                        [room_id] if room_id is not None else [],
+                    )
+                if room_id is None:
+                    unmatched = (entity_id, entity.area)
+                    if unmatched not in self._logged_unmatched:
+                        logger.debug(
+                            "no Brilliant room matched HA area %r for %s; leaving unassigned",
+                            entity.area,
+                            entity_id,
+                        )
+                        self._logged_unmatched.add(unmatched)
+                self._area_by_entity[entity_id] = entity.area
+                self._room_id_by_entity[entity_id] = room_id
+            self._rooms = rooms
 
         stale_entity_ids = self._name_by_entity.keys() - supported.keys()
         for entity_id in list(stale_entity_ids):
@@ -105,6 +161,8 @@ class Mirror:
             await self._host.delete(name)
             del self._name_by_entity[entity_id]
             del self._entity_by_name[name]
+            self._area_by_entity.pop(entity_id, None)
+            self._room_id_by_entity.pop(entity_id, None)
 
     async def _handle_state_change(self, entity: HaEntity) -> None:
         name = self._name_by_entity.get(entity.entity_id)
@@ -117,3 +175,7 @@ class Mirror:
             await self._host.delete(name)
         self._name_by_entity.clear()
         self._entity_by_name.clear()
+        self._rooms.clear()
+        self._area_by_entity.clear()
+        self._room_id_by_entity.clear()
+        self._logged_unmatched.clear()

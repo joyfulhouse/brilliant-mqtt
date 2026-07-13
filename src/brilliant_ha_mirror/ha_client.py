@@ -140,14 +140,21 @@ def labeled_entity_ids(
 
 def area_by_entity(
     entity_registry: list[dict[str, object]],
+    device_registry: list[dict[str, object]],
     area_registry: list[dict[str, object]],
 ) -> dict[str, str | None]:
-    """Map each entity registry id to its assigned Home Assistant area name."""
+    """Map entities to area names, preferring entity over device assignment."""
     names_by_id = {
         area_id: name
         for area in area_registry
         for area_id, name in [(area.get("area_id"), area.get("name"))]
         if isinstance(area_id, str) and isinstance(name, str)
+    }
+    area_id_by_device = {
+        device_id: area_id
+        for device in device_registry
+        for device_id, area_id in [(device.get("id"), device.get("area_id"))]
+        if isinstance(device_id, str) and isinstance(area_id, str)
     }
     result: dict[str, str | None] = {}
     for entity in entity_registry:
@@ -155,6 +162,9 @@ def area_by_entity(
         if not isinstance(entity_id, str):
             continue
         area_id = entity.get("area_id")
+        if not isinstance(area_id, str):
+            device_id = entity.get("device_id")
+            area_id = area_id_by_device.get(device_id) if isinstance(device_id, str) else None
         result[entity_id] = names_by_id.get(area_id) if isinstance(area_id, str) else None
     return result
 
@@ -278,11 +288,12 @@ class WsHaClient(HaClient):
         entities = await self._registry_list(
             "config/entity_registry/list", "entity registry result"
         )
+        devices = await self._registry_list("config/device_registry/list", "device registry result")
         areas = await self._registry_list("config/area_registry/list", "area registry result")
         labels = await self._registry_list("config/label_registry/list", "label registry result")
 
         labeled_ids = labeled_entity_ids(entities, labels, label)
-        self._areas_by_entity = area_by_entity(entities, areas)
+        self._areas_by_entity = area_by_entity(entities, devices, areas)
         result: list[HaEntity] = []
         for state in states:
             # Skip (and log) a single malformed state rather than aborting the

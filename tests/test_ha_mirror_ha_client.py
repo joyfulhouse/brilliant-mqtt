@@ -85,7 +85,8 @@ class FakeTransport:
             result = [
                 {
                     "entity_id": "light.kitchen",
-                    "area_id": "area-kitchen",
+                    "area_id": None,
+                    "device_id": "device-kitchen",
                     "labels": ["label-brilliant"],
                     "disabled_by": None,
                     "hidden_by": None,
@@ -109,6 +110,13 @@ class FakeTransport:
                         "hidden_by": None,
                     },
                 ]
+        elif message_type == "config/device_registry/list":
+            result = [
+                {
+                    "id": "device-kitchen",
+                    "area_id": "area-kitchen",
+                }
+            ]
         elif message_type == "config/area_registry/list":
             result = [
                 {
@@ -185,22 +193,41 @@ def test_labeled_entity_ids_resolves_name_and_excludes_unlabeled() -> None:
     assert labeled_entity_ids(entity_registry, label_registry, "brilliant") == {"light.kitchen"}
 
 
-def test_area_by_entity_maps_names_and_preserves_unassigned() -> None:
+def test_area_by_entity_prefers_entity_area_then_falls_back_to_device_area() -> None:
     entity_registry: list[dict[str, object]] = [
         {
             "entity_id": "light.kitchen",
             "area_id": "area-kitchen",
+            "device_id": "device-downstairs",
             "labels": ["label-brilliant"],
         },
-        {"entity_id": "lock.front_door", "area_id": None, "labels": []},
+        {
+            "entity_id": "lock.front_door",
+            "area_id": None,
+            "device_id": "device-entry",
+            "labels": [],
+        },
+        {
+            "entity_id": "switch.unassigned",
+            "area_id": None,
+            "device_id": None,
+            "labels": [],
+        },
+    ]
+    device_registry: list[dict[str, object]] = [
+        {"id": "device-downstairs", "area_id": "area-downstairs"},
+        {"id": "device-entry", "area_id": "area-entry"},
     ]
     area_registry: list[dict[str, object]] = [
         {"area_id": "area-kitchen", "name": "Kitchen"},
+        {"area_id": "area-downstairs", "name": "Downstairs"},
+        {"area_id": "area-entry", "name": "Entry"},
     ]
 
-    assert area_by_entity(entity_registry, area_registry) == {
+    assert area_by_entity(entity_registry, device_registry, area_registry) == {
         "light.kitchen": "Kitchen",
-        "lock.front_door": None,
+        "lock.front_door": "Entry",
+        "switch.unassigned": None,
     }
 
 
@@ -369,7 +396,7 @@ async def test_client_authenticates_lists_entities_routes_events_and_calls_servi
         )
     )
     assert transport.sent[-1] == {
-        "id": 6,
+        "id": 7,
         "type": "call_service",
         "domain": "light",
         "service": "turn_on",

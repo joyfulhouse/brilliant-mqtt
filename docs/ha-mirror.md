@@ -62,6 +62,7 @@ The manual deploy below is the fallback for panels not managed by the integratio
 | `MQTT_HOST` / `MQTT_USERNAME` / `MQTT_PASSWORD` | yes | Broker creds (used for the leader election). |
 | `MQTT_PORT` | no | Default `1883`. |
 | `MIRROR_LABEL` | no | Entity label to mirror. Default `brilliant`. |
+| `ROOM_OVERRIDES` | no | JSON object mapping HA area names to opaque Brilliant room IDs. Overrides automatic name matching. |
 | `LEADER_PRIORITY` | no | Election rank; **lower number wins**, `0` = never lead. Give each panel a distinct value. |
 | `LEADER_HEARTBEAT_SECONDS` | no | Election heartbeat. Default `10`. |
 | `LOG_LEVEL` | no | Default `INFO`. |
@@ -92,6 +93,25 @@ The manual deploy below is the fallback for panels not managed by the integratio
 
 Repeat per panel with a distinct `LEADER_PRIORITY`. The unit lives under `/var`
 (survives OTA); after a firmware update, re-install it.
+
+## Room assignment (V2)
+
+Mirrored entities are placed in native Brilliant rooms automatically. The mirror
+uses the entity registry's area, falling back to the entity's device area, and
+matches that Home Assistant area name to a Brilliant room name with a
+case-insensitive exact comparison. Brilliant room IDs are opaque and are used
+verbatim.
+
+`ROOM_OVERRIDES` takes precedence over automatic matching. Its value is a JSON
+object whose keys are HA area names and whose values are Brilliant room IDs; for
+example, `{"Back Yard":"opaque-brilliant-room-id"}`. It is optional—automatic
+matching works with no new configuration.
+
+If an area has no matching room and no override, the peripheral remains
+unassigned (`room_ids` is empty) and the mirror logs that outcome once rather
+than on every reconciliation. On later reconciliations it re-asserts the native
+`room_assignment` whenever the entity's HA area or the Brilliant rooms catalog
+changes.
 
 ## How it works (for maintainers)
 

@@ -1,8 +1,8 @@
 """Real Brilliant peripheral-host adapter (``PeripheralHostClient``).
 
 This is the ONLY module in :mod:`brilliant_ha_mirror` that touches the on-panel
-firmware framework (``lib.*`` / ``peripherals.*``). Those imports are DEFERRED —
-performed inside methods, never at module level — so ``import
+firmware framework (``lib.*`` / ``peripherals.*`` / ``thrift_types.*``). Those
+imports are DEFERRED — performed inside methods, never at module level — so ``import
 brilliant_ha_mirror.hosting`` succeeds on any machine without the panel libs
 (matching :mod:`brilliant_mqtt.bus`). Everything else runs off panel behind the
 :class:`~brilliant_ha_mirror.protocols.PeripheralHostClient` Protocol with fakes.
@@ -28,12 +28,22 @@ Verified on-panel facts encoded here (see the HA-mirror research docs):
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import re
+import secrets
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
 
 from brilliant_ha_mirror.mapping import INT_VARIABLES, PeripheralSpec
+
+logger = logging.getLogger(__name__)
+
+_ROOM_OBSERVER_CONNECT_TIMEOUT_SECONDS = 10.0
+_ROOM_OBSERVER_CONNECT_POLL_SECONDS = 0.25
+
+RoomObserverFactory = Callable[[], Awaitable[tuple[Any, Any]]]
 
 # Live peripheral instances by name, so the adapter can push variable updates via
 # each instance's set_value(). The host instantiates the peripheral class, so the
@@ -70,6 +80,68 @@ def _var_type(var: str) -> type:
 
 def _typed_value(var: str, raw: str) -> Any:
     return int(raw) if var in INT_VARIABLES else raw
+
+
+def _container_entries(container: Any) -> list[tuple[str | None, Any]]:
+    """Normalize thrift maps and immutable thrift lists into keyed entries."""
+    if container is None:
+        return []
+    items = getattr(container, "items", None)
+    if callable(items):
+        return [(key if isinstance(key, str) else None, value) for key, value in items()]
+    try:
+        return [(None, value) for value in container]
+    except TypeError:
+        return []
+
+
+def _entry_name(key: str | None, value: Any) -> str | None:
+    if key is not None:
+        return key
+    for field in ("name", "id"):
+        candidate = getattr(value, field, None)
+        if isinstance(candidate, str):
+            return candidate
+    return None
+
+
+def _find_rooms_value(snapshot: Any) -> str | None:
+    """Find home_configuration.rooms across firmware container variants."""
+    devices = getattr(snapshot, "devices", snapshot)
+    for _, device in _container_entries(devices):
+        peripherals = getattr(device, "peripherals", None)
+        for peripheral_key, peripheral in _container_entries(peripherals):
+            if _entry_name(peripheral_key, peripheral) != "home_configuration":
+                continue
+            variables = getattr(peripheral, "variables", None)
+            for variable_key, variable in _container_entries(variables):
+                if _entry_name(variable_key, variable) != "rooms":
+                    continue
+                value = getattr(variable, "value", None)
+                return value if isinstance(value, str) else None
+    return None
+
+
+def _decode_rooms(value: str) -> dict[str, str]:
+    """Deserialize a firmware Rooms value into an opaque id/name catalog."""
+    from lib.serialization import deserialize
+    from thrift_types.configuration.ttypes import Rooms
+
+    decoded = deserialize(Rooms, value)
+    catalog: dict[str, str] = {}
+    for key, room in _container_entries(getattr(decoded, "rooms", None)):
+        room_id = key if key is not None else getattr(room, "id", None)
+        room_name = getattr(room, "name", None)
+        if isinstance(room_id, str) and isinstance(room_name, str):
+            catalog[room_id] = room_name
+    return catalog
+
+
+def _room_assignment_value(room_ids: list[str]) -> Any:
+    """Build the firmware struct expected by the in-process value setter."""
+    from thrift_types.configuration.ttypes import RoomAssignment
+
+    return RoomAssignment(room_ids=list(room_ids))
 
 
 def _make_peripheral_class(
@@ -123,10 +195,20 @@ class RpcPeripheralHost:
     Satisfies :class:`~brilliant_ha_mirror.protocols.PeripheralHostClient`.
     """
 
-    def __init__(self, loop: Any, socket_path: str = "/var/run/brilliant/server_socket") -> None:
+    def __init__(
+        self,
+        loop: Any,
+        socket_path: str = "/var/run/brilliant/server_socket",
+        *,
+        room_observer_factory: RoomObserverFactory | None = None,
+    ) -> None:
         self._loop = loop
         self._socket_path = socket_path
         self._hosts: dict[str, Any] = {}
+        self._room_observer_factory = room_observer_factory
+        self._room_observer: Any = None
+        self._room_processor: Any = None
+        self._room_catalog: dict[str, str] = {}
 
     async def start(self) -> None:
         """No global connection; each peripheral host connects on register."""
@@ -205,6 +287,102 @@ class RpcPeripheralHost:
         for var, raw in values.items():
             await _await_if_coroutine(update(instance, var, _typed_value(var, raw), notify=True))
 
+    async def _open_room_observer(self) -> tuple[Any, Any]:
+        """Connect a dedicated read-only observer using the proven bus recipe."""
+        import lib.protocol.message_bus_peer_service as mbps
+        from lib.message_bus_api.observer_interface import RPCObserver
+        from lib.protocol.processor import SinglePeerProcessor
+
+        observer = RPCObserver(self._loop)
+        processor = SinglePeerProcessor(
+            socket_path=self._socket_path,
+            my_name=f"brilliant_ha_mirror_rooms-{secrets.token_hex(4)}",
+            handler=mbps.PeripheralServer(observer),
+            client_class=mbps.MessageBusClient,
+            loop=self._loop,
+        )
+        try:
+            await processor.start()
+            waited = 0.0
+            while not processor.is_connected():
+                if waited >= _ROOM_OBSERVER_CONNECT_TIMEOUT_SECONDS:
+                    raise TimeoutError(
+                        "room observer did not connect within "
+                        f"{_ROOM_OBSERVER_CONNECT_TIMEOUT_SECONDS:.0f}s"
+                    )
+                await asyncio.sleep(_ROOM_OBSERVER_CONNECT_POLL_SECONDS)
+                waited += _ROOM_OBSERVER_CONNECT_POLL_SECONDS
+            await observer.start(processor, None)
+        except BaseException:
+            for component, label in (
+                (observer, "room observer"),
+                (processor, "room observer processor"),
+            ):
+                try:
+                    await component.shutdown()
+                except Exception:
+                    logger.exception("%s shutdown after startup failure failed", label)
+            raise
+        return observer, processor
+
+    async def _get_room_observer(self) -> Any:
+        if self._room_observer is None:
+            factory = self._room_observer_factory or self._open_room_observer
+            observer, processor = await factory()
+            self._room_observer = observer
+            self._room_processor = processor
+        return self._room_observer
+
+    async def _close_room_observer(self) -> None:
+        observer = self._room_observer
+        processor = self._room_processor
+        self._room_observer = None
+        self._room_processor = None
+        for component, label in (
+            (observer, "room observer"),
+            (processor, "room observer processor"),
+        ):
+            if component is None:
+                continue
+            try:
+                await component.shutdown()
+            except Exception:
+                logger.exception("%s shutdown failed", label)
+
+    async def get_rooms(self) -> Mapping[str, str]:
+        """Read and decode the virtual home's Brilliant room catalog."""
+        try:
+            observer = await self._get_room_observer()
+            snapshot = await observer.get_all()
+            value = _find_rooms_value(snapshot)
+            if value is None:
+                logger.warning(
+                    "home_configuration.rooms was not found on the message bus; "
+                    "keeping the last room catalog"
+                )
+                return dict(self._room_catalog)
+            self._room_catalog = _decode_rooms(value)
+            return dict(self._room_catalog)
+        except Exception as exc:
+            logger.warning(
+                "failed to read Brilliant room catalog; keeping the last catalog: %s",
+                exc,
+                exc_info=True,
+            )
+            await self._close_room_observer()
+            return dict(self._room_catalog)
+
+    async def set_room_assignment(self, name: str, room_ids: list[str]) -> None:
+        """Reflect a RoomAssignment struct into a hosted peripheral."""
+        instance = _INSTANCES.get(name)
+        if instance is None:
+            return
+        from peripherals.lib.peripheral_service.peripheral import Peripheral
+
+        update = Peripheral.__dict__["_set_value_internal"]
+        value = _room_assignment_value(room_ids)
+        await _await_if_coroutine(update(instance, "room_assignment", value, notify=True))
+
     async def delete(self, name: str) -> None:
         host = self._hosts.pop(name, None)
         if host is None:
@@ -224,5 +402,6 @@ class RpcPeripheralHost:
             await host.shutdown()
 
     async def shutdown(self) -> None:
+        await self._close_room_observer()
         for name in list(self._hosts):
             await self.delete(name)

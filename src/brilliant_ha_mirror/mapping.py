@@ -53,6 +53,24 @@ def _domain(entity_id: str) -> str:
     return entity_id.partition(".")[0]
 
 
+def resolve_room_id(
+    area_name: str | None,
+    rooms: Mapping[str, str],
+    overrides: Mapping[str, str],
+) -> str | None:
+    """Resolve an HA area name to an opaque Brilliant room id."""
+    if area_name is None:
+        return None
+    normalized_area = area_name.casefold()
+    for override_area, room_id in overrides.items():
+        if override_area.casefold() == normalized_area:
+            return room_id
+    for room_id, room_name in rooms.items():
+        if room_name.casefold() == normalized_area:
+            return room_id
+    return None
+
+
 def _int_attribute(entity: HaEntity, name: str) -> int:
     value = entity.attributes.get(name, 0)
     return value if isinstance(value, int) else 0
