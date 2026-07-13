@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,7 @@ from brilliant_mqtt.__main__ import _is_panel_device, _is_reconnect_storm, _make
 from brilliant_mqtt.bridge import Bridge
 from brilliant_mqtt.config import Settings
 from brilliant_mqtt.desired_state import DesiredState
+from brilliant_mqtt.ha_control_protocol import mode_command_topic, scene_command_topic
 from brilliant_mqtt.mesh_leader import MESH_LEADER_TOPIC, MeshLeader
 from brilliant_mqtt.model import BrilliantDevice, DeviceKind, Variable
 from tests.fakes import FakeBus, FakeClock, FakeMqtt
@@ -269,3 +271,215 @@ class TestProcessLifetimeDesiredState:
 
         assert seen[0] is not None and seen[1] is not None
         assert seen[0] is not seen[1]  # faceplate and mesh stores stay separate
+
+
+def _scene_settings(enabled: bool, watermark_file: str) -> Settings:
+    """Build settings for scene session tests before and after the fields exist."""
+    settings = _settings()
+    object.__setattr__(settings, "scene_bridge_enabled", enabled)
+    object.__setattr__(settings, "scene_watermark_file", watermark_file)
+    return settings
+
+
+class _SessionBus:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+        self.reconnect_callback: Callable[[], Awaitable[None]] | None = None
+
+    def on_reconnect(self, callback: Callable[[], Awaitable[None]]) -> None:
+        self.events.append("bus_reconnect_callback")
+        self.reconnect_callback = callback
+
+    async def start(self) -> None:
+        self.events.append("bus_start")
+
+    async def shutdown(self) -> None:
+        self.events.append("bus_shutdown")
+
+    def seconds_since_last_push(self) -> float | None:
+        return None
+
+    def recent_reconnects(self, window_seconds: float) -> int:
+        del window_seconds
+        return 0
+
+
+class _SessionMqtt:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+        self.subscriptions: list[str] = []
+
+    async def connect(self) -> None:
+        self.events.append("mqtt_connect")
+
+    async def disconnect(self) -> None:
+        self.events.append("mqtt_disconnect")
+
+    async def subscribe(self, topic: str) -> None:
+        self.subscriptions.append(topic)
+
+
+class _SessionHarness:
+    def __init__(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        scene_start_error: RuntimeError | None = None,
+        scene_shutdown_error: RuntimeError | None = None,
+    ) -> None:
+        self.events: list[str] = []
+        self.ready = asyncio.Event()
+        self.bus = _SessionBus(self.events)
+        self.mqtt = _SessionMqtt(self.events)
+        self.scene_start_error = scene_start_error
+        self.scene_shutdown_error = scene_shutdown_error
+        self.scene_instances: list[object] = []
+        self.scene_bus: object | None = None
+        self.scene_mqtt: object | None = None
+        self.scene_panel: str | None = None
+        self.scene_watermark_path: object | None = None
+        self.scene_clock_ms: Callable[[], int] | None = None
+
+        harness = self
+
+        class SessionBridge:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                del self, args, kwargs
+                harness.events.append("panel_bridge_construct")
+
+            async def reconcile(self) -> None:
+                harness.events.append("panel_reconcile")
+                harness.ready.set()
+
+            async def poll_once(self) -> None:
+                return
+
+            async def withdraw(self) -> None:
+                return
+
+        class SessionSceneBridge:
+            def __init__(
+                self,
+                bus: object,
+                mqtt: object,
+                panel: str,
+                watermark_path: str | Path,
+                clock_ms: Callable[[], int],
+            ) -> None:
+                harness.events.append("scene_bridge_construct")
+                harness.scene_instances.append(self)
+                harness.scene_bus = bus
+                harness.scene_mqtt = mqtt
+                harness.scene_panel = panel
+                harness.scene_watermark_path = watermark_path
+                harness.scene_clock_ms = clock_ms
+
+            async def async_start(self) -> None:
+                harness.events.append("scene_bridge_start")
+                if harness.scene_start_error is not None:
+                    raise harness.scene_start_error
+
+            async def async_shutdown(self) -> None:
+                harness.events.append("scene_bridge_shutdown")
+                if harness.scene_shutdown_error is not None:
+                    raise harness.scene_shutdown_error
+
+        def mqtt_factory(settings: Settings) -> _SessionMqtt:
+            del settings
+            self.events.append("mqtt_construct")
+            return self.mqtt
+
+        def bus_factory(*, extra_device_ids: tuple[str, ...]) -> _SessionBus:
+            del extra_device_ids
+            self.events.append("bus_construct")
+            return self.bus
+
+        monkeypatch.setattr(main_mod, "AioMqttAdapter", mqtt_factory)
+        monkeypatch.setattr(main_mod, "RpcBusAdapter", bus_factory)
+        monkeypatch.setattr(main_mod, "Bridge", SessionBridge)
+        monkeypatch.setattr(main_mod, "SceneBridge", SessionSceneBridge, raising=False)
+
+
+async def _cancel_ready_session(harness: _SessionHarness, settings: Settings) -> None:
+    task = asyncio.create_task(main_mod._run_session(settings, None, None))
+    await asyncio.wait_for(harness.ready.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+class TestSceneBridgeSessionWiring:
+    async def test_enabled_bridge_uses_shared_adapters_and_ordered_lifecycle(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        harness = _SessionHarness(monkeypatch)
+        watermark_file = tmp_path / "scene-state.json"
+        settings = _scene_settings(True, str(watermark_file))
+
+        await _cancel_ready_session(harness, settings)
+
+        assert len(harness.scene_instances) == 1
+        assert harness.scene_bus is harness.bus
+        assert harness.scene_mqtt is harness.mqtt
+        assert harness.scene_panel == "office"
+        assert harness.scene_watermark_path == watermark_file
+        assert isinstance(harness.scene_watermark_path, Path)
+        assert harness.scene_clock_ms is not None
+        assert isinstance(harness.scene_clock_ms(), int)
+
+        order = harness.events.index
+        assert order("panel_bridge_construct") < order("mqtt_connect")
+        assert order("scene_bridge_construct") < order("mqtt_connect")
+        assert order("mqtt_connect") < order("bus_start")
+        assert order("bus_start") < order("scene_bridge_start")
+        assert harness.events[-3:] == [
+            "scene_bridge_shutdown",
+            "bus_shutdown",
+            "mqtt_disconnect",
+        ]
+
+    async def test_disabled_session_never_constructs_or_starts_scene_bridge(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        harness = _SessionHarness(monkeypatch)
+        settings = _scene_settings(False, str(tmp_path / "unused.json"))
+
+        await _cancel_ready_session(harness, settings)
+
+        assert harness.scene_instances == []
+        assert not any(event.startswith("scene_bridge_") for event in harness.events)
+        assert scene_command_topic("office") not in harness.mqtt.subscriptions
+        assert mode_command_topic("office") not in harness.mqtt.subscriptions
+
+    async def test_scene_startup_failure_unwinds_shared_session_in_order(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        start_error = RuntimeError("scene startup failed")
+        harness = _SessionHarness(monkeypatch, scene_start_error=start_error)
+        settings = _scene_settings(True, str(tmp_path / "scene-state.json"))
+
+        with pytest.raises(RuntimeError, match="scene startup failed") as raised:
+            await asyncio.wait_for(main_mod._run_session(settings, None, None), timeout=1)
+
+        assert raised.value is start_error
+        assert harness.events[-3:] == [
+            "scene_bridge_shutdown",
+            "bus_shutdown",
+            "mqtt_disconnect",
+        ]
+
+    async def test_scene_shutdown_failure_does_not_skip_shared_adapter_cleanup(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        harness = _SessionHarness(
+            monkeypatch, scene_shutdown_error=RuntimeError("scene shutdown failed")
+        )
+        settings = _scene_settings(True, str(tmp_path / "scene-state.json"))
+
+        await _cancel_ready_session(harness, settings)
+
+        assert harness.events[-3:] == [
+            "scene_bridge_shutdown",
+            "bus_shutdown",
+            "mqtt_disconnect",
+        ]

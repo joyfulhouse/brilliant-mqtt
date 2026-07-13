@@ -388,3 +388,66 @@ class TestSettings:
 
         s = Settings.from_env()
         assert s.bus_heartbeat_file == "/x"
+
+    def test_scene_bridge_defaults_disabled_with_persistent_watermark_path(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("BRILLIANT_PANEL", "office")
+        monkeypatch.setenv("MQTT_HOST", "10.0.0.1")
+        monkeypatch.setenv("MQTT_USERNAME", "brilliant")
+        monkeypatch.setenv("MQTT_PASSWORD", "s3cr3t")
+        monkeypatch.delenv("SCENE_BRIDGE_ENABLED", raising=False)
+        monkeypatch.delenv("SCENE_WATERMARK_FILE", raising=False)
+
+        s = Settings.from_env()
+
+        assert s.scene_bridge_enabled is False
+        assert s.scene_watermark_file == "/data/brilliant-mqtt/scene-watermarks.json"
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("0", False),
+            ("false", False),
+            ("off", False),
+            ("no", False),
+            ("False", False),
+            (" OFF ", False),
+            ("1", True),
+            ("true", True),
+            ("on", True),
+            ("yes", True),
+            ("TRUE", True),
+        ],
+    )
+    def test_scene_bridge_enabled_parses_boolean_spellings(
+        self, monkeypatch: pytest.MonkeyPatch, raw: str, expected: bool
+    ) -> None:
+        monkeypatch.setenv("BRILLIANT_PANEL", "office")
+        monkeypatch.setenv("MQTT_HOST", "10.0.0.1")
+        monkeypatch.setenv("MQTT_USERNAME", "brilliant")
+        monkeypatch.setenv("MQTT_PASSWORD", "s3cr3t")
+        monkeypatch.setenv("SCENE_BRIDGE_ENABLED", raw)
+
+        assert Settings.from_env().scene_bridge_enabled is expected
+
+    def test_scene_bridge_rejects_unrecognized_boolean(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("BRILLIANT_PANEL", "office")
+        monkeypatch.setenv("MQTT_HOST", "10.0.0.1")
+        monkeypatch.setenv("MQTT_USERNAME", "brilliant")
+        monkeypatch.setenv("MQTT_PASSWORD", "s3cr3t")
+        monkeypatch.setenv("SCENE_BRIDGE_ENABLED", "sometimes")
+
+        with pytest.raises(ValueError, match="SCENE_BRIDGE_ENABLED"):
+            Settings.from_env()
+
+    def test_scene_watermark_file_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("BRILLIANT_PANEL", "office")
+        monkeypatch.setenv("MQTT_HOST", "10.0.0.1")
+        monkeypatch.setenv("MQTT_USERNAME", "brilliant")
+        monkeypatch.setenv("MQTT_PASSWORD", "s3cr3t")
+        monkeypatch.setenv("SCENE_WATERMARK_FILE", "/var/lib/brilliant/scene-state.json")
+
+        assert Settings.from_env().scene_watermark_file == ("/var/lib/brilliant/scene-state.json")

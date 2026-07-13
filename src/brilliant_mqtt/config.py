@@ -96,6 +96,10 @@ class Settings:
     # independent bus-watchdog can detect a wedged message_bus session. tmpfs
     # default (no flash wear); empty disables emission.
     bus_heartbeat_file: str = "/run/brilliant-mqtt/bus-heartbeat"
+    # Bidirectional Brilliant scene/mode transport. Opt-in until panel and HA
+    # rollout validation is complete; its replay/outbox state must persist.
+    scene_bridge_enabled: bool = False
+    scene_watermark_file: str = "/data/brilliant-mqtt/scene-watermarks.json"
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -124,6 +128,10 @@ class Settings:
                   MOTION_DERIVED_HOLD_S (default 60.0 seconds, must be >= 0),
                   BUS_HEARTBEAT_FILE (default "/run/brilliant-mqtt/bus-heartbeat";
                   empty disables),
+                  SCENE_BRIDGE_ENABLED (default "0"; accepted boolean spellings
+                  match MOTION_RECONCILE_ENABLED),
+                  SCENE_WATERMARK_FILE (default
+                  "/data/brilliant-mqtt/scene-watermarks.json"),
 
         Raises KeyError when a required variable is absent and ValueError when
         a value fails validation — both crash startup loudly under systemd.
@@ -168,6 +176,10 @@ class Settings:
         if motion_derived_hold_s < 0:
             raise ValueError("MOTION_DERIVED_HOLD_S must be >= 0")
         bus_heartbeat_file = env.get("BUS_HEARTBEAT_FILE", "/run/brilliant-mqtt/bus-heartbeat")
+        scene_bridge_enabled = _env_bool(env, "SCENE_BRIDGE_ENABLED", "0")
+        scene_watermark_file = env.get(
+            "SCENE_WATERMARK_FILE", "/data/brilliant-mqtt/scene-watermarks.json"
+        )
 
         return cls(
             panel=panel,
@@ -191,4 +203,6 @@ class Settings:
             motion_derived_enabled=motion_derived_enabled,
             motion_derived_hold_s=motion_derived_hold_s,
             bus_heartbeat_file=bus_heartbeat_file,
+            scene_bridge_enabled=scene_bridge_enabled,
+            scene_watermark_file=scene_watermark_file,
         )

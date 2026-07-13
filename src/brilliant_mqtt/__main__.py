@@ -22,6 +22,7 @@ from brilliant_mqtt.model import BrilliantDevice
 from brilliant_mqtt.motion_derive import MotionDeriver
 from brilliant_mqtt.mqttio import AioMqttAdapter
 from brilliant_mqtt.protocols import BusClient
+from brilliant_mqtt.scene_bridge import SceneBridge
 
 log = logging.getLogger(__name__)
 
@@ -33,6 +34,11 @@ _IDLE_TICK_S = 30.0
 # The virtual bus device carrying whole-home mesh loads. Published under the
 # reserved "mesh" pseudo-panel by the elected leader, never the panel bridge.
 _MESH_DEVICE_ID = "ble_mesh"
+
+
+def _clock_ms() -> int:
+    """Current wall-clock time in milliseconds for scene protocol timestamps."""
+    return int(time.time() * 1_000)
 
 
 class BusStaleError(RuntimeError):
@@ -97,6 +103,7 @@ async def _run_session(
     participating = settings.mesh_priority >= 1
     mqtt = AioMqttAdapter(settings)
     bus = RpcBusAdapter(extra_device_ids=(_MESH_DEVICE_ID,) if participating else ())
+    scene_bridge: SceneBridge | None = None
     try:
         # Shared write-throttle: both Bridge instances in this process use the
         # same Thrift bus, so the global min-write-spacing must be enforced
@@ -164,6 +171,18 @@ async def _run_session(
                 on_lose=mesh_bridge.withdraw,
             )
 
+        scene_bridge = (
+            SceneBridge(
+                bus,
+                mqtt,
+                settings.panel,
+                Path(settings.scene_watermark_file),
+                _clock_ms,
+            )
+            if settings.scene_bridge_enabled
+            else None
+        )
+
         async def _on_bus_reconnect() -> None:
             # After a bus reconnect, pushes (and the observer's get_all mirror)
             # may have missed changes — re-reconcile to republish the truth.
@@ -179,6 +198,8 @@ async def _run_session(
             # reconcile is acquisition's job (on_acquire), not startup's.
             await leader.start()
         await bus.start()
+        if scene_bridge is not None:
+            await scene_bridge.async_start()
         await panel_bridge.reconcile()
 
         tick = settings.hot_poll_seconds if settings.hot_poll_seconds > 0 else _IDLE_TICK_S
@@ -224,7 +245,13 @@ async def _run_session(
                     await mesh_bridge.reconcile()
                 next_resync = time.monotonic() + settings.resync_seconds
     finally:
-        # Best-effort teardown; both adapters tolerate a never-fully-started state.
+        # Best-effort teardown; consumers stop before the shared adapters, and
+        # every component tolerates a never-fully-started state.
+        if scene_bridge is not None:
+            try:
+                await scene_bridge.async_shutdown()
+            except Exception:
+                log.exception("scene bridge shutdown failed during cleanup")
         try:
             await bus.shutdown()
         except Exception:
