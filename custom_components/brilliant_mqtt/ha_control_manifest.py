@@ -7,10 +7,20 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any
 
+import voluptuous as vol
 from homeassistant.components.cover import (
     ATTR_CURRENT_POSITION,
     ATTR_CURRENT_TILT_POSITION,
     CoverEntityFeature,
+)
+from homeassistant.components.light import (
+    ATTR_SUPPORTED_COLOR_MODES,
+    valid_supported_color_modes,
+)
+from homeassistant.components.light.const import (
+    COLOR_MODES_BRIGHTNESS,
+    VALID_COLOR_MODES,
+    ColorMode,
 )
 from homeassistant.const import (
     ATTR_DEVICE_CLASS,
@@ -29,14 +39,6 @@ from .ha_control_protocol import MAPPING_VERSION, SCHEMA_VERSION, stable_id
 
 SUPPORTED_DOMAINS = frozenset({"light", "switch", "lock", "cover"})
 _ATTR_BRIGHTNESS = "brightness"
-_ATTR_SUPPORTED_COLOR_MODES = "supported_color_modes"
-_STATE_ATTRIBUTES = (
-    _ATTR_BRIGHTNESS,
-    ATTR_CURRENT_POSITION,
-    ATTR_CURRENT_TILT_POSITION,
-    ATTR_DEVICE_CLASS,
-    ATTR_SUPPORTED_FEATURES,
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -274,17 +276,37 @@ def _commands_and_capabilities(
 
 
 def _supports_brightness(entry: er.RegistryEntry, attributes: Mapping[str, Any]) -> bool:
-    if _ATTR_BRIGHTNESS in attributes:
-        return True
-    color_modes = attributes.get(_ATTR_SUPPORTED_COLOR_MODES)
+    color_modes = attributes.get(ATTR_SUPPORTED_COLOR_MODES)
     if color_modes is None and entry.capabilities is not None:
-        color_modes = entry.capabilities.get(_ATTR_SUPPORTED_COLOR_MODES)
-    return isinstance(color_modes, (list, set, tuple)) and any(
-        isinstance(mode, str) and mode != "onoff" for mode in color_modes
-    )
+        color_modes = entry.capabilities.get(ATTR_SUPPORTED_COLOR_MODES)
+    if not isinstance(color_modes, (list, set, tuple, frozenset)) or not all(
+        isinstance(mode, str) and mode in VALID_COLOR_MODES for mode in color_modes
+    ):
+        return False
+    normalized_modes = {ColorMode(mode) for mode in color_modes}
+    try:
+        valid_supported_color_modes(normalized_modes)
+    except vol.Error:
+        return False
+    return not COLOR_MODES_BRIGHTNESS.isdisjoint(normalized_modes)
 
 
 def _supported_attributes(state: State | None) -> dict[str, object]:
     if state is None:
         return {}
-    return {name: state.attributes[name] for name in _STATE_ATTRIBUTES if name in state.attributes}
+    attributes: dict[str, object] = {}
+    for name, maximum in (
+        (_ATTR_BRIGHTNESS, 255),
+        (ATTR_CURRENT_POSITION, 100),
+        (ATTR_CURRENT_TILT_POSITION, 100),
+    ):
+        value = state.attributes.get(name)
+        if type(value) is int and 0 <= value <= maximum:
+            attributes[name] = value
+    supported_features = state.attributes.get(ATTR_SUPPORTED_FEATURES)
+    if type(supported_features) is int and supported_features >= 0:
+        attributes[ATTR_SUPPORTED_FEATURES] = supported_features
+    device_class = state.attributes.get(ATTR_DEVICE_CLASS)
+    if isinstance(device_class, str):
+        attributes[ATTR_DEVICE_CLASS] = device_class
+    return attributes

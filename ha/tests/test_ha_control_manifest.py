@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, MutableMapping
 from typing import cast
 
 import pytest
 from homeassistant.components.cover import CoverEntityFeature
+from homeassistant.components.light import ATTR_SUPPORTED_COLOR_MODES
 from homeassistant.components.lock import LockEntityFeature
 from homeassistant.const import (
     ATTR_DEVICE_CLASS,
@@ -234,7 +236,11 @@ async def test_commands_and_capabilities_follow_live_support(hass: HomeAssistant
     hass.states.async_set(
         light.entity_id,
         "on",
-        {"brightness": 128, ATTR_SUPPORTED_FEATURES: 0},
+        {
+            "brightness": 128,
+            ATTR_SUPPORTED_COLOR_MODES: ["brightness"],
+            ATTR_SUPPORTED_FEATURES: 0,
+        },
     )
     hass.states.async_set(
         cover.entity_id,
@@ -267,6 +273,35 @@ async def test_commands_and_capabilities_follow_live_support(hass: HomeAssistant
     assert entities[lock.entity_id].capabilities == {"lock": True}
 
 
+@pytest.mark.parametrize(
+    ("attributes", "supports_brightness"),
+    [
+        ({ATTR_SUPPORTED_COLOR_MODES: ["brightness"]}, True),
+        ({ATTR_SUPPORTED_COLOR_MODES: ["hs"]}, True),
+        ({ATTR_SUPPORTED_COLOR_MODES: ["onoff"]}, False),
+        ({ATTR_SUPPORTED_COLOR_MODES: ["unknown"]}, False),
+        ({ATTR_SUPPORTED_COLOR_MODES: ["invalid"]}, False),
+        ({ATTR_SUPPORTED_COLOR_MODES: "brightness"}, False),
+        ({ATTR_SUPPORTED_COLOR_MODES: {"brightness": True}}, False),
+        ({ATTR_SUPPORTED_COLOR_MODES: [1, None]}, False),
+        ({"brightness": 128}, False),
+    ],
+)
+async def test_light_brightness_capability_fails_closed(
+    hass: HomeAssistant,
+    attributes: dict[str, object],
+    supports_brightness: bool,
+) -> None:
+    label_id = _label(hass)
+    entry = _entity(hass, "light.test", label_id=label_id)
+    hass.states.async_set(entry.entity_id, "on", attributes)
+
+    entity = build_manifest(hass, settings(), 1, GENERATED_AT_MS).entities[0]
+
+    assert entity.capabilities == {"brightness": supports_brightness}
+    assert ("set_brightness" in entity.commands) is supports_brightness
+
+
 async def test_state_payload_is_versioned_and_attribute_allowlisted(
     hass: HomeAssistant,
 ) -> None:
@@ -276,11 +311,11 @@ async def test_state_payload_is_versioned_and_attribute_allowlisted(
         entry.entity_id,
         "open",
         {
-            "brightness": 10,
-            "current_position": 90,
-            "current_tilt_position": 30,
+            "brightness": 255,
+            "current_position": 0,
+            "current_tilt_position": 100,
             ATTR_DEVICE_CLASS: "garage",
-            ATTR_SUPPORTED_FEATURES: 7,
+            ATTR_SUPPORTED_FEATURES: 0,
             "access_token": "must-not-leak",
         },
     )
@@ -298,13 +333,56 @@ async def test_state_payload_is_versioned_and_attribute_allowlisted(
         "available": True,
         "state": "open",
         "attributes": {
-            "brightness": 10,
-            "current_position": 90,
-            "current_tilt_position": 30,
+            "brightness": 255,
+            "current_position": 0,
+            "current_tilt_position": 100,
             "device_class": "garage",
-            "supported_features": 7,
+            "supported_features": 0,
         },
     }
+
+
+@pytest.mark.parametrize(
+    ("attribute", "invalid_value"),
+    [
+        ("brightness", True),
+        ("brightness", -1),
+        ("brightness", 256),
+        ("brightness", {}),
+        ("brightness", []),
+        ("current_position", True),
+        ("current_position", -1),
+        ("current_position", 101),
+        ("current_position", {}),
+        ("current_position", []),
+        ("current_tilt_position", True),
+        ("current_tilt_position", -1),
+        ("current_tilt_position", 101),
+        ("current_tilt_position", {}),
+        ("current_tilt_position", []),
+        ("supported_features", True),
+        ("supported_features", -1),
+        ("supported_features", {}),
+        ("supported_features", []),
+        ("device_class", True),
+        ("device_class", {}),
+        ("device_class", []),
+    ],
+)
+async def test_state_payload_omits_invalid_allowlisted_values(
+    hass: HomeAssistant,
+    attribute: str,
+    invalid_value: object,
+) -> None:
+    label_id = _label(hass)
+    entry = _entity(hass, "switch.test", label_id=label_id)
+    hass.states.async_set(entry.entity_id, "on", {attribute: invalid_value})
+    entity = build_manifest(hass, settings(), 1, GENERATED_AT_MS).entities[0]
+
+    payload = build_state_payload(hass.states.get(entry.entity_id), entity, 1, GENERATED_AT_MS)
+
+    assert payload["attributes"] == {}
+    json.dumps(payload)
 
 
 async def test_snapshot_contains_complete_versioned_metadata(hass: HomeAssistant) -> None:
