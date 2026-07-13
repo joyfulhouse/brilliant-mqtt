@@ -8,8 +8,9 @@ import logging
 import os
 import tempfile
 from collections import OrderedDict
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable, Coroutine
+from dataclasses import dataclass, replace
+from functools import partial
 from pathlib import Path
 from typing import cast
 from uuid import UUID
@@ -51,7 +52,9 @@ logger = logging.getLogger(__name__)
 
 _CONFIGURATION_DEVICE_ID = "configuration_virtual_device"
 _EXECUTION_PERIPHERAL_ID = "execution_peripheral"
+_SCENE_EXECUTION_PREFIX = "execution_state:scene_execution_handler:scene:"
 _RESULT_CACHE_LIMIT = 1_024
+_RESULT_RETRY_SECONDS = 1.0
 _TIMEOUT_SECONDS = COMMAND_TTL_MS / 1_000
 
 
@@ -66,7 +69,8 @@ class Watermark:
 @dataclass(slots=True)
 class _Pending:
     value: str
-    task: asyncio.Task[None]
+    timeout_task: asyncio.Task[None]
+    write_task: asyncio.Task[None] | None = None
 
 
 def _is_new(previous: Watermark | None, current: SceneExecution) -> bool:
@@ -103,6 +107,7 @@ class SceneBridge:
         self._callbacks_registered = False
         self._subscribed_topics: list[str] = []
         self._execution: BrilliantDevice | None = None
+        self._execution_available = False
         self._scene_ids: frozenset[str] = frozenset()
         self._mode_ids: frozenset[str] = frozenset()
         self._watermarks: dict[tuple[str, str], Watermark] = {}
@@ -111,6 +116,8 @@ class SceneBridge:
         self._mode_pending: dict[str, _Pending] = {}
         self._tasks: set[asyncio.Task[None]] = set()
         self._results: OrderedDict[tuple[str, str], tuple[str, str]] = OrderedDict()
+        self._undelivered_results: set[tuple[str, str]] = set()
+        self._result_retry_tasks: dict[tuple[str, str], asyncio.Task[None]] = {}
         self._status: dict[str, tuple[bool, str | None]] = {}
         self._scene_catalog_healthy = True
         self._scene_execution_healthy = True
@@ -184,10 +191,15 @@ class SceneBridge:
             (device for device in devices if device.peripheral_id == _EXECUTION_PERIPHERAL_ID),
             None,
         )
+        self._execution = execution
+        self._execution_available = execution is not None
         if execution is not None:
-            self._execution = execution
             await self._async_process_execution(execution, emit_events=emit_history)
+        else:
+            await self._async_health_status("scene")
+            await self._async_health_status("mode")
         await self._async_publish_catalogs()
+        await self._async_retry_results()
 
     async def _async_publish_catalogs(self) -> None:
         try:
@@ -259,23 +271,20 @@ class SceneBridge:
             if not self._started:
                 return
             self._execution = device
+            self._execution_available = True
             try:
                 await self._async_process_execution(device, emit_events=True)
             except Exception:
                 logger.exception("scene bridge execution callback failed; continuing")
 
     async def _async_process_execution(self, device: BrilliantDevice, *, emit_events: bool) -> None:
-        try:
-            scenes = decode_scene_execution(device)
-        except Exception:
-            logger.exception("malformed scene execution record")
-            self._scene_execution_healthy = False
-            await self._async_health_status("scene")
-        else:
-            self._scene_execution_healthy = True
-            await self._async_health_status("scene")
-            for execution in scenes:
-                await self._async_scene_execution(execution, emit_event=emit_events)
+        scenes, scene_malformed = _decode_scene_records(device)
+        self._scene_execution_healthy = not scene_malformed
+        if scene_malformed:
+            logger.warning("malformed scene execution record")
+        await self._async_health_status("scene")
+        for execution in scenes:
+            await self._async_scene_execution(execution, emit_event=emit_events)
 
         try:
             modes = decode_mode_execution(device)
@@ -317,7 +326,7 @@ class SceneBridge:
         for command_id, pending in list(self._scene_pending.items()):
             if pending.value == execution.scene_id:
                 self._scene_pending.pop(command_id)
-                pending.task.cancel()
+                pending.timeout_task.cancel()
                 await self._async_result(
                     "scene", command_id, execution.scene_id, accepted=True, error=None
                 )
@@ -348,7 +357,7 @@ class SceneBridge:
         for command_id, pending in list(self._mode_pending.items()):
             if pending.value == execution.mode_id:
                 self._mode_pending.pop(command_id)
-                pending.task.cancel()
+                pending.timeout_task.cancel()
                 await self._async_result(
                     "mode", command_id, execution.mode_id, accepted=True, error=None
                 )
@@ -360,21 +369,26 @@ class SceneBridge:
             if not self._started:
                 return
             try:
-                await self._async_command(topic, payload, retained)
+                write_scheduled = await self._async_command(topic, payload, retained)
             except Exception:
                 logger.exception("scene bridge command callback failed; continuing")
+                return
+        if write_scheduled:
+            # Let an immediate fake/adapter write begin without making the
+            # shared MQTT reader await a potentially hung bus RPC.
+            await asyncio.sleep(0)
 
-    async def _async_command(self, topic: str, payload: str, retained: bool) -> None:
+    async def _async_command(self, topic: str, payload: str, retained: bool) -> bool:
         kind = "scene" if topic == scene_command_topic(self._panel) else "mode"
         raw_command_id = _extract_command_id(payload)
         cache_key = None if raw_command_id is None else (kind, raw_command_id)
         cached = None if cache_key is None else self._results.get(cache_key)
         if not retained and cached is not None:
-            await self._mqtt.publish(cached[0], cached[1], retain=False)
-            return
+            await self._async_publish_cached(cast(tuple[str, str], cache_key))
+            return False
         pending = self._scene_pending if kind == "scene" else self._mode_pending
         if not retained and raw_command_id is not None and raw_command_id in pending:
-            return
+            return False
 
         command: SceneCommand | ModeCommand
         try:
@@ -390,37 +404,63 @@ class SceneBridge:
                 value = command.mode_id
                 known = value in self._mode_ids
         except ValueError:
-            return
+            return False
 
         if not known:
             await self._async_result(
                 kind, command.command_id, value, accepted=False, error=f"unknown_{kind}"
             )
-            return
+            return False
         if self._execution is None:
             await self._async_result(
                 kind, command.command_id, value, accepted=False, error="execution_unavailable"
             )
-            return
+            return False
 
         variable = "last_executed_scene_id" if kind == "scene" else "manual_mode_id"
-        task = asyncio.create_task(self._async_timeout(kind, command.command_id))
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
-        pending[command.command_id] = _Pending(value, task)
+        timeout_task = self._track_task(self._async_timeout(kind, command.command_id))
+        current = _Pending(value, timeout_task)
+        pending[command.command_id] = current
+        write_task = self._track_task(
+            self._async_write(
+                kind,
+                command.command_id,
+                self._execution.device_id,
+                variable,
+                value,
+            )
+        )
+        current.write_task = write_task
+        return True
+
+    async def _async_write(
+        self,
+        kind: str,
+        command_id: str,
+        device_id: str,
+        variable: str,
+        value: str,
+    ) -> None:
         try:
             await self._bus.set_variables(
-                self._execution.device_id,
+                device_id,
                 _EXECUTION_PERIPHERAL_ID,
                 [VarSet(name=variable, value=value)],
             )
+        except asyncio.CancelledError:
+            raise
         except Exception as error:
             logger.warning("scene bridge write failed (%s)", type(error).__name__)
-            pending.pop(command.command_id, None)
-            task.cancel()
-            await self._async_result(
-                kind, command.command_id, value, accepted=False, error="write_failed"
-            )
+            async with self._lock:
+                pending = self._scene_pending if kind == "scene" else self._mode_pending
+                current = pending.get(command_id)
+                if current is None or current.write_task is not asyncio.current_task():
+                    return
+                pending.pop(command_id)
+                current.timeout_task.cancel()
+                await self._async_result(
+                    kind, command_id, value, accepted=False, error="write_failed"
+                )
 
     async def _async_timeout(self, kind: str, command_id: str) -> None:
         try:
@@ -431,6 +471,8 @@ class SceneBridge:
                 pending_map = self._scene_pending if kind == "scene" else self._mode_pending
                 pending = pending_map.pop(command_id, None)
                 if pending is not None:
+                    if pending.write_task is not None:
+                        pending.write_task.cancel()
                     await self._async_result(
                         kind, command_id, pending.value, accepted=False, error="timeout"
                     )
@@ -463,8 +505,61 @@ class SceneBridge:
         self._results[cache_key] = (topic, payload)
         self._results.move_to_end(cache_key)
         while len(self._results) > _RESULT_CACHE_LIMIT:
-            self._results.popitem(last=False)
-        await self._mqtt.publish(topic, payload, retain=False)
+            evicted, _ = self._results.popitem(last=False)
+            self._undelivered_results.discard(evicted)
+        await self._async_publish_cached(cache_key)
+
+    async def _async_publish_cached(self, cache_key: tuple[str, str]) -> None:
+        cached = self._results.get(cache_key)
+        if cached is None:
+            return
+        try:
+            await self._mqtt.publish(cached[0], cached[1], retain=False)
+        except Exception as error:
+            self._undelivered_results.add(cache_key)
+            logger.warning("scene bridge result publication failed (%s)", type(error).__name__)
+            self._schedule_result_retry(cache_key)
+        else:
+            self._undelivered_results.discard(cache_key)
+
+    async def _async_retry_results(self) -> None:
+        for cache_key in list(self._undelivered_results):
+            await self._async_publish_cached(cache_key)
+
+    def _schedule_result_retry(self, cache_key: tuple[str, str]) -> None:
+        if not self._started or cache_key in self._result_retry_tasks:
+            return
+        task = self._track_task(self._async_retry_result(cache_key))
+        self._result_retry_tasks[cache_key] = task
+        task.add_done_callback(partial(self._result_retry_done, cache_key))
+
+    async def _async_retry_result(self, cache_key: tuple[str, str]) -> None:
+        while True:
+            await self._sleep(_RESULT_RETRY_SECONDS)
+            async with self._lock:
+                if not self._started or cache_key not in self._undelivered_results:
+                    return
+                cached = self._results.get(cache_key)
+            if cached is None:
+                return
+            try:
+                await self._mqtt.publish(cached[0], cached[1], retain=False)
+            except Exception:
+                continue
+            async with self._lock:
+                if self._results.get(cache_key) == cached:
+                    self._undelivered_results.discard(cache_key)
+                    return
+
+    def _result_retry_done(self, cache_key: tuple[str, str], completed: asyncio.Task[None]) -> None:
+        if self._result_retry_tasks.get(cache_key) is completed:
+            self._result_retry_tasks.pop(cache_key)
+
+    def _track_task(self, coroutine: Coroutine[object, object, None]) -> asyncio.Task[None]:
+        task: asyncio.Task[None] = asyncio.create_task(coroutine)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return task
 
     async def _async_status(self, transport: str, available: bool, reason: str | None) -> None:
         current = (available, reason)
@@ -496,7 +591,12 @@ class SceneBridge:
             available = self._scene_catalog_healthy and self._scene_execution_healthy
         else:
             available = self._mode_catalog_healthy and self._mode_execution_healthy
-        await self._async_status(transport, available, None if available else "malformed_data")
+        if not self._execution_available:
+            available = False
+            reason: str | None = "execution_unavailable"
+        else:
+            reason = None if available else "malformed_data"
+        await self._async_status(transport, available, reason)
 
     def _load_watermarks(self) -> None:
         self._watermarks.clear()
@@ -546,6 +646,11 @@ class SceneBridge:
                 os.fsync(handle.fileno())
             os.replace(temporary, self._watermark_path)
             os.chmod(self._watermark_path, 0o600)
+            directory = os.open(self._watermark_path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
         finally:
             if descriptor >= 0:
                 os.close(descriptor)
@@ -576,3 +681,16 @@ def _is_sha256(value: str) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _decode_scene_records(device: BrilliantDevice) -> tuple[tuple[SceneExecution, ...], bool]:
+    records: list[SceneExecution] = []
+    malformed = False
+    for name, variable in device.variables.items():
+        if not name.startswith(_SCENE_EXECUTION_PREFIX):
+            continue
+        try:
+            records.extend(decode_scene_execution(replace(device, variables={name: variable})))
+        except Exception:
+            malformed = True
+    return tuple(sorted(records, key=lambda item: (item.executed_at_ms, item.scene_id))), malformed

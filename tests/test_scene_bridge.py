@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import stat
@@ -264,6 +265,47 @@ async def test_valid_commands_write_only_execution_variables_and_wait_for_confir
     await bridge.async_shutdown()
 
 
+async def test_hung_write_does_not_block_timeout_or_shutdown(tmp_path: Path) -> None:
+    class HangingBus(FakeBus):
+        def __init__(self) -> None:
+            super().__init__(
+                [_execution()],
+                scoped_devices=[_scene_catalog("all_off"), _mode_catalog("away")],
+            )
+            self.write_started = asyncio.Event()
+            self.write_cancelled = asyncio.Event()
+
+        async def set_variables(
+            self, device_id: str, peripheral_id: str, sets: list[VarSet]
+        ) -> None:
+            await super().set_variables(device_id, peripheral_id, sets)
+            self.write_started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                self.write_cancelled.set()
+                raise
+
+    bus = HangingBus()
+    mqtt = FakeMqtt()
+    clock = FakeClockMs(_NOW_MS)
+    bridge = SceneBridge(bus, mqtt, _PANEL, tmp_path / "watermarks.json", clock)
+    await bridge.async_start()
+    command_id = "22222222-2222-4222-8222-222222222222"
+
+    await asyncio.wait_for(
+        mqtt.inject(scene_command_topic(_PANEL), _command(command_id, "scene", "all_off")),
+        timeout=0.1,
+    )
+    await asyncio.wait_for(bus.write_started.wait(), timeout=0.1)
+    await clock.advance_ms(15_000)
+
+    result = _payload(_published(mqtt, scene_result_topic(command_id))[-1])
+    assert result["error"] == "timeout"
+    await asyncio.wait_for(bridge.async_shutdown(), timeout=0.1)
+    assert bus.write_cancelled.is_set()
+
+
 async def test_matching_execution_publishes_event_before_accepted_result_and_caches_replay(
     tmp_path: Path,
 ) -> None:
@@ -428,6 +470,24 @@ async def test_malformed_execution_degrades_status_without_breaking_fanout(tmp_p
     await bridge.async_shutdown()
 
 
+async def test_mixed_initial_execution_seeds_valid_history_while_degrading_status(
+    tmp_path: Path,
+) -> None:
+    valid = _execution("all_off", 500)
+    malformed = _execution("broken", malformed_scene=True)
+    mixed = _device("execution_peripheral", {**valid.variables, **malformed.variables})
+    bridge, bus, mqtt, _, path = await _started(tmp_path, execution=mixed)
+
+    assert _published(mqtt, scene_event_topic(_PANEL)) == []
+    assert json.loads(path.read_text())[_PANEL]["all_off"]["executed_at_ms"] == 500
+    status = _payload(_published(mqtt, transport_status_topic("scene", _PANEL))[-1])
+    assert status["available"] is False
+
+    await bus.emit(valid)
+    assert _published(mqtt, scene_event_topic(_PANEL)) == []
+    await bridge.async_shutdown()
+
+
 async def test_reconnect_malformed_execution_stays_degraded_after_valid_catalog(
     tmp_path: Path,
 ) -> None:
@@ -439,6 +499,60 @@ async def test_reconnect_malformed_execution_stays_degraded_after_valid_catalog(
     status = _payload(_published(mqtt, transport_status_topic("scene", _PANEL))[-1])
     assert status["available"] is False
     assert status["reason"] == "malformed_data"
+    await bridge.async_shutdown()
+
+
+async def test_missing_execution_is_unavailable_and_reconnect_clears_stale_route(
+    tmp_path: Path,
+) -> None:
+    bridge, bus, mqtt, _, _ = await _started(tmp_path)
+    bus.set_devices([])
+
+    await bus.fire_reconnect()
+
+    status = _payload(_published(mqtt, transport_status_topic("scene", _PANEL))[-1])
+    assert status["available"] is False
+    assert status["reason"] == "execution_unavailable"
+    command_id = "22222222-2222-4222-8222-222222222222"
+    await mqtt.inject(scene_command_topic(_PANEL), _command(command_id, "scene", "all_off"))
+    assert bus.commands == []
+    assert _payload(_published(mqtt, scene_result_topic(command_id))[-1])["error"] == (
+        "execution_unavailable"
+    )
+    await bridge.async_shutdown()
+
+
+async def test_failed_terminal_result_publish_retries_until_delivered(tmp_path: Path) -> None:
+    command_id = "22222222-2222-4222-8222-222222222222"
+
+    class OneResultFailsMqtt(FakeMqtt):
+        def __init__(self) -> None:
+            super().__init__()
+            self.failed = False
+
+        async def publish(self, topic: str, payload: str, retain: bool = False) -> None:
+            if topic == scene_result_topic(command_id) and not self.failed:
+                self.failed = True
+                raise RuntimeError("broker unavailable")
+            await super().publish(topic, payload, retain)
+
+    bus = FakeBus(
+        [_execution()],
+        scoped_devices=[_scene_catalog("all_off"), _mode_catalog("away")],
+    )
+    mqtt = OneResultFailsMqtt()
+    clock = FakeClockMs(_NOW_MS)
+    bridge = SceneBridge(bus, mqtt, _PANEL, tmp_path / "watermarks.json", clock)
+    await bridge.async_start()
+    await mqtt.inject(scene_command_topic(_PANEL), _command(command_id, "scene", "all_off"))
+    await bus.emit(_execution("all_off", 500))
+    assert _published(mqtt, scene_result_topic(command_id)) == []
+
+    await clock.advance_ms(1_000)
+
+    results = _published(mqtt, scene_result_topic(command_id))
+    assert len(results) == 1
+    assert _payload(results[0])["accepted"] is True
     await bridge.async_shutdown()
 
 
