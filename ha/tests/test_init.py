@@ -2,16 +2,23 @@
 
 from __future__ import annotations
 
-from unittest.mock import patch
+import asyncio
+import json
+from unittest.mock import AsyncMock, patch
 
 import pytest
+from homeassistant.components import mqtt
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant
 from homeassistant.loader import async_get_integration
-from pytest_homeassistant_custom_component.common import MockConfigEntry
+from pytest_homeassistant_custom_component.common import MockConfigEntry, async_fire_mqtt_message
 from pytest_homeassistant_custom_component.typing import MqttMockHAClient
 
-from custom_components.brilliant_mqtt import async_migrate_entry
+from custom_components.brilliant_mqtt import (
+    async_migrate_entry,
+    async_setup_entry,
+    async_unload_entry,
+)
 from custom_components.brilliant_mqtt.const import (
     COMPONENT_BRIDGE,
     COMPONENT_VOICE,
@@ -32,6 +39,8 @@ from custom_components.brilliant_mqtt.const import (
     CONF_VOICE_ENABLED,
     DATA_SSH_HOST_KEY,
     DOMAIN,
+    availability_topic,
+    meta_topic,
 )
 from custom_components.brilliant_mqtt.ha_control import get_control_plane
 from custom_components.brilliant_mqtt.ha_control_protocol import (
@@ -39,6 +48,7 @@ from custom_components.brilliant_mqtt.ha_control_protocol import (
     stable_id,
     state_topic,
 )
+from custom_components.brilliant_mqtt.manager import PanelManager
 
 
 async def test_integration_discoverable(hass: HomeAssistant) -> None:
@@ -209,6 +219,241 @@ async def test_two_entries_share_control_plane_through_setup_and_unload(
     assert await hass.config_entries.async_unload(zulu.entry_id)
     assert plane.started is False
     assert not mqtt_mock.is_active_subscription("brilliant/ha-control/v1/command/+")
+
+
+@pytest.mark.allow_lingering_timers
+@pytest.mark.parametrize(
+    "detach_failure",
+    [RuntimeError("alternate owner publish failed"), asyncio.CancelledError()],
+    ids=["error", "cancelled"],
+)
+async def test_unload_always_shuts_manager_down_when_alternate_owner_reload_fails(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    detach_failure: BaseException,
+) -> None:
+    """Detach failures must not leave per-entry MQTT subscriptions or timers."""
+    from homeassistant.helpers import entity_registry as er
+    from homeassistant.helpers import label_registry as lr
+
+    label = lr.async_get(hass).async_create("brilliant")
+    entity = er.async_get(hass).async_get_or_create(
+        "switch", "test", "cleanup", original_name="Cleanup"
+    )
+    er.async_get(hass).async_update_entity(entity.entity_id, labels={label.label_id})
+    hass.states.async_set(entity.entity_id, "off")
+    control_data = {
+        CONF_HA_CONTROL_ENABLED: True,
+        CONF_HA_CONTROL_DOMAINS: ("light", "switch"),
+        CONF_MAX_MIRRORED_ENTITIES: 50,
+        CONF_ROOM_OVERRIDES: {},
+    }
+    zulu = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="zulu-cleanup",
+        data={
+            **ENTRY_DATA,
+            **control_data,
+            CONF_PANEL: "zulu",
+            CONF_HA_CONTROL_LABEL: "unused",
+        },
+    )
+    alpha = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="alpha-cleanup",
+        data={
+            **ENTRY_DATA,
+            **control_data,
+            CONF_PANEL: "alpha",
+            CONF_HA_CONTROL_LABEL: "brilliant",
+        },
+    )
+    zulu.add_to_hass(hass)
+    alpha.add_to_hass(hass)
+    plane = get_control_plane(hass)
+    await plane.async_attach(zulu)
+    manager = PanelManager(hass, alpha, asyncio.Lock())
+    alpha.runtime_data = manager
+    await manager.async_setup()
+    await plane.async_attach(alpha)
+    async_fire_mqtt_message(hass, availability_topic("alpha"), "offline")
+    await hass.async_block_till_done()
+    assert manager._grace_cancel is not None
+
+    with (
+        patch.object(
+            hass.config_entries, "async_unload_platforms", new=AsyncMock(return_value=True)
+        ),
+        patch(
+            "custom_components.brilliant_mqtt.ha_control.mqtt.async_publish",
+            side_effect=detach_failure,
+        ),
+        pytest.raises(type(detach_failure)),
+    ):
+        await async_unload_entry(hass, alpha)
+
+    assert manager._grace_cancel is None
+    assert not mqtt_mock.is_active_subscription(availability_topic("alpha"))
+    assert not mqtt_mock.is_active_subscription(meta_topic("alpha"))
+    await plane.async_detach(zulu.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_setup_failure_preserves_original_error_when_detach_cleanup_fails(
+    hass: HomeAssistant, mqtt_mock: MqttMockHAClient
+) -> None:
+    """A cleanup publish failure must not replace the platform setup error."""
+    from homeassistant.helpers import entity_registry as er
+    from homeassistant.helpers import label_registry as lr
+
+    label = lr.async_get(hass).async_create("brilliant")
+    entity = er.async_get(hass).async_get_or_create(
+        "switch", "test", "setup_cleanup", original_name="Setup Cleanup"
+    )
+    er.async_get(hass).async_update_entity(entity.entity_id, labels={label.label_id})
+    hass.states.async_set(entity.entity_id, "off")
+    zulu = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="zulu-setup-cleanup",
+        data={
+            **ENTRY_DATA,
+            CONF_PANEL: "zulu",
+            CONF_HA_CONTROL_ENABLED: True,
+            CONF_HA_CONTROL_LABEL: "unused",
+        },
+    )
+    alpha = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="alpha-setup-cleanup",
+        data={
+            **ENTRY_DATA,
+            CONF_PANEL: "alpha",
+            CONF_HA_CONTROL_ENABLED: True,
+            CONF_HA_CONTROL_LABEL: "brilliant",
+        },
+    )
+    zulu.add_to_hass(hass)
+    alpha.add_to_hass(hass)
+    plane = get_control_plane(hass)
+    await plane.async_attach(zulu)
+    real_publish = mqtt.async_publish
+
+    async def fail_empty_manifest(
+        hass: HomeAssistant,
+        topic: str,
+        payload: str | bytes | int | float | None,
+        qos: int = 0,
+        retain: bool = False,
+        encoding: str | None = "utf-8",
+        *,
+        message_expiry_interval: int | None = None,
+    ) -> None:
+        if topic == manifest_topic() and json.loads(str(payload))["entities"] == []:
+            raise RuntimeError("detach cleanup failed")
+        await real_publish(
+            hass,
+            topic,
+            payload,
+            qos,
+            retain,
+            encoding,
+            message_expiry_interval=message_expiry_interval,
+        )
+
+    with (
+        patch.object(
+            hass.config_entries,
+            "async_forward_entry_setups",
+            new=AsyncMock(side_effect=ValueError("platform setup failed")),
+        ),
+        patch(
+            "custom_components.brilliant_mqtt.ha_control.mqtt.async_publish",
+            side_effect=fail_empty_manifest,
+        ),
+        pytest.raises(ValueError, match="platform setup failed"),
+    ):
+        await async_setup_entry(hass, alpha)
+
+    assert not mqtt_mock.is_active_subscription(availability_topic("alpha"))
+    assert not mqtt_mock.is_active_subscription(meta_topic("alpha"))
+    await plane.async_detach(zulu.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
+@pytest.mark.parametrize(
+    "setup_failure",
+    [RuntimeError("manager setup failed"), asyncio.CancelledError()],
+    ids=["error", "cancelled"],
+)
+async def test_partial_manager_setup_failure_is_cleaned_up(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    setup_failure: BaseException,
+) -> None:
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="partial-setup",
+        data={**ENTRY_DATA, CONF_PANEL: "partial-setup"},
+    )
+    entry.add_to_hass(hass)
+    real_subscribe = mqtt.async_subscribe
+    subscriptions = 0
+
+    async def fail_second_subscribe(*args: object, **kwargs: object) -> object:
+        nonlocal subscriptions
+        subscriptions += 1
+        if subscriptions == 2:
+            raise setup_failure
+        return await real_subscribe(*args, **kwargs)  # type: ignore[arg-type]
+
+    with (
+        patch(
+            "custom_components.brilliant_mqtt.manager.mqtt.async_subscribe",
+            side_effect=fail_second_subscribe,
+        ),
+        pytest.raises(type(setup_failure)),
+    ):
+        await async_setup_entry(hass, entry)
+
+    assert not mqtt_mock.is_active_subscription(availability_topic("partial-setup"))
+
+
+@pytest.mark.allow_lingering_timers
+async def test_external_unload_cancellation_is_drained_before_manager_shutdown(
+    hass: HomeAssistant, mqtt_mock: MqttMockHAClient
+) -> None:
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="cancel-cleanup",
+        data={**ENTRY_DATA, CONF_PANEL: "cancel-cleanup"},
+    )
+    entry.add_to_hass(hass)
+    manager = PanelManager(hass, entry, asyncio.Lock())
+    entry.runtime_data = manager
+    await manager.async_setup()
+    plane = get_control_plane(hass)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_detach(_entry_id: str) -> None:
+        entered.set()
+        await release.wait()
+
+    with (
+        patch.object(
+            hass.config_entries, "async_unload_platforms", new=AsyncMock(return_value=True)
+        ),
+        patch.object(plane, "async_detach", side_effect=slow_detach),
+    ):
+        unload = hass.async_create_task(async_unload_entry(hass, entry))
+        await entered.wait()
+        unload.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await unload
+
+    assert not mqtt_mock.is_active_subscription(availability_topic("cancel-cleanup"))
+    assert not mqtt_mock.is_active_subscription(meta_topic("cancel-cleanup"))
 
 
 async def test_migrate_v1_folds_voice_enabled_into_components(hass: HomeAssistant) -> None:

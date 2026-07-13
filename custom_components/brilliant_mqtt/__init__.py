@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -26,6 +27,8 @@ from .const import (
     PLATFORMS,
 )
 from .manager import PanelManager
+
+_LOGGER = logging.getLogger(__name__)
 
 type BrilliantMqttConfigEntry = ConfigEntry[PanelManager]
 
@@ -52,6 +55,69 @@ def _fleet_lock(hass: HomeAssistant) -> asyncio.Lock:
     domain_data: dict[str, Any] = hass.data.setdefault(DOMAIN, {})
     lock: asyncio.Lock = domain_data.setdefault("ssh_lock", asyncio.Lock())
     return lock
+
+
+async def _async_cleanup_entry(hass: HomeAssistant, entry: BrilliantMqttConfigEntry) -> None:
+    """Attempt control detach and manager shutdown as one drained cleanup unit.
+
+    Shielding keeps caller cancellation from interrupting the cleanup task between
+    the two owners. If the caller is cancelled, drain cleanup before re-raising that
+    cancellation. An internally raised cancellation/error from detach still runs
+    manager shutdown and then propagates as the primary cleanup failure.
+    """
+    from .ha_control import get_control_plane
+
+    async def _run_cleanup() -> None:
+        primary_error: BaseException | None = None
+        try:
+            await get_control_plane(hass).async_detach(entry.entry_id)
+        except BaseException as error:
+            primary_error = error
+
+        shutdown_error: BaseException | None = None
+        try:
+            await entry.runtime_data.async_shutdown()
+        except BaseException as error:
+            shutdown_error = error
+
+        if primary_error is not None:
+            if shutdown_error is not None:
+                _LOGGER.warning(
+                    "Manager shutdown also failed after control detach failure (%s): %s",
+                    type(shutdown_error).__name__,
+                    shutdown_error,
+                )
+            raise primary_error
+        if shutdown_error is not None:
+            raise shutdown_error
+
+    cleanup_task = hass.async_create_task(_run_cleanup())
+    try:
+        await asyncio.shield(cleanup_task)
+    except asyncio.CancelledError:
+        current_task = asyncio.current_task()
+        if current_task is None or current_task.cancelling() == 0:
+            # The cleanup task itself raised CancelledError; it already attempted
+            # manager shutdown, so propagate that internal primary failure.
+            await cleanup_task
+            return
+
+        # The caller was cancelled. Keep the cleanup task shielded from any repeated
+        # cancellation request, drain it, then preserve the caller's cancellation.
+        while not cleanup_task.done():
+            try:
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError:
+                continue
+        try:
+            cleanup_task.result()
+        except BaseException as cleanup_error:
+            _LOGGER.warning(
+                "Entry cleanup failed while unload/setup was cancelled (%s): %s",
+                type(cleanup_error).__name__,
+                cleanup_error,
+            )
+        raise
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
@@ -114,16 +180,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: BrilliantMqttConfigEntry
         raise ConfigEntryNotReady("MQTT integration is not available")
     manager = PanelManager(hass, entry, _fleet_lock(hass))
     entry.runtime_data = manager
-    await manager.async_setup()
     from .ha_control import get_control_plane
 
     control_plane = get_control_plane(hass)
     try:
+        await manager.async_setup()
         await control_plane.async_attach(entry)
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     except BaseException:
-        await control_plane.async_detach(entry.entry_id)
-        await manager.async_shutdown()
+        try:
+            await _async_cleanup_entry(hass, entry)
+        except BaseException as cleanup_error:
+            _LOGGER.warning(
+                "Entry cleanup failed after setup failure (%s): %s",
+                type(cleanup_error).__name__,
+                cleanup_error,
+            )
         raise
     return True
 
@@ -148,10 +220,7 @@ async def async_migrate_entry(hass: HomeAssistant, entry: BrilliantMqttConfigEnt
 
 async def async_unload_entry(hass: HomeAssistant, entry: BrilliantMqttConfigEntry) -> bool:
     if unloaded := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
-        from .ha_control import get_control_plane
-
-        await get_control_plane(hass).async_detach(entry.entry_id)
-        await entry.runtime_data.async_shutdown()
+        await _async_cleanup_entry(hass, entry)
     return unloaded
 
 

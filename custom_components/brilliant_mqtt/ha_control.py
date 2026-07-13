@@ -127,6 +127,7 @@ class HaControlPlane:
         self._lifecycle_lock = asyncio.Lock()
         self._command_lock = asyncio.Lock()
         self._started = False
+        self._accept_commands = False
 
     @property
     def started(self) -> bool:
@@ -151,22 +152,29 @@ class HaControlPlane:
 
     async def async_detach(self, entry_id: str) -> None:
         """Detach one panel and stop only after no enabled entries remain."""
+        # Fence new/queued commands before waiting behind an in-flight command that
+        # owns the lifecycle lock. The active command may drain; later callbacks fail
+        # closed even if they entered the lock queue before this detach task.
+        self._accept_commands = False
         async with self._lifecycle_lock:
             self._entries.pop(entry_id, None)
             await self._async_reload_settings_locked()
 
     async def async_reload_settings(self) -> None:
         """Re-elect the settings owner and rebuild only when necessary."""
+        self._accept_commands = False
         async with self._lifecycle_lock:
             await self._async_reload_settings_locked()
 
     async def async_start(self) -> None:
         """Start publication if an enabled attached entry exists."""
+        self._accept_commands = False
         async with self._lifecycle_lock:
             await self._async_reload_settings_locked()
 
     async def async_stop(self) -> None:
         """Stop subscriptions/listeners and cancel pending work."""
+        self._accept_commands = False
         async with self._lifecycle_lock:
             await self._async_stop_locked()
 
@@ -185,10 +193,12 @@ class HaControlPlane:
             await self._async_start_locked()
             return
         await self._async_rebuild_manifest()
+        self._accept_commands = True
 
     async def _async_start_locked(self) -> None:
         if self._started or self._settings is None:
             return
+        self._accept_commands = False
         try:
             mqtt_unsubscribe = await mqtt.async_subscribe(
                 self.hass, _COMMAND_TOPIC, self._async_command_received
@@ -213,22 +223,20 @@ class HaControlPlane:
             )
             self._started = True
             await self._async_rebuild_manifest()
+            self._accept_commands = True
         except BaseException:
             await self._async_stop_locked()
             raise
 
     async def _async_stop_locked(self) -> None:
         self._started = False
+        self._accept_commands = False
         if self._debounce_cancel is not None:
             self._debounce_cancel()
             self._debounce_cancel = None
         for unsubscribe in reversed(self._unsubscribers):
             unsubscribe()
         self._unsubscribers.clear()
-        self._manifest = None
-        self._manifest_body = None
-        self._state_sequences.clear()
-        self._results.clear()
 
     def _enabled_owner(self) -> BrilliantMqttConfigEntry | None:
         enabled = (
@@ -255,13 +263,14 @@ class HaControlPlane:
         await mqtt.async_publish(
             self.hass, manifest_topic(), encode_json(candidate.as_payload()), retain=True
         )
-        # Commit the authoritative in-memory view only after the retained catalog is
-        # accepted by MQTT. A transient publish failure must leave the candidate
-        # retryable and must not authorize commands a panel could not have observed.
-        self._manifest = candidate
-        self._manifest_body = body
         for entity in candidate.entities:
             await self._async_publish_state(entity, generated_at_ms)
+        # Commit internal authority only after MQTT accepts the retained catalog and
+        # every state required by that catalog. A partial failure leaves the complete
+        # snapshot retryable and cannot authorize a command against incomplete wire
+        # state. Sequences still advance for any successful partial publications.
+        self._manifest = candidate
+        self._manifest_body = body
 
     async def _async_publish_state(
         self, entity: ManifestEntity, generated_at_ms: int | None = None
@@ -305,8 +314,10 @@ class HaControlPlane:
             await self._async_rebuild_manifest()
 
     async def _async_command_received(self, message: ReceiveMessage) -> None:
+        if not self._accept_commands:
+            return
         async with self._lifecycle_lock:
-            if not self._started:
+            if not self._started or not self._accept_commands:
                 return
             async with self._command_lock:
                 await self._async_execute_command(message)

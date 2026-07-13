@@ -12,6 +12,7 @@ from unittest.mock import patch
 from uuid import UUID, uuid4
 
 import pytest
+from homeassistant.components import mqtt
 from homeassistant.components.cover import CoverEntityFeature
 from homeassistant.components.light import ATTR_SUPPORTED_COLOR_MODES
 from homeassistant.const import ATTR_SUPPORTED_FEATURES
@@ -307,6 +308,29 @@ async def test_smallest_enabled_panel_owns_settings_without_restarting(
 
 
 @pytest.mark.allow_lingering_timers
+async def test_successful_alternate_owner_reload_reopens_command_acceptance(
+    hass: HomeAssistant, mqtt_mock: MqttMockHAClient
+) -> None:
+    entity = _selected_entity(hass, "switch.office")
+    calls: list[ServiceCall] = []
+    hass.services.async_register("switch", "turn_on", calls.append)
+    zulu = _entry(hass, "zulu")
+    alpha = _entry(hass, "alpha")
+    plane = get_control_plane(hass)
+    await plane.async_attach(zulu)
+    await plane.async_attach(alpha)
+
+    await plane.async_detach(alpha.entry_id)
+    command_id, payload = _command_payload(entity.entity_id, "turn_on", None)
+    async_fire_mqtt_message(hass, command_topic(stable_id(entity.entity_id)), payload)
+    await hass.async_block_till_done()
+
+    assert len(calls) == 1
+    assert _payload(_published(mqtt_mock, result_topic(command_id))[-1])["accepted"] is True
+    await plane.async_detach(zulu.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
 async def test_registry_events_coalesce_into_one_real_bus_rebuild(
     hass: HomeAssistant, mqtt_mock: MqttMockHAClient
 ) -> None:
@@ -490,6 +514,168 @@ async def test_command_absent_from_manifest_is_rejected(
     assert result["accepted"] is False
     assert result["error"] == "command is not allowed by the current manifest"
     await plane.async_detach(entry.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_dormant_restart_preserves_revision_sequence_and_duplicate_cache(
+    hass: HomeAssistant, mqtt_mock: MqttMockHAClient
+) -> None:
+    first = _selected_entity(hass, "switch.first")
+    calls: list[ServiceCall] = []
+    hass.services.async_register("switch", "turn_on", calls.append)
+    entry = _entry(hass, "office")
+    plane = get_control_plane(hass)
+    await plane.async_attach(entry)
+
+    _selected_entity(hass, "switch.second")
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=1))
+    await hass.async_block_till_done()
+    assert _payload(_published(mqtt_mock, manifest_topic())[-1])["revision"] == 2
+    sequence_before_dormancy = _payload(
+        _published(mqtt_mock, state_topic(stable_id(first.entity_id)))[-1]
+    )["sequence"]
+    assert sequence_before_dormancy > 1
+
+    hass.states.async_set(first.entity_id, "on")
+    await hass.async_block_till_done()
+    sequence_before_dormancy += 1
+    assert (
+        _payload(_published(mqtt_mock, state_topic(stable_id(first.entity_id)))[-1])["sequence"]
+        == sequence_before_dormancy
+    )
+    command_id, command_payload = _command_payload(first.entity_id, "turn_on", None)
+    async_fire_mqtt_message(hass, command_topic(stable_id(first.entity_id)), command_payload)
+    await hass.async_block_till_done()
+    first_result = _published(mqtt_mock, result_topic(command_id))[-1].args[1]
+    assert len(calls) == 1
+
+    await plane.async_detach(entry.entry_id)
+    assert plane.started is False
+    assert plane.result_cache_size == 1
+    mqtt_mock.async_publish.reset_mock()
+    await plane.async_attach(entry)
+
+    async_fire_mqtt_message(hass, command_topic(stable_id(first.entity_id)), command_payload)
+    await hass.async_block_till_done()
+    assert len(calls) == 1
+    assert _published(mqtt_mock, result_topic(command_id))[0].args[1] == first_result
+
+    hass.states.async_set(first.entity_id, "off")
+    await hass.async_block_till_done()
+    assert (
+        _payload(_published(mqtt_mock, state_topic(stable_id(first.entity_id)))[-1])["sequence"]
+        == sequence_before_dormancy + 1
+    )
+    _selected_entity(hass, "switch.third")
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=1))
+    await hass.async_block_till_done()
+    assert _payload(_published(mqtt_mock, manifest_topic())[-1])["revision"] == 3
+    await plane.async_detach(entry.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_partial_state_failure_retries_full_snapshot_before_authorizing(
+    hass: HomeAssistant, mqtt_mock: MqttMockHAClient
+) -> None:
+    first = _selected_entity(hass, "switch.first")
+    second = _selected_entity(hass, "switch.second")
+    calls: list[ServiceCall] = []
+    hass.services.async_register("switch", "turn_on", calls.append)
+    zulu = _entry(hass, "zulu", label="unused")
+    alpha = _entry(hass, "alpha")
+    plane = get_control_plane(hass)
+    await plane.async_attach(zulu)
+    real_publish = mqtt.async_publish
+    failed = False
+
+    async def fail_second_state(
+        hass: HomeAssistant,
+        topic: str,
+        payload: str | bytes | int | float | None,
+        qos: int = 0,
+        retain: bool = False,
+        encoding: str | None = "utf-8",
+        *,
+        message_expiry_interval: int | None = None,
+    ) -> None:
+        nonlocal failed
+        if topic == state_topic(stable_id(second.entity_id)) and not failed:
+            failed = True
+            raise RuntimeError("state publish failed")
+        await real_publish(
+            hass,
+            topic,
+            payload,
+            qos,
+            retain,
+            encoding,
+            message_expiry_interval=message_expiry_interval,
+        )
+
+    with (
+        patch(
+            "custom_components.brilliant_mqtt.ha_control.mqtt.async_publish",
+            side_effect=fail_second_state,
+        ),
+        pytest.raises(RuntimeError, match="state publish failed"),
+    ):
+        await plane.async_attach(alpha)
+
+    rejected_id, rejected_payload = _command_payload(first.entity_id, "turn_on", None)
+    async_fire_mqtt_message(hass, command_topic(stable_id(first.entity_id)), rejected_payload)
+    await hass.async_block_till_done()
+    assert calls == []
+    assert _payload(_published(mqtt_mock, result_topic(rejected_id))[-1])["accepted"] is False
+    mqtt_mock.async_publish.reset_mock()
+
+    await plane.async_reload_settings()
+
+    assert len(_published(mqtt_mock, manifest_topic())) == 1
+    assert len(_published(mqtt_mock, state_topic(stable_id(first.entity_id)))) == 1
+    assert len(_published(mqtt_mock, state_topic(stable_id(second.entity_id)))) == 1
+    accepted_id, accepted_payload = _command_payload(first.entity_id, "turn_on", None)
+    async_fire_mqtt_message(hass, command_topic(stable_id(first.entity_id)), accepted_payload)
+    await hass.async_block_till_done()
+    assert len(calls) == 1
+    assert _payload(_published(mqtt_mock, result_topic(accepted_id))[-1])["accepted"] is True
+    await plane.async_detach(alpha.entry_id)
+    await plane.async_detach(zulu.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_detach_fences_a_queued_command_while_first_command_drains(
+    hass: HomeAssistant, mqtt_mock: MqttMockHAClient
+) -> None:
+    entity = _selected_entity(hass, "switch.controlled")
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    calls: list[ServiceCall] = []
+
+    async def blocking_handler(call: ServiceCall) -> None:
+        calls.append(call)
+        entered.set()
+        await release.wait()
+
+    hass.services.async_register("switch", "turn_on", blocking_handler)
+    entry = _entry(hass, "office")
+    plane = get_control_plane(hass)
+    await plane.async_attach(entry)
+    first_id, first_payload = _command_payload(entity.entity_id, "turn_on", None)
+    second_id, second_payload = _command_payload(entity.entity_id, "turn_on", None)
+
+    async_fire_mqtt_message(hass, command_topic(stable_id(entity.entity_id)), first_payload)
+    await entered.wait()
+    async_fire_mqtt_message(hass, command_topic(stable_id(entity.entity_id)), second_payload)
+    await asyncio.sleep(0)
+    detach = hass.async_create_task(plane.async_detach(entry.entry_id))
+    await asyncio.sleep(0)
+    release.set()
+    await detach
+    await hass.async_block_till_done()
+
+    assert len(calls) == 1
+    assert len(_published(mqtt_mock, result_topic(first_id))) == 1
+    assert _published(mqtt_mock, result_topic(second_id)) == []
 
 
 @pytest.mark.allow_lingering_timers
