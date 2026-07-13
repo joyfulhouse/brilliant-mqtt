@@ -128,6 +128,9 @@ class HaControlPlane:
         self._command_lock = asyncio.Lock()
         self._started = False
         self._accept_commands = False
+        self._rebuilding = False
+        self._hard_fenced = False
+        self._command_fence_generation = 0
 
     @property
     def started(self) -> bool:
@@ -146,9 +149,21 @@ class HaControlPlane:
 
     async def async_attach(self, entry: BrilliantMqttConfigEntry) -> None:
         """Attach one loaded panel entry and start when any entry is enabled."""
-        async with self._lifecycle_lock:
-            self._entries[entry.entry_id] = entry
-            await self._async_reload_settings_locked()
+        self._accept_commands = False
+        self._rebuilding = True
+        try:
+            async with self._lifecycle_lock:
+                self._entries[entry.entry_id] = entry
+                await self._async_reload_settings_locked()
+        except BaseException:
+            self._rebuilding = False
+            self._accept_commands = (
+                self._started and self._manifest is not None and not self._hard_fenced
+            )
+            raise
+        self._hard_fenced = False
+        self._rebuilding = False
+        self._accept_commands = self._started and self._manifest is not None
 
     async def async_detach(self, entry_id: str) -> None:
         """Detach one panel and stop only after no enabled entries remain."""
@@ -156,27 +171,62 @@ class HaControlPlane:
         # owns the lifecycle lock. The active command may drain; later callbacks fail
         # closed even if they entered the lock queue before this detach task.
         self._accept_commands = False
-        async with self._lifecycle_lock:
-            self._entries.pop(entry_id, None)
-            await self._async_reload_settings_locked()
+        self._rebuilding = False
+        self._hard_fenced = True
+        self._command_fence_generation += 1
+        try:
+            async with self._lifecycle_lock:
+                self._entries.pop(entry_id, None)
+                await self._async_reload_settings_locked()
+        except BaseException:
+            self._rebuilding = False
+            raise
+        self._hard_fenced = False
+        self._rebuilding = False
+        self._accept_commands = self._started and self._manifest is not None
 
     async def async_reload_settings(self) -> None:
         """Re-elect the settings owner and rebuild only when necessary."""
         self._accept_commands = False
-        async with self._lifecycle_lock:
-            await self._async_reload_settings_locked()
+        self._rebuilding = True
+        try:
+            async with self._lifecycle_lock:
+                await self._async_reload_settings_locked()
+        except BaseException:
+            self._rebuilding = False
+            self._accept_commands = (
+                self._started and self._manifest is not None and not self._hard_fenced
+            )
+            raise
+        self._hard_fenced = False
+        self._rebuilding = False
+        self._accept_commands = self._started and self._manifest is not None
 
     async def async_start(self) -> None:
         """Start publication if an enabled attached entry exists."""
         self._accept_commands = False
-        async with self._lifecycle_lock:
-            await self._async_reload_settings_locked()
+        self._rebuilding = True
+        try:
+            async with self._lifecycle_lock:
+                await self._async_reload_settings_locked()
+        except BaseException:
+            self._rebuilding = False
+            self._accept_commands = False
+            raise
+        self._hard_fenced = False
+        self._rebuilding = False
+        self._accept_commands = self._started and self._manifest is not None
 
     async def async_stop(self) -> None:
         """Stop subscriptions/listeners and cancel pending work."""
         self._accept_commands = False
-        async with self._lifecycle_lock:
-            await self._async_stop_locked()
+        self._hard_fenced = True
+        self._command_fence_generation += 1
+        try:
+            async with self._lifecycle_lock:
+                await self._async_stop_locked()
+        finally:
+            self._hard_fenced = False
 
     async def _async_reload_settings_locked(self) -> None:
         owner = self._enabled_owner()
@@ -193,7 +243,6 @@ class HaControlPlane:
             await self._async_start_locked()
             return
         await self._async_rebuild_manifest()
-        self._accept_commands = True
 
     async def _async_start_locked(self) -> None:
         if self._started or self._settings is None:
@@ -223,7 +272,6 @@ class HaControlPlane:
             )
             self._started = True
             await self._async_rebuild_manifest()
-            self._accept_commands = True
         except BaseException:
             await self._async_stop_locked()
             raise
@@ -231,6 +279,7 @@ class HaControlPlane:
     async def _async_stop_locked(self) -> None:
         self._started = False
         self._accept_commands = False
+        self._rebuilding = False
         if self._debounce_cancel is not None:
             self._debounce_cancel()
             self._debounce_cancel = None
@@ -252,25 +301,48 @@ class HaControlPlane:
 
     async def _async_rebuild_manifest(self) -> None:
         if not self._started or self._settings is None:
+            self._rebuilding = False
             return
-        revision = 1 if self._manifest is None else self._manifest.revision + 1
-        generated_at_ms = _timestamp_ms()
-        candidate = build_manifest(self.hass, self._settings, revision, generated_at_ms)
-        body = _canonical_manifest_body(candidate)
-        if body == self._manifest_body:
-            return
+        self._accept_commands = False
+        self._rebuilding = True
+        previous_manifest = self._manifest
+        try:
+            revision = 1 if previous_manifest is None else previous_manifest.revision + 1
+            generated_at_ms = _timestamp_ms()
+            candidate = build_manifest(self.hass, self._settings, revision, generated_at_ms)
+            body = _canonical_manifest_body(candidate)
+            if body == self._manifest_body:
+                self._accept_commands = (
+                    self._started and previous_manifest is not None and not self._hard_fenced
+                )
+                return
 
-        await mqtt.async_publish(
-            self.hass, manifest_topic(), encode_json(candidate.as_payload()), retain=True
+            # States are staged first. They are harmless while unreferenced by the
+            # retained manifest. Publishing the manifest last is the broker-visible
+            # commit point for this complete candidate.
+            for entity in candidate.entities:
+                await self._async_publish_state(entity, generated_at_ms)
+            await mqtt.async_publish(
+                self.hass,
+                manifest_topic(),
+                encode_json(candidate.as_payload()),
+                retain=True,
+            )
+            self._manifest = candidate
+            self._manifest_body = body
+        except BaseException:
+            # Manifest-last means a failed candidate never displaced the previous
+            # broker manifest. Reopen that old authority when it exists; initial
+            # startup has no committed authority and therefore remains closed.
+            self._accept_commands = (
+                self._started and previous_manifest is not None and not self._hard_fenced
+            )
+            raise
+        finally:
+            self._rebuilding = False
+        self._accept_commands = (
+            self._started and self._manifest is not None and not self._hard_fenced
         )
-        for entity in candidate.entities:
-            await self._async_publish_state(entity, generated_at_ms)
-        # Commit internal authority only after MQTT accepts the retained catalog and
-        # every state required by that catalog. A partial failure leaves the complete
-        # snapshot retryable and cannot authorize a command against incomplete wire
-        # state. Sequences still advance for any successful partial publications.
-        self._manifest = candidate
-        self._manifest_body = body
 
     async def _async_publish_state(
         self, entity: ManifestEntity, generated_at_ms: int | None = None
@@ -309,15 +381,23 @@ class HaControlPlane:
         )
 
     async def _async_registry_debounce(self, _now: datetime) -> None:
+        self._accept_commands = False
+        self._rebuilding = True
         async with self._lifecycle_lock:
             self._debounce_cancel = None
             await self._async_rebuild_manifest()
 
     async def _async_command_received(self, message: ReceiveMessage) -> None:
-        if not self._accept_commands:
+        generation = self._command_fence_generation
+        if self._hard_fenced or (not self._accept_commands and not self._rebuilding):
             return
         async with self._lifecycle_lock:
-            if not self._started or not self._accept_commands:
+            if (
+                not self._started
+                or not self._accept_commands
+                or self._hard_fenced
+                or generation != self._command_fence_generation
+            ):
                 return
             async with self._command_lock:
                 await self._async_execute_command(message)

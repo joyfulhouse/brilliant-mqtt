@@ -643,6 +643,196 @@ async def test_partial_state_failure_retries_full_snapshot_before_authorizing(
 
 
 @pytest.mark.allow_lingering_timers
+async def test_failed_candidate_state_never_replaces_broker_manifest_a(
+    hass: HomeAssistant, mqtt_mock: MqttMockHAClient
+) -> None:
+    entity_a = _selected_entity(hass, "switch.a", label="label-a")
+    _selected_entity(hass, "switch.b_first", label="label-b")
+    entity_b_second = _selected_entity(hass, "switch.b_second", label="label-b")
+    entry = _entry(hass, "office", label="label-a")
+    plane = get_control_plane(hass)
+    await plane.async_attach(entry)
+    manifest_a = _payload(_published(mqtt_mock, manifest_topic())[-1])
+    real_publish = mqtt.async_publish
+
+    hass.config_entries.async_update_entry(
+        entry, data={**entry.data, CONF_HA_CONTROL_LABEL: "label-b"}
+    )
+
+    async def fail_b_state(
+        hass: HomeAssistant,
+        topic: str,
+        payload: str | bytes | int | float | None,
+        qos: int = 0,
+        retain: bool = False,
+        encoding: str | None = "utf-8",
+        *,
+        message_expiry_interval: int | None = None,
+    ) -> None:
+        if topic == state_topic(stable_id(entity_b_second.entity_id)):
+            raise RuntimeError("candidate B state failed")
+        await real_publish(
+            hass,
+            topic,
+            payload,
+            qos,
+            retain,
+            encoding,
+            message_expiry_interval=message_expiry_interval,
+        )
+
+    with (
+        patch(
+            "custom_components.brilliant_mqtt.ha_control.mqtt.async_publish",
+            side_effect=fail_b_state,
+        ),
+        pytest.raises(RuntimeError, match="candidate B state failed"),
+    ):
+        await plane.async_reload_settings()
+
+    hass.config_entries.async_update_entry(
+        entry, data={**entry.data, CONF_HA_CONTROL_LABEL: "label-a"}
+    )
+    await plane.async_reload_settings()
+
+    manifests = [_payload(call) for call in _published(mqtt_mock, manifest_topic())]
+    assert manifests == [manifest_a]
+    assert manifests[0]["entities"][0]["entity_id"] == entity_a.entity_id
+    await plane.async_detach(entry.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_failed_b_then_c_publishes_only_c_at_revision_a_plus_one(
+    hass: HomeAssistant, mqtt_mock: MqttMockHAClient
+) -> None:
+    entity_a = _selected_entity(hass, "switch.a", label="label-a")
+    entity_b = _selected_entity(hass, "switch.b", label="label-b")
+    entity_c = _selected_entity(hass, "switch.c", label="label-c")
+    entry = _entry(hass, "office", label="label-a")
+    plane = get_control_plane(hass)
+    await plane.async_attach(entry)
+    real_publish = mqtt.async_publish
+
+    hass.config_entries.async_update_entry(
+        entry, data={**entry.data, CONF_HA_CONTROL_LABEL: "label-b"}
+    )
+
+    async def fail_b_state(
+        hass: HomeAssistant,
+        topic: str,
+        payload: str | bytes | int | float | None,
+        qos: int = 0,
+        retain: bool = False,
+        encoding: str | None = "utf-8",
+        *,
+        message_expiry_interval: int | None = None,
+    ) -> None:
+        if topic == state_topic(stable_id(entity_b.entity_id)):
+            raise RuntimeError("candidate B state failed")
+        await real_publish(
+            hass,
+            topic,
+            payload,
+            qos,
+            retain,
+            encoding,
+            message_expiry_interval=message_expiry_interval,
+        )
+
+    with (
+        patch(
+            "custom_components.brilliant_mqtt.ha_control.mqtt.async_publish",
+            side_effect=fail_b_state,
+        ),
+        pytest.raises(RuntimeError, match="candidate B state failed"),
+    ):
+        await plane.async_reload_settings()
+
+    hass.config_entries.async_update_entry(
+        entry, data={**entry.data, CONF_HA_CONTROL_LABEL: "label-c"}
+    )
+    await plane.async_reload_settings()
+
+    manifests = [_payload(call) for call in _published(mqtt_mock, manifest_topic())]
+    assert [(item["revision"], item["entities"][0]["entity_id"]) for item in manifests] == [
+        (1, entity_a.entity_id),
+        (2, entity_c.entity_id),
+    ]
+    await plane.async_detach(entry.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_command_queued_during_rebuild_validates_after_manifest_last_commit(
+    hass: HomeAssistant, mqtt_mock: MqttMockHAClient
+) -> None:
+    old_entity = _selected_entity(hass, "switch.old", label="label-a")
+    new_entity = _selected_entity(hass, "switch.new", label="label-b")
+    calls: list[ServiceCall] = []
+    hass.services.async_register("switch", "turn_on", calls.append)
+    entry = _entry(hass, "office", label="label-a")
+    plane = get_control_plane(hass)
+    await plane.async_attach(entry)
+    mqtt_mock.async_publish.reset_mock()
+    real_publish = mqtt.async_publish
+    state_started = asyncio.Event()
+    release_state = asyncio.Event()
+
+    hass.config_entries.async_update_entry(
+        entry, data={**entry.data, CONF_HA_CONTROL_LABEL: "label-b"}
+    )
+
+    async def block_new_state(
+        hass: HomeAssistant,
+        topic: str,
+        payload: str | bytes | int | float | None,
+        qos: int = 0,
+        retain: bool = False,
+        encoding: str | None = "utf-8",
+        *,
+        message_expiry_interval: int | None = None,
+    ) -> None:
+        if topic == state_topic(stable_id(new_entity.entity_id)):
+            state_started.set()
+            await release_state.wait()
+        await real_publish(
+            hass,
+            topic,
+            payload,
+            qos,
+            retain,
+            encoding,
+            message_expiry_interval=message_expiry_interval,
+        )
+
+    with patch(
+        "custom_components.brilliant_mqtt.ha_control.mqtt.async_publish",
+        side_effect=block_new_state,
+    ):
+        reload_task = hass.async_create_task(plane.async_reload_settings())
+        await state_started.wait()
+        command_id, payload = _command_payload(old_entity.entity_id, "turn_on", None)
+        async_fire_mqtt_message(hass, command_topic(stable_id(old_entity.entity_id)), payload)
+        await asyncio.sleep(0)
+        assert calls == []
+        assert _published(mqtt_mock, result_topic(command_id)) == []
+        release_state.set()
+        await reload_task
+        await hass.async_block_till_done()
+
+    assert calls == []
+    result_calls = _published(mqtt_mock, result_topic(command_id))
+    assert len(result_calls) == 1
+    assert _payload(result_calls[0])["accepted"] is False
+    topics = [call.args[0] for call in mqtt_mock.async_publish.call_args_list]
+    assert (
+        topics.index(state_topic(stable_id(new_entity.entity_id)))
+        < topics.index(manifest_topic())
+        < topics.index(result_topic(command_id))
+    )
+    await plane.async_detach(entry.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
 async def test_detach_fences_a_queued_command_while_first_command_drains(
     hass: HomeAssistant, mqtt_mock: MqttMockHAClient
 ) -> None:
