@@ -73,6 +73,61 @@ disposable Virtual Control, root-only identity storage, the cloud account
 change, and mandatory official removal. An earlier general approval is not the
 short-lived approval file used by the provisioner.
 
+## VC3 — isolated launcher and runtime monitor
+
+Read-only introspection on Office firmware `v26.06.03.1` establishes these
+launcher facts:
+
+- `lib.runner.run_as_main(startable_config, module_name_override=None)` is the
+  shipped event-loop supervisor.
+- `bus.message_bus.MessageBus(...)` accepts dedicated `home_id`, `device_id`,
+  `mb_state_dir`, and `is_virtual_control` arguments. Its startable parameter
+  maps the latter to the `--start_as_virtual_control` flag.
+- `BootstrapParameters` contains `target_home_id`, a server-authentication
+  credential, and Wi-Fi variables. Do not print or deserialize it into a public
+  report.
+- `BootstrapPeripheral` can load saved bootstrap parameters, but it is part of
+  the device bootstrap/reset path. Do not invoke it inside the running physical
+  Control process.
+
+The inspected module SHA-256 values were
+`a85b7a2d0c2533db8d803a217027dbdd245bc104f221bf6955907dc0b8f6feb8`
+(`bus.message_bus`),
+`4ba40ac7d7695dc239590defbc6efd3d22efbf296fc1c2b40f139fb6e1fe3cb0`
+(`lib.runner`), and
+`313d526a3fe1ad1879137a83eaa55096d9b0fb7a08cac30e37a79ea3632d57db`
+(`peripherals.bootstrap.bootstrap_peripheral`). Re-run introspection and stop
+on any firmware/hash change.
+
+Do not start the repository's shipped `run.py` a second time. Its `pre_exec`
+deletes the common message-bus server socket and recreates common runtime
+directories before starting the main message bus. A co-hosted Virtual Control
+must instead have a proven isolated state directory, certificate directory,
+local socket, process-config directory, and device ID. VC3 is blocked until a
+dry-run preflight proves those paths and the official identity input contract;
+the mere presence of `--start_as_virtual_control` is not sufficient.
+
+Once that preflight passes, attach the bounded monitor:
+
+```text
+python -m tools.brilliant_vc.monitor \
+  --pid <exact-vc-pid> \
+  --duration-s 600 \
+  --interval-s 5 \
+  --output-jsonl <ignored-private-path> \
+  --journal-file <scoped-vc-log> \
+  --peer-count-file <sanitized-integer-marker> \
+  --mqtt-latency-file <sanitized-ms-marker> \
+  --physical-lag-file <operator-0-or-1-marker>
+```
+
+The marker files contain one number only and are produced by separate scoped
+observers. Raw journal lines are never written to monitor output; they become
+only allowlisted event counters. The monitor validates PID start time and
+process name before signaling, sends SIGTERM once, and uses SIGKILL only if the
+same exact identity remains after ten seconds. It refuses the protected
+`message_bus`, `switch-ui`, and `brilliant-mqtt` process names.
+
 ## VC5 physical-slider acceptance
 
 Tile rendering and physical-slider assignability are separate gates. After one
