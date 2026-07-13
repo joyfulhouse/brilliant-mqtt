@@ -174,6 +174,55 @@ class TestExtraDeviceIds:
         assert adapter._extra_device_ids == ("ble_mesh",)
 
 
+class _ScopedReadObserver:
+    """Observer double that rejects every read except get_peripheral()."""
+
+    def __init__(self, peripheral: _RawPeripheral | None) -> None:
+        self.peripheral = peripheral
+        self.calls: list[tuple[str, str, str]] = []
+
+    async def get_peripheral(self, device_id: str, peripheral_id: str) -> _RawPeripheral | None:
+        self.calls.append(("get_peripheral", device_id, peripheral_id))
+        return self.peripheral
+
+    async def get_all(self) -> None:
+        raise AssertionError("scoped read must not call get_all()")
+
+    async def get_device(self, device_id: str) -> None:
+        raise AssertionError(f"scoped read must not call get_device({device_id!r})")
+
+
+class TestGetPeripheral:
+    async def test_calls_only_observer_get_peripheral(self) -> None:
+        adapter = RpcBusAdapter()
+        observer = _ScopedReadObserver(_RawPeripheral())
+        adapter._obs = observer
+        adapter._own_device_id = "own-device"
+
+        device = await adapter.get_peripheral("configuration_virtual_device", "scene_configuration")
+
+        assert device is not None
+        assert device.device_id == "configuration_virtual_device"
+        assert device.peripheral_id == "scene_configuration"
+        assert observer.calls == [
+            (
+                "get_peripheral",
+                "configuration_virtual_device",
+                "scene_configuration",
+            )
+        ]
+
+    async def test_missing_peripheral_returns_none(self) -> None:
+        adapter = RpcBusAdapter()
+        observer = _ScopedReadObserver(None)
+        adapter._obs = observer
+        adapter._own_device_id = "own-device"
+
+        device = await adapter.get_peripheral("configuration_virtual_device", "scene_configuration")
+
+        assert device is None
+
+
 class _RawVariable:
     """Duck-typed stand-in for a bus Variable (normalize_peripheral contract)."""
 

@@ -19,14 +19,23 @@ from types import SimpleNamespace
 from brilliant_mqtt.bus import normalize_peripheral
 from brilliant_mqtt.model import BrilliantDevice, DeviceKind
 
+_MISSING = object()
 
-def _var(value: object, externally_settable: object) -> SimpleNamespace:
+
+def _var(
+    value: object,
+    externally_settable: object,
+    timestamp: object = _MISSING,
+) -> SimpleNamespace:
     """Build a duck-typed raw Variable.
 
     ``externally_settable`` is typed ``object`` because the real bus may hand any
     truthy/falsy value; ``normalize_peripheral`` coerces it with ``bool(...)``.
     """
-    return SimpleNamespace(value=value, externally_settable=externally_settable)
+    raw = SimpleNamespace(value=value, externally_settable=externally_settable)
+    if timestamp is not _MISSING:
+        raw.timestamp = timestamp
+    return raw
 
 
 def _light_peripheral() -> SimpleNamespace:
@@ -138,6 +147,33 @@ class TestNameFallback:
 
 
 class TestVariableCoercion:
+    def test_integer_timestamp_is_preserved(self) -> None:
+        raw = SimpleNamespace(
+            name="p",
+            peripheral_type=27,
+            variables={"on": _var("1", True, timestamp=1_721_234_567_890)},
+        )
+        device = normalize_peripheral("dev123", "p", raw)
+        assert device.variables["on"].timestamp_ms == 1_721_234_567_890
+
+    def test_missing_timestamp_becomes_none(self) -> None:
+        raw = SimpleNamespace(
+            name="p",
+            peripheral_type=27,
+            variables={"on": _var("1", True)},
+        )
+        device = normalize_peripheral("dev123", "p", raw)
+        assert device.variables["on"].timestamp_ms is None
+
+    def test_invalid_timestamp_becomes_none(self) -> None:
+        raw = SimpleNamespace(
+            name="p",
+            peripheral_type=27,
+            variables={"on": _var("1", True, timestamp="not-a-number")},
+        )
+        device = normalize_peripheral("dev123", "p", raw)
+        assert device.variables["on"].timestamp_ms is None
+
     def test_none_value_is_skipped(self) -> None:
         raw = SimpleNamespace(
             name="p",

@@ -27,6 +27,10 @@ class BusClient(Protocol):
         """Return all peripherals already scoped to this panel."""
         ...
 
+    async def get_peripheral(self, device_id: str, peripheral_id: str) -> BrilliantDevice | None:
+        """Return one peripheral via a scoped on-demand read, if present."""
+        ...
+
     def on_change(self, cb: Callable[[BrilliantDevice], Awaitable[None]]) -> None:
         """Register a callback invoked when any peripheral changes."""
         ...

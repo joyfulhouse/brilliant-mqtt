@@ -41,6 +41,12 @@ class FakeBus:
     async def get_all(self) -> list[BrilliantDevice]:
         return list(self._devices)
 
+    async def get_peripheral(self, device_id: str, peripheral_id: str) -> BrilliantDevice | None:
+        for device in self._devices:
+            if device.device_id == device_id and device.peripheral_id == peripheral_id:
+                return device
+        return None
+
     def on_change(self, cb: Callable[[BrilliantDevice], Awaitable[None]]) -> None:
         self._change_cbs.append(cb)
 

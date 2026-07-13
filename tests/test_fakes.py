@@ -42,6 +42,28 @@ class TestFakeBusFanout:
         assert seen_b == ["mesh_switch_1"]
 
 
+class TestFakeBusScopedRead:
+    async def test_returns_matching_peripheral(self) -> None:
+        scene = BrilliantDevice(
+            device_id="configuration_virtual_device",
+            peripheral_id="scene_configuration",
+            name="Scene Configuration",
+            kind=DeviceKind.UNKNOWN,
+        )
+        bus = FakeBus([_mesh_switch(), scene])
+
+        result = await bus.get_peripheral("configuration_virtual_device", "scene_configuration")
+
+        assert result is scene
+
+    async def test_returns_none_when_ids_do_not_match(self) -> None:
+        bus = FakeBus([_mesh_switch()])
+
+        result = await bus.get_peripheral("configuration_virtual_device", "scene_configuration")
+
+        assert result is None
+
+
 class TestFakeMqttFanout:
     async def test_inject_reaches_all_registered_callbacks(self) -> None:
         mqtt = FakeMqtt()

@@ -63,7 +63,8 @@ def normalize_peripheral(device_id: str, peripheral_id: str, raw: Any) -> Brilli
     - ``kind`` from :func:`kind_for_peripheral_type`.
     - ``name`` from the ``display_name`` variable's value when present and
       non-empty, else the raw peripheral ``name``, else ``peripheral_id``.
-    - ``variables`` is a dict of ``Variable(name, str(value), bool(settable))``,
+    - ``variables`` is a dict of
+      ``Variable(name, str(value), bool(settable), timestamp_ms)``,
       skipping any entry whose value is ``None`` (complex/absent blob values —
       poc-findings §4 notes those are base64 thrift blobs to ignore); ``bytes``
       values are utf-8-decoded (errors="replace"), never ``str()``-repr'd.
@@ -81,10 +82,13 @@ def normalize_peripheral(device_id: str, peripheral_id: str, raw: Any) -> Brilli
             # Decode to text instead of str()-ing the repr ("b'Lights'");
             # errors="replace" so a bad byte can never raise here.
             value = bytes(value).decode("utf-8", errors="replace")
+        raw_timestamp = getattr(raw_var, "timestamp", None)
+        timestamp_ms = int(raw_timestamp) if isinstance(raw_timestamp, (int, float)) else None
         variables[var_name] = Variable(
             name=var_name,
             value=str(value),
             externally_settable=bool(raw_var.externally_settable),
+            timestamp_ms=timestamp_ms,
         )
 
     name = _resolve_name(variables, raw, peripheral_id)
@@ -408,6 +412,14 @@ class RpcBusAdapter:
                 for peripheral_id, raw_peripheral in dict(raw_device.peripherals).items()
             )
         return devices
+
+    async def get_peripheral(self, device_id: str, peripheral_id: str) -> BrilliantDevice | None:
+        """Return one normalized peripheral via an on-demand scoped read."""
+        obs, _ = self._require_started()
+        raw = await obs.get_peripheral(device_id, peripheral_id)
+        if raw is None:
+            return None
+        return normalize_peripheral(device_id, peripheral_id, raw)
 
     def on_change(self, cb: Callable[[BrilliantDevice], Awaitable[None]]) -> None:
         """Register a change callback fired by :meth:`_dispatch_raw_device`.

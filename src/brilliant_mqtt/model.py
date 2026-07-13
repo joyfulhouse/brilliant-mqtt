@@ -58,6 +58,7 @@ class Variable:
     name: str
     value: str
     externally_settable: bool = False
+    timestamp_ms: int | None = None
 
     def as_bool(self) -> bool:
         """True iff value is exactly "1"."""
