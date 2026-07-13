@@ -175,8 +175,7 @@ def build_state_payload(
         "entity_id": entity.entity_id,
         "sequence": sequence,
         "generated_at_ms": generated_at_ms,
-        "available": state is not None
-        and state.state not in {STATE_UNAVAILABLE, STATE_UNKNOWN},
+        "available": state is not None and state.state not in {STATE_UNAVAILABLE, STATE_UNKNOWN},
         "state": state.state if state is not None else STATE_UNAVAILABLE,
         "attributes": _supported_attributes(state),
     }

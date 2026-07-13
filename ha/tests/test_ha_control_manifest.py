@@ -103,9 +103,7 @@ def _device(hass: HomeAssistant, *, area_id: str | None = None) -> dr.DeviceEntr
     return updated
 
 
-def _set_registry_supported_features(
-    hass: HomeAssistant, entity_id: str, value: object
-) -> None:
+def _set_registry_supported_features(hass: HomeAssistant, entity_id: str, value: object) -> None:
     er.async_get(hass).async_update_entity(
         entity_id,
         supported_features=cast(int, value),
