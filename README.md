@@ -148,6 +148,7 @@ I/O sits behind Protocol seams so the unit suite runs on any machine. See
 
 ## Support
 
+- Join the [JoyfulHouse Discord](https://discord.gg/gc4eTPwxjJ) for support and discussion across all JoyfulHouse Home Assistant integrations and libraries.
 - **Issues:** <https://github.com/joyfulhouse/brilliant-mqtt/issues>
 
 ## Support Development
