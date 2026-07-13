@@ -43,6 +43,7 @@ class AioMqttAdapter:
         # Multiple consumers (panel bridge + mesh publisher) each register a
         # command callback on this one shared connection — fan out to all.
         self._command_cbs: list[Callable[[str, str], Awaitable[None]]] = []
+        self._message_cbs: list[Callable[[str, str, bool], Awaitable[None]]] = []
         self._reader_task: asyncio.Task[None] | None = None
         self._avail_topic = availability_topic(settings.panel)
         # A distinct broker ClientID is REQUIRED for any second connection on the
@@ -90,8 +91,9 @@ class AioMqttAdapter:
         must not break the others sharing this connection.
         """
         async for message in self._client.messages:
-            cbs = list(self._command_cbs)
-            if not cbs:
+            command_cbs = list(self._command_cbs)
+            message_cbs = list(self._message_cbs)
+            if not command_cbs and not message_cbs:
                 # No consumer registered yet — drop (reconcile re-subscribes).
                 continue
             try:
@@ -103,12 +105,17 @@ class AioMqttAdapter:
                 logger.exception("failed decoding MQTT message; continuing")
                 continue
             logger.debug("mqtt message on %s (%d bytes)", topic, len(payload))
-            for cb in cbs:
+            for command_cb in command_cbs:
                 try:
-                    await cb(topic, payload)
+                    await command_cb(topic, payload)
                 except Exception:
                     # Broad by design — see the docstring.
                     logger.exception("command callback failed; continuing")
+            for message_cb in message_cbs:
+                try:
+                    await message_cb(topic, payload, bool(message.retain))
+                except Exception:
+                    logger.exception("message callback failed; continuing")
 
     async def disconnect(self) -> None:
         """Best-effort clean shutdown: publish a clean offline LWT, then close.
@@ -154,6 +161,9 @@ class AioMqttAdapter:
 
     def on_command(self, cb: Callable[[str, str], Awaitable[None]]) -> None:
         self._command_cbs.append(cb)
+
+    def on_message(self, cb: Callable[[str, str, bool], Awaitable[None]]) -> None:
+        self._message_cbs.append(cb)
 
     async def subscribe(self, topic: str) -> None:
         await self._client.subscribe(topic)

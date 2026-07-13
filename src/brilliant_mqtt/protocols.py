@@ -36,10 +36,10 @@ class BusClient(Protocol):
         ...
 
     def on_reconnect(self, cb: Callable[[], Awaitable[None]]) -> None:
-        """Register a callback invoked after the bus session reconnects.
+        """Add a callback invoked after the bus session reconnects.
 
         Pushes (and the data behind get_all) may have been lost while the
-        connection was down — the callback should trigger a full reconcile.
+        connection was down — each callback should trigger its own reconcile.
         """
         ...
 
@@ -84,6 +84,10 @@ class MqttClient(Protocol):
 
     def on_command(self, cb: Callable[[str, str], Awaitable[None]]) -> None:
         """Register a callback invoked for every inbound MQTT message."""
+        ...
+
+    def on_message(self, cb: Callable[[str, str, bool], Awaitable[None]]) -> None:
+        """Register a callback receiving topic, payload, and MQTT retain context."""
         ...
 
     async def subscribe(self, topic: str) -> None:

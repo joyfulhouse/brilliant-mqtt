@@ -41,6 +41,41 @@ class TestFakeBusFanout:
         assert seen_a == ["mesh_switch_1"]
         assert seen_b == ["mesh_switch_1"]
 
+    async def test_reconnect_reaches_all_registered_callbacks(self) -> None:
+        bus = FakeBus([])
+        reached: list[str] = []
+
+        async def first() -> None:
+            reached.append("first")
+
+        async def second() -> None:
+            reached.append("second")
+
+        bus.on_reconnect(first)
+        bus.on_reconnect(second)
+
+        await bus.fire_reconnect()
+
+        assert reached == ["first", "second"]
+
+    async def test_reconnect_failure_does_not_starve_later_callbacks(self) -> None:
+        bus = FakeBus([])
+        reached: list[str] = []
+
+        async def broken() -> None:
+            reached.append("broken")
+            raise RuntimeError("broken")
+
+        async def healthy() -> None:
+            reached.append("healthy")
+
+        bus.on_reconnect(broken)
+        bus.on_reconnect(healthy)
+
+        await bus.fire_reconnect()
+
+        assert reached == ["broken", "healthy"]
+
 
 class TestFakeBusScopedRead:
     async def test_scoped_only_peripheral_is_retrievable_but_absent_from_get_all(self) -> None:
@@ -85,6 +120,26 @@ class TestFakeMqttFanout:
 
         assert seen_a == [("brilliant/home/mesh_switch_1/set", "ON")]
         assert seen_b == [("brilliant/home/mesh_switch_1/set", "ON")]
+
+    async def test_context_callbacks_receive_retained_without_changing_command_callbacks(
+        self,
+    ) -> None:
+        mqtt = FakeMqtt()
+        commands: list[tuple[str, str]] = []
+        messages: list[tuple[str, str, bool]] = []
+
+        async def command_cb(topic: str, payload: str) -> None:
+            commands.append((topic, payload))
+
+        async def message_cb(topic: str, payload: str, retained: bool) -> None:
+            messages.append((topic, payload, retained))
+
+        mqtt.on_command(command_cb)
+        mqtt.on_message(message_cb)
+        await mqtt.inject("topic", "payload", retained=True)
+
+        assert commands == [("topic", "payload")]
+        assert messages == [("topic", "payload", True)]
 
 
 class TestFakeMqttUnsubscribe:

@@ -8,6 +8,7 @@ runs deterministically without real sleeps.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable, Mapping
 
 from brilliant_ha_mirror.mapping import HaEntity, PeripheralSpec, ServiceCall
@@ -25,10 +26,11 @@ class FakeBus:
     ) -> None:
         self._devices = list(devices)
         self._scoped_devices = list(scoped_devices or ())
+        self.scoped_reads: list[tuple[str, str]] = []
         # Multiple consumers (panel bridge + mesh publisher) each register their
         # own change callback on the one shared bus — mirror the adapter's fan-out.
         self._change_cbs: list[Callable[[BrilliantDevice], Awaitable[None]]] = []
-        self._reconnect_cb: Callable[[], Awaitable[None]] | None = None
+        self._reconnect_cbs: list[Callable[[], Awaitable[None]]] = []
         # Each entry is (device_id, peripheral_id, [VarSet, ...]): writes are
         # ROUTED to the bus device owning the peripheral (the panel's own
         # CONTROL id, or "ble_mesh" for mesh loads), so tests assert the route.
@@ -47,6 +49,7 @@ class FakeBus:
         return list(self._devices)
 
     async def get_peripheral(self, device_id: str, peripheral_id: str) -> BrilliantDevice | None:
+        self.scoped_reads.append((device_id, peripheral_id))
         for device in self._devices + self._scoped_devices:
             if device.device_id == device_id and device.peripheral_id == peripheral_id:
                 return device
@@ -56,7 +59,7 @@ class FakeBus:
         self._change_cbs.append(cb)
 
     def on_reconnect(self, cb: Callable[[], Awaitable[None]]) -> None:
-        self._reconnect_cb = cb
+        self._reconnect_cbs.append(cb)
 
     def seconds_since_last_push(self) -> float | None:
         return self.last_push_age
@@ -83,8 +86,12 @@ class FakeBus:
 
     async def fire_reconnect(self) -> None:
         """Test helper: invoke the registered on_reconnect callback."""
-        assert self._reconnect_cb is not None, "on_reconnect was never registered"
-        await self._reconnect_cb()
+        assert self._reconnect_cbs, "on_reconnect was never registered"
+        for reconnect_cb in list(self._reconnect_cbs):
+            try:
+                await reconnect_cb()
+            except Exception:
+                continue
 
 
 class FakeClock:
@@ -104,6 +111,36 @@ class FakeClock:
         self.now += seconds
 
 
+class FakeClockMs:
+    """Deterministic wall clock and async sleeper for command deadlines."""
+
+    def __init__(self, now_ms: int) -> None:
+        self.now_ms = now_ms
+        self._sleepers: list[tuple[int, asyncio.Future[None]]] = []
+
+    def __call__(self) -> int:
+        return self.now_ms
+
+    async def sleep(self, seconds: float) -> None:
+        deadline = self.now_ms + round(seconds * 1_000)
+        if deadline <= self.now_ms:
+            return
+        future = asyncio.get_running_loop().create_future()
+        self._sleepers.append((deadline, future))
+        try:
+            await future
+        finally:
+            self._sleepers = [(at, item) for at, item in self._sleepers if item is not future]
+
+    async def advance_ms(self, milliseconds: int) -> None:
+        await asyncio.sleep(0)
+        self.now_ms += milliseconds
+        for deadline, future in list(self._sleepers):
+            if deadline <= self.now_ms and not future.done():
+                future.set_result(None)
+        await asyncio.sleep(0)
+
+
 class FakeMqtt:
     """Fake MqttClient that records publishes/subscriptions and accepts injected commands."""
 
@@ -114,6 +151,7 @@ class FakeMqtt:
         self.unsubscriptions: list[str] = []
         # Multiple consumers may register (see FakeBus._change_cbs) — fan out.
         self._command_cbs: list[Callable[[str, str], Awaitable[None]]] = []
+        self._message_cbs: list[Callable[[str, str, bool], Awaitable[None]]] = []
         self.connect_count = 0
         self.disconnect_count = 0
 
@@ -129,6 +167,9 @@ class FakeMqtt:
     def on_command(self, cb: Callable[[str, str], Awaitable[None]]) -> None:
         self._command_cbs.append(cb)
 
+    def on_message(self, cb: Callable[[str, str, bool], Awaitable[None]]) -> None:
+        self._message_cbs.append(cb)
+
     async def subscribe(self, topic: str) -> None:
         self.subscriptions.append(topic)
 
@@ -142,11 +183,13 @@ class FakeMqtt:
         if topic in self.subscriptions:
             self.subscriptions.remove(topic)
 
-    async def inject(self, topic: str, payload: str) -> None:
+    async def inject(self, topic: str, payload: str, *, retained: bool = False) -> None:
         """Test helper: invoke every registered on_command callback."""
-        assert self._command_cbs, "on_command was never registered"
-        for cb in list(self._command_cbs):
-            await cb(topic, payload)
+        assert self._command_cbs or self._message_cbs, "no MQTT callback was ever registered"
+        for command_cb in list(self._command_cbs):
+            await command_cb(topic, payload)
+        for message_cb in list(self._message_cbs):
+            await message_cb(topic, payload, retained)
 
 
 class FakeHaClient:

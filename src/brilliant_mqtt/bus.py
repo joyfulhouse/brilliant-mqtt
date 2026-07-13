@@ -214,7 +214,7 @@ class RpcBusAdapter:
         # Multiple consumers (panel bridge + mesh publisher) may each register
         # a change callback; every change fans out to all of them.
         self._change_cbs: list[Callable[[BrilliantDevice], Awaitable[None]]] = []
-        self._reconnect_cb: Callable[[], Awaitable[None]] | None = None
+        self._reconnect_cbs: list[Callable[[], Awaitable[None]]] = []
         # Re-issues this session's subscription; bound as a closure in start()
         # so the reconnect path never needs panel imports of its own.
         self._resubscribe: Callable[[], Awaitable[None]] | None = None
@@ -363,8 +363,8 @@ class RpcBusAdapter:
         return len(self._reconnect_times)
 
     def on_reconnect(self, cb: Callable[[], Awaitable[None]]) -> None:
-        """Register the callback fired after the bus session reconnects."""
-        self._reconnect_cb = cb
+        """Add a callback fired after the bus session reconnects."""
+        self._reconnect_cbs.append(cb)
 
     def _on_proc_reconnect(self, *args: Any, **kwargs: Any) -> None:
         """Processor reconnect signal (sync, lib-invoked) → async fan-out.
@@ -386,8 +386,7 @@ class RpcBusAdapter:
                 await self._resubscribe()
             except Exception:
                 logger.exception("re-subscribe after reconnect failed")
-        cb = self._reconnect_cb
-        if cb is not None:
+        for cb in list(self._reconnect_cbs):
             try:
                 await cb()
             except Exception:

@@ -59,6 +59,41 @@ class TestPushLiveness:
 
 
 class TestReconnectFanout:
+    async def test_reaches_all_registered_callbacks(self) -> None:
+        adapter = RpcBusAdapter()
+        calls: list[str] = []
+
+        async def first() -> None:
+            calls.append("first")
+
+        async def second() -> None:
+            calls.append("second")
+
+        adapter.on_reconnect(first)
+        adapter.on_reconnect(second)
+
+        await adapter._after_reconnect()
+
+        assert calls == ["first", "second"]
+
+    async def test_one_callback_failure_does_not_starve_later_callbacks(self) -> None:
+        adapter = RpcBusAdapter()
+        calls: list[str] = []
+
+        async def broken() -> None:
+            calls.append("broken")
+            raise RuntimeError("broken")
+
+        async def healthy() -> None:
+            calls.append("healthy")
+
+        adapter.on_reconnect(broken)
+        adapter.on_reconnect(healthy)
+
+        await adapter._after_reconnect()
+
+        assert calls == ["broken", "healthy"]
+
     async def test_resubscribe_runs_before_callback(self) -> None:
         adapter = RpcBusAdapter()
         calls: list[str] = []
