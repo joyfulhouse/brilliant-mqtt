@@ -103,6 +103,15 @@ def _device(hass: HomeAssistant, *, area_id: str | None = None) -> dr.DeviceEntr
     return updated
 
 
+def _set_registry_supported_features(
+    hass: HomeAssistant, entity_id: str, value: object
+) -> None:
+    er.async_get(hass).async_update_entity(
+        entity_id,
+        supported_features=cast(int, value),
+    )
+
+
 async def test_entity_area_precedes_device_area(hass: HomeAssistant) -> None:
     label_id = _label(hass)
     areas = ar.async_get(hass)
@@ -304,6 +313,49 @@ async def test_negative_registry_feature_mask_advertises_no_cover_commands(
 
 
 @pytest.mark.parametrize(
+    "invalid_mask",
+    [True, "3", [1, 2], {"open": True}],
+    ids=["bool", "string", "list", "mapping"],
+)
+async def test_malformed_live_feature_mask_does_not_fall_back_to_registry(
+    hass: HomeAssistant,
+    invalid_mask: object,
+) -> None:
+    label_id = _label(hass)
+    entry = _entity(
+        hass,
+        "cover.shade",
+        label_id=label_id,
+        supported_features=int(CoverEntityFeature.OPEN | CoverEntityFeature.CLOSE),
+    )
+    hass.states.async_set(entry.entity_id, "open", {ATTR_SUPPORTED_FEATURES: invalid_mask})
+
+    entity = build_manifest(hass, settings(), 1, GENERATED_AT_MS).entities[0]
+
+    assert entity.commands == ()
+    assert entity.capabilities == {"position": False, "tilt": False}
+
+
+@pytest.mark.parametrize(
+    "invalid_mask",
+    [True, "3", [1, 2], {"open": True}],
+    ids=["bool", "string", "list", "mapping"],
+)
+async def test_malformed_registry_feature_mask_advertises_no_cover_commands(
+    hass: HomeAssistant,
+    invalid_mask: object,
+) -> None:
+    label_id = _label(hass)
+    entry = _entity(hass, "cover.shade", label_id=label_id)
+    _set_registry_supported_features(hass, entry.entity_id, invalid_mask)
+
+    entity = build_manifest(hass, settings(), 1, GENERATED_AT_MS).entities[0]
+
+    assert entity.commands == ()
+    assert entity.capabilities == {"position": False, "tilt": False}
+
+
+@pytest.mark.parametrize(
     ("attributes", "supports_brightness"),
     [
         ({ATTR_SUPPORTED_COLOR_MODES: ["brightness"]}, True),
@@ -380,6 +432,9 @@ async def test_state_payload_normalizes_intflag_supported_features(
     feature_mask = CoverEntityFeature.OPEN | CoverEntityFeature.CLOSE
     hass.states.async_set(entry.entity_id, "open", {ATTR_SUPPORTED_FEATURES: feature_mask})
     entity = build_manifest(hass, settings(), 1, GENERATED_AT_MS).entities[0]
+
+    assert entity.commands == ("open", "close")
+    assert entity.capabilities == {"position": False, "tilt": False}
 
     payload = build_state_payload(hass.states.get(entry.entity_id), entity, 1, GENERATED_AT_MS)
 

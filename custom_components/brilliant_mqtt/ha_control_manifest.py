@@ -242,11 +242,17 @@ def _device_class(entry: er.RegistryEntry, state: State | None) -> str | None:
 
 
 def _supported_features(entry: er.RegistryEntry, state: State | None) -> int:
-    if state is not None:
-        supported_features = state.attributes.get(ATTR_SUPPORTED_FEATURES)
-        if isinstance(supported_features, int) and not isinstance(supported_features, bool):
-            return int(supported_features) if supported_features >= 0 else 0
-    return entry.supported_features if entry.supported_features >= 0 else 0
+    if state is not None and ATTR_SUPPORTED_FEATURES in state.attributes:
+        return _normalize_feature_mask(state.attributes[ATTR_SUPPORTED_FEATURES]) or 0
+    return _normalize_feature_mask(entry.supported_features) or 0
+
+
+def _normalize_feature_mask(value: object) -> int | None:
+    """Normalize a valid non-negative integer feature mask."""
+    if not isinstance(value, int) or isinstance(value, bool):
+        return None
+    normalized = int(value)
+    return normalized if normalized >= 0 else None
 
 
 def _commands_and_capabilities(
@@ -303,13 +309,9 @@ def _supported_attributes(state: State | None) -> dict[str, object]:
         value = state.attributes.get(name)
         if type(value) is int and 0 <= value <= maximum:
             attributes[name] = value
-    supported_features = state.attributes.get(ATTR_SUPPORTED_FEATURES)
-    if (
-        isinstance(supported_features, int)
-        and not isinstance(supported_features, bool)
-        and supported_features >= 0
-    ):
-        attributes[ATTR_SUPPORTED_FEATURES] = int(supported_features)
+    supported_features = _normalize_feature_mask(state.attributes.get(ATTR_SUPPORTED_FEATURES))
+    if supported_features is not None:
+        attributes[ATTR_SUPPORTED_FEATURES] = supported_features
     device_class = state.attributes.get(ATTR_DEVICE_CLASS)
     if isinstance(device_class, str):
         attributes[ATTR_DEVICE_CLASS] = device_class
