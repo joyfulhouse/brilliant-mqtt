@@ -81,7 +81,8 @@ callback or delete was observed. See the
 | Brilliant scene catalog/event → HA | **Implemented + off-panel test** | Scoped catalog codec, durable replay suppression, HA event and constrained configured action; Office hardware gate pending. |
 | HA `run_scene` → Brilliant confirmation | **Implemented + off-panel test** | Existing catalog IDs only; completion requires a matching execution record; Office hardware gate pending. |
 | Brilliant mode catalog/event and HA `set_mode` | **Implemented + off-panel test** | Same constrained transport; live test requires a real configured mode. |
-| Native HA light/switch/lock/cover tiles | **Blocked research** | Physical-Control hosting rejected. Virtual Control must pass provisioning, ownership, rendering, routing, WAN-isolation, resource, and cleanup gates. |
+| Native HA light tile on a physical slider | **Source-eligible; live blocked** | Firmware filters the resolved target by slider-capable `PeripheralType`, not host `DeviceType`; a VC-owned `LIGHT` is structurally eligible. No official VC/light exists yet, so native selector, routing, persistence, and cleanup gates remain. See [slider feasibility](slider-bridge-feasibility.md). |
+| Other native HA switch/lock/cover tiles | **Blocked research** | Physical-Control hosting rejected. Virtual Control must first pass provisioning, ownership, rendering, routing, WAN-isolation, resource, and cleanup gates with the single light. |
 | Room overrides | **Implemented manifest metadata** | Entity area precedes device area and explicit overrides are case-insensitive; metadata does not render a native tile. |
 
 ## What the current integration gets right

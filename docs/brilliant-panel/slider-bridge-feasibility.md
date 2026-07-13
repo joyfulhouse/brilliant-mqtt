@@ -1,0 +1,118 @@
+# Home Assistant entity to physical-slider feasibility
+
+## Current decision
+
+Bridging a Home Assistant light to a Brilliant physical cap-touch slider is
+**structurally supported by firmware but not yet live-validated**.
+
+The `v26.06.03.1` UI selects slider targets by the target peripheral's
+slider-gesture capability and `PeripheralType`, not by the `DeviceType` of the
+device hosting that peripheral. A correctly owned `LIGHT` peripheral on a
+Virtual Control should therefore pass the same type gate as a Brilliant- or
+partner-hosted light. This does not prove that an improvised peripheral is
+discoverable, selectable, routable, persistent, or removable. Those properties
+depend on a real Virtual Control identity and peripheral owner.
+
+No disposable Virtual Control or HA-backed light exists in the Office home at
+the time of this finding, so the native selector and physical operation remain
+unconfirmed. Raw bus injection and physical-Control hosting are not substitutes:
+the former rendered transient state without an owner to accept commands, and
+the latter interfered with the real Control's ownership responsibilities.
+
+## Required data path
+
+```text
+Home Assistant light
+  <-> retained MQTT command/state route
+  <-> one bounded Virtual-Control process
+  <-> Virtual-Control-owned LIGHT peripheral
+  <-> Brilliant home graph and native target selector
+  <-> CapTouchSliderConfig(device_id, peripheral_id)
+  <-> explicitly selected physical Control slider
+```
+
+Every arrow must work in both directions. Slider gestures must produce exactly
+one HA command, and HA state must update the hosted peripheral so the panel does
+not snap back to stale state. The hosted light must have a stable peripheral ID,
+valid room assignment, the Virtual Control's own configuration linkage, and an
+active owner for its full lifetime.
+
+## Decompiled UI evidence
+
+The following symbols are Ghidra names in the sanitized, ignored analysis
+project for `switch-ui`; addresses are relative to that firmware ELF and are
+not stable API names.
+
+| Evidence | Finding | Integration consequence |
+|---|---|---|
+| Qt meta-object strings | `SwitchSliderSettingsScreen` exports `homePeripheralSelector`, `supportsSliderConfiguredPeripheral`, and `sliderCapabilitiesText`. | Native slider assignment has a deliberate eligibility model; writing a config directly would bypass behavior that must be validated. |
+| `FUN_00382a20` | The screen constructor calls `FUN_003f3cc8(..., 3)` and retains the returned type collection. | Capability index 3 supplies the screen's permitted peripheral types. |
+| `FUN_0039f664` | The generic gesture renderer calls the same `FUN_003f3cc8(..., 3)` collection while formatting the UI label `Slider Gesture`; a type outside the collection becomes `Invalid selection`. | The collection is the firmware's slider-gesture peripheral-type filter, not an account/device-host allowlist invented by this integration. |
+| `FUN_00385878` | The `supportsSliderConfiguredPeripheral` getter resolves the configured `(device_id, peripheral_id)`. If resolution returns no target it returns true; a resolved target returns true only when its type identifier is in the retained capability collection. | Eligibility is evaluated on the resolved target peripheral. The function does not reject a target because its host is DeviceType 6 (`VIRTUAL_CONTROL`). |
+| `FUN_00383900` | `sliderCapabilitiesText` explicitly handles `MUSIC` (3), `LIGHT` (27), `OUTLET` (40), `GENERIC_ON_OFF` (45), and `SHADE` (53). Light copy includes tap/flick toggle and slide-up/down brightness behavior. | A dimmable HA light should use `PeripheralType.LIGHT` and the standard light variables; a generic invented type will not work. |
+| Shipped test templates and Thrift types | Slider bindings serialize `CapTouchSliderConfig` with a slider index plus target `device_id` and `peripheral_id`. | The physical slider points at the Virtual Control and hosted light; it does not point at an HA entity ID or MQTT topic directly. |
+
+The strongest source-level conclusion is narrow: **DeviceType 6 is not itself a
+slider-eligibility blocker once its hosted `LIGHT` resolves in the home graph.**
+Selector discovery, room filtering, online/ownership state, command routing,
+restart persistence, and cleanup are separate live gates.
+
+## Hosted-light contract
+
+The single-light pilot uses the ordinary light schema already consumed by the
+UI and slider path:
+
+| Variable | Type | Writable | Pilot purpose |
+|---|---:|---:|---|
+| `on` | integer/boolean semantic | yes | Tap/flick state and HA on/off |
+| `intensity` | integer, 0–1000 | yes | Physical and on-screen dimming |
+| `dimmable` | integer/boolean semantic | no | Advertise slider brightness support |
+| `max_intensity_value` | integer | no | Declare the 1000-point scale |
+| `minimum_dim_level` | integer | yes | Preserve a valid lower bound |
+| `maximum_dim_level` | integer | yes | Preserve a valid upper bound |
+| `display_name` | string | yes | Native label; independent of stable ID |
+| `room_assignment` | Thrift `RoomAssignment` | yes | Native room placement and discovery context |
+| `mode_transition_settings` | serialized string | yes | Match the normal light surface |
+| `configuration_peripheral_id` | string | no | Link only to the disposable Virtual Control's configuration peripheral |
+
+HA brightness 0–255 must be converted to Brilliant intensity 0–1000 with
+round-half-up behavior in both directions. A state echo or retry must not become
+a second HA command.
+
+## Provisioning boundary
+
+The firmware ships
+`WebAPIProvisioningClient.get_virtual_control_self_bootstrap(property_id,
+token)`. Static strings confirm that it posts to
+`/provisioning/virtual-control-self-bootstrap` and returns a device ID, PKCS#12
+certificate, and serialized bootstrap parameters. It does **not** mint the
+required scoped token. The bundled test client can create synthetic tokens for
+test infrastructure; that is not a supported production credential path.
+
+The prior account JWT was rejected with HTTP 401 and its claims did not allow
+the self-bootstrap endpoint. The feasibility run therefore remains gated on a
+token produced by an official Brilliant app workflow. Do not guess a GraphQL
+mutation, reuse the test-client secret, or replay an unrelated account token.
+
+## What will confirm feasibility
+
+The answer becomes `confirmed` only when one disposable, officially
+provisioned Virtual Control passes all of these checks:
+
+1. Its single owned `LIGHT` renders on Office and a second panel in the intended
+   room.
+2. The light appears in the native physical-slider picker without a hand-written
+   `slider_config`.
+3. After a separate approval naming the physical slider, the operator binds it
+   through the native UI and performs the approved tap/dim checks; the agent
+   does not trigger a load or scene.
+4. Each physical gesture reaches HA once, and HA on/off/brightness state returns
+   to both panels without oscillation.
+5. HA, MQTT, Virtual Control, Office, and second-panel restarts preserve or
+   reconcile the route.
+6. WAN-up and WAN-denied tests classify the real cloud dependency.
+7. The exact original physical-slider binding is restored in the native UI.
+8. The light and Virtual Control are removed through supported paths, with two
+   later snapshots showing no tile, owner, or stale slider reference.
+
+Until then, the accurate integration status is `source-eligible, live-blocked`.

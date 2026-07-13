@@ -447,9 +447,15 @@ Collect 30 minutes on Office with the VC stopped: process list, load, forward-ag
 
 Use a systemd transient unit or supervisor with `RuntimeMaxSec=90000`, `Restart=no`, `KillMode=control-group`, and no identity copy. The identity path remains root-only and mounted/readable only by the probe process. Attach the monitor from Task 6.
 
-- [ ] **Step 3: Exercise controls throughout the soak**
+- [ ] **Step 3: Observe controls throughout the soak**
 
-At hours 0, 1, 6, 12, 18, and 24, perform ten physical light interactions, one HA/MQTT scene round trip, and one UI navigation check. Record operator-observed lag as a boolean and optional non-sensitive note. Any lag, cloud disconnect, peer timeout, threshold violation, or forward-bridge regression stops the runtime immediately.
+At hours 0, 1, 6, 12, 18, and 24, observe ten operator-performed physical
+light interactions, one disposable-light state round trip only when separately
+approved, and one UI navigation check. Do not execute Brilliant scenes. The
+agent only observes and records physical interaction. Record operator-observed
+lag as a boolean and optional non-sensitive note. Any lag, cloud disconnect,
+peer timeout, threshold violation, or forward-bridge regression stops the
+runtime immediately.
 
 - [ ] **Step 4: Analyze and record VC4**
 

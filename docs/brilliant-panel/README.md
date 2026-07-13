@@ -12,6 +12,7 @@ The central finding is that the panel is not a collection of isolated integratio
 | [`/var` persistence map](var-persistence.md) | Native persistent state, community payloads, sensitive stores, and integration consequences |
 | [Software architecture](software-architecture.md) | OSTree, systemd, uWSGI services, message bus, device graph, and persistence |
 | [UI/UX information architecture](ui-information-architecture.md) | Home navigation, settings hierarchy, screen families, visual language, and interaction patterns |
+| [HA entity to physical-slider feasibility](slider-bridge-feasibility.md) | Decompiled slider eligibility, required Virtual Control/light contract, provisioning boundary, and live acceptance gates |
 | [Peripheral and control surfaces](peripheral-surfaces.md) | Firmware type system, high-value variables, command paths, scenes, media, and sensors |
 | [Peripheral type catalog](peripheral-type-catalog.md) | Complete firmware `PeripheralType` enum for `v26.06.03.1` |
 | [Cloud and local boundaries](cloud-boundaries.md) | What remains local, what depends on Brilliant or partner clouds, and replacement strategies |

@@ -151,17 +151,24 @@ Mesh switch configuration contains `slider_config`, `double_tap_enabled`, and a 
 - decoding and participating in execution/configuration objects;
 - instrumenting a lower-level input or message path outside the normal variable graph.
 
-The shipped UI does not accept every home peripheral indiscriminately. Static
-analysis identifies a filtered `homePeripheralSelector`, a
-`supportsSliderConfiguredPeripheral` check, diagnostics for unsupported target
-capabilities/types, and explicit handling for `LIGHT`, `OUTLET`,
-`GENERIC_ON_OFF`, and `SHADE` targets. The persisted
-`CapTouchSliderConfig` names the target `device_id` and `peripheral_id`.
-Consequently, a correctly typed Virtual-Control-hosted light is structurally a
-candidate, but its admission to the native selector is **not yet validated**.
-Tile visibility alone does not prove physical-slider assignability; the Virtual
-Control feasibility gate must test native selection, physical operation,
-restart persistence, exact binding restoration, and stale-reference cleanup.
+The shipped UI does not accept every home peripheral indiscriminately. Ghidra
+analysis of `SwitchSliderSettingsScreen` shows that its constructor loads the
+firmware's `Slider Gesture` peripheral-type capability set. The
+`supportsSliderConfiguredPeripheral` getter resolves the configured
+`device_id`/`peripheral_id` and tests the target type against that set; it does
+not test the target's hosting `DeviceType`. `sliderCapabilitiesText` then has
+explicit behavior for `LIGHT`, `OUTLET`, `GENERIC_ON_OFF`, `SHADE`, and a
+special `MUSIC` path. The persisted `CapTouchSliderConfig` names the target
+`device_id` and `peripheral_id`.
+
+Consequently, DeviceType 6 (`VIRTUAL_CONTROL`) is not itself an eligibility
+blocker for a correctly owned `LIGHT`. Its admission to the native selector is
+still **not live-validated** because the Office home currently has no Virtual
+Control or hosted HA light. Tile visibility alone does not prove
+physical-slider assignability; the [slider feasibility analysis](slider-bridge-feasibility.md)
+and Virtual Control gates require native selection, operator-performed physical
+operation after separate approval, restart persistence, exact binding
+restoration, and stale-reference cleanup.
 
 The first option is the supported baseline because it adds no peripheral owner.
 Hosting an HA-backed target remains blocked behind Virtual Control gates.
