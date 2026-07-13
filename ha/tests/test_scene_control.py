@@ -24,6 +24,7 @@ from custom_components.brilliant_mqtt.const import (
 )
 from custom_components.brilliant_mqtt.ha_control import get_control_plane
 from custom_components.brilliant_mqtt.ha_control_protocol import (
+    COMMAND_FUTURE_SKEW_MS,
     MAPPING_VERSION,
     SCHEMA_VERSION,
     encode_json,
@@ -274,6 +275,50 @@ async def test_scene_event_fires_before_action_and_deduplicates_or_rejects_stale
 
 
 @pytest.mark.allow_lingering_timers
+async def test_distinct_scene_events_at_same_millisecond_are_not_dropped(
+    hass: HomeAssistant, mqtt_mock: MqttMockHAClient
+) -> None:
+    events: list[Event[dict[str, object]]] = []
+    actions: list[ServiceCall] = []
+    hass.bus.async_listen(EVENT_SCENE, events.append)
+    hass.services.async_register("scene", "turn_on", actions.append)
+    action = {
+        "domain": "scene",
+        "service": "turn_on",
+        "target": {},
+        "data": {},
+    }
+    runtime = SceneControl(hass)
+    await runtime.async_start(
+        {"office"},
+        default_panel="office",
+        actions={"office:all_off": action, "office:all_on": action},
+    )
+
+    async_fire_mqtt_message(
+        hass,
+        "brilliant/ha-control/v1/scene/event/office",
+        _scene_event(300, scene_id="all_off"),
+    )
+    async_fire_mqtt_message(
+        hass,
+        "brilliant/ha-control/v1/scene/event/office",
+        _scene_event(300, scene_id="all_on"),
+    )
+    async_fire_mqtt_message(
+        hass,
+        "brilliant/ha-control/v1/scene/event/office",
+        _scene_event(300, scene_id="all_off"),
+    )
+    await hass.async_block_till_done()
+
+    assert [event.data["scene_id"] for event in events] == ["all_off", "all_on"]
+    assert len(actions) == 2
+    assert runtime.deduplication_cache_size == 2
+    await runtime.async_stop()
+
+
+@pytest.mark.allow_lingering_timers
 async def test_scene_service_publishes_non_retained_and_waits_for_exact_confirmation(
     hass: HomeAssistant, mqtt_mock: MqttMockHAClient
 ) -> None:
@@ -350,6 +395,61 @@ async def test_scene_service_publishes_non_retained_and_waits_for_exact_confirma
     await service_task
 
     await runtime.async_stop()
+
+
+@pytest.mark.allow_lingering_timers
+async def test_exact_result_accepts_panel_clock_five_seconds_behind_ha(
+    hass: HomeAssistant, mqtt_mock: MqttMockHAClient
+) -> None:
+    now_ms = 1_700_000_000_000
+    runtime = SceneControl(hass)
+    with patch.object(scene_control_module, "_timestamp_ms", return_value=now_ms):
+        await runtime.async_start({"office"}, default_panel="office", actions={})
+        async_fire_mqtt_message(
+            hass,
+            "brilliant/ha-control/v1/scene/catalog/office",
+            _scene_catalog(
+                now_ms - 10_000,
+                [
+                    {
+                        "scene_id": "all_off",
+                        "display_name": "All Lights Off",
+                        "icon": None,
+                    }
+                ],
+            ),
+            retain=True,
+        )
+        async_fire_mqtt_message(
+            hass,
+            "brilliant/ha-control/v1/status/scene/office",
+            _scene_status(now_ms - 9_000),
+            retain=True,
+        )
+        await hass.async_block_till_done()
+        mqtt_mock.async_publish.reset_mock()
+
+        service_task = hass.async_create_task(runtime.async_run_scene("office", "all_off"))
+        await asyncio.sleep(0)
+        call = _published(mqtt_mock, "brilliant/ha-control/v1/scene/command/")[0]
+        command = json.loads(call.args[1])
+        async_fire_mqtt_message(
+            hass,
+            scene_result_topic(command["command_id"]),
+            encode_json(
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "mapping_version": MAPPING_VERSION,
+                    "command_id": command["command_id"],
+                    "panel": "office",
+                    "scene_id": "all_off",
+                    "accepted": True,
+                    "timestamp_ms": command["issued_at_ms"] - COMMAND_FUTURE_SKEW_MS,
+                }
+            ),
+        )
+        await service_task
+        await runtime.async_stop()
 
 
 @pytest.mark.allow_lingering_timers
@@ -685,6 +785,173 @@ async def test_malformed_retained_and_mismatched_messages_leave_state_unchanged_
 
 
 @pytest.mark.allow_lingering_timers
+async def test_future_catalog_timestamps_cannot_poison_ordering(
+    hass: HomeAssistant, mqtt_mock: MqttMockHAClient
+) -> None:
+    now_ms = 1_700_000_000_000
+    runtime = SceneControl(hass)
+    with patch.object(scene_control_module, "_timestamp_ms", return_value=now_ms):
+        await runtime.async_start({"office"}, default_panel="office", actions={})
+        for hostile_timestamp in (10**1000, now_ms + COMMAND_FUTURE_SKEW_MS + 1):
+            async_fire_mqtt_message(
+                hass,
+                "brilliant/ha-control/v1/scene/catalog/office",
+                _scene_catalog(
+                    hostile_timestamp,
+                    [{"scene_id": "poison", "display_name": "Poison", "icon": None}],
+                ),
+                retain=hostile_timestamp == 10**1000,
+            )
+        await hass.async_block_till_done()
+        assert runtime.scene_options("office") == ()
+        assert runtime.catalog_timestamp_ms("scene", "office") is None
+        assert runtime.catalog_revision("scene", "office") is None
+
+        async_fire_mqtt_message(
+            hass,
+            "brilliant/ha-control/v1/scene/catalog/office",
+            _scene_catalog(
+                now_ms,
+                [{"scene_id": "all_off", "display_name": "All Lights Off", "icon": None}],
+            ),
+        )
+        await hass.async_block_till_done()
+        assert runtime.scene_options("office") == (SceneOption("all_off", "All Lights Off"),)
+        assert runtime.catalog_timestamp_ms("scene", "office") == now_ms
+        await runtime.async_stop()
+
+
+@pytest.mark.allow_lingering_timers
+async def test_future_status_timestamps_cannot_poison_ordering(
+    hass: HomeAssistant, mqtt_mock: MqttMockHAClient
+) -> None:
+    now_ms = 1_700_000_000_000
+    runtime = SceneControl(hass)
+    with patch.object(scene_control_module, "_timestamp_ms", return_value=now_ms):
+        await runtime.async_start({"office"}, default_panel="office", actions={})
+        for hostile_timestamp in (10**1000, now_ms + COMMAND_FUTURE_SKEW_MS + 1):
+            async_fire_mqtt_message(
+                hass,
+                "brilliant/ha-control/v1/status/scene/office",
+                _scene_status(hostile_timestamp),
+                retain=hostile_timestamp == 10**1000,
+            )
+        await hass.async_block_till_done()
+        assert runtime.status_timestamp_ms("scene", "office") is None
+
+        async_fire_mqtt_message(
+            hass,
+            "brilliant/ha-control/v1/status/scene/office",
+            _scene_status(now_ms),
+        )
+        await hass.async_block_till_done()
+        assert runtime.status_timestamp_ms("scene", "office") == now_ms
+        await runtime.async_stop()
+
+
+@pytest.mark.allow_lingering_timers
+async def test_future_event_timestamps_cannot_poison_ordering_or_deduplication(
+    hass: HomeAssistant, mqtt_mock: MqttMockHAClient
+) -> None:
+    now_ms = 1_700_000_000_000
+    events: list[Event[dict[str, object]]] = []
+    hass.bus.async_listen(EVENT_SCENE, events.append)
+    runtime = SceneControl(hass)
+    with patch.object(scene_control_module, "_timestamp_ms", return_value=now_ms):
+        await runtime.async_start({"office"}, default_panel="office", actions={})
+        for hostile_timestamp in (now_ms + COMMAND_FUTURE_SKEW_MS + 1, 10**1000):
+            async_fire_mqtt_message(
+                hass,
+                "brilliant/ha-control/v1/scene/event/office",
+                _scene_event(hostile_timestamp),
+            )
+        await hass.async_block_till_done()
+        assert events == []
+        assert runtime.last_event_timestamp_ms("scene", "office") is None
+        assert runtime.deduplication_cache_size == 0
+
+        async_fire_mqtt_message(
+            hass,
+            "brilliant/ha-control/v1/scene/event/office",
+            _scene_event(now_ms),
+        )
+        await hass.async_block_till_done()
+        assert [event.data["executed_at_ms"] for event in events] == [now_ms]
+        assert runtime.last_event_timestamp_ms("scene", "office") == now_ms
+        assert runtime.deduplication_cache_size == 1
+        await runtime.async_stop()
+
+
+@pytest.mark.allow_lingering_timers
+async def test_future_result_timestamps_do_not_resolve_exact_pending_command(
+    hass: HomeAssistant, mqtt_mock: MqttMockHAClient
+) -> None:
+    now_ms = 1_700_000_000_000
+    runtime = SceneControl(hass)
+    with patch.object(scene_control_module, "_timestamp_ms", return_value=now_ms):
+        await runtime.async_start({"office"}, default_panel="office", actions={})
+        async_fire_mqtt_message(
+            hass,
+            "brilliant/ha-control/v1/scene/catalog/office",
+            _scene_catalog(
+                now_ms - 2,
+                [{"scene_id": "all_off", "display_name": "All Lights Off", "icon": None}],
+            ),
+            retain=True,
+        )
+        async_fire_mqtt_message(
+            hass,
+            "brilliant/ha-control/v1/status/scene/office",
+            _scene_status(now_ms - 1),
+            retain=True,
+        )
+        await hass.async_block_till_done()
+        mqtt_mock.async_publish.reset_mock()
+        service_task = hass.async_create_task(runtime.async_run_scene("office", "all_off"))
+        await asyncio.sleep(0)
+        call = _published(mqtt_mock, "brilliant/ha-control/v1/scene/command/")[0]
+        command = json.loads(call.args[1])
+
+        for hostile_timestamp in (now_ms + COMMAND_FUTURE_SKEW_MS + 1, 10**1000):
+            async_fire_mqtt_message(
+                hass,
+                scene_result_topic(command["command_id"]),
+                encode_json(
+                    {
+                        "schema_version": SCHEMA_VERSION,
+                        "mapping_version": MAPPING_VERSION,
+                        "command_id": command["command_id"],
+                        "panel": "office",
+                        "scene_id": "all_off",
+                        "accepted": True,
+                        "timestamp_ms": hostile_timestamp,
+                    }
+                ),
+            )
+        await asyncio.sleep(0)
+        assert not service_task.done()
+        assert runtime.pending_count == 1
+
+        async_fire_mqtt_message(
+            hass,
+            scene_result_topic(command["command_id"]),
+            encode_json(
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "mapping_version": MAPPING_VERSION,
+                    "command_id": command["command_id"],
+                    "panel": "office",
+                    "scene_id": "all_off",
+                    "accepted": True,
+                    "timestamp_ms": now_ms,
+                }
+            ),
+        )
+        await service_task
+        await runtime.async_stop()
+
+
+@pytest.mark.allow_lingering_timers
 async def test_hostile_input_and_pending_state_are_bounded(
     hass: HomeAssistant, mqtt_mock: MqttMockHAClient
 ) -> None:
@@ -962,6 +1229,121 @@ async def test_stop_drains_every_unsubscriber_even_when_one_raises(
     assert calls == list(reversed(range(len(_SUBSCRIPTIONS))))
     assert runtime.started is False
     assert runtime.attached_panels == frozenset()
+
+
+@pytest.mark.allow_lingering_timers
+async def test_stop_retries_uncertain_unsubscribe_before_clean_restart(
+    hass: HomeAssistant, mqtt_mock: MqttMockHAClient
+) -> None:
+    subscribe_calls: list[str] = []
+    active: set[int] = set()
+    unsubscribe_calls: dict[int, int] = {}
+
+    async def subscribe(hass: HomeAssistant, topic: str, callback: object) -> CALLBACK_TYPE:
+        del hass, callback
+        index = len(subscribe_calls)
+        subscribe_calls.append(topic)
+        active.add(index)
+
+        def unsubscribe() -> None:
+            unsubscribe_calls[index] = unsubscribe_calls.get(index, 0) + 1
+            if index == 3 and unsubscribe_calls[index] == 1:
+                raise RuntimeError("unsubscribe failed before deactivation")
+            active.discard(index)
+
+        return unsubscribe
+
+    runtime = SceneControl(hass)
+    with patch(
+        "custom_components.brilliant_mqtt.scene_control.mqtt.async_subscribe",
+        new=subscribe,
+    ):
+        await runtime.async_start({"office"}, default_panel="office", actions={})
+        with pytest.raises(RuntimeError, match="before deactivation"):
+            await runtime.async_stop()
+        assert active == {3}
+
+        await runtime.async_start({"office"}, default_panel="office", actions={})
+        assert len(subscribe_calls) == 2 * len(_SUBSCRIPTIONS)
+        assert len(active) == len(_SUBSCRIPTIONS)
+        assert 3 not in active
+        await runtime.async_stop()
+
+
+@pytest.mark.allow_lingering_timers
+async def test_failed_start_retries_uncertain_rollback_before_clean_restart(
+    hass: HomeAssistant, mqtt_mock: MqttMockHAClient
+) -> None:
+    subscribe_calls: list[str] = []
+    active: set[int] = set()
+    unsubscribe_calls: dict[int, int] = {}
+
+    async def subscribe(hass: HomeAssistant, topic: str, callback: object) -> CALLBACK_TYPE:
+        del hass, callback
+        index = len(subscribe_calls)
+        subscribe_calls.append(topic)
+        if index == 4:
+            raise RuntimeError("subscribe failed")
+        active.add(index)
+
+        def unsubscribe() -> None:
+            unsubscribe_calls[index] = unsubscribe_calls.get(index, 0) + 1
+            if index == 1 and unsubscribe_calls[index] == 1:
+                raise RuntimeError("rollback failed before deactivation")
+            active.discard(index)
+
+        return unsubscribe
+
+    runtime = SceneControl(hass)
+    with patch(
+        "custom_components.brilliant_mqtt.scene_control.mqtt.async_subscribe",
+        new=subscribe,
+    ):
+        with pytest.raises(RuntimeError, match="subscribe failed"):
+            await runtime.async_start({"office"}, default_panel="office", actions={})
+        assert active == {1}
+
+        await runtime.async_start({"office"}, default_panel="office", actions={})
+        assert len(subscribe_calls) == 1 + len(_SUBSCRIPTIONS) + 4
+        assert len(active) == len(_SUBSCRIPTIONS)
+        assert 1 not in active
+        await runtime.async_stop()
+
+
+@pytest.mark.allow_lingering_timers
+async def test_permanently_uncertain_cleanup_blocks_restart_without_subscribing(
+    hass: HomeAssistant, mqtt_mock: MqttMockHAClient
+) -> None:
+    subscribe_calls: list[str] = []
+    active: set[int] = set()
+
+    async def subscribe(hass: HomeAssistant, topic: str, callback: object) -> CALLBACK_TYPE:
+        del hass, callback
+        index = len(subscribe_calls)
+        subscribe_calls.append(topic)
+        active.add(index)
+
+        def unsubscribe() -> None:
+            if index == 3:
+                raise RuntimeError("cleanup remains uncertain")
+            active.discard(index)
+
+        return unsubscribe
+
+    runtime = SceneControl(hass)
+    with patch(
+        "custom_components.brilliant_mqtt.scene_control.mqtt.async_subscribe",
+        new=subscribe,
+    ):
+        await runtime.async_start({"office"}, default_panel="office", actions={})
+        with pytest.raises(RuntimeError, match="cleanup remains uncertain"):
+            await runtime.async_stop()
+        assert active == {3}
+
+        with pytest.raises(RuntimeError, match="cleanup remains uncertain"):
+            await runtime.async_start({"office"}, default_panel="office", actions={})
+        assert len(subscribe_calls) == len(_SUBSCRIPTIONS)
+        assert active == {3}
 
 
 @pytest.mark.allow_lingering_timers

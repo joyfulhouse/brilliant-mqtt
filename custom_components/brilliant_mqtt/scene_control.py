@@ -23,6 +23,7 @@ from homeassistant.helpers.dispatcher import async_dispatcher_send
 
 from .const import DOMAIN
 from .ha_control_protocol import (
+    COMMAND_FUTURE_SKEW_MS,
     MAPPING_VERSION,
     SCHEMA_VERSION,
     encode_json,
@@ -207,27 +208,27 @@ class SceneControl:
         fence_token = self.fence_commands()
         try:
             async with self._lifecycle_lock:
+                if not self._started:
+                    cleanup_error = self._cleanup_unsubscribers_locked()
+                    if cleanup_error is not None:
+                        raise cleanup_error
                 self._async_reconfigure_locked(panels, default_panel, actions)
                 if self._started:
                     return
-                unsubscribers: list[CALLBACK_TYPE] = []
                 try:
                     for topic in _SUBSCRIPTION_TOPICS:
                         unsubscribe = await mqtt.async_subscribe(
                             self.hass, topic, self._async_message_received
                         )
-                        unsubscribers.append(unsubscribe)
+                        self._unsubscribers.append(unsubscribe)
                 except BaseException as primary_error:
-                    for unsubscribe in reversed(unsubscribers):
-                        try:
-                            unsubscribe()
-                        except BaseException as cleanup_error:
-                            _LOGGER.warning(
-                                "Scene subscription rollback also failed (%s)",
-                                type(cleanup_error).__name__,
-                            )
+                    cleanup_error = self._cleanup_unsubscribers_locked()
+                    if cleanup_error is not None:
+                        _LOGGER.warning(
+                            "Scene subscription rollback also failed (%s)",
+                            type(cleanup_error).__name__,
+                        )
                     raise primary_error
-                self._unsubscribers = unsubscribers
                 self._started = True
         finally:
             self.release_command_fence(fence_token)
@@ -252,17 +253,10 @@ class SceneControl:
         fence_token = self.fence_commands()
         try:
             panels_to_notify: frozenset[str]
-            unsubscribe_error: BaseException | None = None
             async with self._lifecycle_lock:
                 panels_to_notify = self._attached_panels
                 self._started = False
-                for unsubscribe in reversed(self._unsubscribers):
-                    try:
-                        unsubscribe()
-                    except BaseException as error:
-                        if unsubscribe_error is None:
-                            unsubscribe_error = error
-                self._unsubscribers.clear()
+                unsubscribe_error = self._cleanup_unsubscribers_locked()
                 self._fail_pending_locked(
                     tuple(self._pending), "Brilliant scene control stopped before confirmation."
                 )
@@ -295,6 +289,20 @@ class SceneControl:
     def release_command_fence(self, token: int) -> None:
         """Release only the fence token owned by a completed lifecycle call."""
         self._active_command_fences.discard(token)
+
+    def _cleanup_unsubscribers_locked(self) -> BaseException | None:
+        """Drain known handles and retain every callback whose cleanup is uncertain."""
+        first_error: BaseException | None = None
+        uncertain: list[CALLBACK_TYPE] = []
+        for unsubscribe in reversed(self._unsubscribers):
+            try:
+                unsubscribe()
+            except BaseException as error:
+                uncertain.append(unsubscribe)
+                if first_error is None:
+                    first_error = error
+        self._unsubscribers = list(reversed(uncertain))
+        return first_error
 
     def _async_reconfigure_locked(
         self,
@@ -564,7 +572,7 @@ class SceneControl:
             ordering_key = (kind, panel)
             previous = self._event_timestamps.get(ordering_key)
             dedup_key = (kind, panel, deduplication_key)
-            if previous is not None and executed_at_ms <= previous:
+            if previous is not None and executed_at_ms < previous:
                 return
             if dedup_key in self._deduplication_keys:
                 return
@@ -627,7 +635,7 @@ class SceneControl:
         _require_exact_keys(payload, expected)
         panel = _required_panel(payload, "panel")
         identifier = _required_string(payload, identifier_key)
-        timestamp_ms = _required_timestamp(payload, "timestamp_ms")
+        _required_timestamp(payload, "timestamp_ms")
         error_value: str | None = None
         if not accepted:
             error_value = _required_string(payload, "error")
@@ -637,12 +645,7 @@ class SceneControl:
             pending = self._pending.get(command_id)
             if pending is None:
                 return
-            if (
-                pending.kind != kind
-                or pending.panel != panel
-                or pending.value != identifier
-                or timestamp_ms < pending.issued_at_ms
-            ):
+            if pending.kind != kind or pending.panel != panel or pending.value != identifier:
                 return
             if not pending.future.done():
                 pending.future.set_result(_CommandResult(accepted, error_value))
@@ -777,6 +780,8 @@ def _required_timestamp(payload: Mapping[str, object], field: str) -> int:
     value = payload.get(field)
     if type(value) is not int or value < 0:
         raise ValueError(f"{field} must be a non-negative integer")
+    if value > _timestamp_ms() + COMMAND_FUTURE_SKEW_MS:
+        raise ValueError(f"{field} is too far in the future")
     return value
 
 
