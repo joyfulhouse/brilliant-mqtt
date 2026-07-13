@@ -23,6 +23,7 @@ import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry, ConfigFlow, ConfigFlowResult, OptionsFlow
 from homeassistant.const import CONF_NAME
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import config_validation as cv
 
 from . import _fleet_lock, panel_ops
 from .components import REGISTRY, optional
@@ -187,6 +188,30 @@ _PANEL_PATTERN = re.compile(r"[a-z0-9][a-z0-9_-]{0,62}")
 _TARGET_KEYS = frozenset({"entity_id", "device_id", "area_id"})
 
 
+class _RawMultiSelect(cv.multi_select):
+    """Expose a serializable multi-select while deferring trust-boundary validation."""
+
+    def __call__(self, selected: Any) -> Any:
+        return selected
+
+
+class _RawInteger(vol.Coerce):
+    """Expose an integer field without coercing booleans or strings before validation."""
+
+    def __init__(self) -> None:
+        super().__init__(int)
+
+    def __call__(self, value: Any) -> Any:
+        return value
+
+
+class _RawRange(vol.Range):
+    """Expose numeric bounds while leaving the raw value for strict validation."""
+
+    def __call__(self, value: Any) -> Any:
+        return value
+
+
 def _canonical_json(value: Mapping[str, object]) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
@@ -245,11 +270,11 @@ def _control_schema_fields(source: Mapping[str, Any], *, panel_default: str) -> 
         vol.Required(
             CONF_HA_CONTROL_DOMAINS,
             default=list(source.get(CONF_HA_CONTROL_DOMAINS, DEFAULT_HA_CONTROL_DOMAINS)),
-        ): object,
+        ): _RawMultiSelect({domain: domain for domain in HA_CONTROL_DOMAINS}),
         vol.Required(
             CONF_MAX_MIRRORED_ENTITIES,
             default=source.get(CONF_MAX_MIRRORED_ENTITIES, DEFAULT_MAX_MIRRORED_ENTITIES),
-        ): object,
+        ): vol.All(_RawInteger(), _RawRange(min=1, max=200)),
         vol.Required(
             CONF_SCENE_PANEL,
             default=source.get(CONF_SCENE_PANEL, panel_default),

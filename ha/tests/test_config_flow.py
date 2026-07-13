@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest.mock import patch
 
 import asyncssh
 import pytest
 import voluptuous as vol
+import voluptuous_serialize
 from homeassistant.const import CONF_NAME
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import config_validation as cv
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.brilliant_mqtt import async_migrate_entry, config_flow, panel_ops
@@ -685,6 +687,25 @@ async def test_apply_config_pushes_when_panel_matches(hass: HomeAssistant) -> No
 
 
 # --- reconfigure -----------------------------------------------------------
+
+
+async def test_reconfigure_schema_is_http_serializable(hass: HomeAssistant) -> None:
+    """Every field must survive the serializer used by HA's config-flow REST API."""
+    entry = _full_entry(hass)
+    result = await entry.start_reconfigure_flow(hass)
+
+    assert result["type"] == "form" and result["step_id"] == "reconfigure"
+    schema = result["data_schema"]
+    assert schema is not None
+    serialized = cast(
+        list[dict[str, Any]],
+        voluptuous_serialize.convert(schema, custom_serializer=cv.custom_serializer),
+    )
+
+    assert {field["name"] for field in serialized} >= {
+        CONF_HA_CONTROL_DOMAINS,
+        CONF_MAX_MIRRORED_ENTITIES,
+    }
 
 
 async def test_reconfigure_same_host_applies_and_pushes(hass: HomeAssistant) -> None:
