@@ -512,16 +512,42 @@ Run the pilot with `--dry-run`; expected output lists only redacted VC ID, stabl
 Start monitor first, then the pilot for at most 30 minutes. Validate on Office and a second panel:
 
 1. tile renders in the intended room with correct display name;
-2. panel on/off and slider commands reach MQTT/HA exactly once;
-3. HA on/off/brightness updates render on both panels;
-4. restart HA, MQTT, pilot process, Office panel, and the second panel one at a time;
-5. temporarily remove network, restore it, and verify reconciliation;
-6. repeat WAN-denied behavior from VC3 and record latency;
-7. physical Office loads remain responsive and monitor thresholds remain clear.
+2. the tile's on-screen on/off and slider commands reach MQTT/HA exactly once;
+3. the Virtual-Control-owned light appears as a selectable target in the
+   Office panel's native physical-slider settings UI; do not infer eligibility
+   merely from tile rendering or the light's peripheral type;
+4. before changing any binding, snapshot the complete selected Office slider
+   configuration and its default/wired-gang behavior, then obtain explicit
+   operator approval naming that physical slider;
+5. bind the pilot light through the native settings UI, never through a guessed
+   raw variable write, and verify one physical tap plus one physical dimming
+   gesture reaches MQTT/HA exactly once and feeds state back to both panels;
+6. verify the bound slider does not operate, stall, or alter its prior wired or
+   default gang and that every other Office load remains responsive;
+7. HA on/off/brightness updates render on both panels and on the bound physical
+   slider's feedback surface, if the firmware exposes one;
+8. restart HA, MQTT, pilot process, Office panel, and the second panel one at a
+   time, verifying both tile operation and the approved slider binding after
+   each restart;
+9. temporarily remove network, restore it, and verify reconciliation;
+10. repeat WAN-denied behavior from VC3 and record latency;
+11. restore the physical slider's exact baseline binding through the native UI
+    and verify its original wired/default behavior before ending the pilot;
+12. physical Office loads remain responsive and monitor thresholds remain clear.
+
+The physical-slider sub-gate is **BLOCKED**, not passed, if the hosted light is
+absent from the native selector. Do not bypass that selector by hand-crafting a
+`slider_config`; the selector's eligibility checks and any associated metadata
+are part of the behavior being validated.
 
 - [ ] **Step 6: Delete and prove no phantom**
 
 Terminate normally, issue timestamped deletion if the framework did not remove it, and take two scoped VC snapshots at least 30 seconds apart. Confirm the peripheral is absent on both panels and the app/home graph while the VC identity itself remains. Run cleanup a second time and require success/no-op.
+
+Also re-read the complete Office physical-slider configuration twice and prove
+that it matches the pre-pilot snapshot exactly and contains no reference to the
+Virtual Control device ID or pilot peripheral ID. A stale binding is a cleanup
+failure even when the native tile has disappeared.
 
 - [ ] **Step 7: Run quality checks, commit code, and record VC5**
 
@@ -534,7 +560,9 @@ git add tools/brilliant_vc/single_light_pilot.py tests/test_vc_single_light.py d
 git commit -m "test: validate one Virtual Control native light"
 ```
 
-VC5 PASS requires every rendering/control/restart/network/cleanup check and no safety abort. Any persistent phantom is FAIL.
+VC5 PASS requires every rendering/control/restart/network/cleanup check,
+including native physical-slider selection, operation, restoration, and no
+safety abort. Any persistent tile or slider-binding phantom is FAIL.
 
 ### Task 9: Close the feasibility track and remove the disposable identity
 
