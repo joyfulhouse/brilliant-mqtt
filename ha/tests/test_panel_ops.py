@@ -616,6 +616,40 @@ async def test_inspect_ha_mirror_parses_all_absent() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "result",
+    [
+        RunResult(1, _ABSENT_HA_MIRROR_INSPECT.stdout, "probe failed"),
+        RunResult(0, "unit=0\nenv=0\nenabled=0\nactive=0\nsenv=0\n", ""),
+        RunResult(
+            0,
+            "unit=0\nunit=0\nenv=0\nenabled=0\nactive=0\nsenv=0\npayload=0\n",
+            "",
+        ),
+        RunResult(
+            0,
+            "unit=yes\nenv=0\nenabled=0\nactive=0\nsenv=0\npayload=0\n",
+            "",
+        ),
+        RunResult(
+            0,
+            "unit=0\nenv=0\nenabled=0\nactive=0\nsenv=0\npayload=0\nunknown=0\n",
+            "",
+        ),
+        RunResult(
+            0,
+            "unit=0\nenv=0\nenabled=0\nactive=0\nsenv=0\npay",
+            "",
+        ),
+    ],
+    ids=["nonzero", "missing", "duplicate", "malformed", "unknown", "truncated"],
+)
+async def test_inspect_ha_mirror_rejects_ambiguous_proof(result: RunResult) -> None:
+    shell = await _connected(FakeShell(responses={panel_ops.HA_MIRROR_INSPECT_COMMAND: result}))
+    with pytest.raises(panel_ops.PanelOpError):
+        await panel_ops.inspect_ha_mirror(shell)
+
+
 def test_ha_mirror_inspect_command_checks_main_entrypoint() -> None:
     assert (
         f"{PANEL_HA_MIRROR_APP_DIR}/brilliant_ha_mirror/__main__.py"

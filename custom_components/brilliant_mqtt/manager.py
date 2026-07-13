@@ -91,6 +91,7 @@ _LOGGER = logging.getLogger(__name__)
 _RECOVERY_SECONDS = 60.0
 _UNREACHABLE_RECHECK_SECONDS = 300.0
 _LEGACY_RETIRE_TIMEOUT_SECONDS = 30.0
+_SHELL_CLOSE_TIMEOUT_SECONDS = 5.0
 
 
 class _HostKeyChanged(Exception):
@@ -153,6 +154,7 @@ class PanelManager:
         self._recovery_cancel: CALLBACK_TYPE | None = None
         self._last_repair_mono: float | None = None
         self._repairing = False
+        self._abandoned_close_tasks: set[asyncio.Task[None]] = set()
         # Set true by async_shutdown. A repair already awaiting inside the ssh_lock
         # resumes AFTER shutdown's one-shot cancel; this flag stops it re-arming a
         # timer that would then fire on a torn-down entry and SSH a removed panel.
@@ -190,6 +192,43 @@ class PanelManager:
         # re-pin a rotated host key (see _connect_for_repair).
         return AsyncsshShell(self.entry.data[CONF_HOST], self.entry.data[CONF_ROOT_PASSWORD], None)
 
+    def _retain_abandoned_close(self, task: asyncio.Task[None]) -> None:
+        """Strongly retain and eventually consume a cancellation-resistant close."""
+        self._abandoned_close_tasks.add(task)
+
+        def _consume(done: asyncio.Task[None]) -> None:
+            self._abandoned_close_tasks.discard(done)
+            try:
+                done.result()
+            except BaseException:
+                pass
+
+        task.add_done_callback(_consume)
+
+    async def _async_close_shell(self, shell: PanelShell) -> bool:
+        """Close once within a hard bound; never await a stuck task after cancel."""
+        close_task = asyncio.create_task(shell.close(), name=f"{self.panel}-bounded-shell-close")
+        try:
+            done, _pending = await asyncio.wait({close_task}, timeout=_SHELL_CLOSE_TIMEOUT_SECONDS)
+        except asyncio.CancelledError:
+            close_task.cancel()
+            self._retain_abandoned_close(close_task)
+            raise
+        if close_task not in done:
+            close_task.cancel()
+            self._retain_abandoned_close(close_task)
+            return False
+        try:
+            close_task.result()
+        except BaseException:
+            return False
+        return True
+
+    async def _async_close_shell_or_raise(self, shell: PanelShell) -> None:
+        """Fail closed when a management session cannot be proven closed."""
+        if not await self._async_close_shell(shell):
+            raise OSError("panel SSH session could not be closed") from None
+
     async def _connect_for_repair(self) -> PanelShell:
         """Connect for a management op, honoring the host-key trust policy.
 
@@ -208,18 +247,21 @@ class PanelManager:
         except asyncssh.HostKeyNotVerifiable:
             # Caught BEFORE any generic asyncssh.Error (this is the only except here,
             # so every other connect failure propagates to the caller's handler).
-            await shell.close()
+            await self._async_close_shell_or_raise(shell)
             if not self._opt(OPT_TRUST_HOST_KEY_CHANGES, DEFAULT_TRUST_HOST_KEY_CHANGES):
                 raise _HostKeyChanged from None
             repinned = self._shell_unpinned()
             try:
                 await repinned.connect()  # unpinned: captures the new key (offers the password)
+            except asyncio.CancelledError:
+                await self._async_close_shell(repinned)
+                raise
             except BaseException:
-                await repinned.close()
+                await self._async_close_shell_or_raise(repinned)
                 raise
             new_key = repinned.pinned_host_key()
             if new_key is None:
-                await repinned.close()
+                await self._async_close_shell_or_raise(repinned)
                 # A fresh failure (the unpinned connect succeeded but exposed no key),
                 # not caused by the host-key mismatch — chain to None, and it reaches
                 # the caller's (OSError, asyncssh.Error) handler as "unreachable".
@@ -229,8 +271,11 @@ class PanelManager:
             )
             self._fire(EVENT_HOST_KEY_REPINNED, {"new_host_key": new_key})
             return repinned
+        except asyncio.CancelledError:
+            await self._async_close_shell(shell)
+            raise
         except BaseException:
-            await shell.close()
+            await self._async_close_shell_or_raise(shell)
             raise
         return shell
 
@@ -243,8 +288,8 @@ class PanelManager:
         self._unsubs.append(
             await mqtt.async_subscribe(self.hass, meta_topic(self.panel), self._on_meta)
         )
-        if self._legacy_retirement_evidence():
-            await self.async_retire_legacy_ha_mirror()
+        if self._legacy_retirement_evidence(include_verified_history=True):
+            await self.async_retire_legacy_ha_mirror(force_history_audit=True)
 
     async def async_shutdown(self) -> None:
         # Latch shutdown FIRST: a repair wedged in the ssh_lock checks this flag
@@ -282,7 +327,7 @@ class PanelManager:
             ir.async_delete_issue(self.hass, DOMAIN, self._issue_id)
         self._notify()
 
-    def _legacy_retirement_evidence(self) -> bool:
+    def _legacy_retirement_evidence(self, *, include_verified_history: bool = False) -> bool:
         components = self.entry.data.get(CONF_COMPONENTS, {})
         component_evidence = (
             isinstance(components, Mapping) and components.get(COMPONENT_HA_MIRROR) is True
@@ -295,7 +340,14 @@ class PanelManager:
                 CONF_HA_MIRROR_LEADER_PRIORITY,
             )
         )
-        return component_evidence or config_evidence
+        return (
+            component_evidence
+            or config_evidence
+            or (
+                include_verified_history
+                and self.entry.data.get(DATA_HA_MIRROR_RETIRE_VERIFIED) is True
+            )
+        )
 
     def _create_ha_mirror_retirement_issue(self) -> None:
         ir.async_create_issue(
@@ -340,54 +392,76 @@ class PanelManager:
                 data.pop(key, None)
         self.hass.config_entries.async_update_entry(self.entry, data=data)
 
-    async def _async_retire_legacy_ha_mirror_on_shell(self, shell: PanelShell) -> bool:
-        """Uninstall and prove absence using a fresh post-write inspection."""
+    def _finalize_verified_ha_mirror_retirement(self) -> None:
+        """Persist proof only after the owning shell has closed successfully."""
+        self._persist_verified_ha_mirror_retirement()
+        self.legacy_mirror_problem = None
+        ir.async_delete_issue(self.hass, DOMAIN, self._ha_mirror_issue_id)
+
+    def _complete_ha_mirror_retirement_after_close(
+        self, result: bool | None, close_ok: bool
+    ) -> None:
+        """Finalize verified absence only after the transport has really closed."""
+        if result is not True:
+            return
+        if close_ok:
+            self._finalize_verified_ha_mirror_retirement()
+            return
+        self.legacy_mirror_problem = "Legacy HA mirror retirement could not be verified"
+        self._create_ha_mirror_retirement_issue()
+
+    async def _async_retire_legacy_ha_mirror_on_shell(self, shell: PanelShell) -> bool | None:
+        """Uninstall and prove absence; the shell owner finalizes after close."""
         initial = await panel_ops.inspect_ha_mirror(shell)
         evidence = self._legacy_retirement_evidence() or not self._ha_mirror_absent(initial)
         if not evidence:
-            return True
+            return None
         self._create_ha_mirror_retirement_issue()
         await panel_ops.uninstall_ha_mirror(shell)
         verified = await panel_ops.inspect_ha_mirror(shell)
         if not self._ha_mirror_absent(verified):
             self.legacy_mirror_problem = "Legacy HA mirror retirement could not be verified"
             return False
-        self._persist_verified_ha_mirror_retirement()
-        self.legacy_mirror_problem = None
-        ir.async_delete_issue(self.hass, DOMAIN, self._ha_mirror_issue_id)
         return True
 
-    async def async_retire_legacy_ha_mirror(self) -> bool:
+    async def async_retire_legacy_ha_mirror(self, *, force_history_audit: bool = False) -> bool:
         """Best-effort bounded retirement; panel outages never block entry setup."""
-        enabled = self.entry.data.get(CONF_HA_CONTROL_ENABLED, DEFAULT_HA_CONTROL_ENABLED) is True
-        credentials_remain = any(
-            key in self.entry.data
-            for key in (
-                CONF_HA_MIRROR_WS_URL,
-                CONF_HA_MIRROR_TOKEN,
-                CONF_HA_MIRROR_LEADER_PRIORITY,
-            )
-        )
-        if self.entry.data.get(DATA_HA_MIRROR_RETIRE_VERIFIED) is True and (
-            not enabled or not credentials_remain
-        ):
-            return True
-        if not self._legacy_retirement_evidence():
+        if not self._legacy_retirement_evidence(include_verified_history=force_history_audit):
             return True
 
         self._create_ha_mirror_retirement_issue()
         shell: PanelShell | None = None
+        result: bool | None = False
+        failure = False
+        cancellation: asyncio.CancelledError | None = None
         try:
-            async with asyncio.timeout(_LEGACY_RETIRE_TIMEOUT_SECONDS):
-                async with self._ssh_lock:
-                    if self._shutting_down:
-                        return False
-                    shell = await self._connect_for_repair()
-                    try:
-                        return await self._async_retire_legacy_ha_mirror_on_shell(shell)
-                    finally:
-                        await shell.close()
-                        shell = None
+            async with self._ssh_lock:
+                try:
+                    async with asyncio.timeout(_LEGACY_RETIRE_TIMEOUT_SECONDS):
+                        if self._shutting_down:
+                            return False
+                        shell = await self._connect_for_repair()
+                        result = await self._async_retire_legacy_ha_mirror_on_shell(shell)
+                except asyncio.CancelledError as error:
+                    cancellation = error
+                except (TimeoutError, _HostKeyChanged, OSError, asyncssh.Error, PanelOpError):
+                    failure = True
+                close_ok = True
+                if shell is not None:
+                    close_ok = await self._async_close_shell(shell)
+                if cancellation is not None:
+                    self.legacy_mirror_problem = "Legacy HA mirror retirement was interrupted"
+                    raise cancellation
+                if failure or not close_ok:
+                    self.legacy_mirror_problem = "Legacy HA mirror retirement could not be verified"
+                    _LOGGER.warning(
+                        "%s: legacy HA mirror retirement could not be verified",
+                        self.panel,
+                    )
+                    return False
+                if result is True or (force_history_audit and result is None):
+                    self._finalize_verified_ha_mirror_retirement()
+                return result is not False
         except asyncio.CancelledError:
             self.legacy_mirror_problem = "Legacy HA mirror retirement was interrupted"
             raise
@@ -395,9 +469,6 @@ class PanelManager:
             self.legacy_mirror_problem = "Legacy HA mirror retirement could not be verified"
             _LOGGER.warning("%s: legacy HA mirror retirement could not be verified", self.panel)
             return False
-        finally:
-            if shell is not None:
-                await shell.close()
 
     def _cancel(self, attr: str) -> None:
         cancel: CALLBACK_TYPE | None = getattr(self, attr)
@@ -597,6 +668,7 @@ class PanelManager:
                     )
                     return
                 try:
+                    retirement_result: bool | None = None
                     state = await panel_ops.inspect_panel(shell)
                     unit, env = await self._config_contents()
                     # Bootstrap a code-less panel (never installed, or its /var code was
@@ -650,7 +722,9 @@ class PanelManager:
                         if err := await self._relay_watchdog(shell, _BUS_WATCHDOG_RELAY):
                             _LOGGER.warning("%s: bus watchdog repair failed: %s", self.panel, err)
                     try:
-                        await self._async_retire_legacy_ha_mirror_on_shell(shell)
+                        retirement_result = await self._async_retire_legacy_ha_mirror_on_shell(
+                            shell
+                        )
                     except (OSError, asyncssh.Error, PanelOpError):
                         self.legacy_mirror_problem = (
                             "Legacy HA mirror retirement could not be verified"
@@ -668,7 +742,8 @@ class PanelManager:
                     self._last_repair_mono = time.monotonic()  # gate any retry
                     return
                 finally:
-                    await shell.close()
+                    close_ok = await self._async_close_shell(shell)
+                self._complete_ha_mirror_retirement_after_close(retirement_result, close_ok)
             self._last_repair_mono = time.monotonic()
             if self._shutting_down:
                 return  # entry torn down mid-repair: do not re-arm a timer
@@ -738,6 +813,7 @@ class PanelManager:
                     ) from err
                 _p(25)
                 try:
+                    retirement_result: bool | None = None
                     _p(40)
                     await panel_ops.deploy_payload(shell, str(_payload_dir()), version)
                     _p(80)
@@ -746,7 +822,9 @@ class PanelManager:
                     _p(90)
                     await panel_ops.restart(shell)
                     try:
-                        await self._async_retire_legacy_ha_mirror_on_shell(shell)
+                        retirement_result = await self._async_retire_legacy_ha_mirror_on_shell(
+                            shell
+                        )
                     except (OSError, asyncssh.Error, PanelOpError):
                         self.legacy_mirror_problem = (
                             "Legacy HA mirror retirement could not be verified"
@@ -760,7 +838,8 @@ class PanelManager:
                         translation_placeholders={"error": str(err)},
                     ) from err
                 finally:
-                    await shell.close()
+                    close_ok = await self._async_close_shell(shell)
+                self._complete_ha_mirror_retirement_after_close(retirement_result, close_ok)
             _p(100)
             self._fire(EVENT_AGENT_UPDATED, {"version": version})
             if self._shutting_down:
@@ -875,7 +954,7 @@ class PanelManager:
 
         component = REGISTRY[component_id]
         if component.deprecated:
-            if not await self.async_retire_legacy_ha_mirror():
+            if not await self.async_retire_legacy_ha_mirror(force_history_audit=True):
                 raise PanelOpError("Legacy HA mirror retirement could not be verified")
             self._notify()
             return
@@ -994,6 +1073,7 @@ class PanelManager:
                 shell = self._shell()
                 await shell.connect()
                 try:
+                    retirement_result: bool | None = None
                     unit, env = await self._config_contents()
                     await panel_ops.ensure_configs(shell, unit, env)
                     # Wi-Fi watchdog: also re-lay its unit when selected — OTA wipes /etc
@@ -1016,12 +1096,15 @@ class PanelManager:
                                 self.panel,
                             )
                     try:
-                        await self._async_retire_legacy_ha_mirror_on_shell(shell)
+                        retirement_result = await self._async_retire_legacy_ha_mirror_on_shell(
+                            shell
+                        )
                     except (OSError, asyncssh.Error, PanelOpError):
                         self.legacy_mirror_problem = (
                             "Legacy HA mirror retirement could not be verified"
                         )
                 finally:
-                    await shell.close()
+                    close_ok = await self._async_close_shell(shell)
+                self._complete_ha_mirror_retirement_after_close(retirement_result, close_ok)
         except (OSError, asyncssh.Error, PanelOpError):
             _LOGGER.warning("%s: staged-copy refresh failed; will retry next reconcile", self.panel)

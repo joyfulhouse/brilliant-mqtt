@@ -474,20 +474,26 @@ class HaMirrorState:
 
 
 async def inspect_ha_mirror(shell: PanelShell) -> HaMirrorState:
-    """Probe HA mirror install/health state in one shell round-trip."""
+    """Probe HA mirror state, accepting only a complete unambiguous proof."""
     result = await shell.run(HA_MIRROR_INSPECT_COMMAND)
+    expected = {"unit", "env", "enabled", "active", "senv", "payload"}
+    if result.exit_status != 0:
+        raise PanelOpError("HA mirror inspection failed")
     flags: dict[str, bool] = {}
     for line in result.stdout.splitlines():
         key, sep, value = line.partition("=")
-        if sep and key in ("unit", "env", "enabled", "active", "senv", "payload"):
-            flags[key] = value == "1"
+        if not sep or key not in expected or key in flags or value not in {"0", "1"}:
+            raise PanelOpError("HA mirror inspection returned ambiguous state")
+        flags[key] = value == "1"
+    if set(flags) != expected:
+        raise PanelOpError("HA mirror inspection returned incomplete state")
     return HaMirrorState(
-        unit_present=flags.get("unit", False),
-        env_present=flags.get("env", False),
-        enabled=flags.get("enabled", False),
-        active=flags.get("active", False),
-        staged_env_present=flags.get("senv", False),
-        payload_present=flags.get("payload", False),
+        unit_present=flags["unit"],
+        env_present=flags["env"],
+        enabled=flags["enabled"],
+        active=flags["active"],
+        staged_env_present=flags["senv"],
+        payload_present=flags["payload"],
     )
 
 

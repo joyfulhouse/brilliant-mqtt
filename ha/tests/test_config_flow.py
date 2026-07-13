@@ -1169,6 +1169,7 @@ async def test_new_install_control_defaults_are_explicit_and_persist_decoded(
     ("changed", "field"),
     [
         ({CONF_HA_CONTROL_LABEL: "   "}, CONF_HA_CONTROL_LABEL),
+        ({CONF_ROOM_OVERRIDES: "{not-json"}, CONF_ROOM_OVERRIDES),
         ({CONF_ROOM_OVERRIDES: "[]"}, CONF_ROOM_OVERRIDES),
         ({CONF_ROOM_OVERRIDES: '{"Office":7}'}, CONF_ROOM_OVERRIDES),
         ({CONF_HA_CONTROL_DOMAINS: ["light", "light"]}, CONF_HA_CONTROL_DOMAINS),
@@ -1177,6 +1178,7 @@ async def test_new_install_control_defaults_are_explicit_and_persist_decoded(
         ({CONF_MAX_MIRRORED_ENTITIES: 0}, CONF_MAX_MIRRORED_ENTITIES),
         ({CONF_MAX_MIRRORED_ENTITIES: 201}, CONF_MAX_MIRRORED_ENTITIES),
         ({CONF_SCENE_PANEL: "backyard"}, CONF_SCENE_PANEL),
+        ({CONF_SCENE_ACTIONS: "{not-json"}, CONF_SCENE_ACTIONS),
         ({CONF_SCENE_ACTIONS: "[]"}, CONF_SCENE_ACTIONS),
         (
             {
@@ -1224,6 +1226,125 @@ async def test_control_validation_fails_closed_and_preserves_safe_text(
     if field in (CONF_ROOM_OVERRIDES, CONF_SCENE_ACTIONS):
         assert _suggested_values(result)[field] == submitted[field]
     assert not hass.config_entries.async_entries(DOMAIN)
+
+
+def _unsafe_json_text(field: str, kind: str) -> tuple[str, str]:
+    sentinel = f"unsafe-{field}-{kind}"
+    if kind == "oversized":
+        return sentinel, '{"' + sentinel + '":"' + ("x" * (70 * 1024)) + '"}'
+    return sentinel, f'{{"{sentinel}":"bad\x00value"}}'
+
+
+@pytest.mark.parametrize("field", [CONF_ROOM_OVERRIDES, CONF_SCENE_ACTIONS])
+@pytest.mark.parametrize("kind", ["oversized", "control_char"])
+async def test_script_unsafe_json_is_not_redisplayed_or_leaked(
+    hass: HomeAssistant,
+    not_installed_panel: None,
+    caplog: pytest.LogCaptureFixture,
+    field: str,
+    kind: str,
+) -> None:
+    sentinel, unsafe = _unsafe_json_text(field, kind)
+    result = await _drive_flow_to_script(hass)
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {**SCRIPT_INPUT, field: unsafe}
+    )
+
+    assert result["type"] == "form" and result["step_id"] == "script"
+    assert result["errors"] == {field: "invalid_value"}
+    suggested = _suggested_values(result)
+    assert suggested[field] == "{}"
+    assert sentinel not in repr(suggested)
+    assert sentinel not in caplog.text
+    assert not hass.config_entries.async_entries(DOMAIN)
+
+
+@pytest.mark.parametrize("field", [CONF_ROOM_OVERRIDES, CONF_SCENE_ACTIONS])
+@pytest.mark.parametrize("kind", ["oversized", "control_char"])
+async def test_reconfigure_unsafe_json_is_not_redisplayed_persisted_or_leaked(
+    hass: HomeAssistant,
+    caplog: pytest.LogCaptureFixture,
+    field: str,
+    kind: str,
+) -> None:
+    sentinel, unsafe = _unsafe_json_text(field, kind)
+    entry = _full_entry(hass)
+    before = dict(entry.data)
+    result = await entry.start_reconfigure_flow(hass)
+    with (
+        patch(APPLY) as apply,
+        patch.object(hass.config_entries, "async_update_entry") as update_entry,
+    ):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {**reconfigure_input(entry), field: unsafe}
+        )
+
+    assert result["type"] == "form" and result["step_id"] == "reconfigure"
+    assert result["errors"] == {field: "invalid_value"}
+    suggested = _suggested_values(result)
+    assert suggested[field] == "{}"
+    assert sentinel not in repr(suggested)
+    assert sentinel not in caplog.text
+    apply.assert_not_called()
+    update_entry.assert_not_called()
+    assert entry.data == before
+
+
+_INVALID_DOMAIN_INPUTS = [
+    [["light"]],
+    {"light": True},
+    ["light", 7],
+    [{"domain": "light"}],
+    ["light", "light"],
+]
+
+
+@pytest.mark.parametrize("domains", _INVALID_DOMAIN_INPUTS)
+async def test_script_domain_validation_never_crashes_or_applies(
+    hass: HomeAssistant,
+    not_installed_panel: None,
+    patch_installs: Any,
+    domains: object,
+) -> None:
+    result = await _drive_flow_to_script(hass)
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {**SCRIPT_INPUT, CONF_HA_CONTROL_DOMAINS: domains},
+    )
+
+    assert result["type"] == "form" and result["step_id"] == "script"
+    assert result["errors"] == {CONF_HA_CONTROL_DOMAINS: "invalid_value"}
+    assert not hass.config_entries.async_entries(DOMAIN)
+    for component_id in (
+        COMPONENT_BRIDGE,
+        COMPONENT_VOICE,
+        COMPONENT_WIFI_WATCHDOG,
+        COMPONENT_BUS_WATCHDOG,
+    ):
+        assert not patch_installs.called(component_id)
+
+
+@pytest.mark.parametrize("domains", _INVALID_DOMAIN_INPUTS)
+async def test_reconfigure_domain_validation_never_applies_or_updates(
+    hass: HomeAssistant, domains: object
+) -> None:
+    entry = _full_entry(hass)
+    before = dict(entry.data)
+    result = await entry.start_reconfigure_flow(hass)
+    with (
+        patch(APPLY) as apply,
+        patch.object(hass.config_entries, "async_update_entry") as update_entry,
+    ):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {**reconfigure_input(entry), CONF_HA_CONTROL_DOMAINS: domains},
+        )
+
+    assert result["type"] == "form" and result["step_id"] == "reconfigure"
+    assert result["errors"] == {CONF_HA_CONTROL_DOMAINS: "invalid_value"}
+    apply.assert_not_called()
+    update_entry.assert_not_called()
+    assert entry.data == before
 
 
 async def test_new_panel_inherits_existing_fleet_global_values(

@@ -131,3 +131,82 @@ jq empty custom_components/brilliant_mqtt/strings.json \
   custom_components/brilliant_mqtt/translations/en.json
 valid; strings and English translation are byte-identical
 ```
+
+## Review hardening follow-up
+
+The post-implementation review identified five fail-closed boundaries and one SSH
+cleanup edge. Each was reproduced before its production fix:
+
+- The mirror inspection parser previously ignored a non-zero exit status and treated
+  missing, duplicate, malformed, unknown, or truncated fields as usable state. It now
+  accepts exactly one `0|1` value for each of `unit`, `env`, `enabled`, `active`,
+  `senv`, and `payload`; everything else raises `PanelOpError`. Both the initial and
+  post-uninstall proof are strict, so ambiguous output retains the Repair, credentials,
+  and unverified marker.
+- Domain input validation previously constructed a set before proving every element
+  was a supported string. Nested lists/dicts and mixed values could raise `TypeError`,
+  while a raw mapping could fail in schema coercion before the flow returned its
+  per-field error. The form now admits the raw object to application validation, which
+  rejects non-lists, non-string or unsupported members, and duplicates without install,
+  apply, persistence, or fleet updates.
+- A historical verified marker previously bypassed future setup audits. Setup and the
+  explicit deprecated-component path now force a fresh panel inspection, including for
+  disabled control with retained legacy credentials. A reappeared mirror is removed and
+  proved absent again; disabled control continues retaining its credentials. A
+  marker-only absence audit clears its temporary Repair after the shell closes instead
+  of leaving a warning on every reload.
+- Retirement persistence is now deferred until the owning SSH shell is proved closed.
+  Shell close runs as a separately retained task under `asyncio.wait()` with a hard
+  bound; a cancellation-resistant close is cancelled but never awaited without a
+  bound, is consumed if it later finishes, and is never invoked twice. Direct
+  retirement, repair, update, and post-OTA refresh all preserve the Repair and secrets
+  when close is uncertain, and finalize only after successful close.
+- Host-key re-pin now fails closed if the original pinned session cannot be proved
+  closed. No unpinned replacement is constructed, no password is offered to the
+  changed-key endpoint, and the stored pin remains unchanged. Failed replacement
+  connections and missing replacement keys use the same sanitized close-failure path.
+- Oversized (over 64 KiB), control-character-bearing, or non-string room/action JSON is
+  replaced with `{}` on error redisplay. Ordinary bounded malformed JSON remains visible
+  for correction. Unsafe sentinels are absent from suggested values, logs, entry data,
+  install/apply calls, and fleet updates.
+
+The consolidated pre-fix review run produced `30 failed, 4 passed, 216 deselected`
+(plus one teardown caused by the deliberately wedged close fixture before cleanup was
+completed). Focused management close/finalization coverage then produced six expected
+failures, and the pinned-close/re-pin test failed because the old implementation opened
+the unpinned replacement instead of raising the sanitized close error.
+
+Final follow-up verification:
+
+```text
+uv run --project ha pytest -c ha/pyproject.toml \
+  ha/tests/test_config_flow.py ha/tests/test_components.py \
+  ha/tests/test_manager.py ha/tests/test_panel_ops.py \
+  ha/tests/test_diagnostics.py ha/tests/test_repairs.py -q
+281 passed in 3.66s
+
+uv run --project ha pytest -c ha/pyproject.toml ha/tests
+505 passed in 8.08s
+
+uv run --project ha ruff check --config ha/pyproject.toml \
+  custom_components/brilliant_mqtt ha/tests
+All checks passed!
+
+uv run --project ha ruff format --check --config ha/pyproject.toml \
+  custom_components/brilliant_mqtt ha/tests
+41 files already formatted
+
+uv run --project ha mypy --strict --config-file ha/pyproject.toml \
+  custom_components/brilliant_mqtt ha/tests
+Success: no issues found in 41 source files
+
+git diff --check
+clean
+
+jq empty custom_components/brilliant_mqtt/strings.json \
+  custom_components/brilliant_mqtt/translations/en.json
+valid; strings and English translation remain byte-identical
+```
+
+No live panel or production Home Assistant state was touched during this review
+follow-up.

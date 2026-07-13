@@ -191,6 +191,16 @@ def _canonical_json(value: Mapping[str, object]) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
+def _safe_control_redisplay_values(user_input: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep ordinary edits, but never echo unsafe JSON text back into a form."""
+    values = dict(user_input)
+    for key in (CONF_ROOM_OVERRIDES, CONF_SCENE_ACTIONS):
+        raw = values.get(key)
+        if not isinstance(raw, str) or len(raw) > _MAX_JSON_TEXT or _has_control_char(raw):
+            values[key] = "{}"
+    return values
+
+
 def _global_defaults(panel: str) -> dict[str, Any]:
     return {
         CONF_HA_CONTROL_ENABLED: DEFAULT_HA_CONTROL_ENABLED,
@@ -235,7 +245,7 @@ def _control_schema_fields(source: Mapping[str, Any], *, panel_default: str) -> 
         vol.Required(
             CONF_HA_CONTROL_DOMAINS,
             default=list(source.get(CONF_HA_CONTROL_DOMAINS, DEFAULT_HA_CONTROL_DOMAINS)),
-        ): list,
+        ): object,
         vol.Required(
             CONF_MAX_MIRRORED_ENTITIES,
             default=source.get(CONF_MAX_MIRRORED_ENTITIES, DEFAULT_MAX_MIRRORED_ENTITIES),
@@ -363,8 +373,11 @@ def _validated_control_input(
     raw_domains = user_input.get(CONF_HA_CONTROL_DOMAINS)
     if (
         not isinstance(raw_domains, list)
+        or any(
+            not isinstance(domain, str) or domain not in HA_CONTROL_DOMAINS
+            for domain in raw_domains
+        )
         or len(raw_domains) != len(set(raw_domains))
-        or any(domain not in HA_CONTROL_DOMAINS for domain in raw_domains)
     ):
         errors[CONF_HA_CONTROL_DOMAINS] = "invalid_value"
     else:
@@ -721,7 +734,9 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
         )
         # Preserve name + mesh + voice fields across an error redisplay.
         if user_input is not None:
-            schema = self.add_suggested_values_to_schema(schema, user_input)
+            schema = self.add_suggested_values_to_schema(
+                schema, _safe_control_redisplay_values(user_input)
+            )
         return self.async_show_form(step_id="script", data_schema=schema, errors=errors)
 
     async def async_step_reconfigure(
@@ -871,7 +886,9 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
         # Keep the operator's just-made edits across an error redisplay (a transient
         # cannot_connect / wrong_panel shouldn't wipe all six fields back to the old config).
         if user_input is not None:
-            schema = self.add_suggested_values_to_schema(schema, user_input)
+            schema = self.add_suggested_values_to_schema(
+                schema, _safe_control_redisplay_values(user_input)
+            )
         return self.async_show_form(step_id="reconfigure", data_schema=schema, errors=errors)
 
 
