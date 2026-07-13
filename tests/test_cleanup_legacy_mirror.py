@@ -6,7 +6,11 @@ import asyncio
 import builtins
 import importlib
 import json
+import os
 import stat
+import subprocess
+import sys
+import textwrap
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -768,6 +772,141 @@ async def test_apply_persists_success_only_after_client_close(
     assert code == 0
     assert json.loads(capsys.readouterr().out)["success"] is True
     assert events == ["write:False", "close", "write:True"]
+
+
+async def test_second_report_failure_preserves_exact_verified_stdout(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    candidate = _device("ha_deleted", "HA Deleted")
+    client = FakeCleanupClient([_snapshot(candidate), _snapshot()])
+    durable: list[str] = []
+
+    def fail_second_write(path: Path, payload: str) -> None:
+        del path
+        if durable:
+            raise OSError("second report write failed")
+        durable.append(payload)
+
+    code = await async_main(
+        ["--apply", "--snapshot", "/safe/cleanup/report.json"],
+        client_factory=lambda: client,
+        effective_uid=lambda: 0,
+        safe_root=Path("/safe/cleanup"),
+        path_validator=lambda path, safe_root: path,
+        now_ms=_clock(1, 2, 3, 4),
+        report_writer=fail_second_write,
+    )
+
+    stdout_report = json.loads(capsys.readouterr().out)
+    durable_report = json.loads(durable[0])
+    assert code == 1
+    assert stdout_report["success"] is False
+    assert stdout_report["candidates"] == [{"id": "ha_deleted", "name": "HA Deleted", "type": 27}]
+    assert stdout_report["deleted_ids"] == ["ha_deleted"]
+    assert stdout_report["remaining_ids"] == []
+    assert durable_report["success"] is False
+    assert durable_report["deleted_ids"] == []
+    assert durable_report["remaining_ids"] == ["ha_deleted"]
+
+
+def _run_synchronous_main_script(body: str) -> subprocess.CompletedProcess[str]:
+    source_root = Path(__file__).parents[1] / "src"
+    environment = dict(os.environ)
+    old_pythonpath = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = (
+        str(source_root) if not old_pythonpath else f"{source_root}{os.pathsep}{old_pythonpath}"
+    )
+    return subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(body)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=1.0,
+        env=environment,
+    )
+
+
+def test_synchronous_main_returns_after_cancellation_suppressing_client_close() -> None:
+    completed = _run_synchronous_main_script(
+        """
+        import asyncio
+        import time
+        import brilliant_mqtt.cleanup_legacy_mirror as cleanup
+        from brilliant_mqtt.cleanup_legacy_mirror import OwnDeviceSnapshot
+
+        class Client:
+            async def start(self):
+                return None
+
+            async def snapshot_own_device(self):
+                return OwnDeviceSnapshot("own-device", ())
+
+            async def delete_peripheral(self, device_id, peripheral_id, deletion_time_ms):
+                raise AssertionError("dry run must not delete")
+
+            async def close(self):
+                while True:
+                    try:
+                        await asyncio.Event().wait()
+                    except asyncio.CancelledError:
+                        continue
+
+        started = time.monotonic()
+        result = cleanup.main([], client_factory=Client, close_timeout_s=0.001)
+        print(f"AFTER:{result}:{time.monotonic() - started:.3f}")
+        """
+    )
+
+    assert completed.returncode == 0
+    assert completed.stderr == ""
+    marker = completed.stdout.strip().splitlines()[-1]
+    _, result, elapsed = marker.split(":")
+    assert result == "1"
+    assert float(elapsed) < 0.2
+
+
+def test_synchronous_main_returns_after_native_child_shutdown_suppresses_cancel() -> None:
+    completed = _run_synchronous_main_script(
+        """
+        import asyncio
+        import time
+        import brilliant_mqtt.cleanup_legacy_mirror as cleanup
+        from brilliant_mqtt.cleanup_legacy_mirror import NativeCleanupClient, OwnDeviceSnapshot
+
+        cleanup._NATIVE_CLOSE_STEP_TIMEOUT_S = 0.001
+
+        class SuppressingShutdown:
+            async def shutdown(self):
+                while True:
+                    try:
+                        await asyncio.Event().wait()
+                    except asyncio.CancelledError:
+                        continue
+
+        class NormalShutdown:
+            async def shutdown(self):
+                return None
+
+        class Client(NativeCleanupClient):
+            async def start(self):
+                self._observer = SuppressingShutdown()
+                self._processor = NormalShutdown()
+
+            async def snapshot_own_device(self):
+                return OwnDeviceSnapshot("own-device", ())
+
+        started = time.monotonic()
+        result = cleanup.main([], client_factory=Client)
+        print(f"AFTER:{result}:{time.monotonic() - started:.3f}")
+        """
+    )
+
+    assert completed.returncode == 0
+    assert completed.stderr == ""
+    marker = completed.stdout.strip().splitlines()[-1]
+    _, result, elapsed = marker.split(":")
+    assert result == "1"
+    assert float(elapsed) < 0.2
 
 
 def test_help_and_argument_errors_do_not_construct_a_live_client() -> None:

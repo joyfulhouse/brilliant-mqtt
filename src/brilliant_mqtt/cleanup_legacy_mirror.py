@@ -243,6 +243,14 @@ class _VerificationReadError(RuntimeError):
         self.report = report
 
 
+class _ReportPersistenceError(RuntimeError):
+    """Internal write error carrying the exact sanitized attempted report."""
+
+    def __init__(self, report: CleanupReport) -> None:
+        super().__init__("cleanup report persistence failed")
+        self.report = report
+
+
 async def run_cleanup(
     client: CleanupClient,
     *,
@@ -317,7 +325,10 @@ async def run_cleanup(
             remaining_ids=candidate_ids,
             success=False,
         )
-        report_writer(report_path, canonical_report_json(conservative))
+        try:
+            report_writer(report_path, canonical_report_json(conservative))
+        except Exception as write_error:
+            raise _ReportPersistenceError(conservative) from write_error
         raise _VerificationReadError(conservative) from exc
 
     observed_ids = {
@@ -344,7 +355,10 @@ async def run_cleanup(
         success=success,
     )
     durable_report = report if not success else replace(report, success=False)
-    report_writer(report_path, canonical_report_json(durable_report))
+    try:
+        report_writer(report_path, canonical_report_json(durable_report))
+    except Exception as exc:
+        raise _ReportPersistenceError(durable_report) from exc
     return (0 if success else 1), report
 
 
@@ -368,6 +382,8 @@ def _native_client_factory() -> CleanupClient:
 
 def _retain_cleanup_task(task: asyncio.Task[Any]) -> None:
     """Retain and eventually consume a cancellation-resistant cleanup task."""
+    if task in _RETAINED_CLEANUP_TASKS:
+        return
     _RETAINED_CLEANUP_TASKS.add(task)
 
     def consume(done: asyncio.Task[Any]) -> None:
@@ -401,6 +417,7 @@ async def _wait_for_cleanup_task(task: asyncio.Task[Any], timeout_s: float) -> b
 
 async def _bounded_close(client: CleanupClient, timeout_s: float) -> bool:
     close_task = asyncio.create_task(client.close(), name="legacy-mirror-cleanup-close")
+    _retain_cleanup_task(close_task)
     return await _wait_for_cleanup_task(close_task, timeout_s)
 
 
@@ -451,6 +468,9 @@ async def async_main(
         )
     except asyncio.CancelledError:
         raise
+    except _ReportPersistenceError as exc:
+        report = exc.report
+        code = 1
     except _VerificationReadError as exc:
         report = exc.report
         code = 1
@@ -484,9 +504,52 @@ def main(
     argv: Sequence[str] | None = None,
     *,
     client_factory: Callable[[], CleanupClient] = _native_client_factory,
+    close_timeout_s: float = _CLI_CLOSE_TIMEOUT_S,
 ) -> int:
-    """Synchronous console entry point."""
-    return asyncio.run(async_main(argv, client_factory=client_factory))
+    """Synchronous entry point with non-joining abandoned-task teardown."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(
+            async_main(
+                argv,
+                client_factory=client_factory,
+                close_timeout_s=close_timeout_s,
+            )
+        )
+    finally:
+        try:
+            _close_main_loop(loop)
+        finally:
+            asyncio.set_event_loop(None)
+
+
+def _close_main_loop(loop: asyncio.AbstractEventLoop) -> None:
+    """Close *loop* without joining explicitly abandoned cleanup tasks."""
+    tracked = {
+        task for task in _RETAINED_CLEANUP_TASKS if task.get_loop() is loop and not task.done()
+    }
+    ordinary = asyncio.all_tasks(loop) - tracked
+    for task in ordinary:
+        task.cancel()
+    if ordinary:
+        loop.run_until_complete(asyncio.gather(*ordinary, return_exceptions=True))
+    loop.run_until_complete(loop.shutdown_asyncgens())
+
+    for task in tuple(_RETAINED_CLEANUP_TASKS):
+        if task.get_loop() is not loop:
+            continue
+        _RETAINED_CLEANUP_TASKS.discard(task)
+        if task.done():
+            try:
+                task.result()
+            except BaseException:
+                pass
+        else:
+            task.cancel()
+            pending_task = cast(Any, task)
+            pending_task._log_destroy_pending = False
+    loop.close()
 
 
 async def _maybe_await(value: object) -> object:
@@ -575,6 +638,7 @@ class NativeCleanupClient:
             if target is None:
                 continue
             shutdown_task = asyncio.create_task(target.shutdown())
+            _retain_cleanup_task(shutdown_task)
             try:
                 completed = await _wait_for_cleanup_task(
                     shutdown_task,
