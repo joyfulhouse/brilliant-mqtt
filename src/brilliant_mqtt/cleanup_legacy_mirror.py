@@ -33,6 +33,7 @@ _CONNECT_TIMEOUT_S = 10.0
 _CONNECT_POLL_S = 0.25
 _NATIVE_CLOSE_STEP_TIMEOUT_S = 2.0
 _CLI_CLOSE_TIMEOUT_S = 5.0
+_RETAINED_CLEANUP_TASKS: set[asyncio.Task[Any]] = set()
 
 
 @dataclass(frozen=True)
@@ -213,7 +214,6 @@ def write_report_atomic(path: Path, payload: str) -> None:
             os.fsync(output.fileno())
         os.replace(temporary_path, path)
         temporary_path = None
-        path.chmod(0o600)
     finally:
         if fd >= 0:
             os.close(fd)
@@ -279,7 +279,7 @@ async def run_cleanup(
             remaining_ids=(),
             success=True,
         )
-        report_writer(report_path, canonical_report_json(report))
+        report_writer(report_path, canonical_report_json(replace(report, success=False)))
         return 0, report
 
     prepared_report = build_report(
@@ -343,7 +343,8 @@ async def run_cleanup(
         remaining_ids=remaining_ids,
         success=success,
     )
-    report_writer(report_path, canonical_report_json(report))
+    durable_report = report if not success else replace(report, success=False)
+    report_writer(report_path, canonical_report_json(durable_report))
     return (0 if success else 1), report
 
 
@@ -357,7 +358,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--apply", action="store_true", help="delete candidates after safe preflight"
     )
-    parser.add_argument("--snapshot", type=Path, help="absolute apply report path")
+    parser.add_argument("--snapshot", help="absolute apply report path")
     return parser
 
 
@@ -365,12 +366,42 @@ def _native_client_factory() -> CleanupClient:
     return NativeCleanupClient()
 
 
-async def _bounded_close(client: CleanupClient, timeout_s: float) -> bool:
+def _retain_cleanup_task(task: asyncio.Task[Any]) -> None:
+    """Retain and eventually consume a cancellation-resistant cleanup task."""
+    _RETAINED_CLEANUP_TASKS.add(task)
+
+    def consume(done: asyncio.Task[Any]) -> None:
+        _RETAINED_CLEANUP_TASKS.discard(done)
+        try:
+            done.result()
+        except BaseException:
+            pass
+
+    task.add_done_callback(consume)
+
+
+async def _wait_for_cleanup_task(task: asyncio.Task[Any], timeout_s: float) -> bool:
+    """Wait within a hard wall-clock bound, never joining after cancel/timeout."""
     try:
-        await asyncio.wait_for(client.close(), timeout=timeout_s)
-    except (Exception, asyncio.CancelledError):
+        done, _pending = await asyncio.wait({task}, timeout=timeout_s)
+    except asyncio.CancelledError:
+        task.cancel()
+        _retain_cleanup_task(task)
+        raise
+    if task not in done:
+        task.cancel()
+        _retain_cleanup_task(task)
+        return False
+    try:
+        task.result()
+    except BaseException:
         return False
     return True
+
+
+async def _bounded_close(client: CleanupClient, timeout_s: float) -> bool:
+    close_task = asyncio.create_task(client.close(), name="legacy-mirror-cleanup-close")
+    return await _wait_for_cleanup_task(close_task, timeout_s)
 
 
 async def async_main(
@@ -387,11 +418,17 @@ async def async_main(
 ) -> int:
     """Run the CLI with injectable off-panel seams."""
     args = _parser().parse_args(argv)
-    report_path: Path | None = args.snapshot
+    raw_report_path: str | None = args.snapshot
+    report_path = None if raw_report_path is None else Path(raw_report_path)
 
     if args.apply:
         try:
-            if effective_uid() != 0 or report_path is None:
+            if (
+                effective_uid() != 0
+                or raw_report_path is None
+                or raw_report_path.endswith("/")
+                or report_path is None
+            ):
                 raise ValueError("apply preflight rejected")
             report_path = path_validator(report_path, safe_root)
         except (OSError, ValueError):
@@ -429,15 +466,16 @@ async def async_main(
                     report = _empty_failure_report(now_ms())
                 elif report.success:
                     report = replace(report, success=False)
-                if args.apply and report_path is not None:
-                    try:
-                        report_writer(report_path, canonical_report_json(report))
-                    except Exception:
-                        code = 1
 
     if report is None:
         report = _empty_failure_report(now_ms())
         code = 1
+    if code == 0 and args.apply and report_path is not None:
+        try:
+            report_writer(report_path, canonical_report_json(report))
+        except Exception:
+            report = replace(report, success=False)
+            code = 1
     print(canonical_report_json(report))
     return code
 
@@ -529,17 +567,26 @@ class NativeCleanupClient:
     async def close(self) -> None:
         """Attempt both shutdown stages, with a bound on each stage."""
         first_error: BaseException | None = None
+        cancellation: asyncio.CancelledError | None = None
         observer, processor = self._observer, self._processor
         self._observer = None
         self._processor = None
         for target in (observer, processor):
             if target is None:
                 continue
+            shutdown_task = asyncio.create_task(target.shutdown())
             try:
-                await asyncio.wait_for(target.shutdown(), timeout=_NATIVE_CLOSE_STEP_TIMEOUT_S)
-            except BaseException as exc:
-                if first_error is None:
-                    first_error = exc
+                completed = await _wait_for_cleanup_task(
+                    shutdown_task,
+                    _NATIVE_CLOSE_STEP_TIMEOUT_S,
+                )
+            except asyncio.CancelledError as exc:
+                cancellation = exc
+                continue
+            if not completed and first_error is None:
+                first_error = RuntimeError("native shutdown step failed")
+        if cancellation is not None:
+            raise cancellation
         if first_error is not None:
             raise RuntimeError("native cleanup client close failed") from first_error
 

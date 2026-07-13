@@ -14,6 +14,7 @@ from typing import Any, cast
 
 import pytest
 
+import brilliant_mqtt.cleanup_legacy_mirror as cleanup_module
 from brilliant_mqtt.cleanup_legacy_mirror import (
     ALLOWED_ID_PREFIXES,
     ALLOWED_NAME_PREFIXES,
@@ -203,6 +204,25 @@ class FakeCleanupClient:
             await self.close_gate.wait()
 
 
+class CancellationSuppressingCleanupClient(FakeCleanupClient):
+    def __init__(self, snapshots: list[OwnDeviceSnapshot | BaseException]) -> None:
+        super().__init__(snapshots)
+        self.close_started = asyncio.Event()
+        self.close_release = asyncio.Event()
+        self.close_finished = asyncio.Event()
+
+    async def close(self) -> None:
+        self.close_calls += 1
+        self.events.append("close")
+        self.close_started.set()
+        while not self.close_release.is_set():
+            try:
+                await self.close_release.wait()
+            except asyncio.CancelledError:
+                continue
+        self.close_finished.set()
+
+
 def _snapshot(*devices: BrilliantDevice) -> OwnDeviceSnapshot:
     return OwnDeviceSnapshot("own-device", tuple(devices))
 
@@ -354,6 +374,37 @@ async def test_apply_guards_reject_before_constructing_a_client(
     assert all(set(json.loads(line)) == CleanupReport.public_fields() for line in output)
 
 
+async def test_apply_rejects_snapshot_argument_with_trailing_separator_before_client(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    factory_calls = 0
+    validator_calls = 0
+
+    def factory() -> FakeCleanupClient:
+        nonlocal factory_calls
+        factory_calls += 1
+        return FakeCleanupClient([])
+
+    def validator(path: Path, safe_root: Path) -> Path:
+        nonlocal validator_calls
+        del safe_root
+        validator_calls += 1
+        return path
+
+    code = await async_main(
+        ["--apply", "--snapshot", "/data/brilliant-mqtt/cleanup/"],
+        client_factory=factory,
+        effective_uid=lambda: 0,
+        path_validator=validator,
+        now_ms=lambda: 1,
+    )
+
+    assert code == 1
+    assert factory_calls == 0
+    assert validator_calls == 0
+    assert json.loads(capsys.readouterr().out)["success"] is False
+
+
 def test_atomic_report_write_is_compact_restrictive_and_replaces(tmp_path: Path) -> None:
     path = tmp_path / "cleanup.json"
     path.write_text("old secret", encoding="utf-8")
@@ -432,7 +483,8 @@ async def test_apply_deletes_serially_with_fresh_timestamps_and_between_only_sle
     ]
     assert len(writes) == 2
     assert json.loads(writes[0][1])["success"] is False
-    assert json.loads(writes[1][1])["success"] is True
+    assert json.loads(writes[1][1])["success"] is False
+    assert json.loads(writes[1][1])["deleted_ids"] == ["ha_first", "zzz_mirror_second"]
 
 
 async def test_apply_does_not_sleep_after_a_single_delete() -> None:
@@ -616,6 +668,108 @@ async def test_client_close_is_bounded_and_close_timeout_fails_the_command(
     assert json.loads(writes[-1])["success"] is False
 
 
+async def test_cancellation_suppressing_client_close_has_a_hard_wall_clock_bound(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    client = CancellationSuppressingCleanupClient([_snapshot()])
+    operation = asyncio.create_task(
+        async_main([], client_factory=lambda: client, now_ms=lambda: 1, close_timeout_s=0.001)
+    )
+
+    done, _pending = await asyncio.wait({operation}, timeout=0.2)
+    try:
+        assert operation in done
+        assert operation.result() == 1
+        assert json.loads(capsys.readouterr().out)["success"] is False
+        assert client.close_calls == 1
+        assert not client.close_finished.is_set()
+    finally:
+        client.close_release.set()
+        await asyncio.wait_for(client.close_finished.wait(), timeout=0.5)
+
+
+async def test_cancellation_delivered_during_client_close_propagates() -> None:
+    client = CancellationSuppressingCleanupClient([_snapshot()])
+    operation = asyncio.create_task(
+        async_main([], client_factory=lambda: client, now_ms=lambda: 1, close_timeout_s=1.0)
+    )
+    await asyncio.wait_for(client.close_started.wait(), timeout=0.5)
+
+    operation.cancel()
+
+    done, _pending = await asyncio.wait({operation}, timeout=0.2)
+    try:
+        assert operation in done
+        with pytest.raises(asyncio.CancelledError):
+            operation.result()
+        assert not client.close_finished.is_set()
+    finally:
+        client.close_release.set()
+        await asyncio.wait_for(client.close_finished.wait(), timeout=0.5)
+
+
+async def test_apply_keeps_durable_failure_until_close_and_final_success_write(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    client = FakeCleanupClient([_snapshot()])
+    accepted: list[str] = []
+
+    def reject_success(path: Path, payload: str) -> None:
+        del path
+        if json.loads(payload)["success"]:
+            raise OSError("final success write rejected")
+        accepted.append(payload)
+
+    code = await async_main(
+        ["--apply", "--snapshot", "/safe/cleanup/report.json"],
+        client_factory=lambda: client,
+        effective_uid=lambda: 0,
+        safe_root=Path("/safe/cleanup"),
+        path_validator=lambda path, safe_root: path,
+        now_ms=lambda: 1,
+        report_writer=reject_success,
+    )
+
+    output = json.loads(capsys.readouterr().out)
+    assert code == 1
+    assert output["success"] is False
+    assert client.close_calls == 1
+    assert len(accepted) == 1
+    assert json.loads(accepted[0])["success"] is False
+
+
+async def test_apply_persists_success_only_after_client_close(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    client = FakeCleanupClient([_snapshot()])
+    events: list[str] = []
+
+    def record_write(path: Path, payload: str) -> None:
+        del path
+        events.append(f"write:{json.loads(payload)['success']}")
+
+    original_close = client.close
+
+    async def record_close() -> None:
+        events.append("close")
+        await original_close()
+
+    client.close = record_close  # type: ignore[method-assign]
+    code = await async_main(
+        ["--apply", "--snapshot", "/safe/cleanup/report.json"],
+        client_factory=lambda: client,
+        effective_uid=lambda: 0,
+        safe_root=Path("/safe/cleanup"),
+        path_validator=lambda path, safe_root: path,
+        now_ms=lambda: 1,
+        report_writer=record_write,
+    )
+
+    assert code == 0
+    assert json.loads(capsys.readouterr().out)["success"] is True
+    assert events == ["write:False", "close", "write:True"]
+
+
 def test_help_and_argument_errors_do_not_construct_a_live_client() -> None:
     calls = 0
 
@@ -715,3 +869,87 @@ async def test_native_delete_calls_the_processors_message_bus_client_directly(
     await client.delete_peripheral("own-device", "ha_native", 1234)
 
     assert calls == [("own-device", "ha_native", 1234)]
+
+
+class _CancellationSuppressingShutdown:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.finished = asyncio.Event()
+        self.calls = 0
+
+    async def shutdown(self) -> None:
+        self.calls += 1
+        self.started.set()
+        while not self.release.is_set():
+            try:
+                await self.release.wait()
+            except asyncio.CancelledError:
+                continue
+        self.finished.set()
+
+
+class _RecordingShutdown:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def shutdown(self) -> None:
+        self.calls += 1
+
+
+async def test_native_shutdown_step_has_a_hard_wall_clock_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observer = _CancellationSuppressingShutdown()
+    processor = _RecordingShutdown()
+    client = NativeCleanupClient()
+    client._observer = observer
+    client._processor = processor
+    monkeypatch.setattr(cleanup_module, "_NATIVE_CLOSE_STEP_TIMEOUT_S", 0.001)
+    operation = asyncio.create_task(client.close())
+
+    done, _pending = await asyncio.wait({operation}, timeout=0.2)
+    try:
+        assert operation in done
+        with pytest.raises(RuntimeError, match="native cleanup client close failed"):
+            operation.result()
+        assert processor.calls == 1
+        assert not observer.finished.is_set()
+    finally:
+        observer.release.set()
+        await asyncio.wait_for(observer.finished.wait(), timeout=0.5)
+        if not operation.done():
+            await asyncio.wait({operation}, timeout=0.5)
+        try:
+            operation.result()
+        except BaseException:
+            pass
+
+
+async def test_cancellation_during_native_shutdown_propagates_and_attempts_processor() -> None:
+    observer = _CancellationSuppressingShutdown()
+    processor = _RecordingShutdown()
+    client = NativeCleanupClient()
+    client._observer = observer
+    client._processor = processor
+    operation = asyncio.create_task(client.close())
+    await asyncio.wait_for(observer.started.wait(), timeout=0.5)
+
+    operation.cancel()
+
+    done, _pending = await asyncio.wait({operation}, timeout=0.2)
+    try:
+        assert operation in done
+        with pytest.raises(asyncio.CancelledError):
+            operation.result()
+        assert processor.calls == 1
+        assert not observer.finished.is_set()
+    finally:
+        observer.release.set()
+        await asyncio.wait_for(observer.finished.wait(), timeout=0.5)
+        if not operation.done():
+            await asyncio.wait({operation}, timeout=0.5)
+        try:
+            operation.result()
+        except BaseException:
+            pass
