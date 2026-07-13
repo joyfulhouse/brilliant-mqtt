@@ -4,17 +4,20 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DEST="$ROOT/custom_components/brilliant_mqtt/agent_payload"
 WHEELS="$(mktemp -d)"
+trap 'rm -rf "$WHEELS"' EXIT
 
 rm -rf "$DEST"
 mkdir -p "$DEST/app" "$DEST/vendor"
 cp -R "$ROOT/src/brilliant_mqtt" "$DEST/app/brilliant_mqtt"
 find "$DEST/app" -name __pycache__ -type d -prune -exec rm -rf {} +
+find "$DEST/app" -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
 
-# Bundle the HA mirror app into its own payload subtree.
+# Keep the HA mirror compatibility payload only until Task 12 live validation.
 rm -rf "$DEST/ha_mirror"
 mkdir -p "$DEST/ha_mirror"
 cp -R "$ROOT/src/brilliant_ha_mirror" "$DEST/ha_mirror/brilliant_ha_mirror"
 find "$DEST/ha_mirror" -name __pycache__ -type d -prune -exec rm -rf {} +
+find "$DEST/ha_mirror" -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
 
 cp "$ROOT/deploy/brilliant-mqtt.service" "$DEST/brilliant-mqtt.service"
 cp "$ROOT/deploy/brilliant-ha-mirror.service" "$DEST/brilliant-ha-mirror.service"
@@ -35,11 +38,24 @@ mkdir -p "$BUSWD_DST"
 cp "$ROOT/src/brilliant_bus_watchdog"/*.py "$BUSWD_DST"/
 
 # Vendored pure-python MQTT deps for the panel's py3.10 (the panel has no pip).
-uv run --with pip python -m pip download aiomqtt paho-mqtt \
-  --python-version 3.10 --only-binary=:all: -d "$WHEELS" >/dev/null
+# Resolve the installed versions from the frozen project environment, then pin
+# the wheel download so rebuilding a committed payload cannot float on PyPI.
+AIOMQTT_VERSION="$(
+  uv run --frozen python -c 'import importlib.metadata as m; print(m.version("aiomqtt"))'
+)"
+PAHO_MQTT_VERSION="$(
+  uv run --frozen python -c 'import importlib.metadata as m; print(m.version("paho-mqtt"))'
+)"
+TYPING_EXTENSIONS_VERSION="$(
+  uv run --frozen python -c 'import importlib.metadata as m; print(m.version("typing-extensions"))'
+)"
+uv run --frozen --with pip python -m pip download \
+  "aiomqtt==$AIOMQTT_VERSION" "paho-mqtt==$PAHO_MQTT_VERSION" \
+  "typing-extensions==$TYPING_EXTENSIONS_VERSION" \
+  --no-deps --python-version 3.10 --only-binary=:all: -d "$WHEELS" >/dev/null
 for whl in "$WHEELS"/*.whl; do unzip -qo "$whl" -d "$DEST/vendor"; done
 rm -rf "$DEST"/vendor/*.dist-info
 
-VERSION="$(uv run python -c 'import brilliant_mqtt; print(brilliant_mqtt.__version__)')"
+VERSION="$(uv run --frozen python -c 'import brilliant_mqtt; print(brilliant_mqtt.__version__)')"
 printf '%s' "$VERSION" > "$DEST/VERSION"
 echo "payload built: $DEST (agent $VERSION)"

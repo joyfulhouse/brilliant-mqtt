@@ -1,0 +1,23 @@
+[Unit]
+# Reference systemd unit for the on-panel bridge. The Ansible role renders this
+# into the panel (lives under /var-backed paths so it survives OTA; if
+# /etc/systemd/system does not survive OTA, the role re-installs it post-update).
+Description=Brilliant message-bus -> MQTT bridge
+After=message_bus.service network-online.target
+Wants=message_bus.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/brilliant-mqtt.env
+Environment=PYTHONPATH=/var/brilliant-mqtt/app:/var/brilliant-mqtt/vendor
+ExecStart=/data/switch-embedded/env/bin/python3 -m brilliant_mqtt
+Restart=always
+RestartSec=5
+# Resource caps so a bug cannot degrade the panel UI:
+Nice=10
+MemoryMax=96M
+CPUQuota=20%
+OOMScoreAdjust=500
+
+[Install]
+WantedBy=multi-user.target

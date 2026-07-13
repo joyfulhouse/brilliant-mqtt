@@ -13,6 +13,13 @@ jobs:
       - uses: astral-sh/setup-uv@v7
       - run: uv python install 3.10
       - run: uv sync
+      - name: Build panel payload
+        run: scripts/build_payload.sh
+      - name: Verify generated payload is committed
+        run: |
+          git diff --exit-code -- custom_components/brilliant_mqtt/agent_payload
+          test -z "$(git ls-files --others --exclude-standard -- custom_components/brilliant_mqtt/agent_payload)"
+          test -z "$(git ls-files --others --ignored --exclude-standard -- custom_components/brilliant_mqtt/agent_payload)"
       - run: uv run ruff check
       - run: uv run ruff format --check
       - run: uv run mypy --strict src tests

@@ -1,0 +1,40 @@
+[Unit]
+# Reference systemd unit for the on-panel HA-mirror agent (the reverse bridge:
+# Home Assistant entities reflected as native, controllable Brilliant panel
+# peripherals). Runs on every panel but is ACTIVE only on the elected leader
+# (priority election over a retained MQTT claim topic), so exactly one panel
+# hosts the mirrored peripherals home-wide. The interpreter is the panel's own
+# py3.10 running `python -m brilliant_ha_mirror`; it opens a Home Assistant
+# WebSocket connection (state + service calls) and hosts the mirrors on the
+# panel's own message-bus device. Lives under /var so it survives OTA; the HA
+# integration re-installs it post-update. See INSTALL.md / docs for the env vars.
+Description=Brilliant HA mirror (Home Assistant entities as native panel devices)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Provides PANEL, HA_WS_URL, HA_TOKEN, MIRROR_LABEL, LEADER_PRIORITY,
+# LEADER_HEARTBEAT_SECONDS, ROOM_OVERRIDES, LOG_LEVEL, and the broker creds
+# MQTT_HOST / MQTT_USERNAME / MQTT_PASSWORD / MQTT_PORT (for leader election).
+EnvironmentFile=/etc/brilliant-ha-mirror.env
+# PYTHONPATH must reach: the mirror app; the brilliant_mqtt bridge package (the
+# mirror reuses its MQTT adapter + leader election) and its vendored aiomqtt at
+# /var/brilliant-mqtt/{app,vendor}; and the panel firmware at /data/switch-embedded
+# (hosting.py imports lib.*/peripherals.*, and the panel's own aiohttp lives in
+# the interpreter's env). The panel bridge must be installed for the mirror to run.
+Environment=PYTHONPATH=/var/brilliant-ha-mirror/app:/var/brilliant-mqtt/app:/var/brilliant-mqtt/vendor:/data/switch-embedded
+ExecStart=/data/switch-embedded/env/bin/python3 -m brilliant_ha_mirror
+Restart=always
+RestartSec=5
+# Resource caps so a mirror bug can never degrade the panel UI. Nice=10 matches
+# the MQTT bridge (below the panel UI and the voice satellite). MemoryMax=150M
+# covers the WebSocket client, the MQTT connection, and a handful of hosted
+# peripherals; measure RSS on the pilot and tighten once steady state is known.
+Nice=10
+MemoryMax=150M
+CPUQuota=40%
+OOMScoreAdjust=600
+
+[Install]
+WantedBy=multi-user.target

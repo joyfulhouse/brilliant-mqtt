@@ -25,8 +25,13 @@ jobs:
           CONST="$(grep -oP 'VOICE_PAYLOAD_VERSION = "\K[^"]+' custom_components/brilliant_mqtt/const.py)"
           VOICE="$(uv run python -c 'import brilliant_voice; print(brilliant_voice.__version__)')"
           test "$CONST" = "$VOICE" || { echo "VOICE_PAYLOAD_VERSION $CONST != brilliant_voice $VOICE"; exit 1; }
-      - name: Build the bundled agent payload
-        run: ./scripts/build_payload.sh
+      - name: Build panel payload
+        run: scripts/build_payload.sh
+      - name: Verify generated payload is committed
+        run: |
+          git diff --exit-code -- custom_components/brilliant_mqtt/agent_payload
+          test -z "$(git ls-files --others --exclude-standard -- custom_components/brilliant_mqtt/agent_payload)"
+          test -z "$(git ls-files --others --ignored --exclude-standard -- custom_components/brilliant_mqtt/agent_payload)"
       - name: Build zip (manifest.json at the zip root, as HACS extracts it)
         run: cd custom_components/brilliant_mqtt && zip -r ../../brilliant_mqtt.zip . -x "*/__pycache__/*" -x "__pycache__/*" -x "voice_payload/*"
       - name: Build the voice payload (separate ~57 MB release asset; never in the HACS zip)
