@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
@@ -28,6 +29,8 @@ MODE_WATERMARK_LIMIT = 1_024
 EVENT_OUTBOX_LIMIT = 1_024
 RESULT_OUTBOX_LIMIT = 1_024
 PENDING_LIMIT = 1_024
+
+_STATE_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="scene-state")
 
 StateKind = Literal["scene", "mode"]
 StateKey = tuple[StateKind, str]
@@ -103,6 +106,11 @@ class LoadedSceneState:
 
 class StateValidationError(ValueError):
     """The whole persisted snapshot failed strict validation."""
+
+
+def state_executor() -> ThreadPoolExecutor:
+    """Return the process-wide total order for all scene state filesystem I/O."""
+    return _STATE_EXECUTOR
 
 
 def command_fingerprint_fields(
@@ -664,5 +672,6 @@ __all__ = [
     "atomic_write_state",
     "command_fingerprint_fields",
     "load_state",
+    "state_executor",
     "state_payload",
 ]

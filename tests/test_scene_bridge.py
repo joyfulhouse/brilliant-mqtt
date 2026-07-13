@@ -1304,12 +1304,14 @@ async def test_cancelled_persistence_keeps_snapshot_writes_serial_and_newest_win
     bridge = SceneBridge(bus, mqtt, _PANEL, path, FakeClockMs(_NOW_MS))
     await bridge.async_start()
 
-    await bus.emit(_execution("all_off", 100))
-    assert first_write_started.wait(timeout=0.1)
-    await bus.emit(_execution("all_off", 200))
-    before_shutdown_release = list(mqtt.published)
-    await asyncio.wait_for(bridge.async_shutdown(), timeout=0.2)
-    release_first_write.set()
+    try:
+        await bus.emit(_execution("all_off", 100))
+        assert first_write_started.wait(timeout=0.1)
+        await bus.emit(_execution("all_off", 200))
+        before_shutdown_release = list(mqtt.published)
+        await asyncio.wait_for(bridge.async_shutdown(), timeout=0.2)
+    finally:
+        release_first_write.set()
 
     for _ in range(200):
         try:
@@ -1325,6 +1327,76 @@ async def test_cancelled_persistence_keeps_snapshot_writes_serial_and_newest_win
     assert maximum_active == 1
     assert write_order.index(100) < write_order.index(200)
     assert mqtt.published == before_shutdown_release
+
+
+async def test_replacement_bridge_state_io_queues_behind_abandoned_old_writer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    blocked = threading.Event()
+    release = threading.Event()
+    old_write_finished = threading.Event()
+    observations: list[tuple[str, int | None]] = []
+    guard = threading.Lock()
+    real_load = scene_state.load_state
+    real_write = scene_state.atomic_write_state
+
+    def observed_load(path: Path) -> scene_state.LoadedSceneState:
+        loaded = real_load(path)
+        watermark = dict(loaded.state.watermarks).get((_PANEL, "all_off"))
+        with guard:
+            observations.append(("load", None if watermark is None else watermark.executed_at_ms))
+        return loaded
+
+    def observed_write(path: Path, state: scene_state.SceneState) -> None:
+        watermark = dict(state.watermarks).get((_PANEL, "all_off"))
+        executed_at_ms = None if watermark is None else watermark.executed_at_ms
+        with guard:
+            observations.append(("write", executed_at_ms))
+        if executed_at_ms == 100:
+            blocked.set()
+            assert release.wait(timeout=1)
+        real_write(path, state)
+        if executed_at_ms == 100:
+            old_write_finished.set()
+
+    monkeypatch.setattr(scene_bridge_module, "load_state", observed_load)
+    monkeypatch.setattr(scene_bridge_module, "atomic_write_state", observed_write)
+    path = tmp_path / "state.json"
+    old_bus = FakeBus(
+        [_execution()],
+        scoped_devices=[_scene_catalog("all_off"), _mode_catalog("away")],
+    )
+    old = SceneBridge(old_bus, FakeMqtt(), _PANEL, path, FakeClockMs(_NOW_MS))
+    await old.async_start()
+    replacement = SceneBridge(
+        FakeBus(
+            [_execution("all_off", 200)],
+            scoped_devices=[_scene_catalog("all_off"), _mode_catalog("away")],
+        ),
+        FakeMqtt(),
+        _PANEL,
+        path,
+        FakeClockMs(_NOW_MS),
+    )
+    try:
+        await old_bus.emit(_execution("all_off", 100))
+        assert blocked.wait(timeout=0.1)
+        await asyncio.wait_for(old.async_shutdown(), timeout=0.2)
+        replacement_start = asyncio.create_task(replacement.async_start())
+        await asyncio.sleep(0.02)
+        replacement_was_queued = not replacement_start.done()
+    finally:
+        release.set()
+    await asyncio.wait_for(replacement_start, timeout=0.2)
+    for _ in range(200):
+        if old_write_finished.is_set():
+            break
+        await asyncio.sleep(0.001)
+
+    assert replacement_was_queued is True
+    assert ("load", 100) in observations
+    assert json.loads(path.read_text())["watermarks"][_PANEL]["all_off"]["executed_at_ms"] == 200
+    await replacement.async_shutdown()
 
 
 async def test_event_capacity_blocks_new_physical_command_even_with_result_room(
@@ -1540,3 +1612,82 @@ async def test_shutdown_bounds_each_unsubscribe(tmp_path: Path) -> None:
 
     assert mqtt.subscriptions == []
     assert mqtt.unsubscriptions == [scene_command_topic(_PANEL), mode_command_topic(_PANEL)]
+
+
+class _CancellationResistantUnsubscribeMqtt(FakeMqtt):
+    def __init__(self) -> None:
+        super().__init__()
+        self.release = asyncio.Event()
+        self.started: set[str] = set()
+        self.cancelled: set[str] = set()
+
+    async def unsubscribe(self, topic: str) -> None:
+        await super().unsubscribe(topic)
+        self.started.add(topic)
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            self.cancelled.add(topic)
+            await self.release.wait()
+
+
+async def test_shutdown_abandons_cancellation_resistant_unsubscribe_tasks(
+    tmp_path: Path,
+) -> None:
+    mqtt = _CancellationResistantUnsubscribeMqtt()
+    bridge = SceneBridge(
+        FakeBus(
+            [_execution()],
+            scoped_devices=[_scene_catalog("all_off"), _mode_catalog("away")],
+        ),
+        mqtt,
+        _PANEL,
+        tmp_path / "state.json",
+        FakeClockMs(_NOW_MS),
+    )
+    await bridge.async_start()
+    started_at = asyncio.get_running_loop().time()
+
+    await asyncio.wait_for(bridge.async_shutdown(), timeout=0.2)
+
+    try:
+        assert asyncio.get_running_loop().time() - started_at < 0.15
+        assert mqtt.started == {scene_command_topic(_PANEL), mode_command_topic(_PANEL)}
+        assert mqtt.cancelled == mqtt.started
+        assert len(bridge._abandoned_cleanup_tasks) == 2
+    finally:
+        mqtt.release.set()
+    for _ in range(200):
+        if not bridge._abandoned_cleanup_tasks:
+            break
+        await asyncio.sleep(0.001)
+    assert bridge._abandoned_cleanup_tasks == set()
+
+
+async def test_restart_is_fail_closed_until_abandoned_unsubscribe_finishes(
+    tmp_path: Path,
+) -> None:
+    mqtt = _CancellationResistantUnsubscribeMqtt()
+    bus = FakeBus(
+        [_execution()],
+        scoped_devices=[_scene_catalog("all_off"), _mode_catalog("away")],
+    )
+    bridge = SceneBridge(bus, mqtt, _PANEL, tmp_path / "state.json", FakeClockMs(_NOW_MS))
+    await bridge.async_start()
+    initial_reads = list(bus.scoped_reads)
+    await bridge.async_shutdown()
+
+    try:
+        with pytest.raises(RuntimeError, match="cleanup incomplete"):
+            await bridge.async_start()
+        assert bus.scoped_reads == initial_reads
+        assert mqtt.subscriptions == []
+    finally:
+        mqtt.release.set()
+    for _ in range(200):
+        if not bridge._abandoned_cleanup_tasks:
+            break
+        await asyncio.sleep(0.001)
+    await bridge.async_start()
+    assert mqtt.subscriptions == [scene_command_topic(_PANEL), mode_command_topic(_PANEL)]
+    await bridge.async_shutdown()

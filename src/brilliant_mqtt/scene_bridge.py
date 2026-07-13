@@ -6,7 +6,6 @@ import asyncio
 import logging
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Coroutine
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
@@ -61,6 +60,7 @@ from brilliant_mqtt.scene_state import (
     atomic_write_state,
     command_fingerprint_fields,
     load_state,
+    state_executor,
 )
 
 logger = logging.getLogger(__name__)
@@ -158,7 +158,7 @@ class SceneBridge:
         self._operation_generation = 0
         self._state_version = 0
         self._persisted_version = 0
-        self._state_executor: ThreadPoolExecutor | None = None
+        self._abandoned_cleanup_tasks: set[asyncio.Task[None]] = set()
 
     async def async_start(self) -> None:
         """Register callbacks, seed history, publish catalogs, and accept commands."""
@@ -168,15 +168,12 @@ class SceneBridge:
             if self._start_task is not None and not self._start_task.done():
                 startup_task = self._start_task
             else:
+                if self._abandoned_cleanup_tasks:
+                    raise RuntimeError("scene bridge cleanup incomplete")
                 self._stopping = False
                 self._epoch += 1
                 self._startup_active = True
                 self._startup_buffered_execution = None
-                if self._state_executor is None:
-                    self._state_executor = ThreadPoolExecutor(
-                        max_workers=1,
-                        thread_name_prefix="scene-state",
-                    )
                 if not self._callbacks_registered:
                     self._bus.on_change(self._bus_change_callback)
                     self._bus.on_reconnect(self._reconnect_callback)
@@ -250,25 +247,45 @@ class SceneBridge:
             self._scene_pending.clear()
             self._mode_pending.clear()
         await self._async_release_topics(topics)
-        executor = self._state_executor
-        self._state_executor = None
-        if executor is not None:
-            executor.shutdown(wait=False)
 
     async def _async_release_topics(self, topics: list[str]) -> None:
+        cleanup_tasks: set[asyncio.Task[None]] = set()
         for topic in topics:
             if topic not in self._subscribed_topics:
                 continue
             self._subscribed_topics.remove(topic)
-            try:
-                await asyncio.wait_for(
-                    self._mqtt.unsubscribe(topic),
-                    timeout=_UNSUBSCRIBE_TIMEOUT_SECONDS,
-                )
-            except asyncio.TimeoutError:
-                logger.warning("scene bridge unsubscribe timed out; continuing")
-            except Exception:
-                logger.exception("scene bridge unsubscribe failed; continuing")
+            task = asyncio.create_task(self._mqtt.unsubscribe(topic))
+            cleanup_tasks.add(task)
+            self._abandoned_cleanup_tasks.add(task)
+            task.add_done_callback(self._cleanup_task_done)
+        if not cleanup_tasks:
+            return
+        try:
+            done, pending = await asyncio.wait(
+                cleanup_tasks,
+                timeout=_UNSUBSCRIBE_TIMEOUT_SECONDS,
+            )
+        except asyncio.CancelledError:
+            for task in cleanup_tasks:
+                if not task.done():
+                    task.cancel()
+            raise
+        for task in done:
+            self._cleanup_task_done(task)
+        for task in pending:
+            logger.warning("scene bridge unsubscribe timed out; abandoning cleanup")
+            task.cancel()
+
+    def _cleanup_task_done(self, task: asyncio.Task[None]) -> None:
+        if task not in self._abandoned_cleanup_tasks:
+            return
+        self._abandoned_cleanup_tasks.discard(task)
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("scene bridge unsubscribe failed; continuing")
 
     async def _bus_change_callback(self, device: BrilliantDevice) -> None:
         task = self._spawn_callback(self._async_bus_change(device))
@@ -300,14 +317,17 @@ class SceneBridge:
         return self._track_task(coroutine)
 
     async def _async_load_state(self) -> LoadedSceneState:
-        executor = self._state_executor
-        if executor is None:
-            raise RuntimeError("scene state executor unavailable")
         loop = asyncio.get_running_loop()
         loaded: list[LoadedSceneState] = []
 
         async def run() -> None:
-            loaded.append(await loop.run_in_executor(executor, load_state, self._watermark_path))
+            loaded.append(
+                await loop.run_in_executor(
+                    state_executor(),
+                    load_state,
+                    self._watermark_path,
+                )
+            )
 
         await self._track_task(run())
         return loaded[0]
@@ -360,11 +380,13 @@ class SceneBridge:
             return self._persisted_version >= version
 
     async def _async_write_state(self, state: SceneState) -> None:
-        executor = self._state_executor
-        if executor is None:
-            raise RuntimeError("scene state executor unavailable")
         loop = asyncio.get_running_loop()
-        write = loop.run_in_executor(executor, atomic_write_state, self._watermark_path, state)
+        write = loop.run_in_executor(
+            state_executor(),
+            atomic_write_state,
+            self._watermark_path,
+            state,
+        )
         await asyncio.shield(write)
 
     def _restore_pending_maps(self) -> None:
