@@ -29,6 +29,7 @@ custom_components/brilliant_mqtt/voice_payload/
 
 # ─── Tooling caches ──────────────────────────────────────────────────────
 .worktrees/
+.superpowers/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
