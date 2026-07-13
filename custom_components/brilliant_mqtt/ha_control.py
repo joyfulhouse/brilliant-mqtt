@@ -161,9 +161,10 @@ class HaControlPlane:
                 self._started and self._manifest is not None and not self._hard_fenced
             )
             raise
-        self._hard_fenced = False
         self._rebuilding = False
-        self._accept_commands = self._started and self._manifest is not None
+        self._accept_commands = (
+            self._started and self._manifest is not None and not self._hard_fenced
+        )
 
     async def async_detach(self, entry_id: str) -> None:
         """Detach one panel and stop only after no enabled entries remain."""
@@ -174,16 +175,19 @@ class HaControlPlane:
         self._rebuilding = False
         self._hard_fenced = True
         self._command_fence_generation += 1
+        fence_generation = self._command_fence_generation
         try:
             async with self._lifecycle_lock:
                 self._entries.pop(entry_id, None)
                 await self._async_reload_settings_locked()
         except BaseException:
-            self._rebuilding = False
+            if fence_generation == self._command_fence_generation:
+                self._rebuilding = False
             raise
-        self._hard_fenced = False
-        self._rebuilding = False
-        self._accept_commands = self._started and self._manifest is not None
+        if fence_generation == self._command_fence_generation:
+            self._hard_fenced = False
+            self._rebuilding = False
+            self._accept_commands = self._started and self._manifest is not None
 
     async def async_reload_settings(self) -> None:
         """Re-elect the settings owner and rebuild only when necessary."""
@@ -198,9 +202,10 @@ class HaControlPlane:
                 self._started and self._manifest is not None and not self._hard_fenced
             )
             raise
-        self._hard_fenced = False
         self._rebuilding = False
-        self._accept_commands = self._started and self._manifest is not None
+        self._accept_commands = (
+            self._started and self._manifest is not None and not self._hard_fenced
+        )
 
     async def async_start(self) -> None:
         """Start publication if an enabled attached entry exists."""
@@ -213,20 +218,23 @@ class HaControlPlane:
             self._rebuilding = False
             self._accept_commands = False
             raise
-        self._hard_fenced = False
         self._rebuilding = False
-        self._accept_commands = self._started and self._manifest is not None
+        self._accept_commands = (
+            self._started and self._manifest is not None and not self._hard_fenced
+        )
 
     async def async_stop(self) -> None:
         """Stop subscriptions/listeners and cancel pending work."""
         self._accept_commands = False
         self._hard_fenced = True
         self._command_fence_generation += 1
+        fence_generation = self._command_fence_generation
         try:
             async with self._lifecycle_lock:
                 await self._async_stop_locked()
         finally:
-            self._hard_fenced = False
+            if fence_generation == self._command_fence_generation:
+                self._hard_fenced = False
 
     async def _async_reload_settings_locked(self) -> None:
         owner = self._enabled_owner()
@@ -389,13 +397,15 @@ class HaControlPlane:
 
     async def _async_command_received(self, message: ReceiveMessage) -> None:
         generation = self._command_fence_generation
-        if self._hard_fenced or (not self._accept_commands and not self._rebuilding):
+        hard_fenced_at_receipt = self._hard_fenced
+        if not hard_fenced_at_receipt and not self._accept_commands and not self._rebuilding:
             return
         async with self._lifecycle_lock:
             if (
                 not self._started
                 or not self._accept_commands
                 or self._hard_fenced
+                or hard_fenced_at_receipt
                 or generation != self._command_fence_generation
             ):
                 return

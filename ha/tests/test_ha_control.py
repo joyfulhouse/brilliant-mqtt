@@ -869,6 +869,152 @@ async def test_detach_fences_a_queued_command_while_first_command_drains(
 
 
 @pytest.mark.allow_lingering_timers
+async def test_soft_rebuild_cannot_clear_hard_detach_fence(
+    hass: HomeAssistant, mqtt_mock: MqttMockHAClient
+) -> None:
+    _selected_entity(hass, "switch.a", label="label-a")
+    entity_b = _selected_entity(hass, "switch.b", label="label-b")
+    entity_c = _selected_entity(hass, "switch.c", label="label-c")
+    calls: list[ServiceCall] = []
+    hass.services.async_register("switch", "turn_on", calls.append)
+    zulu = _entry(hass, "zulu", label="label-c")
+    alpha = _entry(hass, "alpha", label="label-a")
+    plane = get_control_plane(hass)
+    await plane.async_attach(zulu)
+    await plane.async_attach(alpha)
+    real_publish = mqtt.async_publish
+    b_started = asyncio.Event()
+    release_b = asyncio.Event()
+    c_started = asyncio.Event()
+    release_c = asyncio.Event()
+
+    async def block_candidate_states(
+        hass: HomeAssistant,
+        topic: str,
+        payload: str | bytes | int | float | None,
+        qos: int = 0,
+        retain: bool = False,
+        encoding: str | None = "utf-8",
+        *,
+        message_expiry_interval: int | None = None,
+    ) -> None:
+        if topic == state_topic(stable_id(entity_b.entity_id)):
+            b_started.set()
+            await release_b.wait()
+        elif topic == state_topic(stable_id(entity_c.entity_id)):
+            c_started.set()
+            await release_c.wait()
+        await real_publish(
+            hass,
+            topic,
+            payload,
+            qos,
+            retain,
+            encoding,
+            message_expiry_interval=message_expiry_interval,
+        )
+
+    hass.config_entries.async_update_entry(
+        alpha, data={**alpha.data, CONF_HA_CONTROL_LABEL: "label-b"}
+    )
+    with patch(
+        "custom_components.brilliant_mqtt.ha_control.mqtt.async_publish",
+        side_effect=block_candidate_states,
+    ):
+        soft_reload = hass.async_create_task(plane.async_reload_settings())
+        await b_started.wait()
+        detach = hass.async_create_task(plane.async_detach(alpha.entry_id))
+        await asyncio.sleep(0)
+        assert plane._hard_fenced is True
+        release_b.set()
+        await c_started.wait()
+        await soft_reload
+
+        command_id, payload = _command_payload(entity_c.entity_id, "turn_on", None)
+        async_fire_mqtt_message(hass, command_topic(stable_id(entity_c.entity_id)), payload)
+        await asyncio.sleep(0)
+        release_c.set()
+        await detach
+        await hass.async_block_till_done()
+
+    assert calls == []
+    assert not any(
+        _payload(call)["accepted"] is True
+        for call in _published(mqtt_mock, result_topic(command_id))
+    )
+    await plane.async_detach(zulu.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_newer_concurrent_detach_owns_hard_fence_until_it_completes(
+    hass: HomeAssistant, mqtt_mock: MqttMockHAClient
+) -> None:
+    _selected_entity(hass, "switch.a", label="label-a")
+    entity_b = _selected_entity(hass, "switch.b", label="label-b")
+    entity_c = _selected_entity(hass, "switch.c", label="label-c")
+    zulu = _entry(hass, "zulu", label="label-c")
+    beta = _entry(hass, "beta", label="label-b")
+    alpha = _entry(hass, "alpha", label="label-a")
+    plane = get_control_plane(hass)
+    await plane.async_attach(zulu)
+    await plane.async_attach(beta)
+    await plane.async_attach(alpha)
+    real_publish = mqtt.async_publish
+    b_started = asyncio.Event()
+    release_b = asyncio.Event()
+    c_started = asyncio.Event()
+    release_c = asyncio.Event()
+
+    async def block_candidate_states(
+        hass: HomeAssistant,
+        topic: str,
+        payload: str | bytes | int | float | None,
+        qos: int = 0,
+        retain: bool = False,
+        encoding: str | None = "utf-8",
+        *,
+        message_expiry_interval: int | None = None,
+    ) -> None:
+        if topic == state_topic(stable_id(entity_b.entity_id)):
+            b_started.set()
+            await release_b.wait()
+        elif topic == state_topic(stable_id(entity_c.entity_id)):
+            c_started.set()
+            await release_c.wait()
+        await real_publish(
+            hass,
+            topic,
+            payload,
+            qos,
+            retain,
+            encoding,
+            message_expiry_interval=message_expiry_interval,
+        )
+
+    with patch(
+        "custom_components.brilliant_mqtt.ha_control.mqtt.async_publish",
+        side_effect=block_candidate_states,
+    ):
+        first_detach = hass.async_create_task(plane.async_detach(alpha.entry_id))
+        await b_started.wait()
+        second_detach = hass.async_create_task(plane.async_detach(beta.entry_id))
+        await asyncio.sleep(0)
+        newer_generation = plane._command_fence_generation
+        release_b.set()
+        await c_started.wait()
+        await first_detach
+        hard_fenced_while_newer_pending = plane._hard_fenced
+        generation_while_newer_pending = plane._command_fence_generation
+        release_c.set()
+        await second_detach
+
+    assert hard_fenced_while_newer_pending is True
+    assert generation_while_newer_pending == newer_generation
+    assert plane._hard_fenced is False
+    await plane.async_detach(zulu.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
 @pytest.mark.parametrize(
     ("domain", "kind", "invalid_value"),
     [
