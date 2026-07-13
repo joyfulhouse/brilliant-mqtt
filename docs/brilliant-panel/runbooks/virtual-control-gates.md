@@ -130,6 +130,127 @@ same exact identity remains after ten seconds. It refuses the protected
 
 ## VC5 physical-slider acceptance
 
+### Single-light preflight
+
+The repository pilot is
+`tools/brilliant_vc/single_light_pilot.py`. It is not installed or started by
+the panel payload. Copy it only to the ignored, bounded pilot workspace after
+VC0 through VC4 are recorded `pass` in the gate ledger.
+
+Prepare a root-owned, mode `0600` topology snapshot from a scoped VC device
+read. Keep the gate ledger root-owned and mode `0400` or `0600` as well; the
+pilot rejects symlinks, other owners, broader modes, oversized files, and a
+ledger `run_id` mismatch. The topology snapshot's complete schema is:
+
+```json
+{
+  "schema_version": 1,
+  "owner_device_id": "<32-lowercase-hex-VC-id>",
+  "device_type": 6,
+  "peripherals": [
+    {
+      "owner_device_id": "<same-VC-id>",
+      "peripheral_id": "<VC-owned-id>",
+      "role": "configuration"
+    }
+  ],
+  "room_ids": ["<opaque-Brilliant-room-id>"]
+}
+```
+
+Every non-configuration VC peripheral is included with role `other`. Do not
+copy this snapshot into Git. The pilot does not trust it by itself: every dry
+run opens a short-lived read-only observer against the isolated VC socket,
+requires that socket's owning ID to equal the provisioned VC ID, reads only the
+VC's own Device record plus
+`configuration_virtual_device/home_configuration`, decodes `Rooms`, and
+requires the full live room-ID set and normalized VC peripheral set to match
+the snapshot exactly. Zero or multiple VC-owned configuration candidates is
+blocked. The shared
+`brilliant_virtual_device_configuration` is always rejected.
+
+Dry run (line continuations shown only for readability):
+
+```text
+python -m tools.brilliant_vc.single_light_pilot \
+  --vc-identity-dir /data/brilliant-vc/identity \
+  --topology-json <root-only-ignored-topology.json> \
+  --ledger <ignored-gate-ledger.json> \
+  --run-id <same-ledger-run-id> \
+  --stable-id <HA-control-plane-UUID> \
+  --display-name "HA VC Pilot Light" \
+  --room-id <catalog-room-id> \
+  --office-device-id <physical-Office-device-id> \
+  --vc-socket /run/brilliant-vc/server_socket \
+  --runtime-s 1800
+```
+
+The only output is a redacted VC ID, stable peripheral ID, display name,
+boolean room/config-link validation, runtime, MQTT topics, and
+`DRY RUN — no host started`. The dry run reads the isolated bus but registers
+nothing. It resolves the socket path before use and refuses the physical
+Control socket, traversal or symlink escape from the dedicated VC runtime, the
+physical Office identity, reserved virtual devices, any non-DeviceType-6 owner,
+a stale topology snapshot, or an absent/ambiguous VC-owned configuration
+peripheral.
+
+Live mode additionally requires root, `--apply`, `--mqtt-host`, and optional
+root-only MQTT credential input. It accepts no HA URL or token. Start the VC
+monitor first, then add:
+
+```text
+  --apply --mqtt-host <LAN-broker> --mqtt-port 1883 \
+  --mqtt-username <optional-user> \
+  --mqtt-password-file <optional-root-only-file>
+```
+
+Before apply-mode live bus preflight, the process acquires a nonblocking
+root-owned mode `0600` lease at
+`<canonical-VC-runtime>/single-light-pilot.lock`; the parent runtime must be a
+real root-owned mode `0700` directory. The lease remains held through native
+cleanup, so a second invocation cannot race registration or delete the first
+invocation's peripheral. A stale unlocked lease file is reusable and is not a
+registration.
+
+The host creates exactly one `PeripheralHost`, one stable
+`ha_vc_<stable-uuid-hex>` `LIGHT` registration, and passes only the disposable
+VC ID as `virtual_device_id`. It subscribes to the retained v1 HA state topic
+before accepting panel commands. Every MQTT reconnect creates a bounded client
+session while preserving that one host, fences commands and locally reflects
+safe `off`, resubscribes, and requires a fresh authoritative replay within 15
+seconds. An identical retained replay is sufficient to clear the transport
+fence. HA `unknown`/`unavailable` publications keep commands fenced until a
+newer available publication arrives. Sequence resets after HA restart are
+accepted only with a strictly newer `generated_at_ms`; older publications are
+rejected.
+
+Framework-internal state reflection cannot invoke the push callbacks. The
+closed bus boundary accepts only bounded integer values or canonical decimal
+integer strings. Only `on` and `intensity` pushes become non-retained MQTT
+commands; all metadata changes fail closed. `--runtime-s` is the
+180–1800-second live registration-through-cleanup budget; the final 120 seconds
+are reserved for bounded disconnect/deletion and the two absence reads. The
+read-only topology preflight occurs before this live budget and has its own
+per-operation bounds. On SIGINT, SIGTERM, timeout, cancellation, or an exception, deletion
+uses an explicit millisecond timestamp and two short-lived scoped observers 30
+seconds apart must both report absence before local cleanup succeeds. The
+two-panel/app and physical-slider snapshots below remain separate acceptance
+evidence; local absence alone is insufficient.
+
+The exact MQTT mappings are:
+
+| Native push | HA command `kind` | `value` |
+|---|---|---:|
+| `on=1` | `turn_on` | `null` |
+| `on=0` | `turn_off` | `null` |
+| `intensity=0..1000` | `set_brightness` | integer `0..255`, round-half-up |
+
+Every command carries a new UUID, the current retained-state sequence, and a
+current millisecond timestamp. Every identical push at the same observed
+sequence is suppressed even when another variable was pushed between repeats;
+an accepted HA publication clears the per-sequence deduplication set. HA state
+is authoritative and returns through the internal, non-commanding update path.
+
 Tile rendering and physical-slider assignability are separate gates. After one
 VC-hosted `LIGHT` renders:
 

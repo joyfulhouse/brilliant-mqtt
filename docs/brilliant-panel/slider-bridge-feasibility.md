@@ -79,6 +79,40 @@ HA brightness 0–255 must be converted to Brilliant intensity 0–1000 with
 round-half-up behavior in both directions. A state echo or retry must not become
 a second HA command.
 
+The bounded implementation now lives in
+`tools/brilliant_vc/single_light_pilot.py`. Off-panel tests prove the exact
+schema, scaling boundaries, stable ID, canonical socket isolation, MQTT
+envelopes, HA-restart sequence epochs, unavailable-state fencing, interleaved
+duplicate suppression, reconnect/resubscribe behavior, one-registration
+lifecycle with a cross-process runtime lease, bounded cancellation cleanup,
+and idempotent cleanup. Its apply-mode lease is acquired before live bus
+preflight and held through cleanup, preventing concurrent pilots from racing or
+deleting one another's registration. Its live preflight also re-reads the
+isolated VC bus and refuses to register unless all of the following are
+simultaneously true:
+
+- the message-bus owning identity is the provisioned 32-hex VC ID, not Office;
+- the own Device record reports DeviceType 6;
+- the selected room exists in the decoded scoped `home_configuration.rooms`;
+- the complete room and VC peripheral sets match the root-only topology
+  snapshot, with exactly one VC-owned configuration-type peripheral; and
+- the configuration link is not
+  `brilliant_virtual_device_configuration`.
+
+This implementation evidence does not advance the live status. No provisioned
+VC identity, configuration peripheral, or native selector entry has yet been
+observed. In particular, the firmware may provision no suitable VC-owned
+configuration peripheral; that result is an explicit blocked outcome, not a
+reason to borrow a shared or physical configuration.
+
+The existing HA control-plane consumer requires `null` for `turn_on` and
+`turn_off`, and an integer 0–255 for `set_brightness`. The pilot emits that
+exact contract, carries the latest observed HA sequence, never retains a
+command, and applies HA feedback through the framework's internal updater so it
+cannot echo into another command. A broker reconnect keeps the single native
+host but fences commands until retained HA authority is replayed; transient HA
+unavailability similarly shows safe `off` and remains fenced until recovery.
+
 ## Provisioning boundary
 
 The firmware ships

@@ -182,7 +182,13 @@ class GateLedger:
     def load(cls, path: Path) -> GateLedger:
         """Load and fully validate a ledger from disk."""
 
-        payload: object = json.loads(path.read_text(encoding="utf-8"))
+        return cls.loads(path.read_text(encoding="utf-8"))
+
+    @classmethod
+    def loads(cls, serialized: str) -> GateLedger:
+        """Load and fully validate a ledger from an already trusted read."""
+
+        payload: object = json.loads(serialized)
         cls._validate_payload(payload)
         data = cast(dict[str, object], payload)
         raw_records = cast(list[object], data["records"])

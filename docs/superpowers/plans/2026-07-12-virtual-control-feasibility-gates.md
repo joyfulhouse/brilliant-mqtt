@@ -469,7 +469,7 @@ VC4 PASS requires: no abort, no new peer-add timeout/cloud disconnect/reconnect 
 - Modify: `docs/brilliant-panel/runbooks/virtual-control-gates.md`
 
 **Interfaces:**
-- CLI on Office: `python single_light_pilot.py --vc-identity-dir /data/brilliant-vc/identity --stable-id <uuid> --display-name "HA VC Pilot Light" --room-id <catalog-id> --runtime-s 1800`.
+- CLI on Office: `python -m tools.brilliant_vc.single_light_pilot --vc-identity-dir /data/brilliant-vc/identity --topology-json <root-only-ignored-snapshot> --ledger <ignored-ledger> --run-id <same-ledger-run-id> --stable-id <uuid> --display-name "HA VC Pilot Light" --room-id <catalog-id> --office-device-id <physical-id> --vc-socket /run/brilliant-vc/server_socket --runtime-s 1800`.
 - Exactly one `PeripheralHost`, one LIGHT peripheral, one registration at a time, and one MQTT entity command/state route.
 
 - [ ] **Step 1: Write failing schema/guard/lifecycle tests with firmware fakes**
@@ -501,9 +501,27 @@ Expected: FAIL because the pilot module is absent.
 
 - [ ] **Step 3: Implement one typed framework peripheral and shared host**
 
-Defer every Brilliant import until `main()`. Decode room catalog with a scoped `configuration_virtual_device/home_configuration` read and require the supplied room ID to exist. Discover the provisioned VC's own configuration peripheral from its home-graph record; never borrow `brilliant_virtual_device_configuration` or a physical Control configuration.
+Defer every Brilliant import until live adapter execution. Decode the room
+catalog with a scoped `configuration_virtual_device/home_configuration` read
+and require the supplied room ID to exist. Discover the provisioned VC's own
+configuration peripheral from its home-graph record; never borrow
+`brilliant_virtual_device_configuration` or a physical Control configuration.
+Require exactly one configuration-type candidate on the VC's own Device record
+and compare it with a root-only, ignored topology snapshot. Both dry run and
+live mode re-read these facts from the dedicated VC socket before registration;
+the complete room and peripheral sets must match. Canonicalize the socket and
+reject traversal or symlink escape to the physical Control bus.
 
 Use `PeripheralHost`/`HostedStartableSpec` with `virtual_device_id=<provisioned VC device ID>`. Reject `None`, `brilliant_virtual_device`, `configuration_virtual_device`, `ble_mesh`, or the Office physical ID. The push callbacks publish v1 entity commands to HA; retained v1 state updates drive pull/state variables. No direct HA WebSocket/token is accepted.
+
+Keep one host across bounded MQTT reconnect sessions. Fence commands on
+disconnect or HA unavailability, require authoritative retained state after
+each resubscribe, and accept HA sequence resets only when `generated_at_ms`
+proves a newer publication epoch. Establish the total runtime deadline before
+registration and reserve bounded time for deletion and two absence reads.
+Acquire one nonblocking root-owned lease in the canonical VC runtime before
+apply-mode live preflight and hold it through cleanup so concurrent pilot
+processes cannot race the single registration.
 
 - [ ] **Step 4: Run off-panel tests and a preflight dry run**
 
@@ -511,7 +529,10 @@ Run: `uv run pytest tests/test_vc_single_light.py -q`
 
 Expected: PASS.
 
-Run the pilot with `--dry-run`; expected output lists only redacted VC ID, stable peripheral ID, display name, validated room/config IDs, runtime, topics, and `DRY RUN — no host started`.
+Run without `--apply`; expected output lists only the redacted VC ID, stable
+peripheral ID, display name, boolean room/config validations, runtime, topics,
+and `DRY RUN — no host started`. This performs scoped read-only bus preflight
+but does not start a host.
 
 - [ ] **Step 5: Run the bounded live light test**
 
