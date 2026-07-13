@@ -273,6 +273,36 @@ async def test_commands_and_capabilities_follow_live_support(hass: HomeAssistant
     assert entities[lock.entity_id].capabilities == {"lock": True}
 
 
+async def test_negative_live_feature_mask_advertises_no_cover_commands(
+    hass: HomeAssistant,
+) -> None:
+    label_id = _label(hass)
+    entry = _entity(
+        hass,
+        "cover.shade",
+        label_id=label_id,
+        supported_features=int(CoverEntityFeature.OPEN | CoverEntityFeature.CLOSE),
+    )
+    hass.states.async_set(entry.entity_id, "open", {ATTR_SUPPORTED_FEATURES: -1})
+
+    entity = build_manifest(hass, settings(), 1, GENERATED_AT_MS).entities[0]
+
+    assert entity.commands == ()
+    assert entity.capabilities == {"position": False, "tilt": False}
+
+
+async def test_negative_registry_feature_mask_advertises_no_cover_commands(
+    hass: HomeAssistant,
+) -> None:
+    label_id = _label(hass)
+    _entity(hass, "cover.shade", label_id=label_id, supported_features=-1)
+
+    entity = build_manifest(hass, settings(), 1, GENERATED_AT_MS).entities[0]
+
+    assert entity.commands == ()
+    assert entity.capabilities == {"position": False, "tilt": False}
+
+
 @pytest.mark.parametrize(
     ("attributes", "supports_brightness"),
     [
@@ -340,6 +370,22 @@ async def test_state_payload_is_versioned_and_attribute_allowlisted(
             "supported_features": 0,
         },
     }
+
+
+async def test_state_payload_normalizes_intflag_supported_features(
+    hass: HomeAssistant,
+) -> None:
+    label_id = _label(hass)
+    entry = _entity(hass, "cover.shade", label_id=label_id)
+    feature_mask = CoverEntityFeature.OPEN | CoverEntityFeature.CLOSE
+    hass.states.async_set(entry.entity_id, "open", {ATTR_SUPPORTED_FEATURES: feature_mask})
+    entity = build_manifest(hass, settings(), 1, GENERATED_AT_MS).entities[0]
+
+    payload = build_state_payload(hass.states.get(entry.entity_id), entity, 1, GENERATED_AT_MS)
+
+    attributes = cast(dict[str, object], payload["attributes"])
+    assert attributes == {"supported_features": 3}
+    assert type(attributes["supported_features"]) is int
 
 
 @pytest.mark.parametrize(
