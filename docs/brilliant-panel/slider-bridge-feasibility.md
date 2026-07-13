@@ -64,15 +64,19 @@ not stable API names.
 |---|---|---|
 | Qt meta-object strings | `SwitchSliderSettingsScreen` exports `homePeripheralSelector`, `supportsSliderConfiguredPeripheral`, and `sliderCapabilitiesText`. | Native slider assignment has a deliberate eligibility model; writing a config directly would bypass behavior that must be validated. |
 | `FUN_00382a20` | The screen constructor calls `FUN_003f3cc8(..., 3)` and retains the returned type collection. | Capability index 3 supplies the screen's permitted peripheral types. |
+| `FUN_001e7bbc` | `HomePeripheralSelector` copies the supplied type collection into its filter state and composes source/proxy models for the picker. Offline filtering, if any, can occur inside those subordinate models and is not disproved by the screen-level getter. | Picker admission still requires a live UI observation; the type-only getter is not the whole selector pipeline. |
 | `FUN_0039f664` | The generic gesture renderer calls the same `FUN_003f3cc8(..., 3)` collection while formatting the UI label `Slider Gesture`; a type outside the collection becomes `Invalid selection`. | The collection is the firmware's slider-gesture peripheral-type filter, not an account/device-host allowlist invented by this integration. |
 | `FUN_00385878` | The `supportsSliderConfiguredPeripheral` getter resolves the configured `(device_id, peripheral_id)`. If resolution returns no target it returns true; a resolved target returns true only when its type identifier is in the retained capability collection. | Eligibility is evaluated on the resolved target peripheral. The function does not reject a target because its host is DeviceType 6 (`VIRTUAL_CONTROL`). |
 | `FUN_00383900` | `sliderCapabilitiesText` explicitly handles `MUSIC` (3), `LIGHT` (27), `OUTLET` (40), `GENERIC_ON_OFF` (45), and `SHADE` (53). Light copy includes tap/flick toggle and slide-up/down brightness behavior. | A dimmable HA light should use `PeripheralType.LIGHT` and the standard light variables; a generic invented type will not work. |
+| `FUN_001fcb08` | The generic peripheral-action path logs `Peripheral data is null or offline, ignoring` and returns before dispatch when its resolved data is absent or offline. | A persisted offline tile cannot prove command routing or operate as a usable slider bridge, even if the picker happens to list it. |
 | Shipped test templates and Thrift types | Slider bindings serialize `CapTouchSliderConfig` with a slider index plus target `device_id` and `peripheral_id`. | The physical slider points at the Virtual Control and hosted light; it does not point at an HA entity ID or MQTT topic directly. |
 
 The strongest source-level conclusion is narrow: **DeviceType 6 is not itself a
 slider-eligibility blocker once its hosted `LIGHT` resolves in the home graph.**
+The direct configured-target getter is type-only, but the picker is composed
+from additional proxy models and ordinary action dispatch rejects offline data.
 Selector discovery, room filtering, online/ownership state, command routing,
-restart persistence, and cleanup are separate live gates.
+restart persistence, and cleanup therefore remain separate live gates.
 
 ## Hosted-light contract
 
