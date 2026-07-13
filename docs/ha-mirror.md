@@ -129,18 +129,31 @@ investigate manually.
 ### 2. Apply only after a fresh operator decision
 
 Apply is root-only and requires an absolute report path beneath
-`/data/brilliant-mqtt/cleanup/`. Immediately before an approved apply, prove the
-effective user and create/normalize the private parent directory:
+`/data/brilliant-mqtt/cleanup/`. Run this exact block as one root shell; do not
+split it across sessions or continue line-by-line after an error. Immediately
+before an approved apply, it proves the effective user, creates/normalizes the
+private parent directory, and exits before report checks if cleanup fails:
 
 ```bash
+set -eu
 test "$(id -u)" -eq 0
 install -d -m 0700 /data/brilliant-mqtt/cleanup
+CLEANUP_TS=$(date -u +%Y%m%dT%H%M%SZ)
+CLEANUP_REPORT="/data/brilliant-mqtt/cleanup/legacy-mirror-${CLEANUP_TS}.json"
 
-PYTHONPATH=/var/brilliant-mqtt/app:/var/brilliant-mqtt/vendor \
-  /data/switch-embedded/env/bin/python3 \
-  -m brilliant_mqtt.cleanup_legacy_mirror \
-  --apply \
-  --snapshot /data/brilliant-mqtt/cleanup/legacy-mirror-<timestamp>.json
+if ! PYTHONPATH=/var/brilliant-mqtt/app:/var/brilliant-mqtt/vendor \
+    /data/switch-embedded/env/bin/python3 \
+    -m brilliant_mqtt.cleanup_legacy_mirror \
+    --apply \
+    --snapshot "$CLEANUP_REPORT"; then
+  echo "cleanup_apply_success=false"
+  exit 1
+fi
+echo "cleanup_apply_success=true"
+
+REPORT_MODE=$(stat -c %a "$CLEANUP_REPORT")
+test "$REPORT_MODE" = 600
+sha256sum "$CLEANUP_REPORT"
 ```
 
 Relative paths, traversal, missing parents, symlinks, directories, paths
@@ -160,13 +173,11 @@ report write. Verification/read/report/shutdown failure produces a nonzero exit
 and conservative `success:false` output. Re-running with no candidates is
 idempotent and performs no delete.
 
-The actual report contains identifiers and remains on-panel, mode 0600. Verify
-its mode and compute its digest without displaying the content:
-
-```bash
-test "$(stat -c %a /data/brilliant-mqtt/cleanup/legacy-mirror-<timestamp>.json)" = 600
-sha256sum /data/brilliant-mqtt/cleanup/legacy-mirror-<timestamp>.json
-```
+The success boolean is emitted only after the cleanup process exits zero; a
+nonzero cleanup exit terminates the root shell before `stat` or `sha256sum` can
+mask it. The actual report contains identifiers and remains on-panel, mode 0600.
+The block verifies its mode and computes its digest without displaying the
+content.
 
 Only the report SHA-256, sanitized counts/outcome, exit status, and operator
 decision may be copied into the ignored pilot record. Never save the cleanup
@@ -178,11 +189,12 @@ Deletion of a stale peripheral has no automatic inverse. The CLI cannot and
 must not re-host a record to “roll back.” On any nonzero result:
 
 1. stop; do not rerun apply in a loop;
-2. retain the private report and the terminal redacted JSON;
-3. leave `brilliant-ha-mirror` inactive;
-4. verify physical loads and the native UI from the panel;
-5. resolve remaining/ambiguous IDs from a new read-only snapshot; and
-6. do not remove legacy source/runtime packaging until the Office scene bridge
+2. retain the private report on-panel;
+3. review terminal JSON only on-screen and unrecorded;
+4. leave `brilliant-ha-mirror` inactive;
+5. verify physical loads and the native UI from the panel;
+6. resolve remaining/ambiguous IDs from a new read-only snapshot; and
+7. do not remove legacy source/runtime packaging until the Office scene bridge
    hardware gate passes.
 
 Cleanup is intentionally separate from scene-control enable, disable, deploy,

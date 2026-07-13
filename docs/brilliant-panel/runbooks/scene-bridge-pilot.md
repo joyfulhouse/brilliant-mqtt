@@ -673,26 +673,40 @@ exist, review every ID/name/type against the strict dual allowlist in the
 [retirement guide](../../ha-mirror.md). Apply is never automatic and is not part
 of enable/rollback.
 
-A fresh operator decision is required immediately before deletion. If approved:
+A fresh operator decision is required immediately before deletion. If approved,
+run this exact block as one root shell. Do not split it across sessions or
+continue line-by-line after an error; cleanup failure exits before the report
+mode or digest checks:
 
 ```bash
+set -eu
 test "$(id -u)" -eq 0
 install -d -m 0700 /data/brilliant-mqtt/cleanup
-PYTHONPATH=/var/brilliant-mqtt/app:/var/brilliant-mqtt/vendor \
-  /data/switch-embedded/env/bin/python3 \
-  -m brilliant_mqtt.cleanup_legacy_mirror \
-  --apply \
-  --snapshot /data/brilliant-mqtt/cleanup/legacy-mirror-<timestamp>.json
-test "$(stat -c %a /data/brilliant-mqtt/cleanup/legacy-mirror-<timestamp>.json)" = 600
-sha256sum /data/brilliant-mqtt/cleanup/legacy-mirror-<timestamp>.json
+CLEANUP_TS=$(date -u +%Y%m%dT%H%M%SZ)
+CLEANUP_REPORT="/data/brilliant-mqtt/cleanup/legacy-mirror-${CLEANUP_TS}.json"
+if ! PYTHONPATH=/var/brilliant-mqtt/app:/var/brilliant-mqtt/vendor \
+    /data/switch-embedded/env/bin/python3 \
+    -m brilliant_mqtt.cleanup_legacy_mirror \
+    --apply \
+    --snapshot "$CLEANUP_REPORT"; then
+  echo "cleanup_apply_success=false"
+  exit 1
+fi
+echo "cleanup_apply_success=true"
+
+REPORT_MODE=$(stat -c %a "$CLEANUP_REPORT")
+test "$REPORT_MODE" = 600
+sha256sum "$CLEANUP_REPORT"
 ```
 
 Require exit zero, `success:true`, empty `remaining_ids`, fresh second-snapshot
 proof, clean native-client shutdown, and the mode-0600 private atomic report.
+The safe success boolean appears only after the CLI exits zero; its nonzero exit
+terminates the root shell before `stat` or `sha256sum` can mask the failure.
 Review command JSON only on-screen and unrecorded. Record only the report
-SHA-256, sanitized counts/outcome, exit status, and operator decision; never
-copy the report or command JSON into artifacts. On any failure stop; do not
-rerun or recreate a host.
+SHA-256, sanitized counts/outcome, exit status, and operator decision; never copy
+the report or command JSON into artifacts. On any failure stop; do not rerun or
+recreate a host.
 
 ## Final disposition and legacy-removal gate
 
