@@ -21,6 +21,7 @@ from custom_components.brilliant_mqtt import (
 )
 from custom_components.brilliant_mqtt.const import (
     COMPONENT_BRIDGE,
+    COMPONENT_HA_MIRROR,
     COMPONENT_VOICE,
     CONF_COMPONENTS,
     CONF_HA_CONTROL_DOMAINS,
@@ -37,6 +38,7 @@ from custom_components.brilliant_mqtt.const import (
     CONF_ROOM_OVERRIDES,
     CONF_ROOT_PASSWORD,
     CONF_VOICE_ENABLED,
+    CONFIG_ENTRY_VERSION,
     DATA_SSH_HOST_KEY,
     DOMAIN,
     availability_topic,
@@ -457,7 +459,7 @@ async def test_external_unload_cancellation_is_drained_before_manager_shutdown(
 
 
 async def test_migrate_v1_folds_voice_enabled_into_components(hass: HomeAssistant) -> None:
-    """v1 entry with voice_enabled=True must become v2 with components dict."""
+    """v1 voice selection survives migration to the current safe component map."""
     entry = MockConfigEntry(
         domain=DOMAIN,
         version=1,
@@ -465,14 +467,19 @@ async def test_migrate_v1_folds_voice_enabled_into_components(hass: HomeAssistan
     )
     entry.add_to_hass(hass)
     assert await async_migrate_entry(hass, entry) is True
-    assert entry.version == 2
+    assert entry.version == CONFIG_ENTRY_VERSION
     assert entry.data[CONF_COMPONENTS][COMPONENT_BRIDGE] is True
     assert entry.data[CONF_COMPONENTS][COMPONENT_VOICE] is True
+    assert entry.data[CONF_COMPONENTS][COMPONENT_HA_MIRROR] is False
 
 
 async def test_migrate_v1_no_voice_defaults_components_off(hass: HomeAssistant) -> None:
-    """v1 entry without voice_enabled must produce bridge=True, voice=False."""
+    """v1 entry defaults optional components off, including the retired mirror."""
     entry = MockConfigEntry(domain=DOMAIN, version=1, data={"panel": "kitchen"})
     entry.add_to_hass(hass)
     assert await async_migrate_entry(hass, entry) is True
-    assert entry.data[CONF_COMPONENTS] == {COMPONENT_BRIDGE: True, COMPONENT_VOICE: False}
+    assert entry.data[CONF_COMPONENTS] == {
+        COMPONENT_BRIDGE: True,
+        COMPONENT_VOICE: False,
+        COMPONENT_HA_MIRROR: False,
+    }

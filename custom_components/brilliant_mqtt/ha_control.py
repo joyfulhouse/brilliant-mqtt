@@ -152,6 +152,16 @@ class HaControlPlane:
         return len(self._results)
 
     @property
+    def manifest_revision(self) -> int | None:
+        """Return the committed manifest revision for diagnostics."""
+        return self._manifest.revision if self._manifest is not None else None
+
+    @property
+    def manifest_entity_count(self) -> int | None:
+        """Return the number of entities in the committed manifest."""
+        return len(self._manifest.entities) if self._manifest is not None else None
+
+    @property
     def scene_control(self) -> SceneControl:
         """Return the scene/mode runtime owned by this singleton."""
         return self._scene_control

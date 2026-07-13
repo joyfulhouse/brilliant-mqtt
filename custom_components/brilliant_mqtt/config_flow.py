@@ -9,6 +9,9 @@ every mutable setting and pushes the change to the panel; the slug is immutable.
 
 from __future__ import annotations
 
+import copy
+import json
+import math
 import re
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
@@ -20,7 +23,6 @@ import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry, ConfigFlow, ConfigFlowResult, OptionsFlow
 from homeassistant.const import CONF_NAME
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.selector import TextSelector, TextSelectorConfig, TextSelectorType
 
 from . import _fleet_lock, panel_ops
 from .components import REGISTRY, optional
@@ -29,29 +31,36 @@ from .const import (
     COMPONENT_HA_MIRROR,
     COMPONENT_VOICE,
     CONF_COMPONENTS,
-    CONF_HA_MIRROR_LABEL,
-    CONF_HA_MIRROR_LEADER_PRIORITY,
-    CONF_HA_MIRROR_TOKEN,
-    CONF_HA_MIRROR_WS_URL,
+    CONF_HA_CONTROL_DOMAINS,
+    CONF_HA_CONTROL_ENABLED,
+    CONF_HA_CONTROL_LABEL,
     CONF_HOST,
+    CONF_MAX_MIRRORED_ENTITIES,
     CONF_MESH_PRIORITY,
     CONF_MQTT_HOST,
     CONF_MQTT_PASSWORD,
     CONF_MQTT_PORT,
     CONF_MQTT_USERNAME,
     CONF_PANEL,
+    CONF_ROOM_OVERRIDES,
     CONF_ROOT_PASSWORD,
+    CONF_SCENE_ACTIONS,
+    CONF_SCENE_PANEL,
     CONF_VOICE_HA_HOST,
     CONF_VOICE_WAKE_WORD,
+    CONFIG_ENTRY_VERSION,
     DATA_SSH_HOST_KEY,
     DEFAULT_AUTO_REPAIR,
-    DEFAULT_HA_MIRROR_LABEL,
-    DEFAULT_HA_MIRROR_LEADER_PRIORITY,
+    DEFAULT_HA_CONTROL_DOMAINS,
+    DEFAULT_HA_CONTROL_ENABLED,
+    DEFAULT_HA_CONTROL_LABEL,
+    DEFAULT_MAX_MIRRORED_ENTITIES,
     DEFAULT_OFFLINE_GRACE_MINUTES,
     DEFAULT_REPAIR_COOLDOWN_MINUTES,
     DEFAULT_TRUST_HOST_KEY_CHANGES,
     DEFAULT_VOICE_WAKE_WORD,
     DOMAIN,
+    HA_CONTROL_DOMAINS,
     MESH_PANEL,
     OPT_AUTO_REPAIR,
     OPT_OFFLINE_GRACE_MINUTES,
@@ -82,9 +91,7 @@ _NO_CONTROL_CHARS = (
     CONF_MQTT_HOST,
     CONF_MQTT_USERNAME,
     CONF_MQTT_PASSWORD,
-    CONF_HA_MIRROR_WS_URL,
-    CONF_HA_MIRROR_TOKEN,
-    CONF_HA_MIRROR_LABEL,
+    CONF_HA_CONTROL_LABEL,
 )
 
 _SLUG_SEPARATORS = re.compile(r"[\s.]+")
@@ -108,17 +115,6 @@ def _has_control_char(value: str) -> bool:
 def _control_char_errors(user_input: dict[str, Any], keys: tuple[str, ...]) -> dict[str, str]:
     """Per-field ``invalid_value`` errors for any *keys* whose value has a control char."""
     return {key: "invalid_value" for key in keys if _has_control_char(user_input[key])}
-
-
-def _ha_mirror_required_errors(user_input: Mapping[str, Any]) -> dict[str, str]:
-    """Required HA mirror sub-fields, enforced only while the component is selected."""
-    if not user_input.get(COMPONENT_HA_MIRROR, False):
-        return {}
-    return {
-        key: "ha_mirror_required"
-        for key in (CONF_HA_MIRROR_WS_URL, CONF_HA_MIRROR_TOKEN)
-        if not str(user_input.get(key, "")).strip()
-    }
 
 
 def _mqtt_schema_fields(source: Mapping[str, Any]) -> dict[Any, Any]:
@@ -168,33 +164,238 @@ def _components_schema_fields(
         )
     ] = vol.In(list(VOICE_WAKE_WORDS))
     fields[vol.Optional(CONF_VOICE_HA_HOST, default=source.get(CONF_VOICE_HA_HOST, ""))] = str
-    # HA mirror sub-config. Defaults keep these lenient when the component is
-    # unchecked while still ensuring every created entry has the keys its installer reads.
-    fields[
-        vol.Required(
-            CONF_HA_MIRROR_WS_URL,
-            default=source.get(CONF_HA_MIRROR_WS_URL, ""),
-        )
-    ] = str
-    fields[
-        vol.Optional(
-            CONF_HA_MIRROR_TOKEN,
-            default=source.get(CONF_HA_MIRROR_TOKEN, ""),
-        )
-    ] = TextSelector(TextSelectorConfig(type=TextSelectorType.PASSWORD))
-    fields[
-        vol.Required(
-            CONF_HA_MIRROR_LEADER_PRIORITY,
-            default=source.get(CONF_HA_MIRROR_LEADER_PRIORITY, DEFAULT_HA_MIRROR_LEADER_PRIORITY),
-        )
-    ] = vol.All(vol.Coerce(int), vol.Range(min=0, max=99))
-    fields[
-        vol.Optional(
-            CONF_HA_MIRROR_LABEL,
-            default=source.get(CONF_HA_MIRROR_LABEL, DEFAULT_HA_MIRROR_LABEL),
-        )
-    ] = str
     return fields
+
+
+_GLOBAL_KEYS = (
+    CONF_HA_CONTROL_ENABLED,
+    CONF_HA_CONTROL_LABEL,
+    CONF_ROOM_OVERRIDES,
+    CONF_HA_CONTROL_DOMAINS,
+    CONF_MAX_MIRRORED_ENTITIES,
+    CONF_SCENE_PANEL,
+    CONF_SCENE_ACTIONS,
+)
+_MAX_JSON_TEXT = 64 * 1024
+_MAX_JSON_NODES = 2_048
+_MAX_JSON_DEPTH = 12
+_MAX_STRING_LENGTH = 4_096
+_MAX_ROOM_OVERRIDES = 200
+_MAX_SCENE_ACTIONS = 1_024
+_SERVICE_PATTERN = re.compile(r"[a-z0-9_]+")
+_PANEL_PATTERN = re.compile(r"[a-z0-9][a-z0-9_-]{0,62}")
+_TARGET_KEYS = frozenset({"entity_id", "device_id", "area_id"})
+
+
+def _canonical_json(value: Mapping[str, object]) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _global_defaults(panel: str) -> dict[str, Any]:
+    return {
+        CONF_HA_CONTROL_ENABLED: DEFAULT_HA_CONTROL_ENABLED,
+        CONF_HA_CONTROL_LABEL: DEFAULT_HA_CONTROL_LABEL,
+        CONF_ROOM_OVERRIDES: {},
+        CONF_HA_CONTROL_DOMAINS: list(DEFAULT_HA_CONTROL_DOMAINS),
+        CONF_MAX_MIRRORED_ENTITIES: DEFAULT_MAX_MIRRORED_ENTITIES,
+        CONF_SCENE_PANEL: panel,
+        CONF_SCENE_ACTIONS: {},
+    }
+
+
+def _inherited_globals(entries: list[ConfigEntry], panel: str) -> dict[str, Any]:
+    if not entries:
+        return _global_defaults(panel)
+    source = min(
+        entries,
+        key=lambda entry: (str(entry.data.get(CONF_PANEL, "")), entry.entry_id),
+    ).data
+    defaults = _global_defaults(panel)
+    return {
+        key: copy.deepcopy(source[key] if key in source else defaults[key]) for key in _GLOBAL_KEYS
+    }
+
+
+def _control_schema_fields(source: Mapping[str, Any], *, panel_default: str) -> dict[Any, Any]:
+    overrides = source.get(CONF_ROOM_OVERRIDES, {})
+    actions = source.get(CONF_SCENE_ACTIONS, {})
+    return {
+        vol.Required(
+            CONF_HA_CONTROL_ENABLED,
+            default=source.get(CONF_HA_CONTROL_ENABLED, DEFAULT_HA_CONTROL_ENABLED),
+        ): bool,
+        vol.Required(
+            CONF_HA_CONTROL_LABEL,
+            default=source.get(CONF_HA_CONTROL_LABEL, DEFAULT_HA_CONTROL_LABEL),
+        ): str,
+        vol.Required(
+            CONF_ROOM_OVERRIDES,
+            default=_canonical_json(overrides) if isinstance(overrides, Mapping) else "{}",
+        ): str,
+        vol.Required(
+            CONF_HA_CONTROL_DOMAINS,
+            default=list(source.get(CONF_HA_CONTROL_DOMAINS, DEFAULT_HA_CONTROL_DOMAINS)),
+        ): list,
+        vol.Required(
+            CONF_MAX_MIRRORED_ENTITIES,
+            default=source.get(CONF_MAX_MIRRORED_ENTITIES, DEFAULT_MAX_MIRRORED_ENTITIES),
+        ): object,
+        vol.Required(
+            CONF_SCENE_PANEL,
+            default=source.get(CONF_SCENE_PANEL, panel_default),
+        ): str,
+        vol.Required(
+            CONF_SCENE_ACTIONS,
+            default=_canonical_json(actions) if isinstance(actions, Mapping) else "{}",
+        ): str,
+    }
+
+
+def _validate_json_value(value: object, *, depth: int, remaining: list[int]) -> None:
+    remaining[0] -= 1
+    if remaining[0] < 0 or depth > _MAX_JSON_DEPTH:
+        raise ValueError
+    if value is None or type(value) in (bool, int):
+        return
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError
+        return
+    if isinstance(value, str):
+        if len(value) > _MAX_STRING_LENGTH or _has_control_char(value):
+            raise ValueError
+        return
+    if isinstance(value, list):
+        for item in value:
+            _validate_json_value(item, depth=depth + 1, remaining=remaining)
+        return
+    if isinstance(value, dict) and all(isinstance(key, str) for key in value):
+        for key, item in value.items():
+            if len(key) > _MAX_STRING_LENGTH or _has_control_char(key):
+                raise ValueError
+            _validate_json_value(item, depth=depth + 1, remaining=remaining)
+        return
+    raise ValueError
+
+
+def _decode_json_object(raw: object) -> dict[str, object]:
+    if not isinstance(raw, str) or len(raw) > _MAX_JSON_TEXT:
+        raise ValueError
+    try:
+        value = json.loads(raw)
+    except (json.JSONDecodeError, TypeError) as error:
+        raise ValueError from error
+    if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
+        raise ValueError
+    _validate_json_value(value, depth=0, remaining=[_MAX_JSON_NODES])
+    return value
+
+
+def _decode_room_overrides(raw: object) -> dict[str, str]:
+    value = _decode_json_object(raw)
+    if len(value) > _MAX_ROOM_OVERRIDES:
+        raise ValueError
+    decoded: dict[str, str] = {}
+    for key, room in value.items():
+        if (
+            not key.strip()
+            or len(key) > 256
+            or not isinstance(room, str)
+            or not room.strip()
+            or len(room) > 256
+        ):
+            raise ValueError
+        decoded[key.strip()] = room.strip()
+    return decoded
+
+
+def _decode_scene_actions(raw: object, panels: frozenset[str]) -> dict[str, object]:
+    value = _decode_json_object(raw)
+    if len(value) > _MAX_SCENE_ACTIONS:
+        raise ValueError
+    decoded: dict[str, object] = {}
+    for key, raw_action in value.items():
+        if key.count(":") != 1:
+            raise ValueError
+        panel, scene_id = key.split(":")
+        if panel not in panels or not scene_id or len(scene_id) > _MAX_STRING_LENGTH:
+            raise ValueError
+        if not isinstance(raw_action, dict) or set(raw_action) != {
+            "domain",
+            "service",
+            "target",
+            "data",
+        }:
+            raise ValueError
+        domain = raw_action["domain"]
+        service = raw_action["service"]
+        target = raw_action["target"]
+        data = raw_action["data"]
+        if (
+            not isinstance(domain, str)
+            or _SERVICE_PATTERN.fullmatch(domain) is None
+            or not isinstance(service, str)
+            or _SERVICE_PATTERN.fullmatch(service) is None
+            or not isinstance(target, dict)
+            or not set(target).issubset(_TARGET_KEYS)
+            or not isinstance(data, dict)
+        ):
+            raise ValueError
+        decoded[key] = copy.deepcopy(raw_action)
+    return decoded
+
+
+def _validated_control_input(
+    user_input: Mapping[str, Any], *, panels: frozenset[str], default_panel: str
+) -> tuple[dict[str, str], dict[str, Any]]:
+    errors: dict[str, str] = {}
+    values: dict[str, Any] = {}
+    label = str(user_input.get(CONF_HA_CONTROL_LABEL, "")).strip()
+    if not label or len(label) > 256 or _has_control_char(label):
+        errors[CONF_HA_CONTROL_LABEL] = "invalid_value"
+    else:
+        values[CONF_HA_CONTROL_LABEL] = label
+    try:
+        values[CONF_ROOM_OVERRIDES] = _decode_room_overrides(user_input.get(CONF_ROOM_OVERRIDES))
+    except ValueError:
+        errors[CONF_ROOM_OVERRIDES] = "invalid_value"
+
+    raw_domains = user_input.get(CONF_HA_CONTROL_DOMAINS)
+    if (
+        not isinstance(raw_domains, list)
+        or len(raw_domains) != len(set(raw_domains))
+        or any(domain not in HA_CONTROL_DOMAINS for domain in raw_domains)
+    ):
+        errors[CONF_HA_CONTROL_DOMAINS] = "invalid_value"
+    else:
+        values[CONF_HA_CONTROL_DOMAINS] = [
+            domain for domain in HA_CONTROL_DOMAINS if domain in raw_domains
+        ]
+
+    maximum = user_input.get(CONF_MAX_MIRRORED_ENTITIES)
+    if type(maximum) is not int or not 1 <= maximum <= 200:
+        errors[CONF_MAX_MIRRORED_ENTITIES] = "invalid_value"
+    else:
+        values[CONF_MAX_MIRRORED_ENTITIES] = maximum
+
+    scene_panel = str(user_input.get(CONF_SCENE_PANEL, "")).strip() or default_panel
+    if scene_panel not in panels:
+        errors[CONF_SCENE_PANEL] = "invalid_value"
+    else:
+        values[CONF_SCENE_PANEL] = scene_panel
+    try:
+        values[CONF_SCENE_ACTIONS] = _decode_scene_actions(
+            user_input.get(CONF_SCENE_ACTIONS), panels
+        )
+    except ValueError:
+        errors[CONF_SCENE_ACTIONS] = "invalid_value"
+
+    enabled = user_input.get(CONF_HA_CONTROL_ENABLED)
+    if type(enabled) is not bool:
+        errors[CONF_HA_CONTROL_ENABLED] = "invalid_value"
+    else:
+        values[CONF_HA_CONTROL_ENABLED] = enabled
+    return errors, values
 
 
 def _slugify(name: str) -> str:
@@ -234,6 +435,9 @@ def _adopt_data(env: dict[str, str]) -> dict[str, Any] | None:
         port = int(env.get(panel_ops.ENV_MQTT_PORT, "1883"))
         if not 1 <= port <= 65535:
             raise ValueError("mqtt port out of range")
+        scene_bridge = env.get(panel_ops.ENV_SCENE_BRIDGE_ENABLED, "0")
+        if scene_bridge not in ("0", "1"):
+            raise ValueError("invalid scene bridge toggle")
         return {
             CONF_PANEL: panel,
             CONF_MESH_PRIORITY: int(env.get(panel_ops.ENV_MESH_PRIORITY, "0")),
@@ -241,6 +445,7 @@ def _adopt_data(env: dict[str, str]) -> dict[str, Any] | None:
             CONF_MQTT_PORT: port,
             CONF_MQTT_USERNAME: env[panel_ops.ENV_MQTT_USERNAME],
             CONF_MQTT_PASSWORD: env[panel_ops.ENV_MQTT_PASSWORD],
+            CONF_HA_CONTROL_ENABLED: scene_bridge == "1",
         }
     except (KeyError, ValueError):
         return None
@@ -326,7 +531,7 @@ async def _apply_config(
 class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
     """Add one Brilliant panel per entry (detection-first; adopts installed agents)."""
 
-    VERSION = 2
+    VERSION = CONFIG_ENTRY_VERSION
 
     def __init__(self) -> None:
         # Carried across the not-installed onboarding steps (user → mqtt → script).
@@ -373,9 +578,20 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
                     else:
                         await self.async_set_unique_id(adopted[CONF_PANEL])
                         self._abort_if_unique_id_configured()
+                        entries = self._async_current_entries()
+                        inherited = _inherited_globals(entries, adopted[CONF_PANEL])
+                        if not entries:
+                            # With no fleet owner, preserve the installed bridge's
+                            # explicit scene toggle. Once a fleet exists, its seven
+                            # canonical globals are authoritative for every new panel.
+                            inherited[CONF_HA_CONTROL_ENABLED] = adopted[CONF_HA_CONTROL_ENABLED]
                         return self.async_create_entry(
                             title=f"Brilliant {adopted[CONF_PANEL]}",
-                            data={**self._connect, **adopted},
+                            data={
+                                **self._connect,
+                                **adopted,
+                                **inherited,
+                            },
                         )
         schema = vol.Schema(
             {
@@ -425,21 +641,29 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
                 errors[CONF_NAME] = "reserved_panel"
             elif not slug:
                 errors[CONF_NAME] = "invalid_name"
-            # A control char in the HA host flows into render_voice_env → _env_quote, which
-            # raises ValueError (NOT caught by the voice except below) → the flow would
-            # crash. Reject at the boundary for a friendly per-field message instead.
+            # A control char in the HA host flows into render_voice_env → _env_quote.
             errors.update(
                 _control_char_errors(
                     user_input,
-                    (
-                        CONF_VOICE_HA_HOST,
-                        CONF_HA_MIRROR_WS_URL,
-                        CONF_HA_MIRROR_TOKEN,
-                        CONF_HA_MIRROR_LABEL,
-                    ),
+                    (CONF_VOICE_HA_HOST,),
                 )
             )
-            errors.update(_ha_mirror_required_errors(user_input))
+            control_values: dict[str, Any] = {}
+            if slug and slug != MESH_PANEL:
+                panels = frozenset(
+                    {
+                        slug,
+                        *(
+                            str(entry.data[CONF_PANEL])
+                            for entry in self._async_current_entries()
+                            if isinstance(entry.data.get(CONF_PANEL), str)
+                        ),
+                    }
+                )
+                control_errors, control_values = _validated_control_input(
+                    user_input, panels=panels, default_panel=slug
+                )
+                errors.update(control_errors)
             if not errors:
                 await self.async_set_unique_id(slug)
                 self._abort_if_unique_id_configured()
@@ -454,10 +678,7 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
                     CONF_COMPONENTS: components,
                     CONF_VOICE_WAKE_WORD: user_input[CONF_VOICE_WAKE_WORD],
                     CONF_VOICE_HA_HOST: user_input[CONF_VOICE_HA_HOST],
-                    CONF_HA_MIRROR_WS_URL: user_input[CONF_HA_MIRROR_WS_URL],
-                    CONF_HA_MIRROR_TOKEN: user_input[CONF_HA_MIRROR_TOKEN],
-                    CONF_HA_MIRROR_LEADER_PRIORITY: user_input[CONF_HA_MIRROR_LEADER_PRIORITY],
-                    CONF_HA_MIRROR_LABEL: user_input[CONF_HA_MIRROR_LABEL],
+                    **control_values,
                 }
                 current_cid: str | None = None
                 try:
@@ -481,7 +702,13 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
                         else "cannot_install"
                     )
                 else:
+                    for fleet_entry in self.hass.config_entries.async_entries(DOMAIN):
+                        self.hass.config_entries.async_update_entry(
+                            fleet_entry,
+                            data={**fleet_entry.data, **copy.deepcopy(control_values)},
+                        )
                     return self.async_create_entry(title=f"Brilliant {slug}", data=entry_data)
+        inherited = _inherited_globals(self._async_current_entries(), "")
         schema = vol.Schema(
             {
                 vol.Required(CONF_NAME): str,
@@ -489,6 +716,7 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
                     vol.Coerce(int), vol.Range(min=0, max=99)
                 ),
                 **_components_schema_fields({}),
+                **_control_schema_fields(inherited, panel_default=""),
             }
         )
         # Preserve name + mesh + voice fields across an error redisplay.
@@ -515,7 +743,15 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
             ha_host_val = str(user_input.get(CONF_VOICE_HA_HOST, ""))
             if _has_control_char(ha_host_val):
                 errors[CONF_VOICE_HA_HOST] = "invalid_value"
-            errors.update(_ha_mirror_required_errors(user_input))
+            panels = frozenset(
+                str(candidate.data[CONF_PANEL])
+                for candidate in self.hass.config_entries.async_entries(DOMAIN)
+                if isinstance(candidate.data.get(CONF_PANEL), str)
+            )
+            control_errors, control_values = _validated_control_input(
+                user_input, panels=panels, default_panel=str(entry.data[CONF_PANEL])
+            )
+            errors.update(control_errors)
             if not errors:
                 user_input = {**user_input, CONF_HOST: user_input[CONF_HOST].strip()}
                 # Same host → verify the rotated password against the STORED pin (key
@@ -536,6 +772,7 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
                         mqtt_port=user_input[CONF_MQTT_PORT],
                         mqtt_username=user_input[CONF_MQTT_USERNAME],
                         mqtt_password=user_input[CONF_MQTT_PASSWORD],
+                        scene_bridge_enabled=control_values[CONF_HA_CONTROL_ENABLED],
                     )
                     try:
                         host_key = await _apply_config(
@@ -568,22 +805,28 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
                             for c in optional()
                         }
                         desired[COMPONENT_BRIDGE] = True
+                        desired[COMPONENT_HA_MIRROR] = False
                         # Strip optional-component checkbox ids (e.g. "voice") from
                         # user_input before merging: those belong only in CONF_COMPONENTS,
                         # not as top-level stray keys in entry data.
                         _opt_ids = {c.id for c in optional()}
-                        clean_input = {k: v for k, v in user_input.items() if k not in _opt_ids}
+                        clean_input = {
+                            k: v
+                            for k, v in user_input.items()
+                            if k not in _opt_ids and k not in _GLOBAL_KEYS
+                        }
                         new_data: dict[str, Any] = {
                             **entry.data,
                             **clean_input,
                             DATA_SSH_HOST_KEY: host_key,
                             CONF_COMPONENTS: desired,
+                            **control_values,
                         }
                         try:
                             for c in optional():
                                 was: bool = bool(current.get(c.id, False))
                                 now: bool = desired[c.id]
-                                if now and (c.id == COMPONENT_HA_MIRROR or not was):
+                                if now and not was:
                                     async with _panel_session(
                                         self.hass,
                                         user_input[CONF_HOST],
@@ -604,6 +847,13 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
                         except (OSError, asyncssh.Error, panel_ops.PanelOpError):
                             errors["base"] = "cannot_apply"
                         else:
+                            for fleet_entry in self.hass.config_entries.async_entries(DOMAIN):
+                                if fleet_entry.entry_id == entry.entry_id:
+                                    continue
+                                self.hass.config_entries.async_update_entry(
+                                    fleet_entry,
+                                    data={**fleet_entry.data, **copy.deepcopy(control_values)},
+                                )
                             return self.async_update_reload_and_abort(entry, data=new_data)
         data = entry.data
         schema = vol.Schema(
@@ -615,6 +865,7 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
                     vol.Coerce(int), vol.Range(min=0, max=99)
                 ),
                 **_components_schema_fields(data, new_install=False),
+                **_control_schema_fields(data, panel_default=str(data[CONF_PANEL])),
             }
         )
         # Keep the operator's just-made edits across an error redisplay (a transient

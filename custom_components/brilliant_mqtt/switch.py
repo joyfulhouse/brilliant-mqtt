@@ -36,7 +36,6 @@ async def async_setup_entry(
             VoiceSatelliteSwitch(entry),
             WifiWatchdogSwitch(entry),
             BusWatchdogSwitch(entry),
-            HaMirrorSwitch(entry),
         ]
     )
 
@@ -126,7 +125,7 @@ class BusWatchdogSwitch(_ComponentInstallSwitch):
 
 
 class HaMirrorSwitch(_ComponentInstallSwitch):
-    """Install/remove the on-panel Home Assistant entity mirror."""
+    """Legacy entity retained for compatibility but no longer registered."""
 
     _attr_translation_key = "ha_mirror"
     _component_id = COMPONENT_HA_MIRROR

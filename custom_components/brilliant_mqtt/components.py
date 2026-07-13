@@ -22,8 +22,7 @@ from .const import (
     COMPONENT_VOICE,
     COMPONENT_WIFI_WATCHDOG,
     CONF_COMPONENTS,
-    CONF_HA_MIRROR_TOKEN,
-    CONF_HA_MIRROR_WS_URL,
+    CONF_HA_CONTROL_ENABLED,
     CONF_MESH_PRIORITY,
     CONF_MQTT_HOST,
     CONF_MQTT_PASSWORD,
@@ -32,6 +31,7 @@ from .const import (
     CONF_PANEL,
     CONF_VOICE_HA_HOST,
     CONF_VOICE_WAKE_WORD,
+    DEFAULT_HA_CONTROL_ENABLED,
     DEFAULT_VOICE_WAKE_WORD,
     VOICE_PAYLOAD_VERSION,
     panel_device_name,
@@ -50,6 +50,7 @@ class Component:
     present: Callable[[PanelShell], Awaitable[bool]]
     install: Callable[[HomeAssistant, PanelShell, Mapping[str, Any]], Awaitable[None]]
     remove: Callable[[PanelShell], Awaitable[None]]
+    deprecated: bool = False
 
 
 async def _bridge_present(shell: PanelShell) -> bool:
@@ -67,6 +68,7 @@ async def _bridge_install(hass: HomeAssistant, shell: PanelShell, data: Mapping[
         mqtt_port=data[CONF_MQTT_PORT],
         mqtt_username=data[CONF_MQTT_USERNAME],
         mqtt_password=data[CONF_MQTT_PASSWORD],
+        scene_bridge_enabled=data.get(CONF_HA_CONTROL_ENABLED, DEFAULT_HA_CONTROL_ENABLED) is True,
     )
     await panel_ops.deploy_payload(shell, str(payload_dir), version)
     await panel_ops.ensure_configs(shell, unit, env)
@@ -149,21 +151,8 @@ async def _hamirror_present(shell: PanelShell) -> bool:
 async def _hamirror_install(
     hass: HomeAssistant, shell: PanelShell, data: Mapping[str, Any]
 ) -> None:
-    ha_ws_url = data.get(CONF_HA_MIRROR_WS_URL, "")
-    ha_token = data.get(CONF_HA_MIRROR_TOKEN, "")
-    if not ha_ws_url.strip() or not ha_token.strip():
-        raise PanelOpError(
-            "HA mirror needs a Home Assistant WebSocket URL and long-lived token — "
-            "set them via Reconfigure"
-        )
-    payload_dir = _mgr._payload_dir()
-    unit = await hass.async_add_executor_job(
-        (payload_dir / "brilliant-ha-mirror.service").read_text
-    )
-    env = _mgr._ha_mirror_env_from_data(data)
-    await panel_ops.deploy_ha_mirror(shell, str(payload_dir / "ha_mirror"))
-    await panel_ops.ensure_ha_mirror_config(shell, unit, env)
-    await panel_ops.enable_ha_mirror(shell)
+    del hass, shell, data
+    raise PanelOpError("HA mirror is deprecated and cannot be installed")
 
 
 REGISTRY: dict[str, Component] = {
@@ -211,19 +200,28 @@ REGISTRY: dict[str, Component] = {
         present=_hamirror_present,
         install=_hamirror_install,
         remove=panel_ops.uninstall_ha_mirror,
+        deprecated=True,
     ),
 }
 
 
 def optional() -> list[Component]:
     """Non-locked components in stable display order."""
-    return [c for c in REGISTRY.values() if not c.locked]
+    return [c for c in REGISTRY.values() if not c.locked and not c.deprecated]
 
 
 def default_components() -> dict[str, bool]:
-    return {c.id: (True if c.locked else c.default_enabled) for c in REGISTRY.values()}
+    return {
+        c.id: (True if c.locked else c.default_enabled)
+        for c in REGISTRY.values()
+        if not c.deprecated
+    }
 
 
 def selected_ids(entry_data: Mapping[str, Any]) -> list[str]:
     chosen = dict(entry_data.get(CONF_COMPONENTS, {}))
-    return [c.id for c in REGISTRY.values() if c.locked or chosen.get(c.id, False)]
+    return [
+        c.id
+        for c in REGISTRY.values()
+        if not c.deprecated and (c.locked or chosen.get(c.id, False))
+    ]

@@ -143,6 +143,7 @@ ENV_MQTT_PORT = "MQTT_PORT"
 ENV_MQTT_USERNAME = "MQTT_USERNAME"
 ENV_MQTT_PASSWORD = "MQTT_PASSWORD"
 ENV_MESH_PRIORITY = "MESH_PRIORITY"
+ENV_SCENE_BRIDGE_ENABLED = "SCENE_BRIDGE_ENABLED"
 
 
 def render_env(
@@ -152,6 +153,7 @@ def render_env(
     mqtt_port: int,
     mqtt_username: str,
     mqtt_password: str,
+    scene_bridge_enabled: bool = False,
 ) -> str:
     """Render /etc/brilliant-mqtt.env — exactly what the agent's config.py reads.
 
@@ -165,6 +167,7 @@ def render_env(
         f"{ENV_MQTT_USERNAME}={_env_quote(mqtt_username)}\n"
         f"{ENV_MQTT_PASSWORD}={_env_quote(mqtt_password)}\n"
         f"{ENV_MESH_PRIORITY}={mesh_priority}\n"
+        f"{ENV_SCENE_BRIDGE_ENABLED}={1 if scene_bridge_enabled else 0}\n"
         f"LOG_LEVEL=INFO\n"
     )
 
@@ -447,10 +450,12 @@ async def uninstall_voice(shell: PanelShell) -> None:
 
 HA_MIRROR_INSPECT_COMMAND = (
     f"test -f {PANEL_HA_MIRROR_UNIT_FILE} && echo unit=1 || echo unit=0; "
+    f"test -f {PANEL_HA_MIRROR_ENV_FILE} && echo env=1 || echo env=0; "
     f"systemctl is-enabled {HA_MIRROR_SERVICE_NAME} >/dev/null 2>&1"
     f" && echo enabled=1 || echo enabled=0; "
     f"systemctl is-active {HA_MIRROR_SERVICE_NAME} >/dev/null 2>&1"
     f" && echo active=1 || echo active=0; "
+    f"test -f {_HA_MIRROR_STAGED_ENV} && echo senv=1 || echo senv=0; "
     f"test -f {PANEL_HA_MIRROR_APP_DIR}/brilliant_ha_mirror/__main__.py "
     f"&& echo payload=1 || echo payload=0"
 )
@@ -461,8 +466,10 @@ class HaMirrorState:
     """Parsed result of one inspect_ha_mirror() probe."""
 
     unit_present: bool
+    env_present: bool
     enabled: bool
     active: bool
+    staged_env_present: bool
     payload_present: bool
 
 
@@ -472,12 +479,14 @@ async def inspect_ha_mirror(shell: PanelShell) -> HaMirrorState:
     flags: dict[str, bool] = {}
     for line in result.stdout.splitlines():
         key, sep, value = line.partition("=")
-        if sep and key in ("unit", "enabled", "active", "payload"):
+        if sep and key in ("unit", "env", "enabled", "active", "senv", "payload"):
             flags[key] = value == "1"
     return HaMirrorState(
         unit_present=flags.get("unit", False),
+        env_present=flags.get("env", False),
         enabled=flags.get("enabled", False),
         active=flags.get("active", False),
+        staged_env_present=flags.get("senv", False),
         payload_present=flags.get("payload", False),
     )
 

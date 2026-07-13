@@ -40,7 +40,7 @@ from .const import (
     COMPONENT_VOICE,
     COMPONENT_WIFI_WATCHDOG,
     CONF_COMPONENTS,
-    CONF_HA_MIRROR_LABEL,
+    CONF_HA_CONTROL_ENABLED,
     CONF_HA_MIRROR_LEADER_PRIORITY,
     CONF_HA_MIRROR_TOKEN,
     CONF_HA_MIRROR_WS_URL,
@@ -54,11 +54,11 @@ from .const import (
     CONF_ROOT_PASSWORD,
     CONF_VOICE_HA_HOST,
     CONF_VOICE_WAKE_WORD,
+    DATA_HA_MIRROR_RETIRE_VERIFIED,
     DATA_LAST_FIRMWARE,
     DATA_SSH_HOST_KEY,
     DEFAULT_AUTO_REPAIR,
-    DEFAULT_HA_MIRROR_LABEL,
-    DEFAULT_HA_MIRROR_LEADER_PRIORITY,
+    DEFAULT_HA_CONTROL_ENABLED,
     DEFAULT_OFFLINE_GRACE_MINUTES,
     DEFAULT_REPAIR_COOLDOWN_MINUTES,
     DEFAULT_TRUST_HOST_KEY_CHANGES,
@@ -90,6 +90,7 @@ _LOGGER = logging.getLogger(__name__)
 
 _RECOVERY_SECONDS = 60.0
 _UNREACHABLE_RECHECK_SECONDS = 300.0
+_LEGACY_RETIRE_TIMEOUT_SECONDS = 30.0
 
 
 class _HostKeyChanged(Exception):
@@ -99,21 +100,6 @@ class _HostKeyChanged(Exception):
 def _payload_dir() -> Path:
     """The bundled agent payload (built by scripts/build_payload.sh / release CI)."""
     return Path(__file__).parent / "agent_payload"
-
-
-def _ha_mirror_env_from_data(data: Mapping[str, Any]) -> str:
-    """Render the HA mirror env from config-entry data."""
-    return panel_ops.render_ha_mirror_env(
-        panel=data[CONF_PANEL],
-        ha_ws_url=data.get(CONF_HA_MIRROR_WS_URL, ""),
-        ha_token=data.get(CONF_HA_MIRROR_TOKEN, ""),
-        mirror_label=data.get(CONF_HA_MIRROR_LABEL, DEFAULT_HA_MIRROR_LABEL),
-        leader_priority=data.get(CONF_HA_MIRROR_LEADER_PRIORITY, DEFAULT_HA_MIRROR_LEADER_PRIORITY),
-        mqtt_host=data[CONF_MQTT_HOST],
-        mqtt_port=data[CONF_MQTT_PORT],
-        mqtt_username=data[CONF_MQTT_USERNAME],
-        mqtt_password=data[CONF_MQTT_PASSWORD],
-    )
 
 
 class _PayloadState(Protocol):
@@ -161,6 +147,7 @@ class PanelManager:
         self.meta: dict[str, Any] | None = None
         self.problem = False
         self.problem_reason: str | None = None
+        self.legacy_mirror_problem: str | None = None
         self._unsubs: list[Any] = []
         self._grace_cancel: CALLBACK_TYPE | None = None
         self._recovery_cancel: CALLBACK_TYPE | None = None
@@ -185,6 +172,10 @@ class PanelManager:
     def _voice_issue_id(self) -> str:
         """Issue-registry id for 'voice enabled but satellite not running'."""
         return f"voice_missing_{self.entry.entry_id}"
+
+    @property
+    def _ha_mirror_issue_id(self) -> str:
+        return f"ha_mirror_retired_{self.entry.entry_id}"
 
     def _shell(self) -> PanelShell:
         return AsyncsshShell(
@@ -221,7 +212,11 @@ class PanelManager:
             if not self._opt(OPT_TRUST_HOST_KEY_CHANGES, DEFAULT_TRUST_HOST_KEY_CHANGES):
                 raise _HostKeyChanged from None
             repinned = self._shell_unpinned()
-            await repinned.connect()  # unpinned: captures the new key (offers the password)
+            try:
+                await repinned.connect()  # unpinned: captures the new key (offers the password)
+            except BaseException:
+                await repinned.close()
+                raise
             new_key = repinned.pinned_host_key()
             if new_key is None:
                 await repinned.close()
@@ -234,6 +229,9 @@ class PanelManager:
             )
             self._fire(EVENT_HOST_KEY_REPINNED, {"new_host_key": new_key})
             return repinned
+        except BaseException:
+            await shell.close()
+            raise
         return shell
 
     async def async_setup(self) -> None:
@@ -245,6 +243,8 @@ class PanelManager:
         self._unsubs.append(
             await mqtt.async_subscribe(self.hass, meta_topic(self.panel), self._on_meta)
         )
+        if self._legacy_retirement_evidence():
+            await self.async_retire_legacy_ha_mirror()
 
     async def async_shutdown(self) -> None:
         # Latch shutdown FIRST: a repair wedged in the ssh_lock checks this flag
@@ -281,6 +281,123 @@ class PanelManager:
             # "needs attention" repair issue so it doesn't linger after recovery.
             ir.async_delete_issue(self.hass, DOMAIN, self._issue_id)
         self._notify()
+
+    def _legacy_retirement_evidence(self) -> bool:
+        components = self.entry.data.get(CONF_COMPONENTS, {})
+        component_evidence = (
+            isinstance(components, Mapping) and components.get(COMPONENT_HA_MIRROR) is True
+        )
+        config_evidence = any(
+            key in self.entry.data
+            for key in (
+                CONF_HA_MIRROR_WS_URL,
+                CONF_HA_MIRROR_TOKEN,
+                CONF_HA_MIRROR_LEADER_PRIORITY,
+            )
+        )
+        return component_evidence or config_evidence
+
+    def _create_ha_mirror_retirement_issue(self) -> None:
+        ir.async_create_issue(
+            self.hass,
+            DOMAIN,
+            self._ha_mirror_issue_id,
+            is_fixable=False,
+            severity=ir.IssueSeverity.WARNING,
+            translation_key="ha_mirror_retired",
+            translation_placeholders={
+                "panel": self.panel,
+                "reason": "Physical-Control hosting was disabled for responsiveness safety",
+            },
+            learn_more_url="https://github.com/joyfulhouse/brilliant-mqtt/blob/main/docs/ha-integration.md",
+        )
+
+    @staticmethod
+    def _ha_mirror_absent(state: panel_ops.HaMirrorState) -> bool:
+        return not any(
+            (
+                state.unit_present,
+                state.env_present,
+                state.enabled,
+                state.active,
+                state.staged_env_present,
+                state.payload_present,
+            )
+        )
+
+    def _persist_verified_ha_mirror_retirement(self) -> None:
+        data = dict(self.entry.data)
+        components = dict(data.get(CONF_COMPONENTS) or {})
+        components[COMPONENT_HA_MIRROR] = False
+        data[CONF_COMPONENTS] = components
+        data[DATA_HA_MIRROR_RETIRE_VERIFIED] = True
+        if data.get(CONF_HA_CONTROL_ENABLED, DEFAULT_HA_CONTROL_ENABLED) is True:
+            for key in (
+                CONF_HA_MIRROR_WS_URL,
+                CONF_HA_MIRROR_TOKEN,
+                CONF_HA_MIRROR_LEADER_PRIORITY,
+            ):
+                data.pop(key, None)
+        self.hass.config_entries.async_update_entry(self.entry, data=data)
+
+    async def _async_retire_legacy_ha_mirror_on_shell(self, shell: PanelShell) -> bool:
+        """Uninstall and prove absence using a fresh post-write inspection."""
+        initial = await panel_ops.inspect_ha_mirror(shell)
+        evidence = self._legacy_retirement_evidence() or not self._ha_mirror_absent(initial)
+        if not evidence:
+            return True
+        self._create_ha_mirror_retirement_issue()
+        await panel_ops.uninstall_ha_mirror(shell)
+        verified = await panel_ops.inspect_ha_mirror(shell)
+        if not self._ha_mirror_absent(verified):
+            self.legacy_mirror_problem = "Legacy HA mirror retirement could not be verified"
+            return False
+        self._persist_verified_ha_mirror_retirement()
+        self.legacy_mirror_problem = None
+        ir.async_delete_issue(self.hass, DOMAIN, self._ha_mirror_issue_id)
+        return True
+
+    async def async_retire_legacy_ha_mirror(self) -> bool:
+        """Best-effort bounded retirement; panel outages never block entry setup."""
+        enabled = self.entry.data.get(CONF_HA_CONTROL_ENABLED, DEFAULT_HA_CONTROL_ENABLED) is True
+        credentials_remain = any(
+            key in self.entry.data
+            for key in (
+                CONF_HA_MIRROR_WS_URL,
+                CONF_HA_MIRROR_TOKEN,
+                CONF_HA_MIRROR_LEADER_PRIORITY,
+            )
+        )
+        if self.entry.data.get(DATA_HA_MIRROR_RETIRE_VERIFIED) is True and (
+            not enabled or not credentials_remain
+        ):
+            return True
+        if not self._legacy_retirement_evidence():
+            return True
+
+        self._create_ha_mirror_retirement_issue()
+        shell: PanelShell | None = None
+        try:
+            async with asyncio.timeout(_LEGACY_RETIRE_TIMEOUT_SECONDS):
+                async with self._ssh_lock:
+                    if self._shutting_down:
+                        return False
+                    shell = await self._connect_for_repair()
+                    try:
+                        return await self._async_retire_legacy_ha_mirror_on_shell(shell)
+                    finally:
+                        await shell.close()
+                        shell = None
+        except asyncio.CancelledError:
+            self.legacy_mirror_problem = "Legacy HA mirror retirement was interrupted"
+            raise
+        except (TimeoutError, _HostKeyChanged, OSError, asyncssh.Error, PanelOpError):
+            self.legacy_mirror_problem = "Legacy HA mirror retirement could not be verified"
+            _LOGGER.warning("%s: legacy HA mirror retirement could not be verified", self.panel)
+            return False
+        finally:
+            if shell is not None:
+                await shell.close()
 
     def _cancel(self, attr: str) -> None:
         cancel: CALLBACK_TYPE | None = getattr(self, attr)
@@ -366,6 +483,8 @@ class PanelManager:
             mqtt_port=data[CONF_MQTT_PORT],
             mqtt_username=data[CONF_MQTT_USERNAME],
             mqtt_password=data[CONF_MQTT_PASSWORD],
+            scene_bridge_enabled=data.get(CONF_HA_CONTROL_ENABLED, DEFAULT_HA_CONTROL_ENABLED)
+            is True,
         )
         return unit, env
 
@@ -420,27 +539,6 @@ class PanelManager:
             await spec.ensure_unit(shell, unit)
             await spec.enable(shell)
         except (OSError, asyncssh.Error, PanelOpError) as err:
-            return err
-        return None
-
-    async def _relay_ha_mirror(self, shell: PanelShell) -> Exception | None:
-        """Restore the selected HA mirror without blocking the bridge operation."""
-        try:
-            payload_dir = _payload_dir()
-            unit = await self.hass.async_add_executor_job(
-                (payload_dir / "brilliant-ha-mirror.service").read_text
-            )
-            env = _ha_mirror_env_from_data({**self.entry.data, CONF_PANEL: self.panel})
-            await panel_ops.deploy_ha_mirror(shell, str(payload_dir / "ha_mirror"))
-            await panel_ops.ensure_ha_mirror_config(shell, unit, env)
-            await panel_ops.enable_ha_mirror(shell)
-        except (
-            KeyError,
-            ValueError,
-            OSError,
-            asyncssh.Error,
-            PanelOpError,
-        ) as err:
             return err
         return None
 
@@ -551,11 +649,12 @@ class PanelManager:
                     if COMPONENT_BUS_WATCHDOG in selected:
                         if err := await self._relay_watchdog(shell, _BUS_WATCHDOG_RELAY):
                             _LOGGER.warning("%s: bus watchdog repair failed: %s", self.panel, err)
-                    # HA mirror re-lay: refresh its code, unit, and secret env whenever
-                    # selected. Failure is isolated so it cannot block bridge recovery.
-                    if COMPONENT_HA_MIRROR in selected:
-                        if err := await self._relay_ha_mirror(shell):
-                            _LOGGER.warning("%s: HA mirror repair failed: %s", self.panel, err)
+                    try:
+                        await self._async_retire_legacy_ha_mirror_on_shell(shell)
+                    except (OSError, asyncssh.Error, PanelOpError):
+                        self.legacy_mirror_problem = (
+                            "Legacy HA mirror retirement could not be verified"
+                        )
                 except (OSError, asyncssh.Error, PanelOpError) as repair_err:
                     # A checked step (mkdir/daemon-reload/systemctl) exited non-zero.
                     # The panel is half-broken; surface it loudly instead of letting
@@ -646,6 +745,12 @@ class PanelManager:
                     await panel_ops.ensure_configs(shell, unit, env)
                     _p(90)
                     await panel_ops.restart(shell)
+                    try:
+                        await self._async_retire_legacy_ha_mirror_on_shell(shell)
+                    except (OSError, asyncssh.Error, PanelOpError):
+                        self.legacy_mirror_problem = (
+                            "Legacy HA mirror retirement could not be verified"
+                        )
                     _p(95)
                 except (OSError, asyncssh.Error, PanelOpError) as err:
                     self._escalate(f"agent update failed: {err}")
@@ -749,6 +854,8 @@ class PanelManager:
         from .components import REGISTRY  # lazy: components imports manager
 
         component = REGISTRY[component_id]
+        if component.deprecated:
+            raise PanelOpError(f"{component.label} is deprecated and cannot be installed")
         async with self._ssh_lock:
             shell = await self._connect_for_repair()
             try:
@@ -767,6 +874,11 @@ class PanelManager:
         from .components import REGISTRY  # lazy: components imports manager
 
         component = REGISTRY[component_id]
+        if component.deprecated:
+            if not await self.async_retire_legacy_ha_mirror():
+                raise PanelOpError("Legacy HA mirror retirement could not be verified")
+            self._notify()
+            return
         async with self._ssh_lock:
             shell = await self._connect_for_repair()
             try:
@@ -903,13 +1015,12 @@ class PanelManager:
                                 "%s: bus watchdog refresh failed; will retry next reconcile",
                                 self.panel,
                             )
-                    # HA mirror: refresh code plus live/staged secret env after OTA.
-                    if COMPONENT_HA_MIRROR in selected:
-                        if await self._relay_ha_mirror(shell):
-                            _LOGGER.warning(
-                                "%s: HA mirror refresh failed; will retry next reconcile",
-                                self.panel,
-                            )
+                    try:
+                        await self._async_retire_legacy_ha_mirror_on_shell(shell)
+                    except (OSError, asyncssh.Error, PanelOpError):
+                        self.legacy_mirror_problem = (
+                            "Legacy HA mirror retirement could not be verified"
+                        )
                 finally:
                     await shell.close()
         except (OSError, asyncssh.Error, PanelOpError):

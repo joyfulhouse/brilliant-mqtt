@@ -1,6 +1,3 @@
-from pathlib import Path
-from unittest.mock import AsyncMock, patch
-
 import pytest
 from homeassistant.core import HomeAssistant
 
@@ -13,15 +10,6 @@ from custom_components.brilliant_mqtt.const import (
     COMPONENT_VOICE,
     COMPONENT_WIFI_WATCHDOG,
     CONF_COMPONENTS,
-    CONF_HA_MIRROR_LABEL,
-    CONF_HA_MIRROR_LEADER_PRIORITY,
-    CONF_HA_MIRROR_TOKEN,
-    CONF_HA_MIRROR_WS_URL,
-    CONF_MQTT_HOST,
-    CONF_MQTT_PASSWORD,
-    CONF_MQTT_PORT,
-    CONF_MQTT_USERNAME,
-    CONF_PANEL,
 )
 from tests.fakes import FakeShell
 
@@ -75,102 +63,44 @@ def test_default_components_bus_watchdog_on() -> None:
     assert d[COMPONENT_BUS_WATCHDOG] is True
 
 
-def test_ha_mirror_registry_row_default_disabled() -> None:
+def test_ha_mirror_registry_row_is_deprecated_but_keeps_removal_recipe() -> None:
     row = comp.REGISTRY[COMPONENT_HA_MIRROR]
     assert row.id == COMPONENT_HA_MIRROR
     assert row.label == "HA mirror"
     assert row.default_enabled is False
     assert row.locked is False
+    assert row.deprecated is True
+    assert row.remove is panel_ops.uninstall_ha_mirror
 
 
-def test_default_components_ha_mirror_off() -> None:
-    assert comp.default_components()[COMPONENT_HA_MIRROR] is False
+def test_default_components_excludes_deprecated_ha_mirror() -> None:
+    assert COMPONENT_HA_MIRROR not in comp.default_components()
 
 
-def test_optional_order_includes_ha_mirror() -> None:
+def test_optional_order_hides_deprecated_ha_mirror() -> None:
     opts = comp.optional()
     ids = [c.id for c in opts]
     assert ids == [
         COMPONENT_VOICE,
         COMPONENT_WIFI_WATCHDOG,
         COMPONENT_BUS_WATCHDOG,
-        COMPONENT_HA_MIRROR,
     ]
 
 
-async def test_ha_mirror_install_drives_deploy_config_and_enable(
-    hass: HomeAssistant, payload_dir: Path
-) -> None:
-    (payload_dir / "brilliant-ha-mirror.service").write_text("MIRROR_UNIT")
-    shell = FakeShell()
-    await shell.connect()
-    data = {
-        CONF_PANEL: "office",
-        CONF_HA_MIRROR_WS_URL: "ws://homeassistant.local:8123/api/websocket",
-        CONF_HA_MIRROR_TOKEN: "long-lived-token",
-        CONF_HA_MIRROR_LABEL: "home",
-        CONF_HA_MIRROR_LEADER_PRIORITY: 9,
-        CONF_MQTT_HOST: "192.168.1.250",
-        CONF_MQTT_PORT: 1883,
-        CONF_MQTT_USERNAME: "brilliant",
-        CONF_MQTT_PASSWORD: "mqtt-secret",
-    }
-    expected_env = (
-        'PANEL="office"\n'
-        'HA_WS_URL="ws://homeassistant.local:8123/api/websocket"\n'
-        'HA_TOKEN="long-lived-token"\n'
-        'MIRROR_LABEL="home"\n'
-        'LEADER_PRIORITY="9"\n'
-        'MQTT_HOST="192.168.1.250"\n'
-        'MQTT_PORT="1883"\n'
-        'MQTT_USERNAME="brilliant"\n'
-        'MQTT_PASSWORD="mqtt-secret"\n'
-        "LOG_LEVEL=INFO\n"
-    )
-
-    with (
-        patch.object(panel_ops, "deploy_ha_mirror", new_callable=AsyncMock) as deploy,
-        patch.object(panel_ops, "ensure_ha_mirror_config", new_callable=AsyncMock) as ensure,
-        patch.object(panel_ops, "enable_ha_mirror", new_callable=AsyncMock) as enable,
-    ):
-        await comp._hamirror_install(hass, shell, data)
-
-    deploy.assert_awaited_once_with(shell, str(payload_dir / "ha_mirror"))
-    ensure.assert_awaited_once_with(shell, "MIRROR_UNIT", expected_env)
-    enable.assert_awaited_once_with(shell)
-
-
-@pytest.mark.parametrize(
-    "mirror_config",
-    [
-        {},
-        {CONF_HA_MIRROR_WS_URL: "", CONF_HA_MIRROR_TOKEN: ""},
-        {
-            CONF_HA_MIRROR_WS_URL: "ws://homeassistant.local:8123/api/websocket",
-            CONF_HA_MIRROR_TOKEN: "",
-        },
-        {CONF_HA_MIRROR_WS_URL: "", CONF_HA_MIRROR_TOKEN: "long-lived-token"},
-    ],
-)
-async def test_ha_mirror_install_rejects_missing_or_blank_credentials(
+async def test_deprecated_ha_mirror_install_always_fails_closed(
     hass: HomeAssistant,
-    payload_dir: Path,
-    mirror_config: dict[str, str],
 ) -> None:
-    (payload_dir / "brilliant-ha-mirror.service").write_text("MIRROR_UNIT")
     shell = FakeShell()
     await shell.connect()
-    data = {
-        CONF_PANEL: "office",
-        CONF_MQTT_HOST: "192.168.1.250",
-        CONF_MQTT_PORT: 1883,
-        CONF_MQTT_USERNAME: "brilliant",
-        CONF_MQTT_PASSWORD: "mqtt-secret",
-        **mirror_config,
-    }
+    with pytest.raises(panel_ops.PanelOpError, match="deprecated"):
+        await comp.REGISTRY[COMPONENT_HA_MIRROR].install(hass, shell, {})
+    assert not shell.commands
+    assert not shell.uploads
+    assert not shell.dir_uploads
 
-    with pytest.raises(
-        panel_ops.PanelOpError,
-        match="HA mirror needs a Home Assistant WebSocket URL and long-lived token",
-    ):
-        await comp._hamirror_install(hass, shell, data)
+
+def test_selected_ids_never_selects_deprecated_ha_mirror() -> None:
+    selected = comp.selected_ids(
+        {CONF_COMPONENTS: {COMPONENT_BRIDGE: True, COMPONENT_HA_MIRROR: True}}
+    )
+    assert selected == [COMPONENT_BRIDGE]

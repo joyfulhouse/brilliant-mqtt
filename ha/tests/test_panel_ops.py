@@ -101,6 +101,7 @@ def test_render_env_matches_agent_config_contract() -> None:
         mqtt_port=1883,
         mqtt_username="brilliant",
         mqtt_password="secret",
+        scene_bridge_enabled=True,
     )
     # String values are systemd-double-quoted; the int fields stay bare.
     assert env.splitlines() == [
@@ -110,6 +111,7 @@ def test_render_env_matches_agent_config_contract() -> None:
         'MQTT_USERNAME="brilliant"',
         'MQTT_PASSWORD="secret"',
         "MESH_PRIORITY=1",
+        "SCENE_BRIDGE_ENABLED=1",
         "LOG_LEVEL=INFO",
     ]
 
@@ -170,6 +172,7 @@ def test_parse_env_round_trips_render_env() -> None:
         mqtt_port=8883,
         mqtt_username="brilliant",
         mqtt_password='p#a"s\\s',  # the hostile chars _env_quote escapes
+        scene_bridge_enabled=False,
     )
     assert panel_ops.parse_env(env) == {
         "BRILLIANT_PANEL": "office-bath",
@@ -178,6 +181,7 @@ def test_parse_env_round_trips_render_env() -> None:
         "MQTT_USERNAME": "brilliant",
         "MQTT_PASSWORD": 'p#a"s\\s',
         "MESH_PRIORITY": "7",
+        "SCENE_BRIDGE_ENABLED": "0",
         "LOG_LEVEL": "INFO",
     }
 
@@ -571,13 +575,13 @@ async def test_uninstall_voice_sequence_and_paths() -> None:
 
 _FULL_HA_MIRROR_INSPECT = RunResult(
     0,
-    "unit=1\nenabled=1\nactive=1\npayload=1\n",
+    "unit=1\nenv=1\nenabled=1\nactive=1\nsenv=1\npayload=1\n",
     "",
 )
 
 _ABSENT_HA_MIRROR_INSPECT = RunResult(
     0,
-    "unit=0\nenabled=0\nactive=0\npayload=0\n",
+    "unit=0\nenv=0\nenabled=0\nactive=0\nsenv=0\npayload=0\n",
     "",
 )
 
@@ -589,8 +593,10 @@ async def test_inspect_ha_mirror_parses_fully_installed() -> None:
     state = await panel_ops.inspect_ha_mirror(shell)
     assert state == panel_ops.HaMirrorState(
         unit_present=True,
+        env_present=True,
         enabled=True,
         active=True,
+        staged_env_present=True,
         payload_present=True,
     )
 
@@ -602,8 +608,10 @@ async def test_inspect_ha_mirror_parses_all_absent() -> None:
     state = await panel_ops.inspect_ha_mirror(shell)
     assert state == panel_ops.HaMirrorState(
         unit_present=False,
+        env_present=False,
         enabled=False,
         active=False,
+        staged_env_present=False,
         payload_present=False,
     )
 
@@ -613,6 +621,37 @@ def test_ha_mirror_inspect_command_checks_main_entrypoint() -> None:
         f"{PANEL_HA_MIRROR_APP_DIR}/brilliant_ha_mirror/__main__.py"
         in panel_ops.HA_MIRROR_INSPECT_COMMAND
     )
+    assert f"test -f {PANEL_HA_MIRROR_ENV_FILE}" in panel_ops.HA_MIRROR_INSPECT_COMMAND
+    assert (
+        f"{PANEL_HA_MIRROR_STAGED_DIR}/{HA_MIRROR_SERVICE_NAME}.env"
+        in panel_ops.HA_MIRROR_INSPECT_COMMAND
+    )
+
+
+@pytest.mark.parametrize(("enabled", "expected"), [(False, "0"), (True, "1")])
+def test_render_env_exposes_only_scene_bridge_toggle_to_panel(enabled: bool, expected: str) -> None:
+    secret_action = "scene.private_action"
+    secret_label = "private-label"
+    env = panel_ops.render_env(
+        panel="office",
+        mesh_priority=1,
+        mqtt_host="broker",
+        mqtt_port=1883,
+        mqtt_username="user",
+        mqtt_password="password",
+        scene_bridge_enabled=enabled,
+    )
+    assert panel_ops.parse_env(env)["SCENE_BRIDGE_ENABLED"] == expected
+    for forbidden in (
+        "HA_CONTROL_LABEL",
+        "ROOM_OVERRIDES",
+        "SCENE_ACTIONS",
+        "HA_TOKEN",
+        "HA_WS_URL",
+        secret_action,
+        secret_label,
+    ):
+        assert forbidden not in env
 
 
 def test_render_ha_mirror_env_quotes_complete_contract() -> None:

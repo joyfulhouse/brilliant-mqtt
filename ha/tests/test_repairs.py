@@ -100,6 +100,7 @@ async def test_removing_entry_deletes_its_repair_issue(
 
     registry = ir.async_get(hass)
     issue_id = f"needs_attention_{entry.entry_id}"
+    legacy_issue_id = f"ha_mirror_retired_{entry.entry_id}"
 
     # Drive an escalation so the repair issue exists.
     async_fire_mqtt_message(hass, "brilliant/office/availability", "offline")
@@ -107,11 +108,22 @@ async def test_removing_entry_deletes_its_repair_issue(
     async_fire_time_changed(hass, dt_util.utcnow() + timedelta(minutes=11))
     await hass.async_block_till_done()
     assert registry.async_get_issue(DOMAIN, issue_id) is not None
+    ir.async_create_issue(
+        hass,
+        DOMAIN,
+        legacy_issue_id,
+        is_fixable=False,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key="ha_mirror_retired",
+        translation_placeholders={"panel": "office", "reason": "responsiveness safety"},
+    )
+    assert registry.async_get_issue(DOMAIN, legacy_issue_id) is not None
 
     # Removing the entry must clean the issue up (async_remove_entry).
     assert await hass.config_entries.async_remove(entry.entry_id)
     await hass.async_block_till_done()
     assert registry.async_get_issue(DOMAIN, issue_id) is None
+    assert registry.async_get_issue(DOMAIN, legacy_issue_id) is None
 
 
 async def test_update_already_in_progress_raises_translated_error(

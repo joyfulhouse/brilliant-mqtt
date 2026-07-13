@@ -197,6 +197,10 @@ class SceneControl:
         """Return the most recent accepted transport-status timestamp."""
         return self._status_timestamps.get((kind, panel))
 
+    def transport_status(self, kind: _Kind, panel: str) -> bool | None:
+        """Return the latest raw transport status without catalog inference."""
+        return self._status.get((kind, panel))
+
     async def async_start(
         self,
         panels: Collection[str],

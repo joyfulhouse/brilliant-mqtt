@@ -5,6 +5,7 @@ from __future__ import annotations
 from homeassistant.const import Platform
 
 DOMAIN = "brilliant_mqtt"
+CONFIG_ENTRY_VERSION = 3
 PLATFORMS: list[Platform] = [
     Platform.BINARY_SENSOR,
     Platform.BUTTON,
@@ -53,6 +54,7 @@ DEFAULT_HA_CONTROL_ENABLED = False
 DEFAULT_HA_CONTROL_LABEL = "brilliant"
 DEFAULT_HA_CONTROL_DOMAINS = ("light", "switch")
 DEFAULT_MAX_MIRRORED_ENTITIES = 50
+HA_CONTROL_DOMAINS = ("light", "switch", "lock", "cover")
 
 # Per-panel component selection (see docs/ha-integration.md — components/switches).
 CONF_COMPONENTS = "components"  # entry data: {component_id: bool}
@@ -66,6 +68,7 @@ COMPONENT_HA_MIRROR = "ha_mirror"
 DATA_SSH_HOST_KEY = "ssh_host_key"  # TOFU-pinned on first successful connect
 DATA_LAST_FIRMWARE = "last_firmware"  # persisted so panel_updated survives HA restarts
 DATA_CONTROL_PLANE = "ha_control_plane"
+DATA_HA_MIRROR_RETIRE_VERIFIED = "ha_mirror_retire_verified"
 
 # Options keys + defaults.
 OPT_AUTO_REPAIR = "auto_repair"

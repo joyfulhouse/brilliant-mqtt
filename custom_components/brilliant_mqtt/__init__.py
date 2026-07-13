@@ -20,9 +20,24 @@ from homeassistant.helpers.typing import ConfigType
 
 from .const import (
     COMPONENT_BRIDGE,
+    COMPONENT_HA_MIRROR,
     COMPONENT_VOICE,
     CONF_COMPONENTS,
+    CONF_HA_CONTROL_DOMAINS,
+    CONF_HA_CONTROL_ENABLED,
+    CONF_HA_CONTROL_LABEL,
+    CONF_HA_MIRROR_LABEL,
+    CONF_MAX_MIRRORED_ENTITIES,
+    CONF_PANEL,
+    CONF_ROOM_OVERRIDES,
+    CONF_SCENE_ACTIONS,
+    CONF_SCENE_PANEL,
     CONF_VOICE_ENABLED,
+    CONFIG_ENTRY_VERSION,
+    DEFAULT_HA_CONTROL_DOMAINS,
+    DEFAULT_HA_CONTROL_ENABLED,
+    DEFAULT_HA_CONTROL_LABEL,
+    DEFAULT_MAX_MIRRORED_ENTITIES,
     DOMAIN,
     PLATFORMS,
 )
@@ -237,20 +252,37 @@ async def async_setup_entry(hass: HomeAssistant, entry: BrilliantMqttConfigEntry
 
 
 async def async_migrate_entry(hass: HomeAssistant, entry: BrilliantMqttConfigEntry) -> bool:
-    """v1 -> v2: fold the one-off voice_enabled flag into a components dict.
-
-    Optional components not represented in v1 data are simply omitted (treated as
-    not-selected), so migration never silently installs anything on an existing panel.
-    """
-    if entry.version > 2:
+    """Migrate legacy entries to the HA-owned control plane without deleting secrets."""
+    if entry.version > CONFIG_ENTRY_VERSION:
         return False  # downgrade not supported
+    if entry.version == CONFIG_ENTRY_VERSION:
+        return True
+
+    data = dict(entry.data)
     if entry.version == 1:
-        data = dict(entry.data)
         data[CONF_COMPONENTS] = {
             COMPONENT_BRIDGE: True,
             COMPONENT_VOICE: bool(data.get(CONF_VOICE_ENABLED, False)),
         }
-        hass.config_entries.async_update_entry(entry, data=data, version=2)
+    components = dict(data.get(CONF_COMPONENTS) or {})
+    components[COMPONENT_BRIDGE] = True
+    components[COMPONENT_HA_MIRROR] = False
+    data[CONF_COMPONENTS] = components
+
+    if CONF_HA_CONTROL_LABEL not in data:
+        legacy_label = data.get(CONF_HA_MIRROR_LABEL)
+        data[CONF_HA_CONTROL_LABEL] = (
+            legacy_label.strip()
+            if isinstance(legacy_label, str) and legacy_label.strip()
+            else DEFAULT_HA_CONTROL_LABEL
+        )
+    data.setdefault(CONF_HA_CONTROL_ENABLED, DEFAULT_HA_CONTROL_ENABLED)
+    data.setdefault(CONF_ROOM_OVERRIDES, {})
+    data.setdefault(CONF_HA_CONTROL_DOMAINS, list(DEFAULT_HA_CONTROL_DOMAINS))
+    data.setdefault(CONF_MAX_MIRRORED_ENTITIES, DEFAULT_MAX_MIRRORED_ENTITIES)
+    data.setdefault(CONF_SCENE_PANEL, data.get(CONF_PANEL, ""))
+    data.setdefault(CONF_SCENE_ACTIONS, {})
+    hass.config_entries.async_update_entry(entry, data=data, version=CONFIG_ENTRY_VERSION)
     return True
 
 
@@ -264,3 +296,4 @@ async def async_remove_entry(hass: HomeAssistant, entry: BrilliantMqttConfigEntr
     """Delete the panel's repair issues when its config entry is removed."""
     ir.async_delete_issue(hass, DOMAIN, f"needs_attention_{entry.entry_id}")
     ir.async_delete_issue(hass, DOMAIN, f"voice_missing_{entry.entry_id}")
+    ir.async_delete_issue(hass, DOMAIN, f"ha_mirror_retired_{entry.entry_id}")

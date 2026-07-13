@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -11,10 +12,9 @@ import pytest
 import voluptuous as vol
 from homeassistant.const import CONF_NAME
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.selector import TextSelector, TextSelectorType
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.brilliant_mqtt import config_flow, panel_ops
+from custom_components.brilliant_mqtt import async_migrate_entry, config_flow, panel_ops
 from custom_components.brilliant_mqtt.config_flow import _PanelProbe, _slugify, _WrongPanelError
 from custom_components.brilliant_mqtt.const import (
     COMPONENT_BRIDGE,
@@ -23,23 +23,33 @@ from custom_components.brilliant_mqtt.const import (
     COMPONENT_VOICE,
     COMPONENT_WIFI_WATCHDOG,
     CONF_COMPONENTS,
+    CONF_HA_CONTROL_DOMAINS,
+    CONF_HA_CONTROL_ENABLED,
+    CONF_HA_CONTROL_LABEL,
     CONF_HA_MIRROR_LABEL,
     CONF_HA_MIRROR_LEADER_PRIORITY,
     CONF_HA_MIRROR_TOKEN,
     CONF_HA_MIRROR_WS_URL,
     CONF_HOST,
+    CONF_MAX_MIRRORED_ENTITIES,
     CONF_MESH_PRIORITY,
     CONF_MQTT_HOST,
     CONF_MQTT_PASSWORD,
     CONF_MQTT_PORT,
     CONF_MQTT_USERNAME,
     CONF_PANEL,
+    CONF_ROOM_OVERRIDES,
     CONF_ROOT_PASSWORD,
+    CONF_SCENE_ACTIONS,
+    CONF_SCENE_PANEL,
+    CONF_VOICE_ENABLED,
     CONF_VOICE_HA_HOST,
     CONF_VOICE_WAKE_WORD,
     DATA_SSH_HOST_KEY,
-    DEFAULT_HA_MIRROR_LABEL,
-    DEFAULT_HA_MIRROR_LEADER_PRIORITY,
+    DEFAULT_HA_CONTROL_DOMAINS,
+    DEFAULT_HA_CONTROL_ENABLED,
+    DEFAULT_HA_CONTROL_LABEL,
+    DEFAULT_MAX_MIRRORED_ENTITIES,
     DOMAIN,
     OPT_AUTO_REPAIR,
     OPT_OFFLINE_GRACE_MINUTES,
@@ -67,11 +77,13 @@ SCRIPT_INPUT = {
     COMPONENT_VOICE: False,
     CONF_VOICE_WAKE_WORD: "okay_nabu",
     CONF_VOICE_HA_HOST: "",
-    COMPONENT_HA_MIRROR: False,
-    CONF_HA_MIRROR_WS_URL: "",
-    CONF_HA_MIRROR_TOKEN: "",
-    CONF_HA_MIRROR_LEADER_PRIORITY: DEFAULT_HA_MIRROR_LEADER_PRIORITY,
-    CONF_HA_MIRROR_LABEL: DEFAULT_HA_MIRROR_LABEL,
+    CONF_HA_CONTROL_ENABLED: DEFAULT_HA_CONTROL_ENABLED,
+    CONF_HA_CONTROL_LABEL: DEFAULT_HA_CONTROL_LABEL,
+    CONF_ROOM_OVERRIDES: "{}",
+    CONF_HA_CONTROL_DOMAINS: list(DEFAULT_HA_CONTROL_DOMAINS),
+    CONF_MAX_MIRRORED_ENTITIES: DEFAULT_MAX_MIRRORED_ENTITIES,
+    CONF_SCENE_PANEL: "office-bath",
+    CONF_SCENE_ACTIONS: "{}",
 }
 
 FETCH_VOICE = "custom_components.brilliant_mqtt.components.async_fetch_voice_payload"
@@ -88,11 +100,13 @@ RECONFIG_INPUT = {
     COMPONENT_WIFI_WATCHDOG: False,
     CONF_VOICE_WAKE_WORD: "okay_nabu",
     CONF_VOICE_HA_HOST: "",
-    COMPONENT_HA_MIRROR: False,
-    CONF_HA_MIRROR_WS_URL: "",
-    CONF_HA_MIRROR_TOKEN: "",
-    CONF_HA_MIRROR_LEADER_PRIORITY: DEFAULT_HA_MIRROR_LEADER_PRIORITY,
-    CONF_HA_MIRROR_LABEL: DEFAULT_HA_MIRROR_LABEL,
+    CONF_HA_CONTROL_ENABLED: DEFAULT_HA_CONTROL_ENABLED,
+    CONF_HA_CONTROL_LABEL: DEFAULT_HA_CONTROL_LABEL,
+    CONF_ROOM_OVERRIDES: "{}",
+    CONF_HA_CONTROL_DOMAINS: list(DEFAULT_HA_CONTROL_DOMAINS),
+    CONF_MAX_MIRRORED_ENTITIES: DEFAULT_MAX_MIRRORED_ENTITIES,
+    CONF_SCENE_PANEL: "office",
+    CONF_SCENE_ACTIONS: "{}",
 }
 
 
@@ -514,7 +528,7 @@ async def test_script_step_rejects_control_char_in_voice_ha_host(
 
 async def test_installed_adopts_from_panel(hass: HomeAssistant) -> None:
     result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": "user"})
-    with patch(PROBE, return_value=_installed(_env(panel="office"))):
+    with patch(PROBE, return_value=_installed(_env(panel="office", scene_bridge_enabled=True))):
         result = await hass.config_entries.flow.async_configure(result["flow_id"], CONNECT_INPUT)
     assert result["type"] == "create_entry"
     assert result["title"] == "Brilliant office"
@@ -528,6 +542,7 @@ async def test_installed_adopts_from_panel(hass: HomeAssistant) -> None:
     assert data[CONF_MQTT_PORT] == 8883
     assert data[CONF_MQTT_PASSWORD] == "frombroker"
     assert data[CONF_MESH_PRIORITY] == 3
+    assert data[CONF_HA_CONTROL_ENABLED] is True
 
 
 async def test_installed_duplicate_aborts(hass: HomeAssistant) -> None:
@@ -690,6 +705,7 @@ async def test_reconfigure_same_host_applies_and_pushes(hass: HomeAssistant) -> 
     assert 'BRILLIANT_PANEL="office"' in env
     assert "MESH_PRIORITY=5" in env
     assert 'MQTT_PASSWORD="newbroker"' in env
+    assert "SCENE_BRIDGE_ENABLED=0" in env
     # The entry is updated; slug preserved.
     assert entry.data[CONF_ROOT_PASSWORD] == "newpass"
     assert entry.data[CONF_MQTT_PASSWORD] == "newbroker"
@@ -833,99 +849,18 @@ async def test_install_step_persists_components(
     assert patch_installs.called(COMPONENT_VOICE)
 
 
-@pytest.mark.asyncio
-async def test_install_step_collects_ha_mirror_config_and_installs(
-    hass: HomeAssistant,
-    not_installed_panel: None,
-    patch_installs: Any,
-) -> None:
-    result = await _drive_flow_to_script(hass)
-    token = "long-lived-secret-token"
-    result = await hass.config_entries.flow.async_configure(
-        result["flow_id"],
-        {
-            **SCRIPT_INPUT,
-            CONF_NAME: "Office",
-            COMPONENT_HA_MIRROR: True,
-            CONF_HA_MIRROR_WS_URL: "ws://homeassistant.local:8123/api/websocket",
-            CONF_HA_MIRROR_TOKEN: token,
-            CONF_HA_MIRROR_LEADER_PRIORITY: 7,
-            CONF_HA_MIRROR_LABEL: "downstairs",
-        },
-    )
-    assert result["type"] == "create_entry"
-    data = result["data"]
-    assert data[CONF_COMPONENTS][COMPONENT_HA_MIRROR] is True
-    assert data[CONF_HA_MIRROR_WS_URL] == "ws://homeassistant.local:8123/api/websocket"
-    assert data[CONF_HA_MIRROR_TOKEN] == token
-    assert data[CONF_HA_MIRROR_LEADER_PRIORITY] == 7
-    assert data[CONF_HA_MIRROR_LABEL] == "downstairs"
-    assert patch_installs.called(COMPONENT_HA_MIRROR)
-
-
-@pytest.mark.parametrize(
-    "blank_field",
-    [CONF_HA_MIRROR_WS_URL, CONF_HA_MIRROR_TOKEN],
-)
-async def test_install_step_requires_ha_mirror_url_and_token(
-    hass: HomeAssistant,
-    not_installed_panel: None,
-    patch_installs: Any,
-    blank_field: str,
-) -> None:
-    """A selected HA mirror cannot create an entry with either required field blank."""
-    result = await _drive_flow_to_script(hass)
-    user_input = {
-        **SCRIPT_INPUT,
-        CONF_NAME: "Office",
-        COMPONENT_HA_MIRROR: True,
-        CONF_HA_MIRROR_WS_URL: "ws://homeassistant.local:8123/api/websocket",
-        CONF_HA_MIRROR_TOKEN: "long-lived-token",
-    }
-    user_input[blank_field] = ""
-
-    result = await hass.config_entries.flow.async_configure(result["flow_id"], user_input)
-
-    assert result["type"] == "form" and result["step_id"] == "script"
-    assert result["errors"] == {blank_field: "ha_mirror_required"}
-    assert not hass.config_entries.async_entries(DOMAIN)
-    assert not patch_installs.called(COMPONENT_HA_MIRROR)
-
-
-async def test_ha_mirror_token_uses_password_selector(
-    hass: HomeAssistant,
-    not_installed_panel: None,
+async def test_deprecated_ha_mirror_fields_are_hidden_from_new_install(
+    hass: HomeAssistant, not_installed_panel: None
 ) -> None:
     result = await _drive_flow_to_script(hass)
     schema = result["data_schema"]
     assert schema is not None
-    token_selector = next(
-        validator
-        for marker, validator in schema.schema.items()
-        if str(marker) == CONF_HA_MIRROR_TOKEN
-    )
-    assert isinstance(token_selector, TextSelector)
-    assert token_selector.config["type"] == TextSelectorType.PASSWORD
-
-
-@pytest.mark.parametrize("priority", [-1, 100])
-async def test_ha_mirror_leader_priority_rejects_out_of_range_values(
-    hass: HomeAssistant, not_installed_panel: None, priority: int
-) -> None:
-    result = await _drive_flow_to_script(hass)
-    schema = result["data_schema"]
-    assert schema is not None
-    with pytest.raises(vol.Invalid) as err:
-        schema(
-            {
-                **SCRIPT_INPUT,
-                COMPONENT_HA_MIRROR: True,
-                CONF_HA_MIRROR_WS_URL: "ws://homeassistant.local:8123/api/websocket",
-                CONF_HA_MIRROR_TOKEN: "secret",
-                CONF_HA_MIRROR_LEADER_PRIORITY: priority,
-            }
-        )
-    assert err.value.path == [CONF_HA_MIRROR_LEADER_PRIORITY]
+    fields = {str(marker) for marker in schema.schema}
+    assert COMPONENT_HA_MIRROR not in fields
+    assert CONF_HA_MIRROR_WS_URL not in fields
+    assert CONF_HA_MIRROR_TOKEN not in fields
+    assert CONF_HA_MIRROR_LEADER_PRIORITY not in fields
+    assert CONF_HA_MIRROR_LABEL not in fields
 
 
 # --- options ---------------------------------------------------------------
@@ -970,7 +905,6 @@ def reconfigure_input(
     voice: bool | None = None,
     wifi_watchdog: bool | None = None,
     bus_watchdog: bool | None = None,
-    ha_mirror: bool | None = None,
 ) -> dict[str, Any]:
     """Build a full reconfigure user_input dict from entry data.
 
@@ -982,7 +916,6 @@ def reconfigure_input(
     current_voice = bool(comps.get(COMPONENT_VOICE, False))
     current_wd = bool(comps.get(COMPONENT_WIFI_WATCHDOG, False))
     current_bus_wd = bool(comps.get(COMPONENT_BUS_WATCHDOG, False))
-    current_ha_mirror = bool(comps.get(COMPONENT_HA_MIRROR, False))
     return {
         CONF_HOST: data[CONF_HOST],
         CONF_ROOT_PASSWORD: data[CONF_ROOT_PASSWORD],
@@ -994,15 +927,19 @@ def reconfigure_input(
         COMPONENT_VOICE: voice if voice is not None else current_voice,
         COMPONENT_WIFI_WATCHDOG: wifi_watchdog if wifi_watchdog is not None else current_wd,
         COMPONENT_BUS_WATCHDOG: (bus_watchdog if bus_watchdog is not None else current_bus_wd),
-        COMPONENT_HA_MIRROR: ha_mirror if ha_mirror is not None else current_ha_mirror,
         CONF_VOICE_WAKE_WORD: data.get(CONF_VOICE_WAKE_WORD, "okay_nabu"),
         CONF_VOICE_HA_HOST: data.get(CONF_VOICE_HA_HOST, ""),
-        CONF_HA_MIRROR_WS_URL: data.get(CONF_HA_MIRROR_WS_URL, ""),
-        CONF_HA_MIRROR_TOKEN: data.get(CONF_HA_MIRROR_TOKEN, ""),
-        CONF_HA_MIRROR_LEADER_PRIORITY: data.get(
-            CONF_HA_MIRROR_LEADER_PRIORITY, DEFAULT_HA_MIRROR_LEADER_PRIORITY
+        CONF_HA_CONTROL_ENABLED: data.get(CONF_HA_CONTROL_ENABLED, DEFAULT_HA_CONTROL_ENABLED),
+        CONF_HA_CONTROL_LABEL: data.get(CONF_HA_CONTROL_LABEL, DEFAULT_HA_CONTROL_LABEL),
+        CONF_ROOM_OVERRIDES: json.dumps(data.get(CONF_ROOM_OVERRIDES, {}), sort_keys=True),
+        CONF_HA_CONTROL_DOMAINS: list(
+            data.get(CONF_HA_CONTROL_DOMAINS, DEFAULT_HA_CONTROL_DOMAINS)
         ),
-        CONF_HA_MIRROR_LABEL: data.get(CONF_HA_MIRROR_LABEL, DEFAULT_HA_MIRROR_LABEL),
+        CONF_MAX_MIRRORED_ENTITIES: data.get(
+            CONF_MAX_MIRRORED_ENTITIES, DEFAULT_MAX_MIRRORED_ENTITIES
+        ),
+        CONF_SCENE_PANEL: data.get(CONF_SCENE_PANEL, data[CONF_PANEL]),
+        CONF_SCENE_ACTIONS: json.dumps(data.get(CONF_SCENE_ACTIONS, {}), sort_keys=True),
     }
 
 
@@ -1069,10 +1006,8 @@ async def test_reconfigure_rejects_control_char_in_voice_ha_host(
     apply.assert_not_called()
 
 
-@pytest.mark.asyncio
-async def test_reconfigure_updates_ha_mirror_config(
+async def test_reconfigure_hides_legacy_mirror_and_preserves_credentials_until_retired(
     hass: HomeAssistant,
-    patch_installs: Any,
 ) -> None:
     entry = _full_entry(
         hass,
@@ -1091,66 +1026,24 @@ async def test_reconfigure_updates_ha_mirror_config(
         },
     )
     result = await start_reconfigure(hass, entry)
-    updated = {
-        **reconfigure_input(entry),
-        CONF_HA_MIRROR_WS_URL: "wss://new-ha.example/api/websocket",
-        CONF_HA_MIRROR_TOKEN: "new-secret",
-        CONF_HA_MIRROR_LEADER_PRIORITY: 9,
-        CONF_HA_MIRROR_LABEL: "upstairs",
-    }
+    schema = result["data_schema"]
+    assert schema is not None
+    fields = {str(marker) for marker in schema.schema}
+    assert COMPONENT_HA_MIRROR not in fields
+    assert CONF_HA_MIRROR_WS_URL not in fields
+    assert CONF_HA_MIRROR_TOKEN not in fields
+    assert CONF_HA_MIRROR_LEADER_PRIORITY not in fields
+    assert CONF_HA_MIRROR_LABEL not in fields
+
+    updated = reconfigure_input(entry)
     with patch(APPLY, return_value="ssh-ed25519 STORED"):
         result = await hass.config_entries.flow.async_configure(result["flow_id"], updated)
     assert result["type"] == "abort" and result["reason"] == "reconfigure_successful"
-    assert entry.data[CONF_HA_MIRROR_WS_URL] == "wss://new-ha.example/api/websocket"
-    assert entry.data[CONF_HA_MIRROR_TOKEN] == "new-secret"
-    assert entry.data[CONF_HA_MIRROR_LEADER_PRIORITY] == 9
-    assert entry.data[CONF_HA_MIRROR_LABEL] == "upstairs"
-    assert patch_installs.called(COMPONENT_HA_MIRROR)
-    assert not patch_installs.removed(COMPONENT_HA_MIRROR)
-    assert not patch_installs.called(COMPONENT_VOICE)
-    assert not patch_installs.called(COMPONENT_WIFI_WATCHDOG)
-    assert not patch_installs.called(COMPONENT_BUS_WATCHDOG)
-
-
-@pytest.mark.parametrize(
-    "blank_field",
-    [CONF_HA_MIRROR_WS_URL, CONF_HA_MIRROR_TOKEN],
-)
-async def test_reconfigure_requires_selected_ha_mirror_url_and_token(
-    hass: HomeAssistant,
-    blank_field: str,
-) -> None:
-    entry = _full_entry(
-        hass,
-        **{
-            CONF_COMPONENTS: {COMPONENT_BRIDGE: True, COMPONENT_HA_MIRROR: True},
-            CONF_HA_MIRROR_WS_URL: "ws://homeassistant.local:8123/api/websocket",
-            CONF_HA_MIRROR_TOKEN: "long-lived-token",
-        },
-    )
-    result = await start_reconfigure(hass, entry)
-    user_input = {**reconfigure_input(entry), blank_field: ""}
-
-    with patch(APPLY) as apply:
-        result = await hass.config_entries.flow.async_configure(result["flow_id"], user_input)
-
-    assert result["type"] == "form" and result["step_id"] == "reconfigure"
-    assert result["errors"] == {blank_field: "ha_mirror_required"}
-    apply.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_reconfigure_rejects_control_char_in_ha_mirror_token(
-    hass: HomeAssistant,
-) -> None:
-    entry = _full_entry(hass)
-    result = await start_reconfigure(hass, entry)
-    bad_input = {**reconfigure_input(entry), CONF_HA_MIRROR_TOKEN: "secret\nvalue"}
-    with patch(APPLY) as apply:
-        result = await hass.config_entries.flow.async_configure(result["flow_id"], bad_input)
-    assert result["type"] == "form"
-    assert result["errors"] == {CONF_HA_MIRROR_TOKEN: "invalid_value"}
-    apply.assert_not_called()
+    assert entry.data[CONF_HA_MIRROR_WS_URL] == "ws://old-ha:8123/api/websocket"
+    assert entry.data[CONF_HA_MIRROR_TOKEN] == "old-secret"
+    assert entry.data[CONF_HA_MIRROR_LEADER_PRIORITY] == 2
+    assert entry.data[CONF_HA_MIRROR_LABEL] == "old-label"
+    assert entry.data[CONF_COMPONENTS][COMPONENT_HA_MIRROR] is False
 
 
 @pytest.mark.asyncio
@@ -1205,3 +1098,352 @@ async def test_reconfigure_migrated_entry_watchdog_default_not_preselected(
     assert result["type"] == "abort" and result["reason"] == "reconfigure_successful"
     assert not patch_installs.called(COMPONENT_WIFI_WATCHDOG)
     assert not patch_installs.removed(COMPONENT_WIFI_WATCHDOG)
+
+
+# --- Task 9: safe HA control configuration + migration --------------------
+
+
+GLOBAL_KEYS = (
+    CONF_HA_CONTROL_ENABLED,
+    CONF_HA_CONTROL_LABEL,
+    CONF_ROOM_OVERRIDES,
+    CONF_HA_CONTROL_DOMAINS,
+    CONF_MAX_MIRRORED_ENTITIES,
+    CONF_SCENE_PANEL,
+    CONF_SCENE_ACTIONS,
+)
+
+
+def _schema_default(result: Any, key: str) -> Any:
+    schema = result["data_schema"]
+    assert schema is not None
+    marker = next(marker for marker in schema.schema if str(marker) == key)
+    default = marker.default
+    return default() if default is not vol.UNDEFINED and callable(default) else default
+
+
+async def test_new_install_control_defaults_are_explicit_and_persist_decoded(
+    hass: HomeAssistant,
+    not_installed_panel: None,
+    patch_installs: Any,
+) -> None:
+    result = await _drive_flow_to_script(hass)
+    assert _schema_default(result, CONF_HA_CONTROL_ENABLED) is False
+    assert _schema_default(result, CONF_HA_CONTROL_LABEL) == "brilliant"
+    assert _schema_default(result, CONF_ROOM_OVERRIDES) == "{}"
+    assert _schema_default(result, CONF_HA_CONTROL_DOMAINS) == ["light", "switch"]
+    assert _schema_default(result, CONF_MAX_MIRRORED_ENTITIES) == 50
+    # The panel slug is derived from the name submitted on this same step, so the
+    # untouched form uses a safe blank sentinel and persists the current panel.
+    assert _schema_default(result, CONF_SCENE_PANEL) == ""
+    assert _schema_default(result, CONF_SCENE_ACTIONS) == "{}"
+
+    actions = {
+        "office-bath:all_off": {
+            "domain": "scene",
+            "service": "turn_on",
+            "target": {"entity_id": ["scene.downstairs_off"]},
+            "data": {},
+        }
+    }
+    submitted = {
+        **SCRIPT_INPUT,
+        CONF_HA_CONTROL_ENABLED: True,
+        CONF_HA_CONTROL_LABEL: "  ha-visible  ",
+        CONF_ROOM_OVERRIDES: '{"Office":"Office Bath"}',
+        CONF_HA_CONTROL_DOMAINS: ["switch", "light"],
+        CONF_MAX_MIRRORED_ENTITIES: 12,
+        CONF_SCENE_ACTIONS: json.dumps(actions),
+    }
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], submitted)
+    assert result["type"] == "create_entry"
+    data = result["data"]
+    assert data[CONF_HA_CONTROL_LABEL] == "ha-visible"
+    assert data[CONF_ROOM_OVERRIDES] == {"Office": "Office Bath"}
+    assert data[CONF_HA_CONTROL_DOMAINS] == ["light", "switch"]
+    assert data[CONF_SCENE_ACTIONS] == actions
+    assert all(not isinstance(data[key], str) for key in (CONF_ROOM_OVERRIDES, CONF_SCENE_ACTIONS))
+
+
+@pytest.mark.parametrize(
+    ("changed", "field"),
+    [
+        ({CONF_HA_CONTROL_LABEL: "   "}, CONF_HA_CONTROL_LABEL),
+        ({CONF_ROOM_OVERRIDES: "[]"}, CONF_ROOM_OVERRIDES),
+        ({CONF_ROOM_OVERRIDES: '{"Office":7}'}, CONF_ROOM_OVERRIDES),
+        ({CONF_HA_CONTROL_DOMAINS: ["light", "light"]}, CONF_HA_CONTROL_DOMAINS),
+        ({CONF_HA_CONTROL_DOMAINS: ["light", "climate"]}, CONF_HA_CONTROL_DOMAINS),
+        ({CONF_MAX_MIRRORED_ENTITIES: True}, CONF_MAX_MIRRORED_ENTITIES),
+        ({CONF_MAX_MIRRORED_ENTITIES: 0}, CONF_MAX_MIRRORED_ENTITIES),
+        ({CONF_MAX_MIRRORED_ENTITIES: 201}, CONF_MAX_MIRRORED_ENTITIES),
+        ({CONF_SCENE_PANEL: "backyard"}, CONF_SCENE_PANEL),
+        ({CONF_SCENE_ACTIONS: "[]"}, CONF_SCENE_ACTIONS),
+        (
+            {
+                CONF_SCENE_ACTIONS: json.dumps(
+                    {
+                        "backyard:all_off": {
+                            "domain": "scene",
+                            "service": "turn_on",
+                            "target": {},
+                            "data": {},
+                        }
+                    }
+                )
+            },
+            CONF_SCENE_ACTIONS,
+        ),
+        (
+            {
+                CONF_SCENE_ACTIONS: json.dumps(
+                    {
+                        "office-bath:all_off": {
+                            "domain": "scene",
+                            "service": "Turn On",
+                            "target": {"secret": "never"},
+                            "data": {},
+                        }
+                    }
+                )
+            },
+            CONF_SCENE_ACTIONS,
+        ),
+    ],
+)
+async def test_control_validation_fails_closed_and_preserves_safe_text(
+    hass: HomeAssistant,
+    not_installed_panel: None,
+    changed: dict[str, Any],
+    field: str,
+) -> None:
+    result = await _drive_flow_to_script(hass)
+    submitted = {**SCRIPT_INPUT, **changed}
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], submitted)
+    assert result["type"] == "form" and result["step_id"] == "script"
+    assert result["errors"] == {field: "invalid_value"}
+    if field in (CONF_ROOM_OVERRIDES, CONF_SCENE_ACTIONS):
+        assert _suggested_values(result)[field] == submitted[field]
+    assert not hass.config_entries.async_entries(DOMAIN)
+
+
+async def test_new_panel_inherits_existing_fleet_global_values(
+    hass: HomeAssistant,
+    not_installed_panel: None,
+    patch_installs: Any,
+) -> None:
+    inherited = {
+        CONF_HA_CONTROL_ENABLED: True,
+        CONF_HA_CONTROL_LABEL: "whole_home",
+        CONF_ROOM_OVERRIDES: {"Office": "Office Bath"},
+        CONF_HA_CONTROL_DOMAINS: ["light", "cover"],
+        CONF_MAX_MIRRORED_ENTITIES: 33,
+        CONF_SCENE_PANEL: "office",
+        CONF_SCENE_ACTIONS: {},
+    }
+    _full_entry(hass, **inherited)
+    result = await _drive_flow_to_script(hass)
+    assert _schema_default(result, CONF_HA_CONTROL_ENABLED) is True
+    assert _schema_default(result, CONF_HA_CONTROL_LABEL) == "whole_home"
+    assert _schema_default(result, CONF_ROOM_OVERRIDES) == '{"Office":"Office Bath"}'
+    assert _schema_default(result, CONF_HA_CONTROL_DOMAINS) == ["light", "cover"]
+    assert _schema_default(result, CONF_SCENE_PANEL) == "office"
+
+    submitted = {
+        **SCRIPT_INPUT,
+        CONF_NAME: "Backyard",
+        CONF_HA_CONTROL_ENABLED: True,
+        CONF_HA_CONTROL_LABEL: "whole_home",
+        CONF_ROOM_OVERRIDES: '{"Office":"Office Bath"}',
+        CONF_HA_CONTROL_DOMAINS: ["light", "cover"],
+        CONF_MAX_MIRRORED_ENTITIES: 33,
+        CONF_SCENE_PANEL: "office",
+        CONF_SCENE_ACTIONS: "{}",
+    }
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], submitted)
+    assert result["type"] == "create_entry"
+    assert {key: result["data"][key] for key in GLOBAL_KEYS} == inherited
+
+
+async def test_adopted_panel_inherits_fleet_globals_over_stale_panel_toggle(
+    hass: HomeAssistant,
+) -> None:
+    inherited = {
+        CONF_HA_CONTROL_ENABLED: True,
+        CONF_HA_CONTROL_LABEL: "whole_home",
+        CONF_ROOM_OVERRIDES: {"Office": "Office Bath"},
+        CONF_HA_CONTROL_DOMAINS: ["light", "cover"],
+        CONF_MAX_MIRRORED_ENTITIES: 33,
+        CONF_SCENE_PANEL: "office",
+        CONF_SCENE_ACTIONS: {},
+    }
+    _full_entry(hass, **inherited)
+    result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": "user"})
+    with patch(
+        PROBE,
+        return_value=_installed(_env(panel="backyard", scene_bridge_enabled=False)),
+    ):
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], CONNECT_INPUT)
+
+    assert result["type"] == "create_entry"
+    assert {key: result["data"][key] for key in GLOBAL_KEYS} == inherited
+
+
+async def test_new_panel_global_save_propagates_to_existing_fleet_entries(
+    hass: HomeAssistant,
+    not_installed_panel: None,
+    patch_installs: Any,
+) -> None:
+    office = _full_entry(hass, **{"unrelated": "preserved"})
+    before = dict(office.data)
+    desired = {
+        CONF_HA_CONTROL_ENABLED: True,
+        CONF_HA_CONTROL_LABEL: "whole_home",
+        CONF_ROOM_OVERRIDES: {"Office": "Office Bath"},
+        CONF_HA_CONTROL_DOMAINS: ["light", "lock"],
+        CONF_MAX_MIRRORED_ENTITIES: 33,
+        CONF_SCENE_PANEL: "office",
+        CONF_SCENE_ACTIONS: {},
+    }
+    result = await _drive_flow_to_script(hass)
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {
+            **SCRIPT_INPUT,
+            CONF_NAME: "Backyard",
+            CONF_HA_CONTROL_ENABLED: True,
+            CONF_HA_CONTROL_LABEL: "whole_home",
+            CONF_ROOM_OVERRIDES: '{"Office":"Office Bath"}',
+            CONF_HA_CONTROL_DOMAINS: ["light", "lock"],
+            CONF_MAX_MIRRORED_ENTITIES: 33,
+            CONF_SCENE_PANEL: "office",
+            CONF_SCENE_ACTIONS: "{}",
+        },
+    )
+
+    assert result["type"] == "create_entry"
+    assert {key: office.data[key] for key in GLOBAL_KEYS} == desired
+    for key, value in before.items():
+        assert office.data[key] == value
+
+
+async def test_reconfigure_propagates_identical_globals_without_touching_panel_data(
+    hass: HomeAssistant,
+) -> None:
+    office = _full_entry(hass, **{CONF_COMPONENTS: {COMPONENT_BRIDGE: True}})
+    backyard = _full_entry(
+        hass,
+        **{
+            CONF_PANEL: "backyard",
+            CONF_HOST: "192.168.1.11",
+            CONF_ROOT_PASSWORD: "backyard-root",
+            CONF_MQTT_PASSWORD: "backyard-mqtt",
+            DATA_SSH_HOST_KEY: "ssh-ed25519 BACKYARD",
+            "unrelated": "keep-me",
+        },
+    )
+    before = dict(backyard.data)
+    actions = {
+        "backyard:movie": {
+            "domain": "script",
+            "service": "turn_on",
+            "target": {"entity_id": ["script.movie"]},
+            "data": {"variables": {"safe": True}},
+        }
+    }
+    desired = {
+        CONF_HA_CONTROL_ENABLED: True,
+        CONF_HA_CONTROL_LABEL: "controlled",
+        CONF_ROOM_OVERRIDES: {"Office": "Office Bath"},
+        CONF_HA_CONTROL_DOMAINS: ["light", "lock"],
+        CONF_MAX_MIRRORED_ENTITIES: 99,
+        CONF_SCENE_PANEL: "backyard",
+        CONF_SCENE_ACTIONS: actions,
+    }
+    result = await office.start_reconfigure_flow(hass)
+    submitted = {
+        **reconfigure_input(office),
+        **desired,
+        CONF_ROOM_OVERRIDES: json.dumps(desired[CONF_ROOM_OVERRIDES]),
+        CONF_SCENE_ACTIONS: json.dumps(actions),
+    }
+    with patch(APPLY, return_value="ssh-ed25519 STORED") as apply:
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], submitted)
+    assert result["type"] == "abort" and result["reason"] == "reconfigure_successful"
+    for entry in (office, backyard):
+        assert {key: entry.data[key] for key in GLOBAL_KEYS} == desired
+    assert "SCENE_BRIDGE_ENABLED=1" in apply.call_args.kwargs["env_content"]
+    for key in (
+        CONF_HOST,
+        CONF_ROOT_PASSWORD,
+        CONF_MQTT_PASSWORD,
+        DATA_SSH_HOST_KEY,
+        "unrelated",
+    ):
+        if key in before:
+            assert backyard.data[key] == before[key]
+
+
+@pytest.mark.parametrize("version", [1, 2])
+async def test_migration_adds_safe_defaults_and_preserves_legacy_secrets(
+    hass: HomeAssistant, version: int
+) -> None:
+    data = {
+        CONF_PANEL: "office",
+        CONF_COMPONENTS: {
+            COMPONENT_BRIDGE: True,
+            COMPONENT_VOICE: True,
+            COMPONENT_HA_MIRROR: True,
+        },
+        CONF_HA_MIRROR_LABEL: "legacy_label",
+        CONF_HA_MIRROR_WS_URL: "ws://ha/api/websocket",
+        CONF_HA_MIRROR_TOKEN: "legacy-secret",
+        CONF_HA_MIRROR_LEADER_PRIORITY: 7,
+        CONF_VOICE_ENABLED: True,
+        "unrelated": "preserved",
+    }
+    entry = MockConfigEntry(domain=DOMAIN, version=version, data=data)
+    entry.add_to_hass(hass)
+    assert await async_migrate_entry(hass, entry) is True
+    assert entry.version == config_flow.BrilliantMqttConfigFlow.VERSION
+    assert entry.data[CONF_COMPONENTS][COMPONENT_HA_MIRROR] is False
+    assert entry.data[CONF_COMPONENTS][COMPONENT_VOICE] is True
+    assert entry.data[CONF_HA_CONTROL_LABEL] == "legacy_label"
+    assert entry.data[CONF_HA_CONTROL_ENABLED] is False
+    assert entry.data[CONF_HA_CONTROL_DOMAINS] == ["light", "switch"]
+    assert entry.data[CONF_ROOM_OVERRIDES] == {}
+    assert entry.data[CONF_SCENE_PANEL] == "office"
+    assert entry.data[CONF_SCENE_ACTIONS] == {}
+    assert entry.data[CONF_HA_MIRROR_TOKEN] == "legacy-secret"
+    assert entry.data[CONF_HA_MIRROR_WS_URL] == "ws://ha/api/websocket"
+    assert entry.data[CONF_HA_MIRROR_LEADER_PRIORITY] == 7
+    assert entry.data["unrelated"] == "preserved"
+
+    migrated = dict(entry.data)
+    assert await async_migrate_entry(hass, entry) is True
+    assert entry.data == migrated
+
+
+async def test_migration_does_not_overwrite_new_label_and_rejects_future_version(
+    hass: HomeAssistant,
+) -> None:
+    current = MockConfigEntry(
+        domain=DOMAIN,
+        version=2,
+        data={
+            CONF_PANEL: "office",
+            CONF_HA_CONTROL_LABEL: "new-label",
+            CONF_HA_MIRROR_LABEL: "legacy-label",
+        },
+    )
+    current.add_to_hass(hass)
+    assert await async_migrate_entry(hass, current) is True
+    assert current.data[CONF_HA_CONTROL_LABEL] == "new-label"
+
+    future = MockConfigEntry(
+        domain=DOMAIN,
+        version=config_flow.BrilliantMqttConfigFlow.VERSION + 1,
+        data={CONF_PANEL: "future"},
+    )
+    future.add_to_hass(hass)
+    assert await async_migrate_entry(hass, future) is False
+    assert future.version == config_flow.BrilliantMqttConfigFlow.VERSION + 1

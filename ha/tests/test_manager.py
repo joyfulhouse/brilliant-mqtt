@@ -6,7 +6,7 @@ import asyncio
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, cast
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from homeassistant.core import Event, HomeAssistant
@@ -25,6 +25,7 @@ from custom_components.brilliant_mqtt.const import (
     COMPONENT_VOICE,
     COMPONENT_WIFI_WATCHDOG,
     CONF_COMPONENTS,
+    CONF_HA_CONTROL_ENABLED,
     CONF_HA_MIRROR_LABEL,
     CONF_HA_MIRROR_LEADER_PRIORITY,
     CONF_HA_MIRROR_TOKEN,
@@ -36,6 +37,8 @@ from custom_components.brilliant_mqtt.const import (
     DOMAIN,
     EVENT_TYPE,
     OPT_TRUST_HOST_KEY_CHANGES,
+    PANEL_HA_MIRROR_ENV_FILE,
+    PANEL_HA_MIRROR_UNIT_FILE,
 )
 from custom_components.brilliant_mqtt.manager import PanelManager
 from tests.conftest import REPIN_NEW_KEY, RepinShells
@@ -71,6 +74,22 @@ def _timer_cancelled(cancel: object) -> bool:
     """
     handle: asyncio.TimerHandle = cast(Any, cancel).__self__
     return handle.cancelled()
+
+
+@pytest.mark.parametrize(("enabled", "line"), [(False, "0"), (True, "1")])
+async def test_manager_renders_scene_bridge_toggle_from_entry_data(
+    hass: HomeAssistant, payload_dir: Path, enabled: bool, line: str
+) -> None:
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="office",
+        data={**ENTRY_DATA, CONF_HA_CONTROL_ENABLED: enabled},
+        version=3,
+    )
+    entry.add_to_hass(hass)
+    manager = PanelManager(hass, entry, asyncio.Lock())
+    _unit, env = await manager._config_contents()
+    assert f"SCENE_BRIDGE_ENABLED={line}" in env.splitlines()
 
 
 @pytest.mark.allow_lingering_timers
@@ -1746,7 +1765,7 @@ async def test_refresh_staged_copies_skips_bus_watchdog_when_not_selected(
 
 
 # ---------------------------------------------------------------------------
-# HA mirror repair / staged-copy re-lay
+# HA mirror retirement on every management path
 # ---------------------------------------------------------------------------
 
 
@@ -1762,7 +1781,7 @@ def _ha_mirror_entry_data() -> dict[str, Any]:
 
 
 @pytest.mark.allow_lingering_timers
-async def test_repair_relays_ha_mirror_when_selected(
+async def test_repair_retires_ha_mirror_when_legacy_data_exists(
     hass: HomeAssistant,
     mqtt_mock: MqttMockHAClient,
     payload_dir: Path,
@@ -1787,13 +1806,9 @@ async def test_repair_relays_ha_mirror_when_selected(
         await entry.runtime_data.async_repair(trigger="button")
         await hass.async_block_till_done()
 
-    assert any("ha_mirror" in local for (local, _remote) in shell.dir_uploads)
-    assert any(p == "/etc/brilliant-ha-mirror.env" for (p, _d, _m) in shell.uploads)
-    mirror_env = next(
-        data for (path, data, _mode) in shell.uploads if path == "/etc/brilliant-ha-mirror.env"
-    )
-    assert b'PANEL="office"' in mirror_env
-    assert "systemctl enable --now brilliant-ha-mirror" in shell.commands
+    assert "systemctl disable --now brilliant-ha-mirror 2>/dev/null || true" in shell.commands
+    assert "systemctl enable --now brilliant-ha-mirror" not in shell.commands
+    assert not any("ha_mirror" in local for (local, _remote) in shell.dir_uploads)
     assert await hass.config_entries.async_unload(entry.entry_id)
 
 
@@ -1826,7 +1841,7 @@ async def test_repair_skips_ha_mirror_when_not_selected(
 
 
 @pytest.mark.allow_lingering_timers
-async def test_repair_ha_mirror_failure_does_not_fail_bridge_repair(
+async def test_repair_ha_mirror_retirement_failure_does_not_fail_bridge_repair(
     hass: HomeAssistant,
     mqtt_mock: MqttMockHAClient,
     payload_dir: Path,
@@ -1838,7 +1853,12 @@ async def test_repair_ha_mirror_failure_does_not_fail_bridge_repair(
         0, "unit=1\nenv=1\nenabled=1\nactive=1\nsunit=1\nsenv=1\npayload=1\n0.2.0\n", ""
     )
     shell = FakeShell(
-        responses={panel_ops.INSPECT_COMMAND: agent_ok}, put_dir_error=OSError("mirror failed")
+        responses={
+            panel_ops.INSPECT_COMMAND: agent_ok,
+            f"rm -f {PANEL_HA_MIRROR_UNIT_FILE} {PANEL_HA_MIRROR_ENV_FILE}": RunResult(
+                1, "", "denied"
+            ),
+        }
     )
     with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
         entry = MockConfigEntry(
@@ -1850,13 +1870,13 @@ async def test_repair_ha_mirror_failure_does_not_fail_bridge_repair(
         await entry.runtime_data.async_repair(trigger="button")
         await hass.async_block_till_done()
 
-    assert any("brilliant-ha-mirror/app.staging" in command for command in shell.commands)
+    assert "systemctl enable --now brilliant-ha-mirror" not in shell.commands
     assert entry.runtime_data._recovery_cancel is not None
     assert await hass.config_entries.async_unload(entry.entry_id)
 
 
 @pytest.mark.allow_lingering_timers
-async def test_refresh_staged_copies_relays_ha_mirror_when_selected(
+async def test_refresh_staged_copies_retires_ha_mirror_when_legacy_data_exists(
     hass: HomeAssistant,
     mqtt_mock: MqttMockHAClient,
     payload_dir: Path,
@@ -1881,13 +1901,8 @@ async def test_refresh_staged_copies_relays_ha_mirror_when_selected(
         )
         await hass.async_block_till_done(wait_background_tasks=True)
 
-    assert any("ha_mirror" in local for (local, _remote) in shell.dir_uploads)
-    assert any(p == "/etc/brilliant-ha-mirror.env" for (p, _d, _m) in shell.uploads)
-    mirror_env = next(
-        data for (path, data, _mode) in shell.uploads if path == "/etc/brilliant-ha-mirror.env"
-    )
-    assert b'PANEL="office"' in mirror_env
-    assert "systemctl enable --now brilliant-ha-mirror" in shell.commands
+    assert "systemctl disable --now brilliant-ha-mirror 2>/dev/null || true" in shell.commands
+    assert "systemctl enable --now brilliant-ha-mirror" not in shell.commands
     assert await hass.config_entries.async_unload(entry.entry_id)
 
 
@@ -1917,3 +1932,239 @@ async def test_refresh_staged_copies_skips_ha_mirror_when_not_selected(
     assert not any("ha_mirror" in local for (local, _remote) in shell.dir_uploads)
     assert not any("brilliant-ha-mirror" in p for (p, _d, _m) in shell.uploads)
     assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+def _retirement_entry(
+    hass: HomeAssistant, *, enabled: bool = True
+) -> tuple[MockConfigEntry, PanelManager]:
+    data = {
+        **_ha_mirror_entry_data(),
+        CONF_HA_CONTROL_ENABLED: enabled,
+        "unrelated": "keep",
+    }
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=data, version=3)
+    entry.add_to_hass(hass)
+    manager = PanelManager(hass, entry, asyncio.Lock())
+    return entry, manager
+
+
+def _mirror_state(*, installed: bool) -> Any:
+    from custom_components.brilliant_mqtt import panel_ops
+
+    return panel_ops.HaMirrorState(
+        unit_present=installed,
+        env_present=installed,
+        enabled=installed,
+        active=installed,
+        staged_env_present=installed,
+        payload_present=installed,
+    )
+
+
+async def test_retirement_creates_repair_before_remove_and_deletes_after_second_proof(
+    hass: HomeAssistant,
+) -> None:
+    from homeassistant.helpers import issue_registry as ir
+
+    from custom_components.brilliant_mqtt import panel_ops
+
+    entry, manager = _retirement_entry(hass)
+    issue_id = f"ha_mirror_retired_{entry.entry_id}"
+    registry = ir.async_get(hass)
+    shell = FakeShell()
+    order: list[str] = []
+
+    async def uninstall(used_shell: FakeShell) -> None:
+        assert used_shell is shell
+        assert registry.async_get_issue(DOMAIN, issue_id) is not None
+        order.append("uninstall")
+
+    inspect = AsyncMock(side_effect=[_mirror_state(installed=True), _mirror_state(installed=False)])
+    with (
+        patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell),
+        patch.object(panel_ops, "inspect_ha_mirror", inspect),
+        patch.object(panel_ops, "uninstall_ha_mirror", side_effect=uninstall),
+    ):
+        assert await manager.async_retire_legacy_ha_mirror() is True
+
+    assert order == ["uninstall"]
+    assert inspect.await_count == 2
+    assert registry.async_get_issue(DOMAIN, issue_id) is None
+    assert shell.connected is False
+    assert entry.data[CONF_COMPONENTS][COMPONENT_HA_MIRROR] is False
+    assert CONF_HA_MIRROR_WS_URL not in entry.data
+    assert CONF_HA_MIRROR_TOKEN not in entry.data
+    assert CONF_HA_MIRROR_LEADER_PRIORITY not in entry.data
+    assert entry.data[CONF_HA_MIRROR_LABEL] == "downstairs"
+    assert entry.data["unrelated"] == "keep"
+
+
+async def test_verified_retirement_keeps_legacy_credentials_while_control_disabled(
+    hass: HomeAssistant,
+) -> None:
+    from custom_components.brilliant_mqtt import panel_ops
+
+    entry, manager = _retirement_entry(hass, enabled=False)
+    shell = FakeShell()
+    with (
+        patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell),
+        patch.object(
+            panel_ops,
+            "inspect_ha_mirror",
+            new_callable=AsyncMock,
+            side_effect=[_mirror_state(installed=True), _mirror_state(installed=False)],
+        ),
+        patch.object(panel_ops, "uninstall_ha_mirror", new_callable=AsyncMock),
+    ):
+        assert await manager.async_retire_legacy_ha_mirror() is True
+
+    assert entry.data[CONF_HA_MIRROR_WS_URL] == "ws://homeassistant.local:8123/api/websocket"
+    assert entry.data[CONF_HA_MIRROR_TOKEN] == "mirror-secret"
+    assert entry.data[CONF_HA_MIRROR_LEADER_PRIORITY] == 4
+
+
+@pytest.mark.parametrize("failure", ["uninstall", "verification"])
+async def test_retirement_failure_keeps_issue_and_credentials(
+    hass: HomeAssistant, failure: str
+) -> None:
+    from homeassistant.helpers import issue_registry as ir
+
+    from custom_components.brilliant_mqtt import panel_ops
+
+    entry, manager = _retirement_entry(hass)
+    shell = FakeShell()
+    issue_id = f"ha_mirror_retired_{entry.entry_id}"
+    inspect_states = (
+        [_mirror_state(installed=True)]
+        if failure == "uninstall"
+        else [_mirror_state(installed=True), _mirror_state(installed=True)]
+    )
+    uninstall_error = panel_ops.PanelOpError("secret-token must not be surfaced")
+    with (
+        patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell),
+        patch.object(
+            panel_ops,
+            "inspect_ha_mirror",
+            new_callable=AsyncMock,
+            side_effect=inspect_states,
+        ),
+        patch.object(
+            panel_ops,
+            "uninstall_ha_mirror",
+            new_callable=AsyncMock,
+            side_effect=uninstall_error if failure == "uninstall" else None,
+        ),
+    ):
+        assert await manager.async_retire_legacy_ha_mirror() is False
+
+    issue = ir.async_get(hass).async_get_issue(DOMAIN, issue_id)
+    assert issue is not None
+    assert issue.translation_key == "ha_mirror_retired"
+    assert "responsiveness" in str(issue.translation_placeholders).lower()
+    assert "secret-token" not in repr(issue)
+    assert entry.data[CONF_HA_MIRROR_TOKEN] == "mirror-secret"
+    assert shell.connected is False
+
+
+@pytest.mark.allow_lingering_timers
+async def test_offline_retirement_keeps_integration_loaded_and_sanitized_issue(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+) -> None:
+    from homeassistant.config_entries import ConfigEntryState
+    from homeassistant.helpers import issue_registry as ir
+
+    entry, _manager = _retirement_entry(hass)
+    shell = FakeShell(connect_error=OSError("mirror-secret unreachable"))
+    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    assert entry.state is ConfigEntryState.LOADED
+    issue = ir.async_get(hass).async_get_issue(DOMAIN, f"ha_mirror_retired_{entry.entry_id}")
+    assert issue is not None
+    assert "mirror-secret" not in repr(issue)
+    assert entry.data[CONF_HA_MIRROR_TOKEN] == "mirror-secret"
+    assert shell.connected is False
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_retirement_cancellation_closes_shell_and_keeps_issue_and_secret(
+    hass: HomeAssistant,
+) -> None:
+    from homeassistant.helpers import issue_registry as ir
+
+    from custom_components.brilliant_mqtt import panel_ops
+
+    entry, manager = _retirement_entry(hass)
+    shell = FakeShell()
+    with (
+        patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell),
+        patch.object(
+            panel_ops,
+            "inspect_ha_mirror",
+            new_callable=AsyncMock,
+            return_value=_mirror_state(installed=True),
+        ),
+        patch.object(
+            panel_ops,
+            "uninstall_ha_mirror",
+            new_callable=AsyncMock,
+            side_effect=asyncio.CancelledError,
+        ),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await manager.async_retire_legacy_ha_mirror()
+
+    assert shell.connected is False
+    assert entry.data[CONF_HA_MIRROR_TOKEN] == "mirror-secret"
+    assert (
+        ir.async_get(hass).async_get_issue(DOMAIN, f"ha_mirror_retired_{entry.entry_id}")
+        is not None
+    )
+
+
+async def test_retirement_is_idempotent_after_enabled_verified_cleanup(
+    hass: HomeAssistant,
+) -> None:
+    from custom_components.brilliant_mqtt import panel_ops
+
+    _entry, manager = _retirement_entry(hass)
+    shell = FakeShell()
+    inspect = AsyncMock(side_effect=[_mirror_state(installed=True), _mirror_state(installed=False)])
+    uninstall = AsyncMock()
+    with (
+        patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell),
+        patch.object(panel_ops, "inspect_ha_mirror", inspect),
+        patch.object(panel_ops, "uninstall_ha_mirror", uninstall),
+    ):
+        assert await manager.async_retire_legacy_ha_mirror() is True
+        assert await manager.async_retire_legacy_ha_mirror() is True
+
+    assert shell.connect_count == 1
+    assert inspect.await_count == 2
+    assert uninstall.await_count == 1
+
+
+@pytest.mark.parametrize("path", ["repair", "update", "refresh"])
+async def test_every_management_path_converges_on_retirement_helper(
+    hass: HomeAssistant, payload_dir: Path, path: str
+) -> None:
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    manager = PanelManager(hass, entry, asyncio.Lock())
+    shell = FakeShell()
+    retire = AsyncMock(return_value=True)
+    with (
+        patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell),
+        patch.object(manager, "_async_retire_legacy_ha_mirror_on_shell", retire),
+    ):
+        if path == "repair":
+            await manager.async_repair(trigger="button")
+        elif path == "update":
+            await manager.async_update_agent()
+        else:
+            await manager._refresh_staged_copies()
+    retire.assert_awaited_once_with(shell)
+    assert "systemctl enable --now brilliant-ha-mirror" not in shell.commands
+    await manager.async_shutdown()

@@ -25,7 +25,7 @@
       },
       "script": {
         "title": "Panel settings",
-        "description": "Name the panel and set its mesh priority. When you finish, the bridge agent is installed on the panel over SSH and started.",
+        "description": "Name the panel, choose its components, and configure the Home Assistant-owned control plane. Global control settings are shared by every Brilliant panel.",
         "data": {
           "name": "Panel Name",
           "mesh_priority": "Mesh priority",
@@ -34,11 +34,13 @@
           "voice_ha_host": "Home Assistant host override (optional)",
           "wifi_watchdog": "Enable Wi-Fi watchdog",
           "bus_watchdog": "Enable Bus watchdog",
-          "ha_mirror": "Enable HA mirror",
-          "ha_mirror_ws_url": "Home Assistant WebSocket URL",
-          "ha_mirror_token": "Home Assistant long-lived access token",
-          "ha_mirror_leader_priority": "HA mirror leader priority",
-          "ha_mirror_label": "HA mirror label"
+          "ha_control_enabled": "Enable Home Assistant control plane",
+          "ha_control_label": "Home Assistant entity label",
+          "room_overrides": "Room overrides (JSON)",
+          "ha_control_domains": "Entity domains",
+          "max_mirrored_entities": "Maximum entities",
+          "scene_panel": "Default scene panel",
+          "scene_actions": "Scene actions (JSON)"
         },
         "data_description": {
           "name": "A friendly name, e.g. \"Office Bath\". A lowercase id is derived for MQTT topics (\"Office Bath\" → office-bath).",
@@ -48,16 +50,18 @@
           "voice_ha_host": "Only needed if the panel cannot resolve your Home Assistant URL's hostname (e.g. a segmented IoT VLAN). Format: hostname=ip, e.g. homeassistant.example=10.0.0.5. Leave blank to use the panel's own DNS.",
           "wifi_watchdog": "Auto-recovers lost Wi-Fi (reconnect → restart networking → reboot the panel as a last resort).",
           "bus_watchdog": "Installs the on-panel daemon that reboots the panel if the Brilliant bus stays wedged for 30+ minutes.",
-          "ha_mirror": "Expose Home Assistant entities as native controllable devices on this panel.",
-          "ha_mirror_ws_url": "The Home Assistant WebSocket API URL, e.g. ws://homeassistant.local:8123/api/websocket.",
-          "ha_mirror_token": "A Home Assistant long-lived access token used by the on-panel mirror.",
-          "ha_mirror_leader_priority": "0 disables leadership. Among positive values the lowest priority wins leader election.",
-          "ha_mirror_label": "Label used to select the Home Assistant entities mirrored to Brilliant."
+          "ha_control_enabled": "Publishes a constrained, local MQTT control manifest from Home Assistant. The legacy on-panel HA mirror remains disabled.",
+          "ha_control_label": "Home Assistant label selecting entities for the constrained control manifest.",
+          "room_overrides": "A JSON object mapping Home Assistant area names to Brilliant room names, for example {\"Office\":\"Office Bath\"}.",
+          "ha_control_domains": "Only selected supported domains enter the control manifest.",
+          "max_mirrored_entities": "Safety limit for entities in the control manifest (1–200).",
+          "scene_panel": "Brilliant panel used when a scene or mode service call omits a panel.",
+          "scene_actions": "A JSON object of explicitly allowlisted scene actions keyed by panel and scene ID."
         }
       },
       "reconfigure": {
         "title": "Reconfigure panel",
-        "description": "Edit this panel's connection, broker, and mesh priority. Changes are pushed to the panel and the agent is restarted. The panel name can't be changed.",
+        "description": "Edit this panel and the fleet-wide Home Assistant control settings. Panel changes are pushed over SSH; global settings are copied to every Brilliant entry.",
         "data": {
           "host": "Panel IP / hostname",
           "root_password": "Panel root password",
@@ -71,11 +75,13 @@
           "voice_ha_host": "Home Assistant host override (optional)",
           "wifi_watchdog": "Enable Wi-Fi watchdog",
           "bus_watchdog": "Enable Bus watchdog",
-          "ha_mirror": "Enable HA mirror",
-          "ha_mirror_ws_url": "Home Assistant WebSocket URL",
-          "ha_mirror_token": "Home Assistant long-lived access token",
-          "ha_mirror_leader_priority": "HA mirror leader priority",
-          "ha_mirror_label": "HA mirror label"
+          "ha_control_enabled": "Enable Home Assistant control plane",
+          "ha_control_label": "Home Assistant entity label",
+          "room_overrides": "Room overrides (JSON)",
+          "ha_control_domains": "Entity domains",
+          "max_mirrored_entities": "Maximum entities",
+          "scene_panel": "Default scene panel",
+          "scene_actions": "Scene actions (JSON)"
         },
         "data_description": {
           "voice": "Install a Home Assistant voice satellite on this panel (on-panel wake word + microphone + speaker). Speech-to-text, the conversation agent, and text-to-speech all run in your HA Assist pipeline — nothing voice-specific is configured on the panel.",
@@ -83,11 +89,13 @@
           "voice_ha_host": "Only needed if the panel cannot resolve your Home Assistant URL's hostname (e.g. a segmented IoT VLAN). Format: hostname=ip, e.g. homeassistant.example=10.0.0.5. Leave blank to use the panel's own DNS.",
           "wifi_watchdog": "Auto-recovers lost Wi-Fi (reconnect → restart networking → reboot the panel as a last resort).",
           "bus_watchdog": "Installs the on-panel daemon that reboots the panel if the Brilliant bus stays wedged for 30+ minutes.",
-          "ha_mirror": "Expose Home Assistant entities as native controllable devices on this panel.",
-          "ha_mirror_ws_url": "The Home Assistant WebSocket API URL, e.g. ws://homeassistant.local:8123/api/websocket.",
-          "ha_mirror_token": "A Home Assistant long-lived access token used by the on-panel mirror.",
-          "ha_mirror_leader_priority": "0 disables leadership. Among positive values the lowest priority wins leader election.",
-          "ha_mirror_label": "Label used to select the Home Assistant entities mirrored to Brilliant."
+          "ha_control_enabled": "Publishes a constrained, local MQTT control manifest from Home Assistant. The legacy on-panel HA mirror remains disabled.",
+          "ha_control_label": "Home Assistant label selecting entities for the constrained control manifest.",
+          "room_overrides": "A JSON object mapping Home Assistant area names to Brilliant room names, for example {\"Office\":\"Office Bath\"}.",
+          "ha_control_domains": "Only selected supported domains enter the control manifest.",
+          "max_mirrored_entities": "Safety limit for entities in the control manifest (1–200).",
+          "scene_panel": "Brilliant panel used when a scene or mode service call omits a panel.",
+          "scene_actions": "A JSON object of explicitly allowlisted scene actions keyed by panel and scene ID."
         }
       }
     },
@@ -95,7 +103,6 @@
       "reserved_panel": "\"mesh\" is the reserved whole-home pseudo-panel and cannot be managed.",
       "invalid_name": "Enter a name with at least one letter or digit.",
       "invalid_value": "Control characters are not allowed in this field.",
-      "ha_mirror_required": "Enter this value to enable HA mirror.",
       "cannot_connect": "SSH connection failed — check the host and the root password.",
       "cannot_read_config": "The agent is installed but its configuration could not be read. Try Reconfigure, or remove and re-add the panel.",
       "cannot_apply": "Connected, but writing the new settings to the panel failed. Check the agent and try Repair.",
@@ -247,6 +254,10 @@
     "voice_missing": {
       "title": "Brilliant panel voice satellite not installed",
       "description": "Panel `{panel}` has the voice satellite enabled but it isn't running. This issue clears automatically once the satellite is deployed (run Repair, or wait for the next automatic repair)."
+    },
+    "ha_mirror_retired": {
+      "title": "Legacy Brilliant HA mirror disabled",
+      "description": "Panel `{panel}` still has legacy HA mirror state. {reason}. The integration will keep retrying safe removal during panel management; legacy credentials are retained until absence is verified."
     }
   }
 }
