@@ -6,6 +6,7 @@ from brilliant_ha_mirror.mapping import (
     HaEntity,
     ServiceCall,
     command_to_service,
+    resolve_room_id,
     spec_for,
     state_to_variables,
 )
@@ -97,3 +98,22 @@ def test_int_variables_is_the_shared_type_source() -> None:
     # int-typed here; the text-only display/event vars are not.
     assert "display_name" not in INT_VARIABLES
     assert "event" not in INT_VARIABLES
+
+
+def test_resolve_room_id_matches_area_name_case_insensitively() -> None:
+    rooms = {"opaque-office-id": "Office", "2": "Kitchen"}
+
+    assert resolve_room_id("office", rooms, {}) == "opaque-office-id"
+
+
+def test_resolve_room_id_prefers_override_over_name_match() -> None:
+    rooms = {"automatic-id": "Back Yard", "override-id": "Patio"}
+
+    assert resolve_room_id("Back Yard", rooms, {"back yard": "override-id"}) == "override-id"
+
+
+def test_resolve_room_id_leaves_missing_or_unassigned_area_empty() -> None:
+    rooms = {"2": "Kitchen"}
+
+    assert resolve_room_id("Garage", rooms, {}) is None
+    assert resolve_room_id(None, rooms, {}) is None

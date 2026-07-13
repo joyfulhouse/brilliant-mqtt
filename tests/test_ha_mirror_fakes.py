@@ -5,7 +5,7 @@ from tests.fakes import FakeHaClient, FakePeripheralHost
 
 
 async def test_fake_host_register_update_command_delete() -> None:
-    host = FakePeripheralHost()
+    host = FakePeripheralHost(rooms={"room-kitchen": "Kitchen"})
     seen: list[tuple[str, str]] = []
 
     async def on_cmd(var: str, value: str) -> None:
@@ -21,6 +21,10 @@ async def test_fake_host_register_update_command_delete() -> None:
 
     await host.update_variables("HA L", {"on": "1"})
     assert host.variables["HA L"]["on"] == "1"
+
+    assert await host.get_rooms() == {"room-kitchen": "Kitchen"}
+    await host.set_room_assignment("HA L", ["room-kitchen"])
+    assert host.room_assignments["HA L"] == ["room-kitchen"]
 
     await host.fire_command("HA L", "on", "0")
     assert seen == [("on", "0")]

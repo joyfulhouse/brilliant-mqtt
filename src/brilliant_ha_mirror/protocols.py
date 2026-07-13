@@ -61,6 +61,14 @@ class PeripheralHostClient(Protocol):
         """Update the hosted peripheral *name* with the supplied variable values."""
         ...
 
+    async def get_rooms(self) -> Mapping[str, str]:
+        """Return the Brilliant room catalog as opaque id to display name."""
+        ...
+
+    async def set_room_assignment(self, name: str, room_ids: list[str]) -> None:
+        """Replace the hosted peripheral's Brilliant room assignment."""
+        ...
+
     async def delete(self, name: str) -> None:
         """Delete the hosted peripheral identified by *name*."""
         ...
