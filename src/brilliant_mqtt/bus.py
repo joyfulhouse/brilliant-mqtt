@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import secrets
 import time
 from collections.abc import Awaitable, Callable
@@ -83,7 +84,14 @@ def normalize_peripheral(device_id: str, peripheral_id: str, raw: Any) -> Brilli
             # errors="replace" so a bad byte can never raise here.
             value = bytes(value).decode("utf-8", errors="replace")
         raw_timestamp = getattr(raw_var, "timestamp", None)
-        timestamp_ms = int(raw_timestamp) if isinstance(raw_timestamp, (int, float)) else None
+        if isinstance(raw_timestamp, bool):
+            timestamp_ms = None
+        elif isinstance(raw_timestamp, int):
+            timestamp_ms = raw_timestamp
+        elif isinstance(raw_timestamp, float) and math.isfinite(raw_timestamp):
+            timestamp_ms = int(raw_timestamp)
+        else:
+            timestamp_ms = None
         variables[var_name] = Variable(
             name=var_name,
             value=str(value),

@@ -18,8 +18,13 @@ from brilliant_mqtt.model import BrilliantDevice
 class FakeBus:
     """Fake BusClient that starts with a fixed device list and records writes."""
 
-    def __init__(self, devices: list[BrilliantDevice]) -> None:
+    def __init__(
+        self,
+        devices: list[BrilliantDevice],
+        scoped_devices: list[BrilliantDevice] | None = None,
+    ) -> None:
         self._devices = list(devices)
+        self._scoped_devices = list(scoped_devices or ())
         # Multiple consumers (panel bridge + mesh publisher) each register their
         # own change callback on the one shared bus — mirror the adapter's fan-out.
         self._change_cbs: list[Callable[[BrilliantDevice], Awaitable[None]]] = []
@@ -42,7 +47,7 @@ class FakeBus:
         return list(self._devices)
 
     async def get_peripheral(self, device_id: str, peripheral_id: str) -> BrilliantDevice | None:
-        for device in self._devices:
+        for device in self._devices + self._scoped_devices:
             if device.device_id == device_id and device.peripheral_id == peripheral_id:
                 return device
         return None

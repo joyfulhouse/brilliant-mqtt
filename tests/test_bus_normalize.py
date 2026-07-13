@@ -156,6 +156,15 @@ class TestVariableCoercion:
         device = normalize_peripheral("dev123", "p", raw)
         assert device.variables["on"].timestamp_ms == 1_721_234_567_890
 
+    def test_finite_float_timestamp_is_converted_to_integer(self) -> None:
+        raw = SimpleNamespace(
+            name="p",
+            peripheral_type=27,
+            variables={"on": _var("1", True, timestamp=1_721_234_567_890.75)},
+        )
+        device = normalize_peripheral("dev123", "p", raw)
+        assert device.variables["on"].timestamp_ms == 1_721_234_567_890
+
     def test_missing_timestamp_becomes_none(self) -> None:
         raw = SimpleNamespace(
             name="p",
@@ -170,6 +179,42 @@ class TestVariableCoercion:
             name="p",
             peripheral_type=27,
             variables={"on": _var("1", True, timestamp="not-a-number")},
+        )
+        device = normalize_peripheral("dev123", "p", raw)
+        assert device.variables["on"].timestamp_ms is None
+
+    def test_boolean_timestamp_becomes_none(self) -> None:
+        raw = SimpleNamespace(
+            name="p",
+            peripheral_type=27,
+            variables={"on": _var("1", True, timestamp=True)},
+        )
+        device = normalize_peripheral("dev123", "p", raw)
+        assert device.variables["on"].timestamp_ms is None
+
+    def test_nan_timestamp_becomes_none(self) -> None:
+        raw = SimpleNamespace(
+            name="p",
+            peripheral_type=27,
+            variables={"on": _var("1", True, timestamp=float("nan"))},
+        )
+        device = normalize_peripheral("dev123", "p", raw)
+        assert device.variables["on"].timestamp_ms is None
+
+    def test_positive_infinity_timestamp_becomes_none(self) -> None:
+        raw = SimpleNamespace(
+            name="p",
+            peripheral_type=27,
+            variables={"on": _var("1", True, timestamp=float("inf"))},
+        )
+        device = normalize_peripheral("dev123", "p", raw)
+        assert device.variables["on"].timestamp_ms is None
+
+    def test_negative_infinity_timestamp_becomes_none(self) -> None:
+        raw = SimpleNamespace(
+            name="p",
+            peripheral_type=27,
+            variables={"on": _var("1", True, timestamp=float("-inf"))},
         )
         device = normalize_peripheral("dev123", "p", raw)
         assert device.variables["on"].timestamp_ms is None

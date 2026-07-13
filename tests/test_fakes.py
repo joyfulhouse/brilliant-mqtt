@@ -43,18 +43,21 @@ class TestFakeBusFanout:
 
 
 class TestFakeBusScopedRead:
-    async def test_returns_matching_peripheral(self) -> None:
+    async def test_scoped_only_peripheral_is_retrievable_but_absent_from_get_all(self) -> None:
         scene = BrilliantDevice(
             device_id="configuration_virtual_device",
             peripheral_id="scene_configuration",
             name="Scene Configuration",
             kind=DeviceKind.UNKNOWN,
         )
-        bus = FakeBus([_mesh_switch(), scene])
+        bus = FakeBus([_mesh_switch()], scoped_devices=[scene])
 
         result = await bus.get_peripheral("configuration_virtual_device", "scene_configuration")
 
         assert result is scene
+        assert all(
+            device.device_id != "configuration_virtual_device" for device in await bus.get_all()
+        )
 
     async def test_returns_none_when_ids_do_not_match(self) -> None:
         bus = FakeBus([_mesh_switch()])
