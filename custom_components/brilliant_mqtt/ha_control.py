@@ -10,7 +10,7 @@ from collections import OrderedDict, defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from uuid import UUID
 
 from homeassistant.components import mqtt
@@ -31,6 +31,8 @@ from .const import (
     CONF_MAX_MIRRORED_ENTITIES,
     CONF_PANEL,
     CONF_ROOM_OVERRIDES,
+    CONF_SCENE_ACTIONS,
+    CONF_SCENE_PANEL,
     DATA_CONTROL_PLANE,
     DEFAULT_HA_CONTROL_DOMAINS,
     DEFAULT_HA_CONTROL_ENABLED,
@@ -56,6 +58,7 @@ from .ha_control_protocol import (
     state_topic,
     validate_entity_command_context,
 )
+from .scene_control import SceneControl
 
 if TYPE_CHECKING:
     from . import BrilliantMqttConfigEntry
@@ -131,6 +134,7 @@ class HaControlPlane:
         self._rebuilding = False
         self._hard_fenced = False
         self._command_fence_generation = 0
+        self._scene_control = SceneControl(hass)
 
     @property
     def started(self) -> bool:
@@ -147,84 +151,106 @@ class HaControlPlane:
         """Return the current bounded idempotency-cache size."""
         return len(self._results)
 
+    @property
+    def scene_control(self) -> SceneControl:
+        """Return the scene/mode runtime owned by this singleton."""
+        return self._scene_control
+
     async def async_attach(self, entry: BrilliantMqttConfigEntry) -> None:
         """Attach one loaded panel entry and start when any entry is enabled."""
-        self._accept_commands = False
-        self._rebuilding = True
+        scene_fence_token = self._scene_control.fence_commands()
         try:
-            async with self._lifecycle_lock:
-                self._entries[entry.entry_id] = entry
-                await self._async_reload_settings_locked()
-        except BaseException:
+            self._accept_commands = False
+            self._rebuilding = True
+            try:
+                async with self._lifecycle_lock:
+                    self._entries[entry.entry_id] = entry
+                    await self._async_reload_settings_locked()
+            except BaseException:
+                self._rebuilding = False
+                self._accept_commands = (
+                    self._started and self._manifest is not None and not self._hard_fenced
+                )
+                raise
             self._rebuilding = False
             self._accept_commands = (
                 self._started and self._manifest is not None and not self._hard_fenced
             )
-            raise
-        self._rebuilding = False
-        self._accept_commands = (
-            self._started and self._manifest is not None and not self._hard_fenced
-        )
+        finally:
+            self._scene_control.release_command_fence(scene_fence_token)
 
     async def async_detach(self, entry_id: str) -> None:
         """Detach one panel and stop only after no enabled entries remain."""
         # Fence new/queued commands before waiting behind an in-flight command that
         # owns the lifecycle lock. The active command may drain; later callbacks fail
         # closed even if they entered the lock queue before this detach task.
-        self._accept_commands = False
-        self._rebuilding = False
-        self._hard_fenced = True
-        self._command_fence_generation += 1
-        fence_generation = self._command_fence_generation
+        scene_fence_token = self._scene_control.fence_commands()
         try:
-            async with self._lifecycle_lock:
-                self._entries.pop(entry_id, None)
-                await self._async_reload_settings_locked()
-        except BaseException:
-            if fence_generation == self._command_fence_generation:
-                self._rebuilding = False
-            raise
-        if fence_generation == self._command_fence_generation:
-            self._hard_fenced = False
+            self._accept_commands = False
             self._rebuilding = False
-            self._accept_commands = self._started and self._manifest is not None
+            self._hard_fenced = True
+            self._command_fence_generation += 1
+            fence_generation = self._command_fence_generation
+            try:
+                async with self._lifecycle_lock:
+                    self._entries.pop(entry_id, None)
+                    await self._async_reload_settings_locked()
+            except BaseException:
+                if fence_generation == self._command_fence_generation:
+                    self._rebuilding = False
+                raise
+            if fence_generation == self._command_fence_generation:
+                self._hard_fenced = False
+                self._rebuilding = False
+                self._accept_commands = self._started and self._manifest is not None
+        finally:
+            self._scene_control.release_command_fence(scene_fence_token)
 
     async def async_reload_settings(self) -> None:
         """Re-elect the settings owner and rebuild only when necessary."""
-        self._accept_commands = False
-        self._rebuilding = True
+        scene_fence_token = self._scene_control.fence_commands()
         try:
-            async with self._lifecycle_lock:
-                await self._async_reload_settings_locked()
-        except BaseException:
+            self._accept_commands = False
+            self._rebuilding = True
+            try:
+                async with self._lifecycle_lock:
+                    await self._async_reload_settings_locked()
+            except BaseException:
+                self._rebuilding = False
+                self._accept_commands = (
+                    self._started and self._manifest is not None and not self._hard_fenced
+                )
+                raise
             self._rebuilding = False
             self._accept_commands = (
                 self._started and self._manifest is not None and not self._hard_fenced
             )
-            raise
-        self._rebuilding = False
-        self._accept_commands = (
-            self._started and self._manifest is not None and not self._hard_fenced
-        )
+        finally:
+            self._scene_control.release_command_fence(scene_fence_token)
 
     async def async_start(self) -> None:
         """Start publication if an enabled attached entry exists."""
-        self._accept_commands = False
-        self._rebuilding = True
+        scene_fence_token = self._scene_control.fence_commands()
         try:
-            async with self._lifecycle_lock:
-                await self._async_reload_settings_locked()
-        except BaseException:
-            self._rebuilding = False
             self._accept_commands = False
-            raise
-        self._rebuilding = False
-        self._accept_commands = (
-            self._started and self._manifest is not None and not self._hard_fenced
-        )
+            self._rebuilding = True
+            try:
+                async with self._lifecycle_lock:
+                    await self._async_reload_settings_locked()
+            except BaseException:
+                self._rebuilding = False
+                self._accept_commands = False
+                raise
+            self._rebuilding = False
+            self._accept_commands = (
+                self._started and self._manifest is not None and not self._hard_fenced
+            )
+        finally:
+            self._scene_control.release_command_fence(scene_fence_token)
 
     async def async_stop(self) -> None:
         """Stop subscriptions/listeners and cancel pending work."""
+        scene_fence_token = self._scene_control.fence_commands()
         self._accept_commands = False
         self._hard_fenced = True
         self._command_fence_generation += 1
@@ -235,6 +261,7 @@ class HaControlPlane:
         finally:
             if fence_generation == self._command_fence_generation:
                 self._hard_fenced = False
+            self._scene_control.release_command_fence(scene_fence_token)
 
     async def _async_reload_settings_locked(self) -> None:
         owner = self._enabled_owner()
@@ -250,6 +277,12 @@ class HaControlPlane:
         if not self._started:
             await self._async_start_locked()
             return
+        panels, default_panel, actions = self._scene_runtime_settings(owner)
+        await self._scene_control.async_reconfigure(
+            panels,
+            default_panel=default_panel,
+            actions=actions,
+        )
         await self._async_rebuild_manifest()
 
     async def _async_start_locked(self) -> None:
@@ -279,6 +312,15 @@ class HaControlPlane:
                 )
             )
             self._started = True
+            owner = self._enabled_owner()
+            if owner is None:
+                raise RuntimeError("control-plane owner disappeared during startup")
+            panels, default_panel, actions = self._scene_runtime_settings(owner)
+            await self._scene_control.async_start(
+                panels,
+                default_panel=default_panel,
+                actions=actions,
+            )
             await self._async_rebuild_manifest()
         except BaseException:
             await self._async_stop_locked()
@@ -288,12 +330,19 @@ class HaControlPlane:
         self._started = False
         self._accept_commands = False
         self._rebuilding = False
+        scene_error: BaseException | None = None
+        try:
+            await self._scene_control.async_stop()
+        except BaseException as error:
+            scene_error = error
         if self._debounce_cancel is not None:
             self._debounce_cancel()
             self._debounce_cancel = None
         for unsubscribe in reversed(self._unsubscribers):
             unsubscribe()
         self._unsubscribers.clear()
+        if scene_error is not None:
+            raise scene_error
 
     def _enabled_owner(self) -> BrilliantMqttConfigEntry | None:
         enabled = (
@@ -306,6 +355,22 @@ class HaControlPlane:
             key=lambda entry: (str(entry.data.get(CONF_PANEL, "")), entry.entry_id),
             default=None,
         )
+
+    def _scene_runtime_settings(
+        self, owner: BrilliantMqttConfigEntry
+    ) -> tuple[frozenset[str], str | None, Mapping[str, object]]:
+        panels = frozenset(
+            panel
+            for entry in self._entries.values()
+            if isinstance((panel := entry.data.get(CONF_PANEL)), str)
+        )
+        configured_panel = owner.data.get(CONF_SCENE_PANEL, owner.data.get(CONF_PANEL))
+        default_panel = configured_panel if isinstance(configured_panel, str) else None
+        raw_actions = owner.data.get(CONF_SCENE_ACTIONS, {})
+        actions = (
+            cast(Mapping[str, object], raw_actions) if isinstance(raw_actions, Mapping) else {}
+        )
+        return panels, default_panel, actions
 
     async def _async_rebuild_manifest(self) -> None:
         if not self._started or self._settings is None:

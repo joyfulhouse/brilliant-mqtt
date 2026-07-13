@@ -45,6 +45,10 @@ CONF_HA_CONTROL_LABEL = "ha_control_label"
 CONF_ROOM_OVERRIDES = "room_overrides"
 CONF_HA_CONTROL_DOMAINS = "ha_control_domains"
 CONF_MAX_MIRRORED_ENTITIES = "max_mirrored_entities"
+# Scene-control configuration is surfaced by Task 9's config flow. Task 8 consumes
+# the stored keys already so the singleton can select a default panel and actions.
+CONF_SCENE_PANEL = "scene_panel"
+CONF_SCENE_ACTIONS = "scene_actions"
 DEFAULT_HA_CONTROL_ENABLED = False
 DEFAULT_HA_CONTROL_LABEL = "brilliant"
 DEFAULT_HA_CONTROL_DOMAINS = ("light", "switch")

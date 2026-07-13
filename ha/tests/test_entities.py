@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, State
 from homeassistant.helpers import device_registry as dr
 from pytest_homeassistant_custom_component.common import (
     MockConfigEntry,
@@ -17,10 +19,19 @@ from pytest_homeassistant_custom_component.typing import MqttMockHAClient
 from custom_components.brilliant_mqtt.const import (
     COMPONENT_VOICE,
     CONF_COMPONENTS,
+    CONF_HA_CONTROL_ENABLED,
+    CONF_SCENE_ACTIONS,
+    CONF_SCENE_PANEL,
     CONF_VOICE_WAKE_WORD,
     DEFAULT_VOICE_WAKE_WORD,
     DOMAIN,
     VOICE_WAKE_WORDS,
+)
+from custom_components.brilliant_mqtt.ha_control_protocol import (
+    MAPPING_VERSION,
+    SCHEMA_VERSION,
+    encode_json,
+    scene_result_topic,
 )
 from custom_components.brilliant_mqtt.manager import PanelManager
 from tests.fakes import FakeShell
@@ -31,6 +42,8 @@ REPAIR = "button.brilliant_office_repair_bridge"
 UPDATE = "update.brilliant_office_bridge"
 VOICE_SWITCH = "switch.brilliant_office_voice_satellite"
 WAKE_WORD_SELECT = "select.brilliant_office_wake_word"
+SCENE_SELECT = "select.brilliant_office_scene"
+RUN_SCENE = "button.brilliant_office_run_selected_scene"
 
 
 async def _setup(hass: HomeAssistant) -> MockConfigEntry:
@@ -39,6 +52,55 @@ async def _setup(hass: HomeAssistant) -> MockConfigEntry:
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
     return entry
+
+
+async def _setup_scene_control(hass: HomeAssistant) -> MockConfigEntry:
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="office-scenes",
+        data={
+            **ENTRY_DATA,
+            CONF_HA_CONTROL_ENABLED: True,
+            CONF_SCENE_PANEL: "office",
+            CONF_SCENE_ACTIONS: {},
+        },
+    )
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    return entry
+
+
+def _catalog(generated_at_ms: int, scenes: list[dict[str, object]]) -> str:
+    return encode_json(
+        {
+            "schema_version": SCHEMA_VERSION,
+            "mapping_version": MAPPING_VERSION,
+            "panel": "office",
+            "generated_at_ms": generated_at_ms,
+            "scenes": scenes,
+        }
+    )
+
+
+def _status(timestamp_ms: int, available: bool = True) -> str:
+    return encode_json(
+        {
+            "schema_version": SCHEMA_VERSION,
+            "mapping_version": MAPPING_VERSION,
+            "transport": "scene",
+            "panel": "office",
+            "available": available,
+            "reason": None if available else "execution_unavailable",
+            "timestamp_ms": timestamp_ms,
+        }
+    )
+
+
+def _state(hass: HomeAssistant, entity_id: str) -> State:
+    state = hass.states.get(entity_id)
+    assert state is not None
+    return state
 
 
 @pytest.mark.allow_lingering_timers
@@ -272,3 +334,142 @@ async def test_voice_entities_attach_to_panel_device(
     merged = registry.async_get_device(identifiers={("mqtt", "brilliant_panel_office")})
     assert merged is not None
     assert merged.id == existing.id
+
+
+@pytest.mark.allow_lingering_timers
+async def test_scene_entities_map_display_names_to_stable_ids_and_confirm_button(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    fake_shell: FakeShell,
+    payload_dir: Path,
+) -> None:
+    entry = await _setup_scene_control(hass)
+    assert _state(hass, SCENE_SELECT).state == "unavailable"
+    assert _state(hass, RUN_SCENE).state == "unavailable"
+
+    async_fire_mqtt_message(
+        hass,
+        "brilliant/ha-control/v1/scene/catalog/office",
+        _catalog(
+            100,
+            [
+                {"scene_id": "all_off", "display_name": "All Lights Off", "icon": None},
+                {"scene_id": "all_on", "display_name": "All Lights On", "icon": "light"},
+            ],
+        ),
+        retain=True,
+    )
+    async_fire_mqtt_message(
+        hass,
+        "brilliant/ha-control/v1/status/scene/office",
+        _status(101),
+        retain=True,
+    )
+    await hass.async_block_till_done()
+
+    select_state = hass.states.get(SCENE_SELECT)
+    assert select_state is not None
+    assert select_state.attributes["options"] == ["All Lights Off", "All Lights On"]
+    assert select_state.state == "unknown"
+    assert _state(hass, RUN_SCENE).state == "unavailable"
+    mqtt_mock.async_publish.reset_mock()
+
+    await hass.services.async_call(
+        "select",
+        "select_option",
+        {"entity_id": SCENE_SELECT, "option": "All Lights On"},
+        blocking=True,
+    )
+    await hass.async_block_till_done()
+    assert _state(hass, SCENE_SELECT).state == "All Lights On"
+    assert _state(hass, RUN_SCENE).state != "unavailable"
+    assert not [
+        call
+        for call in mqtt_mock.async_publish.call_args_list
+        if call.args[0].startswith("brilliant/ha-control/v1/scene/command/")
+    ]
+
+    press = hass.async_create_task(
+        hass.services.async_call("button", "press", {"entity_id": RUN_SCENE}, blocking=True)
+    )
+    await asyncio.sleep(0)
+    command_calls = [
+        call
+        for call in mqtt_mock.async_publish.call_args_list
+        if call.args[0].startswith("brilliant/ha-control/v1/scene/command/")
+    ]
+    assert len(command_calls) == 1
+    command = json.loads(command_calls[0].args[1])
+    assert command["panel"] == "office"
+    assert command["scene_id"] == "all_on"
+    assert command_calls[0].args[3] is False
+    async_fire_mqtt_message(
+        hass,
+        scene_result_topic(command["command_id"]),
+        encode_json(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "mapping_version": MAPPING_VERSION,
+                "command_id": command["command_id"],
+                "panel": "office",
+                "scene_id": "all_on",
+                "accepted": True,
+                "timestamp_ms": command["issued_at_ms"] + 1,
+            }
+        ),
+    )
+    await press
+
+    async_fire_mqtt_message(
+        hass,
+        "brilliant/ha-control/v1/status/scene/office",
+        _status(102, available=False),
+    )
+    await hass.async_block_till_done()
+    assert _state(hass, SCENE_SELECT).state == "unavailable"
+    assert _state(hass, RUN_SCENE).state == "unavailable"
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_scene_catalog_clear_makes_both_entities_unavailable(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    fake_shell: FakeShell,
+    payload_dir: Path,
+) -> None:
+    entry = await _setup_scene_control(hass)
+    async_fire_mqtt_message(
+        hass,
+        "brilliant/ha-control/v1/scene/catalog/office",
+        _catalog(
+            100,
+            [{"scene_id": "all_off", "display_name": "All Lights Off", "icon": None}],
+        ),
+        retain=True,
+    )
+    async_fire_mqtt_message(
+        hass,
+        "brilliant/ha-control/v1/status/scene/office",
+        _status(101),
+        retain=True,
+    )
+    await hass.async_block_till_done()
+    await hass.services.async_call(
+        "select",
+        "select_option",
+        {"entity_id": SCENE_SELECT, "option": "All Lights Off"},
+        blocking=True,
+    )
+
+    async_fire_mqtt_message(
+        hass,
+        "brilliant/ha-control/v1/scene/catalog/office",
+        _catalog(102, []),
+    )
+    await hass.async_block_till_done()
+    assert _state(hass, SCENE_SELECT).state == "unavailable"
+    assert _state(hass, RUN_SCENE).state == "unavailable"
+
+    assert await hass.config_entries.async_unload(entry.entry_id)

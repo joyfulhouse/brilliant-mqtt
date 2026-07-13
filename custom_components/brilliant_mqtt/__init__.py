@@ -49,6 +49,22 @@ _SERVICE_SCHEMA = vol.Schema(
     extra=vol.ALLOW_EXTRA,
 )
 
+_RUN_SCENE_SCHEMA = vol.Schema(
+    {
+        vol.Optional("panel"): cv.string,
+        vol.Required("scene_id"): cv.string,
+    },
+    extra=vol.PREVENT_EXTRA,
+)
+
+_SET_MODE_SCHEMA = vol.Schema(
+    {
+        vol.Optional("panel"): cv.string,
+        vol.Required("mode_id"): cv.string,
+    },
+    extra=vol.PREVENT_EXTRA,
+)
+
 
 def _fleet_lock(hass: HomeAssistant) -> asyncio.Lock:
     """One SSH operation at a time across the whole fleet (15-panel OTA waves)."""
@@ -167,9 +183,29 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     async def _uninstall(call: ServiceCall) -> None:
         await _apply_to_all(call, lambda m: m.async_uninstall())
 
+    async def _run_scene(call: ServiceCall) -> None:
+        from .ha_control import get_control_plane
+
+        panel = call.data.get("panel")
+        await get_control_plane(hass).scene_control.async_run_scene(
+            panel if isinstance(panel, str) else None,
+            str(call.data["scene_id"]),
+        )
+
+    async def _set_mode(call: ServiceCall) -> None:
+        from .ha_control import get_control_plane
+
+        panel = call.data.get("panel")
+        await get_control_plane(hass).scene_control.async_set_mode(
+            panel if isinstance(panel, str) else None,
+            str(call.data["mode_id"]),
+        )
+
     hass.services.async_register(DOMAIN, "repair", _repair, schema=_SERVICE_SCHEMA)
     hass.services.async_register(DOMAIN, "redeploy", _redeploy, schema=_SERVICE_SCHEMA)
     hass.services.async_register(DOMAIN, "uninstall", _uninstall, schema=_SERVICE_SCHEMA)
+    hass.services.async_register(DOMAIN, "run_scene", _run_scene, schema=_RUN_SCENE_SCHEMA)
+    hass.services.async_register(DOMAIN, "set_mode", _set_mode, schema=_SET_MODE_SCHEMA)
     return True
 
 

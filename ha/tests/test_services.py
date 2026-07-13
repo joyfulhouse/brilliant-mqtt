@@ -2,20 +2,52 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
+import voluptuous as vol
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
-from pytest_homeassistant_custom_component.common import MockConfigEntry
+from pytest_homeassistant_custom_component.common import MockConfigEntry, async_fire_mqtt_message
 from pytest_homeassistant_custom_component.typing import MqttMockHAClient
 
-from custom_components.brilliant_mqtt.const import CONF_PANEL, DOMAIN
+from custom_components.brilliant_mqtt.const import (
+    CONF_HA_CONTROL_ENABLED,
+    CONF_PANEL,
+    CONF_SCENE_ACTIONS,
+    CONF_SCENE_PANEL,
+    DOMAIN,
+)
+from custom_components.brilliant_mqtt.ha_control_protocol import (
+    MAPPING_VERSION,
+    SCHEMA_VERSION,
+    encode_json,
+    mode_result_topic,
+)
 from tests.fakes import FakeShell
 from tests.test_init import ENTRY_DATA
+
+
+async def _setup_control_entry(hass: HomeAssistant) -> MockConfigEntry:
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="office-control-services",
+        data={
+            **ENTRY_DATA,
+            CONF_HA_CONTROL_ENABLED: True,
+            CONF_SCENE_PANEL: "office",
+            CONF_SCENE_ACTIONS: {},
+        },
+    )
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    return entry
 
 
 @pytest.mark.allow_lingering_timers
@@ -139,3 +171,129 @@ async def test_uninstall_aggregates_multi_target_failures(
 
     assert await hass.config_entries.async_unload(office.entry_id)
     assert await hass.config_entries.async_unload(kitchen.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_scene_services_validate_required_ids_and_attached_panels(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    fake_shell: FakeShell,
+    payload_dir: Path,
+) -> None:
+    entry = await _setup_control_entry(hass)
+    assert hass.services.has_service(DOMAIN, "run_scene")
+    assert hass.services.has_service(DOMAIN, "set_mode")
+
+    with pytest.raises(vol.Invalid):
+        await hass.services.async_call(DOMAIN, "run_scene", {}, blocking=True)
+    with pytest.raises(HomeAssistantError, match="panel"):
+        await hass.services.async_call(
+            DOMAIN,
+            "run_scene",
+            {"panel": "garage", "scene_id": "all_off"},
+            blocking=True,
+        )
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_set_mode_service_uses_selected_panel_and_waits_for_confirmation(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    fake_shell: FakeShell,
+    payload_dir: Path,
+) -> None:
+    entry = await _setup_control_entry(hass)
+    async_fire_mqtt_message(
+        hass,
+        "brilliant/ha-control/v1/mode/catalog/office",
+        encode_json(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "mapping_version": MAPPING_VERSION,
+                "panel": "office",
+                "generated_at_ms": 100,
+                "modes": [{"mode_id": "away", "display_name": "Away"}],
+            }
+        ),
+        retain=True,
+    )
+    async_fire_mqtt_message(
+        hass,
+        "brilliant/ha-control/v1/status/mode/office",
+        encode_json(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "mapping_version": MAPPING_VERSION,
+                "transport": "mode",
+                "panel": "office",
+                "available": True,
+                "reason": None,
+                "timestamp_ms": 101,
+            }
+        ),
+        retain=True,
+    )
+    await hass.async_block_till_done()
+    mqtt_mock.async_publish.reset_mock()
+
+    call_task = hass.async_create_task(
+        hass.services.async_call(
+            DOMAIN,
+            "set_mode",
+            {"mode_id": "away"},
+            blocking=True,
+        )
+    )
+    await asyncio.sleep(0)
+    command_calls = [
+        call
+        for call in mqtt_mock.async_publish.call_args_list
+        if call.args[0].startswith("brilliant/ha-control/v1/mode/command/")
+    ]
+    assert len(command_calls) == 1
+    command = json.loads(command_calls[0].args[1])
+    assert command["panel"] == "office"
+    assert command["mode_id"] == "away"
+    assert command_calls[0].args[3] is False
+    async_fire_mqtt_message(
+        hass,
+        mode_result_topic(command["command_id"]),
+        encode_json(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "mapping_version": MAPPING_VERSION,
+                "command_id": command["command_id"],
+                "panel": "office",
+                "mode_id": "away",
+                "accepted": True,
+                "timestamp_ms": command["issued_at_ms"] + 1,
+            }
+        ),
+    )
+    await call_task
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+def test_scene_service_descriptions_and_translations_are_complete() -> None:
+    root = Path(__file__).parents[2]
+    services = (root / "custom_components/brilliant_mqtt/services.yaml").read_text()
+    strings = json.loads((root / "custom_components/brilliant_mqtt/strings.json").read_text())
+    translations = json.loads(
+        (root / "custom_components/brilliant_mqtt/translations/en.json").read_text()
+    )
+
+    for service, field in (("run_scene", "scene_id"), ("set_mode", "mode_id")):
+        assert f"{service}:" in services
+        assert "panel:" in services
+        assert f"{field}:" in services
+        for document in (strings, translations):
+            assert document["services"][service]["name"]
+            assert document["services"][service]["fields"]["panel"]["description"]
+            assert document["services"][service]["fields"][field]["description"]
+
+    for document in (strings, translations):
+        assert document["entity"]["select"]["scene"]["name"]
+        assert document["entity"]["button"]["run_selected_scene"]["name"]

@@ -16,3 +16,35 @@ uninstall:
   target:
     entity:
       integration: brilliant_mqtt
+run_scene:
+  name: Run Brilliant scene
+  description: Run a scene on an attached Brilliant panel and wait for execution confirmation.
+  fields:
+    panel:
+      name: Panel
+      description: Attached panel slug. Omit it to use the configured scene panel.
+      required: false
+      selector:
+        text:
+    scene_id:
+      name: Scene ID
+      description: Stable scene ID from the selected panel's current catalog.
+      required: true
+      selector:
+        text:
+set_mode:
+  name: Set Brilliant mode
+  description: Set a mode on an attached Brilliant panel and wait for execution confirmation.
+  fields:
+    panel:
+      name: Panel
+      description: Attached panel slug. Omit it to use the configured scene panel.
+      required: false
+      selector:
+        text:
+    mode_id:
+      name: Mode ID
+      description: Stable mode ID from the selected panel's current catalog.
+      required: true
+      selector:
+        text:
