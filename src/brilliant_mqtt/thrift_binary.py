@@ -28,6 +28,8 @@ _LIST = 15
 _SUPPORTED_TYPES = frozenset(
     {_BOOL, _BYTE, _DOUBLE, _I16, _I32, _I64, _STRING, _STRUCT, _MAP, _SET, _LIST}
 )
+_INVALID_BOOLEAN_ERROR = "invalid thrift boolean"
+_UNSUPPORTED_TYPE_ERROR = "unsupported thrift type"
 
 
 class ThriftDecodeError(ValueError):
@@ -79,7 +81,7 @@ class _Cursor:
     @staticmethod
     def _validate_type(field_type: int) -> None:
         if field_type not in _SUPPORTED_TYPES:
-            raise ThriftDecodeError(f"unsupported thrift type {field_type}")
+            raise ThriftDecodeError(_UNSUPPORTED_TYPE_ERROR)
 
     def read_struct(self, *, depth: int) -> dict[int, object]:
         self._check_depth(depth)
@@ -95,7 +97,10 @@ class _Cursor:
 
     def _read_value(self, field_type: int, *, depth: int) -> object:
         if field_type == _BOOL:
-            return self._read_i8() == 1
+            value = self._read_u8()
+            if value not in {0, 1}:
+                raise ThriftDecodeError(_INVALID_BOOLEAN_ERROR)
+            return value == 1
         if field_type == _BYTE:
             return self._read_i8()
         if field_type == _DOUBLE:
@@ -114,7 +119,7 @@ class _Cursor:
             return self._read_map(depth=depth + 1)
         if field_type in {_SET, _LIST}:
             return self._read_sequence(depth=depth + 1)
-        raise ThriftDecodeError(f"unsupported thrift type {field_type}")
+        raise ThriftDecodeError(_UNSUPPORTED_TYPE_ERROR)
 
     def _read_string(self) -> str | bytes:
         length = self._read_i32()

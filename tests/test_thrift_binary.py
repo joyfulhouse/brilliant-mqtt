@@ -74,6 +74,23 @@ def test_decodes_binary_protocol_primitives_and_collections() -> None:
     }
 
 
+@pytest.mark.parametrize(("wire_value", "expected"), [(0, False), (1, True)])
+def test_decodes_only_valid_boolean_encodings(wire_value: int, expected: bool) -> None:
+    raw = _field(2, 1, bytes([wire_value])) + b"\x00"
+
+    assert decode_struct_base64(_encoded(raw)) == {1: expected}
+
+
+@pytest.mark.parametrize("wire_value", [2, 127, 128, 254, 255])
+def test_rejects_invalid_boolean_encodings_with_fixed_error(wire_value: int) -> None:
+    raw = _field(2, 1, bytes([wire_value])) + b"\x00"
+
+    with pytest.raises(ThriftDecodeError) as exc_info:
+        decode_struct_base64(_encoded(raw))
+
+    assert str(exc_info.value) == "invalid thrift boolean"
+
+
 @pytest.mark.parametrize("value", ["not base64!", "AA=A", "\N{SNOWMAN}"])
 def test_rejects_invalid_base64_without_echoing_input(value: str) -> None:
     with pytest.raises(ThriftDecodeError) as exc_info:
@@ -136,13 +153,14 @@ def test_rejects_trailing_bytes() -> None:
         decode_struct_base64(_encoded(b"\x00\x00"))
 
 
-def test_rejects_unsupported_wire_type() -> None:
-    raw = _field(5, 1, b"") + b"\x00"
+@pytest.mark.parametrize("field_type", [1, 5, 7, 9, 16, 255])
+def test_rejects_unsupported_wire_type_with_fixed_error(field_type: int) -> None:
+    raw = _field(field_type, 1, b"") + b"\x00"
 
-    with pytest.raises(ThriftDecodeError, match="unsupported thrift type") as exc_info:
+    with pytest.raises(ThriftDecodeError) as exc_info:
         decode_struct_base64(_encoded(raw))
 
-    assert _encoded(raw) not in str(exc_info.value)
+    assert str(exc_info.value) == "unsupported thrift type"
 
 
 def test_rejects_unhashable_map_keys_as_malformed() -> None:
