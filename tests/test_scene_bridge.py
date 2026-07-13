@@ -7,12 +7,15 @@ import base64
 import json
 import stat
 import struct
+import threading
 from pathlib import Path
 from typing import cast
 from uuid import UUID
 
 import pytest
 
+from brilliant_mqtt import scene_bridge as scene_bridge_module
+from brilliant_mqtt import scene_state
 from brilliant_mqtt.commands import VarSet
 from brilliant_mqtt.ha_control_protocol import (
     MAPPING_VERSION,
@@ -129,6 +132,14 @@ def _published(mqtt: FakeMqtt, topic: str) -> list[tuple[str, str, bool]]:
 
 def _payload(item: tuple[str, str, bool]) -> dict[str, object]:
     return cast(dict[str, object], json.loads(item[1]))
+
+
+async def _wait_for_publish(mqtt: FakeMqtt, topic: str, count: int = 1) -> None:
+    for _ in range(200):
+        if len(_published(mqtt, topic)) >= count:
+            return
+        await asyncio.sleep(0.001)
+    pytest.fail(f"timed out waiting for {count} publication(s) on {topic}")
 
 
 async def _started(
@@ -309,6 +320,7 @@ async def test_hung_write_does_not_block_timeout_or_shutdown(tmp_path: Path) -> 
     )
     await asyncio.wait_for(bus.write_started.wait(), timeout=0.1)
     await clock.advance_ms(15_000)
+    await _wait_for_publish(mqtt, scene_result_topic(command_id))
 
     result = _payload(_published(mqtt, scene_result_topic(command_id))[-1])
     assert result["error"] == "timeout"
@@ -325,6 +337,7 @@ async def test_matching_execution_publishes_event_before_accepted_result_and_cac
     await mqtt.inject(scene_command_topic(_PANEL), command)
 
     await bus.emit(_execution("all_off", 1234))
+    await _wait_for_publish(mqtt, scene_result_topic(command_id))
 
     event_index = next(
         i for i, item in enumerate(mqtt.published) if item[0] == scene_event_topic(_PANEL)
@@ -357,6 +370,7 @@ async def test_completed_command_does_not_replay_after_original_command_ttl(tmp_
     command = _command(command_id, "scene", "all_off")
     await mqtt.inject(scene_command_topic(_PANEL), command)
     await bus.emit(_execution("all_off", 1_234))
+    await _wait_for_publish(mqtt, scene_result_topic(command_id))
     first = _published(mqtt, scene_result_topic(command_id))[-1]
 
     await clock.advance_ms(20_000)
@@ -376,6 +390,7 @@ async def test_matching_mode_execution_confirms_only_mode_pending_request(tmp_pa
     await mqtt.inject(mode_command_topic(_PANEL), _command(mode_command_id, "mode", "away"))
 
     await bus.emit(_execution(mode_id="away", mode_at_ms=222))
+    await _wait_for_publish(mqtt, mode_result_topic(mode_command_id))
 
     assert len(_published(mqtt, mode_event_topic(_PANEL))) == 1
     assert len(_published(mqtt, mode_result_topic(mode_command_id))) == 1
@@ -393,6 +408,7 @@ async def test_timeout_is_exactly_fifteen_seconds_and_shutdown_cancels_remaining
     await clock.advance_ms(14_999)
     assert _published(mqtt, scene_result_topic(command_id)) == []
     await clock.advance_ms(1)
+    await _wait_for_publish(mqtt, scene_result_topic(command_id))
     timeout = _payload(_published(mqtt, scene_result_topic(command_id))[-1])
     assert timeout["accepted"] is False
     assert timeout["error"] == "timeout"
@@ -452,6 +468,7 @@ async def test_write_failure_is_sanitized_and_cached(tmp_path: Path) -> None:
     command = _command(command_id, "scene", "all_off")
 
     await mqtt.inject(scene_command_topic(_PANEL), command)
+    await _wait_for_publish(mqtt, scene_result_topic(command_id))
     first = _published(mqtt, scene_result_topic(command_id))[-1]
     await mqtt.inject(scene_command_topic(_PANEL), command)
 
@@ -557,9 +574,15 @@ async def test_failed_terminal_result_publish_retries_until_delivered(tmp_path: 
     await bridge.async_start()
     await mqtt.inject(scene_command_topic(_PANEL), _command(command_id, "scene", "all_off"))
     await bus.emit(_execution("all_off", 500))
+    for _ in range(200):
+        if mqtt.failed:
+            break
+        await asyncio.sleep(0.001)
+    assert mqtt.failed is True
     assert _published(mqtt, scene_result_topic(command_id)) == []
 
     await clock.advance_ms(1_000)
+    await _wait_for_publish(mqtt, scene_result_topic(command_id))
 
     results = _published(mqtt, scene_result_topic(command_id))
     assert len(results) == 1
@@ -666,7 +689,7 @@ async def test_undelivered_accepted_result_survives_process_restart(tmp_path: Pa
     restarted_mqtt = FakeMqtt()
     restarted = SceneBridge(restarted_bus, restarted_mqtt, _PANEL, path, clock)
     await restarted.async_start()
-    await asyncio.sleep(0)
+    await _wait_for_publish(restarted_mqtt, scene_result_topic(command_id))
 
     results = _published(restarted_mqtt, scene_result_topic(command_id))
     assert len(results) == 1
@@ -709,7 +732,7 @@ async def test_event_outbox_survives_restart_and_gates_accepted_result(tmp_path:
     restarted_mqtt = FakeMqtt()
     restarted = SceneBridge(restarted_bus, restarted_mqtt, _PANEL, path, clock)
     await restarted.async_start()
-    await asyncio.sleep(0)
+    await _wait_for_publish(restarted_mqtt, scene_result_topic(command_id))
     event_index = next(
         index
         for index, item in enumerate(restarted_mqtt.published)
@@ -787,10 +810,10 @@ async def test_corrupt_state_without_snapshot_suppresses_first_observed_record(
 async def test_persistence_failure_refuses_commands_and_degrades_status(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def fail_replace(_source: str, _destination: Path) -> None:
+    def fail_write(_path: Path, _state: scene_state.SceneState) -> None:
         raise OSError("disk full")
 
-    monkeypatch.setattr("brilliant_mqtt.scene_bridge.os.replace", fail_replace)
+    monkeypatch.setattr(scene_bridge_module, "atomic_write_state", fail_write)
     bridge, bus, mqtt, _, _ = await _started(tmp_path, execution=_execution("all_off", 500))
     command_id = "22222222-2222-4222-8222-222222222222"
 
@@ -811,7 +834,7 @@ async def test_completed_id_reuse_validates_context_and_fingerprint_before_repla
     original = _command(command_id, "scene", "all_off")
     await mqtt.inject(scene_command_topic(_PANEL), original)
     await bus.emit(_execution("all_off", 500))
-    await asyncio.sleep(0)
+    await _wait_for_publish(mqtt, scene_result_topic(command_id))
     original_results = len(_published(mqtt, scene_result_topic(command_id)))
 
     await mqtt.inject(
@@ -992,6 +1015,26 @@ async def test_result_capacity_never_discards_undelivered_outcome(
     await bridge.async_shutdown()
 
 
+async def test_delivered_result_at_capacity_is_evicted_for_new_physical_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(scene_bridge_module, "_RESULT_CACHE_LIMIT", 1)
+    first_id = "22222222-2222-4222-8222-222222222222"
+    second_id = "44444444-4444-4444-8444-444444444444"
+    bridge, bus, mqtt, _, _ = await _started(
+        tmp_path,
+        scene_ids=("all_off", "all_on"),
+    )
+    await mqtt.inject(scene_command_topic(_PANEL), _command(first_id, "scene", "all_off"))
+    await bus.emit(_execution("all_off", 500))
+    await _wait_for_publish(mqtt, scene_result_topic(first_id))
+
+    await mqtt.inject(scene_command_topic(_PANEL), _command(second_id, "scene", "all_on"))
+
+    assert len(bus.commands) == 2
+    await bridge.async_shutdown()
+
+
 async def test_event_capacity_never_discards_undelivered_event(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1050,6 +1093,7 @@ async def test_inflight_command_is_durable_before_write_and_never_rewrites_after
 
     assert second_bus.commands == []
     await second_bus.emit(_execution("all_off", 500))
+    await _wait_for_publish(second_mqtt, scene_result_topic(command_id))
     assert _payload(_published(second_mqtt, scene_result_topic(command_id))[-1])["accepted"] is True
     await second.async_shutdown()
 
@@ -1187,3 +1231,312 @@ async def test_shutdown_abandons_write_that_delays_cancellation(tmp_path: Path) 
     await asyncio.sleep(0)
 
     assert _published(mqtt, scene_result_topic("22222222-2222-4222-8222-222222222222")) == []
+
+
+async def test_state_load_and_writes_never_run_on_event_loop_thread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    event_loop_thread = threading.get_ident()
+    observed: list[tuple[str, int]] = []
+    real_load = scene_state.load_state
+    real_write = scene_state.atomic_write_state
+
+    def observed_load(path: Path) -> scene_state.LoadedSceneState:
+        observed.append(("load", threading.get_ident()))
+        return real_load(path)
+
+    def observed_write(path: Path, state: scene_state.SceneState) -> None:
+        observed.append(("write", threading.get_ident()))
+        real_write(path, state)
+
+    monkeypatch.setattr(scene_bridge_module, "load_state", observed_load, raising=False)
+    monkeypatch.setattr(scene_bridge_module, "atomic_write_state", observed_write, raising=False)
+    bus = FakeBus(
+        [_execution("all_off", 100)],
+        scoped_devices=[_scene_catalog("all_off"), _mode_catalog("away")],
+    )
+    bridge = SceneBridge(bus, FakeMqtt(), _PANEL, tmp_path / "state.json", FakeClockMs(_NOW_MS))
+
+    await bridge.async_start()
+    await bus.emit(_execution("all_off", 200))
+    await bridge.async_shutdown()
+
+    assert {kind for kind, _ in observed} == {"load", "write"}
+    assert all(thread != event_loop_thread for _, thread in observed)
+
+
+async def test_cancelled_persistence_keeps_snapshot_writes_serial_and_newest_wins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first_write_started = threading.Event()
+    release_first_write = threading.Event()
+    guard = threading.Lock()
+    active_writers = 0
+    maximum_active = 0
+    write_order: list[int | None] = []
+    real_write = scene_state.atomic_write_state
+
+    def ordered_write(path: Path, state: scene_state.SceneState) -> None:
+        nonlocal active_writers, maximum_active
+        watermarks = dict(state.watermarks)
+        watermark = watermarks.get((_PANEL, "all_off"))
+        executed_at_ms = None if watermark is None else watermark.executed_at_ms
+        with guard:
+            active_writers += 1
+            maximum_active = max(maximum_active, active_writers)
+            write_order.append(executed_at_ms)
+        try:
+            if executed_at_ms == 100:
+                first_write_started.set()
+                assert release_first_write.wait(timeout=1)
+            real_write(path, state)
+        finally:
+            with guard:
+                active_writers -= 1
+
+    monkeypatch.setattr(scene_bridge_module, "atomic_write_state", ordered_write)
+    path = tmp_path / "state.json"
+    bus = FakeBus(
+        [_execution()],
+        scoped_devices=[_scene_catalog("all_off"), _mode_catalog("away")],
+    )
+    mqtt = FakeMqtt()
+    bridge = SceneBridge(bus, mqtt, _PANEL, path, FakeClockMs(_NOW_MS))
+    await bridge.async_start()
+
+    await bus.emit(_execution("all_off", 100))
+    assert first_write_started.wait(timeout=0.1)
+    await bus.emit(_execution("all_off", 200))
+    before_shutdown_release = list(mqtt.published)
+    await asyncio.wait_for(bridge.async_shutdown(), timeout=0.2)
+    release_first_write.set()
+
+    for _ in range(200):
+        try:
+            persisted = json.loads(path.read_text())
+            if persisted["watermarks"][_PANEL]["all_off"]["executed_at_ms"] == 200:
+                break
+        except (FileNotFoundError, KeyError, json.JSONDecodeError):
+            pass
+        await asyncio.sleep(0.001)
+    else:
+        pytest.fail("newest queued snapshot did not win after cancellation")
+
+    assert maximum_active == 1
+    assert write_order.index(100) < write_order.index(200)
+    assert mqtt.published == before_shutdown_release
+
+
+async def test_event_capacity_blocks_new_physical_command_even_with_result_room(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(scene_bridge_module, "_EVENT_OUTBOX_LIMIT", 1)
+
+    class EventOfflineMqtt(FakeMqtt):
+        async def publish(self, topic: str, payload: str, retain: bool = False) -> None:
+            if topic == scene_event_topic(_PANEL):
+                raise RuntimeError("offline")
+            await super().publish(topic, payload, retain)
+
+    bus = FakeBus(
+        [_execution()],
+        scoped_devices=[_scene_catalog("all_off"), _mode_catalog("away")],
+    )
+    mqtt = EventOfflineMqtt()
+    bridge = SceneBridge(bus, mqtt, _PANEL, tmp_path / "state.json", FakeClockMs(_NOW_MS))
+    await bridge.async_start()
+    await bus.emit(_execution("all_off", 500))
+
+    await mqtt.inject(
+        scene_command_topic(_PANEL),
+        _command("22222222-2222-4222-8222-222222222222", "scene", "all_off"),
+    )
+
+    assert bus.commands == []
+    await bridge.async_shutdown()
+
+
+async def test_pending_capacity_blocks_every_additional_physical_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(scene_bridge_module, "_PENDING_LIMIT", 1, raising=False)
+    bridge, bus, mqtt, _, _ = await _started(tmp_path, scene_ids=("all_off", "all_on"))
+    await mqtt.inject(
+        scene_command_topic(_PANEL),
+        _command("22222222-2222-4222-8222-222222222222", "scene", "all_off"),
+    )
+
+    await mqtt.inject(
+        scene_command_topic(_PANEL),
+        _command("44444444-4444-4444-8444-444444444444", "scene", "all_on"),
+    )
+
+    assert len(bus.commands) == 1
+    await bridge.async_shutdown()
+
+
+async def test_scene_watermark_growth_is_bounded_during_live_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(scene_bridge_module, "_SCENE_WATERMARK_LIMIT", 1, raising=False)
+    bridge, bus, mqtt, _, path = await _started(
+        tmp_path,
+        execution=_execution("all_off", 100),
+        scene_ids=("all_off", "all_on"),
+    )
+
+    await bus.emit(_execution("all_on", 200))
+
+    stored = json.loads(path.read_text())
+    assert set(stored["watermarks"][_PANEL]) == {"all_off"}
+    status = _payload(_published(mqtt, transport_status_topic("scene", _PANEL))[-1])
+    assert status["reason"] == "state_capacity"
+    await bridge.async_shutdown()
+
+
+async def test_startup_merges_execution_change_after_snapshot_before_activation(
+    tmp_path: Path,
+) -> None:
+    class PausedCatalogBus(FakeBus):
+        def __init__(self) -> None:
+            super().__init__(
+                [_execution()],
+                scoped_devices=[_scene_catalog("all_off"), _mode_catalog("away")],
+            )
+            self.catalog_started = asyncio.Event()
+            self.release_catalog = asyncio.Event()
+
+        async def get_peripheral(
+            self, device_id: str, peripheral_id: str
+        ) -> BrilliantDevice | None:
+            if peripheral_id == "scene_configuration":
+                self.catalog_started.set()
+                await self.release_catalog.wait()
+            return await super().get_peripheral(device_id, peripheral_id)
+
+    bus = PausedCatalogBus()
+    mqtt = FakeMqtt()
+    path = tmp_path / "state.json"
+    bridge = SceneBridge(bus, mqtt, _PANEL, path, FakeClockMs(_NOW_MS))
+    start_task = asyncio.create_task(bridge.async_start())
+    await asyncio.wait_for(bus.catalog_started.wait(), timeout=0.1)
+
+    await bus.emit(_execution("all_off", 500))
+    bus.release_catalog.set()
+    await asyncio.wait_for(start_task, timeout=0.1)
+
+    events = _published(mqtt, scene_event_topic(_PANEL))
+    assert len(events) == 1
+    assert _payload(events[0])["executed_at_ms"] == 500
+    assert json.loads(path.read_text())["watermarks"][_PANEL]["all_off"]["executed_at_ms"] == 500
+    await bridge.async_shutdown()
+
+
+async def test_reconcile_discards_snapshot_older_than_same_epoch_live_change(
+    tmp_path: Path,
+) -> None:
+    old_execution = _device(
+        "execution_peripheral", _execution("all_off", 100).variables, device_id="old-panel"
+    )
+    new_execution = _device(
+        "execution_peripheral", _execution("all_off", 200).variables, device_id="new-panel"
+    )
+
+    class DelayedReconcileBus(FakeBus):
+        def __init__(self) -> None:
+            super().__init__(
+                [old_execution],
+                scoped_devices=[_scene_catalog("all_off"), _mode_catalog("away")],
+            )
+            self.delay_reads = False
+            self.read_started = asyncio.Event()
+            self.release_read = asyncio.Event()
+
+        async def get_all(self) -> list[BrilliantDevice]:
+            snapshot = await super().get_all()
+            if self.delay_reads:
+                self.read_started.set()
+                await self.release_read.wait()
+            return snapshot
+
+    bus = DelayedReconcileBus()
+    mqtt = FakeMqtt()
+    bridge = SceneBridge(bus, mqtt, _PANEL, tmp_path / "state.json", FakeClockMs(_NOW_MS))
+    await bridge.async_start()
+    bus.delay_reads = True
+    reconcile_task = asyncio.create_task(bridge.async_reconcile())
+    await asyncio.wait_for(bus.read_started.wait(), timeout=0.1)
+
+    await bus.emit(new_execution)
+    bus.release_read.set()
+    await asyncio.wait_for(reconcile_task, timeout=0.1)
+    await mqtt.inject(
+        scene_command_topic(_PANEL),
+        _command("22222222-2222-4222-8222-222222222222", "scene", "all_off"),
+    )
+
+    assert bus.commands[-1][0] == "new-panel"
+    await bridge.async_shutdown()
+
+
+async def test_cancel_after_subscribe_return_always_releases_acquired_topic(
+    tmp_path: Path,
+) -> None:
+    class PausedSubscribeMqtt(FakeMqtt):
+        def __init__(self) -> None:
+            super().__init__()
+            self.return_gate = asyncio.Event()
+            self.subscribed = asyncio.Event()
+
+        async def subscribe(self, topic: str) -> None:
+            await super().subscribe(topic)
+            if len(self.subscriptions) == 1:
+                self.subscribed.set()
+                await self.return_gate.wait()
+
+    mqtt = PausedSubscribeMqtt()
+    bus = FakeBus(
+        [_execution()],
+        scoped_devices=[_scene_catalog("all_off"), _mode_catalog("away")],
+    )
+    bridge = SceneBridge(bus, mqtt, _PANEL, tmp_path / "state.json", FakeClockMs(_NOW_MS))
+    start_task = asyncio.create_task(bridge.async_start())
+    await asyncio.wait_for(mqtt.subscribed.wait(), timeout=0.1)
+    await bridge._lock.acquire()
+    mqtt.return_gate.set()
+    await asyncio.sleep(0)
+    shutdown_task = asyncio.create_task(bridge.async_shutdown())
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    bridge._lock.release()
+
+    await asyncio.wait_for(shutdown_task, timeout=0.2)
+    await asyncio.gather(start_task, return_exceptions=True)
+
+    assert mqtt.subscriptions == []
+    assert mqtt.unsubscriptions == [scene_command_topic(_PANEL), mode_command_topic(_PANEL)]
+
+
+async def test_shutdown_bounds_each_unsubscribe(tmp_path: Path) -> None:
+    class HangingUnsubscribeMqtt(FakeMqtt):
+        async def unsubscribe(self, topic: str) -> None:
+            await super().unsubscribe(topic)
+            await asyncio.Future()
+
+    mqtt = HangingUnsubscribeMqtt()
+    bridge = SceneBridge(
+        FakeBus(
+            [_execution()],
+            scoped_devices=[_scene_catalog("all_off"), _mode_catalog("away")],
+        ),
+        mqtt,
+        _PANEL,
+        tmp_path / "state.json",
+        FakeClockMs(_NOW_MS),
+    )
+    await bridge.async_start()
+
+    await asyncio.wait_for(bridge.async_shutdown(), timeout=0.2)
+
+    assert mqtt.subscriptions == []
+    assert mqtt.unsubscriptions == [scene_command_topic(_PANEL), mode_command_topic(_PANEL)]

@@ -3,18 +3,14 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import json
 import logging
-import os
-import tempfile
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Coroutine
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
 from typing import cast
-from uuid import UUID
 
 from brilliant_mqtt.commands import VarSet
 from brilliant_mqtt.ha_control_protocol import (
@@ -48,26 +44,45 @@ from brilliant_mqtt.scene_codec import (
     decode_scene_catalog,
     decode_scene_execution,
 )
+from brilliant_mqtt.scene_state import (
+    EVENT_OUTBOX_LIMIT,
+    MODE_WATERMARK_LIMIT,
+    PENDING_LIMIT,
+    RESULT_OUTBOX_LIMIT,
+    SCENE_WATERMARK_LIMIT,
+    LoadedSceneState,
+    SceneState,
+    StateEvent,
+    StateKey,
+    StateKind,
+    StatePending,
+    StateResult,
+    StateWatermark,
+    atomic_write_state,
+    command_fingerprint_fields,
+    load_state,
+)
 
 logger = logging.getLogger(__name__)
 
 _CONFIGURATION_DEVICE_ID = "configuration_virtual_device"
 _EXECUTION_PERIPHERAL_ID = "execution_peripheral"
 _SCENE_EXECUTION_PREFIX = "execution_state:scene_execution_handler:scene:"
-_RESULT_CACHE_LIMIT = 1_024
-_EVENT_OUTBOX_LIMIT = 1_024
+_RESULT_CACHE_LIMIT = RESULT_OUTBOX_LIMIT
+_EVENT_OUTBOX_LIMIT = EVENT_OUTBOX_LIMIT
+_PENDING_LIMIT = PENDING_LIMIT
+_SCENE_WATERMARK_LIMIT = SCENE_WATERMARK_LIMIT
+_MODE_WATERMARK_LIMIT = MODE_WATERMARK_LIMIT
 _RESULT_EXPIRY_MS = 10 * 60 * 1_000
 _RESULT_RETRY_SECONDS = 1.0
 _SHUTDOWN_DRAIN_SECONDS = 0.05
+_UNSUBSCRIBE_TIMEOUT_SECONDS = 0.05
 _TIMEOUT_SECONDS = COMMAND_TTL_MS / 1_000
 
-
-@dataclass(frozen=True, slots=True)
-class Watermark:
-    """Newest durable execution identity for one panel scene."""
-
-    executed_at_ms: int
-    payload_sha256: str
+Watermark = StateWatermark
+_StoredEvent = StateEvent
+_StoredResult = StateResult
+_StoredPending = StatePending
 
 
 @dataclass(slots=True)
@@ -78,40 +93,6 @@ class _Pending:
     issued_at_ms: int
     timeout_task: asyncio.Task[None] | None
     write_task: asyncio.Task[None] | None = None
-
-
-@dataclass(slots=True)
-class _StoredEvent:
-    topic: str
-    payload: str
-    delivered: bool
-    created_at_ms: int
-
-
-@dataclass(slots=True)
-class _StoredResult:
-    kind: str
-    command_id: str
-    fingerprint: str
-    command_panel: str
-    command_value: str
-    issued_at_ms: int
-    topic: str
-    payload: str
-    delivered: bool
-    expires_at_ms: int
-    event_key: str | None
-
-
-@dataclass(slots=True)
-class _StoredPending:
-    kind: str
-    command_id: str
-    value: str
-    fingerprint: str
-    panel: str
-    issued_at_ms: int
-    expires_at_ms: int
 
 
 def _is_new(previous: Watermark | None, current: SceneExecution) -> bool:
@@ -145,6 +126,8 @@ class SceneBridge:
 
         self._lock = asyncio.Lock()
         self._started = False
+        self._startup_active = False
+        self._startup_buffered_execution: BrilliantDevice | None = None
         self._callbacks_registered = False
         self._subscribed_topics: list[str] = []
         self._execution: BrilliantDevice | None = None
@@ -158,8 +141,8 @@ class SceneBridge:
         self._tasks: set[asyncio.Task[None]] = set()
         self._start_task: asyncio.Task[None] | None = None
         self._events: dict[str, _StoredEvent] = {}
-        self._results: OrderedDict[tuple[str, str], _StoredResult] = OrderedDict()
-        self._pending_records: dict[tuple[str, str], _StoredPending] = {}
+        self._results: OrderedDict[StateKey, _StoredResult] = OrderedDict()
+        self._pending_records: dict[StateKey, _StoredPending] = {}
         self._state_trusted = True
         self._state_reason: str | None = None
         self._delivery_task: asyncio.Task[None] | None = None
@@ -172,6 +155,10 @@ class SceneBridge:
         self._mode_execution_healthy = True
         self._stopping = False
         self._epoch = 0
+        self._operation_generation = 0
+        self._state_version = 0
+        self._persisted_version = 0
+        self._state_executor: ThreadPoolExecutor | None = None
 
     async def async_start(self) -> None:
         """Register callbacks, seed history, publish catalogs, and accept commands."""
@@ -183,13 +170,18 @@ class SceneBridge:
             else:
                 self._stopping = False
                 self._epoch += 1
+                self._startup_active = True
+                self._startup_buffered_execution = None
+                if self._state_executor is None:
+                    self._state_executor = ThreadPoolExecutor(
+                        max_workers=1,
+                        thread_name_prefix="scene-state",
+                    )
                 if not self._callbacks_registered:
                     self._bus.on_change(self._bus_change_callback)
                     self._bus.on_reconnect(self._reconnect_callback)
                     self._mqtt.on_message(self._mqtt_message_callback)
                     self._callbacks_registered = True
-                self._load_state()
-                self._restore_pending_maps()
                 startup_task = self._track_task(self._async_start_io(self._epoch))
                 self._start_task = startup_task
                 startup_task.add_done_callback(self._start_task_done)
@@ -207,36 +199,28 @@ class SceneBridge:
     async def _async_start_io(self, epoch: int) -> None:
         subscribed: list[str] = []
         try:
+            loaded = await self._async_load_state()
+            async with self._lock:
+                if epoch != self._epoch or self._stopping:
+                    return
+                self._state_trusted = loaded.trusted
+                self._state_reason = loaded.reason
+                self._install_loaded_state(loaded.state)
+                self._state_version = 0
+                self._persisted_version = 0
+                self._restore_pending_maps()
             for topic in (scene_command_topic(self._panel), mode_command_topic(self._panel)):
                 await self._mqtt.subscribe(topic)
                 subscribed.append(topic)
-                async with self._lock:
-                    invalidated = epoch != self._epoch or self._stopping
-                    if not invalidated:
-                        self._subscribed_topics.append(topic)
+                self._subscribed_topics.append(topic)
+                invalidated = epoch != self._epoch or self._stopping
                 if invalidated:
-                    await self._mqtt.unsubscribe(topic)
-                    subscribed.remove(topic)
+                    await self._async_release_topics(subscribed)
                     return
             await self._async_reconcile_work(epoch, emit_history=False, during_start=True)
         except BaseException:
-            if not self._stopping:
-                async with self._lock:
-                    for topic in subscribed:
-                        if topic in self._subscribed_topics:
-                            self._subscribed_topics.remove(topic)
-                for topic in reversed(subscribed):
-                    try:
-                        await self._mqtt.unsubscribe(topic)
-                    except Exception:
-                        logger.exception("scene bridge startup unsubscribe failed")
+            await self._async_release_topics(subscribed)
             raise
-        async with self._lock:
-            if epoch != self._epoch or self._stopping:
-                return
-            self._started = True
-            self._schedule_pending_deadlines()
-            self._schedule_delivery()
         await asyncio.sleep(0)
         await asyncio.sleep(0)
 
@@ -248,55 +232,140 @@ class SceneBridge:
         await self._async_reconcile_work(epoch, emit_history=True, during_start=False)
 
     async def async_shutdown(self) -> None:
-        """Fence callbacks, cancel deadlines, unsubscribe exact topics, and flush."""
+        """Fence callbacks, bound task drain, and release exact subscriptions."""
         if self._stopping:
             return
         self._stopping = True
         self._started = False
+        self._startup_active = False
+        self._startup_buffered_execution = None
         self._epoch += 1
         tasks = list(self._tasks)
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.wait(tasks, timeout=_SHUTDOWN_DRAIN_SECONDS)
+        topics = list(self._subscribed_topics)
         async with self._lock:
-            if not self._subscribed_topics:
-                return
-            topics = list(self._subscribed_topics)
-            self._subscribed_topics.clear()
             self._scene_pending.clear()
             self._mode_pending.clear()
+        await self._async_release_topics(topics)
+        executor = self._state_executor
+        self._state_executor = None
+        if executor is not None:
+            executor.shutdown(wait=False)
+
+    async def _async_release_topics(self, topics: list[str]) -> None:
         for topic in topics:
+            if topic not in self._subscribed_topics:
+                continue
+            self._subscribed_topics.remove(topic)
             try:
-                await self._mqtt.unsubscribe(topic)
+                await asyncio.wait_for(
+                    self._mqtt.unsubscribe(topic),
+                    timeout=_UNSUBSCRIBE_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("scene bridge unsubscribe timed out; continuing")
             except Exception:
                 logger.exception("scene bridge unsubscribe failed; continuing")
-        async with self._lock:
-            self._persist_state()
 
     async def _bus_change_callback(self, device: BrilliantDevice) -> None:
-        self._spawn_callback(self._async_bus_change(device))
-        await asyncio.sleep(0)
+        task = self._spawn_callback(self._async_bus_change(device))
+        if task is not None:
+            await asyncio.wait((task,), timeout=_SHUTDOWN_DRAIN_SECONDS)
         await asyncio.sleep(0)
         await asyncio.sleep(0)
 
     async def _reconnect_callback(self) -> None:
-        self._spawn_callback(self.async_reconcile())
-        await asyncio.sleep(0)
+        task = self._spawn_callback(self.async_reconcile())
+        if task is not None:
+            await asyncio.wait((task,), timeout=_SHUTDOWN_DRAIN_SECONDS)
         await asyncio.sleep(0)
         await asyncio.sleep(0)
 
     async def _mqtt_message_callback(self, topic: str, payload: str, retained: bool) -> None:
-        self._spawn_callback(self._async_mqtt_message(topic, payload, retained))
-        await asyncio.sleep(0)
+        task = self._spawn_callback(self._async_mqtt_message(topic, payload, retained))
+        if task is not None:
+            await asyncio.wait((task,), timeout=_SHUTDOWN_DRAIN_SECONDS)
         await asyncio.sleep(0)
         await asyncio.sleep(0)
 
-    def _spawn_callback(self, coroutine: Coroutine[object, object, None]) -> None:
-        if not self._started or self._stopping:
+    def _spawn_callback(
+        self, coroutine: Coroutine[object, object, None]
+    ) -> asyncio.Task[None] | None:
+        if (not self._started and not self._startup_active) or self._stopping:
             coroutine.close()
-            return
-        self._track_task(coroutine)
+            return None
+        return self._track_task(coroutine)
+
+    async def _async_load_state(self) -> LoadedSceneState:
+        executor = self._state_executor
+        if executor is None:
+            raise RuntimeError("scene state executor unavailable")
+        loop = asyncio.get_running_loop()
+        loaded: list[LoadedSceneState] = []
+
+        async def run() -> None:
+            loaded.append(await loop.run_in_executor(executor, load_state, self._watermark_path))
+
+        await self._track_task(run())
+        return loaded[0]
+
+    def _install_loaded_state(self, state: SceneState) -> None:
+        self._watermarks = dict(state.watermarks)
+        self._mode_watermarks = dict(state.mode_watermarks)
+        self._events = dict(state.events)
+        self._results = OrderedDict(state.results)
+        self._pending_records = dict(state.pending)
+        self._prune_delivered_results()
+        if not self._has_global_capacity():
+            self._state_reason = "state_capacity"
+
+    def _capture_state(self) -> tuple[int, SceneState]:
+        self._state_version += 1
+        state = SceneState(
+            watermarks=tuple(sorted(self._watermarks.items())),
+            mode_watermarks=tuple(sorted(self._mode_watermarks.items())),
+            events=tuple(sorted(self._events.items())),
+            results=tuple(self._results.items()),
+            pending=tuple(sorted(self._pending_records.items())),
+        )
+        return self._state_version, state
+
+    async def _async_persist_state(
+        self,
+        version: int,
+        state: SceneState,
+        epoch: int,
+    ) -> bool:
+        task = self._track_task(self._async_write_state(state))
+        try:
+            await task
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("scene bridge state persistence failed")
+            async with self._lock:
+                self._state_trusted = False
+                self._state_reason = "state_untrusted"
+            return False
+        async with self._lock:
+            self._persisted_version = max(self._persisted_version, version)
+            if epoch != self._epoch or self._stopping:
+                return False
+            self._state_trusted = True
+            if self._state_reason == "state_untrusted":
+                self._state_reason = None
+            return self._persisted_version >= version
+
+    async def _async_write_state(self, state: SceneState) -> None:
+        executor = self._state_executor
+        if executor is None:
+            raise RuntimeError("scene state executor unavailable")
+        loop = asyncio.get_running_loop()
+        write = loop.run_in_executor(executor, atomic_write_state, self._watermark_path, state)
+        await asyncio.shield(write)
 
     def _restore_pending_maps(self) -> None:
         self._scene_pending.clear()
@@ -324,6 +393,10 @@ class SceneBridge:
     async def _async_reconcile_work(
         self, epoch: int, *, emit_history: bool, during_start: bool
     ) -> None:
+        async with self._lock:
+            if epoch != self._epoch or self._stopping:
+                return
+            generation = self._operation_generation
         devices = await self._bus.get_all()
         execution = next(
             (device for device in devices if device.peripheral_id == _EXECUTION_PERIPHERAL_ID),
@@ -337,20 +410,45 @@ class SceneBridge:
                 return
             if not during_start and not self._started:
                 return
-            self._execution = execution
-            self._execution_available = execution is not None
             self._scene_ids = scene_ids
             self._scene_catalog_healthy = scene_healthy
             self._mode_ids = mode_ids
             self._mode_catalog_healthy = mode_healthy
-            if execution is not None:
-                await self._async_process_execution(execution, emit_events=emit_history)
-            else:
-                await self._async_health_status("scene")
-                await self._async_health_status("mode")
+            stale = not during_start and generation != self._operation_generation
+            if not stale:
+                self._execution = execution
+                self._execution_available = execution is not None
+        if stale:
             await self._async_health_status("scene")
             await self._async_health_status("mode")
-            self._schedule_delivery()
+            return
+        if execution is not None:
+            await self._async_process_execution(execution, emit_events=emit_history, epoch=epoch)
+        if not during_start:
+            await self._async_health_status("scene")
+            await self._async_health_status("mode")
+            async with self._lock:
+                if epoch == self._epoch and self._started and not self._stopping:
+                    self._schedule_delivery()
+            return
+
+        while True:
+            async with self._lock:
+                if epoch != self._epoch or self._stopping:
+                    return
+                buffered = self._startup_buffered_execution
+                self._startup_buffered_execution = None
+                if buffered is None:
+                    self._startup_active = False
+                    self._started = True
+                    self._schedule_pending_deadlines()
+                    self._schedule_delivery()
+                    break
+                self._execution = buffered
+                self._execution_available = True
+            await self._async_process_execution(buffered, emit_events=True, epoch=epoch)
+        await self._async_health_status("scene")
+        await self._async_health_status("mode")
 
     async def _async_read_catalogs(
         self,
@@ -431,58 +529,84 @@ class SceneBridge:
         if device.peripheral_id != _EXECUTION_PERIPHERAL_ID:
             return
         async with self._lock:
-            if not self._started:
+            if self._stopping or (not self._started and not self._startup_active):
+                return
+            self._operation_generation += 1
+            if self._startup_active:
+                self._startup_buffered_execution = device
                 return
             self._execution = device
             self._execution_available = True
-            try:
-                await self._async_process_execution(device, emit_events=True)
-            except Exception:
-                logger.exception("scene bridge execution callback failed; continuing")
+            epoch = self._epoch
+        try:
+            await self._async_process_execution(device, emit_events=True, epoch=epoch)
+        except Exception:
+            logger.exception("scene bridge execution callback failed; continuing")
 
-    async def _async_process_execution(self, device: BrilliantDevice, *, emit_events: bool) -> None:
-        seed_only = not self._state_trusted
+    async def _async_process_execution(
+        self,
+        device: BrilliantDevice,
+        *,
+        emit_events: bool,
+        epoch: int,
+    ) -> None:
         scenes, scene_malformed = _decode_scene_records(device)
-        self._scene_execution_healthy = not scene_malformed
         if scene_malformed:
             logger.warning("malformed scene execution record")
-        await self._async_health_status("scene")
-        for execution in scenes:
-            await self._async_scene_execution(
-                execution,
-                emit_event=emit_events and not seed_only,
-                persist=not seed_only,
-            )
-        await self._async_health_status("scene")
-
         mode_malformed = False
         try:
             modes = decode_mode_execution(device)
         except Exception:
             mode_malformed = True
+            modes = ()
             logger.exception("malformed mode execution record")
-            self._mode_execution_healthy = False
-            await self._async_health_status("mode")
-        else:
-            self._mode_execution_healthy = True
-            await self._async_health_status("mode")
-            for mode_execution in modes:
-                await self._async_mode_execution(
-                    mode_execution,
-                    emit_event=emit_events and not seed_only,
-                    persist=not seed_only,
-                )
-        await self._async_health_status("mode")
-        if (seed_only or not emit_events) and not scene_malformed and not mode_malformed:
-            self._persist_state()
 
-    async def _async_scene_execution(
-        self, execution: SceneExecution, *, emit_event: bool, persist: bool = True
-    ) -> None:
+        snapshot: tuple[int, SceneState] | None = None
+        async with self._lock:
+            if epoch != self._epoch or self._stopping:
+                return
+            seed_only = not self._state_trusted
+            self._scene_execution_healthy = not scene_malformed
+            self._mode_execution_healthy = not mode_malformed
+            changed = False
+            for execution in scenes:
+                changed = (
+                    self._apply_scene_execution(
+                        execution,
+                        emit_event=emit_events and not seed_only,
+                    )
+                    or changed
+                )
+            for mode_execution in modes:
+                changed = (
+                    self._apply_mode_execution(
+                        mode_execution,
+                        emit_event=emit_events and not seed_only,
+                    )
+                    or changed
+                )
+            if changed or (
+                (seed_only or not emit_events) and not scene_malformed and not mode_malformed
+            ):
+                snapshot = self._capture_state()
+        persisted = True
+        if snapshot is not None:
+            persisted = await self._async_persist_state(*snapshot, epoch)
+        if persisted:
+            async with self._lock:
+                if epoch == self._epoch and not self._stopping:
+                    self._schedule_delivery()
+        await self._async_health_status("scene")
+        await self._async_health_status("mode")
+
+    def _apply_scene_execution(self, execution: SceneExecution, *, emit_event: bool) -> bool:
         key = (self._panel, execution.scene_id)
         previous = self._watermarks.get(key)
         if not _is_new(previous, execution):
-            return
+            return False
+        if key not in self._watermarks and len(self._watermarks) >= _SCENE_WATERMARK_LIMIT:
+            self._state_reason = "state_capacity"
+            return False
         event_payload = encode_json(
             {
                 "schema_version": SCHEMA_VERSION,
@@ -503,7 +627,12 @@ class SceneBridge:
         ]
         publish_event = emit_event or bool(matching)
         if publish_event and not self._reserve_event(event_key):
-            return
+            return False
+        new_results = sum(("scene", command_id) not in self._results for command_id, _ in matching)
+        if publish_event and not self._reserve_result_slots(
+            new_results, releasing_pending=len(matching)
+        ):
+            return False
         self._watermarks[key] = Watermark(execution.executed_at_ms, execution.payload_sha256)
         if publish_event:
             self._events[event_key] = _StoredEvent(
@@ -525,16 +654,16 @@ class SceneBridge:
                     error=None,
                     event_key=event_key,
                 )
-        if persist and self._persist_state():
-            self._schedule_delivery()
+        return True
 
-    async def _async_mode_execution(
-        self, execution: ModeExecution, *, emit_event: bool, persist: bool = True
-    ) -> None:
+    def _apply_mode_execution(self, execution: ModeExecution, *, emit_event: bool) -> bool:
         current = (execution.executed_at_ms, execution.mode_id)
         previous = self._mode_watermarks.get(self._panel)
         if previous is not None and current <= previous:
-            return
+            return False
+        if previous is None and len(self._mode_watermarks) >= _MODE_WATERMARK_LIMIT:
+            self._state_reason = "state_capacity"
+            return False
         event_payload = encode_json(
             {
                 "schema_version": SCHEMA_VERSION,
@@ -555,7 +684,12 @@ class SceneBridge:
         ]
         publish_event = emit_event or bool(matching)
         if publish_event and not self._reserve_event(event_key):
-            return
+            return False
+        new_results = sum(("mode", command_id) not in self._results for command_id, _ in matching)
+        if publish_event and not self._reserve_result_slots(
+            new_results, releasing_pending=len(matching)
+        ):
+            return False
         self._mode_watermarks[self._panel] = current
         if publish_event:
             self._events[event_key] = _StoredEvent(
@@ -577,20 +711,16 @@ class SceneBridge:
                     error=None,
                     event_key=event_key,
                 )
-        if persist and self._persist_state():
-            self._schedule_delivery()
+        return True
 
     async def _async_mqtt_message(self, topic: str, payload: str, retained: bool) -> None:
         if topic not in (scene_command_topic(self._panel), mode_command_topic(self._panel)):
             return
-        async with self._lock:
-            if not self._started:
-                return
-            try:
-                write_scheduled = await self._async_command(topic, payload, retained)
-            except Exception:
-                logger.exception("scene bridge command callback failed; continuing")
-                return
+        try:
+            write_scheduled = await self._async_command(topic, payload, retained)
+        except Exception:
+            logger.exception("scene bridge command callback failed; continuing")
+            return
         if write_scheduled:
             # Let an immediate fake/adapter write begin without making the
             # shared MQTT reader await a potentially hung bus RPC.
@@ -604,99 +734,152 @@ class SceneBridge:
                 command = decode_scene_command(payload, now_ms=self._clock_ms())
                 validate_scene_command_context(command, topic_panel=self._panel, retained=retained)
                 value = command.scene_id
-                known = value in self._scene_ids
             else:
                 kind = "mode"
                 command = decode_mode_command(payload, now_ms=self._clock_ms())
                 validate_mode_command_context(command, topic_panel=self._panel, retained=retained)
                 value = command.mode_id
-                known = value in self._mode_ids
         except ValueError:
             return False
 
         fingerprint = _command_fingerprint(kind, command)
-        cache_key = (kind, command.command_id)
-        if not self._state_trusted:
-            await self._async_health_status(kind)
-            return False
-        cached = self._results.get(cache_key)
-        if cached is not None:
-            if not known or cached.fingerprint != fingerprint:
+        state_kind = cast(StateKind, kind)
+        cache_key: StateKey = (state_kind, command.command_id)
+        snapshot: tuple[int, SceneState] | None = None
+        record: _StoredPending | None = None
+        execution_device_id: str | None = None
+        needs_delivery = False
+        needs_health = False
+        epoch = self._epoch
+        async with self._lock:
+            if not self._started or self._stopping:
                 return False
-            if cached.delivered:
-                cached.event_key = None
-            cached.delivered = False
-            if self._persist_state():
-                self._schedule_delivery()
+            epoch = self._epoch
+            known = value in (self._scene_ids if kind == "scene" else self._mode_ids)
+            if not self._state_trusted:
+                needs_health = True
+            else:
+                cached = self._results.get(cache_key)
+                if cached is not None:
+                    if not known or cached.fingerprint != fingerprint:
+                        return False
+                    self._results[cache_key] = replace(
+                        cached,
+                        event_key=None if cached.delivered else cached.event_key,
+                        delivered=False,
+                    )
+                    snapshot = self._capture_state()
+                    needs_delivery = True
+                elif cache_key in self._pending_records:
+                    return False
+                else:
+                    pending = self._scene_pending if kind == "scene" else self._mode_pending
+                    if command.command_id in pending:
+                        return False
+                    if not known:
+                        if self._store_result(
+                            kind,
+                            command.command_id,
+                            value,
+                            fingerprint,
+                            command.panel,
+                            command.issued_at_ms,
+                            accepted=False,
+                            error=f"unknown_{kind}",
+                            event_key=None,
+                        ):
+                            snapshot = self._capture_state()
+                            needs_delivery = True
+                        else:
+                            needs_health = True
+                    elif self._execution is None:
+                        if self._store_result(
+                            kind,
+                            command.command_id,
+                            value,
+                            fingerprint,
+                            command.panel,
+                            command.issued_at_ms,
+                            accepted=False,
+                            error="execution_unavailable",
+                            event_key=None,
+                        ):
+                            snapshot = self._capture_state()
+                            needs_delivery = True
+                        else:
+                            needs_health = True
+                    elif not self._has_global_capacity():
+                        self._state_reason = "state_capacity"
+                        needs_health = True
+                    else:
+                        record = _StoredPending(
+                            state_kind,
+                            command.command_id,
+                            value,
+                            fingerprint,
+                            command.panel,
+                            command.issued_at_ms,
+                            self._clock_ms() + COMMAND_TTL_MS,
+                        )
+                        self._pending_records[cache_key] = record
+                        pending[command.command_id] = _Pending(
+                            value,
+                            fingerprint,
+                            command.panel,
+                            command.issued_at_ms,
+                            None,
+                        )
+                        execution_device_id = self._execution.device_id
+                        snapshot = self._capture_state()
+        if snapshot is None:
+            if needs_health:
+                await self._async_health_status(kind)
             return False
-        stored_pending = self._pending_records.get(cache_key)
-        if stored_pending is not None:
-            return False
-        pending = self._scene_pending if kind == "scene" else self._mode_pending
-        existing = pending.get(command.command_id)
-        if existing is not None:
-            return False
-
-        if not known:
-            await self._async_result(
-                kind,
-                command.command_id,
-                value,
-                fingerprint,
-                command.panel,
-                command.issued_at_ms,
-                accepted=False,
-                error=f"unknown_{kind}",
-            )
-            return False
-        if self._execution is None:
-            await self._async_result(
-                kind,
-                command.command_id,
-                value,
-                fingerprint,
-                command.panel,
-                command.issued_at_ms,
-                accepted=False,
-                error="execution_unavailable",
-            )
-            return False
-        if not self._reserve_result(cache_key):
+        persisted = await self._async_persist_state(*snapshot, epoch)
+        if not persisted:
+            if record is not None:
+                async with self._lock:
+                    pending = self._scene_pending if kind == "scene" else self._mode_pending
+                    if self._pending_records.get(cache_key) == record:
+                        self._pending_records.pop(cache_key, None)
+                        pending.pop(command.command_id, None)
             await self._async_health_status(kind)
+            return False
+        if record is None:
+            if needs_delivery:
+                async with self._lock:
+                    if epoch == self._epoch and self._started and not self._stopping:
+                        self._schedule_delivery()
             return False
 
         variable = "last_executed_scene_id" if kind == "scene" else "manual_mode_id"
-        record = _StoredPending(
-            kind,
-            command.command_id,
-            value,
-            fingerprint,
-            command.panel,
-            command.issued_at_ms,
-            self._clock_ms() + COMMAND_TTL_MS,
-        )
-        self._pending_records[cache_key] = record
-        current = _Pending(value, fingerprint, command.panel, command.issued_at_ms, None)
-        pending[command.command_id] = current
-        if not self._persist_state():
-            pending.pop(command.command_id, None)
-            self._pending_records.pop(cache_key, None)
-            await self._async_health_status(kind)
-            return False
-        timeout_task = self._track_task(
-            self._async_timeout(kind, command.command_id, _TIMEOUT_SECONDS)
-        )
-        current.timeout_task = timeout_task
-        write_task = self._track_task(
-            self._async_write(
-                kind,
-                command.command_id,
-                self._execution.device_id,
-                variable,
-                value,
+        async with self._lock:
+            if (
+                epoch != self._epoch
+                or not self._started
+                or self._stopping
+                or self._pending_records.get(cache_key) != record
+                or not self._state_trusted
+            ):
+                return False
+            pending = self._scene_pending if kind == "scene" else self._mode_pending
+            current = pending.get(command.command_id)
+            if current is None or execution_device_id is None:
+                return False
+            timeout_task = self._track_task(
+                self._async_timeout(kind, command.command_id, _TIMEOUT_SECONDS)
             )
-        )
-        current.write_task = write_task
+            current.timeout_task = timeout_task
+            write_task = self._track_task(
+                self._async_write(
+                    kind,
+                    command.command_id,
+                    execution_device_id,
+                    variable,
+                    value,
+                )
+            )
+            current.write_task = write_task
         return True
 
     async def _async_write(
@@ -717,77 +900,65 @@ class SceneBridge:
             raise
         except Exception as error:
             logger.warning("scene bridge write failed (%s)", type(error).__name__)
-            async with self._lock:
-                pending = self._scene_pending if kind == "scene" else self._mode_pending
-                current = pending.get(command_id)
-                if current is None or current.write_task is not asyncio.current_task():
-                    return
-                pending.pop(command_id)
-                self._pending_records.pop((kind, command_id), None)
-                if current.timeout_task is not None:
-                    current.timeout_task.cancel()
-                await self._async_result(
-                    kind,
-                    command_id,
-                    value,
-                    current.fingerprint,
-                    current.panel,
-                    current.issued_at_ms,
-                    accepted=False,
-                    error="write_failed",
-                )
+            await self._async_fail_pending(
+                kind,
+                command_id,
+                value,
+                error="write_failed",
+                expected_write=asyncio.current_task(),
+            )
 
     async def _async_timeout(self, kind: str, command_id: str, delay_seconds: float) -> None:
         try:
             await self._sleep(delay_seconds)
-            async with self._lock:
-                if not self._started:
-                    return
-                pending_map = self._scene_pending if kind == "scene" else self._mode_pending
-                pending = pending_map.pop(command_id, None)
-                if pending is not None:
-                    self._pending_records.pop((kind, command_id), None)
-                    if pending.write_task is not None:
-                        pending.write_task.cancel()
-                    await self._async_result(
-                        kind,
-                        command_id,
-                        pending.value,
-                        pending.fingerprint,
-                        pending.panel,
-                        pending.issued_at_ms,
-                        accepted=False,
-                        error="timeout",
-                    )
+            await self._async_fail_pending(kind, command_id, None, error="timeout")
         except asyncio.CancelledError:
             raise
 
-    async def _async_result(
+    async def _async_fail_pending(
         self,
         kind: str,
         command_id: str,
-        value: str,
-        fingerprint: str,
-        command_panel: str,
-        issued_at_ms: int,
+        value: str | None,
         *,
-        accepted: bool,
-        error: str | None,
-        event_key: str | None = None,
+        error: str,
+        expected_write: asyncio.Task[None] | None = None,
     ) -> None:
-        self._store_result(
-            kind,
-            command_id,
-            value,
-            fingerprint,
-            command_panel,
-            issued_at_ms,
-            accepted=accepted,
-            error=error,
-            event_key=event_key,
-        )
-        if self._persist_state():
-            self._schedule_delivery()
+        epoch = self._epoch
+        async with self._lock:
+            if not self._started or self._stopping:
+                return
+            pending_map = self._scene_pending if kind == "scene" else self._mode_pending
+            pending = pending_map.get(command_id)
+            if pending is None:
+                return
+            if expected_write is not None and pending.write_task is not expected_write:
+                return
+            pending_map.pop(command_id, None)
+            state_key: StateKey = (cast(StateKind, kind), command_id)
+            self._pending_records.pop(state_key, None)
+            if error == "timeout" and pending.write_task is not None:
+                pending.write_task.cancel()
+            if error == "write_failed" and pending.timeout_task is not None:
+                pending.timeout_task.cancel()
+            stored = self._store_result(
+                kind,
+                command_id,
+                pending.value if value is None else value,
+                pending.fingerprint,
+                pending.panel,
+                pending.issued_at_ms,
+                accepted=False,
+                error=error,
+                event_key=None,
+            )
+            if not stored:
+                return
+            snapshot = self._capture_state()
+        if await self._async_persist_state(*snapshot, epoch):
+            async with self._lock:
+                if epoch == self._epoch and self._started and not self._stopping:
+                    self._schedule_delivery()
 
     def _store_result(
         self,
@@ -802,7 +973,8 @@ class SceneBridge:
         error: str | None,
         event_key: str | None,
     ) -> bool:
-        cache_key = (kind, command_id)
+        normalized_kind = cast(StateKind, kind)
+        cache_key = (normalized_kind, command_id)
         if not self._reserve_result(cache_key):
             return False
         body: dict[str, object] = {
@@ -819,7 +991,7 @@ class SceneBridge:
         payload = encode_json(body)
         topic = scene_result_topic(command_id) if kind == "scene" else mode_result_topic(command_id)
         self._results[cache_key] = _StoredResult(
-            kind=kind,
+            kind=normalized_kind,
             command_id=command_id,
             fingerprint=fingerprint,
             command_panel=command_panel,
@@ -834,15 +1006,18 @@ class SceneBridge:
         self._results.move_to_end(cache_key)
         return True
 
-    def _reserve_result(self, cache_key: tuple[str, str]) -> bool:
+    def _reserve_result(self, cache_key: StateKey) -> bool:
         if cache_key in self._results:
             return True
+        return self._reserve_result_slots(1)
+
+    def _reserve_result_slots(self, count: int, *, releasing_pending: int = 0) -> bool:
         now = self._clock_ms()
         for key, result in list(self._results.items()):
             if result.delivered and result.expires_at_ms <= now:
                 self._results.pop(key)
-        pending_count = len(self._pending_records)
-        while len(self._results) + pending_count >= _RESULT_CACHE_LIMIT:
+        target = len(self._results) + len(self._pending_records) - releasing_pending + count
+        while target > _RESULT_CACHE_LIMIT:
             removable = next(
                 (key for key, result in self._results.items() if result.delivered),
                 None,
@@ -851,6 +1026,7 @@ class SceneBridge:
                 self._state_reason = "state_capacity"
                 return False
             self._results.pop(removable)
+            target -= 1
         self._clear_capacity_if_room()
         return True
 
@@ -874,6 +1050,21 @@ class SceneBridge:
             if event.delivered and key not in dependencies:
                 self._events.pop(key)
 
+    def _has_global_capacity(self) -> bool:
+        self._prune_events()
+        result_room = self._reserve_result_slots(1)
+        has_room = (
+            len(self._events) < _EVENT_OUTBOX_LIMIT
+            and result_room
+            and len(self._results) + len(self._pending_records) < _RESULT_CACHE_LIMIT
+            and len(self._pending_records) < _PENDING_LIMIT
+            and len(self._watermarks) < _SCENE_WATERMARK_LIMIT
+            and len(self._mode_watermarks) < _MODE_WATERMARK_LIMIT
+        )
+        if not has_room:
+            self._state_reason = "state_capacity"
+        return has_room
+
     def _schedule_delivery(self) -> None:
         if not self._started or self._stopping:
             return
@@ -895,27 +1086,36 @@ class SceneBridge:
             except Exception:
                 await self._sleep(_RESULT_RETRY_SECONDS)
                 continue
+            snapshot: tuple[int, SceneState] | None = None
             async with self._lock:
                 if self._stopping or epoch != self._epoch:
                     return
                 if item_type == "event":
                     event = self._events.get(cast(str, key))
-                    if event is not None and event.payload == payload:
-                        event.delivered = True
+                    if event is not None and event.payload == payload and not event.delivered:
+                        self._events[cast(str, key)] = replace(event, delivered=True)
+                        snapshot = self._capture_state()
                 else:
-                    result = self._results.get(cast(tuple[str, str], key))
-                    if result is not None and result.payload == payload:
-                        result.delivered = True
-                if not self._persist_state():
+                    result_key = cast(tuple[StateKind, str], key)
+                    result = self._results.get(result_key)
+                    if result is not None and result.payload == payload and not result.delivered:
+                        self._results[result_key] = replace(result, delivered=True)
+                        snapshot = self._capture_state()
+            if snapshot is None:
+                continue
+            if not await self._async_persist_state(*snapshot, epoch):
+                return
+            async with self._lock:
+                if self._stopping or epoch != self._epoch:
                     return
                 self._prune_events()
                 self._clear_capacity_if_room()
-                await self._async_health_status("scene")
-                await self._async_health_status("mode")
+            await self._async_health_status("scene")
+            await self._async_health_status("mode")
 
     def _next_delivery(
         self,
-    ) -> tuple[str, str | tuple[str, str], str, str] | None:
+    ) -> tuple[str, str | StateKey, str, str] | None:
         events = sorted(self._events.items(), key=lambda item: item[1].created_at_ms)
         for key, event in events:
             if not event.delivered:
@@ -935,6 +1135,9 @@ class SceneBridge:
             self._state_reason == "state_capacity"
             and len(self._events) < _EVENT_OUTBOX_LIMIT
             and len(self._results) + len(self._pending_records) < _RESULT_CACHE_LIMIT
+            and len(self._pending_records) < _PENDING_LIMIT
+            and len(self._watermarks) < _SCENE_WATERMARK_LIMIT
+            and len(self._mode_watermarks) < _MODE_WATERMARK_LIMIT
         ):
             self._state_reason = None
 
@@ -1003,465 +1206,20 @@ class SceneBridge:
             self._status_tasks.pop(transport)
 
     async def _async_health_status(self, transport: str) -> None:
-        if transport == "scene":
-            available = self._scene_catalog_healthy and self._scene_execution_healthy
-        else:
-            available = self._mode_catalog_healthy and self._mode_execution_healthy
-        if not self._state_trusted or self._state_reason is not None:
-            available = False
-            reason: str | None = self._state_reason or "state_untrusted"
-        elif not self._execution_available:
-            available = False
-            reason = "execution_unavailable"
-        else:
-            reason = None if available else "malformed_data"
+        async with self._lock:
+            if transport == "scene":
+                available = self._scene_catalog_healthy and self._scene_execution_healthy
+            else:
+                available = self._mode_catalog_healthy and self._mode_execution_healthy
+            if not self._state_trusted or self._state_reason is not None:
+                available = False
+                reason: str | None = self._state_reason or "state_untrusted"
+            elif not self._execution_available:
+                available = False
+                reason = "execution_unavailable"
+            else:
+                reason = None if available else "malformed_data"
         await self._async_status(transport, available, reason)
-
-    def _load_state(self) -> None:
-        self._watermarks.clear()
-        self._mode_watermarks.clear()
-        self._events.clear()
-        self._results.clear()
-        self._pending_records.clear()
-        self._state_reason = None
-        try:
-            raw = json.loads(self._watermark_path.read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            self._state_trusted = True
-            return
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            self._state_trusted = False
-            self._state_reason = "state_untrusted"
-            return
-        try:
-            self._parse_state(raw)
-            os.chmod(self._watermark_path, 0o600)
-            os.chmod(self._watermark_path.parent, 0o700)
-        except (OSError, ValueError):
-            self._watermarks.clear()
-            self._mode_watermarks.clear()
-            self._events.clear()
-            self._results.clear()
-            self._pending_records.clear()
-            self._state_trusted = False
-            self._state_reason = "state_untrusted"
-            return
-        self._state_trusted = True
-        self._prune_delivered_results()
-        if (
-            len(self._events) >= _EVENT_OUTBOX_LIMIT
-            and all(not event.delivered for event in self._events.values())
-        ) or (
-            len(self._results) + len(self._pending_records) >= _RESULT_CACHE_LIMIT
-            and all(not result.delivered for result in self._results.values())
-        ):
-            self._state_reason = "state_capacity"
-
-    def _parse_state(self, raw: object) -> None:
-        if not isinstance(raw, dict) or set(raw) != {
-            "version",
-            "watermarks",
-            "mode_watermarks",
-            "events",
-            "results",
-            "pending",
-        }:
-            raise ValueError("invalid state schema")
-        if type(raw["version"]) is not int or raw["version"] != 1:
-            raise ValueError("invalid state version")
-        watermarks = raw["watermarks"]
-        mode_watermarks = raw["mode_watermarks"]
-        events, results, pending_records = raw["events"], raw["results"], raw["pending"]
-        if not all(
-            isinstance(item, dict)
-            for item in (watermarks, mode_watermarks, events, results, pending_records)
-        ):
-            raise ValueError("invalid state collections")
-        if (
-            len(cast(dict[object, object], events)) > _EVENT_OUTBOX_LIMIT
-            or len(cast(dict[object, object], results))
-            + len(cast(dict[object, object], pending_records))
-            > _RESULT_CACHE_LIMIT
-        ):
-            raise ValueError("state collections exceed limits")
-        for panel, panel_records in cast(dict[object, object], watermarks).items():
-            if not isinstance(panel, str) or not isinstance(panel_records, dict):
-                raise ValueError("invalid watermark panel")
-            for scene_id, value in panel_records.items():
-                if (
-                    not isinstance(scene_id, str)
-                    or not isinstance(value, dict)
-                    or set(value)
-                    != {
-                        "executed_at_ms",
-                        "payload_sha256",
-                    }
-                ):
-                    raise ValueError("invalid watermark entry")
-                executed_at_ms, payload_sha256 = value["executed_at_ms"], value["payload_sha256"]
-                if not (
-                    type(executed_at_ms) is int
-                    and executed_at_ms >= 0
-                    and isinstance(payload_sha256, str)
-                    and _is_sha256(payload_sha256)
-                ):
-                    raise ValueError("invalid watermark value")
-                self._watermarks[(panel, scene_id)] = Watermark(executed_at_ms, payload_sha256)
-        for panel, value in cast(dict[object, object], mode_watermarks).items():
-            if (
-                not isinstance(panel, str)
-                or not isinstance(value, dict)
-                or set(value) != {"executed_at_ms", "mode_id"}
-            ):
-                raise ValueError("invalid mode watermark entry")
-            executed_at_ms, mode_id = value["executed_at_ms"], value["mode_id"]
-            if not (
-                type(executed_at_ms) is int
-                and executed_at_ms >= 0
-                and isinstance(mode_id, str)
-                and mode_id
-            ):
-                raise ValueError("invalid mode watermark value")
-            self._mode_watermarks[panel] = (executed_at_ms, mode_id)
-        for event_key, value in cast(dict[object, object], events).items():
-            if (
-                not isinstance(event_key, str)
-                or not isinstance(value, dict)
-                or set(value)
-                != {
-                    "topic",
-                    "payload",
-                    "delivered",
-                    "created_at_ms",
-                }
-            ):
-                raise ValueError("invalid event entry")
-            topic, payload = value["topic"], value["payload"]
-            delivered, created_at_ms = value["delivered"], value["created_at_ms"]
-            if not (
-                isinstance(topic, str)
-                and isinstance(payload, str)
-                and type(delivered) is bool
-                and type(created_at_ms) is int
-                and created_at_ms >= 0
-            ):
-                raise ValueError("invalid event value")
-            decoded_event = json.loads(payload)
-            if not isinstance(decoded_event, dict):
-                raise ValueError("invalid event payload")
-            event_panel = decoded_event.get("panel")
-            executed_at_ms = decoded_event.get("executed_at_ms")
-            if not (
-                isinstance(event_panel, str)
-                and type(decoded_event.get("schema_version")) is int
-                and decoded_event["schema_version"] == SCHEMA_VERSION
-                and type(decoded_event.get("mapping_version")) is int
-                and decoded_event["mapping_version"] == MAPPING_VERSION
-                and type(executed_at_ms) is int
-                and executed_at_ms >= 0
-            ):
-                raise ValueError("invalid event panel")
-            if "scene_id" in decoded_event:
-                kind = "scene"
-                identifier = decoded_event["scene_id"]
-                expected_topic = scene_event_topic(event_panel)
-            elif "mode_id" in decoded_event:
-                kind = "mode"
-                identifier = decoded_event["mode_id"]
-                expected_topic = mode_event_topic(event_panel)
-            else:
-                raise ValueError("invalid event kind")
-            if not isinstance(identifier, str) or not identifier:
-                raise ValueError("invalid event identifier")
-            if set(decoded_event) != {
-                "schema_version",
-                "mapping_version",
-                "panel",
-                f"{kind}_id",
-                "executed_at_ms",
-                "deduplication_key",
-            }:
-                raise ValueError("invalid event payload fields")
-            deduplication_key = f"{event_panel}:{identifier}:{executed_at_ms}"
-            if (
-                topic != expected_topic
-                or decoded_event.get("deduplication_key") != deduplication_key
-                or event_key != f"{kind}:{deduplication_key}"
-            ):
-                raise ValueError("invalid event topic")
-            self._events[event_key] = _StoredEvent(topic, payload, delivered, created_at_ms)
-        for result_key, value in cast(dict[object, object], results).items():
-            required = {
-                "kind",
-                "command_id",
-                "fingerprint",
-                "command_panel",
-                "command_value",
-                "issued_at_ms",
-                "topic",
-                "payload",
-                "delivered",
-                "expires_at_ms",
-                "event_key",
-            }
-            if (
-                not isinstance(result_key, str)
-                or not isinstance(value, dict)
-                or set(value) != required
-            ):
-                raise ValueError("invalid result entry")
-            kind, command_id = value["kind"], value["command_id"]
-            fingerprint, topic, payload = value["fingerprint"], value["topic"], value["payload"]
-            command_panel = value["command_panel"]
-            command_value, issued_at_ms = value["command_value"], value["issued_at_ms"]
-            delivered, expires_at_ms = value["delivered"], value["expires_at_ms"]
-            event_key = value["event_key"]
-            if not (
-                kind in ("scene", "mode")
-                and isinstance(command_id, str)
-                and result_key == f"{kind}:{command_id}"
-                and isinstance(fingerprint, str)
-                and _is_sha256(fingerprint)
-                and isinstance(command_panel, str)
-                and isinstance(command_value, str)
-                and command_value
-                and type(issued_at_ms) is int
-                and issued_at_ms >= 0
-                and isinstance(topic, str)
-                and isinstance(payload, str)
-                and type(delivered) is bool
-                and type(expires_at_ms) is int
-                and expires_at_ms >= 0
-                and (event_key is None or isinstance(event_key, str))
-            ):
-                raise ValueError("invalid result value")
-            UUID(command_id)
-            if kind == "scene":
-                scene_command_topic(command_panel)
-            else:
-                mode_command_topic(command_panel)
-            if fingerprint != _command_fingerprint_fields(
-                cast(str, kind), command_id, command_panel, command_value, issued_at_ms
-            ):
-                raise ValueError("invalid result fingerprint")
-            decoded_result = json.loads(payload)
-            expected_topic = (
-                scene_result_topic(command_id) if kind == "scene" else mode_result_topic(command_id)
-            )
-            expected_fields = {
-                "schema_version",
-                "mapping_version",
-                "command_id",
-                "panel",
-                f"{kind}_id",
-                "accepted",
-                "timestamp_ms",
-            }
-            if isinstance(decoded_result, dict) and decoded_result.get("accepted") is False:
-                expected_fields.add("error")
-            result_identifier = (
-                decoded_result.get(f"{kind}_id") if isinstance(decoded_result, dict) else None
-            )
-            if (
-                topic != expected_topic
-                or not isinstance(decoded_result, dict)
-                or decoded_result.get("command_id") != command_id
-                or set(decoded_result) != expected_fields
-                or type(decoded_result.get("schema_version")) is not int
-                or decoded_result["schema_version"] != SCHEMA_VERSION
-                or type(decoded_result.get("mapping_version")) is not int
-                or decoded_result["mapping_version"] != MAPPING_VERSION
-                or decoded_result.get("panel") != command_panel
-                or not isinstance(result_identifier, str)
-                or result_identifier != command_value
-                or type(decoded_result.get("accepted")) is not bool
-                or type(decoded_result.get("timestamp_ms")) is not int
-                or decoded_result["timestamp_ms"] < 0
-            ):
-                raise ValueError("invalid result payload")
-            if decoded_result["accepted"] is False:
-                error = decoded_result.get("error")
-                if not isinstance(error, str) or not error:
-                    raise ValueError("invalid result error")
-            normalized_kind = cast(str, kind)
-            self._results[(normalized_kind, command_id)] = _StoredResult(
-                normalized_kind,
-                command_id,
-                fingerprint,
-                command_panel,
-                command_value,
-                issued_at_ms,
-                topic,
-                payload,
-                delivered,
-                expires_at_ms,
-                event_key,
-            )
-        for pending_key, value in cast(dict[object, object], pending_records).items():
-            required = {
-                "kind",
-                "command_id",
-                "value",
-                "fingerprint",
-                "panel",
-                "issued_at_ms",
-                "expires_at_ms",
-            }
-            if (
-                not isinstance(pending_key, str)
-                or not isinstance(value, dict)
-                or set(value) != required
-            ):
-                raise ValueError("invalid pending entry")
-            kind, command_id = value["kind"], value["command_id"]
-            command_value = value["value"]
-            fingerprint, expires_at_ms = value["fingerprint"], value["expires_at_ms"]
-            command_panel, issued_at_ms = value["panel"], value["issued_at_ms"]
-            if not (
-                kind in ("scene", "mode")
-                and isinstance(command_id, str)
-                and pending_key == f"{kind}:{command_id}"
-                and isinstance(command_value, str)
-                and command_value
-                and isinstance(fingerprint, str)
-                and _is_sha256(fingerprint)
-                and isinstance(command_panel, str)
-                and type(issued_at_ms) is int
-                and issued_at_ms >= 0
-                and type(expires_at_ms) is int
-                and expires_at_ms >= 0
-            ):
-                raise ValueError("invalid pending value")
-            UUID(command_id)
-            normalized_kind = cast(str, kind)
-            if normalized_kind == "scene":
-                scene_command_topic(command_panel)
-            else:
-                mode_command_topic(command_panel)
-            if fingerprint != _command_fingerprint_fields(
-                normalized_kind,
-                command_id,
-                command_panel,
-                command_value,
-                issued_at_ms,
-            ):
-                raise ValueError("invalid pending fingerprint")
-            key = (normalized_kind, command_id)
-            if key in self._results:
-                raise ValueError("command cannot be pending and complete")
-            self._pending_records[key] = _StoredPending(
-                normalized_kind,
-                command_id,
-                command_value,
-                fingerprint,
-                command_panel,
-                issued_at_ms,
-                expires_at_ms,
-            )
-        for result in self._results.values():
-            if (
-                not result.delivered
-                and result.event_key is not None
-                and result.event_key not in self._events
-            ):
-                raise ValueError("missing result event dependency")
-
-    def _state_payload(self) -> dict[str, object]:
-        watermarks: dict[str, dict[str, dict[str, object]]] = {}
-        for (panel, scene_id), watermark in sorted(self._watermarks.items()):
-            watermarks.setdefault(panel, {})[scene_id] = {
-                "executed_at_ms": watermark.executed_at_ms,
-                "payload_sha256": watermark.payload_sha256,
-            }
-        mode_watermarks = {
-            panel: {"executed_at_ms": watermark[0], "mode_id": watermark[1]}
-            for panel, watermark in sorted(self._mode_watermarks.items())
-        }
-        events = {
-            key: {
-                "topic": event.topic,
-                "payload": event.payload,
-                "delivered": event.delivered,
-                "created_at_ms": event.created_at_ms,
-            }
-            for key, event in sorted(self._events.items())
-        }
-        results = {
-            f"{kind}:{command_id}": {
-                "kind": result.kind,
-                "command_id": result.command_id,
-                "fingerprint": result.fingerprint,
-                "command_panel": result.command_panel,
-                "command_value": result.command_value,
-                "issued_at_ms": result.issued_at_ms,
-                "topic": result.topic,
-                "payload": result.payload,
-                "delivered": result.delivered,
-                "expires_at_ms": result.expires_at_ms,
-                "event_key": result.event_key,
-            }
-            for (kind, command_id), result in self._results.items()
-        }
-        pending = {
-            f"{kind}:{command_id}": {
-                "kind": record.kind,
-                "command_id": record.command_id,
-                "value": record.value,
-                "fingerprint": record.fingerprint,
-                "panel": record.panel,
-                "issued_at_ms": record.issued_at_ms,
-                "expires_at_ms": record.expires_at_ms,
-            }
-            for (kind, command_id), record in sorted(self._pending_records.items())
-        }
-        return {
-            "version": 1,
-            "watermarks": watermarks,
-            "mode_watermarks": mode_watermarks,
-            "events": events,
-            "results": results,
-            "pending": pending,
-        }
-
-    def _persist_state(self) -> bool:
-        descriptor = -1
-        temporary = ""
-        try:
-            self._watermark_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            os.chmod(self._watermark_path.parent, 0o700)
-            descriptor, temporary = tempfile.mkstemp(
-                dir=self._watermark_path.parent,
-                prefix=f".{self._watermark_path.name}.",
-            )
-            os.fchmod(descriptor, 0o600)
-            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                descriptor = -1
-                json.dump(self._state_payload(), handle, separators=(",", ":"), sort_keys=True)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, self._watermark_path)
-            os.chmod(self._watermark_path, 0o600)
-            directory = os.open(self._watermark_path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
-        except OSError:
-            self._state_trusted = False
-            self._state_reason = "state_untrusted"
-            return False
-        finally:
-            if descriptor >= 0:
-                os.close(descriptor)
-            try:
-                if temporary:
-                    os.unlink(temporary)
-            except FileNotFoundError:
-                pass
-        self._state_trusted = True
-        if self._state_reason == "state_untrusted":
-            self._state_reason = None
-        return True
 
     def _prune_delivered_results(self) -> None:
         now = self._clock_ms()
@@ -1489,26 +1247,7 @@ def _command_fingerprint_fields(
     identifier: str,
     issued_at_ms: int,
 ) -> str:
-    canonical = encode_json(
-        {
-            "kind": kind,
-            "command_id": command_id,
-            "panel": panel,
-            f"{kind}_id": identifier,
-            "issued_at_ms": issued_at_ms,
-        }
-    )
-    return hashlib.sha256(canonical.encode()).hexdigest()
-
-
-def _is_sha256(value: str) -> bool:
-    if len(value) != 64 or value != value.lower():
-        return False
-    try:
-        int(value, 16)
-    except ValueError:
-        return False
-    return True
+    return command_fingerprint_fields(kind, command_id, panel, identifier, issued_at_ms)
 
 
 def _decode_scene_records(device: BrilliantDevice) -> tuple[tuple[SceneExecution, ...], bool]:
