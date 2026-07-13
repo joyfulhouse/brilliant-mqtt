@@ -30,7 +30,7 @@ The same-build 2026-07-06 snapshot contains 25 peripherals on the pilot's own Co
 | 27 | `gangbox_peripheral_0` | Wired dimmable light | On/off, intensity, power, temp, fault implemented |
 | 29 | `wifi_peripheral` | Wi-Fi/Ethernet state and requests | Connectivity status implemented |
 | 30 | `analytics_peripheral` | Analytics endpoint configuration | Not exposed |
-| 33 | `execution_peripheral` | Scene/state/mode execution and handlers | Not exposed; scene trigger needs write validation |
+| 33 | `execution_peripheral` | Scene/state/mode execution and handlers | Scene/mode bridge implemented off-panel; Office hardware acceptance pending |
 | 37 | `bootstrap` | Authentication/home join/pivot | Provisioning-only |
 | 42 | `gangbox_config_peripheral` | Gang count and process configuration | Diagnostic/configuration infrastructure |
 | 43 | `faceplate_uart_status_peripheral` | Faceplate firmware status | Not exposed |
@@ -166,15 +166,23 @@ Scene configuration is a binary Thrift object containing at least:
 - icon resource;
 - ordered per-device actions of device ID, peripheral ID, variable, and value.
 
-The pilot home has only `all_off` and `all_on`. The execution peripheral has `last_executed_scene_id`, validity triggers, and dynamic execution-state variables. Static naming strongly suggests `last_executed_scene_id` is the command surface, but this remains unverified as a write contract.
+The pilot home has only `all_off` and `all_on`. The execution peripheral has
+`last_executed_scene_id`, validity triggers, and dynamic execution-state
+variables. The bridge now implements catalog-allowlisted writes and requires a
+matching dynamic execution record before reporting success; the Office hardware
+gate remains pending.
 
 ### Groups
 
-Device-group configuration supports group membership plus toggle and intensity actions. The UI can create/edit groups, count offline/unsupported devices, and display aggregate power. HA groups could map conceptually, but mirrored individual entities already gain native room/type browsing without duplicating HA's entire group model.
+Device-group configuration supports group membership plus toggle and intensity actions. The UI can create/edit groups, count offline/unsupported devices, and display aggregate power. HA groups map conceptually, but no supported transport currently renders generic HA entities in native room/type browsing.
 
 ### Modes
 
-Mode configuration exposes active mode and default eco behavior. The execution peripheral includes `manual_mode_id`. The UI ties modes to scenes, validity, and geolocation/subscription state. A future mapping needs a semantic design, not just a raw text entity.
+Mode configuration exposes active mode and default eco behavior. The execution
+peripheral includes `manual_mode_id`. The bridge catalogs existing modes,
+publishes timestamped mode events, and accepts confirmed `set_mode` requests;
+hardware validation requires a real configured mode. It does not conflate modes
+with HA scenes or invent defaults for an empty catalog.
 
 ### State/config execution
 
@@ -200,7 +208,12 @@ The firmware can model the following even though this installation has no native
 | SOLAR (97) | configuration, estimates, savings/reset | energy sensors/button |
 | HOME_ENERGY_SYSTEM (101) | display/room, solar generation today | energy sensor |
 
-The HA mirror already implements Tier-1 peripheral hosting for lights, switches, locks, positional covers, and garage covers. This is valuable even where the Brilliant fleet has no native device of that type: HA becomes the local source and the panel renders a native screen.
+The former Tier-1 mirror implemented peripheral schemas for lights, switches,
+locks, positional covers, and garage covers, but its physical-Control hosting
+mechanism is deprecated and unsafe. Those schemas are research evidence, not a
+supported native-tile surface. The safe baseline is documented in the
+[HA integration guide](home-assistant-integration.md); native types remain gated
+behind Virtual Control feasibility.
 
 ## Media, camera, and intercom
 
@@ -229,4 +242,7 @@ The full graph includes partner virtual devices for systems such as Hue, LIFX, T
 - republishing causes duplicates and loses native integration diagnostics;
 - credentials and partner-specific setup remain in Brilliant state.
 
-Use the graph for interoperability research and HA mirror type validation, while keeping the forward MQTT bridge scoped to Brilliant-owned hardware and explicitly selected home-wide Brilliant mesh devices.
+Use the graph for interoperability and gated Virtual Control research, while
+keeping the forward MQTT bridge scoped to Brilliant-owned hardware and
+explicitly selected home-wide Brilliant mesh devices. Do not retry native type
+validation by hosting on a physical Control.

@@ -16,14 +16,16 @@ The central finding is that the panel is not a collection of isolated integratio
 | [Peripheral type catalog](peripheral-type-catalog.md) | Complete firmware `PeripheralType` enum for `v26.06.03.1` |
 | [Cloud and local boundaries](cloud-boundaries.md) | What remains local, what depends on Brilliant or partner clouds, and replacement strategies |
 | [Home Assistant support matrix](home-assistant-support-matrix.md) | Implemented, partially implemented, missing, inappropriate, and recommended capabilities |
+| [Home Assistant control and scene bridge](home-assistant-integration.md) | Authoritative ownership model, configuration, MQTT contract, HA surfaces, safety, diagnostics, and migration |
 | [Validation runbook](validation-runbook.md) | Safe static, read-only, telemetry, and write-validation procedures |
+| [Office scene-bridge pilot](runbooks/scene-bridge-pilot.md) | Hardware acceptance, restart/replay checks, rollback, evidence, and legacy-removal gate |
 
 Existing low-level references remain authoritative for the already-proven Python bus client contract:
 
 - [PoC findings](../reference/poc-findings.md)
 - [Message-bus API](../reference/message-bus-api.md)
 - [Bridge architecture](../ARCHITECTURE.md)
-- [HA mirror](../ha-mirror.md)
+- [Deprecated HA mirror and cleanup](../ha-mirror.md)
 
 ## Evidence labels
 
@@ -42,10 +44,10 @@ The documents use these labels so static capability is not confused with working
 1. **Local loads and panel settings are already on the right path.** `brilliant-mqtt` reads and writes the same variables as the native UI and HomeKit vassal.
 2. **The panel UI is broader than the live hardware graph.** The firmware contains first-class UI and schemas for shades, climate, locks, garages, cameras, security, valves, music, and energy. Most are partner-backed virtual peripherals in this home, not panel hardware.
 3. **Rooms, scenes, modes, groups, and shortcuts are first-class IA concepts.** These are the most important remaining cross-system semantics for making HA the central hub.
-4. **The reverse HA mirror is architecturally native.** Hosting HA entities as Brilliant peripherals uses the same pattern as Hue, LIFX, SmartThings, Ring, Sonos, and other bundled adapters.
+4. **Physical-Control HA hosting is rejected.** Although bundled adapters host typed peripherals, adding a manager to a real Control co-managed physical hardware, added bus load, threatened load responsiveness, and did not reliably admit or propagate tiles. The supported baseline is the HA-owned MQTT scene/mode bridge; native tiles remain blocked behind the distinct Virtual Control feasibility gates.
 5. **Physical slider and gesture bindings are configuration objects, not ordinary state variables.** They can target lights, groups, scenes, or modes. The lack of a press-event variable explains why simple bus observation cannot expose every gesture as an HA event.
 6. **Camera/intercom is a media subsystem, not a boolean camera entity.** It combines raw camera hardware, GStreamer, WebRTC/SDP session state, RTSP, remote-media peripherals, and privacy gates. It should be isolated from the core bridge.
-7. **Cloud removal is capability-specific.** Wired loads, mesh loads, panel controls, MQTT, and HA mirror operation are local. Partner account linking, some media relay paths, weather/art catalogs, Alexa, and OTA discovery remain cloud-backed unless separately replaced.
+7. **Cloud removal is capability-specific.** Wired loads, mesh loads, panel controls, MQTT, and the scene/mode bridge use local paths. Partner account linking, some media relay paths, weather/art catalogs, Alexa, and OTA discovery remain cloud-backed unless separately replaced. Virtual Control locality is unproven and must not be inferred from the local scene bridge.
 
 ## Corpus handling
 

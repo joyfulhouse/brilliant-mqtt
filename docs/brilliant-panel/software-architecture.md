@@ -61,10 +61,10 @@ The installed package tree contains 7,116 files, including 618 ARM Cython extens
       Qt/QML switch-ui      uWSGI peripherals      community agents
              │                     │                     │
   screens / gestures /      gangbox, BLE mesh,     brilliant-mqtt
-  settings / media UI       execution, HomeKit,    HA mirror
+  settings / media UI       execution, HomeKit,    scene bridge
                             partner adapters        watchdogs
                                    │                     │
-                         local hardware/cloud       MQTT / HA WS
+                         local hardware/cloud       local MQTT / HA
 ```
 
 The message bus owns the canonical graph. A `Device` is a bus participant or namespace; a `Peripheral` is a typed capability instance; a `Variable` is a string-encoded value plus timestamp and `externally_settable` permission. This distinction matters:
@@ -87,7 +87,7 @@ The on-box Python client is `lib.message_bus_api.observer_interface.RPCObserver`
 - `register_virtual_device` and peripheral hosting through the peripheral framework;
 - inbound `handle_notification`, `handle_home_id_updated`, and set-variable dispatch.
 
-The Qt UI implements its own C++ Thrift client. Static evidence includes `MessageBusClient`, `StateManager`, `SubscriptionFilter`, `SetVariablesRequestResult`, generated `MessageBusService` and `PeripheralService` methods, and the same server-socket path. The HomeKit vassal and HA mirror use the same conceptual write path as the UI.
+The Qt UI implements its own C++ Thrift client. Static evidence includes `MessageBusClient`, `StateManager`, `SubscriptionFilter`, `SetVariablesRequestResult`, generated `MessageBusService` and `PeripheralService` methods, and the same server-socket path. The HomeKit vassal and community bridge use the same conceptual variable-write path as the UI.
 
 ### Important reliability behavior
 
@@ -103,7 +103,12 @@ The firmware ships a reusable peripheral-host framework. Bundled Hue, LIFX, Smar
 - room assignment and display metadata;
 - lifecycle registration and deletion.
 
-The HA mirror follows this native pattern. Selected HA entities become peripherals on the leader Control's device. Panel changes call HA services; HA state changes update variables. This is a better fit than drawing a foreign web dashboard on the panel because it participates in native rooms, screens, shortcuts, and control widgets.
+The deprecated HA mirror attempted to apply this pattern to a physical Control.
+Live testing rejected that ownership model: it co-managed real hardware, added
+bus load, threatened physical responsiveness, and did not reliably admit or
+propagate tiles. The supported [HA scene/mode bridge](home-assistant-integration.md)
+does not host a peripheral. Native HA tiles require the distinct Virtual
+Control path to pass its feasibility gates.
 
 One lifecycle trap is live-verified: own-device hosted peripherals persist in object store across host exit and reboot. A leader or test host must explicitly delete peripherals during handoff and teardown, or the UI retains phantoms.
 

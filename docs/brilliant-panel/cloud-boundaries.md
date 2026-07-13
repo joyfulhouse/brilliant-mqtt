@@ -11,10 +11,11 @@ The panel is local-first at the hardware/control layer but cloud-backed at the a
 | Brilliant BLE mesh control | `ble_mesh` virtual device, BLE proxy/topology, panel-to-panel graph | Provisioning/firmware may use Brilliant services | Routine control is local; implemented with elected publisher |
 | Faceplate motion/lux | Faceplate peripheral | None | Local; implemented |
 | Screen/audio/settings | Hardware/UI/config peripherals | None for routine changes | Local; implemented subset |
-| Rooms/groups/scenes/modes | Configuration virtual device + execution engine | Configuration may synchronize through Brilliant services/mobile app | Execution appears local once cached; lifecycle needs more validation |
+| Rooms/groups/scenes/modes | Configuration virtual device + execution engine | Configuration may synchronize through Brilliant services/mobile app | Existing scene/mode execution uses a local bridge; Office hardware acceptance remains pending |
 | HomeKit | On-panel HAP vassal over LAN | None after pairing | Local fallback; failures observed in service lifecycle, not cloud transport |
 | MQTT bridge | On-panel bus client → local broker | None | Local community path |
-| HA mirror | Panel bus hosting → local HA WebSocket | None beyond HA/broker availability | Local community reverse path |
+| HA scene/mode bridge | Existing panel bus/MQTT session → local HA | None beyond HA/broker availability for cached execution | Supported non-hosting reverse path; pending Office hardware acceptance |
+| Native HA tiles | Physical hosting rejected; Virtual Control unproven | Virtual Control provisioning/runtime may require Brilliant cloud | Blocked behind explicit feasibility and WAN-isolation gates |
 | Native Alexa | Local wake word/audio plus Amazon OAuth/AVS | Amazon and Brilliant token exchange | Cloud-dependent assistant |
 | Google Assistant linking | UI/account linking and external assistant | Google/Brilliant account services | Cloud-dependent |
 | Partner integrations | On-panel adapters plus partner APIs/tokens | Usually partner and/or Brilliant cloud | Prefer native HA integrations |
@@ -36,23 +37,27 @@ physical touch / PIR / gang UART / BLE mesh
                     ↓
           local Brilliant message bus
              ↙                 ↘
-       native Qt UI       brilliant-mqtt / HA mirror
+       native Qt UI       brilliant-mqtt / scene bridge
                                   ↓
                          local MQTT and Home Assistant
 ```
 
-This core should remain the project's priority. It covers the community's most important needs: dependable lights/switches, sensor telemetry, panel settings, physical controls, local HA automations, and native panel rendering of selected HA entities.
+This core should remain the project's priority. It covers dependable
+lights/switches, sensor telemetry, panel settings, physical controls, and local
+HA automations. It does not currently render selected HA entities as native
+panel tiles; physical-Control hosting was rejected and Virtual Control remains
+gated. See the [HA integration guide](home-assistant-integration.md).
 
 ## Cloud-owned graph participants
 
 The full bus graph contains `cloud` and partner virtual devices. These are useful because they reveal interface schemas and the native hosting model, but they are not evidence that the panel has a secret local protocol to every partner device. In many cases the on-panel adapter calls a partner cloud API and reflects the result into a Brilliant peripheral.
 
-Static UI strings and installed modules identify clients or auth flows for Amazon/Alexa, Google/Nest, Ring, TP-Link, SmartThings, Sonos, Hue, LIFX, Ecobee, Schlage, Somfy, Wemo, Hunter Douglas, Bluesound, and others. HA should generally connect to those systems directly and then, when useful, mirror the HA entity back into Brilliant.
+Static UI strings and installed modules identify clients or auth flows for Amazon/Alexa, Google/Nest, Ring, TP-Link, SmartThings, Sonos, Hue, LIFX, Ecobee, Schlage, Somfy, Wemo, Hunter Douglas, Bluesound, and others. HA should generally connect to those systems directly. Existing Brilliant scenes can then trigger configured HA actions without re-hosting each entity on a physical Control.
 
 This inversion has three benefits:
 
 1. HA becomes the authoritative integration hub.
-2. Brilliant's UI still receives native device tiles and controls.
+2. Brilliant's existing scenes/modes remain available in its native UI while HA receives local events and can request confirmed execution.
 3. Loss of Brilliant's partner cloud adapters no longer removes the device from the wall panel.
 
 ## Configuration synchronization risk
@@ -64,7 +69,7 @@ For durable independence, back up sanitized structural data and preserve:
 - the signed OSTree repository and boot artifacts;
 - panel release/commit inventory;
 - room and relevant configuration schemas;
-- HA mirror selection/area mapping;
+- HA control label/area mapping and scene-action configuration;
 - community agent packages and systemd units;
 - broker and HA configuration in the operator's secret stores;
 - documented recovery procedures that do not require copying device credentials into Git.
@@ -103,8 +108,8 @@ Until that test is complete, document local media support as promising but unpro
 | Brilliant mesh accessories | Brilliant mesh leader, bridged once to HA |
 | Third-party devices | Native HA integration |
 | Cross-ecosystem automation | Home Assistant |
-| Devices shown on Brilliant panels | HA mirror hosting selected HA entities |
-| Rooms/areas | HA area is operator authority; map to Brilliant room for display |
+| Devices shown on Brilliant panels | Existing Brilliant graph; native HA tiles blocked pending Virtual Control gates |
+| Rooms/areas | HA area is operator authority; room mapping prepares the HA manifest but does not create tiles |
 | Firmware artifacts | Signed Brilliant commits mirrored locally |
 | Secrets | SOPS/HA secret storage, never panel-analysis docs |
 | HomeKit | Local fallback during migration and for recovery |

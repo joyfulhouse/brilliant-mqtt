@@ -1,109 +1,179 @@
-# HA Mirror — Home Assistant entities as native panel devices
+# HA mirror retirement and legacy peripheral cleanup
 
-The **HA mirror** is the reverse bridge: it reflects selected Home Assistant
-entities into the Brilliant in-wall panel UI as **native, controllable
-devices**. A panel toggle/slider drives a Home Assistant service call; a Home
-Assistant state change updates the panel tile. Control is local via the panel
-message bus.
+> **Deprecated and unsafe:** do not install, enable, or restart the physical-
+> Control HA mirror. `brilliant-ha-mirror` must remain inactive. This page is a
+> retirement and cleanup guide, not installation advice.
 
-It runs on every panel but is **active on only one** — a priority election over
-a retained MQTT topic picks a single leader that hosts the mirrored devices for
-the whole home (they render on every panel).
+The supported replacement is the
+[HA-owned control plane and scene/mode bridge](brilliant-panel/home-assistant-integration.md).
+It reuses the existing panel agent sessions and does not host peripherals. The
+separate native-tile idea remains blocked behind the
+[Virtual Control feasibility gates](superpowers/plans/2026-07-12-virtual-control-feasibility-gates.md).
 
-## What can be mirrored (Tier 1)
+## Why physical-Control hosting was rejected
 
-| Home Assistant domain | Appears on panel as | Control |
-|---|---|---|
-| `light` | Light (on/off + brightness) | ✅ |
-| `switch` | On/off device | ✅ |
-| `lock` | Lock | ✅ |
-| `cover` (position) | Shade | ✅ |
-| `cover` (garage) | Garage door | ✅ |
+The old Tier-1 process reflected labeled HA entities into a real panel's own
+device through `PeripheralHost`. Live validation disproved that architecture:
 
-Cameras, doorbells, thermostats, and media players are **not** in this tier.
+- it co-managed a physical Control that already had a native manager;
+- the deployed design created one bus peer/host per entity, increasing local
+  bus load and contributing to peer timeouts;
+- real light controls became unresponsive under the experiment;
+- native UI admission and home-wide propagation were unreliable;
+- the process placed a direct HA WebSocket credential on the panel; and
+- correct display metadata and room assignment did not repair the ownership,
+  manager-routing, or propagation model.
 
-## Choose what to mirror
+Room metadata still matters to the native UI: unassigned devices are excluded
+from normal room models. It was not the missing architectural ingredient. A
+raw record without an owned manager can render and still route commands to the
+wrong manager; a physical-Control host can own commands and still interfere
+with the panel's real loads. Neither is suitable for community support.
 
-Apply a **label** (default `brilliant`) to each Home Assistant entity you want
-on the panels — in Home Assistant: *Settings → entity → Labels*. Only labeled,
-supported entities are mirrored. Change the label name with `MIRROR_LABEL`.
+No native HA tile, including `HA_PILOT_ROOM_D`, is supported by the replacement
+baseline. Existing Brilliant scenes remain in the native UI; HA receives scene
+and mode events and can request confirmed execution through MQTT.
 
-## Enable it (recommended: via the integration)
+## Config-entry version 3 migration
 
-The Brilliant MQTT integration installs and configures the mirror per panel — no
-manual SSH needed. In each panel's config entry (add or **Reconfigure**), tick
-**HA mirror** and fill in:
+Migration is deliberately fail-closed:
 
-| Field | Value |
-|---|---|
-| HA WebSocket URL | e.g. `ws://homeassistant.local:8123/api/websocket` |
-| Long-lived token | a Home Assistant long-lived access token |
-| Leader priority | election rank, **lower wins**, `0` = never lead — give each panel a distinct value |
-| Mirror label | entity label to mirror (default `brilliant`) |
+1. The bridge component remains selected; the deprecated mirror component is
+   forced off.
+2. The legacy mirror label is copied to the HA-owned control label (or defaults
+   to `brilliant`). Room mapping belongs to the new HA-side room-overrides
+   object; it is never resolved by a panel-side HA client.
+3. New control defaults are added: disabled, `light`/`switch`, maximum 50,
+   current panel as scene panel, and empty room/action objects.
+4. The mirror component is hidden from new install and reconfigure selection.
+   Its install function rejects calls; reconciliation can only uninstall it.
+5. The manager creates a redacted Repair, inspects all six legacy states, runs
+   uninstall when anything remains, and performs a fresh strict inspection.
+6. The Repair clears only after absence is proven and the panel shell closes
+   cleanly. Old URL/direct-HA credential/leader fields are removed only when
+   safe control is enabled and retirement is verified. The copied legacy label
+   and unrelated settings remain.
 
-The integration ships the agent, writes `/etc/brilliant-ha-mirror.env` (0600),
-installs the systemd unit, and enables it — reusing the panel's existing broker
-credentials for the leader election. A per-panel **HA mirror** switch turns it on
-and off; a Repair re-installs the payload if it goes missing. The token is stored
-in the config entry like the broker password and is never logged.
+If the panel is offline, inspection is ambiguous, uninstall fails, the second
+proof still finds state, shell cleanup times out, or the operation is cancelled,
+the Repair remains and old sensitive fields are retained. That is an explicit
+unverified state, not a successful migration. Do not respond by restarting the
+old service.
 
-> The mirror requires the (always-installed) MQTT bridge on the same panel, which
-> the integration guarantees.
+## Inspect service retirement
 
-The manual deploy below is the fallback for panels not managed by the integration.
+Use the integration Repair/reconfigure flow first. A healthy retired panel has
+an active `brilliant-mqtt` service and an inactive or absent
+`brilliant-ha-mirror` service. Authenticate using the approved temporary
+`SSHPASS` environment only; never place a credential in an argument or capture.
 
-## Configuration (`/etc/brilliant-ha-mirror.env`, mode 0600)
+```bash
+sshpass -e ssh root@<panel-ip> \
+  'systemctl is-active brilliant-mqtt; systemctl is-active brilliant-ha-mirror || true'
+```
 
-| Variable | Required | Purpose |
-|---|---|---|
-| `PANEL` | yes | This panel's slug (e.g. `office`). |
-| `HA_WS_URL` | yes | Home Assistant WebSocket URL, e.g. `ws://homeassistant.local:8123/api/websocket`. |
-| `HA_TOKEN` | yes | A Home Assistant long-lived access token. |
-| `MQTT_HOST` / `MQTT_USERNAME` / `MQTT_PASSWORD` | yes | Broker creds (used for the leader election). |
-| `MQTT_PORT` | no | Default `1883`. |
-| `MIRROR_LABEL` | no | Entity label to mirror. Default `brilliant`. |
-| `LEADER_PRIORITY` | no | Election rank; **lower number wins**, `0` = never lead. Give each panel a distinct value. |
-| `LEADER_HEARTBEAT_SECONDS` | no | Election heartbeat. Default `10`. |
-| `LOG_LEVEL` | no | Default `INFO`. |
+Do not print `/etc/brilliant-ha-mirror.env`. The config-entry manager owns
+removal of its unit, environment file, payload directory, and staged copy.
 
-> **Set a distinct `LEADER_PRIORITY` per panel.** The lowest number that is
-> online leads and hosts the mirrors; if it drops, the next takes over.
+## Legacy peripheral cleanup
 
-## Manual deploy (pilot one panel first)
+Service retirement removes the unsafe runtime but cannot assume that records
+persisted by earlier experiments disappeared. The cleanup CLI inventories only
+the Control's own device and is safe to run in dry-run mode. It neither hosts a
+peripheral nor scans the whole home graph.
 
-> **Prerequisite:** the panel must already run the main bridge — the mirror
-> reuses `brilliant_mqtt` (installed at `/var/brilliant-mqtt/app`) and its
-> vendored `aiomqtt` (`/var/brilliant-mqtt/vendor`) for the leader election.
-> `aiohttp` is part of the panel's own Python; nothing else needs vendoring.
+### Candidate rule
 
-1. **Copy the app**: `scp -r src/brilliant_ha_mirror root@<panel-ip>:/var/brilliant-ha-mirror/app/`
-2. **Write** `/etc/brilliant-ha-mirror.env` (table above), mode 0600.
-3. **Smoke-run in the foreground** (watch logs):
-   ```bash
-   PYTHONPATH=/var/brilliant-ha-mirror/app:/var/brilliant-mqtt/app:/var/brilliant-mqtt/vendor:/data/switch-embedded \
-     /data/switch-embedded/env/bin/python3 -m brilliant_ha_mirror
-   ```
-4. Confirm the labeled entities appear on the panels and control works both ways.
-5. Install the unit and enable it:
-   ```bash
-   cp deploy/brilliant-ha-mirror.service /etc/systemd/system/
-   systemctl enable --now brilliant-ha-mirror
-   ```
+A peripheral is eligible only when **both** independent, case-sensitive tests
+pass:
 
-Repeat per panel with a distinct `LEADER_PRIORITY`. The unit lives under `/var`
-(survives OTA); after a firmware update, re-install it.
+- its peripheral ID starts with one of `ha_`, `ha-pilot-`, or `zzz_mirror_`;
+- its display name starts with one of `HA `, `HA_PILOT_`, or `ZZZ Mirror `.
 
-## How it works (for maintainers)
+The prefixes need not be paired by position, but both dimensions must match.
+Near matches, different casing, normal Brilliant loads, and special native
+peripherals are excluded. If an eligible peripheral ID occurs more than once,
+every occurrence of that ID is excluded as ambiguous. Do not rename a record to
+make it pass.
 
-- Each mirrored entity is hosted as a peripheral on the leader panel's **own**
-  message-bus device (`virtual_device_id=None`), which the firmware propagates
-  home-wide — the same mechanism the panel's built-in hue/lifx/smartthings
-  integrations use.
-- A panel command reaches the peripheral's `push_func`, which calls the Home
-  Assistant service. Home Assistant state is reflected back with the framework's
-  internal value-update (no command feedback loop).
-- On leader loss or shutdown the hosted peripherals are deleted (with an
-  explicit deletion timestamp) so no stale devices linger.
+### 1. Dry run
 
-**Design + verification:** `docs/superpowers/specs/2026-07-10-ha-mirror-tier1-design.md`
-and the `docs/superpowers/research/2026-07-10-ha-mirror-*` notes (operator-local).
+Run this first in the deployed agent Python environment:
+
+```bash
+python -m brilliant_mqtt.cleanup_legacy_mirror
+```
+
+Dry run performs one scoped snapshot, no delete, no sleep, and no file write. It
+prints one canonical redacted JSON object with exactly:
+
+- `timestamp_ms` and `owning_device_id`;
+- `candidates` containing only `id`, `name`, and integer `type`;
+- `deleted_ids`, `remaining_ids`, and `success`.
+
+It never copies variables, values, serialized blobs, paths, exception text, or
+credentials into the report. In dry run, candidates appear in
+`remaining_ids`; `success:true` means inventory completed, not that candidates
+were removed.
+
+Record and review the output. If every candidate is not unmistakably from an
+old HA mirror/pilot, stop. Keep the mirror inactive and investigate manually.
+
+### 2. Apply only after a fresh operator decision
+
+Apply is root-only and requires an absolute report path beneath the existing
+`/data/brilliant-mqtt/cleanup/` tree:
+
+```bash
+python -m brilliant_mqtt.cleanup_legacy_mirror \
+  --apply \
+  --snapshot /data/brilliant-mqtt/cleanup/legacy-mirror-<timestamp>.json
+```
+
+Relative paths, traversal, missing parents, symlinks, directories, paths
+outside the safe tree, and unwritable parents are rejected before the native
+client is constructed. Create the intended private parent deliberately; do not
+weaken permissions or redirect the report elsewhere.
+
+Before the first delete, apply atomically writes a mode-0600 failure-state
+report. It then calls the firmware's native `delete_peripheral` method serially
+with a fresh millisecond timestamp and a one-second pause between candidates
+(never after the last). A delete error stops subsequent deletes.
+
+Whether deletion succeeds or fails, the CLI takes a fresh second scoped
+snapshot. Success requires every original candidate to be absent from the same
+owning device, successful native-client shutdown, and a final atomic redacted
+report write. Verification/read/report/shutdown failure produces a nonzero exit
+and conservative `success:false` output. Re-running with no candidates is
+idempotent and performs no delete.
+
+### Abort and rollback expectations
+
+Deletion of a stale peripheral has no automatic inverse. The CLI cannot and
+must not re-host a record to “roll back.” On any nonzero result:
+
+1. stop; do not rerun apply in a loop;
+2. retain the private report and the terminal redacted JSON;
+3. leave `brilliant-ha-mirror` inactive;
+4. verify physical loads and the native UI from the panel;
+5. resolve remaining/ambiguous IDs from a new read-only snapshot; and
+6. do not remove legacy source/runtime packaging until the Office scene bridge
+   hardware gate passes.
+
+Cleanup is intentionally separate from scene-control enable, disable, deploy,
+and rollback. The [Office pilot runbook](brilliant-panel/runbooks/scene-bridge-pilot.md)
+permits dry run after acceptance and requires a new operator decision before any
+apply.
+
+## Historical references
+
+The superseded Tier-1 design and research notes remain evidence of the failure,
+not implementation guidance:
+
+- [Tier-1 design](superpowers/specs/2026-07-10-ha-mirror-tier1-design.md)
+- [visibility research](superpowers/research/2026-07-10-ha-mirror-v1-visibility.md)
+- [per-type research](superpowers/research/2026-07-10-ha-mirror-v3-per-type.md)
+- [replacement design](superpowers/specs/2026-07-12-ha-control-plane-and-virtual-control-design.md)
+
+Do not use the old manual deploy, leader election, direct HA connection, or
+physical-host instructions from superseded documents.

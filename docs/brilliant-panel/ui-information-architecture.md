@@ -44,15 +44,15 @@ The exact home-function vocabulary present in the binary is:
 | Music | Now-playing, groups, presets, volume | Missing as an HA-facing panel capability |
 | Climate | Thermostats and readings | Supported by firmware; no native instance in this panel fleet |
 | Intercom | Call/broadcast/live video | Separate media project; privacy-sensitive |
-| Scenes | Activate/edit/create scenes | Catalog and trigger path need completed live validation |
+| Scenes | Activate/edit/create scenes | Safe catalog/event/confirmed-command bridge implemented off-panel; Office gate pending |
 | Modes | Home-wide operating modes | Useful semantic bridge to HA alarm/presence/input-select state |
-| Rooms | Room-first device navigation | Important for HA mirror area mapping |
+| Rooms | Room-first device navigation | HA area/room metadata is modeled, but does not create a native HA tile |
 | Devices | Type/device browse and settings | Existing HA entity device grouping should align |
 | Alexa | Native voice status/mute | HA voice satellite is intentionally separate |
-| Shades | Position/tilt controls | HA mirror supports covers; native fleet has no shade instance |
+| Shades | Position/tilt controls | Native schema exists; generic HA native tiles are blocked |
 | Alarms | Alarm configuration/execution | Distinct from security system alarm state |
 | Cameras | Live video/device view | Media subsystem, not core MQTT bridge |
-| Access | Locks/access panels/garages | HA mirror supports lock/cover Tier 1 |
+| Access | Locks/access panels/garages | Native schemas exist; physical-Control HA hosting is rejected |
 | Doorbell | Doorbell feeds, chime, paired lock/security | Deferred media/security tier |
 | Solar | Questionnaire, estimates, savings | Firmware schema/UI present; data source partly cloud-derived |
 | Add to Home | Device/group provisioning | Keep native; HA should not emulate mesh provisioning casually |
@@ -64,7 +64,11 @@ Shortcut targets can be a home function, scene, room, mode, or single device. Su
 
 ### HA design consequence
 
-Mirrored HA entities should be native peripherals with room assignments, not a parallel “Home Assistant” silo. That allows the existing home functions, Rooms view, shortcut picker, error states, and device screens to work without bespoke UI.
+If native HA entities become feasible, they should use an officially owned
+Virtual Control identity and complete room/type metadata rather than a parallel
+web silo. Physical-Control hosting and raw injection are rejected. The supported
+baseline intentionally uses HA scene surfaces and existing Brilliant scenes;
+see the [HA integration guide](home-assistant-integration.md).
 
 ## Information hierarchy
 
@@ -122,9 +126,16 @@ The scene editor is capable of more than light toggles. Static controller proper
 - multi-device selection and device groups;
 - validity checking when referenced devices disappear.
 
-The current home snapshot has only the auto-generated “All Lights Off” and “All Lights On” scenes. The scene catalog blob is decoded, but the presumed trigger variable `last_executed_scene_id` still needs a controlled write test before it becomes an HA scene/button contract.
+The current home snapshot has only the auto-generated “All Lights Off” and “All
+Lights On” scenes. The integration decodes this catalog and implements
+catalog-allowlisted `last_executed_scene_id` requests that wait for a matching
+execution record. It remains off-panel-tested until the Office hardware gate.
 
-Modes are separate from scenes. The UI tracks configured modes, active and manual mode IDs, scene membership, invalid scenes, geolocation-triggered scenes, and a Brilliant subscription flag. A future HA bridge should decide whether Brilliant modes map to HA alarm states, presence helpers, scenes, or an explicit select entity; silently conflating modes with scenes would lose behavior.
+Modes are separate from scenes. The UI tracks configured modes, active and
+manual mode IDs, scene membership, invalid scenes, geolocation-triggered scenes,
+and a Brilliant subscription flag. The bridge preserves that distinction with
+separate mode catalog/event/command topics and `set_mode`; it does not map a
+mode silently to an HA scene.
 
 ## Sliders, gestures, and motion
 
@@ -136,11 +147,12 @@ The panel distinguishes three input systems:
 
 Mesh switch configuration contains `slider_config`, `double_tap_enabled`, and a scene binding, but no ordinary “last pressed” variable. That matches live observation: hardware input is consumed locally to execute its binding, while downstream load state changes appear on the bus. Exposing raw gestures as HA events will require one of:
 
-- hosting HA-backed scene/group targets that the native binding can call;
+- mapping an existing Brilliant scene execution to a configured HA action;
 - decoding and participating in execution/configuration objects;
 - instrumenting a lower-level input or message path outside the normal variable graph.
 
-The first option is the safest and most native.
+The first option is the supported baseline because it adds no peripheral owner.
+Hosting an HA-backed target remains blocked behind Virtual Control gates.
 
 ## Settings hierarchy
 

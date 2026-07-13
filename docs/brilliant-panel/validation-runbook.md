@@ -173,32 +173,20 @@ Validate the enabled detection mode, then create controlled motion at known dist
 
 Validate `enable_motion_score`, raw score, configured thresholds, derived motion, clear delay, desired-state reconcile, and leader failover. Do not rely on the firmware's stale `movement_detected` latch as the only oracle.
 
-## 8. HA mirror
+## 8. Deprecated physical-Control HA mirror
 
-Use uniquely named disposable HA entities labeled for mirroring.
+Do not run the former hosted-peripheral validation procedure. Physical-Control
+HA hosting is rejected: it co-managed a real Control, added bus peers, threatened
+physical responsiveness, and did not reliably admit or propagate native tiles.
+Room metadata did not repair ownership or command routing. Keep
+`brilliant-ha-mirror` inactive and follow the
+[retirement/cleanup guide](../ha-mirror.md).
 
-For each supported type:
-
-1. Confirm one elected leader.
-2. Add the label and reconcile.
-3. Confirm exactly one hosted peripheral in the leader's own device.
-4. Confirm it is visible from a second panel.
-5. Change HA state and confirm native panel UI state.
-6. Change from the panel and confirm the exact HA service call/state.
-7. Remove the label and confirm a timestamped tombstone/delete home-wide.
-8. Reboot or hand off the leader and confirm no duplicate or phantom.
-
-Current live-proof coverage:
-
-- LIGHT control callback: proven;
-- LOCK control callback: proven;
-- home-wide visibility/delete: proven;
-- GENERIC_ON_OFF: implementation/test coverage, repeat live;
-- SHADE: schema/implementation, live hosted smoke required;
-- GARAGE_DOOR: schema/implementation, event vocabulary/UI reflection required;
-- room assignment: not implemented in Tier 1.
-
-Do not leave test peripherals hosted. The firmware persists them across host exit and reboot.
+The supported hardware gate is the non-hosting
+[Office scene-bridge pilot](runbooks/scene-bridge-pilot.md). Native HA tiles are
+a separate Virtual Control research track and remain blocked until every
+feasibility gate passes. Historical Tier-1 observations may support failure
+analysis, but they do not authorize another physical-host pilot.
 
 ## 9. Scene validation
 

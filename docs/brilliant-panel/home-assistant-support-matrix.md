@@ -67,28 +67,21 @@ The pilot was inspected read-only during this analysis:
 
 This spot check validates current service health, discovery-state publication, retained telemetry, and ongoing command flow. It is not a substitute for the per-variable write/restore checklist.
 
-## Reverse mirror: HA to native panel UI
+## HA to panel: safe control versus native tiles
 
-| HA entity | Panel type | Status | Evidence / gap |
-|---|---:|---|---|
-| Light | LIGHT 27 | **Implemented + live mechanism** | Hosted light control callback proven; home-wide visibility proven |
-| Switch | GENERIC_ON_OFF 45 | **Implemented + test** | Same scalar command mechanism; complete end-to-end panel UI smoke still useful |
-| Lock | LOCK 1 | **Implemented + live mechanism** | Hosted lock callback proven |
-| Positional cover | SHADE 53 | **Implemented + test** | Interface extracted; no live native shade instance; hosted smoke needed |
-| Garage cover | GARAGE_DOOR 74 | **Implemented + test** | Event vocabulary inferred/implemented; live UI reflection explicitly unverified |
-| Home-wide visibility | own Control device | **Implemented + live** | Hosted peripheral observed on a second panel and cleanly deleted |
-| Leader election | MQTT priority | **Implemented + test** | Reuses mesh election pattern; live failover/no-phantom fleet drill still recommended |
-| Explicit delete/tombstone | peripheral name + timestamp | **Implemented + live facts** | Persistence and timestamp requirement discovered live; adapter passes timestamp |
-| Label selection | HA label registry | **Implemented + test** | Supported labeled entities only |
-| HA state → panel | internal variable update | **Implemented + live fact** | Uses internal update to avoid callback loop |
-| Panel command → HA | `push_func` → service | **Implemented + live mechanism** | Light/lock callback proven; service adapter covered off-panel |
-| HA area → Brilliant room | room assignment struct | **Partial** | HA area names collected, but room IDs/struct are not applied in Tier 1 |
-| Climate | THERMOSTAT 4 | **Research** | Required interface known; defer until room/type hosting is hardened |
-| Media player | MUSIC 3 | **Research** | Rich schema and native screens; service translation is substantial |
-| Alarm panel | SECURITY_SYSTEM 89 | **Research** | Must preserve code/PIN and state-transition semantics |
-| Camera/doorbell | CAMERA 59 / DOORBELL 2 | **Defer to subsystem** | Needs streaming sessions in addition to variables |
-| Valve/leak | WATER_SHUTOFF_VALVE 95 | **Research** | Useful community type after mirror framework validation |
-| Weather/solar/energy | 79/97/101 | **Research** | Good display candidates; decide HA authority and update cadence |
+The earlier reverse-mirror implementation is deprecated. Its physical-Control
+hosting mechanism is not a supported panel transport even where an individual
+callback or delete was observed. See the
+[retirement guide](../ha-mirror.md) for the failure model.
+
+| Surface | Status | Evidence / gap |
+|---|---|---|
+| HA label/area/device manifest and retained state | **Implemented + off-panel test** | HA owns registry resolution and MQTT publication; no current panel transport consumes the generic entity manifest. |
+| Brilliant scene catalog/event → HA | **Implemented + off-panel test** | Scoped catalog codec, durable replay suppression, HA event and constrained configured action; Office hardware gate pending. |
+| HA `run_scene` → Brilliant confirmation | **Implemented + off-panel test** | Existing catalog IDs only; completion requires a matching execution record; Office hardware gate pending. |
+| Brilliant mode catalog/event and HA `set_mode` | **Implemented + off-panel test** | Same constrained transport; live test requires a real configured mode. |
+| Native HA light/switch/lock/cover tiles | **Blocked research** | Physical-Control hosting rejected. Virtual Control must pass provisioning, ownership, rendering, routing, WAN-isolation, resource, and cleanup gates. |
+| Room overrides | **Implemented manifest metadata** | Entity area precedes device area and explicit overrides are case-insensitive; metadata does not render a native tile. |
 
 ## What the current integration gets right
 
@@ -97,7 +90,9 @@ This spot check validates current service health, discovery-state publication, r
 3. **Permission-aware writes.** The bus rejects non-settable variables; mappings should never override that contract.
 4. **Resilience against the frozen observer mirror.** Reconnect, hot polling, stale-stream rebuild, watchdog recovery, retained MQTT state, and LWT address observed failures.
 5. **HA lifecycle management.** The companion integration installs, repairs, updates, and monitors panel-side components without requiring users to hand-edit systemd files.
-6. **Native reverse hosting.** HA mirror devices use Brilliant's own peripheral model instead of a foreign panel web app.
+6. **Safe reverse semantics.** Existing Brilliant scenes/modes cross the shared
+   local MQTT/bus sessions without hosting a peripheral or storing an HA
+   credential on the panel.
 
 ## Important gaps
 
@@ -110,38 +105,24 @@ Run the [validation runbook](validation-runbook.md) for every **Implemented + te
 - touch-slider enable/restore and double-tap timeout;
 - intercom broadcast receive preference;
 - firmware auto-update and remote-assistance read/restore without starting an update/tunnel;
-- HA mirror switch, shade, and garage rendering/control;
-- leader handoff with no persistent phantom.
-
-### P1: room-aware HA mirror
-
-This is the highest-leverage UX improvement. Resolve Brilliant room ID enumeration and struct-valued `room_assignment`, then map HA areas to native rooms with explicit overrides. It makes mirrored devices appear where users expect across Rooms, shortcuts, and type screens.
-
-Acceptance criteria:
-
-- exact and case-normalized room match with operator override;
-- unassigned fallback rather than wrong-room assignment;
-- rename/move reconciliation;
-- explicit deletion of stale assignments/peripherals;
-- visibility confirmed from two physical panels.
+- Office scene event/action and confirmed `run_scene`;
+- reconnect/restart replay suppression with no peer or physical-control
+  regression.
 
 ### P1: scenes as an interoperability bridge
 
-Validate a benign existing scene trigger, then expose Brilliant scenes as HA scene/button entities. In the reverse direction, consider hosting HA scenes or scripts as a native Brilliant scene-compatible target. This is the cleanest route for cap-touch double tap and screen gestures to launch HA automations without inventing raw input events.
-
-Do not begin by exposing dynamic execution-handler variables. Use the catalog and one validated scene command.
+The safe scene/mode bridge and HA surfaces are implemented off-panel. Complete
+the [Office scene-bridge pilot](runbooks/scene-bridge-pilot.md): validate one
+benign existing scene event/action, confirmed HA-to-panel execution, restart
+recovery, no replay, unchanged peer count, and physical responsiveness. Do not
+create arbitrary scene blobs or hosted HA scene peripherals.
 
 ### P1: physical-control bindings to HA
 
-After scene hosting, validate these workflows:
-
-- bind panel slider double tap to an HA-hosted scene/script;
-- bind a screen gesture to a mirrored HA group/scene;
-- bind a mesh-switch double tap when firmware marks it supported;
-- verify action survives panel reboot and leader handoff;
-- ensure deletion removes or invalidates the binding cleanly.
-
-This addresses the community's “use the panel as a central local controller” need more naturally than publishing noisy low-level gestures.
+Use existing Brilliant scene bindings to trigger the HA-side configured action
+map. Directly hosting HA scene/group targets on a physical Control remains
+rejected. Any native binding to a future HA peripheral must wait for the
+distinct Virtual Control feasibility gates.
 
 ### P2: media player and announce
 
@@ -168,14 +149,10 @@ Useful additions with bounded risk:
 
 ### P3: advanced native types
 
-Once the mirror host, room assignment, and lifecycle are proven fleet-wide, add HA-to-panel adapters in this order:
-
-1. climate sensor and thermostat;
-2. water leak/valve;
-3. weather/energy/solar display;
-4. media player;
-5. security system with proper code handling;
-6. camera/doorbell/intercom as a separate architecture.
+Do not add another native type through physical-Control hosting. Type-specific
+adapters become eligible only after the separate Virtual Control track passes
+all feasibility gates. Camera/doorbell/intercom remains a separate media and
+privacy architecture regardless of transport.
 
 ## Features to avoid by default
 
@@ -194,7 +171,11 @@ Once the mirror host, room assignment, and lifecycle are proven fleet-wide, add 
 A coherent local product has three layers:
 
 1. **Brilliant → HA:** physical loads, sensors, panel controls, health, and mesh.
-2. **HA → Brilliant:** selected HA entities rendered natively, room-aware, with clean failover.
-3. **Automation bindings:** scenes/scripts/groups that native sliders, gestures, modes, and shortcuts can execute.
+2. **Bidirectional semantics:** existing Brilliant scene/mode events trigger HA
+   actions, and HA requests catalog-allowlisted execution with confirmation.
+3. **Gated native research:** only an officially provisioned, local-enough
+   Virtual Control may eventually render selected HA entities; physical-Control
+   hosting is not a fallback.
 
-That combination makes HA the central hub while retaining the panel's strongest UX instead of reducing it to a dimmer with a screen.
+That combination makes HA the central hub while preserving the panel's existing
+scene/room UX without risking its physical load manager.
