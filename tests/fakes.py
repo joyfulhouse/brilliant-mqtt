@@ -139,6 +139,8 @@ class FakeClockMs:
             if deadline <= self.now_ms and not future.done():
                 future.set_result(None)
         await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
 
 
 class FakeMqtt:
