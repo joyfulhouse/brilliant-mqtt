@@ -2340,6 +2340,44 @@ async def test_retirement_hanging_close_is_bounded_and_never_finalizes_early(
             await asyncio.wait_for(shell.close_finished.wait(), timeout=0.5)
 
 
+async def test_retirement_lock_wait_is_inside_total_deadline_and_never_touches_panel(
+    hass: HomeAssistant,
+) -> None:
+    from homeassistant.helpers import issue_registry as ir
+
+    entry, manager = _retirement_entry(hass)
+    before = dict(entry.data)
+    issue_id = f"ha_mirror_retired_{entry.entry_id}"
+    await manager._ssh_lock.acquire()
+
+    with (
+        patch("custom_components.brilliant_mqtt.manager.AsyncsshShell") as shell_constructor,
+        patch.object(panel_ops, "inspect_ha_mirror", new_callable=AsyncMock) as inspect,
+        patch.object(panel_ops, "uninstall_ha_mirror", new_callable=AsyncMock) as uninstall,
+        patch(
+            "custom_components.brilliant_mqtt.manager._LEGACY_RETIRE_TIMEOUT_SECONDS",
+            0.01,
+        ),
+    ):
+        retirement = asyncio.create_task(manager.async_retire_legacy_ha_mirror())
+        done, _pending = await asyncio.wait({retirement}, timeout=0.2)
+        try:
+            assert retirement in done
+            assert retirement.result() is False
+            shell_constructor.assert_not_called()
+            inspect.assert_not_awaited()
+            uninstall.assert_not_awaited()
+            assert ir.async_get(hass).async_get_issue(DOMAIN, issue_id) is not None
+            assert entry.data == before
+            assert entry.data[CONF_HA_MIRROR_TOKEN] == "mirror-secret"
+            assert entry.data.get(DATA_HA_MIRROR_RETIRE_VERIFIED) is not True
+        finally:
+            if not retirement.done():
+                retirement.cancel()
+            manager._ssh_lock.release()
+            await asyncio.wait({retirement}, timeout=0.5)
+
+
 @pytest.mark.allow_lingering_timers
 async def test_offline_retirement_keeps_integration_loaded_and_sanitized_issue(
     hass: HomeAssistant,

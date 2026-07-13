@@ -210,3 +210,55 @@ valid; strings and English translation remain byte-identical
 
 No live panel or production Home Assistant state was touched during this review
 follow-up.
+
+## Fleet-lock deadline follow-up
+
+The final review found that the nominal 30-second retirement deadline began only
+after acquiring the fleet SSH lock. A different panel's management operation could
+therefore hold that lock and block config-entry setup indefinitely.
+
+A regression test acquired the fleet lock before starting retirement and patched the
+deadline to 10 ms. Before the fix, the retirement task was still pending after 200 ms.
+The test also proves that the bounded failure path constructs no shell, performs no
+connect/inspect/uninstall work, leaves the Repair in place, and does not alter secrets
+or the verification marker.
+
+The retirement timeout now encloses fleet-lock acquisition, panel operations, and the
+bounded close path. Timeout while waiting for the lock or closing is sanitized as an
+unverified retirement and never finalizes state. External cancellation continues to
+propagate after fail-closed cleanup, and the lock still serializes the full panel
+operation and close.
+
+Final verification for this follow-up:
+
+```text
+uv run --project ha pytest -c ha/pyproject.toml \
+  ha/tests/test_config_flow.py ha/tests/test_components.py \
+  ha/tests/test_manager.py ha/tests/test_panel_ops.py \
+  ha/tests/test_diagnostics.py ha/tests/test_repairs.py -q
+282 passed in 3.57s
+
+uv run --project ha pytest -c ha/pyproject.toml ha/tests
+506 passed in 8.11s
+
+uv run --project ha ruff check --config ha/pyproject.toml \
+  custom_components/brilliant_mqtt ha/tests
+All checks passed!
+
+uv run --project ha ruff format --check --config ha/pyproject.toml \
+  custom_components/brilliant_mqtt ha/tests
+41 files already formatted
+
+uv run --project ha mypy --strict --config-file ha/pyproject.toml \
+  custom_components/brilliant_mqtt ha/tests
+Success: no issues found in 41 source files
+
+git diff --check
+clean
+
+jq empty custom_components/brilliant_mqtt/strings.json \
+  custom_components/brilliant_mqtt/translations/en.json
+valid; strings and English translation remain byte-identical
+```
+
+No live panel or production Home Assistant state was touched.

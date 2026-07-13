@@ -435,33 +435,35 @@ class PanelManager:
         failure = False
         cancellation: asyncio.CancelledError | None = None
         try:
-            async with self._ssh_lock:
-                try:
-                    async with asyncio.timeout(_LEGACY_RETIRE_TIMEOUT_SECONDS):
+            async with asyncio.timeout(_LEGACY_RETIRE_TIMEOUT_SECONDS):
+                async with self._ssh_lock:
+                    try:
                         if self._shutting_down:
                             return False
                         shell = await self._connect_for_repair()
                         result = await self._async_retire_legacy_ha_mirror_on_shell(shell)
-                except asyncio.CancelledError as error:
-                    cancellation = error
-                except (TimeoutError, _HostKeyChanged, OSError, asyncssh.Error, PanelOpError):
-                    failure = True
-                close_ok = True
-                if shell is not None:
-                    close_ok = await self._async_close_shell(shell)
-                if cancellation is not None:
-                    self.legacy_mirror_problem = "Legacy HA mirror retirement was interrupted"
-                    raise cancellation
-                if failure or not close_ok:
-                    self.legacy_mirror_problem = "Legacy HA mirror retirement could not be verified"
-                    _LOGGER.warning(
-                        "%s: legacy HA mirror retirement could not be verified",
-                        self.panel,
-                    )
-                    return False
-                if result is True or (force_history_audit and result is None):
-                    self._finalize_verified_ha_mirror_retirement()
-                return result is not False
+                    except asyncio.CancelledError as error:
+                        cancellation = error
+                    except (_HostKeyChanged, OSError, asyncssh.Error, PanelOpError):
+                        failure = True
+                    close_ok = True
+                    if shell is not None:
+                        close_ok = await self._async_close_shell(shell)
+                    if cancellation is not None:
+                        self.legacy_mirror_problem = "Legacy HA mirror retirement was interrupted"
+                        raise cancellation
+                    if failure or not close_ok:
+                        self.legacy_mirror_problem = (
+                            "Legacy HA mirror retirement could not be verified"
+                        )
+                        _LOGGER.warning(
+                            "%s: legacy HA mirror retirement could not be verified",
+                            self.panel,
+                        )
+                        return False
+                    if result is True or (force_history_audit and result is None):
+                        self._finalize_verified_ha_mirror_retirement()
+                    return result is not False
         except asyncio.CancelledError:
             self.legacy_mirror_problem = "Legacy HA mirror retirement was interrupted"
             raise
