@@ -1,9 +1,9 @@
 """No-start preflight for an isolated Brilliant Virtual Control runtime.
 
 This module deliberately has no process creation, firmware import, socket
-connection, or executable command builder.  It validates the pinned firmware
-surface, provisioned private identity, and isolated filesystem topology, then
-reports the still-unresolved official identity-consumer contract.
+connection, or executable command builder. It validates the pinned uWSGI
+runtime surface, provisioned private identity, and isolated filesystem
+topology, then reports the next unresolved contract without starting anything.
 """
 
 from __future__ import annotations
@@ -19,19 +19,33 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _PINNED_FIRMWARE = "v26.06.03.1"
 _PINNED_HASHES = {
+    "bridge.remote_bridge": ("94ac32df6184814950cc5bc3ebeac828518b858f8fd6ce76380b67f20ccf20e4"),
     "bus.message_bus": "a85b7a2d0c2533db8d803a217027dbdd245bc104f221bf6955907dc0b8f6feb8",
+    "bus.peripheral_process_manager": (
+        "da8d7678c2a7d798aac2e3d735ac6e0789359bfb47226e5b8702f3923fcc7135"
+    ),
+    "configs.process_configs": ("a8ea4ad3885ac0d826da0073b2696a026f8d38a071418fe13196eb554b9e94a9"),
+    "lib.process_management.process_manager": (
+        "38d26c0d300fab7af421731438c0bb9d97b7202760b089609d178a9e1db1b860"
+    ),
     "lib.runner": "4ba40ac7d7695dc239590defbc6efd3d22efbf296fc1c2b40f139fb6e1fe3cb0",
     "peripherals.bootstrap.bootstrap_peripheral": (
         "313d526a3fe1ad1879137a83eaa55096d9b0fb7a08cac30e37a79ea3632d57db"
     ),
+    "peripherals.discovery.discovery_peripheral": (
+        "d6bc30e81430978f4b72779dd2c6927a7ceab094a951ce7bb907a20969b94e45"
+    ),
+    "runtime.run_py": "70d03e29277862a93da7840ca2224b5b27293158d30e3054a8b17068dbb0d961",
+    "runtime.uwsgi": "3384606e779e7a4216f4ff27e39e10221cd0b377c02ad1d9fd8ea61269ecbc43",
 }
 _MESSAGE_BUS_PARAMETERS = frozenset({"home_id", "device_id", "mb_state_dir", "is_virtual_control"})
 _RUNNER_PARAMETERS = frozenset({"startable_config", "module_name_override"})
 _BOOTSTRAP_FIELDS = frozenset({"target_home_id", "server_authentication_token", "wifi_variables"})
 _IDENTITY_FILES = frozenset({"device_id", "pkcs12_certificate", "bootstrap", "metadata.json"})
+_CERTIFICATE_FILES = frozenset({"device.key", "device.cert"})
 _DEVICE_ID = re.compile(r"^[0-9a-f]{32}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
@@ -45,9 +59,24 @@ _PROTECTED_ROOTS = (
     Path("/data/switch-embedded"),
 )
 _PINNED_MODULE_PATHS = {
+    "bridge.remote_bridge": Path(
+        "/data/switch-embedded/env/lib/python3.10/site-packages/"
+        "bridge/remote_bridge.cpython-310-arm-linux-gnueabi.so"
+    ),
     "bus.message_bus": Path(
         "/data/switch-embedded/env/lib/python3.10/site-packages/"
         "bus/message_bus.cpython-310-arm-linux-gnueabi.so"
+    ),
+    "bus.peripheral_process_manager": Path(
+        "/data/switch-embedded/env/lib/python3.10/site-packages/"
+        "bus/peripheral_process_manager.cpython-310-arm-linux-gnueabi.so"
+    ),
+    "configs.process_configs": Path(
+        "/data/switch-embedded/env/lib/python3.10/site-packages/configs/process_configs.py"
+    ),
+    "lib.process_management.process_manager": Path(
+        "/data/switch-embedded/env/lib/python3.10/site-packages/lib/process_management/"
+        "process_manager.cpython-310-arm-linux-gnueabi.so"
     ),
     "lib.runner": Path(
         "/data/switch-embedded/env/lib/python3.10/site-packages/"
@@ -57,6 +86,12 @@ _PINNED_MODULE_PATHS = {
         "/data/switch-embedded/env/lib/python3.10/site-packages/peripherals/"
         "bootstrap/bootstrap_peripheral.cpython-310-arm-linux-gnueabi.so"
     ),
+    "peripherals.discovery.discovery_peripheral": Path(
+        "/data/switch-embedded/env/lib/python3.10/site-packages/peripherals/discovery/"
+        "discovery_peripheral.cpython-310-arm-linux-gnueabi.so"
+    ),
+    "runtime.run_py": Path("/data/switch-embedded/run.py"),
+    "runtime.uwsgi": Path("/data/switch-embedded/env/bin/uwsgi"),
 }
 _MAX_IDENTITY_BYTES = 1024 * 1024
 _MAX_METADATA_BYTES = 64 * 1024
@@ -90,8 +125,11 @@ class NoStartPlan:
     paths_isolated: bool
     private_modes_valid: bool
     empty_runtime_paths: bool
+    certificate_material_present: bool
     identity_file_count: int
     device_id_redacted: str
+    uwsgi_contract_confirmed: bool
+    direct_runner_rejected: bool
     identity_contract_complete: bool
     launcher_implementation_present: bool
     start_permitted: bool
@@ -105,8 +143,11 @@ class NoStartPlan:
             "paths_isolated": self.paths_isolated,
             "private_modes_valid": self.private_modes_valid,
             "empty_runtime_paths": self.empty_runtime_paths,
+            "certificate_material_present": self.certificate_material_present,
             "identity_file_count": self.identity_file_count,
             "device_id_redacted": self.device_id_redacted,
+            "uwsgi_contract_confirmed": self.uwsgi_contract_confirmed,
+            "direct_runner_rejected": self.direct_runner_rejected,
             "identity_contract_complete": self.identity_contract_complete,
             "launcher_implementation_present": self.launcher_implementation_present,
             "start_permitted": self.start_permitted,
@@ -129,7 +170,7 @@ def preflight_no_start(
     actual_hashes = _hash_inventory(actual_module_hashes, "actual module hash")
     if actual_hashes != _PINNED_HASHES:
         raise LauncherPreflightError("actual module hash drift blocks the launcher")
-    _validate_path_topology(
+    certificate_material_present = _validate_path_topology(
         paths,
         required_uid=required_uid,
         allowed_persistent_roots=allowed_persistent_roots,
@@ -143,12 +184,19 @@ def preflight_no_start(
         paths_isolated=True,
         private_modes_valid=True,
         empty_runtime_paths=True,
+        certificate_material_present=certificate_material_present,
         identity_file_count=len(_IDENTITY_FILES),
         device_id_redacted=redacted_device_id,
+        uwsgi_contract_confirmed=True,
+        direct_runner_rejected=True,
         identity_contract_complete=False,
         launcher_implementation_present=False,
         start_permitted=False,
-        blocked_reason="official_identity_consumer_unresolved",
+        blocked_reason=(
+            "bootstrap_runtime_contract_unvalidated"
+            if certificate_material_present
+            else "identity_materialization_required"
+        ),
     )
 
 
@@ -156,18 +204,23 @@ def _validate_firmware_snapshot(snapshot: Mapping[str, object]) -> None:
     expected_fields = {
         "schema_version",
         "firmware_version",
-        "module_sha256",
+        "runtime_sha256",
         "message_bus_parameters",
         "runner_parameters",
         "bootstrap_fields",
         "virtual_control_flag",
+        "runtime_launcher",
+        "message_bus_requires_emperor",
+        "certificate_files",
+        "remote_bridge_parameters",
+        "discovery_fields",
     }
     if set(snapshot) != expected_fields or snapshot.get("schema_version") != _SCHEMA_VERSION:
         raise LauncherPreflightError("firmware snapshot schema is invalid")
     if snapshot["firmware_version"] != _PINNED_FIRMWARE:
         raise LauncherPreflightError("firmware version does not match the pinned build")
 
-    hashes = _hash_inventory(snapshot["module_sha256"], "firmware module hash")
+    hashes = _hash_inventory(snapshot["runtime_sha256"], "firmware runtime hash")
     if hashes != _PINNED_HASHES:
         raise LauncherPreflightError("firmware module hash drift blocks the launcher")
 
@@ -176,6 +229,11 @@ def _validate_firmware_snapshot(snapshot: Mapping[str, object]) -> None:
     )
     runner_parameters = _parameter_set(snapshot["runner_parameters"], "runner interface")
     bootstrap_fields = _parameter_set(snapshot["bootstrap_fields"], "bootstrap interface")
+    certificate_files = _literal_set(snapshot["certificate_files"], "certificate file contract")
+    remote_bridge_parameters = _parameter_set(
+        snapshot["remote_bridge_parameters"], "remote-bridge interface"
+    )
+    discovery_fields = _parameter_set(snapshot["discovery_fields"], "discovery interface")
     if (
         not _MESSAGE_BUS_PARAMETERS <= message_bus_parameters
         or not _RUNNER_PARAMETERS <= runner_parameters
@@ -183,6 +241,14 @@ def _validate_firmware_snapshot(snapshot: Mapping[str, object]) -> None:
         or snapshot["virtual_control_flag"] != "start_as_virtual_control"
     ):
         raise LauncherPreflightError("firmware interface drift blocks the launcher")
+    if (
+        snapshot["runtime_launcher"] != "uwsgi_emperor_vassal"
+        or snapshot["message_bus_requires_emperor"] is not True
+        or certificate_files != _CERTIFICATE_FILES
+        or remote_bridge_parameters != {"listen_port", "message_bus_address_override"}
+        or discovery_fields != {"remote_bridge_port"}
+    ):
+        raise LauncherPreflightError("firmware runtime contract drift blocks the launcher")
 
 
 def _hash_inventory(value: object, description: str) -> dict[str, str]:
@@ -213,13 +279,24 @@ def _parameter_set(value: object, description: str) -> frozenset[str]:
     return frozenset(parameters)
 
 
+def _literal_set(value: object, description: str) -> frozenset[str]:
+    if not isinstance(value, list) or not value or len(value) > 16:
+        raise LauncherPreflightError(f"{description} list is invalid")
+    result: set[str] = set()
+    for item in value:
+        if not isinstance(item, str) or not item or len(item) > 128 or item in result:
+            raise LauncherPreflightError(f"{description} value is invalid")
+        result.add(item)
+    return frozenset(result)
+
+
 def _validate_path_topology(
     paths: LauncherPaths,
     *,
     required_uid: int,
     allowed_persistent_roots: Sequence[Path],
     allowed_runtime_roots: Sequence[Path],
-) -> None:
+) -> bool:
     physical_socket = _PHYSICAL_SOCKET.resolve(strict=False)
     socket = paths.socket_path.resolve(strict=False)
     if socket == physical_socket:
@@ -276,12 +353,33 @@ def _validate_path_topology(
 
     for description, directory in (
         ("state directory", paths.state_dir),
-        ("certificate directory", paths.certificate_dir),
         ("process-config directory", paths.process_config_dir),
         ("runtime directory", paths.runtime_dir),
     ):
         if any(directory.iterdir()):
             raise LauncherPreflightError(f"{description} must be empty before launch")
+    return _validate_certificate_directory(
+        paths.certificate_dir,
+        required_uid=required_uid,
+    )
+
+
+def _validate_certificate_directory(path: Path, *, required_uid: int) -> bool:
+    entries = {entry.name: entry for entry in path.iterdir()}
+    if not entries:
+        return False
+    if set(entries) != _CERTIFICATE_FILES:
+        raise LauncherPreflightError(
+            "certificate directory must be empty or contain exactly device.key and device.cert"
+        )
+    for name, certificate_path in entries.items():
+        _validate_private_file(
+            certificate_path,
+            description=f"materialized certificate {name}",
+            required_uid=required_uid,
+            maximum_bytes=_MAX_METADATA_BYTES,
+        )
+    return True
 
 
 def _private_directory(path: Path, *, description: str, required_uid: int) -> Path:
@@ -422,7 +520,7 @@ def hash_firmware_modules(
     module_paths: Mapping[str, Path] = _PINNED_MODULE_PATHS,
     required_uid: int = 0,
 ) -> dict[str, str]:
-    """Hash the three actual firmware modules without following links."""
+    """Hash every pinned runtime file without following links."""
 
     if set(module_paths) != set(_PINNED_HASHES):
         raise LauncherPreflightError("actual module path inventory is invalid")

@@ -73,31 +73,67 @@ disposable Virtual Control, root-only identity storage, the cloud account
 change, and mandatory official removal. An earlier general approval is not the
 short-lived approval file used by the provisioner.
 
+With VC0 and VC1 recorded `pass` in the same private ledger, run the guarded
+provisioner without `--apply` first. Dry-run mode validates every local guard and
+uses a no-network client:
+
+```text
+python -m tools.brilliant_vc.provision_panel \
+  --run-id <ledger-run-id> \
+  --panel office \
+  --ledger <root-only-gate-ledger.json> \
+  --token-file <root-only-official-token> \
+  --property-id <32-lowercase-hex-property-id> \
+  --expected-home-id <32-lowercase-hex-home-id> \
+  --identity-dir /data/brilliant-vc/identity
+```
+
+Only after reviewing that result and creating the exact root-owned mode-`0600`
+approval document less than ten minutes earlier, repeat with:
+
+```text
+  --apply --approval-file <root-only-approval.json>
+```
+
+Apply mode makes the single official self-bootstrap request, verifies HTTP 200
+and the serialized target home, then persists exactly `device_id`,
+`pkcs12_certificate`, `bootstrap`, and redacted `metadata.json`. If the request
+ends without a confirmed response, inspect the official app and home graph and
+do not retry blindly. This account-visible write has not been performed.
+
 ## VC3 — isolated launcher and runtime monitor
 
-Read-only introspection on Office firmware `v26.06.03.1` establishes these
-launcher facts:
+Static analysis plus network-disabled execution of the captured ARM firmware
+`v26.06.03.1` establishes these launcher facts:
 
-- `lib.runner.run_as_main(startable_config, module_name_override=None)` is the
-  shipped event-loop supervisor.
 - `bus.message_bus.MessageBus(...)` accepts dedicated `home_id`, `device_id`,
   `mb_state_dir`, and `is_virtual_control` arguments. Its startable parameter
-  maps the latter to the `--start_as_virtual_control` flag.
+  maps the latter to `--start_as_virtual_control`.
+- A constructor-only dummy probe creates a `DeviceType 6` owner with home `"0"`
+  and no peripherals before start. This is type evidence, not home assignment.
+- `lib.runner.run_as_main(startable_config, module_name_override=None)` is used
+  by the shipped vassal path, but is not a standalone supervisor. Directly
+  starting `MessageBus` through it fails with
+  `Attempting to bootstrap without uwsgi Emperor running`.
+- The captured uWSGI binary, ProcessManager, and generated vassal configuration
+  are therefore part of the runtime contract. In an ARM container with no
+  network, dummy identifiers, isolated temporary paths, and all 37 unrelated
+  processes disabled, the Emperor created the isolated message-bus socket and
+  kept the vassal alive. The remote bridge reached BLE initialization and then
+  failed because the container intentionally lacked D-Bus/GLib.
 - `BootstrapParameters` contains `target_home_id`, a server-authentication
   credential, and Wi-Fi variables. Do not print or deserialize it into a public
   report.
-- `BootstrapPeripheral` can load saved bootstrap parameters, but it is part of
-  the device bootstrap/reset path. Do not invoke it inside the running physical
-  Control process.
+- `BootstrapPeripheral` can load saved bootstrap parameters and execute home
+  assignment/reset behavior. Do not invoke it in the physical Control process;
+  its behavior with an actual official VC identity remains the next isolated
+  runtime spike.
+- `RemoteBridge` exposes `listen_port` and `message_bus_address_override`.
+  Its default port is `5455`, which the pilot must replace with a dedicated
+  non-colliding port. Discovery publishes the actual `remote_bridge_port`.
 
-The inspected module SHA-256 values were
-`a85b7a2d0c2533db8d803a217027dbdd245bc104f221bf6955907dc0b8f6feb8`
-(`bus.message_bus`),
-`4ba40ac7d7695dc239590defbc6efd3d22efbf296fc1c2b40f139fb6e1fe3cb0`
-(`lib.runner`), and
-`313d526a3fe1ad1879137a83eaa55096d9b0fb7a08cac30e37a79ea3632d57db`
-(`peripherals.bootstrap.bootstrap_peripheral`). Re-run introspection and stop
-on any firmware/hash change.
+No panel, Brilliant service, cloud endpoint, physical load, scene, slider, or
+HA entity was contacted by these off-panel spikes.
 
 Do not start the repository's shipped `run.py` a second time. Its `pre_exec`
 deletes the common message-bus server socket and recreates common runtime
@@ -107,24 +143,66 @@ local socket, process-config directory, and device ID. VC3 is blocked until a
 dry-run preflight proves those paths and the official identity input contract;
 the mere presence of `--start_as_virtual_control` is not sufficient.
 
+### Official identity materialization
+
+The captured provisioning generator returns a Python string containing strict
+base64 of a null-password DER PKCS#12. The generated bundle contains a private
+key and leaf certificate, with the exact common name
+`<device-id>.device.brilliant.tech`; the tested generator emitted no additional
+certificates. The runtime Web API client opens `device.key` and `device.cert`.
+Although the firmware also names `device.csr`, the CSR is a provisioning
+artifact and is not an input to that runtime client.
+
+`tools.brilliant_vc.identity_materializer` implements only this local conversion.
+It has no network, bus, firmware import, process start, provisioning, panel
+control, or cleanup capability. Use it only after VC2 has successfully persisted
+one actual official four-file identity in the designated private directory.
+Dry-run first:
+
+```text
+python -m tools.brilliant_vc.identity_materializer \
+  --identity-dir /data/brilliant-vc/identity \
+  --certificate-dir /data/brilliant-vc/certificates
+```
+
+The dry run requires exact owner/mode/link/size/schema constraints, strict
+base64, an unencrypted bundle, the exact device-ID common name, a matching key,
+a currently valid non-CA leaf, a bounded chain, and bounded PEM output. Its
+printed result contains only redacted ID/fingerprint data. After reviewing that
+result, materialize the pair locally with:
+
+```text
+python -m tools.brilliant_vc.identity_materializer \
+  --identity-dir /data/brilliant-vc/identity \
+  --certificate-dir /data/brilliant-vc/certificates \
+  --apply
+```
+
+Apply mode exclusively creates only mode-`0600` `device.key` and `device.cert`,
+fsyncs them, refuses a non-empty output directory, and removes both outputs on a
+partial failure. It does not start the VC. No official identity currently exists,
+so neither command has been run with live material.
+
 ### No-start launcher preflight
 
 `tools.brilliant_vc.launcher_preflight` implements the repository-safe portion
 of VC3. It has no panel-library import, subprocess call, socket connection,
 command builder, or start method. It validates:
 
-- the exact pinned firmware build and three module hashes above;
-- fresh no-follow SHA-256 reads of the three actual installed `.so` files,
+- the exact pinned firmware build and ten runtime-file hashes below;
+- fresh no-follow SHA-256 reads of all ten actual installed files,
   matched against both the snapshot and pinned digests;
-- the required message-bus, runner, bootstrap, and virtual-control interfaces;
+- the required message-bus, runner, bootstrap, virtual-control, uWSGI Emperor,
+  certificate, remote-bridge, and discovery interfaces;
 - exactly four provisioner outputs (`device_id`, `pkcs12_certificate`,
   `bootstrap`, and `metadata.json`) as root-owned mode-`0600` regular files;
-- device-ID/metadata consistency without opening the PKCS#12 or bootstrap
-  payloads;
+- device-ID/metadata consistency without opening or printing the PKCS#12 or
+  bootstrap payloads;
 - real root-owned mode-`0700` identity, state, certificate, process-config,
   persistent-root, and runtime directories;
-- empty state/certificate/process-config/runtime directories and a nonexistent
-  future socket path; and
+- empty state/process-config/runtime directories, a certificate directory that
+  is either empty or contains exactly the private `device.key`/`device.cert`
+  pair, and a nonexistent future socket path; and
 - canonical, distinct paths outside `/var/device_variables`,
   `/var/run/brilliant`, `/var/brilliant`, `/data/switch-embedded`, and the
   physical `/var/run/brilliant/server_socket`.
@@ -134,12 +212,19 @@ complete schema. It contains names and hashes only, never identity contents:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "firmware_version": "v26.06.03.1",
-  "module_sha256": {
+  "runtime_sha256": {
+    "bridge.remote_bridge": "94ac32df6184814950cc5bc3ebeac828518b858f8fd6ce76380b67f20ccf20e4",
     "bus.message_bus": "a85b7a2d0c2533db8d803a217027dbdd245bc104f221bf6955907dc0b8f6feb8",
+    "bus.peripheral_process_manager": "da8d7678c2a7d798aac2e3d735ac6e0789359bfb47226e5b8702f3923fcc7135",
+    "configs.process_configs": "a8ea4ad3885ac0d826da0073b2696a026f8d38a071418fe13196eb554b9e94a9",
+    "lib.process_management.process_manager": "38d26c0d300fab7af421731438c0bb9d97b7202760b089609d178a9e1db1b860",
     "lib.runner": "4ba40ac7d7695dc239590defbc6efd3d22efbf296fc1c2b40f139fb6e1fe3cb0",
-    "peripherals.bootstrap.bootstrap_peripheral": "313d526a3fe1ad1879137a83eaa55096d9b0fb7a08cac30e37a79ea3632d57db"
+    "peripherals.bootstrap.bootstrap_peripheral": "313d526a3fe1ad1879137a83eaa55096d9b0fb7a08cac30e37a79ea3632d57db",
+    "peripherals.discovery.discovery_peripheral": "d6bc30e81430978f4b72779dd2c6927a7ceab094a951ce7bb907a20969b94e45",
+    "runtime.run_py": "70d03e29277862a93da7840ca2224b5b27293158d30e3054a8b17068dbb0d961",
+    "runtime.uwsgi": "3384606e779e7a4216f4ff27e39e10221cd0b377c02ad1d9fd8ea61269ecbc43"
   },
   "message_bus_parameters": [
     "home_id",
@@ -153,7 +238,12 @@ complete schema. It contains names and hashes only, never identity contents:
     "server_authentication_token",
     "wifi_variables"
   ],
-  "virtual_control_flag": "start_as_virtual_control"
+  "virtual_control_flag": "start_as_virtual_control",
+  "runtime_launcher": "uwsgi_emperor_vassal",
+  "message_bus_requires_emperor": true,
+  "certificate_files": ["device.key", "device.cert"],
+  "remote_bridge_parameters": ["listen_port", "message_bus_address_override"],
+  "discovery_fields": ["remote_bridge_port"]
 }
 ```
 
@@ -172,19 +262,25 @@ python -m tools.brilliant_vc.launcher_preflight \
   --socket-path /run/brilliant-vc/server_socket
 ```
 
-The current expected result is exit status 2 with all file/hash/path checks
-true, `identity_contract_complete=false`,
-`launcher_implementation_present=false`, `start_permitted=false`, and
-`blocked_reason=official_identity_consumer_unresolved`. This is a useful
-preflight result, not VC3 PASS.
+The expected result remains exit status 2 and is intentionally not VC3 PASS. In
+both states it reports `uwsgi_contract_confirmed=true`,
+`direct_runner_rejected=true`, `identity_contract_complete=false`,
+`launcher_implementation_present=false`, and `start_permitted=false`:
 
-Static evidence has not yet identified a supported standalone callable that
-consumes the returned PKCS#12 and serialized `BootstrapParameters`, maps them to
-the isolated certificate/state/socket/config paths, and starts only the new VC
-message bus. `BootstrapPeripheral` is not accepted as that proof because it is
-part of the physical device bootstrap/reset path. Resolve and review that exact
-consumer contract before implementing any launcher. Do not weaken the
-preflight, invoke `run.py`, or convert its no-start plan into a guessed command.
+- before identity materialization:
+  `certificate_material_present=false` and
+  `blocked_reason=identity_materialization_required`;
+- after the exact private PEM pair exists:
+  `certificate_material_present=true` and
+  `blocked_reason=bootstrap_runtime_contract_unvalidated`.
+
+The remaining exact implementation blocker is to prove, with the actual
+official identity and serialized `BootstrapParameters`, that a dedicated uWSGI
+vassal performs target-home assignment, uses only the alternate message-bus and
+remote-bridge addresses, is discoverable by peers, and stops cleanly without
+leaving an owner. That bounded test needs separate approval after provisioning.
+Do not weaken the preflight, invoke physical `run.py`, invoke the physical
+`BootstrapPeripheral`, or turn the no-start plan into a direct-runner command.
 
 Once that preflight passes, attach the bounded monitor:
 

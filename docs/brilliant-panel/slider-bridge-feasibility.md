@@ -146,7 +146,7 @@ cannot echo into another command. A broker reconnect keeps the single native
 host but fences commands until retained HA authority is replayed; transient HA
 unavailability similarly shows safe `off` and remains fenced until recovery.
 
-Three additional repository-safe validators make the live acceptance criteria
+Four additional repository-safe validators make the live acceptance criteria
 executable without granting them mutation authority:
 
 - `tools.brilliant_vc.slider_binding` reads only Office's own type-19
@@ -157,11 +157,21 @@ executable without granting them mutation authority:
   requires one command per operator gesture, a correlated accepted HA result,
   an advancing state sequence, two-panel native convergence, no echo/snap-back,
   and bounded latency. It opens no network or panel connection.
-- `tools.brilliant_vc.launcher_preflight` validates pinned firmware hashes,
-  the four-file provisioned identity contract, private isolated directories,
-  and collision-free socket/state/certificate/config paths. It intentionally
-  contains no start primitive and currently reports the official standalone
-  identity consumer unresolved.
+- `tools.brilliant_vc.identity_materializer` validates the captured firmware's
+  strict base64/null-password PKCS#12 contract and exclusively creates only its
+  private `device.key`/`device.cert` runtime pair with rollback on write error.
+  It has no network, bus, or process-start capability.
+- `tools.brilliant_vc.launcher_preflight` validates ten pinned runtime hashes,
+  the four-file provisioned identity contract, the uWSGI Emperor requirement,
+  the exact certificate pair, private isolated directories, and collision-free
+  socket/state/certificate/config paths. It intentionally contains no start
+  primitive and blocks on isolated bootstrap/home-assignment validation.
+
+Network-disabled ARM execution of the captured binaries established that a
+direct `run_as_main` start is rejected without uWSGI Emperor. A captured uWSGI
+Emperor/vassal created an isolated dummy message-bus socket and remained alive;
+the official identity bootstrap, clean remote-bridge/discovery behavior, and
+target-home assignment have not been tested on Office.
 
 The detailed artifact schema and ordered procedure are in the
 [native slider E2E runbook](runbooks/native-slider-e2e.md). A reviewed passive

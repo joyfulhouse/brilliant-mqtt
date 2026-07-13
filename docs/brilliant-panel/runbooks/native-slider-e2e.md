@@ -63,17 +63,21 @@ Do not select a slider until every item passes:
 1. VC0 and VC1 pass with official-app and bus evidence.
 2. One fresh, disposable DeviceType-6 identity is provisioned after the scoped
    approval gate.
-3. The no-start launcher preflight no longer reports
-   `official_identity_consumer_unresolved`.
-4. The bounded VC runtime and monitor pass with no physical-panel regression.
-5. Exactly one VC-owned type-27 `LIGHT` exists, its
+3. The identity materializer passes first in dry-run mode and then creates only
+   the exact private `device.key`/`device.cert` pair.
+4. Schema-v2 no-start preflight confirms the pinned uWSGI Emperor contract and
+   direct-runner rejection. It no longer reports
+   `identity_materialization_required` or
+   `bootstrap_runtime_contract_unvalidated`.
+5. The bounded VC runtime and monitor pass with no physical-panel regression.
+6. Exactly one VC-owned type-27 `LIGHT` exists, its
    `configuration_peripheral_id` resolves to the VC's own configuration
    peripheral, and retained HA state makes it online.
-6. Office and a second panel render the same online light in the intended room.
-7. The native Office slider picker offers that VC-owned online light without a
+7. Office and a second panel render the same online light in the intended room.
+8. The native Office slider picker offers that VC-owned online light without a
    hand-written binding.
 
-The current legacy picker result satisfies none of items 2–7.
+The current legacy picker result satisfies none of items 2–8.
 
 ## Gate B — capture the original Office binding
 
@@ -314,14 +318,16 @@ lights is an independent, separately approved operation.
 ## Remaining implementation/live work
 
 1. Finish official-app VC0 and obtain the official VC1 token.
-2. Prove the firmware's supported standalone identity-bundle consumer; the
-   no-start launcher preflight currently blocks here.
-3. Provision one disposable VC after fresh approval and confirm official
+2. Provision one disposable VC after fresh approval and confirm official
    removal before starting it.
-4. Run the isolated runtime/monitor, discover its own configuration peripheral,
+3. Validate and materialize the actual official PKCS#12 locally.
+4. Implement and prove target-home bootstrap under an isolated captured uWSGI
+   Emperor/vassal, including alternate remote-bridge/discovery paths and clean
+   stop/removal. Schema-v2 preflight currently blocks here after materialization.
+5. Run the isolated runtime/monitor, discover its own configuration peripheral,
    and host the one online light.
-5. Review and implement the passive multi-panel transcript collector against
+6. Review and implement the passive multi-panel transcript collector against
    that actual topology.
-6. Capture the original slider baseline and obtain binding approval.
-7. Obtain separate gesture permission; the current instruction forbids it.
-8. Run basic, restart, WAN, restoration, and supported-removal gates in order.
+7. Capture the original slider baseline and obtain binding approval.
+8. Obtain separate gesture permission; the current instruction forbids it.
+9. Run basic, restart, WAN, restoration, and supported-removal gates in order.

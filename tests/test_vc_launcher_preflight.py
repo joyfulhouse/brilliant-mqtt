@@ -20,14 +20,31 @@ DEVICE_ID = "a" * 32
 
 def _firmware() -> dict[str, object]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "firmware_version": "v26.06.03.1",
-        "module_sha256": {
+        "runtime_sha256": {
+            "bridge.remote_bridge": (
+                "94ac32df6184814950cc5bc3ebeac828518b858f8fd6ce76380b67f20ccf20e4"
+            ),
             "bus.message_bus": "a85b7a2d0c2533db8d803a217027dbdd245bc104f221bf6955907dc0b8f6feb8",
+            "bus.peripheral_process_manager": (
+                "da8d7678c2a7d798aac2e3d735ac6e0789359bfb47226e5b8702f3923fcc7135"
+            ),
+            "configs.process_configs": (
+                "a8ea4ad3885ac0d826da0073b2696a026f8d38a071418fe13196eb554b9e94a9"
+            ),
+            "lib.process_management.process_manager": (
+                "38d26c0d300fab7af421731438c0bb9d97b7202760b089609d178a9e1db1b860"
+            ),
             "lib.runner": "4ba40ac7d7695dc239590defbc6efd3d22efbf296fc1c2b40f139fb6e1fe3cb0",
             "peripherals.bootstrap.bootstrap_peripheral": (
                 "313d526a3fe1ad1879137a83eaa55096d9b0fb7a08cac30e37a79ea3632d57db"
             ),
+            "peripherals.discovery.discovery_peripheral": (
+                "d6bc30e81430978f4b72779dd2c6927a7ceab094a951ce7bb907a20969b94e45"
+            ),
+            "runtime.run_py": ("70d03e29277862a93da7840ca2224b5b27293158d30e3054a8b17068dbb0d961"),
+            "runtime.uwsgi": ("3384606e779e7a4216f4ff27e39e10221cd0b377c02ad1d9fd8ea61269ecbc43"),
         },
         "message_bus_parameters": [
             "home_id",
@@ -42,11 +59,16 @@ def _firmware() -> dict[str, object]:
             "wifi_variables",
         ],
         "virtual_control_flag": "start_as_virtual_control",
+        "runtime_launcher": "uwsgi_emperor_vassal",
+        "message_bus_requires_emperor": True,
+        "certificate_files": ["device.key", "device.cert"],
+        "remote_bridge_parameters": ["listen_port", "message_bus_address_override"],
+        "discovery_fields": ["remote_bridge_port"],
     }
 
 
 def _module_hashes() -> dict[str, str]:
-    hashes = _firmware()["module_sha256"]
+    hashes = _firmware()["runtime_sha256"]
     assert isinstance(hashes, dict)
     return dict(hashes)
 
@@ -110,12 +132,15 @@ def test_valid_prerequisites_produce_a_redacted_plan_that_cannot_start(tmp_path:
         "paths_isolated": True,
         "private_modes_valid": True,
         "empty_runtime_paths": True,
+        "certificate_material_present": False,
         "identity_file_count": 4,
         "device_id_redacted": "aaaa…aaaa",
+        "uwsgi_contract_confirmed": True,
+        "direct_runner_rejected": True,
         "identity_contract_complete": False,
         "launcher_implementation_present": False,
         "start_permitted": False,
-        "blocked_reason": "official_identity_consumer_unresolved",
+        "blocked_reason": "identity_materialization_required",
     }
     assert DEVICE_ID not in json.dumps(plan.to_public_dict())
     assert not hasattr(plan, "command")
@@ -124,7 +149,7 @@ def test_valid_prerequisites_produce_a_redacted_plan_that_cannot_start(tmp_path:
 def test_hash_or_interface_drift_blocks_before_a_plan(tmp_path: Path) -> None:
     paths = _paths(tmp_path)
     firmware = _firmware()
-    snapshot_hashes = firmware["module_sha256"]
+    snapshot_hashes = firmware["runtime_sha256"]
     assert isinstance(snapshot_hashes, dict)
     snapshot_hashes["lib.runner"] = "0" * 64
     with pytest.raises(LauncherPreflightError, match="hash"):
@@ -162,6 +187,39 @@ def test_hash_or_interface_drift_blocks_before_a_plan(tmp_path: Path) -> None:
             allowed_persistent_roots=(paths.persistent_root,),
             allowed_runtime_roots=(paths.runtime_dir,),
         )
+
+    firmware = _firmware()
+    firmware["message_bus_requires_emperor"] = False
+    with pytest.raises(LauncherPreflightError, match="runtime contract"):
+        preflight_no_start(
+            paths,
+            firmware,
+            actual_module_hashes=_module_hashes(),
+            required_uid=os.getuid(),
+            allowed_persistent_roots=(paths.persistent_root,),
+            allowed_runtime_roots=(paths.runtime_dir,),
+        )
+
+
+def test_materialized_certificate_pair_is_accepted_but_start_remains_blocked(
+    tmp_path: Path,
+) -> None:
+    paths = _paths(tmp_path)
+    _private_file(paths.certificate_dir / "device.key", b"private-key-pem")
+    _private_file(paths.certificate_dir / "device.cert", b"certificate-pem")
+
+    plan = preflight_no_start(
+        paths,
+        _firmware(),
+        actual_module_hashes=_module_hashes(),
+        required_uid=os.getuid(),
+        allowed_persistent_roots=(paths.persistent_root,),
+        allowed_runtime_roots=(paths.runtime_dir,),
+    )
+
+    assert plan.certificate_material_present is True
+    assert plan.start_permitted is False
+    assert plan.blocked_reason == "bootstrap_runtime_contract_unvalidated"
 
 
 def test_rejects_physical_socket_shared_or_colliding_paths(tmp_path: Path) -> None:

@@ -21,6 +21,7 @@ The central finding is that the panel is not a collection of isolated integratio
 | [Home Assistant control and scene bridge](home-assistant-integration.md) | Authoritative ownership model, configuration, MQTT contract, HA surfaces, safety, diagnostics, and migration |
 | [Validation runbook](validation-runbook.md) | Safe static, read-only, telemetry, and write-validation procedures |
 | [Office scene-bridge pilot](runbooks/scene-bridge-pilot.md) | Hardware acceptance, restart/replay checks, rollback, evidence, and legacy-removal gate |
+| [Virtual Control feasibility gates](runbooks/virtual-control-gates.md) | Official token/provisioning boundary, PKCS#12 materialization, isolated uWSGI runtime contract, monitor, and native-light gates |
 | [Native slider E2E runbook](runbooks/native-slider-e2e.md) | Private binding baseline, passive gesture transcript, exactly-once/two-panel analysis, restoration, and remaining blockers |
 
 Existing low-level references remain authoritative for the already-proven Python bus client contract:
@@ -48,9 +49,10 @@ The documents use these labels so static capability is not confused with working
 2. **The panel UI is broader than the live hardware graph.** The firmware contains first-class UI and schemas for shades, climate, locks, garages, cameras, security, valves, music, and energy. Most are partner-backed virtual peripherals in this home, not panel hardware.
 3. **Rooms, scenes, modes, groups, and shortcuts are first-class IA concepts.** These are the most important remaining cross-system semantics for making HA the central hub.
 4. **Physical-Control HA hosting is rejected.** Although bundled adapters host typed peripherals, adding a manager to a real Control co-managed physical hardware, added bus load, threatened load responsiveness, and did not reliably admit or propagate tiles. The supported baseline is the HA-owned MQTT scene/mode bridge; native tiles remain blocked behind the distinct Virtual Control feasibility gates.
-5. **Physical slider and gesture bindings are configuration objects, not ordinary state variables.** They can target lights, groups, scenes, or modes. The lack of a press-event variable explains why simple bus observation cannot expose every gesture as an HA event.
-6. **Camera/intercom is a media subsystem, not a boolean camera entity.** It combines raw camera hardware, GStreamer, WebRTC/SDP session state, RTSP, remote-media peripherals, and privacy gates. It should be isolated from the core bridge.
-7. **Cloud removal is capability-specific.** Wired loads, mesh loads, panel controls, MQTT, and the scene/mode bridge use local paths. Partner account linking, some media relay paths, weather/art catalogs, Alexa, and OTA discovery remain cloud-backed unless separately replaced. Virtual Control locality is unproven and must not be inferred from the local scene bridge.
+5. **A Virtual Control is a uWSGI vassal, not a direct Python runner.** Network-disabled execution of the captured ARM firmware proved the Emperor requirement and the official PKCS#12-to-PEM format off-panel. Actual bootstrap/home assignment, remote-bridge discovery, and locality remain live gates.
+6. **Physical slider and gesture bindings are configuration objects, not ordinary state variables.** They can target lights, groups, scenes, or modes. The lack of a press-event variable explains why simple bus observation cannot expose every gesture as an HA event.
+7. **Camera/intercom is a media subsystem, not a boolean camera entity.** It combines raw camera hardware, GStreamer, WebRTC/SDP session state, RTSP, remote-media peripherals, and privacy gates. It should be isolated from the core bridge.
+8. **Cloud removal is capability-specific.** Wired loads, mesh loads, panel controls, MQTT, and the scene/mode bridge use local paths. Partner account linking, some media relay paths, weather/art catalogs, Alexa, and OTA discovery remain cloud-backed unless separately replaced. Virtual Control locality is unproven and must not be inferred from the local scene bridge.
 
 ## Corpus handling
 

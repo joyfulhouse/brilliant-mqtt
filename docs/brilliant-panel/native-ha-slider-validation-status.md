@@ -84,6 +84,26 @@ is therefore not proof of a live manager.
 | Generic peripheral action path | Returns early for null or offline peripheral data. | Binding one of the stale targets would not prove routing and may leave a dead reference. |
 | `CapTouchSliderConfig` | Stores slider index plus target `device_id` and `peripheral_id`. | A production binding must point to the Virtual Control and its owned light. |
 
+### Off-panel firmware runtime spikes
+
+The captured ARM runtime was exercised only in a network-disabled container
+with dummy identifiers, isolated temporary paths, and all 37 unrelated vassals
+disabled. These are firmware-contract results, not a live Virtual Control test:
+
+| Spike | Result | Integration consequence |
+|---|---|---|
+| Captured ARM module import | Exact constructors expose isolated message-bus state, a Virtual Control flag, saved bootstrap input, remote-bridge port/address overrides, and discovery's `remote_bridge_port`. | The required isolation controls exist in the pinned firmware. |
+| Message-bus construction | A dummy `is_virtual_control=true` instance constructs a `DeviceType 6` owner with home `"0"` and no peripherals before start. | Construction alone does not join the target home or prove a usable configuration peripheral. |
+| Direct `run_as_main` start | Fails with `Attempting to bootstrap without uwsgi Emperor running`. | A direct Python runner is not a valid launcher shape. |
+| Captured uWSGI Emperor/vassal smoke | The isolated message-bus socket was created and the vassal remained alive. The remote bridge reached its BLE initialization boundary, then failed as expected because the container had no D-Bus/GLib. | The runtime must be implemented as an isolated uWSGI Emperor/vassal. Clean remote-bridge and peer discovery still require the bounded Office test. |
+| Captured PKCS#12 generator | Produces strict base64 of null-password DER containing a private key and leaf certificate whose only common name is `<device-id>.device.brilliant.tech`; no additional certificate was emitted. | The official provisioning response can be validated and converted locally without guessing its format. |
+| Certificate consumption | The runtime Web API client consumes `device.key` and `device.cert`; the CSR is a provisioning artifact, not a runtime input. | Materialize only the exact two-file PEM pair in the isolated certificate directory. |
+
+No live panel, Brilliant service, official identity, home assignment, physical
+slider, HA entity, or device was contacted by these spikes. The captured uWSGI
+binary and all ten runtime files used by the probes matched the pinned
+`v26.06.03.1` hashes recorded in the VC runbook.
+
 ## What is confirmed
 
 1. The native UI accepts an ordinary `LIGHT` schema with valid display and room
@@ -97,6 +117,10 @@ is therefore not proof of a live manager.
 6. Physical-Control hosting is unsuitable despite the positive UI behavior: it
    co-manages a real panel, previously harmed responsiveness, and leaves
    persistent phantoms.
+7. The captured Virtual Control message bus requires uWSGI Emperor/vassal
+   supervision; direct `run_as_main` startup is rejected.
+8. The official provisioning PKCS#12 format and runtime certificate filenames
+   are understood and have a fail-closed, off-panel materialization path.
 
 ## What is not confirmed
 
@@ -113,6 +137,9 @@ is therefore not proof of a live manager.
 9. WAN-independent behavior after initial provisioning.
 10. Supported restoration and removal without a stale tile, owner, or slider
     reference.
+11. Validation of an actual officially provisioned PKCS#12 and bootstrap blob.
+12. Isolated bootstrap/home assignment under the captured uWSGI runtime.
+13. Clean remote-bridge startup, peer discovery, and propagation on Office.
 
 ## Implemented validation components
 
@@ -126,13 +153,15 @@ is therefore not proof of a live manager.
 | `tools.brilliant_vc.single_light_pilot` | One VC-owned HA-backed `LIGHT`, retained-state fencing, exactly-once command contract, and cleanup | Off-panel tested; live preconditions unavailable |
 | `tools.brilliant_vc.slider_binding` | Scoped own-Control read, strict `slider_config` decoding, private baseline, and exact restoration verdict | Off-panel tested; no baseline captured and no binding written |
 | `tools.brilliant_vc.e2e_acceptance` | Offline correlation of operator gesture, MQTT command/result/state, and two-panel convergence | Off-panel tested; no gestures performed or transcript collected |
-| `tools.brilliant_vc.launcher_preflight` | Pinned-firmware, identity, permission, and isolated-path checks with no start primitive | Off-panel tested; deliberately reports the identity-consumer contract blocked |
+| `tools.brilliant_vc.identity_materializer` | Strict PKCS#12/device-certificate validation and exclusive, rollback-on-error creation of only `device.key` and `device.cert` | Off-panel tested with generated identities; no official identity exists |
+| `tools.brilliant_vc.launcher_preflight` | Schema-v2 pinned uWSGI/runtime, identity, certificate-pair, permission, and isolated-path checks with no start primitive | Off-panel tested; deliberately blocks before bootstrap runtime validation |
 | `brilliant_mqtt.cleanup_legacy_mirror` | Dry-run-first, own-device-only stale-record cleanup | Repository `0.5.7`; not deployed or applied |
 
-The three repository-safe validation helpers are implemented. They do not make
-the live experiment feasible by themselves: no official VC identity exists,
-the shipped identity-to-standalone-message-bus consumer is still unresolved,
-and no online VC light, physical binding, gesture, or E2E transcript exists.
+The repository-safe validation helpers do not make the live experiment feasible
+by themselves. The PKCS#12-to-PEM contract and uWSGI launcher shape are now
+resolved, but no official VC identity exists and the bootstrap/home-assignment
+behavior has not been validated with that identity. No online VC light,
+physical binding, gesture, or E2E transcript exists.
 See the [native slider E2E runbook](runbooks/native-slider-e2e.md) for their
 scope and usage.
 
@@ -148,27 +177,30 @@ ahead by hand-writing a `slider_config` or borrowing Office's identity.
 | 3 | Obtain fresh approval for one account-visible provisioning write. | Approval names the home, Office, one disposable VC, private storage, and mandatory official removal. | **Pending step 2**. |
 | 4 | Run the guarded provisioner once. | HTTP 200; target home matches; exactly one DeviceType-6 identity appears; identity files are root-only. | **Not run**. |
 | 5 | Confirm the official app exposes a supported removal path, without submitting it. | Correct VC/home/account target is shown at final confirmation. | **Not run**. |
-| 6 | Run the isolated-launcher preflight and then, only after its blocker is resolved and separately approved, a bounded VC process under the monitor. | Dedicated identity, socket, state, certificate, and config paths; a proven official identity consumer; no physical-Control path reuse; resource/peer/latency limits pass. | **Preflight implemented; live start blocked** because the official identity-bundle consumer is unresolved. |
-| 7 | Inventory only the VC-owned graph and configuration peripheral. | Owner is the provisioned DeviceType-6 ID; exactly one suitable VC-owned configuration link exists. | **Not run**. |
-| 8 | Dry-run, then separately approve and start the one-light pilot. | One stable VC-owned `LIGHT`; valid Backyard room; retained HA authority received; tile shows online on two panels. | **Implementation exists; live blocked**. |
-| 9 | Check the online VC light in the native slider picker. | The VC-owned light is offered without writing `slider_config` manually. | **Not run**; legacy picker result does not substitute. |
-| 10 | Snapshot one named Office slider's complete original binding and behavior. | Private canonical snapshot is mode `0600`; a read-only verifier can prove exact restoration later. | **Helper implemented; no slider chosen or snapshot captured**. |
-| 11 | Obtain fresh approval for that named slider, then have the operator bind it through the native UI. | Saved binding resolves to the disposable VC/light; all other slider/load configs are byte-identical. | **Not authorized**. |
-| 12 | Obtain separate permission for physical gestures; the operator performs one tap and one dim while passive evidence is collected. | Each gesture creates exactly one HA command and HA feedback updates both panels without oscillation; the offline analyzer passes. | **Analyzer implemented; gestures currently prohibited** and no transcript exists. |
-| 13 | Exercise HA, broker, VC, and panel restart/reconnect cases. | No replay, duplication, stale snap-back, peer regression, or physical lag. | **Not run**. |
-| 14 | Test WAN-up and WAN-denied operation after provisioning. | Locality/cloud dependency is classified from observed behavior. | **Not run**. |
-| 15 | Restore the original slider binding in the native UI and verify it exactly. | Snapshot comparison passes and normal wired/default behavior is restored. | **Not run**. |
-| 16 | Remove the hosted light and VC through supported paths. | Two later scoped snapshots show no tile, owner, or slider reference. | **Not run**. |
-| 17 | Separately decide whether to deploy `0.5.7` and delete the five legacy phantoms. | Fresh dry run and explicit cleanup approval; no object-store clearing. | **Not authorized**. |
+| 6 | Dry-run the identity materializer, review its redacted result, then apply it locally. | Official PKCS#12 matches the exact device ID/CN, key, validity, non-CA, and size contracts; only mode-`0600` `device.key` and `device.cert` exist. | **Helper implemented; not run**. Before apply, schema-v2 preflight reports `identity_materialization_required`. |
+| 7 | Run schema-v2 launcher preflight, then implement and validate bootstrap/home assignment in an isolated uWSGI vassal. | All ten runtime hashes, Emperor requirement, alternate socket/state/certificate/config/bridge paths, and official bootstrap behavior pass; physical paths remain untouched. | **Preflight implemented; runtime start intentionally absent**. After materialization it reports `bootstrap_runtime_contract_unvalidated`. |
+| 8 | With separate live-start approval, run the bounded isolated VC under the monitor. | Correct DeviceType-6 owner joins the target home; remote bridge/discovery, peer, resource, and physical-latency limits pass. | **Not run**. |
+| 9 | Inventory only the VC-owned graph and configuration peripheral. | Owner is the provisioned DeviceType-6 ID; exactly one suitable VC-owned configuration link exists. | **Not run**. |
+| 10 | Dry-run, then separately approve and start the one-light pilot. | One stable VC-owned `LIGHT`; valid Backyard room; retained HA authority received; tile shows online on two panels. | **Implementation exists; live blocked**. |
+| 11 | Check the online VC light in the native slider picker. | The VC-owned light is offered without writing `slider_config` manually. | **Not run**; legacy picker result does not substitute. |
+| 12 | Snapshot one named Office slider's complete original binding and behavior. | Private canonical snapshot is mode `0600`; a read-only verifier can prove exact restoration later. | **Helper implemented; no slider chosen or snapshot captured**. |
+| 13 | Obtain fresh approval for that named slider, then have the operator bind it through the native UI. | Saved binding resolves to the disposable VC/light; all other slider/load configs are byte-identical. | **Not authorized**. |
+| 14 | Obtain separate permission for physical gestures; the operator performs one tap and one dim while passive evidence is collected. | Each gesture creates exactly one HA command and HA feedback updates both panels without oscillation; the offline analyzer passes. | **Analyzer implemented; gestures currently prohibited** and no transcript exists. |
+| 15 | Exercise HA, broker, VC, and panel restart/reconnect cases. | No replay, duplication, stale snap-back, peer regression, or physical lag. | **Not run**. |
+| 16 | Test WAN-up and WAN-denied operation after provisioning. | Locality/cloud dependency is classified from observed behavior. | **Not run**. |
+| 17 | Restore the original slider binding in the native UI and verify it exactly. | Snapshot comparison passes and normal wired/default behavior is restored. | **Not run**. |
+| 18 | Remove the hosted light and VC through supported paths. | Two later scoped snapshots show no tile, owner, or slider reference. | **Not run**. |
+| 19 | Separately decide whether to deploy `0.5.7` and delete the five legacy phantoms. | Fresh dry run and explicit cleanup approval; no object-store clearing. | **Not authorized**. |
 
 ## Immediate next action
 
 Do not bind the offline legacy lights. Finish the official-app portion of VC0,
-obtain a supported provisioning-scoped token for VC1, and close the
-identity-to-standalone-VC launcher contract. The first live mutation must
-remain the single guarded VC provisioning call after fresh approval; the first
-physical-slider mutation must remain the operator's native-UI binding after an
-online VC light and private original-binding snapshot exist.
+then obtain a supported provisioning-scoped token for VC1. The first live
+mutation must remain the single guarded VC provisioning call after fresh
+approval. Once an actual official identity exists, validate/materialize it
+locally and close the remaining isolated bootstrap/home-assignment contract.
+The first physical-slider mutation must remain the operator's native-UI binding
+after an online VC light and private original-binding snapshot exist.
 
 See also:
 
