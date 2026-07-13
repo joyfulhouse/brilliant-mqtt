@@ -115,7 +115,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: BrilliantMqttConfigEntry
     manager = PanelManager(hass, entry, _fleet_lock(hass))
     entry.runtime_data = manager
     await manager.async_setup()
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    from .ha_control import get_control_plane
+
+    control_plane = get_control_plane(hass)
+    try:
+        await control_plane.async_attach(entry)
+        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    except BaseException:
+        await control_plane.async_detach(entry.entry_id)
+        await manager.async_shutdown()
+        raise
     return True
 
 
@@ -139,6 +148,9 @@ async def async_migrate_entry(hass: HomeAssistant, entry: BrilliantMqttConfigEnt
 
 async def async_unload_entry(hass: HomeAssistant, entry: BrilliantMqttConfigEntry) -> bool:
     if unloaded := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
+        from .ha_control import get_control_plane
+
+        await get_control_plane(hass).async_detach(entry.entry_id)
         await entry.runtime_data.async_shutdown()
     return unloaded
 

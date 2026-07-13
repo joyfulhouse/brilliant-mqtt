@@ -16,17 +16,28 @@ from custom_components.brilliant_mqtt.const import (
     COMPONENT_BRIDGE,
     COMPONENT_VOICE,
     CONF_COMPONENTS,
+    CONF_HA_CONTROL_DOMAINS,
+    CONF_HA_CONTROL_ENABLED,
+    CONF_HA_CONTROL_LABEL,
     CONF_HOST,
+    CONF_MAX_MIRRORED_ENTITIES,
     CONF_MESH_PRIORITY,
     CONF_MQTT_HOST,
     CONF_MQTT_PASSWORD,
     CONF_MQTT_PORT,
     CONF_MQTT_USERNAME,
     CONF_PANEL,
+    CONF_ROOM_OVERRIDES,
     CONF_ROOT_PASSWORD,
     CONF_VOICE_ENABLED,
     DATA_SSH_HOST_KEY,
     DOMAIN,
+)
+from custom_components.brilliant_mqtt.ha_control import get_control_plane
+from custom_components.brilliant_mqtt.ha_control_protocol import (
+    manifest_topic,
+    stable_id,
+    state_topic,
 )
 
 
@@ -122,6 +133,82 @@ async def test_setup_retries_when_mqtt_unavailable(
         await hass.async_block_till_done()
 
     assert entry.state is ConfigEntryState.SETUP_RETRY
+
+
+@pytest.mark.allow_lingering_timers
+async def test_two_entries_share_control_plane_through_setup_and_unload(
+    hass: HomeAssistant, mqtt_mock: MqttMockHAClient
+) -> None:
+    """Entry lifecycle publishes and tears down one singleton control plane."""
+    from homeassistant.helpers import entity_registry as er
+    from homeassistant.helpers import label_registry as lr
+
+    label = lr.async_get(hass).async_create("brilliant")
+    entity = er.async_get(hass).async_get_or_create("switch", "test", "desk", original_name="Desk")
+    er.async_get(hass).async_update_entity(entity.entity_id, labels={label.label_id})
+    hass.states.async_set(entity.entity_id, "off")
+    control_data = {
+        CONF_HA_CONTROL_ENABLED: True,
+        CONF_HA_CONTROL_LABEL: "brilliant",
+        CONF_HA_CONTROL_DOMAINS: ("light", "switch"),
+        CONF_MAX_MIRRORED_ENTITIES: 50,
+        CONF_ROOM_OVERRIDES: {},
+    }
+    zulu = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="zulu",
+        data={**ENTRY_DATA, **control_data, CONF_PANEL: "zulu"},
+    )
+    alpha = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="alpha",
+        data={**ENTRY_DATA, **control_data, CONF_PANEL: "alpha"},
+    )
+    zulu.add_to_hass(hass)
+    alpha.add_to_hass(hass)
+
+    assert await hass.config_entries.async_setup(zulu.entry_id)
+    await hass.async_block_till_done()
+    assert zulu.state is ConfigEntryState.LOADED
+    assert alpha.state is ConfigEntryState.LOADED
+
+    plane = get_control_plane(hass)
+    control_subscriptions = [
+        call
+        for call in mqtt_mock.async_subscribe.call_args_list
+        if call.args[0] == "brilliant/ha-control/v1/command/+"
+    ]
+    assert len(control_subscriptions) == 1
+    assert plane.owner_entry_id == alpha.entry_id
+    assert (
+        len(
+            [
+                call
+                for call in mqtt_mock.async_publish.call_args_list
+                if call.args[0] == manifest_topic() and call.args[3] is True
+            ]
+        )
+        == 1
+    )
+    assert (
+        len(
+            [
+                call
+                for call in mqtt_mock.async_publish.call_args_list
+                if call.args[0] == state_topic(stable_id(entity.entity_id)) and call.args[3] is True
+            ]
+        )
+        == 1
+    )
+
+    assert await hass.config_entries.async_unload(alpha.entry_id)
+    assert get_control_plane(hass) is plane
+    assert plane.started is True
+    assert mqtt_mock.is_active_subscription("brilliant/ha-control/v1/command/+")
+
+    assert await hass.config_entries.async_unload(zulu.entry_id)
+    assert plane.started is False
+    assert not mqtt_mock.is_active_subscription("brilliant/ha-control/v1/command/+")
 
 
 async def test_migrate_v1_folds_voice_enabled_into_components(hass: HomeAssistant) -> None:

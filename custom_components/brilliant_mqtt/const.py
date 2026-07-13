@@ -37,6 +37,19 @@ CONF_HA_MIRROR_LABEL = "ha_mirror_label"
 DEFAULT_HA_MIRROR_LABEL = "brilliant"
 DEFAULT_HA_MIRROR_LEADER_PRIORITY = 0
 
+# Home Assistant-owned MQTT control plane. These global values are copied to each
+# panel entry by the configuration vertical slice; the singleton elects the enabled
+# entry with the lexicographically smallest panel slug as its settings owner.
+CONF_HA_CONTROL_ENABLED = "ha_control_enabled"
+CONF_HA_CONTROL_LABEL = "ha_control_label"
+CONF_ROOM_OVERRIDES = "room_overrides"
+CONF_HA_CONTROL_DOMAINS = "ha_control_domains"
+CONF_MAX_MIRRORED_ENTITIES = "max_mirrored_entities"
+DEFAULT_HA_CONTROL_ENABLED = False
+DEFAULT_HA_CONTROL_LABEL = "brilliant"
+DEFAULT_HA_CONTROL_DOMAINS = ("light", "switch")
+DEFAULT_MAX_MIRRORED_ENTITIES = 50
+
 # Per-panel component selection (see docs/ha-integration.md — components/switches).
 CONF_COMPONENTS = "components"  # entry data: {component_id: bool}
 COMPONENT_BRIDGE = "bridge"
@@ -48,6 +61,7 @@ COMPONENT_HA_MIRROR = "ha_mirror"
 # Internally managed config-entry state (never shown in a config-flow form).
 DATA_SSH_HOST_KEY = "ssh_host_key"  # TOFU-pinned on first successful connect
 DATA_LAST_FIRMWARE = "last_firmware"  # persisted so panel_updated survives HA restarts
+DATA_CONTROL_PLANE = "ha_control_plane"
 
 # Options keys + defaults.
 OPT_AUTO_REPAIR = "auto_repair"
