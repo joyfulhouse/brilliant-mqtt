@@ -18,17 +18,18 @@ guide and `../INSTALL.md` for prerequisites including MQTT broker setup.
   [../docs/CONFIGURATION.md](../docs/CONFIGURATION.md#wi-fi-watchdog).
 - `brilliant-voice.service` — optional on-panel voice satellite. See
   [../docs/voice.md](../docs/voice.md).
-- `brilliant-ha-mirror.service` — optional **reverse bridge**: reflect selected
-  Home Assistant entities (light, switch, lock, cover/shade, garage) as native,
-  controllable Brilliant panel devices. Runs on every panel but is active only
-  on the elected leader (one panel hosts the mirrors home-wide). Reads its own
-  `/etc/brilliant-ha-mirror.env` (a Home Assistant WebSocket URL + long-lived
-  token, the mirror label, the leader priority, and the broker creds for the
-  election). See [../docs/ha-mirror.md](../docs/ha-mirror.md).
+- `brilliant-ha-mirror.service` — **deprecated and unsafe; do not install,
+  enable, or restart it.** The physical-Control HA mirror is retired; the unit
+  file remains only as a reference for verifying retirement. The supported
+  replacement is the HA-owned control plane and scene bridge. See
+  [../docs/ha-mirror.md](../docs/ha-mirror.md) for the retirement and cleanup
+  procedure.
 - `brilliant-vc-pilot.service` — **reference-only bounded Virtual Control
   bootstrap unit**. It is not packaged or installed by automation and has no
   `[Install]` section, so it is non-enableable by default. It must not be
-  included in normal panel automation.
+  included in normal panel automation. Overview of the research toolkit these
+  units belong to:
+  [../docs/brilliant-panel/virtual-control-toolkit.md](../docs/brilliant-panel/virtual-control-toolkit.md).
 - `brilliant-vc-pilot-app-manifest.sha256` — exact seven-file staging manifest
   for the reference unit's root-owned `/var/brilliant-vc/app` subset. Update it
   only with reviewed source changes; it is an integrity input, not an installer.

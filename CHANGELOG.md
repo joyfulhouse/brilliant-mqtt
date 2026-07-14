@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Brilliant scenes and modes in Home Assistant** *(in pilot)*. An opt-in
+  scene/mode bridge (`SCENE_BRIDGE_ENABLED`) runs on each panel agent's
+  existing bus and MQTT sessions: it publishes the panel's scene and mode
+  catalogs, fires `brilliant_mqtt_scene` / `brilliant_mqtt_mode` HA events on
+  native executions, and accepts `brilliant_mqtt.run_scene` /
+  `brilliant_mqtt.set_mode` service calls with **confirmed execution** — a
+  command succeeds only after a matching execution record is observed, never
+  on a bare bus write. Each panel gains a **Scene** select and a **Run
+  selected scene** button. The bridge only catalogs and executes *existing*
+  scene/mode IDs; it never creates or edits Brilliant configuration. See
+  [the scene bridge guide](docs/brilliant-panel/home-assistant-integration.md).
+- **HA MQTT control plane v1.** A versioned, HA-owned contract under
+  `brilliant/ha-control/v1/...`: a retained manifest of labeled HA entities
+  (with areas, Brilliant-room overrides, and capability-derived commands),
+  retained per-entity state, and fenced non-retained command/result exchanges
+  with idempotency keys and expiry. The scene/mode topics ride the same
+  contract. No panel transport consumes the generic entity manifest yet — it
+  is groundwork, not a native-tile feature.
+- **Legacy HA-mirror cleanup CLI.** `brilliant_mqtt.cleanup_legacy_mirror`
+  inventories (dry-run-first) and, on a separate operator decision, deletes
+  peripherals persisted by the retired HA-mirror experiments, using strict
+  case-sensitive ID and display-name allowlists and fail-closed verification.
+  See [HA mirror retirement and cleanup](docs/ha-mirror.md).
+- **Virtual Control research toolkit** (`tools/brilliant_vc/`) with
+  reference-only systemd units and SHA-256 staged-tree manifests in
+  `deploy/`. Research tooling for the blocked native-tile track — fail-closed
+  gates, one-shot approval markers, pinned manifests, non-root runtime; not
+  installed or started by any repository automation. See
+  [the toolkit overview](docs/brilliant-panel/virtual-control-toolkit.md).
+
+### Deprecated
+
+- **The physical-Control HA mirror is retired and must stay inactive.**
+  `brilliant-ha-mirror` is hidden from install selection, its installer fails
+  closed, and config entries migrate to version 3 with a verified uninstall
+  and a redacted Repair when absence cannot be proven. The supported
+  replacement is the HA-owned control plane and scene bridge. See
+  [HA mirror retirement and cleanup](docs/ha-mirror.md).
+
 ## [0.5.6] - 2026-07-05
 
 ### Fixed
