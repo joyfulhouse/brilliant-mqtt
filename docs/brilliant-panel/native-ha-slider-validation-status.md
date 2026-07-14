@@ -29,6 +29,8 @@ active owner and cannot be used for a meaningful control test.
 - The operator navigated the native UI and confirmed that the HA controls were
   offered as slider targets, but did not save a binding or operate a slider.
 - No Virtual Control was created, provisioned, started, or removed.
+- The later launcher/configuration probes were off-panel only; Office was not
+  contacted during that work.
 - No legacy peripheral was deleted.
 - Panel-side inspection was read-only: service state, file existence, process
   presence, and scoped message-bus reads.
@@ -87,21 +89,27 @@ is therefore not proof of a live manager.
 ### Off-panel firmware runtime spikes
 
 The captured ARM runtime was exercised only in a network-disabled container
-with dummy identifiers, isolated temporary paths, and all 37 unrelated vassals
-disabled. These are firmware-contract results, not a live Virtual Control test:
+with dummy identifiers, isolated temporary paths, and no device mounts. The
+three-process stock-lifecycle smoke disabled 35 of 38 known processes; the
+four-process E2E candidate disables 34. These are firmware-contract results,
+not a live Virtual Control test:
 
 | Spike | Result | Integration consequence |
 |---|---|---|
 | Captured ARM module import | Exact constructors expose isolated message-bus state, a Virtual Control flag, saved bootstrap input, remote-bridge port/address overrides, and discovery's `remote_bridge_port`. | The required isolation controls exist in the pinned firmware. |
 | Message-bus construction | A dummy `is_virtual_control=true` instance constructs a `DeviceType 6` owner with home `"0"` and no peripherals before start. | Construction alone does not join the target home or prove a usable configuration peripheral. |
 | Direct `run_as_main` start | Fails with `Attempting to bootstrap without uwsgi Emperor running`. | A direct Python runner is not a valid launcher shape. |
-| Captured uWSGI Emperor/vassal smoke | The isolated message-bus socket was created and the vassal remained alive. The remote bridge reached its BLE initialization boundary, then failed as expected because the container had no D-Bus/GLib. | The runtime must be implemented as an isolated uWSGI Emperor/vassal. Clean remote-bridge and peer discovery still require the bounded Office test. |
+| Stock `run.pre_exec` lifecycle | Before start, only `message_bus.ini` existed. After that vassal became loyal, its captured process manager created discovery and bootstrap INIs. | Preserve message-bus-first startup; do not pre-create all vassals as if they were independent. |
+| Local bus address | With only `message_bus_server_socket_path` set, discovery derived `unix://%2F...%2Fserver_socket`. Raw paths are rejected; a global override also reaches embedded RemoteBridge and makes it self-dial. | Leave `message_bus_address_override` unset for co-located vassals. |
+| Stock multi-vassal ARM smoke | The isolated socket was created and message bus became loyal; QEMU then raised target `SIGBUS` at the first client exchange, before bootstrap parsing. | This is an emulator boundary, not a firmware/bootstrap failure. The next proof requires bounded real ARM hardware. |
+| Vassal privilege generation | Nonprivileged configs contain numeric `user_override`/`group_override`; root-owned mode-`0600` PEM files are unreadable after that drop. | A dedicated runtime-user credential handoff is required; running proprietary vassals as root remains blocked. |
+| Configuration host construction | Stock `config_peripherals` groups type 16, 19, 20, and 48 config records; `device_config_peripheral` is the exact type-19 candidate. | The light pilot must select type 19 while tolerating the other stock configs; live VC behavior is still unproven. |
 | Captured PKCS#12 generator | Produces strict base64 of null-password DER containing a private key and leaf certificate whose only common name is `<device-id>.device.brilliant.tech`; no additional certificate was emitted. | The official provisioning response can be validated and converted locally without guessing its format. |
 | Certificate consumption | The runtime Web API client consumes `device.key` and `device.cert`; the CSR is a provisioning artifact, not a runtime input. | Materialize only the exact two-file PEM pair in the isolated certificate directory. |
 
 No live panel, Brilliant service, official identity, home assignment, physical
 slider, HA entity, or device was contacted by these spikes. The captured uWSGI
-binary and all ten runtime files used by the probes matched the pinned
+binary and all 15 pinned launcher/configuration files matched the
 `v26.06.03.1` hashes recorded in the VC runbook.
 
 ## What is confirmed
@@ -121,12 +129,19 @@ binary and all ten runtime files used by the probes matched the pinned
    supervision; direct `run_as_main` startup is rejected.
 8. The official provisioning PKCS#12 format and runtime certificate filenames
    are understood and have a fail-closed, off-panel materialization path.
+9. The stock runtime starts the message bus first, then lets its own process
+   manager create enabled default vassals.
+10. Co-located clients derive a percent-encoded UNIX URL from the isolated
+    server socket; the address override must remain absent.
+11. The stock grouped configuration host provides a type-19
+    `device_config_peripheral` candidate, plus three other configuration
+    records that the topology validator now handles explicitly.
 
 ## What is not confirmed
 
 1. Creation of an official Brilliant Virtual Control.
-2. A Virtual-Control-owned configuration peripheral suitable for the hosted
-   light's `configuration_peripheral_id`.
+2. Live registration and stable behavior of the candidate VC-owned type-19
+   `device_config_peripheral`.
 3. An online VC-owned HA light rendering on Office and a second panel.
 4. A saved physical-slider binding to a VC-owned light.
 5. Slider tap/dim gestures producing exactly one HA command.
@@ -140,6 +155,9 @@ binary and all ten runtime files used by the probes matched the pinned
 11. Validation of an actual officially provisioned PKCS#12 and bootstrap blob.
 12. Isolated bootstrap/home assignment under the captured uWSGI runtime.
 13. Clean remote-bridge startup, peer discovery, and propagation on Office.
+14. A dedicated non-root runtime principal and reviewed transfer of only the
+    bootstrap blob and validated PEM pair to that principal.
+15. Safe live semantics of `stub_ble_peripheral=true` on a co-hosted panel.
 
 ## Implemented validation components
 
@@ -150,17 +168,19 @@ binary and all ten runtime files used by the probes matched the pinned
 | `tools.brilliant_vc.token_check` | Claims-only validation of the exact self-bootstrap permission | Off-panel tested; no official token available |
 | `tools.brilliant_vc.provision_panel` | Single guarded official self-bootstrap call and private identity persistence | Off-panel tested; never applied |
 | `tools.brilliant_vc.monitor` | Bounded process/resource/physical-lag abort monitor | Off-panel tested; no VC process exists |
-| `tools.brilliant_vc.single_light_pilot` | One VC-owned HA-backed `LIGHT`, retained-state fencing, exactly-once command contract, and cleanup | Off-panel tested; live preconditions unavailable |
+| `tools.brilliant_vc.single_light_pilot` | One VC-owned HA-backed `LIGHT`, retained-state fencing, exactly-once command contract, type-19 Device Configuration selection, and cleanup | Off-panel tested; live preconditions unavailable |
 | `tools.brilliant_vc.slider_binding` | Scoped own-Control read, strict `slider_config` decoding, private baseline, and exact restoration verdict | Off-panel tested; no baseline captured and no binding written |
 | `tools.brilliant_vc.e2e_acceptance` | Offline correlation of operator gesture, MQTT command/result/state, and two-panel convergence | Off-panel tested; no gestures performed or transcript collected |
 | `tools.brilliant_vc.identity_materializer` | Strict PKCS#12/device-certificate validation and exclusive, rollback-on-error creation of only `device.key` and `device.cert` | Off-panel tested with generated identities; no official identity exists |
-| `tools.brilliant_vc.launcher_preflight` | Schema-v2 pinned uWSGI/runtime, identity, certificate-pair, permission, and isolated-path checks with no start primitive | Off-panel tested; deliberately blocks before bootstrap runtime validation |
+| `tools.brilliant_vc.launcher_preflight` | Schema-3 checks for 15 pinned launcher/configuration files, stock lifecycle/address contracts, identity, certificate pair, and the complete isolated path surface | Off-panel tested; deliberately blocks on runtime credential handoff |
+| `tools.brilliant_vc.vassal_manifest` | Redacted four-process candidate, exact 34-process disable set, type-19 config candidate, isolated flags, and explicit blockers | Data-only; contains no command, apply, or start primitive |
 | `brilliant_mqtt.cleanup_legacy_mirror` | Dry-run-first, own-device-only stale-record cleanup | Repository `0.5.7`; not deployed or applied |
 
 The repository-safe validation helpers do not make the live experiment feasible
-by themselves. The PKCS#12-to-PEM contract and uWSGI launcher shape are now
-resolved, but no official VC identity exists and the bootstrap/home-assignment
-behavior has not been validated with that identity. No online VC light,
+by themselves. The PKCS#12-to-PEM contract, stock vassal lifecycle, local
+addressing, path surface, and candidate configuration link are now understood.
+No official VC identity exists; the runtime-user handoff and real-ARM
+bootstrap/home-assignment behavior remain unresolved. No online VC light,
 physical binding, gesture, or E2E transcript exists.
 See the [native slider E2E runbook](runbooks/native-slider-e2e.md) for their
 scope and usage.
@@ -177,10 +197,10 @@ ahead by hand-writing a `slider_config` or borrowing Office's identity.
 | 3 | Obtain fresh approval for one account-visible provisioning write. | Approval names the home, Office, one disposable VC, private storage, and mandatory official removal. | **Pending step 2**. |
 | 4 | Run the guarded provisioner once. | HTTP 200; target home matches; exactly one DeviceType-6 identity appears; identity files are root-only. | **Not run**. |
 | 5 | Confirm the official app exposes a supported removal path, without submitting it. | Correct VC/home/account target is shown at final confirmation. | **Not run**. |
-| 6 | Dry-run the identity materializer, review its redacted result, then apply it locally. | Official PKCS#12 matches the exact device ID/CN, key, validity, non-CA, and size contracts; only mode-`0600` `device.key` and `device.cert` exist. | **Helper implemented; not run**. Before apply, schema-v2 preflight reports `identity_materialization_required`. |
-| 7 | Run schema-v2 launcher preflight, then implement and validate bootstrap/home assignment in an isolated uWSGI vassal. | All ten runtime hashes, Emperor requirement, alternate socket/state/certificate/config/bridge paths, and official bootstrap behavior pass; physical paths remain untouched. | **Preflight implemented; runtime start intentionally absent**. After materialization it reports `bootstrap_runtime_contract_unvalidated`. |
+| 6 | Dry-run the identity materializer, review its redacted result, then apply it locally. | Official PKCS#12 matches the exact device ID/CN, key, validity, non-CA, and size contracts; only mode-`0600` `device.key` and `device.cert` exist. | **Helper implemented; not run**. Before apply, schema-3 preflight reports `identity_materialization_required`. |
+| 7 | Implement the dedicated runtime principal/credential handoff, then run schema-3 preflight and review the no-start manifest. | All 15 hashes, four-process topology, local derived address, expanded path surface, non-root readability, and physical-path isolation pass. | **Manifest/preflight implemented; handoff intentionally absent**. After certificate materialization preflight reports `runtime_user_credential_handoff_unresolved`. |
 | 8 | With separate live-start approval, run the bounded isolated VC under the monitor. | Correct DeviceType-6 owner joins the target home; remote bridge/discovery, peer, resource, and physical-latency limits pass. | **Not run**. |
-| 9 | Inventory only the VC-owned graph and configuration peripheral. | Owner is the provisioned DeviceType-6 ID; exactly one suitable VC-owned configuration link exists. | **Not run**. |
+| 9 | Inventory only the VC-owned graph and configuration peripherals. | Owner is the provisioned DeviceType-6 ID; exactly one type-19 `device_config_peripheral` exists, while the grouped type-16, type-20, and type-48 records are merely inventoried. | **Not run**. |
 | 10 | Dry-run, then separately approve and start the one-light pilot. | One stable VC-owned `LIGHT`; valid Backyard room; retained HA authority received; tile shows online on two panels. | **Implementation exists; live blocked**. |
 | 11 | Check the online VC light in the native slider picker. | The VC-owned light is offered without writing `slider_config` manually. | **Not run**; legacy picker result does not substitute. |
 | 12 | Snapshot one named Office slider's complete original binding and behavior. | Private canonical snapshot is mode `0600`; a read-only verifier can prove exact restoration later. | **Helper implemented; no slider chosen or snapshot captured**. |
@@ -197,14 +217,16 @@ ahead by hand-writing a `slider_config` or borrowing Office's identity.
 Do not bind the offline legacy lights. Finish the official-app portion of VC0,
 then obtain a supported provisioning-scoped token for VC1. The first live
 mutation must remain the single guarded VC provisioning call after fresh
-approval. Once an actual official identity exists, validate/materialize it
-locally and close the remaining isolated bootstrap/home-assignment contract.
+approval. Once an actual official identity exists, validate/materialize it,
+complete the dedicated runtime-user handoff, pass schema-3 preflight, and only
+then seek separate approval for the real-ARM bootstrap/home-assignment test.
 The first physical-slider mutation must remain the operator's native-UI binding
 after an online VC light and private original-binding snapshot exist.
 
 See also:
 
 - [Slider feasibility and binary evidence](slider-bridge-feasibility.md)
+- [Recovered Virtual Control runtime contract](virtual-control-runtime-contract.md)
 - [Virtual Control gate runbook](runbooks/virtual-control-gates.md)
 - [Native slider E2E capture and restoration runbook](runbooks/native-slider-e2e.md)
 - [HA mirror retirement and legacy cleanup](../ha-mirror.md)

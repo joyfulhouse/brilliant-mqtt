@@ -27,6 +27,13 @@ The Brilliant Control is an embedded Linux appliance, not Android:
 4. start the uWSGI emperor against `/var/run/brilliant/processes`;
 5. fork vassals through a zygote/fork-server socket.
 
+`run.py` initially writes only `message_bus.ini`. Once that vassal runs under
+Emperor, its internal `PeripheralProcessManager.run_bootstrap()` writes the
+other enabled default-process INIs and activates embedded startables. The
+method name is historical; it does not start only the bootstrap peripheral.
+This lifecycle matters for any isolated Virtual Control. See the
+[recovered VC runtime contract](virtual-control-runtime-contract.md).
+
 The native `switch_ui_app.service` starts separately after the message bus and executes `/data/switch-ui/switch-ui`. It has a systemd watchdog and an aggressive restart policy whose repeated failure action is a panel reboot. This reinforces an important integration rule: do not inject into, replace, or preload the UI process. Use the bus.
 
 Observed uWSGI vassals on the pilot include:

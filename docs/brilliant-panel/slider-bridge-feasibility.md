@@ -134,9 +134,13 @@ simultaneously true:
 
 This implementation evidence does not advance the live status. No provisioned
 VC identity, configuration peripheral, or native selector entry has yet been
-observed. In particular, the firmware may provision no suitable VC-owned
-configuration peripheral; that result is an explicit blocked outcome, not a
-reason to borrow a shared or physical configuration.
+observed. Static and constructor-only analysis now identifies the stock
+`config_peripherals` host as a candidate: it groups configuration types 16, 19,
+20, and 48, with `device_config_peripheral` as the exact type-19 Device
+Configuration link. The topology snapshot is schema 2 so it can select that
+record while tolerating the three other stock configs. Failure to register the
+type-19 record live remains an explicit blocked outcome, not a reason to borrow
+a shared or physical configuration.
 
 The existing HA control-plane consumer requires `null` for `turn_on` and
 `turn_off`, and an integer 0–255 for `set_brightness`. The pilot emits that
@@ -161,17 +165,29 @@ executable without granting them mutation authority:
   strict base64/null-password PKCS#12 contract and exclusively creates only its
   private `device.key`/`device.cert` runtime pair with rollback on write error.
   It has no network, bus, or process-start capability.
-- `tools.brilliant_vc.launcher_preflight` validates ten pinned runtime hashes,
-  the four-file provisioned identity contract, the uWSGI Emperor requirement,
-  the exact certificate pair, private isolated directories, and collision-free
-  socket/state/certificate/config paths. It intentionally contains no start
-  primitive and blocks on isolated bootstrap/home-assignment validation.
+- `tools.brilliant_vc.launcher_preflight` validates 15 pinned
+  launcher/configuration hashes, the four-file provisioned identity contract,
+  the uWSGI Emperor requirement, the exact certificate pair, the stock process
+  lifecycle/address contract, every writable runtime directory, two distinct
+  sockets, and bounded read-only metadata. It intentionally contains no start
+  primitive and now blocks on non-root credential handoff.
+- `tools.brilliant_vc.vassal_manifest` renders the redacted four-process
+  candidate, exact 34-process disable set, type-19 config candidate, and
+  isolated flags. It contains no firmware import, identity read, write,
+  command, apply, or start path.
 
-Network-disabled ARM execution of the captured binaries established that a
-direct `run_as_main` start is rejected without uWSGI Emperor. A captured uWSGI
-Emperor/vassal created an isolated dummy message-bus socket and remained alive;
-the official identity bootstrap, clean remote-bridge/discovery behavior, and
-target-home assignment have not been tested on Office.
+Network-disabled ARM execution established that a direct `run_as_main` start is
+rejected without uWSGI Emperor. A stock `run.pre_exec` smoke initially created
+only `message_bus.ini`; after that vassal became loyal, its own captured process
+manager created discovery/bootstrap INIs and the client derived the correct
+percent-encoded UNIX address. QEMU then raised target `SIGBUS` on the first
+client exchange, before bootstrap parsing. That is an emulator boundary, not a
+firmware failure. Official bootstrap, the grouped configuration host, clean
+remote-bridge/discovery behavior, and target-home assignment have not been
+tested on Office.
+
+The complete evidence and candidate topology are in the
+[Virtual Control runtime contract](virtual-control-runtime-contract.md).
 
 The detailed artifact schema and ordered procedure are in the
 [native slider E2E runbook](runbooks/native-slider-e2e.md). A reviewed passive

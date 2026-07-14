@@ -27,10 +27,17 @@ from uuid import UUID, uuid4
 from tools.brilliant_vc.gates import GateLedger, GateName, GateStatus
 
 SCHEMA_VERSION = 1
+TOPOLOGY_SCHEMA_VERSION = 2
 MAPPING_VERSION = 1
 LIGHT_PERIPHERAL_TYPE = 27
+DEVICE_CONFIG_PERIPHERAL_TYPE = 19
+DEVICE_CONFIG_PERIPHERAL_ID = "device_config_peripheral"
 PHYSICAL_BUS_SOCKET = "/var/run/brilliant/server_socket"
 _VC_SOCKET_ROOTS = (Path("/run/brilliant-vc"), Path("/var/run/brilliant-vc"))
+_VC_CONTROL_ROOTS = (
+    Path("/run/brilliant-vc-control"),
+    Path("/var/run/brilliant-vc-control"),
+)
 _TOPIC_PREFIX = "brilliant/ha-control/v1"
 _ID = re.compile(r"[0-9a-f]{32}")
 _LINK_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
@@ -116,16 +123,25 @@ class PilotLease:
         self._descriptor: int | None = descriptor
 
     @classmethod
-    def acquire(cls, runtime_dir: Path, *, required_uid: int) -> PilotLease:
+    def acquire(
+        cls,
+        runtime_dir: Path,
+        *,
+        required_uid: int,
+        allowed_roots: Sequence[Path] = _VC_CONTROL_ROOTS,
+    ) -> PilotLease:
         try:
             parent = runtime_dir.lstat()
         except FileNotFoundError:
-            raise PilotGuardError("VC runtime directory does not exist") from None
+            raise PilotGuardError("pilot control directory does not exist") from None
         if stat.S_ISLNK(parent.st_mode) or not stat.S_ISDIR(parent.st_mode):
-            raise PilotGuardError("VC runtime must be a real directory")
+            raise PilotGuardError("pilot control directory must be real")
         if parent.st_uid != required_uid or stat.S_IMODE(parent.st_mode) != 0o700:
-            raise PilotGuardError("VC runtime must be owner-only mode 0700")
-        path = runtime_dir / cls._NAME
+            raise PilotGuardError("pilot control directory must be owner-only mode 0700")
+        resolved_runtime = runtime_dir.resolve(strict=True)
+        if resolved_runtime not in {root.resolve(strict=False) for root in allowed_roots}:
+            raise PilotGuardError("pilot lease directory is outside the allowed control roots")
+        path = resolved_runtime / cls._NAME
         flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
         try:
             descriptor = os.open(path, flags, 0o600)
@@ -164,6 +180,7 @@ class PeripheralRecord:
     owner_device_id: str
     peripheral_id: str
     role: str
+    peripheral_type: int
 
     def __post_init__(self) -> None:
         if not self.owner_device_id or not _LINK_ID.fullmatch(self.owner_device_id):
@@ -172,6 +189,8 @@ class PeripheralRecord:
             raise PilotGuardError("peripheral_id is invalid")
         if self.role not in {"configuration", "other"}:
             raise PilotGuardError("peripheral role must be configuration or other")
+        if type(self.peripheral_type) is not int or not 0 <= self.peripheral_type <= 255:
+            raise PilotGuardError("peripheral_type must be an integer from 0 to 255")
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,7 +208,7 @@ class TopologySnapshot:
             raise PilotGuardError("topology snapshot must be an object")
         data = cast(dict[str, object], payload)
         expected = {"schema_version", "owner_device_id", "device_type", "peripherals", "room_ids"}
-        if set(data) != expected or data.get("schema_version") != SCHEMA_VERSION:
+        if set(data) != expected or data.get("schema_version") != TOPOLOGY_SCHEMA_VERSION:
             raise PilotGuardError("topology snapshot fields or schema version are invalid")
         raw_peripherals = data["peripherals"]
         raw_rooms = data["room_ids"]
@@ -201,6 +220,7 @@ class TopologySnapshot:
                 "owner_device_id",
                 "peripheral_id",
                 "role",
+                "peripheral_type",
             }:
                 raise PilotGuardError("topology peripheral record is invalid")
             values = cast(dict[str, object], item)
@@ -209,6 +229,12 @@ class TopologySnapshot:
                     owner_device_id=_required_str(values, "owner_device_id"),
                     peripheral_id=_required_str(values, "peripheral_id"),
                     role=_required_str(values, "role"),
+                    peripheral_type=_bounded_integer(
+                        values.get("peripheral_type"),
+                        minimum=0,
+                        maximum=255,
+                        name="peripheral_type",
+                    ),
                 )
             )
         rooms: set[str] = set()
@@ -376,18 +402,22 @@ def intensity_to_brightness(value: object) -> int:
 def discover_configuration_peripheral(
     vc_device_id: str, peripherals: Sequence[PeripheralRecord]
 ) -> str:
-    """Select exactly one configuration record owned by this disposable VC."""
+    """Select the stock type-19 Device Configuration owned by this VC."""
 
     candidates = [
         item
         for item in peripherals
-        if item.role == "configuration" and item.owner_device_id == vc_device_id
+        if item.role == "configuration"
+        and item.owner_device_id == vc_device_id
+        and item.peripheral_type == DEVICE_CONFIG_PERIPHERAL_TYPE
     ]
     if not candidates:
-        raise PilotGuardError("VC has no own configuration peripheral")
+        raise PilotGuardError("VC has no own configuration peripheral of type 19")
     if len(candidates) != 1:
-        raise PilotGuardError("VC must have exactly one own configuration peripheral")
+        raise PilotGuardError("VC must have exactly one own type-19 device configuration")
     peripheral_id = candidates[0].peripheral_id
+    if peripheral_id != DEVICE_CONFIG_PERIPHERAL_ID:
+        raise PilotGuardError("VC type-19 configuration has the wrong peripheral ID")
     if peripheral_id in _SHARED_CONFIGURATION_IDS:
         raise PilotGuardError("VC configuration points at a protected shared peripheral")
     return peripheral_id
@@ -1010,6 +1040,27 @@ async def _open_scoped_observer(
         raise
 
 
+def _record_live_peripheral(
+    owner_device_id: str,
+    peripheral_id: object,
+    peripheral: object,
+) -> PeripheralRecord:
+    """Normalize one scoped firmware record without coercing bad type metadata."""
+
+    peripheral_type = _bounded_integer(
+        getattr(peripheral, "peripheral_type", None),
+        minimum=0,
+        maximum=255,
+        name="live peripheral_type",
+    )
+    return PeripheralRecord(
+        owner_device_id=owner_device_id,
+        peripheral_id=str(peripheral_id),
+        role=("configuration" if peripheral_type in _CONFIGURATION_PERIPHERAL_TYPES else "other"),
+        peripheral_type=peripheral_type,
+    )
+
+
 async def _probe_live_topology(config: PilotConfig) -> TopologySnapshot:
     """Discover the VC's own config candidate and room catalog with scoped reads."""
 
@@ -1036,16 +1087,7 @@ async def _probe_live_topology(config: PilotConfig) -> TopologySnapshot:
         if not isinstance(raw_peripherals, Mapping):
             raise PilotGuardError("scoped VC device has no peripheral map")
         peripherals = tuple(
-            PeripheralRecord(
-                owner_device_id=config.vc_device_id,
-                peripheral_id=str(peripheral_id),
-                role=(
-                    "configuration"
-                    if getattr(peripheral, "peripheral_type", None)
-                    in _CONFIGURATION_PERIPHERAL_TYPES
-                    else "other"
-                ),
-            )
+            _record_live_peripheral(config.vc_device_id, peripheral_id, peripheral)
             for peripheral_id, peripheral in raw_peripherals.items()
         )
 
@@ -1067,7 +1109,12 @@ async def _probe_live_topology(config: PilotConfig) -> TopologySnapshot:
         room_ids = frozenset(str(room_id) for room_id in room_map)
         return TopologySnapshot(
             owner_device_id=config.vc_device_id,
-            device_type=int(getattr(device, "device_type", -1)),
+            device_type=_bounded_integer(
+                getattr(device, "device_type", None),
+                minimum=0,
+                maximum=255,
+                name="live device_type",
+            ),
             peripherals=peripherals,
             room_ids=room_ids,
         )
@@ -1087,8 +1134,8 @@ def _require_matching_live_topology(
     if expected.room_ids != observed.room_ids:
         raise PilotGuardError("live room catalog changed after the topology snapshot")
 
-    def key(item: PeripheralRecord) -> tuple[str, str, str]:
-        return item.owner_device_id, item.peripheral_id, item.role
+    def key(item: PeripheralRecord) -> tuple[str, str, str, int]:
+        return item.owner_device_id, item.peripheral_id, item.role, item.peripheral_type
 
     if sorted(expected.peripherals, key=key) != sorted(observed.peripherals, key=key):
         raise PilotGuardError("live VC peripheral set changed after the topology snapshot")
@@ -1540,6 +1587,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--mqtt-port", type=int, default=1883)
     parser.add_argument("--mqtt-username")
     parser.add_argument("--mqtt-password-file", type=Path)
+    parser.add_argument(
+        "--lease-dir",
+        type=Path,
+        default=Path("/run/brilliant-vc-control"),
+        help="root-only control directory for the cross-process pilot lease",
+    )
     parser.add_argument("--apply", action="store_true", help="start the one-light live host")
     return parser
 
@@ -1572,7 +1625,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise PilotGuardError("--mqtt-host is required with --apply")
         if not 1 <= args.mqtt_port <= 65_535:
             raise PilotGuardError("MQTT port must be from 1 to 65535")
-        lease = PilotLease.acquire(Path(config.vc_socket).parent, required_uid=required_uid)
+        lease = PilotLease.acquire(args.lease_dir, required_uid=required_uid)
     try:
         observed_topology = asyncio.run(_probe_live_topology(config))
         _require_matching_live_topology(topology, observed_topology, config)

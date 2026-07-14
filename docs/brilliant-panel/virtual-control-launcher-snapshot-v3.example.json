@@ -1,0 +1,98 @@
+{
+  "schema_version": 3,
+  "firmware_version": "v26.06.03.1",
+  "runtime_sha256": {
+    "bridge.remote_bridge": "94ac32df6184814950cc5bc3ebeac828518b858f8fd6ce76380b67f20ccf20e4",
+    "bus.message_bus": "a85b7a2d0c2533db8d803a217027dbdd245bc104f221bf6955907dc0b8f6feb8",
+    "bus.peripheral_process_manager": "da8d7678c2a7d798aac2e3d735ac6e0789359bfb47226e5b8702f3923fcc7135",
+    "configs.process_configs": "a8ea4ad3885ac0d826da0073b2696a026f8d38a071418fe13196eb554b9e94a9",
+    "lib.process_management.process_manager": "38d26c0d300fab7af421731438c0bb9d97b7202760b089609d178a9e1db1b860",
+    "lib.runner": "4ba40ac7d7695dc239590defbc6efd3d22efbf296fc1c2b40f139fb6e1fe3cb0",
+    "peripherals.bootstrap.bootstrap_peripheral": "313d526a3fe1ad1879137a83eaa55096d9b0fb7a08cac30e37a79ea3632d57db",
+    "peripherals.discovery.discovery_peripheral": "d6bc30e81430978f4b72779dd2c6927a7ceab094a951ce7bb907a20969b94e45",
+    "peripherals.lib.peripheral_service.peripheral_host": "354eed5d1135ab6175cc50f263bb380fc996b73915cd1297f64246554b4ff228",
+    "peripherals.configs.art_config_peripheral": "2a86f73fcada6b1ee488ffe43088894e1af21cba9eab9d947560adf98c628d91",
+    "peripherals.configs.device_config_peripheral": "6bb1a1c46b22d315450634e80b05811a4a766ce63d8b064beb3f47bbb7fe3861",
+    "peripherals.configs.motion_detection_config_peripheral": "b68966769342376f9f883433fcedde21444a423985cc9343fe8ecb6045a4967f",
+    "peripherals.configs.alarm_config_peripheral": "b6e59357305764fac73d83768315c187408adbb964311f556bd2a05850181c69",
+    "runtime.run_py": "70d03e29277862a93da7840ca2224b5b27293158d30e3054a8b17068dbb0d961",
+    "runtime.uwsgi": "3384606e779e7a4216f4ff27e39e10221cd0b377c02ad1d9fd8ea61269ecbc43"
+  },
+  "message_bus_parameters": [
+    "home_id",
+    "device_id",
+    "mb_state_dir",
+    "is_virtual_control"
+  ],
+  "runner_parameters": [
+    "startable_config",
+    "module_name_override"
+  ],
+  "bootstrap_fields": [
+    "target_home_id",
+    "server_authentication_token",
+    "wifi_variables"
+  ],
+  "virtual_control_flag": "start_as_virtual_control",
+  "runtime_launcher": "uwsgi_emperor_vassal",
+  "message_bus_requires_emperor": true,
+  "certificate_files": [
+    "device.key",
+    "device.cert"
+  ],
+  "remote_bridge_parameters": [
+    "listen_port",
+    "enable_bluetooth_provisioning",
+    "enforce_strict_authentication",
+    "message_bus_address_override",
+    "device_provisioning_ip_listen_port",
+    "ble_mesh_debug_interface_listen_port",
+    "stub_ble_peripheral",
+    "uwsgi_stats_socket_path"
+  ],
+  "discovery_fields": [
+    "remote_bridge_port",
+    "enable_remote_bridge_service_discovery",
+    "message_bus_address_override"
+  ],
+  "known_process_count": 38,
+  "candidate_processes": [
+    "message_bus",
+    "discovery_peripheral",
+    "config_peripherals",
+    "bootstrap"
+  ],
+  "candidate_disabled_process_count": 34,
+  "process_manager_launch_mode": "message_bus_then_enabled_defaults",
+  "message_bus_embedded_startables": [
+    "remote_bridge"
+  ],
+  "config_peripherals_embedded_startables": [
+    "art_config_peripheral",
+    "device_config_peripheral",
+    "motion_detection_config_peripheral",
+    "alarm_config_peripheral"
+  ],
+  "local_message_bus_address_mode": "server_socket_path_with_derived_unix_url",
+  "local_message_bus_address_override": null,
+  "vassal_user_fields": [
+    "user_override",
+    "group_override"
+  ],
+  "runtime_path_flags": [
+    "mb_state_dir",
+    "cert_dir",
+    "process_configs_dir",
+    "process_flagfiles_dir",
+    "startable_host_configs_dir",
+    "message_bus_server_socket_path",
+    "saved_bootstrap_parameters_path",
+    "release_info_filepath",
+    "tracking_branch_filepath",
+    "uwsgi_stats_socket_path",
+    "log_output_directory",
+    "error_log_storage_dir",
+    "trace_dir",
+    "art_preload_dir"
+  ]
+}

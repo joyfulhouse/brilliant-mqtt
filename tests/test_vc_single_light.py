@@ -6,6 +6,7 @@ import os
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -26,6 +27,8 @@ from tools.brilliant_vc.single_light_pilot import (
     _finish_live_resources,
     _LivePublisher,
     _normalize_framework_push,
+    _parser,
+    _record_live_peripheral,
     _require_matching_live_topology,
     _run_reconnecting_transport,
     _StateReplayTimeout,
@@ -46,7 +49,7 @@ STABLE_ID = "d353e38a-793e-5b6f-813b-17a1c38aba96"
 VC_ID = "a" * 32
 OFFICE_ID = "b" * 32
 ROOM_ID = "room-backyard"
-CONFIG_ID = "vc_configuration"
+CONFIG_ID = "device_config_peripheral"
 SOCKET = "/run/brilliant-vc/server_socket"
 COMMAND_ID = "11111111-1111-4111-8111-111111111111"
 
@@ -77,7 +80,16 @@ def _topology() -> TopologySnapshot:
                 owner_device_id=VC_ID,
                 peripheral_id=CONFIG_ID,
                 role="configuration",
+                peripheral_type=19,
             ),
+            PeripheralRecord(VC_ID, "art_config_peripheral", "configuration", 16),
+            PeripheralRecord(
+                VC_ID,
+                "motion_detection_config_peripheral",
+                "configuration",
+                20,
+            ),
+            PeripheralRecord(VC_ID, "alarm_config_peripheral", "configuration", 48),
         ),
         room_ids=frozenset({ROOM_ID}),
     )
@@ -198,7 +210,7 @@ def test_live_topology_requires_exact_room_and_peripheral_snapshot() -> None:
             TopologySnapshot(
                 owner_device_id=VC_ID,
                 device_type=6,
-                peripherals=expected.peripherals + (PeripheralRecord(VC_ID, "extra", "other"),),
+                peripherals=expected.peripherals + (PeripheralRecord(VC_ID, "extra", "other", 27),),
                 room_ids=expected.room_ids,
             ),
             _config(),
@@ -223,16 +235,68 @@ def test_socket_canonicalization_rejects_symlink_escape(tmp_path: Path) -> None:
 def test_live_process_lease_allows_only_one_apply_and_can_be_reacquired(tmp_path: Path) -> None:
     runtime = tmp_path / "brilliant-vc"
     runtime.mkdir(mode=0o700)
-    first = PilotLease.acquire(runtime, required_uid=os.geteuid())
+    first = PilotLease.acquire(
+        runtime,
+        required_uid=os.geteuid(),
+        allowed_roots=(runtime,),
+    )
     try:
         with pytest.raises(PilotGuardError, match="already active"):
-            PilotLease.acquire(runtime, required_uid=os.geteuid())
+            PilotLease.acquire(
+                runtime,
+                required_uid=os.geteuid(),
+                allowed_roots=(runtime,),
+            )
     finally:
         first.release()
 
-    second = PilotLease.acquire(runtime, required_uid=os.geteuid())
+    second = PilotLease.acquire(
+        runtime,
+        required_uid=os.geteuid(),
+        allowed_roots=(runtime,),
+    )
     second.release()
     assert (runtime / "single-light-pilot.lock").stat().st_mode & 0o777 == 0o600
+
+
+def test_live_pilot_lease_uses_a_root_control_dir_not_the_service_socket_dir() -> None:
+    args = _parser().parse_args(
+        [
+            "--vc-identity-dir",
+            "/data/brilliant-vc/identity",
+            "--topology-json",
+            "/data/brilliant-vc/evidence/topology.json",
+            "--ledger",
+            "/data/brilliant-vc/evidence/ledger.json",
+            "--run-id",
+            "pilot-run",
+            "--stable-id",
+            STABLE_ID,
+            "--display-name",
+            "HA VC Pilot Light",
+            "--room-id",
+            ROOM_ID,
+            "--office-device-id",
+            OFFICE_ID,
+        ]
+    )
+
+    assert args.lease_dir == Path("/run/brilliant-vc-control")
+    assert args.lease_dir != Path(args.vc_socket).parent
+
+
+def test_live_process_lease_rejects_a_directory_outside_the_control_roots(
+    tmp_path: Path,
+) -> None:
+    runtime = tmp_path / "brilliant-vc"
+    runtime.mkdir(mode=0o700)
+
+    with pytest.raises(PilotGuardError, match="control root"):
+        PilotLease.acquire(
+            runtime,
+            required_uid=os.geteuid(),
+            allowed_roots=(tmp_path / "different-control-root",),
+        )
 
 
 def test_configuration_discovery_rejects_shared_physical_and_ambiguous_candidates() -> None:
@@ -244,16 +308,80 @@ def test_configuration_discovery_rejects_shared_physical_and_ambiguous_candidate
                     owner_device_id="configuration_virtual_device",
                     peripheral_id="brilliant_virtual_device_configuration",
                     role="configuration",
+                    peripheral_type=35,
                 ),
             ),
         )
 
     candidates = (
-        PeripheralRecord(VC_ID, "one", "configuration"),
-        PeripheralRecord(VC_ID, "two", "configuration"),
+        PeripheralRecord(VC_ID, CONFIG_ID, "configuration", 19),
+        PeripheralRecord(VC_ID, CONFIG_ID, "configuration", 19),
     )
     with pytest.raises(PilotGuardError, match="exactly one"):
         discover_configuration_peripheral(VC_ID, candidates)
+
+    with pytest.raises(PilotGuardError, match="wrong peripheral ID"):
+        discover_configuration_peripheral(
+            VC_ID,
+            (PeripheralRecord(VC_ID, "renamed_device_config", "configuration", 19),),
+        )
+
+    assert (
+        discover_configuration_peripheral(
+            VC_ID,
+            (
+                PeripheralRecord(VC_ID, "art_config_peripheral", "configuration", 16),
+                PeripheralRecord(VC_ID, CONFIG_ID, "configuration", 19),
+                PeripheralRecord(
+                    VC_ID,
+                    "motion_detection_config_peripheral",
+                    "configuration",
+                    20,
+                ),
+                PeripheralRecord(VC_ID, "alarm_config_peripheral", "configuration", 48),
+            ),
+        )
+        == CONFIG_ID
+    )
+
+
+def test_live_peripheral_metadata_is_typed_and_fails_closed() -> None:
+    assert _record_live_peripheral(
+        VC_ID,
+        CONFIG_ID,
+        SimpleNamespace(peripheral_type=19),
+    ) == PeripheralRecord(VC_ID, CONFIG_ID, "configuration", 19)
+
+    for value in (None, "19", True, -1, 256):
+        with pytest.raises(PilotGuardError, match="live peripheral_type"):
+            _record_live_peripheral(
+                VC_ID,
+                CONFIG_ID,
+                SimpleNamespace(peripheral_type=value),
+            )
+
+
+def test_topology_snapshot_requires_exact_peripheral_type_metadata() -> None:
+    peripherals: list[dict[str, object]] = [
+        {
+            "owner_device_id": VC_ID,
+            "peripheral_id": CONFIG_ID,
+            "role": "configuration",
+            "peripheral_type": 19,
+        }
+    ]
+    payload = {
+        "schema_version": 2,
+        "owner_device_id": VC_ID,
+        "device_type": 6,
+        "peripherals": peripherals,
+        "room_ids": [ROOM_ID],
+    }
+
+    assert TopologySnapshot.from_payload(payload).peripherals[0].peripheral_type == 19
+    del peripherals[0]["peripheral_type"]
+    with pytest.raises(PilotGuardError, match="peripheral record"):
+        TopologySnapshot.from_payload(payload)
 
 
 def test_exact_light_variable_schema_and_virtual_owner() -> None:

@@ -19,7 +19,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 _PINNED_FIRMWARE = "v26.06.03.1"
 _PINNED_HASHES = {
     "bridge.remote_bridge": ("94ac32df6184814950cc5bc3ebeac828518b858f8fd6ce76380b67f20ccf20e4"),
@@ -38,6 +38,21 @@ _PINNED_HASHES = {
     "peripherals.discovery.discovery_peripheral": (
         "d6bc30e81430978f4b72779dd2c6927a7ceab094a951ce7bb907a20969b94e45"
     ),
+    "peripherals.lib.peripheral_service.peripheral_host": (
+        "354eed5d1135ab6175cc50f263bb380fc996b73915cd1297f64246554b4ff228"
+    ),
+    "peripherals.configs.art_config_peripheral": (
+        "2a86f73fcada6b1ee488ffe43088894e1af21cba9eab9d947560adf98c628d91"
+    ),
+    "peripherals.configs.device_config_peripheral": (
+        "6bb1a1c46b22d315450634e80b05811a4a766ce63d8b064beb3f47bbb7fe3861"
+    ),
+    "peripherals.configs.motion_detection_config_peripheral": (
+        "b68966769342376f9f883433fcedde21444a423985cc9343fe8ecb6045a4967f"
+    ),
+    "peripherals.configs.alarm_config_peripheral": (
+        "b6e59357305764fac73d83768315c187408adbb964311f556bd2a05850181c69"
+    ),
     "runtime.run_py": "70d03e29277862a93da7840ca2224b5b27293158d30e3054a8b17068dbb0d961",
     "runtime.uwsgi": "3384606e779e7a4216f4ff27e39e10221cd0b377c02ad1d9fd8ea61269ecbc43",
 }
@@ -46,6 +61,59 @@ _RUNNER_PARAMETERS = frozenset({"startable_config", "module_name_override"})
 _BOOTSTRAP_FIELDS = frozenset({"target_home_id", "server_authentication_token", "wifi_variables"})
 _IDENTITY_FILES = frozenset({"device_id", "pkcs12_certificate", "bootstrap", "metadata.json"})
 _CERTIFICATE_FILES = frozenset({"device.key", "device.cert"})
+_REMOTE_BRIDGE_PARAMETERS = frozenset(
+    {
+        "listen_port",
+        "enable_bluetooth_provisioning",
+        "enforce_strict_authentication",
+        "message_bus_address_override",
+        "device_provisioning_ip_listen_port",
+        "ble_mesh_debug_interface_listen_port",
+        "stub_ble_peripheral",
+        "uwsgi_stats_socket_path",
+    }
+)
+_DISCOVERY_FIELDS = frozenset(
+    {
+        "remote_bridge_port",
+        "enable_remote_bridge_service_discovery",
+        "message_bus_address_override",
+    }
+)
+_CANDIDATE_PROCESSES = (
+    "message_bus",
+    "discovery_peripheral",
+    "config_peripherals",
+    "bootstrap",
+)
+_MESSAGE_BUS_EMBEDDED_STARTABLES = frozenset({"remote_bridge"})
+_CONFIG_EMBEDDED_STARTABLES = frozenset(
+    {
+        "art_config_peripheral",
+        "device_config_peripheral",
+        "motion_detection_config_peripheral",
+        "alarm_config_peripheral",
+    }
+)
+_VASSAL_USER_FIELDS = frozenset({"user_override", "group_override"})
+_RUNTIME_PATH_FLAGS = frozenset(
+    {
+        "mb_state_dir",
+        "cert_dir",
+        "process_configs_dir",
+        "process_flagfiles_dir",
+        "startable_host_configs_dir",
+        "message_bus_server_socket_path",
+        "saved_bootstrap_parameters_path",
+        "release_info_filepath",
+        "tracking_branch_filepath",
+        "uwsgi_stats_socket_path",
+        "log_output_directory",
+        "error_log_storage_dir",
+        "trace_dir",
+        "art_preload_dir",
+    }
+)
 _DEVICE_ID = re.compile(r"^[0-9a-f]{32}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
@@ -90,6 +158,26 @@ _PINNED_MODULE_PATHS = {
         "/data/switch-embedded/env/lib/python3.10/site-packages/peripherals/discovery/"
         "discovery_peripheral.cpython-310-arm-linux-gnueabi.so"
     ),
+    "peripherals.lib.peripheral_service.peripheral_host": Path(
+        "/data/switch-embedded/env/lib/python3.10/site-packages/peripherals/lib/"
+        "peripheral_service/peripheral_host.cpython-310-arm-linux-gnueabi.so"
+    ),
+    "peripherals.configs.art_config_peripheral": Path(
+        "/data/switch-embedded/env/lib/python3.10/site-packages/peripherals/configs/"
+        "art_config_peripheral.cpython-310-arm-linux-gnueabi.so"
+    ),
+    "peripherals.configs.device_config_peripheral": Path(
+        "/data/switch-embedded/env/lib/python3.10/site-packages/peripherals/configs/"
+        "device_config_peripheral.cpython-310-arm-linux-gnueabi.so"
+    ),
+    "peripherals.configs.motion_detection_config_peripheral": Path(
+        "/data/switch-embedded/env/lib/python3.10/site-packages/peripherals/configs/"
+        "motion_detection_config_peripheral.cpython-310-arm-linux-gnueabi.so"
+    ),
+    "peripherals.configs.alarm_config_peripheral": Path(
+        "/data/switch-embedded/env/lib/python3.10/site-packages/peripherals/configs/"
+        "alarm_config_peripheral.cpython-310-arm-linux-gnueabi.so"
+    ),
     "runtime.run_py": Path("/data/switch-embedded/run.py"),
     "runtime.uwsgi": Path("/data/switch-embedded/env/bin/uwsgi"),
 }
@@ -111,8 +199,16 @@ class LauncherPaths:
     state_dir: Path
     certificate_dir: Path
     process_config_dir: Path
+    process_flagfile_dir: Path
+    startable_config_dir: Path
+    log_dir: Path
+    error_log_dir: Path
+    trace_dir: Path
     runtime_dir: Path
     socket_path: Path
+    stats_socket_path: Path
+    release_info_path: Path
+    tracking_branch_path: Path
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,8 +225,12 @@ class NoStartPlan:
     identity_file_count: int
     device_id_redacted: str
     uwsgi_contract_confirmed: bool
+    stock_process_manager_lifecycle_confirmed: bool
     direct_runner_rejected: bool
     identity_contract_complete: bool
+    full_path_surface_validated: bool
+    candidate_manifest_present: bool
+    runtime_user_handoff_complete: bool
     launcher_implementation_present: bool
     start_permitted: bool
     blocked_reason: str
@@ -147,8 +247,14 @@ class NoStartPlan:
             "identity_file_count": self.identity_file_count,
             "device_id_redacted": self.device_id_redacted,
             "uwsgi_contract_confirmed": self.uwsgi_contract_confirmed,
+            "stock_process_manager_lifecycle_confirmed": (
+                self.stock_process_manager_lifecycle_confirmed
+            ),
             "direct_runner_rejected": self.direct_runner_rejected,
             "identity_contract_complete": self.identity_contract_complete,
+            "full_path_surface_validated": self.full_path_surface_validated,
+            "candidate_manifest_present": self.candidate_manifest_present,
+            "runtime_user_handoff_complete": self.runtime_user_handoff_complete,
             "launcher_implementation_present": self.launcher_implementation_present,
             "start_permitted": self.start_permitted,
             "blocked_reason": self.blocked_reason,
@@ -188,12 +294,16 @@ def preflight_no_start(
         identity_file_count=len(_IDENTITY_FILES),
         device_id_redacted=redacted_device_id,
         uwsgi_contract_confirmed=True,
+        stock_process_manager_lifecycle_confirmed=True,
         direct_runner_rejected=True,
         identity_contract_complete=False,
+        full_path_surface_validated=True,
+        candidate_manifest_present=True,
+        runtime_user_handoff_complete=False,
         launcher_implementation_present=False,
         start_permitted=False,
         blocked_reason=(
-            "bootstrap_runtime_contract_unvalidated"
+            "runtime_user_credential_handoff_unresolved"
             if certificate_material_present
             else "identity_materialization_required"
         ),
@@ -214,6 +324,16 @@ def _validate_firmware_snapshot(snapshot: Mapping[str, object]) -> None:
         "certificate_files",
         "remote_bridge_parameters",
         "discovery_fields",
+        "known_process_count",
+        "candidate_processes",
+        "candidate_disabled_process_count",
+        "process_manager_launch_mode",
+        "message_bus_embedded_startables",
+        "config_peripherals_embedded_startables",
+        "local_message_bus_address_mode",
+        "local_message_bus_address_override",
+        "vassal_user_fields",
+        "runtime_path_flags",
     }
     if set(snapshot) != expected_fields or snapshot.get("schema_version") != _SCHEMA_VERSION:
         raise LauncherPreflightError("firmware snapshot schema is invalid")
@@ -234,6 +354,22 @@ def _validate_firmware_snapshot(snapshot: Mapping[str, object]) -> None:
         snapshot["remote_bridge_parameters"], "remote-bridge interface"
     )
     discovery_fields = _parameter_set(snapshot["discovery_fields"], "discovery interface")
+    candidate_processes = _literal_set(
+        snapshot["candidate_processes"], "candidate process contract"
+    )
+    message_bus_startables = _literal_set(
+        snapshot["message_bus_embedded_startables"], "message-bus embedded startables"
+    )
+    config_startables = _literal_set(
+        snapshot["config_peripherals_embedded_startables"],
+        "configuration embedded startables",
+    )
+    vassal_user_fields = _parameter_set(
+        snapshot["vassal_user_fields"], "vassal user override contract"
+    )
+    runtime_path_flags = _parameter_set(
+        snapshot["runtime_path_flags"], "runtime path flag contract"
+    )
     if (
         not _MESSAGE_BUS_PARAMETERS <= message_bus_parameters
         or not _RUNNER_PARAMETERS <= runner_parameters
@@ -245,8 +381,20 @@ def _validate_firmware_snapshot(snapshot: Mapping[str, object]) -> None:
         snapshot["runtime_launcher"] != "uwsgi_emperor_vassal"
         or snapshot["message_bus_requires_emperor"] is not True
         or certificate_files != _CERTIFICATE_FILES
-        or remote_bridge_parameters != {"listen_port", "message_bus_address_override"}
-        or discovery_fields != {"remote_bridge_port"}
+        or remote_bridge_parameters != _REMOTE_BRIDGE_PARAMETERS
+        or discovery_fields != _DISCOVERY_FIELDS
+        or type(snapshot["known_process_count"]) is not int
+        or snapshot["known_process_count"] != 38
+        or candidate_processes != frozenset(_CANDIDATE_PROCESSES)
+        or type(snapshot["candidate_disabled_process_count"]) is not int
+        or snapshot["candidate_disabled_process_count"] != 34
+        or snapshot["process_manager_launch_mode"] != "message_bus_then_enabled_defaults"
+        or message_bus_startables != _MESSAGE_BUS_EMBEDDED_STARTABLES
+        or config_startables != _CONFIG_EMBEDDED_STARTABLES
+        or snapshot["local_message_bus_address_mode"] != "server_socket_path_with_derived_unix_url"
+        or snapshot["local_message_bus_address_override"] is not None
+        or vassal_user_fields != _VASSAL_USER_FIELDS
+        or runtime_path_flags != _RUNTIME_PATH_FLAGS
     ):
         raise LauncherPreflightError("firmware runtime contract drift blocks the launcher")
 
@@ -299,7 +447,8 @@ def _validate_path_topology(
 ) -> bool:
     physical_socket = _PHYSICAL_SOCKET.resolve(strict=False)
     socket = paths.socket_path.resolve(strict=False)
-    if socket == physical_socket:
+    stats_socket = paths.stats_socket_path.resolve(strict=False)
+    if socket == physical_socket or stats_socket == physical_socket:
         raise LauncherPreflightError("refusing the physical Control message-bus socket")
 
     persistent_root = _private_directory(
@@ -323,6 +472,11 @@ def _validate_path_topology(
         ("state directory", paths.state_dir),
         ("certificate directory", paths.certificate_dir),
         ("process-config directory", paths.process_config_dir),
+        ("process-flagfile directory", paths.process_flagfile_dir),
+        ("startable-config directory", paths.startable_config_dir),
+        ("log directory", paths.log_dir),
+        ("error-log directory", paths.error_log_dir),
+        ("trace directory", paths.trace_dir),
     ):
         resolved = _private_directory(
             directory,
@@ -333,17 +487,38 @@ def _validate_path_topology(
             raise LauncherPreflightError(f"{description} must be directly below persistent root")
         resolved_directories.append(resolved)
     if len(set(resolved_directories)) != len(resolved_directories):
-        raise LauncherPreflightError(
-            "identity, state, certificate, and config paths must be distinct"
-        )
+        raise LauncherPreflightError("all isolated VC directories must be distinct")
 
-    if socket.parent != runtime_root:
-        raise LauncherPreflightError("VC socket must be directly below the isolated runtime root")
+    if socket.parent != runtime_root or stats_socket.parent != runtime_root:
+        raise LauncherPreflightError("VC sockets must be directly below the isolated runtime root")
+    if socket == stats_socket:
+        raise LauncherPreflightError("VC message-bus and stats sockets must be distinct")
     if paths.socket_path.exists() or paths.socket_path.is_symlink():
         raise LauncherPreflightError("VC socket path must not already exist")
+    if paths.stats_socket_path.exists() or paths.stats_socket_path.is_symlink():
+        raise LauncherPreflightError("VC stats socket path must not already exist")
+
+    release_metadata = _validate_readonly_metadata_file(
+        paths.release_info_path,
+        description="release metadata",
+        required_uid=required_uid,
+    )
+    tracking_metadata = _validate_readonly_metadata_file(
+        paths.tracking_branch_path,
+        description="tracking metadata",
+        required_uid=required_uid,
+    )
+    if release_metadata == tracking_metadata:
+        raise LauncherPreflightError("release and tracking metadata paths must be distinct")
 
     protected = tuple(root.resolve(strict=False) for root in _PROTECTED_ROOTS)
-    for candidate in (*resolved_directories, persistent_root, runtime_root, socket):
+    for candidate in (
+        *resolved_directories,
+        persistent_root,
+        runtime_root,
+        socket,
+        stats_socket,
+    ):
         for protected_root in protected:
             try:
                 candidate.relative_to(protected_root)
@@ -354,6 +529,11 @@ def _validate_path_topology(
     for description, directory in (
         ("state directory", paths.state_dir),
         ("process-config directory", paths.process_config_dir),
+        ("process-flagfile directory", paths.process_flagfile_dir),
+        ("startable-config directory", paths.startable_config_dir),
+        ("log directory", paths.log_dir),
+        ("error-log directory", paths.error_log_dir),
+        ("trace directory", paths.trace_dir),
         ("runtime directory", paths.runtime_dir),
     ):
         if any(directory.iterdir()):
@@ -362,6 +542,31 @@ def _validate_path_topology(
         paths.certificate_dir,
         required_uid=required_uid,
     )
+
+
+def _validate_readonly_metadata_file(
+    path: Path,
+    *,
+    description: str,
+    required_uid: int,
+) -> Path:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        raise LauncherPreflightError(f"{description} does not exist") from None
+    if stat.S_ISLNK(metadata.st_mode):
+        raise LauncherPreflightError(f"{description} must not be a symlink")
+    if not stat.S_ISREG(metadata.st_mode):
+        raise LauncherPreflightError(f"{description} must be a regular file")
+    if metadata.st_uid != required_uid or stat.S_IMODE(metadata.st_mode) not in {0o600, 0o644}:
+        raise LauncherPreflightError(
+            f"{description} must have the required owner and mode 0600 or 0644"
+        )
+    if metadata.st_nlink != 1:
+        raise LauncherPreflightError(f"{description} must not be a hard link")
+    if not 0 < metadata.st_size <= _MAX_METADATA_BYTES:
+        raise LauncherPreflightError(f"{description} has an invalid size")
+    return path.resolve(strict=True)
 
 
 def _validate_certificate_directory(path: Path, *, required_uid: int) -> bool:
@@ -603,8 +808,40 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=Path,
         default=Path("/data/brilliant-vc/process-config"),
     )
+    parser.add_argument(
+        "--process-flagfile-dir",
+        type=Path,
+        default=Path("/data/brilliant-vc/flagfiles"),
+    )
+    parser.add_argument(
+        "--startable-config-dir",
+        type=Path,
+        default=Path("/data/brilliant-vc/startable-configs"),
+    )
+    parser.add_argument("--log-dir", type=Path, default=Path("/data/brilliant-vc/logs"))
+    parser.add_argument(
+        "--error-log-dir",
+        type=Path,
+        default=Path("/data/brilliant-vc/errors"),
+    )
+    parser.add_argument("--trace-dir", type=Path, default=Path("/data/brilliant-vc/traces"))
     parser.add_argument("--runtime-dir", type=Path, default=Path("/run/brilliant-vc"))
     parser.add_argument("--socket-path", type=Path, default=Path("/run/brilliant-vc/server_socket"))
+    parser.add_argument(
+        "--stats-socket-path",
+        type=Path,
+        default=Path("/run/brilliant-vc/uwsgi_stats_socket"),
+    )
+    parser.add_argument(
+        "--release-info-path",
+        type=Path,
+        default=Path("/etc/release_info.json"),
+    )
+    parser.add_argument(
+        "--tracking-branch-path",
+        type=Path,
+        default=Path("/var/lib/update_manager/tracking_branch"),
+    )
     args = parser.parse_args(argv)
     required_uid = os.geteuid()
     snapshot = load_firmware_snapshot(
@@ -619,8 +856,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             state_dir=args.state_dir,
             certificate_dir=args.certificate_dir,
             process_config_dir=args.process_config_dir,
+            process_flagfile_dir=args.process_flagfile_dir,
+            startable_config_dir=args.startable_config_dir,
+            log_dir=args.log_dir,
+            error_log_dir=args.error_log_dir,
+            trace_dir=args.trace_dir,
             runtime_dir=args.runtime_dir,
             socket_path=args.socket_path,
+            stats_socket_path=args.stats_socket_path,
+            release_info_path=args.release_info_path,
+            tracking_branch_path=args.tracking_branch_path,
         ),
         snapshot,
         actual_module_hashes=actual_module_hashes,

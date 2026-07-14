@@ -506,11 +506,13 @@ catalog with a scoped `configuration_virtual_device/home_configuration` read
 and require the supplied room ID to exist. Discover the provisioned VC's own
 configuration peripheral from its home-graph record; never borrow
 `brilliant_virtual_device_configuration` or a physical Control configuration.
-Require exactly one configuration-type candidate on the VC's own Device record
-and compare it with a root-only, ignored topology snapshot. Both dry run and
-live mode re-read these facts from the dedicated VC socket before registration;
-the complete room and peripheral sets must match. Canonicalize the socket and
-reject traversal or symlink escape to the physical Control bus.
+Require exactly one VC-owned type-19 `device_config_peripheral` and compare it
+with a root-only, ignored topology snapshot. Tolerate the grouped stock host's
+type-16, type-20, and type-48 configuration records without selecting them.
+Both dry run and live mode re-read these facts from the dedicated VC socket
+before registration; the complete room and peripheral sets must match.
+Canonicalize the socket and reject traversal or symlink escape to the physical
+Control bus.
 
 Use `PeripheralHost`/`HostedStartableSpec` with `virtual_device_id=<provisioned VC device ID>`. Reject `None`, `brilliant_virtual_device`, `configuration_virtual_device`, `ble_mesh`, or the Office physical ID. The push callbacks publish v1 entity commands to HA; retained v1 state updates drive pull/state variables. No direct HA WebSocket/token is accepted.
 
@@ -519,9 +521,11 @@ disconnect or HA unavailability, require authoritative retained state after
 each resubscribe, and accept HA sequence resets only when `generated_at_ms`
 proves a newer publication epoch. Establish the total runtime deadline before
 registration and reserve bounded time for deletion and two absence reads.
-Acquire one nonblocking root-owned lease in the canonical VC runtime before
-apply-mode live preflight and hold it through cleanup so concurrent pilot
-processes cannot race the single registration.
+Acquire one nonblocking root-owned lease in the separate canonical
+`/run/brilliant-vc-control` directory before apply-mode live preflight and hold
+it through cleanup so concurrent pilot processes cannot race the single
+registration. Do not require root ownership of the non-root service's VC
+socket directory.
 
 - [ ] **Step 4: Run off-panel tests and a preflight dry run**
 

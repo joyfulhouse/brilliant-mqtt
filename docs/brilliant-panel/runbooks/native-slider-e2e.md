@@ -65,14 +65,16 @@ Do not select a slider until every item passes:
    approval gate.
 3. The identity materializer passes first in dry-run mode and then creates only
    the exact private `device.key`/`device.cert` pair.
-4. Schema-v2 no-start preflight confirms the pinned uWSGI Emperor contract and
+4. Schema-3 no-start preflight confirms the 15 pinned launcher/configuration
+   files, stock message-bus-first lifecycle, complete path surface, and
    direct-runner rejection. It no longer reports
    `identity_materialization_required` or
-   `bootstrap_runtime_contract_unvalidated`.
+   `runtime_user_credential_handoff_unresolved`.
 5. The bounded VC runtime and monitor pass with no physical-panel regression.
 6. Exactly one VC-owned type-27 `LIGHT` exists, its
-   `configuration_peripheral_id` resolves to the VC's own configuration
-   peripheral, and retained HA state makes it online.
+   `configuration_peripheral_id` resolves to the VC's own type-19
+   `device_config_peripheral`, and retained HA state makes it online. The stock
+   type-16, type-20, and type-48 config records may coexist.
 7. Office and a second panel render the same online light in the intended room.
 8. The native Office slider picker offers that VC-owned online light without a
    hand-written binding.
@@ -321,13 +323,16 @@ lights is an independent, separately approved operation.
 2. Provision one disposable VC after fresh approval and confirm official
    removal before starting it.
 3. Validate and materialize the actual official PKCS#12 locally.
-4. Implement and prove target-home bootstrap under an isolated captured uWSGI
-   Emperor/vassal, including alternate remote-bridge/discovery paths and clean
-   stop/removal. Schema-v2 preflight currently blocks here after materialization.
-5. Run the isolated runtime/monitor, discover its own configuration peripheral,
-   and host the one online light.
-6. Review and implement the passive multi-panel transcript collector against
+4. Implement the dedicated non-root runtime-principal handoff for only the
+   validated PEM pair and saved bootstrap blob. Schema-3 preflight currently
+   blocks here after materialization.
+5. After separate live-start approval, prove target-home bootstrap under the
+   stock message-bus-first Emperor lifecycle, including local derived bus
+   addressing, stubbed BLE isolation, alternate remote-bridge/discovery paths,
+   type-19 Device Configuration registration, and clean stop/removal.
+6. Run the isolated runtime/monitor and host the one online light.
+7. Review and implement the passive multi-panel transcript collector against
    that actual topology.
-7. Capture the original slider baseline and obtain binding approval.
-8. Obtain separate gesture permission; the current instruction forbids it.
-9. Run basic, restart, WAN, restoration, and supported-removal gates in order.
+8. Capture the original slider baseline and obtain binding approval.
+9. Obtain separate gesture permission; the current instruction forbids it.
+10. Run basic, restart, WAN, restoration, and supported-removal gates in order.
