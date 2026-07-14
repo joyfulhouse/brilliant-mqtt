@@ -29,6 +29,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, cast
 
+from tools.brilliant_vc._common import RUNTIME_USER as _RUNTIME_USER
+from tools.brilliant_vc._common import fsync_directory as _fsync_directory
+from tools.brilliant_vc._common import redact as _redact
+from tools.brilliant_vc._common import wipe as _wipe
 from tools.brilliant_vc.launcher_preflight import (
     LauncherPaths,
     LauncherPreflightError,
@@ -43,7 +47,6 @@ from tools.brilliant_vc.runtime_handoff import (
 from tools.brilliant_vc.start_approval import validate_start_approval
 from tools.brilliant_vc.vassal_manifest import ManifestError, build_candidate_manifest
 
-_RUNTIME_USER = "brilliant-vc"
 _APPROVAL_SOURCE_PATH = Path("/run/brilliant-vc-approval/start-approval.json")
 _APPROVAL_MARKER_PATH = Path("/run/brilliant-vc-approval/start-approval-consumed.json")
 _DEVICE_ID = re.compile(r"^[0-9a-f]{32}$")
@@ -1101,29 +1104,6 @@ def _paths_overlap(left: Path, right: Path) -> bool:
         return True
     except ValueError:
         return False
-
-
-def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(
-        path,
-        os.O_RDONLY
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_CLOEXEC", 0),
-    )
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
-def _redact(value: str) -> str:
-    return f"{value[:4]}…{value[-4:]}"
-
-
-def _wipe(value: bytearray) -> None:
-    for index in range(len(value)):
-        value[index] = 0
 
 
 def _default_paths() -> LauncherPaths:

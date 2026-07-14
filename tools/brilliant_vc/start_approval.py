@@ -18,7 +18,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
-_PINNED_FIRMWARE = "v26.06.03.1"
+from tools.brilliant_vc._common import PINNED_FIRMWARE as _PINNED_FIRMWARE
+from tools.brilliant_vc._common import wipe as _wipe
+
 _PANEL = "office"
 _PURPOSE = "bounded_virtual_control_bootstrap"
 _SCHEMA_VERSION = 1
@@ -186,8 +188,3 @@ def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
             raise StartApprovalError("approval file contains a duplicate field")
         result[key] = value
     return result
-
-
-def _wipe(value: bytearray) -> None:
-    for index in range(len(value)):
-        value[index] = 0

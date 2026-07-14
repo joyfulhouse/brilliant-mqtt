@@ -25,12 +25,15 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from tools.brilliant_vc._common import RUNTIME_USER as _RUNTIME_USER
+from tools.brilliant_vc._common import fsync_directory as _fsync_directory
+from tools.brilliant_vc._common import redact as _redact
+from tools.brilliant_vc._common import wipe as _wipe
 from tools.brilliant_vc.launcher_preflight import (
     LauncherPreflightError,
     _validate_runtime_account_contract,
 )
 
-_RUNTIME_USER = "brilliant-vc"
 _IDENTITY_FILES = frozenset({"device_id", "pkcs12_certificate", "bootstrap", "metadata.json"})
 _CERTIFICATE_FILES = frozenset({"device.key", "device.cert"})
 _RUNTIME_ENTRIES = frozenset({"device_id", "bootstrap", "certificates"})
@@ -719,20 +722,6 @@ def _rollback_created_runtime(path: Path) -> None:
             pass
 
 
-def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(
-        path,
-        os.O_RDONLY
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_CLOEXEC", 0),
-    )
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
 def _valid_pem(value: bytes, *, begin: bytes, end: bytes) -> bool:
     return (
         isinstance(value, bytes)
@@ -763,17 +752,8 @@ def _timestamp(value: datetime) -> int:
     return int(value.timestamp())
 
 
-def _redact(value: str) -> str:
-    return f"{value[:4]}…{value[-4:]}"
-
-
 def _redact_digest(value: str) -> str:
     return f"{value[:8]}…{value[-8:]}"
-
-
-def _wipe(value: bytearray) -> None:
-    for index in range(len(value)):
-        value[index] = 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:

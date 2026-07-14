@@ -24,6 +24,8 @@ from pathlib import Path
 from typing import Any, Protocol, cast
 from uuid import UUID, uuid4
 
+from tools.brilliant_vc._common import redact as _redact_device_id
+from tools.brilliant_vc._common import wipe as _wipe
 from tools.brilliant_vc.gates import GateLedger, GateName, GateStatus
 
 SCHEMA_VERSION = 1
@@ -1587,11 +1589,6 @@ def _read_private_regular(path: Path, *, required_uid: int, description: str) ->
         os.close(descriptor)
 
 
-def _wipe(value: bytearray) -> None:
-    for index in range(len(value)):
-        value[index] = 0
-
-
 def _validate_device_id(value: str, name: str) -> None:
     if not isinstance(value, str) or not _ID.fullmatch(value):
         raise PilotGuardError(f"{name} must be 32 lowercase hex characters")
@@ -1618,10 +1615,6 @@ def _required_str(values: Mapping[str, object], name: str) -> str:
     if not isinstance(value, str) or not value:
         raise PilotGuardError(f"{name} must be a non-empty string")
     return value
-
-
-def _redact_device_id(value: str) -> str:
-    return f"{value[:4]}…{value[-4:]}"
 
 
 def _parser() -> argparse.ArgumentParser:

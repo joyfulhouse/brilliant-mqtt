@@ -22,8 +22,11 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from tools.brilliant_vc._common import PINNED_FIRMWARE as _PINNED_FIRMWARE
+from tools.brilliant_vc._common import redact as _redact
+from tools.brilliant_vc._common import wipe as _wipe
+
 _SCHEMA_VERSION = 5
-_PINNED_FIRMWARE = "v26.06.03.1"
 _PINNED_HASHES = {
     "bridge.remote_bridge": ("94ac32df6184814950cc5bc3ebeac828518b858f8fd6ce76380b67f20ccf20e4"),
     "bus.message_bus": "a85b7a2d0c2533db8d803a217027dbdd245bc104f221bf6955907dc0b8f6feb8",
@@ -1116,15 +1119,6 @@ def _read_constrained_file(
         raise
     finally:
         os.close(descriptor)
-
-
-def _redact(device_id: str) -> str:
-    return f"{device_id[:4]}…{device_id[-4:]}"
-
-
-def _wipe(value: bytearray) -> None:
-    for index in range(len(value)):
-        value[index] = 0
 
 
 def hash_firmware_modules(

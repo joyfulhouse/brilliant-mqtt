@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, cast
 
+from tools.brilliant_vc._common import redact as _redact_id
+from tools.brilliant_vc._common import wipe as _wipe
 from tools.brilliant_vc.gates import GateLedger, GateName, GateStatus
 from tools.brilliant_vc.token_check import TokenCheckError, inspect_token
 
@@ -383,15 +385,6 @@ def _validate_identifier(value: str, name: str) -> None:
 def _validate_label(value: str, name: str) -> None:
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", value):
         raise ProvisioningGuardError(f"{name} is not a safe label")
-
-
-def _redact_id(value: str) -> str:
-    return f"{value[:4]}…{value[-4:]}"
-
-
-def _wipe(buffer: bytearray) -> None:
-    for index in range(len(buffer)):
-        buffer[index] = 0
 
 
 def _duration_ms(started: float) -> int:
