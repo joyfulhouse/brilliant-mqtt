@@ -95,6 +95,12 @@ Each panel's device gains six management entities (three diagnostic, three contr
 | `select.brilliant_<panel>_wake_word` | **Wake word** — choose `okay_nabu` (default), `hey_jarvis`, or `hey_mycroft`; changing it restarts the satellite. |
 | `switch.brilliant_<panel>_wi_fi_watchdog` | **Wi-Fi watchdog** — enable installs and starts the on-panel Wi-Fi watchdog daemon (auto-recovers lost Wi-Fi: reconnect → restart networking → reboot as a last resort, see [CONFIGURATION.md → Wi-Fi watchdog](CONFIGURATION.md#wi-fi-watchdog)); disable uninstalls it. |
 | `switch.brilliant_<panel>_bus_watchdog` | **Bus watchdog** — enable installs and starts the on-panel bus-health watchdog daemon (reboots the panel if the Brilliant message bus stays wedged 30+ minutes, gated on the bridge being active and the network being up, see [CONFIGURATION.md → Bus-health watchdog](CONFIGURATION.md#bus-health-watchdog)); disable uninstalls it. |
+| `select.brilliant_<panel>_scene` | **Scene** — the panel's Brilliant scenes, populated from its accepted MQTT catalog. Changing it only updates the HA-local selection; it publishes no command. |
+| `button.brilliant_<panel>_run_selected_scene` | **Run selected scene** — runs the selected scene with blocking execution confirmation. Available only while the scene transport, catalog, and a selection exist. |
+
+The two scene entities are part of the HA control plane and scene bridge —
+canonical semantics, MQTT contract, and safety model live in
+[the scene bridge guide](brilliant-panel/home-assistant-integration.md).
 
 Entity ids follow the panel's HA device name (`Brilliant <panel>`).
 
@@ -120,10 +126,24 @@ fan out across every targeted panel:
 aggregated error naming any that failed (so a single bad panel never silently
 skips the rest of a fleet wave).
 
+Two further services run existing Brilliant scenes and modes:
+
+| Service | What it does |
+|---|---|
+| `brilliant_mqtt.run_scene` | Run a scene on a panel and wait (up to 16 s) for confirmed execution — not just publication. `scene_id` must exist in the panel's current catalog. |
+| `brilliant_mqtt.set_mode` | Set a mode on a panel with the same confirmation semantics. |
+
+Both take an optional `panel` (defaulting to the configured scene panel) and
+reject unknown fields and unknown IDs. Full semantics, error conditions, and
+YAML examples: [scene bridge guide → Services](brilliant-panel/home-assistant-integration.md#services).
+
 ## Events
 
 The integration fires `brilliant_mqtt_event` on the HA event bus. Every event
-carries `panel`, `entry_id`, and a `type`; the table lists the per-type extras:
+carries `panel`, `entry_id`, and a `type`; the table lists the per-type extras.
+(Scene and mode executions fire the separate `brilliant_mqtt_scene` and
+`brilliant_mqtt_mode` events — see
+[scene bridge guide → Events](brilliant-panel/home-assistant-integration.md#events).)
 
 | `type` | Meaning | Extra data |
 |---|---|---|
@@ -178,6 +198,12 @@ Per-panel behavior knobs (under **Configure**); read live — no reload needed.
 | **Offline grace minutes** (`offline_grace_minutes`) | `10` | How long a panel may stay `offline` before repair/escalation kicks in. |
 | **Repair cooldown minutes** (`repair_cooldown_minutes`) | `60` | Minimum gap between automatic repairs, preventing tight-loop repairs on a flapping panel. The manual repair button bypasses this. |
 | **Trust host-key changes** (`trust_host_key_changes`) | `false` | **Off (default):** a changed SSH host key surfaces as `repair_failed: host_key_changed` with guidance to Reconfigure — the root password is never offered to the new-key host. **On:** repair/update auto-re-pins a changed key on the same-host panel so a key-rotating OTA recovers hands-off; fires an auditable `host_key_repinned` event. Only enable on a trusted/isolated network (e.g. a firewalled IoT VLAN). |
+
+Seven further **HA control** settings (enable flag, entity label, room
+overrides, domains, entity cap, default scene panel, scene actions) configure
+the HA control plane and scene bridge. They are fleet-global values copied to
+each entry; their validation rules and defaults are canonical in the
+[scene bridge guide → Configuration](brilliant-panel/home-assistant-integration.md#configuration).
 
 ## Voice satellite
 

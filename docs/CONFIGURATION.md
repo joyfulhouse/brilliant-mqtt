@@ -44,6 +44,19 @@ configuration management; keep credentials out of git).
 | `MESH_PRIORITY` | no | `0` (never publish) | Participate in BLE-mesh leader election with this priority. Lower number wins; ties broken by panel name. `0` means this panel never publishes the mesh namespace. Set to `1` or higher on every panel that should be a standby. |
 | `MESH_HEARTBEAT_SECONDS` | no | `10` seconds | How often the elected leader heartbeats its retained claim. A claim older than 3× this triggers a standby takeover. |
 
+### Scene and mode bridge
+
+Off by default. The HA integration renders `SCENE_BRIDGE_ENABLED=1` during its
+normal reconfigure/redeploy path when **HA control** is enabled; you only set
+these by hand for manual deploys. The bridge's behavior, MQTT contract, and HA
+surfaces are documented in
+[the HA control plane and scene bridge guide](brilliant-panel/home-assistant-integration.md).
+
+| Variable | Required | Default | Meaning |
+|---|---|---|---|
+| `SCENE_BRIDGE_ENABLED` | no | `0` | Enable the per-panel Brilliant scene/mode bridge on the agent's existing bus and MQTT sessions. Boolean spellings match `MOTION_RECONCILE_ENABLED`. |
+| `SCENE_WATERMARK_FILE` | no | `/data/brilliant-mqtt/scene-watermarks.json` | Durable scene/mode execution watermarks, pending intents, and delivery state — used to suppress retained/reconnect replay. |
+
 ### Motion desired-state reconciler
 
 The firmware reverts the motion **enable** flags to defaults within minutes
@@ -196,6 +209,7 @@ See [docs/voice.md](voice.md) for the full end-to-end voice setup guide.
 | Availability | `brilliant/<panel>/availability` | `online`/`offline`, LWT, retained |
 | Mesh namespace | `brilliant/mesh/...` (same shapes as above) | published by the **elected leader panel only** — publisher-agnostic, so failover causes zero HA churn |
 | Mesh leadership | `brilliant/mesh/leader` | retained claim `{"panel", "priority"}` + heartbeat |
+| HA control plane & scene bridge | `brilliant/ha-control/v1/...` | versioned JSON contract: HA-owned entity manifest/state/command/result, plus per-panel scene/mode catalogs, events, commands, results, and status. Exact topics and payload fields: [MQTT version 1 contract](brilliant-panel/home-assistant-integration.md#mqtt-version-1-contract) |
 
 ---
 
@@ -334,8 +348,15 @@ topic readwrite brilliant/#
 topic write homeassistant/#
 ```
 
-- `brilliant/#` — read/write for state, commands, and availability
+- `brilliant/#` — read/write for state, commands, and availability. This also
+  covers the `brilliant/ha-control/v1/#` control-plane and scene-bridge topics;
+  no extra ACL entry is needed for the panel agent.
 - `homeassistant/#` — write for MQTT Discovery configs
+
+If you use the scene bridge, Home Assistant's own MQTT user must additionally
+be able to read **and publish** under `brilliant/ha-control/v1/#` (the HA
+integration publishes the manifest, state, and commands there). A full-access
+HA broker user already satisfies this.
 
 **Mosquitto ACL denials are silent.** A publish to a denied topic is dropped
 with no error to the client. If entities never appear or commands are silently

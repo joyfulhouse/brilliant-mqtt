@@ -28,6 +28,9 @@ Home Assistant discovers everything automatically — no YAML:
   temperatures, and fault alerts.
 - **Manage the panels themselves.** Screen, brightness, volumes, mic mute,
   night mode, child lock, screensaver, firmware auto-update — all from HA.
+- **Use Brilliant scenes from HA** *(in pilot)*. Each panel's existing
+  Brilliant scenes and modes appear over MQTT: run them from HA with confirmed
+  execution, and trigger HA automations when someone runs one on the panel.
 - **Talk to your house** *(optional)*. Any panel can become a local wake-word
   voice satellite for HA Assist, using its built-in mic and speaker.
 
@@ -43,6 +46,7 @@ HomeKit without breaking them. It survives panel firmware updates.
 | Energy | Live wattage per circuit — including always-on gangs you can't see anywhere else |
 | Motion & presence | Motion from every mesh dimmer/switch and panel faceplate, plus panel-in-use occupancy |
 | Panel settings | 25+ entities per panel: screen, audio, privacy, governance switches |
+| Brilliant scenes & modes *(in pilot)* | Per-panel scene/mode catalogs, HA services with confirmed execution, HA events on native scene runs — see [the scene bridge guide](docs/brilliant-panel/home-assistant-integration.md) |
 | Voice satellite | Local wake word → your own HA Assist pipeline (opt-in per panel) |
 | Reliability | Auto-reconnect, watchdogs, and retained MQTT state — entities survive HA restarts, panel reboots, and firmware updates. A bus-health watchdog self-recovers a panel whose Brilliant bus stays wedged. |
 

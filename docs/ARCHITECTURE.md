@@ -48,6 +48,12 @@ bidirectional control.
 | `heartbeat.py` | Bus-liveness heartbeat: atomically stamps a tmpfs file after every successful `get_all()` so the independent `brilliant_bus_watchdog` package can detect a wedged bus session (see Data Flow). | unit |
 | `bridge.py` | Orchestrator: reconcile, change → state publish, command → bus, desired-state enforcement. | unit (fakes) |
 | `mesh_leader.py` | Fleet-wide mesh leader election over MQTT (retained priority claim + heartbeat); gates the mesh bridge's publishes and writes. | unit |
+| `ha_control_protocol.py` | Versioned `brilliant/ha-control/v1` MQTT wire contract (shared verbatim with the HA integration): topic builders, canonical JSON encoding, strict payload validation. | unit |
+| `thrift_binary.py` | Bounded decoder for base64 Thrift `TBinaryProtocol` structs — no generated Thrift types, explicit read/growth budgets against untrusted input. | unit |
+| `scene_codec.py` | Typed scene/mode records reduced from Brilliant bus variables (catalog + execution decoding). | unit |
+| `scene_state.py` | Durable, strictly validated scene-transport state: execution watermarks, pending intents, delivery outboxes (`SCENE_WATERMARK_FILE`). | unit |
+| `scene_bridge.py` | Bidirectional scene/mode transport on the *shared* bus/MQTT sessions — catalogs out, confirmed scene/mode commands in. Opt-in via `SCENE_BRIDGE_ENABLED`. | unit |
+| `cleanup_legacy_mirror.py` | Dry-run-first CLI removing peripherals persisted by the retired HA-mirror experiments (strict allowlists; see [ha-mirror.md](ha-mirror.md)). Not part of the bridge runtime. | unit |
 | `config.py` | Env-driven settings. | unit |
 | `__main__.py` | Entry point: wire real adapters, run the loop. | thin |
 
@@ -93,6 +99,14 @@ bidirectional control.
   entities regardless of which panel serves them. In-process this is a second
   `Bridge` instance (panel slug `mesh`) gated by an include predicate that
   checks leadership, fed by the same bus adapter subscribed to both devices.
+- **Scene/mode bridge (opt-in):** when `SCENE_BRIDGE_ENABLED=1`, a
+  `SceneBridge` runs on the *same* bus and MQTT sessions (no second adapter):
+  it publishes the panel's scene/mode catalogs and execution events under
+  `brilliant/ha-control/v1/...`, and accepts confirmed scene/mode commands
+  from HA — success means an observed execution record, not a successful
+  write. It hosts no peripheral and never creates configuration; the full
+  ownership model and wire contract are in
+  [brilliant-panel/home-assistant-integration.md](brilliant-panel/home-assistant-integration.md).
 
 ## Key Design Decisions
 

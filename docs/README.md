@@ -18,17 +18,25 @@ prerequisites checklist and deploy choice, and links these focused guides:
   onboarding flow, management entities, services, events, options, and repair.
 - [voice.md](voice.md) — voice satellite: enabling wake word + mic + speaker
   on a panel, wake word choices, Assist pipeline assignment, and AEC.
+- [brilliant-panel/home-assistant-integration.md](brilliant-panel/home-assistant-integration.md)
+  — the HA control plane and Brilliant scene/mode bridge: ownership model,
+  configuration, the canonical `brilliant/ha-control/v1` MQTT contract, HA
+  services/events/entities, safety, and diagnostics.
 - [CONFIGURATION.md](CONFIGURATION.md) — env vars, MQTT topics, broker user/ACL
   (the canonical ACL snippet lives here), mesh leader election.
 - [TROUBLESHOOTING.md](TROUBLESHOOTING.md) — problem → fix entries and debug
   logging.
+- [ha-mirror.md](ha-mirror.md) — retirement of the deprecated physical-Control
+  HA mirror and the dry-run-first legacy peripheral cleanup CLI.
 
 ## Reference
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — how the bridge is structured and why.
 - [brilliant-panel/README.md](brilliant-panel/README.md) — reverse-engineered
   panel software, UI/UX information architecture, cloud boundaries, complete
-  peripheral type catalog, HA support matrix, and validation runbook.
+  peripheral type catalog, HA support matrix, validation and pilot runbooks,
+  and the Virtual Control research track (feasibility gates, runtime contract,
+  and the [`tools/brilliant_vc` toolkit](brilliant-panel/virtual-control-toolkit.md)).
 - [DEVELOPMENT.md](DEVELOPMENT.md) — development environment, quality gates,
   testing rules.
 - [reference/message-bus-api.md](reference/message-bus-api.md) — the

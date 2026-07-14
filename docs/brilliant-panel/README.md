@@ -23,6 +23,7 @@ The central finding is that the panel is not a collection of isolated integratio
 | [Home Assistant control and scene bridge](home-assistant-integration.md) | Authoritative ownership model, configuration, MQTT contract, HA surfaces, safety, diagnostics, and migration |
 | [Validation runbook](validation-runbook.md) | Safe static, read-only, telemetry, and write-validation procedures |
 | [Office scene-bridge pilot](runbooks/scene-bridge-pilot.md) | Hardware acceptance, restart/replay checks, rollback, evidence, and legacy-removal gate |
+| [Virtual Control research toolkit](virtual-control-toolkit.md) | What `tools/brilliant_vc` is, its fail-closed safety model, module inventory, and the reference deploy units |
 | [Virtual Control feasibility gates](runbooks/virtual-control-gates.md) | Official token/provisioning boundary, PKCS#12 materialization, isolated uWSGI runtime contract, monitor, and native-light gates |
 | [Native slider E2E runbook](runbooks/native-slider-e2e.md) | Private binding baseline, passive gesture transcript, exactly-once/two-panel analysis, restoration, and remaining blockers |
 
