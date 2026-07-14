@@ -775,20 +775,19 @@ async def test_apply_keeps_durable_failure_until_close_and_final_success_write(
 async def test_apply_persists_success_only_after_client_close(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    client = FakeCleanupClient([_snapshot()])
     events: list[str] = []
+
+    class CloseRecordingClient(FakeCleanupClient):
+        async def close(self) -> None:
+            events.append("close")
+            await super().close()
+
+    client = CloseRecordingClient([_snapshot()])
 
     def record_write(path: Path, payload: str) -> None:
         del path
         events.append(f"write:{json.loads(payload)['success']}")
 
-    original_close = client.close
-
-    async def record_close() -> None:
-        events.append("close")
-        await original_close()
-
-    client.close = record_close  # type: ignore[method-assign]
     code = await async_main(
         ["--apply", "--snapshot", "/safe/cleanup/report.json"],
         client_factory=lambda: client,

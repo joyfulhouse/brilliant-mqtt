@@ -53,7 +53,12 @@ ignore_missing_imports = true
 # disallow_subclassing_any rejects. Relaxing it for these modules is the
 # root-cause config for the closed-source base — not an inline suppression.
 [[tool.mypy.overrides]]
-module = ["brilliant_mqtt.bus", "brilliant_ha_mirror.hosting"]
+module = [
+    "brilliant_mqtt.bus",
+    "brilliant_ha_mirror.hosting",
+    # single_light_pilot subclasses the same no-stub Cython Peripheral base.
+    "tools.brilliant_vc.single_light_pilot",
+]
 disallow_subclassing_any = false
 
 [build-system]

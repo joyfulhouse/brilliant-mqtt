@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -401,12 +402,12 @@ async def test_partial_manager_setup_failure_is_cleaned_up(
     real_subscribe = mqtt.async_subscribe
     subscriptions = 0
 
-    async def fail_second_subscribe(*args: object, **kwargs: object) -> object:
+    async def fail_second_subscribe(*args: Any, **kwargs: Any) -> object:
         nonlocal subscriptions
         subscriptions += 1
         if subscriptions == 2:
             raise setup_failure
-        return await real_subscribe(*args, **kwargs)  # type: ignore[arg-type]
+        return await real_subscribe(*args, **kwargs)
 
     with (
         patch(

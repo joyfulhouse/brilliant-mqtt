@@ -894,7 +894,7 @@ class LivePeripheralHost:
                 for name, definition in variables.items()
             }
 
-        class PilotLightPeripheral(Peripheral):  # type: ignore[misc]
+        class PilotLightPeripheral(Peripheral):
             def __init__(self, *args: Any, **kwargs: Any) -> None:
                 super().__init__(*args, **kwargs)
                 adapter._instance = self
@@ -1040,6 +1040,10 @@ async def _open_scoped_observer(
 ) -> tuple[Any, Any]:
     """Open one bounded read-only observer against the isolated VC socket."""
 
+    # Sanctioned exception to the bus.py-only lib.message_bus_api rule
+    # (CLAUDE.md): the VC runtime is staged without the brilliant_mqtt package
+    # on PYTHONPATH, so it cannot route through bus.py. Deferred import at the
+    # runtime boundary keeps this module importable and unit-testable off-panel.
     import lib.protocol.message_bus_peer_service as mbps
     from lib.message_bus_api.observer_interface import RPCObserver
     from lib.protocol.processor import SinglePeerProcessor

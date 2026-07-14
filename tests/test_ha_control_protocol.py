@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -122,12 +123,12 @@ def test_decode_scene_and_mode_commands() -> None:
 )
 @pytest.mark.parametrize("version_field", ["schema_version", "mapping_version"])
 def test_decoders_reject_unknown_versions(
-    decoder: object, vector_name: str, version_field: str
+    decoder: Callable[..., object], vector_name: str, version_field: str
 ) -> None:
     value = dict(VECTORS["payloads"][vector_name]["value"])
     value[version_field] = 2
     with pytest.raises(ValueError):
-        decoder(encode_json(value), now_ms=VECTORS["now_ms"])  # type: ignore[operator]
+        decoder(encode_json(value), now_ms=VECTORS["now_ms"])
 
 
 @pytest.mark.parametrize(
@@ -139,11 +140,13 @@ def test_decoders_reject_unknown_versions(
         (decode_mode_command, "mode_command", "mode_id"),
     ],
 )
-def test_decoders_reject_missing_ids(decoder: object, vector_name: str, id_field: str) -> None:
+def test_decoders_reject_missing_ids(
+    decoder: Callable[..., object], vector_name: str, id_field: str
+) -> None:
     value = dict(VECTORS["payloads"][vector_name]["value"])
     del value[id_field]
     with pytest.raises(ValueError):
-        decoder(encode_json(value), now_ms=VECTORS["now_ms"])  # type: ignore[operator]
+        decoder(encode_json(value), now_ms=VECTORS["now_ms"])
 
 
 @pytest.mark.parametrize("payload", ["not-json", "[]", "{}"])

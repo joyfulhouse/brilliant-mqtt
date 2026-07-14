@@ -21,7 +21,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol, cast
 
-from brilliant_mqtt.bus import normalize_peripheral
+from brilliant_mqtt.bus import load_rpc_observer_class, normalize_peripheral
 from brilliant_mqtt.model import BrilliantDevice
 
 ALLOWED_ID_PREFIXES = ("ha_", "ha-pilot-", "zzz_mirror_")
@@ -594,11 +594,10 @@ class NativeCleanupClient:
     async def start(self) -> None:
         """Connect after importing panel-only modules at the runtime boundary."""
         import lib.protocol.message_bus_peer_service as mbps
-        from lib.message_bus_api.observer_interface import RPCObserver
         from lib.protocol.processor import SinglePeerProcessor
 
         loop = asyncio.get_running_loop()
-        observer_class = _make_cleanup_observer_class(RPCObserver)
+        observer_class = _make_cleanup_observer_class(load_rpc_observer_class())
         observer = observer_class(loop)
         processor = SinglePeerProcessor(
             socket_path=_SOCKET_PATH,

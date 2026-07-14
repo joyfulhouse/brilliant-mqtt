@@ -610,6 +610,11 @@ class NativeOwnConfigReader:
 
         if self._observer is not None or self._processor is not None:
             raise SliderBindingError("read-only observer is already started")
+        # Sanctioned exception to the bus.py-only lib.message_bus_api rule
+        # (CLAUDE.md): the VC runtime is staged without the brilliant_mqtt
+        # package on PYTHONPATH, so it cannot route through bus.py. Deferred
+        # import at the runtime boundary keeps this module importable and
+        # unit-testable off-panel behind fakes.
         import lib.protocol.message_bus_peer_service as mbps
         from lib.message_bus_api.observer_interface import RPCObserver
         from lib.protocol.processor import SinglePeerProcessor

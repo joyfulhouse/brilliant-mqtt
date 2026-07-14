@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -167,4 +168,4 @@ def test_manifest_rejects_physical_or_colliding_runtime_paths(
 @pytest.mark.parametrize("port", [0, 5455, 65536, True])
 def test_manifest_rejects_unsafe_remote_bridge_port(port: object) -> None:
     with pytest.raises(ManifestError, match="remote-bridge port"):
-        build_candidate_manifest(_paths(), remote_bridge_port=port)  # type: ignore[arg-type]
+        build_candidate_manifest(_paths(), remote_bridge_port=cast(int, port))

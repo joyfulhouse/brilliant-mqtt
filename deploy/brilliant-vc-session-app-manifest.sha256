@@ -8,7 +8,7 @@ cde5d2436f02d6452971437f53f01d4dc056b183eb6bc5b1de95810623948eff  /var/brilliant
 54e61fb7746a930a345cae8d87c955b0bb144388f78bf309090cff68c86e8774  /var/brilliant-vc/app/tools/brilliant_vc/session_approval.py
 d7020d7c9b001f5b6286315a355fc131d50e1c28c5568abbdaccb208944c944a  /var/brilliant-vc/app/tools/brilliant_vc/session_coordinator.py
 d93dd1c72cad4424dc67d7763485b4e23d4f8e31f4cd85896f663d0664558ea8  /var/brilliant-vc/app/tools/brilliant_vc/session_prepare.py
-2fd0f4ffc1ca77884f73d3df62dd747257bdd35266ef042a1c0225bf7ba6f7f3  /var/brilliant-vc/app/tools/brilliant_vc/single_light_pilot.py
+0311c725d01b12a9085aa1391ae20c4d54e276a6ab8ce08a315576566e2fb3c4  /var/brilliant-vc/app/tools/brilliant_vc/single_light_pilot.py
 2e0ad411734163cc1466cedc946e2f677e1c39a630113bd1c53baf21c3c134d7  /var/brilliant-vc/app/tools/brilliant_vc/staged_runtime.py
 0e1450f1f94ec8454fb0d0887b860362209d82a23b0122fb9f128402065a9e34  /var/brilliant-vc/app/tools/brilliant_vc/start_approval.py
 22a64d2019ff4b4d42b8e888b242553062815c3040685c3a6268dd04aaf07cb0  /var/brilliant-vc/app/tools/brilliant_vc/vassal_manifest.py

@@ -63,8 +63,14 @@ in `CREDENTIALS.local.md`. For any new code tasks use
 - **TDD.** Failing test → minimal impl → green → commit. Small, frequent commits.
 - **Never disable linters** (`# noqa`, `# type: ignore`). Fix the root cause.
 - **Never import `lib.message_bus_api` outside `src/brilliant_mqtt/bus.py`.**
-  Everything else is unit-tested off-panel behind `BusClient`/`MqttClient`
-  Protocols with fakes — the suite must run on any machine.
+  Agent modules needing panel classes at the runtime boundary call
+  `bus.load_rpc_observer_class()` instead of importing directly. One scoped
+  exception: separately staged panel-only runtimes under `tools/brilliant_vc/`
+  deploy without `brilliant_mqtt` on `PYTHONPATH` and may deferred-import the
+  panel library inside their boundary adapters (comment the site as the
+  sanctioned exception). Everything else is unit-tested off-panel behind
+  `BusClient`/`MqttClient` Protocols with fakes — the suite must run on any
+  machine.
 - **No secrets in git.** `CREDENTIALS.local.md` and `*.local.md` are gitignored;
   MQTT creds come from the environment / the operator's secret store at deploy
   time. If you ever see a secret staged, STOP and unstage.

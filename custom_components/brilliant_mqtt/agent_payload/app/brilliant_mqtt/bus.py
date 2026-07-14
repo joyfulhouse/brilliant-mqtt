@@ -52,6 +52,20 @@ def _session_client_name(base: str) -> str:
     return f"{base}-{secrets.token_hex(4)}"
 
 
+def load_rpc_observer_class() -> Any:
+    """Deferred panel-only import of ``RPCObserver``.
+
+    This module is the single sanctioned ``lib.message_bus_api`` import site
+    (CLAUDE.md). Other agent modules that need the class at the panel runtime
+    boundary must call this instead of importing the panel library directly,
+    so the import surface stays auditable and every module keeps importing
+    off-panel.
+    """
+    from lib.message_bus_api.observer_interface import RPCObserver
+
+    return RPCObserver
+
+
 def normalize_peripheral(device_id: str, peripheral_id: str, raw: Any) -> BrilliantDevice:
     """Translate a raw bus Peripheral into a normalized :class:`BrilliantDevice`.
 

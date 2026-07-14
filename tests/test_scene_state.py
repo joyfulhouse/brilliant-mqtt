@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 import pytest
@@ -165,18 +166,18 @@ def test_load_rejects_oversized_file_without_reading_it_all(tmp_path: Path) -> N
     ],
 )
 def test_load_rejects_watermark_collection_over_its_limit(
-    tmp_path: Path, field: str, limit: int, entry: object
+    tmp_path: Path, field: str, limit: int, entry: Callable[[int], Mapping[str, object]]
 ) -> None:
     raw = state_payload(SceneState())
     if field == "watermarks":
         records: dict[str, object] = {}
         for index in range(limit + 1):
-            records.update(entry(index))  # type: ignore[operator]
+            records.update(entry(index))
         raw[field] = {_PANEL: records}
     else:
         records = {}
         for index in range(limit + 1):
-            records.update(entry(index))  # type: ignore[operator]
+            records.update(entry(index))
         raw[field] = records
     path = tmp_path / "state.json"
     path.write_text(json.dumps(raw))
@@ -239,10 +240,15 @@ def test_load_rejects_delivered_result_with_undelivered_event_dependency(
 def test_scene_state_is_immutable() -> None:
     state = _state()
 
+    # Assign through setattr with a runtime field name: a static assignment to
+    # the frozen dataclass is (correctly) rejected by mypy; this test exercises
+    # the runtime immutability guard.
+    field_name = "pending"
+    new_value = (
+        (
+            ("scene", _COMMAND_ID),
+            StatePending("scene", _COMMAND_ID, _SCENE_ID, "a" * 64, _PANEL, 1, 2),
+        ),
+    )
     with pytest.raises(AttributeError):
-        state.pending = (  # type: ignore[misc]
-            (
-                ("scene", _COMMAND_ID),
-                StatePending("scene", _COMMAND_ID, _SCENE_ID, "a" * 64, _PANEL, 1, 2),
-            ),
-        )
+        setattr(state, field_name, new_value)

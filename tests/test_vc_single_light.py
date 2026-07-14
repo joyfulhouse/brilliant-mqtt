@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -173,7 +174,7 @@ def test_peripheral_id_is_stable_across_display_rename() -> None:
 def test_config_fails_closed_on_unsafe_identity_or_runtime(
     field: str, value: object, message: str
 ) -> None:
-    data = {
+    data: dict[str, Any] = {
         "stable_id": STABLE_ID,
         "display_name": "HA VC Pilot Light",
         "room_id": ROOM_ID,
@@ -185,7 +186,7 @@ def test_config_fails_closed_on_unsafe_identity_or_runtime(
     data[field] = value
 
     with pytest.raises(PilotGuardError, match=message):
-        PilotConfig(**data)  # type: ignore[arg-type]
+        PilotConfig(**data)
 
 
 def test_topology_requires_type_6_exact_owner_room_and_own_configuration() -> None:
