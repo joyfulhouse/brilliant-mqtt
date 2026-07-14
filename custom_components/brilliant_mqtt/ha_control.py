@@ -514,6 +514,8 @@ class HaControlPlane:
                 raise ValueError("entity is not present in the current manifest")
             if command.kind not in entity.commands:
                 raise ValueError("command is not allowed by the current manifest")
+            if command.observed_sequence != self._state_sequences[command.stable_id]:
+                raise ValueError("observed_sequence is stale")
             route = _SERVICE_ROUTES.get((entity.domain, command.kind))
             if route is None:
                 raise ValueError("command has no service route")

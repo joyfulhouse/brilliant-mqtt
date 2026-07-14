@@ -157,6 +157,7 @@ def _command_payload(
     command_id: str | None = None,
     issued_at_ms: int | None = None,
     payload_stable_id: str | None = None,
+    observed_sequence: int = 1,
 ) -> tuple[str, str]:
     command_id = command_id or str(uuid4())
     return command_id, encode_json(
@@ -167,10 +168,18 @@ def _command_payload(
             "stable_id": payload_stable_id or stable_id(entity_id),
             "kind": kind,
             "value": value,
-            "observed_sequence": 1,
+            "observed_sequence": observed_sequence,
             "issued_at_ms": issued_at_ms or time.time_ns() // 1_000_000,
         }
     )
+
+
+def _current_sequence(mqtt_mock: MqttMockHAClient, entity_id: str) -> int:
+    calls = _published(mqtt_mock, state_topic(stable_id(entity_id)))
+    assert calls, f"no state has been published yet for {entity_id}"
+    sequence = _payload(calls[-1])["sequence"]
+    assert isinstance(sequence, int)
+    return sequence
 
 
 @pytest.mark.allow_lingering_timers
@@ -517,6 +526,90 @@ async def test_command_absent_from_manifest_is_rejected(
 
 
 @pytest.mark.allow_lingering_timers
+async def test_current_observed_sequence_executes_the_command(
+    hass: HomeAssistant, mqtt_mock: MqttMockHAClient
+) -> None:
+    entity = _selected_entity(hass, "switch.controlled")
+    calls: list[ServiceCall] = []
+    hass.services.async_register("switch", "turn_on", calls.append)
+    plane = get_control_plane(hass)
+    entry = _entry(hass, "office")
+    await plane.async_attach(entry)
+    current_sequence = _current_sequence(mqtt_mock, entity.entity_id)
+    mqtt_mock.async_publish.reset_mock()
+    command_id, payload = _command_payload(
+        entity.entity_id, "turn_on", None, observed_sequence=current_sequence
+    )
+
+    async_fire_mqtt_message(hass, command_topic(stable_id(entity.entity_id)), payload)
+    await hass.async_block_till_done()
+
+    assert len(calls) == 1
+    result = _payload(_published(mqtt_mock, result_topic(command_id))[0])
+    assert result["accepted"] is True
+    assert result["error"] is None
+    await plane.async_detach(entry.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_stale_observed_sequence_is_rejected_with_a_conflict_result(
+    hass: HomeAssistant, mqtt_mock: MqttMockHAClient
+) -> None:
+    entity = _selected_entity(hass, "switch.controlled")
+    calls: list[ServiceCall] = []
+    hass.services.async_register("switch", "turn_on", calls.append)
+    plane = get_control_plane(hass)
+    entry = _entry(hass, "office")
+    await plane.async_attach(entry)
+    current_sequence = _current_sequence(mqtt_mock, entity.entity_id)
+    mqtt_mock.async_publish.reset_mock()
+    command_id, payload = _command_payload(
+        entity.entity_id, "turn_on", None, observed_sequence=current_sequence + 1
+    )
+
+    async_fire_mqtt_message(hass, command_topic(stable_id(entity.entity_id)), payload)
+    await hass.async_block_till_done()
+
+    assert calls == []
+    result = _payload(_published(mqtt_mock, result_topic(command_id))[0])
+    assert result["accepted"] is False
+    assert result["error"] == "observed_sequence is stale"
+    assert result["resulting_sequence"] == current_sequence
+    await plane.async_detach(entry.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_stale_observed_sequence_rejection_does_not_advance_the_sequence(
+    hass: HomeAssistant, mqtt_mock: MqttMockHAClient
+) -> None:
+    entity = _selected_entity(hass, "switch.controlled")
+    calls: list[ServiceCall] = []
+    hass.services.async_register("switch", "turn_on", calls.append)
+    plane = get_control_plane(hass)
+    entry = _entry(hass, "office")
+    await plane.async_attach(entry)
+    current_sequence = _current_sequence(mqtt_mock, entity.entity_id)
+    mqtt_mock.async_publish.reset_mock()
+    stale_id, stale_payload = _command_payload(
+        entity.entity_id, "turn_on", None, observed_sequence=current_sequence + 1
+    )
+    async_fire_mqtt_message(hass, command_topic(stable_id(entity.entity_id)), stale_payload)
+    await hass.async_block_till_done()
+    assert calls == []
+    assert _payload(_published(mqtt_mock, result_topic(stale_id))[0])["accepted"] is False
+
+    current_id, current_payload = _command_payload(
+        entity.entity_id, "turn_on", None, observed_sequence=current_sequence
+    )
+    async_fire_mqtt_message(hass, command_topic(stable_id(entity.entity_id)), current_payload)
+    await hass.async_block_till_done()
+
+    assert len(calls) == 1
+    assert _payload(_published(mqtt_mock, result_topic(current_id))[0])["accepted"] is True
+    await plane.async_detach(entry.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
 async def test_dormant_restart_preserves_revision_sequence_and_duplicate_cache(
     hass: HomeAssistant, mqtt_mock: MqttMockHAClient
 ) -> None:
@@ -543,7 +636,9 @@ async def test_dormant_restart_preserves_revision_sequence_and_duplicate_cache(
         _payload(_published(mqtt_mock, state_topic(stable_id(first.entity_id)))[-1])["sequence"]
         == sequence_before_dormancy
     )
-    command_id, command_payload = _command_payload(first.entity_id, "turn_on", None)
+    command_id, command_payload = _command_payload(
+        first.entity_id, "turn_on", None, observed_sequence=sequence_before_dormancy
+    )
     async_fire_mqtt_message(hass, command_topic(stable_id(first.entity_id)), command_payload)
     await hass.async_block_till_done()
     first_result = _published(mqtt_mock, result_topic(command_id))[-1].args[1]
@@ -633,7 +728,12 @@ async def test_partial_state_failure_retries_full_snapshot_before_authorizing(
     assert len(_published(mqtt_mock, manifest_topic())) == 1
     assert len(_published(mqtt_mock, state_topic(stable_id(first.entity_id)))) == 1
     assert len(_published(mqtt_mock, state_topic(stable_id(second.entity_id)))) == 1
-    accepted_id, accepted_payload = _command_payload(first.entity_id, "turn_on", None)
+    accepted_id, accepted_payload = _command_payload(
+        first.entity_id,
+        "turn_on",
+        None,
+        observed_sequence=_current_sequence(mqtt_mock, first.entity_id),
+    )
     async_fire_mqtt_message(hass, command_topic(stable_id(first.entity_id)), accepted_payload)
     await hass.async_block_till_done()
     assert len(calls) == 1
