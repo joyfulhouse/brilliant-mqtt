@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import grp
 import hashlib
 import json
 import os
+import pwd
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,6 +15,7 @@ from tools.brilliant_vc.launcher_preflight import (
     LauncherPaths,
     LauncherPreflightError,
     hash_firmware_modules,
+    main,
     preflight_no_start,
 )
 
@@ -20,7 +24,7 @@ DEVICE_ID = "a" * 32
 
 def _firmware() -> dict[str, object]:
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "firmware_version": "v26.06.03.1",
         "runtime_sha256": {
             "bridge.remote_bridge": (
@@ -127,6 +131,16 @@ def _firmware() -> dict[str, object]:
             "trace_dir",
             "art_preload_dir",
         ],
+        "candidate_supervisor_mode": "dedicated_nonroot_emperor",
+        "candidate_root_emperor_permitted": False,
+        "candidate_generated_directory_mode": "0700",
+        "runtime_credential_layout": [
+            "device_id",
+            "bootstrap",
+            "certificates/device.key",
+            "certificates/device.cert",
+        ],
+        "runtime_credential_access": "root_owner_dedicated_group_read_only",
     }
 
 
@@ -142,13 +156,18 @@ def _private_file(path: Path, data: bytes) -> None:
 
 
 def _paths(tmp_path: Path) -> LauncherPaths:
+    private_root = tmp_path / "data" / "brilliant-vc-private"
+    private_root.mkdir(parents=True, mode=0o700)
+    identity = private_root / "identity"
+    materialized_certificates = private_root / "materialized-certificates"
+    identity.mkdir(mode=0o700)
+    materialized_certificates.mkdir(mode=0o700)
+
     persistent = tmp_path / "data" / "brilliant-vc"
     persistent.mkdir(parents=True, mode=0o700)
     runtime = tmp_path / "run" / "brilliant-vc"
     runtime.mkdir(parents=True, mode=0o700)
-    identity = persistent / "identity"
     state = persistent / "state"
-    certificates = persistent / "certificates"
     process_config = persistent / "process-config"
     process_flagfiles = persistent / "flagfiles"
     startable_configs = persistent / "startable-configs"
@@ -156,9 +175,7 @@ def _paths(tmp_path: Path) -> LauncherPaths:
     errors = persistent / "errors"
     traces = persistent / "traces"
     for directory in (
-        identity,
         state,
-        certificates,
         process_config,
         process_flagfiles,
         startable_configs,
@@ -167,6 +184,20 @@ def _paths(tmp_path: Path) -> LauncherPaths:
         traces,
     ):
         directory.mkdir(mode=0o700)
+    for directory in (
+        persistent,
+        runtime,
+        state,
+        process_config,
+        process_flagfiles,
+        startable_configs,
+        logs,
+        errors,
+        traces,
+    ):
+        os.chown(directory, os.getuid(), os.getgid())
+
+    runtime_credentials = tmp_path / "data" / "brilliant-vc-credentials"
 
     read_only_metadata = tmp_path / "read-only-metadata"
     read_only_metadata.mkdir(mode=0o700)
@@ -188,10 +219,14 @@ def _paths(tmp_path: Path) -> LauncherPaths:
         ).encode(),
     )
     return LauncherPaths(
+        private_root=private_root,
         persistent_root=persistent,
         identity_dir=identity,
+        materialized_certificate_dir=materialized_certificates,
+        runtime_credential_dir=runtime_credentials,
+        bootstrap_path=runtime_credentials / "bootstrap",
         state_dir=state,
-        certificate_dir=certificates,
+        certificate_dir=runtime_credentials / "certificates",
         process_config_dir=process_config,
         process_flagfile_dir=process_flagfiles,
         startable_config_dir=startable_configs,
@@ -206,10 +241,10 @@ def _paths(tmp_path: Path) -> LauncherPaths:
     )
 
 
-def test_tracked_schema_v3_snapshot_example_matches_the_pinned_contract() -> None:
+def test_tracked_schema_v4_snapshot_example_matches_the_pinned_contract() -> None:
     example = (
         Path(__file__).parents[1]
-        / "docs/brilliant-panel/virtual-control-launcher-snapshot-v3.example.json"
+        / "docs/brilliant-panel/virtual-control-launcher-snapshot-v4.example.json"
     )
 
     assert json.loads(example.read_text(encoding="utf-8")) == _firmware()
@@ -223,8 +258,12 @@ def test_valid_prerequisites_produce_a_redacted_plan_that_cannot_start(tmp_path:
         _firmware(),
         actual_module_hashes=_module_hashes(),
         required_uid=os.getuid(),
+        runtime_uid=os.getuid(),
+        runtime_gid=os.getgid(),
+        allowed_private_roots=(paths.private_root,),
         allowed_persistent_roots=(paths.persistent_root,),
         allowed_runtime_roots=(paths.runtime_dir,),
+        allowed_runtime_credential_paths=(paths.runtime_credential_dir,),
     )
 
     assert plan.to_public_dict() == {
@@ -235,10 +274,12 @@ def test_valid_prerequisites_produce_a_redacted_plan_that_cannot_start(tmp_path:
         "private_modes_valid": True,
         "empty_runtime_paths": True,
         "certificate_material_present": False,
+        "runtime_credentials_present": False,
         "identity_file_count": 4,
         "device_id_redacted": "aaaa…aaaa",
         "uwsgi_contract_confirmed": True,
         "stock_process_manager_lifecycle_confirmed": True,
+        "nonroot_emperor_confirmed": True,
         "direct_runner_rejected": True,
         "identity_contract_complete": False,
         "full_path_surface_validated": True,
@@ -250,6 +291,45 @@ def test_valid_prerequisites_produce_a_redacted_plan_that_cannot_start(tmp_path:
     }
     assert DEVICE_ID not in json.dumps(plan.to_public_dict())
     assert not hasattr(plan, "command")
+
+
+def test_runtime_supervisor_identity_must_be_nonroot(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+
+    with pytest.raises(LauncherPreflightError, match="must be non-root"):
+        preflight_no_start(
+            paths,
+            _firmware(),
+            actual_module_hashes=_module_hashes(),
+            required_uid=os.getuid(),
+            runtime_uid=0,
+            runtime_gid=os.getgid(),
+            allowed_private_roots=(paths.private_root,),
+            allowed_persistent_roots=(paths.persistent_root,),
+            allowed_runtime_roots=(paths.runtime_dir,),
+            allowed_runtime_credential_paths=(paths.runtime_credential_dir,),
+        )
+
+
+def test_cli_rejects_a_runtime_group_shared_with_another_account(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr(
+        pwd,
+        "getpwnam",
+        lambda name: SimpleNamespace(pw_uid=1001, pw_gid=1001),
+    )
+    monkeypatch.setattr(
+        grp,
+        "getgrgid",
+        lambda gid: SimpleNamespace(gr_name="brilliant-vc", gr_mem=["another-user"]),
+    )
+    monkeypatch.setattr(pwd, "getpwall", lambda: [])
+
+    with pytest.raises(LauncherPreflightError, match="must not include another account"):
+        main(["--firmware-snapshot", str(tmp_path / "unused.json")])
 
 
 def test_hash_or_interface_drift_blocks_before_a_plan(tmp_path: Path) -> None:
@@ -264,8 +344,12 @@ def test_hash_or_interface_drift_blocks_before_a_plan(tmp_path: Path) -> None:
             firmware,
             actual_module_hashes=_module_hashes(),
             required_uid=os.getuid(),
+            runtime_uid=os.getuid(),
+            runtime_gid=os.getgid(),
+            allowed_private_roots=(paths.private_root,),
             allowed_persistent_roots=(paths.persistent_root,),
             allowed_runtime_roots=(paths.runtime_dir,),
+            allowed_runtime_credential_paths=(paths.runtime_credential_dir,),
         )
 
     actual_hashes = _module_hashes()
@@ -276,8 +360,12 @@ def test_hash_or_interface_drift_blocks_before_a_plan(tmp_path: Path) -> None:
             _firmware(),
             actual_module_hashes=actual_hashes,
             required_uid=os.getuid(),
+            runtime_uid=os.getuid(),
+            runtime_gid=os.getgid(),
+            allowed_private_roots=(paths.private_root,),
             allowed_persistent_roots=(paths.persistent_root,),
             allowed_runtime_roots=(paths.runtime_dir,),
+            allowed_runtime_credential_paths=(paths.runtime_credential_dir,),
         )
 
     firmware = _firmware()
@@ -290,8 +378,12 @@ def test_hash_or_interface_drift_blocks_before_a_plan(tmp_path: Path) -> None:
             firmware,
             actual_module_hashes=_module_hashes(),
             required_uid=os.getuid(),
+            runtime_uid=os.getuid(),
+            runtime_gid=os.getgid(),
+            allowed_private_roots=(paths.private_root,),
             allowed_persistent_roots=(paths.persistent_root,),
             allowed_runtime_roots=(paths.runtime_dir,),
+            allowed_runtime_credential_paths=(paths.runtime_credential_dir,),
         )
 
     firmware = _firmware()
@@ -302,8 +394,28 @@ def test_hash_or_interface_drift_blocks_before_a_plan(tmp_path: Path) -> None:
             firmware,
             actual_module_hashes=_module_hashes(),
             required_uid=os.getuid(),
+            runtime_uid=os.getuid(),
+            runtime_gid=os.getgid(),
+            allowed_private_roots=(paths.private_root,),
             allowed_persistent_roots=(paths.persistent_root,),
             allowed_runtime_roots=(paths.runtime_dir,),
+            allowed_runtime_credential_paths=(paths.runtime_credential_dir,),
+        )
+
+    firmware = _firmware()
+    firmware["candidate_root_emperor_permitted"] = True
+    with pytest.raises(LauncherPreflightError, match="runtime contract"):
+        preflight_no_start(
+            paths,
+            firmware,
+            actual_module_hashes=_module_hashes(),
+            required_uid=os.getuid(),
+            runtime_uid=os.getuid(),
+            runtime_gid=os.getgid(),
+            allowed_private_roots=(paths.private_root,),
+            allowed_persistent_roots=(paths.persistent_root,),
+            allowed_runtime_roots=(paths.runtime_dir,),
+            allowed_runtime_credential_paths=(paths.runtime_credential_dir,),
         )
 
 
@@ -311,21 +423,119 @@ def test_materialized_certificate_pair_is_accepted_but_start_remains_blocked(
     tmp_path: Path,
 ) -> None:
     paths = _paths(tmp_path)
-    _private_file(paths.certificate_dir / "device.key", b"private-key-pem")
-    _private_file(paths.certificate_dir / "device.cert", b"certificate-pem")
+    _private_file(paths.materialized_certificate_dir / "device.key", b"private-key-pem")
+    _private_file(paths.materialized_certificate_dir / "device.cert", b"certificate-pem")
 
     plan = preflight_no_start(
         paths,
         _firmware(),
         actual_module_hashes=_module_hashes(),
         required_uid=os.getuid(),
+        runtime_uid=os.getuid(),
+        runtime_gid=os.getgid(),
+        allowed_private_roots=(paths.private_root,),
         allowed_persistent_roots=(paths.persistent_root,),
         allowed_runtime_roots=(paths.runtime_dir,),
+        allowed_runtime_credential_paths=(paths.runtime_credential_dir,),
     )
 
     assert plan.certificate_material_present is True
     assert plan.start_permitted is False
-    assert plan.blocked_reason == "runtime_user_credential_handoff_unresolved"
+    assert plan.runtime_credentials_present is False
+    assert plan.blocked_reason == "runtime_credential_handoff_required"
+
+
+def test_exact_runtime_handoff_completes_identity_but_still_cannot_start(
+    tmp_path: Path,
+) -> None:
+    paths = _paths(tmp_path)
+    _private_file(paths.materialized_certificate_dir / "device.key", b"private-key-pem")
+    _private_file(paths.materialized_certificate_dir / "device.cert", b"certificate-pem")
+    paths.runtime_credential_dir.mkdir(mode=0o750)
+    paths.certificate_dir.mkdir(mode=0o750)
+    os.chown(paths.runtime_credential_dir, os.getuid(), os.getgid())
+    os.chown(paths.certificate_dir, os.getuid(), os.getgid())
+    for path, value in (
+        (paths.runtime_credential_dir / "device_id", (DEVICE_ID + "\n").encode()),
+        (paths.bootstrap_path, b"opaque-bootstrap"),
+        (paths.certificate_dir / "device.key", b"private-key-pem"),
+        (paths.certificate_dir / "device.cert", b"certificate-pem"),
+    ):
+        path.write_bytes(value)
+        path.chmod(0o640)
+        os.chown(path, os.getuid(), os.getgid())
+
+    plan = preflight_no_start(
+        paths,
+        _firmware(),
+        actual_module_hashes=_module_hashes(),
+        required_uid=os.getuid(),
+        runtime_uid=os.getuid(),
+        runtime_gid=os.getgid(),
+        allowed_private_roots=(paths.private_root,),
+        allowed_persistent_roots=(paths.persistent_root,),
+        allowed_runtime_roots=(paths.runtime_dir,),
+        allowed_runtime_credential_paths=(paths.runtime_credential_dir,),
+    )
+
+    assert plan.certificate_material_present is True
+    assert plan.runtime_credentials_present is True
+    assert plan.runtime_user_handoff_complete is True
+    assert plan.identity_contract_complete is True
+    assert plan.start_permitted is False
+    assert plan.blocked_reason == "nonroot_emperor_launcher_not_implemented"
+
+
+def test_runtime_handoff_must_match_private_sources_and_remain_group_read_only(
+    tmp_path: Path,
+) -> None:
+    paths = _paths(tmp_path)
+    _private_file(paths.materialized_certificate_dir / "device.key", b"private-key-pem")
+    _private_file(paths.materialized_certificate_dir / "device.cert", b"certificate-pem")
+    paths.runtime_credential_dir.mkdir(mode=0o750)
+    paths.certificate_dir.mkdir(mode=0o750)
+    os.chown(paths.runtime_credential_dir, os.getuid(), os.getgid())
+    os.chown(paths.certificate_dir, os.getuid(), os.getgid())
+    for path, value in (
+        (paths.runtime_credential_dir / "device_id", (DEVICE_ID + "\n").encode()),
+        (paths.bootstrap_path, b"wrong-bootstrap"),
+        (paths.certificate_dir / "device.key", b"private-key-pem"),
+        (paths.certificate_dir / "device.cert", b"certificate-pem"),
+    ):
+        path.write_bytes(value)
+        path.chmod(0o640)
+        os.chown(path, os.getuid(), os.getgid())
+
+    with pytest.raises(LauncherPreflightError, match="bootstrap does not match"):
+        preflight_no_start(
+            paths,
+            _firmware(),
+            actual_module_hashes=_module_hashes(),
+            required_uid=os.getuid(),
+            runtime_uid=os.getuid(),
+            runtime_gid=os.getgid(),
+            allowed_private_roots=(paths.private_root,),
+            allowed_persistent_roots=(paths.persistent_root,),
+            allowed_runtime_roots=(paths.runtime_dir,),
+            allowed_runtime_credential_paths=(paths.runtime_credential_dir,),
+        )
+
+    paths.bootstrap_path.write_bytes(b"opaque-bootstrap")
+    paths.bootstrap_path.chmod(0o640)
+    (paths.certificate_dir / "device.key").chmod(0o600)
+    with pytest.raises(LauncherPreflightError, match="runtime device.key.*0640"):
+        preflight_no_start(
+            paths,
+            _firmware(),
+            actual_module_hashes=_module_hashes(),
+            required_uid=os.getuid(),
+            runtime_uid=os.getuid(),
+            runtime_gid=os.getgid(),
+            allowed_private_roots=(paths.private_root,),
+            allowed_persistent_roots=(paths.persistent_root,),
+            allowed_runtime_roots=(paths.runtime_dir,),
+            allowed_runtime_credential_paths=(paths.runtime_credential_dir,),
+        )
 
 
 def test_rejects_physical_socket_shared_or_colliding_paths(tmp_path: Path) -> None:
@@ -336,18 +546,26 @@ def test_rejects_physical_socket_shared_or_colliding_paths(tmp_path: Path) -> No
             _firmware(),
             actual_module_hashes=_module_hashes(),
             required_uid=os.getuid(),
+            runtime_uid=os.getuid(),
+            runtime_gid=os.getgid(),
+            allowed_private_roots=(paths.private_root,),
             allowed_persistent_roots=(paths.persistent_root,),
             allowed_runtime_roots=(paths.runtime_dir,),
+            allowed_runtime_credential_paths=(paths.runtime_credential_dir,),
         )
 
     with pytest.raises(LauncherPreflightError, match="distinct"):
         preflight_no_start(
-            replace(paths, state_dir=paths.certificate_dir),
+            replace(paths, state_dir=paths.process_config_dir),
             _firmware(),
             actual_module_hashes=_module_hashes(),
             required_uid=os.getuid(),
+            runtime_uid=os.getuid(),
+            runtime_gid=os.getgid(),
+            allowed_private_roots=(paths.private_root,),
             allowed_persistent_roots=(paths.persistent_root,),
             allowed_runtime_roots=(paths.runtime_dir,),
+            allowed_runtime_credential_paths=(paths.runtime_credential_dir,),
         )
 
     with pytest.raises(LauncherPreflightError, match="distinct"):
@@ -356,8 +574,12 @@ def test_rejects_physical_socket_shared_or_colliding_paths(tmp_path: Path) -> No
             _firmware(),
             actual_module_hashes=_module_hashes(),
             required_uid=os.getuid(),
+            runtime_uid=os.getuid(),
+            runtime_gid=os.getgid(),
+            allowed_private_roots=(paths.private_root,),
             allowed_persistent_roots=(paths.persistent_root,),
             allowed_runtime_roots=(paths.runtime_dir,),
+            allowed_runtime_credential_paths=(paths.runtime_credential_dir,),
         )
 
 
@@ -371,8 +593,12 @@ def test_rejects_symlink_broad_mode_nonempty_dirs_and_existing_socket(tmp_path: 
             _firmware(),
             actual_module_hashes=_module_hashes(),
             required_uid=os.getuid(),
+            runtime_uid=os.getuid(),
+            runtime_gid=os.getgid(),
+            allowed_private_roots=(paths.private_root,),
             allowed_persistent_roots=(paths.persistent_root,),
             allowed_runtime_roots=(paths.runtime_dir,),
+            allowed_runtime_credential_paths=(paths.runtime_credential_dir,),
         )
 
     paths = _paths(tmp_path / "mode")
@@ -383,8 +609,12 @@ def test_rejects_symlink_broad_mode_nonempty_dirs_and_existing_socket(tmp_path: 
             _firmware(),
             actual_module_hashes=_module_hashes(),
             required_uid=os.getuid(),
+            runtime_uid=os.getuid(),
+            runtime_gid=os.getgid(),
+            allowed_private_roots=(paths.private_root,),
             allowed_persistent_roots=(paths.persistent_root,),
             allowed_runtime_roots=(paths.runtime_dir,),
+            allowed_runtime_credential_paths=(paths.runtime_credential_dir,),
         )
 
     paths = _paths(tmp_path / "nonempty")
@@ -395,8 +625,12 @@ def test_rejects_symlink_broad_mode_nonempty_dirs_and_existing_socket(tmp_path: 
             _firmware(),
             actual_module_hashes=_module_hashes(),
             required_uid=os.getuid(),
+            runtime_uid=os.getuid(),
+            runtime_gid=os.getgid(),
+            allowed_private_roots=(paths.private_root,),
             allowed_persistent_roots=(paths.persistent_root,),
             allowed_runtime_roots=(paths.runtime_dir,),
+            allowed_runtime_credential_paths=(paths.runtime_credential_dir,),
         )
 
     paths = _paths(tmp_path / "socket")
@@ -407,8 +641,12 @@ def test_rejects_symlink_broad_mode_nonempty_dirs_and_existing_socket(tmp_path: 
             _firmware(),
             actual_module_hashes=_module_hashes(),
             required_uid=os.getuid(),
+            runtime_uid=os.getuid(),
+            runtime_gid=os.getgid(),
+            allowed_private_roots=(paths.private_root,),
             allowed_persistent_roots=(paths.persistent_root,),
             allowed_runtime_roots=(paths.runtime_dir,),
+            allowed_runtime_credential_paths=(paths.runtime_credential_dir,),
         )
 
     paths = _paths(tmp_path / "stats-socket")
@@ -419,8 +657,12 @@ def test_rejects_symlink_broad_mode_nonempty_dirs_and_existing_socket(tmp_path: 
             _firmware(),
             actual_module_hashes=_module_hashes(),
             required_uid=os.getuid(),
+            runtime_uid=os.getuid(),
+            runtime_gid=os.getgid(),
+            allowed_private_roots=(paths.private_root,),
             allowed_persistent_roots=(paths.persistent_root,),
             allowed_runtime_roots=(paths.runtime_dir,),
+            allowed_runtime_credential_paths=(paths.runtime_credential_dir,),
         )
 
     paths = _paths(tmp_path / "flagfiles")
@@ -431,8 +673,12 @@ def test_rejects_symlink_broad_mode_nonempty_dirs_and_existing_socket(tmp_path: 
             _firmware(),
             actual_module_hashes=_module_hashes(),
             required_uid=os.getuid(),
+            runtime_uid=os.getuid(),
+            runtime_gid=os.getgid(),
+            allowed_private_roots=(paths.private_root,),
             allowed_persistent_roots=(paths.persistent_root,),
             allowed_runtime_roots=(paths.runtime_dir,),
+            allowed_runtime_credential_paths=(paths.runtime_credential_dir,),
         )
 
 
@@ -447,8 +693,12 @@ def test_read_only_runtime_metadata_must_be_regular_bounded_and_private(
             _firmware(),
             actual_module_hashes=_module_hashes(),
             required_uid=os.getuid(),
+            runtime_uid=os.getuid(),
+            runtime_gid=os.getgid(),
+            allowed_private_roots=(paths.private_root,),
             allowed_persistent_roots=(paths.persistent_root,),
             allowed_runtime_roots=(paths.runtime_dir,),
+            allowed_runtime_credential_paths=(paths.runtime_credential_dir,),
         )
 
     paths = _paths(tmp_path / "symlink")
@@ -460,8 +710,12 @@ def test_read_only_runtime_metadata_must_be_regular_bounded_and_private(
             _firmware(),
             actual_module_hashes=_module_hashes(),
             required_uid=os.getuid(),
+            runtime_uid=os.getuid(),
+            runtime_gid=os.getgid(),
+            allowed_private_roots=(paths.private_root,),
             allowed_persistent_roots=(paths.persistent_root,),
             allowed_runtime_roots=(paths.runtime_dir,),
+            allowed_runtime_credential_paths=(paths.runtime_credential_dir,),
         )
 
 
@@ -474,8 +728,12 @@ def test_identity_contract_is_exact_private_and_self_consistent(tmp_path: Path) 
             _firmware(),
             actual_module_hashes=_module_hashes(),
             required_uid=os.getuid(),
+            runtime_uid=os.getuid(),
+            runtime_gid=os.getgid(),
+            allowed_private_roots=(paths.private_root,),
             allowed_persistent_roots=(paths.persistent_root,),
             allowed_runtime_roots=(paths.runtime_dir,),
+            allowed_runtime_credential_paths=(paths.runtime_credential_dir,),
         )
 
     paths = _paths(tmp_path / "metadata")
@@ -489,8 +747,12 @@ def test_identity_contract_is_exact_private_and_self_consistent(tmp_path: Path) 
             _firmware(),
             actual_module_hashes=_module_hashes(),
             required_uid=os.getuid(),
+            runtime_uid=os.getuid(),
+            runtime_gid=os.getgid(),
+            allowed_private_roots=(paths.private_root,),
             allowed_persistent_roots=(paths.persistent_root,),
             allowed_runtime_roots=(paths.runtime_dir,),
+            allowed_runtime_credential_paths=(paths.runtime_credential_dir,),
         )
 
     paths = _paths(tmp_path / "hardlink")
@@ -505,8 +767,12 @@ def test_identity_contract_is_exact_private_and_self_consistent(tmp_path: Path) 
             _firmware(),
             actual_module_hashes=_module_hashes(),
             required_uid=os.getuid(),
+            runtime_uid=os.getuid(),
+            runtime_gid=os.getgid(),
+            allowed_private_roots=(paths.private_root,),
             allowed_persistent_roots=(paths.persistent_root,),
             allowed_runtime_roots=(paths.runtime_dir,),
+            allowed_runtime_credential_paths=(paths.runtime_credential_dir,),
         )
 
 

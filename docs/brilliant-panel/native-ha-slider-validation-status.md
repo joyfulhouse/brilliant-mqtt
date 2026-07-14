@@ -101,8 +101,8 @@ not a live Virtual Control test:
 | Direct `run_as_main` start | Fails with `Attempting to bootstrap without uwsgi Emperor running`. | A direct Python runner is not a valid launcher shape. |
 | Stock `run.pre_exec` lifecycle | Before start, only `message_bus.ini` existed. After that vassal became loyal, its captured process manager created discovery and bootstrap INIs. | Preserve message-bus-first startup; do not pre-create all vassals as if they were independent. |
 | Local bus address | With only `message_bus_server_socket_path` set, discovery derived `unix://%2F...%2Fserver_socket`. Raw paths are rejected; a global override also reaches embedded RemoteBridge and makes it self-dial. | Leave `message_bus_address_override` unset for co-located vassals. |
-| Stock multi-vassal ARM smoke | The isolated socket was created and message bus became loyal; QEMU then raised target `SIGBUS` at the first client exchange, before bootstrap parsing. | This is an emulator boundary, not a firmware/bootstrap failure. The next proof requires bounded real ARM hardware. |
-| Vassal privilege generation | Nonprivileged configs contain numeric `user_override`/`group_override`; root-owned mode-`0600` PEM files are unreadable after that drop. | A dedicated runtime-user credential handoff is required; running proprietary vassals as root remains blocked. |
+| Stock multi-vassal ARM smoke | `run.pre_exec`, Emperor, and vassals ran at UID/GID `65534:65534`; mode-`0700` generated directories still yielded a loyal message bus and child INIs. QEMU then raised target `SIGBUS` at the first client exchange, before bootstrap parsing. | The entire isolated supervisor can be non-root. This is still an emulator boundary, not a firmware/bootstrap failure. |
+| Credential/privilege boundary | The stock physical unit combines a root Emperor with a mode-`0777` runtime root; root-only PEM files are unreadable after a vassal drop. | The candidate instead uses a non-root Emperor plus root-owned, dedicated-group-readable credentials. A fail-closed handoff helper now implements that file boundary off-panel. |
 | Configuration host construction | Stock `config_peripherals` groups type 16, 19, 20, and 48 config records; `device_config_peripheral` is the exact type-19 candidate. | The light pilot must select type 19 while tolerating the other stock configs; live VC behavior is still unproven. |
 | Captured PKCS#12 generator | Produces strict base64 of null-password DER containing a private key and leaf certificate whose only common name is `<device-id>.device.brilliant.tech`; no additional certificate was emitted. | The official provisioning response can be validated and converted locally without guessing its format. |
 | Certificate consumption | The runtime Web API client consumes `device.key` and `device.cert`; the CSR is a provisioning artifact, not a runtime input. | Materialize only the exact two-file PEM pair in the isolated certificate directory. |
@@ -136,6 +136,8 @@ binary and all 15 pinned launcher/configuration files matched the
 11. The stock grouped configuration host provides a type-19
     `device_config_peripheral` candidate, plus three other configuration
     records that the topology validator now handles explicitly.
+12. The full isolated Emperor/vassal tree can run as one non-root UID with its
+    generated directories tightened to mode `0700`.
 
 ## What is not confirmed
 
@@ -155,8 +157,8 @@ binary and all 15 pinned launcher/configuration files matched the
 11. Validation of an actual officially provisioned PKCS#12 and bootstrap blob.
 12. Isolated bootstrap/home assignment under the captured uWSGI runtime.
 13. Clean remote-bridge startup, peer discovery, and propagation on Office.
-14. A dedicated non-root runtime principal and reviewed transfer of only the
-    bootstrap blob and validated PEM pair to that principal.
+14. Creation/review of the actual dedicated account and service plus application
+    of the implemented credential handoff to an official identity.
 15. Safe live semantics of `stub_ble_peripheral=true` on a co-hosted panel.
 
 ## Implemented validation components
@@ -172,16 +174,18 @@ binary and all 15 pinned launcher/configuration files matched the
 | `tools.brilliant_vc.slider_binding` | Scoped own-Control read, strict `slider_config` decoding, private baseline, and exact restoration verdict | Off-panel tested; no baseline captured and no binding written |
 | `tools.brilliant_vc.e2e_acceptance` | Offline correlation of operator gesture, MQTT command/result/state, and two-panel convergence | Off-panel tested; no gestures performed or transcript collected |
 | `tools.brilliant_vc.identity_materializer` | Strict PKCS#12/device-certificate validation and exclusive, rollback-on-error creation of only `device.key` and `device.cert` | Off-panel tested with generated identities; no official identity exists |
-| `tools.brilliant_vc.launcher_preflight` | Schema-3 checks for 15 pinned launcher/configuration files, stock lifecycle/address contracts, identity, certificate pair, and the complete isolated path surface | Off-panel tested; deliberately blocks on runtime credential handoff |
+| `tools.brilliant_vc.runtime_handoff` | Revalidation and exclusive root-owned/dedicated-group-readable copy of only device ID, bootstrap, key, and certificate | Off-panel tested; no account or official identity exists and apply was not run |
+| `tools.brilliant_vc.launcher_preflight` | Schema-4 checks for 15 pinned files, non-root Emperor proof, lifecycle/address contracts, exact root/service ownership split, credentials, and isolated path surface | Off-panel tested; deliberately blocks on the absent non-root launcher after an exact handoff |
 | `tools.brilliant_vc.vassal_manifest` | Redacted four-process candidate, exact 34-process disable set, type-19 config candidate, isolated flags, and explicit blockers | Data-only; contains no command, apply, or start primitive |
 | `brilliant_mqtt.cleanup_legacy_mirror` | Dry-run-first, own-device-only stale-record cleanup | Repository `0.5.7`; not deployed or applied |
 
 The repository-safe validation helpers do not make the live experiment feasible
 by themselves. The PKCS#12-to-PEM contract, stock vassal lifecycle, local
 addressing, path surface, and candidate configuration link are now understood.
-No official VC identity exists; the runtime-user handoff and real-ARM
-bootstrap/home-assignment behavior remain unresolved. No online VC light,
-physical binding, gesture, or E2E transcript exists.
+No official VC identity exists; the account/service and real-ARM
+bootstrap/home-assignment behavior remain unresolved. The handoff is
+implemented but has nothing official to copy and has not been applied. No
+online VC light, physical binding, gesture, or E2E transcript exists.
 See the [native slider E2E runbook](runbooks/native-slider-e2e.md) for their
 scope and usage.
 
@@ -197,8 +201,8 @@ ahead by hand-writing a `slider_config` or borrowing Office's identity.
 | 3 | Obtain fresh approval for one account-visible provisioning write. | Approval names the home, Office, one disposable VC, private storage, and mandatory official removal. | **Pending step 2**. |
 | 4 | Run the guarded provisioner once. | HTTP 200; target home matches; exactly one DeviceType-6 identity appears; identity files are root-only. | **Not run**. |
 | 5 | Confirm the official app exposes a supported removal path, without submitting it. | Correct VC/home/account target is shown at final confirmation. | **Not run**. |
-| 6 | Dry-run the identity materializer, review its redacted result, then apply it locally. | Official PKCS#12 matches the exact device ID/CN, key, validity, non-CA, and size contracts; only mode-`0600` `device.key` and `device.cert` exist. | **Helper implemented; not run**. Before apply, schema-3 preflight reports `identity_materialization_required`. |
-| 7 | Implement the dedicated runtime principal/credential handoff, then run schema-3 preflight and review the no-start manifest. | All 15 hashes, four-process topology, local derived address, expanded path surface, non-root readability, and physical-path isolation pass. | **Manifest/preflight implemented; handoff intentionally absent**. After certificate materialization preflight reports `runtime_user_credential_handoff_unresolved`. |
+| 6 | Dry-run the identity materializer, review its redacted result, then apply it locally. | Official PKCS#12 matches the exact device ID/CN, key, validity, non-CA, and size contracts; only root-private mode-`0600` `device.key` and `device.cert` exist. | **Helper implemented; not run**. Before apply, schema-4 preflight reports `identity_materialization_required`. |
+| 7 | Review/create the dedicated account, dry-run/apply the credential handoff, implement/review the non-root service/launcher, then run schema-4 preflight and review the no-start manifest. | Four runtime inputs are root:`brilliant-vc` `0640`; writable roots are service-owned `0700`; Emperor and vassals stay non-root; all 15 hashes and topology/address/path checks pass. | **Handoff/manifest/preflight implemented off-panel; no account, official input, service definition, launcher, or apply**. Exact handoff advances the current blocker to `nonroot_emperor_launcher_not_implemented`. |
 | 8 | With separate live-start approval, run the bounded isolated VC under the monitor. | Correct DeviceType-6 owner joins the target home; remote bridge/discovery, peer, resource, and physical-latency limits pass. | **Not run**. |
 | 9 | Inventory only the VC-owned graph and configuration peripherals. | Owner is the provisioned DeviceType-6 ID; exactly one type-19 `device_config_peripheral` exists, while the grouped type-16, type-20, and type-48 records are merely inventoried. | **Not run**. |
 | 10 | Dry-run, then separately approve and start the one-light pilot. | One stable VC-owned `LIGHT`; valid Backyard room; retained HA authority received; tile shows online on two panels. | **Implementation exists; live blocked**. |
@@ -218,8 +222,9 @@ Do not bind the offline legacy lights. Finish the official-app portion of VC0,
 then obtain a supported provisioning-scoped token for VC1. The first live
 mutation must remain the single guarded VC provisioning call after fresh
 approval. Once an actual official identity exists, validate/materialize it,
-complete the dedicated runtime-user handoff, pass schema-3 preflight, and only
-then seek separate approval for the real-ARM bootstrap/home-assignment test.
+review the account/service, apply the implemented handoff, pass schema-4
+preflight, and only then seek separate approval to install/start the real-ARM
+bootstrap/home-assignment test.
 The first physical-slider mutation must remain the operator's native-UI binding
 after an online VC light and private original-binding snapshot exist.
 

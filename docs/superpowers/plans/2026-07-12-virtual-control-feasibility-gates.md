@@ -14,7 +14,11 @@
 - Use only an official Brilliant app/device-add workflow or a directly observed supported request made by that workflow.
 - Do not blind-guess GraphQL mutation names or production API fields.
 - Never print, log, commit, upload, or publish panel private keys, PKCS#12 material, Brilliant passwords, MFA codes, bootstrap tokens, account JWTs, refresh tokens, or certificate contents.
-- Keep returned Virtual Control identity material under `/data/brilliant-vc/identity/` with directory mode `0700` and file mode `0600`; never copy it into the repository.
+- Keep returned Virtual Control identity material under
+  `/data/brilliant-vc-private/identity/` with directory mode `0700` and file
+  mode `0600`; never copy it into the repository. Runtime inputs use the
+  separately validated root-owned credential handoff described in the current
+  runbook.
 - Never bid on or overwrite ownership of `brilliant_virtual_device`, `configuration_virtual_device`, `ble_mesh`, or a physical Control.
 - Never run the Virtual Control identity on more than one host and never implement automatic failover in this feasibility track.
 - Abort on sustained agent CPU above 15%, RSS above 100 MiB, new peer-add timeouts, Brilliant cloud-peer disconnects, operator-observed physical-control lag, or inability to prove cleanup.
@@ -162,7 +166,9 @@ SAFE_STAT_FIELDS = ("path", "exists", "uid", "gid", "mode", "size", "mtime_ns")
 SENSITIVE_PATHS = (
     "/tmp/mirror_poc/.access",
     "/tmp/mirror_poc/.vc_record.json",
-    "/data/brilliant-vc/identity",
+    "/data/brilliant-vc/identity",  # legacy path retained for prior-state detection
+    "/data/brilliant-vc-private",
+    "/data/brilliant-vc-credentials",
 )
 ```
 
@@ -280,7 +286,7 @@ git commit -m "test: verify official Virtual Control bootstrap tokens"
 - Create: `tests/test_vc_provision.py`
 
 **Interfaces:**
-- Panel CLI dry run: `python provision_panel.py --token-file PATH --property-id ID --expected-home-id ID --identity-dir /data/brilliant-vc/identity`.
+- Panel CLI dry run: `python provision_panel.py --token-file PATH --property-id ID --expected-home-id ID --identity-dir /data/brilliant-vc-private/identity`.
 - Live CLI adds: `--apply --approval-file /run/brilliant-vc-approval.json`.
 - Uses shipped `WebAPIProvisioningClient.get_virtual_control_self_bootstrap(home_property_id, token)` against `https://web-api.brilliant.tech` through the panel's device-cert session.
 
@@ -469,7 +475,7 @@ VC4 PASS requires: no abort, no new peer-add timeout/cloud disconnect/reconnect 
 - Modify: `docs/brilliant-panel/runbooks/virtual-control-gates.md`
 
 **Interfaces:**
-- CLI on Office: `python -m tools.brilliant_vc.single_light_pilot --vc-identity-dir /data/brilliant-vc/identity --topology-json <root-only-ignored-snapshot> --ledger <ignored-ledger> --run-id <same-ledger-run-id> --stable-id <uuid> --display-name "HA VC Pilot Light" --room-id <catalog-id> --office-device-id <physical-id> --vc-socket /run/brilliant-vc/server_socket --runtime-s 1800`.
+- CLI on Office: `python -m tools.brilliant_vc.single_light_pilot --vc-identity-dir /data/brilliant-vc-private/identity --topology-json <root-only-ignored-snapshot> --ledger <ignored-ledger> --run-id <same-ledger-run-id> --stable-id <uuid> --display-name "HA VC Pilot Light" --room-id <catalog-id> --office-device-id <physical-id> --vc-socket /run/brilliant-vc/server_socket --runtime-s 1800`.
 - Exactly one `PeripheralHost`, one LIGHT peripheral, one registration at a time, and one MQTT entity command/state route.
 
 - [ ] **Step 1: Write failing schema/guard/lifecycle tests with firmware fakes**
@@ -616,7 +622,7 @@ Summarize every gate status, firmware/app versions, topology classification, lat
 
 - [ ] **Step 3: Remove the disposable VC through the official app**
 
-Stop the runtime, confirm no hosted peripherals, remove the VC through the already-proven official path, verify account/home graph absence from a second snapshot, then securely delete `/data/brilliant-vc/identity/` and `/run/brilliant-vc-approval.json` on Office. Record counts, modes, and absence only. A failed removal changes the decision to `rejected`.
+Stop the runtime, confirm no hosted peripherals, remove the VC through the already-proven official path, verify account/home graph absence from a second snapshot, then securely delete `/data/brilliant-vc-private/`, `/data/brilliant-vc-credentials/`, and `/run/brilliant-vc-approval.json` on Office. Record counts, modes, and absence only. A failed removal changes the decision to `rejected`.
 
 - [ ] **Step 4: Run repository secret and artifact scans**
 

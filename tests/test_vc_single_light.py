@@ -263,7 +263,7 @@ def test_live_pilot_lease_uses_a_root_control_dir_not_the_service_socket_dir() -
     args = _parser().parse_args(
         [
             "--vc-identity-dir",
-            "/data/brilliant-vc/identity",
+            "/data/brilliant-vc-private/identity",
             "--topology-json",
             "/data/brilliant-vc/evidence/topology.json",
             "--ledger",

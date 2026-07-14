@@ -9,17 +9,20 @@ topology, then reports the next unresolved contract without starting anything.
 from __future__ import annotations
 
 import argparse
+import grp
 import hashlib
 import json
 import os
+import pwd
 import re
+import secrets
 import stat
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 _PINNED_FIRMWARE = "v26.06.03.1"
 _PINNED_HASHES = {
     "bridge.remote_bridge": ("94ac32df6184814950cc5bc3ebeac828518b858f8fd6ce76380b67f20ccf20e4"),
@@ -61,6 +64,15 @@ _RUNNER_PARAMETERS = frozenset({"startable_config", "module_name_override"})
 _BOOTSTRAP_FIELDS = frozenset({"target_home_id", "server_authentication_token", "wifi_variables"})
 _IDENTITY_FILES = frozenset({"device_id", "pkcs12_certificate", "bootstrap", "metadata.json"})
 _CERTIFICATE_FILES = frozenset({"device.key", "device.cert"})
+_RUNTIME_CREDENTIAL_ENTRIES = frozenset({"device_id", "bootstrap", "certificates"})
+_RUNTIME_CREDENTIAL_LAYOUT = frozenset(
+    {
+        "device_id",
+        "bootstrap",
+        "certificates/device.key",
+        "certificates/device.cert",
+    }
+)
 _REMOTE_BRIDGE_PARAMETERS = frozenset(
     {
         "listen_port",
@@ -119,6 +131,8 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 _PHYSICAL_SOCKET = Path("/var/run/brilliant/server_socket")
 _DEFAULT_PERSISTENT_ROOTS = (Path("/data/brilliant-vc"),)
+_DEFAULT_PRIVATE_ROOTS = (Path("/data/brilliant-vc-private"),)
+_DEFAULT_RUNTIME_CREDENTIAL_PATHS = (Path("/data/brilliant-vc-credentials"),)
 _DEFAULT_RUNTIME_ROOTS = (Path("/run/brilliant-vc"), Path("/var/run/brilliant-vc"))
 _PROTECTED_ROOTS = (
     Path("/var/device_variables"),
@@ -183,6 +197,7 @@ _PINNED_MODULE_PATHS = {
 }
 _MAX_IDENTITY_BYTES = 1024 * 1024
 _MAX_METADATA_BYTES = 64 * 1024
+_MAX_PEM_BYTES = 128 * 1024
 _MAX_MODULE_BYTES = 64 * 1024 * 1024
 
 
@@ -194,8 +209,12 @@ class LauncherPreflightError(ValueError):
 class LauncherPaths:
     """Every path that a future launcher would be permitted to use."""
 
+    private_root: Path
     persistent_root: Path
     identity_dir: Path
+    materialized_certificate_dir: Path
+    runtime_credential_dir: Path
+    bootstrap_path: Path
     state_dir: Path
     certificate_dir: Path
     process_config_dir: Path
@@ -222,10 +241,12 @@ class NoStartPlan:
     private_modes_valid: bool
     empty_runtime_paths: bool
     certificate_material_present: bool
+    runtime_credentials_present: bool
     identity_file_count: int
     device_id_redacted: str
     uwsgi_contract_confirmed: bool
     stock_process_manager_lifecycle_confirmed: bool
+    nonroot_emperor_confirmed: bool
     direct_runner_rejected: bool
     identity_contract_complete: bool
     full_path_surface_validated: bool
@@ -244,12 +265,14 @@ class NoStartPlan:
             "private_modes_valid": self.private_modes_valid,
             "empty_runtime_paths": self.empty_runtime_paths,
             "certificate_material_present": self.certificate_material_present,
+            "runtime_credentials_present": self.runtime_credentials_present,
             "identity_file_count": self.identity_file_count,
             "device_id_redacted": self.device_id_redacted,
             "uwsgi_contract_confirmed": self.uwsgi_contract_confirmed,
             "stock_process_manager_lifecycle_confirmed": (
                 self.stock_process_manager_lifecycle_confirmed
             ),
+            "nonroot_emperor_confirmed": self.nonroot_emperor_confirmed,
             "direct_runner_rejected": self.direct_runner_rejected,
             "identity_contract_complete": self.identity_contract_complete,
             "full_path_surface_validated": self.full_path_surface_validated,
@@ -267,8 +290,12 @@ def preflight_no_start(
     *,
     actual_module_hashes: Mapping[str, object],
     required_uid: int = 0,
+    runtime_uid: int | None = None,
+    runtime_gid: int | None = None,
+    allowed_private_roots: Sequence[Path] = _DEFAULT_PRIVATE_ROOTS,
     allowed_persistent_roots: Sequence[Path] = _DEFAULT_PERSISTENT_ROOTS,
     allowed_runtime_roots: Sequence[Path] = _DEFAULT_RUNTIME_ROOTS,
+    allowed_runtime_credential_paths: Sequence[Path] = _DEFAULT_RUNTIME_CREDENTIAL_PATHS,
 ) -> NoStartPlan:
     """Validate known prerequisites without creating a runnable launch command."""
 
@@ -276,11 +303,17 @@ def preflight_no_start(
     actual_hashes = _hash_inventory(actual_module_hashes, "actual module hash")
     if actual_hashes != _PINNED_HASHES:
         raise LauncherPreflightError("actual module hash drift blocks the launcher")
-    certificate_material_present = _validate_path_topology(
+    if runtime_uid is None or runtime_gid is None:
+        raise LauncherPreflightError("dedicated runtime identity is required")
+    certificate_material_present, runtime_credentials_present = _validate_path_topology(
         paths,
         required_uid=required_uid,
+        runtime_uid=runtime_uid,
+        runtime_gid=runtime_gid,
+        allowed_private_roots=allowed_private_roots,
         allowed_persistent_roots=allowed_persistent_roots,
         allowed_runtime_roots=allowed_runtime_roots,
+        allowed_runtime_credential_paths=allowed_runtime_credential_paths,
     )
     redacted_device_id = _validate_identity(paths.identity_dir, required_uid=required_uid)
     return NoStartPlan(
@@ -291,21 +324,27 @@ def preflight_no_start(
         private_modes_valid=True,
         empty_runtime_paths=True,
         certificate_material_present=certificate_material_present,
+        runtime_credentials_present=runtime_credentials_present,
         identity_file_count=len(_IDENTITY_FILES),
         device_id_redacted=redacted_device_id,
         uwsgi_contract_confirmed=True,
         stock_process_manager_lifecycle_confirmed=True,
+        nonroot_emperor_confirmed=True,
         direct_runner_rejected=True,
-        identity_contract_complete=False,
+        identity_contract_complete=runtime_credentials_present,
         full_path_surface_validated=True,
         candidate_manifest_present=True,
-        runtime_user_handoff_complete=False,
+        runtime_user_handoff_complete=runtime_credentials_present,
         launcher_implementation_present=False,
         start_permitted=False,
         blocked_reason=(
-            "runtime_user_credential_handoff_unresolved"
-            if certificate_material_present
-            else "identity_materialization_required"
+            "nonroot_emperor_launcher_not_implemented"
+            if runtime_credentials_present
+            else (
+                "runtime_credential_handoff_required"
+                if certificate_material_present
+                else "identity_materialization_required"
+            )
         ),
     )
 
@@ -334,6 +373,11 @@ def _validate_firmware_snapshot(snapshot: Mapping[str, object]) -> None:
         "local_message_bus_address_override",
         "vassal_user_fields",
         "runtime_path_flags",
+        "candidate_supervisor_mode",
+        "candidate_root_emperor_permitted",
+        "candidate_generated_directory_mode",
+        "runtime_credential_layout",
+        "runtime_credential_access",
     }
     if set(snapshot) != expected_fields or snapshot.get("schema_version") != _SCHEMA_VERSION:
         raise LauncherPreflightError("firmware snapshot schema is invalid")
@@ -370,6 +414,9 @@ def _validate_firmware_snapshot(snapshot: Mapping[str, object]) -> None:
     runtime_path_flags = _parameter_set(
         snapshot["runtime_path_flags"], "runtime path flag contract"
     )
+    runtime_credential_layout = _literal_set(
+        snapshot["runtime_credential_layout"], "runtime credential layout"
+    )
     if (
         not _MESSAGE_BUS_PARAMETERS <= message_bus_parameters
         or not _RUNNER_PARAMETERS <= runner_parameters
@@ -395,6 +442,11 @@ def _validate_firmware_snapshot(snapshot: Mapping[str, object]) -> None:
         or snapshot["local_message_bus_address_override"] is not None
         or vassal_user_fields != _VASSAL_USER_FIELDS
         or runtime_path_flags != _RUNTIME_PATH_FLAGS
+        or snapshot["candidate_supervisor_mode"] != "dedicated_nonroot_emperor"
+        or snapshot["candidate_root_emperor_permitted"] is not False
+        or snapshot["candidate_generated_directory_mode"] != "0700"
+        or runtime_credential_layout != _RUNTIME_CREDENTIAL_LAYOUT
+        or snapshot["runtime_credential_access"] != "root_owner_dedicated_group_read_only"
     ):
         raise LauncherPreflightError("firmware runtime contract drift blocks the launcher")
 
@@ -442,35 +494,99 @@ def _validate_path_topology(
     paths: LauncherPaths,
     *,
     required_uid: int,
+    runtime_uid: int,
+    runtime_gid: int,
+    allowed_private_roots: Sequence[Path],
     allowed_persistent_roots: Sequence[Path],
     allowed_runtime_roots: Sequence[Path],
-) -> bool:
+    allowed_runtime_credential_paths: Sequence[Path],
+) -> tuple[bool, bool]:
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in (required_uid, runtime_uid, runtime_gid)
+    ):
+        raise LauncherPreflightError("orchestrator or runtime identity is invalid")
+    if runtime_uid == 0 or runtime_gid == 0:
+        raise LauncherPreflightError("runtime supervisor identity must be non-root")
     physical_socket = _PHYSICAL_SOCKET.resolve(strict=False)
     socket = paths.socket_path.resolve(strict=False)
     stats_socket = paths.stats_socket_path.resolve(strict=False)
     if socket == physical_socket or stats_socket == physical_socket:
         raise LauncherPreflightError("refusing the physical Control message-bus socket")
 
-    persistent_root = _private_directory(
+    private_root = _owned_directory(
+        paths.private_root,
+        description="private root",
+        required_uid=required_uid,
+        required_gid=None,
+        required_mode=0o700,
+    )
+    if private_root not in {root.resolve(strict=False) for root in allowed_private_roots}:
+        raise LauncherPreflightError("private root is outside the allowed VC roots")
+    identity_dir = _owned_directory(
+        paths.identity_dir,
+        description="identity directory",
+        required_uid=required_uid,
+        required_gid=None,
+        required_mode=0o700,
+    )
+    materialized_certificate_dir = _owned_directory(
+        paths.materialized_certificate_dir,
+        description="materialized certificate directory",
+        required_uid=required_uid,
+        required_gid=None,
+        required_mode=0o700,
+    )
+    if (
+        identity_dir.parent != private_root
+        or materialized_certificate_dir.parent != private_root
+        or identity_dir == materialized_certificate_dir
+    ):
+        raise LauncherPreflightError(
+            "private identity and materialized certificates must be distinct direct children"
+        )
+
+    persistent_root = _owned_directory(
         paths.persistent_root,
         description="persistent root",
-        required_uid=required_uid,
+        required_uid=runtime_uid,
+        required_gid=runtime_gid,
+        required_mode=0o700,
     )
-    runtime_root = _private_directory(
+    runtime_root = _owned_directory(
         paths.runtime_dir,
         description="runtime root",
-        required_uid=required_uid,
+        required_uid=runtime_uid,
+        required_gid=runtime_gid,
+        required_mode=0o700,
     )
     if persistent_root not in {root.resolve(strict=False) for root in allowed_persistent_roots}:
         raise LauncherPreflightError("persistent root is outside the allowed VC roots")
     if runtime_root not in {root.resolve(strict=False) for root in allowed_runtime_roots}:
         raise LauncherPreflightError("runtime root is outside the allowed VC roots")
 
+    runtime_credential_root = paths.runtime_credential_dir.resolve(strict=False)
+    if runtime_credential_root not in {
+        path.resolve(strict=False) for path in allowed_runtime_credential_paths
+    }:
+        raise LauncherPreflightError(
+            "runtime credential root is outside the allowed VC credential paths"
+        )
+    root_pairs = (
+        (private_root, persistent_root),
+        (private_root, runtime_root),
+        (persistent_root, runtime_root),
+    )
+    if any(_paths_overlap(left, right) for left, right in root_pairs):
+        raise LauncherPreflightError("private, persistent, and runtime roots must not overlap")
+    if paths.bootstrap_path.resolve(strict=False) != runtime_credential_root / "bootstrap":
+        raise LauncherPreflightError("runtime bootstrap path is not canonical")
+    if paths.certificate_dir.resolve(strict=False) != runtime_credential_root / "certificates":
+        raise LauncherPreflightError("runtime certificate path is not canonical")
+
     resolved_directories: list[Path] = []
     for description, directory in (
-        ("identity directory", paths.identity_dir),
         ("state directory", paths.state_dir),
-        ("certificate directory", paths.certificate_dir),
         ("process-config directory", paths.process_config_dir),
         ("process-flagfile directory", paths.process_flagfile_dir),
         ("startable-config directory", paths.startable_config_dir),
@@ -478,10 +594,12 @@ def _validate_path_topology(
         ("error-log directory", paths.error_log_dir),
         ("trace directory", paths.trace_dir),
     ):
-        resolved = _private_directory(
+        resolved = _owned_directory(
             directory,
             description=description,
-            required_uid=required_uid,
+            required_uid=runtime_uid,
+            required_gid=runtime_gid,
+            required_mode=0o700,
         )
         if resolved.parent != persistent_root:
             raise LauncherPreflightError(f"{description} must be directly below persistent root")
@@ -511,11 +629,22 @@ def _validate_path_topology(
     if release_metadata == tracking_metadata:
         raise LauncherPreflightError("release and tracking metadata paths must be distinct")
 
+    for disallowed_parent in (private_root, persistent_root, runtime_root):
+        if not _paths_overlap(runtime_credential_root, disallowed_parent):
+            continue
+        raise LauncherPreflightError(
+            "runtime credentials must be outside private and service-writable roots"
+        )
+
     protected = tuple(root.resolve(strict=False) for root in _PROTECTED_ROOTS)
     for candidate in (
         *resolved_directories,
+        private_root,
+        identity_dir,
+        materialized_certificate_dir,
         persistent_root,
         runtime_root,
+        runtime_credential_root,
         socket,
         stats_socket,
     ):
@@ -538,10 +667,23 @@ def _validate_path_topology(
     ):
         if any(directory.iterdir()):
             raise LauncherPreflightError(f"{description} must be empty before launch")
-    return _validate_certificate_directory(
-        paths.certificate_dir,
+    certificate_material_present = _validate_materialized_certificate_directory(
+        paths.materialized_certificate_dir,
         required_uid=required_uid,
     )
+    runtime_credentials_present = False
+    if paths.runtime_credential_dir.exists() or paths.runtime_credential_dir.is_symlink():
+        if not certificate_material_present:
+            raise LauncherPreflightError(
+                "runtime credentials exist before materialized certificates"
+            )
+        _validate_runtime_credentials(
+            paths,
+            required_uid=required_uid,
+            runtime_gid=runtime_gid,
+        )
+        runtime_credentials_present = True
+    return certificate_material_present, runtime_credentials_present
 
 
 def _validate_readonly_metadata_file(
@@ -569,7 +711,7 @@ def _validate_readonly_metadata_file(
     return path.resolve(strict=True)
 
 
-def _validate_certificate_directory(path: Path, *, required_uid: int) -> bool:
+def _validate_materialized_certificate_directory(path: Path, *, required_uid: int) -> bool:
     entries = {entry.name: entry for entry in path.iterdir()}
     if not entries:
         return False
@@ -582,12 +724,98 @@ def _validate_certificate_directory(path: Path, *, required_uid: int) -> bool:
             certificate_path,
             description=f"materialized certificate {name}",
             required_uid=required_uid,
-            maximum_bytes=_MAX_METADATA_BYTES,
+            maximum_bytes=_MAX_PEM_BYTES,
         )
     return True
 
 
-def _private_directory(path: Path, *, description: str, required_uid: int) -> Path:
+def _validate_runtime_credentials(
+    paths: LauncherPaths,
+    *,
+    required_uid: int,
+    runtime_gid: int,
+) -> None:
+    runtime_root = _owned_directory(
+        paths.runtime_credential_dir,
+        description="runtime credential directory",
+        required_uid=required_uid,
+        required_gid=runtime_gid,
+        required_mode=0o750,
+    )
+    entries = {entry.name: entry for entry in runtime_root.iterdir()}
+    if set(entries) != _RUNTIME_CREDENTIAL_ENTRIES:
+        raise LauncherPreflightError("runtime credential directory has unexpected entries")
+    if entries["bootstrap"].resolve(strict=False) != paths.bootstrap_path.resolve(strict=False):
+        raise LauncherPreflightError("runtime bootstrap path changed")
+    certificate_dir = _owned_directory(
+        entries["certificates"],
+        description="runtime certificate directory",
+        required_uid=required_uid,
+        required_gid=runtime_gid,
+        required_mode=0o750,
+    )
+    if certificate_dir != paths.certificate_dir.resolve(strict=False):
+        raise LauncherPreflightError("runtime certificate path changed")
+    certificate_entries = {entry.name: entry for entry in certificate_dir.iterdir()}
+    if set(certificate_entries) != _CERTIFICATE_FILES:
+        raise LauncherPreflightError(
+            "runtime certificate directory must contain exactly device.key and device.cert"
+        )
+
+    source_paths = {
+        "device_id": paths.identity_dir / "device_id",
+        "bootstrap": paths.identity_dir / "bootstrap",
+        "device.key": paths.materialized_certificate_dir / "device.key",
+        "device.cert": paths.materialized_certificate_dir / "device.cert",
+    }
+    runtime_paths = {
+        "device_id": entries["device_id"],
+        "bootstrap": entries["bootstrap"],
+        "device.key": certificate_entries["device.key"],
+        "device.cert": certificate_entries["device.cert"],
+    }
+    for name in source_paths:
+        maximum_bytes = {
+            "bootstrap": _MAX_IDENTITY_BYTES,
+            "device_id": _MAX_METADATA_BYTES,
+            "device.key": _MAX_PEM_BYTES,
+            "device.cert": _MAX_PEM_BYTES,
+        }[name]
+        expected = _read_private_file(
+            source_paths[name],
+            required_uid=required_uid,
+            maximum_bytes=maximum_bytes,
+        )
+        if name == "device_id":
+            canonical = bytearray(bytes(expected).strip() + b"\n")
+            _wipe(expected)
+            expected = canonical
+        actual = _read_constrained_file(
+            runtime_paths[name],
+            description=f"runtime {name}",
+            required_uid=required_uid,
+            required_gid=runtime_gid,
+            required_mode=0o640,
+            maximum_bytes=maximum_bytes,
+        )
+        try:
+            if not secrets.compare_digest(actual, expected):
+                raise LauncherPreflightError(
+                    f"runtime {name} does not match its root-private source"
+                )
+        finally:
+            _wipe(actual)
+            _wipe(expected)
+
+
+def _owned_directory(
+    path: Path,
+    *,
+    description: str,
+    required_uid: int,
+    required_gid: int | None,
+    required_mode: int,
+) -> Path:
     try:
         metadata = path.lstat()
     except FileNotFoundError:
@@ -596,9 +824,26 @@ def _private_directory(path: Path, *, description: str, required_uid: int) -> Pa
         raise LauncherPreflightError(f"{description} must not be a symlink")
     if not stat.S_ISDIR(metadata.st_mode):
         raise LauncherPreflightError(f"{description} must be a directory")
-    if metadata.st_uid != required_uid or stat.S_IMODE(metadata.st_mode) != 0o700:
-        raise LauncherPreflightError(f"{description} must have the required owner and mode 0700")
+    if metadata.st_uid != required_uid or (
+        required_gid is not None and metadata.st_gid != required_gid
+    ):
+        raise LauncherPreflightError(f"{description} has the wrong owner or group")
+    if stat.S_IMODE(metadata.st_mode) != required_mode:
+        raise LauncherPreflightError(f"{description} must have mode {required_mode:04o}")
     return path.resolve(strict=True)
+
+
+def _paths_overlap(left: Path, right: Path) -> bool:
+    try:
+        left.relative_to(right)
+        return True
+    except ValueError:
+        pass
+    try:
+        right.relative_to(left)
+        return True
+    except ValueError:
+        return False
 
 
 def _validate_identity(identity_dir: Path, *, required_uid: int) -> str:
@@ -703,8 +948,72 @@ def _read_private_file(path: Path, *, required_uid: int, maximum_bytes: int) -> 
             data.extend(chunk)
             if len(data) > maximum_bytes:
                 raise LauncherPreflightError("private identity file exceeds its size bound")
+        after = os.fstat(descriptor)
+        if (
+            after.st_size != opened.st_size
+            or after.st_mtime_ns != opened.st_mtime_ns
+            or after.st_ctime_ns != opened.st_ctime_ns
+        ):
+            raise LauncherPreflightError("private identity file changed while reading")
         return data
-    except Exception:
+    except BaseException:
+        _wipe(data)
+        raise
+    finally:
+        os.close(descriptor)
+
+
+def _read_constrained_file(
+    path: Path,
+    *,
+    description: str,
+    required_uid: int,
+    required_gid: int,
+    required_mode: int,
+    maximum_bytes: int,
+) -> bytearray:
+    try:
+        before = path.lstat()
+    except FileNotFoundError:
+        raise LauncherPreflightError(f"{description} does not exist") from None
+    if stat.S_ISLNK(before.st_mode):
+        raise LauncherPreflightError(f"{description} must not be a symlink")
+    if not stat.S_ISREG(before.st_mode):
+        raise LauncherPreflightError(f"{description} must be a regular file")
+    if before.st_uid != required_uid or before.st_gid != required_gid:
+        raise LauncherPreflightError(f"{description} has the wrong owner or group")
+    if stat.S_IMODE(before.st_mode) != required_mode:
+        raise LauncherPreflightError(f"{description} must have mode {required_mode:04o}")
+    if before.st_nlink != 1:
+        raise LauncherPreflightError(f"{description} must not be a hard link")
+    if not 0 < before.st_size <= maximum_bytes:
+        raise LauncherPreflightError(f"{description} has an invalid size")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        raise LauncherPreflightError(f"could not safely open {description}") from None
+    data = bytearray()
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            raise LauncherPreflightError(f"{description} changed during open")
+        while True:
+            chunk = os.read(descriptor, min(8192, maximum_bytes + 1 - len(data)))
+            if not chunk:
+                break
+            data.extend(chunk)
+            if len(data) > maximum_bytes:
+                raise LauncherPreflightError(f"{description} exceeds its size bound")
+        after = os.fstat(descriptor)
+        if (
+            after.st_size != opened.st_size
+            or after.st_mtime_ns != opened.st_mtime_ns
+            or after.st_ctime_ns != opened.st_ctime_ns
+        ):
+            raise LauncherPreflightError(f"{description} changed while reading")
+        return data
+    except BaseException:
         _wipe(data)
         raise
     finally:
@@ -795,13 +1104,37 @@ def load_firmware_snapshot(path: Path, *, required_uid: int = 0) -> dict[str, ob
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--firmware-snapshot", type=Path, required=True)
+    parser.add_argument(
+        "--private-root",
+        type=Path,
+        default=Path("/data/brilliant-vc-private"),
+    )
     parser.add_argument("--persistent-root", type=Path, default=Path("/data/brilliant-vc"))
-    parser.add_argument("--identity-dir", type=Path, default=Path("/data/brilliant-vc/identity"))
+    parser.add_argument(
+        "--identity-dir",
+        type=Path,
+        default=Path("/data/brilliant-vc-private/identity"),
+    )
+    parser.add_argument(
+        "--materialized-certificate-dir",
+        type=Path,
+        default=Path("/data/brilliant-vc-private/materialized-certificates"),
+    )
+    parser.add_argument(
+        "--runtime-credential-dir",
+        type=Path,
+        default=Path("/data/brilliant-vc-credentials"),
+    )
+    parser.add_argument(
+        "--bootstrap-path",
+        type=Path,
+        default=Path("/data/brilliant-vc-credentials/bootstrap"),
+    )
     parser.add_argument("--state-dir", type=Path, default=Path("/data/brilliant-vc/state"))
     parser.add_argument(
         "--certificate-dir",
         type=Path,
-        default=Path("/data/brilliant-vc/certificates"),
+        default=Path("/data/brilliant-vc-credentials/certificates"),
     )
     parser.add_argument(
         "--process-config-dir",
@@ -842,8 +1175,31 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=Path,
         default=Path("/var/lib/update_manager/tracking_branch"),
     )
+    parser.add_argument("--runtime-user", default="brilliant-vc")
     args = parser.parse_args(argv)
     required_uid = os.geteuid()
+    if required_uid != 0:
+        raise LauncherPreflightError("launcher preflight must run as root")
+    if args.runtime_user != "brilliant-vc":
+        raise LauncherPreflightError("runtime user must match the pinned dedicated account")
+    try:
+        runtime_account = pwd.getpwnam(args.runtime_user)
+    except KeyError:
+        raise LauncherPreflightError("dedicated runtime account does not exist") from None
+    if runtime_account.pw_uid == 0 or runtime_account.pw_gid == 0:
+        raise LauncherPreflightError("dedicated runtime account must be non-root")
+    try:
+        runtime_group = grp.getgrgid(runtime_account.pw_gid)
+    except KeyError:
+        raise LauncherPreflightError("dedicated runtime group does not exist") from None
+    if runtime_group.gr_name != args.runtime_user:
+        raise LauncherPreflightError("runtime account must use its same-name dedicated group")
+    primary_members = {
+        entry.pw_name for entry in pwd.getpwall() if entry.pw_gid == runtime_account.pw_gid
+    }
+    supplementary_members = set(runtime_group.gr_mem)
+    if (primary_members | supplementary_members) - {args.runtime_user}:
+        raise LauncherPreflightError("runtime group must not include another account")
     snapshot = load_firmware_snapshot(
         args.firmware_snapshot,
         required_uid=required_uid,
@@ -851,8 +1207,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     actual_module_hashes = hash_firmware_modules(required_uid=required_uid)
     plan = preflight_no_start(
         LauncherPaths(
+            private_root=args.private_root,
             persistent_root=args.persistent_root,
             identity_dir=args.identity_dir,
+            materialized_certificate_dir=args.materialized_certificate_dir,
+            runtime_credential_dir=args.runtime_credential_dir,
+            bootstrap_path=args.bootstrap_path,
             state_dir=args.state_dir,
             certificate_dir=args.certificate_dir,
             process_config_dir=args.process_config_dir,
@@ -870,6 +1230,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         snapshot,
         actual_module_hashes=actual_module_hashes,
         required_uid=required_uid,
+        runtime_uid=runtime_account.pw_uid,
+        runtime_gid=runtime_account.pw_gid,
     )
     print(json.dumps(plan.to_public_dict(), sort_keys=True))
     return 0 if plan.start_permitted else 2

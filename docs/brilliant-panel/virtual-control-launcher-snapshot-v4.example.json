@@ -1,5 +1,5 @@
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "firmware_version": "v26.06.03.1",
   "runtime_sha256": {
     "bridge.remote_bridge": "94ac32df6184814950cc5bc3ebeac828518b858f8fd6ce76380b67f20ccf20e4",
@@ -94,5 +94,15 @@
     "error_log_storage_dir",
     "trace_dir",
     "art_preload_dir"
-  ]
+  ],
+  "candidate_supervisor_mode": "dedicated_nonroot_emperor",
+  "candidate_root_emperor_permitted": false,
+  "candidate_generated_directory_mode": "0700",
+  "runtime_credential_layout": [
+    "device_id",
+    "bootstrap",
+    "certificates/device.key",
+    "certificates/device.cert"
+  ],
+  "runtime_credential_access": "root_owner_dedicated_group_read_only"
 }

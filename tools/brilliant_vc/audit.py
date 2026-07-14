@@ -22,6 +22,8 @@ SENSITIVE_PATHS = (
     "/tmp/mirror_poc/.access",
     "/tmp/mirror_poc/.vc_record.json",
     "/data/brilliant-vc/identity",
+    "/data/brilliant-vc-private",
+    "/data/brilliant-vc-credentials",
 )
 
 _SNAPSHOT_FIELDS = {

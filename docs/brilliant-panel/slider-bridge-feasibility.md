@@ -163,21 +163,28 @@ executable without granting them mutation authority:
   and bounded latency. It opens no network or panel connection.
 - `tools.brilliant_vc.identity_materializer` validates the captured firmware's
   strict base64/null-password PKCS#12 contract and exclusively creates only its
-  private `device.key`/`device.cert` runtime pair with rollback on write error.
-  It has no network, bus, or process-start capability.
+  root-private `device.key`/`device.cert` pair with rollback on write error. It
+  has no network, bus, or process-start capability.
+- `tools.brilliant_vc.runtime_handoff` revalidates that pair and exclusively
+  copies only the canonical device ID, bootstrap, key, and certificate into a
+  root-owned, dedicated-group-readable tree. It has no account, service,
+  network, firmware, command, or start capability.
 - `tools.brilliant_vc.launcher_preflight` validates 15 pinned
   launcher/configuration hashes, the four-file provisioned identity contract,
-  the uWSGI Emperor requirement, the exact certificate pair, the stock process
-  lifecycle/address contract, every writable runtime directory, two distinct
-  sockets, and bounded read-only metadata. It intentionally contains no start
-  primitive and now blocks on non-root credential handoff.
+  the uWSGI Emperor requirement, the exact credential copy, the stock process
+  lifecycle/address contract, non-root supervisor contract, every writable
+  runtime directory, two distinct sockets, and bounded read-only metadata. It
+  intentionally contains no start primitive and advances an exact handoff to
+  `nonroot_emperor_launcher_not_implemented`.
 - `tools.brilliant_vc.vassal_manifest` renders the redacted four-process
   candidate, exact 34-process disable set, type-19 config candidate, and
   isolated flags. It contains no firmware import, identity read, write,
   command, apply, or start path.
 
 Network-disabled ARM execution established that a direct `run_as_main` start is
-rejected without uWSGI Emperor. A stock `run.pre_exec` smoke initially created
+rejected without uWSGI Emperor. A stock-path smoke then ran `run.pre_exec`,
+Emperor, message bus, and generated child vassals as UID/GID `65534:65534`,
+with their writable directories tightened to mode `0700`. It initially created
 only `message_bus.ini`; after that vassal became loyal, its own captured process
 manager created discovery/bootstrap INIs and the client derived the correct
 percent-encoded UNIX address. QEMU then raised target `SIGBUS` on the first

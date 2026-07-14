@@ -10,13 +10,19 @@ from tools.brilliant_vc.vassal_manifest import ManifestError, build_candidate_ma
 
 
 def _paths() -> LauncherPaths:
+    private = Path("/data/brilliant-vc-private")
     persistent = Path("/data/brilliant-vc")
+    credentials = Path("/data/brilliant-vc-credentials")
     runtime = Path("/run/brilliant-vc")
     return LauncherPaths(
+        private_root=private,
         persistent_root=persistent,
-        identity_dir=persistent / "identity",
+        identity_dir=private / "identity",
+        materialized_certificate_dir=private / "materialized-certificates",
+        runtime_credential_dir=credentials,
+        bootstrap_path=credentials / "bootstrap",
         state_dir=persistent / "state",
-        certificate_dir=persistent / "certificates",
+        certificate_dir=credentials / "certificates",
         process_config_dir=persistent / "processes",
         process_flagfile_dir=persistent / "flagfiles",
         startable_config_dir=persistent / "startable-configs",
@@ -38,6 +44,14 @@ def test_candidate_manifest_pins_stock_lifecycle_without_a_start_primitive() -> 
     assert public["schema_version"] == 1
     assert public["firmware_version"] == "v26.06.03.1"
     assert public["runtime_user"] == "brilliant-vc"
+    assert public["supervisor"] == {
+        "mode": "dedicated_nonroot_emperor",
+        "runtime_user": "brilliant-vc",
+        "runs_as_root": False,
+        "vassals_use_same_identity": True,
+        "generated_directory_mode": "0700",
+        "credential_access": "root_owner_dedicated_group_read_only",
+    }
     assert public["initial_vassals"] == ["message_bus"]
     assert public["process_manager_generated_vassals"] == [
         "discovery_peripheral",
@@ -94,12 +108,12 @@ def test_candidate_manifest_uses_local_socket_derivation_and_isolates_every_path
     assert flags["process_flagfiles_dir"] == "/data/brilliant-vc/flagfiles"
     assert flags["startable_host_configs_dir"] == "/data/brilliant-vc/startable-configs"
     assert flags["mb_state_dir"] == "/data/brilliant-vc/state"
-    assert flags["cert_dir"] == "/data/brilliant-vc/certificates"
+    assert flags["cert_dir"] == "/data/brilliant-vc-credentials/certificates"
     assert flags["log_output_directory"] == "/data/brilliant-vc/logs"
     assert flags["error_log_storage_dir"] == "/data/brilliant-vc/errors"
     assert flags["trace_dir"] == "/data/brilliant-vc/traces"
     assert flags["uwsgi_stats_socket_path"] == "/run/brilliant-vc/uwsgi_stats_socket"
-    assert flags["saved_bootstrap_parameters_path"] == "/data/brilliant-vc/identity/bootstrap"
+    assert flags["saved_bootstrap_parameters_path"] == "/data/brilliant-vc-credentials/bootstrap"
     assert flags["release_info_filepath"] == "/etc/release_info.json"
     assert flags["tracking_branch_filepath"] == "/var/lib/update_manager/tracking_branch"
     assert flags["remote_bridge_listen_port"] == 15455
@@ -117,7 +131,8 @@ def test_candidate_manifest_keeps_live_blockers_explicit() -> None:
     public = build_candidate_manifest(_paths()).to_public_dict()
 
     assert public["blockers"] == [
-        "runtime_user_credential_handoff_unresolved",
+        "runtime_credential_handoff_not_applied",
+        "nonroot_emperor_launcher_not_implemented",
         "arm_hardware_bootstrap_validation_required",
         "config_peripherals_live_validation_required",
         "remote_bridge_stub_live_validation_required",
@@ -130,6 +145,8 @@ def test_candidate_manifest_keeps_live_blockers_explicit() -> None:
     [
         ("socket_path", Path("/var/run/brilliant/server_socket"), "physical"),
         ("stats_socket_path", Path("/run/brilliant-vc/server_socket"), "distinct"),
+        ("bootstrap_path", Path("/data/brilliant-vc-private/bootstrap"), "credential"),
+        ("certificate_dir", Path("/data/brilliant-vc/certificates"), "credential"),
     ],
 )
 def test_manifest_rejects_physical_or_colliding_runtime_paths(

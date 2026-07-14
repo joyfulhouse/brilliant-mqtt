@@ -65,11 +65,13 @@ Do not select a slider until every item passes:
    approval gate.
 3. The identity materializer passes first in dry-run mode and then creates only
    the exact private `device.key`/`device.cert` pair.
-4. Schema-3 no-start preflight confirms the 15 pinned launcher/configuration
-   files, stock message-bus-first lifecycle, complete path surface, and
-   direct-runner rejection. It no longer reports
-   `identity_materialization_required` or
-   `runtime_user_credential_handoff_unresolved`.
+4. The dedicated non-root account exists, the root-private identity has passed
+   the credential handoff, and schema-4 no-start preflight confirms the 15
+   pinned launcher/configuration files, message-bus-first lifecycle, exact
+   ownership/path surface, and direct-runner rejection. It reports
+   `runtime_credentials_present=true` and has advanced to
+   `nonroot_emperor_launcher_not_implemented` before the separately reviewed
+   launcher is installed.
 5. The bounded VC runtime and monitor pass with no physical-panel regression.
 6. Exactly one VC-owned type-27 `LIGHT` exists, its
    `configuration_peripheral_id` resolves to the VC's own type-19

@@ -484,12 +484,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--identity-dir",
         type=Path,
-        default=Path("/data/brilliant-vc/identity"),
+        default=Path("/data/brilliant-vc-private/identity"),
     )
     parser.add_argument(
         "--certificate-dir",
         type=Path,
-        default=Path("/data/brilliant-vc/certificates"),
+        default=Path("/data/brilliant-vc-private/materialized-certificates"),
     )
     parser.add_argument("--apply", action="store_true")
     args = parser.parse_args(argv)

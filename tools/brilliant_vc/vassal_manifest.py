@@ -85,7 +85,8 @@ _EMBEDDED_STARTABLES = {
     ),
 }
 _BLOCKERS = (
-    "runtime_user_credential_handoff_unresolved",
+    "runtime_credential_handoff_not_applied",
+    "nonroot_emperor_launcher_not_implemented",
     "arm_hardware_bootstrap_validation_required",
     "config_peripherals_live_validation_required",
     "remote_bridge_stub_live_validation_required",
@@ -122,7 +123,7 @@ class CandidateManifest:
             # server socket. A global override would also make RemoteBridge
             # dial its own message bus and is intentionally absent.
             "message_bus_address_override": None,
-            "saved_bootstrap_parameters_path": str(paths.identity_dir / "bootstrap"),
+            "saved_bootstrap_parameters_path": str(paths.bootstrap_path),
             "release_info_filepath": str(paths.release_info_path),
             "tracking_branch_filepath": str(paths.tracking_branch_path),
             "uwsgi_stats_socket_path": str(paths.stats_socket_path),
@@ -148,6 +149,14 @@ class CandidateManifest:
             "firmware_version": _PINNED_FIRMWARE,
             "candidate_only": True,
             "runtime_user": _RUNTIME_USER,
+            "supervisor": {
+                "mode": "dedicated_nonroot_emperor",
+                "runtime_user": _RUNTIME_USER,
+                "runs_as_root": False,
+                "vassals_use_same_identity": True,
+                "generated_directory_mode": "0700",
+                "credential_access": "root_owner_dedicated_group_read_only",
+            },
             "initial_vassals": ["message_bus"],
             "process_manager_generated_vassals": list(_PROCESS_MANAGER_GENERATED),
             "enabled_processes": list(_ENABLED_PROCESSES),
@@ -178,12 +187,18 @@ def build_candidate_manifest(
     socket = paths.socket_path.resolve(strict=False)
     stats_socket = paths.stats_socket_path.resolve(strict=False)
     runtime = paths.runtime_dir.resolve(strict=False)
+    credential_root = paths.runtime_credential_dir.resolve(strict=False)
     if socket == _PHYSICAL_SOCKET.resolve(strict=False):
         raise ManifestError("refusing the physical Control message-bus socket")
     if socket == stats_socket:
         raise ManifestError("message-bus and stats sockets must be distinct")
     if socket.parent != runtime or stats_socket.parent != runtime:
         raise ManifestError("candidate sockets must be direct children of the runtime directory")
+    if (
+        paths.bootstrap_path.resolve(strict=False) != credential_root / "bootstrap"
+        or paths.certificate_dir.resolve(strict=False) != credential_root / "certificates"
+    ):
+        raise ManifestError("runtime credential paths must use the canonical isolated layout")
     if (
         isinstance(remote_bridge_port, bool)
         or not isinstance(remote_bridge_port, int)

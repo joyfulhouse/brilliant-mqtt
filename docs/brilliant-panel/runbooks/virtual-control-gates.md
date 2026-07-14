@@ -13,8 +13,10 @@ experiment authorizes a later production design; it is not a deployment.
 - Never print or copy a token, private key, certificate, PKCS#12 value,
   bootstrap blob, password, home ID, or unredacted device ID into repository
   output.
-- Identity material stays on Office under `/data/brilliant-vc/identity` with a
-  `0700` directory and `0600` files.
+- Raw identity material stays on Office under
+  `/data/brilliant-vc-private/identity` with a `0700` directory and `0600`
+  files. Only the four reviewed runtime inputs may cross into the separate
+  root-owned credential tree.
 - A live process is bounded and supervised. Abort on physical-control lag,
   cloud-peer disconnect, bus peer timeout, sustained CPU above 15%, RSS above
   100 MiB, or uncertain cleanup.
@@ -85,7 +87,7 @@ python -m tools.brilliant_vc.provision_panel \
   --token-file <root-only-official-token> \
   --property-id <32-lowercase-hex-property-id> \
   --expected-home-id <32-lowercase-hex-home-id> \
-  --identity-dir /data/brilliant-vc/identity
+  --identity-dir /data/brilliant-vc-private/identity
 ```
 
 Only after reviewing that result and creating the exact root-owned mode-`0600`
@@ -121,14 +123,15 @@ Static analysis plus network-disabled execution of the captured ARM firmware
   `message_bus_server_socket_path`. `message_bus_address_override` must be
   absent; a global override also reaches embedded RemoteBridge and makes it
   self-dial.
-- A stock-path, non-root ARM smoke reached a loyal message bus, created the
-  isolated socket, generated discovery/bootstrap client INIs, and derived the
-  correct local URL. QEMU then raised target `SIGBUS` at the first client
-  exchange, before bootstrap parsing. This is an emulator boundary, not a
-  firmware failure.
-- Captured vassals use `user_override`/`group_override`. Root-owned mode-`0600`
-  PEMs are unreadable after the drop, so a dedicated runtime-principal
-  credential handoff is required; running the vassals as root is prohibited.
+- A stock-path ARM smoke ran `run.pre_exec`, Emperor, message bus, and child
+  vassals at UID/GID `65534:65534`. With generated directories tightened to
+  mode `0700`, message bus became loyal, created the isolated socket, generated
+  discovery/bootstrap INIs, and derived the correct local URL. QEMU then raised
+  target `SIGBUS` at the first client exchange, before bootstrap parsing. This
+  is an emulator boundary, not a firmware failure.
+- The stock physical unit combines a root Emperor with a mode-`0777` runtime
+  root. The candidate must not copy that trust boundary. Its entire isolated
+  Emperor/vassal tree runs as the dedicated non-root `brilliant-vc` identity.
 - `BootstrapParameters` contains a target home, server credential, and Wi-Fi
   map. It remains private and has not been parsed by a running official VC.
 
@@ -159,8 +162,8 @@ Dry-run first:
 
 ```text
 python -m tools.brilliant_vc.identity_materializer \
-  --identity-dir /data/brilliant-vc/identity \
-  --certificate-dir /data/brilliant-vc/certificates
+  --identity-dir /data/brilliant-vc-private/identity \
+  --certificate-dir /data/brilliant-vc-private/materialized-certificates
 ```
 
 The dry run requires exact owner/mode/link/size/schema constraints, strict
@@ -171,8 +174,8 @@ result, materialize the pair locally with:
 
 ```text
 python -m tools.brilliant_vc.identity_materializer \
-  --identity-dir /data/brilliant-vc/identity \
-  --certificate-dir /data/brilliant-vc/certificates \
+  --identity-dir /data/brilliant-vc-private/identity \
+  --certificate-dir /data/brilliant-vc-private/materialized-certificates \
   --apply
 ```
 
@@ -180,6 +183,50 @@ Apply mode exclusively creates only mode-`0600` `device.key` and `device.cert`,
 fsyncs them, refuses a non-empty output directory, and removes both outputs on a
 partial failure. It does not start the VC. No official identity currently exists,
 so neither command has been run with live material.
+
+### Non-root runtime credential handoff
+
+Do not make the raw provisioner directory readable by the service account and
+do not run Emperor as root. First review a dedicated non-root `brilliant-vc`
+account whose primary group is also named `brilliant-vc`; account/service
+creation remains a separate implementation step. The handoff tool refuses root
+or a shared/differently named primary group.
+
+Dry-run the root-private inputs and exact destination:
+
+```text
+python -m tools.brilliant_vc.runtime_handoff \
+  --private-root /data/brilliant-vc-private \
+  --identity-dir /data/brilliant-vc-private/identity \
+  --materialized-certificate-dir /data/brilliant-vc-private/materialized-certificates \
+  --runtime-credential-dir /data/brilliant-vc-credentials \
+  --runtime-user brilliant-vc
+```
+
+The dry run revalidates identity metadata plus the PEM key/certificate match,
+CN, validity, non-CA status, bounds, and destination parent. It prints only
+redacted digests and writes nothing. After reviewing that report, apply with
+the same arguments plus `--apply`.
+
+Apply exclusively creates this non-service-writable tree:
+
+```text
+/data/brilliant-vc-credentials/             root:brilliant-vc 0750
+  device_id                                 root:brilliant-vc 0640
+  bootstrap                                 root:brilliant-vc 0640
+  certificates/                             root:brilliant-vc 0750
+    device.key                              root:brilliant-vc 0640
+    device.cert                             root:brilliant-vc 0640
+```
+
+Only these four files cross the root-private boundary. The service group can
+read them but cannot replace or delete them. Exact reruns are idempotent;
+content, owner, group, mode, link, or layout drift blocks. Partial creation is
+rolled back only when the tool created that destination during the invocation.
+Each file remains owner-only mode `0600` while its contents are written and
+fsynced, then changes to its final group-readable mode.
+The tool has no firmware import, network, socket, subprocess, account creation,
+service install, command builder, or start capability.
 
 ### No-start launcher preflight
 
@@ -192,23 +239,27 @@ command builder, or start method. It validates:
   matched against both the snapshot and pinned digests;
 - the message-bus-first stock lifecycle, 38-process inventory, exact
   four-process candidate, 34-process disable count, embedded startables,
-  non-root fields, local-address mode, and remote-bridge isolation fields;
+  non-root fields, dedicated non-root Emperor proof, local-address mode, and
+  remote-bridge isolation fields;
 - exactly four provisioner outputs (`device_id`, `pkcs12_certificate`,
   `bootstrap`, and `metadata.json`) as root-owned mode-`0600` regular files;
 - device-ID/metadata consistency without opening or printing the PKCS#12 or
   bootstrap payloads;
-- distinct mode-`0700` identity, state, certificate, process-config, flagfile,
-  embedded-startable, log, error, trace, persistent-root, and runtime
-  directories;
-- empty writable runtime directories, an exact optional PEM pair, two distinct
-  nonexistent sockets, and bounded regular release/tracking metadata; and
+- a root-owned mode-`0700` private root with exact identity and optional
+  materialized PEM pair;
+- a disjoint root:`brilliant-vc` mode-`0750` credential tree whose four
+  mode-`0640` files match their root-private sources byte-for-byte;
+- service-owned mode-`0700` persistent, state, process-config, flagfile,
+  embedded-startable, log, error, trace, and runtime directories;
+- empty writable runtime directories, two distinct nonexistent sockets, and
+  bounded regular release/tracking metadata; and
 - canonical, distinct paths outside `/var/device_variables`,
   `/var/run/brilliant`, `/var/brilliant`, `/data/switch-embedded`, and the
   physical `/var/run/brilliant/server_socket`.
 
 Create a root-owned mode-`0600` sanitized introspection snapshot by copying and
 independently checking
-[`virtual-control-launcher-snapshot-v3.example.json`](../virtual-control-launcher-snapshot-v3.example.json).
+[`virtual-control-launcher-snapshot-v4.example.json`](../virtual-control-launcher-snapshot-v4.example.json).
 The example contains names, interface values, and hashes only. It contains no
 identity, token, bootstrap payload, home ID, or credential.
 
@@ -217,11 +268,15 @@ directories and run:
 
 ```text
 python -m tools.brilliant_vc.launcher_preflight \
-  --firmware-snapshot /data/brilliant-vc/evidence/firmware-launcher.json \
+  --firmware-snapshot /data/brilliant-vc-private/firmware-launcher.json \
+  --private-root /data/brilliant-vc-private \
+  --identity-dir /data/brilliant-vc-private/identity \
+  --materialized-certificate-dir /data/brilliant-vc-private/materialized-certificates \
+  --runtime-credential-dir /data/brilliant-vc-credentials \
+  --bootstrap-path /data/brilliant-vc-credentials/bootstrap \
   --persistent-root /data/brilliant-vc \
-  --identity-dir /data/brilliant-vc/identity \
   --state-dir /data/brilliant-vc/state \
-  --certificate-dir /data/brilliant-vc/certificates \
+  --certificate-dir /data/brilliant-vc-credentials/certificates \
   --process-config-dir /data/brilliant-vc/process-config \
   --process-flagfile-dir /data/brilliant-vc/flagfiles \
   --startable-config-dir /data/brilliant-vc/startable-configs \
@@ -232,29 +287,36 @@ python -m tools.brilliant_vc.launcher_preflight \
   --socket-path /run/brilliant-vc/server_socket \
   --stats-socket-path /run/brilliant-vc/uwsgi_stats_socket \
   --release-info-path /etc/release_info.json \
-  --tracking-branch-path /var/lib/update_manager/tracking_branch
+  --tracking-branch-path /var/lib/update_manager/tracking_branch \
+  --runtime-user brilliant-vc
 ```
 
 The expected result remains exit status 2 and is intentionally not VC3 PASS. In
-both states it reports `uwsgi_contract_confirmed=true`,
+all states it reports `uwsgi_contract_confirmed=true`,
 `stock_process_manager_lifecycle_confirmed=true`,
+`nonroot_emperor_confirmed=true`,
 `full_path_surface_validated=true`, `candidate_manifest_present=true`,
-`runtime_user_handoff_complete=false`, `launcher_implementation_present=false`,
-and `start_permitted=false`:
+`launcher_implementation_present=false`, and `start_permitted=false`:
 
 - before identity materialization:
   `certificate_material_present=false` and
   `blocked_reason=identity_materialization_required`;
 - after the exact private PEM pair exists:
   `certificate_material_present=true` and
-  `blocked_reason=runtime_user_credential_handoff_unresolved`.
+  `blocked_reason=runtime_credential_handoff_required`;
+- after the exact root/dedicated-group runtime copy exists:
+  `runtime_credentials_present=true`,
+  `runtime_user_handoff_complete=true`,
+  `identity_contract_complete=true`, and
+  `blocked_reason=nonroot_emperor_launcher_not_implemented`.
 
 `tools.brilliant_vc.vassal_manifest` renders the redacted four-process
 candidate and all remaining blockers. It is data-only and always reports
 `contains_start_primitive=false` and `start_permitted=false`.
 
-The next implementation blocker is a dedicated runtime principal and reviewed
-handoff of only the validated PEM pair and saved bootstrap blob. After that,
+The next implementation blocker is a reviewed service definition and bounded
+launcher that runs both `run.pre_exec` and Emperor as `brilliant-vc`, hardens
+generated directories to `0700`, and never grants root to a vassal. After that,
 real-ARM bootstrap must prove target-home assignment, the type-19 config record,
 alternate bus/bridge addresses, peer discovery, physical-hardware isolation,
 and clean stop/removal. That test needs separate approval after provisioning.
@@ -330,7 +392,7 @@ Dry run (line continuations shown only for readability):
 
 ```text
 python -m tools.brilliant_vc.single_light_pilot \
-  --vc-identity-dir /data/brilliant-vc/identity \
+  --vc-identity-dir /data/brilliant-vc-private/identity \
   --topology-json <root-only-ignored-topology.json> \
   --ledger <ignored-gate-ledger.json> \
   --run-id <same-ledger-run-id> \

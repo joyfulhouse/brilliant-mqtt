@@ -11,9 +11,10 @@ Control. It is the implementation companion to the
 The firmware contains a coherent path for an officially provisioned
 `VIRTUAL_CONTROL` (`DeviceType 6`) to own a normal `LIGHT` and therefore act as
 the native endpoint for an HA-backed slider target. The repository now has a
-redacted, deterministic candidate manifest for that runtime. It still does not
-have a safe start implementation, an official VC identity, or live proof that
-the candidate joins the home and remains online.
+redacted candidate manifest, a fail-closed credential-handoff tool, and a
+schema-4 mixed-ownership preflight for that runtime. It still does not have a
+safe start implementation, an official VC identity, or live proof that the
+candidate joins the home and remains online.
 
 The current result is therefore:
 
@@ -33,7 +34,7 @@ message bus constructs `PeripheralProcessManager`. Its `run_bootstrap()` method
 admits every enabled default process and activates embedded startables.
 
 ```text
-isolated uWSGI Emperor
+isolated non-root uWSGI Emperor (`brilliant-vc`)
   -> message_bus.ini
        -> bus.message_bus                     (priority -10, non-root)
           -> embedded remote_bridge
@@ -56,7 +57,8 @@ confirmed this sequence at runtime:
 
 The earlier manual experiment that pre-created three vassals was useful for
 isolating uWSGI behavior, but it is not the faithful launcher shape. A future
-launcher must preserve the message-bus-first transition.
+launcher must preserve the message-bus-first transition and run the Emperor
+itself as the dedicated non-root principal.
 
 ## Four-process E2E candidate
 
@@ -120,20 +122,20 @@ and never emits it as a flag.
 
 ## Runtime path surface
 
-Every writable path must be isolated from the physical Control. Schema-3
+Every writable path must be isolated from the physical Control. Schema-4
 preflight now covers all path flags observed in the generated flagfiles, not
 only state/config/socket paths:
 
 | Flag or artifact | Candidate location or rule |
 |---|---|
 | `mb_state_dir` | Dedicated persistent state directory |
-| `cert_dir` | Dedicated runtime certificate directory containing only `device.key` and `device.cert` |
-| `process_configs_dir` | Dedicated Emperor watch directory |
+| `cert_dir` | `/data/brilliant-vc-credentials/certificates`; root-owned, dedicated-group-readable, and not service-writable |
+| `process_configs_dir` | Dedicated mode-`0700` Emperor watch directory owned by `brilliant-vc` |
 | `process_flagfiles_dir` | Dedicated generated flagfile directory |
 | `startable_host_configs_dir` | Dedicated embedded-startable configuration directory |
 | `message_bus_server_socket_path` | Dedicated nonexistent socket below `/run/brilliant-vc` |
 | `uwsgi_stats_socket_path` | A second, distinct nonexistent socket below `/run/brilliant-vc` |
-| `saved_bootstrap_parameters_path` | Official private bootstrap blob; runtime ownership unresolved |
+| `saved_bootstrap_parameters_path` | `/data/brilliant-vc-credentials/bootstrap`; root-owned mode `0640`, readable only by the dedicated runtime group |
 | `log_output_directory` | Dedicated empty log directory |
 | `error_log_storage_dir` | Dedicated empty error directory |
 | `trace_dir` | Dedicated empty trace directory |
@@ -147,7 +149,7 @@ duplicate directories, either pre-existing socket, the physical
 Control's protected roots. It pins 15 launcher/configuration files, including
 the grouped configuration host and its four startables. The sanitized snapshot
 template is
-[`virtual-control-launcher-snapshot-v3.example.json`](virtual-control-launcher-snapshot-v3.example.json).
+[`virtual-control-launcher-snapshot-v4.example.json`](virtual-control-launcher-snapshot-v4.example.json).
 
 ## Privilege and credential handoff
 
@@ -159,30 +161,55 @@ user_override = 65534
 group_override = 65534
 ```
 
-The stock INI and flagfiles were mode `0644`, but the materializer correctly
-creates the private key and certificate as owner-only mode `0600`. If those
-files remain owned by root, a non-root vassal cannot read them. Running all
-vassals as root would bypass the symptom while violating the captured privilege
-model and expanding the impact of proprietary code; it remains prohibited.
+The stock physical service starts Emperor as root and makes
+`/var/run/brilliant` mode `0777`. Its dropped message bus then writes child INIs
+into the watched process directory. Copying that shape for a new service user
+would make a root Emperor consume files writable by that user. The candidate
+therefore does not use a root Emperor.
 
-The candidate pins a dedicated service account name, `brilliant-vc`, but does
-not create the account or change file ownership. Before a launcher can exist,
-a reviewed handoff must prove all of the following:
+The networkless ARM smoke was rerun with Docker UID/GID `65534:65534`, so
+`run.pre_exec`, Emperor, message bus, and child vassals all shared one non-root
+identity. After `pre_exec`, the process, flagfile, hosted-startable, and error
+directories were tightened from the stock umask result to mode `0700`.
+Message bus still became loyal, created the isolated socket, and generated the
+discovery/bootstrap INIs. This proves the non-root supervisor shape up to the
+same QEMU exchange boundary; it does not prove live home assignment.
 
-- raw provisioner outputs remain root-only;
-- only the saved bootstrap blob and validated PEM pair are copied or transferred
-  to the dedicated runtime principal;
-- state, socket, generated-process, and log directories are writable only by
-  that principal and the supervising root Emperor where required;
-- the root orchestration lock lives separately at
-  `/run/brilliant-vc-control/single-light-pilot.lock`, so the light pilot does
-  not require ownership of the service user's socket directory;
-- no physical `brilliant` service account, physical certificate directory, or
-  physical message-bus path is reused; and
-- rollback removes only the disposable VC's files.
+The repository handoff uses three disjoint roots:
 
-Until this exists, schema-3 preflight reports
-`runtime_user_credential_handoff_unresolved` after certificate materialization.
+| Root | Owner/mode | Contents and authority |
+|---|---|---|
+| `/data/brilliant-vc-private` | root, `0700` | Raw four-file provisioner output and root-only materialized PEM pair |
+| `/data/brilliant-vc-credentials` | root:`brilliant-vc`, `0750` | Canonical device ID, bootstrap, and `certificates/`; files are `0640` |
+| `/data/brilliant-vc` and `/run/brilliant-vc` | `brilliant-vc`, `0700` | Writable state, generated configs, logs, sockets, and traces |
+
+`tools.brilliant_vc.runtime_handoff` revalidates the device ID/metadata and the
+materialized key/certificate match, validity, CN, non-CA status, and bounds. A
+dry run writes nothing. Apply exclusively creates only `device_id`,
+`bootstrap`, `certificates/device.key`, and `certificates/device.cert`; it
+keeps each file owner-only until its contents are fsynced, then applies group
+read access. It fsyncs the files/directories, verifies byte equality, is
+idempotent for an exact existing copy, rejects drift, and rolls back only a
+directory it just created.
+It cannot create an account, connect to a panel, import firmware, build a
+command, or start a process.
+
+The runtime account must be a non-root `brilliant-vc` user with a same-name
+dedicated primary group. The service receives group-read access to credentials
+but cannot modify or delete them. Its writable roots are owned by that service
+identity. The root orchestration lock remains separate at
+`/run/brilliant-vc-control/single-light-pilot.lock`.
+
+Schema-4 preflight distinguishes three no-start states:
+
+1. no root-only PEM pair: `identity_materialization_required`;
+2. PEM pair present but no exact runtime copy:
+   `runtime_credential_handoff_required`; and
+3. exact handoff present: `nonroot_emperor_launcher_not_implemented`.
+
+All states retain `start_permitted=false`. The handoff implementation resolves
+the file-access design; it has not been applied to an official identity, and a
+reviewed non-root service definition/start primitive still does not exist.
 
 ## Remote-bridge hardware isolation
 
@@ -201,11 +228,13 @@ faceplate, or load-control surface.
 
 ## ARM emulator boundary
 
-The stock-lifecycle smoke ran as the non-root `nobody` UID with a synthetic
-DeviceType-6 ID, synthetic certificate, canonical serialized
-`BootstrapParameters`, no network, and no hardware. It reached these states:
+The stock-lifecycle smoke ran with the entire container and Emperor at non-root
+UID/GID `65534:65534`, using a synthetic DeviceType-6 ID, synthetic
+certificate, canonical serialized `BootstrapParameters`, no network, and no
+hardware. It reached these states:
 
 - message bus loyal: yes;
+- generated watch/flag/startable/error directories at mode `0700`: yes;
 - isolated socket created: yes;
 - discovery/bootstrap INIs generated by the captured process manager: yes;
 - discovery client derived the correct percent-encoded UNIX address: yes;
@@ -226,16 +255,23 @@ redacted manifest with:
 
 - all 38 process names and the exact 34-process disable set;
 - message-bus-first lifecycle and embedded startables;
+- a dedicated non-root Emperor sharing the vassal identity, never root;
 - the type-19 Device Configuration candidate;
-- every isolated path/port flag;
+- every isolated path/port flag and the root-group credential layout;
 - `message_bus_address_override=null`;
 - a private device-ID placeholder rather than an identity; and
 - all remaining blockers with `contains_start_primitive=false` and
   `start_permitted=false`.
 
 It has no firmware import, private-file read, subprocess, command/argv builder,
-socket, write, apply, or start method. `launcher_preflight` validates schema 3
-and the expanded path/hash surface, but also has no start primitive.
+socket, write, apply, or start method. `launcher_preflight` validates schema 4,
+the expanded path/hash surface, non-root supervisor contract, and exact
+root/service ownership split, but also has no start primitive.
+
+`tools.brilliant_vc.runtime_handoff` is the only new writer. It is limited to
+the exact isolated credential root and has no start path. The identity
+materializer now defaults to root-private source/output directories; neither
+tool writes into the service's state or runtime roots.
 
 ## Remaining live sequence
 
@@ -246,10 +282,14 @@ The remaining order is strict:
 2. Obtain fresh approval for exactly one account-visible disposable VC write
    and confirm the supported removal screen before submitting it.
 3. Provision once; validate and materialize the official identity locally.
-4. Implement and review the dedicated runtime-principal credential handoff.
-5. Pass schema-3 preflight and review the redacted candidate manifest.
-6. Obtain separate approval to start the bounded runtime on Office. The agent
-   must still not trigger a light, slider, load, or scene.
+4. Create/review the dedicated non-root account and same-name private group,
+   then dry-run, review, and apply the implemented credential handoff. Verify
+   the exact root/dedicated-group ownership without exposing contents.
+5. Implement/review the non-root supervisor service, pass schema-4 preflight,
+   and review the redacted candidate manifest. The repository still contains
+   no service definition or start primitive.
+6. Obtain separate approval to install/start the bounded runtime on Office.
+   The agent must still not trigger a light, slider, load, or scene.
 7. Observe DeviceType-6 home assignment, remote-bridge/discovery health,
    resource limits, and the exact VC-owned configuration set; stop on any
    unexpected owner or physical-device access.
