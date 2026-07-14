@@ -18,6 +18,7 @@ from tools.brilliant_vc.runtime_handoff import (
     RuntimeHandoffResult,
     handoff_runtime_credentials,
     main,
+    runtime_credential_bundle_sha256,
     validate_pem_identity,
 )
 
@@ -102,11 +103,21 @@ def test_dry_run_validates_sources_without_copying_or_exposing_identity(tmp_path
         "device_id_redacted": "aaaa…aaaa",
         "certificate_fingerprint_redacted": "bbbbbbbb…bbbbbbbb",
         "bootstrap_sha256_redacted": result.bootstrap_sha256_redacted,
+        "runtime_credential_bundle_sha256": result.runtime_credential_bundle_sha256,
     }
     public = json.dumps(result.to_public_dict())
     assert DEVICE_ID not in public
     assert "private" not in public
     assert len(result.bootstrap_sha256_redacted) == 17
+    assert result.runtime_credential_bundle_sha256 == runtime_credential_bundle_sha256(
+        {
+            "device_id": (DEVICE_ID + "\n").encode(),
+            "bootstrap": BOOTSTRAP,
+            "device.key": KEY_PEM,
+            "device.cert": CERT_PEM,
+        }
+    )
+    assert len(result.runtime_credential_bundle_sha256) == 64
 
 
 def test_apply_creates_only_root_owned_group_readable_runtime_inputs(tmp_path: Path) -> None:
@@ -350,18 +361,23 @@ def test_already_loaded_secret_buffers_are_wiped_when_a_later_read_fails(
 def test_cli_rejects_a_runtime_group_shared_with_another_account(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    account = SimpleNamespace(
+        pw_name="brilliant-vc",
+        pw_uid=1001,
+        pw_gid=1001,
+        pw_dir="/nonexistent",
+        pw_shell="/usr/sbin/nologin",
+    )
+    group = SimpleNamespace(
+        gr_name="brilliant-vc",
+        gr_gid=1001,
+        gr_mem=["another-user"],
+    )
     monkeypatch.setattr(os, "geteuid", lambda: 0)
-    monkeypatch.setattr(
-        pwd,
-        "getpwnam",
-        lambda name: SimpleNamespace(pw_uid=1001, pw_gid=1001),
-    )
-    monkeypatch.setattr(
-        grp,
-        "getgrgid",
-        lambda gid: SimpleNamespace(gr_name="brilliant-vc", gr_mem=["another-user"]),
-    )
-    monkeypatch.setattr(pwd, "getpwall", lambda: [])
+    monkeypatch.setattr(pwd, "getpwnam", lambda name: account)
+    monkeypatch.setattr(grp, "getgrgid", lambda gid: group)
+    monkeypatch.setattr(pwd, "getpwall", lambda: [account])
+    monkeypatch.setattr(grp, "getgrall", lambda: [group])
 
     with pytest.raises(RuntimeHandoffError, match="must not include another account"):
         main([])

@@ -22,7 +22,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-_SCHEMA_VERSION = 4
+_SCHEMA_VERSION = 5
 _PINNED_FIRMWARE = "v26.06.03.1"
 _PINNED_HASHES = {
     "bridge.remote_bridge": ("94ac32df6184814950cc5bc3ebeac828518b858f8fd6ce76380b67f20ccf20e4"),
@@ -31,6 +31,9 @@ _PINNED_HASHES = {
         "da8d7678c2a7d798aac2e3d735ac6e0789359bfb47226e5b8702f3923fcc7135"
     ),
     "configs.process_configs": ("a8ea4ad3885ac0d826da0073b2696a026f8d38a071418fe13196eb554b9e94a9"),
+    "configs.socket_parameters": (
+        "18898d871ab1eacf52fae3ebc4dc0bc4cfc937da2848de0445c6879abe422967"
+    ),
     "lib.process_management.process_manager": (
         "38d26c0d300fab7af421731438c0bb9d97b7202760b089609d178a9e1db1b860"
     ),
@@ -57,7 +60,37 @@ _PINNED_HASHES = {
         "b6e59357305764fac73d83768315c187408adbb964311f556bd2a05850181c69"
     ),
     "runtime.run_py": "70d03e29277862a93da7840ca2224b5b27293158d30e3054a8b17068dbb0d961",
+    "runtime.process_default_ini": (
+        "28ed9ff992040ccf14f9004e3ca139abe16c471547900046fb57d2455996099a"
+    ),
+    "runtime.run_startable_py": (
+        "828a3d1d088e8db597e88c4f9be31f2cb6013efab6ee1d6669937d0c09c1f60c"
+    ),
     "runtime.uwsgi": "3384606e779e7a4216f4ff27e39e10221cd0b377c02ad1d9fd8ea61269ecbc43",
+    "runtime.approval_move": ("dd06bbb44fb05d8f82edf91be54b0785f33c43e48b756a552ef80e17760f93bb"),
+    "runtime.python": "2d78bffcfbe8c92d169c4aa615364661bddc9afae5a3cf4ab336d66a2b95e179",
+}
+_PINNED_MODES = {
+    "bridge.remote_bridge": 0o755,
+    "bus.message_bus": 0o755,
+    "bus.peripheral_process_manager": 0o755,
+    "configs.process_configs": 0o644,
+    "configs.socket_parameters": 0o644,
+    "lib.process_management.process_manager": 0o755,
+    "lib.runner": 0o755,
+    "peripherals.bootstrap.bootstrap_peripheral": 0o755,
+    "peripherals.discovery.discovery_peripheral": 0o755,
+    "peripherals.lib.peripheral_service.peripheral_host": 0o755,
+    "peripherals.configs.art_config_peripheral": 0o755,
+    "peripherals.configs.device_config_peripheral": 0o755,
+    "peripherals.configs.motion_detection_config_peripheral": 0o755,
+    "peripherals.configs.alarm_config_peripheral": 0o755,
+    "runtime.run_py": 0o644,
+    "runtime.process_default_ini": 0o644,
+    "runtime.run_startable_py": 0o644,
+    "runtime.uwsgi": 0o755,
+    "runtime.approval_move": 0o755,
+    "runtime.python": 0o755,
 }
 _MESSAGE_BUS_PARAMETERS = frozenset({"home_id", "device_id", "mb_state_dir", "is_virtual_control"})
 _RUNNER_PARAMETERS = frozenset({"startable_config", "module_name_override"})
@@ -156,6 +189,9 @@ _PINNED_MODULE_PATHS = {
     "configs.process_configs": Path(
         "/data/switch-embedded/env/lib/python3.10/site-packages/configs/process_configs.py"
     ),
+    "configs.socket_parameters": Path(
+        "/data/switch-embedded/env/lib/python3.10/site-packages/configs/socket_parameters.py"
+    ),
     "lib.process_management.process_manager": Path(
         "/data/switch-embedded/env/lib/python3.10/site-packages/lib/process_management/"
         "process_manager.cpython-310-arm-linux-gnueabi.so"
@@ -193,12 +229,23 @@ _PINNED_MODULE_PATHS = {
         "alarm_config_peripheral.cpython-310-arm-linux-gnueabi.so"
     ),
     "runtime.run_py": Path("/data/switch-embedded/run.py"),
+    "runtime.process_default_ini": Path(
+        "/data/switch-embedded/lib/process_management/process-default.ini"
+    ),
+    "runtime.run_startable_py": Path(
+        "/data/switch-embedded/env/lib/python3.10/site-packages/lib/startables/run_startable.py"
+    ),
     "runtime.uwsgi": Path("/data/switch-embedded/env/bin/uwsgi"),
+    "runtime.approval_move": Path("/usr/bin/mv.coreutils"),
+    "runtime.python": Path("/usr/bin/python3.10"),
 }
 _MAX_IDENTITY_BYTES = 1024 * 1024
 _MAX_METADATA_BYTES = 64 * 1024
 _MAX_PEM_BYTES = 128 * 1024
 _MAX_MODULE_BYTES = 64 * 1024 * 1024
+_MAX_SHADOW_BYTES = 4 * 1024 * 1024
+_RUNTIME_HOME = "/nonexistent"
+_RUNTIME_SHELL = "/usr/sbin/nologin"
 
 
 class LauncherPreflightError(ValueError):
@@ -228,6 +275,7 @@ class LauncherPaths:
     stats_socket_path: Path
     release_info_path: Path
     tracking_branch_path: Path
+    art_preload_dir: Path
 
 
 @dataclass(frozen=True, slots=True)
@@ -300,9 +348,7 @@ def preflight_no_start(
     """Validate known prerequisites without creating a runnable launch command."""
 
     _validate_firmware_snapshot(firmware_snapshot)
-    actual_hashes = _hash_inventory(actual_module_hashes, "actual module hash")
-    if actual_hashes != _PINNED_HASHES:
-        raise LauncherPreflightError("actual module hash drift blocks the launcher")
+    validate_actual_module_hashes(actual_module_hashes)
     if runtime_uid is None or runtime_gid is None:
         raise LauncherPreflightError("dedicated runtime identity is required")
     certificate_material_present, runtime_credentials_present = _validate_path_topology(
@@ -335,10 +381,10 @@ def preflight_no_start(
         full_path_surface_validated=True,
         candidate_manifest_present=True,
         runtime_user_handoff_complete=runtime_credentials_present,
-        launcher_implementation_present=False,
+        launcher_implementation_present=True,
         start_permitted=False,
         blocked_reason=(
-            "nonroot_emperor_launcher_not_implemented"
+            "nonroot_service_install_and_compatibility_validation_required"
             if runtime_credentials_present
             else (
                 "runtime_credential_handoff_required"
@@ -349,11 +395,20 @@ def preflight_no_start(
     )
 
 
+def validate_actual_module_hashes(actual_module_hashes: Mapping[str, object]) -> None:
+    """Reject any launcher/configuration file drift from the pinned firmware."""
+
+    actual_hashes = _hash_inventory(actual_module_hashes, "actual module hash")
+    if actual_hashes != _PINNED_HASHES:
+        raise LauncherPreflightError("actual module hash drift blocks the launcher")
+
+
 def _validate_firmware_snapshot(snapshot: Mapping[str, object]) -> None:
     expected_fields = {
         "schema_version",
         "firmware_version",
         "runtime_sha256",
+        "runtime_file_modes",
         "message_bus_parameters",
         "runner_parameters",
         "bootstrap_fields",
@@ -387,6 +442,12 @@ def _validate_firmware_snapshot(snapshot: Mapping[str, object]) -> None:
     hashes = _hash_inventory(snapshot["runtime_sha256"], "firmware runtime hash")
     if hashes != _PINNED_HASHES:
         raise LauncherPreflightError("firmware module hash drift blocks the launcher")
+    modes = snapshot["runtime_file_modes"]
+    if not isinstance(modes, Mapping) or set(modes) != set(_PINNED_MODES):
+        raise LauncherPreflightError("firmware runtime mode inventory is invalid")
+    rendered_modes = {name: f"{mode:04o}" for name, mode in _PINNED_MODES.items()}
+    if dict(modes) != rendered_modes:
+        raise LauncherPreflightError("firmware runtime mode drift blocks the launcher")
 
     message_bus_parameters = _parameter_set(
         snapshot["message_bus_parameters"], "message-bus interface"
@@ -628,13 +689,25 @@ def _validate_path_topology(
     )
     if release_metadata == tracking_metadata:
         raise LauncherPreflightError("release and tracking metadata paths must be distinct")
+    art_preload = _validate_readonly_directory(
+        paths.art_preload_dir,
+        description="art preload directory",
+        required_uid=required_uid,
+        required_mode=0o755,
+    )
 
-    for disallowed_parent in (private_root, persistent_root, runtime_root):
-        if not _paths_overlap(runtime_credential_root, disallowed_parent):
-            continue
-        raise LauncherPreflightError(
-            "runtime credentials must be outside private and service-writable roots"
-        )
+    for read_only_path, description in (
+        (runtime_credential_root, "runtime credentials"),
+        (art_preload, "art preload directory"),
+    ):
+        for disallowed_parent in (private_root, persistent_root, runtime_root):
+            if not _paths_overlap(read_only_path, disallowed_parent):
+                continue
+            raise LauncherPreflightError(
+                f"{description} must be outside private and service-writable roots"
+            )
+    if _paths_overlap(art_preload, runtime_credential_root):
+        raise LauncherPreflightError("art preload directory must be outside runtime credentials")
 
     protected = tuple(root.resolve(strict=False) for root in _PROTECTED_ROOTS)
     for candidate in (
@@ -645,6 +718,7 @@ def _validate_path_topology(
         persistent_root,
         runtime_root,
         runtime_credential_root,
+        art_preload,
         socket,
         stats_socket,
     ):
@@ -700,14 +774,38 @@ def _validate_readonly_metadata_file(
         raise LauncherPreflightError(f"{description} must not be a symlink")
     if not stat.S_ISREG(metadata.st_mode):
         raise LauncherPreflightError(f"{description} must be a regular file")
-    if metadata.st_uid != required_uid or stat.S_IMODE(metadata.st_mode) not in {0o600, 0o644}:
+    if metadata.st_uid != required_uid or stat.S_IMODE(metadata.st_mode) != 0o644:
         raise LauncherPreflightError(
-            f"{description} must have the required owner and mode 0600 or 0644"
+            f"{description} must have the required owner and runtime-readable mode 0644"
         )
     if metadata.st_nlink != 1:
         raise LauncherPreflightError(f"{description} must not be a hard link")
     if not 0 < metadata.st_size <= _MAX_METADATA_BYTES:
         raise LauncherPreflightError(f"{description} has an invalid size")
+    return path.resolve(strict=True)
+
+
+def _validate_readonly_directory(
+    path: Path,
+    *,
+    description: str,
+    required_uid: int,
+    required_mode: int,
+) -> Path:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        raise LauncherPreflightError(f"{description} does not exist") from None
+    except OSError:
+        raise LauncherPreflightError(f"could not inspect {description}") from None
+    if stat.S_ISLNK(metadata.st_mode):
+        raise LauncherPreflightError(f"{description} must not be a symlink")
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise LauncherPreflightError(f"{description} must be a directory")
+    if metadata.st_uid != required_uid or stat.S_IMODE(metadata.st_mode) != required_mode:
+        raise LauncherPreflightError(
+            f"{description} must have the required owner and mode {required_mode:04o}"
+        )
     return path.resolve(strict=True)
 
 
@@ -1050,6 +1148,9 @@ def hash_firmware_modules(
             raise LauncherPreflightError("actual module file must be regular")
         if before.st_uid != required_uid:
             raise LauncherPreflightError("actual module file has the wrong owner")
+        expected_mode = _PINNED_MODES[name]
+        if stat.S_IMODE(before.st_mode) != expected_mode:
+            raise LauncherPreflightError(f"actual module file must have mode {expected_mode:04o}")
         if not 0 < before.st_size <= _MAX_MODULE_BYTES:
             raise LauncherPreflightError("actual module file has an invalid size")
 
@@ -1099,6 +1200,168 @@ def load_firmware_snapshot(path: Path, *, required_uid: int = 0) -> dict[str, ob
     if not isinstance(parsed, dict):
         raise LauncherPreflightError("firmware snapshot must be an object")
     return parsed
+
+
+def _validate_runtime_account_contract(
+    account: object,
+    runtime_group: object,
+    *,
+    all_accounts: Sequence[object],
+    all_groups: Sequence[object],
+    shadow_path: Path,
+    required_uid: int,
+) -> None:
+    """Validate the locked, login-disabled, single-member service account."""
+
+    uid = getattr(account, "pw_uid", None)
+    gid = getattr(account, "pw_gid", None)
+    name = getattr(account, "pw_name", None)
+    home = getattr(account, "pw_dir", None)
+    shell = getattr(account, "pw_shell", None)
+    group_name = getattr(runtime_group, "gr_name", None)
+    group_gid = getattr(runtime_group, "gr_gid", None)
+    group_members = getattr(runtime_group, "gr_mem", None)
+    if (
+        name != "brilliant-vc"
+        or isinstance(uid, bool)
+        or not isinstance(uid, int)
+        or uid <= 0
+        or isinstance(gid, bool)
+        or not isinstance(gid, int)
+        or gid <= 0
+    ):
+        raise LauncherPreflightError("dedicated runtime account must be non-root")
+    if group_name != name or group_gid != gid or not isinstance(group_members, list):
+        raise LauncherPreflightError("runtime account must use its same-name dedicated group")
+    if home != _RUNTIME_HOME or shell != _RUNTIME_SHELL:
+        raise LauncherPreflightError("runtime account must use /nonexistent and /usr/sbin/nologin")
+    if Path(home).exists() or Path(home).is_symlink():
+        raise LauncherPreflightError("runtime account home must remain nonexistent")
+    uid_accounts = [entry for entry in all_accounts if getattr(entry, "pw_uid", None) == uid]
+    if (
+        len(uid_accounts) != 1
+        or getattr(uid_accounts[0], "pw_name", None) != name
+        or getattr(uid_accounts[0], "pw_gid", None) != gid
+        or getattr(uid_accounts[0], "pw_dir", None) != home
+        or getattr(uid_accounts[0], "pw_shell", None) != shell
+    ):
+        raise LauncherPreflightError("runtime UID must map to exactly one account")
+    primary_accounts = [entry for entry in all_accounts if getattr(entry, "pw_gid", None) == gid]
+    if (
+        len(primary_accounts) != 1
+        or getattr(primary_accounts[0], "pw_name", None) != name
+        or getattr(primary_accounts[0], "pw_uid", None) != uid
+        or getattr(primary_accounts[0], "pw_dir", None) != home
+        or getattr(primary_accounts[0], "pw_shell", None) != shell
+        or set(group_members) - {name}
+    ):
+        raise LauncherPreflightError("runtime group must not include another account")
+    primary_group_entries = [entry for entry in all_groups if getattr(entry, "gr_gid", None) == gid]
+    if (
+        len(primary_group_entries) != 1
+        or getattr(primary_group_entries[0], "gr_name", None) != name
+        or set(getattr(primary_group_entries[0], "gr_mem", ())) - {name}
+    ):
+        raise LauncherPreflightError("runtime GID must map to exactly one dedicated group")
+    supplementary_groups = {
+        getattr(entry, "gr_name", None)
+        for entry in all_groups
+        if getattr(entry, "gr_gid", None) != gid and name in set(getattr(entry, "gr_mem", ()))
+    }
+    if supplementary_groups:
+        raise LauncherPreflightError("runtime account must not have supplementary groups")
+    _validate_locked_shadow_entry(
+        shadow_path,
+        username=name,
+        required_uid=required_uid,
+    )
+
+
+def _validate_locked_shadow_entry(
+    path: Path,
+    *,
+    username: str,
+    required_uid: int,
+) -> None:
+    """Require one locked password entry without following or racing the file."""
+
+    try:
+        before = path.lstat()
+    except OSError:
+        raise LauncherPreflightError("could not inspect the account password database") from None
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise LauncherPreflightError("account password database must be a regular non-symlink file")
+    if before.st_uid != required_uid or stat.S_IMODE(before.st_mode) not in {0o600, 0o640}:
+        raise LauncherPreflightError("account password database ownership or mode is unsafe")
+    if before.st_nlink != 1 or not 0 < before.st_size <= _MAX_SHADOW_BYTES:
+        raise LauncherPreflightError("account password database has an invalid link count or size")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        raise LauncherPreflightError(
+            "could not safely open the account password database"
+        ) from None
+    buffer = bytearray(8192)
+    line = bytearray()
+    match_count = 0
+    locked = False
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            raise LauncherPreflightError("account password database changed during open")
+        prefix = f"{username}:".encode("ascii")
+        while True:
+            count = os.readv(descriptor, [buffer])
+            if count == 0:
+                break
+            view = memoryview(buffer)[:count]
+            try:
+                for value in view:
+                    if value == 0x0A:
+                        matched, line_locked = _shadow_line_state(line, prefix)
+                        match_count += int(matched)
+                        locked = locked or line_locked
+                        _wipe(line)
+                        line.clear()
+                    else:
+                        line.append(value)
+                        if len(line) > _MAX_METADATA_BYTES:
+                            raise LauncherPreflightError(
+                                "account password database contains an oversized entry"
+                            )
+            finally:
+                view.release()
+                _wipe(buffer)
+        if line:
+            matched, line_locked = _shadow_line_state(line, prefix)
+            match_count += int(matched)
+            locked = locked or line_locked
+        after = os.fstat(descriptor)
+        if (
+            after.st_size != opened.st_size
+            or after.st_mtime_ns != opened.st_mtime_ns
+            or after.st_ctime_ns != opened.st_ctime_ns
+        ):
+            raise LauncherPreflightError("account password database changed while reading")
+    finally:
+        _wipe(line)
+        _wipe(buffer)
+        os.close(descriptor)
+    if match_count != 1 or not locked:
+        raise LauncherPreflightError("runtime account password must be locked")
+
+
+def _shadow_line_state(line: bytearray, prefix: bytes) -> tuple[bool, bool]:
+    """Inspect only the target entry's first password byte without copying it."""
+
+    if len(line) <= len(prefix) or any(line[index] != value for index, value in enumerate(prefix)):
+        return False, False
+    password_start = len(prefix)
+    password_end = password_start
+    while password_end < len(line) and line[password_end] != 0x3A:
+        password_end += 1
+    return True, (password_end > password_start and line[password_start] in (ord("!"), ord("*")))
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1186,20 +1449,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         runtime_account = pwd.getpwnam(args.runtime_user)
     except KeyError:
         raise LauncherPreflightError("dedicated runtime account does not exist") from None
-    if runtime_account.pw_uid == 0 or runtime_account.pw_gid == 0:
-        raise LauncherPreflightError("dedicated runtime account must be non-root")
     try:
         runtime_group = grp.getgrgid(runtime_account.pw_gid)
     except KeyError:
         raise LauncherPreflightError("dedicated runtime group does not exist") from None
-    if runtime_group.gr_name != args.runtime_user:
-        raise LauncherPreflightError("runtime account must use its same-name dedicated group")
-    primary_members = {
-        entry.pw_name for entry in pwd.getpwall() if entry.pw_gid == runtime_account.pw_gid
-    }
-    supplementary_members = set(runtime_group.gr_mem)
-    if (primary_members | supplementary_members) - {args.runtime_user}:
-        raise LauncherPreflightError("runtime group must not include another account")
+    _validate_runtime_account_contract(
+        runtime_account,
+        runtime_group,
+        all_accounts=pwd.getpwall(),
+        all_groups=grp.getgrall(),
+        shadow_path=Path("/etc/shadow"),
+        required_uid=required_uid,
+    )
     snapshot = load_firmware_snapshot(
         args.firmware_snapshot,
         required_uid=required_uid,
@@ -1226,6 +1487,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             stats_socket_path=args.stats_socket_path,
             release_info_path=args.release_info_path,
             tracking_branch_path=args.tracking_branch_path,
+            art_preload_dir=Path("/etc/brilliant/content_preload/art_library"),
         ),
         snapshot,
         actual_module_hashes=actual_module_hashes,

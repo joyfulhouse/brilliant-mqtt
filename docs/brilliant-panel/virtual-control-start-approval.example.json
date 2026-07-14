@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "approved": true,
+  "approved_at_s": 1800000000,
+  "run_id": "office-vc-bootstrap-example",
+  "panel": "office",
+  "firmware_version": "v26.06.03.1",
+  "purpose": "bounded_virtual_control_bootstrap",
+  "runtime_limit_s": 600,
+  "runtime_credential_bundle_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "physical_device_actions_permitted": false,
+  "hosted_light_permitted": false
+}

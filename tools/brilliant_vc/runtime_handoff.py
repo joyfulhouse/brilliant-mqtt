@@ -25,6 +25,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from tools.brilliant_vc.launcher_preflight import (
+    LauncherPreflightError,
+    _validate_runtime_account_contract,
+)
+
 _RUNTIME_USER = "brilliant-vc"
 _IDENTITY_FILES = frozenset({"device_id", "pkcs12_certificate", "bootstrap", "metadata.json"})
 _CERTIFICATE_FILES = frozenset({"device.key", "device.cert"})
@@ -40,6 +45,8 @@ _CERTIFICATE_BEGIN = b"-----BEGIN CERTIFICATE-----\n"
 _CERTIFICATE_END = b"-----END CERTIFICATE-----\n"
 _DEFAULT_PRIVATE_ROOTS = (Path("/data/brilliant-vc-private"),)
 _DEFAULT_RUNTIME_CREDENTIAL_PATHS = (Path("/data/brilliant-vc-credentials"),)
+_RUNTIME_BUNDLE_ORDER = ("device_id", "bootstrap", "device.key", "device.cert")
+_RUNTIME_BUNDLE_DOMAIN = b"brilliant-vc-runtime-credentials-v1\x00"
 
 
 class RuntimeHandoffError(ValueError):
@@ -71,6 +78,7 @@ class RuntimeHandoffResult:
     device_id_redacted: str
     certificate_fingerprint_redacted: str
     bootstrap_sha256_redacted: str
+    runtime_credential_bundle_sha256: str
 
     def to_public_dict(self) -> dict[str, object]:
         return {
@@ -82,7 +90,28 @@ class RuntimeHandoffResult:
             "device_id_redacted": self.device_id_redacted,
             "certificate_fingerprint_redacted": self.certificate_fingerprint_redacted,
             "bootstrap_sha256_redacted": self.bootstrap_sha256_redacted,
+            "runtime_credential_bundle_sha256": self.runtime_credential_bundle_sha256,
         }
+
+
+def runtime_credential_bundle_sha256(
+    values: Mapping[str, bytes | bytearray],
+) -> str:
+    """Hash the exact four-file runtime bundle with names and lengths."""
+
+    if set(values) != set(_RUNTIME_BUNDLE_ORDER):
+        raise RuntimeHandoffError("runtime credential bundle inventory is invalid")
+    digest = hashlib.sha256(_RUNTIME_BUNDLE_DOMAIN)
+    for name in _RUNTIME_BUNDLE_ORDER:
+        value = values[name]
+        if not isinstance(value, (bytes, bytearray)) or not value:
+            raise RuntimeHandoffError("runtime credential bundle value is invalid")
+        encoded_name = name.encode("ascii")
+        digest.update(len(encoded_name).to_bytes(2, "big"))
+        digest.update(encoded_name)
+        digest.update(len(value).to_bytes(8, "big"))
+        digest.update(value)
+    return digest.hexdigest()
 
 
 def handoff_runtime_credentials(
@@ -207,6 +236,7 @@ def handoff_runtime_credentials(
             "device.key": private_key,
             "device.cert": certificate,
         }
+        bundle_digest = runtime_credential_bundle_sha256(source_values)
         already_complete = False
         if paths.runtime_credential_dir.exists() or paths.runtime_credential_dir.is_symlink():
             _validate_existing_runtime(
@@ -239,6 +269,7 @@ def handoff_runtime_credentials(
             device_id_redacted=redacted_device_id,
             certificate_fingerprint_redacted=_redact_digest(fingerprint),
             bootstrap_sha256_redacted=_redact_digest(bootstrap_digest),
+            runtime_credential_bundle_sha256=bundle_digest,
         )
     finally:
         for value in (bootstrap, private_key, certificate, runtime_device_id):
@@ -778,18 +809,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         account = pwd.getpwnam(args.runtime_user)
     except KeyError:
         raise RuntimeHandoffError("dedicated runtime account does not exist") from None
-    if account.pw_uid == 0 or account.pw_gid == 0:
-        raise RuntimeHandoffError("dedicated runtime account must be non-root")
     try:
         runtime_group = grp.getgrgid(account.pw_gid)
     except KeyError:
         raise RuntimeHandoffError("dedicated runtime group does not exist") from None
-    if runtime_group.gr_name != args.runtime_user:
-        raise RuntimeHandoffError("runtime account must use its same-name dedicated group")
-    primary_members = {entry.pw_name for entry in pwd.getpwall() if entry.pw_gid == account.pw_gid}
-    supplementary_members = set(runtime_group.gr_mem)
-    if (primary_members | supplementary_members) - {args.runtime_user}:
-        raise RuntimeHandoffError("runtime group must not include another account")
+    try:
+        _validate_runtime_account_contract(
+            account,
+            runtime_group,
+            all_accounts=pwd.getpwall(),
+            all_groups=grp.getgrall(),
+            shadow_path=Path("/etc/shadow"),
+            required_uid=0,
+        )
+    except LauncherPreflightError as error:
+        raise RuntimeHandoffError(str(error)) from None
     result = handoff_runtime_credentials(
         RuntimeHandoffPaths(
             private_root=args.private_root,

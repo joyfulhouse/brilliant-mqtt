@@ -14,6 +14,7 @@ import pytest
 from tools.brilliant_vc.launcher_preflight import (
     LauncherPaths,
     LauncherPreflightError,
+    _validate_runtime_account_contract,
     hash_firmware_modules,
     main,
     preflight_no_start,
@@ -24,7 +25,7 @@ DEVICE_ID = "a" * 32
 
 def _firmware() -> dict[str, object]:
     return {
-        "schema_version": 4,
+        "schema_version": 5,
         "firmware_version": "v26.06.03.1",
         "runtime_sha256": {
             "bridge.remote_bridge": (
@@ -36,6 +37,9 @@ def _firmware() -> dict[str, object]:
             ),
             "configs.process_configs": (
                 "a8ea4ad3885ac0d826da0073b2696a026f8d38a071418fe13196eb554b9e94a9"
+            ),
+            "configs.socket_parameters": (
+                "18898d871ab1eacf52fae3ebc4dc0bc4cfc937da2848de0445c6879abe422967"
             ),
             "lib.process_management.process_manager": (
                 "38d26c0d300fab7af421731438c0bb9d97b7202760b089609d178a9e1db1b860"
@@ -63,7 +67,39 @@ def _firmware() -> dict[str, object]:
                 "b6e59357305764fac73d83768315c187408adbb964311f556bd2a05850181c69"
             ),
             "runtime.run_py": ("70d03e29277862a93da7840ca2224b5b27293158d30e3054a8b17068dbb0d961"),
+            "runtime.process_default_ini": (
+                "28ed9ff992040ccf14f9004e3ca139abe16c471547900046fb57d2455996099a"
+            ),
+            "runtime.run_startable_py": (
+                "828a3d1d088e8db597e88c4f9be31f2cb6013efab6ee1d6669937d0c09c1f60c"
+            ),
             "runtime.uwsgi": ("3384606e779e7a4216f4ff27e39e10221cd0b377c02ad1d9fd8ea61269ecbc43"),
+            "runtime.approval_move": (
+                "dd06bbb44fb05d8f82edf91be54b0785f33c43e48b756a552ef80e17760f93bb"
+            ),
+            "runtime.python": ("2d78bffcfbe8c92d169c4aa615364661bddc9afae5a3cf4ab336d66a2b95e179"),
+        },
+        "runtime_file_modes": {
+            "bridge.remote_bridge": "0755",
+            "bus.message_bus": "0755",
+            "bus.peripheral_process_manager": "0755",
+            "configs.process_configs": "0644",
+            "configs.socket_parameters": "0644",
+            "lib.process_management.process_manager": "0755",
+            "lib.runner": "0755",
+            "peripherals.bootstrap.bootstrap_peripheral": "0755",
+            "peripherals.discovery.discovery_peripheral": "0755",
+            "peripherals.lib.peripheral_service.peripheral_host": "0755",
+            "peripherals.configs.art_config_peripheral": "0755",
+            "peripherals.configs.device_config_peripheral": "0755",
+            "peripherals.configs.motion_detection_config_peripheral": "0755",
+            "peripherals.configs.alarm_config_peripheral": "0755",
+            "runtime.run_py": "0644",
+            "runtime.process_default_ini": "0644",
+            "runtime.run_startable_py": "0644",
+            "runtime.uwsgi": "0755",
+            "runtime.approval_move": "0755",
+            "runtime.python": "0755",
         },
         "message_bus_parameters": [
             "home_id",
@@ -203,8 +239,12 @@ def _paths(tmp_path: Path) -> LauncherPaths:
     read_only_metadata.mkdir(mode=0o700)
     release_info = read_only_metadata / "release_info.json"
     tracking_branch = read_only_metadata / "tracking_branch"
+    art_preload = read_only_metadata / "art_library"
+    art_preload.mkdir(mode=0o755)
     _private_file(release_info, b"{}\n")
     _private_file(tracking_branch, b"stable\n")
+    release_info.chmod(0o644)
+    tracking_branch.chmod(0o644)
 
     _private_file(identity / "device_id", (DEVICE_ID + "\n").encode())
     _private_file(identity / "pkcs12_certificate", b"opaque-pkcs12")
@@ -238,16 +278,231 @@ def _paths(tmp_path: Path) -> LauncherPaths:
         stats_socket_path=runtime / "uwsgi_stats_socket",
         release_info_path=release_info,
         tracking_branch_path=tracking_branch,
+        art_preload_dir=art_preload,
     )
 
 
-def test_tracked_schema_v4_snapshot_example_matches_the_pinned_contract() -> None:
+def test_tracked_schema_v5_snapshot_example_matches_the_pinned_contract() -> None:
     example = (
         Path(__file__).parents[1]
-        / "docs/brilliant-panel/virtual-control-launcher-snapshot-v4.example.json"
+        / "docs/brilliant-panel/virtual-control-launcher-snapshot-v5.example.json"
     )
 
     assert json.loads(example.read_text(encoding="utf-8")) == _firmware()
+
+
+def test_runtime_account_contract_requires_locked_nologin_identity(tmp_path: Path) -> None:
+    shadow = tmp_path / "shadow"
+    shadow.write_text("brilliant-vc:!:20000:0:99999:7:::\n", encoding="utf-8")
+    shadow.chmod(0o600)
+    account = SimpleNamespace(
+        pw_name="brilliant-vc",
+        pw_uid=1001,
+        pw_gid=1001,
+        pw_dir="/nonexistent",
+        pw_shell="/usr/sbin/nologin",
+    )
+    group = SimpleNamespace(gr_name="brilliant-vc", gr_gid=1001, gr_mem=[])
+
+    _validate_runtime_account_contract(
+        account,
+        group,
+        all_accounts=[account],
+        all_groups=[group],
+        shadow_path=shadow,
+        required_uid=os.getuid(),
+    )
+
+    shadow.write_text("brilliant-vc:$6$live-hash:20000:0:99999:7:::\n", encoding="utf-8")
+    with pytest.raises(LauncherPreflightError, match="password must be locked"):
+        _validate_runtime_account_contract(
+            account,
+            group,
+            all_accounts=[account],
+            all_groups=[group],
+            shadow_path=shadow,
+            required_uid=os.getuid(),
+        )
+
+
+def test_runtime_account_contract_rejects_login_shell(tmp_path: Path) -> None:
+    shadow = tmp_path / "shadow"
+    shadow.write_text("brilliant-vc:*:20000:0:99999:7:::\n", encoding="utf-8")
+    shadow.chmod(0o600)
+    account = SimpleNamespace(
+        pw_name="brilliant-vc",
+        pw_uid=1001,
+        pw_gid=1001,
+        pw_dir="/nonexistent",
+        pw_shell="/bin/sh",
+    )
+
+    with pytest.raises(LauncherPreflightError, match="nologin"):
+        _validate_runtime_account_contract(
+            account,
+            SimpleNamespace(gr_name="brilliant-vc", gr_gid=1001, gr_mem=[]),
+            all_accounts=[account],
+            all_groups=[],
+            shadow_path=shadow,
+            required_uid=os.getuid(),
+        )
+
+
+def test_runtime_account_contract_rejects_foreign_supplementary_group(
+    tmp_path: Path,
+) -> None:
+    shadow = tmp_path / "shadow"
+    shadow.write_text("brilliant-vc:!:20000:0:99999:7:::\n", encoding="utf-8")
+    shadow.chmod(0o600)
+    account = SimpleNamespace(
+        pw_name="brilliant-vc",
+        pw_uid=1001,
+        pw_gid=1001,
+        pw_dir="/nonexistent",
+        pw_shell="/usr/sbin/nologin",
+    )
+    primary = SimpleNamespace(gr_name="brilliant-vc", gr_gid=1001, gr_mem=[])
+    foreign = SimpleNamespace(gr_name="dialout", gr_gid=20, gr_mem=["brilliant-vc"])
+
+    with pytest.raises(LauncherPreflightError, match="supplementary groups"):
+        _validate_runtime_account_contract(
+            account,
+            primary,
+            all_accounts=[account],
+            all_groups=[primary, foreign],
+            shadow_path=shadow,
+            required_uid=os.getuid(),
+        )
+
+
+def test_runtime_account_contract_rejects_uid_or_gid_aliases(tmp_path: Path) -> None:
+    shadow = tmp_path / "shadow"
+    shadow.write_text("brilliant-vc:!:20000:0:99999:7:::\n", encoding="utf-8")
+    shadow.chmod(0o600)
+    account = SimpleNamespace(
+        pw_name="brilliant-vc",
+        pw_uid=1001,
+        pw_gid=1001,
+        pw_dir="/nonexistent",
+        pw_shell="/usr/sbin/nologin",
+    )
+    primary = SimpleNamespace(gr_name="brilliant-vc", gr_gid=1001, gr_mem=[])
+    uid_alias = SimpleNamespace(pw_name="alias", pw_uid=1001, pw_gid=1002)
+
+    with pytest.raises(LauncherPreflightError, match="UID must map"):
+        _validate_runtime_account_contract(
+            account,
+            primary,
+            all_accounts=[account, uid_alias],
+            all_groups=[primary],
+            shadow_path=shadow,
+            required_uid=os.getuid(),
+        )
+
+    gid_alias = SimpleNamespace(gr_name="alias", gr_gid=1001, gr_mem=[])
+    with pytest.raises(LauncherPreflightError, match="GID must map"):
+        _validate_runtime_account_contract(
+            account,
+            primary,
+            all_accounts=[account],
+            all_groups=[primary, gid_alias],
+            shadow_path=shadow,
+            required_uid=os.getuid(),
+        )
+
+
+def test_runtime_account_contract_rejects_duplicate_same_name_uid_record(
+    tmp_path: Path,
+) -> None:
+    shadow = tmp_path / "shadow"
+    shadow.write_text("brilliant-vc:!:20000:0:99999:7:::\n", encoding="utf-8")
+    shadow.chmod(0o600)
+    account = SimpleNamespace(
+        pw_name="brilliant-vc",
+        pw_uid=1001,
+        pw_gid=1001,
+        pw_dir="/nonexistent",
+        pw_shell="/usr/sbin/nologin",
+    )
+    duplicate = SimpleNamespace(
+        pw_name="brilliant-vc",
+        pw_uid=1001,
+        pw_gid=1001,
+        pw_dir="/tmp/duplicate-home",
+        pw_shell="/bin/sh",
+    )
+    primary = SimpleNamespace(gr_name="brilliant-vc", gr_gid=1001, gr_mem=[])
+
+    with pytest.raises(LauncherPreflightError, match="UID must map"):
+        _validate_runtime_account_contract(
+            account,
+            primary,
+            all_accounts=[account, duplicate],
+            all_groups=[primary],
+            shadow_path=shadow,
+            required_uid=os.getuid(),
+        )
+
+
+def test_runtime_account_contract_rejects_duplicate_same_name_primary_gid_record(
+    tmp_path: Path,
+) -> None:
+    shadow = tmp_path / "shadow"
+    shadow.write_text("brilliant-vc:!:20000:0:99999:7:::\n", encoding="utf-8")
+    shadow.chmod(0o600)
+    account = SimpleNamespace(
+        pw_name="brilliant-vc",
+        pw_uid=1001,
+        pw_gid=1001,
+        pw_dir="/nonexistent",
+        pw_shell="/usr/sbin/nologin",
+    )
+    duplicate = SimpleNamespace(
+        pw_name="brilliant-vc",
+        pw_uid=1002,
+        pw_gid=1001,
+        pw_dir="/tmp/duplicate-home",
+        pw_shell="/bin/sh",
+    )
+    primary = SimpleNamespace(gr_name="brilliant-vc", gr_gid=1001, gr_mem=[])
+
+    with pytest.raises(LauncherPreflightError, match="runtime group must not include"):
+        _validate_runtime_account_contract(
+            account,
+            primary,
+            all_accounts=[account, duplicate],
+            all_groups=[primary],
+            shadow_path=shadow,
+            required_uid=os.getuid(),
+        )
+
+
+@pytest.mark.parametrize("mode", [0o604, 0o644, 0o655, 0o700])
+def test_runtime_account_contract_rejects_exposed_or_executable_shadow_mode(
+    tmp_path: Path,
+    mode: int,
+) -> None:
+    shadow = tmp_path / "shadow"
+    shadow.write_text("brilliant-vc:!:20000:0:99999:7:::\n", encoding="utf-8")
+    shadow.chmod(mode)
+    account = SimpleNamespace(
+        pw_name="brilliant-vc",
+        pw_uid=1001,
+        pw_gid=1001,
+        pw_dir="/nonexistent",
+        pw_shell="/usr/sbin/nologin",
+    )
+    primary = SimpleNamespace(gr_name="brilliant-vc", gr_gid=1001, gr_mem=[])
+
+    with pytest.raises(LauncherPreflightError, match="password database ownership or mode"):
+        _validate_runtime_account_contract(
+            account,
+            primary,
+            all_accounts=[account],
+            all_groups=[primary],
+            shadow_path=shadow,
+            required_uid=os.getuid(),
+        )
 
 
 def test_valid_prerequisites_produce_a_redacted_plan_that_cannot_start(tmp_path: Path) -> None:
@@ -285,7 +540,7 @@ def test_valid_prerequisites_produce_a_redacted_plan_that_cannot_start(tmp_path:
         "full_path_surface_validated": True,
         "candidate_manifest_present": True,
         "runtime_user_handoff_complete": False,
-        "launcher_implementation_present": False,
+        "launcher_implementation_present": True,
         "start_permitted": False,
         "blocked_reason": "identity_materialization_required",
     }
@@ -315,18 +570,23 @@ def test_cli_rejects_a_runtime_group_shared_with_another_account(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    account = SimpleNamespace(
+        pw_name="brilliant-vc",
+        pw_uid=1001,
+        pw_gid=1001,
+        pw_dir="/nonexistent",
+        pw_shell="/usr/sbin/nologin",
+    )
+    group = SimpleNamespace(
+        gr_name="brilliant-vc",
+        gr_gid=1001,
+        gr_mem=["another-user"],
+    )
     monkeypatch.setattr(os, "geteuid", lambda: 0)
-    monkeypatch.setattr(
-        pwd,
-        "getpwnam",
-        lambda name: SimpleNamespace(pw_uid=1001, pw_gid=1001),
-    )
-    monkeypatch.setattr(
-        grp,
-        "getgrgid",
-        lambda gid: SimpleNamespace(gr_name="brilliant-vc", gr_mem=["another-user"]),
-    )
-    monkeypatch.setattr(pwd, "getpwall", lambda: [])
+    monkeypatch.setattr(pwd, "getpwnam", lambda name: account)
+    monkeypatch.setattr(grp, "getgrgid", lambda gid: group)
+    monkeypatch.setattr(pwd, "getpwall", lambda: [account])
+    monkeypatch.setattr(grp, "getgrall", lambda: [group])
 
     with pytest.raises(LauncherPreflightError, match="must not include another account"):
         main(["--firmware-snapshot", str(tmp_path / "unused.json")])
@@ -483,7 +743,8 @@ def test_exact_runtime_handoff_completes_identity_but_still_cannot_start(
     assert plan.runtime_user_handoff_complete is True
     assert plan.identity_contract_complete is True
     assert plan.start_permitted is False
-    assert plan.blocked_reason == "nonroot_emperor_launcher_not_implemented"
+    assert plan.launcher_implementation_present is True
+    assert plan.blocked_reason == "nonroot_service_install_and_compatibility_validation_required"
 
 
 def test_runtime_handoff_must_match_private_sources_and_remain_group_read_only(
@@ -701,6 +962,41 @@ def test_read_only_runtime_metadata_must_be_regular_bounded_and_private(
             allowed_runtime_credential_paths=(paths.runtime_credential_dir,),
         )
 
+    paths = _paths(tmp_path / "not-runtime-readable")
+    paths.release_info_path.chmod(0o600)
+    with pytest.raises(LauncherPreflightError, match="release metadata.*0644"):
+        preflight_no_start(
+            paths,
+            _firmware(),
+            actual_module_hashes=_module_hashes(),
+            required_uid=os.getuid(),
+            runtime_uid=os.getuid(),
+            runtime_gid=os.getgid(),
+            allowed_private_roots=(paths.private_root,),
+            allowed_persistent_roots=(paths.persistent_root,),
+            allowed_runtime_roots=(paths.runtime_dir,),
+            allowed_runtime_credential_paths=(paths.runtime_credential_dir,),
+        )
+
+
+def test_art_preload_directory_must_be_read_only_stock_metadata(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    paths.art_preload_dir.chmod(0o775)
+
+    with pytest.raises(LauncherPreflightError, match="art preload.*0755"):
+        preflight_no_start(
+            paths,
+            _firmware(),
+            actual_module_hashes=_module_hashes(),
+            required_uid=os.getuid(),
+            runtime_uid=os.getuid(),
+            runtime_gid=os.getgid(),
+            allowed_private_roots=(paths.private_root,),
+            allowed_persistent_roots=(paths.persistent_root,),
+            allowed_runtime_roots=(paths.runtime_dir,),
+            allowed_runtime_credential_paths=(paths.runtime_credential_dir,),
+        )
+
     paths = _paths(tmp_path / "symlink")
     paths.tracking_branch_path.unlink()
     paths.tracking_branch_path.symlink_to(paths.release_info_path)
@@ -779,10 +1075,13 @@ def test_identity_contract_is_exact_private_and_self_consistent(tmp_path: Path) 
 def test_hashes_actual_regular_module_files_without_following_symlinks(tmp_path: Path) -> None:
     module_paths: dict[str, Path] = {}
     expected: dict[str, str] = {}
+    modes = _firmware()["runtime_file_modes"]
+    assert isinstance(modes, dict)
     for index, name in enumerate(_module_hashes()):
         path = tmp_path / f"module-{index}.so"
         content = f"module-{index}".encode()
         path.write_bytes(content)
+        path.chmod(int(str(modes[name]), 8))
         module_paths[name] = path
         expected[name] = hashlib.sha256(content).hexdigest()
 
@@ -794,8 +1093,19 @@ def test_hashes_actual_regular_module_files_without_following_symlinks(tmp_path:
         == expected
     )
 
+    module_paths["runtime.uwsgi"].chmod(0o644)
+    with pytest.raises(LauncherPreflightError, match="mode 0755"):
+        hash_firmware_modules(module_paths=module_paths, required_uid=os.getuid())
+    module_paths["runtime.uwsgi"].chmod(0o755)
+
     target = module_paths["lib.runner"]
     target.unlink()
     target.symlink_to(module_paths["bus.message_bus"])
     with pytest.raises(LauncherPreflightError, match="symlink"):
+        hash_firmware_modules(module_paths=module_paths, required_uid=os.getuid())
+
+    target.unlink()
+    target.write_bytes(b"module-drift-surface")
+    target.chmod(0o666)
+    with pytest.raises(LauncherPreflightError, match="mode 0755"):
         hash_firmware_modules(module_paths=module_paths, required_uid=os.getuid())

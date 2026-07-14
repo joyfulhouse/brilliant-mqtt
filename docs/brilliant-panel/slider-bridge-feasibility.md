@@ -169,13 +169,25 @@ executable without granting them mutation authority:
   copies only the canonical device ID, bootstrap, key, and certificate into a
   root-owned, dedicated-group-readable tree. It has no account, service,
   network, firmware, command, or start capability.
-- `tools.brilliant_vc.launcher_preflight` validates 15 pinned
-  launcher/configuration hashes, the four-file provisioned identity contract,
+- `tools.brilliant_vc.launcher_preflight` validates 20 pinned runtime/launch-chain
+  hashes and exact modes, the four-file provisioned identity contract,
   the uWSGI Emperor requirement, the exact credential copy, the stock process
   lifecycle/address contract, non-root supervisor contract, every writable
-  runtime directory, two distinct sockets, and bounded read-only metadata. It
+  runtime directory, two distinct sockets, bounded read-only metadata, and the
+  exact root-owned mode-`0755` stock art catalog. It
   intentionally contains no start primitive and advances an exact handoff to
-  `nonroot_emperor_launcher_not_implemented`.
+  `nonroot_service_install_and_compatibility_validation_required`.
+- `tools.brilliant_vc.runtime_prepare` runs the captured four-process
+  `run.pre_exec` boundary as the dedicated non-root identity, after a fresh
+  bootstrap-only approval in apply mode. It rebuilds stock config objects after
+  flag parsing, validates every generated flagfile/INI and non-root override,
+  hardens the surface, validates the service-consumed approval and credential
+  digest, and contains no Emperor start.
+- `deploy/brilliant-vc-pilot.service` is a reference-only, non-enableable-by-default unit with a
+  pinned root-only approval rename followed by direct non-root Python/uWSGI,
+  600-second/control-group/resource limits, hidden physical paths/devices,
+  empty capabilities, and isolated writes. It has not been staged, installed,
+  enabled, or started and is explicitly bootstrap-only.
 - `tools.brilliant_vc.vassal_manifest` renders the redacted four-process
   candidate, exact 34-process disable set, type-19 config candidate, and
   isolated flags. It contains no firmware import, identity read, write,
@@ -192,6 +204,21 @@ client exchange, before bootstrap parsing. That is an emulator boundary, not a
 firmware failure. Official bootstrap, the grouped configuration host, clean
 remote-bridge/discovery behavior, and target-home assignment have not been
 tested on Office.
+
+A later no-start run exercised the tracked preparer against the same captured
+ARM firmware at synthetic UID/GID `12345:12345`, with read-only firmware,
+dummy identity, no network or physical devices, and every child process except
+the selected import's exact `/sbin/ldconfig -p` lookup blocked. It produced and
+validated exactly four isolated flagfiles, two hosted-startable configs, and
+one `message_bus.ini`, all at mode `0600`, without starting uWSGI. A read-only
+Office query confirmed systemd `250.5+`; exact staged-unit verification and all
+live runtime behavior remain blocked.
+
+The bootstrap approval forbids a hosted light, and its 600-second unit cannot
+contain the single-light pilot's 1,800-second lifecycle/cleanup budget. A
+separate clean-root coordinated-session unit and one-shot approval are a hard
+implementation gate before the light/picker/control path is runnable; neither
+the bootstrap deadline nor consumed marker may be stretched or reused.
 
 The complete evidence and candidate topology are in the
 [Virtual Control runtime contract](virtual-control-runtime-contract.md).

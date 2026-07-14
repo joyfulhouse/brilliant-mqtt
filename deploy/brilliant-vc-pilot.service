@@ -1,0 +1,71 @@
+[Unit]
+# Reference-only bounded Virtual Control bootstrap pilot. This unit is not
+# packaged, installed, enabled, or started by repository automation.
+Description=Brilliant Virtual Control bootstrap pilot (bounded, non-root)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/run/brilliant-vc-approval/start-approval.json
+ConditionPathIsDirectory=/run/brilliant-vc-approval
+
+[Service]
+Type=simple
+User=brilliant-vc
+Group=brilliant-vc
+WorkingDirectory=/data/switch-embedded
+Environment=PYTHONPATH=/var/brilliant-vc/app:/data/switch-embedded:/data/switch-embedded/env/lib/python3.10/site-packages
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=TMPDIR=/run/brilliant-vc
+UMask=0077
+
+# The ! prefix exempts only user/group credential dropping for this one narrow
+# root orchestration step. All other sandboxing remains. The pinned immutable
+# OS mover atomically renames the fresh approval inside its root-owned,
+# group-readable, non-service-writable directory. No repository code runs root.
+ExecStartPre=!/usr/bin/mv.coreutils --no-clobber --no-target-directory /run/brilliant-vc-approval/start-approval.json /run/brilliant-vc-approval/start-approval-consumed.json
+
+# This non-root call validates the consumed marker, pinned firmware hashes,
+# credentials, complete empty path surface, and ownership. It invokes only
+# run.pre_exec. Selected imports can run bounded platform lookup helpers.
+ExecStartPre=/usr/bin/python3.10 -m tools.brilliant_vc.runtime_prepare --apply --approval-marker /run/brilliant-vc-approval/start-approval-consumed.json
+
+# No shell and no stock root delegated-launch shape. Emperor and every vassal share
+# the dedicated non-root identity. The process manager creates child vassals
+# only after message_bus.ini becomes loyal.
+ExecStart=/data/switch-embedded/env/bin/uwsgi --home /data/switch-embedded/env --vassals-include /data/switch-embedded/lib/process_management/process-default.ini --emperor /data/brilliant-vc/process-config --emperor-throttle 100 --emperor-stats /run/brilliant-vc/uwsgi_stats_socket --chmod-socket=600 --die-on-term --logto2 /data/brilliant-vc/logs/emperor.log
+
+# One bounded attempt only. Cleanup and any later retry require root review.
+Restart=no
+RuntimeMaxSec=600
+TimeoutStartSec=30
+TimeoutStopSec=15
+KillMode=control-group
+SendSIGKILL=yes
+Nice=10
+MemoryMax=100M
+CPUQuota=15%
+TasksMax=16
+LimitNOFILE=1024
+OOMScoreAdjust=600
+
+# The runtime can read stock firmware and root-owned credentials, but can write
+# only its two isolated roots. PrivateDevices plus the firmware stub flags keep
+# it away from the physical panel's Bluetooth/UART/load surfaces.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+PrivateDevices=yes
+DevicePolicy=closed
+ProtectSystem=strict
+ProtectHome=yes
+ReadOnlyPaths=/var/brilliant-vc/app /data/switch-embedded /data/brilliant-vc-credentials /etc/release_info.json /var/lib/update_manager/tracking_branch /etc/brilliant/content_preload/art_library
+ReadWritePaths=/data/brilliant-vc /run/brilliant-vc /run/brilliant-vc-approval
+InaccessiblePaths=/var/run/brilliant /run/dbus /run/udev /var/device_variables /var/brilliant
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes

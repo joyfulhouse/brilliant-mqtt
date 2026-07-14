@@ -14,7 +14,7 @@ from urllib.parse import quote
 
 from tools.brilliant_vc.launcher_preflight import LauncherPaths
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _PINNED_FIRMWARE = "v26.06.03.1"
 _RUNTIME_USER = "brilliant-vc"
 _PHYSICAL_SOCKET = Path("/var/run/brilliant/server_socket")
@@ -86,7 +86,10 @@ _EMBEDDED_STARTABLES = {
 }
 _BLOCKERS = (
     "runtime_credential_handoff_not_applied",
-    "nonroot_emperor_launcher_not_implemented",
+    "runtime_preparation_not_applied",
+    "nonroot_service_install_and_compatibility_validation_required",
+    "fresh_bootstrap_start_approval_required",
+    "coordinated_session_unit_and_approval_not_implemented",
     "arm_hardware_bootstrap_validation_required",
     "config_peripherals_live_validation_required",
     "remote_bridge_stub_live_validation_required",
@@ -130,7 +133,7 @@ class CandidateManifest:
             "log_output_directory": str(paths.log_dir),
             "error_log_storage_dir": str(paths.error_log_dir),
             "trace_dir": str(paths.trace_dir),
-            "art_preload_dir": "/etc/brilliant/content_preload/art_library",
+            "art_preload_dir": str(paths.art_preload_dir),
             "message_bus_unprivileged_user": _RUNTIME_USER,
             "disable_peripherals": list(_DISABLED_PROCESSES),
             "bootstrap_max_provisioning_attempts_per_code": 1,

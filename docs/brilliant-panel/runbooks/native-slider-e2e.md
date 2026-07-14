@@ -7,7 +7,9 @@ operation, or cleanup.
 
 Current status is **not ready for a live run**. The Office UI result involved
 offline legacy lights owned by the physical Control, no Virtual Control exists,
-and the operator has not authorized slider gestures. See the
+the implemented service is bootstrap-only, no coordinated 1,800-second
+light/cleanup service profile exists, and the operator has not authorized
+slider gestures. See the
 [validation status](../native-ha-slider-validation-status.md) before using this
 procedure.
 
@@ -66,12 +68,14 @@ Do not select a slider until every item passes:
 3. The identity materializer passes first in dry-run mode and then creates only
    the exact private `device.key`/`device.cert` pair.
 4. The dedicated non-root account exists, the root-private identity has passed
-   the credential handoff, and schema-4 no-start preflight confirms the 15
+   the credential handoff, and schema-5 no-start preflight confirms the 20
    pinned launcher/configuration files, message-bus-first lifecycle, exact
    ownership/path surface, and direct-runner rejection. It reports
    `runtime_credentials_present=true` and has advanced to
-   `nonroot_emperor_launcher_not_implemented` before the separately reviewed
-   launcher is installed.
+   `nonroot_service_install_and_compatibility_validation_required`. The
+   reference unit has then been staged without enabling it, passed on-panel
+   `systemd-analyze verify`, and the no-start preparer dry run passed as the
+   final service account.
 5. The bounded VC runtime and monitor pass with no physical-panel regression.
 6. Exactly one VC-owned type-27 `LIGHT` exists, its
    `configuration_peripheral_id` resolves to the VC's own type-19
@@ -82,6 +86,14 @@ Do not select a slider until every item passes:
    hand-written binding.
 
 The current legacy picker result satisfies none of items 2–8.
+
+The 600-second bootstrap-only approval explicitly forbids hosting a light. It
+cannot be extended or reused for items 6–8, and the first-run preparer rejects
+non-empty state/generated roots after that session. Before this runbook becomes
+executable, implement and review a separate clean-root coordinated-session unit
+and one-shot approval whose budget covers bootstrap, VC3/VC4 observation, the
+1,800-second light registration/cleanup window, and service teardown. No such
+artifact exists in this milestone.
 
 ## Gate B — capture the original Office binding
 
@@ -325,16 +337,21 @@ lights is an independent, separately approved operation.
 2. Provision one disposable VC after fresh approval and confirm official
    removal before starting it.
 3. Validate and materialize the actual official PKCS#12 locally.
-4. Implement the dedicated non-root runtime-principal handoff for only the
-   validated PEM pair and saved bootstrap blob. Schema-3 preflight currently
-   blocks here after materialization.
-5. After separate live-start approval, prove target-home bootstrap under the
+4. Create/review the dedicated account, apply the implemented four-file
+   credential handoff, and pass schema-5 preflight. Stage the implemented
+   reference unit without enabling it, verify it on Office, and pass the
+   captured-firmware preparer dry run as `brilliant-vc`.
+5. After a fresh ten-minute bootstrap-only approval plus separate live-start
+   authorization, prove target-home bootstrap under the
    stock message-bus-first Emperor lifecycle, including local derived bus
    addressing, stubbed BLE isolation, alternate remote-bridge/discovery paths,
    type-19 Device Configuration registration, and clean stop/removal.
-6. Run the isolated runtime/monitor and host the one online light.
-7. Review and implement the passive multi-panel transcript collector against
+6. Implement/review the separate clean-root coordinated-session unit and
+   one-shot approval; do not stretch or reuse the bootstrap-only unit.
+7. Under that future session, pass VC3/VC4, run the isolated monitor, and host
+   the one online light within its aggregate deadline.
+8. Review and implement the passive multi-panel transcript collector against
    that actual topology.
-8. Capture the original slider baseline and obtain binding approval.
-9. Obtain separate gesture permission; the current instruction forbids it.
-10. Run basic, restart, WAN, restoration, and supported-removal gates in order.
+9. Capture the original slider baseline and obtain binding approval.
+10. Obtain separate gesture permission; the current instruction forbids it.
+11. Run basic, restart, WAN, restoration, and supported-removal gates in order.

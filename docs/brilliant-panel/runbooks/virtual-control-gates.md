@@ -135,8 +135,9 @@ Static analysis plus network-disabled execution of the captured ARM firmware
 - `BootstrapParameters` contains a target home, server credential, and Wi-Fi
   map. It remains private and has not been parsed by a running official VC.
 
-No panel, Brilliant service, cloud endpoint, physical load, scene, slider, or
-HA entity was contacted by these off-panel spikes.
+No Brilliant service, cloud endpoint, physical load, scene, slider, or HA
+entity was contacted by these runtime spikes. The only later Office access was
+a read-only systemd version/service-state query; it changed no unit or process.
 
 Do not start the repository's shipped `run.py` against its physical defaults.
 It deletes the configured bus socket and recreates configured runtime
@@ -188,9 +189,14 @@ so neither command has been run with live material.
 
 Do not make the raw provisioner directory readable by the service account and
 do not run Emperor as root. First review a dedicated non-root `brilliant-vc`
-account whose primary group is also named `brilliant-vc`; account/service
-creation remains a separate implementation step. The handoff tool refuses root
-or a shared/differently named primary group.
+account whose primary group is also named `brilliant-vc`. Its UID and GID must
+each resolve to exactly one passwd/group record. Its password must be locked,
+its home must be `/nonexistent` and absent, and its shell must be
+`/usr/sbin/nologin`; it must have no supplementary groups or existing
+processes. `/etc/shadow` must be root-owned mode `0600` or `0640`. Account
+creation and review remain separate live steps. The handoff tool refuses root
+or a shared/differently named primary group, and the later preflight validates
+the full locked account contract.
 
 Dry-run the root-private inputs and exact destination:
 
@@ -234,8 +240,10 @@ service install, command builder, or start capability.
 of VC3. It has no panel-library import, subprocess call, socket connection,
 command builder, or start method. It validates:
 
-- the exact pinned firmware build and 15 launcher/configuration-file hashes;
-- fresh no-follow SHA-256 reads of all 15 actual installed files,
+- the exact pinned firmware build and 20 runtime/launch-chain file hashes and
+  exact `0644`/`0755` modes, including direct Python, uWSGI, the mover,
+  `process-default.ini`, `run_startable.py`, and the socket-parameter helper;
+- fresh no-follow SHA-256 reads of all 20 actual installed files,
   matched against both the snapshot and pinned digests;
 - the message-bus-first stock lifecycle, 38-process inventory, exact
   four-process candidate, 34-process disable count, embedded startables,
@@ -249,17 +257,21 @@ command builder, or start method. It validates:
   materialized PEM pair;
 - a disjoint root:`brilliant-vc` mode-`0750` credential tree whose four
   mode-`0640` files match their root-private sources byte-for-byte;
+- the locked, nologin, no-home, unique UID/GID-record, single-member
+  `brilliant-vc` account contract and protected mode-`0600`/`0640` shadow file;
 - service-owned mode-`0700` persistent, state, process-config, flagfile,
   embedded-startable, log, error, trace, and runtime directories;
 - empty writable runtime directories, two distinct nonexistent sockets, and
-  bounded regular release/tracking metadata; and
+  root-owned, single-link, exact mode-`0644` bounded release/tracking metadata;
+- an existing root-owned, non-symlink, exact mode-`0755` stock art catalog
+  outside every writable service root; and
 - canonical, distinct paths outside `/var/device_variables`,
   `/var/run/brilliant`, `/var/brilliant`, `/data/switch-embedded`, and the
   physical `/var/run/brilliant/server_socket`.
 
 Create a root-owned mode-`0600` sanitized introspection snapshot by copying and
 independently checking
-[`virtual-control-launcher-snapshot-v4.example.json`](../virtual-control-launcher-snapshot-v4.example.json).
+[`virtual-control-launcher-snapshot-v5.example.json`](../virtual-control-launcher-snapshot-v5.example.json).
 The example contains names, interface values, and hashes only. It contains no
 identity, token, bootstrap payload, home ID, or credential.
 
@@ -296,7 +308,7 @@ all states it reports `uwsgi_contract_confirmed=true`,
 `stock_process_manager_lifecycle_confirmed=true`,
 `nonroot_emperor_confirmed=true`,
 `full_path_surface_validated=true`, `candidate_manifest_present=true`,
-`launcher_implementation_present=false`, and `start_permitted=false`:
+`launcher_implementation_present=true`, and `start_permitted=false`:
 
 - before identity materialization:
   `certificate_material_present=false` and
@@ -308,20 +320,139 @@ all states it reports `uwsgi_contract_confirmed=true`,
   `runtime_credentials_present=true`,
   `runtime_user_handoff_complete=true`,
   `identity_contract_complete=true`, and
-  `blocked_reason=nonroot_emperor_launcher_not_implemented`.
+  `blocked_reason=nonroot_service_install_and_compatibility_validation_required`.
 
 `tools.brilliant_vc.vassal_manifest` renders the redacted four-process
 candidate and all remaining blockers. It is data-only and always reports
 `contains_start_primitive=false` and `start_permitted=false`.
 
-The next implementation blocker is a reviewed service definition and bounded
-launcher that runs both `run.pre_exec` and Emperor as `brilliant-vc`, hardens
-generated directories to `0700`, and never grants root to a vassal. After that,
-real-ARM bootstrap must prove target-home assignment, the type-19 config record,
-alternate bus/bridge addresses, peer discovery, physical-hardware isolation,
-and clean stop/removal. That test needs separate approval after provisioning.
-Do not weaken the preflight, invoke physical `run.py` defaults, invoke the
-physical `BootstrapPeripheral`, or turn the no-start manifest into a command.
+### No-start runtime preparation
+
+`tools.brilliant_vc.runtime_prepare` is the implemented pre-start boundary. It
+must execute as the exact non-root `brilliant-vc` account. Dry run validates
+the current 20 file hashes and modes, empty service roots, final credentials and
+certificate, the read-only stock art catalog, exact four/34 process split, and
+isolated argv without importing firmware or writing anything. The command
+below is shown from an already-established `brilliant-vc` service-user session;
+running it as root is rejected:
+
+```text
+cd /data/switch-embedded
+env \
+  PYTHONPATH=/var/brilliant-vc/app:/data/switch-embedded:/data/switch-embedded/env/lib/python3.10/site-packages \
+  PYTHONDONTWRITEBYTECODE=1 \
+  TMPDIR=/run/brilliant-vc \
+  /usr/bin/python3.10 -m tools.brilliant_vc.runtime_prepare
+```
+
+The expected dry-run result includes:
+
+```text
+dry_run=true
+firmware_matches=true
+runtime_identity_valid=true
+runtime_credentials_valid=true
+runtime_credential_bundle_sha256=<64 lowercase hex characters>
+disabled_process_count=34
+contains_emperor_start_primitive=false
+emperor_started=false
+blocked_reason=fresh_start_approval_required
+```
+
+Apply is reserved for the service's `ExecStartPre`; do not run it manually as a
+substitute for start approval. It requires the exact root:`brilliant-vc`
+mode-`0640` document in
+[`virtual-control-start-approval.example.json`](../virtual-control-start-approval.example.json),
+issued no more than ten minutes earlier. The schema allows only an Office,
+firmware-`v26.06.03.1`, 600-second bootstrap and explicitly forbids a hosted
+light and physical-device actions. The tracked example's timestamp and
+all-zero credential digest are deliberate invalid placeholders; never stage it
+as an approval.
+
+The approval source is
+`/run/brilliant-vc-approval/start-approval.json` in a root:`brilliant-vc`
+mode-`0750` directory and binds the exact credential-bundle SHA-256 printed by
+the handoff/preparer dry run. The service account cannot create, replace, or
+delete it. The first pre-start uses the pinned immutable stock mover as its only
+privileged operation to rename it atomically to
+`start-approval-consumed.json`; no repository code runs root. The non-root
+preparer requires the source to be absent, validates the single-link mode-`0640`
+marker and bundle digest, calls only captured `run.pre_exec`, and accepts only
+four exact flagfiles, two hosted-startable files, one `message_bus.ini`, and an
+empty error directory. It parses complete contents, requires isolated paths and
+numeric non-root overrides, hardens directories/files to `0700`/`0600`, then
+rechecks the complete root inventory and empty state/log/trace/runtime
+directories. Missing, extra, linked, broad, empty, oversized, root-vassal,
+physical-path, or content drift blocks. A consumed marker/non-empty surface
+prevents blind reuse. The journal result records the approval run ID, approval
+digest, and credential-bundle digest.
+
+The captured process config constructor freezes flagfile paths at object
+creation. The preparer therefore limits initial gflag discovery to the four
+candidate configs, parses the isolated flags, rebuilds those config objects,
+and only then calls `pre_exec`. This avoids the discovered `/tmp/flagfiles`
+failure and avoids importing the 34 disabled process modules. Selected imports
+can invoke `/sbin/ldconfig -p` for a libc lookup; no Emperor, uWSGI, shell,
+socket, or Brilliant process is started by the preparer.
+
+A networkless ARM container run against the actual captured firmware passed
+this contract at synthetic UID/GID `12345:12345`, with read-only firmware,
+dummy credentials, no physical device mounts, and all unexpected child-process
+paths blocked. This remains preparation proof, not live bootstrap proof.
+
+### Reference service and staging gate
+
+[`deploy/brilliant-vc-pilot.service`](../../../deploy/brilliant-vc-pilot.service)
+is the reviewed start-bearing reference. It has no `[Install]` section and no
+repository automation installs, enables, or starts it. The unit:
+
+- runs only the pinned OS rename pre-start under systemd's narrow `!`
+  credential override; the preparer, Emperor, and all vassals run as
+  `brilliant-vc` with no capabilities;
+- invokes pinned `/usr/bin/python3.10` and uWSGI directly with no shell, stock
+  `emperor.ini`, zygote, fork server, or vassal fork base;
+- uses `Restart=no`, `RuntimeMaxSec=600`, `KillMode=control-group`, and bounded
+  CPU, memory, tasks, and file descriptors;
+- makes the reviewed root-owned app, firmware, credentials, release metadata,
+  and art catalog read-only;
+- makes the physical Brilliant socket/state paths, D-Bus, and udev
+  inaccessible; and
+- permits the runtime to write only below `/data/brilliant-vc` and
+  `/run/brilliant-vc`. The approval directory is allowlisted only for the root
+  mover; DAC keeps it non-writable to `brilliant-vc`.
+
+Stage only the modules required by `runtime_prepare` below
+`/var/brilliant-vc/app`. Require root ownership, non-writable directories and
+files, exact values from
+[`brilliant-vc-pilot-app-manifest.sha256`](../../../deploy/brilliant-vc-pilot-app-manifest.sha256),
+no symlinks, no `__pycache__`, and no extra files.
+`ReadOnlyPaths=/var/brilliant-vc/app` is a runtime backstop, not a substitute
+for staging review. Recheck that no process already runs under the service UID
+immediately before the start gate.
+
+The read-only Office check reported systemd `250 (250.5+)`; its stock message
+bus and existing MQTT bridge stayed active, and deployed community units
+already use `MemoryMax`/`CPUQuota`. Office `systemd-analyze` rejects stdin
+units, so full verification was intentionally not forced through a remote
+temporary file. Before installation, stage the reviewed file without enabling
+it, run `systemd-analyze verify` against that exact staged path, review every
+warning, run the preparer dry-run as the final account, and re-check the two
+physical services. Any unsupported hardening directive or missing read-only
+path is a block, not permission to weaken the unit casually.
+
+The 600-second unit and approval are bootstrap-only:
+`hosted_light_permitted=false`. Do not lengthen them, reuse the consumed
+marker, clean persistent state for a blind retry, or run the 1,800-second
+single-light pilot in this session. A future VC5 run needs a separately
+implemented and reviewed clean-root coordinated-session unit/approval with its
+own one-shot marker, runtime and cleanup budget, isolation, and failure
+handling. That artifact does not exist yet.
+
+After a separately approved start, real ARM must still prove target-home
+assignment, the type-19 config record, alternate bus/bridge addresses, peer
+discovery, physical-hardware isolation, and clean stop/removal. Do not weaken
+the preflight, invoke physical `run.py` defaults, invoke the physical
+`BootstrapPeripheral`, or treat the reference unit as authorization.
 
 Once that preflight passes, attach the bounded monitor:
 
@@ -343,8 +474,17 @@ only allowlisted event counters. The monitor validates PID start time and
 process name before signaling, sends SIGTERM once, and uses SIGKILL only if the
 same exact identity remains after ten seconds. It refuses the protected
 `message_bus`, `switch-ui`, and `brilliant-mqtt` process names.
+Main-PID RSS/CPU samples are supplemental. The service's cgroup-wide memory,
+CPU, task, time, and kill limits remain the aggregate safety boundary for the
+Emperor and all vassals.
 
 ## VC5 physical-slider acceptance
+
+**Hard implementation block:** the commands in this section document the
+off-panel-tested single-light interface. They are not a runnable continuation
+of `brilliant-vc-pilot.service`. Live/apply mode remains prohibited until the
+separate coordinated-session unit and one-shot approval described above are
+implemented, reviewed, and independently authorized.
 
 ### Single-light preflight
 
@@ -388,7 +528,8 @@ the snapshot exactly. A missing, renamed, or repeated type-19 candidate is
 blocked. The shared
 `brilliant_virtual_device_configuration` is always rejected.
 
-Dry run (line continuations shown only for readability):
+Future coordinated-session dry run (line continuations shown only for
+readability):
 
 ```text
 python -m tools.brilliant_vc.single_light_pilot \
@@ -413,9 +554,10 @@ physical Office identity, reserved virtual devices, any non-DeviceType-6 owner,
 a stale topology snapshot, or an absent/ambiguous/wrong-ID type-19 Device
 Configuration peripheral.
 
-Live mode additionally requires root, `--apply`, `--mqtt-host`, and optional
-root-only MQTT credential input. It accepts no HA URL or token. Start the VC
-monitor first, then add:
+After the coordinated-session blocker is implemented and separately approved,
+live mode additionally requires root, `--apply`, `--mqtt-host`, and optional
+root-only MQTT credential input. It accepts no HA URL or token. Start that
+future session's VC monitor first, then add:
 
 ```text
   --apply --mqtt-host <LAN-broker> --mqtt-port 1883 \

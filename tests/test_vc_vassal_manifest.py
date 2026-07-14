@@ -34,6 +34,7 @@ def _paths() -> LauncherPaths:
         stats_socket_path=runtime / "uwsgi_stats_socket",
         release_info_path=Path("/etc/release_info.json"),
         tracking_branch_path=Path("/var/lib/update_manager/tracking_branch"),
+        art_preload_dir=Path("/etc/brilliant/content_preload/art_library"),
     )
 
 
@@ -41,7 +42,7 @@ def test_candidate_manifest_pins_stock_lifecycle_without_a_start_primitive() -> 
     manifest = build_candidate_manifest(_paths())
     public = manifest.to_public_dict()
 
-    assert public["schema_version"] == 1
+    assert public["schema_version"] == 2
     assert public["firmware_version"] == "v26.06.03.1"
     assert public["runtime_user"] == "brilliant-vc"
     assert public["supervisor"] == {
@@ -132,7 +133,10 @@ def test_candidate_manifest_keeps_live_blockers_explicit() -> None:
 
     assert public["blockers"] == [
         "runtime_credential_handoff_not_applied",
-        "nonroot_emperor_launcher_not_implemented",
+        "runtime_preparation_not_applied",
+        "nonroot_service_install_and_compatibility_validation_required",
+        "fresh_bootstrap_start_approval_required",
+        "coordinated_session_unit_and_approval_not_implemented",
         "arm_hardware_bootstrap_validation_required",
         "config_peripherals_live_validation_required",
         "remote_bridge_stub_live_validation_required",

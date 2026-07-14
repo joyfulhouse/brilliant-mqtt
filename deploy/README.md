@@ -25,9 +25,20 @@ guide and `../INSTALL.md` for prerequisites including MQTT broker setup.
   `/etc/brilliant-ha-mirror.env` (a Home Assistant WebSocket URL + long-lived
   token, the mirror label, the leader priority, and the broker creds for the
   election). See [../docs/ha-mirror.md](../docs/ha-mirror.md).
+- `brilliant-vc-pilot.service` — **reference-only bounded Virtual Control
+  bootstrap unit**. It is not packaged or installed by automation and has no
+  `[Install]` section, so it is non-enableable by default. It must not be
+  included in normal panel automation.
+- `brilliant-vc-pilot-app-manifest.sha256` — exact seven-file staging manifest
+  for the reference unit's root-owned `/var/brilliant-vc/app` subset. Update it
+  only with reviewed source changes; it is an integrity input, not an installer.
+  See the
+  [runtime contract](../docs/brilliant-panel/virtual-control-runtime-contract.md)
+  and its separate approval/staging gates.
 
-The HA integration installs and enables these per panel automatically. To wire
-one up **manually**: drop the unit in `/etc/systemd/system/`, then
+The HA integration installs and enables the production units per panel
+automatically; it does not install the VC pilot reference. To wire one of the
+production units up **manually**: drop the unit in `/etc/systemd/system/`, then
 `systemctl enable --now <unit>`. The watchdog units read their settings from the
 same `/etc/brilliant-mqtt.env`.
 
