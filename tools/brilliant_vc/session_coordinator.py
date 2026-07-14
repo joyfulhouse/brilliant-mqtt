@@ -568,7 +568,7 @@ async def _wait_for_stable_topology(
             )
             validate_topology(config, observed)
             normalized = canonical_topology_bytes(observed)
-        except (PilotGuardError, TimeoutError, ConnectionError, OSError):
+        except (PilotGuardError, asyncio.TimeoutError, TimeoutError, ConnectionError, OSError):
             await _bounded_sleep(
                 _TOPOLOGY_RETRY_INTERVAL_S,
                 deadline_s=deadline_s,

@@ -364,6 +364,57 @@ async def test_stable_topology_records_vc3_vc4_then_runs_one_cleanup_proven_pilo
     assert all(path.stat().st_mode & 0o777 == 0o600 for path in paths.output_root.iterdir())
 
 
+async def test_topology_probe_asyncio_timeout_retries_before_stable_session(
+    tmp_path: Path,
+) -> None:
+    paths = _paths(tmp_path)
+    approval = _approval()
+    clock = FakeClock(APPROVED_AT_S + 50)
+    lease = FakeLease()
+    probe_calls = 0
+    pilot_calls = 0
+
+    async def probe(_config: PilotConfig) -> TopologySnapshot:
+        nonlocal probe_calls
+        probe_calls += 1
+        if probe_calls == 1:
+            raise asyncio.TimeoutError
+        return _topology()
+
+    async def pilot(**_kwargs: object) -> CleanupReport:
+        nonlocal pilot_calls
+        pilot_calls += 1
+        return CleanupReport(already_clean=False, absent_first=True, absent_second=True)
+
+    async def monitor(*, output_jsonl: Path, stop: Event, **_kwargs: object) -> str | None:
+        _write_monitor_evidence(output_jsonl, None)
+        await asyncio.to_thread(stop.wait)
+        return None
+
+    result = await coordinate_session(
+        approval=approval,
+        config=_config(),
+        vc2_ledger=_ledger(),
+        vc2_ledger_sha256=approval.vc2_gate_ledger_sha256,
+        mqtt_password=None,
+        paths=paths,
+        runtime_uid=os.getuid(),
+        revalidate_approval=lambda: approval,
+        validate_process=_identity,
+        topology_probe=probe,
+        pilot_runner=pilot,
+        monitor_runner=monitor,
+        lease_factory=lambda: lease,
+        wall_time_s=clock.wall_time_s,
+        sleep=clock.sleep,
+    )
+
+    assert result.succeeded is True
+    assert probe_calls == 3
+    assert pilot_calls == 1
+    assert lease.released is True
+
+
 async def test_topology_instability_exhausts_bootstrap_without_starting_light(
     tmp_path: Path,
 ) -> None:
