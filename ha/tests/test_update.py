@@ -8,6 +8,7 @@ copy bound into its own namespace by a `from .manager import _payload_dir`.
 
 from __future__ import annotations
 
+import importlib
 from pathlib import Path
 
 import pytest
@@ -15,13 +16,15 @@ from homeassistant.core import HomeAssistant
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 from pytest_homeassistant_custom_component.typing import MqttMockHAClient
 
-# Deliberately at module scope (the regression): importing the platform here used to
-# freeze the real `_payload_dir`, so the `payload_dir` patch never reached the entity
-# and setup read the Task-11-only agent_payload/VERSION (FileNotFoundError).
-import custom_components.brilliant_mqtt.update  # noqa: F401
 from custom_components.brilliant_mqtt.const import DOMAIN
 from tests.fakes import FakeShell
 from tests.test_init import ENTRY_DATA
+
+# Deliberately at module scope (the regression): importing the platform here used to
+# freeze the real `_payload_dir`, so the `payload_dir` patch never reached the entity
+# and setup read the Task-11-only agent_payload/VERSION (FileNotFoundError).
+# importlib keeps this an explicit side-effect import (no unused-import name).
+importlib.import_module("custom_components.brilliant_mqtt.update")
 
 UPDATE = "update.brilliant_office_bridge"
 
