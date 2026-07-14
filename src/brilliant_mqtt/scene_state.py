@@ -264,11 +264,7 @@ def atomic_write_state(path: Path, state: SceneState) -> None:
 
 def _normalize_permissions(path: Path) -> None:
     os.chmod(path, 0o600)
-    descriptor = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    _fsync_directory(path)
     os.chmod(path.parent, 0o700)
     _fsync_directory(path.parent)
 
