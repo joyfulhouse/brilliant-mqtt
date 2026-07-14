@@ -864,9 +864,27 @@ class PanelManager:
         no special handling here.
         """
         async with self._ssh_lock:
-            shell = self._shell()
             try:
-                await shell.connect()
+                shell = await self._connect_for_repair()
+            except _HostKeyChanged as err:
+                # A rotated host key with auto-re-pin OFF: never offer the password to
+                # the new-key host. Service-call context → escalate AND raise so HA
+                # reports the uninstall as failed (not a false success).
+                self._escalate(
+                    "panel SSH host key changed — Reconfigure to re-pin, or enable "
+                    "'Trust host-key changes' in options"
+                )
+                raise HomeAssistantError(
+                    translation_domain=DOMAIN, translation_key="host_key_changed"
+                ) from err
+            except (OSError, asyncssh.Error) as err:
+                self._escalate(f"agent uninstall failed: {err}")
+                raise HomeAssistantError(
+                    translation_domain=DOMAIN,
+                    translation_key="uninstall_failed",
+                    translation_placeholders={"error": str(err)},
+                ) from err
+            try:
                 await panel_ops.uninstall(shell)
             except (OSError, asyncssh.Error, PanelOpError) as err:
                 self._escalate(f"agent uninstall failed: {err}")

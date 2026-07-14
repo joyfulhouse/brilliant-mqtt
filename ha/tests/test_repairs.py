@@ -208,3 +208,25 @@ async def test_update_host_key_changed_raises_translated_error(
         await manager.async_update_agent()
     assert err.value.translation_domain == DOMAIN
     assert err.value.translation_key == "host_key_changed"
+
+
+async def test_uninstall_host_key_changed_raises_translated_error(
+    hass: HomeAssistant,
+    repin_shells: object,
+) -> None:
+    """A rotated host key during uninstall raises translation_key='host_key_changed'.
+
+    Before this fix, async_uninstall connected via a plain pinned shell and mapped
+    every connect/op failure (including HostKeyNotVerifiable) to the generic
+    uninstall_failed key. It now routes through _connect_for_repair(), like
+    async_update_agent and _voice_ssh_session, so a rotated host key surfaces its
+    own dedicated error instead of being folded into uninstall_failed.
+    """
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    manager = PanelManager(hass, entry, asyncio.Lock())
+
+    with pytest.raises(HomeAssistantError) as err:
+        await manager.async_uninstall()
+    assert err.value.translation_domain == DOMAIN
+    assert err.value.translation_key == "host_key_changed"
