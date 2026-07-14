@@ -757,7 +757,6 @@ class SceneBridge:
                 validate_scene_command_context(command, topic_panel=self._panel, retained=retained)
                 value = command.scene_id
             else:
-                kind = "mode"
                 command = decode_mode_command(payload, now_ms=self._clock_ms())
                 validate_mode_command_context(command, topic_panel=self._panel, retained=retained)
                 value = command.mode_id
@@ -772,7 +771,6 @@ class SceneBridge:
         execution_device_id: str | None = None
         needs_delivery = False
         needs_health = False
-        epoch = self._epoch
         async with self._lock:
             if not self._started or self._stopping:
                 return False
@@ -1253,23 +1251,13 @@ class SceneBridge:
 
 def _command_fingerprint(kind: str, command: SceneCommand | ModeCommand) -> str:
     identifier = command.scene_id if isinstance(command, SceneCommand) else command.mode_id
-    return _command_fingerprint_fields(
+    return command_fingerprint_fields(
         kind,
         command.command_id,
         command.panel,
         identifier,
         command.issued_at_ms,
     )
-
-
-def _command_fingerprint_fields(
-    kind: str,
-    command_id: str,
-    panel: str,
-    identifier: str,
-    issued_at_ms: int,
-) -> str:
-    return command_fingerprint_fields(kind, command_id, panel, identifier, issued_at_ms)
 
 
 def _decode_scene_records(device: BrilliantDevice) -> tuple[tuple[SceneExecution, ...], bool]:

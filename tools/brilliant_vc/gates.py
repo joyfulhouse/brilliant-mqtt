@@ -141,14 +141,11 @@ class GateLedger:
         for prerequisite in GATE_ORDER[: GATE_ORDER.index(gate)]:
             if self.status(prerequisite) is not GateStatus.PASS:
                 raise GateProgressionError(f"{prerequisite.value} must pass before {gate.value}")
-        if not summary or len(summary) > 500:
-            raise UnsafeEvidenceError("summary must contain 1 to 500 characters")
-        _assert_safe_text(summary, field="summary", reject_absolute=False)
         self._records[gate] = GateRecord(
             gate=gate,
             status=status,
             recorded_at=_utc_now(),
-            summary=summary,
+            summary=_safe_summary(summary),
             evidence=tuple(evidence),
         )
 
