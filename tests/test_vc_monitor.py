@@ -14,6 +14,7 @@ from tools.brilliant_vc.monitor import (
     calculate_cpu_percent,
     count_allowlisted_log_events,
     read_proc_snapshot,
+    run_bounded_monitor,
     terminate_exact_process,
 )
 
@@ -181,3 +182,97 @@ def test_public_sample_contains_only_allowlisted_scalar_fields() -> None:
     assert all(
         isinstance(value, (int, float, bool, str, list, type(None))) for value in payload.values()
     )
+
+
+def test_session_monitor_reports_abort_without_killing_bus_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    terminated: list[ProcSnapshot] = []
+    snapshot = ProcSnapshot(
+        pid=77,
+        process_ticks=1,
+        total_ticks=100,
+        rss_bytes=101 * 1024 * 1024,
+        start_ticks=900,
+        comm="uwsgi",
+    )
+    monkeypatch.setattr("tools.brilliant_vc.monitor.read_proc_snapshot", lambda *_args: snapshot)
+    monkeypatch.setattr(
+        "tools.brilliant_vc.monitor.terminate_exact_process",
+        lambda sample, **_kwargs: terminated.append(sample),
+    )
+    monkeypatch.setattr("tools.brilliant_vc.monitor.os.getloadavg", lambda: (0.1, 0.2, 0.3))
+
+    reason = run_bounded_monitor(
+        pid=77,
+        duration_s=60,
+        interval_s=5,
+        output_jsonl=tmp_path / "monitor.jsonl",
+        terminate_on_abort=False,
+    )
+
+    assert reason == "rss_bytes"
+    assert terminated == []
+    assert json.loads((tmp_path / "monitor.jsonl").read_text())["abort_reason"] == "rss_bytes"
+
+
+def test_session_monitor_can_stop_before_another_proc_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reads = 0
+
+    def read(*_args: object) -> ProcSnapshot:
+        nonlocal reads
+        reads += 1
+        raise AssertionError("proc must not be read after the external stop")
+
+    monkeypatch.setattr("tools.brilliant_vc.monitor.read_proc_snapshot", read)
+
+    reason = run_bounded_monitor(
+        pid=77,
+        duration_s=60,
+        interval_s=5,
+        output_jsonl=tmp_path / "monitor.jsonl",
+        terminate_on_abort=False,
+        stop_requested=lambda: True,
+    )
+
+    assert reason is None
+    assert reads == 0
+    assert (tmp_path / "monitor.jsonl").read_bytes() == b""
+
+
+def test_session_monitor_exclusively_creates_its_evidence_file(tmp_path: Path) -> None:
+    output = tmp_path / "monitor.jsonl"
+    output.write_text("stale\n", encoding="utf-8")
+    output.chmod(0o600)
+
+    with pytest.raises(FileExistsError):
+        run_bounded_monitor(
+            pid=77,
+            duration_s=60,
+            interval_s=5,
+            output_jsonl=output,
+            terminate_on_abort=False,
+            stop_requested=lambda: True,
+            exclusive_output=True,
+        )
+
+
+def test_session_monitor_binds_its_first_sample_to_expected_process_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    snapshot = ProcSnapshot(77, 1, 100, 1024, 900, "uwsgi")
+    monkeypatch.setattr("tools.brilliant_vc.monitor.read_proc_snapshot", lambda *_args: snapshot)
+    monkeypatch.setattr("tools.brilliant_vc.monitor.os.getloadavg", lambda: (0.1, 0.2, 0.3))
+
+    with pytest.raises(RuntimeError, match="identity changed"):
+        run_bounded_monitor(
+            pid=77,
+            duration_s=60,
+            interval_s=5,
+            output_jsonl=tmp_path / "monitor.jsonl",
+            terminate_on_abort=False,
+            expected_start_ticks=901,
+            expected_comm="uwsgi",
+        )

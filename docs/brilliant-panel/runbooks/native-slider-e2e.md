@@ -7,9 +7,8 @@ operation, or cleanup.
 
 Current status is **not ready for a live run**. The Office UI result involved
 offline legacy lights owned by the physical Control, no Virtual Control exists,
-the implemented service is bootstrap-only, no coordinated 1,800-second
-light/cleanup service profile exists, and the operator has not authorized
-slider gestures. See the
+the implemented coordinated 1,800-second light/cleanup profile has never been
+staged or run, and the operator has not authorized slider gestures. See the
 [validation status](../native-ha-slider-validation-status.md) before using this
 procedure.
 
@@ -89,11 +88,15 @@ The current legacy picker result satisfies none of items 2–8.
 
 The 600-second bootstrap-only approval explicitly forbids hosting a light. It
 cannot be extended or reused for items 6–8, and the first-run preparer rejects
-non-empty state/generated roots after that session. Before this runbook becomes
-executable, implement and review a separate clean-root coordinated-session unit
-and one-shot approval whose budget covers bootstrap, VC3/VC4 observation, the
-1,800-second light registration/cleanup window, and service teardown. No such
-artifact exists in this milestone.
+non-empty state/generated roots after that session. The separate clean-root
+coordinated-session unit, source/vendor gate, coordinator, and one-shot approval
+are implemented with a budget covering bootstrap, VC3/VC4 observation, the
+1,800-second light registration/cleanup window, and service teardown. This
+removes the implementation blocker only. Captured-ARM no-start preparation,
+the exact direct-uWSGI option/`--pidfile` parse, production-default staged
+manifest validation, and off-panel systemd 252 verification passed on
+2026-07-14. Exact on-panel systemd 250 review and fresh authorization remain
+mandatory.
 
 ## Gate B — capture the original Office binding
 
@@ -346,12 +349,17 @@ lights is an independent, separately approved operation.
    stock message-bus-first Emperor lifecycle, including local derived bus
    addressing, stubbed BLE isolation, alternate remote-bridge/discovery paths,
    type-19 Device Configuration registration, and clean stop/removal.
-6. Implement/review the separate clean-root coordinated-session unit and
-   one-shot approval; do not stretch or reuse the bootstrap-only unit.
-7. Under that future session, pass VC3/VC4, run the isolated monitor, and host
-   the one online light within its aggregate deadline.
-8. Review and implement the passive multi-panel transcript collector against
-   that actual topology.
+6. Review the implemented clean-root coordinated-session unit, exact staged
+   manifest, and one-shot approval. The captured-ARM/off-panel checks are
+   complete; stage and run the exact systemd 250 verifier only after approval,
+   and do not start yet. Do not stretch or reuse the bootstrap-only unit.
+7. Under a separately authorized session, pass VC3/VC4, run the isolated
+   monitor, and host the one online light within its aggregate deadline.
+8. After the real owner/peripheral IDs exist, prove one exact scoped native
+   read on Office and one peer, then review and implement the passive
+   multi-panel transcript collector against those adapters. The analyzer and
+   schema are complete; inventing a whole-home or unvalidated collector before
+   this topology proof is prohibited.
 9. Capture the original slider baseline and obtain binding approval.
 10. Obtain separate gesture permission; the current instruction forbids it.
 11. Run basic, restart, WAN, restoration, and supported-removal gates in order.

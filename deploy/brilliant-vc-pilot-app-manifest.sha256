@@ -2,6 +2,6 @@
 892cc667e5923979655124b4d31ffbc45f5db78024e96ae5a2bf2b15ca65e518  /var/brilliant-vc/app/tools/brilliant_vc/__init__.py
 4f58e0623d7244e7d09c14d02f97274f092fce0d1d5c7363cdc7bdcbcb7e0af4  /var/brilliant-vc/app/tools/brilliant_vc/launcher_preflight.py
 4d62a5f6304b747e0f3a68fe221bf03aea59940249b87961e0e3cab77ac659de  /var/brilliant-vc/app/tools/brilliant_vc/runtime_handoff.py
-370288b713378b10bef2d62d795ccf9f5cf652560b4cdf3f68e20df8675d1928  /var/brilliant-vc/app/tools/brilliant_vc/runtime_prepare.py
+cde5d2436f02d6452971437f53f01d4dc056b183eb6bc5b1de95810623948eff  /var/brilliant-vc/app/tools/brilliant_vc/runtime_prepare.py
 0e1450f1f94ec8454fb0d0887b860362209d82a23b0122fb9f128402065a9e34  /var/brilliant-vc/app/tools/brilliant_vc/start_approval.py
 22a64d2019ff4b4d42b8e888b242553062815c3040685c3a6268dd04aaf07cb0  /var/brilliant-vc/app/tools/brilliant_vc/vassal_manifest.py

@@ -357,11 +357,24 @@ light and its 600-second deadline is shorter than the single-light pilot's
 1,800-second registration/cleanup budget. It must not be stretched, restarted,
 or reused for VC5. After a bootstrap run, persistent state and generated files
 are intentionally non-empty, so the first-run preparer fails closed on retry.
-A future one-session E2E attempt requires a separately reviewed clean-root
-coordinated-session unit and approval whose deadline covers bootstrap, VC3/VC4
-observation, one light, and cleanup. That profile is not implemented in this
-milestone; the documented 1,800-second light command is non-executable until it
-exists.
+
+The required separate profile is now implemented in
+[`coordinated-session-design.md`](coordinated-session-design.md),
+[`deploy/brilliant-vc-session.service`](../../deploy/brilliant-vc-session.service),
+and `tools.brilliant_vc.{session_approval,session_prepare,session_coordinator}`.
+It has a different consumed marker, fixed VC2/password inputs, empty evidence
+and control roots, exact source/vendor staging gate, and an absolute
+2,520-second deadline. It binds the direct uWSGI PID/executable/UID/GID/cgroup,
+requires two normalized scoped topologies ten seconds apart, records VC3/VC4,
+hosts one approval-bound light while monitoring, and proves two-read deletion.
+It leaves VC5 `not_run`. The profile has passed focused repository tests, a
+production-default 14-app/19-vendor manifest rehearsal, captured-ARM no-start
+preparation, the exact captured-uWSGI option/`--pidfile` parse, and an
+off-panel systemd 252 unit verify. It is not staged, installed, authorized, or
+live evidence. The 2026-07-14 read-only Office check found every session path
+and the `brilliant-vc` account absent while the native bus, UI, and MQTT bridge
+remained active; only the exact on-panel systemd 250 verify is still a staging
+gate.
 
 ## Remote-bridge hardware isolation
 
@@ -456,9 +469,9 @@ The remaining order is strict:
    resource limits, and the exact VC-owned configuration set; stop on any
    unexpected owner or physical-device access.
 8. Stop: the bootstrap-only unit cannot host the 1,800-second light pilot.
-   Implement and review a separate clean-root coordinated-session unit and
-   one-shot approval before attempting VC5.
-9. Under that future session, start the one-light pilot only after VC3/VC4
+   Review and separately authorize the implemented clean-root coordinated
+   session; never reuse the bootstrap marker or roots.
+9. Under that separately authorized session, start the one-light pilot only after VC3/VC4
    pass, then confirm the online tile on two panels and picker admission.
 10. Snapshot one named physical slider and obtain separate native-UI binding
    approval. Physical gestures remain separately prohibited unless the user

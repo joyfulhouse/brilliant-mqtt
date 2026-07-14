@@ -443,10 +443,10 @@ path is a block, not permission to weaken the unit casually.
 The 600-second unit and approval are bootstrap-only:
 `hosted_light_permitted=false`. Do not lengthen them, reuse the consumed
 marker, clean persistent state for a blind retry, or run the 1,800-second
-single-light pilot in this session. A future VC5 run needs a separately
-implemented and reviewed clean-root coordinated-session unit/approval with its
-own one-shot marker, runtime and cleanup budget, isolation, and failure
-handling. That artifact does not exist yet.
+single-light pilot in this session. The separate clean-root coordinated-session
+unit/approval, source/vendor gate, coordinator, and failure handling now exist
+with their own marker and budget. They remain reference-only and have not been
+staged, authorized, or run; implementation is not permission to continue.
 
 After a separately approved start, real ARM must still prove target-home
 assignment, the type-19 config record, alternate bus/bridge addresses, peer
@@ -478,13 +478,21 @@ Main-PID RSS/CPU samples are supplemental. The service's cgroup-wide memory,
 CPU, task, time, and kill limits remain the aggregate safety boundary for the
 Emperor and all vassals.
 
+That signaling behavior is the standalone monitor default. The coordinated
+service selects report-only mode, binds the first sample to the approved
+Emperor start time/name, requests the light lifecycle to stop on an abort, and
+waits for two-read deletion before its non-zero `ExecStartPost` result lets
+systemd stop the cgroup.
+
 ## VC5 physical-slider acceptance
 
-**Hard implementation block:** the commands in this section document the
+**Live authorization block:** the commands in this section document the
 off-panel-tested single-light interface. They are not a runnable continuation
-of `brilliant-vc-pilot.service`. Live/apply mode remains prohibited until the
-separate coordinated-session unit and one-shot approval described above are
-implemented, reviewed, and independently authorized.
+of `brilliant-vc-pilot.service`. The separate coordinated-session artifacts are
+implemented. Their exact manifest, captured-ARM no-start path, direct-uWSGI
+options, and off-panel systemd 252 parse passed on 2026-07-14. Live/apply remains
+prohibited until exact on-panel systemd 250 verification and independent
+authorization pass.
 
 ### Single-light preflight
 
@@ -528,8 +536,8 @@ the snapshot exactly. A missing, renamed, or repeated type-19 candidate is
 blocked. The shared
 `brilliant_virtual_device_configuration` is always rejected.
 
-Future coordinated-session dry run (line continuations shown only for
-readability):
+Standalone scoped dry run after an authorized VC bootstrap (line continuations
+shown only for readability):
 
 ```text
 python -m tools.brilliant_vc.single_light_pilot \
@@ -554,10 +562,12 @@ physical Office identity, reserved virtual devices, any non-DeviceType-6 owner,
 a stale topology snapshot, or an absent/ambiguous/wrong-ID type-19 Device
 Configuration peripheral.
 
-After the coordinated-session blocker is implemented and separately approved,
-live mode additionally requires root, `--apply`, `--mqtt-host`, and optional
-root-only MQTT credential input. It accepts no HA URL or token. Start that
-future session's VC monitor first, then add:
+The standalone live CLI retains its original root-only `--apply` guard and is
+not the coordinated service path. The implemented non-root coordinator instead
+calls the same public lifecycle only after consuming its exact approval,
+binding VC2/runtime/password digests, proving VC3/VC4, starting its exact-PID
+monitor, and acquiring its service-owned lease. It accepts no HA URL or token.
+For interface reference only, the standalone flags are:
 
 ```text
   --apply --mqtt-host <LAN-broker> --mqtt-port 1883 \
@@ -566,7 +576,7 @@ future session's VC monitor first, then add:
   --lease-dir /run/brilliant-vc-control
 ```
 
-Before apply-mode live bus preflight, the process acquires a nonblocking
+Before standalone apply-mode live bus preflight, the process acquires a nonblocking
 root-owned mode `0600` lease at
 `/run/brilliant-vc-control/single-light-pilot.lock`; the separate control
 directory must be a real root-owned mode `0700` directory. Keeping this lock
@@ -574,6 +584,11 @@ away from the service-owned VC socket directory allows the vassals to remain
 non-root. The lease remains held through native cleanup, so a second invocation
 cannot race registration or delete the first invocation's peripheral. A stale
 unlocked lease file is reusable and is not a registration.
+
+The coordinated unit does not use that root-only CLI lease. Its non-root
+coordinator holds the same lock implementation under the distinct
+service-owned mode-`0700` `/run/brilliant-vc-session` root, already bound by the
+session preparer and sandbox.
 
 The host creates exactly one `PeripheralHost`, one stable
 `ha_vc_<stable-uuid-hex>` `LIGHT` registration, and passes only the disposable

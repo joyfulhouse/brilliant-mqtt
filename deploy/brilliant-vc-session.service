@@ -1,0 +1,76 @@
+[Unit]
+# Reference-only coordinated Virtual Control session. Repository automation
+# never installs, enables, or starts this unit.
+Description=Brilliant Virtual Control coordinated one-light session (bounded, non-root)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/run/brilliant-vc-session-approval/session-approval.json
+ConditionPathIsDirectory=/run/brilliant-vc-session-approval
+
+[Service]
+Type=simple
+User=brilliant-vc
+Group=brilliant-vc
+WorkingDirectory=/data/switch-embedded
+Environment=PYTHONPATH=/var/brilliant-vc/app:/var/brilliant-vc/vendor:/data/switch-embedded:/data/switch-embedded/env/lib/python3.10/site-packages PYTHONDONTWRITEBYTECODE=1 TMPDIR=/run/brilliant-vc
+UMask=0077
+
+# Validate the complete root-owned app and MQTT vendor inventory before the
+# one-shot approval is consumed. This call is read-only and runs non-root.
+ExecStartPre=/usr/bin/python3.10 -m tools.brilliant_vc.staged_runtime
+
+# The ! prefix changes only systemd's user/group credential application for
+# this pinned immutable mover. No repository code runs as root.
+ExecStartPre=!/usr/bin/mv.coreutils --no-clobber --no-target-directory /run/brilliant-vc-session-approval/session-approval.json /run/brilliant-vc-session-approval/session-approval-consumed.json
+
+# Validate the consumed session schema, VC2 ledger, broker credential digest,
+# current runtime certificate bundle, isolated roots, and exact firmware pins;
+# invoke only captured run.pre_exec and start no managed process.
+ExecStartPre=/usr/bin/python3.10 -m tools.brilliant_vc.session_prepare --apply
+
+# systemd owns the direct non-root Emperor and all four stock vassals. The PID
+# file is rebound to executable/UID/GID/start-time/cgroup checks by ExecStartPost.
+ExecStart=/data/switch-embedded/env/bin/uwsgi --home /data/switch-embedded/env --vassals-include /data/switch-embedded/lib/process_management/process-default.ini --emperor /data/brilliant-vc/process-config --emperor-throttle 100 --emperor-stats /run/brilliant-vc/uwsgi_stats_socket --pidfile /run/brilliant-vc/emperor.pid --chmod-socket=600 --die-on-term --logto2 /data/brilliant-vc/logs/emperor.log
+
+# This remains part of service activation. It proves stable VC topology, hosts
+# one approval-bound light, monitors the exact Emperor, and proves deletion.
+ExecStartPost=/usr/bin/python3.10 -m tools.brilliant_vc.session_coordinator --apply
+
+# The approval's absolute 2520-second budget is authoritative. The extra 60
+# seconds is emergency systemd margin only. RuntimeMax starts after activation.
+Restart=no
+TimeoutStartSec=2580
+RuntimeMaxSec=1
+TimeoutStopSec=75
+KillMode=control-group
+SendSIGKILL=yes
+Nice=10
+MemoryMax=100M
+CPUQuota=15%
+TasksMax=24
+LimitNOFILE=1024
+OOMScoreAdjust=600
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+PrivateDevices=yes
+DevicePolicy=closed
+ProtectSystem=strict
+ProtectHome=yes
+ReadOnlyPaths=/var/brilliant-vc/app /var/brilliant-vc/vendor /var/brilliant-vc/session-app-manifest.sha256 /data/switch-embedded /data/brilliant-vc-credentials /data/brilliant-vc-session-input /etc/release_info.json /var/lib/update_manager/tracking_branch /etc/brilliant/content_preload/art_library
+ReadWritePaths=/data/brilliant-vc /run/brilliant-vc /data/brilliant-vc-session /run/brilliant-vc-session /run/brilliant-vc-session-approval
+InaccessiblePaths=/var/run/brilliant /run/dbus /run/udev /var/device_variables /var/brilliant
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes

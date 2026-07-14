@@ -16,12 +16,14 @@ from tools.brilliant_vc.launcher_preflight import LauncherPaths
 from tools.brilliant_vc.runtime_handoff import runtime_credential_bundle_sha256
 from tools.brilliant_vc.runtime_prepare import (
     FirmwarePreparer,
+    RuntimeApproval,
     RuntimePrepareError,
     RuntimePrepareResult,
     _runtime_account,
     _StockFirmwarePreparer,
     prepare_runtime_no_start,
 )
+from tools.brilliant_vc.start_approval import validate_start_approval
 from tools.brilliant_vc.vassal_manifest import build_candidate_manifest
 
 DEVICE_ID = "a" * 32
@@ -411,6 +413,57 @@ def test_apply_prepares_exact_nonroot_stock_contract_and_hardens_outputs(tmp_pat
     assert marker.exists()
     assert approval.exists() is False
     assert marker.parent != paths.runtime_dir
+
+
+def test_approval_validator_is_explicitly_injectable_without_changing_the_default(
+    tmp_path: Path,
+) -> None:
+    paths = _paths(tmp_path)
+    source = tmp_path / "approval-control/start-approval.json"
+    marker = source.parent / "start-approval-consumed.json"
+    _approval(source)
+    source.rename(marker)
+    preparer = FakeFirmwarePreparer(paths)
+    calls: list[Path] = []
+
+    def validator(
+        path: Path,
+        *,
+        now_s: int,
+        credential_uid: int,
+        runtime_gid: int,
+        allowed_paths: Sequence[Path],
+    ) -> RuntimeApproval:
+        calls.append(path)
+        return validate_start_approval(
+            path,
+            now_s=now_s,
+            credential_uid=credential_uid,
+            runtime_gid=runtime_gid,
+            allowed_paths=allowed_paths,
+        )
+
+    result = prepare_runtime_no_start(
+        paths,
+        now_s=NOW_S,
+        apply=True,
+        approval_marker=marker,
+        runtime_user=RUNTIME_USER,
+        runtime_uid=os.getuid(),
+        runtime_gid=os.getgid(),
+        credential_uid=os.getuid(),
+        actual_module_hashes=_module_hashes(),
+        firmware_preparer=preparer,
+        approval_validator=validator,
+        allowed_persistent_roots=(paths.persistent_root,),
+        allowed_runtime_roots=(paths.runtime_dir,),
+        allowed_runtime_credential_paths=(paths.runtime_credential_dir,),
+        allowed_approval_marker_paths=(marker,),
+        unconsumed_approval_paths=(source,),
+    )
+
+    assert calls == [marker]
+    assert result.approval_validated is True
 
 
 def test_stock_preparer_limits_pre_exec_discovery_to_candidate_processes(

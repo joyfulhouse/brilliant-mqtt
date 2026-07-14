@@ -114,6 +114,17 @@ class CleanupError(RuntimeError):
     """Raised when two absence observations cannot prove cleanup."""
 
 
+class PilotRunError(PilotGuardError):
+    """A live-pilot failure whose local cleanup outcome is still known."""
+
+    def __init__(self, failure_class: str, *, cleanup_report: CleanupReport) -> None:
+        if re.fullmatch(r"[a-z][a-z0-9_]{0,63}", failure_class) is None:
+            raise ValueError("pilot failure class is invalid")
+        super().__init__("live pilot failed after bounded cleanup")
+        self.failure_class = failure_class
+        self.cleanup_report = cleanup_report
+
+
 class PilotLease:
     """One process-wide live-pilot lease held from preflight through cleanup."""
 
@@ -247,6 +258,30 @@ class TopologySnapshot:
         if type(device_type) is not int:
             raise PilotGuardError("topology device_type must be an integer")
         return cls(owner, device_type, tuple(peripherals), frozenset(rooms))
+
+
+def canonical_topology_bytes(topology: TopologySnapshot) -> bytes:
+    """Serialize one normalized topology deterministically for evidence binding."""
+
+    def key(item: PeripheralRecord) -> tuple[str, str, str, int]:
+        return item.owner_device_id, item.peripheral_id, item.role, item.peripheral_type
+
+    payload = {
+        "schema_version": TOPOLOGY_SCHEMA_VERSION,
+        "owner_device_id": topology.owner_device_id,
+        "device_type": topology.device_type,
+        "peripherals": [
+            {
+                "owner_device_id": item.owner_device_id,
+                "peripheral_id": item.peripheral_id,
+                "role": item.role,
+                "peripheral_type": item.peripheral_type,
+            }
+            for item in sorted(topology.peripherals, key=key)
+        ],
+        "room_ids": sorted(topology.room_ids),
+    }
+    return (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1061,7 +1096,7 @@ def _record_live_peripheral(
     )
 
 
-async def _probe_live_topology(config: PilotConfig) -> TopologySnapshot:
+async def probe_live_topology(config: PilotConfig) -> TopologySnapshot:
     """Discover the VC's own config candidate and room catalog with scoped reads."""
 
     from lib.serialization import deserialize
@@ -1169,22 +1204,23 @@ async def _finish_live_resources(
     unsubscribe: Callable[[], Awaitable[None]],
     *,
     deadline: float | None = None,
-) -> None:
+) -> CleanupReport:
     """Drain reader failures, then always delete, prove absence, and unsubscribe."""
 
     if reader is not None:
         reader.cancel()
         await asyncio.gather(reader, return_exceptions=True)
+    report: CleanupReport | None = None
     try:
         if deadline is None:
-            await lifecycle.cleanup()
+            report = await lifecycle.cleanup()
         else:
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
                 raise CleanupError("pilot cleanup deadline elapsed before deletion")
             cleanup = asyncio.create_task(lifecycle.cleanup())
             try:
-                await asyncio.wait_for(asyncio.shield(cleanup), timeout=remaining)
+                report = await asyncio.wait_for(asyncio.shield(cleanup), timeout=remaining)
             except asyncio.CancelledError as cancellation:
                 remaining = deadline - asyncio.get_running_loop().time()
                 if remaining <= 0:
@@ -1208,6 +1244,8 @@ async def _finish_live_resources(
                 raise CleanupError("pilot cleanup exceeded the total runtime deadline") from None
     finally:
         await unsubscribe()
+    assert report is not None
+    return report
 
 
 class _TransportEnded(ConnectionError):
@@ -1395,7 +1433,7 @@ def validate_gate_ledger(path: Path, *, expected_run_id: str, required_uid: int)
             raise PilotGuardError(f"{gate.value} must pass before the single-light pilot")
 
 
-async def _run_live(
+async def run_live_pilot(
     *,
     config: PilotConfig,
     topology: TopologySnapshot,
@@ -1403,19 +1441,22 @@ async def _run_live(
     mqtt_port: int,
     mqtt_username: str | None,
     mqtt_password: str | None,
-) -> None:
+    stop: asyncio.Event | None = None,
+    install_signal_handlers: bool = True,
+) -> CleanupReport:
     import aiomqtt
     from thrift_types.configuration.ttypes import RoomAssignment
 
-    stop = asyncio.Event()
+    stop_event = asyncio.Event() if stop is None else stop
     loop = asyncio.get_running_loop()
     total_deadline = loop.time() + config.runtime_s
     active_deadline = total_deadline - _SHUTDOWN_RESERVE_S
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, stop.set)
-        except (NotImplementedError, RuntimeError):
-            pass
+    if install_signal_handlers:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, stop_event.set)
+            except (NotImplementedError, RuntimeError):
+                pass
 
     publisher = _LivePublisher()
     host = LivePeripheralHost(loop=loop, socket_path=config.vc_socket)
@@ -1442,6 +1483,8 @@ async def _run_live(
     async def no_unsubscribe() -> None:
         return None
 
+    cleanup: CleanupReport | None = None
+    failure: Exception | None = None
     try:
         await _run_reconnecting_transport(
             config=config,
@@ -1450,16 +1493,22 @@ async def _run_live(
             publisher=publisher,
             client_factory=client_factory,
             retryable_errors=(aiomqtt.MqttError, _TransportEnded, _StateReplayTimeout),
-            stop=stop,
+            stop=stop_event,
             deadline=active_deadline,
         )
+    except Exception as error:
+        failure = error
     finally:
-        await _finish_live_resources(
+        cleanup = await _finish_live_resources(
             None,
             lifecycle,
             no_unsubscribe,
             deadline=total_deadline,
         )
+    assert cleanup is not None
+    if failure is not None:
+        raise PilotRunError("live_transport_failure", cleanup_report=cleanup) from failure
+    return cleanup
 
 
 def _decode_mqtt_payload(payload: object) -> str:
@@ -1627,7 +1676,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise PilotGuardError("MQTT port must be from 1 to 65535")
         lease = PilotLease.acquire(args.lease_dir, required_uid=required_uid)
     try:
-        observed_topology = asyncio.run(_probe_live_topology(config))
+        observed_topology = asyncio.run(probe_live_topology(config))
         _require_matching_live_topology(topology, observed_topology, config)
         public = {
             "dry_run": not args.apply,
@@ -1659,7 +1708,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             finally:
                 _wipe(raw_password)
         asyncio.run(
-            _run_live(
+            run_live_pilot(
                 config=config,
                 topology=observed_topology,
                 mqtt_host=args.mqtt_host,

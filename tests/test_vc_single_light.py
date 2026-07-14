@@ -36,6 +36,7 @@ from tools.brilliant_vc.single_light_pilot import (
     brightness_to_intensity,
     build_command_payload,
     build_variable_definitions,
+    canonical_topology_bytes,
     command_topic,
     discover_configuration_peripheral,
     intensity_to_brightness,
@@ -92,6 +93,31 @@ def _topology() -> TopologySnapshot:
             PeripheralRecord(VC_ID, "alarm_config_peripheral", "configuration", 48),
         ),
         room_ids=frozenset({ROOM_ID}),
+    )
+
+
+def test_topology_canonical_bytes_sort_every_set_like_field() -> None:
+    topology = _topology()
+    reordered = TopologySnapshot(
+        owner_device_id=topology.owner_device_id,
+        device_type=topology.device_type,
+        peripherals=tuple(reversed(topology.peripherals)),
+        room_ids=frozenset({"room-z", ROOM_ID, "room-a"}),
+    )
+    expected = TopologySnapshot(
+        owner_device_id=topology.owner_device_id,
+        device_type=topology.device_type,
+        peripherals=topology.peripherals,
+        room_ids=frozenset({ROOM_ID, "room-a", "room-z"}),
+    )
+
+    serialized = canonical_topology_bytes(reordered)
+
+    assert serialized == canonical_topology_bytes(expected)
+    payload = json.loads(serialized)
+    assert payload["room_ids"] == sorted({ROOM_ID, "room-a", "room-z"})
+    assert [item["peripheral_id"] for item in payload["peripherals"]] == sorted(
+        item.peripheral_id for item in topology.peripherals
     )
 
 
@@ -882,11 +908,12 @@ async def test_failed_mqtt_reader_cannot_skip_live_cleanup() -> None:
         nonlocal unsubscribed
         unsubscribed = True
 
-    await _finish_live_resources(reader, lifecycle, unsubscribe)
+    cleanup = await _finish_live_resources(reader, lifecycle, unsubscribe)
 
     assert host.deletes == [peripheral_id_for(STABLE_ID)]
     assert host.shutdowns == 1
     assert unsubscribed is True
+    assert cleanup.absent_first is True and cleanup.absent_second is True
 
 
 async def test_cancellation_waits_for_bounded_cleanup_before_propagating() -> None:

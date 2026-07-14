@@ -188,6 +188,17 @@ executable without granting them mutation authority:
   600-second/control-group/resource limits, hidden physical paths/devices,
   empty capabilities, and isolated writes. It has not been staged, installed,
   enabled, or started and is explicitly bootstrap-only.
+- `tools.brilliant_vc.session_approval`, `session_prepare`, and
+  `session_coordinator` implement the separate exact 2,520-second session:
+  approval/VC2/runtime digest binding, two stable scoped reads, VC3/VC4 ledger
+  progression, exact Emperor PID/start/cgroup monitoring, one 1,800-second
+  light lifecycle, active deadline guards, and two-read deletion proof. VC5 is
+  deliberately left `not_run` for the operator binding/gesture gate.
+- `tools.brilliant_vc.staged_runtime` plus
+  `deploy/brilliant-vc-session-app-manifest.sha256` enforce the exact root-owned
+  source and MQTT vendor surface. `deploy/brilliant-vc-session.service` is the
+  non-enableable reference unit; none of these artifacts has been staged or
+  run on Office.
 - `tools.brilliant_vc.vassal_manifest` renders the redacted four-process
   candidate, exact 34-process disable set, type-19 config candidate, and
   isolated flags. It contains no firmware import, identity read, write,
@@ -214,11 +225,12 @@ one `message_bus.ini`, all at mode `0600`, without starting uWSGI. A read-only
 Office query confirmed systemd `250.5+`; exact staged-unit verification and all
 live runtime behavior remain blocked.
 
-The bootstrap approval forbids a hosted light, and its 600-second unit cannot
-contain the single-light pilot's 1,800-second lifecycle/cleanup budget. A
-separate clean-root coordinated-session unit and one-shot approval are a hard
-implementation gate before the light/picker/control path is runnable; neither
-the bootstrap deadline nor consumed marker may be stretched or reused.
+The bootstrap approval still forbids a hosted light, and its 600-second unit
+cannot contain the single-light pilot's 1,800-second lifecycle/cleanup budget.
+The separate clean-root coordinated-session unit, schema, source gate, and
+coordinator now exist in the repository; this removes the code-design blocker,
+not the live authorization or evidence blocker. Neither the bootstrap deadline
+nor its consumed marker may be stretched or reused.
 
 The complete evidence and candidate topology are in the
 [Virtual Control runtime contract](virtual-control-runtime-contract.md).

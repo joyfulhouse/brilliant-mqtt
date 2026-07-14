@@ -35,6 +35,14 @@ guide and `../INSTALL.md` for prerequisites including MQTT broker setup.
   See the
   [runtime contract](../docs/brilliant-panel/virtual-control-runtime-contract.md)
   and its separate approval/staging gates.
+- `brilliant-vc-session.service` — **reference-only coordinated-session unit**
+  for one clean-root bootstrap, two stable topology observations, one bounded
+  HA-backed light, exact-PID monitoring, and proven deletion. It has no
+  `[Install]` section and is not installed or started by repository automation.
+- `brilliant-vc-session-app-manifest.sha256` — exact source plus `aiomqtt`/Paho
+  vendor inventory consumed by the coordinated unit's read-only staging gate.
+  See the
+  [coordinated-session contract](../docs/brilliant-panel/coordinated-session-design.md).
 
 The HA integration installs and enables the production units per panel
 automatically; it does not install the VC pilot reference. To wire one of the

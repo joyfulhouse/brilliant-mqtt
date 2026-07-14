@@ -172,10 +172,10 @@ binary and all 20 pinned runtime/launch-chain files matched the exact
     installation of the reference service, plus application of the implemented
     credential handoff to an official identity.
 15. Safe live semantics of `stub_ble_peripheral=true` on a co-hosted panel.
-16. A clean-root coordinated-session unit/approval whose aggregate deadline
-    can cover bootstrap, VC3/VC4 observation, the 1,800-second light pilot, and
-    cleanup. The current 600-second approval is bootstrap-only and forbids a
-    hosted light.
+16. On-panel compatibility and live execution of the implemented clean-root
+    coordinated-session unit/approval. Its repository contract covers
+    bootstrap, VC3/VC4 observation, the 1,800-second light pilot, cleanup, and
+    teardown, but none has run on Office.
 
 ## Implemented validation components
 
@@ -186,7 +186,10 @@ binary and all 20 pinned runtime/launch-chain files matched the exact
 | `tools.brilliant_vc.token_check` | Claims-only validation of the exact self-bootstrap permission | Off-panel tested; no official token available |
 | `tools.brilliant_vc.provision_panel` | Single guarded official self-bootstrap call and private identity persistence | Off-panel tested; never applied |
 | `tools.brilliant_vc.monitor` | Bounded process/resource/physical-lag abort monitor | Off-panel tested; no VC process exists |
-| `tools.brilliant_vc.single_light_pilot` | One VC-owned HA-backed `LIGHT`, retained-state fencing, exactly-once command contract, type-19 Device Configuration selection, and cleanup | Off-panel tested; live/apply is non-executable until a separate coordinated-session unit/approval exists |
+| `tools.brilliant_vc.single_light_pilot` | One VC-owned HA-backed `LIGHT`, retained-state fencing, exactly-once command contract, type-19 Device Configuration selection, and cleanup | Off-panel tested; public lifecycle is consumed only by the separately approved coordinator, while its standalone CLI retains its root-only apply gate |
+| `tools.brilliant_vc.session_approval` / `session_prepare` | Exact 2,520-second one-shot scope plus VC2/password/runtime binding and captured no-start preparation | Off-panel tested; never staged or applied on Office |
+| `tools.brilliant_vc.session_coordinator` | Exact Emperor identity/cgroup, two stable topology reads, VC3/VC4, monitor, one-light lifecycle, active deadline guard, cleanup, and terminal evidence | Off-panel fake-clock/failure-path tested; never run on Office and never records VC5 pass |
+| `tools.brilliant_vc.staged_runtime` and `deploy/brilliant-vc-session.service` | Exact source/MQTT vendor gate and non-enableable coordinated activation profile | 14-app/19-vendor production-default staging rehearsal, captured-ARM direct-uWSGI parse, and systemd 252 verify passed on 2026-07-14; exact on-panel systemd 250 verify remains; never installed or started |
 | `tools.brilliant_vc.slider_binding` | Scoped own-Control read, strict `slider_config` decoding, private baseline, and exact restoration verdict | Off-panel tested; no baseline captured and no binding written |
 | `tools.brilliant_vc.e2e_acceptance` | Offline correlation of operator gesture, MQTT command/result/state, and two-panel convergence | Off-panel tested; no gestures performed or transcript collected |
 | `tools.brilliant_vc.identity_materializer` | Strict PKCS#12/device-certificate validation and exclusive, rollback-on-error creation of only `device.key` and `device.cert` | Off-panel tested with generated identities; no official identity exists |
@@ -224,7 +227,7 @@ ahead by hand-writing a `slider_config` or borrowing Office's identity.
 | 7 | Review/create the dedicated account, dry-run/apply the credential handoff, run schema-5 preflight, stage and verify the reference unit without enabling it, then run the preparer dry-run as that account. | Four runtime inputs are root:`brilliant-vc` `0640`; writable roots are service-owned `0700`; all 20 hashes/modes and path/topology checks pass; `systemd-analyze verify` is clean; physical services remain unchanged. | **Handoff/preflight/preparer/reference unit implemented; captured-firmware preparation passed**. No account, official input, handoff apply, unit staging/install, or on-panel unit verification. Exact handoff reports `nonroot_service_install_and_compatibility_validation_required`. |
 | 8 | With a fresh exact bootstrap-only approval and separate live-start authorization, run the bounded isolated VC under the service and monitor. | Approval is consumed once; correct DeviceType-6 owner joins the target home; remote bridge/discovery, peer, cgroup/resource, and physical-latency limits pass; unit stops within 600 seconds. | **Not run or authorized**. The documented approval forbids physical actions and hosting a light. |
 | 9 | Inventory only the VC-owned graph and configuration peripherals. | Owner is the provisioned DeviceType-6 ID; exactly one type-19 `device_config_peripheral` exists, while the grouped type-16, type-20, and type-48 records are merely inventoried. | **Not run**. |
-| 10 | Implement/review a separate clean-root coordinated-session unit and one-shot approval, then dry-run and separately approve the one-light pilot. | Its aggregate deadline covers bootstrap, VC3/VC4 observation, the 1,800-second light lifecycle, and cleanup; one stable VC-owned `LIGHT` is online in Backyard on two panels. | **Hard implementation block**. The bootstrap-only unit/approval cannot be stretched or reused. |
+| 10 | Review/stage the implemented clean-root coordinated-session unit and one-shot approval, then obtain separate authorization for that exact session. | Its aggregate deadline covers bootstrap, VC3/VC4 observation, the 1,800-second light lifecycle, and cleanup; one stable VC-owned `LIGHT` is online in Backyard on two panels. | **Repository and off-panel validation complete; live blocked**. Captured-ARM no-start/options, the exact staged manifest, and off-panel systemd 252 verify passed. Exact on-panel systemd 250 verify, review, and authorization remain; the bootstrap marker cannot be reused. |
 | 11 | Check the online VC light in the native slider picker. | The VC-owned light is offered without writing `slider_config` manually. | **Not run**; legacy picker result does not substitute. |
 | 12 | Snapshot one named Office slider's complete original binding and behavior. | Private canonical snapshot is mode `0600`; a read-only verifier can prove exact restoration later. | **Helper implemented; no slider chosen or snapshot captured**. |
 | 13 | Obtain fresh approval for that named slider, then have the operator bind it through the native UI. | Saved binding resolves to the disposable VC/light; all other slider/load configs are byte-identical. | **Not authorized**. |
@@ -245,9 +248,11 @@ review the account, apply the implemented handoff, pass schema-5 preflight,
 stage/verify the reference unit and preparer dry-run without enabling it, and
 only then seek separate approval to install and start the bounded real-ARM
 bootstrap/home-assignment test.
-That bootstrap test cannot continue into VC5. A separate clean-root
-coordinated-session unit/approval must be implemented and reviewed before the
-one-light command becomes executable.
+That bootstrap test cannot continue into VC5. The separate clean-root
+coordinated-session unit/approval and frozen manifest are now implemented and
+passed the captured-ARM/off-panel service checks. Exact on-panel systemd 250
+review and independent authorization must still pass before its one-light
+command becomes executable on Office.
 The first physical-slider mutation must remain the operator's native-UI binding
 after an online VC light and private original-binding snapshot exist.
 

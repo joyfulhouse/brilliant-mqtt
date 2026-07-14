@@ -349,11 +349,13 @@ def _read_optional_bool(path: Path | None) -> bool:
     return bool(value)
 
 
-def _open_private_jsonl(path: Path) -> int:
+def _open_private_jsonl(path: Path, *, exclusive: bool = False) -> int:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.is_symlink():
         raise RuntimeError("output path must not be a symlink")
     flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+    if exclusive:
+        flags |= os.O_EXCL
     descriptor = os.open(path, flags, 0o600)
     metadata = os.fstat(descriptor)
     if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) & 0o077:
@@ -373,6 +375,11 @@ def run_bounded_monitor(
     mqtt_latency_file: Path | None = None,
     physical_lag_file: Path | None = None,
     proc_root: Path = Path("/proc"),
+    terminate_on_abort: bool = True,
+    stop_requested: Callable[[], bool] | None = None,
+    exclusive_output: bool = False,
+    expected_start_ticks: int | None = None,
+    expected_comm: str | None = None,
 ) -> str | None:
     """Run the bounded monitor and return the first abort reason, if any."""
 
@@ -380,12 +387,28 @@ def run_bounded_monitor(
         raise ValueError("duration_s must be between 60 and 90000")
     if interval_s <= 0 or interval_s > duration_s:
         raise ValueError("interval_s must be positive and no longer than duration_s")
+    if not isinstance(terminate_on_abort, bool) or not isinstance(exclusive_output, bool):
+        raise ValueError("monitor mode flags must be booleans")
+    if (expected_start_ticks is None) != (expected_comm is None):
+        raise ValueError("expected process identity must be complete")
+    if expected_start_ticks is not None and (
+        isinstance(expected_start_ticks, bool)
+        or not isinstance(expected_start_ticks, int)
+        or expected_start_ticks <= 0
+        or not isinstance(expected_comm, str)
+        or not expected_comm
+    ):
+        raise ValueError("expected process identity is invalid")
 
     monitor = Monitor(
         thresholds=Thresholds(),
-        terminator=lambda sample: terminate_exact_process(sample, proc_root=proc_root),
+        terminator=(
+            (lambda sample: terminate_exact_process(sample, proc_root=proc_root))
+            if terminate_on_abort
+            else (lambda _sample: None)
+        ),
     )
-    descriptor = _open_private_jsonl(output_jsonl)
+    descriptor = _open_private_jsonl(output_jsonl, exclusive=exclusive_output)
     started = time.monotonic()
     journal_offset = (
         journal_file.stat().st_size if journal_file is not None and journal_file.exists() else 0
@@ -393,12 +416,19 @@ def run_bounded_monitor(
     abort_reason: str | None = None
     try:
         while time.monotonic() - started <= duration_s:
+            if stop_requested is not None and stop_requested():
+                break
             lines, journal_offset = _read_new_lines(journal_file, journal_offset)
             peer_count_value = _read_optional_number(peer_count_file, integer=True)
             mqtt_latency_value = _read_optional_number(mqtt_latency_file, integer=False)
+            process = read_proc_snapshot(proc_root, pid)
+            if expected_start_ticks is not None and (
+                process.start_ticks != expected_start_ticks or process.comm != expected_comm
+            ):
+                raise RuntimeError("monitored process identity changed")
             observation = Observation(
                 timestamp_s=int(time.time()),
-                process=read_proc_snapshot(proc_root, pid),
+                process=process,
                 load_average=os.getloadavg(),
                 peer_count=None if peer_count_value is None else int(peer_count_value),
                 event_deltas=count_allowlisted_log_events(lines),

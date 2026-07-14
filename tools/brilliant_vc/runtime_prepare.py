@@ -40,7 +40,7 @@ from tools.brilliant_vc.runtime_handoff import (
     runtime_credential_bundle_sha256,
     validate_pem_identity,
 )
-from tools.brilliant_vc.start_approval import StartApprovalError, validate_start_approval
+from tools.brilliant_vc.start_approval import validate_start_approval
 from tools.brilliant_vc.vassal_manifest import ManifestError, build_candidate_manifest
 
 _RUNTIME_USER = "brilliant-vc"
@@ -95,6 +95,36 @@ class FirmwarePreparer(Protocol):
     """Narrow adapter for the captured, no-start ``run.pre_exec`` call."""
 
     def prepare(self, argv: Sequence[str], *, runtime_user: str) -> None: ...
+
+
+class RuntimeApproval(Protocol):
+    """Minimum validated approval identity consumed by stock preparation."""
+
+    @property
+    def run_id(self) -> str: ...
+
+    @property
+    def sha256(self) -> str: ...
+
+    @property
+    def runtime_credential_bundle_sha256(self) -> str: ...
+
+
+class RuntimeApprovalValidator(Protocol):
+    """Exact keyword contract for a separately selected approval schema."""
+
+    def __call__(
+        self,
+        path: Path,
+        *,
+        now_s: int,
+        credential_uid: int,
+        runtime_gid: int,
+        allowed_paths: Sequence[Path],
+    ) -> RuntimeApproval: ...
+
+
+_DEFAULT_APPROVAL_VALIDATOR = cast(RuntimeApprovalValidator, validate_start_approval)
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,6 +237,7 @@ def prepare_runtime_no_start(
     runtime_gid: int,
     actual_module_hashes: Mapping[str, object],
     firmware_preparer: FirmwarePreparer | None = None,
+    approval_validator: RuntimeApprovalValidator = _DEFAULT_APPROVAL_VALIDATOR,
     credential_uid: int = 0,
     allowed_persistent_roots: Sequence[Path] = _DEFAULT_PERSISTENT_ROOTS,
     allowed_runtime_roots: Sequence[Path] = _DEFAULT_RUNTIME_ROOTS,
@@ -282,14 +313,14 @@ def prepare_runtime_no_start(
     ):
         raise RuntimePrepareError("approval control directory overlaps a writable root")
     try:
-        approval = validate_start_approval(
+        approval = approval_validator(
             approval_marker,
             now_s=now_s,
             credential_uid=credential_uid,
             runtime_gid=runtime_gid,
             allowed_paths=allowed_approval_marker_paths,
         )
-    except StartApprovalError as error:
+    except ValueError as error:
         raise RuntimePrepareError(str(error)) from None
     if not secrets.compare_digest(
         approval.runtime_credential_bundle_sha256,
