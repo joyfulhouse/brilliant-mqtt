@@ -23,6 +23,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from tools.brilliant_vc._common import redact as _redact
+from tools.brilliant_vc._common import wipe as _wipe
+
 _IDENTITY_FILES = frozenset({"device_id", "pkcs12_certificate", "bootstrap", "metadata.json"})
 _DEVICE_ID = re.compile(r"^[0-9a-f]{32}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -466,17 +469,8 @@ def _utc_timestamp(value: datetime) -> int:
     return int(value.timestamp())
 
 
-def _redact(value: str) -> str:
-    return f"{value[:4]}…{value[-4:]}"
-
-
 def _redact_fingerprint(value: str) -> str:
     return f"{value[:8]}…{value[-8:]}"
-
-
-def _wipe(value: bytearray) -> None:
-    for index in range(len(value)):
-        value[index] = 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:

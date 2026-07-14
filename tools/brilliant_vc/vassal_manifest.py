@@ -12,11 +12,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote
 
+from tools.brilliant_vc._common import PINNED_FIRMWARE as _PINNED_FIRMWARE
+from tools.brilliant_vc._common import RUNTIME_USER as _RUNTIME_USER
 from tools.brilliant_vc.launcher_preflight import LauncherPaths
 
 _SCHEMA_VERSION = 2
-_PINNED_FIRMWARE = "v26.06.03.1"
-_RUNTIME_USER = "brilliant-vc"
 _PHYSICAL_SOCKET = Path("/var/run/brilliant/server_socket")
 _PHYSICAL_REMOTE_BRIDGE_PORT = 5455
 _DEVICE_ID_PLACEHOLDER = "<private:device_id>"

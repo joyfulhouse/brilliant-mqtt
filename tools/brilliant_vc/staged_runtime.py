@@ -28,6 +28,7 @@ _MAX_STAGED_FILE_BYTES = 2 * 1024 * 1024
 EXPECTED_APP_ENTRIES = (
     "tools/__init__.py",
     "tools/brilliant_vc/__init__.py",
+    "tools/brilliant_vc/_common.py",
     "tools/brilliant_vc/gates.py",
     "tools/brilliant_vc/launcher_preflight.py",
     "tools/brilliant_vc/monitor.py",

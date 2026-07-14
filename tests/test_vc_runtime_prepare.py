@@ -909,6 +909,7 @@ def test_pilot_app_manifest_pins_the_exact_staged_runtime_subset() -> None:
     expected = {
         "tools/__init__.py",
         "tools/brilliant_vc/__init__.py",
+        "tools/brilliant_vc/_common.py",
         "tools/brilliant_vc/launcher_preflight.py",
         "tools/brilliant_vc/runtime_handoff.py",
         "tools/brilliant_vc/runtime_prepare.py",

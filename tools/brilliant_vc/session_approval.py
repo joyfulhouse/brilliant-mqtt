@@ -18,16 +18,16 @@ from pathlib import Path
 from typing import cast
 from uuid import UUID
 
+from tools.brilliant_vc._common import PINNED_FIRMWARE as _PINNED_FIRMWARE
+from tools.brilliant_vc._common import wipe as _wipe
 from tools.brilliant_vc.start_approval import (
     StartApprovalError,
     _read_approval_file,
     _unique_json_object,
-    _wipe,
 )
 
 _SCHEMA_VERSION = 1
 _PANEL = "office"
-_PINNED_FIRMWARE = "v26.06.03.1"
 _PURPOSE = "coordinated_virtual_control_single_light_session"
 _AGGREGATE_RUNTIME_LIMIT_S = 2520
 _BOOTSTRAP_TIMEOUT_S = 600

@@ -1072,17 +1072,19 @@ class SceneBridge:
             if event.delivered and key not in dependencies:
                 self._events.pop(key)
 
-    def _has_global_capacity(self) -> bool:
-        self._prune_events()
-        result_room = self._reserve_result_slots(1)
-        has_room = (
+    def _within_capacity(self) -> bool:
+        return (
             len(self._events) < _EVENT_OUTBOX_LIMIT
-            and result_room
             and len(self._results) + len(self._pending_records) < _RESULT_CACHE_LIMIT
             and len(self._pending_records) < _PENDING_LIMIT
             and len(self._watermarks) < _SCENE_WATERMARK_LIMIT
             and len(self._mode_watermarks) < _MODE_WATERMARK_LIMIT
         )
+
+    def _has_global_capacity(self) -> bool:
+        self._prune_events()
+        result_room = self._reserve_result_slots(1)
+        has_room = result_room and self._within_capacity()
         if not has_room:
             self._state_reason = "state_capacity"
         return has_room
@@ -1153,14 +1155,7 @@ class SceneBridge:
         return None
 
     def _clear_capacity_if_room(self) -> None:
-        if (
-            self._state_reason == "state_capacity"
-            and len(self._events) < _EVENT_OUTBOX_LIMIT
-            and len(self._results) + len(self._pending_records) < _RESULT_CACHE_LIMIT
-            and len(self._pending_records) < _PENDING_LIMIT
-            and len(self._watermarks) < _SCENE_WATERMARK_LIMIT
-            and len(self._mode_watermarks) < _MODE_WATERMARK_LIMIT
-        ):
+        if self._state_reason == "state_capacity" and self._within_capacity():
             self._state_reason = None
 
     def _track_task(self, coroutine: Coroutine[object, object, None]) -> asyncio.Task[None]:

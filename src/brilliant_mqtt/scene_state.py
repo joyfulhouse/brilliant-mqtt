@@ -220,9 +220,7 @@ def load_state(path: Path) -> LoadedSceneState:
 def atomic_write_state(path: Path, state: SceneState) -> None:
     """Synchronously validate and atomically replace one private state file."""
     validated = _parse_state(state_payload(state))
-    encoded = json.dumps(state_payload(validated), separators=(",", ":"), sort_keys=True).encode(
-        "utf-8"
-    )
+    encoded = encode_json(state_payload(validated)).encode("utf-8")
     if len(encoded) > MAX_STATE_BYTES:
         raise OSError("state snapshot exceeds byte limit")
 

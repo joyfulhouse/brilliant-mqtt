@@ -18,6 +18,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from tools.brilliant_vc._common import RUNTIME_USER as _RUNTIME_USER
 from tools.brilliant_vc.gates import GateLedger, GateName, GateStatus
 from tools.brilliant_vc.launcher_preflight import (
     LauncherPaths,
@@ -42,7 +43,6 @@ from tools.brilliant_vc.session_approval import (
     validate_session_approval,
 )
 
-_RUNTIME_USER = "brilliant-vc"
 _MAX_LEDGER_BYTES = 256 * 1024
 _MAX_PASSWORD_BYTES = 4 * 1024
 _DEFAULT_INPUT_ROOTS = (Path("/data/brilliant-vc-session-input"),)

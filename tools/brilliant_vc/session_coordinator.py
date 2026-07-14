@@ -23,6 +23,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from tools.brilliant_vc._common import redact as _redact_device_id
+from tools.brilliant_vc._common import wipe as _wipe
 from tools.brilliant_vc.gates import Evidence, GateLedger, GateName, GateStatus
 from tools.brilliant_vc.monitor import read_proc_snapshot, run_bounded_monitor
 from tools.brilliant_vc.runtime_prepare import (
@@ -1288,15 +1290,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     print(json.dumps(result.to_public_dict(), sort_keys=True))
     return 0 if result.succeeded else 2
-
-
-def _redact_device_id(value: str) -> str:
-    return f"{value[:4]}…{value[-4:]}"
-
-
-def _wipe(value: bytearray) -> None:
-    for index in range(len(value)):
-        value[index] = 0
 
 
 if __name__ == "__main__":
