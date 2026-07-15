@@ -197,11 +197,15 @@ class FakeCleanupClient:
         *,
         delete_failure_id: str | None = None,
         snapshot_gate: asyncio.Event | None = None,
+        snapshot_gate_call: int | None = None,
+        delete_gate: asyncio.Event | None = None,
         close_gate: asyncio.Event | None = None,
     ) -> None:
         self.snapshots = list(snapshots)
         self.delete_failure_id = delete_failure_id
         self.snapshot_gate = snapshot_gate
+        self.snapshot_gate_call = snapshot_gate_call
+        self.delete_gate = delete_gate
         self.close_gate = close_gate
         self.start_calls = 0
         self.snapshot_calls = 0
@@ -216,7 +220,9 @@ class FakeCleanupClient:
     async def snapshot_own_device(self) -> OwnDeviceSnapshot:
         self.snapshot_calls += 1
         self.events.append(f"snapshot:{self.snapshot_calls}")
-        if self.snapshot_gate is not None:
+        if self.snapshot_gate is not None and (
+            self.snapshot_gate_call is None or self.snapshot_calls == self.snapshot_gate_call
+        ):
             await self.snapshot_gate.wait()
         snapshot = self.snapshots.pop(0)
         if isinstance(snapshot, BaseException):
@@ -228,6 +234,8 @@ class FakeCleanupClient:
     ) -> None:
         self.delete_calls.append((device_id, peripheral_id, deletion_time_ms))
         self.events.append(f"delete:{peripheral_id}")
+        if self.delete_gate is not None:
+            await self.delete_gate.wait()
         if peripheral_id == self.delete_failure_id:
             raise RuntimeError("secret=/credentials/panel-password")
 
@@ -295,6 +303,30 @@ async def test_dry_run_reads_once_prints_one_report_and_has_no_side_effects(
     assert client.close_calls == 1
     assert sleeps == []
     assert writes == []
+
+
+async def test_apply_does_not_delete_prefix_matched_non_mirror_peripheral() -> None:
+    lookalike = _device(
+        "ha_thermostat",
+        "HA Thermostat",
+        peripheral_type=4,
+    )
+    client = FakeCleanupClient([_snapshot(lookalike), _snapshot()])
+
+    code, report = await run_cleanup(
+        client,
+        apply=True,
+        report_path=Path("/validated/report.json"),
+        now_ms=lambda: 1,
+        sleep=asyncio.sleep,
+        report_writer=lambda path, payload: None,
+    )
+
+    assert code == 0
+    assert report.candidates == ()
+    assert report.deleted_ids == ()
+    assert client.snapshot_calls == 1
+    assert client.delete_calls == []
 
 
 def test_validate_report_path_accepts_a_regular_file_in_safe_tree(tmp_path: Path) -> None:
@@ -645,12 +677,142 @@ async def test_runtime_failure_emits_only_a_sanitized_report_and_closes(
     payload = json.loads(output.out)
     assert code == 1
     assert payload["success"] is False
+    assert payload["deleted_ids"] == []
     assert payload["remaining_ids"] == ["ha_failed"]
     assert set(payload) == CleanupReport.public_fields()
     assert "secret" not in output.out
     assert "credentials" not in output.out
     assert output.err == ""
     assert client.close_calls == 1
+    assert json.loads(writes[-1])["success"] is False
+    assert json.loads(writes[-1])["deleted_ids"] == []
+
+
+async def test_apply_initial_snapshot_timeout_persists_failure_report(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    snapshot_gate = asyncio.Event()
+    client = FakeCleanupClient([_snapshot()], snapshot_gate=snapshot_gate)
+    writes: list[str] = []
+    operation = asyncio.create_task(
+        async_main(
+            ["--apply", "--snapshot", "/safe/cleanup/report.json"],
+            client_factory=lambda: client,
+            effective_uid=lambda: 0,
+            safe_root=Path("/safe/cleanup"),
+            path_validator=lambda path, safe_root: path,
+            now_ms=lambda: 1,
+            report_writer=lambda path, payload: writes.append(payload),
+            rpc_timeout_s=0.001,
+        )
+    )
+
+    done, _pending = await asyncio.wait({operation}, timeout=0.2)
+    try:
+        assert operation in done
+        assert operation.result() == 1
+        stdout_report = json.loads(capsys.readouterr().out)
+        durable_report = json.loads(writes[-1])
+        assert stdout_report["success"] is False
+        assert stdout_report["deleted_ids"] == []
+        assert durable_report["success"] is False
+        assert durable_report["deleted_ids"] == []
+        assert client.snapshot_calls == 1
+        assert client.delete_calls == []
+        assert client.close_calls == 1
+    finally:
+        if not operation.done():
+            operation.cancel()
+            await asyncio.gather(operation, return_exceptions=True)
+
+
+async def test_delete_rpc_timeout_stops_deletion_without_claiming_deletion(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    first = _device("ha_first", "HA First")
+    untouched = _device("ha_untouched", "HA Untouched")
+    delete_gate = asyncio.Event()
+    client = FakeCleanupClient(
+        [_snapshot(first, untouched), _snapshot()],
+        delete_gate=delete_gate,
+    )
+    writes: list[str] = []
+    operation = asyncio.create_task(
+        async_main(
+            ["--apply", "--snapshot", "/safe/cleanup/report.json"],
+            client_factory=lambda: client,
+            effective_uid=lambda: 0,
+            safe_root=Path("/safe/cleanup"),
+            path_validator=lambda path, safe_root: path,
+            now_ms=lambda: 1,
+            report_writer=lambda path, payload: writes.append(payload),
+            rpc_timeout_s=0.001,
+        )
+    )
+
+    done, _pending = await asyncio.wait({operation}, timeout=0.2)
+    try:
+        assert operation in done
+        assert operation.result() == 1
+        stdout_report = json.loads(capsys.readouterr().out)
+        durable_report = json.loads(writes[-1])
+        assert stdout_report["success"] is False
+        assert stdout_report["deleted_ids"] == []
+        assert stdout_report["remaining_ids"] == ["ha_first", "ha_untouched"]
+        assert durable_report["success"] is False
+        assert durable_report["deleted_ids"] == []
+        assert [call[1] for call in client.delete_calls] == ["ha_first"]
+        assert client.snapshot_calls == 2
+        assert client.close_calls == 1
+    finally:
+        if not operation.done():
+            operation.cancel()
+            await asyncio.gather(operation, return_exceptions=True)
+
+
+async def test_verification_snapshot_timeout_fails_closed_without_claiming_deletion(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    candidate = _device("ha_deleted", "HA Deleted")
+    verification_gate = asyncio.Event()
+    client = FakeCleanupClient(
+        [_snapshot(candidate), _snapshot()],
+        snapshot_gate=verification_gate,
+        snapshot_gate_call=2,
+    )
+    writes: list[str] = []
+    operation = asyncio.create_task(
+        async_main(
+            ["--apply", "--snapshot", "/safe/cleanup/report.json"],
+            client_factory=lambda: client,
+            effective_uid=lambda: 0,
+            safe_root=Path("/safe/cleanup"),
+            path_validator=lambda path, safe_root: path,
+            now_ms=lambda: 1,
+            report_writer=lambda path, payload: writes.append(payload),
+            rpc_timeout_s=0.001,
+        )
+    )
+
+    done, _pending = await asyncio.wait({operation}, timeout=0.2)
+    try:
+        assert operation in done
+        assert operation.result() == 1
+        stdout_report = json.loads(capsys.readouterr().out)
+        durable_report = json.loads(writes[-1])
+        assert stdout_report["success"] is False
+        assert stdout_report["deleted_ids"] == []
+        assert stdout_report["remaining_ids"] == ["ha_deleted"]
+        assert durable_report["success"] is False
+        assert durable_report["deleted_ids"] == []
+        assert durable_report["remaining_ids"] == ["ha_deleted"]
+        assert [call[1] for call in client.delete_calls] == ["ha_deleted"]
+        assert client.snapshot_calls == 2
+        assert client.close_calls == 1
+    finally:
+        if not operation.done():
+            operation.cancel()
+            await asyncio.gather(operation, return_exceptions=True)
 
 
 async def test_client_closes_after_start_or_snapshot_failure(

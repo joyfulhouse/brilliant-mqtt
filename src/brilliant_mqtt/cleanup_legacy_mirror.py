@@ -19,13 +19,14 @@ from collections import Counter
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import Any, Protocol, TypeVar, cast
 
 from brilliant_mqtt.bus import load_rpc_observer_class, normalize_peripheral
 from brilliant_mqtt.model import BrilliantDevice
 
 ALLOWED_ID_PREFIXES = ("ha_", "ha-pilot-", "zzz_mirror_")
 ALLOWED_NAME_PREFIXES = ("HA ", "HA_PILOT_", "ZZZ Mirror ")
+LEGACY_MIRROR_PERIPHERAL_TYPES = frozenset({1, 27, 45, 53, 74})
 # The July 2026 room-assignment pilot used display labels as peripheral IDs.
 # Keep these fail-closed instead of broadening the ID prefix allowlist to every
 # user-visible name beginning with "HA ".
@@ -42,6 +43,7 @@ SAFE_REPORT_ROOT = Path("/data/brilliant-mqtt/cleanup")
 
 _SOCKET_PATH = "/var/run/brilliant/server_socket"
 _CONNECT_TIMEOUT_S = 10.0
+_RPC_TIMEOUT_S = 10.0
 _CONNECT_POLL_S = 0.25
 _NATIVE_CLOSE_STEP_TIMEOUT_S = 2.0
 _CLI_CLOSE_TIMEOUT_S = 5.0
@@ -113,10 +115,16 @@ class CleanupClient(Protocol):
 
 ReportWriter = Callable[[Path, str], None]
 PathValidator = Callable[[Path, Path], Path]
+_RpcResult = TypeVar("_RpcResult")
 
 
 def is_candidate(device: BrilliantDevice) -> bool:
-    """Return true only when both case-sensitive allowlist dimensions match."""
+    """Return true only for a retired mirror type matching both name dimensions."""
+    if (
+        type(device.peripheral_type) is not int
+        or device.peripheral_type not in LEGACY_MIRROR_PERIPHERAL_TYPES
+    ):
+        return False
     peripheral_id = device.peripheral_id
     name = device.name
     prefix_match = (
@@ -270,6 +278,18 @@ class _ReportPersistenceError(RuntimeError):
         self.report = report
 
 
+class _CleanupRpcTimeoutError(RuntimeError):
+    """Internal timeout with no borrowed RPC details in its message."""
+
+
+async def _wait_for_rpc(awaitable: Awaitable[_RpcResult], timeout_s: float) -> _RpcResult:
+    """Bound one cleanup RPC using Python 3.10's asyncio timeout type."""
+    try:
+        return await asyncio.wait_for(awaitable, timeout=timeout_s)
+    except asyncio.TimeoutError as exc:
+        raise _CleanupRpcTimeoutError("cleanup RPC timed out") from exc
+
+
 async def run_cleanup(
     client: CleanupClient,
     *,
@@ -278,9 +298,10 @@ async def run_cleanup(
     now_ms: Callable[[], int],
     sleep: Callable[[float], Awaitable[None]],
     report_writer: ReportWriter,
+    rpc_timeout_s: float = _RPC_TIMEOUT_S,
 ) -> tuple[int, CleanupReport]:
     """Inventory, optionally delete serially, and verify from a second read."""
-    initial = await client.snapshot_own_device()
+    initial = await _wait_for_rpc(client.snapshot_own_device(), rpc_timeout_s)
     candidates = select_candidates(initial.peripherals)
     candidate_ids = tuple(candidate.peripheral_id for candidate in candidates)
 
@@ -320,13 +341,21 @@ async def run_cleanup(
     report_writer(report_path, canonical_report_json(prepared_report))
 
     delete_failed = False
+    delete_timed_out = False
     for index, candidate in enumerate(candidates):
         try:
-            await client.delete_peripheral(
-                initial.owning_device_id,
-                candidate.peripheral_id,
-                now_ms(),
+            await _wait_for_rpc(
+                client.delete_peripheral(
+                    initial.owning_device_id,
+                    candidate.peripheral_id,
+                    now_ms(),
+                ),
+                rpc_timeout_s,
             )
+        except _CleanupRpcTimeoutError:
+            delete_failed = True
+            delete_timed_out = True
+            break
         except Exception:
             delete_failed = True
             break
@@ -334,7 +363,7 @@ async def run_cleanup(
             await sleep(1.0)
 
     try:
-        verified = await client.snapshot_own_device()
+        verified = await _wait_for_rpc(client.snapshot_own_device(), rpc_timeout_s)
     except Exception as exc:
         conservative = build_report(
             timestamp_ms=now_ms(),
@@ -355,7 +384,9 @@ async def run_cleanup(
         for peripheral in verified.peripherals
         if isinstance(peripheral.peripheral_id, str)
     }
-    if verified.owning_device_id != initial.owning_device_id:
+    if verified.owning_device_id != initial.owning_device_id or delete_timed_out:
+        # A timed-out delete may have reached the server. Treat every candidate
+        # as remaining instead of inferring a deletion from an ambiguous absence.
         remaining_ids = candidate_ids
     else:
         remaining_ids = tuple(
@@ -450,6 +481,7 @@ async def async_main(
     now_ms: Callable[[], int] = lambda: int(time.time() * 1000),
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     report_writer: ReportWriter = write_report_atomic,
+    rpc_timeout_s: float = _RPC_TIMEOUT_S,
     close_timeout_s: float = _CLI_CLOSE_TIMEOUT_S,
 ) -> int:
     """Run the CLI with injectable off-panel seams."""
@@ -484,6 +516,7 @@ async def async_main(
             now_ms=now_ms,
             sleep=sleep,
             report_writer=report_writer,
+            rpc_timeout_s=rpc_timeout_s,
         )
     except asyncio.CancelledError:
         raise
@@ -493,6 +526,14 @@ async def async_main(
     except _VerificationReadError as exc:
         report = exc.report
         code = 1
+    except _CleanupRpcTimeoutError:
+        report = _empty_failure_report(now_ms())
+        code = 1
+        if args.apply and report_path is not None:
+            try:
+                report_writer(report_path, canonical_report_json(report))
+            except Exception:
+                pass
     except Exception:
         report = _empty_failure_report(now_ms())
         code = 1
