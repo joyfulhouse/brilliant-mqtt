@@ -331,7 +331,7 @@ class HaControlPlane:
                 default_panel=default_panel,
                 actions=actions,
             )
-            await self._async_rebuild_manifest()
+            await self._async_rebuild_manifest(republish_unchanged_states=True)
         except BaseException:
             await self._async_stop_locked()
             raise
@@ -382,7 +382,7 @@ class HaControlPlane:
         )
         return panels, default_panel, actions
 
-    async def _async_rebuild_manifest(self) -> None:
+    async def _async_rebuild_manifest(self, *, republish_unchanged_states: bool = False) -> None:
         if not self._started or self._settings is None:
             self._rebuilding = False
             return
@@ -395,6 +395,9 @@ class HaControlPlane:
             candidate = build_manifest(self.hass, self._settings, revision, generated_at_ms)
             body = _canonical_manifest_body(candidate)
             if body == self._manifest_body:
+                if republish_unchanged_states:
+                    for entity in candidate.entities:
+                        await self._async_publish_state(entity, generated_at_ms)
                 self._accept_commands = (
                     self._started and previous_manifest is not None and not self._hard_fenced
                 )
@@ -430,16 +433,19 @@ class HaControlPlane:
     async def _async_publish_state(
         self, entity: ManifestEntity, generated_at_ms: int | None = None
     ) -> None:
-        self._state_sequences[entity.stable_id] += 1
+        next_sequence = self._state_sequences[entity.stable_id] + 1
         payload = build_state_payload(
             self.hass.states.get(entity.entity_id),
             entity,
-            self._state_sequences[entity.stable_id],
+            next_sequence,
             generated_at_ms if generated_at_ms is not None else _timestamp_ms(),
         )
         await mqtt.async_publish(
             self.hass, state_topic(entity.stable_id), encode_json(payload), retain=True
         )
+        # The committed sequence always describes broker-visible retained state.
+        # A failed publish leaves it unchanged so observed_sequence cannot drift.
+        self._state_sequences[entity.stable_id] = next_sequence
 
     async def _async_state_changed(self, event: Event[Any]) -> None:
         async with self._lifecycle_lock:
@@ -475,6 +481,28 @@ class HaControlPlane:
         hard_fenced_at_receipt = self._hard_fenced
         if not hard_fenced_at_receipt and not self._accept_commands and not self._rebuilding:
             return
+        async with self._command_lock:
+            await self._async_execute_command(
+                message,
+                generation=generation,
+                hard_fenced_at_receipt=hard_fenced_at_receipt,
+            )
+
+    async def _async_execute_command(
+        self,
+        message: ReceiveMessage,
+        *,
+        generation: int,
+        hard_fenced_at_receipt: bool,
+    ) -> None:
+        started = _monotonic()
+        raw_payload = str(message.payload)
+        raw_command_id, raw_stable_id = _extract_wire_ids(raw_payload)
+        command_id = raw_command_id
+        entity_stable_id = raw_stable_id or _topic_stable_id(message.topic)
+        accepted = False
+        error: str | None = None
+        service_call: tuple[str, str, dict[str, object], str] | None = None
         async with self._lifecycle_lock:
             if (
                 not self._started
@@ -484,83 +512,79 @@ class HaControlPlane:
                 or generation != self._command_fence_generation
             ):
                 return
-            async with self._command_lock:
-                await self._async_execute_command(message)
+            self._purge_results(started)
+            if (
+                raw_command_id is not None
+                and (cached := self._results.get(raw_command_id)) is not None
+            ):
+                await mqtt.async_publish(self.hass, cached.topic, cached.payload, retain=False)
+                return
+            try:
+                command = decode_command(raw_payload, now_ms=_timestamp_ms())
+                command_id = command.command_id
+                entity_stable_id = command.stable_id
+                validate_entity_command_context(
+                    command,
+                    topic_stable_id=_topic_stable_id(message.topic),
+                    retained=message.retain,
+                )
+                entity = self._manifest_entity(command.stable_id)
+                if entity is None:
+                    raise ValueError("entity is not present in the current manifest")
+                if command.kind not in entity.commands:
+                    raise ValueError("command is not allowed by the current manifest")
+                if command.observed_sequence != self._state_sequences[command.stable_id]:
+                    raise ValueError("observed_sequence is stale")
+                route = _SERVICE_ROUTES.get((entity.domain, command.kind))
+                if route is None:
+                    raise ValueError("command has no service route")
+                service_data = _service_data(entity, route, command.value)
+                service_call = (entity.domain, route.service, service_data, entity.entity_id)
+            except ValueError as validation_error:
+                error = str(validation_error)
 
-    async def _async_execute_command(self, message: ReceiveMessage) -> None:
-        started = _monotonic()
-        raw_payload = str(message.payload)
-        raw_command_id, raw_stable_id = _extract_wire_ids(raw_payload)
-        self._purge_results(started)
-        if raw_command_id is not None and (cached := self._results.get(raw_command_id)) is not None:
-            await mqtt.async_publish(self.hass, cached.topic, cached.payload, retain=False)
-            return
-
-        command_id = raw_command_id
-        entity_stable_id = raw_stable_id or _topic_stable_id(message.topic)
-        accepted = False
-        error: str | None = None
-        try:
-            command = decode_command(raw_payload, now_ms=_timestamp_ms())
-            command_id = command.command_id
-            entity_stable_id = command.stable_id
-            validate_entity_command_context(
-                command,
-                topic_stable_id=_topic_stable_id(message.topic),
-                retained=message.retain,
-            )
-            entity = self._manifest_entity(command.stable_id)
-            if entity is None:
-                raise ValueError("entity is not present in the current manifest")
-            if command.kind not in entity.commands:
-                raise ValueError("command is not allowed by the current manifest")
-            if command.observed_sequence != self._state_sequences[command.stable_id]:
-                raise ValueError("observed_sequence is stale")
-            route = _SERVICE_ROUTES.get((entity.domain, command.kind))
-            if route is None:
-                raise ValueError("command has no service route")
-            service_data = _service_data(entity, route, command.value)
+        if service_call is not None:
+            service_domain, service, service_data, entity_id = service_call
             try:
                 await self.hass.services.async_call(
-                    entity.domain,
-                    route.service,
+                    service_domain,
+                    service,
                     service_data,
                     blocking=True,
                 )
             except Exception as service_error:
                 _LOGGER.warning(
                     "HA control service call failed for %s (%s): %s",
-                    entity.entity_id,
+                    entity_id,
                     type(service_error).__name__,
                     _sanitize_log_message(service_error),
                 )
                 error = "service_call_failed"
             else:
                 accepted = True
-        except ValueError as validation_error:
-            error = str(validation_error)
 
-        if command_id is None or entity_stable_id is None:
-            return
-        elapsed_ms = max(0, int((_monotonic() - started) * 1_000))
-        result = encode_json(
-            {
-                "schema_version": SCHEMA_VERSION,
-                "mapping_version": MAPPING_VERSION,
-                "command_id": command_id,
-                "stable_id": entity_stable_id,
-                "accepted": accepted,
-                "resulting_sequence": self._state_sequences[entity_stable_id],
-                "timestamp_ms": _timestamp_ms(),
-                "error": error,
-                "elapsed_ms": elapsed_ms,
-            }
-        )
-        topic = result_topic(command_id)
-        self._results[command_id] = _CachedResult(started, topic, result)
-        while len(self._results) > _RESULT_CACHE_LIMIT:
-            self._results.popitem(last=False)
-        await mqtt.async_publish(self.hass, topic, result, retain=False)
+        async with self._lifecycle_lock:
+            if command_id is None or entity_stable_id is None:
+                return
+            elapsed_ms = max(0, int((_monotonic() - started) * 1_000))
+            result = encode_json(
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "mapping_version": MAPPING_VERSION,
+                    "command_id": command_id,
+                    "stable_id": entity_stable_id,
+                    "accepted": accepted,
+                    "resulting_sequence": self._state_sequences[entity_stable_id],
+                    "timestamp_ms": _timestamp_ms(),
+                    "error": error,
+                    "elapsed_ms": elapsed_ms,
+                }
+            )
+            topic = result_topic(command_id)
+            self._results[command_id] = _CachedResult(started, topic, result)
+            while len(self._results) > _RESULT_CACHE_LIMIT:
+                self._results.popitem(last=False)
+            await mqtt.async_publish(self.hass, topic, result, retain=False)
 
     def _manifest_entity(self, entity_stable_id: str) -> ManifestEntity | None:
         if self._manifest is None:

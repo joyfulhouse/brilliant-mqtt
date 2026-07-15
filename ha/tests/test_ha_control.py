@@ -392,6 +392,130 @@ async def test_state_changes_publish_immediately_with_monotonic_sequence(
 
 
 @pytest.mark.allow_lingering_timers
+async def test_failed_state_publish_does_not_consume_sequence(
+    hass: HomeAssistant, mqtt_mock: MqttMockHAClient
+) -> None:
+    entity = _selected_entity(hass, "switch.controlled")
+    plane = get_control_plane(hass)
+    entry = _entry(hass, "office")
+    await plane.async_attach(entry)
+    current_sequence = _current_sequence(mqtt_mock, entity.entity_id)
+    manifest_entity = plane._manifest_entity(stable_id(entity.entity_id))
+    assert manifest_entity is not None
+    mqtt_mock.async_publish.reset_mock()
+
+    with (
+        patch(
+            "custom_components.brilliant_mqtt.ha_control.mqtt.async_publish",
+            side_effect=RuntimeError("state publish failed"),
+        ),
+        pytest.raises(RuntimeError, match="state publish failed"),
+    ):
+        await plane._async_publish_state(manifest_entity)
+
+    await plane._async_publish_state(manifest_entity)
+
+    calls = _published(mqtt_mock, state_topic(stable_id(entity.entity_id)))
+    assert len(calls) == 1
+    assert _payload(calls[0])["sequence"] == current_sequence + 1
+    await plane.async_detach(entry.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_command_result_carries_sequence_published_by_command_state_change(
+    hass: HomeAssistant, mqtt_mock: MqttMockHAClient
+) -> None:
+    entity = _selected_entity(hass, "switch.controlled")
+
+    async def turn_on(_call: ServiceCall) -> None:
+        hass.states.async_set(entity.entity_id, "on")
+
+    hass.services.async_register("switch", "turn_on", turn_on)
+    plane = get_control_plane(hass)
+    entry = _entry(hass, "office")
+    await plane.async_attach(entry)
+    current_sequence = _current_sequence(mqtt_mock, entity.entity_id)
+    mqtt_mock.async_publish.reset_mock()
+    command_id, payload = _command_payload(
+        entity.entity_id,
+        "turn_on",
+        None,
+        observed_sequence=current_sequence,
+    )
+
+    async_fire_mqtt_message(hass, command_topic(stable_id(entity.entity_id)), payload)
+    await hass.async_block_till_done()
+
+    state = _payload(_published(mqtt_mock, state_topic(stable_id(entity.entity_id)))[-1])
+    result = _payload(_published(mqtt_mock, result_topic(command_id))[-1])
+    assert state["sequence"] == current_sequence + 1
+    assert result["accepted"] is True
+    assert result["resulting_sequence"] == state["sequence"]
+    await plane.async_detach(entry.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_service_waiting_for_its_state_callback_does_not_deadlock(
+    hass: HomeAssistant, mqtt_mock: MqttMockHAClient
+) -> None:
+    entity = _selected_entity(hass, "switch.controlled")
+    state_published = asyncio.Event()
+
+    async def turn_on(_call: ServiceCall) -> None:
+        hass.states.async_set(entity.entity_id, "on")
+        await asyncio.wait_for(state_published.wait(), timeout=0.1)
+
+    hass.services.async_register("switch", "turn_on", turn_on)
+    plane = get_control_plane(hass)
+    entry = _entry(hass, "office")
+    await plane.async_attach(entry)
+    current_sequence = _current_sequence(mqtt_mock, entity.entity_id)
+    mqtt_mock.async_publish.reset_mock()
+    command_id, payload = _command_payload(
+        entity.entity_id,
+        "turn_on",
+        None,
+        observed_sequence=current_sequence,
+    )
+    real_publish = mqtt.async_publish
+
+    async def publish_and_signal_state(
+        hass: HomeAssistant,
+        topic: str,
+        payload: str | bytes | int | float | None,
+        qos: int = 0,
+        retain: bool = False,
+        encoding: str | None = "utf-8",
+        *,
+        message_expiry_interval: int | None = None,
+    ) -> None:
+        await real_publish(
+            hass,
+            topic,
+            payload,
+            qos,
+            retain,
+            encoding,
+            message_expiry_interval=message_expiry_interval,
+        )
+        if topic == state_topic(stable_id(entity.entity_id)):
+            state_published.set()
+
+    with patch(
+        "custom_components.brilliant_mqtt.ha_control.mqtt.async_publish",
+        side_effect=publish_and_signal_state,
+    ):
+        async_fire_mqtt_message(hass, command_topic(stable_id(entity.entity_id)), payload)
+        await hass.async_block_till_done()
+
+    result = _payload(_published(mqtt_mock, result_topic(command_id))[-1])
+    assert state_published.is_set()
+    assert result["accepted"] is True
+    assert result["error"] is None
+    await plane.async_detach(entry.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
 @pytest.mark.parametrize(("kind", "value", "domain", "service", "extra_data"), COMMAND_CASES)
 async def test_valid_commands_call_exact_home_assistant_service(
     hass: HomeAssistant,
@@ -610,6 +734,32 @@ async def test_stale_observed_sequence_rejection_does_not_advance_the_sequence(
 
 
 @pytest.mark.allow_lingering_timers
+async def test_dormant_restart_republishes_state_changed_while_stopped(
+    hass: HomeAssistant, mqtt_mock: MqttMockHAClient
+) -> None:
+    entity = _selected_entity(hass, "switch.controlled")
+    entry = _entry(hass, "office")
+    plane = get_control_plane(hass)
+    await plane.async_attach(entry)
+    sequence_before_stop = _current_sequence(mqtt_mock, entity.entity_id)
+
+    await plane.async_detach(entry.entry_id)
+    mqtt_mock.async_publish.reset_mock()
+    hass.states.async_set(entity.entity_id, "on")
+    await hass.async_block_till_done()
+    assert _published(mqtt_mock, state_topic(stable_id(entity.entity_id))) == []
+
+    await plane.async_attach(entry)
+
+    calls = _published(mqtt_mock, state_topic(stable_id(entity.entity_id)))
+    assert len(calls) == 1
+    state = _payload(calls[0])
+    assert state["state"] == "on"
+    assert state["sequence"] == sequence_before_stop + 1
+    await plane.async_detach(entry.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
 async def test_dormant_restart_preserves_revision_sequence_and_duplicate_cache(
     hass: HomeAssistant, mqtt_mock: MqttMockHAClient
 ) -> None:
@@ -649,6 +799,10 @@ async def test_dormant_restart_preserves_revision_sequence_and_duplicate_cache(
     assert plane.result_cache_size == 1
     mqtt_mock.async_publish.reset_mock()
     await plane.async_attach(entry)
+    assert (
+        _payload(_published(mqtt_mock, state_topic(stable_id(first.entity_id)))[-1])["sequence"]
+        == sequence_before_dormancy + 1
+    )
 
     async_fire_mqtt_message(hass, command_topic(stable_id(first.entity_id)), command_payload)
     await hass.async_block_till_done()
@@ -659,7 +813,7 @@ async def test_dormant_restart_preserves_revision_sequence_and_duplicate_cache(
     await hass.async_block_till_done()
     assert (
         _payload(_published(mqtt_mock, state_topic(stable_id(first.entity_id)))[-1])["sequence"]
-        == sequence_before_dormancy + 1
+        == sequence_before_dormancy + 2
     )
     _selected_entity(hass, "switch.third")
     async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=1))
