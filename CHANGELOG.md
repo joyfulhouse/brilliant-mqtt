@@ -26,15 +26,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   best-effort and never blocks the reboot; the service takes
   `collect_diagnostics` (default on) and `journal_lines` (100–2000, default
   400). Intended for a scheduled staggered overnight reboot automation.
-- **Disable Wi-Fi power-save at agent start** — root cause of the MQTT
-  keepalive flap. The on-panel systemd unit now runs
-  `ExecStartPre=-/bin/sh -c 'iw dev wlan0 set power_save off'` before the
-  bridge. Wi-Fi power-save drops inbound packets → MQTT keepalive timeouts →
-  LWT → ~5-minute unavailable cycles (confirmed live: 20 min with power-save
-  off held bridge errors at 0 vs constant before). The `-` prefix keeps it
-  strictly best-effort (a missing/failing `iw` can never delay or block the
-  bridge), and it rolls out durably across panel reboots via the existing
-  redeploy/repair service.
 - **Brilliant scenes and modes in Home Assistant** *(in pilot)*. An opt-in
   scene/mode bridge (`SCENE_BRIDGE_ENABLED`) runs on each panel agent's
   existing bus and MQTT sessions: it publishes the panel's scene and mode
@@ -73,6 +64,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and a redacted Repair when absence cannot be proven. The supported
   replacement is the HA-owned control plane and scene bridge. See
   [HA mirror retirement and cleanup](docs/ha-mirror.md).
+
+### Fixed
+
+- **Agent unit disables panel Wi-Fi power-save at start** — root cause of the
+  MQTT keepalive flap / entity churn. The on-panel systemd unit now runs
+  `ExecStartPre=-/bin/sh -c 'iw dev wlan0 set power_save off'` before the
+  bridge. Wi-Fi power-save drops inbound packets → MQTT keepalive timeouts →
+  LWT → ~5-minute unavailable cycles (confirmed live: 20 min with power-save
+  off held bridge errors at 0 vs constant before). The `-` prefix keeps it
+  strictly best-effort so a missing/failing `iw` can never delay or block the
+  bridge, and it rolls out durably across panel reboots via the existing
+  redeploy/repair service.
 
 ## [0.5.6] - 2026-07-05
 
