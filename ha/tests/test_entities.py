@@ -39,6 +39,7 @@ from tests.test_init import ENTRY_DATA
 
 HEALTH = "binary_sensor.brilliant_office_bridge_health"
 REPAIR = "button.brilliant_office_repair_bridge"
+REBOOT = "button.brilliant_office_reboot_panel"
 UPDATE = "update.brilliant_office_bridge"
 VOICE_SWITCH = "switch.brilliant_office_voice_satellite"
 WAKE_WORD_SELECT = "select.brilliant_office_wake_word"
@@ -52,6 +53,12 @@ async def _setup(hass: HomeAssistant) -> MockConfigEntry:
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
     return entry
+
+
+def _diagnostics_written(hass: HomeAssistant, panel: str = "office") -> bool:
+    """Sync file check (kept out of the async test for ruff's ASYNC240 pathlib rule)."""
+    directory = Path(hass.config.path("brilliant_mqtt", "diagnostics", panel))
+    return bool(list(directory.glob("*.log")))
 
 
 async def _setup_scene_control(hass: HomeAssistant) -> MockConfigEntry:
@@ -183,6 +190,27 @@ async def test_repair_button_runs_manual_repair(
     await hass.services.async_call("button", "press", {"entity_id": REPAIR}, blocking=True)
     await hass.async_block_till_done()
     assert "systemctl enable --now brilliant-mqtt" in fake_shell.commands
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_reboot_button_captures_diagnostics_then_reboots(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    fake_shell: FakeShell,
+    payload_dir: Path,
+    panel_diagnostics_isolated: None,
+) -> None:
+    entry = await _setup(hass)
+    assert hass.states.get(REBOOT) is not None  # the per-panel Reboot button exists
+    await hass.services.async_call("button", "press", {"entity_id": REBOOT}, blocking=True)
+    await hass.async_block_till_done()
+
+    assert "reboot" in fake_shell.commands  # the panel was rebooted
+    # The button always captures diagnostics first (the panel journal is volatile), so a
+    # bundle landed under <config>/brilliant_mqtt/diagnostics/office/.
+    assert _diagnostics_written(hass)
 
     assert await hass.config_entries.async_unload(entry.entry_id)
 

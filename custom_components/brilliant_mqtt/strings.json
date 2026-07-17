@@ -144,6 +144,20 @@
       "name": "Uninstall agent",
       "description": "Stop, disable, and remove the agent from the panel (explicit only)."
     },
+    "reboot": {
+      "name": "Reboot panel",
+      "description": "Capture a diagnostics bundle over SSH, then reboot the panel. The panel's logs are volatile (lost on reboot), so diagnostics are always captured first.",
+      "fields": {
+        "collect_diagnostics": {
+          "name": "Capture diagnostics",
+          "description": "Capture a diagnostics bundle before rebooting (saved under the config directory)."
+        },
+        "journal_lines": {
+          "name": "Journal lines",
+          "description": "How many current-boot journal lines to capture."
+        }
+      }
+    },
     "run_scene": {
       "name": "Run Brilliant scene",
       "description": "Run a scene on an attached Brilliant panel and wait for execution confirmation.",
@@ -182,6 +196,9 @@
     "button": {
       "repair_bridge": {
         "name": "Repair bridge"
+      },
+      "reboot_panel": {
+        "name": "Reboot panel"
       },
       "run_selected_scene": {
         "name": "Run selected scene"
@@ -232,6 +249,9 @@
     },
     "uninstall_failed": {
       "message": "Agent uninstall failed: {error}"
+    },
+    "reboot_failed": {
+      "message": "Panel reboot failed: {error}"
     },
     "voice_failed": {
       "message": "Voice satellite operation failed: {error}"

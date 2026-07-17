@@ -85,6 +85,18 @@ DEFAULT_TRUST_HOST_KEY_CHANGES = False
 # The reserved whole-home pseudo-panel — never manageable (no host behind it).
 MESH_PANEL = "mesh"
 
+# Panel reboot + pre-reboot diagnostics. The panels wedge two ways (an uptime-decay
+# wedge that only a reboot clears, and Wi-Fi power-save packet starvation), and the
+# panel's journald is VOLATILE (/run tmpfs — only the current boot survives), so a
+# diagnostics bundle is pulled over SSH BEFORE the reboot that would erase the
+# evidence. Bundles land under <config>/brilliant_mqtt/diagnostics/<panel>/, newest
+# DIAGNOSTICS_RETENTION kept.
+DEFAULT_REBOOT_JOURNAL_LINES = 400
+MIN_REBOOT_JOURNAL_LINES = 100
+MAX_REBOOT_JOURNAL_LINES = 2000
+DIAGNOSTICS_SUBDIR = "diagnostics"
+DIAGNOSTICS_RETENTION = 14
+
 # MQTT contract with the on-panel agent (docs/ARCHITECTURE.md "Data Flow").
 AVAILABILITY_ONLINE = "online"
 AVAILABILITY_OFFLINE = "offline"

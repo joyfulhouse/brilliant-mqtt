@@ -16,6 +16,33 @@ uninstall:
   target:
     entity:
       integration: brilliant_mqtt
+reboot:
+  name: Reboot panel
+  description: >-
+    Capture a diagnostics bundle over SSH, then reboot the panel. The panel's logs
+    are volatile (lost on reboot), so diagnostics are always captured first.
+  target:
+    entity:
+      integration: brilliant_mqtt
+  fields:
+    collect_diagnostics:
+      name: Capture diagnostics
+      description: Capture a diagnostics bundle before rebooting (saved under the config directory).
+      required: false
+      default: true
+      selector:
+        boolean:
+    journal_lines:
+      name: Journal lines
+      description: How many current-boot journal lines to capture.
+      required: false
+      default: 400
+      selector:
+        number:
+          min: 100
+          max: 2000
+          mode: box
+          unit_of_measurement: lines
 run_scene:
   name: Run Brilliant scene
   description: Run a scene on an attached Brilliant panel and wait for execution confirmation.

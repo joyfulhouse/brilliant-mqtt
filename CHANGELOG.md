@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Panel reboot with pre-reboot diagnostics.** A new `brilliant_mqtt.reboot`
+  service and a per-panel **Reboot panel** button capture a diagnostics bundle
+  over SSH and *then* reboot the panel. The panels wedge two ways in practice —
+  an uptime-decay wedge that ignores relay commands until a reboot, and Wi-Fi
+  power-save packet starvation (MQTT keep-alive timeouts → LWT → unavailable
+  cycles) — and the panel's journald is **volatile** (a `/run` tmpfs holding
+  only the current boot), so a reboot destroys all evidence. The bundle is
+  therefore always captured *before* the reboot and persisted to
+  `<config>/brilliant_mqtt/diagnostics/<panel>/<UTC-timestamp>.log` (newest 14
+  kept per panel); it collects uptime/memory/`/var` usage, the current-boot and
+  bridge-unit journals, kernel Wi-Fi/OOM lines, the `wlan0` link + power-save
+  state, connman services, and the bridge unit status — each probe failure-
+  tolerant so one dead probe never aborts the bundle. The reboot's inevitable
+  mid-command SSH disconnect is treated as success. Diagnostics capture is
+  best-effort and never blocks the reboot; the service takes
+  `collect_diagnostics` (default on) and `journal_lines` (100–2000, default
+  400). Intended for a scheduled staggered overnight reboot automation.
+- **Disable Wi-Fi power-save at agent start** — root cause of the MQTT
+  keepalive flap. The on-panel systemd unit now runs
+  `ExecStartPre=-/bin/sh -c 'iw dev wlan0 set power_save off'` before the
+  bridge. Wi-Fi power-save drops inbound packets → MQTT keepalive timeouts →
+  LWT → ~5-minute unavailable cycles (confirmed live: 20 min with power-save
+  off held bridge errors at 0 vs constant before). The `-` prefix keeps it
+  strictly best-effort (a missing/failing `iw` can never delay or block the
+  bridge), and it rolls out durably across panel reboots via the existing
+  redeploy/repair service.
 - **Brilliant scenes and modes in Home Assistant** *(in pilot)*. An opt-in
   scene/mode bridge (`SCENE_BRIDGE_ENABLED`) runs on each panel agent's
   existing bus and MQTT sessions: it publishes the panel's scene and mode

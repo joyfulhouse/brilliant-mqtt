@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncssh
 import pytest
 
 from custom_components.brilliant_mqtt import panel_ops
@@ -298,6 +299,58 @@ async def test_enable_now_raises_on_nonzero_exit() -> None:
     )
     with pytest.raises(panel_ops.PanelOpError, match="exited 1"):
         await panel_ops.enable_now(shell)
+
+
+async def test_collect_diagnostics_assembles_sections_and_tolerates_a_failing_probe() -> None:
+    # One probe raises a transport drop → its section carries an error note, and the rest
+    # of the bundle is still assembled (never abort — a partial bundle beats none).
+    shell = await _connected(
+        FakeShell(
+            responses={"uptime": RunResult(0, "up 3 days\n", "")},
+            run_errors={"iw dev wlan0 link": asyncssh.ConnectionLost("dropped")},
+        )
+    )
+    bundle = await panel_ops.collect_diagnostics(shell, lines=400)
+
+    # Journal depths scale: the whole current boot at `lines`, the bridge unit at lines//2.
+    assert "journalctl -b -n 400 --no-pager" in bundle
+    assert f"journalctl -u {SERVICE_NAME} -n 200 --no-pager" in bundle
+    # A healthy probe's output is embedded; the failing probe became a note, not an abort.
+    assert "up 3 days" in bundle
+    assert "<probe failed:" in bundle
+    # All ten sections are present and clearly delimited (the "===== " header marker).
+    assert bundle.count("===== ") == 10
+    for command in (
+        "df /var",
+        "connmanctl services 2>&1 | head -n 15",
+        "iw dev wlan0 get power_save",
+        f"systemctl status {SERVICE_NAME} --no-pager 2>&1 | head -n 15",
+    ):
+        assert f"$ {command}" in bundle
+
+
+async def test_collect_diagnostics_unit_depth_never_floors_to_zero() -> None:
+    # lines//2 must stay ≥ 1 (journalctl -n 0 prints nothing).
+    shell = await _connected(FakeShell())
+    bundle = await panel_ops.collect_diagnostics(shell, lines=1)
+    assert f"journalctl -u {SERVICE_NAME} -n 1 --no-pager" in bundle
+
+
+async def test_reboot_treats_ssh_disconnect_as_success() -> None:
+    # `reboot` tears down sshd; the mid-command asyncssh disconnect IS the success signal.
+    shell = await _connected(
+        FakeShell(run_errors={panel_ops.REBOOT_COMMAND: asyncssh.ConnectionLost("bye")})
+    )
+    await panel_ops.reboot(shell)  # must NOT raise
+    assert panel_ops.REBOOT_COMMAND in shell.commands
+
+
+async def test_reboot_tolerates_oserror_and_a_clean_return() -> None:
+    dropped = await _connected(FakeShell(run_errors={panel_ops.REBOOT_COMMAND: OSError("reset")}))
+    await panel_ops.reboot(dropped)  # OSError disconnect → success
+    clean = await _connected(FakeShell())
+    await panel_ops.reboot(clean)  # systemd answered 0 before dropping → success
+    assert panel_ops.REBOOT_COMMAND in clean.commands
 
 
 # Move-aside swap: stage fully, set old app/vendor aside, move new in, drop the

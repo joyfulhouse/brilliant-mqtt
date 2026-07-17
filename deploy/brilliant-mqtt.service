@@ -10,6 +10,11 @@ Wants=message_bus.service
 Type=simple
 EnvironmentFile=/etc/brilliant-mqtt.env
 Environment=PYTHONPATH=/var/brilliant-mqtt/app:/var/brilliant-mqtt/vendor
+# Disable Wi-Fi power-save before starting the bridge: it is the root cause of the
+# MQTT keepalive flap (power-save drops inbound packets -> keepalive timeouts -> LWT
+# -> ~5-min unavailable cycles). The `-` prefix + `/bin/sh -c` (PATH-resolved iw) keep
+# it strictly best-effort so a missing/failing iw can never delay or block the bridge.
+ExecStartPre=-/bin/sh -c 'iw dev wlan0 set power_save off'
 ExecStart=/data/switch-embedded/env/bin/python3 -m brilliant_mqtt
 Restart=always
 RestartSec=5

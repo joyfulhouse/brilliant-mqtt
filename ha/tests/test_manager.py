@@ -8,8 +8,10 @@ from pathlib import Path
 from typing import Any, cast
 from unittest.mock import AsyncMock, patch
 
+import asyncssh
 import pytest
 from homeassistant.core import Event, HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import (
     MockConfigEntry,
@@ -957,6 +959,152 @@ async def test_agent_update_reports_progress(
     assert 0 <= min(pcts) and max(pcts) <= 100
     assert fake_shell.dir_uploads  # the deploy actually ran
     assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+# ---------------------------------------------------------------------------
+# Panel reboot + pre-reboot diagnostics
+# ---------------------------------------------------------------------------
+
+
+def _reboot_entry(hass: HomeAssistant) -> MockConfigEntry:
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    return entry
+
+
+# The diagnostics helpers below are deliberately SYNC (blocking file I/O), kept out of
+# the async tests so ruff's ASYNC240 (no pathlib in async funcs) stays satisfied.
+def _diag_dir(hass: HomeAssistant, panel: str = "office") -> Path:
+    return Path(hass.config.path("brilliant_mqtt", "diagnostics", panel))
+
+
+def _diag_dir_exists(hass: HomeAssistant, panel: str = "office") -> bool:
+    return _diag_dir(hass, panel).exists()
+
+
+def _diag_log_names(hass: HomeAssistant, panel: str = "office") -> list[str]:
+    directory = _diag_dir(hass, panel)
+    return sorted(p.name for p in directory.glob("*.log")) if directory.exists() else []
+
+
+def _read_sole_diag(hass: HomeAssistant, panel: str = "office") -> str:
+    logs = list(_diag_dir(hass, panel).glob("*.log"))
+    assert len(logs) == 1
+    return logs[0].read_text(encoding="utf-8")
+
+
+def _seed_diag(hass: HomeAssistant, names: list[str], panel: str = "office") -> None:
+    directory = _diag_dir(hass, panel)
+    directory.mkdir(parents=True)
+    for name in names:
+        (directory / name).write_text("old\n", encoding="utf-8")
+
+
+async def test_async_reboot_captures_diagnostics_before_rebooting(
+    hass: HomeAssistant, panel_diagnostics_isolated: None
+) -> None:
+    """The volatile-journal invariant: diagnostics are captured AND persisted BEFORE the
+    reboot command, which is issued last."""
+    entry = _reboot_entry(hass)
+    shell = FakeShell(responses={"uptime": RunResult(0, "up 1 day\n", "")})
+    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+        manager = PanelManager(hass, entry, asyncio.Lock())
+        await manager.async_reboot(collect_diagnostics=True, journal_lines=400)
+
+    assert panel_ops.REBOOT_COMMAND in shell.commands
+    # A diagnostics probe ran BEFORE the reboot, and the reboot is the LAST command.
+    assert shell.commands.index("uptime") < shell.commands.index(panel_ops.REBOOT_COMMAND)
+    assert shell.commands[-1] == panel_ops.REBOOT_COMMAND
+    # The sole persisted bundle (under <config>/brilliant_mqtt/diagnostics/office/) has it.
+    assert "up 1 day" in _read_sole_diag(hass)
+
+
+async def test_async_reboot_disconnect_is_success_and_can_skip_diagnostics(
+    hass: HomeAssistant, panel_diagnostics_isolated: None
+) -> None:
+    entry = _reboot_entry(hass)
+    shell = FakeShell(run_errors={panel_ops.REBOOT_COMMAND: asyncssh.ConnectionLost("down")})
+    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+        manager = PanelManager(hass, entry, asyncio.Lock())
+        await manager.async_reboot(collect_diagnostics=False)  # must NOT raise
+
+    assert panel_ops.REBOOT_COMMAND in shell.commands
+    # collect_diagnostics=False → nothing captured, no diagnostics directory created.
+    assert not _diag_dir_exists(hass)
+
+
+async def test_async_reboot_prunes_diagnostics_to_retention(
+    hass: HomeAssistant, panel_diagnostics_isolated: None
+) -> None:
+    entry = _reboot_entry(hass)
+    # 14 pre-existing bundles whose names sort BEFORE any current-time UTC stamp.
+    old = [f"20200101-0000{n:02d}.log" for n in range(1, 15)]
+    _seed_diag(hass, old)
+
+    shell = FakeShell()
+    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+        manager = PanelManager(hass, entry, asyncio.Lock())
+        await manager.async_reboot(collect_diagnostics=True, journal_lines=200)
+
+    remaining = _diag_log_names(hass)
+    assert len(remaining) == 14  # 14 old + 1 new = 15 → pruned to the newest 14
+    assert "20200101-000001.log" not in remaining  # the single oldest was pruned
+    assert old[-1] in remaining  # a newer pre-existing bundle survived
+
+
+async def test_async_reboot_still_reboots_when_diagnostics_persist_fails(
+    hass: HomeAssistant, panel_diagnostics_isolated: None
+) -> None:
+    """A diagnostics failure must never block the reboot the operator asked for."""
+    entry = _reboot_entry(hass)
+    shell = FakeShell(responses={"uptime": RunResult(0, "x\n", "")})
+    with (
+        patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell),
+        patch(
+            "custom_components.brilliant_mqtt.manager._write_diagnostics_bundle",
+            side_effect=OSError("disk full"),
+        ),
+    ):
+        manager = PanelManager(hass, entry, asyncio.Lock())
+        await manager.async_reboot(collect_diagnostics=True)  # must NOT raise
+
+    assert panel_ops.REBOOT_COMMAND in shell.commands  # reboot still issued
+    assert not _diag_dir_exists(hass)  # persist failed → nothing landed on disk
+
+
+async def test_async_reboot_raises_when_panel_unreachable(hass: HomeAssistant) -> None:
+    entry = _reboot_entry(hass)
+    shell = FakeShell(connect_error=OSError("unreachable"))
+    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+        manager = PanelManager(hass, entry, asyncio.Lock())
+        with pytest.raises(HomeAssistantError) as err:
+            await manager.async_reboot()
+
+    assert err.value.translation_key == "reboot_failed"
+    # A failed connect must NOT escalate — a nightly reboot may hit a briefly-offline panel.
+    assert manager.problem is False
+    assert panel_ops.REBOOT_COMMAND not in shell.commands
+
+
+def test_agent_unit_disables_wifi_power_save_before_start() -> None:
+    """The shipped agent unit disables Wi-Fi power-save before start — the root cause of
+    the MQTT keepalive flap — failure-tolerantly, so it can never block the bridge.
+
+    _config_contents deploys the bundled payload unit to panels via repair/redeploy, and
+    the build copies deploy/brilliant-mqtt.service into the payload verbatim, so both the
+    git-tracked source and the bundled copy must carry the line and stay in sync.
+    """
+    root = Path(__file__).parents[2]
+    deploy_unit = (root / "deploy" / "brilliant-mqtt.service").read_text(encoding="utf-8")
+    bundled_unit = (
+        root / "custom_components" / "brilliant_mqtt" / "agent_payload" / "brilliant-mqtt.service"
+    ).read_text(encoding="utf-8")
+
+    power_save = "ExecStartPre=-/bin/sh -c 'iw dev wlan0 set power_save off'"
+    assert power_save in deploy_unit
+    assert bundled_unit == deploy_unit  # the copy the integration actually ships stays in sync
+    # Best-effort (`-` prefix) and BEFORE ExecStart, so it runs pre-start and never blocks.
+    assert deploy_unit.index(power_save) < deploy_unit.index("ExecStart=/data/switch-embedded")
 
 
 # ---------------------------------------------------------------------------

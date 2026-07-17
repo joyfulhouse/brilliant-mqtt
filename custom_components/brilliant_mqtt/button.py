@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from homeassistant.components.button import ButtonEntity
+from homeassistant.components.button import ButtonDeviceClass, ButtonEntity
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
@@ -25,7 +25,9 @@ async def async_setup_entry(
     entry: BrilliantMqttConfigEntry,
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    async_add_entities([RepairButton(entry), RunSelectedSceneButton(entry)])
+    async_add_entities(
+        [RepairButton(entry), RebootPanelButton(entry), RunSelectedSceneButton(entry)]
+    )
 
 
 class RepairButton(BrilliantPanelEntity, ButtonEntity):
@@ -38,6 +40,23 @@ class RepairButton(BrilliantPanelEntity, ButtonEntity):
 
     async def async_press(self) -> None:
         await self._manager.async_repair(trigger="button")
+
+
+class RebootPanelButton(BrilliantPanelEntity, ButtonEntity):
+    """Capture pre-reboot diagnostics, then reboot the panel (clears the uptime wedge)."""
+
+    _attr_device_class = ButtonDeviceClass.RESTART
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_translation_key = "reboot_panel"
+
+    def __init__(self, entry: BrilliantMqttConfigEntry) -> None:
+        super().__init__(entry.runtime_data)
+        self._attr_unique_id = f"{entry.entry_id}_reboot_panel"
+
+    async def async_press(self) -> None:
+        # Always capture diagnostics on a manual press (journald is volatile — the
+        # reboot erases it); service callers can opt out via the service field.
+        await self._manager.async_reboot(collect_diagnostics=True)
 
 
 class RunSelectedSceneButton(BrilliantPanelEntity, ButtonEntity):

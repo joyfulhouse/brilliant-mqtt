@@ -277,6 +277,84 @@ async def test_set_mode_service_uses_selected_panel_and_waits_for_confirmation(
     assert await hass.config_entries.async_unload(entry.entry_id)
 
 
+@pytest.mark.allow_lingering_timers
+async def test_reboot_service_reaches_manager_with_options(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    fake_shell: FakeShell,
+    payload_dir: Path,
+) -> None:
+    """The reboot service resolves its target to the panel manager and forwards the
+    diagnostics options (the operator's overnight automation targets one panel each)."""
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    assert hass.services.has_service(DOMAIN, "reboot")
+
+    device = dr.async_get(hass).async_get_device(identifiers={("mqtt", "brilliant_panel_office")})
+    assert device is not None
+    with patch(
+        "custom_components.brilliant_mqtt.PanelManager.async_reboot", autospec=True
+    ) as reboot:
+        await hass.services.async_call(
+            DOMAIN,
+            "reboot",
+            {"device_id": device.id, "collect_diagnostics": False, "journal_lines": 250},
+            blocking=True,
+        )
+    reboot.assert_awaited_once()
+    assert reboot.await_args is not None
+    assert reboot.await_args.kwargs == {"collect_diagnostics": False, "journal_lines": 250}
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_reboot_service_rejects_out_of_range_journal_lines(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    fake_shell: FakeShell,
+    payload_dir: Path,
+) -> None:
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    device = dr.async_get(hass).async_get_device(identifiers={("mqtt", "brilliant_panel_office")})
+    assert device is not None
+    with pytest.raises(vol.Invalid):
+        await hass.services.async_call(
+            DOMAIN,
+            "reboot",
+            {"device_id": device.id, "journal_lines": 5000},
+            blocking=True,
+        )
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+def test_reboot_service_and_button_descriptions_and_translations_are_complete() -> None:
+    root = Path(__file__).parents[2]
+    services = (root / "custom_components/brilliant_mqtt/services.yaml").read_text()
+    strings = json.loads((root / "custom_components/brilliant_mqtt/strings.json").read_text())
+    translations = json.loads(
+        (root / "custom_components/brilliant_mqtt/translations/en.json").read_text()
+    )
+
+    assert "reboot:" in services
+    for field in ("collect_diagnostics", "journal_lines"):
+        assert f"{field}:" in services
+    for document in (strings, translations):
+        assert document["services"]["reboot"]["name"]
+        assert document["services"]["reboot"]["description"]
+        for field in ("collect_diagnostics", "journal_lines"):
+            assert document["services"]["reboot"]["fields"][field]["description"]
+        assert document["entity"]["button"]["reboot_panel"]["name"]
+        assert document["exceptions"]["reboot_failed"]["message"]
+
+
 def test_scene_service_descriptions_and_translations_are_complete() -> None:
     root = Path(__file__).parents[2]
     services = (root / "custom_components/brilliant_mqtt/services.yaml").read_text()

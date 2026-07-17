@@ -19,10 +19,14 @@ class FakeShell:
         put_dir_error: Exception | None = None,
         connect_gate: asyncio.Event | None = None,
         pinned: str | None = "ssh-ed25519 FAKEKEY",
+        run_errors: dict[str, Exception] | None = None,
     ) -> None:
         self.responses = dict(responses or {})
         self.connect_error = connect_error
         self.put_dir_error = put_dir_error
+        # Commands whose run() raises the mapped exception (models a mid-command
+        # transport drop — e.g. the reboot disconnect, or a dead diagnostics probe).
+        self.run_errors = dict(run_errors or {})
         # When set, connect() blocks on this event — lets a test wedge a repair
         # inside the ssh_lock to exercise the shutdown-mid-repair interleaving.
         self.connect_gate = connect_gate
@@ -61,7 +65,9 @@ class FakeShell:
 
     async def run(self, command: str) -> RunResult:
         self._require_connected()
-        self.commands.append(command)
+        self.commands.append(command)  # recorded even when it raises: proves it was attempted
+        if command in self.run_errors:
+            raise self.run_errors[command]
         return self.responses.get(command, _OK)
 
     async def put_bytes(self, data: bytes, remote_path: str, mode: int) -> None:

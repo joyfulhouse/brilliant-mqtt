@@ -38,7 +38,10 @@ from .const import (
     DEFAULT_HA_CONTROL_ENABLED,
     DEFAULT_HA_CONTROL_LABEL,
     DEFAULT_MAX_MIRRORED_ENTITIES,
+    DEFAULT_REBOOT_JOURNAL_LINES,
     DOMAIN,
+    MAX_REBOOT_JOURNAL_LINES,
+    MIN_REBOOT_JOURNAL_LINES,
     PLATFORMS,
 )
 from .manager import PanelManager
@@ -78,6 +81,22 @@ _SET_MODE_SCHEMA = vol.Schema(
         vol.Required("mode_id"): cv.string,
     },
     extra=vol.PREVENT_EXTRA,
+)
+
+# Like _SERVICE_SCHEMA (entity/device/area target) plus the two reboot options. HA
+# merges the target ids into the call data; the handler resolves managers from them.
+_REBOOT_SCHEMA = vol.Schema(
+    {
+        vol.Optional(ATTR_ENTITY_ID): vol.Any(str, [str]),
+        vol.Optional(ATTR_DEVICE_ID): vol.Any(str, [str]),
+        vol.Optional(ATTR_AREA_ID): vol.Any(str, [str]),
+        vol.Optional("collect_diagnostics", default=True): cv.boolean,
+        vol.Optional("journal_lines", default=DEFAULT_REBOOT_JOURNAL_LINES): vol.All(
+            vol.Coerce(int),
+            vol.Range(min=MIN_REBOOT_JOURNAL_LINES, max=MAX_REBOOT_JOURNAL_LINES),
+        ),
+    },
+    extra=vol.ALLOW_EXTRA,
 )
 
 
@@ -198,6 +217,14 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     async def _uninstall(call: ServiceCall) -> None:
         await _apply_to_all(call, lambda m: m.async_uninstall())
 
+    async def _reboot(call: ServiceCall) -> None:
+        collect = bool(call.data.get("collect_diagnostics", True))
+        lines = int(call.data.get("journal_lines", DEFAULT_REBOOT_JOURNAL_LINES))
+        await _apply_to_all(
+            call,
+            lambda m: m.async_reboot(collect_diagnostics=collect, journal_lines=lines),
+        )
+
     async def _run_scene(call: ServiceCall) -> None:
         from .ha_control import get_control_plane
 
@@ -219,6 +246,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     hass.services.async_register(DOMAIN, "repair", _repair, schema=_SERVICE_SCHEMA)
     hass.services.async_register(DOMAIN, "redeploy", _redeploy, schema=_SERVICE_SCHEMA)
     hass.services.async_register(DOMAIN, "uninstall", _uninstall, schema=_SERVICE_SCHEMA)
+    hass.services.async_register(DOMAIN, "reboot", _reboot, schema=_REBOOT_SCHEMA)
     hass.services.async_register(DOMAIN, "run_scene", _run_scene, schema=_RUN_SCENE_SCHEMA)
     hass.services.async_register(DOMAIN, "set_mode", _set_mode, schema=_SET_MODE_SCHEMA)
     return True

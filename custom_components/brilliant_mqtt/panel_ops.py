@@ -8,10 +8,14 @@ and /etc/systemd/system/brilliant-mqtt.service (see the design spec §7).
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
+
+import asyncssh
 
 from .const import (
     BUS_WATCHDOG_SERVICE_NAME,
+    DEFAULT_REBOOT_JOURNAL_LINES,
     HA_MIRROR_SERVICE_NAME,
     PANEL_BUS_WATCHDOG_DIR,
     PANEL_BUS_WATCHDOG_UNIT_FILE,
@@ -260,6 +264,101 @@ def journal_command(lines: int) -> str:
 
 async def collect_journal(shell: PanelShell, lines: int = 50) -> str:
     return (await shell.run(journal_command(lines))).stdout
+
+
+REBOOT_COMMAND = "reboot"
+# Bound the reboot issue: the box goes down mid-command, so run() should return (via
+# the disconnect) quickly. If sshd never returns an exit status before the panel is
+# gone the timeout fires and — like the disconnect — counts as success.
+_REBOOT_ISSUE_TIMEOUT_SECONDS = 20.0
+
+
+async def reboot(shell: PanelShell) -> None:
+    """Reboot the panel, treating the inevitable mid-command disconnect as success.
+
+    A tolerant sibling of `_checked`: `reboot` tears down sshd as the panel goes down,
+    so `run()` routinely ends in a dropped connection / EOF (and, defensively, could
+    hang with no exit status). Every one of those means the command took, so we bound
+    the wait and swallow the transport error / timeout rather than raise. A clean return
+    (systemd accepted the reboot and answered before dropping) is success too. Only the
+    caller's connect step can meaningfully fail — once `reboot` is in flight, the box
+    going down IS the expected outcome.
+    """
+    try:
+        async with asyncio.timeout(_REBOOT_ISSUE_TIMEOUT_SECONDS):
+            await shell.run(REBOOT_COMMAND)
+    except (OSError, asyncssh.Error):
+        # Expected: sshd went down with the panel (disconnect/EOF), or the channel
+        # never returned before the box did (TimeoutError, itself an OSError subclass).
+        return
+
+
+def _diagnostics_probes(lines: int) -> tuple[tuple[str, str], ...]:
+    """(title, command) pairs for collect_diagnostics — POSIX-simple, no bashisms.
+
+    Two probes scale with *lines*: the whole current boot (the wedge context) and the
+    bridge unit's own tail at half that depth. The rest are fixed one-shots covering the
+    two observed wedge classes — the uptime-decay wedge and Wi-Fi power-save starvation
+    (connman timeouts, kernel wlan/deauth/carrier noise, the radio's power_save state).
+    """
+    unit_lines = max(1, lines // 2)
+    return (
+        ("uptime", "uptime"),
+        ("free", "free"),
+        ("df /var", "df /var"),
+        (f"journalctl -b (last {lines})", f"journalctl -b -n {lines} --no-pager"),
+        (
+            f"journalctl -u {SERVICE_NAME} (last {unit_lines})",
+            f"journalctl -u {SERVICE_NAME} -n {unit_lines} --no-pager",
+        ),
+        (
+            "kernel wifi/oom",
+            "journalctl -k | grep -iE 'wlan|brcm|dhd|deauth|disassoc|carrier|oom' | tail -60",
+        ),
+        ("iw dev wlan0 link", "iw dev wlan0 link"),
+        ("iw dev wlan0 power_save", "iw dev wlan0 get power_save"),
+        ("connmanctl services", "connmanctl services 2>&1 | head -n 15"),
+        (
+            f"systemctl status {SERVICE_NAME}",
+            f"systemctl status {SERVICE_NAME} --no-pager 2>&1 | head -n 15",
+        ),
+    )
+
+
+async def _diagnostics_probe(shell: PanelShell, command: str) -> str:
+    """Run one read-only diagnostics probe, returning its output or an error note.
+
+    Failure-tolerant by contract so one dead probe never aborts the surrounding bundle:
+    a transport error becomes a text note. Exit status is deliberately NOT checked — a
+    non-zero probe (e.g. `iw ... get power_save` on a downed link, or `grep` finding no
+    match) still yields output worth capturing.
+    """
+    try:
+        result = await shell.run(command)
+    except (OSError, asyncssh.Error) as err:
+        return f"<probe failed: {type(err).__name__}: {err}>"
+    body = result.stdout.rstrip("\n")
+    stderr = result.stderr.rstrip("\n")
+    if stderr:
+        body = f"{body}\n[stderr] {stderr}" if body else f"[stderr] {stderr}"
+    return body or "<no output>"
+
+
+async def collect_diagnostics(shell: PanelShell, lines: int = DEFAULT_REBOOT_JOURNAL_LINES) -> str:
+    """Assemble a pre-reboot diagnostics bundle from independent, failure-tolerant probes.
+
+    The panel's journald is volatile (/run tmpfs — only the current boot survives a
+    reboot), so the wedge evidence MUST be pulled over SSH BEFORE the reboot that would
+    erase it. Sections are clearly delimited; each probe is best-effort (a raising probe
+    yields an error note in its section, never an abort — a partial bundle beats none).
+    """
+    sections: list[str] = []
+    for title, command in _diagnostics_probes(lines):
+        sections.append(f"===== {title} =====")
+        sections.append(f"$ {command}")
+        sections.append(await _diagnostics_probe(shell, command))
+        sections.append("")
+    return "\n".join(sections)
 
 
 async def deploy_payload(shell: PanelShell, local_payload_dir: str, version: str) -> None:

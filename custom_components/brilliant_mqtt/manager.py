@@ -17,7 +17,7 @@ import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -60,9 +60,12 @@ from .const import (
     DEFAULT_AUTO_REPAIR,
     DEFAULT_HA_CONTROL_ENABLED,
     DEFAULT_OFFLINE_GRACE_MINUTES,
+    DEFAULT_REBOOT_JOURNAL_LINES,
     DEFAULT_REPAIR_COOLDOWN_MINUTES,
     DEFAULT_TRUST_HOST_KEY_CHANGES,
     DEFAULT_VOICE_WAKE_WORD,
+    DIAGNOSTICS_RETENTION,
+    DIAGNOSTICS_SUBDIR,
     DOMAIN,
     EVENT_AGENT_UPDATED,
     EVENT_HOST_KEY_REPINNED,
@@ -101,6 +104,28 @@ class _HostKeyChanged(Exception):
 def _payload_dir() -> Path:
     """The bundled agent payload (built by scripts/build_payload.sh / release CI)."""
     return Path(__file__).parent / "agent_payload"
+
+
+def _write_diagnostics_bundle(directory: str, content: str) -> str:
+    """Write *content* to a timestamped .log in *directory*, keeping only the newest N.
+
+    Runs in the executor (blocking file I/O off the event loop). Names are UTC
+    yyyymmdd-HHMMSS stamps so they sort chronologically; a same-second burst gets a
+    `_N` suffix (which sorts AFTER the bare stamp) so a write never clobbers a sibling.
+    Retention prunes by that filename sort, keeping the newest DIAGNOSTICS_RETENTION.
+    """
+    dir_path = Path(directory)
+    dir_path.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    target = dir_path / f"{stamp}.log"
+    collision = 1
+    while target.exists():
+        target = dir_path / f"{stamp}_{collision}.log"
+        collision += 1
+    target.write_text(content, encoding="utf-8")
+    for stale in sorted(dir_path.glob("*.log"))[:-DIAGNOSTICS_RETENTION]:
+        stale.unlink(missing_ok=True)
+    return str(target)
 
 
 class _PayloadState(Protocol):
@@ -903,6 +928,76 @@ class PanelManager:
             title="Brilliant MQTT",
             notification_id=f"{EVENT_TYPE}_{self.panel}",
         )
+
+    async def async_reboot(
+        self,
+        *,
+        collect_diagnostics: bool = True,
+        journal_lines: int = DEFAULT_REBOOT_JOURNAL_LINES,
+    ) -> None:
+        """Capture a pre-reboot diagnostics bundle (if asked), then reboot the panel.
+
+        The panel's journald is volatile (/run tmpfs — only the current boot survives a
+        reboot), so the wedge evidence MUST be pulled over SSH BEFORE the reboot that
+        would erase it: capture always precedes the reboot command. Capture is
+        best-effort — a capture/persist failure is logged but never blocks the reboot the
+        operator asked for (the wedge must still clear). The reboot is issued LAST and its
+        inevitable mid-command SSH disconnect is treated as success (``panel_ops.reboot``).
+
+        Service-call/button context (like ``async_uninstall``): a connect failure raises
+        HomeAssistantError so the caller — the operator's scheduled 4 AM automation — sees
+        it. A connect failure does NOT escalate: a nightly reboot hitting a briefly-offline
+        panel should not raise a persistent repair issue, and the availability state
+        machine already owns real outages.
+        """
+        async with self._ssh_lock:
+            try:
+                shell = await self._connect_for_repair()
+            except _HostKeyChanged as err:
+                raise HomeAssistantError(
+                    translation_domain=DOMAIN, translation_key="host_key_changed"
+                ) from err
+            except (OSError, asyncssh.Error) as err:
+                raise HomeAssistantError(
+                    translation_domain=DOMAIN,
+                    translation_key="reboot_failed",
+                    translation_placeholders={"error": str(err)},
+                ) from err
+            diagnostics_path: str | None = None
+            try:
+                if collect_diagnostics:
+                    try:
+                        bundle = await panel_ops.collect_diagnostics(shell, journal_lines)
+                        diagnostics_path = await self._persist_diagnostics(bundle)
+                    except (OSError, asyncssh.Error) as diag_err:
+                        # Best-effort: a diagnostics failure must never block the reboot
+                        # (collect_diagnostics is itself per-probe tolerant, so this is
+                        # almost always the executor file write, e.g. a full disk).
+                        _LOGGER.warning(
+                            "%s: pre-reboot diagnostics capture failed: %s",
+                            self.panel,
+                            diag_err,
+                        )
+                # Reboot LAST: the connection drops as the panel goes down; panel_ops.reboot
+                # treats that disconnect (or a timeout with no exit status) as success.
+                await panel_ops.reboot(shell)
+            finally:
+                await self._async_close_shell(shell)
+        _LOGGER.info(
+            "%s: reboot issued (diagnostics: %s)",
+            self.panel,
+            diagnostics_path or ("skipped" if not collect_diagnostics else "capture failed"),
+        )
+
+    async def _persist_diagnostics(self, bundle: str) -> str:
+        """Write *bundle* under <config>/brilliant_mqtt/diagnostics/<panel>/, return its path.
+
+        The blocking file write + retention prune run in the executor (never on the event
+        loop). The panel slug is filesystem-safe (lowercase alnum + hyphens), so it is used
+        directly as the per-panel subdirectory.
+        """
+        directory = self.hass.config.path(DOMAIN, DIAGNOSTICS_SUBDIR, self.panel)
+        return await self.hass.async_add_executor_job(_write_diagnostics_bundle, directory, bundle)
 
     @asynccontextmanager
     async def _voice_ssh_session(self) -> AsyncIterator[PanelShell]:

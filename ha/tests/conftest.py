@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
 from collections.abc import Awaitable, Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from dataclasses import replace as _dc_replace
@@ -96,6 +97,22 @@ def repin_shells() -> Iterator[RepinShells]:
 @pytest.fixture(autouse=True)
 def auto_enable_custom_integrations(enable_custom_integrations: None) -> None:
     """Let the HA test harness load custom_components/ from this directory."""
+
+
+@pytest.fixture
+def panel_diagnostics_isolated(hass: HomeAssistant) -> Iterator[None]:
+    """Keep a test's panel diagnostics tree hermetic.
+
+    The reboot feature persists diagnostics bundles under
+    ``<config>/brilliant_mqtt/diagnostics/<panel>/``, but the HA test harness shares one
+    on-disk config dir across every test (and across runs), so those bundles would
+    otherwise leak between tests. Nothing else lives under ``<config>/brilliant_mqtt/``,
+    so wipe that subtree before and after the test.
+    """
+    root = Path(hass.config.path("brilliant_mqtt"))
+    shutil.rmtree(root, ignore_errors=True)
+    yield
+    shutil.rmtree(root, ignore_errors=True)
 
 
 @pytest.fixture
