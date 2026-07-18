@@ -37,6 +37,8 @@ CONF_HA_MIRROR_LEADER_PRIORITY = "ha_mirror_leader_priority"
 CONF_HA_MIRROR_LABEL = "ha_mirror_label"
 DEFAULT_HA_MIRROR_LABEL = "brilliant"
 DEFAULT_HA_MIRROR_LEADER_PRIORITY = 0
+# diyHue CA-recovery hook feature keys.
+CONF_HUE_CA_CERT = "hue_ca_cert"
 
 # Home Assistant-owned MQTT control plane. These global values are copied to each
 # panel entry by the configuration vertical slice; the singleton elects the enabled
@@ -63,6 +65,7 @@ COMPONENT_VOICE = "voice"
 COMPONENT_WIFI_WATCHDOG = "wifi_watchdog"
 COMPONENT_BUS_WATCHDOG = "bus_watchdog"
 COMPONENT_HA_MIRROR = "ha_mirror"
+COMPONENT_HUE_CA = "hue_ca"
 
 # Internally managed config-entry state (never shown in a config-flow form).
 DATA_SSH_HOST_KEY = "ssh_host_key"  # TOFU-pinned on first successful connect
@@ -182,6 +185,16 @@ WIFI_WATCHDOG_SERVICE_NAME = "brilliant-wifi-watchdog"
 PANEL_BUS_WATCHDOG_DIR = f"{PANEL_VAR_DIR}/bus_watchdog"
 PANEL_BUS_WATCHDOG_UNIT_FILE = "/etc/systemd/system/brilliant-bus-watchdog.service"
 BUS_WATCHDOG_SERVICE_NAME = "brilliant-bus-watchdog"
+
+# On-panel diyHue CA-recovery hook paths. Code tree lives under the OTA-proof /var
+# bridge dir like the other watchdogs; the operator's injected CA PEM lives under its
+# OWN top-level dir (outside PANEL_HUE_CA_DIR) so a hook uninstall/reinstall never
+# touches it. Two units (service + timer) because the hook is a periodic oneshot.
+PANEL_HUE_CA_DIR = f"{PANEL_VAR_DIR}/hue_ca"
+PANEL_HUE_CA_CERT_FILE = "/var/brilliant-hue-ca/injected-ca.pem"
+PANEL_HUE_CA_SERVICE_UNIT_FILE = "/etc/systemd/system/brilliant-hue-ca.service"
+PANEL_HUE_CA_TIMER_UNIT_FILE = "/etc/systemd/system/brilliant-hue-ca.timer"
+HUE_CA_TIMER_NAME = "brilliant-hue-ca.timer"
 
 EVENT_TYPE = "brilliant_mqtt_event"
 SIGNAL_PANEL_STATE = f"{DOMAIN}_panel_state"  # dispatcher: f"{SIGNAL_PANEL_STATE}_{entry_id}"
