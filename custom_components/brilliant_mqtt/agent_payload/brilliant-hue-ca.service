@@ -1,0 +1,13 @@
+[Unit]
+Description=Brilliant diyHue CA recovery (oneshot)
+After=network.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/brilliant-mqtt.env
+ExecStart=/usr/bin/python3.10 -m brilliant_hue_ca.run
+WorkingDirectory=/var/brilliant-mqtt/hue_ca
+Environment=PYTHONPATH=/var/brilliant-mqtt/hue_ca
+Nice=15
+MemoryMax=48M
+CPUQuota=10%

@@ -23,6 +23,8 @@ cp "$ROOT/deploy/brilliant-mqtt.service" "$DEST/brilliant-mqtt.service"
 cp "$ROOT/deploy/brilliant-ha-mirror.service" "$DEST/brilliant-ha-mirror.service"
 cp "$ROOT/deploy/brilliant-wifi-watchdog.service" "$DEST/brilliant-wifi-watchdog.service"
 cp "$ROOT/deploy/brilliant-bus-watchdog.service" "$DEST/brilliant-bus-watchdog.service"
+cp "$ROOT/deploy/brilliant-hue-ca.service" "$DEST/brilliant-hue-ca.service"
+cp "$ROOT/deploy/brilliant-hue-ca.timer" "$DEST/brilliant-hue-ca.timer"
 
 # Bundle the stdlib Wi-Fi watchdog (no vendored deps) into the integration payload.
 WD_SRC="$ROOT/src/brilliant_wifi_watchdog"
@@ -36,6 +38,11 @@ BUSWD_DST="$DEST/bus_watchdog/brilliant_bus_watchdog"
 rm -rf "$(dirname "$BUSWD_DST")"
 mkdir -p "$BUSWD_DST"
 cp "$ROOT/src/brilliant_bus_watchdog"/*.py "$BUSWD_DST"/
+
+# hue-ca CA-recovery oneshot
+HUECA_DST="$DEST/hue_ca/brilliant_hue_ca"
+mkdir -p "$HUECA_DST"
+cp "$ROOT/src/brilliant_hue_ca"/*.py "$HUECA_DST"/
 
 # Vendored pure-python MQTT deps for the panel's py3.10 (the panel has no pip).
 # Resolve the installed versions from the frozen project environment, then pin

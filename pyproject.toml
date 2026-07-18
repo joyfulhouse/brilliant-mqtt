@@ -71,4 +71,5 @@ packages = [
     "src/brilliant_voice",
     "src/brilliant_bus_watchdog",
     "src/brilliant_ha_mirror",
+    "src/brilliant_hue_ca",
 ]
