@@ -72,3 +72,32 @@ def test_run_once_returns_zero_when_bundle_absent() -> None:
     )
     # bundle-not-found is non-fatal (timer retries) -> exit 0
     assert rc == 0
+
+
+def test_run_once_returns_one_when_ca_empty() -> None:
+    # read_ca succeeds (file is readable) but returns an empty string -> the
+    # PEM is unparseable, so cert_fingerprint() must raise ValueError, which
+    # run_once needs to catch and turn into a logged, non-zero exit (not an
+    # uncaught traceback).
+    fs = FakeFS({"/b": True}, {"/b": CA})
+    rc = run_once(
+        {"HUE_CA_BUNDLE_PATH": "/b"},
+        fs=fs,
+        coordinator=FakeCoord(),
+        read_ca=lambda _p: "",
+    )
+    assert rc == 1
+
+
+def test_run_once_returns_one_when_ca_corrupt() -> None:
+    # Readable, non-empty, but not valid base64 in the PEM body -> binascii.Error
+    # (a ValueError subclass) from ssl.PEM_cert_to_DER_cert.
+    corrupt = "-----BEGIN CERTIFICATE-----\nnot-valid-base64!!!\n-----END CERTIFICATE-----\n"
+    fs = FakeFS({"/b": True}, {"/b": CA})
+    rc = run_once(
+        {"HUE_CA_BUNDLE_PATH": "/b"},
+        fs=fs,
+        coordinator=FakeCoord(),
+        read_ca=lambda _p: corrupt,
+    )
+    assert rc == 1

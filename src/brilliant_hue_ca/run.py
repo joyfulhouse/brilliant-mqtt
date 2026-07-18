@@ -12,7 +12,7 @@ from collections.abc import Callable, Mapping
 from .config import load_config
 from .coordinator import Coordinator, RealCoordinator
 from .fs import FileSystem, RealFileSystem
-from .reconcile import reconcile
+from .reconcile import cert_fingerprint, reconcile
 
 _LOG = logging.getLogger("brilliant_hue_ca")
 
@@ -29,6 +29,14 @@ def run_once(
         ca_pem = read_ca(cfg.ca_cert_path)
     except OSError:
         _LOG.exception("cannot read CA cert at %s", cfg.ca_cert_path)
+        return 1
+    try:
+        cert_fingerprint(ca_pem)
+    except ValueError:
+        _LOG.exception(
+            "CA cert at %s is empty or unparseable (not a valid PEM certificate)",
+            cfg.ca_cert_path,
+        )
         return 1
     try:
         outcome = reconcile(
