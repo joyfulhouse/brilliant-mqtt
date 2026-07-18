@@ -7,10 +7,17 @@ and its config-flow field.
 
 from __future__ import annotations
 
-import pytest
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
+import pytest
+from homeassistant.core import HomeAssistant
+
+from custom_components.brilliant_mqtt import components as comp
 from custom_components.brilliant_mqtt import panel_ops
 from custom_components.brilliant_mqtt.const import (
+    COMPONENT_HUE_CA,
+    CONF_HUE_CA_CERT,
     HUE_CA_TIMER_NAME,
     PANEL_HUE_CA_CERT_FILE,
     PANEL_HUE_CA_DIR,
@@ -143,3 +150,53 @@ async def test_uninstall_hue_ca_sequence_and_paths() -> None:
     for cmd in shell.commands:
         tokens = cmd.split()
         assert PANEL_VAR_DIR not in tokens, f"Command removes PANEL_VAR_DIR itself: {cmd!r}"
+
+
+# --- Task 6: component registry entry + config field --------------------------
+
+
+def test_hue_ca_in_optional_components() -> None:
+    ids = [c.id for c in comp.optional()]
+    assert COMPONENT_HUE_CA in ids
+    entry = comp.REGISTRY[COMPONENT_HUE_CA]
+    assert entry.locked is False
+    assert entry.default_enabled is False
+    assert entry.remove is panel_ops.uninstall_hue_ca
+
+
+async def test_hue_ca_install_refuses_empty_ca(hass: HomeAssistant) -> None:
+    entry = comp.REGISTRY[COMPONENT_HUE_CA]
+    shell = await _connected(FakeShell())
+    with pytest.raises(panel_ops.PanelOpError):
+        await entry.install(hass, shell, {CONF_HUE_CA_CERT: ""})
+    assert not shell.commands
+    assert not shell.uploads
+    assert not shell.dir_uploads
+
+
+async def test_hue_ca_install_refuses_blank_ca(hass: HomeAssistant) -> None:
+    """Whitespace-only input is stripped and treated as empty."""
+    entry = comp.REGISTRY[COMPONENT_HUE_CA]
+    shell = await _connected(FakeShell())
+    with pytest.raises(panel_ops.PanelOpError):
+        await entry.install(hass, shell, {CONF_HUE_CA_CERT: "   \n"})
+    assert not shell.commands
+
+
+async def test_hue_ca_install_deploys_with_ca(hass: HomeAssistant, tmp_path: Path) -> None:
+    # Stub the bundled payload dir so install can read the unit files from it.
+    (tmp_path / "brilliant-hue-ca.service").write_text("SERVICE_CONTENT")
+    (tmp_path / "brilliant-hue-ca.timer").write_text("TIMER_CONTENT")
+    (tmp_path / "hue_ca").mkdir()
+    entry = comp.REGISTRY[COMPONENT_HUE_CA]
+    shell = await _connected(FakeShell())
+    with (
+        patch("custom_components.brilliant_mqtt.manager._payload_dir", return_value=tmp_path),
+        patch.object(panel_ops, "deploy_hue_ca", new=AsyncMock()) as deploy,
+        patch.object(panel_ops, "ensure_hue_ca_units", new=AsyncMock()) as ensure_units,
+        patch.object(panel_ops, "enable_hue_ca", new=AsyncMock()) as enable,
+    ):
+        await entry.install(hass, shell, {CONF_HUE_CA_CERT: "PEM"})
+    deploy.assert_awaited_once_with(shell, str(tmp_path / "hue_ca"), "PEM")
+    ensure_units.assert_awaited_once_with(shell, "SERVICE_CONTENT", "TIMER_CONTENT")
+    enable.assert_awaited_once_with(shell)

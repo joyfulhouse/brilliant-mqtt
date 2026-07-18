@@ -19,10 +19,12 @@ from .const import (
     COMPONENT_BRIDGE,
     COMPONENT_BUS_WATCHDOG,
     COMPONENT_HA_MIRROR,
+    COMPONENT_HUE_CA,
     COMPONENT_VOICE,
     COMPONENT_WIFI_WATCHDOG,
     CONF_COMPONENTS,
     CONF_HA_CONTROL_ENABLED,
+    CONF_HUE_CA_CERT,
     CONF_MESH_PRIORITY,
     CONF_MQTT_HOST,
     CONF_MQTT_PASSWORD,
@@ -144,6 +146,24 @@ async def _bus_install(hass: HomeAssistant, shell: PanelShell, data: Mapping[str
     )
 
 
+async def _hue_ca_present(shell: PanelShell) -> bool:
+    return (await panel_ops.inspect_hue_ca(shell)).payload_present
+
+
+async def _hue_ca_install(hass: HomeAssistant, shell: PanelShell, data: Mapping[str, Any]) -> None:
+    ca_pem = str(data.get(CONF_HUE_CA_CERT, "")).strip()
+    if not ca_pem:
+        raise PanelOpError("Hue CA recovery needs the diyHue CA certificate (PEM)")
+    payload_dir = _mgr._payload_dir()
+    service = await hass.async_add_executor_job(
+        (payload_dir / "brilliant-hue-ca.service").read_text
+    )
+    timer = await hass.async_add_executor_job((payload_dir / "brilliant-hue-ca.timer").read_text)
+    await panel_ops.deploy_hue_ca(shell, str(payload_dir / "hue_ca"), ca_pem)
+    await panel_ops.ensure_hue_ca_units(shell, service, timer)
+    await panel_ops.enable_hue_ca(shell)
+
+
 async def _hamirror_present(shell: PanelShell) -> bool:
     return (await panel_ops.inspect_ha_mirror(shell)).payload_present
 
@@ -201,6 +221,15 @@ REGISTRY: dict[str, Component] = {
         install=_hamirror_install,
         remove=panel_ops.uninstall_ha_mirror,
         deprecated=True,
+    ),
+    COMPONENT_HUE_CA: Component(
+        id=COMPONENT_HUE_CA,
+        label="Hue CA recovery",
+        locked=False,
+        default_enabled=False,
+        present=_hue_ca_present,
+        install=_hue_ca_install,
+        remove=panel_ops.uninstall_hue_ca,
     ),
 }
 
