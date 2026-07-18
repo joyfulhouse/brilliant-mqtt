@@ -722,6 +722,7 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
                     CONF_COMPONENTS: components,
                     CONF_VOICE_WAKE_WORD: user_input[CONF_VOICE_WAKE_WORD],
                     CONF_VOICE_HA_HOST: user_input[CONF_VOICE_HA_HOST],
+                    CONF_HUE_CA_CERT: user_input.get(CONF_HUE_CA_CERT, ""),
                     **control_values,
                 }
                 current_cid: str | None = None
