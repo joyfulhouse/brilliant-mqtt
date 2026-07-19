@@ -84,7 +84,7 @@ Behavior knobs are under **Configure** (Options).
 
 ## Entities
 
-Each panel's device gains six management entities (three diagnostic, three control):
+Each panel's device gains ten management entities (three diagnostic, seven control):
 
 | Entity | What it is |
 |---|---|
@@ -95,6 +95,7 @@ Each panel's device gains six management entities (three diagnostic, three contr
 | `select.brilliant_<panel>_wake_word` | **Wake word** — choose `okay_nabu` (default), `hey_jarvis`, or `hey_mycroft`; changing it restarts the satellite. |
 | `switch.brilliant_<panel>_wi_fi_watchdog` | **Wi-Fi watchdog** — enable installs and starts the on-panel Wi-Fi watchdog daemon (auto-recovers lost Wi-Fi: reconnect → restart networking → reboot as a last resort, see [CONFIGURATION.md → Wi-Fi watchdog](CONFIGURATION.md#wi-fi-watchdog)); disable uninstalls it. |
 | `switch.brilliant_<panel>_bus_watchdog` | **Bus watchdog** — enable installs and starts the on-panel bus-health watchdog daemon (reboots the panel if the Brilliant message bus stays wedged 30+ minutes, gated on the bridge being active and the network being up, see [CONFIGURATION.md → Bus-health watchdog](CONFIGURATION.md#bus-health-watchdog)); disable uninstalls it. |
+| `switch.brilliant_<panel>_hue_ca_recovery` | **Hue CA recovery** — enable installs and starts the on-panel diyHue CA recovery oneshot+timer (re-appends your diyHue bridge's CA to the panel's pinned Hue trust bundle after every OTA, see [CONFIGURATION.md → Hue CA recovery](CONFIGURATION.md#hue-ca-recovery)); requires the diyHue CA certificate to already be set on the config entry (onboarding or **Reconfigure**) — enabling with none configured fails closed. Disable uninstalls it. |
 | `select.brilliant_<panel>_scene` | **Scene** — the panel's Brilliant scenes, populated from its accepted MQTT catalog. Changing it only updates the HA-local selection; it publishes no command. |
 | `button.brilliant_<panel>_run_selected_scene` | **Run selected scene** — runs the selected scene with blocking execution confirmation. Available only while the scene transport, catalog, and a selection exist. |
 

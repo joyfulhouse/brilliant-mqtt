@@ -235,6 +235,9 @@
       "bus_watchdog_enabled": {
         "name": "Bus watchdog"
       },
+      "hue_ca_enabled": {
+        "name": "Hue CA recovery"
+      },
       "ha_mirror": {
         "name": "HA mirror"
       }
@@ -269,6 +272,9 @@
     },
     "bus_watchdog_failed": {
       "message": "Bus watchdog operation failed: {error}"
+    },
+    "hue_ca_failed": {
+      "message": "Hue CA recovery operation failed: {error}"
     },
     "ha_mirror_failed": {
       "message": "HA mirror operation failed: {error}"

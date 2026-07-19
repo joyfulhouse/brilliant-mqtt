@@ -126,8 +126,9 @@ OTA, which wipes `/data` (and the bundle with it) but not `/var`. This is what
 keeps the panel's native Hue client trusting your diyHue bridge so a wall
 slider can keep controlling an HA-backed bulb with no SmartThings/cloud
 round-trip. **Off by default.** Installed via the HA integration's component
-checklist (onboarding, or **Reconfigure** on an existing panel) — there is no
-runtime switch entity for it, unlike the watchdogs below.
+checklist (onboarding, or **Reconfigure** on an existing panel), or — like
+the watchdogs below — toggled live afterward via the **Hue CA recovery**
+switch (see [ha-integration.md → Entities](ha-integration.md#entities)).
 
 Enabling it requires pasting the **diyHue CA certificate (PEM)** field: your
 diyHue bridge's CA *public* certificate, PEM-encoded. The integration refuses

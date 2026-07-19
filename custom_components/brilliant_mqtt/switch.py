@@ -13,6 +13,7 @@ from . import BrilliantMqttConfigEntry
 from .const import (
     COMPONENT_BUS_WATCHDOG,
     COMPONENT_HA_MIRROR,
+    COMPONENT_HUE_CA,
     COMPONENT_VOICE,
     COMPONENT_WIFI_WATCHDOG,
     CONF_COMPONENTS,
@@ -36,6 +37,7 @@ async def async_setup_entry(
             VoiceSatelliteSwitch(entry),
             WifiWatchdogSwitch(entry),
             BusWatchdogSwitch(entry),
+            HueCaSwitch(entry),
         ]
     )
 
@@ -122,6 +124,15 @@ class BusWatchdogSwitch(_ComponentInstallSwitch):
     _component_id = COMPONENT_BUS_WATCHDOG
     _unique_id_suffix = "bus_watchdog_enabled"
     _failure_translation_key = "bus_watchdog_failed"
+
+
+class HueCaSwitch(_ComponentInstallSwitch):
+    """Install/remove the on-panel diyHue CA recovery hook."""
+
+    _attr_translation_key = "hue_ca_enabled"
+    _component_id = COMPONENT_HUE_CA
+    _unique_id_suffix = "hue_ca_enabled"
+    _failure_translation_key = "hue_ca_failed"
 
 
 class HaMirrorSwitch(_ComponentInstallSwitch):
