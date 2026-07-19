@@ -116,6 +116,49 @@ separate env file.
 broker reachability alongside the gateway probe — informational only; broker
 state never drives the escalation ladder.
 
+### Hue CA recovery
+
+An optional standalone oneshot (`brilliant_hue_ca`) for panels bridged to a
+local [diyHue](https://diyhue.org) bridge: it re-appends your diyHue CA's
+*public* certificate to the panel's pinned Hue trust bundle and restarts the
+local Hue coordinator whenever it has to append — recovering from a firmware
+OTA, which wipes `/data` (and the bundle with it) but not `/var`. This is what
+keeps the panel's native Hue client trusting your diyHue bridge so a wall
+slider can keep controlling an HA-backed bulb with no SmartThings/cloud
+round-trip. **Off by default.** Installed via the HA integration's component
+checklist (onboarding, or **Reconfigure** on an existing panel) — there is no
+runtime switch entity for it, unlike the watchdogs below.
+
+Enabling it requires pasting the **diyHue CA certificate (PEM)** field: your
+diyHue bridge's CA *public* certificate, PEM-encoded. The integration refuses
+to install the component if this field is empty.
+
+A `brilliant-hue-ca.timer` drives the oneshot: it fires once ~2 minutes after
+boot, then every ~15 minutes thereafter — frequent enough to reliably catch a
+post-OTA cert wipe without waiting on a manual restart.
+
+> **Rollout note:** enable this on **every** bridged panel, not just the one
+> currently hosting the Brilliant Hue integration. The Hue integration host can
+> move to any panel (leader election, manual reassignment, panel replacement),
+> and a panel without this hook would strand the integration — silently
+> failing Hue-bridge TLS — if it became the host.
+
+It reads the same `/etc/brilliant-mqtt.env` as the bridge (optionally — a
+missing file is not an error) — there is no separate env file.
+
+| Variable | Required | Default | Meaning |
+|---|---|---|---|
+| `HUE_CA_CERT_PATH` | no | `/var/brilliant-hue-ca/injected-ca.pem` | Where the operator's injected CA PEM lives on the panel (written by the HA integration when the component is installed). |
+| `HUE_CA_BUNDLE_PATH` | no | the pinned `.../lib/certs/hue-bridge-ca-certs.pem` under the panel's Python 3.10 site-packages | The panel's pinned Hue CA trust bundle to append into. If this path doesn't exist, the hook falls back to a glob under `HUE_CA_SITE_PACKAGES`. |
+| `HUE_CA_SITE_PACKAGES` | no | the panel's Python 3.10 `site-packages` root | Glob-fallback root searched for `hue-bridge-ca-certs.pem` when `HUE_CA_BUNDLE_PATH` doesn't exist (e.g. after a firmware version bump moves the path). |
+| `HUE_CA_VASSAL_INI` | no | `/var/run/brilliant/processes/hue_bridge_peripherals.ini` | The Hue coordinator's uWSGI vassal control file. Its presence means this panel currently hosts Hue; touching it (`os.utime`) triggers the emperor to reload that vassal — the "restart" this hook performs after appending. |
+| `HUE_CA_LOG` | no | `/var/log/brilliant-hue-ca.log` | Rotating log file (256 KB × 2 backups) for each oneshot run. |
+
+Each run is idempotent: the hook compares certificates by SHA-256 fingerprint
+of the DER encoding, so it only appends (and only restarts the coordinator)
+when your CA is actually missing from the bundle — a no-op run on every other
+timer tick.
+
 ### Bus-health watchdog
 
 An optional standalone daemon (`brilliant_bus_watchdog`) that reboots the

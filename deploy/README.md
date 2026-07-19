@@ -16,6 +16,15 @@ guide and `../INSTALL.md` for prerequisites including MQTT broker setup.
 - `brilliant-wifi-watchdog.service` — optional Wi-Fi watchdog: recovers a panel
   that drops off Wi-Fi (connman re-enable → restart → GPIO reset/reboot). See
   [../docs/CONFIGURATION.md](../docs/CONFIGURATION.md#wi-fi-watchdog).
+- `brilliant-hue-ca.service` — optional **Hue CA recovery** component (oneshot):
+  re-appends the operator's diyHue CA to the panel's pinned Hue trust bundle
+  and restarts the local Hue coordinator when it does. Installed via the HA
+  integration's component checklist, activated by its timer below (not
+  enabled directly). See
+  [../docs/CONFIGURATION.md](../docs/CONFIGURATION.md#hue-ca-recovery).
+- `brilliant-hue-ca.timer` — activation timer for the Hue CA recovery oneshot
+  above: fires ~2 min after boot, then every ~15 min. See
+  [../docs/CONFIGURATION.md](../docs/CONFIGURATION.md#hue-ca-recovery).
 - `brilliant-voice.service` — optional on-panel voice satellite. See
   [../docs/voice.md](../docs/voice.md).
 - `brilliant-ha-mirror.service` — **deprecated and unsafe; do not install,
