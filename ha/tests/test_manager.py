@@ -25,6 +25,7 @@ from custom_components.brilliant_mqtt.const import (
     COMPONENT_BRIDGE,
     COMPONENT_BUS_WATCHDOG,
     COMPONENT_HA_MIRROR,
+    COMPONENT_HUE_CA,
     COMPONENT_VOICE,
     COMPONENT_WIFI_WATCHDOG,
     CONF_COMPONENTS,
@@ -33,6 +34,7 @@ from custom_components.brilliant_mqtt.const import (
     CONF_HA_MIRROR_LEADER_PRIORITY,
     CONF_HA_MIRROR_TOKEN,
     CONF_HA_MIRROR_WS_URL,
+    CONF_HUE_CA_CERT,
     CONF_PANEL,
     CONF_VOICE_ENABLED,
     CONF_VOICE_WAKE_WORD,
@@ -43,6 +45,7 @@ from custom_components.brilliant_mqtt.const import (
     OPT_TRUST_HOST_KEY_CHANGES,
     PANEL_HA_MIRROR_ENV_FILE,
     PANEL_HA_MIRROR_UNIT_FILE,
+    PANEL_HUE_CA_CERT_FILE,
 )
 from custom_components.brilliant_mqtt.manager import PanelManager
 from custom_components.brilliant_mqtt.shell import RunResult
@@ -1959,6 +1962,298 @@ async def test_refresh_staged_copies_skips_bus_watchdog_when_not_selected(
     assert not any("brilliant-bus-watchdog" in p for (p, _d, _m) in shell.uploads)
 
     assert await hass.config_entries.async_unload(entry.entry_id)
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+# ---------------------------------------------------------------------------
+# Hue CA recovery hook repair re-lay (the OTA-survival defect: /etc AND /data are
+# wiped by the OTA the hook exists to recover from — the units must be re-laid).
+# ---------------------------------------------------------------------------
+
+_HUE_CA_CERT_PEM = "-----BEGIN CERTIFICATE-----\nFAKE\n-----END CERTIFICATE-----\n"
+
+
+def _write_hue_ca_units(payload_dir: Path) -> None:
+    (payload_dir / "brilliant-hue-ca.service").write_text("[Unit]\nDescription=test hue-ca unit\n")
+    (payload_dir / "brilliant-hue-ca.timer").write_text("[Unit]\nDescription=test hue-ca timer\n")
+
+
+@pytest.mark.allow_lingering_timers
+async def test_repair_relays_hue_ca_units_when_selected(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    payload_dir: Path,
+) -> None:
+    """When hue_ca is selected, async_repair re-lays its units and re-enables the timer.
+
+    OTA wipes /etc/systemd/system/ (dropping the units) AND /data (the pinned Hue CA
+    bundle the hook itself recovers) — but the code and the previously-written CA
+    both live under /var and survive. The repair must call ensure_hue_ca_units +
+    enable_hue_ca so the hook keeps re-appending the CA across OTAs, WITHOUT
+    redeploying the code+CA (payload already present).
+    """
+    from custom_components.brilliant_mqtt import panel_ops
+    from custom_components.brilliant_mqtt.shell import RunResult
+
+    _write_hue_ca_units(payload_dir)
+    agent_ok = RunResult(
+        0, "unit=1\nenv=1\nenabled=1\nactive=1\nsunit=1\nsenv=1\npayload=1\n0.2.0\n", ""
+    )
+    hue_ca_payload_ok = RunResult(0, "payload=1\n", "")
+    shell = FakeShell(
+        responses={
+            panel_ops.INSPECT_COMMAND: agent_ok,
+            panel_ops.HUE_CA_INSPECT_COMMAND: hue_ca_payload_ok,
+        }
+    )
+    entry_data = {
+        **ENTRY_DATA,
+        CONF_COMPONENTS: {COMPONENT_BRIDGE: True, COMPONENT_HUE_CA: True},
+        CONF_HUE_CA_CERT: _HUE_CA_CERT_PEM,
+    }
+    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+        entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=entry_data, version=2)
+        entry.add_to_hass(hass)
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        await entry.runtime_data.async_repair(trigger="button")
+        await hass.async_block_till_done()
+
+    # ensure_hue_ca_units wrote both units to /etc and the staged copies.
+    etc_uploads = [p for (p, _d, _m) in shell.uploads]
+    assert "/etc/systemd/system/brilliant-hue-ca.service" in etc_uploads
+    assert "/etc/systemd/system/brilliant-hue-ca.timer" in etc_uploads
+    # enable_hue_ca enabled the TIMER (not the oneshot service).
+    assert "systemctl enable --now brilliant-hue-ca.timer" in shell.commands
+    # Payload was present in /var → no redeploy of the hue-ca code tree or the CA.
+    assert not any("hue_ca" in local for (local, _remote) in shell.dir_uploads)
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_repair_redeploys_hue_ca_code_and_cert_when_payload_absent(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    payload_dir: Path,
+) -> None:
+    """When the hue-ca /var payload was also lost, repair redeploys the code+CA.
+
+    Mirrors the bridge's own "code-less panel" bootstrap: deploy_hue_ca re-uploads
+    the code tree and re-writes the CA (only after a successful code swap), then the
+    units are still re-laid and the timer re-enabled.
+    """
+    from custom_components.brilliant_mqtt import panel_ops
+    from custom_components.brilliant_mqtt.shell import RunResult
+
+    _write_hue_ca_units(payload_dir)
+    agent_ok = RunResult(
+        0, "unit=1\nenv=1\nenabled=1\nactive=1\nsunit=1\nsenv=1\npayload=1\n0.2.0\n", ""
+    )
+    hue_ca_payload_absent = RunResult(0, "payload=0\n", "")
+    shell = FakeShell(
+        responses={
+            panel_ops.INSPECT_COMMAND: agent_ok,
+            panel_ops.HUE_CA_INSPECT_COMMAND: hue_ca_payload_absent,
+        }
+    )
+    entry_data = {
+        **ENTRY_DATA,
+        CONF_COMPONENTS: {COMPONENT_BRIDGE: True, COMPONENT_HUE_CA: True},
+        CONF_HUE_CA_CERT: _HUE_CA_CERT_PEM,
+    }
+    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+        entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=entry_data, version=2)
+        entry.add_to_hass(hass)
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        await entry.runtime_data.async_repair(trigger="button")
+        await hass.async_block_till_done()
+
+    # deploy_hue_ca uploaded the code tree AND wrote the CA (after the swap).
+    # The relay strips the PEM before writing it (mirroring _hue_ca_install), hence
+    # .strip() here too.
+    assert any("hue_ca" in local for (local, _remote) in shell.dir_uploads)
+    assert (
+        PANEL_HUE_CA_CERT_FILE,
+        _HUE_CA_CERT_PEM.strip().encode(),
+        0o644,
+    ) in shell.uploads
+    # The units are still re-laid and the timer re-enabled.
+    etc_uploads = [p for (p, _d, _m) in shell.uploads]
+    assert "/etc/systemd/system/brilliant-hue-ca.service" in etc_uploads
+    assert "/etc/systemd/system/brilliant-hue-ca.timer" in etc_uploads
+    assert "systemctl enable --now brilliant-hue-ca.timer" in shell.commands
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_repair_skips_hue_ca_relay_when_payload_absent_and_no_ca_configured(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    payload_dir: Path,
+) -> None:
+    """No CA configured + code also absent: skip the whole relay, never redeploy.
+
+    Redeploying with an empty CA would overwrite whatever CA the panel already has
+    with nothing useful, and enabling the timer with no code present would just fail
+    every run — so the relay must skip entirely (matching _hue_ca_install's own
+    empty-CA guard) rather than attempt a broken partial repair.
+    """
+    from custom_components.brilliant_mqtt import panel_ops
+    from custom_components.brilliant_mqtt.shell import RunResult
+
+    _write_hue_ca_units(payload_dir)
+    agent_ok = RunResult(
+        0, "unit=1\nenv=1\nenabled=1\nactive=1\nsunit=1\nsenv=1\npayload=1\n0.2.0\n", ""
+    )
+    hue_ca_payload_absent = RunResult(0, "payload=0\n", "")
+    shell = FakeShell(
+        responses={
+            panel_ops.INSPECT_COMMAND: agent_ok,
+            panel_ops.HUE_CA_INSPECT_COMMAND: hue_ca_payload_absent,
+        }
+    )
+    entry_data = {
+        **ENTRY_DATA,
+        CONF_COMPONENTS: {COMPONENT_BRIDGE: True, COMPONENT_HUE_CA: True},
+        CONF_HUE_CA_CERT: "",
+    }
+    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+        entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=entry_data, version=2)
+        entry.add_to_hass(hass)
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        await entry.runtime_data.async_repair(trigger="button")
+        await hass.async_block_till_done()
+
+    # No redeploy, no unit re-lay, no enable — the relay was skipped entirely.
+    assert not any("hue_ca" in local for (local, _remote) in shell.dir_uploads)
+    assert not any("brilliant-hue-ca" in p for (p, _d, _m) in shell.uploads)
+    assert "systemctl enable --now brilliant-hue-ca.timer" not in shell.commands
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_repair_skips_hue_ca_when_not_selected(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    payload_dir: Path,
+) -> None:
+    """When hue_ca is NOT in the selected components, repair must not touch it."""
+    from custom_components.brilliant_mqtt import panel_ops
+    from custom_components.brilliant_mqtt.shell import RunResult
+
+    agent_ok = RunResult(
+        0, "unit=1\nenv=1\nenabled=1\nactive=1\nsunit=1\nsenv=1\npayload=1\n0.2.0\n", ""
+    )
+    shell = FakeShell(responses={panel_ops.INSPECT_COMMAND: agent_ok})
+    entry_data = {
+        **ENTRY_DATA,
+        CONF_COMPONENTS: {COMPONENT_BRIDGE: True},
+    }
+    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+        entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=entry_data, version=2)
+        entry.add_to_hass(hass)
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        await entry.runtime_data.async_repair(trigger="button")
+        await hass.async_block_till_done()
+
+    # No hue-ca commands or uploads must have run.
+    assert "systemctl enable --now brilliant-hue-ca.timer" not in shell.commands
+    assert not any("hue-ca" in c or "hue_ca" in c for c in shell.commands)
+    assert not any("brilliant-hue-ca" in p for (p, _d, _m) in shell.uploads)
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+# ---------------------------------------------------------------------------
+# Hue CA recovery hook staged-copy refresh re-lay (same OTA gap, non-outage path)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.allow_lingering_timers
+async def test_refresh_staged_copies_relays_hue_ca_units_when_selected(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    payload_dir: Path,
+) -> None:
+    """When hue_ca is selected, a post-OTA staged-copy refresh re-lays its units.
+
+    _refresh_staged_copies runs on every firmware-change sighting (the bridge stayed
+    up through the OTA), not just after an outage — so the hue-ca hook's units must
+    be re-laid there too, since the same OTA wipes /etc/systemd/system/ for it (and
+    /data, which the hook itself recovers).
+    """
+    from custom_components.brilliant_mqtt import panel_ops
+    from custom_components.brilliant_mqtt.shell import RunResult
+
+    _write_hue_ca_units(payload_dir)
+    hue_ca_payload_ok = RunResult(0, "payload=1\n", "")
+    shell = FakeShell(responses={panel_ops.HUE_CA_INSPECT_COMMAND: hue_ca_payload_ok})
+    entry_data = {
+        **ENTRY_DATA,
+        CONF_COMPONENTS: {COMPONENT_BRIDGE: True, COMPONENT_HUE_CA: True},
+        CONF_HUE_CA_CERT: _HUE_CA_CERT_PEM,
+    }
+    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+        entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=entry_data, version=2)
+        entry.add_to_hass(hass)
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+        async_fire_mqtt_message(
+            hass, "brilliant/office/bridge", '{"agent_version": "0.2.0", "panel_firmware": "v1"}'
+        )
+        await hass.async_block_till_done()
+        async_fire_mqtt_message(
+            hass, "brilliant/office/bridge", '{"agent_version": "0.2.0", "panel_firmware": "v2"}'
+        )
+        await hass.async_block_till_done(wait_background_tasks=True)
+
+    etc_uploads = [p for (p, _d, _m) in shell.uploads]
+    assert "/etc/systemd/system/brilliant-hue-ca.service" in etc_uploads
+    assert "/etc/systemd/system/brilliant-hue-ca.timer" in etc_uploads
+    assert "systemctl enable --now brilliant-hue-ca.timer" in shell.commands
+    assert not any("hue_ca" in local for (local, _remote) in shell.dir_uploads)
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_refresh_staged_copies_skips_hue_ca_when_not_selected(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    payload_dir: Path,
+) -> None:
+    """When hue_ca is NOT selected, a staged-copy refresh must not touch it."""
+    shell = FakeShell()
+    entry_data = {
+        **ENTRY_DATA,
+        CONF_COMPONENTS: {COMPONENT_BRIDGE: True},
+    }
+    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+        entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=entry_data, version=2)
+        entry.add_to_hass(hass)
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+        async_fire_mqtt_message(
+            hass, "brilliant/office/bridge", '{"agent_version": "0.2.0", "panel_firmware": "v1"}'
+        )
+        await hass.async_block_till_done()
+        async_fire_mqtt_message(
+            hass, "brilliant/office/bridge", '{"agent_version": "0.2.0", "panel_firmware": "v2"}'
+        )
+        await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert "systemctl enable --now brilliant-hue-ca.timer" not in shell.commands
+    assert not any("hue-ca" in c or "hue_ca" in c for c in shell.commands)
+    assert not any("brilliant-hue-ca" in p for (p, _d, _m) in shell.uploads)
 
     assert await hass.config_entries.async_unload(entry.entry_id)
 

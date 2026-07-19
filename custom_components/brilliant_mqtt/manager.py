@@ -37,6 +37,7 @@ from .const import (
     AVAILABILITY_ONLINE,
     COMPONENT_BUS_WATCHDOG,
     COMPONENT_HA_MIRROR,
+    COMPONENT_HUE_CA,
     COMPONENT_VOICE,
     COMPONENT_WIFI_WATCHDOG,
     CONF_COMPONENTS,
@@ -45,6 +46,7 @@ from .const import (
     CONF_HA_MIRROR_TOKEN,
     CONF_HA_MIRROR_WS_URL,
     CONF_HOST,
+    CONF_HUE_CA_CERT,
     CONF_MESH_PRIORITY,
     CONF_MQTT_HOST,
     CONF_MQTT_PASSWORD,
@@ -640,6 +642,47 @@ class PanelManager:
             return err
         return None
 
+    async def _relay_hue_ca(self, shell: PanelShell) -> Exception | None:
+        """Restore the selected hue-ca recovery hook without blocking the bridge op.
+
+        Bespoke sibling of _relay_watchdog: the hook needs TWO unit files (a oneshot
+        .service the .timer activates) plus the operator's CA PEM, so it can't reuse
+        _WatchdogRelaySpec verbatim. An OTA wipes /etc/systemd/system/ (dropping the
+        units) AND /data (the pinned Hue CA bundle the hook re-appends) — but the code
+        + the CA PEM this hook already wrote to PANEL_HUE_CA_CERT_FILE both live under
+        /var and normally survive. So the common case is a pure re-lay + re-enable;
+        deploy_hue_ca (which re-writes the code AND the CA) only runs when the /var
+        payload itself was also lost. Mirrors deploy_hue_ca's own contract (CA is
+        written only after a successful code swap) by never redeploying with an empty
+        CA — matching _hue_ca_install's guard — and skips the whole relay (not just
+        the redeploy) when the code is gone and no CA is configured, since enabling
+        the timer then would just fail every run.
+        """
+        try:
+            payload_dir = _payload_dir()
+            service = await self.hass.async_add_executor_job(
+                (payload_dir / "brilliant-hue-ca.service").read_text
+            )
+            timer = await self.hass.async_add_executor_job(
+                (payload_dir / "brilliant-hue-ca.timer").read_text
+            )
+            state = await panel_ops.inspect_hue_ca(shell)
+            if not state.payload_present:
+                ca_pem = str(self.entry.data.get(CONF_HUE_CA_CERT, "")).strip()
+                if not ca_pem:
+                    _LOGGER.warning(
+                        "%s: hue-ca code is missing and no CA certificate is "
+                        "configured; skipping the hue-ca relay",
+                        self.panel,
+                    )
+                    return None
+                await panel_ops.deploy_hue_ca(shell, str(payload_dir / "hue_ca"), ca_pem)
+            await panel_ops.ensure_hue_ca_units(shell, service, timer)
+            await panel_ops.enable_hue_ca(shell)
+        except (OSError, asyncssh.Error, PanelOpError) as err:
+            return err
+        return None
+
     async def async_repair(self, trigger: str = "manual") -> None:
         """Restore unit/env + enable; recovery is confirmed by the availability LWT."""
         if self._repairing:
@@ -748,6 +791,16 @@ class PanelManager:
                     if COMPONENT_BUS_WATCHDOG in selected:
                         if err := await self._relay_watchdog(shell, _BUS_WATCHDOG_RELAY):
                             _LOGGER.warning("%s: bus watchdog repair failed: %s", self.panel, err)
+                    # Hue CA recovery hook re-lay: re-write its units to /etc if selected.
+                    # OTA wipes /etc/systemd/system/ (and /data — what the hook itself
+                    # recovers), so the timer disappears after a firmware update even
+                    # though the code + previously-written CA survive in /var. Lay it
+                    # back down (and redeploy code+CA if /var was also wiped) so the
+                    # hook keeps re-appending the CA across OTAs. Failure is logged and
+                    # swallowed — a hue-ca outage must not block the bridge repair.
+                    if COMPONENT_HUE_CA in selected:
+                        if err := await self._relay_hue_ca(shell):
+                            _LOGGER.warning("%s: hue-ca repair failed: %s", self.panel, err)
                     try:
                         retirement_result = await self._async_retire_legacy_ha_mirror_on_shell(
                             shell
@@ -1208,6 +1261,15 @@ class PanelManager:
                         if await self._relay_watchdog(shell, _BUS_WATCHDOG_RELAY):
                             _LOGGER.warning(
                                 "%s: bus watchdog refresh failed; will retry next reconcile",
+                                self.panel,
+                            )
+                    # Hue CA recovery hook: also re-lay its units when selected — OTA
+                    # wipes /etc and the timer disappears even though the code +
+                    # previously-written CA in /var survive.
+                    if COMPONENT_HUE_CA in selected:
+                        if await self._relay_hue_ca(shell):
+                            _LOGGER.warning(
+                                "%s: hue-ca refresh failed; will retry next reconcile",
                                 self.panel,
                             )
                     try:
