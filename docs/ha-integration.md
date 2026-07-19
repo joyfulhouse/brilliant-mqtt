@@ -84,13 +84,14 @@ Behavior knobs are under **Configure** (Options).
 
 ## Entities
 
-Each panel's device gains ten management entities (three diagnostic, seven control):
+Each panel's device gains eleven management entities (three diagnostic, eight control):
 
 | Entity | What it is |
 |---|---|
 | `update.brilliant_<panel>_bridge` | Agent **update** entity. Installed version comes from the panel's retained bridge-meta (`agent_version`); latest from the bundled payload's `VERSION`. Installing pushes the bundled payload and restarts the agent. |
 | `binary_sensor.brilliant_<panel>_bridge_health` | Bridge **health** (device class `problem`). `on` = needs attention (offline past grace with auto-repair off, a repair step failed, or a repair ran but the bridge stayed offline). Attributes: `reason`, `availability`. |
 | `button.brilliant_<panel>_repair_bridge` | **Manual repair** — restores the unit/env and starts the agent (installs agent code first if missing), bypassing the auto-repair cooldown. |
+| `button.brilliant_<panel>_reboot_panel` | **Reboot panel** (device class `restart`) — captures a diagnostics bundle over SSH, then reboots the panel (its logs are volatile, so diagnostics are captured first). |
 | `switch.brilliant_<panel>_voice_satellite` | **Voice satellite** — enable installs and starts the satellite; disable uninstalls it. |
 | `select.brilliant_<panel>_wake_word` | **Wake word** — choose `okay_nabu` (default), `hey_jarvis`, or `hey_mycroft`; changing it restarts the satellite. |
 | `switch.brilliant_<panel>_wi_fi_watchdog` | **Wi-Fi watchdog** — enable installs and starts the on-panel Wi-Fi watchdog daemon (auto-recovers lost Wi-Fi: reconnect → restart networking → reboot as a last resort, see [CONFIGURATION.md → Wi-Fi watchdog](CONFIGURATION.md#wi-fi-watchdog)); disable uninstalls it. |
