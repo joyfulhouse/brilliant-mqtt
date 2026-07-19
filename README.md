@@ -33,6 +33,11 @@ Home Assistant discovers everything automatically — no YAML:
   execution, and trigger HA automations when someone runs one on the panel.
 - **Talk to your house** *(optional)*. Any panel can become a local wake-word
   voice satellite for HA Assist, using its built-in mic and speaker.
+- **Drive Home Assistant lights from the wall** *(operator setup)*. Point the
+  panel's built-in Hue integration at a local [diyHue](https://github.com/diyhue/diyHue)
+  bridge backed by Home Assistant, and a wall slider controls any HA-managed bulb
+  (Tuya, WiZ, …) natively — fully local, no SmartThings, no cloud. See the
+  [diyHue bridge guide](docs/brilliant-panel/diyhue-bridge.md).
 
 Everything stays local: the agent taps the panel's own internal message bus —
 the same one Brilliant's HomeKit bridge uses — and runs alongside Alexa and
@@ -48,6 +53,7 @@ HomeKit without breaking them. It survives panel firmware updates.
 | Panel settings | 25+ entities per panel: screen, audio, privacy, governance switches |
 | Brilliant scenes & modes *(in pilot)* | Per-panel scene/mode catalogs, HA services with confirmed execution, HA events on native scene runs — see [the scene bridge guide](docs/brilliant-panel/home-assistant-integration.md) |
 | Voice satellite | Local wake word → your own HA Assist pipeline (opt-in per panel) |
+| HA lights via Hue *(operator setup)* | The panel's native Hue client drives HA-managed bulbs through a local diyHue bridge — wall slider → any HA light, no cloud. A **Hue CA recovery** component keeps it alive across firmware OTAs. See [diyHue bridge](docs/brilliant-panel/diyhue-bridge.md) |
 | Reliability | Auto-reconnect, watchdogs, and retained MQTT state — entities survive HA restarts, panel reboots, and firmware updates. A bus-health watchdog self-recovers a panel whose Brilliant bus stays wedged. |
 
 Compared to pairing the panels through HomeKit Controller (the usual

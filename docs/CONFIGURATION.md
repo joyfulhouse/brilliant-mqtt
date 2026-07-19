@@ -118,6 +118,12 @@ state never drives the escalation ladder.
 
 ### Hue CA recovery
 
+> New to the diyHue path? Read
+> [the diyHue bridge guide](brilliant-panel/diyhue-bridge.md) first — it covers
+> the whole architecture (panel Hue client → diyHue → HA), how the pinned-cert
+> trust is set up, and how leadership moves between panels. This section is just
+> the durability component that keeps that trust alive across OTAs.
+
 An optional standalone oneshot (`brilliant_hue_ca`) for panels bridged to a
 local [diyHue](https://diyhue.org) bridge: it re-appends your diyHue CA's
 *public* certificate to the panel's pinned Hue trust bundle and restarts the

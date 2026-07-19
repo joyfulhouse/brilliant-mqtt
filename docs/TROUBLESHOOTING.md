@@ -61,6 +61,43 @@ Reset to `LOG_LEVEL=INFO` when done.
 
 ---
 
+## diyHue path
+
+For panels driving HA lights through a local diyHue bridge — see
+[the diyHue bridge guide](brilliant-panel/diyhue-bridge.md).
+
+### A diyHue light shows on the panel but is offline / won't respond
+
+The light populated but sits `reachable=False` (panel `status=0`) and the panel
+drops its commands. Cause: the HA entity is **not tagged for diyHue**, so diyHue
+never syncs its state.
+
+1. Add `diyhue: include` to the entity under `homeassistant: → customize:` in HA
+   `configuration.yaml`, run `ha core check`, then call the
+   `homeassistant.reload_core_config` service. Confirm the attribute on
+   `/api/states/<entity>`.
+2. Restart the diyHue pod (forces a full state sync; it does **not** duplicate
+   already-served lights).
+3. Restart the **current Hue leader's** coordinator (`touch
+   /var/run/brilliant/processes/hue_bridge_peripherals.ini`). The light should
+   flip to `status=1` and become controllable.
+
+### diyHue lights all went offline after a firmware OTA or a panel restart
+
+Two things happen on OTA/restart, and both are expected to self-heal:
+
+- **The CA was wiped** (`/data` is replaced). The **Hue CA recovery** component
+  re-appends it and restarts the coordinator within ~2 min of boot — if it is
+  enabled on the panel. If lights stay dark, confirm the component is enabled on
+  **every** panel (see below) — see
+  [Configuration → Hue CA recovery](CONFIGURATION.md#hue-ca-recovery).
+- **The Hue integration leader moved** to another panel. That's normal; the new
+  leader reconnects because the CA is on all panels. If it doesn't, that panel is
+  probably missing the CA — the whole reason Hue CA recovery must be enabled
+  **fleet-wide**, not on a subset.
+
+---
+
 ## Data quality
 
 ### Sensors lag or freeze (power/motion/occupancy stale for minutes)

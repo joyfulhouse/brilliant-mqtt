@@ -14,6 +14,7 @@ The central finding is that the panel is not a collection of isolated integratio
 | [UI/UX information architecture](ui-information-architecture.md) | Home navigation, settings hierarchy, screen families, visual language, and interaction patterns |
 | [Native HA slider validation status](native-ha-slider-validation-status.md) | Exact live evidence, safety record, confirmed/unknown boundaries, implemented probes, and ordered remaining gates |
 | [HA entity to physical-slider feasibility](slider-bridge-feasibility.md) | Decompiled slider eligibility, required Virtual Control/light contract, provisioning boundary, and live acceptance gates |
+| [diyHue local control path](diyhue-bridge.md) | **PROVEN** — the panel's native Hue client drives HA lights via a local diyHue bridge: the three walls (mDNS discovery, link-button pairing, pinned-cert TLS) and how each is handled, credential injection, leadership moves, the CA-recovery component, and the operational runbook |
 | [Virtual Control runtime contract](virtual-control-runtime-contract.md) | Recovered stock vassal lifecycle, local addressing, configuration host, privilege handoff, isolated path surface, emulator boundary, and no-start manifest |
 | [Coordinated VC session](coordinated-session-design.md) | Implemented one-shot approval, staged-source gate, non-root coordinator/service, exact deadlines, monitoring, cleanup, and remaining live proof |
 | [Peripheral and control surfaces](peripheral-surfaces.md) | Firmware type system, high-value variables, command paths, scenes, media, and sensors |
