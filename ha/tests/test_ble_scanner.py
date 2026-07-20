@@ -332,6 +332,92 @@ async def test_ordering_accepts_new_generations_and_rejects_replays(
     bridge.async_shutdown()
 
 
+async def test_recovery_duplicate_rolls_back_only_the_speculative_scanner(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    fake_bluetooth_manager: FakeBluetoothManager,
+    scanner_registration: ScannerRegistrationRecorder,
+) -> None:
+    bridge = BrilliantBleScannerBridge(hass, _entry(), device_id="panel-device-id")
+    await bridge.async_setup()
+    bridge.async_handle_status(_status_message("online"))
+    bridge.async_handle_advertisement(_message(_payload(sequence=42)))
+    established_scanner = bridge.scanner
+    assert established_scanner is not None
+
+    bridge.async_handle_advertisement(_message(_payload(sequence=42)))
+
+    assert bridge.scanner is established_scanner
+    assert len(scanner_registration.calls) == 1
+    assert scanner_registration.unregister_count == 0
+
+    bridge.async_handle_status(_status_message("offline", retained=False))
+    bridge.async_handle_status(_status_message("online", retained=False))
+    bridge.async_handle_advertisement(_message(_payload(sequence=42)))
+
+    assert bridge.scanner is None
+    assert bridge.diagnostics["registered"] is False
+    assert bridge.diagnostics["scanning"] is False
+    assert len(scanner_registration.calls) == 2
+    assert scanner_registration.unregister_count == 2
+    assert bridge._sequence.last_sequence == 42
+    assert bridge.diagnostics["packets_received"] == 3
+    assert bridge.diagnostics["packets_accepted"] == 1
+    assert bridge.diagnostics["packets_dropped"] == 2
+
+    bridge.async_handle_advertisement(_message(_payload(sequence=43)))
+
+    assert bridge.scanner is not None
+    assert bridge.scanner is not established_scanner
+    assert len(scanner_registration.calls) == 3
+    assert scanner_registration.unregister_count == 2
+    assert bridge._sequence.last_sequence == 43
+    assert bridge.diagnostics["packets_received"] == 4
+    assert bridge.diagnostics["packets_accepted"] == 2
+    assert bridge.diagnostics["packets_dropped"] == 2
+    bridge.async_shutdown()
+
+
+async def test_recovery_prior_session_rolls_back_speculative_scanner_and_current_retries(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    fake_bluetooth_manager: FakeBluetoothManager,
+    scanner_registration: ScannerRegistrationRecorder,
+) -> None:
+    old_session = "223e4567-e89b-12d3-a456-426614174000"
+    current_session = "323e4567-e89b-12d3-a456-426614174000"
+    bridge = BrilliantBleScannerBridge(hass, _entry(), device_id="panel-device-id")
+    await bridge.async_setup()
+    bridge.async_handle_status(_status_message("online"))
+    bridge.async_handle_advertisement(_message(_payload(session_id=old_session, sequence=42)))
+    bridge.async_handle_advertisement(_message(_payload(session_id=current_session, sequence=1)))
+
+    bridge.async_handle_status(_status_message("offline", retained=False))
+    bridge.async_handle_status(_status_message("online", retained=False))
+    bridge.async_handle_advertisement(_message(_payload(session_id=old_session, sequence=43)))
+
+    assert bridge.scanner is None
+    assert len(scanner_registration.calls) == 2
+    assert scanner_registration.unregister_count == 2
+    assert bridge._sequence.current_session_id == current_session
+    assert bridge._sequence.last_sequence == 1
+    assert bridge.diagnostics["packets_received"] == 3
+    assert bridge.diagnostics["packets_accepted"] == 2
+    assert bridge.diagnostics["packets_dropped"] == 1
+
+    bridge.async_handle_advertisement(_message(_payload(session_id=current_session, sequence=2)))
+
+    assert bridge.scanner is not None
+    assert len(scanner_registration.calls) == 3
+    assert scanner_registration.unregister_count == 2
+    assert bridge._sequence.current_session_id == current_session
+    assert bridge._sequence.last_sequence == 2
+    assert bridge.diagnostics["packets_received"] == 4
+    assert bridge.diagnostics["packets_accepted"] == 3
+    assert bridge.diagnostics["packets_dropped"] == 1
+    bridge.async_shutdown()
+
+
 async def test_adapter_source_is_stable_and_rejection_does_not_advance_sequence(
     hass: HomeAssistant,
     mqtt_mock: MqttMockHAClient,

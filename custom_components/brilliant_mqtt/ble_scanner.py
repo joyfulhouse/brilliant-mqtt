@@ -225,6 +225,7 @@ class BrilliantBleScannerBridge:
         # Establish HA lifecycle before mutating ordering state on every registration,
         # including recovery after observer-offline teardown. A failed registration is
         # an isolated dropped packet and can be retried with the same sequence.
+        scanner_created_for_packet = False
         if self._scanner is None:
             try:
                 self._ensure_scanner(advertisement.adapter_address)
@@ -236,10 +237,13 @@ class BrilliantBleScannerBridge:
                     type(error).__name__,
                 )
                 return
+            scanner_created_for_packet = True
 
         try:
             self._sequence.accept(advertisement)
         except ValueError:
+            if scanner_created_for_packet:
+                self._teardown_scanner()
             self._drop_packet()
             return
 
