@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -20,10 +22,13 @@ from custom_components.brilliant_mqtt import (
     async_setup_entry,
     async_unload_entry,
 )
+from custom_components.brilliant_mqtt.ble_protocol import advertisement_topic
+from custom_components.brilliant_mqtt.ble_scanner import observer_status_topic
 from custom_components.brilliant_mqtt.const import (
     COMPONENT_BRIDGE,
     COMPONENT_HA_MIRROR,
     COMPONENT_VOICE,
+    CONF_BLE_SCANNER_ENABLED,
     CONF_COMPONENTS,
     CONF_HA_CONTROL_DOMAINS,
     CONF_HA_CONTROL_ENABLED,
@@ -60,6 +65,7 @@ async def test_integration_discoverable(hass: HomeAssistant) -> None:
     assert integration.domain == DOMAIN
     assert integration.integration_type == "device"
     assert "mqtt" in (integration.dependencies or [])
+    assert "bluetooth" in (integration.dependencies or [])
     assert any(r.startswith("asyncssh==") for r in integration.requirements or [])
 
 
@@ -89,6 +95,9 @@ async def test_entry_sets_up_and_tracks_availability(
 
     manager = entry.runtime_data
     assert manager.availability is None
+    assert manager.ble_scanner_bridge is None
+    assert not mqtt_mock.is_active_subscription(advertisement_topic("office"))
+    assert not mqtt_mock.is_active_subscription(observer_status_topic("office"))
 
     async_fire_mqtt_message(hass, "brilliant/office/availability", "online")
     await hass.async_block_till_done()
@@ -103,6 +112,62 @@ async def test_entry_sets_up_and_tracks_availability(
     assert manager.meta == {"agent_version": "0.2.0", "panel_firmware": "v26.05.20.2"}
 
     assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_enabled_ble_bridge_survives_bad_packet_and_reloads_cleanly(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+) -> None:
+    unregisters = 0
+
+    def register(*args: object, **kwargs: object) -> Callable[[], None]:
+        def unregister() -> None:
+            nonlocal unregisters
+            unregisters += 1
+
+        return unregister
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="office",
+        data={**ENTRY_DATA, CONF_BLE_SCANNER_ENABLED: True},
+        version=3,
+    )
+    entry.add_to_hass(hass)
+    with patch(
+        "custom_components.brilliant_mqtt.ble_scanner._register_scanner_api",
+        side_effect=register,
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        assert mqtt_mock.is_active_subscription(advertisement_topic("office"))
+        assert mqtt_mock.is_active_subscription(observer_status_topic("office"))
+
+        async_fire_mqtt_message(hass, advertisement_topic("office"), "not-json")
+        await hass.async_block_till_done()
+        assert entry.state is ConfigEntryState.LOADED
+
+        payload = json.loads(
+            (Path(__file__).parents[2] / "tests/fixtures/ble_observer_v1.json").read_text()
+        )["valid_advertisement"]["value"]
+        payload["panel"] = "office"
+        async_fire_mqtt_message(hass, advertisement_topic("office"), json.dumps(payload))
+        await hass.async_block_till_done()
+
+        assert await hass.config_entries.async_reload(entry.entry_id)
+        await hass.async_block_till_done()
+        assert unregisters == 1
+        assert mqtt_mock.is_active_subscription(advertisement_topic("office"))
+        assert mqtt_mock.is_active_subscription(observer_status_topic("office"))
+
+        async_fire_mqtt_message(hass, advertisement_topic("office"), json.dumps(payload))
+        await hass.async_block_till_done()
+
+        assert await hass.config_entries.async_unload(entry.entry_id)
+    assert unregisters == 2
+    assert not mqtt_mock.is_active_subscription(advertisement_topic("office"))
+    assert not mqtt_mock.is_active_subscription(observer_status_topic("office"))
 
 
 @pytest.mark.allow_lingering_timers
@@ -472,6 +537,7 @@ async def test_migrate_v1_folds_voice_enabled_into_components(hass: HomeAssistan
     assert entry.data[CONF_COMPONENTS][COMPONENT_BRIDGE] is True
     assert entry.data[CONF_COMPONENTS][COMPONENT_VOICE] is True
     assert entry.data[CONF_COMPONENTS][COMPONENT_HA_MIRROR] is False
+    assert entry.data[CONF_BLE_SCANNER_ENABLED] is False
 
 
 async def test_migrate_v1_no_voice_defaults_components_off(hass: HomeAssistant) -> None:

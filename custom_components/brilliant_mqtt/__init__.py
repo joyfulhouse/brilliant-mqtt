@@ -22,6 +22,7 @@ from .const import (
     COMPONENT_BRIDGE,
     COMPONENT_HA_MIRROR,
     COMPONENT_VOICE,
+    CONF_BLE_SCANNER_ENABLED,
     CONF_COMPONENTS,
     CONF_HA_CONTROL_DOMAINS,
     CONF_HA_CONTROL_ENABLED,
@@ -34,6 +35,7 @@ from .const import (
     CONF_SCENE_PANEL,
     CONF_VOICE_ENABLED,
     CONFIG_ENTRY_VERSION,
+    DEFAULT_BLE_SCANNER_ENABLED,
     DEFAULT_HA_CONTROL_DOMAINS,
     DEFAULT_HA_CONTROL_ENABLED,
     DEFAULT_HA_CONTROL_LABEL,
@@ -310,6 +312,7 @@ async def async_migrate_entry(hass: HomeAssistant, entry: BrilliantMqttConfigEnt
     data.setdefault(CONF_MAX_MIRRORED_ENTITIES, DEFAULT_MAX_MIRRORED_ENTITIES)
     data.setdefault(CONF_SCENE_PANEL, data.get(CONF_PANEL, ""))
     data.setdefault(CONF_SCENE_ACTIONS, {})
+    data.setdefault(CONF_BLE_SCANNER_ENABLED, DEFAULT_BLE_SCANNER_ENABLED)
     hass.config_entries.async_update_entry(entry, data=data, version=CONFIG_ENTRY_VERSION)
     return True
 

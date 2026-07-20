@@ -13,6 +13,9 @@ from unittest.mock import patch
 
 import asyncssh
 import pytest
+from bluetooth_adapters import AdapterDetails, BluetoothAdapters
+from habluetooth import BluetoothManager, BluetoothServiceInfoBleak
+from habluetooth.central_manager import CentralBluetoothManager
 from homeassistant.core import HomeAssistant
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
@@ -48,6 +51,44 @@ _PROBE_PATH = "custom_components.brilliant_mqtt.config_flow._probe_panel"
 
 # The key an unpinned re-pin connect captures (mirrors the rotated server key).
 REPIN_NEW_KEY = "ssh-ed25519 NEWKEY"
+
+
+class FakeBluetoothManager(BluetoothManager):
+    """Concrete habluetooth manager accepted by the compiled scanner API."""
+
+    def _discover_service_info(self, service_info: BluetoothServiceInfoBleak) -> None:
+        """Consume scanner output; assertions inspect the scanner's own cache."""
+
+
+class FakeBluetoothAdapters(BluetoothAdapters):
+    """Empty local-adapter inventory for hermetic HA Bluetooth setup."""
+
+    @property
+    def adapters(self) -> dict[str, AdapterDetails]:
+        """Expose no host adapters during integration tests."""
+        return {}
+
+    @property
+    def default_adapter(self) -> str:
+        """Return HA's conventional adapter name without probing the host."""
+        return "hci0"
+
+
+@pytest.fixture(autouse=True)
+def auto_mock_bluetooth_adapters(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the integration's core Bluetooth dependency off the developer host bus."""
+    monkeypatch.setattr(
+        "homeassistant.components.bluetooth.get_adapters",
+        FakeBluetoothAdapters,
+    )
+
+
+@pytest.fixture
+def fake_bluetooth_manager(monkeypatch: pytest.MonkeyPatch) -> FakeBluetoothManager:
+    """Install a hermetic central manager for BaseHaRemoteScanner construction."""
+    manager = FakeBluetoothManager()
+    monkeypatch.setattr(CentralBluetoothManager, "manager", manager)
+    return manager
 
 
 @dataclass

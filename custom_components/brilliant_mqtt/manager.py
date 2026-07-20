@@ -27,11 +27,13 @@ from homeassistant.components.mqtt.models import ReceiveMessage
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.event import async_call_later
 
 from . import panel_ops
+from .ble_scanner import BrilliantBleScannerBridge
 from .const import (
     AVAILABILITY_OFFLINE,
     AVAILABILITY_ONLINE,
@@ -40,6 +42,7 @@ from .const import (
     COMPONENT_HUE_CA,
     COMPONENT_VOICE,
     COMPONENT_WIFI_WATCHDOG,
+    CONF_BLE_SCANNER_ENABLED,
     CONF_COMPONENTS,
     CONF_HA_CONTROL_ENABLED,
     CONF_HA_MIRROR_LEADER_PRIORITY,
@@ -60,6 +63,7 @@ from .const import (
     DATA_LAST_FIRMWARE,
     DATA_SSH_HOST_KEY,
     DEFAULT_AUTO_REPAIR,
+    DEFAULT_BLE_SCANNER_ENABLED,
     DEFAULT_HA_CONTROL_ENABLED,
     DEFAULT_OFFLINE_GRACE_MINUTES,
     DEFAULT_REBOOT_JOURNAL_LINES,
@@ -176,6 +180,7 @@ class PanelManager:
         self.problem = False
         self.problem_reason: str | None = None
         self.legacy_mirror_problem: str | None = None
+        self.ble_scanner_bridge: BrilliantBleScannerBridge | None = None
         self._unsubs: list[Any] = []
         self._grace_cancel: CALLBACK_TYPE | None = None
         self._recovery_cancel: CALLBACK_TYPE | None = None
@@ -315,6 +320,24 @@ class PanelManager:
         self._unsubs.append(
             await mqtt.async_subscribe(self.hass, meta_topic(self.panel), self._on_meta)
         )
+        if self.entry.data.get(CONF_BLE_SCANNER_ENABLED, DEFAULT_BLE_SCANNER_ENABLED) is True:
+            panel_device = dr.async_get(self.hass).async_get_or_create(
+                config_entry_id=self.entry.entry_id,
+                identifiers={
+                    (DOMAIN, self.panel),
+                    ("mqtt", f"brilliant_panel_{self.panel}"),
+                },
+                name=panel_device_name(self.panel),
+                manufacturer="Brilliant",
+            )
+            bridge = BrilliantBleScannerBridge(
+                self.hass,
+                self.entry,
+                device_id=panel_device.id,
+            )
+            self.ble_scanner_bridge = bridge
+            await bridge.async_setup()
+            self.entry.async_on_unload(bridge.async_shutdown)
         if self._legacy_retirement_evidence(include_verified_history=True):
             await self.async_retire_legacy_ha_mirror(force_history_audit=True)
 
@@ -326,6 +349,9 @@ class PanelManager:
         # unload (or reload) never leaves a grace/recovery callback dangling.
         self._cancel("_grace_cancel")
         self._cancel("_recovery_cancel")
+        if self.ble_scanner_bridge is not None:
+            self.ble_scanner_bridge.async_shutdown()
+            self.ble_scanner_bridge = None
         for unsub in self._unsubs:
             unsub()
         self._unsubs.clear()

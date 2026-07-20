@@ -10,11 +10,13 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry, async_
 from pytest_homeassistant_custom_component.typing import MqttMockHAClient
 
 from custom_components.brilliant_mqtt.const import (
+    CONF_BLE_SCANNER_ENABLED,
     CONF_HA_CONTROL_DOMAINS,
     CONF_HA_CONTROL_ENABLED,
     CONF_HA_CONTROL_LABEL,
     CONF_HA_MIRROR_TOKEN,
     CONF_MAX_MIRRORED_ENTITIES,
+    CONF_PANEL,
     CONF_ROOM_OVERRIDES,
     CONF_SCENE_ACTIONS,
     CONF_SCENE_PANEL,
@@ -126,6 +128,16 @@ async def test_diagnostics_redact_secrets(
     assert control["scene_last_event_timestamp_ms"] == 3
     assert control["scene_status"] == "online"
     assert control["native_tiles"] == {"status": "blocked", "validated": False}
+    assert diag["ble_scanner"] == {
+        "enabled": False,
+        "registered": False,
+        "observer_online": None,
+        "scanning": False,
+        "packets_received": 0,
+        "packets_accepted": 0,
+        "packets_dropped": 0,
+        "last_packet_age_seconds": None,
+    }
 
     assert await hass.config_entries.async_unload(entry.entry_id)
 
@@ -148,3 +160,47 @@ async def test_diagnostics_missing_control_runtime_values_are_none(
     assert control["scene_catalog_revision"] is None
     assert control["scene_last_event_timestamp_ms"] is None
     assert control["scene_status"] is None
+
+
+async def test_ble_diagnostics_are_aggregate_and_redacted(hass: HomeAssistant) -> None:
+    sensitive_address = "AA:BB:CC:DD:EE:FF"
+    sensitive_payload = "021500112233445566778899aabbccddeeff00420007c5"
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="shed",
+        data={**ENTRY_DATA, CONF_PANEL: "shed", CONF_BLE_SCANNER_ENABLED: True},
+        version=3,
+    )
+    entry.add_to_hass(hass)
+    entry.runtime_data = type(
+        "Manager",
+        (),
+        {
+            "availability": "online",
+            "meta": None,
+            "problem": False,
+            "problem_reason": None,
+            "ble_scanner_bridge": type(
+                "Bridge",
+                (),
+                {
+                    "diagnostics": {
+                        "enabled": True,
+                        "registered": True,
+                        "observer_online": True,
+                        "scanning": True,
+                        "packets_received": 12,
+                        "packets_accepted": 10,
+                        "packets_dropped": 2,
+                        "last_packet_age_seconds": 1.25,
+                    }
+                },
+            )(),
+        },
+    )()
+
+    diag = await async_get_config_entry_diagnostics(hass, entry)
+    assert diag["ble_scanner"]["packets_accepted"] == 10
+    assert diag["ble_scanner"]["packets_dropped"] == 2
+    assert sensitive_address not in repr(diag)
+    assert sensitive_payload not in repr(diag)

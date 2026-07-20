@@ -12,6 +12,8 @@ import asyncssh
 import pytest
 from homeassistant.core import Event, HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import area_registry as ar
+from homeassistant.helpers import device_registry as dr
 from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import (
     MockConfigEntry,
@@ -28,6 +30,7 @@ from custom_components.brilliant_mqtt.const import (
     COMPONENT_HUE_CA,
     COMPONENT_VOICE,
     COMPONENT_WIFI_WATCHDOG,
+    CONF_BLE_SCANNER_ENABLED,
     CONF_COMPONENTS,
     CONF_HA_CONTROL_ENABLED,
     CONF_HA_MIRROR_LABEL,
@@ -60,6 +63,46 @@ async def _setup(hass: HomeAssistant) -> MockConfigEntry:
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
     return entry
+
+
+@pytest.mark.allow_lingering_timers
+async def test_ble_bridge_links_existing_panel_device_and_area(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+) -> None:
+    area = ar.async_get(hass).async_create("Shed")
+    registry = dr.async_get(hass)
+    mqtt_entry = hass.config_entries.async_entries("mqtt")[0]
+    existing = registry.async_get_or_create(
+        config_entry_id=mqtt_entry.entry_id,
+        identifiers={("mqtt", "brilliant_panel_shed")},
+        name="Brilliant Shed",
+    )
+    registry.async_update_device(existing.id, area_id=area.id)
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="shed",
+        data={
+            **ENTRY_DATA,
+            CONF_PANEL: "shed",
+            CONF_BLE_SCANNER_ENABLED: True,
+        },
+        version=3,
+    )
+    entry.add_to_hass(hass)
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    linked = registry.async_get_device(identifiers={(DOMAIN, "shed")})
+    assert linked is not None
+    assert linked.id == existing.id
+    assert linked.area_id == area.id
+    assert entry.entry_id in linked.config_entries
+    assert entry.runtime_data.ble_scanner_bridge is not None
+    assert entry.runtime_data.ble_scanner_bridge.device_id == linked.id
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
 
 
 def _capture_events(hass: HomeAssistant) -> list[Event]:

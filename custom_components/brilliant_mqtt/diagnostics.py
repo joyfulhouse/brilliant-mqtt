@@ -11,6 +11,7 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import label_registry as lr
 
 from . import BrilliantMqttConfigEntry
+from .ble_scanner import disabled_scanner_diagnostics
 from .const import (
     CONF_HA_CONTROL_DOMAINS,
     CONF_HA_CONTROL_ENABLED,
@@ -80,6 +81,7 @@ async def async_get_config_entry_diagnostics(
         if label_entry is not None
         else 0
     )
+    ble_scanner_bridge = getattr(manager, "ble_scanner_bridge", None)
     return {
         "entry": async_redact_data(data, _TO_REDACT),
         "options": dict(entry.options),
@@ -87,6 +89,11 @@ async def async_get_config_entry_diagnostics(
         "meta": manager.meta,
         "problem": manager.problem,
         "problem_reason": manager.problem_reason,
+        "ble_scanner": (
+            ble_scanner_bridge.diagnostics
+            if ble_scanner_bridge is not None
+            else disabled_scanner_diagnostics()
+        ),
         "ha_control": {
             "enabled": data.get(CONF_HA_CONTROL_ENABLED, DEFAULT_HA_CONTROL_ENABLED) is True,
             "label": label,

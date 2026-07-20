@@ -40,6 +40,11 @@ DEFAULT_HA_MIRROR_LEADER_PRIORITY = 0
 # diyHue CA-recovery hook feature keys.
 CONF_HUE_CA_CERT = "hue_ca_cert"
 
+# Home Assistant remote-scanner bridge. This kill switch is deliberately
+# independent from the on-panel observer and remains off when absent.
+CONF_BLE_SCANNER_ENABLED = "ble_scanner_enabled"
+DEFAULT_BLE_SCANNER_ENABLED = False
+
 # Home Assistant-owned MQTT control plane. These global values are copied to each
 # panel entry by the configuration vertical slice; the singleton elects the enabled
 # entry with the lexicographically smallest panel slug as its settings owner.
