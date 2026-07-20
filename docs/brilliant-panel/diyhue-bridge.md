@@ -111,6 +111,20 @@ Apply with the `homeassistant.reload_core_config` service (no restart), then a
 diyHue pod restart forces a full state sync (it does **not** duplicate
 already-served lights). See the [runbook](#operational-runbook).
 
+### Which HA domains work
+
+diyHue's HA-WebSocket backend only maps two HA domains — **`light.`** and
+**`switch.`** — and builds each device from its `supported_color_modes`
+(anything else is skipped with "unknown model id"). Consequences:
+
+- **`light.`** → a Hue light (dim/color/temp per the light's capabilities).
+- **`switch.`** → an on/off Hue light — so any HA switch is drivable from the wall.
+- **`cover.` / `climate.` / `fan.` / `lock.` / `media_player.`** → **not exposed
+  at all.** To surface one, wrap it in a **template `light`** (e.g. brightness →
+  cover position, on/off → open/close) or a template `switch`, and tag *that*
+  entity. It appears on the panel as a light tile. *(Proven: `light` + grouped
+  lights. The template-cover variant is expected to work but is unverified here.)*
+
 ## Leadership moves
 
 The Brilliant Hue integration is hosted by one **elected** panel. It re-elects
