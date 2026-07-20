@@ -144,6 +144,13 @@ async def test_enabled_ble_bridge_survives_bad_packet_and_reloads_cleanly(
         assert mqtt_mock.is_active_subscription(advertisement_topic("office"))
         assert mqtt_mock.is_active_subscription(observer_status_topic("office"))
 
+        async_fire_mqtt_message(
+            hass,
+            observer_status_topic("office"),
+            "online",
+            retain=True,
+        )
+
         async_fire_mqtt_message(hass, advertisement_topic("office"), "not-json")
         await hass.async_block_till_done()
         assert entry.state is ConfigEntryState.LOADED
@@ -160,6 +167,13 @@ async def test_enabled_ble_bridge_survives_bad_packet_and_reloads_cleanly(
         assert unregisters == 1
         assert mqtt_mock.is_active_subscription(advertisement_topic("office"))
         assert mqtt_mock.is_active_subscription(observer_status_topic("office"))
+
+        async_fire_mqtt_message(
+            hass,
+            observer_status_topic("office"),
+            "online",
+            retain=True,
+        )
 
         async_fire_mqtt_message(hass, advertisement_topic("office"), json.dumps(payload))
         await hass.async_block_till_done()

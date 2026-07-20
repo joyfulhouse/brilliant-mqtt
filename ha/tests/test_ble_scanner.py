@@ -10,7 +10,7 @@ import pytest
 from homeassistant.components.mqtt.models import ReceiveMessage
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant
-from pytest_homeassistant_custom_component.common import MockConfigEntry
+from pytest_homeassistant_custom_component.common import MockConfigEntry, async_fire_mqtt_message
 from pytest_homeassistant_custom_component.typing import MqttMockHAClient
 
 from custom_components.brilliant_mqtt.ble_protocol import (
@@ -60,7 +60,7 @@ def _message(
     )
 
 
-def _status_message(payload: str, *, retained: bool = True) -> ReceiveMessage:
+def _status_message(payload: str | bytes, *, retained: bool = True) -> ReceiveMessage:
     topic = observer_status_topic("shed")
     return ReceiveMessage(
         topic=topic,
@@ -230,6 +230,7 @@ async def test_bridge_sets_up_and_registers_before_first_feed_with_zero_slots(
         monotonic=lambda: 123.5,
     )
     await bridge.async_setup()
+    bridge.async_handle_status(_status_message("online"))
     bridge.async_handle_advertisement(_message(VALID["encoded"]))
 
     assert events == [
@@ -266,6 +267,7 @@ async def test_retained_topic_mismatch_and_malformed_packets_are_isolated(
     entry.add_to_hass(hass)
     bridge = BrilliantBleScannerBridge(hass, entry, device_id="panel-device-id")
     await bridge.async_setup()
+    bridge.async_handle_status(_status_message("online"))
 
     bridge.async_handle_advertisement(_message(VALID["encoded"], retained=True))
     bridge.async_handle_advertisement(
@@ -297,6 +299,7 @@ async def test_ordering_accepts_new_generations_and_rejects_replays(
         monotonic=lambda: 88.0,
     )
     await bridge.async_setup()
+    bridge.async_handle_status(_status_message("online"))
     old_boot = "123e4567-e89b-12d3-a456-426614174000"
     old_session = "223e4567-e89b-12d3-a456-426614174000"
     new_session = "323e4567-e89b-12d3-a456-426614174000"
@@ -337,6 +340,7 @@ async def test_adapter_source_is_stable_and_rejection_does_not_advance_sequence(
 ) -> None:
     bridge = BrilliantBleScannerBridge(hass, _entry(), device_id="panel-device-id")
     await bridge.async_setup()
+    bridge.async_handle_status(_status_message("online"))
     bridge.async_handle_advertisement(_message(_payload(sequence=42)))
     bridge.async_handle_advertisement(
         _message(_payload(sequence=43, adapter_address="22:33:44:55:66:77"))
@@ -351,7 +355,7 @@ async def test_adapter_source_is_stable_and_rejection_does_not_advance_sequence(
     bridge.async_shutdown()
 
 
-async def test_retained_offline_quarantines_sequence_and_online_recreates_scanner(
+async def test_mqtt_status_replay_and_fresh_transitions_gate_sequence_and_scanner(
     hass: HomeAssistant,
     mqtt_mock: MqttMockHAClient,
     fake_bluetooth_manager: FakeBluetoothManager,
@@ -360,11 +364,20 @@ async def test_retained_offline_quarantines_sequence_and_online_recreates_scanne
 ) -> None:
     bridge = BrilliantBleScannerBridge(hass, _entry(), device_id="panel-device-id")
     await bridge.async_setup()
-    bridge.async_handle_status(_status_message("offline", retained=False))
-    assert bridge.diagnostics["observer_online"] is None
 
-    bridge.async_handle_status(_status_message("online"))
-    bridge.async_handle_advertisement(_message(_payload(sequence=42)))
+    async_fire_mqtt_message(hass, advertisement_topic("shed"), _payload(sequence=42))
+    await hass.async_block_till_done()
+    assert bridge.diagnostics["observer_online"] is None
+    assert bridge.scanner is None
+    assert bridge.diagnostics["packets_dropped"] == 1
+
+    async_fire_mqtt_message(hass, observer_status_topic("shed"), "offline", retain=True)
+    await hass.async_block_till_done()
+    assert bridge.diagnostics["observer_online"] is False
+
+    async_fire_mqtt_message(hass, observer_status_topic("shed"), "online", retain=False)
+    async_fire_mqtt_message(hass, advertisement_topic("shed"), _payload(sequence=42))
+    await hass.async_block_till_done()
     first_scanner = bridge.scanner
     assert first_scanner is not None
 
@@ -375,27 +388,84 @@ async def test_retained_offline_quarantines_sequence_and_online_recreates_scanne
     )
     first_scanner._async_scanner_watchdog()
     assert bridge.diagnostics["scanning"] is False
-    bridge.async_handle_advertisement(_message(_payload(sequence=43)))
+    async_fire_mqtt_message(hass, advertisement_topic("shed"), _payload(sequence=43))
+    await hass.async_block_till_done()
     assert bridge.diagnostics["scanning"] is True
 
-    bridge.async_handle_status(_status_message("offline"))
+    async_fire_mqtt_message(hass, observer_status_topic("shed"), "offline", retain=False)
+    await hass.async_block_till_done()
     assert bridge.scanner is None
     assert scanner_registration.unregister_count == 1
     assert bridge.diagnostics["observer_online"] is False
     assert bridge.diagnostics["registered"] is False
 
-    bridge.async_handle_advertisement(_message(_payload(sequence=44)))
+    async_fire_mqtt_message(hass, advertisement_topic("shed"), _payload(sequence=44))
+    await hass.async_block_till_done()
     assert bridge.scanner is None
     assert bridge.diagnostics["packets_accepted"] == 2
 
-    bridge.async_handle_status(_status_message("online"))
-    bridge.async_handle_advertisement(_message(_payload(sequence=44)))
+    async_fire_mqtt_message(hass, observer_status_topic("shed"), "online", retain=False)
+    async_fire_mqtt_message(hass, advertisement_topic("shed"), _payload(sequence=44))
+    await hass.async_block_till_done()
     assert bridge.scanner is not None
     assert bridge.scanner is not first_scanner
     assert bridge.scanner.source == ADAPTER_ADDRESS
     assert len(scanner_registration.calls) == 2
     assert bridge.diagnostics["observer_online"] is True
     assert bridge.diagnostics["packets_accepted"] == 3
+    assert bridge.diagnostics["packets_received"] == 5
+    assert bridge.diagnostics["packets_dropped"] == 2
+    bridge.async_shutdown()
+
+
+@pytest.mark.parametrize("bad_status", ["unknown", b"\xff"])
+async def test_mqtt_unknown_or_non_utf8_status_closes_an_online_scanner(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    fake_bluetooth_manager: FakeBluetoothManager,
+    scanner_registration: ScannerRegistrationRecorder,
+    bad_status: str | bytes,
+) -> None:
+    bridge = BrilliantBleScannerBridge(hass, _entry(), device_id="panel-device-id")
+    await bridge.async_setup()
+
+    async_fire_mqtt_message(hass, observer_status_topic("shed"), "online", retain=False)
+    async_fire_mqtt_message(hass, advertisement_topic("shed"), VALID["encoded"])
+    await hass.async_block_till_done()
+    assert bridge.scanner is not None
+
+    async_fire_mqtt_message(
+        hass,
+        observer_status_topic("shed"),
+        bad_status,
+        retain=False,
+    )
+    await hass.async_block_till_done()
+
+    assert bridge.diagnostics["observer_online"] is False
+    assert bridge.scanner is None
+    assert scanner_registration.unregister_count == 1
+    bridge.async_shutdown()
+
+
+async def test_mqtt_non_utf8_advertisement_is_counted_and_dropped(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    fake_bluetooth_manager: FakeBluetoothManager,
+    scanner_registration: ScannerRegistrationRecorder,
+) -> None:
+    bridge = BrilliantBleScannerBridge(hass, _entry(), device_id="panel-device-id")
+    await bridge.async_setup()
+
+    async_fire_mqtt_message(hass, observer_status_topic("shed"), "online", retain=False)
+    async_fire_mqtt_message(hass, advertisement_topic("shed"), b"\xff")
+    await hass.async_block_till_done()
+
+    assert bridge.scanner is None
+    assert scanner_registration.calls == []
+    assert bridge.diagnostics["packets_received"] == 1
+    assert bridge.diagnostics["packets_accepted"] == 0
+    assert bridge.diagnostics["packets_dropped"] == 1
     bridge.async_shutdown()
 
 
@@ -408,6 +478,7 @@ async def test_shutdown_unsubscribes_is_idempotent_and_supports_ha_restart(
     entry = _entry()
     first = BrilliantBleScannerBridge(hass, entry, device_id="panel-device-id")
     await first.async_setup()
+    first.async_handle_status(_status_message("online"))
     first.async_handle_advertisement(_message(VALID["encoded"]))
     assert mqtt_mock.is_active_subscription(advertisement_topic("shed"))
     assert mqtt_mock.is_active_subscription(observer_status_topic("shed"))
@@ -420,6 +491,7 @@ async def test_shutdown_unsubscribes_is_idempotent_and_supports_ha_restart(
 
     restarted = BrilliantBleScannerBridge(hass, entry, device_id="panel-device-id")
     await restarted.async_setup()
+    restarted.async_handle_status(_status_message("online"))
     restarted.async_handle_advertisement(_message(VALID["encoded"]))
     assert len(scanner_registration.calls) == 2
     assert restarted.scanner is not None
@@ -455,13 +527,15 @@ async def test_partial_mqtt_setup_failure_removes_first_subscription(
     assert not mqtt_mock.is_active_subscription(observer_status_topic("shed"))
 
 
-async def test_registration_failure_unsets_scanner_without_accepting_packet(
+async def test_recovery_registration_failure_preserves_sequence_and_same_packet_retries(
     hass: HomeAssistant,
     mqtt_mock: MqttMockHAClient,
     fake_bluetooth_manager: FakeBluetoothManager,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     unsetup_calls = 0
+    registration_attempts = 0
+    successful_registration = ScannerRegistrationRecorder()
     original_setup = BrilliantRemoteScanner.async_setup
 
     def tracked_setup(scanner: BrilliantRemoteScanner) -> CALLBACK_TYPE:
@@ -474,21 +548,45 @@ async def test_registration_failure_unsets_scanner_without_accepting_packet(
 
         return tracked_unsetup
 
-    def fail_registration(*args: object, **kwargs: object) -> CALLBACK_TYPE:
-        raise RuntimeError("Bluetooth registration failed")
+    def fail_recovery_registration_once(*args: Any, **kwargs: Any) -> CALLBACK_TYPE:
+        nonlocal registration_attempts
+        registration_attempts += 1
+        if registration_attempts == 2:
+            raise RuntimeError("Bluetooth registration failed")
+        return successful_registration(*args, **kwargs)
 
     monkeypatch.setattr(BrilliantRemoteScanner, "async_setup", tracked_setup)
     monkeypatch.setattr(
         "custom_components.brilliant_mqtt.ble_scanner._register_scanner_api",
-        fail_registration,
+        fail_recovery_registration_once,
     )
     bridge = BrilliantBleScannerBridge(hass, _entry(), device_id="panel-device-id")
     await bridge.async_setup()
+    bridge.async_handle_status(_status_message("online"))
+    bridge.async_handle_advertisement(_message(_payload(sequence=42)))
+    assert bridge.scanner is not None
 
-    with pytest.raises(RuntimeError, match="Bluetooth registration failed"):
-        bridge.async_handle_advertisement(_message(VALID["encoded"]))
+    bridge.async_handle_status(_status_message("offline", retained=False))
+    bridge.async_handle_status(_status_message("online", retained=False))
+
+    bridge.async_handle_advertisement(_message(_payload(sequence=43)))
 
     assert bridge.scanner is None
-    assert unsetup_calls == 1
-    assert bridge.diagnostics["packets_accepted"] == 0
+    assert unsetup_calls == 2
+    assert bridge._sequence.last_sequence == 42
+    assert bridge.diagnostics["packets_received"] == 2
+    assert bridge.diagnostics["packets_accepted"] == 1
+    assert bridge.diagnostics["packets_dropped"] == 1
+
+    bridge.async_handle_advertisement(_message(_payload(sequence=43)))
+
+    assert registration_attempts == 3
+    assert bridge.scanner is not None
+    assert bridge._sequence.last_sequence == 43
+    assert bridge.diagnostics["packets_received"] == 3
+    assert bridge.diagnostics["packets_accepted"] == 2
+    assert bridge.diagnostics["packets_dropped"] == 1
+    assert bridge.diagnostics["packets_received"] == (
+        bridge.diagnostics["packets_accepted"] + bridge.diagnostics["packets_dropped"]
+    )
     bridge.async_shutdown()

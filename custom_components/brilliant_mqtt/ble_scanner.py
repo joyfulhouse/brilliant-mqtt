@@ -180,6 +180,7 @@ class BrilliantBleScannerBridge:
                     observer_status_topic(self.panel),
                     self.async_handle_status,
                     qos=0,
+                    encoding=None,
                 )
             )
             self._mqtt_unsubscribers.append(
@@ -188,6 +189,7 @@ class BrilliantBleScannerBridge:
                     advertisement_topic(self.panel),
                     self.async_handle_advertisement,
                     qos=0,
+                    encoding=None,
                 )
             )
         except BaseException:
@@ -200,9 +202,9 @@ class BrilliantBleScannerBridge:
         if self._closed:
             return
         self._packets_received += 1
-        # Retained offline status is a trust boundary: quarantine advertisements
-        # without feeding HA or mutating sequence state until retained online reopens it.
-        if self._observer_online is False:
+        # Exact observer-online health is the trust boundary. Missing or invalid status
+        # quarantines advertisements without feeding HA or mutating sequence state.
+        if self._observer_online is not True:
             self._drop_packet()
             return
         try:
@@ -220,10 +222,20 @@ class BrilliantBleScannerBridge:
             self._drop_packet()
             return
 
-        # Establish HA lifecycle before mutating ordering state on the first packet,
-        # allowing a registration failure to be retried with the same sequence.
-        if self._adapter_address is None:
-            self._ensure_scanner(advertisement.adapter_address)
+        # Establish HA lifecycle before mutating ordering state on every registration,
+        # including recovery after observer-offline teardown. A failed registration is
+        # an isolated dropped packet and can be retried with the same sequence.
+        if self._scanner is None:
+            try:
+                self._ensure_scanner(advertisement.adapter_address)
+            except Exception as error:
+                self._drop_packet()
+                _LOGGER.warning(
+                    "%s: BLE scanner setup/registration failed; advertisement dropped (%s)",
+                    self.panel,
+                    type(error).__name__,
+                )
+                return
 
         try:
             self._sequence.accept(advertisement)
@@ -231,9 +243,6 @@ class BrilliantBleScannerBridge:
             self._drop_packet()
             return
 
-        # Offline tears down only the scanner; source and accepted ordering state persist.
-        if self._scanner is None:
-            self._ensure_scanner(advertisement.adapter_address)
         scanner = self._scanner
         if scanner is None:  # pragma: no cover - _ensure_scanner sets or raises
             raise RuntimeError("BLE scanner registration did not produce a scanner")
@@ -247,22 +256,22 @@ class BrilliantBleScannerBridge:
 
     @callback
     def async_handle_status(self, message: ReceiveMessage) -> None:
-        """Apply retained health; offline quarantines feeds and sequence mutation."""
-        if self._closed or not message.retain or message.topic != observer_status_topic(self.panel):
+        """Apply health; only exact online permits feeds, while every other value closes."""
+        if self._closed or message.topic != observer_status_topic(self.panel):
             return
         payload = _message_payload(message)
         if isinstance(payload, bytes):
             try:
                 status = payload.decode("utf-8")
             except UnicodeDecodeError:
-                return
+                status = None
         else:
             status = payload
         if status == "online":
             self._observer_online = True
-        elif status == "offline":
-            self._observer_online = False
-            self._teardown_scanner()
+            return
+        self._observer_online = False
+        self._teardown_scanner()
 
     @callback
     def async_shutdown(self) -> None:

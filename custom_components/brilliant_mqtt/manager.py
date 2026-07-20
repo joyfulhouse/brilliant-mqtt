@@ -337,7 +337,6 @@ class PanelManager:
             )
             self.ble_scanner_bridge = bridge
             await bridge.async_setup()
-            self.entry.async_on_unload(bridge.async_shutdown)
         if self._legacy_retirement_evidence(include_verified_history=True):
             await self.async_retire_legacy_ha_mirror(force_history_audit=True)
 
