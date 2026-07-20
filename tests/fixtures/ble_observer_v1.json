@@ -1,0 +1,37 @@
+{
+  "valid_advertisement": {
+    "encoded": "{\"adapter_address\":\"11:22:33:44:55:66\",\"address\":\"AA:BB:CC:DD:EE:FF\",\"address_type\":\"public\",\"boot_id\":\"123e4567-e89b-12d3-a456-426614174000\",\"capture_monotonic_ms\":123456789,\"local_name\":\"Wallet\",\"manufacturer_data\":{\"76\":\"021500112233445566778899aabbccddeeff00420007c5\"},\"panel\":\"shed\",\"rssi\":-61,\"sequence\":42,\"service_data\":{\"0000180f-0000-1000-8000-00805f9b34fb\":\"aabbcc\"},\"service_uuids\":[\"0000180f-0000-1000-8000-00805f9b34fb\"],\"tx_power\":-59,\"version\":1}",
+    "value": {
+      "adapter_address": "11:22:33:44:55:66",
+      "address": "AA:BB:CC:DD:EE:FF",
+      "address_type": "public",
+      "boot_id": "123e4567-e89b-12d3-a456-426614174000",
+      "capture_monotonic_ms": 123456789,
+      "local_name": "Wallet",
+      "manufacturer_data": {
+        "76": "021500112233445566778899aabbccddeeff00420007c5"
+      },
+      "panel": "shed",
+      "rssi": -61,
+      "sequence": 42,
+      "service_data": {
+        "0000180f-0000-1000-8000-00805f9b34fb": "aabbcc"
+      },
+      "service_uuids": [
+        "0000180f-0000-1000-8000-00805f9b34fb"
+      ],
+      "tx_power": -59,
+      "version": 1
+    }
+  },
+  "allowlist": [
+    {
+      "address": "AA:BB:CC:DD:EE:FF"
+    },
+    {
+      "ibeacon_major": 66,
+      "ibeacon_minor": 7,
+      "ibeacon_uuid": "00112233-4455-6677-8899-aabbccddeeff"
+    }
+  ]
+}
