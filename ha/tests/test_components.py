@@ -7,6 +7,7 @@ from custom_components.brilliant_mqtt.const import (
     COMPONENT_BRIDGE,
     COMPONENT_BUS_WATCHDOG,
     COMPONENT_HA_MIRROR,
+    COMPONENT_HUE_CA,
     COMPONENT_VOICE,
     COMPONENT_WIFI_WATCHDOG,
     CONF_COMPONENTS,
@@ -84,6 +85,7 @@ def test_optional_order_hides_deprecated_ha_mirror() -> None:
         COMPONENT_VOICE,
         COMPONENT_WIFI_WATCHDOG,
         COMPONENT_BUS_WATCHDOG,
+        COMPONENT_HUE_CA,
     ]
 
 

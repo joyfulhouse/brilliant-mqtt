@@ -22,6 +22,7 @@ from custom_components.brilliant_mqtt.const import (
     COMPONENT_BRIDGE,
     COMPONENT_BUS_WATCHDOG,
     COMPONENT_HA_MIRROR,
+    COMPONENT_HUE_CA,
     COMPONENT_VOICE,
     COMPONENT_WIFI_WATCHDOG,
     CONF_COMPONENTS,
@@ -33,6 +34,7 @@ from custom_components.brilliant_mqtt.const import (
     CONF_HA_MIRROR_TOKEN,
     CONF_HA_MIRROR_WS_URL,
     CONF_HOST,
+    CONF_HUE_CA_CERT,
     CONF_MAX_MIRRORED_ENTITIES,
     CONF_MESH_PRIORITY,
     CONF_MQTT_HOST,
@@ -58,6 +60,7 @@ from custom_components.brilliant_mqtt.const import (
     OPT_REPAIR_COOLDOWN_MINUTES,
     OPT_TRUST_HOST_KEY_CHANGES,
     PANEL_ENV_FILE,
+    PANEL_HUE_CA_CERT_FILE,
 )
 from custom_components.brilliant_mqtt.shell import RunResult
 from custom_components.brilliant_mqtt.voice_payload import VoicePayloadError
@@ -497,6 +500,41 @@ async def test_voice_component_ssh_failure_shows_voice_error_no_entry(
     assert result["type"] == "form" and result["step_id"] == "script"
     assert result["errors"] == {"base": "cannot_install_voice"}
     assert not hass.config_entries.async_entries(DOMAIN)
+
+
+async def test_hue_ca_enabled_persists_cert_through_initial_onboarding(
+    hass: HomeAssistant, payload_dir: Path
+) -> None:
+    """Checking hue_ca + typing a CA PEM during FRESH onboarding installs the hook and
+    persists CONF_HUE_CA_CERT in entry_data (regression: async_step_script's entry_data
+    allowlist previously omitted it, so the CA was silently dropped and _hue_ca_install
+    raised PanelOpError on an empty CA -> cannot_install, blocking onboarding)."""
+    (payload_dir / "brilliant-hue-ca.service").write_text("[Unit]\nDescription=test hue-ca unit\n")
+    (payload_dir / "brilliant-hue-ca.timer").write_text("[Unit]\nDescription=test hue-ca timer\n")
+
+    result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": "user"})
+    with patch(PROBE, return_value=_not_installed()):
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], CONNECT_INPUT)
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], MQTT_INPUT)
+
+    ca_pem = "-----BEGIN CERTIFICATE-----\nFAKECA\n-----END CERTIFICATE-----\n"
+    hue_ca_input = {**SCRIPT_INPUT, COMPONENT_HUE_CA: True, CONF_HUE_CA_CERT: ca_pem}
+    install_shell = FakeShell()
+    with (
+        patch.object(config_flow, "AsyncsshShell", return_value=install_shell),
+        patch(FETCH_VOICE) as mock_fetch,
+    ):
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], hue_ca_input)
+
+    assert result["type"] == "create_entry"
+    data = result["data"]
+    assert data[CONF_COMPONENTS][COMPONENT_HUE_CA] is True
+    assert data[CONF_HUE_CA_CERT] == ca_pem
+    mock_fetch.assert_not_called()  # voice stayed disabled
+    # The CA actually reached the panel — proves _hue_ca_install saw the real value
+    # (not the empty string it saw before the fix, which raised PanelOpError).
+    # _hue_ca_install strips the PEM before writing it, hence .strip() here too.
+    assert (PANEL_HUE_CA_CERT_FILE, ca_pem.strip().encode(), 0o644) in install_shell.uploads
 
 
 async def test_script_step_rejects_control_char_in_voice_ha_host(

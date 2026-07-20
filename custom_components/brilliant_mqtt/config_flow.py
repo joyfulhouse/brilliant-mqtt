@@ -24,6 +24,7 @@ from homeassistant.config_entries import ConfigEntry, ConfigFlow, ConfigFlowResu
 from homeassistant.const import CONF_NAME
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.selector import TextSelector, TextSelectorConfig
 
 from . import _fleet_lock, panel_ops
 from .components import REGISTRY, optional
@@ -36,6 +37,7 @@ from .const import (
     CONF_HA_CONTROL_ENABLED,
     CONF_HA_CONTROL_LABEL,
     CONF_HOST,
+    CONF_HUE_CA_CERT,
     CONF_MAX_MIRRORED_ENTITIES,
     CONF_MESH_PRIORITY,
     CONF_MQTT_HOST,
@@ -165,6 +167,10 @@ def _components_schema_fields(
         )
     ] = vol.In(list(VOICE_WAKE_WORDS))
     fields[vol.Optional(CONF_VOICE_HA_HOST, default=source.get(CONF_VOICE_HA_HOST, ""))] = str
+    # Hue CA-recovery sub-config (meaningful only when hue_ca is checked).
+    fields[vol.Optional(CONF_HUE_CA_CERT, default=source.get(CONF_HUE_CA_CERT, ""))] = TextSelector(
+        TextSelectorConfig(multiline=True)
+    )
     return fields
 
 
@@ -716,6 +722,7 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
                     CONF_COMPONENTS: components,
                     CONF_VOICE_WAKE_WORD: user_input[CONF_VOICE_WAKE_WORD],
                     CONF_VOICE_HA_HOST: user_input[CONF_VOICE_HA_HOST],
+                    CONF_HUE_CA_CERT: user_input.get(CONF_HUE_CA_CERT, ""),
                     **control_values,
                 }
                 current_cid: str | None = None

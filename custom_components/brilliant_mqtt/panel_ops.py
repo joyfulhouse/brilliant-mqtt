@@ -9,6 +9,7 @@ and /etc/systemd/system/brilliant-mqtt.service (see the design spec §7).
 from __future__ import annotations
 
 import asyncio
+import os
 from dataclasses import dataclass
 
 import asyncssh
@@ -17,6 +18,7 @@ from .const import (
     BUS_WATCHDOG_SERVICE_NAME,
     DEFAULT_REBOOT_JOURNAL_LINES,
     HA_MIRROR_SERVICE_NAME,
+    HUE_CA_TIMER_NAME,
     PANEL_BUS_WATCHDOG_DIR,
     PANEL_BUS_WATCHDOG_UNIT_FILE,
     PANEL_ENV_FILE,
@@ -25,6 +27,10 @@ from .const import (
     PANEL_HA_MIRROR_STAGED_DIR,
     PANEL_HA_MIRROR_UNIT_FILE,
     PANEL_HA_MIRROR_VAR_DIR,
+    PANEL_HUE_CA_CERT_FILE,
+    PANEL_HUE_CA_DIR,
+    PANEL_HUE_CA_SERVICE_UNIT_FILE,
+    PANEL_HUE_CA_TIMER_UNIT_FILE,
     PANEL_STAGED_DIR,
     PANEL_UNIT_FILE,
     PANEL_VAR_DIR,
@@ -887,4 +893,113 @@ async def uninstall_bus_watchdog(shell: PanelShell) -> None:
     await _checked(shell, f"rm -f {PANEL_BUS_WATCHDOG_UNIT_FILE}")
     await _checked(shell, f"rm -rf {PANEL_BUS_WATCHDOG_DIR} {_BUS_WATCHDOG_STAGING_DIR}")
     await _checked(shell, f"rm -f {_BUS_WATCHDOG_LOG_FILE} {_BUS_WATCHDOG_STATE_FILE}")
+    await _checked(shell, "systemctl daemon-reload")
+
+
+# ---------------------------------------------------------------------------
+# diyHue CA-recovery hook recipes
+# ---------------------------------------------------------------------------
+
+_HUE_CA_STAGING_DIR = f"{PANEL_HUE_CA_DIR}.staging"
+# Staged OTA-proof unit copies, mirroring _BUS_WATCHDOG_STAGED_UNIT. Two units (the
+# hook is a periodic oneshot: a .service the timer activates + the .timer itself).
+_HUE_CA_STAGED_SERVICE = f"{PANEL_HUE_CA_DIR}/{os.path.basename(PANEL_HUE_CA_SERVICE_UNIT_FILE)}"
+_HUE_CA_STAGED_TIMER = f"{PANEL_HUE_CA_DIR}/{os.path.basename(PANEL_HUE_CA_TIMER_UNIT_FILE)}"
+
+HUE_CA_INSPECT_COMMAND = (
+    f"test -f {PANEL_HUE_CA_DIR}/brilliant_hue_ca/run.py && echo payload=1 || echo payload=0"
+)
+
+
+@dataclass(frozen=True)
+class HueCaState:
+    """Parsed result of one inspect_hue_ca() probe."""
+
+    payload_present: bool  # run.py entrypoint present inside PANEL_HUE_CA_DIR
+
+
+async def inspect_hue_ca(shell: PanelShell) -> HueCaState:
+    """Probe diyHue CA-recovery hook install state in one shell round-trip."""
+    result = await shell.run(HUE_CA_INSPECT_COMMAND)
+    flags: dict[str, bool] = {}
+    for line in result.stdout.splitlines():
+        key, sep, value = line.partition("=")
+        if sep and key == "payload":
+            flags[key] = value == "1"
+    return HueCaState(payload_present=flags.get("payload", False))
+
+
+async def deploy_hue_ca(shell: PanelShell, local_dir: str, ca_pem: str) -> None:
+    """Upload local_dir (contains brilliant_hue_ca/), swap into place, write the CA.
+
+    *local_dir* is the integration payload's agent_payload/hue_ca/, which contains
+    the brilliant_hue_ca/ package. Stage+swap via put_dir so a failed transfer never
+    half-replaces a working install; the current dir is moved aside (.bak) so a
+    mid-swap failure stays recoverable. The operator's CA PEM is written LAST, after
+    the swap succeeds, to its own top-level path (PANEL_HUE_CA_CERT_FILE, outside
+    PANEL_HUE_CA_DIR) so a failed code swap never leaves a stale/half-written CA.
+
+    Result on panel: {PANEL_HUE_CA_DIR}/brilliant_hue_ca/run.py + PANEL_HUE_CA_CERT_FILE.
+    """
+    await shell.run(f"rm -rf {_HUE_CA_STAGING_DIR}")
+    await shell.put_dir(local_dir, _HUE_CA_STAGING_DIR)
+    await _checked(shell, _hue_ca_swap_command())
+    await _checked(shell, f"mkdir -p {os.path.dirname(PANEL_HUE_CA_CERT_FILE)}")
+    await shell.put_bytes(ca_pem.encode(), PANEL_HUE_CA_CERT_FILE, 0o644)
+
+
+def _hue_ca_swap_command() -> str:
+    """Move-aside swap for the hue-ca recovery hook directory.
+
+    Ensures the parent /var/brilliant-mqtt exists (bridge already creates it, but
+    the hook may be deployed standalone), moves the current install aside to .bak,
+    puts the staged dir in place, then drops the backup. A single failed mv leaves
+    a restorable .bak rather than a missing install.
+    """
+    return " && ".join(
+        [
+            f"mkdir -p {PANEL_VAR_DIR}",
+            f"rm -rf {PANEL_HUE_CA_DIR}.bak",
+            f"{{ [ -e {PANEL_HUE_CA_DIR} ] && "
+            f"mv {PANEL_HUE_CA_DIR} {PANEL_HUE_CA_DIR}.bak; true; }}",
+            f"mv {_HUE_CA_STAGING_DIR} {PANEL_HUE_CA_DIR}",
+            f"rm -rf {PANEL_HUE_CA_DIR}.bak",
+        ]
+    )
+
+
+async def ensure_hue_ca_units(shell: PanelShell, service_content: str, timer_content: str) -> None:
+    """Write the hue-ca service+timer to /etc and staged OTA-proof copies, then reload.
+
+    The hook has no env file of its own — the oneshot service execs the deployed
+    run.py directly, which reads PANEL_HUE_CA_CERT_FILE itself. Both units are
+    staged under PANEL_HUE_CA_DIR (like _BUS_WATCHDOG_STAGED_UNIT) so a firmware
+    OTA that wipes /etc leaves a restorable copy in the OTA-proof /var tree.
+    """
+    await _checked(shell, f"mkdir -p {PANEL_HUE_CA_DIR}")
+    service_bytes = service_content.encode()
+    timer_bytes = timer_content.encode()
+    await shell.put_bytes(service_bytes, PANEL_HUE_CA_SERVICE_UNIT_FILE, 0o644)
+    await shell.put_bytes(timer_bytes, PANEL_HUE_CA_TIMER_UNIT_FILE, 0o644)
+    await shell.put_bytes(service_bytes, _HUE_CA_STAGED_SERVICE, 0o644)
+    await shell.put_bytes(timer_bytes, _HUE_CA_STAGED_TIMER, 0o644)
+    await _checked(shell, "systemctl daemon-reload")
+
+
+async def enable_hue_ca(shell: PanelShell) -> None:
+    """Enable + start the TIMER (not the oneshot service — the timer activates it)."""
+    await _checked(shell, f"systemctl enable --now {HUE_CA_TIMER_NAME}")
+
+
+async def uninstall_hue_ca(shell: PanelShell) -> None:
+    """Stop + disable + remove everything the hue-ca recovery hook owns on the panel.
+
+    Removes both unit files, the code directory (+ staging sibling), and the
+    operator's injected CA cert. PANEL_VAR_DIR itself is NOT removed — it belongs
+    to the bridge.
+    """
+    await shell.run(f"systemctl disable --now {HUE_CA_TIMER_NAME} 2>/dev/null || true")
+    await _checked(shell, f"rm -f {PANEL_HUE_CA_SERVICE_UNIT_FILE} {PANEL_HUE_CA_TIMER_UNIT_FILE}")
+    await _checked(shell, f"rm -rf {PANEL_HUE_CA_DIR} {_HUE_CA_STAGING_DIR}")
+    await _checked(shell, f"rm -f {PANEL_HUE_CA_CERT_FILE}")
     await _checked(shell, "systemctl daemon-reload")
