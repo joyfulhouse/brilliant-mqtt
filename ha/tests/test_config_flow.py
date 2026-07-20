@@ -19,7 +19,13 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers import config_validation as cv
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.brilliant_mqtt import async_migrate_entry, components, config_flow, panel_ops
+from custom_components.brilliant_mqtt import (
+    async_cleanup,
+    async_migrate_entry,
+    components,
+    config_flow,
+    panel_ops,
+)
 from custom_components.brilliant_mqtt.config_flow import _PanelProbe, _slugify, _WrongPanelError
 from custom_components.brilliant_mqtt.const import (
     BLE_OBSERVER_SERVICE_NAME,
@@ -121,6 +127,44 @@ class _GatedBleQuarantineShell(FakeShell):
             await self.release_quarantine.wait()
             return RunResult(0, "", "")
         return await super().run(command)
+
+
+class _StalledBleCleanupShell(FakeShell):
+    """Permanently stall one cleanup phase until cancellation or test teardown."""
+
+    def __init__(self, *, stall_command: bool = False, stall_close: bool = False) -> None:
+        super().__init__()
+        self.stall_command = stall_command
+        self.stall_close = stall_close
+        self.command_started = asyncio.Event()
+        self.command_cancelled = asyncio.Event()
+        self.close_started = asyncio.Event()
+        self.close_cancelled = asyncio.Event()
+        self.release_command = asyncio.Event()
+        self.release_close = asyncio.Event()
+
+    async def run(self, command: str) -> RunResult:
+        if self.stall_command and command == f"systemctl disable --now {BLE_OBSERVER_SERVICE_NAME}":
+            self._require_connected()
+            self.commands.append(command)
+            self.command_started.set()
+            try:
+                await self.release_command.wait()
+            except asyncio.CancelledError:
+                self.command_cancelled.set()
+                raise
+            return RunResult(0, "", "")
+        return await super().run(command)
+
+    async def close(self) -> None:
+        self.close_started.set()
+        if self.stall_close:
+            try:
+                await self.release_close.wait()
+            except asyncio.CancelledError:
+                self.close_cancelled.set()
+                raise
+        await super().close()
 
 
 RECONFIG_INPUT = {
@@ -792,9 +836,35 @@ async def test_script_step_rejects_control_char_in_voice_ha_host(
 # --- onboarding: already installed (adopt) ---------------------------------
 
 
-async def test_installed_adopts_from_panel(hass: HomeAssistant) -> None:
+async def test_installed_adopts_only_after_quarantining_enabled_observer(
+    hass: HomeAssistant,
+) -> None:
     result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": "user"})
-    with patch(PROBE, return_value=_installed(_env(panel="office", scene_bridge_enabled=True))):
+    prior_allowlist = '[{"address":"AA:BB:CC:DD:EE:FF"}]'
+    installed_env = panel_ops.render_env(
+        panel="office",
+        mesh_priority=3,
+        mqtt_host="192.168.1.250",
+        mqtt_port=8883,
+        mqtt_username="brilliant",
+        mqtt_password="frombroker",
+        scene_bridge_enabled=True,
+        ble_observer_enabled=True,
+        ble_observer_allowlist_json=prior_allowlist,
+    )
+    shell = SequencedResponseShell(
+        {
+            panel_ops.BLE_OBSERVER_ACTIVE_COMMAND: [
+                RunResult(0, "active\n", ""),
+                RunResult(3, "inactive\n", ""),
+            ]
+        },
+        responses={f"cat {PANEL_ENV_FILE}": RunResult(0, installed_env, "")},
+    )
+    with (
+        patch(PROBE, return_value=_installed(panel_ops.parse_env(installed_env))),
+        patch.object(config_flow, "AsyncsshShell", return_value=shell) as shell_factory,
+    ):
         result = await hass.config_entries.flow.async_configure(result["flow_id"], CONNECT_INPUT)
     assert result["type"] == "create_entry"
     assert result["title"] == "Brilliant office"
@@ -812,6 +882,68 @@ async def test_installed_adopts_from_panel(hass: HomeAssistant) -> None:
     assert data[CONF_COMPONENTS][COMPONENT_BLE_OBSERVER] is False
     assert data[CONF_BLE_SCANNER_ENABLED] is False
     assert data[CONF_BLE_OBSERVER_ALLOWLIST_JSON] == "[]"
+    shell_factory.assert_called_once_with(
+        CONNECT_INPUT[CONF_HOST],
+        CONNECT_INPUT[CONF_ROOT_PASSWORD],
+        "ssh-ed25519 PINNED",
+    )
+    disable = f"systemctl disable --now {BLE_OBSERVER_SERVICE_NAME}"
+    stop = f"systemctl stop {BLE_OBSERVER_SERVICE_NAME}"
+    assert shell.commands.index(disable) < shell.commands.index(stop)
+    assert any(PANEL_BLE_OBSERVER_UNIT_FILE in command for command in shell.commands)
+    safe_env = next(data.decode() for path, data, _mode in shell.uploads if path == PANEL_ENV_FILE)
+    parsed_safe_env = panel_ops.parse_env(safe_env)
+    assert parsed_safe_env[panel_ops.ENV_BLE_OBSERVER_ENABLED] == "0"
+    assert parsed_safe_env[panel_ops.ENV_BLE_OBSERVER_ALLOWLIST_JSON] == "[]"
+    assert prior_allowlist not in safe_env
+
+
+async def test_installed_adoption_failure_creates_no_unsafe_entry(hass: HomeAssistant) -> None:
+    """An observer that remains active cannot be adopted as stored default-off."""
+    result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": "user"})
+    shell = FakeShell(
+        responses={panel_ops.BLE_OBSERVER_ACTIVE_COMMAND: RunResult(0, "active\n", "")}
+    )
+    with (
+        patch(PROBE, return_value=_installed(_env(panel="office"))),
+        patch.object(config_flow, "AsyncsshShell", return_value=shell),
+    ):
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], CONNECT_INPUT)
+
+    assert result["type"] == "form" and result["step_id"] == "user"
+    assert result["errors"] == {"base": "cannot_install"}
+    assert not hass.config_entries.async_entries(DOMAIN)
+
+
+async def test_installed_adoption_cancellation_quarantines_before_no_entry(
+    hass: HomeAssistant,
+) -> None:
+    """Cancellation drains the pinned quarantine before preserving cancellation."""
+    result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": "user"})
+    shell = _GatedBleQuarantineShell()
+    with (
+        patch(PROBE, return_value=_installed(_env(panel="office"))),
+        patch.object(config_flow, "AsyncsshShell", return_value=shell),
+    ):
+        operation = asyncio.create_task(
+            hass.config_entries.flow.async_configure(result["flow_id"], CONNECT_INPUT)
+        )
+        try:
+            await asyncio.wait_for(shell.quarantine_started.wait(), timeout=0.5)
+            operation.cancel()
+            operation.cancel()
+            shell.release_quarantine.set()
+            with pytest.raises(asyncio.CancelledError):
+                await operation
+        finally:
+            shell.release_quarantine.set()
+            if not operation.done():
+                operation.cancel()
+                await asyncio.gather(operation, return_exceptions=True)
+
+    assert not hass.config_entries.async_entries(DOMAIN)
+    assert panel_ops.BLE_OBSERVER_ACTIVE_COMMAND in shell.commands
+    assert any(PANEL_BLE_OBSERVER_UNIT_FILE in command for command in shell.commands)
 
 
 async def test_installed_duplicate_aborts(hass: HomeAssistant) -> None:
@@ -819,9 +951,13 @@ async def test_installed_duplicate_aborts(hass: HomeAssistant) -> None:
         hass
     )
     result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": "user"})
-    with patch(PROBE, return_value=_installed(_env(panel="office"))):
+    with (
+        patch(PROBE, return_value=_installed(_env(panel="office"))),
+        patch.object(config_flow, "AsyncsshShell") as shell_factory,
+    ):
         result = await hass.config_entries.flow.async_configure(result["flow_id"], CONNECT_INPUT)
     assert result["type"] == "abort" and result["reason"] == "already_configured"
+    shell_factory.assert_not_called()
 
 
 async def test_installed_unreadable_config_shows_error(hass: HomeAssistant) -> None:
@@ -863,11 +999,91 @@ async def test_installed_adopts_with_default_port_and_mesh(hass: HomeAssistant) 
         'BRILLIANT_PANEL="office"\nMQTT_HOST="h"\nMQTT_USERNAME="u"\nMQTT_PASSWORD="p"\n'
     )
     result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": "user"})
-    with patch(PROBE, return_value=_installed(minimal)):
+    with (
+        patch(PROBE, return_value=_installed(minimal)),
+        patch.object(config_flow, "AsyncsshShell", return_value=FakeShell()),
+    ):
         result = await hass.config_entries.flow.async_configure(result["flow_id"], CONNECT_INPUT)
     assert result["type"] == "create_entry"
     assert result["data"][CONF_MQTT_PORT] == 1883
     assert result["data"][CONF_MESH_PRIORITY] == 0
+
+
+@pytest.mark.parametrize("stall_phase", ["command", "close", "command_and_close"])
+async def test_fail_closed_cleanup_timeout_drains_stalled_panel_session(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    stall_phase: str,
+) -> None:
+    """A stuck command or close cannot make cancellation wait without a hard bound."""
+    monkeypatch.setattr(async_cleanup, "_CLEANUP_TIMEOUT_SECONDS", 0.01, raising=False)
+    shell = _StalledBleCleanupShell(
+        stall_command=stall_phase in {"command", "command_and_close"},
+        stall_close=stall_phase in {"close", "command_and_close"},
+    )
+    original = asyncio.CancelledError()
+
+    with patch.object(config_flow, "AsyncsshShell", return_value=shell):
+        operation = asyncio.create_task(
+            async_cleanup.shielded_cleanup_after_failure(
+                original,
+                config_flow._quarantine_ble_at(
+                    hass,
+                    host="10.0.0.10",
+                    password="pw",
+                    host_key="ssh-ed25519 PINNED",
+                ),
+            )
+        )
+        started = shell.close_started if stall_phase == "close" else shell.command_started
+        try:
+            await asyncio.wait_for(started.wait(), timeout=0.5)
+            done, _pending = await asyncio.wait({operation}, timeout=0.25)
+            assert operation in done, f"{stall_phase} cleanup exceeded its hard bound"
+            with pytest.raises(asyncio.CancelledError) as raised:
+                operation.result()
+            assert raised.value is original
+        finally:
+            shell.release_command.set()
+            shell.release_close.set()
+            if not operation.done():
+                operation.cancel()
+                await asyncio.gather(operation, return_exceptions=True)
+
+    if stall_phase in {"command", "command_and_close"}:
+        assert shell.command_cancelled.is_set()
+        assert shell.close_started.is_set()
+    if stall_phase in {"close", "command_and_close"}:
+        assert shell.close_cancelled.is_set()
+
+
+async def test_fail_closed_cleanup_timeout_surfaces_after_ordinary_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cleanup deadline is visible when there is no cancellation to preserve."""
+    monkeypatch.setattr(async_cleanup, "_CLEANUP_TIMEOUT_SECONDS", 0.01)
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def stalled_cleanup() -> None:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    operation = asyncio.create_task(
+        async_cleanup.shielded_cleanup_after_failure(
+            panel_ops.PanelOpError("mutation failed"),
+            stalled_cleanup(),
+        )
+    )
+    await asyncio.wait_for(started.wait(), timeout=0.5)
+
+    with pytest.raises(TimeoutError, match="fail-closed cleanup exceeded 0.01 seconds"):
+        await operation
+    assert cancelled.is_set()
 
 
 def _inspect(unit: bool, env: bool, version: str = "9.9.9") -> RunResult:
@@ -2443,9 +2659,12 @@ async def test_adopted_panel_inherits_fleet_globals_over_stale_panel_toggle(
     }
     _full_entry(hass, **inherited)
     result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": "user"})
-    with patch(
-        PROBE,
-        return_value=_installed(_env(panel="backyard", scene_bridge_enabled=False)),
+    with (
+        patch(
+            PROBE,
+            return_value=_installed(_env(panel="backyard", scene_bridge_enabled=False)),
+        ),
+        patch.object(config_flow, "AsyncsshShell", return_value=FakeShell()),
     ):
         result = await hass.config_entries.flow.async_configure(result["flow_id"], CONNECT_INPUT)
 

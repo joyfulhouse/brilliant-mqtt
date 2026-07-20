@@ -1,10 +1,11 @@
 """Config flow: one entry per panel — each panel stores ITS OWN root password.
 
 Onboarding is detection-first: step 1 connects (the only required inputs) and, if the
-agent is already installed, ADOPTS the panel by reading its config back — no further
-questions, no changes to the panel. A not-yet-installed panel continues to the MQTT
-broker (pre-filled from a prior panel) and the panel-settings step. Reconfigure edits
-every mutable setting and pushes the change to the panel; the slug is immutable.
+agent is already installed, ADOPTS the panel by reading its config back and quarantining
+any unowned BLE observer before entry creation — no further questions. A not-yet-installed
+panel continues to the MQTT broker (pre-filled from a prior panel) and the panel-settings
+step. Reconfigure edits every mutable setting and pushes the change to the panel; the slug
+is immutable.
 """
 
 from __future__ import annotations
@@ -29,7 +30,7 @@ from homeassistant.helpers.selector import TextSelector, TextSelectorConfig
 
 from . import _fleet_lock, panel_ops
 from . import components as component_ops
-from .async_cleanup import shielded_cleanup_after_failure
+from .async_cleanup import shield_and_drain, shielded_cleanup_after_failure
 from .components import REGISTRY, optional
 from .const import (
     COMPONENT_BLE_OBSERVER,
@@ -887,7 +888,7 @@ async def _quarantine_ble_at(
     password: str,
     host_key: str,
 ) -> bool:
-    """Try one pinned, bounded observer quarantine and report whether it was proven."""
+    """Try one pinned observer quarantine and report whether inactivity was proven."""
     try:
         async with _panel_session(
             hass,
@@ -967,6 +968,15 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
     def async_get_options_flow(config_entry: ConfigEntry) -> OptionsFlow:
         return BrilliantMqttOptionsFlow()
 
+    async def _quarantine_connected_panel_ble(self) -> bool:
+        """Quarantine BLE using the TOFU-captured connection retained by this flow."""
+        return await _quarantine_ble_at(
+            self.hass,
+            host=str(self._connect[CONF_HOST]),
+            password=str(self._connect[CONF_ROOT_PASSWORD]),
+            host_key=str(self._connect[DATA_SSH_HOST_KEY]),
+        )
+
     async def async_step_user(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         """Step 1 — connect (IP + root password, the only required inputs).
 
@@ -1002,21 +1012,32 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
                     else:
                         await self.async_set_unique_id(adopted[CONF_PANEL])
                         self._abort_if_unique_id_configured()
-                        entries = self._async_current_entries()
-                        inherited = _inherited_globals(entries, adopted[CONF_PANEL])
-                        if not entries:
-                            # With no fleet owner, preserve the installed bridge's
-                            # explicit scene toggle. Once a fleet exists, its seven
-                            # canonical globals are authoritative for every new panel.
-                            inherited[CONF_HA_CONTROL_ENABLED] = adopted[CONF_HA_CONTROL_ENABLED]
-                        return self.async_create_entry(
-                            title=f"Brilliant {adopted[CONF_PANEL]}",
-                            data={
-                                **self._connect,
-                                **adopted,
-                                **inherited,
-                            },
-                        )
+                        try:
+                            observer_quarantined = await shield_and_drain(
+                                self._quarantine_connected_panel_ble()
+                            )
+                        except (OSError, asyncssh.Error, panel_ops.PanelOpError, TimeoutError):
+                            observer_quarantined = False
+                        if not observer_quarantined:
+                            errors["base"] = "cannot_install"
+                        else:
+                            entries = self._async_current_entries()
+                            inherited = _inherited_globals(entries, adopted[CONF_PANEL])
+                            if not entries:
+                                # With no fleet owner, preserve the installed bridge's
+                                # explicit scene toggle. Once a fleet exists, its seven
+                                # canonical globals are authoritative for every new panel.
+                                inherited[CONF_HA_CONTROL_ENABLED] = adopted[
+                                    CONF_HA_CONTROL_ENABLED
+                                ]
+                            return self.async_create_entry(
+                                title=f"Brilliant {adopted[CONF_PANEL]}",
+                                data={
+                                    **self._connect,
+                                    **adopted,
+                                    **inherited,
+                                },
+                            )
         schema = vol.Schema(
             {
                 vol.Required(
@@ -1129,12 +1150,7 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
                             await REGISTRY[cid].install(self.hass, shell, entry_data)
                     if not components.get(COMPONENT_BLE_OBSERVER, False):
                         current_cid = None
-                        if not await _quarantine_ble_at(
-                            self.hass,
-                            host=str(self._connect[CONF_HOST]),
-                            password=str(self._connect[CONF_ROOT_PASSWORD]),
-                            host_key=str(self._connect[DATA_SSH_HOST_KEY]),
-                        ):
+                        if not await self._quarantine_connected_panel_ble():
                             raise panel_ops.PanelOpError(
                                 "default-off BLE observer state could not be proven"
                             )
@@ -1142,12 +1158,7 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
                     if panel_may_have_changed:
                         cleanup_succeeded = await shielded_cleanup_after_failure(
                             error,
-                            _quarantine_ble_at(
-                                self.hass,
-                                host=str(self._connect[CONF_HOST]),
-                                password=str(self._connect[CONF_ROOT_PASSWORD]),
-                                host_key=str(self._connect[DATA_SSH_HOST_KEY]),
-                            ),
+                            self._quarantine_connected_panel_ble(),
                         )
                     else:
                         if not isinstance(error, Exception):
