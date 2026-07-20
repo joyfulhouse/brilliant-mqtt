@@ -23,6 +23,7 @@ from custom_components.brilliant_mqtt import components as _components
 from custom_components.brilliant_mqtt import config_flow as _config_flow
 from custom_components.brilliant_mqtt.config_flow import _PanelProbe
 from custom_components.brilliant_mqtt.const import (
+    COMPONENT_BLE_OBSERVER,
     COMPONENT_BRIDGE,
     COMPONENT_BUS_WATCHDOG,
     COMPONENT_HA_MIRROR,
@@ -173,6 +174,13 @@ def payload_dir(tmp_path: Path) -> Iterator[Path]:
     )
     (tmp_path / "bus_watchdog" / "brilliant_bus_watchdog").mkdir(parents=True)
     (tmp_path / "bus_watchdog" / "brilliant_bus_watchdog" / "run.py").write_text("# stub\n")
+    (tmp_path / "brilliant-ble-observer.service").write_text(
+        "[Unit]\nDescription=test BLE observer unit\n"
+    )
+    (tmp_path / "ble_observer" / "brilliant_ble_observer").mkdir(parents=True)
+    (tmp_path / "ble_observer" / "brilliant_ble_observer" / "__main__.py").write_text("# stub\n")
+    (tmp_path / "ble_observer" / "vendor" / "dbus_next").mkdir(parents=True)
+    (tmp_path / "ble_observer" / "vendor" / "dbus_next" / "__init__.py").write_text("# stub\n")
     (tmp_path / "brilliant-ha-mirror.service").write_text(
         "[Unit]\nDescription=test HA mirror unit\n"
     )
@@ -304,6 +312,11 @@ def patch_installs() -> Iterator[_PatchInstallsResult]:
             _components.REGISTRY[COMPONENT_HA_MIRROR],
             install=_make_install(COMPONENT_HA_MIRROR),
             remove=_make_remove(COMPONENT_HA_MIRROR),
+        ),
+        COMPONENT_BLE_OBSERVER: _dc_replace(
+            _components.REGISTRY[COMPONENT_BLE_OBSERVER],
+            install=_make_install(COMPONENT_BLE_OBSERVER),
+            remove=_make_remove(COMPONENT_BLE_OBSERVER),
         ),
     }
 

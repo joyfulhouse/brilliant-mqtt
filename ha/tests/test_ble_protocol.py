@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import importlib
 import json
+import random
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -47,7 +49,6 @@ def test_shared_fixture_decodes_with_complete_byte_fields() -> None:
     advertisement = decode_advertisement(
         VALID["encoded"], topic="brilliant/ble/v1/shed/advertisement", retained=False
     )
-
     assert json.loads(VALID["encoded"]) == VALID["value"]
     assert advertisement == Advertisement(
         panel="shed",
@@ -65,6 +66,131 @@ def test_shared_fixture_decodes_with_complete_byte_fields() -> None:
         manufacturer_data={76: bytes.fromhex("021500112233445566778899aabbccddeeff00420007c5")},
         capture_monotonic_ms=123456789,
     )
+
+
+def test_seeded_panel_encoder_to_ha_decoder_fuzz_parity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deterministic corpus executes both runtime codecs so field drift fails CI."""
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[2] / "src"))
+    panel_model = importlib.import_module("brilliant_ble_observer.model")
+    envelope_type: Any = panel_model.AdvertisementEnvelope
+    rng = random.Random(0xB1E0B5E)
+    shared_fields = (
+        "panel",
+        "adapter_address",
+        "boot_id",
+        "session_id",
+        "sequence",
+        "address",
+        "address_type",
+        "rssi",
+        "local_name",
+        "tx_power",
+        "service_uuids",
+        "service_data",
+        "manufacturer_data",
+        "capture_monotonic_ms",
+        "version",
+    )
+
+    def random_mac() -> str:
+        return "-".join(f"{rng.randrange(256):02x}" for _index in range(6))
+
+    for sequence in range(1, 65):
+        service_uuid = str(UUID(int=rng.randrange(1, 1 << 128)))
+        service_bytes = bytes(rng.randrange(256) for _index in range(rng.randrange(9)))
+        manufacturer_bytes = bytes(rng.randrange(256) for _index in range(rng.randrange(9)))
+        envelope = envelope_type(
+            panel="shed",
+            adapter_address=random_mac(),
+            boot_id=str(UUID(int=rng.randrange(1, 1 << 128))).upper(),
+            session_id=str(UUID(int=rng.randrange(1, 1 << 128))).upper(),
+            sequence=sequence,
+            address=random_mac(),
+            address_type=" PUBLIC " if sequence % 2 else " RANDOM ",
+            rssi=rng.randint(MIN_RSSI, MAX_RSSI),
+            local_name=None if sequence % 3 == 0 else f" Beacon {sequence} ",
+            tx_power=None if sequence % 4 == 0 else rng.randint(MIN_TX_POWER, MAX_TX_POWER),
+            service_uuids=(service_uuid.upper(), service_uuid),
+            service_data={service_uuid.upper(): bytearray(service_bytes)},
+            manufacturer_data={rng.randrange(0x10000): memoryview(manufacturer_bytes)},
+            capture_monotonic_ms=rng.randrange(MAX_COUNTER + 1),
+        )
+
+        decoded = decode_advertisement(
+            envelope.to_json(),
+            topic=advertisement_topic("shed"),
+            retained=False,
+        )
+
+        for field_name in shared_fields:
+            assert getattr(decoded, field_name) == getattr(envelope, field_name), (
+                sequence,
+                field_name,
+            )
+
+
+@pytest.mark.parametrize(
+    ("panel_change", "wire_change"),
+    [
+        ({"address": "not-a-mac"}, {"address": "not-a-mac"}),
+        ({"rssi": MIN_RSSI - 1}, {"rssi": MIN_RSSI - 1}),
+        ({"rssi": True}, {"rssi": True}),
+        ({"tx_power": MAX_TX_POWER + 1}, {"tx_power": MAX_TX_POWER + 1}),
+        (
+            {"local_name": "é" * ((MAX_LOCAL_NAME_BYTES // 2) + 1)},
+            {"local_name": "é" * ((MAX_LOCAL_NAME_BYTES // 2) + 1)},
+        ),
+        (
+            {"service_data": {BATTERY_UUID: b"x" * (MAX_DATA_BYTES + 1)}},
+            {"service_data": {BATTERY_UUID: "78" * (MAX_DATA_BYTES + 1)}},
+        ),
+        (
+            {"capture_monotonic_ms": MAX_COUNTER + 1},
+            {"capture_monotonic_ms": MAX_COUNTER + 1},
+        ),
+    ],
+    ids=[
+        "address",
+        "rssi-bound",
+        "bool-is-not-int",
+        "tx-bound",
+        "utf8-name-bound",
+        "binary-bound",
+        "counter-bound",
+    ],
+)
+def test_panel_encoder_and_ha_decoder_reject_same_hostile_vectors(
+    monkeypatch: pytest.MonkeyPatch,
+    panel_change: dict[str, object],
+    wire_change: dict[str, object],
+) -> None:
+    """Boundary and type attacks stay fail-closed on both sides of the MQTT seam."""
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[2] / "src"))
+    panel_model = importlib.import_module("brilliant_ble_observer.model")
+    envelope_type: Any = panel_model.AdvertisementEnvelope
+    panel_values: dict[str, object] = {
+        "panel": "shed",
+        "adapter_address": "11:22:33:44:55:66",
+        "boot_id": "123e4567-e89b-12d3-a456-426614174000",
+        "session_id": "223e4567-e89b-12d3-a456-426614174000",
+        "sequence": 42,
+        "address": "AA:BB:CC:DD:EE:FF",
+        "address_type": "public",
+        "rssi": -61,
+        "local_name": "Wallet",
+        "tx_power": -59,
+        "service_uuids": (BATTERY_UUID,),
+        "service_data": {BATTERY_UUID: bytes.fromhex("aabbcc")},
+        "manufacturer_data": {76: bytes.fromhex("00")},
+        "capture_monotonic_ms": 123456789,
+    }
+
+    with pytest.raises(ValueError):
+        envelope_type(**{**panel_values, **panel_change})
+    with pytest.raises(ValueError):
+        _decode(**wire_change)
 
 
 def test_decoder_normalizes_wire_values() -> None:

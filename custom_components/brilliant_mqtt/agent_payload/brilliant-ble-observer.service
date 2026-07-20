@@ -1,0 +1,40 @@
+[Unit]
+Description=Brilliant read-only BLE advertisement observer
+After=bluetooth.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/brilliant-mqtt.env
+Environment=PYTHONPATH=/var/brilliant-mqtt/ble_observer:/var/brilliant-mqtt/ble_observer/vendor:/var/brilliant-mqtt/vendor PYTHONDONTWRITEBYTECODE=1
+WorkingDirectory=/var/brilliant-mqtt/ble_observer
+ExecStart=/data/switch-embedded/env/bin/python3 -m brilliant_ble_observer
+Restart=on-failure
+RestartSec=10
+Nice=10
+MemoryMax=48M
+CPUQuota=10%
+OOMScoreAdjust=500
+UMask=0077
+
+# The observer talks to BlueZ only over the system D-Bus socket and publishes to
+# MQTT. It never opens the adapter device or needs a writable system path.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateDevices=true
+PrivateTmp=true
+DevicePolicy=closed
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

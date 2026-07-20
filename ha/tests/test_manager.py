@@ -24,12 +24,14 @@ from pytest_homeassistant_custom_component.typing import MqttMockHAClient
 
 from custom_components.brilliant_mqtt import panel_ops
 from custom_components.brilliant_mqtt.const import (
+    COMPONENT_BLE_OBSERVER,
     COMPONENT_BRIDGE,
     COMPONENT_BUS_WATCHDOG,
     COMPONENT_HA_MIRROR,
     COMPONENT_HUE_CA,
     COMPONENT_VOICE,
     COMPONENT_WIFI_WATCHDOG,
+    CONF_BLE_OBSERVER_ALLOWLIST_JSON,
     CONF_BLE_SCANNER_ENABLED,
     CONF_COMPONENTS,
     CONF_HA_CONTROL_ENABLED,
@@ -41,6 +43,7 @@ from custom_components.brilliant_mqtt.const import (
     CONF_PANEL,
     CONF_VOICE_ENABLED,
     CONF_VOICE_WAKE_WORD,
+    CONFIG_ENTRY_VERSION,
     DATA_HA_MIRROR_RETIRE_VERIFIED,
     DATA_SSH_HOST_KEY,
     DOMAIN,
@@ -53,7 +56,7 @@ from custom_components.brilliant_mqtt.const import (
 from custom_components.brilliant_mqtt.manager import PanelManager
 from custom_components.brilliant_mqtt.shell import RunResult
 from tests.conftest import REPIN_NEW_KEY, RepinShells
-from tests.fakes import FakeShell
+from tests.fakes import FakeShell, SequencedResponseShell
 from tests.test_init import ENTRY_DATA
 
 
@@ -87,7 +90,7 @@ async def test_ble_bridge_links_existing_panel_device_and_area(
             CONF_PANEL: "shed",
             CONF_BLE_SCANNER_ENABLED: True,
         },
-        version=3,
+        version=CONFIG_ENTRY_VERSION,
     )
     entry.add_to_hass(hass)
 
@@ -135,12 +138,361 @@ async def test_manager_renders_scene_bridge_toggle_from_entry_data(
         domain=DOMAIN,
         unique_id="office",
         data={**ENTRY_DATA, CONF_HA_CONTROL_ENABLED: enabled},
-        version=3,
+        version=CONFIG_ENTRY_VERSION,
     )
     entry.add_to_hass(hass)
     manager = PanelManager(hass, entry, asyncio.Lock())
     _unit, env = await manager._config_contents()
     assert f"SCENE_BRIDGE_ENABLED={line}" in env.splitlines()
+
+
+async def test_manager_renders_selected_observer_and_allowlist_from_entry_data(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    allowlist = '[{"address":"AA:BB:CC:DD:EE:FF"}]'
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="office",
+        data={
+            **ENTRY_DATA,
+            CONF_COMPONENTS: {
+                COMPONENT_BRIDGE: True,
+                COMPONENT_BLE_OBSERVER: True,
+            },
+            CONF_BLE_OBSERVER_ALLOWLIST_JSON: allowlist,
+        },
+        version=CONFIG_ENTRY_VERSION,
+    )
+    entry.add_to_hass(hass)
+    manager = PanelManager(hass, entry, asyncio.Lock())
+
+    _unit, env = await manager._config_contents()
+
+    parsed = panel_ops.parse_env(env)
+    assert parsed["BLE_OBSERVER_ENABLED"] == "1"
+    assert parsed["BLE_OBSERVER_ALLOWLIST_JSON"] == allowlist
+
+
+async def test_manager_malformed_observer_allowlist_fails_closed(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="office",
+        data={
+            **ENTRY_DATA,
+            CONF_COMPONENTS: {
+                COMPONENT_BRIDGE: True,
+                COMPONENT_BLE_OBSERVER: True,
+            },
+            CONF_BLE_OBSERVER_ALLOWLIST_JSON: {"address": "AA:BB:CC:DD:EE:FF"},
+        },
+        version=CONFIG_ENTRY_VERSION,
+    )
+    entry.add_to_hass(hass)
+    manager = PanelManager(hass, entry, asyncio.Lock())
+
+    _unit, env = await manager._config_contents()
+
+    assert panel_ops.parse_env(env)["BLE_OBSERVER_ALLOWLIST_JSON"] == "[]"
+
+
+def _online_message() -> Any:
+    """Build one retained online LWT for direct manager reconciliation tests."""
+    from homeassistant.components.mqtt.models import ReceiveMessage
+
+    return ReceiveMessage(
+        topic="brilliant/office/availability",
+        payload="online",
+        qos=0,
+        retain=True,
+        subscribed_topic="brilliant/office/availability",
+        timestamp=dt_util.utcnow().timestamp(),
+    )
+
+
+def _offline_message() -> Any:
+    """Build one retained offline LWT for direct manager reconciliation tests."""
+    from homeassistant.components.mqtt.models import ReceiveMessage
+
+    return ReceiveMessage(
+        topic="brilliant/office/availability",
+        payload="offline",
+        qos=0,
+        retain=True,
+        subscribed_topic="brilliant/office/availability",
+        timestamp=dt_util.utcnow().timestamp(),
+    )
+
+
+async def test_migrated_default_off_entry_stops_active_observer_on_first_online(
+    hass: HomeAssistant,
+) -> None:
+    """An explicit migrated false flag is reconciled against stale physical state."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="office",
+        data={
+            **ENTRY_DATA,
+            CONF_COMPONENTS: {
+                COMPONENT_BRIDGE: True,
+                COMPONENT_BLE_OBSERVER: False,
+            },
+        },
+        version=CONFIG_ENTRY_VERSION,
+    )
+    entry.add_to_hass(hass)
+    shell = SequencedResponseShell(
+        {
+            panel_ops.BLE_OBSERVER_ACTIVE_COMMAND: [
+                RunResult(0, "active\n", ""),
+                RunResult(3, "inactive\n", ""),
+            ]
+        }
+    )
+    manager = PanelManager(hass, entry, asyncio.Lock())
+
+    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+        await manager._on_availability(_online_message())
+        await manager._on_availability(_online_message())
+
+    assert manager._ble_off_reconciled is True
+    assert shell.connect_count == 1
+    assert manager.problem is False
+    assert "systemctl stop brilliant-ble-observer" in shell.commands
+    assert any("brilliant-ble-observer.service" in command for command in shell.commands)
+    assert not any(
+        "bluetoothd" in command or "systemctl restart brilliant-mqtt" in command
+        for command in shell.commands
+    )
+
+
+async def test_default_off_online_audit_surfaces_failure_and_retries(
+    hass: HomeAssistant,
+) -> None:
+    """No inactive proof is visible as a problem; the next online LWT retries once."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="office",
+        data={
+            **ENTRY_DATA,
+            CONF_COMPONENTS: {
+                COMPONENT_BRIDGE: True,
+                COMPONENT_BLE_OBSERVER: False,
+            },
+        },
+        version=CONFIG_ENTRY_VERSION,
+    )
+    entry.add_to_hass(hass)
+    unsafe = FakeShell(
+        responses={
+            panel_ops.BLE_OBSERVER_ACTIVE_COMMAND: RunResult(0, "active\n", ""),
+        }
+    )
+    recovered = FakeShell(
+        responses={
+            panel_ops.BLE_OBSERVER_ACTIVE_COMMAND: RunResult(3, "inactive\n", ""),
+        }
+    )
+    manager = PanelManager(hass, entry, asyncio.Lock())
+    events = _capture_events(hass)
+
+    with patch(
+        "custom_components.brilliant_mqtt.manager.AsyncsshShell",
+        side_effect=[unsafe, recovered],
+    ):
+        await manager._on_availability(_online_message())
+        assert manager._ble_off_reconciled is False
+        assert manager.problem is True
+        assert "BLE observer" in str(manager.problem_reason)
+        await manager._on_availability(_online_message())
+
+    assert unsafe.connect_count == 1
+    assert recovered.connect_count == 1
+    assert manager._ble_off_reconciled is True
+    assert manager.problem is False
+    assert "needs_attention" in _types(events)
+
+
+async def test_default_off_successful_audit_is_reused_across_lwt_transitions(
+    hass: HomeAssistant,
+) -> None:
+    """Availability alone cannot recreate removed observer state or invalidate proof."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="office",
+        data={
+            **ENTRY_DATA,
+            CONF_COMPONENTS: {
+                COMPONENT_BRIDGE: True,
+                COMPONENT_BLE_OBSERVER: False,
+            },
+        },
+        version=CONFIG_ENTRY_VERSION,
+    )
+    entry.add_to_hass(hass)
+    shell = FakeShell(
+        responses={panel_ops.BLE_OBSERVER_ACTIVE_COMMAND: RunResult(3, "inactive\n", "")}
+    )
+    manager = PanelManager(hass, entry, asyncio.Lock())
+
+    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+        await manager._on_availability(_online_message())
+        await manager._on_availability(_offline_message())
+        await manager._on_availability(_online_message())
+
+    assert shell.connect_count == 1
+    assert manager._ble_off_reconciled is True
+    assert manager._grace_cancel is None
+
+
+async def test_repair_invalidates_prior_default_off_proof(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """A state-restoring repair must audit again even after a successful LWT audit."""
+    shell = SequencedResponseShell(
+        {
+            panel_ops.BLE_OBSERVER_ACTIVE_COMMAND: [
+                RunResult(0, "active\n", ""),
+                RunResult(3, "inactive\n", ""),
+            ]
+        },
+        responses={
+            panel_ops.INSPECT_COMMAND: RunResult(
+                0,
+                "unit=1\nenv=1\nenabled=1\nactive=1\nsunit=1\nsenv=1\npayload=1\n0.2.0\n",
+                "",
+            )
+        },
+    )
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="office",
+        data={
+            **ENTRY_DATA,
+            CONF_COMPONENTS: {
+                COMPONENT_BRIDGE: True,
+                COMPONENT_BLE_OBSERVER: False,
+            },
+        },
+        version=CONFIG_ENTRY_VERSION,
+    )
+    entry.add_to_hass(hass)
+    manager = PanelManager(hass, entry, asyncio.Lock())
+    manager._ble_off_reconciled = True
+
+    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+        await manager.async_repair(trigger="button")
+        await manager.async_shutdown()
+
+    assert "systemctl stop brilliant-ble-observer" in shell.commands
+    assert manager._ble_off_reconciled is True
+
+
+async def test_staged_refresh_invalidates_prior_default_off_proof(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """Post-OTA config restoration must quarantine observer state again."""
+    shell = SequencedResponseShell(
+        {
+            panel_ops.BLE_OBSERVER_ACTIVE_COMMAND: [
+                RunResult(0, "active\n", ""),
+                RunResult(3, "inactive\n", ""),
+            ]
+        }
+    )
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="office",
+        data={
+            **ENTRY_DATA,
+            CONF_COMPONENTS: {
+                COMPONENT_BRIDGE: True,
+                COMPONENT_BLE_OBSERVER: False,
+            },
+        },
+        version=CONFIG_ENTRY_VERSION,
+    )
+    entry.add_to_hass(hass)
+    manager = PanelManager(hass, entry, asyncio.Lock())
+    manager._ble_off_reconciled = True
+
+    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+        await manager._refresh_staged_copies()
+
+    assert "systemctl stop brilliant-ble-observer" in shell.commands
+    assert manager._ble_off_reconciled is True
+
+
+async def test_initial_retained_offline_audits_ble_before_normal_grace(
+    hass: HomeAssistant,
+) -> None:
+    """A stale independent observer is a safety problem even while the bridge is offline."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="office",
+        data={
+            **ENTRY_DATA,
+            CONF_COMPONENTS: {
+                COMPONENT_BRIDGE: True,
+                COMPONENT_BLE_OBSERVER: False,
+            },
+        },
+        version=CONFIG_ENTRY_VERSION,
+    )
+    entry.add_to_hass(hass)
+    shell = FakeShell(
+        responses={
+            panel_ops.BLE_OBSERVER_ACTIVE_COMMAND: RunResult(0, "active\n", ""),
+        }
+    )
+    manager = PanelManager(hass, entry, asyncio.Lock())
+    events = _capture_events(hass)
+
+    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+        await manager._on_availability(_offline_message())
+
+    assert shell.connect_count == 1
+    assert manager.problem is True
+    assert manager._grace_cancel is None
+    assert "needs_attention" in _types(events)
+
+
+async def test_default_off_audit_waiting_for_lock_stops_cleanly_on_shutdown(
+    hass: HomeAssistant,
+) -> None:
+    """Unload while the fleet lock is held must prevent a post-shutdown SSH session."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="office",
+        data={
+            **ENTRY_DATA,
+            CONF_COMPONENTS: {
+                COMPONENT_BRIDGE: True,
+                COMPONENT_BLE_OBSERVER: False,
+            },
+        },
+        version=CONFIG_ENTRY_VERSION,
+    )
+    entry.add_to_hass(hass)
+    lock = asyncio.Lock()
+    await lock.acquire()
+    manager = PanelManager(hass, entry, lock)
+    events = _capture_events(hass)
+
+    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell") as shell_factory:
+        audit = asyncio.create_task(manager._on_availability(_online_message()))
+        await asyncio.sleep(0)
+        await manager.async_shutdown()
+        lock.release()
+        await audit
+
+    shell_factory.assert_not_called()
+    assert "needs_attention" not in _types(events)
 
 
 @pytest.mark.allow_lingering_timers
@@ -155,7 +507,12 @@ async def test_offline_grace_triggers_auto_repair_then_recovery(
 
     async_fire_mqtt_message(hass, "brilliant/office/availability", "offline")
     await hass.async_block_till_done()
-    assert not fake_shell.commands  # grace period: no SSH yet
+    # The explicit migrated default-off BLE switch is reconciled immediately;
+    # the normal bridge repair itself still waits for the grace period.
+    assert "systemctl disable --now brilliant-ble-observer" in fake_shell.commands
+    assert panel_ops.INSPECT_COMMAND not in fake_shell.commands
+    assert "systemctl enable --now brilliant-mqtt" not in fake_shell.commands
+    fake_shell.commands.clear()
 
     async_fire_time_changed(hass, dt_util.utcnow() + timedelta(minutes=11))
     await hass.async_block_till_done()
@@ -265,7 +622,9 @@ async def test_auto_repair_off_notifies_only(
     async_fire_time_changed(hass, dt_util.utcnow() + timedelta(minutes=11))
     await hass.async_block_till_done()
 
-    assert not fake_shell.commands
+    assert "systemctl disable --now brilliant-ble-observer" in fake_shell.commands
+    assert panel_ops.INSPECT_COMMAND not in fake_shell.commands
+    assert "systemctl enable --now brilliant-mqtt" not in fake_shell.commands
     assert _types(events) == ["needs_attention"]
     assert entry.runtime_data.problem is True
 
@@ -317,7 +676,18 @@ async def test_unreachable_panel_reports_and_schedules_recheck(
 ) -> None:
     shell = FakeShell(connect_error=OSError("unreachable"))
     with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
-        entry = await _setup(hass)
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            unique_id="office",
+            data={
+                **ENTRY_DATA,
+                CONF_COMPONENTS: {COMPONENT_BRIDGE: True},
+            },
+            version=CONFIG_ENTRY_VERSION,
+        )
+        entry.add_to_hass(hass)
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
         events = _capture_events(hass)
         async_fire_mqtt_message(hass, "brilliant/office/availability", "offline")
         await hass.async_block_till_done()
@@ -939,6 +1309,7 @@ async def test_repair_repin_connect_failure_is_unreachable(
     events = _capture_events(hass)
 
     await manager.async_repair(trigger="button")
+    await hass.async_block_till_done()
 
     failed = next(e for e in events if e.data["type"] == "repair_failed")
     assert failed.data["reason"] == "unreachable"
@@ -1005,6 +1376,94 @@ async def test_agent_update_reports_progress(
     assert 0 <= min(pcts) and max(pcts) <= 100
     assert fake_shell.dir_uploads  # the deploy actually ran
     assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_agent_update_force_refreshes_selected_ble_observer_payload(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    shell = FakeShell(
+        responses={
+            panel_ops.BLE_OBSERVER_INSPECT_COMMAND: RunResult(
+                0,
+                "unit=1\nenabled=1\nactive=1\nsunit=1\npayload=1\n",
+                "",
+            )
+        }
+    )
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="office",
+        data={
+            **ENTRY_DATA,
+            CONF_COMPONENTS: {
+                COMPONENT_BRIDGE: True,
+                COMPONENT_BLE_OBSERVER: True,
+            },
+            CONF_BLE_OBSERVER_ALLOWLIST_JSON: '[{"address":"AA:BB:CC:DD:EE:FF"}]',
+        },
+        version=CONFIG_ENTRY_VERSION,
+    )
+    entry.add_to_hass(hass)
+    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+        manager = PanelManager(hass, entry, asyncio.Lock())
+        await manager.async_update_agent()
+        await manager.async_shutdown()
+
+    assert (
+        str(payload_dir / "ble_observer"),
+        "/var/brilliant-mqtt/ble_observer.staging",
+    ) in shell.dir_uploads
+    observer_enable = shell.commands.index("systemctl enable brilliant-ble-observer")
+    observer_restart = shell.commands.index("systemctl restart brilliant-ble-observer")
+    bridge_restart = shell.commands.index("systemctl restart brilliant-mqtt")
+    assert observer_enable < observer_restart < bridge_restart
+    assert not any(
+        "bluetoothctl" in command or "bluetoothd" in command for command in shell.commands
+    )
+
+
+async def test_agent_update_quarantines_stale_unselected_ble_observer(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """A false observer flag is not success until stale physical state is removed."""
+    shell = SequencedResponseShell(
+        {
+            panel_ops.BLE_OBSERVER_ACTIVE_COMMAND: [
+                RunResult(0, "active\n", ""),
+                RunResult(3, "inactive\n", ""),
+            ]
+        }
+    )
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="office",
+        data={
+            **ENTRY_DATA,
+            CONF_COMPONENTS: {
+                COMPONENT_BRIDGE: True,
+                COMPONENT_BLE_OBSERVER: False,
+            },
+        },
+        version=CONFIG_ENTRY_VERSION,
+    )
+    entry.add_to_hass(hass)
+    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+        manager = PanelManager(hass, entry, asyncio.Lock())
+        manager._ble_off_reconciled = True
+        await manager.async_update_agent()
+        await manager.async_shutdown()
+
+    disable = "systemctl disable --now brilliant-ble-observer"
+    stop = "systemctl stop brilliant-ble-observer"
+    bridge_restart = "systemctl restart brilliant-mqtt"
+    assert shell.commands.index(disable) < shell.commands.index(stop)
+    assert shell.commands.index(stop) < shell.commands.index(bridge_restart)
+    assert any(
+        command.startswith("rm -rf /var/brilliant-mqtt/ble_observer ") for command in shell.commands
+    )
+    assert manager._ble_off_reconciled is True
 
 
 # ---------------------------------------------------------------------------
@@ -1784,6 +2243,73 @@ async def test_repair_skips_watchdog_when_not_selected(
     assert not any("brilliant-wifi-watchdog" in p for (p, _d, _m) in shell.uploads)
 
 
+@pytest.mark.allow_lingering_timers
+async def test_repair_relays_selected_ble_observer_without_touching_bridge_or_bluez(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    payload_dir: Path,
+) -> None:
+    agent_ok = RunResult(
+        0,
+        "unit=1\nenv=1\nenabled=1\nactive=1\nsunit=1\nsenv=1\npayload=1\n0.2.0\n",
+        "",
+    )
+    observer_before = RunResult(
+        0,
+        "unit=0\nenabled=0\nactive=0\nsunit=1\npayload=1\n",
+        "",
+    )
+    observer_after = RunResult(
+        0,
+        "unit=1\nenabled=1\nactive=1\nsunit=1\npayload=1\n",
+        "",
+    )
+    shell = SequencedResponseShell(
+        {panel_ops.BLE_OBSERVER_INSPECT_COMMAND: [observer_before, observer_after]},
+        responses={
+            panel_ops.INSPECT_COMMAND: agent_ok,
+        },
+    )
+    allowlist = '[{"address":"AA:BB:CC:DD:EE:FF"}]'
+    entry_data = {
+        **ENTRY_DATA,
+        CONF_COMPONENTS: {
+            COMPONENT_BRIDGE: True,
+            COMPONENT_BLE_OBSERVER: True,
+        },
+        CONF_BLE_OBSERVER_ALLOWLIST_JSON: allowlist,
+    }
+    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            unique_id="office",
+            data=entry_data,
+            version=CONFIG_ENTRY_VERSION,
+        )
+        entry.add_to_hass(hass)
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        await entry.runtime_data.async_repair(trigger="button")
+        await hass.async_block_till_done()
+
+    assert "systemctl enable --now brilliant-ble-observer" in shell.commands
+    assert any("brilliant-ble-observer.service" in path for path, _data, _mode in shell.uploads)
+    assert not any("ble_observer" in local for local, _remote in shell.dir_uploads)
+    main_env = next(
+        data for path, data, _mode in shell.uploads if path == "/etc/brilliant-mqtt.env"
+    )
+    parsed = panel_ops.parse_env(main_env.decode())
+    assert parsed["BLE_OBSERVER_ENABLED"] == "1"
+    assert parsed["BLE_OBSERVER_ALLOWLIST_JSON"] == allowlist
+    assert not any(
+        forbidden in command
+        for command in shell.commands
+        for forbidden in ("bluetoothctl", "bluetoothd")
+    )
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
 # ---------------------------------------------------------------------------
 # Bus watchdog repair re-lay (Task 3: OTA wipes /etc, unit must be re-laid)
 # ---------------------------------------------------------------------------
@@ -2494,7 +3020,12 @@ def _retirement_entry(
         CONF_HA_CONTROL_ENABLED: enabled,
         "unrelated": "keep",
     }
-    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=data, version=3)
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="office",
+        data=data,
+        version=CONFIG_ENTRY_VERSION,
+    )
     entry.add_to_hass(hass)
     manager = PanelManager(hass, entry, asyncio.Lock())
     return entry, manager

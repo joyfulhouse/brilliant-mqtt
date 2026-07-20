@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import patch
@@ -16,15 +18,19 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers import config_validation as cv
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.brilliant_mqtt import async_migrate_entry, config_flow, panel_ops
+from custom_components.brilliant_mqtt import async_migrate_entry, components, config_flow, panel_ops
 from custom_components.brilliant_mqtt.config_flow import _PanelProbe, _slugify, _WrongPanelError
 from custom_components.brilliant_mqtt.const import (
+    BLE_OBSERVER_SERVICE_NAME,
+    COMPONENT_BLE_OBSERVER,
     COMPONENT_BRIDGE,
     COMPONENT_BUS_WATCHDOG,
     COMPONENT_HA_MIRROR,
     COMPONENT_HUE_CA,
     COMPONENT_VOICE,
     COMPONENT_WIFI_WATCHDOG,
+    CONF_BLE_OBSERVER_ALLOWLIST_JSON,
+    CONF_BLE_SCANNER_ENABLED,
     CONF_COMPONENTS,
     CONF_HA_CONTROL_DOMAINS,
     CONF_HA_CONTROL_ENABLED,
@@ -59,12 +65,13 @@ from custom_components.brilliant_mqtt.const import (
     OPT_OFFLINE_GRACE_MINUTES,
     OPT_REPAIR_COOLDOWN_MINUTES,
     OPT_TRUST_HOST_KEY_CHANGES,
+    PANEL_BLE_OBSERVER_UNIT_FILE,
     PANEL_ENV_FILE,
     PANEL_HUE_CA_CERT_FILE,
 )
-from custom_components.brilliant_mqtt.shell import RunResult
+from custom_components.brilliant_mqtt.shell import PanelShell, RunResult
 from custom_components.brilliant_mqtt.voice_payload import VoicePayloadError
-from tests.fakes import FakeShell
+from tests.fakes import FakeShell, SequencedResponseShell
 
 PROBE = "custom_components.brilliant_mqtt.config_flow._probe_panel"
 APPLY = "custom_components.brilliant_mqtt.config_flow._apply_config"
@@ -80,6 +87,9 @@ SCRIPT_INPUT = {
     CONF_NAME: "Office Bath",
     CONF_MESH_PRIORITY: 1,
     COMPONENT_VOICE: False,
+    COMPONENT_BLE_OBSERVER: False,
+    CONF_BLE_SCANNER_ENABLED: False,
+    CONF_BLE_OBSERVER_ALLOWLIST_JSON: "[]",
     CONF_VOICE_WAKE_WORD: "okay_nabu",
     CONF_VOICE_HA_HOST: "",
     CONF_HA_CONTROL_ENABLED: DEFAULT_HA_CONTROL_ENABLED,
@@ -103,6 +113,9 @@ RECONFIG_INPUT = {
     CONF_MESH_PRIORITY: 5,
     COMPONENT_VOICE: False,
     COMPONENT_WIFI_WATCHDOG: False,
+    COMPONENT_BLE_OBSERVER: False,
+    CONF_BLE_SCANNER_ENABLED: False,
+    CONF_BLE_OBSERVER_ALLOWLIST_JSON: "[]",
     CONF_VOICE_WAKE_WORD: "okay_nabu",
     CONF_VOICE_HA_HOST: "",
     CONF_HA_CONTROL_ENABLED: DEFAULT_HA_CONTROL_ENABLED,
@@ -502,6 +515,139 @@ async def test_voice_component_ssh_failure_shows_voice_error_no_entry(
     assert not hass.config_entries.async_entries(DOMAIN)
 
 
+async def test_script_failure_before_ble_quarantines_desired_observer(
+    hass: HomeAssistant,
+    not_installed_panel: None,
+    patch_installs: Any,
+) -> None:
+    """Bridge env may be BLE-on before voice fails, so onboarding must remove that state."""
+    del patch_installs
+    result = await _drive_flow_to_script(hass)
+    shell = FakeShell(
+        responses={
+            panel_ops.BLE_OBSERVER_ACTIVE_COMMAND: RunResult(3, "inactive\n", ""),
+        }
+    )
+
+    async def fail_voice(*_args: object, **_kwargs: object) -> None:
+        raise VoicePayloadError("download failed")
+
+    voice = replace(components.REGISTRY[COMPONENT_VOICE], install=fail_voice)
+    with (
+        patch.object(config_flow, "AsyncsshShell", return_value=shell),
+        patch.dict(components.REGISTRY, {COMPONENT_VOICE: voice}),
+    ):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {
+                **SCRIPT_INPUT,
+                COMPONENT_VOICE: True,
+                COMPONENT_BLE_OBSERVER: True,
+                CONF_BLE_OBSERVER_ALLOWLIST_JSON: ('[{"address":"AA:BB:CC:DD:EE:FF"}]'),
+            },
+        )
+
+    assert result["type"] == "form" and result["errors"] == {"base": "cannot_install_voice"}
+    assert not hass.config_entries.async_entries(DOMAIN)
+    assert f"systemctl disable --now {BLE_OBSERVER_SERVICE_NAME}" in shell.commands
+    assert any(PANEL_BLE_OBSERVER_UNIT_FILE in command for command in shell.commands)
+
+
+async def test_script_partial_ble_enable_failure_is_quarantined_before_no_entry(
+    hass: HomeAssistant,
+    not_installed_panel: None,
+    patch_installs: Any,
+) -> None:
+    """A BLE install that mutates systemd and then raises cannot outlive failed setup."""
+    del patch_installs
+    result = await _drive_flow_to_script(hass)
+    shell = FakeShell(
+        responses={
+            panel_ops.BLE_OBSERVER_ACTIVE_COMMAND: RunResult(3, "inactive\n", ""),
+        }
+    )
+    enable = f"systemctl enable --now {BLE_OBSERVER_SERVICE_NAME}"
+
+    async def partially_enable(
+        _hass: HomeAssistant,
+        target: PanelShell,
+        _data: Mapping[str, Any],
+    ) -> None:
+        await target.run(enable)
+        raise panel_ops.PanelOpError("enable reported failure after mutation")
+
+    observer = replace(components.REGISTRY[COMPONENT_BLE_OBSERVER], install=partially_enable)
+    with (
+        patch.object(config_flow, "AsyncsshShell", return_value=shell),
+        patch.dict(components.REGISTRY, {COMPONENT_BLE_OBSERVER: observer}),
+    ):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {
+                **SCRIPT_INPUT,
+                COMPONENT_BLE_OBSERVER: True,
+                CONF_BLE_OBSERVER_ALLOWLIST_JSON: ('[{"address":"AA:BB:CC:DD:EE:FF"}]'),
+            },
+        )
+
+    assert result["type"] == "form" and result["errors"] == {"base": "cannot_install"}
+    assert not hass.config_entries.async_entries(DOMAIN)
+    disable = f"systemctl disable --now {BLE_OBSERVER_SERVICE_NAME}"
+    assert shell.commands.index(enable) < shell.commands.index(disable)
+    assert any(PANEL_BLE_OBSERVER_UNIT_FILE in command for command in shell.commands)
+
+
+async def test_script_default_off_proves_stale_active_observer_stopped_before_entry(
+    hass: HomeAssistant,
+    not_installed_panel: None,
+    patch_installs: Any,
+) -> None:
+    """Fresh default-off setup reconciles an older active observer before persisting."""
+    del patch_installs
+    result = await _drive_flow_to_script(hass)
+    shell = SequencedResponseShell(
+        {
+            panel_ops.BLE_OBSERVER_ACTIVE_COMMAND: [
+                RunResult(0, "active\n", ""),
+                RunResult(3, "inactive\n", ""),
+            ]
+        }
+    )
+
+    with patch.object(config_flow, "AsyncsshShell", return_value=shell):
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], SCRIPT_INPUT)
+
+    assert result["type"] == "create_entry"
+    assert result["data"][CONF_COMPONENTS][COMPONENT_BLE_OBSERVER] is False
+    disable = f"systemctl disable --now {BLE_OBSERVER_SERVICE_NAME}"
+    stop = f"systemctl stop {BLE_OBSERVER_SERVICE_NAME}"
+    assert shell.commands.index(disable) < shell.commands.index(stop)
+    assert any(PANEL_BLE_OBSERVER_UNIT_FILE in command for command in shell.commands)
+
+
+async def test_script_default_off_never_creates_entry_without_inactive_proof(
+    hass: HomeAssistant,
+    not_installed_panel: None,
+    patch_installs: Any,
+) -> None:
+    """An observer that remains active makes onboarding fail, with no unowned entry gap."""
+    del patch_installs
+    result = await _drive_flow_to_script(hass)
+    shell = FakeShell(
+        responses={
+            panel_ops.BLE_OBSERVER_ACTIVE_COMMAND: RunResult(0, "active\n", ""),
+        }
+    )
+
+    with patch.object(config_flow, "AsyncsshShell", return_value=shell):
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], SCRIPT_INPUT)
+
+    assert result["type"] == "form" and result["errors"] == {"base": "cannot_install"}
+    assert not hass.config_entries.async_entries(DOMAIN)
+    assert shell.commands.count(f"systemctl stop {BLE_OBSERVER_SERVICE_NAME}") == 2
+    assert not any(PANEL_BLE_OBSERVER_UNIT_FILE in command for command in shell.commands)
+
+
 async def test_hue_ca_enabled_persists_cert_through_initial_onboarding(
     hass: HomeAssistant, payload_dir: Path
 ) -> None:
@@ -583,6 +729,9 @@ async def test_installed_adopts_from_panel(hass: HomeAssistant) -> None:
     assert data[CONF_MQTT_PASSWORD] == "frombroker"
     assert data[CONF_MESH_PRIORITY] == 3
     assert data[CONF_HA_CONTROL_ENABLED] is True
+    assert data[CONF_COMPONENTS][COMPONENT_BLE_OBSERVER] is False
+    assert data[CONF_BLE_SCANNER_ENABLED] is False
+    assert data[CONF_BLE_OBSERVER_ALLOWLIST_JSON] == "[]"
 
 
 async def test_installed_duplicate_aborts(hass: HomeAssistant) -> None:
@@ -722,6 +871,54 @@ async def test_apply_config_pushes_when_panel_matches(hass: HomeAssistant) -> No
     assert key == "ssh-ed25519 FAKEKEY"
     assert any(data == b"NEWENV" for (_path, data, _mode) in shell.uploads)
     assert "systemctl restart brilliant-mqtt" in shell.commands
+
+
+async def test_apply_config_failure_quarantines_changed_observer_env(hass: HomeAssistant) -> None:
+    """A partially failing bridge restart cannot leave a newly enabled BLE env runnable."""
+    same = panel_ops.render_env(
+        panel="office",
+        mesh_priority=0,
+        mqtt_host="old.broker",
+        mqtt_port=1883,
+        mqtt_username="brilliant",
+        mqtt_password="oldbroker",
+    )
+    desired = panel_ops.render_env(
+        panel="office",
+        mesh_priority=0,
+        mqtt_host="new.broker",
+        mqtt_port=1883,
+        mqtt_username="brilliant",
+        mqtt_password="newbroker",
+        ble_observer_enabled=True,
+        ble_observer_allowlist_json='[{"address":"AA:BB:CC:DD:EE:FF"}]',
+    )
+    shell = FakeShell(
+        responses={
+            panel_ops.INSPECT_COMMAND: _inspect(True, True),
+            f"cat {PANEL_ENV_FILE}": RunResult(0, same, ""),
+            "systemctl restart brilliant-mqtt": RunResult(1, "", "restart failed"),
+            panel_ops.BLE_OBSERVER_ACTIVE_COMMAND: RunResult(3, "inactive\n", ""),
+        }
+    )
+
+    with patch.object(config_flow, "AsyncsshShell", return_value=shell):
+        with pytest.raises(panel_ops.PanelOpError, match="restart failed"):
+            await config_flow._apply_config(
+                hass,
+                "10.0.0.10",
+                "pw",
+                pinned_key="ssh-ed25519 FAKEKEY",
+                env_content=desired,
+                expected_panel="office",
+                fail_closed_ble=True,
+            )
+
+    live_env_writes = [data for path, data, _mode in shell.uploads if path == PANEL_ENV_FILE]
+    assert live_env_writes[0] == desired.encode()
+    assert panel_ops.parse_env(live_env_writes[-1].decode())["BLE_OBSERVER_ENABLED"] == "0"
+    assert f"systemctl disable --now {BLE_OBSERVER_SERVICE_NAME}" in shell.commands
+    assert any(PANEL_BLE_OBSERVER_UNIT_FILE in command for command in shell.commands)
 
 
 # --- reconfigure -----------------------------------------------------------
@@ -904,6 +1101,9 @@ async def test_install_step_persists_components(
     comps = result["data"][CONF_COMPONENTS]
     assert comps[COMPONENT_BRIDGE] is True
     assert comps[COMPONENT_VOICE] is True
+    assert comps[COMPONENT_BLE_OBSERVER] is False
+    assert result["data"][CONF_BLE_SCANNER_ENABLED] is False
+    assert result["data"][CONF_BLE_OBSERVER_ALLOWLIST_JSON] == "[]"
     assert patch_installs.called(COMPONENT_BRIDGE)
     assert patch_installs.called(COMPONENT_VOICE)
 
@@ -920,6 +1120,24 @@ async def test_deprecated_ha_mirror_fields_are_hidden_from_new_install(
     assert CONF_HA_MIRROR_TOKEN not in fields
     assert CONF_HA_MIRROR_LEADER_PRIORITY not in fields
     assert CONF_HA_MIRROR_LABEL not in fields
+
+
+async def test_new_install_exposes_two_independent_default_off_ble_switches(
+    hass: HomeAssistant,
+    not_installed_panel: None,
+) -> None:
+    result = await _drive_flow_to_script(hass)
+    schema = result["data_schema"]
+    assert schema is not None
+    fields = {str(marker) for marker in schema.schema}
+    assert {
+        COMPONENT_BLE_OBSERVER,
+        CONF_BLE_SCANNER_ENABLED,
+        CONF_BLE_OBSERVER_ALLOWLIST_JSON,
+    } <= fields
+    assert _schema_default(result, COMPONENT_BLE_OBSERVER) is False
+    assert _schema_default(result, CONF_BLE_SCANNER_ENABLED) is False
+    assert _schema_default(result, CONF_BLE_OBSERVER_ALLOWLIST_JSON) == "[]"
 
 
 # --- options ---------------------------------------------------------------
@@ -964,6 +1182,7 @@ def reconfigure_input(
     voice: bool | None = None,
     wifi_watchdog: bool | None = None,
     bus_watchdog: bool | None = None,
+    ble_observer: bool | None = None,
 ) -> dict[str, Any]:
     """Build a full reconfigure user_input dict from entry data.
 
@@ -975,6 +1194,7 @@ def reconfigure_input(
     current_voice = bool(comps.get(COMPONENT_VOICE, False))
     current_wd = bool(comps.get(COMPONENT_WIFI_WATCHDOG, False))
     current_bus_wd = bool(comps.get(COMPONENT_BUS_WATCHDOG, False))
+    current_ble_observer = bool(comps.get(COMPONENT_BLE_OBSERVER, False))
     return {
         CONF_HOST: data[CONF_HOST],
         CONF_ROOT_PASSWORD: data[CONF_ROOT_PASSWORD],
@@ -986,6 +1206,11 @@ def reconfigure_input(
         COMPONENT_VOICE: voice if voice is not None else current_voice,
         COMPONENT_WIFI_WATCHDOG: wifi_watchdog if wifi_watchdog is not None else current_wd,
         COMPONENT_BUS_WATCHDOG: (bus_watchdog if bus_watchdog is not None else current_bus_wd),
+        COMPONENT_BLE_OBSERVER: (
+            ble_observer if ble_observer is not None else current_ble_observer
+        ),
+        CONF_BLE_SCANNER_ENABLED: data.get(CONF_BLE_SCANNER_ENABLED, False),
+        CONF_BLE_OBSERVER_ALLOWLIST_JSON: data.get(CONF_BLE_OBSERVER_ALLOWLIST_JSON, "[]"),
         CONF_VOICE_WAKE_WORD: data.get(CONF_VOICE_WAKE_WORD, "okay_nabu"),
         CONF_VOICE_HA_HOST: data.get(CONF_VOICE_HA_HOST, ""),
         CONF_HA_CONTROL_ENABLED: data.get(CONF_HA_CONTROL_ENABLED, DEFAULT_HA_CONTROL_ENABLED),
@@ -1048,6 +1273,461 @@ async def test_reconfigure_no_change_skips_install_remove(
     assert result["type"] == "abort" and result["reason"] == "reconfigure_successful"
     assert not patch_installs.called(COMPONENT_VOICE)
     assert not patch_installs.removed(COMPONENT_VOICE)
+
+
+async def test_reconfigure_enables_observer_and_scanner_with_canonical_allowlist(
+    hass: HomeAssistant,
+    patch_installs: Any,
+) -> None:
+    entry = _full_entry(
+        hass,
+        **{
+            CONF_COMPONENTS: {
+                COMPONENT_BRIDGE: True,
+                COMPONENT_BLE_OBSERVER: False,
+            },
+            CONF_BLE_SCANNER_ENABLED: False,
+            CONF_BLE_OBSERVER_ALLOWLIST_JSON: "[]",
+        },
+    )
+    hass.config_entries.async_update_entry(
+        entry,
+        version=config_flow.BrilliantMqttConfigFlow.VERSION,
+    )
+    result = await start_reconfigure(hass, entry)
+    raw_allowlist = json.dumps(
+        [
+            {"address": "aa-bb-cc-dd-ee-ff"},
+            {
+                "ibeacon_uuid": "FDA50693-A4E2-4FB1-AFCF-C6EB07647825",
+                "ibeacon_major": 1,
+                "ibeacon_minor": 2,
+            },
+        ]
+    )
+    submitted = {
+        **reconfigure_input(entry, ble_observer=True),
+        CONF_BLE_SCANNER_ENABLED: True,
+        CONF_BLE_OBSERVER_ALLOWLIST_JSON: raw_allowlist,
+    }
+
+    with patch(APPLY, return_value="ssh-ed25519 STORED") as apply:
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], submitted)
+
+    assert result["type"] == "abort" and result["reason"] == "reconfigure_successful"
+    canonical = (
+        '[{"address":"AA:BB:CC:DD:EE:FF"},'
+        '{"ibeacon_major":1,"ibeacon_minor":2,'
+        '"ibeacon_uuid":"fda50693-a4e2-4fb1-afcf-c6eb07647825"}]'
+    )
+    assert entry.data[CONF_COMPONENTS][COMPONENT_BLE_OBSERVER] is True
+    assert entry.data[CONF_BLE_SCANNER_ENABLED] is True
+    assert entry.data[CONF_BLE_OBSERVER_ALLOWLIST_JSON] == canonical
+    assert patch_installs.called(COMPONENT_BLE_OBSERVER)
+    pushed = panel_ops.parse_env(apply.call_args.kwargs["env_content"])
+    assert pushed["BLE_OBSERVER_ENABLED"] == "1"
+    assert pushed["BLE_OBSERVER_ALLOWLIST_JSON"] == canonical
+
+
+async def test_reconfigure_component_failure_before_ble_quarantines_desired_observer(
+    hass: HomeAssistant,
+) -> None:
+    """Desired BLE env is fail-closed when an earlier optional install aborts the diff."""
+    entry = _full_entry(
+        hass,
+        **{
+            CONF_COMPONENTS: {
+                COMPONENT_BRIDGE: True,
+                COMPONENT_VOICE: False,
+                COMPONENT_BLE_OBSERVER: False,
+            },
+            CONF_BLE_OBSERVER_ALLOWLIST_JSON: "[]",
+        },
+    )
+    before = dict(entry.data)
+    shell = FakeShell(
+        responses={
+            panel_ops.BLE_OBSERVER_ACTIVE_COMMAND: RunResult(3, "inactive\n", ""),
+        }
+    )
+
+    async def fail_voice_install(*_args: object, **_kwargs: object) -> None:
+        raise panel_ops.PanelOpError("voice unit failed")
+
+    voice = replace(components.REGISTRY[COMPONENT_VOICE], install=fail_voice_install)
+    result = await start_reconfigure(hass, entry)
+    submitted = {
+        **reconfigure_input(entry, voice=True, ble_observer=True),
+        CONF_BLE_OBSERVER_ALLOWLIST_JSON: '[{"address":"AA:BB:CC:DD:EE:FF"}]',
+    }
+    with (
+        patch(APPLY, return_value="ssh-ed25519 STORED") as apply,
+        patch.object(config_flow, "AsyncsshShell", return_value=shell),
+        patch.dict(components.REGISTRY, {COMPONENT_VOICE: voice}),
+    ):
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], submitted)
+
+    assert result["type"] == "form" and result["errors"] == {"base": "cannot_apply"}
+    assert entry.data == before
+    pushed = panel_ops.parse_env(apply.call_args.kwargs["env_content"])
+    assert pushed["BLE_OBSERVER_ENABLED"] == "1"
+    assert f"systemctl disable --now {BLE_OBSERVER_SERVICE_NAME}" in shell.commands
+    assert panel_ops.BLE_OBSERVER_ACTIVE_COMMAND in shell.commands
+    assert any(PANEL_BLE_OBSERVER_UNIT_FILE in command for command in shell.commands)
+    assert f"systemctl enable --now {BLE_OBSERVER_SERVICE_NAME}" not in shell.commands
+
+
+@pytest.mark.parametrize(
+    ("changed_key", "new_value", "expected_env_key", "expected_env_value"),
+    [
+        (CONF_HOST, "192.168.1.11", panel_ops.ENV_PANEL, "office"),
+        (CONF_MQTT_HOST, "new.broker", panel_ops.ENV_MQTT_HOST, "new.broker"),
+        (CONF_MQTT_PORT, 8883, panel_ops.ENV_MQTT_PORT, "8883"),
+        (CONF_MQTT_USERNAME, "new-user", panel_ops.ENV_MQTT_USERNAME, "new-user"),
+        (CONF_MQTT_PASSWORD, "new-password", panel_ops.ENV_MQTT_PASSWORD, "new-password"),
+        (
+            CONF_BLE_OBSERVER_ALLOWLIST_JSON,
+            '[{"address":"11:22:33:44:55:66"}]',
+            panel_ops.ENV_BLE_OBSERVER_ALLOWLIST_JSON,
+            '[{"address":"11:22:33:44:55:66"}]',
+        ),
+    ],
+    ids=["panel-host", "mqtt-host", "mqtt-port", "mqtt-username", "mqtt-password", "allowlist"],
+)
+async def test_reconfigure_selected_observer_restarts_after_runtime_env_write(
+    hass: HomeAssistant,
+    payload_dir: Path,
+    changed_key: str,
+    new_value: Any,
+    expected_env_key: str,
+    expected_env_value: str,
+) -> None:
+    old_allowlist = '[{"address":"AA:BB:CC:DD:EE:FF"}]'
+    entry = _full_entry(
+        hass,
+        **{
+            CONF_COMPONENTS: {
+                COMPONENT_BRIDGE: True,
+                COMPONENT_BLE_OBSERVER: True,
+            },
+            CONF_BLE_SCANNER_ENABLED: False,
+            CONF_BLE_OBSERVER_ALLOWLIST_JSON: old_allowlist,
+        },
+    )
+    hass.config_entries.async_update_entry(
+        entry,
+        version=config_flow.BrilliantMqttConfigFlow.VERSION,
+    )
+    old_env = panel_ops.render_env(
+        panel="office",
+        mesh_priority=0,
+        mqtt_host="old.broker",
+        mqtt_port=1883,
+        mqtt_username="brilliant",
+        mqtt_password="oldbroker",
+        ble_observer_enabled=True,
+        ble_observer_allowlist_json=old_allowlist,
+    )
+    shell = FakeShell(
+        responses={
+            panel_ops.INSPECT_COMMAND: RunResult(
+                0,
+                "unit=1\nenv=1\nenabled=1\nactive=1\nsunit=1\nsenv=1\npayload=1\n0.5.7\n",
+                "",
+            ),
+            f"cat {PANEL_ENV_FILE}": RunResult(0, old_env, ""),
+            panel_ops.BLE_OBSERVER_INSPECT_COMMAND: RunResult(
+                0,
+                "unit=1\nenabled=1\nactive=1\nsunit=1\npayload=1\n",
+                "",
+            ),
+        }
+    )
+    refresh_observer = components.refresh_ble_observer
+
+    async def assert_env_then_refresh(
+        target_hass: HomeAssistant,
+        target: PanelShell,
+        data: Mapping[str, Any],
+    ) -> None:
+        assert target_hass is hass
+        fake_target = cast(FakeShell, target)
+        live_env = next(
+            chunk for path, chunk, _mode in fake_target.uploads if path == PANEL_ENV_FILE
+        )
+        assert panel_ops.parse_env(live_env.decode())[expected_env_key] == expected_env_value
+        await refresh_observer(target_hass, target, data)
+
+    result = await start_reconfigure(hass, entry)
+    with (
+        patch.object(config_flow, "AsyncsshShell", return_value=shell),
+        patch.object(
+            components,
+            "refresh_ble_observer",
+            side_effect=assert_env_then_refresh,
+        ) as activate,
+    ):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {
+                **reconfigure_input(entry),
+                changed_key: new_value,
+            },
+        )
+
+    assert result["type"] == "abort" and result["reason"] == "reconfigure_successful"
+    assert activate.await_count == 1
+    assert activate.call_args.args[0:2] == (hass, shell)
+    bridge_restart = shell.commands.index("systemctl restart brilliant-mqtt")
+    observer_enable = shell.commands.index("systemctl enable brilliant-ble-observer")
+    observer_restart = shell.commands.index("systemctl restart brilliant-ble-observer")
+    assert bridge_restart < observer_enable < observer_restart
+    assert shell.commands.count("systemctl restart brilliant-mqtt") == 1
+    assert not any(
+        "bluetoothctl" in command or "bluetoothd" in command for command in shell.commands
+    )
+    assert entry.data[changed_key] == new_value
+
+
+async def test_selected_observer_refresh_retry_reinstalls_after_failed_proof_quarantine(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """A failed refresh removes unsafe state; the identical retry rebuilds it fully."""
+    old_allowlist = '[{"address":"AA:BB:CC:DD:EE:FF"}]'
+    new_allowlist = '[{"address":"11:22:33:44:55:66"}]'
+    previous: dict[str, Any] = {
+        CONF_HOST: "192.168.1.10",
+        CONF_ROOT_PASSWORD: "panelpass",
+        CONF_MQTT_HOST: "broker",
+        CONF_MQTT_PORT: 1883,
+        CONF_MQTT_USERNAME: "user",
+        CONF_MQTT_PASSWORD: "password",
+        CONF_COMPONENTS: {
+            COMPONENT_BRIDGE: True,
+            COMPONENT_BLE_OBSERVER: True,
+        },
+        CONF_BLE_OBSERVER_ALLOWLIST_JSON: old_allowlist,
+    }
+    updated = {**previous, CONF_BLE_OBSERVER_ALLOWLIST_JSON: new_allowlist}
+    existing = panel_ops.render_env(
+        panel="office",
+        mesh_priority=0,
+        mqtt_host="broker",
+        mqtt_port=1883,
+        mqtt_username="user",
+        mqtt_password="password",
+        ble_observer_enabled=True,
+        ble_observer_allowlist_json=new_allowlist,
+    )
+    unhealthy = FakeShell(
+        responses={
+            f"cat {PANEL_ENV_FILE}": RunResult(0, existing, ""),
+            panel_ops.BLE_OBSERVER_INSPECT_COMMAND: RunResult(
+                0,
+                "unit=1\nenabled=1\nactive=0\nsunit=1\npayload=1\n",
+                "",
+            ),
+            panel_ops.BLE_OBSERVER_ACTIVE_COMMAND: RunResult(3, "inactive\n", ""),
+        }
+    )
+    healthy = FakeShell(
+        responses={
+            f"cat {PANEL_ENV_FILE}": RunResult(0, existing, ""),
+            panel_ops.BLE_OBSERVER_INSPECT_COMMAND: RunResult(
+                0,
+                "unit=1\nenabled=1\nactive=1\nsunit=1\npayload=1\n",
+                "",
+            ),
+        }
+    )
+
+    with patch.object(
+        config_flow,
+        "AsyncsshShell",
+        side_effect=[unhealthy, healthy],
+    ):
+        with pytest.raises(panel_ops.PanelOpError):
+            await config_flow._restart_changed_ble_observer(
+                hass,
+                previous,
+                updated,
+                host_key="ssh-ed25519 STORED",
+            )
+        await config_flow._restart_changed_ble_observer(
+            hass,
+            previous,
+            updated,
+            host_key="ssh-ed25519 STORED",
+        )
+
+    assert any(PANEL_BLE_OBSERVER_UNIT_FILE in command for command in unhealthy.commands)
+    assert healthy.dir_uploads == [
+        (str(payload_dir / "ble_observer"), "/var/brilliant-mqtt/ble_observer.staging")
+    ]
+    assert any(path == PANEL_BLE_OBSERVER_UNIT_FILE for path, _data, _mode in healthy.uploads)
+    assert f"systemctl restart {BLE_OBSERVER_SERVICE_NAME}" in healthy.commands
+
+
+async def test_reconfigure_unchanged_selected_observer_is_not_restarted(
+    hass: HomeAssistant,
+) -> None:
+    entry = _full_entry(
+        hass,
+        **{
+            CONF_COMPONENTS: {
+                COMPONENT_BRIDGE: True,
+                COMPONENT_BLE_OBSERVER: True,
+            },
+            CONF_BLE_OBSERVER_ALLOWLIST_JSON: '[{"address":"AA:BB:CC:DD:EE:FF"}]',
+        },
+    )
+    result = await start_reconfigure(hass, entry)
+
+    with (
+        patch(APPLY, return_value="ssh-ed25519 STORED"),
+        patch.object(components, "refresh_ble_observer") as activate,
+    ):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            reconfigure_input(entry),
+        )
+
+    assert result["type"] == "abort" and result["reason"] == "reconfigure_successful"
+    activate.assert_not_awaited()
+
+
+async def test_reconfigure_never_restarts_unselected_observer(hass: HomeAssistant) -> None:
+    entry = _full_entry(
+        hass,
+        **{
+            CONF_COMPONENTS: {
+                COMPONENT_BRIDGE: True,
+                COMPONENT_BLE_OBSERVER: False,
+            },
+            CONF_BLE_OBSERVER_ALLOWLIST_JSON: "[]",
+        },
+    )
+    result = await start_reconfigure(hass, entry)
+
+    with (
+        patch(APPLY, return_value="ssh-ed25519 STORED"),
+        patch.object(components, "refresh_ble_observer") as activate,
+    ):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            reconfigure_input(entry, ble_observer=False),
+        )
+
+    assert result["type"] == "abort" and result["reason"] == "reconfigure_successful"
+    activate.assert_not_awaited()
+
+
+async def test_reconfigure_observer_removal_never_restarts_it(
+    hass: HomeAssistant,
+    patch_installs: Any,
+) -> None:
+    entry = _full_entry(
+        hass,
+        **{
+            CONF_COMPONENTS: {
+                COMPONENT_BRIDGE: True,
+                COMPONENT_BLE_OBSERVER: True,
+            },
+            CONF_BLE_OBSERVER_ALLOWLIST_JSON: '[{"address":"AA:BB:CC:DD:EE:FF"}]',
+        },
+    )
+    result = await start_reconfigure(hass, entry)
+
+    with (
+        patch(APPLY, return_value="ssh-ed25519 STORED"),
+        patch.object(components, "refresh_ble_observer") as activate,
+    ):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            reconfigure_input(entry, ble_observer=False),
+        )
+
+    assert result["type"] == "abort" and result["reason"] == "reconfigure_successful"
+    assert patch_installs.removed(COMPONENT_BLE_OBSERVER)
+    activate.assert_not_awaited()
+
+
+def _oversized_ble_allowlist() -> str:
+    return json.dumps([{"address": f"AA:BB:CC:DD:EE:{index:02X}"} for index in range(65)])
+
+
+@pytest.mark.parametrize(
+    "allowlist",
+    [
+        "{}",
+        '[{"address":"not-a-mac"}]',
+        '[{"address":"AA:BB:CC:DD:EE:FF","extra":true}]',
+        '[{"ibeacon_uuid":"fda50693-a4e2-4fb1-afcf-c6eb07647825","ibeacon_major":1}]',
+        '[{"ibeacon_uuid":"fda50693-a4e2-4fb1-afcf-c6eb07647825",'
+        '"ibeacon_major":true,"ibeacon_minor":2}]',
+        '[{"address":"AA:BB:CC:DD:EE:FF"},{"address":"aa-bb-cc-dd-ee-ff"}]',
+        '[{"address":"AA:BB:CC:DD:EE:FF\\u0000"}]',
+        "[\x00]",
+        "[" + (" " * (65 * 1024)) + "]",
+        _oversized_ble_allowlist(),
+    ],
+    ids=[
+        "not-array",
+        "bad-address",
+        "unknown-key",
+        "partial-ibeacon",
+        "boolean-major",
+        "normalized-duplicate",
+        "escaped-control",
+        "raw-control",
+        "oversized-text",
+        "too-many-identities",
+    ],
+)
+async def test_reconfigure_rejects_unbounded_or_invalid_ble_identity_data(
+    hass: HomeAssistant,
+    allowlist: str,
+) -> None:
+    entry = _full_entry(hass)
+    before = dict(entry.data)
+    result = await start_reconfigure(hass, entry)
+    submitted = {
+        **reconfigure_input(entry, ble_observer=True),
+        CONF_BLE_OBSERVER_ALLOWLIST_JSON: allowlist,
+    }
+
+    with patch(APPLY) as apply:
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], submitted)
+
+    assert result["type"] == "form" and result["step_id"] == "reconfigure"
+    assert result["errors"] == {CONF_BLE_OBSERVER_ALLOWLIST_JSON: "invalid_value"}
+    apply.assert_not_called()
+    assert entry.data == before
+
+
+async def test_reconfigure_does_not_redisplay_unsafe_ble_allowlist(
+    hass: HomeAssistant,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    entry = _full_entry(hass)
+    result = await start_reconfigure(hass, entry)
+    unsafe = '[{"address":"SENTINEL\x00"}]'
+
+    with patch(APPLY) as apply:
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {
+                **reconfigure_input(entry, ble_observer=True),
+                CONF_BLE_OBSERVER_ALLOWLIST_JSON: unsafe,
+            },
+        )
+
+    assert result["errors"] == {CONF_BLE_OBSERVER_ALLOWLIST_JSON: "invalid_value"}
+    assert _suggested_values(result)[CONF_BLE_OBSERVER_ALLOWLIST_JSON] == "[]"
+    assert "SENTINEL" not in repr(_suggested_values(result))
+    assert "SENTINEL" not in caplog.text
+    apply.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1587,6 +2267,9 @@ async def test_migration_adds_safe_defaults_and_preserves_legacy_secrets(
     assert entry.version == config_flow.BrilliantMqttConfigFlow.VERSION
     assert entry.data[CONF_COMPONENTS][COMPONENT_HA_MIRROR] is False
     assert entry.data[CONF_COMPONENTS][COMPONENT_VOICE] is True
+    assert entry.data[CONF_COMPONENTS][COMPONENT_BLE_OBSERVER] is False
+    assert entry.data[CONF_BLE_SCANNER_ENABLED] is False
+    assert entry.data[CONF_BLE_OBSERVER_ALLOWLIST_JSON] == "[]"
     assert entry.data[CONF_HA_CONTROL_LABEL] == "legacy_label"
     assert entry.data[CONF_HA_CONTROL_ENABLED] is False
     assert entry.data[CONF_HA_CONTROL_DOMAINS] == ["light", "switch"]
@@ -1627,3 +2310,29 @@ async def test_migration_does_not_overwrite_new_label_and_rejects_future_version
     future.add_to_hass(hass)
     assert await async_migrate_entry(hass, future) is False
     assert future.version == config_flow.BrilliantMqttConfigFlow.VERSION + 1
+
+
+async def test_v3_migration_forces_both_ble_kill_switches_off(
+    hass: HomeAssistant,
+) -> None:
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        version=3,
+        data={
+            CONF_PANEL: "office",
+            CONF_COMPONENTS: {
+                COMPONENT_BRIDGE: True,
+                COMPONENT_BLE_OBSERVER: True,
+            },
+            CONF_BLE_SCANNER_ENABLED: True,
+            CONF_BLE_OBSERVER_ALLOWLIST_JSON: '[{"address":"AA:BB:CC:DD:EE:FF"}]',
+        },
+    )
+    entry.add_to_hass(hass)
+
+    assert await async_migrate_entry(hass, entry) is True
+
+    assert entry.version == config_flow.BrilliantMqttConfigFlow.VERSION
+    assert entry.data[CONF_COMPONENTS][COMPONENT_BLE_OBSERVER] is False
+    assert entry.data[CONF_BLE_SCANNER_ENABLED] is False
+    assert entry.data[CONF_BLE_OBSERVER_ALLOWLIST_JSON] == "[]"

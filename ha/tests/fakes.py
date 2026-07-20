@@ -7,6 +7,8 @@ import asyncio
 from custom_components.brilliant_mqtt.shell import RunResult
 
 _OK = RunResult(0, "", "")
+_DEFAULT_INACTIVE_BLE_PROBE = "systemctl is-active brilliant-ble-observer 2>/dev/null"
+_INACTIVE = RunResult(3, "inactive\n", "")
 
 
 class FakeShell:
@@ -68,7 +70,11 @@ class FakeShell:
         self.commands.append(command)  # recorded even when it raises: proves it was attempted
         if command in self.run_errors:
             raise self.run_errors[command]
-        return self.responses.get(command, _OK)
+        if command in self.responses:
+            return self.responses[command]
+        if command == _DEFAULT_INACTIVE_BLE_PROBE:
+            return _INACTIVE
+        return _OK
 
     async def put_bytes(self, data: bytes, remote_path: str, mode: int) -> None:
         self._require_connected()
@@ -85,3 +91,26 @@ class FakeShell:
     async def put_file(self, local_path: str, remote_path: str, mode: int) -> None:
         self._require_connected()
         self.file_uploads.append((local_path, remote_path, mode))
+
+
+class SequencedResponseShell(FakeShell):
+    """FakeShell whose selected commands return a finite state-transition sequence."""
+
+    def __init__(
+        self,
+        response_sequences: dict[str, list[RunResult]],
+        responses: dict[str, RunResult] | None = None,
+    ) -> None:
+        super().__init__(responses=responses)
+        if any(not sequence for sequence in response_sequences.values()):
+            raise ValueError("response sequences must not be empty")
+        self._response_sequences = {
+            command: list(sequence) for command, sequence in response_sequences.items()
+        }
+
+    async def run(self, command: str) -> RunResult:
+        if sequence := self._response_sequences.get(command):
+            self._require_connected()
+            self.commands.append(command)
+            return sequence.pop(0)
+        return await super().run(command)

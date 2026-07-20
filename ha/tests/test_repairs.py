@@ -27,8 +27,10 @@ from pytest_homeassistant_custom_component.common import (
 )
 from pytest_homeassistant_custom_component.typing import MqttMockHAClient
 
+from custom_components.brilliant_mqtt import panel_ops
 from custom_components.brilliant_mqtt.const import DOMAIN
 from custom_components.brilliant_mqtt.manager import PanelManager
+from custom_components.brilliant_mqtt.shell import RunResult
 from tests.fakes import FakeShell
 from tests.test_init import ENTRY_DATA
 
@@ -49,6 +51,7 @@ async def test_escalation_raises_repair_issue_and_recovery_clears_it(
     hass: HomeAssistant,
     mqtt_mock: MqttMockHAClient,
     payload_dir: Path,
+    fake_shell: FakeShell,
 ) -> None:
     """An auto-repair-off outage past grace must surface a repair ISSUE (not a
     persistent notification), and a later recovery must delete it."""
@@ -90,6 +93,7 @@ async def test_removing_entry_deletes_its_repair_issue(
     hass: HomeAssistant,
     mqtt_mock: MqttMockHAClient,
     payload_dir: Path,
+    fake_shell: FakeShell,
 ) -> None:
     """Deleting a config entry with an active repair issue must not orphan the issue."""
     entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
@@ -192,6 +196,43 @@ async def test_uninstall_failure_raises_translated_uninstall_failed(
     # The same failure was surfaced as a repair issue.
     issue = ir.async_get(hass).async_get_issue(DOMAIN, f"needs_attention_{entry.entry_id}")
     assert issue is not None
+
+
+async def test_uninstall_retains_agent_when_observer_stop_is_unproven(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """Never delete the main payload around an ambiguously active observer process."""
+    shell = FakeShell(
+        responses={
+            "systemctl disable --now brilliant-ble-observer": RunResult(
+                1,
+                "",
+                "disable failed",
+            ),
+            panel_ops.BLE_OBSERVER_ACTIVE_COMMAND: RunResult(
+                255,
+                "inactive\n",
+                "transport lost",
+            ),
+        }
+    )
+    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+        entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+        entry.add_to_hass(hass)
+        manager = PanelManager(hass, entry, asyncio.Lock())
+
+        with pytest.raises(HomeAssistantError) as err:
+            await manager.async_uninstall()
+
+    assert err.value.translation_key == "uninstall_failed"
+    assert shell.commands[:2] == [
+        "systemctl disable --now brilliant-ble-observer",
+        panel_ops.BLE_OBSERVER_ACTIVE_COMMAND,
+    ]
+    assert not any("brilliant-mqtt.service /etc/brilliant-mqtt.env" in c for c in shell.commands)
+    assert not any("rm -rf /var/brilliant-mqtt " in c for c in shell.commands)
+    assert shell.uploads == []
 
 
 async def test_update_host_key_changed_raises_translated_error(

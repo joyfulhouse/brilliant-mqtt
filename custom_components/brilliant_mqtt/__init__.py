@@ -19,9 +19,11 @@ from homeassistant.helpers.service import async_extract_config_entry_ids
 from homeassistant.helpers.typing import ConfigType
 
 from .const import (
+    COMPONENT_BLE_OBSERVER,
     COMPONENT_BRIDGE,
     COMPONENT_HA_MIRROR,
     COMPONENT_VOICE,
+    CONF_BLE_OBSERVER_ALLOWLIST_JSON,
     CONF_BLE_SCANNER_ENABLED,
     CONF_COMPONENTS,
     CONF_HA_CONTROL_DOMAINS,
@@ -35,6 +37,7 @@ from .const import (
     CONF_SCENE_PANEL,
     CONF_VOICE_ENABLED,
     CONFIG_ENTRY_VERSION,
+    DEFAULT_BLE_OBSERVER_ALLOWLIST_JSON,
     DEFAULT_BLE_SCANNER_ENABLED,
     DEFAULT_HA_CONTROL_DOMAINS,
     DEFAULT_HA_CONTROL_ENABLED,
@@ -297,6 +300,7 @@ async def async_migrate_entry(hass: HomeAssistant, entry: BrilliantMqttConfigEnt
     components = dict(data.get(CONF_COMPONENTS) or {})
     components[COMPONENT_BRIDGE] = True
     components[COMPONENT_HA_MIRROR] = False
+    components[COMPONENT_BLE_OBSERVER] = False
     data[CONF_COMPONENTS] = components
 
     if CONF_HA_CONTROL_LABEL not in data:
@@ -312,7 +316,10 @@ async def async_migrate_entry(hass: HomeAssistant, entry: BrilliantMqttConfigEnt
     data.setdefault(CONF_MAX_MIRRORED_ENTITIES, DEFAULT_MAX_MIRRORED_ENTITIES)
     data.setdefault(CONF_SCENE_PANEL, data.get(CONF_PANEL, ""))
     data.setdefault(CONF_SCENE_ACTIONS, {})
-    data.setdefault(CONF_BLE_SCANNER_ENABLED, DEFAULT_BLE_SCANNER_ENABLED)
+    # v4 introduces two independent BLE kill switches. Force both off for every
+    # pre-v4 entry even if experimental keys were manually injected earlier.
+    data[CONF_BLE_SCANNER_ENABLED] = DEFAULT_BLE_SCANNER_ENABLED
+    data[CONF_BLE_OBSERVER_ALLOWLIST_JSON] = DEFAULT_BLE_OBSERVER_ALLOWLIST_JSON
     hass.config_entries.async_update_entry(entry, data=data, version=CONFIG_ENTRY_VERSION)
     return True
 

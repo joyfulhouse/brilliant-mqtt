@@ -13,6 +13,7 @@ from homeassistant.helpers import label_registry as lr
 from . import BrilliantMqttConfigEntry
 from .ble_scanner import disabled_scanner_diagnostics
 from .const import (
+    CONF_BLE_OBSERVER_ALLOWLIST_JSON,
     CONF_HA_CONTROL_DOMAINS,
     CONF_HA_CONTROL_ENABLED,
     CONF_HA_CONTROL_LABEL,
@@ -33,7 +34,12 @@ from .const import (
 )
 from .ha_control import HaControlPlane
 
-_TO_REDACT = {CONF_ROOT_PASSWORD, CONF_MQTT_PASSWORD, CONF_HA_MIRROR_TOKEN}
+_TO_REDACT = {
+    CONF_ROOT_PASSWORD,
+    CONF_MQTT_PASSWORD,
+    CONF_HA_MIRROR_TOKEN,
+    CONF_BLE_OBSERVER_ALLOWLIST_JSON,
+}
 
 
 async def async_get_config_entry_diagnostics(

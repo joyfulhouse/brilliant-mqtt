@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from homeassistant.const import Platform
 
 DOMAIN = "brilliant_mqtt"
-CONFIG_ENTRY_VERSION = 3
+CONFIG_ENTRY_VERSION = 4
 PLATFORMS: list[Platform] = [
     Platform.BINARY_SENSOR,
     Platform.BUTTON,
@@ -44,6 +46,15 @@ CONF_HUE_CA_CERT = "hue_ca_cert"
 # independent from the on-panel observer and remains off when absent.
 CONF_BLE_SCANNER_ENABLED = "ble_scanner_enabled"
 DEFAULT_BLE_SCANNER_ENABLED = False
+CONF_BLE_OBSERVER_ALLOWLIST_JSON = "ble_observer_allowlist_json"
+DEFAULT_BLE_OBSERVER_ALLOWLIST_JSON = "[]"
+
+
+def ble_observer_allowlist_json(data: Mapping[str, object]) -> str:
+    """Return the stored allowlist or a fail-closed default for malformed legacy data."""
+    value = data.get(CONF_BLE_OBSERVER_ALLOWLIST_JSON, DEFAULT_BLE_OBSERVER_ALLOWLIST_JSON)
+    return value if isinstance(value, str) else DEFAULT_BLE_OBSERVER_ALLOWLIST_JSON
+
 
 # Home Assistant-owned MQTT control plane. These global values are copied to each
 # panel entry by the configuration vertical slice; the singleton elects the enabled
@@ -71,6 +82,7 @@ COMPONENT_WIFI_WATCHDOG = "wifi_watchdog"
 COMPONENT_BUS_WATCHDOG = "bus_watchdog"
 COMPONENT_HA_MIRROR = "ha_mirror"
 COMPONENT_HUE_CA = "hue_ca"
+COMPONENT_BLE_OBSERVER = "ble_observer"
 
 # Internally managed config-entry state (never shown in a config-flow form).
 DATA_SSH_HOST_KEY = "ssh_host_key"  # TOFU-pinned on first successful connect
@@ -190,6 +202,12 @@ WIFI_WATCHDOG_SERVICE_NAME = "brilliant-wifi-watchdog"
 PANEL_BUS_WATCHDOG_DIR = f"{PANEL_VAR_DIR}/bus_watchdog"
 PANEL_BUS_WATCHDOG_UNIT_FILE = "/etc/systemd/system/brilliant-bus-watchdog.service"
 BUS_WATCHDOG_SERVICE_NAME = "brilliant-bus-watchdog"
+
+# On-panel passive BLE observer paths. Its code and pure-Python D-Bus dependency
+# are isolated under the bridge's OTA-proof /var tree, with a separate unit.
+PANEL_BLE_OBSERVER_DIR = f"{PANEL_VAR_DIR}/ble_observer"
+PANEL_BLE_OBSERVER_UNIT_FILE = "/etc/systemd/system/brilliant-ble-observer.service"
+BLE_OBSERVER_SERVICE_NAME = "brilliant-ble-observer"
 
 # On-panel diyHue CA-recovery hook paths. Code tree lives under the OTA-proof /var
 # bridge dir like the other watchdogs; the operator's injected CA PEM lives under its

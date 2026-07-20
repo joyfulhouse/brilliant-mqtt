@@ -25,9 +25,11 @@ from custom_components.brilliant_mqtt import (
 from custom_components.brilliant_mqtt.ble_protocol import advertisement_topic
 from custom_components.brilliant_mqtt.ble_scanner import observer_status_topic
 from custom_components.brilliant_mqtt.const import (
+    COMPONENT_BLE_OBSERVER,
     COMPONENT_BRIDGE,
     COMPONENT_HA_MIRROR,
     COMPONENT_VOICE,
+    CONF_BLE_OBSERVER_ALLOWLIST_JSON,
     CONF_BLE_SCANNER_ENABLED,
     CONF_COMPONENTS,
     CONF_HA_CONTROL_DOMAINS,
@@ -84,7 +86,9 @@ ENTRY_DATA = {
 
 @pytest.mark.allow_lingering_timers
 async def test_entry_sets_up_and_tracks_availability(
-    hass: HomeAssistant, mqtt_mock: MqttMockHAClient
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    fake_shell: object,
 ) -> None:
     from pytest_homeassistant_custom_component.common import async_fire_mqtt_message
 
@@ -132,7 +136,7 @@ async def test_enabled_ble_bridge_survives_bad_packet_and_reloads_cleanly(
         domain=DOMAIN,
         unique_id="office",
         data={**ENTRY_DATA, CONF_BLE_SCANNER_ENABLED: True},
-        version=3,
+        version=CONFIG_ENTRY_VERSION,
     )
     entry.add_to_hass(hass)
     with patch(
@@ -551,7 +555,9 @@ async def test_migrate_v1_folds_voice_enabled_into_components(hass: HomeAssistan
     assert entry.data[CONF_COMPONENTS][COMPONENT_BRIDGE] is True
     assert entry.data[CONF_COMPONENTS][COMPONENT_VOICE] is True
     assert entry.data[CONF_COMPONENTS][COMPONENT_HA_MIRROR] is False
+    assert entry.data[CONF_COMPONENTS][COMPONENT_BLE_OBSERVER] is False
     assert entry.data[CONF_BLE_SCANNER_ENABLED] is False
+    assert entry.data[CONF_BLE_OBSERVER_ALLOWLIST_JSON] == "[]"
 
 
 async def test_migrate_v1_no_voice_defaults_components_off(hass: HomeAssistant) -> None:
@@ -563,4 +569,7 @@ async def test_migrate_v1_no_voice_defaults_components_off(hass: HomeAssistant) 
         COMPONENT_BRIDGE: True,
         COMPONENT_VOICE: False,
         COMPONENT_HA_MIRROR: False,
+        COMPONENT_BLE_OBSERVER: False,
     }
+    assert entry.data[CONF_BLE_SCANNER_ENABLED] is False
+    assert entry.data[CONF_BLE_OBSERVER_ALLOWLIST_JSON] == "[]"

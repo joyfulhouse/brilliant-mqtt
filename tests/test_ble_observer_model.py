@@ -6,6 +6,7 @@ import json
 from collections.abc import MutableMapping
 from dataclasses import FrozenInstanceError
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 from uuid import UUID
 
@@ -23,6 +24,7 @@ from brilliant_ble_observer.model import (
     AdvertisementEnvelope,
     AllowlistEntry,
     matches_allowlist,
+    normalize_advertisement_instance,
     parse_allowlist,
 )
 
@@ -77,6 +79,32 @@ def test_envelope_normalizes_and_encodes_shared_golden_vector() -> None:
     assert advertisement.manufacturer_data == {76: IBEACON_BYTES}
     assert advertisement.to_payload() == VECTORS["valid_advertisement"]["value"]
     assert advertisement.to_json() == VECTORS["valid_advertisement"]["encoded"]
+
+
+def test_shared_normalization_seam_applies_every_common_field() -> None:
+    """Observation and envelope models share one canonical normalize/apply operation."""
+    raw = SimpleNamespace(
+        adapter_address="11-22-33-44-55-66",
+        address="aa-bb-cc-dd-ee-ff",
+        address_type=" PUBLIC ",
+        rssi=-61,
+        local_name=" Wallet ",
+        tx_power=-59,
+        service_uuids=(BATTERY_UUID.upper(), BATTERY_UUID),
+        service_data={BATTERY_UUID.upper(): bytearray.fromhex("aabbcc")},
+        manufacturer_data={76: memoryview(IBEACON_BYTES)},
+        capture_monotonic_ms=123456789,
+    )
+
+    normalize_advertisement_instance(raw)
+
+    assert raw.adapter_address == "11:22:33:44:55:66"
+    assert raw.address == "AA:BB:CC:DD:EE:FF"
+    assert raw.address_type == "public"
+    assert raw.local_name == "Wallet"
+    assert raw.service_uuids == (BATTERY_UUID,)
+    assert raw.service_data == {BATTERY_UUID: bytes.fromhex("aabbcc")}
+    assert raw.manufacturer_data == {76: IBEACON_BYTES}
 
 
 def test_envelope_is_deeply_immutable() -> None:

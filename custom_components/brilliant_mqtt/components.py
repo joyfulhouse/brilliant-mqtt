@@ -15,7 +15,9 @@ from homeassistant.core import HomeAssistant
 
 from . import manager as _mgr
 from . import panel_ops
+from .component_payloads import SINGLE_UNIT_PAYLOAD_BY_ID, SingleUnitPayloadSpec
 from .const import (
+    COMPONENT_BLE_OBSERVER,
     COMPONENT_BRIDGE,
     COMPONENT_BUS_WATCHDOG,
     COMPONENT_HA_MIRROR,
@@ -36,6 +38,7 @@ from .const import (
     DEFAULT_HA_CONTROL_ENABLED,
     DEFAULT_VOICE_WAKE_WORD,
     VOICE_PAYLOAD_VERSION,
+    ble_observer_allowlist_json,
     panel_device_name,
 )
 from .panel_ops import PanelOpError
@@ -71,6 +74,8 @@ async def _bridge_install(hass: HomeAssistant, shell: PanelShell, data: Mapping[
         mqtt_username=data[CONF_MQTT_USERNAME],
         mqtt_password=data[CONF_MQTT_PASSWORD],
         scene_bridge_enabled=data.get(CONF_HA_CONTROL_ENABLED, DEFAULT_HA_CONTROL_ENABLED) is True,
+        ble_observer_enabled=bool(data.get(CONF_COMPONENTS, {}).get(COMPONENT_BLE_OBSERVER, False)),
+        ble_observer_allowlist_json=ble_observer_allowlist_json(data),
     )
     await panel_ops.deploy_payload(shell, str(payload_dir), version)
     await panel_ops.ensure_configs(shell, unit, env)
@@ -96,54 +101,41 @@ async def _voice_install(hass: HomeAssistant, shell: PanelShell, data: Mapping[s
     await panel_ops.enable_voice(shell)
 
 
-async def _wd_present(shell: PanelShell) -> bool:
-    return (await panel_ops.inspect_wifi_watchdog(shell)).payload_present
+def _single_unit_present(
+    spec: SingleUnitPayloadSpec,
+) -> Callable[[PanelShell], Awaitable[bool]]:
+    async def present(shell: PanelShell) -> bool:
+        return (await spec.inspect(shell)).payload_present
+
+    return present
 
 
-async def _install_watchdog(
+async def _install_single_unit_payload(
     hass: HomeAssistant,
     shell: PanelShell,
     *,
-    service_filename: str,
-    payload_subdir: str,
-    deploy: Callable[[PanelShell, str], Awaitable[None]],
-    ensure_unit: Callable[[PanelShell, str], Awaitable[None]],
-    enable: Callable[[PanelShell], Awaitable[None]],
+    spec: SingleUnitPayloadSpec,
 ) -> None:
-    """Deploy and enable one watchdog from the bundled payload."""
+    """Deploy and enable one single-unit component from the bundled payload."""
     payload_dir = _mgr._payload_dir()
-    unit = await hass.async_add_executor_job((payload_dir / service_filename).read_text)
-    await deploy(shell, str(payload_dir / payload_subdir))
-    await ensure_unit(shell, unit)
-    await enable(shell)
+    unit = await hass.async_add_executor_job((payload_dir / spec.service_filename).read_text)
+    await spec.deploy(shell, str(payload_dir / spec.payload_subdir))
+    await spec.ensure_unit(shell, unit)
+    await spec.enable(shell)
 
 
-async def _wd_install(hass: HomeAssistant, shell: PanelShell, data: Mapping[str, Any]) -> None:
-    await _install_watchdog(
-        hass,
-        shell,
-        service_filename="brilliant-wifi-watchdog.service",
-        payload_subdir="wifi_watchdog",
-        deploy=panel_ops.deploy_wifi_watchdog,
-        ensure_unit=panel_ops.ensure_wifi_watchdog_unit,
-        enable=panel_ops.enable_wifi_watchdog,
-    )
+def _single_unit_installer(
+    spec: SingleUnitPayloadSpec,
+) -> Callable[[HomeAssistant, PanelShell, Mapping[str, Any]], Awaitable[None]]:
+    async def install(
+        hass: HomeAssistant,
+        shell: PanelShell,
+        data: Mapping[str, Any],
+    ) -> None:
+        del data
+        await _install_single_unit_payload(hass, shell, spec=spec)
 
-
-async def _bus_present(shell: PanelShell) -> bool:
-    return (await panel_ops.inspect_bus_watchdog(shell)).payload_present
-
-
-async def _bus_install(hass: HomeAssistant, shell: PanelShell, data: Mapping[str, Any]) -> None:
-    await _install_watchdog(
-        hass,
-        shell,
-        service_filename="brilliant-bus-watchdog.service",
-        payload_subdir="bus_watchdog",
-        deploy=panel_ops.deploy_bus_watchdog,
-        ensure_unit=panel_ops.ensure_bus_watchdog_unit,
-        enable=panel_ops.enable_bus_watchdog,
-    )
+    return install
 
 
 async def _hue_ca_present(shell: PanelShell) -> bool:
@@ -175,6 +167,49 @@ async def _hamirror_install(
     raise PanelOpError("HA mirror is deprecated and cannot be installed")
 
 
+async def _apply_ble_observer(
+    hass: HomeAssistant,
+    shell: PanelShell,
+    data: Mapping[str, Any],
+    *,
+    activate: Callable[[PanelShell], Awaitable[None]],
+) -> None:
+    """Rebuild/configure the observer, then use one proof-bearing activation path."""
+    spec = SINGLE_UNIT_PAYLOAD_BY_ID[COMPONENT_BLE_OBSERVER]
+    payload_dir = _mgr._payload_dir()
+    unit = await hass.async_add_executor_job((payload_dir / spec.service_filename).read_text)
+    await spec.deploy(shell, str(payload_dir / spec.payload_subdir))
+    await panel_ops.configure_ble_observer_env(
+        shell,
+        enabled=True,
+        allowlist_json=ble_observer_allowlist_json(data),
+    )
+    await spec.ensure_unit(shell, unit)
+    await activate(shell)
+
+
+async def _ble_observer_install(
+    hass: HomeAssistant,
+    shell: PanelShell,
+    data: Mapping[str, Any],
+) -> None:
+    """Deploy/configure/start the observer without controlling bridge or BlueZ."""
+    spec = SINGLE_UNIT_PAYLOAD_BY_ID[COMPONENT_BLE_OBSERVER]
+    await _apply_ble_observer(hass, shell, data, activate=spec.enable)
+
+
+async def refresh_ble_observer(
+    hass: HomeAssistant,
+    shell: PanelShell,
+    data: Mapping[str, Any],
+) -> None:
+    """Self-heal all observer assets and restart onto the desired runtime config."""
+    activate = SINGLE_UNIT_PAYLOAD_BY_ID[COMPONENT_BLE_OBSERVER].activate_updated
+    if activate is None:
+        raise PanelOpError("BLE observer update activation is not configured")
+    await _apply_ble_observer(hass, shell, data, activate=activate)
+
+
 REGISTRY: dict[str, Component] = {
     COMPONENT_BRIDGE: Component(
         id=COMPONENT_BRIDGE,
@@ -196,20 +231,20 @@ REGISTRY: dict[str, Component] = {
     ),
     COMPONENT_WIFI_WATCHDOG: Component(
         id=COMPONENT_WIFI_WATCHDOG,
-        label="Wi-Fi watchdog",
+        label=SINGLE_UNIT_PAYLOAD_BY_ID[COMPONENT_WIFI_WATCHDOG].label,
         locked=False,
         default_enabled=True,
-        present=_wd_present,
-        install=_wd_install,
+        present=_single_unit_present(SINGLE_UNIT_PAYLOAD_BY_ID[COMPONENT_WIFI_WATCHDOG]),
+        install=_single_unit_installer(SINGLE_UNIT_PAYLOAD_BY_ID[COMPONENT_WIFI_WATCHDOG]),
         remove=panel_ops.uninstall_wifi_watchdog,
     ),
     COMPONENT_BUS_WATCHDOG: Component(
         id=COMPONENT_BUS_WATCHDOG,
-        label="Bus watchdog",
+        label=SINGLE_UNIT_PAYLOAD_BY_ID[COMPONENT_BUS_WATCHDOG].label,
         locked=False,
         default_enabled=True,
-        present=_bus_present,
-        install=_bus_install,
+        present=_single_unit_present(SINGLE_UNIT_PAYLOAD_BY_ID[COMPONENT_BUS_WATCHDOG]),
+        install=_single_unit_installer(SINGLE_UNIT_PAYLOAD_BY_ID[COMPONENT_BUS_WATCHDOG]),
         remove=panel_ops.uninstall_bus_watchdog,
     ),
     COMPONENT_HA_MIRROR: Component(
@@ -230,6 +265,15 @@ REGISTRY: dict[str, Component] = {
         present=_hue_ca_present,
         install=_hue_ca_install,
         remove=panel_ops.uninstall_hue_ca,
+    ),
+    COMPONENT_BLE_OBSERVER: Component(
+        id=COMPONENT_BLE_OBSERVER,
+        label=SINGLE_UNIT_PAYLOAD_BY_ID[COMPONENT_BLE_OBSERVER].label,
+        locked=False,
+        default_enabled=False,
+        present=_single_unit_present(SINGLE_UNIT_PAYLOAD_BY_ID[COMPONENT_BLE_OBSERVER]),
+        install=_ble_observer_install,
+        remove=panel_ops.uninstall_ble_observer,
     ),
 }
 

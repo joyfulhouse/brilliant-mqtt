@@ -10,6 +10,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry, async_
 from pytest_homeassistant_custom_component.typing import MqttMockHAClient
 
 from custom_components.brilliant_mqtt.const import (
+    CONF_BLE_OBSERVER_ALLOWLIST_JSON,
     CONF_BLE_SCANNER_ENABLED,
     CONF_HA_CONTROL_DOMAINS,
     CONF_HA_CONTROL_ENABLED,
@@ -20,6 +21,7 @@ from custom_components.brilliant_mqtt.const import (
     CONF_ROOM_OVERRIDES,
     CONF_SCENE_ACTIONS,
     CONF_SCENE_PANEL,
+    CONFIG_ENTRY_VERSION,
     DOMAIN,
 )
 from custom_components.brilliant_mqtt.diagnostics import async_get_config_entry_diagnostics
@@ -33,6 +35,7 @@ async def test_diagnostics_redact_secrets(
     mqtt_mock: MqttMockHAClient,
     fake_shell: FakeShell,
     payload_dir: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     from homeassistant.helpers import entity_registry as er
     from homeassistant.helpers import label_registry as lr
@@ -40,6 +43,11 @@ async def test_diagnostics_redact_secrets(
     mirror_token = "diagnostics-must-never-expose-this-token"
     action_secret = "diagnostics-must-never-expose-action-data"
     room_secret = "diagnostics-must-never-expose-room-mapping"
+    allowlist_secret = (
+        '[{"address":"D0:11:22:33:44:55"},'
+        '{"ibeacon_uuid":"fda50693-a4e2-4fb1-afcf-c6eb07647825",'
+        '"ibeacon_major":43124,"ibeacon_minor":9876}]'
+    )
     label = lr.async_get(hass).async_create("controlled")
     entity = er.async_get(hass).async_get_or_create(
         "switch", "test", "diagnostic", original_name="Diagnostic"
@@ -49,10 +57,11 @@ async def test_diagnostics_redact_secrets(
     entry = MockConfigEntry(
         domain=DOMAIN,
         unique_id="office",
-        version=3,
+        version=CONFIG_ENTRY_VERSION,
         data={
             **ENTRY_DATA,
             CONF_HA_MIRROR_TOKEN: mirror_token,
+            CONF_BLE_OBSERVER_ALLOWLIST_JSON: allowlist_secret,
             CONF_HA_CONTROL_ENABLED: True,
             CONF_HA_CONTROL_LABEL: "controlled",
             CONF_ROOM_OVERRIDES: {"Secret area": room_secret},
@@ -104,7 +113,12 @@ async def test_diagnostics_redact_secrets(
     assert diag["entry"]["root_password"] == "**REDACTED**"
     assert diag["entry"]["mqtt_password"] == "**REDACTED**"
     assert diag["entry"][CONF_HA_MIRROR_TOKEN] == "**REDACTED**"
+    assert diag["entry"][CONF_BLE_OBSERVER_ALLOWLIST_JSON] == "**REDACTED**"
     assert mirror_token not in repr(diag)
+    assert allowlist_secret not in repr(diag)
+    assert "D0:11:22:33:44:55" not in repr(diag)
+    assert "fda50693-a4e2-4fb1-afcf-c6eb07647825" not in repr(diag)
+    assert allowlist_secret not in caplog.text
     assert "**REDACTED**" in repr(diag)
     assert diag["entry"]["host"] == "192.168.1.10"  # non-secrets stay visible
     assert CONF_ROOM_OVERRIDES not in diag["entry"]
@@ -145,7 +159,12 @@ async def test_diagnostics_redact_secrets(
 async def test_diagnostics_missing_control_runtime_values_are_none(
     hass: HomeAssistant,
 ) -> None:
-    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA, version=3)
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="office",
+        data=ENTRY_DATA,
+        version=CONFIG_ENTRY_VERSION,
+    )
     entry.add_to_hass(hass)
     # A minimal stand-in is enough: diagnostics must tolerate no singleton runtime data.
     entry.runtime_data = type(
@@ -169,7 +188,7 @@ async def test_ble_diagnostics_are_aggregate_and_redacted(hass: HomeAssistant) -
         domain=DOMAIN,
         unique_id="shed",
         data={**ENTRY_DATA, CONF_PANEL: "shed", CONF_BLE_SCANNER_ENABLED: True},
-        version=3,
+        version=CONFIG_ENTRY_VERSION,
     )
     entry.add_to_hass(hass)
     entry.runtime_data = type(

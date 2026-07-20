@@ -15,10 +15,14 @@ from dataclasses import dataclass
 import asyncssh
 
 from .const import (
+    BLE_OBSERVER_SERVICE_NAME,
     BUS_WATCHDOG_SERVICE_NAME,
+    DEFAULT_BLE_OBSERVER_ALLOWLIST_JSON,
     DEFAULT_REBOOT_JOURNAL_LINES,
     HA_MIRROR_SERVICE_NAME,
     HUE_CA_TIMER_NAME,
+    PANEL_BLE_OBSERVER_DIR,
+    PANEL_BLE_OBSERVER_UNIT_FILE,
     PANEL_BUS_WATCHDOG_DIR,
     PANEL_BUS_WATCHDOG_UNIT_FILE,
     PANEL_ENV_FILE,
@@ -154,6 +158,32 @@ ENV_MQTT_USERNAME = "MQTT_USERNAME"
 ENV_MQTT_PASSWORD = "MQTT_PASSWORD"
 ENV_MESH_PRIORITY = "MESH_PRIORITY"
 ENV_SCENE_BRIDGE_ENABLED = "SCENE_BRIDGE_ENABLED"
+ENV_BLE_OBSERVER_ENABLED = "BLE_OBSERVER_ENABLED"
+ENV_BLE_OBSERVER_ALLOWLIST_JSON = "BLE_OBSERVER_ALLOWLIST_JSON"
+ENV_BLE_OBSERVER_ADAPTER = "BLE_OBSERVER_ADAPTER"
+ENV_BLE_OBSERVER_MAX_EVENTS_PER_SECOND = "BLE_OBSERVER_MAX_EVENTS_PER_SECOND"
+ENV_BLE_OBSERVER_LOG_LEVEL = "BLE_OBSERVER_LOG_LEVEL"
+
+_BLE_OBSERVER_ENV_KEYS = frozenset(
+    {
+        ENV_BLE_OBSERVER_ENABLED,
+        ENV_BLE_OBSERVER_ALLOWLIST_JSON,
+        ENV_BLE_OBSERVER_ADAPTER,
+        ENV_BLE_OBSERVER_MAX_EVENTS_PER_SECOND,
+        ENV_BLE_OBSERVER_LOG_LEVEL,
+    }
+)
+
+
+def render_ble_observer_env(*, enabled: bool, allowlist_json: str) -> str:
+    """Render the observer-only block for the bridge's shared 0600 env file."""
+    return (
+        f"{ENV_BLE_OBSERVER_ENABLED}={1 if enabled else 0}\n"
+        f"{ENV_BLE_OBSERVER_ALLOWLIST_JSON}={_env_quote(allowlist_json)}\n"
+        f"{ENV_BLE_OBSERVER_ADAPTER}={_env_quote('hci0')}\n"
+        f"{ENV_BLE_OBSERVER_MAX_EVENTS_PER_SECOND}=10\n"
+        f"{ENV_BLE_OBSERVER_LOG_LEVEL}={_env_quote('INFO')}\n"
+    )
 
 
 def render_env(
@@ -164,12 +194,18 @@ def render_env(
     mqtt_username: str,
     mqtt_password: str,
     scene_bridge_enabled: bool = False,
+    ble_observer_enabled: bool = False,
+    ble_observer_allowlist_json: str = DEFAULT_BLE_OBSERVER_ALLOWLIST_JSON,
 ) -> str:
     """Render /etc/brilliant-mqtt.env — exactly what the agent's config.py reads.
 
     String values are quoted via _env_quote (user-typed broker passwords routinely
     contain `#`, quotes, `$`, backslash); the int fields are safe and stay bare.
     """
+    observer_env = render_ble_observer_env(
+        enabled=ble_observer_enabled,
+        allowlist_json=ble_observer_allowlist_json,
+    )
     return (
         f"{ENV_PANEL}={_env_quote(panel)}\n"
         f"{ENV_MQTT_HOST}={_env_quote(mqtt_host)}\n"
@@ -178,6 +214,7 @@ def render_env(
         f"{ENV_MQTT_PASSWORD}={_env_quote(mqtt_password)}\n"
         f"{ENV_MESH_PRIORITY}={mesh_priority}\n"
         f"{ENV_SCENE_BRIDGE_ENABLED}={1 if scene_bridge_enabled else 0}\n"
+        f"{observer_env}"
         f"LOG_LEVEL=INFO\n"
     )
 
@@ -240,6 +277,47 @@ async def write_env(shell: PanelShell, env_content: str) -> None:
     env_bytes = env_content.encode()
     await shell.put_bytes(env_bytes, PANEL_ENV_FILE, 0o600)
     await shell.put_bytes(env_bytes, _STAGED_ENV, 0o600)
+
+
+def _with_ble_observer_env(
+    existing: str,
+    *,
+    enabled: bool,
+    allowlist_json: str,
+) -> str:
+    """Replace only observer-owned variables in an existing shared env file."""
+    kept: list[str] = []
+    for line in existing.splitlines():
+        stripped = line.strip()
+        key = stripped.partition("=")[0].strip() if "=" in stripped else ""
+        if key not in _BLE_OBSERVER_ENV_KEYS:
+            kept.append(line)
+    prefix = "\n".join(kept).rstrip("\n")
+    observer = render_ble_observer_env(
+        enabled=enabled,
+        allowlist_json=allowlist_json,
+    ).rstrip("\n")
+    return f"{prefix}\n{observer}\n" if prefix else f"{observer}\n"
+
+
+async def configure_ble_observer_env(
+    shell: PanelShell,
+    *,
+    enabled: bool,
+    allowlist_json: str,
+) -> None:
+    """Patch observer values into the shared 0600 env without restarting anything."""
+    result = await shell.run(f"cat {PANEL_ENV_FILE}")
+    if result.exit_status != 0 or not result.stdout.strip():
+        raise PanelOpError("BLE observer needs an existing Brilliant MQTT environment")
+    await write_env(
+        shell,
+        _with_ble_observer_env(
+            result.stdout,
+            enabled=enabled,
+            allowlist_json=allowlist_json,
+        ),
+    )
 
 
 async def ensure_configs(shell: PanelShell, unit_content: str, env_content: str) -> None:
@@ -1003,3 +1081,200 @@ async def uninstall_hue_ca(shell: PanelShell) -> None:
     await _checked(shell, f"rm -rf {PANEL_HUE_CA_DIR} {_HUE_CA_STAGING_DIR}")
     await _checked(shell, f"rm -f {PANEL_HUE_CA_CERT_FILE}")
     await _checked(shell, "systemctl daemon-reload")
+
+
+# ---------------------------------------------------------------------------
+# Passive BLE observer recipes
+# ---------------------------------------------------------------------------
+
+_BLE_OBSERVER_STAGING_DIR = f"{PANEL_BLE_OBSERVER_DIR}.staging"
+_BLE_OBSERVER_STAGED_UNIT = f"{PANEL_BLE_OBSERVER_DIR}/{BLE_OBSERVER_SERVICE_NAME}.service"
+_BLE_OBSERVER_DISABLE_COMMAND = f"systemctl disable --now {BLE_OBSERVER_SERVICE_NAME}"
+_BLE_OBSERVER_STOP_COMMAND = f"systemctl stop {BLE_OBSERVER_SERVICE_NAME}"
+BLE_OBSERVER_ACTIVE_COMMAND = f"systemctl is-active {BLE_OBSERVER_SERVICE_NAME} 2>/dev/null"
+
+BLE_OBSERVER_INSPECT_COMMAND = (
+    f"test -f {PANEL_BLE_OBSERVER_UNIT_FILE} && echo unit=1 || echo unit=0; "
+    f"systemctl is-enabled {BLE_OBSERVER_SERVICE_NAME} >/dev/null 2>&1"
+    f" && echo enabled=1 || echo enabled=0; "
+    f"systemctl is-active {BLE_OBSERVER_SERVICE_NAME} >/dev/null 2>&1"
+    f" && echo active=1 || echo active=0; "
+    f"test -f {_BLE_OBSERVER_STAGED_UNIT} && echo sunit=1 || echo sunit=0; "
+    f"test -f {PANEL_BLE_OBSERVER_DIR}/brilliant_ble_observer/__main__.py "
+    f"&& test -f {PANEL_BLE_OBSERVER_DIR}/vendor/dbus_next/__init__.py "
+    f"&& echo payload=1 || echo payload=0"
+)
+
+
+@dataclass(frozen=True)
+class BleObserverState:
+    """Strict install/health proof for the isolated BLE observer."""
+
+    unit_present: bool
+    enabled: bool
+    active: bool
+    staged_unit_present: bool
+    payload_present: bool
+
+
+async def inspect_ble_observer(shell: PanelShell) -> BleObserverState:
+    """Probe observer state, rejecting incomplete or ambiguous shell output."""
+    result = await shell.run(BLE_OBSERVER_INSPECT_COMMAND)
+    expected = {"unit", "enabled", "active", "sunit", "payload"}
+    if result.exit_status != 0:
+        raise PanelOpError("BLE observer inspection failed")
+    flags: dict[str, bool] = {}
+    for line in result.stdout.splitlines():
+        key, sep, value = line.partition("=")
+        if not sep or key not in expected or key in flags or value not in {"0", "1"}:
+            raise PanelOpError("BLE observer inspection returned ambiguous state")
+        flags[key] = value == "1"
+    if set(flags) != expected:
+        raise PanelOpError("BLE observer inspection returned incomplete state")
+    return BleObserverState(
+        unit_present=flags["unit"],
+        enabled=flags["enabled"],
+        active=flags["active"],
+        staged_unit_present=flags["sunit"],
+        payload_present=flags["payload"],
+    )
+
+
+def _ble_observer_swap_command() -> str:
+    """Return the recoverable move-aside swap for observer code + vendor."""
+    return " && ".join(
+        [
+            f"mkdir -p {PANEL_VAR_DIR}",
+            f"rm -rf {PANEL_BLE_OBSERVER_DIR}.bak",
+            f"{{ [ -e {PANEL_BLE_OBSERVER_DIR} ] && "
+            f"mv {PANEL_BLE_OBSERVER_DIR} {PANEL_BLE_OBSERVER_DIR}.bak; true; }}",
+            f"mv {_BLE_OBSERVER_STAGING_DIR} {PANEL_BLE_OBSERVER_DIR}",
+            f"rm -rf {PANEL_BLE_OBSERVER_DIR}.bak",
+        ]
+    )
+
+
+async def deploy_ble_observer(shell: PanelShell, local_dir: str) -> None:
+    """Upload the observer package + dedicated vendor tree, then atomically swap."""
+    await shell.run(f"rm -rf {_BLE_OBSERVER_STAGING_DIR}")
+    await shell.put_dir(local_dir, _BLE_OBSERVER_STAGING_DIR)
+    await _checked(shell, _ble_observer_swap_command())
+
+
+async def ensure_ble_observer_unit(shell: PanelShell, unit_content: str) -> None:
+    """Write live + OTA-proof observer unit copies and reload systemd only."""
+    await _checked(shell, f"mkdir -p {PANEL_BLE_OBSERVER_DIR}")
+    unit_bytes = unit_content.encode()
+    await shell.put_bytes(unit_bytes, PANEL_BLE_OBSERVER_UNIT_FILE, 0o644)
+    await shell.put_bytes(unit_bytes, _BLE_OBSERVER_STAGED_UNIT, 0o644)
+    await _checked(shell, "systemctl daemon-reload")
+
+
+async def _activate_and_prove_ble_observer(
+    shell: PanelShell,
+    commands: tuple[str, ...],
+) -> None:
+    """Run activation commands, prove full health, and quarantine every failed proof."""
+    try:
+        for command in commands:
+            await _checked(shell, command)
+        state = await inspect_ble_observer(shell)
+        if state != BleObserverState(
+            unit_present=True,
+            enabled=True,
+            active=True,
+            staged_unit_present=True,
+            payload_present=True,
+        ):
+            raise PanelOpError("BLE observer activation health proof failed")
+    except (OSError, asyncssh.Error, PanelOpError):
+        await quarantine_ble_observer(shell)
+        raise
+
+
+async def enable_ble_observer(shell: PanelShell) -> None:
+    """Enable/start only the observer, then prove its complete isolated install."""
+    await _activate_and_prove_ble_observer(
+        shell,
+        (f"systemctl enable --now {BLE_OBSERVER_SERVICE_NAME}",),
+    )
+
+
+async def activate_updated_ble_observer(shell: PanelShell) -> None:
+    """Restart replaced code, then prove the selected observer completely healthy."""
+    await _activate_and_prove_ble_observer(
+        shell,
+        (
+            f"systemctl enable {BLE_OBSERVER_SERVICE_NAME}",
+            f"systemctl restart {BLE_OBSERVER_SERVICE_NAME}",
+        ),
+    )
+
+
+async def _ble_observer_is_active(shell: PanelShell) -> bool:
+    """Return exact systemd activity, rejecting output that cannot prove either state."""
+    result = await shell.run(BLE_OBSERVER_ACTIVE_COMMAND)
+    state = result.stdout.strip()
+    if result.stderr.strip():
+        raise PanelOpError("BLE observer activity probe returned ambiguous state")
+    if result.exit_status == 0 and state == "active":
+        return True
+    if result.exit_status == 3 and state in {"failed", "inactive"}:
+        return False
+    if result.exit_status == 4 and state == "unknown":
+        return False
+    raise PanelOpError("BLE observer activity probe returned ambiguous state")
+
+
+async def _remove_inactive_ble_observer(shell: PanelShell) -> None:
+    """Remove observer-owned state after a caller has proven the unit inactive."""
+    env_error: OSError | asyncssh.Error | PanelOpError | None = None
+
+    # Keep the independent on-panel kill switch false if the shared env survives.
+    # A missing/corrupt bridge env must not prevent removal of the observer service.
+    result = await shell.run(f"cat {PANEL_ENV_FILE}")
+    if result.exit_status == 0 and result.stdout.strip():
+        try:
+            await write_env(
+                shell,
+                _with_ble_observer_env(
+                    result.stdout,
+                    enabled=False,
+                    allowlist_json=DEFAULT_BLE_OBSERVER_ALLOWLIST_JSON,
+                ),
+            )
+        except (OSError, asyncssh.Error, PanelOpError) as error:
+            # Still remove the unit and payload: either the false env OR no runnable
+            # unit is enough to keep a stopped observer fail-closed after this call.
+            env_error = error
+
+    await _checked(shell, f"rm -f {PANEL_BLE_OBSERVER_UNIT_FILE}")
+    await _checked(
+        shell,
+        f"rm -rf {PANEL_BLE_OBSERVER_DIR} {_BLE_OBSERVER_STAGING_DIR}",
+    )
+    await _checked(shell, "systemctl daemon-reload")
+    if env_error is not None:
+        raise PanelOpError("BLE observer env disable failed after safe removal") from env_error
+
+
+async def quarantine_ble_observer(shell: PanelShell) -> None:
+    """Bounded failure cleanup: force-stop, prove inactive, then remove the observer."""
+    await shell.run(_BLE_OBSERVER_DISABLE_COMMAND)
+    if await _ble_observer_is_active(shell):
+        # An enable/restart/disable command can mutate systemd and still report a
+        # failure. One explicit stop + re-probe closes that partial-success window.
+        await shell.run(_BLE_OBSERVER_STOP_COMMAND)
+        if await _ble_observer_is_active(shell):
+            raise PanelOpError("BLE observer is still active after quarantine stop")
+    await _remove_inactive_ble_observer(shell)
+
+
+async def uninstall_ble_observer(shell: PanelShell) -> None:
+    """Remove only observer-owned state after proving its service is inactive."""
+    await shell.run(_BLE_OBSERVER_DISABLE_COMMAND)
+    if await _ble_observer_is_active(shell):
+        # Do not delete the unit, payload, or kill-switch env around a process that
+        # systemd still reports active. The caller keeps the selected entry state.
+        raise PanelOpError("BLE observer is still active after disable")
+    await _remove_inactive_ble_observer(shell)

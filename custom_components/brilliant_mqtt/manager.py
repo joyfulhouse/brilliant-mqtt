@@ -14,12 +14,11 @@ import asyncio
 import json
 import logging
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Collection, Mapping
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
 import asyncssh
 from homeassistant.components import mqtt, persistent_notification
@@ -34,14 +33,18 @@ from homeassistant.helpers.event import async_call_later
 
 from . import panel_ops
 from .ble_scanner import BrilliantBleScannerBridge
+from .component_payloads import (
+    SINGLE_UNIT_PAYLOAD_BY_ID,
+    SINGLE_UNIT_PAYLOAD_SPECS,
+    SingleUnitPayloadSpec,
+)
 from .const import (
     AVAILABILITY_OFFLINE,
     AVAILABILITY_ONLINE,
-    COMPONENT_BUS_WATCHDOG,
+    COMPONENT_BLE_OBSERVER,
     COMPONENT_HA_MIRROR,
     COMPONENT_HUE_CA,
     COMPONENT_VOICE,
-    COMPONENT_WIFI_WATCHDOG,
     CONF_BLE_SCANNER_ENABLED,
     CONF_COMPONENTS,
     CONF_HA_CONTROL_ENABLED,
@@ -88,6 +91,7 @@ from .const import (
     SIGNAL_PANEL_STATE,
     VOICE_PAYLOAD_VERSION,
     availability_topic,
+    ble_observer_allowlist_json,
     meta_topic,
     panel_device_name,
 )
@@ -134,37 +138,7 @@ def _write_diagnostics_bundle(directory: str, content: str) -> str:
     return str(target)
 
 
-class _PayloadState(Protocol):
-    @property
-    def payload_present(self) -> bool: ...
-
-
-@dataclass(frozen=True)
-class _WatchdogRelaySpec:
-    service_filename: str
-    payload_subdir: str
-    inspect: Callable[[PanelShell], Awaitable[_PayloadState]]
-    deploy: Callable[[PanelShell, str], Awaitable[None]]
-    ensure_unit: Callable[[PanelShell, str], Awaitable[None]]
-    enable: Callable[[PanelShell], Awaitable[None]]
-
-
-_WIFI_WATCHDOG_RELAY = _WatchdogRelaySpec(
-    service_filename="brilliant-wifi-watchdog.service",
-    payload_subdir="wifi_watchdog",
-    inspect=panel_ops.inspect_wifi_watchdog,
-    deploy=panel_ops.deploy_wifi_watchdog,
-    ensure_unit=panel_ops.ensure_wifi_watchdog_unit,
-    enable=panel_ops.enable_wifi_watchdog,
-)
-_BUS_WATCHDOG_RELAY = _WatchdogRelaySpec(
-    service_filename="brilliant-bus-watchdog.service",
-    payload_subdir="bus_watchdog",
-    inspect=panel_ops.inspect_bus_watchdog,
-    deploy=panel_ops.deploy_bus_watchdog,
-    ensure_unit=panel_ops.ensure_bus_watchdog_unit,
-    enable=panel_ops.enable_bus_watchdog,
-)
+_BLE_OBSERVER_RELAY = SINGLE_UNIT_PAYLOAD_BY_ID[COMPONENT_BLE_OBSERVER]
 
 
 class PanelManager:
@@ -186,6 +160,10 @@ class PanelManager:
         self._recovery_cancel: CALLBACK_TYPE | None = None
         self._last_repair_mono: float | None = None
         self._repairing = False
+        # Explicit default-off entries are reconciled against physical systemd state
+        # on their first retained online/offline LWT. False is retained after failures
+        # so the next availability signal retries instead of trusting entry data alone.
+        self._ble_off_reconciled = False
         self._abandoned_close_tasks: set[asyncio.Task[None]] = set()
         # Set true by async_shutdown. A repair already awaiting inside the ssh_lock
         # resumes AFTER shutdown's one-shot cancel; this flag stops it re-arming a
@@ -530,19 +508,72 @@ class PanelManager:
             cancel()
             setattr(self, attr, None)
 
+    def _ble_observer_explicitly_off(self) -> bool:
+        """Whether entry data owns the observer in its default-off state."""
+        components = self.entry.data.get(CONF_COMPONENTS)
+        return isinstance(components, Mapping) and (components.get(COMPONENT_BLE_OBSERVER) is False)
+
+    def _needs_ble_off_reconciliation(self) -> bool:
+        """Whether physical default-off proof is missing for the current panel epoch."""
+        return self._ble_observer_explicitly_off() and not self._ble_off_reconciled
+
+    def _reset_ble_off_reconciliation(self) -> None:
+        """Invalidate prior physical proof before a state-restoring panel operation."""
+        if self._ble_observer_explicitly_off():
+            self._ble_off_reconciled = False
+
+    async def _reconcile_ble_observer_default_off_on_shell(self, shell: PanelShell) -> None:
+        """Prove default-off state while the caller owns a connected panel shell."""
+        if not self._needs_ble_off_reconciliation():
+            return
+        await panel_ops.quarantine_ble_observer(shell)
+        self._ble_off_reconciled = True
+
+    async def _reconcile_ble_observer_default_off(self) -> bool:
+        """Prove an explicitly unselected observer inactive, surfacing retryable failure."""
+        if not self._needs_ble_off_reconciliation():
+            return True
+        if self._shutting_down:
+            return False
+        self._ble_off_reconciled = False
+        try:
+            async with self._ssh_lock:
+                if self._shutting_down:
+                    return False
+                shell = await self._connect_for_repair()
+                try:
+                    await self._reconcile_ble_observer_default_off_on_shell(shell)
+                finally:
+                    if not await self._async_close_shell(shell):
+                        raise OSError("panel SSH session could not be closed")
+        except (_HostKeyChanged, OSError, asyncssh.Error, PanelOpError) as error:
+            if self._shutting_down:
+                return False
+            self._escalate(f"BLE observer default-off reconciliation failed: {error}")
+            return False
+        self._ble_off_reconciled = True
+        return True
+
     async def _on_availability(self, msg: ReceiveMessage) -> None:
         if self._shutting_down:
             return  # defense-in-depth: never arm a timer on a torn-down entry
         payload = str(msg.payload)
         self.availability = payload
+        ble_safe = True
+        if payload in {AVAILABILITY_ONLINE, AVAILABILITY_OFFLINE}:
+            ble_safe = await self._reconcile_ble_observer_default_off()
+            if self._shutting_down:
+                return
         if payload == AVAILABILITY_ONLINE:
             self._cancel("_grace_cancel")
             if self._recovery_cancel is not None:
                 self._cancel("_recovery_cancel")
                 self._fire(EVENT_REPAIR_SUCCEEDED)
-            self._set_problem(False, None)
+            if ble_safe:
+                self._set_problem(False, None)
         elif (
             payload == AVAILABILITY_OFFLINE
+            and ble_safe
             and self._grace_cancel is None
             and self._recovery_cancel is None
             and not self._repairing
@@ -601,6 +632,7 @@ class PanelManager:
             (_payload_dir() / "brilliant-mqtt.service").read_text
         )
         data = self.entry.data
+        components = dict(data.get(CONF_COMPONENTS) or {})
         env = panel_ops.render_env(
             panel=self.panel,
             mesh_priority=data[CONF_MESH_PRIORITY],
@@ -610,6 +642,8 @@ class PanelManager:
             mqtt_password=data[CONF_MQTT_PASSWORD],
             scene_bridge_enabled=data.get(CONF_HA_CONTROL_ENABLED, DEFAULT_HA_CONTROL_ENABLED)
             is True,
+            ble_observer_enabled=components.get(COMPONENT_BLE_OBSERVER) is True,
+            ble_observer_allowlist_json=ble_observer_allowlist_json(data),
         )
         return unit, env
 
@@ -647,32 +681,69 @@ class PanelManager:
         await panel_ops.ensure_voice_config(shell, self._voice_env())
         await panel_ops.enable_voice(shell)
 
-    async def _relay_watchdog(
+    async def _relay_component(
         self,
         shell: PanelShell,
-        spec: _WatchdogRelaySpec,
+        spec: SingleUnitPayloadSpec,
+        *,
+        force_payload: bool = False,
     ) -> Exception | None:
-        """Restore one selected watchdog without blocking the bridge operation."""
+        """Restore one selected payload+unit component without blocking its caller."""
         try:
             payload_dir = _payload_dir()
             unit = await self.hass.async_add_executor_job(
                 (payload_dir / spec.service_filename).read_text
             )
             state = await spec.inspect(shell)
-            if not state.payload_present:
+            if force_payload or not state.payload_present:
                 await spec.deploy(shell, str(payload_dir / spec.payload_subdir))
             await spec.ensure_unit(shell, unit)
-            await spec.enable(shell)
+            activator = spec.activate_updated if force_payload else None
+            await (activator or spec.enable)(shell)
         except (OSError, asyncssh.Error, PanelOpError) as err:
             return err
         return None
 
+    async def _relay_selected_components(
+        self,
+        shell: PanelShell,
+        selected: Collection[str],
+        *,
+        action: str,
+    ) -> None:
+        """Best-effort restore the selected single-unit payload components."""
+        for spec in SINGLE_UNIT_PAYLOAD_SPECS:
+            if spec.component_id not in selected:
+                continue
+            if error := await self._relay_component(shell, spec):
+                _LOGGER.warning(
+                    "%s: %s %s failed: %s",
+                    self.panel,
+                    spec.label,
+                    action,
+                    error,
+                )
+
+    async def _refresh_ble_observer_for_update(self, shell: PanelShell) -> None:
+        """Force-refresh selected observer code; propagate failure to update.install."""
+        from .components import selected_ids  # lazy: components imports manager
+
+        if COMPONENT_BLE_OBSERVER not in selected_ids(self.entry.data):
+            return
+        error = await self._relay_component(
+            shell,
+            _BLE_OBSERVER_RELAY,
+            force_payload=True,
+        )
+        if error is not None:
+            raise error
+
     async def _relay_hue_ca(self, shell: PanelShell) -> Exception | None:
         """Restore the selected hue-ca recovery hook without blocking the bridge op.
 
-        Bespoke sibling of _relay_watchdog: the hook needs TWO unit files (a oneshot
+        Bespoke sibling of _relay_component: the hook needs TWO unit files (a oneshot
         .service the .timer activates) plus the operator's CA PEM, so it can't reuse
-        _WatchdogRelaySpec verbatim. An OTA wipes /etc/systemd/system/ (dropping the
+        SingleUnitPayloadSpec verbatim. An OTA wipes /etc/systemd/system/ (dropping the
         units) AND /data (the pinned Hue CA bundle the hook re-appends) — but the code
         + the CA PEM this hook already wrote to PANEL_HUE_CA_CERT_FILE both live under
         /var and normally survive. So the common case is a pure re-lay + re-enable;
@@ -766,6 +837,7 @@ class PanelManager:
                     retirement_result: bool | None = None
                     state = await panel_ops.inspect_panel(shell)
                     unit, env = await self._config_contents()
+                    self._reset_ble_off_reconciliation()
                     # Bootstrap a code-less panel (never installed, or its /var code was
                     # lost): lay the agent payload down BEFORE enabling the unit, so the
                     # Repair button / auto-repair can install from scratch rather than
@@ -795,27 +867,14 @@ class PanelManager:
                             )
                         else:
                             ir.async_delete_issue(self.hass, DOMAIN, self._voice_issue_id)
-                    # Wi-Fi watchdog re-lay: re-write unit to /etc if selected.
-                    # OTA wipes /etc/systemd/system/ so the unit disappears after a
-                    # firmware update even though the code survives in /var.  Lay it
-                    # back down (and redeploy the code if /var was also wiped) so the
-                    # watchdog keeps running across OTAs.  Failure is logged and
-                    # swallowed — a watchdog outage must not block the bridge repair.
+                    # Re-lay selected one-unit payload components. OTA may wipe their
+                    # /etc units while /var payloads survive; individual failures must
+                    # not block bridge repair.
                     from .components import selected_ids  # lazy: components imports manager
 
                     selected = selected_ids(self.entry.data)
-                    if COMPONENT_WIFI_WATCHDOG in selected:
-                        if err := await self._relay_watchdog(shell, _WIFI_WATCHDOG_RELAY):
-                            _LOGGER.warning("%s: watchdog repair failed: %s", self.panel, err)
-                    # Bus watchdog re-lay: re-write unit to /etc if selected.
-                    # OTA wipes /etc/systemd/system/ so the unit disappears after a
-                    # firmware update even though the code survives in /var.  Lay it
-                    # back down (and redeploy the code if /var was also wiped) so the
-                    # watchdog keeps running across OTAs.  Failure is logged and
-                    # swallowed — a watchdog outage must not block the bridge repair.
-                    if COMPONENT_BUS_WATCHDOG in selected:
-                        if err := await self._relay_watchdog(shell, _BUS_WATCHDOG_RELAY):
-                            _LOGGER.warning("%s: bus watchdog repair failed: %s", self.panel, err)
+                    await self._relay_selected_components(shell, selected, action="repair")
+                    await self._reconcile_ble_observer_default_off_on_shell(shell)
                     # Hue CA recovery hook re-lay: re-write its units to /etc if selected.
                     # OTA wipes /etc/systemd/system/ (and /data — what the hook itself
                     # recovers), so the timer disappears after a firmware update even
@@ -923,7 +982,10 @@ class PanelManager:
                     await panel_ops.deploy_payload(shell, str(_payload_dir()), version)
                     _p(80)
                     unit, env = await self._config_contents()
+                    self._reset_ble_off_reconciliation()
                     await panel_ops.ensure_configs(shell, unit, env)
+                    await self._refresh_ble_observer_for_update(shell)
+                    await self._reconcile_ble_observer_default_off_on_shell(shell)
                     _p(90)
                     await panel_ops.restart(shell)
                     try:
@@ -988,6 +1050,9 @@ class PanelManager:
                     translation_placeholders={"error": str(err)},
                 ) from err
             try:
+                # The observer owns a separate unit but its code lives below the main
+                # agent tree. Stop, prove, and remove it before deleting that tree.
+                await panel_ops.quarantine_ble_observer(shell)
                 await panel_ops.uninstall(shell)
             except (OSError, asyncssh.Error, PanelOpError) as err:
                 self._escalate(f"agent uninstall failed: {err}")
@@ -1268,26 +1333,14 @@ class PanelManager:
                 try:
                     retirement_result: bool | None = None
                     unit, env = await self._config_contents()
+                    self._reset_ble_off_reconciliation()
                     await panel_ops.ensure_configs(shell, unit, env)
-                    # Wi-Fi watchdog: also re-lay its unit when selected — OTA wipes /etc
-                    # and the watchdog unit disappears even though the code in /var survives.
+                    # Re-lay selected one-unit payload components after an OTA.
                     from .components import selected_ids  # lazy: components imports manager
 
                     selected = selected_ids(self.entry.data)
-                    if COMPONENT_WIFI_WATCHDOG in selected:
-                        if await self._relay_watchdog(shell, _WIFI_WATCHDOG_RELAY):
-                            _LOGGER.warning(
-                                "%s: watchdog refresh failed; will retry next reconcile",
-                                self.panel,
-                            )
-                    # Bus watchdog: also re-lay its unit when selected — OTA wipes /etc
-                    # and the watchdog unit disappears even though the code in /var survives.
-                    if COMPONENT_BUS_WATCHDOG in selected:
-                        if await self._relay_watchdog(shell, _BUS_WATCHDOG_RELAY):
-                            _LOGGER.warning(
-                                "%s: bus watchdog refresh failed; will retry next reconcile",
-                                self.panel,
-                            )
+                    await self._relay_selected_components(shell, selected, action="refresh")
+                    await self._reconcile_ble_observer_default_off_on_shell(shell)
                     # Hue CA recovery hook: also re-lay its units when selected — OTA
                     # wipes /etc and the timer disappears even though the code +
                     # previously-written CA in /var survive.

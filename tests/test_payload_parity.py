@@ -16,12 +16,24 @@ PAYLOAD_ROOT = (
     / "app"
     / "brilliant_mqtt"
 )
+OBSERVER_SOURCE_ROOT = REPOSITORY_ROOT / "src" / "brilliant_ble_observer"
+OBSERVER_PAYLOAD_ROOT = (
+    REPOSITORY_ROOT
+    / "custom_components"
+    / "brilliant_mqtt"
+    / "agent_payload"
+    / "ble_observer"
+    / "brilliant_ble_observer"
+)
 BUILD_SCRIPT = REPOSITORY_ROOT / "scripts" / "build_payload.sh"
+SHA256_VERIFIER = REPOSITORY_ROOT / "scripts" / "verify_sha256.py"
+UV_LOCK = REPOSITORY_ROOT / "uv.lock"
 PAYLOAD_WORKFLOWS = (
     REPOSITORY_ROOT / ".github" / "workflows" / "ci.yml",
     REPOSITORY_ROOT / ".github" / "workflows" / "release.yml",
 )
 PAYLOAD_RELATIVE_PATH = Path("custom_components/brilliant_mqtt/agent_payload")
+AGENT_PAYLOAD_ROOT = REPOSITORY_ROOT / PAYLOAD_RELATIVE_PATH
 
 
 def _sha256_files(root: Path) -> dict[str, str]:
@@ -91,6 +103,82 @@ def test_payload_build_pins_every_vendored_mqtt_distribution_without_deps() -> N
     assert 'm.version("typing-extensions")' in script
     assert '"typing-extensions==$TYPING_EXTENSIONS_VERSION"' in script
     assert "--no-deps" in script
+
+
+def test_committed_ble_observer_payload_matches_source_and_unit() -> None:
+    assert _sha256_files(OBSERVER_PAYLOAD_ROOT) == _sha256_files(OBSERVER_SOURCE_ROOT)
+    assert (AGENT_PAYLOAD_ROOT / "brilliant-ble-observer.service").read_bytes() == (
+        REPOSITORY_ROOT / "deploy" / "brilliant-ble-observer.service"
+    ).read_bytes()
+
+
+def test_ble_observer_payload_has_pinned_dbus_next_without_build_or_secret_artifacts() -> None:
+    script = BUILD_SCRIPT.read_text(encoding="utf-8")
+    assert 'm.version("dbus-next")' in script
+    assert '"dbus-next==$DBUS_NEXT_VERSION"' in script
+    assert "--no-deps" in script
+    locked_hash = "58948f9aff9db08316734c0be2a120f6dc502124d9642f55e90ac82ffb16a18b"
+    locked_url = (
+        "https://files.pythonhosted.org/packages/d2/fc/"
+        "c0a3f4c4eaa5a22fbef91713474666e13d0ea2a69c84532579490a9f2cc8/"
+        "dbus_next-0.2.3-py3-none-any.whl"
+    )
+    assert f'DBUS_NEXT_SHA256="{locked_hash}"' in script
+    assert f'DBUS_NEXT_URL="{locked_url}"' in script
+    assert 'verify_sha256.py"' in script
+    assert '"$DBUS_NEXT_WHEEL" "$DBUS_NEXT_SHA256"' in script
+    lock = UV_LOCK.read_text(encoding="utf-8")
+    assert locked_url in lock
+    assert f"sha256:{locked_hash}" in lock
+    assert (AGENT_PAYLOAD_ROOT / "ble_observer/vendor/dbus_next/__init__.py").is_file()
+
+    license_text = (
+        AGENT_PAYLOAD_ROOT / "ble_observer/vendor-licenses/dbus-next-LICENSE"
+    ).read_text(encoding="utf-8")
+    assert license_text.startswith("Copyright (c) 2019 Tony Crisci\n")
+    provenance = (
+        AGENT_PAYLOAD_ROOT / "ble_observer/vendor-licenses/dbus-next-PROVENANCE.txt"
+    ).read_text(encoding="utf-8")
+    assert provenance.splitlines() == [
+        "Name: dbus-next",
+        "Version: 0.2.3",
+        "Lock-Source: uv.lock",
+        f"Wheel-URL: {locked_url}",
+        f"Wheel-SHA256: {locked_hash}",
+        "License: dbus-next-LICENSE",
+    ]
+
+    forbidden_parts = {"__pycache__"}
+    forbidden_suffixes = {".pyc", ".pyo", ".env", ".pem", ".key", ".token"}
+    for path in AGENT_PAYLOAD_ROOT.rglob("*"):
+        relative = path.relative_to(AGENT_PAYLOAD_ROOT)
+        assert not forbidden_parts.intersection(relative.parts), relative
+        assert not any(part.endswith(".dist-info") for part in relative.parts), relative
+        if path.is_file():
+            assert path.suffix not in forbidden_suffixes, relative
+
+
+def test_payload_sha256_verifier_fails_closed_on_mismatch(tmp_path: Path) -> None:
+    artifact = tmp_path / "artifact.whl"
+    artifact.write_bytes(b"locked artifact")
+    expected = hashlib.sha256(artifact.read_bytes()).hexdigest()
+
+    valid = subprocess.run(
+        ["python", str(SHA256_VERIFIER), str(artifact), expected],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert valid.returncode == 0
+
+    mismatch = subprocess.run(
+        ["python", str(SHA256_VERIFIER), str(artifact), "0" * 64],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert mismatch.returncode != 0
+    assert "SHA-256 mismatch" in mismatch.stderr
 
 
 def test_payload_workflow_guards_reject_untracked_generated_files() -> None:

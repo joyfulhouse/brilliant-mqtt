@@ -26,6 +26,7 @@ from custom_components.brilliant_mqtt.ble_scanner import (
 from custom_components.brilliant_mqtt.const import (
     CONF_BLE_SCANNER_ENABLED,
     CONF_PANEL,
+    CONFIG_ENTRY_VERSION,
     DOMAIN,
 )
 from tests.conftest import FakeBluetoothManager
@@ -131,7 +132,7 @@ def _entry(panel: str = "shed") -> MockConfigEntry:
             CONF_PANEL: panel,
             CONF_BLE_SCANNER_ENABLED: True,
         },
-        version=3,
+        version=CONFIG_ENTRY_VERSION,
     )
 
 

@@ -7,8 +7,11 @@ import pytest
 
 from custom_components.brilliant_mqtt import panel_ops
 from custom_components.brilliant_mqtt.const import (
+    BLE_OBSERVER_SERVICE_NAME,
     BUS_WATCHDOG_SERVICE_NAME,
     HA_MIRROR_SERVICE_NAME,
+    PANEL_BLE_OBSERVER_DIR,
+    PANEL_BLE_OBSERVER_UNIT_FILE,
     PANEL_BUS_WATCHDOG_DIR,
     PANEL_BUS_WATCHDOG_UNIT_FILE,
     PANEL_ENV_FILE,
@@ -43,6 +46,25 @@ _FULL_INSPECT = RunResult(
 async def _connected(shell: FakeShell) -> FakeShell:
     await shell.connect()
     return shell
+
+
+class _SequencedActivityShell(FakeShell):
+    """Fake systemd activity changing across bounded stop probes."""
+
+    def __init__(
+        self,
+        activity: list[RunResult],
+        responses: dict[str, RunResult] | None = None,
+    ) -> None:
+        super().__init__(responses=responses)
+        self._activity = activity
+
+    async def run(self, command: str) -> RunResult:
+        if command == panel_ops.BLE_OBSERVER_ACTIVE_COMMAND:
+            self._require_connected()
+            self.commands.append(command)
+            return self._activity.pop(0)
+        return await super().run(command)
 
 
 async def test_inspect_parses_healthy_panel() -> None:
@@ -113,6 +135,11 @@ def test_render_env_matches_agent_config_contract() -> None:
         'MQTT_PASSWORD="secret"',
         "MESH_PRIORITY=1",
         "SCENE_BRIDGE_ENABLED=1",
+        "BLE_OBSERVER_ENABLED=0",
+        'BLE_OBSERVER_ALLOWLIST_JSON="[]"',
+        'BLE_OBSERVER_ADAPTER="hci0"',
+        "BLE_OBSERVER_MAX_EVENTS_PER_SECOND=10",
+        'BLE_OBSERVER_LOG_LEVEL="INFO"',
         "LOG_LEVEL=INFO",
     ]
 
@@ -183,6 +210,11 @@ def test_parse_env_round_trips_render_env() -> None:
         "MQTT_PASSWORD": 'p#a"s\\s',
         "MESH_PRIORITY": "7",
         "SCENE_BRIDGE_ENABLED": "0",
+        "BLE_OBSERVER_ENABLED": "0",
+        "BLE_OBSERVER_ALLOWLIST_JSON": "[]",
+        "BLE_OBSERVER_ADAPTER": "hci0",
+        "BLE_OBSERVER_MAX_EVENTS_PER_SECOND": "10",
+        "BLE_OBSERVER_LOG_LEVEL": "INFO",
         "LOG_LEVEL": "INFO",
     }
 
@@ -1111,3 +1143,304 @@ async def test_uninstall_bus_watchdog_sequence_and_paths() -> None:
     for cmd in shell.commands:
         tokens = cmd.split()
         assert PANEL_VAR_DIR not in tokens, f"Command removes PANEL_VAR_DIR itself: {cmd!r}"
+
+
+# ---------------------------------------------------------------------------
+# BLE observer recipes
+# ---------------------------------------------------------------------------
+
+_FULL_BLE_OBSERVER_INSPECT = RunResult(
+    0,
+    "unit=1\nenabled=1\nactive=1\nsunit=1\npayload=1\n",
+    "",
+)
+
+
+async def test_inspect_ble_observer_requires_complete_payload_and_unit_proof() -> None:
+    shell = await _connected(
+        FakeShell(
+            responses={
+                panel_ops.BLE_OBSERVER_INSPECT_COMMAND: _FULL_BLE_OBSERVER_INSPECT,
+            }
+        )
+    )
+
+    assert await panel_ops.inspect_ble_observer(shell) == panel_ops.BleObserverState(
+        unit_present=True,
+        enabled=True,
+        active=True,
+        staged_unit_present=True,
+        payload_present=True,
+    )
+    assert f"{PANEL_BLE_OBSERVER_DIR}/brilliant_ble_observer/__main__.py" in (
+        panel_ops.BLE_OBSERVER_INSPECT_COMMAND
+    )
+    assert f"{PANEL_BLE_OBSERVER_DIR}/vendor/dbus_next/__init__.py" in (
+        panel_ops.BLE_OBSERVER_INSPECT_COMMAND
+    )
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        RunResult(1, _FULL_BLE_OBSERVER_INSPECT.stdout, "failed"),
+        RunResult(0, "unit=1\nenabled=1\nactive=1\nsunit=1\n", ""),
+        RunResult(
+            0,
+            "unit=1\nunit=1\nenabled=1\nactive=1\nsunit=1\npayload=1\n",
+            "",
+        ),
+        RunResult(0, "unit=yes\nenabled=1\nactive=1\nsunit=1\npayload=1\n", ""),
+    ],
+    ids=["nonzero", "missing", "duplicate", "malformed"],
+)
+async def test_inspect_ble_observer_rejects_ambiguous_proof(result: RunResult) -> None:
+    shell = await _connected(FakeShell(responses={panel_ops.BLE_OBSERVER_INSPECT_COMMAND: result}))
+    with pytest.raises(panel_ops.PanelOpError):
+        await panel_ops.inspect_ble_observer(shell)
+
+
+_EXPECTED_BLE_OBSERVER_SWAP = " && ".join(
+    [
+        "mkdir -p /var/brilliant-mqtt",
+        "rm -rf /var/brilliant-mqtt/ble_observer.bak",
+        "{ [ -e /var/brilliant-mqtt/ble_observer ] && "
+        "mv /var/brilliant-mqtt/ble_observer "
+        "/var/brilliant-mqtt/ble_observer.bak; true; }",
+        "mv /var/brilliant-mqtt/ble_observer.staging /var/brilliant-mqtt/ble_observer",
+        "rm -rf /var/brilliant-mqtt/ble_observer.bak",
+    ]
+)
+
+
+async def test_deploy_ble_observer_stages_then_atomically_swaps() -> None:
+    shell = await _connected(FakeShell())
+    await panel_ops.deploy_ble_observer(shell, "/local/ble_observer")
+
+    assert shell.commands[0] == "rm -rf /var/brilliant-mqtt/ble_observer.staging"
+    assert shell.dir_uploads == [
+        ("/local/ble_observer", "/var/brilliant-mqtt/ble_observer.staging")
+    ]
+    assert _EXPECTED_BLE_OBSERVER_SWAP in shell.commands
+
+
+async def test_deploy_ble_observer_failed_upload_never_swaps() -> None:
+    shell = await _connected(FakeShell(put_dir_error=OSError("transfer aborted")))
+    with pytest.raises(OSError, match="transfer aborted"):
+        await panel_ops.deploy_ble_observer(shell, "/local/ble_observer")
+    assert shell.commands == ["rm -rf /var/brilliant-mqtt/ble_observer.staging"]
+
+
+async def test_configure_ble_observer_patches_shared_env_without_restarting_bridge() -> None:
+    existing = panel_ops.render_env(
+        panel="office",
+        mesh_priority=3,
+        mqtt_host="broker",
+        mqtt_port=1883,
+        mqtt_username="user",
+        mqtt_password="private",
+    )
+    shell = await _connected(
+        FakeShell(responses={f"cat {PANEL_ENV_FILE}": RunResult(0, existing, "")})
+    )
+    allowlist = '[{"address":"AA:BB:CC:DD:EE:FF"}]'
+
+    await panel_ops.configure_ble_observer_env(
+        shell,
+        enabled=True,
+        allowlist_json=allowlist,
+    )
+
+    assert [(path, mode) for path, _data, mode in shell.uploads] == [
+        (PANEL_ENV_FILE, 0o600),
+        (f"{PANEL_VAR_DIR}/system/brilliant-mqtt.env", 0o600),
+    ]
+    updated = panel_ops.parse_env(shell.uploads[0][1].decode())
+    assert updated["MQTT_PASSWORD"] == "private"
+    assert updated["BLE_OBSERVER_ENABLED"] == "1"
+    assert updated["BLE_OBSERVER_ALLOWLIST_JSON"] == allowlist
+    assert "systemctl restart brilliant-mqtt" not in shell.commands
+    assert not any("bluetoothd" in command for command in shell.commands)
+
+
+async def test_ensure_and_enable_ble_observer_only_start_its_own_service() -> None:
+    shell = await _connected(
+        FakeShell(
+            responses={
+                panel_ops.BLE_OBSERVER_INSPECT_COMMAND: _FULL_BLE_OBSERVER_INSPECT,
+            }
+        )
+    )
+    await panel_ops.ensure_ble_observer_unit(shell, "OBSERVER UNIT")
+
+    assert [(path, mode) for path, _data, mode in shell.uploads] == [
+        (PANEL_BLE_OBSERVER_UNIT_FILE, 0o644),
+        (f"{PANEL_BLE_OBSERVER_DIR}/{BLE_OBSERVER_SERVICE_NAME}.service", 0o644),
+    ]
+    assert shell.commands[-1] == "systemctl daemon-reload"
+    assert not any("enable --now" in command for command in shell.commands)
+
+    await panel_ops.enable_ble_observer(shell)
+    assert shell.commands[-2:] == [
+        f"systemctl enable --now {BLE_OBSERVER_SERVICE_NAME}",
+        panel_ops.BLE_OBSERVER_INSPECT_COMMAND,
+    ]
+
+
+async def test_activate_updated_ble_observer_restarts_only_its_own_service() -> None:
+    shell = await _connected(
+        FakeShell(
+            responses={
+                panel_ops.BLE_OBSERVER_INSPECT_COMMAND: _FULL_BLE_OBSERVER_INSPECT,
+            }
+        )
+    )
+
+    await panel_ops.activate_updated_ble_observer(shell)
+
+    assert shell.commands == [
+        f"systemctl enable {BLE_OBSERVER_SERVICE_NAME}",
+        f"systemctl restart {BLE_OBSERVER_SERVICE_NAME}",
+        panel_ops.BLE_OBSERVER_INSPECT_COMMAND,
+    ]
+    assert not any(
+        forbidden in command
+        for command in shell.commands
+        for forbidden in ("brilliant-mqtt ", "bluetoothctl", "bluetoothd")
+    )
+
+
+@pytest.mark.parametrize(
+    "proof",
+    [
+        RunResult(0, "unit=1\nenabled=1\nactive=0\nsunit=1\npayload=1\n", ""),
+        RunResult(0, "unit=1\nenabled=1\nactive=1\nsunit=1\n", ""),
+    ],
+    ids=["unhealthy", "ambiguous"],
+)
+async def test_enable_ble_observer_quarantines_unproven_activation(proof: RunResult) -> None:
+    shell = await _connected(
+        FakeShell(
+            responses={
+                panel_ops.BLE_OBSERVER_INSPECT_COMMAND: proof,
+                panel_ops.BLE_OBSERVER_ACTIVE_COMMAND: RunResult(3, "inactive\n", ""),
+            }
+        )
+    )
+
+    with pytest.raises(panel_ops.PanelOpError):
+        await panel_ops.enable_ble_observer(shell)
+
+    enable = f"systemctl enable --now {BLE_OBSERVER_SERVICE_NAME}"
+    disable = f"systemctl disable --now {BLE_OBSERVER_SERVICE_NAME}"
+    assert shell.commands.index(enable) < shell.commands.index(disable)
+    assert any(PANEL_BLE_OBSERVER_UNIT_FILE in command for command in shell.commands)
+
+
+async def test_uninstall_ble_observer_disables_env_and_leaves_bridge_and_bluez_untouched() -> None:
+    existing = panel_ops.render_env(
+        panel="office",
+        mesh_priority=3,
+        mqtt_host="broker",
+        mqtt_port=1883,
+        mqtt_username="user",
+        mqtt_password="private",
+        ble_observer_enabled=True,
+        ble_observer_allowlist_json='[{"address":"AA:BB:CC:DD:EE:FF"}]',
+    )
+    shell = await _connected(
+        FakeShell(
+            responses={
+                panel_ops.BLE_OBSERVER_ACTIVE_COMMAND: RunResult(3, "inactive\n", ""),
+                f"cat {PANEL_ENV_FILE}": RunResult(0, existing, ""),
+            }
+        )
+    )
+
+    await panel_ops.uninstall_ble_observer(shell)
+
+    updated = panel_ops.parse_env(shell.uploads[0][1].decode())
+    assert updated["BLE_OBSERVER_ENABLED"] == "0"
+    assert updated["BLE_OBSERVER_ALLOWLIST_JSON"] == "[]"
+    assert f"systemctl disable --now {BLE_OBSERVER_SERVICE_NAME}" in shell.commands[0]
+    assert any(PANEL_BLE_OBSERVER_UNIT_FILE in command for command in shell.commands)
+    assert not any(
+        forbidden in command
+        for command in shell.commands
+        for forbidden in (
+            "systemctl restart brilliant-mqtt",
+            "systemctl stop brilliant-mqtt",
+            "systemctl disable --now brilliant-mqtt ",
+            "bluetoothctl",
+            "bluetoothd",
+        )
+    )
+
+
+async def test_uninstall_ble_observer_retains_everything_when_stop_is_not_proven() -> None:
+    """A failed disable must not delete the only controls around an active observer."""
+    disable = f"systemctl disable --now {BLE_OBSERVER_SERVICE_NAME}"
+    shell = await _connected(
+        FakeShell(
+            responses={
+                disable: RunResult(1, "", "disable failed"),
+                panel_ops.BLE_OBSERVER_ACTIVE_COMMAND: RunResult(0, "active\n", ""),
+            }
+        )
+    )
+
+    with pytest.raises(panel_ops.PanelOpError, match="still active"):
+        await panel_ops.uninstall_ble_observer(shell)
+
+    assert shell.commands == [disable, panel_ops.BLE_OBSERVER_ACTIVE_COMMAND]
+    assert shell.uploads == []
+    assert not any(
+        command.startswith("rm ") or command.startswith("rm -") for command in shell.commands
+    )
+
+
+async def test_uninstall_rejects_transport_exit_with_misleading_inactive_stdout() -> None:
+    """SSH status 255 plus partial stdout is not systemctl's documented inactive proof."""
+    disable = f"systemctl disable --now {BLE_OBSERVER_SERVICE_NAME}"
+    shell = await _connected(
+        FakeShell(
+            responses={
+                disable: RunResult(255, "", "transport lost"),
+                panel_ops.BLE_OBSERVER_ACTIVE_COMMAND: RunResult(
+                    255, "inactive\n", "transport lost"
+                ),
+            }
+        )
+    )
+
+    with pytest.raises(panel_ops.PanelOpError, match="ambiguous"):
+        await panel_ops.uninstall_ble_observer(shell)
+
+    assert shell.commands == [disable, panel_ops.BLE_OBSERVER_ACTIVE_COMMAND]
+    assert shell.uploads == []
+
+
+async def test_quarantine_proves_inactive_after_partially_failing_systemctl_commands() -> None:
+    """Reported disable/stop failures are safe only when the follow-up probe proves stop."""
+    disable = f"systemctl disable --now {BLE_OBSERVER_SERVICE_NAME}"
+    stop = f"systemctl stop {BLE_OBSERVER_SERVICE_NAME}"
+    shell = await _connected(
+        _SequencedActivityShell(
+            [RunResult(0, "active\n", ""), RunResult(3, "inactive\n", "")],
+            responses={
+                disable: RunResult(1, "", "partially failed"),
+                stop: RunResult(1, "", "reported failure after stop"),
+            },
+        )
+    )
+
+    await panel_ops.quarantine_ble_observer(shell)
+
+    assert shell.commands[:4] == [
+        disable,
+        panel_ops.BLE_OBSERVER_ACTIVE_COMMAND,
+        stop,
+        panel_ops.BLE_OBSERVER_ACTIVE_COMMAND,
+    ]
+    assert any(PANEL_BLE_OBSERVER_UNIT_FILE in command for command in shell.commands[4:])
+    assert any(command.startswith("rm -rf ") for command in shell.commands[4:])
