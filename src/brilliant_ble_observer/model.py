@@ -131,6 +131,7 @@ class AdvertisementEnvelope:
     panel: str
     adapter_address: str
     boot_id: str
+    session_id: str
     sequence: int
     address: str
     address_type: str
@@ -151,6 +152,9 @@ class AdvertisementEnvelope:
             normalize_address(self.adapter_address, field_name="adapter_address"),
         )
         object.__setattr__(self, "boot_id", normalize_uuid(self.boot_id, field_name="boot_id"))
+        object.__setattr__(
+            self, "session_id", normalize_uuid(self.session_id, field_name="session_id")
+        )
         object.__setattr__(
             self,
             "sequence",
@@ -212,6 +216,7 @@ class AdvertisementEnvelope:
             "panel": self.panel,
             "rssi": self.rssi,
             "sequence": self.sequence,
+            "session_id": self.session_id,
             "service_data": {key: value.hex() for key, value in self.service_data.items()},
             "service_uuids": list(self.service_uuids),
             "version": self.version,

@@ -15,6 +15,7 @@ from custom_components.brilliant_mqtt.ble_protocol import (
     MAX_DATA_BYTES,
     MAX_LOCAL_NAME_BYTES,
     MAX_RSSI,
+    MAX_TOMBSTONES,
     MAX_TX_POWER,
     MIN_RSSI,
     MIN_TX_POWER,
@@ -52,6 +53,7 @@ def test_shared_fixture_decodes_with_complete_byte_fields() -> None:
         panel="shed",
         adapter_address="11:22:33:44:55:66",
         boot_id="123e4567-e89b-12d3-a456-426614174000",
+        session_id="223e4567-e89b-12d3-a456-426614174000",
         sequence=42,
         address="AA:BB:CC:DD:EE:FF",
         address_type="public",
@@ -72,6 +74,7 @@ def test_decoder_normalizes_wire_values() -> None:
             address="aa-bb-cc-dd-ee-ff",
             address_type=" RANDOM ",
             boot_id="123E4567-E89B-12D3-A456-426614174000",
+            session_id="223E4567-E89B-12D3-A456-426614174000",
             service_uuids=[BATTERY_UUID.upper(), BATTERY_UUID],
             service_data={BATTERY_UUID.upper(): "AABBCC"},
         ),
@@ -83,6 +86,7 @@ def test_decoder_normalizes_wire_values() -> None:
     assert advertisement.address == "AA:BB:CC:DD:EE:FF"
     assert advertisement.address_type == "random"
     assert advertisement.boot_id == "123e4567-e89b-12d3-a456-426614174000"
+    assert advertisement.session_id == "223e4567-e89b-12d3-a456-426614174000"
     assert advertisement.service_uuids == (BATTERY_UUID,)
     assert advertisement.service_data == {BATTERY_UUID: bytes.fromhex("aabbcc")}
 
@@ -116,6 +120,15 @@ def test_decoder_rejects_unknown_version_and_fields() -> None:
         _decode(private_identity="must-not-leak")
 
 
+def test_decoder_requires_process_session_id() -> None:
+    value = dict(VALID["value"])
+    del value["session_id"]
+    payload = json.dumps(value, separators=(",", ":"), sort_keys=True)
+
+    with pytest.raises(ValueError, match="session_id"):
+        decode_advertisement(payload, topic=advertisement_topic("shed"), retained=False)
+
+
 def test_decoder_rejects_duplicate_json_keys_at_any_depth() -> None:
     duplicate_panel = VALID["encoded"].replace('"panel":"shed"', '"panel":"shed","panel":"office"')
     duplicate_manufacturer = VALID["encoded"].replace(
@@ -132,6 +145,13 @@ def test_decoder_rejects_duplicate_json_keys_at_any_depth() -> None:
 @pytest.mark.parametrize("value", ["", "AA:BB:CC:DD:EE", "GG:BB:CC:DD:EE:FF"])
 def test_decoder_rejects_invalid_bluetooth_addresses(field: str, value: str) -> None:
     with pytest.raises(ValueError, match="address"):
+        _decode(**{field: value})
+
+
+@pytest.mark.parametrize("field", ["boot_id", "session_id"])
+@pytest.mark.parametrize("value", ["", "not-a-uuid", 1])
+def test_decoder_rejects_invalid_generation_uuid(field: str, value: object) -> None:
+    with pytest.raises(ValueError, match=field):
         _decode(**{field: value})
 
 
@@ -222,6 +242,7 @@ def test_sequence_tracker_accepts_strictly_increasing_packets() -> None:
     tracker.accept(_decode(sequence=41))
     tracker.accept(_decode(sequence=42))
     assert tracker.current_boot_id == "123e4567-e89b-12d3-a456-426614174000"
+    assert tracker.current_session_id == "223e4567-e89b-12d3-a456-426614174000"
     assert tracker.last_sequence == 42
 
     with pytest.raises(ValueError, match="duplicate"):
@@ -230,15 +251,68 @@ def test_sequence_tracker_accepts_strictly_increasing_packets() -> None:
         tracker.accept(_decode(sequence=40))
 
 
+def test_sequence_tracker_accepts_same_boot_restart_and_tombstones_old_session() -> None:
+    tracker = AdvertisementSequenceTracker()
+    boot_id = "123e4567-e89b-12d3-a456-426614174000"
+    old_session = "223e4567-e89b-12d3-a456-426614174000"
+    new_session = "323e4567-e89b-12d3-a456-426614174000"
+
+    tracker.accept(_decode(boot_id=boot_id, session_id=old_session, sequence=900))
+    tracker.accept(_decode(boot_id=boot_id, session_id=new_session, sequence=1))
+    assert tracker.current_boot_id == boot_id
+    assert tracker.current_session_id == new_session
+    assert tracker.last_sequence == 1
+
+    with pytest.raises(ValueError, match="prior session"):
+        tracker.accept(_decode(boot_id=boot_id, session_id=old_session, sequence=901))
+
+
 def test_sequence_tracker_accepts_new_boot_and_tombstones_old_boot() -> None:
     tracker = AdvertisementSequenceTracker()
     old_boot = "123e4567-e89b-12d3-a456-426614174000"
     new_boot = "223e4567-e89b-12d3-a456-426614174000"
+    old_session = "323e4567-e89b-12d3-a456-426614174000"
+    new_session = "423e4567-e89b-12d3-a456-426614174000"
 
-    tracker.accept(_decode(boot_id=old_boot, sequence=900))
-    tracker.accept(_decode(boot_id=new_boot, sequence=1))
+    tracker.accept(_decode(boot_id=old_boot, session_id=old_session, sequence=900))
+    tracker.accept(_decode(boot_id=new_boot, session_id=new_session, sequence=1))
     assert tracker.current_boot_id == new_boot
+    assert tracker.current_session_id == new_session
     assert tracker.last_sequence == 1
 
     with pytest.raises(ValueError, match="prior boot"):
-        tracker.accept(_decode(boot_id=old_boot, sequence=901))
+        tracker.accept(_decode(boot_id=old_boot, session_id=old_session, sequence=901))
+
+
+def test_sequence_tombstone_horizon_evicts_oldest_session_explicitly() -> None:
+    tracker = AdvertisementSequenceTracker()
+    boot_id = str(UUID(int=1))
+    sessions = [str(UUID(int=100 + index)) for index in range(MAX_TOMBSTONES + 2)]
+
+    tracker.accept(_decode(boot_id=boot_id, session_id=sessions[0], sequence=1))
+    for session_id in sessions[1 : MAX_TOMBSTONES + 1]:
+        tracker.accept(_decode(boot_id=boot_id, session_id=session_id, sequence=1))
+
+    with pytest.raises(ValueError, match="prior session"):
+        tracker.accept(_decode(boot_id=boot_id, session_id=sessions[0], sequence=2))
+
+    tracker.accept(_decode(boot_id=boot_id, session_id=sessions[MAX_TOMBSTONES + 1], sequence=1))
+    tracker.accept(_decode(boot_id=boot_id, session_id=sessions[0], sequence=2))
+    assert tracker.current_session_id == sessions[0]
+
+
+def test_sequence_tombstone_horizon_evicts_oldest_boot_explicitly() -> None:
+    tracker = AdvertisementSequenceTracker()
+    boots = [str(UUID(int=1_000 + index)) for index in range(MAX_TOMBSTONES + 2)]
+    session_id = str(UUID(int=10_000))
+
+    tracker.accept(_decode(boot_id=boots[0], session_id=session_id, sequence=1))
+    for boot_id in boots[1 : MAX_TOMBSTONES + 1]:
+        tracker.accept(_decode(boot_id=boot_id, session_id=session_id, sequence=1))
+
+    with pytest.raises(ValueError, match="prior boot"):
+        tracker.accept(_decode(boot_id=boots[0], session_id=session_id, sequence=2))
+
+    tracker.accept(_decode(boot_id=boots[MAX_TOMBSTONES + 1], session_id=session_id, sequence=1))
+    tracker.accept(_decode(boot_id=boots[0], session_id=session_id, sequence=2))
+    assert tracker.current_boot_id == boots[0]

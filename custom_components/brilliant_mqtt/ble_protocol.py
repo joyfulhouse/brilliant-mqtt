@@ -21,7 +21,11 @@ MIN_RSSI = -127
 MAX_RSSI = 20
 MIN_TX_POWER = -127
 MAX_TX_POWER = 20
-MAX_PRIOR_BOOT_IDS = 8
+# MQTT QoS 0 can still deliver a bounded amount of late traffic. Retain the most
+# recent 64 retired process sessions and 64 retired kernel boots. This is a
+# deliberate replay *horizon*, not permanent replay protection; explicit eviction
+# behavior is covered by the protocol tests.
+MAX_TOMBSTONES = 64
 
 _TOPIC_PREFIX = "brilliant/ble/v1"
 _PANEL_PATTERN = re.compile(r"[a-z0-9][a-z0-9_-]{0,62}")
@@ -34,6 +38,7 @@ _REQUIRED_FIELDS = frozenset(
         "panel",
         "adapter_address",
         "boot_id",
+        "session_id",
         "sequence",
         "address",
         "address_type",
@@ -54,6 +59,7 @@ class Advertisement:
     panel: str
     adapter_address: str
     boot_id: str
+    session_id: str
     sequence: int
     address: str
     address_type: str
@@ -76,6 +82,9 @@ class Advertisement:
             _normalized_address(self.adapter_address, field_name="adapter_address"),
         )
         object.__setattr__(self, "boot_id", _normalized_uuid(self.boot_id, field_name="boot_id"))
+        object.__setattr__(
+            self, "session_id", _normalized_uuid(self.session_id, field_name="session_id")
+        )
         object.__setattr__(
             self,
             "sequence",
@@ -123,15 +132,24 @@ class Advertisement:
 
 
 class AdvertisementSequenceTracker:
-    """Enforce strict sequence order while permitting one-way boot changes."""
+    """Order packets within process generations and bound late-packet rejection.
 
-    def __init__(self, *, max_prior_boot_ids: int = MAX_PRIOR_BOOT_IDS) -> None:
-        if type(max_prior_boot_ids) is not int or not 1 <= max_prior_boot_ids <= 64:
-            raise ValueError("max_prior_boot_ids must be an integer from 1 through 64")
-        self._max_prior_boot_ids = max_prior_boot_ids
+    Sequence order is scoped to ``(boot_id, session_id)``. A process restart gets a
+    fresh session UUID even when the kernel boot is unchanged, so sequence may reset.
+    Retired sessions and boots are rejected only while they remain inside the explicit
+    ``max_tombstones`` horizon.
+    """
+
+    def __init__(self, *, max_tombstones: int = MAX_TOMBSTONES) -> None:
+        if type(max_tombstones) is not int or not 1 <= max_tombstones <= MAX_TOMBSTONES:
+            raise ValueError(f"max_tombstones must be an integer from 1 through {MAX_TOMBSTONES}")
+        self._max_tombstones = max_tombstones
         self._prior_boot_ids: deque[str] = deque()
         self._prior_boot_set: set[str] = set()
+        self._prior_sessions: deque[tuple[str, str]] = deque()
+        self._prior_session_set: set[tuple[str, str]] = set()
         self.current_boot_id: str | None = None
+        self.current_session_id: str | None = None
         self.last_sequence: int | None = None
 
     def accept(self, advertisement: Advertisement) -> None:
@@ -140,27 +158,47 @@ class AdvertisementSequenceTracker:
             raise ValueError("advertisement must be validated before ordering")
         if self.current_boot_id is None:
             self.current_boot_id = advertisement.boot_id
+            self.current_session_id = advertisement.session_id
             self.last_sequence = advertisement.sequence
             return
-        if advertisement.boot_id == self.current_boot_id:
+        if advertisement.boot_id in self._prior_boot_set:
+            raise ValueError("advertisement belongs to a prior boot")
+        generation = (advertisement.boot_id, advertisement.session_id)
+        if generation in self._prior_session_set:
+            raise ValueError("advertisement belongs to a prior session")
+        if (
+            advertisement.boot_id == self.current_boot_id
+            and advertisement.session_id == self.current_session_id
+        ):
             if advertisement.sequence == self.last_sequence:
                 raise ValueError("duplicate advertisement sequence")
             if self.last_sequence is not None and advertisement.sequence < self.last_sequence:
                 raise ValueError("out-of-order advertisement sequence")
             self.last_sequence = advertisement.sequence
             return
-        if advertisement.boot_id in self._prior_boot_set:
-            raise ValueError("advertisement belongs to a prior boot")
-        self._remember_prior_boot(self.current_boot_id)
+        if advertisement.boot_id == self.current_boot_id:
+            if self.current_session_id is None:
+                raise ValueError("current advertisement session is unavailable")
+            self._remember_prior_session((self.current_boot_id, self.current_session_id))
+        else:
+            self._remember_prior_boot(self.current_boot_id)
         self.current_boot_id = advertisement.boot_id
+        self.current_session_id = advertisement.session_id
         self.last_sequence = advertisement.sequence
 
     def _remember_prior_boot(self, boot_id: str) -> None:
-        if len(self._prior_boot_ids) == self._max_prior_boot_ids:
+        if len(self._prior_boot_ids) == self._max_tombstones:
             forgotten = self._prior_boot_ids.popleft()
             self._prior_boot_set.remove(forgotten)
         self._prior_boot_ids.append(boot_id)
         self._prior_boot_set.add(boot_id)
+
+    def _remember_prior_session(self, generation: tuple[str, str]) -> None:
+        if len(self._prior_sessions) == self._max_tombstones:
+            forgotten = self._prior_sessions.popleft()
+            self._prior_session_set.remove(forgotten)
+        self._prior_sessions.append(generation)
+        self._prior_session_set.add(generation)
 
 
 def advertisement_topic(panel: str) -> str:
@@ -179,6 +217,7 @@ def decode_advertisement(payload: str | bytes, *, topic: str, retained: bool) ->
         panel=_required_string(value, "panel"),
         adapter_address=_required_string(value, "adapter_address"),
         boot_id=_required_string(value, "boot_id"),
+        session_id=_required_string(value, "session_id"),
         sequence=_required_integer(value, "sequence"),
         address=_required_string(value, "address"),
         address_type=_required_string(value, "address_type"),

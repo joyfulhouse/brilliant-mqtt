@@ -37,6 +37,7 @@ def _advertisement(**overrides: Any) -> AdvertisementEnvelope:
         "panel": "shed",
         "adapter_address": "11:22:33:44:55:66",
         "boot_id": "123e4567-e89b-12d3-a456-426614174000",
+        "session_id": "223e4567-e89b-12d3-a456-426614174000",
         "sequence": 42,
         "address": "AA:BB:CC:DD:EE:FF",
         "address_type": "public",
@@ -58,6 +59,7 @@ def test_envelope_normalizes_and_encodes_shared_golden_vector() -> None:
         address="aa-bb-cc-dd-ee-ff",
         address_type=" PUBLIC ",
         boot_id="123E4567-E89B-12D3-A456-426614174000",
+        session_id="223E4567-E89B-12D3-A456-426614174000",
         local_name=" Wallet ",
         service_uuids=(BATTERY_UUID.upper(), BATTERY_UUID),
         service_data={BATTERY_UUID.upper(): bytearray.fromhex("aabbcc")},
@@ -68,6 +70,7 @@ def test_envelope_normalizes_and_encodes_shared_golden_vector() -> None:
     assert advertisement.address == "AA:BB:CC:DD:EE:FF"
     assert advertisement.address_type == "public"
     assert advertisement.boot_id == "123e4567-e89b-12d3-a456-426614174000"
+    assert advertisement.session_id == "223e4567-e89b-12d3-a456-426614174000"
     assert advertisement.local_name == "Wallet"
     assert advertisement.service_uuids == (BATTERY_UUID,)
     assert advertisement.service_data == {BATTERY_UUID: bytes.fromhex("aabbcc")}
@@ -98,6 +101,13 @@ def test_envelope_rejects_invalid_panel_slug(panel: str) -> None:
 @pytest.mark.parametrize("value", ["", "AA:BB:CC:DD:EE", "GG:BB:CC:DD:EE:FF"])
 def test_envelope_rejects_invalid_bluetooth_addresses(field: str, value: str) -> None:
     with pytest.raises(ValueError, match="address"):
+        _advertisement(**{field: value})
+
+
+@pytest.mark.parametrize("field", ["boot_id", "session_id"])
+@pytest.mark.parametrize("value", ["", "not-a-uuid", 1])
+def test_envelope_rejects_invalid_generation_uuid(field: str, value: object) -> None:
+    with pytest.raises(ValueError, match=field):
         _advertisement(**{field: value})
 
 
