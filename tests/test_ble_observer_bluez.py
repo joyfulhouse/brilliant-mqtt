@@ -9,6 +9,7 @@ import pytest
 
 from brilliant_ble_observer.bluez import (
     DEVICE_INTERFACE,
+    MAX_DEVICE_CACHE_ENTRIES,
     BluezObserver,
     DbusSignal,
     Observation,
@@ -68,7 +69,7 @@ class FakeBluezClient:
     async def add_signal_match(self, rule: str, handler: SignalHandler) -> None:
         self.method_calls.append("AddMatch")
         self.handlers[rule] = handler
-        if len(self.handlers) == 2:
+        if len(self.handlers) == 3:
             self.matches_ready.set()
 
     async def remove_signal_match(self, rule: str, handler: SignalHandler) -> None:
@@ -111,6 +112,7 @@ async def _start_observer(
     client: FakeBluezClient,
     *,
     allowlist: tuple[AllowlistEntry, ...] | None = None,
+    device_cache_size: int = MAX_DEVICE_CACHE_ENTRIES,
 ) -> tuple[asyncio.Task[None], list[Observation]]:
     observations: list[Observation] = []
 
@@ -129,6 +131,7 @@ async def _start_observer(
         ),
         client_factory=lambda: client,
         monotonic=lambda: 123.456,
+        device_cache_size=device_cache_size,
     )
     task = asyncio.create_task(observer.observe_once(on_observation))
     await asyncio.wait_for(client.matches_ready.wait(), timeout=1)
@@ -277,6 +280,110 @@ async def test_fresh_payload_that_no_longer_matches_allowlist_is_not_emitted() -
     assert [item.rssi for item in observations] == [-61]
 
 
+async def test_interfaces_removed_discards_cached_device_properties() -> None:
+    barrier_address = "AA:BB:CC:DD:EE:01"
+    barrier_path = f"{ADAPTER_PATH}/dev_AA_BB_CC_DD_EE_01"
+    client = FakeBluezClient()
+    task, observations = await _start_observer(
+        client,
+        allowlist=(
+            AllowlistEntry(address="AA:BB:CC:DD:EE:FF"),
+            AllowlistEntry(address=barrier_address),
+        ),
+    )
+    client.emit(
+        DbusSignal(
+            path="/",
+            interface="org.freedesktop.DBus.ObjectManager",
+            member="InterfacesAdded",
+            body=(DEVICE_PATH, {DEVICE_INTERFACE: _device_properties()}),
+        )
+    )
+    await _wait_for_count(observations, 1)
+
+    client.emit(
+        DbusSignal(
+            path="/",
+            interface="org.freedesktop.DBus.ObjectManager",
+            member="InterfacesRemoved",
+            body=(DEVICE_PATH, (DEVICE_INTERFACE,)),
+        )
+    )
+    client.emit(
+        DbusSignal(
+            path=DEVICE_PATH,
+            interface="org.freedesktop.DBus.Properties",
+            member="PropertiesChanged",
+            body=(DEVICE_INTERFACE, {"RSSI": -55}, ()),
+        )
+    )
+    client.emit(
+        DbusSignal(
+            path="/",
+            interface="org.freedesktop.DBus.ObjectManager",
+            member="InterfacesAdded",
+            body=(
+                barrier_path,
+                {DEVICE_INTERFACE: _device_properties(Address=barrier_address, RSSI=-40)},
+            ),
+        )
+    )
+    await _wait_for_count(observations, 2)
+    await _cancel(task)
+
+    assert [item.rssi for item in observations] == [-61, -40]
+
+
+async def test_device_property_cache_evicts_least_recently_seen_path() -> None:
+    addresses = (
+        "AA:BB:CC:DD:EE:01",
+        "AA:BB:CC:DD:EE:02",
+        "AA:BB:CC:DD:EE:03",
+        "AA:BB:CC:DD:EE:04",
+    )
+    paths = tuple(f"{ADAPTER_PATH}/dev_{address.replace(':', '_')}" for address in addresses)
+    client = FakeBluezClient()
+    task, observations = await _start_observer(
+        client,
+        allowlist=tuple(AllowlistEntry(address=address) for address in addresses),
+        device_cache_size=2,
+    )
+    for path, address in zip(paths[:3], addresses[:3], strict=True):
+        client.emit(
+            DbusSignal(
+                path="/",
+                interface="org.freedesktop.DBus.ObjectManager",
+                member="InterfacesAdded",
+                body=(path, {DEVICE_INTERFACE: _device_properties(Address=address)}),
+            )
+        )
+    await _wait_for_count(observations, 3)
+
+    client.emit(
+        DbusSignal(
+            path=paths[0],
+            interface="org.freedesktop.DBus.Properties",
+            member="PropertiesChanged",
+            body=(DEVICE_INTERFACE, {"RSSI": -50}, ()),
+        )
+    )
+    client.emit(
+        DbusSignal(
+            path="/",
+            interface="org.freedesktop.DBus.ObjectManager",
+            member="InterfacesAdded",
+            body=(
+                paths[3],
+                {DEVICE_INTERFACE: _device_properties(Address=addresses[3], RSSI=-45)},
+            ),
+        )
+    )
+    await _wait_for_count(observations, 4)
+    await _cancel(task)
+
+    assert [item.address for item in observations] == list(addresses)
+
+
 async def test_cancellation_unregisters_signals_and_closes_client() -> None:
     client = FakeBluezClient()
     task, _observations = await _start_observer(client)
@@ -289,7 +396,9 @@ async def test_cancellation_unregisters_signals_and_closes_client() -> None:
         "Properties.Get:org.bluez.Adapter1.Address",
         "AddMatch",
         "AddMatch",
+        "AddMatch",
         "GetManagedObjects",
+        "RemoveMatch",
         "RemoveMatch",
         "RemoveMatch",
     ]

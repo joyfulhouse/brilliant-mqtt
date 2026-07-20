@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal, Protocol, cast
@@ -29,6 +30,7 @@ PROPERTIES_INTERFACE = "org.freedesktop.DBus.Properties"
 DBUS_INTERFACE = "org.freedesktop.DBus"
 DBUS_PATH = "/org/freedesktop/DBus"
 SIGNAL_QUEUE_SIZE = 256
+MAX_DEVICE_CACHE_ENTRIES = 512
 
 _LOG = logging.getLogger(__name__)
 
@@ -122,6 +124,7 @@ class BluezObserver:
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         reconnect_backoff: float = 2.0,
+        device_cache_size: int = MAX_DEVICE_CACHE_ENTRIES,
     ) -> None:
         self._adapter_path = f"/org/bluez/{adapter}"
         self._allowlist = tuple(allowlist)
@@ -131,6 +134,13 @@ class BluezObserver:
         if reconnect_backoff < 0:
             raise ValueError("reconnect_backoff must be non-negative")
         self._reconnect_backoff = reconnect_backoff
+        if (
+            not isinstance(device_cache_size, int)
+            or isinstance(device_cache_size, bool)
+            or device_cache_size < 1
+        ):
+            raise ValueError("device_cache_size must be a positive integer")
+        self._device_cache_size = device_cache_size
 
     async def run(self, on_observation: ObservationHandler) -> None:
         """Rebuild passive D-Bus sessions after disconnects with fixed backoff."""
@@ -153,7 +163,7 @@ class BluezObserver:
         rules = self._signal_rules()
         registered: list[str] = []
         signal_queue: asyncio.Queue[DbusSignal] = asyncio.Queue(maxsize=SIGNAL_QUEUE_SIZE)
-        properties: dict[str, dict[str, object]] = {}
+        properties: OrderedDict[str, dict[str, object]] = OrderedDict()
 
         def receive_signal(signal: DbusSignal) -> None:
             if signal_queue.full():
@@ -181,7 +191,7 @@ class BluezObserver:
                 if not isinstance(raw, Mapping):
                     continue
                 current = _string_mapping(cast(Mapping[object, object], raw))
-                properties[path] = current
+                self._remember_device(properties, path, current)
                 if "RSSI" in current:
                     await self._emit_if_allowed(
                         current,
@@ -210,7 +220,7 @@ class BluezObserver:
         self,
         client: BluezClient,
         queue: asyncio.Queue[DbusSignal],
-        properties: dict[str, dict[str, object]],
+        properties: OrderedDict[str, dict[str, object]],
         *,
         adapter_address: str,
         on_observation: ObservationHandler,
@@ -242,7 +252,7 @@ class BluezObserver:
     async def _handle_signal(
         self,
         signal: DbusSignal,
-        properties: dict[str, dict[str, object]],
+        properties: OrderedDict[str, dict[str, object]],
         *,
         adapter_address: str,
         on_observation: ObservationHandler,
@@ -261,7 +271,7 @@ class BluezObserver:
             if not isinstance(device, Mapping):
                 return
             current = _string_mapping(device)
-            properties[path] = current
+            self._remember_device(properties, path, current)
             if "RSSI" not in current:
                 return
             await self._emit_if_allowed(
@@ -269,6 +279,19 @@ class BluezObserver:
                 adapter_address=adapter_address,
                 on_observation=on_observation,
             )
+            return
+
+        if (
+            signal.interface == OBJECT_MANAGER_INTERFACE
+            and signal.member == "InterfacesRemoved"
+            and len(signal.body) == 2
+        ):
+            path, interfaces = signal.body
+            if not isinstance(path, str) or not self._is_adapter_device(path):
+                return
+            if isinstance(interfaces, Sequence) and not isinstance(interfaces, (str, bytes)):
+                if DEVICE_INTERFACE in interfaces:
+                    properties.pop(path, None)
             return
 
         if (
@@ -282,12 +305,13 @@ class BluezObserver:
         if interface_name != DEVICE_INTERFACE or not isinstance(changed, Mapping):
             return
         changed_values = _string_mapping(changed)
-        current = properties.setdefault(signal.path, {})
+        current = properties.pop(signal.path, {})
         current.update(changed_values)
         if isinstance(invalidated, Sequence) and not isinstance(invalidated, (str, bytes)):
             for field in invalidated:
                 if isinstance(field, str):
                     current.pop(field, None)
+        self._remember_device(properties, signal.path, current)
         if "RSSI" not in changed_values:
             return
         await self._emit_if_allowed(
@@ -319,10 +343,23 @@ class BluezObserver:
     def _is_adapter_device(self, path: object) -> bool:
         return isinstance(path, str) and path.startswith(f"{self._adapter_path}/dev_")
 
-    def _signal_rules(self) -> tuple[str, str]:
+    def _remember_device(
+        self,
+        properties: OrderedDict[str, dict[str, object]],
+        path: str,
+        current: dict[str, object],
+    ) -> None:
+        properties[path] = current
+        properties.move_to_end(path)
+        while len(properties) > self._device_cache_size:
+            properties.popitem(last=False)
+
+    def _signal_rules(self) -> tuple[str, ...]:
         return (
             "type='signal',sender='org.bluez',"
             "interface='org.freedesktop.DBus.ObjectManager',member='InterfacesAdded'",
+            "type='signal',sender='org.bluez',"
+            "interface='org.freedesktop.DBus.ObjectManager',member='InterfacesRemoved'",
             "type='signal',sender='org.bluez',"
             "interface='org.freedesktop.DBus.Properties',member='PropertiesChanged',"
             f"path_namespace='{self._adapter_path}'",

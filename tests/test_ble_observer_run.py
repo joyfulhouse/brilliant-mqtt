@@ -73,6 +73,11 @@ class FailingObserver:
         raise ConnectionError("BlueZ failed")
 
 
+class ImmediateFailingObserver:
+    async def run(self, _callback: Callable[[Observation], Awaitable[None]]) -> None:
+        raise ConnectionError("BlueZ failed immediately")
+
+
 class FakePublisher:
     def __init__(self) -> None:
         self.envelopes: list[AdvertisementEnvelope] = []
@@ -93,10 +98,19 @@ class FakePublisher:
 
 
 class FakeProbeClient:
-    def __init__(self, *, connect_error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        connect_error: Exception | None = None,
+        block_start: bool = False,
+        stop_error: Exception | None = None,
+    ) -> None:
         self.connect_error = connect_error
+        self.block_start = block_start
+        self.stop_error = stop_error
         self.calls: list[str] = []
         self.started = asyncio.Event()
+        self.release_start = asyncio.Event()
 
     async def connect(self) -> None:
         self.calls.append("connect")
@@ -106,9 +120,13 @@ class FakeProbeClient:
     async def start_discovery(self, adapter_path: str) -> None:
         self.calls.append(f"StartDiscovery:{adapter_path}")
         self.started.set()
+        if self.block_start:
+            await self.release_start.wait()
 
     async def stop_discovery(self, adapter_path: str) -> None:
         self.calls.append(f"StopDiscovery:{adapter_path}")
+        if self.stop_error is not None:
+            raise self.stop_error
 
     async def close(self) -> None:
         self.calls.append("close")
@@ -208,6 +226,24 @@ async def test_child_failure_cancels_peer_and_propagates() -> None:
     assert publisher.stopped.is_set()
 
 
+async def test_child_failure_wins_race_with_requested_stop() -> None:
+    publisher = FakePublisher()
+    stop_event = asyncio.Event()
+    stop_event.set()
+
+    with pytest.raises(ConnectionError, match="failed immediately"):
+        await run_service(
+            _settings(enabled=True),
+            observer_factory=lambda _settings: ImmediateFailingObserver(),
+            publisher_factory=lambda _settings: publisher,
+            boot_id_reader=lambda: BOOT_ID,
+            session_id_factory=lambda: SESSION_ID,
+            stop_event=stop_event,
+        )
+
+    assert publisher.stopped.is_set()
+
+
 async def test_stop_event_cancels_both_children_cleanly() -> None:
     observer = FakeObserver()
     publisher = FakePublisher()
@@ -283,8 +319,40 @@ async def test_probe_cancellation_stops_discovery_in_finally() -> None:
     ]
 
 
+async def test_probe_cancellation_during_start_still_attempts_balanced_stop() -> None:
+    client = FakeProbeClient(block_start=True)
+    task = asyncio.create_task(run_probe(adapter="hci0", seconds=10, client_factory=lambda: client))
+    await asyncio.wait_for(client.started.wait(), timeout=1)
+
+    await _cancel(task)
+
+    assert client.calls == [
+        "connect",
+        "StartDiscovery:/org/bluez/hci0",
+        "StopDiscovery:/org/bluez/hci0",
+        "close",
+    ]
+
+
 async def test_probe_exception_between_start_and_stop_still_cleans_up() -> None:
     client = FakeProbeClient()
+
+    async def fail(_duration: float) -> None:
+        raise RuntimeError("probe interrupted")
+
+    with pytest.raises(RuntimeError, match="probe interrupted"):
+        await run_probe(
+            adapter="hci0",
+            seconds=10,
+            client_factory=lambda: client,
+            sleep=fail,
+        )
+
+    assert client.calls[-2:] == ["StopDiscovery:/org/bluez/hci0", "close"]
+
+
+async def test_probe_cleanup_failure_does_not_mask_primary_failure() -> None:
+    client = FakeProbeClient(stop_error=RuntimeError("stop failed"))
 
     async def fail(_duration: float) -> None:
         raise RuntimeError("probe interrupted")

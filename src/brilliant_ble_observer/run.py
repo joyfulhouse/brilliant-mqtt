@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -17,6 +18,8 @@ from .mqtt import AdvertisementPublisher
 BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
 MIN_PROBE_SECONDS = 5.0
 MAX_PROBE_SECONDS = 60.0
+
+_LOG = logging.getLogger(__name__)
 
 
 class ObservationSource(Protocol):
@@ -128,17 +131,47 @@ async def run_service(
 
     try:
         done, _pending = await asyncio.wait(wait_tasks, return_when=asyncio.FIRST_COMPLETED)
+        completed_children = tuple(task for task in child_tasks if task in done)
+        for task in completed_children:
+            if task.cancelled() or task.exception() is not None:
+                await task
+        if completed_children:
+            raise RuntimeError(f"{completed_children[0].get_name()} stopped unexpectedly")
         if stop_task is not None and stop_task in done:
             return
-        for task in child_tasks:
-            if task not in done:
-                continue
-            await task
-            raise RuntimeError(f"{task.get_name()} stopped unexpectedly")
     finally:
         for cleanup_task in wait_tasks:
             cleanup_task.cancel()
         await asyncio.gather(*wait_tasks, return_exceptions=True)
+
+
+async def _complete_cleanup(operation: Awaitable[None]) -> BaseException | None:
+    """Finish one cleanup operation even if its caller is cancelled."""
+    cleanup_task = asyncio.ensure_future(operation)
+    try:
+        await asyncio.shield(cleanup_task)
+    except asyncio.CancelledError as cancellation:
+        try:
+            await cleanup_task
+        except BaseException as error:
+            return error
+        return cancellation
+    except BaseException as error:
+        return error
+    return None
+
+
+async def _cleanup_probe(
+    client: ProbeClient, adapter_path: str, *, stop_discovery: bool
+) -> tuple[BaseException, ...]:
+    """Balance a probe session and retain every cleanup failure."""
+    errors: list[BaseException] = []
+    if stop_discovery:
+        if error := await _complete_cleanup(client.stop_discovery(adapter_path)):
+            errors.append(error)
+    if error := await _complete_cleanup(client.close()):
+        errors.append(error)
+    return tuple(errors)
 
 
 async def run_probe(
@@ -156,15 +189,24 @@ async def run_probe(
     duration = min(MAX_PROBE_SECONDS, max(MIN_PROBE_SECONDS, duration))
     adapter_path = f"/org/bluez/{adapter}"
     client = client_factory()
-    started = False
+    start_attempted = False
+    failure: BaseException | None = None
     try:
         await client.connect()
+        start_attempted = True
         await client.start_discovery(adapter_path)
-        started = True
         await sleep(duration)
-    finally:
-        try:
-            if started:
-                await client.stop_discovery(adapter_path)
-        finally:
-            await client.close()
+    except BaseException as primary_error:
+        failure = primary_error
+
+    cleanup_errors = await _cleanup_probe(client, adapter_path, stop_discovery=start_attempted)
+    if failure is not None:
+        for cleanup_error in cleanup_errors:
+            _LOG.warning(
+                "BLE probe cleanup failed while propagating %s (%s)",
+                type(failure).__name__,
+                type(cleanup_error).__name__,
+            )
+        raise failure
+    if cleanup_errors:
+        raise cleanup_errors[0]
