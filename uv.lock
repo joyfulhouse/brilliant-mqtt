@@ -132,6 +132,7 @@ source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
     { name = "aiomqtt" },
+    { name = "dbus-next" },
 ]
 
 [package.dev-dependencies]
@@ -147,6 +148,7 @@ dev = [
 requires-dist = [
     { name = "aiohttp", specifier = ">=3.14.1" },
     { name = "aiomqtt", specifier = ">=2.3" },
+    { name = "dbus-next", specifier = "==0.2.3" },
 ]
 
 [package.metadata.requires-dev]
@@ -211,6 +213,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/da/81/330bf2ac32feb234096bfdebaae53888e95de8af01b88b6f477156569401/cryptography-38.0.1-cp36-abi3-musllinux_1_1_x86_64.whl", hash = "sha256:89ed49784ba88c221756ff4d4755dbc03b3c8d2c5103f6d6b4f83a0fb1e85294", size = 4228078, upload-time = "2022-09-07T12:35:39.332Z" },
     { url = "https://files.pythonhosted.org/packages/15/e6/0f8365582b130cbd1f1e7f1f901ac817f483b28417ae4d51f41d47c5addf/cryptography-38.0.1-cp36-abi3-win32.whl", hash = "sha256:ac7e48f7e7261207d750fa7e55eac2d45f720027d5703cd9007e9b37bbb59ac0", size = 2085757, upload-time = "2022-09-07T12:35:42.703Z" },
     { url = "https://files.pythonhosted.org/packages/cd/ec/e44ce2d0b787e4aa437f5cdae4583c2d673c5c2dba3c4ae6d3b088b89bfb/cryptography-38.0.1-cp36-abi3-win_amd64.whl", hash = "sha256:ad7353f6ddf285aeadfaf79e5a6829110106ff8189391704c1d8801aa0bae45a", size = 2435308, upload-time = "2022-09-07T12:35:46.728Z" },
+]
+
+[[package]]
+name = "dbus-next"
+version = "0.2.3"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/ce/45/6a40fbe886d60a8c26f480e7d12535502b5ba123814b3b9a0b002ebca198/dbus_next-0.2.3.tar.gz", hash = "sha256:f4eae26909332ada528c0a3549dda8d4f088f9b365153952a408e28023a626a5", size = 71112, upload-time = "2021-07-25T22:11:28.398Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d2/fc/c0a3f4c4eaa5a22fbef91713474666e13d0ea2a69c84532579490a9f2cc8/dbus_next-0.2.3-py3-none-any.whl", hash = "sha256:58948f9aff9db08316734c0be2a120f6dc502124d9642f55e90ac82ffb16a18b", size = 57885, upload-time = "2021-07-25T22:11:25.466Z" },
 ]
 
 [[package]]

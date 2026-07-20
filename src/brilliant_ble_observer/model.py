@@ -125,6 +125,73 @@ def _normalize_manufacturer_data(values: object) -> Mapping[int, bytes]:
 
 
 @dataclass(frozen=True)
+class NormalizedAdvertisementFields:
+    """Canonical normalized fields shared by panel observation and wire models."""
+
+    adapter_address: str
+    address: str
+    address_type: str
+    rssi: int
+    local_name: str | None
+    tx_power: int | None
+    service_uuids: tuple[str, ...]
+    service_data: Mapping[str, bytes]
+    manufacturer_data: Mapping[int, bytes]
+    capture_monotonic_ms: int
+
+
+def normalize_advertisement_fields(
+    *,
+    adapter_address: object,
+    address: object,
+    address_type: object,
+    rssi: object,
+    local_name: object,
+    tx_power: object,
+    service_uuids: object,
+    service_data: object,
+    manufacturer_data: object,
+    capture_monotonic_ms: object,
+) -> NormalizedAdvertisementFields:
+    """Validate and normalize the common advertisement field set once."""
+    if not isinstance(address_type, str):
+        raise ValueError("address_type must be public or random")
+    normalized_address_type = address_type.strip().lower()
+    if normalized_address_type not in _ADDRESS_TYPES:
+        raise ValueError("address_type must be public or random")
+    normalized_tx_power = None
+    if tx_power is not None:
+        normalized_tx_power = _bounded_integer(
+            tx_power,
+            field_name="tx_power",
+            minimum=MIN_TX_POWER,
+            maximum=MAX_TX_POWER,
+        )
+    return NormalizedAdvertisementFields(
+        adapter_address=normalize_address(adapter_address, field_name="adapter_address"),
+        address=normalize_address(address),
+        address_type=normalized_address_type,
+        rssi=_bounded_integer(
+            rssi,
+            field_name="rssi",
+            minimum=MIN_RSSI,
+            maximum=MAX_RSSI,
+        ),
+        local_name=_normalize_local_name(local_name),
+        tx_power=normalized_tx_power,
+        service_uuids=_normalize_service_uuids(service_uuids),
+        service_data=_normalize_service_data(service_data),
+        manufacturer_data=_normalize_manufacturer_data(manufacturer_data),
+        capture_monotonic_ms=_bounded_integer(
+            capture_monotonic_ms,
+            field_name="capture_monotonic_ms",
+            minimum=0,
+            maximum=MAX_COUNTER,
+        ),
+    )
+
+
+@dataclass(frozen=True)
 class AdvertisementEnvelope:
     """One normalized advertisement emitted by one physical panel."""
 
@@ -146,11 +213,6 @@ class AdvertisementEnvelope:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "panel", normalize_panel(self.panel))
-        object.__setattr__(
-            self,
-            "adapter_address",
-            normalize_address(self.adapter_address, field_name="adapter_address"),
-        )
         object.__setattr__(self, "boot_id", normalize_uuid(self.boot_id, field_name="boot_id"))
         object.__setattr__(
             self, "session_id", normalize_uuid(self.session_id, field_name="session_id")
@@ -160,45 +222,28 @@ class AdvertisementEnvelope:
             "sequence",
             _bounded_integer(self.sequence, field_name="sequence", minimum=1, maximum=MAX_COUNTER),
         )
-        object.__setattr__(self, "address", normalize_address(self.address))
-        if not isinstance(self.address_type, str):
-            raise ValueError("address_type must be public or random")
-        address_type = self.address_type.strip().lower()
-        if address_type not in _ADDRESS_TYPES:
-            raise ValueError("address_type must be public or random")
-        object.__setattr__(self, "address_type", address_type)
-        object.__setattr__(
-            self,
-            "rssi",
-            _bounded_integer(self.rssi, field_name="rssi", minimum=MIN_RSSI, maximum=MAX_RSSI),
+        normalized = normalize_advertisement_fields(
+            adapter_address=self.adapter_address,
+            address=self.address,
+            address_type=self.address_type,
+            rssi=self.rssi,
+            local_name=self.local_name,
+            tx_power=self.tx_power,
+            service_uuids=self.service_uuids,
+            service_data=self.service_data,
+            manufacturer_data=self.manufacturer_data,
+            capture_monotonic_ms=self.capture_monotonic_ms,
         )
-        object.__setattr__(self, "local_name", _normalize_local_name(self.local_name))
-        if self.tx_power is not None:
-            object.__setattr__(
-                self,
-                "tx_power",
-                _bounded_integer(
-                    self.tx_power,
-                    field_name="tx_power",
-                    minimum=MIN_TX_POWER,
-                    maximum=MAX_TX_POWER,
-                ),
-            )
-        object.__setattr__(self, "service_uuids", _normalize_service_uuids(self.service_uuids))
-        object.__setattr__(self, "service_data", _normalize_service_data(self.service_data))
-        object.__setattr__(
-            self, "manufacturer_data", _normalize_manufacturer_data(self.manufacturer_data)
-        )
-        object.__setattr__(
-            self,
-            "capture_monotonic_ms",
-            _bounded_integer(
-                self.capture_monotonic_ms,
-                field_name="capture_monotonic_ms",
-                minimum=0,
-                maximum=MAX_COUNTER,
-            ),
-        )
+        object.__setattr__(self, "adapter_address", normalized.adapter_address)
+        object.__setattr__(self, "address", normalized.address)
+        object.__setattr__(self, "address_type", normalized.address_type)
+        object.__setattr__(self, "rssi", normalized.rssi)
+        object.__setattr__(self, "local_name", normalized.local_name)
+        object.__setattr__(self, "tx_power", normalized.tx_power)
+        object.__setattr__(self, "service_uuids", normalized.service_uuids)
+        object.__setattr__(self, "service_data", normalized.service_data)
+        object.__setattr__(self, "manufacturer_data", normalized.manufacturer_data)
+        object.__setattr__(self, "capture_monotonic_ms", normalized.capture_monotonic_ms)
         if len(self.to_json().encode("utf-8")) > MAX_PAYLOAD_BYTES:
             raise ValueError(f"advertisement payload must not exceed {MAX_PAYLOAD_BYTES} bytes")
 

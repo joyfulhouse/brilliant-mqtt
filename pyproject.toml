@@ -9,6 +9,7 @@ requires-python = ">=3.10,<3.11"
 dependencies = [
     "aiomqtt>=2.3", # async MQTT (wraps paho-mqtt); vendored to /var on the panel
     "aiohttp>=3.14.1", # async HTTP/WebSocket client for the HA mirror (brilliant_ha_mirror)
+    "dbus-next==0.2.3",
 ]
 
 [dependency-groups]
@@ -72,4 +73,5 @@ packages = [
     "src/brilliant_bus_watchdog",
     "src/brilliant_ha_mirror",
     "src/brilliant_hue_ca",
+    "src/brilliant_ble_observer",
 ]

@@ -19,6 +19,16 @@ _ADAPTER_PATTERN = re.compile(r"hci(?:0|[1-9][0-9]{0,2})")
 _LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 
 
+def normalize_adapter(value: object) -> str:
+    """Return one validated BlueZ adapter name."""
+    if not isinstance(value, str):
+        raise ValueError("BLE_OBSERVER_ADAPTER must be hci followed by a numeric index")
+    normalized = value.strip()
+    if _ADAPTER_PATTERN.fullmatch(normalized) is None:
+        raise ValueError("BLE_OBSERVER_ADAPTER must be hci followed by a numeric index")
+    return normalized
+
+
 @dataclass(frozen=True)
 class Settings:
     """Immutable observer settings sourced from the process environment."""
@@ -51,9 +61,7 @@ class Settings:
         enabled = _parse_bool(source.get("BLE_OBSERVER_ENABLED", "false"))
         allowlist = _parse_allowlist_json(source.get("BLE_OBSERVER_ALLOWLIST_JSON", "[]"))
 
-        adapter = source.get("BLE_OBSERVER_ADAPTER", "hci0").strip()
-        if _ADAPTER_PATTERN.fullmatch(adapter) is None:
-            raise ValueError("BLE_OBSERVER_ADAPTER must be hci followed by a numeric index")
+        adapter = normalize_adapter(source.get("BLE_OBSERVER_ADAPTER", "hci0"))
 
         rate = _parse_rate(source.get("BLE_OBSERVER_MAX_EVENTS_PER_SECOND", "10"))
         log_level = source.get("BLE_OBSERVER_LOG_LEVEL", "INFO").strip().upper()
