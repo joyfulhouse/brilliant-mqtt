@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Mapping
 from dataclasses import replace
@@ -102,6 +103,25 @@ SCRIPT_INPUT = {
 }
 
 FETCH_VOICE = "custom_components.brilliant_mqtt.components.async_fetch_voice_payload"
+
+
+class _GatedBleQuarantineShell(FakeShell):
+    """Hold a pinned cleanup open so a second cancellation can test shielding."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.quarantine_started = asyncio.Event()
+        self.release_quarantine = asyncio.Event()
+
+    async def run(self, command: str) -> RunResult:
+        if command == f"systemctl disable --now {BLE_OBSERVER_SERVICE_NAME}":
+            self._require_connected()
+            self.commands.append(command)
+            self.quarantine_started.set()
+            await self.release_quarantine.wait()
+            return RunResult(0, "", "")
+        return await super().run(command)
+
 
 RECONFIG_INPUT = {
     CONF_HOST: "192.168.1.10",
@@ -597,6 +617,66 @@ async def test_script_partial_ble_enable_failure_is_quarantined_before_no_entry(
     assert any(PANEL_BLE_OBSERVER_UNIT_FILE in command for command in shell.commands)
 
 
+async def test_script_cancellation_shields_pinned_quarantine_before_no_entry(
+    hass: HomeAssistant,
+    not_installed_panel: None,
+    patch_installs: Any,
+) -> None:
+    """Setup cancellation cannot strand an enabled observer without an owning entry."""
+    del patch_installs
+    result = await _drive_flow_to_script(hass)
+    shell = _GatedBleQuarantineShell()
+    observer_mutated = asyncio.Event()
+    enable = f"systemctl enable --now {BLE_OBSERVER_SERVICE_NAME}"
+
+    async def partially_enable_then_wait(
+        _hass: HomeAssistant,
+        target: PanelShell,
+        _data: Mapping[str, Any],
+    ) -> None:
+        await target.run(enable)
+        observer_mutated.set()
+        await asyncio.Event().wait()
+
+    observer = replace(
+        components.REGISTRY[COMPONENT_BLE_OBSERVER],
+        install=partially_enable_then_wait,
+    )
+    with (
+        patch.object(config_flow, "AsyncsshShell", return_value=shell),
+        patch.dict(components.REGISTRY, {COMPONENT_BLE_OBSERVER: observer}),
+    ):
+        operation = asyncio.create_task(
+            hass.config_entries.flow.async_configure(
+                result["flow_id"],
+                {
+                    **SCRIPT_INPUT,
+                    COMPONENT_BLE_OBSERVER: True,
+                    CONF_BLE_OBSERVER_ALLOWLIST_JSON: ('[{"address":"AA:BB:CC:DD:EE:FF"}]'),
+                },
+            )
+        )
+        try:
+            await asyncio.wait_for(observer_mutated.wait(), timeout=0.5)
+            operation.cancel()
+            await asyncio.wait_for(shell.quarantine_started.wait(), timeout=0.5)
+            operation.cancel()
+            shell.release_quarantine.set()
+            with pytest.raises(asyncio.CancelledError):
+                await operation
+        finally:
+            shell.release_quarantine.set()
+            if not operation.done():
+                operation.cancel()
+                await asyncio.gather(operation, return_exceptions=True)
+
+    assert not hass.config_entries.async_entries(DOMAIN)
+    disable = f"systemctl disable --now {BLE_OBSERVER_SERVICE_NAME}"
+    assert shell.commands.index(enable) < shell.commands.index(disable)
+    assert panel_ops.BLE_OBSERVER_ACTIVE_COMMAND in shell.commands
+    assert any(PANEL_BLE_OBSERVER_UNIT_FILE in command for command in shell.commands)
+
+
 async def test_script_default_off_proves_stale_active_observer_stopped_before_entry(
     hass: HomeAssistant,
     not_installed_panel: None,
@@ -871,6 +951,116 @@ async def test_apply_config_pushes_when_panel_matches(hass: HomeAssistant) -> No
     assert key == "ssh-ed25519 FAKEKEY"
     assert any(data == b"NEWENV" for (_path, data, _mode) in shell.uploads)
     assert "systemctl restart brilliant-mqtt" in shell.commands
+
+
+async def test_apply_config_ble_only_patches_env_without_restarting_bridge(
+    hass: HomeAssistant,
+) -> None:
+    """Observer lifecycle data shares the env file but not the bridge process."""
+    same = panel_ops.render_env(
+        panel="office",
+        mesh_priority=0,
+        mqtt_host="h",
+        mqtt_port=1883,
+        mqtt_username="u",
+        mqtt_password="p",
+    )
+    allowlist = '[{"address":"AA:BB:CC:DD:EE:FF"}]'
+    shell = FakeShell(
+        responses={
+            panel_ops.INSPECT_COMMAND: _inspect(True, True),
+            f"cat {PANEL_ENV_FILE}": RunResult(0, same, ""),
+        }
+    )
+
+    with patch.object(config_flow, "AsyncsshShell", return_value=shell):
+        key = await config_flow._apply_config(
+            hass,
+            "10.0.0.10",
+            "pw",
+            pinned_key="ssh-ed25519 FAKEKEY",
+            env_content=None,
+            expected_panel="office",
+            restart_bridge=False,
+            ble_observer_config=(True, allowlist),
+        )
+
+    assert key == "ssh-ed25519 FAKEKEY"
+    live_env = next(data for path, data, _mode in shell.uploads if path == PANEL_ENV_FILE)
+    parsed = panel_ops.parse_env(live_env.decode())
+    assert parsed[panel_ops.ENV_BLE_OBSERVER_ENABLED] == "1"
+    assert parsed[panel_ops.ENV_BLE_OBSERVER_ALLOWLIST_JSON] == allowlist
+    assert "systemctl restart brilliant-mqtt" not in shell.commands
+
+
+async def test_apply_config_cancellation_uses_pinned_quarantine_session(
+    hass: HomeAssistant,
+) -> None:
+    """Cancellation after an env mutation drains cleanup on a fresh pinned session."""
+    existing = panel_ops.render_env(
+        panel="office",
+        mesh_priority=0,
+        mqtt_host="h",
+        mqtt_port=1883,
+        mqtt_username="u",
+        mqtt_password="p",
+    )
+    applying = FakeShell(
+        responses={
+            panel_ops.INSPECT_COMMAND: _inspect(True, True),
+            f"cat {PANEL_ENV_FILE}": RunResult(0, existing, ""),
+        },
+        pinned="ssh-ed25519 PINNED",
+    )
+    cleanup = FakeShell(
+        responses={panel_ops.BLE_OBSERVER_ACTIVE_COMMAND: RunResult(3, "inactive\n", "")}
+    )
+    shells = iter((applying, cleanup))
+    connections: list[tuple[str, str, str | None]] = []
+    mutation_started = asyncio.Event()
+
+    def shell_factory(host: str, password: str, pinned_key: str | None) -> FakeShell:
+        connections.append((host, password, pinned_key))
+        return next(shells)
+
+    async def mutate_then_wait(
+        target: PanelShell,
+        *,
+        enabled: bool,
+        allowlist_json: str,
+    ) -> None:
+        del target, enabled, allowlist_json
+        mutation_started.set()
+        await asyncio.Event().wait()
+
+    with (
+        patch.object(config_flow, "AsyncsshShell", side_effect=shell_factory),
+        patch.object(panel_ops, "configure_ble_observer_env", side_effect=mutate_then_wait),
+    ):
+        operation = asyncio.create_task(
+            config_flow._apply_config(
+                hass,
+                "10.0.0.10",
+                "pw",
+                pinned_key="ssh-ed25519 PINNED",
+                env_content=None,
+                expected_panel="office",
+                restart_bridge=False,
+                ble_observer_config=(True, '[{"address":"AA:BB:CC:DD:EE:FF"}]'),
+                fail_closed_ble=True,
+            )
+        )
+        await asyncio.wait_for(mutation_started.wait(), timeout=0.5)
+        operation.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await operation
+
+    assert connections == [
+        ("10.0.0.10", "pw", "ssh-ed25519 PINNED"),
+        ("10.0.0.10", "pw", "ssh-ed25519 PINNED"),
+    ]
+    assert f"systemctl disable --now {BLE_OBSERVER_SERVICE_NAME}" in cleanup.commands
+    assert any(PANEL_BLE_OBSERVER_UNIT_FILE in command for command in cleanup.commands)
 
 
 async def test_apply_config_failure_quarantines_changed_observer_env(hass: HomeAssistant) -> None:
@@ -1324,9 +1514,109 @@ async def test_reconfigure_enables_observer_and_scanner_with_canonical_allowlist
     assert entry.data[CONF_BLE_SCANNER_ENABLED] is True
     assert entry.data[CONF_BLE_OBSERVER_ALLOWLIST_JSON] == canonical
     assert patch_installs.called(COMPONENT_BLE_OBSERVER)
-    pushed = panel_ops.parse_env(apply.call_args.kwargs["env_content"])
-    assert pushed["BLE_OBSERVER_ENABLED"] == "1"
-    assert pushed["BLE_OBSERVER_ALLOWLIST_JSON"] == canonical
+    assert apply.call_args.kwargs["env_content"] is None
+    assert apply.call_args.kwargs["restart_bridge"] is False
+    assert apply.call_args.kwargs["ble_observer_config"] == (True, canonical)
+
+
+async def test_reconfigure_scanner_only_change_skips_panel_ssh(
+    hass: HomeAssistant,
+) -> None:
+    """The HA-side scanner switch cannot disrupt either panel-side service."""
+    entry = _full_entry(
+        hass,
+        **{
+            CONF_COMPONENTS: {
+                COMPONENT_BRIDGE: True,
+                COMPONENT_BLE_OBSERVER: False,
+            },
+            CONF_BLE_SCANNER_ENABLED: False,
+            CONF_BLE_OBSERVER_ALLOWLIST_JSON: "[]",
+        },
+    )
+    hass.config_entries.async_update_entry(
+        entry,
+        version=config_flow.BrilliantMqttConfigFlow.VERSION,
+    )
+    result = await start_reconfigure(hass, entry)
+    submitted = {
+        **reconfigure_input(entry),
+        CONF_BLE_SCANNER_ENABLED: True,
+    }
+
+    with patch(APPLY, return_value="ssh-ed25519 STORED") as apply:
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], submitted)
+
+    assert result["type"] == "abort" and result["reason"] == "reconfigure_successful"
+    apply.assert_not_awaited()
+    assert entry.data[CONF_BLE_SCANNER_ENABLED] is True
+
+
+async def test_reconfigure_cancellation_quarantines_before_entry_update(
+    hass: HomeAssistant,
+    patch_installs: Any,
+) -> None:
+    """A cancelled observer install cannot outlive the still-off stored selection."""
+    del patch_installs
+    entry = _full_entry(
+        hass,
+        **{
+            CONF_COMPONENTS: {
+                COMPONENT_BRIDGE: True,
+                COMPONENT_BLE_OBSERVER: False,
+            },
+            CONF_BLE_OBSERVER_ALLOWLIST_JSON: "[]",
+        },
+    )
+    before = dict(entry.data)
+    result = await start_reconfigure(hass, entry)
+    shell = FakeShell(
+        responses={panel_ops.BLE_OBSERVER_ACTIVE_COMMAND: RunResult(3, "inactive\n", "")}
+    )
+    observer_mutated = asyncio.Event()
+    enable = f"systemctl enable --now {BLE_OBSERVER_SERVICE_NAME}"
+
+    async def partially_enable_then_wait(
+        _hass: HomeAssistant,
+        target: PanelShell,
+        _data: Mapping[str, Any],
+    ) -> None:
+        await target.run(enable)
+        observer_mutated.set()
+        await asyncio.Event().wait()
+
+    observer = replace(
+        components.REGISTRY[COMPONENT_BLE_OBSERVER],
+        install=partially_enable_then_wait,
+    )
+    with (
+        patch(APPLY, return_value="ssh-ed25519 STORED"),
+        patch.object(config_flow, "AsyncsshShell", return_value=shell),
+        patch.dict(components.REGISTRY, {COMPONENT_BLE_OBSERVER: observer}),
+    ):
+        operation = asyncio.create_task(
+            hass.config_entries.flow.async_configure(
+                result["flow_id"],
+                {
+                    **reconfigure_input(entry, ble_observer=True),
+                    CONF_BLE_OBSERVER_ALLOWLIST_JSON: ('[{"address":"AA:BB:CC:DD:EE:FF"}]'),
+                },
+            )
+        )
+        try:
+            await asyncio.wait_for(observer_mutated.wait(), timeout=0.5)
+            operation.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await operation
+        finally:
+            if not operation.done():
+                operation.cancel()
+                await asyncio.gather(operation, return_exceptions=True)
+
+    assert entry.data == before
+    disable = f"systemctl disable --now {BLE_OBSERVER_SERVICE_NAME}"
+    assert shell.commands.index(enable) < shell.commands.index(disable)
+    assert any(PANEL_BLE_OBSERVER_UNIT_FILE in command for command in shell.commands)
 
 
 async def test_reconfigure_component_failure_before_ble_quarantines_desired_observer(
@@ -1369,8 +1659,12 @@ async def test_reconfigure_component_failure_before_ble_quarantines_desired_obse
 
     assert result["type"] == "form" and result["errors"] == {"base": "cannot_apply"}
     assert entry.data == before
-    pushed = panel_ops.parse_env(apply.call_args.kwargs["env_content"])
-    assert pushed["BLE_OBSERVER_ENABLED"] == "1"
+    assert apply.call_args.kwargs["env_content"] is None
+    assert apply.call_args.kwargs["restart_bridge"] is False
+    assert apply.call_args.kwargs["ble_observer_config"] == (
+        True,
+        '[{"address":"AA:BB:CC:DD:EE:FF"}]',
+    )
     assert f"systemctl disable --now {BLE_OBSERVER_SERVICE_NAME}" in shell.commands
     assert panel_ops.BLE_OBSERVER_ACTIVE_COMMAND in shell.commands
     assert any(PANEL_BLE_OBSERVER_UNIT_FILE in command for command in shell.commands)
@@ -1378,18 +1672,25 @@ async def test_reconfigure_component_failure_before_ble_quarantines_desired_obse
 
 
 @pytest.mark.parametrize(
-    ("changed_key", "new_value", "expected_env_key", "expected_env_value"),
+    (
+        "changed_key",
+        "new_value",
+        "expected_env_key",
+        "expected_env_value",
+        "bridge_restarted",
+    ),
     [
-        (CONF_HOST, "192.168.1.11", panel_ops.ENV_PANEL, "office"),
-        (CONF_MQTT_HOST, "new.broker", panel_ops.ENV_MQTT_HOST, "new.broker"),
-        (CONF_MQTT_PORT, 8883, panel_ops.ENV_MQTT_PORT, "8883"),
-        (CONF_MQTT_USERNAME, "new-user", panel_ops.ENV_MQTT_USERNAME, "new-user"),
-        (CONF_MQTT_PASSWORD, "new-password", panel_ops.ENV_MQTT_PASSWORD, "new-password"),
+        (CONF_HOST, "192.168.1.11", panel_ops.ENV_PANEL, "office", False),
+        (CONF_MQTT_HOST, "new.broker", panel_ops.ENV_MQTT_HOST, "new.broker", True),
+        (CONF_MQTT_PORT, 8883, panel_ops.ENV_MQTT_PORT, "8883", True),
+        (CONF_MQTT_USERNAME, "new-user", panel_ops.ENV_MQTT_USERNAME, "new-user", True),
+        (CONF_MQTT_PASSWORD, "new-password", panel_ops.ENV_MQTT_PASSWORD, "new-password", True),
         (
             CONF_BLE_OBSERVER_ALLOWLIST_JSON,
             '[{"address":"11:22:33:44:55:66"}]',
             panel_ops.ENV_BLE_OBSERVER_ALLOWLIST_JSON,
             '[{"address":"11:22:33:44:55:66"}]',
+            False,
         ),
     ],
     ids=["panel-host", "mqtt-host", "mqtt-port", "mqtt-username", "mqtt-password", "allowlist"],
@@ -1401,6 +1702,7 @@ async def test_reconfigure_selected_observer_restarts_after_runtime_env_write(
     new_value: Any,
     expected_env_key: str,
     expected_env_value: str,
+    bridge_restarted: bool,
 ) -> None:
     old_allowlist = '[{"address":"AA:BB:CC:DD:EE:FF"}]'
     entry = _full_entry(
@@ -1478,11 +1780,14 @@ async def test_reconfigure_selected_observer_restarts_after_runtime_env_write(
     assert result["type"] == "abort" and result["reason"] == "reconfigure_successful"
     assert activate.await_count == 1
     assert activate.call_args.args[0:2] == (hass, shell)
-    bridge_restart = shell.commands.index("systemctl restart brilliant-mqtt")
     observer_enable = shell.commands.index("systemctl enable brilliant-ble-observer")
     observer_restart = shell.commands.index("systemctl restart brilliant-ble-observer")
-    assert bridge_restart < observer_enable < observer_restart
-    assert shell.commands.count("systemctl restart brilliant-mqtt") == 1
+    assert observer_enable < observer_restart
+    bridge_command = "systemctl restart brilliant-mqtt"
+    assert (bridge_command in shell.commands) is bridge_restarted
+    if bridge_restarted:
+        assert shell.commands.index(bridge_command) < observer_enable
+        assert shell.commands.count(bridge_command) == 1
     assert not any(
         "bluetoothctl" in command or "bluetoothd" in command for command in shell.commands
     )

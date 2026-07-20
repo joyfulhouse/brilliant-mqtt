@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import asyncssh
 import pytest
 
@@ -64,6 +66,30 @@ class _SequencedActivityShell(FakeShell):
             self._require_connected()
             self.commands.append(command)
             return self._activity.pop(0)
+        return await super().run(command)
+
+
+class _CancellationDuringActivationShell(FakeShell):
+    """Expose both cancellation boundaries around a mutating BLE activation."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.activation_started = asyncio.Event()
+        self.quarantine_started = asyncio.Event()
+        self.release_quarantine = asyncio.Event()
+
+    async def run(self, command: str) -> RunResult:
+        if command == f"systemctl enable --now {BLE_OBSERVER_SERVICE_NAME}":
+            self._require_connected()
+            self.commands.append(command)
+            self.activation_started.set()
+            await asyncio.Event().wait()
+        if command == f"systemctl disable --now {BLE_OBSERVER_SERVICE_NAME}":
+            self._require_connected()
+            self.commands.append(command)
+            self.quarantine_started.set()
+            await self.release_quarantine.wait()
+            return RunResult(0, "", "")
         return await super().run(command)
 
 
@@ -1337,6 +1363,34 @@ async def test_enable_ble_observer_quarantines_unproven_activation(proof: RunRes
     assert any(PANEL_BLE_OBSERVER_UNIT_FILE in command for command in shell.commands)
 
 
+async def test_enable_ble_observer_cancellation_shields_and_drains_quarantine() -> None:
+    """Repeated cancellation cannot interrupt cleanup after activation may mutate."""
+    shell = _CancellationDuringActivationShell()
+    await shell.connect()
+    operation = asyncio.create_task(panel_ops.enable_ble_observer(shell))
+
+    try:
+        await asyncio.wait_for(shell.activation_started.wait(), timeout=0.5)
+        operation.cancel()
+        await asyncio.wait_for(shell.quarantine_started.wait(), timeout=0.5)
+        operation.cancel()
+        shell.release_quarantine.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await operation
+    finally:
+        shell.release_quarantine.set()
+        if not operation.done():
+            operation.cancel()
+            await asyncio.gather(operation, return_exceptions=True)
+
+    enable = f"systemctl enable --now {BLE_OBSERVER_SERVICE_NAME}"
+    disable = f"systemctl disable --now {BLE_OBSERVER_SERVICE_NAME}"
+    assert shell.commands.index(enable) < shell.commands.index(disable)
+    assert panel_ops.BLE_OBSERVER_ACTIVE_COMMAND in shell.commands
+    assert any(PANEL_BLE_OBSERVER_UNIT_FILE in command for command in shell.commands)
+
+
 async def test_uninstall_ble_observer_disables_env_and_leaves_bridge_and_bluez_untouched() -> None:
     existing = panel_ops.render_env(
         panel="office",
@@ -1364,6 +1418,7 @@ async def test_uninstall_ble_observer_disables_env_and_leaves_bridge_and_bluez_u
     assert updated["BLE_OBSERVER_ALLOWLIST_JSON"] == "[]"
     assert f"systemctl disable --now {BLE_OBSERVER_SERVICE_NAME}" in shell.commands[0]
     assert any(PANEL_BLE_OBSERVER_UNIT_FILE in command for command in shell.commands)
+    assert any(f"{PANEL_BLE_OBSERVER_DIR}.bak" in command for command in shell.commands)
     assert not any(
         forbidden in command
         for command in shell.commands

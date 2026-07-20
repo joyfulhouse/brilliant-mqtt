@@ -68,6 +68,35 @@ def test_all_environment_values_are_parsed() -> None:
     assert settings.mqtt_port == 8883
 
 
+def test_settings_repr_redacts_password_and_private_allowlist() -> None:
+    password = "SENTINEL-BROKER-PASSWORD"
+    address = "AA:BB:CC:DD:EE:FF"
+    ibeacon_uuid = "00112233-4455-6677-8899-aabbccddeeff"
+    settings = Settings.from_env(
+        _required_env(
+            MQTT_PASSWORD=password,
+            BLE_OBSERVER_ALLOWLIST_JSON=json.dumps(
+                [
+                    {"address": address},
+                    {
+                        "ibeacon_uuid": ibeacon_uuid,
+                        "ibeacon_major": 66,
+                        "ibeacon_minor": 7,
+                    },
+                ]
+            ),
+        )
+    )
+
+    rendered = repr(settings)
+    assert "Settings(" in rendered
+    assert password not in rendered
+    assert address not in rendered
+    assert ibeacon_uuid not in rendered
+    assert "mqtt_password=" not in rendered
+    assert "allowlist=" not in rendered
+
+
 @pytest.mark.parametrize(
     "missing", ["BRILLIANT_PANEL", "MQTT_HOST", "MQTT_USERNAME", "MQTT_PASSWORD"]
 )

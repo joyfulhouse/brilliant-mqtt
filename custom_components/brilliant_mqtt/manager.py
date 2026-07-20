@@ -522,12 +522,19 @@ class PanelManager:
         if self._ble_observer_explicitly_off():
             self._ble_off_reconciled = False
 
-    async def _reconcile_ble_observer_default_off_on_shell(self, shell: PanelShell) -> None:
-        """Prove default-off state while the caller owns a connected panel shell."""
+    async def _reconcile_ble_observer_default_off_on_shell(self, shell: PanelShell) -> bool:
+        """Prove default-off state, returning whether this shell established proof."""
         if not self._needs_ble_off_reconciliation():
-            return
+            return False
         await panel_ops.quarantine_ble_observer(shell)
-        self._ble_off_reconciled = True
+        return True
+
+    def _complete_ble_off_reconciliation_after_close(
+        self, reconciled: bool, close_ok: bool
+    ) -> None:
+        """Persist physical proof only after its owning transport closes cleanly."""
+        if reconciled:
+            self._ble_off_reconciled = close_ok
 
     async def _reconcile_ble_observer_default_off(self) -> bool:
         """Prove an explicitly unselected observer inactive, surfacing retryable failure."""
@@ -542,16 +549,17 @@ class PanelManager:
                     return False
                 shell = await self._connect_for_repair()
                 try:
-                    await self._reconcile_ble_observer_default_off_on_shell(shell)
+                    reconciled = await self._reconcile_ble_observer_default_off_on_shell(shell)
                 finally:
-                    if not await self._async_close_shell(shell):
-                        raise OSError("panel SSH session could not be closed")
+                    close_ok = await self._async_close_shell(shell)
+                self._complete_ble_off_reconciliation_after_close(reconciled, close_ok)
+                if not close_ok:
+                    raise OSError("panel SSH session could not be closed")
         except (_HostKeyChanged, OSError, asyncssh.Error, PanelOpError) as error:
             if self._shutting_down:
                 return False
             self._escalate(f"BLE observer default-off reconciliation failed: {error}")
             return False
-        self._ble_off_reconciled = True
         return True
 
     async def _on_availability(self, msg: ReceiveMessage) -> None:
@@ -835,6 +843,7 @@ class PanelManager:
                     return
                 try:
                     retirement_result: bool | None = None
+                    ble_off_reconciled = False
                     state = await panel_ops.inspect_panel(shell)
                     unit, env = await self._config_contents()
                     self._reset_ble_off_reconciliation()
@@ -874,7 +883,9 @@ class PanelManager:
 
                     selected = selected_ids(self.entry.data)
                     await self._relay_selected_components(shell, selected, action="repair")
-                    await self._reconcile_ble_observer_default_off_on_shell(shell)
+                    ble_off_reconciled = await self._reconcile_ble_observer_default_off_on_shell(
+                        shell
+                    )
                     # Hue CA recovery hook re-lay: re-write its units to /etc if selected.
                     # OTA wipes /etc/systemd/system/ (and /data — what the hook itself
                     # recovers), so the timer disappears after a firmware update even
@@ -907,6 +918,7 @@ class PanelManager:
                     return
                 finally:
                     close_ok = await self._async_close_shell(shell)
+                self._complete_ble_off_reconciliation_after_close(ble_off_reconciled, close_ok)
                 self._complete_ha_mirror_retirement_after_close(retirement_result, close_ok)
             self._last_repair_mono = time.monotonic()
             if self._shutting_down:
@@ -978,6 +990,7 @@ class PanelManager:
                 _p(25)
                 try:
                     retirement_result: bool | None = None
+                    ble_off_reconciled = False
                     _p(40)
                     await panel_ops.deploy_payload(shell, str(_payload_dir()), version)
                     _p(80)
@@ -985,7 +998,9 @@ class PanelManager:
                     self._reset_ble_off_reconciliation()
                     await panel_ops.ensure_configs(shell, unit, env)
                     await self._refresh_ble_observer_for_update(shell)
-                    await self._reconcile_ble_observer_default_off_on_shell(shell)
+                    ble_off_reconciled = await self._reconcile_ble_observer_default_off_on_shell(
+                        shell
+                    )
                     _p(90)
                     await panel_ops.restart(shell)
                     try:
@@ -1006,6 +1021,7 @@ class PanelManager:
                     ) from err
                 finally:
                     close_ok = await self._async_close_shell(shell)
+                self._complete_ble_off_reconciliation_after_close(ble_off_reconciled, close_ok)
                 self._complete_ha_mirror_retirement_after_close(retirement_result, close_ok)
             _p(100)
             self._fire(EVENT_AGENT_UPDATED, {"version": version})
@@ -1332,6 +1348,7 @@ class PanelManager:
                 await shell.connect()
                 try:
                     retirement_result: bool | None = None
+                    ble_off_reconciled = False
                     unit, env = await self._config_contents()
                     self._reset_ble_off_reconciliation()
                     await panel_ops.ensure_configs(shell, unit, env)
@@ -1340,7 +1357,9 @@ class PanelManager:
 
                     selected = selected_ids(self.entry.data)
                     await self._relay_selected_components(shell, selected, action="refresh")
-                    await self._reconcile_ble_observer_default_off_on_shell(shell)
+                    ble_off_reconciled = await self._reconcile_ble_observer_default_off_on_shell(
+                        shell
+                    )
                     # Hue CA recovery hook: also re-lay its units when selected — OTA
                     # wipes /etc and the timer disappears even though the code +
                     # previously-written CA in /var survive.
@@ -1360,6 +1379,7 @@ class PanelManager:
                         )
                 finally:
                     close_ok = await self._async_close_shell(shell)
+                self._complete_ble_off_reconciliation_after_close(ble_off_reconciled, close_ok)
                 self._complete_ha_mirror_retirement_after_close(retirement_result, close_ok)
         except (OSError, asyncssh.Error, PanelOpError):
             _LOGGER.warning("%s: staged-copy refresh failed; will retry next reconcile", self.panel)

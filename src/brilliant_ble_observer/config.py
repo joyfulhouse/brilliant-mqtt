@@ -7,7 +7,7 @@ import math
 import os
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .model import AllowlistEntry, normalize_panel, parse_allowlist
 
@@ -36,10 +36,10 @@ class Settings:
     panel: str
     mqtt_host: str
     mqtt_username: str
-    mqtt_password: str
+    mqtt_password: str = field(repr=False)
     mqtt_port: int = 1883
     enabled: bool = False
-    allowlist: tuple[AllowlistEntry, ...] = ()
+    allowlist: tuple[AllowlistEntry, ...] = field(default=(), repr=False)
     adapter: str = "hci0"
     max_events_per_second: float = 10.0
     log_level: str = "INFO"

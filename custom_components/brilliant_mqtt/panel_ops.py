@@ -14,6 +14,7 @@ from dataclasses import dataclass
 
 import asyncssh
 
+from .async_cleanup import shielded_cleanup_after_failure
 from .const import (
     BLE_OBSERVER_SERVICE_NAME,
     BUS_WATCHDOG_SERVICE_NAME,
@@ -1187,8 +1188,8 @@ async def _activate_and_prove_ble_observer(
             payload_present=True,
         ):
             raise PanelOpError("BLE observer activation health proof failed")
-    except (OSError, asyncssh.Error, PanelOpError):
-        await quarantine_ble_observer(shell)
+    except BaseException as error:
+        await shielded_cleanup_after_failure(error, quarantine_ble_observer(shell))
         raise
 
 
@@ -1251,7 +1252,7 @@ async def _remove_inactive_ble_observer(shell: PanelShell) -> None:
     await _checked(shell, f"rm -f {PANEL_BLE_OBSERVER_UNIT_FILE}")
     await _checked(
         shell,
-        f"rm -rf {PANEL_BLE_OBSERVER_DIR} {_BLE_OBSERVER_STAGING_DIR}",
+        f"rm -rf {PANEL_BLE_OBSERVER_DIR} {_BLE_OBSERVER_STAGING_DIR} {PANEL_BLE_OBSERVER_DIR}.bak",
     )
     await _checked(shell, "systemctl daemon-reload")
     if env_error is not None:

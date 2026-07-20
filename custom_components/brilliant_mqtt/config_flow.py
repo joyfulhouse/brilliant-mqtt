@@ -29,6 +29,7 @@ from homeassistant.helpers.selector import TextSelector, TextSelectorConfig
 
 from . import _fleet_lock, panel_ops
 from . import components as component_ops
+from .async_cleanup import shielded_cleanup_after_failure
 from .components import REGISTRY, optional
 from .const import (
     COMPONENT_BLE_OBSERVER,
@@ -227,6 +228,15 @@ _BLE_OBSERVER_RUNTIME_KEYS = (
     CONF_MQTT_PASSWORD,
     CONF_BLE_OBSERVER_ALLOWLIST_JSON,
 )
+_MAIN_AGENT_RUNTIME_KEYS = (
+    CONF_MQTT_HOST,
+    CONF_MQTT_PORT,
+    CONF_MQTT_USERNAME,
+    CONF_MQTT_PASSWORD,
+    CONF_MESH_PRIORITY,
+    CONF_HA_CONTROL_ENABLED,
+)
+_PANEL_ENDPOINT_KEYS = (CONF_HOST, CONF_ROOT_PASSWORD)
 
 
 class _RawMultiSelect(cv.multi_select):
@@ -692,44 +702,105 @@ async def _probe_panel(hass: HomeAssistant, host: str, password: str) -> _PanelP
         return _PanelProbe(host_key=key, config=config)
 
 
+def _validate_config_apply_request(
+    env_content: str | None,
+    *,
+    restart_bridge: bool,
+    ble_observer_config: tuple[bool, str] | None,
+) -> None:
+    """Reject contradictory panel config mutations before opening SSH."""
+    if restart_bridge and env_content is None:
+        raise ValueError("bridge restart requires a full environment")
+    if env_content is not None and ble_observer_config is not None:
+        raise ValueError("full and observer-only environment writes are mutually exclusive")
+
+
+async def _apply_requested_panel_config(
+    shell: PanelShell,
+    *,
+    env_content: str | None,
+    restart_bridge: bool,
+    ble_observer_config: tuple[bool, str] | None,
+) -> None:
+    """Apply a pre-validated full, observer-only, or verification-only request."""
+    if env_content is not None:
+        await panel_ops.write_env(shell, env_content)
+    if ble_observer_config is not None:
+        enabled, allowlist_json = ble_observer_config
+        await panel_ops.configure_ble_observer_env(
+            shell,
+            enabled=enabled,
+            allowlist_json=allowlist_json,
+        )
+    if restart_bridge:
+        await panel_ops.restart(shell)
+
+
 async def _apply_config(
     hass: HomeAssistant,
     host: str,
     password: str,
     *,
     pinned_key: str | None,
-    env_content: str,
+    env_content: str | None,
     expected_panel: str,
+    restart_bridge: bool = True,
+    ble_observer_config: tuple[bool, str] | None = None,
     fail_closed_ble: bool = False,
 ) -> str:
-    """Verify/capture the host key; if the agent is installed, push env + restart.
+    """Verify the panel and apply exactly one requested shared-env mutation.
 
-    Returns the (pinned/verified) host key. A not-yet-installed panel skips the push —
-    the entry update still lands and the next deploy renders the new values.
+    A full ``env_content`` write may restart the bridge.  ``ble_observer_config``
+    instead patches only observer-owned keys and never restarts the bridge.  With both
+    values ``None`` this is a verification-only connection.  A not-yet-installed
+    panel skips every write and returns the captured/verified host key.
 
     Before overwriting, it refuses to clobber a DIFFERENT panel: if the box already
     runs an agent whose env names another slug than *expected_panel* (e.g. the host
     was mistyped to another controller in the fleet), it raises _WrongPanelError
     instead of stamping this entry's identity onto that panel and restarting it.
     """
-    async with _panel_session(hass, host, password, pinned_key) as shell:
-        key = shell.pinned_host_key()
-        if key is None:
-            raise OSError("no host key captured")
-        state = await panel_ops.inspect_panel(shell)
-        if state.unit_present:
-            if state.env_present:
-                found = (await panel_ops.read_env(shell)).get(panel_ops.ENV_PANEL)
-                if found and found != expected_panel:
-                    raise _WrongPanelError(found)
-            try:
-                await panel_ops.write_env(shell, env_content)
-                await panel_ops.restart(shell)
-            except (OSError, asyncssh.Error, panel_ops.PanelOpError):
-                if fail_closed_ble:
-                    await panel_ops.quarantine_ble_observer(shell)
-                raise
-        return key
+    _validate_config_apply_request(
+        env_content,
+        restart_bridge=restart_bridge,
+        ble_observer_config=ble_observer_config,
+    )
+
+    key = pinned_key
+    panel_may_have_changed = False
+    try:
+        async with _panel_session(hass, host, password, pinned_key) as shell:
+            key = shell.pinned_host_key()
+            if key is None:
+                raise OSError("no host key captured")
+            state = await panel_ops.inspect_panel(shell)
+            if state.unit_present:
+                if state.env_present:
+                    found = (await panel_ops.read_env(shell)).get(panel_ops.ENV_PANEL)
+                    if found and found != expected_panel:
+                        raise _WrongPanelError(found)
+                panel_may_have_changed = env_content is not None or ble_observer_config is not None
+                await _apply_requested_panel_config(
+                    shell,
+                    env_content=env_content,
+                    restart_bridge=restart_bridge,
+                    ble_observer_config=ble_observer_config,
+                )
+    except BaseException as error:
+        if fail_closed_ble and panel_may_have_changed and key is not None:
+            await shielded_cleanup_after_failure(
+                error,
+                _quarantine_ble_at(
+                    hass,
+                    host=host,
+                    password=password,
+                    host_key=key,
+                ),
+            )
+        raise
+    if key is None:
+        raise OSError("no host key captured")
+    return key
 
 
 def _ble_observer_runtime_values(data: Mapping[str, Any]) -> tuple[object, ...]:
@@ -754,6 +825,40 @@ def _ble_observer_config_changed(previous: Mapping[str, Any], updated: Mapping[s
         return True
     return (was_selected or selected) and (
         _ble_observer_runtime_values(previous) != _ble_observer_runtime_values(updated)
+    )
+
+
+def _main_agent_config_changed(previous: Mapping[str, Any], updated: Mapping[str, Any]) -> bool:
+    """Whether the bridge must reload values from its shared environment."""
+    defaults: Mapping[str, Any] = {
+        CONF_MESH_PRIORITY: 0,
+        CONF_HA_CONTROL_ENABLED: DEFAULT_HA_CONTROL_ENABLED,
+    }
+    return any(
+        previous.get(key, defaults.get(key)) != updated.get(key, defaults.get(key))
+        for key in _MAIN_AGENT_RUNTIME_KEYS
+    )
+
+
+def _panel_reconfigure_required(
+    previous: Mapping[str, Any],
+    updated: Mapping[str, Any],
+    *,
+    current_components: Mapping[str, Any],
+    desired_components: Mapping[str, Any],
+) -> bool:
+    """Whether a reconfigure changes any panel-side state or SSH endpoint."""
+    endpoint_changed = any(previous.get(key) != updated.get(key) for key in _PANEL_ENDPOINT_KEYS)
+    selection_changed = any(
+        bool(current_components.get(component.id, False))
+        != bool(desired_components.get(component.id, False))
+        for component in optional()
+    )
+    return (
+        endpoint_changed
+        or selection_changed
+        or _main_agent_config_changed(previous, updated)
+        or _ble_observer_config_changed(previous, updated)
     )
 
 
@@ -1033,18 +1138,26 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
                             raise panel_ops.PanelOpError(
                                 "default-off BLE observer state could not be proven"
                             )
-                except (
-                    VoicePayloadError,
-                    OSError,
-                    asyncssh.Error,
-                    panel_ops.PanelOpError,
-                ) as error:
-                    cleanup_succeeded = not panel_may_have_changed or await _quarantine_ble_at(
-                        self.hass,
-                        host=str(self._connect[CONF_HOST]),
-                        password=str(self._connect[CONF_ROOT_PASSWORD]),
-                        host_key=str(self._connect[DATA_SSH_HOST_KEY]),
-                    )
+                except BaseException as error:
+                    if panel_may_have_changed:
+                        cleanup_succeeded = await shielded_cleanup_after_failure(
+                            error,
+                            _quarantine_ble_at(
+                                self.hass,
+                                host=str(self._connect[CONF_HOST]),
+                                password=str(self._connect[CONF_ROOT_PASSWORD]),
+                                host_key=str(self._connect[DATA_SSH_HOST_KEY]),
+                            ),
+                        )
+                    else:
+                        if not isinstance(error, Exception):
+                            raise
+                        cleanup_succeeded = True
+                    if not isinstance(
+                        error,
+                        (VoicePayloadError, OSError, asyncssh.Error, panel_ops.PanelOpError),
+                    ):
+                        raise
                     voice_failure = isinstance(error, VoicePayloadError) or (
                         current_cid == COMPONENT_VOICE
                     )
@@ -1121,38 +1234,84 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
                     # would re-offer the root password to an unverified host.
                     errors["base"] = "host_key_changed"
                 else:
-                    ble_candidate_components = dict(entry.data.get(CONF_COMPONENTS) or {})
-                    ble_candidate_components[COMPONENT_BLE_OBSERVER] = (
-                        user_input[COMPONENT_BLE_OBSERVER] is True
-                    )
-                    ble_candidate: dict[str, Any] = {
-                        **entry.data,
-                        **user_input,
-                        CONF_COMPONENTS: ble_candidate_components,
-                        **ble_values,
+                    current: dict[str, Any] = dict(entry.data.get(CONF_COMPONENTS) or {})
+                    desired = {
+                        component.id: bool(
+                            user_input.get(component.id, current.get(component.id, False))
+                        )
+                        for component in optional()
                     }
-                    ble_config_changed = _ble_observer_config_changed(entry.data, ble_candidate)
-                    env = panel_ops.render_env(
-                        panel=entry.data[CONF_PANEL],
-                        mesh_priority=user_input[CONF_MESH_PRIORITY],
-                        mqtt_host=user_input[CONF_MQTT_HOST],
-                        mqtt_port=user_input[CONF_MQTT_PORT],
-                        mqtt_username=user_input[CONF_MQTT_USERNAME],
-                        mqtt_password=user_input[CONF_MQTT_PASSWORD],
-                        scene_bridge_enabled=control_values[CONF_HA_CONTROL_ENABLED],
-                        ble_observer_enabled=user_input[COMPONENT_BLE_OBSERVER] is True,
-                        ble_observer_allowlist_json=ble_values[CONF_BLE_OBSERVER_ALLOWLIST_JSON],
+                    desired[COMPONENT_BRIDGE] = True
+                    desired[COMPONENT_HA_MIRROR] = False
+                    # Checkbox ids live only inside CONF_COMPONENTS; global control
+                    # values are canonicalized separately by _validated_control_input.
+                    optional_ids = {component.id for component in optional()}
+                    clean_input = {
+                        key: value
+                        for key, value in user_input.items()
+                        if key not in optional_ids and key not in _GLOBAL_KEYS
+                    }
+                    candidate_data: dict[str, Any] = {
+                        **entry.data,
+                        **clean_input,
+                        CONF_COMPONENTS: desired,
+                        **ble_values,
+                        **control_values,
+                    }
+                    ble_config_changed = _ble_observer_config_changed(entry.data, candidate_data)
+                    main_agent_changed = _main_agent_config_changed(entry.data, candidate_data)
+                    panel_reconfigure_required = _panel_reconfigure_required(
+                        entry.data,
+                        candidate_data,
+                        current_components=current,
+                        desired_components=desired,
                     )
                     try:
-                        host_key = await _apply_config(
-                            self.hass,
-                            user_input[CONF_HOST],
-                            user_input[CONF_ROOT_PASSWORD],
-                            pinned_key=pinned_key,
-                            env_content=env,
-                            expected_panel=entry.data[CONF_PANEL],
-                            fail_closed_ble=ble_config_changed,
-                        )
+                        if panel_reconfigure_required:
+                            env = (
+                                panel_ops.render_env(
+                                    panel=entry.data[CONF_PANEL],
+                                    mesh_priority=user_input[CONF_MESH_PRIORITY],
+                                    mqtt_host=user_input[CONF_MQTT_HOST],
+                                    mqtt_port=user_input[CONF_MQTT_PORT],
+                                    mqtt_username=user_input[CONF_MQTT_USERNAME],
+                                    mqtt_password=user_input[CONF_MQTT_PASSWORD],
+                                    scene_bridge_enabled=control_values[CONF_HA_CONTROL_ENABLED],
+                                    ble_observer_enabled=(
+                                        user_input[COMPONENT_BLE_OBSERVER] is True
+                                    ),
+                                    ble_observer_allowlist_json=ble_values[
+                                        CONF_BLE_OBSERVER_ALLOWLIST_JSON
+                                    ],
+                                )
+                                if main_agent_changed
+                                else None
+                            )
+                            observer_config = (
+                                (
+                                    user_input[COMPONENT_BLE_OBSERVER] is True,
+                                    ble_values[CONF_BLE_OBSERVER_ALLOWLIST_JSON],
+                                )
+                                if ble_config_changed and not main_agent_changed
+                                else None
+                            )
+                            host_key = await _apply_config(
+                                self.hass,
+                                user_input[CONF_HOST],
+                                user_input[CONF_ROOT_PASSWORD],
+                                pinned_key=pinned_key,
+                                env_content=env,
+                                expected_panel=entry.data[CONF_PANEL],
+                                restart_bridge=main_agent_changed,
+                                ble_observer_config=observer_config,
+                                fail_closed_ble=ble_config_changed,
+                            )
+                        elif isinstance(pinned_key, str):
+                            # Scanner/control-only changes are HA-local. Retain the
+                            # already-verified pin without opening an SSH connection.
+                            host_key = pinned_key
+                        else:
+                            raise asyncssh.HostKeyNotVerifiable("missing stored host key")
                     except _WrongPanelError:
                         # The host runs a DIFFERENT panel's agent (likely a mistyped
                         # address): refuse rather than overwrite + restart that panel.
@@ -1168,30 +1327,9 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
                         # Connected fine, but writing the env / restarting failed.
                         errors["base"] = "cannot_apply"
                     else:
-                        # Env push succeeded — now diff and apply component changes.
-                        current: dict[str, Any] = dict(entry.data.get(CONF_COMPONENTS) or {})
-                        desired = {
-                            c.id: bool(user_input.get(c.id, current.get(c.id, False)))
-                            for c in optional()
-                        }
-                        desired[COMPONENT_BRIDGE] = True
-                        desired[COMPONENT_HA_MIRROR] = False
-                        # Strip optional-component checkbox ids (e.g. "voice") from
-                        # user_input before merging: those belong only in CONF_COMPONENTS,
-                        # not as top-level stray keys in entry data.
-                        _opt_ids = {c.id for c in optional()}
-                        clean_input = {
-                            k: v
-                            for k, v in user_input.items()
-                            if k not in _opt_ids and k not in _GLOBAL_KEYS
-                        }
                         new_data: dict[str, Any] = {
-                            **entry.data,
-                            **clean_input,
+                            **candidate_data,
                             DATA_SSH_HOST_KEY: host_key,
-                            CONF_COMPONENTS: desired,
-                            **ble_values,
-                            **control_values,
                         }
                         try:
                             for c in optional():
@@ -1211,24 +1349,27 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
                                 new_data,
                                 host_key=host_key,
                             )
-                        except VoicePayloadError:
-                            cleanup_succeeded = await _quarantine_failed_ble_transition(
-                                self.hass,
-                                entry.data,
-                                new_data,
-                                host_key=host_key,
+                        except BaseException as error:
+                            cleanup_succeeded = await shielded_cleanup_after_failure(
+                                error,
+                                _quarantine_failed_ble_transition(
+                                    self.hass,
+                                    entry.data,
+                                    new_data,
+                                    host_key=host_key,
+                                ),
                             )
-                            errors["base"] = (
-                                "cannot_install_voice" if cleanup_succeeded else "cannot_apply"
-                            )
-                        except (OSError, asyncssh.Error, panel_ops.PanelOpError):
-                            await _quarantine_failed_ble_transition(
-                                self.hass,
-                                entry.data,
-                                new_data,
-                                host_key=host_key,
-                            )
-                            errors["base"] = "cannot_apply"
+                            if isinstance(error, VoicePayloadError):
+                                errors["base"] = (
+                                    "cannot_install_voice" if cleanup_succeeded else "cannot_apply"
+                                )
+                            elif isinstance(
+                                error,
+                                (OSError, asyncssh.Error, panel_ops.PanelOpError),
+                            ):
+                                errors["base"] = "cannot_apply"
+                            else:
+                                raise
                         else:
                             for fleet_entry in self.hass.config_entries.async_entries(DOMAIN):
                                 if fleet_entry.entry_id == entry.entry_id:

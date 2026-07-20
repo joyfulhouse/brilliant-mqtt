@@ -316,6 +316,51 @@ async def test_default_off_online_audit_surfaces_failure_and_retries(
     assert "needs_attention" in _types(events)
 
 
+async def test_default_off_close_failure_keeps_audit_retryable(
+    hass: HomeAssistant,
+) -> None:
+    """Physical proof is not durable until its owning SSH session closes cleanly."""
+
+    class FailingCloseShell(FakeShell):
+        async def close(self) -> None:
+            self.connected = False
+            raise OSError("close failed")
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="office",
+        data={
+            **ENTRY_DATA,
+            CONF_COMPONENTS: {
+                COMPONENT_BRIDGE: True,
+                COMPONENT_BLE_OBSERVER: False,
+            },
+        },
+        version=CONFIG_ENTRY_VERSION,
+    )
+    entry.add_to_hass(hass)
+    first = FailingCloseShell(
+        responses={panel_ops.BLE_OBSERVER_ACTIVE_COMMAND: RunResult(3, "inactive\n", "")}
+    )
+    retry = FakeShell(
+        responses={panel_ops.BLE_OBSERVER_ACTIVE_COMMAND: RunResult(3, "inactive\n", "")}
+    )
+    manager = PanelManager(hass, entry, asyncio.Lock())
+
+    with patch(
+        "custom_components.brilliant_mqtt.manager.AsyncsshShell",
+        side_effect=[first, retry],
+    ):
+        await manager._on_availability(_online_message())
+        assert manager._ble_off_reconciled is False
+        await manager._on_availability(_online_message())
+
+    assert first.connect_count == 1
+    assert retry.connect_count == 1
+    assert manager._ble_off_reconciled is True
+    assert manager.problem is False
+
+
 async def test_default_off_successful_audit_is_reused_across_lwt_transitions(
     hass: HomeAssistant,
 ) -> None:
