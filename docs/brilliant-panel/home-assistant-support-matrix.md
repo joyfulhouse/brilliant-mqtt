@@ -47,7 +47,8 @@
 | Music/media player | **Research** | Rich MUSIC schema and UI; no forward mapping |
 | Notification/announce | **Research** | UI rich, notification peripheral has no readable vars |
 | Camera/intercom | **Defer to subsystem** | Media/signaling/privacy/resource work, not core MQTT bridge |
-| Partner virtual devices | **Defer** | Prefer native HA integrations; avoid duplicates/cloud indirection |
+| Existing real partner virtual devices | **Defer by default** | Prefer native HA integrations; avoid duplicate entities, partner-cloud indirection, and writes to active real-device rings |
+| Stock partner-stub hosting | **Research** | Shipped `PeripheralInfo(stubbed=True)` path can materialize native partner-owned types; unused Hunter Douglas `SHADE` and dormant RemoteLock `LOCK` are bounded candidates, with production mutation blocked on offline/disposable-home gates |
 | Mesh DFU, bootstrap, reset, beta firmware | **Defer/guarded admin** | High-risk operational commands |
 
 ### 2026-07-11 deployment spot check
@@ -82,7 +83,10 @@ callback or delete was observed. See the
 | HA `run_scene` → Brilliant confirmation | **Implemented + off-panel test** | Existing catalog IDs only; completion requires a matching execution record; Office hardware gate pending. |
 | Brilliant mode catalog/event and HA `set_mode` | **Implemented + off-panel test** | Same constrained transport; live test requires a real configured mode. |
 | Native HA light tile on a physical slider | **Source-eligible; live blocked** | Three stale physical-Control-owned HA `LIGHT` records were offered as assignable targets in the Office slider UI, but were not bound or operated. The four-process VC candidate, type-19 link, credential handoff, captured-firmware pre-start, bounded bootstrap reference, and separate one-shot coordinated light-session validator/coordinator/unit are implemented. Captured-ARM no-start/options, exact staged-source validation, and off-panel unit verification pass. No official VC/light, account/install, live bootstrap, online routing, binding, persistence, or cleanup proof exists. See [slider feasibility](slider-bridge-feasibility.md). |
-| Other native HA switch/lock/cover tiles | **Blocked research** | Physical-Control hosting rejected. Virtual Control must first pass provisioning, ownership, rendering, routing, WAN-isolation, resource, and cleanup gates with the single light. |
+| Native HA cover tile via partner stub | **Research; production blocked** | Stock Hunter Douglas host and shade stub exist on the naturally owned, otherwise-empty partner ring. Must prove rendering, UI→HA, HA→UI without echo, truthful availability, restart, and exact cleanup. PowerView emulation is the cover-specific fallback. See [partner-stub feasibility](native-partner-stub-feasibility.md). |
+| Native HA lock tile via partner stub | **Research; production blocked** | Dormant RemoteLock config is dynamic-variable gated and its lock stub bypasses the real request seam. It becomes eligible only after the shade lifecycle passes; first scope is state plus lock-only, never unlock. |
+| Generic native HA switch/lock/cover tile | **Blocked research** | Physical-Control hosting remains rejected. Types without a safe, unused stock partner stub still require Virtual Control provisioning, ownership, routing, locality, resource, and cleanup proof. |
+| Native HA camera/doorbell tile | **Blocked subsystem** | Firmware can pull RTSP, but stock stubs do not synthesize arbitrary HA media. A real owner must answer `live_view_session:*`; admission alone does not solve signaling, privacy, or teardown. |
 | Room overrides | **Implemented manifest metadata** | Entity area precedes device area and explicit overrides are case-insensitive; metadata does not render a native tile. |
 
 On 2026-07-13, five stale legacy mirror `LIGHT` records rendered in their
@@ -129,12 +133,13 @@ benign existing scene event/action, confirmed HA-to-panel execution, restart
 recovery, no replay, unchanged peer count, and physical responsiveness. Do not
 create arbitrary scene blobs or hosted HA scene peripherals.
 
-### P1: physical-control bindings to HA
+### P1: native bindings to HA
 
 Use existing Brilliant scene bindings to trigger the HA-side configured action
 map. Directly hosting HA scene/group targets on a physical Control remains
-rejected. Any native binding to a future HA peripheral must wait for the
-distinct Virtual Control feasibility gates.
+rejected. A future binding may target either a partner-owned peripheral that
+passed the dedicated [stub feasibility gates](native-partner-stub-feasibility.md)
+or an officially provisioned Virtual Control that passed its separate gates.
 
 ### P2: media player and announce
 
@@ -161,10 +166,12 @@ Useful additions with bounded risk:
 
 ### P3: advanced native types
 
-Do not add another native type through physical-Control hosting. Type-specific
-adapters become eligible only after the separate Virtual Control track passes
-all feasibility gates. Camera/doorbell/intercom remains a separate media and
-privacy architecture regardless of transport.
+Do not add another native type through physical-Control hosting. A type-specific
+partner stub becomes eligible only when its stock host is unused/safely
+isolated and the offline, disposable-home, authoritative-feedback,
+availability, owner/relay, and cleanup gates pass. Types without that path still
+require the separate Virtual Control track. Camera/doorbell/intercom remains a
+separate media and privacy architecture regardless of tile admission.
 
 ## Features to avoid by default
 
@@ -172,7 +179,8 @@ privacy architecture regardless of transport.
 - reset-all-settings, bootstrap pivot, or HomeKit reset;
 - mesh DFU and firmware beta toggles;
 - raw device/home/account identifiers;
-- partner cloud virtual devices duplicated into HA;
+- real partner-cloud virtual devices duplicated into HA, or test stubs added to
+  an active real-device ring;
 - camera or microphone activation without explicit privacy design;
 - using `switch_ui.active` as room occupancy;
 - high-frequency full-graph polling;
@@ -185,8 +193,9 @@ A coherent local product has three layers:
 1. **Brilliant → HA:** physical loads, sensors, panel controls, health, and mesh.
 2. **Bidirectional semantics:** existing Brilliant scene/mode events trigger HA
    actions, and HA requests catalog-allowlisted execution with confirmation.
-3. **Gated native research:** only an officially provisioned, local-enough
-   Virtual Control may eventually render selected HA entities; physical-Control
+3. **Gated native research:** selected types may use an otherwise-unused stock
+   partner host after the dedicated stub gates; generic types still require an
+   officially provisioned, local-enough Virtual Control. Physical-Control
    hosting is not a fallback.
 
 That combination makes HA the central hub while preserving the panel's existing

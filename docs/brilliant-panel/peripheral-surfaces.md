@@ -212,8 +212,10 @@ The former Tier-1 mirror implemented peripheral schemas for lights, switches,
 locks, positional covers, and garage covers, but its physical-Control hosting
 mechanism is deprecated and unsafe. Those schemas are research evidence, not a
 supported native-tile surface. The safe baseline is documented in the
-[HA integration guide](home-assistant-integration.md); native types remain gated
-behind Virtual Control feasibility.
+[HA integration guide](home-assistant-integration.md). Generic native types
+remain gated behind Virtual Control feasibility; selected types with shipped
+partner stubs have the separate, still-unproven path documented in
+[native partner-stub feasibility](native-partner-stub-feasibility.md).
 
 ## Media, camera, and intercom
 
@@ -242,7 +244,23 @@ The full graph includes partner virtual devices for systems such as Hue, LIFX, T
 - republishing causes duplicates and loses native integration diagnostics;
 - credentials and partner-specific setup remain in Brilliant state.
 
-Use the graph for interoperability and gated Virtual Control research, while
-keeping the forward MQTT bridge scoped to Brilliant-owned hardware and
-explicitly selected home-wide Brilliant mesh devices. Do not retry native type
-validation by hosting on a physical Control.
+The captured firmware also ships a narrower mechanism: configuration dynamic
+variables can carry `PeripheralInfo(stubbed=True)`, causing the naturally owned
+partner host to choose its compiled stub module and materialize the represented
+native type. Brilliant's own test tool defines stubs for Hunter Douglas shades,
+RemoteLock/Schlage/August locks, Ring cameras/security, SmartThings types, Genie
+garage doors, and others.
+
+This does not make active partner rings safe extension points. Read-only Office
+inventory found real Schlage locks and a populated Ring camera/security ring,
+which must not be mutated. It also found a remote-bridge-only Hunter Douglas
+device and an empty dynamic-gated RemoteLock configuration. Those are bounded
+shade-then-lock research candidates because they avoid a new owner and do not
+co-manage a physical Control. Authoritative HA feedback, truthful availability,
+owner/relay stability, cleanup, and disposable-home validation remain open.
+
+Use the graph for interoperability, the dedicated gated partner-stub track, and
+Virtual Control research while keeping the production forward MQTT bridge
+scoped to Brilliant-owned hardware and explicitly selected home-wide Brilliant
+mesh devices. Do not retry native type validation by hosting on a physical
+Control. See [native partner-stub feasibility](native-partner-stub-feasibility.md).
