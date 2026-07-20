@@ -151,6 +151,22 @@ A firmware OTA wipes **both** `/data` (the CA bundle) and `/etc/systemd/system/`
 
 ## Operational runbook
 
+**Pair diyHue with the panels (one-time — the link button does NOT work)**
+
+The panel's built-in *Add Philips Hue* flow will **not** complete against diyHue
+even once the CA is trusted — it hangs on "searching / press the button" (mDNS +
+link-button pairing don't land). You **register diyHue manually** by injecting the
+credential into the bus, which is what actually pairs it:
+
+1. Confirm the CA is appended on every panel (leadership moves) and diyHue serves
+   a matching EC leaf — see [Trust (the cert wall)](#trust-the-cert-wall).
+2. On the current owner (find it below), write a `HueBridgeCredential`
+   (diyHue IP + a diyHue API username, keyed by bridge id) into the type-25
+   `hue_bridge_configuration` — same encode + `request_set_variables_in_peripheral`
+   write shown under [Recover a stuck bridge](#operational-runbook).
+3. Restart the coordinator (`touch …/hue_bridge_peripherals.ini`). The panel now
+   treats diyHue as a paired bridge and enumerates the included HA lights.
+
 **Add an HA light to the panel**
 1. Tag the entity in HA `configuration.yaml` (`diyhue: include`), `ha core check`,
    then `homeassistant.reload_core_config`; verify the attr via `/api/states/<e>`.
