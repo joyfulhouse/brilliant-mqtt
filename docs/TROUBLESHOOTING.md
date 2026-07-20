@@ -82,6 +82,21 @@ never syncs its state.
    /var/run/brilliant/processes/hue_bridge_peripherals.ini`). The light should
    flip to `status=1` and become controllable.
 
+### diyHue bridge is grayed out / "0 configured devices" / stuck "searching"
+
+Usually the aftermath of **removing and re-adding the Hue integration on the
+panel** — the removal empties the bridge's stored credential, leaving it
+paired-but-empty, and the *Add Philips Hue* flow then hangs on
+"press the button". The UI re-pair will not recover it; the credential must be
+re-injected on the bus and the coordinator restarted. Full procedure:
+[diyHue bridge → Recover a stuck / grayed-out bridge](brilliant-panel/diyhue-bridge.md#operational-runbook).
+
+### diyHue lights appear but aren't in any room
+
+Freshly imported diyHue lights have no room assignment, so the panel files them
+under no room. Assign each light's `room_assignment` per
+[diyHue bridge → Assign lights to rooms](brilliant-panel/diyhue-bridge.md#operational-runbook).
+
 ### diyHue lights all went offline after a firmware OTA or a panel restart
 
 Two things happen on OTA/restart, and both are expected to self-heal:

@@ -162,6 +162,53 @@ A firmware OTA wipes **both** `/data` (the CA bundle) and `/etc/systemd/system/`
 5. Verify: the light shows `status=1` on the `hue_bridge` device and a bus set of
    its `on`/`intensity` drives the HA entity.
 
+**Recover a stuck / grayed-out bridge (empty credentials)**
+
+*Symptom:* the panel shows the Hue bridge **grayed out with "0 configured
+devices"**, and the *Add Philips Hue* flow hangs on "searching / press the
+button". Cause: **removing + re-adding the Hue integration on the panel empties
+the credential map** — the type-25 config peripheral survives but its
+`credentials` map is cleared, so the panel has no username to authenticate with
+and the UI re-pair never lands.
+
+1. **Confirm it** — on the current owner, dump the type-25
+   `hue_bridge_configuration` peripheral. `credentials = DQABCwwAAAAAAA==` is an
+   **empty thrift map** (zero credentials); there is no `hue_bridge` device and
+   no type-27 light peripherals. That is the stuck state.
+2. **Re-inject the credential (do NOT rely on the UI re-pair).** The value is a
+   base64 `HueBridgeCredentials{1: map<bridgeid, HueBridgeCredential{1:ip, 2:username,
+   3:attempting_auth, 4:bridge_name}>}` thrift blob (the panel's own thrift codec
+   is broken on py3 → hand-encode the TBinaryProtocol; **validate by reproducing
+   the empty-map `DQABCwwAAAAAAA==` byte-for-byte first**). Write it on the owner:
+   ```python
+   await obs.request_set_variables_in_peripheral(
+       "hue_bridge_configuration", {"credentials": BLOB},
+       device_id="configuration_virtual_device")
+   ```
+3. **Restart the coordinator** — `touch /var/run/brilliant/processes/hue_bridge_peripherals.ini`.
+4. **Verify** — within ~20 s the `hue_bridge` device reappears with the type-27
+   lights (each with its `thirdparty_display_name`), and diyHue logs show
+   authenticated `GET /lights`,`/groups`,`/scenes` returning **200**.
+
+**Assign lights to rooms**
+
+Freshly enumerated hue lights have an **empty `room_assignment`**
+(`DwABCwAAAAAA`) → they appear under **no room** on the panel. Assign each:
+
+1. Read the room catalog — deserialize `home_configuration.rooms` (`Rooms` via
+   `lib.serialization.deserialize`) into `{room_id: name}`.
+2. Encode `RoomAssignment{1: list<string> room_ids}` as a base64 thrift string —
+   one room id per light. **Validate the encoder against a known physical light's
+   `room_assignment` value first.**
+3. Write it (external base64-string write; **first arg is the light's diyHue
+   uniqueid**, e.g. `00:17:88:01:00:1F:40:C5-0B`, not `"hue_bridge"`):
+   ```python
+   await obs.request_set_variables_in_peripheral(
+       light_uniqueid, {"room_assignment": BLOB}, device_id="hue_bridge")
+   ```
+4. **No coordinator restart needed** — panels pick it up on their next poll.
+   Assignment is home-wide, so every panel files the light into the same room.
+
 **Find the current leader** — read the `owner` field of the type-25
 `hue_bridge_configuration`; map the device id to a panel IP via each panel's
 `/var/device_variables/device_id`.
