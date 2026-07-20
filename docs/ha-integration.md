@@ -58,13 +58,18 @@ on whether the agent is already installed on the panel:
 
 | Step | New panel (no agent) | Already has agent |
 |---|---|---|
-| **1. Connect** | Enter Host + Root password. Integration SSHes in, pins the host key (TOFU), detects no agent. | Enter Host + Root password. Integration SSHes in, detects the running agent. |
+| **1. Connect** | Enter Host + Root password. Integration SSHes in, pins the host key (TOFU), detects no agent. | Enter Host + Root password. Integration SSHes in, pins the host key (TOFU), detects the running agent, and reads its live env. After duplicate detection, a genuinely new adoption reconnects against that captured pin, quarantines any unowned BLE observer, and proves it inactive. |
 | **2. MQTT broker** | Enter broker host / port / user / password. Pre-filled from the most recently added panel (broker is fleet-shared); root password is never pre-filled. | _Skipped_ — broker is read back from the live env file. |
-| **3. Panel settings** | Set Panel Name (e.g. "Office Bath" → slug `office-bath`) and Mesh priority (`MESH_PRIORITY`: 0 = never lead; 1 = primary; 2/3 = standbys). Optionally enable **Voice satellite** (see [Voice satellite](#voice-satellite)). On submit: agent is installed over SSH, then entry is created. | _Skipped_ — name + mesh priority + broker are adopted verbatim from the running agent. Panel is left untouched. |
-| **Result** | Agent installed; panel entities fill in after first MQTT publish. | Panel adopted; entry created immediately. |
+| **3. Panel settings** | Set Panel Name (e.g. "Office Bath" → slug `office-bath`) and Mesh priority (`MESH_PRIORITY`: 0 = never lead; 1 = primary; 2/3 = standbys). Optionally enable **Voice satellite** (see [Voice satellite](#voice-satellite)). On submit: agent is installed over SSH, then entry is created. | _Skipped_ — name + mesh priority + broker are adopted verbatim from the running agent. |
+| **Result** | Agent installed; panel entities fill in after first MQTT publish. | Panel adopted with its BLE observer stored off and allowlist empty; entry is created only after physical inactivity is proven. |
 
 **Install failure:** if the SSH install fails at step 3, the step stays open
 with `cannot_install` and **no entry is created** — fix the panel and retry.
+
+**Adoption quarantine failure:** if the pinned observer quarantine, inactivity
+proof, or SSH close fails, step 1 stays open with `cannot_install` and **no
+entry is created**. A duplicate add attempt aborts before this quarantine, so it
+does not mutate a panel already owned by an existing entry.
 
 **Adopting a hand-deployed panel:** onboarding reads `BRILLIANT_PANEL` from the
 live env file and adopts it verbatim. Set it to a lowercase slug
