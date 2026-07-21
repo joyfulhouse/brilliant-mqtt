@@ -29,6 +29,7 @@ from brilliant_mqtt.mapping import EntityDescriptor, entities_for, payload_field
 from brilliant_mqtt.model import BrilliantDevice, DeviceKind, Variable
 from brilliant_mqtt.motion_derive import MotionDeriver
 from brilliant_mqtt.protocols import BusClient, MqttClient
+from brilliant_mqtt.retained_topics import RetainedTopicLedger
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +97,7 @@ class Bridge:
         reconcile_min_write_spacing_s: float = 0.5,
         clock: Callable[[], float] = time.monotonic,
         write_throttle: WriteThrottle | None = None,
+        owned_topics: RetainedTopicLedger | None = None,
     ) -> None:
         self._bus = bus
         self._mqtt = mqtt
@@ -121,6 +123,7 @@ class Bridge:
         self._reconcile_max_writes_per_tick = reconcile_max_writes_per_tick
         self._reconcile_min_write_spacing_s = reconcile_min_write_spacing_s
         self._clock = clock
+        self._owned_topics = owned_topics
         # (peripheral_id, var) -> monotonic time of last re-assert attempt.
         self._last_reassert: dict[tuple[str, str], float] = {}
         # (peripheral_id, var) pairs already reported as not exposed by their
@@ -166,10 +169,9 @@ class Bridge:
         operationally by clearing the retained config topic (see
         docs/reference/deployment.md).
         """
-        await self._mqtt.publish(
+        await self._async_publish_retained(
             availability_topic(self._panel),
             "online",
-            retain=True,
         )
 
         # Scope filter BEFORE the sw_version pre-pass and entity computation:
@@ -188,10 +190,9 @@ class Bridge:
             meta: dict[str, str] = {"agent_version": __version__}
             if sw_version is not None:
                 meta["panel_firmware"] = sw_version
-            await self._mqtt.publish(
+            await self._async_publish_retained(
                 meta_topic(self._panel),
                 json.dumps(meta, sort_keys=True),
-                retain=True,
             )
 
         n_devices = n_entities = 0
@@ -208,10 +209,9 @@ class Bridge:
 
             # Publish one discovery config per entity descriptor.
             for descriptor in descriptors:
-                await self._mqtt.publish(
+                await self._async_publish_retained(
                     config_topic(descriptor),
                     config_payload(descriptor, sw_version=sw_version),
-                    retain=True,
                 )
 
             # Publish exactly ONE shared state payload per peripheral, whenever
@@ -407,11 +407,17 @@ class Bridge:
             return
         self._last_state_payload[device.peripheral_id] = payload
         logger.debug("state publish for %s%s", device.peripheral_id, " (forced)" if force else "")
-        await self._mqtt.publish(
+        await self._async_publish_retained(
             state_topic(self._panel, device.peripheral_id),
             payload,
-            retain=True,
         )
+
+    async def _async_publish_retained(self, topic: str, payload: str) -> None:
+        """Publish through the panel ledger, or directly for the mesh bridge."""
+        if self._owned_topics is None:
+            await self._mqtt.publish(topic, payload, retain=True)
+            return
+        await self._owned_topics.async_publish(self._mqtt, topic, payload)
 
     async def _on_change(self, device: BrilliantDevice) -> None:
         """Handle a bus change event: update stored snapshot and re-publish state."""

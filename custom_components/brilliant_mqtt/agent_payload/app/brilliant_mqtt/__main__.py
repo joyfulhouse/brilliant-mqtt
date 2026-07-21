@@ -22,6 +22,7 @@ from brilliant_mqtt.model import BrilliantDevice
 from brilliant_mqtt.motion_derive import MotionDeriver
 from brilliant_mqtt.mqttio import AioMqttAdapter
 from brilliant_mqtt.protocols import BusClient
+from brilliant_mqtt.retained_topics import RetainedTopicLedger
 from brilliant_mqtt.scene_bridge import SceneBridge
 
 log = logging.getLogger(__name__)
@@ -100,6 +101,8 @@ async def _run_session(
     The desired-state stores are constructed by :func:`run` (process scope)
     and only wired here — see the comment there for why.
     """
+    owned_topics = RetainedTopicLedger(settings.panel, Path(settings.retained_topics_file))
+    await owned_topics.async_load()
     participating = settings.mesh_priority >= 1
     mqtt = AioMqttAdapter(settings)
     bus = RpcBusAdapter(extra_device_ids=(_MESH_DEVICE_ID,) if participating else ())
@@ -137,6 +140,7 @@ async def _run_session(
             reconcile_max_writes_per_tick=settings.motion_reconcile_max_writes_per_tick,
             reconcile_min_write_spacing_s=settings.motion_reconcile_min_write_spacing_s,
             write_throttle=write_throttle,
+            owned_topics=owned_topics,
         )
 
         if participating:
@@ -161,6 +165,7 @@ async def _run_session(
                 reconcile_max_writes_per_tick=settings.motion_reconcile_max_writes_per_tick,
                 reconcile_min_write_spacing_s=settings.motion_reconcile_min_write_spacing_s,
                 write_throttle=write_throttle,
+                owned_topics=None,
             )
             leader = MeshLeader(
                 mqtt,

@@ -223,13 +223,15 @@ async def test_poll_once_enforces(tmp_path: Path) -> None:
 async def test_reconcile_enforces(tmp_path: Path) -> None:
     dev = _mesh_light("pidA", enable_motion_score="0", on="0")
     bus = FakeBus([dev])
+    mqtt = FakeMqtt()
     ds = DesiredState(tmp_path / "mesh.json")
     ds.record("pidA", "enable_motion_score", "1")
-    bridge = Bridge(bus, FakeMqtt(), "mesh", desired=ds, clock=FakeClock())
+    bridge = Bridge(bus, mqtt, "mesh", desired=ds, clock=FakeClock())
 
     await bridge.reconcile()
 
     assert ("ble_mesh", "pidA", [_vs("enable_motion_score", "1")]) in bus.commands
+    assert all(topic != "brilliant/mesh/ownership" for topic, _, _ in mqtt.published)
 
 
 @pytest.mark.asyncio

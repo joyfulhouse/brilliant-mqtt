@@ -12,6 +12,7 @@ Fixtures mirror the real office panel:
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -19,6 +20,7 @@ from brilliant_mqtt import __version__
 from brilliant_mqtt.bridge import Bridge, _state_payload
 from brilliant_mqtt.commands import VarSet
 from brilliant_mqtt.model import BrilliantDevice, DeviceKind, Variable
+from brilliant_mqtt.retained_topics import RetainedTopicLedger
 from tests.fakes import FakeBus, FakeMqtt
 
 PANEL = "office"
@@ -172,6 +174,28 @@ class TestStatePayload:
 
 
 class TestReconcile:
+    async def test_panel_retained_publishes_are_claimed_before_the_target(
+        self,
+        tmp_path: Path,
+        dimmer: BrilliantDevice,
+    ) -> None:
+        bus = FakeBus([dimmer])
+        mqtt = FakeMqtt()
+        ledger = RetainedTopicLedger(PANEL, tmp_path / "owned-topics.json")
+        await ledger.async_load()
+        bridge = Bridge(bus, mqtt, PANEL, owned_topics=ledger)
+
+        await bridge.reconcile()
+
+        for index, (topic, _, retain) in enumerate(mqtt.published):
+            if not retain or topic == ledger.ownership_topic:
+                continue
+            assert index > 0
+            assert mqtt.published[index - 1][0] == ledger.ownership_topic
+            assert mqtt.published_qos[index - 1] == 1
+            assert mqtt.published_qos[index] == 0
+            assert topic in ledger.topics
+
     async def test_availability_published_retained(
         self, dimmer: BrilliantDevice, motion: BrilliantDevice, always_on: BrilliantDevice
     ) -> None:
