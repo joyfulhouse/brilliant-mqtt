@@ -1,10 +1,14 @@
 # MQTT Fleet Onboarding Simplification — Design
 
 - **Date:** 2026-07-20
-- **Status:** Approved direction; pending specification review
+- **Last revised:** 2026-07-21, after medium-effort Fable review and local
+  verification
+- **Status:** Approved direction; revised specification pending user review
 - **Scope:** Replace the one-entry-per-panel setup wizard with a fleet-first
   Home Assistant integration, validate MQTT end to end during onboarding, and
-  preserve the existing panel agent and MQTT entity contract.
+  preserve the existing MQTT topic/entity contract. Narrow, additive panel-
+  agent changes are authorized for server-authenticated TLS and retained-topic
+  ownership; this is not an agent rewrite.
 - **Home Assistant baseline:** 2026.6.0 or newer, matching `hacs.json`.
 - **Related documentation:**
   - [Current Home Assistant integration](../../ha-integration.md)
@@ -22,10 +26,12 @@ a second panel daemon or a custom Home Assistant network protocol. The setup
 complexity belongs in the Home Assistant integration, not in fields repeated
 for every panel.
 
-The integration becomes a hub with one fleet config entry and one config
-subentry per panel. A fleet owns one MQTT connection profile and a shared
-dedicated Brilliant MQTT credential. A panel subentry owns only panel identity,
-SSH provisioning, and panel-specific feature overrides.
+The integration becomes a hub with exactly one fleet config entry per Home
+Assistant installation and one config subentry per panel. Home Assistant's MQTT
+integration exposes one active broker path, so the Brilliant fleet must use
+that same broker. The fleet owns one normalized panel connection profile and a
+shared dedicated Brilliant MQTT credential. A panel subentry owns only panel
+identity, SSH provisioning, and panel-specific feature overrides.
 
 On first setup, users choose one of two fully supported paths:
 
@@ -37,6 +43,11 @@ On first setup, users choose one of two fully supported paths:
 The integration never installs the official app, edits broker configuration,
 creates broker accounts, or forces a broker choice. It documents the official
 app as a prerequisite only when that path is selected.
+
+MQTT Discovery uses the existing fixed `homeassistant` prefix in this release.
+If Home Assistant is configured with a different discovery prefix, onboarding
+stops with a documented compatibility error rather than creating entities that
+the current panel agent cannot discover correctly.
 
 Fleet creation succeeds only after a temporary device client and Home
 Assistant's MQTT connection prove authentication, bidirectional messaging,
@@ -62,6 +73,8 @@ track rather than an onboarding prerequisite.
 
 This design therefore changes Home Assistant ownership and setup UX while
 leaving the steady-state panel transport and Brilliant bus boundary intact.
+The only panel-agent additions are TLS client configuration, a shared client
+factory used by runtime and preflight, and a retained-topic ownership ledger.
 
 ## Current problem
 
@@ -87,7 +100,7 @@ The result has several failure modes:
 
 ## Goals
 
-1. Make MQTT configuration a once-per-fleet concern.
+1. Make MQTT configuration a once-per-Home-Assistant-installation concern.
 2. Make the official Mosquitto app the easiest documented path without making
    it mandatory.
 3. Support existing local, remote, and hosted brokers as a first-class path.
@@ -98,10 +111,15 @@ The result has several failure modes:
 6. Move optional capabilities into focused post-install flows.
 7. Replace generic failures with actionable, stage-specific remediation and
    direct documentation links.
-8. Preserve MQTT topics, discovery identities, entity IDs, automations, panel
-   runtime behavior, and current resource use.
-9. Migrate existing entries without requiring a panel reinstall or forcing
-   panels that use different brokers into one fleet.
+8. Preserve existing MQTT topic names, discovery identities, entity IDs,
+   automations, panel runtime behavior, and current resource use. An additive
+   management topic may be introduced for cleanup ownership.
+9. Migrate compatible existing entries without requiring a panel reinstall.
+   Preserve incompatible or conflicting legacy entries in compatibility mode
+   until an explicit consolidation repair succeeds.
+10. Enforce one Brilliant fleet and broker path, matching Home Assistant's
+    active MQTT integration, rather than implying unsupported multi-broker
+    operation.
 
 ## Non-goals
 
@@ -111,7 +129,12 @@ The result has several failure modes:
 - Reading or reusing Home Assistant's hidden internal MQTT credentials.
 - Automatically creating Home Assistant users or external broker accounts.
 - Managing arbitrary broker ACL files.
-- Redesigning the MQTT discovery/state/command topic contract.
+- Redesigning existing MQTT discovery/state/command topic identifiers or
+  payloads.
+- Supporting multiple simultaneous Brilliant brokers in one Home Assistant
+  installation.
+- MQTT over WebSockets, mutual TLS/client certificates, or automatically
+  weakening server certificate validation in this release.
 - Redesigning voice, diyHue, scene control, or HA control-plane behavior.
 - Introducing an additional resident process or MQTT connection on a panel.
 - Replacing stored panel root passwords with managed SSH keys in this release.
@@ -146,9 +169,12 @@ The default experience has these properties:
 | Keep one entry per panel and store broker data in hidden integration storage | Smaller initial migration | Creates invisible cross-entry coupling, unclear ownership, and fragile deletion/reload behavior | Rejected |
 | Separate top-level broker and panel entries | Explicit dependency graph | Produces multiple integration cards, reference lifecycle problems, and much of the current UX complexity | Rejected |
 
-Multiple fleet entries remain valid. One fleet always maps to one exact broker
-connection profile, but a Home Assistant installation may intentionally manage
-different Brilliant fleets on different brokers.
+Exactly one Brilliant fleet entry is allowed. Starting setup when that entry
+already exists aborts with a link to **Add panel** on the existing fleet. This
+matches Home Assistant's single active MQTT client and avoids presenting
+multi-broker behavior that the MQTT integration cannot supply. An existing,
+remote, or hosted broker remains fully supported; it simply becomes the one
+broker shared by Home Assistant and every managed Brilliant panel.
 
 ## Architecture and ownership
 
@@ -156,9 +182,9 @@ Change the integration type from `device` to `hub`. The top-level config entry
 is the fleet hub; panels are Home Assistant config subentries.
 
 ```text
-Home Assistant MQTT integration ───────────────┐
+Home Assistant MQTT integration (one client) ─┐
                                                │ same broker
-Brilliant MQTT fleet entry                    │
+Single Brilliant MQTT fleet entry             │
   broker profile + fleet credential            │
   BrokerValidator                              │
   FleetManager                                 │
@@ -178,11 +204,23 @@ The fleet entry persists:
 - broker port;
 - dedicated fleet MQTT username and password;
 - TLS enabled/disabled;
-- certificate validation mode and optional public CA material/reference;
-- MQTT discovery prefix, defaulting to `homeassistant` and prefilled from the
-  Home Assistant MQTT integration when available;
+- optional public CA material/reference for strict server certificate
+  validation;
 - fleet feature defaults and mesh-priority allocation state;
+- the installation-global Home Assistant control and scene configuration;
 - schema and migration version.
+
+The MQTT Discovery prefix is not configurable or persisted as connection data
+in v1. It remains the current hard-coded `homeassistant` contract. The flow
+reads Home Assistant's effective MQTT discovery prefix and returns
+`unsupported_discovery_prefix` with a direct remediation link if it differs.
+
+The seven current installation-global values move from copied per-panel data
+to this single fleet entry: `ha_control_enabled`, `ha_control_label`,
+`room_overrides`, `ha_control_domains`, `max_mirrored_entities`, `scene_panel`,
+and `scene_actions`. `scene_panel` must reference a panel subentry belonging to
+this fleet. No lexicographic panel-slug election or implicit settings owner
+remains.
 
 The broker kind changes guidance and defaults only. Runtime validation and
 panel rendering use one normalized connection-profile type for both paths.
@@ -197,7 +235,8 @@ display text.
 
 Each panel subentry persists:
 
-- stable identity discovered from the panel;
+- stable identity derived from the pinned SSH host public key;
+- the canonical pinned SSH host public key and its SHA-256 fingerprint;
 - current hostname or IP address;
 - friendly name and stable MQTT panel slug;
 - SSH username and root password;
@@ -236,9 +275,12 @@ credentials**. Diagnostics and logs always redact it.
 - **`FleetManager`** owns runtime panel controllers, shared MQTT subscriptions,
   fleet health aggregation, management entities, broker reconfiguration, and
   global configuration propagation.
-- **`MigrationPlanner`** is an idempotent helper that groups legacy entries,
-  builds and validates a migration plan, and commits it in recoverable phases.
-  It is not a long-lived runtime service.
+- **`MigrationPlanner`** is a pure, idempotent helper that inspects all legacy
+  entries and produces a no-write consolidation plan or a conflict report.
+- **`MigrationCoordinator`** is a domain-scoped, single-lock service that runs
+  only after all Brilliant entries have been enumerated. It commits a safe
+  plan in recoverable phases; per-entry migration hooks never mutate sibling
+  entries.
 
 Physical controls continue to be created by MQTT Discovery. Status, update,
 restart, diagnostics, and configuration entities supplied by this custom
@@ -270,28 +312,69 @@ TLS controls remain available for customized official-app deployments.
 This path is visible beside the recommended path, not hidden behind Advanced.
 It requires:
 
-- Home Assistant's MQTT integration already connected to the same broker;
+- Home Assistant's sole active MQTT integration already connected to the same
+  broker;
 - support for MQTT 5 as required by current Home Assistant and MQTT 3.1.1 as
   used by the current panel client;
 - an endpoint reachable from both Home Assistant and each panel;
 - retained messages and wildcard subscriptions;
 - a dedicated fleet credential;
 - permissions to read and write `brilliant/#`;
-- permission to write `<discovery_prefix>/#` for MQTT Discovery.
+- permission to write `homeassistant/#` for MQTT Discovery;
+- an effective Home Assistant discovery prefix of `homeassistant`.
 
-Host, port, username, and password are normal fields. TLS enablement,
-certificate validation, custom CA input, and other certificate controls are
-under Advanced settings. Error text and documentation remain broker-neutral.
+Host, port, username, and password are normal fields. TLS enablement, strict
+certificate validation, and custom CA input are under Advanced settings. Error
+text and documentation remain broker-neutral.
+
+External-broker documentation must describe both broker principals, because a
+correct panel ACL alone cannot complete the end-to-end probes:
+
+| Principal | Minimum Brilliant-related access |
+|---|---|
+| Dedicated Brilliant fleet user used by every panel | Read/write `brilliant/#`; write `homeassistant/#` |
+| Home Assistant MQTT user | Read/write `brilliant/#`; read `homeassistant/#`; retain its normal MQTT permissions, including write access to its configured birth/will/status topics (default `homeassistant/status`) |
+
+The official Mosquitto app normally supplies Home Assistant's internal access;
+the dedicated Brilliant user is still required. On an external broker, the
+operator configures both principals. Validation names the client and direction
+when the broker returns an explicit authorization failure; an otherwise silent
+timeout remains an ambiguous routing-or-ACL error.
+
+### TLS compatibility contract
+
+TLS for an existing or customized official broker is a supported v1 path, not
+documentation-only configuration. The panel agent gains these additive
+settings:
+
+- `MQTT_TLS_ENABLED`;
+- `MQTT_TLS_CA_FILE`, optional when the broker chains to the panel's system
+  trust store.
+
+A single MQTT client factory constructs the strict server-authenticated TLS
+context for both the resident agent and the temporary panel preflight. It
+enables hostname verification and certificate-chain validation and never falls
+back to plaintext or an insecure context after failure. The broker hostname in
+the fleet profile is the verified TLS server name; IP endpoints therefore need
+a certificate valid for that IP or must be replaced with a matching DNS name.
+Mutual TLS, client key distribution, and MQTT over WebSockets are deferred.
 
 No fleet entry is created while Home Assistant's MQTT integration is absent or
 disconnected. The flow preserves non-secret values, explains how to configure
 MQTT, and allows retry without restarting the integration setup.
 
+No fleet entry is created when Home Assistant's effective discovery prefix is
+not `homeassistant`. The `unsupported_discovery_prefix` error explains the
+current agent compatibility constraint and links to the exact Home Assistant
+MQTT option that must be restored before retrying.
+
 ## Broker validation contract
 
 Validation must prove behavior, not merely open a TCP socket. It uses a random
-setup ID and topics below `brilliant/setup/<setup_id>/`. The setup ID is not
-retained or reused.
+setup ID, data probes below `brilliant/setup/<setup_id>/`, and one discovery-ACL
+probe at `homeassistant/brilliant_mqtt_setup/<setup_id>/probe`. The latter does
+not end in `/config`, so Home Assistant cannot interpret it as entity
+discovery. The setup ID is not retained or reused.
 
 | Stage | Operation | What it proves |
 |---|---|---|
@@ -299,6 +382,7 @@ retained or reused.
 | `fleet_auth` | Open a temporary device client with the supplied Brilliant credential | Endpoint, protocol, TLS, and authentication work |
 | `panel_to_ha` | Subscribe through Home Assistant, then publish a random nonce from the temporary device client | Device publish ACL, HA subscribe path, and same-broker routing work |
 | `ha_to_panel` | Subscribe through the temporary client, then publish a different nonce through Home Assistant | HA publish path and device subscribe ACL work |
+| `discovery_write` | Subscribe through Home Assistant, then publish a nonce from the temporary device client to the non-entity discovery-ACL probe topic | Device discovery-prefix write ACL and HA discovery-prefix subscription work without creating a test entity |
 | `retained_message` | Publish a retained nonce, subscribe after publication, require the retained flag and exact payload | Broker retention required by discovery/state works |
 | `cleanup` | Publish empty retained payloads and unsubscribe/disconnect both sides | No setup artifacts remain |
 
@@ -328,21 +412,46 @@ Ask only for:
 Use root as the default SSH username and keep it out of the standard form unless
 an advanced deployment needs to override it.
 
+Before sending the password, perform an unauthenticated SSH key exchange and
+collect the server host public key. The candidate key and its SHA-256
+fingerprint become the in-progress flow's trust-on-first-use pin. The
+authenticated inspection must present that exact key before the password is
+sent; the first connection never disables host-key checking merely to make
+password authentication convenient.
+
+The stable fingerprint is the standard SHA-256 digest of the decoded SSH public
+key blob, not a hash of address-dependent `known_hosts` text. Reformatting the
+same key therefore cannot change panel identity.
+
 ### Step 2: Inspect and confirm
 
 SSH inspection collects the minimum safe facts needed to continue:
 
-- stable device identity;
+- the candidate SSH host-key fingerprint, used as the stable panel identity;
 - hostname/model and suggested friendly name;
 - supported architecture, firmware, Python, and service-manager versions;
 - available disk and memory;
 - current Brilliant MQTT installation/version;
 - conflicting retired services;
-- duplicate-panel status in every configured fleet.
+- duplicate-panel status in the single configured fleet.
 
-The second screen shows the discovered facts and an editable friendly name. A
-duplicate stable identity offers reconfiguration of the existing panel rather
-than creating a second subentry.
+The second screen shows the fingerprint, discovered facts, and an editable
+friendly name. Confirming the screen persists the canonical host public key in
+the successful subentry. A duplicate fingerprint offers reconfiguration of the
+existing panel rather than creating a second subentry.
+
+Every later SSH connection verifies the pin before transmitting credentials.
+Credential repair does not replace the pin. Changing a panel address first
+checks that the new endpoint presents the same key. A different key fails
+closed and opens an explicit **Rebind replaced/reflashed panel** flow that
+shows both fingerprints and preserves the existing MQTT slug and entity
+identity only after deliberate confirmation. Host-key changes are never
+silently accepted.
+
+The current opt-in `trust_host_key_changes` auto-repin behavior is not carried
+into the fleet model. A legacy panel with that option enabled remains in
+compatibility mode until the repair flow explains the change and the user
+explicitly accepts fail-closed rebind behavior.
 
 ### Step 3: Stage and test from the panel
 
@@ -362,6 +471,8 @@ proves:
 - TCP routing from the panel VLAN;
 - TLS validation using the panel's clock and trust material;
 - authentication and publish/subscribe ACLs;
+- write access from the panel to the non-entity `homeassistant` discovery-ACL
+  probe topic;
 - retained-message behavior through the same broker used by Home Assistant.
 
 The temporary process exits and disconnects before activation.
@@ -408,16 +519,25 @@ The fleet options menu contains:
 - **Add panel**
 - **Fleet diagnostics**
 
-A broker endpoint, TLS, discovery-prefix, or credential change is staged. The
-new profile is validated through Home Assistant and from every registered
-panel before any running service is changed. The default policy is strict: an
-offline or failing panel blocks the fleet change and is listed with its failed
-stage. The user may repair, remove, or move that panel before retrying; the
-integration does not silently create a mixed-broker fleet.
+A broker endpoint, TLS, or credential change is staged. For an endpoint change,
+the user first points Home Assistant's MQTT integration at the proposed broker;
+the old broker and old panel credentials must remain available until the fleet
+move is confirmed. The new profile is then validated through Home Assistant
+and from every registered panel before any running service is changed. An
+offline or failing panel blocks the change and is listed with its failed stage.
+The user may repair or remove that panel before retrying; the integration never
+silently creates a mixed-broker fleet.
 
-After all preflights pass, panels switch in a rolling transaction. The previous
-profile and release remain available until all panels publish health on the new
-broker. Any failure rolls already-switched panels back to the prior profile.
+After all preflights pass, panels switch sequentially using a durable per-panel
+journal. The screen continuously identifies panels still on the old profile,
+confirmed on the new profile, and failed. On failure, the transaction halts;
+no remaining panel is changed. V1 offers an explicit one-click revert for each
+already-switched panel, followed by instructions to restore Home Assistant's
+old MQTT connection when the endpoint changed. It does not promise automatic
+cross-panel rollback while Home Assistant can observe only one broker. Fully
+automatic fleet rollback is deferred until the provisioning journal has proven
+safe on hardware. Old broker/profile material is removed only after the user
+confirms that every panel is healthy on the new path.
 
 ### Panel menu
 
@@ -437,13 +557,65 @@ the source data is in Home Assistant registries. Expert-only values remain in a
 clearly labeled Advanced step and are documented individually.
 
 Removing a panel first runs an explicit uninstall-and-cleanup transaction. It
-captures the panel's current discovery publications before stopping the
-service, then clears the panel-owned retained discovery, state, bridge metadata,
-and availability topics. Fleet-owned `brilliant/mesh` topics are never removed
-with one panel. The subentry is deleted only after verified cleanup. If the
-panel is unreachable, the UI explicitly distinguishes **Remove Home Assistant
-configuration only** from a verified panel uninstall, warns that retained
-topics may remain, and links to the safe cleanup procedure.
+stops the service, consumes its retained-topic ownership manifest, then clears
+the panel-owned discovery, state, bridge metadata, and availability topics.
+Fleet-owned `brilliant/mesh` topics are never removed with one panel. Normal
+removal deletes the subentry only after verified cleanup. If the panel is
+unreachable, **Remove Home Assistant configuration only** is an explicit escape
+hatch: it cannot claim that the service was stopped and does not clear broker
+topics that a still-running panel could immediately republish. It warns about
+the orphaned service/topics and records the cleanup procedure. A separate
+advanced **Clean broker topics after externally stopping the agent** action may
+use a valid manifest, but only after an operator attestation; it still does not
+claim a verified panel uninstall.
+
+### Retained-topic ownership and cleanup
+
+The additive retained topic `brilliant/<panel_slug>/ownership` carries a
+versioned JSON manifest:
+
+```json
+{
+  "schema_version": 1,
+  "panel_slug": "kitchen",
+  "topics": [
+    "brilliant/kitchen/availability",
+    "brilliant/kitchen/bridge",
+    "brilliant/kitchen/<peripheral>/state",
+    "homeassistant/<component>/<unique_id>/config"
+  ]
+}
+```
+
+The actual array contains complete concrete topic names, not patterns. It lists
+only retained topics owned by that panel. The agent keeps the same ledger in a
+durable file below `/var/brilliant-mqtt/`. Before publishing a new retained
+topic, it durably adds the topic and receives acknowledgement for the updated
+manifest; it does not publish the new retained value if that step fails. After
+successfully clearing a retired topic, it removes that topic and republishes the
+manifest. During uninstall, cleanup clears every listed topic and clears the
+ownership manifest last. This ordering favors harmless over-inclusion after a
+crash rather than an orphaned retained topic.
+
+Manifest parsing is defensive: v1 accepts at most 4,096 unique topics and
+256 KiB of JSON, rejects unknown fields/types or a mismatched slug, and never
+uses a manifest as authority to delete an arbitrary topic. Each
+`brilliant/<panel_slug>/...` entry must match a known retained panel-topic
+shape. Each discovery entry must still contain a retained payload whose parsed
+device identifier matches `brilliant_panel_<panel_slug>` before it is cleared.
+An invalid or over-limit manifest falls back to the strict legacy scan and
+surfaces a repair issue.
+
+The ledger and manifest never claim `brilliant/mesh` or mesh discovery topics,
+which are fleet-owned. On the first ledger-aware upgrade, the integration seeds
+the ledger with a bounded legacy scan before treating it as authoritative. For
+an older agent with no valid manifest, the fallback subscribes briefly to
+retained `homeassistant/+/+/config` messages and the known
+`brilliant/<panel_slug>/#` namespace. It clears only discovery payloads whose
+parsed Brilliant device identifier exactly matches the target panel slug and
+known panel state/meta/availability topics. It never clears mesh or an
+unrecognized payload. If ownership cannot be proven, removal preserves the
+message and reports the exact manual-cleanup guidance instead of guessing.
 
 ## Error model and remediation
 
@@ -461,12 +633,12 @@ Canonical error families include:
 
 | Family | Representative failures | Primary remediation |
 |---|---|---|
-| Home Assistant MQTT | Integration missing, entry not loaded, broker disconnected | Configure/reload HA MQTT and retry |
+| Home Assistant MQTT | Integration missing, entry not loaded, broker disconnected, non-default discovery prefix | Configure/reload HA MQTT, restore the `homeassistant` prefix, and retry |
 | Network | DNS failure, timeout, connection refused, route unavailable | Correct endpoint, DNS, firewall, or VLAN route |
 | Authentication/ACL | Bad username/password, publish denied, subscribe denied, discovery write denied | Correct fleet credentials or broker ACL |
 | Broker behavior | Messages do not cross due to broker mismatch or a silent ACL drop; retained payload missing/changed; protocol incompatibility | Verify the shared broker and both ACL directions, then enable retention |
-| TLS | Unknown CA, hostname mismatch, expired/not-yet-valid certificate, panel clock invalid | Correct time, hostname, validation mode, or CA |
-| Panel SSH | Host unreachable, root authentication rejected, duplicate identity | Correct address/credential or reconfigure existing panel |
+| TLS | Unknown CA, hostname mismatch, expired/not-yet-valid certificate, panel clock invalid | Correct panel time, endpoint hostname, broker certificate, or CA |
+| Panel SSH | Host unreachable, host-key mismatch, root authentication rejected, duplicate identity | Correct the address/credential, reconfigure the existing panel, or deliberately rebind a replaced panel |
 | Panel compatibility | Unsupported firmware/architecture, low disk/memory, conflicting service | Follow compatibility or cleanup guidance |
 | Activation | Unit failed, availability timeout, initial state/discovery timeout | Show a redacted service-log excerpt, roll back, and offer retry |
 | Migration | Conflicting/invalid legacy data, phased commit interrupted | Leave legacy entry active or resume idempotent migration |
@@ -486,10 +658,12 @@ root passwords, private keys, tokens, or unredacted environment files.
   files may remain only as a versioned, inactive retry artifact.
 - Upgrade activation failure restores the previous release, environment file,
   unit state, and component selection.
-- Broker-change failure keeps or restores the prior connection profile on every
-  panel.
-- Probe subscriptions, temporary clients, files, and retained topics are
-  cleaned after all outcomes.
+- Broker-change failure halts before touching another panel, preserves the
+  per-panel old/new state in its journal, and offers explicit reversion of each
+  already-switched panel. Automatic cross-panel rollback is not a v1 guarantee.
+- Probe subscriptions, temporary clients, files, and retained setup topics are
+  cleaned after all outcomes. Panel removal clears only topics proven by the
+  ownership manifest or strict legacy fallback.
 - Cleanup or rollback failure is never hidden behind the original error. It
   creates a repair issue containing both failures and the safe manual action.
 
@@ -501,51 +675,87 @@ the existing issue instead of generating notification storms.
 
 ## Migration from per-panel entries
 
-Migration is automatic, idempotent, and does not contact or reinstall a panel.
+Migration is automatic only when consolidation is provably lossless. It is
+idempotent and does not contact or reinstall a panel on the automatic path.
 
-### Grouping
+### Automatic-consolidation eligibility
 
-Legacy entries are grouped by an exact normalized broker profile:
+The planner reads every legacy entry before changing any of them. Exactly one
+fleet can be produced automatically only when all of these conditions hold:
 
-- host and port;
-- username and password;
-- TLS and certificate settings;
-- discovery prefix.
+- every entry has the same exact normalized broker host, port, username,
+  password, TLS mode, and CA material;
+- the profile passes the broker validation contract against Home Assistant's
+  active MQTT connection;
+- Home Assistant's effective discovery prefix is `homeassistant`;
+- the seven installation-global Home Assistant control/scene values are
+  canonically identical across entries;
+- every entry has a canonical pinned SSH host public key, and its SHA-256
+  fingerprint is unique;
+- every panel already uses the default fail-closed SSH host-key policy; an
+  enabled legacy `trust_host_key_changes` option requires user acknowledgement;
+- all config-entry, device-registry, and entity-registry references can be
+  retargeted without changing unique IDs or entity IDs.
 
-Each group becomes one fleet. Entries using different profiles become separate
-fleets. This preserves working deployments instead of guessing that similarly
-named brokers or usernames are equivalent.
+Canonical panel identity is derived from the existing pinned SSH host-key data,
+including legacy `DATA_SSH_HOST_KEY`; migration does not invent identity from a
+mutable address or panel slug. A missing/invalid key, duplicate fingerprint,
+different normalized broker profile, or conflicting global value makes the
+whole automatic plan ineligible. Similar DNS names, broker aliases, or
+different credentials are never assumed equivalent because proving that would
+require panel mutation.
 
-Within a group, legacy panel-specific component and feature values become
-subentry overrides. Existing mesh priorities are retained exactly. A later
-options flow can adopt fleet defaults deliberately.
+Within an eligible plan, panel-specific component and feature values become
+subentry overrides. Existing mesh priorities and immutable MQTT panel slugs are
+retained exactly. The shared global values move once to the fleet entry, and
+`scene_panel` is converted to a same-fleet subentry reference.
 
-### Recoverable phases
+### Coordinator and recoverable phases
 
-1. Read all legacy entries and build a complete migration plan without writes.
-2. Validate unique panel identities, config-entry references, entity/device
-   registry targets, and normalized broker groups.
-3. Select one deterministic legacy entry per group as the fleet anchor so its
-   config entry ID can be preserved.
-4. Create panel subentries and retarget this integration's management
-   entities/devices while preserving unique IDs and entity IDs.
-5. Load the new fleet and verify every expected panel controller exists.
-6. Mark non-anchor legacy entries superseded and remove them only after the
-   fleet passes verification.
+Home Assistant invokes `async_migrate_entry` one entry at a time, so that hook
+must never inspect-and-edit sibling entries. It may normalize that entry's own
+schema, advance a compatibility version, and mark it
+`legacy_pending_consolidation`; it returns success without disabling the
+legacy runtime.
 
-A persisted phase marker makes restart recovery deterministic. Before the
-commit phase, any error leaves all legacy entries untouched. During commit, a
-restart resumes or rolls back from the marker rather than creating duplicate
-managers.
+A domain-scoped `MigrationCoordinator` runs after all Brilliant entries have
+been enumerated and Home Assistant MQTT is ready. Under one integration-wide
+lock it:
+
+1. reads all legacy entries and builds a complete no-write plan;
+2. either records a conflict repair issue or persists the eligible plan and
+   phase marker;
+3. unloads/quiesces all candidate legacy managers;
+4. converts the deterministic anchor entry into the fleet and creates panel
+   subentries, including the single copy of global settings;
+5. retargets this integration's management entities/devices while preserving
+   their unique IDs and entity IDs;
+6. loads the fleet and verifies that every expected panel controller and
+   registry target exists;
+7. marks sibling legacy entries superseded and removes them only after
+   verification.
+
+The persisted marker includes the plan digest, anchor, candidate IDs, current
+phase, and enough pre-change data to resume or reverse an interrupted commit.
+Before quiescing, any error leaves every legacy entry untouched. After
+quiescing, startup recovery must finish or reverse that exact plan before a new
+one can begin, preventing duplicate managers and partial sibling deletion.
 
 Physical MQTT Discovery entities belong to the Home Assistant MQTT integration,
 so their topics, discovery unique IDs, device identifiers, and entity IDs do not
 change. Panel environment files also remain unchanged until a later explicit
 reconfigure or update.
 
-If a migration cannot prove registry or entry consistency, it leaves the
-legacy configuration operational and creates one repair issue with redacted
-diagnostics. It never discards conflicting values.
+If automatic consolidation is ineligible, all legacy entries and their values
+remain in compatibility mode and one repair issue explains each conflicting
+field without exposing secrets. The repair flow asks the user to choose one
+canonical broker profile and one global control/scene configuration, validates
+that choice against Home Assistant, then reconfigures and verifies panels one
+at a time using the normal journaled broker-change path. It also requires an
+explicit acknowledgement before disabling any legacy automatic host-key
+repinning. Only after every panel matches does the coordinator rerun
+consolidation. Cancellation or failure never discards a competing value or
+falsely reports that multiple brokers are supported.
 
 ## Security and credential handling
 
@@ -554,6 +764,9 @@ diagnostics. It never discards conflicting values.
 - Store the fleet MQTT password once in the fleet entry.
 - Keep the existing panel SSH-secret storage model for this release, but never
   repeat root credentials in fleet data.
+- Fetch the SSH host public key before password authentication, pin the exact
+  key for the authenticated connection, persist it on success, and fail closed
+  on every later mismatch.
 - Protect the temporary provisioning journal like Home Assistant config-entry
   storage, redact it from diagnostics, and delete it after promotion or
   verified rollback.
@@ -561,20 +774,22 @@ diagnostics. It never discards conflicting values.
 - Remove retained probe payloads after every outcome.
 - Redact secrets from logs, config-flow errors, repair issues, diagnostics, and
   support bundles.
-- Treat custom CA certificates as public trust material but never expose client
-  private keys if future broker configurations add mutual TLS.
-- Do not weaken certificate validation automatically. A TLS error explains the
-  correct CA/hostname/time remedy and leaves any insecure override in Advanced.
+- Treat custom CA certificates as public trust material. V1 does not accept or
+  distribute MQTT client private keys.
+- Never weaken certificate validation automatically or expose an insecure TLS
+  toggle. A TLS error explains the correct CA, hostname, or panel-time remedy.
 
-For custom ACLs, documentation grants the Brilliant user only the required
-topic families: read/write `brilliant/#` and write access to the configured
-discovery prefix. Home Assistant's broker user retains its own permissions.
+For custom ACLs, documentation grants the Brilliant fleet user only the
+required topic families: read/write `brilliant/#` and write
+`homeassistant/#`. It separately documents Home Assistant's required access
+from the broker-principal table above; validation exercises both principals.
 
 ## Diagnostics and documentation
 
 Fleet diagnostics include, with secrets redacted:
 
-- broker kind, host, port, TLS mode, and discovery prefix;
+- broker kind, host, port, TLS mode, and the fixed discovery-prefix
+  compatibility result;
 - Home Assistant MQTT entry state;
 - last successful validation timestamp and stage;
 - aggregate panel health and migration version;
@@ -582,12 +797,14 @@ Fleet diagnostics include, with secrets redacted:
 
 Panel diagnostics include:
 
-- identity/model, address, installed version, and enabled components;
+- SSH host-key fingerprint, model, address, installed version, and enabled
+  components;
 - assigned mesh priority and current leadership observation;
 - SSH reachability result;
 - panel-side broker preflight result;
 - availability and last state/discovery timestamps;
 - last deployment transaction and rollback result;
+- retained-topic ownership schema/count and last verified cleanup result;
 - bounded/redacted service journal excerpts.
 
 User documentation is reorganized around tasks:
@@ -610,24 +827,38 @@ the official-app path; external-broker guidance remains protocol-neutral.
 
 - Fleet and panel schemas, defaults, menus, progress states, and Advanced-field
   visibility.
+- Singleton fleet enforcement and second-setup redirection to **Add panel**.
+- Fixed `homeassistant` discovery-prefix compatibility checks and rejection of
+  a non-default Home Assistant prefix.
 - Secret sentinel preservation and redaction.
 - Normalization and equality of broker profiles.
 - Validation state-machine timeouts, cancellation, cleanup, and error mapping.
-- Panel inspection, duplicate identity handling, priority allocation, staged
-  activation, and rollback.
+- TLS settings parsing and one strict client factory shared by runtime and
+  preflight.
+- SSH trust-on-first-use pinning, fingerprint-derived identity, duplicate
+  identity handling, mismatch failure, and explicit rebind.
+- Priority allocation, staged activation, and rollback.
 - Fleet health aggregation and repair-issue deduplication.
-- Migration grouping, phase recovery, overrides, and registry retargeting.
+- Single ownership of all seven global control/scene keys and same-fleet scene
+  references.
+- Retained-topic ledger ordering, manifest validation, mesh exclusion, and
+  strict legacy cleanup filtering.
+- Migration eligibility/conflict reporting, coordinator locking, phase
+  recovery, overrides, and registry retargeting.
 
 ### Broker integration tests
 
 Run real disposable broker instances in CI for:
 
 - plain authenticated MQTT;
-- TLS with trusted and untrusted CAs;
+- server-authenticated TLS with system/custom trusted and untrusted CAs using
+  the actual panel client factory;
 - incorrect hostname and expired/not-yet-valid certificates;
 - bad credentials;
-- publish-only and subscribe-only ACL failures;
-- discovery-prefix denial;
+- panel-principal and Home-Assistant-principal publish/subscribe ACL failures in
+  both message directions;
+- `homeassistant/#` discovery-write denial;
+- non-default Home Assistant discovery-prefix rejection before provisioning;
 - retained messages disabled or altered;
 - Home Assistant and device clients connected to different brokers;
 - broker disconnect during every validation stage;
@@ -642,16 +873,27 @@ retention defects.
 Use a controlled SSH test server/fake panel filesystem to verify:
 
 - supported and unsupported inspection results;
+- unauthenticated host-key collection followed by pinned password
+  authentication;
+- address changes with the same key, mismatches that fail before password
+  transmission, and deliberate rebind after replacement/reflash;
 - first install and idempotent reinstall;
+- plaintext and strict-TLS agent/preflight configuration parity;
 - interruption before activation;
 - Home Assistant interruption immediately after activation and provisioning-
   journal recovery;
 - service failure after activation;
 - exact restoration of a prior release/config;
 - offline panels during fleet changes;
-- legacy single-broker, multi-broker, and differing-override fixtures;
+- sequential broker change, halt-on-failure, explicit per-panel reversion, and
+  old/new journal recovery;
+- legacy exact-profile consolidation, conflicting broker/global compatibility
+  mode, legacy auto-repin acknowledgement, and repair-driven consolidation
+  fixtures;
 - restart during every migration phase;
-- unchanged MQTT entity IDs and integration management entity IDs.
+- unchanged MQTT entity IDs and integration management entity IDs;
+- ownership-manifest uninstall, ledger-aware upgrade seeding, legacy fallback,
+  and refusal to clear ambiguous or mesh topics.
 
 ### Hardware qualification
 
@@ -664,7 +906,8 @@ broker. Exercise:
 - TLS CA, hostname, and clock failures;
 - credential rotation and broker moves;
 - an offline panel during a proposed fleet change;
-- rollback after service activation failure;
+- rollback after service activation failure and explicit broker-profile
+  reversion after a partial rolling change;
 - retained discovery/state recovery after outages.
 
 ## Performance and safety gates
@@ -686,8 +929,8 @@ Against the same release and panel workload, a hardware soak must show:
 - normal physical-control responsiveness throughout broker and HA restarts.
 
 Any duplicate bus peer, reconnect storm, loss of physical responsiveness,
-retained-topic leak, or failed rollback is a release blocker regardless of
-average CPU/RSS.
+retained-topic leak, failed service rollback, or failed explicit broker-profile
+reversion is a release blocker regardless of average CPU/RSS.
 
 ## Rollout
 
@@ -696,10 +939,11 @@ average CPU/RSS.
 2. Exercise dry-run migration against captured/redacted config fixtures.
 3. Enable the new flow on a one-panel official-Mosquitto canary.
 4. Validate one panel against an existing remote broker.
-5. Migrate a mixed multi-panel fleet and run the resource/failure soak.
+5. Migrate a compatible multi-panel installation, exercise the conflicting-
+   legacy repair path, and run the resource/failure soak.
 6. Publish the new task-oriented prerequisite and error-code documentation.
-7. Release the config-entry migration only after dry-run output, rollback, and
-   entity-registry preservation pass.
+7. Release the config-entry migration only after dry-run output, interrupted-
+   phase recovery, explicit reversion, and entity-registry preservation pass.
 
 The implementation plan may divide these into separately reviewable milestones,
 but the user-visible migration is not shipped until the full validation,
@@ -710,14 +954,23 @@ rollback, documentation, and preservation gates are met.
 - MQTT remains the production transport.
 - Official Mosquitto is recommended, documented, and never forced.
 - Existing brokers are first-class and pass the same validation contract.
-- One fleet credential is stored once and deployed to all panels in that fleet.
+- Exactly one fleet matches Home Assistant's one active MQTT broker path.
+- One fleet credential is stored once and deployed to every managed panel.
+- TLS uses strict server authentication in both agent runtime and preflight.
+- MQTT Discovery remains on the existing `homeassistant` prefix, and an
+  incompatible Home Assistant prefix fails before provisioning.
 - New panel onboarding has no broker fields, raw JSON, mesh priority, or
   unrelated optional-feature settings.
 - Broker validation proves both message directions and retained behavior.
 - Panel validation proves the actual panel network path before activation.
 - Success requires normal agent availability and discovery.
 - Errors identify the failed stage and provide a specific recovery link.
-- Failed installs, upgrades, and broker changes are inactive or rolled back.
-- Existing entries migrate without changing MQTT topics or entity IDs.
-- Different legacy brokers become different fleets rather than being merged.
+- Failed installs and upgrades are inactive or rolled back. Partial broker
+  changes halt, preserve per-panel state, and expose verified explicit reverts.
+- Compatible existing entries migrate without changing MQTT topics or entity
+  IDs; conflicts remain intact until the guided repair succeeds.
+- SSH host keys are pinned before password authentication and changes fail
+  closed outside an explicit rebind.
+- Panel-owned retained topics have a durable manifest; cleanup never guesses or
+  removes fleet-owned mesh topics.
 - The panel runs no additional resident process and passes resource gates.
