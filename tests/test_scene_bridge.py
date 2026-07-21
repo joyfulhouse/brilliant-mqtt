@@ -558,11 +558,13 @@ async def test_failed_terminal_result_publish_retries_until_delivered(tmp_path: 
             super().__init__()
             self.failed = False
 
-        async def publish(self, topic: str, payload: str, retain: bool = False) -> None:
+        async def publish(
+            self, topic: str, payload: str, retain: bool = False, qos: int = 0
+        ) -> None:
             if topic == scene_result_topic(command_id) and not self.failed:
                 self.failed = True
                 raise RuntimeError("broker unavailable")
-            await super().publish(topic, payload, retain)
+            await super().publish(topic, payload, retain, qos)
 
     bus = FakeBus(
         [_execution()],
@@ -658,10 +660,12 @@ async def test_undelivered_accepted_result_survives_process_restart(tmp_path: Pa
     command_id = "22222222-2222-4222-8222-222222222222"
 
     class ResultOfflineMqtt(FakeMqtt):
-        async def publish(self, topic: str, payload: str, retain: bool = False) -> None:
+        async def publish(
+            self, topic: str, payload: str, retain: bool = False, qos: int = 0
+        ) -> None:
             if topic == scene_result_topic(command_id):
                 raise RuntimeError("offline")
-            await super().publish(topic, payload, retain)
+            await super().publish(topic, payload, retain, qos)
 
     path = tmp_path / "state.json"
     bus = FakeBus([_execution()], scoped_devices=[_scene_catalog("all_off"), _mode_catalog("away")])
@@ -705,10 +709,12 @@ async def test_event_outbox_survives_restart_and_gates_accepted_result(tmp_path:
             super().__init__()
             self.fail_events = True
 
-        async def publish(self, topic: str, payload: str, retain: bool = False) -> None:
+        async def publish(
+            self, topic: str, payload: str, retain: bool = False, qos: int = 0
+        ) -> None:
             if topic == scene_event_topic(_PANEL) and self.fail_events:
                 raise RuntimeError("offline")
-            await super().publish(topic, payload, retain)
+            await super().publish(topic, payload, retain, qos)
 
     path = tmp_path / "state.json"
     bus = FakeBus([_execution()], scoped_devices=[_scene_catalog("all_off"), _mode_catalog("away")])
@@ -872,11 +878,13 @@ async def test_hung_reconcile_and_publish_callbacks_do_not_block_shutdown(tmp_pa
             self.hang_events = False
             self.publish_started = asyncio.Event()
 
-        async def publish(self, topic: str, payload: str, retain: bool = False) -> None:
+        async def publish(
+            self, topic: str, payload: str, retain: bool = False, qos: int = 0
+        ) -> None:
             if topic == scene_event_topic(_PANEL) and self.hang_events:
                 self.publish_started.set()
                 await asyncio.Future()
-            await super().publish(topic, payload, retain)
+            await super().publish(topic, payload, retain, qos)
 
     bus = HangingBus()
     mqtt = HangingEventMqtt()
@@ -903,7 +911,9 @@ async def test_hung_event_publish_is_cancelled_before_shutdown_returns(tmp_path:
             self.publish_started = asyncio.Event()
             self.publish_cancelled = asyncio.Event()
 
-        async def publish(self, topic: str, payload: str, retain: bool = False) -> None:
+        async def publish(
+            self, topic: str, payload: str, retain: bool = False, qos: int = 0
+        ) -> None:
             if topic == scene_event_topic(_PANEL):
                 self.publish_started.set()
                 try:
@@ -911,7 +921,7 @@ async def test_hung_event_publish_is_cancelled_before_shutdown_returns(tmp_path:
                 except asyncio.CancelledError:
                     self.publish_cancelled.set()
                     raise
-            await super().publish(topic, payload, retain)
+            await super().publish(topic, payload, retain, qos)
 
     bus = FakeBus([_execution()], scoped_devices=[_scene_catalog("all_off"), _mode_catalog("away")])
     mqtt = HangingEventMqtt()
@@ -994,10 +1004,12 @@ async def test_result_capacity_never_discards_undelivered_outcome(
     second_id = "44444444-4444-4444-8444-444444444444"
 
     class ResultOfflineMqtt(FakeMqtt):
-        async def publish(self, topic: str, payload: str, retain: bool = False) -> None:
+        async def publish(
+            self, topic: str, payload: str, retain: bool = False, qos: int = 0
+        ) -> None:
             if "/scene/result/" in topic:
                 raise RuntimeError("offline")
-            await super().publish(topic, payload, retain)
+            await super().publish(topic, payload, retain, qos)
 
     bus = FakeBus([_execution()], scoped_devices=[_scene_catalog("all_off"), _mode_catalog("away")])
     mqtt = ResultOfflineMqtt()
@@ -1041,10 +1053,12 @@ async def test_event_capacity_never_discards_undelivered_event(
     monkeypatch.setattr("brilliant_mqtt.scene_bridge._EVENT_OUTBOX_LIMIT", 1)
 
     class EventOfflineMqtt(FakeMqtt):
-        async def publish(self, topic: str, payload: str, retain: bool = False) -> None:
+        async def publish(
+            self, topic: str, payload: str, retain: bool = False, qos: int = 0
+        ) -> None:
             if topic == scene_event_topic(_PANEL):
                 raise RuntimeError("offline")
-            await super().publish(topic, payload, retain)
+            await super().publish(topic, payload, retain, qos)
 
     path = tmp_path / "state.json"
     bus = FakeBus(
@@ -1405,10 +1419,12 @@ async def test_event_capacity_blocks_new_physical_command_even_with_result_room(
     monkeypatch.setattr(scene_bridge_module, "_EVENT_OUTBOX_LIMIT", 1)
 
     class EventOfflineMqtt(FakeMqtt):
-        async def publish(self, topic: str, payload: str, retain: bool = False) -> None:
+        async def publish(
+            self, topic: str, payload: str, retain: bool = False, qos: int = 0
+        ) -> None:
             if topic == scene_event_topic(_PANEL):
                 raise RuntimeError("offline")
-            await super().publish(topic, payload, retain)
+            await super().publish(topic, payload, retain, qos)
 
     bus = FakeBus(
         [_execution()],

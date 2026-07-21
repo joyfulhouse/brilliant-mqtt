@@ -33,14 +33,83 @@ class TestSettings:
         monkeypatch.setenv("MQTT_USERNAME", "brilliant")
         monkeypatch.setenv("MQTT_PASSWORD", "s3cr3t")
         monkeypatch.delenv("MQTT_PORT", raising=False)
+        monkeypatch.delenv("MQTT_TLS_ENABLED", raising=False)
+        monkeypatch.delenv("MQTT_TLS_CA_FILE", raising=False)
+        monkeypatch.delenv("RETAINED_TOPICS_FILE", raising=False)
         monkeypatch.delenv("RESYNC_SECONDS", raising=False)
         monkeypatch.delenv("LOG_LEVEL", raising=False)
 
         s = Settings.from_env()
 
         assert s.mqtt_port == 1883
+        assert s.mqtt_tls_enabled is False
+        assert s.mqtt_tls_ca_file is None
+        assert s.retained_topics_file == "/var/brilliant-mqtt/state/owned-topics.json"
         assert s.resync_seconds == 300
         assert s.log_level == "INFO"
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("0", False),
+            ("false", False),
+            ("off", False),
+            ("no", False),
+            ("False", False),
+            (" OFF ", False),
+            ("1", True),
+            ("true", True),
+            ("on", True),
+            ("yes", True),
+            ("TRUE", True),
+        ],
+    )
+    def test_mqtt_tls_enabled_parses_strict_boolean_spellings(
+        self, monkeypatch: pytest.MonkeyPatch, raw: str, expected: bool
+    ) -> None:
+        monkeypatch.setenv("BRILLIANT_PANEL", "office")
+        monkeypatch.setenv("MQTT_HOST", "mqtt.example.test")
+        monkeypatch.setenv("MQTT_USERNAME", "brilliant")
+        monkeypatch.setenv("MQTT_PASSWORD", "s3cr3t")
+        monkeypatch.setenv("MQTT_TLS_ENABLED", raw)
+        monkeypatch.delenv("MQTT_TLS_CA_FILE", raising=False)
+
+        assert Settings.from_env().mqtt_tls_enabled is expected
+
+    def test_mqtt_tls_enabled_rejects_unrecognized_boolean(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("BRILLIANT_PANEL", "office")
+        monkeypatch.setenv("MQTT_HOST", "mqtt.example.test")
+        monkeypatch.setenv("MQTT_USERNAME", "brilliant")
+        monkeypatch.setenv("MQTT_PASSWORD", "s3cr3t")
+        monkeypatch.setenv("MQTT_TLS_ENABLED", "sometimes")
+
+        with pytest.raises(ValueError, match="MQTT_TLS_ENABLED"):
+            Settings.from_env()
+
+    def test_mqtt_tls_ca_file_requires_tls(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("BRILLIANT_PANEL", "office")
+        monkeypatch.setenv("MQTT_HOST", "mqtt.example.test")
+        monkeypatch.setenv("MQTT_USERNAME", "brilliant")
+        monkeypatch.setenv("MQTT_PASSWORD", "s3cr3t")
+        monkeypatch.setenv("MQTT_TLS_ENABLED", "0")
+        monkeypatch.setenv("MQTT_TLS_CA_FILE", "/tmp/brilliant-mqtt-test-ca.pem")
+
+        with pytest.raises(ValueError, match="MQTT_TLS_CA_FILE requires MQTT_TLS_ENABLED"):
+            Settings.from_env()
+
+    def test_retained_topics_file_must_be_below_persistent_agent_root(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("BRILLIANT_PANEL", "office")
+        monkeypatch.setenv("MQTT_HOST", "mqtt.example.test")
+        monkeypatch.setenv("MQTT_USERNAME", "brilliant")
+        monkeypatch.setenv("MQTT_PASSWORD", "s3cr3t")
+        monkeypatch.setenv("RETAINED_TOPICS_FILE", "/tmp/owned-topics.json")
+
+        with pytest.raises(ValueError, match="RETAINED_TOPICS_FILE"):
+            Settings.from_env()
 
     def test_missing_brilliant_panel_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("BRILLIANT_PANEL", raising=False)

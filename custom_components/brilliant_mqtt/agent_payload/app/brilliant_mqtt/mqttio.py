@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import ssl
 from collections.abc import Awaitable, Callable
 
 import aiomqtt
@@ -21,6 +22,17 @@ from brilliant_mqtt.config import Settings
 from brilliant_mqtt.discovery import availability_topic
 
 logger = logging.getLogger(__name__)
+
+
+def build_tls_context(settings: Settings) -> ssl.SSLContext | None:
+    """Build a strict server-authenticated TLS context when TLS is enabled."""
+    if not settings.mqtt_tls_enabled:
+        return None
+
+    context = ssl.create_default_context(cafile=settings.mqtt_tls_ca_file)
+    context.check_hostname = True
+    context.verify_mode = ssl.CERT_REQUIRED
+    return context
 
 
 class AioMqttAdapter:
@@ -70,6 +82,7 @@ class AioMqttAdapter:
             password=settings.mqtt_password,
             identifier=self._identifier,
             will=will,
+            tls_context=build_tls_context(settings),
         )
 
     async def connect(self) -> None:
@@ -156,8 +169,10 @@ class AioMqttAdapter:
 
     # -- MqttClient Protocol -------------------------------------------------
 
-    async def publish(self, topic: str, payload: str, retain: bool = False) -> None:
-        await self._client.publish(topic, payload=payload, retain=retain)
+    async def publish(self, topic: str, payload: str, retain: bool = False, qos: int = 0) -> None:
+        if qos not in (0, 1, 2):
+            raise ValueError("qos must be between 0 and 2")
+        await self._client.publish(topic, payload=payload, retain=retain, qos=qos)
 
     def on_command(self, cb: Callable[[str, str], Awaitable[None]]) -> None:
         self._command_cbs.append(cb)

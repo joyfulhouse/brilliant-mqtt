@@ -78,8 +78,8 @@ class BusClient(Protocol):
 class MqttClient(Protocol):
     """Adapter for the central MQTT broker."""
 
-    async def publish(self, topic: str, payload: str, retain: bool = False) -> None:
-        """Publish *payload* to *topic*, optionally with the retain flag."""
+    async def publish(self, topic: str, payload: str, retain: bool = False, qos: int = 0) -> None:
+        """Publish *payload* to *topic* with the requested retain flag and QoS."""
         ...
 
     def on_command(self, cb: Callable[[str, str], Awaitable[None]]) -> None:

@@ -39,6 +39,9 @@ class Settings:
     mqtt_username: str
     mqtt_password: str
     mqtt_port: int = 1883
+    mqtt_tls_enabled: bool = False
+    mqtt_tls_ca_file: str | None = None
+    retained_topics_file: str = "/var/brilliant-mqtt/state/owned-topics.json"
     resync_seconds: int = 300
     log_level: str = "INFO"
     # Cadence of the scoped get-device poll that bounds state staleness even
@@ -106,7 +109,10 @@ class Settings:
         """Construct Settings from environment variables.
 
         Required: BRILLIANT_PANEL, MQTT_HOST, MQTT_USERNAME, MQTT_PASSWORD.
-        Optional: MQTT_PORT (default 1883), RESYNC_SECONDS (default 300),
+        Optional: MQTT_PORT (default 1883), MQTT_TLS_ENABLED (default "0"),
+                  MQTT_TLS_CA_FILE (default unset), RETAINED_TOPICS_FILE (default
+                  "/var/brilliant-mqtt/state/owned-topics.json"),
+                  RESYNC_SECONDS (default 300),
                   LOG_LEVEL (default "INFO"), HOT_POLL_SECONDS (default 2.0),
                   BUS_STALE_SECONDS (default 900), MESH_PRIORITY (default 0:
                   never participate in mesh publishing),
@@ -146,6 +152,16 @@ class Settings:
 
         # Optional with typed defaults.
         mqtt_port = int(env.get("MQTT_PORT", "1883"))
+        mqtt_tls_enabled = _env_bool(env, "MQTT_TLS_ENABLED", "0")
+        mqtt_tls_ca_file = env.get("MQTT_TLS_CA_FILE") or None
+        retained_topics_file = env.get(
+            "RETAINED_TOPICS_FILE",
+            "/var/brilliant-mqtt/state/owned-topics.json",
+        )
+        if mqtt_tls_ca_file is not None and not mqtt_tls_enabled:
+            raise ValueError("MQTT_TLS_CA_FILE requires MQTT_TLS_ENABLED")
+        if not retained_topics_file.startswith("/var/brilliant-mqtt/"):
+            raise ValueError("RETAINED_TOPICS_FILE must be below /var/brilliant-mqtt/")
         resync_seconds = int(env.get("RESYNC_SECONDS", "300"))
         log_level = env.get("LOG_LEVEL", "INFO")
         hot_poll_seconds = float(env.get("HOT_POLL_SECONDS", "2.0"))
@@ -187,6 +203,9 @@ class Settings:
             mqtt_username=mqtt_username,
             mqtt_password=mqtt_password,
             mqtt_port=mqtt_port,
+            mqtt_tls_enabled=mqtt_tls_enabled,
+            mqtt_tls_ca_file=mqtt_tls_ca_file,
+            retained_topics_file=retained_topics_file,
             resync_seconds=resync_seconds,
             log_level=log_level,
             hot_poll_seconds=hot_poll_seconds,
