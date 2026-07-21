@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "vectors": [
+    {
+      "setup_id": "12345678-1234-4abc-8def-1234567890ab",
+      "topics": {
+        "panel_to_ha": "brilliant/setup/12345678-1234-4abc-8def-1234567890ab/panel_to_ha",
+        "ha_to_panel": "brilliant/setup/12345678-1234-4abc-8def-1234567890ab/ha_to_panel",
+        "retained": "brilliant/setup/12345678-1234-4abc-8def-1234567890ab/retained",
+        "discovery_probe": "homeassistant/brilliant_mqtt_setup/12345678-1234-4abc-8def-1234567890ab/probe"
+      },
+      "request": {"schema_version": 1, "setup_id": "12345678-1234-4abc-8def-1234567890ab", "nonce": "panel-nonce"},
+      "result": {"schema_version": 1, "setup_id": "12345678-1234-4abc-8def-1234567890ab", "nonce": "ha-nonce", "reply_to_nonce": "panel-nonce"}
+    }
+  ]
+}
