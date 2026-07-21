@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import ssl
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -18,6 +20,16 @@ from brilliant_mqtt.config import Settings
 class _TlsContext:
     check_hostname: bool = False
     verify_mode: ssl.VerifyMode = ssl.CERT_NONE
+
+
+class _CloseFailingClient:
+    def __init__(self, raw_close_error: str) -> None:
+        self._raw_close_error = raw_close_error
+        self.exit_attempts = 0
+
+    async def __aexit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.exit_attempts += 1
+        raise RuntimeError(self._raw_close_error)
 
 
 def _settings(*, tls_enabled: bool, ca_file: str | None = None) -> Settings:
@@ -130,3 +142,52 @@ def test_adapter_does_not_fall_back_to_plaintext_when_tls_setup_fails(
         mqttio.AioMqttAdapter(_settings(tls_enabled=True))
 
     assert client_calls == []
+
+
+async def test_checked_redacted_disconnect_finishes_reader_and_client_close(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    raw_reader_error = "raw-reader-error password=s3cr3t"
+    raw_close_error = "raw-close-error host=mqtt.example.test"
+    client = _CloseFailingClient(raw_close_error)
+    monkeypatch.setattr(aiomqtt, "Client", lambda **kwargs: client)
+    caplog.set_level(logging.DEBUG, logger=mqttio.__name__)
+    adapter = mqttio.AioMqttAdapter(
+        _settings(tls_enabled=False),
+        publish_availability=False,
+        checked_disconnect=True,
+        redacted_logging=True,
+    )
+
+    async def fail_reader() -> None:
+        raise RuntimeError(raw_reader_error)
+
+    reader_task = asyncio.create_task(fail_reader())
+    await asyncio.sleep(0)
+    adapter._reader_task = reader_task
+
+    with pytest.raises(RuntimeError, match=r"^MQTT disconnect failed$") as raised:
+        await adapter.disconnect()
+
+    assert client.exit_attempts == 1
+    assert adapter._reader_task is None
+    assert raw_reader_error not in str(raised.value)
+    assert raw_close_error not in str(raised.value)
+    assert raw_reader_error not in caplog.text
+    assert raw_close_error not in caplog.text
+
+
+async def test_default_disconnect_remains_best_effort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _CloseFailingClient("resident close failure")
+    monkeypatch.setattr(aiomqtt, "Client", lambda **kwargs: client)
+    adapter = mqttio.AioMqttAdapter(
+        _settings(tls_enabled=False),
+        publish_availability=False,
+    )
+
+    await adapter.disconnect()
+
+    assert client.exit_attempts == 1

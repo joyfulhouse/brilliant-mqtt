@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -12,9 +13,11 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+import aiomqtt
 import pytest
 
 import brilliant_mqtt.preflight as preflight_module
+from brilliant_mqtt import mqttio
 from brilliant_mqtt.config import Settings
 from brilliant_mqtt.preflight import (
     PreflightReport,
@@ -76,13 +79,25 @@ class RecordingMqtt(FakeMqtt):
         self.events: list[tuple[object, ...]] = []
         self.failures: dict[tuple[str, ...], BaseException] = {}
         self.blocked: set[tuple[str, ...]] = set()
+        self.cancellation_delays: dict[tuple[str, ...], float] = {}
+        self.pauses: dict[tuple[str, ...], tuple[asyncio.Event, asyncio.Event]] = {}
         self.publish_hook: PublishHook | None = None
         self.subscribe_hook: SubscribeHook | None = None
 
     async def _before(self, key: tuple[str, ...]) -> None:
         self.events.append(key)
+        pause = self.pauses.get(key)
+        if pause is not None:
+            entered, release = pause
+            entered.set()
+            await release.wait()
         if key in self.blocked:
-            await asyncio.Future()
+            try:
+                await asyncio.Future()
+            finally:
+                delay = self.cancellation_delays.get(key)
+                if delay is not None:
+                    await asyncio.sleep(delay)
         failure = self.failures.get(key)
         if failure is not None:
             raise failure
@@ -147,6 +162,76 @@ def _successful_mqtt(request: PreflightRequest) -> RecordingMqtt:
     return mqtt
 
 
+class _ConcreteMessageStream:
+    def __init__(self) -> None:
+        self._messages: asyncio.Queue[aiomqtt.Message] = asyncio.Queue()
+
+    def __aiter__(self) -> _ConcreteMessageStream:
+        return self
+
+    async def __anext__(self) -> aiomqtt.Message:
+        return await self._messages.get()
+
+    def feed(self, topic: str, payload: str, *, retained: bool) -> None:
+        self._messages.put_nowait(
+            aiomqtt.Message(
+                topic=topic,
+                payload=payload.encode(),
+                qos=1,
+                retain=retained,
+                mid=1,
+                properties=None,
+            )
+        )
+
+
+class _ConcretePreflightClient:
+    """Broker seam used while exercising the real AioMqttAdapter lifecycle."""
+
+    def __init__(self, request: PreflightRequest, raw_close_error: str) -> None:
+        self._request = request
+        self._topics = SetupTopics.for_id(request.setup_id)
+        self._raw_close_error = raw_close_error
+        self._retained_payload: str | None = None
+        self.messages = _ConcreteMessageStream()
+        self.exit_attempts = 0
+        self.unsubscriptions: list[str] = []
+
+    async def __aenter__(self) -> _ConcretePreflightClient:
+        return self
+
+    async def __aexit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.exit_attempts += 1
+        raise RuntimeError(self._raw_close_error)
+
+    async def publish(
+        self,
+        topic: str,
+        payload: str,
+        retain: bool = False,
+        qos: int = 0,
+    ) -> None:
+        if topic == self._topics.panel_to_ha:
+            self.messages.feed(
+                self._topics.ha_to_panel,
+                SetupResult(
+                    setup_id=self._request.setup_id,
+                    nonce=self._request.ha_nonce,
+                    reply_to_nonce=self._request.panel_nonce,
+                ).to_payload(),
+                retained=False,
+            )
+        if topic == self._topics.retained and retain:
+            self._retained_payload = payload
+
+    async def subscribe(self, topic: str) -> None:
+        if topic == self._topics.retained and self._retained_payload:
+            self.messages.feed(topic, self._retained_payload, retained=True)
+
+    async def unsubscribe(self, topic: str) -> None:
+        self.unsubscriptions.append(topic)
+
+
 def test_request_parses_exact_contract_and_stage_values() -> None:
     request = _request()
 
@@ -192,6 +277,32 @@ def test_request_rejects_missing_key_and_non_object_json() -> None:
         PreflightRequest.from_json(_canonical(missing))
     with pytest.raises(ValueError, match=r"^invalid_preflight_request"):
         PreflightRequest.from_json("[]")
+
+
+def test_request_requires_setup_id_to_be_a_json_string() -> None:
+    value = dict(REQUEST_OBJECT)
+    value["setup_id"] = 12345678123441238123123456789012
+
+    with pytest.raises(ValueError, match=r"^invalid_preflight_request"):
+        PreflightRequest.from_json(_canonical(value))
+
+
+def test_request_maps_huge_integer_timeout_to_stable_validation_error() -> None:
+    value = dict(REQUEST_OBJECT)
+    value["timeout_seconds"] = 10**400
+
+    with pytest.raises(ValueError, match=r"^invalid_preflight_request"):
+        PreflightRequest.from_json(_canonical(value))
+
+
+def test_request_maps_json_integer_digit_limit_to_stable_validation_error() -> None:
+    raw = (
+        '{"ha_nonce":"ha-nonce","panel_nonce":"panel-nonce","schema_version":1,'
+        f'"setup_id":"{SETUP_ID}","timeout_seconds":' + "1" * 5_000 + "}"
+    )
+
+    with pytest.raises(ValueError, match=r"^invalid_preflight_request"):
+        PreflightRequest.from_json(raw)
 
 
 async def test_success_uses_exact_order_nonces_qos_retain_and_canonical_report(
@@ -274,6 +385,8 @@ async def test_factory_gets_unique_setup_client_id_and_no_availability_lwt() -> 
             {
                 "identifier": f"brilliant-mqtt-setup-{SETUP_ID}",
                 "publish_availability": False,
+                "checked_disconnect": True,
+                "redacted_logging": True,
             },
         ),
         (
@@ -281,6 +394,8 @@ async def test_factory_gets_unique_setup_client_id_and_no_availability_lwt() -> 
             {
                 "identifier": f"brilliant-mqtt-setup-{SECOND_SETUP_ID}",
                 "publish_availability": False,
+                "checked_disconnect": True,
+                "redacted_logging": True,
             },
         ),
     ]
@@ -448,6 +563,30 @@ async def test_cleanup_timeout_is_bounded_and_reported() -> None:
     )
 
 
+async def test_cleanup_budget_reserves_time_to_attempt_disconnect() -> None:
+    request = _request(timeout_seconds=0.2)
+    topics = SetupTopics.for_id(request.setup_id)
+    mqtt = _successful_mqtt(request)
+    delayed_timeouts = {
+        ("publish", topics.discovery_probe, "", "True", "1"),
+        ("publish", topics.retained, "", "True", "1"),
+        ("unsubscribe", topics.ha_to_panel),
+        ("unsubscribe", topics.retained),
+    }
+    mqtt.blocked.update(delayed_timeouts)
+    mqtt.cancellation_delays.update(dict.fromkeys(delayed_timeouts, 0.011))
+
+    report = await asyncio.wait_for(
+        async_run_preflight(_settings(), request, mqtt_factory=lambda *args, **kw: mqtt),
+        timeout=0.5,
+    )
+
+    assert report.success is False
+    assert report.failed_stage is PreflightStage.CLEANUP
+    assert report.error_code == "mqtt_timeout"
+    assert ("disconnect",) in mqtt.events
+
+
 async def test_ordinary_failure_still_clears_both_probes_unsubscribes_and_disconnects() -> None:
     request = _request()
     topics = SetupTopics.for_id(request.setup_id)
@@ -488,6 +627,106 @@ async def test_partial_cleanup_failures_do_not_skip_later_cleanup_actions() -> N
     assert ("publish", topics.retained, "", "True", "1") in mqtt.events
     assert ("unsubscribe", topics.retained) in mqtt.events
     assert mqtt.events[-1] == ("disconnect",)
+
+
+async def test_first_cancellation_during_cleanup_waits_for_every_action() -> None:
+    request = _request(timeout_seconds=0.5)
+    topics = SetupTopics.for_id(request.setup_id)
+    mqtt = _successful_mqtt(request)
+    cleanup_entered = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    mqtt.pauses[("publish", topics.discovery_probe, "", "True", "1")] = (
+        cleanup_entered,
+        release_cleanup,
+    )
+    task = asyncio.create_task(
+        async_run_preflight(_settings(), request, mqtt_factory=lambda *args, **kw: mqtt)
+    )
+    await asyncio.wait_for(cleanup_entered.wait(), timeout=0.2)
+
+    task.cancel()
+    await asyncio.sleep(0)
+
+    assert task.done() is False
+    release_cleanup.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=0.5)
+
+    assert [event for event in mqtt.events if event[0] == "publish" and event[2] == ""] == [
+        ("publish", topics.discovery_probe, "", "True", "1"),
+        ("publish", topics.retained, "", "True", "1"),
+    ]
+    assert mqtt.unsubscriptions == [topics.ha_to_panel, topics.retained]
+    assert mqtt.events[-1] == ("disconnect",)
+
+
+async def test_repeated_cancellation_during_cleanup_waits_for_every_action() -> None:
+    request = _request(timeout_seconds=0.5)
+    topics = SetupTopics.for_id(request.setup_id)
+    mqtt = _successful_mqtt(request)
+    subscribe_entered = asyncio.Event()
+    never_release_suback = asyncio.Event()
+    cleanup_entered = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    mqtt.pauses[("subscribe", topics.retained)] = (
+        subscribe_entered,
+        never_release_suback,
+    )
+    mqtt.pauses[("publish", topics.discovery_probe, "", "True", "1")] = (
+        cleanup_entered,
+        release_cleanup,
+    )
+    task = asyncio.create_task(
+        async_run_preflight(_settings(), request, mqtt_factory=lambda *args, **kw: mqtt)
+    )
+    await asyncio.wait_for(subscribe_entered.wait(), timeout=0.2)
+
+    task.cancel()
+    await asyncio.wait_for(cleanup_entered.wait(), timeout=0.2)
+    task.cancel()
+    await asyncio.sleep(0)
+
+    assert task.done() is False
+    release_cleanup.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=0.5)
+
+    assert [event for event in mqtt.events if event[0] == "publish" and event[2] == ""] == [
+        ("publish", topics.discovery_probe, "", "True", "1"),
+        ("publish", topics.retained, "", "True", "1"),
+    ]
+    assert mqtt.unsubscriptions == [topics.ha_to_panel, topics.retained]
+    assert mqtt.events[-1] == ("disconnect",)
+
+
+@pytest.mark.parametrize("subscription_name", ["ha_to_panel", "retained"])
+async def test_broker_applied_subscription_is_cleaned_after_suback_timeout(
+    subscription_name: str,
+) -> None:
+    request = _request(timeout_seconds=0.02)
+    topics = SetupTopics.for_id(request.setup_id)
+    mqtt = _successful_mqtt(request)
+    topic = getattr(topics, subscription_name)
+    subscribe_entered = asyncio.Event()
+    never_deliver_suback = asyncio.Event()
+
+    async def broker_applies_before_suback(subscribed_topic: str) -> None:
+        if subscribed_topic == topic:
+            assert subscribed_topic in mqtt.subscriptions
+            subscribe_entered.set()
+            await never_deliver_suback.wait()
+
+    mqtt.subscribe_hook = broker_applies_before_suback
+
+    report = await asyncio.wait_for(
+        async_run_preflight(_settings(), request, mqtt_factory=lambda *args, **kw: mqtt),
+        timeout=0.3,
+    )
+
+    assert subscribe_entered.is_set()
+    assert report.success is False
+    assert report.error_code == "mqtt_timeout"
+    assert ("unsubscribe", topic) in mqtt.events
 
 
 async def test_cancellation_propagates_after_independent_bounded_cleanup() -> None:
@@ -539,6 +778,62 @@ async def test_raw_settings_ca_and_broker_exception_text_are_redacted(
 
     assert report.detail == "MQTT connection failed"
     for raw in raw_values:
+        assert raw not in serialized
+        assert raw not in caplog.text
+
+
+async def test_real_adapter_close_failure_maps_to_redacted_cleanup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    settings = _settings()
+    request = _request()
+    raw_close_error = "raw-close-error password-do-not-leak panel-nonce"
+    client = _ConcretePreflightClient(request, raw_close_error)
+    modes: list[tuple[bool, bool]] = []
+    monkeypatch.setattr(aiomqtt, "Client", lambda **kwargs: client)
+    monkeypatch.setattr(mqttio, "build_tls_context", lambda received: None)
+    caplog.set_level(logging.DEBUG, logger=mqttio.__name__)
+
+    def factory(
+        settings: Settings,
+        *,
+        identifier: str,
+        publish_availability: bool,
+        checked_disconnect: bool = False,
+        redacted_logging: bool = False,
+    ) -> mqttio.AioMqttAdapter:
+        modes.append((checked_disconnect, redacted_logging))
+        return mqttio.AioMqttAdapter(
+            settings,
+            identifier=identifier,
+            publish_availability=publish_availability,
+            checked_disconnect=checked_disconnect,
+            redacted_logging=redacted_logging,
+        )
+
+    report = await async_run_preflight(settings, request, mqtt_factory=factory)
+
+    assert report.success is False
+    assert report.failed_stage is PreflightStage.CLEANUP
+    assert report.error_code == "cleanup_failed"
+    assert report.detail == "MQTT cleanup failed"
+    assert modes == [(True, True)]
+    assert client.exit_attempts == 1
+    assert client.unsubscriptions == [
+        SetupTopics.for_id(request.setup_id).ha_to_panel,
+        SetupTopics.for_id(request.setup_id).retained,
+    ]
+    serialized = report.to_json()
+    for raw in (
+        settings.mqtt_host,
+        settings.mqtt_username,
+        settings.mqtt_password,
+        str(settings.mqtt_tls_ca_file),
+        request.panel_nonce,
+        request.ha_nonce,
+        raw_close_error,
+    ):
         assert raw not in serialized
         assert raw not in caplog.text
 
@@ -595,6 +890,125 @@ async def test_cli_prints_exactly_one_canonical_json_object_and_maps_failure_to_
     assert captured.err == ""
 
 
+async def test_cli_valid_request_maps_settings_failure_to_one_redacted_json_line(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    raw_secret = "settings-validation-secret-do-not-leak"
+
+    def fail_settings() -> Settings:
+        raise ValueError(raw_secret)
+
+    async def runner(received: Settings, request: PreflightRequest) -> PreflightReport:
+        raise AssertionError("runner must not be called when settings are invalid")
+
+    code = await preflight_module.async_main(
+        ["--request-json", _canonical(REQUEST_OBJECT)],
+        settings_factory=fail_settings,
+        runner=runner,
+    )
+
+    captured = capsys.readouterr()
+    assert code == 1
+    assert (
+        captured.out
+        == _canonical(
+            {
+                "completed_stages": [],
+                "detail": "MQTT connection failed",
+                "error_code": "mqtt_connect",
+                "failed_stage": "fleet_auth",
+                "schema_version": 1,
+                "setup_id": SETUP_ID,
+                "stage_elapsed_ms": {},
+                "success": False,
+            }
+        )
+        + "\n"
+    )
+    assert captured.err == ""
+    assert raw_secret not in captured.out
+    assert raw_secret not in captured.err
+
+
+async def test_cli_malformed_provided_request_maps_to_one_redacted_json_line(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    raw_secret = "malformed-request-secret-do-not-echo"
+
+    code = await preflight_module.async_main(
+        ["--request-json", "{" + raw_secret],
+        settings_factory=lambda: _settings(),
+    )
+
+    captured = capsys.readouterr()
+    assert code == 1
+    assert (
+        captured.out
+        == _canonical(
+            {
+                "completed_stages": [],
+                "detail": "MQTT payload validation failed",
+                "error_code": "mqtt_payload",
+                "failed_stage": "fleet_auth",
+                "schema_version": 1,
+                "setup_id": None,
+                "stage_elapsed_ms": {},
+                "success": False,
+            }
+        )
+        + "\n"
+    )
+    assert captured.err == ""
+    assert raw_secret not in captured.out
+    assert raw_secret not in captured.err
+
+
+def test_cli_subprocess_redacts_invalid_environment_value() -> None:
+    raw_secret = "invalid-port-secret-do-not-leak"
+    source_root = Path(__file__).resolve().parents[1] / "src"
+    environment = {
+        "PATH": os.environ.get("PATH", ""),
+        "PYTHONPATH": str(source_root),
+        "BRILLIANT_PANEL": "office",
+        "MQTT_HOST": "broker.internal.example",
+        "MQTT_USERNAME": "preflight-user",
+        "MQTT_PASSWORD": "password-do-not-leak",
+        "MQTT_PORT": raw_secret,
+    }
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "brilliant_mqtt.preflight",
+            "--request-json",
+            _canonical(REQUEST_OBJECT),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5.0,
+        env=environment,
+    )
+
+    assert completed.returncode == 1
+    assert completed.stdout.count("\n") == 1
+    assert completed.stdout == _canonical(json.loads(completed.stdout)) + "\n"
+    assert json.loads(completed.stdout) == {
+        "completed_stages": [],
+        "detail": "MQTT connection failed",
+        "error_code": "mqtt_connect",
+        "failed_stage": "fleet_auth",
+        "schema_version": 1,
+        "setup_id": SETUP_ID,
+        "stage_elapsed_ms": {},
+        "success": False,
+    }
+    assert completed.stderr == ""
+    assert raw_secret not in completed.stdout
+    assert raw_secret not in completed.stderr
+
+
 def test_cli_help_exits_zero_and_lists_required_request_argument(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -605,6 +1019,18 @@ def test_cli_help_exits_zero_and_lists_required_request_argument(
     assert raised.value.code == 0
     assert "--request-json" in captured.out
     assert captured.err == ""
+
+
+def test_cli_missing_required_argument_keeps_argparse_system_exit(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as raised:
+        preflight_module.main([])
+
+    captured = capsys.readouterr()
+    assert raised.value.code == 2
+    assert captured.out == ""
+    assert "--request-json" in captured.err
 
 
 def test_importing_preflight_does_not_import_or_reference_panel_bus() -> None:

@@ -23,6 +23,8 @@ from brilliant_mqtt.discovery import availability_topic
 
 logger = logging.getLogger(__name__)
 
+_DISCONNECT_ERROR = "MQTT disconnect failed"
+
 
 def build_tls_context(settings: Settings) -> ssl.SSLContext | None:
     """Build a strict server-authenticated TLS context when TLS is enabled."""
@@ -40,9 +42,14 @@ class AioMqttAdapter:
 
     Construction builds the client (with the LWT) but performs no I/O.
     :meth:`connect` opens the connection and starts the receive loop;
-    :meth:`disconnect` cleans up. The runner uses this concrete class so the
-    connect/disconnect lifecycle (beyond the Protocol) is available.
+    :meth:`disconnect` cleans up. Disconnect remains best-effort by default;
+    temporary preflight clients opt into checked, redacted shutdown. The runner
+    uses this concrete class so the connect/disconnect lifecycle (beyond the
+    Protocol) is available.
     """
+
+    _checked_disconnect = False
+    _redacted_logging = False
 
     def __init__(
         self,
@@ -50,6 +57,8 @@ class AioMqttAdapter:
         *,
         identifier: str | None = None,
         publish_availability: bool = True,
+        checked_disconnect: bool = False,
+        redacted_logging: bool = False,
     ) -> None:
         self._settings = settings
         # Multiple consumers (panel bridge + mesh publisher) each register a
@@ -67,6 +76,8 @@ class AioMqttAdapter:
         # in HA while the bridge is healthy.
         self._identifier = identifier or f"brilliant-mqtt-{settings.panel}"
         self._publish_availability = publish_availability
+        self._checked_disconnect = checked_disconnect
+        self._redacted_logging = redacted_logging
 
         # Last-Will-and-Testament: the broker publishes this retained "offline"
         # if we drop without a clean disconnect, so HA marks the panel offline.
@@ -89,11 +100,14 @@ class AioMqttAdapter:
         """Open the broker connection and start the message reader task."""
         await self._client.__aenter__()
         self._reader_task = asyncio.create_task(self._read_loop())
-        logger.info(
-            "connected to MQTT broker %s:%s",
-            self._settings.mqtt_host,
-            self._settings.mqtt_port,
-        )
+        if self._redacted_logging:
+            logger.info("connected temporary MQTT client")
+        else:
+            logger.info(
+                "connected to MQTT broker %s:%s",
+                self._settings.mqtt_host,
+                self._settings.mqtt_port,
+            )
 
     async def _read_loop(self) -> None:
         """Dispatch inbound messages to every registered command callback.
@@ -115,29 +129,44 @@ class AioMqttAdapter:
             except Exception:
                 # Broad by design: keep the reader alive across any single
                 # message's decode failure.
-                logger.exception("failed decoding MQTT message; continuing")
+                if self._redacted_logging:
+                    logger.warning("failed decoding temporary MQTT message; continuing")
+                else:
+                    logger.exception("failed decoding MQTT message; continuing")
                 continue
-            logger.debug("mqtt message on %s (%d bytes)", topic, len(payload))
+            if self._redacted_logging:
+                logger.debug("temporary MQTT message received (%d bytes)", len(payload))
+            else:
+                logger.debug("mqtt message on %s (%d bytes)", topic, len(payload))
             for command_cb in command_cbs:
                 try:
                     await command_cb(topic, payload)
                 except Exception:
                     # Broad by design — see the docstring.
-                    logger.exception("command callback failed; continuing")
+                    if self._redacted_logging:
+                        logger.warning("temporary MQTT command callback failed; continuing")
+                    else:
+                        logger.exception("command callback failed; continuing")
             for message_cb in message_cbs:
                 try:
                     await message_cb(topic, payload, bool(message.retain))
                 except Exception:
-                    logger.exception("message callback failed; continuing")
+                    if self._redacted_logging:
+                        logger.warning("temporary MQTT message callback failed; continuing")
+                    else:
+                        logger.exception("message callback failed; continuing")
 
     async def disconnect(self) -> None:
-        """Best-effort clean shutdown: publish a clean offline LWT, then close.
+        """Publish a clean offline LWT, stop the reader, and close the client.
 
         Publishing "offline" retained here (rather than relying on the broker's
         LWT) gives a deterministic offline marker on an orderly stop (plan M7
         Step 3 — "clean LWT on exit"). Skipped when this adapter does not own the
-        panel's availability topic (a secondary election-only consumer).
+        panel's availability topic (a secondary election-only consumer). The
+        default remains best-effort; checked mode finishes every close step and
+        then raises one generic error if any step failed.
         """
+        failed = False
         if self._publish_availability:
             try:
                 await self._client.publish(self._avail_topic, payload="offline", retain=True)
@@ -146,11 +175,22 @@ class AioMqttAdapter:
                 # cycle hits this): one quiet line, no traceback — the broker-side
                 # LWT publishes the retained "offline" for us. MqttCodeError is a
                 # subclass of MqttError, so this catch covers both.
-                logger.warning("clean offline publish failed (%s); broker-side LWT covers it", exc)
+                if self._checked_disconnect:
+                    failed = True
+                    logger.warning("clean offline publish failed; broker-side LWT covers it")
+                else:
+                    logger.warning(
+                        "clean offline publish failed (%s); broker-side LWT covers it", exc
+                    )
             except Exception:
-                # Anything non-MQTT here is genuinely unexpected — keep the
-                # traceback, and keep disconnect() best-effort (never raise).
-                logger.exception("failed publishing clean offline availability")
+                # Anything non-MQTT here is genuinely unexpected. Resident mode
+                # keeps the traceback and remains best-effort; checked mode
+                # records the failure without exposing its exception text.
+                if self._checked_disconnect:
+                    failed = True
+                    logger.error("failed publishing clean offline availability")
+                else:
+                    logger.exception("failed publishing clean offline availability")
 
         if self._reader_task is not None:
             self._reader_task.cancel()
@@ -159,13 +199,24 @@ class AioMqttAdapter:
             except asyncio.CancelledError:
                 pass
             except Exception:
-                logger.exception("reader task raised during cancellation")
+                if self._checked_disconnect:
+                    failed = True
+                    logger.error("reader task failed during cancellation")
+                else:
+                    logger.exception("reader task raised during cancellation")
             self._reader_task = None
 
         try:
             await self._client.__aexit__(None, None, None)
         except Exception:
-            logger.exception("failed closing MQTT client")
+            if self._checked_disconnect:
+                failed = True
+                logger.error("failed closing MQTT client")
+            else:
+                logger.exception("failed closing MQTT client")
+
+        if failed:
+            raise RuntimeError(_DISCONNECT_ERROR) from None
 
     # -- MqttClient Protocol -------------------------------------------------
 

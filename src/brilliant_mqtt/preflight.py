@@ -61,21 +61,26 @@ class PreflightRequest:
             raise ValueError(
                 "invalid_preflight_request: invalid setup identity or nonce"
             ) from error
-        if (
-            isinstance(self.timeout_seconds, bool)
-            or not isinstance(self.timeout_seconds, (int, float))
-            or not math.isfinite(self.timeout_seconds)
-            or self.timeout_seconds <= 0
+        if isinstance(self.timeout_seconds, bool) or not isinstance(
+            self.timeout_seconds, (int, float)
         ):
             raise ValueError("invalid_preflight_request: timeout_seconds must be positive")
-        object.__setattr__(self, "timeout_seconds", float(self.timeout_seconds))
+        try:
+            timeout_seconds = float(self.timeout_seconds)
+        except (OverflowError, TypeError, ValueError) as error:
+            raise ValueError(
+                "invalid_preflight_request: timeout_seconds must be positive"
+            ) from error
+        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise ValueError("invalid_preflight_request: timeout_seconds must be positive")
+        object.__setattr__(self, "timeout_seconds", timeout_seconds)
 
     @classmethod
     def from_json(cls, raw: str) -> PreflightRequest:
         """Parse an exact schema-v1 preflight request without echoing input."""
         try:
             decoded = json.loads(raw)
-        except (json.JSONDecodeError, RecursionError, TypeError) as error:
+        except (RecursionError, TypeError, ValueError) as error:
             raise ValueError("invalid_preflight_request: expected a JSON object") from error
         if not isinstance(decoded, dict):
             raise ValueError("invalid_preflight_request: expected a JSON object")
@@ -85,8 +90,10 @@ class PreflightRequest:
             raise ValueError("invalid_preflight_request: unexpected or missing keys")
         if type(value["schema_version"]) is not int or value["schema_version"] != SCHEMA_VERSION:
             raise ValueError("invalid_preflight_request: expected schema_version 1")
+        if not isinstance(value["setup_id"], str):
+            raise ValueError("invalid_preflight_request: invalid setup identity or nonce")
         try:
-            setup_id = UUID(str(value["setup_id"]))
+            setup_id = UUID(value["setup_id"])
         except (AttributeError, TypeError, ValueError) as error:
             raise ValueError(
                 "invalid_preflight_request: invalid setup identity or nonce"
@@ -163,6 +170,8 @@ class _MqttFactory(Protocol):
         *,
         identifier: str,
         publish_availability: bool,
+        checked_disconnect: bool,
+        redacted_logging: bool,
     ) -> _PreflightMqtt: ...
 
 
@@ -246,9 +255,10 @@ async def _cleanup(
         operations.append(unsubscribe)
     operations.append(mqtt.disconnect)
 
-    # Give every independent cleanup action one share of the stage budget. A
-    # hung clear cannot prevent the second clear, unsubscriptions, or disconnect.
-    action_timeout = timeout_seconds / len(operations)
+    # Give every independent action one share and reserve one additional share
+    # for task-cancellation and scheduling overhead. A hung clear cannot consume
+    # the outer stage boundary before later unsubscriptions or disconnect begin.
+    action_timeout = timeout_seconds / (len(operations) + 1)
     timed_out = False
     failed = False
     for operation in operations:
@@ -320,6 +330,8 @@ async def async_run_preflight(
                 settings,
                 identifier=f"brilliant-mqtt-setup-{request.setup_id}",
                 publish_availability=False,
+                checked_disconnect=True,
+                redacted_logging=True,
             )
             mqtt.on_message(on_message)
         except Exception as error:
@@ -333,13 +345,13 @@ async def async_run_preflight(
 
     async def panel_to_ha() -> None:
         assert mqtt is not None
+        subscribed.append(topics.ha_to_panel)
         await _mqtt_operation(
             PreflightStage.PANEL_TO_HA,
             "mqtt_subscribe",
             _SUBSCRIBE_DETAIL,
             mqtt.subscribe(topics.ha_to_panel),
         )
-        subscribed.append(topics.ha_to_panel)
         await _mqtt_operation(
             PreflightStage.PANEL_TO_HA,
             "mqtt_publish",
@@ -385,13 +397,13 @@ async def async_run_preflight(
             mqtt.publish(topics.retained, request.panel_nonce, retain=True, qos=1),
         )
         retained_subscription_active = True
+        subscribed.append(topics.retained)
         await _mqtt_operation(
             PreflightStage.RETAINED_MESSAGE,
             "mqtt_subscribe",
             _SUBSCRIBE_DETAIL,
             mqtt.subscribe(topics.retained),
         )
-        subscribed.append(topics.retained)
         result = await retained_result
         if result.code is not None:
             raise _Failure(
@@ -442,19 +454,28 @@ async def async_run_preflight(
         except _Failure as error:
             primary_failure = error
     finally:
-        try:
-            await _run_stage(
-                PreflightStage.CLEANUP,
-                lambda: _cleanup(mqtt, topics, tuple(subscribed), request.timeout_seconds),
-                request.timeout_seconds,
-                completed,
-                elapsed,
-            )
-        except asyncio.CancelledError:
-            if cancellation is None:
-                raise
-        except _Failure as error:
-            cleanup_failure = error
+
+        async def run_cleanup_stage() -> _Failure | None:
+            try:
+                await _run_stage(
+                    PreflightStage.CLEANUP,
+                    lambda: _cleanup(mqtt, topics, tuple(subscribed), request.timeout_seconds),
+                    request.timeout_seconds,
+                    completed,
+                    elapsed,
+                )
+            except _Failure as error:
+                return error
+            return None
+
+        cleanup_task = asyncio.create_task(run_cleanup_stage())
+        while not cleanup_task.done():
+            try:
+                cleanup_failure = await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError as error:
+                if cancellation is None:
+                    cancellation = error
+        cleanup_failure = cleanup_task.result()
 
     if cancellation is not None:
         raise cancellation
@@ -485,6 +506,23 @@ def _argument_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _cli_failure_json(*, setup_id: UUID | None, code: str, detail: str) -> str:
+    return json.dumps(
+        {
+            "schema_version": SCHEMA_VERSION,
+            "setup_id": str(setup_id) if setup_id is not None else None,
+            "success": False,
+            "completed_stages": [],
+            "stage_elapsed_ms": {},
+            "failed_stage": PreflightStage.FLEET_AUTH.value,
+            "error_code": code,
+            "detail": detail,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
 async def async_main(
     argv: Sequence[str] | None = None,
     *,
@@ -493,8 +531,23 @@ async def async_main(
 ) -> int:
     """Parse CLI input, execute one preflight, and print one JSON object."""
     args = _argument_parser().parse_args(argv)
-    request = PreflightRequest.from_json(args.request_json)
-    report = await runner(settings_factory(), request)
+    try:
+        request = PreflightRequest.from_json(args.request_json)
+    except ValueError:
+        print(_cli_failure_json(setup_id=None, code="mqtt_payload", detail=_PAYLOAD_DETAIL))
+        return 1
+    try:
+        settings = settings_factory()
+    except Exception:
+        print(
+            _cli_failure_json(
+                setup_id=request.setup_id,
+                code="mqtt_connect",
+                detail=_CONNECT_DETAIL,
+            )
+        )
+        return 1
+    report = await runner(settings, request)
     print(report.to_json())
     return 0 if report.success else 1
 
