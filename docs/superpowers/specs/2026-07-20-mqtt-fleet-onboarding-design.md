@@ -3,7 +3,7 @@
 - **Date:** 2026-07-20
 - **Last revised:** 2026-07-21, after medium-effort Fable review and local
   verification
-- **Status:** Approved direction; revised specification pending user review
+- **Status:** Approved 2026-07-21; implementation plans ready
 - **Scope:** Replace the one-entry-per-panel setup wizard with a fleet-first
   Home Assistant integration, validate MQTT end to end during onboarding, and
   preserve the existing MQTT topic/entity contract. Narrow, additive panel-
@@ -11,6 +11,9 @@
   ownership; this is not an agent rewrite.
 - **Home Assistant baseline:** 2026.6.0 or newer, matching `hacs.json`.
 - **Related documentation:**
+  - [Plan 1 — MQTT validation and panel-agent foundations](../plans/2026-07-21-mqtt-foundations.md)
+  - [Plan 2 — fleet config entry and panel onboarding](../plans/2026-07-21-fleet-onboarding.md)
+  - [Plan 3 — fleet migration and day-two operations](../plans/2026-07-21-fleet-migration-operations.md)
   - [Current Home Assistant integration](../../ha-integration.md)
   - [Current configuration reference](../../CONFIGURATION.md)
   - [Current architecture](../../ARCHITECTURE.md)
