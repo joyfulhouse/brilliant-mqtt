@@ -11,7 +11,10 @@ import asyncio
 import json
 import os
 import re
-from dataclasses import dataclass
+import tempfile
+import threading
+import weakref
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import cast
 
@@ -55,6 +58,20 @@ class OwnedTopicsManifest:
         return payload
 
 
+@dataclass
+class _PathState:
+    """Mutation state shared by live ledgers for one normalized path."""
+
+    panel_slug: str
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    topics: frozenset[str] = frozenset()
+    loaded: bool = False
+
+
+_PATH_STATES: weakref.WeakValueDictionary[Path, _PathState] = weakref.WeakValueDictionary()
+_PATH_STATES_LOCK = threading.Lock()
+
+
 class RetainedTopicLedger:
     """Persist and publish the retained topics owned by one real panel."""
 
@@ -62,10 +79,9 @@ class RetainedTopicLedger:
         if _PANEL_PATTERN.fullmatch(panel_slug) is None or panel_slug == "mesh":
             raise RetainedLedgerError("invalid panel slug for retained ledger")
         self._panel_slug = panel_slug
-        self._path = path
-        self._topics: frozenset[str] = frozenset()
+        self._path = _normalize_path(path)
+        self._state = _path_state(self._path, panel_slug)
         self._loaded = False
-        self._lock = asyncio.Lock()
 
     @property
     def ownership_topic(self) -> str:
@@ -75,73 +91,108 @@ class RetainedTopicLedger:
     @property
     def topics(self) -> frozenset[str]:
         """Immutable snapshot of the currently owned retained topics."""
-        return self._topics
+        return self._state.topics
 
     async def async_load(self) -> None:
         """Load and strictly validate an existing ledger; missing means empty."""
-        async with self._lock:
+        async with self._state.lock:
+            self._loaded = False
+            self._state.loaded = False
+            self._state.topics = frozenset()
             try:
                 raw = await asyncio.to_thread(self._path.read_bytes)
             except FileNotFoundError:
-                self._topics = frozenset()
+                self._state.loaded = True
                 self._loaded = True
                 return
             except OSError as error:
                 raise RetainedLedgerError("could not read retained ledger") from error
 
             manifest = _decode_manifest(raw, self._panel_slug)
-            self._topics = manifest.topics
+            self._state.topics = manifest.topics
+            self._state.loaded = True
             self._loaded = True
 
     async def async_publish(self, mqtt: MqttClient, topic: str, payload: str) -> None:
         """Claim *topic*, acknowledge the manifest, then publish its value."""
-        async with self._lock:
+        async with self._state.lock:
             self._require_loaded()
             _validate_topic(self._panel_slug, topic)
-            enlarged = self._topics | {topic}
+            enlarged = self._state.topics | {topic}
             manifest_payload = _new_manifest(self._panel_slug, enlarged).to_payload()
-            if enlarged != self._topics:
-                await self._async_persist(manifest_payload)
-                self._topics = enlarged
+            if enlarged != self._state.topics:
+                await self._async_persist(manifest_payload, enlarged)
 
             await mqtt.publish(self.ownership_topic, manifest_payload, retain=True, qos=1)
             await mqtt.publish(topic, payload, retain=True, qos=0)
 
     async def async_clear(self, mqtt: MqttClient, topic: str) -> None:
         """Clear one owned retained topic, then persist and publish its removal."""
-        async with self._lock:
+        async with self._state.lock:
             self._require_loaded()
             await self._async_clear_locked(mqtt, topic)
 
     async def async_clear_all(self, mqtt: MqttClient) -> None:
         """Clear every owned retained topic and clear the ownership topic last."""
-        async with self._lock:
+        async with self._state.lock:
             self._require_loaded()
-            for topic in sorted(self._topics):
+            for topic in sorted(self._state.topics):
                 await self._async_clear_locked(mqtt, topic)
             await mqtt.publish(self.ownership_topic, "", retain=True, qos=1)
 
     async def _async_clear_locked(self, mqtt: MqttClient, topic: str) -> None:
         _validate_topic(self._panel_slug, topic)
-        if topic not in self._topics:
+        if topic not in self._state.topics:
             raise RetainedLedgerError("refusing to clear a topic not owned by this ledger")
 
         await mqtt.publish(topic, "", retain=True, qos=0)
-        smaller = self._topics - {topic}
+        smaller = self._state.topics - {topic}
         manifest_payload = _new_manifest(self._panel_slug, smaller).to_payload()
-        await self._async_persist(manifest_payload)
-        self._topics = smaller
+        await self._async_persist(manifest_payload, smaller)
         await mqtt.publish(self.ownership_topic, manifest_payload, retain=True, qos=1)
 
-    async def _async_persist(self, payload: str) -> None:
+    async def _async_persist(self, payload: str, topics: frozenset[str]) -> None:
+        write = asyncio.create_task(asyncio.to_thread(_write_payload, self._path, payload))
+        cancellation: asyncio.CancelledError | None = None
+        while not write.done():
+            try:
+                await asyncio.shield(write)
+            except asyncio.CancelledError as error:
+                if cancellation is None:
+                    cancellation = error
+            except OSError:
+                break
         try:
-            await asyncio.to_thread(_write_payload, self._path, payload)
+            write.result()
         except OSError as error:
             raise RetainedLedgerError("could not persist retained ledger") from error
+        self._state.topics = topics
+        if cancellation is not None:
+            raise cancellation
 
     def _require_loaded(self) -> None:
-        if not self._loaded:
+        if not self._loaded or not self._state.loaded:
             raise RetainedLedgerError("retained ledger must be loaded before use")
+
+
+def _normalize_path(path: Path) -> Path:
+    try:
+        return path.expanduser().resolve(strict=False)
+    except (OSError, RuntimeError) as error:
+        raise RetainedLedgerError("could not normalize retained ledger path") from error
+
+
+def _path_state(path: Path, panel_slug: str) -> _PathState:
+    with _PATH_STATES_LOCK:
+        state = _PATH_STATES.get(path)
+        if state is None:
+            state = _PathState(panel_slug=panel_slug)
+            _PATH_STATES[path] = state
+        elif state.panel_slug != panel_slug:
+            raise RetainedLedgerError(
+                "retained ledger path is already assigned to a different panel"
+            )
+        return state
 
 
 def _new_manifest(panel_slug: str, topics: frozenset[str]) -> OwnedTopicsManifest:
@@ -218,8 +269,13 @@ def _validate_topic(panel_slug: str, topic: str) -> None:
 
 def _write_payload(path: Path, payload: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f"{path.name}.tmp")
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    temporary = Path(temporary_name)
+    replaced = False
     try:
         os.fchmod(descriptor, 0o600)
         with os.fdopen(descriptor, "w", encoding="utf-8") as file_handle:
@@ -227,11 +283,19 @@ def _write_payload(path: Path, payload: str) -> None:
             file_handle.write(payload)
             file_handle.flush()
             os.fsync(file_handle.fileno())
+        os.replace(temporary, path)
+        replaced = True
     finally:
-        if descriptor >= 0:
-            os.close(descriptor)
+        try:
+            if descriptor >= 0:
+                os.close(descriptor)
+        finally:
+            if not replaced:
+                try:
+                    temporary.unlink()
+                except FileNotFoundError:
+                    pass
 
-    os.replace(temporary, path)
     directory_descriptor = os.open(path.parent, os.O_RDONLY)
     try:
         os.fsync(directory_descriptor)

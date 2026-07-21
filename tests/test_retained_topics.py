@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import stat
+import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import NoReturn
 
 import pytest
 
+from brilliant_mqtt import retained_topics as retained_topics_module
 from brilliant_mqtt.retained_topics import RetainedLedgerError, RetainedTopicLedger
 from tests.fakes import FakeMqtt
 
@@ -79,6 +83,35 @@ async def test_valid_ledger_reloads_all_permitted_topic_families(tmp_path: Path)
     ledger = await _loaded_ledger(path)
 
     assert ledger.topics == frozenset(topics)
+
+
+async def test_failed_repeat_load_invalidates_prior_snapshot(tmp_path: Path) -> None:
+    target = "brilliant/kitchen/bridge"
+    path = tmp_path / "owned-topics.json"
+    path.write_text(_manifest([target]), encoding="utf-8")
+    ledger = await _loaded_ledger(path)
+    corrupt = b"{corrupt-ledger"
+    path.write_bytes(corrupt)
+
+    with pytest.raises(RetainedLedgerError, match="invalid"):
+        await ledger.async_load()
+
+    mqtt = FakeMqtt()
+    with pytest.raises(RetainedLedgerError, match="loaded"):
+        await ledger.async_publish(mqtt, "brilliant/kitchen/availability", "online")
+
+    assert ledger.topics == frozenset()
+    assert mqtt.published == []
+    assert path.read_bytes() == corrupt
+
+
+def test_same_path_cannot_be_assigned_to_different_panels(tmp_path: Path) -> None:
+    path = tmp_path / "owned-topics.json"
+    first_ledger = RetainedTopicLedger(PANEL, path)
+
+    with pytest.raises(RetainedLedgerError, match="path|panel"):
+        RetainedTopicLedger("garage", tmp_path / "." / "owned-topics.json")
+    assert first_ledger.topics == frozenset()
 
 
 @pytest.mark.parametrize(
@@ -209,6 +242,153 @@ async def test_manifest_serializes_topics_in_sorted_order(tmp_path: Path) -> Non
     assert path.read_text(encoding="utf-8") == _manifest([earlier, later])
 
 
+async def test_cancellation_keeps_write_serialized_until_thread_finishes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "owned-topics.json"
+    ledger = await _loaded_ledger(path)
+    mqtt = FakeMqtt()
+    first = "brilliant/kitchen/light-1/state"
+    second = "brilliant/kitchen/light-2/state"
+    expected_manifest = _manifest([first, second])
+    real_to_thread = asyncio.to_thread
+    real_write = retained_topics_module._write_payload
+    loop = asyncio.get_running_loop()
+    release_first_write = threading.Event()
+    first_thread_started = asyncio.Event()
+    first_thread_finished = asyncio.Event()
+    second_write_submitted = asyncio.Event()
+    write_submissions = 0
+
+    def blocking_write(write_path: Path, payload: str) -> None:
+        if payload == _manifest([first]):
+            loop.call_soon_threadsafe(first_thread_started.set)
+            release_first_write.wait()
+            try:
+                real_write(write_path, payload)
+            finally:
+                loop.call_soon_threadsafe(first_thread_finished.set)
+            return
+        real_write(write_path, payload)
+
+    async def track_to_thread(
+        function: Callable[..., object],
+        /,
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        nonlocal write_submissions
+        if function is blocking_write:
+            write_submissions += 1
+            if write_submissions == 2:
+                second_write_submitted.set()
+        return await real_to_thread(function, *args, **kwargs)
+
+    monkeypatch.setattr(retained_topics_module, "_write_payload", blocking_write)
+    monkeypatch.setattr(asyncio, "to_thread", track_to_thread)
+
+    first_publish = asyncio.create_task(ledger.async_publish(mqtt, first, "one"))
+    await first_thread_started.wait()
+    first_publish.cancel()
+    await asyncio.sleep(0)
+    pending_after_first_cancel = not first_publish.done()
+    first_publish.cancel()
+    await asyncio.sleep(0)
+    pending_after_repeat_cancel = not first_publish.done()
+
+    second_publish = asyncio.create_task(ledger.async_publish(mqtt, second, "two"))
+    await asyncio.sleep(0)
+    second_submitted_before_release = second_write_submitted.is_set()
+    release_first_write.set()
+    await first_thread_finished.wait()
+    first_result, second_result = await asyncio.gather(
+        first_publish,
+        second_publish,
+        return_exceptions=True,
+    )
+
+    assert pending_after_first_cancel
+    assert pending_after_repeat_cancel
+    assert not second_submitted_before_release
+    assert isinstance(first_result, asyncio.CancelledError)
+    assert second_result is None
+    assert ledger.topics == frozenset({first, second})
+    assert path.read_text(encoding="utf-8") == expected_manifest
+    assert mqtt.published == [
+        (ledger.ownership_topic, expected_manifest, True),
+        (second, "two", True),
+    ]
+    assert mqtt.published_qos == [1, 0]
+
+
+async def test_loaded_instances_for_normalized_path_publish_union(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    alias_parent = tmp_path / "alias"
+    alias_parent.mkdir()
+    path = tmp_path / "owned-topics.json"
+    alias_path = alias_parent / ".." / path.name
+    first_ledger = await _loaded_ledger(path)
+    second_ledger = await _loaded_ledger(alias_path)
+    mqtt = FakeMqtt()
+    first = "brilliant/kitchen/light-1/state"
+    second = "brilliant/kitchen/light-2/state"
+    expected_manifest = _manifest([first, second])
+    real_to_thread = asyncio.to_thread
+    first_write_started = asyncio.Event()
+    release_first_write = asyncio.Event()
+    second_write_started = asyncio.Event()
+    write_count = 0
+
+    async def controlled_to_thread(
+        function: Callable[..., object],
+        /,
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        nonlocal write_count
+        if function is retained_topics_module._write_payload:
+            write_count += 1
+            if write_count == 1:
+                first_write_started.set()
+                await release_first_write.wait()
+            else:
+                second_write_started.set()
+            assert len(args) == 2
+            assert not kwargs
+            write_path, payload = args
+            assert isinstance(write_path, Path)
+            assert isinstance(payload, str)
+            retained_topics_module._write_payload(write_path, payload)
+            return None
+        return await real_to_thread(function, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", controlled_to_thread)
+    first_publish = asyncio.create_task(first_ledger.async_publish(mqtt, first, "one"))
+    await first_write_started.wait()
+    second_publish = asyncio.create_task(second_ledger.async_publish(mqtt, second, "two"))
+    await asyncio.sleep(0)
+    second_started_before_release = second_write_started.is_set()
+    release_first_write.set()
+    await asyncio.gather(first_publish, second_publish)
+
+    assert not second_started_before_release
+    assert first_ledger.topics == frozenset({first, second})
+    assert second_ledger.topics == frozenset({first, second})
+    assert path.read_text(encoding="utf-8") == expected_manifest
+    ownership_messages = [
+        (payload, mqtt.published_qos[index])
+        for index, (topic, payload, _retain) in enumerate(mqtt.published)
+        if topic == first_ledger.ownership_topic
+    ]
+    assert ownership_messages[-1] == (expected_manifest, 1)
+    assert (first, "one", True) in mqtt.published
+    assert (second, "two", True) in mqtt.published
+    assert mqtt.published_qos == [1, 0, 1, 0]
+
+
 async def test_disk_write_failure_prevents_manifest_and_target_publish(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -229,6 +409,7 @@ async def test_disk_write_failure_prevents_manifest_and_target_publish(
     assert mqtt.published == []
     assert ledger.topics == frozenset()
     assert not path.exists()
+    assert list(path.parent.iterdir()) == []
 
 
 async def test_manifest_publish_failure_prevents_target_and_keeps_disk_claim(
@@ -336,3 +517,30 @@ async def test_persistence_is_atomic_durable_and_private(
     assert "fsync" in events[:replace_index]
     assert "fsync" in events[replace_index + 1 :]
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+async def test_each_persistence_uses_a_private_sibling_temporary_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    replaced_sources: list[Path] = []
+    real_replace = os.replace
+
+    def spy_replace(
+        source: str | os.PathLike[str],
+        destination: str | os.PathLike[str],
+    ) -> None:
+        replaced_sources.append(Path(source))
+        real_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", spy_replace)
+    path = tmp_path / "nested" / "owned-topics.json"
+    ledger = await _loaded_ledger(path)
+
+    await ledger.async_publish(FakeMqtt(), "brilliant/kitchen/availability", "online")
+    await ledger.async_publish(FakeMqtt(), "brilliant/kitchen/bridge", "{}")
+
+    assert len(replaced_sources) == 2
+    assert replaced_sources[0] != replaced_sources[1]
+    assert all(source.parent == path.parent for source in replaced_sources)
+    assert all(not source.exists() for source in replaced_sources)
