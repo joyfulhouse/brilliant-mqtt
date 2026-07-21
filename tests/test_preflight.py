@@ -188,10 +188,10 @@ class _ConcreteMessageStream:
 class _ConcretePreflightClient:
     """Broker seam used while exercising the real AioMqttAdapter lifecycle."""
 
-    def __init__(self, request: PreflightRequest, raw_close_error: str) -> None:
+    def __init__(self, request: PreflightRequest, close_error: BaseException) -> None:
         self._request = request
         self._topics = SetupTopics.for_id(request.setup_id)
-        self._raw_close_error = raw_close_error
+        self._close_error = close_error
         self._retained_payload: str | None = None
         self.messages = _ConcreteMessageStream()
         self.exit_attempts = 0
@@ -202,7 +202,7 @@ class _ConcretePreflightClient:
 
     async def __aexit__(self, exc_type: object, exc: object, traceback: object) -> None:
         self.exit_attempts += 1
-        raise RuntimeError(self._raw_close_error)
+        raise self._close_error
 
     async def publish(
         self,
@@ -510,7 +510,7 @@ async def test_retained_replay_requires_exact_payload_and_retained_flag(
     assert report.error_code == error_code
 
 
-async def test_every_stage_uses_request_timeout_and_wait_timeout_is_reported(
+async def test_protocol_stages_use_request_timeout_and_cleanup_owns_its_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     request = _request(timeout_seconds=0.01)
@@ -540,7 +540,7 @@ async def test_every_stage_uses_request_timeout_and_wait_timeout_is_reported(
         PreflightStage.PANEL_TO_HA,
         PreflightStage.CLEANUP,
     )
-    assert timeouts == [0.01, 0.01, 0.01, 0.01]
+    assert timeouts == [0.01, 0.01, 0.01]
     assert ("unsubscribe", topics.ha_to_panel) in mqtt.events
     assert ("disconnect",) in mqtt.events
 
@@ -563,28 +563,34 @@ async def test_cleanup_timeout_is_bounded_and_reported() -> None:
     )
 
 
-async def test_cleanup_budget_reserves_time_to_attempt_disconnect() -> None:
+async def test_cleanup_advances_without_waiting_for_timed_out_action_teardown() -> None:
     request = _request(timeout_seconds=0.2)
     topics = SetupTopics.for_id(request.setup_id)
     mqtt = _successful_mqtt(request)
-    delayed_timeouts = {
+    cleanup_actions = [
         ("publish", topics.discovery_probe, "", "True", "1"),
         ("publish", topics.retained, "", "True", "1"),
         ("unsubscribe", topics.ha_to_panel),
         ("unsubscribe", topics.retained),
-    }
-    mqtt.blocked.update(delayed_timeouts)
-    mqtt.cancellation_delays.update(dict.fromkeys(delayed_timeouts, 0.011))
+        ("disconnect",),
+    ]
+    mqtt.blocked.update(cleanup_actions[:4])
+    mqtt.cancellation_delays.update(dict.fromkeys(cleanup_actions[:4], 0.03))
+    loop = asyncio.get_running_loop()
+    started = loop.time()
 
     report = await asyncio.wait_for(
         async_run_preflight(_settings(), request, mqtt_factory=lambda *args, **kw: mqtt),
-        timeout=0.5,
+        timeout=0.35,
     )
+    elapsed = loop.time() - started
+    await asyncio.sleep(0.05)
 
     assert report.success is False
     assert report.failed_stage is PreflightStage.CLEANUP
     assert report.error_code == "mqtt_timeout"
-    assert ("disconnect",) in mqtt.events
+    assert [event for event in mqtt.events if event in cleanup_actions] == cleanup_actions
+    assert elapsed < 0.3
 
 
 async def test_ordinary_failure_still_clears_both_probes_unsubscribes_and_disconnects() -> None:
@@ -789,7 +795,7 @@ async def test_real_adapter_close_failure_maps_to_redacted_cleanup_failure(
     settings = _settings()
     request = _request()
     raw_close_error = "raw-close-error password-do-not-leak panel-nonce"
-    client = _ConcretePreflightClient(request, raw_close_error)
+    client = _ConcretePreflightClient(request, RuntimeError(raw_close_error))
     modes: list[tuple[bool, bool]] = []
     monkeypatch.setattr(aiomqtt, "Client", lambda **kwargs: client)
     monkeypatch.setattr(mqttio, "build_tls_context", lambda received: None)
@@ -836,6 +842,38 @@ async def test_real_adapter_close_failure_maps_to_redacted_cleanup_failure(
     ):
         assert raw not in serialized
         assert raw not in caplog.text
+
+
+async def test_real_adapter_internal_close_cancellation_maps_to_stable_cleanup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    settings = _settings()
+    request = _request()
+    raw_close_error = "raw-cancelled-close password-do-not-leak panel-nonce"
+    client = _ConcretePreflightClient(request, asyncio.CancelledError(raw_close_error))
+    monkeypatch.setattr(aiomqtt, "Client", lambda **kwargs: client)
+    monkeypatch.setattr(mqttio, "build_tls_context", lambda received: None)
+    monkeypatch.setattr(preflight_module, "_monotonic_ms", iter(range(12)).__next__)
+    caplog.set_level(logging.DEBUG, logger=mqttio.__name__)
+
+    report = await async_run_preflight(settings, request)
+
+    assert client.exit_attempts == 1
+    assert report.to_json() == _canonical(
+        {
+            "completed_stages": [stage.value for stage in tuple(PreflightStage)[:-1]],
+            "detail": "MQTT cleanup failed",
+            "error_code": "cleanup_failed",
+            "failed_stage": "cleanup",
+            "schema_version": 1,
+            "setup_id": SETUP_ID,
+            "stage_elapsed_ms": {stage.value: 1 for stage in PreflightStage},
+            "success": False,
+        }
+    )
+    assert raw_close_error not in report.to_json()
+    assert raw_close_error not in caplog.text
 
 
 async def test_cli_prints_exactly_one_canonical_json_object_and_maps_failure_to_exit_one(

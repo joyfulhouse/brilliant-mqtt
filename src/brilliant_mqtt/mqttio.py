@@ -206,13 +206,25 @@ class AioMqttAdapter:
                     logger.exception("reader task raised during cancellation")
             self._reader_task = None
 
-        try:
-            await self._client.__aexit__(None, None, None)
-        except Exception:
-            if self._checked_disconnect:
+        if self._checked_disconnect:
+
+            async def close_checked() -> bool:
+                try:
+                    await self._client.__aexit__(None, None, None)
+                except asyncio.CancelledError:
+                    return False
+                except Exception:
+                    return False
+                return True
+
+            closed = (await asyncio.gather(close_checked()))[0]
+            if not closed:
                 failed = True
                 logger.error("failed closing MQTT client")
-            else:
+        else:
+            try:
+                await self._client.__aexit__(None, None, None)
+            except Exception:
                 logger.exception("failed closing MQTT client")
 
         if failed:

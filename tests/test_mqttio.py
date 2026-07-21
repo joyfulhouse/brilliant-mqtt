@@ -23,13 +23,24 @@ class _TlsContext:
 
 
 class _CloseFailingClient:
-    def __init__(self, raw_close_error: str) -> None:
-        self._raw_close_error = raw_close_error
+    def __init__(self, close_error: BaseException) -> None:
+        self._close_error = close_error
         self.exit_attempts = 0
 
     async def __aexit__(self, exc_type: object, exc: object, traceback: object) -> None:
         self.exit_attempts += 1
-        raise RuntimeError(self._raw_close_error)
+        raise self._close_error
+
+
+class _BlockingCloseClient:
+    def __init__(self) -> None:
+        self.close_started = asyncio.Event()
+        self.exit_attempts = 0
+
+    async def __aexit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.exit_attempts += 1
+        self.close_started.set()
+        await asyncio.Future()
 
 
 def _settings(*, tls_enabled: bool, ca_file: str | None = None) -> Settings:
@@ -150,7 +161,7 @@ async def test_checked_redacted_disconnect_finishes_reader_and_client_close(
 ) -> None:
     raw_reader_error = "raw-reader-error password=s3cr3t"
     raw_close_error = "raw-close-error host=mqtt.example.test"
-    client = _CloseFailingClient(raw_close_error)
+    client = _CloseFailingClient(RuntimeError(raw_close_error))
     monkeypatch.setattr(aiomqtt, "Client", lambda **kwargs: client)
     caplog.set_level(logging.DEBUG, logger=mqttio.__name__)
     adapter = mqttio.AioMqttAdapter(
@@ -181,7 +192,7 @@ async def test_checked_redacted_disconnect_finishes_reader_and_client_close(
 async def test_default_disconnect_remains_best_effort(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    client = _CloseFailingClient("resident close failure")
+    client = _CloseFailingClient(RuntimeError("resident close failure"))
     monkeypatch.setattr(aiomqtt, "Client", lambda **kwargs: client)
     adapter = mqttio.AioMqttAdapter(
         _settings(tls_enabled=False),
@@ -190,4 +201,64 @@ async def test_default_disconnect_remains_best_effort(
 
     await adapter.disconnect()
 
+    assert client.exit_attempts == 1
+
+
+async def test_checked_disconnect_maps_internal_close_cancellation_to_generic_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    raw_close_error = "raw-cancelled-close password=s3cr3t"
+    client = _CloseFailingClient(asyncio.CancelledError(raw_close_error))
+    monkeypatch.setattr(aiomqtt, "Client", lambda **kwargs: client)
+    caplog.set_level(logging.DEBUG, logger=mqttio.__name__)
+    adapter = mqttio.AioMqttAdapter(
+        _settings(tls_enabled=False),
+        publish_availability=False,
+        checked_disconnect=True,
+        redacted_logging=True,
+    )
+
+    with pytest.raises(RuntimeError, match=r"^MQTT disconnect failed$") as raised:
+        await adapter.disconnect()
+
+    assert client.exit_attempts == 1
+    assert raw_close_error not in str(raised.value)
+    assert raw_close_error not in caplog.text
+
+
+async def test_default_disconnect_preserves_internal_close_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _CloseFailingClient(asyncio.CancelledError("resident cancellation"))
+    monkeypatch.setattr(aiomqtt, "Client", lambda **kwargs: client)
+    adapter = mqttio.AioMqttAdapter(
+        _settings(tls_enabled=False),
+        publish_availability=False,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await adapter.disconnect()
+
+    assert client.exit_attempts == 1
+
+
+async def test_checked_disconnect_propagates_caller_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _BlockingCloseClient()
+    monkeypatch.setattr(aiomqtt, "Client", lambda **kwargs: client)
+    adapter = mqttio.AioMqttAdapter(
+        _settings(tls_enabled=False),
+        publish_availability=False,
+        checked_disconnect=True,
+        redacted_logging=True,
+    )
+    disconnect_task = asyncio.create_task(adapter.disconnect())
+    await asyncio.wait_for(client.close_started.wait(), timeout=0.1)
+
+    disconnect_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await disconnect_task
     assert client.exit_attempts == 1

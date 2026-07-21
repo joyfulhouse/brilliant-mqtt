@@ -31,6 +31,8 @@ _CLEANUP_DETAIL = "MQTT cleanup failed"
 
 _T = TypeVar("_T")
 
+_detached_cleanup_tasks: set[asyncio.Task[None]] = set()
+
 
 class PreflightStage(str, Enum):
     """Ordered panel-side setup validation stages."""
@@ -262,12 +264,22 @@ async def _cleanup(
     timed_out = False
     failed = False
     for operation in operations:
+        action_task: asyncio.Task[None] = asyncio.create_task(_run_cleanup_action(operation))
         try:
-            await asyncio.wait_for(operation(), timeout=action_timeout)
+            done, _ = await asyncio.wait({action_task}, timeout=action_timeout)
+        except asyncio.CancelledError:
+            action_task.cancel()
+            _track_detached_cleanup_task(action_task)
+            raise
+        if not done:
+            timed_out = True
+            action_task.cancel()
+            _track_detached_cleanup_task(action_task)
+            continue
+        try:
+            action_task.result()
         except asyncio.CancelledError:
             raise
-        except asyncio.TimeoutError:
-            timed_out = True
         except Exception:
             failed = True
 
@@ -275,6 +287,36 @@ async def _cleanup(
         raise _Failure(PreflightStage.CLEANUP, "mqtt_timeout", _TIMEOUT_DETAIL)
     if failed:
         raise _Failure(PreflightStage.CLEANUP, "cleanup_failed", _CLEANUP_DETAIL)
+
+
+async def _run_cleanup_action(operation: Callable[[], Awaitable[None]]) -> None:
+    await operation()
+
+
+def _track_detached_cleanup_task(task: asyncio.Task[None]) -> None:
+    """Keep cancellation-pending cleanup work alive and consume its result."""
+    _detached_cleanup_tasks.add(task)
+    task.add_done_callback(_consume_detached_cleanup_task)
+
+
+def _consume_detached_cleanup_task(task: asyncio.Task[None]) -> None:
+    _detached_cleanup_tasks.discard(task)
+    if not task.cancelled():
+        task.exception()
+
+
+async def _run_cleanup_stage(
+    operation: Callable[[], Awaitable[None]],
+    completed: list[PreflightStage],
+    elapsed: dict[PreflightStage, int],
+) -> None:
+    """Record cleanup without adding an outer timeout around its action loop."""
+    started = _monotonic_ms()
+    try:
+        await operation()
+    finally:
+        elapsed[PreflightStage.CLEANUP] = max(0, _monotonic_ms() - started)
+    completed.append(PreflightStage.CLEANUP)
 
 
 async def async_run_preflight(
@@ -457,10 +499,8 @@ async def async_run_preflight(
 
         async def run_cleanup_stage() -> _Failure | None:
             try:
-                await _run_stage(
-                    PreflightStage.CLEANUP,
+                await _run_cleanup_stage(
                     lambda: _cleanup(mqtt, topics, tuple(subscribed), request.timeout_seconds),
-                    request.timeout_seconds,
                     completed,
                     elapsed,
                 )
