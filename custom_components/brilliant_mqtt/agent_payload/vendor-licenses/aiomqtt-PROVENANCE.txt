@@ -1,0 +1,6 @@
+Name: aiomqtt
+Version: 2.5.1
+Lock-Source: uv.lock
+Wheel-URL: https://files.pythonhosted.org/packages/01/9e/5089fa596220bf0dc73deeb23db27904e4b3504986caf08571f6f5cb84a8/aiomqtt-2.5.1-py3-none-any.whl
+Wheel-SHA256: fd58c3593160e4d475d90ce911cdfc4239cd64de96b0ba22edf6c86bd7afa278
+License: aiomqtt-LICENSE
