@@ -505,6 +505,63 @@ async def test_mqtt_status_replay_and_fresh_transitions_gate_sequence_and_scanne
     bridge.async_shutdown()
 
 
+async def test_reconnect_backlog_before_online_cannot_refresh_scanner_evidence(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    fake_bluetooth_manager: FakeBluetoothManager,
+    scanner_registration: ScannerRegistrationRecorder,
+) -> None:
+    now = 100.0
+    bridge = BrilliantBleScannerBridge(
+        hass,
+        _entry(),
+        device_id="panel-device-id",
+        monotonic=lambda: now,
+    )
+    await bridge.async_setup()
+
+    async_fire_mqtt_message(hass, observer_status_topic("shed"), "online", retain=False)
+    async_fire_mqtt_message(
+        hass,
+        advertisement_topic("shed"),
+        _payload(sequence=42, rssi=-61),
+    )
+    await hass.async_block_till_done()
+    assert bridge.last_accepted_monotonic == 100.0
+    assert bridge.diagnostics["packets_accepted"] == 1
+
+    async_fire_mqtt_message(hass, observer_status_topic("shed"), "offline", retain=False)
+    await hass.async_block_till_done()
+    now = 400.0
+    async_fire_mqtt_message(
+        hass,
+        advertisement_topic("shed"),
+        _payload(sequence=43, rssi=-10),
+    )
+    await hass.async_block_till_done()
+
+    assert bridge.scanner is None
+    assert bridge.last_accepted_monotonic == 100.0
+    assert bridge.diagnostics["packets_accepted"] == 1
+    assert bridge.diagnostics["packets_dropped"] == 1
+
+    async_fire_mqtt_message(hass, observer_status_topic("shed"), "online", retain=False)
+    async_fire_mqtt_message(
+        hass,
+        advertisement_topic("shed"),
+        _payload(sequence=44, rssi=-70),
+    )
+    await hass.async_block_till_done()
+
+    assert bridge.scanner is not None
+    assert bridge.scanner._previous_service_info["AA:BB:CC:DD:EE:FF"].rssi == -70
+    assert bridge.last_accepted_monotonic == 400.0
+    assert bridge._sequence.last_sequence == 44
+    assert bridge.diagnostics["packets_accepted"] == 2
+    assert bridge.diagnostics["packets_dropped"] == 1
+    bridge.async_shutdown()
+
+
 @pytest.mark.parametrize("bad_status", ["unknown", b"\xff"])
 async def test_mqtt_unknown_or_non_utf8_status_closes_an_online_scanner(
     hass: HomeAssistant,

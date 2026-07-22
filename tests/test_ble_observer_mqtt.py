@@ -10,6 +10,7 @@ import pytest
 from brilliant_ble_observer.config import Settings
 from brilliant_ble_observer.model import AdvertisementEnvelope, AllowlistEntry
 from brilliant_ble_observer.mqtt import (
+    MAX_PENDING_AGE_SECONDS,
     AdvertisementPublisher,
     MqttConnectionConfig,
     PublisherStats,
@@ -22,8 +23,8 @@ IBEACON_BYTES = bytes.fromhex("021500112233445566778899aabbccddeeff00420007c5")
 
 
 class FakeClock:
-    def __init__(self) -> None:
-        self.now = 0.0
+    def __init__(self, now: float = 1.0) -> None:
+        self.now = now
 
     def __call__(self) -> float:
         return self.now
@@ -44,6 +45,7 @@ class FakeTransport:
         self.published: list[tuple[str, str, int, bool]] = []
         self.connect_count = 0
         self.disconnect_count = 0
+        self.online_published = asyncio.Event()
         self.observation_published = asyncio.Event()
 
     async def connect(self) -> None:
@@ -53,6 +55,8 @@ class FakeTransport:
 
     async def publish(self, topic: str, payload: str, *, qos: int, retain: bool) -> None:
         self.published.append((topic, payload, qos, retain))
+        if topic.endswith("/status") and payload == "online":
+            self.online_published.set()
         if topic.endswith("/advertisement") and self.failed_observations:
             self.failed_observations -= 1
             raise ConnectionError("broker link dropped")
@@ -80,6 +84,7 @@ def _advertisement(
     address_suffix: int = 0xFF,
     adapter_address: str = "11:22:33:44:55:66",
     manufacturer_data: bytes = IBEACON_BYTES,
+    capture_monotonic_ms: int | None = None,
 ) -> AdvertisementEnvelope:
     return AdvertisementEnvelope(
         panel="shed",
@@ -95,7 +100,7 @@ def _advertisement(
         service_uuids=(BATTERY_UUID,),
         service_data={BATTERY_UUID: b"\xaa\xbb\xcc"},
         manufacturer_data={76: manufacturer_data},
-        capture_monotonic_ms=sequence,
+        capture_monotonic_ms=(sequence if capture_monotonic_ms is None else capture_monotonic_ms),
     )
 
 
@@ -106,6 +111,7 @@ async def _cancel(task: asyncio.Task[None]) -> None:
 
 
 async def test_observations_are_qos_zero_nonretained_and_health_is_separate() -> None:
+    clock = FakeClock()
     transport = FakeTransport()
     configs: list[MqttConnectionConfig] = []
 
@@ -113,7 +119,7 @@ async def test_observations_are_qos_zero_nonretained_and_health_is_separate() ->
         configs.append(config)
         return transport
 
-    publisher = AdvertisementPublisher(_settings(), transport_factory=factory)
+    publisher = AdvertisementPublisher(_settings(), transport_factory=factory, monotonic=clock)
     advertisement = _advertisement(1)
     assert publisher.enqueue(advertisement)
 
@@ -144,6 +150,7 @@ async def test_observations_are_qos_zero_nonretained_and_health_is_separate() ->
         queued=0,
         published=1,
         dropped_oldest=0,
+        dropped_stale=0,
         rate_limited=0,
         publish_failures=0,
         reconnects=0,
@@ -151,11 +158,13 @@ async def test_observations_are_qos_zero_nonretained_and_health_is_separate() ->
 
 
 async def test_bounded_queue_drops_oldest_pending_observation() -> None:
+    clock = FakeClock()
     transport = FakeTransport()
     publisher = AdvertisementPublisher(
         _settings(rate=100.0),
         transport_factory=lambda _config: transport,
         queue_size=2,
+        monotonic=clock,
     )
     first = _advertisement(1, address_suffix=1)
     second = _advertisement(2, address_suffix=2)
@@ -236,6 +245,7 @@ def test_rotating_addresses_for_one_ibeacon_share_a_rate_bucket() -> None:
 
 
 async def test_publish_failures_reconnect_with_exponential_backoff() -> None:
+    clock = FakeClock()
     transports = iter(
         (
             FakeTransport(failed_observations=1),
@@ -259,6 +269,7 @@ async def test_publish_failures_reconnect_with_exponential_backoff() -> None:
         _settings(),
         transport_factory=factory,
         sleep=sleep,
+        monotonic=clock,
         initial_backoff=1.0,
         max_backoff=8.0,
     )
@@ -283,6 +294,7 @@ async def test_publish_failures_reconnect_with_exponential_backoff() -> None:
 
 
 async def test_connect_failure_is_cleaned_up_before_reconnect() -> None:
+    clock = FakeClock()
     first = FakeTransport(connect_error=ConnectionError("broker unavailable"))
     second = FakeTransport()
     transports = iter((first, second))
@@ -296,6 +308,7 @@ async def test_connect_failure_is_cleaned_up_before_reconnect() -> None:
         _settings(),
         transport_factory=lambda _config: next(transports),
         sleep=sleep,
+        monotonic=clock,
         initial_backoff=1.0,
     )
     assert publisher.enqueue(_advertisement(1))
@@ -310,11 +323,94 @@ async def test_connect_failure_is_cleaned_up_before_reconnect() -> None:
     assert publisher.stats.publish_failures == 0
 
 
+async def test_reconnect_drops_stale_backlog_before_online_then_accepts_fresh_packet(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    clock = FakeClock(now=0.0)
+    first = FakeTransport(connect_error=ConnectionError("broker unavailable"))
+    second = FakeTransport()
+    transports = iter((first, second))
+
+    async def sleep(_seconds: float) -> None:
+        clock.advance(MAX_PENDING_AGE_SECONDS + 1.0)
+        await asyncio.sleep(0)
+
+    publisher = AdvertisementPublisher(
+        _settings(rate=100.0),
+        transport_factory=lambda _config: next(transports),
+        monotonic=clock,
+        sleep=sleep,
+    )
+    stale = _advertisement(1, address_suffix=1)
+    assert publisher.enqueue(stale)
+
+    with caplog.at_level(logging.WARNING, logger="brilliant_ble_observer.mqtt"):
+        task = asyncio.create_task(publisher.run())
+        await asyncio.wait_for(second.online_published.wait(), timeout=1)
+        fresh = _advertisement(
+            2,
+            address_suffix=2,
+            capture_monotonic_ms=int(clock() * 1_000),
+        )
+        assert publisher.enqueue(fresh)
+        await asyncio.wait_for(second.observation_published.wait(), timeout=1)
+        await _cancel(task)
+
+    observations = [item for item in second.published if item[0].endswith("/advertisement")]
+    assert observations == [(advertisement_topic("shed"), fresh.to_json(), 0, False)]
+    assert publisher.stats.dropped_stale == 1
+    assert publisher.stats.published == 1
+    assert publisher.stats.queued == 0
+    assert publisher.stats.reconnects == 1
+    assert "dropped=1" in caplog.text
+    assert stale.address not in caplog.text
+    assert stale.local_name is not None
+    assert stale.local_name not in caplog.text
+    assert stale.to_json() not in caplog.text
+
+
+async def test_packet_that_ages_while_online_is_published_is_dropped() -> None:
+    clock = FakeClock(now=0.0)
+
+    class AgingOnlineTransport(FakeTransport):
+        async def publish(self, topic: str, payload: str, *, qos: int, retain: bool) -> None:
+            await super().publish(topic, payload, qos=qos, retain=retain)
+            if topic.endswith("/status") and payload == "online":
+                clock.advance(MAX_PENDING_AGE_SECONDS + 1.0)
+
+    transport = AgingOnlineTransport()
+    publisher = AdvertisementPublisher(
+        _settings(rate=100.0),
+        transport_factory=lambda _config: transport,
+        monotonic=clock,
+    )
+    stale = _advertisement(1, address_suffix=1, capture_monotonic_ms=0)
+    assert publisher.enqueue(stale)
+
+    task = asyncio.create_task(publisher.run())
+    await asyncio.wait_for(transport.online_published.wait(), timeout=1)
+    fresh = _advertisement(
+        2,
+        address_suffix=2,
+        capture_monotonic_ms=int(clock() * 1_000),
+    )
+    assert publisher.enqueue(fresh)
+    await asyncio.wait_for(transport.observation_published.wait(), timeout=1)
+    await _cancel(task)
+
+    observations = [item for item in transport.published if item[0].endswith("/advertisement")]
+    assert observations == [(advertisement_topic("shed"), fresh.to_json(), 0, False)]
+    assert publisher.stats.dropped_stale == 1
+
+
 async def test_logs_never_include_advertisement_payload_or_private_address(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    clock = FakeClock()
     transport = FakeTransport()
-    publisher = AdvertisementPublisher(_settings(), transport_factory=lambda _config: transport)
+    publisher = AdvertisementPublisher(
+        _settings(), transport_factory=lambda _config: transport, monotonic=clock
+    )
     advertisement = _advertisement(1)
     publisher.enqueue(advertisement)
 

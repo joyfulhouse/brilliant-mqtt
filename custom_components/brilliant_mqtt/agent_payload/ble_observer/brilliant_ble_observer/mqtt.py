@@ -21,6 +21,8 @@ DEFAULT_QUEUE_SIZE = 256
 DEFAULT_RATE_STATE_SIZE = 256
 DEFAULT_INITIAL_BACKOFF = 1.0
 DEFAULT_MAX_BACKOFF = 30.0
+MAX_PENDING_AGE_SECONDS = 5.0
+_MAX_PENDING_AGE_MS = int(MAX_PENDING_AGE_SECONDS * 1_000)
 
 
 def advertisement_topic(panel: str) -> str:
@@ -70,6 +72,7 @@ class PublisherStats:
     queued: int
     published: int
     dropped_oldest: int
+    dropped_stale: int
     rate_limited: int
     publish_failures: int
     reconnects: int
@@ -156,6 +159,7 @@ class AdvertisementPublisher:
         self._last_emitted: OrderedDict[tuple[str, tuple[object, ...]], float] = OrderedDict()
         self._published = 0
         self._dropped_oldest = 0
+        self._dropped_stale = 0
         self._rate_limited = 0
         self._publish_failures = 0
         self._reconnects = 0
@@ -167,6 +171,7 @@ class AdvertisementPublisher:
             queued=len(self._pending),
             published=self._published,
             dropped_oldest=self._dropped_oldest,
+            dropped_stale=self._dropped_stale,
             rate_limited=self._rate_limited,
             publish_failures=self._publish_failures,
             reconnects=self._reconnects,
@@ -225,6 +230,12 @@ class AdvertisementPublisher:
             try:
                 await transport.connect()
                 connected = True
+                stale_dropped = self._drop_stale_pending()
+                if stale_dropped:
+                    logger.warning(
+                        "Dropped stale BLE observer backlog before MQTT online (dropped=%d)",
+                        stale_dropped,
+                    )
                 await transport.publish(config.will_topic, "online", qos=0, retain=True)
                 while True:
                     advertisement = await self._next_pending()
@@ -258,10 +269,40 @@ class AdvertisementPublisher:
                 backoff = min(self._max_backoff, backoff * 2)
 
     async def _next_pending(self) -> AdvertisementEnvelope:
-        while not self._pending:
+        while True:
+            while not self._pending:
+                self._pending_event.clear()
+                await self._pending_event.wait()
+            advertisement = self._pending.popleft()
+            if self._is_stale(advertisement, now_ms=self._monotonic_ms()):
+                self._dropped_stale += 1
+                continue
+            return advertisement
+
+    def _drop_stale_pending(self) -> int:
+        """Discard unsafe backlog before advertising this MQTT session as online."""
+        if not self._pending:
+            return 0
+        now_ms = self._monotonic_ms()
+        retained = deque(
+            advertisement
+            for advertisement in self._pending
+            if not self._is_stale(advertisement, now_ms=now_ms)
+        )
+        dropped = len(self._pending) - len(retained)
+        self._pending = retained
+        self._dropped_stale += dropped
+        if not retained:
             self._pending_event.clear()
-            await self._pending_event.wait()
-        return self._pending.popleft()
+        return dropped
+
+    def _monotonic_ms(self) -> int:
+        return int(self._monotonic() * 1_000)
+
+    @staticmethod
+    def _is_stale(advertisement: AdvertisementEnvelope, *, now_ms: int) -> bool:
+        age_ms = now_ms - advertisement.capture_monotonic_ms
+        return not 0 <= age_ms <= _MAX_PENDING_AGE_MS
 
     async def _close_transport(
         self,
