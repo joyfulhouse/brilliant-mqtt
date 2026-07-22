@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from collections import OrderedDict, deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import NoReturn, Protocol
 
 import aiomqtt
 
@@ -22,7 +23,9 @@ DEFAULT_RATE_STATE_SIZE = 256
 DEFAULT_INITIAL_BACKOFF = 1.0
 DEFAULT_MAX_BACKOFF = 30.0
 MAX_PENDING_AGE_SECONDS = 5.0
+OFFLINE_PUBLISH_TIMEOUT_SECONDS = 10.0
 _MAX_PENDING_AGE_MS = int(MAX_PENDING_AGE_SECONDS * 1_000)
+_ABORT_EXIT_CODE = 1
 
 
 def advertisement_topic(panel: str) -> str:
@@ -90,11 +93,19 @@ class MqttTransport(Protocol):
     async def disconnect(self) -> None:
         """Close the broker connection."""
 
+    def abort(self) -> NoReturn:
+        """Terminate without MQTT DISCONNECT so the broker emits the LWT."""
+
 
 class AioMqttTransport:
     """Concrete outbound-only aiomqtt transport."""
 
-    def __init__(self, config: MqttConnectionConfig) -> None:
+    def __init__(
+        self,
+        config: MqttConnectionConfig,
+        *,
+        terminate_process: Callable[[int], NoReturn] = os._exit,
+    ) -> None:
         will = aiomqtt.Will(
             topic=config.will_topic,
             payload=config.will_payload,
@@ -109,6 +120,7 @@ class AioMqttTransport:
             identifier=config.identifier,
             will=will,
         )
+        self._terminate_process = terminate_process
 
     async def connect(self) -> None:
         await self._client.__aenter__()
@@ -118,6 +130,15 @@ class AioMqttTransport:
 
     async def disconnect(self) -> None:
         await self._client.__aexit__(None, None, None)
+
+    def abort(self) -> NoReturn:
+        """Fail-stop before stable aiomqtt's graceful-only exit can suppress LWT.
+
+        The observer runs in its own restart-on-failure systemd service. Process
+        termination makes the kernel close its MQTT socket without DISCONNECT,
+        so the broker publishes the configured retained offline will.
+        """
+        self._terminate_process(_ABORT_EXIT_CODE)
 
 
 TransportFactory = Callable[[MqttConnectionConfig], MqttTransport]
@@ -312,11 +333,25 @@ class AdvertisementPublisher:
     ) -> None:
         if connected:
             try:
-                await transport.publish(
-                    health_topic(self._settings.panel), "offline", qos=0, retain=True
+                # If a later MQTT DISCONNECT reaches the broker, TCP ordering proves
+                # this preceding QoS-0 publish reached it first. A failure or timeout
+                # is ambiguous, so fail-stop before any graceful disconnect.
+                await asyncio.wait_for(
+                    transport.publish(
+                        health_topic(self._settings.panel),
+                        "offline",
+                        qos=0,
+                        retain=True,
+                    ),
+                    timeout=OFFLINE_PUBLISH_TIMEOUT_SECONDS,
                 )
-            except Exception:
-                logger.warning("MQTT observer clean offline publication failed")
+            except Exception as error:
+                logger.warning(
+                    "MQTT observer clean offline publication failed; "
+                    "aborting process to preserve LWT"
+                )
+                transport.abort()
+                raise RuntimeError("MQTT transport abort returned unexpectedly") from error
         try:
             await transport.disconnect()
         except Exception:

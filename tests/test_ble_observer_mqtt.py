@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import NoReturn
 
 import pytest
 
@@ -12,6 +13,7 @@ from brilliant_ble_observer.model import AdvertisementEnvelope, AllowlistEntry
 from brilliant_ble_observer.mqtt import (
     MAX_PENDING_AGE_SECONDS,
     AdvertisementPublisher,
+    AioMqttTransport,
     MqttConnectionConfig,
     PublisherStats,
     advertisement_topic,
@@ -20,6 +22,10 @@ from brilliant_ble_observer.mqtt import (
 
 BATTERY_UUID = "0000180f-0000-1000-8000-00805f9b34fb"
 IBEACON_BYTES = bytes.fromhex("021500112233445566778899aabbccddeeff00420007c5")
+
+
+class ExpectedTransportAbort(RuntimeError):
+    """Test sentinel for the production process-termination seam."""
 
 
 class FakeClock:
@@ -39,12 +45,17 @@ class FakeTransport:
         *,
         connect_error: Exception | None = None,
         failed_observations: int = 0,
+        failed_offline_publishes: int = 0,
+        hang_offline_publish: bool = False,
     ) -> None:
         self.connect_error = connect_error
         self.failed_observations = failed_observations
+        self.failed_offline_publishes = failed_offline_publishes
+        self.hang_offline_publish = hang_offline_publish
         self.published: list[tuple[str, str, int, bool]] = []
         self.connect_count = 0
         self.disconnect_count = 0
+        self.abort_count = 0
         self.online_published = asyncio.Event()
         self.observation_published = asyncio.Event()
 
@@ -57,6 +68,11 @@ class FakeTransport:
         self.published.append((topic, payload, qos, retain))
         if topic.endswith("/status") and payload == "online":
             self.online_published.set()
+        if topic.endswith("/status") and payload == "offline" and self.hang_offline_publish:
+            await asyncio.Event().wait()
+        if topic.endswith("/status") and payload == "offline" and self.failed_offline_publishes:
+            self.failed_offline_publishes -= 1
+            raise ConnectionError("offline publication failed")
         if topic.endswith("/advertisement") and self.failed_observations:
             self.failed_observations -= 1
             raise ConnectionError("broker link dropped")
@@ -65,6 +81,10 @@ class FakeTransport:
 
     async def disconnect(self) -> None:
         self.disconnect_count += 1
+
+    def abort(self) -> NoReturn:
+        self.abort_count += 1
+        raise ExpectedTransportAbort
 
 
 def _settings(*, rate: float = 10.0, allowlist: tuple[AllowlistEntry, ...] = ()) -> Settings:
@@ -321,6 +341,91 @@ async def test_connect_failure_is_cleaned_up_before_reconnect() -> None:
     assert first.disconnect_count == second.disconnect_count == 1
     assert publisher.stats.reconnects == 1
     assert publisher.stats.publish_failures == 0
+
+
+async def test_publish_and_offline_failures_abort_without_graceful_disconnect() -> None:
+    transport = FakeTransport(failed_observations=1, failed_offline_publishes=1)
+    publisher = AdvertisementPublisher(
+        _settings(),
+        transport_factory=lambda _config: transport,
+        monotonic=FakeClock(),
+    )
+    advertisement = _advertisement(1)
+    assert publisher.enqueue(advertisement)
+
+    with pytest.raises(ExpectedTransportAbort):
+        await publisher.run()
+
+    assert transport.abort_count == 1
+    assert transport.disconnect_count == 0
+    assert transport.published == [
+        (health_topic("shed"), "online", 0, True),
+        (advertisement_topic("shed"), advertisement.to_json(), 0, False),
+        (health_topic("shed"), "offline", 0, True),
+    ]
+    assert publisher.stats.publish_failures == 1
+    assert publisher.stats.reconnects == 1
+
+
+async def test_shutdown_offline_failure_aborts_without_graceful_disconnect() -> None:
+    transport = FakeTransport(failed_offline_publishes=1)
+    publisher = AdvertisementPublisher(
+        _settings(),
+        transport_factory=lambda _config: transport,
+        monotonic=FakeClock(),
+    )
+
+    task = asyncio.create_task(publisher.run())
+    await asyncio.wait_for(transport.online_published.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(ExpectedTransportAbort):
+        await task
+
+    assert transport.abort_count == 1
+    assert transport.disconnect_count == 0
+
+
+async def test_shutdown_bounds_hung_offline_publish_before_abort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "brilliant_ble_observer.mqtt.OFFLINE_PUBLISH_TIMEOUT_SECONDS",
+        0.001,
+        raising=False,
+    )
+    transport = FakeTransport(hang_offline_publish=True)
+    publisher = AdvertisementPublisher(
+        _settings(),
+        transport_factory=lambda _config: transport,
+        monotonic=FakeClock(),
+    )
+
+    task = asyncio.create_task(publisher.run())
+    await asyncio.wait_for(transport.online_published.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(ExpectedTransportAbort):
+        await asyncio.wait_for(task, timeout=0.1)
+
+    assert transport.abort_count == 1
+    assert transport.disconnect_count == 0
+
+
+async def test_concrete_abort_uses_process_termination_seam() -> None:
+    exit_codes: list[int] = []
+
+    def terminate_process(exit_code: int) -> NoReturn:
+        exit_codes.append(exit_code)
+        raise ExpectedTransportAbort
+
+    transport = AioMqttTransport(
+        MqttConnectionConfig.from_settings(_settings()),
+        terminate_process=terminate_process,
+    )
+
+    with pytest.raises(ExpectedTransportAbort):
+        transport.abort()
+
+    assert exit_codes == [1]
 
 
 async def test_reconnect_drops_stale_backlog_before_online_then_accepts_fresh_packet(
