@@ -193,18 +193,33 @@ class AioMqttAdapter:
                     logger.exception("failed publishing clean offline availability")
 
         if self._reader_task is not None:
-            self._reader_task.cancel()
+            reader_task = self._reader_task
+            reader_task.cancel()
             try:
-                await self._reader_task
-            except asyncio.CancelledError:
-                pass
-            except Exception:
                 if self._checked_disconnect:
-                    failed = True
-                    logger.error("reader task failed during cancellation")
+
+                    async def wait_reader_checked() -> bool:
+                        try:
+                            await reader_task
+                        except asyncio.CancelledError:
+                            return True
+                        except Exception:
+                            return False
+                        return True
+
+                    reader_stopped = (await asyncio.gather(wait_reader_checked()))[0]
+                    if not reader_stopped:
+                        failed = True
+                        logger.error("reader task failed during cancellation")
                 else:
-                    logger.exception("reader task raised during cancellation")
-            self._reader_task = None
+                    try:
+                        await reader_task
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        logger.exception("reader task raised during cancellation")
+            finally:
+                self._reader_task = None
 
         if self._checked_disconnect:
 

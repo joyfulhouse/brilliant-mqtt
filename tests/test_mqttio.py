@@ -43,6 +43,14 @@ class _BlockingCloseClient:
         await asyncio.Future()
 
 
+class _SuccessfulCloseClient:
+    def __init__(self) -> None:
+        self.exit_attempts = 0
+
+    async def __aexit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.exit_attempts += 1
+
+
 def _settings(*, tls_enabled: bool, ca_file: str | None = None) -> Settings:
     return cast(
         Settings,
@@ -262,3 +270,45 @@ async def test_checked_disconnect_propagates_caller_cancellation(
     with pytest.raises(asyncio.CancelledError):
         await disconnect_task
     assert client.exit_attempts == 1
+
+
+async def test_checked_disconnect_propagates_caller_cancellation_during_reader_teardown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _SuccessfulCloseClient()
+    monkeypatch.setattr(aiomqtt, "Client", lambda **kwargs: client)
+    adapter = mqttio.AioMqttAdapter(
+        _settings(tls_enabled=False),
+        publish_availability=False,
+        checked_disconnect=True,
+        redacted_logging=True,
+    )
+    reader_cleanup_started = asyncio.Event()
+    release_reader_cleanup = asyncio.Event()
+
+    async def slow_reader_cancellation() -> None:
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            reader_cleanup_started.set()
+            await release_reader_cleanup.wait()
+            raise
+
+    reader_task = asyncio.create_task(slow_reader_cancellation())
+    adapter._reader_task = reader_task
+    disconnect_task = asyncio.create_task(adapter.disconnect())
+    await asyncio.wait_for(reader_cleanup_started.wait(), timeout=0.1)
+
+    disconnect_task.cancel()
+
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(disconnect_task, timeout=0.1)
+    finally:
+        release_reader_cleanup.set()
+        if not reader_task.done():
+            reader_task.cancel()
+        try:
+            await reader_task
+        except asyncio.CancelledError:
+            pass

@@ -80,6 +80,8 @@ class RecordingMqtt(FakeMqtt):
         self.failures: dict[tuple[str, ...], BaseException] = {}
         self.blocked: set[tuple[str, ...]] = set()
         self.cancellation_delays: dict[tuple[str, ...], float] = {}
+        self.post_cancellation_failures: dict[tuple[str, ...], BaseException] = {}
+        self.post_cancellation_failures_raised: list[tuple[str, ...]] = []
         self.pauses: dict[tuple[str, ...], tuple[asyncio.Event, asyncio.Event]] = {}
         self.publish_hook: PublishHook | None = None
         self.subscribe_hook: SubscribeHook | None = None
@@ -94,10 +96,15 @@ class RecordingMqtt(FakeMqtt):
         if key in self.blocked:
             try:
                 await asyncio.Future()
-            finally:
+            except asyncio.CancelledError:
                 delay = self.cancellation_delays.get(key)
                 if delay is not None:
                     await asyncio.sleep(delay)
+                post_cancellation_failure = self.post_cancellation_failures.get(key)
+                if post_cancellation_failure is not None:
+                    self.post_cancellation_failures_raised.append(key)
+                    raise post_cancellation_failure from None
+                raise
         failure = self.failures.get(key)
         if failure is not None:
             raise failure
@@ -593,6 +600,57 @@ async def test_cleanup_advances_without_waiting_for_timed_out_action_teardown() 
     assert elapsed < 0.3
 
 
+async def test_detached_cleanup_consumes_post_cancellation_failure_and_drains_tracking(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    request = _request(timeout_seconds=0.1)
+    topics = SetupTopics.for_id(request.setup_id)
+    mqtt = _successful_mqtt(request)
+    cleanup_actions = [
+        ("publish", topics.discovery_probe, "", "True", "1"),
+        ("publish", topics.retained, "", "True", "1"),
+        ("unsubscribe", topics.ha_to_panel),
+        ("unsubscribe", topics.retained),
+        ("disconnect",),
+    ]
+    slow_action = cleanup_actions[0]
+    raw_error = "post-cancellation password=must-not-leak"
+    mqtt.blocked.add(slow_action)
+    mqtt.cancellation_delays[slow_action] = 0.03
+    mqtt.post_cancellation_failures[slow_action] = RuntimeError(raw_error)
+    loop = asyncio.get_running_loop()
+    loop_contexts: list[dict[str, Any]] = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: loop_contexts.append(context))
+
+    try:
+        report = await async_run_preflight(
+            _settings(),
+            request,
+            mqtt_factory=lambda *args, **kw: mqtt,
+        )
+        assert len(preflight_module._detached_cleanup_tasks) == 1
+        detached_cleanup_finished = asyncio.Event()
+        next(iter(preflight_module._detached_cleanup_tasks)).add_done_callback(
+            lambda _task: detached_cleanup_finished.set()
+        )
+        await asyncio.wait_for(detached_cleanup_finished.wait(), timeout=0.2)
+        await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    assert report.success is False
+    assert report.failed_stage is PreflightStage.CLEANUP
+    assert report.error_code == "mqtt_timeout"
+    assert report.detail == "MQTT stage timed out"
+    assert [event for event in mqtt.events if event in cleanup_actions] == cleanup_actions
+    assert mqtt.post_cancellation_failures_raised == [slow_action]
+    assert preflight_module._detached_cleanup_tasks == set()
+    assert loop_contexts == []
+    assert raw_error not in report.to_json()
+    assert raw_error not in caplog.text
+
+
 async def test_ordinary_failure_still_clears_both_probes_unsubscribes_and_disconnects() -> None:
     request = _request()
     topics = SetupTopics.for_id(request.setup_id)
@@ -633,6 +691,35 @@ async def test_partial_cleanup_failures_do_not_skip_later_cleanup_actions() -> N
     assert ("publish", topics.retained, "", "True", "1") in mqtt.events
     assert ("unsubscribe", topics.retained) in mqtt.events
     assert mqtt.events[-1] == ("disconnect",)
+
+
+async def test_cleanup_action_timeout_error_maps_to_mqtt_timeout(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    request = _request()
+    topics = SetupTopics.for_id(request.setup_id)
+    mqtt = _successful_mqtt(request)
+    raw_error = "cleanup timeout password=must-not-leak"
+    mqtt.failures[("publish", topics.discovery_probe, "", "True", "1")] = asyncio.TimeoutError(
+        raw_error
+    )
+
+    report = await async_run_preflight(
+        _settings(),
+        request,
+        mqtt_factory=lambda *args, **kw: mqtt,
+    )
+
+    assert report.success is False
+    assert report.failed_stage is PreflightStage.CLEANUP
+    assert report.error_code == "mqtt_timeout"
+    assert report.detail == "MQTT stage timed out"
+    assert ("publish", topics.retained, "", "True", "1") in mqtt.events
+    assert ("unsubscribe", topics.ha_to_panel) in mqtt.events
+    assert ("unsubscribe", topics.retained) in mqtt.events
+    assert mqtt.events[-1] == ("disconnect",)
+    assert raw_error not in report.to_json()
+    assert raw_error not in caplog.text
 
 
 async def test_first_cancellation_during_cleanup_waits_for_every_action() -> None:

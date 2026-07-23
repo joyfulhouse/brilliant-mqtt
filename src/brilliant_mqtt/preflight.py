@@ -280,6 +280,8 @@ async def _cleanup(
             action_task.result()
         except asyncio.CancelledError:
             raise
+        except asyncio.TimeoutError:
+            timed_out = True
         except Exception:
             failed = True
 
