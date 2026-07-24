@@ -80,11 +80,15 @@ class RecordingMqtt(FakeMqtt):
         self.failures: dict[tuple[str, ...], BaseException] = {}
         self.blocked: set[tuple[str, ...]] = set()
         self.cancellation_delays: dict[tuple[str, ...], float] = {}
+        self.cancellation_pauses: dict[tuple[str, ...], tuple[asyncio.Event, asyncio.Event]] = {}
         self.post_cancellation_failures: dict[tuple[str, ...], BaseException] = {}
         self.post_cancellation_failures_raised: list[tuple[str, ...]] = []
         self.pauses: dict[tuple[str, ...], tuple[asyncio.Event, asyncio.Event]] = {}
         self.publish_hook: PublishHook | None = None
         self.subscribe_hook: SubscribeHook | None = None
+        self._payload_decode_error_cbs: list[
+            Callable[[mqttio.MqttPayloadDecodeError], Awaitable[None]]
+        ] = []
 
     async def _before(self, key: tuple[str, ...]) -> None:
         self.events.append(key)
@@ -97,6 +101,11 @@ class RecordingMqtt(FakeMqtt):
             try:
                 await asyncio.Future()
             except asyncio.CancelledError:
+                cancellation_pause = self.cancellation_pauses.get(key)
+                if cancellation_pause is not None:
+                    entered, release = cancellation_pause
+                    entered.set()
+                    await release.wait()
                 delay = self.cancellation_delays.get(key)
                 if delay is not None:
                     await asyncio.sleep(delay)
@@ -132,6 +141,12 @@ class RecordingMqtt(FakeMqtt):
     def on_message(self, cb: Callable[[str, str, bool], Awaitable[None]]) -> None:
         self.events.append(("on_message",))
         super().on_message(cb)
+
+    def on_payload_decode_error(
+        self,
+        cb: Callable[[mqttio.MqttPayloadDecodeError], Awaitable[None]],
+    ) -> None:
+        self._payload_decode_error_cbs.append(cb)
 
     async def subscribe(self, topic: str) -> None:
         await self._before(("subscribe", topic))
@@ -179,11 +194,11 @@ class _ConcreteMessageStream:
     async def __anext__(self) -> aiomqtt.Message:
         return await self._messages.get()
 
-    def feed(self, topic: str, payload: str, *, retained: bool) -> None:
+    def feed(self, topic: str, payload: bytes | str, *, retained: bool) -> None:
         self._messages.put_nowait(
             aiomqtt.Message(
                 topic=topic,
-                payload=payload.encode(),
+                payload=payload.encode() if isinstance(payload, str) else payload,
                 qos=1,
                 retain=retained,
                 mid=1,
@@ -195,12 +210,23 @@ class _ConcreteMessageStream:
 class _ConcretePreflightClient:
     """Broker seam used while exercising the real AioMqttAdapter lifecycle."""
 
-    def __init__(self, request: PreflightRequest, close_error: BaseException) -> None:
+    def __init__(
+        self,
+        request: PreflightRequest,
+        close_error: BaseException | None,
+    ) -> None:
         self._request = request
         self._topics = SetupTopics.for_id(request.setup_id)
         self._close_error = close_error
         self._retained_payload: str | None = None
         self.messages = _ConcreteMessageStream()
+        self.ha_payload: bytes | str = SetupResult(
+            setup_id=request.setup_id,
+            nonce=request.ha_nonce,
+            reply_to_nonce=request.panel_nonce,
+        ).to_payload()
+        self.messages_before_ha: list[tuple[str, bytes | str, bool]] = []
+        self.retained_replay_payload: bytes | str | None = None
         self.exit_attempts = 0
         self.unsubscriptions: list[str] = []
 
@@ -209,7 +235,8 @@ class _ConcretePreflightClient:
 
     async def __aexit__(self, exc_type: object, exc: object, traceback: object) -> None:
         self.exit_attempts += 1
-        raise self._close_error
+        if self._close_error is not None:
+            raise self._close_error
 
     async def publish(
         self,
@@ -219,21 +246,22 @@ class _ConcretePreflightClient:
         qos: int = 0,
     ) -> None:
         if topic == self._topics.panel_to_ha:
-            self.messages.feed(
-                self._topics.ha_to_panel,
-                SetupResult(
-                    setup_id=self._request.setup_id,
-                    nonce=self._request.ha_nonce,
-                    reply_to_nonce=self._request.panel_nonce,
-                ).to_payload(),
-                retained=False,
-            )
+            for incoming_topic, incoming_payload, incoming_retained in self.messages_before_ha:
+                self.messages.feed(
+                    incoming_topic,
+                    incoming_payload,
+                    retained=incoming_retained,
+                )
+            self.messages.feed(self._topics.ha_to_panel, self.ha_payload, retained=False)
         if topic == self._topics.retained and retain:
             self._retained_payload = payload
 
     async def subscribe(self, topic: str) -> None:
         if topic == self._topics.retained and self._retained_payload:
-            self.messages.feed(topic, self._retained_payload, retained=True)
+            payload = self.retained_replay_payload
+            if payload is None:
+                payload = self._retained_payload
+            self.messages.feed(topic, payload, retained=True)
 
     async def unsubscribe(self, topic: str) -> None:
         self.unsubscriptions.append(topic)
@@ -517,6 +545,71 @@ async def test_retained_replay_requires_exact_payload_and_retained_flag(
     assert report.error_code == error_code
 
 
+@pytest.mark.parametrize(
+    ("payload_target", "failed_stage"),
+    [
+        ("ha_to_panel", PreflightStage.HA_TO_PANEL),
+        ("retained", PreflightStage.RETAINED_MESSAGE),
+    ],
+)
+async def test_real_adapter_invalid_utf8_on_exact_validation_topic_maps_to_mqtt_payload(
+    payload_target: str,
+    failed_stage: PreflightStage,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    settings = _settings()
+    request = _request(timeout_seconds=0.02)
+    invalid_payload = b"\xffmalformed-payload-secret"
+    client = _ConcretePreflightClient(request, None)
+    if payload_target == "ha_to_panel":
+        client.ha_payload = invalid_payload
+    else:
+        client.retained_replay_payload = invalid_payload
+    monkeypatch.setattr(aiomqtt, "Client", lambda **kwargs: client)
+    monkeypatch.setattr(mqttio, "build_tls_context", lambda received: None)
+    caplog.set_level(logging.DEBUG, logger=mqttio.__name__)
+
+    report = await asyncio.wait_for(
+        async_run_preflight(settings, request),
+        timeout=0.5,
+    )
+
+    assert report.success is False
+    assert report.failed_stage is failed_stage
+    assert report.error_code == "mqtt_payload"
+    assert report.detail == "MQTT payload validation failed"
+    assert client.exit_attempts == 1
+    assert "malformed-payload-secret" not in report.to_json()
+    assert "malformed-payload-secret" not in caplog.text
+
+
+async def test_real_adapter_ignores_unrelated_invalid_utf8_and_processes_later_valid_message(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    settings = _settings()
+    request = _request(timeout_seconds=0.1)
+    client = _ConcretePreflightClient(request, None)
+    client.messages_before_ha.append(
+        ("brilliant/setup/unrelated/ha_to_panel", b"\xffunrelated-payload-secret", False)
+    )
+    monkeypatch.setattr(aiomqtt, "Client", lambda **kwargs: client)
+    monkeypatch.setattr(mqttio, "build_tls_context", lambda received: None)
+    caplog.set_level(logging.DEBUG, logger=mqttio.__name__)
+
+    report = await asyncio.wait_for(
+        async_run_preflight(settings, request),
+        timeout=0.5,
+    )
+
+    assert report.success is True
+    assert report.completed_stages == tuple(PreflightStage)
+    assert client.exit_attempts == 1
+    assert "unrelated-payload-secret" not in report.to_json()
+    assert "unrelated-payload-secret" not in caplog.text
+
+
 async def test_protocol_stages_use_request_timeout_and_cleanup_owns_its_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -616,7 +709,9 @@ async def test_detached_cleanup_consumes_post_cancellation_failure_and_drains_tr
     slow_action = cleanup_actions[0]
     raw_error = "post-cancellation password=must-not-leak"
     mqtt.blocked.add(slow_action)
-    mqtt.cancellation_delays[slow_action] = 0.03
+    cancellation_started = asyncio.Event()
+    release_cancellation = asyncio.Event()
+    mqtt.cancellation_pauses[slow_action] = (cancellation_started, release_cancellation)
     mqtt.post_cancellation_failures[slow_action] = RuntimeError(raw_error)
     loop = asyncio.get_running_loop()
     loop_contexts: list[dict[str, Any]] = []
@@ -624,19 +719,25 @@ async def test_detached_cleanup_consumes_post_cancellation_failure_and_drains_tr
     loop.set_exception_handler(lambda _loop, context: loop_contexts.append(context))
 
     try:
-        report = await async_run_preflight(
-            _settings(),
-            request,
-            mqtt_factory=lambda *args, **kw: mqtt,
+        preflight_task = asyncio.create_task(
+            async_run_preflight(
+                _settings(),
+                request,
+                mqtt_factory=lambda *args, **kw: mqtt,
+            )
         )
+        await asyncio.wait_for(cancellation_started.wait(), timeout=0.2)
         assert len(preflight_module._detached_cleanup_tasks) == 1
+        assert next(iter(preflight_module._detached_cleanup_tasks)).done() is False
+        report = await asyncio.wait_for(preflight_task, timeout=0.2)
         detached_cleanup_finished = asyncio.Event()
         next(iter(preflight_module._detached_cleanup_tasks)).add_done_callback(
             lambda _task: detached_cleanup_finished.set()
         )
+        release_cancellation.set()
         await asyncio.wait_for(detached_cleanup_finished.wait(), timeout=0.2)
-        await asyncio.sleep(0)
     finally:
+        release_cancellation.set()
         loop.set_exception_handler(previous_handler)
 
     assert report.success is False

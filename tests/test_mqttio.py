@@ -197,6 +197,39 @@ async def test_checked_redacted_disconnect_finishes_reader_and_client_close(
     assert raw_close_error not in caplog.text
 
 
+async def test_checked_disconnect_maps_reader_only_failure_to_generic_redacted_error(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    raw_reader_error = "reader-only-error password=s3cr3t"
+    client = _SuccessfulCloseClient()
+    monkeypatch.setattr(aiomqtt, "Client", lambda **kwargs: client)
+    caplog.set_level(logging.DEBUG, logger=mqttio.__name__)
+    adapter = mqttio.AioMqttAdapter(
+        _settings(tls_enabled=False),
+        publish_availability=False,
+        checked_disconnect=True,
+        redacted_logging=True,
+    )
+
+    async def fail_reader_during_cancellation() -> None:
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            raise RuntimeError(raw_reader_error) from None
+
+    adapter._reader_task = asyncio.create_task(fail_reader_during_cancellation())
+    await asyncio.sleep(0)
+
+    with pytest.raises(RuntimeError, match=r"^MQTT disconnect failed$") as raised:
+        await adapter.disconnect()
+
+    assert client.exit_attempts == 1
+    assert adapter._reader_task is None
+    assert raw_reader_error not in str(raised.value)
+    assert raw_reader_error not in caplog.text
+
+
 async def test_default_disconnect_remains_best_effort(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

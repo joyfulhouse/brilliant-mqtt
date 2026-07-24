@@ -9,6 +9,7 @@ from typing import Any, cast
 
 import pytest
 
+from brilliant_mqtt import mqttio
 from brilliant_mqtt.mqttio import AioMqttAdapter
 
 
@@ -58,6 +59,7 @@ async def test_read_loop_fans_out_retained_context_and_preserves_two_arg_callbac
 
     adapter._command_cbs = [command_cb]
     adapter._message_cbs = [message_cb]
+    adapter._payload_decode_error_cbs = []
 
     await adapter._read_loop()
 
@@ -78,10 +80,52 @@ async def test_failing_context_callback_does_not_starve_other_callbacks() -> Non
 
     adapter._command_cbs = []
     adapter._message_cbs = [broken, healthy]
+    adapter._payload_decode_error_cbs = []
 
     await adapter._read_loop()
 
     assert reached == [False]
+
+
+async def test_invalid_utf8_uses_typed_error_signal_without_text_delivery_and_reader_continues(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    adapter = object.__new__(AioMqttAdapter)
+    adapter._client = cast(
+        Any,
+        _Client(
+            [
+                _Message("unrelated/topic", b"\xffraw-payload-secret", False),
+                _Message("valid/topic", b"valid-payload", True),
+            ]
+        ),
+    )
+    adapter._redacted_logging = True
+    commands: list[tuple[str, str]] = []
+    decode_errors: list[object] = []
+
+    async def command_cb(topic: str, payload: str) -> None:
+        commands.append((topic, payload))
+
+    async def broken_decode_error_cb(error: object) -> None:
+        raise RuntimeError("decode-callback-secret") from None
+
+    async def healthy_decode_error_cb(error: object) -> None:
+        decode_errors.append(error)
+
+    adapter._command_cbs = [command_cb]
+    adapter._message_cbs = []
+    adapter._payload_decode_error_cbs = []
+    adapter.on_payload_decode_error(broken_decode_error_cb)
+    adapter.on_payload_decode_error(healthy_decode_error_cb)
+
+    await adapter._read_loop()
+
+    assert commands == [("valid/topic", "valid-payload")]
+    assert decode_errors == [mqttio.MqttPayloadDecodeError(topic="unrelated/topic", retained=False)]
+    assert not hasattr(decode_errors[0], "payload")
+    assert "raw-payload-secret" not in caplog.text
+    assert "decode-callback-secret" not in caplog.text
 
 
 async def test_publish_forwards_qos_and_awaits_broker_acknowledgement() -> None:

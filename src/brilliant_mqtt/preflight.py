@@ -14,7 +14,7 @@ from typing import Protocol, TypeVar, cast
 from uuid import UUID
 
 from brilliant_mqtt.config import Settings
-from brilliant_mqtt.mqttio import AioMqttAdapter
+from brilliant_mqtt.mqttio import AioMqttAdapter, MqttPayloadDecodeError
 from brilliant_mqtt.setup_protocol import SCHEMA_VERSION, SetupRequest, SetupResult, SetupTopics
 
 _REQUEST_KEYS = frozenset(
@@ -159,6 +159,11 @@ class _PreflightMqtt(Protocol):
     ) -> None: ...
 
     def on_message(self, cb: Callable[[str, str, bool], Awaitable[None]]) -> None: ...
+
+    def on_payload_decode_error(
+        self,
+        cb: Callable[[MqttPayloadDecodeError], Awaitable[None]],
+    ) -> None: ...
 
     async def subscribe(self, topic: str) -> None: ...
 
@@ -367,6 +372,17 @@ async def async_run_preflight(
             else:
                 retained_result.set_result(_InboundResult())
 
+    async def on_payload_decode_error(error: MqttPayloadDecodeError) -> None:
+        if error.topic == topics.ha_to_panel and not ha_result.done():
+            ha_result.set_result(_InboundResult("mqtt_payload", _PAYLOAD_DETAIL))
+            return
+        if (
+            error.topic == topics.retained
+            and retained_subscription_active
+            and not retained_result.done()
+        ):
+            retained_result.set_result(_InboundResult("mqtt_payload", _PAYLOAD_DETAIL))
+
     async def fleet_auth() -> None:
         nonlocal mqtt
         try:
@@ -378,6 +394,7 @@ async def async_run_preflight(
                 redacted_logging=True,
             )
             mqtt.on_message(on_message)
+            mqtt.on_payload_decode_error(on_payload_decode_error)
         except Exception as error:
             raise _Failure(PreflightStage.FLEET_AUTH, "mqtt_connect", _CONNECT_DETAIL) from error
         await _mqtt_operation(

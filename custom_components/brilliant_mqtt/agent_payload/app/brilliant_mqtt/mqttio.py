@@ -15,6 +15,7 @@ import asyncio
 import logging
 import ssl
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 
 import aiomqtt
 
@@ -24,6 +25,14 @@ from brilliant_mqtt.discovery import availability_topic
 logger = logging.getLogger(__name__)
 
 _DISCONNECT_ERROR = "MQTT disconnect failed"
+
+
+@dataclass(frozen=True, slots=True)
+class MqttPayloadDecodeError:
+    """Metadata-only signal for an inbound payload that is not valid UTF-8."""
+
+    topic: str
+    retained: bool
 
 
 def build_tls_context(settings: Settings) -> ssl.SSLContext | None:
@@ -65,6 +74,9 @@ class AioMqttAdapter:
         # command callback on this one shared connection — fan out to all.
         self._command_cbs: list[Callable[[str, str], Awaitable[None]]] = []
         self._message_cbs: list[Callable[[str, str, bool], Awaitable[None]]] = []
+        self._payload_decode_error_cbs: list[
+            Callable[[MqttPayloadDecodeError], Awaitable[None]]
+        ] = []
         self._reader_task: asyncio.Task[None] | None = None
         self._avail_topic = availability_topic(settings.panel)
         # A distinct broker ClientID is REQUIRED for any second connection on the
@@ -120,12 +132,40 @@ class AioMqttAdapter:
         async for message in self._client.messages:
             command_cbs = list(self._command_cbs)
             message_cbs = list(self._message_cbs)
-            if not command_cbs and not message_cbs:
+            payload_decode_error_cbs = list(self._payload_decode_error_cbs)
+            if not command_cbs and not message_cbs and not payload_decode_error_cbs:
                 # No consumer registered yet — drop (reconcile re-subscribes).
                 continue
             try:
                 topic = str(message.topic)
+            except Exception:
+                if self._redacted_logging:
+                    logger.warning("failed decoding temporary MQTT message; continuing")
+                else:
+                    logger.exception("failed decoding MQTT message; continuing")
+                continue
+            try:
                 payload = _decode_payload(message.payload)
+            except UnicodeDecodeError:
+                if self._redacted_logging:
+                    logger.warning("failed decoding temporary MQTT message; continuing")
+                else:
+                    logger.exception("failed decoding MQTT message; continuing")
+                decode_error = MqttPayloadDecodeError(
+                    topic=topic,
+                    retained=bool(message.retain),
+                )
+                for payload_decode_error_cb in payload_decode_error_cbs:
+                    try:
+                        await payload_decode_error_cb(decode_error)
+                    except Exception:
+                        if self._redacted_logging:
+                            logger.warning(
+                                "temporary MQTT payload decode callback failed; continuing"
+                            )
+                        else:
+                            logger.exception("payload decode callback failed; continuing")
+                continue
             except Exception:
                 # Broad by design: keep the reader alive across any single
                 # message's decode failure.
@@ -257,6 +297,13 @@ class AioMqttAdapter:
 
     def on_message(self, cb: Callable[[str, str, bool], Awaitable[None]]) -> None:
         self._message_cbs.append(cb)
+
+    def on_payload_decode_error(
+        self,
+        cb: Callable[[MqttPayloadDecodeError], Awaitable[None]],
+    ) -> None:
+        """Register metadata-only handling for inbound invalid UTF-8."""
+        self._payload_decode_error_cbs.append(cb)
 
     async def subscribe(self, topic: str) -> None:
         await self._client.subscribe(topic)
