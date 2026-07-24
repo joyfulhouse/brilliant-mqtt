@@ -267,6 +267,66 @@ class _ConcretePreflightClient:
         self.unsubscriptions.append(topic)
 
 
+class _AckRacePreflightClient(_ConcretePreflightClient):
+    """Concrete adapter seam with one broker acknowledgement held pending."""
+
+    def __init__(
+        self,
+        request: PreflightRequest,
+        *,
+        pending_operation: tuple[str, str],
+        post_cancellation_error: BaseException | None,
+    ) -> None:
+        super().__init__(request, None)
+        self._pending_operation = pending_operation
+        self._post_cancellation_error = post_cancellation_error
+        self.ack_pending = asyncio.Event()
+        self.cancellation_started = asyncio.Event()
+        self.release_cancellation = asyncio.Event()
+        self.cancellation_finished = asyncio.Event()
+        self.close_started = asyncio.Event()
+        self.operations: list[tuple[object, ...]] = []
+
+    async def _hold_ack(self, operation: str, topic: str) -> None:
+        if (operation, topic) != self._pending_operation:
+            return
+        self.ack_pending.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            self.cancellation_started.set()
+            await self.release_cancellation.wait()
+            self.cancellation_finished.set()
+            if self._post_cancellation_error is not None:
+                raise self._post_cancellation_error from None
+            raise
+
+    async def __aexit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.operations.append(("disconnect",))
+        self.close_started.set()
+        await super().__aexit__(exc_type, exc, traceback)
+
+    async def publish(
+        self,
+        topic: str,
+        payload: str,
+        retain: bool = False,
+        qos: int = 0,
+    ) -> None:
+        self.operations.append(("publish", topic, payload, retain, qos))
+        await super().publish(topic, payload, retain=retain, qos=qos)
+        await self._hold_ack("publish", topic)
+
+    async def subscribe(self, topic: str) -> None:
+        self.operations.append(("subscribe", topic))
+        await super().subscribe(topic)
+        await self._hold_ack("subscribe", topic)
+
+    async def unsubscribe(self, topic: str) -> None:
+        self.operations.append(("unsubscribe", topic))
+        await super().unsubscribe(topic)
+
+
 def test_request_parses_exact_contract_and_stage_values() -> None:
     request = _request()
 
@@ -584,6 +644,138 @@ async def test_real_adapter_invalid_utf8_on_exact_validation_topic_maps_to_mqtt_
     assert "malformed-payload-secret" not in caplog.text
 
 
+async def _assert_malformed_payload_beats_pending_ack(
+    *,
+    pending_operation_name: str,
+    failed_stage: PreflightStage,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    settings = _settings()
+    request = _request(timeout_seconds=0.05)
+    topics = SetupTopics.for_id(request.setup_id)
+    pending_topic = topics.panel_to_ha if pending_operation_name == "publish" else topics.retained
+    raw_payload = b"\xffack-race-payload-secret"
+    raw_cancellation_error = "ack-race-cancellation password=must-not-leak"
+    client = _AckRacePreflightClient(
+        request,
+        pending_operation=(pending_operation_name, pending_topic),
+        post_cancellation_error=RuntimeError(raw_cancellation_error),
+    )
+    if pending_operation_name == "publish":
+        client.ha_payload = raw_payload
+    else:
+        client.retained_replay_payload = raw_payload
+    monkeypatch.setattr(aiomqtt, "Client", lambda **kwargs: client)
+    monkeypatch.setattr(mqttio, "build_tls_context", lambda received: None)
+    caplog.set_level(logging.DEBUG, logger=mqttio.__name__)
+    loop = asyncio.get_running_loop()
+    loop_contexts: list[dict[str, Any]] = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: loop_contexts.append(context))
+    preflight_task = asyncio.create_task(async_run_preflight(settings, request))
+    report: PreflightReport | None = None
+    cleanup_finished_before_release = False
+
+    try:
+        await asyncio.wait_for(client.ack_pending.wait(), timeout=0.2)
+        await asyncio.wait_for(client.cancellation_started.wait(), timeout=0.2)
+        try:
+            await asyncio.wait_for(client.close_started.wait(), timeout=0.1)
+        except asyncio.TimeoutError:
+            pass
+        else:
+            cleanup_finished_before_release = True
+            report = await asyncio.wait_for(asyncio.shield(preflight_task), timeout=0.2)
+    finally:
+        client.release_cancellation.set()
+
+    try:
+        if report is None:
+            report = await asyncio.wait_for(preflight_task, timeout=0.3)
+        await asyncio.wait_for(client.cancellation_finished.wait(), timeout=0.2)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+    finally:
+        client.release_cancellation.set()
+        if not preflight_task.done():
+            preflight_task.cancel()
+            await asyncio.gather(preflight_task, return_exceptions=True)
+        loop.set_exception_handler(previous_handler)
+
+    cleanup_operations = [
+        ("publish", topics.discovery_probe, "", True, 1),
+        ("publish", topics.retained, "", True, 1),
+        ("unsubscribe", topics.ha_to_panel),
+    ]
+    if pending_operation_name == "subscribe":
+        cleanup_operations.append(("unsubscribe", topics.retained))
+    cleanup_operations.append(("disconnect",))
+
+    assert cleanup_finished_before_release is True
+    assert report.success is False
+    assert report.failed_stage is failed_stage
+    assert report.error_code == "mqtt_payload"
+    assert report.detail == "MQTT payload validation failed"
+    assert [item for item in client.operations if item in cleanup_operations] == cleanup_operations
+    assert client.exit_attempts == 1
+    assert loop_contexts == []
+    assert "ack-race-payload-secret" not in report.to_json()
+    assert "ack-race-payload-secret" not in caplog.text
+    assert raw_cancellation_error not in report.to_json()
+    assert raw_cancellation_error not in caplog.text
+
+
+async def test_real_adapter_invalid_utf8_beats_pending_request_puback(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    await _assert_malformed_payload_beats_pending_ack(
+        pending_operation_name="publish",
+        failed_stage=PreflightStage.HA_TO_PANEL,
+        monkeypatch=monkeypatch,
+        caplog=caplog,
+    )
+
+
+async def test_real_adapter_invalid_utf8_retained_replay_beats_pending_suback(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    await _assert_malformed_payload_beats_pending_ack(
+        pending_operation_name="subscribe",
+        failed_stage=PreflightStage.RETAINED_MESSAGE,
+        monkeypatch=monkeypatch,
+        caplog=caplog,
+    )
+
+
+async def test_valid_ha_response_does_not_waive_pending_request_puback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings()
+    request = _request(timeout_seconds=0.02)
+    topics = SetupTopics.for_id(request.setup_id)
+    client = _AckRacePreflightClient(
+        request,
+        pending_operation=("publish", topics.panel_to_ha),
+        post_cancellation_error=None,
+    )
+    client.release_cancellation.set()
+    monkeypatch.setattr(aiomqtt, "Client", lambda **kwargs: client)
+    monkeypatch.setattr(mqttio, "build_tls_context", lambda received: None)
+
+    report = await asyncio.wait_for(
+        async_run_preflight(settings, request),
+        timeout=0.3,
+    )
+
+    assert report.success is False
+    assert report.failed_stage is PreflightStage.PANEL_TO_HA
+    assert report.error_code == "mqtt_timeout"
+    assert client.exit_attempts == 1
+
+
 async def test_real_adapter_ignores_unrelated_invalid_utf8_and_processes_later_valid_message(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -792,6 +984,86 @@ async def test_partial_cleanup_failures_do_not_skip_later_cleanup_actions() -> N
     assert ("publish", topics.retained, "", "True", "1") in mqtt.events
     assert ("unsubscribe", topics.retained) in mqtt.events
     assert mqtt.events[-1] == ("disconnect",)
+
+
+async def test_internal_cleanup_action_cancellation_is_redacted_and_does_not_skip_actions(
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    request = _request()
+    topics = SetupTopics.for_id(request.setup_id)
+    mqtt = _successful_mqtt(request)
+    raw_error = "cleanup-child-cancelled password=must-not-leak"
+    cleanup_actions = [
+        ("publish", topics.discovery_probe, "", "True", "1"),
+        ("publish", topics.retained, "", "True", "1"),
+        ("unsubscribe", topics.ha_to_panel),
+        ("unsubscribe", topics.retained),
+        ("disconnect",),
+    ]
+    mqtt.failures[cleanup_actions[0]] = asyncio.CancelledError(raw_error)
+
+    report = await async_run_preflight(
+        _settings(),
+        request,
+        mqtt_factory=lambda *args, **kw: mqtt,
+    )
+
+    async def runner(received: Settings, received_request: PreflightRequest) -> PreflightReport:
+        assert received == _settings()
+        assert received_request == request
+        return report
+
+    exit_code = await preflight_module.async_main(
+        ["--request-json", _canonical(REQUEST_OBJECT)],
+        settings_factory=_settings,
+        runner=runner,
+    )
+    captured = capsys.readouterr()
+
+    assert report.success is False
+    assert report.failed_stage is PreflightStage.CLEANUP
+    assert report.error_code == "cleanup_failed"
+    assert report.detail == "MQTT cleanup failed"
+    assert [event for event in mqtt.events if event in cleanup_actions] == cleanup_actions
+    assert exit_code == 1
+    assert captured.out == f"{report.to_json()}\n"
+    assert captured.err == ""
+    assert raw_error not in report.to_json()
+    assert raw_error not in captured.out
+    assert raw_error not in captured.err
+    assert raw_error not in caplog.text
+
+
+async def test_internal_cleanup_action_cancellation_preserves_primary_payload_failure() -> None:
+    request = _request()
+    topics = SetupTopics.for_id(request.setup_id)
+    mqtt = _successful_mqtt(request)
+    cleanup_actions = [
+        ("publish", topics.discovery_probe, "", "True", "1"),
+        ("publish", topics.retained, "", "True", "1"),
+        ("unsubscribe", topics.ha_to_panel),
+        ("disconnect",),
+    ]
+
+    async def malformed_response(topic: str, payload: str, retain: bool, qos: int) -> None:
+        if topic == topics.panel_to_ha:
+            await mqtt.inject(topics.ha_to_panel, "not-json")
+
+    mqtt.publish_hook = malformed_response
+    mqtt.failures[cleanup_actions[0]] = asyncio.CancelledError("cleanup-child-secret")
+
+    report = await async_run_preflight(
+        _settings(),
+        request,
+        mqtt_factory=lambda *args, **kw: mqtt,
+    )
+
+    assert report.success is False
+    assert report.failed_stage is PreflightStage.HA_TO_PANEL
+    assert report.error_code == "mqtt_payload"
+    assert report.detail == "MQTT payload validation failed"
+    assert [event for event in mqtt.events if event in cleanup_actions] == cleanup_actions
 
 
 async def test_cleanup_action_timeout_error_maps_to_mqtt_timeout(

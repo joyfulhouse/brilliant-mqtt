@@ -10,7 +10,7 @@ import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from enum import Enum
-from typing import Protocol, TypeVar, cast
+from typing import Protocol, cast
 from uuid import UUID
 
 from brilliant_mqtt.config import Settings
@@ -29,9 +29,8 @@ _PAYLOAD_DETAIL = "MQTT payload validation failed"
 _RETAINED_DETAIL = "Retained replay flag was missing"
 _CLEANUP_DETAIL = "MQTT cleanup failed"
 
-_T = TypeVar("_T")
-
 _detached_cleanup_tasks: set[asyncio.Task[None]] = set()
+_detached_preflight_futures: set[asyncio.Future[None]] = set()
 
 
 class PreflightStage(str, Enum):
@@ -202,8 +201,20 @@ def _monotonic_ms() -> int:
     return round(time.monotonic() * 1_000)
 
 
-async def _wait_for(awaitable: Awaitable[_T], timeout: float) -> _T:
-    return await asyncio.wait_for(awaitable, timeout=timeout)
+async def _wait_for(awaitable: Awaitable[None], timeout: float) -> None:
+    """Apply a Python 3.10 timeout without ``wait_for`` cancellation races."""
+    operation = asyncio.ensure_future(awaitable)
+    try:
+        done, _ = await asyncio.wait({operation}, timeout=timeout)
+    except asyncio.CancelledError:
+        operation.cancel()
+        _track_detached_preflight_future(operation)
+        raise
+    if not done:
+        operation.cancel()
+        _track_detached_preflight_future(operation)
+        raise asyncio.TimeoutError
+    operation.result()
 
 
 async def _mqtt_operation(
@@ -220,6 +231,52 @@ async def _mqtt_operation(
         raise _Failure(stage, "mqtt_timeout", _TIMEOUT_DETAIL) from error
     except Exception as error:
         raise _Failure(stage, code, detail) from error
+
+
+async def _mqtt_operation_observing_inbound(
+    operation_stage: PreflightStage,
+    code: str,
+    detail: str,
+    operation: Callable[[], Awaitable[None]],
+    inbound_result: asyncio.Future[_InboundResult],
+    validation_stage: PreflightStage,
+) -> None:
+    """Await a broker acknowledgement while allowing malformed input to fail fast."""
+
+    async def run_operation() -> None:
+        await _mqtt_operation(operation_stage, code, detail, operation())
+
+    operation_task = asyncio.create_task(run_operation())
+    waitables = {
+        cast(asyncio.Future[object], operation_task),
+        cast(asyncio.Future[object], inbound_result),
+    }
+    try:
+        await asyncio.wait(
+            waitables,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if inbound_result.done():
+            result = inbound_result.result()
+            if result.code is not None:
+                if operation_task.done():
+                    _consume_future_result(operation_task)
+                else:
+                    operation_task.cancel()
+                    _track_detached_preflight_future(operation_task)
+                raise _Failure(
+                    validation_stage,
+                    result.code,
+                    result.detail or _PAYLOAD_DETAIL,
+                )
+        await asyncio.shield(operation_task)
+    except asyncio.CancelledError:
+        if operation_task.done():
+            _consume_future_result(operation_task)
+        else:
+            operation_task.cancel()
+            _track_detached_preflight_future(operation_task)
+        raise
 
 
 async def _run_stage(
@@ -284,7 +341,7 @@ async def _cleanup(
         try:
             action_task.result()
         except asyncio.CancelledError:
-            raise
+            failed = True
         except asyncio.TimeoutError:
             timed_out = True
         except Exception:
@@ -308,8 +365,23 @@ def _track_detached_cleanup_task(task: asyncio.Task[None]) -> None:
 
 def _consume_detached_cleanup_task(task: asyncio.Task[None]) -> None:
     _detached_cleanup_tasks.discard(task)
-    if not task.cancelled():
-        task.exception()
+    _consume_future_result(task)
+
+
+def _track_detached_preflight_future(future: asyncio.Future[None]) -> None:
+    """Keep canceled stage/broker work alive and consume its terminal state."""
+    _detached_preflight_futures.add(future)
+    future.add_done_callback(_consume_detached_preflight_future)
+
+
+def _consume_detached_preflight_future(future: asyncio.Future[None]) -> None:
+    _detached_preflight_futures.discard(future)
+    _consume_future_result(future)
+
+
+def _consume_future_result(future: asyncio.Future[None]) -> None:
+    if not future.cancelled():
+        future.exception()
 
 
 async def _run_cleanup_stage(
@@ -413,16 +485,18 @@ async def async_run_preflight(
             _SUBSCRIBE_DETAIL,
             mqtt.subscribe(topics.ha_to_panel),
         )
-        await _mqtt_operation(
+        await _mqtt_operation_observing_inbound(
             PreflightStage.PANEL_TO_HA,
             "mqtt_publish",
             _PUBLISH_DETAIL,
-            mqtt.publish(
+            lambda: mqtt.publish(
                 topics.panel_to_ha,
                 SetupRequest(request.setup_id, request.panel_nonce).to_payload(),
                 retain=False,
                 qos=1,
             ),
+            ha_result,
+            PreflightStage.HA_TO_PANEL,
         )
 
     async def ha_to_panel() -> None:
@@ -459,11 +533,13 @@ async def async_run_preflight(
         )
         retained_subscription_active = True
         subscribed.append(topics.retained)
-        await _mqtt_operation(
+        await _mqtt_operation_observing_inbound(
             PreflightStage.RETAINED_MESSAGE,
             "mqtt_subscribe",
             _SUBSCRIBE_DETAIL,
-            mqtt.subscribe(topics.retained),
+            lambda: mqtt.subscribe(topics.retained),
+            retained_result,
+            PreflightStage.RETAINED_MESSAGE,
         )
         result = await retained_result
         if result.code is not None:
