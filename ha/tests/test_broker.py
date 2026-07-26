@@ -6,6 +6,7 @@ import asyncio
 import copy
 import pickle
 import ssl
+import threading
 from collections.abc import AsyncIterator
 from dataclasses import FrozenInstanceError, asdict, dataclass
 from importlib.metadata import version
@@ -119,6 +120,17 @@ class _FailingLifecycleClient(_FakeAioClient):
         await super().__aexit__(exc_type, exc, traceback)
         if self._exit_error is not None:
             raise self._exit_error
+
+
+def _exception_chain(error: BaseException) -> list[BaseException]:
+    chain: list[BaseException] = []
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chain.append(current)
+        current = current.__cause__ or current.__context__
+    return chain
 
 
 @dataclass(slots=True)
@@ -607,7 +619,7 @@ async def test_context_closes_exactly_once_after_caller_cancellation() -> None:
         ),
     ],
 )
-async def test_context_entry_maps_broker_failures_and_closes_once(
+async def test_context_entry_maps_broker_failures_without_unowned_cleanup(
     raw_error: Exception,
     expected_code: str,
     expected_retryable: bool,
@@ -628,8 +640,8 @@ async def test_context_entry_maps_broker_failures_and_closes_once(
     assert caught.value.__context__ is None
     assert caught.value.__cause__ is None
     assert raw_client.enter_count == 1
-    assert raw_client.exit_count == 1
-    assert raw_client.exit_types == [type(raw_error)]
+    assert raw_client.exit_count == 0
+    assert raw_client.exit_types == []
     for secret in (
         "mqtt.secret.example",
         "password-secret",
@@ -666,6 +678,52 @@ async def test_real_aiomqtt_wrapped_connect_error_maps_without_message_parsing()
 
 
 @pytest.mark.asyncio
+async def test_cancelling_real_aiomqtt_blocked_connect_never_disconnects_concurrently() -> None:
+    profile = BrokerProfile.from_mapping(_profile_data())
+    connect_started = threading.Event()
+    release_connect = threading.Event()
+    connect_finished = threading.Event()
+    disconnect_attempted = threading.Event()
+
+    def blocked_connect(_client: aiomqtt.Client) -> None:
+        connect_started.set()
+        release_connect.wait(timeout=5)
+        connect_finished.set()
+
+    def reject_concurrent_disconnect(*_args: object, **_kwargs: object) -> None:
+        disconnect_attempted.set()
+        raise RuntimeError("disconnect raced blocked connect")
+
+    async def enter_client() -> None:
+        async with profile.device_client("blocked-connect-cancellation"):
+            pytest.fail("a cancelled entry must not yield a client")
+
+    with (
+        patch.object(
+            aiomqtt.Client,
+            "_client_connect",
+            autospec=True,
+            side_effect=blocked_connect,
+        ),
+        patch(
+            "paho.mqtt.client.Client.disconnect",
+            autospec=True,
+            side_effect=reject_concurrent_disconnect,
+        ),
+    ):
+        task = asyncio.create_task(enter_client())
+        try:
+            assert await asyncio.to_thread(connect_started.wait, 1)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert not disconnect_attempted.is_set()
+        finally:
+            release_connect.set()
+            assert await asyncio.to_thread(connect_finished.wait, 1)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "control_error",
     [
@@ -674,7 +732,7 @@ async def test_real_aiomqtt_wrapped_connect_error_maps_without_message_parsing()
         SystemExit("system-exit-secret"),
     ],
 )
-async def test_context_entry_preserves_control_exceptions_after_one_cleanup(
+async def test_context_entry_preserves_control_exceptions_without_unowned_cleanup(
     control_error: BaseException,
 ) -> None:
     raw_client = _FailingLifecycleClient(enter_error=control_error)
@@ -689,12 +747,12 @@ async def test_context_entry_preserves_control_exceptions_after_one_cleanup(
 
     assert caught.value is control_error
     assert raw_client.enter_count == 1
-    assert raw_client.exit_count == 1
-    assert raw_client.exit_types == [type(control_error)]
+    assert raw_client.exit_count == 0
+    assert raw_client.exit_types == []
 
 
 @pytest.mark.asyncio
-async def test_entry_failure_preserves_primary_and_attaches_cleanup_failure() -> None:
+async def test_entry_failure_never_invokes_exit_owned_only_by_successful_entry() -> None:
     raw_client = _FailingLifecycleClient(
         enter_error=MqttConnectError(4),
         exit_error=RuntimeError("cleanup-password-secret"),
@@ -710,12 +768,10 @@ async def test_entry_failure_preserves_primary_and_attaches_cleanup_failure() ->
 
     assert caught.value.stage is OperationStage.FLEET_AUTH
     assert caught.value.code == "broker_authentication_failed"
-    assert caught.value.cleanup_error is not None
-    assert caught.value.cleanup_error.stage is OperationStage.CLEANUP
-    assert caught.value.cleanup_error.code == "cleanup_failed"
+    assert caught.value.cleanup_error is None
     assert caught.value.__context__ is None
     assert caught.value.__cause__ is None
-    assert raw_client.exit_count == 1
+    assert raw_client.exit_count == 0
     assert "cleanup-password-secret" not in repr(caught.value)
     assert "cleanup-password-secret" not in repr(caught.value.redacted_dict())
 
@@ -830,13 +886,41 @@ def test_tls_construction_failure_maps_to_redacted_invalid_profile() -> None:
         profile.device_client("tls-error")
 
     assert caught.value.code == "invalid_broker_profile"
-    assert CA_PEM not in str(caught.value)
-    assert PASSWORD not in repr(caught.value)
+    assert caught.value.__context__ is None
+    assert caught.value.__cause__ is None
+    assert _exception_chain(caught.value) == [caught.value]
+    chain_surface = repr(_exception_chain(caught.value))
+    assert CA_PEM not in chain_surface
+    assert PASSWORD not in chain_surface
+
+
+def test_aiomqtt_construction_failure_has_no_raw_exception_chain() -> None:
+    profile = BrokerProfile.from_mapping(_profile_data())
+    constructor_secret = "constructor-password-secret"
+
+    with (
+        patch(
+            "custom_components.brilliant_mqtt.broker.aiomqtt.Client",
+            side_effect=RuntimeError(constructor_secret),
+        ),
+        pytest.raises(OperationError) as caught,
+    ):
+        profile.device_client("constructor-error")
+
+    assert caught.value.code == "invalid_broker_profile"
+    assert caught.value.__context__ is None
+    assert caught.value.__cause__ is None
+    assert _exception_chain(caught.value) == [caught.value]
+    assert constructor_secret not in repr(_exception_chain(caught.value))
 
 
 @pytest.mark.parametrize("client_id", ["", "   ", 123, True])
 def test_invalid_client_id_maps_to_stable_profile_error(client_id: object) -> None:
     profile = BrokerProfile.from_mapping(_profile_data())
 
-    with pytest.raises(OperationError, match="invalid_broker_profile"):
+    with pytest.raises(OperationError, match="invalid_broker_profile") as caught:
         profile.device_client(client_id)  # type: ignore[arg-type]
+
+    assert caught.value.__context__ is None
+    assert caught.value.__cause__ is None
+    assert _exception_chain(caught.value) == [caught.value]

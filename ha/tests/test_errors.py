@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import socket
 import ssl
-import traceback
 from dataclasses import FrozenInstanceError
 from typing import cast
 
@@ -233,22 +232,23 @@ def test_nested_cleanup_error_remains_fully_redacted() -> None:
     _assert_secret_free(combined)
 
 
-def test_raising_mapped_error_suppresses_secret_bearing_exception_context() -> None:
-    captured: OperationError | None = None
-    rendered_traceback = ""
+def test_from_exception_is_a_chain_free_classifier_for_deferred_raising() -> None:
+    mapped: OperationError | None = None
     try:
         raise RuntimeError("mqtt-user-secret mqtt-password-secret mqtt.secret.example nonce-secret")
     except RuntimeError as raw_error:
-        try:
-            raise from_exception(OperationStage.FLEET_AUTH, raw_error)
-        except OperationError as mapped:
-            captured = mapped
-            rendered_traceback = "".join(traceback.format_exception(mapped))
+        mapped = from_exception(OperationStage.FLEET_AUTH, raw_error)
 
-    assert captured is not None
-    assert captured.__suppress_context__ is True
-    for secret in SECRET_VALUES:
-        assert secret not in rendered_traceback
+    assert mapped is not None
+    assert mapped.__context__ is None
+    assert mapped.__cause__ is None
+    with pytest.raises(OperationError) as caught:
+        raise mapped
+
+    assert caught.value is mapped
+    assert caught.value.__context__ is None
+    assert caught.value.__cause__ is None
+    _assert_secret_free(caught.value)
 
 
 def test_operation_error_is_frozen() -> None:

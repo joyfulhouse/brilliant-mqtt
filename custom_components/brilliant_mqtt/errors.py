@@ -232,7 +232,12 @@ class OperationError(Exception):
 
 
 def from_exception(stage: OperationStage, error: BaseException) -> OperationError:
-    """Map an exception to stable metadata without retaining its text."""
+    """Classify an exception without retaining it or raising the mapped result.
+
+    Public boundaries must capture the raw failure, leave its exception handler,
+    and only then raise the returned error so Python cannot attach the raw
+    exception as implicit context.
+    """
     _validate_stage(stage)
     if isinstance(error, OperationError):
         return error

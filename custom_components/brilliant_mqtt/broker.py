@@ -301,6 +301,8 @@ class BrokerProfile(_BrokerSecrets):
         client_id: str,
     ) -> AbstractAsyncContextManager[DeviceMqttClient]:
         """Build one strict temporary MQTT 3.1.1 device-principal client."""
+        raw_client: aiomqtt.Client | None = None
+        construction_failed = False
         try:
             if not isinstance(client_id, str) or not client_id.strip():
                 raise ValueError
@@ -315,13 +317,14 @@ class BrokerProfile(_BrokerSecrets):
                 will=None,
                 tls_context=tls_context,
             )
-        except OperationError:
-            raise
         except Exception:
+            construction_failed = True
+        if construction_failed:
             raise OperationError.for_code(
                 OperationStage.BROKER_PROFILE,
                 "invalid_broker_profile",
             ) from None
+        assert raw_client is not None
         return _DeviceClientContext(raw_client)
 
     def _build_tls_context(self) -> ssl.SSLContext | None:
@@ -339,13 +342,11 @@ class BrokerProfile(_BrokerSecrets):
 class _DeviceClientContext(AbstractAsyncContextManager[DeviceMqttClient]):
     def __init__(self, raw_client: aiomqtt.Client) -> None:
         self._raw_client = raw_client
-        self._started = False
         self._entered = False
         self._closed = False
         self._client = _AioMqttDeviceClient(raw_client, self)
 
     async def __aenter__(self) -> DeviceMqttClient:
-        self._started = True
         try:
             await self._raw_client.__aenter__()
         except BaseException as error:
@@ -354,19 +355,10 @@ class _DeviceClientContext(AbstractAsyncContextManager[DeviceMqttClient]):
             self._entered = True
             return self._client
 
-        cleanup_error = await self._attempt_raw_exit(
-            type(entry_error),
-            entry_error,
-            entry_error.__traceback__,
-        )
         if not isinstance(entry_error, Exception):
             raise entry_error
-        if cleanup_error is not None and not isinstance(cleanup_error, Exception):
-            raise cleanup_error
 
         mapped = from_exception(OperationStage.FLEET_AUTH, entry_error)
-        if cleanup_error is not None:
-            mapped = mapped.with_cleanup_error(_cleanup_failure())
         raise mapped from None
 
     async def __aexit__(
@@ -404,7 +396,7 @@ class _DeviceClientContext(AbstractAsyncContextManager[DeviceMqttClient]):
         exc: BaseException | None,
         traceback: TracebackType | None,
     ) -> BaseException | None:
-        if not self._started or self._closed:
+        if not self._entered or self._closed:
             return None
         self._closed = True
         cleanup_error: BaseException | None
