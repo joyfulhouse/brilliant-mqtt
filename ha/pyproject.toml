@@ -25,7 +25,10 @@ testpaths = ["tests"]
 # repo root whether pytest runs from the root (-c ha/pyproject.toml → rootdir=ha)
 # or from inside ha/ (rootdir=ha) — both make ".." the repo root.
 pythonpath = [".."]
-markers = ["allow_lingering_timers: tolerate the core mqtt integration's recurring timer"]
+markers = [
+    "allow_lingering_timers: tolerate the core mqtt integration's recurring timer",
+    "mqtt_live: requires disposable externally provisioned MQTT brokers",
+]
 
 [tool.ruff]
 target-version = "py313"  # ruff has no py314 target yet; bump when ruff adds support
