@@ -65,19 +65,27 @@ addition to the panel's own site-packages it already exposes).
 
 The [MQTT broker prerequisite guide](../install/mqtt-broker.md) has the exact
 principal table, official source links, and stable remediation anchors for the
-onboarding validator. Validation proves authentication, both message
-directions, discovery write access, and retained-message behavior; it does not
-modify broker users, ACLs, or configuration.
+packaged validator. The current one-panel flow does not call it. The
+forthcoming Plan 2 fleet flow will prove authentication, both message
+directions, discovery write access, and retained-message behavior without
+modifying broker users, ACLs, or configuration.
 
 ## MQTT TLS
 
-The panel supports plaintext TCP (`MQTT_TLS_ENABLED=0`), strict TLS with its
-system/public CA store (`MQTT_TLS_ENABLED=1` with no CA file), and strict TLS
-with a custom public CA. For the custom-CA path, the integration uploads the
-exact CA bytes as mode `0644` to a content-addressed path below
-`/var/brilliant-mqtt/tls/`; the mode-`0600` environment stores only that path.
-Old CA files are not rewritten or deleted during staging, so an older
-environment snapshot can still reference its prior trust material.
+The panel agent supports plaintext TCP (`MQTT_TLS_ENABLED=0`), strict TLS with
+its system/public CA store (`MQTT_TLS_ENABLED=1` with no CA file), and strict
+TLS with a custom public CA for manual deployment. The integration package
+contains a future-flow helper that uploads exact CA bytes as mode `0644` to a
+content-addressed path below `/var/brilliant-mqtt/tls/`; the mode-`0600`
+environment stores only that path. Old CA files are not rewritten or deleted
+during staging, so an older environment snapshot can still reference its prior
+trust material.
+
+The current one-panel integration UI, adoption, reconfigure, repair, and update
+paths are not TLS-aware. They can discard manual TLS settings and regenerate
+the environment with `MQTT_TLS_ENABLED=0`; do not place a manually
+TLS-configured panel under that lifecycle management until Plan 2 wires the
+packaged seam throughout the fleet flow.
 
 TLS verifies both hostname and certificate chain and never falls back to
 plaintext. Anonymous access, insecure certificate bypass, mutual TLS, and MQTT

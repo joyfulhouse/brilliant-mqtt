@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import secrets
+
 import asyncssh
 import pytest
 
@@ -38,8 +42,19 @@ _FULL_INSPECT = RunResult(
     "unit=1\nenv=1\nenabled=1\nactive=1\nsunit=1\nsenv=1\npayload=1\n9.9.9\n",
     "",
 )
+_EXPECTED_ENV_MQTT_CA_PATH = "/var/brilliant-mqtt/tls/mqtt-ca-0fa6a631898df0f5.pem"
 _TEST_MQTT_CA = b"test-ca\n"
-_TEST_MQTT_CA_PATH = "/var/brilliant-mqtt/tls/mqtt-ca-0fa6a631898df0f5.pem"
+_TEST_MQTT_CA_DIGEST = hashlib.sha256(_TEST_MQTT_CA).hexdigest()
+_TEST_MQTT_CA_PATH = f"/var/brilliant-mqtt/tls/mqtt-ca-{_TEST_MQTT_CA_DIGEST[:16]}.pem"
+_TEMP_TOKEN = "0123456789abcdef0123456789abcdef"
+_TEST_MQTT_CA_TEMP_PATH = f"{_TEST_MQTT_CA_PATH}.tmp-{_TEMP_TOKEN}"
+_VERIFY_MQTT_CA_COMMAND = f"sha256sum {_TEST_MQTT_CA_TEMP_PATH}"
+_PROMOTE_MQTT_CA_COMMAND = f"ln {_TEST_MQTT_CA_TEMP_PATH} {_TEST_MQTT_CA_PATH}"
+_COMPARE_MQTT_CA_COMMAND = (
+    f"test -f {_TEST_MQTT_CA_PATH} && test ! -L {_TEST_MQTT_CA_PATH} "
+    f"&& cmp -s {_TEST_MQTT_CA_TEMP_PATH} {_TEST_MQTT_CA_PATH}"
+)
+_CLEAN_MQTT_CA_TEMP_COMMAND = f"rm -f {_TEST_MQTT_CA_TEMP_PATH}"
 
 
 async def _connected(shell: FakeShell) -> FakeShell:
@@ -130,11 +145,11 @@ def test_render_env_custom_tls_uses_only_content_addressed_ca_path() -> None:
         mqtt_username='fleet # "user"',
         mqtt_password='p#a"s\\word',
         mqtt_tls_enabled=True,
-        mqtt_tls_ca_file=_TEST_MQTT_CA_PATH,
+        mqtt_tls_ca_file=_EXPECTED_ENV_MQTT_CA_PATH,
     )
 
     assert "MQTT_TLS_ENABLED=1\n" in env
-    assert f"MQTT_TLS_CA_FILE={_TEST_MQTT_CA_PATH}\n" in env
+    assert f"MQTT_TLS_CA_FILE={_EXPECTED_ENV_MQTT_CA_PATH}\n" in env
     assert "RETAINED_TOPICS_FILE=/var/brilliant-mqtt/state/owned-topics.json\n" in env
     assert "test-ca" not in env
     assert "test-ca" not in repr(env)
@@ -177,7 +192,45 @@ def test_render_env_rejects_custom_ca_path_without_tls() -> None:
             mqtt_username="fleet",
             mqtt_password="password",
             mqtt_tls_enabled=False,
-            mqtt_tls_ca_file=_TEST_MQTT_CA_PATH,
+            mqtt_tls_ca_file=_EXPECTED_ENV_MQTT_CA_PATH,
+        )
+
+
+@pytest.mark.parametrize("tls_enabled", ["true", "false", 0, 1, None])
+def test_render_env_rejects_non_boolean_tls_flag(tls_enabled: object) -> None:
+    with pytest.raises(ValueError, match="invalid_mqtt_tls_enabled"):
+        panel_ops.render_env(
+            panel="office",
+            mesh_priority=1,
+            mqtt_host="broker.example",
+            mqtt_port=8883,
+            mqtt_username="fleet",
+            mqtt_password="password",
+            mqtt_tls_enabled=tls_enabled,  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize(
+    "ca_path",
+    [
+        "/var/brilliant-mqtt/tls/mqtt-ca-0fa6a631898df0f5.pem\nLD_PRELOAD=/tmp/evil.so",
+        "/tmp/mqtt-ca-0fa6a631898df0f5.pem",
+        "/var/brilliant-mqtt/tls/../mqtt-ca-0fa6a631898df0f5.pem",
+        "/var/brilliant-mqtt/tls/mqtt-ca-0FA6A631898DF0F5.pem",
+        "/var/brilliant-mqtt/tls/mqtt-ca-0fa6a631898df0f5.pem ",
+    ],
+)
+def test_render_env_rejects_unmanaged_or_injectable_ca_path(ca_path: str) -> None:
+    with pytest.raises(ValueError, match="invalid_mqtt_tls_ca_file"):
+        panel_ops.render_env(
+            panel="office",
+            mesh_priority=1,
+            mqtt_host="broker.example",
+            mqtt_port=8883,
+            mqtt_username="fleet",
+            mqtt_password="password",
+            mqtt_tls_enabled=True,
+            mqtt_tls_ca_file=ca_path,
         )
 
 
@@ -321,14 +374,278 @@ async def test_write_env_raises_when_mkdir_fails() -> None:
     assert shell.uploads == []
 
 
-async def test_stage_mqtt_ca_preserves_exact_bytes_and_public_mode() -> None:
-    shell = await _connected(FakeShell())
+async def test_stage_mqtt_ca_verifies_temp_then_promotes_without_writing_final(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(secrets, "token_hex", lambda length: _TEMP_TOKEN)
+    shell = await _connected(
+        FakeShell(
+            responses={
+                _VERIFY_MQTT_CA_COMMAND: RunResult(
+                    0,
+                    f"{_TEST_MQTT_CA_DIGEST}  {_TEST_MQTT_CA_TEMP_PATH}\n",
+                    "",
+                )
+            }
+        )
+    )
 
     path = await panel_ops.stage_mqtt_ca(shell, _TEST_MQTT_CA)
 
-    assert path == _TEST_MQTT_CA_PATH
-    assert shell.commands == ["mkdir -p /var/brilliant-mqtt/tls"]
-    assert shell.uploads == [(_TEST_MQTT_CA_PATH, _TEST_MQTT_CA, 0o644)]
+    assert path == _EXPECTED_ENV_MQTT_CA_PATH == _TEST_MQTT_CA_PATH
+    assert shell.commands == [
+        "mkdir -p /var/brilliant-mqtt/tls",
+        _VERIFY_MQTT_CA_COMMAND,
+        _PROMOTE_MQTT_CA_COMMAND,
+        _CLEAN_MQTT_CA_TEMP_COMMAND,
+    ]
+    assert shell.uploads == [(_TEST_MQTT_CA_TEMP_PATH, _TEST_MQTT_CA, 0o644)]
+    assert all(path != _TEST_MQTT_CA_PATH for path, _data, _mode in shell.uploads)
+
+
+async def test_stage_mqtt_ca_repeat_compares_existing_file_without_replacing_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(secrets, "token_hex", lambda length: _TEMP_TOKEN)
+    shell = await _connected(
+        FakeShell(
+            responses={
+                _VERIFY_MQTT_CA_COMMAND: RunResult(
+                    0,
+                    f"{_TEST_MQTT_CA_DIGEST}  {_TEST_MQTT_CA_TEMP_PATH}\n",
+                    "",
+                ),
+                _PROMOTE_MQTT_CA_COMMAND: RunResult(1, "", "File exists\n"),
+                _COMPARE_MQTT_CA_COMMAND: RunResult(0, "", ""),
+            }
+        )
+    )
+
+    assert await panel_ops.stage_mqtt_ca(shell, _TEST_MQTT_CA) == _TEST_MQTT_CA_PATH
+    assert shell.commands[-3:] == [
+        _PROMOTE_MQTT_CA_COMMAND,
+        _COMPARE_MQTT_CA_COMMAND,
+        _CLEAN_MQTT_CA_TEMP_COMMAND,
+    ]
+    assert shell.uploads == [(_TEST_MQTT_CA_TEMP_PATH, _TEST_MQTT_CA, 0o644)]
+
+
+async def test_stage_mqtt_ca_rejects_conflicting_existing_file_and_cleans_temp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(secrets, "token_hex", lambda length: _TEMP_TOKEN)
+    shell = await _connected(
+        FakeShell(
+            responses={
+                _VERIFY_MQTT_CA_COMMAND: RunResult(
+                    0,
+                    f"{_TEST_MQTT_CA_DIGEST}  {_TEST_MQTT_CA_TEMP_PATH}\n",
+                    "",
+                ),
+                _PROMOTE_MQTT_CA_COMMAND: RunResult(1, "", "File exists\n"),
+                _COMPARE_MQTT_CA_COMMAND: RunResult(1, "", ""),
+            }
+        )
+    )
+
+    with pytest.raises(panel_ops.PanelOpError, match="mqtt_ca_promotion_failed"):
+        await panel_ops.stage_mqtt_ca(shell, _TEST_MQTT_CA)
+
+    assert shell.commands[-1] == _CLEAN_MQTT_CA_TEMP_COMMAND
+    assert all(path != _TEST_MQTT_CA_PATH for path, _data, _mode in shell.uploads)
+
+
+async def test_stage_mqtt_ca_rejects_remote_digest_mismatch_before_promotion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(secrets, "token_hex", lambda length: _TEMP_TOKEN)
+    shell = await _connected(
+        FakeShell(
+            responses={
+                _VERIFY_MQTT_CA_COMMAND: RunResult(
+                    0,
+                    f"{'0' * 64}  {_TEST_MQTT_CA_TEMP_PATH}\n",
+                    "",
+                )
+            }
+        )
+    )
+
+    with pytest.raises(panel_ops.PanelOpError, match="mqtt_ca_verification_failed"):
+        await panel_ops.stage_mqtt_ca(shell, _TEST_MQTT_CA)
+
+    assert _PROMOTE_MQTT_CA_COMMAND not in shell.commands
+    assert shell.commands[-1] == _CLEAN_MQTT_CA_TEMP_COMMAND
+
+
+async def test_stage_mqtt_ca_rejects_missing_remote_digest_and_cleans_temp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(secrets, "token_hex", lambda length: _TEMP_TOKEN)
+    shell = await _connected(
+        FakeShell(
+            responses={
+                _VERIFY_MQTT_CA_COMMAND: RunResult(0, "", ""),
+            }
+        )
+    )
+
+    with pytest.raises(panel_ops.PanelOpError, match="mqtt_ca_verification_failed"):
+        await panel_ops.stage_mqtt_ca(shell, _TEST_MQTT_CA)
+
+    assert _PROMOTE_MQTT_CA_COMMAND not in shell.commands
+    assert shell.commands[-1] == _CLEAN_MQTT_CA_TEMP_COMMAND
+
+
+async def test_stage_mqtt_ca_interruption_cleans_only_its_unique_temp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(secrets, "token_hex", lambda length: _TEMP_TOKEN)
+    shell = await _connected(
+        FakeShell(run_errors={_VERIFY_MQTT_CA_COMMAND: ConnectionError("transport interrupted")})
+    )
+
+    with pytest.raises(ConnectionError, match="transport interrupted"):
+        await panel_ops.stage_mqtt_ca(shell, _TEST_MQTT_CA)
+
+    assert shell.commands[-1] == _CLEAN_MQTT_CA_TEMP_COMMAND
+    assert f"rm -f {_TEST_MQTT_CA_PATH}" not in shell.commands
+
+
+async def test_stage_mqtt_ca_cleanup_failure_does_not_replace_verification_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(secrets, "token_hex", lambda length: _TEMP_TOKEN)
+    shell = await _connected(
+        FakeShell(
+            responses={
+                _VERIFY_MQTT_CA_COMMAND: RunResult(
+                    0,
+                    f"{'0' * 64}  {_TEST_MQTT_CA_TEMP_PATH}\n",
+                    "",
+                ),
+                _CLEAN_MQTT_CA_TEMP_COMMAND: RunResult(1, "", "cleanup failed\n"),
+            }
+        )
+    )
+
+    with pytest.raises(
+        panel_ops.PanelOpError,
+        match="^mqtt_ca_verification_failed$",
+    ):
+        await panel_ops.stage_mqtt_ca(shell, _TEST_MQTT_CA)
+
+
+async def test_stage_mqtt_ca_new_cancellation_during_cleanup_wins_over_primary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(secrets, "token_hex", lambda length: _TEMP_TOKEN)
+    cleanup_entered = asyncio.Event()
+    cleanup_gate = asyncio.Event()
+
+    class BlockingCleanupShell(FakeShell):
+        async def run(self, command: str) -> RunResult:
+            if command == _CLEAN_MQTT_CA_TEMP_COMMAND:
+                self._require_connected()
+                self.commands.append(command)
+                cleanup_entered.set()
+                await cleanup_gate.wait()
+                return RunResult(0, "", "")
+            return await super().run(command)
+
+    shell = await _connected(
+        BlockingCleanupShell(
+            responses={
+                _VERIFY_MQTT_CA_COMMAND: RunResult(
+                    0,
+                    f"{'0' * 64}  {_TEST_MQTT_CA_TEMP_PATH}\n",
+                    "",
+                ),
+            }
+        )
+    )
+    task = asyncio.create_task(panel_ops.stage_mqtt_ca(shell, _TEST_MQTT_CA))
+    await asyncio.wait_for(cleanup_entered.wait(), timeout=1)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.parametrize(
+    "primary",
+    [ConnectionError("transport interrupted"), asyncio.CancelledError()],
+)
+async def test_stage_mqtt_ca_cleanup_failure_preserves_transport_or_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+    primary: BaseException,
+) -> None:
+    monkeypatch.setattr(secrets, "token_hex", lambda length: _TEMP_TOKEN)
+
+    class PrimaryFailureShell(FakeShell):
+        async def run(self, command: str) -> RunResult:
+            if command == _VERIFY_MQTT_CA_COMMAND:
+                self._require_connected()
+                self.commands.append(command)
+                raise primary
+            return await super().run(command)
+
+    shell = await _connected(
+        PrimaryFailureShell(
+            responses={
+                _CLEAN_MQTT_CA_TEMP_COMMAND: RunResult(1, "", "cleanup failed\n"),
+            },
+        )
+    )
+
+    with pytest.raises(type(primary)) as caught:
+        await panel_ops.stage_mqtt_ca(shell, _TEST_MQTT_CA)
+
+    assert caught.value is primary
+
+
+async def test_stage_mqtt_ca_success_surfaces_temp_cleanup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(secrets, "token_hex", lambda length: _TEMP_TOKEN)
+    shell = await _connected(
+        FakeShell(
+            responses={
+                _VERIFY_MQTT_CA_COMMAND: RunResult(
+                    0,
+                    f"{_TEST_MQTT_CA_DIGEST}  {_TEST_MQTT_CA_TEMP_PATH}\n",
+                    "",
+                ),
+                _CLEAN_MQTT_CA_TEMP_COMMAND: RunResult(1, "", "cleanup failed\n"),
+            }
+        )
+    )
+
+    with pytest.raises(panel_ops.PanelOpError, match="exited 1"):
+        await panel_ops.stage_mqtt_ca(shell, _TEST_MQTT_CA)
+
+
+@pytest.mark.parametrize(
+    "ca_bytes",
+    [
+        None,
+        "",
+        bytearray(_TEST_MQTT_CA),
+        b"",
+        b"-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----\n",
+        _TEST_MQTT_CA + b"-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----\n",
+    ],
+)
+async def test_stage_mqtt_ca_rejects_invalid_or_private_material_before_shell(
+    ca_bytes: object,
+) -> None:
+    shell = await _connected(FakeShell())
+
+    with pytest.raises(ValueError, match="invalid_mqtt_tls_ca"):
+        await panel_ops.stage_mqtt_ca(shell, ca_bytes)  # type: ignore[arg-type]
+
+    assert shell.commands == []
+    assert shell.uploads == []
 
 
 async def test_stage_mqtt_ca_mkdir_failure_prevents_upload() -> None:

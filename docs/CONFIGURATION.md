@@ -2,8 +2,9 @@
 
 Full configuration reference for brilliant-mqtt.
 
-> **Status:** implemented and verified live on a pilot panel — this contract
-> is enforced by the test suite (`config.py`).
+> **Status:** the panel-agent environment contract is implemented and enforced
+> by the `config.py` test suite. Home Assistant lifecycle support varies by
+> setting; the MQTT TLS limitation is called out below.
 
 ## Runtime configuration (environment)
 
@@ -27,13 +28,13 @@ configuration management; keep credentials out of git).
 
 ### MQTT transport security
 
-The HA integration renders one of three supported profiles:
+The panel agent accepts three profiles for manual deployment:
 
 - **Plaintext:** `MQTT_TLS_ENABLED=0`, with no CA file.
 - **TLS using public/system CAs:** `MQTT_TLS_ENABLED=1`, with no CA file.
 - **TLS using a custom CA:** `MQTT_TLS_ENABLED=1`, with
-  `MQTT_TLS_CA_FILE` pointing to an immutable, content-addressed public CA
-  staged below `/var/brilliant-mqtt/tls/`.
+  `MQTT_TLS_CA_FILE` pointing to public CA material staged below
+  `/var/brilliant-mqtt/tls/`.
 
 TLS always verifies the certificate chain and broker hostname. It never falls
 back to plaintext or an insecure context. The entered hostname must match the
@@ -42,6 +43,13 @@ clock must be correct. Anonymous MQTT, ignored certificate validation, mutual
 TLS client certificates, and MQTT over WebSockets are unsupported by the panel
 transport in this release. See the
 [broker prerequisite guide](install/mqtt-broker.md#transport-security).
+
+The integration package contains content-addressed CA staging for the
+forthcoming Plan 2 fleet flow, but the current one-panel UI does not expose
+TLS. Adoption does not preserve manual TLS values, and current reconfigure,
+repair, and update paths regenerate this environment with
+`MQTT_TLS_ENABLED=0`. Keep a manually TLS-configured panel under manual
+lifecycle management until the fleet flow wires TLS through those paths.
 
 ### Polling and watchdog timers
 
@@ -417,8 +425,9 @@ Use the official Home Assistant Mosquitto Broker app/add-on
 remote, or hosted broker reachable by both Home Assistant and the panels. The
 broker guide documents both paths and the required
 [authentication](install/mqtt-broker.md#mqtt-broker-authentication). The
-integration validates the supplied configuration; it never creates users,
-changes ACLs, or manages the broker.
+current one-panel flow does not call `BrokerValidator`; the forthcoming Plan 2
+fleet flow will validate the supplied configuration. The integration never
+creates users, changes ACLs, or manages the broker.
 
 For an external broker, configure both principals:
 
@@ -440,8 +449,9 @@ topic write homeassistant/#
 - `homeassistant/#` lets the panel publish MQTT Discovery.
 - Home Assistant's narrow
   `homeassistant/brilliant_mqtt_setup/+/probe` write permission lets validation
-  independently clear its temporary discovery probe after a device-side
-  disconnect. It is cleanup access, not general discovery publishing.
+  independently clear its temporary discovery probe when the forthcoming
+  fleet flow uses the packaged validator. It is cleanup access, not general
+  discovery publishing.
 
 **Mosquitto ACL denials are silent.** A publish to a denied topic is dropped
 with no error to the client. If entities never appear or commands are silently
@@ -449,8 +459,8 @@ swallowed, check the ACL first — it is the most common cause.
 
 MQTT Discovery is fixed at `homeassistant` in this release. Keep Home
 Assistant's effective discovery prefix at that value. For provisioning, TLS,
-retained-message requirements, end-to-end onboarding validation, and direct
-links for every validation error, see the
+retained-message requirements, forthcoming fleet-onboarding validation, and
+direct links for every validation error, see the
 [MQTT broker prerequisite](install/mqtt-broker.md).
 
 ---

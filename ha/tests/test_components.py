@@ -17,6 +17,19 @@ from custom_components.brilliant_mqtt.const import (
 )
 from tests.fakes import FakeShell
 
+_VALID_MQTT_CA_PEM = """-----BEGIN CERTIFICATE-----
+MIIBfTCCASOgAwIBAgIUdPxf3XpyWhlomBsnOw4v6PnRbEwwCgYIKoZIzj0EAwIw
+FDESMBAGA1UEAwwJY2EtYS10ZXN0MB4XDTI2MDcxODIzMDQyMFoXDTM2MDcxNTIz
+MDQyMFowFDESMBAGA1UEAwwJY2EtYS10ZXN0MFkwEwYHKoZIzj0CAQYIKoZIzj0D
+AQcDQgAELbHkjdm57Utb7nuP+u68qOg+5DtLm3J3BkkLthx4TSYFkD02O8STczCH
+/eykkJrKVd90Zn4NlnnwPHh1TqXBKaNTMFEwHQYDVR0OBBYEFHI1jyb/yVM80rJa
+pCrwjLltX/JzMB8GA1UdIwQYMBaAFHI1jyb/yVM80rJapCrwjLltX/JzMA8GA1Ud
+EwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDSAAwRQIhALuIYO82yKVgMuFSWB70ALJE
+UZ0KQhgbgLS5gw+Rh6xeAiBu0CzhNXZ6QO4blinurR+/lGd5m1qRG/RuKanWrWOo
+Jw==
+-----END CERTIFICATE-----
+"""
+
 
 def test_component_id_constants() -> None:
     assert const.CONF_COMPONENTS == "components"
@@ -169,11 +182,11 @@ async def test_bridge_install_stages_custom_ca_before_payload_and_uses_returned_
     await comp._bridge_install(
         hass,
         shell,
-        _bridge_data(tls_enabled=True, ca_pem="test-ca\n"),
+        _bridge_data(tls_enabled=True, ca_pem=_VALID_MQTT_CA_PEM),
     )
 
     assert events == ["stage_ca", "deploy", "config", "enable"]
-    assert staged_bytes == [b"test-ca\n"]
+    assert staged_bytes == [_VALID_MQTT_CA_PEM.encode()]
     assert len(rendered_env) == 1
     parsed = panel_ops.parse_env(rendered_env[0])
     assert parsed["MQTT_TLS_ENABLED"] == "1"
@@ -252,7 +265,67 @@ async def test_bridge_install_ca_stage_failure_blocks_panel_deployment(
         await comp._bridge_install(
             hass,
             shell,
-            _bridge_data(tls_enabled=True, ca_pem="test-ca\n"),
+            _bridge_data(tls_enabled=True, ca_pem=_VALID_MQTT_CA_PEM),
         )
 
     assert downstream_calls == []
+
+
+@pytest.mark.parametrize(
+    ("tls_enabled", "ca_value"),
+    [
+        ("true", None),
+        (1, None),
+        (None, None),
+        (True, ""),
+        (True, "not a certificate"),
+        (
+            True,
+            "-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----\n",
+        ),
+        (True, 42),
+        (False, _VALID_MQTT_CA_PEM),
+    ],
+)
+async def test_bridge_install_rejects_invalid_tls_before_any_panel_mutation(
+    hass: HomeAssistant,
+    payload_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tls_enabled: object,
+    ca_value: object,
+) -> None:
+    del payload_dir
+    calls: list[str] = []
+
+    async def stage_mqtt_ca(shell: Any, ca_bytes: bytes) -> str:
+        calls.append("stage")
+        return "/var/brilliant-mqtt/tls/mqtt-ca-0fa6a631898df0f5.pem"
+
+    async def deploy_payload(shell: Any, local_payload_dir: str, version: str) -> None:
+        calls.append("deploy")
+
+    async def ensure_configs(shell: Any, unit: str, env: str) -> None:
+        calls.append("config")
+
+    async def enable_now(shell: Any) -> None:
+        calls.append("enable")
+
+    monkeypatch.setattr(panel_ops, "stage_mqtt_ca", stage_mqtt_ca)
+    monkeypatch.setattr(panel_ops, "deploy_payload", deploy_payload)
+    monkeypatch.setattr(panel_ops, "ensure_configs", ensure_configs)
+    monkeypatch.setattr(panel_ops, "enable_now", enable_now)
+
+    data = _bridge_data(tls_enabled=False)
+    data[const.CONF_MQTT_TLS_ENABLED] = tls_enabled
+    if ca_value is not None or tls_enabled is True:
+        data[const.CONF_MQTT_TLS_CA] = ca_value
+
+    shell = FakeShell()
+    await shell.connect()
+    with pytest.raises(ValueError, match="invalid_mqtt_tls"):
+        await comp._bridge_install(hass, shell, data)
+
+    assert calls == []
+    assert shell.commands == []
+    assert shell.uploads == []
+    assert shell.dir_uploads == []

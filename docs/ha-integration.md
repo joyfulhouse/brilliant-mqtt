@@ -66,17 +66,27 @@ For either path:
 - enter a LAN hostname/IP and TCP port the panels can resolve and reach (an
   internal app hostname may work only inside Home Assistant); and
 - keep Home Assistant's effective MQTT Discovery prefix fixed at
-  `homeassistant` (otherwise validation returns
-  `unsupported_discovery_prefix`).
+  `homeassistant` for current agent compatibility.
 
-The integration validates authentication, both message directions, discovery
-write access, retained-message behavior, and cleanup. It does not install or
-start `core_mosquitto`, create accounts, edit ACLs, or modify broker
-configuration. Plaintext TCP, strict system/public-CA TLS, and strict custom-CA
-TLS are supported; TLS verifies hostname and certificate chain and never falls
-back to plaintext. See the
+The current one-panel flow does **not** call the packaged `BrokerValidator`; it
+can install the agent and create an entry without checking authentication,
+message directions, discovery write access, retained behavior, or cleanup. The
+forthcoming Plan 2 fleet-onboarding flow will perform those checks and return
+`unsupported_discovery_prefix` when the prefix differs. The integration never
+installs or starts `core_mosquitto`, creates accounts, edits ACLs, or modifies
+broker configuration.
+
+The panel agent supports plaintext TCP, strict system/public-CA TLS, and strict
+custom-CA TLS for manual deployment, and the integration package contains the
+CA-staging seam for the future fleet flow. The current one-panel broker form
+does not expose TLS; adoption does not retain manual TLS values; and current
+reconfigure, repair, and update paths regenerate the environment as plaintext
+(`MQTT_TLS_ENABLED=0`). Do not use the current HA lifecycle flow to manage a
+manually TLS-configured panel because it may overwrite that TLS environment.
+See the
 [MQTT broker prerequisite](install/mqtt-broker.md) for both setup paths, the
-exact two-principal ACL table, and direct explanations for validation errors.
+exact two-principal ACL table, transport warning, and the forthcoming
+validation-error contract.
 
 ## Onboarding a panel
 
@@ -90,16 +100,18 @@ on whether the agent is already installed on the panel:
 | **3. Panel settings** | Set Panel Name (e.g. "Office Bath" → slug `office-bath`) and Mesh priority (`MESH_PRIORITY`: 0 = never lead; 1 = primary; 2/3 = standbys). Optionally enable **Voice satellite** (see [Voice satellite](#voice-satellite)). On submit: agent is installed over SSH, then entry is created. | _Skipped_ — name + mesh priority + broker are adopted verbatim from the running agent. Panel is left untouched. |
 | **Result** | Agent installed; panel entities fill in after first MQTT publish. | Panel adopted; entry created immediately. |
 
-**Validation or install failure:** no entry is created. MQTT errors link to a
-stable [cause/check/fix/retry section](install/mqtt-broker.md#mqtt-validation);
-SSH install failures keep step 3 open with `cannot_install`. Fix the reported
-prerequisite and retry.
+**Current install failure:** SSH install failures keep step 3 open with
+`cannot_install`, and no entry is created. The current flow does not perform
+end-to-end MQTT validation. The forthcoming fleet flow will block entry
+creation and link MQTT failures to a stable
+[cause/check/fix/retry section](install/mqtt-broker.md#mqtt-validation).
 
 **Adopting a hand-deployed panel:** onboarding reads `BRILLIANT_PANEL` from the
 live env file and adopts it verbatim. Set it to a lowercase slug
 (`^[a-z0-9_-]+$`) before adding — a non-slug or the reserved value `mesh` is
 refused (`cannot_read_config`). See [INSTALL.md](../INSTALL.md) for manual
-deploy steps.
+deploy steps. Do not adopt a manually TLS-configured panel in the current flow;
+the TLS settings are not preserved for later lifecycle operations.
 
 **Slug is immutable** after creation (rename = remove + re-add).
 
@@ -108,6 +120,8 @@ later — it re-validates over SSH and pushes the change to the panel. If the ho
 is unchanged, the new password is verified against the **stored** host key (key
 checked before auth), so rotating a password can't silently accept a swapped
 key. If the host changes, a fresh TOFU connect re-pins to the new host.
+Reconfigure verifies SSH, not the MQTT path, and is not TLS-aware in the current
+one-panel flow.
 
 Behavior knobs are under **Configure** (Options).
 

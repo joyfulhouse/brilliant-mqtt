@@ -7,6 +7,7 @@ one REGISTRY row (+ its panel_ops recipes).
 
 from __future__ import annotations
 
+import ssl
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -61,16 +62,37 @@ async def _bridge_present(shell: PanelShell) -> bool:
     return (await panel_ops.inspect_panel(shell)).payload_present
 
 
+def _validated_mqtt_tls(data: Mapping[str, Any]) -> tuple[bool, bytes | None]:
+    """Return strict TLS inputs before any panel-side mutation is attempted."""
+    tls_enabled = data.get(CONF_MQTT_TLS_ENABLED, False)
+    if type(tls_enabled) is not bool:
+        raise ValueError("invalid_mqtt_tls_configuration")
+
+    ca_pem = data.get(CONF_MQTT_TLS_CA)
+    if ca_pem is None:
+        return tls_enabled, None
+    if (
+        not isinstance(ca_pem, str)
+        or not ca_pem
+        or not tls_enabled
+        or "PRIVATE KEY" in ca_pem.upper()
+    ):
+        raise ValueError("invalid_mqtt_tls_configuration")
+
+    try:
+        ssl.create_default_context(cadata=ca_pem)
+    except (ssl.SSLError, ValueError):
+        raise ValueError("invalid_mqtt_tls_configuration") from None
+    return tls_enabled, ca_pem.encode()
+
+
 async def _bridge_install(hass: HomeAssistant, shell: PanelShell, data: Mapping[str, Any]) -> None:
+    mqtt_tls_enabled, mqtt_tls_ca = _validated_mqtt_tls(data)
     payload_dir = _mgr._payload_dir()
     unit = await hass.async_add_executor_job((payload_dir / "brilliant-mqtt.service").read_text)
     version = (await hass.async_add_executor_job((payload_dir / "VERSION").read_text)).strip()
-    mqtt_tls_enabled = data.get(CONF_MQTT_TLS_ENABLED, False) is True
-    mqtt_tls_ca = data.get(CONF_MQTT_TLS_CA)
-    if mqtt_tls_ca and not mqtt_tls_enabled:
-        raise ValueError("mqtt_tls_ca_requires_tls")
     mqtt_tls_ca_file = (
-        await panel_ops.stage_mqtt_ca(shell, mqtt_tls_ca.encode()) if mqtt_tls_ca else None
+        await panel_ops.stage_mqtt_ca(shell, mqtt_tls_ca) if mqtt_tls_ca is not None else None
     )
     env = panel_ops.render_env(
         panel=data[CONF_PANEL],

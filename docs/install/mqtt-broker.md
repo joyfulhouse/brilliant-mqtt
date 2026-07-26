@@ -10,8 +10,11 @@ Choose either path below:
    compatible local, remote, or hosted service.
 
 The integration does not install or start a broker, create users, edit ACLs, or
-change broker configuration. Onboarding validates the settings you provide and
-gives a specific error if the end-to-end MQTT path does not work.
+change broker configuration. The current one-panel setup flow also does **not**
+call the packaged `BrokerValidator`: it can install the agent and create an
+entry without proving the MQTT path. The forthcoming Plan 2 fleet-onboarding
+flow will use that validator to check the settings you provide and return a
+specific error when the end-to-end MQTT path does not work.
 
 Primary references:
 
@@ -46,7 +49,7 @@ the [existing broker](#existing-broker) path instead.
 
 An existing Mosquitto-compatible broker may be on the LAN, another network, or
 a hosted service. It is not a second-class or advanced-only option. Before
-onboarding:
+using the current one-panel setup or the forthcoming fleet-onboarding flow:
 
 1. Configure Home Assistant's MQTT integration to use that broker.
 2. Confirm the endpoint is reachable from Home Assistant and from the panels'
@@ -55,6 +58,37 @@ onboarding:
    panel client, retained messages, and wildcard subscriptions.
 4. Create a dedicated Brilliant fleet username/password and configure both
    principals in the ACL table below.
+
+<a id="mqtt-broker-profile"></a>
+## Broker profile troubleshooting
+
+The forthcoming fleet validator reports an invalid broker profile before it
+opens a connection. The current one-panel UI performs only basic host, port,
+username, and password form validation.
+
+- **Cause:** A required broker value is missing, the port or TLS flag has the
+  wrong type or range, or custom CA content is empty or invalid.
+- **Check:** Recheck the hostname, TCP port, username/password, TLS selection,
+  and complete public CA certificate. Do not paste a private key.
+- **Fix:** Correct the profile and use a custom CA only with TLS enabled.
+- **Retry:** Verify the corrected values manually today; retry the validator
+  when using the forthcoming fleet-onboarding flow.
+
+<a id="mqtt-broker-connect"></a>
+## Broker connection troubleshooting
+
+Connection, timeout, unavailable, and broker-rejected errors share this
+remediation target.
+
+- **Cause:** DNS, routing, firewall, listener, or broker availability prevents
+  the client from completing a connection, or the broker rejects the selected
+  protocol/settings.
+- **Check:** Resolve the entered hostname from the relevant network, test the
+  exact TCP port, inspect broker logs, and confirm MQTT 3.1.1 and MQTT 5
+  support.
+- **Fix:** Correct DNS/routing/firewall/listener settings or restore the broker.
+- **Retry:** Reconnect both Home Assistant and the panel path, then retry the
+  manual check or forthcoming fleet validation.
 
 <a id="mqtt-broker-authentication"></a>
 ## Authentication
@@ -88,8 +122,8 @@ Do not replace Home Assistant's existing permissions with only the rows above.
 The official Mosquitto app normally owns the internal Home Assistant
 principal. If you enable a custom ACL there, preserve the app's documented
 permissions for its reserved internal principals. The narrow setup-probe write
-rule lets Home Assistant independently clear the validator's temporary
-discovery probe if the Brilliant client disconnects before cleanup; it does not
+rule lets Home Assistant independently clear the packaged validator's
+temporary discovery probe when the forthcoming fleet flow uses it; it does not
 grant general discovery publishing.
 
 Mosquitto can silently drop an unauthorized publish. A timeout may therefore
@@ -100,43 +134,67 @@ mean an ACL or routing error even when login succeeded.
 
 This release publishes discovery only below the fixed `homeassistant` prefix.
 In Home Assistant's MQTT integration, keep discovery enabled and its Discovery
-Prefix set to `homeassistant`. A different prefix stops onboarding with
-`unsupported_discovery_prefix`; it is not copied into the panel configuration.
+Prefix set to `homeassistant`. The forthcoming fleet flow will stop with
+`unsupported_discovery_prefix` when that differs; the current one-panel flow
+does not check the effective prefix.
 
 <a id="mqtt-retained-messages"></a>
 ## Retained-message requirement
 
 The broker must preserve the MQTT retained flag and retained payloads. The
-bridge uses retained discovery, state, availability, and setup probes so
-Home Assistant recovers immediately after a restart. Proxies or hosted-broker
-rules must not rewrite or discard retained messages.
+bridge uses retained discovery, state, and availability so Home Assistant
+recovers immediately after a restart; the forthcoming fleet validator also
+uses retained setup probes. Proxies or hosted-broker rules must not rewrite or
+discard retained messages.
 
+<a id="mqtt-broker-tls"></a>
 ## Transport security
 
-All three supported TCP profiles still require a username and password:
+The panel agent supports all three TCP profiles below for manual deployment;
+each still requires a username and password:
 
 | Profile | Panel environment | Use when |
 |---|---|---|
 | Plaintext TCP | `MQTT_TLS_ENABLED=0`; no CA file | A trusted, isolated LAN where unencrypted MQTT is an accepted risk |
 | TLS with public/system CA | `MQTT_TLS_ENABLED=1`; no CA file | The broker certificate chains to a CA in the panel's system trust store |
-| TLS with custom CA | `MQTT_TLS_ENABLED=1`; `MQTT_TLS_CA_FILE` points to the integration-staged public CA | A private CA signs the broker certificate |
+| TLS with custom CA | `MQTT_TLS_ENABLED=1`; `MQTT_TLS_CA_FILE` points to a manually staged public CA today or a future integration-staged CA | A private CA signs the broker certificate |
 
 TLS is strict: the panel verifies both the certificate chain and the broker
 hostname. Use a DNS name present in the certificate, or a certificate valid for
 the entered IP address, and keep panel time correct. A TLS failure never falls
 back to plaintext or disables verification. The custom CA is public trust
-material; the integration stages its exact bytes in a content-addressed file
-under `/var/brilliant-mqtt/tls/` and stores only that path in the protected
-environment file.
+material. The packaged integration contains a content-addressed CA staging seam
+for the forthcoming fleet flow, but the current one-panel UI does not expose
+TLS or a custom-CA field.
+
+> **Current integration limitation:** adoption does not retain manual
+> `MQTT_TLS_ENABLED`/`MQTT_TLS_CA_FILE` values, and current reconfigure,
+> repair, and update paths regenerate the environment as plaintext
+> (`MQTT_TLS_ENABLED=0`). Do not use the current HA lifecycle flow to manage a
+> manually TLS-configured panel; it may overwrite that panel's TLS environment.
+> Keep managing the TLS environment manually until Plan 2 fleet onboarding
+> wires the packaged staging seam through adoption and lifecycle operations.
 
 Anonymous MQTT, insecure/ignore-certificate TLS, mutual TLS client
 certificates, and MQTT over WebSockets are unsupported by the Brilliant panel
 transport in this release.
 
-<a id="mqtt-validation"></a>
-## Onboarding validation
+- **Cause:** The future validator cannot verify the broker certificate chain or
+  hostname, or the panel cannot use the selected trust store.
+- **Check:** Confirm the entered hostname/IP is present in the certificate,
+  inspect the full chain and validity period, verify panel time, and confirm the
+  selected public/custom CA is correct.
+- **Fix:** Correct the endpoint name, server certificate chain, panel time, or
+  CA. Never disable verification.
+- **Retry:** Verify TLS manually today; retry the validator when using the
+  forthcoming fleet-onboarding flow.
 
-Onboarding checks behavior rather than only opening a socket. It verifies that:
+<a id="mqtt-validation"></a>
+## Forthcoming fleet-onboarding validation
+
+The packaged `BrokerValidator` is not called by the current one-panel setup
+flow. Plan 2 fleet onboarding will call it before creating a fleet entry and
+will check behavior rather than only opening a socket. It will verify that:
 
 - Home Assistant's MQTT client is loaded, connected, and using the
   `homeassistant` discovery prefix;
@@ -147,13 +205,15 @@ Onboarding checks behavior rather than only opening a socket. It verifies that:
 - retained messages arrive unchanged with the retained flag; and
 - all temporary subscriptions and retained probes are cleaned up.
 
-Validation never creates or modifies a broker account, ACL, app/add-on, or
-broker setting. Fix the reported prerequisite and use **Retry**.
+The validator never creates or modifies a broker account, ACL, app/add-on, or
+broker setting. Until the fleet flow is wired, perform these checks manually;
+the stable error contract below documents the future **Retry** path.
 
 ## Validation errors
 
-Each error below has a stable anchor so the integration can link directly to
-the matching cause, check, fix, and retry instructions.
+Each error below has a stable anchor so the forthcoming fleet flow can link
+directly to the matching cause, check, fix, and retry instructions. The checks
+and fixes are also useful for diagnosing the current one-panel flow manually.
 
 <a id="ha_mqtt_unavailable"></a>
 ### `ha_mqtt_unavailable`
@@ -164,7 +224,8 @@ the matching cause, check, fix, and retry instructions.
   connection status and broker endpoint.
 - **Fix:** Install/reload MQTT, start the broker, and make Home Assistant use
   the same broker intended for the panels.
-- **Retry:** Return to Brilliant MQTT onboarding and select **Retry**.
+- **Retry:** In the forthcoming fleet flow, return to Brilliant MQTT
+  onboarding and select **Retry**.
 
 <a id="unsupported_discovery_prefix"></a>
 ### `unsupported_discovery_prefix`
@@ -173,7 +234,7 @@ the matching cause, check, fix, and retry instructions.
   `homeassistant`.
 - **Check:** Open the MQTT integration's discovery options.
 - **Fix:** Enable discovery and restore the prefix to `homeassistant`.
-- **Retry:** Reload MQTT if requested, then retry onboarding.
+- **Retry:** Reload MQTT if requested, then retry forthcoming fleet onboarding.
 
 <a id="fleet_auth_failed"></a>
 ### `fleet_auth_failed`
@@ -183,7 +244,8 @@ the matching cause, check, fix, and retry instructions.
   current; inspect the broker authentication log.
 - **Fix:** Correct or rotate the dedicated credential without substituting
   Home Assistant's hidden credential.
-- **Retry:** Enter the corrected password and retry validation.
+- **Retry:** Enter the corrected password and retry forthcoming fleet
+  validation.
 
 <a id="panel_to_ha_timeout"></a>
 ### `panel_to_ha_timeout`
@@ -194,7 +256,8 @@ the matching cause, check, fix, and retry instructions.
   Assistant can read `brilliant/#`.
 - **Fix:** Correct the broker endpoint, routing, or Home Assistant principal's
   read ACL.
-- **Retry:** Retry after Home Assistant has reconnected.
+- **Retry:** Retry forthcoming fleet validation after Home Assistant has
+  reconnected.
 
 <a id="ha_to_panel_timeout"></a>
 ### `ha_to_panel_timeout`
@@ -204,7 +267,7 @@ the matching cause, check, fix, and retry instructions.
 - **Check:** Confirm Home Assistant can write `brilliant/#` and the Brilliant
   principal can read it.
 - **Fix:** Correct those ACL directions and any broker/proxy routing rule.
-- **Retry:** Retry validation after both clients reconnect.
+- **Retry:** Retry forthcoming fleet validation after both clients reconnect.
 
 <a id="discovery_write_denied"></a>
 ### `discovery_write_denied`
@@ -216,7 +279,8 @@ the matching cause, check, fix, and retry instructions.
   `homeassistant/#`, plus broker-side authorization logs.
 - **Fix:** Grant the Brilliant principal write access to
   `homeassistant/#`; keep the fixed discovery prefix.
-- **Retry:** Reload the broker ACL if required, reconnect, and retry.
+- **Retry:** Reload the broker ACL if required, reconnect, and retry forthcoming
+  fleet validation.
 
 <a id="retained_message_invalid"></a>
 ### `retained_message_invalid`
@@ -227,7 +291,8 @@ the matching cause, check, fix, and retry instructions.
   rule, or hosted-service policy that rewrites or clears retained traffic.
 - **Fix:** Enable unmodified retained messages and ensure both clients use the
   same broker path.
-- **Retry:** Clear any test rule/cache involved, then retry validation.
+- **Retry:** Clear any test rule/cache involved, then retry forthcoming fleet
+  validation.
 
 <a id="mqtt-validation-cleanup"></a>
 <a id="cleanup_failed"></a>
@@ -239,6 +304,7 @@ the matching cause, check, fix, and retry instructions.
   topic directions.
 - **Fix:** Restore the broker connection and permissions. Setup IDs are unique,
   but retained probes should still be cleared.
-- **Retry:** Retry validation; cleanup is attempted independently on every run.
+- **Retry:** Retry forthcoming fleet validation; cleanup is attempted
+  independently on every run.
 
 Back to the [install overview](../../INSTALL.md).

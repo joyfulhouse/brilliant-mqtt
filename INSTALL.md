@@ -42,10 +42,20 @@ Whichever path you choose:
 - use a LAN hostname/IP and TCP port every panel can resolve and reach; and
 - keep Home Assistant's MQTT Discovery prefix set to `homeassistant`.
 
-The Brilliant integration validates authentication, both message directions,
-discovery ACL, and retained messages. It does not install the app, discover
-Home Assistant's hidden MQTT credential, or create/modify broker users, ACLs,
-or configuration.
+The current one-panel integration flow does not call the packaged
+`BrokerValidator`; verify authentication, both message directions, discovery
+ACL, and retained messages yourself before deployment. The forthcoming Plan 2
+fleet-onboarding flow will run those checks. Neither flow installs the app,
+discovers Home Assistant's hidden MQTT credential, or creates/modifies broker
+users, ACLs, or configuration.
+
+Strict TLS is available to manually managed panel-agent deployments, and the
+integration package contains the CA-staging seam for the future fleet flow. The
+current one-panel UI, adoption, reconfigure, repair, and update paths are not
+TLS-aware and may rewrite a manually configured TLS environment with
+`MQTT_TLS_ENABLED=0`. Do not use the current HA lifecycle flow to manage a
+manual TLS panel; see the
+[transport-security warning](docs/install/mqtt-broker.md#transport-security).
 
 ## Step 3 — Deploy the agent to a panel
 

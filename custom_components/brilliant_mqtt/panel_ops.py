@@ -11,6 +11,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import re
+import secrets
 from dataclasses import dataclass
 
 import asyncssh
@@ -61,6 +63,8 @@ _VOICE_STAGED_ENV = f"{PANEL_VOICE_STAGED_DIR}/{VOICE_SERVICE_NAME}.env"
 
 _HA_MIRROR_STAGING_DIR = f"{PANEL_HA_MIRROR_APP_DIR}.staging"
 _HA_MIRROR_STAGED_ENV = f"{PANEL_HA_MIRROR_STAGED_DIR}/{HA_MIRROR_SERVICE_NAME}.env"
+
+_MANAGED_MQTT_CA_PATH = re.compile(rf"{re.escape(PANEL_MQTT_TLS_DIR)}/mqtt-ca-[0-9a-f]{{16}}\.pem")
 
 
 class PanelOpError(RuntimeError):
@@ -178,8 +182,15 @@ def render_env(
     String values are quoted via _env_quote (user-typed broker passwords routinely
     contain `#`, quotes, `$`, backslash); the int fields are safe and stay bare.
     """
+    if type(mqtt_tls_enabled) is not bool:
+        raise ValueError("invalid_mqtt_tls_enabled")
     if mqtt_tls_ca_file and not mqtt_tls_enabled:
         raise ValueError("mqtt_tls_ca_file_requires_tls")
+    if mqtt_tls_ca_file is not None and (
+        not isinstance(mqtt_tls_ca_file, str)
+        or _MANAGED_MQTT_CA_PATH.fullmatch(mqtt_tls_ca_file) is None
+    ):
+        raise ValueError("invalid_mqtt_tls_ca_file")
 
     broker_env = (
         f"{ENV_PANEL}={_env_quote(panel)}\n"
@@ -260,11 +271,45 @@ async def write_env(shell: PanelShell, env_content: str) -> None:
 
 
 async def stage_mqtt_ca(shell: PanelShell, ca_bytes: bytes) -> str:
-    """Upload an immutable custom MQTT CA and return its content-addressed path."""
+    """Verify and atomically install an immutable, content-addressed MQTT CA."""
+    if type(ca_bytes) is not bytes or not ca_bytes or b"PRIVATE KEY" in ca_bytes.upper():
+        raise ValueError("invalid_mqtt_tls_ca")
+
+    digest = hashlib.sha256(ca_bytes).hexdigest()
+    remote_path = f"{PANEL_MQTT_TLS_DIR}/mqtt-ca-{digest[:16]}.pem"
+    temp_path = f"{remote_path}.tmp-{secrets.token_hex(16)}"
     await _checked(shell, f"mkdir -p {PANEL_MQTT_TLS_DIR}")
-    digest = hashlib.sha256(ca_bytes).hexdigest()[:16]
-    remote_path = f"{PANEL_MQTT_TLS_DIR}/mqtt-ca-{digest}.pem"
-    await shell.put_bytes(ca_bytes, remote_path, 0o644)
+    try:
+        # put_bytes may truncate its target, so it is restricted to a unique
+        # temporary path. The content-addressed final is never opened for write.
+        await shell.put_bytes(ca_bytes, temp_path, 0o644)
+        remote_digest = await _checked(shell, f"sha256sum {temp_path}")
+        remote_fields = remote_digest.stdout.split(maxsplit=1)
+        if not remote_fields or remote_fields[0] != digest:
+            raise PanelOpError("mqtt_ca_verification_failed")
+
+        # A hard link is an atomic no-replace promotion on the persistent
+        # filesystem. If another run already installed this short-hash path,
+        # accept it only when the complete bytes match and it is not a symlink.
+        promoted = await shell.run(f"ln {temp_path} {remote_path}")
+        if promoted.exit_status != 0:
+            existing = await shell.run(
+                f"test -f {remote_path} && test ! -L {remote_path} "
+                f"&& cmp -s {temp_path} {remote_path}"
+            )
+            if existing.exit_status != 0:
+                raise PanelOpError("mqtt_ca_promotion_failed")
+    except BaseException:
+        # Cleanup is best-effort after a primary failure. Never replace a
+        # verification/transport/process-control outcome with a later rm error.
+        try:
+            await _checked(shell, f"rm -f {temp_path}")
+        except Exception:
+            pass
+        raise
+
+    # A successful install is not reported while its staging file remains.
+    await _checked(shell, f"rm -f {temp_path}")
     return remote_path
 
 
