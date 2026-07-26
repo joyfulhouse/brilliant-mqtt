@@ -296,6 +296,8 @@ class _FakeDeviceClient(DeviceMqttClient):
     incoming: asyncio.Queue[DeviceMqttMessage] = field(default_factory=asyncio.Queue)
     subscriptions: set[str] = field(default_factory=set)
     disconnect_count: int = 0
+    subscribe_errors: dict[str, BaseException] = field(default_factory=dict)
+    subscribe_blockers: set[str] = field(default_factory=set)
     publish_errors: dict[str, BaseException] = field(default_factory=dict)
     clear_errors: dict[str, BaseException] = field(default_factory=dict)
     clear_blockers: set[str] = field(default_factory=set)
@@ -315,6 +317,10 @@ class _FakeDeviceClient(DeviceMqttClient):
     async def subscribe(self, topic: str, qos: int = 0) -> None:
         self.events.append(("device_subscribe", topic, qos))
         self.subscriptions.add(topic)
+        if topic in self.subscribe_errors:
+            raise self.subscribe_errors[topic]
+        if topic in self.subscribe_blockers:
+            await asyncio.Event().wait()
 
     async def publish(
         self,
@@ -1166,6 +1172,90 @@ async def test_early_stage_deadlines_are_strict_and_stable(
     if stage is OperationStage.FLEET_AUTH:
         assert factory.contexts[0].client.disconnect_count == 0
         assert factory.contexts[0].exit_count == 0
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_subscribe_side_effect_before_ack_is_explicitly_unsubscribed(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mqtt_entry(hass)
+    seam = _FakeHaMqtt()
+    seam.install(monkeypatch)
+    topics = SetupTopics.for_id(SETUP_ID)
+
+    def configure(context: _FakeDeviceContext) -> None:
+        context.client.subscribe_blockers.add(topics.ha_to_panel)
+        context.client.disconnect_error = RuntimeError("SECRET-DISCONNECT-AFTER-SUBSCRIBE")
+
+    factory = _FakeDeviceFactory(
+        seam,
+        seam.events,
+        configure_context=configure,
+    )
+    baseline_tasks = {task for task in asyncio.all_tasks() if task is not asyncio.current_task()}
+
+    with pytest.raises(OperationError) as raised:
+        await BrokerValidator(hass, factory, 0.01).async_validate(
+            _profile(),
+            setup_id=SETUP_ID,
+        )
+    await asyncio.sleep(0)
+
+    error = raised.value
+    assert error.stage is OperationStage.HA_TO_PANEL
+    assert error.code == "ha_to_panel_timeout"
+    assert error.cleanup_error is not None
+    assert error.cleanup_error.stage is OperationStage.CLEANUP
+    assert error.cleanup_error.code == "cleanup_failed"
+    context = factory.contexts[0]
+    assert seam.events.count(("device_unsubscribe", topics.ha_to_panel)) == 1
+    assert context.client.subscriptions == set()
+    assert context.client.disconnect_count == 1
+    assert context.exit_count == 1
+    assert {
+        task
+        for task in asyncio.all_tasks()
+        if task is not asyncio.current_task() and task not in baseline_tasks and not task.done()
+    } == set()
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_immediate_subscribe_failure_keeps_primary_and_cleans_intent_once(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mqtt_entry(hass)
+    seam = _FakeHaMqtt()
+    seam.install(monkeypatch)
+    topics = SetupTopics.for_id(SETUP_ID)
+
+    def configure(context: _FakeDeviceContext) -> None:
+        context.client.subscribe_errors[topics.ha_to_panel] = RuntimeError(
+            "SECRET-IMMEDIATE-SUBSCRIBE-FAILURE"
+        )
+
+    factory = _FakeDeviceFactory(
+        seam,
+        seam.events,
+        configure_context=configure,
+    )
+
+    with pytest.raises(OperationError) as raised:
+        await BrokerValidator(hass, factory, 0.02).async_validate(
+            _profile(),
+            setup_id=SETUP_ID,
+        )
+
+    error = raised.value
+    assert error.stage is OperationStage.HA_TO_PANEL
+    assert error.code == "ha_to_panel_timeout"
+    assert error.cleanup_error is None
+    context = factory.contexts[0]
+    assert seam.events.count(("device_unsubscribe", topics.ha_to_panel)) == 1
+    assert context.client.subscriptions == set()
+    assert context.client.disconnect_count == 1
+    assert context.exit_count == 1
 
 
 @pytest.mark.usefixtures("enable_custom_integrations")

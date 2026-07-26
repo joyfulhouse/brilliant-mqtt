@@ -345,8 +345,8 @@ class BrokerValidator:
     ) -> None:
         assert state.device is not None
         assert state.device_messages is not None
-        await state.device.subscribe(state.topics.ha_to_panel, qos=1)
         state.device_subscriptions.append(state.topics.ha_to_panel)
+        await state.device.subscribe(state.topics.ha_to_panel, qos=1)
         await mqtt.async_publish(
             self.hass,
             state.topics.ha_to_panel,
