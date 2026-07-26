@@ -70,6 +70,43 @@ async def test_missing_ledger_loads_empty_without_creating_a_file(tmp_path: Path
             setattr(ledger, attribute, value)
 
 
+@pytest.mark.parametrize(
+    "panel_slug",
+    [
+        "a" * 64,
+        "panel_" + ("z" * 250),
+    ],
+    ids=["64-characters", "current-flow-long"],
+)
+async def test_current_flow_canonical_slugs_have_no_hidden_ledger_length_limit(
+    tmp_path: Path,
+    panel_slug: str,
+) -> None:
+    path = tmp_path / "owned-topics.json"
+    ledger = RetainedTopicLedger(panel_slug, path)
+    mqtt = FakeMqtt()
+    topic = f"brilliant/{panel_slug}/availability"
+    expected_manifest = json.dumps(
+        {
+            "panel_slug": panel_slug,
+            "schema_version": 1,
+            "topics": [topic],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+    await ledger.async_load()
+    await ledger.async_publish(mqtt, topic, "online")
+
+    assert ledger.ownership_topic == f"brilliant/{panel_slug}/ownership"
+    assert mqtt.published == [
+        (ledger.ownership_topic, expected_manifest, True),
+        (topic, "online", True),
+    ]
+    assert mqtt.published_qos == [1, 0]
+
+
 async def test_valid_ledger_reloads_all_permitted_topic_families(tmp_path: Path) -> None:
     topics = [
         "brilliant/kitchen/availability",

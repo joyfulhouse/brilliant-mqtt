@@ -25,7 +25,7 @@ MAX_TOPICS = 4_096
 MAX_MANIFEST_BYTES = 256 * 1024
 
 _MANIFEST_KEYS = frozenset({"schema_version", "panel_slug", "topics"})
-_PANEL_PATTERN = re.compile(r"[a-z0-9][a-z0-9_-]{0,62}")
+_PANEL_PATTERN = re.compile(r"[a-z0-9][a-z0-9_-]*")
 
 
 class RetainedLedgerError(RuntimeError):

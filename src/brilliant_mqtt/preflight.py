@@ -201,18 +201,29 @@ def _monotonic_ms() -> int:
     return round(time.monotonic() * 1_000)
 
 
-async def _wait_for(awaitable: Awaitable[None], timeout: float) -> None:
+async def _wait_for(
+    awaitable: Awaitable[None],
+    timeout: float,
+    *,
+    settle_on_cancel: bool = False,
+) -> None:
     """Apply a Python 3.10 timeout without ``wait_for`` cancellation races."""
     operation = asyncio.ensure_future(awaitable)
     try:
         done, _ = await asyncio.wait({operation}, timeout=timeout)
     except asyncio.CancelledError:
         operation.cancel()
-        _track_detached_preflight_future(operation)
+        if settle_on_cancel:
+            await _settle_cancelled_preflight_future(operation)
+        else:
+            _track_detached_preflight_future(operation)
         raise
     if not done:
         operation.cancel()
-        _track_detached_preflight_future(operation)
+        if settle_on_cancel:
+            await _settle_cancelled_preflight_future(operation)
+        else:
+            _track_detached_preflight_future(operation)
         raise asyncio.TimeoutError
     operation.result()
 
@@ -285,10 +296,16 @@ async def _run_stage(
     timeout_seconds: float,
     completed: list[PreflightStage],
     elapsed: dict[PreflightStage, int],
+    *,
+    settle_on_cancel: bool = False,
 ) -> None:
     started = _monotonic_ms()
     try:
-        await _wait_for(operation(), timeout_seconds)
+        await _wait_for(
+            operation(),
+            timeout_seconds,
+            settle_on_cancel=settle_on_cancel,
+        )
     except asyncio.CancelledError:
         raise
     except asyncio.TimeoutError as error:
@@ -382,6 +399,21 @@ def _consume_detached_preflight_future(future: asyncio.Future[None]) -> None:
 def _consume_future_result(future: asyncio.Future[None]) -> None:
     if not future.cancelled():
         future.exception()
+
+
+async def _settle_cancelled_preflight_future(future: asyncio.Future[None]) -> None:
+    """Settle connect work after cancellation without changing its primary result."""
+    while not future.done():
+        try:
+            await asyncio.shield(future)
+        except asyncio.CancelledError:
+            if future.done():
+                break
+        except BaseException:
+            break
+        else:
+            break
+    _consume_future_result(future)
 
 
 async def _run_cleanup_stage(
@@ -557,6 +589,7 @@ async def async_run_preflight(
                 request.timeout_seconds,
                 completed,
                 elapsed,
+                settle_on_cancel=True,
             )
             await _run_stage(
                 PreflightStage.PANEL_TO_HA,

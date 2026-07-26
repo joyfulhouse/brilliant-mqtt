@@ -383,6 +383,31 @@ def test_profile_equality_includes_all_hidden_connection_material() -> None:
         assert secret not in surfaces
 
 
+def test_profile_equality_supports_equal_and_unequal_unicode_credentials() -> None:
+    unicode_credentials = _profile_data(
+        mqtt_username="brýån-用户",
+        mqtt_password="påssword-🔒",
+    )
+    profile = BrokerProfile.from_mapping(unicode_credentials)
+    equal_profile = BrokerProfile.from_mapping(unicode_credentials)
+    different_username = BrokerProfile.from_mapping(
+        {
+            **unicode_credentials,
+            "mqtt_username": "brýån-別",
+        }
+    )
+    different_password = BrokerProfile.from_mapping(
+        {
+            **unicode_credentials,
+            "mqtt_password": "påssword-🔓",
+        }
+    )
+
+    assert profile == equal_profile
+    assert profile != different_username
+    assert profile != different_password
+
+
 def test_profile_copy_is_safe_and_serialization_is_rejected_without_secrets() -> None:
     profile = BrokerProfile.from_mapping(_profile_data(mqtt_tls_enabled=True, mqtt_tls_ca=CA_PEM))
 

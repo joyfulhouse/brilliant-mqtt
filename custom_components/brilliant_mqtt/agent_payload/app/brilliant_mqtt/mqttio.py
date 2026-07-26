@@ -90,6 +90,8 @@ class AioMqttAdapter:
         self._publish_availability = publish_availability
         self._checked_disconnect = checked_disconnect
         self._redacted_logging = redacted_logging
+        self._entered = False
+        self._closed = False
 
         # Last-Will-and-Testament: the broker publishes this retained "offline"
         # if we drop without a clean disconnect, so HA marks the panel offline.
@@ -110,7 +112,18 @@ class AioMqttAdapter:
 
     async def connect(self) -> None:
         """Open the broker connection and start the message reader task."""
-        await self._client.__aenter__()
+        entry_task = asyncio.create_task(
+            self._attempt_raw_enter(),
+            name="brilliant-mqtt-enter",
+        )
+        entry_error, cancellation = await _settle_lifecycle_task(entry_task)
+        if entry_error is None:
+            self._entered = True
+        if cancellation is not None:
+            raise cancellation from None
+        if entry_error is not None:
+            raise entry_error
+
         self._reader_task = asyncio.create_task(self._read_loop())
         if self._redacted_logging:
             logger.info("connected temporary MQTT client")
@@ -120,6 +133,13 @@ class AioMqttAdapter:
                 self._settings.mqtt_host,
                 self._settings.mqtt_port,
             )
+
+    async def _attempt_raw_enter(self) -> BaseException | None:
+        try:
+            await self._client.__aenter__()
+        except BaseException as error:
+            return error
+        return None
 
     async def _read_loop(self) -> None:
         """Dispatch inbound messages to every registered command callback.
@@ -206,6 +226,9 @@ class AioMqttAdapter:
         default remains best-effort; checked mode finishes every close step and
         then raises one generic error if any step failed.
         """
+        if not self._entered or self._closed:
+            return
+
         failed = False
         if self._publish_availability:
             try:
@@ -235,12 +258,15 @@ class AioMqttAdapter:
         if self._checked_disconnect:
 
             async def close_checked() -> bool:
+                self._closed = True
                 try:
                     await self._client.__aexit__(None, None, None)
                 except asyncio.CancelledError:
                     return False
                 except Exception:
                     return False
+                finally:
+                    self._entered = False
                 return True
 
             if self._reader_task is not None:
@@ -286,9 +312,12 @@ class AioMqttAdapter:
                 finally:
                     self._reader_task = None
             try:
+                self._closed = True
                 await self._client.__aexit__(None, None, None)
             except Exception:
                 logger.exception("failed closing MQTT client")
+            finally:
+                self._entered = False
 
         if failed:
             raise RuntimeError(_DISCONNECT_ERROR) from None
@@ -327,3 +356,22 @@ def _decode_payload(payload: object) -> str:
     if isinstance(payload, (bytes, bytearray)):
         return bytes(payload).decode("utf-8")
     return str(payload)
+
+
+async def _settle_lifecycle_task(
+    task: asyncio.Task[BaseException | None],
+) -> tuple[BaseException | None, asyncio.CancelledError | None]:
+    """Wait for raw MQTT entry without cancelling its executor-backed work."""
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            lifecycle_error = await asyncio.shield(task)
+        except asyncio.CancelledError as error:
+            if task.cancelled():
+                return error, cancellation
+            if cancellation is None:
+                cancellation = error
+            continue
+        except BaseException as error:
+            return error, cancellation
+        return lifecycle_error, cancellation

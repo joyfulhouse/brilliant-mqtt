@@ -178,6 +178,7 @@ async def test_checked_redacted_disconnect_finishes_reader_and_client_close(
         checked_disconnect=True,
         redacted_logging=True,
     )
+    adapter._entered = True
 
     async def fail_reader() -> None:
         raise RuntimeError(raw_reader_error)
@@ -211,6 +212,7 @@ async def test_checked_disconnect_maps_reader_only_failure_to_generic_redacted_e
         checked_disconnect=True,
         redacted_logging=True,
     )
+    adapter._entered = True
 
     async def fail_reader_during_cancellation() -> None:
         try:
@@ -239,6 +241,7 @@ async def test_default_disconnect_remains_best_effort(
         _settings(tls_enabled=False),
         publish_availability=False,
     )
+    adapter._entered = True
 
     await adapter.disconnect()
 
@@ -259,6 +262,7 @@ async def test_checked_disconnect_maps_internal_close_cancellation_to_generic_fa
         checked_disconnect=True,
         redacted_logging=True,
     )
+    adapter._entered = True
 
     with pytest.raises(RuntimeError, match=r"^MQTT disconnect failed$") as raised:
         await adapter.disconnect()
@@ -277,6 +281,7 @@ async def test_default_disconnect_preserves_internal_close_cancellation(
         _settings(tls_enabled=False),
         publish_availability=False,
     )
+    adapter._entered = True
 
     with pytest.raises(asyncio.CancelledError):
         await adapter.disconnect()
@@ -295,6 +300,7 @@ async def test_checked_disconnect_propagates_caller_cancellation(
         checked_disconnect=True,
         redacted_logging=True,
     )
+    adapter._entered = True
     disconnect_task = asyncio.create_task(adapter.disconnect())
     await asyncio.wait_for(client.close_started.wait(), timeout=0.1)
 
@@ -316,6 +322,7 @@ async def test_checked_disconnect_propagates_caller_cancellation_during_reader_t
         checked_disconnect=True,
         redacted_logging=True,
     )
+    adapter._entered = True
     reader_cleanup_started = asyncio.Event()
     release_reader_cleanup = asyncio.Event()
 

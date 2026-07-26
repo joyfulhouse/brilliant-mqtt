@@ -94,8 +94,8 @@ class _SensitiveText:
 
     def __eq__(self, other: object) -> bool:
         return isinstance(other, _SensitiveText) and hmac.compare_digest(
-            self.__value,
-            other.__value,
+            self.__value.encode("utf-8"),
+            other.__value.encode("utf-8"),
         )
 
     __hash__ = None  # type: ignore[assignment]

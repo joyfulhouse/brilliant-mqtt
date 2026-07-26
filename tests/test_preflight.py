@@ -8,6 +8,7 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path
 from typing import Any
@@ -311,6 +312,51 @@ class _ConcretePreflightClient:
         self.unsubscriptions.append(topic)
 
 
+class _ThreadDelayedEntryPreflightClient(_ConcretePreflightClient):
+    """Production-shaped raw client with executor-backed connection entry."""
+
+    def __init__(
+        self,
+        request: PreflightRequest,
+        *,
+        enter_error: BaseException | None = None,
+    ) -> None:
+        super().__init__(request, None)
+        self._enter_error = enter_error
+        self._loop = asyncio.get_running_loop()
+        self._release_enter_worker = threading.Event()
+        self.enter_worker_started = asyncio.Event()
+        self.enter_worker_finished = asyncio.Event()
+        self.enter_worker_active = False
+        self.enter_succeeded = False
+        self.exit_while_enter_active = False
+        self.exit_after_successful_enter = False
+
+    def _enter_worker(self) -> None:
+        self.enter_worker_active = True
+        self._loop.call_soon_threadsafe(self.enter_worker_started.set)
+        try:
+            self._release_enter_worker.wait()
+            if self._enter_error is not None:
+                raise self._enter_error
+            self.enter_succeeded = True
+        finally:
+            self.enter_worker_active = False
+            self._loop.call_soon_threadsafe(self.enter_worker_finished.set)
+
+    async def __aenter__(self) -> _ThreadDelayedEntryPreflightClient:
+        await asyncio.to_thread(self._enter_worker)
+        return self
+
+    async def __aexit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.exit_while_enter_active |= self.enter_worker_active
+        self.exit_after_successful_enter |= self.enter_succeeded
+        await super().__aexit__(exc_type, exc, traceback)
+
+    def release_enter_worker(self) -> None:
+        self._release_enter_worker.set()
+
+
 class _CloseDependentReaderPreflightClient(_ConcretePreflightClient):
     """Concrete client whose reader can finish only after client close starts."""
 
@@ -396,6 +442,110 @@ class _AckRacePreflightClient(_ConcretePreflightClient):
     async def unsubscribe(self, topic: str) -> None:
         self.operations.append(("unsubscribe", topic))
         await super().unsubscribe(topic)
+
+
+async def test_fleet_auth_timeout_settles_successful_raw_entry_before_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings()
+    request = _request(timeout_seconds=0.01)
+    client = _ThreadDelayedEntryPreflightClient(request)
+    monkeypatch.setattr(aiomqtt, "Client", lambda **kwargs: client)
+    monkeypatch.setattr(mqttio, "build_tls_context", lambda received: None)
+    preflight_task = asyncio.create_task(async_run_preflight(settings, request))
+
+    try:
+        await asyncio.wait_for(client.enter_worker_started.wait(), timeout=0.2)
+        done_while_enter_active, _ = await asyncio.wait({preflight_task}, timeout=0.05)
+        returned_while_enter_active = bool(done_while_enter_active)
+        exit_raced_enter = client.exit_while_enter_active
+    finally:
+        client.release_enter_worker()
+
+    await asyncio.wait_for(client.enter_worker_finished.wait(), timeout=0.2)
+    report = await asyncio.wait_for(preflight_task, timeout=0.2)
+
+    assert returned_while_enter_active is False
+    assert exit_raced_enter is False
+    assert report.success is False
+    assert report.failed_stage is PreflightStage.FLEET_AUTH
+    assert report.error_code == "mqtt_timeout"
+    assert client.enter_succeeded is True
+    assert client.exit_attempts == 1
+    assert client.exit_after_successful_enter is True
+    assert client.exit_while_enter_active is False
+    assert client.enter_worker_active is False
+
+
+async def test_fleet_auth_timeout_settles_failed_raw_entry_without_exit(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    settings = _settings()
+    request = _request(timeout_seconds=0.01)
+    raw_error = "delayed raw entry failure password=must-not-leak"
+    client = _ThreadDelayedEntryPreflightClient(
+        request,
+        enter_error=RuntimeError(raw_error),
+    )
+    monkeypatch.setattr(aiomqtt, "Client", lambda **kwargs: client)
+    monkeypatch.setattr(mqttio, "build_tls_context", lambda received: None)
+    preflight_task = asyncio.create_task(async_run_preflight(settings, request))
+
+    try:
+        await asyncio.wait_for(client.enter_worker_started.wait(), timeout=0.2)
+        done_while_enter_active, _ = await asyncio.wait({preflight_task}, timeout=0.05)
+        returned_while_enter_active = bool(done_while_enter_active)
+        exit_raced_enter = client.exit_while_enter_active
+    finally:
+        client.release_enter_worker()
+
+    await asyncio.wait_for(client.enter_worker_finished.wait(), timeout=0.2)
+    report = await asyncio.wait_for(preflight_task, timeout=0.2)
+
+    assert returned_while_enter_active is False
+    assert exit_raced_enter is False
+    assert report.success is False
+    assert report.failed_stage is PreflightStage.FLEET_AUTH
+    assert report.error_code == "mqtt_timeout"
+    assert client.enter_succeeded is False
+    assert client.exit_attempts == 0
+    assert client.exit_while_enter_active is False
+    assert client.enter_worker_active is False
+    assert raw_error not in report.to_json()
+    assert raw_error not in caplog.text
+
+
+async def test_caller_cancellation_settles_successful_raw_entry_before_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings()
+    request = _request(timeout_seconds=1.0)
+    client = _ThreadDelayedEntryPreflightClient(request)
+    monkeypatch.setattr(aiomqtt, "Client", lambda **kwargs: client)
+    monkeypatch.setattr(mqttio, "build_tls_context", lambda received: None)
+    preflight_task = asyncio.create_task(async_run_preflight(settings, request))
+
+    try:
+        await asyncio.wait_for(client.enter_worker_started.wait(), timeout=0.2)
+        preflight_task.cancel()
+        done_while_enter_active, _ = await asyncio.wait({preflight_task}, timeout=0.05)
+        returned_while_enter_active = bool(done_while_enter_active)
+        exit_raced_enter = client.exit_while_enter_active
+    finally:
+        client.release_enter_worker()
+
+    await asyncio.wait_for(client.enter_worker_finished.wait(), timeout=0.2)
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(preflight_task, timeout=0.2)
+
+    assert returned_while_enter_active is False
+    assert exit_raced_enter is False
+    assert client.enter_succeeded is True
+    assert client.exit_attempts == 1
+    assert client.exit_after_successful_enter is True
+    assert client.exit_while_enter_active is False
+    assert client.enter_worker_active is False
 
 
 async def test_checked_disconnect_closes_before_draining_close_dependent_reader(
@@ -1059,11 +1209,16 @@ async def test_protocol_stages_use_request_timeout_and_cleanup_owns_its_budget(
     request = _request(timeout_seconds=0.01)
     mqtt = _successful_mqtt(request)
     topics = SetupTopics.for_id(request.setup_id)
-    timeouts: list[float] = []
+    timeouts: list[tuple[float, bool]] = []
     real_wait_for = asyncio.wait_for
 
-    async def record_wait_for(awaitable: Awaitable[Any], timeout: float) -> Any:
-        timeouts.append(timeout)
+    async def record_wait_for(
+        awaitable: Awaitable[Any],
+        timeout: float,
+        *,
+        settle_on_cancel: bool = False,
+    ) -> Any:
+        timeouts.append((timeout, settle_on_cancel))
         return await real_wait_for(awaitable, timeout)
 
     monkeypatch.setattr(preflight_module, "_wait_for", record_wait_for)
@@ -1083,7 +1238,11 @@ async def test_protocol_stages_use_request_timeout_and_cleanup_owns_its_budget(
         PreflightStage.PANEL_TO_HA,
         PreflightStage.CLEANUP,
     )
-    assert timeouts == [0.01, 0.01, 0.01]
+    assert timeouts == [
+        (0.01, True),
+        (0.01, False),
+        (0.01, False),
+    ]
     assert ("unsubscribe", topics.ha_to_panel) in mqtt.events
     assert ("disconnect",) in mqtt.events
 
