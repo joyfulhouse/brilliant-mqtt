@@ -2,17 +2,18 @@
 
 from __future__ import annotations
 
+import hmac
 import ssl
 from collections.abc import AsyncIterator, Mapping
 from contextlib import AbstractAsyncContextManager
 from dataclasses import InitVar, dataclass
 from enum import StrEnum
 from types import TracebackType
-from typing import Any, Protocol, Self
+from typing import Any, Never, Protocol, Self, SupportsIndex
 
 import aiomqtt
 
-from .errors import OperationError, OperationStage
+from .errors import OperationError, OperationStage, from_exception
 
 
 class BrokerKind(StrEnum):
@@ -67,9 +68,13 @@ class _SensitiveText:
     """Immutable text whose string, repr, and deepcopy surfaces stay redacted."""
 
     __slots__ = ("__value",)
+    __value: str
 
     def __init__(self, value: str) -> None:
-        self.__value = value
+        object.__setattr__(self, "_SensitiveText__value", value)
+
+    def __setattr__(self, name: str, value: object) -> Never:
+        raise AttributeError("sensitive_text_is_immutable")
 
     def _reveal(self) -> str:
         return self.__value
@@ -87,10 +92,18 @@ class _SensitiveText:
         return self
 
     def __eq__(self, other: object) -> bool:
-        return isinstance(other, _SensitiveText) and self.__value == other.__value
+        return isinstance(other, _SensitiveText) and hmac.compare_digest(
+            self.__value,
+            other.__value,
+        )
 
-    def __hash__(self) -> int:
-        return hash(self.__value)
+    __hash__ = None  # type: ignore[assignment]
+
+    def __reduce__(self) -> Never:
+        raise TypeError("sensitive_text_not_serializable")
+
+    def __reduce_ex__(self, protocol: SupportsIndex) -> Never:
+        raise TypeError("sensitive_text_not_serializable")
 
 
 class _BrokerSecrets:
@@ -103,7 +116,7 @@ class _BrokerSecrets:
     _ca_pem: _SensitiveText | None
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, eq=False)
 class BrokerProfile(_BrokerSecrets):
     """One immutable, normalized MQTT connection profile."""
 
@@ -115,12 +128,40 @@ class BrokerProfile(_BrokerSecrets):
     _password_value: InitVar[str]
     _ca_pem_value: InitVar[str | None]
 
+    __hash__ = None  # type: ignore[assignment]
+
     def __post_init__(
         self,
         _username_value: str,
         _password_value: str,
         _ca_pem_value: str | None,
     ) -> None:
+        if not isinstance(self.kind, BrokerKind):
+            raise ValueError("invalid_broker_profile")
+        if not isinstance(self.host, str):
+            raise ValueError("invalid_broker_profile")
+        normalized_host = self.host.strip().lower()
+        if not normalized_host:
+            raise ValueError("invalid_broker_profile")
+        if type(self.port) is not int or not 1 <= self.port <= 65535:
+            raise ValueError("invalid_broker_profile")
+        if type(self.tls_enabled) is not bool:
+            raise ValueError("invalid_broker_profile")
+        if not isinstance(_username_value, str) or not _username_value:
+            raise ValueError("invalid_broker_profile")
+        if not isinstance(_password_value, str) or not _password_value:
+            raise ValueError("invalid_broker_profile")
+        if _ca_pem_value is not None and (
+            not isinstance(_ca_pem_value, str)
+            or not _ca_pem_value.strip()
+            or not self.tls_enabled
+            or "-----BEGIN CERTIFICATE-----" not in _ca_pem_value
+            or "-----END CERTIFICATE-----" not in _ca_pem_value
+            or "PRIVATE KEY-----" in _ca_pem_value.upper()
+        ):
+            raise ValueError("invalid_broker_profile")
+
+        object.__setattr__(self, "host", normalized_host)
         object.__setattr__(self, "_username", _SensitiveText(_username_value))
         object.__setattr__(self, "_password", _SensitiveText(_password_value))
         object.__setattr__(
@@ -136,7 +177,12 @@ class BrokerProfile(_BrokerSecrets):
             raw_kind = data["broker_kind"]
             if not isinstance(raw_kind, str):
                 raise ValueError
-            kind = BrokerKind(raw_kind)
+            if raw_kind == BrokerKind.OFFICIAL_MOSQUITTO.value:
+                kind = BrokerKind.OFFICIAL_MOSQUITTO
+            elif raw_kind == BrokerKind.EXISTING_BROKER.value:
+                kind = BrokerKind.EXISTING_BROKER
+            else:
+                raise ValueError
 
             raw_host = data["mqtt_host"]
             if not isinstance(raw_host, str):
@@ -178,7 +224,7 @@ class BrokerProfile(_BrokerSecrets):
                 ):
                     raise ValueError
 
-            return cls(
+            profile = cls(
                 kind=kind,
                 host=host,
                 port=port,
@@ -187,13 +233,47 @@ class BrokerProfile(_BrokerSecrets):
                 _password_value=raw_password,
                 _ca_pem_value=raw_ca_pem if isinstance(raw_ca_pem, str) else None,
             )
-        except OperationError:
-            raise
         except Exception:
+            profile = None
+        if profile is None:
             raise OperationError.for_code(
                 OperationStage.BROKER_PROFILE,
                 "invalid_broker_profile",
             ) from None
+        return profile
+
+    def __eq__(self, other: object) -> bool:
+        if other.__class__ is not self.__class__:
+            return NotImplemented
+        assert isinstance(other, BrokerProfile)
+        secrets_equal = (
+            (self._username == other._username)
+            & (self._password == other._password)
+            & (self._ca_pem == other._ca_pem)
+        )
+        return (
+            self.kind,
+            self.host,
+            self.port,
+            self.tls_enabled,
+        ) == (
+            other.kind,
+            other.host,
+            other.port,
+            other.tls_enabled,
+        ) and bool(secrets_equal)
+
+    def __copy__(self) -> Self:
+        return self
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> Self:
+        return self
+
+    def __reduce__(self) -> Never:
+        raise TypeError("broker_profile_not_serializable")
+
+    def __reduce_ex__(self, protocol: SupportsIndex) -> Never:
+        raise TypeError("broker_profile_not_serializable")
 
     @property
     def has_custom_ca(self) -> bool:
@@ -259,14 +339,35 @@ class BrokerProfile(_BrokerSecrets):
 class _DeviceClientContext(AbstractAsyncContextManager[DeviceMqttClient]):
     def __init__(self, raw_client: aiomqtt.Client) -> None:
         self._raw_client = raw_client
+        self._started = False
         self._entered = False
         self._closed = False
         self._client = _AioMqttDeviceClient(raw_client, self)
 
     async def __aenter__(self) -> DeviceMqttClient:
-        await self._raw_client.__aenter__()
-        self._entered = True
-        return self._client
+        self._started = True
+        try:
+            await self._raw_client.__aenter__()
+        except BaseException as error:
+            entry_error = error
+        else:
+            self._entered = True
+            return self._client
+
+        cleanup_error = await self._attempt_raw_exit(
+            type(entry_error),
+            entry_error,
+            entry_error.__traceback__,
+        )
+        if not isinstance(entry_error, Exception):
+            raise entry_error
+        if cleanup_error is not None and not isinstance(cleanup_error, Exception):
+            raise cleanup_error
+
+        mapped = from_exception(OperationStage.FLEET_AUTH, entry_error)
+        if cleanup_error is not None:
+            mapped = mapped.with_cleanup_error(_cleanup_failure())
+        raise mapped from None
 
     async def __aexit__(
         self,
@@ -282,10 +383,38 @@ class _DeviceClientContext(AbstractAsyncContextManager[DeviceMqttClient]):
         exc: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        if not self._entered or self._closed:
+        cleanup_error = await self._attempt_raw_exit(exc_type, exc, traceback)
+        if cleanup_error is None:
             return
+
+        if exc is not None and not isinstance(exc, Exception):
+            return
+        if not isinstance(cleanup_error, Exception):
+            raise cleanup_error
+        cleanup = _cleanup_failure()
+        if isinstance(exc, OperationError):
+            raise exc.with_cleanup_error(cleanup) from None
+        if exc is not None:
+            return
+        raise cleanup from None
+
+    async def _attempt_raw_exit(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> BaseException | None:
+        if not self._started or self._closed:
+            return None
         self._closed = True
-        await self._raw_client.__aexit__(exc_type, exc, traceback)
+        cleanup_error: BaseException | None
+        try:
+            await self._raw_client.__aexit__(exc_type, exc, traceback)
+        except BaseException as error:
+            cleanup_error = error
+        else:
+            cleanup_error = None
+        return cleanup_error
 
 
 class _AioMqttDeviceClient:
@@ -327,3 +456,7 @@ class _AioMqttDeviceClient:
 
     async def disconnect(self) -> None:
         await self._lifecycle._close(None, None, None)
+
+
+def _cleanup_failure() -> OperationError:
+    return OperationError.for_code(OperationStage.CLEANUP, "cleanup_failed")

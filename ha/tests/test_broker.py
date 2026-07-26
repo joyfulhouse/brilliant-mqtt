@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import copy
+import pickle
 import ssl
 from collections.abc import AsyncIterator
 from dataclasses import FrozenInstanceError, asdict, dataclass
 from importlib.metadata import version
 from types import TracebackType
-from typing import Self
+from typing import Self, cast
 from unittest.mock import patch
 
 import aiomqtt
 import pytest
+from aiomqtt.exceptions import MqttConnectError, MqttError
 
 from custom_components.brilliant_mqtt.broker import (
     BrokerKind,
@@ -90,6 +93,34 @@ class _FakeAioClient:
         self.publications.append((topic, payload, qos, retain))
 
 
+class _FailingLifecycleClient(_FakeAioClient):
+    def __init__(
+        self,
+        *,
+        enter_error: BaseException | None = None,
+        exit_error: BaseException | None = None,
+    ) -> None:
+        super().__init__()
+        self._enter_error = enter_error
+        self._exit_error = exit_error
+
+    async def __aenter__(self) -> Self:
+        self.enter_count += 1
+        if self._enter_error is not None:
+            raise self._enter_error
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        await super().__aexit__(exc_type, exc, traceback)
+        if self._exit_error is not None:
+            raise self._exit_error
+
+
 @dataclass(slots=True)
 class _FakeSslContext:
     verify_mode: ssl.VerifyMode = ssl.CERT_NONE
@@ -107,6 +138,28 @@ def _profile_data(**overrides: object) -> dict[str, object]:
     }
     data.update(overrides)
     return data
+
+
+def _direct_profile(**overrides: object) -> BrokerProfile:
+    values: dict[str, object] = {
+        "kind": BrokerKind.OFFICIAL_MOSQUITTO,
+        "host": " MQTT.Example.COM ",
+        "port": 1884,
+        "tls_enabled": False,
+        "_username_value": USERNAME,
+        "_password_value": PASSWORD,
+        "_ca_pem_value": None,
+    }
+    values.update(overrides)
+    return BrokerProfile(
+        kind=cast(BrokerKind, values["kind"]),
+        host=cast(str, values["host"]),
+        port=cast(int, values["port"]),
+        tls_enabled=cast(bool, values["tls_enabled"]),
+        _username_value=cast(str, values["_username_value"]),
+        _password_value=cast(str, values["_password_value"]),
+        _ca_pem_value=cast(str | None, values["_ca_pem_value"]),
+    )
 
 
 def test_dependency_versions_are_exact_in_ha_environment() -> None:
@@ -175,6 +228,129 @@ def test_profile_is_frozen_slotted_and_all_diagnostic_surfaces_are_redacted() ->
         assert all(secret not in surface for surface in surfaces)
 
 
+def test_direct_profile_construction_normalizes_and_preserves_exact_credentials() -> None:
+    profile = _direct_profile()
+
+    assert profile.host == "mqtt.example.com"
+    with patch("custom_components.brilliant_mqtt.broker.aiomqtt.Client") as client:
+        profile.device_client("direct-profile")
+
+    assert client.call_args.kwargs["username"] == USERNAME
+    assert client.call_args.kwargs["password"] == PASSWORD
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"kind": "official_mosquitto"},
+        {"kind": object()},
+        {"host": ""},
+        {"host": "   "},
+        {"host": 123},
+        {"port": 0},
+        {"port": 65536},
+        {"port": True},
+        {"port": "1883"},
+        {"tls_enabled": 1},
+        {"tls_enabled": "true"},
+        {"_username_value": ""},
+        {"_username_value": 123},
+        {"_password_value": ""},
+        {"_password_value": 123},
+        {"_ca_pem_value": CA_PEM},
+        {"tls_enabled": True, "_ca_pem_value": 123},
+        {"tls_enabled": True, "_ca_pem_value": ""},
+        {"tls_enabled": True, "_ca_pem_value": "not a public certificate"},
+        {
+            "tls_enabled": True,
+            "_ca_pem_value": (
+                "-----BEGIN PRIVATE KEY-----\nprivate-secret\n-----END PRIVATE KEY-----"
+            ),
+        },
+    ],
+)
+def test_direct_profile_construction_cannot_bypass_invariants(
+    overrides: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError, match="^invalid_broker_profile$") as caught:
+        _direct_profile(**overrides)
+
+    assert caught.value.__context__ is None
+    assert caught.value.__cause__ is None
+    for secret in (PASSWORD, USERNAME, CA_PEM, "private-secret"):
+        assert secret not in str(caught.value)
+        assert secret not in repr(caught.value)
+
+
+def test_profile_equality_includes_all_hidden_connection_material() -> None:
+    equivalent = BrokerProfile.from_mapping(_profile_data())
+    normalized_equivalent = BrokerProfile.from_mapping(_profile_data(mqtt_host="mqtt.example.com"))
+    different_username = BrokerProfile.from_mapping(
+        _profile_data(mqtt_username="different-username-secret")
+    )
+    different_password = BrokerProfile.from_mapping(
+        _profile_data(mqtt_password="different-password-secret")
+    )
+    first_ca = BrokerProfile.from_mapping(_profile_data(mqtt_tls_enabled=True, mqtt_tls_ca=CA_PEM))
+    second_ca = BrokerProfile.from_mapping(
+        _profile_data(
+            mqtt_tls_enabled=True,
+            mqtt_tls_ca=CA_PEM.replace("CA-PEM-SECRET", "DIFFERENT-CA-SECRET"),
+        )
+    )
+
+    assert equivalent == normalized_equivalent
+    assert equivalent != different_username
+    assert equivalent != different_password
+    assert first_ca != second_ca
+    assert equivalent != BrokerProfile.from_mapping(
+        _profile_data(broker_kind=BrokerKind.EXISTING_BROKER.value)
+    )
+    with pytest.raises(TypeError):
+        hash(equivalent)
+    surfaces = repr(
+        (
+            equivalent == different_username,
+            equivalent == different_password,
+            first_ca == second_ca,
+        )
+    )
+    for secret in (
+        USERNAME,
+        PASSWORD,
+        "different-username-secret",
+        "different-password-secret",
+        "DIFFERENT-CA-SECRET",
+    ):
+        assert secret not in surfaces
+
+
+def test_profile_copy_is_safe_and_serialization_is_rejected_without_secrets() -> None:
+    profile = BrokerProfile.from_mapping(_profile_data(mqtt_tls_enabled=True, mqtt_tls_ca=CA_PEM))
+
+    assert copy.copy(profile) is profile
+    assert copy.deepcopy(profile) is profile
+    with pytest.raises(TypeError, match="^broker_profile_not_serializable$") as caught:
+        pickle.dumps(profile)
+
+    assert caught.value.__context__ is None
+    assert caught.value.__cause__ is None
+    for secret in (USERNAME, PASSWORD, CA_PEM):
+        assert secret not in str(caught.value)
+        assert secret not in repr(caught.value)
+
+
+def test_sensitive_values_reject_ordinary_mutation_and_serialization() -> None:
+    profile = BrokerProfile.from_mapping(_profile_data())
+
+    with pytest.raises(AttributeError, match="^sensitive_text_is_immutable$"):
+        profile._password._SensitiveText__value = "changed-password-secret"
+    with pytest.raises(TypeError, match="^sensitive_text_not_serializable$"):
+        pickle.dumps(profile._password)
+
+    assert repr(profile._password) == "<redacted>"
+
+
 @pytest.mark.parametrize(
     "data",
     [
@@ -217,6 +393,16 @@ def test_invalid_profile_shapes_map_to_stable_operation_error(
     surface = f"{caught.value!s} {caught.value!r} {caught.value.redacted_dict()!r}"
     for secret in (PASSWORD, USERNAME, CA_PEM, "private-secret"):
         assert secret not in surface
+
+
+def test_mapping_validation_does_not_retain_secret_bearing_context() -> None:
+    with pytest.raises(OperationError) as caught:
+        BrokerProfile.from_mapping(_profile_data(broker_kind="mqtt-password-secret"))
+
+    assert caught.value.stage is OperationStage.BROKER_PROFILE
+    assert caught.value.code == "invalid_broker_profile"
+    assert caught.value.__context__ is None
+    assert caught.value.__cause__ is None
 
 
 def test_default_port_follows_tls_only_when_port_is_absent() -> None:
@@ -388,6 +574,247 @@ async def test_context_closes_exactly_once_after_caller_cancellation() -> None:
 
     assert raw_client.exit_count == 1
     assert raw_client.exit_types == [asyncio.CancelledError]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("raw_error", "expected_code", "expected_retryable"),
+    [
+        (MqttConnectError(4), "broker_authentication_failed", False),
+        (MqttConnectError(3), "broker_unavailable", True),
+        (
+            MqttError("mqtt.secret.example password-secret CA-PEM-SECRET"),
+            "broker_connect_failed",
+            True,
+        ),
+        (
+            ConnectionRefusedError("mqtt.secret.example password-secret"),
+            "broker_connect_failed",
+            True,
+        ),
+        (
+            TimeoutError("mqtt.secret.example password-secret"),
+            "broker_timeout",
+            True,
+        ),
+        (
+            ssl.SSLCertVerificationError(
+                1,
+                "mqtt.secret.example password-secret CA-PEM-SECRET",
+            ),
+            "broker_tls_verification_failed",
+            False,
+        ),
+    ],
+)
+async def test_context_entry_maps_broker_failures_and_closes_once(
+    raw_error: Exception,
+    expected_code: str,
+    expected_retryable: bool,
+) -> None:
+    raw_client = _FailingLifecycleClient(enter_error=raw_error)
+    profile = BrokerProfile.from_mapping(_profile_data())
+
+    with (
+        patch("custom_components.brilliant_mqtt.broker.aiomqtt.Client", return_value=raw_client),
+        pytest.raises(OperationError) as caught,
+    ):
+        async with profile.device_client("entry-failure"):
+            pytest.fail("entry failure must not yield a client")
+
+    assert caught.value.stage is OperationStage.FLEET_AUTH
+    assert caught.value.code == expected_code
+    assert caught.value.retryable is expected_retryable
+    assert caught.value.__context__ is None
+    assert caught.value.__cause__ is None
+    assert raw_client.enter_count == 1
+    assert raw_client.exit_count == 1
+    assert raw_client.exit_types == [type(raw_error)]
+    for secret in (
+        "mqtt.secret.example",
+        "password-secret",
+        "CA-PEM-SECRET",
+    ):
+        assert secret not in str(caught.value)
+        assert secret not in repr(caught.value)
+        assert secret not in repr(caught.value.redacted_dict())
+
+
+@pytest.mark.asyncio
+async def test_real_aiomqtt_wrapped_connect_error_maps_without_message_parsing() -> None:
+    profile = BrokerProfile.from_mapping(_profile_data())
+
+    with (
+        patch.object(
+            aiomqtt.Client,
+            "_client_connect",
+            side_effect=ssl.SSLCertVerificationError(
+                1,
+                "mqtt.secret.example password-secret CA-PEM-SECRET",
+            ),
+        ),
+        pytest.raises(OperationError) as caught,
+    ):
+        async with profile.device_client("real-wrapped-connect-error"):
+            pytest.fail("entry failure must not yield a client")
+
+    assert caught.value.stage is OperationStage.FLEET_AUTH
+    assert caught.value.code == "broker_connect_failed"
+    assert caught.value.retryable is True
+    assert caught.value.__context__ is None
+    assert caught.value.__cause__ is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "control_error",
+    [
+        asyncio.CancelledError("cancel-secret"),
+        KeyboardInterrupt("keyboard-secret"),
+        SystemExit("system-exit-secret"),
+    ],
+)
+async def test_context_entry_preserves_control_exceptions_after_one_cleanup(
+    control_error: BaseException,
+) -> None:
+    raw_client = _FailingLifecycleClient(enter_error=control_error)
+    profile = BrokerProfile.from_mapping(_profile_data())
+
+    with (
+        patch("custom_components.brilliant_mqtt.broker.aiomqtt.Client", return_value=raw_client),
+        pytest.raises(type(control_error)) as caught,
+    ):
+        async with profile.device_client("entry-control-error"):
+            pytest.fail("entry failure must not yield a client")
+
+    assert caught.value is control_error
+    assert raw_client.enter_count == 1
+    assert raw_client.exit_count == 1
+    assert raw_client.exit_types == [type(control_error)]
+
+
+@pytest.mark.asyncio
+async def test_entry_failure_preserves_primary_and_attaches_cleanup_failure() -> None:
+    raw_client = _FailingLifecycleClient(
+        enter_error=MqttConnectError(4),
+        exit_error=RuntimeError("cleanup-password-secret"),
+    )
+    profile = BrokerProfile.from_mapping(_profile_data())
+
+    with (
+        patch("custom_components.brilliant_mqtt.broker.aiomqtt.Client", return_value=raw_client),
+        pytest.raises(OperationError) as caught,
+    ):
+        async with profile.device_client("entry-and-cleanup-failure"):
+            pytest.fail("entry failure must not yield a client")
+
+    assert caught.value.stage is OperationStage.FLEET_AUTH
+    assert caught.value.code == "broker_authentication_failed"
+    assert caught.value.cleanup_error is not None
+    assert caught.value.cleanup_error.stage is OperationStage.CLEANUP
+    assert caught.value.cleanup_error.code == "cleanup_failed"
+    assert caught.value.__context__ is None
+    assert caught.value.__cause__ is None
+    assert raw_client.exit_count == 1
+    assert "cleanup-password-secret" not in repr(caught.value)
+    assert "cleanup-password-secret" not in repr(caught.value.redacted_dict())
+
+
+@pytest.mark.asyncio
+async def test_close_failure_maps_to_cleanup_error_and_never_double_closes() -> None:
+    raw_client = _FailingLifecycleClient(exit_error=RuntimeError("cleanup-password-secret"))
+    profile = BrokerProfile.from_mapping(_profile_data())
+
+    with (
+        patch("custom_components.brilliant_mqtt.broker.aiomqtt.Client", return_value=raw_client),
+        pytest.raises(OperationError) as caught,
+    ):
+        async with profile.device_client("close-failure") as client:
+            await client.disconnect()
+
+    assert caught.value.stage is OperationStage.CLEANUP
+    assert caught.value.code == "cleanup_failed"
+    assert caught.value.__context__ is None
+    assert caught.value.__cause__ is None
+    assert raw_client.exit_count == 1
+    assert "cleanup-password-secret" not in repr(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_implicit_close_failure_maps_to_cleanup_error_once() -> None:
+    raw_client = _FailingLifecycleClient(
+        exit_error=RuntimeError("implicit-cleanup-password-secret")
+    )
+    profile = BrokerProfile.from_mapping(_profile_data())
+
+    with (
+        patch("custom_components.brilliant_mqtt.broker.aiomqtt.Client", return_value=raw_client),
+        pytest.raises(OperationError) as caught,
+    ):
+        async with profile.device_client("implicit-close-failure"):
+            pass
+
+    assert caught.value.stage is OperationStage.CLEANUP
+    assert caught.value.code == "cleanup_failed"
+    assert caught.value.__context__ is None
+    assert caught.value.__cause__ is None
+    assert raw_client.exit_count == 1
+    assert "implicit-cleanup-password-secret" not in repr(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_body_operation_error_remains_primary_when_cleanup_fails() -> None:
+    raw_client = _FailingLifecycleClient(exit_error=RuntimeError("cleanup-password-secret"))
+    profile = BrokerProfile.from_mapping(_profile_data())
+    primary = OperationError.for_code(
+        OperationStage.PANEL_TO_HA,
+        "panel_to_ha_timeout",
+    )
+
+    with (
+        patch("custom_components.brilliant_mqtt.broker.aiomqtt.Client", return_value=raw_client),
+        pytest.raises(OperationError) as caught,
+    ):
+        async with profile.device_client("primary-and-cleanup-failure"):
+            raise primary
+
+    assert caught.value.stage is OperationStage.PANEL_TO_HA
+    assert caught.value.code == "panel_to_ha_timeout"
+    assert caught.value.cleanup_error is not None
+    assert caught.value.cleanup_error.code == "cleanup_failed"
+    assert caught.value.__context__ is primary
+    assert caught.value.__cause__ is None
+    assert primary.__context__ is None
+    assert primary.__cause__ is None
+    assert raw_client.exit_count == 1
+    assert "cleanup-password-secret" not in repr(caught.value)
+    assert "cleanup-password-secret" not in repr(caught.value.redacted_dict())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "control_error",
+    [
+        asyncio.CancelledError("cancel-secret"),
+        KeyboardInterrupt("keyboard-secret"),
+        SystemExit("system-exit-secret"),
+    ],
+)
+async def test_cleanup_failure_never_swallows_body_control_exception(
+    control_error: BaseException,
+) -> None:
+    raw_client = _FailingLifecycleClient(exit_error=RuntimeError("cleanup-password-secret"))
+    profile = BrokerProfile.from_mapping(_profile_data())
+
+    with (
+        patch("custom_components.brilliant_mqtt.broker.aiomqtt.Client", return_value=raw_client),
+        pytest.raises(type(control_error)) as caught,
+    ):
+        async with profile.device_client("body-control-error"):
+            raise control_error
+
+    assert caught.value is control_error
+    assert raw_client.exit_count == 1
 
 
 def test_tls_construction_failure_maps_to_redacted_invalid_profile() -> None:

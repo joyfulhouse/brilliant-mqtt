@@ -6,10 +6,11 @@ import socket
 import ssl
 import traceback
 from dataclasses import FrozenInstanceError
+from typing import cast
 
 import pytest
 import voluptuous as vol
-from aiomqtt.exceptions import MqttConnectError
+from aiomqtt.exceptions import MqttConnectError, MqttError
 from paho.mqtt.packettypes import PacketTypes
 from paho.mqtt.reasoncodes import ReasonCode
 
@@ -95,6 +96,11 @@ def test_operation_stage_values_are_the_shared_stage_table() -> None:
             True,
         ),
         (
+            MqttError("mqtt.secret.example mqtt-password-secret"),
+            "broker_connect_failed",
+            True,
+        ),
+        (
             RuntimeError("mqtt-user-secret mqtt-password-secret nonce-secret"),
             "operation_failed",
             False,
@@ -134,6 +140,68 @@ def test_profile_validation_errors_map_without_raw_text(error: Exception) -> Non
     assert mapped.code == "invalid_broker_profile"
     assert mapped.retryable is False
     _assert_secret_free(mapped)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ValueError("mqtt-user-secret mqtt-password-secret"),
+        TypeError("mqtt-user-secret mqtt-password-secret"),
+        vol.Invalid("mqtt-user-secret mqtt-password-secret"),
+    ],
+)
+def test_non_profile_validation_errors_do_not_claim_profile_is_invalid(
+    error: Exception,
+) -> None:
+    mapped = from_exception(OperationStage.RETAINED_MESSAGE, error)
+
+    assert mapped.stage is OperationStage.RETAINED_MESSAGE
+    assert mapped.code == "operation_failed"
+    assert mapped.retryable is False
+    _assert_secret_free(mapped)
+
+
+@pytest.mark.parametrize(
+    "control_error",
+    [
+        GeneratorExit("generator-secret"),
+        BaseExceptionGroup(
+            "base-group-secret",
+            [GeneratorExit("nested-generator-secret")],
+        ),
+    ],
+)
+def test_non_exception_base_exceptions_propagate_unchanged(
+    control_error: BaseException,
+) -> None:
+    with pytest.raises(type(control_error)) as caught:
+        from_exception(OperationStage.FLEET_AUTH, control_error)
+
+    assert caught.value is control_error
+
+
+def test_operation_error_rejects_invalid_stage_with_fixed_text() -> None:
+    valid = OperationError.for_code(
+        OperationStage.FLEET_AUTH,
+        "broker_connect_failed",
+    )
+    invalid_stage = cast(OperationStage, "mqtt-password-secret")
+
+    with pytest.raises(TypeError, match="^invalid_operation_stage$") as direct:
+        OperationError(
+            stage=invalid_stage,
+            code=valid.code,
+            retryable=valid.retryable,
+            summary_key=valid.summary_key,
+            documentation_slug=valid.documentation_slug,
+            redacted_detail=valid.redacted_detail,
+        )
+    with pytest.raises(TypeError, match="^invalid_operation_stage$") as factory:
+        OperationError.for_code(invalid_stage, "broker_connect_failed")
+
+    for caught in (direct, factory):
+        assert "mqtt-password-secret" not in str(caught.value)
+        assert "mqtt-password-secret" not in repr(caught.value)
 
 
 def test_existing_operation_error_is_not_double_wrapped() -> None:

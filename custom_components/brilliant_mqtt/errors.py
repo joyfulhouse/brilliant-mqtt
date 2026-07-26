@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import asyncio
 import socket
 import ssl
 from dataclasses import dataclass, replace
 from enum import StrEnum
 
 import voluptuous as vol
-from aiomqtt.exceptions import MqttConnectError
+from aiomqtt.exceptions import MqttConnectError, MqttError
 from paho.mqtt.reasoncodes import ReasonCode
 
 
@@ -156,6 +155,7 @@ class OperationError(Exception):
 
     def __post_init__(self) -> None:
         """Reject ad-hoc metadata that could carry raw exception text."""
+        _validate_stage(self.stage)
         metadata = _ERROR_METADATA.get(self.code)
         if metadata is None or (
             self.retryable,
@@ -183,6 +183,7 @@ class OperationError(Exception):
         cleanup_error: OperationError | None = None,
     ) -> OperationError:
         """Construct an error only from the fixed metadata table."""
+        _validate_stage(stage)
         metadata = _ERROR_METADATA.get(code)
         if metadata is None:
             raise ValueError("unknown_operation_error_code")
@@ -232,14 +233,16 @@ class OperationError(Exception):
 
 def from_exception(stage: OperationStage, error: BaseException) -> OperationError:
     """Map an exception to stable metadata without retaining its text."""
+    _validate_stage(stage)
     if isinstance(error, OperationError):
         return error
-    if isinstance(error, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+    if not isinstance(error, Exception):
         raise error
     if isinstance(error, ssl.SSLCertVerificationError):
         return OperationError.for_code(stage, "broker_tls_verification_failed")
-    if isinstance(error, ValueError) or (
-        stage is OperationStage.BROKER_PROFILE and isinstance(error, (TypeError, vol.Invalid))
+    if stage is OperationStage.BROKER_PROFILE and isinstance(
+        error,
+        (ValueError, TypeError, vol.Invalid),
     ):
         return OperationError.for_code(stage, "invalid_broker_profile")
     if isinstance(error, TimeoutError):
@@ -251,9 +254,18 @@ def from_exception(stage: OperationStage, error: BaseException) -> OperationErro
         if reason_code in {1, 2, 129, 130, 132, 133}:
             return OperationError.for_code(stage, "broker_connection_rejected")
         return OperationError.for_code(stage, "broker_unavailable")
+    if isinstance(error, MqttError):
+        if stage is OperationStage.FLEET_AUTH:
+            return OperationError.for_code(stage, "broker_connect_failed")
+        return OperationError.for_code(stage, "operation_failed")
     if isinstance(error, (socket.gaierror, ConnectionError, OSError)):
         return OperationError.for_code(stage, "broker_connect_failed")
     return OperationError.for_code(stage, "operation_failed")
+
+
+def _validate_stage(stage: object) -> None:
+    if not isinstance(stage, OperationStage):
+        raise TypeError("invalid_operation_stage")
 
 
 def _mqtt_reason_code(error: MqttConnectError) -> int | None:
