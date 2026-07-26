@@ -148,6 +148,26 @@ class _BlockedSuccessfulEntryClient(_FakeAioClient):
         await self.release_exit.wait()
 
 
+class _BlockedExitClient(_FakeAioClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.exit_started = asyncio.Event()
+        self.release_exit = asyncio.Event()
+        self.exit_errors: list[BaseException | None] = []
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        self.exit_count += 1
+        self.exit_types.append(exc_type)
+        self.exit_errors.append(exc)
+        self.exit_started.set()
+        await self.release_exit.wait()
+
+
 def _exception_chain(error: BaseException) -> list[BaseException]:
     chain: list[BaseException] = []
     current: BaseException | None = error
@@ -612,6 +632,45 @@ async def test_context_closes_exactly_once_after_caller_cancellation() -> None:
 
     assert raw_client.exit_count == 1
     assert raw_client.exit_types == [asyncio.CancelledError]
+
+
+@pytest.mark.asyncio
+async def test_repeated_cancellation_during_exit_preserves_the_body_cancellation() -> None:
+    raw_client = _BlockedExitClient()
+    profile = BrokerProfile.from_mapping(_profile_data())
+    entered = asyncio.Event()
+
+    async def run_until_cancelled() -> None:
+        async with profile.device_client("repeat-cancel-close"):
+            entered.set()
+            await asyncio.Future()
+
+    with patch("custom_components.brilliant_mqtt.broker.aiomqtt.Client", return_value=raw_client):
+        task = asyncio.create_task(run_until_cancelled())
+        await entered.wait()
+        task.cancel("original-body-cancellation")
+        await raw_client.exit_started.wait()
+        assert len(raw_client.exit_errors) == 1
+        original_cancellation = raw_client.exit_errors[0]
+        assert isinstance(original_cancellation, asyncio.CancelledError)
+
+        task.cancel("repeated-exit-cancellation")
+        await asyncio.sleep(0)
+        assert not task.done()
+
+        raw_client.release_exit.set()
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await task
+
+    assert caught.value is original_cancellation
+    assert caught.value.args == ("original-body-cancellation",)
+    assert raw_client.exit_count == 1
+    assert raw_client.exit_types == [asyncio.CancelledError]
+    assert all(
+        candidate.done()
+        for candidate in asyncio.all_tasks()
+        if candidate.get_name() == "brilliant-mqtt-device-exit"
+    )
 
 
 @pytest.mark.asyncio

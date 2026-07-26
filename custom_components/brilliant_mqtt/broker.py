@@ -417,13 +417,13 @@ class _DeviceClientContext(AbstractAsyncContextManager[DeviceMqttClient]):
             name="brilliant-mqtt-device-exit",
         )
         cleanup_error, cancellation = await _settle_lifecycle_task(exit_task)
+        if exc is not None and not isinstance(exc, Exception):
+            return
         if cancellation is not None:
             raise cancellation from None
         if cleanup_error is None:
             return
 
-        if exc is not None and not isinstance(exc, Exception):
-            return
         if not isinstance(cleanup_error, Exception):
             raise cleanup_error
         cleanup = _cleanup_failure()
