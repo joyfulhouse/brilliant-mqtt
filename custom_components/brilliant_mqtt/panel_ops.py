@@ -299,6 +299,9 @@ async def stage_mqtt_ca(shell: PanelShell, ca_bytes: bytes) -> str:
             )
             if existing.exit_status != 0:
                 raise PanelOpError("mqtt_ca_promotion_failed")
+            existing_mode = await shell.run(f"stat -c %a {remote_path}")
+            if existing_mode.exit_status != 0 or existing_mode.stdout.strip() != "644":
+                raise PanelOpError("mqtt_ca_promotion_failed")
     except BaseException:
         # Cleanup is best-effort after a primary failure. Never replace a
         # verification/transport/process-control outcome with a later rm error.

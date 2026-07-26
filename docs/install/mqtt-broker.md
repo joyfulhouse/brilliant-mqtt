@@ -93,6 +93,16 @@ remediation target.
 <a id="mqtt-broker-authentication"></a>
 ## Authentication
 
+- **Cause:** The broker rejects the dedicated Brilliant credential. The current
+  one-panel flow may still create an entry because it does not test MQTT
+  authentication; Plan 2 reports the stable authentication failure directly.
+- **Check:** Confirm the user is enabled, verify the entered username/password,
+  and inspect the broker authentication log without exposing credentials.
+- **Fix:** Create, correct, or rotate the dedicated non-owner Brilliant
+  credential; never substitute Home Assistant's hidden generated credential.
+- **Retry:** Verify the credential manually with the current flow. In Plan 2,
+  re-enter the corrected password and select **Retry**.
+
 Username/password authentication is required. Anonymous access is unsupported.
 Use one dedicated, non-owner Brilliant fleet principal on every panel; do not
 reuse Home Assistant's MQTT principal or its hidden generated credential.
@@ -102,6 +112,16 @@ guided reconfiguration. Never put broker passwords in git or documentation.
 
 <a id="mqtt-broker-acl"></a>
 ## Broker ACL
+
+- **Cause:** One principal can connect but a required Brilliant, discovery, or
+  cleanup topic direction is denied or silently dropped.
+- **Check:** Compare both principals with the table below and inspect broker
+  authorization logs while manually testing each publish/subscribe direction.
+- **Fix:** Apply the minimum Brilliant-related grants below while preserving
+  Home Assistant's existing birth, will, status, and reserved-principal access.
+- **Retry:** Reconnect both clients and verify both directions manually today.
+  Plan 2 will rerun discovery, retained-message, and cleanup probes on
+  **Retry**.
 
 For an external broker, configure both principals:
 
@@ -132,6 +152,16 @@ mean an ACL or routing error even when login succeeded.
 <a id="mqtt-discovery-prefix"></a>
 ## MQTT Discovery prefix
 
+- **Cause:** Home Assistant listens below a discovery prefix other than the
+  agent's fixed `homeassistant` prefix. The current flow does not detect this;
+  Plan 2 returns `unsupported_discovery_prefix`.
+- **Check:** Inspect Home Assistant's effective MQTT Discovery setting and
+  confirm discovery is enabled with prefix `homeassistant`.
+- **Fix:** Restore the exact `homeassistant` prefix and reload MQTT if Home
+  Assistant requests it.
+- **Retry:** Verify current entities rediscover after the reload. In Plan 2,
+  return to onboarding and select **Retry**.
+
 This release publishes discovery only below the fixed `homeassistant` prefix.
 In Home Assistant's MQTT integration, keep discovery enabled and its Discovery
 Prefix set to `homeassistant`. The forthcoming fleet flow will stop with
@@ -140,6 +170,15 @@ does not check the effective prefix.
 
 <a id="mqtt-retained-messages"></a>
 ## Retained-message requirement
+
+- **Cause:** The broker, bridge, proxy, or hosted-service policy drops, rewrites,
+  or replays retained messages without the retained flag.
+- **Check:** Publish a harmless retained test value, subscribe after publishing,
+  and confirm the exact payload arrives with retained status.
+- **Fix:** Enable unmodified retained-message storage/delivery and remove any
+  rule that rewrites or prematurely clears the relevant topics.
+- **Retry:** Reconnect the current agent and confirm retained state manually. In
+  Plan 2, clear any manual probe and select **Retry**.
 
 The broker must preserve the MQTT retained flag and retained payloads. The
 bridge uses retained discovery, state, and availability so Home Assistant
@@ -191,6 +230,16 @@ transport in this release.
 
 <a id="mqtt-validation"></a>
 ## Forthcoming fleet-onboarding validation
+
+- **Cause:** The packaged validator cannot complete Home Assistant readiness,
+  either message direction, discovery write, retained delivery, or cleanup.
+  The current one-panel flow does not invoke this validator.
+- **Check:** Perform those checks manually today and use the specific stable
+  error section below when Plan 2 reports a code.
+- **Fix:** Correct the broker endpoint, credential, ACL direction, discovery
+  prefix, retained behavior, or cleanup access identified by that check.
+- **Retry:** Re-test manually with the current flow. In Plan 2, correct the
+  prerequisite and select **Retry**; validation never modifies broker state.
 
 The packaged `BrokerValidator` is not called by the current one-panel setup
 flow. Plan 2 fleet onboarding will call it before creating a fleet entry and

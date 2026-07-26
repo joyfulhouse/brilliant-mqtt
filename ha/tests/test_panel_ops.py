@@ -54,6 +54,7 @@ _COMPARE_MQTT_CA_COMMAND = (
     f"test -f {_TEST_MQTT_CA_PATH} && test ! -L {_TEST_MQTT_CA_PATH} "
     f"&& cmp -s {_TEST_MQTT_CA_TEMP_PATH} {_TEST_MQTT_CA_PATH}"
 )
+_STAT_MQTT_CA_MODE_COMMAND = f"stat -c %a {_TEST_MQTT_CA_PATH}"
 _CLEAN_MQTT_CA_TEMP_COMMAND = f"rm -f {_TEST_MQTT_CA_TEMP_PATH}"
 
 
@@ -417,17 +418,48 @@ async def test_stage_mqtt_ca_repeat_compares_existing_file_without_replacing_it(
                 ),
                 _PROMOTE_MQTT_CA_COMMAND: RunResult(1, "", "File exists\n"),
                 _COMPARE_MQTT_CA_COMMAND: RunResult(0, "", ""),
+                _STAT_MQTT_CA_MODE_COMMAND: RunResult(0, "644\n", ""),
             }
         )
     )
 
     assert await panel_ops.stage_mqtt_ca(shell, _TEST_MQTT_CA) == _TEST_MQTT_CA_PATH
-    assert shell.commands[-3:] == [
+    assert shell.commands[-4:] == [
         _PROMOTE_MQTT_CA_COMMAND,
         _COMPARE_MQTT_CA_COMMAND,
+        _STAT_MQTT_CA_MODE_COMMAND,
         _CLEAN_MQTT_CA_TEMP_COMMAND,
     ]
     assert shell.uploads == [(_TEST_MQTT_CA_TEMP_PATH, _TEST_MQTT_CA, 0o644)]
+
+
+@pytest.mark.parametrize("mode", ["600", "666"])
+async def test_stage_mqtt_ca_rejects_exact_existing_bytes_with_wrong_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    monkeypatch.setattr(secrets, "token_hex", lambda length: _TEMP_TOKEN)
+    shell = await _connected(
+        FakeShell(
+            responses={
+                _VERIFY_MQTT_CA_COMMAND: RunResult(
+                    0,
+                    f"{_TEST_MQTT_CA_DIGEST}  {_TEST_MQTT_CA_TEMP_PATH}\n",
+                    "",
+                ),
+                _PROMOTE_MQTT_CA_COMMAND: RunResult(1, "", "File exists\n"),
+                _COMPARE_MQTT_CA_COMMAND: RunResult(0, "", ""),
+                _STAT_MQTT_CA_MODE_COMMAND: RunResult(0, f"{mode}\n", ""),
+            }
+        )
+    )
+
+    with pytest.raises(panel_ops.PanelOpError, match="mqtt_ca_promotion_failed"):
+        await panel_ops.stage_mqtt_ca(shell, _TEST_MQTT_CA)
+
+    assert shell.commands[-1] == _CLEAN_MQTT_CA_TEMP_COMMAND
+    assert all("chmod" not in command for command in shell.commands)
+    assert all(path != _TEST_MQTT_CA_PATH for path, _data, _mode in shell.uploads)
 
 
 async def test_stage_mqtt_ca_rejects_conflicting_existing_file_and_cleans_temp(
