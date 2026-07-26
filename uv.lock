@@ -132,6 +132,7 @@ source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
     { name = "aiomqtt" },
+    { name = "paho-mqtt" },
 ]
 
 [package.dev-dependencies]
@@ -146,7 +147,8 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "aiohttp", specifier = ">=3.14.1" },
-    { name = "aiomqtt", specifier = ">=2.3" },
+    { name = "aiomqtt", specifier = "==2.5.1" },
+    { name = "paho-mqtt", specifier = "==2.1.0" },
 ]
 
 [package.metadata.requires-dev]

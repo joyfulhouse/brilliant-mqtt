@@ -17,7 +17,9 @@
   ],
   "quality_scale": "platinum",
   "requirements": [
-    "asyncssh==2.23.1"
+    "asyncssh==2.23.1",
+    "aiomqtt==2.5.1",
+    "paho-mqtt==2.1.0"
   ],
   "version": "0.6.0"
 }
