@@ -122,6 +122,32 @@ class _FailingLifecycleClient(_FakeAioClient):
             raise self._exit_error
 
 
+class _BlockedSuccessfulEntryClient(_FakeAioClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.enter_started = asyncio.Event()
+        self.release_enter = asyncio.Event()
+        self.exit_started = asyncio.Event()
+        self.release_exit = asyncio.Event()
+
+    async def __aenter__(self) -> Self:
+        self.enter_count += 1
+        self.enter_started.set()
+        await self.release_enter.wait()
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        self.exit_count += 1
+        self.exit_types.append(exc_type)
+        self.exit_started.set()
+        await self.release_exit.wait()
+
+
 def _exception_chain(error: BaseException) -> list[BaseException]:
     chain: list[BaseException] = []
     current: BaseException | None = error
@@ -684,15 +710,22 @@ async def test_cancelling_real_aiomqtt_blocked_connect_never_disconnects_concurr
     release_connect = threading.Event()
     connect_finished = threading.Event()
     disconnect_attempted = threading.Event()
+    raw_clients: list[aiomqtt.Client] = []
 
-    def blocked_connect(_client: aiomqtt.Client) -> None:
+    def blocked_connect(raw_client: aiomqtt.Client) -> None:
+        raw_clients.append(raw_client)
         connect_started.set()
         release_connect.wait(timeout=5)
+        raw_client._loop.call_soon_threadsafe(  # noqa: SLF001
+            raw_client._connected.set_exception,  # noqa: SLF001
+            MqttError("blocked-connect-secret"),
+        )
         connect_finished.set()
 
     def reject_concurrent_disconnect(*_args: object, **_kwargs: object) -> None:
         disconnect_attempted.set()
-        raise RuntimeError("disconnect raced blocked connect")
+        if not connect_finished.is_set():
+            raise RuntimeError("disconnect raced blocked connect")
 
     async def enter_client() -> None:
         async with profile.device_client("blocked-connect-cancellation"):
@@ -714,13 +747,89 @@ async def test_cancelling_real_aiomqtt_blocked_connect_never_disconnects_concurr
         task = asyncio.create_task(enter_client())
         try:
             assert await asyncio.to_thread(connect_started.wait, 1)
-            task.cancel()
+            task.cancel("caller-cancelled")
+            await asyncio.sleep(0)
+            assert not task.done()
+            release_connect.set()
             with pytest.raises(asyncio.CancelledError):
-                await task
+                await asyncio.wait_for(asyncio.shield(task), timeout=2)
+            assert task.done()
             assert not disconnect_attempted.is_set()
         finally:
             release_connect.set()
             assert await asyncio.to_thread(connect_finished.wait, 1)
+
+    assert len(raw_clients) == 1
+    assert not raw_clients[0]._lock.locked()  # noqa: SLF001
+    assert all(
+        candidate.done()
+        for candidate in asyncio.all_tasks()
+        if candidate.get_name() == "brilliant-mqtt-device-enter"
+    )
+
+
+@pytest.mark.asyncio
+async def test_cancellation_waits_for_successful_entry_and_exactly_one_exit() -> None:
+    raw_client = _BlockedSuccessfulEntryClient()
+    profile = BrokerProfile.from_mapping(_profile_data())
+
+    async def enter_client() -> None:
+        async with profile.device_client("blocked-successful-entry"):
+            pytest.fail("a cancelled entry must not yield a client")
+
+    with patch("custom_components.brilliant_mqtt.broker.aiomqtt.Client", return_value=raw_client):
+        task = asyncio.create_task(enter_client())
+        await raw_client.enter_started.wait()
+        task.cancel("original-cancellation")
+        await asyncio.sleep(0)
+        assert not task.done()
+
+        raw_client.release_enter.set()
+        await raw_client.exit_started.wait()
+        task.cancel("repeated-cancellation")
+        await asyncio.sleep(0)
+        assert not task.done()
+
+        raw_client.release_exit.set()
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await task
+
+    assert caught.value.args == ("original-cancellation",)
+    assert raw_client.enter_count == 1
+    assert raw_client.exit_count == 1
+    assert raw_client.exit_types == [asyncio.CancelledError]
+    assert all(
+        candidate.done()
+        for candidate in asyncio.all_tasks()
+        if candidate.get_name() in {"brilliant-mqtt-device-enter", "brilliant-mqtt-device-exit"}
+    )
+
+
+@pytest.mark.asyncio
+async def test_context_rejects_active_and_closed_reentry_with_stable_error() -> None:
+    raw_client = _FakeAioClient()
+    profile = BrokerProfile.from_mapping(_profile_data())
+
+    with patch("custom_components.brilliant_mqtt.broker.aiomqtt.Client", return_value=raw_client):
+        context = profile.device_client("reject-reentry")
+        await context.__aenter__()
+
+        with pytest.raises(OperationError) as active_error:
+            await context.__aenter__()
+
+        await context.__aexit__(None, None, None)
+
+        with pytest.raises(OperationError) as closed_error:
+            await context.__aenter__()
+
+    for error in (active_error.value, closed_error.value):
+        assert error.stage is OperationStage.FLEET_AUTH
+        assert error.code == "operation_failed"
+        assert error.__context__ is None
+        assert error.__cause__ is None
+        assert _exception_chain(error) == [error]
+    assert raw_client.enter_count == 1
+    assert raw_client.exit_count == 1
 
 
 @pytest.mark.asyncio

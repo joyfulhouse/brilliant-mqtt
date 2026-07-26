@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import ssl
 from collections.abc import AsyncIterator, Mapping
@@ -342,24 +343,58 @@ class BrokerProfile(_BrokerSecrets):
 class _DeviceClientContext(AbstractAsyncContextManager[DeviceMqttClient]):
     def __init__(self, raw_client: aiomqtt.Client) -> None:
         self._raw_client = raw_client
+        self._entry_started = False
         self._entered = False
         self._closed = False
         self._client = _AioMqttDeviceClient(raw_client, self)
 
     async def __aenter__(self) -> DeviceMqttClient:
+        if self._entry_started or self._closed:
+            raise OperationError.for_code(
+                OperationStage.FLEET_AUTH,
+                "operation_failed",
+            ) from None
+        self._entry_started = True
+
+        entry_task = asyncio.create_task(
+            self._attempt_raw_enter(),
+            name="brilliant-mqtt-device-enter",
+        )
+        entry_error, cancellation = await _settle_lifecycle_task(entry_task)
+
+        if cancellation is not None:
+            if entry_error is None:
+                self._entered = True
+                exit_task = asyncio.create_task(
+                    self._attempt_raw_exit(
+                        type(cancellation),
+                        cancellation,
+                        cancellation.__traceback__,
+                    ),
+                    name="brilliant-mqtt-device-exit",
+                )
+                await _settle_lifecycle_task(exit_task)
+            else:
+                self._closed = True
+            raise cancellation from None
+
+        if entry_error is not None:
+            self._closed = True
+            if not isinstance(entry_error, Exception):
+                raise entry_error
+
+            mapped = from_exception(OperationStage.FLEET_AUTH, entry_error)
+            raise mapped from None
+
+        self._entered = True
+        return self._client
+
+    async def _attempt_raw_enter(self) -> BaseException | None:
         try:
             await self._raw_client.__aenter__()
         except BaseException as error:
-            entry_error = error
-        else:
-            self._entered = True
-            return self._client
-
-        if not isinstance(entry_error, Exception):
-            raise entry_error
-
-        mapped = from_exception(OperationStage.FLEET_AUTH, entry_error)
-        raise mapped from None
+            return error
+        return None
 
     async def __aexit__(
         self,
@@ -375,7 +410,15 @@ class _DeviceClientContext(AbstractAsyncContextManager[DeviceMqttClient]):
         exc: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        cleanup_error = await self._attempt_raw_exit(exc_type, exc, traceback)
+        if not self._entered or self._closed:
+            return
+        exit_task = asyncio.create_task(
+            self._attempt_raw_exit(exc_type, exc, traceback),
+            name="brilliant-mqtt-device-exit",
+        )
+        cleanup_error, cancellation = await _settle_lifecycle_task(exit_task)
+        if cancellation is not None:
+            raise cancellation from None
         if cleanup_error is None:
             return
 
@@ -452,3 +495,22 @@ class _AioMqttDeviceClient:
 
 def _cleanup_failure() -> OperationError:
     return OperationError.for_code(OperationStage.CLEANUP, "cleanup_failed")
+
+
+async def _settle_lifecycle_task(
+    task: asyncio.Task[BaseException | None],
+) -> tuple[BaseException | None, asyncio.CancelledError | None]:
+    """Wait for MQTT lifecycle I/O without cancelling it with its caller."""
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            lifecycle_error = await asyncio.shield(task)
+        except asyncio.CancelledError as error:
+            if task.cancelled():
+                return error, cancellation
+            if cancellation is None:
+                cancellation = error
+            continue
+        except BaseException as error:
+            return error, cancellation
+        return lifecycle_error, cancellation
