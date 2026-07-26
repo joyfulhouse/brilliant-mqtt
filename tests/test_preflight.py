@@ -207,6 +207,50 @@ class _ConcreteMessageStream:
         )
 
 
+class _CloseDependentMessageStream(_ConcreteMessageStream):
+    """aiomqtt-shaped iterator whose cancellation teardown needs disconnect."""
+
+    def __init__(
+        self,
+        close_released: asyncio.Event,
+        lifecycle: list[str],
+        *,
+        teardown_delay: float,
+    ) -> None:
+        super().__init__()
+        self._close_released = close_released
+        self._lifecycle = lifecycle
+        self._teardown_delay = teardown_delay
+        self.reader_started = asyncio.Event()
+        self.reader_cancellation_started = asyncio.Event()
+        self.reader_teardown_cancelled = asyncio.Event()
+        self.reader_finished = asyncio.Event()
+
+    async def __anext__(self) -> aiomqtt.Message:
+        self.reader_started.set()
+        try:
+            return await super().__anext__()
+        except asyncio.CancelledError:
+            self._lifecycle.append("reader_cancellation_started")
+            self.reader_cancellation_started.set()
+            while not self._close_released.is_set():
+                try:
+                    await self._close_released.wait()
+                except asyncio.CancelledError:
+                    self._lifecycle.append("reader_teardown_cancelled")
+                    self.reader_teardown_cancelled.set()
+            deadline = asyncio.get_running_loop().time() + self._teardown_delay
+            while (remaining := deadline - asyncio.get_running_loop().time()) > 0:
+                try:
+                    await asyncio.sleep(remaining)
+                except asyncio.CancelledError:
+                    self._lifecycle.append("reader_teardown_cancelled")
+                    self.reader_teardown_cancelled.set()
+            self._lifecycle.append("reader_finished")
+            self.reader_finished.set()
+            raise
+
+
 class _ConcretePreflightClient:
     """Broker seam used while exercising the real AioMqttAdapter lifecycle."""
 
@@ -267,6 +311,33 @@ class _ConcretePreflightClient:
         self.unsubscriptions.append(topic)
 
 
+class _CloseDependentReaderPreflightClient(_ConcretePreflightClient):
+    """Concrete client whose reader can finish only after client close starts."""
+
+    def __init__(
+        self,
+        request: PreflightRequest,
+        *,
+        reader_teardown_delay: float = 0.0,
+    ) -> None:
+        super().__init__(request, None)
+        self.close_released = asyncio.Event()
+        self.close_started = asyncio.Event()
+        self.lifecycle: list[str] = []
+        self.close_dependent_messages = _CloseDependentMessageStream(
+            self.close_released,
+            self.lifecycle,
+            teardown_delay=reader_teardown_delay,
+        )
+        self.messages = self.close_dependent_messages
+
+    async def __aexit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.lifecycle.append("close_started")
+        self.close_started.set()
+        self.close_released.set()
+        await super().__aexit__(exc_type, exc, traceback)
+
+
 class _AckRacePreflightClient(_ConcretePreflightClient):
     """Concrete adapter seam with one broker acknowledgement held pending."""
 
@@ -325,6 +396,186 @@ class _AckRacePreflightClient(_ConcretePreflightClient):
     async def unsubscribe(self, topic: str) -> None:
         self.operations.append(("unsubscribe", topic))
         await super().unsubscribe(topic)
+
+
+async def test_checked_disconnect_closes_before_draining_close_dependent_reader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings()
+    client = _CloseDependentReaderPreflightClient(_request())
+    monkeypatch.setattr(aiomqtt, "Client", lambda **kwargs: client)
+    monkeypatch.setattr(mqttio, "build_tls_context", lambda received: None)
+    adapter = mqttio.AioMqttAdapter(
+        settings,
+        publish_availability=False,
+        checked_disconnect=True,
+        redacted_logging=True,
+    )
+    await adapter.connect()
+    await asyncio.wait_for(client.close_dependent_messages.reader_started.wait(), timeout=0.1)
+    disconnect_task = asyncio.create_task(adapter.disconnect())
+
+    try:
+        await asyncio.wait_for(client.close_started.wait(), timeout=0.2)
+    finally:
+        client.close_released.set()
+        await asyncio.wait_for(asyncio.shield(disconnect_task), timeout=0.2)
+
+    assert client.exit_attempts == 1
+    assert client.close_dependent_messages.reader_cancellation_started.is_set()
+    assert client.close_dependent_messages.reader_finished.is_set()
+    assert adapter._reader_task is None
+
+
+async def test_preflight_cleanup_closes_before_reader_drain_without_pending_tasks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings()
+    request = _request(timeout_seconds=0.12)
+    client = _CloseDependentReaderPreflightClient(request)
+    monkeypatch.setattr(aiomqtt, "Client", lambda **kwargs: client)
+    monkeypatch.setattr(mqttio, "build_tls_context", lambda received: None)
+    adapters: list[mqttio.AioMqttAdapter] = []
+
+    def factory(
+        settings: Settings,
+        *,
+        identifier: str,
+        publish_availability: bool,
+        checked_disconnect: bool,
+        redacted_logging: bool,
+    ) -> mqttio.AioMqttAdapter:
+        adapter = mqttio.AioMqttAdapter(
+            settings,
+            identifier=identifier,
+            publish_availability=publish_availability,
+            checked_disconnect=checked_disconnect,
+            redacted_logging=redacted_logging,
+        )
+        adapters.append(adapter)
+        return adapter
+
+    loop = asyncio.get_running_loop()
+    loop_contexts: list[dict[str, Any]] = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: loop_contexts.append(context))
+    started = loop.time()
+    preflight_task = asyncio.create_task(
+        async_run_preflight(settings, request, mqtt_factory=factory)
+    )
+
+    try:
+        report = await asyncio.wait_for(asyncio.shield(preflight_task), timeout=0.5)
+        elapsed = loop.time() - started
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert report.success is True
+        assert elapsed < 0.3
+        assert client.exit_attempts == 1
+        assert client.close_dependent_messages.reader_finished.is_set()
+        assert adapters[0]._reader_task is None
+        assert preflight_module._detached_cleanup_tasks == set()
+        assert preflight_module._detached_preflight_futures == set()
+        assert loop_contexts == []
+    finally:
+        client.close_released.set()
+        if not preflight_task.done():
+            preflight_task.cancel()
+        await asyncio.gather(preflight_task, return_exceptions=True)
+        for _ in range(10):
+            if not preflight_module._detached_cleanup_tasks:
+                break
+            await asyncio.sleep(0)
+        loop.set_exception_handler(previous_handler)
+
+
+async def test_preflight_attempts_close_before_slow_reader_drain_slot_expires(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings()
+    request = _request(timeout_seconds=0.12)
+    client = _CloseDependentReaderPreflightClient(
+        request,
+        reader_teardown_delay=0.06,
+    )
+    monkeypatch.setattr(aiomqtt, "Client", lambda **kwargs: client)
+    monkeypatch.setattr(mqttio, "build_tls_context", lambda received: None)
+    started = asyncio.get_running_loop().time()
+
+    try:
+        report = await asyncio.wait_for(
+            async_run_preflight(settings, request),
+            timeout=0.5,
+        )
+    finally:
+        client.close_released.set()
+        await asyncio.wait_for(
+            client.close_dependent_messages.reader_finished.wait(),
+            timeout=0.2,
+        )
+        for _ in range(10):
+            if not preflight_module._detached_cleanup_tasks:
+                break
+            await asyncio.sleep(0)
+
+    assert report.success is False
+    assert report.failed_stage is PreflightStage.CLEANUP
+    assert report.error_code == "mqtt_timeout"
+    assert asyncio.get_running_loop().time() - started < 0.3
+    assert client.exit_attempts == 1
+    assert client.close_dependent_messages.reader_teardown_cancelled.is_set()
+    assert client.lifecycle.index("close_started") < client.lifecycle.index(
+        "reader_teardown_cancelled"
+    )
+    assert preflight_module._detached_cleanup_tasks == set()
+
+
+def test_close_dependent_reader_does_not_hang_asyncio_run_shutdown() -> None:
+    repository_root = Path(__file__).resolve().parents[1]
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = os.pathsep.join(
+        (str(repository_root / "src"), str(repository_root))
+    )
+    script = """
+import asyncio
+import aiomqtt
+
+from brilliant_mqtt import mqttio
+from brilliant_mqtt.preflight import async_run_preflight
+from tests.test_preflight import (
+    _CloseDependentReaderPreflightClient,
+    _request,
+    _settings,
+)
+
+
+async def run() -> None:
+    request = _request(timeout_seconds=0.12)
+    client = _CloseDependentReaderPreflightClient(request)
+    aiomqtt.Client = lambda **kwargs: client
+    mqttio.build_tls_context = lambda received: None
+    report = await async_run_preflight(_settings(), request)
+    assert report.success
+    assert client.exit_attempts == 1
+    assert client.close_dependent_messages.reader_finished.is_set()
+
+
+asyncio.run(run())
+"""
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5.0,
+        env=environment,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout == ""
+    assert completed.stderr == ""
 
 
 def test_request_parses_exact_contract_and_stage_values() -> None:

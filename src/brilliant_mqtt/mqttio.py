@@ -232,35 +232,6 @@ class AioMqttAdapter:
                 else:
                     logger.exception("failed publishing clean offline availability")
 
-        if self._reader_task is not None:
-            reader_task = self._reader_task
-            reader_task.cancel()
-            try:
-                if self._checked_disconnect:
-
-                    async def wait_reader_checked() -> bool:
-                        try:
-                            await reader_task
-                        except asyncio.CancelledError:
-                            return True
-                        except Exception:
-                            return False
-                        return True
-
-                    reader_stopped = (await asyncio.gather(wait_reader_checked()))[0]
-                    if not reader_stopped:
-                        failed = True
-                        logger.error("reader task failed during cancellation")
-                else:
-                    try:
-                        await reader_task
-                    except asyncio.CancelledError:
-                        pass
-                    except Exception:
-                        logger.exception("reader task raised during cancellation")
-            finally:
-                self._reader_task = None
-
         if self._checked_disconnect:
 
             async def close_checked() -> bool:
@@ -272,11 +243,48 @@ class AioMqttAdapter:
                     return False
                 return True
 
-            closed = (await asyncio.gather(close_checked()))[0]
+            if self._reader_task is not None:
+                reader_task = self._reader_task
+                reader_task.cancel()
+
+                async def wait_reader_checked() -> bool:
+                    try:
+                        await reader_task
+                    except asyncio.CancelledError:
+                        return True
+                    except Exception:
+                        return False
+                    return True
+
+                try:
+                    # aiomqtt's iterator observes the disconnected state driven
+                    # by __aexit__, so start close before draining the reader.
+                    closed, reader_stopped = await asyncio.gather(
+                        close_checked(),
+                        wait_reader_checked(),
+                    )
+                finally:
+                    self._reader_task = None
+                if not reader_stopped:
+                    failed = True
+                    logger.error("reader task failed during cancellation")
+            else:
+                closed = (await asyncio.gather(close_checked()))[0]
             if not closed:
                 failed = True
                 logger.error("failed closing MQTT client")
         else:
+            if self._reader_task is not None:
+                reader_task = self._reader_task
+                reader_task.cancel()
+                try:
+                    await reader_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    logger.exception("reader task raised during cancellation")
+                finally:
+                    self._reader_task = None
             try:
                 await self._client.__aexit__(None, None, None)
             except Exception:
