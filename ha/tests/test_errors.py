@@ -203,6 +203,37 @@ def test_operation_error_rejects_invalid_stage_with_fixed_text() -> None:
         assert "mqtt-password-secret" not in repr(caught.value)
 
 
+@pytest.mark.parametrize(
+    ("stage", "code", "expected_detail"),
+    [
+        (
+            OperationStage.PANEL_TO_HA,
+            "panel_to_ha_timeout",
+            "No panel-to-Home-Assistant validation message arrived; the panel "
+            "and Home Assistant may use different MQTT brokers, or a broker ACL "
+            "may block panel-to-Home-Assistant traffic.",
+        ),
+        (
+            OperationStage.HA_TO_PANEL,
+            "ha_to_panel_timeout",
+            "No Home-Assistant-to-panel validation message arrived; Home "
+            "Assistant and the panel may use different MQTT brokers, or a broker "
+            "ACL may block Home-Assistant-to-panel traffic.",
+        ),
+    ],
+)
+def test_routing_timeout_guidance_covers_broker_and_directional_acl_failures(
+    stage: OperationStage,
+    code: str,
+    expected_detail: str,
+) -> None:
+    error = OperationError.for_code(stage, code)
+
+    assert error.redacted_detail == expected_detail
+    assert "Mosquitto" not in error.redacted_detail
+    _assert_secret_free(error)
+
+
 def test_existing_operation_error_is_not_double_wrapped() -> None:
     mapped = from_exception(
         OperationStage.BROKER_PROFILE,

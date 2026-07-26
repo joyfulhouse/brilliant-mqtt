@@ -107,8 +107,9 @@ _ERROR_METADATA = {
         summary_key="panel_to_ha_timeout",
         documentation_slug="mqtt-validation",
         redacted_detail=(
-            "No panel-to-Home-Assistant validation message arrived; confirm both "
-            "use the same MQTT broker."
+            "No panel-to-Home-Assistant validation message arrived; the panel "
+            "and Home Assistant may use different MQTT brokers, or a broker ACL "
+            "may block panel-to-Home-Assistant traffic."
         ),
     ),
     "ha_to_panel_timeout": _ErrorMetadata(
@@ -116,8 +117,9 @@ _ERROR_METADATA = {
         summary_key="ha_to_panel_timeout",
         documentation_slug="mqtt-validation",
         redacted_detail=(
-            "No Home-Assistant-to-panel validation message arrived; confirm both "
-            "use the same MQTT broker."
+            "No Home-Assistant-to-panel validation message arrived; Home "
+            "Assistant and the panel may use different MQTT brokers, or a broker "
+            "ACL may block Home-Assistant-to-panel traffic."
         ),
     ),
     "discovery_write_denied": _ErrorMetadata(
