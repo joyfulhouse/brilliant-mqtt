@@ -51,6 +51,33 @@ extract it into `config/custom_components/brilliant_mqtt/` so that
 `manifest.json` sits at the root of that folder. Restart Home Assistant and add
 the integration as above.
 
+## MQTT prerequisite
+
+Configure one MQTT broker before adding a panel. The recommended shortcut is
+Home Assistant's official Mosquitto Broker app/add-on (`core_mosquitto`), but
+it is not required or auto-managed. An existing local, remote, or hosted broker
+is equally supported.
+
+For either path:
+
+- connect Home Assistant's MQTT integration to the broker first;
+- create a dedicated, non-owner Brilliant username/password instead of reading
+  or reusing Home Assistant's hidden generated MQTT credential;
+- enter a LAN hostname/IP and TCP port the panels can resolve and reach (an
+  internal app hostname may work only inside Home Assistant); and
+- keep Home Assistant's effective MQTT Discovery prefix fixed at
+  `homeassistant` (otherwise validation returns
+  `unsupported_discovery_prefix`).
+
+The integration validates authentication, both message directions, discovery
+write access, retained-message behavior, and cleanup. It does not install or
+start `core_mosquitto`, create accounts, edit ACLs, or modify broker
+configuration. Plaintext TCP, strict system/public-CA TLS, and strict custom-CA
+TLS are supported; TLS verifies hostname and certificate chain and never falls
+back to plaintext. See the
+[MQTT broker prerequisite](install/mqtt-broker.md) for both setup paths, the
+exact two-principal ACL table, and direct explanations for validation errors.
+
 ## Onboarding a panel
 
 Adding the integration walks a **detection-first** flow. The path taken depends
@@ -63,8 +90,10 @@ on whether the agent is already installed on the panel:
 | **3. Panel settings** | Set Panel Name (e.g. "Office Bath" → slug `office-bath`) and Mesh priority (`MESH_PRIORITY`: 0 = never lead; 1 = primary; 2/3 = standbys). Optionally enable **Voice satellite** (see [Voice satellite](#voice-satellite)). On submit: agent is installed over SSH, then entry is created. | _Skipped_ — name + mesh priority + broker are adopted verbatim from the running agent. Panel is left untouched. |
 | **Result** | Agent installed; panel entities fill in after first MQTT publish. | Panel adopted; entry created immediately. |
 
-**Install failure:** if the SSH install fails at step 3, the step stays open
-with `cannot_install` and **no entry is created** — fix the panel and retry.
+**Validation or install failure:** no entry is created. MQTT errors link to a
+stable [cause/check/fix/retry section](install/mqtt-broker.md#mqtt-validation);
+SSH install failures keep step 3 open with `cannot_install`. Fix the reported
+prerequisite and retry.
 
 **Adopting a hand-deployed panel:** onboarding reads `BRILLIANT_PANEL` from the
 live env file and adopts it verbatim. Set it to a lowercase slug
@@ -284,8 +313,11 @@ release via the update entity or `redeploy`.
   password can't burn through a lockout threshold.
 - The integration only writes paths it owns: `/var/brilliant-mqtt/**`
   (including the Wi-Fi watchdog code, and `/var/brilliant-mqtt/bus_watchdog/**`
-  for the bus watchdog, when enabled), `/var/brilliant-voice/**` (when voice is
-  enabled), `/etc/brilliant-mqtt.env` (mode `0600`), `/etc/brilliant-voice.env`
+  for the bus watchdog, when enabled, content-addressed public MQTT CA files
+  under `/var/brilliant-mqtt/tls/`, and the retained-topic ledger under
+  `/var/brilliant-mqtt/state/`), `/var/brilliant-voice/**` (when voice is
+  enabled), `/etc/brilliant-mqtt.env` (mode `0600`; its staged restore copy is
+  also `0600`), `/etc/brilliant-voice.env`
   (mode `0600`), and the systemd units
   `/etc/systemd/system/brilliant-mqtt.service` /
   `brilliant-voice.service` / `brilliant-wifi-watchdog.service` /

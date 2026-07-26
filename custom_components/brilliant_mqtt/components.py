@@ -29,6 +29,8 @@ from .const import (
     CONF_MQTT_HOST,
     CONF_MQTT_PASSWORD,
     CONF_MQTT_PORT,
+    CONF_MQTT_TLS_CA,
+    CONF_MQTT_TLS_ENABLED,
     CONF_MQTT_USERNAME,
     CONF_PANEL,
     CONF_VOICE_HA_HOST,
@@ -63,6 +65,13 @@ async def _bridge_install(hass: HomeAssistant, shell: PanelShell, data: Mapping[
     payload_dir = _mgr._payload_dir()
     unit = await hass.async_add_executor_job((payload_dir / "brilliant-mqtt.service").read_text)
     version = (await hass.async_add_executor_job((payload_dir / "VERSION").read_text)).strip()
+    mqtt_tls_enabled = data.get(CONF_MQTT_TLS_ENABLED, False) is True
+    mqtt_tls_ca = data.get(CONF_MQTT_TLS_CA)
+    if mqtt_tls_ca and not mqtt_tls_enabled:
+        raise ValueError("mqtt_tls_ca_requires_tls")
+    mqtt_tls_ca_file = (
+        await panel_ops.stage_mqtt_ca(shell, mqtt_tls_ca.encode()) if mqtt_tls_ca else None
+    )
     env = panel_ops.render_env(
         panel=data[CONF_PANEL],
         mesh_priority=data[CONF_MESH_PRIORITY],
@@ -71,6 +80,8 @@ async def _bridge_install(hass: HomeAssistant, shell: PanelShell, data: Mapping[
         mqtt_username=data[CONF_MQTT_USERNAME],
         mqtt_password=data[CONF_MQTT_PASSWORD],
         scene_bridge_enabled=data.get(CONF_HA_CONTROL_ENABLED, DEFAULT_HA_CONTROL_ENABLED) is True,
+        mqtt_tls_enabled=mqtt_tls_enabled,
+        mqtt_tls_ca_file=mqtt_tls_ca_file,
     )
     await panel_ops.deploy_payload(shell, str(payload_dir), version)
     await panel_ops.ensure_configs(shell, unit, env)

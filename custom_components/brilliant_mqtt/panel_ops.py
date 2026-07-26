@@ -9,6 +9,7 @@ and /etc/systemd/system/brilliant-mqtt.service (see the design spec §7).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 from dataclasses import dataclass
 
@@ -31,6 +32,8 @@ from .const import (
     PANEL_HUE_CA_DIR,
     PANEL_HUE_CA_SERVICE_UNIT_FILE,
     PANEL_HUE_CA_TIMER_UNIT_FILE,
+    PANEL_MQTT_TLS_DIR,
+    PANEL_RETAINED_TOPICS_FILE,
     PANEL_STAGED_DIR,
     PANEL_UNIT_FILE,
     PANEL_VAR_DIR,
@@ -152,6 +155,9 @@ ENV_MQTT_HOST = "MQTT_HOST"
 ENV_MQTT_PORT = "MQTT_PORT"
 ENV_MQTT_USERNAME = "MQTT_USERNAME"
 ENV_MQTT_PASSWORD = "MQTT_PASSWORD"
+ENV_MQTT_TLS_ENABLED = "MQTT_TLS_ENABLED"
+ENV_MQTT_TLS_CA_FILE = "MQTT_TLS_CA_FILE"
+ENV_RETAINED_TOPICS_FILE = "RETAINED_TOPICS_FILE"
 ENV_MESH_PRIORITY = "MESH_PRIORITY"
 ENV_SCENE_BRIDGE_ENABLED = "SCENE_BRIDGE_ENABLED"
 
@@ -164,18 +170,29 @@ def render_env(
     mqtt_username: str,
     mqtt_password: str,
     scene_bridge_enabled: bool = False,
+    mqtt_tls_enabled: bool = False,
+    mqtt_tls_ca_file: str | None = None,
 ) -> str:
     """Render /etc/brilliant-mqtt.env — exactly what the agent's config.py reads.
 
     String values are quoted via _env_quote (user-typed broker passwords routinely
     contain `#`, quotes, `$`, backslash); the int fields are safe and stay bare.
     """
-    return (
+    if mqtt_tls_ca_file and not mqtt_tls_enabled:
+        raise ValueError("mqtt_tls_ca_file_requires_tls")
+
+    broker_env = (
         f"{ENV_PANEL}={_env_quote(panel)}\n"
         f"{ENV_MQTT_HOST}={_env_quote(mqtt_host)}\n"
         f"{ENV_MQTT_PORT}={mqtt_port}\n"
         f"{ENV_MQTT_USERNAME}={_env_quote(mqtt_username)}\n"
         f"{ENV_MQTT_PASSWORD}={_env_quote(mqtt_password)}\n"
+        f"{ENV_MQTT_TLS_ENABLED}={1 if mqtt_tls_enabled else 0}\n"
+    )
+    if mqtt_tls_ca_file:
+        broker_env += f"{ENV_MQTT_TLS_CA_FILE}={mqtt_tls_ca_file}\n"
+    return (
+        broker_env + f"{ENV_RETAINED_TOPICS_FILE}={PANEL_RETAINED_TOPICS_FILE}\n"
         f"{ENV_MESH_PRIORITY}={mesh_priority}\n"
         f"{ENV_SCENE_BRIDGE_ENABLED}={1 if scene_bridge_enabled else 0}\n"
         f"LOG_LEVEL=INFO\n"
@@ -240,6 +257,15 @@ async def write_env(shell: PanelShell, env_content: str) -> None:
     env_bytes = env_content.encode()
     await shell.put_bytes(env_bytes, PANEL_ENV_FILE, 0o600)
     await shell.put_bytes(env_bytes, _STAGED_ENV, 0o600)
+
+
+async def stage_mqtt_ca(shell: PanelShell, ca_bytes: bytes) -> str:
+    """Upload an immutable custom MQTT CA and return its content-addressed path."""
+    await _checked(shell, f"mkdir -p {PANEL_MQTT_TLS_DIR}")
+    digest = hashlib.sha256(ca_bytes).hexdigest()[:16]
+    remote_path = f"{PANEL_MQTT_TLS_DIR}/mqtt-ca-{digest}.pem"
+    await shell.put_bytes(ca_bytes, remote_path, 0o644)
+    return remote_path
 
 
 async def ensure_configs(shell: PanelShell, unit_content: str, env_content: str) -> None:

@@ -13,7 +13,13 @@ quick reference.
   partition — survives OTA, unlike `/data`).
   - `/var/brilliant-mqtt/app/brilliant_mqtt/…` — our package
   - `/var/brilliant-mqtt/vendor/…` — vendored pure-python deps (aiomqtt, paho-mqtt)
-- **Config:** `/etc/brilliant-mqtt.env` (panel slug + MQTT creds).
+  - `/var/brilliant-mqtt/tls/mqtt-ca-<hash>.pem` — immutable public custom CAs
+    when strict custom-CA MQTT TLS is used
+  - `/var/brilliant-mqtt/state/owned-topics.json` — retained-topic ownership
+    ledger
+- **Config:** `/etc/brilliant-mqtt.env` (panel slug + MQTT credentials/TLS
+  path, mode `0600`), with its OTA restore copy under
+  `/var/brilliant-mqtt/system/` also mode `0600`.
 - **Service:** systemd `brilliant-mqtt.service`, `Restart=always`, resource-capped
   (`MemoryMax`, `CPUQuota`, `Nice`) so a bug can't degrade the panel UI.
 
@@ -36,16 +42,46 @@ addition to the panel's own site-packages it already exposes).
 
 ## MQTT credentials (no secrets in git)
 
-- Any LAN-reachable Mosquitto-compatible broker works; if you have none, Home
-  Assistant's official Mosquitto add-on does — full setup in
-  [INSTALL.md](../../INSTALL.md#step-2--set-up-the-mqtt-broker).
-- Use a dedicated `brilliant` user; keep its password in your secret store and
-  inject it into `/etc/brilliant-mqtt.env` (mode 0600) at deploy time.
-- **ACL:** grant `brilliant` → `brilliant/#` (rw) + `homeassistant/#` (write, for
-  discovery). Mosquitto ACL **deny is silent** — get it right or state/commands
-  vanish with no error.
+- The recommended shortcut is Home Assistant's official Mosquitto Broker
+  app/add-on (`core_mosquitto`), but it is never required or managed by this
+  integration. An existing local, remote, or hosted Mosquitto-compatible
+  broker is equally supported.
+- Configure Home Assistant's MQTT integration first, then use a broker
+  hostname/IP and TCP port that every panel can resolve and reach. Do not
+  assume the app's internal hostname is reachable from the panel VLAN.
+- Use a dedicated, non-owner `brilliant` principal. Keep its password in your
+  secret store and inject it into `/etc/brilliant-mqtt.env` at deploy time.
+  Never extract or reuse Home Assistant's hidden generated MQTT credential.
+- **ACL:** the panel principal needs `brilliant/#` (read/write) and
+  `homeassistant/#` (write). The Home Assistant principal also needs
+  `brilliant/#` (read/write), `homeassistant/#` (read), narrow validation
+  cleanup write access to `homeassistant/brilliant_mqtt_setup/+/probe` (or
+  broader existing write access), and its normal birth/will/status permissions.
+  Mosquitto ACL **deny is silent**—get either direction wrong and state or
+  commands can vanish with no client error.
+- Keep Home Assistant's MQTT Discovery prefix fixed at `homeassistant`.
 - After restarting the broker, check that your OTHER MQTT clients reconnected —
   some (e.g. certain container deployments) need a restart after a broker roll.
+
+The [MQTT broker prerequisite guide](../install/mqtt-broker.md) has the exact
+principal table, official source links, and stable remediation anchors for the
+onboarding validator. Validation proves authentication, both message
+directions, discovery write access, and retained-message behavior; it does not
+modify broker users, ACLs, or configuration.
+
+## MQTT TLS
+
+The panel supports plaintext TCP (`MQTT_TLS_ENABLED=0`), strict TLS with its
+system/public CA store (`MQTT_TLS_ENABLED=1` with no CA file), and strict TLS
+with a custom public CA. For the custom-CA path, the integration uploads the
+exact CA bytes as mode `0644` to a content-addressed path below
+`/var/brilliant-mqtt/tls/`; the mode-`0600` environment stores only that path.
+Old CA files are not rewritten or deleted during staging, so an older
+environment snapshot can still reference its prior trust material.
+
+TLS verifies both hostname and certificate chain and never falls back to
+plaintext. Anonymous access, insecure certificate bypass, mutual TLS, and MQTT
+over WebSockets are unsupported by the panel transport.
 
 ## OTA survival
 

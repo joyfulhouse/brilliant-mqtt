@@ -38,6 +38,8 @@ _FULL_INSPECT = RunResult(
     "unit=1\nenv=1\nenabled=1\nactive=1\nsunit=1\nsenv=1\npayload=1\n9.9.9\n",
     "",
 )
+_TEST_MQTT_CA = b"test-ca\n"
+_TEST_MQTT_CA_PATH = "/var/brilliant-mqtt/tls/mqtt-ca-0fa6a631898df0f5.pem"
 
 
 async def _connected(shell: FakeShell) -> FakeShell:
@@ -111,10 +113,72 @@ def test_render_env_matches_agent_config_contract() -> None:
         "MQTT_PORT=1883",
         'MQTT_USERNAME="brilliant"',
         'MQTT_PASSWORD="secret"',
+        "MQTT_TLS_ENABLED=0",
+        "RETAINED_TOPICS_FILE=/var/brilliant-mqtt/state/owned-topics.json",
         "MESH_PRIORITY=1",
         "SCENE_BRIDGE_ENABLED=1",
         "LOG_LEVEL=INFO",
     ]
+
+
+def test_render_env_custom_tls_uses_only_content_addressed_ca_path() -> None:
+    env = panel_ops.render_env(
+        panel="office",
+        mesh_priority=1,
+        mqtt_host='broker "quoted".example',
+        mqtt_port=8883,
+        mqtt_username='fleet # "user"',
+        mqtt_password='p#a"s\\word',
+        mqtt_tls_enabled=True,
+        mqtt_tls_ca_file=_TEST_MQTT_CA_PATH,
+    )
+
+    assert "MQTT_TLS_ENABLED=1\n" in env
+    assert f"MQTT_TLS_CA_FILE={_TEST_MQTT_CA_PATH}\n" in env
+    assert "RETAINED_TOPICS_FILE=/var/brilliant-mqtt/state/owned-topics.json\n" in env
+    assert "test-ca" not in env
+    assert "test-ca" not in repr(env)
+    parsed = panel_ops.parse_env(env)
+    assert parsed["MQTT_HOST"] == 'broker "quoted".example'
+    assert parsed["MQTT_USERNAME"] == 'fleet # "user"'
+    assert parsed["MQTT_PASSWORD"] == 'p#a"s\\word'
+
+
+@pytest.mark.parametrize(
+    ("tls_enabled", "expected_tls_line"),
+    [(False, "MQTT_TLS_ENABLED=0"), (True, "MQTT_TLS_ENABLED=1")],
+)
+def test_render_env_without_custom_ca_uses_plaintext_or_system_trust(
+    tls_enabled: bool,
+    expected_tls_line: str,
+) -> None:
+    env = panel_ops.render_env(
+        panel="office",
+        mesh_priority=1,
+        mqtt_host="broker.example",
+        mqtt_port=8883 if tls_enabled else 1883,
+        mqtt_username="fleet",
+        mqtt_password="password",
+        mqtt_tls_enabled=tls_enabled,
+    )
+
+    assert expected_tls_line in env.splitlines()
+    assert "MQTT_TLS_CA_FILE=" not in env
+    assert "RETAINED_TOPICS_FILE=/var/brilliant-mqtt/state/owned-topics.json" in env.splitlines()
+
+
+def test_render_env_rejects_custom_ca_path_without_tls() -> None:
+    with pytest.raises(ValueError, match="mqtt_tls_ca_file_requires_tls"):
+        panel_ops.render_env(
+            panel="office",
+            mesh_priority=1,
+            mqtt_host="broker.example",
+            mqtt_port=1883,
+            mqtt_username="fleet",
+            mqtt_password="password",
+            mqtt_tls_enabled=False,
+            mqtt_tls_ca_file=_TEST_MQTT_CA_PATH,
+        )
 
 
 def _password_line(password: str) -> str:
@@ -181,6 +245,8 @@ def test_parse_env_round_trips_render_env() -> None:
         "MQTT_PORT": "8883",
         "MQTT_USERNAME": "brilliant",
         "MQTT_PASSWORD": 'p#a"s\\s',
+        "MQTT_TLS_ENABLED": "0",
+        "RETAINED_TOPICS_FILE": "/var/brilliant-mqtt/state/owned-topics.json",
         "MESH_PRIORITY": "7",
         "SCENE_BRIDGE_ENABLED": "0",
         "LOG_LEVEL": "INFO",
@@ -252,6 +318,27 @@ async def test_write_env_raises_when_mkdir_fails() -> None:
     )
     with pytest.raises(panel_ops.PanelOpError, match="exited 1"):
         await panel_ops.write_env(shell, "ENVDATA")
+    assert shell.uploads == []
+
+
+async def test_stage_mqtt_ca_preserves_exact_bytes_and_public_mode() -> None:
+    shell = await _connected(FakeShell())
+
+    path = await panel_ops.stage_mqtt_ca(shell, _TEST_MQTT_CA)
+
+    assert path == _TEST_MQTT_CA_PATH
+    assert shell.commands == ["mkdir -p /var/brilliant-mqtt/tls"]
+    assert shell.uploads == [(_TEST_MQTT_CA_PATH, _TEST_MQTT_CA, 0o644)]
+
+
+async def test_stage_mqtt_ca_mkdir_failure_prevents_upload() -> None:
+    mkdir = "mkdir -p /var/brilliant-mqtt/tls"
+    shell = await _connected(FakeShell(responses={mkdir: RunResult(1, "", "permission denied\n")}))
+
+    with pytest.raises(panel_ops.PanelOpError, match="exited 1"):
+        await panel_ops.stage_mqtt_ca(shell, _TEST_MQTT_CA)
+
+    assert shell.commands == [mkdir]
     assert shell.uploads == []
 
 

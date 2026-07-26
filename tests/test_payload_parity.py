@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import subprocess
 from pathlib import Path
+
+import brilliant_mqtt
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 SOURCE_ROOT = REPOSITORY_ROOT / "src" / "brilliant_mqtt"
@@ -22,6 +25,8 @@ PAYLOAD_WORKFLOWS = (
     REPOSITORY_ROOT / ".github" / "workflows" / "release.yml",
 )
 PAYLOAD_RELATIVE_PATH = Path("custom_components/brilliant_mqtt/agent_payload")
+PAYLOAD_VERSION_FILE = REPOSITORY_ROOT / PAYLOAD_RELATIVE_PATH / "VERSION"
+EXPECTED_PAYLOAD_VERSION = "0.6.0"
 
 
 def _sha256_files(root: Path) -> dict[str, str]:
@@ -83,6 +88,28 @@ def test_committed_agent_payload_matches_source_tree() -> None:
         f"extra={extra}\n"
         f"changed={changed}"
     )
+
+
+def test_project_source_and_payload_versions_are_0_6_0() -> None:
+    project_source = (REPOSITORY_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    project_section = project_source.split("[project]", maxsplit=1)[1].split("\n[", maxsplit=1)
+    version_match = re.search(r'^version = "([^"]+)"$', project_section[0], re.MULTILINE)
+
+    assert version_match is not None
+    assert version_match.group(1) == EXPECTED_PAYLOAD_VERSION
+    assert brilliant_mqtt.__version__ == EXPECTED_PAYLOAD_VERSION
+    assert PAYLOAD_VERSION_FILE.read_text(encoding="utf-8").strip() == EXPECTED_PAYLOAD_VERSION
+
+
+def test_preflight_and_retained_topic_modules_are_packaged_byte_for_byte() -> None:
+    for relative_path in (
+        Path("setup_protocol.py"),
+        Path("preflight.py"),
+        Path("retained_topics.py"),
+    ):
+        assert (PAYLOAD_ROOT / relative_path).read_bytes() == (
+            SOURCE_ROOT / relative_path
+        ).read_bytes()
 
 
 def test_payload_build_pins_every_vendored_mqtt_distribution_without_deps() -> None:

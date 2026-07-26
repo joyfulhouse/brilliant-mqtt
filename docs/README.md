@@ -9,8 +9,10 @@ prerequisites checklist and deploy choice, and links these focused guides:
 
 - [install/root-ssh.md](install/root-ssh.md) — enabling Brilliant's official
   root SSH on a panel, with caveats and a verify step.
-- [install/mqtt-broker.md](install/mqtt-broker.md) — standalone Mosquitto or
-  the Home Assistant Mosquitto add-on, plus the dedicated user and ACL.
+- [install/mqtt-broker.md](install/mqtt-broker.md) — the recommended official
+  Home Assistant Mosquitto app/add-on (`core_mosquitto`), an equally supported
+  existing local/remote/hosted broker, strict TLS profiles, the two-principal
+  ACL, and validation-error remediation.
 
 ## User guides
 

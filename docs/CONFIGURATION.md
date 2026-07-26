@@ -20,7 +20,28 @@ configuration management; keep credentials out of git).
 | `MQTT_PORT` | no | `1883` | Broker TCP port |
 | `MQTT_USERNAME` | yes | — | Broker user (the dedicated `brilliant` user) |
 | `MQTT_PASSWORD` | yes | — | Broker password — store in your secret store, never in git |
+| `MQTT_TLS_ENABLED` | no | `0` | `1` enables strict broker TLS; `0` uses plaintext TCP |
+| `MQTT_TLS_CA_FILE` | no | — | Public custom-CA file used for strict TLS. Requires `MQTT_TLS_ENABLED=1`; omit it to use the panel's system CA store. |
+| `RETAINED_TOPICS_FILE` | no | `/var/brilliant-mqtt/state/owned-topics.json` | OTA-persistent ownership ledger used to clear only retained topics published by this agent. Must stay below `/var/brilliant-mqtt/`. |
 | `LOG_LEVEL` | no | `INFO` | Python log level: `DEBUG` turns on verbose tracing; `WARNING` quiets normal traffic |
+
+### MQTT transport security
+
+The HA integration renders one of three supported profiles:
+
+- **Plaintext:** `MQTT_TLS_ENABLED=0`, with no CA file.
+- **TLS using public/system CAs:** `MQTT_TLS_ENABLED=1`, with no CA file.
+- **TLS using a custom CA:** `MQTT_TLS_ENABLED=1`, with
+  `MQTT_TLS_CA_FILE` pointing to an immutable, content-addressed public CA
+  staged below `/var/brilliant-mqtt/tls/`.
+
+TLS always verifies the certificate chain and broker hostname. It never falls
+back to plaintext or an insecure context. The entered hostname must match the
+certificate (an IP endpoint needs an IP-valid certificate), and the panel's
+clock must be correct. Anonymous MQTT, ignored certificate validation, mutual
+TLS client certificates, and MQTT over WebSockets are unsupported by the panel
+transport in this release. See the
+[broker prerequisite guide](install/mqtt-broker.md#transport-security).
 
 ### Polling and watchdog timers
 
@@ -213,6 +234,8 @@ MQTT_HOST=192.0.2.10
 MQTT_PORT=1883
 MQTT_USERNAME=brilliant
 MQTT_PASSWORD=<your broker password>
+MQTT_TLS_ENABLED=0
+RETAINED_TOPICS_FILE=/var/brilliant-mqtt/state/owned-topics.json
 LOG_LEVEL=INFO
 ```
 
@@ -389,31 +412,46 @@ opt-in governance surfaces, not fleet-wide defaults.
 
 ## Broker user and ACL
 
-The bridge uses a dedicated `brilliant` broker user scoped to its own topics:
+Use the official Home Assistant Mosquitto Broker app/add-on
+(`core_mosquitto`) as the recommended shortcut, or use any existing local,
+remote, or hosted broker reachable by both Home Assistant and the panels. The
+broker guide documents both paths and the required
+[authentication](install/mqtt-broker.md#mqtt-broker-authentication). The
+integration validates the supplied configuration; it never creates users,
+changes ACLs, or manages the broker.
 
-```
-# /etc/mosquitto/acl
+For an external broker, configure both principals:
+
+| Principal | Minimum Brilliant-related access |
+|---|---|
+| Dedicated Brilliant fleet principal used by the panels | Read/write `brilliant/#`; write `homeassistant/#` |
+| Home Assistant MQTT principal | Read/write `brilliant/#`; read `homeassistant/#`; write `homeassistant/brilliant_mqtt_setup/+/probe` for validation cleanup (or retain broader existing write access); keep its normal birth/will/status permissions, including write access to its configured status topic (default `homeassistant/status`) |
+
+The Brilliant principal's equivalent Mosquitto rules are:
+
+```text
 user brilliant
 topic readwrite brilliant/#
 topic write homeassistant/#
 ```
 
-- `brilliant/#` — read/write for state, commands, and availability. This also
-  covers the `brilliant/ha-control/v1/#` control-plane and scene-bridge topics;
-  no extra ACL entry is needed for the panel agent.
-- `homeassistant/#` — write for MQTT Discovery configs
-
-If you use the scene bridge, Home Assistant's own MQTT user must additionally
-be able to read **and publish** under `brilliant/ha-control/v1/#` (the HA
-integration publishes the manifest, state, and commands there). A full-access
-HA broker user already satisfies this.
+- `brilliant/#` covers state, commands, availability, and the
+  `brilliant/ha-control/v1/#` scene/control-plane topics.
+- `homeassistant/#` lets the panel publish MQTT Discovery.
+- Home Assistant's narrow
+  `homeassistant/brilliant_mqtt_setup/+/probe` write permission lets validation
+  independently clear its temporary discovery probe after a device-side
+  disconnect. It is cleanup access, not general discovery publishing.
 
 **Mosquitto ACL denials are silent.** A publish to a denied topic is dropped
 with no error to the client. If entities never appear or commands are silently
 swallowed, check the ACL first — it is the most common cause.
 
-For provisioning steps (password file, `mosquitto.conf` references, and the
-HA Mosquitto add-on path) see [INSTALL.md](../INSTALL.md#step-2--set-up-the-mqtt-broker).
+MQTT Discovery is fixed at `homeassistant` in this release. Keep Home
+Assistant's effective discovery prefix at that value. For provisioning, TLS,
+retained-message requirements, end-to-end onboarding validation, and direct
+links for every validation error, see the
+[MQTT broker prerequisite](install/mqtt-broker.md).
 
 ---
 

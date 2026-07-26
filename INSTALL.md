@@ -14,10 +14,13 @@ Before you start, confirm you have each of these:
 | Requirement | Ready? | Guide |
 |---|---|---|
 | A Brilliant Control panel with **root SSH enabled** | Brilliant's official opt-in; off by default | [docs/install/root-ssh.md](docs/install/root-ssh.md) |
-| An **MQTT broker** reachable from the panels and Home Assistant | Standalone Mosquitto (recommended) or the HA Mosquitto add-on | [docs/install/mqtt-broker.md](docs/install/mqtt-broker.md) |
+| An **MQTT broker** reachable from the panels and Home Assistant | Official Home Assistant Mosquitto app/add-on (`core_mosquitto`) recommended; an existing local, remote, or hosted broker is equally supported | [docs/install/mqtt-broker.md](docs/install/mqtt-broker.md) |
 | **Home Assistant** connected to that broker | *Settings → Devices & Services → Add Integration → MQTT* | — |
 
-If you already have a broker, skip to [broker user and ACL](docs/CONFIGURATION.md#broker-user-and-acl) to add the dedicated `brilliant` user, then go straight to [Deploy](#step-3--deploy-the-agent-to-a-panel).
+If you already have a broker, keep it. Follow the
+[existing-broker prerequisites](docs/install/mqtt-broker.md#existing-broker)
+to connect Home Assistant and configure the two broker principals, then go
+straight to [Deploy](#step-3--deploy-the-agent-to-a-panel).
 
 ## Step 1 — Enable root SSH on the panel
 
@@ -26,9 +29,23 @@ steps. This is Brilliant's official opt-in feature — no jailbreak needed.
 
 ## Step 2 — Set up the MQTT broker
 
-See **[docs/install/mqtt-broker.md](docs/install/mqtt-broker.md)** for
-standalone Mosquitto or the Home Assistant Mosquitto add-on, plus the
-dedicated bridge user and ACL.
+See **[docs/install/mqtt-broker.md](docs/install/mqtt-broker.md)**. The
+recommended shortcut is the official Home Assistant Mosquitto Broker
+app/add-on (`core_mosquitto`), installed and started before onboarding. It is
+not required: an existing local, remote, or hosted broker is a first-class
+path.
+
+Whichever path you choose:
+
+- configure Home Assistant's MQTT integration first;
+- create a dedicated, non-owner Brilliant username/password;
+- use a LAN hostname/IP and TCP port every panel can resolve and reach; and
+- keep Home Assistant's MQTT Discovery prefix set to `homeassistant`.
+
+The Brilliant integration validates authentication, both message directions,
+discovery ACL, and retained messages. It does not install the app, discover
+Home Assistant's hidden MQTT credential, or create/modify broker users, ACLs,
+or configuration.
 
 ## Step 3 — Deploy the agent to a panel
 
@@ -74,7 +91,9 @@ two standbys higher numbers — see [docs/CONFIGURATION.md](docs/CONFIGURATION.m
 |---|---|
 | `/var/brilliant-mqtt/app/` | the `brilliant_mqtt` package |
 | `/var/brilliant-mqtt/vendor/` | vendored pure-Python deps (aiomqtt, paho-mqtt) |
-| `/etc/brilliant-mqtt.env` | panel slug + MQTT credentials |
+| `/etc/brilliant-mqtt.env` | panel slug + MQTT credentials/TLS path (mode `0600`) |
+| `/var/brilliant-mqtt/tls/` | immutable, content-addressed public MQTT CA files when custom-CA TLS is used |
+| `/var/brilliant-mqtt/state/owned-topics.json` | retained-topic ownership ledger used for safe cleanup |
 | `brilliant-mqtt.service` | systemd unit, resource-capped, `Restart=always` |
 
 The app and vendored deps live under `/var` (the persistent partition) so they
