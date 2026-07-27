@@ -26,6 +26,7 @@ from custom_components.brilliant_mqtt.const import (
     COMPONENT_VOICE,
     COMPONENT_WIFI_WATCHDOG,
     CONF_COMPONENTS,
+    CONF_ENTRY_KIND,
     CONF_HA_CONTROL_DOMAINS,
     CONF_HA_CONTROL_ENABLED,
     CONF_HA_CONTROL_LABEL,
@@ -55,6 +56,7 @@ from custom_components.brilliant_mqtt.const import (
     DEFAULT_HA_CONTROL_LABEL,
     DEFAULT_MAX_MIRRORED_ENTITIES,
     DOMAIN,
+    ENTRY_KIND_LEGACY_PENDING_CONSOLIDATION,
     OPT_AUTO_REPAIR,
     OPT_OFFLINE_GRACE_MINUTES,
     OPT_REPAIR_COOLDOWN_MINUTES,
@@ -254,6 +256,7 @@ async def test_not_installed_walks_three_steps(hass: HomeAssistant, payload_dir:
     assert data[CONF_MQTT_HOST] == "192.168.1.250"
     assert data[CONF_MQTT_PASSWORD] == "mqttpass"
     assert data[CONF_MESH_PRIORITY] == 1
+    assert data[CONF_ENTRY_KIND] == ENTRY_KIND_LEGACY_PENDING_CONSOLIDATION
 
     # The agent was actually installed: payload uploaded, unit/env written, service enabled.
     assert install_shell.dir_uploads  # deploy_payload pushed app/+vendor/
@@ -645,6 +648,7 @@ async def test_installed_adopts_from_panel(hass: HomeAssistant) -> None:
     assert data[CONF_MQTT_PASSWORD] == "frombroker"
     assert data[CONF_MESH_PRIORITY] == 3
     assert data[CONF_HA_CONTROL_ENABLED] is True
+    assert data[CONF_ENTRY_KIND] == ENTRY_KIND_LEGACY_PENDING_CONSOLIDATION
 
 
 async def test_installed_duplicate_aborts(hass: HomeAssistant) -> None:

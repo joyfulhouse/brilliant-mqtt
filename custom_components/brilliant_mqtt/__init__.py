@@ -23,6 +23,7 @@ from .const import (
     COMPONENT_HA_MIRROR,
     COMPONENT_VOICE,
     CONF_COMPONENTS,
+    CONF_ENTRY_KIND,
     CONF_HA_CONTROL_DOMAINS,
     CONF_HA_CONTROL_ENABLED,
     CONF_HA_CONTROL_LABEL,
@@ -40,6 +41,7 @@ from .const import (
     DEFAULT_MAX_MIRRORED_ENTITIES,
     DEFAULT_REBOOT_JOURNAL_LINES,
     DOMAIN,
+    ENTRY_KIND_LEGACY_PENDING_CONSOLIDATION,
     MAX_REBOOT_JOURNAL_LINES,
     MIN_REBOOT_JOURNAL_LINES,
     PLATFORMS,
@@ -292,24 +294,26 @@ async def async_migrate_entry(hass: HomeAssistant, entry: BrilliantMqttConfigEnt
             COMPONENT_BRIDGE: True,
             COMPONENT_VOICE: bool(data.get(CONF_VOICE_ENABLED, False)),
         }
-    components = dict(data.get(CONF_COMPONENTS) or {})
-    components[COMPONENT_BRIDGE] = True
-    components[COMPONENT_HA_MIRROR] = False
-    data[CONF_COMPONENTS] = components
+    if entry.version < 3:
+        components = dict(data.get(CONF_COMPONENTS) or {})
+        components[COMPONENT_BRIDGE] = True
+        components[COMPONENT_HA_MIRROR] = False
+        data[CONF_COMPONENTS] = components
 
-    if CONF_HA_CONTROL_LABEL not in data:
-        legacy_label = data.get(CONF_HA_MIRROR_LABEL)
-        data[CONF_HA_CONTROL_LABEL] = (
-            legacy_label.strip()
-            if isinstance(legacy_label, str) and legacy_label.strip()
-            else DEFAULT_HA_CONTROL_LABEL
-        )
-    data.setdefault(CONF_HA_CONTROL_ENABLED, DEFAULT_HA_CONTROL_ENABLED)
-    data.setdefault(CONF_ROOM_OVERRIDES, {})
-    data.setdefault(CONF_HA_CONTROL_DOMAINS, list(DEFAULT_HA_CONTROL_DOMAINS))
-    data.setdefault(CONF_MAX_MIRRORED_ENTITIES, DEFAULT_MAX_MIRRORED_ENTITIES)
-    data.setdefault(CONF_SCENE_PANEL, data.get(CONF_PANEL, ""))
-    data.setdefault(CONF_SCENE_ACTIONS, {})
+        if CONF_HA_CONTROL_LABEL not in data:
+            legacy_label = data.get(CONF_HA_MIRROR_LABEL)
+            data[CONF_HA_CONTROL_LABEL] = (
+                legacy_label.strip()
+                if isinstance(legacy_label, str) and legacy_label.strip()
+                else DEFAULT_HA_CONTROL_LABEL
+            )
+        data.setdefault(CONF_HA_CONTROL_ENABLED, DEFAULT_HA_CONTROL_ENABLED)
+        data.setdefault(CONF_ROOM_OVERRIDES, {})
+        data.setdefault(CONF_HA_CONTROL_DOMAINS, list(DEFAULT_HA_CONTROL_DOMAINS))
+        data.setdefault(CONF_MAX_MIRRORED_ENTITIES, DEFAULT_MAX_MIRRORED_ENTITIES)
+        data.setdefault(CONF_SCENE_PANEL, data.get(CONF_PANEL, ""))
+        data.setdefault(CONF_SCENE_ACTIONS, {})
+    data[CONF_ENTRY_KIND] = ENTRY_KIND_LEGACY_PENDING_CONSOLIDATION
     hass.config_entries.async_update_entry(entry, data=data, version=CONFIG_ENTRY_VERSION)
     return True
 

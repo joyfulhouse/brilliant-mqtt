@@ -484,3 +484,59 @@ async def test_migrate_v1_no_voice_defaults_components_off(hass: HomeAssistant) 
         COMPONENT_VOICE: False,
         COMPONENT_HA_MIRROR: False,
     }
+
+
+async def test_migrate_v3_marks_only_current_entry_and_preserves_runtime(
+    hass: HomeAssistant,
+) -> None:
+    """The compatibility hook cannot coordinate or mutate a sibling entry."""
+    current_data = {
+        **ENTRY_DATA,
+        "future_legacy_data": {"must": ["survive"]},
+    }
+    current_options = {
+        "auto_repair": False,
+        "future_legacy_option": {"must": ["survive"]},
+    }
+    current = MockConfigEntry(
+        domain=DOMAIN,
+        version=3,
+        data=current_data,
+        options=current_options,
+        unique_id="office",
+    )
+    sibling_data = {**ENTRY_DATA, CONF_PANEL: "kitchen", "sibling": "untouched"}
+    sibling_options = {"auto_repair": True}
+    sibling = MockConfigEntry(
+        domain=DOMAIN,
+        version=3,
+        data=sibling_data,
+        options=sibling_options,
+        unique_id="kitchen",
+    )
+    current.add_to_hass(hass)
+    sibling.add_to_hass(hass)
+    runtime = object()
+    current.runtime_data = runtime
+    original_update = hass.config_entries.async_update_entry
+
+    with patch.object(
+        hass.config_entries,
+        "async_update_entry",
+        wraps=original_update,
+    ) as update_entry:
+        assert await async_migrate_entry(hass, current) is True
+        assert await async_migrate_entry(hass, current) is True
+
+    assert current.version == CONFIG_ENTRY_VERSION
+    assert current.data == {
+        **current_data,
+        "entry_kind": "legacy_pending_consolidation",
+    }
+    assert dict(current.options) == current_options
+    assert current.runtime_data is runtime
+    assert sibling.version == 3
+    assert dict(sibling.data) == sibling_data
+    assert dict(sibling.options) == sibling_options
+    assert update_entry.call_count == 1
+    assert update_entry.call_args.args[0] is current

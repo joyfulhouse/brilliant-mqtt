@@ -33,6 +33,7 @@ from .const import (
     COMPONENT_HA_MIRROR,
     COMPONENT_VOICE,
     CONF_COMPONENTS,
+    CONF_ENTRY_KIND,
     CONF_HA_CONTROL_DOMAINS,
     CONF_HA_CONTROL_ENABLED,
     CONF_HA_CONTROL_LABEL,
@@ -63,6 +64,7 @@ from .const import (
     DEFAULT_TRUST_HOST_KEY_CHANGES,
     DEFAULT_VOICE_WAKE_WORD,
     DOMAIN,
+    ENTRY_KIND_LEGACY_PENDING_CONSOLIDATION,
     HA_CONTROL_DOMAINS,
     MESH_PANEL,
     OPT_AUTO_REPAIR,
@@ -85,6 +87,15 @@ _PREFILL_KEYS = (
     CONF_MQTT_USERNAME,
     CONF_MQTT_PASSWORD,
 )
+
+
+def _legacy_entry_payload(data: Mapping[str, Any]) -> dict[str, Any]:
+    """Mark entries created by the interim panel-first flow for consolidation."""
+    return {
+        **data,
+        CONF_ENTRY_KIND: ENTRY_KIND_LEGACY_PENDING_CONSOLIDATION,
+    }
+
 
 # Free-text fields that flow into the on-panel env file / SSH; a control char here
 # corrupts the env file (panel_ops `_env_quote` rejects it as a hard backstop), so
@@ -641,11 +652,13 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
                             inherited[CONF_HA_CONTROL_ENABLED] = adopted[CONF_HA_CONTROL_ENABLED]
                         return self.async_create_entry(
                             title=f"Brilliant {adopted[CONF_PANEL]}",
-                            data={
-                                **self._connect,
-                                **adopted,
-                                **inherited,
-                            },
+                            data=_legacy_entry_payload(
+                                {
+                                    **self._connect,
+                                    **adopted,
+                                    **inherited,
+                                }
+                            ),
                         )
         schema = vol.Schema(
             {
@@ -762,7 +775,10 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
                             fleet_entry,
                             data={**fleet_entry.data, **copy.deepcopy(control_values)},
                         )
-                    return self.async_create_entry(title=f"Brilliant {slug}", data=entry_data)
+                    return self.async_create_entry(
+                        title=f"Brilliant {slug}",
+                        data=_legacy_entry_payload(entry_data),
+                    )
         inherited = _inherited_globals(self._async_current_entries(), "")
         schema = vol.Schema(
             {

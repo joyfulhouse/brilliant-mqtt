@@ -5,7 +5,11 @@ from __future__ import annotations
 from homeassistant.const import Platform
 
 DOMAIN = "brilliant_mqtt"
-CONFIG_ENTRY_VERSION = 3
+CONFIG_ENTRY_VERSION = 4
+ENTRY_KIND_FLEET = "fleet"
+ENTRY_KIND_LEGACY_PENDING_CONSOLIDATION = "legacy_pending_consolidation"
+SUBENTRY_TYPE_PANEL = "panel"
+FLEET_UNIQUE_ID = "brilliant_mqtt_fleet"
 PLATFORMS: list[Platform] = [
     Platform.BINARY_SENSOR,
     Platform.BUTTON,
@@ -15,6 +19,16 @@ PLATFORMS: list[Platform] = [
 ]
 
 # Config entry data keys (one entry per panel; each stores ITS OWN root password).
+CONF_ENTRY_KIND = "entry_kind"
+CONF_BROKER_KIND = "broker_kind"
+CONF_SCHEMA_VERSION = "schema_version"
+CONF_NEXT_MESH_PRIORITY = "next_mesh_priority"
+CONF_IDENTITY_FINGERPRINT = "identity_fingerprint"
+CONF_SSH_HOST_KEY = "ssh_host_key"
+CONF_SSH_USERNAME = "ssh_username"
+CONF_MANAGEMENT_ID = "management_id"
+CONF_FEATURE_OVERRIDES = "feature_overrides"
+CONF_PROVISIONING_TRANSACTION_ID = "provisioning_transaction_id"
 CONF_HOST = "host"
 CONF_ROOT_PASSWORD = "root_password"
 CONF_PANEL = "panel"
@@ -70,7 +84,7 @@ COMPONENT_HA_MIRROR = "ha_mirror"
 COMPONENT_HUE_CA = "hue_ca"
 
 # Internally managed config-entry state (never shown in a config-flow form).
-DATA_SSH_HOST_KEY = "ssh_host_key"  # TOFU-pinned on first successful connect
+DATA_SSH_HOST_KEY = CONF_SSH_HOST_KEY  # TOFU-pinned on first successful connect
 DATA_LAST_FIRMWARE = "last_firmware"  # persisted so panel_updated survives HA restarts
 DATA_CONTROL_PLANE = "ha_control_plane"
 DATA_HA_MIRROR_RETIRE_VERIFIED = "ha_mirror_retire_verified"
