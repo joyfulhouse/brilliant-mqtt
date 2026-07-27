@@ -7,6 +7,7 @@ test suite executes off-panel.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -44,6 +45,10 @@ class WriteThrottle:
     bounds the rate on the shared bus across all Bridge instances."""
 
     last_ts: float | None = None
+
+
+class HotPollReadTimeout(RuntimeError):
+    """A hot-poll snapshot read missed its panel RPC deadline."""
 
 
 def _state_payload(device: BrilliantDevice) -> str:
@@ -293,7 +298,13 @@ class Bridge:
         reconnects). Discovery/subscribe stay reconcile-only; the diff cache
         keeps the fast cadence from spamming identical retained payloads.
         """
-        devices = await self._bus.get_all()
+        try:
+            devices = await self._bus.get_all()
+        except (TimeoutError, asyncio.TimeoutError) as error:
+            # Type only the scoped READ boundary. The session coordinator may
+            # grant one retry without also swallowing MQTT publish or desired
+            # write timeouts from the rest of this method.
+            raise HotPollReadTimeout("hot poll bus read timed out") from error
         self._beat()
         for device in devices:
             # Same scope filter as reconcile: the shared get_all returns every

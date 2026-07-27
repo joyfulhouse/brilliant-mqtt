@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 
 from brilliant_mqtt import __version__
-from brilliant_mqtt.bridge import Bridge, WriteThrottle
+from brilliant_mqtt.bridge import Bridge, HotPollReadTimeout, WriteThrottle
 from brilliant_mqtt.bus import RpcBusAdapter
 from brilliant_mqtt.config import Settings
 from brilliant_mqtt.desired_state import DesiredState
@@ -32,6 +32,10 @@ log = logging.getLogger(__name__)
 
 # Backoff before reconnecting after a failed/ended session.
 _BACKOFF_S = 5
+# A ledger failure requires operator action (repair the file/filesystem), not a
+# hot reconnect loop. Keep retrying so recovery is automatic, but slowly enough
+# that one affected panel cannot churn the broker.
+_LEDGER_BACKOFF_S = 60.0
 # Loop tick when the hot poll is disabled (stale checks still need a cadence).
 _IDLE_TICK_S = 30.0
 
@@ -218,6 +222,7 @@ async def _run_session(
 
         tick = settings.hot_poll_seconds if settings.hot_poll_seconds > 0 else _IDLE_TICK_S
         next_resync = time.monotonic() + settings.resync_seconds
+        consecutive_hot_poll_timeouts = 0
         while True:
             await asyncio.sleep(tick)
 
@@ -247,9 +252,23 @@ async def _run_session(
             # Hot poll: bounds state staleness at the poll cadence; the
             # bridge's diff cache keeps unchanged payloads off MQTT.
             if settings.hot_poll_seconds > 0:
-                await panel_bridge.poll_once()
-                if participating and leader.is_leader:
-                    await mesh_bridge.poll_once()
+                try:
+                    await panel_bridge.poll_once()
+                    if participating and leader.is_leader:
+                        await mesh_bridge.poll_once()
+                except HotPollReadTimeout:
+                    if consecutive_hot_poll_timeouts >= 1:
+                        raise
+                    consecutive_hot_poll_timeouts = 1
+                    log.warning(
+                        "hot poll bus read timed out; retrying once before rebuilding session"
+                    )
+                    # Treat panel + elected-mesh polling as one atomic health
+                    # cycle. Do not run a due reconcile after a partial read.
+                    continue
+                else:
+                    # Only a fully successful combined cycle earns fresh grace.
+                    consecutive_hot_poll_timeouts = 0
 
             # Periodic level-triggered resync: republishes retained discovery
             # + state, covering any push notifications that were missed.
@@ -319,6 +338,10 @@ async def run(settings: Settings) -> None:
             await _run_session(settings, desired_panel, desired_mesh)
         except asyncio.CancelledError:
             raise
+        except RetainedLedgerError:
+            log.exception("retained ledger unavailable; will reconnect after extended backoff")
+            await asyncio.sleep(_LEDGER_BACKOFF_S)
+            continue
         except Exception:
             log.exception("bridge session failed; will reconnect after backoff")
         await asyncio.sleep(_BACKOFF_S)

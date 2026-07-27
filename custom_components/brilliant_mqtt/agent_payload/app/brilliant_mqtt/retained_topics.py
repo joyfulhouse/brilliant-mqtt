@@ -179,6 +179,8 @@ class RetainedTopicLedger:
         try:
             write.result()
         except OSError as error:
+            if cancellation is not None:
+                raise cancellation from error
             raise RetainedLedgerError("could not persist retained ledger") from error
         self._state.topics = topics
         if cancellation is not None:

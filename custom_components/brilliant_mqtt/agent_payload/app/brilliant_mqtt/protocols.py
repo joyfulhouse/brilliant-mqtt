@@ -24,7 +24,12 @@ class BusClient(Protocol):
         ...
 
     async def get_all(self) -> list[BrilliantDevice]:
-        """Return all peripherals already scoped to this panel."""
+        """Return all peripherals already scoped to this panel.
+
+        Raises built-in ``TimeoutError`` or ``asyncio.TimeoutError`` when a
+        scoped panel RPC misses its request deadline (the panel runs Python
+        3.10, where those are distinct classes).
+        """
         ...
 
     async def get_peripheral(self, device_id: str, peripheral_id: str) -> BrilliantDevice | None:

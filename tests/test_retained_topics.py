@@ -447,6 +447,39 @@ async def test_cancellation_keeps_write_serialized_until_thread_finishes(
     assert mqtt.published_qos == [1, 0]
 
 
+async def test_cancellation_remains_primary_when_shielded_write_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "owned-topics.json"
+    ledger = await _loaded_ledger(path)
+    mqtt = FakeMqtt()
+    loop = asyncio.get_running_loop()
+    write_started = asyncio.Event()
+    release_write = threading.Event()
+
+    def failing_write(write_path: Path, payload: str) -> NoReturn:
+        del write_path, payload
+        loop.call_soon_threadsafe(write_started.set)
+        release_write.wait()
+        raise OSError("simulated persistence failure")
+
+    monkeypatch.setattr(retained_topics_module, "_write_payload", failing_write)
+    publish = asyncio.create_task(ledger.async_publish(mqtt, "brilliant/kitchen/bridge", "{}"))
+    await write_started.wait()
+
+    publish.cancel()
+    await asyncio.sleep(0)
+    release_write.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await publish
+
+    assert ledger.topics == frozenset()
+    assert mqtt.published == []
+    assert not path.exists()
+
+
 async def test_loaded_instances_for_normalized_path_publish_union(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -369,8 +369,10 @@ git commit -m "feat: guide conflicting fleet consolidation"
 
 **Files:**
 - Modify: src/brilliant_mqtt/retained_topics.py
+- Modify: src/brilliant_mqtt/scene_bridge.py
 - Create: src/brilliant_mqtt/ownership_seed.py
 - Modify: tests/test_retained_topics.py
+- Modify: tests/test_scene_bridge.py
 - Create: tests/test_ownership_seed.py
 - Modify: scripts/build_payload.sh
 - Modify: custom_components/brilliant_mqtt/agent_payload/
@@ -394,7 +396,7 @@ git commit -m "feat: guide conflicting fleet consolidation"
 
 - [ ] **Step 1: Write failing seed and defensive manifest tests**
 
-Agent tests prove seed rejects a mismatched slug, brilliant/mesh, mesh discovery, unknown topic shape, duplicate, 4,097 topics, and canonical JSON above 256 KiB. It writes atomically and publishes the ownership manifest at QoS 1 before success. The CLI imports no bus module and emits one redacted JSON result.
+Agent tests prove seed rejects a mismatched slug, brilliant/mesh, mesh discovery, unknown topic shape, duplicate, 4,097 topics, and canonical JSON above 256 KiB. Exact panel-scoped retained scene/mode catalog and scene/mode transport-status topics are accepted; non-retained event, command, and result topics are rejected. It writes atomically and publishes the ownership manifest at QoS 1 before success. The CLI imports no bus module and emits one redacted JSON result.
 
 HA tests parse a retained ownership payload only when:
 
@@ -402,14 +404,21 @@ HA tests parse a retained ownership payload only when:
 - keys are exactly schema_version, panel_slug, topics;
 - slug matches;
 - count/bytes are within bounds;
-- every brilliant topic matches a known retained shape;
+- every brilliant topic matches a known retained shape, including only the
+  exact panel-scoped retained scene/mode catalog and transport-status shapes;
 - every discovery topic's currently retained config payload parses as JSON and contains device.identifiers including f"brilliant_panel_{slug}".
 
 Reject legacy/single-string device identifiers, a different panel, absent retained config, invalid JSON, and any mesh identifier. Invalid manifest must return strict_fallback_required, never partial deletion authority.
 
 - [ ] **Step 2: Write failing bounded fallback/removal tests**
 
-Fallback subscribes only to homeassistant/+/+/config and f"brilliant/{slug}/#", collects retained messages for at most 2 seconds, 4,096 topics, and 256 KiB, and applies the same payload/device validation. It recognizes only availability, bridge, ownership, and f"{peripheral}/state" below the exact slug. Unknown messages are preserved and reported.
+Fallback subscribes only to homeassistant/+/+/config, f"brilliant/{slug}/#",
+and the four exact panel-scoped scene/mode catalog and transport-status topics.
+It collects retained messages for at most 2 seconds, 4,096 topics, and 256 KiB,
+and applies the same payload/device validation. It recognizes only
+availability, bridge, ownership, f"{peripheral}/state" below the exact slug,
+and those four exact HA-control topics. Unknown messages are preserved and
+reported.
 
 Removal tests prove:
 
@@ -433,18 +442,31 @@ Expected: FAIL for missing seed/cleanup/removal APIs.
 
 - [ ] **Step 4: Implement first-upgrade seeding**
 
-Before activating the first ledger-aware agent for an existing panel:
+Every legacy-entry migration seeds ownership before the fleet entry may treat
+the manifest as complete. This is required even when a prerelease/canary has
+already run a ledger-aware agent and the broker currently has a valid manifest:
+that manifest proves only topics republished since the upgrade, not that legacy
+orphans were scanned. For an existing panel:
 
-1. collect the strict bounded legacy scan through HA MQTT;
+1. collect the strict bounded legacy scan through HA MQTT and union it with any
+   defensively validated current manifest;
 2. stop the old agent and verify inactive;
 3. stage/activate the 0.6+ payload without starting;
 4. invoke ownership_seed with the proven concrete topics and local ledger path;
 5. start the agent and verify fresh health;
-6. verify broker manifest equals local seed result.
+6. verify broker manifest equals local seed result;
+7. persist a migration-owned `ownership_seeded` fact so a merely valid runtime
+   manifest can never be mistaken for completed legacy seeding.
 
 If scan or seed fails, restore/start the previous agent and create ownership_seed_failed. A new install begins with an empty ledger and needs no scan.
 
 - [ ] **Step 5: Implement cleanup ordering**
+
+Before enabling managed removal, route SceneBridge's retained scene/mode
+catalog and transport-status publications through the same panel ledger.
+Retained-ledger failures from catalog reads or background status tasks must
+reach session supervision rather than being reduced to a malformed-catalog or
+status-publication log; add failure-injection coverage for both paths.
 
 For valid manifest evidence, publish empty retained payloads for every listed topic except ownership, sorted for deterministic logs. After each acknowledgement remove it from the evidence result. Clear ownership last. For fallback, clear only proven topics and report every preserved unknown. Never use a wildcard in a publish call.
 
@@ -458,7 +480,7 @@ Run:
 
 ~~~bash
 scripts/build_payload.sh
-uv run pytest tests/test_retained_topics.py tests/test_ownership_seed.py tests/test_payload_parity.py -q
+uv run pytest tests/test_retained_topics.py tests/test_scene_bridge.py tests/test_ownership_seed.py tests/test_payload_parity.py -q
 uv run --project ha pytest -c ha/pyproject.toml ha/tests/test_retained_cleanup.py ha/tests/test_panel_removal.py ha/tests/test_panel_ops.py ha/tests/test_manager.py ha/tests/test_config_flow.py -q
 ~~~
 
@@ -467,7 +489,7 @@ Expected: PASS, including invalid-manifest preservation and mesh exclusion.
 - [ ] **Step 8: Commit ownership/removal operations**
 
 ~~~bash
-git add src/brilliant_mqtt/retained_topics.py src/brilliant_mqtt/ownership_seed.py tests/test_retained_topics.py tests/test_ownership_seed.py scripts/build_payload.sh custom_components/brilliant_mqtt/agent_payload custom_components/brilliant_mqtt/retained_cleanup.py custom_components/brilliant_mqtt/panel_removal.py custom_components/brilliant_mqtt/panel_ops.py custom_components/brilliant_mqtt/manager.py custom_components/brilliant_mqtt/config_flow.py ha/tests/test_retained_cleanup.py ha/tests/test_panel_removal.py ha/tests/test_panel_ops.py ha/tests/test_manager.py ha/tests/test_config_flow.py
+git add src/brilliant_mqtt/retained_topics.py src/brilliant_mqtt/scene_bridge.py src/brilliant_mqtt/ownership_seed.py tests/test_retained_topics.py tests/test_scene_bridge.py tests/test_ownership_seed.py scripts/build_payload.sh custom_components/brilliant_mqtt/agent_payload custom_components/brilliant_mqtt/retained_cleanup.py custom_components/brilliant_mqtt/panel_removal.py custom_components/brilliant_mqtt/panel_ops.py custom_components/brilliant_mqtt/manager.py custom_components/brilliant_mqtt/config_flow.py ha/tests/test_retained_cleanup.py ha/tests/test_panel_removal.py ha/tests/test_panel_ops.py ha/tests/test_manager.py ha/tests/test_config_flow.py
 git commit -m "feat: clean up proven panel MQTT ownership"
 ~~~
 

@@ -216,7 +216,9 @@ git commit -m "feat: pin panel identity before SSH authentication"
 - Create: ha/tests/test_panel_health.py
 - Create: ha/tests/test_panel_provisioner.py
 - Modify: custom_components/brilliant_mqtt/broker_validation.py
+- Modify: custom_components/brilliant_mqtt/errors.py
 - Modify: ha/tests/test_broker_validation.py
+- Modify: ha/tests/test_errors.py
 - Modify: custom_components/brilliant_mqtt/panel_ops.py
 - Modify: custom_components/brilliant_mqtt/components.py
 - Modify: ha/tests/test_panel_ops.py
@@ -245,6 +247,12 @@ The journal record includes transaction_id, operation, phase, setup_id, panel id
 
 Add tests proving:
 
+- a plain stage deadline at discovery_write maps to a retryable
+  discovery_write_timeout, while an observed authorization rejection remains
+  non-retryable discovery_write_denied;
+- a plain stage deadline at retained_message maps to a retryable
+  retained_message_timeout, while an observed message without the retained flag
+  remains non-retryable retained_message_invalid;
 - stage_release uploads versioned payload, unit, env, and CA without replacing /etc files or starting a unit;
 - snapshot captures exact active release link, env bytes, unit bytes, enabled/active states, and component selection;
 - activate_staged uses same-filesystem rename/link replacement, daemon-reload, enable/start;
@@ -281,6 +289,12 @@ separate outer SSH-process deadline, terminate a still-running preflight
 process, await SSH process settlement, and only then return an onboarding
 error.
 
+Before the validator becomes user-reachable, add the two retryable timeout
+codes above to the fixed redacted error table and preserve the existing
+definitive denial/invalid codes only when that condition was actually observed.
+Do not map a generic `asyncio.timeout` expiry to a non-retryable ACL or retained
+payload diagnosis.
+
 - [ ] **Step 5: Implement staged installation and recovery**
 
 PanelProvisioner order is exact:
@@ -316,7 +330,7 @@ Expected: PASS for first install, upgrade, every failure boundary, cancellation,
 - [ ] **Step 7: Commit provisioning**
 
 ~~~bash
-git add custom_components/brilliant_mqtt/provisioning_journal.py custom_components/brilliant_mqtt/panel_health.py custom_components/brilliant_mqtt/panel_provisioner.py custom_components/brilliant_mqtt/broker_validation.py custom_components/brilliant_mqtt/panel_ops.py custom_components/brilliant_mqtt/components.py ha/tests/test_provisioning_journal.py ha/tests/test_panel_health.py ha/tests/test_panel_provisioner.py ha/tests/test_broker_validation.py ha/tests/test_panel_ops.py ha/tests/test_components.py
+git add custom_components/brilliant_mqtt/provisioning_journal.py custom_components/brilliant_mqtt/panel_health.py custom_components/brilliant_mqtt/panel_provisioner.py custom_components/brilliant_mqtt/broker_validation.py custom_components/brilliant_mqtt/errors.py custom_components/brilliant_mqtt/panel_ops.py custom_components/brilliant_mqtt/components.py ha/tests/test_provisioning_journal.py ha/tests/test_panel_health.py ha/tests/test_panel_provisioner.py ha/tests/test_broker_validation.py ha/tests/test_errors.py ha/tests/test_panel_ops.py ha/tests/test_components.py
 git commit -m "feat: provision panels with staged rollback"
 ~~~
 

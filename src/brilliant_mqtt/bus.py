@@ -419,6 +419,10 @@ class RpcBusAdapter:
         A device that comes back missing/peripheral-less is warned about and
         skipped — an absent extra (e.g. a home with no mesh devices) must
         never fail the whole snapshot.
+
+        The panel RPC layer's ``TimeoutError`` deliberately propagates so each
+        caller can apply its own policy (best-effort hot poll versus fatal
+        startup/reconcile).
         """
         obs, own_id = self._require_started()
         devices: list[BrilliantDevice] = []
