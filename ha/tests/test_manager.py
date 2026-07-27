@@ -169,6 +169,48 @@ async def test_repair_deploys_payload_when_code_absent(
     assert await hass.config_entries.async_unload(entry.entry_id)
 
 
+@pytest.mark.parametrize("path", ["repair", "update"])
+async def test_tls_refusal_precedes_management_payload_deployment(
+    hass: HomeAssistant,
+    payload_dir: Path,
+    path: str,
+) -> None:
+    """Update and code-less repair must reject TLS downgrade before payload writes."""
+    del payload_dir
+    code_absent = RunResult(
+        0,
+        "unit=0\nenv=0\nenabled=0\nactive=0\nsunit=0\nsenv=0\npayload=0\n",
+        "",
+    )
+    shell = FakeShell(
+        responses={
+            panel_ops.INSPECT_COMMAND: code_absent,
+            panel_ops.MQTT_TLS_GUARD_COMMAND: RunResult(
+                0,
+                "MQTT_TLS_ENABLED='true'\n",
+                "",
+            ),
+        }
+    )
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    manager = PanelManager(hass, entry, asyncio.Lock())
+
+    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+        if path == "repair":
+            await manager.async_repair(trigger="button")
+        else:
+            with pytest.raises(HomeAssistantError) as err:
+                await manager.async_update_agent()
+            assert err.value.translation_key == "update_failed"
+
+    assert manager.problem_reason is not None
+    assert "mqtt_tls_downgrade_refused" in manager.problem_reason
+    assert shell.dir_uploads == []
+    assert shell.uploads == []
+    await manager.async_shutdown()
+
+
 @pytest.mark.allow_lingering_timers
 async def test_repair_timeout_escalates_and_cooldown_blocks_retry(
     hass: HomeAssistant,

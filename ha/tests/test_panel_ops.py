@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import secrets
+import subprocess
 
 import asyncssh
 import pytest
@@ -355,6 +356,17 @@ async def test_read_env_cats_and_parses_the_live_env_file() -> None:
     assert shell.commands == [f"cat {PANEL_ENV_FILE}"]
 
 
+def test_mqtt_tls_guard_command_is_valid_posix_shell() -> None:
+    result = subprocess.run(
+        ["sh", "-n"],
+        input=panel_ops.MQTT_TLS_GUARD_COMMAND,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 async def test_write_env_writes_only_env_to_etc_and_staged() -> None:
     shell = await _connected(FakeShell())
     await panel_ops.write_env(shell, "ENVDATA")
@@ -392,9 +404,13 @@ async def test_write_env_refuses_existing_tls_to_plaintext_before_mutation() -> 
         )
     )
 
-    with pytest.raises(panel_ops.PanelOpError, match="mqtt_tls_downgrade_refused"):
+    with pytest.raises(panel_ops.PanelOpError, match="mqtt_tls_downgrade_refused") as exc_info:
         await panel_ops.write_env(shell, desired)
 
+    message = str(exc_info.value)
+    assert "cannot round-trip TLS settings" in message
+    assert "manual lifecycle management" in message
+    assert "configure MQTT TLS in Home Assistant" not in message
     assert shell.commands == [panel_ops.MQTT_TLS_GUARD_COMMAND]
     assert PANEL_ENV_FILE in panel_ops.MQTT_TLS_GUARD_COMMAND
     assert "/var/brilliant-mqtt/system/brilliant-mqtt.env" in (panel_ops.MQTT_TLS_GUARD_COMMAND)

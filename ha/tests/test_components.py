@@ -271,6 +271,33 @@ async def test_bridge_install_ca_stage_failure_blocks_panel_deployment(
     assert downstream_calls == []
 
 
+async def test_bridge_install_tls_refusal_precedes_payload_deployment(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """A fail-closed TLS guard must not leave a partially updated payload behind."""
+    del payload_dir
+    from custom_components.brilliant_mqtt.shell import RunResult
+
+    shell = FakeShell(
+        responses={
+            panel_ops.MQTT_TLS_GUARD_COMMAND: RunResult(
+                0,
+                "MQTT_TLS_ENABLED=1\n",
+                "",
+            )
+        }
+    )
+    await shell.connect()
+
+    with pytest.raises(panel_ops.PanelOpError, match="mqtt_tls_downgrade_refused"):
+        await comp._bridge_install(hass, shell, _bridge_data(tls_enabled=False))
+
+    assert shell.commands == [panel_ops.MQTT_TLS_GUARD_COMMAND]
+    assert shell.dir_uploads == []
+    assert shell.uploads == []
+
+
 @pytest.mark.parametrize(
     ("tls_enabled", "ca_value"),
     [

@@ -761,6 +761,7 @@ class PanelManager:
                     # already-installed panel (the common OTA-wiped-/etc case) keeps the
                     # light path — rewrite config + enable, no re-upload.
                     if not state.payload_present:
+                        await panel_ops.async_assert_no_mqtt_tls_downgrade(shell, env)
                         await panel_ops.deploy_payload(
                             shell, str(_payload_dir()), await self._payload_version()
                         )
@@ -909,10 +910,11 @@ class PanelManager:
                 _p(25)
                 try:
                     retirement_result: bool | None = None
+                    unit, env = await self._config_contents()
+                    await panel_ops.async_assert_no_mqtt_tls_downgrade(shell, env)
                     _p(40)
                     await panel_ops.deploy_payload(shell, str(_payload_dir()), version)
                     _p(80)
-                    unit, env = await self._config_contents()
                     await panel_ops.ensure_configs(shell, unit, env)
                     _p(90)
                     await panel_ops.restart(shell)

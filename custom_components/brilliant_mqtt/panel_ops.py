@@ -294,11 +294,11 @@ def _mqtt_tls_assignments(env_content: str) -> tuple[bool | None, ...]:
     return tuple(values)
 
 
-async def _async_guard_mqtt_tls_downgrade(
+async def async_assert_no_mqtt_tls_downgrade(
     shell: PanelShell,
     desired_env_content: str,
 ) -> None:
-    """Refuse an implicit TLS-to-plaintext rewrite before touching panel files."""
+    """Refuse an implicit TLS-to-plaintext lifecycle operation before mutation."""
     desired_assignments = _mqtt_tls_assignments(desired_env_content)
     desired_tls = desired_assignments[-1] if desired_assignments else False
     if desired_tls is None:
@@ -311,7 +311,8 @@ async def _async_guard_mqtt_tls_downgrade(
     if any(value is not False for value in existing_assignments):
         raise PanelOpError(
             "mqtt_tls_downgrade_refused: existing panel TLS state is enabled or "
-            "ambiguous; configure MQTT TLS in Home Assistant before rewriting it"
+            "ambiguous; this Home Assistant release cannot round-trip TLS settings; "
+            "keep this panel under manual lifecycle management"
         )
 
 
@@ -322,7 +323,7 @@ async def write_env(shell: PanelShell, env_content: str) -> None:
     unit is unchanged, so this rewrites just the env in both locations; the caller
     restarts the agent to pick it up.
     """
-    await _async_guard_mqtt_tls_downgrade(shell, env_content)
+    await async_assert_no_mqtt_tls_downgrade(shell, env_content)
     await _checked(shell, f"mkdir -p {PANEL_STAGED_DIR}")
     env_bytes = env_content.encode()
     await shell.put_bytes(env_bytes, PANEL_ENV_FILE, 0o600)
@@ -381,7 +382,7 @@ async def ensure_configs(shell: PanelShell, unit_content: str, env_content: str)
     The staged copies are the OTA-proof restore source: /var survives firmware
     updates, /etc may not. Env files carry the broker password → 0600 both places.
     """
-    await _async_guard_mqtt_tls_downgrade(shell, env_content)
+    await async_assert_no_mqtt_tls_downgrade(shell, env_content)
     await _checked(shell, f"mkdir -p {PANEL_STAGED_DIR}")
     await shell.put_bytes(unit_content.encode(), PANEL_UNIT_FILE, 0o644)
     await shell.put_bytes(env_content.encode(), PANEL_ENV_FILE, 0o600)

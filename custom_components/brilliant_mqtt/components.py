@@ -105,6 +105,7 @@ async def _bridge_install(hass: HomeAssistant, shell: PanelShell, data: Mapping[
         mqtt_tls_enabled=mqtt_tls_enabled,
         mqtt_tls_ca_file=mqtt_tls_ca_file,
     )
+    await panel_ops.async_assert_no_mqtt_tls_downgrade(shell, env)
     await panel_ops.deploy_payload(shell, str(payload_dir), version)
     await panel_ops.ensure_configs(shell, unit, env)
     await panel_ops.enable_now(shell)
