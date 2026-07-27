@@ -88,8 +88,10 @@ from .const import (
     panel_device_name,
 )
 from .panel_ops import PanelOpError
-from .shell import AsyncsshShell, PanelShell
+from .shell import PanelShell, _LegacyAsyncsshShell
 from .voice_payload import VoicePayloadError, async_fetch_voice_payload
+
+AsyncsshShell = _LegacyAsyncsshShell
 
 _LOGGER = logging.getLogger(__name__)
 

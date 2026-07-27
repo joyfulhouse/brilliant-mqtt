@@ -74,8 +74,10 @@ from .const import (
     VOICE_WAKE_WORDS,
 )
 from .ha_control_protocol import is_panel_slug
-from .shell import AsyncsshShell, PanelShell
+from .shell import PanelShell, _LegacyAsyncsshShell
 from .voice_payload import VoicePayloadError
+
+AsyncsshShell = _LegacyAsyncsshShell
 
 # Entry-data keys whose values pre-fill the NEXT add-panel MQTT step. Only the broker
 # creds are genuinely fleet-shared; the root password is deliberately excluded — the

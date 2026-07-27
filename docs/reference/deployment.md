@@ -158,6 +158,28 @@ pilot for the ≥1-day soak. The final physical-control regression check still
 requires an explicitly approved safe Office circuit; no load was actuated by
 the automated canary.
 
+## Office read-only onboarding preflight
+
+The 2026-07-27 Task 2 canary fetched Office's SSH identity without a username
+or password, required the previously approved Ed25519 fingerprint during the
+credentialed connection, and then ran the single bounded read-only inspection
+command. The final candidate reported:
+
+| Fact | Office result |
+| --- | --- |
+| Hostname / model | `b2qt-brilliant-imx6` / `Brilliant Control Development Board` |
+| Architecture / firmware | `armv7l` / `v26.07.15.1` |
+| Python / init | `3.10.9` / `systemd 250` |
+| Available `/var` / memory | 4,742,729,728 bytes / 254,840,832 bytes |
+| Installed agent | `0.6.0` |
+| Active owned services | `brilliant-mqtt`, `brilliant-voice`, `brilliant-bus-watchdog` |
+| Conflicting retired services | none |
+
+The model is retained as a bounded descriptive fact rather than an invented
+hardware allowlist; architecture, Python, firmware provenance/shape, service
+manager, disk, and memory remain compatibility gates. The probe wrote no
+files, changed no services, contacted no MQTT broker, and actuated no circuit.
+
 ## Rollback
 
 - Stop + disable `brilliant-mqtt.service` on the affected panel(s); HomeKit (kept
