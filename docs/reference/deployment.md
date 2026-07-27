@@ -117,6 +117,47 @@ over WebSockets are unsupported by the panel transport.
 4. Repoint HA automations to the MQTT entities; if the panels are HomeKit-
    paired, keep that pairing as a fallback.
 
+## Office 0.6.0 foundation canary
+
+The 2026-07-27 Office pilot used the existing-broker path (not the official
+Mosquitto add-on) and candidate commit
+`40e1c398e1c067e63ea8ecdd17ec4cec6bc67f2b`, with normalized app/vendor
+manifest
+`6b1a95021d2b902dddfad8b4d629d43b5498476ed30228244f6c9d9acd1e20ec`.
+The host-key-pinned deployment guard retained an exact rollback snapshot and
+observed `0.5.7 → offline → 0.6.0 → online`, fresh retained-topic ownership,
+one bus connection, one MQTT connection, and no degraded metadata.
+
+Both the before and after resource windows contained 31 samples at 60-second
+cadence. The fail-closed analyzer passed every invariant and threshold:
+
+| Metric | 0.5.7 baseline | 0.6.0 candidate | Delta / limit |
+| --- | ---: | ---: | ---: |
+| Agent RSS p95 | 25,944 KiB | 26,544 KiB | +600 KiB / ≤5,120 KiB |
+| Agent CPU | 9.0506% | 9.5169% | +0.4663 points / ≤2.0 |
+| Message-bus CPU | 0.0216% | 0.0222% | +0.0006 points / ≤0.5 |
+| Pre-existing message-bus peer failures | 1,279 | 1,146 | ≤1,412 |
+| Bridge failures | 1 | 0 | no increase |
+| Bridge timeout markers | 2 | 0 | no increase |
+
+The agent, stock message bus, and panel UI kept stable PIDs for the complete
+post window. The agent remained a single process with zero systemd restarts,
+zero MQTT/bus reconnects, exactly one established MQTT connection, and a
+healthy socket shape. `MemoryMax=96M` and `CPUQuota=20%` remained pinned by the
+candidate unit.
+
+Home Assistant independently reported the installed agent as 0.6.0,
+availability online, clear bridge health, and no update in progress. Its
+`latest_version` remained 0.5.7 because the live Home Assistant integration
+bundle still contains the older payload. Do not run that integration's
+update/redeploy action against this pilot until its bundled payload is
+refreshed to 0.6.0; doing so could downgrade the panel.
+
+The 30-minute technical/resource gate is complete. Keep Office as the sole
+pilot for the ≥1-day soak. The final physical-control regression check still
+requires an explicitly approved safe Office circuit; no load was actuated by
+the automated canary.
+
 ## Rollback
 
 - Stop + disable `brilliant-mqtt.service` on the affected panel(s); HomeKit (kept
