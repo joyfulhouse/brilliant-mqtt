@@ -788,7 +788,7 @@ async def test_context_entry_maps_broker_failures_without_unowned_cleanup(
 
 
 @pytest.mark.asyncio
-async def test_real_aiomqtt_wrapped_connect_error_maps_without_message_parsing() -> None:
+async def test_real_aiomqtt_wrapped_tls_error_maps_without_message_parsing() -> None:
     profile = BrokerProfile.from_mapping(_profile_data())
 
     with (
@@ -806,8 +806,8 @@ async def test_real_aiomqtt_wrapped_connect_error_maps_without_message_parsing()
             pytest.fail("entry failure must not yield a client")
 
     assert caught.value.stage is OperationStage.FLEET_AUTH
-    assert caught.value.code == "broker_connect_failed"
-    assert caught.value.retryable is True
+    assert caught.value.code == "broker_tls_verification_failed"
+    assert caught.value.retryable is False
     assert caught.value.__context__ is None
     assert caught.value.__cause__ is None
 

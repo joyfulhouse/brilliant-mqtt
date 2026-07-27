@@ -16,7 +16,7 @@ configuration management; keep credentials out of git).
 
 | Variable | Required | Default | Meaning |
 |---|---|---|---|
-| `BRILLIANT_PANEL` | yes | — | Stable panel slug (e.g. `office`); namespaces all MQTT topics and entity IDs. `mesh` is reserved — do not use. |
+| `BRILLIANT_PANEL` | yes | — | Stable canonical lowercase ASCII panel slug (e.g. `office`); namespaces MQTT topics, entity IDs, and local state paths. New Home Assistant allocations are at most 64 characters; existing canonical identities may be longer and remain unchanged. `mesh` is reserved — do not use. |
 | `MQTT_HOST` | yes | — | Central broker hostname or IP (e.g. `192.0.2.10`) |
 | `MQTT_PORT` | no | `1883` | Broker TCP port |
 | `MQTT_USERNAME` | yes | — | Broker user (the dedicated `brilliant` user) |
@@ -25,6 +25,11 @@ configuration management; keep credentials out of git).
 | `MQTT_TLS_CA_FILE` | no | — | Public custom-CA file used for strict TLS. Requires `MQTT_TLS_ENABLED=1`; omit it to use the panel's system CA store. |
 | `RETAINED_TOPICS_FILE` | no | `/var/brilliant-mqtt/state/owned-topics.json` | OTA-persistent ownership ledger used to clear only retained topics published by this agent. Must stay below `/var/brilliant-mqtt/`. |
 | `LOG_LEVEL` | no | `INFO` | Python log level: `DEBUG` turns on verbose tracing; `WARNING` quiets normal traffic |
+
+Home Assistant accepts a new panel name of at most 4,096 characters, normalizes
+it, and allocates a slug of at most 64 characters. Adoption and manual agent
+startup validate canonical syntax without truncating an existing slug: changing
+it would rename MQTT topics and Home Assistant identities.
 
 ### MQTT transport security
 
@@ -47,9 +52,12 @@ transport in this release. See the
 The integration package contains content-addressed CA staging for the
 forthcoming Plan 2 fleet flow, but the current one-panel UI does not expose
 TLS. Adoption does not preserve manual TLS values, and current reconfigure,
-repair, and update paths regenerate this environment with
-`MQTT_TLS_ENABLED=0`. Keep a manually TLS-configured panel under manual
-lifecycle management until the fleet flow wires TLS through those paths.
+repair, and update paths still render a plaintext destination. Before writing,
+they inspect `MQTT_TLS_ENABLED` in both the live and OTA-staged environments and
+abort with `mqtt_tls_downgrade_refused` if either enables TLS or contains an
+ambiguous value. No panel file is changed in that case. Keep a manually
+TLS-configured panel under manual lifecycle management until the fleet flow
+wires TLS through those paths.
 
 ### Polling and watchdog timers
 

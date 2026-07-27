@@ -363,7 +363,124 @@ async def test_write_env_writes_only_env_to_etc_and_staged() -> None:
         ("/etc/brilliant-mqtt.env", 0o600),
         ("/var/brilliant-mqtt/system/brilliant-mqtt.env", 0o600),
     ]
-    assert shell.commands[0] == "mkdir -p /var/brilliant-mqtt/system"
+    assert shell.commands == [
+        panel_ops.MQTT_TLS_GUARD_COMMAND,
+        "mkdir -p /var/brilliant-mqtt/system",
+    ]
+
+
+async def test_write_env_refuses_existing_tls_to_plaintext_before_mutation() -> None:
+    desired = panel_ops.render_env(
+        panel="office",
+        mesh_priority=0,
+        mqtt_host="broker",
+        mqtt_port=1883,
+        mqtt_username="fleet",
+        mqtt_password="password",
+    )
+    shell = await _connected(
+        FakeShell(
+            responses={
+                panel_ops.MQTT_TLS_GUARD_COMMAND: RunResult(
+                    0,
+                    # The live file may be plaintext while the OTA-proof staged
+                    # copy still carries the operator's TLS configuration.
+                    "MQTT_TLS_ENABLED=0\nMQTT_TLS_ENABLED='true'\n",
+                    "",
+                )
+            }
+        )
+    )
+
+    with pytest.raises(panel_ops.PanelOpError, match="mqtt_tls_downgrade_refused"):
+        await panel_ops.write_env(shell, desired)
+
+    assert shell.commands == [panel_ops.MQTT_TLS_GUARD_COMMAND]
+    assert PANEL_ENV_FILE in panel_ops.MQTT_TLS_GUARD_COMMAND
+    assert "/var/brilliant-mqtt/system/brilliant-mqtt.env" in (panel_ops.MQTT_TLS_GUARD_COMMAND)
+    assert shell.uploads == []
+
+
+async def test_write_env_refuses_ambiguous_existing_tls_assignment() -> None:
+    desired = panel_ops.render_env(
+        panel="office",
+        mesh_priority=0,
+        mqtt_host="broker",
+        mqtt_port=1883,
+        mqtt_username="fleet",
+        mqtt_password="password",
+    )
+    shell = await _connected(
+        FakeShell(
+            responses={
+                panel_ops.MQTT_TLS_GUARD_COMMAND: RunResult(
+                    0,
+                    r"MQTT_TLS_ENABLED=t\rue" + "\n",
+                    "",
+                )
+            }
+        )
+    )
+
+    with pytest.raises(panel_ops.PanelOpError, match="mqtt_tls_downgrade_refused"):
+        await panel_ops.write_env(shell, desired)
+
+    assert shell.commands == [panel_ops.MQTT_TLS_GUARD_COMMAND]
+    assert shell.uploads == []
+
+
+@pytest.mark.parametrize(
+    "existing",
+    [
+        "MQTT_TLS_ENABLED=0\n",
+        "MQTT_TLS_ENABLED='false'\n",
+        'MQTT_TLS_ENABLED="off"\n',
+        "MQTT_TLS_ENABLED=no\n",
+    ],
+)
+async def test_write_env_accepts_provably_plaintext_existing_env(existing: str) -> None:
+    desired = panel_ops.render_env(
+        panel="office",
+        mesh_priority=0,
+        mqtt_host="broker",
+        mqtt_port=1883,
+        mqtt_username="fleet",
+        mqtt_password="password",
+    )
+    shell = await _connected(
+        FakeShell(
+            responses={
+                panel_ops.MQTT_TLS_GUARD_COMMAND: RunResult(0, existing, ""),
+            }
+        )
+    )
+
+    await panel_ops.write_env(shell, desired)
+
+    assert len(shell.uploads) == 2
+
+
+async def test_write_env_tls_destination_needs_no_existing_env_probe() -> None:
+    desired = panel_ops.render_env(
+        panel="office",
+        mesh_priority=0,
+        mqtt_host="broker",
+        mqtt_port=8883,
+        mqtt_username="fleet",
+        mqtt_password="password",
+        mqtt_tls_enabled=True,
+    )
+    shell = await _connected(
+        FakeShell(
+            run_errors={
+                panel_ops.MQTT_TLS_GUARD_COMMAND: RuntimeError("must not probe"),
+            }
+        )
+    )
+
+    await panel_ops.write_env(shell, desired)
+
+    assert panel_ops.MQTT_TLS_GUARD_COMMAND not in shell.commands
 
 
 async def test_write_env_raises_when_mkdir_fails() -> None:
@@ -701,8 +818,57 @@ async def test_ensure_configs_writes_etc_and_staged_copies_then_reloads() -> Non
         ("/var/brilliant-mqtt/system/brilliant-mqtt.service", 0o644),
         ("/var/brilliant-mqtt/system/brilliant-mqtt.env", 0o600),
     ]
-    assert shell.commands[0] == "mkdir -p /var/brilliant-mqtt/system"
+    assert shell.commands[0] == panel_ops.MQTT_TLS_GUARD_COMMAND
+    assert shell.commands[1] == "mkdir -p /var/brilliant-mqtt/system"
     assert shell.commands[-1] == "systemctl daemon-reload"
+
+
+async def test_ensure_configs_refuses_existing_tls_to_plaintext_before_mutation() -> None:
+    desired = panel_ops.render_env(
+        panel="office",
+        mesh_priority=0,
+        mqtt_host="broker",
+        mqtt_port=1883,
+        mqtt_username="fleet",
+        mqtt_password="password",
+    )
+    shell = await _connected(
+        FakeShell(
+            responses={
+                panel_ops.MQTT_TLS_GUARD_COMMAND: RunResult(
+                    0,
+                    ' MQTT_TLS_ENABLED = "true"\n',
+                    "",
+                )
+            }
+        )
+    )
+
+    with pytest.raises(panel_ops.PanelOpError, match="mqtt_tls_downgrade_refused"):
+        await panel_ops.ensure_configs(shell, unit_content="UNIT", env_content=desired)
+
+    assert shell.commands == [panel_ops.MQTT_TLS_GUARD_COMMAND]
+    assert shell.uploads == []
+
+
+async def test_tls_guard_probe_failure_is_fail_closed_before_mutation() -> None:
+    shell = await _connected(
+        FakeShell(
+            responses={
+                panel_ops.MQTT_TLS_GUARD_COMMAND: RunResult(
+                    2,
+                    "",
+                    "permission denied\n",
+                )
+            }
+        )
+    )
+
+    with pytest.raises(panel_ops.PanelOpError, match="exited 2"):
+        await panel_ops.ensure_configs(shell, unit_content="UNIT", env_content="ENV")
+
+    assert shell.commands == [panel_ops.MQTT_TLS_GUARD_COMMAND]
+    assert shell.uploads == []
 
 
 async def test_ensure_configs_raises_when_mkdir_fails() -> None:

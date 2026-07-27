@@ -80,10 +80,11 @@ The panel agent supports plaintext TCP, strict system/public-CA TLS, and strict
 custom-CA TLS for manual deployment, and the integration package contains the
 CA-staging seam for the future fleet flow. The current one-panel broker form
 does not expose TLS; adoption does not retain manual TLS values; and current
-reconfigure, repair, and update paths regenerate the environment as plaintext
-(`MQTT_TLS_ENABLED=0`). Do not use the current HA lifecycle flow to manage a
-manually TLS-configured panel because it may overwrite that TLS environment.
-See the
+reconfigure, repair, and update paths still render a plaintext destination.
+They now fail closed with `mqtt_tls_downgrade_refused` before changing any file
+when either the live or OTA-staged panel environment enables TLS or contains an
+ambiguous TLS value. Keep a manually TLS-configured panel under manual
+lifecycle management until Plan 2 can preserve those settings. See the
 [MQTT broker prerequisite](install/mqtt-broker.md) for both setup paths, the
 exact two-principal ACL table, transport warning, and the forthcoming
 validation-error contract.
@@ -107,11 +108,14 @@ creation and link MQTT failures to a stable
 [cause/check/fix/retry section](install/mqtt-broker.md#mqtt-validation).
 
 **Adopting a hand-deployed panel:** onboarding reads `BRILLIANT_PANEL` from the
-live env file and adopts it verbatim. Set it to a lowercase slug
-(`^[a-z0-9_-]+$`) before adding — a non-slug or the reserved value `mesh` is
-refused (`cannot_read_config`). See [INSTALL.md](../INSTALL.md) for manual
-deploy steps. Do not adopt a manually TLS-configured panel in the current flow;
-the TLS settings are not preserved for later lifecycle operations.
+live env file and adopts it verbatim. Set it to a canonical lowercase slug
+(`^[a-z0-9][a-z0-9_-]*$`) before adding — a non-slug or the reserved value
+`mesh` is refused (`cannot_read_config`). Existing canonical slugs are never
+truncated or renamed, even when longer than the 64-character cap used for new
+allocations. New panel names accept at most 4,096 characters before
+normalization. See [INSTALL.md](../INSTALL.md) for manual deploy steps. Do not
+adopt a manually TLS-configured panel in the current flow; the TLS settings are
+not preserved for later lifecycle operations.
 
 **Slug is immutable** after creation (rename = remove + re-add).
 
@@ -309,6 +313,17 @@ service will start but the bridge won't come back online. The recovery timer
 fires `repair_failed` (`reason: still_offline`, with a captured journal) and
 `needs_attention`, because the agent itself needs a code fix — deploy a new
 release via the update entity or `redeploy`.
+
+<a id="retained-ledger"></a>
+**Retained-ledger fault.** If the agent cannot read or durably persist
+`/var/brilliant-mqtt/state/owned-topics.json`, it remains fail-closed and
+publishes retained bridge metadata with `"degraded":"retained_ledger"` at QoS
+1. Home Assistant creates one needs-attention repair issue and suppresses the
+generic offline auto-repair loop so it cannot replace the useful storage
+diagnosis. Check panel storage capacity, the state-directory permissions, and
+the agent journal. Repair the storage or ledger deliberately; do not discard
+the ledger casually because it is the ownership inventory for safe retained
+topic cleanup. After restart, ordinary bridge metadata clears the issue.
 
 ## Security model
 

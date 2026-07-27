@@ -489,6 +489,7 @@ def _profile(
     environment: _LiveEnvironment,
     *,
     password: str | None = None,
+    trust_tls_ca: bool = True,
 ) -> BrokerProfile:
     return BrokerProfile(
         kind=BrokerKind.EXISTING_BROKER,
@@ -497,7 +498,7 @@ def _profile(
         tls_enabled=endpoint.tls_enabled,
         _username_value=environment.device_username,
         _password_value=environment.device_password if password is None else password,
-        _ca_pem_value=environment.ca_pem if endpoint.tls_enabled else None,
+        _ca_pem_value=(environment.ca_pem if endpoint.tls_enabled and trust_tls_ca else None),
     )
 
 
@@ -549,7 +550,7 @@ async def test_ca_trusted_tls_validation_succeeds(
 @pytest.mark.mqtt_live
 @pytest.mark.usefixtures("_allow_live_loopback")
 @_skip_without_live_broker
-async def test_bad_device_password_maps_to_fleet_auth_failed(
+async def test_bad_device_password_preserves_authentication_failure(
     hass: HomeAssistant,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -570,7 +571,33 @@ async def test_bad_device_password_maps_to_fleet_auth_failed(
             )
 
     assert raised.value.stage is OperationStage.FLEET_AUTH
-    assert raised.value.code == "fleet_auth_failed"
+    assert raised.value.code == "broker_authentication_failed"
+
+
+@pytest.mark.mqtt_live
+@pytest.mark.usefixtures("_allow_live_loopback")
+@_skip_without_live_broker
+async def test_untrusted_ca_tls_preserves_verification_failure(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = _LiveEnvironment.from_environ()
+    async with _real_ha_mqtt(hass, monkeypatch, environment.tls, environment):
+        with pytest.raises(OperationError) as raised:
+            await BrokerValidator(
+                hass,
+                _device_client,
+                timeout_seconds=_VALIDATION_TIMEOUT_SECONDS,
+            ).async_validate(
+                _profile(
+                    environment.tls,
+                    environment,
+                    trust_tls_ca=False,
+                )
+            )
+
+    assert raised.value.stage is OperationStage.FLEET_AUTH
+    assert raised.value.code == "broker_tls_verification_failed"
 
 
 @pytest.mark.mqtt_live

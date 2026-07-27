@@ -289,6 +289,25 @@ class _FakeHaMqtt:
             await result
 
 
+class _FakeDeviceMessages(AsyncIterator[DeviceMqttMessage]):
+    def __init__(self, client: _FakeDeviceClient) -> None:
+        self._client = client
+
+    def __aiter__(self) -> _FakeDeviceMessages:
+        return self
+
+    async def __anext__(self) -> DeviceMqttMessage:
+        return await self._client.incoming.get()
+
+    async def aclose(self) -> None:
+        self._client.messages_closed = True
+        self._client.events.append(("device_messages_close",))
+        if self._client.messages_close_error is not None:
+            raise self._client.messages_close_error
+        if self._client.messages_close_blocker:
+            await asyncio.Event().wait()
+
+
 @dataclass(slots=True)
 class _FakeDeviceClient(DeviceMqttClient):
     seam: _FakeHaMqtt
@@ -305,14 +324,17 @@ class _FakeDeviceClient(DeviceMqttClient):
     unsubscribe_blockers: set[str] = field(default_factory=set)
     disconnect_error: BaseException | None = None
     disconnect_blocker: bool = False
+    messages_close_error: BaseException | None = None
+    messages_close_blocker: bool = False
+    messages_closed: bool = False
+    device_messages: _FakeDeviceMessages = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.device_messages = _FakeDeviceMessages(self)
 
     @property
     def messages(self) -> AsyncIterator[DeviceMqttMessage]:
-        return self._messages()
-
-    async def _messages(self) -> AsyncIterator[DeviceMqttMessage]:
-        while True:
-            yield await self.incoming.get()
+        return self.device_messages
 
     async def subscribe(self, topic: str, qos: int = 0) -> None:
         self.events.append(("device_subscribe", topic, qos))
@@ -666,10 +688,7 @@ async def test_stage_table_maps_fixed_errors_and_still_cleans_up(
     elif case == "ha_wait_unavailable":
         seam.wait_result = False
     elif case == "fleet_auth":
-        factory.enter_error = OperationError.for_code(
-            OperationStage.FLEET_AUTH,
-            "broker_authentication_failed",
-        )
+        factory.enter_error = RuntimeError("secret unclassified fleet auth failure")
     elif case == "panel_to_ha":
         seam.drop_device_to_ha.add(topics.panel_to_ha)
     elif case == "ha_to_panel":
@@ -733,6 +752,48 @@ async def test_stage_table_maps_fixed_errors_and_still_cleans_up(
         assert ("ha_unsubscribe", topics.discovery_probe) in seam.events
         assert ("ha_unsubscribe", topics.retained) in seam.events
         assert ("device_unsubscribe", topics.ha_to_panel) in seam.events
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+@pytest.mark.parametrize(
+    "classified_code",
+    [
+        "broker_tls_verification_failed",
+        "broker_authentication_failed",
+        "broker_connection_rejected",
+        "broker_unavailable",
+        "broker_connect_failed",
+        "broker_timeout",
+    ],
+)
+async def test_fleet_auth_preserves_classified_broker_error(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    classified_code: str,
+) -> None:
+    _mqtt_entry(hass)
+    seam = _FakeHaMqtt()
+    seam.install(monkeypatch)
+    factory = _FakeDeviceFactory(
+        seam,
+        seam.events,
+        enter_error=OperationError.for_code(
+            OperationStage.FLEET_AUTH,
+            classified_code,
+        ),
+    )
+
+    with pytest.raises(OperationError) as raised:
+        await BrokerValidator(hass, factory, 0.02).async_validate(
+            _profile(),
+            setup_id=SETUP_ID,
+        )
+
+    error = raised.value
+    assert error.stage is OperationStage.FLEET_AUTH
+    assert error.code == classified_code
+    assert error.__cause__ is None
+    assert error.__context__ is None
 
 
 @pytest.mark.usefixtures("enable_custom_integrations")
@@ -1139,7 +1200,7 @@ async def test_ha_suback_is_required_before_cross_client_publish(
     ("stage", "expected_code"),
     [
         (OperationStage.HA_MQTT_READY, "ha_mqtt_unavailable"),
-        (OperationStage.FLEET_AUTH, "fleet_auth_failed"),
+        (OperationStage.FLEET_AUTH, "broker_timeout"),
     ],
 )
 async def test_early_stage_deadlines_are_strict_and_stable(
@@ -1433,6 +1494,95 @@ async def test_cleanup_attempts_every_action_after_multiple_failures(
         assert seam.events.count(expected) == 1
     assert factory.contexts[0].client.disconnect_count == 1
     assert factory.contexts[0].exit_count == 1
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_cleanup_closes_device_messages_before_unsubscribe_and_disconnect(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mqtt_entry(hass)
+    seam = _FakeHaMqtt()
+    seam.install(monkeypatch)
+    factory = _FakeDeviceFactory(seam, seam.events)
+    baseline_tasks = {task for task in asyncio.all_tasks() if task is not asyncio.current_task()}
+
+    await BrokerValidator(hass, factory, 0.02).async_validate(
+        _profile(),
+        setup_id=SETUP_ID,
+    )
+    await asyncio.sleep(0)
+
+    topics = SetupTopics.for_id(SETUP_ID)
+    context = factory.contexts[0]
+    close_index = seam.events.index(("device_messages_close",))
+    later_actions = (
+        ("device_publish", topics.discovery_probe, b"", 1, True),
+        ("device_publish", topics.retained, b"", 1, True),
+        ("ha_publish", topics.discovery_probe, b"", 1, True),
+        ("ha_publish", topics.retained, b"", 1, True),
+        ("ha_unsubscribe", topics.panel_to_ha),
+        ("ha_unsubscribe", topics.discovery_probe),
+        ("ha_unsubscribe", topics.retained),
+        ("device_unsubscribe", topics.ha_to_panel),
+        ("device_disconnect",),
+        ("device_exit",),
+    )
+    assert context.client.messages_closed
+    assert all(close_index < seam.events.index(action) for action in later_actions)
+    assert {
+        task
+        for task in asyncio.all_tasks()
+        if task is not asyncio.current_task() and task not in baseline_tasks and not task.done()
+    } == set()
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+@pytest.mark.parametrize("blocked", [False, True])
+async def test_device_messages_close_failure_is_bounded_and_cleanup_continues(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    blocked: bool,
+) -> None:
+    _mqtt_entry(hass)
+    seam = _FakeHaMqtt()
+    seam.install(monkeypatch)
+    topics = SetupTopics.for_id(SETUP_ID)
+
+    def configure(context: _FakeDeviceContext) -> None:
+        if blocked:
+            context.client.messages_close_blocker = True
+        else:
+            context.client.messages_close_error = RuntimeError(
+                "secret device messages close failure"
+            )
+
+    factory = _FakeDeviceFactory(
+        seam,
+        seam.events,
+        configure_context=configure,
+    )
+    baseline_tasks = {task for task in asyncio.all_tasks() if task is not asyncio.current_task()}
+
+    with pytest.raises(OperationError) as raised:
+        await BrokerValidator(hass, factory, 0.005).async_validate(
+            _profile(),
+            setup_id=SETUP_ID,
+        )
+    await asyncio.sleep(0)
+
+    assert raised.value.stage is OperationStage.CLEANUP
+    assert raised.value.code == "cleanup_failed"
+    assert ("device_messages_close",) in seam.events
+    assert ("ha_unsubscribe", topics.panel_to_ha) in seam.events
+    assert ("device_unsubscribe", topics.ha_to_panel) in seam.events
+    assert ("device_disconnect",) in seam.events
+    assert ("device_exit",) in seam.events
+    assert {
+        task
+        for task in asyncio.all_tasks()
+        if task is not asyncio.current_task() and task not in baseline_tasks and not task.done()
+    } == set()
 
 
 @pytest.mark.usefixtures("enable_custom_integrations")

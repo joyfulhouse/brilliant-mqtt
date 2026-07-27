@@ -165,6 +165,16 @@ ENV_RETAINED_TOPICS_FILE = "RETAINED_TOPICS_FILE"
 ENV_MESH_PRIORITY = "MESH_PRIORITY"
 ENV_SCENE_BRIDGE_ENABLED = "SCENE_BRIDGE_ENABLED"
 
+_MQTT_TLS_TRUE_VALUES = frozenset({"1", "true", "on", "yes"})
+_MQTT_TLS_FALSE_VALUES = frozenset({"0", "false", "off", "no"})
+MQTT_TLS_GUARD_COMMAND = (
+    f"for file in {PANEL_ENV_FILE} {_STAGED_ENV}; do "
+    'if test -f "$file"; then '
+    "awk -F= '$1 ~ /^[[:space:]]*MQTT_TLS_ENABLED[[:space:]]*$/ "
+    '{ print }\' "$file" || exit $?; '
+    "fi; done"
+)
+
 
 def render_env(
     panel: str,
@@ -257,6 +267,54 @@ async def read_env(shell: PanelShell) -> dict[str, str]:
     return parse_env(result.stdout)
 
 
+def _mqtt_tls_assignments(env_content: str) -> tuple[bool | None, ...]:
+    """Classify MQTT TLS assignments without under-parsing systemd quotes.
+
+    ``None`` means an assignment was present but was not provably true or
+    false. Existing ambiguous values are treated conservatively by the guard.
+    """
+    values: list[bool | None] = []
+    for line in env_content.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        key, separator, raw = stripped.partition("=")
+        if not separator or key.strip() != ENV_MQTT_TLS_ENABLED:
+            continue
+        value = raw.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+            value = value[1:-1].strip()
+        normalized = value.lower()
+        if normalized in _MQTT_TLS_TRUE_VALUES:
+            values.append(True)
+        elif normalized in _MQTT_TLS_FALSE_VALUES:
+            values.append(False)
+        else:
+            values.append(None)
+    return tuple(values)
+
+
+async def _async_guard_mqtt_tls_downgrade(
+    shell: PanelShell,
+    desired_env_content: str,
+) -> None:
+    """Refuse an implicit TLS-to-plaintext rewrite before touching panel files."""
+    desired_assignments = _mqtt_tls_assignments(desired_env_content)
+    desired_tls = desired_assignments[-1] if desired_assignments else False
+    if desired_tls is None:
+        raise PanelOpError("invalid desired MQTT_TLS_ENABLED value")
+    if desired_tls:
+        return
+
+    existing = await _checked(shell, MQTT_TLS_GUARD_COMMAND)
+    existing_assignments = _mqtt_tls_assignments(existing.stdout)
+    if any(value is not False for value in existing_assignments):
+        raise PanelOpError(
+            "mqtt_tls_downgrade_refused: existing panel TLS state is enabled or "
+            "ambiguous; configure MQTT TLS in Home Assistant before rewriting it"
+        )
+
+
 async def write_env(shell: PanelShell, env_content: str) -> None:
     """(Re)write ONLY the env file to /etc + the /var staged copy (0600); no unit.
 
@@ -264,6 +322,7 @@ async def write_env(shell: PanelShell, env_content: str) -> None:
     unit is unchanged, so this rewrites just the env in both locations; the caller
     restarts the agent to pick it up.
     """
+    await _async_guard_mqtt_tls_downgrade(shell, env_content)
     await _checked(shell, f"mkdir -p {PANEL_STAGED_DIR}")
     env_bytes = env_content.encode()
     await shell.put_bytes(env_bytes, PANEL_ENV_FILE, 0o600)
@@ -322,6 +381,7 @@ async def ensure_configs(shell: PanelShell, unit_content: str, env_content: str)
     The staged copies are the OTA-proof restore source: /var survives firmware
     updates, /etc may not. Env files carry the broker password → 0600 both places.
     """
+    await _async_guard_mqtt_tls_downgrade(shell, env_content)
     await _checked(shell, f"mkdir -p {PANEL_STAGED_DIR}")
     await shell.put_bytes(unit_content.encode(), PANEL_UNIT_FILE, 0o644)
     await shell.put_bytes(env_content.encode(), PANEL_ENV_FILE, 0o600)

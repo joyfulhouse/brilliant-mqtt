@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 import brilliant_mqtt.__main__ as main_mod
+from brilliant_mqtt import __version__
 from brilliant_mqtt.__main__ import _is_panel_device, _is_reconnect_storm, _make_desired
 from brilliant_mqtt.bridge import Bridge
 from brilliant_mqtt.config import Settings
@@ -24,6 +25,7 @@ from brilliant_mqtt.desired_state import DesiredState
 from brilliant_mqtt.ha_control_protocol import mode_command_topic, scene_command_topic
 from brilliant_mqtt.mesh_leader import MESH_LEADER_TOPIC, MeshLeader
 from brilliant_mqtt.model import BrilliantDevice, DeviceKind, Variable
+from brilliant_mqtt.retained_topics import RetainedLedgerError
 from tests.fakes import FakeBus, FakeClock, FakeMqtt
 
 HB = 10.0
@@ -308,12 +310,29 @@ class _SessionMqtt:
     def __init__(self, events: list[str]) -> None:
         self.events = events
         self.subscriptions: list[str] = []
+        self.published: list[tuple[str, str, bool, int]] = []
+        self.connect_error: Exception | None = None
+        self.publish_error: Exception | None = None
 
     async def connect(self) -> None:
         self.events.append("mqtt_connect")
+        if self.connect_error is not None:
+            raise self.connect_error
 
     async def disconnect(self) -> None:
         self.events.append("mqtt_disconnect")
+
+    async def publish(
+        self,
+        topic: str,
+        payload: str,
+        retain: bool = False,
+        qos: int = 0,
+    ) -> None:
+        self.events.append("mqtt_publish")
+        if self.publish_error is not None:
+            raise self.publish_error
+        self.published.append((topic, payload, retain, qos))
 
     async def subscribe(self, topic: str) -> None:
         self.subscriptions.append(topic)
@@ -326,6 +345,7 @@ class _SessionHarness:
         *,
         scene_start_error: RuntimeError | None = None,
         scene_shutdown_error: RuntimeError | None = None,
+        bridge_reconcile_error: Exception | None = None,
     ) -> None:
         self.events: list[str] = []
         self.ready = asyncio.Event()
@@ -333,6 +353,7 @@ class _SessionHarness:
         self.mqtt = _SessionMqtt(self.events)
         self.scene_start_error = scene_start_error
         self.scene_shutdown_error = scene_shutdown_error
+        self.bridge_reconcile_error = bridge_reconcile_error
         self.scene_instances: list[object] = []
         self.scene_bus: object | None = None
         self.scene_mqtt: object | None = None
@@ -349,6 +370,8 @@ class _SessionHarness:
 
             async def reconcile(self) -> None:
                 harness.events.append("panel_reconcile")
+                if harness.bridge_reconcile_error is not None:
+                    raise harness.bridge_reconcile_error
                 harness.ready.set()
 
             async def poll_once(self) -> None:
@@ -483,3 +506,88 @@ class TestSceneBridgeSessionWiring:
             "bus_shutdown",
             "mqtt_disconnect",
         ]
+
+
+class TestRetainedLedgerDegradedDiagnostic:
+    async def test_load_failure_publishes_retained_diagnostic_then_preserves_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ledger_error = RetainedLedgerError("invalid retained ledger")
+
+        class FailingLedger:
+            def __init__(self, panel_slug: str, path: Path) -> None:
+                del self, panel_slug, path
+
+            async def async_load(self) -> None:
+                raise ledger_error
+
+        monkeypatch.setattr(main_mod, "RetainedTopicLedger", FailingLedger)
+        harness = _SessionHarness(monkeypatch)
+
+        with pytest.raises(RetainedLedgerError) as raised:
+            await main_mod._run_session(_settings(), None, None)
+
+        assert raised.value is ledger_error
+        assert harness.mqtt.published == [
+            (
+                "brilliant/office/bridge",
+                json.dumps(
+                    {
+                        "agent_version": __version__,
+                        "degraded": "retained_ledger",
+                    },
+                    sort_keys=True,
+                ),
+                True,
+                1,
+            )
+        ]
+        assert harness.events == [
+            "mqtt_construct",
+            "bus_construct",
+            "mqtt_connect",
+            "mqtt_publish",
+            "bus_shutdown",
+            "mqtt_disconnect",
+        ]
+
+    async def test_runtime_failure_uses_existing_connection_for_diagnostic(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ledger_error = RetainedLedgerError("could not persist retained ledger")
+        harness = _SessionHarness(
+            monkeypatch,
+            bridge_reconcile_error=ledger_error,
+        )
+        with pytest.raises(RetainedLedgerError) as raised:
+            await main_mod._run_session(_settings(), None, None)
+
+        assert raised.value is ledger_error
+        assert harness.events.count("mqtt_connect") == 1
+        assert harness.mqtt.published[0][0] == "brilliant/office/bridge"
+        assert harness.mqtt.published[0][2:] == (True, 1)
+        assert harness.events[-2:] == ["bus_shutdown", "mqtt_disconnect"]
+
+    @pytest.mark.parametrize("failure_point", ["connect", "publish"])
+    async def test_diagnostic_failure_does_not_replace_ledger_error(
+        self, monkeypatch: pytest.MonkeyPatch, failure_point: str
+    ) -> None:
+        ledger_error = RetainedLedgerError("invalid retained ledger")
+
+        class FailingLedger:
+            def __init__(self, panel_slug: str, path: Path) -> None:
+                del self, panel_slug, path
+
+            async def async_load(self) -> None:
+                raise ledger_error
+
+        monkeypatch.setattr(main_mod, "RetainedTopicLedger", FailingLedger)
+        harness = _SessionHarness(monkeypatch)
+        failure = RuntimeError(f"diagnostic {failure_point} failed")
+        setattr(harness.mqtt, f"{failure_point}_error", failure)
+
+        with pytest.raises(RetainedLedgerError) as raised:
+            await main_mod._run_session(_settings(), None, None)
+
+        assert raised.value is ledger_error
+        assert harness.events[-2:] == ["bus_shutdown", "mqtt_disconnect"]

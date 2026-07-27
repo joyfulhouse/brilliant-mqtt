@@ -48,6 +48,32 @@ class TestSettings:
         assert s.resync_seconds == 300
         assert s.log_level == "INFO"
 
+    def test_panel_slug_preserves_legacy_canonical_value(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        panel = "panel_" + ("z" * 300)
+        monkeypatch.setenv("BRILLIANT_PANEL", panel)
+        monkeypatch.setenv("MQTT_HOST", "mqtt.example.test")
+        monkeypatch.setenv("MQTT_USERNAME", "brilliant")
+        monkeypatch.setenv("MQTT_PASSWORD", "s3cr3t")
+
+        assert Settings.from_env().panel == panel
+
+    @pytest.mark.parametrize("panel", ["Office Bath", "mesh"])
+    def test_panel_slug_rejects_noncanonical_or_reserved_value(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        panel: str,
+    ) -> None:
+        monkeypatch.setenv("BRILLIANT_PANEL", panel)
+        monkeypatch.setenv("MQTT_HOST", "mqtt.example.test")
+        monkeypatch.setenv("MQTT_USERNAME", "brilliant")
+        monkeypatch.setenv("MQTT_PASSWORD", "s3cr3t")
+
+        with pytest.raises(ValueError, match="BRILLIANT_PANEL"):
+            Settings.from_env()
+
     @pytest.mark.parametrize(
         ("raw", "expected"),
         [

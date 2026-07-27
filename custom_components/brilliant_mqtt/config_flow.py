@@ -101,6 +101,8 @@ _NO_CONTROL_CHARS = (
 _SLUG_SEPARATORS = re.compile(r"[\s.]+")
 _SLUG_INVALID = re.compile(r"[^a-z0-9_-]+")
 _SLUG_DASH_RUNS = re.compile(r"-{2,}")
+_MAX_PANEL_NAME_LENGTH = 4_096
+_MAX_NEW_PANEL_SLUG_LENGTH = 64
 
 
 class _WrongPanelError(Exception):
@@ -442,34 +444,42 @@ def _validated_control_input(
     return errors, values
 
 
-def _slugify(name: str) -> str:
-    """Free-form panel name → the slug stored as CONF_PANEL / MQTT topic id.
-
-    "Office Bath" → "office-bath". Lowercases, turns whitespace/dots into hyphens,
-    drops anything outside ``[a-z0-9_-]``, collapses repeats, trims. May return ""
-    (the caller rejects that as invalid_name). HA humanizes the slug back for display
-    (entity.py: "office-bath" → "Office Bath"), so the original name need not be stored.
-    """
+def _normalize_slug(name: str) -> str:
+    """Normalize a panel name without imposing a new-allocation length limit."""
     slug = _SLUG_SEPARATORS.sub("-", name.strip().lower())
     slug = _SLUG_INVALID.sub("", slug)
     return _SLUG_DASH_RUNS.sub("-", slug).strip("-_")
 
 
+def _slugify(name: str) -> str:
+    """Allocate a bounded CONF_PANEL / MQTT topic slug from a new free-form name.
+
+    "Office Bath" → "office-bath". Lowercases, turns whitespace/dots into hyphens,
+    drops anything outside ``[a-z0-9_-]``, collapses repeats, trims, then caps new
+    allocations at 64 characters. Truncation can expose a separator at the end, so
+    that edge is trimmed again. May return "" (the caller rejects that as
+    invalid_name). HA humanizes the slug back for display (entity.py:
+    "office-bath" → "Office Bath"), so the original name need not be stored.
+    """
+    return _normalize_slug(name)[:_MAX_NEW_PANEL_SLUG_LENGTH].rstrip("-_")
+
+
 def _adopt_data(env: dict[str, str]) -> dict[str, Any] | None:
     """Map an installed agent's parsed env file to entry data; None if unusable.
 
-    The slug is trusted from the device but still gated to the SAME canonical form
-    the typed path produces: a hand-deployed env with BRILLIANT_PANEL="mesh", empty,
-    or any non-canonical value (spaces, uppercase, leading/trailing or doubled
-    separators like "-office") must NOT become a config entry — it would collide with
-    the reserved pseudo-panel or break the MQTT topic contract. Same for an
-    out-of-range port. All of these surface as cannot_read_config.
+    The slug is trusted from the device but still gated to the canonical syntax.
+    Existing canonical slugs are preserved byte-for-byte even when they predate the
+    64-character new-allocation bound. A hand-deployed env with
+    BRILLIANT_PANEL="mesh", empty, or any non-canonical value (spaces, uppercase,
+    leading/trailing or doubled separators like "-office") must NOT become a config
+    entry — it would collide with the reserved pseudo-panel or break the MQTT topic
+    contract. Same for an out-of-range port. All surface as cannot_read_config.
     """
     try:
         panel = env[panel_ops.ENV_PANEL]
-        # Require the adopted slug to be exactly what _slugify would produce, so the
-        # adopt and typed-name paths can never disagree on what a valid slug is.
-        if panel == MESH_PANEL or not is_panel_slug(panel) or _slugify(panel) != panel:
+        # Compare against unbounded normalization: adoption validates syntax but
+        # never truncates or renames an established MQTT/entity identity.
+        if panel == MESH_PANEL or not is_panel_slug(panel) or _normalize_slug(panel) != panel:
             return None
         # MQTT_PORT and MESH_PRIORITY are OPTIONAL in the agent's env contract
         # (config.py defaults them to 1883 / 0), so a valid hand-deployed env may omit
@@ -756,7 +766,10 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
         inherited = _inherited_globals(self._async_current_entries(), "")
         schema = vol.Schema(
             {
-                vol.Required(CONF_NAME): str,
+                vol.Required(CONF_NAME): vol.All(
+                    str,
+                    vol.Length(max=_MAX_PANEL_NAME_LENGTH),
+                ),
                 vol.Required(CONF_MESH_PRIORITY, default=0): vol.All(
                     vol.Coerce(int), vol.Range(min=0, max=99)
                 ),

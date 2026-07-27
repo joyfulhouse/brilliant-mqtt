@@ -95,7 +95,7 @@ Expected: FAIL during collection for missing entry_data.
 
 - [ ] **Step 3: Implement immutable typed views and adapters**
 
-Use frozen slot dataclasses. BrokerProfile remains the nested normalized connection type. PanelConfig.components is a MappingProxyType[str, bool], and feature_overrides is a MappingProxyType[str, JSON-compatible scalar/list/mapping]. provisioning_transaction_id is temporary internal state: it is required on a newly provisioned subentry and removed only after async_setup_entry or the live subentry update listener matches it to the journal and verifies the runtime. Reject panel slug mesh and anything not matching ^[a-z0-9][a-z0-9_-]{0,63}$.
+Use frozen slot dataclasses. BrokerProfile remains the nested normalized connection type. PanelConfig.components is a MappingProxyType[str, bool], and feature_overrides is a MappingProxyType[str, JSON-compatible scalar/list/mapping]. provisioning_transaction_id is temporary internal state: it is required on a newly provisioned subentry and removed only after async_setup_entry or the live subentry update listener matches it to the journal and verifies the runtime. New fleet allocations reject panel slug mesh and anything not matching ^[a-z0-9][a-z0-9_-]{0,63}$. The legacy compatibility adapter accepts existing canonical slugs matching ^[a-z0-9][a-z0-9_-]*$ without a length cutoff and preserves them byte-for-byte; it never routes a legacy identity through the new-allocation truncation path.
 
 FleetPanelStore updates a subentry through:
 

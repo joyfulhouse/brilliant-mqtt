@@ -122,6 +122,57 @@ def test_exception_mapping_uses_stable_allowlisted_metadata(
     _assert_secret_free(mapped)
 
 
+@pytest.mark.parametrize("link_name", ["__cause__", "__context__"])
+def test_wrapped_tls_verification_error_keeps_specific_classification(
+    link_name: str,
+) -> None:
+    tls_error = ssl.SSLCertVerificationError(
+        1,
+        "mqtt-password-secret -----BEGIN CERTIFICATE-----CA-SECRET",
+    )
+    socket_wrapper = OSError("mqtt.secret.example mqtt-user-secret")
+    setattr(socket_wrapper, link_name, tls_error)
+    mqtt_wrapper = MqttError("MQTT_PASSWORD=environment-secret")
+    mqtt_wrapper.__cause__ = socket_wrapper
+
+    mapped = from_exception(OperationStage.FLEET_AUTH, mqtt_wrapper)
+
+    assert mapped.code == "broker_tls_verification_failed"
+    assert mapped.__cause__ is None
+    assert mapped.__context__ is None
+    _assert_secret_free(mapped)
+
+
+def test_exception_chain_classification_is_cycle_safe() -> None:
+    outer = OSError("mqtt-password-secret")
+    inner = RuntimeError("mqtt-user-secret")
+    outer.__cause__ = inner
+    inner.__context__ = outer
+
+    mapped = from_exception(OperationStage.FLEET_AUTH, outer)
+
+    assert mapped.code == "broker_connect_failed"
+    _assert_secret_free(mapped)
+
+
+def test_exception_chain_classification_has_a_finite_search_bound() -> None:
+    outer = OSError("mqtt-password-secret")
+    current: BaseException = outer
+    for _ in range(128):
+        nested = RuntimeError("mqtt-user-secret")
+        current.__cause__ = nested
+        current = nested
+    current.__cause__ = ssl.SSLCertVerificationError(
+        1,
+        "-----BEGIN CERTIFICATE-----CA-SECRET",
+    )
+
+    mapped = from_exception(OperationStage.FLEET_AUTH, outer)
+
+    assert mapped.code == "broker_connect_failed"
+    _assert_secret_free(mapped)
+
+
 @pytest.mark.parametrize(
     "error",
     [

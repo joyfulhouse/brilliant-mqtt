@@ -13,6 +13,8 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 
+from brilliant_mqtt.ha_control_protocol import is_panel_slug
+
 # Recognized spellings for boolean env vars. Anything else raises ValueError at
 # startup — an operator writing "false" must never silently get "enabled".
 _ENV_TRUTHY = frozenset({"1", "true", "on", "yes"})
@@ -149,6 +151,8 @@ class Settings:
         mqtt_host = env["MQTT_HOST"]
         mqtt_username = env["MQTT_USERNAME"]
         mqtt_password = env["MQTT_PASSWORD"]
+        if panel == "mesh" or not is_panel_slug(panel):
+            raise ValueError("BRILLIANT_PANEL must be a canonical, non-reserved panel slug")
 
         # Optional with typed defaults.
         mqtt_port = int(env.get("MQTT_PORT", "1883"))

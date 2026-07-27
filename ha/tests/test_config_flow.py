@@ -177,11 +177,53 @@ def _suggested_values(result: Any) -> dict[str, Any]:
         ("office_front", "office_front"),
         ("Panel 2", "panel-2"),
         ("Garage (Left)", "garage-left"),
+        ("P" * 4_096, "p" * 64),
+        (("A" * 63) + "-suffix", "a" * 63),
+        (("A" * 63) + "_suffix", "a" * 63),
         ("!!!", ""),
     ],
 )
 def test_slugify(name: str, slug: str) -> None:
     assert _slugify(name) == slug
+
+
+async def test_not_installed_accepts_maximum_name_and_allocates_bounded_slug(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": "user"})
+    with patch(PROBE, return_value=_not_installed()):
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], CONNECT_INPUT)
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], MQTT_INPUT)
+
+    with patch.object(config_flow, "AsyncsshShell", return_value=FakeShell()):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {
+                **SCRIPT_INPUT,
+                CONF_NAME: "P" * 4_096,
+                CONF_SCENE_PANEL: "",
+            },
+        )
+
+    assert result["type"] == "create_entry"
+    assert result["data"][CONF_PANEL] == "p" * 64
+
+
+async def test_script_name_schema_rejects_input_above_limit(
+    hass: HomeAssistant,
+) -> None:
+    result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": "user"})
+    with patch(PROBE, return_value=_not_installed()):
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], CONNECT_INPUT)
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], MQTT_INPUT)
+
+    schema = result["data_schema"]
+    assert schema is not None
+
+    assert schema({**SCRIPT_INPUT, CONF_NAME: "P" * 4_096})[CONF_NAME] == "P" * 4_096
+    with pytest.raises(vol.Invalid):
+        schema({**SCRIPT_INPUT, CONF_NAME: "P" * 4_097})
 
 
 # --- onboarding: not installed (three steps) -------------------------------
@@ -367,6 +409,26 @@ async def test_not_installed_duplicate_name_aborts(hass: HomeAssistant) -> None:
     result = await hass.config_entries.flow.async_configure(result["flow_id"], MQTT_INPUT)
     result = await hass.config_entries.flow.async_configure(result["flow_id"], SCRIPT_INPUT)
     assert result["type"] == "abort" and result["reason"] == "already_configured"
+
+
+async def test_long_new_name_collides_on_its_bounded_allocated_slug(
+    hass: HomeAssistant,
+) -> None:
+    allocated = "p" * 64
+    MockConfigEntry(domain=DOMAIN, unique_id=allocated, data={CONF_PANEL: allocated}).add_to_hass(
+        hass
+    )
+    result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": "user"})
+    with patch(PROBE, return_value=_not_installed()):
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], CONNECT_INPUT)
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], MQTT_INPUT)
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {**SCRIPT_INPUT, CONF_NAME: ("P" * 64) + " Different", CONF_SCENE_PANEL: ""},
+    )
+
+    assert result["type"] == "abort"
+    assert result["reason"] == "already_configured"
 
 
 # --- onboarding: voice opt-in ----------------------------------------------
@@ -606,7 +668,16 @@ async def test_installed_unreadable_config_shows_error(hass: HomeAssistant) -> N
 
 @pytest.mark.parametrize(
     "bad_panel",
-    ["mesh", "Office Bath", "office/bath", "", "-office", "office-", "_", "--"],
+    [
+        "mesh",
+        "Office Bath",
+        "office/bath",
+        "",
+        "-office",
+        "office-",
+        "_",
+        "--",
+    ],
 )
 async def test_installed_rejects_unsafe_adopted_slug(hass: HomeAssistant, bad_panel: str) -> None:
     """A hand-deployed BRILLIANT_PANEL that isn't the canonical slug form must not adopt.
@@ -618,6 +689,19 @@ async def test_installed_rejects_unsafe_adopted_slug(hass: HomeAssistant, bad_pa
     with patch(PROBE, return_value=_installed(_env(panel=bad_panel))):
         result = await hass.config_entries.flow.async_configure(result["flow_id"], CONNECT_INPUT)
     assert result["type"] == "form" and result["errors"] == {"base": "cannot_read_config"}
+
+
+async def test_installed_adopts_legacy_long_canonical_slug_byte_for_byte(
+    hass: HomeAssistant,
+) -> None:
+    panel = "panel_" + ("z" * 300)
+    result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": "user"})
+    with patch(PROBE, return_value=_installed(_env(panel=panel))):
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], CONNECT_INPUT)
+
+    assert result["type"] == "create_entry"
+    assert result["data"][CONF_PANEL] == panel
+    assert result["result"].unique_id == panel
 
 
 async def test_installed_rejects_out_of_range_port(hass: HomeAssistant) -> None:

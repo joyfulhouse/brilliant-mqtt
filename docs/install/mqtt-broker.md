@@ -215,11 +215,12 @@ TLS or a custom-CA field.
 
 > **Current integration limitation:** adoption does not retain manual
 > `MQTT_TLS_ENABLED`/`MQTT_TLS_CA_FILE` values, and current reconfigure,
-> repair, and update paths regenerate the environment as plaintext
-> (`MQTT_TLS_ENABLED=0`). Do not use the current HA lifecycle flow to manage a
-> manually TLS-configured panel; it may overwrite that panel's TLS environment.
-> Keep managing the TLS environment manually until Plan 2 fleet onboarding
-> wires the packaged staging seam through adoption and lifecycle operations.
+> repair, and update paths still render a plaintext destination. Before any
+> write, they inspect both the live and OTA-staged panel environments and abort
+> with `mqtt_tls_downgrade_refused` if either enables TLS or has an ambiguous
+> TLS value; no panel file is changed. Keep managing the TLS environment
+> manually until Plan 2 fleet onboarding wires the packaged staging seam
+> through adoption and lifecycle operations.
 
 Anonymous MQTT, insecure/ignore-certificate TLS, mutual TLS client
 certificates, and MQTT over WebSockets are unsupported by the Brilliant panel
@@ -295,13 +296,15 @@ and fixes are also useful for diagnosing the current one-panel flow manually.
 <a id="fleet_auth_failed"></a>
 ### `fleet_auth_failed`
 
-- **Cause:** The broker rejected the dedicated Brilliant username/password.
-- **Check:** Confirm the user exists, is enabled, and the entered password is
-  current; inspect the broker authentication log.
-- **Fix:** Correct or rotate the dedicated credential without substituting
-  Home Assistant's hidden credential.
-- **Retry:** Enter the corrected password and retry forthcoming fleet
-  validation.
+- **Cause:** Opening the temporary Brilliant client failed in a way that did
+  not match the stable TLS, authentication, rejection, availability,
+  connection, or timeout classifications.
+- **Check:** Inspect the adjacent stable broker guidance and the broker log;
+  diagnostics intentionally omit raw exception text and secrets.
+- **Fix:** Correct the endpoint, transport, or broker policy identified there
+  without substituting Home Assistant's hidden credential.
+- **Retry:** Retry forthcoming fleet validation after correcting the
+  prerequisite. Known failures surface their more specific stable code.
 
 <a id="panel_to_ha_timeout"></a>
 ### `panel_to_ha_timeout`

@@ -81,6 +81,7 @@ class RetainedTopicLedger:
         self._path = _normalize_path(path)
         self._state = _path_state(self._path, panel_slug)
         self._loaded = False
+        self._manifest_acknowledged = False
 
     @property
     def ownership_topic(self) -> str:
@@ -96,6 +97,7 @@ class RetainedTopicLedger:
         """Load and strictly validate an existing ledger; missing means empty."""
         async with self._state.lock:
             self._loaded = False
+            self._manifest_acknowledged = False
             self._state.loaded = False
             self._state.topics = frozenset()
             try:
@@ -113,16 +115,26 @@ class RetainedTopicLedger:
             self._loaded = True
 
     async def async_publish(self, mqtt: MqttClient, topic: str, payload: str) -> None:
-        """Claim *topic*, acknowledge the manifest, then publish its value."""
+        """Claim *topic*, acknowledge changed ownership, then publish its value."""
         async with self._state.lock:
             self._require_loaded()
             _validate_topic(self._panel_slug, topic)
             enlarged = self._state.topics | {topic}
-            manifest_payload = _new_manifest(self._panel_slug, enlarged).to_payload()
-            if enlarged != self._state.topics:
+            ownership_changed = enlarged != self._state.topics
+            manifest_payload: str | None = None
+            if ownership_changed:
+                manifest_payload = _new_manifest(self._panel_slug, enlarged).to_payload()
+                self._manifest_acknowledged = False
                 await self._async_persist(manifest_payload, enlarged)
 
-            await mqtt.publish(self.ownership_topic, manifest_payload, retain=True, qos=1)
+            if not self._manifest_acknowledged:
+                if manifest_payload is None:
+                    manifest_payload = _new_manifest(
+                        self._panel_slug,
+                        self._state.topics,
+                    ).to_payload()
+                await mqtt.publish(self.ownership_topic, manifest_payload, retain=True, qos=1)
+                self._manifest_acknowledged = True
             await mqtt.publish(topic, payload, retain=True, qos=0)
 
     async def async_clear(self, mqtt: MqttClient, topic: str) -> None:
@@ -137,6 +149,7 @@ class RetainedTopicLedger:
             self._require_loaded()
             for topic in sorted(self._state.topics):
                 await self._async_clear_locked(mqtt, topic)
+            self._manifest_acknowledged = False
             await mqtt.publish(self.ownership_topic, "", retain=True, qos=1)
 
     async def _async_clear_locked(self, mqtt: MqttClient, topic: str) -> None:
@@ -144,11 +157,13 @@ class RetainedTopicLedger:
         if topic not in self._state.topics:
             raise RetainedLedgerError("refusing to clear a topic not owned by this ledger")
 
-        await mqtt.publish(topic, "", retain=True, qos=0)
+        await mqtt.publish(topic, "", retain=True, qos=1)
+        self._manifest_acknowledged = False
         smaller = self._state.topics - {topic}
         manifest_payload = _new_manifest(self._panel_slug, smaller).to_payload()
         await self._async_persist(manifest_payload, smaller)
         await mqtt.publish(self.ownership_topic, manifest_payload, retain=True, qos=1)
+        self._manifest_acknowledged = True
 
     async def _async_persist(self, payload: str, topics: frozenset[str]) -> None:
         write = asyncio.create_task(asyncio.to_thread(_write_payload, self._path, payload))

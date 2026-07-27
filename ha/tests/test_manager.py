@@ -696,6 +696,129 @@ async def test_on_meta_ignored_after_shutdown(hass: HomeAssistant) -> None:
     assert manager.meta is None  # guard returned before storing
 
 
+async def test_retained_ledger_degraded_meta_is_actionable_idempotent_and_self_clearing(
+    hass: HomeAssistant,
+) -> None:
+    """A fixed agent diagnostic becomes one durable issue until normal meta replaces it."""
+    from homeassistant.components.mqtt.models import ReceiveMessage
+    from homeassistant.helpers import issue_registry as ir
+
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    manager = PanelManager(hass, entry, asyncio.Lock())
+    events = _capture_events(hass)
+
+    offline = ReceiveMessage(
+        topic="brilliant/office/availability",
+        payload="offline",
+        qos=0,
+        retain=True,
+        subscribed_topic="brilliant/office/availability",
+        timestamp=dt_util.utcnow().timestamp(),
+    )
+    await manager._on_availability(offline)
+    assert manager._grace_cancel is not None
+
+    degraded = ReceiveMessage(
+        topic="brilliant/office/bridge",
+        payload='{"agent_version":"0.6.0","degraded":"retained_ledger"}',
+        qos=1,
+        retain=True,
+        subscribed_topic="brilliant/office/bridge",
+        timestamp=dt_util.utcnow().timestamp(),
+    )
+    await manager._on_meta(degraded)
+    await manager._on_meta(degraded)
+
+    assert manager.problem is True
+    assert manager.problem_reason == (
+        "agent retained-topic ownership ledger is unreadable or unwritable; "
+        "check /var/brilliant-mqtt/state/owned-topics.json and panel storage"
+    )
+    assert _types(events) == ["needs_attention"]
+    assert ir.async_get(hass).async_get_issue(DOMAIN, manager._issue_id) is not None
+    assert manager._grace_cancel is None
+
+    # This fault needs storage/operator action, not repeated SSH repair loops.
+    await manager._on_availability(offline)
+    assert manager._grace_cancel is None
+    with patch.object(manager, "_shell", side_effect=AssertionError("must not repair")):
+        await manager._recovery_timeout(dt_util.utcnow())
+    assert _types(events) == ["needs_attention"]
+
+    # A stale retained online marker must not hide the more specific diagnostic.
+    online = ReceiveMessage(
+        topic="brilliant/office/availability",
+        payload="online",
+        qos=0,
+        retain=True,
+        subscribed_topic="brilliant/office/availability",
+        timestamp=dt_util.utcnow().timestamp(),
+    )
+    await manager._on_availability(online)
+    assert manager.problem is True
+
+    # A healthy agent replaces the retained diagnostic with ordinary bridge meta.
+    healthy = ReceiveMessage(
+        topic="brilliant/office/bridge",
+        payload='{"agent_version":"0.6.0"}',
+        qos=0,
+        retain=True,
+        subscribed_topic="brilliant/office/bridge",
+        timestamp=dt_util.utcnow().timestamp(),
+    )
+    await manager._on_meta(healthy)
+    assert manager.problem is False
+    assert manager.problem_reason is None
+    assert ir.async_get(hass).async_get_issue(DOMAIN, manager._issue_id) is None
+
+
+async def test_inflight_recovery_timeout_cannot_overwrite_retained_ledger_diagnostic(
+    hass: HomeAssistant,
+) -> None:
+    """A diagnostic arriving during journal I/O wins over the stale generic timeout."""
+    from homeassistant.components.mqtt.models import ReceiveMessage
+
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    manager = PanelManager(hass, entry, asyncio.Lock())
+    manager.availability = "offline"
+    events = _capture_events(hass)
+    shell = FakeShell()
+    journal_started = asyncio.Event()
+    release_journal = asyncio.Event()
+
+    async def blocked_collect_journal(_shell: FakeShell, _lines: int) -> str:
+        journal_started.set()
+        await release_journal.wait()
+        return "stale generic recovery evidence"
+
+    degraded = ReceiveMessage(
+        topic="brilliant/office/bridge",
+        payload='{"agent_version":"0.6.0","degraded":"retained_ledger"}',
+        qos=1,
+        retain=True,
+        subscribed_topic="brilliant/office/bridge",
+        timestamp=dt_util.utcnow().timestamp(),
+    )
+    with (
+        patch.object(manager, "_shell", return_value=shell),
+        patch.object(panel_ops, "collect_journal", side_effect=blocked_collect_journal),
+    ):
+        timeout = hass.async_create_task(manager._recovery_timeout(dt_util.utcnow()))
+        await journal_started.wait()
+        await manager._on_meta(degraded)
+        release_journal.set()
+        await timeout
+
+    assert manager.problem is True
+    assert manager.problem_reason == (
+        "agent retained-topic ownership ledger is unreadable or unwritable; "
+        "check /var/brilliant-mqtt/state/owned-topics.json and panel storage"
+    )
+    assert _types(events) == ["needs_attention"]
+
+
 async def test_shutdown_during_inflight_repair_connect_fail_leaks_no_timer(
     hass: HomeAssistant,
 ) -> None:

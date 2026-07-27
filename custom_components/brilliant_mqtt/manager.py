@@ -97,6 +97,11 @@ _RECOVERY_SECONDS = 60.0
 _UNREACHABLE_RECHECK_SECONDS = 300.0
 _LEGACY_RETIRE_TIMEOUT_SECONDS = 30.0
 _SHELL_CLOSE_TIMEOUT_SECONDS = 5.0
+_RETAINED_LEDGER_DEGRADED = "retained_ledger"
+_RETAINED_LEDGER_PROBLEM = (
+    "agent retained-topic ownership ledger is unreadable or unwritable; "
+    "check /var/brilliant-mqtt/state/owned-topics.json and panel storage"
+)
 
 
 class _HostKeyChanged(Exception):
@@ -515,9 +520,15 @@ class PanelManager:
             if self._recovery_cancel is not None:
                 self._cancel("_recovery_cancel")
                 self._fire(EVENT_REPAIR_SUCCEEDED)
-            self._set_problem(False, None)
+            # A retained online value can predate a newer bridge diagnostic.
+            # Only ordinary bridge meta proves the ledger itself recovered.
+            if self.problem_reason == _RETAINED_LEDGER_PROBLEM:
+                self._notify()
+            else:
+                self._set_problem(False, None)
         elif (
             payload == AVAILABILITY_OFFLINE
+            and self.problem_reason != _RETAINED_LEDGER_PROBLEM
             and self._grace_cancel is None
             and self._recovery_cancel is None
             and not self._repairing
@@ -534,6 +545,8 @@ class PanelManager:
     async def _grace_expired(self, _now: datetime) -> None:
         self._grace_cancel = None
         if self._shutting_down:
+            return
+        if self.problem_reason == _RETAINED_LEDGER_PROBLEM:
             return
         if self.availability != AVAILABILITY_OFFLINE:
             return
@@ -827,6 +840,8 @@ class PanelManager:
             self._last_repair_mono = time.monotonic()
             if self._shutting_down:
                 return  # entry torn down mid-repair: do not re-arm a timer
+            if self.problem_reason == _RETAINED_LEDGER_PROBLEM:
+                return  # preserve the storage diagnosis; another restart cannot repair it
             self._recovery_cancel = async_call_later(
                 self.hass, _RECOVERY_SECONDS, self._recovery_timeout
             )
@@ -924,6 +939,8 @@ class PanelManager:
             self._fire(EVENT_AGENT_UPDATED, {"version": version})
             if self._shutting_down:
                 return  # entry torn down mid-update: do not re-arm a timer
+            if self.problem_reason == _RETAINED_LEDGER_PROBLEM:
+                return  # healthy bridge meta, not a generic timeout, must clear this fault
             # Cancel any prior recovery handle (e.g. a repair's, if this update lands in
             # its window) BEFORE re-arming, so the old TimerHandle can't be orphaned.
             self._cancel("_recovery_cancel")
@@ -1187,6 +1204,8 @@ class PanelManager:
         self._recovery_cancel = None
         if self._shutting_down:
             return
+        if self.problem_reason == _RETAINED_LEDGER_PROBLEM:
+            return
         if self.availability == AVAILABILITY_ONLINE:
             return
         journal = ""
@@ -1200,6 +1219,16 @@ class PanelManager:
                     await shell.close()
         except (OSError, asyncssh.Error, PanelOpError):
             _LOGGER.warning("%s: could not collect journal after failed repair", self.panel)
+        # MQTT callbacks continue while the SSH/journal awaits above. Re-check
+        # the authoritative state so a healthy online marker or a specific
+        # retained-ledger diagnosis that arrived in-flight is never overwritten
+        # by this now-stale generic timeout.
+        if (
+            self._shutting_down
+            or self.problem_reason == _RETAINED_LEDGER_PROBLEM
+            or self.availability == AVAILABILITY_ONLINE
+        ):
+            return
         self._fire(EVENT_REPAIR_FAILED, {"reason": "still_offline", "journal": journal})
         self._escalate(
             "repair ran but the bridge did not come back — probable bus-lib API drift "
@@ -1218,6 +1247,18 @@ class PanelManager:
             _LOGGER.warning("%s: bridge meta is not a JSON object: %r", self.panel, msg.payload)
             return
         self.meta = meta
+        if meta.get("degraded") == _RETAINED_LEDGER_DEGRADED:
+            # The agent republishes this retained marker on each failed session.
+            # Escalate only on the transition so reconnect loops cannot spam HA.
+            self._cancel("_grace_cancel")
+            self._cancel("_recovery_cancel")
+            if self.problem_reason == _RETAINED_LEDGER_PROBLEM:
+                self._notify()
+            else:
+                self._escalate(_RETAINED_LEDGER_PROBLEM)
+            return
+
+        clear_retained_ledger_problem = self.problem_reason == _RETAINED_LEDGER_PROBLEM
         firmware = meta.get("panel_firmware")
         previous = self.entry.data.get(DATA_LAST_FIRMWARE)
         if firmware and firmware != previous:
@@ -1232,7 +1273,10 @@ class PanelManager:
                 self.entry.async_create_background_task(
                     self.hass, self._refresh_staged_copies(), name=f"{self.panel}-staged"
                 )
-        self._notify()
+        if clear_retained_ledger_problem:
+            self._set_problem(False, None)
+        else:
+            self._notify()
 
     async def _refresh_staged_copies(self) -> None:
         """Post-OTA hygiene when the bridge survived: re-write /etc + staged copies."""

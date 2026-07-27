@@ -11,6 +11,8 @@ import voluptuous as vol
 from aiomqtt.exceptions import MqttConnectError, MqttError
 from paho.mqtt.reasoncodes import ReasonCode
 
+_MAX_EXCEPTION_CHAIN_NODES = 32
+
 
 class OperationStage(StrEnum):
     """Ordered stages shared by broker setup and validation."""
@@ -245,7 +247,7 @@ def from_exception(stage: OperationStage, error: BaseException) -> OperationErro
         return error
     if not isinstance(error, Exception):
         raise error
-    if isinstance(error, ssl.SSLCertVerificationError):
+    if _contains_tls_verification_error(error):
         return OperationError.for_code(stage, "broker_tls_verification_failed")
     if stage is OperationStage.BROKER_PROFILE and isinstance(
         error,
@@ -273,6 +275,24 @@ def from_exception(stage: OperationStage, error: BaseException) -> OperationErro
 def _validate_stage(stage: object) -> None:
     if not isinstance(stage, OperationStage):
         raise TypeError("invalid_operation_stage")
+
+
+def _contains_tls_verification_error(error: BaseException) -> bool:
+    pending = [error]
+    seen: set[int] = set()
+    while pending and len(seen) < _MAX_EXCEPTION_CHAIN_NODES:
+        current = pending.pop()
+        identity = id(current)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        if isinstance(current, ssl.SSLCertVerificationError):
+            return True
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+    return False
 
 
 def _mqtt_reason_code(error: MqttConnectError) -> int | None:

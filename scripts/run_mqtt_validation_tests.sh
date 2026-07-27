@@ -92,7 +92,7 @@ cleanup() {
     trap '' INT TERM HUP
     set +e
     if expected_id="$(pending_container_id)"; then
-        docker rm -f -- "${pending_container_name}" >/dev/null 2>&1
+        docker rm -f -v -- "${pending_container_name}" >/dev/null 2>&1
         removed_pending="${pending_container_name}"
     fi
     for ((index = ${#created_containers[@]} - 1; index >= 0; index--)); do
@@ -100,7 +100,7 @@ cleanup() {
         expected_id="${created_container_ids[index]}"
         if [[ "${exact_name}" != "${removed_pending}" ]] &&
             container_is_owned "${exact_name}" "${expected_id}"; then
-            docker rm -f -- "${exact_name}" >/dev/null 2>&1
+            docker rm -f -v -- "${exact_name}" >/dev/null 2>&1
         fi
     done
     if valid_runtime_dir; then

@@ -55,6 +55,10 @@ class _RunnerHarness:
         removed = self.state_dir / "removed"
         return removed.read_text(encoding="utf-8").splitlines() if removed.exists() else []
 
+    def remove_arguments(self) -> list[str]:
+        removed = self.state_dir / "remove-args"
+        return removed.read_text(encoding="utf-8").splitlines() if removed.exists() else []
+
     def assert_isolated_cleanup(self) -> None:
         assert list(self.runtime_base.glob("brilliant-mqtt-live.*")) == []
         assert (self.state_dir / "foreign").read_text(encoding="utf-8") == "untouched\n"
@@ -230,6 +234,7 @@ case "${command_name}" in
         ;;
     rm)
         exact_name="${!#}"
+        printf '%s\n' "$*" >>"${state}/remove-args"
         printf '%s\n' "${exact_name}" >>"${state}/removed"
         if [[ "${exact_name}" == "pre-existing-foreign" ]]; then
             : >"${state}/foreign-deleted"
@@ -291,6 +296,7 @@ def test_fake_runner_success_cleans_only_owned_names(
 
     assert result.returncode == 0
     assert runner_harness.removed_names() == ALL_NAMES
+    assert runner_harness.remove_arguments() == [f"-f -v -- {name}" for name in ALL_NAMES]
     assert "ha/tests/test_broker_validation_live.py -m mqtt_live -q" in (
         runner_harness.state_dir / "pytest-args"
     ).read_text(encoding="utf-8")

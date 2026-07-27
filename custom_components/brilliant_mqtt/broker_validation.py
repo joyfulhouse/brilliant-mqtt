@@ -27,13 +27,21 @@ from homeassistant.config_entries import SOURCE_IGNORE, ConfigEntryState
 from homeassistant.core import HomeAssistant
 
 from .broker import BrokerProfile, DeviceMqttClient, DeviceMqttMessage
-from .errors import OperationError, OperationStage
+from .errors import OperationError, OperationStage, from_exception
 from .setup_protocol import SetupRequest, SetupResult, SetupTopics
 
 _DeviceClientFactory = Callable[
     [BrokerProfile, str],
     AbstractAsyncContextManager[DeviceMqttClient],
 ]
+_FLEET_AUTH_CODES = {
+    "broker_tls_verification_failed",
+    "broker_authentication_failed",
+    "broker_connection_rejected",
+    "broker_unavailable",
+    "broker_connect_failed",
+    "broker_timeout",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,6 +138,7 @@ class BrokerValidator:
                 OperationStage.FLEET_AUTH,
                 "fleet_auth_failed",
                 lambda: self._async_open_device(state, profile, validation_id),
+                allowed_codes=_FLEET_AUTH_CODES,
             )
             self._record_stage(
                 OperationStage.FLEET_AUTH,
@@ -244,13 +253,10 @@ class BrokerValidator:
             return
         if not isinstance(failure, Exception):
             raise failure
-        if (
-            isinstance(failure, OperationError)
-            and allowed_codes is not None
-            and failure.stage is stage
-            and failure.code in allowed_codes
-        ):
-            raise failure from None
+        if allowed_codes is not None:
+            classified = from_exception(stage, failure)
+            if classified.stage is stage and classified.code in allowed_codes:
+                raise classified from None
         raise OperationError.for_code(stage, default_code) from None
 
     async def _async_ha_mqtt_ready(self) -> None:
@@ -469,6 +475,10 @@ class BrokerValidator:
 
         actions: list[Callable[[], Awaitable[None]]] = []
         device = state.device
+        if state.device_messages is not None:
+            # Close the suspended consumer first, while its underlying client
+            # and context are still valid and before any slower cleanup work.
+            actions.append(partial(_async_close_iterator, state.device_messages))
         if device is not None:
             for topic in state.retained_topics:
                 actions.append(
@@ -545,6 +555,17 @@ def _payload_matches(payload: object, expected: str) -> bool:
 
 async def _async_call(callback: Callable[[], Any]) -> None:
     result = callback()
+    if inspect.isawaitable(result):
+        await result
+
+
+async def _async_close_iterator(
+    iterator: AsyncIterator[DeviceMqttMessage],
+) -> None:
+    close = getattr(iterator, "aclose", None)
+    if not callable(close):
+        return
+    result = close()
     if inspect.isawaitable(result):
         await result
 

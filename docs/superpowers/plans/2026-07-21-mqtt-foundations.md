@@ -18,6 +18,7 @@
 - TLS always verifies the server certificate chain and hostname. A TLS failure never retries over plaintext.
 - Setup IDs are UUIDv4 values generated for one validation attempt. Setup topics are cleaned in a finally block after success, failure, timeout, or cancellation.
 - A panel ownership ledger may claim only retained topics owned by that concrete panel slug. It must reject brilliant/mesh and mesh discovery identifiers.
+- New Home Assistant panel allocations are capped at 64 characters after normalization. Shared wire/runtime validators remain syntax-only so an existing canonical slug is preserved byte-for-byte even when longer; `mesh` remains reserved.
 - Keep FakeMqtt.published as the existing three-tuple shape so unrelated tests do not churn; record QoS separately.
 - Root source remains Python 3.10. HA source remains Python 3.14. Never import HA code into the panel package.
 - Automated tests do not contact a real panel, a production broker, or the Brilliant message bus.
@@ -36,12 +37,14 @@
 - Create tests/test_mqttio.py: client construction, TLS, and publish acknowledgement tests.
 - Create src/brilliant_mqtt/retained_topics.py and tests/test_retained_topics.py: durable bounded ownership ledger.
 - Modify src/brilliant_mqtt/bridge.py and src/brilliant_mqtt/__main__.py: route panel-retained publications through the ledger.
+- Modify custom_components/brilliant_mqtt/manager.py and ha/tests/test_manager.py: surface the fixed retained-ledger degraded diagnostic without repair-loop spam.
 - Create src/brilliant_mqtt/preflight.py and tests/test_preflight.py: temporary panel-side validation CLI.
 - Create custom_components/brilliant_mqtt/errors.py and ha/tests/test_errors.py: stable typed operation errors.
 - Create custom_components/brilliant_mqtt/broker.py and ha/tests/test_broker.py: normalized/redacted fleet broker profile and temporary MQTT client.
 - Create custom_components/brilliant_mqtt/broker_validation.py and ha/tests/test_broker_validation.py: end-to-end HA/device validation.
 - Modify pyproject.toml, custom_components/brilliant_mqtt/manifest.json, ha/pyproject.toml, and uv.lock: pin the same aiomqtt/Paho device stack in both runtimes.
 - Modify custom_components/brilliant_mqtt/panel_ops.py, custom_components/brilliant_mqtt/components.py, ha/tests/test_panel_ops.py, and ha/tests/test_components.py: render TLS and ledger settings into staged panel environments.
+- Modify custom_components/brilliant_mqtt/config_flow.py and ha/tests/test_config_flow.py: cap only new slug allocations while preserving canonical adopted identities.
 - Modify scripts/build_payload.sh and custom_components/brilliant_mqtt/agent_payload/: package the new agent modules and pinned dependencies.
 - Create tests/mqtt_broker/mosquitto.conf, tests/mqtt_broker/acl, tests/mqtt_broker/passwords.example, tests/mqtt_broker/tls/: disposable broker fixtures with generated certificates.
 - Create scripts/run_mqtt_validation_tests.sh and ha/tests/test_broker_validation_live.py: opt-in plain/TLS/ACL live-broker contract tests.
@@ -150,6 +153,7 @@ git commit -m "feat: define MQTT setup validation protocol"
 Add tests proving:
 
 - defaults are plaintext, no CA file, and /var/brilliant-mqtt/state/owned-topics.json;
+- BRILLIANT_PANEL rejects non-canonical syntax and the reserved `mesh` value while accepting established canonical identities without a length cutoff;
 - MQTT_TLS_ENABLED accepts only the existing strict boolean spellings;
 - MQTT_TLS_CA_FILE without MQTT_TLS_ENABLED is rejected;
 - TLS with no CA calls ssl.create_default_context() with no cafile;
@@ -255,7 +259,7 @@ assert mqtt.published == [
 assert mqtt.published_qos == [1, 0]
 ~~~
 
-Assert that disk write failure or manifest QoS-1 publish failure prevents the target publish. Assert clear publishes an empty retained payload first, then removes the topic from disk and republishes the smaller manifest. Assert clear_all clears ownership last.
+Assert that disk write failure or manifest QoS-1 publish failure prevents the target publish. A loaded ledger publishes its manifest exactly once before the first target publication in that session, repeated unchanged target publications do not republish it, and a changed owned set requires a new acknowledgement. Assert clear publishes an empty retained payload at QoS 1 first, then removes the topic from disk and republishes the smaller manifest. Assert clear_all uses QoS 1 tombstones and clears ownership last.
 
 - [ ] **Step 2: Run and verify the missing-module failure**
 
@@ -267,14 +271,16 @@ Expected: FAIL during collection for missing brilliant_mqtt.retained_topics.
 
 Use a frozen OwnedTopicsManifest dataclass. Persist by mkdir(parents=True), write canonical UTF-8 JSON to a sibling temporary file opened with mode 0o600, flush, os.fsync, os.replace, then fsync the parent directory. Offload file operations with asyncio.to_thread. Keep a frozenset snapshot and serialize sorted topics.
 
-The first publication of a topic must execute:
+The first publication of a newly owned topic must execute:
 
 1. validate the topic;
 2. persist the enlarged set;
 3. publish the ownership manifest retained at QoS 1;
 4. publish the retained target at QoS 0.
 
-On step 3 failure, retain the conservative on-disk over-inclusion. On target failure, leave the manifest claiming the topic. Never silently recreate an invalid existing ledger; raise RetainedLedgerError and let the runtime publish a degraded diagnostic.
+On step 3 failure, retain the conservative on-disk over-inclusion. On target failure, leave the manifest claiming the topic. After `async_load`, republish the current manifest exactly once before the session's first retained target so a broker that lost retained state reconverges; skip manifest serialization and publication on the unchanged hot path after that acknowledgement.
+
+Never silently recreate an invalid existing ledger. On `RetainedLedgerError` during load or persistence, the runtime best-effort connects MQTT when needed, publishes retained QoS 1 `{"agent_version": "...", "degraded": "retained_ledger"}` to `brilliant/{slug}/bridge`, and then preserves the original ledger failure. Diagnostic connection/publication failure must not replace it. Home Assistant creates one stable needs-attention issue, cancels generic offline/recovery timers, rechecks the diagnosis after any already in-flight SSH await before generic escalation, and clears that issue only when ordinary bridge metadata replaces the degraded marker.
 
 - [ ] **Step 4: Route every panel-retained bridge publication through the ledger**
 
@@ -449,7 +455,8 @@ Build a fake HA MQTT seam around mqtt.async_wait_for_mqtt_client, mqtt.async_sub
 |---|---|---|
 | ha_mqtt_ready | no connected HA client | ha_mqtt_unavailable |
 | ha_mqtt_ready | effective prefix zigbee | unsupported_discovery_prefix |
-| fleet_auth | CONNACK rejection | fleet_auth_failed |
+| fleet_auth | classified TLS/auth/rejection/connect/timeout failure | broker_tls_verification_failed, broker_authentication_failed, broker_connection_rejected, broker_unavailable, broker_connect_failed, or broker_timeout |
+| fleet_auth | otherwise unclassified open failure | fleet_auth_failed |
 | panel_to_ha | nonce never reaches HA | panel_to_ha_timeout |
 | ha_to_panel | nonce never reaches device | ha_to_panel_timeout |
 | discovery_write | explicit authorization failure | discovery_write_denied |
@@ -470,7 +477,7 @@ Use one generated UUID and SetupTopics. Read Home Assistant's sole effective MQT
 
 Use mqtt.async_subscribe for HA receives and mqtt.async_publish(self.hass, topic, payload, qos=1, retain=retain) for HA sends. Use the device protocol for panel-principal receives/sends. Validate the exact setup_id and nonce at each hop. Retained validation must subscribe after the device retained publish and require both the retained flag and exact nonce.
 
-In finally, independently attempt: device empty-retained cleanup, HA empty-retained cleanup, HA unsubscribe callbacks, device unsubscribe/disconnect. If validation already failed, attach cleanup failure to that OperationError; if validation succeeded but cleanup failed, raise cleanup_failed.
+In finally, first close the stored device-message async iterator while its client/context remain valid, then independently attempt: device empty-retained cleanup, HA empty-retained cleanup, HA unsubscribe callbacks, device unsubscribe/disconnect, and context exit. Bound each action separately and continue after a close error or timeout. If validation already failed, attach cleanup failure to that OperationError; if validation succeeded but cleanup failed, raise cleanup_failed.
 
 - [ ] **Step 4: Run focused and existing MQTT integration tests**
 
@@ -532,6 +539,8 @@ Expected: FAIL because render_env and payload do not include the new contract.
 
 Add constants for /var/brilliant-mqtt/tls and /var/brilliant-mqtt/state/owned-topics.json. Extend render_env with broker TLS fields and an explicit mqtt_tls_ca_file value. Add a stage_mqtt_ca helper that creates the TLS directory and uploads public CA material to the filename produced by f"mqtt-ca-{hashlib.sha256(ca_bytes).hexdigest()[:16]}.pem"; an inactive new file cannot change the running service, while old env snapshots continue to reference their prior file during rollback. Keep current deploy/enable calls untouched; fleet provisioning will use the staging seam in plan 2 and garbage-collect only unreferenced CA files after commit.
 
+Before `write_env` or `ensure_configs` writes any file, inspect only `MQTT_TLS_ENABLED` in both the live and OTA-staged existing environments. Recognize the agent's strict boolean spellings through valid single or double systemd quotes; conservatively refuse escaped, continued, or otherwise ambiguous assignments. If either environment enables TLS or is ambiguous while the desired environment does not enable TLS, fail closed with `mqtt_tls_downgrade_refused` before mkdir/upload/daemon-reload. A TLS-enabled desired environment needs no probe. Full TLS adoption and UI round-tripping remain Plan 2 scope.
+
 Update agent package version to 0.6.0. Ensure scripts/build_payload.sh copies setup_protocol.py, preflight.py, and retained_topics.py through its existing package-copy step and continues to vendor the lock-resolved aiomqtt/Paho versions.
 
 - [ ] **Step 4: Regenerate and verify payload parity**
@@ -588,7 +597,7 @@ git commit -m "feat: package MQTT preflight and TLS support"
 
 - [ ] **Step 1: Write a skipped-by-default live test**
 
-Mark tests mqtt_live and skip unless BRILLIANT_MQTT_TEST_BROKER_URL exists. Exercise four cases against disposable listeners: plaintext success, CA-trusted TLS success, bad device password, and discovery-write ACL denial. A fifth case connects the HA seam and device principal to two listeners and asserts the panel_to_ha timeout maps to the broker-mismatch-or-ACL guidance.
+Mark tests mqtt_live and skip unless BRILLIANT_MQTT_TEST_BROKER_URL exists. Exercise five cases against disposable listeners: plaintext success, CA-trusted TLS success, untrusted-system-CA classification, bad device password, and discovery-write ACL denial. A sixth case connects the HA seam and device principal to two listeners and asserts the panel_to_ha timeout maps to the broker-mismatch-or-ACL guidance.
 
 - [ ] **Step 2: Add a hardened broker runner**
 
@@ -601,7 +610,7 @@ scripts/run_mqtt_validation_tests.sh must:
 - wait for readiness with a bounded 30-second loop;
 - export only test URLs/credentials;
 - run the mqtt_live test;
-- remove containers and the temporary directory in the trap.
+- remove containers with their anonymous volumes and remove the temporary directory in the trap.
 
 The committed ACL grants device readwrite brilliant/# and write homeassistant/#, while a denial variant omits homeassistant write. Do not commit generated keys, certificates, or a usable password file.
 
@@ -647,7 +656,10 @@ git commit -m "test: exercise MQTT validation against Mosquitto"
 - Both runtimes pass the same setup v1 golden vectors.
 - Runtime and preflight use the same strict TLS client construction.
 - BrokerValidator proves HA readiness, both message directions, discovery write, and retained delivery with cleanup.
-- Every real-panel retained publish is preceded by a durable ownership-manifest acknowledgement; mesh remains unclaimed.
+- Every real-panel session republishes its ownership manifest once, owned-set changes are durably acknowledged before target publication, unchanged hot-path publications do not churn the manifest, and mesh remains unclaimed.
+- Retained-ledger failures remain fail-closed but publish one fixed MQTT-visible degraded diagnostic that Home Assistant surfaces without starting a generic repair loop.
+- Existing TLS-enabled live or staged panel environments cannot be implicitly rewritten as plaintext.
+- Fleet authentication preserves actionable transport/TLS/authentication classifications, and validator cleanup closes the device-message iterator first.
 - The payload contains the new modules and stays byte-for-byte in parity with source.
 - Official Mosquitto is recommended but not required; external broker ACLs cover both principals.
 - Mock, disposable-broker, full root, full HA, and pilot resource gates pass.

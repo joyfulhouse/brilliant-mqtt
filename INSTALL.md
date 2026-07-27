@@ -52,9 +52,11 @@ users, ACLs, or configuration.
 Strict TLS is available to manually managed panel-agent deployments, and the
 integration package contains the CA-staging seam for the future fleet flow. The
 current one-panel UI, adoption, reconfigure, repair, and update paths are not
-TLS-aware and may rewrite a manually configured TLS environment with
-`MQTT_TLS_ENABLED=0`. Do not use the current HA lifecycle flow to manage a
-manual TLS panel; see the
+TLS-aware. To prevent an implicit downgrade, every lifecycle write checks both
+the live and OTA-staged panel environments and aborts with
+`mqtt_tls_downgrade_refused` before changing files if either enables TLS or its
+TLS value cannot be classified safely. Keep a manual TLS panel under manual
+lifecycle management until Plan 2 can round-trip those settings; see the
 [transport-security warning](docs/install/mqtt-broker.md#transport-security).
 
 ## Step 3 — Deploy the agent to a panel

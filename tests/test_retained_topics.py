@@ -53,6 +53,25 @@ class RecordingFailureMqtt(FakeMqtt):
             raise RuntimeError(f"publish failed: {topic}")
 
 
+class RecordingOneShotFailureMqtt(FakeMqtt):
+    def __init__(self, fail_topic: str) -> None:
+        super().__init__()
+        self._fail_topic = fail_topic
+        self._failed = False
+
+    async def publish(
+        self,
+        topic: str,
+        payload: str,
+        retain: bool = False,
+        qos: int = 0,
+    ) -> None:
+        await super().publish(topic, payload, retain, qos)
+        if topic == self._fail_topic and not self._failed:
+            self._failed = True
+            raise RuntimeError(f"publish failed once: {topic}")
+
+
 async def test_missing_ledger_loads_empty_without_creating_a_file(tmp_path: Path) -> None:
     path = tmp_path / "owned-topics.json"
     ledger = RetainedTopicLedger(PANEL, path)
@@ -76,9 +95,9 @@ async def test_missing_ledger_loads_empty_without_creating_a_file(tmp_path: Path
         "a" * 64,
         "panel_" + ("z" * 250),
     ],
-    ids=["64-characters", "current-flow-long"],
+    ids=["64-characters", "legacy-long"],
 )
-async def test_current_flow_canonical_slugs_have_no_hidden_ledger_length_limit(
+async def test_canonical_slugs_have_no_hidden_ledger_length_limit(
     tmp_path: Path,
     panel_slug: str,
 ) -> None:
@@ -262,6 +281,75 @@ async def test_first_publish_persists_then_publishes_manifest_before_target(
         (target, '{"on":true}', True),
     ]
     assert mqtt.published_qos == [1, 0]
+    assert ledger.topics == frozenset({target})
+    assert path.read_text(encoding="utf-8") == expected_manifest
+
+
+async def test_loaded_manifest_is_acknowledged_once_before_unchanged_hot_path(
+    tmp_path: Path,
+) -> None:
+    target = "brilliant/kitchen/light-1/state"
+    expected_manifest = _manifest([target])
+    path = tmp_path / "owned-topics.json"
+    path.write_text(expected_manifest, encoding="utf-8")
+    ledger = await _loaded_ledger(path)
+    mqtt = FakeMqtt()
+
+    await ledger.async_publish(mqtt, target, "one")
+    await ledger.async_publish(mqtt, target, "two")
+
+    assert mqtt.published == [
+        (ledger.ownership_topic, expected_manifest, True),
+        (target, "one", True),
+        (target, "two", True),
+    ]
+    assert mqtt.published_qos == [1, 0, 0]
+
+
+async def test_repeat_load_requires_a_fresh_manifest_ack_before_existing_target(
+    tmp_path: Path,
+) -> None:
+    target = "brilliant/kitchen/light-1/state"
+    expected_manifest = _manifest([target])
+    path = tmp_path / "owned-topics.json"
+    path.write_text(expected_manifest, encoding="utf-8")
+    ledger = await _loaded_ledger(path)
+    mqtt = FakeMqtt()
+    await ledger.async_publish(mqtt, target, "before-reload")
+    mqtt.published.clear()
+    mqtt.published_qos.clear()
+
+    await ledger.async_load()
+    await ledger.async_publish(mqtt, target, "after-reload")
+
+    assert mqtt.published == [
+        (ledger.ownership_topic, expected_manifest, True),
+        (target, "after-reload", True),
+    ]
+    assert mqtt.published_qos == [1, 0]
+
+
+async def test_failed_manifest_ack_is_retried_before_target_publish(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "owned-topics.json"
+    ledger = await _loaded_ledger(path)
+    target = "brilliant/kitchen/light-1/state"
+    expected_manifest = _manifest([target])
+    mqtt = RecordingOneShotFailureMqtt(ledger.ownership_topic)
+
+    with pytest.raises(RuntimeError, match="publish failed once"):
+        await ledger.async_publish(mqtt, target, "one")
+    await ledger.async_publish(mqtt, target, "two")
+    await ledger.async_publish(mqtt, target, "three")
+
+    assert mqtt.published == [
+        (ledger.ownership_topic, expected_manifest, True),
+        (ledger.ownership_topic, expected_manifest, True),
+        (target, "two", True),
+        (target, "three", True),
+    ]
+    assert mqtt.published_qos == [1, 1, 0, 0]
     assert ledger.topics == frozenset({target})
     assert path.read_text(encoding="utf-8") == expected_manifest
 
@@ -499,7 +587,7 @@ async def test_clear_publishes_tombstone_before_persisting_smaller_manifest(
         (removed, "", True),
         (ledger.ownership_topic, _manifest([kept]), True),
     ]
-    assert mqtt.published_qos == [0, 1]
+    assert mqtt.published_qos == [1, 1]
     assert ledger.topics == frozenset({kept})
     assert path.read_text(encoding="utf-8") == _manifest([kept])
 
@@ -523,6 +611,8 @@ async def test_clear_all_clears_ownership_last(tmp_path: Path) -> None:
     assert mqtt.published_qos[-1] == 1
     for topic in topics:
         assert (topic, "", True) in mqtt.published[:-1]
+        index = mqtt.published.index((topic, "", True))
+        assert mqtt.published_qos[index] == 1
     assert ledger.topics == frozenset()
     assert path.read_text(encoding="utf-8") == _manifest([])
 
