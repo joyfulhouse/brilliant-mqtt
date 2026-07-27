@@ -15,6 +15,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry, async_
 from pytest_homeassistant_custom_component.typing import MqttMockHAClient
 
 from custom_components.brilliant_mqtt import scene_control as scene_control_module
+from custom_components.brilliant_mqtt.config_flow import _slugify
 from custom_components.brilliant_mqtt.const import (
     CONF_HA_CONTROL_ENABLED,
     CONF_PANEL,
@@ -29,6 +30,7 @@ from custom_components.brilliant_mqtt.ha_control_protocol import (
     SCHEMA_VERSION,
     encode_json,
     mode_result_topic,
+    scene_catalog_topic,
     scene_result_topic,
 )
 from custom_components.brilliant_mqtt.scene_control import (
@@ -126,6 +128,35 @@ def _scene_event(executed_at_ms: int, *, scene_id: str = "all_off") -> str:
             "deduplication_key": f"office:{scene_id}:{executed_at_ms}",
         }
     )
+
+
+@pytest.mark.allow_lingering_timers
+async def test_config_flow_long_slug_reaches_scene_catalog_runtime(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+) -> None:
+    panel = _slugify("Panel " + ("Z" * 250))
+    runtime = SceneControl(hass)
+    await runtime.async_start({panel}, default_panel=panel, actions={})
+
+    try:
+        async_fire_mqtt_message(
+            hass,
+            scene_catalog_topic(panel),
+            _scene_catalog(
+                200,
+                [{"scene_id": "all_off", "display_name": "All Lights Off", "icon": None}],
+                panel=panel,
+            ),
+            retain=True,
+        )
+        await hass.async_block_till_done()
+
+        assert runtime.attached_panels == frozenset({panel})
+        assert runtime.default_panel == panel
+        assert runtime.scene_options(panel) == (SceneOption("all_off", "All Lights Off"),)
+    finally:
+        await runtime.async_stop()
 
 
 def _mode_event(executed_at_ms: int, *, mode_id: str = "away") -> str:

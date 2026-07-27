@@ -64,10 +64,33 @@ def test_topics_match_golden_vectors() -> None:
     } == expected
 
 
-@pytest.mark.parametrize("invalid", ["Office", "office/bath", "office%2Fbath", "", "a" * 64])
+@pytest.mark.parametrize("invalid", ["Office", "office/bath", "office%2Fbath", ""])
 def test_topic_helpers_reject_invalid_panel_slugs(invalid: str) -> None:
     with pytest.raises(ValueError):
         scene_catalog_topic(invalid)
+
+
+@pytest.mark.parametrize("panel", ["a" * 64, "panel_" + ("z" * 250)])
+def test_scene_wire_contract_accepts_current_flow_long_panel_slugs(panel: str) -> None:
+    command_id = "22222222-2222-4222-8222-222222222222"
+    payload = encode_json(
+        {
+            "schema_version": 1,
+            "mapping_version": 1,
+            "command_id": command_id,
+            "panel": panel,
+            "scene_id": "all-off",
+            "issued_at_ms": VECTORS["now_ms"],
+        }
+    )
+
+    assert scene_catalog_topic(panel) == f"brilliant/ha-control/v1/scene/catalog/{panel}"
+    assert decode_scene_command(payload, now_ms=VECTORS["now_ms"]) == SceneCommand(
+        command_id=command_id,
+        panel=panel,
+        scene_id="all-off",
+        issued_at_ms=VECTORS["now_ms"],
+    )
 
 
 @pytest.mark.parametrize("invalid", ["not-a-uuid", "", "office%2Flamp"])

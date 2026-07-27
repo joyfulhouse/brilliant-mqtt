@@ -27,6 +27,7 @@ from .ha_control_protocol import (
     MAPPING_VERSION,
     SCHEMA_VERSION,
     encode_json,
+    is_panel_slug,
     mode_command_topic,
     scene_command_topic,
 )
@@ -47,7 +48,6 @@ _MAX_STRING_LENGTH = 4_096
 _RESULT_TIMEOUT_SECONDS = 16.0
 
 _TOPIC_PREFIX = ("brilliant", "ha-control", "v1")
-_PANEL_PATTERN = re.compile(r"[a-z0-9][a-z0-9_-]{0,62}")
 _SERVICE_PATTERN = re.compile(r"[a-z0-9_]+")
 _RESULT_ERROR_PATTERN = re.compile(r"[a-z0-9_]{1,64}")
 _TARGET_KEYS = frozenset({"entity_id", "device_id", "area_id"})
@@ -808,7 +808,7 @@ def _validated_uuid(value: str) -> str:
 
 
 def _is_panel(value: object) -> bool:
-    return isinstance(value, str) and _PANEL_PATTERN.fullmatch(value) is not None
+    return is_panel_slug(value)
 
 
 def _decode_scene_options(raw_items: list[object]) -> tuple[SceneOption, ...]:

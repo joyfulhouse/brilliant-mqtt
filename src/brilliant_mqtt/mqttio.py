@@ -25,6 +25,7 @@ from brilliant_mqtt.discovery import availability_topic
 logger = logging.getLogger(__name__)
 
 _DISCONNECT_ERROR = "MQTT disconnect failed"
+_LIFECYCLE_ERROR = "MQTT adapter cannot be reused"
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,7 +91,9 @@ class AioMqttAdapter:
         self._publish_availability = publish_availability
         self._checked_disconnect = checked_disconnect
         self._redacted_logging = redacted_logging
+        self._connect_started = False
         self._entered = False
+        self._closing = False
         self._closed = False
 
         # Last-Will-and-Testament: the broker publishes this retained "offline"
@@ -111,7 +114,10 @@ class AioMqttAdapter:
         )
 
     async def connect(self) -> None:
-        """Open the broker connection and start the message reader task."""
+        """Open this one-shot adapter and start its message reader task."""
+        if self._connect_started or self._closing or self._closed:
+            raise RuntimeError(_LIFECYCLE_ERROR)
+        self._connect_started = True
         entry_task = asyncio.create_task(
             self._attempt_raw_enter(),
             name="brilliant-mqtt-enter",
@@ -119,6 +125,8 @@ class AioMqttAdapter:
         entry_error, cancellation = await _settle_lifecycle_task(entry_task)
         if entry_error is None:
             self._entered = True
+        else:
+            self._closed = True
         if cancellation is not None:
             raise cancellation from None
         if entry_error is not None:
@@ -226,13 +234,21 @@ class AioMqttAdapter:
         default remains best-effort; checked mode finishes every close step and
         then raises one generic error if any step failed.
         """
-        if not self._entered or self._closed:
+        if self._closed:
             return
+        if self._closing or (self._connect_started and not self._entered):
+            raise RuntimeError(_LIFECYCLE_ERROR)
+        if not self._entered:
+            return
+        self._closing = True
 
         failed = False
+        cancellation: asyncio.CancelledError | None = None
         if self._publish_availability:
             try:
                 await self._client.publish(self._avail_topic, payload="offline", retain=True)
+            except asyncio.CancelledError as error:
+                cancellation = error
             except aiomqtt.MqttError as exc:
                 # Ordinary when the link is already down (every runner reconnect
                 # cycle hits this): one quiet line, no traceback — the broker-side
@@ -255,72 +271,76 @@ class AioMqttAdapter:
                 else:
                     logger.exception("failed publishing clean offline availability")
 
-        if self._checked_disconnect:
+        reader_settle_task: asyncio.Task[BaseException | None] | None = None
+        if self._reader_task is not None:
+            self._reader_task.cancel()
+            reader_settle_task = asyncio.create_task(
+                _attempt_reader_stop(self._reader_task),
+                name="brilliant-mqtt-reader-stop",
+            )
 
-            async def close_checked() -> bool:
-                self._closed = True
-                try:
-                    await self._client.__aexit__(None, None, None)
-                except asyncio.CancelledError:
-                    return False
-                except Exception:
-                    return False
-                finally:
-                    self._entered = False
-                return True
+        # Start raw exit before draining the reader: aiomqtt's message iterator
+        # can depend on the context manager reaching its disconnected state.
+        exit_task = asyncio.create_task(
+            self._attempt_raw_exit(),
+            name="brilliant-mqtt-exit",
+        )
+        exit_error, exit_cancellation = await _settle_lifecycle_task(exit_task)
+        cancellation = cancellation or exit_cancellation
+        reader_error: BaseException | None = None
+        if reader_settle_task is not None:
+            reader_error, reader_cancellation = await _settle_lifecycle_task(reader_settle_task)
+            cancellation = cancellation or reader_cancellation
 
-            if self._reader_task is not None:
-                reader_task = self._reader_task
-                reader_task.cancel()
+        # The adapter becomes terminal only after both owned tasks settle. Raw
+        # context-manager instances are one-shot even when exit itself fails.
+        self._reader_task = None
+        self._entered = False
+        self._closing = False
+        self._closed = True
 
-                async def wait_reader_checked() -> bool:
-                    try:
-                        await reader_task
-                    except asyncio.CancelledError:
-                        return True
-                    except Exception:
-                        return False
-                    return True
-
-                try:
-                    # aiomqtt's iterator observes the disconnected state driven
-                    # by __aexit__, so start close before draining the reader.
-                    closed, reader_stopped = await asyncio.gather(
-                        close_checked(),
-                        wait_reader_checked(),
-                    )
-                finally:
-                    self._reader_task = None
-                if not reader_stopped:
-                    failed = True
-                    logger.error("reader task failed during cancellation")
+        if reader_error is not None:
+            if self._checked_disconnect:
+                failed = True
+                logger.error("reader task failed during cancellation")
+            elif isinstance(reader_error, Exception):
+                logger.error(
+                    "reader task raised during cancellation",
+                    exc_info=(
+                        type(reader_error),
+                        reader_error,
+                        reader_error.__traceback__,
+                    ),
+                )
             else:
-                closed = (await asyncio.gather(close_checked()))[0]
-            if not closed:
+                raise reader_error
+
+        if exit_error is not None:
+            if self._checked_disconnect:
                 failed = True
                 logger.error("failed closing MQTT client")
-        else:
-            if self._reader_task is not None:
-                reader_task = self._reader_task
-                reader_task.cancel()
-                try:
-                    await reader_task
-                except asyncio.CancelledError:
-                    pass
-                except Exception:
-                    logger.exception("reader task raised during cancellation")
-                finally:
-                    self._reader_task = None
-            try:
-                self._closed = True
-                await self._client.__aexit__(None, None, None)
-            except Exception:
-                logger.exception("failed closing MQTT client")
-            finally:
-                self._entered = False
+            elif isinstance(exit_error, asyncio.CancelledError):
+                if cancellation is None:
+                    raise exit_error
+            elif isinstance(exit_error, Exception):
+                logger.error(
+                    "failed closing MQTT client",
+                    exc_info=(type(exit_error), exit_error, exit_error.__traceback__),
+                )
+            else:
+                raise exit_error
 
+        if cancellation is not None:
+            raise cancellation from None
         if failed:
             raise RuntimeError(_DISCONNECT_ERROR) from None
+
+    async def _attempt_raw_exit(self) -> BaseException | None:
+        try:
+            await self._client.__aexit__(None, None, None)
+        except BaseException as error:
+            return error
+        return None
 
     # -- MqttClient Protocol -------------------------------------------------
 
@@ -375,3 +395,14 @@ async def _settle_lifecycle_task(
         except BaseException as error:
             return error, cancellation
         return lifecycle_error, cancellation
+
+
+async def _attempt_reader_stop(task: asyncio.Task[None]) -> BaseException | None:
+    """Collect one reader's terminal state without exposing it in checked mode."""
+    try:
+        await task
+    except asyncio.CancelledError:
+        return None
+    except BaseException as error:
+        return error
+    return None

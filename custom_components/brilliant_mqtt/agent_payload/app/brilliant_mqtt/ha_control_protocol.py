@@ -15,7 +15,7 @@ COMMAND_TTL_MS = 15_000
 COMMAND_FUTURE_SKEW_MS = 5_000
 _STABLE_NAMESPACE = UUID("ddd06dfa-168a-5a0b-b8b3-4c5f742b0354")
 _TOPIC_PREFIX = "brilliant/ha-control/v1"
-_PANEL_PATTERN = re.compile(r"[a-z0-9][a-z0-9_-]{0,62}")
+_PANEL_PATTERN = re.compile(r"[a-z0-9][a-z0-9_-]*")
 
 
 @dataclass(frozen=True)
@@ -53,6 +53,11 @@ class ModeCommand:
 def stable_id(entity_id: str) -> str:
     """Return the deterministic wire ID for a Home Assistant entity ID."""
     return str(uuid5(_STABLE_NAMESPACE, entity_id))
+
+
+def is_panel_slug(value: object) -> bool:
+    """Return whether *value* matches the canonical current-flow panel slug."""
+    return isinstance(value, str) and _PANEL_PATTERN.fullmatch(value) is not None
 
 
 def encode_json(value: Mapping[str, object]) -> str:
@@ -208,7 +213,7 @@ def _validated_uuid(value: str, field: str) -> str:
 
 
 def _validated_panel(panel: str) -> str:
-    if _PANEL_PATTERN.fullmatch(panel) is None:
+    if not is_panel_slug(panel):
         raise ValueError("panel must be a percent-free lowercase slug")
     return panel
 

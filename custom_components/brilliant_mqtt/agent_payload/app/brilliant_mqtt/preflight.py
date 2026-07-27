@@ -46,7 +46,12 @@ class PreflightStage(str, Enum):
 
 @dataclass(frozen=True, slots=True)
 class PreflightRequest:
-    """Strict input contract passed to the temporary panel process."""
+    """Strict input contract passed to the temporary panel process.
+
+    ``timeout_seconds`` is a per-stage result deadline, not a total process
+    deadline. Fleet authentication may exceed it while a non-cancellable OS
+    connect worker settles so cleanup never races a late connection.
+    """
 
     setup_id: UUID
     panel_nonce: str
@@ -207,7 +212,11 @@ async def _wait_for(
     *,
     settle_on_cancel: bool = False,
 ) -> None:
-    """Apply a Python 3.10 timeout without ``wait_for`` cancellation races."""
+    """Apply a stage deadline while optionally settling cancellation-safe I/O.
+
+    ``settle_on_cancel`` deliberately makes the deadline soft when the
+    operation owns executor-backed lifecycle work that cannot be stopped.
+    """
     operation = asyncio.ensure_future(awaitable)
     try:
         done, _ = await asyncio.wait({operation}, timeout=timeout)
@@ -435,7 +444,13 @@ async def async_run_preflight(
     request: PreflightRequest,
     mqtt_factory: _MqttFactory = AioMqttAdapter,
 ) -> PreflightReport:
-    """Run one bounded MQTT setup validation and always clean its topics."""
+    """Run MQTT setup validation and always settle lifecycle cleanup.
+
+    Protocol stages use ``request.timeout_seconds`` as result deadlines. The
+    fleet-auth stage can return later when an OS-level connect worker cannot be
+    cancelled safely; CLI callers must impose and enforce an outer process
+    deadline.
+    """
     topics = SetupTopics.for_id(request.setup_id)
     loop = asyncio.get_running_loop()
     ha_result: asyncio.Future[_InboundResult] = loop.create_future()
@@ -669,7 +684,14 @@ async def async_run_preflight(
 
 
 def _argument_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="python -m brilliant_mqtt.preflight")
+    parser = argparse.ArgumentParser(
+        prog="python -m brilliant_mqtt.preflight",
+        description=(
+            "An outer process deadline is required: timeout_seconds is a "
+            "per-stage result deadline, while connection lifecycle settlement "
+            "may take longer."
+        ),
+    )
     parser.add_argument("--request-json", required=True)
     return parser
 

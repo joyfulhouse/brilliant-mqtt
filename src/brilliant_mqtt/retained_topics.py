@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import re
 import tempfile
 import threading
 import weakref
@@ -18,6 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import cast
 
+from brilliant_mqtt.ha_control_protocol import is_panel_slug
 from brilliant_mqtt.protocols import MqttClient
 
 SCHEMA_VERSION = 1
@@ -25,7 +25,6 @@ MAX_TOPICS = 4_096
 MAX_MANIFEST_BYTES = 256 * 1024
 
 _MANIFEST_KEYS = frozenset({"schema_version", "panel_slug", "topics"})
-_PANEL_PATTERN = re.compile(r"[a-z0-9][a-z0-9_-]*")
 
 
 class RetainedLedgerError(RuntimeError):
@@ -76,7 +75,7 @@ class RetainedTopicLedger:
     """Persist and publish the retained topics owned by one real panel."""
 
     def __init__(self, panel_slug: str, path: Path) -> None:
-        if _PANEL_PATTERN.fullmatch(panel_slug) is None or panel_slug == "mesh":
+        if not is_panel_slug(panel_slug) or panel_slug == "mesh":
             raise RetainedLedgerError("invalid panel slug for retained ledger")
         self._panel_slug = panel_slug
         self._path = _normalize_path(path)

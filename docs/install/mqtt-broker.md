@@ -149,6 +149,13 @@ grant general discovery publishing.
 Mosquitto can silently drop an unauthorized publish. A timeout may therefore
 mean an ACL or routing error even when login succeeded.
 
+The packaged panel validator treats `timeout_seconds` as a per-stage result
+deadline. If the operating system has already started a connection worker that
+cannot be cancelled, the validator waits for that worker and MQTT cleanup to
+settle before it exits. The forthcoming fleet coordinator therefore also owns
+an outer SSH-process deadline and terminates a still-running validator before
+onboarding returns; this avoids racing cleanup against a late connection.
+
 <a id="mqtt-discovery-prefix"></a>
 ## MQTT Discovery prefix
 

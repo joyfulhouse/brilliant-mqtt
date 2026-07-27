@@ -71,6 +71,7 @@ from .const import (
     OPT_TRUST_HOST_KEY_CHANGES,
     VOICE_WAKE_WORDS,
 )
+from .ha_control_protocol import is_panel_slug
 from .shell import AsyncsshShell, PanelShell
 from .voice_payload import VoicePayloadError
 
@@ -190,7 +191,6 @@ _MAX_STRING_LENGTH = 4_096
 _MAX_ROOM_OVERRIDES = 200
 _MAX_SCENE_ACTIONS = 1_024
 _SERVICE_PATTERN = re.compile(r"[a-z0-9_]+")
-_PANEL_PATTERN = re.compile(r"[a-z0-9][a-z0-9_-]{0,62}")
 _TARGET_KEYS = frozenset({"entity_id", "device_id", "area_id"})
 
 
@@ -469,7 +469,7 @@ def _adopt_data(env: dict[str, str]) -> dict[str, Any] | None:
         panel = env[panel_ops.ENV_PANEL]
         # Require the adopted slug to be exactly what _slugify would produce, so the
         # adopt and typed-name paths can never disagree on what a valid slug is.
-        if not panel or panel == MESH_PANEL or _slugify(panel) != panel:
+        if panel == MESH_PANEL or not is_panel_slug(panel) or _slugify(panel) != panel:
             return None
         # MQTT_PORT and MESH_PRIORITY are OPTIONAL in the agent's env contract
         # (config.py defaults them to 1883 / 0), so a valid hand-deployed env may omit
@@ -683,7 +683,7 @@ class BrilliantMqttConfigFlow(ConfigFlow, domain=DOMAIN):
             slug = _slugify(user_input[CONF_NAME])
             if slug == MESH_PANEL:
                 errors[CONF_NAME] = "reserved_panel"
-            elif not slug:
+            elif not is_panel_slug(slug):
                 errors[CONF_NAME] = "invalid_name"
             # A control char in the HA host flows into render_voice_env → _env_quote.
             errors.update(

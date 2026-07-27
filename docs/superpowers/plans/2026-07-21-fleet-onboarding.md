@@ -274,6 +274,13 @@ set -a; . /var/brilliant-mqtt/system/brilliant-mqtt.env; set +a; PYTHONPATH=/var
 
 using safe single-quote escaping from a dedicated shell_arg helper. panel_ops builds this command from fixed paths and one escaped request argument; it never accepts a free-form command. The staged env points at an immutable versioned CA file, and PYTHONPATH points only at the staged app/vendor while the service remains unchanged. When HA receives the exact SetupRequest on panel_to_ha, publish SetupResult on ha_to_panel at QoS 1. Require the panel process report to prove fleet_auth, both directions, discovery_write, retained_message, and cleanup. Require HA to observe panel_to_ha and discovery_write. A timeout remains the approved same-broker-or-ACL ambiguous error. Always unsubscribe and terminate a still-running preflight process before returning.
 
+`timeout_seconds` is a per-stage result deadline, not a hard process return
+bound: executor-backed MQTT connect/close work may need to settle after that
+deadline so it cannot race cleanup. The HA coordinator must therefore impose a
+separate outer SSH-process deadline, terminate a still-running preflight
+process, await SSH process settlement, and only then return an onboarding
+error.
+
 - [ ] **Step 5: Implement staged installation and recovery**
 
 PanelProvisioner order is exact:

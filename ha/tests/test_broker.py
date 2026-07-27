@@ -408,6 +408,31 @@ def test_profile_equality_supports_equal_and_unequal_unicode_credentials() -> No
     assert profile != different_password
 
 
+def test_profile_equality_supports_lone_surrogate_credentials() -> None:
+    surrogate_credentials = _profile_data(
+        mqtt_username="brilliant-\ud800",
+        mqtt_password="password-\udfff",
+    )
+    profile = BrokerProfile.from_mapping(surrogate_credentials)
+    equal_profile = BrokerProfile.from_mapping(surrogate_credentials)
+    different_username = BrokerProfile.from_mapping(
+        {
+            **surrogate_credentials,
+            "mqtt_username": "brilliant-\ud801",
+        }
+    )
+    different_password = BrokerProfile.from_mapping(
+        {
+            **surrogate_credentials,
+            "mqtt_password": "password-\udffe",
+        }
+    )
+
+    assert profile == equal_profile
+    assert profile != different_username
+    assert profile != different_password
+
+
 def test_profile_copy_is_safe_and_serialization_is_rejected_without_secrets() -> None:
     profile = BrokerProfile.from_mapping(_profile_data(mqtt_tls_enabled=True, mqtt_tls_ca=CA_PEM))
 

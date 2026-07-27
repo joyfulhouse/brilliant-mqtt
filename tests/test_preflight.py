@@ -640,7 +640,7 @@ async def test_preflight_cleanup_closes_before_reader_drain_without_pending_task
         loop.set_exception_handler(previous_handler)
 
 
-async def test_preflight_attempts_close_before_slow_reader_drain_slot_expires(
+async def test_preflight_keeps_slow_reader_settlement_owned_after_cleanup_slot_expires(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = _settings()
@@ -674,10 +674,8 @@ async def test_preflight_attempts_close_before_slow_reader_drain_slot_expires(
     assert report.error_code == "mqtt_timeout"
     assert asyncio.get_running_loop().time() - started < 0.3
     assert client.exit_attempts == 1
-    assert client.close_dependent_messages.reader_teardown_cancelled.is_set()
-    assert client.lifecycle.index("close_started") < client.lifecycle.index(
-        "reader_teardown_cancelled"
-    )
+    assert not client.close_dependent_messages.reader_teardown_cancelled.is_set()
+    assert client.lifecycle.index("close_started") < client.lifecycle.index("reader_finished")
     assert preflight_module._detached_cleanup_tasks == set()
 
 
@@ -1917,7 +1915,7 @@ def test_cli_subprocess_redacts_invalid_environment_value() -> None:
     assert raw_secret not in completed.stderr
 
 
-def test_cli_help_exits_zero_and_lists_required_request_argument(
+def test_cli_help_explains_required_argument_and_outer_process_deadline(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     with pytest.raises(SystemExit) as raised:
@@ -1926,6 +1924,7 @@ def test_cli_help_exits_zero_and_lists_required_request_argument(
     captured = capsys.readouterr()
     assert raised.value.code == 0
     assert "--request-json" in captured.out
+    assert "outer process deadline" in captured.out
     assert captured.err == ""
 
 

@@ -35,12 +35,13 @@ class _CloseFailingClient:
 class _BlockingCloseClient:
     def __init__(self) -> None:
         self.close_started = asyncio.Event()
+        self.release_close = asyncio.Event()
         self.exit_attempts = 0
 
     async def __aexit__(self, exc_type: object, exc: object, traceback: object) -> None:
         self.exit_attempts += 1
         self.close_started.set()
-        await asyncio.Future()
+        await self.release_close.wait()
 
 
 class _SuccessfulCloseClient:
@@ -49,6 +50,45 @@ class _SuccessfulCloseClient:
 
     async def __aexit__(self, exc_type: object, exc: object, traceback: object) -> None:
         self.exit_attempts += 1
+
+
+class _NeverMessages:
+    def __aiter__(self) -> _NeverMessages:
+        return self
+
+    async def __anext__(self) -> object:
+        await asyncio.Future()
+        raise StopAsyncIteration
+
+
+class _LifecycleClient:
+    """Production-shaped async context manager with controllable raw exit."""
+
+    def __init__(
+        self,
+        *,
+        block_exit: bool = False,
+        exit_error: BaseException | None = None,
+    ) -> None:
+        self.messages = _NeverMessages()
+        self.enter_attempts = 0
+        self.exit_attempts = 0
+        self.exit_started = asyncio.Event()
+        self.release_exit = asyncio.Event()
+        if not block_exit:
+            self.release_exit.set()
+        self._exit_error = exit_error
+
+    async def __aenter__(self) -> _LifecycleClient:
+        self.enter_attempts += 1
+        return self
+
+    async def __aexit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.exit_attempts += 1
+        self.exit_started.set()
+        await self.release_exit.wait()
+        if self._exit_error is not None:
+            raise self._exit_error
 
 
 def _settings(*, tls_enabled: bool, ca_file: str | None = None) -> Settings:
@@ -305,9 +345,11 @@ async def test_checked_disconnect_propagates_caller_cancellation(
     await asyncio.wait_for(client.close_started.wait(), timeout=0.1)
 
     disconnect_task.cancel()
-
+    done_before_close_settled, _ = await asyncio.wait({disconnect_task}, timeout=0.02)
+    client.release_close.set()
     with pytest.raises(asyncio.CancelledError):
-        await disconnect_task
+        await asyncio.wait_for(disconnect_task, timeout=0.1)
+    assert done_before_close_settled == set()
     assert client.exit_attempts == 1
 
 
@@ -340,15 +382,90 @@ async def test_checked_disconnect_propagates_caller_cancellation_during_reader_t
     await asyncio.wait_for(reader_cleanup_started.wait(), timeout=0.1)
 
     disconnect_task.cancel()
+    done_before_reader_settled, _ = await asyncio.wait({disconnect_task}, timeout=0.02)
+    release_reader_cleanup.set()
 
     try:
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(disconnect_task, timeout=0.1)
     finally:
-        release_reader_cleanup.set()
         if not reader_task.done():
             reader_task.cancel()
         try:
             await reader_task
         except asyncio.CancelledError:
             pass
+    assert done_before_reader_settled == set()
+
+
+async def test_disconnect_cancellation_waits_for_raw_exit_to_settle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _LifecycleClient(block_exit=True)
+    monkeypatch.setattr(aiomqtt, "Client", lambda **kwargs: client)
+    adapter = mqttio.AioMqttAdapter(
+        _settings(tls_enabled=False),
+        publish_availability=False,
+        checked_disconnect=True,
+        redacted_logging=True,
+    )
+    await adapter.connect()
+    disconnect_task = asyncio.create_task(adapter.disconnect())
+    await asyncio.wait_for(client.exit_started.wait(), timeout=0.1)
+
+    disconnect_task.cancel()
+    done_before_raw_exit, _ = await asyncio.wait({disconnect_task}, timeout=0.02)
+    client.release_exit.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(disconnect_task, timeout=0.1)
+
+    assert done_before_raw_exit == set()
+    assert client.enter_attempts == 1
+    assert client.exit_attempts == 1
+
+
+async def test_adapter_rejects_reconnect_before_and_after_successful_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _LifecycleClient()
+    monkeypatch.setattr(aiomqtt, "Client", lambda **kwargs: client)
+    adapter = mqttio.AioMqttAdapter(
+        _settings(tls_enabled=False),
+        publish_availability=False,
+        checked_disconnect=True,
+        redacted_logging=True,
+    )
+
+    await adapter.connect()
+    with pytest.raises(RuntimeError, match=r"^MQTT adapter cannot be reused$"):
+        await adapter.connect()
+    await adapter.disconnect()
+    await adapter.disconnect()
+    with pytest.raises(RuntimeError, match=r"^MQTT adapter cannot be reused$"):
+        await adapter.connect()
+
+    assert client.enter_attempts == 1
+    assert client.exit_attempts == 1
+
+
+async def test_failed_raw_exit_is_terminal_and_cleanup_remains_exactly_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _LifecycleClient(exit_error=RuntimeError("raw close secret"))
+    monkeypatch.setattr(aiomqtt, "Client", lambda **kwargs: client)
+    adapter = mqttio.AioMqttAdapter(
+        _settings(tls_enabled=False),
+        publish_availability=False,
+        checked_disconnect=True,
+        redacted_logging=True,
+    )
+
+    await adapter.connect()
+    with pytest.raises(RuntimeError, match=r"^MQTT disconnect failed$"):
+        await adapter.disconnect()
+    await adapter.disconnect()
+    with pytest.raises(RuntimeError, match=r"^MQTT adapter cannot be reused$"):
+        await adapter.connect()
+
+    assert client.enter_attempts == 1
+    assert client.exit_attempts == 1
