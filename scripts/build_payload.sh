@@ -20,9 +20,12 @@ find "$DEST/ha_mirror" -name __pycache__ -type d -prune -exec rm -rf {} +
 find "$DEST/ha_mirror" -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
 
 cp "$ROOT/deploy/brilliant-mqtt.service" "$DEST/brilliant-mqtt.service"
+cp "$ROOT/deploy/brilliant-mqtt-release.service" "$DEST/brilliant-mqtt-release.service"
 cp "$ROOT/deploy/brilliant-ha-mirror.service" "$DEST/brilliant-ha-mirror.service"
 cp "$ROOT/deploy/brilliant-wifi-watchdog.service" "$DEST/brilliant-wifi-watchdog.service"
+cp "$ROOT/deploy/brilliant-wifi-watchdog-release.service" "$DEST/brilliant-wifi-watchdog-release.service"
 cp "$ROOT/deploy/brilliant-bus-watchdog.service" "$DEST/brilliant-bus-watchdog.service"
+cp "$ROOT/deploy/brilliant-bus-watchdog-release.service" "$DEST/brilliant-bus-watchdog-release.service"
 cp "$ROOT/deploy/brilliant-hue-ca.service" "$DEST/brilliant-hue-ca.service"
 cp "$ROOT/deploy/brilliant-hue-ca.timer" "$DEST/brilliant-hue-ca.timer"
 

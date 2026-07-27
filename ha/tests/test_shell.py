@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any, get_type_hints
+from typing import Any, Protocol, get_type_hints
 
 import asyncssh
 import pytest
-
+from custom_components.brilliant_mqtt import shell as shell_module
 from custom_components.brilliant_mqtt.shell import (
     AsyncsshShell,
     HostIdentity,
@@ -18,6 +18,8 @@ from custom_components.brilliant_mqtt.shell import (
     async_verify_host_identity,
     known_hosts_line,
 )
+
+from tests import fakes
 from tests.fakes import FakeShell
 
 # A real (throwaway, public-half-only) ed25519 key so the pinned-connect test
@@ -176,18 +178,121 @@ class _FakeServerHostKey:
 class _FakeConnection:
     """Minimal asyncssh.SSHClientConnection stand-in for connect() tests."""
 
-    def __init__(self, host_key: _FakeServerHostKey | None) -> None:
+    def __init__(
+        self,
+        host_key: _FakeServerHostKey | None,
+        *,
+        process: _FakeRawProcess | None = None,
+        wait_closed_gate: asyncio.Event | None = None,
+    ) -> None:
         self._host_key = host_key
+        self._process = process
+        self._wait_closed_gate = wait_closed_gate
         self.closed = False
+        self.close_count = 0
+        self.wait_closed_count = 0
+        self.process_calls: list[tuple[str, dict[str, object]]] = []
 
     def get_server_host_key(self) -> _FakeServerHostKey | None:
         return self._host_key
 
     def close(self) -> None:
         self.closed = True
+        self.close_count += 1
 
     async def wait_closed(self) -> None:
-        return None
+        self.wait_closed_count += 1
+        if self._wait_closed_gate is not None:
+            await self._wait_closed_gate.wait()
+
+    async def create_process(self, command: str, **kwargs: object) -> _FakeRawProcess:
+        self.process_calls.append((command, kwargs))
+        if self._process is None:
+            raise RuntimeError("SECRET create-process failure")
+        return self._process
+
+
+class _FakeRawReader:
+    """Bounded-reader stand-in for AsyncSSH's binary stdout/stderr readers."""
+
+    def __init__(self, payload: bytes, settled: asyncio.Event) -> None:
+        self._payload = payload
+        self._settled = settled
+        self._offset = 0
+
+    async def read(self, size: int = -1) -> bytes:
+        if self._offset < len(self._payload):
+            end = len(self._payload) if size < 0 else min(len(self._payload), self._offset + size)
+            chunk = self._payload[self._offset : end]
+            self._offset = end
+            return chunk
+        await self._settled.wait()
+        return b""
+
+
+class _TestRawReader(Protocol):
+    async def read(self, size: int = -1) -> bytes: ...
+
+
+class _FailingRawReader:
+    """Reader which fails without retaining its sensitive failure detail."""
+
+    async def read(self, size: int = -1) -> bytes:
+        del size
+        raise RuntimeError("SECRET-STREAM-FAILURE")
+
+
+class _GatedEOFReader:
+    """Reader which proves process settlement waits for every stream."""
+
+    def __init__(self, gate: asyncio.Event) -> None:
+        self._gate = gate
+        self.drained = asyncio.Event()
+
+    async def read(self, size: int = -1) -> bytes:
+        del size
+        await self._gate.wait()
+        self.drained.set()
+        return b""
+
+
+class _FakeRawProcess:
+    """Small controllable AsyncSSH process double used by lifecycle tests."""
+
+    def __init__(
+        self,
+        stdout: bytes = b"",
+        stderr: bytes = b"",
+        *,
+        exit_status: int = 0,
+        settled: bool = True,
+    ) -> None:
+        self._settled = asyncio.Event()
+        if settled:
+            self._settled.set()
+        self.stdout: _TestRawReader = _FakeRawReader(stdout, self._settled)
+        self.stderr: _TestRawReader = _FakeRawReader(stderr, self._settled)
+        self.exit_status: int | None = exit_status
+        self.returncode: int | None = exit_status
+        self.terminate_count = 0
+        self.close_count = 0
+        self.wait_closed_count = 0
+        self.terminated = asyncio.Event()
+
+    def terminate(self) -> None:
+        self.terminate_count += 1
+        self.terminated.set()
+        self.exit_status = 143
+        self.returncode = 143
+        self._settled.set()
+
+    def close(self) -> None:
+        self.close_count += 1
+        self._settled.set()
+
+    async def wait_closed(self) -> None:
+        self.wait_closed_count += 1
+        await self._settled.wait()
 
 
 def _patch_connect(monkeypatch: pytest.MonkeyPatch, conn: _FakeConnection) -> dict[str, object]:
@@ -661,3 +766,199 @@ async def test_double_connect_raises(monkeypatch: pytest.MonkeyPatch) -> None:
 async def test_asyncssh_shell_run_requires_connect() -> None:
     with pytest.raises(RuntimeError, match="not connected"):
         await AsyncsshShell("192.168.1.10", "pw", _REAL_ED25519_PUB).run("true")
+
+
+# --- Bounded started-process lifecycle used by panel-side preflight ----------
+
+
+async def _connected_process_shell(
+    monkeypatch: pytest.MonkeyPatch,
+    raw_process: _FakeRawProcess | None,
+) -> tuple[AsyncsshShell, _FakeConnection]:
+    connection = _FakeConnection(None, process=raw_process)
+    _patch_connect(monkeypatch, connection)
+    shell = AsyncsshShell("panel.local", "pw", _REAL_ED25519_PUB)
+    await shell.connect()
+    return shell, connection
+
+
+async def test_start_uses_binary_pipes_and_returns_bounded_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_process = _FakeRawProcess(b'{"success":true}\n', b"fixed warning\n", exit_status=7)
+    shell, connection = await _connected_process_shell(monkeypatch, raw_process)
+
+    process = await shell.start("fixed preflight command")
+    result = await process.wait()
+
+    assert result == RunResult(7, '{"success":true}\n', "fixed warning\n")
+    assert process.running is False
+    assert connection.process_calls == [
+        (
+            "fixed preflight command",
+            {
+                "encoding": None,
+                "stdin": asyncssh.DEVNULL,
+                "stdout": asyncssh.PIPE,
+                "stderr": asyncssh.PIPE,
+            },
+        )
+    ]
+
+
+async def test_started_process_enforces_one_combined_output_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_process = _FakeRawProcess(
+        b"x" * shell_module.PANEL_PROCESS_OUTPUT_LIMIT,
+        b"y",
+    )
+    shell, _connection = await _connected_process_shell(monkeypatch, raw_process)
+    process = await shell.start("fixed preflight command")
+
+    with pytest.raises(shell_module.PanelProcessError) as raised:
+        await process.wait()
+
+    assert raised.value.code == "process_output_too_large"
+    assert str(raised.value) == "process_output_too_large"
+    assert "x" * 20 not in repr(raised.value)
+    assert raw_process.terminate_count == 1
+    assert raw_process.close_count == 1
+    assert process.running is False
+
+
+async def test_started_process_rejects_non_utf8_output_without_exposing_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_process = _FakeRawProcess(b"\xffSECRET-OUTPUT", b"")
+    shell, _connection = await _connected_process_shell(monkeypatch, raw_process)
+    process = await shell.start("SECRET-COMMAND")
+
+    with pytest.raises(shell_module.PanelProcessError) as raised:
+        await process.wait()
+
+    assert raised.value.code == "process_output_invalid"
+    assert "SECRET" not in str(raised.value)
+    assert "SECRET" not in repr(raised.value)
+
+
+async def test_started_process_failure_waits_for_every_stream_to_settle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    drain_gate = asyncio.Event()
+    gated_reader = _GatedEOFReader(drain_gate)
+    raw_process = _FakeRawProcess()
+    raw_process.stdout = _FailingRawReader()
+    raw_process.stderr = gated_reader
+    shell, _connection = await _connected_process_shell(monkeypatch, raw_process)
+    process = await shell.start("SECRET-COMMAND")
+    waiting = asyncio.create_task(process.wait())
+
+    await raw_process.terminated.wait()
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    assert waiting.done() is False
+    drain_gate.set()
+    with pytest.raises(shell_module.PanelProcessError) as raised:
+        await waiting
+    assert raised.value.code == "process_wait_failed"
+    assert "SECRET" not in str(raised.value)
+    assert "SECRET" not in repr(raised.value)
+    assert gated_reader.drained.is_set()
+
+
+async def test_wait_cancellation_leaves_process_available_for_explicit_settlement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_process = _FakeRawProcess(settled=False)
+    shell, _connection = await _connected_process_shell(monkeypatch, raw_process)
+    process = await shell.start("fixed preflight command")
+    waiter = asyncio.create_task(process.wait())
+    await asyncio.sleep(0)
+
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+
+    assert process.running is True
+    process.terminate()
+    process.terminate()
+    assert await process.wait() == RunResult(143, "", "")
+    assert raw_process.terminate_count == 1
+    assert raw_process.close_count == 1
+    assert process.running is False
+
+
+async def test_shell_close_terminates_and_settles_live_children(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_process = _FakeRawProcess(settled=False)
+    shell, connection = await _connected_process_shell(monkeypatch, raw_process)
+    process = await shell.start("fixed preflight command")
+
+    await shell.close()
+
+    assert raw_process.terminate_count == 1
+    assert raw_process.close_count == 1
+    assert raw_process.wait_closed_count == 1
+    assert process.running is False
+    assert connection.close_count == 1
+    assert connection.wait_closed_count == 1
+
+
+async def test_shell_close_cancellation_waits_for_connection_settlement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_process = _FakeRawProcess(settled=False)
+    connection_gate = asyncio.Event()
+    connection = _FakeConnection(
+        None,
+        process=raw_process,
+        wait_closed_gate=connection_gate,
+    )
+    _patch_connect(monkeypatch, connection)
+    shell = AsyncsshShell("panel.local", "pw", _REAL_ED25519_PUB)
+    await shell.connect()
+    process = await shell.start("fixed preflight command")
+    closing = asyncio.create_task(shell.close())
+    await raw_process.terminated.wait()
+
+    closing.cancel()
+    await asyncio.sleep(0)
+
+    assert closing.done() is False
+    connection_gate.set()
+    with pytest.raises(asyncio.CancelledError):
+        await closing
+    assert process.running is False
+    assert connection.wait_closed_count == 1
+
+
+async def test_start_failure_is_stable_and_does_not_expose_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shell, _connection = await _connected_process_shell(monkeypatch, None)
+
+    with pytest.raises(shell_module.PanelProcessError) as raised:
+        await shell.start("SECRET-COMMAND")
+
+    assert raised.value.code == "process_start_failed"
+    assert "SECRET" not in str(raised.value)
+    assert raised.value.__context__ is None
+
+
+async def test_fake_shell_exposes_the_same_explicit_process_lifecycle() -> None:
+    scripted = fakes.FakePanelProcess(RunResult(9, "report\n", ""), settled=False)
+    shell = FakeShell(processes={"preflight": scripted})
+    await shell.connect()
+
+    process = await shell.start("preflight")
+    assert process is scripted
+    assert process.running is True
+
+    await shell.close()
+
+    assert scripted.terminate_count == 1
+    assert scripted.running is False
+    assert shell.commands == ["preflight"]

@@ -27,6 +27,11 @@ PAYLOAD_WORKFLOWS = (
 PAYLOAD_RELATIVE_PATH = Path("custom_components/brilliant_mqtt/agent_payload")
 PAYLOAD_VERSION_FILE = REPOSITORY_ROOT / PAYLOAD_RELATIVE_PATH / "VERSION"
 EXPECTED_PAYLOAD_VERSION = "0.6.0"
+RELEASE_SERVICE_TEMPLATES = (
+    "brilliant-mqtt-release.service",
+    "brilliant-wifi-watchdog-release.service",
+    "brilliant-bus-watchdog-release.service",
+)
 
 
 def _sha256_files(root: Path) -> dict[str, str]:
@@ -118,6 +123,70 @@ def test_payload_build_pins_every_vendored_mqtt_distribution_without_deps() -> N
     assert 'm.version("typing-extensions")' in script
     assert '"typing-extensions==$TYPING_EXTENSIONS_VERSION"' in script
     assert "--no-deps" in script
+
+
+def test_fleet_release_service_templates_are_packaged_byte_for_byte() -> None:
+    payload_root = REPOSITORY_ROOT / PAYLOAD_RELATIVE_PATH
+    for name in RELEASE_SERVICE_TEMPLATES:
+        assert (payload_root / name).read_bytes() == (
+            REPOSITORY_ROOT / "deploy" / name
+        ).read_bytes()
+
+
+def test_payload_build_copies_every_fleet_release_service_template() -> None:
+    script = BUILD_SCRIPT.read_text(encoding="utf-8")
+
+    for name in RELEASE_SERVICE_TEMPLATES:
+        assert f'cp "$ROOT/deploy/{name}" "$DEST/{name}"' in script
+
+
+def test_fleet_release_templates_use_current_link_without_changing_legacy_layout() -> None:
+    payload_root = REPOSITORY_ROOT / PAYLOAD_RELATIVE_PATH
+    expected_release_paths = {
+        "brilliant-mqtt": (
+            "WorkingDirectory=/var/brilliant-mqtt/current/app",
+            (
+                "Environment=PYTHONPATH=/var/brilliant-mqtt/current/app:"
+                "/var/brilliant-mqtt/current/vendor"
+            ),
+        ),
+        "brilliant-wifi-watchdog": (
+            "WorkingDirectory=/var/brilliant-mqtt/current/wifi_watchdog",
+            "Environment=PYTHONPATH=/var/brilliant-mqtt/current/wifi_watchdog",
+        ),
+        "brilliant-bus-watchdog": (
+            "WorkingDirectory=/var/brilliant-mqtt/current/bus_watchdog",
+            "Environment=PYTHONPATH=/var/brilliant-mqtt/current/bus_watchdog",
+        ),
+    }
+    expected_legacy_paths = {
+        "brilliant-mqtt": (
+            "Environment=PYTHONPATH=/var/brilliant-mqtt/app:/var/brilliant-mqtt/vendor",
+        ),
+        "brilliant-wifi-watchdog": (
+            "WorkingDirectory=/var/brilliant-mqtt/wifi_watchdog",
+            "Environment=PYTHONPATH=/var/brilliant-mqtt/wifi_watchdog",
+        ),
+        "brilliant-bus-watchdog": (
+            "WorkingDirectory=/var/brilliant-mqtt/bus_watchdog",
+            "Environment=PYTHONPATH=/var/brilliant-mqtt/bus_watchdog",
+        ),
+    }
+
+    for service, expected_paths in expected_release_paths.items():
+        source = (REPOSITORY_ROOT / "deploy" / f"{service}-release.service").read_text(
+            encoding="utf-8"
+        )
+        packaged = (payload_root / f"{service}-release.service").read_text(encoding="utf-8")
+        assert source == packaged
+        assert all(path in source for path in expected_paths)
+
+    for service, legacy_paths in expected_legacy_paths.items():
+        source = (REPOSITORY_ROOT / "deploy" / f"{service}.service").read_text(encoding="utf-8")
+        packaged = (payload_root / f"{service}.service").read_text(encoding="utf-8")
+        assert source == packaged
+        assert "/var/brilliant-mqtt/current/" not in source
+        assert all(path in source for path in legacy_paths)
 
 
 def test_payload_workflow_guards_reject_untracked_generated_files() -> None:

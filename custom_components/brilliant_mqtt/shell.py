@@ -10,17 +10,27 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, cast
 
 import asyncssh
 from asyncssh import SFTPAttrs
 
 _CONNECT_TIMEOUT = 15
 _LOGIN_TIMEOUT = 15
+PANEL_PROCESS_OUTPUT_LIMIT = 32 * 1024
+_PROCESS_READ_SIZE = 4096
 _ED25519_HOST_KEY_ALGORITHMS = ("ssh-ed25519",)
 _RSA_HOST_KEY_ALGORITHMS = ("rsa-sha2-512", "rsa-sha2-256")
 _HOST_KEY_ALGORITHMS = (*_ED25519_HOST_KEY_ALGORITHMS, *_RSA_HOST_KEY_ALGORITHMS)
 _SUPPORTED_PUBLIC_KEY_ALGORITHMS = frozenset({"ssh-ed25519", "ssh-rsa"})
+_PROCESS_ERROR_CODES = frozenset(
+    {
+        "process_output_invalid",
+        "process_output_too_large",
+        "process_start_failed",
+        "process_wait_failed",
+    }
+)
 _IDENTITY_ERROR_CODES = frozenset(
     {
         "host_key_missing",
@@ -46,6 +56,19 @@ class PanelIdentityError(ValueError):
             raise ValueError("invalid_panel_identity_error_code")
         self.code = code
         super().__init__(code)
+
+
+class PanelProcessError(RuntimeError):
+    """Stable process-control failure which never retains command or output."""
+
+    __slots__ = ("code",)
+
+    def __init__(self, code: str) -> None:
+        if code not in _PROCESS_ERROR_CODES:
+            raise ValueError("invalid_panel_process_error_code")
+        self.code = code
+        super().__init__(code)
+        self.__suppress_context__ = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -254,10 +277,155 @@ class PanelShell(Protocol):
     async def connect(self) -> None: ...
     async def close(self) -> None: ...
     async def run(self, command: str) -> RunResult: ...
+    async def start(self, command: str) -> PanelProcess: ...
     async def put_bytes(self, data: bytes, remote_path: str, mode: int) -> None: ...
     async def put_dir(self, local_dir: str, remote_dir: str) -> None: ...
     async def put_file(self, local_path: str, remote_path: str, mode: int) -> None: ...
     def pinned_host_key(self) -> str | None: ...
+
+
+class PanelProcess(Protocol):
+    """One bounded remote child with explicit termination and settlement."""
+
+    @property
+    def running(self) -> bool: ...
+
+    def terminate(self) -> None: ...
+
+    async def wait(self) -> RunResult: ...
+
+
+class _BinaryReader(Protocol):
+    async def read(self, size: int = -1) -> bytes: ...
+
+
+class _RawProcess(Protocol):
+    stdout: _BinaryReader
+    stderr: _BinaryReader
+
+    @property
+    def exit_status(self) -> int | None: ...
+
+    @property
+    def returncode(self) -> int | None: ...
+
+    def terminate(self) -> None: ...
+
+    def close(self) -> None: ...
+
+    async def wait_closed(self) -> None: ...
+
+
+class _AsyncsshPanelProcess:
+    """Drain one AsyncSSH child under a fixed combined memory ceiling."""
+
+    __slots__ = (
+        "_output_size",
+        "_overflowed",
+        "_raw",
+        "_settlement",
+        "_stderr",
+        "_stdout",
+        "_terminated",
+    )
+
+    def __init__(self, raw: _RawProcess) -> None:
+        self._raw = raw
+        self._stdout: list[bytes] = []
+        self._stderr: list[bytes] = []
+        self._output_size = 0
+        self._overflowed = False
+        self._terminated = False
+        self._settlement = asyncio.create_task(
+            self._async_settle(),
+            name="brilliant-mqtt-panel-process",
+        )
+
+    @property
+    def running(self) -> bool:
+        return not self._settlement.done()
+
+    def terminate(self) -> None:
+        """Request termination once and force the SSH channel toward EOF."""
+        if self._terminated or self._settlement.done():
+            return
+        self._terminated = True
+        try:
+            self._raw.terminate()
+        except Exception:
+            pass
+        try:
+            self._raw.close()
+        except Exception:
+            pass
+
+    async def wait(self) -> RunResult:
+        """Await settlement without letting caller cancellation destroy it."""
+        return await asyncio.shield(self._settlement)
+
+    async def _async_read(self, reader: _BinaryReader, output: list[bytes]) -> None:
+        while chunk := await reader.read(_PROCESS_READ_SIZE):
+            if not isinstance(chunk, bytes):
+                raise TypeError
+            remaining = PANEL_PROCESS_OUTPUT_LIMIT - self._output_size
+            if len(chunk) > remaining:
+                self._overflowed = True
+                self.terminate()
+                continue
+            self._output_size += len(chunk)
+            output.append(chunk)
+
+    async def _async_settle(self) -> RunResult:
+        tasks = (
+            asyncio.create_task(
+                self._async_read(self._raw.stdout, self._stdout),
+                name="brilliant-mqtt-panel-stdout",
+            ),
+            asyncio.create_task(
+                self._async_read(self._raw.stderr, self._stderr),
+                name="brilliant-mqtt-panel-stderr",
+            ),
+            asyncio.create_task(
+                self._raw.wait_closed(),
+                name="brilliant-mqtt-panel-wait-closed",
+            ),
+        )
+        try:
+            done, _pending = await asyncio.wait(
+                tasks,
+                return_when=asyncio.FIRST_EXCEPTION,
+            )
+            if any(task.cancelled() or task.exception() is not None for task in done):
+                self.terminate()
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+        except asyncio.CancelledError:
+            self.terminate()
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+
+        if self._overflowed:
+            raise PanelProcessError("process_output_too_large")
+        if any(isinstance(result, BaseException) for result in results):
+            raise PanelProcessError("process_wait_failed")
+
+        stdout: str | None = None
+        stderr: str | None = None
+        try:
+            stdout = b"".join(self._stdout).decode("utf-8")
+            stderr = b"".join(self._stderr).decode("utf-8")
+        except UnicodeDecodeError:
+            pass
+        if stdout is None or stderr is None:
+            raise PanelProcessError("process_output_invalid")
+
+        exit_status = self._raw.exit_status
+        if exit_status is None:
+            exit_status = self._raw.returncode
+        if exit_status is None:
+            raise PanelProcessError("process_wait_failed")
+        return RunResult(exit_status=exit_status, stdout=stdout, stderr=stderr)
 
 
 class _ShellOperations:
@@ -268,15 +436,43 @@ class _ShellOperations:
         self._password = password
         self._pinned = pinned_host_key
         self._conn: asyncssh.SSHClientConnection | None = None
+        self._children: set[_AsyncsshPanelProcess] = set()
 
     def pinned_host_key(self) -> str | None:
         return self._pinned
 
     async def close(self) -> None:
-        if self._conn is not None:
-            self._conn.close()
-            await self._conn.wait_closed()
-            self._conn = None
+        conn = self._conn
+        if conn is None:
+            return
+        self._conn = None
+        children = tuple(self._children)
+        cleanup = asyncio.create_task(
+            self._async_close_connection(conn, children),
+            name="brilliant-mqtt-shell-close",
+        )
+        cancellation: asyncio.CancelledError | None = None
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError as error:
+                if cancellation is None:
+                    cancellation = error
+        self._children.clear()
+        if cancellation is not None:
+            raise cancellation from None
+        cleanup.result()
+
+    @staticmethod
+    async def _async_close_connection(
+        conn: asyncssh.SSHClientConnection,
+        children: tuple[_AsyncsshPanelProcess, ...],
+    ) -> None:
+        for child in children:
+            child.terminate()
+        conn.close()
+        await asyncio.gather(*(child.wait() for child in children), return_exceptions=True)
+        await conn.wait_closed()
 
     def _require_conn(self) -> asyncssh.SSHClientConnection:
         # Intentional contract, not a debug check — must hold under -O too.
@@ -292,6 +488,31 @@ class _ShellOperations:
             stdout=str(result.stdout or ""),
             stderr=str(result.stderr or ""),
         )
+
+    async def start(self, command: str) -> PanelProcess:
+        """Start a bounded binary-output child without retaining its command."""
+        conn = self._require_conn()
+        raw: _RawProcess | None = None
+        failed = False
+        try:
+            created = await conn.create_process(
+                command,
+                encoding=None,
+                stdin=asyncssh.DEVNULL,
+                stdout=asyncssh.PIPE,
+                stderr=asyncssh.PIPE,
+            )
+            raw = cast(_RawProcess, created)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            failed = True
+        if failed or raw is None:
+            raise PanelProcessError("process_start_failed")
+
+        process = _AsyncsshPanelProcess(raw)
+        self._children.add(process)
+        return process
 
     async def put_bytes(self, data: bytes, remote_path: str, mode: int) -> None:
         conn = self._require_conn()

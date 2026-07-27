@@ -18,3 +18,13 @@ def test_fleet_storage_contract_constants_are_stable() -> None:
     assert const.ENTRY_KIND_LEGACY_PENDING_CONSOLIDATION == "legacy_pending_consolidation"
     assert const.SUBENTRY_TYPE_PANEL == "panel"
     assert const.FLEET_UNIQUE_ID == "brilliant_mqtt_fleet"
+
+
+def test_fleet_release_layout_is_separate_from_legacy_fixed_paths() -> None:
+    """Fleet activation uses a versioned release root and one atomic current link."""
+    assert const.PANEL_RELEASES_DIR == "/var/brilliant-mqtt/releases"
+    assert const.PANEL_CURRENT_LINK == "/var/brilliant-mqtt/current"
+    assert const.PANEL_APP_DIR == "/var/brilliant-mqtt/app"
+    assert const.PANEL_VENDOR_DIR == "/var/brilliant-mqtt/vendor"
+    assert const.PANEL_WIFI_WATCHDOG_DIR == "/var/brilliant-mqtt/wifi_watchdog"
+    assert const.PANEL_BUS_WATCHDOG_DIR == "/var/brilliant-mqtt/bus_watchdog"

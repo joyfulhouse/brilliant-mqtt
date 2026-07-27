@@ -168,6 +168,11 @@ DEFAULT_VOICE_WAKE_WORD = "okay_nabu"
 
 # On-panel paths owned by the integration (mirror docs/reference/deployment.md).
 PANEL_VAR_DIR = "/var/brilliant-mqtt"
+# Fleet provisioning stages immutable versions below releases/ and atomically
+# switches current. The fixed app/vendor/watchdog paths below remain the legacy
+# installer contract until fleet migration explicitly retires that path.
+PANEL_RELEASES_DIR = f"{PANEL_VAR_DIR}/releases"
+PANEL_CURRENT_LINK = f"{PANEL_VAR_DIR}/current"
 PANEL_APP_DIR = f"{PANEL_VAR_DIR}/app"
 PANEL_VENDOR_DIR = f"{PANEL_VAR_DIR}/vendor"
 PANEL_STAGED_DIR = f"{PANEL_VAR_DIR}/system"

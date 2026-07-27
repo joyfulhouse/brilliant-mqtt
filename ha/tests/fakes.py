@@ -4,9 +4,42 @@ from __future__ import annotations
 
 import asyncio
 
-from custom_components.brilliant_mqtt.shell import RunResult
+from custom_components.brilliant_mqtt.shell import PanelProcess, RunResult
 
 _OK = RunResult(0, "", "")
+
+
+class FakePanelProcess:
+    """Controllable explicit-settlement implementation of PanelProcess."""
+
+    def __init__(self, result: RunResult = _OK, *, settled: bool = True) -> None:
+        self._result = result
+        self._settled = asyncio.Event()
+        if settled:
+            self._settled.set()
+        self._terminated = False
+        self.terminate_count = 0
+
+    @property
+    def running(self) -> bool:
+        return not self._settled.is_set()
+
+    def terminate(self) -> None:
+        if self._terminated or not self.running:
+            return
+        self._terminated = True
+        self.terminate_count += 1
+        self._settled.set()
+
+    async def wait(self) -> RunResult:
+        await self._settled.wait()
+        return self._result
+
+    def settle(self, result: RunResult | None = None) -> None:
+        """Test-only completion hook for a naturally exiting child."""
+        if result is not None:
+            self._result = result
+        self._settled.set()
 
 
 class FakeShell:
@@ -20,6 +53,7 @@ class FakeShell:
         connect_gate: asyncio.Event | None = None,
         pinned: str | None = "ssh-ed25519 FAKEKEY",
         run_errors: dict[str, Exception] | None = None,
+        processes: dict[str, FakePanelProcess] | None = None,
     ) -> None:
         self.responses = dict(responses or {})
         self.connect_error = connect_error
@@ -27,6 +61,7 @@ class FakeShell:
         # Commands whose run() raises the mapped exception (models a mid-command
         # transport drop — e.g. the reboot disconnect, or a dead diagnostics probe).
         self.run_errors = dict(run_errors or {})
+        self.processes = dict(processes or {})
         # When set, connect() blocks on this event — lets a test wedge a repair
         # inside the ssh_lock to exercise the shutdown-mid-repair interleaving.
         self.connect_gate = connect_gate
@@ -41,6 +76,7 @@ class FakeShell:
         self.uploads: list[tuple[str, bytes, int]] = []
         self.dir_uploads: list[tuple[str, str]] = []
         self.file_uploads: list[tuple[str, str, int]] = []
+        self.started_processes: list[PanelProcess] = []
 
     def pinned_host_key(self) -> str | None:
         return self._pinned
@@ -55,6 +91,13 @@ class FakeShell:
         self.connected = True
 
     async def close(self) -> None:
+        for process in self.started_processes:
+            if process.running:
+                process.terminate()
+        await asyncio.gather(
+            *(process.wait() for process in self.started_processes),
+            return_exceptions=True,
+        )
         self.connected = False
 
     def _require_connected(self) -> None:
@@ -69,6 +112,13 @@ class FakeShell:
         if command in self.run_errors:
             raise self.run_errors[command]
         return self.responses.get(command, _OK)
+
+    async def start(self, command: str) -> PanelProcess:
+        self._require_connected()
+        self.commands.append(command)
+        process = self.processes.get(command, FakePanelProcess(self.responses.get(command, _OK)))
+        self.started_processes.append(process)
+        return process
 
     async def put_bytes(self, data: bytes, remote_path: str, mode: int) -> None:
         self._require_connected()
