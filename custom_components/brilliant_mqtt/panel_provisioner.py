@@ -204,8 +204,7 @@ class PanelProvisioningError(RuntimeError):
         capability: str | None = None,
     ) -> None:
         valid_toolchain_capability = (
-            isinstance(capability, str)
-            and capability in PANEL_TOOLCHAIN_CAPABILITIES
+            isinstance(capability, str) and capability in PANEL_TOOLCHAIN_CAPABILITIES
         )
         if (
             code not in _ERROR_CODES
@@ -216,10 +215,7 @@ class PanelProvisioningError(RuntimeError):
                 )
             )
             or cleanup_code not in {None, "cleanup_failed"}
-            or (
-                code == "unsupported_panel_toolchain"
-                and not valid_toolchain_capability
-            )
+            or (code == "unsupported_panel_toolchain" and not valid_toolchain_capability)
             or code != "unsupported_panel_toolchain"
             and capability is not None
         ):
