@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import inspect
+import json
 import traceback as traceback_module
 from collections.abc import AsyncIterator, Callable, Coroutine, Iterator
 from contextlib import AbstractAsyncContextManager
@@ -19,6 +21,7 @@ from homeassistant.config_entries import ConfigEntryDisabler, ConfigEntryState
 from homeassistant.core import HomeAssistant
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
+from custom_components.brilliant_mqtt import broker_validation
 from custom_components.brilliant_mqtt.broker import (
     BrokerKind,
     BrokerProfile,
@@ -30,7 +33,16 @@ from custom_components.brilliant_mqtt.errors import (
     OperationError,
     OperationStage,
 )
-from custom_components.brilliant_mqtt.setup_protocol import SetupRequest, SetupResult, SetupTopics
+from custom_components.brilliant_mqtt.setup_protocol import (
+    MAX_PREFLIGHT_REPORT_BYTES,
+    PreflightReport,
+    PreflightRequest,
+    PreflightStage,
+    SetupRequest,
+    SetupResult,
+    SetupTopics,
+)
+from custom_components.brilliant_mqtt.shell import RunResult
 
 SETUP_ID = UUID("c0a80101-7c5e-4aca-8e21-0123456789ab")
 OTHER_SETUP_ID = UUID("d0a80101-7c5e-4aca-8e21-0123456789ab")
@@ -289,6 +301,58 @@ class _FakeHaMqtt:
             await result
 
 
+class _FakePanelProcess:
+    """Repeatable process seam with explicit termination and settlement events."""
+
+    def __init__(
+        self,
+        result: RunResult,
+        events: _EventLog,
+        *,
+        settled: bool = True,
+    ) -> None:
+        self._result = result
+        self._events = events
+        self._settled = asyncio.Event()
+        if settled:
+            self._settled.set()
+        self.terminate_count = 0
+        self.wait_count = 0
+
+    @property
+    def running(self) -> bool:
+        return not self._settled.is_set()
+
+    def terminate(self) -> None:
+        if not self.running:
+            return
+        self.terminate_count += 1
+        self._events.append(("panel_process_terminate",))
+        self._settled.set()
+
+    async def wait(self) -> RunResult:
+        self.wait_count += 1
+        self._events.append(("panel_process_wait", self.wait_count))
+        await self._settled.wait()
+        self._events.append(("panel_process_settled", self.wait_count))
+        return self._result
+
+
+class _HungPanelProcess:
+    """A broken transport child which ignores terminate and never settles."""
+
+    @property
+    def running(self) -> bool:
+        return True
+
+    def terminate(self) -> None:
+        pass
+
+    async def wait(self) -> RunResult:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+
 class _FakeDeviceMessages(AsyncIterator[DeviceMqttMessage]):
     def __init__(self, client: _FakeDeviceClient) -> None:
         self._client = client
@@ -318,6 +382,7 @@ class _FakeDeviceClient(DeviceMqttClient):
     subscribe_errors: dict[str, BaseException] = field(default_factory=dict)
     subscribe_blockers: set[str] = field(default_factory=set)
     publish_errors: dict[str, BaseException] = field(default_factory=dict)
+    publish_blockers: set[str] = field(default_factory=set)
     clear_errors: dict[str, BaseException] = field(default_factory=dict)
     clear_blockers: set[str] = field(default_factory=set)
     unsubscribe_errors: dict[str, BaseException] = field(default_factory=dict)
@@ -355,6 +420,8 @@ class _FakeDeviceClient(DeviceMqttClient):
         errors = self.clear_errors if payload in (b"", "", None) else self.publish_errors
         if topic in errors:
             raise errors[topic]
+        if payload not in (b"", "", None) and topic in self.publish_blockers:
+            await asyncio.Event().wait()
         if payload in (b"", "", None) and topic in self.clear_blockers:
             await asyncio.Event().wait()
         await self.seam.deliver_from_device(topic, payload, qos, retain)
@@ -657,7 +724,7 @@ async def test_success_uses_ordered_qos_one_round_trips_and_redacted_result(
         (
             "discovery_write",
             OperationStage.DISCOVERY_WRITE,
-            "discovery_write_denied",
+            "discovery_write_timeout",
         ),
         (
             "retained_message",
@@ -696,9 +763,7 @@ async def test_stage_table_maps_fixed_errors_and_still_cleans_up(
     elif case == "discovery_write":
 
         def configure_discovery_failure(context: _FakeDeviceContext) -> None:
-            context.client.publish_errors[topics.discovery_probe] = RuntimeError(
-                "secret discovery ACL response"
-            )
+            context.client.publish_blockers.add(topics.discovery_probe)
 
         factory.configure_context = configure_discovery_failure
     elif case == "retained_message":
@@ -1121,13 +1186,19 @@ async def test_stale_messages_are_ignored_until_exact_messages_arrive(
 
 @pytest.mark.usefixtures("enable_custom_integrations")
 @pytest.mark.parametrize(
-    "invalid_kind",
-    ["missing_retained_flag", "wrong_payload", "wrong_topic", "bytearray"],
+    ("invalid_kind", "expected_code"),
+    [
+        ("missing_retained_flag", "retained_message_invalid"),
+        ("wrong_payload", "retained_message_timeout"),
+        ("wrong_topic", "retained_message_timeout"),
+        ("bytearray", "retained_message_timeout"),
+    ],
 )
 async def test_retained_replay_requires_exact_topic_payload_and_flag(
     hass: HomeAssistant,
     monkeypatch: pytest.MonkeyPatch,
     invalid_kind: str,
+    expected_code: str,
 ) -> None:
     _mqtt_entry(hass)
     seam = _FakeHaMqtt()
@@ -1166,7 +1237,7 @@ async def test_retained_replay_requires_exact_topic_payload_and_flag(
         ).async_validate(_profile(), setup_id=SETUP_ID)
 
     assert raised.value.stage is OperationStage.RETAINED_MESSAGE
-    assert raised.value.code == "retained_message_invalid"
+    assert raised.value.code == expected_code
 
 
 @pytest.mark.usefixtures("enable_custom_integrations")
@@ -1356,7 +1427,36 @@ async def test_discovery_probe_requires_exact_topic_and_payload(
         ).async_validate(_profile(), setup_id=SETUP_ID)
 
     assert raised.value.stage is OperationStage.DISCOVERY_WRITE
+    assert raised.value.code == "discovery_write_timeout"
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_observed_discovery_authorization_rejection_remains_definitive(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mqtt_entry(hass)
+    seam = _FakeHaMqtt()
+    seam.install(monkeypatch)
+    topics = SetupTopics.for_id(SETUP_ID)
+
+    def configure(context: _FakeDeviceContext) -> None:
+        context.client.publish_errors[topics.discovery_probe] = OperationError.for_code(
+            OperationStage.DISCOVERY_WRITE,
+            "discovery_write_denied",
+        )
+
+    with pytest.raises(OperationError) as raised:
+        await BrokerValidator(
+            hass,
+            _FakeDeviceFactory(seam, seam.events, configure_context=configure),
+            0.02,
+        ).async_validate(_profile(), setup_id=SETUP_ID)
+
+    assert raised.value.stage is OperationStage.DISCOVERY_WRITE
     assert raised.value.code == "discovery_write_denied"
+    assert raised.value.retryable is False
+    assert _direct_exception_chain(raised.value) == [raised.value]
 
 
 @pytest.mark.usefixtures("enable_custom_integrations")
@@ -1701,7 +1801,15 @@ async def test_cancellation_during_every_stage_cleans_once_without_leaked_tasks(
         seam.drop_device_to_ha.add(topics.discovery_probe)
         marker = ("device_publish", topics.discovery_probe)
     elif stage is OperationStage.RETAINED_MESSAGE:
-        seam.retained_replay_flag = False
+        seam.retained_replay_overrides[topics.retained] = [
+            _HaMessage(
+                topics.retained,
+                "stale-retained-payload",
+                1,
+                True,
+                topics.retained,
+            )
+        ]
         marker = ("ha_subscribe", topics.retained, 1)
     else:
 
@@ -1891,7 +1999,7 @@ async def test_primary_and_cleanup_errors_expose_only_allowlisted_diagnostics(
         ).async_validate(profile, setup_id=SETUP_ID)
 
     error = raised.value
-    assert error.code == "discovery_write_denied"
+    assert error.code == "operation_failed"
     assert error.cleanup_error is not None
     assert error.cleanup_error.code == "cleanup_failed"
     assert _direct_exception_chain(error) == [error]
@@ -2024,3 +2132,694 @@ async def test_options_win_without_any_config_entry_mutation_api(
     update.assert_not_called()
     reload_entry.assert_not_awaited()
     create_flow.assert_not_awaited()
+
+
+def _successful_panel_report(setup_id: UUID) -> PreflightReport:
+    return PreflightReport(
+        setup_id=setup_id,
+        success=True,
+        completed_stages=tuple(PreflightStage),
+        stage_elapsed_ms={stage: 1 for stage in PreflightStage},
+        last_stage=PreflightStage.CLEANUP,
+    )
+
+
+def _failed_panel_report(
+    setup_id: UUID,
+    stage: PreflightStage,
+    code: str,
+    detail: str,
+) -> PreflightReport:
+    work_stages = tuple(PreflightStage)[:-1]
+    if stage is PreflightStage.CLEANUP:
+        completed = work_stages
+    else:
+        completed = work_stages[: work_stages.index(stage)] + (PreflightStage.CLEANUP,)
+    elapsed_stages = set(completed) | {stage, PreflightStage.CLEANUP}
+    return PreflightReport(
+        setup_id=setup_id,
+        success=False,
+        completed_stages=completed,
+        stage_elapsed_ms={elapsed_stage: 1 for elapsed_stage in elapsed_stages},
+        failed_stage=stage,
+        error_code=code,
+        detail=detail,
+    )
+
+
+async def _deliver_panel_request(
+    seam: _FakeHaMqtt,
+    request: PreflightRequest,
+) -> None:
+    topics = SetupTopics.for_id(request.setup_id)
+    await seam.deliver_from_device(
+        topics.panel_to_ha,
+        SetupRequest(request.setup_id, request.panel_nonce).to_payload(),
+        1,
+        False,
+    )
+
+
+async def _deliver_discovery_probe(
+    seam: _FakeHaMqtt,
+    request: PreflightRequest,
+) -> None:
+    await seam.deliver_from_device(
+        SetupTopics.for_id(request.setup_id).discovery_probe,
+        request.panel_nonce,
+        1,
+        False,
+    )
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_panel_preflight_subacks_before_launch_and_exact_round_trip(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mqtt_entry(hass)
+    seam = _FakeHaMqtt()
+    seam.install(monkeypatch)
+    launched_requests: list[str] = []
+
+    async def launcher(raw_request: str) -> _FakePanelProcess:
+        launched_requests.append(raw_request)
+        seam.events.append(("panel_launcher",))
+        request = PreflightRequest.from_json(raw_request)
+        await _deliver_panel_request(seam, request)
+        await _deliver_discovery_probe(seam, request)
+        return _FakePanelProcess(
+            RunResult(0, _successful_panel_report(request.setup_id).to_json() + "\n", ""),
+            seam.events,
+        )
+
+    result = await BrokerValidator(
+        hass,
+        cast(Any, object()),
+        timeout_seconds=0.1,
+    ).async_validate_panel(_profile(), launcher, setup_id=SETUP_ID)
+
+    topics = SetupTopics.for_id(SETUP_ID)
+    request = PreflightRequest.from_json(launched_requests[0])
+    launch_index = seam.events.index(("panel_launcher",))
+    assert seam.events.index(("ha_suback", topics.panel_to_ha, 1)) < launch_index
+    assert seam.events.index(("ha_suback", topics.discovery_probe, 1)) < launch_index
+    assert len(request.panel_nonce) <= 256
+    assert len(request.ha_nonce) <= 256
+    assert request.panel_nonce != request.ha_nonce
+    assert (
+        "ha_publish",
+        topics.ha_to_panel,
+        SetupResult(SETUP_ID, request.ha_nonce, request.panel_nonce).to_payload(),
+        1,
+        False,
+    ) in seam.events
+    assert result.setup_id == SETUP_ID
+    assert result.completed_stages == tuple(OperationStage)[1:]
+    assert ("ha_unsubscribe", topics.panel_to_ha) in seam.events
+    assert ("ha_unsubscribe", topics.discovery_probe) in seam.events
+    assert ("ha_publish", topics.discovery_probe, b"", 1, True) in seam.events
+    assert ("ha_publish", topics.retained, b"", 1, True) in seam.events
+    assert not seam.subscriptions
+    assert not seam.retained
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_panel_preflight_never_launches_before_both_subacks(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mqtt_entry(hass)
+    seam = _FakeHaMqtt()
+    seam.install(monkeypatch)
+    topics = SetupTopics.for_id(SETUP_ID)
+    seam.suppress_suback.add(topics.discovery_probe)
+    launches = 0
+
+    async def launcher(raw_request: str) -> _FakePanelProcess:
+        nonlocal launches
+        launches += 1
+        raise AssertionError(raw_request)
+
+    with pytest.raises(OperationError) as raised:
+        await BrokerValidator(
+            hass,
+            cast(Any, object()),
+            timeout_seconds=0.01,
+        ).async_validate_panel(_profile(), launcher, setup_id=SETUP_ID)
+
+    assert launches == 0
+    assert raised.value.stage is OperationStage.DISCOVERY_WRITE
+    assert raised.value.code == "discovery_write_timeout"
+    assert ("ha_unsubscribe", topics.panel_to_ha) in seam.events
+    assert ("ha_unsubscribe", topics.discovery_probe) in seam.events
+    assert ("ha_publish", topics.discovery_probe, b"", 1, True) in seam.events
+    assert ("ha_publish", topics.retained, b"", 1, True) in seam.events
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+@pytest.mark.parametrize(
+    ("invalid_observation", "expected_stage", "expected_code"),
+    [
+        (
+            "panel_request",
+            OperationStage.PANEL_TO_HA,
+            "panel_to_ha_timeout",
+        ),
+        (
+            "discovery",
+            OperationStage.DISCOVERY_WRITE,
+            "discovery_write_timeout",
+        ),
+        (
+            "retained_discovery",
+            OperationStage.DISCOVERY_WRITE,
+            "discovery_write_timeout",
+        ),
+    ],
+)
+async def test_panel_preflight_stale_observations_never_satisfy_success(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_observation: str,
+    expected_stage: OperationStage,
+    expected_code: str,
+) -> None:
+    _mqtt_entry(hass)
+    seam = _FakeHaMqtt()
+    seam.install(monkeypatch)
+
+    async def launcher(raw_request: str) -> _FakePanelProcess:
+        request = PreflightRequest.from_json(raw_request)
+        topics = SetupTopics.for_id(request.setup_id)
+        if invalid_observation == "panel_request":
+            await seam.deliver_from_device(
+                topics.panel_to_ha,
+                SetupRequest(OTHER_SETUP_ID, request.panel_nonce).to_payload(),
+                1,
+                False,
+            )
+        else:
+            await _deliver_panel_request(seam, request)
+            await seam.deliver_from_device(
+                topics.discovery_probe,
+                (
+                    request.panel_nonce
+                    if invalid_observation == "retained_discovery"
+                    else f"stale-{request.panel_nonce}"
+                ),
+                1,
+                True,
+            )
+        return _FakePanelProcess(
+            RunResult(0, _successful_panel_report(request.setup_id).to_json() + "\n", ""),
+            seam.events,
+        )
+
+    with pytest.raises(OperationError) as raised:
+        await BrokerValidator(
+            hass,
+            cast(Any, object()),
+            timeout_seconds=0.05,
+        ).async_validate_panel(_profile(), launcher, setup_id=SETUP_ID)
+
+    assert raised.value.stage is expected_stage
+    assert raised.value.code == expected_code
+    assert _direct_exception_chain(raised.value) == [raised.value]
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_panel_preflight_waits_for_live_discovery_dispatch_after_process_exit(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mqtt_entry(hass)
+    seam = _FakeHaMqtt()
+    seam.install(monkeypatch)
+    delivery_completed = asyncio.Event()
+
+    async def launcher(raw_request: str) -> _FakePanelProcess:
+        request = PreflightRequest.from_json(raw_request)
+        await _deliver_panel_request(seam, request)
+
+        async def deliver_after_stdout() -> None:
+            await asyncio.sleep(0.01)
+            await _deliver_discovery_probe(seam, request)
+            delivery_completed.set()
+
+        asyncio.create_task(
+            deliver_after_stdout(),
+            name="test-delayed-live-discovery",
+        )
+        return _FakePanelProcess(
+            RunResult(0, _successful_panel_report(request.setup_id).to_json() + "\n", ""),
+            seam.events,
+        )
+
+    result = await BrokerValidator(
+        hass,
+        cast(Any, object()),
+        timeout_seconds=0.05,
+    ).async_validate_panel(_profile(), launcher, setup_id=SETUP_ID)
+
+    assert delivery_completed.is_set()
+    assert result.completed_stages == tuple(OperationStage)[1:]
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+@pytest.mark.parametrize(
+    "invalid_output",
+    [
+        "extra_stdout",
+        "oversized",
+        "extra_key",
+        "wrong_setup_id",
+        "wrong_order",
+        "missing_cleanup",
+        "nonzero_success",
+    ],
+)
+async def test_panel_preflight_rejects_adversarial_process_reports(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_output: str,
+) -> None:
+    _mqtt_entry(hass)
+    seam = _FakeHaMqtt()
+    seam.install(monkeypatch)
+
+    async def launcher(raw_request: str) -> _FakePanelProcess:
+        request = PreflightRequest.from_json(raw_request)
+        await _deliver_panel_request(seam, request)
+        await _deliver_discovery_probe(seam, request)
+        report_json = _successful_panel_report(request.setup_id).to_json()
+        stderr = ""
+        exit_status = 0
+        if invalid_output == "extra_stdout":
+            report_json += "\nraw-extra-output-secret"
+        elif invalid_output == "oversized":
+            report_json = "x" * (MAX_PREFLIGHT_REPORT_BYTES + 1)
+        elif invalid_output == "extra_key":
+            value = json.loads(report_json)
+            value["raw-extra-secret"] = True
+            report_json = json.dumps(value, sort_keys=True, separators=(",", ":"))
+        elif invalid_output == "wrong_setup_id":
+            report_json = _successful_panel_report(OTHER_SETUP_ID).to_json()
+        elif invalid_output in {"wrong_order", "missing_cleanup"}:
+            value = json.loads(report_json)
+            completed = cast(list[str], value["completed_stages"])
+            if invalid_output == "wrong_order":
+                completed[1], completed[2] = completed[2], completed[1]
+            else:
+                completed.pop()
+            report_json = json.dumps(value, sort_keys=True, separators=(",", ":"))
+        elif invalid_output == "nonzero_success":
+            exit_status = 1
+        return _FakePanelProcess(
+            RunResult(exit_status, report_json + "\n", stderr),
+            seam.events,
+        )
+
+    with pytest.raises(OperationError) as raised:
+        await BrokerValidator(
+            hass,
+            cast(Any, object()),
+            timeout_seconds=0.05,
+        ).async_validate_panel(_profile(), launcher, setup_id=SETUP_ID)
+
+    error = raised.value
+    assert error.stage is OperationStage.CLEANUP
+    assert error.code == "operation_failed"
+    assert _direct_exception_chain(error) == [error]
+    surface = f"{error!r}\n{error.redacted_dict()!r}\n{traceback_module.format_exception(error)!r}"
+    assert "raw-stderr-secret" not in surface
+    assert "raw-extra-output-secret" not in surface
+    assert "raw-extra-secret" not in surface
+
+
+def test_valid_panel_success_report_survives_untrusted_stderr() -> None:
+    report = _successful_panel_report(SETUP_ID)
+
+    parsed, error = broker_validation._parsed_panel_report(
+        RunResult(0, report.to_json() + "\n", "raw-stderr-secret"),
+        SETUP_ID,
+    )
+
+    assert parsed == report
+    assert error is None
+
+
+def test_valid_panel_failure_report_survives_untrusted_stderr() -> None:
+    report = _failed_panel_report(
+        SETUP_ID,
+        PreflightStage.FLEET_AUTH,
+        "mqtt_connect",
+        "MQTT connection failed",
+    )
+
+    parsed, error = broker_validation._parsed_panel_report(
+        RunResult(1, report.to_json() + "\n", "raw-stderr-secret"),
+        SETUP_ID,
+    )
+
+    assert parsed is None
+    assert error is not None
+    assert error.stage is OperationStage.FLEET_AUTH
+    assert error.code == "broker_connect_failed"
+    surface = f"{error!r}\n{error.redacted_dict()!r}"
+    assert "raw-stderr-secret" not in surface
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+@pytest.mark.parametrize(
+    ("stage", "report_code", "detail", "expected_stage", "expected_code"),
+    [
+        (
+            PreflightStage.FLEET_AUTH,
+            "settings_invalid",
+            "Panel configuration invalid",
+            OperationStage.FLEET_AUTH,
+            "panel_settings_invalid",
+        ),
+        (
+            PreflightStage.FLEET_AUTH,
+            "mqtt_connect",
+            "MQTT connection failed",
+            OperationStage.FLEET_AUTH,
+            "broker_connect_failed",
+        ),
+        (
+            PreflightStage.DISCOVERY_WRITE,
+            "mqtt_publish",
+            "MQTT publish failed",
+            OperationStage.DISCOVERY_WRITE,
+            "operation_failed",
+        ),
+        (
+            PreflightStage.DISCOVERY_WRITE,
+            "mqtt_authorization",
+            "MQTT authorization rejected",
+            OperationStage.DISCOVERY_WRITE,
+            "discovery_write_denied",
+        ),
+        (
+            PreflightStage.DISCOVERY_WRITE,
+            "mqtt_timeout",
+            "MQTT stage timed out",
+            OperationStage.DISCOVERY_WRITE,
+            "discovery_write_timeout",
+        ),
+        (
+            PreflightStage.RETAINED_MESSAGE,
+            "retained_flag_missing",
+            "Retained replay flag was missing",
+            OperationStage.RETAINED_MESSAGE,
+            "retained_message_invalid",
+        ),
+        (
+            PreflightStage.RETAINED_MESSAGE,
+            "mqtt_timeout",
+            "MQTT stage timed out",
+            OperationStage.RETAINED_MESSAGE,
+            "retained_message_timeout",
+        ),
+    ],
+)
+async def test_panel_preflight_maps_only_explicit_evidence(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: PreflightStage,
+    report_code: str,
+    detail: str,
+    expected_stage: OperationStage,
+    expected_code: str,
+) -> None:
+    _mqtt_entry(hass)
+    seam = _FakeHaMqtt()
+    seam.install(monkeypatch)
+
+    async def launcher(raw_request: str) -> _FakePanelProcess:
+        request = PreflightRequest.from_json(raw_request)
+        if stage is not PreflightStage.FLEET_AUTH:
+            await _deliver_panel_request(seam, request)
+        if stage is PreflightStage.RETAINED_MESSAGE:
+            await _deliver_discovery_probe(seam, request)
+        report = _failed_panel_report(request.setup_id, stage, report_code, detail)
+        return _FakePanelProcess(
+            RunResult(1, report.to_json() + "\n", ""),
+            seam.events,
+        )
+
+    with pytest.raises(OperationError) as raised:
+        await BrokerValidator(
+            hass,
+            cast(Any, object()),
+            timeout_seconds=0.05,
+        ).async_validate_panel(_profile(), launcher, setup_id=SETUP_ID)
+
+    assert raised.value.stage is expected_stage
+    assert raised.value.code == expected_code
+    assert _direct_exception_chain(raised.value) == [raised.value]
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_panel_preflight_report_preserves_primary_and_attaches_missing_cleanup(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mqtt_entry(hass)
+    seam = _FakeHaMqtt()
+    seam.install(monkeypatch)
+
+    async def launcher(raw_request: str) -> _FakePanelProcess:
+        request = PreflightRequest.from_json(raw_request)
+        await _deliver_panel_request(seam, request)
+        report = PreflightReport(
+            setup_id=request.setup_id,
+            success=False,
+            completed_stages=(
+                PreflightStage.FLEET_AUTH,
+                PreflightStage.PANEL_TO_HA,
+                PreflightStage.HA_TO_PANEL,
+            ),
+            stage_elapsed_ms={
+                PreflightStage.FLEET_AUTH: 1,
+                PreflightStage.PANEL_TO_HA: 1,
+                PreflightStage.HA_TO_PANEL: 1,
+                PreflightStage.DISCOVERY_WRITE: 1,
+                PreflightStage.CLEANUP: 1,
+            },
+            failed_stage=PreflightStage.DISCOVERY_WRITE,
+            error_code="mqtt_timeout",
+            detail="MQTT stage timed out",
+        )
+        return _FakePanelProcess(
+            RunResult(1, report.to_json() + "\n", ""),
+            seam.events,
+        )
+
+    with pytest.raises(OperationError) as raised:
+        await BrokerValidator(
+            hass,
+            cast(Any, object()),
+            timeout_seconds=0.05,
+        ).async_validate_panel(_profile(), launcher, setup_id=SETUP_ID)
+
+    error = raised.value
+    assert error.stage is OperationStage.DISCOVERY_WRITE
+    assert error.code == "discovery_write_timeout"
+    assert error.cleanup_error is not None
+    assert error.cleanup_error.stage is OperationStage.CLEANUP
+    assert error.cleanup_error.code == "cleanup_failed"
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_panel_preflight_outer_timeout_terminates_once_settles_then_cleans(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mqtt_entry(hass)
+    seam = _FakeHaMqtt()
+    seam.install(monkeypatch)
+    topics = SetupTopics.for_id(SETUP_ID)
+    process: _FakePanelProcess | None = None
+
+    async def launcher(raw_request: str) -> _FakePanelProcess:
+        nonlocal process
+        request = PreflightRequest.from_json(raw_request)
+        process = _FakePanelProcess(
+            RunResult(0, _successful_panel_report(request.setup_id).to_json() + "\n", ""),
+            seam.events,
+            settled=False,
+        )
+        return process
+
+    with pytest.raises(OperationError) as raised:
+        await BrokerValidator(
+            hass,
+            cast(Any, object()),
+            timeout_seconds=0.01,
+        ).async_validate_panel(_profile(), launcher, setup_id=SETUP_ID)
+
+    assert process is not None
+    assert process.terminate_count == 1
+    assert process.running is False
+    settled_index = max(
+        index for index, event in enumerate(seam.events) if event[0] == "panel_process_settled"
+    )
+    cleanup_index = min(
+        index
+        for index, event in enumerate(seam.events)
+        if event
+        in {
+            ("ha_unsubscribe", topics.panel_to_ha),
+            ("ha_unsubscribe", topics.discovery_probe),
+            ("ha_publish", topics.discovery_probe, b"", 1, True),
+            ("ha_publish", topics.retained, b"", 1, True),
+        }
+    )
+    assert settled_index < cleanup_index
+    assert raised.value.stage is OperationStage.PANEL_TO_HA
+    assert raised.value.code == "panel_to_ha_timeout"
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_panel_preflight_settlement_has_a_hard_transport_bound(
+    hass: HomeAssistant,
+) -> None:
+    validator = BrokerValidator(
+        hass,
+        cast(Any, object()),
+        timeout_seconds=0.01,
+    )
+
+    failed, control = await asyncio.wait_for(
+        validator._async_settle_panel_process(_HungPanelProcess()),
+        timeout=0.2,
+    )
+
+    assert failed is True
+    assert control is None
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_panel_preflight_settlement_preserves_same_turn_caller_cancel(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    validator = BrokerValidator(
+        hass,
+        cast(Any, object()),
+        timeout_seconds=10,
+    )
+    loop = asyncio.get_running_loop()
+    settlement_task: asyncio.Task[tuple[bool, BaseException | None]] | None = None
+
+    def immediate_deadline(
+        _delay: float,
+        callback: Callable[..., object],
+        *args: object,
+        context: contextvars.Context | None = None,
+    ) -> asyncio.Handle:
+        deadline = loop.call_soon(callback, *args, context=context)
+        assert settlement_task is not None
+        loop.call_soon(settlement_task.cancel, "caller-cancelled")
+        return deadline
+
+    monkeypatch.setattr(loop, "call_later", immediate_deadline)
+    settlement_task = asyncio.create_task(
+        validator._async_settle_panel_process(_HungPanelProcess())
+    )
+
+    failed, control = await settlement_task
+
+    assert failed is True
+    assert isinstance(control, asyncio.CancelledError)
+    assert control.args == ("caller-cancelled",)
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_panel_preflight_cancellation_wins_after_settlement_and_all_cleanup(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mqtt_entry(hass)
+    seam = _FakeHaMqtt()
+    seam.install(monkeypatch)
+    topics = SetupTopics.for_id(SETUP_ID)
+    launched = asyncio.Event()
+    process: _FakePanelProcess | None = None
+    for topic in (topics.panel_to_ha, topics.discovery_probe):
+        seam.ha_unsubscribe_errors[topic] = RuntimeError("raw-unsubscribe-secret")
+    for topic in (topics.discovery_probe, topics.retained):
+        seam.ha_clear_errors[topic] = RuntimeError("raw-clear-secret")
+
+    async def launcher(raw_request: str) -> _FakePanelProcess:
+        nonlocal process
+        request = PreflightRequest.from_json(raw_request)
+        process = _FakePanelProcess(
+            RunResult(0, _successful_panel_report(request.setup_id).to_json() + "\n", ""),
+            seam.events,
+            settled=False,
+        )
+        launched.set()
+        return process
+
+    task = asyncio.create_task(
+        BrokerValidator(
+            hass,
+            cast(Any, object()),
+            timeout_seconds=0.05,
+        ).async_validate_panel(_profile(), launcher, setup_id=SETUP_ID)
+    )
+    await asyncio.wait_for(launched.wait(), timeout=0.2)
+    task.cancel("caller-cancelled")
+
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await task
+
+    assert raised.value.args == ("caller-cancelled",)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert process is not None
+    assert process.terminate_count == 1
+    assert process.running is False
+    assert ("ha_unsubscribe", topics.panel_to_ha) in seam.events
+    assert ("ha_unsubscribe", topics.discovery_probe) in seam.events
+    assert ("ha_publish", topics.discovery_probe, b"", 1, True) in seam.events
+    assert ("ha_publish", topics.retained, b"", 1, True) in seam.events
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_panel_preflight_primary_and_cleanup_failures_are_fully_redacted(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mqtt_entry(hass)
+    seam = _FakeHaMqtt()
+    seam.install(monkeypatch)
+    topics = SetupTopics.for_id(SETUP_ID)
+    seam.ha_clear_errors[topics.discovery_probe] = RuntimeError("raw-cleanup-secret")
+
+    async def launcher(raw_request: str) -> _FakePanelProcess:
+        return _FakePanelProcess(
+            RunResult(1, '{"raw-report-secret":true}\n', "raw-stderr-secret"),
+            seam.events,
+        )
+
+    with pytest.raises(OperationError) as raised:
+        await BrokerValidator(
+            hass,
+            cast(Any, object()),
+            timeout_seconds=0.05,
+        ).async_validate_panel(_profile(), launcher, setup_id=SETUP_ID)
+
+    error = raised.value
+    assert error.code == "operation_failed"
+    assert error.cleanup_error is not None
+    assert error.cleanup_error.code == "cleanup_failed"
+    assert _direct_exception_chain(error) == [error]
+    assert _direct_exception_chain(error.cleanup_error) == [error.cleanup_error]
+    surface = f"{error!r}\n{error.redacted_dict()!r}\n{traceback_module.format_exception(error)!r}"
+    for secret in ("raw-report-secret", "raw-stderr-secret", "raw-cleanup-secret"):
+        assert secret not in surface

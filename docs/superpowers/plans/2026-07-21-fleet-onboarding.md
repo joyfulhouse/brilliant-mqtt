@@ -228,6 +228,7 @@ git commit -m "feat: pin panel identity before SSH authentication"
 - ProvisioningJournal uses Store(hass, 1, "brilliant_mqtt.provisioning").
 - PanelProvisioner.async_install(request, fleet, progress) -> ProvisionedPanel.
 - PanelProvisioner.async_recover() -> None.
+- PanelHealthObserver.mark_activation_started(expected_version, expected_deployment_id) -> None.
 - PanelHealthObserver.async_wait(expected_version, timeout=90.0) -> PanelHealthEvidence.
 - BrokerValidator.async_validate_panel(profile, launcher) -> BrokerValidationResult.
 
@@ -243,6 +244,11 @@ activation_pending|activated|verifying -> rollback_pending -> rolled_back
 
 The journal record includes transaction_id, operation, phase, setup_id, panel identity/request, fleet profile, staged version, prior PanelSnapshot, started_at, and last_error. Save before returning from every transition. Delete only after committed subentry creation or verified rolled_back state. Assert diagnostics returns count/phase only and never record data.
 
+`staged` is the durable intent boundary for an inactive candidate and may
+therefore describe a partially uploaded release. Persist it immediately before
+the first panel staging write; recovery cleanup is idempotent for absent,
+partial, and complete candidates.
+
 - [ ] **Step 2: Write failing panel-operation and health tests**
 
 Add tests proving:
@@ -254,13 +260,31 @@ Add tests proving:
   retained_message_timeout, while an observed message without the retained flag
   remains non-retryable retained_message_invalid;
 - stage_release uploads versioned payload, unit, env, and CA without replacing /etc files or starting a unit;
+- a custom CA exists only inside its transaction-owned immutable release and
+  is removed with a failed candidate;
 - snapshot captures exact active release link, env bytes, unit bytes, enabled/active states, and component selection;
+- a legacy snapshot can preserve exact watchdog-only or otherwise partial
+  service residue without inventing a bridge service;
 - activate_staged uses same-filesystem rename/link replacement, daemon-reload, enable/start;
 - rollback restores the exact snapshot and removes a first-install unit;
+- verified rollback removes the failed transaction's candidate before clearing
+  the durable journal;
 - health subscriptions exist before activate_staged;
 - retained callbacks cannot satisfy any health gate;
-- non-retained online, expected bridge agent_version, one state topic, and one discovery config for device identifier f"brilliant_panel_{slug}" are all required;
-- cancellation closes subscriptions and drives rollback.
+- after every incumbent service is confirmed stopped, a health boundary binds
+  the expected agent version and transaction deployment ID before candidate
+  start;
+- non-retained online, matching deployment metadata, one state topic, and one
+  discovery config for device identifier f"brilliant_panel_{slug}" are all
+  required;
+- settlement distinguishes dependency-originated cancellation from caller
+  cancellation and preserves the latest repeated caller cancellation;
+- cancellation closes subscriptions and drives rollback;
+- an inactive-candidate cleanup failure durably preserves the original code,
+  returns the original plus a fixed cleanup code, and creates one repair;
+- after verified health, a bounded graceful SSH-close failure does not reopen
+  and roll back the healthy panel, while genuine caller cancellation before
+  ownership handoff still does.
 
 - [ ] **Step 3: Run focused tests and verify missing service failures**
 
@@ -277,10 +301,28 @@ Expected: FAIL because the journal, observer, provisioner, and staged operations
 Before launching the SSH command, subscribe HA to SetupTopics.panel_to_ha and discovery_probe. Launch:
 
 ~~~text
-set -a; . /var/brilliant-mqtt/system/brilliant-mqtt.env; set +a; PYTHONPATH=/var/brilliant-mqtt.staging/app:/var/brilliant-mqtt.staging/vendor /data/switch-embedded/env/bin/python3 -m brilliant_mqtt.preflight --request-json '{"schema_version":1,"setup_id":"12345678-1234-4abc-8def-1234567890ab","panel_nonce":"panel-nonce","ha_nonce":"ha-nonce","timeout_seconds":10.0}'
+PYTHONPATH=/var/brilliant-mqtt/releases/<version>--<transaction>/app:/var/brilliant-mqtt/releases/<version>--<transaction>/vendor /data/switch-embedded/env/bin/python3 -m brilliant_mqtt.preflight --environment-file /var/brilliant-mqtt/releases/<version>--<transaction>/brilliant-mqtt.env --request-json '{"schema_version":1,"setup_id":"12345678-1234-4abc-8def-1234567890ab","panel_nonce":"panel-nonce","ha_nonce":"ha-nonce","timeout_seconds":10.0}'
 ~~~
 
-using safe single-quote escaping from a dedicated shell_arg helper. panel_ops builds this command from fixed paths and one escaped request argument; it never accepts a free-form command. The staged env points at an immutable versioned CA file, and PYTHONPATH points only at the staged app/vendor while the service remains unchanged. When HA receives the exact SetupRequest on panel_to_ha, publish SetupResult on ha_to_panel at QoS 1. Require the panel process report to prove fleet_auth, both directions, discovery_write, retained_message, and cleanup. Require HA to observe panel_to_ha and discovery_write. A timeout remains the approved same-broker-or-ACL ambiguous error. Always unsubscribe and terminate a still-running preflight process before returning.
+using safe single-quote escaping from a dedicated `shell_arg` helper.
+`panel_ops` builds this command from fixed paths and escaped structured
+arguments; it never accepts a free-form command and never shell-sources the
+systemd `EnvironmentFile`. The panel opens a bounded regular environment file
+without following symlinks and accepts only the renderer's allowlisted
+double-quoted or safe bare-value grammar. Shell syntax such as `$()`, backticks,
+and `$VAR` remains literal data. `PYTHONPATH` points only at the staged
+app/vendor while the service remains unchanged.
+
+A custom CA, when present, is
+`/var/brilliant-mqtt/releases/<version>--<transaction>/mqtt-ca.pem`. Upload
+verifies its full SHA-256, regular-file type, no-symlink status, mode, and exact
+single environment binding before promotion. When HA receives the exact
+`SetupRequest` on `panel_to_ha`, publish `SetupResult` on `ha_to_panel` at QoS
+1. Require the panel report to prove fleet authentication, both directions,
+discovery write, retained-message behavior, and cleanup. Require HA to observe
+the panel request and discovery write. A timeout remains the approved
+same-broker-or-ACL ambiguous error. Always unsubscribe and settle or terminate
+the temporary process before returning.
 
 `timeout_seconds` is a per-stage result deadline, not a hard process return
 bound: executor-backed MQTT connect/close work may need to settle after that
@@ -303,17 +345,31 @@ PanelProvisioner order is exact:
 2. authenticate and inspect;
 3. reject duplicate fingerprint before writes;
 4. snapshot current owned files/unit state;
-5. stage payload/env/public CA;
-6. run coordinated panel preflight;
-7. write journal phase activation_pending;
-8. subscribe PanelHealthObserver;
-9. activate atomically and mark activated;
-10. await fresh health and mark verifying;
-11. return ProvisionedPanel for config-entry/subentry commit;
-12. caller marks pending_config_commit and includes the transaction ID in the proposed panel subentry;
-13. async_setup_entry or FleetManager's live subentry listener marks committed and clears both the journal and temporary subentry field only after Home Assistant storage and runtime verification succeed.
+5. prepare and validate the deterministic release metadata without panel writes;
+6. durably write journal phase staged;
+7. stage payload/env/public CA;
+8. run coordinated panel preflight;
+9. write journal phase activation_pending;
+10. subscribe PanelHealthObserver;
+11. stop and confirm the incumbent bridge, establish the observer boundary, activate atomically, and mark activated;
+12. await fresh health and mark verifying;
+13. return ProvisionedPanel for config-entry/subentry commit;
+14. caller marks pending_config_commit and includes the transaction ID in the proposed panel subentry;
+15. async_setup_entry or FleetManager's live subentry listener marks committed and clears both the journal and temporary subentry field only after Home Assistant storage and runtime verification succeed.
 
-On first-install failure, disable/remove the owned unit/env and verify inactive. On upgrade failure, restore snapshot and verify the old version/active state. If rollback fails, preserve journal at rollback_pending and create one repair issue containing original and rollback codes.
+On first-install failure, disable/remove the owned unit/env and verify inactive.
+On upgrade failure, restore the exact snapshot—including legitimate legacy
+partial service residue—and verify the old version and active state. After
+verified rollback, remove the transaction-owned candidate before clearing the
+journal. If inactive candidate cleanup fails, preserve the journal at `staged`;
+if rollback or post-activation candidate cleanup fails, preserve it at
+`rollback_pending`. In either case, create one repair issue containing the
+original and compensation codes.
+
+After fresh health has advanced the journal to `verifying`, failure of the
+bounded graceful SSH close is a local cleanup diagnostic, not a reason to
+reopen and destructively roll back a healthy panel. Caller cancellation before
+the config-entry ownership handoff still performs the exact rollback.
 
 async_recover runs before accepting another provisioning request. For activated/verifying it first subscribes for fresh health and either advances to pending_config_commit or rolls back. For pending_config_commit it searches all fleet subentries for the exact transaction ID: a match completes runtime verification and commit; no match after config-flow completion or abort is known rolls the panel back. It never starts a different transaction while a journal exists.
 

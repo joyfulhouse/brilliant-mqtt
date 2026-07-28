@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import socket
 import ssl
-from dataclasses import dataclass, replace
+from dataclasses import FrozenInstanceError, dataclass, replace
 from enum import StrEnum
 
 import voluptuous as vol
@@ -12,6 +12,26 @@ from aiomqtt.exceptions import MqttConnectError, MqttError
 from paho.mqtt.reasoncodes import ReasonCode
 
 _MAX_EXCEPTION_CHAIN_NODES = 32
+_RUNTIME_EXCEPTION_ATTRIBUTES = frozenset(
+    {
+        "__cause__",
+        "__context__",
+        "__notes__",
+        "__suppress_context__",
+        "__traceback__",
+    }
+)
+_OPERATION_ERROR_FIELDS = frozenset(
+    {
+        "stage",
+        "code",
+        "retryable",
+        "summary_key",
+        "documentation_slug",
+        "redacted_detail",
+        "cleanup_error",
+    }
+)
 
 
 class OperationStage(StrEnum):
@@ -47,6 +67,12 @@ _ERROR_METADATA = {
         summary_key="mqtt_broker_connect_failed",
         documentation_slug="mqtt-broker-connect",
         redacted_detail="The MQTT broker connection failed.",
+    ),
+    "panel_settings_invalid": _ErrorMetadata(
+        retryable=False,
+        summary_key="mqtt_panel_settings_invalid",
+        documentation_slug="mqtt-panel-configuration",
+        redacted_detail="The staged panel configuration is invalid.",
     ),
     "broker_tls_verification_failed": _ErrorMetadata(
         retryable=False,
@@ -130,11 +156,29 @@ _ERROR_METADATA = {
         documentation_slug="mqtt-broker-acl",
         redacted_detail="The broker denied the discovery validation write.",
     ),
+    "discovery_write_timeout": _ErrorMetadata(
+        retryable=True,
+        summary_key="discovery_write_timeout",
+        documentation_slug="mqtt-broker-acl",
+        redacted_detail=(
+            "The discovery validation write timed out; broker routing or ACL "
+            "behavior could not be confirmed."
+        ),
+    ),
     "retained_message_invalid": _ErrorMetadata(
         retryable=False,
         summary_key="retained_message_invalid",
         documentation_slug="mqtt-retained-messages",
         redacted_detail="The retained-message validation failed.",
+    ),
+    "retained_message_timeout": _ErrorMetadata(
+        retryable=True,
+        summary_key="retained_message_timeout",
+        documentation_slug="mqtt-retained-messages",
+        redacted_detail=(
+            "The retained-message validation timed out; broker retention "
+            "behavior could not be confirmed."
+        ),
     ),
     "cleanup_failed": _ErrorMetadata(
         retryable=False,
@@ -145,7 +189,7 @@ _ERROR_METADATA = {
 }
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class OperationError(Exception):
     """Immutable operation failure containing allowlisted metadata only."""
 
@@ -156,6 +200,23 @@ class OperationError(Exception):
     documentation_slug: str
     redacted_detail: str
     cleanup_error: OperationError | None = None
+
+    def __setattr__(self, name: str, value: object) -> None:
+        """Freeze logical fields while allowing BaseException runtime state."""
+        if name in _OPERATION_ERROR_FIELDS and not hasattr(self, name):
+            object.__setattr__(self, name, value)
+            return
+        if name in _RUNTIME_EXCEPTION_ATTRIBUTES:
+            BaseException.__setattr__(self, name, value)
+            return
+        raise FrozenInstanceError(f"cannot assign to field {name!r}")
+
+    def __delattr__(self, name: str) -> None:
+        """Allow only Python's mutable BaseException bookkeeping."""
+        if name in _RUNTIME_EXCEPTION_ATTRIBUTES:
+            BaseException.__delattr__(self, name)
+            return
+        raise FrozenInstanceError(f"cannot delete field {name!r}")
 
     def __post_init__(self) -> None:
         """Reject ad-hoc metadata that could carry raw exception text."""

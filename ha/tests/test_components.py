@@ -65,6 +65,21 @@ def test_selected_ids_includes_bridge_always() -> None:
     assert COMPONENT_BRIDGE in sel and COMPONENT_VOICE in sel
 
 
+def test_selected_core_ids_are_canonical_and_leave_optional_components_out() -> None:
+    selected = comp.selected_core_ids(
+        {
+            CONF_COMPONENTS: {
+                COMPONENT_VOICE: True,
+                COMPONENT_BUS_WATCHDOG: True,
+                COMPONENT_WIFI_WATCHDOG: False,
+                COMPONENT_HUE_CA: True,
+            }
+        }
+    )
+
+    assert selected == (COMPONENT_BRIDGE, COMPONENT_BUS_WATCHDOG)
+
+
 def test_wifi_watchdog_registry_row_default_enabled() -> None:
     row = comp.REGISTRY[COMPONENT_WIFI_WATCHDOG]
     assert row.default_enabled is True

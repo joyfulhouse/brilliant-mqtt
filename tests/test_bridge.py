@@ -1324,6 +1324,22 @@ async def test_reconcile_publishes_bridge_meta(dimmer: BrilliantDevice) -> None:
     }
 
 
+async def test_reconcile_publishes_candidate_deployment_id(
+    dimmer: BrilliantDevice,
+) -> None:
+    bus = FakeBus([dimmer])
+    mqtt = FakeMqtt()
+    deployment_id = "1234567812344abc8def1234567890ab"
+
+    await Bridge(bus, mqtt, PANEL, deployment_id=deployment_id).reconcile()
+
+    payload = next(p for (t, p, _r) in mqtt.published if t == f"brilliant/{PANEL}/bridge")
+    assert json.loads(payload) == {
+        "agent_version": __version__,
+        "deployment_id": deployment_id,
+    }
+
+
 async def test_reconcile_meta_omits_firmware_when_unknown(dimmer: BrilliantDevice) -> None:
     bus = FakeBus([dimmer])
     mqtt = FakeMqtt()

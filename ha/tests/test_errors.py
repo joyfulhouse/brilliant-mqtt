@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import socket
 import ssl
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import FrozenInstanceError
+from pathlib import Path
 from typing import cast
 
 import pytest
@@ -40,6 +43,27 @@ def test_operation_stage_values_are_the_shared_stage_table() -> None:
         "retained_message",
         "cleanup",
     ]
+
+
+def test_panel_settings_error_has_actionable_redacted_metadata() -> None:
+    error = OperationError.for_code(
+        OperationStage.FLEET_AUTH,
+        "panel_settings_invalid",
+    )
+
+    assert error.retryable is False
+    assert error.summary_key == "mqtt_panel_settings_invalid"
+    assert error.documentation_slug == "mqtt-panel-configuration"
+    assert error.redacted_detail == "The staged panel configuration is invalid."
+    _assert_secret_free(error)
+
+
+def test_panel_settings_documentation_slug_has_a_matching_anchor() -> None:
+    documentation = (
+        Path(__file__).resolve().parents[2] / "docs" / "install" / "mqtt-broker.md"
+    ).read_text(encoding="utf-8")
+
+    assert '<a id="mqtt-panel-configuration"></a>' in documentation
 
 
 @pytest.mark.parametrize(
@@ -285,6 +309,26 @@ def test_routing_timeout_guidance_covers_broker_and_directional_acl_failures(
     _assert_secret_free(error)
 
 
+@pytest.mark.parametrize(
+    ("stage", "code"),
+    [
+        (OperationStage.DISCOVERY_WRITE, "discovery_write_timeout"),
+        (OperationStage.RETAINED_MESSAGE, "retained_message_timeout"),
+    ],
+)
+def test_ambiguous_probe_deadlines_are_retryable_and_redacted(
+    stage: OperationStage,
+    code: str,
+) -> None:
+    error = OperationError.for_code(stage, code)
+
+    assert error.retryable is True
+    assert "timed out" in error.redacted_detail
+    assert "denied" not in error.redacted_detail
+    assert "invalid" not in error.redacted_detail
+    _assert_secret_free(error)
+
+
 def test_existing_operation_error_is_not_double_wrapped() -> None:
     mapped = from_exception(
         OperationStage.BROKER_PROFILE,
@@ -339,6 +383,42 @@ def test_operation_error_is_frozen() -> None:
     field = "code"
     with pytest.raises(FrozenInstanceError):
         setattr(error, field, "changed")
+
+
+def test_operation_error_rejects_args_mutation_and_logical_field_deletion() -> None:
+    error = OperationError.for_code(
+        OperationStage.DISCOVERY_WRITE,
+        "operation_failed",
+    )
+
+    with pytest.raises(FrozenInstanceError):
+        error.args = ("raw-secret",)
+    with pytest.raises(FrozenInstanceError):
+        del error.code
+
+    assert error.args == ("operation_failed",)
+    assert error.code == "operation_failed"
+
+
+def test_operation_error_allows_context_manager_traceback_bookkeeping() -> None:
+    @contextmanager
+    def passthrough() -> Iterator[None]:
+        yield
+
+    error = OperationError.for_code(
+        OperationStage.DISCOVERY_WRITE,
+        "operation_failed",
+    )
+
+    with pytest.raises(OperationError) as raised:
+        with passthrough():
+            raise error
+
+    assert raised.value is error
+    assert raised.value.__traceback__ is not None
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    _assert_secret_free(raised.value)
 
 
 def _assert_secret_free(error: OperationError) -> None:

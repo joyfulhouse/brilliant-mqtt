@@ -7,6 +7,7 @@ from typing import Any, Protocol, get_type_hints
 
 import asyncssh
 import pytest
+
 from custom_components.brilliant_mqtt import shell as shell_module
 from custom_components.brilliant_mqtt.shell import (
     AsyncsshShell,
@@ -18,7 +19,6 @@ from custom_components.brilliant_mqtt.shell import (
     async_verify_host_identity,
     known_hosts_line,
 )
-
 from tests import fakes
 from tests.fakes import FakeShell
 
@@ -189,6 +189,7 @@ class _FakeConnection:
         self._process = process
         self._wait_closed_gate = wait_closed_gate
         self.closed = False
+        self.abort_count = 0
         self.close_count = 0
         self.wait_closed_count = 0
         self.process_calls: list[tuple[str, dict[str, object]]] = []
@@ -199,6 +200,12 @@ class _FakeConnection:
     def close(self) -> None:
         self.closed = True
         self.close_count += 1
+
+    def abort(self) -> None:
+        self.closed = True
+        self.abort_count += 1
+        if self._wait_closed_gate is not None:
+            self._wait_closed_gate.set()
 
     async def wait_closed(self) -> None:
         self.wait_closed_count += 1
@@ -933,6 +940,30 @@ async def test_shell_close_cancellation_waits_for_connection_settlement(
         await closing
     assert process.running is False
     assert connection.wait_closed_count == 1
+
+
+async def test_shell_close_aborts_a_transport_which_never_settles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_process = _FakeRawProcess(settled=False)
+    connection_gate = asyncio.Event()
+    connection = _FakeConnection(
+        None,
+        process=raw_process,
+        wait_closed_gate=connection_gate,
+    )
+    _patch_connect(monkeypatch, connection)
+    monkeypatch.setattr(shell_module, "_CLOSE_TIMEOUT", 0.01)
+    shell = AsyncsshShell("panel.local", "pw", _REAL_ED25519_PUB)
+    await shell.connect()
+    process = await shell.start("fixed preflight command")
+
+    with pytest.raises(shell_module.PanelProcessError) as raised:
+        await asyncio.wait_for(shell.close(), timeout=0.2)
+
+    assert raised.value.code == "shell_close_timeout"
+    assert connection.abort_count == 1
+    assert process.running is False
 
 
 async def test_start_failure_is_stable_and_does_not_expose_command(

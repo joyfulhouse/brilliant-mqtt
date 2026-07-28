@@ -4,22 +4,25 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from contextlib import contextmanager
+from dataclasses import FrozenInstanceError, dataclass, field
 from time import monotonic
 from typing import Any
 
 import pytest
+from homeassistant.components import mqtt
+from homeassistant.components.mqtt.models import ReceiveMessage
+from homeassistant.core import HomeAssistant
+
 from custom_components.brilliant_mqtt.panel_health import (
     MAX_HEALTH_PAYLOAD_BYTES,
     PanelHealthError,
     PanelHealthObserver,
 )
-from homeassistant.components import mqtt
-from homeassistant.components.mqtt.models import ReceiveMessage
-from homeassistant.core import HomeAssistant
 
 PANEL = "office"
 VERSION = "0.7.0"
+DEPLOYMENT_ID = "1234567812344abc8def1234567890ab"
 AVAILABILITY = "brilliant/office/availability"
 METADATA = "brilliant/office/bridge"
 STATE_FILTER = "brilliant/office/+/state"
@@ -126,9 +129,17 @@ def _fire_online(seam: _FakeHaMqtt) -> None:
     seam.fire(AVAILABILITY, AVAILABILITY, "online")
 
 
+def _metadata(
+    *,
+    version: str = VERSION,
+    deployment_id: str = DEPLOYMENT_ID,
+) -> str:
+    return f'{{"agent_version":"{version}","deployment_id":"{deployment_id}"}}'
+
+
 def _fire_complete_health(seam: _FakeHaMqtt) -> None:
     _fire_online(seam)
-    seam.fire(METADATA, METADATA, f'{{"agent_version":"{VERSION}"}}')
+    seam.fire(METADATA, METADATA, _metadata())
     seam.fire(DISCOVERY_FILTER, DISCOVERY, _discovery())
     seam.fire(STATE_FILTER, STATE, '{"state":"OFF"}')
 
@@ -149,6 +160,25 @@ def _exception_graph(root: BaseException) -> list[BaseException]:
             pending.append(error.__cause__)
         pending.extend(argument for argument in error.args if isinstance(argument, BaseException))
     return found
+
+
+@contextmanager
+def _passthrough_context() -> Any:
+    yield
+
+
+def test_panel_health_error_is_logically_frozen_but_runtime_raise_safe() -> None:
+    error = PanelHealthError("panel_health_timeout")
+
+    with pytest.raises(FrozenInstanceError):
+        error.code = "panel_health_closed"
+
+    with pytest.raises(PanelHealthError) as raised:
+        with _passthrough_context():
+            raise error
+
+    assert raised.value is error
+    assert _exception_graph(raised.value) == [raised.value]
 
 
 async def _subscribed_observer(
@@ -179,7 +209,7 @@ async def test_subscribes_and_confirms_every_topic_before_activation(
     ]
     assert not ha_mqtt.status_callbacks
 
-    observer.mark_activation_started()
+    observer.mark_activation_started(VERSION, DEPLOYMENT_ID)
     await observer.async_close()
     assert not ha_mqtt.callbacks
 
@@ -193,14 +223,14 @@ async def test_success_requires_one_coherent_fresh_post_online_session(
     # Broker replays and live messages received before activation cannot seed a gate.
     for retained in (True, False):
         ha_mqtt.fire(AVAILABILITY, AVAILABILITY, "online", retain=retained)
-        ha_mqtt.fire(METADATA, METADATA, f'{{"agent_version":"{VERSION}"}}', retain=retained)
+        ha_mqtt.fire(METADATA, METADATA, _metadata(), retain=retained)
         ha_mqtt.fire(DISCOVERY_FILTER, DISCOVERY, _discovery(), retain=retained)
         ha_mqtt.fire(STATE_FILTER, STATE, '{"state":"OFF"}', retain=retained)
 
-    observer.mark_activation_started()
+    observer.mark_activation_started(VERSION, DEPLOYMENT_ID)
 
     # Post-activation metadata/state/discovery still do not count until fresh online.
-    ha_mqtt.fire(METADATA, METADATA, f'{{"agent_version":"{VERSION}"}}')
+    ha_mqtt.fire(METADATA, METADATA, _metadata())
     ha_mqtt.fire(DISCOVERY_FILTER, DISCOVERY, _discovery())
     ha_mqtt.fire(STATE_FILTER, STATE, '{"state":"OFF"}')
     _fire_complete_health(ha_mqtt)
@@ -221,13 +251,45 @@ async def test_success_requires_one_coherent_fresh_post_online_session(
     ]
 
 
+async def test_same_version_incumbent_deployment_cannot_satisfy_candidate_health(
+    hass: HomeAssistant,
+    ha_mqtt: _FakeHaMqtt,
+) -> None:
+    observer = await _subscribed_observer(hass)
+    observer.mark_activation_started(VERSION, DEPLOYMENT_ID)
+    _fire_online(ha_mqtt)
+    ha_mqtt.fire(
+        METADATA,
+        METADATA,
+        f'{{"agent_version":"{VERSION}","deployment_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}',
+    )
+    ha_mqtt.fire(DISCOVERY_FILTER, DISCOVERY, _discovery())
+    ha_mqtt.fire(STATE_FILTER, STATE, '{"state":"OFF"}')
+
+    wait = asyncio.create_task(observer.async_wait(VERSION, timeout=0.05))
+    await asyncio.sleep(0)
+    _fire_online(ha_mqtt)
+    ha_mqtt.fire(
+        METADATA,
+        METADATA,
+        _metadata(),
+    )
+    ha_mqtt.fire(DISCOVERY_FILTER, DISCOVERY, _discovery())
+    ha_mqtt.fire(STATE_FILTER, STATE, '{"state":"OFF"}')
+
+    evidence = await wait
+
+    assert evidence.agent_version == VERSION
+    assert evidence.deployment_id == DEPLOYMENT_ID
+
+
 async def test_retained_and_pre_activation_or_old_timestamp_messages_time_out(
     hass: HomeAssistant,
     ha_mqtt: _FakeHaMqtt,
 ) -> None:
     observer = await _subscribed_observer(hass)
     pre_activation_timestamp = monotonic() - 10
-    observer.mark_activation_started()
+    observer.mark_activation_started(VERSION, DEPLOYMENT_ID)
 
     for retain, timestamp in (
         (True, None),
@@ -243,7 +305,7 @@ async def test_retained_and_pre_activation_or_old_timestamp_messages_time_out(
         ha_mqtt.fire(
             METADATA,
             METADATA,
-            f'{{"agent_version":"{VERSION}"}}',
+            _metadata(),
             retain=retain,
             timestamp=timestamp,
         )
@@ -276,9 +338,9 @@ async def test_offline_after_online_clears_partial_session_evidence(
     ha_mqtt: _FakeHaMqtt,
 ) -> None:
     observer = await _subscribed_observer(hass)
-    observer.mark_activation_started()
+    observer.mark_activation_started(VERSION, DEPLOYMENT_ID)
     _fire_online(ha_mqtt)
-    ha_mqtt.fire(METADATA, METADATA, f'{{"agent_version":"{VERSION}"}}')
+    ha_mqtt.fire(METADATA, METADATA, _metadata())
     ha_mqtt.fire(AVAILABILITY, AVAILABILITY, "offline")
     ha_mqtt.fire(DISCOVERY_FILTER, DISCOVERY, _discovery())
     ha_mqtt.fire(STATE_FILTER, STATE, '{"state":"OFF"}')
@@ -294,16 +356,18 @@ async def test_wrong_version_fails_closed_with_redacted_typed_error(
     ha_mqtt: _FakeHaMqtt,
 ) -> None:
     observer = await _subscribed_observer(hass)
-    observer.mark_activation_started()
+    observer.mark_activation_started(VERSION, DEPLOYMENT_ID)
+    wait = asyncio.create_task(observer.async_wait(VERSION, timeout=0.05))
+    await asyncio.sleep(0)
     _fire_online(ha_mqtt)
     ha_mqtt.fire(
         METADATA,
         METADATA,
-        '{"agent_version":"SECRET-wrong-version"}',
+        _metadata(version="SECRET-wrong-version"),
     )
 
     with pytest.raises(PanelHealthError) as raised:
-        await observer.async_wait(VERSION, timeout=0.05)
+        await wait
 
     assert raised.value.code == "panel_health_version_mismatch"
     assert "SECRET" not in str(raised.value)
@@ -311,14 +375,44 @@ async def test_wrong_version_fails_closed_with_redacted_typed_error(
     assert not ha_mqtt.callbacks
 
 
+async def test_old_version_session_before_wait_is_cleared_for_new_candidate(
+    hass: HomeAssistant,
+    ha_mqtt: _FakeHaMqtt,
+) -> None:
+    observer = await _subscribed_observer(hass)
+    observer.mark_activation_started(VERSION, DEPLOYMENT_ID)
+
+    # A queued incumbent publication has a different deployment identity even
+    # when it arrives after the stop-confirmed activation boundary.
+    _fire_online(ha_mqtt)
+    ha_mqtt.fire(
+        METADATA,
+        METADATA,
+        _metadata(
+            version="0.6.0",
+            deployment_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ),
+    )
+
+    wait = asyncio.create_task(observer.async_wait(VERSION, timeout=0.05))
+    await asyncio.sleep(0)
+    _fire_complete_health(ha_mqtt)
+
+    evidence = await wait
+
+    assert evidence.agent_version == VERSION
+    assert evidence.state_topic == STATE
+    assert evidence.discovery_topic == DISCOVERY
+
+
 async def test_wrong_slug_topic_cannot_satisfy_health(
     hass: HomeAssistant,
     ha_mqtt: _FakeHaMqtt,
 ) -> None:
     observer = await _subscribed_observer(hass)
-    observer.mark_activation_started()
+    observer.mark_activation_started(VERSION, DEPLOYMENT_ID)
     _fire_online(ha_mqtt)
-    ha_mqtt.fire(METADATA, METADATA, f'{{"agent_version":"{VERSION}"}}')
+    ha_mqtt.fire(METADATA, METADATA, _metadata())
     ha_mqtt.fire(
         STATE_FILTER,
         "brilliant/kitchen/load-1/state",
@@ -341,7 +435,7 @@ async def test_wrong_discovery_device_identity_cannot_satisfy_health(
     ha_mqtt: _FakeHaMqtt,
 ) -> None:
     observer = await _subscribed_observer(hass)
-    observer.mark_activation_started()
+    observer.mark_activation_started(VERSION, DEPLOYMENT_ID)
     _fire_online(ha_mqtt)
     ha_mqtt.fire(
         DISCOVERY_FILTER,
@@ -376,8 +470,10 @@ async def test_fresh_targeted_malformed_or_oversized_payload_fails_redacted(
     payload: str,
 ) -> None:
     observer = await _subscribed_observer(hass)
-    observer.mark_activation_started()
+    observer.mark_activation_started(VERSION, DEPLOYMENT_ID)
     _fire_online(ha_mqtt)
+    if subscribed_topic == STATE_FILTER:
+        ha_mqtt.fire(METADATA, METADATA, _metadata())
     ha_mqtt.fire(subscribed_topic, topic, payload)
 
     with pytest.raises(PanelHealthError) as raised:
@@ -402,7 +498,7 @@ async def test_malformed_global_discovery_is_rejected_without_cross_panel_failur
     payload: str,
 ) -> None:
     observer = await _subscribed_observer(hass)
-    observer.mark_activation_started()
+    observer.mark_activation_started(VERSION, DEPLOYMENT_ID)
     _fire_online(ha_mqtt)
     ha_mqtt.fire(DISCOVERY_FILTER, DISCOVERY, payload)
 
@@ -418,7 +514,7 @@ async def test_prefix_colliding_panel_discovery_is_ignored(
     ha_mqtt: _FakeHaMqtt,
 ) -> None:
     observer = await _subscribed_observer(hass)
-    observer.mark_activation_started()
+    observer.mark_activation_started(VERSION, DEPLOYMENT_ID)
     _fire_online(ha_mqtt)
     ha_mqtt.fire(
         DISCOVERY_FILTER,
@@ -440,9 +536,9 @@ async def test_discovery_and_state_may_prove_distinct_entities_on_the_same_panel
     ha_mqtt: _FakeHaMqtt,
 ) -> None:
     observer = await _subscribed_observer(hass)
-    observer.mark_activation_started()
+    observer.mark_activation_started(VERSION, DEPLOYMENT_ID)
     _fire_online(ha_mqtt)
-    ha_mqtt.fire(METADATA, METADATA, f'{{"agent_version":"{VERSION}"}}')
+    ha_mqtt.fire(METADATA, METADATA, _metadata())
     ha_mqtt.fire(DISCOVERY_FILTER, DISCOVERY, _discovery())
     ha_mqtt.fire(STATE_FILTER, "brilliant/office/load-2/state", '{"state":"OFF"}')
 
@@ -493,7 +589,7 @@ async def test_wait_cancellation_closes_every_subscription(
     ha_mqtt: _FakeHaMqtt,
 ) -> None:
     observer = await _subscribed_observer(hass)
-    observer.mark_activation_started()
+    observer.mark_activation_started(VERSION, DEPLOYMENT_ID)
     wait = asyncio.create_task(observer.async_wait(VERSION, timeout=60))
     await asyncio.sleep(0)
 
@@ -533,7 +629,7 @@ async def test_activation_and_wait_require_confirmed_subscriptions(
 
     with pytest.raises(PanelHealthError) as raised:
         if method == "mark":
-            observer.mark_activation_started()
+            observer.mark_activation_started(VERSION, DEPLOYMENT_ID)
         else:
             await observer.async_wait(VERSION, timeout=0.01)
 

@@ -17,6 +17,8 @@ from asyncssh import SFTPAttrs
 
 _CONNECT_TIMEOUT = 15
 _LOGIN_TIMEOUT = 15
+_OPERATION_TIMEOUT = 120
+_CLOSE_TIMEOUT = 15
 PANEL_PROCESS_OUTPUT_LIMIT = 32 * 1024
 _PROCESS_READ_SIZE = 4096
 _ED25519_HOST_KEY_ALGORITHMS = ("ssh-ed25519",)
@@ -29,6 +31,7 @@ _PROCESS_ERROR_CODES = frozenset(
         "process_output_too_large",
         "process_start_failed",
         "process_wait_failed",
+        "shell_close_timeout",
     }
 )
 _IDENTITY_ERROR_CODES = frozenset(
@@ -359,6 +362,12 @@ class _AsyncsshPanelProcess:
         except Exception:
             pass
 
+    def _abort(self) -> None:
+        """Force local settlement after the SSH transport misses its close bound."""
+        self.terminate()
+        if not self._settlement.done():
+            self._settlement.cancel()
+
     async def wait(self) -> RunResult:
         """Await settlement without letting caller cancellation destroy it."""
         return await asyncio.shield(self._settlement)
@@ -471,8 +480,22 @@ class _ShellOperations:
         for child in children:
             child.terminate()
         conn.close()
-        await asyncio.gather(*(child.wait() for child in children), return_exceptions=True)
-        await conn.wait_closed()
+        try:
+            async with asyncio.timeout(_CLOSE_TIMEOUT):
+                await asyncio.gather(
+                    *(child.wait() for child in children),
+                    return_exceptions=True,
+                )
+                await conn.wait_closed()
+        except TimeoutError:
+            conn.abort()
+            for child in children:
+                child._abort()
+            await asyncio.gather(
+                *(child.wait() for child in children),
+                return_exceptions=True,
+            )
+            raise PanelProcessError("shell_close_timeout") from None
 
     def _require_conn(self) -> asyncssh.SSHClientConnection:
         # Intentional contract, not a debug check — must hold under -O too.
@@ -482,7 +505,11 @@ class _ShellOperations:
 
     async def run(self, command: str) -> RunResult:
         conn = self._require_conn()
-        result = await conn.run(command, check=False)
+        result = await conn.run(
+            command,
+            check=False,
+            timeout=_OPERATION_TIMEOUT,
+        )
         return RunResult(
             exit_status=result.exit_status or 0,
             stdout=str(result.stdout or ""),
@@ -495,13 +522,14 @@ class _ShellOperations:
         raw: _RawProcess | None = None
         failed = False
         try:
-            created = await conn.create_process(
-                command,
-                encoding=None,
-                stdin=asyncssh.DEVNULL,
-                stdout=asyncssh.PIPE,
-                stderr=asyncssh.PIPE,
-            )
+            async with asyncio.timeout(_OPERATION_TIMEOUT):
+                created = await conn.create_process(
+                    command,
+                    encoding=None,
+                    stdin=asyncssh.DEVNULL,
+                    stdout=asyncssh.PIPE,
+                    stderr=asyncssh.PIPE,
+                )
             raw = cast(_RawProcess, created)
         except asyncio.CancelledError:
             raise
@@ -517,25 +545,32 @@ class _ShellOperations:
     async def put_bytes(self, data: bytes, remote_path: str, mode: int) -> None:
         conn = self._require_conn()
         # asyncssh.SFTPClient is itself an async context manager (not start_sftp_client)
-        async with await conn.start_sftp_client() as sftp:
-            # The secret must never sit with wrong permissions: attrs sets the
-            # mode on fresh creates, but asyncssh ignores attrs when the file
-            # already exists ("wb" truncates, keeps old perms) — so also chmod
-            # the open (truncated-empty) handle BEFORE the data lands.
-            async with await sftp.open(remote_path, "wb", attrs=SFTPAttrs(permissions=mode)) as f:
-                await f.chmod(mode)  # converge pre-existing files; no-op on fresh creates
-                await f.write(data)
+        async with asyncio.timeout(_OPERATION_TIMEOUT):
+            async with await conn.start_sftp_client() as sftp:
+                # The secret must never sit with wrong permissions: attrs sets the
+                # mode on fresh creates, but asyncssh ignores attrs when the file
+                # already exists ("wb" truncates, keeps old perms) — so also chmod
+                # the open (truncated-empty) handle BEFORE the data lands.
+                async with await sftp.open(
+                    remote_path,
+                    "wb",
+                    attrs=SFTPAttrs(permissions=mode),
+                ) as f:
+                    await f.chmod(mode)  # converge pre-existing files; no-op on fresh creates
+                    await f.write(data)
 
     async def put_dir(self, local_dir: str, remote_dir: str) -> None:
         conn = self._require_conn()
-        async with await conn.start_sftp_client() as sftp:
-            await sftp.put(local_dir, remote_dir, recurse=True)
+        async with asyncio.timeout(_OPERATION_TIMEOUT):
+            async with await conn.start_sftp_client() as sftp:
+                await sftp.put(local_dir, remote_dir, recurse=True)
 
     async def put_file(self, local_path: str, remote_path: str, mode: int) -> None:
         conn = self._require_conn()
-        async with await conn.start_sftp_client() as sftp:
-            await sftp.put(local_path, remote_path)
-            await sftp.chmod(remote_path, mode)
+        async with asyncio.timeout(_OPERATION_TIMEOUT):
+            async with await conn.start_sftp_client() as sftp:
+                await sftp.put(local_path, remote_path)
+                await sftp.chmod(remote_path, mode)
 
 
 class AsyncsshShell(_ShellOperations):

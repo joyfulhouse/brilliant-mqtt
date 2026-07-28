@@ -18,6 +18,7 @@ import aiomqtt
 import pytest
 from aiomqtt.exceptions import MqttConnectError, MqttError
 
+from custom_components.brilliant_mqtt import panel_ops
 from custom_components.brilliant_mqtt.broker import (
     BrokerKind,
     BrokerProfile,
@@ -230,6 +231,90 @@ def test_broker_kind_values_are_exact() -> None:
         "official_mosquitto",
         "existing_broker",
     ]
+
+
+def test_panel_release_settings_render_without_exporting_individual_secrets() -> None:
+    profile = _direct_profile()
+
+    settings = profile.panel_release_settings(
+        panel="office",
+        mesh_priority=1,
+        scene_bridge_enabled=False,
+    )
+
+    parsed = panel_ops.parse_env(settings.environment)
+    assert parsed["MQTT_USERNAME"] == USERNAME
+    assert parsed["MQTT_PASSWORD"] == PASSWORD
+    assert parsed["BRILLIANT_PANEL"] == "office"
+    assert parsed["MESH_PRIORITY"] == "1"
+    assert settings.mqtt_ca is None
+    assert settings.mqtt_ca_path is None
+    assert repr(settings) == "PanelBrokerReleaseSettings(<redacted>)"
+    assert USERNAME not in repr(settings)
+    assert PASSWORD not in repr(settings)
+
+
+def test_panel_release_settings_binds_candidate_deployment_id() -> None:
+    profile = _direct_profile()
+    deployment_id = "1234567812344abc8def1234567890ab"
+
+    settings = profile.panel_release_settings(
+        panel="office",
+        mesh_priority=1,
+        scene_bridge_enabled=False,
+        deployment_id=deployment_id,
+    )
+
+    assert settings.deployment_id == deployment_id
+    assert panel_ops.parse_env(settings.environment)["BRILLIANT_DEPLOYMENT_ID"] == deployment_id
+
+
+def test_panel_release_settings_bind_custom_ca_to_immutable_path() -> None:
+    profile = _direct_profile(
+        tls_enabled=True,
+        _ca_pem_value=CA_PEM,
+    )
+    expected_path = (
+        "/var/brilliant-mqtt/releases/0.7.0--1234567812344abc8def1234567890ab/mqtt-ca.pem"
+    )
+
+    settings = profile.panel_release_settings(
+        panel="office",
+        mesh_priority=2,
+        scene_bridge_enabled=True,
+        mqtt_ca_path=expected_path,
+    )
+
+    expected_ca = CA_PEM.encode()
+    assert settings.mqtt_ca == expected_ca
+    assert settings.mqtt_ca_path == expected_path
+    parsed = panel_ops.parse_env(settings.environment)
+    assert parsed["MQTT_TLS_ENABLED"] == "1"
+    assert parsed["MQTT_TLS_CA_FILE"] == expected_path
+    assert parsed["SCENE_BRIDGE_ENABLED"] == "1"
+
+
+def test_panel_release_settings_requires_path_only_for_custom_ca() -> None:
+    custom = _direct_profile(tls_enabled=True, _ca_pem_value=CA_PEM)
+    default_trust = _direct_profile(tls_enabled=True)
+    release_ca = "/var/brilliant-mqtt/releases/0.7.0--1234567812344abc8def1234567890ab/mqtt-ca.pem"
+
+    with pytest.raises(OperationError) as missing:
+        custom.panel_release_settings(
+            panel="office",
+            mesh_priority=2,
+            scene_bridge_enabled=True,
+        )
+    with pytest.raises(OperationError) as unexpected:
+        default_trust.panel_release_settings(
+            panel="office",
+            mesh_priority=2,
+            scene_bridge_enabled=True,
+            mqtt_ca_path=release_ca,
+        )
+
+    assert missing.value.code == "invalid_broker_profile"
+    assert unexpected.value.code == "invalid_broker_profile"
 
 
 @pytest.mark.asyncio

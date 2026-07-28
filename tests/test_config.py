@@ -14,6 +14,10 @@ class TestSettings:
         monkeypatch.setenv("MQTT_USERNAME", "brilliant")
         monkeypatch.setenv("MQTT_PASSWORD", "s3cr3t")
         monkeypatch.setenv("MQTT_PORT", "8883")
+        monkeypatch.setenv(
+            "BRILLIANT_DEPLOYMENT_ID",
+            "1234567812344abc8def1234567890ab",
+        )
         monkeypatch.setenv("RESYNC_SECONDS", "120")
         monkeypatch.setenv("LOG_LEVEL", "DEBUG")
 
@@ -24,6 +28,7 @@ class TestSettings:
         assert s.mqtt_username == "brilliant"
         assert s.mqtt_password == "s3cr3t"
         assert s.mqtt_port == 8883
+        assert s.deployment_id == "1234567812344abc8def1234567890ab"
         assert s.resync_seconds == 120
         assert s.log_level == "DEBUG"
 
@@ -47,6 +52,30 @@ class TestSettings:
         assert s.retained_topics_file == "/var/brilliant-mqtt/state/owned-topics.json"
         assert s.resync_seconds == 300
         assert s.log_level == "INFO"
+        assert s.deployment_id is None
+
+    @pytest.mark.parametrize(
+        "deployment_id",
+        [
+            "",
+            "12345678-1234-4abc-8def-1234567890ab",
+            "1234567812344ABC8DEF1234567890AB",
+            "not-a-deployment",
+        ],
+    )
+    def test_deployment_id_rejects_noncanonical_value(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        deployment_id: str,
+    ) -> None:
+        monkeypatch.setenv("BRILLIANT_PANEL", "office")
+        monkeypatch.setenv("MQTT_HOST", "10.0.0.1")
+        monkeypatch.setenv("MQTT_USERNAME", "brilliant")
+        monkeypatch.setenv("MQTT_PASSWORD", "s3cr3t")
+        monkeypatch.setenv("BRILLIANT_DEPLOYMENT_ID", deployment_id)
+
+        with pytest.raises(ValueError, match="BRILLIANT_DEPLOYMENT_ID"):
+            Settings.from_env()
 
     def test_panel_slug_preserves_legacy_canonical_value(
         self,

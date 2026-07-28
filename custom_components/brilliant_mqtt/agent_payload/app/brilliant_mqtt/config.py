@@ -10,6 +10,7 @@ No panel imports, no MQTT library imports: pure stdlib only.
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -19,6 +20,7 @@ from brilliant_mqtt.ha_control_protocol import is_panel_slug
 # startup — an operator writing "false" must never silently get "enabled".
 _ENV_TRUTHY = frozenset({"1", "true", "on", "yes"})
 _ENV_FALSY = frozenset({"0", "false", "off", "no"})
+_DEPLOYMENT_ID = re.compile(r"^[0-9a-f]{32}$")
 
 
 def _env_bool(env: Mapping[str, str], key: str, default: str) -> bool:
@@ -43,6 +45,7 @@ class Settings:
     mqtt_port: int = 1883
     mqtt_tls_enabled: bool = False
     mqtt_tls_ca_file: str | None = None
+    deployment_id: str | None = None
     retained_topics_file: str = "/var/brilliant-mqtt/state/owned-topics.json"
     resync_seconds: int = 300
     log_level: str = "INFO"
@@ -107,7 +110,7 @@ class Settings:
     scene_watermark_file: str = "/data/brilliant-mqtt/scene-watermarks.json"
 
     @classmethod
-    def from_env(cls) -> Settings:
+    def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
         """Construct Settings from environment variables.
 
         Required: BRILLIANT_PANEL, MQTT_HOST, MQTT_USERNAME, MQTT_PASSWORD.
@@ -144,7 +147,8 @@ class Settings:
         Raises KeyError when a required variable is absent and ValueError when
         a value fails validation — both crash startup loudly under systemd.
         """
-        env = os.environ
+        if env is None:
+            env = os.environ
 
         # Required — intentionally use direct __getitem__ so KeyError propagates.
         panel = env["BRILLIANT_PANEL"]
@@ -158,6 +162,11 @@ class Settings:
         mqtt_port = int(env.get("MQTT_PORT", "1883"))
         mqtt_tls_enabled = _env_bool(env, "MQTT_TLS_ENABLED", "0")
         mqtt_tls_ca_file = env.get("MQTT_TLS_CA_FILE") or None
+        deployment_id = env.get("BRILLIANT_DEPLOYMENT_ID")
+        if deployment_id is not None and (
+            not isinstance(deployment_id, str) or _DEPLOYMENT_ID.fullmatch(deployment_id) is None
+        ):
+            raise ValueError("BRILLIANT_DEPLOYMENT_ID must be 32 lowercase hexadecimal characters")
         retained_topics_file = env.get(
             "RETAINED_TOPICS_FILE",
             "/var/brilliant-mqtt/state/owned-topics.json",
@@ -209,6 +218,7 @@ class Settings:
             mqtt_port=mqtt_port,
             mqtt_tls_enabled=mqtt_tls_enabled,
             mqtt_tls_ca_file=mqtt_tls_ca_file,
+            deployment_id=deployment_id,
             retained_topics_file=retained_topics_file,
             resync_seconds=resync_seconds,
             log_level=log_level,

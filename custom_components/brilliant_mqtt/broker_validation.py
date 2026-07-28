@@ -11,7 +11,7 @@ from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from functools import partial
 from time import monotonic
-from typing import Any
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 from homeassistant.components import mqtt
@@ -28,12 +28,22 @@ from homeassistant.core import HomeAssistant
 
 from .broker import BrokerProfile, DeviceMqttClient, DeviceMqttMessage
 from .errors import OperationError, OperationStage, from_exception
-from .setup_protocol import SetupRequest, SetupResult, SetupTopics
+from .setup_protocol import (
+    MAX_PREFLIGHT_REPORT_BYTES,
+    PreflightReport,
+    PreflightRequest,
+    PreflightStage,
+    SetupRequest,
+    SetupResult,
+    SetupTopics,
+)
+from .shell import PanelProcess, RunResult
 
 _DeviceClientFactory = Callable[
     [BrokerProfile, str],
     AbstractAsyncContextManager[DeviceMqttClient],
 ]
+_PanelLauncher = Callable[[str], Awaitable[PanelProcess]]
 _FLEET_AUTH_CODES = {
     "broker_tls_verification_failed",
     "broker_authentication_failed",
@@ -74,6 +84,21 @@ class _ValidationState:
     ha_unsubscribes: list[Callable[[], None]] = field(default_factory=list)
     device_subscriptions: list[str] = field(default_factory=list)
     retained_topics: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class _PanelValidationState:
+    topics: SetupTopics
+    ha_unsubscribes: list[Callable[[], None]] = field(default_factory=list)
+    process: PanelProcess | None = None
+    panel_request_observed: bool = False
+    ha_response_published: bool = False
+    discovery_observed: bool = False
+    callback_failure: OperationError | None = None
+    callback_failure_event: asyncio.Event = field(default_factory=asyncio.Event)
+    panel_request_event: asyncio.Event = field(default_factory=asyncio.Event)
+    ha_response_event: asyncio.Event = field(default_factory=asyncio.Event)
+    discovery_event: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 class BrokerValidator:
@@ -178,8 +203,12 @@ class BrokerValidator:
 
             await self._run_stage(
                 OperationStage.DISCOVERY_WRITE,
-                "discovery_write_denied",
+                "discovery_write_timeout",
                 lambda: self._async_discovery_write(state, discovery_nonce),
+                allowed_codes={
+                    "discovery_write_denied",
+                    "operation_failed",
+                },
             )
             self._record_stage(
                 OperationStage.DISCOVERY_WRITE,
@@ -190,8 +219,12 @@ class BrokerValidator:
 
             await self._run_stage(
                 OperationStage.RETAINED_MESSAGE,
-                "retained_message_invalid",
+                "retained_message_timeout",
                 lambda: self._async_retained_message(state, retained_nonce),
+                allowed_codes={
+                    "retained_message_invalid",
+                    "operation_failed",
+                },
             )
             self._record_stage(
                 OperationStage.RETAINED_MESSAGE,
@@ -233,6 +266,410 @@ class BrokerValidator:
             elapsed_seconds=monotonic() - started,
             stage_elapsed_seconds=tuple(elapsed),
         )
+
+    async def async_validate_panel(
+        self,
+        profile: BrokerProfile,
+        launcher: _PanelLauncher,
+        setup_id: UUID | None = None,
+    ) -> BrokerValidationResult:
+        """Coordinate one bounded panel-side preflight through Home Assistant."""
+        candidate_id = uuid4() if setup_id is None else setup_id
+        if not isinstance(candidate_id, UUID) or candidate_id.version != 4:
+            raise ValueError("invalid_setup_id") from None
+        if not isinstance(profile, BrokerProfile):
+            raise TypeError("profile must be a BrokerProfile")
+        if not callable(launcher):
+            raise TypeError("launcher must be callable")
+
+        validation_id = candidate_id
+        state = _PanelValidationState(SetupTopics.for_id(validation_id))
+        request_box = [
+            PreflightRequest(
+                setup_id=validation_id,
+                panel_nonce=f"panel-{secrets.token_urlsafe(24)}",
+                ha_nonce=f"ha-{secrets.token_urlsafe(24)}",
+                timeout_seconds=self._timeout_seconds,
+            )
+        ]
+        started = monotonic()
+        completed: list[OperationStage] = []
+        elapsed: list[tuple[OperationStage, float]] = []
+        process_result: RunResult | None = None
+        panel_report: PreflightReport | None = None
+        launched_process: PanelProcess | None = None
+        primary: BaseException | None = None
+        settlement_failed = False
+        settlement_control: BaseException | None = None
+        del profile
+
+        try:
+            await self._run_stage(
+                OperationStage.HA_MQTT_READY,
+                "ha_mqtt_unavailable",
+                self._async_ha_mqtt_ready,
+                allowed_codes={
+                    "ha_mqtt_unavailable",
+                    "unsupported_discovery_prefix",
+                },
+            )
+            self._record_stage(
+                OperationStage.HA_MQTT_READY,
+                completed,
+                elapsed,
+                started,
+            )
+            await self._run_stage(
+                OperationStage.PANEL_TO_HA,
+                "panel_to_ha_timeout",
+                partial(
+                    self._async_prepare_panel_request_subscription,
+                    state,
+                    request_box[0],
+                ),
+            )
+            await self._run_stage(
+                OperationStage.DISCOVERY_WRITE,
+                "discovery_write_timeout",
+                partial(
+                    self._async_prepare_discovery_subscription,
+                    state,
+                    request_box[0],
+                ),
+            )
+
+            async with asyncio.timeout(min(self._timeout_seconds * 8.0, 300.0)):
+                launched_process = await launcher(request_box[0].to_json())
+                if not _is_panel_process(launched_process):
+                    raise TypeError("invalid_panel_process")
+                state.process = launched_process
+                process_result, callback_failure = await self._async_wait_panel_process(
+                    state,
+                    launched_process,
+                )
+                if callback_failure is not None:
+                    primary = callback_failure
+                elif launched_process.running:
+                    primary = OperationError.for_code(
+                        OperationStage.CLEANUP,
+                        "operation_failed",
+                    )
+                elif process_result is not None:
+                    panel_report, report_error = _parsed_panel_report(
+                        process_result,
+                        validation_id,
+                    )
+                    if report_error is not None:
+                        primary = report_error
+                    elif panel_report is not None and panel_report.success:
+                        callback_failure = await self._async_wait_panel_success_evidence(state)
+                        if callback_failure is not None:
+                            primary = callback_failure
+        except BaseException as error:
+            primary = error
+
+        settled_process = state.process
+        if primary is not None and settled_process is not None:
+            if settled_process.running:
+                terminate_failed = False
+                try:
+                    settled_process.terminate()
+                except Exception:
+                    terminate_failed = True
+                if terminate_failed:
+                    settlement_failed = True
+            settle_failed, settle_control = await self._async_settle_panel_process(settled_process)
+            settlement_failed = settlement_failed or settle_failed
+            settlement_control = settle_control
+
+        mapped_primary: OperationError | None = None
+        control: BaseException | None = None
+        if primary is not None:
+            if not isinstance(primary, Exception):
+                control = primary
+            elif isinstance(primary, OperationError):
+                mapped_primary = primary
+            elif isinstance(primary, TimeoutError):
+                mapped_primary = _panel_evidence_error(state)
+            else:
+                mapped_primary = OperationError.for_code(
+                    OperationStage.FLEET_AUTH,
+                    "operation_failed",
+                )
+        elif panel_report is not None:
+            if panel_report.success:
+                for panel_stage in panel_report.completed_stages:
+                    operation_stage = OperationStage(panel_stage.value)
+                    completed.append(operation_stage)
+                    elapsed.append(
+                        (
+                            operation_stage,
+                            panel_report.stage_elapsed_ms[panel_stage] / 1_000,
+                        )
+                    )
+            else:
+                mapped_primary = _panel_report_error(panel_report)
+        else:
+            mapped_primary = OperationError.for_code(
+                OperationStage.CLEANUP,
+                "operation_failed",
+            )
+
+        cleanup_failed, cleanup_control = await self._async_cleanup_panel(state)
+        request_box.clear()
+        process_result = None
+        panel_report = None
+        launched_process = None
+        primary = None
+        state.process = None
+        state.ha_unsubscribes.clear()
+        del settled_process
+        del launcher
+
+        if control is not None:
+            raise control
+        if settlement_control is not None:
+            raise settlement_control
+        if cleanup_control is not None:
+            raise cleanup_control
+        if mapped_primary is not None:
+            if settlement_failed or cleanup_failed:
+                mapped_primary = mapped_primary.with_cleanup_error(_cleanup_error())
+            raise mapped_primary from None
+        if settlement_failed or cleanup_failed:
+            raise _cleanup_error() from None
+
+        return BrokerValidationResult(
+            setup_id=validation_id,
+            completed_stages=tuple(completed),
+            elapsed_seconds=monotonic() - started,
+            stage_elapsed_seconds=tuple(elapsed),
+        )
+
+    async def _async_prepare_panel_request_subscription(
+        self,
+        state: _PanelValidationState,
+        request: PreflightRequest,
+    ) -> None:
+        async def on_message(message: ReceiveMessage) -> None:
+            if (
+                state.panel_request_observed
+                or message.topic != state.topics.panel_to_ha
+                or message.qos != 1
+                or message.retain is not False
+                or message.subscribed_topic != state.topics.panel_to_ha
+                or not isinstance(message.payload, (bytes, str))
+            ):
+                return
+            try:
+                received = SetupRequest.from_payload(message.payload)
+            except (TypeError, ValueError):
+                return
+            if received.setup_id != request.setup_id or received.nonce != request.panel_nonce:
+                return
+
+            state.panel_request_observed = True
+            state.panel_request_event.set()
+            publish_failed = False
+            try:
+                await mqtt.async_publish(
+                    self.hass,
+                    state.topics.ha_to_panel,
+                    SetupResult(
+                        request.setup_id,
+                        request.ha_nonce,
+                        request.panel_nonce,
+                    ).to_payload(),
+                    qos=1,
+                    retain=False,
+                )
+            except Exception:
+                publish_failed = True
+            if publish_failed:
+                state.callback_failure = OperationError.for_code(
+                    OperationStage.HA_TO_PANEL,
+                    "operation_failed",
+                )
+                state.callback_failure_event.set()
+                return
+            state.ha_response_published = True
+            state.ha_response_event.set()
+
+        await self._async_subscribe_ha(
+            state,
+            state.topics.panel_to_ha,
+            on_message,
+        )
+
+    async def _async_prepare_discovery_subscription(
+        self,
+        state: _PanelValidationState,
+        request: PreflightRequest,
+    ) -> None:
+        def on_message(message: ReceiveMessage) -> None:
+            if (
+                not state.discovery_observed
+                and message.topic == state.topics.discovery_probe
+                and message.qos == 1
+                and message.retain is False
+                and message.subscribed_topic == state.topics.discovery_probe
+                and _payload_matches(message.payload, request.panel_nonce)
+            ):
+                state.discovery_observed = True
+                state.discovery_event.set()
+
+        await self._async_subscribe_ha(
+            state,
+            state.topics.discovery_probe,
+            on_message,
+        )
+
+    async def _async_wait_panel_success_evidence(
+        self,
+        state: _PanelValidationState,
+    ) -> OperationError | None:
+        evidence_wait = asyncio.gather(
+            state.panel_request_event.wait(),
+            state.ha_response_event.wait(),
+            state.discovery_event.wait(),
+        )
+        callback_wait = asyncio.create_task(
+            state.callback_failure_event.wait(),
+            name="brilliant-mqtt-panel-preflight-evidence-callback",
+        )
+        try:
+            done, _ = await asyncio.wait(
+                (evidence_wait, callback_wait),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if callback_wait in done and state.callback_failure is not None:
+                evidence_wait.cancel()
+                await asyncio.gather(evidence_wait, return_exceptions=True)
+                return state.callback_failure
+            callback_wait.cancel()
+            await asyncio.gather(callback_wait, return_exceptions=True)
+            await evidence_wait
+            return None
+        except BaseException:
+            for task in (evidence_wait, callback_wait):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(evidence_wait, callback_wait, return_exceptions=True)
+            raise
+
+    async def _async_wait_panel_process(
+        self,
+        state: _PanelValidationState,
+        process: PanelProcess,
+    ) -> tuple[RunResult | None, OperationError | None]:
+        process_wait = asyncio.create_task(
+            process.wait(),
+            name="brilliant-mqtt-panel-preflight-wait",
+        )
+        callback_wait = asyncio.create_task(
+            state.callback_failure_event.wait(),
+            name="brilliant-mqtt-panel-preflight-callback",
+        )
+        try:
+            done, _ = await asyncio.wait(
+                (process_wait, callback_wait),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if callback_wait in done and state.callback_failure is not None:
+                process_wait.cancel()
+                await asyncio.gather(process_wait, return_exceptions=True)
+                return None, state.callback_failure
+            callback_wait.cancel()
+            await asyncio.gather(callback_wait, return_exceptions=True)
+            return process_wait.result(), None
+        except BaseException:
+            for task in (process_wait, callback_wait):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(process_wait, callback_wait, return_exceptions=True)
+            raise
+
+    async def _async_settle_panel_process(
+        self,
+        process: PanelProcess,
+    ) -> tuple[bool, BaseException | None]:
+        settlement = asyncio.create_task(
+            process.wait(),
+            name="brilliant-mqtt-panel-preflight-settlement",
+        )
+        deadline = asyncio.get_running_loop().call_later(
+            self._timeout_seconds,
+            settlement.cancel,
+        )
+        owner = asyncio.current_task()
+        cancellation_count = owner.cancelling() if owner is not None else 0
+        control: BaseException | None = None
+        try:
+            while not settlement.done():
+                try:
+                    await asyncio.shield(settlement)
+                except asyncio.CancelledError as error:
+                    if (
+                        owner is not None
+                        and owner.cancelling() > cancellation_count
+                        and control is None
+                    ):
+                        control = error
+                    if settlement.cancelled():
+                        break
+                except Exception:
+                    break
+        finally:
+            deadline.cancel()
+        failed = False
+        if settlement.cancelled():
+            failed = True
+        elif settlement.done():
+            try:
+                settlement.result()
+            except BaseException as error:
+                if not isinstance(error, Exception):
+                    if control is None:
+                        control = error
+                else:
+                    failed = True
+        return failed, control
+
+    async def _async_cleanup_panel(
+        self,
+        state: _PanelValidationState,
+    ) -> tuple[bool, BaseException | None]:
+        failed = False
+        control: BaseException | None = None
+        actions: list[Callable[[], Awaitable[None]]] = [
+            *(partial(_async_call, unsubscribe) for unsubscribe in state.ha_unsubscribes),
+            partial(
+                mqtt.async_publish,
+                self.hass,
+                state.topics.discovery_probe,
+                b"",
+                qos=1,
+                retain=True,
+            ),
+            partial(
+                mqtt.async_publish,
+                self.hass,
+                state.topics.retained,
+                b"",
+                qos=1,
+                retain=True,
+            ),
+        ]
+        for action in actions:
+            action_failure = await self._async_cleanup_action(action)
+            if action_failure is None:
+                continue
+            if not isinstance(action_failure, Exception):
+                if control is None:
+                    control = action_failure
+            else:
+                failed = True
+        return failed, control
 
     async def _run_stage(
         self,
@@ -423,17 +860,20 @@ class BrokerValidator:
             if (
                 not received.done()
                 and message.topic == state.topics.retained
-                and message.retain is True
                 and _payload_matches(message.payload, nonce)
             ):
-                received.set_result(None)
+                received.set_result(message.retain is True)
 
         await self._async_subscribe_ha(state, state.topics.retained, on_message)
-        await received
+        if await received is not True:
+            raise OperationError.for_code(
+                OperationStage.RETAINED_MESSAGE,
+                "retained_message_invalid",
+            )
 
     async def _async_subscribe_ha(
         self,
-        state: _ValidationState,
+        state: _ValidationState | _PanelValidationState,
         topic: str,
         callback: Callable[[ReceiveMessage], Any],
     ) -> None:
@@ -551,6 +991,137 @@ def _payload_matches(payload: object, expected: str) -> bool:
     if isinstance(payload, bytes):
         return payload == expected.encode()
     return False
+
+
+def _is_panel_process(value: object) -> bool:
+    candidate = cast(Any, value)
+    try:
+        running = candidate.running
+        terminate = candidate.terminate
+        wait = candidate.wait
+    except Exception:
+        return False
+    return isinstance(running, bool) and callable(terminate) and callable(wait)
+
+
+def _parsed_panel_report(
+    result: RunResult,
+    setup_id: UUID,
+) -> tuple[PreflightReport | None, OperationError | None]:
+    invalid = (
+        not isinstance(result, RunResult)
+        or type(result.exit_status) is not int
+        or not isinstance(result.stdout, str)
+        or not isinstance(result.stderr, str)
+    )
+    stdout = result.stdout if isinstance(result, RunResult) else ""
+    if not invalid:
+        encoded_size: int | None = None
+        try:
+            encoded_size = len(stdout.encode("utf-8"))
+        except UnicodeError:
+            pass
+        invalid = (
+            encoded_size is None
+            or encoded_size > MAX_PREFLIGHT_REPORT_BYTES + 1
+            or not stdout.endswith("\n")
+            or "\n" in stdout[:-1]
+            or "\r" in stdout
+        )
+
+    report: PreflightReport | None = None
+    if not invalid:
+        try:
+            report = PreflightReport.from_json(stdout[:-1])
+        except ValueError:
+            pass
+    stdout = ""
+    if report is None or report.setup_id != setup_id:
+        return None, OperationError.for_code(
+            OperationStage.CLEANUP,
+            "operation_failed",
+        )
+    if report.success:
+        if result.exit_status != 0:
+            return None, OperationError.for_code(
+                OperationStage.CLEANUP,
+                "operation_failed",
+            )
+        return report, None
+    if result.exit_status == 0:
+        return None, OperationError.for_code(
+            OperationStage.CLEANUP,
+            "operation_failed",
+        )
+    return None, _panel_report_error(report)
+
+
+def _panel_report_error(report: PreflightReport) -> OperationError:
+    assert report.failed_stage is not None
+    assert report.error_code is not None
+    stage = OperationStage(report.failed_stage.value)
+    code = "operation_failed"
+    if report.failed_stage is PreflightStage.CLEANUP:
+        code = "cleanup_failed"
+    elif report.error_code == "mqtt_timeout":
+        code = {
+            PreflightStage.FLEET_AUTH: "broker_timeout",
+            PreflightStage.PANEL_TO_HA: "panel_to_ha_timeout",
+            PreflightStage.HA_TO_PANEL: "ha_to_panel_timeout",
+            PreflightStage.DISCOVERY_WRITE: "discovery_write_timeout",
+            PreflightStage.RETAINED_MESSAGE: "retained_message_timeout",
+        }.get(report.failed_stage, "operation_failed")
+    elif (
+        report.failed_stage is PreflightStage.DISCOVERY_WRITE
+        and report.error_code == "mqtt_authorization"
+    ):
+        code = "discovery_write_denied"
+    elif (
+        report.failed_stage is PreflightStage.RETAINED_MESSAGE
+        and report.error_code == "retained_flag_missing"
+    ):
+        code = "retained_message_invalid"
+    elif (
+        report.failed_stage is PreflightStage.FLEET_AUTH
+        and report.error_code == "mqtt_authorization"
+    ):
+        code = "fleet_auth_failed"
+    elif report.failed_stage is PreflightStage.FLEET_AUTH and report.error_code == "mqtt_connect":
+        code = "broker_connect_failed"
+    elif (
+        report.failed_stage is PreflightStage.FLEET_AUTH and report.error_code == "settings_invalid"
+    ):
+        code = "panel_settings_invalid"
+
+    error = OperationError.for_code(stage, code)
+    if (
+        report.failed_stage is not PreflightStage.CLEANUP
+        and PreflightStage.CLEANUP not in report.completed_stages
+    ):
+        error = error.with_cleanup_error(_cleanup_error())
+    return error
+
+
+def _panel_evidence_error(state: _PanelValidationState) -> OperationError:
+    if not state.panel_request_observed:
+        return OperationError.for_code(
+            OperationStage.PANEL_TO_HA,
+            "panel_to_ha_timeout",
+        )
+    if not state.ha_response_published:
+        return OperationError.for_code(
+            OperationStage.HA_TO_PANEL,
+            "operation_failed",
+        )
+    if not state.discovery_observed:
+        return OperationError.for_code(
+            OperationStage.DISCOVERY_WRITE,
+            "discovery_write_timeout",
+        )
+    return OperationError.for_code(
+        OperationStage.RETAINED_MESSAGE,
+        "retained_message_timeout",
+    )
 
 
 async def _async_call(callback: Callable[[], Any]) -> None:

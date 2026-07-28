@@ -461,11 +461,19 @@ explicitly accepts fail-closed rebind behavior.
 After confirmation, show Home Assistant config-flow progress rather than
 holding a form submission open.
 
-The provisioner uploads a staged release and normalized environment file but
-does not enable or replace the active service. A temporary preflight command
-from the staged package uses the same bundled aiomqtt/Paho stack, broker
-profile, TLS assets, and credentials as the agent. It does not open a Brilliant
-message-bus peer.
+Before its first panel write, the provisioner records durable intent and then
+uploads a transaction-owned immutable release and normalized environment file
+without enabling or replacing the active service. A custom public CA lives
+inside that release, is hash-verified during upload, and is removed with a
+failed candidate. A temporary preflight command from the staged package uses
+the same bundled aiomqtt/Paho stack, broker profile, TLS assets, and credentials
+as the agent. It does not open a Brilliant message-bus peer.
+
+The preflight command never shell-sources the systemd environment file. It
+passes the path to a bounded parser that opens a regular file without following
+symlinks and accepts only the integration renderer's allowlisted grammar.
+Shell metacharacters in credentials remain literal data. The renderer and
+parser both enforce systemd's UTF-8 scalar restrictions.
 
 The panel preflight participates in a nonce exchange with `BrokerValidator` and
 proves:
@@ -482,12 +490,14 @@ The temporary process exits and disconnects before activation.
 
 ### Step 4: Activate and verify
 
-Subscribe to the panel's health topics and record a durable provisioning
-transaction before activation. Then atomically install the staged
-release/config and start the service. Onboarding waits for:
+Subscribe to the panel's health topics. Activation confirms every incumbent
+core service is stopped, then marks a boundary with the candidate version and
+transaction deployment ID before it atomically installs the staged
+release/config and starts the service. Onboarding waits for:
 
 - a fresh, non-replayed panel availability publication of `online`;
-- a fresh bridge metadata publication with the expected agent version;
+- a fresh bridge metadata publication with both the expected agent version and
+  exact transaction deployment ID;
 - a fresh initial state publication;
 - fresh normal discovery publications.
 
@@ -654,13 +664,16 @@ root passwords, private keys, tokens, or unredacted environment files.
 
 - Broker-validation failure creates no fleet entry.
 - Panel preflight failure never enables or replaces the service.
-- A durable provisioning journal is written before activation and recovered on
-  Home Assistant startup. Recovery either completes health verification and
-  creates the subentry or rolls the panel back before deleting the journal.
-- First-install activation failure leaves no active partial service; staged
-  files may remain only as a versioned, inactive retry artifact.
-- Upgrade activation failure restores the previous release, environment file,
-  unit state, and component selection.
+- A durable provisioning journal is written before the first staging write and
+  recovered on Home Assistant startup. Recovery either completes health
+  verification and creates the subentry or rolls the panel back before
+  deleting the journal.
+- First-install activation failure leaves no active partial service. Verified
+  compensation removes the failed transaction's candidate release before
+  clearing the journal.
+- Upgrade activation failure restores the exact previous release, environment
+  file, unit state, and component selection, including legitimate partial
+  legacy service residue, then removes the failed candidate.
 - Broker-change failure halts before touching another panel, preserves the
   per-panel old/new state in its journal, and offers explicit reversion of each
   already-switched panel. Automatic cross-panel rollback is not a v1 guarantee.
@@ -669,6 +682,9 @@ root passwords, private keys, tokens, or unredacted environment files.
   ownership manifest or strict legacy fallback.
 - Cleanup or rollback failure is never hidden behind the original error. It
   creates a repair issue containing both failures and the safe manual action.
+- After fresh health is durably recorded, a bounded graceful SSH-close failure
+  does not reopen and roll back the healthy panel. Explicit cancellation before
+  config-entry ownership handoff still performs the exact rollback.
 
 Runtime outages do not block Home Assistant startup. The fleet loads degraded
 and reconnects with bounded exponential backoff. One broker outage produces one

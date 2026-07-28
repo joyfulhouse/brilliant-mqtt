@@ -236,6 +236,18 @@ transport in this release.
 - **Retry:** Verify TLS manually today; retry the validator when using the
   forthcoming fleet-onboarding flow.
 
+<a id="mqtt-panel-configuration"></a>
+## Staged panel configuration
+
+- **Cause:** The generated panel environment is missing a required field, has
+  an invalid value, or does not match the transaction-owned TLS assets.
+- **Check:** Recheck the broker host, port, username, password, TLS selection,
+  and custom CA. The panel error intentionally does not echo those values.
+- **Fix:** Correct the fleet broker settings or CA, then let onboarding render
+  and stage a new transaction; do not hand-edit the staged environment.
+- **Retry:** Select **Retry** in fleet onboarding. The invalid candidate stays
+  inactive and is cleaned before another transaction proceeds.
+
 <a id="mqtt-validation"></a>
 ## Forthcoming fleet-onboarding validation
 

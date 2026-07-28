@@ -6,7 +6,7 @@ import asyncio
 import base64
 import binascii
 import re
-from collections.abc import Mapping
+from collections.abc import Coroutine, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -14,7 +14,8 @@ from typing import Any, Self
 from uuid import RFC_4122, UUID
 
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.storage import Store
+from homeassistant.helpers.storage import Store as HomeAssistantStore
+from homeassistant.util import json as json_util
 
 from .broker import BrokerKind
 from .shell import HostIdentity, PanelIdentityError, known_hosts_line
@@ -22,6 +23,8 @@ from .shell import HostIdentity, PanelIdentityError, known_hosts_line
 JOURNAL_STORAGE_VERSION = 1
 JOURNAL_STORAGE_KEY = "brilliant_mqtt.provisioning"
 _JOURNAL_COORDINATOR_KEY = "brilliant_mqtt.provisioning_journal.coordinator"
+_STORE_LOAD_TIMEOUT_SECONDS = 30.0
+_MISSING = object()
 
 _MAX_SECRET_BYTES = 16 * 1024
 _MAX_FILE_BYTES = 1024 * 1024
@@ -34,6 +37,47 @@ _SSH_USERNAME = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 _VERSION_PATTERN = r"[0-9A-Za-z][0-9A-Za-z._+-]{0,127}"
 _VERSION = re.compile(rf"^{_VERSION_PATTERN}$")
 _RELEASE_TARGET = re.compile(rf"^/var/brilliant-mqtt/releases/{_VERSION_PATTERN}--[0-9a-f]{{32}}$")
+
+
+def _load_json_or_missing(path: str) -> object:
+    return json_util.load_json(path, _MISSING)  # type: ignore[arg-type]
+
+
+class Store(HomeAssistantStore[dict[str, Any]]):
+    """Strict Store variant for safety-critical provisioning state."""
+
+    async def async_load(self) -> dict[str, Any] | None:
+        """Read exact on-disk state and fail closed on malformed storage."""
+        raw: object = await self.hass.async_add_executor_job(
+            _load_json_or_missing,
+            self.path,
+        )
+        if raw is _MISSING:
+            return None
+        if (
+            not isinstance(raw, dict)
+            or frozenset(raw) != frozenset({"version", "minor_version", "key", "data"})
+            or raw["version"] != self.version
+            or raw["minor_version"] != self.minor_version
+            or raw["key"] != self.key
+            or not isinstance(raw["data"], dict)
+        ):
+            raise ValueError("invalid_provisioning_store_envelope")
+        return raw["data"]
+
+    async def async_save(self, data: dict[str, Any]) -> None:
+        """Atomically write once and propagate serialization or I/O failures."""
+        envelope = {
+            "version": self.version,
+            "minor_version": self.minor_version,
+            "key": self.key,
+            "data": data,
+        }
+        # Store.async_save logs and swallows WriteError. This protected primitive
+        # retains Store's atomic/private encoding while preserving failure.
+        await self._async_write_data(envelope)
+
+
 _RECORD_KEYS = frozenset(
     {
         "transaction_id",
@@ -547,22 +591,32 @@ class StoredPanelSnapshot:
             if (
                 not isinstance(self.active_release_target, str)
                 or _RELEASE_TARGET.fullmatch(self.active_release_target) is None
+                or self.version_file.content is None
             ):
                 raise _invalid()
         elif self.active_release_target is not None:
             raise _invalid()
 
+        selected_from_units = tuple(
+            component_id
+            for component_id, service in (
+                ("bridge", self.bridge_service),
+                ("wifi_watchdog", self.wifi_watchdog_service),
+                ("bus_watchdog", self.bus_watchdog_service),
+            )
+            if service.unit_file.content is not None
+        )
         files_absent = (
             self.environment_file.content is None
             and self.version_file.content is None
-            and self.bridge_service.unit_file.content is None
-            and self.wifi_watchdog_service.unit_file.content is None
-            and self.bus_watchdog_service.unit_file.content is None
+            and not selected_from_units
         )
         if self.layout is StoredPanelLayout.ABSENT:
             if not files_absent or selected_components:
                 raise _invalid()
-        elif (
+        elif set(selected_components) != set(selected_from_units):
+            raise _invalid()
+        elif self.layout is StoredPanelLayout.RELEASE_LINK and (
             self.environment_file.content is None
             or self.bridge_service.unit_file.content is None
             or not selected_components
@@ -739,13 +793,57 @@ class _JournalCoordinator:
     record: ProvisioningRecord | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _StorageSettlement:
+    """One storage operation settled without losing caller cancellation."""
+
+    result: object
+    error: BaseException | None
+    cancellation: asyncio.CancelledError | None
+
+
+async def _async_settle_storage(
+    hass: HomeAssistant,
+    operation: Coroutine[Any, Any, object],
+) -> _StorageSettlement:
+    """Keep the journal lock until an executor-backed side effect has settled."""
+    task = hass.async_create_task(
+        operation,
+        "brilliant_mqtt provisioning storage",
+        eager_start=False,
+    )
+    cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as error:
+            if cancellation is None:
+                cancellation = error
+            if task.done():
+                break
+        except BaseException:
+            break
+    result: object = None
+    failure: BaseException | None = None
+    try:
+        result = task.result()
+    except BaseException as error:
+        failure = error
+    return _StorageSettlement(
+        result=result,
+        error=failure,
+        cancellation=cancellation,
+    )
+
+
 class ProvisioningJournal:
     """Serialize one provisioning transaction before every observable phase change."""
 
-    __slots__ = ("_coordinator", "_store")
+    __slots__ = ("_coordinator", "_hass", "_store")
 
     def __init__(self, hass: HomeAssistant) -> None:
-        self._store: Store[dict[str, Any]] = Store(
+        self._hass = hass
+        self._store: Store = Store(
             hass,
             JOURNAL_STORAGE_VERSION,
             JOURNAL_STORAGE_KEY,
@@ -839,6 +937,18 @@ class ProvisioningJournal:
             await self._async_remove()
             return record
 
+    async def async_clear_committed(
+        self,
+        transaction_id: UUID,
+    ) -> ProvisioningRecord:
+        """Retry removal after the durable committed phase already proves creation."""
+        async with self._coordinator.lock:
+            record = await self._async_current(transaction_id)
+            if record.phase is not ProvisioningPhase.COMMITTED:
+                raise ProvisioningJournalError("invalid_journal_transition")
+            await self._async_remove()
+            return record
+
     async def async_complete_rollback(
         self,
         transaction_id: UUID,
@@ -874,7 +984,8 @@ class ProvisioningJournal:
         load_failed = False
         raw: dict[str, Any] | None = None
         try:
-            raw = await self._store.async_load()
+            async with asyncio.timeout(_STORE_LOAD_TIMEOUT_SECONDS):
+                raw = await self._store.async_load()
         except Exception:
             load_failed = True
         if load_failed:
@@ -907,23 +1018,56 @@ class ProvisioningJournal:
         return record
 
     async def _async_save(self, record: ProvisioningRecord) -> None:
-        save_failed = False
-        try:
-            await self._store.async_save({"record": record._to_storage()})
-        except Exception:
-            save_failed = True
-        if save_failed:
+        payload = {"record": record._to_storage()}
+        save_outcome = await _async_settle_storage(
+            self._hass,
+            self._store.async_save(payload),
+        )
+        cancellation = save_outcome.cancellation
+        save_failed = save_outcome.error is not None
+        del save_outcome
+        verification_failed = True
+        if not save_failed:
+            verification = await _async_settle_storage(
+                self._hass,
+                self._store.async_load(),
+            )
+            if cancellation is None:
+                cancellation = verification.cancellation
+            verification_failed = verification.error is not None or verification.result != payload
+            del verification
+        if save_failed or verification_failed:
+            if cancellation is not None:
+                raise cancellation from None
             raise ProvisioningJournalError("journal_save_failed")
         self._coordinator.record = record
         self._coordinator.loaded = True
+        if cancellation is not None:
+            raise cancellation from None
 
     async def _async_remove(self) -> None:
-        remove_failed = False
-        try:
-            await self._store.async_remove()
-        except Exception:
-            remove_failed = True
-        if remove_failed:
+        remove_outcome = await _async_settle_storage(
+            self._hass,
+            self._store.async_remove(),
+        )
+        cancellation = remove_outcome.cancellation
+        remove_failed = remove_outcome.error is not None
+        del remove_outcome
+        verification_failed = True
+        if not remove_failed:
+            verification = await _async_settle_storage(
+                self._hass,
+                self._store.async_load(),
+            )
+            if cancellation is None:
+                cancellation = verification.cancellation
+            verification_failed = verification.error is not None or verification.result is not None
+            del verification
+        if remove_failed or verification_failed:
+            if cancellation is not None:
+                raise cancellation from None
             raise ProvisioningJournalError("journal_remove_failed")
         self._coordinator.record = None
         self._coordinator.loaded = True
+        if cancellation is not None:
+            raise cancellation from None

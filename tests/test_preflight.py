@@ -10,6 +10,8 @@ import subprocess
 import sys
 import threading
 from collections.abc import Awaitable, Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -799,6 +801,30 @@ def test_request_maps_json_integer_digit_limit_to_stable_validation_error() -> N
         PreflightRequest.from_json(raw)
 
 
+def test_internal_failure_is_raise_safe_and_logically_immutable() -> None:
+    @contextmanager
+    def passthrough() -> Iterator[None]:
+        yield
+
+    error = preflight_module._Failure(
+        PreflightStage.DISCOVERY_WRITE,
+        "mqtt_timeout",
+        "MQTT stage timed out",
+    )
+
+    with pytest.raises(preflight_module._Failure) as raised:
+        with passthrough():
+            raise error
+
+    assert raised.value is error
+    assert raised.value.__traceback__ is not None
+    with pytest.raises(FrozenInstanceError):
+        error.args = ("raw-secret",)
+    with pytest.raises(FrozenInstanceError):
+        del error.code
+    assert error.code == "mqtt_timeout"
+
+
 async def test_success_uses_exact_order_nonces_qos_retain_and_canonical_report(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -957,7 +983,7 @@ async def test_mqtt_operation_failures_map_to_stable_stage_codes(
     ],
 )
 async def test_ha_result_requires_exact_valid_setup_and_nonces(payload: str) -> None:
-    request = _request()
+    request = _request(timeout_seconds=0.01)
     topics = SetupTopics.for_id(request.setup_id)
     mqtt = _successful_mqtt(request)
 
@@ -971,15 +997,15 @@ async def test_ha_result_requires_exact_valid_setup_and_nonces(payload: str) -> 
 
     assert report.success is False
     assert report.failed_stage is PreflightStage.HA_TO_PANEL
-    assert report.error_code == "mqtt_payload"
-    assert report.detail == "MQTT payload validation failed"
+    assert report.error_code == "mqtt_timeout"
+    assert report.detail == "MQTT stage timed out"
 
 
 @pytest.mark.parametrize(
     ("payload", "retained", "error_code"),
     [
         (PANEL_NONCE, False, "retained_flag_missing"),
-        ("wrong-retained-payload", True, "mqtt_payload"),
+        ("wrong-retained-payload", True, "mqtt_timeout"),
     ],
 )
 async def test_retained_replay_requires_exact_payload_and_retained_flag(
@@ -987,7 +1013,7 @@ async def test_retained_replay_requires_exact_payload_and_retained_flag(
     retained: bool,
     error_code: str,
 ) -> None:
-    request = _request()
+    request = _request(timeout_seconds=0.01)
     topics = SetupTopics.for_id(request.setup_id)
     mqtt = _successful_mqtt(request)
 
@@ -1011,7 +1037,7 @@ async def test_retained_replay_requires_exact_payload_and_retained_flag(
         ("retained", PreflightStage.RETAINED_MESSAGE),
     ],
 )
-async def test_real_adapter_invalid_utf8_on_exact_validation_topic_maps_to_mqtt_payload(
+async def test_real_adapter_invalid_utf8_on_exact_validation_topic_times_out(
     payload_target: str,
     failed_stage: PreflightStage,
     monkeypatch: pytest.MonkeyPatch,
@@ -1036,14 +1062,14 @@ async def test_real_adapter_invalid_utf8_on_exact_validation_topic_maps_to_mqtt_
 
     assert report.success is False
     assert report.failed_stage is failed_stage
-    assert report.error_code == "mqtt_payload"
-    assert report.detail == "MQTT payload validation failed"
+    assert report.error_code == "mqtt_timeout"
+    assert report.detail == "MQTT stage timed out"
     assert client.exit_attempts == 1
     assert "malformed-payload-secret" not in report.to_json()
     assert "malformed-payload-secret" not in caplog.text
 
 
-async def _assert_malformed_payload_beats_pending_ack(
+async def _assert_malformed_payload_does_not_override_pending_ack_timeout(
     *,
     pending_operation_name: str,
     failed_stage: PreflightStage,
@@ -1114,8 +1140,8 @@ async def _assert_malformed_payload_beats_pending_ack(
     assert cleanup_finished_before_release is True
     assert report.success is False
     assert report.failed_stage is failed_stage
-    assert report.error_code == "mqtt_payload"
-    assert report.detail == "MQTT payload validation failed"
+    assert report.error_code == "mqtt_timeout"
+    assert report.detail == "MQTT stage timed out"
     assert [item for item in client.operations if item in cleanup_operations] == cleanup_operations
     assert client.exit_attempts == 1
     assert loop_contexts == []
@@ -1125,23 +1151,23 @@ async def _assert_malformed_payload_beats_pending_ack(
     assert raw_cancellation_error not in caplog.text
 
 
-async def test_real_adapter_invalid_utf8_beats_pending_request_puback(
+async def test_real_adapter_invalid_utf8_does_not_override_pending_request_puback(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    await _assert_malformed_payload_beats_pending_ack(
+    await _assert_malformed_payload_does_not_override_pending_ack_timeout(
         pending_operation_name="publish",
-        failed_stage=PreflightStage.HA_TO_PANEL,
+        failed_stage=PreflightStage.PANEL_TO_HA,
         monkeypatch=monkeypatch,
         caplog=caplog,
     )
 
 
-async def test_real_adapter_invalid_utf8_retained_replay_beats_pending_suback(
+async def test_real_adapter_invalid_utf8_does_not_override_pending_retained_suback(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    await _assert_malformed_payload_beats_pending_ack(
+    await _assert_malformed_payload_does_not_override_pending_ack_timeout(
         pending_operation_name="subscribe",
         failed_stage=PreflightStage.RETAINED_MESSAGE,
         monkeypatch=monkeypatch,
@@ -1353,7 +1379,7 @@ async def test_detached_cleanup_consumes_post_cancellation_failure_and_drains_tr
 
 
 async def test_ordinary_failure_still_clears_both_probes_unsubscribes_and_disconnects() -> None:
-    request = _request()
+    request = _request(timeout_seconds=0.01)
     topics = SetupTopics.for_id(request.setup_id)
     mqtt = _successful_mqtt(request)
 
@@ -1365,7 +1391,7 @@ async def test_ordinary_failure_still_clears_both_probes_unsubscribes_and_discon
 
     report = await async_run_preflight(_settings(), request, mqtt_factory=lambda *args, **kw: mqtt)
 
-    assert report.error_code == "mqtt_payload"
+    assert report.error_code == "mqtt_timeout"
     assert [item[:3] for item in mqtt.events if item[0] == "publish" and item[2] == ""] == [
         ("publish", topics.discovery_probe, ""),
         ("publish", topics.retained, ""),
@@ -1443,8 +1469,8 @@ async def test_internal_cleanup_action_cancellation_is_redacted_and_does_not_ski
     assert raw_error not in caplog.text
 
 
-async def test_internal_cleanup_action_cancellation_preserves_primary_payload_failure() -> None:
-    request = _request()
+async def test_internal_cleanup_action_cancellation_preserves_primary_timeout() -> None:
+    request = _request(timeout_seconds=0.01)
     topics = SetupTopics.for_id(request.setup_id)
     mqtt = _successful_mqtt(request)
     cleanup_actions = [
@@ -1469,8 +1495,8 @@ async def test_internal_cleanup_action_cancellation_preserves_primary_payload_fa
 
     assert report.success is False
     assert report.failed_stage is PreflightStage.HA_TO_PANEL
-    assert report.error_code == "mqtt_payload"
-    assert report.detail == "MQTT payload validation failed"
+    assert report.error_code == "mqtt_timeout"
+    assert report.detail == "MQTT stage timed out"
     assert [event for event in mqtt.events if event in cleanup_actions] == cleanup_actions
 
 
@@ -1819,13 +1845,16 @@ async def test_cli_valid_request_maps_settings_failure_to_one_redacted_json_line
         captured.out
         == _canonical(
             {
-                "completed_stages": [],
-                "detail": "MQTT connection failed",
-                "error_code": "mqtt_connect",
+                "completed_stages": ["cleanup"],
+                "detail": "Panel configuration invalid",
+                "error_code": "settings_invalid",
                 "failed_stage": "fleet_auth",
                 "schema_version": 1,
                 "setup_id": SETUP_ID,
-                "stage_elapsed_ms": {},
+                "stage_elapsed_ms": {
+                    "cleanup": 0,
+                    "fleet_auth": 0,
+                },
                 "success": False,
             }
         )
@@ -1834,6 +1863,9 @@ async def test_cli_valid_request_maps_settings_failure_to_one_redacted_json_line
     assert captured.err == ""
     assert raw_secret not in captured.out
     assert raw_secret not in captured.err
+    assert PreflightReport.from_json(captured.out[:-1]).completed_stages == (
+        PreflightStage.CLEANUP,
+    )
 
 
 async def test_cli_malformed_provided_request_maps_to_one_redacted_json_line(
@@ -1901,18 +1933,200 @@ def test_cli_subprocess_redacts_invalid_environment_value() -> None:
     assert completed.stdout.count("\n") == 1
     assert completed.stdout == _canonical(json.loads(completed.stdout)) + "\n"
     assert json.loads(completed.stdout) == {
-        "completed_stages": [],
-        "detail": "MQTT connection failed",
-        "error_code": "mqtt_connect",
+        "completed_stages": ["cleanup"],
+        "detail": "Panel configuration invalid",
+        "error_code": "settings_invalid",
         "failed_stage": "fleet_auth",
         "schema_version": 1,
         "setup_id": SETUP_ID,
-        "stage_elapsed_ms": {},
+        "stage_elapsed_ms": {
+            "cleanup": 0,
+            "fleet_auth": 0,
+        },
         "success": False,
     }
     assert completed.stderr == ""
     assert raw_secret not in completed.stdout
     assert raw_secret not in completed.stderr
+
+
+def test_environment_file_loader_treats_shell_syntax_as_literal(
+    tmp_path: Path,
+) -> None:
+    command_substitution = tmp_path / "command-substitution-ran"
+    backtick = tmp_path / "backtick-ran"
+    password = f"$(touch {command_substitution})`touch {backtick}`$HOME"
+    environment_file = tmp_path / "brilliant-mqtt.env"
+    environment_file.write_text(
+        "\n".join(
+            (
+                'BRILLIANT_PANEL="office"',
+                'MQTT_HOST="broker.internal.example"',
+                "MQTT_PORT=8883",
+                'MQTT_USERNAME="preflight-user"',
+                f'MQTT_PASSWORD="{password}"',
+                "MQTT_TLS_ENABLED=0",
+                "RETAINED_TOPICS_FILE=/var/brilliant-mqtt/state/owned-topics.json",
+                "MESH_PRIORITY=2",
+                "SCENE_BRIDGE_ENABLED=0",
+                "LOG_LEVEL=INFO",
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    settings = preflight_module._settings_from_environment_file(str(environment_file))
+
+    assert settings.mqtt_password == password
+    assert settings.mqtt_username == "preflight-user"
+    assert not command_substitution.exists()
+    assert not backtick.exists()
+
+
+@pytest.mark.parametrize(
+    "separator",
+    ["\v", "\f", "\x85", "\u2028", "\u2029"],
+    ids=["vertical-tab", "form-feed", "next-line", "line-separator", "paragraph-separator"],
+)
+def test_environment_file_loader_preserves_non_lf_password_characters(
+    tmp_path: Path,
+    separator: str,
+) -> None:
+    password = f"before{separator}after"
+    environment_file = tmp_path / "brilliant-mqtt.env"
+    environment_file.write_text(
+        "\n".join(
+            (
+                'BRILLIANT_PANEL="office"',
+                'MQTT_HOST="broker.internal.example"',
+                'MQTT_USERNAME="preflight-user"',
+                f'MQTT_PASSWORD="{password}"',
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    settings = preflight_module._settings_from_environment_file(str(environment_file))
+
+    assert settings.mqtt_password == password
+
+
+@pytest.mark.parametrize(
+    "invalid_character",
+    [
+        "\ufeff",
+        "\ufdd0",
+        "\ufdef",
+        "\ufffe",
+        "\uffff",
+        "\U0001fffe",
+        "\U0010ffff",
+    ],
+)
+def test_environment_file_loader_rejects_systemd_invalid_unicode(
+    tmp_path: Path,
+    invalid_character: str,
+) -> None:
+    environment_file = tmp_path / "brilliant-mqtt.env"
+    environment_file.write_text(
+        "\n".join(
+            (
+                'BRILLIANT_PANEL="office"',
+                'MQTT_HOST="broker.internal.example"',
+                'MQTT_USERNAME="preflight-user"',
+                f'MQTT_PASSWORD="before{invalid_character}after"',
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="invalid_preflight_environment"):
+        preflight_module._settings_from_environment_file(str(environment_file))
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        'LD_PRELOAD="/tmp/attacker.so"',
+        "MQTT_PASSWORD=$(touch /tmp/SHOULD_NOT_EXIST)",
+        'MQTT_PASSWORD="unterminated',
+        'MQTT_PASSWORD="bad\\qescape"',
+        'MQTT_PASSWORD="premature"quote"',
+    ],
+)
+def test_environment_file_loader_rejects_noncanonical_input(
+    tmp_path: Path,
+    line: str,
+) -> None:
+    environment_file = tmp_path / "brilliant-mqtt.env"
+    environment_file.write_text(
+        "\n".join(
+            (
+                'BRILLIANT_PANEL="office"',
+                'MQTT_HOST="broker.internal.example"',
+                'MQTT_USERNAME="preflight-user"',
+                line,
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="invalid_preflight_environment"):
+        preflight_module._settings_from_environment_file(str(environment_file))
+
+
+async def test_cli_environment_file_supplies_literal_settings(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    environment_file = tmp_path / "brilliant-mqtt.env"
+    password = "literal-$USER-`id`-$(id)"
+    environment_file.write_text(
+        "\n".join(
+            (
+                'BRILLIANT_PANEL="office"',
+                'MQTT_HOST="broker.internal.example"',
+                'MQTT_USERNAME="preflight-user"',
+                f'MQTT_PASSWORD="{password}"',
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+    expected = PreflightReport(
+        setup_id=UUID(SETUP_ID),
+        success=True,
+        completed_stages=tuple(PreflightStage),
+        stage_elapsed_ms={stage: 0 for stage in PreflightStage},
+        last_stage=PreflightStage.CLEANUP,
+    )
+
+    async def runner(
+        settings: Settings,
+        request: PreflightRequest,
+    ) -> PreflightReport:
+        assert settings.mqtt_password == password
+        assert request.setup_id == UUID(SETUP_ID)
+        return expected
+
+    code = await preflight_module.async_main(
+        [
+            "--environment-file",
+            str(environment_file),
+            "--request-json",
+            _canonical(REQUEST_OBJECT),
+        ],
+        runner=runner,
+    )
+
+    captured = capsys.readouterr()
+    assert code == 0
+    assert captured.out == f"{expected.to_json()}\n"
+    assert captured.err == ""
 
 
 def test_cli_help_explains_required_argument_and_outer_process_deadline(

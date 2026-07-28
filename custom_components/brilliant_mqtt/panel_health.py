@@ -7,7 +7,7 @@ import json
 import math
 import re
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import FrozenInstanceError, dataclass
 from time import monotonic
 from typing import Any
 
@@ -26,6 +26,16 @@ _MAX_JSON_DEPTH = 64
 _MAX_JSON_NODES = 4096
 _PANEL_SLUG = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _AGENT_VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$")
+_DEPLOYMENT_ID = re.compile(r"^[0-9a-f]{32}$")
+_RUNTIME_EXCEPTION_ATTRIBUTES = frozenset(
+    {
+        "__cause__",
+        "__context__",
+        "__notes__",
+        "__suppress_context__",
+        "__traceback__",
+    }
+)
 
 _ERROR_RETRYABLE = {
     "panel_health_invalid_request": False,
@@ -44,9 +54,9 @@ _ERROR_RETRYABLE = {
 }
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class PanelHealthError(Exception):
-    """Allowlisted health failure which never retains MQTT or broker details."""
+    """Logically immutable health failure with writable exception internals."""
 
     code: str
 
@@ -55,6 +65,23 @@ class PanelHealthError(Exception):
             raise ValueError("invalid_panel_health_error")
         Exception.__init__(self, self.code)
         object.__setattr__(self, "__suppress_context__", True)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        """Keep public state frozen while supporting normal exception raising."""
+        if name == "code" and not hasattr(self, "code"):
+            object.__setattr__(self, name, value)
+            return
+        if name in _RUNTIME_EXCEPTION_ATTRIBUTES:
+            BaseException.__setattr__(self, name, value)
+            return
+        raise FrozenInstanceError(f"cannot assign to field {name!r}")
+
+    def __delattr__(self, name: str) -> None:
+        """Allow only Python's mutable BaseException bookkeeping."""
+        if name in _RUNTIME_EXCEPTION_ATTRIBUTES:
+            BaseException.__delattr__(self, name)
+            return
+        raise FrozenInstanceError(f"cannot delete field {name!r}")
 
     @property
     def retryable(self) -> bool:
@@ -72,6 +99,7 @@ class PanelHealthEvidence:
 
     panel: str
     agent_version: str
+    deployment_id: str
     state_topic: str
     discovery_topic: str
     device_identifier: str
@@ -81,6 +109,7 @@ class PanelHealthEvidence:
         return {
             "panel": self.panel,
             "agent_version": self.agent_version,
+            "deployment_id": self.deployment_id,
             "state_topic": self.state_topic,
             "discovery_topic": self.discovery_topic,
             "device_identifier": self.device_identifier,
@@ -101,9 +130,11 @@ class PanelHealthObserver:
         "_closed",
         "_discovery_topics",
         "_error",
+        "_expected_deployment_id",
         "_expected_version",
         "_hass",
         "_meta_version",
+        "_meta_deployment_id",
         "_online_seen",
         "_panel",
         "_state_topics",
@@ -141,7 +172,9 @@ class PanelHealthObserver:
         self._activated_at: float | None = None
         self._online_seen = False
         self._expected_version: str | None = None
+        self._expected_deployment_id: str | None = None
         self._meta_version: str | None = None
+        self._meta_deployment_id: str | None = None
         self._state_topics: set[str] = set()
         self._discovery_topics: set[str] = set()
         self._error: PanelHealthError | None = None
@@ -184,12 +217,22 @@ class PanelHealthObserver:
         self._subscribed = True
 
     @callback
-    def mark_activation_started(self) -> None:
-        """Set the one-shot boundary after subscriptions and before activation."""
+    def mark_activation_started(
+        self,
+        expected_version: str,
+        expected_deployment_id: str,
+    ) -> None:
+        """Set candidate identity at the stop-confirmed activation boundary."""
         if not self._subscribed or self._closed:
             raise PanelHealthError("panel_health_not_subscribed")
         if self._activated_at is not None:
             raise PanelHealthError("panel_health_activation_already_started")
+        if not _valid_agent_version(expected_version) or not _valid_deployment_id(
+            expected_deployment_id
+        ):
+            raise PanelHealthError("panel_health_invalid_request")
+        self._expected_version = expected_version
+        self._expected_deployment_id = expected_deployment_id
         self._activated_at = monotonic()
         self._clear_session()
         self._updated.set()
@@ -207,14 +250,11 @@ class PanelHealthObserver:
             raise PanelHealthError("panel_health_activation_not_started")
         if self._waiting:
             raise PanelHealthError("panel_health_already_waiting")
-        if not _valid_agent_version(expected_version) or not _valid_timeout(timeout):
+        if expected_version != self._expected_version or not _valid_timeout(timeout):
             self._close_suppressing_errors()
             raise PanelHealthError("panel_health_invalid_request")
 
         self._waiting = True
-        self._expected_version = expected_version
-        if self._meta_version is not None and self._meta_version != expected_version:
-            self._set_error("panel_health_version_mismatch")
 
         try:
             timed_out = False
@@ -296,15 +336,18 @@ class PanelHealthObserver:
             await self._updated.wait()
 
     def _evidence(self) -> PanelHealthEvidence | None:
-        if not self._online_seen or self._meta_version is None:
+        if not self._online_seen or self._meta_version is None or self._meta_deployment_id is None:
             return None
         if self._expected_version is None or self._meta_version != self._expected_version:
+            return None
+        if self._meta_deployment_id != self._expected_deployment_id:
             return None
         if not self._state_topics or not self._discovery_topics:
             return None
         return PanelHealthEvidence(
             panel=self._panel,
             agent_version=self._meta_version,
+            deployment_id=self._meta_deployment_id,
             state_topic=min(self._state_topics),
             discovery_topic=min(self._discovery_topics),
             device_identifier=self._device_identifier,
@@ -352,8 +395,19 @@ class PanelHealthObserver:
             self._set_error("panel_health_payload_invalid")
             return
 
+        deployment_id = payload.get("deployment_id")
+        if not _valid_deployment_id(deployment_id) or deployment_id != self._expected_deployment_id:
+            # A stopped incumbent can still have QoS 1 publications queued at
+            # the broker. Candidate identity makes those messages stale rather
+            # than a false version failure, independent of broker ordering.
+            self._clear_session()
+            self._updated.set()
+            return
+
         assert isinstance(agent_version, str)
+        assert isinstance(deployment_id, str)
         self._meta_version = agent_version
+        self._meta_deployment_id = deployment_id
         if self._expected_version is not None and agent_version != self._expected_version:
             self._set_error("panel_health_version_mismatch")
             return
@@ -364,7 +418,7 @@ class PanelHealthObserver:
         if (
             message.subscribed_topic != self._state_filter
             or _state_topic_peripheral(message.topic, self._panel) is None
-            or not self._eligible_after_online(message)
+            or not self._eligible_after_candidate_metadata(message)
         ):
             return
         try:
@@ -381,7 +435,7 @@ class PanelHealthObserver:
         if (
             message.subscribed_topic != self._discovery_filter
             or unique_id is None
-            or not self._eligible_after_online(message)
+            or not self._eligible_after_candidate_metadata(message)
         ):
             return
         try:
@@ -434,9 +488,17 @@ class PanelHealthObserver:
     def _eligible_after_online(self, message: ReceiveMessage) -> bool:
         return self._online_seen and self._is_fresh(message)
 
+    def _eligible_after_candidate_metadata(self, message: ReceiveMessage) -> bool:
+        return (
+            self._eligible_after_online(message)
+            and self._meta_version == self._expected_version
+            and self._meta_deployment_id == self._expected_deployment_id
+        )
+
     def _clear_session(self) -> None:
         self._online_seen = False
         self._meta_version = None
+        self._meta_deployment_id = None
         self._state_topics.clear()
         self._discovery_topics.clear()
         self._error = None
@@ -471,6 +533,10 @@ def _valid_timeout(value: float) -> bool:
 
 def _valid_agent_version(value: object) -> bool:
     return isinstance(value, str) and _AGENT_VERSION.fullmatch(value) is not None
+
+
+def _valid_deployment_id(value: object) -> bool:
+    return isinstance(value, str) and _DEPLOYMENT_ID.fullmatch(value) is not None
 
 
 def _decode_payload(payload: object) -> str:

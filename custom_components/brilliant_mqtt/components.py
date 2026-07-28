@@ -288,3 +288,17 @@ def selected_ids(entry_data: Mapping[str, Any]) -> list[str]:
         for c in REGISTRY.values()
         if not c.deprecated and (c.locked or chosen.get(c.id, False))
     ]
+
+
+def selected_core_ids(entry_data: Mapping[str, Any]) -> tuple[str, ...]:
+    """Return only fleet core components in the release contract's fixed order."""
+    selected = set(selected_ids(entry_data))
+    return tuple(
+        component_id
+        for component_id in (
+            COMPONENT_BRIDGE,
+            COMPONENT_WIFI_WATCHDOG,
+            COMPONENT_BUS_WATCHDOG,
+        )
+        if component_id in selected
+    )

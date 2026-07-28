@@ -5,13 +5,17 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import threading
 from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 from uuid import UUID
 
 import pytest
+from homeassistant.core import HomeAssistant
+
 from custom_components.brilliant_mqtt.broker import BrokerKind
 from custom_components.brilliant_mqtt.provisioning_journal import (
     JOURNAL_STORAGE_KEY,
@@ -29,7 +33,9 @@ from custom_components.brilliant_mqtt.provisioning_journal import (
     StoredPanelSnapshot,
     StoredServiceSnapshot,
 )
-from homeassistant.core import HomeAssistant
+from custom_components.brilliant_mqtt.provisioning_journal import (
+    Store as DurableProvisioningStore,
+)
 
 _PUBLIC_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKIykuTed7zNwJwn20eCelcKcHKJ9c/pGFfvulRWazuC"
 _FINGERPRINT = "SHA256:JfCon51dCgE/yWGkyroh3Ne+ONLMm6QmHMQnEoPSLx0"
@@ -53,6 +59,7 @@ class _MemoryStore:
         self.load_error: Exception | None = None
         self.remove_error: Exception | None = None
         self.save_error: Exception | None = None
+        self.drop_save = False
 
     async def async_load(self) -> dict[str, Any] | None:
         if self.load_error is not None:
@@ -62,6 +69,8 @@ class _MemoryStore:
     async def async_save(self, data: dict[str, Any]) -> None:
         if self.save_error is not None:
             raise self.save_error
+        if self.drop_save:
+            return
         copied = copy.deepcopy(data)
         record = copied.get("record")
         phase = record.get("phase") if isinstance(record, dict) else None
@@ -85,12 +94,43 @@ class _BlockingStore(_MemoryStore):
         self.save_started = asyncio.Event()
         self.allow_save = asyncio.Event()
         self.block_save = False
+        self.remove_started = asyncio.Event()
+        self.allow_remove = asyncio.Event()
+        self.block_remove = False
 
     async def async_save(self, data: dict[str, Any]) -> None:
         if self.block_save:
             self.save_started.set()
             await self.allow_save.wait()
         await super().async_save(data)
+
+    async def async_remove(self) -> None:
+        if self.block_remove:
+            self.remove_started.set()
+            await self.allow_remove.wait()
+        await super().async_remove()
+
+
+class _ExecutorBlockingStore(_MemoryStore):
+    """A late executor side effect which models HA's shutdown cancellation race."""
+
+    def __init__(self, hass: HomeAssistant) -> None:
+        super().__init__()
+        self._hass = hass
+        self.save_started = asyncio.Event()
+        self.allow_save = threading.Event()
+
+    async def async_save(self, data: dict[str, Any]) -> None:
+        def save_late() -> None:
+            self._hass.loop.call_soon_threadsafe(self.save_started.set)
+            self.allow_save.wait()
+            copied = copy.deepcopy(data)
+            record = copied.get("record")
+            phase = record.get("phase") if isinstance(record, dict) else None
+            self.events.append(("save", phase if isinstance(phase, str) else None))
+            self.data = copied
+
+        await self._hass.async_add_executor_job(save_late)
 
 
 def _file(content: bytes, mode: int) -> StoredFileSnapshot:
@@ -142,6 +182,36 @@ def _absent_snapshot() -> StoredPanelSnapshot:
     )
 
 
+def test_stored_snapshot_accepts_bridge_less_legacy_watchdog_residue() -> None:
+    absent_file = StoredFileSnapshot(content=None, mode=None)
+    absent_service = StoredServiceSnapshot(
+        unit_file=absent_file,
+        enabled=False,
+        active=False,
+    )
+
+    snapshot = StoredPanelSnapshot(
+        layout=StoredPanelLayout.LEGACY_FIXED,
+        active_release_target=None,
+        environment_file=absent_file,
+        version_file=absent_file,
+        bridge_service=absent_service,
+        wifi_watchdog_service=StoredServiceSnapshot(
+            unit_file=StoredFileSnapshot(
+                content=b"orphaned-wifi-unit",
+                mode=0o644,
+            ),
+            enabled=True,
+            active=False,
+        ),
+        bus_watchdog_service=absent_service,
+        selected_components=("wifi_watchdog",),
+    )
+
+    assert snapshot.selected_components == ("wifi_watchdog",)
+    assert repr(snapshot) == "StoredPanelSnapshot(<redacted>)"
+
+
 def _record(*, phase: ProvisioningPhase = ProvisioningPhase.STAGED) -> ProvisioningRecord:
     return ProvisioningRecord(
         transaction_id=_TRANSACTION_ID,
@@ -168,6 +238,19 @@ def _record(*, phase: ProvisioningPhase = ProvisioningPhase.STAGED) -> Provision
         started_at=datetime(2026, 7, 27, 18, 30, tzinfo=UTC),
         last_error=None,
     )
+
+
+def _write_storage_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+
+def _write_storage_json(path: Path, payload: object) -> None:
+    _write_storage_text(path, json.dumps(payload))
+
+
+def _unlink_storage(path: Path) -> None:
+    path.unlink(missing_ok=True)
 
 
 @pytest.fixture
@@ -637,6 +720,161 @@ async def test_terminal_cleanup_is_restart_safe_when_remove_fails(
     assert memory_store.data is None
 
 
+async def test_committed_phase_is_sufficient_proof_for_restart_cleanup(
+    hass: HomeAssistant,
+    memory_store: _MemoryStore,
+) -> None:
+    journal = _journal(hass, memory_store)
+    await _advance_to(journal, ProvisioningPhase.PENDING_CONFIG_COMMIT)
+    memory_store.remove_error = OSError("first remove failed")
+
+    with pytest.raises(ProvisioningJournalError):
+        await journal.async_complete_commit(
+            _TRANSACTION_ID,
+            subentry_id="01J6H8J0BK5GJPPF3XEGQT71QX",
+        )
+
+    restarted = _journal(hass, memory_store)
+    completed = await restarted.async_clear_committed(_TRANSACTION_ID)
+
+    assert completed.phase is ProvisioningPhase.COMMITTED
+    assert memory_store.events[-1] == ("remove", None)
+    assert memory_store.data is None
+
+
+async def test_clear_committed_rejects_a_nonterminal_record(
+    hass: HomeAssistant,
+    memory_store: _MemoryStore,
+) -> None:
+    journal = _journal(hass, memory_store)
+    await journal.async_create(_record())
+
+    with pytest.raises(ProvisioningJournalError) as raised:
+        await journal.async_clear_committed(_TRANSACTION_ID)
+
+    assert raised.value.code == "invalid_journal_transition"
+    assert memory_store.data is not None
+
+
+async def test_store_normal_return_without_durable_save_fails_closed(
+    hass: HomeAssistant,
+    memory_store: _MemoryStore,
+) -> None:
+    memory_store.drop_save = True
+    journal = _journal(hass, memory_store)
+
+    with pytest.raises(ProvisioningJournalError) as raised:
+        await journal.async_create(_record())
+
+    assert raised.value.code == "journal_save_failed"
+    assert raised.value.__context__ is None
+    assert raised.value.__cause__ is None
+
+
+async def test_cancelled_save_settles_and_verifies_before_releasing_lock(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _BlockingStore()
+    monkeypatch.setattr(
+        "custom_components.brilliant_mqtt.provisioning_journal.Store",
+        lambda *_args, **_kwargs: store,
+    )
+    journal = ProvisioningJournal(hass)
+    store.block_save = True
+
+    create_task = asyncio.create_task(journal.async_create(_record()))
+    await store.save_started.wait()
+    create_task.cancel()
+    await asyncio.sleep(0)
+
+    assert not create_task.done()
+    store.allow_save.set()
+    with pytest.raises(asyncio.CancelledError):
+        await create_task
+    assert store.data is not None
+    assert store.data["record"]["phase"] == ProvisioningPhase.STAGED.value
+
+    with pytest.raises(ProvisioningJournalError) as raised:
+        await journal.async_create(_record())
+
+    assert raised.value.code == "journal_transaction_in_progress"
+
+
+async def test_ha_shutdown_background_cancellation_cannot_release_late_save(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _ExecutorBlockingStore(hass)
+    monkeypatch.setattr(
+        "custom_components.brilliant_mqtt.provisioning_journal.Store",
+        lambda *_args, **_kwargs: store,
+    )
+    journal = ProvisioningJournal(hass)
+    background_before = set(hass._background_tasks)  # noqa: SLF001
+    create_task = asyncio.create_task(journal.async_create(_record()))
+    await asyncio.wait_for(store.save_started.wait(), timeout=1.0)
+
+    newly_background = set(hass._background_tasks) - background_before  # noqa: SLF001
+    completed_before_release = False
+    result: ProvisioningRecord | None = None
+    failure: BaseException | None = None
+    try:
+        for task in newly_background:
+            task.cancel("Home Assistant is stopping")
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        completed_before_release = create_task.done()
+    finally:
+        store.allow_save.set()
+        try:
+            result = await create_task
+        except BaseException as error:
+            failure = error
+
+    assert not completed_before_release
+    assert failure is None
+    assert result == _record()
+    assert store.data is not None
+
+
+async def test_cancelled_remove_settles_before_a_new_transaction_can_start(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _BlockingStore()
+    monkeypatch.setattr(
+        "custom_components.brilliant_mqtt.provisioning_journal.Store",
+        lambda *_args, **_kwargs: store,
+    )
+    journal = ProvisioningJournal(hass)
+    await journal.async_create(_record())
+    pending = await journal.async_transition(
+        _TRANSACTION_ID,
+        ProvisioningPhase.ROLLBACK_PENDING,
+    )
+    assert pending.phase is ProvisioningPhase.ROLLBACK_PENDING
+    store.block_remove = True
+
+    remove_task = asyncio.create_task(
+        journal.async_complete_rollback(_TRANSACTION_ID, verified=True)
+    )
+    await store.remove_started.wait()
+    remove_task.cancel()
+    await asyncio.sleep(0)
+
+    assert not remove_task.done()
+    concurrent_create = asyncio.create_task(journal.async_create(_record()))
+    await asyncio.sleep(0)
+    assert not concurrent_create.done()
+
+    store.allow_remove.set()
+    with pytest.raises(asyncio.CancelledError):
+        await remove_task
+    assert store.data is None
+    assert await concurrent_create == _record()
+
+
 @pytest.mark.parametrize("boundary", ("load", "save"))
 async def test_store_failures_do_not_retain_secret_exception_objects(
     hass: HomeAssistant,
@@ -774,6 +1012,72 @@ async def test_corrupt_storage_fails_with_one_redacted_error(
     assert memory_store.events[-1] == ("save", "staged")
 
 
+@pytest.mark.parametrize("content", ('{"record":', "null"))
+async def test_invalid_on_disk_journal_fails_closed(
+    hass: HomeAssistant,
+    content: str,
+) -> None:
+    storage_path = Path(hass.config.path(".storage", JOURNAL_STORAGE_KEY))
+    await hass.async_add_executor_job(_write_storage_text, storage_path, content)
+    journal = ProvisioningJournal(hass)
+
+    try:
+        with pytest.raises(ProvisioningJournalError) as raised:
+            await journal.async_load()
+        storage_still_exists = await hass.async_add_executor_job(storage_path.exists)
+    finally:
+        await hass.async_add_executor_job(_unlink_storage, storage_path)
+
+    assert raised.value.code == "journal_load_failed"
+    assert raised.value.__context__ is None
+    assert raised.value.__cause__ is None
+    assert storage_still_exists
+
+
+async def test_remove_readback_rejects_present_json_null(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def persist_exactly(
+        store: DurableProvisioningStore,
+        data: dict[str, Any],
+    ) -> None:
+        envelope = {
+            "version": store.version,
+            "minor_version": store.minor_version,
+            "key": store.key,
+            "data": data,
+        }
+        await hass.async_add_executor_job(
+            _write_storage_json,
+            Path(store.path),
+            envelope,
+        )
+
+    async def replace_with_json_null(store: DurableProvisioningStore) -> None:
+        await hass.async_add_executor_job(_write_storage_text, Path(store.path), "null")
+
+    monkeypatch.setattr(DurableProvisioningStore, "async_save", persist_exactly)
+    monkeypatch.setattr(DurableProvisioningStore, "async_remove", replace_with_json_null)
+    journal = ProvisioningJournal(hass)
+    await journal.async_create(_record())
+    await journal.async_transition(
+        _TRANSACTION_ID,
+        ProvisioningPhase.ROLLBACK_PENDING,
+    )
+    storage_path = Path(hass.config.path(".storage", JOURNAL_STORAGE_KEY))
+
+    try:
+        with pytest.raises(ProvisioningJournalError) as raised:
+            await journal.async_complete_rollback(_TRANSACTION_ID, verified=True)
+        storage_still_exists = await hass.async_add_executor_job(storage_path.exists)
+    finally:
+        await hass.async_add_executor_job(_unlink_storage, storage_path)
+
+    assert raised.value.code == "journal_remove_failed"
+    assert storage_still_exists
+
+
 def test_invalid_typed_record_fails_with_a_stable_redacted_error() -> None:
     with pytest.raises(ProvisioningJournalError) as raised:
         replace(
@@ -898,6 +1202,63 @@ def test_legacy_layout_losslessly_preserves_an_absent_version_marker() -> None:
 def test_release_link_layout_requires_a_release_target() -> None:
     with pytest.raises(ProvisioningJournalError) as raised:
         replace(_upgrade_snapshot(), active_release_target=None)
+
+    assert raised.value.code == "invalid_provisioning_journal"
+
+
+def test_release_link_layout_requires_its_exact_version_marker() -> None:
+    absent_file = StoredFileSnapshot(content=None, mode=None)
+
+    with pytest.raises(ProvisioningJournalError) as raised:
+        replace(_upgrade_snapshot(), version_file=absent_file)
+
+    assert raised.value.code == "invalid_provisioning_journal"
+
+
+@pytest.mark.parametrize(
+    ("service_field", "selected_components"),
+    (
+        (
+            "wifi_watchdog_service",
+            ("bridge", "bus_watchdog", "wifi_watchdog"),
+        ),
+        (
+            "bus_watchdog_service",
+            ("bridge", "bus_watchdog", "wifi_watchdog"),
+        ),
+        (
+            "wifi_watchdog_service",
+            ("bridge", "bus_watchdog"),
+        ),
+    ),
+)
+def test_snapshot_component_selection_exactly_matches_owned_unit_files(
+    service_field: str,
+    selected_components: tuple[str, ...],
+) -> None:
+    snapshot = _upgrade_snapshot()
+    absent_file = StoredFileSnapshot(content=None, mode=None)
+    absent_service = StoredServiceSnapshot(
+        unit_file=absent_file,
+        enabled=False,
+        active=False,
+    )
+
+    with pytest.raises(ProvisioningJournalError) as raised:
+        if service_field == "wifi_watchdog_service" and len(selected_components) == 3:
+            replace(
+                snapshot,
+                selected_components=selected_components,
+                wifi_watchdog_service=absent_service,
+            )
+        elif service_field == "bus_watchdog_service":
+            replace(
+                snapshot,
+                selected_components=selected_components,
+                bus_watchdog_service=absent_service,
+            )
+        else:
+            replace(snapshot, selected_components=selected_components)
 
     assert raised.value.code == "invalid_provisioning_journal"
 

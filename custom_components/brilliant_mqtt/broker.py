@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import re
 import ssl
 from collections.abc import AsyncIterator, Mapping
 from contextlib import AbstractAsyncContextManager
-from dataclasses import InitVar, dataclass
+from dataclasses import InitVar, dataclass, field
 from enum import StrEnum
 from types import TracebackType
 from typing import Any, Never, Protocol, Self, SupportsIndex
@@ -32,6 +33,40 @@ class DeviceMqttMessage:
     payload: bytes
     qos: int
     retain: bool
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class PanelBrokerReleaseSettings:
+    """Purpose-limited panel environment and optional public trust material."""
+
+    environment: str = field(repr=False)
+    mqtt_ca: bytes | None = field(default=None, repr=False)
+    mqtt_ca_path: str | None = None
+    deployment_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.environment, str)
+            or not self.environment
+            or (
+                self.deployment_id is not None
+                and re.fullmatch(r"[0-9a-f]{32}", self.deployment_id) is None
+            )
+            or (self.mqtt_ca is None and self.mqtt_ca_path is not None)
+            or (
+                self.mqtt_ca is not None
+                and (
+                    type(self.mqtt_ca) is not bytes
+                    or not self.mqtt_ca
+                    or not isinstance(self.mqtt_ca_path, str)
+                    or not self.mqtt_ca_path
+                )
+            )
+        ):
+            raise ValueError("invalid_panel_broker_release_settings")
+
+    def __repr__(self) -> str:
+        return "PanelBrokerReleaseSettings(<redacted>)"
 
 
 class DeviceMqttClient(Protocol):
@@ -296,6 +331,64 @@ class BrokerProfile(_BrokerSecrets):
             "has_custom_ca": self.has_custom_ca,
             "username_configured": self.username_configured,
         }
+
+    def panel_release_settings(
+        self,
+        *,
+        panel: str,
+        mesh_priority: int,
+        scene_bridge_enabled: bool,
+        mqtt_ca_path: str | None = None,
+        deployment_id: str | None = None,
+    ) -> PanelBrokerReleaseSettings:
+        """Render the panel transport contract without exporting secret fields."""
+        from .panel_ops import render_env
+
+        username = self._username._reveal()
+        password = self._password._reveal()
+        ca_pem = self._ca_pem._reveal() if self._ca_pem is not None else None
+        environment = ""
+        mqtt_ca: bytes | None = None
+        settings: PanelBrokerReleaseSettings | None = None
+        failed = False
+        try:
+            if ca_pem is not None:
+                if not isinstance(mqtt_ca_path, str) or not mqtt_ca_path:
+                    raise ValueError
+                mqtt_ca = ca_pem.encode("utf-8")
+            elif mqtt_ca_path is not None:
+                raise ValueError
+            environment = render_env(
+                panel=panel,
+                mesh_priority=mesh_priority,
+                mqtt_host=self.host,
+                mqtt_port=self.port,
+                mqtt_username=username,
+                mqtt_password=password,
+                scene_bridge_enabled=scene_bridge_enabled,
+                mqtt_tls_enabled=self.tls_enabled,
+                mqtt_tls_ca_file=mqtt_ca_path,
+                deployment_id=deployment_id,
+            )
+            settings = PanelBrokerReleaseSettings(
+                environment=environment,
+                mqtt_ca=mqtt_ca,
+                mqtt_ca_path=mqtt_ca_path,
+                deployment_id=deployment_id,
+            )
+        except Exception:
+            failed = True
+        username = "<redacted>"
+        password = "<redacted>"
+        ca_pem = None
+        environment = "<redacted>"
+        mqtt_ca = None
+        if failed or settings is None:
+            raise OperationError.for_code(
+                OperationStage.BROKER_PROFILE,
+                "invalid_broker_profile",
+            ) from None
+        return settings
 
     def device_client(
         self,

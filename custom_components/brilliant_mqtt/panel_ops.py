@@ -9,21 +9,32 @@ and /etc/systemd/system/brilliant-mqtt.service (see the design spec §7).
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import hashlib
+import json
 import os
 import re
 import secrets
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from enum import StrEnum
+from uuid import RFC_4122, UUID
 
 import asyncssh
 
 from .const import (
     BUS_WATCHDOG_SERVICE_NAME,
+    COMPONENT_BRIDGE,
+    COMPONENT_BUS_WATCHDOG,
+    COMPONENT_WIFI_WATCHDOG,
     DEFAULT_REBOOT_JOURNAL_LINES,
     HA_MIRROR_SERVICE_NAME,
     HUE_CA_TIMER_NAME,
+    PANEL_APP_DIR,
     PANEL_BUS_WATCHDOG_DIR,
     PANEL_BUS_WATCHDOG_UNIT_FILE,
+    PANEL_CURRENT_LINK,
     PANEL_ENV_FILE,
     PANEL_HA_MIRROR_APP_DIR,
     PANEL_HA_MIRROR_ENV_FILE,
@@ -35,10 +46,12 @@ from .const import (
     PANEL_HUE_CA_SERVICE_UNIT_FILE,
     PANEL_HUE_CA_TIMER_UNIT_FILE,
     PANEL_MQTT_TLS_DIR,
+    PANEL_RELEASES_DIR,
     PANEL_RETAINED_TOPICS_FILE,
     PANEL_STAGED_DIR,
     PANEL_UNIT_FILE,
     PANEL_VAR_DIR,
+    PANEL_VENDOR_DIR,
     PANEL_VERSION_FILE,
     PANEL_VOICE_ENV_FILE,
     PANEL_VOICE_STAGED_DIR,
@@ -51,7 +64,8 @@ from .const import (
     VOICE_SERVICE_NAME,
     WIFI_WATCHDOG_SERVICE_NAME,
 )
-from .shell import PanelShell, RunResult
+from .setup_protocol import PreflightRequest
+from .shell import PanelProcess, PanelShell, RunResult
 
 _STAGING_DIR = f"{PANEL_VAR_DIR}.staging"
 _STAGED_UNIT = f"{PANEL_STAGED_DIR}/{SERVICE_NAME}.service"
@@ -64,11 +78,1376 @@ _VOICE_STAGED_ENV = f"{PANEL_VOICE_STAGED_DIR}/{VOICE_SERVICE_NAME}.env"
 _HA_MIRROR_STAGING_DIR = f"{PANEL_HA_MIRROR_APP_DIR}.staging"
 _HA_MIRROR_STAGED_ENV = f"{PANEL_HA_MIRROR_STAGED_DIR}/{HA_MIRROR_SERVICE_NAME}.env"
 
-_MANAGED_MQTT_CA_PATH = re.compile(rf"{re.escape(PANEL_MQTT_TLS_DIR)}/mqtt-ca-[0-9a-f]{{16}}\.pem")
-
 
 class PanelOpError(RuntimeError):
     """A panel shell command exited non-zero."""
+
+
+_CORE_COMPONENT_ORDER = (
+    COMPONENT_BRIDGE,
+    COMPONENT_WIFI_WATCHDOG,
+    COMPONENT_BUS_WATCHDOG,
+)
+_CORE_SERVICES = (
+    (COMPONENT_BRIDGE, SERVICE_NAME, PANEL_UNIT_FILE),
+    (
+        COMPONENT_WIFI_WATCHDOG,
+        WIFI_WATCHDOG_SERVICE_NAME,
+        PANEL_WIFI_WATCHDOG_UNIT_FILE,
+    ),
+    (
+        COMPONENT_BUS_WATCHDOG,
+        BUS_WATCHDOG_SERVICE_NAME,
+        PANEL_BUS_WATCHDOG_UNIT_FILE,
+    ),
+)
+_VERSION_PATTERN = r"[0-9A-Za-z][0-9A-Za-z._+-]{0,127}"
+_VERSION = re.compile(rf"^{_VERSION_PATTERN}$")
+_RELEASE_TARGET = re.compile(
+    rf"^{re.escape(PANEL_RELEASES_DIR)}/{_VERSION_PATTERN}--[0-9a-f]{{32}}$"
+)
+_MANAGED_MQTT_CA_PATH = re.compile(
+    rf"(?:"
+    rf"{re.escape(PANEL_MQTT_TLS_DIR)}/mqtt-ca-[0-9a-f]{{16}}\.pem"
+    rf"|{re.escape(PANEL_RELEASES_DIR)}/{_VERSION_PATTERN}"
+    rf"--[0-9a-f]{{32}}/mqtt-ca\.pem"
+    rf")"
+)
+MAX_SNAPSHOT_FILE_BYTES = 16 * 1024
+MAX_SNAPSHOT_WIRE_BYTES = 24 * 1024
+MAX_MQTT_CA_BYTES = 256 * 1024
+_MAX_LAYOUT_WIRE_BYTES = 4096
+_MAX_VERSION_BYTES = 128
+_PANEL_PYTHON = "/data/switch-embedded/env/bin/python3"
+_PanelPreflightLauncher = Callable[[str], Awaitable[PanelProcess]]
+
+
+class PanelLayout(StrEnum):
+    """Core installation layout captured before a fleet activation."""
+
+    ABSENT = "absent"
+    LEGACY_FIXED = "legacy_fixed"
+    RELEASE_LINK = "release_link"
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class FileSnapshot:
+    """Exact optional owned-file bytes and permission mode."""
+
+    content: bytes | None
+    mode: int | None
+
+    def __post_init__(self) -> None:
+        if self.content is None:
+            if self.mode is not None:
+                raise PanelOpError("invalid_panel_snapshot")
+            return
+        if (
+            type(self.content) is not bytes
+            or len(self.content) > MAX_SNAPSHOT_FILE_BYTES
+            or type(self.mode) is not int
+            or not 0 <= self.mode <= 0o777
+        ):
+            raise PanelOpError("invalid_panel_snapshot")
+        object.__setattr__(self, "content", bytes(self.content))
+
+    def __repr__(self) -> str:
+        return "FileSnapshot(<redacted>)"
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class ServiceSnapshot:
+    """Exact owned systemd unit and its independent enabled/active state."""
+
+    unit_file: FileSnapshot
+    enabled: bool
+    active: bool
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.unit_file, FileSnapshot)
+            or type(self.enabled) is not bool
+            or type(self.active) is not bool
+            or (self.unit_file.content is None and (self.enabled or self.active))
+        ):
+            raise PanelOpError("invalid_panel_snapshot")
+
+    def __repr__(self) -> str:
+        return "ServiceSnapshot(<redacted>)"
+
+
+def _normalize_selected_components(
+    selected_components: tuple[str, ...],
+    *,
+    allow_empty: bool = False,
+    require_bridge: bool = True,
+) -> tuple[str, ...]:
+    if (
+        not isinstance(selected_components, tuple)
+        or (not selected_components and not allow_empty)
+        or len(selected_components) > len(_CORE_COMPONENT_ORDER)
+        or any(type(component_id) is not str for component_id in selected_components)
+        or len(set(selected_components)) != len(selected_components)
+        or any(component_id not in _CORE_COMPONENT_ORDER for component_id in selected_components)
+        or (require_bridge and selected_components and COMPONENT_BRIDGE not in selected_components)
+    ):
+        raise PanelOpError("invalid_selected_components")
+    chosen = set(selected_components)
+    return tuple(component_id for component_id in _CORE_COMPONENT_ORDER if component_id in chosen)
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class PanelSnapshot:
+    """Exact core-owned state needed for a verifiable rollback."""
+
+    layout: PanelLayout
+    active_release_target: str | None
+    environment_file: FileSnapshot
+    version_file: FileSnapshot
+    bridge_service: ServiceSnapshot
+    wifi_watchdog_service: ServiceSnapshot
+    bus_watchdog_service: ServiceSnapshot
+    selected_components: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.layout, PanelLayout)
+            or not isinstance(self.environment_file, FileSnapshot)
+            or not isinstance(self.version_file, FileSnapshot)
+            or not isinstance(self.bridge_service, ServiceSnapshot)
+            or not isinstance(self.wifi_watchdog_service, ServiceSnapshot)
+            or not isinstance(self.bus_watchdog_service, ServiceSnapshot)
+        ):
+            raise PanelOpError("invalid_panel_snapshot")
+        selected_invalid = False
+        selected: tuple[str, ...] = ()
+        try:
+            selected = _normalize_selected_components(
+                self.selected_components,
+                allow_empty=True,
+                require_bridge=self.layout is PanelLayout.RELEASE_LINK,
+            )
+        except PanelOpError:
+            selected_invalid = True
+        if selected_invalid:
+            raise PanelOpError("invalid_panel_snapshot")
+        if self.layout is PanelLayout.RELEASE_LINK:
+            if (
+                not isinstance(self.active_release_target, str)
+                or _RELEASE_TARGET.fullmatch(self.active_release_target) is None
+                or self.version_file.content is None
+            ):
+                raise PanelOpError("invalid_panel_snapshot")
+        elif self.active_release_target is not None:
+            raise PanelOpError("invalid_panel_snapshot")
+
+        services = (
+            (COMPONENT_BRIDGE, self.bridge_service),
+            (COMPONENT_WIFI_WATCHDOG, self.wifi_watchdog_service),
+            (COMPONENT_BUS_WATCHDOG, self.bus_watchdog_service),
+        )
+        selected_from_units = tuple(
+            component_id
+            for component_id, service in services
+            if service.unit_file.content is not None
+        )
+        files_absent = (
+            self.environment_file.content is None
+            and self.version_file.content is None
+            and not selected_from_units
+        )
+        if self.layout is PanelLayout.ABSENT:
+            if not files_absent or selected:
+                raise PanelOpError("invalid_panel_snapshot")
+        elif selected != selected_from_units:
+            raise PanelOpError("invalid_panel_snapshot")
+        elif self.layout is PanelLayout.RELEASE_LINK and (
+            self.environment_file.content is None or self.bridge_service.unit_file.content is None
+        ):
+            raise PanelOpError("invalid_panel_snapshot")
+        object.__setattr__(self, "selected_components", selected)
+
+    def __repr__(self) -> str:
+        return "PanelSnapshot(<redacted>)"
+
+
+def _valid_uuid4(value: object) -> bool:
+    return (
+        isinstance(value, UUID)
+        and value.variant == RFC_4122
+        and value.version == 4
+        and UUID(value.hex) == value
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class StagedRelease:
+    """One immutable, transaction-unique release prepared on a panel."""
+
+    version: str
+    transaction_id: UUID
+    release_target: str
+    selected_components: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.version, str)
+            or _VERSION.fullmatch(self.version) is None
+            or not _valid_uuid4(self.transaction_id)
+        ):
+            raise PanelOpError("invalid_staged_release")
+        expected_target = f"{PANEL_RELEASES_DIR}/{self.version}--{self.transaction_id.hex}"
+        if self.release_target != expected_target:
+            raise PanelOpError("invalid_staged_release")
+        object.__setattr__(
+            self,
+            "selected_components",
+            _normalize_selected_components(self.selected_components),
+        )
+
+
+async def _provisioning_run(
+    shell: PanelShell,
+    command: str,
+    error_code: str,
+) -> RunResult:
+    """Run a fixed provisioning command without retaining transport details."""
+    failed = False
+    result: RunResult | None = None
+    try:
+        result = await shell.run(command)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        failed = True
+    if failed or result is None or result.exit_status != 0:
+        command = "<redacted>"
+        result = None
+        raise PanelOpError(error_code)
+    return result
+
+
+async def _provisioning_put_dir(
+    shell: PanelShell,
+    local_dir: str,
+    remote_dir: str,
+    error_code: str,
+) -> None:
+    failed = False
+    try:
+        await shell.put_dir(local_dir, remote_dir)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        failed = True
+    if failed:
+        local_dir = "<redacted>"
+        remote_dir = "<redacted>"
+        raise PanelOpError(error_code)
+
+
+async def _provisioning_put_bytes(
+    shell: PanelShell,
+    data: bytes,
+    remote_path: str,
+    mode: int,
+    error_code: str,
+) -> None:
+    failed = False
+    try:
+        await shell.put_bytes(data, remote_path, mode)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        failed = True
+    if failed:
+        data = b""
+        remote_path = "<redacted>"
+        raise PanelOpError(error_code)
+
+
+def _layout_probe_command() -> str:
+    legacy_paths = (
+        PANEL_ENV_FILE,
+        PANEL_VERSION_FILE,
+        PANEL_UNIT_FILE,
+        PANEL_WIFI_WATCHDOG_UNIT_FILE,
+        PANEL_BUS_WATCHDOG_UNIT_FILE,
+        PANEL_APP_DIR,
+        PANEL_VENDOR_DIR,
+        PANEL_WIFI_WATCHDOG_DIR,
+        PANEL_BUS_WATCHDOG_DIR,
+    )
+    services = tuple(
+        (component_id, service_name) for component_id, service_name, _ in _CORE_SERVICES
+    )
+    return (
+        "python3 - <<'BRILLIANT_MQTT_SNAPSHOT'\n"
+        "import json, os, subprocess\n"
+        f"current = {PANEL_CURRENT_LINK!r}\n"
+        f"legacy_paths = {legacy_paths!r}\n"
+        f"services = {services!r}\n"
+        "if os.path.lexists(current):\n"
+        "    if not os.path.islink(current):\n"
+        "        raise SystemExit(41)\n"
+        "    layout = 'release_link'\n"
+        "    target = os.readlink(current)\n"
+        "else:\n"
+        "    legacy = any(os.path.lexists(path) for path in legacy_paths)\n"
+        "    layout = 'legacy_fixed' if legacy else 'absent'\n"
+        "    target = None\n"
+        "def state(service_name, operation, truthy, falsey):\n"
+        "    result = subprocess.run(\n"
+        "        ['systemctl', operation, service_name],\n"
+        "        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,\n"
+        "        check=False, text=True,\n"
+        "    )\n"
+        "    value = result.stdout.strip()\n"
+        "    if value in truthy:\n"
+        "        return True\n"
+        "    if value in falsey:\n"
+        "        return False\n"
+        "    raise SystemExit(45)\n"
+        "states = {}\n"
+        "for component_id, service_name in services:\n"
+        "    enabled = state(\n"
+        "        service_name, 'is-enabled',\n"
+        "        {'alias', 'enabled', 'enabled-runtime', 'linked', 'linked-runtime'},\n"
+        "        {'disabled', 'generated', 'indirect', 'masked', 'not-found',\n"
+        "         'static', 'transient'},\n"
+        "    )\n"
+        "    active = state(\n"
+        "        service_name, 'is-active', {'active'},\n"
+        "        {'failed', 'inactive', 'unknown'},\n"
+        "    )\n"
+        "    states[component_id] = {'active': active, 'enabled': enabled}\n"
+        "print(json.dumps(\n"
+        "    {'active_release_target': target, 'layout': layout, 'services': states},\n"
+        "    sort_keys=True, separators=(',', ':'),\n"
+        "))\n"
+        "BRILLIANT_MQTT_SNAPSHOT"
+    )
+
+
+def _file_probe_command(path: str, maximum_bytes: int) -> str:
+    return (
+        "python3 - <<'BRILLIANT_MQTT_FILE_SNAPSHOT'\n"
+        "import base64, errno, json, os, stat\n"
+        f"path = {path!r}\n"
+        f"maximum = {maximum_bytes}\n"
+        "try:\n"
+        "    descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)\n"
+        "except FileNotFoundError:\n"
+        '    print(\'{"content":null,"mode":null,"present":false}\')\n'
+        "    raise SystemExit(0)\n"
+        "except OSError as error:\n"
+        "    if error.errno == errno.ENOENT:\n"
+        '        print(\'{"content":null,"mode":null,"present":false}\')\n'
+        "        raise SystemExit(0)\n"
+        "    raise\n"
+        "try:\n"
+        "    metadata = os.fstat(descriptor)\n"
+        "    if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > maximum:\n"
+        "        raise SystemExit(42)\n"
+        "    chunks = []\n"
+        "    remaining = metadata.st_size\n"
+        "    while remaining:\n"
+        "        chunk = os.read(descriptor, min(remaining, 65536))\n"
+        "        if not chunk:\n"
+        "            raise SystemExit(43)\n"
+        "        chunks.append(chunk)\n"
+        "        remaining -= len(chunk)\n"
+        "    if os.read(descriptor, 1):\n"
+        "        raise SystemExit(44)\n"
+        "finally:\n"
+        "    os.close(descriptor)\n"
+        "content = b''.join(chunks)\n"
+        "print(json.dumps(\n"
+        "    {'content': base64.b64encode(content).decode('ascii'),\n"
+        "     'mode': stat.S_IMODE(metadata.st_mode), 'present': True},\n"
+        "    sort_keys=True, separators=(',', ':'),\n"
+        "))\n"
+        "BRILLIANT_MQTT_FILE_SNAPSHOT"
+    )
+
+
+SNAPSHOT_LAYOUT_COMMAND = _layout_probe_command()
+SNAPSHOT_FILE_COMMANDS = {
+    "environment": _file_probe_command(PANEL_ENV_FILE, MAX_SNAPSHOT_FILE_BYTES),
+    "version": _file_probe_command(PANEL_VERSION_FILE, _MAX_VERSION_BYTES),
+    "bridge_unit": _file_probe_command(PANEL_UNIT_FILE, MAX_SNAPSHOT_FILE_BYTES),
+    "wifi_unit": _file_probe_command(
+        PANEL_WIFI_WATCHDOG_UNIT_FILE,
+        MAX_SNAPSHOT_FILE_BYTES,
+    ),
+    "bus_unit": _file_probe_command(
+        PANEL_BUS_WATCHDOG_UNIT_FILE,
+        MAX_SNAPSHOT_FILE_BYTES,
+    ),
+}
+
+
+def _json_object(
+    raw: str, expected_keys: frozenset[str], maximum_bytes: int
+) -> dict[str, object] | None:
+    if not isinstance(raw, str):
+        return None
+    try:
+        wire_size = len(raw.encode("utf-8"))
+    except UnicodeError:
+        return None
+    if wire_size > maximum_bytes:
+        return None
+
+    def object_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        value: dict[str, object] = {}
+        for key, item in pairs:
+            if type(key) is not str or key in value:
+                raise ValueError
+            value[key] = item
+        return value
+
+    try:
+        value = json.loads(
+            raw,
+            object_pairs_hook=object_pairs,
+            parse_constant=lambda _value: (_ for _ in ()).throw(ValueError()),
+        )
+    except (
+        UnicodeError,
+        ValueError,
+        TypeError,
+        RecursionError,
+        json.JSONDecodeError,
+    ):
+        return None
+    if type(value) is not dict or frozenset(value) != expected_keys:
+        return None
+    return value
+
+
+def _parse_service_states(raw: object) -> dict[str, tuple[bool, bool]] | None:
+    if type(raw) is not dict or frozenset(raw) != frozenset(_CORE_COMPONENT_ORDER):
+        return None
+    states: dict[str, tuple[bool, bool]] = {}
+    for component_id in _CORE_COMPONENT_ORDER:
+        value = raw.get(component_id)
+        if (
+            type(value) is not dict
+            or frozenset(value) != frozenset({"active", "enabled"})
+            or type(value.get("enabled")) is not bool
+            or type(value.get("active")) is not bool
+        ):
+            return None
+        states[component_id] = (value["enabled"], value["active"])
+    return states
+
+
+def _parse_file_snapshot(raw: str, maximum_bytes: int) -> FileSnapshot | None:
+    value = _json_object(
+        raw,
+        frozenset({"content", "mode", "present"}),
+        MAX_SNAPSHOT_WIRE_BYTES,
+    )
+    if value is None or type(value["present"]) is not bool:
+        return None
+    if value["present"] is False:
+        if value["content"] is not None or value["mode"] is not None:
+            return None
+        return FileSnapshot(content=None, mode=None)
+    encoded = value["content"]
+    mode = value["mode"]
+    if (
+        not isinstance(encoded, str)
+        or not encoded.isascii()
+        or type(mode) is not int
+        or not 0 <= mode <= 0o777
+    ):
+        return None
+    try:
+        content = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    if len(content) > maximum_bytes or base64.b64encode(content).decode("ascii") != encoded:
+        return None
+    return FileSnapshot(content=content, mode=mode)
+
+
+async def snapshot_panel(shell: PanelShell) -> PanelSnapshot:
+    """Capture bounded, exact rollback state for the three fleet-owned services."""
+    layout_result = await _provisioning_run(
+        shell,
+        SNAPSHOT_LAYOUT_COMMAND,
+        "snapshot_probe_failed",
+    )
+    layout_value = _json_object(
+        layout_result.stdout,
+        frozenset({"active_release_target", "layout", "services"}),
+        _MAX_LAYOUT_WIRE_BYTES,
+    )
+    if layout_value is None:
+        raise PanelOpError("snapshot_payload_invalid")
+    states = _parse_service_states(layout_value["services"])
+    raw_layout = layout_value["layout"]
+    if not isinstance(raw_layout, str):
+        layout = None
+    else:
+        try:
+            layout = PanelLayout(raw_layout)
+        except ValueError:
+            layout = None
+    target = layout_value["active_release_target"]
+    if layout is None or states is None or (target is not None and not isinstance(target, str)):
+        raise PanelOpError("snapshot_payload_invalid")
+
+    parsed_files: dict[str, FileSnapshot] = {}
+    for key, command in SNAPSHOT_FILE_COMMANDS.items():
+        result = await _provisioning_run(shell, command, "snapshot_probe_failed")
+        maximum = _MAX_VERSION_BYTES if key == "version" else MAX_SNAPSHOT_FILE_BYTES
+        parsed = _parse_file_snapshot(result.stdout, maximum)
+        if parsed is None:
+            raise PanelOpError("snapshot_payload_invalid")
+        parsed_files[key] = parsed
+
+    snapshot_values_invalid = False
+    bridge: ServiceSnapshot | None = None
+    wifi: ServiceSnapshot | None = None
+    bus: ServiceSnapshot | None = None
+    try:
+        bridge = ServiceSnapshot(
+            parsed_files["bridge_unit"],
+            enabled=states[COMPONENT_BRIDGE][0],
+            active=states[COMPONENT_BRIDGE][1],
+        )
+        wifi = ServiceSnapshot(
+            parsed_files["wifi_unit"],
+            enabled=states[COMPONENT_WIFI_WATCHDOG][0],
+            active=states[COMPONENT_WIFI_WATCHDOG][1],
+        )
+        bus = ServiceSnapshot(
+            parsed_files["bus_unit"],
+            enabled=states[COMPONENT_BUS_WATCHDOG][0],
+            active=states[COMPONENT_BUS_WATCHDOG][1],
+        )
+    except Exception:
+        snapshot_values_invalid = True
+    if snapshot_values_invalid or bridge is None or wifi is None or bus is None:
+        raise PanelOpError("snapshot_payload_invalid")
+    selected = tuple(
+        component_id
+        for component_id, service in (
+            (COMPONENT_BRIDGE, bridge),
+            (COMPONENT_WIFI_WATCHDOG, wifi),
+            (COMPONENT_BUS_WATCHDOG, bus),
+        )
+        if service.unit_file.content is not None
+    )
+    invalid = False
+    snapshot: PanelSnapshot | None = None
+    try:
+        snapshot = PanelSnapshot(
+            layout=layout,
+            active_release_target=target,
+            environment_file=parsed_files["environment"],
+            version_file=parsed_files["version"],
+            bridge_service=bridge,
+            wifi_watchdog_service=wifi,
+            bus_watchdog_service=bus,
+            selected_components=selected,
+        )
+    except Exception:
+        invalid = True
+    if invalid or snapshot is None:
+        raise PanelOpError("snapshot_payload_invalid")
+    return snapshot
+
+
+def _staged_temp_path(staged: StagedRelease) -> str:
+    return f"{PANEL_RELEASES_DIR}/.{staged.version}--{staged.transaction_id.hex}.tmp"
+
+
+def _release_mqtt_ca_path(staged: StagedRelease) -> str:
+    return f"{staged.release_target}/mqtt-ca.pem"
+
+
+def _release_mqtt_ca_digest_command(staged: StagedRelease, digest: str) -> str:
+    if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise PanelOpError("invalid_staged_release")
+    path = f"{_staged_temp_path(staged)}/mqtt-ca.pem"
+    return f"test \"$(sha256sum {path} | cut -d ' ' -f 1)\" = {digest}"
+
+
+def _mqtt_ca_environment_assignments(environment: str) -> tuple[str, ...]:
+    assignments: list[str] = []
+    for line in environment.split("\n"):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        key, separator, _value = stripped.partition("=")
+        if separator and key.strip() == ENV_MQTT_TLS_CA_FILE:
+            assignments.append(stripped)
+    return tuple(assignments)
+
+
+def _release_validation_command(
+    staged: StagedRelease,
+    *,
+    promoted: bool = False,
+) -> str:
+    """Validate the uploaded release without interpolating caller-controlled paths."""
+    root = staged.release_target if promoted else _staged_temp_path(staged)
+    required_files = (
+        f"{root}/app/brilliant_mqtt/__main__.py",
+        f"{root}/wifi_watchdog/brilliant_wifi_watchdog/run.py",
+        f"{root}/bus_watchdog/brilliant_bus_watchdog/run.py",
+        f"{root}/brilliant-mqtt-release.service",
+        f"{root}/brilliant-wifi-watchdog-release.service",
+        f"{root}/brilliant-bus-watchdog-release.service",
+        f"{root}/brilliant-mqtt.env",
+        f"{root}/VERSION",
+    )
+    checks = [
+        f"test -d {root}",
+        f"test ! -L {root}",
+        f"test -d {root}/vendor",
+        f"test ! -L {root}/vendor",
+    ]
+    for path in required_files:
+        checks.extend((f"test -f {path}", f"test ! -L {path}"))
+    mqtt_ca_file = f"{root}/mqtt-ca.pem"
+    mqtt_ca_binding = f"{ENV_MQTT_TLS_CA_FILE}={_release_mqtt_ca_path(staged)}"
+    mqtt_ca_assignment = rf"^[[:space:]]*{ENV_MQTT_TLS_CA_FILE}[[:space:]]*="
+    checks.extend(
+        (
+            f'test "$(stat -c %a -- {root}/brilliant-mqtt.env)" = 600',
+            f'test "$(cat -- {root}/VERSION)" = {staged.version}',
+            (
+                f"(if grep -Eq '{mqtt_ca_assignment}' {root}/brilliant-mqtt.env; then "
+                f"test \"$(grep -Ec '{mqtt_ca_assignment}' "
+                f'{root}/brilliant-mqtt.env)" = 1 && '
+                f"grep -Fxq -- {mqtt_ca_binding} {root}/brilliant-mqtt.env && "
+                f"test -f {mqtt_ca_file} && test ! -L {mqtt_ca_file} && "
+                f'test "$(stat -c %a -- {mqtt_ca_file})" = 644; '
+                f"else test ! -e {mqtt_ca_file} && test ! -L {mqtt_ca_file}; fi)"
+            ),
+            f'test -z "$(find {root} -type l -print -quit)"',
+        )
+    )
+    return " && ".join(checks)
+
+
+def _shell_arg(value: str) -> str:
+    """Quote one bounded value as an inert POSIX-shell argument."""
+    if not isinstance(value, str) or "\0" in value:
+        raise PanelOpError("invalid_preflight_request")
+    return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
+def panel_preflight_launcher(
+    shell: PanelShell,
+    staged: StagedRelease,
+) -> _PanelPreflightLauncher:
+    """Build a launcher pinned to one validated immutable release."""
+    if not isinstance(staged, StagedRelease):
+        raise PanelOpError("invalid_staged_release")
+
+    async def launch(raw_request: str) -> PanelProcess:
+        request: PreflightRequest | None = None
+        invalid = False
+        try:
+            request = PreflightRequest.from_json(raw_request)
+        except Exception:
+            invalid = True
+        raw_request = "<redacted>"
+        if invalid or request is None:
+            raise PanelOpError("invalid_preflight_request")
+
+        canonical_request = request.to_json()
+        await _provisioning_run(
+            shell,
+            _release_validation_command(staged, promoted=True),
+            "preflight_release_invalid",
+        )
+        release = staged.release_target
+        command = (
+            f"export PYTHONPATH={_shell_arg(f'{release}/app:{release}/vendor')} && "
+            f"exec {_PANEL_PYTHON} -m brilliant_mqtt.preflight "
+            f"--environment-file {_shell_arg(f'{release}/brilliant-mqtt.env')} "
+            f"--request-json {_shell_arg(canonical_request)}"
+        )
+        process: PanelProcess | None = None
+        failed = False
+        try:
+            process = await shell.start(command)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            failed = True
+        command = "<redacted>"
+        canonical_request = "<redacted>"
+        request = None
+        if failed or process is None:
+            raise PanelOpError("preflight_start_failed")
+        return process
+
+    return launch
+
+
+def _stage_prepare_command(staged: StagedRelease) -> str:
+    temporary = _staged_temp_path(staged)
+    return (
+        f"mkdir -p -- {PANEL_RELEASES_DIR} && "
+        f"test -d {PANEL_RELEASES_DIR} && test ! -L {PANEL_RELEASES_DIR} && "
+        f"rm -rf -- {temporary} && "
+        f"test ! -e {staged.release_target} && test ! -L {staged.release_target}"
+    )
+
+
+def _stage_promote_command(staged: StagedRelease) -> str:
+    temporary = _staged_temp_path(staged)
+    return (
+        f"mv -T -n -- {temporary} {staged.release_target} && "
+        f"test ! -e {temporary} && test ! -L {temporary} && "
+        f"test -d {staged.release_target} && test ! -L {staged.release_target}"
+    )
+
+
+async def _settled_cleanup_run(shell: PanelShell, command: str) -> bool:
+    """Run cleanup to settlement and report failure without losing cancellation."""
+    cleanup_task = asyncio.create_task(shell.run(command))
+    owner = asyncio.current_task()
+    observed_cancellations = owner.cancelling() if owner is not None else 0
+    cancellation: asyncio.CancelledError | None = None
+    while not cleanup_task.done():
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError as error:
+            current_cancellations = owner.cancelling() if owner is not None else 0
+            if current_cancellations > observed_cancellations:
+                cancellation = error
+                observed_cancellations = current_cancellations
+            if cleanup_task.done():
+                break
+        except Exception:
+            break
+    succeeded = False
+    try:
+        succeeded = cleanup_task.result().exit_status == 0
+    except BaseException:
+        pass
+    command = "<redacted>"
+    if cancellation is not None:
+        raise cancellation from None
+    return succeeded
+
+
+async def stage_release(
+    shell: PanelShell,
+    local_payload_dir: str,
+    version: str,
+    environment: str,
+    selected_components: tuple[str, ...],
+    transaction_id: UUID,
+    mqtt_ca: bytes | None = None,
+) -> StagedRelease:
+    """Upload and remotely validate one unique release without changing live state."""
+    normalized = _normalize_selected_components(selected_components)
+    if (
+        not isinstance(version, str)
+        or _VERSION.fullmatch(version) is None
+        or not _valid_uuid4(transaction_id)
+        or not isinstance(local_payload_dir, str)
+        or not local_payload_dir
+        or not isinstance(environment, str)
+    ):
+        raise PanelOpError("invalid_staged_release")
+    staged = StagedRelease(
+        version=version,
+        transaction_id=transaction_id,
+        release_target=f"{PANEL_RELEASES_DIR}/{version}--{transaction_id.hex}",
+        selected_components=normalized,
+    )
+    encoding_failed = False
+    environment_bytes = b""
+    try:
+        environment_bytes = environment.encode("utf-8")
+    except UnicodeError:
+        encoding_failed = True
+    if encoding_failed or len(environment_bytes) > MAX_SNAPSHOT_FILE_BYTES:
+        environment = "<redacted>"
+        environment_bytes = b""
+        raise PanelOpError("invalid_staged_release")
+    mqtt_ca_path = _release_mqtt_ca_path(staged)
+    expected_ca_assignment = f"{ENV_MQTT_TLS_CA_FILE}={mqtt_ca_path}"
+    ca_assignments = _mqtt_ca_environment_assignments(environment)
+    if mqtt_ca is None:
+        valid_ca = not ca_assignments
+    else:
+        valid_ca = (
+            type(mqtt_ca) is bytes
+            and bool(mqtt_ca)
+            and len(mqtt_ca) <= MAX_MQTT_CA_BYTES
+            and b"PRIVATE KEY" not in mqtt_ca.upper()
+            and ca_assignments == (expected_ca_assignment,)
+        )
+    if not valid_ca:
+        environment = "<redacted>"
+        environment_bytes = b""
+        mqtt_ca = None
+        raise PanelOpError("invalid_staged_release")
+    mqtt_ca_digest = hashlib.sha256(mqtt_ca).hexdigest() if mqtt_ca is not None else None
+
+    failure: BaseException | None = None
+    try:
+        await _provisioning_run(
+            shell,
+            _stage_prepare_command(staged),
+            "stage_prepare_failed",
+        )
+        await _provisioning_put_dir(
+            shell,
+            local_payload_dir,
+            _staged_temp_path(staged),
+            "stage_upload_failed",
+        )
+        await _provisioning_run(
+            shell,
+            f"rm -f -- {_staged_temp_path(staged)}/mqtt-ca.pem",
+            "stage_upload_failed",
+        )
+        await _provisioning_put_bytes(
+            shell,
+            environment_bytes,
+            f"{_staged_temp_path(staged)}/brilliant-mqtt.env",
+            0o600,
+            "stage_upload_failed",
+        )
+        environment_bytes = b""
+        environment = "<redacted>"
+        if mqtt_ca is not None:
+            await _provisioning_put_bytes(
+                shell,
+                mqtt_ca,
+                f"{_staged_temp_path(staged)}/mqtt-ca.pem",
+                0o644,
+                "stage_upload_failed",
+            )
+            mqtt_ca = None
+            await _provisioning_run(
+                shell,
+                _release_mqtt_ca_digest_command(staged, mqtt_ca_digest or ""),
+                "stage_validation_failed",
+            )
+            mqtt_ca_digest = None
+        await _provisioning_put_bytes(
+            shell,
+            version.encode("ascii"),
+            f"{_staged_temp_path(staged)}/VERSION",
+            0o644,
+            "stage_upload_failed",
+        )
+        await _provisioning_run(
+            shell,
+            _release_validation_command(staged),
+            "stage_validation_failed",
+        )
+        await _provisioning_run(
+            shell,
+            _stage_promote_command(staged),
+            "stage_promotion_failed",
+        )
+    except BaseException as error:
+        failure = error
+
+    local_payload_dir = "<redacted>"
+    environment = "<redacted>"
+    environment_bytes = b""
+    mqtt_ca = None
+    mqtt_ca_digest = None
+    if failure is not None:
+        cleanup_succeeded = await _settled_cleanup_run(
+            shell,
+            _cleanup_staged_command(staged),
+        )
+        if not cleanup_succeeded:
+            if not isinstance(failure, Exception):
+                raise failure from None
+            raise PanelOpError("staged_cleanup_failed")
+        raise failure from None
+    return staged
+
+
+def _activation_paths(staged: StagedRelease) -> dict[str, tuple[str, str]]:
+    suffix = f".fleet-{staged.transaction_id.hex}.tmp"
+    return {
+        "environment": (
+            f"{staged.release_target}/brilliant-mqtt.env",
+            f"{PANEL_ENV_FILE}{suffix}",
+        ),
+        "version": (
+            f"{staged.release_target}/VERSION",
+            f"{PANEL_VERSION_FILE}{suffix}",
+        ),
+        "bridge_unit": (
+            f"{staged.release_target}/brilliant-mqtt-release.service",
+            f"{PANEL_UNIT_FILE}{suffix}",
+        ),
+        "wifi_unit": (
+            f"{staged.release_target}/brilliant-wifi-watchdog-release.service",
+            f"{PANEL_WIFI_WATCHDOG_UNIT_FILE}{suffix}",
+        ),
+        "bus_unit": (
+            f"{staged.release_target}/brilliant-bus-watchdog-release.service",
+            f"{PANEL_BUS_WATCHDOG_UNIT_FILE}{suffix}",
+        ),
+    }
+
+
+def _activation_prepare_command(staged: StagedRelease) -> str:
+    paths = _activation_paths(staged)
+    temporary_paths = " ".join(temporary for _, temporary in paths.values())
+    operations = [f"rm -f -- {temporary_paths}"]
+    for source, temporary in paths.values():
+        operations.append(f"cp -- {source} {temporary}")
+    operations.extend(
+        (
+            f"chmod 600 {paths['environment'][1]}",
+            f"chmod 644 {paths['version'][1]}",
+            f"chmod 644 {paths['bridge_unit'][1]}",
+            f"chmod 644 {paths['wifi_unit'][1]}",
+            f"chmod 644 {paths['bus_unit'][1]}",
+        )
+    )
+    return " && ".join(operations)
+
+
+def _stop_service_command(service_name: str) -> str:
+    return (
+        f"if systemctl is-active --quiet {service_name}; then "
+        f"systemctl stop {service_name}; fi; "
+        f'state="$(systemctl is-active {service_name} 2>/dev/null || true)"; '
+        'case "$state" in inactive|failed|unknown) ;; *) exit 47 ;; esac'
+    )
+
+
+def _disabled_state_command(service_name: str) -> str:
+    return (
+        f'state="$(systemctl is-enabled {service_name} 2>/dev/null || true)"; '
+        'case "$state" in '
+        "disabled|generated|indirect|masked|not-found|static|transient) ;; "
+        "*) exit 48 ;; esac"
+    )
+
+
+def _disable_service_command(service_name: str) -> str:
+    return (
+        f"systemctl disable {service_name} >/dev/null 2>&1 || true; "
+        f"{_disabled_state_command(service_name)}"
+    )
+
+
+def _activation_commit_command(staged: StagedRelease) -> str:
+    paths = _activation_paths(staged)
+    selected = set(staged.selected_components)
+    current_temporary = f"{PANEL_CURRENT_LINK}.fleet-{staged.transaction_id.hex}.tmp"
+    operations = [
+        (
+            f"if [ -e {PANEL_CURRENT_LINK} ] || [ -L {PANEL_CURRENT_LINK} ]; "
+            f"then [ -L {PANEL_CURRENT_LINK} ]; fi"
+        ),
+        f"mv -Tf -- {paths['environment'][1]} {PANEL_ENV_FILE}",
+        f"mv -Tf -- {paths['version'][1]} {PANEL_VERSION_FILE}",
+        f"mv -Tf -- {paths['bridge_unit'][1]} {PANEL_UNIT_FILE}",
+    ]
+    for component_id, key, destination in (
+        (
+            COMPONENT_WIFI_WATCHDOG,
+            "wifi_unit",
+            PANEL_WIFI_WATCHDOG_UNIT_FILE,
+        ),
+        (
+            COMPONENT_BUS_WATCHDOG,
+            "bus_unit",
+            PANEL_BUS_WATCHDOG_UNIT_FILE,
+        ),
+    ):
+        if component_id in selected:
+            operations.append(f"mv -Tf -- {paths[key][1]} {destination}")
+        else:
+            operations.append(f"rm -f -- {paths[key][1]} {destination}")
+    operations.extend(
+        (
+            f"rm -f -- {current_temporary}",
+            f"ln -s {staged.release_target} {current_temporary}",
+            f"mv -Tf -- {current_temporary} {PANEL_CURRENT_LINK}",
+        )
+    )
+    return " && ".join(operations)
+
+
+async def _converge_service(
+    shell: PanelShell,
+    service_name: str,
+    *,
+    selected: bool,
+    error_code: str,
+) -> None:
+    if selected:
+        await _provisioning_run(
+            shell,
+            f"systemctl enable {service_name}",
+            error_code,
+        )
+        await _provisioning_run(
+            shell,
+            f"systemctl start {service_name}",
+            error_code,
+        )
+        await _provisioning_run(
+            shell,
+            (
+                f"systemctl is-enabled --quiet {service_name} && "
+                f"systemctl is-active --quiet {service_name}"
+            ),
+            error_code,
+        )
+        return
+    await _provisioning_run(
+        shell,
+        _disabled_state_command(service_name),
+        error_code,
+    )
+    await _provisioning_run(
+        shell,
+        _stop_service_command(service_name),
+        error_code,
+    )
+
+
+async def activate_staged(
+    shell: PanelShell,
+    staged: StagedRelease,
+    *,
+    on_services_stopped: Callable[[], None],
+) -> None:
+    """Atomically select a validated release and converge only fleet core units."""
+    if not isinstance(staged, StagedRelease) or not callable(on_services_stopped):
+        raise PanelOpError("invalid_staged_release")
+    await _provisioning_run(
+        shell,
+        _release_validation_command(staged, promoted=True),
+        "activation_prepare_failed",
+    )
+    await _provisioning_run(
+        shell,
+        _activation_prepare_command(staged),
+        "activation_prepare_failed",
+    )
+    for _, service_name, _ in _CORE_SERVICES:
+        await _provisioning_run(
+            shell,
+            _stop_service_command(service_name),
+            "activation_stop_failed",
+        )
+    selected = set(staged.selected_components)
+    for component_id, service_name, _ in _CORE_SERVICES:
+        if component_id not in selected:
+            await _provisioning_run(
+                shell,
+                _disable_service_command(service_name),
+                "activation_service_failed",
+            )
+    try:
+        on_services_stopped()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        raise PanelOpError("activation_boundary_failed") from None
+    await _provisioning_run(
+        shell,
+        _activation_commit_command(staged),
+        "activation_commit_failed",
+    )
+    await _provisioning_run(
+        shell,
+        "systemctl daemon-reload",
+        "activation_reload_failed",
+    )
+    for component_id, service_name, _ in _CORE_SERVICES:
+        await _converge_service(
+            shell,
+            service_name,
+            selected=component_id in selected,
+            error_code="activation_service_failed",
+        )
+
+
+def _rollback_temp_path(path: str, staged: StagedRelease) -> str:
+    return f"{path}.rollback-{staged.transaction_id.hex}.tmp"
+
+
+async def _restore_file(
+    shell: PanelShell,
+    path: str,
+    snapshot: FileSnapshot,
+    staged: StagedRelease,
+) -> None:
+    temporary = _rollback_temp_path(path, staged)
+    await _provisioning_run(
+        shell,
+        f"rm -f -- {temporary}",
+        "rollback_restore_failed",
+    )
+    if snapshot.content is None:
+        await _provisioning_run(
+            shell,
+            f"rm -f -- {path}",
+            "rollback_restore_failed",
+        )
+        return
+    assert snapshot.mode is not None
+    await _provisioning_put_bytes(
+        shell,
+        snapshot.content,
+        temporary,
+        snapshot.mode,
+        "rollback_restore_failed",
+    )
+    await _provisioning_run(
+        shell,
+        (
+            f"test -f {temporary} && test ! -L {temporary} && "
+            f'test "$(stat -c %a -- {temporary})" = {snapshot.mode:o} && '
+            f"mv -Tf -- {temporary} {path}"
+        ),
+        "rollback_restore_failed",
+    )
+
+
+def _rollback_link_command(
+    snapshot: PanelSnapshot,
+    staged: StagedRelease,
+) -> str:
+    temporary = f"{PANEL_CURRENT_LINK}.rollback-{staged.transaction_id.hex}.tmp"
+    guard = (
+        f"if [ -e {PANEL_CURRENT_LINK} ] || [ -L {PANEL_CURRENT_LINK} ]; "
+        f"then [ -L {PANEL_CURRENT_LINK} ] || exit 46; fi"
+    )
+    if snapshot.layout is PanelLayout.RELEASE_LINK:
+        assert snapshot.active_release_target is not None
+        return (
+            f"{guard}; rm -f -- {temporary}; "
+            f"ln -s {snapshot.active_release_target} {temporary} && "
+            f"mv -Tf -- {temporary} {PANEL_CURRENT_LINK}"
+        )
+    return f"{guard}; rm -f -- {temporary} {PANEL_CURRENT_LINK}"
+
+
+async def _restore_service_state(
+    shell: PanelShell,
+    service_name: str,
+    snapshot: ServiceSnapshot,
+) -> None:
+    if snapshot.enabled:
+        await _provisioning_run(
+            shell,
+            f"systemctl enable {service_name}",
+            "rollback_service_failed",
+        )
+    else:
+        await _provisioning_run(
+            shell,
+            _disabled_state_command(service_name),
+            "rollback_service_failed",
+        )
+    if snapshot.active:
+        await _provisioning_run(
+            shell,
+            f"systemctl start {service_name}",
+            "rollback_service_failed",
+        )
+    else:
+        await _provisioning_run(
+            shell,
+            _stop_service_command(service_name),
+            "rollback_service_failed",
+        )
+
+
+def _rollback_cleanup_command(staged: StagedRelease) -> str:
+    paths = (
+        PANEL_ENV_FILE,
+        PANEL_VERSION_FILE,
+        PANEL_UNIT_FILE,
+        PANEL_WIFI_WATCHDOG_UNIT_FILE,
+        PANEL_BUS_WATCHDOG_UNIT_FILE,
+    )
+    temporary_paths = [_rollback_temp_path(path, staged) for path in paths]
+    temporary_paths.extend(temporary for _, temporary in _activation_paths(staged).values())
+    temporary_paths.append(f"{PANEL_CURRENT_LINK}.rollback-{staged.transaction_id.hex}.tmp")
+    temporary_paths.append(f"{PANEL_CURRENT_LINK}.fleet-{staged.transaction_id.hex}.tmp")
+    return f"rm -f -- {' '.join(temporary_paths)}"
+
+
+async def rollback_snapshot(
+    shell: PanelShell,
+    snapshot: PanelSnapshot,
+    staged: StagedRelease,
+) -> None:
+    """Restore exact files, link, and independent core service states."""
+    if not isinstance(snapshot, PanelSnapshot):
+        raise PanelOpError("invalid_panel_snapshot")
+    if not isinstance(staged, StagedRelease):
+        raise PanelOpError("invalid_staged_release")
+    failure: BaseException | None = None
+    try:
+        for _, service_name, _ in _CORE_SERVICES:
+            await _provisioning_run(
+                shell,
+                _stop_service_command(service_name),
+                "rollback_service_failed",
+            )
+        for service_name, service_snapshot in (
+            (SERVICE_NAME, snapshot.bridge_service),
+            (
+                WIFI_WATCHDOG_SERVICE_NAME,
+                snapshot.wifi_watchdog_service,
+            ),
+            (
+                BUS_WATCHDOG_SERVICE_NAME,
+                snapshot.bus_watchdog_service,
+            ),
+        ):
+            if not service_snapshot.enabled:
+                await _provisioning_run(
+                    shell,
+                    _disable_service_command(service_name),
+                    "rollback_service_failed",
+                )
+        for path, file_snapshot in (
+            (PANEL_ENV_FILE, snapshot.environment_file),
+            (PANEL_VERSION_FILE, snapshot.version_file),
+            (PANEL_UNIT_FILE, snapshot.bridge_service.unit_file),
+            (
+                PANEL_WIFI_WATCHDOG_UNIT_FILE,
+                snapshot.wifi_watchdog_service.unit_file,
+            ),
+            (
+                PANEL_BUS_WATCHDOG_UNIT_FILE,
+                snapshot.bus_watchdog_service.unit_file,
+            ),
+        ):
+            await _restore_file(shell, path, file_snapshot, staged)
+        await _provisioning_run(
+            shell,
+            _rollback_link_command(snapshot, staged),
+            "rollback_restore_failed",
+        )
+        await _provisioning_run(
+            shell,
+            "systemctl daemon-reload",
+            "rollback_reload_failed",
+        )
+        for service_name, service_snapshot in (
+            (SERVICE_NAME, snapshot.bridge_service),
+            (
+                WIFI_WATCHDOG_SERVICE_NAME,
+                snapshot.wifi_watchdog_service,
+            ),
+            (
+                BUS_WATCHDOG_SERVICE_NAME,
+                snapshot.bus_watchdog_service,
+            ),
+        ):
+            await _restore_service_state(shell, service_name, service_snapshot)
+
+        verification_failed = False
+        observed: PanelSnapshot | None = None
+        try:
+            observed = await snapshot_panel(shell)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            verification_failed = True
+        if verification_failed or observed != snapshot:
+            observed = None
+            raise PanelOpError("rollback_verification_failed")
+    except BaseException as error:
+        failure = error
+
+    cleanup_succeeded = await _settled_cleanup_run(
+        shell,
+        _rollback_cleanup_command(staged),
+    )
+    if not cleanup_succeeded:
+        if failure is not None and not isinstance(failure, Exception):
+            raise failure from None
+        raise PanelOpError("rollback_cleanup_failed")
+    if failure is not None:
+        raise failure from None
+
+
+def _cleanup_staged_command(staged: StagedRelease) -> str:
+    temporary = _staged_temp_path(staged)
+    return (
+        f"rm -rf -- {temporary}; "
+        f"if [ -e {PANEL_CURRENT_LINK} ] || [ -L {PANEL_CURRENT_LINK} ]; then "
+        f"test -L {PANEL_CURRENT_LINK} || exit 46; "
+        f'test "$(readlink {PANEL_CURRENT_LINK})" != {staged.release_target} '
+        "|| exit 47; "
+        f"fi; rm -rf -- {staged.release_target}"
+    )
+
+
+async def cleanup_staged(shell: PanelShell, staged: StagedRelease) -> None:
+    """Delete only a transaction-owned candidate after proving it is inactive."""
+    if not isinstance(staged, StagedRelease):
+        raise PanelOpError("invalid_staged_release")
+    await _provisioning_run(
+        shell,
+        _cleanup_staged_command(staged),
+        "staged_cleanup_failed",
+    )
+
+
+async def restart_candidate(
+    shell: PanelShell,
+    staged: StagedRelease,
+    *,
+    on_service_stopped: Callable[[], None],
+) -> None:
+    """Restart the selected bridge around a stop-confirmed health boundary."""
+    if not isinstance(staged, StagedRelease) or not callable(on_service_stopped):
+        raise PanelOpError("invalid_staged_release")
+    await _provisioning_run(
+        shell,
+        (
+            f"test -L {PANEL_CURRENT_LINK} && "
+            f'test "$(readlink {PANEL_CURRENT_LINK})" = {staged.release_target}'
+        ),
+        "candidate_not_active",
+    )
+    await _provisioning_run(
+        shell,
+        _stop_service_command(SERVICE_NAME),
+        "candidate_restart_failed",
+    )
+    try:
+        on_service_stopped()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        raise PanelOpError("candidate_boundary_failed") from None
+    await _provisioning_run(
+        shell,
+        f"systemctl start {SERVICE_NAME}",
+        "candidate_restart_failed",
+    )
+    await _provisioning_run(
+        shell,
+        f"systemctl is-active --quiet {SERVICE_NAME}",
+        "candidate_restart_failed",
+    )
 
 
 async def _checked(shell: PanelShell, command: str) -> RunResult:
@@ -93,10 +1472,28 @@ def _env_quote(value: str) -> str:
     leading `#` comments the var out. We fail closed on control chars and quote
     everything else so the value round-trips byte-for-byte.
     """
-    if "\n" in value or "\r" in value or "\x00" in value:
-        raise ValueError("control characters are not allowed in env values")
+    if any(
+        character in "\n\r" or _invalid_systemd_environment_character(character)
+        for character in value
+    ):
+        raise ValueError(
+            "control characters or unsupported Unicode are not allowed "
+            "in systemd environment values"
+        )
     escaped = value.replace("\\", "\\\\").replace('"', '\\"')
     return f'"{escaped}"'
+
+
+def _invalid_systemd_environment_character(character: str) -> bool:
+    """Match systemd EnvironmentFile's excluded Unicode scalar values."""
+    codepoint = ord(character)
+    return (
+        codepoint == 0
+        or codepoint == 0xFEFF
+        or 0xD800 <= codepoint <= 0xDFFF
+        or 0xFDD0 <= codepoint <= 0xFDEF
+        or codepoint & 0xFFFF in {0xFFFE, 0xFFFF}
+    )
 
 
 # One composite probe so inspection is a single round-trip. Key=0/1 lines, then
@@ -155,6 +1552,7 @@ async def inspect_panel(shell: PanelShell) -> PanelState:
 # render_env writes these; parse_env/read_env recover them when adopting an
 # already-installed panel during onboarding.
 ENV_PANEL = "BRILLIANT_PANEL"
+ENV_DEPLOYMENT_ID = "BRILLIANT_DEPLOYMENT_ID"
 ENV_MQTT_HOST = "MQTT_HOST"
 ENV_MQTT_PORT = "MQTT_PORT"
 ENV_MQTT_USERNAME = "MQTT_USERNAME"
@@ -186,6 +1584,7 @@ def render_env(
     scene_bridge_enabled: bool = False,
     mqtt_tls_enabled: bool = False,
     mqtt_tls_ca_file: str | None = None,
+    deployment_id: str | None = None,
 ) -> str:
     """Render /etc/brilliant-mqtt.env — exactly what the agent's config.py reads.
 
@@ -201,6 +1600,8 @@ def render_env(
         or _MANAGED_MQTT_CA_PATH.fullmatch(mqtt_tls_ca_file) is None
     ):
         raise ValueError("invalid_mqtt_tls_ca_file")
+    if deployment_id is not None and re.fullmatch(r"[0-9a-f]{32}", deployment_id) is None:
+        raise ValueError("invalid_deployment_id")
 
     broker_env = (
         f"{ENV_PANEL}={_env_quote(panel)}\n"
@@ -210,6 +1611,8 @@ def render_env(
         f"{ENV_MQTT_PASSWORD}={_env_quote(mqtt_password)}\n"
         f"{ENV_MQTT_TLS_ENABLED}={1 if mqtt_tls_enabled else 0}\n"
     )
+    if deployment_id is not None:
+        broker_env += f"{ENV_DEPLOYMENT_ID}={deployment_id}\n"
     if mqtt_tls_ca_file:
         broker_env += f"{ENV_MQTT_TLS_CA_FILE}={mqtt_tls_ca_file}\n"
     return (
@@ -252,7 +1655,7 @@ def parse_env(text: str) -> dict[str, str]:
     still always regenerates the env from entry data, never reads it back.
     """
     parsed: dict[str, str] = {}
-    for line in text.splitlines():
+    for line in text.split("\n"):
         stripped = line.strip()
         if not stripped or stripped.startswith("#") or "=" not in stripped:
             continue
@@ -274,7 +1677,7 @@ def _mqtt_tls_assignments(env_content: str) -> tuple[bool | None, ...]:
     false. Existing ambiguous values are treated conservatively by the guard.
     """
     values: list[bool | None] = []
-    for line in env_content.splitlines():
+    for line in env_content.split("\n"):
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue

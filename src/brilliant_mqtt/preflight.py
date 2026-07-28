@@ -5,148 +5,73 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import math
+import os
+import re
+import stat
 import time
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
-from enum import Enum
+from dataclasses import FrozenInstanceError, dataclass
 from typing import Protocol, cast
 from uuid import UUID
 
 from brilliant_mqtt.config import Settings
 from brilliant_mqtt.mqttio import AioMqttAdapter, MqttPayloadDecodeError
-from brilliant_mqtt.setup_protocol import SCHEMA_VERSION, SetupRequest, SetupResult, SetupTopics
-
-_REQUEST_KEYS = frozenset(
-    {"schema_version", "setup_id", "panel_nonce", "ha_nonce", "timeout_seconds"}
+from brilliant_mqtt.setup_protocol import (
+    SCHEMA_VERSION,
+    SetupRequest,
+    SetupResult,
+    SetupTopics,
+)
+from brilliant_mqtt.setup_protocol import (
+    PreflightReport as PreflightReport,
+)
+from brilliant_mqtt.setup_protocol import (
+    PreflightRequest as PreflightRequest,
+)
+from brilliant_mqtt.setup_protocol import (
+    PreflightStage as PreflightStage,
 )
 
 _CONNECT_DETAIL = "MQTT connection failed"
+_SETTINGS_DETAIL = "Panel configuration invalid"
 _PUBLISH_DETAIL = "MQTT publish failed"
 _SUBSCRIBE_DETAIL = "MQTT subscription failed"
 _TIMEOUT_DETAIL = "MQTT stage timed out"
 _PAYLOAD_DETAIL = "MQTT payload validation failed"
 _RETAINED_DETAIL = "Retained replay flag was missing"
 _CLEANUP_DETAIL = "MQTT cleanup failed"
+_RUNTIME_EXCEPTION_ATTRIBUTES = frozenset(
+    {
+        "__cause__",
+        "__context__",
+        "__notes__",
+        "__suppress_context__",
+        "__traceback__",
+    }
+)
+_FAILURE_FIELDS = frozenset({"stage", "code", "detail"})
+_MAX_ENVIRONMENT_FILE_BYTES = 16 * 1024
+_ENVIRONMENT_KEY = re.compile(r"^[A-Z][A-Z0-9_]*$")
+_BARE_ENVIRONMENT_VALUE = re.compile(r"^[A-Za-z0-9_./:+-]+$")
+_PREFLIGHT_ENVIRONMENT_KEYS = frozenset(
+    {
+        "BRILLIANT_PANEL",
+        "BRILLIANT_DEPLOYMENT_ID",
+        "LOG_LEVEL",
+        "MESH_PRIORITY",
+        "MQTT_HOST",
+        "MQTT_PASSWORD",
+        "MQTT_PORT",
+        "MQTT_TLS_CA_FILE",
+        "MQTT_TLS_ENABLED",
+        "MQTT_USERNAME",
+        "RETAINED_TOPICS_FILE",
+        "SCENE_BRIDGE_ENABLED",
+    }
+)
 
 _detached_cleanup_tasks: set[asyncio.Task[None]] = set()
 _detached_preflight_futures: set[asyncio.Future[None]] = set()
-
-
-class PreflightStage(str, Enum):
-    """Ordered panel-side setup validation stages."""
-
-    FLEET_AUTH = "fleet_auth"
-    PANEL_TO_HA = "panel_to_ha"
-    HA_TO_PANEL = "ha_to_panel"
-    DISCOVERY_WRITE = "discovery_write"
-    RETAINED_MESSAGE = "retained_message"
-    CLEANUP = "cleanup"
-
-
-@dataclass(frozen=True, slots=True)
-class PreflightRequest:
-    """Strict input contract passed to the temporary panel process.
-
-    ``timeout_seconds`` is a per-stage result deadline, not a total process
-    deadline. Fleet authentication may exceed it while a non-cancellable OS
-    connect worker settles so cleanup never races a late connection.
-    """
-
-    setup_id: UUID
-    panel_nonce: str
-    ha_nonce: str
-    timeout_seconds: float
-
-    def __post_init__(self) -> None:
-        try:
-            SetupTopics.for_id(self.setup_id)
-            SetupRequest(self.setup_id, self.panel_nonce)
-            SetupResult(self.setup_id, self.ha_nonce, self.panel_nonce)
-        except ValueError as error:
-            raise ValueError(
-                "invalid_preflight_request: invalid setup identity or nonce"
-            ) from error
-        if isinstance(self.timeout_seconds, bool) or not isinstance(
-            self.timeout_seconds, (int, float)
-        ):
-            raise ValueError("invalid_preflight_request: timeout_seconds must be positive")
-        try:
-            timeout_seconds = float(self.timeout_seconds)
-        except (OverflowError, TypeError, ValueError) as error:
-            raise ValueError(
-                "invalid_preflight_request: timeout_seconds must be positive"
-            ) from error
-        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
-            raise ValueError("invalid_preflight_request: timeout_seconds must be positive")
-        object.__setattr__(self, "timeout_seconds", timeout_seconds)
-
-    @classmethod
-    def from_json(cls, raw: str) -> PreflightRequest:
-        """Parse an exact schema-v1 preflight request without echoing input."""
-        try:
-            decoded = json.loads(raw)
-        except (RecursionError, TypeError, ValueError) as error:
-            raise ValueError("invalid_preflight_request: expected a JSON object") from error
-        if not isinstance(decoded, dict):
-            raise ValueError("invalid_preflight_request: expected a JSON object")
-
-        value = cast(dict[str, object], decoded)
-        if set(value) != _REQUEST_KEYS:
-            raise ValueError("invalid_preflight_request: unexpected or missing keys")
-        if type(value["schema_version"]) is not int or value["schema_version"] != SCHEMA_VERSION:
-            raise ValueError("invalid_preflight_request: expected schema_version 1")
-        if not isinstance(value["setup_id"], str):
-            raise ValueError("invalid_preflight_request: invalid setup identity or nonce")
-        try:
-            setup_id = UUID(value["setup_id"])
-        except (AttributeError, TypeError, ValueError) as error:
-            raise ValueError(
-                "invalid_preflight_request: invalid setup identity or nonce"
-            ) from error
-        return cls(
-            setup_id=setup_id,
-            panel_nonce=cast(str, value["panel_nonce"]),
-            ha_nonce=cast(str, value["ha_nonce"]),
-            timeout_seconds=cast(float, value["timeout_seconds"]),
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class PreflightReport:
-    """Deterministic, redacted result consumed by the HA coordinator."""
-
-    setup_id: UUID
-    success: bool
-    completed_stages: tuple[PreflightStage, ...]
-    stage_elapsed_ms: dict[PreflightStage, int]
-    last_stage: PreflightStage | None = None
-    failed_stage: PreflightStage | None = None
-    error_code: str | None = None
-    detail: str | None = None
-
-    def to_json(self) -> str:
-        """Serialize one canonical compact report object."""
-        value: dict[str, object] = {
-            "schema_version": SCHEMA_VERSION,
-            "setup_id": str(self.setup_id),
-            "success": self.success,
-            "completed_stages": [stage.value for stage in self.completed_stages],
-            "stage_elapsed_ms": {
-                stage.value: elapsed for stage, elapsed in self.stage_elapsed_ms.items()
-            },
-        }
-        if self.success:
-            if self.last_stage is not None:
-                value["last_stage"] = self.last_stage.value
-        else:
-            if self.failed_stage is not None:
-                value["failed_stage"] = self.failed_stage.value
-            if self.error_code is not None:
-                value["error_code"] = self.error_code
-            if self.detail is not None:
-                value["detail"] = self.detail
-        return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
 class _PreflightMqtt(Protocol):
@@ -189,11 +114,29 @@ class _MqttFactory(Protocol):
 _Runner = Callable[[Settings, PreflightRequest], Awaitable[PreflightReport]]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class _Failure(Exception):
     stage: PreflightStage
     code: str
     detail: str
+
+    def __post_init__(self) -> None:
+        Exception.__init__(self, self.code)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name in _FAILURE_FIELDS and not hasattr(self, name):
+            object.__setattr__(self, name, value)
+            return
+        if name in _RUNTIME_EXCEPTION_ATTRIBUTES:
+            BaseException.__setattr__(self, name, value)
+            return
+        raise FrozenInstanceError(f"cannot assign to field {name!r}")
+
+    def __delattr__(self, name: str) -> None:
+        if name in _RUNTIME_EXCEPTION_ATTRIBUTES:
+            BaseException.__delattr__(self, name)
+            return
+        raise FrozenInstanceError(f"cannot delete field {name!r}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -469,22 +412,20 @@ async def async_run_preflight(
             try:
                 result = SetupResult.from_payload(payload)
             except ValueError:
-                ha_result.set_result(_InboundResult("mqtt_payload", _PAYLOAD_DETAIL))
                 return
             if (
                 result.setup_id != request.setup_id
                 or result.nonce != request.ha_nonce
                 or result.reply_to_nonce != request.panel_nonce
             ):
-                ha_result.set_result(_InboundResult("mqtt_payload", _PAYLOAD_DETAIL))
                 return
             ha_result.set_result(_InboundResult())
             return
 
         if topic == topics.retained and retained_subscription_active and not retained_result.done():
             if payload != request.panel_nonce:
-                retained_result.set_result(_InboundResult("mqtt_payload", _PAYLOAD_DETAIL))
-            elif not retained:
+                return
+            if not retained:
                 retained_result.set_result(
                     _InboundResult("retained_flag_missing", _RETAINED_DETAIL)
                 )
@@ -492,15 +433,10 @@ async def async_run_preflight(
                 retained_result.set_result(_InboundResult())
 
     async def on_payload_decode_error(error: MqttPayloadDecodeError) -> None:
-        if error.topic == topics.ha_to_panel and not ha_result.done():
-            ha_result.set_result(_InboundResult("mqtt_payload", _PAYLOAD_DETAIL))
-            return
-        if (
-            error.topic == topics.retained
-            and retained_subscription_active
-            and not retained_result.done()
-        ):
-            retained_result.set_result(_InboundResult("mqtt_payload", _PAYLOAD_DETAIL))
+        # Malformed and stale payloads are not evidence about broker behavior.
+        # Exact messages determine success; silence until the bound maps to a
+        # retryable timeout rather than a definitive payload or ACL diagnosis.
+        return
 
     async def fleet_auth() -> None:
         nonlocal mqtt
@@ -692,11 +628,113 @@ def _argument_parser() -> argparse.ArgumentParser:
             "may take longer."
         ),
     )
+    parser.add_argument("--environment-file")
     parser.add_argument("--request-json", required=True)
     return parser
 
 
+def _decode_environment_value(raw: str) -> str:
+    if len(raw) >= 2 and raw[0] == raw[-1] == '"':
+        decoded: list[str] = []
+        index = 1
+        while index < len(raw) - 1:
+            character = raw[index]
+            if character == '"':
+                raise ValueError("invalid_preflight_environment")
+            if character != "\\":
+                decoded.append(character)
+                index += 1
+                continue
+            index += 1
+            if index >= len(raw) - 1 or raw[index] not in {'"', "\\"}:
+                raise ValueError("invalid_preflight_environment")
+            decoded.append(raw[index])
+            index += 1
+        return "".join(decoded)
+    if _BARE_ENVIRONMENT_VALUE.fullmatch(raw) is None:
+        raise ValueError("invalid_preflight_environment")
+    return raw
+
+
+def _invalid_systemd_environment_character(character: str) -> bool:
+    """Match systemd EnvironmentFile's excluded Unicode scalar values."""
+    codepoint = ord(character)
+    return (
+        codepoint == 0
+        or codepoint == 0xFEFF
+        or 0xD800 <= codepoint <= 0xDFFF
+        or 0xFDD0 <= codepoint <= 0xFDEF
+        or codepoint & 0xFFFF in {0xFFFE, 0xFFFF}
+    )
+
+
+def _settings_from_environment_file(path: str) -> Settings:
+    """Read the generated systemd env syntax without invoking a shell."""
+    if not isinstance(path, str) or not path or "\0" in path:
+        raise ValueError("invalid_preflight_environment")
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+        )
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > _MAX_ENVIRONMENT_FILE_BYTES:
+            raise ValueError
+        chunks: list[bytes] = []
+        remaining = metadata.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 65536))
+            if not chunk:
+                raise ValueError
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise ValueError
+        raw_environment = b"".join(chunks).decode("utf-8")
+    except (OSError, UnicodeError, ValueError):
+        raise ValueError("invalid_preflight_environment") from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+    environment: dict[str, str] = {}
+    try:
+        if "\r" in raw_environment or any(
+            _invalid_systemd_environment_character(character) for character in raw_environment
+        ):
+            raise ValueError
+        for line in raw_environment.split("\n"):
+            if not line:
+                continue
+            key, separator, raw_value = line.partition("=")
+            if (
+                not separator
+                or _ENVIRONMENT_KEY.fullmatch(key) is None
+                or key not in _PREFLIGHT_ENVIRONMENT_KEYS
+                or key in environment
+            ):
+                raise ValueError
+            environment[key] = _decode_environment_value(raw_value)
+        return Settings.from_env(environment)
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("invalid_preflight_environment") from None
+
+
 def _cli_failure_json(*, setup_id: UUID | None, code: str, detail: str) -> str:
+    if setup_id is not None:
+        return PreflightReport(
+            setup_id=setup_id,
+            success=False,
+            completed_stages=(PreflightStage.CLEANUP,),
+            stage_elapsed_ms={
+                PreflightStage.FLEET_AUTH: 0,
+                PreflightStage.CLEANUP: 0,
+            },
+            failed_stage=PreflightStage.FLEET_AUTH,
+            error_code=code,
+            detail=detail,
+        ).to_json()
     return json.dumps(
         {
             "schema_version": SCHEMA_VERSION,
@@ -716,7 +754,7 @@ def _cli_failure_json(*, setup_id: UUID | None, code: str, detail: str) -> str:
 async def async_main(
     argv: Sequence[str] | None = None,
     *,
-    settings_factory: Callable[[], Settings] = Settings.from_env,
+    settings_factory: Callable[[], Settings] | None = None,
     runner: _Runner = async_run_preflight,
 ) -> int:
     """Parse CLI input, execute one preflight, and print one JSON object."""
@@ -727,13 +765,18 @@ async def async_main(
         print(_cli_failure_json(setup_id=None, code="mqtt_payload", detail=_PAYLOAD_DETAIL))
         return 1
     try:
-        settings = settings_factory()
+        if settings_factory is not None:
+            settings = settings_factory()
+        elif args.environment_file is not None:
+            settings = _settings_from_environment_file(args.environment_file)
+        else:
+            settings = Settings.from_env()
     except Exception:
         print(
             _cli_failure_json(
                 setup_id=request.setup_id,
-                code="mqtt_connect",
-                detail=_CONNECT_DETAIL,
+                code="settings_invalid",
+                detail=_SETTINGS_DETAIL,
             )
         )
         return 1
