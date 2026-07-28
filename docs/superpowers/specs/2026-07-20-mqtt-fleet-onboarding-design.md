@@ -1,8 +1,7 @@
 # MQTT Fleet Onboarding Simplification — Design
 
 - **Date:** 2026-07-20
-- **Last revised:** 2026-07-21, after medium-effort Fable review and local
-  verification
+- **Last revised:** 2026-07-27, after crash-recovery architecture review
 - **Status:** Approved 2026-07-21; implementation plans ready
 - **Scope:** Replace the one-entry-per-panel setup wizard with a fleet-first
   Home Assistant integration, validate MQTT end to end during onboarding, and
@@ -52,11 +51,22 @@ If Home Assistant is configured with a different discovery prefix, onboarding
 stops with a documented compatibility error rather than creating entities that
 the current panel agent cannot discover correctly.
 
-Fleet creation succeeds only after a temporary device client and Home
+Broker validation succeeds only after a temporary device client and Home
 Assistant's MQTT connection prove authentication, bidirectional messaging,
-same-broker routing, and retained-message behavior. Panel creation succeeds
-only after the same MQTT path works from the panel and the installed service
-publishes its normal availability and discovery data.
+same-broker routing, and retained-message behavior. The flow then creates a
+side-effect-free fleet with zero panels. In `async_on_create_entry`, it waits
+boundedly for Home Assistant core's normal config-entry persistence and
+verifies the exact fleet envelope by on-disk readback. Only then does it chain
+the first panel through the normal **Add panel** subentry flow. The integration
+does not invoke private Home Assistant write paths. No SSH authentication,
+provisioning journal, or panel write may precede that persistence gate. The
+empty fleet is a valid runtime and the durable startup-recovery anchor if Home
+Assistant stops during first-panel onboarding.
+
+Panel creation succeeds only after the same MQTT path works from the panel and
+the installed service publishes its normal availability and discovery data.
+Failure or cancellation leaves the validated empty fleet available for retry
+and rolls back any transaction-owned panel work.
 
 ## Why MQTT remains the transport
 
@@ -222,8 +232,11 @@ The seven current installation-global values move from copied per-panel data
 to this single fleet entry: `ha_control_enabled`, `ha_control_label`,
 `room_overrides`, `ha_control_domains`, `max_mirrored_entities`, `scene_panel`,
 and `scene_actions`. `scene_panel` must reference a panel subentry belonging to
-this fleet. No lexicographic panel-slug election or implicit settings owner
-remains.
+this fleet whenever one or more panels exist. A single stable reserved
+unassigned value is valid only while the fleet has zero panel subentries. The
+first exact journal-to-subentry ownership handoff replaces that sentinel with
+the new subentry ID before the transaction is committed. No lexicographic
+panel-slug election or implicit settings owner remains.
 
 The broker kind changes guidance and defaults only. Runtime validation and
 panel rendering use one normalized connection-profile type for both paths.
@@ -255,13 +268,16 @@ belong to a panel controller/diagnostics store rather than being rewritten into
 the config entry on every update.
 
 The root password is accepted during onboarding and persisted in the long-lived
-subentry only when panel creation succeeds. Immediately before activation, a
+subentry only when panel creation succeeds. Before the first staging write, a
 durable provisioning journal may hold the credential temporarily so a Home
-Assistant restart can finish or roll back the transaction. The journal is
-deleted after promotion to the subentry or verified rollback. Routine options
-flows do not ask for the password. A repair flow asks for a replacement only
-after SSH authentication fails or the user explicitly chooses **Repair SSH
-credentials**. Diagnostics and logs always redact it.
+Assistant restart can roll back the transaction. As soon as the `staged`
+record is durably written, the active panel subentry flow copies that exact
+transaction UUID into its in-memory context. A live fleet reload can therefore
+distinguish the still-owning flow from an abandoned transaction. The journal
+is deleted after promotion to the subentry or verified rollback. Routine
+options flows do not ask for the password. A repair flow asks for a replacement
+only after SSH authentication fails or the user explicitly chooses **Repair
+SSH credentials**. Diagnostics and logs always redact it.
 
 ### Component boundaries
 
@@ -277,7 +293,9 @@ credentials**. Diagnostics and logs always redact it.
   and panel request; it does not read Home Assistant forms directly.
 - **`FleetManager`** owns runtime panel controllers, shared MQTT subscriptions,
   fleet health aggregation, management entities, broker reconfiguration, and
-  global configuration propagation.
+  global configuration propagation. A zero-panel fleet still starts this
+  manager so startup can reconcile or roll back the one durable provisioning
+  journal.
 - **`MigrationPlanner`** is a pure, idempotent helper that inspects all legacy
   entries and produces a no-write consolidation plan or a conflict report.
 - **`MigrationCoordinator`** is a domain-scoped, single-lock service that runs
@@ -405,6 +423,30 @@ timeout alone.
 
 ## Add-panel onboarding
 
+The broker flow and the panel flow have separate ownership. After successful
+broker validation, the initial config flow returns a fleet `CREATE_ENTRY`
+result containing the normalized broker profile, defaults, zero panel
+subentries, mesh allocation starting at `1`, and the reserved unassigned scene
+owner. The result contains no panel credential or provisioning transaction.
+
+Home Assistant adds that entry before invoking `async_on_create_entry`. The
+callback waits boundedly for core's normally scheduled config-entry save and
+verifies the exact singleton fleet/profile envelope by reading persisted
+storage. Only after that succeeds does it initialize `PanelSubentryFlow` and
+attach it as the result's `next_flow`. It never calls Home Assistant's private
+write machinery. A persistence timeout or mismatched readback does not start
+the panel flow and cannot cause SSH authentication or a panel write.
+
+This proves the same process-crash/restart visibility that Home Assistant core
+provides for config entries. The integration does not claim stronger
+sudden-power-loss durability than core's storage implementation, which does not
+expose an fsync barrier for this store.
+
+The chained first-panel experience and the later **Add panel** action use the
+same `PanelSubentryFlow`, allocation logic, validation, provisioning, and
+recovery paths. The first flow is not a private config-flow path that creates a
+parent and subentry together.
+
 ### Step 1: Connect
 
 Ask only for:
@@ -461,13 +503,21 @@ explicitly accepts fail-closed rebind behavior.
 After confirmation, show Home Assistant config-flow progress rather than
 holding a form submission open.
 
-Before its first panel write, the provisioner records durable intent and then
-uploads a transaction-owned immutable release and normalized environment file
-without enabling or replacing the active service. A custom public CA lives
-inside that release, is hash-verified during upload, and is removed with a
-failed candidate. A temporary preflight command from the staged package uses
-the same bundled aiomqtt/Paho stack, broker profile, TLS assets, and credentials
-as the agent. It does not open a Brilliant message-bus peer.
+Immediately before provisioning, the subentry flow again waits boundedly for
+core persistence and verifies the exact parent fleet entry by on-disk
+readback. This closes the window between flow chaining and the first panel side
+effect. If the persistence check fails, confirmation stays retryable with a
+fixed redacted storage error and the provisioner is not called.
+
+Before its first panel write, the provisioner records durable intent at
+`staged` and then uploads a transaction-owned immutable release and normalized
+environment file without enabling or replacing the active service. Once that
+journal write succeeds, its exact transaction UUID is copied into the active
+subentry flow context before a fleet live reload can claim recovery. A custom
+public CA lives inside that release, is hash-verified during upload, and is
+removed with a failed candidate. A temporary preflight command from the staged
+package uses the same bundled aiomqtt/Paho stack, broker profile, TLS assets,
+and credentials as the agent. It does not open a Brilliant message-bus peer.
 
 The preflight command never shell-sources the systemd environment file. It
 passes the path to a bounded parser that opens a regular file without following
@@ -501,11 +551,16 @@ release/config and starts the service. Onboarding waits for:
 - a fresh initial state publication;
 - fresh normal discovery publications.
 
-Pre-existing retained values do not satisfy these checks. Only then promote the
-transaction into the panel subentry, clear the journal, and report success. The
-core bridge plus the current Wi-Fi and independent bus watchdog defaults are
-enabled. Optional voice, diyHue, HA control, and certificate-recovery components
-remain off until their focused post-install flow is completed.
+Pre-existing retained values do not satisfy these checks. Only then mark the
+journal pending config commit and return the proposed panel subentry with the
+same temporary transaction ID. Home Assistant storage and the live runtime must
+both prove that exact ownership. For the first panel, the same handoff also
+normalizes the fleet's reserved unassigned scene owner to the exact new
+subentry ID. The integration durably removes the temporary marker before
+marking the journal committed and clearing it. The core bridge plus the current
+Wi-Fi and independent bus watchdog defaults are enabled. Optional voice,
+diyHue, HA control, and certificate-recovery components remain off until their
+focused post-install flow is completed.
 
 ### Automatic mesh priority
 
@@ -654,6 +709,7 @@ Canonical error families include:
 | Panel SSH | Host unreachable, host-key mismatch, root authentication rejected, duplicate identity | Correct the address/credential, reconfigure the existing panel, or deliberately rebind a replaced panel |
 | Panel compatibility | Unsupported firmware/architecture, low disk/memory, conflicting service | Follow compatibility or cleanup guidance |
 | Activation | Unit failed, availability timeout, initial state/discovery timeout | Show a redacted service-log excerpt, roll back, and offer retry |
+| Home Assistant storage | Core persistence did not produce the exact expected on-disk fleet or panel ownership before the bounded deadline | Retry after storage is writable; no new panel mutation begins |
 | Migration | Conflicting/invalid legacy data, phased commit interrupted | Leave legacy entry active or resume idempotent migration |
 
 The UI presents one recommended action, a retry action, and a direct link to the
@@ -663,11 +719,33 @@ root passwords, private keys, tokens, or unredacted environment files.
 ## Transaction and rollback rules
 
 - Broker-validation failure creates no fleet entry.
+- Successful broker validation creates a side-effect-free empty fleet before
+  panel onboarding. `async_on_create_entry` and the subentry confirmation gate
+  must each await core's normal persistence and verify exact on-disk ownership
+  before any panel side effect. They never invoke private write paths.
 - Panel preflight failure never enables or replaces the service.
 - A durable provisioning journal is written before the first staging write and
-  recovered on Home Assistant startup. Recovery either completes health
-  verification and creates the subentry or rolls the panel back before
-  deleting the journal.
+  recovered on Home Assistant startup through the already-durable fleet.
+- The active `PanelSubentryFlow` copies the exact transaction UUID into its
+  context immediately after the journal reaches `staged`. A live reload may
+  leave that owned transaction alone; it must not infer ownership from address,
+  slug, timing, or credentials.
+- After a Home Assistant restart, flow context is gone. A journal in `staged`,
+  `activation_pending`, `activated`, or `verifying` with no persisted matching
+  subentry is rolled back; startup never invents or auto-creates a panel
+  subentry from sensitive journal data.
+- A `pending_config_commit` journal completes only against one exact matching
+  subentry and singleton fleet envelope whose kind, host, port, and TLS mode
+  match the journal's stored profile. The first exact handoff normalizes the
+  reserved scene owner to that subentry. Missing, competing, or mismatched
+  ownership fails closed and preserves a repairable journal.
+- Removing the fleet may operate on a journal only when the removed entry is
+  the exact singleton fleet and its persisted broker kind, host, port, and TLS
+  mode match the journal envelope. It does not add credentials, certificate
+  bodies, or secret hashes to the journal for this purpose. Ambiguous ownership
+  is preserved and reported rather than guessed. A `committed` record is
+  clear-only: removal must never roll back a panel whose ownership handoff
+  already committed.
 - First-install activation failure leaves no active partial service. Verified
   compensation removes the failed transaction's candidate release before
   clearing the journal.
@@ -847,6 +925,12 @@ the official-app path; external-broker guidance remains protocol-neutral.
 - Fleet and panel schemas, defaults, menus, progress states, and Advanced-field
   visibility.
 - Singleton fleet enforcement and second-setup redirection to **Add panel**.
+- Broker validation followed by a zero-panel `CREATE_ENTRY`, bounded
+  `async_on_create_entry` verification of core-persisted on-disk ownership, and
+  `next_flow` chaining into the normal panel subentry flow.
+- The reserved scene owner accepted only for zero panels, rejected for every
+  other invalid owner, and normalized only by the first exact transaction
+  handoff.
 - Fixed `homeassistant` discovery-prefix compatibility checks and rejection of
   a non-default Home Assistant prefix.
 - Secret sentinel preservation and redaction.
@@ -901,6 +985,14 @@ Use a controlled SSH test server/fake panel filesystem to verify:
 - interruption before activation;
 - Home Assistant interruption immediately after activation and provisioning-
   journal recovery;
+- restart at `staged`, `activation_pending`, `activated`, and `verifying`
+  before the first subentry exists, proving the durable empty fleet loads and
+  rolls the panel back instead of synthesizing ownership;
+- a live fleet reload after `staged`, proving the exact transaction UUID in the
+  active subentry-flow context prevents premature recovery;
+- restart and removal at `pending_config_commit` and `committed`, including
+  exact singleton/profile matching, first-panel scene-owner normalization,
+  ambiguity refusal, and committed clear-only behavior;
 - service failure after activation;
 - exact restoration of a prior release/config;
 - offline panels during fleet changes;
@@ -974,6 +1066,11 @@ rollback, documentation, and preservation gates are met.
 - Official Mosquitto is recommended, documented, and never forced.
 - Existing brokers are first-class and pass the same validation contract.
 - Exactly one fleet matches Home Assistant's one active MQTT broker path.
+- Broker validation creates a durable, side-effect-free empty fleet before the
+  normal panel subentry flow performs SSH authentication or panel mutation.
+- A zero-panel fleet is a valid recovery anchor; the reserved scene owner is
+  invalid as soon as a panel exists and is normalized only by the first exact
+  ownership handoff.
 - One fleet credential is stored once and deployed to every managed panel.
 - TLS uses strict server authentication in both agent runtime and preflight.
 - MQTT Discovery remains on the existing `homeassistant` prefix, and an

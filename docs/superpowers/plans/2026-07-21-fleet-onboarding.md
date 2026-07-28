@@ -4,7 +4,7 @@
 
 **Goal:** Replace repeated per-panel setup with one validated Brilliant MQTT fleet entry and one Home Assistant config subentry per panel, including verify-before-password SSH identity, staged panel preflight, atomic activation, and focused day-two configuration.
 
-**Architecture:** A fleet entry owns the normalized broker profile, one MQTT credential, seven installation-global settings, and a FleetManager. Panel subentries own immutable SSH-key identity, address/credential, stable MQTT slug, components, overrides, and mesh priority. PanelManager consumes a storage adapter rather than a raw ConfigEntry so legacy entries remain loadable while fleet subentries use the same runtime. Config flows contain only UI state; BrokerValidator, PanelProvisioner, ProvisioningJournal, and FleetManager own network and mutation work.
+**Architecture:** A fleet entry owns the normalized broker profile, one MQTT credential, seven installation-global settings, and a FleetManager. Broker validation creates this entry with zero panels and no panel side effects; `async_on_create_entry` waits boundedly for Home Assistant core's normal persistence and verifies exact on-disk ownership before chaining the first panel through the normal PanelSubentryFlow. Panel subentries own immutable SSH-key identity, address/credential, stable MQTT slug, components, overrides, and mesh priority. PanelManager consumes a storage adapter rather than a raw ConfigEntry so legacy entries remain loadable while fleet subentries use the same runtime. Config flows contain only UI state; BrokerValidator, PanelProvisioner, ProvisioningJournal, and FleetManager own network and mutation work.
 
 **Tech Stack:** Home Assistant 2026.6 config entries/subentries, Python 3.14, asyncssh 2.23.1, HA MQTT APIs, the MQTT foundation services from plan 1, voluptuous/selectors, Store-backed journals, pytest-homeassistant-custom-component, uv, ruff, mypy strict.
 
@@ -13,9 +13,11 @@
 - Complete [MQTT foundations](2026-07-21-mqtt-foundations.md) first. Do not begin this plan with failing foundation gates.
 - This is plan 2 of 3. It introduces the fleet runtime and onboarding but retains legacy runtime compatibility; plan 3 performs cross-entry consolidation and retained cleanup.
 - Exactly one fleet config entry is allowed per Home Assistant installation. A fleet matches Home Assistant's one active MQTT broker path.
-- Initial setup validates the broker and provisions the first panel in one continuous flow. No fleet entry is created if either validation or first-panel provisioning fails.
+- Initial setup validates the broker, creates and durably verifies a side-effect-free empty fleet, then chains the first panel through the same PanelSubentryFlow used by later Add panel actions. Broker failure creates no fleet; panel failure or cancellation keeps the valid empty fleet and rolls back transaction-owned panel work.
 - Subsequent Add panel flows ask initially for panel address and root password only. They never ask for MQTT settings, raw JSON, mesh priority, or unrelated optional features.
 - Broker kind changes copy/defaults only. Both kinds normalize into the same BrokerProfile and pass the same validator.
+- Home Assistant Mosquitto (`core_mosquitto`) is the recommended documented prerequisite, never an enforced dependency. Existing local, remote, and hosted brokers remain first-class and use the identical behavioral validator.
+- A stable reserved scene-owner value is valid only while a fleet has zero panel subentries. The first exact journal-to-subentry handoff replaces it with that subentry ID.
 - A panel root password is never sent until an unauthenticated key exchange has produced a candidate key and the authenticated connection pins that exact key.
 - New fleet panels never auto-repin. A key change requires an explicit rebind flow. Legacy auto-repin behavior remains isolated in its compatibility adapter until plan 3 resolves it.
 - The first eligible panel receives mesh priority 1; later panels receive the next unused positive integer. Slugs and priorities are never implicitly renumbered.
@@ -41,8 +43,9 @@
 - Create custom_components/brilliant_mqtt/fleet_manager.py and ha/tests/test_fleet_manager.py: fleet lifecycle and panel lookup.
 - Modify custom_components/brilliant_mqtt/manager.py and ha/tests/test_manager.py: consume PanelConfigStore and remove raw-entry ownership.
 - Modify custom_components/brilliant_mqtt/__init__.py, all platform modules, custom_components/brilliant_mqtt/entity.py, and entity/service tests: one fleet runtime with subentry-associated entities.
-- Rewrite custom_components/brilliant_mqtt/config_flow.py and ha/tests/test_config_flow.py: recommended/existing broker paths, progress validation, first panel, and panel subentry flow.
+- Rewrite custom_components/brilliant_mqtt/config_flow.py and ha/tests/test_config_flow.py: recommended/existing broker paths, progress validation, empty-fleet creation, strict persistence gate, and chained panel subentry flow.
 - Create custom_components/brilliant_mqtt/flow_schemas.py and ha/tests/test_flow_schemas.py: focused normal/advanced forms and secret-preserving updates.
+- Modify custom_components/brilliant_mqtt/fleet_manager.py, custom_components/brilliant_mqtt/__init__.py, ha/tests/test_fleet_manager.py, and ha/tests/test_init.py: zero-panel recovery anchor, exact first-panel handoff, and safe removed-entry recovery.
 - Modify custom_components/brilliant_mqtt/strings.json and custom_components/brilliant_mqtt/translations/en.json: all new screens/errors/remediation links.
 - Modify custom_components/brilliant_mqtt/diagnostics.py and ha/tests/test_diagnostics.py: fleet/panel redacted diagnostics.
 - Modify custom_components/brilliant_mqtt/manifest.json and custom_components/brilliant_mqtt/quality_scale.yaml: integration_type hub and documented quality behavior.
@@ -371,7 +374,16 @@ bounded graceful SSH close is a local cleanup diagnostic, not a reason to
 reopen and destructively roll back a healthy panel. Caller cancellation before
 the config-entry ownership handoff still performs the exact rollback.
 
-async_recover runs before accepting another provisioning request. For activated/verifying it first subscribes for fresh health and either advances to pending_config_commit or rolls back. For pending_config_commit it searches all fleet subentries for the exact transaction ID: a match completes runtime verification and commit; no match after config-flow completion or abort is known rolls the panel back. It never starts a different transaction while a journal exists.
+async_recover runs before accepting another provisioning request. Task 5
+provides the durable empty-fleet anchor and the exact active-flow ownership
+signal. After a Home Assistant restart, no in-memory flow survives:
+`staged`, `activation_pending`, `activated`, or `verifying` without a persisted
+matching subentry therefore rolls back rather than synthesizing a subentry.
+For `pending_config_commit`, recovery accepts only one exact transaction-marked
+subentry in the singleton fleet whose kind, host, port, and TLS mode match the
+journal's stored profile; a match completes runtime verification and commit. A
+`committed` record is clear-only. It never starts a different transaction while
+a journal exists.
 
 - [ ] **Step 6: Run complete provisioning tests**
 
@@ -479,12 +491,18 @@ git commit -m "refactor: manage panels through one fleet runtime"
 - Create: ha/tests/test_flow_schemas.py
 - Rewrite: custom_components/brilliant_mqtt/config_flow.py
 - Rewrite: ha/tests/test_config_flow.py
+- Modify: custom_components/brilliant_mqtt/fleet_manager.py
+- Modify: ha/tests/test_fleet_manager.py
+- Modify: custom_components/brilliant_mqtt/__init__.py
+- Modify: ha/tests/test_init.py
 
 **Interfaces:**
 - BrilliantMqttConfigFlow.async_get_supported_subentry_types returns {"panel": PanelSubentryFlow}.
-- Initial steps: user -> broker -> broker_advanced when selected -> broker_validation -> panel_connect -> panel_confirm -> panel_provision -> create.
+- Initial steps: user -> broker -> broker_advanced when selected -> broker_validation -> fleet_create.
+- BrilliantMqttConfigFlow.async_on_create_entry(result) awaits core persistence, verifies the empty fleet by exact on-disk readback, initializes PanelSubentryFlow, and attaches its flow ID through next_flow.
 - PanelSubentryFlow steps: user -> confirm -> provision -> create.
 - Fleet entry unique_id is brilliant_mqtt_fleet; panel subentry unique_id is SSH SHA256 fingerprint.
+- ProvisioningProgress(STAGING, transaction_id=<UUID>) is the first live-flow ownership signal and occurs only after the journal record is durable.
 
 - [ ] **Step 1: Write failing UI contract tests**
 
@@ -495,16 +513,20 @@ Test exact paths:
 3. existing path exposes host/port/username/password in the normal form;
 4. advanced exposes TLS and custom public CA for either path;
 5. missing/disconnected HA MQTT or a non-homeassistant discovery prefix preserves non-secret inputs, creates no entry, and links the matching docs slug;
-6. broker success advances to panel_connect with no broker fields shown again;
-7. panel_connect asks host and root_password, with root fixed unless Advanced SSH is selected;
-8. confirm shows fingerprint/facts and only name is editable;
-9. provision uses async_show_progress and cannot double-submit;
-10. success creates one fleet entry plus one ConfigSubentryData in the same result;
-11. existing fleet aborts already_configured;
-12. any legacy entry aborts legacy_migration_required rather than creating a competing fleet;
-13. subsequent PanelSubentryFlow receives broker/globals from parent, allocates priority, and creates only panel data;
-14. duplicate fingerprint aborts already_configured and identifies the existing subentry;
-15. failure persists no root/MQTT password in flow result, issue, or logs.
+6. broker success returns an empty fleet CREATE_ENTRY with no panel credential, panel subentry, or provisioning transaction;
+7. the empty fleet stores next_mesh_priority=1 and the one reserved unassigned scene owner;
+8. async_on_create_entry waits boundedly for core persistence and reads back the exact on-disk fleet before initializing the panel subentry flow and returning next_flow;
+9. a persistence timeout or readback mismatch starts no subentry flow and causes zero SSH, journal, or panel writes;
+10. the chained PanelSubentryFlow starts at panel_connect with no broker fields shown again;
+11. panel_connect asks host and root_password, with root fixed unless Advanced SSH is selected;
+12. confirm shows fingerprint/facts and only name is editable;
+13. immediately before provisioning, the flow again waits for core persistence and verifies the exact parent by on-disk readback; failure stays retryable on confirm and calls no provisioner;
+14. provision uses async_show_progress, cannot double-submit, and copies the exact transaction UUID into flow context on the durable STAGING update;
+15. success creates only one ConfigSubentryData under the existing fleet;
+16. existing fleet aborts already_configured and any legacy entry aborts legacy_migration_required;
+17. later PanelSubentryFlow uses the identical parent persistence, allocation, provisioning, and recovery path;
+18. duplicate fingerprint aborts already_configured and identifies the existing subentry;
+19. failure persists no root/MQTT password in flow result, issue, or logs.
 
 - [ ] **Step 2: Run and verify old-flow failures**
 
@@ -522,47 +544,119 @@ Use TextSelector(type=PASSWORD) for secrets and section(advanced_schema, {"colla
 
 Slug allocation lowercases the confirmed name, replaces non-alphanumerics with one hyphen, rejects mesh, truncates at 64 characters, and appends -2, -3 in the first available slot. It is written once. Mesh allocation returns the smallest positive integer not already used and never changes existing priorities.
 
-- [ ] **Step 4: Implement the initial flow as thin orchestration**
+- [ ] **Step 4: Implement side-effect-free empty-fleet creation**
 
-Store in-progress secrets only on the flow instance. Call BrokerValidator in a config-flow progress task. Fetch identity before constructing an authenticated shell. Call async_inspect_panel for confirm. After confirmation call PanelProvisioner in a second progress task.
+Store in-progress MQTT secrets only on the flow instance and call BrokerValidator in a config-flow progress task. Set unique ID brilliant_mqtt_fleet before validation and abort any existing fleet or legacy entry.
 
-On success return:
+After successful validation, use a progress-done transition to fleet_create and
+return:
 
 ~~~python
 self.async_create_entry(
     title="Brilliant MQTT",
     data=fleet_data,
-    subentries=[
-        ConfigSubentryData(
-            data=panel_data,
-            subentry_type=SUBENTRY_TYPE_PANEL,
-            title=panel_name,
-            unique_id=identity.fingerprint,
-        )
-    ],
 )
 ~~~
 
-Set unique ID brilliant_mqtt_fleet before validation and abort any existing fleet. Put provisioning_transaction_id in panel_data and leave the journal at pending_config_commit when returning the result. async_setup_entry matches the stored subentry to the journal, verifies its manager, removes the temporary field, and only then clears the journal. If Home Assistant stops between flow completion and storage, startup recovery either finds that exact subentry or performs the recorded rollback.
+fleet_data contains the normalized broker fields, installation defaults,
+next_mesh_priority=1, schema/version fields, and one stable reserved unassigned
+scene owner. It contains no panel address, SSH/root credential, fingerprint,
+slug, component selection, or provisioning transaction. subentries is empty.
+Broker failure creates no entry. First-panel failure does not delete this valid
+fleet.
 
-- [ ] **Step 5: Implement PanelSubentryFlow with the same services**
+- [ ] **Step 5: Persist the recovery anchor and chain the standard subentry flow**
+
+In BrilliantMqttConfigFlow.async_on_create_entry, require the just-added entry
+to be the exact domain, unique ID, fleet kind, schema version, and normalized
+non-secret broker envelope produced by this flow. Wait under a bounded timeout
+for Home Assistant core's normally scheduled config-entry save, then read
+persisted storage and require that exact fleet entry. Do not call private Store
+write methods, acquire its private write lock, or serialize config entries
+directly.
+
+Only after that proof, initialize:
+
+~~~python
+entry = cast(ConfigEntry[Any], result["result"])
+flow_result = await self.hass.config_entries.subentries.async_init(
+    (entry.entry_id, SUBENTRY_TYPE_PANEL),
+    context={"source": SOURCE_USER},
+)
+result["next_flow"] = (FlowType.CONFIG_SUBENTRIES_FLOW, flow_result["flow_id"])
+return result
+~~~
+
+Use the Home Assistant 2026.6 supported result shape and preserve the original
+CREATE_ENTRY result. On storage failure or mismatched readback, do not
+initialize a subentry flow and do not touch a panel.
+
+Treat this as proof of Home Assistant process-crash/restart visibility, not an
+additional sudden-power-loss guarantee: core does not expose an fsync barrier
+for this config-entry store.
+
+- [ ] **Step 6: Implement PanelSubentryFlow with one crash-safe handoff**
 
 Return {"panel": PanelSubentryFlow} only for an entry_kind=fleet parent. Use _get_entry() and async_create_entry(title=panel_name, data=panel_data, unique_id=identity.fingerprint). Do not copy broker profile, fleet password, CA, or globals into panel_data. Schedule parent reload after successful creation only if its update listener cannot add the new runtime manager live.
 
-- [ ] **Step 6: Run flow and provisioning tests**
+Before calling PanelProvisioner, wait boundedly for core persistence and verify
+the exact parent fleet by on-disk readback again. Surface one fixed redacted
+retryable storage error on confirm if that fails. Fetch identity before
+constructing an authenticated shell, inspect for confirm, allocate the smallest
+unused positive priority, and run provisioning in a non-submit-capable progress
+task.
+
+When PanelProvisioner reports STAGING with a transaction UUID, require the
+journal already to contain that exact staged record, then immediately copy the
+UUID into this active flow's context. Transaction lookup returns FLOW_PENDING
+only for that exact context UUID; a live FleetManager reload must leave it
+alone. Put the same provisioning_transaction_id in the proposed subentry and
+leave the journal at pending_config_commit when returning CREATE_ENTRY.
+
+FleetManager accepts the reserved unassigned scene owner only with zero
+subentries. On the first exact journal/subentry match it atomically replaces
+that sentinel with the new subentry_id and recomputes next_mesh_priority,
+awaits core persistence and verifies exact on-disk parent/subentry ownership,
+verifies the runtime, removes the temporary subentry marker, again awaits and
+verifies core persistence, then commits and clears the journal. A non-empty
+fleet with the sentinel or any unrelated scene owner fails closed.
+
+- [ ] **Step 7: Add startup, abandonment, and removal recovery**
+
+An empty fleet must load a FleetManager and inspect the journal. After restart,
+flow context cannot be trusted because it is not durable. For STAGED,
+ACTIVATION_PENDING, ACTIVATED, or VERIFYING without a persisted exact subentry,
+perform the recorded idempotent rollback; never synthesize a subentry from the
+journal. For PENDING_CONFIG_COMMIT, complete only one exact marked subentry in
+the singleton fleet whose kind, host, port, and TLS mode match the journal.
+
+When Home Assistant abandons either config flow, settle cancellation and
+rollback the context's exact uncommitted transaction. When removing a fleet
+entry, call async_recover_removed_entry even though Home Assistant has already
+removed it from the registry. Recovery may claim the journal only if the
+removed object is the exact singleton fleet envelope and its broker kind, host,
+port, and TLS mode match the journal. Do not add credentials, CA bodies, or
+secret hashes to the journal to strengthen this match. Competing fleet/legacy
+state, a different envelope, or ambiguous markers fail closed and preserve a
+redacted repair. COMMITTED is clear-only and must never trigger panel rollback.
+
+- [ ] **Step 8: Run flow, recovery, and provisioning tests**
 
 Run:
 
 ~~~bash
-uv run --project ha pytest -c ha/pyproject.toml ha/tests/test_flow_schemas.py ha/tests/test_config_flow.py ha/tests/test_panel_provisioner.py ha/tests/test_entry_data.py -q
+uv run --project ha pytest -c ha/pyproject.toml ha/tests/test_flow_schemas.py ha/tests/test_config_flow.py ha/tests/test_fleet_manager.py ha/tests/test_init.py ha/tests/test_panel_provisioner.py ha/tests/test_entry_data.py -q
 ~~~
 
-Expected: PASS across both broker kinds and retry/cancellation branches.
+Expected: PASS across both broker kinds, empty-fleet persistence failures, live
+reload after STAGING, hard restart at every pre-subentry phase, exact
+pending-commit handoff, cancellation, entry removal, COMMITTED clear-only, and
+all retry branches.
 
-- [ ] **Step 7: Commit fleet onboarding UI**
+- [ ] **Step 9: Commit fleet onboarding UI**
 
 ~~~bash
-git add custom_components/brilliant_mqtt/flow_schemas.py custom_components/brilliant_mqtt/config_flow.py ha/tests/test_flow_schemas.py ha/tests/test_config_flow.py
+git add custom_components/brilliant_mqtt/flow_schemas.py custom_components/brilliant_mqtt/config_flow.py custom_components/brilliant_mqtt/fleet_manager.py custom_components/brilliant_mqtt/__init__.py ha/tests/test_flow_schemas.py ha/tests/test_config_flow.py ha/tests/test_fleet_manager.py ha/tests/test_init.py
 git commit -m "feat: add fleet-first panel onboarding"
 ~~~
 
@@ -668,7 +762,7 @@ Expected: FAIL until strings/diagnostics describe the fleet model.
 
 - [ ] **Step 3: Update metadata and documentation**
 
-Set manifest integration_type to hub. Explain the official Mosquitto prerequisite as recommended, never required. Document the Existing broker path at the same hierarchy level, panel-reachable host requirement, first continuous setup, later Add panel, automatic mesh allocation, focused optional-feature setup, strict key pin/rebind, and why a broker change with panels is deferred to the guided operation.
+Set manifest integration_type to hub. Explain the official Mosquitto prerequisite as recommended, never required. Document the Existing broker path at the same hierarchy level, panel-reachable host requirement, broker validation followed by a durable empty fleet and chained first-panel flow, later Add panel, automatic mesh allocation, focused optional-feature setup, strict key pin/rebind, and why a broker change with panels is deferred to the guided operation.
 
 - [ ] **Step 4: Run translation, HACS, and docs checks**
 
@@ -725,6 +819,8 @@ On a disposable HA test instance and designated pilot panel:
 - select Home Assistant Mosquitto;
 - enter a dedicated Brilliant user and panel-reachable broker host;
 - observe all broker stages;
+- verify core persists an empty fleet before the chained panel subentry flow
+  begins;
 - enter only panel address/password;
 - verify the displayed fingerprint/facts;
 - complete staged preflight/activation;
@@ -752,10 +848,13 @@ git commit -m "test: qualify fleet onboarding canaries"
 ## Plan 2 completion criteria
 
 - A new user chooses recommended official Mosquitto or an existing broker and passes identical behavioral validation.
-- Initial setup provisions the first panel without repeating broker or advanced component settings.
+- Initial setup persists a side-effect-free empty fleet, then provisions the first panel through the normal subentry flow without repeating broker or advanced component settings.
 - Later panels are Home Assistant config subentries and initially ask only for address/password.
 - SSH identity is collected before authentication, remains stable across address changes, and fails closed outside explicit rebind.
 - Provisioning is staged, panel-path validated, journaled, atomically activated, fresh-health verified, and recoverable.
+- Startup rolls back every pre-subentry journal phase through the durable empty
+  fleet; exact pending ownership completes, while COMMITTED recovery is
+  clear-only.
 - One FleetManager owns all panel runtimes; management entities associate with their panel subentries.
 - Fleet-global settings exist once; panel slugs and priorities remain stable.
 - Legacy entries still load unchanged in compatibility mode, ready for plan 3 consolidation.

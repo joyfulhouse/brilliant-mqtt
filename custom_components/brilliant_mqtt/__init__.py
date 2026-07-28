@@ -63,7 +63,13 @@ from .const import (
     MIN_REBOOT_JOURNAL_LINES,
     PLATFORMS,
 )
-from .fleet_manager import FleetManager
+from .fleet_manager import (
+    FleetManager,
+    async_recover_removed_entry,
+)
+from .fleet_manager import (
+    get_panel_provisioner as get_panel_provisioner,
+)
 from .manager import PanelManager
 
 _LOGGER = logging.getLogger(__name__)
@@ -402,7 +408,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: BrilliantMqttConfigEntr
 
 
 async def async_remove_entry(hass: HomeAssistant, entry: BrilliantMqttConfigEntry) -> None:
-    """Delete fleet and panel repair issues when their owner is removed."""
+    """Delete owned issues, then settle any exact uncommitted panel handoff."""
     management_ids = {
         str(subentry.data[CONF_MANAGEMENT_ID])
         for subentry in entry.subentries.values()
@@ -414,3 +420,5 @@ async def async_remove_entry(hass: HomeAssistant, entry: BrilliantMqttConfigEntr
         ir.async_delete_issue(hass, DOMAIN, f"ha_mirror_retired_{management_id}")
     ir.async_delete_issue(hass, DOMAIN, f"broker_unavailable_{entry.entry_id}")
     ir.async_delete_issue(hass, DOMAIN, f"runtime_setup_failed_{entry.entry_id}")
+    ir.async_delete_issue(hass, DOMAIN, f"fleet_storage_{entry.entry_id}")
+    await async_recover_removed_entry(hass, entry)

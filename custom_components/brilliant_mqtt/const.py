@@ -10,6 +10,10 @@ ENTRY_KIND_FLEET = "fleet"
 ENTRY_KIND_LEGACY_PENDING_CONSOLIDATION = "legacy_pending_consolidation"
 SUBENTRY_TYPE_PANEL = "panel"
 FLEET_UNIQUE_ID = "brilliant_mqtt_fleet"
+# A zero-panel fleet has no Home Assistant-assigned subentry ID to own scene
+# routing yet. This fixed value is reserved exclusively for that durable bootstrap
+# state and must be replaced by the exact first provisioned panel subentry.
+FLEET_SCENE_OWNER_UNASSIGNED = "__unassigned__"
 PLATFORMS: list[Platform] = [
     Platform.BINARY_SENSOR,
     Platform.BUTTON,

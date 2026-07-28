@@ -14,7 +14,6 @@ from homeassistant.const import CONF_NAME
 from homeassistant.core import HomeAssistant
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.brilliant_mqtt import config_flow
 from custom_components.brilliant_mqtt.broker import BrokerKind
 from custom_components.brilliant_mqtt.const import (
     COMPONENT_BRIDGE,
@@ -289,18 +288,6 @@ def test_panel_identity_must_match_subentry_unique_id() -> None:
                 unique_id="SHA256:different",
             )
         )
-
-
-def test_interim_legacy_flow_payload_is_marked_for_consolidation() -> None:
-    """Version-4 entries made by the old flow remain identifiable as legacy."""
-    original = _panel_data()
-    marked = config_flow._legacy_entry_payload(original)
-
-    assert marked == {
-        **original,
-        "entry_kind": "legacy_pending_consolidation",
-    }
-    assert original.get("entry_kind") is None
 
 
 async def test_fleet_store_preserves_identity_and_updates_parent_subentry(

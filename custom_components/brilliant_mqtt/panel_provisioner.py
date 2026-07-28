@@ -711,6 +711,11 @@ class _RepairReporter(Protocol):
         rollback_code: str,
     ) -> None: ...
 
+    async def async_clear_rollback_failure(
+        self,
+        transaction_id: UUID,
+    ) -> None: ...
+
 
 @dataclass(slots=True, repr=False)
 class _InstallState:
@@ -1000,14 +1005,6 @@ class PanelProvisioner:
         ):
             raise PanelProvisioningError("release_prepare_failed")
 
-        state.failure_code = "progress_failed"
-        state.failure_stage = "progress"
-        await _report(
-            progress,
-            ProvisioningProgressStage.STAGING,
-            state.transaction_id,
-            state.setup_id,
-        )
         state.staged = self._staged_release_factory(
             bundle.version,
             state.transaction_id,
@@ -1061,6 +1058,14 @@ class PanelProvisioner:
         if create_outcome.cancellation is not None:
             raise create_outcome.cancellation from None
 
+        state.failure_code = "progress_failed"
+        state.failure_stage = "progress"
+        await _report(
+            progress,
+            ProvisioningProgressStage.STAGING,
+            state.transaction_id,
+            state.setup_id,
+        )
         state.failure_code = "stage_failed"
         state.failure_stage = "stage"
         staged_result = await self._operations.stage_release(
@@ -1338,12 +1343,27 @@ class PanelProvisioner:
         if not _is_uuid4(transaction_id):
             raise PanelProvisioningError("commit_failed")
         async with self._lock:
-            outcome = await _settle(
-                self._journal.async_transition(
+
+            async def mark_pending() -> None:
+                record = await self._journal.async_load()
+                if (
+                    isinstance(record, ProvisioningRecord)
+                    and record.transaction_id == transaction_id
+                    and record.phase is ProvisioningPhase.PENDING_CONFIG_COMMIT
+                ):
+                    return
+                if (
+                    not isinstance(record, ProvisioningRecord)
+                    or record.transaction_id != transaction_id
+                    or record.phase is not ProvisioningPhase.VERIFYING
+                ):
+                    raise PanelProvisioningError("commit_failed")
+                await self._journal.async_transition(
                     transaction_id,
                     ProvisioningPhase.PENDING_CONFIG_COMMIT,
                 )
-            )
+
+            outcome = await _settle(mark_pending())
             if outcome.cancellation is not None:
                 raise outcome.cancellation from None
             if outcome.error is not None:
@@ -1359,12 +1379,15 @@ class PanelProvisioner:
         if not _is_uuid4(transaction_id):
             raise PanelProvisioningError("commit_failed")
         async with self._lock:
-            outcome = await _settle(
-                self._journal.async_complete_commit(
+
+            async def complete_commit() -> None:
+                await self._journal.async_complete_commit(
                     transaction_id,
                     subentry_id=subentry_id,
                 )
-            )
+                await self._repair_reporter.async_clear_rollback_failure(transaction_id)
+
+            outcome = await _settle(complete_commit())
             if outcome.cancellation is not None:
                 raise outcome.cancellation from None
             if outcome.error is not None:
@@ -1405,9 +1428,11 @@ class PanelProvisioner:
                 record.transaction_id,
                 verified=True,
             )
+            await self._repair_reporter.async_clear_rollback_failure(record.transaction_id)
             return
         if record.phase is ProvisioningPhase.COMMITTED:
             await self._journal.async_clear_committed(record.transaction_id)
+            await self._repair_reporter.async_clear_rollback_failure(record.transaction_id)
             return
         if record.phase is ProvisioningPhase.PENDING_CONFIG_COMMIT:
             lookup = await self._transaction_lookup(record.transaction_id)
@@ -1418,6 +1443,7 @@ class PanelProvisioner:
                     record.transaction_id,
                     subentry_id=lookup.subentry_id,
                 )
+                await self._repair_reporter.async_clear_rollback_failure(record.transaction_id)
                 return
 
         staged = self._staged_release_factory(
@@ -1458,6 +1484,7 @@ class PanelProvisioner:
                     record.transaction_id,
                     verified=True,
                 )
+                await self._repair_reporter.async_clear_rollback_failure(record.transaction_id)
             elif record.phase in {
                 ProvisioningPhase.ACTIVATION_PENDING,
                 ProvisioningPhase.ROLLBACK_PENDING,
@@ -1474,66 +1501,79 @@ class PanelProvisioner:
                 ProvisioningPhase.ACTIVATED,
                 ProvisioningPhase.VERIFYING,
             }:
-                observer = self._health_observer_factory(record.panel_request.slug)
-                health_failed = False
-                try:
-                    await observer.async_subscribe()
-
-                    def mark_candidate_boundary() -> None:
-                        observer.mark_activation_started(
-                            record.staged_version,
-                            record.transaction_id.hex,
-                        )
-
-                    await self._operations.restart_candidate(
-                        shell,
-                        staged,
-                        on_service_stopped=mark_candidate_boundary,
-                    )
-                    await observer.async_wait(
-                        record.staged_version,
-                        self._health_timeout,
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    health_failed = True
-                if health_failed:
+                lookup = await self._transaction_lookup(record.transaction_id)
+                if lookup.state is TransactionLookupState.FLOW_ABORTED_OR_ABSENT:
                     await self._async_recovery_rollback(
                         record,
                         shell,
                         snapshot,
                         staged,
-                        original_code="health_failed",
+                        original_code="flow_aborted",
                     )
                 else:
-                    if record.phase is ProvisioningPhase.ACTIVATED:
-                        record = await self._journal.async_transition(
-                            record.transaction_id,
-                            ProvisioningPhase.VERIFYING,
+                    observer = self._health_observer_factory(record.panel_request.slug)
+                    health_failed = False
+                    try:
+                        await observer.async_subscribe()
+
+                        def mark_candidate_boundary() -> None:
+                            observer.mark_activation_started(
+                                record.staged_version,
+                                record.transaction_id.hex,
+                            )
+
+                        await self._operations.restart_candidate(
+                            shell,
+                            staged,
+                            on_service_stopped=mark_candidate_boundary,
                         )
-                    lookup = await self._transaction_lookup(record.transaction_id)
-                    if lookup.state is TransactionLookupState.FLOW_ABORTED_OR_ABSENT:
+                        await observer.async_wait(
+                            record.staged_version,
+                            self._health_timeout,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        health_failed = True
+                    if health_failed:
                         await self._async_recovery_rollback(
                             record,
                             shell,
                             snapshot,
                             staged,
-                            original_code="flow_aborted",
+                            original_code="health_failed",
                         )
                     else:
-                        await self._journal.async_transition(
-                            record.transaction_id,
-                            ProvisioningPhase.PENDING_CONFIG_COMMIT,
-                        )
-                        if (
-                            lookup.state is TransactionLookupState.MATCHED
-                            and lookup.subentry_id is not None
-                        ):
-                            await self._journal.async_complete_commit(
+                        if record.phase is ProvisioningPhase.ACTIVATED:
+                            record = await self._journal.async_transition(
                                 record.transaction_id,
-                                subentry_id=lookup.subentry_id,
+                                ProvisioningPhase.VERIFYING,
                             )
+                        lookup = await self._transaction_lookup(record.transaction_id)
+                        if lookup.state is TransactionLookupState.FLOW_ABORTED_OR_ABSENT:
+                            await self._async_recovery_rollback(
+                                record,
+                                shell,
+                                snapshot,
+                                staged,
+                                original_code="flow_aborted",
+                            )
+                        else:
+                            await self._journal.async_transition(
+                                record.transaction_id,
+                                ProvisioningPhase.PENDING_CONFIG_COMMIT,
+                            )
+                            if (
+                                lookup.state is TransactionLookupState.MATCHED
+                                and lookup.subentry_id is not None
+                            ):
+                                await self._journal.async_complete_commit(
+                                    record.transaction_id,
+                                    subentry_id=lookup.subentry_id,
+                                )
+                                await self._repair_reporter.async_clear_rollback_failure(
+                                    record.transaction_id
+                                )
         except asyncio.CancelledError:
             raise
         except PanelProvisioningError as error:
@@ -1601,6 +1641,7 @@ class PanelProvisioner:
             current.transaction_id,
             verified=True,
         )
+        await self._repair_reporter.async_clear_rollback_failure(current.transaction_id)
 
     def _next_id(self) -> UUID:
         candidate = self._id_factory()

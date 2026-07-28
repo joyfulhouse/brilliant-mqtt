@@ -55,6 +55,8 @@ from custom_components.brilliant_mqtt.ha_control_protocol import (
     state_topic,
 )
 from custom_components.brilliant_mqtt.manager import PanelManager
+from custom_components.brilliant_mqtt.panel_provisioner import PanelProvisioner
+from custom_components.brilliant_mqtt.shell import HostIdentity
 
 
 async def test_integration_discoverable(hass: HomeAssistant) -> None:
@@ -64,6 +66,25 @@ async def test_integration_discoverable(hass: HomeAssistant) -> None:
     assert integration.integration_type == "device"
     assert "mqtt" in (integration.dependencies or [])
     assert any(r.startswith("asyncssh==") for r in integration.requirements or [])
+
+
+def test_config_flow_resolves_production_provisioner_from_package_root(
+    hass: HomeAssistant,
+) -> None:
+    """The lazy config-flow seam resolves without tests patching its factory."""
+    from custom_components.brilliant_mqtt.config_flow import _get_panel_provisioner
+
+    provisioner = _get_panel_provisioner(
+        hass,
+        expected_identity=HostIdentity(
+            public_key=(
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKIykuTed7zNwJwn20eCelcKcHKJ9c/pGFfvulRWazuC"
+            ),
+            fingerprint="SHA256:JfCon51dCgE/yWGkyroh3Ne+ONLMm6QmHMQnEoPSLx0",
+        ),
+    )
+
+    assert isinstance(provisioner, PanelProvisioner)
 
 
 ENTRY_DATA = {
@@ -77,6 +98,50 @@ ENTRY_DATA = {
     CONF_MQTT_PASSWORD: "mqttpass",
     DATA_SSH_HOST_KEY: "ssh-ed25519 PINNED",
 }
+
+
+async def test_ha_remove_delegates_recovery_after_registry_owner_is_deleted(
+    hass: HomeAssistant,
+) -> None:
+    """The integration sees the removed entry only after HA drops registry ownership."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="removed-owner",
+        data=ENTRY_DATA,
+    )
+    entry.add_to_hass(hass)
+    observed: list[str] = []
+
+    async def recover_removed(
+        candidate_hass: HomeAssistant,
+        removed: MockConfigEntry,
+    ) -> None:
+        assert candidate_hass is hass
+        assert removed is entry
+        assert hass.config_entries.async_get_entry(entry.entry_id) is None
+        observed.append(removed.entry_id)
+
+    with (
+        patch(
+            "custom_components.brilliant_mqtt.async_recover_removed_entry",
+            side_effect=recover_removed,
+        ) as recover,
+        patch(
+            "custom_components.brilliant_mqtt.ir.async_delete_issue",
+        ) as delete_issue,
+    ):
+        await hass.config_entries.async_remove(entry.entry_id)
+
+    assert observed == [entry.entry_id]
+    recover.assert_awaited_once_with(hass, entry)
+    assert {call.args[2] for call in delete_issue.call_args_list} == {
+        f"needs_attention_{entry.entry_id}",
+        f"voice_missing_{entry.entry_id}",
+        f"ha_mirror_retired_{entry.entry_id}",
+        f"broker_unavailable_{entry.entry_id}",
+        f"runtime_setup_failed_{entry.entry_id}",
+        f"fleet_storage_{entry.entry_id}",
+    }
 
 
 def _entry_manager(entry: MockConfigEntry) -> PanelManager:

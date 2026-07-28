@@ -48,6 +48,7 @@ from custom_components.brilliant_mqtt.panel_provisioner import (
     PanelProvisioningError,
     PanelReleaseBundle,
     ProvisioningProgress,
+    ProvisioningProgressStage,
     StagedRelease,
     TransactionLookup,
     TransactionLookupState,
@@ -76,6 +77,7 @@ from tests.fakes import FakePanelProcess, FakeShell
 _PUBLIC_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKIykuTed7zNwJwn20eCelcKcHKJ9c/pGFfvulRWazuC"
 _FINGERPRINT = "SHA256:JfCon51dCgE/yWGkyroh3Ne+ONLMm6QmHMQnEoPSLx0"
 _TRANSACTION_ID = UUID("12345678-1234-4abc-8def-1234567890ab")
+_OTHER_TRANSACTION_ID = UUID("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
 _SETUP_ID = UUID("87654321-4321-4cba-8fed-ba0987654321")
 _STARTED_AT = datetime(2026, 7, 27, 18, 30, tzinfo=UTC)
 _VERSION = "0.7.0"
@@ -541,6 +543,30 @@ class _FakeJournal:
                 await self.block_pending_commit.wait()
         assert self.record is not None
         assert self.record.transaction_id == transaction_id
+        allowed = {
+            ProvisioningPhase.STAGED: {
+                ProvisioningPhase.ACTIVATION_PENDING,
+                ProvisioningPhase.ROLLBACK_PENDING,
+            },
+            ProvisioningPhase.ACTIVATION_PENDING: {
+                ProvisioningPhase.ACTIVATED,
+                ProvisioningPhase.ROLLBACK_PENDING,
+            },
+            ProvisioningPhase.ACTIVATED: {
+                ProvisioningPhase.VERIFYING,
+                ProvisioningPhase.ROLLBACK_PENDING,
+            },
+            ProvisioningPhase.VERIFYING: {
+                ProvisioningPhase.PENDING_CONFIG_COMMIT,
+                ProvisioningPhase.ROLLBACK_PENDING,
+            },
+            ProvisioningPhase.PENDING_CONFIG_COMMIT: {ProvisioningPhase.ROLLBACK_PENDING},
+            ProvisioningPhase.COMMITTED: set(),
+            ProvisioningPhase.ROLLBACK_PENDING: set(),
+            ProvisioningPhase.ROLLED_BACK: set(),
+        }
+        if phase not in allowed[self.record.phase]:
+            raise RuntimeError("invalid journal transition")
         self.record = replace(self.record, phase=phase, last_error=last_error)
         if phase is self.block_after_transition:
             self.transition_committed.set()
@@ -754,6 +780,7 @@ class _FakeObserver:
 class _FakeRepairReporter:
     def __init__(self, events: list[tuple[object, ...]]) -> None:
         self.events = events
+        self.cleared: list[UUID] = []
 
     async def async_report_rollback_failure(
         self,
@@ -763,6 +790,9 @@ class _FakeRepairReporter:
         rollback_code: str,
     ) -> None:
         self.events.append(("repair", transaction_id, original_code, rollback_code))
+
+    async def async_clear_rollback_failure(self, transaction_id: UUID) -> None:
+        self.cleared.append(transaction_id)
 
 
 class _Harness:
@@ -781,6 +811,7 @@ class _Harness:
         self.inspection_error: PanelCompatibilityError | None = None
         self.preflight_error: BaseException | None = None
         self.omit_custom_ca = False
+        self.repair_reporter = _FakeRepairReporter(self.events)
 
     async def fetch_identity(self, host: str) -> HostIdentity:
         self.events.append(("identity", host))
@@ -899,9 +930,12 @@ class _Harness:
     def id_factory(self) -> UUID:
         return next(self.ids)
 
-    def provisioner(self) -> PanelProvisioner:
+    def provisioner(
+        self,
+        operation_lock: asyncio.Lock | None = None,
+    ) -> PanelProvisioner:
         return PanelProvisioner(
-            operation_lock=asyncio.Lock(),
+            operation_lock=operation_lock or asyncio.Lock(),
             journal=self.journal,
             identity_fetcher=self.fetch_identity,
             shell_factory=self.shell_factory,
@@ -916,7 +950,7 @@ class _Harness:
             broker_validator=self,
             health_observer_factory=self.observer_factory,
             transaction_lookup=self.transaction_lookup,
-            repair_reporter=_FakeRepairReporter(self.events),
+            repair_reporter=self.repair_reporter,
             id_factory=self.id_factory,
             clock=lambda: _STARTED_AT,
             health_timeout=45.0,
@@ -1015,6 +1049,67 @@ async def test_install_has_exact_durable_order_and_returns_canonical_panel_data(
         ("journal_transition", ProvisioningPhase.VERIFYING.value),
         ("shell_close",),
     ]
+
+
+async def test_staging_progress_observes_exact_durable_record_before_panel_write() -> None:
+    harness = _Harness()
+    record_at_staging: ProvisioningRecord | None = None
+
+    async def progress(update: ProvisioningProgress) -> None:
+        nonlocal record_at_staging
+        harness.events.append(("progress", update.stage.value))
+        if update.stage is ProvisioningProgressStage.STAGING:
+            record_at_staging = harness.journal.record
+            assert update.transaction_id == _TRANSACTION_ID
+            assert update.setup_id == _SETUP_ID
+
+    await harness.provisioner().async_install(
+        _request(),
+        _fleet(),
+        progress,
+    )
+
+    assert record_at_staging == _record(ProvisioningPhase.STAGED)
+    assert record_at_staging is harness.journal.created_record
+    journal_create = harness.events.index(("journal_create", ProvisioningPhase.STAGED.value))
+    staging_progress = harness.events.index(("progress", ProvisioningProgressStage.STAGING.value))
+    first_panel_write = next(
+        index for index, event in enumerate(harness.events) if event[0] == "stage"
+    )
+    assert journal_create < staging_progress < first_panel_write
+
+
+async def test_staging_progress_failure_compensates_durable_record_before_panel_write() -> None:
+    harness = _Harness()
+    record_at_staging: ProvisioningRecord | None = None
+
+    async def failing_progress(update: ProvisioningProgress) -> None:
+        nonlocal record_at_staging
+        harness.events.append(("progress", update.stage.value))
+        if update.stage is ProvisioningProgressStage.STAGING:
+            record_at_staging = harness.journal.record
+            raise RuntimeError("SECRET progress callback failure")
+
+    with pytest.raises(PanelProvisioningError) as raised:
+        await harness.provisioner().async_install(
+            _request(),
+            _fleet(),
+            failing_progress,
+        )
+
+    assert raised.value.code == "progress_failed"
+    assert record_at_staging == _record(ProvisioningPhase.STAGED)
+    assert not any(event[0] == "stage" for event in harness.events)
+    assert ("cleanup_staged", _TRANSACTION_ID) in harness.events
+    assert harness.journal.record is None
+    assert (
+        harness.events.index(("journal_create", ProvisioningPhase.STAGED.value))
+        < harness.events.index(("progress", ProvisioningProgressStage.STAGING.value))
+        < harness.events.index(("cleanup_staged", _TRANSACTION_ID))
+    )
+    assert harness.events[-1] == ("shell_close",)
+    assert "SECRET" not in repr(raised.value)
+    assert _exception_graph(raised.value) == [raised.value]
 
 
 def _exception_graph(root: BaseException) -> list[BaseException]:
@@ -1450,6 +1545,42 @@ async def test_cancel_after_staged_journal_commit_settles_then_cleans_candidate(
     with pytest.raises(asyncio.CancelledError):
         await task
 
+    assert not any(event[0] == "stage" for event in harness.events)
+    assert ("cleanup_staged", _TRANSACTION_ID) in harness.events
+    assert harness.journal.record is None
+    assert harness.events[-1] == ("shell_close",)
+
+
+async def test_cancel_during_staging_progress_compensates_durable_record() -> None:
+    harness = _Harness()
+    progress_started = asyncio.Event()
+    phase_at_staging: ProvisioningPhase | None = None
+
+    async def blocking_progress(update: ProvisioningProgress) -> None:
+        nonlocal phase_at_staging
+        harness.events.append(("progress", update.stage.value))
+        if update.stage is ProvisioningProgressStage.STAGING:
+            phase_at_staging = (
+                None if harness.journal.record is None else harness.journal.record.phase
+            )
+            progress_started.set()
+            await asyncio.Event().wait()
+
+    task = asyncio.create_task(
+        harness.provisioner().async_install(
+            _request(),
+            _fleet(),
+            blocking_progress,
+        )
+    )
+    await asyncio.wait_for(progress_started.wait(), timeout=1.0)
+
+    task.cancel()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert phase_at_staging is ProvisioningPhase.STAGED
     assert not any(event[0] == "stage" for event in harness.events)
     assert ("cleanup_staged", _TRANSACTION_ID) in harness.events
     assert harness.journal.record is None
@@ -1957,6 +2088,25 @@ async def test_recovery_cleans_or_rolls_back_interrupted_mutation_phases(
         assert not any(event[0] == "rollback" for event in harness.events)
 
 
+async def test_successful_recovery_retry_clears_prior_transaction_repair() -> None:
+    """A non-fixable rollback issue cannot survive the retry that resolves it."""
+    harness = _Harness()
+    harness.journal.record = _record(ProvisioningPhase.ROLLBACK_PENDING)
+    harness.operations.fail_at.add("rollback")
+
+    with pytest.raises(PanelProvisioningError, match="rollback_failed"):
+        await harness.provisioner().async_recover(harness.progress)
+
+    assert harness.repair_reporter.cleared == []
+    assert any(event[0] == "repair" for event in harness.events)
+
+    harness.operations.fail_at.remove("rollback")
+    await harness.provisioner().async_recover(harness.progress)
+
+    assert harness.journal.record is None
+    assert harness.repair_reporter.cleared == [_TRANSACTION_ID]
+
+
 async def test_recovery_rejects_unpinned_shell_before_password_authentication() -> None:
     harness = _Harness()
     harness.journal.record = _record(ProvisioningPhase.ACTIVATION_PENDING)
@@ -2020,20 +2170,26 @@ async def test_recovery_verified_candidate_commits_only_exact_transaction_match(
     assert harness.journal.record is None
 
 
-async def test_recovery_verified_candidate_rolls_back_authoritative_abort() -> None:
+@pytest.mark.parametrize(
+    "phase",
+    (ProvisioningPhase.ACTIVATED, ProvisioningPhase.VERIFYING),
+)
+async def test_recovery_aborted_candidate_rolls_back_without_restart_or_health(
+    phase: ProvisioningPhase,
+) -> None:
     harness = _Harness()
-    harness.journal.record = _record(ProvisioningPhase.VERIFYING)
+    harness.journal.record = _record(phase)
     harness.lookup = TransactionLookup(TransactionLookupState.FLOW_ABORTED_OR_ABSENT)
 
     await harness.provisioner().async_recover(harness.progress)
 
-    health_index = next(
-        index for index, event in enumerate(harness.events) if event[0] == "health_wait"
+    assert not any(
+        isinstance(event[0], str) and event[0].startswith("health_") for event in harness.events
     )
-    rollback_index = next(
-        index for index, event in enumerate(harness.events) if event[0] == "rollback"
+    assert not any(
+        isinstance(event[0], str) and event[0].startswith("restart") for event in harness.events
     )
-    assert health_index < rollback_index
+    assert any(event[0] == "rollback" for event in harness.events)
     assert harness.journal.record is None
 
 
@@ -2140,6 +2296,7 @@ async def test_pending_and_commit_hooks_preserve_exact_transaction_identity() ->
     await provisioner.async_mark_pending_config_commit(_TRANSACTION_ID)
     assert harness.journal.record is not None
     assert harness.journal.record.phase is ProvisioningPhase.PENDING_CONFIG_COMMIT
+    assert harness.repair_reporter.cleared == []
 
     await provisioner.async_complete_config_commit(
         _TRANSACTION_ID,
@@ -2147,6 +2304,92 @@ async def test_pending_and_commit_hooks_preserve_exact_transaction_identity() ->
     )
     assert harness.journal.record is None
     assert ("journal_commit", "panel-subentry-id") in harness.events
+    assert harness.repair_reporter.cleared == [_TRANSACTION_ID]
+
+
+async def test_pending_hook_is_idempotent_only_for_exact_pending_transaction() -> None:
+    harness = _Harness()
+    harness.journal.record = _record(ProvisioningPhase.PENDING_CONFIG_COMMIT)
+
+    await harness.provisioner().async_mark_pending_config_commit(_TRANSACTION_ID)
+
+    assert harness.journal.record is not None
+    assert harness.journal.record.phase is ProvisioningPhase.PENDING_CONFIG_COMMIT
+    assert not any(event[0] == "journal_transition" for event in harness.events)
+
+
+@pytest.mark.parametrize(
+    ("record", "transaction_id"),
+    [
+        (None, _TRANSACTION_ID),
+        (_record(ProvisioningPhase.PENDING_CONFIG_COMMIT), _OTHER_TRANSACTION_ID),
+        (_record(ProvisioningPhase.STAGED), _TRANSACTION_ID),
+        (_record(ProvisioningPhase.COMMITTED), _TRANSACTION_ID),
+    ],
+    ids=["missing", "wrong_transaction", "staged", "committed"],
+)
+async def test_pending_hook_idempotency_fails_closed(
+    record: ProvisioningRecord | None,
+    transaction_id: UUID,
+) -> None:
+    harness = _Harness()
+    harness.journal.record = record
+
+    with pytest.raises(PanelProvisioningError) as raised:
+        await harness.provisioner().async_mark_pending_config_commit(transaction_id)
+
+    assert raised.value.code == "commit_failed"
+
+
+async def test_queued_recovery_may_advance_before_original_pending_hook() -> None:
+    """A queued installer can recover VERIFYING before the original flow resumes."""
+    harness = _Harness()
+    operation_lock = asyncio.Lock()
+    original = harness.provisioner(operation_lock)
+    contender = harness.provisioner(operation_lock)
+    result = await original.async_install(
+        _request(),
+        _fleet(),
+        harness.progress,
+    )
+    assert harness.journal.record is not None
+    assert harness.journal.record.phase is ProvisioningPhase.VERIFYING
+
+    harness.journal.block_pending_commit = asyncio.Event()
+    contender_task = asyncio.create_task(
+        contender.async_install(
+            _request(),
+            _fleet(),
+            harness.progress,
+        )
+    )
+    await harness.journal.pending_commit_started.wait()
+    mark_task = asyncio.create_task(
+        original.async_mark_pending_config_commit(result.transaction_id)
+    )
+    await asyncio.sleep(0)
+    assert mark_task.done() is False
+
+    harness.journal.block_pending_commit.set()
+    with pytest.raises(PanelProvisioningError) as raised:
+        await contender_task
+    assert raised.value.code == "transaction_in_progress"
+    await mark_task
+
+    final_record = await harness.journal.async_load()
+    assert final_record is not None
+    assert final_record.phase is ProvisioningPhase.PENDING_CONFIG_COMMIT
+    assert (
+        sum(
+            event
+            == (
+                "journal_transition",
+                ProvisioningPhase.PENDING_CONFIG_COMMIT.value,
+            )
+            for event in harness.events
+        )
+        == 1
+    )
 
 
 async def test_pending_commit_hook_settles_write_under_repeated_cancel() -> None:
@@ -2192,6 +2435,7 @@ async def test_complete_commit_hook_settles_write_under_repeated_cancel() -> Non
 
     assert harness.journal.record is None
     assert ("journal_commit", "panel-subentry-id") in harness.events
+    assert harness.repair_reporter.cleared == [_TRANSACTION_ID]
 
 
 async def test_install_never_starts_second_transaction_while_recovery_is_pending() -> None:
