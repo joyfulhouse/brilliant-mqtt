@@ -24,7 +24,6 @@ from typing import Any, Protocol
 import asyncssh
 from homeassistant.components import mqtt, persistent_notification
 from homeassistant.components.mqtt.models import ReceiveMessage
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import issue_registry as ir
@@ -32,26 +31,23 @@ from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.event import async_call_later
 
 from . import panel_ops
+from .broker import PanelBrokerReleaseSettings
 from .const import (
     AVAILABILITY_OFFLINE,
     AVAILABILITY_ONLINE,
+    COMPONENT_BRIDGE,
     COMPONENT_BUS_WATCHDOG,
     COMPONENT_HA_MIRROR,
     COMPONENT_HUE_CA,
     COMPONENT_VOICE,
     COMPONENT_WIFI_WATCHDOG,
     CONF_COMPONENTS,
-    CONF_HA_CONTROL_ENABLED,
     CONF_HA_MIRROR_LEADER_PRIORITY,
     CONF_HA_MIRROR_TOKEN,
     CONF_HA_MIRROR_WS_URL,
     CONF_HOST,
     CONF_HUE_CA_CERT,
     CONF_MESH_PRIORITY,
-    CONF_MQTT_HOST,
-    CONF_MQTT_PASSWORD,
-    CONF_MQTT_PORT,
-    CONF_MQTT_USERNAME,
     CONF_PANEL,
     CONF_ROOT_PASSWORD,
     CONF_VOICE_HA_HOST,
@@ -60,7 +56,6 @@ from .const import (
     DATA_LAST_FIRMWARE,
     DATA_SSH_HOST_KEY,
     DEFAULT_AUTO_REPAIR,
-    DEFAULT_HA_CONTROL_ENABLED,
     DEFAULT_OFFLINE_GRACE_MINUTES,
     DEFAULT_REBOOT_JOURNAL_LINES,
     DEFAULT_REPAIR_COOLDOWN_MINUTES,
@@ -81,17 +76,27 @@ from .const import (
     OPT_OFFLINE_GRACE_MINUTES,
     OPT_REPAIR_COOLDOWN_MINUTES,
     OPT_TRUST_HOST_KEY_CHANGES,
+    PANEL_MQTT_TLS_DIR,
     SIGNAL_PANEL_STATE,
     VOICE_PAYLOAD_VERSION,
     availability_topic,
     meta_topic,
     panel_device_name,
 )
+from .entry_data import FleetConfig, LegacyPanelStore, PanelConfigStore
 from .panel_ops import PanelOpError
-from .shell import PanelShell, _LegacyAsyncsshShell
+from .shell import (
+    AsyncsshShell as _StrictAsyncsshShell,
+)
+from .shell import (
+    PanelIdentityError,
+    PanelShell,
+    _LegacyAsyncsshShell,
+)
 from .voice_payload import VoicePayloadError, async_fetch_voice_payload
 
-AsyncsshShell = _LegacyAsyncsshShell
+AsyncsshShell = _StrictAsyncsshShell
+LegacyAsyncsshShell = _LegacyAsyncsshShell
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -173,10 +178,17 @@ _BUS_WATCHDOG_RELAY = _WatchdogRelaySpec(
 class PanelManager:
     """Owns one panel's state. Entities read it; the state machine mutates it."""
 
-    def __init__(self, hass: HomeAssistant, entry: ConfigEntry, ssh_lock: asyncio.Lock) -> None:
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        store: PanelConfigStore,
+        fleet: FleetConfig,
+        ssh_lock: asyncio.Lock,
+    ) -> None:
         self.hass = hass
-        self.entry = entry
-        self.panel: str = entry.data[CONF_PANEL]
+        self.store = store
+        self.fleet = fleet
+        self.panel: str = str(store.data[CONF_PANEL])
         self._ssh_lock = ssh_lock  # fleet-wide: ONE panel SSH op at a time
         self.availability: str | None = None  # None until the retained LWT arrives
         self.meta: dict[str, Any] | None = None
@@ -193,38 +205,72 @@ class PanelManager:
         # resumes AFTER shutdown's one-shot cancel; this flag stops it re-arming a
         # timer that would then fire on a torn-down entry and SSH a removed panel.
         self._shutting_down = False
+        self._last_firmware: Any = (
+            store.data.get(DATA_LAST_FIRMWARE) if isinstance(store, LegacyPanelStore) else None
+        )
+
+    @property
+    def management_id(self) -> str:
+        """Return the stable identity used by signals, events, and entities."""
+        return self.store.management_id
+
+    def update_config(self, store: PanelConfigStore, fleet: FleetConfig) -> None:
+        """Adopt a validated live config snapshot without restarting MQTT watchers."""
+        if (
+            store.panel_id != self.store.panel_id
+            or store.management_id != self.management_id
+            or store.data[CONF_PANEL] != self.panel
+        ):
+            raise ValueError("immutable_panel_runtime_identity")
+        self.store = store
+        self.fleet = fleet
+        self._notify()
+
+    @callback
+    def mark_runtime_degraded(self, reason: str) -> None:
+        """Expose an isolated setup failure without leaking its exception text."""
+        self._set_problem(True, reason)
 
     @property
     def signal(self) -> str:
         """Dispatcher signal entities subscribe to for state refreshes."""
-        return f"{SIGNAL_PANEL_STATE}_{self.entry.entry_id}"
+        return f"{SIGNAL_PANEL_STATE}_{self.management_id}"
 
     @property
     def _issue_id(self) -> str:
         """Stable issue-registry id for this panel's 'needs attention' repair issue."""
-        return f"needs_attention_{self.entry.entry_id}"
+        return f"needs_attention_{self.management_id}"
 
     @property
     def _voice_issue_id(self) -> str:
         """Issue-registry id for 'voice enabled but satellite not running'."""
-        return f"voice_missing_{self.entry.entry_id}"
+        return f"voice_missing_{self.management_id}"
 
     @property
     def _ha_mirror_issue_id(self) -> str:
-        return f"ha_mirror_retired_{self.entry.entry_id}"
+        return f"ha_mirror_retired_{self.management_id}"
 
     def _shell(self) -> PanelShell:
-        return AsyncsshShell(
-            self.entry.data[CONF_HOST],
-            self.entry.data[CONF_ROOT_PASSWORD],
-            self.entry.data.get(DATA_SSH_HOST_KEY),
-        )
+        host = self.store.data[CONF_HOST]
+        password = self.store.data[CONF_ROOT_PASSWORD]
+        pinned_host_key = self.store.data.get(DATA_SSH_HOST_KEY)
+        if isinstance(self.store, LegacyPanelStore):
+            return LegacyAsyncsshShell(host, password, pinned_host_key)
+        if not isinstance(pinned_host_key, str):
+            raise PanelIdentityError("pinned_host_key_required")
+        return AsyncsshShell(host, password, pinned_host_key)
 
     def _shell_unpinned(self) -> PanelShell:
         # Mirrors _shell() but with NO pinned key: this connect WILL offer the root
         # password to whatever host answers. Used only after an explicit opt-in to
         # re-pin a rotated host key (see _connect_for_repair).
-        return AsyncsshShell(self.entry.data[CONF_HOST], self.entry.data[CONF_ROOT_PASSWORD], None)
+        if not isinstance(self.store, LegacyPanelStore):
+            raise RuntimeError("fleet_unpinned_shell_forbidden")
+        return LegacyAsyncsshShell(
+            self.store.data[CONF_HOST],
+            self.store.data[CONF_ROOT_PASSWORD],
+            None,
+        )
 
     def _retain_abandoned_close(self, task: asyncio.Task[None]) -> None:
         """Strongly retain and eventually consume a cancellation-resistant close."""
@@ -282,7 +328,9 @@ class PanelManager:
             # Caught BEFORE any generic asyncssh.Error (this is the only except here,
             # so every other connect failure propagates to the caller's handler).
             await self._async_close_shell_or_raise(shell)
-            if not self._opt(OPT_TRUST_HOST_KEY_CHANGES, DEFAULT_TRUST_HOST_KEY_CHANGES):
+            if not isinstance(self.store, LegacyPanelStore) or not self._opt(
+                OPT_TRUST_HOST_KEY_CHANGES, DEFAULT_TRUST_HOST_KEY_CHANGES
+            ):
                 raise _HostKeyChanged from None
             repinned = self._shell_unpinned()
             try:
@@ -300,9 +348,7 @@ class PanelManager:
                 # not caused by the host-key mismatch — chain to None, and it reaches
                 # the caller's (OSError, asyncssh.Error) handler as "unreachable".
                 raise OSError("no host key captured on re-pin") from None
-            self.hass.config_entries.async_update_entry(
-                self.entry, data={**self.entry.data, DATA_SSH_HOST_KEY: new_key}
-            )
+            self.store.update_data({**self.store.data, DATA_SSH_HOST_KEY: new_key})
             self._fire(EVENT_HOST_KEY_REPINNED, {"new_host_key": new_key})
             return repinned
         except asyncio.CancelledError:
@@ -314,16 +360,40 @@ class PanelManager:
         return shell
 
     async def async_setup(self) -> None:
-        self._unsubs.append(
-            await mqtt.async_subscribe(
-                self.hass, availability_topic(self.panel), self._on_availability
+        self._shutting_down = False
+        try:
+            self._unsubs.append(
+                await mqtt.async_subscribe(
+                    self.hass, availability_topic(self.panel), self._on_availability
+                )
             )
-        )
-        self._unsubs.append(
-            await mqtt.async_subscribe(self.hass, meta_topic(self.panel), self._on_meta)
-        )
-        if self._legacy_retirement_evidence(include_verified_history=True):
-            await self.async_retire_legacy_ha_mirror(force_history_audit=True)
+            self._unsubs.append(
+                await mqtt.async_subscribe(self.hass, meta_topic(self.panel), self._on_meta)
+            )
+            if isinstance(self.store, LegacyPanelStore) and self._legacy_retirement_evidence(
+                include_verified_history=True
+            ):
+                await self.async_retire_legacy_ha_mirror(force_history_audit=True)
+        except BaseException:
+            for failure in self._drain_unsubscribers():
+                _LOGGER.warning(
+                    "%s: subscription cleanup failed after setup failure (%s)",
+                    self.panel,
+                    type(failure).__name__,
+                )
+            raise
+
+    def _drain_unsubscribers(self) -> list[BaseException]:
+        """Release every MQTT subscriber and clear ownership before callbacks run."""
+        unsubscribers = tuple(self._unsubs)
+        self._unsubs.clear()
+        failures: list[BaseException] = []
+        for unsubscribe in unsubscribers:
+            try:
+                unsubscribe()
+            except BaseException as error:
+                failures.append(error)
+        return failures
 
     async def async_shutdown(self) -> None:
         # Latch shutdown FIRST: a repair wedged in the ssh_lock checks this flag
@@ -331,23 +401,47 @@ class PanelManager:
         self._shutting_down = True
         # Cancel any in-flight timers BEFORE dropping the subscriptions so an entry
         # unload (or reload) never leaves a grace/recovery callback dangling.
-        self._cancel("_grace_cancel")
-        self._cancel("_recovery_cancel")
-        for unsub in self._unsubs:
-            unsub()
-        self._unsubs.clear()
+        failures: list[BaseException] = []
+        for attribute in ("_grace_cancel", "_recovery_cancel"):
+            cancel: CALLBACK_TYPE | None = getattr(self, attribute)
+            setattr(self, attribute, None)
+            if cancel is None:
+                continue
+            try:
+                cancel()
+            except BaseException as error:
+                failures.append(error)
+        failures.extend(self._drain_unsubscribers())
+        if failures:
+            for secondary in failures[1:]:
+                _LOGGER.warning(
+                    "%s: additional runtime cleanup failed (%s)",
+                    self.panel,
+                    type(secondary).__name__,
+                )
+            raise failures[0]
 
     @callback
     def _notify(self) -> None:
         async_dispatcher_send(self.hass, self.signal)
 
     def _opt(self, key: str, default: Any) -> Any:
-        return self.entry.options.get(key, default)
+        return self.store.options.get(key, default)
+
+    def _panel_override(self, key: str, default: Any) -> Any:
+        """Read new-fleet feature overrides while preserving legacy data layout."""
+        if isinstance(self.store, LegacyPanelStore):
+            return self.store.data.get(key, default)
+        return self.store.options.get(key, default)
 
     def _fire(self, event_type: str, data: dict[str, Any] | None = None) -> None:
         self.hass.bus.async_fire(
             EVENT_TYPE,
-            {"type": event_type, "panel": self.panel, "entry_id": self.entry.entry_id}
+            {
+                "type": event_type,
+                "panel": self.panel,
+                "entry_id": self.management_id,
+            }
             | (data or {}),
         )
 
@@ -362,12 +456,14 @@ class PanelManager:
         self._notify()
 
     def _legacy_retirement_evidence(self, *, include_verified_history: bool = False) -> bool:
-        components = self.entry.data.get(CONF_COMPONENTS, {})
+        if not isinstance(self.store, LegacyPanelStore):
+            return False
+        components = self.store.data.get(CONF_COMPONENTS, {})
         component_evidence = (
             isinstance(components, Mapping) and components.get(COMPONENT_HA_MIRROR) is True
         )
         config_evidence = any(
-            key in self.entry.data
+            key in self.store.data
             for key in (
                 CONF_HA_MIRROR_WS_URL,
                 CONF_HA_MIRROR_TOKEN,
@@ -379,7 +475,7 @@ class PanelManager:
             or config_evidence
             or (
                 include_verified_history
-                and self.entry.data.get(DATA_HA_MIRROR_RETIRE_VERIFIED) is True
+                and self.store.data.get(DATA_HA_MIRROR_RETIRE_VERIFIED) is True
             )
         )
 
@@ -412,19 +508,21 @@ class PanelManager:
         )
 
     def _persist_verified_ha_mirror_retirement(self) -> None:
-        data = dict(self.entry.data)
+        if not isinstance(self.store, LegacyPanelStore):
+            return
+        data = dict(self.store.data)
         components = dict(data.get(CONF_COMPONENTS) or {})
         components[COMPONENT_HA_MIRROR] = False
         data[CONF_COMPONENTS] = components
         data[DATA_HA_MIRROR_RETIRE_VERIFIED] = True
-        if data.get(CONF_HA_CONTROL_ENABLED, DEFAULT_HA_CONTROL_ENABLED) is True:
+        if self.fleet.ha_control_enabled:
             for key in (
                 CONF_HA_MIRROR_WS_URL,
                 CONF_HA_MIRROR_TOKEN,
                 CONF_HA_MIRROR_LEADER_PRIORITY,
             ):
                 data.pop(key, None)
-        self.hass.config_entries.async_update_entry(self.entry, data=data)
+        self.store.update_data(data)
 
     def _finalize_verified_ha_mirror_retirement(self) -> None:
         """Persist proof only after the owning shell has closed successfully."""
@@ -512,6 +610,30 @@ class PanelManager:
             cancel()
             setattr(self, attr, None)
 
+    @callback
+    def _arm_offline_grace(self) -> None:
+        """Ensure an offline panel retains exactly one path to recovery."""
+        if (
+            self._shutting_down
+            or self.availability != AVAILABILITY_OFFLINE
+            or self.problem_reason == _RETAINED_LEDGER_PROBLEM
+            or self._grace_cancel is not None
+            or self._recovery_cancel is not None
+            or self._repairing
+        ):
+            return
+        grace_s = self._opt(OPT_OFFLINE_GRACE_MINUTES, DEFAULT_OFFLINE_GRACE_MINUTES) * 60
+        _LOGGER.info(
+            "%s: bridge is unavailable (LWT offline); starting %d-minute grace period",
+            self.panel,
+            grace_s // 60,
+        )
+        self._grace_cancel = async_call_later(
+            self.hass,
+            grace_s,
+            self._grace_expired,
+        )
+
     async def _on_availability(self, msg: ReceiveMessage) -> None:
         if self._shutting_down:
             return  # defense-in-depth: never arm a timer on a torn-down entry
@@ -528,20 +650,8 @@ class PanelManager:
                 self._notify()
             else:
                 self._set_problem(False, None)
-        elif (
-            payload == AVAILABILITY_OFFLINE
-            and self.problem_reason != _RETAINED_LEDGER_PROBLEM
-            and self._grace_cancel is None
-            and self._recovery_cancel is None
-            and not self._repairing
-        ):
-            grace_s = self._opt(OPT_OFFLINE_GRACE_MINUTES, DEFAULT_OFFLINE_GRACE_MINUTES) * 60
-            _LOGGER.info(
-                "%s: bridge is unavailable (LWT offline); starting %d-minute grace period",
-                self.panel,
-                grace_s // 60,
-            )
-            self._grace_cancel = async_call_later(self.hass, grace_s, self._grace_expired)
+        elif payload == AVAILABILITY_OFFLINE:
+            self._arm_offline_grace()
         self._notify()
 
     async def _grace_expired(self, _now: datetime) -> None:
@@ -581,27 +691,45 @@ class PanelManager:
         )
         self._set_problem(True, reason)
 
-    async def _config_contents(self) -> tuple[str, str]:
-        """(unit, env): unit from the bundled payload, env re-rendered from entry data.
+    def _broker_release_settings(self) -> PanelBrokerReleaseSettings:
+        """Render broker settings without exporting fleet credentials.
 
-        Always regenerated from known-good sources — never read back from the
-        panel — so a repair also heals config drift.
+        A custom CA needs a nonempty path to release its public bytes. Connected
+        operations stage those bytes first and render again with the exact
+        content-addressed path returned by ``stage_mqtt_ca``.
         """
-        unit = await self.hass.async_add_executor_job(
+        mqtt_ca_path = (
+            f"{PANEL_MQTT_TLS_DIR}/mqtt-ca-0000000000000000.pem"
+            if self.fleet.broker.has_custom_ca
+            else None
+        )
+        return self.fleet.broker.panel_release_settings(
+            panel=self.panel,
+            mesh_priority=self.store.data[CONF_MESH_PRIORITY],
+            scene_bridge_enabled=self.fleet.ha_control_enabled,
+            mqtt_ca_path=mqtt_ca_path,
+        )
+
+    async def _async_stage_broker_ca(self, shell: PanelShell) -> str:
+        """Stage optional public trust material and return its bound environment."""
+        settings = self._broker_release_settings()
+        if settings.mqtt_ca is not None:
+            staged_path = await panel_ops.stage_mqtt_ca(shell, settings.mqtt_ca)
+            settings = self.fleet.broker.panel_release_settings(
+                panel=self.panel,
+                mesh_priority=self.store.data[CONF_MESH_PRIORITY],
+                scene_bridge_enabled=self.fleet.ha_control_enabled,
+                mqtt_ca_path=staged_path,
+            )
+            if staged_path not in settings.environment:
+                raise PanelOpError("staged MQTT CA path did not match rendered environment")
+        return settings.environment
+
+    async def _unit_contents(self) -> str:
+        """Read the bundled service unit without creating a throwaway broker env."""
+        return await self.hass.async_add_executor_job(
             (_payload_dir() / "brilliant-mqtt.service").read_text
         )
-        data = self.entry.data
-        env = panel_ops.render_env(
-            panel=self.panel,
-            mesh_priority=data[CONF_MESH_PRIORITY],
-            mqtt_host=data[CONF_MQTT_HOST],
-            mqtt_port=data[CONF_MQTT_PORT],
-            mqtt_username=data[CONF_MQTT_USERNAME],
-            mqtt_password=data[CONF_MQTT_PASSWORD],
-            scene_bridge_enabled=data.get(CONF_HA_CONTROL_ENABLED, DEFAULT_HA_CONTROL_ENABLED)
-            is True,
-        )
-        return unit, env
 
     async def _payload_version(self) -> str:
         """The bundled agent payload's version string (read off-thread; blocking IO)."""
@@ -613,15 +741,14 @@ class PanelManager:
         """Render the voice env. *wake_word* overrides the persisted value so a push can
         use a NOT-YET-persisted word (async_set_voice_wake_word persists only on success).
         """
-        data = self.entry.data
         return panel_ops.render_voice_env(
             panel=self.panel,
             name=panel_device_name(self.panel),
             api_port=6053,  # LVA ESPHome API; not exposed per-panel this phase
             wake_word=wake_word
             if wake_word is not None
-            else data.get(CONF_VOICE_WAKE_WORD, DEFAULT_VOICE_WAKE_WORD),
-            ha_host=data.get(CONF_VOICE_HA_HOST, ""),
+            else self._panel_override(CONF_VOICE_WAKE_WORD, DEFAULT_VOICE_WAKE_WORD),
+            ha_host=self._panel_override(CONF_VOICE_HA_HOST, ""),
             enable_aec=False,  # AEC ships OFF (barge-in tuning is a follow-up)
         )
 
@@ -683,7 +810,7 @@ class PanelManager:
             )
             state = await panel_ops.inspect_hue_ca(shell)
             if not state.payload_present:
-                ca_pem = str(self.entry.data.get(CONF_HUE_CA_CERT, "")).strip()
+                ca_pem = str(self._panel_override(CONF_HUE_CA_CERT, "")).strip()
                 if not ca_pem:
                     _LOGGER.warning(
                         "%s: hue-ca code is missing and no CA certificate is "
@@ -715,7 +842,7 @@ class PanelManager:
             # any escape here would otherwise wedge _repairing=True forever (it is called from
             # timers/the Repair button).
             voice_tarball: str | None = None
-            if self.entry.data.get(CONF_COMPONENTS, {}).get(COMPONENT_VOICE, False):
+            if self.store.data.get(CONF_COMPONENTS, {}).get(COMPONENT_VOICE, False):
                 try:
                     voice_tarball = await async_fetch_voice_payload(self.hass)
                 except VoicePayloadError as fetch_err:
@@ -755,7 +882,8 @@ class PanelManager:
                 try:
                     retirement_result: bool | None = None
                     state = await panel_ops.inspect_panel(shell)
-                    unit, env = await self._config_contents()
+                    unit = await self._unit_contents()
+                    env = await self._async_stage_broker_ca(shell)
                     # Bootstrap a code-less panel (never installed, or its /var code was
                     # lost): lay the agent payload down BEFORE enabling the unit, so the
                     # Repair button / auto-repair can install from scratch rather than
@@ -794,7 +922,7 @@ class PanelManager:
                     # swallowed — a watchdog outage must not block the bridge repair.
                     from .components import selected_ids  # lazy: components imports manager
 
-                    selected = selected_ids(self.entry.data)
+                    selected = selected_ids(self.store.data)
                     if COMPONENT_WIFI_WATCHDOG in selected:
                         if err := await self._relay_watchdog(shell, _WIFI_WATCHDOG_RELAY):
                             _LOGGER.warning("%s: watchdog repair failed: %s", self.panel, err)
@@ -912,7 +1040,8 @@ class PanelManager:
                 _p(25)
                 try:
                     retirement_result: bool | None = None
-                    unit, env = await self._config_contents()
+                    unit = await self._unit_contents()
+                    env = await self._async_stage_broker_ca(shell)
                     await panel_ops.async_assert_no_mqtt_tls_downgrade(shell, env)
                     _p(40)
                     await panel_ops.deploy_payload(shell, str(_payload_dir()), version)
@@ -1107,11 +1236,30 @@ class PanelManager:
 
     async def _set_component_flag(self, component_id: str, enabled: bool) -> None:
         """Persist a component's selected state into entry data."""
-        components = dict(self.entry.data.get(CONF_COMPONENTS, {}))
+        components = dict(self.store.data.get(CONF_COMPONENTS, {}))
         components[component_id] = enabled
-        self.hass.config_entries.async_update_entry(
-            self.entry, data={**self.entry.data, CONF_COMPONENTS: components}
-        )
+        self.store.update_data({**self.store.data, CONF_COMPONENTS: components})
+
+    async def _async_install_bridge(self, shell: PanelShell) -> None:
+        """Install the bridge using the broker's non-exporting render seam."""
+        unit = await self._unit_contents()
+        env = await self._async_stage_broker_ca(shell)
+        await panel_ops.async_assert_no_mqtt_tls_downgrade(shell, env)
+        await panel_ops.deploy_payload(shell, str(_payload_dir()), await self._payload_version())
+        await panel_ops.ensure_configs(shell, unit, env)
+        await panel_ops.enable_now(shell)
+
+    def _component_install_data(self, component_id: str) -> Mapping[str, Any]:
+        """Expose only the fields one optional component deliberately consumes."""
+        data: dict[str, Any] = {CONF_PANEL: self.panel}
+        if component_id == COMPONENT_VOICE:
+            data[CONF_VOICE_WAKE_WORD] = self._panel_override(
+                CONF_VOICE_WAKE_WORD, DEFAULT_VOICE_WAKE_WORD
+            )
+            data[CONF_VOICE_HA_HOST] = self._panel_override(CONF_VOICE_HA_HOST, "")
+        elif component_id == COMPONENT_HUE_CA:
+            data[CONF_HUE_CA_CERT] = self._panel_override(CONF_HUE_CA_CERT, "")
+        return data
 
     async def async_install_component(self, component_id: str) -> None:
         """SSH-install a component, then record it as selected.
@@ -1127,7 +1275,14 @@ class PanelManager:
         async with self._ssh_lock:
             shell = await self._connect_for_repair()
             try:
-                await component.install(self.hass, shell, self.entry.data)
+                if component_id == COMPONENT_BRIDGE:
+                    await self._async_install_bridge(shell)
+                else:
+                    await component.install(
+                        self.hass,
+                        shell,
+                        self._component_install_data(component_id),
+                    )
             finally:
                 await shell.close()
         await self._set_component_flag(component_id, True)
@@ -1195,13 +1350,14 @@ class PanelManager:
         shows the OLD word the panel is actually using. When voice is disabled there is no
         panel to push to, so just persist.
         """
-        if self.entry.data.get(CONF_COMPONENTS, {}).get(COMPONENT_VOICE, False):
+        if self.store.data.get(CONF_COMPONENTS, {}).get(COMPONENT_VOICE, False):
             async with self._voice_ssh_session() as shell:
                 await panel_ops.ensure_voice_config(shell, self._voice_env(wake_word=wake_word))
                 await panel_ops.restart_voice(shell)
-        self.hass.config_entries.async_update_entry(
-            self.entry, data={**self.entry.data, CONF_VOICE_WAKE_WORD: wake_word}
-        )
+        if isinstance(self.store, LegacyPanelStore):
+            self.store.update_data({**self.store.data, CONF_VOICE_WAKE_WORD: wake_word})
+        else:
+            self.store.update_options({**self.store.options, CONF_VOICE_WAKE_WORD: wake_word})
         self._notify()
 
     async def _recovery_timeout(self, _now: datetime) -> None:
@@ -1264,21 +1420,24 @@ class PanelManager:
 
         clear_retained_ledger_problem = self.problem_reason == _RETAINED_LEDGER_PROBLEM
         firmware = meta.get("panel_firmware")
-        previous = self.entry.data.get(DATA_LAST_FIRMWARE)
+        previous = self._last_firmware
         if firmware and firmware != previous:
-            self.hass.config_entries.async_update_entry(
-                self.entry, data={**self.entry.data, DATA_LAST_FIRMWARE: firmware}
-            )
+            self._last_firmware = firmware
+            if isinstance(self.store, LegacyPanelStore):
+                self.store.update_data({**self.store.data, DATA_LAST_FIRMWARE: firmware})
             if previous is not None:
                 self._fire(
                     EVENT_PANEL_UPDATED,
                     {"old_firmware": previous, "new_firmware": firmware},
                 )
-                self.entry.async_create_background_task(
-                    self.hass, self._refresh_staged_copies(), name=f"{self.panel}-staged"
+                self.store.async_create_background_task(
+                    self.hass,
+                    self._refresh_staged_copies(),
+                    name=f"{self.panel}-staged",
                 )
         if clear_retained_ledger_problem:
             self._set_problem(False, None)
+            self._arm_offline_grace()
         else:
             self._notify()
 
@@ -1290,13 +1449,14 @@ class PanelManager:
                 await shell.connect()
                 try:
                     retirement_result: bool | None = None
-                    unit, env = await self._config_contents()
+                    unit = await self._unit_contents()
+                    env = await self._async_stage_broker_ca(shell)
                     await panel_ops.ensure_configs(shell, unit, env)
                     # Wi-Fi watchdog: also re-lay its unit when selected — OTA wipes /etc
                     # and the watchdog unit disappears even though the code in /var survives.
                     from .components import selected_ids  # lazy: components imports manager
 
-                    selected = selected_ids(self.entry.data)
+                    selected = selected_ids(self.store.data)
                     if COMPONENT_WIFI_WATCHDOG in selected:
                         if await self._relay_watchdog(shell, _WIFI_WATCHDOG_RELAY):
                             _LOGGER.warning(

@@ -11,6 +11,7 @@ import pytest
 import voluptuous as vol
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import area_registry as ar
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from pytest_homeassistant_custom_component.common import MockConfigEntry, async_fire_mqtt_message
@@ -30,6 +31,8 @@ from custom_components.brilliant_mqtt.ha_control_protocol import (
     mode_result_topic,
 )
 from tests.fakes import FakeShell
+from tests.test_entry_data import _fleet_data
+from tests.test_fleet_manager import _panel
 from tests.test_init import ENTRY_DATA
 
 
@@ -48,6 +51,295 @@ async def _setup_control_entry(hass: HomeAssistant) -> MockConfigEntry:
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
     return entry
+
+
+async def _setup_fleet_entry(hass: HomeAssistant) -> MockConfigEntry:
+    """Load one fleet with two complete panel subentries."""
+    office = _panel("office", "SHA256:office", subentry_id="panel-office")
+    kitchen = _panel(
+        "kitchen",
+        "SHA256:kitchen",
+        subentry_id="panel-kitchen",
+        mesh_priority=2,
+    )
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="brilliant_mqtt_fleet",
+        version=4,
+        data=_fleet_data(),
+        subentries_data=[office.as_dict(), kitchen.as_dict()],
+    )
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    return entry
+
+
+@pytest.mark.allow_lingering_timers
+async def test_service_entity_target_operates_on_only_its_panel_subentry(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    fake_shell: FakeShell,
+    payload_dir: Path,
+) -> None:
+    """A management entity target narrows a fleet runtime to exactly one panel."""
+    entry = await _setup_fleet_entry(hass)
+    office = entry.runtime_data.panels["panel-office"]
+    kitchen = entry.runtime_data.panels["panel-kitchen"]
+    office.async_repair = AsyncMock()
+    kitchen.async_repair = AsyncMock()
+    entity_id = er.async_get(hass).async_get_entity_id(
+        "binary_sensor", DOMAIN, "SHA256:office_bridge_health"
+    )
+    assert entity_id is not None
+
+    await hass.services.async_call(
+        DOMAIN,
+        "repair",
+        {"entity_id": entity_id},
+        blocking=True,
+    )
+
+    office.async_repair.assert_awaited_once_with(trigger="service")
+    kitchen.async_repair.assert_not_awaited()
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_service_panel_device_target_operates_on_only_its_panel_subentry(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    fake_shell: FakeShell,
+    payload_dir: Path,
+) -> None:
+    """The shared MQTT device keeps enough subentry identity to select one panel."""
+    entry = await _setup_fleet_entry(hass)
+    office = entry.runtime_data.panels["panel-office"]
+    kitchen = entry.runtime_data.panels["panel-kitchen"]
+    office.async_repair = AsyncMock()
+    kitchen.async_repair = AsyncMock()
+    device = dr.async_get(hass).async_get_device(identifiers={("mqtt", "brilliant_panel_office")})
+    assert device is not None
+
+    await hass.services.async_call(
+        DOMAIN,
+        "repair",
+        {"device_id": device.id},
+        blocking=True,
+    )
+
+    office.async_repair.assert_awaited_once_with(trigger="service")
+    kitchen.async_repair.assert_not_awaited()
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_overlapping_entity_and_device_targets_do_not_repeat_panel_operation(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    fake_shell: FakeShell,
+    payload_dir: Path,
+) -> None:
+    """Selecting one panel through two registry paths still invokes it only once."""
+    entry = await _setup_fleet_entry(hass)
+    office = entry.runtime_data.panels["panel-office"]
+    kitchen = entry.runtime_data.panels["panel-kitchen"]
+    office.async_repair = AsyncMock()
+    kitchen.async_repair = AsyncMock()
+    registry = er.async_get(hass)
+    entity_id = registry.async_get_entity_id("binary_sensor", DOMAIN, "SHA256:office_bridge_health")
+    device = dr.async_get(hass).async_get_device(identifiers={("mqtt", "brilliant_panel_office")})
+    assert entity_id is not None
+    assert device is not None
+
+    await hass.services.async_call(
+        DOMAIN,
+        "repair",
+        {"entity_id": entity_id, "device_id": device.id},
+        blocking=True,
+    )
+
+    office.async_repair.assert_awaited_once_with(trigger="service")
+    kitchen.async_repair.assert_not_awaited()
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.parametrize("target_kind", ["entity", "device", "area"])
+@pytest.mark.allow_lingering_timers
+async def test_explicit_foreign_target_never_falls_back_to_all_panels(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    fake_shell: FakeShell,
+    payload_dir: Path,
+    target_kind: str,
+) -> None:
+    """Only an actually targetless call is fleet-wide; unmatched targets are no-ops."""
+    entry = await _setup_fleet_entry(hass)
+    managers = tuple(entry.runtime_data.panels.values())
+    for manager in managers:
+        manager.async_repair = AsyncMock()
+    mqtt_entry = hass.config_entries.async_entries("mqtt")[0]
+    if target_kind == "entity":
+        foreign = er.async_get(hass).async_get_or_create(
+            "sensor",
+            "mqtt",
+            "foreign-target",
+            config_entry=mqtt_entry,
+            original_name="Foreign target",
+        )
+        target = {"entity_id": foreign.entity_id}
+    elif target_kind == "device":
+        foreign_device = dr.async_get(hass).async_get_or_create(
+            config_entry_id=mqtt_entry.entry_id,
+            identifiers={("mqtt", "foreign-target")},
+            name="Foreign target",
+        )
+        target = {"device_id": foreign_device.id}
+    else:
+        foreign_area = ar.async_get(hass).async_get_or_create("Foreign target")
+        dr.async_get(hass).async_get_or_create(
+            config_entry_id=mqtt_entry.entry_id,
+            identifiers={("mqtt", "foreign-area-target")},
+            name="Foreign target",
+            suggested_area=foreign_area.name,
+        )
+        target = {"area_id": foreign_area.id}
+
+    await hass.services.async_call(DOMAIN, "repair", target, blocking=True)
+
+    for manager in managers:
+        manager.async_repair.assert_not_awaited()
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.parametrize(
+    ("service_name", "method_name"),
+    [
+        ("repair", "async_repair"),
+        ("redeploy", "async_update_agent"),
+        ("uninstall", "async_uninstall"),
+        ("reboot", "async_reboot"),
+    ],
+)
+@pytest.mark.parametrize(
+    "empty_target",
+    ["none", [], None],
+    ids=["match-none", "empty-list", "null"],
+)
+@pytest.mark.allow_lingering_timers
+async def test_explicit_empty_target_is_noop_for_panel_management_services(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    fake_shell: FakeShell,
+    payload_dir: Path,
+    service_name: str,
+    method_name: str,
+    empty_target: str | list[object] | None,
+) -> None:
+    """Only absent target keys opt into fleet-wide destructive behavior."""
+    entry = await _setup_fleet_entry(hass)
+    operations: list[AsyncMock] = []
+    for manager in entry.runtime_data.panels.values():
+        operation = AsyncMock()
+        setattr(manager, method_name, operation)
+        operations.append(operation)
+
+    await hass.services.async_call(
+        DOMAIN,
+        service_name,
+        {"entity_id": empty_target},
+        blocking=True,
+    )
+
+    for operation in operations:
+        operation.assert_not_awaited()
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_service_fleet_device_target_operates_on_every_panel(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    fake_shell: FakeShell,
+    payload_dir: Path,
+) -> None:
+    """A config-entry device without a subentry association denotes the whole fleet."""
+    entry = await _setup_fleet_entry(hass)
+    managers = tuple(entry.runtime_data.panels.values())
+    for manager in managers:
+        manager.async_repair = AsyncMock()
+    fleet_device = dr.async_get(hass).async_get_or_create(
+        config_entry_id=entry.entry_id,
+        identifiers={(DOMAIN, "fleet-management")},
+        name="Brilliant MQTT fleet",
+    )
+
+    await hass.services.async_call(
+        DOMAIN,
+        "repair",
+        {"device_id": fleet_device.id},
+        blocking=True,
+    )
+
+    for manager in managers:
+        manager.async_repair.assert_awaited_once_with(trigger="service")
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_service_without_target_attempts_all_panels_and_aggregates_failures(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    fake_shell: FakeShell,
+    payload_dir: Path,
+) -> None:
+    """No target retains fleet-wide behavior and one failure cannot skip a sibling."""
+    entry = await _setup_fleet_entry(hass)
+    office = entry.runtime_data.panels["panel-office"]
+    kitchen = entry.runtime_data.panels["panel-kitchen"]
+    office.async_uninstall = AsyncMock(side_effect=HomeAssistantError("office boom"))
+    kitchen.async_uninstall = AsyncMock(side_effect=HomeAssistantError("kitchen boom"))
+
+    with pytest.raises(HomeAssistantError) as err:
+        await hass.services.async_call(DOMAIN, "uninstall", {}, blocking=True)
+
+    office.async_uninstall.assert_awaited_once()
+    kitchen.async_uninstall.assert_awaited_once()
+    assert "office" in str(err.value)
+    assert "kitchen" in str(err.value)
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_service_without_target_spans_fleet_and_legacy_entries(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    fake_shell: FakeShell,
+    payload_dir: Path,
+) -> None:
+    """Fleet-wide defaults include every loaded Brilliant runtime, including legacy."""
+    fleet_entry = await _setup_fleet_entry(hass)
+    legacy_entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="garage",
+        data={**ENTRY_DATA, CONF_PANEL: "garage"},
+    )
+    legacy_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(legacy_entry.entry_id)
+    await hass.async_block_till_done()
+    managers = (
+        *fleet_entry.runtime_data.panels.values(),
+        *legacy_entry.runtime_data.panels.values(),
+    )
+    for manager in managers:
+        manager.async_repair = AsyncMock()
+
+    await hass.services.async_call(DOMAIN, "repair", {}, blocking=True)
+
+    for manager in managers:
+        manager.async_repair.assert_awaited_once_with(trigger="service")
+    assert await hass.config_entries.async_unload(legacy_entry.entry_id)
+    assert await hass.config_entries.async_unload(fleet_entry.entry_id)
 
 
 @pytest.mark.allow_lingering_timers
@@ -153,8 +445,10 @@ async def test_uninstall_aggregates_multi_target_failures(
 
     # BOTH targets fail: a naive loop attempts only whichever the set yields first,
     # leaving the other's mock un-awaited — order-independently red against the bug.
-    office.runtime_data.async_uninstall = AsyncMock(side_effect=HomeAssistantError("office boom"))
-    kitchen.runtime_data.async_uninstall = AsyncMock(side_effect=HomeAssistantError("kitchen boom"))
+    office_manager = next(iter(office.runtime_data.panels.values()))
+    kitchen_manager = next(iter(kitchen.runtime_data.panels.values()))
+    office_manager.async_uninstall = AsyncMock(side_effect=HomeAssistantError("office boom"))
+    kitchen_manager.async_uninstall = AsyncMock(side_effect=HomeAssistantError("kitchen boom"))
 
     with pytest.raises(HomeAssistantError) as err:
         await hass.services.async_call(
@@ -165,8 +459,8 @@ async def test_uninstall_aggregates_multi_target_failures(
         )
 
     # Every target attempted (no early abort) and ONE error names BOTH failed panels.
-    office.runtime_data.async_uninstall.assert_awaited_once()
-    kitchen.runtime_data.async_uninstall.assert_awaited_once()
+    office_manager.async_uninstall.assert_awaited_once()
+    kitchen_manager.async_uninstall.assert_awaited_once()
     assert "office" in str(err.value) and "kitchen" in str(err.value)
 
     assert await hass.config_entries.async_unload(office.entry_id)

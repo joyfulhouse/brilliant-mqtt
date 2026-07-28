@@ -140,11 +140,12 @@ def test_host_identity_rejects_fingerprint_unrelated_to_public_key() -> None:
     assert _REAL_ED25519_PUB not in str(raised.value)
 
 
-def test_interim_panel_first_runtime_uses_only_private_legacy_adapter() -> None:
+def test_runtime_keeps_strict_fleet_and_private_legacy_adapters_separate() -> None:
     from custom_components.brilliant_mqtt import config_flow, manager
 
     assert config_flow.AsyncsshShell is _LegacyAsyncsshShell
-    assert manager.AsyncsshShell is _LegacyAsyncsshShell
+    assert manager.AsyncsshShell is AsyncsshShell
+    assert manager.LegacyAsyncsshShell is _LegacyAsyncsshShell
 
 
 # --- AsyncsshShell.connect() security posture (monkeypatched asyncssh.connect) ---

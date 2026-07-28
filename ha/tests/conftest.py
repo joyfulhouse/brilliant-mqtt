@@ -39,6 +39,8 @@ from custom_components.brilliant_mqtt.const import (
     DATA_SSH_HOST_KEY,
     DOMAIN,
 )
+from custom_components.brilliant_mqtt.entry_data import LegacyPanelStore
+from custom_components.brilliant_mqtt.fleet_manager import legacy_fleet_config
 from custom_components.brilliant_mqtt.manager import PanelManager
 from custom_components.brilliant_mqtt.shell import PanelShell
 from tests.fakes import FakeShell
@@ -90,7 +92,7 @@ class RepinShells:
 def repin_shells() -> Iterator[RepinShells]:
     """Patch manager.AsyncsshShell with a pin-keyed factory (see RepinShells)."""
     factory = RepinShells()
-    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", side_effect=factory):
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", side_effect=factory):
         yield factory
 
 
@@ -157,7 +159,7 @@ def fake_shell() -> Iterator[FakeShell]:
         0, "unit=1\nenv=1\nenabled=1\nactive=1\nsunit=1\nsenv=1\npayload=1\n0.2.0\n", ""
     )
     shell = FakeShell(responses={panel_ops.INSPECT_COMMAND: installed})
-    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
         yield shell
 
 
@@ -183,13 +185,18 @@ def manager_with_fake_panel(hass: HomeAssistant) -> Iterator[PanelManager]:
     entry.add_to_hass(hass)
     shell = FakeShell()
     with (
-        patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell),
+        patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell),
         patch(
             "custom_components.brilliant_mqtt.components.async_fetch_voice_payload",
             return_value="/tmp/fake-voice.tar.gz",
         ),
     ):
-        yield PanelManager(hass, entry, asyncio.Lock())
+        yield PanelManager(
+            hass,
+            LegacyPanelStore(hass, entry),
+            legacy_fleet_config(entry),
+            asyncio.Lock(),
+        )
 
 
 @pytest.fixture

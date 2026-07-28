@@ -13,6 +13,7 @@ from . import BrilliantMqttConfigEntry
 from .const import CONF_VOICE_WAKE_WORD, DEFAULT_VOICE_WAKE_WORD, VOICE_WAKE_WORDS
 from .entity import BrilliantPanelEntity
 from .ha_control import get_control_plane
+from .manager import PanelManager
 from .scene_control import scene_control_signal
 
 # Push-only; selecting serializes panel SSH via the fleet-wide lock in the manager.
@@ -24,7 +25,12 @@ async def async_setup_entry(
     entry: BrilliantMqttConfigEntry,
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    async_add_entities([WakeWordSelect(entry), SceneSelect(entry)])
+    for manager in entry.runtime_data.panels.values():
+        entities = [WakeWordSelect(manager), SceneSelect(manager)]
+        if (subentry_id := manager.store.subentry_id) is None:
+            async_add_entities(entities)
+        else:
+            async_add_entities(entities, config_subentry_id=subentry_id)
 
 
 class WakeWordSelect(BrilliantPanelEntity, SelectEntity):
@@ -32,13 +38,15 @@ class WakeWordSelect(BrilliantPanelEntity, SelectEntity):
     _attr_translation_key = "voice_wake_word"
     _attr_options = list(VOICE_WAKE_WORDS)
 
-    def __init__(self, entry: BrilliantMqttConfigEntry) -> None:
-        super().__init__(entry.runtime_data)
-        self._attr_unique_id = f"{entry.entry_id}_voice_wake_word"
+    def __init__(self, manager: PanelManager) -> None:
+        super().__init__(manager)
+        self._attr_unique_id = f"{manager.store.management_id}_voice_wake_word"
 
     @property
     def current_option(self) -> str:
-        return str(self._manager.entry.data.get(CONF_VOICE_WAKE_WORD, DEFAULT_VOICE_WAKE_WORD))
+        store = self._manager.store
+        values = store.data if store.subentry_id is None else store.options
+        return str(values.get(CONF_VOICE_WAKE_WORD, DEFAULT_VOICE_WAKE_WORD))
 
     async def async_select_option(self, option: str) -> None:
         await self._manager.async_set_voice_wake_word(option)
@@ -49,9 +57,9 @@ class SceneSelect(BrilliantPanelEntity, SelectEntity):
 
     _attr_translation_key = "scene"
 
-    def __init__(self, entry: BrilliantMqttConfigEntry) -> None:
-        super().__init__(entry.runtime_data)
-        self._attr_unique_id = f"{entry.entry_id}_scene"
+    def __init__(self, manager: PanelManager) -> None:
+        super().__init__(manager)
+        self._attr_unique_id = f"{manager.store.management_id}_scene"
 
     @property
     def available(self) -> bool:

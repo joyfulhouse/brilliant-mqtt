@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from homeassistant.components import mqtt
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.helpers import issue_registry as ir
 from homeassistant.loader import async_get_integration
 from pytest_homeassistant_custom_component.common import MockConfigEntry, async_fire_mqtt_message
 from pytest_homeassistant_custom_component.typing import MqttMockHAClient
@@ -45,6 +47,7 @@ from custom_components.brilliant_mqtt.const import (
     availability_topic,
     meta_topic,
 )
+from custom_components.brilliant_mqtt.fleet_manager import FleetManager
 from custom_components.brilliant_mqtt.ha_control import get_control_plane
 from custom_components.brilliant_mqtt.ha_control_protocol import (
     manifest_topic,
@@ -76,6 +79,25 @@ ENTRY_DATA = {
 }
 
 
+def _entry_manager(entry: MockConfigEntry) -> PanelManager:
+    """Return the one compatibility panel below a legacy FleetManager."""
+    runtime = cast(FleetManager, entry.runtime_data)
+    return runtime.panels[entry.entry_id]
+
+
+async def _setup_direct_runtime(
+    hass: HomeAssistant,
+    entry: MockConfigEntry,
+) -> PanelManager:
+    """Attach a FleetManager when a cleanup test calls hooks directly."""
+    if entry.version != CONFIG_ENTRY_VERSION:
+        assert await async_migrate_entry(hass, entry)
+    runtime = FleetManager(hass, entry)
+    entry.runtime_data = runtime
+    await runtime.async_setup()
+    return runtime.panels[entry.entry_id]
+
+
 @pytest.mark.allow_lingering_timers
 async def test_entry_sets_up_and_tracks_availability(
     hass: HomeAssistant, mqtt_mock: MqttMockHAClient
@@ -87,7 +109,7 @@ async def test_entry_sets_up_and_tracks_availability(
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
 
-    manager = entry.runtime_data
+    manager = _entry_manager(entry)
     assert manager.availability is None
 
     async_fire_mqtt_message(hass, "brilliant/office/availability", "online")
@@ -115,7 +137,7 @@ async def test_non_object_meta_is_ignored(hass: HomeAssistant, mqtt_mock: MqttMo
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
 
-    manager = entry.runtime_data
+    manager = _entry_manager(entry)
     assert manager.meta is None
 
     async_fire_mqtt_message(hass, "brilliant/office/bridge", "42")
@@ -275,9 +297,7 @@ async def test_unload_always_shuts_manager_down_when_alternate_owner_reload_fail
     alpha.add_to_hass(hass)
     plane = get_control_plane(hass)
     await plane.async_attach(zulu)
-    manager = PanelManager(hass, alpha, asyncio.Lock())
-    alpha.runtime_data = manager
-    await manager.async_setup()
+    manager = await _setup_direct_runtime(hass, alpha)
     await plane.async_attach(alpha)
     async_fire_mqtt_message(hass, availability_topic("alpha"), "offline")
     await hass.async_block_till_done()
@@ -339,6 +359,7 @@ async def test_setup_failure_preserves_original_error_when_detach_cleanup_fails(
     alpha.add_to_hass(hass)
     plane = get_control_plane(hass)
     await plane.async_attach(zulu)
+    assert await async_migrate_entry(hass, alpha)
     real_publish = mqtt.async_publish
 
     async def fail_empty_manifest(
@@ -399,6 +420,7 @@ async def test_partial_manager_setup_failure_is_cleaned_up(
         data={**ENTRY_DATA, CONF_PANEL: "partial-setup"},
     )
     entry.add_to_hass(hass)
+    assert await async_migrate_entry(hass, entry)
     real_subscribe = mqtt.async_subscribe
     subscriptions = 0
 
@@ -409,14 +431,24 @@ async def test_partial_manager_setup_failure_is_cleaned_up(
             raise setup_failure
         return await real_subscribe(*args, **kwargs)
 
-    with (
-        patch(
-            "custom_components.brilliant_mqtt.manager.mqtt.async_subscribe",
-            side_effect=fail_second_subscribe,
-        ),
-        pytest.raises(type(setup_failure)),
-    ):
-        await async_setup_entry(hass, entry)
+    subscribe_patch = patch(
+        "custom_components.brilliant_mqtt.manager.mqtt.async_subscribe",
+        side_effect=fail_second_subscribe,
+    )
+    if isinstance(setup_failure, asyncio.CancelledError):
+        with subscribe_patch, pytest.raises(asyncio.CancelledError):
+            await async_setup_entry(hass, entry)
+    else:
+        with (
+            subscribe_patch,
+            pytest.raises(ConfigEntryNotReady, match="No panel runtime could start"),
+        ):
+            await async_setup_entry(hass, entry)
+        assert entry.runtime_data.panels == {}
+        assert (
+            ir.async_get(hass).async_get_issue(DOMAIN, f"runtime_setup_failed_{entry.entry_id}")
+            is not None
+        )
 
     assert not mqtt_mock.is_active_subscription(availability_topic("partial-setup"))
 
@@ -431,9 +463,7 @@ async def test_external_unload_cancellation_is_drained_before_manager_shutdown(
         data={**ENTRY_DATA, CONF_PANEL: "cancel-cleanup"},
     )
     entry.add_to_hass(hass)
-    manager = PanelManager(hass, entry, asyncio.Lock())
-    entry.runtime_data = manager
-    await manager.async_setup()
+    await _setup_direct_runtime(hass, entry)
     plane = get_control_plane(hass)
     entered = asyncio.Event()
     release = asyncio.Event()

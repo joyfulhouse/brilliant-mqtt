@@ -1,28 +1,202 @@
-"""Diagnostics never leak the root password or broker password."""
+"""Diagnostics never export fleet, panel, or MQTT-carried secrets."""
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from types import MappingProxyType
 
 import pytest
+from homeassistant.config_entries import ConfigSubentry
+from homeassistant.const import CONF_NAME
 from homeassistant.core import HomeAssistant
 from pytest_homeassistant_custom_component.common import MockConfigEntry, async_fire_mqtt_message
 from pytest_homeassistant_custom_component.typing import MqttMockHAClient
 
+from custom_components.brilliant_mqtt.broker import BrokerKind
 from custom_components.brilliant_mqtt.const import (
+    COMPONENT_BRIDGE,
+    COMPONENT_BUS_WATCHDOG,
+    COMPONENT_WIFI_WATCHDOG,
+    CONF_BROKER_KIND,
+    CONF_COMPONENTS,
+    CONF_ENTRY_KIND,
+    CONF_FEATURE_OVERRIDES,
     CONF_HA_CONTROL_DOMAINS,
     CONF_HA_CONTROL_ENABLED,
     CONF_HA_CONTROL_LABEL,
     CONF_HA_MIRROR_TOKEN,
+    CONF_HOST,
+    CONF_IDENTITY_FINGERPRINT,
+    CONF_MANAGEMENT_ID,
     CONF_MAX_MIRRORED_ENTITIES,
+    CONF_MESH_PRIORITY,
+    CONF_MQTT_HOST,
+    CONF_MQTT_PASSWORD,
+    CONF_MQTT_PORT,
+    CONF_MQTT_TLS_CA,
+    CONF_MQTT_TLS_ENABLED,
+    CONF_MQTT_USERNAME,
+    CONF_NEXT_MESH_PRIORITY,
+    CONF_PANEL,
     CONF_ROOM_OVERRIDES,
+    CONF_ROOT_PASSWORD,
     CONF_SCENE_ACTIONS,
     CONF_SCENE_PANEL,
+    CONF_SCHEMA_VERSION,
+    CONF_SSH_HOST_KEY,
+    CONF_SSH_USERNAME,
+    CONFIG_ENTRY_VERSION,
     DOMAIN,
+    ENTRY_KIND_FLEET,
+    SUBENTRY_TYPE_PANEL,
+    availability_topic,
+    meta_topic,
 )
 from custom_components.brilliant_mqtt.diagnostics import async_get_config_entry_diagnostics
+from custom_components.brilliant_mqtt.fleet_manager import FleetManager
 from tests.fakes import FakeShell
 from tests.test_init import ENTRY_DATA
+
+
+@pytest.mark.allow_lingering_timers
+async def test_fleet_diagnostics_are_keyed_by_runtime_id_and_never_export_secrets(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fleet diagnostic cannot serialize any persisted or MQTT-carried secret."""
+    username = "diagnostics-fleet-username"
+    mqtt_password = "diagnostics-fleet-password"
+    ca_pem = (
+        "-----BEGIN CERTIFICATE-----\ndiagnostics-ca-body-must-not-leak\n-----END CERTIFICATE-----"
+    )
+    environment = "MQTT_PASSWORD=diagnostics-env-body-must-not-leak\n"
+    identities = {
+        "office": (
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKIykuTed7zNwJwn20eCelcKcHKJ9c/pGFfvulRWazuC",
+            "SHA256:JfCon51dCgE/yWGkyroh3Ne+ONLMm6QmHMQnEoPSLx0",
+        ),
+        "kitchen": (
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIG/koBYdTnHujqIpcXlQkQqzGBoZJ6Y4rm22iGIdAu4B",
+            "SHA256:8mIRtm2GlHfcML0pUZInHQk3nT+hlkTq4k2FGR/Y0KM",
+        ),
+    }
+
+    def panel(slug: str, runtime_id: str) -> ConfigSubentry:
+        public_key, fingerprint = identities[slug]
+        return ConfigSubentry(
+            data=MappingProxyType(
+                {
+                    CONF_IDENTITY_FINGERPRINT: fingerprint,
+                    CONF_SSH_HOST_KEY: public_key,
+                    CONF_HOST: f"{slug}.example.com",
+                    CONF_SSH_USERNAME: "root",
+                    CONF_ROOT_PASSWORD: f"diagnostics-{slug}-root-password",
+                    CONF_NAME: slug.title(),
+                    CONF_PANEL: slug,
+                    CONF_MANAGEMENT_ID: fingerprint,
+                    CONF_COMPONENTS: {
+                        COMPONENT_BRIDGE: True,
+                        COMPONENT_WIFI_WATCHDOG: True,
+                        COMPONENT_BUS_WATCHDOG: True,
+                    },
+                    CONF_FEATURE_OVERRIDES: {"environment": environment},
+                    CONF_MESH_PRIORITY: 1,
+                }
+            ),
+            subentry_id=runtime_id,
+            subentry_type=SUBENTRY_TYPE_PANEL,
+            title=slug.title(),
+            unique_id=fingerprint,
+        )
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        version=CONFIG_ENTRY_VERSION,
+        data={
+            CONF_ENTRY_KIND: ENTRY_KIND_FLEET,
+            CONF_BROKER_KIND: BrokerKind.EXISTING_BROKER.value,
+            CONF_MQTT_HOST: "mqtt.example.com",
+            CONF_MQTT_PORT: 8883,
+            CONF_MQTT_USERNAME: username,
+            CONF_MQTT_PASSWORD: mqtt_password,
+            CONF_MQTT_TLS_ENABLED: True,
+            CONF_MQTT_TLS_CA: ca_pem,
+            CONF_NEXT_MESH_PRIORITY: 3,
+            CONF_HA_CONTROL_ENABLED: False,
+            CONF_HA_CONTROL_LABEL: "brilliant",
+            CONF_ROOM_OVERRIDES: {},
+            CONF_HA_CONTROL_DOMAINS: ["light", "switch"],
+            CONF_MAX_MIRRORED_ENTITIES: 50,
+            CONF_SCENE_PANEL: "panel-office",
+            CONF_SCENE_ACTIONS: {},
+            CONF_SCHEMA_VERSION: CONFIG_ENTRY_VERSION,
+        },
+        options={"environment": environment},
+        subentries_data=[
+            panel("office", "panel-office").as_dict(),
+            panel("kitchen", "panel-kitchen").as_dict(),
+        ],
+    )
+    runtime = FleetManager(hass, entry)
+    entry.runtime_data = runtime
+    monkeypatch.setattr(
+        "custom_components.brilliant_mqtt.fleet_manager.mqtt.is_connected",
+        lambda _hass: False,
+    )
+
+    await runtime.async_setup()
+    try:
+        async_fire_mqtt_message(hass, availability_topic("office"), "online")
+        async_fire_mqtt_message(
+            hass,
+            meta_topic("office"),
+            json.dumps(
+                {
+                    "agent_version": "0.7.0",
+                    "panel_firmware": "v26.07.28.1",
+                    "environment": environment,
+                }
+            ),
+        )
+        await hass.async_block_till_done()
+        runtime.panels["panel-kitchen"].mark_runtime_degraded("runtime setup failed (RuntimeError)")
+
+        diag = await async_get_config_entry_diagnostics(hass, entry)
+    finally:
+        await runtime.async_shutdown()
+
+    assert diag["broker_available"] is False
+    assert diag["panels"] == {
+        "panel-office": {
+            "availability": "online",
+            "meta": {
+                "agent_version": "0.7.0",
+                "panel_firmware": "v26.07.28.1",
+            },
+            "problem": False,
+            "problem_reason": None,
+        },
+        "panel-kitchen": {
+            "availability": None,
+            "meta": None,
+            "problem": True,
+            "problem_reason": "runtime setup failed (RuntimeError)",
+        },
+    }
+    diagnostic_text = repr(diag)
+    for secret in (
+        username,
+        mqtt_password,
+        ca_pem,
+        "diagnostics-ca-body-must-not-leak",
+        environment,
+        "diagnostics-env-body-must-not-leak",
+        "diagnostics-office-root-password",
+        "diagnostics-kitchen-root-password",
+    ):
+        assert secret not in diagnostic_text
 
 
 @pytest.mark.allow_lingering_timers
@@ -99,6 +273,7 @@ async def test_diagnostics_redact_secrets(
     await hass.async_block_till_done()
 
     diag = await async_get_config_entry_diagnostics(hass, entry)
+    assert set(diag["panels"]) == {entry.entry_id}
     assert diag["entry"]["root_password"] == "**REDACTED**"
     assert diag["entry"]["mqtt_password"] == "**REDACTED**"
     assert diag["entry"][CONF_HA_MIRROR_TOKEN] == "**REDACTED**"
@@ -135,13 +310,27 @@ async def test_diagnostics_missing_control_runtime_values_are_none(
 ) -> None:
     entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA, version=3)
     entry.add_to_hass(hass)
-    # A minimal stand-in is enough: diagnostics must tolerate no singleton runtime data.
-    entry.runtime_data = type(
-        "Manager",
+    # A minimal one-panel FleetManager stand-in isolates the absent control-plane case.
+    panel = type(
+        "PanelManager",
         (),
         {"availability": None, "meta": None, "problem": False, "problem_reason": None},
     )()
+    entry.runtime_data = type(
+        "FleetManager",
+        (),
+        {"broker_available": None, "panels": {entry.entry_id: panel}},
+    )()
     diag = await async_get_config_entry_diagnostics(hass, entry)
+    assert diag["broker_available"] is None
+    assert diag["panels"] == {
+        entry.entry_id: {
+            "availability": None,
+            "meta": None,
+            "problem": False,
+            "problem_reason": None,
+        }
+    }
     control = diag["ha_control"]
     assert control["manifest_revision"] is None
     assert control["manifest_entity_count"] is None

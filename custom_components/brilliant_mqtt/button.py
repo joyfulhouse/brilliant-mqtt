@@ -13,6 +13,7 @@ from . import BrilliantMqttConfigEntry
 from .const import DOMAIN
 from .entity import BrilliantPanelEntity
 from .ha_control import get_control_plane
+from .manager import PanelManager
 from .scene_control import scene_control_signal
 
 # Push-only entity (its state never polls); the press handler serializes panel SSH
@@ -25,18 +26,25 @@ async def async_setup_entry(
     entry: BrilliantMqttConfigEntry,
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    async_add_entities(
-        [RepairButton(entry), RebootPanelButton(entry), RunSelectedSceneButton(entry)]
-    )
+    for manager in entry.runtime_data.panels.values():
+        entities = [
+            RepairButton(manager),
+            RebootPanelButton(manager),
+            RunSelectedSceneButton(manager),
+        ]
+        if (subentry_id := manager.store.subentry_id) is None:
+            async_add_entities(entities)
+        else:
+            async_add_entities(entities, config_subentry_id=subentry_id)
 
 
 class RepairButton(BrilliantPanelEntity, ButtonEntity):
     _attr_entity_category = EntityCategory.DIAGNOSTIC
     _attr_translation_key = "repair_bridge"
 
-    def __init__(self, entry: BrilliantMqttConfigEntry) -> None:
-        super().__init__(entry.runtime_data)
-        self._attr_unique_id = f"{entry.entry_id}_repair_bridge"
+    def __init__(self, manager: PanelManager) -> None:
+        super().__init__(manager)
+        self._attr_unique_id = f"{manager.store.management_id}_repair_bridge"
 
     async def async_press(self) -> None:
         await self._manager.async_repair(trigger="button")
@@ -49,9 +57,9 @@ class RebootPanelButton(BrilliantPanelEntity, ButtonEntity):
     _attr_entity_category = EntityCategory.CONFIG
     _attr_translation_key = "reboot_panel"
 
-    def __init__(self, entry: BrilliantMqttConfigEntry) -> None:
-        super().__init__(entry.runtime_data)
-        self._attr_unique_id = f"{entry.entry_id}_reboot_panel"
+    def __init__(self, manager: PanelManager) -> None:
+        super().__init__(manager)
+        self._attr_unique_id = f"{manager.store.management_id}_reboot_panel"
 
     async def async_press(self) -> None:
         # Always capture diagnostics on a manual press (journald is volatile — the
@@ -64,9 +72,9 @@ class RunSelectedSceneButton(BrilliantPanelEntity, ButtonEntity):
 
     _attr_translation_key = "run_selected_scene"
 
-    def __init__(self, entry: BrilliantMqttConfigEntry) -> None:
-        super().__init__(entry.runtime_data)
-        self._attr_unique_id = f"{entry.entry_id}_run_selected_scene"
+    def __init__(self, manager: PanelManager) -> None:
+        super().__init__(manager)
+        self._attr_unique_id = f"{manager.store.management_id}_run_selected_scene"
 
     @property
     def available(self) -> bool:

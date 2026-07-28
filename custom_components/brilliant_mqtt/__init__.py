@@ -5,17 +5,33 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, cast
 
 import voluptuous as vol
 from homeassistant.components import mqtt
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
-from homeassistant.const import ATTR_AREA_ID, ATTR_DEVICE_ID, ATTR_ENTITY_ID
+from homeassistant.const import (
+    ATTR_AREA_ID,
+    ATTR_DEVICE_ID,
+    ATTR_ENTITY_ID,
+    ATTR_FLOOR_ID,
+    ATTR_LABEL_ID,
+)
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.exceptions import ConfigEntryNotReady, HomeAssistantError
-from homeassistant.helpers import config_validation as cv
-from homeassistant.helpers import issue_registry as ir
-from homeassistant.helpers.service import async_extract_config_entry_ids
+from homeassistant.helpers import (
+    config_validation as cv,
+)
+from homeassistant.helpers import (
+    device_registry as dr,
+)
+from homeassistant.helpers import (
+    entity_registry as er,
+)
+from homeassistant.helpers import (
+    issue_registry as ir,
+)
+from homeassistant.helpers import target as target_helpers
 from homeassistant.helpers.typing import ConfigType
 
 from .const import (
@@ -28,6 +44,7 @@ from .const import (
     CONF_HA_CONTROL_ENABLED,
     CONF_HA_CONTROL_LABEL,
     CONF_HA_MIRROR_LABEL,
+    CONF_MANAGEMENT_ID,
     CONF_MAX_MIRRORED_ENTITIES,
     CONF_PANEL,
     CONF_ROOM_OVERRIDES,
@@ -46,25 +63,26 @@ from .const import (
     MIN_REBOOT_JOURNAL_LINES,
     PLATFORMS,
 )
+from .fleet_manager import FleetManager
 from .manager import PanelManager
 
 _LOGGER = logging.getLogger(__name__)
 
-type BrilliantMqttConfigEntry = ConfigEntry[PanelManager]
+type BrilliantMqttConfigEntry = ConfigEntry[FleetManager]
 
 # This integration is config-entry only (it registers services in async_setup but takes
 # no YAML configuration), so declare the standard config-entry-only schema for hassfest.
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 # Target services: HA merges entity/device/area target ids into the call data, and the
-# handlers resolve config entries from any of them via async_extract_config_entry_ids.
-# services.yaml targets by `entity` (hassfest), so a UI call supplies entity_id, NOT
-# device_id — requiring device_id rejected those calls before they reached the handler.
+# handler resolves their exact config-entry/subentry ownership through the registries.
+# services.yaml targets by `entity` (hassfest), so a UI call supplies entity_id, not
+# necessarily device_id.
 _SERVICE_SCHEMA = vol.Schema(
     {
-        vol.Optional(ATTR_ENTITY_ID): vol.Any(str, [str]),
-        vol.Optional(ATTR_DEVICE_ID): vol.Any(str, [str]),
-        vol.Optional(ATTR_AREA_ID): vol.Any(str, [str]),
+        vol.Optional(ATTR_ENTITY_ID): vol.Any(None, str, [str]),
+        vol.Optional(ATTR_DEVICE_ID): vol.Any(None, str, [str]),
+        vol.Optional(ATTR_AREA_ID): vol.Any(None, str, [str]),
     },
     extra=vol.ALLOW_EXTRA,
 )
@@ -89,9 +107,9 @@ _SET_MODE_SCHEMA = vol.Schema(
 # merges the target ids into the call data; the handler resolves managers from them.
 _REBOOT_SCHEMA = vol.Schema(
     {
-        vol.Optional(ATTR_ENTITY_ID): vol.Any(str, [str]),
-        vol.Optional(ATTR_DEVICE_ID): vol.Any(str, [str]),
-        vol.Optional(ATTR_AREA_ID): vol.Any(str, [str]),
+        vol.Optional(ATTR_ENTITY_ID): vol.Any(None, str, [str]),
+        vol.Optional(ATTR_DEVICE_ID): vol.Any(None, str, [str]),
+        vol.Optional(ATTR_AREA_ID): vol.Any(None, str, [str]),
         vol.Optional("collect_diagnostics", default=True): cv.boolean,
         vol.Optional("journal_lines", default=DEFAULT_REBOOT_JOURNAL_LINES): vol.All(
             vol.Coerce(int),
@@ -99,6 +117,16 @@ _REBOOT_SCHEMA = vol.Schema(
         ),
     },
     extra=vol.ALLOW_EXTRA,
+)
+
+_TARGET_KEYS = frozenset(
+    {
+        ATTR_ENTITY_ID,
+        ATTR_DEVICE_ID,
+        ATTR_AREA_ID,
+        ATTR_FLOOR_ID,
+        ATTR_LABEL_ID,
+    }
 )
 
 
@@ -176,17 +204,66 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Register domain services once (entries come and go; services persist)."""
 
     async def _managers_for(call: ServiceCall) -> list[PanelManager]:
-        managers: list[PanelManager] = []
-        # In this HA version async_extract_config_entry_ids reads hass off the call.
-        for entry_id in await async_extract_config_entry_ids(call):
-            entry = hass.config_entries.async_get_entry(entry_id)
-            if (
-                entry is not None
-                and entry.domain == DOMAIN
-                and entry.state is ConfigEntryState.LOADED
+        """Resolve fleet subentries without collapsing them to their parent entry."""
+        selection = target_helpers.TargetSelection(call.data)
+        loaded: dict[str, BrilliantMqttConfigEntry] = {}
+        for candidate in hass.config_entries.async_entries(DOMAIN):
+            if candidate.state is ConfigEntryState.LOADED and isinstance(
+                candidate.runtime_data, FleetManager
             ):
-                managers.append(entry.runtime_data)
-        return managers
+                loaded[candidate.entry_id] = cast(BrilliantMqttConfigEntry, candidate)
+
+        selected_managers: dict[tuple[str, str], PanelManager] = {}
+
+        def _add_entry(
+            entry_id: str,
+            subentry_ids: set[str | None] | None,
+        ) -> None:
+            entry = loaded.get(entry_id)
+            if entry is None:
+                return
+            runtime = entry.runtime_data
+            if subentry_ids is None or None in subentry_ids:
+                for panel_id, manager in runtime.panels.items():
+                    selected_managers[(entry_id, panel_id)] = manager
+                return
+            for subentry_id in subentry_ids:
+                if subentry_id is None:
+                    continue
+                selected = runtime.panels.get(subentry_id)
+                if selected is not None:
+                    selected_managers[(entry_id, subentry_id)] = selected
+
+        has_explicit_target = not _TARGET_KEYS.isdisjoint(call.data)
+        if not has_explicit_target:
+            for entry_id in loaded:
+                _add_entry(entry_id, None)
+            return list(selected_managers.values())
+        if not selection.has_any_target:
+            return []
+
+        referenced = target_helpers.async_extract_referenced_entity_ids(
+            hass,
+            selection,
+            primary_entities_only=False,
+        )
+        entity_registry = er.async_get(hass)
+        for entity_id in referenced.referenced | referenced.indirectly_referenced:
+            if (
+                entity_entry := entity_registry.async_get(entity_id)
+            ) is not None and entity_entry.config_entry_id is not None:
+                _add_entry(
+                    entity_entry.config_entry_id,
+                    {entity_entry.config_subentry_id},
+                )
+
+        device_registry = dr.async_get(hass)
+        for device_id in referenced.referenced_devices:
+            if (device_entry := device_registry.async_get(device_id)) is None:
+                continue
+            for entry_id, subentry_ids in device_entry.config_entries_subentries.items():
+                _add_entry(entry_id, set(subentry_ids))
+        return list(selected_managers.values())
 
     async def _apply_to_all(
         call: ServiceCall, op: Callable[[PanelManager], Awaitable[None]]
@@ -259,7 +336,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: BrilliantMqttConfigEntry
     # HA's mqtt integration, so don't set up "green" against a broker that isn't up yet.
     if not await mqtt.async_wait_for_mqtt_client(hass):
         raise ConfigEntryNotReady("MQTT integration is not available")
-    manager = PanelManager(hass, entry, _fleet_lock(hass))
+    manager = FleetManager(hass, entry)
     entry.runtime_data = manager
     from .ha_control import get_control_plane
 
@@ -325,7 +402,15 @@ async def async_unload_entry(hass: HomeAssistant, entry: BrilliantMqttConfigEntr
 
 
 async def async_remove_entry(hass: HomeAssistant, entry: BrilliantMqttConfigEntry) -> None:
-    """Delete the panel's repair issues when its config entry is removed."""
-    ir.async_delete_issue(hass, DOMAIN, f"needs_attention_{entry.entry_id}")
-    ir.async_delete_issue(hass, DOMAIN, f"voice_missing_{entry.entry_id}")
-    ir.async_delete_issue(hass, DOMAIN, f"ha_mirror_retired_{entry.entry_id}")
+    """Delete fleet and panel repair issues when their owner is removed."""
+    management_ids = {
+        str(subentry.data[CONF_MANAGEMENT_ID])
+        for subentry in entry.subentries.values()
+        if CONF_MANAGEMENT_ID in subentry.data
+    } or {entry.entry_id}
+    for management_id in management_ids:
+        ir.async_delete_issue(hass, DOMAIN, f"needs_attention_{management_id}")
+        ir.async_delete_issue(hass, DOMAIN, f"voice_missing_{management_id}")
+        ir.async_delete_issue(hass, DOMAIN, f"ha_mirror_retired_{management_id}")
+    ir.async_delete_issue(hass, DOMAIN, f"broker_unavailable_{entry.entry_id}")
+    ir.async_delete_issue(hass, DOMAIN, f"runtime_setup_failed_{entry.entry_id}")

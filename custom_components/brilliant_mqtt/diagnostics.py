@@ -1,7 +1,8 @@
-"""Redacted diagnostics for one panel entry."""
+"""Redacted diagnostics for a Brilliant MQTT fleet entry."""
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -12,17 +13,30 @@ from homeassistant.helpers import label_registry as lr
 
 from . import BrilliantMqttConfigEntry
 from .const import (
+    AVAILABILITY_OFFLINE,
+    AVAILABILITY_ONLINE,
+    CONF_BROKER_KIND,
+    CONF_ENTRY_KIND,
     CONF_HA_CONTROL_DOMAINS,
     CONF_HA_CONTROL_ENABLED,
     CONF_HA_CONTROL_LABEL,
     CONF_HA_MIRROR_LABEL,
     CONF_HA_MIRROR_TOKEN,
+    CONF_HOST,
     CONF_MAX_MIRRORED_ENTITIES,
+    CONF_MESH_PRIORITY,
+    CONF_MQTT_HOST,
     CONF_MQTT_PASSWORD,
+    CONF_MQTT_PORT,
+    CONF_MQTT_TLS_CA,
+    CONF_MQTT_TLS_ENABLED,
+    CONF_MQTT_USERNAME,
+    CONF_PANEL,
     CONF_ROOM_OVERRIDES,
     CONF_ROOT_PASSWORD,
     CONF_SCENE_ACTIONS,
     CONF_SCENE_PANEL,
+    CONF_SCHEMA_VERSION,
     DATA_CONTROL_PLANE,
     DEFAULT_HA_CONTROL_DOMAINS,
     DEFAULT_HA_CONTROL_ENABLED,
@@ -32,13 +46,53 @@ from .const import (
 )
 from .ha_control import HaControlPlane
 
-_TO_REDACT = {CONF_ROOT_PASSWORD, CONF_MQTT_PASSWORD, CONF_HA_MIRROR_TOKEN}
+_TO_REDACT = {
+    CONF_ROOT_PASSWORD,
+    CONF_MQTT_USERNAME,
+    CONF_MQTT_PASSWORD,
+    CONF_MQTT_TLS_CA,
+    CONF_HA_MIRROR_TOKEN,
+}
+_SAFE_ENTRY_KEYS = {
+    CONF_ENTRY_KIND,
+    CONF_BROKER_KIND,
+    CONF_SCHEMA_VERSION,
+    CONF_HOST,
+    CONF_PANEL,
+    CONF_MESH_PRIORITY,
+    CONF_MQTT_HOST,
+    CONF_MQTT_PORT,
+    CONF_MQTT_TLS_ENABLED,
+}
+_SAFE_META_KEYS = ("agent_version", "panel_firmware")
+_SAFE_VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$")
+
+
+def _entry_diagnostics(data: Mapping[str, Any]) -> dict[str, Any]:
+    """Allowlist persisted values so unknown secret-bearing mappings stay private."""
+    included = _SAFE_ENTRY_KEYS | _TO_REDACT
+    return async_redact_data(
+        {key: value for key, value in data.items() if key in included},
+        _TO_REDACT,
+    )
+
+
+def _meta_diagnostics(meta: Mapping[str, Any] | None) -> dict[str, str] | None:
+    """Expose only bounded version identifiers, never the raw MQTT metadata object."""
+    if meta is None:
+        return None
+    safe = {
+        key: value
+        for key in _SAFE_META_KEYS
+        if isinstance((value := meta.get(key)), str) and _SAFE_VERSION.fullmatch(value) is not None
+    }
+    return safe or None
 
 
 async def async_get_config_entry_diagnostics(
     hass: HomeAssistant, entry: BrilliantMqttConfigEntry
 ) -> dict[str, Any]:
-    """Entry data (secrets redacted) + options + the manager's live panel state."""
+    """Return allowlisted config and live state for every panel in the fleet."""
     manager = entry.runtime_data
     data = dict(entry.data)
     raw_overrides = data.pop(CONF_ROOM_OVERRIDES, {})
@@ -81,12 +135,20 @@ async def async_get_config_entry_diagnostics(
         else 0
     )
     return {
-        "entry": async_redact_data(data, _TO_REDACT),
-        "options": dict(entry.options),
-        "availability": manager.availability,
-        "meta": manager.meta,
-        "problem": manager.problem,
-        "problem_reason": manager.problem_reason,
+        "entry": _entry_diagnostics(data),
+        "options": {"configured": bool(entry.options)},
+        "broker_available": manager.broker_available,
+        "panels": {
+            panel_id: {
+                "availability": panel.availability
+                if panel.availability in {AVAILABILITY_ONLINE, AVAILABILITY_OFFLINE}
+                else None,
+                "meta": _meta_diagnostics(panel.meta),
+                "problem": panel.problem,
+                "problem_reason": panel.problem_reason,
+            }
+            for panel_id, panel in manager.panels.items()
+        },
         "ha_control": {
             "enabled": data.get(CONF_HA_CONTROL_ENABLED, DEFAULT_HA_CONTROL_ENABLED) is True,
             "label": label,

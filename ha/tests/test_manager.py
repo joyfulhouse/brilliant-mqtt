@@ -5,11 +5,13 @@ from __future__ import annotations
 import asyncio
 from datetime import timedelta
 from pathlib import Path
+from types import MappingProxyType, SimpleNamespace
 from typing import Any, cast
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import asyncssh
 import pytest
+from homeassistant.config_entries import ConfigSubentry
 from homeassistant.core import Event, HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.util import dt as dt_util
@@ -29,16 +31,21 @@ from custom_components.brilliant_mqtt.const import (
     COMPONENT_VOICE,
     COMPONENT_WIFI_WATCHDOG,
     CONF_COMPONENTS,
+    CONF_FEATURE_OVERRIDES,
     CONF_HA_CONTROL_ENABLED,
     CONF_HA_MIRROR_LABEL,
     CONF_HA_MIRROR_LEADER_PRIORITY,
     CONF_HA_MIRROR_TOKEN,
     CONF_HA_MIRROR_WS_URL,
     CONF_HUE_CA_CERT,
+    CONF_MQTT_TLS_CA,
+    CONF_MQTT_TLS_ENABLED,
     CONF_PANEL,
     CONF_VOICE_ENABLED,
+    CONF_VOICE_HA_HOST,
     CONF_VOICE_WAKE_WORD,
     DATA_HA_MIRROR_RETIRE_VERIFIED,
+    DATA_LAST_FIRMWARE,
     DATA_SSH_HOST_KEY,
     DOMAIN,
     EVENT_TYPE,
@@ -47,8 +54,22 @@ from custom_components.brilliant_mqtt.const import (
     PANEL_HA_MIRROR_UNIT_FILE,
     PANEL_HUE_CA_CERT_FILE,
 )
+from custom_components.brilliant_mqtt.entry_data import (
+    FleetConfig,
+    FleetPanelStore,
+    LegacyPanelStore,
+)
+from custom_components.brilliant_mqtt.fleet_manager import (
+    FleetManager,
+    legacy_fleet_config,
+)
 from custom_components.brilliant_mqtt.manager import PanelManager
-from custom_components.brilliant_mqtt.shell import RunResult
+from custom_components.brilliant_mqtt.shell import (
+    AsyncsshShell,
+    PanelIdentityError,
+    RunResult,
+    _LegacyAsyncsshShell,
+)
 from tests.conftest import REPIN_NEW_KEY, RepinShells
 from tests.fakes import FakeShell
 from tests.test_init import ENTRY_DATA
@@ -60,6 +81,70 @@ async def _setup(hass: HomeAssistant) -> MockConfigEntry:
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
     return entry
+
+
+def _legacy_manager(
+    hass: HomeAssistant,
+    entry: MockConfigEntry,
+    lock: asyncio.Lock | None = None,
+) -> PanelManager:
+    """Build the compatibility runtime through the same production adapters."""
+    return PanelManager(
+        hass,
+        LegacyPanelStore(hass, entry),
+        legacy_fleet_config(entry),
+        lock or asyncio.Lock(),
+    )
+
+
+def _entry_manager(entry: MockConfigEntry) -> PanelManager:
+    """Return one legacy panel below either old direct or new fleet runtime data."""
+    runtime = entry.runtime_data
+    if isinstance(runtime, FleetManager):
+        return runtime.panels[entry.entry_id]
+    assert isinstance(runtime, PanelManager)
+    return runtime
+
+
+def _fleet_panel_manager(
+    hass: HomeAssistant,
+    *,
+    feature_overrides: dict[str, Any] | None = None,
+    fleet_overrides: dict[str, Any] | None = None,
+    panel_overrides: dict[str, Any] | None = None,
+) -> tuple[MockConfigEntry, PanelManager]:
+    """Build one new-fleet panel without copying fleet globals into its subentry."""
+    from tests.test_fleet_manager import _fleet_data, _panel
+
+    source = _panel("office", "SHA256:office", subentry_id="panel-office")
+    source = ConfigSubentry(
+        data=MappingProxyType(
+            {
+                **source.data,
+                CONF_COMPONENTS: {COMPONENT_BRIDGE: True},
+                CONF_FEATURE_OVERRIDES: feature_overrides or {},
+                **(panel_overrides or {}),
+            }
+        ),
+        subentry_id=source.subentry_id,
+        subentry_type=source.subentry_type,
+        title=source.title,
+        unique_id=source.unique_id,
+    )
+    fleet_data = _fleet_data()
+    fleet_data.update(fleet_overrides or {})
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        version=4,
+        data=fleet_data,
+        subentries_data=[source.as_dict()],
+    )
+    entry.add_to_hass(hass)
+    store = FleetPanelStore(hass, entry, entry.subentries[source.subentry_id])
+    return (
+        entry,
+        PanelManager(hass, store, FleetConfig.from_entry(entry), asyncio.Lock()),
+    )
 
 
 def _capture_events(hass: HomeAssistant) -> list[Event]:
@@ -84,6 +169,24 @@ def _timer_cancelled(cancel: object) -> bool:
     return handle.cancelled()
 
 
+async def test_shutdown_drains_every_subscription_when_one_callback_raises(
+    hass: HomeAssistant,
+) -> None:
+    """One broken MQTT unsubscribe cannot retain the manager's later owners."""
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    manager = _legacy_manager(hass, entry)
+    first = Mock(side_effect=RuntimeError("unsubscribe failed"))
+    second = Mock()
+    manager._unsubs.extend((first, second))
+
+    with pytest.raises(RuntimeError, match="unsubscribe failed"):
+        await manager.async_shutdown()
+
+    first.assert_called_once_with()
+    second.assert_called_once_with()
+    assert manager._unsubs == []
+
+
 @pytest.mark.parametrize(("enabled", "line"), [(False, "0"), (True, "1")])
 async def test_manager_renders_scene_bridge_toggle_from_entry_data(
     hass: HomeAssistant, payload_dir: Path, enabled: bool, line: str
@@ -95,9 +198,162 @@ async def test_manager_renders_scene_bridge_toggle_from_entry_data(
         version=3,
     )
     entry.add_to_hass(hass)
-    manager = PanelManager(hass, entry, asyncio.Lock())
-    _unit, env = await manager._config_contents()
+    manager = _legacy_manager(hass, entry)
+    env = manager._broker_release_settings().environment
     assert f"SCENE_BRIDGE_ENABLED={line}" in env.splitlines()
+
+
+def test_manager_uses_strict_fleet_shell_and_private_legacy_adapter(
+    hass: HomeAssistant,
+) -> None:
+    """Fleet pins are validated at construction; only compatibility may use TOFU."""
+    _entry, fleet_manager = _fleet_panel_manager(hass)
+    legacy_entry = MockConfigEntry(domain=DOMAIN, unique_id="legacy", data=ENTRY_DATA)
+    legacy_manager = _legacy_manager(hass, legacy_entry)
+
+    assert isinstance(fleet_manager._shell(), AsyncsshShell)
+    assert isinstance(legacy_manager._shell(), _LegacyAsyncsshShell)
+    with pytest.raises(RuntimeError, match="fleet_unpinned_shell_forbidden"):
+        fleet_manager._shell_unpinned()
+
+    _entry, malformed = _fleet_panel_manager(
+        hass,
+        panel_overrides={DATA_SSH_HOST_KEY: "ssh-ed25519 not-canonical"},
+    )
+    connect = AsyncMock()
+    with (
+        patch(
+            "custom_components.brilliant_mqtt.shell.asyncssh.connect",
+            connect,
+        ),
+        pytest.raises(PanelIdentityError),
+    ):
+        malformed._shell()
+    connect.assert_not_awaited()
+
+
+@pytest.mark.parametrize("operation", ["repair", "component"])
+async def test_fleet_custom_ca_is_staged_and_exact_returned_path_is_rendered(
+    hass: HomeAssistant,
+    payload_dir: Path,
+    operation: str,
+) -> None:
+    """Fleet repair/install never exports broker secrets or guesses the CA path."""
+    ca_pem = "-----BEGIN CERTIFICATE-----\nZmFrZS1wdWJsaWMtY2E=\n-----END CERTIFICATE-----"
+    entry, manager = _fleet_panel_manager(
+        hass,
+        fleet_overrides={
+            CONF_MQTT_TLS_ENABLED: True,
+            CONF_MQTT_TLS_CA: ca_pem,
+        },
+    )
+    shell = FakeShell()
+    staged_path = "/var/brilliant-mqtt/tls/mqtt-ca-0123456789abcdef.pem"
+    stage = AsyncMock(return_value=staged_path)
+    render = Mock(wraps=manager._broker_release_settings)
+
+    with (
+        patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell),
+        patch.object(manager, "_broker_release_settings", render),
+        patch(
+            "custom_components.brilliant_mqtt.manager.panel_ops.stage_mqtt_ca",
+            stage,
+        ),
+        patch(
+            "custom_components.brilliant_mqtt.manager.panel_ops.inspect_panel",
+            new=AsyncMock(return_value=SimpleNamespace(payload_present=True)),
+        ),
+        patch.object(
+            manager,
+            "_async_retire_legacy_ha_mirror_on_shell",
+            new=AsyncMock(return_value=None),
+        ),
+    ):
+        if operation == "repair":
+            await manager.async_repair(trigger="test")
+        else:
+            await manager.async_install_component(COMPONENT_BRIDGE)
+
+    stage.assert_awaited_once_with(shell, ca_pem.encode())
+    assert render.call_count == 1
+    environments = [
+        content.decode()
+        for path, content, _mode in shell.uploads
+        if path.endswith("brilliant-mqtt.env")
+    ]
+    assert environments
+    assert all(staged_path in environment for environment in environments)
+    assert all("mqtt-ca-0000000000000000.pem" not in environment for environment in environments)
+    assert CONF_MQTT_TLS_CA not in entry.subentries["panel-office"].data
+    assert "mqtt_password" not in entry.subentries["panel-office"].data
+    await manager.async_shutdown()
+
+
+async def test_fleet_overrides_cannot_shadow_panel_identity_and_wake_word_stays_owned(
+    hass: HomeAssistant,
+) -> None:
+    """Only allowlisted overrides reach component installers or panel storage."""
+    entry, manager = _fleet_panel_manager(
+        hass,
+        feature_overrides={
+            CONF_PANEL: "attacker-controlled-shadow",
+            CONF_COMPONENTS: {COMPONENT_VOICE: True},
+            CONF_VOICE_HA_HOST: "ha.example.com",
+            CONF_VOICE_WAKE_WORD: "hey_jarvis",
+        },
+    )
+
+    install_data = manager._component_install_data(COMPONENT_VOICE)
+    assert install_data == {
+        CONF_PANEL: "office",
+        CONF_VOICE_HA_HOST: "ha.example.com",
+        CONF_VOICE_WAKE_WORD: "hey_jarvis",
+    }
+    assert manager.store.data[CONF_PANEL] == "office"
+    assert manager.store.data[CONF_COMPONENTS] == {COMPONENT_BRIDGE: True}
+
+    await manager.async_set_voice_wake_word("okay_nabu")
+    stored = entry.subentries["panel-office"].data
+    assert CONF_VOICE_WAKE_WORD not in stored
+    assert stored[CONF_FEATURE_OVERRIDES][CONF_VOICE_WAKE_WORD] == "okay_nabu"
+    assert stored[CONF_FEATURE_OVERRIDES][CONF_PANEL] == "attacker-controlled-shadow"
+
+
+async def test_fleet_firmware_health_remains_runtime_only(hass: HomeAssistant) -> None:
+    """A fleet metadata update never writes legacy runtime keys into panel data."""
+    entry, manager = _fleet_panel_manager(hass)
+
+    await manager._on_meta(
+        cast(
+            Any,
+            SimpleNamespace(payload='{"agent_version": "0.2.0", "panel_firmware": "v26.07.28.1"}'),
+        )
+    )
+
+    assert manager._last_firmware == "v26.07.28.1"
+    assert DATA_LAST_FIRMWARE not in entry.subentries["panel-office"].data
+
+
+async def test_fleet_override_can_never_enable_legacy_unpinned_repin(
+    hass: HomeAssistant,
+) -> None:
+    """A malicious/new-fleet override cannot offer credentials before key trust."""
+    _entry, manager = _fleet_panel_manager(
+        hass,
+        feature_overrides={OPT_TRUST_HOST_KEY_CHANGES: True},
+    )
+    pinned = FakeShell(connect_error=asyncssh.HostKeyNotVerifiable("changed"))
+
+    with (
+        patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=pinned),
+        patch.object(manager, "_shell_unpinned") as unpinned,
+    ):
+        await manager.async_repair(trigger="test")
+
+    unpinned.assert_not_called()
+    assert manager.problem is True
+    assert manager.problem_reason is not None
+    assert "host key changed" in manager.problem_reason
 
 
 @pytest.mark.allow_lingering_timers
@@ -133,7 +389,7 @@ async def test_offline_grace_triggers_auto_repair_then_recovery(
     async_fire_mqtt_message(hass, "brilliant/office/availability", "online")
     await hass.async_block_till_done()
     assert _types(events) == ["repair_started", "repair_succeeded"]
-    assert entry.runtime_data.problem is False
+    assert _entry_manager(entry).problem is False
 
     assert await hass.config_entries.async_unload(entry.entry_id)
 
@@ -154,9 +410,9 @@ async def test_repair_deploys_payload_when_code_absent(
         0, "unit=0\nenv=0\nenabled=0\nactive=0\nsunit=0\nsenv=0\npayload=0\n", ""
     )
     shell = FakeShell(responses={panel_ops.INSPECT_COMMAND: code_absent})
-    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
         entry = await _setup(hass)
-        await entry.runtime_data.async_repair(trigger="button")
+        await _entry_manager(entry).async_repair(trigger="button")
         await hass.async_block_till_done()
 
     assert shell.dir_uploads  # deploy_payload uploaded app/+vendor/
@@ -194,9 +450,9 @@ async def test_tls_refusal_precedes_management_payload_deployment(
     )
     entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
     entry.add_to_hass(hass)
-    manager = PanelManager(hass, entry, asyncio.Lock())
+    manager = _legacy_manager(hass, entry)
 
-    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
         if path == "repair":
             await manager.async_repair(trigger="button")
         else:
@@ -232,7 +488,7 @@ async def test_repair_timeout_escalates_and_cooldown_blocks_retry(
     async_fire_time_changed(hass, dt_util.utcnow() + timedelta(minutes=13))
     await hass.async_block_till_done()
     assert _types(events) == ["repair_started", "repair_failed", "needs_attention"]
-    assert entry.runtime_data.problem is True
+    assert _entry_manager(entry).problem is True
     assert any("journalctl -u brilliant-mqtt" in c for c in fake_shell.commands)
 
     # A second offline→grace within the cooldown must NOT repair again.
@@ -266,7 +522,7 @@ async def test_auto_repair_off_notifies_only(
 
     assert not fake_shell.commands
     assert _types(events) == ["needs_attention"]
-    assert entry.runtime_data.problem is True
+    assert _entry_manager(entry).problem is True
 
     assert await hass.config_entries.async_unload(entry.entry_id)
 
@@ -315,7 +571,7 @@ async def test_unreachable_panel_reports_and_schedules_recheck(
     payload_dir: Path,
 ) -> None:
     shell = FakeShell(connect_error=OSError("unreachable"))
-    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
         entry = await _setup(hass)
         events = _capture_events(hass)
         async_fire_mqtt_message(hass, "brilliant/office/availability", "offline")
@@ -325,7 +581,7 @@ async def test_unreachable_panel_reports_and_schedules_recheck(
 
         assert _types(events) == ["repair_started", "repair_failed"]
         assert events[-1].data["reason"] == "unreachable"
-        assert entry.runtime_data.problem is True
+        assert _entry_manager(entry).problem is True
         assert shell.connect_count == 1  # one real SSH attempt so far
 
         # I1: the connect-fail path recorded the cooldown. When the 5-min recheck
@@ -351,15 +607,12 @@ async def test_unload_cancels_pending_timers(hass: HomeAssistant) -> None:
     the manager's (mqtt_mock would start its own recurring timer that the guard would
     flag, masking what we are testing); the availability handler is exercised directly.
     """
-    import asyncio
 
     from homeassistant.components.mqtt.models import ReceiveMessage
 
-    from custom_components.brilliant_mqtt.manager import PanelManager
-
     entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
     entry.add_to_hass(hass)
-    manager = PanelManager(hass, entry, asyncio.Lock())
+    manager = _legacy_manager(hass, entry)
 
     msg = ReceiveMessage(
         topic="brilliant/office/availability",
@@ -392,7 +645,7 @@ async def test_repair_step_failure_escalates_and_sets_problem(
     from custom_components.brilliant_mqtt.shell import RunResult
 
     shell = FakeShell(responses={"systemctl enable --now brilliant-mqtt": RunResult(1, "", "boom")})
-    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
         entry = await _setup(hass)
         events = _capture_events(hass)
 
@@ -407,11 +660,11 @@ async def test_repair_step_failure_escalates_and_sets_problem(
     assert "repair_succeeded" not in _types(events)
     failed = next(e for e in events if e.data["type"] == "repair_failed")
     assert failed.data["reason"] == "repair_step_failed"
-    assert entry.runtime_data.problem is True
+    assert _entry_manager(entry).problem is True
 
     # No recovery timer was scheduled (we returned before the success path), and the
     # cooldown was recorded so a retry within it would be gated — unloading is clean.
-    assert entry.runtime_data._recovery_cancel is None
+    assert _entry_manager(entry)._recovery_cancel is None
     assert await hass.config_entries.async_unload(entry.entry_id)
 
 
@@ -427,22 +680,20 @@ async def test_shutdown_during_inflight_repair_leaks_no_timer(
     timer that could linger is the manager's. The repair is wedged by gating
     FakeShell.connect on an event.
 
-    `payload_dir` is REQUIRED: it makes _config_contents() succeed so the gated repair
+    `payload_dir` is REQUIRED: it makes _unit_contents() succeed so the gated repair
     traverses the SUCCESS path to the recovery-timer schedule site. Without it,
-    _config_contents() raises FileNotFoundError, the C2 step handler returns first, and
+    _unit_contents() raises FileNotFoundError, the C2 step handler returns first, and
     the success-site guard is never reached (the bug the re-review caught).
     """
     import asyncio
-
-    from custom_components.brilliant_mqtt.manager import PanelManager
 
     entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
     entry.add_to_hass(hass)
 
     gate = asyncio.Event()
     shell = FakeShell(connect_gate=gate)
-    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
-        manager = PanelManager(hass, entry, asyncio.Lock())
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
+        manager = _legacy_manager(hass, entry)
 
         repair = hass.async_create_task(manager.async_repair(trigger="auto"))
         # Deterministically wait until the repair is wedged inside connect() (gated)
@@ -487,22 +738,23 @@ async def test_agent_update_step_failure_escalates_and_raises(
     from custom_components.brilliant_mqtt.shell import RunResult
 
     shell = FakeShell(responses={"systemctl restart brilliant-mqtt": RunResult(1, "", "boom")})
-    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
         entry = await _setup(hass)
         events = _capture_events(hass)
         with pytest.raises(HomeAssistantError) as err:
-            await entry.runtime_data.async_update_agent()
+            await _entry_manager(entry).async_update_agent()
         await hass.async_block_till_done()
     assert err.value.translation_key == "update_failed"
 
     assert "agent_updated" not in _types(events)
     assert _types(events)[-1] == "needs_attention"
-    assert entry.runtime_data.problem is True
-    assert entry.runtime_data.problem_reason is not None
-    assert "agent update failed" in entry.runtime_data.problem_reason
+    assert _entry_manager(entry).problem is True
+    problem_reason = _entry_manager(entry).problem_reason
+    assert problem_reason is not None
+    assert "agent update failed" in problem_reason
     assert shell.dir_uploads  # payload reached the panel before the failing restart
-    assert entry.runtime_data._recovery_cancel is None  # no timer armed on the failure path
-    assert entry.runtime_data._repairing is False  # mutex released even though we raised
+    assert _entry_manager(entry)._recovery_cancel is None  # no timer armed on the failure path
+    assert _entry_manager(entry)._repairing is False  # mutex released even though we raised
 
     assert await hass.config_entries.async_unload(entry.entry_id)
 
@@ -520,15 +772,13 @@ async def test_shutdown_during_inflight_agent_update_leaks_no_timer(
     """
     import asyncio
 
-    from custom_components.brilliant_mqtt.manager import PanelManager
-
     entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
     entry.add_to_hass(hass)
 
     gate = asyncio.Event()
     shell = FakeShell(connect_gate=gate)
-    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
-        manager = PanelManager(hass, entry, asyncio.Lock())
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
+        manager = _legacy_manager(hass, entry)
 
         update = hass.async_create_task(manager.async_update_agent())
         await shell.connect_entered.wait()  # wedged inside connect(), holding the ssh_lock
@@ -571,15 +821,15 @@ async def test_update_during_repair_recovery_window_leaks_no_timer(
 
     from homeassistant.components.mqtt.models import ReceiveMessage
 
-    from custom_components.brilliant_mqtt.manager import PanelManager
-
     entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
     entry.add_to_hass(hass)
-    manager = PanelManager(hass, entry, asyncio.Lock())
+    manager = _legacy_manager(hass, entry)
 
     # First a clean repair so we are genuinely inside its recovery window.
     repair_shell = FakeShell()
-    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=repair_shell):
+    with patch(
+        "custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=repair_shell
+    ):
         await manager.async_repair(trigger="manual")
     assert manager._recovery_cancel is not None  # recovery timer armed by the repair
     prior_recovery = manager._recovery_cancel
@@ -589,7 +839,9 @@ async def test_update_during_repair_recovery_window_leaks_no_timer(
     # (an offline LWT mid-update arms NO grace timer) before letting it finish.
     gate = asyncio.Event()
     update_shell = FakeShell(connect_gate=gate)
-    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=update_shell):
+    with patch(
+        "custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=update_shell
+    ):
         update = hass.async_create_task(manager.async_update_agent())
         await update_shell.connect_entered.wait()  # wedged: _repairing True, holds ssh_lock
         assert manager._repairing is True
@@ -637,17 +889,16 @@ async def test_repair_cancels_pending_grace_timer(
     and the only timers in flight are the manager's; NOT allow_lingering_timers — the
     strict guard proves we leak nothing once the recovery timer is cancelled at shutdown.
     """
-    import asyncio
 
     from homeassistant.components.mqtt.models import ReceiveMessage
-
-    from custom_components.brilliant_mqtt.manager import PanelManager
 
     entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
     entry.add_to_hass(hass)
 
-    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=FakeShell()):
-        manager = PanelManager(hass, entry, asyncio.Lock())
+    with patch(
+        "custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=FakeShell()
+    ):
+        manager = _legacy_manager(hass, entry)
 
         offline = ReceiveMessage(
             topic="brilliant/office/availability",
@@ -681,15 +932,12 @@ async def test_on_availability_ignored_after_shutdown(hass: HomeAssistant) -> No
     guard a leaked grace timer would fail the test. No mqtt_mock so the only possible
     timer is the manager's.
     """
-    import asyncio
 
     from homeassistant.components.mqtt.models import ReceiveMessage
 
-    from custom_components.brilliant_mqtt.manager import PanelManager
-
     entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
     entry.add_to_hass(hass)
-    manager = PanelManager(hass, entry, asyncio.Lock())
+    manager = _legacy_manager(hass, entry)
 
     await manager.async_shutdown()
     assert manager._shutting_down is True
@@ -713,15 +961,12 @@ async def test_on_meta_ignored_after_shutdown(hass: HomeAssistant) -> None:
 
     Constructed directly like the other shutdown tests; no mqtt_mock.
     """
-    import asyncio
 
     from homeassistant.components.mqtt.models import ReceiveMessage
 
-    from custom_components.brilliant_mqtt.manager import PanelManager
-
     entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
     entry.add_to_hass(hass)
-    manager = PanelManager(hass, entry, asyncio.Lock())
+    manager = _legacy_manager(hass, entry)
 
     await manager.async_shutdown()
     assert manager._shutting_down is True
@@ -747,7 +992,7 @@ async def test_retained_ledger_degraded_meta_is_actionable_idempotent_and_self_c
 
     entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
     entry.add_to_hass(hass)
-    manager = PanelManager(hass, entry, asyncio.Lock())
+    manager = _legacy_manager(hass, entry)
     events = _capture_events(hass)
 
     offline = ReceiveMessage(
@@ -815,6 +1060,54 @@ async def test_retained_ledger_degraded_meta_is_actionable_idempotent_and_self_c
     assert ir.async_get(hass).async_get_issue(DOMAIN, manager._issue_id) is None
 
 
+async def test_retained_ledger_recovery_rearms_offline_grace_once(
+    hass: HomeAssistant,
+) -> None:
+    """Healthy metadata cannot strand an offline panel without a recovery timer."""
+    from homeassistant.components.mqtt.models import ReceiveMessage
+
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    manager = _legacy_manager(hass, entry)
+
+    offline = ReceiveMessage(
+        topic="brilliant/office/availability",
+        payload="offline",
+        qos=0,
+        retain=True,
+        subscribed_topic="brilliant/office/availability",
+        timestamp=dt_util.utcnow().timestamp(),
+    )
+    degraded = ReceiveMessage(
+        topic="brilliant/office/bridge",
+        payload='{"agent_version":"0.6.0","degraded":"retained_ledger"}',
+        qos=1,
+        retain=True,
+        subscribed_topic="brilliant/office/bridge",
+        timestamp=dt_util.utcnow().timestamp(),
+    )
+    healthy = ReceiveMessage(
+        topic="brilliant/office/bridge",
+        payload='{"agent_version":"0.6.0"}',
+        qos=0,
+        retain=True,
+        subscribed_topic="brilliant/office/bridge",
+        timestamp=dt_util.utcnow().timestamp(),
+    )
+
+    await manager._on_availability(offline)
+    assert manager._grace_cancel is not None
+    await manager._on_meta(degraded)
+    assert manager._grace_cancel is None
+
+    await manager._on_meta(healthy)
+    rearmed = manager._grace_cancel
+    assert rearmed is not None
+    await manager._on_meta(healthy)
+    assert manager._grace_cancel is rearmed
+    await manager.async_shutdown()
+
+
 async def test_inflight_recovery_timeout_cannot_overwrite_retained_ledger_diagnostic(
     hass: HomeAssistant,
 ) -> None:
@@ -823,7 +1116,7 @@ async def test_inflight_recovery_timeout_cannot_overwrite_retained_ledger_diagno
 
     entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
     entry.add_to_hass(hass)
-    manager = PanelManager(hass, entry, asyncio.Lock())
+    manager = _legacy_manager(hass, entry)
     manager.availability = "offline"
     events = _capture_events(hass)
     shell = FakeShell()
@@ -874,8 +1167,6 @@ async def test_shutdown_during_inflight_repair_connect_fail_leaks_no_timer(
     """
     import asyncio
 
-    from custom_components.brilliant_mqtt.manager import PanelManager
-
     entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
     entry.add_to_hass(hass)
 
@@ -883,8 +1174,8 @@ async def test_shutdown_during_inflight_repair_connect_fail_leaks_no_timer(
     # Wedge inside connect() (connect_entered fires before the gate), then fail once
     # released — so _shutting_down is already True when the connect-fail branch runs.
     shell = FakeShell(connect_gate=gate, connect_error=OSError("unreachable"))
-    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
-        manager = PanelManager(hass, entry, asyncio.Lock())
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
+        manager = _legacy_manager(hass, entry)
 
         repair = hass.async_create_task(manager.async_repair(trigger="auto"))
         await shell.connect_entered.wait()
@@ -914,13 +1205,10 @@ async def test_repair_host_key_changed_without_optin_escalates_and_never_repins(
     Built directly (no mqtt_mock) under the strict timer guard so a leaked recheck timer
     would fail loudly. async_repair swallows (button/timer context), so no raise here.
     """
-    import asyncio
-
-    from custom_components.brilliant_mqtt.manager import PanelManager
 
     entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
     entry.add_to_hass(hass)
-    manager = PanelManager(hass, entry, asyncio.Lock())
+    manager = _legacy_manager(hass, entry)
     events = _capture_events(hass)
 
     await manager.async_repair(trigger="button")
@@ -953,9 +1241,6 @@ async def test_repair_host_key_changed_with_optin_repins_and_proceeds(
     Built directly under the strict guard; shutdown at the end cancels the recovery timer
     so nothing lingers.
     """
-    import asyncio
-
-    from custom_components.brilliant_mqtt.manager import PanelManager
 
     entry = MockConfigEntry(
         domain=DOMAIN,
@@ -964,7 +1249,7 @@ async def test_repair_host_key_changed_with_optin_repins_and_proceeds(
         options={OPT_TRUST_HOST_KEY_CHANGES: True},
     )
     entry.add_to_hass(hass)
-    manager = PanelManager(hass, entry, asyncio.Lock())
+    manager = _legacy_manager(hass, entry)
     events = _capture_events(hass)
 
     await manager.async_repair(trigger="button")
@@ -1008,11 +1293,11 @@ async def test_repin_aborts_before_unpinned_connect_when_pinned_close_is_uncerta
         options={OPT_TRUST_HOST_KEY_CHANGES: True},
     )
     entry.add_to_hass(hass)
-    manager = PanelManager(hass, entry, asyncio.Lock())
+    manager = _legacy_manager(hass, entry)
 
     with (
         patch(
-            "custom_components.brilliant_mqtt.manager.AsyncsshShell",
+            "custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell",
             side_effect=shell_factory,
         ),
         patch(
@@ -1044,9 +1329,6 @@ async def test_repair_repin_connect_failure_is_unreachable(
     Built directly under the strict guard; the unreachable branch arms a recheck timer,
     so shutdown at the end cancels it.
     """
-    import asyncio
-
-    from custom_components.brilliant_mqtt.manager import PanelManager
 
     repin_shells.unpinned_connect_error = OSError("unreachable on re-pin")
 
@@ -1057,7 +1339,7 @@ async def test_repair_repin_connect_failure_is_unreachable(
         options={OPT_TRUST_HOST_KEY_CHANGES: True},
     )
     entry.add_to_hass(hass)
-    manager = PanelManager(hass, entry, asyncio.Lock())
+    manager = _legacy_manager(hass, entry)
     events = _capture_events(hass)
 
     await manager.async_repair(trigger="button")
@@ -1082,15 +1364,12 @@ async def test_update_host_key_changed_without_optin_raises(
     offering the password to the new-key host (no unpinned shell constructed) and without
     touching the stored pin.
     """
-    import asyncio
 
     from homeassistant.exceptions import HomeAssistantError
 
-    from custom_components.brilliant_mqtt.manager import PanelManager
-
     entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
     entry.add_to_hass(hass)
-    manager = PanelManager(hass, entry, asyncio.Lock())
+    manager = _legacy_manager(hass, entry)
     events = _capture_events(hass)
 
     with pytest.raises(HomeAssistantError) as err:
@@ -1119,7 +1398,7 @@ async def test_agent_update_reports_progress(
     so the update entity can show a real progress bar through the deploy stages."""
     entry = await _setup(hass)
     pcts: list[int] = []
-    await entry.runtime_data.async_update_agent(progress=pcts.append)
+    await _entry_manager(entry).async_update_agent(progress=pcts.append)
     await hass.async_block_till_done()
     assert pcts, "no progress reported"
     assert pcts == sorted(pcts), f"progress must be monotonic: {pcts}"
@@ -1175,8 +1454,8 @@ async def test_async_reboot_captures_diagnostics_before_rebooting(
     reboot command, which is issued last."""
     entry = _reboot_entry(hass)
     shell = FakeShell(responses={"uptime": RunResult(0, "up 1 day\n", "")})
-    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
-        manager = PanelManager(hass, entry, asyncio.Lock())
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
+        manager = _legacy_manager(hass, entry)
         await manager.async_reboot(collect_diagnostics=True, journal_lines=400)
 
     assert panel_ops.REBOOT_COMMAND in shell.commands
@@ -1192,8 +1471,8 @@ async def test_async_reboot_disconnect_is_success_and_can_skip_diagnostics(
 ) -> None:
     entry = _reboot_entry(hass)
     shell = FakeShell(run_errors={panel_ops.REBOOT_COMMAND: asyncssh.ConnectionLost("down")})
-    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
-        manager = PanelManager(hass, entry, asyncio.Lock())
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
+        manager = _legacy_manager(hass, entry)
         await manager.async_reboot(collect_diagnostics=False)  # must NOT raise
 
     assert panel_ops.REBOOT_COMMAND in shell.commands
@@ -1210,8 +1489,8 @@ async def test_async_reboot_prunes_diagnostics_to_retention(
     _seed_diag(hass, old)
 
     shell = FakeShell()
-    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
-        manager = PanelManager(hass, entry, asyncio.Lock())
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
+        manager = _legacy_manager(hass, entry)
         await manager.async_reboot(collect_diagnostics=True, journal_lines=200)
 
     remaining = _diag_log_names(hass)
@@ -1227,13 +1506,13 @@ async def test_async_reboot_still_reboots_when_diagnostics_persist_fails(
     entry = _reboot_entry(hass)
     shell = FakeShell(responses={"uptime": RunResult(0, "x\n", "")})
     with (
-        patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell),
+        patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell),
         patch(
             "custom_components.brilliant_mqtt.manager._write_diagnostics_bundle",
             side_effect=OSError("disk full"),
         ),
     ):
-        manager = PanelManager(hass, entry, asyncio.Lock())
+        manager = _legacy_manager(hass, entry)
         await manager.async_reboot(collect_diagnostics=True)  # must NOT raise
 
     assert panel_ops.REBOOT_COMMAND in shell.commands  # reboot still issued
@@ -1243,8 +1522,8 @@ async def test_async_reboot_still_reboots_when_diagnostics_persist_fails(
 async def test_async_reboot_raises_when_panel_unreachable(hass: HomeAssistant) -> None:
     entry = _reboot_entry(hass)
     shell = FakeShell(connect_error=OSError("unreachable"))
-    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
-        manager = PanelManager(hass, entry, asyncio.Lock())
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
+        manager = _legacy_manager(hass, entry)
         with pytest.raises(HomeAssistantError) as err:
             await manager.async_reboot()
 
@@ -1258,7 +1537,7 @@ def test_agent_unit_disables_wifi_power_save_before_start() -> None:
     """The shipped agent unit disables Wi-Fi power-save before start — the root cause of
     the MQTT keepalive flap — failure-tolerantly, so it can never block the bridge.
 
-    _config_contents deploys the bundled payload unit to panels via repair/redeploy, and
+    _unit_contents deploys the bundled payload unit to panels via repair/redeploy, and
     the build copies deploy/brilliant-mqtt.service into the payload verbatim, so both the
     git-tracked source and the bundled copy must carry the line and stay in sync.
     """
@@ -1315,17 +1594,16 @@ async def test_set_voice_enabled_true_payload_absent_deploys(
     payload_dir: Path,
 ) -> None:
     """enable=True when voice payload is absent → tarball uploaded, config written, enabled."""
-    import asyncio
 
     entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
     entry.add_to_hass(hass)
 
     shell = _make_voice_shell(payload_present=False)
     with (
-        patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell),
+        patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell),
         patch(_COMPONENTS_FETCH_PATCH, return_value=_FAKE_TARBALL),
     ):
-        manager = PanelManager(hass, entry, asyncio.Lock())
+        manager = _legacy_manager(hass, entry)
         await manager.async_set_voice_enabled(True)
 
     # Tarball uploaded to panel (deploy_voice_payload → put_file)
@@ -1347,17 +1625,16 @@ async def test_set_voice_enabled_true_always_deploys(
     only in the repair path (_deploy_voice); the component registry install() is a
     deliberate, unconditional install.
     """
-    import asyncio
 
     entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
     entry.add_to_hass(hass)
 
     shell = _make_voice_shell(payload_present=True)
     with (
-        patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell),
+        patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell),
         patch(_COMPONENTS_FETCH_PATCH, return_value=_FAKE_TARBALL),
     ):
-        manager = PanelManager(hass, entry, asyncio.Lock())
+        manager = _legacy_manager(hass, entry)
         await manager.async_set_voice_enabled(True)
 
     # Tarball IS uploaded (no skip-if-present in the generic install path)
@@ -1373,7 +1650,6 @@ async def test_set_voice_enabled_false_uninstalls(
     payload_dir: Path,
 ) -> None:
     """enable=False → uninstall_voice commands ran, CONF_COMPONENTS[voice]=False, issue deleted."""
-    import asyncio
 
     from homeassistant.helpers import issue_registry as ir
 
@@ -1395,8 +1671,8 @@ async def test_set_voice_enabled_false_uninstalls(
     assert registry.async_get_issue(DOMAIN, voice_issue_id) is not None
 
     shell = _make_voice_shell(payload_present=True)
-    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
-        manager = PanelManager(hass, entry, asyncio.Lock())
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
+        manager = _legacy_manager(hass, entry)
         await manager.async_set_voice_enabled(False)
 
     # disable + rm commands ran
@@ -1411,16 +1687,13 @@ async def test_set_voice_wake_word_voice_enabled_restarts(
     payload_dir: Path,
 ) -> None:
     """Wake-word change with voice enabled → entry updated AND restart ran on panel."""
-    import asyncio
-
-    from custom_components.brilliant_mqtt.manager import PanelManager
 
     entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=_voice_entry_data(), version=2)
     entry.add_to_hass(hass)
 
     shell = _make_voice_shell(payload_present=True)
-    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
-        manager = PanelManager(hass, entry, asyncio.Lock())
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
+        manager = _legacy_manager(hass, entry)
         await manager.async_set_voice_wake_word("hey_jarvis")
 
     assert entry.data[CONF_VOICE_WAKE_WORD] == "hey_jarvis"
@@ -1431,16 +1704,13 @@ async def test_set_voice_wake_word_voice_disabled_no_ssh(
     hass: HomeAssistant,
 ) -> None:
     """Wake-word change with voice disabled → entry updated, NO SSH connection."""
-    import asyncio
-
-    from custom_components.brilliant_mqtt.manager import PanelManager
 
     entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
     entry.add_to_hass(hass)
 
     shell = _make_voice_shell(payload_present=False)
-    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
-        manager = PanelManager(hass, entry, asyncio.Lock())
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
+        manager = _legacy_manager(hass, entry)
         await manager.async_set_voice_wake_word("hey_mycroft")
 
     assert entry.data[CONF_VOICE_WAKE_WORD] == "hey_mycroft"
@@ -1472,7 +1742,7 @@ async def test_repair_fold_in_voice_enabled_absent_payload(
         }
     )
     with (
-        patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell),
+        patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell),
         patch(_FETCH_PATCH, return_value=_FAKE_TARBALL),
     ):
         entry = MockConfigEntry(
@@ -1482,7 +1752,7 @@ async def test_repair_fold_in_voice_enabled_absent_payload(
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
-        await entry.runtime_data.async_repair(trigger="button")
+        await _entry_manager(entry).async_repair(trigger="button")
         await hass.async_block_till_done()
 
     # Voice tarball uploaded and enabled
@@ -1524,7 +1794,7 @@ async def test_repair_voice_failure_isolated_from_agent_repair(
     )
     events = _capture_events(hass)
     with (
-        patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell),
+        patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell),
         patch(_FETCH_PATCH, return_value=_FAKE_TARBALL),
     ):
         entry = MockConfigEntry(
@@ -1535,7 +1805,7 @@ async def test_repair_voice_failure_isolated_from_agent_repair(
         await hass.async_block_till_done()
 
         # This must NOT raise — voice failure is isolated
-        await entry.runtime_data.async_repair(trigger="button")
+        await _entry_manager(entry).async_repair(trigger="button")
         await hass.async_block_till_done()
 
     # Agent repair ran normally (enable_now executed)
@@ -1601,7 +1871,7 @@ async def test_repair_voice_prefetch_oserror_is_swallowed_and_repairing_resets(
     """
     shell = _make_voice_shell(payload_present=True)
     with (
-        patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell),
+        patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell),
         patch(
             "custom_components.brilliant_mqtt.voice_payload._read_cached",
             side_effect=OSError("disk read error"),
@@ -1615,11 +1885,11 @@ async def test_repair_voice_prefetch_oserror_is_swallowed_and_repairing_resets(
         await hass.async_block_till_done()
 
         # Must NOT raise even though the pre-fetch's executor file op raised OSError.
-        await entry.runtime_data.async_repair(trigger="button")
+        await _entry_manager(entry).async_repair(trigger="button")
         await hass.async_block_till_done()
 
     # The mutex was released by the outer finally — not stuck True.
-    assert entry.runtime_data._repairing is False
+    assert _entry_manager(entry)._repairing is False
     # The agent repair still ran (voice was skipped, not fatal).
     assert "systemctl enable --now brilliant-mqtt" in shell.commands
     # Voice was never deployed (pre-fetch failed → tarball None).
@@ -1661,11 +1931,9 @@ async def test_set_voice_wake_word_push_failure_keeps_old_word(
     HomeAssistantError(voice_failed) and entry.data[CONF_VOICE_WAKE_WORD] stays at the OLD
     value, so the select keeps showing the word the panel is actually running.
     """
-    import asyncio
 
     from homeassistant.exceptions import HomeAssistantError
 
-    from custom_components.brilliant_mqtt.manager import PanelManager
     from custom_components.brilliant_mqtt.shell import RunResult
 
     old_word = "okay_nabu"
@@ -1678,8 +1946,8 @@ async def test_set_voice_wake_word_push_failure_keeps_old_word(
 
     shell = _make_voice_shell(payload_present=True)
     shell.responses["systemctl restart brilliant-voice"] = RunResult(1, "", "restart boom")
-    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
-        manager = PanelManager(hass, entry, asyncio.Lock())
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
+        manager = _legacy_manager(hass, entry)
         with pytest.raises(HomeAssistantError) as err:
             await manager.async_set_voice_wake_word("hey_jarvis")
     assert err.value.translation_key == "voice_failed"
@@ -1698,7 +1966,6 @@ async def test_set_voice_enabled_true_clears_stale_voice_issue(
     After enable the satellite is running, so the "voice enabled but not running" issue
     must be deleted (previously it was deleted only on the disable path).
     """
-    import asyncio
 
     from homeassistant.helpers import issue_registry as ir
 
@@ -1721,10 +1988,10 @@ async def test_set_voice_enabled_true_clears_stale_voice_issue(
 
     shell = _make_voice_shell(payload_present=False)
     with (
-        patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell),
+        patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell),
         patch(_COMPONENTS_FETCH_PATCH, return_value=_FAKE_TARBALL),
     ):
-        manager = PanelManager(hass, entry, asyncio.Lock())
+        manager = _legacy_manager(hass, entry)
         await manager.async_set_voice_enabled(True)
 
     assert entry.data[CONF_COMPONENTS][COMPONENT_VOICE] is True
@@ -1778,7 +2045,7 @@ async def test_repair_voice_disabled_via_components_skips_voice(
     }
 
     with (
-        patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell),
+        patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell),
         patch(_FETCH_PATCH, return_value=_FAKE_TARBALL),
     ):
         entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=split_brain_data, version=2)
@@ -1786,7 +2053,7 @@ async def test_repair_voice_disabled_via_components_skips_voice(
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
-        await entry.runtime_data.async_repair(trigger="button")
+        await _entry_manager(entry).async_repair(trigger="button")
         await hass.async_block_till_done()
 
     # Voice must NOT be re-deployed: no tarball upload, no enable command.
@@ -1807,7 +2074,7 @@ async def test_install_component_records_selection(
     """async_install_component sets CONF_COMPONENTS[id]=True in entry data."""
     mgr = manager_with_fake_panel
     await mgr.async_install_component(COMPONENT_VOICE)
-    assert mgr.entry.data[CONF_COMPONENTS][COMPONENT_VOICE] is True
+    assert mgr.store.data[CONF_COMPONENTS][COMPONENT_VOICE] is True
 
 
 async def test_remove_component_clears_selection(
@@ -1817,7 +2084,7 @@ async def test_remove_component_clears_selection(
     mgr = manager_with_fake_panel
     await mgr.async_install_component(COMPONENT_VOICE)
     await mgr.async_remove_component(COMPONENT_VOICE)
-    assert mgr.entry.data[CONF_COMPONENTS][COMPONENT_VOICE] is False
+    assert mgr.store.data[CONF_COMPONENTS][COMPONENT_VOICE] is False
 
 
 # ---------------------------------------------------------------------------
@@ -1856,12 +2123,12 @@ async def test_repair_relays_watchdog_unit_when_selected(
         **ENTRY_DATA,
         CONF_COMPONENTS: {COMPONENT_BRIDGE: True, COMPONENT_WIFI_WATCHDOG: True},
     }
-    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
         entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=entry_data, version=2)
         entry.add_to_hass(hass)
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
-        await entry.runtime_data.async_repair(trigger="button")
+        await _entry_manager(entry).async_repair(trigger="button")
         await hass.async_block_till_done()
 
     # ensure_wifi_watchdog_unit wrote the unit to /etc and the staged copy.
@@ -1892,12 +2159,12 @@ async def test_repair_skips_watchdog_when_not_selected(
         **ENTRY_DATA,
         CONF_COMPONENTS: {COMPONENT_BRIDGE: True},
     }
-    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
         entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=entry_data, version=2)
         entry.add_to_hass(hass)
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
-        await entry.runtime_data.async_repair(trigger="button")
+        await _entry_manager(entry).async_repair(trigger="button")
         await hass.async_block_till_done()
 
     # No watchdog commands or uploads must have run.
@@ -1942,12 +2209,12 @@ async def test_repair_relays_bus_watchdog_unit_when_selected(
         **ENTRY_DATA,
         CONF_COMPONENTS: {COMPONENT_BRIDGE: True, COMPONENT_BUS_WATCHDOG: True},
     }
-    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
         entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=entry_data, version=2)
         entry.add_to_hass(hass)
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
-        await entry.runtime_data.async_repair(trigger="button")
+        await _entry_manager(entry).async_repair(trigger="button")
         await hass.async_block_till_done()
 
     # ensure_bus_watchdog_unit wrote the unit to /etc and the staged copy.
@@ -1978,12 +2245,12 @@ async def test_repair_skips_bus_watchdog_when_not_selected(
         **ENTRY_DATA,
         CONF_COMPONENTS: {COMPONENT_BRIDGE: True},
     }
-    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
         entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=entry_data, version=2)
         entry.add_to_hass(hass)
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
-        await entry.runtime_data.async_repair(trigger="button")
+        await _entry_manager(entry).async_repair(trigger="button")
         await hass.async_block_till_done()
 
     # No bus watchdog commands or uploads must have run.
@@ -2014,7 +2281,7 @@ async def test_refresh_staged_copies_relays_wifi_watchdog_unit_when_selected(
         **ENTRY_DATA,
         CONF_COMPONENTS: {COMPONENT_BRIDGE: True, COMPONENT_WIFI_WATCHDOG: True},
     }
-    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
         entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=entry_data, version=2)
         entry.add_to_hass(hass)
         assert await hass.config_entries.async_setup(entry.entry_id)
@@ -2066,7 +2333,7 @@ async def test_refresh_staged_copies_relays_bus_watchdog_unit_when_selected(
         **ENTRY_DATA,
         CONF_COMPONENTS: {COMPONENT_BRIDGE: True, COMPONENT_BUS_WATCHDOG: True},
     }
-    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
         entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=entry_data, version=2)
         entry.add_to_hass(hass)
         assert await hass.config_entries.async_setup(entry.entry_id)
@@ -2106,7 +2373,7 @@ async def test_refresh_staged_copies_skips_bus_watchdog_when_not_selected(
         **ENTRY_DATA,
         CONF_COMPONENTS: {COMPONENT_BRIDGE: True},
     }
-    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
         entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=entry_data, version=2)
         entry.add_to_hass(hass)
         assert await hass.config_entries.async_setup(entry.entry_id)
@@ -2177,12 +2444,12 @@ async def test_repair_relays_hue_ca_units_when_selected(
         CONF_COMPONENTS: {COMPONENT_BRIDGE: True, COMPONENT_HUE_CA: True},
         CONF_HUE_CA_CERT: _HUE_CA_CERT_PEM,
     }
-    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
         entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=entry_data, version=2)
         entry.add_to_hass(hass)
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
-        await entry.runtime_data.async_repair(trigger="button")
+        await _entry_manager(entry).async_repair(trigger="button")
         await hass.async_block_till_done()
 
     # ensure_hue_ca_units wrote both units to /etc and the staged copies.
@@ -2228,12 +2495,12 @@ async def test_repair_redeploys_hue_ca_code_and_cert_when_payload_absent(
         CONF_COMPONENTS: {COMPONENT_BRIDGE: True, COMPONENT_HUE_CA: True},
         CONF_HUE_CA_CERT: _HUE_CA_CERT_PEM,
     }
-    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
         entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=entry_data, version=2)
         entry.add_to_hass(hass)
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
-        await entry.runtime_data.async_repair(trigger="button")
+        await _entry_manager(entry).async_repair(trigger="button")
         await hass.async_block_till_done()
 
     # deploy_hue_ca uploaded the code tree AND wrote the CA (after the swap).
@@ -2286,12 +2553,12 @@ async def test_repair_skips_hue_ca_relay_when_payload_absent_and_no_ca_configure
         CONF_COMPONENTS: {COMPONENT_BRIDGE: True, COMPONENT_HUE_CA: True},
         CONF_HUE_CA_CERT: "",
     }
-    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
         entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=entry_data, version=2)
         entry.add_to_hass(hass)
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
-        await entry.runtime_data.async_repair(trigger="button")
+        await _entry_manager(entry).async_repair(trigger="button")
         await hass.async_block_till_done()
 
     # No redeploy, no unit re-lay, no enable — the relay was skipped entirely.
@@ -2320,12 +2587,12 @@ async def test_repair_skips_hue_ca_when_not_selected(
         **ENTRY_DATA,
         CONF_COMPONENTS: {COMPONENT_BRIDGE: True},
     }
-    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
         entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=entry_data, version=2)
         entry.add_to_hass(hass)
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
-        await entry.runtime_data.async_repair(trigger="button")
+        await _entry_manager(entry).async_repair(trigger="button")
         await hass.async_block_till_done()
 
     # No hue-ca commands or uploads must have run.
@@ -2365,7 +2632,7 @@ async def test_refresh_staged_copies_relays_hue_ca_units_when_selected(
         CONF_COMPONENTS: {COMPONENT_BRIDGE: True, COMPONENT_HUE_CA: True},
         CONF_HUE_CA_CERT: _HUE_CA_CERT_PEM,
     }
-    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
         entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=entry_data, version=2)
         entry.add_to_hass(hass)
         assert await hass.config_entries.async_setup(entry.entry_id)
@@ -2401,7 +2668,7 @@ async def test_refresh_staged_copies_skips_hue_ca_when_not_selected(
         **ENTRY_DATA,
         CONF_COMPONENTS: {COMPONENT_BRIDGE: True},
     }
-    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
         entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=entry_data, version=2)
         entry.add_to_hass(hass)
         assert await hass.config_entries.async_setup(entry.entry_id)
@@ -2460,7 +2727,7 @@ async def test_repair_retires_ha_mirror_when_legacy_data_exists(
         ]
     )
     shell.responses[panel_ops.INSPECT_COMMAND] = agent_ok
-    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
         entry = MockConfigEntry(
             domain=DOMAIN, unique_id="office", data=_ha_mirror_entry_data(), version=2
         )
@@ -2468,9 +2735,13 @@ async def test_repair_retires_ha_mirror_when_legacy_data_exists(
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
         hass.config_entries.async_update_entry(
-            entry, data={**entry.data, CONF_PANEL: "entry-data-changed-after-manager-init"}
+            entry,
+            data={
+                **entry.data,
+                CONF_HA_MIRROR_LABEL: "entry-data-changed-after-manager-init",
+            },
         )
-        await entry.runtime_data.async_repair(trigger="button")
+        await _entry_manager(entry).async_repair(trigger="button")
         await hass.async_block_till_done()
 
     assert "systemctl disable --now brilliant-ha-mirror 2>/dev/null || true" in shell.commands
@@ -2493,12 +2764,12 @@ async def test_repair_skips_ha_mirror_when_not_selected(
     )
     shell = FakeShell(responses={panel_ops.INSPECT_COMMAND: agent_ok})
     entry_data = {**ENTRY_DATA, CONF_COMPONENTS: {COMPONENT_BRIDGE: True}}
-    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
         entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=entry_data, version=2)
         entry.add_to_hass(hass)
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
-        await entry.runtime_data.async_repair(trigger="button")
+        await _entry_manager(entry).async_repair(trigger="button")
         await hass.async_block_till_done()
 
     assert "systemctl enable --now brilliant-ha-mirror" not in shell.commands
@@ -2527,18 +2798,18 @@ async def test_repair_ha_mirror_retirement_failure_does_not_fail_bridge_repair(
             ),
         }
     )
-    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
         entry = MockConfigEntry(
             domain=DOMAIN, unique_id="office", data=_ha_mirror_entry_data(), version=2
         )
         entry.add_to_hass(hass)
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
-        await entry.runtime_data.async_repair(trigger="button")
+        await _entry_manager(entry).async_repair(trigger="button")
         await hass.async_block_till_done()
 
     assert "systemctl enable --now brilliant-ha-mirror" not in shell.commands
-    assert entry.runtime_data._recovery_cancel is not None
+    assert _entry_manager(entry)._recovery_cancel is not None
     assert await hass.config_entries.async_unload(entry.entry_id)
 
 
@@ -2556,7 +2827,7 @@ async def test_refresh_staged_copies_retires_ha_mirror_when_legacy_data_exists(
             _mirror_inspect_result(installed=False),
         ]
     )
-    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
         entry = MockConfigEntry(
             domain=DOMAIN, unique_id="office", data=_ha_mirror_entry_data(), version=2
         )
@@ -2564,7 +2835,11 @@ async def test_refresh_staged_copies_retires_ha_mirror_when_legacy_data_exists(
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
         hass.config_entries.async_update_entry(
-            entry, data={**entry.data, CONF_PANEL: "entry-data-changed-after-manager-init"}
+            entry,
+            data={
+                **entry.data,
+                CONF_HA_MIRROR_LABEL: "entry-data-changed-after-manager-init",
+            },
         )
         async_fire_mqtt_message(
             hass, "brilliant/office/bridge", '{"agent_version": "0.2.0", "panel_firmware": "v1"}'
@@ -2588,7 +2863,7 @@ async def test_refresh_staged_copies_skips_ha_mirror_when_not_selected(
 ) -> None:
     shell = FakeShell()
     entry_data = {**ENTRY_DATA, CONF_COMPONENTS: {COMPONENT_BRIDGE: True}}
-    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
         entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=entry_data, version=2)
         entry.add_to_hass(hass)
         assert await hass.config_entries.async_setup(entry.entry_id)
@@ -2618,7 +2893,7 @@ def _retirement_entry(
     }
     entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=data, version=3)
     entry.add_to_hass(hass)
-    manager = PanelManager(hass, entry, asyncio.Lock())
+    manager = _legacy_manager(hass, entry)
     return entry, manager
 
 
@@ -2714,7 +2989,7 @@ async def test_retirement_creates_repair_before_remove_and_deletes_after_second_
 
     inspect = AsyncMock(side_effect=[_mirror_state(installed=True), _mirror_state(installed=False)])
     with (
-        patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell),
+        patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell),
         patch.object(panel_ops, "inspect_ha_mirror", inspect),
         patch.object(panel_ops, "uninstall_ha_mirror", side_effect=uninstall),
     ):
@@ -2740,7 +3015,7 @@ async def test_verified_retirement_keeps_legacy_credentials_while_control_disabl
     entry, manager = _retirement_entry(hass, enabled=False)
     shell = FakeShell()
     with (
-        patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell),
+        patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell),
         patch.object(
             panel_ops,
             "inspect_ha_mirror",
@@ -2774,7 +3049,7 @@ async def test_retirement_failure_keeps_issue_and_credentials(
     )
     uninstall_error = panel_ops.PanelOpError("secret-token must not be surfaced")
     with (
-        patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell),
+        patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell),
         patch.object(
             panel_ops,
             "inspect_ha_mirror",
@@ -2815,7 +3090,7 @@ async def test_retirement_rejects_ambiguous_initial_and_post_uninstall_proof(
     )
     shell = _SequencedMirrorInspectShell(results)
     issue_id = f"ha_mirror_retired_{entry.entry_id}"
-    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
         assert await manager.async_retire_legacy_ha_mirror() is False
 
     assert ir.async_get(hass).async_get_issue(DOMAIN, issue_id) is not None
@@ -2859,7 +3134,7 @@ async def test_stale_verified_marker_reaudits_reappeared_mirror_during_setup(
         return await original_run(command)
 
     with (
-        patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell),
+        patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell),
         patch.object(shell, "run", side_effect=run),
     ):
         try:
@@ -2899,7 +3174,7 @@ async def test_verified_marker_absence_reaudit_clears_transient_issue(
     shell = _SequencedMirrorInspectShell([_mirror_inspect_result(installed=False)])
     issue_id = f"ha_mirror_retired_{entry.entry_id}"
 
-    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
         try:
             await manager.async_setup()
             assert shell.connect_count == 1
@@ -2920,7 +3195,7 @@ async def test_retirement_hanging_close_is_bounded_and_never_finalizes_early(
     )
     issue_id = f"ha_mirror_retired_{entry.entry_id}"
     with (
-        patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell),
+        patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell),
         patch(
             "custom_components.brilliant_mqtt.manager._SHELL_CLOSE_TIMEOUT_SECONDS",
             0.01,
@@ -2959,7 +3234,7 @@ async def test_retirement_lock_wait_is_inside_total_deadline_and_never_touches_p
     await manager._ssh_lock.acquire()
 
     with (
-        patch("custom_components.brilliant_mqtt.manager.AsyncsshShell") as shell_constructor,
+        patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell") as shell_constructor,
         patch.object(panel_ops, "inspect_ha_mirror", new_callable=AsyncMock) as inspect,
         patch.object(panel_ops, "uninstall_ha_mirror", new_callable=AsyncMock) as uninstall,
         patch(
@@ -2996,7 +3271,7 @@ async def test_offline_retirement_keeps_integration_loaded_and_sanitized_issue(
 
     entry, _manager = _retirement_entry(hass)
     shell = FakeShell(connect_error=OSError("mirror-secret unreachable"))
-    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -3019,7 +3294,7 @@ async def test_retirement_cancellation_closes_shell_and_keeps_issue_and_secret(
     entry, manager = _retirement_entry(hass)
     shell = FakeShell()
     with (
-        patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell),
+        patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell),
         patch.object(
             panel_ops,
             "inspect_ha_mirror",
@@ -3054,7 +3329,7 @@ async def test_retirement_is_idempotent_after_enabled_verified_cleanup(
     inspect = AsyncMock(side_effect=[_mirror_state(installed=True), _mirror_state(installed=False)])
     uninstall = AsyncMock()
     with (
-        patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell),
+        patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell),
         patch.object(panel_ops, "inspect_ha_mirror", inspect),
         patch.object(panel_ops, "uninstall_ha_mirror", uninstall),
     ):
@@ -3072,11 +3347,11 @@ async def test_every_management_path_converges_on_retirement_helper(
 ) -> None:
     entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
     entry.add_to_hass(hass)
-    manager = PanelManager(hass, entry, asyncio.Lock())
+    manager = _legacy_manager(hass, entry)
     shell = FakeShell()
     retire = AsyncMock(return_value=True)
     with (
-        patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell),
+        patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell),
         patch.object(manager, "_async_retire_legacy_ha_mirror_on_shell", retire),
     ):
         if path == "repair":
@@ -3113,7 +3388,7 @@ async def test_management_retirement_finalizes_after_successful_close(
     retire = AsyncMock(return_value=True)
 
     with (
-        patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell),
+        patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell),
         patch.object(manager, "_async_retire_legacy_ha_mirror_on_shell", retire),
     ):
         try:
@@ -3141,7 +3416,7 @@ async def test_management_retirement_hanging_close_is_bounded_and_not_finalized(
     retire = AsyncMock(return_value=True)
 
     with (
-        patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell),
+        patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell),
         patch.object(manager, "_async_retire_legacy_ha_mirror_on_shell", retire),
         patch(
             "custom_components.brilliant_mqtt.manager._SHELL_CLOSE_TIMEOUT_SECONDS",

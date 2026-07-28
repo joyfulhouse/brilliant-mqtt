@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -16,6 +18,21 @@ from pytest_homeassistant_custom_component.common import (
 )
 from pytest_homeassistant_custom_component.typing import MqttMockHAClient
 
+from custom_components.brilliant_mqtt import (
+    binary_sensor as binary_sensor_platform,
+)
+from custom_components.brilliant_mqtt import (
+    button as button_platform,
+)
+from custom_components.brilliant_mqtt import (
+    select as select_platform,
+)
+from custom_components.brilliant_mqtt import (
+    switch as switch_platform,
+)
+from custom_components.brilliant_mqtt import (
+    update as update_platform,
+)
 from custom_components.brilliant_mqtt.const import (
     COMPONENT_VOICE,
     CONF_COMPONENTS,
@@ -108,6 +125,152 @@ def _state(hass: HomeAssistant, entity_id: str) -> State:
     state = hass.states.get(entity_id)
     assert state is not None
     return state
+
+
+def _platform_manager(
+    hass: HomeAssistant,
+    *,
+    panel: str,
+    management_id: str,
+    subentry_id: str | None,
+) -> PanelManager:
+    """Build the complete manager surface consumed while platforms create entities."""
+    return cast(
+        PanelManager,
+        SimpleNamespace(
+            hass=hass,
+            panel=panel,
+            signal=f"brilliant_mqtt_panel_state_{management_id}",
+            store=SimpleNamespace(
+                data={CONF_COMPONENTS: {}},
+                management_id=management_id,
+                options={},
+                subentry_id=subentry_id,
+            ),
+        ),
+    )
+
+
+def test_wake_word_select_reads_panel_feature_overrides(hass: HomeAssistant) -> None:
+    """Fleet panel options own wake-word overrides; top-level panel data does not."""
+    manager = _platform_manager(
+        hass,
+        panel="office",
+        management_id="SHA256:office",
+        subentry_id="panel-office",
+    )
+    cast(dict[str, Any], manager.store.data)[CONF_VOICE_WAKE_WORD] = "okay_nabu"
+    cast(dict[str, Any], manager.store.options)[CONF_VOICE_WAKE_WORD] = "hey_jarvis"
+
+    entity = select_platform.WakeWordSelect(manager)
+
+    assert entity.current_option == "hey_jarvis"
+
+
+def test_wake_word_select_preserves_legacy_data_location(hass: HomeAssistant) -> None:
+    """Compatibility entries keep their historical top-level wake-word value."""
+    manager = _platform_manager(
+        hass,
+        panel="office",
+        management_id="legacy-entry-id",
+        subentry_id=None,
+    )
+    cast(dict[str, Any], manager.store.data)[CONF_VOICE_WAKE_WORD] = "okay_nabu"
+    cast(dict[str, Any], manager.store.options)[CONF_VOICE_WAKE_WORD] = "hey_jarvis"
+
+    entity = select_platform.WakeWordSelect(manager)
+
+    assert entity.current_option == "okay_nabu"
+
+
+@pytest.mark.parametrize(
+    ("setup_platform", "suffixes"),
+    [
+        pytest.param(
+            binary_sensor_platform.async_setup_entry,
+            ("bridge_health",),
+            id="binary_sensor",
+        ),
+        pytest.param(
+            button_platform.async_setup_entry,
+            ("repair_bridge", "reboot_panel", "run_selected_scene"),
+            id="button",
+        ),
+        pytest.param(
+            select_platform.async_setup_entry,
+            ("voice_wake_word", "scene"),
+            id="select",
+        ),
+        pytest.param(
+            switch_platform.async_setup_entry,
+            (
+                "voice_enabled",
+                "wifi_watchdog_enabled",
+                "bus_watchdog_enabled",
+                "hue_ca_enabled",
+            ),
+            id="switch",
+        ),
+        pytest.param(
+            update_platform.async_setup_entry,
+            ("agent_update",),
+            id="update",
+        ),
+    ],
+)
+async def test_platforms_create_entities_for_every_panel_with_stable_ownership(
+    hass: HomeAssistant,
+    payload_dir: Path,
+    setup_platform: Any,
+    suffixes: tuple[str, ...],
+) -> None:
+    """Each manager gets its own stable IDs, MQTT device, and subentry association."""
+    managers = (
+        _platform_manager(
+            hass,
+            panel="office",
+            management_id="SHA256:office",
+            subentry_id="panel-office",
+        ),
+        _platform_manager(
+            hass,
+            panel="kitchen",
+            management_id="SHA256:kitchen",
+            subentry_id="panel-kitchen",
+        ),
+        _platform_manager(
+            hass,
+            panel="legacy",
+            management_id="legacy-entry-id",
+            subentry_id=None,
+        ),
+    )
+    entry = SimpleNamespace(
+        runtime_data=SimpleNamespace(
+            panels={manager.store.management_id: manager for manager in managers}
+        )
+    )
+    added: list[tuple[list[Any], tuple[Any, ...], dict[str, Any]]] = []
+
+    def async_add_entities(entities: list[Any], *args: Any, **kwargs: Any) -> None:
+        added.append((entities, args, kwargs))
+
+    await setup_platform(hass, entry, async_add_entities)
+
+    assert [args for _, args, _ in added] == [(), (), ()]
+    assert [kwargs for _, _, kwargs in added] == [
+        {"config_subentry_id": "panel-office"},
+        {"config_subentry_id": "panel-kitchen"},
+        {},
+    ]
+    for manager, (entities, _, _) in zip(managers, added, strict=True):
+        assert [entity.unique_id for entity in entities] == [
+            f"{manager.store.management_id}_{suffix}" for suffix in suffixes
+        ]
+        assert all(
+            entity.device_info["identifiers"] == {("mqtt", f"brilliant_panel_{manager.panel}")}
+            for entity in entities
+        )
 
 
 @pytest.mark.allow_lingering_timers
@@ -238,7 +401,7 @@ async def test_voice_switch_exists_and_reflects_entry_data(
 ) -> None:
     """Voice satellite switch reflects components dict from entry.data."""
     entry = await _setup(hass)
-    manager = entry.runtime_data
+    manager = next(iter(entry.runtime_data.panels.values()))
 
     # Default: voice_enabled not set → switch is off.
     state = hass.states.get(VOICE_SWITCH)
@@ -294,7 +457,7 @@ async def test_wake_word_select_exists_and_reflects_entry_data(
 ) -> None:
     """Wake-word select reflects CONF_VOICE_WAKE_WORD from entry.data."""
     entry = await _setup(hass)
-    manager = entry.runtime_data
+    manager = next(iter(entry.runtime_data.panels.values()))
 
     # Default: wake word not set → select falls back to DEFAULT_VOICE_WAKE_WORD.
     state = hass.states.get(WAKE_WORD_SELECT)
