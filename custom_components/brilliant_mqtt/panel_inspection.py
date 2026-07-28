@@ -39,7 +39,37 @@ _SERVICE_STATES = frozenset(
     }
 )
 _RUNNING_STATES = frozenset({"active", "activating", "reloading"})
-_PYTHON_VERSION = re.compile(r"^Python (3\.10\.[0-9]+)$")
+_ENABLED_SERVICE_STATES = frozenset(
+    {
+        "alias",
+        "bad",
+        "disabled",
+        "enabled",
+        "enabled-runtime",
+        "generated",
+        "indirect",
+        "linked",
+        "linked-runtime",
+        "masked",
+        "masked-runtime",
+        "not-found",
+        "static",
+        "transient",
+    }
+)
+_SYSTEMD_MANAGER_STATES = frozenset(
+    {
+        "degraded",
+        "initializing",
+        "maintenance",
+        "offline",
+        "running",
+        "starting",
+        "stopping",
+        "unknown",
+    }
+)
+_PYTHON_VERSION = re.compile(r"^Python ([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$")
 _SYSTEMD_VERSION = re.compile(r"^systemd [0-9]+$")
 _FIRMWARE_VERSION = re.compile(r"^v[0-9]+(?:\.[0-9]+){3}$")
 _HOSTNAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$")
@@ -53,6 +83,101 @@ _OWNED_SERVICES = (
     ("service_brilliant_hue_ca_timer", HUE_CA_TIMER_NAME),
 )
 _RETIRED_SERVICES = (("service_brilliant_ha_mirror", HA_MIRROR_SERVICE_NAME),)
+_EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+
+def _no_symlinks_command(root: str) -> str:
+    """Preserve ``find`` failure instead of treating empty stderr as success."""
+    return f'links="$(find {root} -type l -print -quit)" && test -z "$links"'
+
+
+_TOOLCHAIN_PROBES = (
+    (
+        "toolchain_mv_no_clobber",
+        "mv_no_clobber",
+        (
+            'help=$(/usr/bin/mv.coreutils --help 2>/dev/null) && case "$help" in '
+            "*--no-clobber*) true ;; *) false ;; esac"
+        ),
+    ),
+    (
+        "toolchain_mv_no_target_directory",
+        "mv_no_target_directory",
+        (
+            'help=$(/usr/bin/mv.coreutils --help 2>/dev/null) && case "$help" in '
+            "*--no-target-directory*) true ;; *) false ;; esac"
+        ),
+    ),
+    (
+        "toolchain_stat_mode",
+        "stat_mode",
+        (
+            'mode="$(stat -c %a -- /dev/null 2>/dev/null)" && case "$mode" in '
+            "[0-7][0-7][0-7]|[0-7][0-7][0-7][0-7]) true ;; *) false ;; esac"
+        ),
+    ),
+    (
+        "toolchain_grep_fixed_exact_quiet",
+        "grep_fixed_exact_quiet",
+        ("printf '%s\\n' brilliant-mqtt-toolchain | grep -Fxq -- brilliant-mqtt-toolchain"),
+    ),
+    (
+        "toolchain_grep_extended_count",
+        "grep_extended_count",
+        (
+            "test \"$(printf '%s\\n' brilliant-mqtt-toolchain | "
+            "grep -Ec -- '^brilliant-mqtt-toolchain$')\" = 1"
+        ),
+    ),
+    (
+        "toolchain_find_print_quit",
+        "find_print_quit",
+        _no_symlinks_command("/dev/null"),
+    ),
+    (
+        "toolchain_sha256sum",
+        "sha256sum",
+        (f"test \"$(/usr/bin/sha256sum -- /dev/null 2>/dev/null)\" = '{_EMPTY_SHA256}  /dev/null'"),
+    ),
+    (
+        "toolchain_python_3_10",
+        "python_3_10",
+        (
+            f"{_PANEL_PYTHON} -B -c 'import sys;"
+            "raise SystemExit(0 if sys.version_info >= (3,10) else 1)'"
+        ),
+    ),
+    (
+        "toolchain_systemd_manager",
+        "systemd_manager",
+        (
+            'state="$(systemctl is-system-running 2>/dev/null || true)"; '
+            f'case "$state" in {"|".join(sorted(_SYSTEMD_MANAGER_STATES))}) '
+            "true ;; *) false ;; esac"
+        ),
+    ),
+    (
+        "toolchain_systemd_is_active",
+        "systemd_is_active",
+        (
+            f'state="$(systemctl is-active {SERVICE_NAME} 2>/dev/null || true)"; '
+            f'case "$state" in {"|".join(sorted(_SERVICE_STATES))}) '
+            "true ;; *) false ;; esac"
+        ),
+    ),
+    (
+        "toolchain_systemd_is_enabled",
+        "systemd_is_enabled",
+        (
+            f'state="$(systemctl is-enabled {SERVICE_NAME} 2>/dev/null || true)"; '
+            f'case "$state" in {"|".join(sorted(_ENABLED_SERVICE_STATES))}) '
+            "true ;; *) false ;; esac"
+        ),
+    ),
+)
+PANEL_TOOLCHAIN_CAPABILITIES = frozenset(
+    capability for _key, capability, _command in _TOOLCHAIN_PROBES
+)
 _BASE_KEYS = frozenset(
     {
         "hostname",
@@ -66,7 +191,11 @@ _BASE_KEYS = frozenset(
         "installed_agent_version",
     }
 )
-_EXPECTED_KEYS = _BASE_KEYS | {key for key, _service in (*_OWNED_SERVICES, *_RETIRED_SERVICES)}
+_EXPECTED_KEYS = (
+    _BASE_KEYS
+    | {key for key, _service in (*_OWNED_SERVICES, *_RETIRED_SERVICES)}
+    | {key for key, _capability, _command in _TOOLCHAIN_PROBES}
+)
 _ERROR_CODES = frozenset(
     {
         "inspection_timeout",
@@ -77,6 +206,7 @@ _ERROR_CODES = frozenset(
         "unsupported_python",
         "insufficient_storage",
         "insufficient_memory",
+        "unsupported_panel_toolchain",
     }
 )
 
@@ -97,6 +227,13 @@ def _service_probe(key: str, service: str) -> str:
         "active|activating|deactivating|failed|inactive|reloading|unknown) ;; "
         "*) state=unknown ;; esac; "
         f"printf '{key}=%s\\n' \"$state\""
+    )
+
+
+def _capability_probe(key: str, command: str) -> str:
+    return (
+        f"if {{ {command}; }} >/dev/null 2>&1; "
+        f"then printf '{key}=1\\n'; else printf '{key}=0\\n'; fi"
     )
 
 
@@ -161,6 +298,7 @@ _PANEL_INSPECTION_PROBES = (
     _AGENT_VERSION_PROBE,
     *(_service_probe(key, service) for key, service in _OWNED_SERVICES),
     *(_service_probe(key, service) for key, service in _RETIRED_SERVICES),
+    *(_capability_probe(key, command) for key, _capability, command in _TOOLCHAIN_PROBES),
 )
 
 PANEL_INSPECTION_COMMAND = "{ " + "; ".join(_PANEL_INSPECTION_PROBES) + "; } 2>&1 | head -c 16385"
@@ -169,13 +307,27 @@ PANEL_INSPECTION_COMMAND = "{ " + "; ".join(_PANEL_INSPECTION_PROBES) + "; } 2>&
 class PanelCompatibilityError(ValueError):
     """Redacted inspection or compatibility result with a stable code."""
 
-    __slots__ = ("code",)
+    __slots__ = ("capability", "code")
 
-    def __init__(self, code: str) -> None:
-        if code not in _ERROR_CODES:
+    def __init__(self, code: str, *, capability: str | None = None) -> None:
+        valid_toolchain_capability = (
+            isinstance(capability, str)
+            and capability in PANEL_TOOLCHAIN_CAPABILITIES
+        )
+        if (
+            code not in _ERROR_CODES
+            or (
+                code == "unsupported_panel_toolchain"
+                and not valid_toolchain_capability
+            )
+            or code != "unsupported_panel_toolchain"
+            and capability is not None
+        ):
             raise ValueError("invalid_panel_compatibility_error_code")
         self.code = code
+        self.capability = capability
         super().__init__(code)
+        self.__suppress_context__ = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -233,6 +385,18 @@ def _validate_service_states(values: dict[str, str]) -> None:
         raise PanelCompatibilityError("inspection_output_invalid")
 
 
+def _validate_toolchain(values: dict[str, str]) -> None:
+    for key, capability, _command in _TOOLCHAIN_PROBES:
+        result = values[key]
+        if result not in {"0", "1"}:
+            raise PanelCompatibilityError("inspection_output_invalid")
+        if result == "0":
+            raise PanelCompatibilityError(
+                "unsupported_panel_toolchain",
+                capability=capability,
+            )
+
+
 async def async_inspect_panel(shell: PanelShell, identity: HostIdentity) -> PanelFacts:
     """Run one bounded command and return strictly parsed compatibility facts."""
     if not isinstance(identity, HostIdentity):
@@ -256,12 +420,16 @@ async def async_inspect_panel(shell: PanelShell, identity: HostIdentity) -> Pane
         raise PanelCompatibilityError("inspection_failed")
     values = _parse_output(result.stdout)
     _validate_service_states(values)
+    _validate_toolchain(values)
 
     architecture = values["architecture"]
     if architecture not in _SUPPORTED_ARCHITECTURES:
         raise PanelCompatibilityError("unsupported_architecture")
     python_match = _PYTHON_VERSION.fullmatch(values["python_version"])
     if python_match is None:
+        raise PanelCompatibilityError("unsupported_python")
+    python_version = tuple(int(part) for part in python_match.groups())
+    if python_version < (3, 10, 0):
         raise PanelCompatibilityError("unsupported_python")
     model = values["model"]
     if (
@@ -304,7 +472,7 @@ async def async_inspect_panel(shell: PanelShell, identity: HostIdentity) -> Pane
         model=model,
         architecture=architecture,
         firmware=firmware,
-        python_version=python_match.group(1),
+        python_version=".".join(python_match.groups()),
         init_system=values["init_system"],
         available_bytes=available_bytes,
         available_memory_bytes=available_memory_bytes,

@@ -40,7 +40,11 @@ from .const import (
 from .entry_data import FleetConfig
 from .errors import OperationError, OperationStage
 from .panel_health import PanelHealthEvidence
-from .panel_inspection import PanelFacts
+from .panel_inspection import (
+    PANEL_TOOLCHAIN_CAPABILITIES,
+    PanelCompatibilityError,
+    PanelFacts,
+)
 from .panel_ops import (
     MAX_MQTT_CA_BYTES,
     MAX_SNAPSHOT_FILE_BYTES,
@@ -100,6 +104,7 @@ _ERROR_CODES = frozenset(
         "snapshot_failed",
         "stage_failed",
         "transaction_in_progress",
+        "unsupported_panel_toolchain",
     }
 )
 _MAX_JSON_DEPTH = 64
@@ -188,7 +193,7 @@ class ProvisioningFailureDetail:
 class PanelProvisioningError(RuntimeError):
     """One allowlisted orchestration failure without raw dependency context."""
 
-    __slots__ = ("cleanup_code", "code", "detail")
+    __slots__ = ("capability", "cleanup_code", "code", "detail")
 
     def __init__(
         self,
@@ -196,7 +201,12 @@ class PanelProvisioningError(RuntimeError):
         *,
         detail: ProvisioningFailureDetail | None = None,
         cleanup_code: str | None = None,
+        capability: str | None = None,
     ) -> None:
+        valid_toolchain_capability = (
+            isinstance(capability, str)
+            and capability in PANEL_TOOLCHAIN_CAPABILITIES
+        )
         if (
             code not in _ERROR_CODES
             or (
@@ -206,18 +216,28 @@ class PanelProvisioningError(RuntimeError):
                 )
             )
             or cleanup_code not in {None, "cleanup_failed"}
+            or (
+                code == "unsupported_panel_toolchain"
+                and not valid_toolchain_capability
+            )
+            or code != "unsupported_panel_toolchain"
+            and capability is not None
         ):
             raise ValueError("invalid_panel_provisioning_error_code")
         self.code = code
         self.detail = detail
         self.cleanup_code = cleanup_code
+        self.capability = capability
         super().__init__(code)
         self.__suppress_context__ = True
 
     def __repr__(self) -> str:
+        fields = [f"code={self.code!r}"]
+        if self.capability is not None:
+            fields.append(f"capability={self.capability!r}")
         if self.cleanup_code is not None:
-            return f"PanelProvisioningError(code={self.code!r}, cleanup_code={self.cleanup_code!r})"
-        return f"PanelProvisioningError(code={self.code!r})"
+            fields.append(f"cleanup_code={self.cleanup_code!r}")
+        return f"PanelProvisioningError({', '.join(fields)})"
 
 
 def _invalid_request() -> PanelProvisioningError:
@@ -806,6 +826,15 @@ class PanelProvisioner:
                 )
             except asyncio.CancelledError as error:
                 cancellation = error
+            except PanelCompatibilityError as error:
+                primary = (
+                    PanelProvisioningError(
+                        "unsupported_panel_toolchain",
+                        capability=error.capability,
+                    )
+                    if error.code == "unsupported_panel_toolchain"
+                    else PanelProvisioningError(state.failure_code)
+                )
             except PanelProvisioningError as error:
                 primary = error
             except OperationError as error:
@@ -851,6 +880,7 @@ class PanelProvisioner:
                         primary.code,
                         detail=primary.detail,
                         cleanup_code="cleanup_failed",
+                        capability=primary.capability,
                     )
 
             shell_outcome = await _settle_close(

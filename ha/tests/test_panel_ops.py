@@ -7,6 +7,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import secrets
 import subprocess
 import sys
@@ -17,7 +18,7 @@ from uuid import UUID
 import asyncssh
 import pytest
 
-from custom_components.brilliant_mqtt import panel_ops
+from custom_components.brilliant_mqtt import panel_inspection, panel_ops
 from custom_components.brilliant_mqtt.const import (
     BUS_WATCHDOG_SERVICE_NAME,
     COMPONENT_BRIDGE,
@@ -64,13 +65,13 @@ _TEST_MQTT_CA_DIGEST = hashlib.sha256(_TEST_MQTT_CA).hexdigest()
 _TEST_MQTT_CA_PATH = f"/var/brilliant-mqtt/tls/mqtt-ca-{_TEST_MQTT_CA_DIGEST[:16]}.pem"
 _TEMP_TOKEN = "0123456789abcdef0123456789abcdef"
 _TEST_MQTT_CA_TEMP_PATH = f"{_TEST_MQTT_CA_PATH}.tmp-{_TEMP_TOKEN}"
-_VERIFY_MQTT_CA_COMMAND = f"sha256sum {_TEST_MQTT_CA_TEMP_PATH}"
+_VERIFY_MQTT_CA_COMMAND = f"/usr/bin/sha256sum -- {_TEST_MQTT_CA_TEMP_PATH}"
 _PROMOTE_MQTT_CA_COMMAND = f"ln {_TEST_MQTT_CA_TEMP_PATH} {_TEST_MQTT_CA_PATH}"
 _COMPARE_MQTT_CA_COMMAND = (
     f"test -f {_TEST_MQTT_CA_PATH} && test ! -L {_TEST_MQTT_CA_PATH} "
     f"&& cmp -s {_TEST_MQTT_CA_TEMP_PATH} {_TEST_MQTT_CA_PATH}"
 )
-_STAT_MQTT_CA_MODE_COMMAND = f"stat -c %a {_TEST_MQTT_CA_PATH}"
+_STAT_MQTT_CA_MODE_COMMAND = f"stat -c %a -- {_TEST_MQTT_CA_PATH}"
 _CLEAN_MQTT_CA_TEMP_COMMAND = f"rm -f {_TEST_MQTT_CA_TEMP_PATH}"
 
 
@@ -2061,11 +2062,83 @@ def _watchdog_residue_snapshot() -> panel_ops.PanelSnapshot:
     )
 
 
+async def test_fleet_atomic_moves_use_only_the_verified_coreutils_mover() -> None:
+    staged = _staged()
+    restore_shell = await _connected(FakeShell())
+    await panel_ops._restore_file(
+        restore_shell,
+        PANEL_ENV_FILE,
+        _file(b"restored", 0o600),
+        staged,
+    )
+    commands = (
+        panel_ops._stage_promote_command(staged),
+        panel_ops._activation_commit_command(staged),
+        restore_shell.commands[-1],
+        panel_ops._rollback_link_command(_release_snapshot(), staged),
+    )
+    joined = "\n".join(commands)
+
+    assert (
+        "/usr/bin/mv.coreutils --no-clobber --no-target-directory -- "
+        f"{panel_ops._staged_temp_path(staged)} {_CANDIDATE_RELEASE}"
+    ) in commands[0]
+    assert joined.count("/usr/bin/mv.coreutils --force --no-target-directory -- ") == 8
+    assert re.search(r"(?<![/A-Za-z0-9_.-])mv\s+-T", joined) is None
+    assert "mv -Tf" not in joined
+    assert "mv -T -n" not in joined
+
+
+def test_release_ca_digest_uses_verified_sha256sum_without_a_cut_dependency() -> None:
+    staged = _staged((COMPONENT_BRIDGE,))
+    path = f"{panel_ops._staged_temp_path(staged)}/mqtt-ca.pem"
+
+    command = panel_ops._release_mqtt_ca_digest_command(
+        staged,
+        _TEST_MQTT_CA_DIGEST,
+    )
+
+    assert command == (
+        f"test \"$(/usr/bin/sha256sum -- {path})\" = '{_TEST_MQTT_CA_DIGEST}  {path}'"
+    )
+    assert " cut " not in command
+
+
+@pytest.mark.parametrize("result", ("masked-runtime", "bad"))
+def test_toolchain_accepts_documented_is_enabled_states(result: str) -> None:
+    command = next(
+        command
+        for _key, capability, command in panel_inspection._TOOLCHAIN_PROBES
+        if capability == "systemd_is_enabled"
+    )
+    script = f"systemctl() {{ printf '%s\\n' {result}; return 1; }}; {command}"
+
+    assert subprocess.run(["sh", "-c", script], check=False).returncode == 0
+
+
+def test_release_symlink_validation_preserves_find_failure() -> None:
+    command = panel_ops._no_symlinks_command("/dev/null")
+    script = f"find() {{ return 23; }}; {command}"
+
+    assert "find /dev/null -type l -print -quit" in command
+    assert subprocess.run(["sh", "-c", script], check=False).returncode == 23
+
+
 async def test_snapshot_panel_reads_exact_bounded_release_state() -> None:
     shell = await _connected(FakeShell(responses=_snapshot_responses()))
 
     snapshot = await panel_ops.snapshot_panel(shell)
 
+    assert panel_ops.SNAPSHOT_LAYOUT_COMMAND.startswith(
+        "/data/switch-embedded/env/bin/python3 - <<'BRILLIANT_MQTT_SNAPSHOT'"
+    )
+    assert all(
+        command.startswith(
+            "/data/switch-embedded/env/bin/python3 - <<'BRILLIANT_MQTT_FILE_SNAPSHOT'"
+        )
+        for command in panel_ops.SNAPSHOT_FILE_COMMANDS.values()
+    )
+    assert not panel_ops.SNAPSHOT_LAYOUT_COMMAND.startswith("python3 ")
     assert snapshot == _release_snapshot()
     assert shell.commands == [
         panel_ops.SNAPSHOT_LAYOUT_COMMAND,
@@ -2765,7 +2838,7 @@ async def test_activate_staged_switches_current_and_converges_only_core_services
 
     joined = "\n".join(shell.commands)
     assert f"ln -s {_CANDIDATE_RELEASE}" in joined
-    assert "mv -Tf" in joined
+    assert "/usr/bin/mv.coreutils --force --no-target-directory --" in joined
     assert PANEL_CURRENT_LINK in joined
     assert shell.commands.count("systemctl daemon-reload") == 1
     for service in (
@@ -2859,7 +2932,10 @@ async def test_activate_disables_deselected_unit_before_removing_its_file() -> N
     [
         ("cp --", "activation_prepare_failed"),
         ("is-active --quiet", "activation_stop_failed"),
-        ("mv -Tf", "activation_commit_failed"),
+        (
+            "/usr/bin/mv.coreutils --force --no-target-directory",
+            "activation_commit_failed",
+        ),
         ("daemon-reload", "activation_reload_failed"),
         ("systemctl enable brilliant-mqtt", "activation_service_failed"),
     ],
@@ -2998,7 +3074,8 @@ async def test_rollback_restores_bridge_less_legacy_watchdog_residue_exactly(
         for path, data, mode in uploaded
     )
     assert any(
-        command.endswith(f" {PANEL_WIFI_WATCHDOG_UNIT_FILE}") and "mv -Tf --" in command
+        command.endswith(f" {PANEL_WIFI_WATCHDOG_UNIT_FILE}")
+        and "/usr/bin/mv.coreutils --force --no-target-directory --" in command
         for command in shell.commands
     )
     assert not any(path == PANEL_UNIT_FILE for path, _, _ in uploaded)

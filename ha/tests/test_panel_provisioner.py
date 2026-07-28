@@ -36,7 +36,10 @@ from custom_components.brilliant_mqtt.const import (
 from custom_components.brilliant_mqtt.entry_data import FleetConfig
 from custom_components.brilliant_mqtt.errors import OperationError, OperationStage
 from custom_components.brilliant_mqtt.panel_health import PanelHealthEvidence
-from custom_components.brilliant_mqtt.panel_inspection import PanelFacts
+from custom_components.brilliant_mqtt.panel_inspection import (
+    PanelCompatibilityError,
+    PanelFacts,
+)
 from custom_components.brilliant_mqtt.panel_provisioner import (
     CanonicalPanelData,
     PanelInstallRequest,
@@ -775,6 +778,7 @@ class _Harness:
         self.lookup = TransactionLookup(TransactionLookupState.FLOW_PENDING)
         self.ids = iter((_TRANSACTION_ID, _SETUP_ID))
         self.duplicate_found = False
+        self.inspection_error: PanelCompatibilityError | None = None
         self.preflight_error: BaseException | None = None
         self.omit_custom_ca = False
 
@@ -802,6 +806,8 @@ class _Harness:
         del shell
         assert identity.fingerprint == _FINGERPRINT
         self.events.append(("inspect",))
+        if self.inspection_error is not None:
+            raise self.inspection_error
         return _facts()
 
     async def duplicate(self, fingerprint: str) -> bool:
@@ -1027,6 +1033,55 @@ def _exception_graph(root: BaseException) -> list[BaseException]:
             pending.append(error.__cause__)
         pending.extend(argument for argument in error.args if isinstance(argument, BaseException))
     return found
+
+
+async def test_unsupported_toolchain_stops_before_snapshot_journal_or_panel_write() -> None:
+    harness = _Harness()
+    compatibility_error = PanelCompatibilityError(
+        "unsupported_panel_toolchain",
+        capability="mv_no_target_directory",
+    )
+    harness.inspection_error = compatibility_error
+
+    with pytest.raises(PanelProvisioningError) as raised:
+        await harness.provisioner().async_install(
+            _request(),
+            _fleet(),
+            harness.progress,
+        )
+
+    assert compatibility_error.capability == "mv_no_target_directory"
+    assert str(compatibility_error) == "unsupported_panel_toolchain"
+    assert raised.value.code == "unsupported_panel_toolchain"
+    assert raised.value.capability == "mv_no_target_directory"
+    assert "mv_no_target_directory" in repr(raised.value)
+    forbidden = {
+        "snapshot",
+        "release",
+        "journal_create",
+        "journal_transition",
+        "journal_error",
+        "stage",
+        "preflight",
+        "health_subscribe",
+        "activation_stopped",
+        "activate",
+        "rollback",
+        "cleanup_staged",
+    }
+    assert not any(event[0] in forbidden for event in harness.events)
+    assert harness.events[-1] == ("shell_close",)
+    assert _exception_graph(raised.value) == [raised.value]
+    assert "SECRET" not in repr(raised.value)
+    assert "SECRET" not in repr(compatibility_error)
+
+
+def test_provisioning_error_rejects_capability_on_unrelated_code() -> None:
+    with pytest.raises(ValueError, match="^invalid_panel_provisioning_error_code$"):
+        PanelProvisioningError(
+            "inspection_failed",
+            capability="SECRET-untrusted-tool-output",
+        )
 
 
 async def test_duplicate_identity_is_rejected_before_snapshot_or_any_write() -> None:

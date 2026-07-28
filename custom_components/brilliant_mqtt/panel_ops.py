@@ -119,6 +119,8 @@ MAX_MQTT_CA_BYTES = 256 * 1024
 _MAX_LAYOUT_WIRE_BYTES = 4096
 _MAX_VERSION_BYTES = 128
 _PANEL_PYTHON = "/data/switch-embedded/env/bin/python3"
+_PANEL_ATOMIC_MOVER = "/usr/bin/mv.coreutils"
+_PANEL_SHA256SUM = "/usr/bin/sha256sum"
 _PanelPreflightLauncher = Callable[[str], Awaitable[PanelProcess]]
 
 
@@ -382,7 +384,7 @@ def _layout_probe_command() -> str:
         (component_id, service_name) for component_id, service_name, _ in _CORE_SERVICES
     )
     return (
-        "python3 - <<'BRILLIANT_MQTT_SNAPSHOT'\n"
+        f"{_PANEL_PYTHON} - <<'BRILLIANT_MQTT_SNAPSHOT'\n"
         "import json, os, subprocess\n"
         f"current = {PANEL_CURRENT_LINK!r}\n"
         f"legacy_paths = {legacy_paths!r}\n"
@@ -431,7 +433,7 @@ def _layout_probe_command() -> str:
 
 def _file_probe_command(path: str, maximum_bytes: int) -> str:
     return (
-        "python3 - <<'BRILLIANT_MQTT_FILE_SNAPSHOT'\n"
+        f"{_PANEL_PYTHON} - <<'BRILLIANT_MQTT_FILE_SNAPSHOT'\n"
         "import base64, errno, json, os, stat\n"
         f"path = {path!r}\n"
         f"maximum = {maximum_bytes}\n"
@@ -674,7 +676,7 @@ def _release_mqtt_ca_digest_command(staged: StagedRelease, digest: str) -> str:
     if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
         raise PanelOpError("invalid_staged_release")
     path = f"{_staged_temp_path(staged)}/mqtt-ca.pem"
-    return f"test \"$(sha256sum {path} | cut -d ' ' -f 1)\" = {digest}"
+    return f"test \"$({_PANEL_SHA256SUM} -- {path})\" = '{digest}  {path}'"
 
 
 def _mqtt_ca_environment_assignments(environment: str) -> tuple[str, ...]:
@@ -687,6 +689,11 @@ def _mqtt_ca_environment_assignments(environment: str) -> tuple[str, ...]:
         if separator and key.strip() == ENV_MQTT_TLS_CA_FILE:
             assignments.append(stripped)
     return tuple(assignments)
+
+
+def _no_symlinks_command(root: str) -> str:
+    """Reject symlinks while preserving a failing ``find`` exit status."""
+    return f'links="$(find {root} -type l -print -quit)" && test -z "$links"'
 
 
 def _release_validation_command(
@@ -722,15 +729,15 @@ def _release_validation_command(
             f'test "$(stat -c %a -- {root}/brilliant-mqtt.env)" = 600',
             f'test "$(cat -- {root}/VERSION)" = {staged.version}',
             (
-                f"(if grep -Eq '{mqtt_ca_assignment}' {root}/brilliant-mqtt.env; then "
-                f"test \"$(grep -Ec '{mqtt_ca_assignment}' "
+                f"(if grep -Eq -- '{mqtt_ca_assignment}' {root}/brilliant-mqtt.env; then "
+                f"test \"$(grep -Ec -- '{mqtt_ca_assignment}' "
                 f'{root}/brilliant-mqtt.env)" = 1 && '
                 f"grep -Fxq -- {mqtt_ca_binding} {root}/brilliant-mqtt.env && "
                 f"test -f {mqtt_ca_file} && test ! -L {mqtt_ca_file} && "
                 f'test "$(stat -c %a -- {mqtt_ca_file})" = 644; '
                 f"else test ! -e {mqtt_ca_file} && test ! -L {mqtt_ca_file}; fi)"
             ),
-            f'test -z "$(find {root} -type l -print -quit)"',
+            _no_symlinks_command(root),
         )
     )
     return " && ".join(checks)
@@ -806,7 +813,8 @@ def _stage_prepare_command(staged: StagedRelease) -> str:
 def _stage_promote_command(staged: StagedRelease) -> str:
     temporary = _staged_temp_path(staged)
     return (
-        f"mv -T -n -- {temporary} {staged.release_target} && "
+        f"{_PANEL_ATOMIC_MOVER} --no-clobber --no-target-directory -- "
+        f"{temporary} {staged.release_target} && "
         f"test ! -e {temporary} && test ! -L {temporary} && "
         f"test -d {staged.release_target} && test ! -L {staged.release_target}"
     )
@@ -1055,9 +1063,12 @@ def _activation_commit_command(staged: StagedRelease) -> str:
             f"if [ -e {PANEL_CURRENT_LINK} ] || [ -L {PANEL_CURRENT_LINK} ]; "
             f"then [ -L {PANEL_CURRENT_LINK} ]; fi"
         ),
-        f"mv -Tf -- {paths['environment'][1]} {PANEL_ENV_FILE}",
-        f"mv -Tf -- {paths['version'][1]} {PANEL_VERSION_FILE}",
-        f"mv -Tf -- {paths['bridge_unit'][1]} {PANEL_UNIT_FILE}",
+        f"{_PANEL_ATOMIC_MOVER} --force --no-target-directory -- "
+        f"{paths['environment'][1]} {PANEL_ENV_FILE}",
+        f"{_PANEL_ATOMIC_MOVER} --force --no-target-directory -- "
+        f"{paths['version'][1]} {PANEL_VERSION_FILE}",
+        f"{_PANEL_ATOMIC_MOVER} --force --no-target-directory -- "
+        f"{paths['bridge_unit'][1]} {PANEL_UNIT_FILE}",
     ]
     for component_id, key, destination in (
         (
@@ -1072,14 +1083,18 @@ def _activation_commit_command(staged: StagedRelease) -> str:
         ),
     ):
         if component_id in selected:
-            operations.append(f"mv -Tf -- {paths[key][1]} {destination}")
+            operations.append(
+                f"{_PANEL_ATOMIC_MOVER} --force --no-target-directory -- "
+                f"{paths[key][1]} {destination}"
+            )
         else:
             operations.append(f"rm -f -- {paths[key][1]} {destination}")
     operations.extend(
         (
             f"rm -f -- {current_temporary}",
             f"ln -s {staged.release_target} {current_temporary}",
-            f"mv -Tf -- {current_temporary} {PANEL_CURRENT_LINK}",
+            f"{_PANEL_ATOMIC_MOVER} --force --no-target-directory -- "
+            f"{current_temporary} {PANEL_CURRENT_LINK}",
         )
     )
     return " && ".join(operations)
@@ -1218,7 +1233,8 @@ async def _restore_file(
         (
             f"test -f {temporary} && test ! -L {temporary} && "
             f'test "$(stat -c %a -- {temporary})" = {snapshot.mode:o} && '
-            f"mv -Tf -- {temporary} {path}"
+            f"{_PANEL_ATOMIC_MOVER} --force --no-target-directory -- "
+            f"{temporary} {path}"
         ),
         "rollback_restore_failed",
     )
@@ -1238,7 +1254,8 @@ def _rollback_link_command(
         return (
             f"{guard}; rm -f -- {temporary}; "
             f"ln -s {snapshot.active_release_target} {temporary} && "
-            f"mv -Tf -- {temporary} {PANEL_CURRENT_LINK}"
+            f"{_PANEL_ATOMIC_MOVER} --force --no-target-directory -- "
+            f"{temporary} {PANEL_CURRENT_LINK}"
         )
     return f"{guard}; rm -f -- {temporary} {PANEL_CURRENT_LINK}"
 
@@ -1746,7 +1763,7 @@ async def stage_mqtt_ca(shell: PanelShell, ca_bytes: bytes) -> str:
         # put_bytes may truncate its target, so it is restricted to a unique
         # temporary path. The content-addressed final is never opened for write.
         await shell.put_bytes(ca_bytes, temp_path, 0o644)
-        remote_digest = await _checked(shell, f"sha256sum {temp_path}")
+        remote_digest = await _checked(shell, f"{_PANEL_SHA256SUM} -- {temp_path}")
         remote_fields = remote_digest.stdout.split(maxsplit=1)
         if not remote_fields or remote_fields[0] != digest:
             raise PanelOpError("mqtt_ca_verification_failed")
@@ -1762,7 +1779,7 @@ async def stage_mqtt_ca(shell: PanelShell, ca_bytes: bytes) -> str:
             )
             if existing.exit_status != 0:
                 raise PanelOpError("mqtt_ca_promotion_failed")
-            existing_mode = await shell.run(f"stat -c %a {remote_path}")
+            existing_mode = await shell.run(f"stat -c %a -- {remote_path}")
             if existing_mode.exit_status != 0 or existing_mode.stdout.strip() != "644":
                 raise PanelOpError("mqtt_ca_promotion_failed")
     except BaseException:

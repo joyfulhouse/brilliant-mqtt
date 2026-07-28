@@ -44,7 +44,32 @@ _BASE_VALUES = {
     "service_brilliant_bus_watchdog": "active",
     "service_brilliant_hue_ca_timer": "inactive",
     "service_brilliant_ha_mirror": "inactive",
+    "toolchain_mv_no_clobber": "1",
+    "toolchain_mv_no_target_directory": "1",
+    "toolchain_stat_mode": "1",
+    "toolchain_grep_fixed_exact_quiet": "1",
+    "toolchain_grep_extended_count": "1",
+    "toolchain_find_print_quit": "1",
+    "toolchain_sha256sum": "1",
+    "toolchain_python_3_10": "1",
+    "toolchain_systemd_manager": "1",
+    "toolchain_systemd_is_active": "1",
+    "toolchain_systemd_is_enabled": "1",
 }
+
+_TOOLCHAIN_FAILURES = (
+    ("toolchain_mv_no_clobber", "mv_no_clobber"),
+    ("toolchain_mv_no_target_directory", "mv_no_target_directory"),
+    ("toolchain_stat_mode", "stat_mode"),
+    ("toolchain_grep_fixed_exact_quiet", "grep_fixed_exact_quiet"),
+    ("toolchain_grep_extended_count", "grep_extended_count"),
+    ("toolchain_find_print_quit", "find_print_quit"),
+    ("toolchain_sha256sum", "sha256sum"),
+    ("toolchain_python_3_10", "python_3_10"),
+    ("toolchain_systemd_manager", "systemd_manager"),
+    ("toolchain_systemd_is_active", "systemd_is_active"),
+    ("toolchain_systemd_is_enabled", "systemd_is_enabled"),
+)
 
 
 def _output(**overrides: str) -> str:
@@ -136,6 +161,14 @@ def test_inspection_command_uses_fixed_read_only_compatibility_sources() -> None
         "systemctl is-active brilliant-bus-watchdog",
         "systemctl is-active brilliant-hue-ca.timer",
         "systemctl is-active brilliant-ha-mirror",
+        "/usr/bin/mv.coreutils --help",
+        "stat -c %a -- /dev/null",
+        "grep -Fxq",
+        "grep -Ec --",
+        "find /dev/null -type l -print -quit",
+        "/usr/bin/sha256sum -- /dev/null",
+        "systemctl is-system-running",
+        "systemctl is-enabled brilliant-mqtt",
     )
     assert all(fragment in PANEL_INSPECTION_COMMAND for fragment in required_fragments)
     assert "\n" not in PANEL_INSPECTION_COMMAND
@@ -156,8 +189,57 @@ def test_inspection_command_uses_fixed_read_only_compatibility_sources() -> None
             "systemctl start",
             "systemctl enable",
             "systemctl restart",
+            "systemctl stop",
         )
     )
+
+
+@pytest.mark.parametrize(("wire_key", "capability"), _TOOLCHAIN_FAILURES)
+async def test_missing_toolchain_capability_has_one_allowlisted_redacted_identity(
+    wire_key: str,
+    capability: str,
+) -> None:
+    shell = await _connected_shell(RunResult(0, _output(**{wire_key: "0"}), ""))
+
+    with pytest.raises(PanelCompatibilityError) as raised:
+        await async_inspect_panel(shell, _IDENTITY)
+
+    assert raised.value.code == "unsupported_panel_toolchain"
+    assert raised.value.capability == capability
+    assert str(raised.value) == "unsupported_panel_toolchain"
+    assert raised.value.__context__ is None
+    assert shell.uploads == []
+    assert shell.dir_uploads == []
+    assert shell.file_uploads == []
+
+
+@pytest.mark.parametrize("wire_value", ("", "2", "true", "01"))
+async def test_malformed_toolchain_result_is_not_a_capability_diagnostic(
+    wire_value: str,
+) -> None:
+    shell = await _connected_shell(RunResult(0, _output(toolchain_mv_no_clobber=wire_value), ""))
+
+    with pytest.raises(PanelCompatibilityError) as raised:
+        await async_inspect_panel(shell, _IDENTITY)
+
+    assert raised.value.code == "inspection_output_invalid"
+    assert raised.value.capability is None
+
+
+def test_toolchain_error_rejects_non_allowlisted_capability_identity() -> None:
+    with pytest.raises(ValueError, match="^invalid_panel_compatibility_error_code$"):
+        PanelCompatibilityError(
+            "unsupported_panel_toolchain",
+            capability="SECRET-untrusted-tool-output",
+        )
+
+
+def test_non_toolchain_error_rejects_any_capability_identity() -> None:
+    with pytest.raises(ValueError, match="^invalid_panel_compatibility_error_code$"):
+        PanelCompatibilityError(
+            "inspection_failed",
+            capability="SECRET-untrusted-tool-output",
+        )
 
 
 async def test_missing_optional_agent_version_is_explicitly_unknown() -> None:
@@ -337,7 +419,7 @@ def test_firmware_probe_reports_malformed_or_oversized_file_as_unknown(
         ({"architecture": "aarch64"}, "unsupported_architecture"),
         ({"firmware": ""}, "firmware_unknown"),
         ({"firmware": "2174d3882504"}, "firmware_unknown"),
-        ({"python_version": "Python 3.11.0"}, "unsupported_python"),
+        ({"python_version": "Python 3.9.18"}, "unsupported_python"),
         ({"python_version": "not-python"}, "unsupported_python"),
         ({"available_kib": "65535"}, "insufficient_storage"),
         ({"available_memory_kib": "32767"}, "insufficient_memory"),
@@ -401,7 +483,12 @@ async def test_missing_python_takes_precedence_over_dependent_firmware_probe() -
     shell = await _connected_shell(
         RunResult(
             0,
-            _output(model="", firmware="", python_version=""),
+            _output(
+                model="",
+                firmware="",
+                python_version="",
+                toolchain_python_3_10="0",
+            ),
             "",
         )
     )
@@ -409,7 +496,16 @@ async def test_missing_python_takes_precedence_over_dependent_firmware_probe() -
     with pytest.raises(PanelCompatibilityError) as raised:
         await async_inspect_panel(shell, _IDENTITY)
 
-    assert raised.value.code == "unsupported_python"
+    assert raised.value.code == "unsupported_panel_toolchain"
+    assert raised.value.capability == "python_3_10"
+
+
+async def test_fixed_panel_python_newer_than_3_10_is_compatible() -> None:
+    shell = await _connected_shell(RunResult(0, _output(python_version="Python 3.11.8"), ""))
+
+    facts = await async_inspect_panel(shell, _IDENTITY)
+
+    assert facts.python_version == "3.11.8"
 
 
 class _BlockingShell(FakeShell):
