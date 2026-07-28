@@ -26,6 +26,7 @@ from homeassistant.config_entries import (
     OptionsFlow,
     SubentryFlowResult,
     UnknownEntry,
+    UnknownSubEntry,
 )
 from homeassistant.const import CONF_NAME
 from homeassistant.core import HomeAssistant, callback
@@ -46,7 +47,10 @@ from .const import (
     COMPONENT_BRIDGE,
     COMPONENT_BUS_WATCHDOG,
     COMPONENT_HA_MIRROR,
+    COMPONENT_HUE_CA,
+    COMPONENT_VOICE,
     COMPONENT_WIFI_WATCHDOG,
+    CONF_BROKER_KIND,
     CONF_COMPONENTS,
     CONF_ENTRY_KIND,
     CONF_FEATURE_OVERRIDES,
@@ -62,6 +66,8 @@ from .const import (
     CONF_MQTT_HOST,
     CONF_MQTT_PASSWORD,
     CONF_MQTT_PORT,
+    CONF_MQTT_TLS_CA,
+    CONF_MQTT_TLS_ENABLED,
     CONF_MQTT_USERNAME,
     CONF_NEXT_MESH_PRIORITY,
     CONF_PANEL,
@@ -98,19 +104,38 @@ from .const import (
     SUBENTRY_TYPE_PANEL,
     VOICE_WAKE_WORDS,
 )
-from .entry_data import EntryDataError, FleetConfig
+from .entry_data import EntryDataError, FleetConfig, PanelConfig
 from .errors import OperationError
 from .flow_schemas import (
     BROKER_MENU_OPTIONS,
+    SECRET_UNCHANGED,
     FlowInputError,
     allocate_mesh_priority,
     allocate_panel_slug,
+    broker_form_source,
     broker_schema,
+    fleet_control_schema,
+    fleet_defaults_schema,
+    fleet_scenes_schema,
     normalize_broker_input,
+    normalize_fleet_control_input,
+    normalize_fleet_defaults_input,
+    normalize_fleet_scenes_input,
+    normalize_panel_address_input,
     normalize_panel_connect_input,
+    normalize_panel_feature_overrides_input,
     normalize_panel_name,
+    normalize_panel_rebind_input,
+    normalize_panel_rename_input,
+    normalize_panel_ssh_credentials_input,
+    panel_address_schema,
     panel_confirm_schema,
+    panel_connect_form_source,
     panel_connect_schema,
+    panel_feature_overrides_schema,
+    panel_rebind_schema,
+    panel_rename_schema,
+    panel_ssh_credentials_schema,
 )
 from .panel_inspection import (
     PanelCompatibilityError,
@@ -533,6 +558,22 @@ _CORE_COMPONENTS = (
     COMPONENT_BUS_WATCHDOG,
 )
 _PROVISIONING_STAGE_ORDER = tuple(ProvisioningProgressStage)
+_DOCUMENTATION_ROOT = "https://github.com/joyfulhouse/brilliant-mqtt/blob/main/docs"
+_MQTT_DOCUMENTATION_URL = f"{_DOCUMENTATION_ROOT}/install/mqtt-broker.md"
+_PANEL_ONBOARDING_DOCUMENTATION_URL = (
+    f"{_DOCUMENTATION_ROOT}/ha-integration.md#panel-onboarding-errors"
+)
+_DOCUMENTATION_SLUG = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+_FAILURE_DOCUMENTATION_SLUGS = {
+    "invalid_broker_profile": "mqtt-broker-profile",
+    "broker_validation_failed": "mqtt-broker-validation-failed",
+}
+
+
+def _documentation_url(slug: str) -> str:
+    if _DOCUMENTATION_SLUG.fullmatch(slug) and slug.startswith("mqtt-"):
+        return f"{_MQTT_DOCUMENTATION_URL}#{slug}"
+    return _PANEL_ONBOARDING_DOCUMENTATION_URL
 
 
 @dataclass(frozen=True, slots=True)
@@ -546,6 +587,7 @@ class _FlowFailure:
     def placeholders(self) -> dict[str, str]:
         return {
             "documentation_slug": self.documentation_slug,
+            "documentation_url": _documentation_url(self.documentation_slug),
             "stage": self.stage,
         }
 
@@ -657,6 +699,38 @@ async def _async_verify_staged_progress(
         raise ValueError("invalid_provisioning_progress")
 
 
+@callback
+def _same_entry_panel_add_flow_active(
+    hass: HomeAssistant,
+    entry_id: str,
+) -> bool:
+    """Return whether an Add panel flow can still start provisioning for this fleet."""
+    for progress in hass.config_entries.subentries.async_progress(
+        include_uninitialized=True,
+    ):
+        if not isinstance(progress, Mapping) or progress.get("handler") != (
+            entry_id,
+            SUBENTRY_TYPE_PANEL,
+        ):
+            continue
+        context = progress.get("context")
+        if not isinstance(context, Mapping) or context.get("source") != "reconfigure":
+            return True
+    return False
+
+
+async def _async_provisioning_journal_clear(hass: HomeAssistant) -> bool:
+    """Fail closed unless durable provisioning state is readable and empty."""
+    from .provisioning_journal import ProvisioningJournal
+
+    try:
+        return await ProvisioningJournal(hass).async_load() is None
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return False
+
+
 def _fleet_storage_issue_id(entry_id: str) -> str:
     return f"fleet_storage_{entry_id}"
 
@@ -694,7 +768,10 @@ def _operation_failure(error: OperationError) -> _FlowFailure:
 def _panel_failure(code: str, *, stage: str = "panel") -> _FlowFailure:
     return _FlowFailure(
         code=code,
-        documentation_slug=f"panel-{code.replace('_', '-')}",
+        documentation_slug=_FAILURE_DOCUMENTATION_SLUGS.get(
+            code,
+            f"panel-{code.replace('_', '-')}",
+        ),
         stage=stage,
     )
 
@@ -733,10 +810,16 @@ def _is_exact_fleet_parent(entry: ConfigEntry[Any]) -> bool:
 def _duplicate_panel(
     entry: ConfigEntry[Any] | None,
     fingerprint: str,
+    *,
+    exclude_subentry_id: str | None = None,
 ) -> _DuplicatePanel | None:
     for subentry in _panel_subentries(entry):
-        if subentry.unique_id == fingerprint or (
-            subentry.data.get(CONF_IDENTITY_FINGERPRINT) == fingerprint
+        if subentry.subentry_id == exclude_subentry_id:
+            continue
+        if (
+            subentry.unique_id == fingerprint
+            or subentry.data.get(CONF_IDENTITY_FINGERPRINT) == fingerprint
+            or subentry.data.get(CONF_MANAGEMENT_ID) == fingerprint
         ):
             return _DuplicatePanel(
                 subentry_id=subentry.subentry_id,
@@ -992,6 +1075,7 @@ class _PanelOnboardingMixin:
         self,
         user_input: Mapping[str, object],
     ) -> tuple[dict[str, str], _FlowFailure | None, _DuplicatePanel | None]:
+        self._panel_source = panel_connect_form_source(user_input)
         try:
             normalized = normalize_panel_connect_input(user_input)
         except FlowInputError as error:
@@ -999,7 +1083,6 @@ class _PanelOnboardingMixin:
 
         host = normalized[CONF_HOST]
         root_password = normalized[CONF_ROOT_PASSWORD]
-        self._panel_source = {CONF_HOST: host}
         self._panel_host = host
         self._panel_root_password = root_password
         self._panel_ssh_username = normalized[CONF_SSH_USERNAME]
@@ -1069,7 +1152,11 @@ class _PanelOnboardingMixin:
             step_id="panel_connect",
             data_schema=panel_connect_schema(self._panel_source),
             errors=errors or ({"base": failure.code} if failure is not None else {}),
-            description_placeholders=(failure.placeholders() if failure is not None else None),
+            description_placeholders=(
+                failure.placeholders()
+                if failure is not None
+                else {"documentation_url": _PANEL_ONBOARDING_DOCUMENTATION_URL}
+            ),
         )
 
     async def async_step_panel_confirm(
@@ -1169,7 +1256,11 @@ class _PanelOnboardingMixin:
             errors=errors or ({"base": failure.code} if failure is not None else {}),
             description_placeholders={
                 **_facts_placeholders(facts),
-                **(failure.placeholders() if failure is not None else {}),
+                **(
+                    failure.placeholders()
+                    if failure is not None
+                    else {"documentation_url": _PANEL_ONBOARDING_DOCUMENTATION_URL}
+                ),
             },
         )
 
@@ -1294,6 +1385,8 @@ class BrilliantMqttConfigFlow(
     def __init__(self) -> None:
         self._broker_kind: BrokerKind | None = None
         self._broker_values: dict[str, object] = {}
+        self._broker_source: dict[str, object] = {}
+        self._ha_control_enabled = DEFAULT_HA_CONTROL_ENABLED
         self._broker_profile: BrokerProfile | None = None
         self._broker_failure: _FlowFailure | None = None
         self._broker_task: asyncio.Task[object] | None = None
@@ -1301,7 +1394,8 @@ class BrilliantMqttConfigFlow(
     @staticmethod
     @callback
     def async_get_options_flow(config_entry: ConfigEntry[Any]) -> OptionsFlow:
-        del config_entry
+        if config_entry.data.get(CONF_ENTRY_KIND) == ENTRY_KIND_FLEET:
+            return BrilliantMqttFleetOptionsFlow()
         return BrilliantMqttOptionsFlow()
 
     @classmethod
@@ -1339,7 +1433,7 @@ class BrilliantMqttConfigFlow(
             CONF_ENTRY_KIND: ENTRY_KIND_FLEET,
             **self._broker_values,
             CONF_NEXT_MESH_PRIORITY: 1,
-            CONF_HA_CONTROL_ENABLED: DEFAULT_HA_CONTROL_ENABLED,
+            CONF_HA_CONTROL_ENABLED: self._ha_control_enabled,
             CONF_HA_CONTROL_LABEL: DEFAULT_HA_CONTROL_LABEL,
             CONF_ROOM_OVERRIDES: {},
             CONF_HA_CONTROL_DOMAINS: list(DEFAULT_HA_CONTROL_DOMAINS),
@@ -1452,14 +1546,21 @@ class BrilliantMqttConfigFlow(
             return self.async_abort(reason="invalid_flow_state")
         errors: dict[str, str] = {}
         if user_input is not None:
+            self._broker_source = broker_form_source(user_input)
+            profile: BrokerProfile | None = None
+            ha_control_enabled = user_input.get(CONF_HA_CONTROL_ENABLED)
+            if type(ha_control_enabled) is not bool:
+                errors[CONF_HA_CONTROL_ENABLED] = "invalid_value"
+            else:
+                self._ha_control_enabled = ha_control_enabled
             try:
                 values = normalize_broker_input(kind, user_input)
                 profile = BrokerProfile.from_mapping(values)
             except FlowInputError as error:
-                errors = dict(error.errors)
+                errors.update(error.errors)
             except OperationError as error:
                 self._broker_failure = _operation_failure(error)
-            else:
+            if profile is not None and not errors:
                 self._broker_values = values
                 self._broker_profile = profile
                 self._broker_failure = None
@@ -1468,18 +1569,32 @@ class BrilliantMqttConfigFlow(
                     "brilliant-mqtt-broker-validation",
                 )
                 return await self.async_step_broker_validation()
+            if errors:
+                self._broker_failure = None
 
         failure = self._broker_failure
         local_ip = self.hass.config.api.local_ip if self.hass.config.api is not None else None
+        schema = broker_schema(
+            kind,
+            self._broker_source,
+            default_host=local_ip,
+        ).extend(
+            {
+                vol.Required(
+                    CONF_HA_CONTROL_ENABLED,
+                    default=self._ha_control_enabled,
+                ): bool,
+            }
+        )
         return self.async_show_form(
             step_id="broker",
-            data_schema=broker_schema(
-                kind,
-                self._broker_values,
-                default_host=local_ip,
-            ),
+            data_schema=schema,
             errors=errors or ({"base": failure.code} if failure is not None else {}),
-            description_placeholders=(failure.placeholders() if failure is not None else None),
+            description_placeholders=(
+                failure.placeholders()
+                if failure is not None
+                else {"documentation_url": f"{_MQTT_DOCUMENTATION_URL}#mqtt-validation"}
+            ),
         )
 
     async def async_step_broker_validation(
@@ -1691,6 +1806,11 @@ class PanelSubentryFlow(ConfigSubentryFlow, _PanelOnboardingMixin):
 
     def __init__(self) -> None:
         self._init_panel_onboarding()
+        self._reconfigure_expected: PanelConfig | None = None
+        self._reconfigure_host: str | None = None
+        self._rebind_identity: HostIdentity | None = None
+        self._rebind_facts: PanelFacts | None = None
+        self._rebind_password: str | None = None
 
     @callback
     def async_remove(self) -> None:
@@ -1784,6 +1904,1066 @@ class PanelSubentryFlow(ConfigSubentryFlow, _PanelOnboardingMixin):
         return cast(
             SubentryFlowResult,
             await self.async_step_panel_connect(user_input),
+        )
+
+    async def async_step_reconfigure(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> SubentryFlowResult:
+        """Expose focused day-two actions for one exact panel subentry."""
+        del user_input
+        if self._reconfigure_target() is None:
+            return self.async_abort(reason="invalid_parent")
+        return self.async_show_menu(
+            step_id="reconfigure",
+            menu_options=(
+                "rename",
+                "address",
+                "repair_credentials",
+                "components",
+                "overrides",
+                "rebind",
+            ),
+        )
+
+    def _reconfigure_target(
+        self,
+    ) -> tuple[ConfigEntry[Any], ConfigSubentry, PanelConfig] | None:
+        """Return one exact, validated same-fleet reconfigure target."""
+        entry = self._onboarding_parent_entry()
+        if entry is None:
+            return None
+        try:
+            subentry = self._get_reconfigure_subentry()
+        except (UnknownEntry, UnknownSubEntry):
+            return None
+        if subentry.subentry_type != SUBENTRY_TYPE_PANEL:
+            return None
+        try:
+            panel = PanelConfig.from_subentry(subentry)
+        except EntryDataError:
+            return None
+        return entry, subentry, panel
+
+    def _capture_or_compare_reconfigure(
+        self,
+        current: PanelConfig,
+    ) -> bool:
+        """Capture the form snapshot once and reject concurrent panel changes."""
+        if self._reconfigure_expected is None:
+            self._reconfigure_expected = current
+            return True
+        return self._reconfigure_expected == current
+
+    async def _async_verify_existing_panel(
+        self,
+        current: PanelConfig,
+        *,
+        host: str,
+        root_password: str,
+    ) -> _FlowFailure | None:
+        """Prove the pinned identity before offering a password to the candidate."""
+        try:
+            identity = await async_fetch_host_identity(host)
+        except asyncio.CancelledError:
+            raise
+        except PanelIdentityError as error:
+            return _panel_failure(error.code, stage="panel_identity")
+        except (OSError, asyncssh.Error):
+            return _panel_failure("cannot_connect", stage="panel_identity")
+        except Exception:
+            return _panel_failure("inspection_failed", stage="panel_identity")
+
+        if (
+            identity.fingerprint != current.identity_fingerprint
+            or identity.public_key != current.ssh_host_key
+        ):
+            return _panel_failure(
+                "panel_identity_mismatch",
+                stage="panel_identity",
+            )
+        try:
+            await _async_inspect_candidate(
+                self.hass,
+                host,
+                root_password,
+                identity,
+            )
+        except asyncio.CancelledError:
+            raise
+        except asyncssh.HostKeyNotVerifiable:
+            return _panel_failure("host_key_changed", stage="panel_ssh")
+        except asyncssh.PermissionDenied:
+            return _panel_failure(
+                "panel_authentication_failed",
+                stage="panel_ssh",
+            )
+        except PanelIdentityError as error:
+            return _panel_failure(error.code, stage="panel_identity")
+        except PanelCompatibilityError as error:
+            return _panel_failure(error.code, stage="panel_inspection")
+        except (OSError, asyncssh.Error):
+            return _panel_failure("cannot_connect", stage="panel_ssh")
+        except Exception:
+            return _panel_failure("inspection_failed", stage="panel_inspection")
+        return None
+
+    async def async_step_rename(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> SubentryFlowResult:
+        """Change only the human-facing panel title and name."""
+        target = self._reconfigure_target()
+        if target is None:
+            return self.async_abort(reason="invalid_parent")
+        entry, subentry, current = target
+        if not self._capture_or_compare_reconfigure(current):
+            return self.async_abort(reason="parent_changed")
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            try:
+                normalized = normalize_panel_rename_input(user_input)
+            except FlowInputError as error:
+                errors = dict(error.errors)
+            else:
+                target = self._reconfigure_target()
+                if target is None:
+                    return self.async_abort(reason="invalid_parent")
+                entry, subentry, current = target
+                if not self._capture_or_compare_reconfigure(current):
+                    return self.async_abort(reason="parent_changed")
+                name = normalized[CONF_NAME]
+                return self.async_update_and_abort(
+                    entry,
+                    subentry,
+                    title=name,
+                    data={**subentry.data, CONF_NAME: name},
+                )
+        return self.async_show_form(
+            step_id="rename",
+            data_schema=panel_rename_schema(subentry.data),
+            errors=errors,
+        )
+
+    async def async_step_address(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> SubentryFlowResult:
+        """Move a panel address only after its existing identity is proven."""
+        target = self._reconfigure_target()
+        if target is None:
+            return self.async_abort(reason="invalid_parent")
+        entry, subentry, current = target
+        if not self._capture_or_compare_reconfigure(current):
+            return self.async_abort(reason="parent_changed")
+        errors: dict[str, str] = {}
+        failure: _FlowFailure | None = None
+        if user_input is not None:
+            try:
+                normalized = normalize_panel_address_input(user_input)
+            except FlowInputError as error:
+                errors = dict(error.errors)
+            else:
+                host = normalized[CONF_HOST]
+                self._reconfigure_host = host
+                failure = await self._async_verify_existing_panel(
+                    current,
+                    host=host,
+                    root_password=current.root_password,
+                )
+                if failure is None:
+                    target = self._reconfigure_target()
+                    if target is None:
+                        return self.async_abort(reason="invalid_parent")
+                    entry, subentry, latest = target
+                    if not self._capture_or_compare_reconfigure(latest):
+                        return self.async_abort(reason="parent_changed")
+                    return self.async_update_and_abort(
+                        entry,
+                        subentry,
+                        data={**subentry.data, CONF_HOST: host},
+                    )
+        source = {CONF_HOST: self._reconfigure_host or current.host}
+        return self.async_show_form(
+            step_id="address",
+            data_schema=panel_address_schema(source),
+            errors=errors or ({"base": failure.code} if failure is not None else {}),
+            description_placeholders=(failure.placeholders() if failure is not None else None),
+        )
+
+    async def async_step_repair_credentials(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> SubentryFlowResult:
+        """Replace the root credential only after re-proving pinned identity."""
+        target = self._reconfigure_target()
+        if target is None:
+            return self.async_abort(reason="invalid_parent")
+        entry, subentry, current = target
+        if not self._capture_or_compare_reconfigure(current):
+            return self.async_abort(reason="parent_changed")
+        errors: dict[str, str] = {}
+        failure: _FlowFailure | None = None
+        if user_input is not None:
+            try:
+                normalized = normalize_panel_ssh_credentials_input(user_input)
+            except FlowInputError as error:
+                errors = dict(error.errors)
+            else:
+                password = normalized[CONF_ROOT_PASSWORD]
+                failure = await self._async_verify_existing_panel(
+                    current,
+                    host=current.host,
+                    root_password=password,
+                )
+                if failure is None:
+                    target = self._reconfigure_target()
+                    if target is None:
+                        return self.async_abort(reason="invalid_parent")
+                    entry, subentry, latest = target
+                    if not self._capture_or_compare_reconfigure(latest):
+                        return self.async_abort(reason="parent_changed")
+                    return self.async_update_and_abort(
+                        entry,
+                        subentry,
+                        data={
+                            **subentry.data,
+                            CONF_ROOT_PASSWORD: password,
+                        },
+                    )
+        return self.async_show_form(
+            step_id="repair_credentials",
+            data_schema=panel_ssh_credentials_schema(),
+            errors=errors or ({"base": failure.code} if failure is not None else {}),
+            description_placeholders=(failure.placeholders() if failure is not None else None),
+        )
+
+    async def async_step_overrides(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> SubentryFlowResult:
+        """Update only allowlisted panel feature values."""
+        target = self._reconfigure_target()
+        if target is None:
+            return self.async_abort(reason="invalid_parent")
+        entry, subentry, current = target
+        if not self._capture_or_compare_reconfigure(current):
+            return self.async_abort(reason="parent_changed")
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            try:
+                normalized = normalize_panel_feature_overrides_input(user_input)
+            except FlowInputError as error:
+                errors = dict(error.errors)
+            else:
+                async with _fleet_lock(self.hass):
+                    target = self._reconfigure_target()
+                    if target is None:
+                        return self.async_abort(reason="invalid_parent")
+                    entry, subentry, latest = target
+                    if not self._capture_or_compare_reconfigure(latest):
+                        return self.async_abort(reason="parent_changed")
+
+                    current_wake_word = latest.feature_overrides.get(
+                        CONF_VOICE_WAKE_WORD,
+                        DEFAULT_VOICE_WAKE_WORD,
+                    )
+                    current_ha_host = latest.feature_overrides.get(
+                        CONF_VOICE_HA_HOST,
+                        "",
+                    )
+                    current_hue_ca = latest.feature_overrides.get(
+                        CONF_HUE_CA_CERT,
+                        "",
+                    )
+                    voice_changed = (
+                        normalized[CONF_VOICE_WAKE_WORD] != current_wake_word
+                        or normalized[CONF_VOICE_HA_HOST] != current_ha_host
+                    )
+                    hue_ca_changed = normalized[CONF_HUE_CA_CERT] != current_hue_ca
+                    if (latest.components.get(COMPONENT_VOICE) is True and voice_changed) or (
+                        latest.components.get(COMPONENT_HUE_CA) is True and hue_ca_changed
+                    ):
+                        return self.async_abort(
+                            reason="feature_override_change_requires_agent_rollout",
+                        )
+
+                    overrides = {
+                        **latest.feature_overrides,
+                        **normalized,
+                    }
+                    if overrides == latest.feature_overrides:
+                        return self.async_abort(reason="reconfigure_successful")
+                    return self.async_update_and_abort(
+                        entry,
+                        subentry,
+                        data={
+                            **subentry.data,
+                            CONF_FEATURE_OVERRIDES: overrides,
+                        },
+                    )
+        return self.async_show_form(
+            step_id="overrides",
+            data_schema=panel_feature_overrides_schema(
+                current.feature_overrides,
+            ),
+            errors=errors,
+        )
+
+    async def async_step_components(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> SubentryFlowResult:
+        """Route component mutation to the existing observable config entities."""
+        del user_input
+        if self._reconfigure_target() is None:
+            return self.async_abort(reason="invalid_parent")
+        return self.async_abort(reason="manage_components_with_panel_entities")
+
+    async def async_step_rebind(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> SubentryFlowResult:
+        """Inspect a replacement identity without granting user identity authority."""
+        target = self._reconfigure_target()
+        if target is None:
+            return self.async_abort(reason="invalid_parent")
+        entry, subentry, current = target
+        if not self._capture_or_compare_reconfigure(current):
+            return self.async_abort(reason="parent_changed")
+
+        errors: dict[str, str] = {}
+        failure: _FlowFailure | None = None
+        if user_input is not None:
+            self._rebind_identity = None
+            self._rebind_facts = None
+            self._rebind_password = None
+            preserved_host = panel_connect_form_source(user_input).get(CONF_HOST)
+            self._reconfigure_host = preserved_host if isinstance(preserved_host, str) else None
+            try:
+                normalized = normalize_panel_rebind_input(user_input)
+            except FlowInputError as error:
+                errors = dict(error.errors)
+            else:
+                host = normalized[CONF_HOST]
+                password = normalized[CONF_ROOT_PASSWORD]
+                self._reconfigure_host = host
+                try:
+                    identity = await async_fetch_host_identity(host)
+                except asyncio.CancelledError:
+                    raise
+                except PanelIdentityError as error:
+                    failure = _panel_failure(error.code, stage="panel_identity")
+                except (OSError, asyncssh.Error):
+                    failure = _panel_failure("cannot_connect", stage="panel_identity")
+                except Exception:
+                    failure = _panel_failure(
+                        "inspection_failed",
+                        stage="panel_identity",
+                    )
+                else:
+                    if (
+                        identity.fingerprint == current.identity_fingerprint
+                        and identity.public_key == current.ssh_host_key
+                    ):
+                        failure = _panel_failure(
+                            "rebind_identity_unchanged",
+                            stage="panel_identity",
+                        )
+                    elif duplicate := _duplicate_panel(
+                        entry,
+                        identity.fingerprint,
+                        exclude_subentry_id=subentry.subentry_id,
+                    ):
+                        return self.async_abort(
+                            reason="already_configured",
+                            description_placeholders={
+                                "subentry_id": duplicate.subentry_id,
+                                "panel_name": duplicate.title,
+                            },
+                        )
+                    else:
+                        try:
+                            facts = await _async_inspect_candidate(
+                                self.hass,
+                                host,
+                                password,
+                                identity,
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except asyncssh.HostKeyNotVerifiable:
+                            failure = _panel_failure(
+                                "host_key_changed",
+                                stage="panel_ssh",
+                            )
+                        except asyncssh.PermissionDenied:
+                            failure = _panel_failure(
+                                "panel_authentication_failed",
+                                stage="panel_ssh",
+                            )
+                        except PanelIdentityError as error:
+                            failure = _panel_failure(
+                                error.code,
+                                stage="panel_identity",
+                            )
+                        except PanelCompatibilityError as error:
+                            failure = _panel_failure(
+                                error.code,
+                                stage="panel_inspection",
+                            )
+                        except (OSError, asyncssh.Error):
+                            failure = _panel_failure(
+                                "cannot_connect",
+                                stage="panel_ssh",
+                            )
+                        except Exception:
+                            failure = _panel_failure(
+                                "inspection_failed",
+                                stage="panel_inspection",
+                            )
+                        else:
+                            target = self._reconfigure_target()
+                            if target is None:
+                                return self.async_abort(reason="invalid_parent")
+                            _entry, _subentry, latest = target
+                            if not self._capture_or_compare_reconfigure(latest):
+                                return self.async_abort(reason="parent_changed")
+                            self._rebind_identity = identity
+                            self._rebind_facts = facts
+                            self._rebind_password = password
+                            return await self.async_step_rebind_confirm()
+
+        source = {CONF_HOST: self._reconfigure_host or current.host}
+        return self.async_show_form(
+            step_id="rebind",
+            data_schema=panel_rebind_schema(source),
+            errors=errors or ({"base": failure.code} if failure is not None else {}),
+            description_placeholders=(failure.placeholders() if failure is not None else None),
+        )
+
+    async def async_step_rebind_confirm(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> SubentryFlowResult:
+        """Commit only an explicitly confirmed, rechecked replacement identity."""
+        identity = self._rebind_identity
+        facts = self._rebind_facts
+        password = self._rebind_password
+        host = self._reconfigure_host
+        expected = self._reconfigure_expected
+        if (
+            identity is None
+            or facts is None
+            or password is None
+            or host is None
+            or expected is None
+        ):
+            return self.async_abort(reason="invalid_flow_state")
+
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            if set(user_input) != {"confirm"} or user_input.get("confirm") is not True:
+                errors["confirm"] = "confirmation_required"
+            else:
+                target = self._reconfigure_target()
+                if target is None:
+                    return self.async_abort(reason="invalid_parent")
+                entry, subentry, current = target
+                if not self._capture_or_compare_reconfigure(current):
+                    return self.async_abort(reason="parent_changed")
+                try:
+                    live_identity = await async_fetch_host_identity(host)
+                except asyncio.CancelledError:
+                    raise
+                except (PanelIdentityError, OSError, asyncssh.Error):
+                    errors["base"] = "cannot_connect"
+                except Exception:
+                    errors["base"] = "inspection_failed"
+                else:
+                    if live_identity != identity:
+                        errors["base"] = "rebind_identity_changed"
+                    elif duplicate := _duplicate_panel(
+                        entry,
+                        identity.fingerprint,
+                        exclude_subentry_id=subentry.subentry_id,
+                    ):
+                        return self.async_abort(
+                            reason="already_configured",
+                            description_placeholders={
+                                "subentry_id": duplicate.subentry_id,
+                                "panel_name": duplicate.title,
+                            },
+                        )
+                    if not errors:
+                        from .fleet_manager import (
+                            ConfigEntryPersistenceError,
+                            FleetManager,
+                        )
+
+                        runtime = entry.runtime_data
+                        if not isinstance(runtime, FleetManager):
+                            return self.async_abort(reason="runtime_unavailable")
+                        try:
+                            await runtime.async_rebind_panel(
+                                subentry.subentry_id,
+                                expected,
+                                host=host,
+                                root_password=password,
+                                candidate=identity,
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except ConfigEntryPersistenceError:
+                            return self.async_abort(
+                                reason="config_entry_storage_unavailable",
+                            )
+                        except EntryDataError as error:
+                            code = str(error)
+                            if code == "panel_snapshot_changed":
+                                return self.async_abort(reason="parent_changed")
+                            if code == "duplicate_panel_fingerprint":
+                                duplicate = _duplicate_panel(
+                                    entry,
+                                    identity.fingerprint,
+                                    exclude_subentry_id=subentry.subentry_id,
+                                )
+                                if duplicate is not None:
+                                    return self.async_abort(
+                                        reason="already_configured",
+                                        description_placeholders={
+                                            "subentry_id": duplicate.subentry_id,
+                                            "panel_name": duplicate.title,
+                                        },
+                                    )
+                                return self.async_abort(reason="parent_changed")
+                            if code == "panel_rebind_unavailable":
+                                return self.async_abort(reason="runtime_unavailable")
+                            if code == "panel_rebind_blocked_by_panel_onboarding":
+                                return self.async_abort(
+                                    reason="rebind_blocked_by_panel_onboarding",
+                                )
+                            if code == "panel_rebind_identity_changed":
+                                return self.async_abort(
+                                    reason="rebind_identity_changed",
+                                )
+                            if code == "panel_rebind_identity_unreachable":
+                                return self.async_abort(reason="cannot_connect")
+                            return self.async_abort(reason="rebind_failed")
+                        except Exception as error:
+                            _LOGGER.error(
+                                "Explicit panel rebind failed (%s)",
+                                type(error).__name__,
+                            )
+                            return self.async_abort(reason="rebind_failed")
+                        finally:
+                            self._rebind_password = None
+                        return self.async_abort(reason="reconfigure_successful")
+
+        return self.async_show_form(
+            step_id="rebind_confirm",
+            data_schema=vol.Schema(
+                {
+                    vol.Required("confirm", default=False): bool,
+                }
+            ),
+            errors=errors,
+            description_placeholders={
+                **_facts_placeholders(facts),
+                "old_fingerprint": expected.identity_fingerprint,
+                "new_fingerprint": identity.fingerprint,
+            },
+        )
+
+
+class BrilliantMqttFleetOptionsFlow(OptionsFlow):
+    """Focused settings owned once by the singleton fleet entry."""
+
+    def __init__(self) -> None:
+        self._broker_kind: BrokerKind | None = None
+        self._broker_values: dict[str, object] = {}
+        self._broker_source: dict[str, object] = {}
+        self._broker_profile: BrokerProfile | None = None
+        self._broker_expected_profile: BrokerProfile | None = None
+        self._broker_failure: _FlowFailure | None = None
+        self._broker_task: asyncio.Task[object] | None = None
+        self._control_expected: dict[str, object] | None = None
+        self._scenes_expected: tuple[object, ...] | None = None
+        self._defaults_expected: dict[str, Any] | None = None
+
+    def _exact_registered_entry(self) -> ConfigEntry[Any] | None:
+        """Resolve the still-registered singleton owner for every commit boundary."""
+        try:
+            entry = self.config_entry
+        except UnknownEntry:
+            return None
+        if self.hass.config_entries.async_get_entry(
+            entry.entry_id
+        ) is not entry or not _is_exact_fleet_parent(entry):
+            return None
+        return entry
+
+    @staticmethod
+    def _broker_transport_matches(
+        values: Mapping[str, object],
+        current: BrokerProfile,
+    ) -> bool:
+        """Compare runtime broker material while ignoring guidance-only kind."""
+        try:
+            comparable = BrokerProfile.from_mapping(
+                {
+                    **values,
+                    CONF_BROKER_KIND: current.kind.value,
+                }
+            )
+        except OperationError:
+            return False
+        return comparable == current
+
+    async def async_step_init(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        del user_input
+        if self._exact_registered_entry() is None:
+            return self.async_abort(reason="invalid_parent")
+        return self.async_show_menu(
+            step_id="init",
+            menu_options=(
+                "broker",
+                "ha_control",
+                "scenes",
+                "fleet_defaults",
+                "advanced",
+            ),
+        )
+
+    async def async_step_broker(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Choose broker guidance without preferring away external brokers."""
+        del user_input
+        return self.async_show_menu(
+            step_id="broker",
+            menu_options=BROKER_MENU_OPTIONS,
+        )
+
+    async def async_step_official_mosquitto(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        del user_input
+        self._broker_kind = BrokerKind.OFFICIAL_MOSQUITTO
+        return await self.async_step_broker_profile()
+
+    async def async_step_existing_broker(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        del user_input
+        self._broker_kind = BrokerKind.EXISTING_BROKER
+        return await self.async_step_broker_profile()
+
+    async def async_step_broker_profile(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Normalize a masked profile before any validation or mutation."""
+        kind = self._broker_kind
+        entry = self._exact_registered_entry()
+        if kind is None or entry is None:
+            return self.async_abort(reason="invalid_parent")
+
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            self._broker_source = broker_form_source(user_input)
+            try:
+                current = FleetConfig.from_entry(entry).broker
+                pending_password = self._broker_values.get(CONF_MQTT_PASSWORD)
+                retained_password = (
+                    pending_password
+                    if isinstance(pending_password, str) and pending_password != SECRET_UNCHANGED
+                    else str(entry.data[CONF_MQTT_PASSWORD])
+                )
+                values = normalize_broker_input(
+                    kind,
+                    user_input,
+                    stored_password=retained_password,
+                )
+                candidate = BrokerProfile.from_mapping(values)
+            except FlowInputError as error:
+                errors = dict(error.errors)
+            except (EntryDataError, OperationError):
+                self._broker_failure = _panel_failure(
+                    "invalid_broker_profile",
+                    stage="broker_validation",
+                )
+            else:
+                if entry.subentries and not self._broker_transport_matches(
+                    values,
+                    current,
+                ):
+                    return self.async_abort(
+                        reason="broker_change_requires_guided_flow",
+                    )
+                self._broker_values = values
+                self._broker_profile = candidate
+                self._broker_expected_profile = current
+                self._broker_failure = None
+                self._broker_task = self.hass.async_create_task(
+                    _broker_validator(self.hass).async_validate(candidate),
+                    "brilliant-mqtt-options-broker-validation",
+                )
+                return await self.async_step_broker_validation()
+            if errors:
+                self._broker_failure = None
+
+        source = self._broker_source or dict(entry.data)
+        failure = self._broker_failure
+        return self.async_show_form(
+            step_id="broker_profile",
+            data_schema=broker_schema(
+                kind,
+                source,
+                reconfigure=True,
+            ),
+            errors=errors or ({"base": failure.code} if failure is not None else {}),
+            description_placeholders=(
+                failure.placeholders()
+                if failure is not None
+                else {"documentation_url": f"{_MQTT_DOCUMENTATION_URL}#mqtt-validation"}
+            ),
+        )
+
+    async def async_step_broker_validation(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Validate before committing one empty-fleet profile update."""
+        del user_input
+        task = self._broker_task
+        if task is None:
+            return self.async_abort(reason="invalid_flow_state")
+        if not task.done():
+            return self.async_show_progress(
+                step_id="broker_validation",
+                progress_action="broker_validation",
+                progress_task=task,
+            )
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            raise
+        except OperationError as error:
+            self._broker_failure = _operation_failure(error)
+        except Exception:
+            self._broker_failure = _panel_failure(
+                "broker_validation_failed",
+                stage="broker_validation",
+            )
+        finally:
+            self._broker_task = None
+        if self._broker_failure is not None:
+            return self.async_show_progress_done(next_step_id="broker_profile")
+        return self.async_show_progress_done(next_step_id="broker_commit")
+
+    async def async_step_broker_commit(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Commit runtime broker material only outside panel provisioning."""
+        del user_input
+        entry = self._exact_registered_entry()
+        if entry is None:
+            return self.async_abort(reason="invalid_parent")
+        candidate = self._broker_profile
+        expected = self._broker_expected_profile
+        if candidate is None or expected is None:
+            return self.async_abort(reason="invalid_flow_state")
+        try:
+            current = FleetConfig.from_entry(entry).broker
+        except EntryDataError:
+            return self.async_abort(reason="invalid_parent")
+        if current != expected:
+            return self.async_abort(reason="parent_changed")
+
+        runtime_change = not self._broker_transport_matches(
+            self._broker_values,
+            current,
+        )
+        if runtime_change:
+            async with _fleet_lock(self.hass):
+                entry = self._exact_registered_entry()
+                if entry is None:
+                    return self.async_abort(reason="invalid_parent")
+                try:
+                    current = FleetConfig.from_entry(entry).broker
+                except EntryDataError:
+                    return self.async_abort(reason="invalid_parent")
+                if current != expected:
+                    return self.async_abort(reason="parent_changed")
+                if entry.subentries:
+                    return self.async_abort(
+                        reason="broker_change_requires_guided_flow",
+                    )
+
+                journal_clear = await _async_provisioning_journal_clear(self.hass)
+
+                # The journal read yields to HA. Re-resolve every storage invariant
+                # and the active-flow registry afterward, then update synchronously
+                # while the shared provisioning lock is still held.
+                entry = self._exact_registered_entry()
+                if entry is None:
+                    return self.async_abort(reason="invalid_parent")
+                try:
+                    current = FleetConfig.from_entry(entry).broker
+                except EntryDataError:
+                    return self.async_abort(reason="invalid_parent")
+                if current != expected:
+                    return self.async_abort(reason="parent_changed")
+                if entry.subentries:
+                    return self.async_abort(
+                        reason="broker_change_requires_guided_flow",
+                    )
+                if not journal_clear or _same_entry_panel_add_flow_active(
+                    self.hass,
+                    entry.entry_id,
+                ):
+                    return self.async_abort(
+                        reason="broker_change_blocked_by_panel_onboarding",
+                    )
+                self._update_broker_entry(entry)
+        elif candidate != current:
+            # BrokerKind is persisted guidance only and has no runtime transport
+            # effect, so it cannot orphan an active or recoverable installation.
+            self._update_broker_entry(entry)
+        return self.async_abort(reason="reconfigure_successful")
+
+    @callback
+    def _update_broker_entry(self, entry: ConfigEntry[Any]) -> None:
+        """Synchronously replace only the canonical broker profile fields."""
+        updated = dict(entry.data)
+        for key in (
+            CONF_BROKER_KIND,
+            CONF_MQTT_HOST,
+            CONF_MQTT_PORT,
+            CONF_MQTT_USERNAME,
+            CONF_MQTT_PASSWORD,
+            CONF_MQTT_TLS_ENABLED,
+            CONF_MQTT_TLS_CA,
+        ):
+            updated.pop(key, None)
+        updated.update(self._broker_values)
+        self.hass.config_entries.async_update_entry(
+            entry,
+            data=updated,
+        )
+
+    def _fleet_config(self) -> FleetConfig | None:
+        """Return the exact current fleet snapshot or fail closed."""
+        entry = self._exact_registered_entry()
+        if entry is None:
+            return None
+        try:
+            return FleetConfig.from_entry(entry)
+        except EntryDataError:
+            return None
+
+    def _control_snapshot(self) -> dict[str, object]:
+        return {
+            key: copy.deepcopy(self.config_entry.data.get(key))
+            for key in (
+                CONF_HA_CONTROL_ENABLED,
+                CONF_HA_CONTROL_LABEL,
+                CONF_ROOM_OVERRIDES,
+                CONF_HA_CONTROL_DOMAINS,
+                CONF_MAX_MIRRORED_ENTITIES,
+            )
+        }
+
+    @staticmethod
+    def _panel_topology(
+        entry: ConfigEntry[Any],
+    ) -> tuple[tuple[str, PanelConfig], ...] | None:
+        panels: list[tuple[str, PanelConfig]] = []
+        try:
+            for subentry in _panel_subentries(entry):
+                panels.append(
+                    (
+                        subentry.subentry_id,
+                        PanelConfig.from_subentry(subentry),
+                    )
+                )
+        except EntryDataError:
+            return None
+        return tuple(sorted(panels, key=lambda item: item[0]))
+
+    def _scenes_snapshot(
+        self,
+        entry: ConfigEntry[Any],
+    ) -> tuple[object, ...] | None:
+        topology = self._panel_topology(entry)
+        if topology is None:
+            return None
+        return (
+            entry.data.get(CONF_SCENE_PANEL),
+            copy.deepcopy(entry.data.get(CONF_SCENE_ACTIONS)),
+            topology,
+        )
+
+    async def async_step_ha_control(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Update the five live HA-control globals on the fleet owner."""
+        fleet = self._fleet_config()
+        if fleet is None:
+            return self.async_abort(reason="invalid_parent")
+        current = self._control_snapshot()
+        if self._control_expected is None:
+            self._control_expected = current
+        elif current != self._control_expected:
+            return self.async_abort(reason="parent_changed")
+
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            try:
+                normalized = normalize_fleet_control_input(user_input)
+            except FlowInputError as error:
+                errors = dict(error.errors)
+            else:
+                if (
+                    self.config_entry.subentries
+                    and normalized[CONF_HA_CONTROL_ENABLED] != fleet.ha_control_enabled
+                ):
+                    return self.async_abort(
+                        reason="ha_control_change_requires_agent_rollout",
+                    )
+                latest = self._control_snapshot()
+                if latest != self._control_expected:
+                    return self.async_abort(reason="parent_changed")
+                self.hass.config_entries.async_update_entry(
+                    self.config_entry,
+                    data={
+                        **self.config_entry.data,
+                        **normalized,
+                    },
+                )
+                return self.async_abort(reason="reconfigure_successful")
+        return self.async_show_form(
+            step_id="ha_control",
+            data_schema=fleet_control_schema(self.config_entry.data),
+            errors=errors,
+        )
+
+    async def async_step_scenes(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Update scene ownership by subentry ID and actions by wire slug."""
+        entry = self._exact_registered_entry()
+        if entry is None:
+            return self.async_abort(reason="invalid_parent")
+        snapshot = self._scenes_snapshot(entry)
+        if snapshot is None:
+            return self.async_abort(reason="invalid_parent")
+        if self._scenes_expected is None:
+            if self._fleet_config() is None:
+                return self.async_abort(reason="invalid_parent")
+            self._scenes_expected = snapshot
+        elif snapshot != self._scenes_expected:
+            return self.async_abort(reason="parent_changed")
+
+        topology = cast(tuple[tuple[str, PanelConfig], ...], snapshot[2])
+        if not topology:
+            return self.async_abort(reason="no_panels_configured")
+        panel_ids = tuple(panel_id for panel_id, _panel in topology)
+        panel_slugs = tuple(panel.panel for _panel_id, panel in topology)
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            try:
+                normalized = normalize_fleet_scenes_input(
+                    user_input,
+                    panel_subentry_ids=panel_ids,
+                    panel_slugs=panel_slugs,
+                )
+            except FlowInputError as error:
+                errors = dict(error.errors)
+            else:
+                if self._scenes_snapshot(entry) != self._scenes_expected:
+                    return self.async_abort(reason="parent_changed")
+                self.hass.config_entries.async_update_entry(
+                    entry,
+                    data={
+                        **entry.data,
+                        **normalized,
+                    },
+                )
+                return self.async_abort(reason="reconfigure_successful")
+        return self.async_show_form(
+            step_id="scenes",
+            data_schema=fleet_scenes_schema(
+                entry.data,
+                panel_subentry_ids=panel_ids,
+            ),
+            errors=errors,
+        )
+
+    async def async_step_fleet_defaults(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Persist the three fleet-wide resilience defaults in entry options."""
+        if self._fleet_config() is None:
+            return self.async_abort(reason="invalid_parent")
+        current = dict(self.config_entry.options)
+        if self._defaults_expected is None:
+            self._defaults_expected = current
+        elif current != self._defaults_expected:
+            return self.async_abort(reason="parent_changed")
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            try:
+                normalized = normalize_fleet_defaults_input(user_input)
+            except FlowInputError as error:
+                errors = dict(error.errors)
+            else:
+                if dict(self.config_entry.options) != self._defaults_expected:
+                    return self.async_abort(reason="parent_changed")
+                return self.async_create_entry(
+                    title="",
+                    data=normalized,
+                )
+        return self.async_show_form(
+            step_id="fleet_defaults",
+            data_schema=fleet_defaults_schema(self.config_entry.options),
+            errors=errors,
+        )
+
+    async def async_step_advanced(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Expose advanced fleet operations without unsafe direct mutation."""
+        del user_input
+        if self._fleet_config() is None:
+            return self.async_abort(reason="invalid_parent")
+        return self.async_show_menu(
+            step_id="advanced",
+            menu_options=("mesh_priorities",),
+        )
+
+    async def async_step_mesh_priorities(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Defer mesh env mutation until it has a journaled agent rollout."""
+        del user_input
+        if self._fleet_config() is None:
+            return self.async_abort(reason="invalid_parent")
+        return self.async_abort(
+            reason="mesh_priority_change_requires_agent_rollout",
         )
 
 

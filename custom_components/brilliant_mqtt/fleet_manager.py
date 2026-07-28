@@ -54,6 +54,7 @@ from .const import (
     DOMAIN,
     ENTRY_KIND_FLEET,
     ENTRY_KIND_LEGACY_PENDING_CONSOLIDATION,
+    EVENT_PANEL_REBOUND,
     FLEET_SCENE_OWNER_UNASSIGNED,
     FLEET_UNIQUE_ID,
     SUBENTRY_TYPE_PANEL,
@@ -66,7 +67,7 @@ from .entry_data import (
     PanelConfig,
     PanelConfigStore,
 )
-from .manager import PanelManager
+from .manager import PanelManager, async_delete_panel_issues
 from .panel_health import PanelHealthObserver
 from .panel_inspection import async_inspect_panel
 from .panel_provisioner import (
@@ -97,6 +98,12 @@ _RUNTIME_SETUP_ISSUE_REASON = (
     "No panel runtime could start. Home Assistant will retry automatically; "
     "verify MQTT connectivity and review the integration logs."
 )
+_REBIND_STORAGE_ISSUE_REASON = (
+    "Home Assistant could not prove whether the previous panel identity was restored "
+    "in durable storage. Do not operate or retry either panel until storage is healthy "
+    "and the saved panel identity has been inspected or reloaded. If the previous "
+    "identity is restored, run Replace physical panel again."
+)
 _PENDING_SCENE_OWNER_PREFIX = "pending-provisioning:"
 _PROVISIONING_REPAIR_REASON = (
     "Automatic provisioning rollback did not finish. Retry panel onboarding or "
@@ -104,7 +111,7 @@ _PROVISIONING_REPAIR_REASON = (
 )
 _CONFIG_ENTRIES_STORAGE_FILE = ".storage/core.config_entries"
 _CONFIG_ENTRY_PERSISTENCE_TIMEOUT_SECONDS = 5.0
-_CONFIG_ENTRY_PERSISTENCE_POLL_SECONDS = 0.05
+_CONFIG_ENTRY_PERSISTENCE_POLL_SECONDS = 0.25
 
 
 def pending_scene_owner(transaction_id: UUID) -> str:
@@ -122,12 +129,64 @@ def _provisioning_repair_issue_id(transaction_id: UUID) -> str:
     return f"provisioning_rollback_{transaction_id.hex}"
 
 
+def _fleet_storage_issue_id(entry_id: str) -> str:
+    return f"fleet_storage_{entry_id}"
+
+
+@callback
+def _async_create_fleet_storage_issue(
+    hass: HomeAssistant,
+    entry_id: str,
+) -> None:
+    """Keep unknown config-entry ownership visible without exposing storage errors."""
+    ir.async_create_issue(
+        hass,
+        DOMAIN,
+        _fleet_storage_issue_id(entry_id),
+        is_fixable=False,
+        severity=ir.IssueSeverity.ERROR,
+        translation_key="needs_attention",
+        translation_placeholders={
+            "panel": "Brilliant MQTT fleet",
+            "reason": _REBIND_STORAGE_ISSUE_REASON,
+        },
+        learn_more_url=(
+            "https://github.com/joyfulhouse/brilliant-mqtt/blob/main/docs/ha-integration.md"
+        ),
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class _PendingHandoff:
     """Exact stored ownership awaiting runtime proof and journal completion."""
 
     record: ProvisioningRecord
     subentry_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingControlPlaneReload:
+    """One generation-bound target awaiting successful control-plane publication."""
+
+    generation: int
+    target: tuple[object, ...]
+
+
+def _control_plane_snapshot(
+    fleet: FleetConfig,
+    panels: Mapping[str, PanelConfig],
+) -> tuple[object, ...]:
+    """Return only entry data consumed by HA-control and scene routing."""
+    return (
+        fleet.ha_control_enabled,
+        fleet.ha_control_label,
+        fleet.room_overrides,
+        fleet.ha_control_domains,
+        fleet.max_mirrored_entities,
+        fleet.scene_panel,
+        fleet.scene_actions,
+        tuple(sorted((panel_id, config.panel) for panel_id, config in panels.items())),
+    )
 
 
 class _ProvisioningRepairReporter:
@@ -219,15 +278,14 @@ def _matches_record_fleet(
     entry: ConfigEntry[Any],
     record: ProvisioningRecord,
 ) -> bool:
-    """Bind a stored panel owner to the journal's exact non-secret MQTT fleet."""
+    """Bind a stored panel owner to the journal's exact MQTT transport."""
     try:
         broker = BrokerProfile.from_mapping(entry.data)
     except ValueError:
         return False
     expected = record.fleet_profile
     return (
-        broker.kind is expected.kind
-        and broker.host == expected.host
+        broker.host == expected.host
         and broker.port == expected.port
         and broker.tls_enabled is expected.tls_enabled
     )
@@ -441,11 +499,19 @@ async def async_wait_config_entry_persisted(
 async def _async_duplicate_fingerprint(
     hass: HomeAssistant,
     fingerprint: str,
+    *,
+    exclude_entry_id: str | None = None,
+    exclude_subentry_id: str | None = None,
 ) -> bool:
     """Recheck every persisted fleet and legacy pin immediately before writes."""
     for entry in hass.config_entries.async_entries(DOMAIN):
         for subentry in entry.subentries.values():
-            if subentry.data.get(CONF_IDENTITY_FINGERPRINT) == fingerprint:
+            if entry.entry_id == exclude_entry_id and subentry.subentry_id == exclude_subentry_id:
+                continue
+            if (
+                subentry.data.get(CONF_IDENTITY_FINGERPRINT) == fingerprint
+                or subentry.data.get(CONF_MANAGEMENT_ID) == fingerprint
+            ):
                 return True
         public_key = entry.data.get(CONF_SSH_HOST_KEY)
         if not isinstance(public_key, str):
@@ -846,6 +912,8 @@ class FleetManager:
         self._panel_configs: dict[str, PanelConfig] = {}
         self._runtime_owned_panel_ids: set[str] = set()
         self._pending_handoff: _PendingHandoff | None = None
+        self._control_plane_reload_generation = 0
+        self._pending_control_plane_reload: _PendingControlPlaneReload | None = None
         self._recovery_task: asyncio.Task[None] | None = None
         self._recovery_transaction_id: UUID | None = None
         self._fleet: FleetConfig | None = None
@@ -1211,6 +1279,7 @@ class FleetManager:
             slugs: set[str] = set()
             fingerprints: set[str] = set()
             management_ids: set[str] = set()
+            positive_mesh_priorities: set[int] = set()
             for subentry in self.entry.subentries.values():
                 config = PanelConfig.from_subentry(subentry)
                 if config.ssh_username != "root":
@@ -1228,9 +1297,13 @@ class FleetManager:
                     raise EntryDataError("duplicate_panel_fingerprint")
                 if config.management_id in management_ids:
                     raise EntryDataError("duplicate_panel_management_id")
+                if config.mesh_priority > 0 and config.mesh_priority in positive_mesh_priorities:
+                    raise EntryDataError("duplicate_panel_mesh_priority")
                 slugs.add(config.panel)
                 fingerprints.add(config.identity_fingerprint)
                 management_ids.add(config.management_id)
+                if config.mesh_priority > 0:
+                    positive_mesh_priorities.add(config.mesh_priority)
                 fleet_store = FleetPanelStore(self.hass, self.entry, subentry)
                 built[fleet_store.panel_id] = (fleet_store, config)
             if built and fleet.scene_panel not in built:
@@ -1302,13 +1375,19 @@ class FleetManager:
         self,
         managers: Iterable[PanelManager],
     ) -> None:
-        """Drain every removed runtime and surface the first cleanup failure."""
-        failures = await _async_drain(manager.async_shutdown() for manager in managers)
+        """Drain removed runtimes, delete their issues, and surface cleanup failure."""
+        removed = tuple(managers)
+        failures = await _async_drain(manager.async_shutdown() for manager in removed)
+        for manager in removed:
+            try:
+                async_delete_panel_issues(self.hass, manager.management_id)
+            except BaseException as error:
+                failures.append(error)
         if not failures:
             return
         for failure in failures[1:]:
             _LOGGER.warning(
-                "Additional removed-panel shutdown failed (%s)",
+                "Additional removed-panel cleanup failed (%s)",
                 type(failure).__name__,
             )
         raise failures[0]
@@ -1513,6 +1592,18 @@ class FleetManager:
                 for panel_id, manager in self._panels.items()
                 if panel_id not in built
             )
+            panel_configs = {
+                panel_id: config
+                for panel_id, (_store, config) in built.items()
+                if config is not None
+            }
+            control_plane_target = _control_plane_snapshot(fleet, panel_configs)
+            control_plane_changed = (
+                not legacy
+                and self._fleet is not None
+                and _control_plane_snapshot(self._fleet, self._panel_configs)
+                != control_plane_target
+            )
 
             self._fleet = fleet
             for panel_id, (store, _config) in built.items():
@@ -1523,16 +1614,292 @@ class FleetManager:
                 self._runtime_owned_panel_ids.discard(panel_id)
             self._panels.update(staged)
 
-            self._panel_configs = {
-                panel_id: config
-                for panel_id, (_store, config) in built.items()
-                if config is not None
-            }
-            if removed:
-                await _async_settle_cleanup(
-                    self._async_shutdown_removed(tuple(manager for _panel_id, manager in removed))
+            self._panel_configs = panel_configs
+            control_plane_reload_attempt: _PendingControlPlaneReload | None = None
+            if not legacy and (
+                control_plane_changed or self._pending_control_plane_reload is not None
+            ):
+                self._control_plane_reload_generation += 1
+                control_plane_reload_attempt = _PendingControlPlaneReload(
+                    self._control_plane_reload_generation,
+                    control_plane_target,
                 )
-            return await self._async_complete_pending_handoff()
+                self._pending_control_plane_reload = control_plane_reload_attempt
+            try:
+                if removed:
+                    await _async_settle_cleanup(
+                        self._async_shutdown_removed(
+                            tuple(manager for _panel_id, manager in removed)
+                        )
+                    )
+                entry_reload_required = await self._async_complete_pending_handoff()
+            except asyncio.CancelledError:
+                if control_plane_reload_attempt is not None and not self._shutting_down:
+                    self._async_schedule_reload_once()
+                raise
+            except ConfigEntryNotReady:
+                raise
+            except Exception:
+                raise ConfigEntryNotReady(
+                    "Fleet post-update cleanup is temporarily unavailable"
+                ) from None
+
+        if control_plane_reload_attempt is not None:
+            from .ha_control import get_control_plane
+
+            try:
+                await get_control_plane(self.hass).async_reload_settings()
+                async with self._lifecycle_lock:
+                    if (
+                        self._pending_control_plane_reload == control_plane_reload_attempt
+                        and self._fleet is not None
+                        and _control_plane_snapshot(self._fleet, self._panel_configs)
+                        == control_plane_reload_attempt.target
+                    ):
+                        self._pending_control_plane_reload = None
+            except asyncio.CancelledError:
+                if not self._shutting_down:
+                    self._async_schedule_reload_once()
+                raise
+            except Exception:
+                raise ConfigEntryNotReady(
+                    "Control-plane settings reload is temporarily unavailable"
+                ) from None
+        return entry_reload_required
+
+    async def _async_restore_rebind_snapshot(
+        self,
+        subentry_id: str,
+        *,
+        data: Mapping[str, Any],
+        title: str,
+        unique_id: str | None,
+    ) -> None:
+        """Restore and prove the exact pre-rebind subentry snapshot."""
+        try:
+            subentry = self.entry.subentries.get(subentry_id)
+            if subentry is None:
+                raise ConfigEntryPersistenceError
+            self.hass.config_entries.async_update_subentry(
+                self.entry,
+                subentry,
+                data=dict(data),
+                title=title,
+                unique_id=unique_id,
+            )
+            if subentry.data != data or subentry.title != title or subentry.unique_id != unique_id:
+                raise ConfigEntryPersistenceError
+            await async_wait_config_entry_persisted(
+                self.hass,
+                self.entry,
+                subentry_id=subentry_id,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _async_create_fleet_storage_issue(self.hass, self.entry.entry_id)
+            raise ConfigEntryPersistenceError from None
+        ir.async_delete_issue(
+            self.hass,
+            DOMAIN,
+            _fleet_storage_issue_id(self.entry.entry_id),
+        )
+
+    async def _async_settle_rebind_rollback(
+        self,
+        subentry_id: str,
+        *,
+        data: Mapping[str, Any],
+        title: str,
+        unique_id: str | None,
+    ) -> None:
+        """Finish an exact rollback despite caller cancellation."""
+        try:
+            await _async_settle_cleanup(
+                self._async_restore_rebind_snapshot(
+                    subentry_id,
+                    data=data,
+                    title=title,
+                    unique_id=unique_id,
+                )
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _LOGGER.warning("Panel rebind rollback persistence could not be proven")
+
+    def _rebind_snapshot(
+        self,
+        subentry_id: str,
+        expected: PanelConfig,
+    ) -> tuple[FleetConfig, PanelManager, ConfigSubentry]:
+        """Return one exact live rebind target while both operation locks are held."""
+        if (
+            self._shutting_down
+            or self._legacy
+            or self._fleet is None
+            or self.entry.data.get(CONF_ENTRY_KIND) != ENTRY_KIND_FLEET
+            or self.hass.config_entries.async_get_entry(self.entry.entry_id) is not self.entry
+            or self._pending_handoff is not None
+        ):
+            raise EntryDataError("panel_rebind_unavailable")
+
+        fleet, built, legacy = self._build_stores()
+        manager = self._panels.get(subentry_id)
+        built_panel = built.get(subentry_id)
+        if legacy or manager is None or built_panel is None:
+            raise EntryDataError("panel_rebind_unavailable")
+        _store, current = built_panel
+        if current is None:
+            raise EntryDataError("panel_rebind_unavailable")
+        if (
+            fleet != self._fleet
+            or current != expected
+            or self._panel_configs.get(subentry_id) != expected
+            or current.provisioning_transaction_id is not None
+        ):
+            raise EntryDataError("panel_snapshot_changed")
+
+        subentry = self.entry.subentries.get(subentry_id)
+        if subentry is None:
+            raise EntryDataError("panel_rebind_unavailable")
+        if subentry.title != current.name:
+            raise EntryDataError("panel_snapshot_changed")
+        return fleet, manager, subentry
+
+    async def _async_assert_rebind_journal_clear(self) -> None:
+        """Fail closed unless no global panel transaction owns durable recovery."""
+        try:
+            record = await ProvisioningJournal(self.hass).async_load()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            raise EntryDataError("panel_rebind_blocked_by_panel_onboarding") from None
+        if record is not None:
+            raise EntryDataError("panel_rebind_blocked_by_panel_onboarding")
+
+    async def async_rebind_panel(
+        self,
+        subentry_id: str,
+        expected: PanelConfig,
+        *,
+        host: str,
+        root_password: str,
+        candidate: HostIdentity,
+    ) -> None:
+        """Durably replace one explicitly verified panel identity."""
+        async with self._lifecycle_lock, self._ssh_lock:
+            await self._async_assert_rebind_journal_clear()
+            fleet, manager, subentry = self._rebind_snapshot(subentry_id, expected)
+            if await _async_duplicate_fingerprint(
+                self.hass,
+                candidate.fingerprint,
+                exclude_entry_id=self.entry.entry_id,
+                exclude_subentry_id=subentry_id,
+            ):
+                raise EntryDataError("duplicate_panel_fingerprint")
+
+            try:
+                verified = await async_verify_host_identity(host, candidate)
+            except asyncio.CancelledError:
+                raise
+            except PanelIdentityError as error:
+                code = (
+                    "panel_rebind_identity_changed"
+                    if str(error) == "host_key_changed"
+                    else "panel_rebind_identity_unreachable"
+                )
+                raise EntryDataError(code) from None
+            except Exception:
+                raise EntryDataError("panel_rebind_identity_unreachable") from None
+            if verified != candidate:
+                raise EntryDataError("panel_rebind_identity_changed")
+
+            await self._async_assert_rebind_journal_clear()
+            fleet, manager, subentry = self._rebind_snapshot(subentry_id, expected)
+            if await _async_duplicate_fingerprint(
+                self.hass,
+                candidate.fingerprint,
+                exclude_entry_id=self.entry.entry_id,
+                exclude_subentry_id=subentry_id,
+            ):
+                raise EntryDataError("duplicate_panel_fingerprint")
+
+            original_data = dict(subentry.data)
+            original_title = subentry.title
+            original_unique_id = subentry.unique_id
+            rebound_data = {
+                **original_data,
+                CONF_HOST: host,
+                CONF_ROOT_PASSWORD: root_password,
+                CONF_IDENTITY_FINGERPRINT: candidate.fingerprint,
+                CONF_SSH_HOST_KEY: candidate.public_key,
+            }
+            rebound_subentry = ConfigSubentry(
+                data=MappingProxyType(rebound_data),
+                subentry_id=subentry.subentry_id,
+                subentry_type=subentry.subentry_type,
+                title=subentry.title,
+                unique_id=candidate.fingerprint,
+            )
+            rebound = PanelConfig.from_subentry(rebound_subentry)
+
+            try:
+                changed = self.hass.config_entries.async_update_subentry(
+                    self.entry,
+                    subentry,
+                    data=rebound_data,
+                    unique_id=candidate.fingerprint,
+                )
+            except Exception:
+                await self._async_settle_rebind_rollback(
+                    subentry_id,
+                    data=original_data,
+                    title=original_title,
+                    unique_id=original_unique_id,
+                )
+                raise ConfigEntryPersistenceError from None
+            if not changed:
+                raise EntryDataError("panel_snapshot_changed")
+
+            try:
+                await async_wait_config_entry_persisted(
+                    self.hass,
+                    self.entry,
+                    subentry_id=subentry_id,
+                )
+            except asyncio.CancelledError:
+                await self._async_settle_rebind_rollback(
+                    subentry_id,
+                    data=original_data,
+                    title=original_title,
+                    unique_id=original_unique_id,
+                )
+                raise
+            except Exception:
+                await self._async_settle_rebind_rollback(
+                    subentry_id,
+                    data=original_data,
+                    title=original_title,
+                    unique_id=original_unique_id,
+                )
+                raise ConfigEntryPersistenceError from None
+
+            ir.async_delete_issue(
+                self.hass,
+                DOMAIN,
+                _fleet_storage_issue_id(self.entry.entry_id),
+            )
+            store = FleetPanelStore(self.hass, self.entry, subentry)
+            manager.update_config(store, fleet)
+            self._panel_configs[subentry_id] = rebound
+            manager._fire(
+                EVENT_PANEL_REBOUND,
+                {
+                    "old_fingerprint": expected.identity_fingerprint,
+                    "new_fingerprint": rebound.identity_fingerprint,
+                },
+            )
 
     async def async_panel_added(self, subentry_id: str) -> None:
         """Reconcile a newly persisted panel subentry."""

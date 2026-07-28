@@ -7,6 +7,7 @@ import json
 import time
 from collections.abc import Callable, Mapping
 from datetime import timedelta
+from types import MappingProxyType
 from typing import Any
 from unittest.mock import patch
 from uuid import UUID, uuid4
@@ -15,7 +16,8 @@ import pytest
 from homeassistant.components import mqtt
 from homeassistant.components.cover import CoverEntityFeature
 from homeassistant.components.light import ATTR_SUPPORTED_COLOR_MODES
-from homeassistant.const import ATTR_SUPPORTED_FEATURES
+from homeassistant.config_entries import ConfigSubentry
+from homeassistant.const import ATTR_SUPPORTED_FEATURES, CONF_NAME
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.helpers import area_registry as ar
 from homeassistant.helpers import device_registry as dr
@@ -29,16 +31,43 @@ from pytest_homeassistant_custom_component.common import (
 )
 from pytest_homeassistant_custom_component.typing import MqttMockHAClient
 
+from custom_components.brilliant_mqtt.broker import BrokerKind
 from custom_components.brilliant_mqtt.const import (
+    COMPONENT_BRIDGE,
+    CONF_BROKER_KIND,
+    CONF_COMPONENTS,
+    CONF_ENTRY_KIND,
+    CONF_FEATURE_OVERRIDES,
     CONF_HA_CONTROL_DOMAINS,
     CONF_HA_CONTROL_ENABLED,
     CONF_HA_CONTROL_LABEL,
     CONF_HA_MIRROR_LABEL,
+    CONF_HOST,
+    CONF_IDENTITY_FINGERPRINT,
+    CONF_MANAGEMENT_ID,
     CONF_MAX_MIRRORED_ENTITIES,
+    CONF_MESH_PRIORITY,
+    CONF_MQTT_HOST,
+    CONF_MQTT_PASSWORD,
+    CONF_MQTT_PORT,
+    CONF_MQTT_TLS_ENABLED,
+    CONF_MQTT_USERNAME,
+    CONF_NEXT_MESH_PRIORITY,
     CONF_PANEL,
     CONF_ROOM_OVERRIDES,
+    CONF_ROOT_PASSWORD,
+    CONF_SCENE_ACTIONS,
+    CONF_SCENE_PANEL,
+    CONF_SCHEMA_VERSION,
+    CONF_SSH_HOST_KEY,
+    CONF_SSH_USERNAME,
+    CONFIG_ENTRY_VERSION,
     DOMAIN,
+    ENTRY_KIND_FLEET,
+    FLEET_UNIQUE_ID,
+    SUBENTRY_TYPE_PANEL,
 )
+from custom_components.brilliant_mqtt.entry_data import EntryDataError
 from custom_components.brilliant_mqtt.ha_control import get_control_plane
 from custom_components.brilliant_mqtt.ha_control_manifest import build_manifest
 from custom_components.brilliant_mqtt.ha_control_protocol import (
@@ -88,6 +117,66 @@ def _entry(
             CONF_MAX_MIRRORED_ENTITIES: maximum,
             CONF_ROOM_OVERRIDES: dict(overrides or {}),
         },
+    )
+    entry.add_to_hass(hass)
+    return entry
+
+
+def _fleet_panel(slug: str, subentry_id: str, priority: int) -> ConfigSubentry:
+    fingerprint = f"SHA256:{slug}"
+    return ConfigSubentry(
+        data=MappingProxyType(
+            {
+                CONF_IDENTITY_FINGERPRINT: fingerprint,
+                CONF_SSH_HOST_KEY: f"ssh-ed25519 AAAA-{slug}",
+                CONF_HOST: f"{slug}.iot.example",
+                CONF_SSH_USERNAME: "root",
+                CONF_ROOT_PASSWORD: f"{slug}-secret",
+                CONF_NAME: slug.title(),
+                CONF_PANEL: slug,
+                CONF_MANAGEMENT_ID: fingerprint,
+                CONF_COMPONENTS: {COMPONENT_BRIDGE: True},
+                CONF_FEATURE_OVERRIDES: {},
+                CONF_MESH_PRIORITY: priority,
+            }
+        ),
+        subentry_id=subentry_id,
+        subentry_type=SUBENTRY_TYPE_PANEL,
+        title=slug.title(),
+        unique_id=fingerprint,
+    )
+
+
+def _fleet_entry(
+    hass: HomeAssistant,
+    *panels: ConfigSubentry,
+    scene_panel: str,
+    scene_actions: Mapping[str, object] | None = None,
+) -> MockConfigEntry:
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Brilliant MQTT",
+        unique_id=FLEET_UNIQUE_ID,
+        version=CONFIG_ENTRY_VERSION,
+        data={
+            CONF_ENTRY_KIND: ENTRY_KIND_FLEET,
+            CONF_BROKER_KIND: BrokerKind.EXISTING_BROKER.value,
+            CONF_MQTT_HOST: "mqtt.example.com",
+            CONF_MQTT_PORT: 1883,
+            CONF_MQTT_USERNAME: "brilliant",
+            CONF_MQTT_PASSWORD: "fleet-secret",
+            CONF_MQTT_TLS_ENABLED: False,
+            CONF_NEXT_MESH_PRIORITY: len(panels) + 1,
+            CONF_HA_CONTROL_ENABLED: True,
+            CONF_HA_CONTROL_LABEL: "brilliant",
+            CONF_ROOM_OVERRIDES: {},
+            CONF_HA_CONTROL_DOMAINS: list(ALL_DOMAINS),
+            CONF_MAX_MIRRORED_ENTITIES: 50,
+            CONF_SCENE_PANEL: scene_panel,
+            CONF_SCENE_ACTIONS: dict(scene_actions or {}),
+            CONF_SCHEMA_VERSION: CONFIG_ENTRY_VERSION,
+        },
+        subentries_data=[panel.as_dict() for panel in panels],
     )
     entry.add_to_hass(hass)
     return entry
@@ -202,6 +291,102 @@ async def test_disabled_entries_keep_a_dormant_singleton(
 
     await plane.async_detach(disabled.entry_id)
     assert plane.started is False
+
+
+@pytest.mark.allow_lingering_timers
+async def test_fleet_attach_and_reload_resolve_subentry_scene_owner_to_wire_slug(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+) -> None:
+    office = _fleet_panel("office", "runtime-office", 1)
+    kitchen = _fleet_panel("kitchen", "runtime-kitchen", 2)
+    kitchen_actions: dict[str, object] = {
+        "kitchen:all_off": {
+            "domain": "light",
+            "service": "turn_off",
+            "target": {"area_id": "kitchen"},
+            "data": {},
+        }
+    }
+    entry = _fleet_entry(
+        hass,
+        office,
+        kitchen,
+        scene_panel=kitchen.subentry_id,
+        scene_actions=kitchen_actions,
+    )
+    plane = get_control_plane(hass)
+
+    await plane.async_attach(entry)
+
+    assert CONF_PANEL not in entry.data
+    assert plane.scene_control.attached_panels == frozenset({"office", "kitchen"})
+    assert plane.scene_control.default_panel == "kitchen"
+    panels, default_panel, actions = plane._scene_runtime_settings(entry)
+    assert panels == frozenset({"office", "kitchen"})
+    assert default_panel == "kitchen"
+    assert actions == kitchen_actions
+    assert set(actions) == {"kitchen:all_off"}
+
+    office_actions: dict[str, object] = {
+        "office:all_off": {
+            "domain": "light",
+            "service": "turn_off",
+            "target": {"area_id": "office"},
+            "data": {},
+        }
+    }
+    hass.config_entries.async_update_entry(
+        entry,
+        data={
+            **entry.data,
+            CONF_SCENE_PANEL: office.subentry_id,
+            CONF_SCENE_ACTIONS: office_actions,
+        },
+    )
+    await plane.async_reload_settings()
+
+    assert plane.scene_control.attached_panels == frozenset({"office", "kitchen"})
+    assert plane.scene_control.default_panel == "office"
+    panels, default_panel, actions = plane._scene_runtime_settings(entry)
+    assert panels == frozenset({"office", "kitchen"})
+    assert default_panel == "office"
+    assert actions == office_actions
+    assert set(actions) == {"office:all_off"}
+    await plane.async_detach(entry.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
+@pytest.mark.parametrize(
+    ("scene_owner", "error_code"),
+    (
+        (None, "invalid_fleet_entry_data"),
+        ("", "invalid_entry_data"),
+        ("foreign-panel-runtime", "invalid_scene_panel"),
+    ),
+)
+async def test_fleet_attach_rejects_missing_invalid_or_foreign_scene_owner(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    scene_owner: str | None,
+    error_code: str,
+) -> None:
+    del mqtt_mock
+    office = _fleet_panel("office", "runtime-office", 1)
+    entry = _fleet_entry(hass, office, scene_panel=office.subentry_id)
+    data = dict(entry.data)
+    if scene_owner is None:
+        del data[CONF_SCENE_PANEL]
+    else:
+        data[CONF_SCENE_PANEL] = scene_owner
+    hass.config_entries.async_update_entry(entry, data=data)
+    plane = get_control_plane(hass)
+
+    with pytest.raises(EntryDataError, match=error_code):
+        await plane.async_attach(entry)
+
+    assert plane.started is False
+    assert plane.scene_control.attached_panels == frozenset()
 
 
 @pytest.mark.allow_lingering_timers
@@ -1387,9 +1572,10 @@ async def test_service_failure_result_is_sanitized(
     hass: HomeAssistant, mqtt_mock: MqttMockHAClient, caplog: pytest.LogCaptureFixture
 ) -> None:
     entity = _selected_entity(hass, "switch.controlled")
+    secret = "MQTT_PASSWORD=service-secret-canary"
 
     async def fail(_call: ServiceCall) -> None:
-        raise RuntimeError("secret\nsecond line")
+        raise RuntimeError(f"{secret}\nsecond line")
 
     hass.services.async_register("switch", "turn_on", fail)
     plane = get_control_plane(hass)
@@ -1405,7 +1591,8 @@ async def test_service_failure_result_is_sanitized(
     result = _payload(result_call)
     assert result["accepted"] is False
     assert result["error"] == "service_call_failed"
-    assert "secret" not in result_call.args[1]
+    assert secret not in result_call.args[1]
     assert "RuntimeError" in caplog.text
-    assert "secret second line" in caplog.text
+    assert secret not in caplog.text
+    assert "second line" not in caplog.text
     await plane.async_detach(entry.entry_id)

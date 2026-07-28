@@ -169,8 +169,7 @@ async def test_update_step_failure_raises_translated_update_failed(
     mqtt_mock: MqttMockHAClient,
     payload_dir: Path,
 ) -> None:
-    """A failed update step raises HomeAssistantError(translation_key='update_failed')
-    with the underlying error as a placeholder, and escalates a repair issue."""
+    """A failed update step raises a redacted translated error and repair issue."""
     from custom_components.brilliant_mqtt.shell import RunResult
 
     shell = FakeShell(responses={"systemctl restart brilliant-mqtt": RunResult(1, "", "boom")})
@@ -190,7 +189,8 @@ async def test_update_step_failure_raises_translated_update_failed(
     assert err.value.translation_domain == DOMAIN
     assert err.value.translation_key == "update_failed"
     assert err.value.translation_placeholders is not None
-    assert "boom" in err.value.translation_placeholders["error"]
+    assert err.value.translation_placeholders["error"] == ("agent update failed during deployment")
+    assert "boom" not in repr(err.value.translation_placeholders)
     # The same outage was surfaced as a repair issue.
     issue = ir.async_get(hass).async_get_issue(DOMAIN, f"needs_attention_{entry.entry_id}")
     assert issue is not None
@@ -216,7 +216,10 @@ async def test_uninstall_failure_raises_translated_uninstall_failed(
     assert err.value.translation_domain == DOMAIN
     assert err.value.translation_key == "uninstall_failed"
     assert err.value.translation_placeholders is not None
-    assert "unreachable" in err.value.translation_placeholders["error"]
+    assert err.value.translation_placeholders["error"] == (
+        "agent uninstall could not connect to the panel"
+    )
+    assert "unreachable" not in repr(err.value.translation_placeholders)
     # The same failure was surfaced as a repair issue.
     issue = ir.async_get(hass).async_get_issue(DOMAIN, f"needs_attention_{entry.entry_id}")
     assert issue is not None

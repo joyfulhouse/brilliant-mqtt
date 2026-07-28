@@ -371,8 +371,8 @@ async def test_reboot_button_captures_diagnostics_then_reboots(
     await hass.async_block_till_done()
 
     assert "reboot" in fake_shell.commands  # the panel was rebooted
-    # The button always captures diagnostics first (the panel journal is volatile), so a
-    # bundle landed under <config>/brilliant_mqtt/diagnostics/office/.
+    # The button always captures a typed summary first (the panel journal is volatile),
+    # so a summary landed under <config>/brilliant_mqtt/diagnostics/office/.
     assert _diagnostics_written(hass)
 
     assert await hass.config_entries.async_unload(entry.entry_id)

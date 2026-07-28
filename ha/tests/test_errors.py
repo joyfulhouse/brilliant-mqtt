@@ -16,6 +16,7 @@ from aiomqtt.exceptions import MqttConnectError, MqttError
 from paho.mqtt.packettypes import PacketTypes
 from paho.mqtt.reasoncodes import ReasonCode
 
+from custom_components.brilliant_mqtt import errors as operation_errors
 from custom_components.brilliant_mqtt.errors import (
     OperationError,
     OperationStage,
@@ -64,6 +65,41 @@ def test_panel_settings_documentation_slug_has_a_matching_anchor() -> None:
     ).read_text(encoding="utf-8")
 
     assert '<a id="mqtt-panel-configuration"></a>' in documentation
+
+
+def test_every_operation_error_documentation_slug_has_a_matching_anchor() -> None:
+    documentation = (
+        Path(__file__).resolve().parents[2] / "docs" / "install" / "mqtt-broker.md"
+    ).read_text(encoding="utf-8")
+
+    for metadata in operation_errors._ERROR_METADATA.values():
+        assert f'<a id="{metadata.documentation_slug}"></a>' in documentation
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "code"),
+    (
+        ("install/mqtt-broker.md", "invalid_broker_profile"),
+        ("install/mqtt-broker.md", "broker_validation_failed"),
+        ("ha-integration.md", "inspection_failed"),
+        ("ha-integration.md", "provisioning_failed"),
+        ("ha-integration.md", "rebind_identity_unchanged"),
+    ),
+)
+def test_reachable_fallback_error_has_actionable_documentation(
+    relative_path: str,
+    code: str,
+) -> None:
+    documentation = (Path(__file__).resolve().parents[2] / "docs" / relative_path).read_text(
+        encoding="utf-8"
+    )
+    anchor = f'<a id="{code}"></a>'
+    start = documentation.index(anchor)
+    next_anchor = documentation.find("\n<a id=", start + len(anchor))
+    section = documentation[start : next_anchor if next_anchor >= 0 else None]
+
+    for label in ("Cause", "Check", "Fix", "Retry"):
+        assert f"- **{label}:**" in section
 
 
 @pytest.mark.parametrize(

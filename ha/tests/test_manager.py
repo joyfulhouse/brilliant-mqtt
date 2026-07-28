@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 from datetime import timedelta
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
@@ -49,6 +51,9 @@ from custom_components.brilliant_mqtt.const import (
     DATA_SSH_HOST_KEY,
     DOMAIN,
     EVENT_TYPE,
+    OPT_AUTO_REPAIR,
+    OPT_OFFLINE_GRACE_MINUTES,
+    OPT_REPAIR_COOLDOWN_MINUTES,
     OPT_TRUST_HOST_KEY_CHANGES,
     PANEL_HA_MIRROR_ENV_FILE,
     PANEL_HA_MIRROR_UNIT_FILE,
@@ -73,6 +78,8 @@ from custom_components.brilliant_mqtt.shell import (
 from tests.conftest import REPIN_NEW_KEY, RepinShells
 from tests.fakes import FakeShell
 from tests.test_init import ENTRY_DATA
+
+_SECRET_FAILURE_CANARY = "MQTT_PASSWORD=manager-outward-secret"
 
 
 async def _setup(hass: HomeAssistant) -> MockConfigEntry:
@@ -110,6 +117,7 @@ def _fleet_panel_manager(
     hass: HomeAssistant,
     *,
     feature_overrides: dict[str, Any] | None = None,
+    fleet_options: dict[str, Any] | None = None,
     fleet_overrides: dict[str, Any] | None = None,
     panel_overrides: dict[str, Any] | None = None,
 ) -> tuple[MockConfigEntry, PanelManager]:
@@ -137,6 +145,7 @@ def _fleet_panel_manager(
         domain=DOMAIN,
         version=4,
         data=fleet_data,
+        options=fleet_options or {},
         subentries_data=[source.as_dict()],
     )
     entry.add_to_hass(hass)
@@ -334,13 +343,69 @@ async def test_fleet_firmware_health_remains_runtime_only(hass: HomeAssistant) -
     assert DATA_LAST_FIRMWARE not in entry.subentries["panel-office"].data
 
 
+def test_fleet_resilience_options_resolve_panel_then_parent(
+    hass: HomeAssistant,
+) -> None:
+    """Each explicit panel value wins; otherwise the exact fleet default is used."""
+    parent = {
+        OPT_AUTO_REPAIR: False,
+        OPT_OFFLINE_GRACE_MINUTES: 17,
+        OPT_REPAIR_COOLDOWN_MINUTES: 93,
+    }
+    _entry, inherited = _fleet_panel_manager(hass, fleet_options=parent)
+    _entry, overridden = _fleet_panel_manager(
+        hass,
+        fleet_options=parent,
+        feature_overrides={
+            OPT_AUTO_REPAIR: True,
+            OPT_OFFLINE_GRACE_MINUTES: 4,
+            OPT_REPAIR_COOLDOWN_MINUTES: 120,
+        },
+    )
+
+    assert (
+        inherited._opt(OPT_AUTO_REPAIR, True),
+        inherited._opt(OPT_OFFLINE_GRACE_MINUTES, 1),
+        inherited._opt(OPT_REPAIR_COOLDOWN_MINUTES, 1),
+    ) == (False, 17, 93)
+    assert (
+        overridden._opt(OPT_AUTO_REPAIR, False),
+        overridden._opt(OPT_OFFLINE_GRACE_MINUTES, 1),
+        overridden._opt(OPT_REPAIR_COOLDOWN_MINUTES, 1),
+    ) == (True, 4, 120)
+
+
+def test_legacy_resilience_options_remain_entry_local(hass: HomeAssistant) -> None:
+    """Legacy panels keep their established per-entry option behavior."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="legacy-resilience",
+        data=ENTRY_DATA,
+        options={
+            OPT_AUTO_REPAIR: False,
+            OPT_OFFLINE_GRACE_MINUTES: 23,
+            OPT_REPAIR_COOLDOWN_MINUTES: 77,
+        },
+    )
+    manager = _legacy_manager(hass, entry)
+
+    assert (
+        manager._opt(OPT_AUTO_REPAIR, True),
+        manager._opt(OPT_OFFLINE_GRACE_MINUTES, 1),
+        manager._opt(OPT_REPAIR_COOLDOWN_MINUTES, 1),
+    ) == (False, 23, 77)
+
+
+@pytest.mark.parametrize("source", ["fleet", "panel"])
 async def test_fleet_override_can_never_enable_legacy_unpinned_repin(
     hass: HomeAssistant,
+    source: str,
 ) -> None:
     """A malicious/new-fleet override cannot offer credentials before key trust."""
     _entry, manager = _fleet_panel_manager(
         hass,
-        feature_overrides={OPT_TRUST_HOST_KEY_CHANGES: True},
+        feature_overrides=({OPT_TRUST_HOST_KEY_CHANGES: True} if source == "panel" else None),
+        fleet_options=({OPT_TRUST_HOST_KEY_CHANGES: True} if source == "fleet" else None),
     )
     pinned = FakeShell(connect_error=asyncssh.HostKeyNotVerifiable("changed"))
 
@@ -354,6 +419,8 @@ async def test_fleet_override_can_never_enable_legacy_unpinned_repin(
     assert manager.problem is True
     assert manager.problem_reason is not None
     assert "host key changed" in manager.problem_reason
+    assert "rebind" in manager.problem_reason.lower()
+    assert "Trust host-key changes" not in manager.problem_reason
 
 
 @pytest.mark.allow_lingering_timers
@@ -668,6 +735,54 @@ async def test_repair_step_failure_escalates_and_sets_problem(
     assert await hass.config_entries.async_unload(entry.entry_id)
 
 
+async def test_repair_step_failure_redacts_every_outward_surface(
+    hass: HomeAssistant,
+    payload_dir: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Remote stderr must not reach state, issues, events, or manager logs."""
+    from homeassistant.helpers import issue_registry as ir
+
+    shell = FakeShell(
+        responses={
+            "systemctl enable --now brilliant-mqtt": RunResult(
+                1,
+                "",
+                _SECRET_FAILURE_CANARY,
+            )
+        }
+    )
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    manager = _legacy_manager(hass, entry)
+    events = _capture_events(hass)
+    caplog.set_level(logging.DEBUG, logger="custom_components.brilliant_mqtt.manager")
+
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
+        await manager.async_repair(trigger="button")
+        await hass.async_block_till_done()
+
+    issue = ir.async_get(hass).async_get_issue(DOMAIN, manager._issue_id)
+    assert issue is not None
+    outward = repr(
+        (
+            manager.problem_reason,
+            [event.data for event in events],
+            issue.translation_placeholders,
+            caplog.messages,
+        )
+    )
+    assert _SECRET_FAILURE_CANARY not in outward
+    assert manager.problem_reason == "panel repair step failed"
+    failed = next(event for event in events if event.data["type"] == "repair_failed")
+    assert failed.data == {
+        "type": "repair_failed",
+        "panel": "office",
+        "entry_id": entry.entry_id,
+        "reason": "repair_step_failed",
+    }
+
+
 async def test_shutdown_during_inflight_repair_leaks_no_timer(
     hass: HomeAssistant, payload_dir: Path
 ) -> None:
@@ -757,6 +872,98 @@ async def test_agent_update_step_failure_escalates_and_raises(
     assert _entry_manager(entry)._repairing is False  # mutex released even though we raised
 
     assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_agent_update_failure_redacts_every_outward_surface(
+    hass: HomeAssistant,
+    payload_dir: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Update errors retain their stage without exporting remote stderr."""
+    from homeassistant.helpers import issue_registry as ir
+
+    shell = FakeShell(
+        responses={
+            "systemctl restart brilliant-mqtt": RunResult(
+                1,
+                "",
+                _SECRET_FAILURE_CANARY,
+            )
+        }
+    )
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    manager = _legacy_manager(hass, entry)
+    events = _capture_events(hass)
+    caplog.set_level(logging.DEBUG, logger="custom_components.brilliant_mqtt.manager")
+
+    with (
+        patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell),
+        pytest.raises(HomeAssistantError) as raised,
+    ):
+        await manager.async_update_agent()
+    await hass.async_block_till_done()
+
+    issue = ir.async_get(hass).async_get_issue(DOMAIN, manager._issue_id)
+    assert issue is not None
+    outward = repr(
+        (
+            manager.problem_reason,
+            [event.data for event in events],
+            issue.translation_placeholders,
+            raised.value.translation_placeholders,
+            caplog.messages,
+        )
+    )
+    assert _SECRET_FAILURE_CANARY not in outward
+    assert raised.value.translation_key == "update_failed"
+    assert raised.value.translation_placeholders == {
+        "error": "agent update failed during deployment"
+    }
+    assert raised.value.__cause__ is None
+    assert raised.value.__suppress_context__ is True
+
+
+async def test_agent_uninstall_failure_redacts_every_outward_surface(
+    hass: HomeAssistant,
+    payload_dir: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Connection failures use a fixed uninstall-stage summary everywhere."""
+    from homeassistant.helpers import issue_registry as ir
+
+    shell = FakeShell(connect_error=OSError(_SECRET_FAILURE_CANARY))
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    manager = _legacy_manager(hass, entry)
+    events = _capture_events(hass)
+    caplog.set_level(logging.DEBUG, logger="custom_components.brilliant_mqtt.manager")
+
+    with (
+        patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell),
+        pytest.raises(HomeAssistantError) as raised,
+    ):
+        await manager.async_uninstall()
+    await hass.async_block_till_done()
+
+    issue = ir.async_get(hass).async_get_issue(DOMAIN, manager._issue_id)
+    assert issue is not None
+    outward = repr(
+        (
+            manager.problem_reason,
+            [event.data for event in events],
+            issue.translation_placeholders,
+            raised.value.translation_placeholders,
+            caplog.messages,
+        )
+    )
+    assert _SECRET_FAILURE_CANARY not in outward
+    assert raised.value.translation_key == "uninstall_failed"
+    assert raised.value.translation_placeholders == {
+        "error": "agent uninstall could not connect to the panel"
+    }
+    assert raised.value.__cause__ is None
+    assert raised.value.__suppress_context__ is True
 
 
 async def test_shutdown_during_inflight_agent_update_leaks_no_timer(
@@ -1154,6 +1361,68 @@ async def test_inflight_recovery_timeout_cannot_overwrite_retained_ledger_diagno
     assert _types(events) == ["needs_attention"]
 
 
+async def test_recovery_timeout_never_exports_collected_journal(
+    hass: HomeAssistant,
+) -> None:
+    """Raw panel journal content is never copied onto the HA event bus."""
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    manager = _legacy_manager(hass, entry)
+    manager.availability = "offline"
+    events = _capture_events(hass)
+    shell = FakeShell()
+
+    with (
+        patch.object(manager, "_shell", return_value=shell),
+        patch.object(panel_ops, "collect_journal", return_value=_SECRET_FAILURE_CANARY),
+    ):
+        await manager._recovery_timeout(dt_util.utcnow())
+    await hass.async_block_till_done()
+
+    failed = next(event for event in events if event.data["type"] == "repair_failed")
+    assert failed.data == {
+        "type": "repair_failed",
+        "panel": "office",
+        "entry_id": entry.entry_id,
+        "reason": "still_offline",
+    }
+    assert _SECRET_FAILURE_CANARY not in repr([event.data for event in events])
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        f'{{"agent_version":"0.7.0","detail":"{_SECRET_FAILURE_CANARY}"',
+        f'["{_SECRET_FAILURE_CANARY}"]',
+    ],
+)
+async def test_malformed_meta_logging_never_echoes_payload(
+    hass: HomeAssistant,
+    caplog: pytest.LogCaptureFixture,
+    payload: str,
+) -> None:
+    """Malformed or wrong-shape MQTT data is categorized without payload text."""
+    from homeassistant.components.mqtt.models import ReceiveMessage
+
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    manager = _legacy_manager(hass, entry)
+    caplog.set_level(logging.DEBUG, logger="custom_components.brilliant_mqtt.manager")
+    message = ReceiveMessage(
+        topic="brilliant/office/bridge",
+        payload=payload,
+        qos=0,
+        retain=True,
+        subscribed_topic="brilliant/office/bridge",
+        timestamp=dt_util.utcnow().timestamp(),
+    )
+
+    await manager._on_meta(message)
+
+    assert _SECRET_FAILURE_CANARY not in caplog.text
+    assert "discarded invalid bridge meta payload" in caplog.text
+
+
 async def test_shutdown_during_inflight_repair_connect_fail_leaks_no_timer(
     hass: HomeAssistant,
 ) -> None:
@@ -1453,17 +1722,36 @@ async def test_async_reboot_captures_diagnostics_before_rebooting(
     """The volatile-journal invariant: diagnostics are captured AND persisted BEFORE the
     reboot command, which is issued last."""
     entry = _reboot_entry(hass)
-    shell = FakeShell(responses={"uptime": RunResult(0, "up 1 day\n", "")})
+    secret = "MQTT_PASSWORD=persisted-diagnostics-canary"
+    shell = FakeShell(
+        responses={
+            "cat /proc/uptime": RunResult(0, "86400.0 100.0\n", secret),
+            "journalctl -b -n 400 --no-pager": RunResult(
+                0,
+                f"bridge failed: {secret}\n",
+                secret,
+            ),
+        },
+        run_errors={
+            "iw dev wlan0 link": asyncssh.ConnectionLost(secret),
+        },
+    )
     with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
         manager = _legacy_manager(hass, entry)
         await manager.async_reboot(collect_diagnostics=True, journal_lines=400)
 
     assert panel_ops.REBOOT_COMMAND in shell.commands
     # A diagnostics probe ran BEFORE the reboot, and the reboot is the LAST command.
-    assert shell.commands.index("uptime") < shell.commands.index(panel_ops.REBOOT_COMMAND)
+    assert shell.commands.index("cat /proc/uptime") < shell.commands.index(panel_ops.REBOOT_COMMAND)
     assert shell.commands[-1] == panel_ops.REBOOT_COMMAND
-    # The sole persisted bundle (under <config>/brilliant_mqtt/diagnostics/office/) has it.
-    assert "up 1 day" in _read_sole_diag(hass)
+    # Persist only the typed, allowlisted summary; arbitrary probe content never lands.
+    persisted = _read_sole_diag(hass)
+    summary = json.loads(persisted)
+    probes = {probe["id"]: probe for probe in summary["probes"]}
+    assert probes["uptime"]["uptime_seconds"] == 86400
+    assert probes["boot_events"]["categories"] == {"bridge_failure": 1}
+    assert probes["wifi_link"]["outcome"] == "transport_error"
+    assert secret not in persisted
 
 
 async def test_async_reboot_disconnect_is_success_and_can_skip_diagnostics(
@@ -1500,16 +1788,19 @@ async def test_async_reboot_prunes_diagnostics_to_retention(
 
 
 async def test_async_reboot_still_reboots_when_diagnostics_persist_fails(
-    hass: HomeAssistant, panel_diagnostics_isolated: None
+    hass: HomeAssistant,
+    panel_diagnostics_isolated: None,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A diagnostics failure must never block the reboot the operator asked for."""
     entry = _reboot_entry(hass)
     shell = FakeShell(responses={"uptime": RunResult(0, "x\n", "")})
+    caplog.set_level(logging.DEBUG, logger="custom_components.brilliant_mqtt.manager")
     with (
         patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell),
         patch(
             "custom_components.brilliant_mqtt.manager._write_diagnostics_bundle",
-            side_effect=OSError("disk full"),
+            side_effect=OSError(_SECRET_FAILURE_CANARY),
         ),
     ):
         manager = _legacy_manager(hass, entry)
@@ -1517,17 +1808,25 @@ async def test_async_reboot_still_reboots_when_diagnostics_persist_fails(
 
     assert panel_ops.REBOOT_COMMAND in shell.commands  # reboot still issued
     assert not _diag_dir_exists(hass)  # persist failed → nothing landed on disk
+    assert _SECRET_FAILURE_CANARY not in caplog.text
+    assert "pre-reboot diagnostics capture failed" in caplog.text
 
 
 async def test_async_reboot_raises_when_panel_unreachable(hass: HomeAssistant) -> None:
     entry = _reboot_entry(hass)
-    shell = FakeShell(connect_error=OSError("unreachable"))
+    shell = FakeShell(connect_error=OSError(_SECRET_FAILURE_CANARY))
     with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
         manager = _legacy_manager(hass, entry)
         with pytest.raises(HomeAssistantError) as err:
             await manager.async_reboot()
 
     assert err.value.translation_key == "reboot_failed"
+    assert err.value.translation_placeholders == {
+        "error": "panel reboot could not connect to the panel"
+    }
+    assert _SECRET_FAILURE_CANARY not in repr(err.value)
+    assert err.value.__cause__ is None
+    assert err.value.__suppress_context__ is True
     # A failed connect must NOT escalate — a nightly reboot may hit a briefly-offline panel.
     assert manager.problem is False
     assert panel_ops.REBOOT_COMMAND not in shell.commands
@@ -1945,15 +2244,64 @@ async def test_set_voice_wake_word_push_failure_keeps_old_word(
     entry.add_to_hass(hass)
 
     shell = _make_voice_shell(payload_present=True)
-    shell.responses["systemctl restart brilliant-voice"] = RunResult(1, "", "restart boom")
+    shell.responses["systemctl restart brilliant-voice"] = RunResult(
+        1,
+        "",
+        _SECRET_FAILURE_CANARY,
+    )
     with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
         manager = _legacy_manager(hass, entry)
         with pytest.raises(HomeAssistantError) as err:
             await manager.async_set_voice_wake_word("hey_jarvis")
     assert err.value.translation_key == "voice_failed"
+    assert err.value.translation_placeholders == {
+        "error": "voice satellite operation failed on the panel"
+    }
+    assert _SECRET_FAILURE_CANARY not in repr(err.value)
+    assert err.value.__cause__ is None
+    assert err.value.__suppress_context__ is True
     # The push used the NEW word (env rendered with it) ...
     assert any("/etc/brilliant-voice.env" in p for (p, _d, _m) in shell.uploads)
     # ... but because the push failed, the persisted word is UNCHANGED.
+    assert entry.data[CONF_VOICE_WAKE_WORD] == old_word
+
+
+async def test_set_voice_wake_word_persistence_failure_is_redacted(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """A local persistence error is mapped without exposing its exception text."""
+    old_word = "okay_nabu"
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="office",
+        data={**_voice_entry_data(), CONF_VOICE_WAKE_WORD: old_word},
+    )
+    entry.add_to_hass(hass)
+    shell = _make_voice_shell(payload_present=True)
+
+    with patch(
+        "custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell",
+        return_value=shell,
+    ):
+        manager = _legacy_manager(hass, entry)
+        with (
+            patch.object(
+                LegacyPanelStore,
+                "update_data",
+                side_effect=OSError(_SECRET_FAILURE_CANARY),
+            ),
+            pytest.raises(HomeAssistantError) as err,
+        ):
+            await manager.async_set_voice_wake_word("hey_jarvis")
+
+    assert err.value.translation_key == "voice_failed"
+    assert err.value.translation_placeholders == {
+        "error": "voice satellite settings could not be saved"
+    }
+    assert _SECRET_FAILURE_CANARY not in repr(err.value)
+    assert err.value.__cause__ is None
+    assert err.value.__suppress_context__ is True
     assert entry.data[CONF_VOICE_WAKE_WORD] == old_word
 
 
@@ -2068,6 +2416,30 @@ async def test_repair_voice_disabled_via_components_skips_voice(
 # ---------------------------------------------------------------------------
 
 
+class _ComponentCloseGateShell(FakeShell):
+    """Hold close so caller cancellation lands after the remote mutation."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.close_started = asyncio.Event()
+        self.close_release = asyncio.Event()
+        self.close_finished = asyncio.Event()
+
+    async def close(self) -> None:
+        self.close_started.set()
+        await self.close_release.wait()
+        self.connected = False
+        self.close_finished.set()
+
+
+class _ComponentCloseFailureShell(FakeShell):
+    """Report a secret-bearing close failure after a successful command."""
+
+    async def close(self) -> None:
+        self.connected = False
+        raise OSError(_SECRET_FAILURE_CANARY)
+
+
 async def test_install_component_records_selection(
     manager_with_fake_panel: PanelManager,
 ) -> None:
@@ -2085,6 +2457,355 @@ async def test_remove_component_clears_selection(
     await mgr.async_install_component(COMPONENT_VOICE)
     await mgr.async_remove_component(COMPONENT_VOICE)
     assert mgr.store.data[CONF_COMPONENTS][COMPONENT_VOICE] is False
+
+
+@pytest.mark.parametrize(
+    ("method_name", "initial_enabled", "settled_enabled"),
+    [
+        ("async_install_component", False, True),
+        ("async_remove_component", True, False),
+    ],
+)
+async def test_component_mutation_drains_after_caller_cancellation(
+    hass: HomeAssistant,
+    method_name: str,
+    initial_enabled: bool,
+    settled_enabled: bool,
+) -> None:
+    """Cancellation waits through close and synchronous flag persistence."""
+    from homeassistant.helpers import issue_registry as ir
+
+    from custom_components.brilliant_mqtt.components import REGISTRY
+
+    shell = _ComponentCloseGateShell()
+    component = SimpleNamespace(
+        deprecated=False,
+        label="Voice satellite",
+        install=AsyncMock(),
+        remove=AsyncMock(),
+    )
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="office",
+        data={
+            **ENTRY_DATA,
+            CONF_COMPONENTS: {COMPONENT_VOICE: initial_enabled},
+        },
+    )
+    entry.add_to_hass(hass)
+    manager = _legacy_manager(hass, entry)
+
+    with (
+        patch.dict(REGISTRY, {COMPONENT_VOICE: component}),
+        patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell),
+    ):
+        operation = hass.async_create_task(
+            getattr(manager, method_name)(COMPONENT_VOICE),
+        )
+        await shell.close_started.wait()
+        operation.cancel()
+        await asyncio.sleep(0)
+        assert operation.done() is False
+        shell.close_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await operation
+
+    assert shell.close_finished.is_set()
+    assert entry.data[CONF_COMPONENTS][COMPONENT_VOICE] is settled_enabled
+    assert (
+        ir.async_get(hass).async_get_issue(
+            DOMAIN,
+            manager._component_issue_id(COMPONENT_VOICE),
+        )
+        is None
+    )
+
+
+async def test_component_caller_cancellation_wins_remote_failure_race(
+    hass: HomeAssistant,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Drain a failing remote operation, but preserve caller cancellation."""
+    from homeassistant.helpers import issue_registry as ir
+
+    from custom_components.brilliant_mqtt.components import REGISTRY
+
+    install_started = asyncio.Event()
+    install_release = asyncio.Event()
+
+    async def fail_install(*_args: object) -> None:
+        install_started.set()
+        await install_release.wait()
+        raise panel_ops.PanelOpError(_SECRET_FAILURE_CANARY)
+
+    component = SimpleNamespace(
+        deprecated=False,
+        label="Voice satellite",
+        install=AsyncMock(side_effect=fail_install),
+        remove=AsyncMock(),
+    )
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="office",
+        data={
+            **ENTRY_DATA,
+            CONF_COMPONENTS: {COMPONENT_VOICE: False},
+        },
+    )
+    entry.add_to_hass(hass)
+    manager = _legacy_manager(hass, entry)
+    caplog.set_level(logging.DEBUG, logger="custom_components.brilliant_mqtt.manager")
+
+    with (
+        patch.dict(REGISTRY, {COMPONENT_VOICE: component}),
+        patch(
+            "custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell",
+            return_value=FakeShell(),
+        ),
+    ):
+        operation = hass.async_create_task(
+            manager.async_install_component(COMPONENT_VOICE),
+        )
+        await install_started.wait()
+        operation.cancel()
+        await asyncio.sleep(0)
+        assert operation.done() is False
+        install_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await operation
+
+    assert entry.data[CONF_COMPONENTS][COMPONENT_VOICE] is False
+    issue = ir.async_get(hass).async_get_issue(
+        DOMAIN,
+        manager._component_issue_id(COMPONENT_VOICE),
+    )
+    assert issue is not None
+    assert _SECRET_FAILURE_CANARY not in repr((issue, caplog.messages))
+
+
+@pytest.mark.parametrize(
+    ("method_name", "initial_enabled", "settled_enabled"),
+    [
+        ("async_install_component", False, True),
+        ("async_remove_component", True, False),
+    ],
+)
+async def test_component_close_failure_persists_successful_remote_result(
+    hass: HomeAssistant,
+    method_name: str,
+    initial_enabled: bool,
+    settled_enabled: bool,
+) -> None:
+    """A successful command is persisted even when SSH close is unverified."""
+    from homeassistant.helpers import issue_registry as ir
+
+    from custom_components.brilliant_mqtt.components import REGISTRY
+
+    shell = _ComponentCloseFailureShell()
+    component = SimpleNamespace(
+        deprecated=False,
+        label="Voice satellite",
+        install=AsyncMock(),
+        remove=AsyncMock(),
+    )
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="office",
+        data={
+            **ENTRY_DATA,
+            CONF_COMPONENTS: {COMPONENT_VOICE: initial_enabled},
+        },
+    )
+    entry.add_to_hass(hass)
+    manager = _legacy_manager(hass, entry)
+
+    with (
+        patch.dict(REGISTRY, {COMPONENT_VOICE: component}),
+        patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell),
+        pytest.raises(panel_ops.PanelOpError) as raised,
+    ):
+        await getattr(manager, method_name)(COMPONENT_VOICE)
+
+    assert entry.data[CONF_COMPONENTS][COMPONENT_VOICE] is settled_enabled
+    issue = ir.async_get(hass).async_get_issue(
+        DOMAIN,
+        manager._component_issue_id(COMPONENT_VOICE),
+    )
+    assert issue is not None
+    assert "physical state is unverified" in str(issue.translation_placeholders)
+    assert _SECRET_FAILURE_CANARY not in repr((raised.value, issue))
+
+
+@pytest.mark.parametrize(
+    ("method_name", "initial_enabled", "preserved_enabled"),
+    [
+        ("async_install_component", False, False),
+        ("async_install_component", True, True),
+        ("async_remove_component", True, True),
+        ("async_remove_component", False, False),
+    ],
+)
+async def test_component_remote_failure_preserves_preoperation_flag_and_creates_issue(
+    hass: HomeAssistant,
+    method_name: str,
+    initial_enabled: bool,
+    preserved_enabled: bool,
+) -> None:
+    """A remote failure never fabricates a state different from the stored flag."""
+    from homeassistant.helpers import issue_registry as ir
+
+    from custom_components.brilliant_mqtt.components import REGISTRY
+
+    failure = panel_ops.PanelOpError(_SECRET_FAILURE_CANARY)
+    component = SimpleNamespace(
+        deprecated=False,
+        label="Voice satellite",
+        install=AsyncMock(side_effect=failure),
+        remove=AsyncMock(side_effect=failure),
+    )
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="office",
+        data={
+            **ENTRY_DATA,
+            CONF_COMPONENTS: {COMPONENT_VOICE: initial_enabled},
+        },
+    )
+    entry.add_to_hass(hass)
+    manager = _legacy_manager(hass, entry)
+
+    with (
+        patch.dict(REGISTRY, {COMPONENT_VOICE: component}),
+        patch(
+            "custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell",
+            return_value=FakeShell(),
+        ),
+        pytest.raises(panel_ops.PanelOpError) as raised,
+    ):
+        await getattr(manager, method_name)(COMPONENT_VOICE)
+
+    assert entry.data[CONF_COMPONENTS][COMPONENT_VOICE] is preserved_enabled
+    issue = ir.async_get(hass).async_get_issue(
+        DOMAIN,
+        manager._component_issue_id(COMPONENT_VOICE),
+    )
+    assert issue is not None
+    assert _SECRET_FAILURE_CANARY not in repr((raised.value, issue))
+
+
+@pytest.mark.parametrize(
+    ("method_name", "initial_enabled"),
+    [
+        ("async_install_component", True),
+        ("async_remove_component", False),
+    ],
+)
+async def test_component_connect_failure_never_inverts_preoperation_flag(
+    hass: HomeAssistant,
+    method_name: str,
+    initial_enabled: bool,
+) -> None:
+    """A failed connection preserves even an already-requested stored state."""
+    from homeassistant.helpers import issue_registry as ir
+
+    from custom_components.brilliant_mqtt.components import REGISTRY
+
+    component = SimpleNamespace(
+        deprecated=False,
+        label="Voice satellite",
+        install=AsyncMock(),
+        remove=AsyncMock(),
+    )
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="office",
+        data={
+            **ENTRY_DATA,
+            CONF_COMPONENTS: {COMPONENT_VOICE: initial_enabled},
+        },
+    )
+    entry.add_to_hass(hass)
+    manager = _legacy_manager(hass, entry)
+
+    with (
+        patch.dict(REGISTRY, {COMPONENT_VOICE: component}),
+        patch(
+            "custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell",
+            return_value=FakeShell(connect_error=OSError(_SECRET_FAILURE_CANARY)),
+        ),
+        pytest.raises(panel_ops.PanelOpError) as raised,
+    ):
+        await getattr(manager, method_name)(COMPONENT_VOICE)
+
+    assert entry.data[CONF_COMPONENTS][COMPONENT_VOICE] is initial_enabled
+    issue = ir.async_get(hass).async_get_issue(
+        DOMAIN,
+        manager._component_issue_id(COMPONENT_VOICE),
+    )
+    assert issue is not None
+    assert _SECRET_FAILURE_CANARY not in repr((raised.value, issue))
+    component.install.assert_not_awaited()
+    component.remove.assert_not_awaited()
+
+
+async def test_component_persistence_failure_creates_issue_and_later_success_clears(
+    hass: HomeAssistant,
+) -> None:
+    """Idempotent retry repairs an unproven flag write and clears its issue."""
+    from homeassistant.helpers import issue_registry as ir
+
+    from custom_components.brilliant_mqtt.components import REGISTRY
+
+    component = SimpleNamespace(
+        deprecated=False,
+        label="Voice satellite",
+        install=AsyncMock(),
+        remove=AsyncMock(),
+    )
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="office",
+        data={
+            **ENTRY_DATA,
+            CONF_COMPONENTS: {COMPONENT_VOICE: False},
+        },
+    )
+    entry.add_to_hass(hass)
+    manager = _legacy_manager(hass, entry)
+    issue_id = manager._component_issue_id(COMPONENT_VOICE)
+
+    with (
+        patch.dict(REGISTRY, {COMPONENT_VOICE: component}),
+        patch(
+            "custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell",
+            return_value=FakeShell(),
+        ),
+        patch.object(
+            manager,
+            "_set_component_flag",
+            side_effect=OSError(_SECRET_FAILURE_CANARY),
+        ),
+        pytest.raises(panel_ops.PanelOpError) as raised,
+    ):
+        await manager.async_install_component(COMPONENT_VOICE)
+
+    registry = ir.async_get(hass)
+    issue = registry.async_get_issue(DOMAIN, issue_id)
+    assert issue is not None
+    assert entry.data[CONF_COMPONENTS][COMPONENT_VOICE] is False
+    assert _SECRET_FAILURE_CANARY not in repr((raised.value, issue))
+
+    with (
+        patch.dict(REGISTRY, {COMPONENT_VOICE: component}),
+        patch(
+            "custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell",
+            return_value=FakeShell(),
+        ),
+    ):
+        await manager.async_install_component(COMPONENT_VOICE)
+
+    assert entry.data[CONF_COMPONENTS][COMPONENT_VOICE] is True
+    assert registry.async_get_issue(DOMAIN, issue_id) is None
 
 
 # ---------------------------------------------------------------------------

@@ -26,7 +26,7 @@ All four must pass before any commit:
 ```bash
 uv run ruff check --fix          # lint
 uv run ruff format               # format
-uv run mypy --strict src tests   # type check
+uv run mypy --strict src tests scripts/brilliant-panel/bundle_manifest.py
 uv run pytest                    # tests
 ```
 

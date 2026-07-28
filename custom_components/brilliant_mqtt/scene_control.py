@@ -380,6 +380,7 @@ class SceneControl:
             topic = (
                 scene_command_topic(selected) if kind == "scene" else mode_command_topic(selected)
             )
+            publish_failed = False
             try:
                 await mqtt.async_publish(self.hass, topic, payload, retain=False)
             except asyncio.CancelledError:
@@ -394,13 +395,16 @@ class SceneControl:
                     kind,
                     type(error).__name__,
                 )
-                raise HomeAssistantError(f"Brilliant {kind} command publish failed.") from error
+                publish_failed = True
+            if publish_failed:
+                raise HomeAssistantError(f"Brilliant {kind} command publish failed.") from None
 
+        timed_out = False
         try:
             async with asyncio.timeout(_RESULT_TIMEOUT_SECONDS):
                 result = await future
-        except TimeoutError as error:
-            raise HomeAssistantError(f"Brilliant {kind} confirmation timed out.") from error
+        except TimeoutError:
+            timed_out = True
         finally:
             async with self._lifecycle_lock:
                 current = self._pending.get(command_id)
@@ -408,6 +412,8 @@ class SceneControl:
                     self._pending.pop(command_id, None)
                 if not future.done():
                     future.cancel()
+        if timed_out:
+            raise HomeAssistantError(f"Brilliant {kind} confirmation timed out.") from None
         if not result.accepted:
             detail = f": {result.error}" if result.error is not None else ""
             raise HomeAssistantError(f"Brilliant {kind} execution failed{detail}.")
@@ -439,8 +445,11 @@ class SceneControl:
                 await self._async_result(kind, topic_value, payload, retained=message.retain)
         except (TypeError, ValueError):
             _LOGGER.warning("Ignored invalid Brilliant scene control MQTT message")
-        except Exception:
-            _LOGGER.exception("Brilliant scene control MQTT callback failed; continuing")
+        except Exception as error:
+            _LOGGER.error(
+                "Brilliant scene control MQTT callback failed (%s); continuing",
+                type(error).__name__,
+            )
 
     async def _async_catalog(
         self,

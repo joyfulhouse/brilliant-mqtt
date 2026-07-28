@@ -20,7 +20,7 @@ from .const import (
     DOMAIN,
 )
 from .entity import BrilliantPanelEntity
-from .manager import PanelManager, _HostKeyChanged
+from .manager import PanelManager, _HostKeyChanged, _safe_failure_summary
 from .panel_ops import PanelOpError
 
 # Push-only; toggling serializes panel SSH via the fleet-wide lock in the manager.
@@ -99,16 +99,20 @@ class _ComponentInstallSwitch(BrilliantPanelEntity, SwitchEntity):
                 await self._manager.async_install_component(self._component_id)
             else:
                 await self._manager.async_remove_component(self._component_id)
-        except _HostKeyChanged as err:
+        except _HostKeyChanged:
             raise HomeAssistantError(
                 translation_domain=DOMAIN, translation_key="host_key_changed"
-            ) from err
+            ) from None
         except (OSError, asyncssh.Error, PanelOpError) as err:
+            summary = _safe_failure_summary(
+                "panel component operation failed",
+                err,
+            )
             raise HomeAssistantError(
                 translation_domain=DOMAIN,
                 translation_key=self._failure_translation_key,
-                translation_placeholders={"error": str(err)},
-            ) from err
+                translation_placeholders={"error": summary},
+            ) from None
 
 
 class WifiWatchdogSwitch(_ComponentInstallSwitch):

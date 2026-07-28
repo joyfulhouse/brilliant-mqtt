@@ -22,7 +22,9 @@ PLATFORMS: list[Platform] = [
     Platform.UPDATE,
 ]
 
-# Config entry data keys (one entry per panel; each stores ITS OWN root password).
+# Fleet-global keys live on the singleton parent; panel identity, address, and each
+# panel's own root password live on its panel subentry. Legacy entries retain the
+# historical combined layout only for compatibility.
 CONF_ENTRY_KIND = "entry_kind"
 CONF_BROKER_KIND = "broker_kind"
 CONF_SCHEMA_VERSION = "schema_version"
@@ -60,16 +62,16 @@ DEFAULT_HA_MIRROR_LEADER_PRIORITY = 0
 # diyHue CA-recovery hook feature keys.
 CONF_HUE_CA_CERT = "hue_ca_cert"
 
-# Home Assistant-owned MQTT control plane. These global values are copied to each
-# panel entry by the configuration vertical slice; the singleton elects the enabled
-# entry with the lexicographically smallest panel slug as its settings owner.
+# Home Assistant-owned MQTT control plane. A fleet entry owns these values once.
+# Legacy standalone panel entries retain compatibility copies; only that legacy
+# runtime elects the enabled entry with the lexicographically smallest panel slug.
 CONF_HA_CONTROL_ENABLED = "ha_control_enabled"
 CONF_HA_CONTROL_LABEL = "ha_control_label"
 CONF_ROOM_OVERRIDES = "room_overrides"
 CONF_HA_CONTROL_DOMAINS = "ha_control_domains"
 CONF_MAX_MIRRORED_ENTITIES = "max_mirrored_entities"
-# Scene-control configuration is surfaced by Task 9's config flow. Task 8 consumes
-# the stored keys already so the singleton can select a default panel and actions.
+# Fleet-owned scene-control configuration selects one default panel and an explicit
+# allowlist of actions.
 CONF_SCENE_PANEL = "scene_panel"
 CONF_SCENE_ACTIONS = "scene_actions"
 DEFAULT_HA_CONTROL_ENABLED = False
@@ -111,8 +113,9 @@ MESH_PANEL = "mesh"
 # Panel reboot + pre-reboot diagnostics. The panels wedge two ways (an uptime-decay
 # wedge that only a reboot clears, and Wi-Fi power-save packet starvation), and the
 # panel's journald is VOLATILE (/run tmpfs — only the current boot survives), so a
-# diagnostics bundle is pulled over SSH BEFORE the reboot that would erase the
-# evidence. Bundles land under <config>/brilliant_mqtt/diagnostics/<panel>/, newest
+# typed, allowlisted diagnostics summary is collected over SSH BEFORE the reboot that
+# would erase the evidence. Raw journal/stdout/stderr text is never persisted.
+# Summaries land under <config>/brilliant_mqtt/diagnostics/<panel>/, newest
 # DIAGNOSTICS_RETENTION kept.
 DEFAULT_REBOOT_JOURNAL_LINES = 400
 MIN_REBOOT_JOURNAL_LINES = 100
@@ -234,6 +237,9 @@ EVENT_REPAIR_SUCCEEDED = "repair_succeeded"
 EVENT_REPAIR_FAILED = "repair_failed"
 EVENT_NEEDS_ATTENTION = "needs_attention"
 EVENT_AGENT_UPDATED = "agent_updated"
+# Fired only after an explicit fleet-panel identity rebind is durable. Extra data:
+# old_fingerprint and new_fingerprint; standard panel/entry_id identify the owner.
+EVENT_PANEL_REBOUND = "panel_rebound"
 # Fired when a rotated SSH host key was auto-trusted during repair/update (opt-in
 # OPT_TRUST_HOST_KEY_CHANGES). Extra data: new_host_key. Auditable security event.
 EVENT_HOST_KEY_REPINNED = "host_key_repinned"

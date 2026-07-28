@@ -21,7 +21,10 @@
 - A panel root password is never sent until an unauthenticated key exchange has produced a candidate key and the authenticated connection pins that exact key.
 - New fleet panels never auto-repin. A key change requires an explicit rebind flow. Legacy auto-repin behavior remains isolated in its compatibility adapter until plan 3 resolves it.
 - The first eligible panel receives mesh priority 1; later panels receive the next unused positive integer. Slugs and priorities are never implicitly renumbered.
-- New installs enable bridge, Wi-Fi watchdog, and bus watchdog. Voice, diyHue, HA control, certificate recovery, and retired HA mirror remain off until focused configuration.
+- New installs enable bridge, Wi-Fi watchdog, and bus watchdog. Voice, diyHue,
+  certificate recovery, and retired HA mirror remain off until focused
+  configuration. HA control defaults off unless the user explicitly enables it
+  during broker validation before the first panel.
 - Subscribe for health before activation and reject retained/replayed messages. Success requires fresh availability, metadata with the staged version, initial state, and normal discovery.
 - Journal every activation before mutating the active service. First-install failure leaves no active partial unit; upgrade failure restores the exact prior release/env/unit/component state.
 - Never log or place MQTT passwords, root passwords, CA PEM bodies, or environment contents in flow placeholders, issues, diagnostics, or exceptions.
@@ -380,10 +383,11 @@ signal. After a Home Assistant restart, no in-memory flow survives:
 `staged`, `activation_pending`, `activated`, or `verifying` without a persisted
 matching subentry therefore rolls back rather than synthesizing a subentry.
 For `pending_config_commit`, recovery accepts only one exact transaction-marked
-subentry in the singleton fleet whose kind, host, port, and TLS mode match the
-journal's stored profile; a match completes runtime verification and commit. A
-`committed` record is clear-only. It never starts a different transaction while
-a journal exists.
+subentry in the singleton fleet whose host, port, and TLS mode match the
+journal's stored transport; broker kind remains persisted operator guidance
+and is excluded from transport ownership. A match completes runtime
+verification and commit. A `committed` record is clear-only. It never starts a
+different transaction while a journal exists.
 
 - [ ] **Step 6: Run complete provisioning tests**
 
@@ -512,21 +516,24 @@ Test exact paths:
 2. official path prefills hass.config.api.local_ip when present and port 1883, but both remain editable;
 3. existing path exposes host/port/username/password in the normal form;
 4. advanced exposes TLS and custom public CA for either path;
-5. missing/disconnected HA MQTT or a non-homeassistant discovery prefix preserves non-secret inputs, creates no entry, and links the matching docs slug;
-6. broker success returns an empty fleet CREATE_ENTRY with no panel credential, panel subentry, or provisioning transaction;
-7. the empty fleet stores next_mesh_priority=1 and the one reserved unassigned scene owner;
-8. async_on_create_entry waits boundedly for core persistence and reads back the exact on-disk fleet before initializing the panel subentry flow and returning next_flow;
-9. a persistence timeout or readback mismatch starts no subentry flow and causes zero SSH, journal, or panel writes;
-10. the chained PanelSubentryFlow starts at panel_connect with no broker fields shown again;
-11. panel_connect asks host and root_password, with root fixed unless Advanced SSH is selected;
-12. confirm shows fingerprint/facts and only name is editable;
-13. immediately before provisioning, the flow again waits for core persistence and verifies the exact parent by on-disk readback; failure stays retryable on confirm and calls no provisioner;
-14. provision uses async_show_progress, cannot double-submit, and copies the exact transaction UUID into flow context on the durable STAGING update;
-15. success creates only one ConfigSubentryData under the existing fleet;
-16. existing fleet aborts already_configured and any legacy entry aborts legacy_migration_required;
-17. later PanelSubentryFlow uses the identical parent persistence, allocation, provisioning, and recovery path;
-18. duplicate fingerprint aborts already_configured and identifies the existing subentry;
-19. failure persists no root/MQTT password in flow result, issue, or logs.
+5. the broker form includes one HA-control choice, defaults it off, preserves it
+   across validation retries, and writes it to the empty fleet before first-panel
+   onboarding;
+6. missing/disconnected HA MQTT or a non-homeassistant discovery prefix preserves non-secret inputs, creates no entry, and links the matching docs slug;
+7. broker success returns an empty fleet CREATE_ENTRY with no panel credential, panel subentry, or provisioning transaction;
+8. the empty fleet stores next_mesh_priority=1 and the one reserved unassigned scene owner;
+9. async_on_create_entry waits boundedly for core persistence and reads back the exact on-disk fleet before initializing the panel subentry flow and returning next_flow;
+10. a persistence timeout or readback mismatch starts no subentry flow and causes zero SSH, journal, or panel writes;
+11. the chained PanelSubentryFlow starts at panel_connect with no broker fields shown again;
+12. panel_connect asks host and root_password, with root fixed unless Advanced SSH is selected;
+13. confirm shows fingerprint/facts and only name is editable;
+14. immediately before provisioning, the flow again waits for core persistence and verifies the exact parent by on-disk readback; failure stays retryable on confirm and calls no provisioner;
+15. provision uses async_show_progress, cannot double-submit, and copies the exact transaction UUID into flow context on the durable STAGING update;
+16. success creates only one ConfigSubentryData under the existing fleet;
+17. existing fleet aborts already_configured and any legacy entry aborts legacy_migration_required;
+18. later PanelSubentryFlow uses the identical parent persistence, allocation, provisioning, and recovery path;
+19. duplicate fingerprint or reserved management ID aborts already_configured and identifies the existing subentry;
+20. failure persists no root/MQTT password in flow result, issue, or logs.
 
 - [ ] **Step 2: Run and verify old-flow failures**
 
@@ -559,11 +566,11 @@ self.async_create_entry(
 ~~~
 
 fleet_data contains the normalized broker fields, installation defaults,
-next_mesh_priority=1, schema/version fields, and one stable reserved unassigned
-scene owner. It contains no panel address, SSH/root credential, fingerprint,
-slug, component selection, or provisioning transaction. subentries is empty.
-Broker failure creates no entry. First-panel failure does not delete this valid
-fleet.
+the explicit default-off HA-control choice, next_mesh_priority=1,
+schema/version fields, and one stable reserved unassigned scene owner. It
+contains no panel address, SSH/root credential, fingerprint, slug, component
+selection, or provisioning transaction. subentries is empty. Broker failure
+creates no entry. First-panel failure does not delete this valid fleet.
 
 - [ ] **Step 5: Persist the recovery anchor and chain the standard subentry flow**
 
@@ -628,17 +635,20 @@ flow context cannot be trusted because it is not durable. For STAGED,
 ACTIVATION_PENDING, ACTIVATED, or VERIFYING without a persisted exact subentry,
 perform the recorded idempotent rollback; never synthesize a subentry from the
 journal. For PENDING_CONFIG_COMMIT, complete only one exact marked subentry in
-the singleton fleet whose kind, host, port, and TLS mode match the journal.
+the singleton fleet whose host, port, and TLS mode match the journal transport.
+Broker kind is guidance-only and must not invalidate unchanged transport
+ownership.
 
 When Home Assistant abandons either config flow, settle cancellation and
 rollback the context's exact uncommitted transaction. When removing a fleet
 entry, call async_recover_removed_entry even though Home Assistant has already
 removed it from the registry. Recovery may claim the journal only if the
-removed object is the exact singleton fleet envelope and its broker kind, host,
-port, and TLS mode match the journal. Do not add credentials, CA bodies, or
-secret hashes to the journal to strengthen this match. Competing fleet/legacy
-state, a different envelope, or ambiguous markers fail closed and preserve a
-redacted repair. COMMITTED is clear-only and must never trigger panel rollback.
+removed object is the exact singleton fleet envelope and its host, port, and
+TLS mode match the journal transport. Broker kind is excluded because it does
+not affect the connection. Do not add credentials, CA bodies, or secret hashes
+to the journal to strengthen this match. Competing fleet/legacy state, a
+different envelope, or ambiguous markers fail closed and preserve a redacted
+repair. COMMITTED is clear-only and must never trigger panel rollback.
 
 - [ ] **Step 8: Run flow, recovery, and provisioning tests**
 
@@ -695,6 +705,12 @@ Panel reconfigure must expose:
 
 Assert the seven globals update once on fleet data and never in a subentry. Assert scene_panel accepts only a current subentry_id. Assert a renamed panel keeps slug, fingerprint, management_id, MQTT topics, and entity unique IDs. Assert a changed address must present the existing key before any password is sent.
 
+Assert an active feature's payload-producing overrides cannot be persisted
+without a live rollout. Assert a material broker change on an empty fleet
+shares the provisioning lock, rejects every active/unreadable journal state,
+and revalidates ownership after the lock. Assert duplicate fingerprints,
+management IDs, and positive mesh priorities fail closed.
+
 - [ ] **Step 2: Run focused tests and verify old options failures**
 
 Run: uv run --project ha pytest -c ha/pyproject.toml ha/tests/test_config_flow.py ha/tests/test_fleet_manager.py -q
@@ -707,11 +723,43 @@ Broker/credential change in this plan may update an empty fleet or validate an i
 
 Update globals atomically on the fleet entry and notify FleetManager. Validate room_overrides, ha_control_domains, scene_actions, and max count with existing typed validators, now in flow_schemas.py. Replace panel-slug scene owner with the chosen panel subentry_id.
 
+The initial default-off HA-control choice is stored before the first panel.
+Once any panel exists, changing that enabled flag aborts with
+ha_control_change_requires_agent_rollout. Control-plane reload runs outside the
+lifecycle lock; a generation-tagged pending target survives failure or
+cancellation, retries on an identical reconcile, and cannot be cleared by an
+older concurrent completion.
+
+For a material empty-fleet broker update, acquire the shared fleet/provisioning
+lock, reject any active panel flow or provisioning journal (including an
+unreadable store), then re-resolve the exact entry and profile before the
+synchronous commit. Broker-kind-only guidance changes do not cross this
+transport boundary.
+
 - [ ] **Step 4: Implement safe panel reconfigure/rebind**
 
 Rename changes title/name only. Address or password change fetches candidate identity first and accepts it only if fingerprint equals stored identity. Rebind is a separate confirm screen displaying old/new fingerprints; deliberate confirmation preserves slug/management ID but stores the new canonical key/fingerprint and records an audit event. It never runs from a normal credential repair.
 
 Remove OPT_TRUST_HOST_KEY_CHANGES from fleet options. Legacy adapters still surface a repair issue explaining that their opt-in cannot migrate automatically.
+
+Rebind acquires both lifecycle and provisioning locks, requires a clear
+readable journal, verifies unauthenticated identity immediately before
+persistence, and rechecks the registered subentry plus all fingerprints and
+management IDs after each awaited boundary. The old physical management ID
+remains reserved after rebind. If restoring the original config-entry snapshot
+cannot be durably proven, create one stable redacted storage repair and direct
+operators to stop panel operations until it is resolved.
+An active or unreadable journal aborts with
+rebind_blocked_by_panel_onboarding and recovery-specific documentation; it is
+not reported as a stopped runtime.
+
+Component install/remove operations settle cancellation through the remote
+command, SSH close, and synchronous Home Assistant config-entry flag update.
+Remote-versus-stored ambiguity produces one stable redacted repair issue and
+preserves the pre-operation flag unless the remote command is proven; a later
+fully proven operation clears it. Do not add a second per-toggle write-ahead
+journal. Active Voice wake-word/HA-host and diyHue CA overrides require the
+component to be disabled or a dedicated live selector.
 
 - [ ] **Step 5: Run day-two tests**
 
@@ -748,7 +796,7 @@ git commit -m "feat: add focused fleet and panel settings"
 
 Add a test that recursively compares strings.json and en.json keys. Require titles/descriptions/errors for every new step, both broker choices, every stable foundation/provisioning code, duplicate panel, explicit rebind, and legacy migration required. Assert each error includes one recommended action and documentation slug.
 
-Fleet diagnostics allow broker kind/host/port/TLS boolean, HA MQTT state, validation stage/time, panel counts/health, and schema version. Panel diagnostics allow fingerprint/model/address/version/components/priority/leadership/health timestamps/journal phase. Assert serialized diagnostics contain none of either password, username value, CA PEM, environment body, or raw setup nonce.
+Fleet diagnostics allow broker kind/host/port/TLS boolean, HA MQTT state, validation stage/time, panel counts/health, and schema version. Panel diagnostics allow fingerprint/model/address/version/components/priority/leadership/health timestamps/journal phase. Assert serialized diagnostics contain none of either password, username value, CA PEM, environment body, raw setup nonce, exception/stderr text, malformed MQTT body, or raw journal detail. Runtime problem reasons are mapped to stable categories before serialization.
 
 - [ ] **Step 2: Run and verify incomplete metadata failures**
 
@@ -770,8 +818,8 @@ Run:
 
 ~~~bash
 uv run --project ha pytest -c ha/pyproject.toml ha/tests/test_diagnostics.py ha/tests/test_config_flow.py ha/tests/test_brand.py -q
-python -m json.tool custom_components/brilliant_mqtt/strings.json >/dev/null
-python -m json.tool custom_components/brilliant_mqtt/translations/en.json >/dev/null
+uv run --project ha python -m json.tool custom_components/brilliant_mqtt/strings.json >/dev/null
+uv run --project ha python -m json.tool custom_components/brilliant_mqtt/translations/en.json >/dev/null
 rg -n "Recommended|Existing MQTT broker|Add panel|rebind|mesh priority" INSTALL.md docs/ha-integration.md
 ~~~
 
@@ -793,24 +841,33 @@ git commit -m "docs: describe fleet-first MQTT onboarding"
 Run:
 
 ~~~bash
-uv run ruff check --fix
-uv run ruff format
-uv run mypy --strict src tests
+scripts/build_payload.sh
+git diff --exit-code -- custom_components/brilliant_mqtt/agent_payload
+test -z "$(git ls-files --others --exclude-standard -- custom_components/brilliant_mqtt/agent_payload)"
+test -z "$(git ls-files --others --ignored --exclude-standard -- custom_components/brilliant_mqtt/agent_payload)"
+uv run ruff check
+uv run ruff format --check
+uv run mypy --strict src tests scripts/brilliant-panel/bundle_manifest.py
 uv run pytest
-uv run --project ha ruff check --fix --config ha/pyproject.toml custom_components/brilliant_mqtt ha/tests
-uv run --project ha ruff format --config ha/pyproject.toml custom_components/brilliant_mqtt ha/tests
+uv run --project ha ruff check --config ha/pyproject.toml custom_components/brilliant_mqtt ha/tests
+uv run --project ha ruff format --check --config ha/pyproject.toml custom_components/brilliant_mqtt ha/tests
 uv run --project ha mypy --strict --config-file ha/pyproject.toml custom_components/brilliant_mqtt ha/tests
 uv run --project ha pytest -c ha/pyproject.toml ha/tests
 git diff --check
 ~~~
 
-Expected: every command exits 0.
+Expected: every command exits 0, and rebuilding the committed agent payload
+produces no modified, ordinary-untracked, or ignored-untracked payload files.
 
 - [ ] **Step 2: Run the disposable broker suite**
 
 Run: scripts/run_mqtt_validation_tests.sh
 
-Expected: PASS for plaintext/TLS and the expected typed ACL/auth/mismatch failures.
+Expected: PASS for plaintext/TLS. An MQTT 3.1.1 deny fixture that silently drops
+Discovery publishes produces retryable `discovery_write_timeout` guidance
+because routing and ACL failure are observationally ambiguous; an authorization
+failure the broker actually reports remains `discovery_write_denied`.
+Authentication, TLS-verification, and broker-mismatch failures remain typed.
 
 - [ ] **Step 3: Exercise one official-Mosquitto canary**
 
@@ -826,15 +883,32 @@ On a disposable HA test instance and designated pilot panel:
 - complete staged preflight/activation;
 - verify one fleet entry, one panel subentry, fresh normal MQTT entities, and management entities associated with that subentry;
 - rename the panel and verify topics/unique IDs do not change;
-- uninstall/reinstall the integration entry only after preserving raw evidence under gitignored artifacts/.
+- uninstall/reinstall the integration entry only after preserving sanitized,
+  path/hash-only evidence under gitignored `artifacts/`; raw logs, credentials,
+  environment contents, host details, and command transcripts are prohibited.
+
+Office is not eligible for this canary. Keep Office on its unchanged external
+broker and run the official `core_mosquitto` path on a separate disposable Home
+Assistant instance and pilot panel. The official-Mosquitto qualification
+remains outstanding until that separate canary completes.
 
 - [ ] **Step 4: Exercise one external-broker canary**
 
 Repeat against a broker not managed by Home Assistant, once plaintext or trusted-public-CA TLS and once custom-CA TLS. Verify no core_mosquitto lookup/install is attempted, both ACL principals are required, panel path validation succeeds, and the resulting stored schema is identical except broker kind/profile values.
 
+Office may be used only for the unchanged existing-broker, software-only
+portion after the exact-bundle parity, durable-journal, and immutable-prior-
+release gates in `docs/reference/deployment.md` pass. That does not substitute
+for the two disposable external-broker TLS variants, and it never authorizes
+physical load actuation.
+
 - [ ] **Step 5: Re-run resource/safety gates**
 
 Verify one resident agent/MQTT connection/bus peer, RSS and CPU limits from plan 1, temporary preflight exit before agent start, no duplicate client-ID disconnect, rollback after a deliberately failed staged unit, and normal physical controls through broker/HA restarts.
+
+For Office, defer the final physical-control clause until that exact safe
+circuit is separately approved. Record it as outstanding rather than inferring
+success from software or MQTT health.
 
 - [ ] **Step 6: Commit sanitized canary evidence**
 

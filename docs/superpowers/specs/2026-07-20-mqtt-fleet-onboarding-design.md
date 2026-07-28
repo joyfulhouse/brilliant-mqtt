@@ -1,8 +1,8 @@
 # MQTT Fleet Onboarding Simplification — Design
 
 - **Date:** 2026-07-20
-- **Last revised:** 2026-07-27, after crash-recovery architecture review
-- **Status:** Approved 2026-07-21; implementation plans ready
+- **Last revised:** 2026-07-28, after implementation adversarial review
+- **Status:** Approved 2026-07-21; implementation and qualification in progress
 - **Scope:** Replace the one-entry-per-panel setup wizard with a fleet-first
   Home Assistant integration, validate MQTT end to end during onboarding, and
   preserve the existing MQTT topic/entity contract. Narrow, additive panel-
@@ -166,12 +166,15 @@ The default experience has these properties:
   reachable from panels plus the dedicated fleet username and password.
 - The existing-broker path asks for host, port, username, and password; TLS and
   certificate controls appear only when Advanced settings are opened.
+- The broker form has one explicit **Enable Home Assistant control** choice,
+  defaults it off, and stores it before the first panel is provisioned. Detailed
+  control-plane settings remain in the focused fleet flow.
 - Add panel asks initially for address and root password. SSH inspection
   discovers identity and suggests the name on a confirmation step.
 - Core bridge and watchdog behavior use safe defaults.
 - Mesh priority is assigned automatically.
-- Voice, diyHue, HA controls, certificates, and other specialist features do
-  not appear during core onboarding.
+- Voice, diyHue, certificates, and other specialist settings do not appear
+  during core onboarding.
 - Setup cannot finish until real MQTT messages traverse both directions.
 
 ## Alternatives considered
@@ -237,6 +240,15 @@ unassigned value is valid only while the fleet has zero panel subentries. The
 first exact journal-to-subentry ownership handoff replaces that sentinel with
 the new subentry ID before the transaction is committed. No lexicographic
 panel-slug election or implicit settings owner remains.
+
+The initial broker form owns the default-off `ha_control_enabled` choice so the
+first panel is rendered consistently with the durable fleet. Once any panel
+exists, changing that installation flag requires the guided agent-rollout
+operation; the fleet settings form must not claim that a config-entry update
+alone changed panel behavior. Other control-plane settings reload outside the
+fleet lifecycle lock. Failed or cancelled reloads retain a generation-tagged
+pending target and are retried without allowing an older completion to clear a
+newer target.
 
 The broker kind changes guidance and defaults only. Runtime validation and
 panel rendering use one normalized connection-profile type for both paths.
@@ -354,7 +366,7 @@ correct panel ACL alone cannot complete the end-to-end probes:
 | Principal | Minimum Brilliant-related access |
 |---|---|
 | Dedicated Brilliant fleet user used by every panel | Read/write `brilliant/#`; write `homeassistant/#` |
-| Home Assistant MQTT user | Read/write `brilliant/#`; read `homeassistant/#`; retain its normal MQTT permissions, including write access to its configured birth/will/status topics (default `homeassistant/status`) |
+| Home Assistant MQTT user | Read/write `brilliant/#`; read `homeassistant/#`; write `homeassistant/brilliant_mqtt_setup/+/probe` so validation can independently clear its retained setup probe; retain its normal MQTT permissions, including write access to its configured birth/will/status topics (default `homeassistant/status`) |
 
 The official Mosquitto app normally supplies Home Assistant's internal access;
 the dedicated Brilliant user is still required. On an external broker, the
@@ -560,7 +572,10 @@ subentry ID. The integration durably removes the temporary marker before
 marking the journal committed and clearing it. The core bridge plus the current
 Wi-Fi and independent bus watchdog defaults are enabled. Optional voice,
 diyHue, HA control, and certificate-recovery components remain off until their
-focused post-install flow is completed.
+focused post-install flow is completed. HA control is the one exception when
+the user explicitly enabled its default-off choice on the broker form: the
+first panel is then provisioned consistently with that already-durable fleet
+choice.
 
 ### Automatic mesh priority
 
@@ -607,6 +622,14 @@ automatic fleet rollback is deferred until the provisioning journal has proven
 safe on hardware. Old broker/profile material is removed only after the user
 confirms that every panel is healthy on the new path.
 
+Until that journaled multi-panel operation ships, the implemented focused
+broker flow permits only an identical profile or a material change on an empty
+fleet. A material empty-fleet change shares the fleet provisioning/SSH lock and
+is rejected while any add-panel flow owns live work, any provisioning journal
+exists, or journal state cannot be read. After acquiring the lock it re-reads
+the exact registered entry and broker profile before committing. A
+guidance-only broker-kind correction is not a material transport change.
+
 ### Panel menu
 
 Each panel subentry exposes focused actions:
@@ -623,6 +646,26 @@ Enabling an optional feature opens only that feature's required inputs. Home
 Assistant area, device, entity, and label selectors replace raw JSON wherever
 the source data is in Home Assistant registries. Expert-only values remain in a
 clearly labeled Advanced step and are documented individually.
+
+Values for an inactive feature may be prepared without touching the panel.
+Once Voice or diyHue CA handling is active, changing a payload-producing
+override cannot update durable configuration alone: the user must use the
+feature's live selector when available, or disable the component, edit the
+stored value, and re-enable it. The flow serializes those commits with fleet
+provisioning and revalidates the exact panel owner and optimistic snapshot
+after acquiring the lock.
+
+Explicit rebind also shares the fleet lifecycle/provisioning lock. It requires
+a clear, readable provisioning journal, verifies the unauthenticated SSH
+identity again immediately before persistence, and rechecks the registered
+subentry and all stable identities after every awaited boundary. The original
+management ID remains reserved so the old physical identity cannot later be
+added as a second panel. If restoring the pre-rebind config-entry snapshot
+cannot be durably proven, the integration creates a stable repair issue and
+directs operators to stop panel operations until storage is repaired.
+An active or unreadable journal returns the dedicated
+`rebind_blocked_by_panel_onboarding` result with recovery-specific guidance; it
+must not be mislabeled as a stopped fleet runtime.
 
 Removing a panel first runs an explicit uninstall-and-cleanup transaction. It
 stops the service, consumes its retained-topic ownership manifest, then clears
@@ -735,17 +778,19 @@ root passwords, private keys, tokens, or unredacted environment files.
   subentry is rolled back; startup never invents or auto-creates a panel
   subentry from sensitive journal data.
 - A `pending_config_commit` journal completes only against one exact matching
-  subentry and singleton fleet envelope whose kind, host, port, and TLS mode
-  match the journal's stored profile. The first exact handoff normalizes the
-  reserved scene owner to that subentry. Missing, competing, or mismatched
-  ownership fails closed and preserves a repairable journal.
+  subentry and singleton fleet envelope whose host, port, and TLS mode match
+  the journal's stored transport. Broker kind is persisted operator guidance,
+  not runtime transport identity, so a guidance-only correction cannot orphan
+  an in-flight journal. The first exact handoff normalizes the reserved scene
+  owner to that subentry. Missing, competing, or mismatched ownership fails
+  closed and preserves a repairable journal.
 - Removing the fleet may operate on a journal only when the removed entry is
-  the exact singleton fleet and its persisted broker kind, host, port, and TLS
-  mode match the journal envelope. It does not add credentials, certificate
-  bodies, or secret hashes to the journal for this purpose. Ambiguous ownership
-  is preserved and reported rather than guessed. A `committed` record is
-  clear-only: removal must never roll back a panel whose ownership handoff
-  already committed.
+  the exact singleton fleet and its persisted host, port, and TLS mode match
+  the journal transport. Broker kind is excluded because it does not alter the
+  connection. The journal does not add credentials, certificate bodies, or
+  secret hashes for this purpose. Ambiguous ownership is preserved and
+  reported rather than guessed. A `committed` record is clear-only: removal
+  must never roll back a panel whose ownership handoff already committed.
 - First-install activation failure leaves no active partial service. Verified
   compensation removes the failed transaction's candidate release before
   clearing the journal.
@@ -763,6 +808,14 @@ root passwords, private keys, tokens, or unredacted environment files.
 - After fresh health is durably recorded, a bounded graceful SSH-close failure
   does not reopen and roll back the healthy panel. Explicit cancellation before
   config-entry ownership handoff still performs the exact rollback.
+- Rebind and material empty-fleet broker edits serialize with provisioning and
+  require a clear, readable journal. Rebind rechecks both durable ownership and
+  the unauthenticated SSH identity at its final commit boundary.
+- Component install/remove cancellation is settled through remote command
+  completion, SSH close, and the synchronous Home Assistant config-entry flag
+  update. Ambiguous remote-versus-stored state creates one redacted repair
+  issue; a later completely proven operation clears it. This does not add a
+  second per-toggle write-ahead journal.
 
 Runtime outages do not block Home Assistant startup. The fleet loads degraded
 and reconnects with bounded exponential backoff. One broker outage produces one
@@ -892,6 +945,10 @@ Fleet diagnostics include, with secrets redacted:
 - aggregate panel health and migration version;
 - active repair issues.
 
+Diagnostics expose only stable problem categories. Raw exception text, command
+stderr, journal payloads, malformed MQTT bodies, and translation placeholders
+derived from them are excluded even when an unexpected runtime failure occurs.
+
 Panel diagnostics include:
 
 - SSH host-key fingerprint, model, address, installed version, and enabled
@@ -902,7 +959,8 @@ Panel diagnostics include:
 - availability and last state/discovery timestamps;
 - last deployment transaction and rollback result;
 - retained-topic ownership schema/count and last verified cleanup result;
-- bounded/redacted service journal excerpts.
+- bounded service-journal category counts and typed probe metrics. Raw journal,
+  stdout, and stderr text is never persisted.
 
 User documentation is reorganized around tasks:
 
@@ -936,6 +994,12 @@ the official-app path; external-broker guidance remains protocol-neutral.
 - Secret sentinel preservation and redaction.
 - Normalization and equality of broker profiles.
 - Validation state-machine timeouts, cancellation, cleanup, and error mapping.
+- Initial default-off HA-control persistence and the post-panel rollout gate.
+- Broker edit, rebind, and active-feature override serialization against
+  provisioning/journal ownership.
+- Control-plane reload failure, cancellation, identical retry, and concurrent
+  generation ordering.
+- Component toggle cancellation and remote/durable ambiguity settlement.
 - TLS settings parsing and one strict client factory shared by runtime and
   preflight.
 - SSH trust-on-first-use pinning, fingerprint-derived identity, duplicate
@@ -1077,10 +1141,14 @@ rollback, documentation, and preservation gates are met.
   incompatible Home Assistant prefix fails before provisioning.
 - New panel onboarding has no broker fields, raw JSON, mesh priority, or
   unrelated optional-feature settings.
+- Initial HA control is an explicit default-off choice; changing its enabled
+  state after panels exist cannot bypass agent rollout.
 - Broker validation proves both message directions and retained behavior.
 - Panel validation proves the actual panel network path before activation.
 - Success requires normal agent availability and discovery.
 - Errors identify the failed stage and provide a specific recovery link.
+- Day-two broker edits, rebinds, component toggles, and feature overrides never
+  report a durable state that has not been proven against live ownership.
 - Failed installs and upgrades are inactive or rolled back. Partial broker
   changes halt, preserve per-panel state, and expose verified explicit reverts.
 - Compatible existing entries migrate without changing MQTT topics or entity

@@ -12,8 +12,7 @@ prerequisites checklist and deploy choice, and links these focused guides:
 - [install/mqtt-broker.md](install/mqtt-broker.md) — the recommended official
   Home Assistant Mosquitto app/add-on (`core_mosquitto`), an equally supported
   existing local/remote/hosted broker, strict TLS profiles, the two-principal
-  ACL, current lifecycle limitations, and the forthcoming fleet-validation
-  error contract.
+  ACL, active fleet validation, and its stage-specific error contract.
 
 ## User guides
 

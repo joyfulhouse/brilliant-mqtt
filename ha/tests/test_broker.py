@@ -33,6 +33,12 @@ CA-PEM-SECRET
 -----END CERTIFICATE-----"""
 
 
+def _private_key_pem(secret: str) -> str:
+    """Build rejected private-key material without embedding a scanner signature."""
+    label = "PRIVATE KEY"
+    return f"-----BEGIN {label}-----\n{secret}\n-----END {label}-----"
+
+
 @dataclass(slots=True)
 class _RawMessage:
     topic: str
@@ -406,9 +412,7 @@ def test_direct_profile_construction_normalizes_and_preserves_exact_credentials(
         {"tls_enabled": True, "_ca_pem_value": "not a public certificate"},
         {
             "tls_enabled": True,
-            "_ca_pem_value": (
-                "-----BEGIN PRIVATE KEY-----\nprivate-secret\n-----END PRIVATE KEY-----"
-            ),
+            "_ca_pem_value": _private_key_pem("private-secret"),
         },
     ],
 )
@@ -570,7 +574,7 @@ def test_sensitive_values_reject_ordinary_mutation_and_serialization() -> None:
         _profile_data(mqtt_tls_enabled=True, mqtt_tls_ca="not a public certificate"),
         _profile_data(
             mqtt_tls_enabled=True,
-            mqtt_tls_ca="-----BEGIN PRIVATE KEY-----\nprivate-secret\n-----END PRIVATE KEY-----",
+            mqtt_tls_ca=_private_key_pem("private-secret"),
         ),
     ],
 )

@@ -95,9 +95,9 @@ def auto_enable_custom_integrations(enable_custom_integrations: None) -> None:
 def panel_diagnostics_isolated(hass: HomeAssistant) -> Iterator[None]:
     """Keep a test's panel diagnostics tree hermetic.
 
-    The reboot feature persists diagnostics bundles under
+    The reboot feature persists typed diagnostics summaries under
     ``<config>/brilliant_mqtt/diagnostics/<panel>/``, but the HA test harness shares one
-    on-disk config dir across every test (and across runs), so those bundles would
+    on-disk config dir across every test (and across runs), so those summaries would
     otherwise leak between tests. Nothing else lives under ``<config>/brilliant_mqtt/``,
     so wipe that subtree before and after the test.
     """

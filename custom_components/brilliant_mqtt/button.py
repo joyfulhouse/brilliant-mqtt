@@ -51,7 +51,7 @@ class RepairButton(BrilliantPanelEntity, ButtonEntity):
 
 
 class RebootPanelButton(BrilliantPanelEntity, ButtonEntity):
-    """Capture pre-reboot diagnostics, then reboot the panel (clears the uptime wedge)."""
+    """Capture a typed diagnostics summary, then reboot the panel."""
 
     _attr_device_class = ButtonDeviceClass.RESTART
     _attr_entity_category = EntityCategory.CONFIG
@@ -62,8 +62,8 @@ class RebootPanelButton(BrilliantPanelEntity, ButtonEntity):
         self._attr_unique_id = f"{manager.store.management_id}_reboot_panel"
 
     async def async_press(self) -> None:
-        # Always capture diagnostics on a manual press (journald is volatile — the
-        # reboot erases it); service callers can opt out via the service field.
+        # Always capture the typed summary on a manual press (journald is volatile —
+        # the reboot erases it); service callers can opt out via the service field.
         await self._manager.async_reboot(collect_diagnostics=True)
 
 

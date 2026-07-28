@@ -109,10 +109,46 @@ _RETAINED_LEDGER_PROBLEM = (
     "agent retained-topic ownership ledger is unreadable or unwritable; "
     "check /var/brilliant-mqtt/state/owned-topics.json and panel storage"
 )
+_SAFE_PANEL_OP_DETAILS = {
+    "mqtt_ca_promotion_failed": "mqtt_ca_promotion_failed",
+    "mqtt_ca_verification_failed": "mqtt_ca_verification_failed",
+    "mqtt_tls_downgrade_refused": "mqtt_tls_downgrade_refused",
+}
+_PANEL_OP_CODE_PREFIX_LIMIT = 64
 
 
 class _HostKeyChanged(Exception):
     """Pinned SSH host key no longer matches and auto-re-pin is disabled."""
+
+
+def _safe_failure_summary(summary: str, error: BaseException | None = None) -> str:
+    """Return fixed context plus an explicitly allowlisted panel-operation code."""
+    if isinstance(error, PanelOpError):
+        # Panel operations may append diagnostics after ``"<stable-code>: "``.
+        # Match only the bounded code field and never export the appended detail.
+        code = str(error)[:_PANEL_OP_CODE_PREFIX_LIMIT].partition(":")[0]
+        if safe_code := _SAFE_PANEL_OP_DETAILS.get(code):
+            return f"{summary} ({safe_code})"
+    return summary
+
+
+@callback
+def async_delete_panel_issues(hass: HomeAssistant, management_id: str) -> None:
+    """Delete every repair issue owned by one removed panel runtime."""
+    from .components import REGISTRY  # lazy: components imports manager
+
+    issue_ids = (
+        f"needs_attention_{management_id}",
+        f"voice_missing_{management_id}",
+        f"ha_mirror_retired_{management_id}",
+        *(
+            f"component_state_unverified_{management_id}_{component.id}"
+            for component in REGISTRY.values()
+            if not component.deprecated
+        ),
+    )
+    for issue_id in issue_ids:
+        ir.async_delete_issue(hass, DOMAIN, issue_id)
 
 
 def _payload_dir() -> Path:
@@ -246,6 +282,40 @@ class PanelManager:
         """Issue-registry id for 'voice enabled but satellite not running'."""
         return f"voice_missing_{self.management_id}"
 
+    def _component_issue_id(self, component_id: str) -> str:
+        """Return one stable issue ID for an unverified component mutation."""
+        return f"component_state_unverified_{self.management_id}_{component_id}"
+
+    def _create_component_state_issue(self, component_id: str, *, enabled: bool) -> None:
+        """Report an unproven physical component state without exception text."""
+        action = "installation" if enabled else "removal"
+        ir.async_create_issue(
+            self.hass,
+            DOMAIN,
+            self._component_issue_id(component_id),
+            is_fixable=False,
+            severity=ir.IssueSeverity.ERROR,
+            translation_key="needs_attention",
+            translation_placeholders={
+                "panel": self.panel,
+                "reason": (
+                    f"{component_id} component physical state is unverified after "
+                    f"{action}; retry the same component action"
+                ),
+            },
+            learn_more_url=(
+                "https://github.com/joyfulhouse/brilliant-mqtt/blob/main/docs/ha-integration.md"
+            ),
+        )
+
+    def _clear_component_state_issue(self, component_id: str) -> None:
+        """Clear an unverified-state issue only after a proven later mutation."""
+        ir.async_delete_issue(
+            self.hass,
+            DOMAIN,
+            self._component_issue_id(component_id),
+        )
+
     @property
     def _ha_mirror_issue_id(self) -> str:
         return f"ha_mirror_retired_{self.management_id}"
@@ -270,6 +340,18 @@ class PanelManager:
             self.store.data[CONF_HOST],
             self.store.data[CONF_ROOT_PASSWORD],
             None,
+        )
+
+    def _host_key_changed_guidance(self) -> str:
+        """Return architecture-appropriate recovery without unsafe fleet advice."""
+        if isinstance(self.store, LegacyPanelStore):
+            return (
+                "panel SSH host key changed — open Reconfigure to re-pin, or "
+                "enable 'Trust host-key changes' in options"
+            )
+        return (
+            "panel SSH host key changed — verify the configured address; for a "
+            "deliberately replaced or reflashed panel, use its explicit Rebind action"
         )
 
     def _retain_abandoned_close(self, task: asyncio.Task[None]) -> None:
@@ -426,7 +508,18 @@ class PanelManager:
         async_dispatcher_send(self.hass, self.signal)
 
     def _opt(self, key: str, default: Any) -> Any:
-        return self.store.options.get(key, default)
+        if isinstance(self.store, LegacyPanelStore):
+            return self.store.options.get(key, default)
+        if key == OPT_TRUST_HOST_KEY_CHANGES:
+            return default
+        fleet_default = default
+        if key == OPT_AUTO_REPAIR:
+            fleet_default = self.fleet.auto_repair
+        elif key == OPT_OFFLINE_GRACE_MINUTES:
+            fleet_default = self.fleet.offline_grace_minutes
+        elif key == OPT_REPAIR_COOLDOWN_MINUTES:
+            fleet_default = self.fleet.repair_cooldown_minutes
+        return self.store.options.get(key, fleet_default)
 
     def _panel_override(self, key: str, default: Any) -> Any:
         """Read new-fleet feature overrides while preserving legacy data layout."""
@@ -691,6 +784,15 @@ class PanelManager:
         )
         self._set_problem(True, reason)
 
+    @staticmethod
+    def _translated_failure(translation_key: str, summary: str) -> HomeAssistantError:
+        """Build one translated exception carrying only fixed failure context."""
+        return HomeAssistantError(
+            translation_domain=DOMAIN,
+            translation_key=translation_key,
+            translation_placeholders={"error": summary},
+        )
+
     def _broker_release_settings(self) -> PanelBrokerReleaseSettings:
         """Render broker settings without exporting fleet credentials.
 
@@ -845,11 +947,10 @@ class PanelManager:
             if self.store.data.get(CONF_COMPONENTS, {}).get(COMPONENT_VOICE, False):
                 try:
                     voice_tarball = await async_fetch_voice_payload(self.hass)
-                except VoicePayloadError as fetch_err:
+                except VoicePayloadError:
                     _LOGGER.warning(
-                        "%s: could not fetch voice payload for repair: %s",
+                        "%s: voice payload fetch failed during repair",
                         self.panel,
-                        fetch_err,
                     )
             async with self._ssh_lock:
                 try:
@@ -860,16 +961,18 @@ class PanelManager:
                     # just hit the same mismatch — so escalate for operator action and
                     # arm NO timer. _escalate already sets problem.
                     self._fire(EVENT_REPAIR_FAILED, {"reason": "host_key_changed"})
-                    self._escalate(
-                        "panel SSH host key changed (likely a firmware reflash) — open "
-                        "Reconfigure to re-pin, or enable 'Trust host-key changes' in "
-                        "options for hands-off repair"
-                    )
+                    self._escalate(self._host_key_changed_guidance())
                     self._last_repair_mono = time.monotonic()
                     return  # needs operator action; a recheck would just hit the same mismatch
                 except (OSError, asyncssh.Error, PanelOpError) as connect_err:
                     self._fire(EVENT_REPAIR_FAILED, {"reason": "unreachable"})
-                    self._set_problem(True, f"panel unreachable: {connect_err}")
+                    self._set_problem(
+                        True,
+                        _safe_failure_summary(
+                            "panel unreachable during repair",
+                            connect_err,
+                        ),
+                    )
                     # Record the cooldown so the recheck does not re-offer the root
                     # password to a flapping host every few minutes forever.
                     self._last_repair_mono = time.monotonic()
@@ -900,8 +1003,8 @@ class PanelManager:
                     if voice_tarball is not None:
                         try:
                             await self._deploy_voice(shell, voice_tarball)
-                        except (OSError, asyncssh.Error, PanelOpError) as voice_err:
-                            _LOGGER.warning("%s: voice repair failed: %s", self.panel, voice_err)
+                        except (OSError, asyncssh.Error, PanelOpError):
+                            _LOGGER.warning("%s: voice repair failed", self.panel)
                             ir.async_create_issue(
                                 self.hass,
                                 DOMAIN,
@@ -924,8 +1027,8 @@ class PanelManager:
 
                     selected = selected_ids(self.store.data)
                     if COMPONENT_WIFI_WATCHDOG in selected:
-                        if err := await self._relay_watchdog(shell, _WIFI_WATCHDOG_RELAY):
-                            _LOGGER.warning("%s: watchdog repair failed: %s", self.panel, err)
+                        if await self._relay_watchdog(shell, _WIFI_WATCHDOG_RELAY):
+                            _LOGGER.warning("%s: watchdog repair failed", self.panel)
                     # Bus watchdog re-lay: re-write unit to /etc if selected.
                     # OTA wipes /etc/systemd/system/ so the unit disappears after a
                     # firmware update even though the code survives in /var.  Lay it
@@ -933,8 +1036,8 @@ class PanelManager:
                     # watchdog keeps running across OTAs.  Failure is logged and
                     # swallowed — a watchdog outage must not block the bridge repair.
                     if COMPONENT_BUS_WATCHDOG in selected:
-                        if err := await self._relay_watchdog(shell, _BUS_WATCHDOG_RELAY):
-                            _LOGGER.warning("%s: bus watchdog repair failed: %s", self.panel, err)
+                        if await self._relay_watchdog(shell, _BUS_WATCHDOG_RELAY):
+                            _LOGGER.warning("%s: bus watchdog repair failed", self.panel)
                     # Hue CA recovery hook re-lay: re-write its units to /etc if selected.
                     # OTA wipes /etc/systemd/system/ (and /data — what the hook itself
                     # recovers), so the timer disappears after a firmware update even
@@ -943,8 +1046,8 @@ class PanelManager:
                     # hook keeps re-appending the CA across OTAs. Failure is logged and
                     # swallowed — a hue-ca outage must not block the bridge repair.
                     if COMPONENT_HUE_CA in selected:
-                        if err := await self._relay_hue_ca(shell):
-                            _LOGGER.warning("%s: hue-ca repair failed: %s", self.panel, err)
+                        if await self._relay_hue_ca(shell):
+                            _LOGGER.warning("%s: hue-ca repair failed", self.panel)
                     try:
                         retirement_result = await self._async_retire_legacy_ha_mirror_on_shell(
                             shell
@@ -960,9 +1063,14 @@ class PanelManager:
                     # through to the success path (no recovery timer would ever fire).
                     self._fire(
                         EVENT_REPAIR_FAILED,
-                        {"reason": "repair_step_failed", "error": str(repair_err)},
+                        {"reason": "repair_step_failed"},
                     )
-                    self._escalate(f"repair step failed: {repair_err}")
+                    self._escalate(
+                        _safe_failure_summary(
+                            "panel repair step failed",
+                            repair_err,
+                        )
+                    )
                     self._last_repair_mono = time.monotonic()  # gate any retry
                     return
                 finally:
@@ -1015,28 +1123,33 @@ class PanelManager:
 
         try:
             _p(10)
-            version = await self._payload_version()
+            try:
+                version = await self._payload_version()
+            except OSError as error:
+                summary = _safe_failure_summary(
+                    "agent update could not read the bundled release",
+                    error,
+                )
+                self._escalate(summary)
+                raise self._translated_failure("update_failed", summary) from None
             async with self._ssh_lock:
                 try:
                     shell = await self._connect_for_repair()
-                except _HostKeyChanged as err:
+                except _HostKeyChanged:
                     # A rotated host key with auto-re-pin OFF: never offer the password to
                     # the new-key host. Service-call context → escalate AND raise so HA
                     # reports the install as failed (not a false success).
-                    self._escalate(
-                        "panel SSH host key changed — Reconfigure to re-pin, or enable "
-                        "'Trust host-key changes' in options"
-                    )
+                    self._escalate(self._host_key_changed_guidance())
                     raise HomeAssistantError(
                         translation_domain=DOMAIN, translation_key="host_key_changed"
-                    ) from err
+                    ) from None
                 except (OSError, asyncssh.Error) as err:
-                    self._escalate(f"agent update failed: {err}")
-                    raise HomeAssistantError(
-                        translation_domain=DOMAIN,
-                        translation_key="update_failed",
-                        translation_placeholders={"error": str(err)},
-                    ) from err
+                    summary = _safe_failure_summary(
+                        "agent update could not connect to the panel",
+                        err,
+                    )
+                    self._escalate(summary)
+                    raise self._translated_failure("update_failed", summary) from None
                 _p(25)
                 try:
                     retirement_result: bool | None = None
@@ -1059,12 +1172,12 @@ class PanelManager:
                         )
                     _p(95)
                 except (OSError, asyncssh.Error, PanelOpError) as err:
-                    self._escalate(f"agent update failed: {err}")
-                    raise HomeAssistantError(
-                        translation_domain=DOMAIN,
-                        translation_key="update_failed",
-                        translation_placeholders={"error": str(err)},
-                    ) from err
+                    summary = _safe_failure_summary(
+                        "agent update failed during deployment",
+                        err,
+                    )
+                    self._escalate(summary)
+                    raise self._translated_failure("update_failed", summary) from None
                 finally:
                     close_ok = await self._async_close_shell(shell)
                 self._complete_ha_mirror_retirement_after_close(retirement_result, close_ok)
@@ -1094,35 +1207,36 @@ class PanelManager:
         async with self._ssh_lock:
             try:
                 shell = await self._connect_for_repair()
-            except _HostKeyChanged as err:
+            except _HostKeyChanged:
                 # A rotated host key with auto-re-pin OFF: never offer the password to
                 # the new-key host. Service-call context → escalate AND raise so HA
                 # reports the uninstall as failed (not a false success).
-                self._escalate(
-                    "panel SSH host key changed — Reconfigure to re-pin, or enable "
-                    "'Trust host-key changes' in options"
-                )
+                self._escalate(self._host_key_changed_guidance())
                 raise HomeAssistantError(
                     translation_domain=DOMAIN, translation_key="host_key_changed"
-                ) from err
+                ) from None
             except (OSError, asyncssh.Error) as err:
-                self._escalate(f"agent uninstall failed: {err}")
-                raise HomeAssistantError(
-                    translation_domain=DOMAIN,
-                    translation_key="uninstall_failed",
-                    translation_placeholders={"error": str(err)},
-                ) from err
+                summary = _safe_failure_summary(
+                    "agent uninstall could not connect to the panel",
+                    err,
+                )
+                self._escalate(summary)
+                raise self._translated_failure("uninstall_failed", summary) from None
             try:
                 await panel_ops.uninstall(shell)
             except (OSError, asyncssh.Error, PanelOpError) as err:
-                self._escalate(f"agent uninstall failed: {err}")
-                raise HomeAssistantError(
-                    translation_domain=DOMAIN,
-                    translation_key="uninstall_failed",
-                    translation_placeholders={"error": str(err)},
-                ) from err
+                summary = _safe_failure_summary(
+                    "agent uninstall failed during removal",
+                    err,
+                )
+                self._escalate(summary)
+                raise self._translated_failure("uninstall_failed", summary) from None
             finally:
-                await shell.close()
+                close_ok = await self._async_close_shell(shell)
+            if not close_ok:
+                summary = "agent uninstall completed but the SSH session close was unverified"
+                self._escalate(summary)
+                raise self._translated_failure("uninstall_failed", summary) from None
         persistent_notification.async_create(
             self.hass,
             f"Agent removed from panel `{self.panel}`. Delete the config entry to stop "
@@ -1138,14 +1252,15 @@ class PanelManager:
         collect_diagnostics: bool = True,
         journal_lines: int = DEFAULT_REBOOT_JOURNAL_LINES,
     ) -> None:
-        """Capture a pre-reboot diagnostics bundle (if asked), then reboot the panel.
+        """Capture a secret-safe pre-reboot diagnostics summary, then reboot the panel.
 
         The panel's journald is volatile (/run tmpfs — only the current boot survives a
-        reboot), so the wedge evidence MUST be pulled over SSH BEFORE the reboot that
-        would erase it: capture always precedes the reboot command. Capture is
-        best-effort — a capture/persist failure is logged but never blocks the reboot the
-        operator asked for (the wedge must still clear). The reboot is issued LAST and its
-        inevitable mid-command SSH disconnect is treated as success (``panel_ops.reboot``).
+        reboot), so typed wedge-category counts and probe metrics MUST be collected over
+        SSH BEFORE the reboot that would erase the evidence. Raw journal/stdout/stderr
+        text is never persisted. Capture is best-effort — a capture/persist failure is
+        logged but never blocks the reboot the operator asked for (the wedge must still
+        clear). The reboot is issued LAST and its inevitable mid-command SSH disconnect
+        is treated as success (``panel_ops.reboot``).
 
         Service-call/button context (like ``async_uninstall``): a connect failure raises
         HomeAssistantError so the caller — the operator's scheduled 4 AM automation — sees
@@ -1156,34 +1271,40 @@ class PanelManager:
         async with self._ssh_lock:
             try:
                 shell = await self._connect_for_repair()
-            except _HostKeyChanged as err:
+            except _HostKeyChanged:
                 raise HomeAssistantError(
                     translation_domain=DOMAIN, translation_key="host_key_changed"
-                ) from err
+                ) from None
             except (OSError, asyncssh.Error) as err:
-                raise HomeAssistantError(
-                    translation_domain=DOMAIN,
-                    translation_key="reboot_failed",
-                    translation_placeholders={"error": str(err)},
-                ) from err
+                summary = _safe_failure_summary(
+                    "panel reboot could not connect to the panel",
+                    err,
+                )
+                raise self._translated_failure("reboot_failed", summary) from None
             diagnostics_path: str | None = None
             try:
                 if collect_diagnostics:
                     try:
                         bundle = await panel_ops.collect_diagnostics(shell, journal_lines)
                         diagnostics_path = await self._persist_diagnostics(bundle)
-                    except (OSError, asyncssh.Error) as diag_err:
+                    except (OSError, asyncssh.Error, PanelOpError):
                         # Best-effort: a diagnostics failure must never block the reboot
                         # (collect_diagnostics is itself per-probe tolerant, so this is
                         # almost always the executor file write, e.g. a full disk).
                         _LOGGER.warning(
-                            "%s: pre-reboot diagnostics capture failed: %s",
+                            "%s: pre-reboot diagnostics capture failed",
                             self.panel,
-                            diag_err,
                         )
                 # Reboot LAST: the connection drops as the panel goes down; panel_ops.reboot
                 # treats that disconnect (or a timeout with no exit status) as success.
-                await panel_ops.reboot(shell)
+                try:
+                    await panel_ops.reboot(shell)
+                except (OSError, asyncssh.Error, PanelOpError) as err:
+                    summary = _safe_failure_summary(
+                        "panel reboot command failed",
+                        err,
+                    )
+                    raise self._translated_failure("reboot_failed", summary) from None
             finally:
                 await self._async_close_shell(shell)
         _LOGGER.info(
@@ -1213,29 +1334,33 @@ class PanelManager:
         async with self._ssh_lock:
             try:
                 shell = await self._connect_for_repair()
-            except _HostKeyChanged as err:
+            except _HostKeyChanged:
                 raise HomeAssistantError(
                     translation_domain=DOMAIN, translation_key="host_key_changed"
-                ) from err
+                ) from None
             except (OSError, asyncssh.Error) as err:
-                raise HomeAssistantError(
-                    translation_domain=DOMAIN,
-                    translation_key="voice_failed",
-                    translation_placeholders={"error": str(err)},
-                ) from err
+                summary = _safe_failure_summary(
+                    "voice satellite could not connect to the panel",
+                    err,
+                )
+                raise self._translated_failure("voice_failed", summary) from None
             try:
                 yield shell
             except (OSError, asyncssh.Error, PanelOpError) as err:
-                raise HomeAssistantError(
-                    translation_domain=DOMAIN,
-                    translation_key="voice_failed",
-                    translation_placeholders={"error": str(err)},
-                ) from err
+                summary = _safe_failure_summary(
+                    "voice satellite operation failed on the panel",
+                    err,
+                )
+                raise self._translated_failure("voice_failed", summary) from None
             finally:
-                await shell.close()
+                if not await self._async_close_shell(shell):
+                    raise self._translated_failure(
+                        "voice_failed",
+                        "voice satellite SSH session close was unverified",
+                    ) from None
 
-    async def _set_component_flag(self, component_id: str, enabled: bool) -> None:
-        """Persist a component's selected state into entry data."""
+    def _set_component_flag(self, component_id: str, enabled: bool) -> None:
+        """Synchronously persist a component's selected state into entry data."""
         components = dict(self.store.data.get(CONF_COMPONENTS, {}))
         components[component_id] = enabled
         self.store.update_data({**self.store.data, CONF_COMPONENTS: components})
@@ -1261,6 +1386,139 @@ class PanelManager:
             data[CONF_HUE_CA_CERT] = self._panel_override(CONF_HUE_CA_CERT, "")
         return data
 
+    async def _async_component_mutation(self, component_id: str, *, enabled: bool) -> None:
+        """Settle remote command, close, flag, and repair state as one unit."""
+        from .components import REGISTRY  # lazy: components imports manager
+
+        component = REGISTRY[component_id]
+        stored_components = self.store.data.get(CONF_COMPONENTS, {})
+        stored_enabled = stored_components.get(component_id)
+        previous_enabled = stored_enabled if isinstance(stored_enabled, bool) else not enabled
+        remote_succeeded = False
+        close_ok = False
+        failure: BaseException | None = None
+
+        async with self._ssh_lock:
+            shell: PanelShell | None = None
+            try:
+                shell = await self._connect_for_repair()
+                try:
+                    if enabled and component_id == COMPONENT_BRIDGE:
+                        await self._async_install_bridge(shell)
+                    elif enabled:
+                        await component.install(
+                            self.hass,
+                            shell,
+                            self._component_install_data(component_id),
+                        )
+                    else:
+                        await component.remove(shell)
+                    remote_succeeded = True
+                except asyncio.CancelledError as error:
+                    failure = error
+                except Exception as error:
+                    failure = error
+            except asyncio.CancelledError as error:
+                failure = error
+            except Exception as error:
+                failure = error
+            finally:
+                if shell is not None:
+                    try:
+                        close_ok = await self._async_close_shell(shell)
+                    except asyncio.CancelledError as error:
+                        failure = failure or error
+
+            # A proven remote success is the strongest available desired-state
+            # evidence even if SSH close is ambiguous. If the remote operation did
+            # not succeed, retain the actual pre-operation flag. This avoids
+            # fabricating the inverse state for idempotent install/remove retries.
+            persisted = False
+            try:
+                self._set_component_flag(
+                    component_id,
+                    enabled if remote_succeeded else previous_enabled,
+                )
+                persisted = True
+                self._notify()
+            except Exception as error:
+                failure = failure or error
+
+            if remote_succeeded and close_ok and persisted:
+                self._clear_component_state_issue(component_id)
+                return
+            self._create_component_state_issue(component_id, enabled=enabled)
+
+        if isinstance(failure, asyncio.CancelledError):
+            raise asyncio.CancelledError from None
+        if isinstance(failure, _HostKeyChanged):
+            raise _HostKeyChanged from None
+        action = "install" if enabled else "remove"
+        raise PanelOpError(
+            _safe_failure_summary(
+                f"component_{action}_failed",
+                failure,
+            )
+        ) from None
+
+    async def _async_settle_component_mutation(
+        self,
+        component_id: str,
+        *,
+        enabled: bool,
+    ) -> None:
+        """Drain one mutation through caller cancellation, then re-raise it."""
+
+        async def settle() -> BaseException | None:
+            try:
+                await self._async_component_mutation(component_id, enabled=enabled)
+            except BaseException as error:
+                # A shield abandoned by caller cancellation logs a later child
+                # exception before the caller can retrieve it. Return the outcome
+                # as data so every shielded future settles successfully, then
+                # restore the exception contract below.
+                return error
+            return None
+
+        task = asyncio.create_task(
+            settle(),
+            name=f"{self.panel}-{component_id}-component-mutation",
+        )
+        owner = asyncio.current_task()
+        observed_cancellations = owner.cancelling() if owner is not None else 0
+        cancellation: asyncio.CancelledError | None = None
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as error:
+                current_cancellations = owner.cancelling() if owner is not None else 0
+                if current_cancellations > observed_cancellations:
+                    cancellation = error
+                    observed_cancellations = current_cancellations
+                if task.done():
+                    break
+            except BaseException:
+                # Inspect the completed task below. In particular, a child failure
+                # that races with caller cancellation must not replace the caller's
+                # cancellation while we drain the physical operation.
+                break
+
+        try:
+            failure = task.result()
+        except BaseException as error:
+            # Defensive: ``settle`` captures every child outcome, but preserve
+            # cancellation/error semantics if task machinery itself ever fails.
+            failure = error
+        if cancellation is not None:
+            if failure is not None and not isinstance(failure, asyncio.CancelledError):
+                _LOGGER.warning(
+                    "%s: component mutation failed while caller cancellation settled",
+                    self.panel,
+                )
+            raise cancellation from None
+        if failure is not None:
+            raise failure
+
     async def async_install_component(self, component_id: str) -> None:
         """SSH-install a component, then record it as selected.
 
@@ -1271,22 +1529,8 @@ class PanelManager:
 
         component = REGISTRY[component_id]
         if component.deprecated:
-            raise PanelOpError(f"{component.label} is deprecated and cannot be installed")
-        async with self._ssh_lock:
-            shell = await self._connect_for_repair()
-            try:
-                if component_id == COMPONENT_BRIDGE:
-                    await self._async_install_bridge(shell)
-                else:
-                    await component.install(
-                        self.hass,
-                        shell,
-                        self._component_install_data(component_id),
-                    )
-            finally:
-                await shell.close()
-        await self._set_component_flag(component_id, True)
-        self._notify()
+            raise PanelOpError("component_deprecated") from None
+        await self._async_settle_component_mutation(component_id, enabled=True)
 
     async def async_remove_component(self, component_id: str) -> None:
         """SSH-remove a component, then clear its selection.
@@ -1299,17 +1543,10 @@ class PanelManager:
         component = REGISTRY[component_id]
         if component.deprecated:
             if not await self.async_retire_legacy_ha_mirror(force_history_audit=True):
-                raise PanelOpError("Legacy HA mirror retirement could not be verified")
+                raise PanelOpError("legacy_ha_mirror_retirement_unverified") from None
             self._notify()
             return
-        async with self._ssh_lock:
-            shell = await self._connect_for_repair()
-            try:
-                await component.remove(shell)
-            finally:
-                await shell.close()
-        await self._set_component_flag(component_id, False)
-        self._notify()
+        await self._async_settle_component_mutation(component_id, enabled=False)
 
     async def async_set_voice_enabled(self, enabled: bool) -> None:
         """Enable (deploy+start) or disable (uninstall) the voice satellite on the panel.
@@ -1327,16 +1564,16 @@ class PanelManager:
                 await self.async_install_component(COMPONENT_VOICE)
             else:
                 await self.async_remove_component(COMPONENT_VOICE)
-        except _HostKeyChanged as err:
+        except _HostKeyChanged:
             raise HomeAssistantError(
                 translation_domain=DOMAIN, translation_key="host_key_changed"
-            ) from err
+            ) from None
         except (VoicePayloadError, OSError, asyncssh.Error, PanelOpError) as err:
-            raise HomeAssistantError(
-                translation_domain=DOMAIN,
-                translation_key="voice_failed",
-                translation_placeholders={"error": str(err)},
-            ) from err
+            summary = _safe_failure_summary(
+                "voice satellite component mutation failed",
+                err,
+            )
+            raise self._translated_failure("voice_failed", summary) from None
         # Clear any stale "voice enabled but not running" issue: after a disable there is
         # nothing to run, and after a successful enable the satellite IS running — either
         # way the issue must not linger.
@@ -1355,9 +1592,21 @@ class PanelManager:
                 await panel_ops.ensure_voice_config(shell, self._voice_env(wake_word=wake_word))
                 await panel_ops.restart_voice(shell)
         if isinstance(self.store, LegacyPanelStore):
-            self.store.update_data({**self.store.data, CONF_VOICE_WAKE_WORD: wake_word})
+            try:
+                self.store.update_data({**self.store.data, CONF_VOICE_WAKE_WORD: wake_word})
+            except OSError:
+                raise self._translated_failure(
+                    "voice_failed",
+                    "voice satellite settings could not be saved",
+                ) from None
         else:
-            self.store.update_options({**self.store.options, CONF_VOICE_WAKE_WORD: wake_word})
+            try:
+                self.store.update_options({**self.store.options, CONF_VOICE_WAKE_WORD: wake_word})
+            except OSError:
+                raise self._translated_failure(
+                    "voice_failed",
+                    "voice satellite settings could not be saved",
+                ) from None
         self._notify()
 
     async def _recovery_timeout(self, _now: datetime) -> None:
@@ -1368,13 +1617,12 @@ class PanelManager:
             return
         if self.availability == AVAILABILITY_ONLINE:
             return
-        journal = ""
         try:
             async with self._ssh_lock:
                 shell = self._shell()
                 await shell.connect()
                 try:
-                    journal = await panel_ops.collect_journal(shell, 50)
+                    await panel_ops.collect_journal(shell, 50)
                 finally:
                     await shell.close()
         except (OSError, asyncssh.Error, PanelOpError):
@@ -1389,7 +1637,7 @@ class PanelManager:
             or self.availability == AVAILABILITY_ONLINE
         ):
             return
-        self._fire(EVENT_REPAIR_FAILED, {"reason": "still_offline", "journal": journal})
+        self._fire(EVENT_REPAIR_FAILED, {"reason": "still_offline"})
         self._escalate(
             "repair ran but the bridge did not come back — probable bus-lib API drift "
             "after the firmware update; the agent needs a code fix"
@@ -1401,10 +1649,10 @@ class PanelManager:
         try:
             meta = json.loads(str(msg.payload))
         except ValueError:
-            _LOGGER.warning("%s: unparseable bridge meta payload: %r", self.panel, msg.payload)
+            _LOGGER.warning("%s: discarded invalid bridge meta payload", self.panel)
             return
         if not isinstance(meta, dict):
-            _LOGGER.warning("%s: bridge meta is not a JSON object: %r", self.panel, msg.payload)
+            _LOGGER.warning("%s: discarded invalid bridge meta payload", self.panel)
             return
         self.meta = meta
         if meta.get("degraded") == _RETAINED_LEDGER_DEGRADED:

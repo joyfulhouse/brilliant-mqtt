@@ -14,12 +14,13 @@ from uuid import UUID
 import pytest
 from homeassistant.config_entries import ConfigSubentry
 from homeassistant.const import CONF_NAME
-from homeassistant.core import HomeAssistant
+from homeassistant.core import Event, HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers import issue_registry as ir
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.brilliant_mqtt.broker import BrokerKind
+from custom_components.brilliant_mqtt.components import REGISTRY
 from custom_components.brilliant_mqtt.const import (
     COMPONENT_BRIDGE,
     COMPONENT_BUS_WATCHDOG,
@@ -56,6 +57,8 @@ from custom_components.brilliant_mqtt.const import (
     DOMAIN,
     ENTRY_KIND_FLEET,
     ENTRY_KIND_LEGACY_PENDING_CONSOLIDATION,
+    EVENT_PANEL_REBOUND,
+    EVENT_TYPE,
     FLEET_UNIQUE_ID,
     SUBENTRY_TYPE_PANEL,
 )
@@ -63,10 +66,13 @@ from custom_components.brilliant_mqtt.entry_data import (
     EntryDataError,
     FleetPanelStore,
     LegacyPanelStore,
+    PanelConfig,
 )
 from custom_components.brilliant_mqtt.fleet_manager import (
+    _CONFIG_ENTRY_PERSISTENCE_POLL_SECONDS,
     ConfigEntryPersistenceError,
     FleetManager,
+    _async_duplicate_fingerprint,
     _async_transaction_lookup,
     _canonical_entry_storage,
     async_recover_removed_entry,
@@ -87,7 +93,7 @@ from custom_components.brilliant_mqtt.provisioning_journal import (
     StoredPanelSnapshot,
     StoredServiceSnapshot,
 )
-from custom_components.brilliant_mqtt.shell import HostIdentity
+from custom_components.brilliant_mqtt.shell import HostIdentity, PanelIdentityError
 
 _OFFICE_PUBLIC_KEY = (
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKIykuTed7zNwJwn20eCelcKcHKJ9c/pGFfvulRWazuC"
@@ -106,6 +112,25 @@ _OTHER_TRANSACTION_ID = UUID("87654321-4321-4cba-8fed-ba0987654321")
 _SETUP_ID = UUID("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
 
 
+def test_persistence_poll_interval_avoids_busy_storage_reads() -> None:
+    """The durability gate should stay responsive without polling disk at 20 Hz."""
+    assert _CONFIG_ENTRY_PERSISTENCE_POLL_SECONDS >= 0.25
+
+
+def _panel_owned_issue_ids(management_id: str) -> set[str]:
+    """Return every issue ID owned by one panel runtime."""
+    return {
+        f"needs_attention_{management_id}",
+        f"voice_missing_{management_id}",
+        f"ha_mirror_retired_{management_id}",
+        *(
+            f"component_state_unverified_{management_id}_{component.id}"
+            for component in REGISTRY.values()
+            if not component.deprecated
+        ),
+    }
+
+
 @pytest.fixture(autouse=True)
 def _mqtt_connection_status(monkeypatch: pytest.MonkeyPatch) -> None:
     """FleetManager's production caller has already proven MQTT is loaded."""
@@ -116,6 +141,19 @@ def _mqtt_connection_status(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "custom_components.brilliant_mqtt.fleet_manager.mqtt.async_subscribe_connection_status",
         lambda hass, callback: Mock(),
+    )
+
+    async def verify_confirmed_identity(
+        host: str,
+        expected: HostIdentity,
+        port: int = 22,
+    ) -> HostIdentity:
+        del host, port
+        return expected
+
+    monkeypatch.setattr(
+        "custom_components.brilliant_mqtt.fleet_manager.async_verify_host_identity",
+        verify_confirmed_identity,
     )
 
 
@@ -148,7 +186,7 @@ def _panel(
     subentry_id: str,
     host: str | None = None,
     management_id: str | None = None,
-    mesh_priority: int = 1,
+    mesh_priority: int | None = None,
     transaction_id: UUID | None = None,
 ) -> ConfigSubentry:
     if fingerprint == "SHA256:office":
@@ -157,6 +195,13 @@ def _panel(
         public_key, identity_fingerprint = _THIRD_PUBLIC_KEY, _THIRD_FINGERPRINT
     else:
         public_key, identity_fingerprint = _OTHER_PUBLIC_KEY, _OTHER_FINGERPRINT
+    if mesh_priority is None:
+        mesh_priority = {
+            "office": 1,
+            "kitchen": 2,
+            "bedroom": 3,
+            "garage": 2,
+        }.get(slug, 1)
     data: dict[str, Any] = {
         CONF_IDENTITY_FINGERPRINT: identity_fingerprint,
         CONF_SSH_HOST_KEY: public_key,
@@ -1223,6 +1268,61 @@ async def test_pending_handoff_rejects_different_journaled_broker(
     assert entry.data[CONF_SCENE_PANEL] == pending_scene_owner(_TRANSACTION_ID)
     issue_id = f"provisioning_rollback_{_TRANSACTION_ID.hex}"
     assert ir.async_get(hass).async_get_issue(DOMAIN, issue_id) is not None
+
+
+async def test_pending_handoff_accepts_guidance_only_broker_kind_correction(
+    hass: HomeAssistant,
+) -> None:
+    """Broker kind guidance cannot invalidate an unchanged journal transport."""
+    entry = _provisioning_entry(
+        _panel(
+            "office",
+            "SHA256:office",
+            subentry_id="panel-office",
+            management_id=_OFFICE_FINGERPRINT,
+            transaction_id=_TRANSACTION_ID,
+        ),
+        scene_owner=pending_scene_owner(_TRANSACTION_ID),
+    )
+    entry.add_to_hass(hass)
+    hass.config_entries.async_update_entry(
+        entry,
+        data={
+            **entry.data,
+            CONF_BROKER_KIND: BrokerKind.OFFICIAL_MOSQUITTO.value,
+        },
+    )
+    journal = Mock(
+        async_load=AsyncMock(return_value=_pending_record()),
+        async_complete_commit=AsyncMock(),
+    )
+    persisted = AsyncMock()
+    fleet = FleetManager(hass, entry)
+
+    with (
+        patch(
+            "custom_components.brilliant_mqtt.fleet_manager.ProvisioningJournal",
+            return_value=journal,
+        ),
+        patch(
+            "custom_components.brilliant_mqtt.fleet_manager.async_wait_config_entry_persisted",
+            persisted,
+        ),
+        patch.object(PanelManager, "async_setup", _noop_setup),
+        patch.object(PanelManager, "async_shutdown", _noop_shutdown),
+    ):
+        await fleet.async_setup()
+
+    journal.async_complete_commit.assert_awaited_once_with(
+        _TRANSACTION_ID,
+        subentry_id="panel-office",
+    )
+    assert entry.data[CONF_BROKER_KIND] == BrokerKind.OFFICIAL_MOSQUITTO.value
+    assert entry.data[CONF_SCENE_PANEL] == "panel-office"
+    assert persisted.await_count == 2
+
+    with patch.object(PanelManager, "async_shutdown", _noop_shutdown):
+        await fleet.async_shutdown()
 
 
 async def test_startup_without_stored_owner_invokes_recorded_recovery_before_setup(
@@ -2366,6 +2466,85 @@ async def test_duplicate_management_id_fails_before_manager_start(
     assert starts == []
 
 
+async def test_provisioning_duplicate_guard_reserves_rebound_management_identity(
+    hass: HomeAssistant,
+) -> None:
+    """Adding the old physical panel after A→X rebind cannot reuse stable identity A."""
+    rebound = _panel(
+        "office",
+        "SHA256:bedroom",
+        subentry_id="panel-office",
+        management_id=_OFFICE_FINGERPRINT,
+    )
+    entry = _fleet_entry(rebound)
+    entry.add_to_hass(hass)
+
+    assert rebound.data[CONF_IDENTITY_FINGERPRINT] == _THIRD_FINGERPRINT
+    assert rebound.data[CONF_MANAGEMENT_ID] == _OFFICE_FINGERPRINT
+    assert await _async_duplicate_fingerprint(hass, _OFFICE_FINGERPRINT) is True
+
+
+async def test_duplicate_positive_mesh_priority_fails_before_manager_start(
+    hass: HomeAssistant,
+) -> None:
+    """Only one panel may publish each positive mesh leadership priority."""
+    entry = _fleet_entry(
+        _panel(
+            "office",
+            "SHA256:office",
+            subentry_id="panel-office",
+            mesh_priority=1,
+        ),
+        _panel(
+            "kitchen",
+            "SHA256:kitchen",
+            subentry_id="panel-kitchen",
+            mesh_priority=1,
+        ),
+    )
+    starts: list[str] = []
+
+    async def record_start(manager: PanelManager) -> None:
+        starts.append(manager.panel)
+
+    with (
+        patch.object(PanelManager, "async_setup", record_start),
+        pytest.raises(EntryDataError, match="duplicate_panel_mesh_priority"),
+    ):
+        await FleetManager(hass, entry).async_setup()
+
+    assert starts == []
+
+
+async def test_zero_mesh_priority_may_repeat_for_nonpublishing_panels(
+    hass: HomeAssistant,
+) -> None:
+    """Priority zero opts out of leadership and therefore is not an ownership key."""
+    entry = _fleet_entry(
+        _panel(
+            "office",
+            "SHA256:office",
+            subentry_id="panel-office",
+            mesh_priority=0,
+        ),
+        _panel(
+            "kitchen",
+            "SHA256:kitchen",
+            subentry_id="panel-kitchen",
+            mesh_priority=0,
+        ),
+    )
+    fleet = FleetManager(hass, entry)
+
+    with (
+        patch.object(PanelManager, "async_setup", _noop_setup),
+        patch.object(PanelManager, "async_shutdown", _noop_shutdown),
+    ):
+        await fleet.async_setup()
+        assert set(fleet.panels) == {"panel-office", "panel-kitchen"}
+        await fleet.async_shutdown()
+
+
 async def test_management_id_may_differ_from_rebound_identity_fingerprint(
     hass: HomeAssistant,
 ) -> None:
@@ -2386,6 +2565,1245 @@ async def test_management_id_may_differ_from_rebound_identity_fingerprint(
     ):
         await fleet.async_setup()
         assert fleet.panels["panel-office"].management_id == "SHA256:original-management-id"
+        await fleet.async_shutdown()
+
+
+async def test_rebind_durably_adopts_exact_identity_and_audits_after_proof(
+    hass: HomeAssistant,
+) -> None:
+    """A deliberate rebind preserves logical identity and advances the live baseline."""
+    office = _panel(
+        "office",
+        "SHA256:office",
+        subentry_id="panel-office",
+        management_id="stable-office-management",
+    )
+    entry = _fleet_entry(office)
+    entry.add_to_hass(hass)
+    fleet = FleetManager(hass, entry)
+    order: list[str] = []
+    immutable_checks: list[tuple[PanelConfig, PanelConfig]] = []
+    events: list[Event[dict[str, Any]]] = []
+
+    def capture_event(event: Event[dict[str, Any]]) -> None:
+        events.append(event)
+
+    hass.bus.async_listen(EVENT_TYPE, capture_event)
+    with (
+        patch.object(PanelManager, "async_setup", _noop_setup),
+        patch.object(PanelManager, "async_shutdown", _noop_shutdown),
+    ):
+        await fleet.async_setup()
+        manager = fleet.panels["panel-office"]
+        original_store = manager.store
+        expected = PanelConfig.from_subentry(entry.subentries["panel-office"])
+        original_parent_data = deepcopy(dict(entry.data))
+        original_subentry = entry.subentries["panel-office"]
+        original_panel_data = deepcopy(dict(original_subentry.data))
+        original_title = original_subentry.title
+        candidate = HostIdentity(
+            public_key=_OTHER_PUBLIC_KEY,
+            fingerprint=_OTHER_FINGERPRINT,
+        )
+        new_password = "new-rebind-root-secret"
+
+        async def prove_persisted(
+            hass_arg: HomeAssistant,
+            entry_arg: MockConfigEntry,
+            *,
+            subentry_id: str | None = None,
+        ) -> None:
+            assert hass_arg is hass
+            assert entry_arg is entry
+            assert subentry_id == "panel-office"
+            assert fleet._lifecycle_lock.locked()
+            stored = entry.subentries["panel-office"]
+            assert stored.unique_id == candidate.fingerprint
+            assert stored.data[CONF_SSH_HOST_KEY] == candidate.public_key
+            assert manager.store is original_store
+            assert fleet._panel_configs["panel-office"] == expected
+            order.append("persisted")
+
+        original_fire = manager._fire
+
+        def record_audit(
+            event_type: str,
+            data: dict[str, Any] | None = None,
+        ) -> None:
+            order.append("audit")
+            original_fire(event_type, data)
+
+        original_assert = fleet._assert_immutable_panel
+
+        def record_immutable_check(
+            previous: PanelConfig,
+            current: PanelConfig,
+        ) -> None:
+            immutable_checks.append((previous, current))
+            original_assert(previous, current)
+
+        with (
+            patch(
+                "custom_components.brilliant_mqtt.fleet_manager.async_wait_config_entry_persisted",
+                new=AsyncMock(side_effect=prove_persisted),
+            ) as persisted,
+            patch.object(manager, "_fire", side_effect=record_audit) as audit,
+            patch.object(
+                fleet,
+                "_assert_immutable_panel",
+                side_effect=record_immutable_check,
+            ),
+        ):
+            await fleet.async_rebind_panel(
+                "panel-office",
+                expected,
+                host="replacement.example.com",
+                root_password=new_password,
+                candidate=candidate,
+            )
+            await hass.async_block_till_done()
+
+        stored = entry.subentries["panel-office"]
+        rebound = PanelConfig.from_subentry(stored)
+        assert stored is original_subentry
+        assert stored.subentry_id == "panel-office"
+        assert stored.title == original_title
+        assert stored.unique_id == candidate.fingerprint
+        assert set(stored.data) == set(original_panel_data)
+        assert {
+            key for key, old_value in original_panel_data.items() if stored.data[key] != old_value
+        } == {
+            CONF_HOST,
+            CONF_ROOT_PASSWORD,
+            CONF_IDENTITY_FINGERPRINT,
+            CONF_SSH_HOST_KEY,
+        }
+        assert rebound.host == "replacement.example.com"
+        assert rebound.root_password == new_password
+        assert rebound.identity_fingerprint == candidate.fingerprint
+        assert rebound.ssh_host_key == candidate.public_key
+        assert rebound.name == expected.name
+        assert rebound.panel == expected.panel
+        assert rebound.management_id == expected.management_id
+        assert rebound.components == expected.components
+        assert rebound.feature_overrides == expected.feature_overrides
+        assert rebound.mesh_priority == expected.mesh_priority
+        assert entry.data == original_parent_data
+        assert fleet.panels["panel-office"] is manager
+        assert manager.store is not original_store
+        assert manager.store.subentry_id == "panel-office"
+        assert manager.store.data == stored.data
+        assert fleet._panel_configs["panel-office"] == rebound
+        assert order == ["persisted", "audit"]
+        persisted.assert_awaited_once_with(
+            hass,
+            entry,
+            subentry_id="panel-office",
+        )
+        audit.assert_called_once_with(
+            EVENT_PANEL_REBOUND,
+            {
+                "old_fingerprint": expected.identity_fingerprint,
+                "new_fingerprint": candidate.fingerprint,
+            },
+        )
+        assert immutable_checks
+        assert all(
+            previous.identity_fingerprint == candidate.fingerprint
+            and current.identity_fingerprint == candidate.fingerprint
+            for previous, current in immutable_checks
+        )
+        assert len(events) == 1
+        assert events[0].data == {
+            "type": EVENT_PANEL_REBOUND,
+            "panel": expected.panel,
+            "entry_id": expected.management_id,
+            "old_fingerprint": expected.identity_fingerprint,
+            "new_fingerprint": candidate.fingerprint,
+        }
+        serialized_audit = repr(events[0].data)
+        assert new_password not in serialized_audit
+        assert candidate.public_key not in serialized_audit
+        assert expected.root_password not in serialized_audit
+        assert expected.ssh_host_key not in serialized_audit
+
+        assert fleet._update_unsub is not None
+        fleet._update_unsub()
+        fleet._update_unsub = None
+        assert hass.config_entries.async_update_subentry(
+            entry,
+            stored,
+            data={
+                **stored.data,
+                CONF_IDENTITY_FINGERPRINT: _THIRD_FINGERPRINT,
+                CONF_SSH_HOST_KEY: _THIRD_PUBLIC_KEY,
+            },
+            unique_id=_THIRD_FINGERPRINT,
+        )
+        with pytest.raises(EntryDataError, match="immutable_panel_identity"):
+            await fleet._async_reconcile()
+
+        await fleet.async_shutdown()
+
+
+async def test_concurrent_rebinds_serialize_and_stale_snapshot_fails(
+    hass: HomeAssistant,
+) -> None:
+    """Only the first contender may durably replace one expected identity snapshot."""
+    entry = _fleet_entry(_panel("office", "SHA256:office", subentry_id="panel-office"))
+    entry.add_to_hass(hass)
+    fleet = FleetManager(hass, entry)
+    proof_started = asyncio.Event()
+    allow_proof = asyncio.Event()
+    proofs = 0
+
+    async def prove_persisted(
+        hass_arg: HomeAssistant,
+        entry_arg: MockConfigEntry,
+        *,
+        subentry_id: str | None = None,
+    ) -> None:
+        del hass_arg, entry_arg
+        nonlocal proofs
+        assert subentry_id == "panel-office"
+        proofs += 1
+        proof_started.set()
+        await allow_proof.wait()
+
+    with (
+        patch.object(PanelManager, "async_setup", _noop_setup),
+        patch.object(PanelManager, "async_shutdown", _noop_shutdown),
+    ):
+        await fleet.async_setup()
+        assert fleet._update_unsub is not None
+        fleet._update_unsub()
+        fleet._update_unsub = None
+        expected = PanelConfig.from_subentry(entry.subentries["panel-office"])
+        first_candidate = HostIdentity(_OTHER_PUBLIC_KEY, _OTHER_FINGERPRINT)
+        second_candidate = HostIdentity(_THIRD_PUBLIC_KEY, _THIRD_FINGERPRINT)
+
+        with patch(
+            "custom_components.brilliant_mqtt.fleet_manager.async_wait_config_entry_persisted",
+            new=AsyncMock(side_effect=prove_persisted),
+        ):
+            first = asyncio.create_task(
+                fleet.async_rebind_panel(
+                    "panel-office",
+                    expected,
+                    host="first.example.com",
+                    root_password="first-secret",
+                    candidate=first_candidate,
+                )
+            )
+            await proof_started.wait()
+            second = asyncio.create_task(
+                fleet.async_rebind_panel(
+                    "panel-office",
+                    expected,
+                    host="second.example.com",
+                    root_password="second-secret",
+                    candidate=second_candidate,
+                )
+            )
+            await asyncio.sleep(0)
+            assert not second.done()
+
+            allow_proof.set()
+            await first
+            with pytest.raises(EntryDataError, match="panel_snapshot_changed"):
+                await second
+
+        assert proofs == 1
+        assert fleet._panel_configs["panel-office"].identity_fingerprint == _OTHER_FINGERPRINT
+        assert fleet.panels["panel-office"].store.data[CONF_HOST] == "first.example.com"
+        await fleet.async_shutdown()
+
+
+async def test_rebind_waits_for_shared_ssh_operation_before_any_write_or_audit(
+    hass: HomeAssistant,
+) -> None:
+    """An old-panel SSH operation must finish before identity ownership can move."""
+    entry = _fleet_entry(_panel("office", "SHA256:office", subentry_id="panel-office"))
+    entry.add_to_hass(hass)
+    fleet = FleetManager(hass, entry)
+    candidate = HostIdentity(_OTHER_PUBLIC_KEY, _OTHER_FINGERPRINT)
+    verified = AsyncMock(return_value=candidate)
+    persisted = AsyncMock()
+
+    with (
+        patch.object(PanelManager, "async_setup", _noop_setup),
+        patch.object(PanelManager, "async_shutdown", _noop_shutdown),
+    ):
+        await fleet.async_setup()
+        expected = PanelConfig.from_subentry(entry.subentries["panel-office"])
+        manager = fleet.panels["panel-office"]
+        await fleet._ssh_lock.acquire()
+        try:
+            with (
+                patch(
+                    "custom_components.brilliant_mqtt.fleet_manager.async_verify_host_identity",
+                    verified,
+                ),
+                patch(
+                    "custom_components.brilliant_mqtt.fleet_manager.async_wait_config_entry_persisted",
+                    persisted,
+                ),
+                patch.object(manager, "_fire") as audit,
+            ):
+                rebind = asyncio.create_task(
+                    fleet.async_rebind_panel(
+                        "panel-office",
+                        expected,
+                        host="replacement.example.com",
+                        root_password="replacement-secret",
+                        candidate=candidate,
+                    )
+                )
+                await asyncio.sleep(0)
+
+                assert not rebind.done()
+                verified.assert_not_awaited()
+                persisted.assert_not_awaited()
+                audit.assert_not_called()
+
+                fleet._ssh_lock.release()
+                await rebind
+
+                verified.assert_awaited_once_with(
+                    "replacement.example.com",
+                    candidate,
+                )
+                persisted.assert_awaited_once_with(
+                    hass,
+                    entry,
+                    subentry_id="panel-office",
+                )
+                audit.assert_called_once()
+        finally:
+            if fleet._ssh_lock.locked():
+                fleet._ssh_lock.release()
+        await fleet.async_shutdown()
+
+
+async def test_rebind_cancelled_while_waiting_for_shared_ssh_lock_is_write_free(
+    hass: HomeAssistant,
+) -> None:
+    """Cancellation while queued releases lifecycle ownership without side effects."""
+    entry = _fleet_entry(_panel("office", "SHA256:office", subentry_id="panel-office"))
+    entry.add_to_hass(hass)
+    fleet = FleetManager(hass, entry)
+    candidate = HostIdentity(_OTHER_PUBLIC_KEY, _OTHER_FINGERPRINT)
+    verified = AsyncMock(return_value=candidate)
+    persisted = AsyncMock()
+
+    with (
+        patch.object(PanelManager, "async_setup", _noop_setup),
+        patch.object(PanelManager, "async_shutdown", _noop_shutdown),
+    ):
+        await fleet.async_setup()
+        expected = PanelConfig.from_subentry(entry.subentries["panel-office"])
+        manager = fleet.panels["panel-office"]
+        original_data = deepcopy(dict(entry.subentries["panel-office"].data))
+        await fleet._ssh_lock.acquire()
+        try:
+            with (
+                patch(
+                    "custom_components.brilliant_mqtt.fleet_manager.async_verify_host_identity",
+                    verified,
+                ),
+                patch(
+                    "custom_components.brilliant_mqtt.fleet_manager.async_wait_config_entry_persisted",
+                    persisted,
+                ),
+                patch.object(manager, "_fire") as audit,
+            ):
+                rebind = asyncio.create_task(
+                    fleet.async_rebind_panel(
+                        "panel-office",
+                        expected,
+                        host="cancelled.example.com",
+                        root_password="cancelled-secret",
+                        candidate=candidate,
+                    )
+                )
+                await asyncio.sleep(0)
+
+                rebind.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await rebind
+
+                assert not fleet._lifecycle_lock.locked()
+                assert fleet._ssh_lock.locked()
+                verified.assert_not_awaited()
+                persisted.assert_not_awaited()
+                audit.assert_not_called()
+                assert entry.subentries["panel-office"].data == original_data
+                assert fleet._panel_configs["panel-office"] == expected
+                assert manager.store.data == original_data
+        finally:
+            fleet._ssh_lock.release()
+        await fleet.async_shutdown()
+
+
+async def test_rebind_rechecks_the_panel_snapshot_after_waiting_for_ssh(
+    hass: HomeAssistant,
+) -> None:
+    """A queued rebind cannot commit against the pre-wait panel snapshot."""
+    entry = _fleet_entry(_panel("office", "SHA256:office", subentry_id="panel-office"))
+    entry.add_to_hass(hass)
+    fleet = FleetManager(hass, entry)
+    candidate = HostIdentity(_OTHER_PUBLIC_KEY, _OTHER_FINGERPRINT)
+    verified = AsyncMock(return_value=candidate)
+    persisted = AsyncMock()
+
+    with (
+        patch.object(PanelManager, "async_setup", _noop_setup),
+        patch.object(PanelManager, "async_shutdown", _noop_shutdown),
+    ):
+        await fleet.async_setup()
+        assert fleet._update_unsub is not None
+        fleet._update_unsub()
+        fleet._update_unsub = None
+        expected = PanelConfig.from_subentry(entry.subentries["panel-office"])
+        manager = fleet.panels["panel-office"]
+        await fleet._ssh_lock.acquire()
+        try:
+            with (
+                patch(
+                    "custom_components.brilliant_mqtt.fleet_manager.async_verify_host_identity",
+                    verified,
+                ),
+                patch(
+                    "custom_components.brilliant_mqtt.fleet_manager.async_wait_config_entry_persisted",
+                    persisted,
+                ),
+                patch.object(manager, "_fire") as audit,
+            ):
+                rebind = asyncio.create_task(
+                    fleet.async_rebind_panel(
+                        "panel-office",
+                        expected,
+                        host="replacement.example.com",
+                        root_password="replacement-secret",
+                        candidate=candidate,
+                    )
+                )
+                await asyncio.sleep(0)
+
+                subentry = entry.subentries["panel-office"]
+                assert hass.config_entries.async_update_subentry(
+                    entry,
+                    subentry,
+                    data={**subentry.data, CONF_NAME: "Renamed while queued"},
+                    title="Renamed while queued",
+                )
+                fleet._ssh_lock.release()
+
+                with pytest.raises(EntryDataError, match="panel_snapshot_changed"):
+                    await rebind
+
+                verified.assert_not_awaited()
+                persisted.assert_not_awaited()
+                audit.assert_not_called()
+                assert entry.subentries["panel-office"].data[CONF_NAME] == "Renamed while queued"
+                assert entry.subentries["panel-office"].data[CONF_HOST] == expected.host
+                assert (
+                    entry.subentries["panel-office"].data[CONF_IDENTITY_FINGERPRINT]
+                    == expected.identity_fingerprint
+                )
+                assert fleet._panel_configs["panel-office"] == expected
+                assert manager.store.data[CONF_NAME] == "Renamed while queued"
+        finally:
+            if fleet._ssh_lock.locked():
+                fleet._ssh_lock.release()
+        await fleet.async_shutdown()
+
+
+async def test_rebind_rechecks_duplicate_ownership_after_waiting_for_ssh(
+    hass: HomeAssistant,
+) -> None:
+    """A candidate claimed while queued cannot be persisted into this panel."""
+    entry = _fleet_entry(_panel("office", "SHA256:office", subentry_id="panel-office"))
+    entry.add_to_hass(hass)
+    fleet = FleetManager(hass, entry)
+    candidate = HostIdentity(_OTHER_PUBLIC_KEY, _OTHER_FINGERPRINT)
+    verified = AsyncMock(return_value=candidate)
+    persisted = AsyncMock()
+
+    with (
+        patch.object(PanelManager, "async_setup", _noop_setup),
+        patch.object(PanelManager, "async_shutdown", _noop_shutdown),
+    ):
+        await fleet.async_setup()
+        expected = PanelConfig.from_subentry(entry.subentries["panel-office"])
+        manager = fleet.panels["panel-office"]
+        await fleet._ssh_lock.acquire()
+        try:
+            with (
+                patch(
+                    "custom_components.brilliant_mqtt.fleet_manager.async_verify_host_identity",
+                    verified,
+                ),
+                patch(
+                    "custom_components.brilliant_mqtt.fleet_manager.async_wait_config_entry_persisted",
+                    persisted,
+                ),
+                patch.object(manager, "_fire") as audit,
+            ):
+                rebind = asyncio.create_task(
+                    fleet.async_rebind_panel(
+                        "panel-office",
+                        expected,
+                        host="replacement.example.com",
+                        root_password="replacement-secret",
+                        candidate=candidate,
+                    )
+                )
+                await asyncio.sleep(0)
+
+                duplicate_entry = _fleet_entry(
+                    _panel(
+                        "kitchen",
+                        "SHA256:kitchen",
+                        subentry_id="panel-kitchen",
+                    )
+                )
+                duplicate_entry.add_to_hass(hass)
+                fleet._ssh_lock.release()
+
+                with pytest.raises(
+                    EntryDataError,
+                    match="duplicate_panel_fingerprint",
+                ):
+                    await rebind
+
+                verified.assert_not_awaited()
+                persisted.assert_not_awaited()
+                audit.assert_not_called()
+                assert PanelConfig.from_subentry(entry.subentries["panel-office"]) == expected
+                assert fleet._panel_configs["panel-office"] == expected
+                assert manager.store.data[CONF_IDENTITY_FINGERPRINT] == (
+                    expected.identity_fingerprint
+                )
+        finally:
+            if fleet._ssh_lock.locked():
+                fleet._ssh_lock.release()
+        await fleet.async_shutdown()
+
+
+async def test_rebind_rechecks_snapshot_after_late_identity_network_wait(
+    hass: HomeAssistant,
+) -> None:
+    """A config change during the key exchange cannot bypass optimistic ownership."""
+    entry = _fleet_entry(_panel("office", "SHA256:office", subentry_id="panel-office"))
+    entry.add_to_hass(hass)
+    fleet = FleetManager(hass, entry)
+    candidate = HostIdentity(_OTHER_PUBLIC_KEY, _OTHER_FINGERPRINT)
+    verification_started = asyncio.Event()
+    allow_verification = asyncio.Event()
+    persisted = AsyncMock()
+
+    async def verify_identity(host: str, expected: HostIdentity) -> HostIdentity:
+        assert host == "replacement.example.com"
+        assert expected == candidate
+        assert fleet._lifecycle_lock.locked()
+        assert fleet._ssh_lock.locked()
+        verification_started.set()
+        await allow_verification.wait()
+        return candidate
+
+    with (
+        patch.object(PanelManager, "async_setup", _noop_setup),
+        patch.object(PanelManager, "async_shutdown", _noop_shutdown),
+    ):
+        await fleet.async_setup()
+        assert fleet._update_unsub is not None
+        fleet._update_unsub()
+        fleet._update_unsub = None
+        expected = PanelConfig.from_subentry(entry.subentries["panel-office"])
+        manager = fleet.panels["panel-office"]
+
+        with (
+            patch(
+                "custom_components.brilliant_mqtt.fleet_manager.async_verify_host_identity",
+                new=AsyncMock(side_effect=verify_identity),
+            ),
+            patch(
+                "custom_components.brilliant_mqtt.fleet_manager.async_wait_config_entry_persisted",
+                persisted,
+            ),
+            patch.object(manager, "_fire") as audit,
+        ):
+            rebind = asyncio.create_task(
+                fleet.async_rebind_panel(
+                    "panel-office",
+                    expected,
+                    host="replacement.example.com",
+                    root_password="replacement-secret",
+                    candidate=candidate,
+                )
+            )
+            await verification_started.wait()
+            subentry = entry.subentries["panel-office"]
+            assert hass.config_entries.async_update_subentry(
+                entry,
+                subentry,
+                data={**subentry.data, CONF_NAME: "Changed during verification"},
+                title="Changed during verification",
+            )
+            allow_verification.set()
+
+            with pytest.raises(EntryDataError, match="panel_snapshot_changed"):
+                await rebind
+
+        persisted.assert_not_awaited()
+        audit.assert_not_called()
+        assert entry.subentries["panel-office"].data[CONF_HOST] == expected.host
+        assert entry.subentries["panel-office"].data[CONF_IDENTITY_FINGERPRINT] == (
+            expected.identity_fingerprint
+        )
+        assert fleet._panel_configs["panel-office"] == expected
+        await fleet.async_shutdown()
+
+
+async def test_rebind_rechecks_duplicate_after_late_identity_network_wait(
+    hass: HomeAssistant,
+) -> None:
+    """A fingerprint claimed during key exchange cannot cross the final write gate."""
+    entry = _fleet_entry(_panel("office", "SHA256:office", subentry_id="panel-office"))
+    entry.add_to_hass(hass)
+    fleet = FleetManager(hass, entry)
+    candidate = HostIdentity(_OTHER_PUBLIC_KEY, _OTHER_FINGERPRINT)
+    verification_started = asyncio.Event()
+    allow_verification = asyncio.Event()
+    persisted = AsyncMock()
+
+    async def verify_identity(host: str, expected: HostIdentity) -> HostIdentity:
+        assert host == "replacement.example.com"
+        assert expected == candidate
+        verification_started.set()
+        await allow_verification.wait()
+        return candidate
+
+    with (
+        patch.object(PanelManager, "async_setup", _noop_setup),
+        patch.object(PanelManager, "async_shutdown", _noop_shutdown),
+    ):
+        await fleet.async_setup()
+        expected = PanelConfig.from_subentry(entry.subentries["panel-office"])
+        manager = fleet.panels["panel-office"]
+
+        with (
+            patch(
+                "custom_components.brilliant_mqtt.fleet_manager.async_verify_host_identity",
+                new=AsyncMock(side_effect=verify_identity),
+            ),
+            patch(
+                "custom_components.brilliant_mqtt.fleet_manager.async_wait_config_entry_persisted",
+                persisted,
+            ),
+            patch.object(manager, "_fire") as audit,
+        ):
+            rebind = asyncio.create_task(
+                fleet.async_rebind_panel(
+                    "panel-office",
+                    expected,
+                    host="replacement.example.com",
+                    root_password="replacement-secret",
+                    candidate=candidate,
+                )
+            )
+            await verification_started.wait()
+            duplicate_entry = _fleet_entry(
+                _panel(
+                    "kitchen",
+                    "SHA256:kitchen",
+                    subentry_id="panel-kitchen",
+                )
+            )
+            duplicate_entry.add_to_hass(hass)
+            allow_verification.set()
+
+            with pytest.raises(
+                EntryDataError,
+                match="duplicate_panel_fingerprint",
+            ):
+                await rebind
+
+        persisted.assert_not_awaited()
+        audit.assert_not_called()
+        assert PanelConfig.from_subentry(entry.subentries["panel-office"]) == expected
+        assert fleet._panel_configs["panel-office"] == expected
+        await fleet.async_shutdown()
+
+
+async def test_rebind_rechecks_global_provisioning_journal_after_identity_wait(
+    hass: HomeAssistant,
+) -> None:
+    """A transaction appearing during key exchange blocks the identity write."""
+    entry = _fleet_entry(_panel("office", "SHA256:office", subentry_id="panel-office"))
+    entry.add_to_hass(hass)
+    fleet = FleetManager(hass, entry)
+    candidate = HostIdentity(_OTHER_PUBLIC_KEY, _OTHER_FINGERPRINT)
+    journal = Mock(async_load=AsyncMock(side_effect=[None, _pending_record()]))
+    persisted = AsyncMock()
+
+    with (
+        patch.object(PanelManager, "async_setup", _noop_setup),
+        patch.object(PanelManager, "async_shutdown", _noop_shutdown),
+    ):
+        await fleet.async_setup()
+        expected = PanelConfig.from_subentry(entry.subentries["panel-office"])
+        manager = fleet.panels["panel-office"]
+        original_data = deepcopy(dict(entry.subentries["panel-office"].data))
+
+        with (
+            patch(
+                "custom_components.brilliant_mqtt.fleet_manager.ProvisioningJournal",
+                return_value=journal,
+            ),
+            patch(
+                "custom_components.brilliant_mqtt.fleet_manager.async_verify_host_identity",
+                new=AsyncMock(return_value=candidate),
+            ) as verified,
+            patch(
+                "custom_components.brilliant_mqtt.fleet_manager.async_wait_config_entry_persisted",
+                persisted,
+            ),
+            patch.object(manager, "_fire") as audit,
+            pytest.raises(
+                EntryDataError,
+                match="panel_rebind_blocked_by_panel_onboarding",
+            ),
+        ):
+            await fleet.async_rebind_panel(
+                "panel-office",
+                expected,
+                host="replacement.example.com",
+                root_password="replacement-secret",
+                candidate=candidate,
+            )
+
+        assert journal.async_load.await_count == 2
+        verified.assert_awaited_once_with("replacement.example.com", candidate)
+        persisted.assert_not_awaited()
+        audit.assert_not_called()
+        assert entry.subentries["panel-office"].data == original_data
+        assert fleet._panel_configs["panel-office"] == expected
+        assert manager.store.data == original_data
+        await fleet.async_shutdown()
+
+
+async def test_rebind_active_journal_blocks_before_identity_network(
+    hass: HomeAssistant,
+) -> None:
+    """An existing recovery owner prevents even the unauthenticated key exchange."""
+    entry = _fleet_entry(_panel("office", "SHA256:office", subentry_id="panel-office"))
+    entry.add_to_hass(hass)
+    fleet = FleetManager(hass, entry)
+    candidate = HostIdentity(_OTHER_PUBLIC_KEY, _OTHER_FINGERPRINT)
+    journal = Mock(async_load=AsyncMock(return_value=_pending_record()))
+    verified = AsyncMock(return_value=candidate)
+    persisted = AsyncMock()
+
+    with (
+        patch.object(PanelManager, "async_setup", _noop_setup),
+        patch.object(PanelManager, "async_shutdown", _noop_shutdown),
+    ):
+        await fleet.async_setup()
+        expected = PanelConfig.from_subentry(entry.subentries["panel-office"])
+        manager = fleet.panels["panel-office"]
+        original_data = deepcopy(dict(entry.subentries["panel-office"].data))
+
+        with (
+            patch(
+                "custom_components.brilliant_mqtt.fleet_manager.ProvisioningJournal",
+                return_value=journal,
+            ),
+            patch(
+                "custom_components.brilliant_mqtt.fleet_manager.async_verify_host_identity",
+                verified,
+            ),
+            patch(
+                "custom_components.brilliant_mqtt.fleet_manager.async_wait_config_entry_persisted",
+                persisted,
+            ),
+            patch.object(manager, "_fire") as audit,
+            pytest.raises(
+                EntryDataError,
+                match="panel_rebind_blocked_by_panel_onboarding",
+            ),
+        ):
+            await fleet.async_rebind_panel(
+                "panel-office",
+                expected,
+                host="replacement.example.com",
+                root_password="replacement-secret",
+                candidate=candidate,
+            )
+
+        journal.async_load.assert_awaited_once_with()
+        verified.assert_not_awaited()
+        persisted.assert_not_awaited()
+        audit.assert_not_called()
+        assert entry.subentries["panel-office"].data == original_data
+        assert fleet._panel_configs["panel-office"] == expected
+        assert manager.store.data == original_data
+        await fleet.async_shutdown()
+
+
+async def test_rebind_unreadable_journal_blocks_before_identity_network(
+    hass: HomeAssistant,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Unreadable recovery ownership has a distinct secret-safe failure."""
+    entry = _fleet_entry(_panel("office", "SHA256:office", subentry_id="panel-office"))
+    entry.add_to_hass(hass)
+    fleet = FleetManager(hass, entry)
+    candidate = HostIdentity(_OTHER_PUBLIC_KEY, _OTHER_FINGERPRINT)
+    private_failure = "journal-backend-private-detail"
+    journal = Mock(async_load=AsyncMock(side_effect=OSError(private_failure)))
+    verified = AsyncMock(return_value=candidate)
+    persisted = AsyncMock()
+
+    with (
+        patch.object(PanelManager, "async_setup", _noop_setup),
+        patch.object(PanelManager, "async_shutdown", _noop_shutdown),
+    ):
+        await fleet.async_setup()
+        expected = PanelConfig.from_subentry(entry.subentries["panel-office"])
+        manager = fleet.panels["panel-office"]
+        original_data = deepcopy(dict(entry.subentries["panel-office"].data))
+
+        with (
+            patch(
+                "custom_components.brilliant_mqtt.fleet_manager.ProvisioningJournal",
+                return_value=journal,
+            ),
+            patch(
+                "custom_components.brilliant_mqtt.fleet_manager.async_verify_host_identity",
+                verified,
+            ),
+            patch(
+                "custom_components.brilliant_mqtt.fleet_manager.async_wait_config_entry_persisted",
+                persisted,
+            ),
+            patch.object(manager, "_fire") as audit,
+            pytest.raises(
+                EntryDataError,
+                match="panel_rebind_blocked_by_panel_onboarding",
+            ) as captured,
+        ):
+            await fleet.async_rebind_panel(
+                "panel-office",
+                expected,
+                host="replacement.example.com",
+                root_password="replacement-secret",
+                candidate=candidate,
+            )
+
+        journal.async_load.assert_awaited_once_with()
+        verified.assert_not_awaited()
+        persisted.assert_not_awaited()
+        audit.assert_not_called()
+        assert entry.subentries["panel-office"].data == original_data
+        assert fleet._panel_configs["panel-office"] == expected
+        assert manager.store.data == original_data
+        assert private_failure not in f"{captured.value!r}\n{caplog.text}"
+        await fleet.async_shutdown()
+
+
+@pytest.mark.parametrize(
+    ("identity_failure", "error_code"),
+    [
+        (
+            PanelIdentityError("host_key_changed"),
+            "panel_rebind_identity_changed",
+        ),
+        (
+            PanelIdentityError("host_unreachable"),
+            "panel_rebind_identity_unreachable",
+        ),
+        (
+            OSError("transport carried replacement-root-secret"),
+            "panel_rebind_identity_unreachable",
+        ),
+    ],
+)
+async def test_rebind_identity_recheck_fails_closed_before_mutation(
+    hass: HomeAssistant,
+    identity_failure: BaseException,
+    error_code: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Late identity drift or loss cannot cross the durable ownership boundary."""
+    entry = _fleet_entry(_panel("office", "SHA256:office", subentry_id="panel-office"))
+    entry.add_to_hass(hass)
+    fleet = FleetManager(hass, entry)
+    persisted = AsyncMock()
+    replacement_password = "replacement-root-secret"
+    candidate = HostIdentity(_OTHER_PUBLIC_KEY, _OTHER_FINGERPRINT)
+
+    with (
+        patch.object(PanelManager, "async_setup", _noop_setup),
+        patch.object(PanelManager, "async_shutdown", _noop_shutdown),
+    ):
+        await fleet.async_setup()
+        expected = PanelConfig.from_subentry(entry.subentries["panel-office"])
+        manager = fleet.panels["panel-office"]
+        original_data = deepcopy(dict(entry.subentries["panel-office"].data))
+        original_unique_id = entry.subentries["panel-office"].unique_id
+
+        with (
+            patch(
+                "custom_components.brilliant_mqtt.fleet_manager.async_verify_host_identity",
+                new=AsyncMock(side_effect=identity_failure),
+            ) as verified,
+            patch(
+                "custom_components.brilliant_mqtt.fleet_manager.async_wait_config_entry_persisted",
+                persisted,
+            ),
+            patch.object(manager, "_fire") as audit,
+            pytest.raises(EntryDataError, match=error_code) as captured,
+        ):
+            await fleet.async_rebind_panel(
+                "panel-office",
+                expected,
+                host="replacement.example.com",
+                root_password=replacement_password,
+                candidate=candidate,
+            )
+
+        verified.assert_awaited_once_with("replacement.example.com", candidate)
+        persisted.assert_not_awaited()
+        audit.assert_not_called()
+        stored = entry.subentries["panel-office"]
+        assert stored.data == original_data
+        assert stored.unique_id == original_unique_id
+        assert fleet._panel_configs["panel-office"] == expected
+        assert manager.store.data == original_data
+        redacted = f"{captured.value!r}\n{caplog.text}"
+        assert replacement_password not in redacted
+        assert candidate.public_key not in redacted
+        assert str(identity_failure) not in redacted
+        await fleet.async_shutdown()
+
+
+async def test_rebind_rejects_fingerprint_owned_by_another_panel(
+    hass: HomeAssistant,
+) -> None:
+    """A rebind cannot merge two physical identities into one fleet panel."""
+    entry = _fleet_entry(
+        _panel("office", "SHA256:office", subentry_id="panel-office"),
+        _panel(
+            "kitchen",
+            "SHA256:kitchen",
+            subentry_id="panel-kitchen",
+            mesh_priority=2,
+        ),
+    )
+    entry.add_to_hass(hass)
+    fleet = FleetManager(hass, entry)
+    persisted = AsyncMock()
+
+    with (
+        patch.object(PanelManager, "async_setup", _noop_setup),
+        patch.object(PanelManager, "async_shutdown", _noop_shutdown),
+    ):
+        await fleet.async_setup()
+        expected = PanelConfig.from_subentry(entry.subentries["panel-office"])
+        office_manager = fleet.panels["panel-office"]
+        with (
+            patch(
+                "custom_components.brilliant_mqtt.fleet_manager.async_wait_config_entry_persisted",
+                persisted,
+            ),
+            patch.object(office_manager, "_fire") as audit,
+            pytest.raises(EntryDataError, match="duplicate_panel_fingerprint"),
+        ):
+            await fleet.async_rebind_panel(
+                "panel-office",
+                expected,
+                host="kitchen-replacement.example.com",
+                root_password="duplicate-secret",
+                candidate=HostIdentity(_OTHER_PUBLIC_KEY, _OTHER_FINGERPRINT),
+            )
+
+        assert PanelConfig.from_subentry(entry.subentries["panel-office"]) == expected
+        assert fleet._panel_configs["panel-office"] == expected
+        persisted.assert_not_awaited()
+        audit.assert_not_called()
+        await fleet.async_shutdown()
+
+
+async def test_rebind_storage_failure_durably_rolls_back_without_audit(
+    hass: HomeAssistant,
+) -> None:
+    """An unproven write restores the exact old snapshot and reports a fixed error."""
+    entry = _fleet_entry(_panel("office", "SHA256:office", subentry_id="panel-office"))
+    entry.add_to_hass(hass)
+    fleet = FleetManager(hass, entry)
+    storage_secret = "storage-error-with-private-context"
+    new_password = "uncommitted-new-root-secret"
+    proof_calls = 0
+
+    async def prove_persisted(
+        hass_arg: HomeAssistant,
+        entry_arg: MockConfigEntry,
+        *,
+        subentry_id: str | None = None,
+    ) -> None:
+        del hass_arg, entry_arg
+        nonlocal proof_calls
+        assert subentry_id == "panel-office"
+        proof_calls += 1
+        if proof_calls == 1:
+            raise OSError(storage_secret)
+        assert PanelConfig.from_subentry(entry.subentries["panel-office"]) == expected
+
+    with (
+        patch.object(PanelManager, "async_setup", _noop_setup),
+        patch.object(PanelManager, "async_shutdown", _noop_shutdown),
+    ):
+        await fleet.async_setup()
+        expected = PanelConfig.from_subentry(entry.subentries["panel-office"])
+        manager = fleet.panels["panel-office"]
+        candidate = HostIdentity(_OTHER_PUBLIC_KEY, _OTHER_FINGERPRINT)
+        with (
+            patch(
+                "custom_components.brilliant_mqtt.fleet_manager.async_wait_config_entry_persisted",
+                new=AsyncMock(side_effect=prove_persisted),
+            ),
+            patch.object(manager, "_fire") as audit,
+            pytest.raises(ConfigEntryPersistenceError) as captured,
+        ):
+            await fleet.async_rebind_panel(
+                "panel-office",
+                expected,
+                host="uncommitted.example.com",
+                root_password=new_password,
+                candidate=candidate,
+            )
+        await hass.async_block_till_done()
+
+        assert proof_calls == 2
+        assert PanelConfig.from_subentry(entry.subentries["panel-office"]) == expected
+        assert fleet._panel_configs["panel-office"] == expected
+        assert manager.store.data[CONF_IDENTITY_FINGERPRINT] == expected.identity_fingerprint
+        audit.assert_not_called()
+        assert str(captured.value) == "config_entry_storage_unavailable"
+        serialized_error = repr(captured.value)
+        assert storage_secret not in serialized_error
+        assert new_password not in serialized_error
+        assert candidate.public_key not in serialized_error
+        await fleet.async_shutdown()
+
+
+async def test_cancelled_rebind_settles_durable_rollback_before_reraising(
+    hass: HomeAssistant,
+) -> None:
+    """Cancellation cannot expose an unproven identity or emit a success audit."""
+    entry = _fleet_entry(_panel("office", "SHA256:office", subentry_id="panel-office"))
+    entry.add_to_hass(hass)
+    fleet = FleetManager(hass, entry)
+    first_proof_started = asyncio.Event()
+    rollback_proof_started = asyncio.Event()
+    allow_rollback_proof = asyncio.Event()
+    proof_calls = 0
+
+    async def prove_persisted(
+        hass_arg: HomeAssistant,
+        entry_arg: MockConfigEntry,
+        *,
+        subentry_id: str | None = None,
+    ) -> None:
+        del hass_arg, entry_arg
+        nonlocal proof_calls
+        assert subentry_id == "panel-office"
+        proof_calls += 1
+        if proof_calls == 1:
+            first_proof_started.set()
+            await asyncio.Future()
+        rollback_proof_started.set()
+        await allow_rollback_proof.wait()
+
+    with (
+        patch.object(PanelManager, "async_setup", _noop_setup),
+        patch.object(PanelManager, "async_shutdown", _noop_shutdown),
+    ):
+        await fleet.async_setup()
+        expected = PanelConfig.from_subentry(entry.subentries["panel-office"])
+        manager = fleet.panels["panel-office"]
+        candidate = HostIdentity(_OTHER_PUBLIC_KEY, _OTHER_FINGERPRINT)
+        with (
+            patch(
+                "custom_components.brilliant_mqtt.fleet_manager.async_wait_config_entry_persisted",
+                new=AsyncMock(side_effect=prove_persisted),
+            ),
+            patch.object(manager, "_fire") as audit,
+        ):
+            rebind = asyncio.create_task(
+                fleet.async_rebind_panel(
+                    "panel-office",
+                    expected,
+                    host="cancelled.example.com",
+                    root_password="cancelled-root-secret",
+                    candidate=candidate,
+                )
+            )
+            await first_proof_started.wait()
+            rebind.cancel()
+            await rollback_proof_started.wait()
+
+            assert not rebind.done()
+            assert PanelConfig.from_subentry(entry.subentries["panel-office"]) == expected
+            assert fleet._panel_configs["panel-office"] == expected
+            assert manager.store.data[CONF_IDENTITY_FINGERPRINT] == expected.identity_fingerprint
+            audit.assert_not_called()
+
+            allow_rollback_proof.set()
+            with pytest.raises(asyncio.CancelledError):
+                await rebind
+        await hass.async_block_till_done()
+
+        assert proof_calls == 2
+        assert PanelConfig.from_subentry(entry.subentries["panel-office"]) == expected
+        audit.assert_not_called()
+        await fleet.async_shutdown()
+
+
+async def test_rebind_double_storage_failure_keeps_one_redacted_repair_until_proven(
+    hass: HomeAssistant,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Unknown rollback durability stays visible until an exact later disk proof."""
+    entry = _fleet_entry(_panel("office", "SHA256:office", subentry_id="panel-office"))
+    entry.add_to_hass(hass)
+    fleet = FleetManager(hass, entry)
+    candidate = HostIdentity(_OTHER_PUBLIC_KEY, _OTHER_FINGERPRINT)
+    replacement_password = "unproven-replacement-root-secret"
+    storage_secret = "storage-backend-private-detail"
+    proof = AsyncMock(side_effect=OSError(storage_secret))
+
+    with (
+        patch.object(PanelManager, "async_setup", _noop_setup),
+        patch.object(PanelManager, "async_shutdown", _noop_shutdown),
+    ):
+        await fleet.async_setup()
+        expected = PanelConfig.from_subentry(entry.subentries["panel-office"])
+        manager = fleet.panels["panel-office"]
+        original_data = deepcopy(dict(entry.subentries["panel-office"].data))
+        original_title = entry.subentries["panel-office"].title
+        original_unique_id = entry.subentries["panel-office"].unique_id
+
+        with (
+            patch(
+                "custom_components.brilliant_mqtt.fleet_manager.async_wait_config_entry_persisted",
+                proof,
+            ),
+            patch.object(manager, "_fire") as audit,
+            pytest.raises(ConfigEntryPersistenceError) as captured,
+        ):
+            await fleet.async_rebind_panel(
+                "panel-office",
+                expected,
+                host="replacement.example.com",
+                root_password=replacement_password,
+                candidate=candidate,
+            )
+
+        assert proof.await_count == 2
+        audit.assert_not_called()
+        issue = ir.async_get(hass).async_get_issue(
+            DOMAIN,
+            f"fleet_storage_{entry.entry_id}",
+        )
+        assert issue is not None
+        assert issue.translation_key == "needs_attention"
+        assert issue.translation_placeholders == {
+            "panel": "Brilliant MQTT fleet",
+            "reason": (
+                "Home Assistant could not prove whether the previous panel identity was "
+                "restored in durable storage. Do not operate or retry either panel until "
+                "storage is healthy and the saved panel identity has been inspected or "
+                "reloaded. If the previous identity is restored, run Replace physical "
+                "panel again."
+            ),
+        }
+        serialized = f"{captured.value!r}\n{issue!r}\n{caplog.text}"
+        assert storage_secret not in serialized
+        assert replacement_password not in serialized
+        assert candidate.public_key not in serialized
+        assert expected.root_password not in serialized
+        assert expected.ssh_host_key not in serialized
+
+        stored = entry.subentries["panel-office"]
+        assert stored.data == original_data
+        assert stored.title == original_title
+        assert stored.unique_id == original_unique_id
+        assert fleet._panel_configs["panel-office"] == expected
+        assert manager.store.data == original_data
+
+        with patch(
+            "custom_components.brilliant_mqtt.fleet_manager.async_wait_config_entry_persisted",
+            new=AsyncMock(),
+        ) as later_proof:
+            await fleet._async_restore_rebind_snapshot(
+                "panel-office",
+                data=original_data,
+                title=original_title,
+                unique_id=original_unique_id,
+            )
+
+        later_proof.assert_awaited_once_with(
+            hass,
+            entry,
+            subentry_id="panel-office",
+        )
+        assert (
+            ir.async_get(hass).async_get_issue(
+                DOMAIN,
+                f"fleet_storage_{entry.entry_id}",
+            )
+            is None
+        )
+        audit.assert_not_called()
+        await fleet.async_shutdown()
+
+
+async def test_rebind_is_unavailable_for_legacy_runtime(
+    hass: HomeAssistant,
+) -> None:
+    """Compatibility managers cannot mutate identity through the fleet-only API."""
+    entry = _legacy_entry()
+    entry.add_to_hass(hass)
+    fleet = FleetManager(hass, entry)
+    expected = PanelConfig.from_subentry(
+        _panel("office", "SHA256:office", subentry_id="panel-office")
+    )
+    persisted = AsyncMock()
+
+    with (
+        patch.object(PanelManager, "async_setup", _noop_setup),
+        patch.object(PanelManager, "async_shutdown", _noop_shutdown),
+    ):
+        await fleet.async_setup()
+        with (
+            patch(
+                "custom_components.brilliant_mqtt.fleet_manager.async_wait_config_entry_persisted",
+                persisted,
+            ),
+            pytest.raises(EntryDataError, match="panel_rebind_unavailable"),
+        ):
+            await fleet.async_rebind_panel(
+                entry.entry_id,
+                expected,
+                host="replacement.example.com",
+                root_password="replacement-secret",
+                candidate=HostIdentity(_OTHER_PUBLIC_KEY, _OTHER_FINGERPRINT),
+            )
+
+        persisted.assert_not_awaited()
         await fleet.async_shutdown()
 
 
@@ -2850,6 +4268,604 @@ async def test_live_subentry_add_update_remove_reconciles_without_restarting_sib
         assert stops == ["kitchen", "office"]
 
 
+async def test_successful_fleet_control_change_reloads_after_lifecycle_unlock(
+    hass: HomeAssistant,
+) -> None:
+    """A validated control snapshot reaches the existing plane without lock inversion."""
+    entry = _fleet_entry(_panel("office", "SHA256:office", subentry_id="panel-office"))
+    entry.add_to_hass(hass)
+    fleet = FleetManager(hass, entry)
+
+    async def reload_settings() -> None:
+        assert not fleet._lifecycle_lock.locked()
+
+    control_plane = Mock(
+        async_reload_settings=AsyncMock(side_effect=reload_settings),
+    )
+    with (
+        patch.object(PanelManager, "async_setup", _noop_setup),
+        patch.object(PanelManager, "async_shutdown", _noop_shutdown),
+    ):
+        await fleet.async_setup()
+        assert fleet._update_unsub is not None
+        fleet._update_unsub()
+        fleet._update_unsub = None
+        hass.config_entries.async_update_entry(
+            entry,
+            data={
+                **entry.data,
+                CONF_HA_CONTROL_LABEL: "new-label",
+                CONF_SCENE_ACTIONS: {"movie": {"service": "scene.turn_on"}},
+            },
+        )
+
+        with patch(
+            "custom_components.brilliant_mqtt.ha_control.get_control_plane",
+            return_value=control_plane,
+        ) as get_control_plane:
+            await fleet._async_reconcile()
+
+        assert fleet.fleet.ha_control_label == "new-label"
+        assert fleet.fleet.scene_actions == {"movie": {"service": "scene.turn_on"}}
+        get_control_plane.assert_called_once_with(hass)
+        control_plane.async_reload_settings.assert_awaited_once_with()
+        await fleet.async_shutdown()
+
+
+async def test_failed_control_reload_stays_pending_for_identical_reconcile_retry(
+    hass: HomeAssistant,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A committed baseline cannot consume a failed control-plane publication."""
+    entry = _fleet_entry(_panel("office", "SHA256:office", subentry_id="panel-office"))
+    entry.add_to_hass(hass)
+    fleet = FleetManager(hass, entry)
+    private_failure = "control-plane-private-runtime-detail"
+    attempts = 0
+
+    async def reload_settings() -> None:
+        nonlocal attempts
+        assert not fleet._lifecycle_lock.locked()
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError(private_failure)
+
+    control_plane = Mock(
+        async_reload_settings=AsyncMock(side_effect=reload_settings),
+    )
+    with (
+        patch.object(PanelManager, "async_setup", _noop_setup),
+        patch.object(PanelManager, "async_shutdown", _noop_shutdown),
+    ):
+        await fleet.async_setup()
+        assert fleet._update_unsub is not None
+        fleet._update_unsub()
+        fleet._update_unsub = None
+        hass.config_entries.async_update_entry(
+            entry,
+            data={**entry.data, CONF_HA_CONTROL_LABEL: "retry-label"},
+        )
+
+        with (
+            patch(
+                "custom_components.brilliant_mqtt.ha_control.get_control_plane",
+                return_value=control_plane,
+            ),
+            patch.object(hass.config_entries, "async_schedule_reload") as schedule_reload,
+        ):
+            with pytest.raises(
+                ConfigEntryNotReady,
+                match="Control-plane settings reload is temporarily unavailable",
+            ) as captured:
+                await fleet._async_reconcile()
+
+            assert fleet.fleet.ha_control_label == "retry-label"
+            assert fleet._pending_control_plane_reload is not None
+            schedule_reload.assert_called_once_with(entry.entry_id)
+
+            await fleet._async_reconcile()
+
+        assert attempts == 2
+        assert fleet._pending_control_plane_reload is None
+        serialized = f"{captured.value!r}\n{caplog.text}"
+        assert private_failure not in serialized
+        await fleet.async_shutdown()
+
+
+async def test_cancelled_control_reload_keeps_pending_and_schedules_recovery(
+    hass: HomeAssistant,
+) -> None:
+    """Cancellation after baseline commit retains retry ownership and propagates."""
+    entry = _fleet_entry(_panel("office", "SHA256:office", subentry_id="panel-office"))
+    entry.add_to_hass(hass)
+    fleet = FleetManager(hass, entry)
+    first_reload_started = asyncio.Event()
+    attempts = 0
+
+    async def reload_settings() -> None:
+        nonlocal attempts
+        assert not fleet._lifecycle_lock.locked()
+        attempts += 1
+        if attempts == 1:
+            first_reload_started.set()
+            await asyncio.Future()
+
+    control_plane = Mock(
+        async_reload_settings=AsyncMock(side_effect=reload_settings),
+    )
+    with (
+        patch.object(PanelManager, "async_setup", _noop_setup),
+        patch.object(PanelManager, "async_shutdown", _noop_shutdown),
+    ):
+        await fleet.async_setup()
+        assert fleet._update_unsub is not None
+        fleet._update_unsub()
+        fleet._update_unsub = None
+        hass.config_entries.async_update_entry(
+            entry,
+            data={**entry.data, CONF_HA_CONTROL_LABEL: "cancelled-reload-label"},
+        )
+
+        with (
+            patch(
+                "custom_components.brilliant_mqtt.ha_control.get_control_plane",
+                return_value=control_plane,
+            ),
+            patch.object(hass.config_entries, "async_schedule_reload") as schedule_reload,
+        ):
+            reconcile = asyncio.create_task(fleet._async_reconcile())
+            await first_reload_started.wait()
+            assert fleet.fleet.ha_control_label == "cancelled-reload-label"
+            assert fleet._pending_control_plane_reload is not None
+
+            reconcile.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await reconcile
+
+            assert fleet._pending_control_plane_reload is not None
+            schedule_reload.assert_called_once_with(entry.entry_id)
+
+            await fleet._async_reconcile()
+
+        assert attempts == 2
+        assert fleet._pending_control_plane_reload is None
+        await fleet.async_shutdown()
+
+
+async def test_cancelled_control_reload_clear_schedules_pending_recovery(
+    hass: HomeAssistant,
+) -> None:
+    """Cancellation while reacquiring lifecycle cannot orphan a successful attempt."""
+    entry = _fleet_entry(_panel("office", "SHA256:office", subentry_id="panel-office"))
+    entry.add_to_hass(hass)
+    fleet = FleetManager(hass, entry)
+    reload_started = asyncio.Event()
+    allow_reload_return = asyncio.Event()
+    reload_returning = asyncio.Event()
+
+    async def reload_settings() -> None:
+        assert not fleet._lifecycle_lock.locked()
+        reload_started.set()
+        await allow_reload_return.wait()
+        reload_returning.set()
+
+    control_plane = Mock(
+        async_reload_settings=AsyncMock(side_effect=reload_settings),
+    )
+    with (
+        patch.object(PanelManager, "async_setup", _noop_setup),
+        patch.object(PanelManager, "async_shutdown", _noop_shutdown),
+    ):
+        await fleet.async_setup()
+        assert fleet._update_unsub is not None
+        fleet._update_unsub()
+        fleet._update_unsub = None
+        hass.config_entries.async_update_entry(
+            entry,
+            data={**entry.data, CONF_HA_CONTROL_LABEL: "cancelled-clear-label"},
+        )
+
+        with (
+            patch(
+                "custom_components.brilliant_mqtt.ha_control.get_control_plane",
+                return_value=control_plane,
+            ),
+            patch.object(hass.config_entries, "async_schedule_reload") as schedule_reload,
+        ):
+            reconcile = asyncio.create_task(fleet._async_reconcile())
+            await reload_started.wait()
+            await fleet._lifecycle_lock.acquire()
+            try:
+                allow_reload_return.set()
+                await reload_returning.wait()
+                await asyncio.sleep(0)
+
+                reconcile.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await reconcile
+
+                assert fleet._pending_control_plane_reload is not None
+                schedule_reload.assert_called_once_with(entry.entry_id)
+            finally:
+                fleet._lifecycle_lock.release()
+
+            await fleet._async_reconcile()
+
+        assert fleet._pending_control_plane_reload is None
+        await fleet.async_shutdown()
+
+
+async def test_cancellation_during_post_commit_cleanup_schedules_control_recovery(
+    hass: HomeAssistant,
+) -> None:
+    """Any cancellation after the new baseline exists retains publication ownership."""
+    entry = _fleet_entry(
+        _panel("office", "SHA256:office", subentry_id="panel-office"),
+        _panel("kitchen", "SHA256:kitchen", subentry_id="panel-kitchen"),
+    )
+    entry.add_to_hass(hass)
+    fleet = FleetManager(hass, entry)
+    kitchen_shutdown_started = asyncio.Event()
+    allow_kitchen_shutdown = asyncio.Event()
+
+    async def shutdown(manager: PanelManager) -> None:
+        if manager.panel == "kitchen":
+            kitchen_shutdown_started.set()
+            await allow_kitchen_shutdown.wait()
+
+    control_plane = Mock(async_reload_settings=AsyncMock())
+    with (
+        patch.object(PanelManager, "async_setup", _noop_setup),
+        patch.object(PanelManager, "async_shutdown", shutdown),
+    ):
+        await fleet.async_setup()
+        assert fleet._update_unsub is not None
+        fleet._update_unsub()
+        fleet._update_unsub = None
+        assert hass.config_entries.async_remove_subentry(entry, "panel-kitchen")
+        hass.config_entries.async_update_entry(
+            entry,
+            data={**entry.data, CONF_HA_CONTROL_LABEL: "cleanup-cancel-label"},
+        )
+
+        with (
+            patch(
+                "custom_components.brilliant_mqtt.ha_control.get_control_plane",
+                return_value=control_plane,
+            ),
+            patch.object(hass.config_entries, "async_schedule_reload") as schedule_reload,
+        ):
+            reconcile = asyncio.create_task(fleet._async_reconcile())
+            await kitchen_shutdown_started.wait()
+            assert fleet.fleet.ha_control_label == "cleanup-cancel-label"
+            assert fleet._pending_control_plane_reload is not None
+
+            reconcile.cancel()
+            await asyncio.sleep(0)
+            assert not reconcile.done()
+            allow_kitchen_shutdown.set()
+            with pytest.raises(asyncio.CancelledError):
+                await reconcile
+
+            schedule_reload.assert_called_once_with(entry.entry_id)
+            control_plane.async_reload_settings.assert_not_awaited()
+            assert fleet._pending_control_plane_reload is not None
+
+            await fleet._async_reconcile()
+
+        control_plane.async_reload_settings.assert_awaited_once_with()
+        assert fleet._pending_control_plane_reload is None
+        await fleet.async_shutdown()
+
+
+async def test_failed_post_commit_cleanup_schedules_identical_control_retry(
+    hass: HomeAssistant,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A generic cleanup failure cannot orphan committed publication ownership."""
+    entry = _fleet_entry(
+        _panel("office", "SHA256:office", subentry_id="panel-office"),
+        _panel("kitchen", "SHA256:kitchen", subentry_id="panel-kitchen"),
+    )
+    entry.add_to_hass(hass)
+    fleet = FleetManager(hass, entry)
+    private_failure = "removed-runtime-private-shutdown-detail"
+    kitchen_shutdown_attempts = 0
+
+    async def shutdown(manager: PanelManager) -> None:
+        nonlocal kitchen_shutdown_attempts
+        if manager.panel != "kitchen":
+            return
+        kitchen_shutdown_attempts += 1
+        raise RuntimeError(private_failure)
+
+    control_plane = Mock(async_reload_settings=AsyncMock())
+    with (
+        patch.object(PanelManager, "async_setup", _noop_setup),
+        patch.object(PanelManager, "async_shutdown", shutdown),
+    ):
+        await fleet.async_setup()
+        kitchen_manager = fleet.panels["panel-kitchen"]
+        kitchen_issue_ids = _panel_owned_issue_ids(kitchen_manager.management_id)
+        office_issue_id = f"needs_attention_{fleet.panels['panel-office'].management_id}"
+        registry = ir.async_get(hass)
+        for issue_id in kitchen_issue_ids | {office_issue_id}:
+            ir.async_create_issue(
+                hass,
+                DOMAIN,
+                issue_id,
+                is_fixable=False,
+                severity=ir.IssueSeverity.WARNING,
+                translation_key="needs_attention",
+                translation_placeholders={
+                    "panel": "test",
+                    "reason": "test",
+                },
+            )
+        assert fleet._update_unsub is not None
+        fleet._update_unsub()
+        fleet._update_unsub = None
+        assert hass.config_entries.async_remove_subentry(entry, "panel-kitchen")
+        hass.config_entries.async_update_entry(
+            entry,
+            data={**entry.data, CONF_HA_CONTROL_LABEL: "cleanup-retry-label"},
+        )
+
+        with (
+            patch(
+                "custom_components.brilliant_mqtt.ha_control.get_control_plane",
+                return_value=control_plane,
+            ),
+            patch.object(hass.config_entries, "async_schedule_reload") as schedule_reload,
+        ):
+            with pytest.raises(
+                ConfigEntryNotReady,
+                match="Fleet post-update cleanup is temporarily unavailable",
+            ) as captured:
+                await fleet._async_reconcile()
+
+            assert fleet.fleet.ha_control_label == "cleanup-retry-label"
+            assert set(fleet.panels) == {"panel-office"}
+            assert fleet._pending_control_plane_reload is not None
+            assert kitchen_shutdown_attempts == 1
+            schedule_reload.assert_called_once_with(entry.entry_id)
+            control_plane.async_reload_settings.assert_not_awaited()
+            assert all(
+                registry.async_get_issue(DOMAIN, issue_id) is None for issue_id in kitchen_issue_ids
+            )
+            assert registry.async_get_issue(DOMAIN, office_issue_id) is not None
+
+            await fleet._async_reconcile()
+
+        control_plane.async_reload_settings.assert_awaited_once_with()
+        assert fleet._pending_control_plane_reload is None
+        assert captured.value.__cause__ is None
+        assert captured.value.__suppress_context__
+        assert private_failure not in f"{captured.value!r}\n{caplog.text}"
+        await fleet.async_shutdown()
+
+
+async def test_older_control_reload_success_cannot_clear_newer_snapshot(
+    hass: HomeAssistant,
+) -> None:
+    """Generation ownership prevents an older completion from consuming newer work."""
+    entry = _fleet_entry(_panel("office", "SHA256:office", subentry_id="panel-office"))
+    entry.add_to_hass(hass)
+    fleet = FleetManager(hass, entry)
+    first_reload_started = asyncio.Event()
+    second_reload_started = asyncio.Event()
+    finish_first_reload = asyncio.Event()
+    finish_second_reload = asyncio.Event()
+    attempts = 0
+
+    async def reload_settings() -> None:
+        nonlocal attempts
+        assert not fleet._lifecycle_lock.locked()
+        attempts += 1
+        if attempts == 1:
+            first_reload_started.set()
+            await finish_first_reload.wait()
+            return
+        if attempts == 2:
+            second_reload_started.set()
+            await finish_second_reload.wait()
+            return
+        raise AssertionError("unexpected control-plane reload")
+
+    control_plane = Mock(
+        async_reload_settings=AsyncMock(side_effect=reload_settings),
+    )
+    with (
+        patch.object(PanelManager, "async_setup", _noop_setup),
+        patch.object(PanelManager, "async_shutdown", _noop_shutdown),
+    ):
+        await fleet.async_setup()
+        assert fleet._update_unsub is not None
+        fleet._update_unsub()
+        fleet._update_unsub = None
+
+        with patch(
+            "custom_components.brilliant_mqtt.ha_control.get_control_plane",
+            return_value=control_plane,
+        ):
+            hass.config_entries.async_update_entry(
+                entry,
+                data={**entry.data, CONF_HA_CONTROL_LABEL: "generation-one"},
+            )
+            first = asyncio.create_task(fleet._async_reconcile())
+            await first_reload_started.wait()
+            first_pending = fleet._pending_control_plane_reload
+            assert first_pending is not None
+
+            hass.config_entries.async_update_entry(
+                entry,
+                data={**entry.data, CONF_HA_CONTROL_LABEL: "generation-two"},
+            )
+            second = asyncio.create_task(fleet._async_reconcile())
+            await second_reload_started.wait()
+            second_pending = fleet._pending_control_plane_reload
+            assert second_pending is not None
+            assert second_pending != first_pending
+            assert fleet.fleet.ha_control_label == "generation-two"
+
+            finish_first_reload.set()
+            await first
+            assert fleet._pending_control_plane_reload == second_pending
+
+            finish_second_reload.set()
+            await second
+
+        assert attempts == 2
+        assert fleet._pending_control_plane_reload is None
+        await fleet.async_shutdown()
+
+
+async def test_successful_fleet_topology_change_reloads_control_plane(
+    hass: HomeAssistant,
+) -> None:
+    """Scene routing is rebuilt when a validated fleet gains a panel slug."""
+    entry = _fleet_entry(_panel("office", "SHA256:office", subentry_id="panel-office"))
+    entry.add_to_hass(hass)
+    fleet = FleetManager(hass, entry)
+    control_plane = Mock(async_reload_settings=AsyncMock())
+
+    with (
+        patch.object(PanelManager, "async_setup", _noop_setup),
+        patch.object(PanelManager, "async_shutdown", _noop_shutdown),
+    ):
+        await fleet.async_setup()
+        assert fleet._update_unsub is not None
+        fleet._update_unsub()
+        fleet._update_unsub = None
+        assert hass.config_entries.async_add_subentry(
+            entry,
+            _panel("kitchen", "SHA256:kitchen", subentry_id="panel-kitchen"),
+        )
+
+        with patch(
+            "custom_components.brilliant_mqtt.ha_control.get_control_plane",
+            return_value=control_plane,
+        ):
+            await fleet.async_panel_added("panel-kitchen")
+
+        control_plane.async_reload_settings.assert_awaited_once_with()
+        await fleet.async_shutdown()
+
+
+async def test_rejected_fleet_snapshot_does_not_reload_control_plane(
+    hass: HomeAssistant,
+) -> None:
+    """An immutable-identity violation cannot publish unrelated control changes."""
+    entry = _fleet_entry(_panel("office", "SHA256:office", subentry_id="panel-office"))
+    entry.add_to_hass(hass)
+    fleet = FleetManager(hass, entry)
+    control_plane = Mock(async_reload_settings=AsyncMock())
+
+    with (
+        patch.object(PanelManager, "async_setup", _noop_setup),
+        patch.object(PanelManager, "async_shutdown", _noop_shutdown),
+    ):
+        await fleet.async_setup()
+        assert fleet._update_unsub is not None
+        fleet._update_unsub()
+        fleet._update_unsub = None
+        hass.config_entries.async_update_entry(
+            entry,
+            data={**entry.data, CONF_HA_CONTROL_LABEL: "rejected-label"},
+        )
+        stored_office = entry.subentries["panel-office"]
+        assert hass.config_entries.async_update_subentry(
+            entry,
+            stored_office,
+            data={**stored_office.data, CONF_PANEL: "rebound-office"},
+        )
+
+        with (
+            patch(
+                "custom_components.brilliant_mqtt.ha_control.get_control_plane",
+                return_value=control_plane,
+            ) as get_control_plane,
+            pytest.raises(EntryDataError, match="immutable_panel_identity"),
+        ):
+            await fleet._async_reconcile()
+
+        assert fleet.fleet.ha_control_label == "brilliant"
+        get_control_plane.assert_not_called()
+        control_plane.async_reload_settings.assert_not_awaited()
+        await fleet.async_shutdown()
+
+
+async def test_panel_host_only_change_does_not_reload_control_plane(
+    hass: HomeAssistant,
+) -> None:
+    """Panel connection changes stay outside HA-control and scene authority."""
+    entry = _fleet_entry(_panel("office", "SHA256:office", subentry_id="panel-office"))
+    entry.add_to_hass(hass)
+    fleet = FleetManager(hass, entry)
+    control_plane = Mock(async_reload_settings=AsyncMock())
+
+    with (
+        patch.object(PanelManager, "async_setup", _noop_setup),
+        patch.object(PanelManager, "async_shutdown", _noop_shutdown),
+    ):
+        await fleet.async_setup()
+        assert fleet._update_unsub is not None
+        fleet._update_unsub()
+        fleet._update_unsub = None
+        stored_office = entry.subentries["panel-office"]
+        assert hass.config_entries.async_update_subentry(
+            entry,
+            stored_office,
+            data={**stored_office.data, CONF_HOST: "office-new.example.com"},
+        )
+
+        with patch(
+            "custom_components.brilliant_mqtt.ha_control.get_control_plane",
+            return_value=control_plane,
+        ) as get_control_plane:
+            await fleet.async_panel_updated("panel-office")
+
+        assert fleet._panel_configs["panel-office"].host == "office-new.example.com"
+        get_control_plane.assert_not_called()
+        control_plane.async_reload_settings.assert_not_awaited()
+        await fleet.async_shutdown()
+
+
+async def test_legacy_reconcile_preserves_existing_control_plane_behavior(
+    hass: HomeAssistant,
+) -> None:
+    """Compatibility entries keep their full-entry reload path unchanged."""
+    entry = _legacy_entry()
+    entry.add_to_hass(hass)
+    fleet = FleetManager(hass, entry)
+    control_plane = Mock(async_reload_settings=AsyncMock())
+
+    with (
+        patch.object(PanelManager, "async_setup", _noop_setup),
+        patch.object(PanelManager, "async_shutdown", _noop_shutdown),
+    ):
+        await fleet.async_setup()
+        assert fleet._update_unsub is not None
+        fleet._update_unsub()
+        fleet._update_unsub = None
+        hass.config_entries.async_update_entry(
+            entry,
+            data={**entry.data, CONF_HA_CONTROL_LABEL: "legacy-new-label"},
+        )
+
+        with patch(
+            "custom_components.brilliant_mqtt.ha_control.get_control_plane",
+            return_value=control_plane,
+        ) as get_control_plane:
+            await fleet._async_reconcile()
+
+        assert fleet.fleet.ha_control_label == "legacy-new-label"
+        assert fleet._pending_control_plane_reload is None
+        get_control_plane.assert_not_called()
+        control_plane.async_reload_settings.assert_not_awaited()
+        await fleet.async_shutdown()
+
+
 async def test_failed_pending_panel_start_is_not_published_and_schedules_retry(
     hass: HomeAssistant,
 ) -> None:
@@ -3238,6 +5254,7 @@ async def test_cancelled_staged_live_add_preserves_committed_snapshot_and_drains
     with (
         patch.object(PanelManager, "async_setup", setup),
         patch.object(PanelManager, "async_shutdown", shutdown),
+        patch("custom_components.brilliant_mqtt.ha_control.get_control_plane") as get_control_plane,
     ):
         addition = asyncio.create_task(fleet.async_panel_added("panel-bedroom"))
         await bedroom_setup.wait()
@@ -3253,6 +5270,7 @@ async def test_cancelled_staged_live_add_preserves_committed_snapshot_and_drains
         assert fleet._panel_configs == original_config_values
         assert office_manager.store is original_store
         assert office_manager.fleet is original_fleet
+        get_control_plane.assert_not_called()
 
         await fleet.async_shutdown()
 
@@ -3297,7 +5315,10 @@ async def test_removal_commits_snapshot_before_cancellation_settled_cleanup(
             cleanup_entered.set()
             await cleanup_release.wait()
 
-    with patch.object(PanelManager, "async_shutdown", shutdown):
+    with (
+        patch.object(PanelManager, "async_shutdown", shutdown),
+        patch.object(hass.config_entries, "async_schedule_reload") as schedule_reload,
+    ):
         removal = asyncio.create_task(fleet.async_panel_removed("panel-kitchen"))
         await cleanup_entered.wait()
 
@@ -3316,6 +5337,7 @@ async def test_removal_commits_snapshot_before_cancellation_settled_cleanup(
             await removal
 
         assert stopped == ["kitchen"]
+        schedule_reload.assert_called_once_with(entry.entry_id)
         await fleet.async_shutdown()
 
 
@@ -3360,6 +5382,7 @@ async def test_cancelled_removal_finishes_cleanup_after_atomic_snapshot_swap(
     with (
         patch.object(PanelManager, "async_setup", _noop_setup),
         patch.object(PanelManager, "async_shutdown", shutdown),
+        patch.object(hass.config_entries, "async_schedule_reload") as schedule_reload,
     ):
         reconcile = asyncio.create_task(fleet.async_panel_added("panel-kitchen"))
         await removal_started.wait()
@@ -3375,6 +5398,7 @@ async def test_cancelled_removal_finishes_cleanup_after_atomic_snapshot_swap(
             await reconcile
 
         assert stopped == ["garage"]
+        schedule_reload.assert_called_once_with(entry.entry_id)
         assert set(fleet.panels) == {"panel-office", "panel-kitchen"}
         assert fleet._panel_configs.keys() == fleet.panels.keys()
         await fleet.async_shutdown()

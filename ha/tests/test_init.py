@@ -22,6 +22,7 @@ from custom_components.brilliant_mqtt import (
     async_setup_entry,
     async_unload_entry,
 )
+from custom_components.brilliant_mqtt.components import REGISTRY
 from custom_components.brilliant_mqtt.const import (
     COMPONENT_BRIDGE,
     COMPONENT_HA_MIRROR,
@@ -63,7 +64,8 @@ async def test_integration_discoverable(hass: HomeAssistant) -> None:
     """The HA loader resolves the integration and the manifest carries the contract."""
     integration = await async_get_integration(hass, DOMAIN)
     assert integration.domain == DOMAIN
-    assert integration.integration_type == "device"
+    assert integration.integration_type == "hub"
+    assert integration.name == "Brilliant MQTT Fleet Manager"
     assert "mqtt" in (integration.dependencies or [])
     assert any(r.startswith("asyncssh==") for r in integration.requirements or [])
 
@@ -98,6 +100,16 @@ ENTRY_DATA = {
     CONF_MQTT_PASSWORD: "mqttpass",
     DATA_SSH_HOST_KEY: "ssh-ed25519 PINNED",
 }
+
+
+def _component_issue_ids(management_ids: set[str]) -> set[str]:
+    """Return every stable component issue ID the manager can currently create."""
+    return {
+        f"component_state_unverified_{management_id}_{component.id}"
+        for management_id in management_ids
+        for component in REGISTRY.values()
+        if not component.deprecated
+    }
 
 
 async def test_ha_remove_delegates_recovery_after_registry_owner_is_deleted(
@@ -141,7 +153,53 @@ async def test_ha_remove_delegates_recovery_after_registry_owner_is_deleted(
         f"broker_unavailable_{entry.entry_id}",
         f"runtime_setup_failed_{entry.entry_id}",
         f"fleet_storage_{entry.entry_id}",
-    }
+    } | _component_issue_ids({entry.entry_id})
+
+
+async def test_fleet_remove_deletes_component_issues_for_each_management_id(
+    hass: HomeAssistant,
+) -> None:
+    """Fleet removal cleans component issues by durable panel management ID."""
+    from tests.test_fleet_manager import _fleet_entry, _panel
+
+    office_management_id = "management-office"
+    kitchen_management_id = "management-kitchen"
+    entry = _fleet_entry(
+        _panel(
+            "office",
+            "SHA256:office",
+            subentry_id="panel-office",
+            management_id=office_management_id,
+        ),
+        _panel(
+            "kitchen",
+            "SHA256:kitchen",
+            subentry_id="panel-kitchen",
+            management_id=kitchen_management_id,
+        ),
+    )
+    entry.add_to_hass(hass)
+
+    with (
+        patch(
+            "custom_components.brilliant_mqtt.async_recover_removed_entry",
+        ) as recover,
+        patch(
+            "custom_components.brilliant_mqtt.ir.async_delete_issue",
+        ) as delete_issue,
+    ):
+        await hass.config_entries.async_remove(entry.entry_id)
+
+    recover.assert_awaited_once_with(hass, entry)
+    management_ids = {office_management_id, kitchen_management_id}
+    assert {call.args[2] for call in delete_issue.call_args_list} == {
+        *(f"needs_attention_{management_id}" for management_id in management_ids),
+        *(f"voice_missing_{management_id}" for management_id in management_ids),
+        *(f"ha_mirror_retired_{management_id}" for management_id in management_ids),
+        f"broker_unavailable_{entry.entry_id}",
+        f"runtime_setup_failed_{entry.entry_id}",
+        f"fleet_storage_{entry.entry_id}",
+    } | _component_issue_ids(management_ids)
 
 
 def _entry_manager(entry: MockConfigEntry) -> PanelManager:
@@ -388,7 +446,9 @@ async def test_unload_always_shuts_manager_down_when_alternate_owner_reload_fail
 
 @pytest.mark.allow_lingering_timers
 async def test_setup_failure_preserves_original_error_when_detach_cleanup_fails(
-    hass: HomeAssistant, mqtt_mock: MqttMockHAClient
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A cleanup publish failure must not replace the platform setup error."""
     from homeassistant.helpers import entity_registry as er
@@ -426,6 +486,7 @@ async def test_setup_failure_preserves_original_error_when_detach_cleanup_fails(
     await plane.async_attach(zulu)
     assert await async_migrate_entry(hass, alpha)
     real_publish = mqtt.async_publish
+    private_cleanup_failure = "MQTT_PASSWORD=entry-cleanup-secret"
 
     async def fail_empty_manifest(
         hass: HomeAssistant,
@@ -438,7 +499,7 @@ async def test_setup_failure_preserves_original_error_when_detach_cleanup_fails(
         message_expiry_interval: int | None = None,
     ) -> None:
         if topic == manifest_topic() and json.loads(str(payload))["entities"] == []:
-            raise RuntimeError("detach cleanup failed")
+            raise RuntimeError(private_cleanup_failure)
         await real_publish(
             hass,
             topic,
@@ -465,6 +526,7 @@ async def test_setup_failure_preserves_original_error_when_detach_cleanup_fails(
 
     assert not mqtt_mock.is_active_subscription(availability_topic("alpha"))
     assert not mqtt_mock.is_active_subscription(meta_topic("alpha"))
+    assert private_cleanup_failure not in caplog.text
     await plane.async_detach(zulu.entry_id)
 
 

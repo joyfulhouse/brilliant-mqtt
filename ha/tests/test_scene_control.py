@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import traceback
 from collections.abc import Mapping
 from typing import Any
 from unittest.mock import AsyncMock, patch
@@ -1125,7 +1126,9 @@ async def test_noncanonical_deduplication_key_is_rejected(
 
 @pytest.mark.allow_lingering_timers
 async def test_command_publish_failure_is_sanitized_and_does_not_leak_pending_state(
-    hass: HomeAssistant, mqtt_mock: MqttMockHAClient
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     runtime = SceneControl(hass)
     await runtime.async_start({"office"}, default_panel="office", actions={})
@@ -1156,8 +1159,39 @@ async def test_command_publish_failure_is_sanitized_and_does_not_leak_pending_st
     ):
         await runtime.async_run_scene("office", "all_off")
     assert secret not in str(error.value)
+    assert secret not in repr(error.value)
+    assert secret not in "".join(traceback.format_exception(error.value))
+    assert secret not in caplog.text
+    assert error.value.__cause__ is None
     assert runtime.pending_count == 0
 
+    await runtime.async_stop()
+
+
+@pytest.mark.allow_lingering_timers
+async def test_unexpected_scene_callback_failure_logs_type_only(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    runtime = SceneControl(hass)
+    await runtime.async_start({"office"}, default_panel="office", actions={})
+    secret = "MQTT_PASSWORD=scene-callback-secret"
+
+    with patch.object(
+        runtime,
+        "_async_catalog",
+        new=AsyncMock(side_effect=RuntimeError(secret)),
+    ):
+        async_fire_mqtt_message(
+            hass,
+            "brilliant/ha-control/v1/scene/catalog/office",
+            _scene_catalog(10, []),
+        )
+        await hass.async_block_till_done()
+
+    assert "RuntimeError" in caplog.text
+    assert secret not in caplog.text
     await runtime.async_stop()
 
 

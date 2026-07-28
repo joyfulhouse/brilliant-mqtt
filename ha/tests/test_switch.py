@@ -89,18 +89,23 @@ async def test_wifi_watchdog_switch_turn_on_calls_install_component(
 async def test_wifi_watchdog_switch_turn_on_maps_ssh_error(
     manager_with_fake_panel: PanelManager,
 ) -> None:
+    private_failure = "MQTT_PASSWORD=switch-outward-secret"
     sw = WifiWatchdogSwitch(manager_with_fake_panel)
     with (
         patch.object(
             PanelManager,
             "async_install_component",
             new_callable=AsyncMock,
-            side_effect=OSError("unreachable"),
+            side_effect=OSError(private_failure),
         ),
         pytest.raises(HomeAssistantError) as err,
     ):
         await sw.async_turn_on()
     assert err.value.translation_key == "wifi_watchdog_failed"
+    assert err.value.translation_placeholders == {"error": "panel component operation failed"}
+    assert private_failure not in repr(err.value)
+    assert err.value.__cause__ is None
+    assert err.value.__suppress_context__ is True
 
 
 @pytest.mark.asyncio

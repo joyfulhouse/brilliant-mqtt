@@ -31,6 +31,7 @@ from .const import (
     DEFAULT_REBOOT_JOURNAL_LINES,
     HA_MIRROR_SERVICE_NAME,
     HUE_CA_TIMER_NAME,
+    MAX_REBOOT_JOURNAL_LINES,
     PANEL_APP_DIR,
     PANEL_BUS_WATCHDOG_DIR,
     PANEL_BUS_WATCHDOG_UNIT_FILE,
@@ -1832,6 +1833,8 @@ REBOOT_COMMAND = "reboot"
 # the disconnect) quickly. If sshd never returns an exit status before the panel is
 # gone the timeout fires and — like the disconnect — counts as success.
 _REBOOT_ISSUE_TIMEOUT_SECONDS = 20.0
+DIAGNOSTICS_COUNT_LIMIT = 64 * 1024
+_DIAGNOSTICS_PARSE_LIMIT = 64 * 1024
 
 
 async def reboot(shell: PanelShell) -> None:
@@ -1855,71 +1858,255 @@ async def reboot(shell: PanelShell) -> None:
 
 
 def _diagnostics_probes(lines: int) -> tuple[tuple[str, str], ...]:
-    """(title, command) pairs for collect_diagnostics — POSIX-simple, no bashisms.
+    """Return fixed probe IDs and read-only commands.
 
-    Two probes scale with *lines*: the whole current boot (the wedge context) and the
-    bridge unit's own tail at half that depth. The rest are fixed one-shots covering the
-    two observed wedge classes — the uptime-decay wedge and Wi-Fi power-save starvation
-    (connman timeouts, kernel wlan/deauth/carrier noise, the radio's power_save state).
+    Probe output is never persisted directly. ``collect_diagnostics`` reduces every
+    result to a fixed-schema allowlist of numeric metrics, enum states, and event counts.
     """
     unit_lines = max(1, lines // 2)
     return (
-        ("uptime", "uptime"),
-        ("free", "free"),
-        ("df /var", "df /var"),
-        (f"journalctl -b (last {lines})", f"journalctl -b -n {lines} --no-pager"),
+        ("uptime", "cat /proc/uptime"),
+        ("memory", "free -k"),
+        ("var_filesystem", "df -Pk /var"),
+        ("boot_events", f"journalctl -b -n {lines} --no-pager"),
         (
-            f"journalctl -u {SERVICE_NAME} (last {unit_lines})",
+            "bridge_events",
             f"journalctl -u {SERVICE_NAME} -n {unit_lines} --no-pager",
         ),
         (
-            "kernel wifi/oom",
+            "kernel_events",
             "journalctl -k | grep -iE 'wlan|brcm|dhd|deauth|disassoc|carrier|oom' | tail -60",
         ),
-        ("iw dev wlan0 link", "iw dev wlan0 link"),
-        ("iw dev wlan0 power_save", "iw dev wlan0 get power_save"),
-        ("connmanctl services", "connmanctl services 2>&1 | head -n 15"),
+        ("wifi_link", "iw dev wlan0 link"),
+        ("wifi_power_save", "iw dev wlan0 get power_save"),
+        ("connman_services", "connmanctl services | head -n 15"),
         (
-            f"systemctl status {SERVICE_NAME}",
-            f"systemctl status {SERVICE_NAME} --no-pager 2>&1 | head -n 15",
+            "bridge_status",
+            f"systemctl status {SERVICE_NAME} --no-pager | head -n 15",
         ),
     )
 
 
-async def _diagnostics_probe(shell: PanelShell, command: str) -> str:
-    """Run one read-only diagnostics probe, returning its output or an error note.
+def _bounded_count(value: int) -> int:
+    return min(max(value, 0), DIAGNOSTICS_COUNT_LIMIT)
 
-    Failure-tolerant by contract so one dead probe never aborts the surrounding bundle:
-    a transport error becomes a text note. Exit status is deliberately NOT checked — a
-    non-zero probe (e.g. `iw ... get power_save` on a downed link, or `grep` finding no
-    match) still yields output worth capturing.
-    """
+
+def _text_counts(prefix: str, value: str) -> dict[str, int]:
+    return {
+        f"{prefix}_bytes": _bounded_count(len(value.encode("utf-8", errors="replace"))),
+        f"{prefix}_lines": _bounded_count(len(value.splitlines())),
+    }
+
+
+def _safe_nonnegative_int(value: str) -> int | None:
+    if not re.fullmatch(r"\d{1,18}", value):
+        return None
+    return int(value)
+
+
+def _parse_uptime(stdout: str) -> dict[str, object]:
+    for line in stdout[:_DIAGNOSTICS_PARSE_LIMIT].splitlines():
+        match = re.fullmatch(
+            r"\s*(\d{1,12})(?:\.\d{1,6})?\s+\d{1,12}(?:\.\d{1,6})?\s*",
+            line,
+        )
+        if match is not None:
+            return {"uptime_seconds": int(match.group(1))}
+    return {}
+
+
+def _parse_memory(stdout: str) -> dict[str, object]:
+    for line in stdout[:_DIAGNOSTICS_PARSE_LIMIT].splitlines():
+        fields = line.split()
+        if len(fields) < 4 or fields[0] != "Mem:":
+            continue
+        total, used, free = (_safe_nonnegative_int(field) for field in fields[1:4])
+        if total is not None and used is not None and free is not None:
+            return {
+                "total_kib": total,
+                "used_kib": used,
+                "free_kib": free,
+            }
+    return {}
+
+
+def _parse_var_filesystem(stdout: str) -> dict[str, object]:
+    for line in reversed(stdout[:_DIAGNOSTICS_PARSE_LIMIT].splitlines()):
+        fields = line.split()
+        if len(fields) < 6 or fields[-1] != "/var":
+            continue
+        total, used, available = (_safe_nonnegative_int(field) for field in fields[1:4])
+        used_match = re.fullmatch(r"(\d{1,3})%", fields[4])
+        if (
+            total is not None
+            and used is not None
+            and available is not None
+            and used_match is not None
+            and int(used_match.group(1)) <= 100
+        ):
+            return {
+                "total_kib": total,
+                "used_kib": used,
+                "available_kib": available,
+                "used_percent": int(used_match.group(1)),
+            }
+    return {}
+
+
+def _event_categories(stdout: str) -> dict[str, object]:
+    counts: dict[str, int] = {}
+    bounded = stdout[-_DIAGNOSTICS_PARSE_LIMIT:]
+    if len(stdout) > _DIAGNOSTICS_PARSE_LIMIT:
+        _partial, separator, bounded = bounded.partition("\n")
+        if not separator:
+            return {}
+    failure_pattern = re.compile(
+        r"\b(?:fail(?:ed|ure)?|error|denied|reject(?:ed)?|invalid|expired|"
+        r"unable|timeout|timed out)\b"
+    )
+    for line in bounded.splitlines():
+        normalized = line.casefold()
+        categories: set[str] = set()
+        failure = failure_pattern.search(normalized) is not None
+        if (
+            failure
+            and "mqtt" in normalized
+            and ("auth" in normalized or "credential" in normalized)
+        ):
+            categories.add("mqtt_authentication_failure")
+        if failure and ("tls" in normalized or "certificate" in normalized):
+            categories.add("tls_failure")
+        if "deauth" in normalized or "disassoc" in normalized:
+            categories.add("wifi_deauthentication")
+        if "carrier" in normalized:
+            categories.add("carrier_change")
+        if "out of memory" in normalized or re.search(r"\boom\b", normalized):
+            categories.add("out_of_memory")
+        if "timeout" in normalized or "timed out" in normalized:
+            categories.add("timeout")
+        if failure:
+            categories.add("bridge_failure")
+        if "connman" in normalized and categories & {"timeout", "bridge_failure"}:
+            categories.add("connman_failure")
+        for category in categories:
+            counts[category] = min(counts.get(category, 0) + 1, DIAGNOSTICS_COUNT_LIMIT)
+    return {"categories": dict(sorted(counts.items()))} if counts else {}
+
+
+def _parse_wifi_link(stdout: str) -> dict[str, object]:
+    bounded = stdout[:_DIAGNOSTICS_PARSE_LIMIT]
+    normalized = bounded.casefold()
+    result: dict[str, object] = {}
+    if "not connected" in normalized:
+        result["wifi_state"] = "disconnected"
+    elif re.search(r"(?m)^\s*connected to\s", normalized):
+        result["wifi_state"] = "connected"
+    signal = re.search(r"(?im)^\s*signal:\s*(-?\d{1,3})\s*dBm\s*$", bounded)
+    if signal is not None:
+        rssi = int(signal.group(1))
+        if -200 <= rssi <= 0:
+            result["rssi_dbm"] = rssi
+    return result
+
+
+def _parse_power_save(stdout: str) -> dict[str, object]:
+    match = re.search(
+        r"(?im)^\s*power save:\s*(on|off)\s*$",
+        stdout[:_DIAGNOSTICS_PARSE_LIMIT],
+    )
+    return {"power_save": match.group(1).lower()} if match is not None else {}
+
+
+def _parse_connman_services(stdout: str) -> dict[str, object]:
+    count = sum(bool(line.strip()) for line in stdout[:_DIAGNOSTICS_PARSE_LIMIT].splitlines())
+    return {"service_count": _bounded_count(count)}
+
+
+def _parse_bridge_status(stdout: str) -> dict[str, object]:
+    bounded = stdout[:_DIAGNOSTICS_PARSE_LIMIT]
+    result: dict[str, object] = {}
+    active = re.search(
+        r"(?im)^\s*Active:\s*(active|inactive|failed|activating|deactivating)\b",
+        bounded,
+    )
+    if active is not None:
+        result["active_state"] = active.group(1).lower()
+    enabled = re.search(
+        r"(?im)^\s*Loaded:.*;\s*(enabled|disabled|static|masked)\s*[;)]",
+        bounded,
+    )
+    if enabled is not None:
+        result["enabled_state"] = enabled.group(1).lower()
+    return result
+
+
+def _parse_diagnostics_probe(probe_id: str, stdout: str) -> dict[str, object]:
+    if probe_id == "uptime":
+        return _parse_uptime(stdout)
+    if probe_id == "memory":
+        return _parse_memory(stdout)
+    if probe_id == "var_filesystem":
+        return _parse_var_filesystem(stdout)
+    if probe_id in {"boot_events", "bridge_events", "kernel_events"}:
+        return _event_categories(stdout)
+    if probe_id == "wifi_link":
+        return _parse_wifi_link(stdout)
+    if probe_id == "wifi_power_save":
+        return _parse_power_save(stdout)
+    if probe_id == "connman_services":
+        return _parse_connman_services(stdout)
+    if probe_id == "bridge_status":
+        return _parse_bridge_status(stdout)
+    return {}
+
+
+async def _diagnostics_probe(
+    shell: PanelShell,
+    probe_id: str,
+    command: str,
+) -> dict[str, object]:
+    """Reduce one probe to an allowlisted summary without retaining raw content."""
     try:
         result = await shell.run(command)
-    except (OSError, asyncssh.Error) as err:
-        return f"<probe failed: {type(err).__name__}: {err}>"
-    body = result.stdout.rstrip("\n")
-    stderr = result.stderr.rstrip("\n")
-    if stderr:
-        body = f"{body}\n[stderr] {stderr}" if body else f"[stderr] {stderr}"
-    return body or "<no output>"
+    except (OSError, asyncssh.Error):
+        return {"id": probe_id, "outcome": "transport_error"}
+    stdout = result.stdout if isinstance(result.stdout, str) else ""
+    stderr = result.stderr if isinstance(result.stderr, str) else ""
+    summary: dict[str, object] = {
+        "id": probe_id,
+        "outcome": "ok" if result.exit_status == 0 else "nonzero",
+        **_text_counts("stdout", stdout),
+        **_text_counts("stderr", stderr),
+    }
+    summary.update(_parse_diagnostics_probe(probe_id, stdout))
+    return summary
 
 
 async def collect_diagnostics(shell: PanelShell, lines: int = DEFAULT_REBOOT_JOURNAL_LINES) -> str:
-    """Assemble a pre-reboot diagnostics bundle from independent, failure-tolerant probes.
+    """Assemble a secret-safe, typed pre-reboot diagnostics summary.
 
     The panel's journald is volatile (/run tmpfs — only the current boot survives a
-    reboot), so the wedge evidence MUST be pulled over SSH BEFORE the reboot that would
-    erase it. Sections are clearly delimited; each probe is best-effort (a raising probe
-    yields an error note in its section, never an abort — a partial bundle beats none).
+    reboot), so known wedge categories are counted before reboot. Original stdout,
+    stderr, journal lines, command strings, SSIDs, MACs, and exception text are never
+    serialized. Each probe is best-effort; a transport failure becomes a stable outcome.
     """
-    sections: list[str] = []
-    for title, command in _diagnostics_probes(lines):
-        sections.append(f"===== {title} =====")
-        sections.append(f"$ {command}")
-        sections.append(await _diagnostics_probe(shell, command))
-        sections.append("")
-    return "\n".join(sections)
+    bounded_lines = min(max(lines, 1), MAX_REBOOT_JOURNAL_LINES)
+    probes = [
+        await _diagnostics_probe(shell, probe_id, command)
+        for probe_id, command in _diagnostics_probes(bounded_lines)
+    ]
+    return (
+        json.dumps(
+            {
+                "journal_line_limit": bounded_lines,
+                "probes": probes,
+                "schema_version": 1,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    )
 
 
 async def deploy_payload(shell: PanelShell, local_payload_dir: str, version: str) -> None:

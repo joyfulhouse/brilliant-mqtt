@@ -50,6 +50,9 @@ from custom_components.brilliant_mqtt.const import (
     CONFIG_ENTRY_VERSION,
     DOMAIN,
     ENTRY_KIND_FLEET,
+    OPT_AUTO_REPAIR,
+    OPT_OFFLINE_GRACE_MINUTES,
+    OPT_REPAIR_COOLDOWN_MINUTES,
     SUBENTRY_TYPE_PANEL,
 )
 from custom_components.brilliant_mqtt.entry_data import (
@@ -131,6 +134,18 @@ def _subentry(
     )
 
 
+_INVALID_RESILIENCE_OPTIONS: tuple[tuple[str, object], ...] = (
+    (OPT_AUTO_REPAIR, 1),
+    (OPT_AUTO_REPAIR, "true"),
+    (OPT_OFFLINE_GRACE_MINUTES, True),
+    (OPT_OFFLINE_GRACE_MINUTES, 1),
+    (OPT_OFFLINE_GRACE_MINUTES, 121),
+    (OPT_REPAIR_COOLDOWN_MINUTES, False),
+    (OPT_REPAIR_COOLDOWN_MINUTES, 4),
+    (OPT_REPAIR_COOLDOWN_MINUTES, 1441),
+)
+
+
 def test_typed_views_accept_exact_fleet_and_panel_ownership() -> None:
     """Fleet and panel views expose only their deliberately separate owners."""
     office = _subentry()
@@ -182,6 +197,66 @@ def test_typed_views_accept_absent_optional_ca_without_exposing_overrides() -> N
 
     assert fleet.broker.has_custom_ca is False
     assert "sensitive-public-trust-material" not in repr(panel)
+
+
+@pytest.mark.parametrize(
+    ("options", "expected"),
+    [
+        ({}, (True, 10, 60)),
+        (
+            {
+                OPT_AUTO_REPAIR: False,
+                OPT_OFFLINE_GRACE_MINUTES: 2,
+                OPT_REPAIR_COOLDOWN_MINUTES: 5,
+            },
+            (False, 2, 5),
+        ),
+        (
+            {
+                OPT_AUTO_REPAIR: True,
+                OPT_OFFLINE_GRACE_MINUTES: 120,
+                OPT_REPAIR_COOLDOWN_MINUTES: 1440,
+            },
+            (True, 120, 1440),
+        ),
+    ],
+)
+def test_fleet_resilience_defaults_are_parsed_with_bounded_values(
+    options: dict[str, object],
+    expected: tuple[bool, int, int],
+) -> None:
+    """An exact fleet owns validated resilience defaults, with constants last."""
+    fleet = FleetConfig.from_entry(
+        MockConfigEntry(
+            domain=DOMAIN,
+            version=CONFIG_ENTRY_VERSION,
+            data=_fleet_data(),
+            options=options,
+        )
+    )
+
+    assert (
+        fleet.auto_repair,
+        fleet.offline_grace_minutes,
+        fleet.repair_cooldown_minutes,
+    ) == expected
+
+
+@pytest.mark.parametrize(("option", "value"), _INVALID_RESILIENCE_OPTIONS)
+def test_fleet_resilience_defaults_reject_invalid_types_and_ranges(
+    option: str,
+    value: object,
+) -> None:
+    """Malformed fleet defaults fail at the persisted-entry boundary."""
+    with pytest.raises(EntryDataError, match="invalid_fleet_entry_data"):
+        FleetConfig.from_entry(
+            MockConfigEntry(
+                domain=DOMAIN,
+                version=CONFIG_ENTRY_VERSION,
+                data=_fleet_data(),
+                options={option: value},
+            )
+        )
 
 
 def test_fleet_view_rejects_legacy_config_entry_version() -> None:
@@ -275,6 +350,16 @@ def test_panel_mesh_priority_rejects_invalid_values(mesh_priority: object) -> No
     """Negative priorities and booleans are not valid mesh allocation values."""
     with pytest.raises(EntryDataError):
         PanelConfig.from_subentry(_subentry(mesh_priority=mesh_priority))
+
+
+@pytest.mark.parametrize(("option", "value"), _INVALID_RESILIENCE_OPTIONS)
+def test_panel_resilience_overrides_reject_invalid_types_and_ranges(
+    option: str,
+    value: object,
+) -> None:
+    """A malformed explicit override cannot reach timer or repair arithmetic."""
+    with pytest.raises(EntryDataError, match="invalid_panel_entry_data"):
+        PanelConfig.from_subentry(_subentry(feature_overrides={option: value}))
 
 
 def test_panel_identity_must_match_subentry_unique_id() -> None:

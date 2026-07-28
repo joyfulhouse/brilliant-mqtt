@@ -70,7 +70,7 @@ from .fleet_manager import (
 from .fleet_manager import (
     get_panel_provisioner as get_panel_provisioner,
 )
-from .manager import PanelManager
+from .manager import PanelManager, async_delete_panel_issues
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -169,9 +169,8 @@ async def _async_cleanup_entry(hass: HomeAssistant, entry: BrilliantMqttConfigEn
         if primary_error is not None:
             if shutdown_error is not None:
                 _LOGGER.warning(
-                    "Manager shutdown also failed after control detach failure (%s): %s",
+                    "Manager shutdown also failed after control detach failure (%s)",
                     type(shutdown_error).__name__,
-                    shutdown_error,
                 )
             raise primary_error
         if shutdown_error is not None:
@@ -199,9 +198,8 @@ async def _async_cleanup_entry(hass: HomeAssistant, entry: BrilliantMqttConfigEn
             cleanup_task.result()
         except BaseException as cleanup_error:
             _LOGGER.warning(
-                "Entry cleanup failed while unload/setup was cancelled (%s): %s",
+                "Entry cleanup failed while unload/setup was cancelled (%s)",
                 type(cleanup_error).__name__,
-                cleanup_error,
             )
         raise
 
@@ -356,9 +354,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: BrilliantMqttConfigEntry
             await _async_cleanup_entry(hass, entry)
         except BaseException as cleanup_error:
             _LOGGER.warning(
-                "Entry cleanup failed after setup failure (%s): %s",
+                "Entry cleanup failed after setup failure (%s)",
                 type(cleanup_error).__name__,
-                cleanup_error,
             )
         raise
     return True
@@ -415,9 +412,7 @@ async def async_remove_entry(hass: HomeAssistant, entry: BrilliantMqttConfigEntr
         if CONF_MANAGEMENT_ID in subentry.data
     } or {entry.entry_id}
     for management_id in management_ids:
-        ir.async_delete_issue(hass, DOMAIN, f"needs_attention_{management_id}")
-        ir.async_delete_issue(hass, DOMAIN, f"voice_missing_{management_id}")
-        ir.async_delete_issue(hass, DOMAIN, f"ha_mirror_retired_{management_id}")
+        async_delete_panel_issues(hass, management_id)
     ir.async_delete_issue(hass, DOMAIN, f"broker_unavailable_{entry.entry_id}")
     ir.async_delete_issue(hass, DOMAIN, f"runtime_setup_failed_{entry.entry_id}")
     ir.async_delete_issue(hass, DOMAIN, f"fleet_storage_{entry.entry_id}")

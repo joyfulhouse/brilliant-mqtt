@@ -22,10 +22,12 @@ MQTT availability (LWT) and retained bridge-meta topic to drive an automatic
 post-firmware-OTA repair. If you remove the integration, the agents keep running
 and the device entities are unaffected.
 
-One config entry = one panel. Each entry stores **its own** root password (the
-operator runs per-controller root passwords). The integration attaches its
-management entities to the **same HA device** the agent already publishes, so
-they appear on the existing per-panel device page.
+One config entry represents the Brilliant MQTT **fleet**. It stores the single
+broker profile and installation-global Home Assistant control settings. Each
+panel is a Home Assistant config subentry with its own pinned SSH identity,
+address, root password, stable MQTT slug, and feature overrides. Management
+entities still attach to the **same HA device** the agent publishes, so they
+appear on the existing per-panel device page.
 
 ## Install
 
@@ -33,9 +35,10 @@ they appear on the existing per-panel device page.
 
 1. In HACS → **Integrations** → ⋮ → **Custom repositories**, add
    `joyfulhouse/brilliant-mqtt` with category **Integration**.
-2. Install **Brilliant MQTT Panel Manager**, then restart Home Assistant.
+2. Install **Brilliant MQTT Fleet Manager**, then restart Home Assistant.
 3. Add it under **Settings → Devices & Services → Add Integration → Brilliant
-   MQTT** (one add per panel — see the onboarding flow below).
+   MQTT**. Add the integration once; later panels use its native **Add panel**
+   action, shown as **Add Brilliant panel**.
 
 HACS installs the release zip, whose contents extract straight into
 `config/custom_components/brilliant_mqtt/`. The zip bundles the agent payload
@@ -53,10 +56,14 @@ the integration as above.
 
 ## MQTT prerequisite
 
-Configure one MQTT broker before adding a panel. The recommended shortcut is
-Home Assistant's official Mosquitto Broker app/add-on (`core_mosquitto`), but
-it is not required or auto-managed. An existing local, remote, or hosted broker
-is equally supported.
+MQTT remains the lightweight transport between Home Assistant and every panel,
+so configure one broker before adding Brilliant MQTT. Choose either supported
+path:
+
+- **Home Assistant Mosquitto add-on (Recommended):** install and start the
+  official `core_mosquitto` add-on first.
+- **Existing MQTT broker:** use a compatible local, remote, or hosted broker.
+  This path is at the same setup level and never requires `core_mosquitto`.
 
 For either path:
 
@@ -68,66 +75,198 @@ For either path:
 - keep Home Assistant's effective MQTT Discovery prefix fixed at
   `homeassistant` for current agent compatibility.
 
-The current one-panel flow does **not** call the packaged `BrokerValidator`; it
-can install the agent and create an entry without checking authentication,
-message directions, discovery write access, retained behavior, or cleanup. The
-forthcoming Plan 2 fleet-onboarding flow will perform those checks and return
-`unsupported_discovery_prefix` when the prefix differs. The integration never
-installs or starts `core_mosquitto`, creates accounts, edits ACLs, or modifies
-broker configuration.
+The two choices normalize to the same broker profile and run the same
+behavioral validator. It checks Home Assistant MQTT readiness, the dedicated
+Brilliant credential, panel-client → Home Assistant and Home Assistant →
+panel-client traffic, Discovery writes, retained delivery, and cleanup.
+Panel provisioning later repeats the relevant checks from a staged,
+non-active agent before activation.
 
-The panel agent supports plaintext TCP, strict system/public-CA TLS, and strict
-custom-CA TLS for manual deployment, and the integration package contains the
-CA-staging seam for the future fleet flow. The current one-panel broker form
-does not expose TLS; adoption does not retain manual TLS values; and current
-reconfigure, repair, and update paths still render a plaintext destination.
-They now fail closed with `mqtt_tls_downgrade_refused` before changing any file
-when either the live or OTA-staged panel environment enables TLS or contains an
-ambiguous TLS value. Keep a manually TLS-configured panel under manual
-lifecycle management until Plan 2 can preserve those settings. See the
-[MQTT broker prerequisite](install/mqtt-broker.md) for both setup paths, the
-exact two-principal ACL table, transport warning, and the forthcoming
-validation-error contract.
+Failures are stage-specific and secret-safe. Correct the reported
+prerequisite, follow the linked cause/check/fix/retry guidance, and retry:
+[Home Assistant MQTT unavailable](install/mqtt-broker.md#ha_mqtt_unavailable),
+[authentication](install/mqtt-broker.md#fleet_auth_failed),
+[panel → Home Assistant](install/mqtt-broker.md#panel_to_ha_timeout),
+[Home Assistant → panel](install/mqtt-broker.md#ha_to_panel_timeout),
+[Discovery ACL](install/mqtt-broker.md#discovery_write_denied),
+[retained messages](install/mqtt-broker.md#retained_message_invalid), or
+[cleanup](install/mqtt-broker.md#cleanup_failed).
+
+The integration never installs or starts `core_mosquitto`, creates accounts,
+edits ACLs, or modifies broker configuration. It supports plaintext TCP,
+strict system/public-CA TLS, and strict custom-CA TLS; TLS verification never
+falls back to plaintext. The
+[MQTT broker prerequisite](install/mqtt-broker.md) has the two-principal ACL
+table and transport details.
 
 ## Onboarding a panel
 
-Adding the integration walks a **detection-first** flow. The path taken depends
-on whether the agent is already installed on the panel:
+Initial setup is fleet-first:
 
-| Step | New panel (no agent) | Already has agent |
-|---|---|---|
-| **1. Connect** | Enter Host + Root password. Integration SSHes in, pins the host key (TOFU), detects no agent. | Enter Host + Root password. Integration SSHes in, detects the running agent. |
-| **2. MQTT broker** | Enter broker host / port / user / password. Pre-filled from the most recently added panel (broker is fleet-shared); root password is never pre-filled. | _Skipped_ — broker is read back from the live env file. |
-| **3. Panel settings** | Set Panel Name (e.g. "Office Bath" → slug `office-bath`) and Mesh priority (`MESH_PRIORITY`: 0 = never lead; 1 = primary; 2/3 = standbys). Optionally enable **Voice satellite** (see [Voice satellite](#voice-satellite)). On submit: agent is installed over SSH, then entry is created. | _Skipped_ — name + mesh priority + broker are adopted verbatim from the running agent. Panel is left untouched. |
-| **Result** | Agent installed; panel entities fill in after first MQTT publish. | Panel adopted; entry created immediately. |
+1. Choose **Home Assistant Mosquitto add-on (Recommended)** or **Existing MQTT
+   broker**, then enter the dedicated Brilliant broker profile. The same form
+   has one optional **Enable Home Assistant control and scenes** checkbox. It
+   defaults off and must be chosen here if the first panel should run the scene
+   bridge; changing that flag after panels exist requires a guided agent rollout.
+2. Home Assistant runs the identical behavioral validation described above.
+   A failure creates no Brilliant entry or panel side effect.
+3. After validation succeeds, Home Assistant creates and durably verifies an
+   empty Brilliant MQTT fleet. Only then does it chain into the first **Add
+   Brilliant panel** flow.
+4. Enter only the panel address and root password. Home Assistant obtains the
+   SSH host key before authentication, pins that exact candidate for the
+   authenticated inspection, and shows the detected fingerprint and panel
+   facts before provisioning.
+5. Give the panel a friendly name. Home Assistant allocates its immutable MQTT
+   slug and the next unused positive mesh priority automatically.
+6. Provisioning snapshots the current state, stages the candidate release,
+   validates MQTT from the panel path, activates it, and waits for fresh
+   availability, metadata, state, and Discovery. A failed candidate is rolled
+   back.
 
-**Current install failure:** SSH install failures keep step 3 open with
-`cannot_install`, and no entry is created. The current flow does not perform
-end-to-end MQTT validation. The forthcoming fleet flow will block entry
-creation and link MQTT failures to a stable
-[cause/check/fix/retry section](install/mqtt-broker.md#mqtt-validation).
+If first-panel setup fails or is cancelled, the validated empty fleet remains
+available for retry; broker settings do not need to be entered again. To add
+another panel, open the existing Brilliant MQTT fleet and use its native **Add
+panel** action, shown as **Add Brilliant panel**. Later additions use the same
+panel flow and never repeat broker settings, optional-feature choices, raw JSON,
+or mesh priority.
 
-**Adopting a hand-deployed panel:** onboarding reads `BRILLIANT_PANEL` from the
-live env file and adopts it verbatim. Set it to a canonical lowercase slug
-(`^[a-z0-9][a-z0-9_-]*$`) before adding — a non-slug or the reserved value
-`mesh` is refused (`cannot_read_config`). Existing canonical slugs are never
-truncated or renamed, even when longer than the 64-character cap used for new
-allocations. New panel names accept at most 4,096 characters before
-normalization. See [INSTALL.md](../INSTALL.md) for manual deploy steps. Do not
-adopt a manually TLS-configured panel in the current flow; the TLS settings are
-not preserved for later lifecycle operations.
+The MQTT slug and mesh priority remain stable after creation. Renaming changes
+only the display name; it does not rename topics, devices, entity unique IDs,
+or the stored management identity. Optional components and overrides are
+configured after the base panel is healthy.
 
-**Slug is immutable** after creation (rename = remove + re-add).
+The staged software checks do not claim qualification across every Brilliant
+firmware and network combination. Pilot and soak one panel before expanding
+the fleet.
 
-**Reconfigure** lets you change host, root password, broker, or mesh priority
-later — it re-validates over SSH and pushes the change to the panel. If the host
-is unchanged, the new password is verified against the **stored** host key (key
-checked before auth), so rotating a password can't silently accept a swapped
-key. If the host changes, a fresh TOFU connect re-pins to the new host.
-Reconfigure verifies SSH, not the MQTT path, and is not TLS-aware in the current
-one-panel flow.
+### Panel onboarding errors
 
-Behavior knobs are under **Configure** (Options).
+The **Open troubleshooting** link on the panel connection and confirmation
+screens returns here. Leave the failed flow open while correcting the reported
+condition; the form keeps only a stable error code and never retains raw SSH,
+broker, command, or credential text.
+
+- `cannot_connect`, `host_unreachable`, or `panel_authentication_failed`:
+  confirm root SSH is enabled, the address is reachable from Home Assistant,
+  and the root password is current. Retry the same form.
+- `host_key_missing`, `host_key_malformed`, `host_key_unsupported`, or
+  `host_key_fingerprint_invalid`: stop and verify the panel firmware and SSH
+  service. Do not bypass host-key verification.
+- `host_key_changed` or `panel_identity_mismatch`: stop and verify the physical
+  panel and address. Use **Replace physical panel** only for an intentional
+  replacement whose old and new fingerprints you can review.
+- `firmware_unknown`, `unsupported_architecture`, `unsupported_python`,
+  `unsupported_panel_toolchain`, `insufficient_memory`, or
+  `insufficient_storage`: correct the reported compatibility prerequisite
+  before retrying; the integration has not activated a candidate.
+- Broker, TLS, authentication, ACL, retained-message, and MQTT timeout codes
+  link directly to their error-specific section in the
+  [MQTT prerequisite guide](install/mqtt-broker.md).
+- `stage_failed`, `preflight_failed`, `activation_failed`, or `health_failed`:
+  the candidate did not become the committed release. Correct the stable cause
+  and retry only after the flow reports that rollback completed.
+- `rollback_failed`, `recovery_failed`, `journal_failed`, or
+  `config_entry_storage_unavailable`: stop panel mutations, repair Home
+  Assistant storage if indicated, and follow the persistent Brilliant MQTT
+  repair issue before retrying. Do not delete the fleet entry to bypass the
+  recovery journal.
+
+<a id="inspection_failed"></a>
+#### `inspection_failed`
+
+- **Cause:** A panel identity or compatibility inspection failed unexpectedly,
+  so the integration discarded the raw exception and stopped before changing
+  the panel.
+- **Check:** Confirm the panel remains reachable over root SSH, then inspect
+  Home Assistant's Brilliant MQTT logs for the inspection stage and verify the
+  panel firmware and free resources.
+- **Fix:** Restore SSH/panel responsiveness or the reported compatibility
+  prerequisite. If the stable code repeats on an otherwise healthy panel,
+  collect secret-redacted Home Assistant diagnostics and report the failure.
+- **Retry:** Reopen the same panel action after the panel is healthy. No
+  candidate release was activated by this failed inspection.
+
+<a id="provisioning_failed"></a>
+#### `provisioning_failed`
+
+- **Cause:** Provisioning hit an unexpected failure after its transactional
+  safety path began; the integration attempted recovery and exposed no raw
+  command, exception, or credential text.
+- **Check:** Confirm there is no active Brilliant MQTT recovery issue, verify
+  the prior panel release is healthy, and inspect the stable provisioning stage
+  recorded in Home Assistant.
+- **Fix:** Complete any reported recovery first, then correct the panel,
+  storage, or network dependency identified for that stage. Do not delete the
+  fleet entry or manually remove the recovery journal.
+- **Retry:** Start **Add Brilliant panel** again only after recovery is clear
+  and the prior release is healthy.
+
+<a id="rebind_identity_unchanged"></a>
+#### `rebind_identity_unchanged`
+
+- **Cause:** **Replace physical panel** reached the same pinned SSH identity
+  already stored for this panel, so it is not a physical replacement.
+- **Check:** Compare the displayed address with the intended panel and confirm
+  whether only its address or root password changed.
+- **Fix:** Use **Change address** for a network-address change or **Repair SSH
+  credentials** for a password change. Do not force an identity rebind.
+- **Retry:** Close the replacement flow and start the matching focused panel
+  action. No identity, credential, or panel setting was changed.
+
+## Fleet and panel configuration
+
+Open **Configure** on the fleet entry for focused, single-owner settings:
+
+- broker and fleet credential;
+- Home Assistant control;
+- scenes and the default scene panel;
+- fleet repair defaults; and
+- mesh priorities under **Advanced**.
+
+An empty fleet may accept a validated broker-profile change, and an unchanged
+profile may be revalidated. Once panels exist, a changed broker endpoint, TLS
+profile, or credential is deliberately deferred to a guided multi-panel
+operation. The integration refuses the edit instead of leaving a mixed-broker
+fleet. Broker edits also fail closed while an Add panel flow, provisioning
+journal, or recovery transaction is active; see
+[`broker_change_blocked_by_panel_onboarding`](install/mqtt-broker.md#broker_change_blocked_by_panel_onboarding).
+
+Each panel subentry has focused day-two actions:
+
+- **Rename** changes its display name only.
+- **Change address** and **Repair SSH credentials** first fetch the candidate
+  host identity and require it to match the stored fingerprint before a
+  password is sent.
+- **Components** points to the panel device's observable component switches and
+  selectors. Set inactive Voice or Hue CA values in **Panel overrides**, then
+  enable the component from its device control.
+- An active Voice wake word changes through the **Wake word** selector. To
+  change an active Voice host override or Hue CA certificate, disable that
+  component, edit the override, and enable it again; the flow refuses a silent
+  stored/running mismatch.
+- **Rebind replaced/reflashed panel** is the only path that may accept a
+  different SSH identity. It displays the old and new fingerprints for
+  deliberate confirmation while preserving the panel's MQTT slug and
+  management identity.
+
+Normal repair, update, and address changes never auto-repin a new host key. An
+unexpected mismatch fails closed; verify the address and network before using
+the explicit rebind action.
+
+<a id="rebind_blocked_by_panel_onboarding"></a>
+### Rebind blocked by panel onboarding or recovery
+
+- **Cause:** Another panel onboarding/recovery transaction owns the durable
+  provisioning journal, or Home Assistant cannot prove that journal is
+  readable and empty.
+- **Check:** Finish or cancel the visible **Add Brilliant panel** flow, then
+  inspect Brilliant MQTT repair issues and Home Assistant storage health.
+- **Fix:** Let the existing transaction commit or complete its verified
+  rollback. Repair unreadable Home Assistant storage before replacing a panel.
+- **Retry:** Start **Rebind replaced/reflashed panel** again only after no panel
+  onboarding/recovery issue remains. The blocked attempt changed no identity,
+  credential, or panel setting.
 
 ## Entities
 
@@ -138,12 +277,12 @@ Each panel's device gains eleven management entities (three diagnostic, eight co
 | `update.brilliant_<panel>_bridge` | Agent **update** entity. Installed version comes from the panel's retained bridge-meta (`agent_version`); latest from the bundled payload's `VERSION`. Installing pushes the bundled payload and restarts the agent. |
 | `binary_sensor.brilliant_<panel>_bridge_health` | Bridge **health** (device class `problem`). `on` = needs attention (offline past grace with auto-repair off, a repair step failed, or a repair ran but the bridge stayed offline). Attributes: `reason`, `availability`. |
 | `button.brilliant_<panel>_repair_bridge` | **Manual repair** — restores the unit/env and starts the agent (installs agent code first if missing), bypassing the auto-repair cooldown. |
-| `button.brilliant_<panel>_reboot_panel` | **Reboot panel** (device class `restart`) — captures a diagnostics bundle over SSH, then reboots the panel (its logs are volatile, so diagnostics are captured first). |
+| `button.brilliant_<panel>_reboot_panel` | **Reboot panel** (device class `restart`) — captures a secret-safe diagnostics summary over SSH, then reboots the panel. Typed service-journal categories and probe metrics are saved before volatile logs disappear; raw log text is never persisted. |
 | `switch.brilliant_<panel>_voice_satellite` | **Voice satellite** — enable installs and starts the satellite; disable uninstalls it. |
 | `select.brilliant_<panel>_wake_word` | **Wake word** — choose `okay_nabu` (default), `hey_jarvis`, or `hey_mycroft`; changing it restarts the satellite. |
 | `switch.brilliant_<panel>_wi_fi_watchdog` | **Wi-Fi watchdog** — enable installs and starts the on-panel Wi-Fi watchdog daemon (auto-recovers lost Wi-Fi: reconnect → restart networking → reboot as a last resort, see [CONFIGURATION.md → Wi-Fi watchdog](CONFIGURATION.md#wi-fi-watchdog)); disable uninstalls it. |
 | `switch.brilliant_<panel>_bus_watchdog` | **Bus watchdog** — enable installs and starts the on-panel bus-health watchdog daemon (reboots the panel if the Brilliant message bus stays wedged 30+ minutes, gated on the bridge being active and the network being up, see [CONFIGURATION.md → Bus-health watchdog](CONFIGURATION.md#bus-health-watchdog)); disable uninstalls it. |
-| `switch.brilliant_<panel>_hue_ca_recovery` | **Hue CA recovery** — enable installs and starts the on-panel diyHue CA recovery oneshot+timer (re-appends your diyHue bridge's CA to the panel's pinned Hue trust bundle after every OTA, see [CONFIGURATION.md → Hue CA recovery](CONFIGURATION.md#hue-ca-recovery)); requires the diyHue CA certificate to already be set on the config entry (onboarding or **Reconfigure**) — enabling with none configured fails closed. Disable uninstalls it. |
+| `switch.brilliant_<panel>_hue_ca_recovery` | **Hue CA recovery** — enable installs and starts the on-panel diyHue CA recovery oneshot+timer (re-appends your diyHue bridge's CA to the panel's pinned Hue trust bundle after every OTA, see [CONFIGURATION.md → Hue CA recovery](CONFIGURATION.md#hue-ca-recovery)); requires the diyHue CA certificate to be set through **Panel overrides** first — enabling with none configured fails closed. Disable uninstalls it. |
 | `select.brilliant_<panel>_scene` | **Scene** — the panel's Brilliant scenes, populated from its accepted MQTT catalog. Changing it only updates the HA-local selection; it publishes no command. |
 | `button.brilliant_<panel>_run_selected_scene` | **Run selected scene** — runs the selected scene with blocking execution confirmation. Available only while the scene transport, catalog, and a selection exist. |
 
@@ -199,10 +338,11 @@ carries `panel`, `entry_id`, and a `type`; the table lists the per-type extras.
 | `panel_updated` | Panel **firmware** changed (seen on the bridge-meta topic). | `old_firmware`, `new_firmware` |
 | `repair_started` | A repair began. | `trigger` (`auto` / `button` / `service`) |
 | `repair_succeeded` | The bridge came back online after a repair. | — |
-| `repair_failed` | A repair could not complete or the bridge stayed offline. | `reason` (`unreachable` / `host_key_changed` / `repair_step_failed` / `still_offline`), plus `error` or `journal` |
+| `repair_failed` | A repair could not complete or the bridge stayed offline. | `reason` (`unreachable` / `host_key_changed` / `repair_step_failed` / `still_offline`) |
 | `needs_attention` | The panel needs a human (escalation). | `reason` |
 | `agent_updated` | The agent was updated to a new version. | `version` |
-| `host_key_repinned` | A panel's SSH host key changed and was **auto-trusted** during repair/update (only when **Trust host-key changes** is on). | `new_host_key` |
+| `panel_rebound` | An explicit replacement-panel identity rebind was durably committed. | `old_fingerprint`, `new_fingerprint` |
+| `host_key_repinned` | Legacy panel entry only: its compatibility option auto-trusted a changed key. New fleet panels never auto-repin and require explicit rebind. | `new_host_key` |
 
 Example — notify on anything that needs a human, and on repair outcomes:
 
@@ -237,22 +377,24 @@ automation:
           message: "Repair {{ trigger.event.data.type.split('_')[1] }}"
 ```
 
-## Options
+## Fleet repair defaults
 
-Per-panel behavior knobs (under **Configure**); read live — no reload needed.
+These defaults are owned once by the fleet and read live:
 
 | Option | Default | What it does |
 |---|---|---|
 | **Auto-repair** (`auto_repair`) | `true` | On: outage past the grace period triggers automatic repair. Off: outage only notifies. |
 | **Offline grace minutes** (`offline_grace_minutes`) | `10` | How long a panel may stay `offline` before repair/escalation kicks in. |
 | **Repair cooldown minutes** (`repair_cooldown_minutes`) | `60` | Minimum gap between automatic repairs, preventing tight-loop repairs on a flapping panel. The manual repair button bypasses this. |
-| **Trust host-key changes** (`trust_host_key_changes`) | `false` | **Off (default):** a changed SSH host key surfaces as `repair_failed: host_key_changed` with guidance to Reconfigure — the root password is never offered to the new-key host. **On:** repair/update auto-re-pins a changed key on the same-host panel so a key-rotating OTA recovers hands-off; fires an auditable `host_key_repinned` event. Only enable on a trusted/isolated network (e.g. a firewalled IoT VLAN). |
 
-Seven further **HA control** settings (enable flag, entity label, room
-overrides, domains, entity cap, default scene panel, scene actions) configure
-the HA control plane and scene bridge. They are fleet-global values copied to
-each entry; their validation rules and defaults are canonical in the
+Seven **HA control and scene** settings (enable flag, entity label, room
+overrides, domains, entity cap, default scene panel, scene actions) are also
+stored once on the fleet rather than copied into panel subentries. Their
+validation rules and defaults are canonical in the
 [scene bridge guide → Configuration](brilliant-panel/home-assistant-integration.md#configuration).
+Choose the enable flag during initial broker validation. Once a panel is
+installed, that flag remains fail-closed until the guided agent rollout ships;
+the other fleet control fields update live.
 
 ## Voice satellite
 
@@ -261,11 +403,12 @@ A Brilliant panel can act as a **Home Assistant ESPHome voice satellite**
 run in your existing HA Assist pipeline — the panel is backend-agnostic.
 
 **Quick start:**
-1. During onboarding (step 3), toggle **Enable voice satellite**, choose a wake
-   word, and optionally set a HA host override. The integration installs the
-   satellite alongside the bridge agent.
-2. Alternatively, flip the **Voice satellite** switch on the device page at any
-   time (or use the **Wake word** select to change the wake word).
+1. After the base panel is healthy, open **Panel overrides** and set the initial
+   wake word plus a Home Assistant host override only if needed.
+2. Open **Components** to reach the panel's device controls, then turn on the
+   **Voice satellite** switch. Use the **Wake word** selector for later active
+   wake-word changes. To change the active host override, turn Voice off, edit
+   the override, and turn it on again.
 3. HA auto-discovers the satellite over zeroconf — accept the ESPHome device
    discovery, then assign an Assist pipeline under **Settings → Voice
    assistants**. The resulting device is managed by HA's built-in **ESPHome**
@@ -301,8 +444,8 @@ service → wait for LWT to flip back online → `repair_succeeded` or
 `repair_failed` + `needs_attention`.
 
 **Key behaviors:**
-- Config is always **regenerated** from the stored entry, never read back from
-  the panel — so a repair also heals config drift.
+- Config is always **regenerated** from the stored fleet and panel subentry,
+  never read back from the panel — so a repair also heals config drift.
 - A firmware change on the bridge-meta topic fires `panel_updated` and
   re-stages the config copies under `/var`.
 
@@ -310,9 +453,10 @@ service → wait for LWT to flip back online → `repair_succeeded` or
 the unit; it does not change the agent code. If a firmware OTA changed the
 on-panel message-bus API such that the agent can no longer communicate, the
 service will start but the bridge won't come back online. The recovery timer
-fires `repair_failed` (`reason: still_offline`, with a captured journal) and
-`needs_attention`, because the agent itself needs a code fix — deploy a new
-release via the update entity or `redeploy`.
+transiently probes the service journal (raw output is discarded), then fires
+`repair_failed` (`reason: still_offline`) and `needs_attention`, because the
+agent itself needs a code fix — deploy a new release via the update entity or
+`redeploy`.
 
 <a id="retained-ledger"></a>
 **Retained-ledger fault.** If the agent cannot read or durably persist
@@ -328,15 +472,15 @@ topic cleanup. After restart, ordinary bridge metadata clears the issue.
 ## Security model
 
 **Key points:**
-- Root password is stored in the HA config-entry store (same exposure class as
-  `secrets.yaml`). Protect the HA host accordingly. It is per-panel, never
-  shared, and redacted from diagnostics.
-- TOFU host-key pinning: the **first** connect trusts whatever host answers
-  and pins its key (trust-on-first-use — like the first `ssh` to a new
-  machine, the password is sent to an unverified host that one time; add
-  panels from a trusted network). Every **later** connect verifies the pinned
-  key **before** authenticating, so the root password is never offered to a
-  changed or impostor host afterwards.
+- Each root password is stored only in that panel's HA config subentry (same
+  exposure class as `secrets.yaml`). Protect the HA host accordingly. It is
+  never shared across panels and is redacted from diagnostics.
+- On first add, Home Assistant performs an unauthenticated SSH key exchange,
+  derives the fingerprint, and pins that exact candidate before authenticating.
+  This prevents a key swap between discovery and password use, but the first
+  address is still trust-on-first-use; add panels from a trusted network and
+  review the displayed fingerprint. Every later connection verifies the
+  stored key **before** sending a password.
 - Single auth attempt per connect (`client_keys=None`,
   `preferred_auth=("password",)`, keyboard-interactive disabled) so a wrong
   password can't burn through a lockout threshold.
@@ -354,10 +498,11 @@ topic cleanup. After restart, ordinary bridge metadata clears the issue.
   integration) also stamps a liveness heartbeat to the tmpfs path
   `/run/brilliant-mqtt/bus-heartbeat`, cleared on every reboot.
 
-**OTA host-key rotation** is handled in two modes (see the **Trust host-key
-changes** option above): the default surfaces a changed key as a detectable
-failure (re-pin by removing and re-adding the panel); the opt-in mode
-auto-re-pins on the same-host panel and fires an auditable event.
+**Host-key changes fail closed.** Normal repair, update, address, and credential
+flows never auto-repin. If a panel was deliberately replaced or reflashed,
+verify the new fingerprint and use its explicit **rebind** action; an
+unexpected change should be investigated as a wrong address or possible
+impostor.
 
 See also [ARCHITECTURE.md](ARCHITECTURE.md) and
 [reference/deployment.md](reference/deployment.md).

@@ -45,8 +45,14 @@ from .const import (
     CONF_SSH_HOST_KEY,
     CONF_SSH_USERNAME,
     CONFIG_ENTRY_VERSION,
+    DEFAULT_AUTO_REPAIR,
+    DEFAULT_OFFLINE_GRACE_MINUTES,
+    DEFAULT_REPAIR_COOLDOWN_MINUTES,
     ENTRY_KIND_FLEET,
     MESH_PANEL,
+    OPT_AUTO_REPAIR,
+    OPT_OFFLINE_GRACE_MINUTES,
+    OPT_REPAIR_COOLDOWN_MINUTES,
     SUBENTRY_TYPE_PANEL,
 )
 
@@ -169,6 +175,32 @@ def _components_mapping(value: Any) -> MappingProxyType[str, bool]:
     return MappingProxyType(components)
 
 
+def _resilience_values(
+    options: Mapping[str, Any],
+    *,
+    error_code: str,
+) -> tuple[bool, int, int]:
+    """Parse the three bounded repair controls without coercing persisted data."""
+    auto_repair = options.get(OPT_AUTO_REPAIR, DEFAULT_AUTO_REPAIR)
+    offline_grace_minutes = options.get(
+        OPT_OFFLINE_GRACE_MINUTES,
+        DEFAULT_OFFLINE_GRACE_MINUTES,
+    )
+    repair_cooldown_minutes = options.get(
+        OPT_REPAIR_COOLDOWN_MINUTES,
+        DEFAULT_REPAIR_COOLDOWN_MINUTES,
+    )
+    if (
+        type(auto_repair) is not bool
+        or type(offline_grace_minutes) is not int
+        or not 2 <= offline_grace_minutes <= 120
+        or type(repair_cooldown_minutes) is not int
+        or not 5 <= repair_cooldown_minutes <= 1440
+    ):
+        raise _invalid(error_code)
+    return auto_repair, offline_grace_minutes, repair_cooldown_minutes
+
+
 @dataclass(frozen=True, slots=True)
 class FleetConfig:
     """Immutable fleet-owned settings parsed from one version-4 config entry."""
@@ -184,6 +216,9 @@ class FleetConfig:
     scene_panel: str
     scene_actions: MappingProxyType[str, JsonValue]
     schema_version: int
+    auto_repair: bool = DEFAULT_AUTO_REPAIR
+    offline_grace_minutes: int = DEFAULT_OFFLINE_GRACE_MINUTES
+    repair_cooldown_minutes: int = DEFAULT_REPAIR_COOLDOWN_MINUTES
 
     @classmethod
     def from_entry(cls, entry: ConfigEntry[Any]) -> FleetConfig:
@@ -211,6 +246,10 @@ class FleetConfig:
             not isinstance(domain, str) or not domain for domain in domains
         ):
             raise _invalid("invalid_fleet_entry_data")
+        auto_repair, offline_grace_minutes, repair_cooldown_minutes = _resilience_values(
+            entry.options,
+            error_code="invalid_fleet_entry_data",
+        )
 
         try:
             broker = BrokerProfile.from_mapping(data)
@@ -226,6 +265,9 @@ class FleetConfig:
                 scene_panel=_required_string(data, CONF_SCENE_PANEL),
                 scene_actions=_json_mapping(data[CONF_SCENE_ACTIONS]),
                 schema_version=CONFIG_ENTRY_VERSION,
+                auto_repair=auto_repair,
+                offline_grace_minutes=offline_grace_minutes,
+                repair_cooldown_minutes=repair_cooldown_minutes,
             )
         except EntryDataError:
             raise
@@ -277,6 +319,11 @@ class PanelConfig:
             transaction_id = raw_transaction_id
 
         try:
+            feature_overrides = _json_mapping(data[CONF_FEATURE_OVERRIDES])
+            _resilience_values(
+                feature_overrides,
+                error_code="invalid_panel_entry_data",
+            )
             return cls(
                 identity_fingerprint=identity_fingerprint,
                 ssh_host_key=_required_string(data, CONF_SSH_HOST_KEY),
@@ -287,7 +334,7 @@ class PanelConfig:
                 panel=panel,
                 management_id=_required_string(data, CONF_MANAGEMENT_ID),
                 components=_components_mapping(data[CONF_COMPONENTS]),
-                feature_overrides=_json_mapping(data[CONF_FEATURE_OVERRIDES]),
+                feature_overrides=feature_overrides,
                 mesh_priority=_required_nonnegative_int(data, CONF_MESH_PRIORITY),
                 provisioning_transaction_id=transaction_id,
             )

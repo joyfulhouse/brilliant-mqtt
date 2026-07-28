@@ -12,18 +12,43 @@ import voluptuous_serialize
 from homeassistant.const import CONF_NAME
 from homeassistant.helpers import config_validation as cv
 
+from custom_components.brilliant_mqtt import flow_schemas
 from custom_components.brilliant_mqtt.broker import BrokerKind
 from custom_components.brilliant_mqtt.const import (
     CONF_BROKER_KIND,
+    CONF_FEATURE_OVERRIDES,
+    CONF_HA_CONTROL_DOMAINS,
+    CONF_HA_CONTROL_ENABLED,
+    CONF_HA_CONTROL_LABEL,
     CONF_HOST,
+    CONF_HUE_CA_CERT,
+    CONF_IDENTITY_FINGERPRINT,
+    CONF_MAX_MIRRORED_ENTITIES,
     CONF_MQTT_HOST,
     CONF_MQTT_PASSWORD,
     CONF_MQTT_PORT,
     CONF_MQTT_TLS_CA,
     CONF_MQTT_TLS_ENABLED,
     CONF_MQTT_USERNAME,
+    CONF_ROOM_OVERRIDES,
     CONF_ROOT_PASSWORD,
+    CONF_SCENE_ACTIONS,
+    CONF_SCENE_PANEL,
+    CONF_SSH_HOST_KEY,
     CONF_SSH_USERNAME,
+    CONF_VOICE_HA_HOST,
+    CONF_VOICE_WAKE_WORD,
+    DEFAULT_AUTO_REPAIR,
+    DEFAULT_HA_CONTROL_DOMAINS,
+    DEFAULT_HA_CONTROL_ENABLED,
+    DEFAULT_HA_CONTROL_LABEL,
+    DEFAULT_MAX_MIRRORED_ENTITIES,
+    DEFAULT_OFFLINE_GRACE_MINUTES,
+    DEFAULT_REPAIR_COOLDOWN_MINUTES,
+    DEFAULT_VOICE_WAKE_WORD,
+    OPT_AUTO_REPAIR,
+    OPT_OFFLINE_GRACE_MINUTES,
+    OPT_REPAIR_COOLDOWN_MINUTES,
 )
 from custom_components.brilliant_mqtt.flow_schemas import (
     ADVANCED_SECTION,
@@ -77,6 +102,27 @@ def _valid_broker_input(**overrides: object) -> dict[str, object]:
     }
     data.update(overrides)
     return data
+
+
+def _valid_control_input(**overrides: object) -> dict[str, object]:
+    data: dict[str, object] = {
+        CONF_HA_CONTROL_ENABLED: True,
+        CONF_HA_CONTROL_LABEL: "Brilliant",
+        CONF_ROOM_OVERRIDES: "{}",
+        CONF_HA_CONTROL_DOMAINS: ["light", "switch"],
+        CONF_MAX_MIRRORED_ENTITIES: 50,
+    }
+    data.update(overrides)
+    return data
+
+
+def _scene_action() -> dict[str, object]:
+    return {
+        "domain": "light",
+        "service": "turn_on",
+        "target": {"entity_id": "light.office"},
+        "data": {"brightness_pct": 60},
+    }
 
 
 def test_broker_menu_keeps_recommended_and_existing_paths_equal() -> None:
@@ -634,3 +680,339 @@ def test_mesh_priority_allocation_fails_when_supported_range_is_exhausted() -> N
         allocate_mesh_priority(range(1, 100))
 
     assert dict(raised.value.errors) == {"base": "mesh_priority_exhausted"}
+
+
+def test_fleet_control_surface_owns_only_five_typed_globals() -> None:
+    source = {
+        CONF_HA_CONTROL_ENABLED: DEFAULT_HA_CONTROL_ENABLED,
+        CONF_HA_CONTROL_LABEL: DEFAULT_HA_CONTROL_LABEL,
+        CONF_ROOM_OVERRIDES: {"Kitchen": "Upstairs"},
+        CONF_HA_CONTROL_DOMAINS: DEFAULT_HA_CONTROL_DOMAINS,
+        CONF_MAX_MIRRORED_ENTITIES: DEFAULT_MAX_MIRRORED_ENTITIES,
+        CONF_SCENE_PANEL: "panel-subentry-office",
+        CONF_SCENE_ACTIONS: {"office:movie": _scene_action()},
+    }
+
+    schema = flow_schemas.fleet_control_schema(source)
+
+    assert {str(marker) for marker in schema.schema} == {
+        CONF_HA_CONTROL_ENABLED,
+        CONF_HA_CONTROL_LABEL,
+        CONF_ROOM_OVERRIDES,
+        CONF_HA_CONTROL_DOMAINS,
+        CONF_MAX_MIRRORED_ENTITIES,
+    }
+    assert _field_default(schema, CONF_ROOM_OVERRIDES) == '{"Kitchen":"Upstairs"}'
+    assert flow_schemas.normalize_fleet_control_input(
+        _valid_control_input(
+            **{
+                CONF_HA_CONTROL_LABEL: " Whole Home ",
+                CONF_ROOM_OVERRIDES: '{" Kitchen ":" Upstairs "}',
+                CONF_HA_CONTROL_DOMAINS: ["cover", "light"],
+                CONF_MAX_MIRRORED_ENTITIES: "75",
+            }
+        )
+    ) == {
+        CONF_HA_CONTROL_ENABLED: True,
+        CONF_HA_CONTROL_LABEL: "Whole Home",
+        CONF_ROOM_OVERRIDES: {"Kitchen": "Upstairs"},
+        CONF_HA_CONTROL_DOMAINS: ["light", "cover"],
+        CONF_MAX_MIRRORED_ENTITIES: 75,
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        (CONF_HA_CONTROL_ENABLED, 1),
+        (CONF_HA_CONTROL_LABEL, "é" * 129),
+        (CONF_ROOM_OVERRIDES, "{" + (" " * (64 * 1024)) + "}"),
+        (CONF_HA_CONTROL_DOMAINS, ["light", "light"]),
+        (CONF_HA_CONTROL_DOMAINS, ["light", "sensor"]),
+        (CONF_MAX_MIRRORED_ENTITIES, True),
+        (CONF_MAX_MIRRORED_ENTITIES, 201),
+    ],
+)
+def test_fleet_control_rejects_untyped_or_unbounded_values(
+    field: str,
+    value: object,
+) -> None:
+    submitted = _valid_control_input(**{field: value})
+
+    with pytest.raises(FlowInputError) as raised:
+        flow_schemas.normalize_fleet_control_input(submitted)
+
+    assert dict(raised.value.errors) == {field: "invalid_value"}
+    assert repr(value) not in repr(raised.value)
+
+
+def test_fleet_scenes_separates_subentry_owners_from_action_panel_slugs() -> None:
+    source = {
+        CONF_SCENE_PANEL: "panel-subentry-office",
+        CONF_SCENE_ACTIONS: {"office:movie": _scene_action()},
+    }
+    schema = flow_schemas.fleet_scenes_schema(
+        source,
+        panel_subentry_ids=("panel-subentry-office", "panel-subentry-kitchen"),
+    )
+
+    assert {str(marker) for marker in schema.schema} == {
+        CONF_SCENE_PANEL,
+        CONF_SCENE_ACTIONS,
+    }
+    assert _field_default(schema, CONF_SCENE_PANEL) == "panel-subentry-office"
+    normalized = flow_schemas.normalize_fleet_scenes_input(
+        {
+            CONF_SCENE_PANEL: "panel-subentry-office",
+            CONF_SCENE_ACTIONS: json.dumps({"office:movie": _scene_action()}),
+        },
+        panel_subentry_ids=("panel-subentry-office", "panel-subentry-kitchen"),
+        panel_slugs=("office", "kitchen"),
+    )
+    assert normalized == source
+
+    with pytest.raises(FlowInputError) as owner_error:
+        flow_schemas.normalize_fleet_scenes_input(
+            {
+                CONF_SCENE_PANEL: "office",
+                CONF_SCENE_ACTIONS: "{}",
+            },
+            panel_subentry_ids=("panel-subentry-office",),
+            panel_slugs=("office",),
+        )
+    assert dict(owner_error.value.errors) == {CONF_SCENE_PANEL: "invalid_value"}
+
+    with pytest.raises(FlowInputError) as action_error:
+        flow_schemas.normalize_fleet_scenes_input(
+            {
+                CONF_SCENE_PANEL: "panel-subentry-office",
+                CONF_SCENE_ACTIONS: json.dumps({"panel-subentry-office:movie": _scene_action()}),
+            },
+            panel_subentry_ids=("panel-subentry-office",),
+            panel_slugs=("office",),
+        )
+    assert dict(action_error.value.errors) == {CONF_SCENE_ACTIONS: "invalid_value"}
+
+
+def test_fleet_scene_actions_reject_unbounded_nested_data_without_echoing_it() -> None:
+    deeply_nested: object = "TRANSIENT-SCENE-VALUE"
+    for _ in range(14):
+        deeply_nested = {"nested": deeply_nested}
+    actions = {
+        "office:movie": {
+            **_scene_action(),
+            "data": deeply_nested,
+        }
+    }
+
+    with pytest.raises(FlowInputError) as raised:
+        flow_schemas.normalize_fleet_scenes_input(
+            {
+                CONF_SCENE_PANEL: "panel-subentry-office",
+                CONF_SCENE_ACTIONS: json.dumps(actions),
+            },
+            panel_subentry_ids=("panel-subentry-office",),
+            panel_slugs=("office",),
+        )
+
+    assert dict(raised.value.errors) == {CONF_SCENE_ACTIONS: "invalid_value"}
+    assert "TRANSIENT-SCENE-VALUE" not in repr(raised.value)
+
+
+def test_fleet_defaults_are_strict_and_keep_existing_ranges() -> None:
+    schema = flow_schemas.fleet_defaults_schema()
+
+    assert {str(marker) for marker in schema.schema} == {
+        OPT_AUTO_REPAIR,
+        OPT_OFFLINE_GRACE_MINUTES,
+        OPT_REPAIR_COOLDOWN_MINUTES,
+    }
+    assert _field_default(schema, OPT_AUTO_REPAIR) is DEFAULT_AUTO_REPAIR
+    assert _field_default(schema, OPT_OFFLINE_GRACE_MINUTES) == DEFAULT_OFFLINE_GRACE_MINUTES
+    assert _field_default(schema, OPT_REPAIR_COOLDOWN_MINUTES) == DEFAULT_REPAIR_COOLDOWN_MINUTES
+    assert flow_schemas.normalize_fleet_defaults_input(
+        {
+            OPT_AUTO_REPAIR: False,
+            OPT_OFFLINE_GRACE_MINUTES: "2",
+            OPT_REPAIR_COOLDOWN_MINUTES: "1440",
+        }
+    ) == {
+        OPT_AUTO_REPAIR: False,
+        OPT_OFFLINE_GRACE_MINUTES: 2,
+        OPT_REPAIR_COOLDOWN_MINUTES: 1440,
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        (OPT_AUTO_REPAIR, 1),
+        (OPT_OFFLINE_GRACE_MINUTES, 1),
+        (OPT_OFFLINE_GRACE_MINUTES, 121),
+        (OPT_REPAIR_COOLDOWN_MINUTES, 4),
+        (OPT_REPAIR_COOLDOWN_MINUTES, 1441),
+    ],
+)
+def test_fleet_defaults_reject_invalid_types_and_ranges(
+    field: str,
+    value: object,
+) -> None:
+    submitted: dict[str, object] = {
+        OPT_AUTO_REPAIR: True,
+        OPT_OFFLINE_GRACE_MINUTES: 10,
+        OPT_REPAIR_COOLDOWN_MINUTES: 60,
+        field: value,
+    }
+
+    with pytest.raises(FlowInputError) as raised:
+        flow_schemas.normalize_fleet_defaults_input(submitted)
+
+    assert dict(raised.value.errors) == {field: "invalid_value"}
+
+
+def test_panel_rename_and_address_are_focused_bounded_inputs() -> None:
+    rename = flow_schemas.panel_rename_schema(
+        {
+            CONF_NAME: "Office Panel",
+            CONF_HOST: "192.0.2.20",
+            CONF_ROOT_PASSWORD: "RAW-ROOT-SECRET",
+        }
+    )
+    address = flow_schemas.panel_address_schema(
+        {
+            CONF_NAME: "Office Panel",
+            CONF_HOST: "192.0.2.20",
+            CONF_ROOT_PASSWORD: "RAW-ROOT-SECRET",
+        }
+    )
+
+    assert {str(marker) for marker in rename.schema} == {CONF_NAME}
+    assert {str(marker) for marker in address.schema} == {CONF_HOST}
+    assert _field_default(rename, CONF_NAME) == "Office Panel"
+    assert _field_default(address, CONF_HOST) == "192.0.2.20"
+    assert flow_schemas.normalize_panel_rename_input({CONF_NAME: " Office "}) == {
+        CONF_NAME: "Office"
+    }
+    assert flow_schemas.normalize_panel_address_input({CONF_HOST: " 192.0.2.21 "}) == {
+        CONF_HOST: "192.0.2.21"
+    }
+    assert "RAW-ROOT-SECRET" not in repr(rename)
+    assert "RAW-ROOT-SECRET" not in repr(address)
+
+
+def test_panel_credential_and_rebind_passwords_are_masked_without_suggestions() -> None:
+    credentials = flow_schemas.panel_ssh_credentials_schema()
+    rebind = flow_schemas.panel_rebind_schema(
+        {
+            CONF_HOST: "192.0.2.20",
+            CONF_ROOT_PASSWORD: "RAW-ROOT-SECRET",
+            CONF_IDENTITY_FINGERPRINT: "SHA256:OLD-FINGERPRINT",
+            CONF_SSH_HOST_KEY: "ssh-ed25519 RAW-PUBLIC-KEY",
+        }
+    )
+    serialized = _serialized(credentials) + _serialized(rebind)
+    fields = {field["name"]: field for field in serialized}
+    encoded = json.dumps(serialized, sort_keys=True)
+
+    assert {str(marker) for marker in credentials.schema} == {CONF_ROOT_PASSWORD}
+    assert {str(marker) for marker in rebind.schema} == {CONF_HOST, CONF_ROOT_PASSWORD}
+    assert fields[CONF_ROOT_PASSWORD]["selector"]["text"]["type"] == "password"
+    assert "suggested_value" not in fields[CONF_ROOT_PASSWORD].get("description", {})
+    assert "RAW-ROOT-SECRET" not in encoded
+    assert "SHA256:OLD-FINGERPRINT" not in encoded
+    assert "RAW-PUBLIC-KEY" not in encoded
+    assert SECRET_UNCHANGED not in encoded
+    assert flow_schemas.normalize_panel_ssh_credentials_input(
+        {CONF_ROOT_PASSWORD: " password with spaces "}
+    ) == {CONF_ROOT_PASSWORD: " password with spaces "}
+    assert flow_schemas.normalize_panel_rebind_input(
+        {
+            CONF_HOST: " 192.0.2.21 ",
+            CONF_ROOT_PASSWORD: " replacement secret ",
+        }
+    ) == {
+        CONF_HOST: "192.0.2.21",
+        CONF_ROOT_PASSWORD: " replacement secret ",
+    }
+
+
+@pytest.mark.parametrize(
+    "identity_field",
+    [CONF_IDENTITY_FINGERPRINT, CONF_SSH_HOST_KEY],
+)
+def test_panel_rebind_never_accepts_user_asserted_identity(
+    identity_field: str,
+) -> None:
+    with pytest.raises(FlowInputError) as raised:
+        flow_schemas.normalize_panel_rebind_input(
+            {
+                CONF_HOST: "192.0.2.21",
+                CONF_ROOT_PASSWORD: "replacement secret",
+                identity_field: "USER-ASSERTED-IDENTITY",
+            }
+        )
+
+    assert dict(raised.value.errors) == {"base": "invalid_value"}
+    assert "USER-ASSERTED-IDENTITY" not in repr(raised.value)
+
+
+def test_panel_feature_overrides_are_typed_and_allowlisted() -> None:
+    certificate = "-----BEGIN CERTIFICATE-----\nPUBLIC-CA\n-----END CERTIFICATE-----"
+    schema = flow_schemas.panel_feature_overrides_schema(
+        {
+            CONF_VOICE_WAKE_WORD: "hey_jarvis",
+            CONF_VOICE_HA_HOST: "ha.internal",
+            CONF_HUE_CA_CERT: certificate,
+            CONF_FEATURE_OVERRIDES: {"unexpected": True},
+        }
+    )
+
+    assert {str(marker) for marker in schema.schema} == {
+        CONF_VOICE_WAKE_WORD,
+        CONF_VOICE_HA_HOST,
+        CONF_HUE_CA_CERT,
+    }
+    assert _field_default(schema, CONF_VOICE_WAKE_WORD) == "hey_jarvis"
+    assert _field_default(schema, CONF_VOICE_HA_HOST) == "ha.internal"
+    assert flow_schemas.normalize_panel_feature_overrides_input(
+        {
+            CONF_VOICE_WAKE_WORD: "hey_mycroft",
+            CONF_VOICE_HA_HOST: " ha.internal ",
+            CONF_HUE_CA_CERT: certificate,
+        }
+    ) == {
+        CONF_VOICE_WAKE_WORD: "hey_mycroft",
+        CONF_VOICE_HA_HOST: "ha.internal",
+        CONF_HUE_CA_CERT: certificate,
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("unexpected", True),
+        (CONF_VOICE_WAKE_WORD, "user_supplied_wake_word"),
+        (CONF_VOICE_HA_HOST, "ha.internal\n"),
+        (
+            CONF_HUE_CA_CERT,
+            "-----BEGIN PRIVATE KEY-----\nTRANSIENT-PRIVATE-SECRET\n-----END PRIVATE KEY-----",
+        ),
+    ],
+)
+def test_panel_feature_overrides_reject_unknown_or_unsafe_values(
+    field: str,
+    value: object,
+) -> None:
+    submitted: dict[str, object] = {
+        CONF_VOICE_WAKE_WORD: DEFAULT_VOICE_WAKE_WORD,
+        CONF_VOICE_HA_HOST: "",
+        CONF_HUE_CA_CERT: "",
+        field: value,
+    }
+
+    with pytest.raises(FlowInputError) as raised:
+        flow_schemas.normalize_panel_feature_overrides_input(submitted)
+
+    expected_field = field if field != "unexpected" else "base"
+    assert dict(raised.value.errors) == {expected_field: "invalid_value"}
+    assert repr(value) not in repr(raised.value)

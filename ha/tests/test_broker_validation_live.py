@@ -603,7 +603,7 @@ async def test_untrusted_ca_tls_preserves_verification_failure(
 @pytest.mark.mqtt_live
 @pytest.mark.usefixtures("_allow_live_loopback")
 @_skip_without_live_broker
-async def test_discovery_write_acl_denial_maps_to_typed_failure(
+async def test_silent_discovery_write_acl_denial_maps_to_retryable_timeout(
     hass: HomeAssistant,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -617,7 +617,10 @@ async def test_discovery_write_acl_denial_maps_to_typed_failure(
             ).async_validate(_profile(environment.deny, environment))
 
     assert raised.value.stage is OperationStage.DISCOVERY_WRITE
-    assert raised.value.code == "discovery_write_denied"
+    # The temporary device follows the panel's MQTT 3.1.1 transport. That
+    # protocol has no negative PUBACK reason code, and Mosquitto silently drops
+    # this denied publish, so the validator must not claim it observed a denial.
+    assert raised.value.code == "discovery_write_timeout"
 
 
 @pytest.mark.mqtt_live

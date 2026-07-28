@@ -1,8 +1,9 @@
 # Deployment Reference
 
 How the bridge runs on a panel, survives OTA, and gets its credentials. The
-authoritative steps are in the plan (Milestones 7–9); this is the operational
-quick reference.
+authoritative release gates are in
+[Task 8 of the fleet-onboarding plan](../superpowers/plans/2026-07-21-fleet-onboarding.md#task-8-run-full-gates-and-one-panel-onboarding-canaries);
+this is the operational quick reference.
 
 ## Where it runs
 
@@ -65,27 +66,20 @@ addition to the panel's own site-packages it already exposes).
 
 The [MQTT broker prerequisite guide](../install/mqtt-broker.md) has the exact
 principal table, official source links, and stable remediation anchors for the
-packaged validator. The current one-panel flow does not call it. The
-forthcoming Plan 2 fleet flow will prove authentication, both message
-directions, discovery write access, and retained-message behavior without
-modifying broker users, ACLs, or configuration.
+packaged validator. Fleet onboarding proves authentication, both message
+directions, Discovery write access, and retained-message behavior before it
+creates the fleet. Each staged panel repeats the relevant broker checks before
+activation. Validation never modifies broker users, ACLs, or configuration.
 
 ## MQTT TLS
 
-The panel agent supports plaintext TCP (`MQTT_TLS_ENABLED=0`), strict TLS with
-its system/public CA store (`MQTT_TLS_ENABLED=1` with no CA file), and strict
-TLS with a custom public CA for manual deployment. The integration package
-contains a future-flow helper that uploads exact CA bytes as mode `0644` to a
-content-addressed path below `/var/brilliant-mqtt/tls/`; the mode-`0600`
+The panel agent and fleet integration support plaintext TCP
+(`MQTT_TLS_ENABLED=0`), strict TLS with the panel's system/public CA store
+(`MQTT_TLS_ENABLED=1` with no CA file), and strict TLS with a custom public CA.
+For custom trust, lifecycle operations upload the exact CA bytes as mode `0644`
+to a content-addressed path below `/var/brilliant-mqtt/tls/`; the mode-`0600`
 environment stores only that path. Old CA files are not rewritten or deleted
-during staging, so an older environment snapshot can still reference its prior
-trust material.
-
-The current one-panel integration UI, adoption, reconfigure, repair, and update
-paths are not TLS-aware. They can discard manual TLS settings and regenerate
-the environment with `MQTT_TLS_ENABLED=0`; do not place a manually
-TLS-configured panel under that lifecycle management until Plan 2 wires the
-packaged seam throughout the fleet flow.
+during staging, so rollback can still reference its prior trust material.
 
 TLS verifies both hostname and certificate chain and never falls back to
 plaintext. Anonymous access, insecure certificate bypass, mutual TLS, and MQTT
@@ -105,17 +99,142 @@ over WebSockets are unsupported by the panel transport.
   availability LWT + `brilliant/<panel>/bridge` meta topic, and restores the
   unit/env from the copies it stages under `/var/brilliant-mqtt/system/`.
 
+> **Office safety stop:** Office is reserved for the existing-external-broker,
+> software-only canary. Keep its broker endpoint, TLS profile, and credentials
+> unchanged. Do not send a light, switch, scene, mode, or other physical-load
+> command unless the user separately approves one exact safe Office circuit.
+> Run the outstanding official `core_mosquitto` qualification on a different
+> disposable Home Assistant instance and pilot panel.
+
 ## Roll-out order
 
 1. Pilot ONE panel. Soak ≥1 day.
 2. Verify in HA: entities present, telemetry reflects manual panel changes,
-   commands drive loads, LWT `offline` on agent kill, recovery on restart,
-   entities return after an HA restart (retained discovery/state).
+   LWT `offline` on agent kill, recovery on restart, and entities return after
+   an HA restart (retained discovery/state). Exercise load commands only on a
+   separately approved safe circuit; this is explicitly not authorized for
+   Office by the software canary.
 3. Roll out to the remaining panels (your configuration management); if
    publishing the BLE mesh loads, give exactly one panel `MESH_PRIORITY=1`
    and one or two standbys higher numbers.
 4. Repoint HA automations to the MQTT entities; if the panels are HomeKit-
    paired, keep that pairing as a fallback.
+
+## Office exact-bundle parity gate
+
+Before any Office update or redeploy, prove byte parity against the actual
+integration loaded by Home Assistant—not a nearby checkout or a matching
+version label.
+
+The deterministic helper
+[`scripts/brilliant-panel/bundle_manifest.py`](../../scripts/brilliant-panel/bundle_manifest.py)
+emits exactly `<logical-path><TAB><sha256>`, rejects symlinks and special
+files, rejects ambiguous filenames, and detects files, directories, or the
+active-release selector changing while hashing. It excludes runtime Python
+caches in every layout and excludes only the generated top-level
+`brilliant-mqtt.env` and `mqtt-ca.pem` from an active panel release. Run these
+commands from the qualified repository root. `ha-qualified` and
+`office-qualified` must be preconfigured SSH aliases with pinned host keys;
+never add an insecure host-key option:
+
+```bash
+set -euo pipefail
+parity_evidence=artifacts/brilliant-panel/pilots/office-bundle-parity
+manifest_helper=scripts/brilliant-panel/bundle_manifest.py
+mkdir -p "$parity_evidence"
+
+scripts/build_payload.sh
+git diff --exit-code -- custom_components/brilliant_mqtt/agent_payload
+test -z "$(git ls-files --others --exclude-standard -- custom_components/brilliant_mqtt/agent_payload)"
+test -z "$(git ls-files --others --ignored --exclude-standard -- custom_components/brilliant_mqtt/agent_payload)"
+
+uv run python "$manifest_helper" integration \
+  custom_components/brilliant_mqtt \
+  > "$parity_evidence/repository-integration.sha256"
+uv run python "$manifest_helper" payload-release \
+  custom_components/brilliant_mqtt/agent_payload \
+  > "$parity_evidence/repository-payload.sha256"
+
+ssh ha-qualified \
+  'python3 - integration /config/custom_components/brilliant_mqtt' \
+  < "$manifest_helper" \
+  > "$parity_evidence/home-assistant-integration.sha256"
+ssh ha-qualified \
+  'python3 - payload-release /config/custom_components/brilliant_mqtt/agent_payload' \
+  < "$manifest_helper" \
+  > "$parity_evidence/home-assistant-payload.sha256"
+
+ssh office-qualified \
+  '/data/switch-embedded/env/bin/python3 - panel-release /var/brilliant-mqtt --unit /etc/systemd/system/brilliant-mqtt.service --wifi-unit /etc/systemd/system/brilliant-wifi-watchdog.service --bus-unit /etc/systemd/system/brilliant-bus-watchdog.service' \
+  < "$manifest_helper" \
+  > "$parity_evidence/office-active-payload.sha256"
+
+diff -u \
+  "$parity_evidence/repository-integration.sha256" \
+  "$parity_evidence/home-assistant-integration.sha256" \
+  > "$parity_evidence/integration.diff" || {
+    echo "STOP: Home Assistant integration bundle differs" >&2
+    exit 1
+  }
+diff -u \
+  "$parity_evidence/repository-payload.sha256" \
+  "$parity_evidence/home-assistant-payload.sha256" \
+  > "$parity_evidence/home-assistant-payload.diff" || {
+    echo "STOP: Home Assistant payload differs" >&2
+    exit 1
+  }
+diff -u \
+  "$parity_evidence/repository-payload.sha256" \
+  "$parity_evidence/office-active-payload.sha256" \
+  > "$parity_evidence/office-payload.diff" || {
+    echo "STOP: Office active payload differs" >&2
+    exit 1
+  }
+```
+
+The `payload-release` layout hashes the complete static payload and adds
+normalized `installed/` aliases for `VERSION` and all three release service
+templates. The `panel-release` layout requires
+`/var/brilliant-mqtt/current` to remain one stable symlink to one direct,
+non-symlink child of `/var/brilliant-mqtt/releases`; there is deliberately no
+legacy-layout fallback for this exact-release gate. It hashes the complete
+active static release and maps `/var/brilliant-mqtt/VERSION` plus the installed
+bridge, Wi-Fi-watchdog, and bus-watchdog units to those same normalized aliases.
+A missing `current` selector or required installed unit, any command failure,
+any rejected or changing filesystem entry, or any non-empty diff is a stop
+condition.
+
+Store only the path/hash manifests and their path/hash-only diff below
+gitignored `artifacts/brilliant-panel/pilots/office-bundle-parity/`. Do not
+capture file contents, environment files, CA material, credentials, logs,
+host details, or command transcripts. The private provisioning journal is not
+canary evidence and must never be copied into this directory.
+
+Equality of `VERSION` values is necessary but is not proof of bundle parity.
+Keep Office on its existing external broker throughout this gate. A passing
+manifest comparison authorizes only the previously approved software canary;
+it does not authorize physical load actuation.
+
+Before the integration mutates Office, require its journaled snapshot to cover
+the prior active-release selector, exact environment,
+`VERSION`, bridge/Wi-Fi-watchdog/bus-watchdog units and their modes, enabled and
+active service states, and selected components. The referenced immutable prior
+release must still contain its complete static tree before mutation begins.
+The integration must durably commit and re-read that private journal snapshot
+before it changes the active selector or installed files. Record only the
+transaction identifier and proven journal phase in sanitized canary notes;
+never export journal contents, environment bytes, or CA material. An external
+Home Assistant backup remains a sensible operator precaution, but is not an
+additional canary gate because the onboarding transaction cannot create and
+verify one itself.
+
+Rollback means: stop the candidate, restore the saved files with their saved
+modes, restore the prior immutable release if absent, atomically repoint
+`current` (or restore the legacy fixed layout), run `systemctl daemon-reload`,
+restore the recorded enablement/active states, and require fresh MQTT health
+from the prior version. If the integration's automatic rollback or startup
+recovery cannot complete that sequence, stop all further panel mutations and
+surface the persistent repair issue; do not improvise a partial redeploy.
 
 ## Office 0.6.0 foundation canary
 
@@ -152,11 +271,18 @@ availability online, clear bridge health, and no update in progress. Its
 bundle still contains the older payload. Do not run that integration's
 update/redeploy action against this pilot until its bundled payload is
 refreshed to 0.6.0; doing so could downgrade the panel.
+This is the dated live-instance state captured by that canary, not the version
+of the current repository payload.
 
 The 30-minute technical/resource gate is complete. Keep Office as the sole
 pilot for the ≥1-day soak. The final physical-control regression check still
 requires an explicitly approved safe Office circuit; no load was actuated by
 the automated canary.
+
+This dated Office foundation canary does **not** qualify the fleet-onboarding
+official-Mosquitto path. The Task 8 `core_mosquitto` canary remains outstanding
+and must use a separate disposable Home Assistant instance and non-Office
+pilot.
 
 ## Office read-only onboarding preflight
 
@@ -182,8 +308,13 @@ files, changed no services, contacted no MQTT broker, and actuated no circuit.
 
 ## Rollback
 
-- Stop + disable `brilliant-mqtt.service` on the affected panel(s); HomeKit (kept
-  paired) remains the control path.
+- For a journaled integration rollout, use its automatic rollback/startup
+  recovery contract described above. A rollback is complete only after the
+  prior files, release selector/layout, component service states, and fresh
+  prior-version MQTT health are all verified.
+- If recovery reports `rollback_failed` or `recovery_failed`, stop further
+  mutations and follow the persistent repair issue using the approved encrypted
+  snapshot. Merely stopping the candidate is not an exact restoration.
 - Discovery topics are retained — to fully remove an entity from HA, publish an
   empty retained payload to its `homeassistant/<component>/<unique_id>/config`.
 - When decommissioning a panel entirely, also clear its retained

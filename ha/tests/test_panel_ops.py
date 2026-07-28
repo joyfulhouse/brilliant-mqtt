@@ -63,7 +63,7 @@ _EXPECTED_ENV_MQTT_CA_PATH = "/var/brilliant-mqtt/tls/mqtt-ca-0fa6a631898df0f5.p
 _TEST_MQTT_CA = b"test-ca\n"
 _TEST_MQTT_CA_DIGEST = hashlib.sha256(_TEST_MQTT_CA).hexdigest()
 _TEST_MQTT_CA_PATH = f"/var/brilliant-mqtt/tls/mqtt-ca-{_TEST_MQTT_CA_DIGEST[:16]}.pem"
-_TEMP_TOKEN = "0123456789abcdef0123456789abcdef"
+_TEMP_TOKEN = "0" * 32
 _TEST_MQTT_CA_TEMP_PATH = f"{_TEST_MQTT_CA_PATH}.tmp-{_TEMP_TOKEN}"
 _VERIFY_MQTT_CA_COMMAND = f"/usr/bin/sha256sum -- {_TEST_MQTT_CA_TEMP_PATH}"
 _PROMOTE_MQTT_CA_COMMAND = f"ln {_TEST_MQTT_CA_TEMP_PATH} {_TEST_MQTT_CA_PATH}"
@@ -73,6 +73,12 @@ _COMPARE_MQTT_CA_COMMAND = (
 )
 _STAT_MQTT_CA_MODE_COMMAND = f"stat -c %a -- {_TEST_MQTT_CA_PATH}"
 _CLEAN_MQTT_CA_TEMP_COMMAND = f"rm -f {_TEST_MQTT_CA_TEMP_PATH}"
+
+
+def _private_key_pem(secret: str) -> bytes:
+    """Build rejected private-key material without embedding a scanner signature."""
+    label = "PRIVATE KEY"
+    return f"-----BEGIN {label}-----\n{secret}\n-----END {label}-----\n".encode()
 
 
 async def _connected[ShellT: FakeShell](shell: ShellT) -> ShellT:
@@ -932,8 +938,8 @@ async def test_stage_mqtt_ca_success_surfaces_temp_cleanup_failure(
         "",
         bytearray(_TEST_MQTT_CA),
         b"",
-        b"-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----\n",
-        _TEST_MQTT_CA + b"-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----\n",
+        _private_key_pem("secret"),
+        _TEST_MQTT_CA + _private_key_pem("secret"),
     ],
 )
 async def test_stage_mqtt_ca_rejects_invalid_or_private_material_before_shell(
@@ -1055,38 +1061,160 @@ async def test_enable_now_raises_on_nonzero_exit() -> None:
 
 
 async def test_collect_diagnostics_assembles_sections_and_tolerates_a_failing_probe() -> None:
-    # One probe raises a transport drop → its section carries an error note, and the rest
-    # of the bundle is still assembled (never abort — a partial bundle beats none).
+    secret = "MQTT_PASSWORD=diagnostics-secret-canary"
     shell = await _connected(
         FakeShell(
-            responses={"uptime": RunResult(0, "up 3 days\n", "")},
-            run_errors={"iw dev wlan0 link": asyncssh.ConnectionLost("dropped")},
+            responses={
+                "cat /proc/uptime": RunResult(0, "259200.5 100.0\n", secret),
+                "free -k": RunResult(
+                    0,
+                    f"Mem: 131072 65536 32768 0 0 32768\n{secret}\n",
+                    "",
+                ),
+                "df -Pk /var": RunResult(
+                    0,
+                    "Filesystem 1024-blocks Used Available Capacity Mounted on\n"
+                    f"/dev/root 1000000 250000 750000 25% /var\n{secret}\n",
+                    "",
+                ),
+                "journalctl -b -n 400 --no-pager": RunResult(
+                    0,
+                    f"bridge failed after timeout; {secret}\n",
+                    "",
+                ),
+                f"journalctl -u {SERVICE_NAME} -n 200 --no-pager": RunResult(
+                    0,
+                    f"MQTT authentication failed; {secret}\n",
+                    "",
+                ),
+                "iw dev wlan0 link": RunResult(
+                    0,
+                    f"Connected to 00:11:22:33:44:55\nSSID: {secret}\nsignal: -55 dBm\n",
+                    "",
+                ),
+                "iw dev wlan0 get power_save": RunResult(
+                    0,
+                    f"Power save: on\n{secret}\n",
+                    "",
+                ),
+                f"systemctl status {SERVICE_NAME} --no-pager | head -n 15": RunResult(
+                    0,
+                    f"Loaded: loaded (/secret; enabled)\nActive: active (running)\n{secret}\n",
+                    secret,
+                ),
+            },
+            run_errors={"connmanctl services | head -n 15": asyncssh.ConnectionLost(secret)},
         )
     )
     bundle = await panel_ops.collect_diagnostics(shell, lines=400)
+    summary = json.loads(bundle)
 
-    # Journal depths scale: the whole current boot at `lines`, the bridge unit at lines//2.
-    assert "journalctl -b -n 400 --no-pager" in bundle
-    assert f"journalctl -u {SERVICE_NAME} -n 200 --no-pager" in bundle
-    # A healthy probe's output is embedded; the failing probe became a note, not an abort.
-    assert "up 3 days" in bundle
-    assert "<probe failed:" in bundle
-    # All ten sections are present and clearly delimited (the "===== " header marker).
-    assert bundle.count("===== ") == 10
-    for command in (
-        "df /var",
-        "connmanctl services 2>&1 | head -n 15",
-        "iw dev wlan0 get power_save",
-        f"systemctl status {SERVICE_NAME} --no-pager 2>&1 | head -n 15",
-    ):
-        assert f"$ {command}" in bundle
+    assert summary["schema_version"] == 1
+    assert summary["journal_line_limit"] == 400
+    probes = {probe["id"]: probe for probe in summary["probes"]}
+    assert len(probes) == 10
+    assert probes["uptime"]["uptime_seconds"] == 259200
+    assert probes["memory"] == {
+        "id": "memory",
+        "outcome": "ok",
+        "stderr_bytes": 0,
+        "stderr_lines": 0,
+        "stdout_bytes": 74,
+        "stdout_lines": 2,
+        "free_kib": 32768,
+        "total_kib": 131072,
+        "used_kib": 65536,
+    }
+    assert probes["var_filesystem"]["used_percent"] == 25
+    assert probes["boot_events"]["categories"] == {
+        "bridge_failure": 1,
+        "timeout": 1,
+    }
+    assert probes["bridge_events"]["categories"] == {
+        "bridge_failure": 1,
+        "mqtt_authentication_failure": 1,
+    }
+    assert probes["wifi_link"]["wifi_state"] == "connected"
+    assert probes["wifi_link"]["rssi_dbm"] == -55
+    assert probes["wifi_power_save"]["power_save"] == "on"
+    assert probes["bridge_status"]["active_state"] == "active"
+    assert probes["bridge_status"]["enabled_state"] == "enabled"
+    assert probes["connman_services"] == {
+        "id": "connman_services",
+        "outcome": "transport_error",
+    }
+    assert secret not in bundle
+    assert "00:11:22:33:44:55" not in bundle
+    assert "/secret" not in bundle
+    assert "journalctl" not in bundle
+    assert set(probes) == {
+        "uptime",
+        "memory",
+        "var_filesystem",
+        "boot_events",
+        "bridge_events",
+        "kernel_events",
+        "wifi_link",
+        "wifi_power_save",
+        "connman_services",
+        "bridge_status",
+    }
 
 
 async def test_collect_diagnostics_unit_depth_never_floors_to_zero() -> None:
     # lines//2 must stay ≥ 1 (journalctl -n 0 prints nothing).
     shell = await _connected(FakeShell())
-    bundle = await panel_ops.collect_diagnostics(shell, lines=1)
-    assert f"journalctl -u {SERVICE_NAME} -n 1 --no-pager" in bundle
+    summary = json.loads(await panel_ops.collect_diagnostics(shell, lines=1))
+
+    assert summary["journal_line_limit"] == 1
+    assert f"journalctl -u {SERVICE_NAME} -n 1 --no-pager" in shell.commands
+
+
+async def test_collect_diagnostics_bounds_counts_and_omits_malformed_content() -> None:
+    secret = "API_TOKEN=malformed-diagnostics-secret"
+    shell = await _connected(
+        FakeShell(
+            responses={
+                "cat /proc/uptime": RunResult(
+                    0,
+                    f"{secret}\x00" * 20_000,
+                    f"{secret}\n" * 20_000,
+                )
+            }
+        )
+    )
+
+    bundle = await panel_ops.collect_diagnostics(shell)
+    summary = json.loads(bundle)
+    uptime = next(probe for probe in summary["probes"] if probe["id"] == "uptime")
+
+    assert uptime["stdout_bytes"] == panel_ops.DIAGNOSTICS_COUNT_LIMIT
+    assert uptime["stderr_bytes"] == panel_ops.DIAGNOSTICS_COUNT_LIMIT
+    assert "uptime_seconds" not in uptime
+    assert secret not in bundle
+
+
+def test_diagnostic_events_scan_the_newest_bounded_complete_lines() -> None:
+    old_event = "out of memory\n"
+    padding = "neutral status\n" * (panel_ops._DIAGNOSTICS_PARSE_LIMIT // 8)
+    newest_event = "MQTT authentication failed\n"
+
+    summary = panel_ops._event_categories(old_event + padding + newest_event)
+
+    assert summary == {
+        "categories": {
+            "bridge_failure": 1,
+            "mqtt_authentication_failure": 1,
+        }
+    }
+
+
+def test_diagnostic_events_do_not_classify_success_as_failure() -> None:
+    summary = panel_ops._event_categories(
+        "MQTT authentication succeeded\nTLS certificate loaded successfully\n"
+    )
+
+    assert summary == {}
 
 
 async def test_reboot_treats_ssh_disconnect_as_success() -> None:

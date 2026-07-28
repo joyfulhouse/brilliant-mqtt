@@ -1,6 +1,6 @@
 {
   "domain": "brilliant_mqtt",
-  "name": "Brilliant MQTT Panel Manager",
+  "name": "Brilliant MQTT Fleet Manager",
   "codeowners": [
     "@btli"
   ],
@@ -9,7 +9,7 @@
     "mqtt"
   ],
   "documentation": "https://github.com/joyfulhouse/brilliant-mqtt",
-  "integration_type": "device",
+  "integration_type": "hub",
   "iot_class": "local_push",
   "issue_tracker": "https://github.com/joyfulhouse/brilliant-mqtt/issues",
   "loggers": [

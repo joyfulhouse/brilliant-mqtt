@@ -1,4 +1,4 @@
-# Brilliant MQTT Panel Manager
+# Brilliant MQTT Fleet Manager
 
 ![release_badge](https://img.shields.io/github/v/release/joyfulhouse/brilliant-mqtt?style=for-the-badge)
 ![release_date](https://img.shields.io/github/release-date/joyfulhouse/brilliant-mqtt?style=for-the-badge)
@@ -17,12 +17,12 @@ This companion integration manages the on-panel `brilliant-mqtt` agent's lifecyc
 - **First deploy** — push the agent to a panel over SSH and start it under systemd.
 - **OTA updates** — update the agent on each panel when a new release is available.
 - **Automatic repair** — detect and recover the agent after a panel firmware update (which replaces the panel OS, removing the agent).
-- **Removal** — cleanly uninstall the agent from a panel.
+- **Explicit uninstall** — remove the agent from a panel on demand. Removing the Home Assistant integration alone leaves running panel agents untouched.
 
 The Brilliant Control panels themselves appear as **native MQTT-Discovery entities** published directly by the agent — lights, switches, dimmers, power sensors, presence, panel controls, and BLE-mesh loads — independent of this integration. Removing the integration leaves the device entities fully intact.
 
 ## Installation
 
-Install via HACS: add `joyfulhouse/brilliant-mqtt` as a custom repository (category: **Integration**), install **Brilliant MQTT Panel Manager**, restart Home Assistant, then add the integration under **Settings → Devices & Services**.
+Install via HACS: add `joyfulhouse/brilliant-mqtt` as a custom repository (category: **Integration**), install **Brilliant MQTT Fleet Manager**, restart Home Assistant, then add the integration once under **Settings → Devices & Services**. The official Home Assistant Mosquitto add-on is the recommended MQTT prerequisite, while an existing local, remote, or hosted broker is equally supported.
 
 See [docs/ha-integration.md](https://github.com/joyfulhouse/brilliant-mqtt/blob/main/docs/ha-integration.md) for the full guide, including SSH prerequisites and per-panel configuration.
