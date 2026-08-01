@@ -1262,13 +1262,45 @@ async def test_protocol_stages_use_request_timeout_and_cleanup_owns_its_budget(
         PreflightStage.PANEL_TO_HA,
         PreflightStage.CLEANUP,
     )
+    # Stages that issue I/O on the shared adapter (fleet_auth, panel_to_ha —
+    # and discovery_write/retained_message when reached) settle their
+    # cancelled operation before cleanup touches the same client; ha_to_panel
+    # only awaits an inbound message, so it has nothing to settle.
     assert timeouts == [
         (0.01, True),
-        (0.01, False),
+        (0.01, True),
         (0.01, False),
     ]
     assert ("unsubscribe", topics.ha_to_panel) in mqtt.events
     assert ("disconnect",) in mqtt.events
+
+
+async def test_every_io_stage_settles_cancelled_operations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _request(timeout_seconds=1.0)
+    mqtt = _successful_mqtt(request)
+    settle_flags: list[bool] = []
+    real_wait_for = asyncio.wait_for
+
+    async def record_wait_for(
+        awaitable: Awaitable[Any],
+        timeout: float,
+        *,
+        settle_on_cancel: bool = False,
+    ) -> Any:
+        settle_flags.append(settle_on_cancel)
+        return await real_wait_for(awaitable, timeout)
+
+    monkeypatch.setattr(preflight_module, "_wait_for", record_wait_for)
+
+    report = await async_run_preflight(_settings(), request, mqtt_factory=lambda *args, **kw: mqtt)
+
+    assert report.success is True
+    # fleet_auth, panel_to_ha, ha_to_panel, discovery_write, retained_message —
+    # every stage that issues adapter I/O settles its cancelled operation
+    # before cleanup can touch the same client.
+    assert settle_flags == [True, True, False, True, True]
 
 
 async def test_cleanup_timeout_is_bounded_and_reported() -> None:

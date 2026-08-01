@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hmac
 import json
 import os
 import re
@@ -147,6 +148,18 @@ class _InboundResult:
 
 def _monotonic_ms() -> int:
     return round(time.monotonic() * 1_000)
+
+
+def _nonce_matches(received: str, expected: str) -> bool:
+    """Compare pairing nonces in constant time.
+
+    surrogatepass keeps the encode total: json.loads can yield lone
+    surrogates, which a plain utf-8 encode would raise on.
+    """
+    return hmac.compare_digest(
+        received.encode("utf-8", "surrogatepass"),
+        expected.encode("utf-8", "surrogatepass"),
+    )
 
 
 async def _wait_for(
@@ -415,15 +428,15 @@ async def async_run_preflight(
                 return
             if (
                 result.setup_id != request.setup_id
-                or result.nonce != request.ha_nonce
-                or result.reply_to_nonce != request.panel_nonce
+                or not _nonce_matches(result.nonce, request.ha_nonce)
+                or not _nonce_matches(result.reply_to_nonce, request.panel_nonce)
             ):
                 return
             ha_result.set_result(_InboundResult())
             return
 
         if topic == topics.retained and retained_subscription_active and not retained_result.done():
-            if payload != request.panel_nonce:
+            if not _nonce_matches(payload, request.panel_nonce):
                 return
             if not retained:
                 retained_result.set_result(
@@ -542,12 +555,17 @@ async def async_run_preflight(
                 elapsed,
                 settle_on_cancel=True,
             )
+            # Every stage that issues I/O on the shared adapter settles its
+            # cancelled operation before the outer finally runs _cleanup —
+            # otherwise a timed-out publish/subscribe could still be unwinding
+            # inside aiomqtt while cleanup touches the same client.
             await _run_stage(
                 PreflightStage.PANEL_TO_HA,
                 panel_to_ha,
                 request.timeout_seconds,
                 completed,
                 elapsed,
+                settle_on_cancel=True,
             )
             await _run_stage(
                 PreflightStage.HA_TO_PANEL,
@@ -562,6 +580,7 @@ async def async_run_preflight(
                 request.timeout_seconds,
                 completed,
                 elapsed,
+                settle_on_cancel=True,
             )
             await _run_stage(
                 PreflightStage.RETAINED_MESSAGE,
@@ -569,6 +588,7 @@ async def async_run_preflight(
                 request.timeout_seconds,
                 completed,
                 elapsed,
+                settle_on_cancel=True,
             )
         except asyncio.CancelledError as error:
             cancellation = error

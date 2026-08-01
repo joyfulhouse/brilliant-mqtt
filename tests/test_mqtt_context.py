@@ -60,6 +60,7 @@ async def test_read_loop_fans_out_retained_context_and_preserves_two_arg_callbac
     adapter._command_cbs = [command_cb]
     adapter._message_cbs = [message_cb]
     adapter._payload_decode_error_cbs = []
+    adapter._redacted_logging = False
 
     await adapter._read_loop()
 
@@ -81,6 +82,7 @@ async def test_failing_context_callback_does_not_starve_other_callbacks() -> Non
     adapter._command_cbs = []
     adapter._message_cbs = [broken, healthy]
     adapter._payload_decode_error_cbs = []
+    adapter._redacted_logging = False
 
     await adapter._read_loop()
 

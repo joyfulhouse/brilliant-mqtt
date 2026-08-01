@@ -496,7 +496,7 @@ class FakePublisher:
     def __init__(self) -> None:
         self.published: list[tuple[str, str, bool]] = []
 
-    async def publish(self, topic: str, payload: str, retain: bool = False) -> None:
+    async def publish(self, topic: str, payload: str, retain: bool = False, qos: int = 0) -> None:
         self.published.append((topic, payload, retain))
 
 

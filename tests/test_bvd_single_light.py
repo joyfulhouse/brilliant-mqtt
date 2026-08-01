@@ -539,7 +539,7 @@ class _Publisher:
     def __init__(self) -> None:
         self.publications: list[tuple[str, str, bool]] = []
 
-    async def publish(self, topic: str, payload: str, retain: bool = False) -> None:
+    async def publish(self, topic: str, payload: str, retain: bool = False, qos: int = 0) -> None:
         self.publications.append((topic, payload, retain))
 
 
@@ -548,7 +548,7 @@ class _FailOncePublisher(_Publisher):
         super().__init__()
         self._failed = False
 
-    async def publish(self, topic: str, payload: str, retain: bool = False) -> None:
+    async def publish(self, topic: str, payload: str, retain: bool = False, qos: int = 0) -> None:
         if not self._failed:
             self._failed = True
             raise RuntimeError("publish failed")
