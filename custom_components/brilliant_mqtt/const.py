@@ -5,7 +5,15 @@ from __future__ import annotations
 from homeassistant.const import Platform
 
 DOMAIN = "brilliant_mqtt"
-CONFIG_ENTRY_VERSION = 3
+CONFIG_ENTRY_VERSION = 4
+ENTRY_KIND_FLEET = "fleet"
+ENTRY_KIND_LEGACY_PENDING_CONSOLIDATION = "legacy_pending_consolidation"
+SUBENTRY_TYPE_PANEL = "panel"
+FLEET_UNIQUE_ID = "brilliant_mqtt_fleet"
+# A zero-panel fleet has no Home Assistant-assigned subentry ID to own scene
+# routing yet. This fixed value is reserved exclusively for that durable bootstrap
+# state and must be replaced by the exact first provisioned panel subentry.
+FLEET_SCENE_OWNER_UNASSIGNED = "__unassigned__"
 PLATFORMS: list[Platform] = [
     Platform.BINARY_SENSOR,
     Platform.BUTTON,
@@ -14,7 +22,19 @@ PLATFORMS: list[Platform] = [
     Platform.UPDATE,
 ]
 
-# Config entry data keys (one entry per panel; each stores ITS OWN root password).
+# Fleet-global keys live on the singleton parent; panel identity, address, and each
+# panel's own root password live on its panel subentry. Legacy entries retain the
+# historical combined layout only for compatibility.
+CONF_ENTRY_KIND = "entry_kind"
+CONF_BROKER_KIND = "broker_kind"
+CONF_SCHEMA_VERSION = "schema_version"
+CONF_NEXT_MESH_PRIORITY = "next_mesh_priority"
+CONF_IDENTITY_FINGERPRINT = "identity_fingerprint"
+CONF_SSH_HOST_KEY = "ssh_host_key"
+CONF_SSH_USERNAME = "ssh_username"
+CONF_MANAGEMENT_ID = "management_id"
+CONF_FEATURE_OVERRIDES = "feature_overrides"
+CONF_PROVISIONING_TRANSACTION_ID = "provisioning_transaction_id"
 CONF_HOST = "host"
 CONF_ROOT_PASSWORD = "root_password"
 CONF_PANEL = "panel"
@@ -26,6 +46,8 @@ CONF_MQTT_HOST = "mqtt_host"
 CONF_MQTT_PORT = "mqtt_port"
 CONF_MQTT_USERNAME = "mqtt_username"
 CONF_MQTT_PASSWORD = "mqtt_password"
+CONF_MQTT_TLS_ENABLED = "mqtt_tls_enabled"
+CONF_MQTT_TLS_CA = "mqtt_tls_ca"
 # Voice satellite feature keys.
 CONF_VOICE_ENABLED = "voice_enabled"
 CONF_VOICE_WAKE_WORD = "voice_wake_word"
@@ -40,16 +62,16 @@ DEFAULT_HA_MIRROR_LEADER_PRIORITY = 0
 # diyHue CA-recovery hook feature keys.
 CONF_HUE_CA_CERT = "hue_ca_cert"
 
-# Home Assistant-owned MQTT control plane. These global values are copied to each
-# panel entry by the configuration vertical slice; the singleton elects the enabled
-# entry with the lexicographically smallest panel slug as its settings owner.
+# Home Assistant-owned MQTT control plane. A fleet entry owns these values once.
+# Legacy standalone panel entries retain compatibility copies; only that legacy
+# runtime elects the enabled entry with the lexicographically smallest panel slug.
 CONF_HA_CONTROL_ENABLED = "ha_control_enabled"
 CONF_HA_CONTROL_LABEL = "ha_control_label"
 CONF_ROOM_OVERRIDES = "room_overrides"
 CONF_HA_CONTROL_DOMAINS = "ha_control_domains"
 CONF_MAX_MIRRORED_ENTITIES = "max_mirrored_entities"
-# Scene-control configuration is surfaced by Task 9's config flow. Task 8 consumes
-# the stored keys already so the singleton can select a default panel and actions.
+# Fleet-owned scene-control configuration selects one default panel and an explicit
+# allowlist of actions.
 CONF_SCENE_PANEL = "scene_panel"
 CONF_SCENE_ACTIONS = "scene_actions"
 DEFAULT_HA_CONTROL_ENABLED = False
@@ -68,7 +90,7 @@ COMPONENT_HA_MIRROR = "ha_mirror"
 COMPONENT_HUE_CA = "hue_ca"
 
 # Internally managed config-entry state (never shown in a config-flow form).
-DATA_SSH_HOST_KEY = "ssh_host_key"  # TOFU-pinned on first successful connect
+DATA_SSH_HOST_KEY = CONF_SSH_HOST_KEY  # TOFU-pinned on first successful connect
 DATA_LAST_FIRMWARE = "last_firmware"  # persisted so panel_updated survives HA restarts
 DATA_CONTROL_PLANE = "ha_control_plane"
 DATA_HA_MIRROR_RETIRE_VERIFIED = "ha_mirror_retire_verified"
@@ -91,8 +113,9 @@ MESH_PANEL = "mesh"
 # Panel reboot + pre-reboot diagnostics. The panels wedge two ways (an uptime-decay
 # wedge that only a reboot clears, and Wi-Fi power-save packet starvation), and the
 # panel's journald is VOLATILE (/run tmpfs — only the current boot survives), so a
-# diagnostics bundle is pulled over SSH BEFORE the reboot that would erase the
-# evidence. Bundles land under <config>/brilliant_mqtt/diagnostics/<panel>/, newest
+# typed, allowlisted diagnostics summary is collected over SSH BEFORE the reboot that
+# would erase the evidence. Raw journal/stdout/stderr text is never persisted.
+# Summaries land under <config>/brilliant_mqtt/diagnostics/<panel>/, newest
 # DIAGNOSTICS_RETENTION kept.
 DEFAULT_REBOOT_JOURNAL_LINES = 400
 MIN_REBOOT_JOURNAL_LINES = 100
@@ -152,10 +175,17 @@ DEFAULT_VOICE_WAKE_WORD = "okay_nabu"
 
 # On-panel paths owned by the integration (mirror docs/reference/deployment.md).
 PANEL_VAR_DIR = "/var/brilliant-mqtt"
+# Fleet provisioning stages immutable versions below releases/ and atomically
+# switches current. The fixed app/vendor/watchdog paths below remain the legacy
+# installer contract until fleet migration explicitly retires that path.
+PANEL_RELEASES_DIR = f"{PANEL_VAR_DIR}/releases"
+PANEL_CURRENT_LINK = f"{PANEL_VAR_DIR}/current"
 PANEL_APP_DIR = f"{PANEL_VAR_DIR}/app"
 PANEL_VENDOR_DIR = f"{PANEL_VAR_DIR}/vendor"
 PANEL_STAGED_DIR = f"{PANEL_VAR_DIR}/system"
 PANEL_VERSION_FILE = f"{PANEL_VAR_DIR}/VERSION"
+PANEL_MQTT_TLS_DIR = f"{PANEL_VAR_DIR}/tls"
+PANEL_RETAINED_TOPICS_FILE = f"{PANEL_VAR_DIR}/state/owned-topics.json"
 PANEL_ENV_FILE = "/etc/brilliant-mqtt.env"
 PANEL_UNIT_FILE = "/etc/systemd/system/brilliant-mqtt.service"
 SERVICE_NAME = "brilliant-mqtt"
@@ -207,6 +237,9 @@ EVENT_REPAIR_SUCCEEDED = "repair_succeeded"
 EVENT_REPAIR_FAILED = "repair_failed"
 EVENT_NEEDS_ATTENTION = "needs_attention"
 EVENT_AGENT_UPDATED = "agent_updated"
+# Fired only after an explicit fleet-panel identity rebind is durable. Extra data:
+# old_fingerprint and new_fingerprint; standard panel/entry_id identify the owner.
+EVENT_PANEL_REBOUND = "panel_rebound"
 # Fired when a rotated SSH host key was auto-trusted during repair/update (opt-in
 # OPT_TRUST_HOST_KEY_CHANGES). Extra data: new_host_key. Auditable security event.
 EVENT_HOST_KEY_REPINNED = "host_key_repinned"

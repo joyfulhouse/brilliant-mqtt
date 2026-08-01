@@ -1,0 +1,14 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Bounded root-password length validation is not a credential"
+condition = "AND"
+targetRules = ["generic-api-key"]
+regexTarget = "line"
+regexes = [
+  '''^\s*or not _valid_text\(self\.root_password, maximum_bytes=16 \* 1024\)\s*$''',
+]
+paths = [
+  '''(^|/)custom_components/brilliant_mqtt/panel_provisioner\.py$''',
+]

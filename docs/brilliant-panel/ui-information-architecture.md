@@ -49,10 +49,10 @@ The exact home-function vocabulary present in the binary is:
 | Rooms | Room-first device navigation | HA area/room metadata is modeled, but does not create a native HA tile |
 | Devices | Type/device browse and settings | Existing HA entity device grouping should align |
 | Alexa | Native voice status/mute | HA voice satellite is intentionally separate |
-| Shades | Position/tilt controls | Native schema exists; generic HA native tiles are blocked |
+| Shades | Position/tilt controls | Native schema and stock Hunter Douglas stub exist; the dedicated stub track remains production-blocked |
 | Alarms | Alarm configuration/execution | Distinct from security system alarm state |
 | Cameras | Live video/device view | Media subsystem, not core MQTT bridge |
-| Access | Locks/access panels/garages | Native schemas exist; physical-Control HA hosting is rejected |
+| Access | Locks/access panels/garages | Native schemas and selected partner stubs exist; physical-Control HA hosting remains rejected |
 | Doorbell | Doorbell feeds, chime, paired lock/security | Deferred media/security tier |
 | Solar | Questionnaire, estimates, savings | Firmware schema/UI present; data source partly cloud-derived |
 | Add to Home | Device/group provisioning | Keep native; HA should not emulate mesh provisioning casually |
@@ -64,11 +64,14 @@ Shortcut targets can be a home function, scene, room, mode, or single device. Su
 
 ### HA design consequence
 
-If native HA entities become feasible, they should use an officially owned
-Virtual Control identity and complete room/type metadata rather than a parallel
-web silo. Physical-Control hosting and raw injection are rejected. The supported
-baseline intentionally uses HA scene surfaces and existing Brilliant scenes;
-see the [HA integration guide](home-assistant-integration.md).
+If native HA entities become feasible, generic types should use an officially
+owned Virtual Control identity and complete room/type metadata rather than a
+parallel web silo. Selected types may instead use an otherwise-unused,
+naturally owned stock partner host after the dedicated
+[stub gates](native-partner-stub-feasibility.md). Physical-Control hosting and
+raw injection are rejected. The supported baseline intentionally uses HA scene
+surfaces and existing Brilliant scenes; see the
+[HA integration guide](home-assistant-integration.md).
 
 ## Information hierarchy
 
@@ -173,7 +176,10 @@ operation after separate approval, restart persistence, exact binding
 restoration, and stale-reference cleanup.
 
 The first option is the supported baseline because it adds no peripheral owner.
-Hosting an HA-backed target remains blocked behind Virtual Control gates.
+Hosting a generic HA-backed target remains blocked behind Virtual Control gates.
+A partner-owned `SHADE` is source-eligible for the same type filter, but no stub
+shade has been rendered, selected, bound, or operated live; it remains behind
+the separate partner-stub gates.
 
 ## Settings hierarchy
 

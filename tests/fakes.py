@@ -149,6 +149,7 @@ class FakeMqtt:
     def __init__(self) -> None:
         # Each entry is (topic, payload, retain).
         self.published: list[tuple[str, str, bool]] = []
+        self.published_qos: list[int] = []
         self.subscriptions: list[str] = []
         self.unsubscriptions: list[str] = []
         # Multiple consumers may register (see FakeBus._change_cbs) — fan out.
@@ -165,6 +166,7 @@ class FakeMqtt:
 
     async def publish(self, topic: str, payload: str, retain: bool = False, qos: int = 0) -> None:
         self.published.append((topic, payload, retain))
+        self.published_qos.append(qos)
 
     def on_command(self, cb: Callable[[str, str], Awaitable[None]]) -> None:
         self._command_cbs.append(cb)

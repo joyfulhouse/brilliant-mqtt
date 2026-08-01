@@ -19,22 +19,23 @@ uninstall:
 reboot:
   name: Reboot panel
   description: >-
-    Capture a diagnostics bundle over SSH, then reboot the panel. The panel's logs
-    are volatile (lost on reboot), so diagnostics are always captured first.
+    Optionally capture a secret-safe diagnostics summary over SSH, then reboot the
+    panel. When Capture diagnostics is enabled, typed diagnostic counts are saved
+    before the panel's volatile logs disappear; raw log text is not saved.
   target:
     entity:
       integration: brilliant_mqtt
   fields:
     collect_diagnostics:
       name: Capture diagnostics
-      description: Capture a diagnostics bundle before rebooting (saved under the config directory).
+      description: Capture a secret-safe diagnostics summary before rebooting (saved under the config directory without raw log text).
       required: false
       default: true
       selector:
         boolean:
     journal_lines:
       name: Journal lines
-      description: How many current-boot journal lines to capture.
+      description: How many current-boot journal lines to scan for typed diagnostic counts; raw lines are not saved.
       required: false
       default: 400
       selector:

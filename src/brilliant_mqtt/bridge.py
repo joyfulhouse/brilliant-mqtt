@@ -103,10 +103,12 @@ class Bridge:
         clock: Callable[[], float] = time.monotonic,
         write_throttle: WriteThrottle | None = None,
         owned_topics: RetainedTopicLedger | None = None,
+        deployment_id: str | None = None,
     ) -> None:
         self._bus = bus
         self._mqtt = mqtt
         self._panel = panel
+        self._deployment_id = deployment_id
         # Scope filter; None means everything (the single-bridge default).
         # The mesh milestone runs TWO Bridge instances on the SAME bus in one
         # process — the panel bridge excludes "ble_mesh", the mesh bridge
@@ -193,6 +195,8 @@ class Bridge:
         # republished on every reconcile (idempotent, like discovery configs).
         if self._panel != _MESH_PANEL:
             meta: dict[str, str] = {"agent_version": __version__}
+            if self._deployment_id is not None:
+                meta["deployment_id"] = self._deployment_id
             if sw_version is not None:
                 meta["panel_firmware"] = sw_version
             await self._async_publish_retained(

@@ -15,10 +15,12 @@ The panel is local-first at the hardware/control layer but cloud-backed at the a
 | HomeKit | On-panel HAP vassal over LAN | None after pairing | Local fallback; failures observed in service lifecycle, not cloud transport |
 | MQTT bridge | On-panel bus client → local broker | None | Local community path |
 | HA scene/mode bridge | Existing panel bus/MQTT session → local HA | None beyond HA/broker availability for cached execution | Implemented and off-panel tested; Office hardware acceptance pending |
-| Native HA tiles | Physical hosting rejected; Virtual Control unproven | Virtual Control provisioning/runtime may require Brilliant cloud | Blocked behind explicit feasibility and WAN-isolation gates |
+| Native HA tiles through a stock partner stub | Naturally owned partner host + local message bus | Configuration may synchronize through Brilliant; HA/broker remain the state authority | Distinct research path for otherwise-unused Hunter Douglas `SHADE` and RemoteLock `LOCK`; production blocked on feedback, availability, owner/relay, cleanup, and disposable-home gates |
+| Generic native HA tiles | Physical hosting rejected; Virtual Control unproven | Virtual Control provisioning/runtime may require Brilliant cloud | Blocked behind explicit feasibility and WAN-isolation gates |
 | Native Alexa | Local wake word/audio plus Amazon OAuth/AVS | Amazon and Brilliant token exchange | Cloud-dependent assistant |
 | Google Assistant linking | UI/account linking and external assistant | Google/Brilliant account services | Cloud-dependent |
-| Partner integrations | On-panel adapters plus partner APIs/tokens | Usually partner and/or Brilliant cloud | Prefer native HA integrations |
+| Real partner integrations | On-panel adapters plus partner APIs/tokens | Usually partner and/or Brilliant cloud | Prefer native HA integrations; do not mutate active real-device rings |
+| Local cover protocol emulation | Stock Hunter Douglas LAN adapter → PowerView-compatible HA service | None during routine operation beyond HA/service availability | Cover-specific fallback if the stock stub data plane cannot report authoritative state and availability |
 | Weather | Weather peripheral and lock-screen widget | Data source likely cloud | Cache may survive temporarily; not independent |
 | Art libraries | Local object-store cache and art configuration | Catalog/custom-art acquisition likely cloud | Cached display local; catalog lifecycle cloud-backed |
 | Solar estimates/savings | Local schema/UI and configuration | Weather/model/account inputs may be cloud-derived | Partially local; source validation required |
@@ -44,15 +46,26 @@ physical touch / PIR / gang UART / BLE mesh
 
 This core should remain the project's priority. It covers dependable
 lights/switches, sensor telemetry, panel settings, physical controls, and local
-HA automations. It does not currently render selected HA entities as native
-panel tiles; physical-Control hosting was rejected and Virtual Control remains
-gated. See the [HA integration guide](home-assistant-integration.md).
+HA automations. It does not currently render selected HA entities as
+production-supported native panel tiles. Physical-Control hosting was rejected;
+selected partner stubs now have a distinct gated research path, while generic
+types still require Virtual Control. See the
+[HA integration guide](home-assistant-integration.md) and
+[partner-stub feasibility](native-partner-stub-feasibility.md).
 
 ## Cloud-owned graph participants
 
 The full bus graph contains `cloud` and partner virtual devices. These are useful because they reveal interface schemas and the native hosting model, but they are not evidence that the panel has a secret local protocol to every partner device. In many cases the on-panel adapter calls a partner cloud API and reflects the result into a Brilliant peripheral.
 
 Static UI strings and installed modules identify clients or auth flows for Amazon/Alexa, Google/Nest, Ring, TP-Link, SmartThings, Sonos, Hue, LIFX, Ecobee, Schlage, Somfy, Wemo, Hunter Douglas, Bluesound, and others. HA should generally connect to those systems directly. Existing Brilliant scenes can then trigger configured HA actions without re-hosting each entity on a physical Control.
+
+The stock `stubbed=True` mechanism is a limited exception to the blanket
+partner-cloud conclusion. It can ask an existing partner host to materialize a
+native type without calling that partner's normal device API. This is useful
+only when the partner ring is otherwise unused and the stub is proven to make
+zero external requests. It does not authorize copying real partner devices into
+HA, changing partner ownership, or adding test records beside active Ring or
+Schlage devices.
 
 This inversion has three benefits:
 
@@ -108,10 +121,14 @@ Until that test is complete, document local media support as promising but unpro
 | Brilliant mesh accessories | Brilliant mesh leader, bridged once to HA |
 | Third-party devices | Native HA integration |
 | Cross-ecosystem automation | Home Assistant |
-| Devices shown on Brilliant panels | Existing Brilliant graph; native HA tiles blocked pending Virtual Control gates |
+| Devices shown on Brilliant panels | Existing Brilliant graph; selected stock partner stubs only after their dedicated gates; generic HA tiles pending Virtual Control gates |
 | Rooms/areas | HA area is operator authority; room mapping prepares the HA manifest but does not create tiles |
 | Firmware artifacts | Signed Brilliant commits mirrored locally |
 | Secrets | SOPS/HA secret storage, never panel-analysis docs |
 | HomeKit | Local fallback during migration and for recovery |
 
 This model uses Brilliant for what the hardware uniquely does well and HA for integration breadth, automation, history, and replacement of cloud-dependent partner adapters.
+
+For the ordered shade/lock decision, sanitized Office inventory, PowerView
+cover fallback, media boundary, and mutation/cleanup constraints, see
+[native partner-stub feasibility](native-partner-stub-feasibility.md).

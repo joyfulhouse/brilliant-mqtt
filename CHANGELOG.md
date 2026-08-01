@@ -9,6 +9,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Fleet-first onboarding.** One validated **Brilliant MQTT fleet** config
+  entry now owns the broker profile, the shared fleet MQTT credential, and the
+  installation-global settings; each panel becomes one Home Assistant config
+  subentry sharing a single fleet runtime. Initial setup validates the broker
+  end to end — including a real panel-side **setup preflight** driven through
+  Home Assistant's own MQTT connection — creates the durably verified empty
+  fleet, then chains straight into the same **Add panel** flow used for every
+  later panel. Add panel asks only for the panel address and root password;
+  MQTT settings, slugs, and mesh priorities are never re-asked.
+  - **Verify-before-password SSH identity.** An unauthenticated key exchange
+    pins the panel's exact host key *before* the root password is ever sent;
+    fleet panels never auto-repin — a changed key requires an explicit,
+    deliberate rebind flow.
+  - **Staged provisioning with rollback.** Every activation is journaled
+    before mutating the panel; staged install → health verification (fresh
+    availability, staged-version metadata, initial state, and discovery over
+    MQTT — retained replays rejected) → atomic activation. A first-install
+    failure leaves no partial unit; an upgrade failure restores the exact
+    prior release, environment, unit, and component state.
+  - **Stable identity.** Panel MQTT slugs are immutable; the first panel gets
+    mesh priority 1 and later panels the next unused value — nothing is ever
+    implicitly renumbered. The agent reports an optional
+    `BRILLIANT_DEPLOYMENT_ID` in its bridge metadata so the integration can
+    correlate deployments.
+  - **Focused day-two configuration** per panel (components, overrides, mesh
+    priority) and redacted fleet/panel diagnostics. Config entries migrate to
+    schema version 4; existing per-panel entries keep loading unchanged and
+    are consolidated in a later release.
+
+### Fixed
+
+- **Mesh loads with spaces in their peripheral IDs get entities again.**
+  Discovery unique_ids now replace every character Home Assistant rejects in
+  a discovery topic (anything outside `[a-zA-Z0-9_-]`) with `_` — previously
+  such loads (e.g. `HA Backyard Lamp 1`) produced an illegal discovery topic,
+  HA dropped the config, and the load silently had no entity. Already-legal
+  unique_ids are byte-identical, so existing entity registrations are
+  untouched.
+- **Preflight hardening from the v0.6.0 review is now part of the fleet
+  branch line:** constant-time pairing-nonce comparison and cancelled-I/O
+  settling on every stage that touches the shared MQTT adapter, combined with
+  the branch's stricter environment handling (canonical environment-file
+  parsing, bounded nonces, exception-safe failure records).
+
+## [0.6.0] - 2026-08-01
+### Added
+
 - **Agent payload 0.6.0 — MQTT preflight, retained-topic ownership ledger, and
   TLS support** *(recovered 2026-08-01 from the office panel's live artifact;
   the original branch `feature/mqtt-fleet-onboarding` / commit `2598b09` was

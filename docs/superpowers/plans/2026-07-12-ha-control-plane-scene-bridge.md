@@ -148,7 +148,11 @@ class ModeCommand:
     issued_at_ms: int
 ```
 
-Topic helpers must percent-free validate slugs/UUIDs with `re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,62}", panel)` and `UUID(value)` before interpolation. Scene topics are the locked extension to the namespace table in the design spec.
+Topic helpers must percent-free validate slugs/UUIDs with
+`re.fullmatch(r"[a-z0-9][a-z0-9_-]*", panel)` and `UUID(value)` before
+interpolation. The slug contract intentionally matches the existing config-flow
+and adopted-agent identity paths without a hidden 63-character cutoff. Scene
+topics are the locked extension to the namespace table in the design spec.
 
 - [ ] **Step 4: Run both protocol suites**
 

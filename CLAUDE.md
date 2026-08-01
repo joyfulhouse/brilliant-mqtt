@@ -59,7 +59,9 @@ in `CREDENTIALS.local.md`. For any new code tasks use
   tests stay in `ha/`. Run its gate from the repo root with the `ha/` env+config:
   `uv run --project ha ruff check --fix --config ha/pyproject.toml custom_components/brilliant_mqtt ha/tests && uv run --project ha ruff format --config ha/pyproject.toml custom_components/brilliant_mqtt ha/tests && uv run --project ha mypy --strict --config-file ha/pyproject.toml custom_components/brilliant_mqtt ha/tests && uv run --project ha pytest -c ha/pyproject.toml ha/tests`.
 - **uv for everything.** `uv sync`, `uv run pytest`, `uv run ruff check --fix`,
-  `uv run ruff format`, `uv run mypy --strict src tests`. **Never** `pip`/`pip3`.
+  `uv run ruff format`,
+  `uv run mypy --strict src tests scripts/brilliant-panel/bundle_manifest.py`.
+  **Never** `pip`/`pip3`.
 - **TDD.** Failing test → minimal impl → green → commit. Small, frequent commits.
 - **Never disable linters** (`# noqa`, `# type: ignore`). Fix the root cause.
 - **Never import `lib.message_bus_api` outside `src/brilliant_mqtt/bus.py`.**
@@ -90,7 +92,7 @@ in `CREDENTIALS.local.md`. For any new code tasks use
 
 ## Pre-commit gate
 
-`uv run ruff check --fix && uv run ruff format && uv run mypy --strict src tests && uv run pytest`
+`uv run ruff check --fix && uv run ruff format && uv run mypy --strict src tests scripts/brilliant-panel/bundle_manifest.py && uv run pytest`
 — all green before any commit. **If you changed the integration
 (`custom_components/brilliant_mqtt/`) or its tests (`ha/tests/`), also run the
 integration gate** (`uv run --project ha ruff check --fix --config ha/pyproject.toml custom_components/brilliant_mqtt ha/tests && uv run --project ha ruff format --config ha/pyproject.toml custom_components/brilliant_mqtt ha/tests && uv run --project ha mypy --strict --config-file ha/pyproject.toml custom_components/brilliant_mqtt ha/tests && uv run --project ha pytest -c ha/pyproject.toml ha/tests`)

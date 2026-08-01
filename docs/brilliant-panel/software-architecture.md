@@ -114,8 +114,11 @@ The deprecated HA mirror attempted to apply this pattern to a physical Control.
 Live testing rejected that ownership model: it co-managed real hardware, added
 bus load, threatened physical responsiveness, and did not reliably admit or
 propagate tiles. The supported [HA scene/mode bridge](home-assistant-integration.md)
-does not host a peripheral. Native HA tiles require the distinct Virtual
-Control path to pass its feasibility gates.
+does not host a peripheral. Generic native HA tiles still require the distinct
+Virtual Control path to pass its feasibility gates. Selected types with a
+shipped, otherwise-unused stock partner host have the separate gated path in
+[native partner-stub feasibility](native-partner-stub-feasibility.md); that path
+does not rehabilitate physical-Control hosting.
 
 One lifecycle trap is live-verified: own-device hosted peripherals persist in object store across host exit and reboot. A leader or test host must explicitly delete peripherals during handoff and teardown, or the UI retains phantoms.
 

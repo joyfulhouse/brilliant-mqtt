@@ -153,6 +153,7 @@ async def _run_session(
             reconcile_min_write_spacing_s=settings.motion_reconcile_min_write_spacing_s,
             write_throttle=write_throttle,
             owned_topics=owned_topics,
+            deployment_id=settings.deployment_id,
         )
 
         if participating:
@@ -293,6 +294,11 @@ async def _run_session(
                     {
                         "agent_version": __version__,
                         "degraded": "retained_ledger",
+                        **(
+                            {"deployment_id": settings.deployment_id}
+                            if settings.deployment_id is not None
+                            else {}
+                        ),
                     },
                     sort_keys=True,
                 ),

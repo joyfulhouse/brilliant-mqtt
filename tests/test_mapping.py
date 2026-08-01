@@ -904,6 +904,44 @@ def test_mesh_dimmer_sentinel_yields_only_primary_light() -> None:
     assert result[0].supports_brightness is True
 
 
+def _mesh_dimmer_named(peripheral_id: str) -> BrilliantDevice:
+    device = _mesh_dimmer()
+    return BrilliantDevice(
+        device_id=device.device_id,
+        peripheral_id=peripheral_id,
+        name=peripheral_id,
+        kind=device.kind,
+        peripheral_type=device.peripheral_type,
+        variables=device.variables,
+    )
+
+
+def test_unique_id_replaces_ha_illegal_peripheral_characters() -> None:
+    """Mesh peripheral IDs can contain spaces ("HA Backyard Lamp 1"). HA
+    rejects discovery topics whose object_id node holds characters outside
+    [a-zA-Z0-9_-] and silently drops the entity, so the unique_id (the
+    discovery topic node) maps every illegal character to "_". Display name
+    and peripheral_id — hence state/command topics — stay raw."""
+    (d,) = entities_for(_mesh_dimmer_named("HA Backyard Lamp 1"), "mesh")
+    assert d.unique_id == "brilliant_mesh_HA_Backyard_Lamp_1"
+    assert d.name == "HA Backyard Lamp 1"
+    assert d.peripheral_id == "HA Backyard Lamp 1"
+
+
+def test_aux_unique_id_replaces_ha_illegal_peripheral_characters() -> None:
+    device = _mesh_dimmer_named("HA Backyard Lamp 1")
+    device.variables["power"] = Variable("power", "52")
+    by_uid = _by_uid(entities_for(device, "mesh"))
+    assert "brilliant_mesh_HA_Backyard_Lamp_1_power" in by_uid
+
+
+def test_unique_id_keeps_legal_peripheral_ids_verbatim() -> None:
+    """Legal IDs must stay byte-identical — a rename would orphan every
+    existing entity in HA's registry fleet-wide."""
+    (d,) = entities_for(_mesh_dimmer(), "mesh")
+    assert d.unique_id == f"brilliant_mesh_{MESH_PID}"
+
+
 def test_mesh_dimmer_payload_brightness_uses_fallback_scale() -> None:
     """No max_intensity_value on mesh dimmers — brightness scales against 1000."""
     payload = payload_fields(_mesh_dimmer())

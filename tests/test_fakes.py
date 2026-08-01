@@ -103,6 +103,14 @@ class TestFakeBusScopedRead:
 
 
 class TestFakeMqttFanout:
+    async def test_publish_records_qos_without_changing_existing_tuple_shape(self) -> None:
+        mqtt = FakeMqtt()
+
+        await mqtt.publish("probe/topic", "nonce", retain=True, qos=1)
+
+        assert mqtt.published == [("probe/topic", "nonce", True)]
+        assert mqtt.published_qos == [1]
+
     async def test_inject_reaches_all_registered_callbacks(self) -> None:
         mqtt = FakeMqtt()
         seen_a: list[tuple[str, str]] = []

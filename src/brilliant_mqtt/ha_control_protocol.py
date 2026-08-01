@@ -15,7 +15,7 @@ COMMAND_TTL_MS = 15_000
 COMMAND_FUTURE_SKEW_MS = 5_000
 _STABLE_NAMESPACE = UUID("ddd06dfa-168a-5a0b-b8b3-4c5f742b0354")
 _TOPIC_PREFIX = "brilliant/ha-control/v1"
-_PANEL_PATTERN = re.compile(r"[a-z0-9][a-z0-9_-]{0,62}")
+_PANEL_PATTERN = re.compile(r"[a-z0-9][a-z0-9_-]*")
 
 
 @dataclass(frozen=True)

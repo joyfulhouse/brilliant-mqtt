@@ -24,6 +24,7 @@ from homeassistant.helpers import label_registry as lr
 from homeassistant.helpers.event import async_call_later
 
 from .const import (
+    CONF_ENTRY_KIND,
     CONF_HA_CONTROL_DOMAINS,
     CONF_HA_CONTROL_ENABLED,
     CONF_HA_CONTROL_LABEL,
@@ -39,7 +40,10 @@ from .const import (
     DEFAULT_HA_CONTROL_LABEL,
     DEFAULT_MAX_MIRRORED_ENTITIES,
     DOMAIN,
+    ENTRY_KIND_FLEET,
+    FLEET_SCENE_OWNER_UNASSIGNED,
 )
+from .entry_data import EntryDataError, FleetConfig, PanelConfig
 from .ha_control_manifest import (
     SUPPORTED_DOMAINS,
     ControlSettings,
@@ -369,6 +373,8 @@ class HaControlPlane:
     def _scene_runtime_settings(
         self, owner: BrilliantMqttConfigEntry
     ) -> tuple[frozenset[str], str | None, Mapping[str, object]]:
+        if owner.data.get(CONF_ENTRY_KIND) == ENTRY_KIND_FLEET:
+            return _fleet_scene_runtime_settings(owner)
         panels = frozenset(
             panel
             for entry in self._entries.values()
@@ -554,10 +560,9 @@ class HaControlPlane:
                 )
             except Exception as service_error:
                 _LOGGER.warning(
-                    "HA control service call failed for %s (%s): %s",
+                    "HA control service call failed for %s (%s)",
                     entity_id,
                     type(service_error).__name__,
-                    _sanitize_log_message(service_error),
                 )
                 error = "service_call_failed"
             else:
@@ -650,6 +655,29 @@ def _settings_from_entry(entry: BrilliantMqttConfigEntry) -> ControlSettings:
     )
 
 
+def _fleet_scene_runtime_settings(
+    entry: BrilliantMqttConfigEntry,
+) -> tuple[frozenset[str], str | None, Mapping[str, object]]:
+    """Resolve fleet-owned subentry IDs to the panel slugs used on MQTT."""
+    fleet = FleetConfig.from_entry(entry)
+    panels_by_id: dict[str, str] = {}
+    for subentry in entry.subentries.values():
+        panel = PanelConfig.from_subentry(subentry).panel
+        if panel in panels_by_id.values():
+            raise EntryDataError("duplicate_panel_slug")
+        panels_by_id[subentry.subentry_id] = panel
+
+    if not panels_by_id:
+        if fleet.scene_panel != FLEET_SCENE_OWNER_UNASSIGNED:
+            raise EntryDataError("invalid_scene_panel")
+        return frozenset(), None, fleet.scene_actions
+
+    default_panel = panels_by_id.get(fleet.scene_panel)
+    if default_panel is None:
+        raise EntryDataError("invalid_scene_panel")
+    return frozenset(panels_by_id.values()), default_panel, fleet.scene_actions
+
+
 def _canonical_manifest_body(snapshot: ManifestSnapshot) -> str:
     payload = snapshot.as_payload()
     del payload["revision"]
@@ -697,8 +725,3 @@ def _service_data(entity: ManifestEntity, route: _ServiceRoute, value: object) -
         )
     result[route.data_key] = value
     return result
-
-
-def _sanitize_log_message(error: Exception) -> str:
-    message = " ".join(str(error).splitlines())
-    return "".join(character for character in message if character.isprintable())[:200]

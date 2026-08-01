@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import traceback
 from collections.abc import Mapping
 from typing import Any
 from unittest.mock import AsyncMock, patch
@@ -29,6 +30,7 @@ from custom_components.brilliant_mqtt.ha_control_protocol import (
     SCHEMA_VERSION,
     encode_json,
     mode_result_topic,
+    scene_catalog_topic,
     scene_result_topic,
 )
 from custom_components.brilliant_mqtt.scene_control import (
@@ -126,6 +128,34 @@ def _scene_event(executed_at_ms: int, *, scene_id: str = "all_off") -> str:
             "deduplication_key": f"office:{scene_id}:{executed_at_ms}",
         }
     )
+
+
+@pytest.mark.allow_lingering_timers
+async def test_legacy_long_slug_reaches_scene_catalog_runtime(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+) -> None:
+    panel = "panel_" + ("z" * 250)
+    runtime = SceneControl(hass)
+    await runtime.async_start({panel}, default_panel=panel, actions={})
+
+    try:
+        async_fire_mqtt_message(
+            hass,
+            scene_catalog_topic(panel),
+            _scene_catalog(
+                200,
+                [{"scene_id": "all_off", "display_name": "All Lights Off", "icon": None}],
+                panel=panel,
+            ),
+            retain=True,
+        )
+        await hass.async_block_till_done()
+        assert runtime.attached_panels == frozenset({panel})
+        assert runtime.default_panel == panel
+        assert runtime.scene_options(panel) == (SceneOption("all_off", "All Lights Off"),)
+    finally:
+        await runtime.async_stop()
 
 
 def _mode_event(executed_at_ms: int, *, mode_id: str = "away") -> str:
@@ -1096,7 +1126,9 @@ async def test_noncanonical_deduplication_key_is_rejected(
 
 @pytest.mark.allow_lingering_timers
 async def test_command_publish_failure_is_sanitized_and_does_not_leak_pending_state(
-    hass: HomeAssistant, mqtt_mock: MqttMockHAClient
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     runtime = SceneControl(hass)
     await runtime.async_start({"office"}, default_panel="office", actions={})
@@ -1127,8 +1159,39 @@ async def test_command_publish_failure_is_sanitized_and_does_not_leak_pending_st
     ):
         await runtime.async_run_scene("office", "all_off")
     assert secret not in str(error.value)
+    assert secret not in repr(error.value)
+    assert secret not in "".join(traceback.format_exception(error.value))
+    assert secret not in caplog.text
+    assert error.value.__cause__ is None
     assert runtime.pending_count == 0
 
+    await runtime.async_stop()
+
+
+@pytest.mark.allow_lingering_timers
+async def test_unexpected_scene_callback_failure_logs_type_only(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    runtime = SceneControl(hass)
+    await runtime.async_start({"office"}, default_panel="office", actions={})
+    secret = "MQTT_PASSWORD=scene-callback-secret"
+
+    with patch.object(
+        runtime,
+        "_async_catalog",
+        new=AsyncMock(side_effect=RuntimeError(secret)),
+    ):
+        async_fire_mqtt_message(
+            hass,
+            "brilliant/ha-control/v1/scene/catalog/office",
+            _scene_catalog(10, []),
+        )
+        await hass.async_block_till_done()
+
+    assert "RuntimeError" in caplog.text
+    assert secret not in caplog.text
     await runtime.async_stop()
 
 

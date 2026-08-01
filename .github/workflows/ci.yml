@@ -22,7 +22,7 @@ jobs:
           test -z "$(git ls-files --others --ignored --exclude-standard -- custom_components/brilliant_mqtt/agent_payload)"
       - run: uv run ruff check
       - run: uv run ruff format --check
-      - run: uv run mypy --strict src tests
+      - run: uv run mypy --strict src tests scripts/brilliant-panel/bundle_manifest.py
       - run: uv run pytest
 
   ha-integration:

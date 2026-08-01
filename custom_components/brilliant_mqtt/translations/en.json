@@ -2,66 +2,57 @@
   "config": {
     "step": {
       "user": {
-        "title": "Connect to the Brilliant panel",
-        "description": "Enter the panel's IP and root password. If the bridge agent is already installed, its settings are adopted automatically — you're done after this step.",
-        "data": {
-          "host": "Panel IP / hostname",
-          "root_password": "Panel root password"
-        },
-        "data_description": {
-          "host": "The panel's address on your network (e.g. 192.168.1.10).",
-          "root_password": "Stored per panel — each controller can have its own root password."
+        "title": "Set up Brilliant MQTT",
+        "description": "Choose where the Brilliant panels should connect. The recommended path uses the official Home Assistant Mosquitto broker add-on; an existing or externally hosted MQTT broker is also fully supported.",
+        "menu_options": {
+          "official_mosquitto": "Home Assistant Mosquitto add-on (recommended)",
+          "existing_broker": "Existing or external MQTT broker (fully supported)"
         }
       },
+      "official_mosquitto": {
+        "title": "Home Assistant Mosquitto add-on (recommended)",
+        "description": "Use the official `core_mosquitto` add-on. Install and start the add-on first, then create dedicated Brilliant broker credentials for the panels. Home Assistant's existing MQTT connection is validated separately."
+      },
+      "existing_broker": {
+        "title": "Existing or external MQTT broker",
+        "description": "Use any reachable MQTT broker, including one hosted outside Home Assistant. The integration validates connectivity and required broker behavior before it changes a panel."
+      },
       "broker": {
-        "title": "MQTT broker",
-        "description": "The broker the on-panel agent publishes to. Pre-filled from your most recently added panel.",
+        "title": "Validate MQTT broker",
+        "description": "For the recommended Home Assistant path, install and start the official `core_mosquitto` add-on, then create dedicated Brilliant broker credentials before continuing. External-broker users do not need this add-on; enter a broker address reachable by Home Assistant and every Brilliant panel. You may also enable Home Assistant control and Brilliant scenes before the first panel is installed. Advanced settings are optional. [Open troubleshooting]({documentation_url})",
         "data": {
           "mqtt_host": "Broker host",
           "mqtt_port": "Broker port",
           "mqtt_username": "Broker username",
-          "mqtt_password": "Broker password"
-        }
-      },
-      "script": {
-        "title": "Panel settings",
-        "description": "Name the panel, choose its components, and configure the Home Assistant-owned control plane. Global control settings are shared by every Brilliant panel.",
-        "data": {
-          "name": "Panel Name",
-          "mesh_priority": "Mesh priority",
-          "voice": "Enable voice satellite",
-          "voice_wake_word": "Wake word",
-          "voice_ha_host": "Home Assistant host override (optional)",
-          "wifi_watchdog": "Enable Wi-Fi watchdog",
-          "bus_watchdog": "Enable Bus watchdog",
-          "hue_ca": "Enable Hue CA recovery",
-          "hue_ca_cert": "diyHue CA certificate (PEM)",
-          "ha_control_enabled": "Enable Home Assistant control plane",
-          "ha_control_label": "Home Assistant entity label",
-          "room_overrides": "Room overrides (JSON)",
-          "ha_control_domains": "Entity domains",
-          "max_mirrored_entities": "Maximum entities",
-          "scene_panel": "Default scene panel",
-          "scene_actions": "Scene actions (JSON)"
+          "mqtt_password": "Broker password",
+          "ha_control_enabled": "Enable Home Assistant control and scenes"
         },
         "data_description": {
-          "name": "A friendly name, e.g. \"Office Bath\". A lowercase id is derived for MQTT topics (\"Office Bath\" → office-bath).",
-          "mesh_priority": "0 = this panel never publishes the BLE mesh. Among positive values the LOWEST wins leader election (1 = primary, 2/3 = standbys).",
-          "voice": "Install a Home Assistant voice satellite on this panel (on-panel wake word + microphone + speaker). Speech-to-text, the conversation agent, and text-to-speech all run in your HA Assist pipeline — nothing voice-specific is configured on the panel.",
-          "voice_wake_word": "The on-panel wake word that activates the satellite.",
-          "voice_ha_host": "Only needed if the panel cannot resolve your Home Assistant URL's hostname (e.g. a segmented IoT VLAN). Format: hostname=ip, e.g. homeassistant.example=10.0.0.5. Leave blank to use the panel's own DNS.",
-          "wifi_watchdog": "Auto-recovers lost Wi-Fi (reconnect → restart networking → reboot the panel as a last resort).",
-          "bus_watchdog": "Installs the on-panel daemon that reboots the panel if the Brilliant bus stays wedged for 30+ minutes.",
-          "hue_ca": "Installs a periodic timer that re-injects your diyHue CA certificate into the panel's pinned Hue trust bundle, recovering it after an OTA update wipes /data.",
-          "hue_ca_cert": "The diyHue bridge's CA certificate, PEM-encoded. Required to enable Hue CA recovery.",
-          "ha_control_enabled": "Publishes a constrained, local MQTT control manifest from Home Assistant. The legacy on-panel HA mirror remains disabled.",
-          "ha_control_label": "Home Assistant label selecting entities for the constrained control manifest.",
-          "room_overrides": "A JSON object mapping Home Assistant area names to Brilliant room names, for example: \"Office\" mapped to \"Office Bath\".",
-          "ha_control_domains": "Only selected supported domains enter the control manifest.",
-          "max_mirrored_entities": "Safety limit for entities in the control manifest (1–200).",
-          "scene_panel": "Brilliant panel used when a scene or mode service call omits a panel.",
-          "scene_actions": "A JSON object of explicitly allowlisted scene actions keyed by panel and scene ID."
+          "mqtt_host": "Address reachable by both Home Assistant and every Brilliant panel.",
+          "mqtt_port": "Usually 1883 without TLS or 8883 with TLS.",
+          "mqtt_username": "Broker account used by the Brilliant fleet.",
+          "mqtt_password": "Broker password. It is stored securely and is never shown again.",
+          "ha_control_enabled": "Optional. Enable the constrained Home Assistant MQTT control manifest and Brilliant scene bridge before the first panel is installed. This defaults off."
+        },
+        "sections": {
+          "advanced": {
+            "name": "Advanced",
+            "data": {
+              "mqtt_tls_enabled": "Use TLS",
+              "mqtt_tls_ca": "Custom broker CA certificate"
+            },
+            "data_description": {
+              "mqtt_tls_enabled": "Enable encrypted MQTT transport.",
+              "mqtt_tls_ca": "Optional public PEM certificate chain for a private broker CA. Never paste a private key."
+            }
+          }
         }
+      },
+      "broker_validation": {
+        "title": "Validating MQTT broker"
+      },
+      "fleet_create": {
+        "title": "Creating Brilliant MQTT fleet"
       },
       "reconfigure": {
         "title": "Reconfigure panel",
@@ -107,26 +98,270 @@
         }
       }
     },
+    "progress": {
+      "broker_validation": "Checking Home Assistant MQTT readiness, broker authentication, discovery writes, and retained-message behavior."
+    },
     "error": {
       "reserved_panel": "\"mesh\" is the reserved whole-home pseudo-panel and cannot be managed.",
       "invalid_name": "Enter a name with at least one letter or digit.",
       "invalid_value": "Control characters are not allowed in this field.",
+      "config_entry_storage_unavailable": "Home Assistant could not confirm the fleet in durable storage. Check storage health and try again; no panel changes were made.",
+      "mesh_priority_exhausted": "All supported mesh priorities are already assigned. Remove an unused panel before adding another.",
+      "ha_mqtt_unavailable": "Home Assistant's MQTT integration is not ready. Install/configure MQTT, verify the broker connection, and retry.",
+      "unsupported_discovery_prefix": "The configured MQTT discovery prefix is unsupported. Restore a valid Home Assistant discovery prefix and retry.",
+      "invalid_broker_profile": "The broker settings are invalid.",
+      "broker_validation_failed": "MQTT validation failed unexpectedly. Verify the broker connection and credentials, then retry.",
+      "broker_connect_failed": "Could not connect to the MQTT broker. Verify host, port, routing, and firewall rules.",
+      "broker_tls_verification_failed": "The MQTT broker certificate could not be verified. Check the broker certificate and optional public CA chain.",
+      "broker_timeout": "The MQTT broker did not respond in time.",
+      "broker_authentication_failed": "The MQTT broker rejected these credentials.",
+      "broker_unavailable": "The MQTT broker is unavailable.",
+      "broker_connection_rejected": "The MQTT broker rejected the connection settings.",
+      "fleet_auth_failed": "The MQTT broker rejected the fleet credentials.",
+      "panel_to_ha_timeout": "No panel-to-Home Assistant validation message arrived. Confirm both systems use the same broker and that broker ACLs allow the fleet topics.",
+      "ha_to_panel_timeout": "No Home Assistant-to-panel validation message arrived. Confirm the panel can reach this broker and that broker ACLs allow the fleet topics.",
+      "discovery_write_denied": "The broker denied the MQTT discovery validation write. Update its ACLs and retry.",
+      "discovery_write_timeout": "The MQTT discovery validation write timed out. Check broker routing and ACLs.",
+      "retained_message_invalid": "The broker did not preserve the validation message correctly. Verify retained-message support.",
+      "retained_message_timeout": "Retained-message validation timed out. Verify broker retention behavior and routing.",
+      "cleanup_failed": "MQTT validation cleanup did not finish. Review broker connectivity before retrying.",
+      "operation_failed": "MQTT validation failed. Review the integration documentation and retry.",
       "cannot_connect": "SSH connection failed — check the host and the root password.",
       "cannot_read_config": "The agent is installed but its configuration could not be read. Try Reconfigure, or remove and re-add the panel.",
       "cannot_apply": "Connected, but writing the new settings to the panel failed. Check the agent and try Repair.",
       "cannot_install": "Connected, but installing the agent on the panel failed. Check the panel and try again.",
       "cannot_install_voice": "The bridge agent installed, but installing the voice satellite failed (its payload may not be downloadable yet, or the panel rejected it). Untick \"Enable voice satellite\" to finish without it, or try again.",
       "wrong_panel": "That host already runs a different Brilliant panel's agent. Check the IP — applying here would overwrite and restart the wrong panel.",
-      "host_key_changed": "The panel's SSH host key changed since it was added. If this is expected (e.g. the panel was reflashed), remove and re-add the panel to re-pin it. Otherwise it may indicate a man-in-the-middle, so do not proceed until you have confirmed the host."
+      "host_key_changed": "The panel's SSH host key changed. For a fleet panel, verify the physical replacement and use Replace physical panel for an explicit identity rebind. For a legacy entry, remove and re-add the verified panel to re-pin it. If the change is unexpected, do not continue; check the address and network for impersonation."
     },
     "abort": {
-      "already_configured": "This panel is already configured."
+      "already_configured": "A Brilliant MQTT fleet is already configured.",
+      "legacy_migration_required": "Legacy Brilliant panel entries already exist. Migrate or remove them before creating the singleton fleet.",
+      "invalid_flow_state": "The setup state changed unexpectedly. Start Brilliant MQTT setup again.",
+      "reconfigure_not_supported": "Fleet broker settings are managed through the fleet onboarding workflow; legacy panel reconfiguration is not available for this entry."
+    }
+  },
+  "config_subentries": {
+    "panel": {
+      "entry_type": "Brilliant panel",
+      "initiate_flow": {
+        "user": "Add Brilliant panel"
+      },
+      "step": {
+        "panel_connect": {
+          "title": "Connect to a Brilliant panel",
+          "description": "Enter the panel address and root password. Home Assistant first reads and verifies the panel identity; installation starts only after you review the detected panel. [Open troubleshooting]({documentation_url})",
+          "data": {
+            "host": "Panel IP address or hostname",
+            "root_password": "Panel root password"
+          },
+          "data_description": {
+            "host": "A stable address reachable from Home Assistant.",
+            "root_password": "Used only for this panel's pinned SSH connection and stored per panel."
+          }
+        },
+        "panel_confirm": {
+          "title": "Confirm Brilliant panel",
+          "description": "Detected `{hostname}` ({model}, {architecture}) with SSH fingerprint `{fingerprint}`. Name the panel to continue. Home Assistant will verify durable fleet storage before making any panel changes. [Open troubleshooting]({documentation_url})",
+          "data": {
+            "name": "Panel name"
+          },
+          "data_description": {
+            "name": "A friendly name used in Home Assistant. A stable MQTT slug is allocated automatically."
+          }
+        },
+        "panel_provision": {
+          "title": "Installing Brilliant MQTT"
+        },
+        "panel_create": {
+          "title": "Saving Brilliant panel"
+        },
+        "reconfigure": {
+          "title": "Manage Brilliant panel",
+          "description": "Choose one focused panel operation. Identity-sensitive changes are verified against the panel's pinned SSH identity before anything is saved.",
+          "menu_options": {
+            "rename": "Rename panel",
+            "address": "Change network address",
+            "repair_credentials": "Repair SSH credentials",
+            "components": "Manage installed components",
+            "overrides": "Edit feature overrides",
+            "rebind": "Replace physical panel"
+          }
+        },
+        "rename": {
+          "title": "Rename panel",
+          "description": "Change only the panel's display name. Its MQTT slug, entity identities, pinned SSH identity, and settings stay unchanged.",
+          "data": {
+            "name": "Panel name"
+          },
+          "data_description": {
+            "name": "Friendly name shown in Home Assistant. Renaming does not change MQTT topics or entity IDs."
+          }
+        },
+        "address": {
+          "title": "Change panel network address",
+          "description": "Move this panel to a new hostname or IP address. Home Assistant accepts the address only if it presents the panel's existing pinned SSH identity.",
+          "data": {
+            "host": "New panel IP address or hostname"
+          },
+          "data_description": {
+            "host": "Stable address reachable from Home Assistant. Use Replace physical panel instead if the SSH identity is different."
+          }
+        },
+        "repair_credentials": {
+          "title": "Repair panel SSH credentials",
+          "description": "Replace the stored root password for this panel. Home Assistant verifies the existing pinned SSH identity before it offers the new password to the host.",
+          "data": {
+            "root_password": "New panel root password"
+          },
+          "data_description": {
+            "root_password": "The new password is stored only after authentication succeeds and is never shown again."
+          }
+        },
+        "components": {
+          "title": "Manage installed components",
+          "description": "Component switches and selectors live with this panel's Home Assistant device so their state and failures remain observable."
+        },
+        "overrides": {
+          "title": "Edit panel feature overrides",
+          "description": "Set supported voice and certificate values before enabling their component. For an active Voice satellite, change the wake word with its selector; disable Voice or Hue CA recovery before changing another value, then enable it again. Fleet repair behavior and pinned identity are not changed.",
+          "data": {
+            "voice_wake_word": "Wake word",
+            "voice_ha_host": "Home Assistant host override",
+            "hue_ca_cert": "diyHue CA certificate"
+          },
+          "data_description": {
+            "voice_wake_word": "Wake word used on the next Voice satellite install. If Voice is active, use the panel's Wake word selector instead.",
+            "voice_ha_host": "Optional hostname=IP mapping for a panel that cannot resolve the Home Assistant hostname. Disable Voice before changing this active value; leave blank to use panel DNS.",
+            "hue_ca_cert": "Optional public PEM certificate chain for diyHue CA recovery. Disable Hue CA recovery before changing its active certificate. Never paste a private key."
+          }
+        },
+        "rebind": {
+          "title": "Replace physical panel",
+          "description": "Use this only when intentionally replacing the physical panel represented by this Home Assistant device. Home Assistant reads the replacement's SSH identity before authentication and inspects it read-only. No panel settings or stored identity are changed until you review and confirm the detected replacement.",
+          "data": {
+            "host": "Replacement panel IP address or hostname",
+            "root_password": "Replacement panel root password"
+          },
+          "data_description": {
+            "host": "Stable address of the replacement panel, reachable from Home Assistant.",
+            "root_password": "Used only after the replacement SSH identity is captured. It is never redisplayed."
+          }
+        },
+        "rebind_confirm": {
+          "title": "Confirm physical panel replacement",
+          "description": "Detected replacement `{hostname}` ({model}, {architecture}) with SSH fingerprint `{new_fingerprint}`. The currently pinned fingerprint is `{old_fingerprint}`. Confirm only if you intentionally replaced this physical panel. This replaces the pinned SSH identity while preserving the logical panel's MQTT slug, entities, name, components, and feature settings.",
+          "data": {
+            "confirm": "I confirm this is the intended replacement panel"
+          },
+          "data_description": {
+            "confirm": "Home Assistant rechecks the replacement identity immediately before saving. Leave this off to make no changes."
+          }
+        }
+      },
+      "progress": {
+        "panel_provision": "Inspecting, staging, validating, activating, and health-checking the panel. If any step fails, the prior panel state is restored automatically."
+      },
+      "error": {
+        "invalid_value": "Enter a valid value without control characters.",
+        "invalid_name": "Enter a name with at least one letter or digit.",
+        "reserved_panel": "\"mesh\" is reserved and cannot be used as a panel name.",
+        "mesh_priority_exhausted": "All supported mesh priorities are already assigned. Remove an unused panel before adding another.",
+        "config_entry_storage_unavailable": "Home Assistant could not confirm the fleet in durable storage. Check storage health and retry; no panel changes were made.",
+        "cannot_connect": "Could not connect to the panel over SSH. Verify its address, network access, and root password.",
+        "invalid_host": "Enter a valid panel hostname or IP address without spaces or wildcard characters.",
+        "invalid_port": "Enter a valid SSH port from 1 through 65535.",
+        "host_unreachable": "The panel did not answer the SSH identity check. Verify its address, network access, and SSH service.",
+        "host_key_missing": "The panel did not present an SSH host key. Verify that SSH is enabled and retry.",
+        "host_key_malformed": "The panel presented an invalid SSH host key. Verify the panel firmware and SSH configuration before retrying.",
+        "host_key_unsupported": "The panel uses an unsupported SSH host-key algorithm. Update its SSH configuration before retrying.",
+        "host_key_fingerprint_invalid": "The panel SSH fingerprint could not be verified. Check the panel address and retry.",
+        "host_key_changed": "The panel SSH identity changed during the operation. No settings were saved. Check the address; if this is an intended replacement, restart Replace physical panel and explicitly review the new fingerprint. If unexpected, do not continue.",
+        "pinned_host_key_required": "The saved panel identity is missing. Reconfigure or re-add the panel before continuing.",
+        "panel_identity_mismatch": "This address presents a different SSH identity than the one pinned for this panel. Check the address. If you intentionally replaced the physical panel, use Replace physical panel and review both fingerprints.",
+        "rebind_identity_unchanged": "The proposed replacement presents the panel's current SSH identity. Use Change network address or Repair SSH credentials instead.",
+        "rebind_identity_changed": "The replacement SSH identity changed after the confirmation screen opened. No settings were changed. Check the address and start Replace physical panel again.",
+        "confirmation_required": "Explicitly confirm the detected replacement identity to continue.",
+        "panel_authentication_failed": "The panel rejected the root password.",
+        "firmware_unknown": "The panel firmware could not be identified.",
+        "inspection_failed": "The panel could not be inspected safely.",
+        "inspection_timeout": "Panel inspection timed out. Verify the panel is responsive and retry.",
+        "inspection_output_invalid": "The panel returned invalid inspection data.",
+        "insufficient_memory": "The panel does not have enough available memory for installation.",
+        "insufficient_storage": "The panel does not have enough available storage for installation.",
+        "unsupported_architecture": "This panel architecture is not supported.",
+        "unsupported_python": "This panel's Python runtime is not supported.",
+        "unsupported_panel_toolchain": "This panel is missing a required installation tool.",
+        "duplicate_panel": "This physical panel is already configured.",
+        "invalid_panel_install_request": "The panel installation request is invalid. Start Add Brilliant panel again.",
+        "invalid_provisioning_dependency": "A required provisioning dependency is unavailable. Start Add Brilliant panel again.",
+        "identity_failed": "The panel SSH identity could not be verified.",
+        "snapshot_failed": "The current panel state could not be captured safely.",
+        "release_prepare_failed": "The panel release could not be prepared.",
+        "stage_failed": "The panel release could not be staged.",
+        "preflight_failed": "The staged panel could not validate MQTT communication.",
+        "ha_mqtt_unavailable": "Home Assistant's MQTT integration is unavailable. Reconnect MQTT, then retry. The panel installation was rolled back.",
+        "unsupported_discovery_prefix": "The Home Assistant MQTT discovery prefix is unsupported. Restore the `homeassistant` discovery prefix and retry. The panel installation was rolled back.",
+        "invalid_broker_profile": "The fleet broker settings are invalid.",
+        "panel_settings_invalid": "The staged panel MQTT settings are invalid. Review the fleet broker and TLS settings, then retry. The panel installation was rolled back.",
+        "broker_connect_failed": "The panel could not connect to the MQTT broker.",
+        "broker_tls_verification_failed": "The panel could not verify the MQTT broker certificate.",
+        "broker_timeout": "The MQTT broker did not respond to the panel in time.",
+        "broker_authentication_failed": "The MQTT broker rejected the panel credentials.",
+        "broker_unavailable": "The MQTT broker is unavailable.",
+        "broker_connection_rejected": "The MQTT broker rejected the panel connection.",
+        "fleet_auth_failed": "The MQTT broker rejected the fleet credentials.",
+        "panel_to_ha_timeout": "No panel-to-Home Assistant validation message arrived. Check broker routing and ACLs.",
+        "ha_to_panel_timeout": "No Home Assistant-to-panel validation message arrived. Check broker routing and ACLs.",
+        "discovery_write_denied": "The broker denied the MQTT discovery validation write.",
+        "discovery_write_timeout": "The MQTT discovery validation write timed out.",
+        "retained_message_invalid": "The broker did not preserve the validation message correctly.",
+        "retained_message_timeout": "Retained-message validation timed out.",
+        "cleanup_failed": "Provisioning cleanup did not finish automatically.",
+        "operation_failed": "Panel MQTT validation failed unexpectedly. Verify broker connectivity and ACLs, then retry. The panel installation was rolled back.",
+        "activation_failed": "The staged release could not be activated.",
+        "health_subscribe_failed": "Home Assistant could not subscribe for panel health confirmation.",
+        "health_failed": "The new panel release did not pass its health check and was rolled back.",
+        "journal_failed": "Home Assistant could not persist the provisioning safety journal.",
+        "progress_failed": "Home Assistant could not update provisioning progress safely.",
+        "commit_failed": "The installed panel could not be committed to durable Home Assistant storage.",
+        "rollback_failed": "Automatic rollback did not finish. Follow the provisioning recovery instructions before retrying.",
+        "recovery_failed": "A prior provisioning transaction could not be recovered automatically.",
+        "transaction_in_progress": "Another panel provisioning transaction is still being recovered.",
+        "provisioning_failed": "Panel provisioning failed. Review the integration logs and recovery instructions before retrying."
+      },
+      "abort": {
+        "already_configured": "Panel `{panel_name}` is already configured.",
+        "invalid_parent": "The Brilliant MQTT fleet is unavailable or no longer valid.",
+        "invalid_flow_state": "The panel operation state changed unexpectedly. Close this flow and start the panel action again.",
+        "parent_changed": "The fleet or panel changed while this operation was open. No uncommitted settings were kept; reopen the panel action.",
+        "panel_slug_conflict": "Another panel claimed slug `{panel}` while onboarding was in progress. The new panel was rolled back.",
+        "mesh_priority_conflict": "Another panel claimed mesh priority `{mesh_priority}` while onboarding was in progress. The new panel was rolled back.",
+        "recovery_failed": "The panel could not be rolled back automatically. Follow the provisioning recovery instructions before retrying.",
+        "reconfigure_successful": "The panel settings were updated successfully.",
+        "manage_components_with_panel_entities": "Manage installed components from this panel's Home Assistant device controls. Use its switches, selectors, and repair action so progress and failures stay visible.",
+        "feature_override_change_requires_agent_rollout": "This override is already in use by an active panel component. Nothing was changed. Change an active wake word with the panel's Wake word selector, or disable the affected Voice satellite or Hue CA recovery component, edit its override, and enable it again.",
+        "runtime_unavailable": "The Brilliant MQTT fleet manager is not running. Reload the integration, confirm the fleet is healthy, and retry.",
+        "rebind_blocked_by_panel_onboarding": "Another panel onboarding or recovery transaction is active, or Home Assistant could not prove its safety journal is readable and empty. Nothing was changed. Finish or recover that operation, repair storage if needed, then retry Replace physical panel.",
+        "config_entry_storage_unavailable": "Home Assistant could not prove the replacement identity or an exact restoration in durable storage. Stop panel operations, repair Home Assistant storage, and follow the fleet repair issue before retrying.",
+        "rebind_identity_changed": "The replacement SSH identity changed after confirmation. Nothing was accepted. Verify the address and start Replace physical panel again to review the current fingerprint.",
+        "cannot_connect": "The replacement stopped answering during the final SSH identity check. Nothing was accepted. Verify its address, network access, and SSH service, then restart Replace physical panel.",
+        "rebind_failed": "The replacement panel could not be bound safely. Nothing was accepted unless Home Assistant shows a fleet storage repair issue; resolve any such issue before retrying."
+      }
     }
   },
   "options": {
     "step": {
       "init": {
-        "title": "Panel manager behavior",
+        "title": "Brilliant MQTT settings",
+        "description": "Manage fleet-owned MQTT, Home Assistant control, scene, and repair settings. Legacy panel entries show their supported behavior fields here.",
+        "menu_options": {
+          "broker": "MQTT broker",
+          "ha_control": "Home Assistant control",
+          "scenes": "Scenes and modes",
+          "fleet_defaults": "Fleet repair defaults",
+          "advanced": "Advanced"
+        },
         "data": {
           "auto_repair": "Automatically repair the bridge after an outage",
           "offline_grace_minutes": "Minutes offline before acting",
@@ -136,7 +371,152 @@
         "data_description": {
           "trust_host_key_changes": "When on, repair auto-trusts a changed SSH host key so a firmware update that rotates the panel's keys recovers hands-off. This offers the root password to whatever host answers at the panel's address, so only enable on a trusted/isolated network (e.g. a firewalled IoT VLAN). Each automatic re-pin fires a host_key_repinned event you can alert on. Default off: a changed key instead surfaces repair_failed (host_key_changed) and asks you to Reconfigure to re-pin."
         }
+      },
+      "broker": {
+        "title": "Choose MQTT broker guidance",
+        "description": "Select the broker setup you use. The choice changes onboarding guidance only; both paths use the same validated MQTT transport.",
+        "menu_options": {
+          "official_mosquitto": "Home Assistant Mosquitto add-on (recommended)",
+          "existing_broker": "Existing or external MQTT broker (fully supported)"
+        }
+      },
+      "official_mosquitto": {
+        "title": "Home Assistant Mosquitto add-on (recommended)",
+        "description": "Use the official `core_mosquitto` add-on after installing and starting it and creating dedicated Brilliant broker credentials."
+      },
+      "existing_broker": {
+        "title": "Existing or external MQTT broker",
+        "description": "Use any broker reachable by Home Assistant and every Brilliant panel. The same connectivity, authentication, ACL, discovery, and retained-message checks validate this fully supported path."
+      },
+      "broker_profile": {
+        "title": "Validate MQTT broker settings",
+        "description": "The official `core_mosquitto` add-on is the recommended Home Assistant default, but it is not required. An existing or externally hosted broker is fully supported. Broker changes are validated before being saved; installed panels require the guided rollout described in the MQTT broker setup documentation. [Open troubleshooting]({documentation_url})",
+        "data": {
+          "mqtt_host": "Broker host",
+          "mqtt_port": "Broker port",
+          "mqtt_username": "Broker username",
+          "mqtt_password": "Broker password"
+        },
+        "data_description": {
+          "mqtt_host": "Address reachable by Home Assistant and every Brilliant panel.",
+          "mqtt_port": "Usually 1883 without TLS or 8883 with TLS.",
+          "mqtt_username": "Dedicated MQTT account used by the Brilliant fleet.",
+          "mqtt_password": "Leave the masked value unchanged to keep the stored password, or enter a replacement password."
+        },
+        "sections": {
+          "advanced": {
+            "name": "Advanced",
+            "data": {
+              "mqtt_tls_enabled": "Use TLS",
+              "mqtt_tls_ca": "Custom broker CA certificate"
+            },
+            "data_description": {
+              "mqtt_tls_enabled": "Encrypt MQTT transport and verify the broker certificate.",
+              "mqtt_tls_ca": "Optional public PEM certificate chain for a private broker CA. Never paste a private key."
+            }
+          }
+        }
+      },
+      "broker_validation": {
+        "title": "Validating MQTT broker",
+        "description": "Home Assistant is checking MQTT readiness, fleet authentication, bidirectional traffic, discovery writes, retained messages, and cleanup before saving anything."
+      },
+      "broker_commit": {
+        "title": "Saving MQTT broker settings",
+        "description": "Home Assistant is rechecking fleet ownership and the validated broker snapshot before the durable update."
+      },
+      "ha_control": {
+        "title": "Home Assistant control",
+        "description": "Configure the constrained MQTT control manifest once for the fleet. Changing whether control is enabled after panels are installed requires a guided agent rollout; the other fields update live.",
+        "data": {
+          "ha_control_enabled": "Enable Home Assistant control",
+          "ha_control_label": "Entity label",
+          "room_overrides": "Room overrides (JSON)",
+          "ha_control_domains": "Entity domains",
+          "max_mirrored_entities": "Maximum mirrored entities"
+        },
+        "data_description": {
+          "ha_control_enabled": "Publish the constrained local MQTT control manifest. The legacy on-panel Home Assistant mirror remains disabled.",
+          "ha_control_label": "Home Assistant label selecting entities for the fleet control manifest.",
+          "room_overrides": "A JSON object mapping Home Assistant area names to Brilliant room names, for example: \"Office\" mapped to \"Office Bath\".",
+          "ha_control_domains": "Only entities in these supported domains can enter the control manifest.",
+          "max_mirrored_entities": "Fleet safety limit from 1 through 200 entities."
+        }
+      },
+      "scenes": {
+        "title": "Scenes and modes",
+        "description": "Choose the current panel that owns default scene requests and maintain the explicit scene-action allowlist. At least one panel must be configured.",
+        "data": {
+          "scene_panel": "Default scene panel",
+          "scene_actions": "Scene actions (JSON)"
+        },
+        "data_description": {
+          "scene_panel": "Panel used when a scene or mode service call does not specify one. The saved owner is its stable Home Assistant panel ID.",
+          "scene_actions": "JSON object of explicitly allowed actions keyed by immutable panel MQTT slug and scene ID."
+        }
+      },
+      "fleet_defaults": {
+        "title": "Fleet repair defaults",
+        "description": "Set the repair timing defaults inherited by panels that do not have an explicit per-panel override. SSH host-key trust is never changed here.",
+        "data": {
+          "auto_repair": "Automatically repair after an outage",
+          "offline_grace_minutes": "Minutes offline before repair",
+          "repair_cooldown_minutes": "Minimum minutes between repairs"
+        },
+        "data_description": {
+          "auto_repair": "Allow the manager to repair an unhealthy panel automatically after its offline grace period.",
+          "offline_grace_minutes": "Wait from 2 through 120 minutes before treating a panel outage as actionable.",
+          "repair_cooldown_minutes": "Wait from 5 through 1440 minutes between automatic repair attempts."
+        }
+      },
+      "advanced": {
+        "title": "Advanced fleet operations",
+        "description": "These operations can affect panel-wide behavior and require extra safety checks.",
+        "menu_options": {
+          "mesh_priorities": "Mesh priorities"
+        }
+      },
+      "mesh_priorities": {
+        "title": "Mesh priority rollout required",
+        "description": "Mesh priority changes alter on-panel agent configuration and are available only through a journaled rollout. Direct mutation is intentionally blocked."
       }
+    },
+    "progress": {
+      "broker_validation": "Validating Home Assistant MQTT readiness, broker authentication, bidirectional fleet topics, discovery writes, retained messages, and cleanup."
+    },
+    "error": {
+      "invalid_value": "Enter a valid value in the documented format.",
+      "invalid_broker_profile": "The MQTT broker profile is invalid. Review every required field and the MQTT broker setup guide, then retry.",
+      "broker_validation_failed": "MQTT validation failed unexpectedly. Check the broker connection, credentials, and Home Assistant MQTT status, then retry.",
+      "broker_connect_failed": "Home Assistant could not connect to the MQTT broker. Check the host, port, routing, DNS, and firewall rules, then retry.",
+      "panel_settings_invalid": "The staged panel MQTT settings are invalid. Review the broker host, TLS, and fleet settings before retrying.",
+      "broker_tls_verification_failed": "The MQTT broker certificate could not be verified. Check its hostname, validity, trust chain, and optional public CA certificate before retrying.",
+      "broker_timeout": "The MQTT broker did not respond in time. Check broker availability and network routing, then retry.",
+      "broker_authentication_failed": "The MQTT broker rejected these credentials. Check the dedicated fleet username, password, and broker authentication policy before retrying.",
+      "broker_unavailable": "The MQTT broker is unavailable. Check that it is running and reachable, then retry.",
+      "broker_connection_rejected": "The MQTT broker rejected the connection settings. Review the listener port, TLS mode, and broker policy before retrying.",
+      "operation_failed": "MQTT validation failed. Review the MQTT broker setup and troubleshooting documentation, then retry.",
+      "ha_mqtt_unavailable": "Home Assistant's MQTT integration is not ready. Check its broker connection and reload MQTT before retrying.",
+      "unsupported_discovery_prefix": "The configured Home Assistant MQTT discovery prefix is unsupported. Restore the supported `homeassistant` prefix and retry.",
+      "fleet_auth_failed": "The MQTT broker rejected the Brilliant fleet credentials. Check the username, password, and ACL policy before retrying.",
+      "panel_to_ha_timeout": "No panel-to-Home Assistant validation message arrived. Confirm both systems use this broker and check that ACLs allow fleet publish and subscribe topics.",
+      "ha_to_panel_timeout": "No Home Assistant-to-panel validation message arrived. Confirm the panel can reach this broker and check that ACLs allow fleet publish and subscribe topics.",
+      "discovery_write_denied": "The broker denied the MQTT discovery validation write. Review its ACLs for the Home Assistant discovery prefix, then retry.",
+      "discovery_write_timeout": "The MQTT discovery validation write timed out. Check broker routing, listener health, and ACL behavior, then retry.",
+      "retained_message_invalid": "The broker did not preserve the validation message correctly. Check that retained messages are enabled and not rewritten, then retry.",
+      "retained_message_timeout": "Retained-message validation timed out. Check broker persistence, routing, and ACL behavior, then retry.",
+      "cleanup_failed": "MQTT validation cleanup could not be confirmed. Check broker availability and ACLs before retrying."
+    },
+    "abort": {
+      "invalid_parent": "The Brilliant MQTT fleet is unavailable or no longer valid. Reload the integration and open its settings again.",
+      "invalid_flow_state": "The settings flow lost its validated state. Open Brilliant MQTT settings and retry.",
+      "parent_changed": "Fleet settings changed while this form was open. Nothing was saved; open the relevant settings page again.",
+      "broker_change_requires_guided_flow": "Installed panels still depend on the current MQTT transport. Nothing was changed. Open the MQTT broker rollout guide before moving the fleet to a different host, port, credentials, or TLS profile.",
+      "broker_change_blocked_by_panel_onboarding": "A panel onboarding or recovery transaction is active or could not be read safely. Nothing was changed. Finish or recover Add Brilliant panel, then retry the broker update.",
+      "reconfigure_successful": "The Brilliant MQTT fleet settings were updated successfully.",
+      "ha_control_change_requires_agent_rollout": "Changing whether Home Assistant control is enabled also changes on-panel agent configuration. Nothing was changed. Check the guided agent rollout documentation.",
+      "no_panels_configured": "Add at least one Brilliant panel before choosing a default scene panel.",
+      "mesh_priority_change_requires_agent_rollout": "Changing mesh priorities requires a journaled on-panel agent rollout. Nothing was changed. Check the advanced rollout documentation."
     }
   },
   "services": {
@@ -154,15 +534,15 @@
     },
     "reboot": {
       "name": "Reboot panel",
-      "description": "Capture a diagnostics bundle over SSH, then reboot the panel. The panel's logs are volatile (lost on reboot), so diagnostics are always captured first.",
+      "description": "Optionally capture a secret-safe diagnostics summary over SSH, then reboot the panel. When Capture diagnostics is enabled, typed diagnostic counts are saved before the panel's volatile logs disappear; raw log text is not saved.",
       "fields": {
         "collect_diagnostics": {
           "name": "Capture diagnostics",
-          "description": "Capture a diagnostics bundle before rebooting (saved under the config directory)."
+          "description": "Capture a secret-safe diagnostics summary before rebooting (saved under the config directory without raw log text)."
         },
         "journal_lines": {
           "name": "Journal lines",
-          "description": "How many current-boot journal lines to capture."
+          "description": "How many current-boot journal lines to scan for typed diagnostic counts; raw lines are not saved."
         }
       }
     },
@@ -253,7 +633,7 @@
       "message": "A repair or update is already in progress for this panel."
     },
     "host_key_changed": {
-      "message": "The panel SSH host key changed. If this is expected (e.g. a reflash), remove and re-add the panel to re-pin it, or enable \"Trust host-key changes\" in options for hands-off repair. If unexpected, investigate before proceeding."
+      "message": "The panel SSH host key changed. For a fleet panel, verify the physical replacement and use Replace physical panel for an explicit identity rebind. Legacy entries may be removed and re-added after verification, or may use \"Trust host-key changes\" only on a trusted isolated network. If the change is unexpected, investigate the address and network before proceeding."
     },
     "update_failed": {
       "message": "Agent update failed: {error}"

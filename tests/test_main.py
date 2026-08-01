@@ -17,13 +17,15 @@ from pathlib import Path
 import pytest
 
 import brilliant_mqtt.__main__ as main_mod
+from brilliant_mqtt import __version__
 from brilliant_mqtt.__main__ import _is_panel_device, _is_reconnect_storm, _make_desired
-from brilliant_mqtt.bridge import Bridge
+from brilliant_mqtt.bridge import Bridge, HotPollReadTimeout
 from brilliant_mqtt.config import Settings
 from brilliant_mqtt.desired_state import DesiredState
 from brilliant_mqtt.ha_control_protocol import mode_command_topic, scene_command_topic
 from brilliant_mqtt.mesh_leader import MESH_LEADER_TOPIC, MeshLeader
 from brilliant_mqtt.model import BrilliantDevice, DeviceKind, Variable
+from brilliant_mqtt.retained_topics import RetainedLedgerError
 from tests.fakes import FakeBus, FakeClock, FakeMqtt
 
 HB = 10.0
@@ -273,6 +275,64 @@ class TestProcessLifetimeDesiredState:
         assert seen[0] is not seen[1]  # faceplate and mesh stores stay separate
 
 
+class TestSupervisorBackoff:
+    async def test_retained_ledger_failure_uses_sixty_second_backoff(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        session_calls = 0
+        sleeps: list[float] = []
+
+        async def failing_session(
+            settings: Settings,
+            desired_panel: DesiredState | None,
+            desired_mesh: DesiredState | None,
+        ) -> None:
+            del settings, desired_panel, desired_mesh
+            nonlocal session_calls
+            session_calls += 1
+            raise RetainedLedgerError("persistent ledger failure")
+
+        async def cancel_on_sleep(delay: float) -> None:
+            sleeps.append(delay)
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(main_mod, "_run_session", failing_session)
+        monkeypatch.setattr(asyncio, "sleep", cancel_on_sleep)
+
+        with pytest.raises(asyncio.CancelledError):
+            await main_mod.run(_desired_settings(motion_reconcile_enabled=False))
+
+        assert session_calls == 1
+        assert sleeps == [60.0]
+
+    async def test_transient_session_failure_keeps_five_second_backoff(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        sleeps: list[float] = []
+
+        async def failing_session(
+            settings: Settings,
+            desired_panel: DesiredState | None,
+            desired_mesh: DesiredState | None,
+        ) -> None:
+            del settings, desired_panel, desired_mesh
+            raise RuntimeError("transient session failure")
+
+        async def cancel_on_sleep(delay: float) -> None:
+            sleeps.append(delay)
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(main_mod, "_run_session", failing_session)
+        monkeypatch.setattr(asyncio, "sleep", cancel_on_sleep)
+
+        with pytest.raises(asyncio.CancelledError):
+            await main_mod.run(_desired_settings(motion_reconcile_enabled=False))
+
+        assert sleeps == [5]
+
+
 def _scene_settings(enabled: bool, watermark_file: str) -> Settings:
     """Build settings for scene session tests before and after the fields exist."""
     settings = _settings()
@@ -308,12 +368,29 @@ class _SessionMqtt:
     def __init__(self, events: list[str]) -> None:
         self.events = events
         self.subscriptions: list[str] = []
+        self.published: list[tuple[str, str, bool, int]] = []
+        self.connect_error: Exception | None = None
+        self.publish_error: Exception | None = None
 
     async def connect(self) -> None:
         self.events.append("mqtt_connect")
+        if self.connect_error is not None:
+            raise self.connect_error
 
     async def disconnect(self) -> None:
         self.events.append("mqtt_disconnect")
+
+    async def publish(
+        self,
+        topic: str,
+        payload: str,
+        retain: bool = False,
+        qos: int = 0,
+    ) -> None:
+        self.events.append("mqtt_publish")
+        if self.publish_error is not None:
+            raise self.publish_error
+        self.published.append((topic, payload, retain, qos))
 
     async def subscribe(self, topic: str) -> None:
         self.subscriptions.append(topic)
@@ -326,6 +403,8 @@ class _SessionHarness:
         *,
         scene_start_error: RuntimeError | None = None,
         scene_shutdown_error: RuntimeError | None = None,
+        bridge_reconcile_error: Exception | None = None,
+        bridge_poll_effects: dict[str, list[BaseException | None]] | None = None,
     ) -> None:
         self.events: list[str] = []
         self.ready = asyncio.Event()
@@ -333,6 +412,10 @@ class _SessionHarness:
         self.mqtt = _SessionMqtt(self.events)
         self.scene_start_error = scene_start_error
         self.scene_shutdown_error = scene_shutdown_error
+        self.bridge_reconcile_error = bridge_reconcile_error
+        self.bridge_poll_effects = {
+            scope: list(effects) for scope, effects in (bridge_poll_effects or {}).items()
+        }
         self.scene_instances: list[object] = []
         self.scene_bus: object | None = None
         self.scene_mqtt: object | None = None
@@ -344,18 +427,38 @@ class _SessionHarness:
 
         class SessionBridge:
             def __init__(self, *args: object, **kwargs: object) -> None:
-                del self, args, kwargs
-                harness.events.append("panel_bridge_construct")
+                del kwargs
+                self._scope = "mesh" if args[2] == "mesh" else "panel"
+                harness.events.append(f"{self._scope}_bridge_construct")
 
             async def reconcile(self) -> None:
-                harness.events.append("panel_reconcile")
-                harness.ready.set()
+                harness.events.append(f"{self._scope}_reconcile")
+                if self._scope == "panel" and harness.bridge_reconcile_error is not None:
+                    raise harness.bridge_reconcile_error
+                if self._scope == "panel":
+                    harness.ready.set()
 
             async def poll_once(self) -> None:
-                return
+                harness.events.append(f"{self._scope}_poll")
+                effects = harness.bridge_poll_effects.get(self._scope)
+                if effects:
+                    effect = effects.pop(0)
+                    if effect is not None:
+                        raise effect
 
             async def withdraw(self) -> None:
                 return
+
+        class SessionLeader:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                del args, kwargs
+                self.is_leader = True
+
+            async def start(self) -> None:
+                harness.events.append("leader_start")
+
+            async def tick(self) -> None:
+                harness.events.append("leader_tick")
 
         class SessionSceneBridge:
             def __init__(
@@ -397,6 +500,7 @@ class _SessionHarness:
         monkeypatch.setattr(main_mod, "AioMqttAdapter", mqtt_factory)
         monkeypatch.setattr(main_mod, "RpcBusAdapter", bus_factory)
         monkeypatch.setattr(main_mod, "Bridge", SessionBridge)
+        monkeypatch.setattr(main_mod, "MeshLeader", SessionLeader)
         monkeypatch.setattr(main_mod, "SceneBridge", SessionSceneBridge, raising=False)
 
 
@@ -406,6 +510,135 @@ async def _cancel_ready_session(harness: _SessionHarness, settings: Settings) ->
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+def _hot_poll_settings(*, mesh: bool = False, resync_seconds: int = 3_600) -> Settings:
+    settings = _settings()
+    object.__setattr__(settings, "hot_poll_seconds", 0.001)
+    object.__setattr__(settings, "bus_stale_seconds", 0)
+    object.__setattr__(settings, "resync_seconds", resync_seconds)
+    object.__setattr__(settings, "mesh_priority", 1 if mesh else 0)
+    return settings
+
+
+class TestHotPollReadTimeoutPolicy:
+    async def test_first_timeout_gets_one_grace_and_skips_resync(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        timeout = HotPollReadTimeout("private panel detail")
+        harness = _SessionHarness(
+            monkeypatch,
+            bridge_poll_effects={"panel": [timeout, asyncio.CancelledError()]},
+        )
+
+        with caplog.at_level("WARNING", logger="brilliant_mqtt.__main__"):
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(
+                    main_mod._run_session(
+                        _hot_poll_settings(resync_seconds=0),
+                        None,
+                        None,
+                    ),
+                    timeout=1,
+                )
+
+        assert harness.events.count("panel_poll") == 2
+        assert harness.events.count("panel_reconcile") == 1
+        assert (
+            caplog.messages.count(
+                "hot poll bus read timed out; retrying once before rebuilding session"
+            )
+            == 1
+        )
+        assert "private panel detail" not in caplog.text
+
+    async def test_second_consecutive_combined_cycle_timeout_rebuilds_session(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        first = HotPollReadTimeout("first")
+        second = HotPollReadTimeout("second")
+        harness = _SessionHarness(
+            monkeypatch,
+            bridge_poll_effects={
+                "panel": [None, None],
+                "mesh": [first, second],
+            },
+        )
+
+        with pytest.raises(HotPollReadTimeout) as raised:
+            await asyncio.wait_for(
+                main_mod._run_session(_hot_poll_settings(mesh=True), None, None),
+                timeout=1,
+            )
+
+        assert raised.value is second
+        poll_events = [event for event in harness.events if event.endswith("_poll")]
+        assert poll_events == ["panel_poll", "mesh_poll", "panel_poll", "mesh_poll"]
+        assert harness.events[-2:] == ["bus_shutdown", "mqtt_disconnect"]
+
+    async def test_full_combined_cycle_success_resets_timeout_grace(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        harness = _SessionHarness(
+            monkeypatch,
+            bridge_poll_effects={
+                "panel": [None, None, None, asyncio.CancelledError()],
+                "mesh": [
+                    HotPollReadTimeout("first"),
+                    None,
+                    HotPollReadTimeout("after success"),
+                ],
+            },
+        )
+
+        with caplog.at_level("WARNING", logger="brilliant_mqtt.__main__"):
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(
+                    main_mod._run_session(_hot_poll_settings(mesh=True), None, None),
+                    timeout=1,
+                )
+
+        poll_events = [event for event in harness.events if event.endswith("_poll")]
+        assert poll_events == [
+            "panel_poll",
+            "mesh_poll",
+            "panel_poll",
+            "mesh_poll",
+            "panel_poll",
+            "mesh_poll",
+            "panel_poll",
+        ]
+        assert (
+            caplog.messages.count(
+                "hot poll bus read timed out; retrying once before rebuilding session"
+            )
+            == 2
+        )
+
+    async def test_non_timeout_poll_failure_rebuilds_immediately(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        failure = RuntimeError("bus session broke")
+        harness = _SessionHarness(
+            monkeypatch,
+            bridge_poll_effects={"panel": [failure]},
+        )
+
+        with pytest.raises(RuntimeError) as raised:
+            await asyncio.wait_for(
+                main_mod._run_session(_hot_poll_settings(), None, None),
+                timeout=1,
+            )
+
+        assert raised.value is failure
+        assert harness.events.count("panel_poll") == 1
+        assert harness.events[-2:] == ["bus_shutdown", "mqtt_disconnect"]
 
 
 class TestSceneBridgeSessionWiring:
@@ -483,3 +716,88 @@ class TestSceneBridgeSessionWiring:
             "bus_shutdown",
             "mqtt_disconnect",
         ]
+
+
+class TestRetainedLedgerDegradedDiagnostic:
+    async def test_load_failure_publishes_retained_diagnostic_then_preserves_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ledger_error = RetainedLedgerError("invalid retained ledger")
+
+        class FailingLedger:
+            def __init__(self, panel_slug: str, path: Path) -> None:
+                del self, panel_slug, path
+
+            async def async_load(self) -> None:
+                raise ledger_error
+
+        monkeypatch.setattr(main_mod, "RetainedTopicLedger", FailingLedger)
+        harness = _SessionHarness(monkeypatch)
+
+        with pytest.raises(RetainedLedgerError) as raised:
+            await main_mod._run_session(_settings(), None, None)
+
+        assert raised.value is ledger_error
+        assert harness.mqtt.published == [
+            (
+                "brilliant/office/bridge",
+                json.dumps(
+                    {
+                        "agent_version": __version__,
+                        "degraded": "retained_ledger",
+                    },
+                    sort_keys=True,
+                ),
+                True,
+                1,
+            )
+        ]
+        assert harness.events == [
+            "mqtt_construct",
+            "bus_construct",
+            "mqtt_connect",
+            "mqtt_publish",
+            "bus_shutdown",
+            "mqtt_disconnect",
+        ]
+
+    async def test_runtime_failure_uses_existing_connection_for_diagnostic(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ledger_error = RetainedLedgerError("could not persist retained ledger")
+        harness = _SessionHarness(
+            monkeypatch,
+            bridge_reconcile_error=ledger_error,
+        )
+        with pytest.raises(RetainedLedgerError) as raised:
+            await main_mod._run_session(_settings(), None, None)
+
+        assert raised.value is ledger_error
+        assert harness.events.count("mqtt_connect") == 1
+        assert harness.mqtt.published[0][0] == "brilliant/office/bridge"
+        assert harness.mqtt.published[0][2:] == (True, 1)
+        assert harness.events[-2:] == ["bus_shutdown", "mqtt_disconnect"]
+
+    @pytest.mark.parametrize("failure_point", ["connect", "publish"])
+    async def test_diagnostic_failure_does_not_replace_ledger_error(
+        self, monkeypatch: pytest.MonkeyPatch, failure_point: str
+    ) -> None:
+        ledger_error = RetainedLedgerError("invalid retained ledger")
+
+        class FailingLedger:
+            def __init__(self, panel_slug: str, path: Path) -> None:
+                del self, panel_slug, path
+
+            async def async_load(self) -> None:
+                raise ledger_error
+
+        monkeypatch.setattr(main_mod, "RetainedTopicLedger", FailingLedger)
+        harness = _SessionHarness(monkeypatch)
+        failure = RuntimeError(f"diagnostic {failure_point} failed")
+        setattr(harness.mqtt, f"{failure_point}_error", failure)
+
+        with pytest.raises(RetainedLedgerError) as raised:
+            await main_mod._run_session(_settings(), None, None)
+
+        assert raised.value is ledger_error
+        assert harness.events[-2:] == ["bus_shutdown", "mqtt_disconnect"]

@@ -12,6 +12,7 @@ from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from . import BrilliantMqttConfigEntry
 from .entity import BrilliantPanelEntity
+from .manager import PanelManager
 
 # Push-only entities (refreshed via the manager's dispatcher signal), so there is
 # nothing to rate-limit — there are no outbound polls to serialize.
@@ -23,7 +24,12 @@ async def async_setup_entry(
     entry: BrilliantMqttConfigEntry,
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    async_add_entities([BridgeHealthSensor(entry)])
+    for manager in entry.runtime_data.panels.values():
+        entities = [BridgeHealthSensor(manager)]
+        if (subentry_id := manager.store.subentry_id) is None:
+            async_add_entities(entities)
+        else:
+            async_add_entities(entities, config_subentry_id=subentry_id)
 
 
 class BridgeHealthSensor(BrilliantPanelEntity, BinarySensorEntity):
@@ -31,9 +37,9 @@ class BridgeHealthSensor(BrilliantPanelEntity, BinarySensorEntity):
     _attr_entity_category = EntityCategory.DIAGNOSTIC
     _attr_translation_key = "bridge_health"
 
-    def __init__(self, entry: BrilliantMqttConfigEntry) -> None:
-        super().__init__(entry.runtime_data)
-        self._attr_unique_id = f"{entry.entry_id}_bridge_health"
+    def __init__(self, manager: PanelManager) -> None:
+        super().__init__(manager)
+        self._attr_unique_id = f"{manager.store.management_id}_bridge_health"
 
     @property
     def is_on(self) -> bool:

@@ -1,0 +1,8 @@
+user brilliant_device
+topic readwrite brilliant/#
+
+user homeassistant
+topic readwrite brilliant/#
+topic read homeassistant/#
+topic write homeassistant/status
+topic write homeassistant/brilliant_mqtt_setup/+/probe

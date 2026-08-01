@@ -4,9 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import shutil
-from collections.abc import Awaitable, Callable, Iterator, Mapping
+from collections.abc import Iterator
 from dataclasses import dataclass, field
-from dataclasses import replace as _dc_replace
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -16,15 +15,9 @@ import pytest
 from homeassistant.core import HomeAssistant
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.brilliant_mqtt import components as _components
-from custom_components.brilliant_mqtt import config_flow as _config_flow
-from custom_components.brilliant_mqtt.config_flow import _PanelProbe
 from custom_components.brilliant_mqtt.const import (
     COMPONENT_BRIDGE,
-    COMPONENT_BUS_WATCHDOG,
-    COMPONENT_HA_MIRROR,
     COMPONENT_VOICE,
-    COMPONENT_WIFI_WATCHDOG,
     CONF_COMPONENTS,
     CONF_HOST,
     CONF_MESH_PRIORITY,
@@ -39,12 +32,11 @@ from custom_components.brilliant_mqtt.const import (
     DATA_SSH_HOST_KEY,
     DOMAIN,
 )
+from custom_components.brilliant_mqtt.entry_data import LegacyPanelStore
+from custom_components.brilliant_mqtt.fleet_manager import legacy_fleet_config
 from custom_components.brilliant_mqtt.manager import PanelManager
-from custom_components.brilliant_mqtt.shell import PanelShell
 from tests.fakes import FakeShell
 from tests.test_init import ENTRY_DATA
-
-_PROBE_PATH = "custom_components.brilliant_mqtt.config_flow._probe_panel"
 
 # The key an unpinned re-pin connect captures (mirrors the rotated server key).
 REPIN_NEW_KEY = "ssh-ed25519 NEWKEY"
@@ -90,7 +82,7 @@ class RepinShells:
 def repin_shells() -> Iterator[RepinShells]:
     """Patch manager.AsyncsshShell with a pin-keyed factory (see RepinShells)."""
     factory = RepinShells()
-    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", side_effect=factory):
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", side_effect=factory):
         yield factory
 
 
@@ -103,9 +95,9 @@ def auto_enable_custom_integrations(enable_custom_integrations: None) -> None:
 def panel_diagnostics_isolated(hass: HomeAssistant) -> Iterator[None]:
     """Keep a test's panel diagnostics tree hermetic.
 
-    The reboot feature persists diagnostics bundles under
+    The reboot feature persists typed diagnostics summaries under
     ``<config>/brilliant_mqtt/diagnostics/<panel>/``, but the HA test harness shares one
-    on-disk config dir across every test (and across runs), so those bundles would
+    on-disk config dir across every test (and across runs), so those summaries would
     otherwise leak between tests. Nothing else lives under ``<config>/brilliant_mqtt/``,
     so wipe that subtree before and after the test.
     """
@@ -157,7 +149,7 @@ def fake_shell() -> Iterator[FakeShell]:
         0, "unit=1\nenv=1\nenabled=1\nactive=1\nsunit=1\nsenv=1\npayload=1\n0.2.0\n", ""
     )
     shell = FakeShell(responses={panel_ops.INSPECT_COMMAND: installed})
-    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
         yield shell
 
 
@@ -183,95 +175,18 @@ def manager_with_fake_panel(hass: HomeAssistant) -> Iterator[PanelManager]:
     entry.add_to_hass(hass)
     shell = FakeShell()
     with (
-        patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell),
+        patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell),
         patch(
             "custom_components.brilliant_mqtt.components.async_fetch_voice_payload",
             return_value="/tmp/fake-voice.tar.gz",
         ),
     ):
-        yield PanelManager(hass, entry, asyncio.Lock())
-
-
-@pytest.fixture
-def not_installed_panel() -> Iterator[None]:
-    """Patch the step-1 probe to return a fresh panel (agent not installed, key pinned)."""
-    probe = _PanelProbe(host_key="ssh-ed25519 PINNED", config=None)
-    with patch(_PROBE_PATH, return_value=probe):
-        yield
-
-
-class _PatchInstallsResult:
-    """Tracks which component IDs had install() or remove() called."""
-
-    def __init__(self, called_ids: set[str], removed_ids: set[str]) -> None:
-        self._called = called_ids
-        self._removed = removed_ids
-
-    def called(self, cid: str) -> bool:
-        return cid in self._called
-
-    def removed(self, cid: str) -> bool:
-        return cid in self._removed
-
-
-@pytest.fixture
-def patch_installs() -> Iterator[_PatchInstallsResult]:
-    """Replace REGISTRY install/remove callables with no-ops; track which IDs were invoked.
-
-    Also patches config_flow.AsyncsshShell so _panel_session does not attempt
-    real SSH — the mocked install/remove functions do not use the shell.
-    """
-    called_ids: set[str] = set()
-    removed_ids: set[str] = set()
-
-    def _make_install(
-        cid: str,
-    ) -> Callable[[HomeAssistant, PanelShell, Mapping[str, Any]], Awaitable[None]]:
-        async def install(hass: HomeAssistant, shell: PanelShell, data: Mapping[str, Any]) -> None:
-            called_ids.add(cid)
-
-        return install
-
-    def _make_remove(cid: str) -> Callable[[PanelShell], Awaitable[None]]:
-        async def remove(shell: PanelShell) -> None:
-            removed_ids.add(cid)
-
-        return remove
-
-    new_registry = {
-        COMPONENT_BRIDGE: _dc_replace(
-            _components.REGISTRY[COMPONENT_BRIDGE],
-            install=_make_install(COMPONENT_BRIDGE),
-            remove=_make_remove(COMPONENT_BRIDGE),
-        ),
-        COMPONENT_VOICE: _dc_replace(
-            _components.REGISTRY[COMPONENT_VOICE],
-            install=_make_install(COMPONENT_VOICE),
-            remove=_make_remove(COMPONENT_VOICE),
-        ),
-        COMPONENT_WIFI_WATCHDOG: _dc_replace(
-            _components.REGISTRY[COMPONENT_WIFI_WATCHDOG],
-            install=_make_install(COMPONENT_WIFI_WATCHDOG),
-            remove=_make_remove(COMPONENT_WIFI_WATCHDOG),
-        ),
-        COMPONENT_BUS_WATCHDOG: _dc_replace(
-            _components.REGISTRY[COMPONENT_BUS_WATCHDOG],
-            install=_make_install(COMPONENT_BUS_WATCHDOG),
-            remove=_make_remove(COMPONENT_BUS_WATCHDOG),
-        ),
-        COMPONENT_HA_MIRROR: _dc_replace(
-            _components.REGISTRY[COMPONENT_HA_MIRROR],
-            install=_make_install(COMPONENT_HA_MIRROR),
-            remove=_make_remove(COMPONENT_HA_MIRROR),
-        ),
-    }
-
-    install_shell = FakeShell()
-    with (
-        patch.dict(_components.REGISTRY, new_registry),
-        patch.object(_config_flow, "AsyncsshShell", return_value=install_shell),
-    ):
-        yield _PatchInstallsResult(called_ids, removed_ids)
+        yield PanelManager(
+            hass,
+            LegacyPanelStore(hass, entry),
+            legacy_fleet_config(entry),
+            asyncio.Lock(),
+        )
 
 
 @pytest.fixture

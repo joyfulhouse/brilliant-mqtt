@@ -1,588 +1,706 @@
-"""Unit tests for the durable retained-topic ownership ledger (retained_topics.py).
-
-Covers: async_load's strict validation matrix, async_publish's
-persist-before-publish ordering, the topic ownership whitelist, async_clear(_all),
-_async_persist's cancel-mid-write semantics, and _PathState sharing across
-ledger instances that point at the same file.
-"""
-
 from __future__ import annotations
 
 import asyncio
 import json
+import os
+import stat
 import threading
+from collections.abc import Callable
 from pathlib import Path
+from typing import NoReturn
 
 import pytest
 
-from brilliant_mqtt import retained_topics
-from brilliant_mqtt.retained_topics import (
-    MAX_MANIFEST_BYTES,
-    MAX_TOPICS,
-    SCHEMA_VERSION,
-    RetainedLedgerError,
-    RetainedTopicLedger,
-    _validate_topic,
-)
+from brilliant_mqtt import retained_topics as retained_topics_module
+from brilliant_mqtt.retained_topics import RetainedLedgerError, RetainedTopicLedger
 from tests.fakes import FakeMqtt
 
-PANEL = "office"
-AVAILABILITY = f"brilliant/{PANEL}/availability"
-BRIDGE_META = f"brilliant/{PANEL}/bridge"
-STATE_A = f"brilliant/{PANEL}/peripheral-a/state"
-STATE_B = f"brilliant/{PANEL}/peripheral-b/state"
-CONFIG_A = f"homeassistant/light/brilliant_{PANEL}_peripheral-a/config"
+PANEL = "kitchen"
+MAX_TOPICS = 4_096
+MAX_MANIFEST_BYTES = 256 * 1024
 
 
-class _SnapshotMqtt(FakeMqtt):
-    """Records the ledger file's on-disk bytes at the moment of each publish call.
+def _manifest(topics: list[str], *, panel: str = PANEL, **extra: object) -> str:
+    value: dict[str, object] = {
+        "schema_version": 1,
+        "panel_slug": panel,
+        "topics": topics,
+        **extra,
+    }
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
-    Lets a test assert that a disk write genuinely happened BEFORE a given
-    publish, not merely that it happened at some point during the whole call.
-    """
 
-    def __init__(self, ledger_path: Path) -> None:
+async def _loaded_ledger(path: Path) -> RetainedTopicLedger:
+    ledger = RetainedTopicLedger(PANEL, path)
+    await ledger.async_load()
+    return ledger
+
+
+class RecordingFailureMqtt(FakeMqtt):
+    def __init__(self, fail_topic: str) -> None:
         super().__init__()
-        self._ledger_path = ledger_path
-        self.disk_snapshots_at_publish: list[bytes | None] = []
+        self._fail_topic = fail_topic
 
-    async def publish(self, topic: str, payload: str, retain: bool = False, qos: int = 0) -> None:
-        self.disk_snapshots_at_publish.append(
-            self._ledger_path.read_bytes() if self._ledger_path.exists() else None
-        )
+    async def publish(
+        self,
+        topic: str,
+        payload: str,
+        retain: bool = False,
+        qos: int = 0,
+    ) -> None:
         await super().publish(topic, payload, retain, qos)
+        if topic == self._fail_topic:
+            raise RuntimeError(f"publish failed: {topic}")
 
 
-def _write_raw_manifest(path: Path, value: object) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value))
+class RecordingOneShotFailureMqtt(FakeMqtt):
+    def __init__(self, fail_topic: str) -> None:
+        super().__init__()
+        self._fail_topic = fail_topic
+        self._failed = False
+
+    async def publish(
+        self,
+        topic: str,
+        payload: str,
+        retain: bool = False,
+        qos: int = 0,
+    ) -> None:
+        await super().publish(topic, payload, retain, qos)
+        if topic == self._fail_topic and not self._failed:
+            self._failed = True
+            raise RuntimeError(f"publish failed once: {topic}")
 
 
-async def _wait_until(predicate: object, timeout: float = 2.0) -> None:
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
-    while not predicate():  # type: ignore[operator]
-        if loop.time() > deadline:
-            raise AssertionError("condition was not met in time")
-        await asyncio.sleep(0.005)
-
-
-# -- async_load: strict validation matrix -------------------------------------
-
-
-async def test_async_load_missing_file_is_empty(tmp_path: Path) -> None:
-    ledger = RetainedTopicLedger(PANEL, tmp_path / "owned-topics.json")
+async def test_missing_ledger_loads_empty_without_creating_a_file(tmp_path: Path) -> None:
+    path = tmp_path / "owned-topics.json"
+    ledger = RetainedTopicLedger(PANEL, path)
 
     await ledger.async_load()
 
+    assert ledger.ownership_topic == "brilliant/kitchen/ownership"
     assert ledger.topics == frozenset()
+    assert not path.exists()
+    for attribute, value in (
+        ("topics", frozenset({"changed"})),
+        ("ownership_topic", "changed"),
+    ):
+        with pytest.raises(AttributeError):
+            setattr(ledger, attribute, value)
 
 
-async def test_async_load_malformed_json_raises(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "panel_slug",
+    [
+        "a" * 64,
+        "panel_" + ("z" * 250),
+    ],
+    ids=["64-characters", "legacy-long"],
+)
+async def test_canonical_slugs_have_no_hidden_ledger_length_limit(
+    tmp_path: Path,
+    panel_slug: str,
+) -> None:
     path = tmp_path / "owned-topics.json"
-    path.write_text("{not json")
-    ledger = RetainedTopicLedger(PANEL, path)
-
-    with pytest.raises(RetainedLedgerError, match="invalid retained ledger JSON"):
-        await ledger.async_load()
-
-
-async def test_async_load_non_dict_json_raises(tmp_path: Path) -> None:
-    path = tmp_path / "owned-topics.json"
-    path.write_text("[1, 2, 3]")
-    ledger = RetainedTopicLedger(PANEL, path)
-
-    with pytest.raises(RetainedLedgerError, match="expected a JSON object"):
-        await ledger.async_load()
-
-
-async def test_async_load_wrong_keys_raises(tmp_path: Path) -> None:
-    path = tmp_path / "owned-topics.json"
-    _write_raw_manifest(
-        path, {"schema_version": SCHEMA_VERSION, "panel_slug": PANEL, "topics": [], "extra": 1}
-    )
-    ledger = RetainedTopicLedger(PANEL, path)
-
-    with pytest.raises(RetainedLedgerError, match="invalid retained ledger keys"):
-        await ledger.async_load()
-
-
-async def test_async_load_missing_key_raises(tmp_path: Path) -> None:
-    path = tmp_path / "owned-topics.json"
-    _write_raw_manifest(path, {"schema_version": SCHEMA_VERSION, "panel_slug": PANEL})
-    ledger = RetainedTopicLedger(PANEL, path)
-
-    with pytest.raises(RetainedLedgerError, match="invalid retained ledger keys"):
-        await ledger.async_load()
-
-
-async def test_async_load_wrong_schema_version_raises(tmp_path: Path) -> None:
-    path = tmp_path / "owned-topics.json"
-    _write_raw_manifest(path, {"schema_version": 2, "panel_slug": PANEL, "topics": []})
-    ledger = RetainedTopicLedger(PANEL, path)
-
-    with pytest.raises(RetainedLedgerError, match="unsupported retained ledger schema"):
-        await ledger.async_load()
-
-
-async def test_async_load_schema_version_as_bool_raises(tmp_path: Path) -> None:
-    # bool is an int subclass in Python; `type(x) is not int` must still reject it.
-    path = tmp_path / "owned-topics.json"
-    _write_raw_manifest(path, {"schema_version": True, "panel_slug": PANEL, "topics": []})
-    ledger = RetainedTopicLedger(PANEL, path)
-
-    with pytest.raises(RetainedLedgerError, match="unsupported retained ledger schema"):
-        await ledger.async_load()
-
-
-async def test_async_load_wrong_panel_raises(tmp_path: Path) -> None:
-    path = tmp_path / "owned-topics.json"
-    _write_raw_manifest(
-        path, {"schema_version": SCHEMA_VERSION, "panel_slug": "kitchen", "topics": []}
-    )
-    ledger = RetainedTopicLedger(PANEL, path)
-
-    with pytest.raises(RetainedLedgerError, match="panel slug does not match"):
-        await ledger.async_load()
-
-
-async def test_async_load_non_list_topics_raises(tmp_path: Path) -> None:
-    path = tmp_path / "owned-topics.json"
-    _write_raw_manifest(
-        path, {"schema_version": SCHEMA_VERSION, "panel_slug": PANEL, "topics": {"a": 1}}
-    )
-    ledger = RetainedTopicLedger(PANEL, path)
-
-    with pytest.raises(RetainedLedgerError, match="expected a list"):
-        await ledger.async_load()
-
-
-async def test_async_load_non_string_topic_entries_raises(tmp_path: Path) -> None:
-    path = tmp_path / "owned-topics.json"
-    _write_raw_manifest(
-        path, {"schema_version": SCHEMA_VERSION, "panel_slug": PANEL, "topics": [1, 2]}
-    )
-    ledger = RetainedTopicLedger(PANEL, path)
-
-    with pytest.raises(RetainedLedgerError, match="expected strings"):
-        await ledger.async_load()
-
-
-async def test_async_load_duplicate_topics_raises(tmp_path: Path) -> None:
-    path = tmp_path / "owned-topics.json"
-    _write_raw_manifest(
-        path,
-        {"schema_version": SCHEMA_VERSION, "panel_slug": PANEL, "topics": [STATE_A, STATE_A]},
-    )
-    ledger = RetainedTopicLedger(PANEL, path)
-
-    with pytest.raises(RetainedLedgerError, match="duplicate topics"):
-        await ledger.async_load()
-
-
-async def test_async_load_too_many_topics_raises(tmp_path: Path) -> None:
-    path = tmp_path / "owned-topics.json"
-    # The count guard fires before per-topic shape validation, so placeholder
-    # strings (not real ownable topics) are enough to exercise it.
-    topics = [f"t{i}" for i in range(MAX_TOPICS + 1)]
-    _write_raw_manifest(
-        path, {"schema_version": SCHEMA_VERSION, "panel_slug": PANEL, "topics": topics}
-    )
-    ledger = RetainedTopicLedger(PANEL, path)
-
-    with pytest.raises(RetainedLedgerError, match=f"exceeds {MAX_TOPICS:,} topics"):
-        await ledger.async_load()
-
-
-async def test_async_load_topic_failing_ownership_whitelist_raises(tmp_path: Path) -> None:
-    path = tmp_path / "owned-topics.json"
-    _write_raw_manifest(
-        path,
+    ledger = RetainedTopicLedger(panel_slug, path)
+    mqtt = FakeMqtt()
+    topic = f"brilliant/{panel_slug}/availability"
+    expected_manifest = json.dumps(
         {
-            "schema_version": SCHEMA_VERSION,
-            "panel_slug": PANEL,
-            "topics": ["brilliant/other-panel/x/state"],
+            "panel_slug": panel_slug,
+            "schema_version": 1,
+            "topics": [topic],
         },
+        sort_keys=True,
+        separators=(",", ":"),
     )
-    ledger = RetainedTopicLedger(PANEL, path)
 
-    with pytest.raises(RetainedLedgerError, match="not owned by this panel"):
+    await ledger.async_load()
+    await ledger.async_publish(mqtt, topic, "online")
+
+    assert ledger.ownership_topic == f"brilliant/{panel_slug}/ownership"
+    assert mqtt.published == [
+        (ledger.ownership_topic, expected_manifest, True),
+        (topic, "online", True),
+    ]
+    assert mqtt.published_qos == [1, 0]
+
+
+async def test_valid_ledger_reloads_all_permitted_topic_families(tmp_path: Path) -> None:
+    topics = [
+        "brilliant/kitchen/availability",
+        "brilliant/kitchen/bridge",
+        "brilliant/kitchen/light-1/state",
+        "homeassistant/light/brilliant_kitchen_light-1/config",
+    ]
+    path = tmp_path / "owned-topics.json"
+    path.write_text(_manifest(topics), encoding="utf-8")
+
+    ledger = await _loaded_ledger(path)
+
+    assert ledger.topics == frozenset(topics)
+
+
+async def test_failed_repeat_load_invalidates_prior_snapshot(tmp_path: Path) -> None:
+    target = "brilliant/kitchen/bridge"
+    path = tmp_path / "owned-topics.json"
+    path.write_text(_manifest([target]), encoding="utf-8")
+    ledger = await _loaded_ledger(path)
+    corrupt = b"{corrupt-ledger"
+    path.write_bytes(corrupt)
+
+    with pytest.raises(RetainedLedgerError, match="invalid"):
         await ledger.async_load()
 
-
-async def test_async_load_oversize_manifest_raises(tmp_path: Path) -> None:
-    path = tmp_path / "owned-topics.json"
-    # A single topic whose JSON encoding alone exceeds the manifest byte cap,
-    # while staying at 1 topic so the topic-count guard doesn't fire first.
-    huge_topic = f"brilliant/{PANEL}/" + ("x" * (MAX_MANIFEST_BYTES + 1)) + "/state"
-    _write_raw_manifest(
-        path, {"schema_version": SCHEMA_VERSION, "panel_slug": PANEL, "topics": [huge_topic]}
-    )
-    ledger = RetainedTopicLedger(PANEL, path)
-
-    with pytest.raises(RetainedLedgerError, match=f"exceeds {MAX_MANIFEST_BYTES} bytes"):
-        await ledger.async_load()
-
-
-async def test_async_load_valid_manifest_populates_topics(tmp_path: Path) -> None:
-    path = tmp_path / "owned-topics.json"
-    _write_raw_manifest(
-        path, {"schema_version": SCHEMA_VERSION, "panel_slug": PANEL, "topics": [STATE_A, STATE_B]}
-    )
-    ledger = RetainedTopicLedger(PANEL, path)
-
-    await ledger.async_load()
-
-    assert ledger.topics == frozenset({STATE_A, STATE_B})
-
-
-async def test_constructor_rejects_mesh_panel_slug(tmp_path: Path) -> None:
-    with pytest.raises(RetainedLedgerError, match="invalid panel slug"):
-        RetainedTopicLedger("mesh", tmp_path / "owned-topics.json")
-
-
-async def test_constructor_rejects_non_canonical_panel_slug(tmp_path: Path) -> None:
-    with pytest.raises(RetainedLedgerError, match="invalid panel slug"):
-        RetainedTopicLedger("Office", tmp_path / "owned-topics.json")
-
-
-# -- async_publish: claim-then-publish ordering --------------------------------
-
-
-async def test_async_publish_persists_before_manifest_before_value(tmp_path: Path) -> None:
-    path = tmp_path / "owned-topics.json"
-    ledger = RetainedTopicLedger(PANEL, path)
-    await ledger.async_load()
-    mqtt = _SnapshotMqtt(path)
-
-    await ledger.async_publish(mqtt, STATE_A, "v1")
-
-    assert [call[0] for call in mqtt.published] == [ledger.ownership_topic, STATE_A]
-    assert mqtt.published[0] == (
-        ledger.ownership_topic,
-        json.dumps(
-            {"schema_version": SCHEMA_VERSION, "panel_slug": PANEL, "topics": [STATE_A]},
-            sort_keys=True,
-            separators=(",", ":"),
-        ),
-        True,
-    )
-    assert mqtt.published[1] == (STATE_A, "v1", True)
-    # The ledger file already carried the claimed topic BEFORE the ownership
-    # manifest was published — the durable record precedes the broker write.
-    on_disk_at_first_publish = mqtt.disk_snapshots_at_publish[0]
-    assert on_disk_at_first_publish is not None
-    assert json.loads(on_disk_at_first_publish)["topics"] == [STATE_A]
-
-
-async def test_async_publish_same_topic_again_skips_persist_and_manifest(tmp_path: Path) -> None:
-    path = tmp_path / "owned-topics.json"
-    ledger = RetainedTopicLedger(PANEL, path)
-    await ledger.async_load()
-    mqtt = _SnapshotMqtt(path)
-    await ledger.async_publish(mqtt, STATE_A, "v1")
-    mtime_after_first = path.stat().st_mtime_ns
-    mqtt.published.clear()
-
-    await ledger.async_publish(mqtt, STATE_A, "v2")
-
-    # Ownership is unchanged and already acknowledged: only the value republishes.
-    assert mqtt.published == [(STATE_A, "v2", True)]
-    assert path.stat().st_mtime_ns == mtime_after_first
-
-
-async def test_async_publish_new_topic_republishes_manifest_not_first_value(
-    tmp_path: Path,
-) -> None:
-    path = tmp_path / "owned-topics.json"
-    ledger = RetainedTopicLedger(PANEL, path)
-    await ledger.async_load()
     mqtt = FakeMqtt()
-    await ledger.async_publish(mqtt, STATE_A, "v1")
-    mqtt.published.clear()
+    with pytest.raises(RetainedLedgerError, match="loaded"):
+        await ledger.async_publish(mqtt, "brilliant/kitchen/availability", "online")
 
-    await ledger.async_publish(mqtt, STATE_B, "v2")
-
-    assert [call[0] for call in mqtt.published] == [ledger.ownership_topic, STATE_B]
-    manifest_payload = mqtt.published[0][1]
-    assert json.loads(manifest_payload)["topics"] == sorted([STATE_A, STATE_B])
-    assert ledger.topics == frozenset({STATE_A, STATE_B})
-
-
-async def test_async_publish_republishes_unacknowledged_manifest_without_reclaiming(
-    tmp_path: Path,
-) -> None:
-    # Simulates a cold-start reload of an existing ledger: ownership is already
-    # on disk (so no persist is needed), but this fresh instance has never
-    # acknowledged the manifest to the broker this session.
-    path = tmp_path / "owned-topics.json"
-    _write_raw_manifest(
-        path, {"schema_version": SCHEMA_VERSION, "panel_slug": PANEL, "topics": [STATE_A]}
-    )
-    ledger = RetainedTopicLedger(PANEL, path)
-    await ledger.async_load()
-    mtime_before = path.stat().st_mtime_ns
-    mqtt = FakeMqtt()
-
-    await ledger.async_publish(mqtt, STATE_A, "v1")
-
-    assert [call[0] for call in mqtt.published] == [ledger.ownership_topic, STATE_A]
-    assert path.stat().st_mtime_ns == mtime_before  # no re-persist; ownership unchanged
-
-
-async def test_async_publish_rejects_topic_outside_ownership_whitelist(tmp_path: Path) -> None:
-    ledger = RetainedTopicLedger(PANEL, tmp_path / "owned-topics.json")
-    await ledger.async_load()
-    mqtt = FakeMqtt()
-
-    with pytest.raises(RetainedLedgerError, match="not owned by this panel"):
-        await ledger.async_publish(mqtt, "brilliant/kitchen/x/state", "v1")
-
-    assert mqtt.published == []
-
-
-async def test_async_publish_requires_load_first(tmp_path: Path) -> None:
-    ledger = RetainedTopicLedger(PANEL, tmp_path / "owned-topics.json")
-    mqtt = FakeMqtt()
-
-    with pytest.raises(RetainedLedgerError, match="must be loaded before use"):
-        await ledger.async_publish(mqtt, STATE_A, "v1")
-
-
-# -- Topic ownership whitelist (_validate_topic) --------------------------------
-
-
-@pytest.mark.parametrize(
-    "topic",
-    [
-        AVAILABILITY,
-        BRIDGE_META,
-        STATE_A,
-        CONFIG_A,
-        f"homeassistant/binary_sensor/brilliant_{PANEL}_peripheral-a_lux/config",
-    ],
-)
-def test_validate_topic_accepts_real_bridge_topics(topic: str) -> None:
-    _validate_topic(PANEL, topic)  # must not raise
-
-
-@pytest.mark.parametrize(
-    "topic",
-    [
-        "",
-        f"brilliant/{PANEL}/+/state",
-        f"brilliant/{PANEL}/#",
-        f"brilliant/{PANEL}//state",
-        "brilliant/kitchen/peripheral-a/state",
-        f"brilliant/{PANEL}/ownership",
-        f"frigate/{PANEL}/peripheral-a/state",
-        "homeassistant/light/brilliant_kitchen_peripheral-a/config",
-        f"homeassistant/light/other_{PANEL}_peripheral-a/config",
-        f"brilliant/{PANEL}/peripheral-a/notstate",
-        f"brilliant/{PANEL}/pe\x00ripheral/state",
-    ],
-)
-def test_validate_topic_rejects_everything_else(topic: str) -> None:
-    with pytest.raises(RetainedLedgerError):
-        _validate_topic(PANEL, topic)
-
-
-# -- async_clear / async_clear_all ----------------------------------------------
-
-
-async def test_async_clear_refuses_unowned_topic(tmp_path: Path) -> None:
-    ledger = RetainedTopicLedger(PANEL, tmp_path / "owned-topics.json")
-    await ledger.async_load()
-    mqtt = FakeMqtt()
-    await ledger.async_publish(mqtt, STATE_A, "v1")
-    mqtt.published.clear()
-
-    with pytest.raises(RetainedLedgerError, match="refusing to clear a topic not owned"):
-        await ledger.async_clear(mqtt, STATE_B)
-
-    assert mqtt.published == []
-    assert ledger.topics == frozenset({STATE_A})
-
-
-async def test_async_clear_removes_topic_and_republishes_smaller_manifest(tmp_path: Path) -> None:
-    path = tmp_path / "owned-topics.json"
-    ledger = RetainedTopicLedger(PANEL, path)
-    await ledger.async_load()
-    mqtt = FakeMqtt()
-    await ledger.async_publish(mqtt, STATE_A, "v1")
-    await ledger.async_publish(mqtt, STATE_B, "v2")
-    mqtt.published.clear()
-
-    await ledger.async_clear(mqtt, STATE_A)
-
-    assert mqtt.published == [
-        (STATE_A, "", True),
-        (
-            ledger.ownership_topic,
-            json.dumps(
-                {"schema_version": SCHEMA_VERSION, "panel_slug": PANEL, "topics": [STATE_B]},
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
-            True,
-        ),
-    ]
-    assert ledger.topics == frozenset({STATE_B})
-    assert json.loads(path.read_text())["topics"] == [STATE_B]
-
-
-async def test_async_clear_all_clears_ownership_topic_last(tmp_path: Path) -> None:
-    ledger = RetainedTopicLedger(PANEL, tmp_path / "owned-topics.json")
-    await ledger.async_load()
-    mqtt = FakeMqtt()
-    await ledger.async_publish(mqtt, STATE_A, "v1")
-    await ledger.async_publish(mqtt, STATE_B, "v2")
-    mqtt.published.clear()
-
-    await ledger.async_clear_all(mqtt)
-
-    # Each per-topic clear also republishes a shrinking ownership manifest
-    # (STATE_A < STATE_B, so it clears in that sorted order); only the FINAL
-    # call clears the ownership topic itself with an empty payload.
-    assert mqtt.published == [
-        (STATE_A, "", True),
-        (
-            ledger.ownership_topic,
-            json.dumps(
-                {"schema_version": SCHEMA_VERSION, "panel_slug": PANEL, "topics": [STATE_B]},
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
-            True,
-        ),
-        (STATE_B, "", True),
-        (
-            ledger.ownership_topic,
-            json.dumps(
-                {"schema_version": SCHEMA_VERSION, "panel_slug": PANEL, "topics": []},
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
-            True,
-        ),
-        (ledger.ownership_topic, "", True),
-    ]
-    assert mqtt.published[-1] == (ledger.ownership_topic, "", True)
     assert ledger.topics == frozenset()
-
-
-# -- _async_persist: cancel-mid-write semantics --------------------------------
-
-
-async def test_publish_cancelled_mid_write_reraises_after_write_settles(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    path = tmp_path / "owned-topics.json"
-    ledger = RetainedTopicLedger(PANEL, path)
-    await ledger.async_load()
-    mqtt = FakeMqtt()
-
-    started = threading.Event()
-    release = threading.Event()
-    original_write = retained_topics._write_payload
-
-    def blocking_write(write_path: Path, payload: str) -> None:
-        started.set()
-        assert release.wait(2.0), "test never released the blocked write"
-        original_write(write_path, payload)
-
-    monkeypatch.setattr(retained_topics, "_write_payload", blocking_write)
-
-    task = asyncio.ensure_future(ledger.async_publish(mqtt, STATE_A, "v1"))
-    await _wait_until(started.is_set)
-    task.cancel()
-    release.set()
-
-    with pytest.raises(asyncio.CancelledError):
-        await task
-
-    # The shielded write ran to completion despite the cancellation: disk AND
-    # in-memory state reflect the claim, but neither MQTT publish (which comes
-    # strictly after the persist step) ever ran.
-    assert ledger.topics == frozenset({STATE_A})
-    assert json.loads(path.read_text())["topics"] == [STATE_A]
     assert mqtt.published == []
-
-    # The lock was released correctly despite the exception unwinding through
-    # `async with self._state.lock:` — a follow-up call must not deadlock.
-    await asyncio.wait_for(ledger.async_publish(mqtt, STATE_B, "v2"), timeout=1.0)
-    assert ledger.topics == frozenset({STATE_A, STATE_B})
+    assert path.read_bytes() == corrupt
 
 
-async def test_publish_write_failure_raises_ledger_error_without_publishing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_same_path_cannot_be_assigned_to_different_panels(tmp_path: Path) -> None:
+    path = tmp_path / "owned-topics.json"
+    first_ledger = RetainedTopicLedger(PANEL, path)
+
+    with pytest.raises(RetainedLedgerError, match="path|panel"):
+        RetainedTopicLedger("garage", tmp_path / "." / "owned-topics.json")
+    assert first_ledger.topics == frozenset()
+
+
+@pytest.mark.parametrize(
+    ("raw", "error_match"),
+    [
+        ("{not json", "invalid"),
+        (_manifest([], unexpected=True), "keys"),
+        (_manifest([], panel="garage"), "panel"),
+        (_manifest(["brilliant/kitchen/bridge", "brilliant/kitchen/bridge"]), "duplicate"),
+        (
+            json.dumps(
+                {"schema_version": True, "panel_slug": PANEL, "topics": []},
+                separators=(",", ":"),
+            ),
+            "schema",
+        ),
+        (
+            json.dumps(
+                {"schema_version": 1, "panel_slug": PANEL, "topics": "not-a-list"},
+                separators=(",", ":"),
+            ),
+            "topics",
+        ),
+        (
+            json.dumps(
+                {"schema_version": 1, "panel_slug": PANEL, "topics": [1]},
+                separators=(",", ":"),
+            ),
+            "topic",
+        ),
+    ],
+)
+async def test_invalid_existing_ledger_fails_closed(
+    tmp_path: Path,
+    raw: str,
+    error_match: str,
 ) -> None:
     path = tmp_path / "owned-topics.json"
+    path.write_text(raw, encoding="utf-8")
     ledger = RetainedTopicLedger(PANEL, path)
-    await ledger.async_load()
+
+    with pytest.raises(RetainedLedgerError, match=error_match):
+        await ledger.async_load()
+
+    assert ledger.topics == frozenset()
+    assert path.read_text(encoding="utf-8") == raw
+
+
+async def test_ledger_rejects_4_097_topics(tmp_path: Path) -> None:
+    topics = [f"brilliant/kitchen/peripheral-{index}/state" for index in range(MAX_TOPICS + 1)]
+    path = tmp_path / "owned-topics.json"
+    path.write_text(_manifest(topics), encoding="utf-8")
+
+    with pytest.raises(RetainedLedgerError, match="4,096|4096|topics"):
+        await RetainedTopicLedger(PANEL, path).async_load()
+
+
+async def test_ledger_rejects_canonical_json_over_256_kib(tmp_path: Path) -> None:
+    unique_id = "brilliant_kitchen_" + ("x" * MAX_MANIFEST_BYTES)
+    raw = _manifest([f"homeassistant/light/{unique_id}/config"])
+    assert len(raw.encode("utf-8")) > MAX_MANIFEST_BYTES
+    path = tmp_path / "owned-topics.json"
+    path.write_text(raw, encoding="utf-8")
+
+    with pytest.raises(RetainedLedgerError, match="256|large|bytes"):
+        await RetainedTopicLedger(PANEL, path).async_load()
+
+
+@pytest.mark.parametrize(
+    "topic",
+    [
+        "brilliant/garage/availability",
+        "brilliant/mesh/light-1/state",
+        "homeassistant/light/brilliant_garage_light-1/config",
+        "homeassistant/light/brilliant_mesh_light-1/config",
+        "homeassistant/light/brilliant_panel_mesh/config",
+        "brilliant/kitchen/light-1/set",
+        "brilliant/kitchen/ownership",
+        "homeassistant/+/brilliant_kitchen_light-1/config",
+    ],
+)
+async def test_publish_rejects_topics_not_owned_by_the_concrete_panel(
+    tmp_path: Path,
+    topic: str,
+) -> None:
+    path = tmp_path / "owned-topics.json"
+    ledger = await _loaded_ledger(path)
     mqtt = FakeMqtt()
 
-    def failing_write(write_path: Path, payload: str) -> None:
-        raise OSError("disk full")
-
-    monkeypatch.setattr(retained_topics, "_write_payload", failing_write)
-
-    with pytest.raises(RetainedLedgerError, match="could not persist retained ledger"):
-        await ledger.async_publish(mqtt, STATE_A, "v1")
+    with pytest.raises(RetainedLedgerError, match="topic"):
+        await ledger.async_publish(mqtt, topic, "value")
 
     assert ledger.topics == frozenset()
     assert mqtt.published == []
     assert not path.exists()
 
 
-# -- _PathState: cross-instance sharing + panel mismatch -----------------------
-
-
-async def test_two_ledgers_same_path_share_the_underlying_lock(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+async def test_first_publish_persists_then_publishes_manifest_before_target(
+    tmp_path: Path,
 ) -> None:
     path = tmp_path / "owned-topics.json"
-    ledger1 = RetainedTopicLedger(PANEL, path)
-    await ledger1.async_load()
-    ledger2 = RetainedTopicLedger(PANEL, path)
-    await ledger2.async_load()
+    ledger = await _loaded_ledger(path)
+    mqtt = FakeMqtt()
+    target = "brilliant/kitchen/light-1/state"
+    expected_manifest = _manifest([target])
+
+    await ledger.async_publish(mqtt, target, '{"on":true}')
+
+    assert mqtt.published == [
+        ("brilliant/kitchen/ownership", expected_manifest, True),
+        (target, '{"on":true}', True),
+    ]
+    assert mqtt.published_qos == [1, 0]
+    assert ledger.topics == frozenset({target})
+    assert path.read_text(encoding="utf-8") == expected_manifest
+
+
+async def test_loaded_manifest_is_acknowledged_once_before_unchanged_hot_path(
+    tmp_path: Path,
+) -> None:
+    target = "brilliant/kitchen/light-1/state"
+    expected_manifest = _manifest([target])
+    path = tmp_path / "owned-topics.json"
+    path.write_text(expected_manifest, encoding="utf-8")
+    ledger = await _loaded_ledger(path)
     mqtt = FakeMqtt()
 
-    started = threading.Event()
-    release = threading.Event()
-    original_write = retained_topics._write_payload
+    await ledger.async_publish(mqtt, target, "one")
+    await ledger.async_publish(mqtt, target, "two")
+
+    assert mqtt.published == [
+        (ledger.ownership_topic, expected_manifest, True),
+        (target, "one", True),
+        (target, "two", True),
+    ]
+    assert mqtt.published_qos == [1, 0, 0]
+
+
+async def test_repeat_load_requires_a_fresh_manifest_ack_before_existing_target(
+    tmp_path: Path,
+) -> None:
+    target = "brilliant/kitchen/light-1/state"
+    expected_manifest = _manifest([target])
+    path = tmp_path / "owned-topics.json"
+    path.write_text(expected_manifest, encoding="utf-8")
+    ledger = await _loaded_ledger(path)
+    mqtt = FakeMqtt()
+    await ledger.async_publish(mqtt, target, "before-reload")
+    mqtt.published.clear()
+    mqtt.published_qos.clear()
+
+    await ledger.async_load()
+    await ledger.async_publish(mqtt, target, "after-reload")
+
+    assert mqtt.published == [
+        (ledger.ownership_topic, expected_manifest, True),
+        (target, "after-reload", True),
+    ]
+    assert mqtt.published_qos == [1, 0]
+
+
+async def test_failed_manifest_ack_is_retried_before_target_publish(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "owned-topics.json"
+    ledger = await _loaded_ledger(path)
+    target = "brilliant/kitchen/light-1/state"
+    expected_manifest = _manifest([target])
+    mqtt = RecordingOneShotFailureMqtt(ledger.ownership_topic)
+
+    with pytest.raises(RuntimeError, match="publish failed once"):
+        await ledger.async_publish(mqtt, target, "one")
+    await ledger.async_publish(mqtt, target, "two")
+    await ledger.async_publish(mqtt, target, "three")
+
+    assert mqtt.published == [
+        (ledger.ownership_topic, expected_manifest, True),
+        (ledger.ownership_topic, expected_manifest, True),
+        (target, "two", True),
+        (target, "three", True),
+    ]
+    assert mqtt.published_qos == [1, 1, 0, 0]
+    assert ledger.topics == frozenset({target})
+    assert path.read_text(encoding="utf-8") == expected_manifest
+
+
+async def test_manifest_serializes_topics_in_sorted_order(tmp_path: Path) -> None:
+    path = tmp_path / "owned-topics.json"
+    ledger = await _loaded_ledger(path)
+    mqtt = FakeMqtt()
+    later = "brilliant/kitchen/z-light/state"
+    earlier = "brilliant/kitchen/a-light/state"
+
+    await ledger.async_publish(mqtt, later, "z")
+    await ledger.async_publish(mqtt, earlier, "a")
+
+    assert path.read_text(encoding="utf-8") == _manifest([earlier, later])
+
+
+async def test_cancellation_keeps_write_serialized_until_thread_finishes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "owned-topics.json"
+    ledger = await _loaded_ledger(path)
+    mqtt = FakeMqtt()
+    first = "brilliant/kitchen/light-1/state"
+    second = "brilliant/kitchen/light-2/state"
+    expected_manifest = _manifest([first, second])
+    real_to_thread = asyncio.to_thread
+    real_write = retained_topics_module._write_payload
+    loop = asyncio.get_running_loop()
+    release_first_write = threading.Event()
+    first_thread_started = asyncio.Event()
+    first_thread_finished = asyncio.Event()
+    second_write_submitted = asyncio.Event()
+    write_submissions = 0
 
     def blocking_write(write_path: Path, payload: str) -> None:
-        started.set()
-        assert release.wait(2.0), "test never released the blocked write"
-        original_write(write_path, payload)
+        if payload == _manifest([first]):
+            loop.call_soon_threadsafe(first_thread_started.set)
+            release_first_write.wait()
+            try:
+                real_write(write_path, payload)
+            finally:
+                loop.call_soon_threadsafe(first_thread_finished.set)
+            return
+        real_write(write_path, payload)
 
-    monkeypatch.setattr(retained_topics, "_write_payload", blocking_write)
+    async def track_to_thread(
+        function: Callable[..., object],
+        /,
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        nonlocal write_submissions
+        if function is blocking_write:
+            write_submissions += 1
+            if write_submissions == 2:
+                second_write_submitted.set()
+        return await real_to_thread(function, *args, **kwargs)
 
-    task1 = asyncio.ensure_future(ledger1.async_publish(mqtt, STATE_A, "v1"))
-    await _wait_until(started.is_set)
+    monkeypatch.setattr(retained_topics_module, "_write_payload", blocking_write)
+    monkeypatch.setattr(asyncio, "to_thread", track_to_thread)
 
-    # ledger2 shares ledger1's asyncio.Lock (same normalized path) — its
-    # publish must block behind ledger1's in-flight write, not race it.
-    task2 = asyncio.ensure_future(ledger2.async_publish(mqtt, STATE_B, "v2"))
-    await asyncio.sleep(0.05)
-    assert not task2.done()
+    first_publish = asyncio.create_task(ledger.async_publish(mqtt, first, "one"))
+    await first_thread_started.wait()
+    first_publish.cancel()
+    await asyncio.sleep(0)
+    pending_after_first_cancel = not first_publish.done()
+    first_publish.cancel()
+    await asyncio.sleep(0)
+    pending_after_repeat_cancel = not first_publish.done()
 
-    release.set()
-    await task1
-    await task2
+    second_publish = asyncio.create_task(ledger.async_publish(mqtt, second, "two"))
+    await asyncio.sleep(0)
+    second_submitted_before_release = second_write_submitted.is_set()
+    release_first_write.set()
+    await first_thread_finished.wait()
+    first_result, second_result = await asyncio.gather(
+        first_publish,
+        second_publish,
+        return_exceptions=True,
+    )
 
-    assert ledger1.topics == ledger2.topics == frozenset({STATE_A, STATE_B})
+    assert pending_after_first_cancel
+    assert pending_after_repeat_cancel
+    assert not second_submitted_before_release
+    assert isinstance(first_result, asyncio.CancelledError)
+    assert second_result is None
+    assert ledger.topics == frozenset({first, second})
+    assert path.read_text(encoding="utf-8") == expected_manifest
+    assert mqtt.published == [
+        (ledger.ownership_topic, expected_manifest, True),
+        (second, "two", True),
+    ]
+    assert mqtt.published_qos == [1, 0]
 
 
-async def test_second_ledger_different_panel_same_path_raises(tmp_path: Path) -> None:
+async def test_cancellation_remains_primary_when_shielded_write_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     path = tmp_path / "owned-topics.json"
-    ledger1 = RetainedTopicLedger(PANEL, path)
-    await ledger1.async_load()
+    ledger = await _loaded_ledger(path)
+    mqtt = FakeMqtt()
+    loop = asyncio.get_running_loop()
+    write_started = asyncio.Event()
+    release_write = threading.Event()
 
-    with pytest.raises(RetainedLedgerError, match="already assigned to a different panel"):
-        RetainedTopicLedger("kitchen", path)
+    def failing_write(write_path: Path, payload: str) -> NoReturn:
+        del write_path, payload
+        loop.call_soon_threadsafe(write_started.set)
+        release_write.wait()
+        raise OSError("simulated persistence failure")
 
-    # ledger1 stays alive (referenced above) for the duration of the assertion
-    # so the WeakValueDictionary entry for `path` cannot be collected early.
-    assert ledger1.topics == frozenset()
+    monkeypatch.setattr(retained_topics_module, "_write_payload", failing_write)
+    publish = asyncio.create_task(ledger.async_publish(mqtt, "brilliant/kitchen/bridge", "{}"))
+    await write_started.wait()
+
+    publish.cancel()
+    await asyncio.sleep(0)
+    release_write.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await publish
+
+    assert ledger.topics == frozenset()
+    assert mqtt.published == []
+    assert not path.exists()
+
+
+async def test_loaded_instances_for_normalized_path_publish_union(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    alias_parent = tmp_path / "alias"
+    alias_parent.mkdir()
+    path = tmp_path / "owned-topics.json"
+    alias_path = alias_parent / ".." / path.name
+    first_ledger = await _loaded_ledger(path)
+    second_ledger = await _loaded_ledger(alias_path)
+    mqtt = FakeMqtt()
+    first = "brilliant/kitchen/light-1/state"
+    second = "brilliant/kitchen/light-2/state"
+    expected_manifest = _manifest([first, second])
+    real_to_thread = asyncio.to_thread
+    first_write_started = asyncio.Event()
+    release_first_write = asyncio.Event()
+    second_write_started = asyncio.Event()
+    write_count = 0
+
+    async def controlled_to_thread(
+        function: Callable[..., object],
+        /,
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        nonlocal write_count
+        if function is retained_topics_module._write_payload:
+            write_count += 1
+            if write_count == 1:
+                first_write_started.set()
+                await release_first_write.wait()
+            else:
+                second_write_started.set()
+            assert len(args) == 2
+            assert not kwargs
+            write_path, payload = args
+            assert isinstance(write_path, Path)
+            assert isinstance(payload, str)
+            retained_topics_module._write_payload(write_path, payload)
+            return None
+        return await real_to_thread(function, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", controlled_to_thread)
+    first_publish = asyncio.create_task(first_ledger.async_publish(mqtt, first, "one"))
+    await first_write_started.wait()
+    second_publish = asyncio.create_task(second_ledger.async_publish(mqtt, second, "two"))
+    await asyncio.sleep(0)
+    second_started_before_release = second_write_started.is_set()
+    release_first_write.set()
+    await asyncio.gather(first_publish, second_publish)
+
+    assert not second_started_before_release
+    assert first_ledger.topics == frozenset({first, second})
+    assert second_ledger.topics == frozenset({first, second})
+    assert path.read_text(encoding="utf-8") == expected_manifest
+    ownership_messages = [
+        (payload, mqtt.published_qos[index])
+        for index, (topic, payload, _retain) in enumerate(mqtt.published)
+        if topic == first_ledger.ownership_topic
+    ]
+    assert ownership_messages[-1] == (expected_manifest, 1)
+    assert (first, "one", True) in mqtt.published
+    assert (second, "two", True) in mqtt.published
+    assert mqtt.published_qos == [1, 0, 1, 0]
+
+
+async def test_disk_write_failure_prevents_manifest_and_target_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "owned-topics.json"
+    ledger = await _loaded_ledger(path)
+    mqtt = FakeMqtt()
+
+    def fail_replace(source: object, destination: object) -> NoReturn:
+        del source, destination
+        raise OSError("disk full")
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+
+    with pytest.raises(RetainedLedgerError, match="persist"):
+        await ledger.async_publish(mqtt, "brilliant/kitchen/light-1/state", "value")
+
+    assert mqtt.published == []
+    assert ledger.topics == frozenset()
+    assert not path.exists()
+    assert list(path.parent.iterdir()) == []
+
+
+async def test_manifest_publish_failure_prevents_target_and_keeps_disk_claim(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "owned-topics.json"
+    ledger = await _loaded_ledger(path)
+    mqtt = RecordingFailureMqtt(ledger.ownership_topic)
+    target = "brilliant/kitchen/light-1/state"
+
+    with pytest.raises(RuntimeError, match="publish failed"):
+        await ledger.async_publish(mqtt, target, "value")
+
+    assert mqtt.published == [(ledger.ownership_topic, _manifest([target]), True)]
+    assert mqtt.published_qos == [1]
+    assert ledger.topics == frozenset({target})
+    assert path.read_text(encoding="utf-8") == _manifest([target])
+
+
+async def test_target_publish_failure_leaves_manifest_claiming_topic(tmp_path: Path) -> None:
+    path = tmp_path / "owned-topics.json"
+    ledger = await _loaded_ledger(path)
+    target = "brilliant/kitchen/light-1/state"
+    mqtt = RecordingFailureMqtt(target)
+
+    with pytest.raises(RuntimeError, match="publish failed"):
+        await ledger.async_publish(mqtt, target, "value")
+
+    reloaded = await _loaded_ledger(path)
+    assert reloaded.topics == frozenset({target})
+    assert mqtt.published[-1] == (target, "value", True)
+
+
+async def test_clear_publishes_tombstone_before_persisting_smaller_manifest(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "owned-topics.json"
+    ledger = await _loaded_ledger(path)
+    mqtt = FakeMqtt()
+    removed = "brilliant/kitchen/light-1/state"
+    kept = "brilliant/kitchen/light-2/state"
+    await ledger.async_publish(mqtt, removed, "one")
+    await ledger.async_publish(mqtt, kept, "two")
+    mqtt.published.clear()
+    mqtt.published_qos.clear()
+
+    await ledger.async_clear(mqtt, removed)
+
+    assert mqtt.published == [
+        (removed, "", True),
+        (ledger.ownership_topic, _manifest([kept]), True),
+    ]
+    assert mqtt.published_qos == [1, 1]
+    assert ledger.topics == frozenset({kept})
+    assert path.read_text(encoding="utf-8") == _manifest([kept])
+
+
+async def test_clear_all_clears_ownership_last(tmp_path: Path) -> None:
+    path = tmp_path / "owned-topics.json"
+    ledger = await _loaded_ledger(path)
+    mqtt = FakeMqtt()
+    topics = {
+        "brilliant/kitchen/light-1/state",
+        "homeassistant/light/brilliant_kitchen_light-1/config",
+    }
+    for topic in topics:
+        await ledger.async_publish(mqtt, topic, "value")
+    mqtt.published.clear()
+    mqtt.published_qos.clear()
+
+    await ledger.async_clear_all(mqtt)
+
+    assert mqtt.published[-1] == (ledger.ownership_topic, "", True)
+    assert mqtt.published_qos[-1] == 1
+    for topic in topics:
+        assert (topic, "", True) in mqtt.published[:-1]
+        index = mqtt.published.index((topic, "", True))
+        assert mqtt.published_qos[index] == 1
+    assert ledger.topics == frozenset()
+    assert path.read_text(encoding="utf-8") == _manifest([])
+
+
+async def test_persistence_is_atomic_durable_and_private(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    real_fsync = os.fsync
+    real_replace = os.replace
+
+    def spy_fsync(fd: int) -> None:
+        events.append("fsync")
+        real_fsync(fd)
+
+    def spy_replace(source: str | os.PathLike[str], destination: str | os.PathLike[str]) -> None:
+        events.append("replace")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(os, "fsync", spy_fsync)
+    monkeypatch.setattr(os, "replace", spy_replace)
+    path = tmp_path / "nested" / "owned-topics.json"
+    ledger = await _loaded_ledger(path)
+
+    await ledger.async_publish(FakeMqtt(), "brilliant/kitchen/availability", "online")
+
+    replace_index = events.index("replace")
+    assert "fsync" in events[:replace_index]
+    assert "fsync" in events[replace_index + 1 :]
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+async def test_each_persistence_uses_a_private_sibling_temporary_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    replaced_sources: list[Path] = []
+    real_replace = os.replace
+
+    def spy_replace(
+        source: str | os.PathLike[str],
+        destination: str | os.PathLike[str],
+    ) -> None:
+        replaced_sources.append(Path(source))
+        real_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", spy_replace)
+    path = tmp_path / "nested" / "owned-topics.json"
+    ledger = await _loaded_ledger(path)
+
+    await ledger.async_publish(FakeMqtt(), "brilliant/kitchen/availability", "online")
+    await ledger.async_publish(FakeMqtt(), "brilliant/kitchen/bridge", "{}")
+
+    assert len(replaced_sources) == 2
+    assert replaced_sources[0] != replaced_sources[1]
+    assert all(source.parent == path.parent for source in replaced_sources)
+    assert all(not source.exists() for source in replaced_sources)

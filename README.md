@@ -65,14 +65,17 @@ per-panel duplicates.
 
 - One or more Brilliant Smart Home Control panels with **Root SSH Login**
   enabled (a supported toggle in the panel's settings)
-- An MQTT broker (e.g. Mosquitto) that Home Assistant is connected to
+- An MQTT broker that Home Assistant is connected to. The official Home
+  Assistant Mosquitto add-on (`core_mosquitto`) is the recommended shortcut;
+  an existing local, remote, or hosted broker is equally supported.
 - Home Assistant with HACS (for the recommended install path)
 
 ## Installation
 
-**Recommended:** install the companion integration via HACS — it walks you
-through onboarding, installs the agent on each panel over SSH, keeps it
-updated from HA, and auto-repairs after firmware updates.
+**Recommended:** install the companion integration via HACS — add it once,
+validate the shared broker, then add panels to the resulting fleet. It installs
+the agent on each panel over SSH, keeps it updated from HA, and auto-repairs
+after firmware updates.
 
 [![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=joyfulhouse&repository=brilliant-mqtt&category=integration)
 
@@ -147,7 +150,9 @@ broker/ACL issues — are covered in
 git clone https://github.com/joyfulhouse/brilliant-mqtt.git
 cd brilliant-mqtt
 uv sync
-uv run ruff check && uv run mypy --strict src tests && uv run pytest
+uv run ruff check
+uv run mypy --strict src tests scripts/brilliant-panel/bundle_manifest.py
+uv run pytest
 ```
 
 Python 3.10 (panel-locked), uv, ruff, mypy --strict, pytest; all bus/broker

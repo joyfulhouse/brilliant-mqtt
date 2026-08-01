@@ -20,7 +20,7 @@ from .const import (
     DOMAIN,
 )
 from .entity import BrilliantPanelEntity
-from .manager import _HostKeyChanged
+from .manager import PanelManager, _HostKeyChanged, _safe_failure_summary
 from .panel_ops import PanelOpError
 
 # Push-only; toggling serializes panel SSH via the fleet-wide lock in the manager.
@@ -32,27 +32,30 @@ async def async_setup_entry(
     entry: BrilliantMqttConfigEntry,
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    async_add_entities(
-        [
-            VoiceSatelliteSwitch(entry),
-            WifiWatchdogSwitch(entry),
-            BusWatchdogSwitch(entry),
-            HueCaSwitch(entry),
+    for manager in entry.runtime_data.panels.values():
+        entities = [
+            VoiceSatelliteSwitch(manager),
+            WifiWatchdogSwitch(manager),
+            BusWatchdogSwitch(manager),
+            HueCaSwitch(manager),
         ]
-    )
+        if (subentry_id := manager.store.subentry_id) is None:
+            async_add_entities(entities)
+        else:
+            async_add_entities(entities, config_subentry_id=subentry_id)
 
 
 class VoiceSatelliteSwitch(BrilliantPanelEntity, SwitchEntity):
     _attr_entity_category = EntityCategory.CONFIG
     _attr_translation_key = "voice_enabled"
 
-    def __init__(self, entry: BrilliantMqttConfigEntry) -> None:
-        super().__init__(entry.runtime_data)
-        self._attr_unique_id = f"{entry.entry_id}_voice_enabled"
+    def __init__(self, manager: PanelManager) -> None:
+        super().__init__(manager)
+        self._attr_unique_id = f"{manager.store.management_id}_voice_enabled"
 
     @property
     def is_on(self) -> bool:
-        components = self._manager.entry.data.get(CONF_COMPONENTS, {})
+        components = self._manager.store.data.get(CONF_COMPONENTS, {})
         return bool(components.get(COMPONENT_VOICE, False))
 
     async def async_turn_on(self, **kwargs: object) -> None:
@@ -75,13 +78,13 @@ class _ComponentInstallSwitch(BrilliantPanelEntity, SwitchEntity):
     _unique_id_suffix: str
     _failure_translation_key: str
 
-    def __init__(self, entry: BrilliantMqttConfigEntry) -> None:
-        super().__init__(entry.runtime_data)
-        self._attr_unique_id = f"{entry.entry_id}_{self._unique_id_suffix}"
+    def __init__(self, manager: PanelManager) -> None:
+        super().__init__(manager)
+        self._attr_unique_id = f"{manager.store.management_id}_{self._unique_id_suffix}"
 
     @property
     def is_on(self) -> bool:
-        components = self._manager.entry.data.get(CONF_COMPONENTS, {})
+        components = self._manager.store.data.get(CONF_COMPONENTS, {})
         return bool(components.get(self._component_id, False))
 
     async def async_turn_on(self, **kwargs: object) -> None:
@@ -96,16 +99,20 @@ class _ComponentInstallSwitch(BrilliantPanelEntity, SwitchEntity):
                 await self._manager.async_install_component(self._component_id)
             else:
                 await self._manager.async_remove_component(self._component_id)
-        except _HostKeyChanged as err:
+        except _HostKeyChanged:
             raise HomeAssistantError(
                 translation_domain=DOMAIN, translation_key="host_key_changed"
-            ) from err
+            ) from None
         except (OSError, asyncssh.Error, PanelOpError) as err:
+            summary = _safe_failure_summary(
+                "panel component operation failed",
+                err,
+            )
             raise HomeAssistantError(
                 translation_domain=DOMAIN,
                 translation_key=self._failure_translation_key,
-                translation_placeholders={"error": str(err)},
-            ) from err
+                translation_placeholders={"error": summary},
+            ) from None
 
 
 class WifiWatchdogSwitch(_ComponentInstallSwitch):

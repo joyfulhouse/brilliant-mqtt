@@ -27,6 +27,7 @@ from .ha_control_protocol import (
     MAPPING_VERSION,
     SCHEMA_VERSION,
     encode_json,
+    is_panel_slug,
     mode_command_topic,
     scene_command_topic,
 )
@@ -47,7 +48,6 @@ _MAX_STRING_LENGTH = 4_096
 _RESULT_TIMEOUT_SECONDS = 16.0
 
 _TOPIC_PREFIX = ("brilliant", "ha-control", "v1")
-_PANEL_PATTERN = re.compile(r"[a-z0-9][a-z0-9_-]{0,62}")
 _SERVICE_PATTERN = re.compile(r"[a-z0-9_]+")
 _RESULT_ERROR_PATTERN = re.compile(r"[a-z0-9_]{1,64}")
 _TARGET_KEYS = frozenset({"entity_id", "device_id", "area_id"})
@@ -380,6 +380,7 @@ class SceneControl:
             topic = (
                 scene_command_topic(selected) if kind == "scene" else mode_command_topic(selected)
             )
+            publish_failed = False
             try:
                 await mqtt.async_publish(self.hass, topic, payload, retain=False)
             except asyncio.CancelledError:
@@ -394,13 +395,16 @@ class SceneControl:
                     kind,
                     type(error).__name__,
                 )
-                raise HomeAssistantError(f"Brilliant {kind} command publish failed.") from error
+                publish_failed = True
+            if publish_failed:
+                raise HomeAssistantError(f"Brilliant {kind} command publish failed.") from None
 
+        timed_out = False
         try:
             async with asyncio.timeout(_RESULT_TIMEOUT_SECONDS):
                 result = await future
-        except TimeoutError as error:
-            raise HomeAssistantError(f"Brilliant {kind} confirmation timed out.") from error
+        except TimeoutError:
+            timed_out = True
         finally:
             async with self._lifecycle_lock:
                 current = self._pending.get(command_id)
@@ -408,6 +412,8 @@ class SceneControl:
                     self._pending.pop(command_id, None)
                 if not future.done():
                     future.cancel()
+        if timed_out:
+            raise HomeAssistantError(f"Brilliant {kind} confirmation timed out.") from None
         if not result.accepted:
             detail = f": {result.error}" if result.error is not None else ""
             raise HomeAssistantError(f"Brilliant {kind} execution failed{detail}.")
@@ -439,8 +445,11 @@ class SceneControl:
                 await self._async_result(kind, topic_value, payload, retained=message.retain)
         except (TypeError, ValueError):
             _LOGGER.warning("Ignored invalid Brilliant scene control MQTT message")
-        except Exception:
-            _LOGGER.exception("Brilliant scene control MQTT callback failed; continuing")
+        except Exception as error:
+            _LOGGER.error(
+                "Brilliant scene control MQTT callback failed (%s); continuing",
+                type(error).__name__,
+            )
 
     async def _async_catalog(
         self,
@@ -808,7 +817,7 @@ def _validated_uuid(value: str) -> str:
 
 
 def _is_panel(value: object) -> bool:
-    return isinstance(value, str) and _PANEL_PATTERN.fullmatch(value) is not None
+    return is_panel_slug(value)
 
 
 def _decode_scene_options(raw_items: list[object]) -> tuple[SceneOption, ...]:

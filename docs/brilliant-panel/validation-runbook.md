@@ -183,10 +183,12 @@ Room metadata did not repair ownership or command routing. Keep
 [retirement/cleanup guide](../ha-mirror.md).
 
 The supported hardware gate is the non-hosting
-[Office scene-bridge pilot](runbooks/scene-bridge-pilot.md). Native HA tiles are
-a separate Virtual Control research track and remain blocked until every
-feasibility gate passes. Historical Tier-1 observations may support failure
-analysis, but they do not authorize another physical-host pilot.
+[Office scene-bridge pilot](runbooks/scene-bridge-pilot.md). Generic native HA
+tiles are a separate Virtual Control research track. Selected shipped partner
+stubs have their own ordered
+[shade/lock feasibility gates](native-partner-stub-feasibility.md). Both tracks
+remain production-blocked, and neither authorizes another physical-host pilot.
+Historical Tier-1 observations may support failure analysis only.
 
 ## 9. Scene validation
 

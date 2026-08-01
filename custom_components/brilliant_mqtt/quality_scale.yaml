@@ -4,11 +4,10 @@
 # Status values: done, todo, exempt
 # For exempt rules, include a comment explaining why.
 #
-# This integration is a HACS custom component that manages the lifecycle of the
-# on-panel brilliant-mqtt agent. The devices themselves are native MQTT-Discovery
-# entities published by that agent; this integration adds per-panel management
-# entities (bridge-health binary_sensor, repair button, agent update) plus the
-# OTA repair state machine, talking to MQTT (state/LWT) and the panel over SSH.
+# This HACS custom component owns one Brilliant fleet hub config entry with
+# per-panel config subentries. Each panel agent publishes native MQTT Discovery
+# devices while the integration adds panel management entities and coordinates
+# MQTT validation, SSH provisioning, repair, and update lifecycles.
 
 rules:
   # =============================================================================
@@ -29,19 +28,19 @@ rules:
 
   common-modules:
     status: done
-    comment: Shared base entity in entity.py (BrilliantPanelEntity); per-entry runtime in manager.py (PanelManager).
+    comment: Shared entity behavior lives in entity.py; FleetManager owns entry-wide resources and delegates panel state to PanelManager.
 
   config-flow:
     status: done
-    comment: Full config flow in config_flow.py (config_flow:true); one config entry per panel.
+    comment: The flow creates one singleton fleet, validates either the recommended official Mosquitto add-on or an existing broker, then manages panels as config subentries.
 
   config-flow-test-coverage:
     status: done
-    comment: tests/test_config_flow.py covers the user, reconfigure, and options flows including error paths.
+    comment: ha/tests/test_config_flow.py covers fleet bootstrap, broker validation, panel onboarding, subentry reconfiguration, options, races, and error paths.
 
   dependency-transparency:
     status: done
-    comment: The single runtime dependency (asyncssh, pinned) is declared in manifest requirements.
+    comment: All pinned runtime dependencies (asyncssh, aiomqtt, and paho-mqtt) are declared in manifest requirements.
 
   docs-actions:
     status: done
@@ -65,7 +64,7 @@ rules:
 
   entity-unique-id:
     status: done
-    comment: Every entity sets _attr_unique_id (f"{entry_id}_<role>").
+    comment: Every entity derives _attr_unique_id from its panel's stable management identity plus its role.
 
   has-entity-name:
     status: done
@@ -73,11 +72,11 @@ rules:
 
   runtime-data:
     status: done
-    comment: PanelManager is stored in entry.runtime_data (typed BrilliantMqttConfigEntry).
+    comment: FleetManager is stored in entry.runtime_data (typed BrilliantMqttConfigEntry) and exposes its panel runtimes through a read-only mapping.
 
   test-before-configure:
     status: done
-    comment: The config flow opens an SSH connection (_probe_panel) before creating the entry.
+    comment: Panel onboarding fetches the SSH host identity before password authentication, then performs a pinned read-only inspection before any provisioning write.
 
   test-before-setup:
     status: done
@@ -85,7 +84,7 @@ rules:
 
   unique-config-entry:
     status: done
-    comment: The config flow sets the panel slug as unique_id and calls _abort_if_unique_id_configured().
+    comment: The singleton fleet uses the fixed brilliant_mqtt_fleet unique ID; each panel subentry uses its verified SSH host-key fingerprint as unique_id.
 
   # =============================================================================
   # Silver Tier (Reliability & Robustness)
@@ -97,15 +96,15 @@ rules:
 
   config-entry-unloading:
     status: done
-    comment: async_unload_entry unloads platforms and calls PanelManager.async_shutdown (cancels timers, drops MQTT subscriptions).
+    comment: async_unload_entry unloads platforms and calls FleetManager.async_shutdown, which drains every panel timer, task, and MQTT subscription.
 
   docs-configuration-parameters:
     status: done
-    comment: Options (auto-repair, grace, cooldown, trust-host-key-changes) documented in strings.json and docs/ha-integration.md (Options).
+    comment: Fleet broker, HA-control, scenes, resilience defaults, mesh priorities, and bounded per-panel feature overrides are documented in strings.json and docs/ha-integration.md.
 
   docs-installation-parameters:
     status: done
-    comment: Add-panel form fields documented in strings.json and docs/ha-integration.md (The add-panel form).
+    comment: Fleet creation, both equal-level broker choices, validation stages, and the Add panel fields are documented in strings.json, INSTALL.md, and docs/ha-integration.md.
 
   entity-unavailable:
     status: exempt
@@ -125,7 +124,7 @@ rules:
 
   reauthentication-flow:
     status: exempt
-    comment: No cloud/OAuth credentials. The only secret is the panel root password, rotated via the reconfigure flow (verified against the pinned host key before auth).
+    comment: There is no cloud/OAuth session. MQTT credentials use the validated broker settings flow; panel credential repair requires the exact pinned identity, while replacement identity requires an explicit confirmed rebind.
 
   test-coverage:
     status: done
@@ -141,15 +140,15 @@ rules:
 
   diagnostics:
     status: done
-    comment: diagnostics.py implements async_get_config_entry_diagnostics with secrets redacted.
+    comment: diagnostics.py returns allowlisted fleet health, panel configuration/runtime state, and provisioning count/phase while excluding credentials and raw journal contents.
 
   discovery:
     status: exempt
-    comment: Panels are added manually (one config entry per panel); they expose no network discovery protocol for this management surface.
+    comment: Panels are added manually as subentries below the singleton fleet; they expose no network discovery protocol for this management surface.
 
   discovery-update-info:
     status: exempt
-    comment: No discovery (see discovery); host/credentials are updated via the reconfigure flow.
+    comment: No discovery (see discovery); address and credentials use pinned-identity subentry flows, and replacement hardware requires explicit confirmed rebind.
 
   docs-data-update:
     status: done
@@ -180,8 +179,8 @@ rules:
     comment: README (Why this over HomeKit Controller) and docs/ha-integration.md (Events) cover the use cases.
 
   dynamic-devices:
-    status: exempt
-    comment: Exactly one device per config entry, fixed at setup; no devices appear or disappear at runtime.
+    status: done
+    comment: FleetManager reconciles panel subentry additions and removals, with an entry reload when platform entities must be rebuilt.
 
   entity-category:
     status: done
@@ -209,7 +208,7 @@ rules:
 
   reconfiguration-flow:
     status: done
-    comment: config_flow.async_step_reconfigure rotates a panel's host/root password (slug immutable).
+    comment: Focused panel subentry flows rename, change address, repair credentials, or explicitly rebind replacement hardware while preserving the immutable panel slug.
 
   repair-issues:
     status: done
@@ -217,7 +216,7 @@ rules:
 
   stale-devices:
     status: exempt
-    comment: One device per config entry; the device is removed when its entry is unloaded/removed.
+    comment: Panel devices and management entities carry exact config-subentry associations, so Home Assistant removes their ownership with the deleted panel subentry.
 
   # =============================================================================
   # Platinum Tier (Technical Excellence)
@@ -225,7 +224,7 @@ rules:
 
   async-dependency:
     status: done
-    comment: asyncssh (the only dependency) is fully async; all panel I/O is awaited.
+    comment: Panel SSH uses awaited asyncssh APIs; MQTT device-principal work uses aiomqtt's async API with Paho behind that adapter.
 
   inject-websession:
     status: done

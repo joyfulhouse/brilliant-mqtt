@@ -28,9 +28,31 @@ from pytest_homeassistant_custom_component.common import (
 from pytest_homeassistant_custom_component.typing import MqttMockHAClient
 
 from custom_components.brilliant_mqtt.const import DOMAIN
+from custom_components.brilliant_mqtt.entry_data import LegacyPanelStore
+from custom_components.brilliant_mqtt.fleet_manager import (
+    FleetManager,
+    legacy_fleet_config,
+)
 from custom_components.brilliant_mqtt.manager import PanelManager
 from tests.fakes import FakeShell
 from tests.test_init import ENTRY_DATA
+
+
+def _legacy_manager(hass: HomeAssistant, entry: MockConfigEntry) -> PanelManager:
+    """Build one compatibility manager through its production adapters."""
+    return PanelManager(
+        hass,
+        LegacyPanelStore(hass, entry),
+        legacy_fleet_config(entry),
+        asyncio.Lock(),
+    )
+
+
+def _entry_manager(entry: MockConfigEntry) -> PanelManager:
+    """Return the compatibility panel below the loaded fleet runtime."""
+    runtime = entry.runtime_data
+    assert isinstance(runtime, FleetManager)
+    return runtime.panels[entry.entry_id]
 
 
 def _offline_msg() -> ReceiveMessage:
@@ -74,13 +96,13 @@ async def test_escalation_raises_repair_issue_and_recovery_clears_it(
     assert issue.translation_placeholders["panel"] == "office"
     assert "grace" in issue.translation_placeholders["reason"]
     assert issue.severity == ir.IssueSeverity.ERROR
-    assert entry.runtime_data.problem is True
+    assert _entry_manager(entry).problem is True
 
     # Bridge recovers → the problem clears → the issue is deleted.
     async_fire_mqtt_message(hass, "brilliant/office/availability", "online")
     await hass.async_block_till_done()
     assert registry.async_get_issue(DOMAIN, issue_id) is None
-    assert entry.runtime_data.problem is False
+    assert _entry_manager(entry).problem is False
 
     assert await hass.config_entries.async_unload(entry.entry_id)
 
@@ -132,7 +154,7 @@ async def test_update_already_in_progress_raises_translated_error(
     """The re-entrancy guard raises a translated HomeAssistantError, not a raw string."""
     entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
     entry.add_to_hass(hass)
-    manager = PanelManager(hass, entry, asyncio.Lock())
+    manager = _legacy_manager(hass, entry)
     manager._repairing = True  # simulate a concurrent repair/update in flight
 
     with pytest.raises(HomeAssistantError) as err:
@@ -147,25 +169,28 @@ async def test_update_step_failure_raises_translated_update_failed(
     mqtt_mock: MqttMockHAClient,
     payload_dir: Path,
 ) -> None:
-    """A failed update step raises HomeAssistantError(translation_key='update_failed')
-    with the underlying error as a placeholder, and escalates a repair issue."""
+    """A failed update step raises a redacted translated error and repair issue."""
     from custom_components.brilliant_mqtt.shell import RunResult
 
     shell = FakeShell(responses={"systemctl restart brilliant-mqtt": RunResult(1, "", "boom")})
-    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+    with patch(
+        "custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell",
+        return_value=shell,
+    ):
         entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
         entry.add_to_hass(hass)
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
         with pytest.raises(HomeAssistantError) as err:
-            await entry.runtime_data.async_update_agent()
+            await _entry_manager(entry).async_update_agent()
         await hass.async_block_till_done()
 
     assert err.value.translation_domain == DOMAIN
     assert err.value.translation_key == "update_failed"
     assert err.value.translation_placeholders is not None
-    assert "boom" in err.value.translation_placeholders["error"]
+    assert err.value.translation_placeholders["error"] == ("agent update failed during deployment")
+    assert "boom" not in repr(err.value.translation_placeholders)
     # The same outage was surfaced as a repair issue.
     issue = ir.async_get(hass).async_get_issue(DOMAIN, f"needs_attention_{entry.entry_id}")
     assert issue is not None
@@ -178,17 +203,23 @@ async def test_uninstall_failure_raises_translated_uninstall_failed(
 ) -> None:
     """A failed uninstall raises HomeAssistantError(translation_key='uninstall_failed')."""
     shell = FakeShell(connect_error=OSError("unreachable"))
-    with patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell):
+    with patch(
+        "custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell",
+        return_value=shell,
+    ):
         entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
         entry.add_to_hass(hass)
-        manager = PanelManager(hass, entry, asyncio.Lock())
+        manager = _legacy_manager(hass, entry)
 
         with pytest.raises(HomeAssistantError) as err:
             await manager.async_uninstall()
     assert err.value.translation_domain == DOMAIN
     assert err.value.translation_key == "uninstall_failed"
     assert err.value.translation_placeholders is not None
-    assert "unreachable" in err.value.translation_placeholders["error"]
+    assert err.value.translation_placeholders["error"] == (
+        "agent uninstall could not connect to the panel"
+    )
+    assert "unreachable" not in repr(err.value.translation_placeholders)
     # The same failure was surfaced as a repair issue.
     issue = ir.async_get(hass).async_get_issue(DOMAIN, f"needs_attention_{entry.entry_id}")
     assert issue is not None
@@ -202,7 +233,7 @@ async def test_update_host_key_changed_raises_translated_error(
     """A rotated host key during update raises translation_key='host_key_changed'."""
     entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
     entry.add_to_hass(hass)
-    manager = PanelManager(hass, entry, asyncio.Lock())
+    manager = _legacy_manager(hass, entry)
 
     with pytest.raises(HomeAssistantError) as err:
         await manager.async_update_agent()
@@ -224,7 +255,7 @@ async def test_uninstall_host_key_changed_raises_translated_error(
     """
     entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
     entry.add_to_hass(hass)
-    manager = PanelManager(hass, entry, asyncio.Lock())
+    manager = _legacy_manager(hass, entry)
 
     with pytest.raises(HomeAssistantError) as err:
         await manager.async_uninstall()

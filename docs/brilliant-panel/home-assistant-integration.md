@@ -18,7 +18,7 @@ records the validation and retirement gates.
 | Panel scene/mode catalogs, execution events, and confirmed commands | Implemented; off-panel tested | The agent reuses its existing bus/MQTT clients. Firmware codecs and lifecycle paths are tested with acquired-format fixtures and fakes. |
 | HA scene select, run button, services, events, configured scene actions, and diagnostics | Implemented; off-panel tested | HA tests cover strict input, action dispatch, confirmation, timeouts, restarts, and bounded state. |
 | Office deployment and physical acceptance | Pending hardware acceptance | Do not call the feature hardware-supported until every criterion in the [Office runbook](runbooks/scene-bridge-pilot.md) passes. |
-| Native HA device/room tiles on Brilliant | Blocked research | Physical-Control hosting is rejected. Virtual Control remains blocked behind the [feasibility gates](../superpowers/plans/2026-07-12-virtual-control-feasibility-gates.md). |
+| Native HA device/room tiles on Brilliant | Separate blocked research | This safe scene/mode baseline does not create tiles. Physical-Control hosting is rejected; selected shipped partner stubs now have their own [feasibility gates](native-partner-stub-feasibility.md), while generic types still require Virtual Control to pass its [separate gates](../superpowers/plans/2026-07-12-virtual-control-feasibility-gates.md). |
 | Creating or editing Brilliant scenes/modes | Not implemented | The bridge catalogs and executes existing IDs only. It never creates arbitrary configuration blobs. |
 
 Evidence labels and safe validation levels are defined in the generic
@@ -43,7 +43,8 @@ The supported HA surfaces are:
 Existing Brilliant scenes remain visible in Brilliant's own UI because they are
 native configuration. Labels, HA areas, Brilliant-room overrides, and display
 metadata prepare an HA-owned entity manifest; they do not render panel tiles
-while the native peripheral transport is blocked.
+because this baseline has no native peripheral transport. The stock
+partner-stub and Virtual Control transports are separate gated research tracks.
 
 The earlier pilots proved that room metadata was necessary but insufficient.
 The UI excludes empty room assignments from ordinary room models, so a valid
@@ -105,7 +106,9 @@ The JSON forms are bounded to 64 KiB, 2,048 JSON nodes, depth 12, and 4,096
 characters per general string. Invalid JSON is rejected rather than partially
 applied. Room, area, label, domain, and maximum fields influence only the
 HA-owned generic manifest today. They are groundwork for a future gated native
-transport, not evidence that native HA tiles are available.
+transport, not evidence that native HA tiles are available. The separate
+partner-stub track does not consume this generic manifest without an explicit,
+reviewed adapter.
 
 ### Scene-action JSON
 
@@ -363,7 +366,7 @@ all `brilliant/#` traffic.
 | Unknown ID | HA service says the scene/mode is unavailable, or agent result is `unknown_scene`/`unknown_mode` | Refresh catalog and use its exact current ID. Never send a display name or arbitrary blob. |
 | Confirmation timeout | HA waits 16 seconds; panel result may say `timeout` after 15 seconds | Check for a matching execution record and panel status. Do not retry repeatedly; verify physical state and logs first. |
 | Malformed MQTT | HA logs one ignored invalid scene-control message; no event/action | Compare exact fields, schema/mapping version, retain flag, timestamp, topic/payload panel, and canonical deduplication key. |
-| No Backyard tile | Expected safe-baseline behavior | Use HA scene surfaces. Native tiles remain blocked; room metadata alone does not enable them. |
+| No Backyard tile | Expected safe-baseline behavior | Use HA scene surfaces. This integration does not create native tiles; room metadata alone does not enable them. Selected partner stubs and generic Virtual Control hosting remain separate gated research tracks. |
 
 The complete hardware procedure, timing record, restart matrix, and rollback are
 in the [Office scene-bridge pilot](runbooks/scene-bridge-pilot.md).

@@ -1,226 +1,350 @@
-"""Unit tests for the versioned MQTT setup wire contract (setup_protocol.py)."""
-
 from __future__ import annotations
 
 import json
-from uuid import uuid1, uuid4
+import traceback
+from dataclasses import FrozenInstanceError, asdict
+from pathlib import Path
+from typing import Any
+from uuid import UUID
 
 import pytest
 
 from brilliant_mqtt.setup_protocol import (
-    MAX_SETUP_PAYLOAD_BYTES,
-    SCHEMA_VERSION,
+    MAX_PREFLIGHT_REPORT_BYTES,
+    PreflightReport,
+    PreflightRequest,
+    PreflightStage,
     SetupRequest,
     SetupResult,
     SetupTopics,
 )
 
-
-def _uuid4_str() -> str:
-    return str(uuid4())
-
-
-# -- SetupTopics --------------------------------------------------------------
-
-
-def test_setup_topics_for_id_builds_expected_shape() -> None:
-    setup_id = uuid4()
-    topics = SetupTopics.for_id(setup_id)
-
-    canonical = str(setup_id)
-    assert topics.panel_to_ha == f"brilliant/setup/{canonical}/panel_to_ha"
-    assert topics.ha_to_panel == f"brilliant/setup/{canonical}/ha_to_panel"
-    assert topics.retained == f"brilliant/setup/{canonical}/retained"
-    assert topics.discovery_probe == f"homeassistant/brilliant_mqtt_setup/{canonical}/probe"
-
-
-def test_setup_topics_for_id_rejects_non_v4_uuid() -> None:
-    with pytest.raises(ValueError, match="invalid_setup_id"):
-        SetupTopics.for_id(uuid1())
-
-
-# -- SetupRequest ---------------------------------------------------------------
-
-
-def test_setup_request_round_trip_via_str_payload() -> None:
-    setup_id = uuid4()
-    request = SetupRequest(setup_id, "panel-nonce-1")
-
-    parsed = SetupRequest.from_payload(request.to_payload())
-
-    assert parsed == request
+FIXTURE_PATH = Path(__file__).parent / "fixtures/mqtt_setup_v1_vectors.json"
+VECTORS = json.loads(FIXTURE_PATH.read_text())
+SETUP_ID = "12345678-1234-4abc-8def-1234567890ab"
+REQUEST = {"schema_version": 1, "setup_id": SETUP_ID, "nonce": "panel-nonce"}
+RESULT = {
+    "schema_version": 1,
+    "setup_id": SETUP_ID,
+    "nonce": "ha-nonce",
+    "reply_to_nonce": "panel-nonce",
+}
+PREFLIGHT_REQUEST = {
+    "schema_version": 1,
+    "setup_id": SETUP_ID,
+    "panel_nonce": "panel-nonce",
+    "ha_nonce": "ha-nonce",
+    "timeout_seconds": 10.0,
+}
+SUCCESS_REPORT = {
+    "completed_stages": [stage.value for stage in PreflightStage],
+    "last_stage": "cleanup",
+    "schema_version": 1,
+    "setup_id": SETUP_ID,
+    "stage_elapsed_ms": {stage.value: 1 for stage in PreflightStage},
+    "success": True,
+}
 
 
-def test_setup_request_round_trip_via_bytes_payload() -> None:
-    request = SetupRequest(uuid4(), "panel-nonce-bytes")
-
-    parsed = SetupRequest.from_payload(request.to_payload().encode("utf-8"))
-
-    assert parsed == request
+def _canonical(value: object) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
-def test_setup_request_to_payload_is_canonical_compact_json() -> None:
-    setup_id = uuid4()
-    request = SetupRequest(setup_id, "n1")
+def test_golden_vectors_match_topics_and_canonical_payloads() -> None:
+    assert VECTORS["schema_version"] == 1
+    for vector in VECTORS["vectors"]:
+        setup_id = UUID(vector["setup_id"])
+        request = SetupRequest.from_payload(_canonical(vector["request"]))
+        result = SetupResult.from_payload(_canonical(vector["result"]).encode())
 
-    assert request.to_payload() == json.dumps(
-        {"schema_version": SCHEMA_VERSION, "setup_id": str(setup_id), "nonce": "n1"},
-        sort_keys=True,
-        separators=(",", ":"),
+        assert asdict(SetupTopics.for_id(setup_id)) == vector["topics"]
+        assert request == SetupRequest(setup_id=setup_id, nonce=vector["request"]["nonce"])
+        assert result == SetupResult(
+            setup_id=setup_id,
+            nonce=vector["result"]["nonce"],
+            reply_to_nonce=vector["result"]["reply_to_nonce"],
+        )
+        assert request.to_payload() == _canonical(vector["request"])
+        assert result.to_payload() == _canonical(vector["result"])
+
+
+def test_payload_output_canonicalizes_setup_id() -> None:
+    value = dict(REQUEST)
+    value["setup_id"] = SETUP_ID.upper()
+
+    assert SetupRequest.from_payload(_canonical(value)).to_payload() == _canonical(REQUEST)
+
+
+@pytest.mark.parametrize(
+    ("contract_type", "payload", "error_prefix"),
+    [
+        (SetupRequest, {**REQUEST, "setup_id": "not-a-uuid"}, "invalid_setup_id"),
+        (SetupResult, {**RESULT, "setup_id": "not-a-uuid"}, "invalid_setup_id"),
+        (SetupRequest, {**REQUEST, "schema_version": 2}, "unsupported_setup_schema"),
+        (SetupResult, {**RESULT, "schema_version": 2}, "unsupported_setup_schema"),
+        (SetupRequest, {**REQUEST, "extra": True}, "invalid_setup_payload"),
+        (SetupResult, {**RESULT, "extra": True}, "invalid_setup_payload"),
+        (SetupRequest, {"schema_version": 1, "setup_id": SETUP_ID}, "invalid_setup_payload"),
+        (
+            SetupResult,
+            {"schema_version": 1, "setup_id": SETUP_ID, "nonce": "ha-nonce"},
+            "invalid_setup_payload",
+        ),
+        (SetupRequest, {**REQUEST, "nonce": ""}, "invalid_setup_payload"),
+        (SetupResult, {**RESULT, "reply_to_nonce": ""}, "invalid_setup_payload"),
+    ],
+)
+def test_payloads_reject_invalid_contract_shapes(
+    contract_type: type[SetupRequest] | type[SetupResult],
+    payload: dict[str, Any],
+    error_prefix: str,
+) -> None:
+    with pytest.raises(ValueError, match=rf"^{error_prefix}"):
+        contract_type.from_payload(_canonical(payload))
+
+
+@pytest.mark.parametrize(
+    ("contract_type", "payload", "field"),
+    [
+        (SetupRequest, REQUEST, "nonce"),
+        (SetupResult, RESULT, "nonce"),
+        (SetupResult, RESULT, "reply_to_nonce"),
+    ],
+)
+@pytest.mark.parametrize("invalid_nonce", [None, 0, False])
+def test_payloads_reject_non_string_nonces(
+    contract_type: type[SetupRequest] | type[SetupResult],
+    payload: dict[str, object],
+    field: str,
+    invalid_nonce: object,
+) -> None:
+    value = dict(payload)
+    value[field] = invalid_nonce
+
+    with pytest.raises(ValueError, match=r"^invalid_setup_payload"):
+        contract_type.from_payload(_canonical(value))
+
+
+def test_deeply_nested_json_maps_parser_recursion_to_stable_error() -> None:
+    payload = (
+        '{"schema_version":1,"setup_id":"'
+        + SETUP_ID
+        + '","nonce":'
+        + "[" * 1_100
+        + "null"
+        + "]" * 1_100
+        + "}"
     )
 
-
-def test_setup_request_rejects_non_v4_setup_id() -> None:
-    with pytest.raises(ValueError, match="invalid_setup_id"):
-        SetupRequest(uuid1(), "n1")
+    with pytest.raises(ValueError, match=r"^invalid_setup_payload"):
+        SetupRequest.from_payload(payload)
 
 
-def test_setup_request_rejects_empty_nonce() -> None:
-    with pytest.raises(ValueError, match="invalid_setup_payload: nonce"):
-        SetupRequest(uuid4(), "")
+@pytest.mark.parametrize("contract_type", [SetupRequest, SetupResult])
+def test_payloads_reject_16_385_bytes(
+    contract_type: type[SetupRequest] | type[SetupResult],
+) -> None:
+    with pytest.raises(ValueError, match=r"^setup_payload_too_large"):
+        contract_type.from_payload(b"x" * 16_385)
 
 
-def test_setup_request_from_payload_rejects_non_string_nonce() -> None:
-    raw = json.dumps({"schema_version": SCHEMA_VERSION, "setup_id": _uuid4_str(), "nonce": 123})
-    with pytest.raises(ValueError, match="invalid_setup_payload: nonce"):
-        SetupRequest.from_payload(raw)
+def test_topics_reject_non_v4_setup_id() -> None:
+    with pytest.raises(ValueError, match=r"^invalid_setup_id"):
+        SetupTopics.for_id(UUID("12345678-1234-1abc-8def-1234567890ab"))
 
 
-def test_setup_request_from_payload_rejects_non_string_setup_id() -> None:
-    raw = json.dumps({"schema_version": SCHEMA_VERSION, "setup_id": 42, "nonce": "n1"})
-    with pytest.raises(ValueError, match="invalid_setup_id"):
-        SetupRequest.from_payload(raw)
+@pytest.mark.parametrize(
+    ("value", "field"),
+    [
+        (SetupTopics.for_id(UUID(SETUP_ID)), "panel_to_ha"),
+        (SetupRequest(UUID(SETUP_ID), "panel-nonce"), "nonce"),
+        (SetupResult(UUID(SETUP_ID), "ha-nonce", "panel-nonce"), "reply_to_nonce"),
+    ],
+)
+def test_contract_objects_are_frozen_and_slotted(value: object, field: str) -> None:
+    assert not hasattr(value, "__dict__")
+    with pytest.raises(FrozenInstanceError):
+        setattr(value, field, "changed")
 
 
-# -- SetupResult ------------------------------------------------------------------
+def test_preflight_request_round_trips_exact_canonical_json() -> None:
+    raw = _canonical(PREFLIGHT_REQUEST)
+
+    request = PreflightRequest.from_json(raw)
+
+    assert request.to_json() == raw
+    assert request.setup_id == UUID(SETUP_ID)
+    assert request.timeout_seconds == 10.0
 
 
-def test_setup_result_round_trip() -> None:
-    setup_id = uuid4()
-    result = SetupResult(setup_id, "ha-nonce", "panel-nonce")
+@pytest.mark.parametrize(
+    "raw",
+    [
+        json.dumps(PREFLIGHT_REQUEST),
+        _canonical(PREFLIGHT_REQUEST) + "\n",
+        _canonical({**PREFLIGHT_REQUEST, "extra": True}),
+        _canonical({**PREFLIGHT_REQUEST, "panel_nonce": "x" * 257}),
+        _canonical({**PREFLIGHT_REQUEST, "timeout_seconds": True}),
+    ],
+)
+def test_preflight_request_rejects_noncanonical_or_unbounded_input(raw: str) -> None:
+    with pytest.raises(ValueError, match=r"^invalid_preflight_request$"):
+        PreflightRequest.from_json(raw)
 
-    parsed = SetupResult.from_payload(result.to_payload())
 
-    assert parsed == result
+def test_preflight_report_round_trips_exact_success_contract() -> None:
+    raw = _canonical(SUCCESS_REPORT)
+
+    report = PreflightReport.from_json(raw)
+
+    assert report.to_json() == raw
+    assert report.success is True
+    assert report.completed_stages == tuple(PreflightStage)
+    assert report.last_stage is PreflightStage.CLEANUP
 
 
-def test_setup_result_to_payload_is_canonical_compact_json() -> None:
-    setup_id = uuid4()
-    result = SetupResult(setup_id, "n1", "n2")
-
-    assert result.to_payload() == json.dumps(
-        {
-            "schema_version": SCHEMA_VERSION,
-            "setup_id": str(setup_id),
-            "nonce": "n1",
-            "reply_to_nonce": "n2",
+def test_preflight_report_round_trips_exact_failure_contract() -> None:
+    value = {
+        "completed_stages": ["fleet_auth", "cleanup"],
+        "detail": "MQTT stage timed out",
+        "error_code": "mqtt_timeout",
+        "failed_stage": "panel_to_ha",
+        "schema_version": 1,
+        "setup_id": SETUP_ID,
+        "stage_elapsed_ms": {
+            "cleanup": 1,
+            "fleet_auth": 1,
+            "panel_to_ha": 1,
         },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-
-
-def test_setup_result_rejects_non_v4_setup_id() -> None:
-    with pytest.raises(ValueError, match="invalid_setup_id"):
-        SetupResult(uuid1(), "n1", "n2")
-
-
-def test_setup_result_rejects_empty_nonce() -> None:
-    with pytest.raises(ValueError, match="invalid_setup_payload: nonce"):
-        SetupResult(uuid4(), "", "n2")
-
-
-def test_setup_result_rejects_empty_reply_to_nonce() -> None:
-    with pytest.raises(ValueError, match="invalid_setup_payload: reply_to_nonce"):
-        SetupResult(uuid4(), "n1", "")
-
-
-# -- Shared payload envelope validation (_decode_payload / _payload_size) -----
-
-
-def test_from_payload_rejects_malformed_json() -> None:
-    with pytest.raises(ValueError, match="invalid_setup_payload: expected a JSON object"):
-        SetupRequest.from_payload("{not json")
-
-
-def test_from_payload_rejects_non_dict_json() -> None:
-    with pytest.raises(ValueError, match="invalid_setup_payload: expected a JSON object"):
-        SetupRequest.from_payload("[1, 2, 3]")
-
-
-def test_from_payload_rejects_scalar_json() -> None:
-    with pytest.raises(ValueError, match="invalid_setup_payload: expected a JSON object"):
-        SetupResult.from_payload('"just a string"')
-
-
-def test_from_payload_rejects_missing_key() -> None:
-    raw = json.dumps({"schema_version": SCHEMA_VERSION, "setup_id": _uuid4_str()})
-    with pytest.raises(ValueError, match="unexpected or missing keys"):
-        SetupRequest.from_payload(raw)
-
-
-def test_from_payload_rejects_extra_key() -> None:
-    raw = json.dumps(
-        {
-            "schema_version": SCHEMA_VERSION,
-            "setup_id": _uuid4_str(),
-            "nonce": "n1",
-            "unexpected": "x",
-        }
-    )
-    with pytest.raises(ValueError, match="unexpected or missing keys"):
-        SetupRequest.from_payload(raw)
-
-
-def test_from_payload_rejects_result_wrong_keys() -> None:
-    # A well-formed *request* payload is missing reply_to_nonce for a *result*.
-    raw = SetupRequest(uuid4(), "n1").to_payload()
-    with pytest.raises(ValueError, match="unexpected or missing keys"):
-        SetupResult.from_payload(raw)
-
-
-def test_from_payload_rejects_wrong_schema_version_value() -> None:
-    raw = json.dumps({"schema_version": 2, "setup_id": _uuid4_str(), "nonce": "n1"})
-    with pytest.raises(ValueError, match="unsupported_setup_schema"):
-        SetupRequest.from_payload(raw)
-
-
-def test_from_payload_rejects_schema_version_as_bool() -> None:
-    # bool is an int subclass in Python; `type(x) is not int` must still reject it.
-    raw_dict: dict[str, object] = {
-        "schema_version": True,
-        "setup_id": _uuid4_str(),
-        "nonce": "n1",
+        "success": False,
     }
-    with pytest.raises(ValueError, match="unsupported_setup_schema"):
-        SetupRequest.from_payload(json.dumps(raw_dict))
+    raw = _canonical(value)
+
+    report = PreflightReport.from_json(raw)
+
+    assert report.to_json() == raw
+    assert report.failed_stage is PreflightStage.PANEL_TO_HA
+    assert report.error_code == "mqtt_timeout"
 
 
-def test_from_payload_rejects_schema_version_as_string() -> None:
-    raw = json.dumps({"schema_version": "1", "setup_id": _uuid4_str(), "nonce": "n1"})
-    with pytest.raises(ValueError, match="unsupported_setup_schema"):
-        SetupRequest.from_payload(raw)
+def test_preflight_report_accepts_fixed_settings_failure_contract() -> None:
+    value = {
+        "completed_stages": ["cleanup"],
+        "detail": "Panel configuration invalid",
+        "error_code": "settings_invalid",
+        "failed_stage": "fleet_auth",
+        "schema_version": 1,
+        "setup_id": SETUP_ID,
+        "stage_elapsed_ms": {
+            "cleanup": 0,
+            "fleet_auth": 0,
+        },
+        "success": False,
+    }
+    raw = _canonical(value)
+
+    report = PreflightReport.from_json(raw)
+
+    assert report.to_json() == raw
+    assert report.error_code == "settings_invalid"
 
 
-def test_from_payload_rejects_oversize_payload() -> None:
-    raw = json.dumps(
-        {"schema_version": SCHEMA_VERSION, "setup_id": _uuid4_str(), "nonce": "x" * 20_000}
-    )
-    assert len(raw.encode("utf-8")) > MAX_SETUP_PAYLOAD_BYTES
-    with pytest.raises(ValueError, match="setup_payload_too_large"):
-        SetupRequest.from_payload(raw)
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"extra": True},
+        {"schema_version": 2},
+        {"success": 1},
+        {"completed_stages": ["fleet_auth", "ha_to_panel", "cleanup"]},
+        {"completed_stages": [stage.value for stage in tuple(PreflightStage)[:-1]]},
+        {"last_stage": "retained_message"},
+        {"stage_elapsed_ms": {"cleanup": True}},
+    ],
+)
+def test_preflight_report_rejects_wrong_schema_types_order_and_missing_cleanup(
+    mutation: dict[str, object],
+) -> None:
+    value = dict(SUCCESS_REPORT)
+    value.update(mutation)
+
+    with pytest.raises(ValueError, match=r"^invalid_preflight_report$"):
+        PreflightReport.from_json(_canonical(value))
 
 
-def test_from_payload_rejects_bytes_at_the_size_boundary() -> None:
-    # A raw bytes payload skips the JSON-decode step's own re-encode, so the
-    # byte-length check must still be evaluated first.
-    oversized = b"{" + b"x" * MAX_SETUP_PAYLOAD_BYTES + b"}"
-    with pytest.raises(ValueError, match="setup_payload_too_large"):
-        SetupRequest.from_payload(oversized)
+@pytest.mark.parametrize(
+    "raw",
+    [
+        json.dumps(SUCCESS_REPORT),
+        _canonical(SUCCESS_REPORT) + "\n",
+        "{}{}",
+        "[]",
+        b"x" * (MAX_PREFLIGHT_REPORT_BYTES + 1),
+    ],
+)
+def test_preflight_report_rejects_noncanonical_excess_or_oversized_output(
+    raw: bytes | str,
+) -> None:
+    with pytest.raises(ValueError, match=r"^invalid_preflight_report$"):
+        PreflightReport.from_json(raw)
 
 
-def test_from_payload_rejects_lone_surrogate_payload() -> None:
-    # A lone UTF-16 surrogate is a legal Python str but cannot be strict-UTF-8
-    # encoded; the size check must fail closed rather than raise UnicodeEncodeError.
-    with pytest.raises(ValueError, match="invalid_setup_payload: payload is not valid UTF-8"):
-        SetupRequest.from_payload("\ud800")
+@pytest.mark.parametrize(
+    ("error_code", "detail"),
+    [
+        ("mqtt_timeout", "raw timeout secret"),
+        ("unknown", "MQTT stage timed out"),
+        ("mqtt_authorization", "raw broker denial"),
+    ],
+)
+def test_preflight_report_failure_detail_is_fixed_by_allowlisted_code(
+    error_code: str,
+    detail: str,
+) -> None:
+    value = {
+        "completed_stages": ["fleet_auth", "cleanup"],
+        "detail": detail,
+        "error_code": error_code,
+        "failed_stage": "panel_to_ha",
+        "schema_version": 1,
+        "setup_id": SETUP_ID,
+        "stage_elapsed_ms": {
+            "cleanup": 1,
+            "fleet_auth": 1,
+            "panel_to_ha": 1,
+        },
+        "success": False,
+    }
+
+    with pytest.raises(ValueError, match=r"^invalid_preflight_report$"):
+        PreflightReport.from_json(_canonical(value))
+
+
+@pytest.mark.parametrize(
+    ("parser", "raw", "message"),
+    [
+        (
+            PreflightRequest.from_json,
+            '{"panel_nonce":"request-secret-do-not-retain"',
+            "invalid_preflight_request",
+        ),
+        (
+            PreflightReport.from_json,
+            '{"detail":"report-secret-do-not-retain"',
+            "invalid_preflight_report",
+        ),
+    ],
+)
+def test_preflight_parsers_drop_raw_json_exception_context(
+    parser: Any,
+    raw: str,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=rf"^{message}$") as raised:
+        parser(raw)
+
+    error = raised.value
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    surface = f"{error!r}\n{''.join(traceback.format_exception(error))}"
+    assert raw not in surface
+    assert "secret-do-not-retain" not in surface

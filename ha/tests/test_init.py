@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from homeassistant.components import mqtt
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.helpers import issue_registry as ir
 from homeassistant.loader import async_get_integration
 from pytest_homeassistant_custom_component.common import MockConfigEntry, async_fire_mqtt_message
 from pytest_homeassistant_custom_component.typing import MqttMockHAClient
@@ -20,6 +22,7 @@ from custom_components.brilliant_mqtt import (
     async_setup_entry,
     async_unload_entry,
 )
+from custom_components.brilliant_mqtt.components import REGISTRY
 from custom_components.brilliant_mqtt.const import (
     COMPONENT_BRIDGE,
     COMPONENT_HA_MIRROR,
@@ -45,6 +48,7 @@ from custom_components.brilliant_mqtt.const import (
     availability_topic,
     meta_topic,
 )
+from custom_components.brilliant_mqtt.fleet_manager import FleetManager
 from custom_components.brilliant_mqtt.ha_control import get_control_plane
 from custom_components.brilliant_mqtt.ha_control_protocol import (
     manifest_topic,
@@ -52,15 +56,37 @@ from custom_components.brilliant_mqtt.ha_control_protocol import (
     state_topic,
 )
 from custom_components.brilliant_mqtt.manager import PanelManager
+from custom_components.brilliant_mqtt.panel_provisioner import PanelProvisioner
+from custom_components.brilliant_mqtt.shell import HostIdentity
 
 
 async def test_integration_discoverable(hass: HomeAssistant) -> None:
     """The HA loader resolves the integration and the manifest carries the contract."""
     integration = await async_get_integration(hass, DOMAIN)
     assert integration.domain == DOMAIN
-    assert integration.integration_type == "device"
+    assert integration.integration_type == "hub"
+    assert integration.name == "Brilliant MQTT Fleet Manager"
     assert "mqtt" in (integration.dependencies or [])
     assert any(r.startswith("asyncssh==") for r in integration.requirements or [])
+
+
+def test_config_flow_resolves_production_provisioner_from_package_root(
+    hass: HomeAssistant,
+) -> None:
+    """The lazy config-flow seam resolves without tests patching its factory."""
+    from custom_components.brilliant_mqtt.config_flow import _get_panel_provisioner
+
+    provisioner = _get_panel_provisioner(
+        hass,
+        expected_identity=HostIdentity(
+            public_key=(
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKIykuTed7zNwJwn20eCelcKcHKJ9c/pGFfvulRWazuC"
+            ),
+            fingerprint="SHA256:JfCon51dCgE/yWGkyroh3Ne+ONLMm6QmHMQnEoPSLx0",
+        ),
+    )
+
+    assert isinstance(provisioner, PanelProvisioner)
 
 
 ENTRY_DATA = {
@@ -76,6 +102,125 @@ ENTRY_DATA = {
 }
 
 
+def _component_issue_ids(management_ids: set[str]) -> set[str]:
+    """Return every stable component issue ID the manager can currently create."""
+    return {
+        f"component_state_unverified_{management_id}_{component.id}"
+        for management_id in management_ids
+        for component in REGISTRY.values()
+        if not component.deprecated
+    }
+
+
+async def test_ha_remove_delegates_recovery_after_registry_owner_is_deleted(
+    hass: HomeAssistant,
+) -> None:
+    """The integration sees the removed entry only after HA drops registry ownership."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="removed-owner",
+        data=ENTRY_DATA,
+    )
+    entry.add_to_hass(hass)
+    observed: list[str] = []
+
+    async def recover_removed(
+        candidate_hass: HomeAssistant,
+        removed: MockConfigEntry,
+    ) -> None:
+        assert candidate_hass is hass
+        assert removed is entry
+        assert hass.config_entries.async_get_entry(entry.entry_id) is None
+        observed.append(removed.entry_id)
+
+    with (
+        patch(
+            "custom_components.brilliant_mqtt.async_recover_removed_entry",
+            side_effect=recover_removed,
+        ) as recover,
+        patch(
+            "custom_components.brilliant_mqtt.ir.async_delete_issue",
+        ) as delete_issue,
+    ):
+        await hass.config_entries.async_remove(entry.entry_id)
+
+    assert observed == [entry.entry_id]
+    recover.assert_awaited_once_with(hass, entry)
+    assert {call.args[2] for call in delete_issue.call_args_list} == {
+        f"needs_attention_{entry.entry_id}",
+        f"voice_missing_{entry.entry_id}",
+        f"ha_mirror_retired_{entry.entry_id}",
+        f"broker_unavailable_{entry.entry_id}",
+        f"runtime_setup_failed_{entry.entry_id}",
+        f"fleet_storage_{entry.entry_id}",
+    } | _component_issue_ids({entry.entry_id})
+
+
+async def test_fleet_remove_deletes_component_issues_for_each_management_id(
+    hass: HomeAssistant,
+) -> None:
+    """Fleet removal cleans component issues by durable panel management ID."""
+    from tests.test_fleet_manager import _fleet_entry, _panel
+
+    office_management_id = "management-office"
+    kitchen_management_id = "management-kitchen"
+    entry = _fleet_entry(
+        _panel(
+            "office",
+            "SHA256:office",
+            subentry_id="panel-office",
+            management_id=office_management_id,
+        ),
+        _panel(
+            "kitchen",
+            "SHA256:kitchen",
+            subentry_id="panel-kitchen",
+            management_id=kitchen_management_id,
+        ),
+    )
+    entry.add_to_hass(hass)
+
+    with (
+        patch(
+            "custom_components.brilliant_mqtt.async_recover_removed_entry",
+        ) as recover,
+        patch(
+            "custom_components.brilliant_mqtt.ir.async_delete_issue",
+        ) as delete_issue,
+    ):
+        await hass.config_entries.async_remove(entry.entry_id)
+
+    recover.assert_awaited_once_with(hass, entry)
+    management_ids = {office_management_id, kitchen_management_id}
+    assert {call.args[2] for call in delete_issue.call_args_list} == {
+        *(f"needs_attention_{management_id}" for management_id in management_ids),
+        *(f"voice_missing_{management_id}" for management_id in management_ids),
+        *(f"ha_mirror_retired_{management_id}" for management_id in management_ids),
+        f"broker_unavailable_{entry.entry_id}",
+        f"runtime_setup_failed_{entry.entry_id}",
+        f"fleet_storage_{entry.entry_id}",
+    } | _component_issue_ids(management_ids)
+
+
+def _entry_manager(entry: MockConfigEntry) -> PanelManager:
+    """Return the one compatibility panel below a legacy FleetManager."""
+    runtime = cast(FleetManager, entry.runtime_data)
+    return runtime.panels[entry.entry_id]
+
+
+async def _setup_direct_runtime(
+    hass: HomeAssistant,
+    entry: MockConfigEntry,
+) -> PanelManager:
+    """Attach a FleetManager when a cleanup test calls hooks directly."""
+    if entry.version != CONFIG_ENTRY_VERSION:
+        assert await async_migrate_entry(hass, entry)
+    runtime = FleetManager(hass, entry)
+    entry.runtime_data = runtime
+    await runtime.async_setup()
+    return runtime.panels[entry.entry_id]
+
+
 @pytest.mark.allow_lingering_timers
 async def test_entry_sets_up_and_tracks_availability(
     hass: HomeAssistant, mqtt_mock: MqttMockHAClient
@@ -87,7 +232,7 @@ async def test_entry_sets_up_and_tracks_availability(
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
 
-    manager = entry.runtime_data
+    manager = _entry_manager(entry)
     assert manager.availability is None
 
     async_fire_mqtt_message(hass, "brilliant/office/availability", "online")
@@ -115,7 +260,7 @@ async def test_non_object_meta_is_ignored(hass: HomeAssistant, mqtt_mock: MqttMo
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
 
-    manager = entry.runtime_data
+    manager = _entry_manager(entry)
     assert manager.meta is None
 
     async_fire_mqtt_message(hass, "brilliant/office/bridge", "42")
@@ -275,9 +420,7 @@ async def test_unload_always_shuts_manager_down_when_alternate_owner_reload_fail
     alpha.add_to_hass(hass)
     plane = get_control_plane(hass)
     await plane.async_attach(zulu)
-    manager = PanelManager(hass, alpha, asyncio.Lock())
-    alpha.runtime_data = manager
-    await manager.async_setup()
+    manager = await _setup_direct_runtime(hass, alpha)
     await plane.async_attach(alpha)
     async_fire_mqtt_message(hass, availability_topic("alpha"), "offline")
     await hass.async_block_till_done()
@@ -303,7 +446,9 @@ async def test_unload_always_shuts_manager_down_when_alternate_owner_reload_fail
 
 @pytest.mark.allow_lingering_timers
 async def test_setup_failure_preserves_original_error_when_detach_cleanup_fails(
-    hass: HomeAssistant, mqtt_mock: MqttMockHAClient
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A cleanup publish failure must not replace the platform setup error."""
     from homeassistant.helpers import entity_registry as er
@@ -339,7 +484,9 @@ async def test_setup_failure_preserves_original_error_when_detach_cleanup_fails(
     alpha.add_to_hass(hass)
     plane = get_control_plane(hass)
     await plane.async_attach(zulu)
+    assert await async_migrate_entry(hass, alpha)
     real_publish = mqtt.async_publish
+    private_cleanup_failure = "MQTT_PASSWORD=entry-cleanup-secret"
 
     async def fail_empty_manifest(
         hass: HomeAssistant,
@@ -352,7 +499,7 @@ async def test_setup_failure_preserves_original_error_when_detach_cleanup_fails(
         message_expiry_interval: int | None = None,
     ) -> None:
         if topic == manifest_topic() and json.loads(str(payload))["entities"] == []:
-            raise RuntimeError("detach cleanup failed")
+            raise RuntimeError(private_cleanup_failure)
         await real_publish(
             hass,
             topic,
@@ -379,6 +526,7 @@ async def test_setup_failure_preserves_original_error_when_detach_cleanup_fails(
 
     assert not mqtt_mock.is_active_subscription(availability_topic("alpha"))
     assert not mqtt_mock.is_active_subscription(meta_topic("alpha"))
+    assert private_cleanup_failure not in caplog.text
     await plane.async_detach(zulu.entry_id)
 
 
@@ -399,6 +547,7 @@ async def test_partial_manager_setup_failure_is_cleaned_up(
         data={**ENTRY_DATA, CONF_PANEL: "partial-setup"},
     )
     entry.add_to_hass(hass)
+    assert await async_migrate_entry(hass, entry)
     real_subscribe = mqtt.async_subscribe
     subscriptions = 0
 
@@ -409,14 +558,24 @@ async def test_partial_manager_setup_failure_is_cleaned_up(
             raise setup_failure
         return await real_subscribe(*args, **kwargs)
 
-    with (
-        patch(
-            "custom_components.brilliant_mqtt.manager.mqtt.async_subscribe",
-            side_effect=fail_second_subscribe,
-        ),
-        pytest.raises(type(setup_failure)),
-    ):
-        await async_setup_entry(hass, entry)
+    subscribe_patch = patch(
+        "custom_components.brilliant_mqtt.manager.mqtt.async_subscribe",
+        side_effect=fail_second_subscribe,
+    )
+    if isinstance(setup_failure, asyncio.CancelledError):
+        with subscribe_patch, pytest.raises(asyncio.CancelledError):
+            await async_setup_entry(hass, entry)
+    else:
+        with (
+            subscribe_patch,
+            pytest.raises(ConfigEntryNotReady, match="No panel runtime could start"),
+        ):
+            await async_setup_entry(hass, entry)
+        assert entry.runtime_data.panels == {}
+        assert (
+            ir.async_get(hass).async_get_issue(DOMAIN, f"runtime_setup_failed_{entry.entry_id}")
+            is not None
+        )
 
     assert not mqtt_mock.is_active_subscription(availability_topic("partial-setup"))
 
@@ -431,9 +590,7 @@ async def test_external_unload_cancellation_is_drained_before_manager_shutdown(
         data={**ENTRY_DATA, CONF_PANEL: "cancel-cleanup"},
     )
     entry.add_to_hass(hass)
-    manager = PanelManager(hass, entry, asyncio.Lock())
-    entry.runtime_data = manager
-    await manager.async_setup()
+    await _setup_direct_runtime(hass, entry)
     plane = get_control_plane(hass)
     entered = asyncio.Event()
     release = asyncio.Event()
@@ -484,3 +641,59 @@ async def test_migrate_v1_no_voice_defaults_components_off(hass: HomeAssistant) 
         COMPONENT_VOICE: False,
         COMPONENT_HA_MIRROR: False,
     }
+
+
+async def test_migrate_v3_marks_only_current_entry_and_preserves_runtime(
+    hass: HomeAssistant,
+) -> None:
+    """The compatibility hook cannot coordinate or mutate a sibling entry."""
+    current_data = {
+        **ENTRY_DATA,
+        "future_legacy_data": {"must": ["survive"]},
+    }
+    current_options = {
+        "auto_repair": False,
+        "future_legacy_option": {"must": ["survive"]},
+    }
+    current = MockConfigEntry(
+        domain=DOMAIN,
+        version=3,
+        data=current_data,
+        options=current_options,
+        unique_id="office",
+    )
+    sibling_data = {**ENTRY_DATA, CONF_PANEL: "kitchen", "sibling": "untouched"}
+    sibling_options = {"auto_repair": True}
+    sibling = MockConfigEntry(
+        domain=DOMAIN,
+        version=3,
+        data=sibling_data,
+        options=sibling_options,
+        unique_id="kitchen",
+    )
+    current.add_to_hass(hass)
+    sibling.add_to_hass(hass)
+    runtime = object()
+    current.runtime_data = runtime
+    original_update = hass.config_entries.async_update_entry
+
+    with patch.object(
+        hass.config_entries,
+        "async_update_entry",
+        wraps=original_update,
+    ) as update_entry:
+        assert await async_migrate_entry(hass, current) is True
+        assert await async_migrate_entry(hass, current) is True
+
+    assert current.version == CONFIG_ENTRY_VERSION
+    assert current.data == {
+        **current_data,
+        "entry_kind": "legacy_pending_consolidation",
+    }
+    assert dict(current.options) == current_options
+    assert current.runtime_data is runtime
+    assert sibling.version == 3
+    assert dict(sibling.data) == sibling_data
+    assert dict(sibling.options) == sibling_options
+    assert update_entry.call_count == 1
+    assert update_entry.call_args.args[0] is current

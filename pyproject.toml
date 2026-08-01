@@ -1,13 +1,14 @@
 [project]
 name = "brilliant-mqtt"
-version = "0.5.7"
+version = "0.7.0"
 description = "Bridge Brilliant Control panels' message bus to MQTT / Home Assistant"
 readme = "README.md"
 license = "MIT"
 # The panel interpreter is Python 3.10.9 and is the runtime — do NOT bump.
 requires-python = ">=3.10,<3.11"
 dependencies = [
-    "aiomqtt>=2.3", # async MQTT (wraps paho-mqtt); vendored to /var on the panel
+    "aiomqtt==2.5.1", # async MQTT (wraps paho-mqtt); vendored to /var on the panel
+    "paho-mqtt==2.1.0", # exact transport stack used by both panel and HA validation
     "aiohttp>=3.14.1", # async HTTP/WebSocket client for the HA mirror (brilliant_ha_mirror)
 ]
 

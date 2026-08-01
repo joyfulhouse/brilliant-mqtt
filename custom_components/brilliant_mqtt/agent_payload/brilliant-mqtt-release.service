@@ -1,0 +1,28 @@
+[Unit]
+# Fleet-only bridge unit. The atomic current link selects one immutable release;
+# legacy installers continue to use deploy/brilliant-mqtt.service.
+Description=Brilliant message-bus -> MQTT bridge
+After=message_bus.service network-online.target
+Wants=message_bus.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/brilliant-mqtt.env
+WorkingDirectory=/var/brilliant-mqtt/current/app
+Environment=PYTHONPATH=/var/brilliant-mqtt/current/app:/var/brilliant-mqtt/current/vendor
+# Disable Wi-Fi power-save before starting the bridge: it is the root cause of the
+# MQTT keepalive flap (power-save drops inbound packets -> keepalive timeouts -> LWT
+# -> ~5-min unavailable cycles). The `-` prefix + `/bin/sh -c` (PATH-resolved iw) keep
+# it strictly best-effort so a missing/failing iw can never delay or block the bridge.
+ExecStartPre=-/bin/sh -c 'iw dev wlan0 set power_save off'
+ExecStart=/data/switch-embedded/env/bin/python3 -m brilliant_mqtt
+Restart=always
+RestartSec=5
+# Resource caps so a bug cannot degrade the panel UI:
+Nice=10
+MemoryMax=96M
+CPUQuota=20%
+OOMScoreAdjust=500
+
+[Install]
+WantedBy=multi-user.target
