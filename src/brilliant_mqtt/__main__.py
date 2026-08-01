@@ -8,26 +8,34 @@ transient bus/broker drop does not require a full process restart.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from pathlib import Path
 
-from brilliant_mqtt.bridge import Bridge, WriteThrottle
+from brilliant_mqtt import __version__
+from brilliant_mqtt.bridge import Bridge, HotPollReadTimeout, WriteThrottle
 from brilliant_mqtt.bus import RpcBusAdapter
 from brilliant_mqtt.config import Settings
 from brilliant_mqtt.desired_state import DesiredState
+from brilliant_mqtt.discovery import meta_topic
 from brilliant_mqtt.heartbeat import write_heartbeat
 from brilliant_mqtt.mesh_leader import MeshLeader
 from brilliant_mqtt.model import BrilliantDevice
 from brilliant_mqtt.motion_derive import MotionDeriver
 from brilliant_mqtt.mqttio import AioMqttAdapter
 from brilliant_mqtt.protocols import BusClient
+from brilliant_mqtt.retained_topics import RetainedLedgerError, RetainedTopicLedger
 from brilliant_mqtt.scene_bridge import SceneBridge
 
 log = logging.getLogger(__name__)
 
 # Backoff before reconnecting after a failed/ended session.
 _BACKOFF_S = 5
+# A ledger failure requires operator action (repair the file/filesystem), not a
+# hot reconnect loop. Keep retrying so recovery is automatic, but slowly enough
+# that one affected panel cannot churn the broker.
+_LEDGER_BACKOFF_S = 60.0
 # Loop tick when the hot poll is disabled (stale checks still need a cadence).
 _IDLE_TICK_S = 30.0
 
@@ -104,7 +112,14 @@ async def _run_session(
     mqtt = AioMqttAdapter(settings)
     bus = RpcBusAdapter(extra_device_ids=(_MESH_DEVICE_ID,) if participating else ())
     scene_bridge: SceneBridge | None = None
+    mqtt_connected = False
     try:
+        owned_topics = RetainedTopicLedger(
+            settings.panel,
+            Path(settings.retained_topics_file),
+        )
+        await owned_topics.async_load()
+
         # Shared write-throttle: both Bridge instances in this process use the
         # same Thrift bus, so the global min-write-spacing must be enforced
         # bus-wide, not per-bridge.  A single WriteThrottle shared here
@@ -137,6 +152,7 @@ async def _run_session(
             reconcile_max_writes_per_tick=settings.motion_reconcile_max_writes_per_tick,
             reconcile_min_write_spacing_s=settings.motion_reconcile_min_write_spacing_s,
             write_throttle=write_throttle,
+            owned_topics=owned_topics,
         )
 
         if participating:
@@ -161,6 +177,7 @@ async def _run_session(
                 reconcile_max_writes_per_tick=settings.motion_reconcile_max_writes_per_tick,
                 reconcile_min_write_spacing_s=settings.motion_reconcile_min_write_spacing_s,
                 write_throttle=write_throttle,
+                owned_topics=None,
             )
             leader = MeshLeader(
                 mqtt,
@@ -193,6 +210,7 @@ async def _run_session(
         bus.on_reconnect(_on_bus_reconnect)
 
         await mqtt.connect()
+        mqtt_connected = True
         if participating:
             # Join the election before bus data flows; the FIRST mesh
             # reconcile is acquisition's job (on_acquire), not startup's.
@@ -204,6 +222,7 @@ async def _run_session(
 
         tick = settings.hot_poll_seconds if settings.hot_poll_seconds > 0 else _IDLE_TICK_S
         next_resync = time.monotonic() + settings.resync_seconds
+        consecutive_hot_poll_timeouts = 0
         while True:
             await asyncio.sleep(tick)
 
@@ -233,9 +252,23 @@ async def _run_session(
             # Hot poll: bounds state staleness at the poll cadence; the
             # bridge's diff cache keeps unchanged payloads off MQTT.
             if settings.hot_poll_seconds > 0:
-                await panel_bridge.poll_once()
-                if participating and leader.is_leader:
-                    await mesh_bridge.poll_once()
+                try:
+                    await panel_bridge.poll_once()
+                    if participating and leader.is_leader:
+                        await mesh_bridge.poll_once()
+                except HotPollReadTimeout:
+                    if consecutive_hot_poll_timeouts >= 1:
+                        raise
+                    consecutive_hot_poll_timeouts = 1
+                    log.warning(
+                        "hot poll bus read timed out; retrying once before rebuilding session"
+                    )
+                    # Treat panel + elected-mesh polling as one atomic health
+                    # cycle. Do not run a due reconcile after a partial read.
+                    continue
+                else:
+                    # Only a fully successful combined cycle earns fresh grace.
+                    consecutive_hot_poll_timeouts = 0
 
             # Periodic level-triggered resync: republishes retained discovery
             # + state, covering any push notifications that were missed.
@@ -244,6 +277,35 @@ async def _run_session(
                 if participating and leader.is_leader:
                     await mesh_bridge.reconcile()
                 next_resync = time.monotonic() + settings.resync_seconds
+    except RetainedLedgerError:
+        # The ownership ledger is deliberately fail-closed: publishing retained
+        # data without a durable ownership record would make later cleanup
+        # unsafe. Still expose the cause through the one fixed, panel-owned meta
+        # topic so Home Assistant can direct the operator to a meaningful fix.
+        # This direct publish intentionally bypasses the unusable ledger.
+        try:
+            if not mqtt_connected:
+                await mqtt.connect()
+                mqtt_connected = True
+            await mqtt.publish(
+                meta_topic(settings.panel),
+                json.dumps(
+                    {
+                        "agent_version": __version__,
+                        "degraded": "retained_ledger",
+                    },
+                    sort_keys=True,
+                ),
+                retain=True,
+                qos=1,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Diagnostic delivery is best-effort and must never hide the
+            # actionable RetainedLedgerError that caused this session to fail.
+            log.exception("could not publish retained-ledger degraded diagnostic")
+        raise
     finally:
         # Best-effort teardown; consumers stop before the shared adapters, and
         # every component tolerates a never-fully-started state.
@@ -276,6 +338,10 @@ async def run(settings: Settings) -> None:
             await _run_session(settings, desired_panel, desired_mesh)
         except asyncio.CancelledError:
             raise
+        except RetainedLedgerError:
+            log.exception("retained ledger unavailable; will reconnect after extended backoff")
+            await asyncio.sleep(_LEDGER_BACKOFF_S)
+            continue
         except Exception:
             log.exception("bridge session failed; will reconnect after backoff")
         await asyncio.sleep(_BACKOFF_S)

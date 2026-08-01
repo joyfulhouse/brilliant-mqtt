@@ -163,7 +163,7 @@ class FakeMqtt:
     async def disconnect(self) -> None:
         self.disconnect_count += 1
 
-    async def publish(self, topic: str, payload: str, retain: bool = False) -> None:
+    async def publish(self, topic: str, payload: str, retain: bool = False, qos: int = 0) -> None:
         self.published.append((topic, payload, retain))
 
     def on_command(self, cb: Callable[[str, str], Awaitable[None]]) -> None:

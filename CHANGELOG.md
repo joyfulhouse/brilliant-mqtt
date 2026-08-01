@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Agent payload 0.6.0 — MQTT preflight, retained-topic ownership ledger, and
+  TLS support** *(recovered 2026-08-01 from the office panel's live artifact;
+  the original branch `feature/mqtt-fleet-onboarding` / commit `2598b09` was
+  never pushed — see bd `homelab-8mn7`)*. Three pieces:
+  - **Setup preflight** (`preflight.py` + `setup_protocol.py`): a temporary
+    panel-side MQTT validation state machine and JSON CLI the HA integration
+    can drive during onboarding — staged fleet-auth / bidirectional round-trip
+    / discovery-write / retained-replay / cleanup checks over a one-shot,
+    redacted-logging MQTT client, reporting a deterministic redacted JSON
+    result.
+  - **Retained-topic ownership ledger** (`retained_topics.py`): each panel
+    durably records (fsync'd atomic JSON under `/var/brilliant-mqtt/state/`)
+    every retained topic it owns *before* publishing it, and mirrors the
+    manifest to `brilliant/<panel>/ownership` (retained, QoS 1) — making later
+    cleanup of a renamed/retired panel's retained topics safe. Fail-closed: a
+    broken ledger halts the session (60 s backoff loop) and publishes a
+    `degraded: retained_ledger` diagnostic on the panel's bridge topic.
+  - **Broker TLS** (`MQTT_TLS_ENABLED` / `MQTT_TLS_CA_FILE`): strict
+    server-authenticated TLS context (hostname check + CERT_REQUIRED),
+    default off — the LAN-only broker stays plaintext until an operator
+    opts in.
+  Plus: one hot-poll bus-read timeout now earns a single retry before the
+  session rebuilds (`HotPollReadTimeout`); `BRILLIANT_PANEL` is validated as a
+  canonical non-reserved slug at startup; the MQTT adapter is one-shot with a
+  checked-disconnect mode; `MqttClient.publish` gained a `qos` parameter.
+  *(Recovery deltas vs the panel artifact: the panel-slug pattern keeps main's
+  63-char bound, and two `object.__new__`-style tests initialize the new
+  callback list.)*
+
 - **Panel reboot with pre-reboot diagnostics.** A new `brilliant_mqtt.reboot`
   service and a per-panel **Reboot panel** button capture a diagnostics bundle
   over SSH and *then* reboot the panel. The panels wedge two ways in practice —
