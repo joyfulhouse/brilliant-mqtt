@@ -14,7 +14,7 @@ from uuid import UUID
 import pytest
 import voluptuous as vol
 from homeassistant.components.http import ApiConfig
-from homeassistant.config_entries import ConfigSubentry
+from homeassistant.config_entries import SOURCE_IGNORE, ConfigSubentry
 from homeassistant.const import CONF_NAME
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
@@ -1747,6 +1747,26 @@ async def test_existing_fleet_aborts_new_initial_flow(hass: HomeAssistant) -> No
 
     assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "already_configured"
+
+
+async def test_ignored_fleet_entry_still_allows_manual_onboarding(
+    hass: HomeAssistant,
+) -> None:
+    """Core's _abort_if_unique_id_configured deliberately lets a manual user
+    flow proceed past an ignored entry — ignoring a fleet must not brick
+    onboarding forever."""
+    MockConfigEntry(
+        domain=DOMAIN,
+        unique_id=FLEET_UNIQUE_ID,
+        source=SOURCE_IGNORE,
+    ).add_to_hass(hass)
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": "user"},
+    )
+
+    assert result["type"] is FlowResultType.MENU
 
 
 async def test_legacy_entry_aborts_competing_fleet_creation(

@@ -1515,6 +1515,11 @@ class BrilliantMqttConfigFlow(
             )
         if entries:
             return self.async_abort(reason="legacy_migration_required")
+        # Canonical backstop behind the richer aborts above. For an ignored
+        # fleet entry this deliberately falls through (core lets a manual user
+        # flow re-configure an ignored integration), so ignoring a fleet does
+        # not permanently brick onboarding.
+        self._abort_if_unique_id_configured()
         return self.async_show_menu(
             step_id="user",
             menu_options=BROKER_MENU_OPTIONS,
