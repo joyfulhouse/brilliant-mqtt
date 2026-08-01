@@ -11,6 +11,7 @@ derive from it, so a spec is declared exactly once.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from brilliant_mqtt.model import BrilliantDevice, DeviceKind, Variable
@@ -622,6 +623,18 @@ class EntityDescriptor:
     step: float | None = None
 
 
+# HA rejects a discovery topic whose object_id node has characters outside
+# [a-zA-Z0-9_-] ("Received message on illegal discovery topic") and silently
+# drops the entity — mesh peripheral IDs can contain spaces ("HA Backyard
+# Lamp 1"). Substitution only ever touches illegal characters, so every
+# already-registered unique_id stays byte-identical.
+_HA_OBJECT_ID_ILLEGAL = re.compile(r"[^a-zA-Z0-9_-]")
+
+
+def _discovery_object_id(panel: str, peripheral_id: str) -> str:
+    return f"brilliant_{panel}_{_HA_OBJECT_ID_ILLEGAL.sub('_', peripheral_id)}"
+
+
 def _aux_descriptors(device: BrilliantDevice, panel: str) -> list[EntityDescriptor]:
     """Build descriptors for every AUX_SPEC variable present on *device*.
 
@@ -633,7 +646,7 @@ def _aux_descriptors(device: BrilliantDevice, panel: str) -> list[EntityDescript
     entity set and the payload keys stay in lockstep.
     """
     specs = AUX_SPECS.get(device.kind, ())
-    base_uid = f"brilliant_{panel}_{device.peripheral_id}"
+    base_uid = _discovery_object_id(panel, device.peripheral_id)
     prefix = f"{device.name} " if device.kind in _LOAD_KINDS else ""
     descriptors: list[EntityDescriptor] = []
     for spec in specs:
@@ -674,7 +687,7 @@ def entities_for(device: BrilliantDevice, panel: str) -> list[EntityDescriptor]:
     (ALWAYS_ON / HARDWARE / UI / WIFI / MOTION_CONFIG / ART_CONFIG /
     DEVICE_CONFIG) yields ONLY its aux entities. UNKNOWN and SENSOR yield [].
     """
-    base_uid = f"brilliant_{panel}_{device.peripheral_id}"
+    base_uid = _discovery_object_id(panel, device.peripheral_id)
 
     if device.kind is DeviceKind.LIGHT:
         return [
