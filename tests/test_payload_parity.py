@@ -26,7 +26,7 @@ PAYLOAD_WORKFLOWS = (
 )
 PAYLOAD_RELATIVE_PATH = Path("custom_components/brilliant_mqtt/agent_payload")
 PAYLOAD_VERSION_FILE = REPOSITORY_ROOT / PAYLOAD_RELATIVE_PATH / "VERSION"
-EXPECTED_PAYLOAD_VERSION = "0.6.0"
+EXPECTED_PAYLOAD_VERSION = "0.7.0"
 RELEASE_SERVICE_TEMPLATES = (
     "brilliant-mqtt-release.service",
     "brilliant-wifi-watchdog-release.service",
@@ -95,7 +95,7 @@ def test_committed_agent_payload_matches_source_tree() -> None:
     )
 
 
-def test_project_source_and_payload_versions_are_0_6_0() -> None:
+def test_project_source_and_payload_versions_are_0_7_0() -> None:
     project_source = (REPOSITORY_ROOT / "pyproject.toml").read_text(encoding="utf-8")
     project_section = project_source.split("[project]", maxsplit=1)[1].split("\n[", maxsplit=1)
     version_match = re.search(r'^version = "([^"]+)"$', project_section[0], re.MULTILINE)

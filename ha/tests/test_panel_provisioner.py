@@ -292,11 +292,11 @@ async def test_concrete_release_provider_uses_bundled_payload_and_broker_seam(
     )
 
     assert bundle.local_payload_dir.endswith("/custom_components/brilliant_mqtt/agent_payload")
-    assert bundle.version == "0.6.0"
+    assert bundle.version == "0.7.0"
     assert bundle.transaction_id == _TRANSACTION_ID
     assert bundle.mqtt_ca == _CA_BYTES
     assert bundle.mqtt_ca_path == (
-        f"/var/brilliant-mqtt/releases/0.6.0--{_TRANSACTION_ID.hex}/mqtt-ca.pem"
+        f"/var/brilliant-mqtt/releases/0.7.0--{_TRANSACTION_ID.hex}/mqtt-ca.pem"
     )
     parsed = panel_ops.parse_env(bundle.environment)
     assert parsed["BRILLIANT_PANEL"] == "office"
