@@ -55,6 +55,11 @@ def stable_id(entity_id: str) -> str:
     return str(uuid5(_STABLE_NAMESPACE, entity_id))
 
 
+def is_panel_slug(value: object) -> bool:
+    """Return whether *value* matches the canonical current-flow panel slug."""
+    return isinstance(value, str) and _PANEL_PATTERN.fullmatch(value) is not None
+
+
 def encode_json(value: Mapping[str, object]) -> str:
     """Encode a mapping using the canonical compact wire representation."""
     return json.dumps(value, separators=(",", ":"), sort_keys=True)
@@ -208,7 +213,7 @@ def _validated_uuid(value: str, field: str) -> str:
 
 
 def _validated_panel(panel: str) -> str:
-    if _PANEL_PATTERN.fullmatch(panel) is None:
+    if not is_panel_slug(panel):
         raise ValueError("panel must be a percent-free lowercase slug")
     return panel
 

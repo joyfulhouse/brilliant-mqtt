@@ -24,7 +24,12 @@ class BusClient(Protocol):
         ...
 
     async def get_all(self) -> list[BrilliantDevice]:
-        """Return all peripherals already scoped to this panel."""
+        """Return all peripherals already scoped to this panel.
+
+        Raises built-in ``TimeoutError`` or ``asyncio.TimeoutError`` when a
+        scoped panel RPC misses its request deadline (the panel runs Python
+        3.10, where those are distinct classes).
+        """
         ...
 
     async def get_peripheral(self, device_id: str, peripheral_id: str) -> BrilliantDevice | None:
@@ -78,8 +83,8 @@ class BusClient(Protocol):
 class MqttClient(Protocol):
     """Adapter for the central MQTT broker."""
 
-    async def publish(self, topic: str, payload: str, retain: bool = False) -> None:
-        """Publish *payload* to *topic*, optionally with the retain flag."""
+    async def publish(self, topic: str, payload: str, retain: bool = False, qos: int = 0) -> None:
+        """Publish *payload* to *topic* with the requested retain flag and QoS."""
         ...
 
     def on_command(self, cb: Callable[[str, str], Awaitable[None]]) -> None:
