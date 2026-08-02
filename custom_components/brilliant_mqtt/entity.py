@@ -12,6 +12,7 @@ from .const import DOMAIN, panel_device_name
 from .manager import PanelManager
 
 
+@callback
 def async_remove_gated_entity(hass: HomeAssistant, platform_domain: str, unique_id: str) -> None:
     """Drop a stale registry entry for an entity a feature flag has disabled.
 
