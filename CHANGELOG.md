@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-08-02
+
+Integration-only patch release — the on-panel agent stays at 0.7.0 and no
+panel redeploy is needed.
+
+### Fixed
+
+- **Scene entities are now created only when Home Assistant control is
+  enabled.** The scene select and *Run selected scene* button exist only for
+  fleets with the **Enable Home Assistant control** option turned on (the
+  option that provisions the panel-side scene bridge). With the option off —
+  the default — the integration no longer creates the pair of
+  permanently-unavailable entities per panel, and it removes previously
+  registered ones from the entity registry on upgrade. Re-enabling the option
+  restores the entities with their entity IDs and customizations intact.
+
+### Documentation
+
+- The management-entity table in `docs/ha-integration.md` now reflects the
+  conditional scene entities (nine always, two more with Home Assistant
+  control enabled).
+
 ## [0.7.0] - 2026-08-01
 
 ### Added
