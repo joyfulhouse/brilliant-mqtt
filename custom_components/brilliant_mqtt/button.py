@@ -11,7 +11,7 @@ from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from . import BrilliantMqttConfigEntry
 from .const import DOMAIN
-from .entity import BrilliantPanelEntity
+from .entity import BrilliantPanelEntity, async_remove_gated_entity
 from .ha_control import get_control_plane
 from .manager import PanelManager
 from .scene_control import scene_control_signal
@@ -27,11 +27,16 @@ async def async_setup_entry(
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     for manager in entry.runtime_data.panels.values():
-        entities = [
+        entities: list[BrilliantPanelEntity] = [
             RepairButton(manager),
             RebootPanelButton(manager),
-            RunSelectedSceneButton(manager),
         ]
+        if manager.fleet.ha_control_enabled:
+            entities.append(RunSelectedSceneButton(manager))
+        else:
+            async_remove_gated_entity(
+                hass, "button", f"{manager.store.management_id}_run_selected_scene"
+            )
         if (subentry_id := manager.store.subentry_id) is None:
             async_add_entities(entities)
         else:

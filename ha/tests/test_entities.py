@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from homeassistant.core import HomeAssistant, State
 from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
 from pytest_homeassistant_custom_component.common import (
     MockConfigEntry,
     async_fire_mqtt_message,
@@ -133,6 +134,7 @@ def _platform_manager(
     panel: str,
     management_id: str,
     subentry_id: str | None,
+    ha_control_enabled: bool = True,
 ) -> PanelManager:
     """Build the complete manager surface consumed while platforms create entities."""
     return cast(
@@ -147,6 +149,7 @@ def _platform_manager(
                 options={},
                 subentry_id=subentry_id,
             ),
+            fleet=SimpleNamespace(ha_control_enabled=ha_control_enabled),
         ),
     )
 
@@ -662,5 +665,46 @@ async def test_scene_catalog_clear_makes_both_entities_unavailable(
     await hass.async_block_till_done()
     assert _state(hass, SCENE_SELECT).state == "unavailable"
     assert _state(hass, RUN_SCENE).state == "unavailable"
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_scene_entities_absent_when_ha_control_disabled(
+    hass: HomeAssistant, mqtt_mock: MqttMockHAClient, fake_shell: FakeShell, payload_dir: Path
+) -> None:
+    """`_setup` uses ENTRY_DATA, which carries no CONF_HA_CONTROL_ENABLED (defaults False)."""
+    entry = await _setup(hass)
+
+    assert hass.states.get(SCENE_SELECT) is None
+    assert hass.states.get(RUN_SCENE) is None
+    # The rest of the panel's management entities are unaffected by the gate.
+    assert hass.states.get(WAKE_WORD_SELECT) is not None
+    assert hass.states.get(REPAIR) is not None
+    assert hass.states.get(REBOOT) is not None
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_stale_scene_registry_entries_removed_when_ha_control_disabled(
+    hass: HomeAssistant, mqtt_mock: MqttMockHAClient, fake_shell: FakeShell, payload_dir: Path
+) -> None:
+    """Entities left behind by a flag flipping True->False must not linger forever."""
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office-stale", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    registry = er.async_get(hass)
+    stale_select = registry.async_get_or_create(
+        "select", DOMAIN, f"{entry.entry_id}_scene", config_entry=entry
+    )
+    stale_button = registry.async_get_or_create(
+        "button", DOMAIN, f"{entry.entry_id}_run_selected_scene", config_entry=entry
+    )
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert registry.async_get(stale_select.entity_id) is None
+    assert registry.async_get(stale_button.entity_id) is None
 
     assert await hass.config_entries.async_unload(entry.entry_id)

@@ -2,13 +2,27 @@
 
 from __future__ import annotations
 
-from homeassistant.core import callback
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity import Entity
 
-from .const import panel_device_name
+from .const import DOMAIN, panel_device_name
 from .manager import PanelManager
+
+
+@callback
+def async_remove_gated_entity(hass: HomeAssistant, platform_domain: str, unique_id: str) -> None:
+    """Drop a stale registry entry for an entity a feature flag has disabled.
+
+    A feature-gated entity (e.g. scene controls when ha_control is off) must not
+    linger as a permanently-unavailable registry entry once its flag flips off.
+    """
+    registry = er.async_get(hass)
+    entity_id = registry.async_get_entity_id(platform_domain, DOMAIN, unique_id)
+    if entity_id is not None:
+        registry.async_remove(entity_id)
 
 
 class BrilliantPanelEntity(Entity):
