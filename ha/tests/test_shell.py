@@ -141,7 +141,8 @@ def test_host_identity_rejects_fingerprint_unrelated_to_public_key() -> None:
 
 
 def test_runtime_keeps_strict_fleet_and_private_legacy_adapters_separate() -> None:
-    from custom_components.brilliant_mqtt import config_flow, manager
+    from custom_components.brilliant_mqtt import manager
+    from custom_components.brilliant_mqtt.flow import gateway as config_flow
 
     assert config_flow.AsyncsshShell is _LegacyAsyncsshShell
     assert manager.AsyncsshShell is AsyncsshShell

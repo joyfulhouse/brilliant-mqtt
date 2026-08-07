@@ -9,6 +9,7 @@ import re
 import unicodedata
 from collections.abc import Iterable, Mapping
 from types import MappingProxyType
+from typing import Any
 
 import voluptuous as vol
 from homeassistant.const import CONF_NAME
@@ -20,9 +21,11 @@ from homeassistant.helpers.selector import (
     TextSelectorType,
 )
 
-from .broker import BrokerKind
-from .const import (
+from ..broker import BrokerKind
+from ..components import optional
+from ..const import (
     CONF_BROKER_KIND,
+    CONF_COMPONENTS,
     CONF_HA_CONTROL_DOMAINS,
     CONF_HA_CONTROL_ENABLED,
     CONF_HA_CONTROL_LABEL,
@@ -57,7 +60,7 @@ from .const import (
     OPT_REPAIR_COOLDOWN_MINUTES,
     VOICE_WAKE_WORDS,
 )
-from .panel_ops import MAX_MQTT_CA_BYTES
+from ..panel_ops import MAX_MQTT_CA_BYTES
 
 ADVANCED_SECTION = "advanced"
 DEFAULT_SSH_USERNAME = "root"
@@ -1315,3 +1318,208 @@ def allocate_mesh_priority(existing_priorities: Iterable[int]) -> int:
         if candidate not in used:
             return candidate
     raise FlowInputError({"base": "mesh_priority_exhausted"})
+
+
+# Free-text fields that flow into the on-panel env file / SSH; a control char here
+# corrupts the env file (panel_ops `_env_quote` rejects it as a hard backstop), so
+# reject at the boundary for a friendly per-field message.
+_NO_CONTROL_CHARS = (
+    CONF_HOST,
+    CONF_ROOT_PASSWORD,
+    CONF_MQTT_HOST,
+    CONF_MQTT_USERNAME,
+    CONF_MQTT_PASSWORD,
+    CONF_HA_CONTROL_LABEL,
+)
+
+
+def _mqtt_schema_fields(source: Mapping[str, Any]) -> dict[Any, Any]:
+    """The four broker fields shared by the add-broker and reconfigure steps.
+
+    Defaults come from *source* (prior-entry prefill, or the entry being reconfigured);
+    the three string fields fall back to blank, the port to 1883.
+    """
+    return {
+        vol.Required(CONF_MQTT_HOST, default=source.get(CONF_MQTT_HOST, vol.UNDEFINED)): str,
+        vol.Required(CONF_MQTT_PORT, default=source.get(CONF_MQTT_PORT, 1883)): vol.All(
+            vol.Coerce(int), vol.Range(min=1, max=65535)
+        ),
+        vol.Required(
+            CONF_MQTT_USERNAME, default=source.get(CONF_MQTT_USERNAME, vol.UNDEFINED)
+        ): str,
+        vol.Required(
+            CONF_MQTT_PASSWORD,
+        ): TextSelector(TextSelectorConfig(type=TextSelectorType.PASSWORD)),
+    }
+
+
+def _components_schema_fields(
+    source: Mapping[str, Any], *, new_install: bool = True
+) -> dict[Any, Any]:
+    """One checkbox per OPTIONAL component (bridge is implicit/locked), plus voice sub-fields.
+
+    *new_install* controls the fallback default for keys absent from the entry's
+    CONF_COMPONENTS dict:
+
+    - ``True`` (new installs / script step): fall back to ``c.default_enabled`` so
+      default-on components (e.g. wifi_watchdog) render pre-checked on first setup.
+    - ``False`` (existing panels / reconfigure step): fall back to ``False`` so a
+      panel that was onboarded before the component existed does NOT accidentally get
+      it installed on a no-change reconfigure Save.
+    """
+    chosen: Mapping[str, Any] = source.get(CONF_COMPONENTS, {})
+    fields: dict[Any, Any] = {}
+    for c in optional():
+        default = chosen.get(c.id, c.default_enabled if new_install else False)
+        fields[vol.Required(c.id, default=default)] = bool
+    # Voice sub-config (meaningful only when voice is checked; validated leniently).
+    fields[
+        vol.Required(
+            CONF_VOICE_WAKE_WORD,
+            default=source.get(CONF_VOICE_WAKE_WORD, DEFAULT_VOICE_WAKE_WORD),
+        )
+    ] = vol.In(list(VOICE_WAKE_WORDS))
+    fields[vol.Optional(CONF_VOICE_HA_HOST, default=source.get(CONF_VOICE_HA_HOST, ""))] = str
+    # Hue CA-recovery sub-config (meaningful only when hue_ca is checked).
+    fields[vol.Optional(CONF_HUE_CA_CERT, default=source.get(CONF_HUE_CA_CERT, ""))] = TextSelector(
+        TextSelectorConfig(multiline=True)
+    )
+    return fields
+
+
+_GLOBAL_KEYS = (
+    CONF_HA_CONTROL_ENABLED,
+    CONF_HA_CONTROL_LABEL,
+    CONF_ROOM_OVERRIDES,
+    CONF_HA_CONTROL_DOMAINS,
+    CONF_MAX_MIRRORED_ENTITIES,
+    CONF_SCENE_PANEL,
+    CONF_SCENE_ACTIONS,
+)
+
+
+class _RawMultiSelect(cv.multi_select):
+    """Expose a serializable multi-select while deferring trust-boundary validation."""
+
+    def __call__(self, selected: Any) -> Any:
+        return selected
+
+
+class _RawInteger(vol.Coerce):
+    """Expose an integer field without coercing booleans or strings before validation."""
+
+    def __init__(self) -> None:
+        super().__init__(int)
+
+    def __call__(self, value: Any) -> Any:
+        return value
+
+
+class _RawRange(vol.Range):
+    """Expose numeric bounds while leaving the raw value for strict validation."""
+
+    def __call__(self, value: Any) -> Any:
+        return value
+
+
+def _safe_control_redisplay_values(user_input: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep ordinary edits, but never echo credentials or unsafe JSON text."""
+    values = dict(user_input)
+    values.pop(CONF_ROOT_PASSWORD, None)
+    values.pop(CONF_MQTT_PASSWORD, None)
+    for key in (CONF_ROOM_OVERRIDES, CONF_SCENE_ACTIONS):
+        raw = values.get(key)
+        if not isinstance(raw, str) or len(raw) > _MAX_JSON_TEXT or _has_control_char(raw):
+            values[key] = "{}"
+    return values
+
+
+def _control_schema_fields(source: Mapping[str, Any], *, panel_default: str) -> dict[Any, Any]:
+    overrides = source.get(CONF_ROOM_OVERRIDES, {})
+    actions = source.get(CONF_SCENE_ACTIONS, {})
+    return {
+        vol.Required(
+            CONF_HA_CONTROL_ENABLED,
+            default=source.get(CONF_HA_CONTROL_ENABLED, DEFAULT_HA_CONTROL_ENABLED),
+        ): bool,
+        vol.Required(
+            CONF_HA_CONTROL_LABEL,
+            default=source.get(CONF_HA_CONTROL_LABEL, DEFAULT_HA_CONTROL_LABEL),
+        ): str,
+        vol.Required(
+            CONF_ROOM_OVERRIDES,
+            default=_canonical_json(overrides) if isinstance(overrides, Mapping) else "{}",
+        ): str,
+        vol.Required(
+            CONF_HA_CONTROL_DOMAINS,
+            default=list(source.get(CONF_HA_CONTROL_DOMAINS, DEFAULT_HA_CONTROL_DOMAINS)),
+        ): _RawMultiSelect({domain: domain for domain in HA_CONTROL_DOMAINS}),
+        vol.Required(
+            CONF_MAX_MIRRORED_ENTITIES,
+            default=source.get(CONF_MAX_MIRRORED_ENTITIES, DEFAULT_MAX_MIRRORED_ENTITIES),
+        ): vol.All(_RawInteger(), _RawRange(min=1, max=200)),
+        vol.Required(
+            CONF_SCENE_PANEL,
+            default=source.get(CONF_SCENE_PANEL, panel_default),
+        ): str,
+        vol.Required(
+            CONF_SCENE_ACTIONS,
+            default=_canonical_json(actions) if isinstance(actions, Mapping) else "{}",
+        ): str,
+    }
+
+
+def _validated_control_input(
+    user_input: Mapping[str, Any], *, panels: frozenset[str], default_panel: str
+) -> tuple[dict[str, str], dict[str, Any]]:
+    errors: dict[str, str] = {}
+    values: dict[str, Any] = {}
+    label = str(user_input.get(CONF_HA_CONTROL_LABEL, "")).strip()
+    if not label or len(label) > 256 or _has_control_char(label):
+        errors[CONF_HA_CONTROL_LABEL] = "invalid_value"
+    else:
+        values[CONF_HA_CONTROL_LABEL] = label
+    try:
+        values[CONF_ROOM_OVERRIDES] = _decode_room_overrides(user_input.get(CONF_ROOM_OVERRIDES))
+    except ValueError:
+        errors[CONF_ROOM_OVERRIDES] = "invalid_value"
+
+    raw_domains = user_input.get(CONF_HA_CONTROL_DOMAINS)
+    if (
+        not isinstance(raw_domains, list)
+        or any(
+            not isinstance(domain, str) or domain not in HA_CONTROL_DOMAINS
+            for domain in raw_domains
+        )
+        or len(raw_domains) != len(set(raw_domains))
+    ):
+        errors[CONF_HA_CONTROL_DOMAINS] = "invalid_value"
+    else:
+        values[CONF_HA_CONTROL_DOMAINS] = [
+            domain for domain in HA_CONTROL_DOMAINS if domain in raw_domains
+        ]
+
+    maximum = user_input.get(CONF_MAX_MIRRORED_ENTITIES)
+    if type(maximum) is not int or not 1 <= maximum <= 200:
+        errors[CONF_MAX_MIRRORED_ENTITIES] = "invalid_value"
+    else:
+        values[CONF_MAX_MIRRORED_ENTITIES] = maximum
+
+    scene_panel = str(user_input.get(CONF_SCENE_PANEL, "")).strip() or default_panel
+    if scene_panel not in panels:
+        errors[CONF_SCENE_PANEL] = "invalid_value"
+    else:
+        values[CONF_SCENE_PANEL] = scene_panel
+    try:
+        values[CONF_SCENE_ACTIONS] = _decode_scene_actions(
+            user_input.get(CONF_SCENE_ACTIONS), panels
+        )
+    except ValueError:
+        errors[CONF_SCENE_ACTIONS] = "invalid_value"
+
+    enabled = user_input.get(CONF_HA_CONTROL_ENABLED)
+    if type(enabled) is not bool:
+        errors[CONF_HA_CONTROL_ENABLED] = "invalid_value"
+    else:
+        values[CONF_HA_CONTROL_ENABLED] = enabled
+    return errors, values

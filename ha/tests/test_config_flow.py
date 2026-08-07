@@ -84,7 +84,9 @@ from custom_components.brilliant_mqtt.entry_data import (
 )
 from custom_components.brilliant_mqtt.errors import OperationError, OperationStage
 from custom_components.brilliant_mqtt.fleet_manager import FleetManager
-from custom_components.brilliant_mqtt.flow_schemas import (
+from custom_components.brilliant_mqtt.flow import gateway as flow_gateway
+from custom_components.brilliant_mqtt.flow import support as flow_support
+from custom_components.brilliant_mqtt.flow.schemas import (
     ADVANCED_SECTION,
     BROKER_MENU_OPTIONS,
     SECRET_UNCHANGED,
@@ -145,7 +147,7 @@ _PANEL_INPUT = {
 def _prove_config_entry_persistence(monkeypatch: pytest.MonkeyPatch) -> None:
     """HA's test Store is in-memory; focused fleet tests cover real disk polling."""
     monkeypatch.setattr(
-        config_flow,
+        flow_gateway,
         "_async_wait_config_entry_persisted",
         AsyncMock(),
     )
@@ -358,7 +360,7 @@ def test_broker_fallback_failure_links_to_mqtt_guide(
     code: str,
     documentation_slug: str,
 ) -> None:
-    placeholders = config_flow._panel_failure(
+    placeholders = flow_support._panel_failure(
         code,
         stage="broker_validation",
     ).placeholders()
@@ -536,7 +538,7 @@ async def _prepare_fleet_broker_commit(
         CONF_MQTT_HOST: "replacement-broker.iot.example",
         CONF_MQTT_PASSWORD: SECRET_UNCHANGED,
     }
-    with patch.object(config_flow, "_broker_validator", return_value=validator):
+    with patch.object(flow_gateway, "_broker_validator", return_value=validator):
         progress = await hass.config_entries.options.async_configure(
             form["flow_id"],
             submitted,
@@ -596,7 +598,7 @@ async def _submit_broker_create(
 ) -> dict[str, Any]:
     if validator.gate is None:
         validator.gate = asyncio.Event()
-    with patch.object(config_flow, "_broker_validator", return_value=validator):
+    with patch.object(flow_gateway, "_broker_validator", return_value=validator):
         progress = await hass.config_entries.flow.async_configure(
             result["flow_id"],
             broker_input or _BROKER_INPUT,
@@ -664,12 +666,12 @@ async def _start_initial_confirm(
     assert panel_connect["step_id"] == "panel_connect"
     with (
         patch.object(
-            config_flow,
+            flow_gateway,
             "async_fetch_host_identity",
             return_value=candidate,
         ),
         patch.object(
-            config_flow,
+            flow_gateway,
             "_async_inspect_candidate",
             return_value=_facts(candidate),
         ),
@@ -696,12 +698,12 @@ async def _start_subentry_confirm(
     )
     with (
         patch.object(
-            config_flow,
+            flow_gateway,
             "async_fetch_host_identity",
             return_value=candidate,
         ),
         patch.object(
-            config_flow,
+            flow_gateway,
             "_async_inspect_candidate",
             return_value=_facts(candidate),
         ),
@@ -948,7 +950,7 @@ async def test_broker_progress_task_cannot_be_double_submitted(
     broker = await _start_broker_form(hass, BrokerKind.EXISTING_BROKER)
     gate = asyncio.Event()
     validator = _FakeValidator(gate=gate)
-    with patch.object(config_flow, "_broker_validator", return_value=validator):
+    with patch.object(flow_gateway, "_broker_validator", return_value=validator):
         first = await hass.config_entries.flow.async_configure(
             broker["flow_id"],
             _BROKER_INPUT,
@@ -996,12 +998,12 @@ async def test_broker_validation_creates_durable_empty_fleet_and_chains_first_pa
             new=AsyncMock(side_effect=setup_entry),
         ),
         patch.object(
-            config_flow,
+            flow_gateway,
             "_async_wait_config_entry_persisted",
             side_effect=prove_persistence,
         ),
         patch.object(
-            config_flow,
+            flow_gateway,
             "async_fetch_host_identity",
             identity_fetch,
         ),
@@ -1078,7 +1080,7 @@ async def test_created_fleet_mutation_blocks_persistence_and_first_panel_chain(
             new=mutate_before_callback,
         ),
         patch.object(
-            config_flow,
+            flow_gateway,
             "_async_wait_config_entry_persisted",
             persisted,
         ),
@@ -1120,7 +1122,7 @@ async def test_unproven_fleet_storage_keeps_empty_entry_and_one_redacted_repair(
 
     with (
         patch.object(
-            config_flow,
+            flow_gateway,
             "_async_wait_config_entry_persisted",
             side_effect=OSError(secret),
         ),
@@ -1156,7 +1158,7 @@ async def test_unproven_fleet_storage_keeps_empty_entry_and_one_redacted_repair(
     confirm = await _start_subentry_confirm(hass, entry)
     provisioner = _FakeProvisioner(_identity(), gate=asyncio.Event())
     with patch.object(
-        config_flow,
+        flow_gateway,
         "_get_panel_provisioner",
         return_value=provisioner,
     ):
@@ -1187,12 +1189,12 @@ async def test_panel_confirm_storage_failure_is_fixed_redacted_and_write_free(
 
     with (
         patch.object(
-            config_flow,
+            flow_gateway,
             "_async_wait_config_entry_persisted",
             side_effect=OSError(secret),
         ),
         patch.object(
-            config_flow,
+            flow_gateway,
             "_get_panel_provisioner",
             get_provisioner,
         ),
@@ -1241,9 +1243,9 @@ async def test_panel_connect_fetches_identity_before_password_authentication(
         return _facts(identity)
 
     with (
-        patch.object(config_flow, "async_fetch_host_identity", side_effect=fetch),
-        patch.object(config_flow, "FleetAsyncsshShell", side_effect=shell_factory),
-        patch.object(config_flow, "async_inspect_panel", side_effect=inspect),
+        patch.object(flow_gateway, "async_fetch_host_identity", side_effect=fetch),
+        patch.object(flow_gateway, "FleetAsyncsshShell", side_effect=shell_factory),
+        patch.object(flow_gateway, "async_inspect_panel", side_effect=inspect),
     ):
         result = await hass.config_entries.subentries.async_configure(
             panel_connect["flow_id"],
@@ -1271,15 +1273,15 @@ async def test_panel_inspection_preserves_cancellation_while_closing(
 
     shell.close.side_effect = close
     with (
-        patch.object(config_flow, "FleetAsyncsshShell", return_value=shell),
+        patch.object(flow_gateway, "FleetAsyncsshShell", return_value=shell),
         patch.object(
-            config_flow,
+            flow_gateway,
             "async_inspect_panel",
             side_effect=OSError("inspection failed"),
         ),
     ):
         task = asyncio.create_task(
-            config_flow._async_inspect_candidate(
+            flow_gateway._async_inspect_candidate(
                 hass,
                 "office.iot.example",
                 _ROOT_PASSWORD,
@@ -1361,7 +1363,7 @@ def test_canonical_handoff_rejects_component_or_override_mismatch(
         feature_overrides=MappingProxyType({}),
     )
     provisioned = _provisioned(request, identity)
-    assert config_flow._provisioned_matches_request(
+    assert flow_support._provisioned_matches_request(
         provisioned,
         request,
         identity,
@@ -1372,7 +1374,7 @@ def test_canonical_handoff_rejects_component_or_override_mismatch(
         panel_data=CanonicalPanelData(MappingProxyType(mismatched_data)),
     )
 
-    assert not config_flow._provisioned_matches_request(
+    assert not flow_support._provisioned_matches_request(
         mismatched,
         request,
         identity,
@@ -1386,7 +1388,7 @@ async def test_panel_connect_error_is_redacted_and_creates_nothing(
     panel_connect = await _submit_broker(hass, broker, _FakeValidator())
 
     with patch.object(
-        config_flow,
+        flow_gateway,
         "async_fetch_host_identity",
         side_effect=OSError(_ROOT_PASSWORD),
     ):
@@ -1439,7 +1441,7 @@ async def test_panel_identity_error_uses_translated_stable_code(
     panel_connect = await _submit_broker(hass, broker, _FakeValidator())
 
     with patch.object(
-        config_flow,
+        flow_gateway,
         "async_fetch_host_identity",
         side_effect=PanelIdentityError("host_unreachable"),
     ):
@@ -1468,12 +1470,12 @@ async def test_panel_compatibility_error_uses_stable_code_without_secret(
 
     with (
         patch.object(
-            config_flow,
+            flow_gateway,
             "async_fetch_host_identity",
             return_value=_identity(),
         ),
         patch.object(
-            config_flow,
+            flow_gateway,
             "_async_inspect_candidate",
             side_effect=PanelCompatibilityError("insufficient_memory"),
         ),
@@ -1513,7 +1515,7 @@ async def test_first_panel_progress_cannot_double_submit_and_creates_subentry(
 
     with (
         patch.object(
-            config_flow,
+            flow_gateway,
             "_get_panel_provisioner",
             return_value=provisioner,
         ) as get_provisioner,
@@ -1575,7 +1577,7 @@ async def test_first_panel_provision_failure_returns_to_confirm_without_secret_l
     )
 
     with patch.object(
-        config_flow,
+        flow_gateway,
         "_get_panel_provisioner",
         return_value=provisioner,
     ):
@@ -1616,7 +1618,7 @@ async def test_first_panel_mark_pending_failure_clears_flow_transaction(
     )
 
     with patch.object(
-        config_flow,
+        flow_gateway,
         "_get_panel_provisioner",
         return_value=provisioner,
     ):
@@ -1659,7 +1661,7 @@ async def test_mark_pending_cancellation_drains_recovery_then_propagates(
     )
 
     with patch.object(
-        config_flow,
+        flow_gateway,
         "_get_panel_provisioner",
         return_value=provisioner,
     ):
@@ -1708,7 +1710,7 @@ async def test_mismatched_provisioner_result_is_recovered_before_retry(
     )
 
     with patch.object(
-        config_flow,
+        flow_gateway,
         "_get_panel_provisioner",
         return_value=provisioner,
     ):
@@ -1831,7 +1833,7 @@ async def test_add_panel_inherits_fleet_and_creates_panel_only_subentry(
     )
 
     with patch.object(
-        config_flow,
+        flow_gateway,
         "_get_panel_provisioner",
         return_value=provisioner,
     ) as get_provisioner:
@@ -1922,7 +1924,7 @@ async def test_add_panel_allocates_first_available_slug_and_priority(
     provisioner = _FakeProvisioner(third_identity, gate=asyncio.Event())
 
     with patch.object(
-        config_flow,
+        flow_gateway,
         "_get_panel_provisioner",
         return_value=provisioner,
     ):
@@ -1958,7 +1960,7 @@ async def test_exhausted_mesh_priorities_redisplay_without_starting_provision(
     entry = _fleet_entry(hass, *panels)
     confirm = await _start_subentry_confirm(hass, entry)
 
-    with patch.object(config_flow, "_get_panel_provisioner") as get_provisioner:
+    with patch.object(flow_gateway, "_get_panel_provisioner") as get_provisioner:
         result = await hass.config_entries.subentries.async_configure(
             confirm["flow_id"],
             {CONF_NAME: "New panel"},
@@ -1980,7 +1982,7 @@ async def test_subentry_progress_abandonment_invokes_removal_recovery(
     provisioner = _FakeProvisioner(candidate, gate=asyncio.Event())
 
     with patch.object(
-        config_flow,
+        flow_gateway,
         "_get_panel_provisioner",
         return_value=provisioner,
     ):
@@ -2031,7 +2033,7 @@ async def test_add_panel_aborts_if_fleet_changes_during_install(
     provisioner = _FakeProvisioner(candidate, gate=asyncio.Event())
 
     with patch.object(
-        config_flow,
+        flow_gateway,
         "_get_panel_provisioner",
         return_value=provisioner,
     ):
@@ -2074,7 +2076,7 @@ async def test_add_panel_aborts_if_parent_is_removed_during_install(
     provisioner = _FakeProvisioner(candidate, gate=asyncio.Event())
 
     with patch.object(
-        config_flow,
+        flow_gateway,
         "_get_panel_provisioner",
         return_value=provisioner,
     ):
@@ -2115,7 +2117,7 @@ async def test_post_install_abort_surfaces_recovery_failure(
     )
 
     with patch.object(
-        config_flow,
+        flow_gateway,
         "_get_panel_provisioner",
         return_value=provisioner,
     ):
@@ -2168,7 +2170,7 @@ async def test_add_panel_rechecks_storage_conflicts_after_install(
     provisioner = _FakeProvisioner(candidate, gate=asyncio.Event())
 
     with patch.object(
-        config_flow,
+        flow_gateway,
         "_get_panel_provisioner",
         return_value=provisioner,
     ):
@@ -2217,11 +2219,11 @@ async def test_duplicate_fingerprint_aborts_before_password_authentication(
 
     with (
         patch.object(
-            config_flow,
+            flow_gateway,
             "async_fetch_host_identity",
             return_value=_identity(),
         ),
-        patch.object(config_flow, "FleetAsyncsshShell") as shell_constructor,
+        patch.object(flow_gateway, "FleetAsyncsshShell") as shell_constructor,
     ):
         result = await hass.config_entries.subentries.async_configure(
             result["flow_id"],
@@ -2255,11 +2257,11 @@ async def test_add_panel_reserves_rebound_panel_management_identity_before_authe
 
     with (
         patch.object(
-            config_flow,
+            flow_gateway,
             "async_fetch_host_identity",
             return_value=_identity(),
         ),
-        patch.object(config_flow, "_async_inspect_candidate", inspect),
+        patch.object(flow_gateway, "_async_inspect_candidate", inspect),
     ):
         result = await hass.config_entries.subentries.async_configure(
             result["flow_id"],
@@ -2288,7 +2290,7 @@ async def test_subentry_provisioning_error_keeps_parent_and_secrets_redacted(
     )
 
     with patch.object(
-        config_flow,
+        flow_gateway,
         "_get_panel_provisioner",
         return_value=provisioner,
     ):
@@ -2400,7 +2402,7 @@ async def test_fleet_broker_options_field_error_clears_stale_validation_help(
         ),
         gate=asyncio.Event(),
     )
-    with patch.object(config_flow, "_broker_validator", return_value=validator):
+    with patch.object(flow_gateway, "_broker_validator", return_value=validator):
         progress = await hass.config_entries.options.async_configure(
             form["flow_id"],
             {
@@ -2460,7 +2462,7 @@ async def test_empty_fleet_broker_options_validates_then_updates_profile(
         CONF_MQTT_PASSWORD: "SECRET-replacement-broker-password",
     }
 
-    with patch.object(config_flow, "_broker_validator", return_value=validator):
+    with patch.object(flow_gateway, "_broker_validator", return_value=validator):
         progress = await hass.config_entries.options.async_configure(
             form["flow_id"],
             submitted,
@@ -2498,7 +2500,7 @@ async def test_populated_fleet_identical_broker_profile_is_validation_only(
         },
     }
 
-    with patch.object(config_flow, "_broker_validator", return_value=validator):
+    with patch.object(flow_gateway, "_broker_validator", return_value=validator):
         progress = await hass.config_entries.options.async_configure(
             form["flow_id"],
             submitted,
@@ -2526,7 +2528,7 @@ async def test_populated_fleet_broker_change_requires_guided_flow_without_valida
     form = await _start_fleet_broker_options(hass, entry)
     validator = _FakeValidator()
 
-    with patch.object(config_flow, "_broker_validator", return_value=validator):
+    with patch.object(flow_gateway, "_broker_validator", return_value=validator):
         result = await hass.config_entries.options.async_configure(
             form["flow_id"],
             {
@@ -2557,7 +2559,7 @@ async def test_fleet_broker_validation_failure_is_actionable_and_redacted(
         gate=asyncio.Event(),
     )
 
-    with patch.object(config_flow, "_broker_validator", return_value=validator):
+    with patch.object(flow_gateway, "_broker_validator", return_value=validator):
         progress = await hass.config_entries.options.async_configure(
             form["flow_id"],
             {
@@ -2591,7 +2593,7 @@ async def test_empty_fleet_broker_update_fails_closed_if_panel_appears_during_va
     form = await _start_fleet_broker_options(hass, entry)
     validator = _FakeValidator(gate=asyncio.Event())
 
-    with patch.object(config_flow, "_broker_validator", return_value=validator):
+    with patch.object(flow_gateway, "_broker_validator", return_value=validator):
         progress = await hass.config_entries.options.async_configure(
             form["flow_id"],
             {
@@ -2631,7 +2633,7 @@ async def test_empty_fleet_broker_update_does_not_overwrite_concurrent_profile_c
     form = await _start_fleet_broker_options(hass, entry)
     validator = _FakeValidator(gate=asyncio.Event())
 
-    with patch.object(config_flow, "_broker_validator", return_value=validator):
+    with patch.object(flow_gateway, "_broker_validator", return_value=validator):
         progress = await hass.config_entries.options.async_configure(
             form["flow_id"],
             {
@@ -2802,7 +2804,7 @@ async def test_empty_fleet_broker_update_waits_for_real_provisioner_operation_lo
     entry = _fleet_entry(hass)
     original_data = dict(entry.data)
     options_flow_id = await _prepare_fleet_broker_commit(hass, entry)
-    provisioner = config_flow._get_panel_provisioner(
+    provisioner = flow_gateway._get_panel_provisioner(
         hass,
         expected_identity=_identity(),
     )
@@ -2852,7 +2854,7 @@ async def test_fleet_broker_failure_retry_keeps_new_pending_password(
         CONF_MQTT_PASSWORD: replacement_password,
     }
 
-    with patch.object(config_flow, "_broker_validator", return_value=failed):
+    with patch.object(flow_gateway, "_broker_validator", return_value=failed):
         progress = await hass.config_entries.options.async_configure(
             form["flow_id"],
             submitted,
@@ -2869,7 +2871,7 @@ async def test_fleet_broker_failure_retry_keeps_new_pending_password(
     assert replacement_password not in repr(retry)
 
     succeeded = _FakeValidator(gate=asyncio.Event())
-    with patch.object(config_flow, "_broker_validator", return_value=succeeded):
+    with patch.object(flow_gateway, "_broker_validator", return_value=succeeded):
         progress = await hass.config_entries.options.async_configure(
             retry["flow_id"],
             {
@@ -2903,7 +2905,7 @@ async def test_populated_fleet_can_correct_guidance_only_broker_kind(
     )
     validator = _FakeValidator(gate=asyncio.Event())
 
-    with patch.object(config_flow, "_broker_validator", return_value=validator):
+    with patch.object(flow_gateway, "_broker_validator", return_value=validator):
         progress = await hass.config_entries.options.async_configure(
             form["flow_id"],
             {
@@ -2949,7 +2951,7 @@ async def test_fleet_broker_commit_rejects_ownership_envelope_drift(
     form = await _start_fleet_broker_options(hass, entry)
     validator = _FakeValidator(gate=asyncio.Event())
 
-    with patch.object(config_flow, "_broker_validator", return_value=validator):
+    with patch.object(flow_gateway, "_broker_validator", return_value=validator):
         progress = await hass.config_entries.options.async_configure(
             form["flow_id"],
             {
@@ -2982,7 +2984,7 @@ async def test_fleet_broker_commit_handles_parent_removal_during_validation(
     form = await _start_fleet_broker_options(hass, entry)
     validator = _FakeValidator(gate=asyncio.Event())
 
-    with patch.object(config_flow, "_broker_validator", return_value=validator):
+    with patch.object(flow_gateway, "_broker_validator", return_value=validator):
         progress = await hass.config_entries.options.async_configure(
             form["flow_id"],
             {
@@ -3295,11 +3297,11 @@ async def test_panel_address_rejects_changed_identity_before_password_authentica
 
     with (
         patch.object(
-            config_flow,
+            flow_gateway,
             "async_fetch_host_identity",
             AsyncMock(return_value=_identity(other=True)),
         ) as fetch_identity,
-        patch.object(config_flow, "_async_inspect_candidate", inspect),
+        patch.object(flow_gateway, "_async_inspect_candidate", inspect),
     ):
         result = await hass.config_entries.subentries.async_configure(
             form["flow_id"],
@@ -3333,11 +3335,11 @@ async def test_panel_address_authenticates_only_after_existing_identity_matches(
 
     with (
         patch.object(
-            config_flow,
+            flow_gateway,
             "async_fetch_host_identity",
             AsyncMock(return_value=identity),
         ),
-        patch.object(config_flow, "_async_inspect_candidate", inspect),
+        patch.object(flow_gateway, "_async_inspect_candidate", inspect),
     ):
         result = await hass.config_entries.subentries.async_configure(
             form["flow_id"],
@@ -3378,11 +3380,11 @@ async def test_panel_credential_repair_rechecks_identity_and_never_redisplays_se
 
     with (
         patch.object(
-            config_flow,
+            flow_gateway,
             "async_fetch_host_identity",
             AsyncMock(return_value=identity),
         ),
-        patch.object(config_flow, "_async_inspect_candidate", inspect),
+        patch.object(flow_gateway, "_async_inspect_candidate", inspect),
     ):
         result = await hass.config_entries.subentries.async_configure(
             form["flow_id"],
@@ -3713,8 +3715,8 @@ async def test_explicit_rebind_verifies_new_identity_then_requires_confirmation(
     inspect = AsyncMock(return_value=_facts(candidate))
 
     with (
-        patch.object(config_flow, "async_fetch_host_identity", fetch_identity),
-        patch.object(config_flow, "_async_inspect_candidate", inspect),
+        patch.object(flow_gateway, "async_fetch_host_identity", fetch_identity),
+        patch.object(flow_gateway, "_async_inspect_candidate", inspect),
         patch.object(runtime, "async_rebind_panel", rebind_panel),
     ):
         confirm = await hass.config_entries.subentries.async_configure(
@@ -3788,11 +3790,11 @@ async def test_explicit_rebind_rejects_current_or_duplicate_identity_before_auth
         inspect = AsyncMock()
         with (
             patch.object(
-                config_flow,
+                flow_gateway,
                 "async_fetch_host_identity",
                 AsyncMock(return_value=identity),
             ),
-            patch.object(config_flow, "_async_inspect_candidate", inspect),
+            patch.object(flow_gateway, "_async_inspect_candidate", inspect),
         ):
             result = await hass.config_entries.subentries.async_configure(
                 form["flow_id"],
@@ -3837,12 +3839,12 @@ async def test_explicit_rebind_allows_target_reserved_management_identity(
 
     with (
         patch.object(
-            config_flow,
+            flow_gateway,
             "async_fetch_host_identity",
             AsyncMock(return_value=candidate),
         ),
         patch.object(
-            config_flow,
+            flow_gateway,
             "_async_inspect_candidate",
             AsyncMock(return_value=_facts(candidate)),
         ),
@@ -3893,11 +3895,11 @@ async def test_explicit_rebind_rejects_another_panels_reserved_management_identi
 
     with (
         patch.object(
-            config_flow,
+            flow_gateway,
             "async_fetch_host_identity",
             AsyncMock(return_value=_identity()),
         ),
-        patch.object(config_flow, "_async_inspect_candidate", AsyncMock()),
+        patch.object(flow_gateway, "_async_inspect_candidate", AsyncMock()),
     ):
         result = await hass.config_entries.subentries.async_configure(
             form["flow_id"],
@@ -3935,12 +3937,12 @@ async def test_explicit_rebind_requires_positive_confirmation_without_mutation(
 
     with (
         patch.object(
-            config_flow,
+            flow_gateway,
             "async_fetch_host_identity",
             AsyncMock(return_value=candidate),
         ),
         patch.object(
-            config_flow,
+            flow_gateway,
             "_async_inspect_candidate",
             AsyncMock(return_value=_facts(candidate)),
         ),
@@ -3984,9 +3986,9 @@ async def test_explicit_rebind_rechecks_identity_at_confirmation(
     )
 
     with (
-        patch.object(config_flow, "async_fetch_host_identity", fetch_identity),
+        patch.object(flow_gateway, "async_fetch_host_identity", fetch_identity),
         patch.object(
-            config_flow,
+            flow_gateway,
             "_async_inspect_candidate",
             AsyncMock(return_value=_facts(candidate)),
         ),
@@ -4044,12 +4046,12 @@ async def test_explicit_rebind_maps_locked_manager_failures(
 
     with (
         patch.object(
-            config_flow,
+            flow_gateway,
             "async_fetch_host_identity",
             AsyncMock(side_effect=(candidate, candidate)),
         ),
         patch.object(
-            config_flow,
+            flow_gateway,
             "_async_inspect_candidate",
             AsyncMock(return_value=_facts(candidate)),
         ),
@@ -4119,7 +4121,7 @@ async def test_legacy_reconfigure_passwords_are_masked_and_never_redisplayed(
         CONF_MQTT_PASSWORD: "SECRET-new-mqtt-password",
     }
     with patch.object(
-        config_flow,
+        flow_gateway,
         "_apply_config",
         side_effect=OSError("transient connection failure"),
     ):

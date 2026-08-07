@@ -12,7 +12,6 @@ import voluptuous_serialize
 from homeassistant.const import CONF_NAME
 from homeassistant.helpers import config_validation as cv
 
-from custom_components.brilliant_mqtt import flow_schemas
 from custom_components.brilliant_mqtt.broker import BrokerKind
 from custom_components.brilliant_mqtt.const import (
     CONF_BROKER_KIND,
@@ -50,7 +49,8 @@ from custom_components.brilliant_mqtt.const import (
     OPT_OFFLINE_GRACE_MINUTES,
     OPT_REPAIR_COOLDOWN_MINUTES,
 )
-from custom_components.brilliant_mqtt.flow_schemas import (
+from custom_components.brilliant_mqtt.flow import schemas as flow_schemas
+from custom_components.brilliant_mqtt.flow.schemas import (
     ADVANCED_SECTION,
     BROKER_MENU_OPTIONS,
     DEFAULT_SSH_USERNAME,
