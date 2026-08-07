@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Awaitable, Callable, Iterable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from types import MappingProxyType
 from typing import Any, cast
@@ -595,6 +596,7 @@ async def _submit_broker_create(
     validator: _FakeValidator,
     *,
     broker_input: dict[str, object] | None = None,
+    features_input: dict[str, object] | None = None,
 ) -> dict[str, Any]:
     if validator.gate is None:
         validator.gate = asyncio.Event()
@@ -605,7 +607,16 @@ async def _submit_broker_create(
         )
     assert progress["type"] is FlowResultType.SHOW_PROGRESS
     validator.gate.set()
-    return await _drain_progress(hass.config_entries.flow, result["flow_id"])
+    created = await _drain_progress(hass.config_entries.flow, result["flow_id"])
+    if created["type"] is FlowResultType.FORM and created["step_id"] == "fleet_features":
+        created = cast(
+            dict[str, Any],
+            await hass.config_entries.flow.async_configure(
+                result["flow_id"],
+                features_input or {},
+            ),
+        )
+    return created
 
 
 async def _submit_broker(
@@ -755,7 +766,6 @@ async def test_official_broker_prefills_editable_local_host_and_port(
     assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "broker"
     assert _schema_keys(result) == {
-        CONF_HA_CONTROL_ENABLED,
         CONF_MQTT_HOST,
         CONF_MQTT_PORT,
         CONF_MQTT_USERNAME,
@@ -763,7 +773,6 @@ async def test_official_broker_prefills_editable_local_host_and_port(
         ADVANCED_SECTION,
     }
     defaults = _schema_defaults(result)
-    assert defaults[CONF_HA_CONTROL_ENABLED] is False
     assert defaults[CONF_MQTT_HOST] == "192.0.2.10"
     assert defaults[CONF_MQTT_PORT] == 1883
     validated = result["data_schema"](
@@ -783,7 +792,6 @@ async def test_existing_broker_has_normal_fields_and_shared_advanced_tls(
     result = await _start_broker_form(hass, BrokerKind.EXISTING_BROKER)
 
     assert _schema_keys(result) == {
-        CONF_HA_CONTROL_ENABLED,
         CONF_MQTT_HOST,
         CONF_MQTT_PORT,
         CONF_MQTT_USERNAME,
@@ -856,10 +864,7 @@ async def test_broker_readiness_failure_preserves_only_nonsecret_input(
         hass,
         broker,
         validator,
-        broker_input={
-            **_BROKER_INPUT,
-            CONF_HA_CONTROL_ENABLED: True,
-        },
+        broker_input=_BROKER_INPUT,
     )
 
     assert result["type"] is FlowResultType.FORM
@@ -873,7 +878,6 @@ async def test_broker_readiness_failure_preserves_only_nonsecret_input(
     assert defaults[CONF_MQTT_HOST] == "mqtt.iot.example"
     assert defaults[CONF_MQTT_PORT] == 1883
     assert defaults[CONF_MQTT_USERNAME] == "brilliant-fleet"
-    assert defaults[CONF_HA_CONTROL_ENABLED] is True
     assert _BROKER_PASSWORD not in repr(result)
     assert not hass.config_entries.async_entries(DOMAIN)
 
@@ -889,7 +893,6 @@ async def test_broker_field_error_preserves_only_valid_nonsecret_input(
         {
             **_TLS_BROKER_INPUT,
             CONF_MQTT_PASSWORD: submitted_password,
-            CONF_HA_CONTROL_ENABLED: True,
         },
     )
 
@@ -900,7 +903,6 @@ async def test_broker_field_error_preserves_only_valid_nonsecret_input(
     assert defaults[CONF_MQTT_HOST] == "mqtt.iot.example"
     assert defaults[CONF_MQTT_PORT] == 8883
     assert defaults[CONF_MQTT_USERNAME] == "brilliant-fleet"
-    assert defaults[CONF_HA_CONTROL_ENABLED] is True
     assert defaults[ADVANCED_SECTION] == {
         CONF_MQTT_TLS_ENABLED: True,
         CONF_MQTT_TLS_CA: _CA_PEM,
@@ -965,6 +967,12 @@ async def test_broker_progress_task_cannot_be_double_submitted(
     assert len(validator.calls) == 1
     gate.set()
     result = await _drain_progress(hass.config_entries.flow, broker["flow_id"])
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "fleet_features"
+    result = cast(
+        dict[str, Any],
+        await hass.config_entries.flow.async_configure(broker["flow_id"], {}),
+    )
     assert result["type"] is FlowResultType.CREATE_ENTRY
     _flow_type, flow_id = result["next_flow"]
     assert hass.config_entries.subentries.async_get(flow_id)["step_id"] == "panel_connect"
@@ -1025,20 +1033,18 @@ async def test_broker_validation_creates_durable_empty_fleet_and_chains_first_pa
     identity_fetch.assert_not_awaited()
 
 
-async def test_initial_broker_form_enables_ha_control_before_first_panel(
+async def test_initial_flow_collects_ha_control_on_its_own_features_step(
     hass: HomeAssistant,
 ) -> None:
-    """The broker page is the only pre-panel decision point for HA control."""
+    """Broker credentials and fleet features are separate pre-panel steps."""
     broker = await _start_broker_form(hass, BrokerKind.EXISTING_BROKER)
+    assert CONF_HA_CONTROL_ENABLED not in _schema_keys(broker)
 
     created = await _submit_broker_create(
         hass,
         broker,
         _FakeValidator(),
-        broker_input={
-            **_BROKER_INPUT,
-            CONF_HA_CONTROL_ENABLED: True,
-        },
+        features_input={CONF_HA_CONTROL_ENABLED: True},
     )
 
     assert created["type"] is FlowResultType.CREATE_ENTRY
@@ -1046,6 +1052,18 @@ async def test_initial_broker_form_enables_ha_control_before_first_panel(
     assert entry.data[CONF_HA_CONTROL_ENABLED] is True
     _flow_type, flow_id = created["next_flow"]
     assert hass.config_entries.subentries.async_get(flow_id)["step_id"] == "panel_connect"
+
+
+async def test_initial_features_step_defaults_ha_control_off(
+    hass: HomeAssistant,
+) -> None:
+    """Submitting the features step with defaults keeps HA control disabled."""
+    broker = await _start_broker_form(hass, BrokerKind.EXISTING_BROKER)
+
+    created = await _submit_broker_create(hass, broker, _FakeValidator())
+
+    assert created["type"] is FlowResultType.CREATE_ENTRY
+    assert created["result"].data[CONF_HA_CONTROL_ENABLED] is False
 
 
 async def test_created_fleet_mutation_blocks_persistence_and_first_panel_chain(
@@ -4094,10 +4112,67 @@ async def test_fleet_reconfigure_aborts_without_indexing_panel_secrets(
     assert _BROKER_PASSWORD not in repr(result)
 
 
-async def test_legacy_reconfigure_passwords_are_masked_and_never_redisplayed(
+_RECONFIGURE_MENU = (
+    "reconfigure_connection",
+    "reconfigure_mqtt",
+    "reconfigure_components",
+    "reconfigure_ha_control",
+    "reconfigure_advanced",
+)
+
+
+async def _open_legacy_reconfigure_step(
+    hass: HomeAssistant,
+    entry: MockConfigEntry,
+    step_id: str,
+) -> dict[str, Any]:
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={
+            "source": "reconfigure",
+            "entry_id": entry.entry_id,
+        },
+    )
+    assert result["type"] is FlowResultType.MENU
+    return cast(
+        dict[str, Any],
+        await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {"next_step_id": step_id},
+        ),
+    )
+
+
+async def _submit_legacy_reconfigure(
+    hass: HomeAssistant,
+    form: Mapping[str, Any],
+    user_input: dict[str, Any],
+    apply: AsyncMock,
+) -> dict[str, Any]:
+    """Submit one reconfigure section with the SSH apply and reload isolated."""
+    with (
+        patch.object(flow_gateway, "_apply_config", apply),
+        patch(
+            "custom_components.brilliant_mqtt.async_setup_entry",
+            AsyncMock(return_value=True),
+        ),
+        patch(
+            "custom_components.brilliant_mqtt.async_unload_entry",
+            AsyncMock(return_value=True),
+        ),
+    ):
+        result = await hass.config_entries.flow.async_configure(
+            form["flow_id"],
+            user_input,
+        )
+        await hass.async_block_till_done()
+    return cast(dict[str, Any], result)
+
+
+async def test_legacy_reconfigure_is_a_menu_of_focused_sections(
     hass: HomeAssistant,
 ) -> None:
-    """Stored and just-submitted credentials never become schema defaults."""
+    """Reconfigure offers focused sections instead of one wall of inputs."""
     entry = _legacy_entry(hass)
     result = await hass.config_entries.flow.async_init(
         DOMAIN,
@@ -4107,34 +4182,280 @@ async def test_legacy_reconfigure_passwords_are_masked_and_never_redisplayed(
         },
     )
 
-    assert result["type"] is FlowResultType.FORM
-    for key in (CONF_ROOT_PASSWORD, CONF_MQTT_PASSWORD):
-        selector = _schema_validator(result, key)
-        assert isinstance(selector, TextSelector)
-        assert selector.config["type"] == TextSelectorType.PASSWORD
+    assert result["type"] is FlowResultType.MENU
+    assert tuple(cast(Iterable[str], result["menu_options"])) == _RECONFIGURE_MENU
     assert _ROOT_PASSWORD not in repr(result)
     assert _BROKER_PASSWORD not in repr(result)
 
-    submitted = {
-        **_schema_defaults(result),
-        CONF_ROOT_PASSWORD: "SECRET-new-root-password",
-        CONF_MQTT_PASSWORD: "SECRET-new-mqtt-password",
-    }
+
+async def test_legacy_reconfigure_connection_blank_password_reuses_stored_secret(
+    hass: HomeAssistant,
+) -> None:
+    """The connection step prefills the host and keeps the stored root password."""
+    entry = _legacy_entry(hass)
+    form = await _open_legacy_reconfigure_step(hass, entry, "reconfigure_connection")
+
+    assert form["type"] is FlowResultType.FORM
+    assert form["step_id"] == "reconfigure_connection"
+    defaults = _schema_defaults(form)
+    assert defaults[CONF_HOST] == "office.iot.example"
+    assert defaults[CONF_ROOT_PASSWORD] == ""
+    selector = _schema_validator(form, CONF_ROOT_PASSWORD)
+    assert isinstance(selector, TextSelector)
+    assert selector.config["type"] == TextSelectorType.PASSWORD
+    assert _ROOT_PASSWORD not in repr(form)
+
+    apply = AsyncMock(return_value=_PUBLIC_KEY)
+    result = await _submit_legacy_reconfigure(
+        hass,
+        form,
+        {CONF_HOST: "office.iot.example", CONF_ROOT_PASSWORD: ""},
+        apply,
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+    assert apply.await_count == 1
+    call = apply.await_args
+    assert call is not None
+    assert call.args[1] == "office.iot.example"
+    assert call.args[2] == _ROOT_PASSWORD
+    assert call.kwargs["pinned_key"] == _PUBLIC_KEY
+    assert call.kwargs["expected_panel"] == "office"
+    assert entry.data[CONF_ROOT_PASSWORD] == _ROOT_PASSWORD
+    assert entry.data[CONF_MQTT_PASSWORD] == _BROKER_PASSWORD
+
+
+async def test_legacy_reconfigure_connection_new_password_is_stored(
+    hass: HomeAssistant,
+) -> None:
+    """A typed replacement root password is offered over SSH and then stored."""
+    entry = _legacy_entry(hass)
+    form = await _open_legacy_reconfigure_step(hass, entry, "reconfigure_connection")
+
+    apply = AsyncMock(return_value=_PUBLIC_KEY)
+    result = await _submit_legacy_reconfigure(
+        hass,
+        form,
+        {CONF_HOST: "office.iot.example", CONF_ROOT_PASSWORD: "rotated-root-password"},
+        apply,
+    )
+
+    assert result["reason"] == "reconfigure_successful"
+    call = apply.await_args
+    assert call is not None
+    assert call.args[2] == "rotated-root-password"
+    assert entry.data[CONF_ROOT_PASSWORD] == "rotated-root-password"
+
+
+async def test_legacy_reconfigure_mqtt_blank_password_reuses_stored_secret(
+    hass: HomeAssistant,
+) -> None:
+    """The MQTT step prefills broker fields and keeps the stored password."""
+    entry = _legacy_entry(hass)
+    form = await _open_legacy_reconfigure_step(hass, entry, "reconfigure_mqtt")
+
+    assert form["step_id"] == "reconfigure_mqtt"
+    defaults = _schema_defaults(form)
+    assert defaults[CONF_MQTT_HOST] == "mqtt.iot.example"
+    assert defaults[CONF_MQTT_PORT] == 1883
+    assert defaults[CONF_MQTT_USERNAME] == "brilliant-fleet"
+    assert defaults[CONF_MQTT_PASSWORD] == ""
+    assert _BROKER_PASSWORD not in repr(form)
+
+    apply = AsyncMock(return_value=_PUBLIC_KEY)
+    result = await _submit_legacy_reconfigure(
+        hass,
+        form,
+        {
+            CONF_MQTT_HOST: "replacement.iot.example",
+            CONF_MQTT_PORT: 1883,
+            CONF_MQTT_USERNAME: "brilliant-fleet",
+            CONF_MQTT_PASSWORD: "",
+        },
+        apply,
+    )
+
+    assert result["reason"] == "reconfigure_successful"
+    call = apply.await_args
+    assert call is not None
+    assert call.args[2] == _ROOT_PASSWORD
+    env = call.kwargs["env_content"]
+    assert "replacement.iot.example" in env
+    assert _BROKER_PASSWORD in env
+    assert entry.data[CONF_MQTT_HOST] == "replacement.iot.example"
+    assert entry.data[CONF_MQTT_PASSWORD] == _BROKER_PASSWORD
+    assert entry.data[CONF_HOST] == "office.iot.example"
+
+
+async def test_legacy_reconfigure_secrets_are_masked_and_never_redisplayed(
+    hass: HomeAssistant,
+) -> None:
+    """Stored and just-submitted credentials never become schema defaults."""
+    entry = _legacy_entry(hass)
+    form = await _open_legacy_reconfigure_step(hass, entry, "reconfigure_connection")
+
     with patch.object(
         flow_gateway,
         "_apply_config",
         side_effect=OSError("transient connection failure"),
     ):
         result = await hass.config_entries.flow.async_configure(
-            result["flow_id"],
-            submitted,
+            form["flow_id"],
+            {
+                CONF_HOST: "office.iot.example",
+                CONF_ROOT_PASSWORD: "SECRET-new-root-password",
+            },
         )
 
     assert result["type"] is FlowResultType.FORM
     assert result["errors"] == {"base": "cannot_connect"}
     assert "SECRET-new-root-password" not in repr(result)
-    assert "SECRET-new-mqtt-password" not in repr(result)
     assert _ROOT_PASSWORD not in repr(result)
-    assert _BROKER_PASSWORD not in repr(result)
-    assert CONF_ROOT_PASSWORD not in _schema_defaults(result)
-    assert CONF_MQTT_PASSWORD not in _schema_defaults(result)
+    assert _schema_defaults(result).get(CONF_ROOT_PASSWORD, "") == ""
+    assert entry.data[CONF_ROOT_PASSWORD] == _ROOT_PASSWORD
+
+
+async def test_legacy_reconfigure_components_prefill_and_no_change_is_push_only(
+    hass: HomeAssistant,
+) -> None:
+    """The components step prefills installed state; a no-change save runs no ops."""
+    entry = _legacy_entry(hass)
+    form = await _open_legacy_reconfigure_step(hass, entry, "reconfigure_components")
+
+    assert form["step_id"] == "reconfigure_components"
+    defaults = _schema_defaults(form)
+    assert defaults[COMPONENT_WIFI_WATCHDOG] is True
+    assert defaults[COMPONENT_BUS_WATCHDOG] is True
+    assert defaults[COMPONENT_VOICE] is False
+    assert defaults[CONF_VOICE_WAKE_WORD] == DEFAULT_VOICE_WAKE_WORD
+
+    apply = AsyncMock(return_value=_PUBLIC_KEY)
+    session = AsyncMock()
+    with patch.object(flow_gateway, "_panel_session", session):
+        result = await _submit_legacy_reconfigure(
+            hass,
+            form,
+            dict(defaults),
+            apply,
+        )
+
+    assert result["reason"] == "reconfigure_successful"
+    session.assert_not_called()
+    components = entry.data[CONF_COMPONENTS]
+    assert components[COMPONENT_BRIDGE] is True
+    assert components[COMPONENT_WIFI_WATCHDOG] is True
+    assert components[COMPONENT_VOICE] is False
+
+
+async def test_legacy_reconfigure_components_diff_installs_with_stored_secrets(
+    hass: HomeAssistant,
+) -> None:
+    """Enabling a component installs it using the stored SSH credential."""
+    entry = _legacy_entry(hass)
+    form = await _open_legacy_reconfigure_step(hass, entry, "reconfigure_components")
+    defaults = _schema_defaults(form)
+
+    install = AsyncMock()
+    voice = replace(config_flow.REGISTRY[COMPONENT_VOICE], install=install)
+    session_passwords: list[str] = []
+
+    @asynccontextmanager
+    async def fake_session(
+        _hass: HomeAssistant,
+        _host: str,
+        password: str,
+        _key: str | None,
+    ) -> AsyncIterator[object]:
+        session_passwords.append(password)
+        yield object()
+
+    apply = AsyncMock(return_value=_PUBLIC_KEY)
+    with (
+        patch.object(flow_gateway, "_panel_session", fake_session),
+        patch.dict(config_flow.REGISTRY, {COMPONENT_VOICE: voice}),
+    ):
+        result = await _submit_legacy_reconfigure(
+            hass,
+            form,
+            {**defaults, COMPONENT_VOICE: True},
+            apply,
+        )
+
+    assert result["reason"] == "reconfigure_successful"
+    install.assert_awaited_once()
+    assert session_passwords == [_ROOT_PASSWORD]
+    assert entry.data[CONF_COMPONENTS][COMPONENT_VOICE] is True
+
+
+async def test_legacy_reconfigure_ha_control_updates_globals_and_fans_out(
+    hass: HomeAssistant,
+) -> None:
+    """The HA-control step updates globals here and on every other entry."""
+    entry = _legacy_entry(hass)
+    other = MockConfigEntry(
+        domain=DOMAIN,
+        title="Other Brilliant panel",
+        version=CONFIG_ENTRY_VERSION,
+        data={
+            **_fleet_data(),
+            CONF_ENTRY_KIND: ENTRY_KIND_LEGACY_PENDING_CONSOLIDATION,
+            CONF_HOST: "kitchen.iot.example",
+            CONF_ROOT_PASSWORD: "kitchen-root-password",
+            CONF_SSH_HOST_KEY: _OTHER_PUBLIC_KEY,
+            CONF_PANEL: "kitchen",
+            CONF_MESH_PRIORITY: 2,
+            CONF_SCENE_PANEL: "kitchen",
+        },
+    )
+    other.add_to_hass(hass)
+    form = await _open_legacy_reconfigure_step(hass, entry, "reconfigure_ha_control")
+
+    assert form["step_id"] == "reconfigure_ha_control"
+    defaults = _schema_defaults(form)
+    assert defaults[CONF_HA_CONTROL_LABEL] == DEFAULT_HA_CONTROL_LABEL
+
+    apply = AsyncMock(return_value=_PUBLIC_KEY)
+    result = await _submit_legacy_reconfigure(
+        hass,
+        form,
+        {
+            **defaults,
+            CONF_HA_CONTROL_ENABLED: True,
+            CONF_HA_CONTROL_LABEL: "Panels",
+        },
+        apply,
+    )
+
+    assert result["reason"] == "reconfigure_successful"
+    assert entry.data[CONF_HA_CONTROL_ENABLED] is True
+    assert entry.data[CONF_HA_CONTROL_LABEL] == "Panels"
+    assert other.data[CONF_HA_CONTROL_ENABLED] is True
+    assert other.data[CONF_HA_CONTROL_LABEL] == "Panels"
+    assert other.data[CONF_ROOT_PASSWORD] == "kitchen-root-password"
+
+
+async def test_legacy_reconfigure_advanced_updates_mesh_priority(
+    hass: HomeAssistant,
+) -> None:
+    """The advanced step edits only the mesh priority and pushes it to the panel."""
+    entry = _legacy_entry(hass)
+    form = await _open_legacy_reconfigure_step(hass, entry, "reconfigure_advanced")
+
+    assert form["step_id"] == "reconfigure_advanced"
+    assert _schema_defaults(form)[CONF_MESH_PRIORITY] == 1
+
+    apply = AsyncMock(return_value=_PUBLIC_KEY)
+    result = await _submit_legacy_reconfigure(
+        hass,
+        form,
+        {CONF_MESH_PRIORITY: 7},
+        apply,
+    )
+
+    assert result["reason"] == "reconfigure_successful"
+    call = apply.await_args
+    assert call is not None
+    assert "MESH_PRIORITY=7" in call.kwargs["env_content"]
+    assert entry.data[CONF_MESH_PRIORITY] == 7
+    assert entry.data[CONF_HOST] == "office.iot.example"

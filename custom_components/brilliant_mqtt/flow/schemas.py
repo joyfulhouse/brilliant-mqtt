@@ -1320,25 +1320,21 @@ def allocate_mesh_priority(existing_priorities: Iterable[int]) -> int:
     raise FlowInputError({"base": "mesh_priority_exhausted"})
 
 
-# Free-text fields that flow into the on-panel env file / SSH; a control char here
-# corrupts the env file (panel_ops `_env_quote` rejects it as a hard backstop), so
-# reject at the boundary for a friendly per-field message.
-_NO_CONTROL_CHARS = (
-    CONF_HOST,
-    CONF_ROOT_PASSWORD,
-    CONF_MQTT_HOST,
-    CONF_MQTT_USERNAME,
-    CONF_MQTT_PASSWORD,
-    CONF_HA_CONTROL_LABEL,
-)
-
-
-def _mqtt_schema_fields(source: Mapping[str, Any]) -> dict[Any, Any]:
+def _mqtt_schema_fields(
+    source: Mapping[str, Any], *, secret_optional: bool = False
+) -> dict[Any, Any]:
     """The four broker fields shared by the add-broker and reconfigure steps.
 
     Defaults come from *source* (prior-entry prefill, or the entry being reconfigured);
-    the three string fields fall back to blank, the port to 1883.
+    the three string fields fall back to blank, the port to 1883. With
+    ``secret_optional`` (reconfigure mode) the password field is optional and
+    defaults to blank — a blank submission re-uses the stored password.
     """
+    password_marker: vol.Marker = (
+        vol.Optional(CONF_MQTT_PASSWORD, default="")
+        if secret_optional
+        else vol.Required(CONF_MQTT_PASSWORD)
+    )
     return {
         vol.Required(CONF_MQTT_HOST, default=source.get(CONF_MQTT_HOST, vol.UNDEFINED)): str,
         vol.Required(CONF_MQTT_PORT, default=source.get(CONF_MQTT_PORT, 1883)): vol.All(
@@ -1347,9 +1343,7 @@ def _mqtt_schema_fields(source: Mapping[str, Any]) -> dict[Any, Any]:
         vol.Required(
             CONF_MQTT_USERNAME, default=source.get(CONF_MQTT_USERNAME, vol.UNDEFINED)
         ): str,
-        vol.Required(
-            CONF_MQTT_PASSWORD,
-        ): TextSelector(TextSelectorConfig(type=TextSelectorType.PASSWORD)),
+        password_marker: TextSelector(TextSelectorConfig(type=TextSelectorType.PASSWORD)),
     }
 
 
@@ -1385,17 +1379,6 @@ def _components_schema_fields(
         TextSelectorConfig(multiline=True)
     )
     return fields
-
-
-_GLOBAL_KEYS = (
-    CONF_HA_CONTROL_ENABLED,
-    CONF_HA_CONTROL_LABEL,
-    CONF_ROOM_OVERRIDES,
-    CONF_HA_CONTROL_DOMAINS,
-    CONF_MAX_MIRRORED_ENTITIES,
-    CONF_SCENE_PANEL,
-    CONF_SCENE_ACTIONS,
-)
 
 
 class _RawMultiSelect(cv.multi_select):

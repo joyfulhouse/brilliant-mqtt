@@ -1,4 +1,11 @@
-"""Legacy single-entry panel reconfigure steps (pre-subentry panels)."""
+"""Menu-driven reconfigure for one legacy (single-config-entry) panel.
+
+Instead of one wall of inputs, reconfigure opens a menu of focused sections
+(connection, MQTT broker, components, HA control, advanced). Every section
+prefills the stored values, and secret fields left blank silently re-use the
+stored credential — a blank never overwrites, and a stored secret is never
+redisplayed.
+"""
 
 from __future__ import annotations
 
@@ -7,7 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 import asyncssh
 import voluptuous as vol
-from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.config_entries import ConfigEntry, ConfigFlow, ConfigFlowResult
 from homeassistant.helpers.selector import (
     TextSelector,
     TextSelectorConfig,
@@ -22,6 +29,7 @@ from ..const import (
     CONF_COMPONENTS,
     CONF_ENTRY_KIND,
     CONF_HA_CONTROL_ENABLED,
+    CONF_HA_CONTROL_LABEL,
     CONF_HOST,
     CONF_MESH_PRIORITY,
     CONF_MQTT_HOST,
@@ -38,8 +46,6 @@ from ..const import (
 from ..voice_payload import VoicePayloadError
 from . import gateway
 from .schemas import (
-    _GLOBAL_KEYS,
-    _NO_CONTROL_CHARS,
     _components_schema_fields,
     _control_schema_fields,
     _has_control_char,
@@ -54,167 +60,326 @@ if TYPE_CHECKING:
 else:
     _Base = object
 
+RECONFIGURE_MENU_OPTIONS = (
+    "reconfigure_connection",
+    "reconfigure_mqtt",
+    "reconfigure_components",
+    "reconfigure_ha_control",
+    "reconfigure_advanced",
+)
+
+_PASSWORD_SELECTOR = TextSelector(TextSelectorConfig(type=TextSelectorType.PASSWORD))
+
 
 class LegacyPanelReconfigureFlow(_Base):
     """Reconfigure steps for one legacy (single-config-entry) panel.
 
     Mixed into :class:`~.fleet.BrilliantMqttConfigFlow`; typed against
     ``ConfigFlow`` only when type checking so the runtime class keeps a single
-    Home Assistant flow registration.
+    Home Assistant flow registration. The panel slug (CONF_PANEL) stays
+    immutable after onboarding.
     """
+
+    def _legacy_reconfigure_entry(self) -> ConfigEntry[Any] | None:
+        entry = self._get_reconfigure_entry()
+        if entry.data.get(CONF_ENTRY_KIND) == ENTRY_KIND_FLEET:
+            return None
+        return entry
 
     async def async_step_reconfigure(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Edit host/password/broker/mesh/components for one panel and push it.
+        """Offer one focused section per concern instead of a wall of inputs."""
+        del user_input
+        if self._legacy_reconfigure_entry() is None:
+            return self.async_abort(reason="reconfigure_not_supported")
+        return self.async_show_menu(
+            step_id="reconfigure",
+            menu_options=RECONFIGURE_MENU_OPTIONS,
+        )
 
-        The panel slug (CONF_PANEL) is immutable after onboarding.
+    async def _async_apply_legacy_section(
+        self,
+        entry: ConfigEntry[Any],
+        updates: dict[str, Any],
+        *,
+        control_values: dict[str, Any] | None = None,
+        desired_components: dict[str, bool] | None = None,
+    ) -> tuple[dict[str, str], ConfigFlowResult | None]:
+        """Push the merged config to the panel, then persist one section's edits.
+
+        ``updates``/``control_values`` arrive with blank secrets already resolved
+        back to the stored values, so the merge below is the exact config the
+        panel should run. Returns ``(errors, result)``: transient failures come
+        back as form errors and leave the entry untouched.
         """
-        entry = self._get_reconfigure_entry()
-        if entry.data.get(CONF_ENTRY_KIND) == ENTRY_KIND_FLEET:
+        data = entry.data
+        merged: dict[str, Any] = {**data, **updates, **(control_values or {})}
+        host = str(merged[CONF_HOST])
+        password = str(merged[CONF_ROOT_PASSWORD])
+        panel = str(data[CONF_PANEL])
+        # Same host → verify against the STORED pin (key checked before auth, so
+        # the password is never offered to a changed/impostor host). Different
+        # host → new endpoint/hardware → fresh TOFU.
+        host_unchanged = host == data[CONF_HOST]
+        pinned_key = data.get(DATA_SSH_HOST_KEY) if host_unchanged else None
+        if host_unchanged and pinned_key is None:
+            # Defense-in-depth: same host but no stored pin (not reachable today
+            # — every entry-write pins). Fail closed: an unpinned connect here
+            # would re-offer the root password to an unverified host.
+            return {"base": "host_key_changed"}, None
+        env = panel_ops.render_env(
+            panel=panel,
+            mesh_priority=int(merged.get(CONF_MESH_PRIORITY, 0)),
+            mqtt_host=str(merged[CONF_MQTT_HOST]),
+            mqtt_port=int(merged[CONF_MQTT_PORT]),
+            mqtt_username=str(merged[CONF_MQTT_USERNAME]),
+            mqtt_password=str(merged[CONF_MQTT_PASSWORD]),
+            scene_bridge_enabled=bool(merged.get(CONF_HA_CONTROL_ENABLED, False)),
+        )
+        try:
+            host_key = await gateway._apply_config(
+                self.hass,
+                host,
+                password,
+                pinned_key=pinned_key,
+                env_content=env,
+                expected_panel=panel,
+            )
+        except gateway._WrongPanelError:
+            # The host runs a DIFFERENT panel's agent (likely a mistyped
+            # address): refuse rather than overwrite + restart that panel.
+            return {"base": "wrong_panel"}, None
+        except asyncssh.HostKeyNotVerifiable:
+            # Same known-good host but its key no longer matches the pin: a
+            # reflash — or a MITM. Surface it; never silently re-pin. The
+            # stored pin and entry data are left untouched.
+            return {"base": "host_key_changed"}, None
+        except (OSError, asyncssh.Error):
+            return {"base": "cannot_connect"}, None
+        except panel_ops.PanelOpError:
+            # Connected fine, but writing the env / restarting failed.
+            return {"base": "cannot_apply"}, None
+
+        new_data: dict[str, Any] = {**data, **updates, DATA_SSH_HOST_KEY: host_key}
+        if desired_components is not None:
+            current: dict[str, Any] = dict(data.get(CONF_COMPONENTS) or {})
+            new_data[CONF_COMPONENTS] = desired_components
+            try:
+                for component in optional():
+                    was = bool(current.get(component.id, False))
+                    now = desired_components[component.id]
+                    if now == was:
+                        continue
+                    async with gateway._panel_session(
+                        self.hass,
+                        host,
+                        password,
+                        host_key,
+                    ) as shell:
+                        if now:
+                            await REGISTRY[component.id].install(self.hass, shell, new_data)
+                        else:
+                            await REGISTRY[component.id].remove(shell)
+            except VoicePayloadError:
+                return {"base": "cannot_install_voice"}, None
+            except (OSError, asyncssh.Error, panel_ops.PanelOpError):
+                return {"base": "cannot_apply"}, None
+        if control_values is not None:
+            new_data.update(control_values)
+            for fleet_entry in self.hass.config_entries.async_entries(DOMAIN):
+                if fleet_entry.entry_id == entry.entry_id:
+                    continue
+                self.hass.config_entries.async_update_entry(
+                    fleet_entry,
+                    data={**fleet_entry.data, **copy.deepcopy(control_values)},
+                )
+        return {}, self.async_update_reload_and_abort(entry, data=new_data)
+
+    def _legacy_section_form(
+        self,
+        step_id: str,
+        fields: dict[Any, Any],
+        errors: dict[str, str],
+        user_input: dict[str, Any] | None,
+    ) -> ConfigFlowResult:
+        """One prefilled section form; error redisplays keep non-secret edits."""
+        schema = vol.Schema(fields)
+        if user_input is not None:
+            # Keep the operator's just-made edits across an error redisplay (a
+            # transient cannot_connect shouldn't wipe the fields back to the old
+            # config) — but never echo credentials or unsafe JSON text.
+            schema = self.add_suggested_values_to_schema(
+                schema, _safe_control_redisplay_values(user_input)
+            )
+        return self.async_show_form(step_id=step_id, data_schema=schema, errors=errors)
+
+    async def async_step_reconfigure_connection(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Change the panel address and/or rotate its root password."""
+        entry = self._legacy_reconfigure_entry()
+        if entry is None:
             return self.async_abort(reason="reconfigure_not_supported")
         errors: dict[str, str] = {}
         if user_input is not None:
-            # Reject control chars on the RAW input first, THEN strip benign surrounding
-            # whitespace — otherwise a stray trailing space would read as a "different"
-            # host and downgrade the same-host pinned check to a fresh TOFU.
-            errors = control_char_errors(user_input, _NO_CONTROL_CHARS)
-            # voice_ha_host is now on this form; validate it for control chars too
-            # (a control char there crashes render_voice_env → _env_quote).
-            ha_host_val = str(user_input.get(CONF_VOICE_HA_HOST, ""))
-            if _has_control_char(ha_host_val):
+            # Reject control chars on the RAW input first, THEN strip benign
+            # surrounding whitespace — otherwise a stray trailing space would read
+            # as a "different" host and downgrade the pinned check to a fresh TOFU.
+            errors = control_char_errors(user_input, (CONF_HOST, CONF_ROOT_PASSWORD))
+            if not errors:
+                typed_password = str(user_input.get(CONF_ROOT_PASSWORD) or "")
+                errors, result = await self._async_apply_legacy_section(
+                    entry,
+                    {
+                        CONF_HOST: str(user_input[CONF_HOST]).strip(),
+                        CONF_ROOT_PASSWORD: (typed_password or str(entry.data[CONF_ROOT_PASSWORD])),
+                    },
+                )
+                if result is not None:
+                    return result
+        return self._legacy_section_form(
+            "reconfigure_connection",
+            {
+                vol.Required(CONF_HOST, default=entry.data[CONF_HOST]): str,
+                vol.Optional(CONF_ROOT_PASSWORD, default=""): _PASSWORD_SELECTOR,
+            },
+            errors,
+            user_input,
+        )
+
+    async def async_step_reconfigure_mqtt(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Point the panel at a different MQTT broker or rotate its credential."""
+        entry = self._legacy_reconfigure_entry()
+        if entry is None:
+            return self.async_abort(reason="reconfigure_not_supported")
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            errors = control_char_errors(
+                user_input,
+                (CONF_MQTT_HOST, CONF_MQTT_USERNAME, CONF_MQTT_PASSWORD),
+            )
+            if not errors:
+                typed_password = str(user_input.get(CONF_MQTT_PASSWORD) or "")
+                errors, result = await self._async_apply_legacy_section(
+                    entry,
+                    {
+                        CONF_MQTT_HOST: user_input[CONF_MQTT_HOST],
+                        CONF_MQTT_PORT: user_input[CONF_MQTT_PORT],
+                        CONF_MQTT_USERNAME: user_input[CONF_MQTT_USERNAME],
+                        CONF_MQTT_PASSWORD: (typed_password or str(entry.data[CONF_MQTT_PASSWORD])),
+                    },
+                )
+                if result is not None:
+                    return result
+        return self._legacy_section_form(
+            "reconfigure_mqtt",
+            _mqtt_schema_fields(entry.data, secret_optional=True),
+            errors,
+            user_input,
+        )
+
+    async def async_step_reconfigure_components(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Install/remove optional components using the stored SSH credential."""
+        entry = self._legacy_reconfigure_entry()
+        if entry is None:
+            return self.async_abort(reason="reconfigure_not_supported")
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            # A control char in voice_ha_host crashes render_voice_env → _env_quote.
+            if _has_control_char(str(user_input.get(CONF_VOICE_HA_HOST, ""))):
                 errors[CONF_VOICE_HA_HOST] = "invalid_value"
+            if not errors:
+                current: dict[str, Any] = dict(entry.data.get(CONF_COMPONENTS) or {})
+                desired = {
+                    component.id: bool(
+                        user_input.get(component.id, current.get(component.id, False))
+                    )
+                    for component in optional()
+                }
+                desired[COMPONENT_BRIDGE] = True
+                desired[COMPONENT_HA_MIRROR] = False
+                # Strip optional-component checkbox ids (e.g. "voice") from the
+                # entry-data updates: those belong only in CONF_COMPONENTS, not
+                # as top-level stray keys in entry data.
+                optional_ids = {component.id for component in optional()}
+                errors, result = await self._async_apply_legacy_section(
+                    entry,
+                    {key: value for key, value in user_input.items() if key not in optional_ids},
+                    desired_components=desired,
+                )
+                if result is not None:
+                    return result
+        return self._legacy_section_form(
+            "reconfigure_components",
+            _components_schema_fields(entry.data, new_install=False),
+            errors,
+            user_input,
+        )
+
+    async def async_step_reconfigure_ha_control(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Edit the HA-control globals; they fan out to every panel entry."""
+        entry = self._legacy_reconfigure_entry()
+        if entry is None:
+            return self.async_abort(reason="reconfigure_not_supported")
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            errors = control_char_errors(user_input, (CONF_HA_CONTROL_LABEL,))
             panels = frozenset(
                 str(candidate.data[CONF_PANEL])
                 for candidate in self.hass.config_entries.async_entries(DOMAIN)
                 if isinstance(candidate.data.get(CONF_PANEL), str)
             )
             control_errors, control_values = _validated_control_input(
-                user_input, panels=panels, default_panel=str(entry.data[CONF_PANEL])
+                user_input,
+                panels=panels,
+                default_panel=str(entry.data[CONF_PANEL]),
             )
             errors.update(control_errors)
             if not errors:
-                user_input = {**user_input, CONF_HOST: user_input[CONF_HOST].strip()}
-                # Same host → verify the rotated password against the STORED pin (key
-                # checked before auth, so the password is never offered to a changed/
-                # impostor host). Different host → new endpoint/hardware → fresh TOFU.
-                host_unchanged = user_input[CONF_HOST] == entry.data[CONF_HOST]
-                pinned_key = entry.data.get(DATA_SSH_HOST_KEY) if host_unchanged else None
-                if host_unchanged and pinned_key is None:
-                    # Defense-in-depth: same host but no stored pin (not reachable today
-                    # — every entry-write pins). Fail closed: an unpinned connect here
-                    # would re-offer the root password to an unverified host.
-                    errors["base"] = "host_key_changed"
-                else:
-                    env = panel_ops.render_env(
-                        panel=entry.data[CONF_PANEL],
-                        mesh_priority=user_input[CONF_MESH_PRIORITY],
-                        mqtt_host=user_input[CONF_MQTT_HOST],
-                        mqtt_port=user_input[CONF_MQTT_PORT],
-                        mqtt_username=user_input[CONF_MQTT_USERNAME],
-                        mqtt_password=user_input[CONF_MQTT_PASSWORD],
-                        scene_bridge_enabled=control_values[CONF_HA_CONTROL_ENABLED],
-                    )
-                    try:
-                        host_key = await gateway._apply_config(
-                            self.hass,
-                            user_input[CONF_HOST],
-                            user_input[CONF_ROOT_PASSWORD],
-                            pinned_key=pinned_key,
-                            env_content=env,
-                            expected_panel=entry.data[CONF_PANEL],
-                        )
-                    except gateway._WrongPanelError:
-                        # The host runs a DIFFERENT panel's agent (likely a mistyped
-                        # address): refuse rather than overwrite + restart that panel.
-                        errors["base"] = "wrong_panel"
-                    except asyncssh.HostKeyNotVerifiable:
-                        # Same known-good host but its key no longer matches the pin: a
-                        # reflash — or a MITM. Surface it; never silently re-pin. The
-                        # stored pin and entry data are left untouched.
-                        errors["base"] = "host_key_changed"
-                    except (OSError, asyncssh.Error):
-                        errors["base"] = "cannot_connect"
-                    except panel_ops.PanelOpError:
-                        # Connected fine, but writing the env / restarting failed.
-                        errors["base"] = "cannot_apply"
-                    else:
-                        # Env push succeeded — now diff and apply component changes.
-                        current: dict[str, Any] = dict(entry.data.get(CONF_COMPONENTS) or {})
-                        desired = {
-                            c.id: bool(user_input.get(c.id, current.get(c.id, False)))
-                            for c in optional()
-                        }
-                        desired[COMPONENT_BRIDGE] = True
-                        desired[COMPONENT_HA_MIRROR] = False
-                        # Strip optional-component checkbox ids (e.g. "voice") from
-                        # user_input before merging: those belong only in CONF_COMPONENTS,
-                        # not as top-level stray keys in entry data.
-                        _opt_ids = {c.id for c in optional()}
-                        clean_input = {
-                            k: v
-                            for k, v in user_input.items()
-                            if k not in _opt_ids and k not in _GLOBAL_KEYS
-                        }
-                        new_data: dict[str, Any] = {
-                            **entry.data,
-                            **clean_input,
-                            DATA_SSH_HOST_KEY: host_key,
-                            CONF_COMPONENTS: desired,
-                            **control_values,
-                        }
-                        try:
-                            for c in optional():
-                                was: bool = bool(current.get(c.id, False))
-                                now: bool = desired[c.id]
-                                if now and not was:
-                                    async with gateway._panel_session(
-                                        self.hass,
-                                        user_input[CONF_HOST],
-                                        user_input[CONF_ROOT_PASSWORD],
-                                        host_key,
-                                    ) as shell:
-                                        await REGISTRY[c.id].install(self.hass, shell, new_data)
-                                elif was and not now:
-                                    async with gateway._panel_session(
-                                        self.hass,
-                                        user_input[CONF_HOST],
-                                        user_input[CONF_ROOT_PASSWORD],
-                                        host_key,
-                                    ) as shell:
-                                        await REGISTRY[c.id].remove(shell)
-                        except VoicePayloadError:
-                            errors["base"] = "cannot_install_voice"
-                        except (OSError, asyncssh.Error, panel_ops.PanelOpError):
-                            errors["base"] = "cannot_apply"
-                        else:
-                            for fleet_entry in self.hass.config_entries.async_entries(DOMAIN):
-                                if fleet_entry.entry_id == entry.entry_id:
-                                    continue
-                                self.hass.config_entries.async_update_entry(
-                                    fleet_entry,
-                                    data={**fleet_entry.data, **copy.deepcopy(control_values)},
-                                )
-                            return self.async_update_reload_and_abort(entry, data=new_data)
-        data = entry.data
-        schema = vol.Schema(
-            {
-                vol.Required(CONF_HOST, default=data[CONF_HOST]): str,
-                vol.Required(CONF_ROOT_PASSWORD): TextSelector(
-                    TextSelectorConfig(type=TextSelectorType.PASSWORD)
-                ),
-                **_mqtt_schema_fields(data),
-                vol.Required(CONF_MESH_PRIORITY, default=data.get(CONF_MESH_PRIORITY, 0)): vol.All(
-                    vol.Coerce(int), vol.Range(min=0, max=99)
-                ),
-                **_components_schema_fields(data, new_install=False),
-                **_control_schema_fields(data, panel_default=str(data[CONF_PANEL])),
-            }
+                errors, result = await self._async_apply_legacy_section(
+                    entry,
+                    {},
+                    control_values=control_values,
+                )
+                if result is not None:
+                    return result
+        return self._legacy_section_form(
+            "reconfigure_ha_control",
+            _control_schema_fields(entry.data, panel_default=str(entry.data[CONF_PANEL])),
+            errors,
+            user_input,
         )
-        # Keep the operator's just-made edits across an error redisplay (a transient
-        # cannot_connect / wrong_panel shouldn't wipe all six fields back to the old config).
+
+    async def async_step_reconfigure_advanced(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Edit the mesh leader-election priority and push it to the panel."""
+        entry = self._legacy_reconfigure_entry()
+        if entry is None:
+            return self.async_abort(reason="reconfigure_not_supported")
+        errors: dict[str, str] = {}
         if user_input is not None:
-            schema = self.add_suggested_values_to_schema(
-                schema, _safe_control_redisplay_values(user_input)
+            errors, result = await self._async_apply_legacy_section(
+                entry,
+                {CONF_MESH_PRIORITY: int(user_input[CONF_MESH_PRIORITY])},
             )
-        return self.async_show_form(step_id="reconfigure", data_schema=schema, errors=errors)
+            if result is not None:
+                return result
+        return self._legacy_section_form(
+            "reconfigure_advanced",
+            {
+                vol.Required(
+                    CONF_MESH_PRIORITY,
+                    default=entry.data.get(CONF_MESH_PRIORITY, 0),
+                ): vol.All(vol.Coerce(int), vol.Range(min=0, max=99)),
+            },
+            errors,
+            user_input,
+        )

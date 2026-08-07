@@ -248,11 +248,6 @@ class BrilliantMqttConfigFlow(
         if user_input is not None:
             self._broker_source = broker_form_source(user_input)
             profile: BrokerProfile | None = None
-            ha_control_enabled = user_input.get(CONF_HA_CONTROL_ENABLED)
-            if type(ha_control_enabled) is not bool:
-                errors[CONF_HA_CONTROL_ENABLED] = "invalid_value"
-            else:
-                self._ha_control_enabled = ha_control_enabled
             try:
                 values = normalize_broker_input(kind, user_input)
                 profile = BrokerProfile.from_mapping(values)
@@ -278,13 +273,6 @@ class BrilliantMqttConfigFlow(
             kind,
             self._broker_source,
             default_host=local_ip,
-        ).extend(
-            {
-                vol.Required(
-                    CONF_HA_CONTROL_ENABLED,
-                    default=self._ha_control_enabled,
-                ): bool,
-            }
         )
         return self.async_show_form(
             step_id="broker",
@@ -326,7 +314,35 @@ class BrilliantMqttConfigFlow(
             self._broker_task = None
         if self._broker_failure is not None:
             return self.async_show_progress_done(next_step_id="broker")
-        return self.async_show_progress_done(next_step_id="fleet_create")
+        return self.async_show_progress_done(next_step_id="fleet_features")
+
+    async def async_step_fleet_features(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Collect fleet-wide feature toggles once the broker has validated."""
+        if self._broker_profile is None or not self._broker_values:
+            return self.async_abort(reason="invalid_flow_state")
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            ha_control_enabled = user_input.get(CONF_HA_CONTROL_ENABLED)
+            if type(ha_control_enabled) is not bool:
+                errors[CONF_HA_CONTROL_ENABLED] = "invalid_value"
+            else:
+                self._ha_control_enabled = ha_control_enabled
+                return await self.async_step_fleet_create()
+        return self.async_show_form(
+            step_id="fleet_features",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        CONF_HA_CONTROL_ENABLED,
+                        default=self._ha_control_enabled,
+                    ): bool,
+                }
+            ),
+            errors=errors,
+        )
 
     async def async_step_fleet_create(
         self,

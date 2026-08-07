@@ -19,20 +19,18 @@
       },
       "broker": {
         "title": "Validate MQTT broker",
-        "description": "For the recommended Home Assistant path, install and start the official `core_mosquitto` add-on, then create dedicated Brilliant broker credentials before continuing. External-broker users do not need this add-on; enter a broker address reachable by Home Assistant and every Brilliant panel. You may also enable Home Assistant control and Brilliant scenes before the first panel is installed. Advanced settings are optional. [Open troubleshooting]({documentation_url})",
+        "description": "For the recommended Home Assistant path, install and start the official `core_mosquitto` add-on, then create dedicated Brilliant broker credentials before continuing. External-broker users do not need this add-on; enter a broker address reachable by Home Assistant and every Brilliant panel. Advanced settings are optional. [Open troubleshooting]({documentation_url})",
         "data": {
           "mqtt_host": "Broker host",
           "mqtt_port": "Broker port",
           "mqtt_username": "Broker username",
-          "mqtt_password": "Broker password",
-          "ha_control_enabled": "Enable Home Assistant control and scenes"
+          "mqtt_password": "Broker password"
         },
         "data_description": {
           "mqtt_host": "Address reachable by both Home Assistant and every Brilliant panel.",
           "mqtt_port": "Usually 1883 without TLS or 8883 with TLS.",
           "mqtt_username": "Broker account used by the Brilliant fleet.",
-          "mqtt_password": "Broker password. It is stored securely and is never shown again.",
-          "ha_control_enabled": "Optional. Enable the constrained Home Assistant MQTT control manifest and Brilliant scene bridge before the first panel is installed. This defaults off."
+          "mqtt_password": "Broker password. It is stored securely and is never shown again."
         },
         "sections": {
           "advanced": {
@@ -51,27 +49,80 @@
       "broker_validation": {
         "title": "Validating MQTT broker"
       },
+      "fleet_features": {
+        "title": "Fleet features",
+        "description": "Choose fleet-wide features. You can change these later from the fleet options.",
+        "data": {
+          "ha_control_enabled": "Enable Home Assistant control plane"
+        },
+        "data_description": {
+          "ha_control_enabled": "Publishes a constrained, local MQTT control manifest from Home Assistant. The legacy on-panel HA mirror remains disabled."
+        }
+      },
       "fleet_create": {
         "title": "Creating Brilliant MQTT fleet"
       },
       "reconfigure": {
         "title": "Reconfigure panel",
-        "description": "Edit this panel and the fleet-wide Home Assistant control settings. Panel changes are pushed over SSH; global settings are copied to every Brilliant entry.",
+        "description": "Pick the section to change. Everything else stays untouched.",
+        "menu_options": {
+          "reconfigure_connection": "Panel connection (address, root password)",
+          "reconfigure_mqtt": "MQTT broker",
+          "reconfigure_components": "Components and features",
+          "reconfigure_ha_control": "Home Assistant control and scenes",
+          "reconfigure_advanced": "Advanced (mesh priority)"
+        }
+      },
+      "reconfigure_connection": {
+        "title": "Panel connection",
+        "description": "Change the panel address or rotate its root password. The change is verified against the pinned SSH host key and pushed over SSH.",
         "data": {
           "host": "Panel IP / hostname",
-          "root_password": "Panel root password",
+          "root_password": "Panel root password"
+        },
+        "data_description": {
+          "root_password": "Leave blank to keep the current password."
+        }
+      },
+      "reconfigure_mqtt": {
+        "title": "MQTT broker",
+        "description": "Point this panel at a different MQTT broker or rotate its broker credential. The new settings are pushed to the panel over SSH.",
+        "data": {
           "mqtt_host": "Broker host",
           "mqtt_port": "Broker port",
           "mqtt_username": "Broker username",
-          "mqtt_password": "Broker password",
-          "mesh_priority": "Mesh priority",
+          "mqtt_password": "Broker password"
+        },
+        "data_description": {
+          "mqtt_password": "Leave blank to keep the current password."
+        }
+      },
+      "reconfigure_components": {
+        "title": "Components and features",
+        "description": "Enable or disable optional on-panel components. Changes are installed or removed over SSH using the stored credentials.",
+        "data": {
           "voice": "Enable voice satellite",
           "voice_wake_word": "Wake word",
           "voice_ha_host": "Home Assistant host override (optional)",
           "wifi_watchdog": "Enable Wi-Fi watchdog",
           "bus_watchdog": "Enable Bus watchdog",
           "hue_ca": "Enable Hue CA recovery",
-          "hue_ca_cert": "diyHue CA certificate (PEM)",
+          "hue_ca_cert": "diyHue CA certificate (PEM)"
+        },
+        "data_description": {
+          "voice": "Install a Home Assistant voice satellite on this panel (on-panel wake word + microphone + speaker). Speech-to-text, the conversation agent, and text-to-speech all run in your HA Assist pipeline — nothing voice-specific is configured on the panel.",
+          "voice_wake_word": "The on-panel wake word that activates the satellite.",
+          "voice_ha_host": "Only needed if the panel cannot resolve your Home Assistant URL's hostname (e.g. a segmented IoT VLAN). Format: hostname=ip, e.g. homeassistant.example=10.0.0.5. Leave blank to use the panel's own DNS.",
+          "wifi_watchdog": "Auto-recovers lost Wi-Fi (reconnect → restart networking → reboot the panel as a last resort).",
+          "bus_watchdog": "Installs the on-panel daemon that reboots the panel if the Brilliant bus stays wedged for 30+ minutes.",
+          "hue_ca": "Installs a periodic timer that re-injects your diyHue CA certificate into the panel's pinned Hue trust bundle, recovering it after an OTA update wipes /data.",
+          "hue_ca_cert": "The diyHue bridge's CA certificate, PEM-encoded. Required to enable Hue CA recovery."
+        }
+      },
+      "reconfigure_ha_control": {
+        "title": "Home Assistant control and scenes",
+        "description": "Edit the fleet-wide Home Assistant control settings. These globals are copied to every Brilliant entry.",
+        "data": {
           "ha_control_enabled": "Enable Home Assistant control plane",
           "ha_control_label": "Home Assistant entity label",
           "room_overrides": "Room overrides (JSON)",
@@ -81,13 +132,6 @@
           "scene_actions": "Scene actions (JSON)"
         },
         "data_description": {
-          "voice": "Install a Home Assistant voice satellite on this panel (on-panel wake word + microphone + speaker). Speech-to-text, the conversation agent, and text-to-speech all run in your HA Assist pipeline — nothing voice-specific is configured on the panel.",
-          "voice_wake_word": "The on-panel wake word that activates the satellite.",
-          "voice_ha_host": "Only needed if the panel cannot resolve your Home Assistant URL's hostname (e.g. a segmented IoT VLAN). Format: hostname=ip, e.g. homeassistant.example=10.0.0.5. Leave blank to use the panel's own DNS.",
-          "wifi_watchdog": "Auto-recovers lost Wi-Fi (reconnect → restart networking → reboot the panel as a last resort).",
-          "bus_watchdog": "Installs the on-panel daemon that reboots the panel if the Brilliant bus stays wedged for 30+ minutes.",
-          "hue_ca": "Installs a periodic timer that re-injects your diyHue CA certificate into the panel's pinned Hue trust bundle, recovering it after an OTA update wipes /data.",
-          "hue_ca_cert": "The diyHue bridge's CA certificate, PEM-encoded. Required to enable Hue CA recovery.",
           "ha_control_enabled": "Publishes a constrained, local MQTT control manifest from Home Assistant. The legacy on-panel HA mirror remains disabled.",
           "ha_control_label": "Home Assistant label selecting entities for the constrained control manifest.",
           "room_overrides": "A JSON object mapping Home Assistant area names to Brilliant room names, for example: \"Office\" mapped to \"Office Bath\".",
@@ -95,6 +139,16 @@
           "max_mirrored_entities": "Safety limit for entities in the control manifest (1–200).",
           "scene_panel": "Brilliant panel used when a scene or mode service call omits a panel.",
           "scene_actions": "A JSON object of explicitly allowlisted scene actions keyed by panel and scene ID."
+        }
+      },
+      "reconfigure_advanced": {
+        "title": "Advanced",
+        "description": "Change this panel's mesh leader-election priority. The new value is pushed to the panel over SSH.",
+        "data": {
+          "mesh_priority": "Mesh priority"
+        },
+        "data_description": {
+          "mesh_priority": "Lower numbers win the BLE-mesh leader election. Each panel needs a unique priority."
         }
       }
     },
