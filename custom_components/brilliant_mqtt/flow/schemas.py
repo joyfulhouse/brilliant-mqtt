@@ -1320,21 +1320,13 @@ def allocate_mesh_priority(existing_priorities: Iterable[int]) -> int:
     raise FlowInputError({"base": "mesh_priority_exhausted"})
 
 
-def _mqtt_schema_fields(
-    source: Mapping[str, Any], *, secret_optional: bool = False
-) -> dict[Any, Any]:
-    """The four broker fields shared by the add-broker and reconfigure steps.
+def _mqtt_schema_fields(source: Mapping[str, Any]) -> dict[Any, Any]:
+    """The four broker fields for the legacy reconfigure MQTT section.
 
-    Defaults come from *source* (prior-entry prefill, or the entry being reconfigured);
-    the three string fields fall back to blank, the port to 1883. With
-    ``secret_optional`` (reconfigure mode) the password field is optional and
-    defaults to blank — a blank submission re-uses the stored password.
+    Defaults come from *source* (the entry being reconfigured); the three string
+    fields fall back to blank, the port to 1883. The password field is optional
+    and defaults to blank — a blank submission re-uses the stored password.
     """
-    password_marker: vol.Marker = (
-        vol.Optional(CONF_MQTT_PASSWORD, default="")
-        if secret_optional
-        else vol.Required(CONF_MQTT_PASSWORD)
-    )
     return {
         vol.Required(CONF_MQTT_HOST, default=source.get(CONF_MQTT_HOST, vol.UNDEFINED)): str,
         vol.Required(CONF_MQTT_PORT, default=source.get(CONF_MQTT_PORT, 1883)): vol.All(
@@ -1343,29 +1335,21 @@ def _mqtt_schema_fields(
         vol.Required(
             CONF_MQTT_USERNAME, default=source.get(CONF_MQTT_USERNAME, vol.UNDEFINED)
         ): str,
-        password_marker: TextSelector(TextSelectorConfig(type=TextSelectorType.PASSWORD)),
+        vol.Optional(CONF_MQTT_PASSWORD, default=""): _PASSWORD_SELECTOR,
     }
 
 
-def _components_schema_fields(
-    source: Mapping[str, Any], *, new_install: bool = True
-) -> dict[Any, Any]:
+def _components_schema_fields(source: Mapping[str, Any]) -> dict[Any, Any]:
     """One checkbox per OPTIONAL component (bridge is implicit/locked), plus voice sub-fields.
 
-    *new_install* controls the fallback default for keys absent from the entry's
-    CONF_COMPONENTS dict:
-
-    - ``True`` (new installs / script step): fall back to ``c.default_enabled`` so
-      default-on components (e.g. wifi_watchdog) render pre-checked on first setup.
-    - ``False`` (existing panels / reconfigure step): fall back to ``False`` so a
-      panel that was onboarded before the component existed does NOT accidentally get
-      it installed on a no-change reconfigure Save.
+    Keys absent from the entry's CONF_COMPONENTS dict fall back to ``False`` so a
+    panel that was onboarded before the component existed does NOT accidentally get
+    it installed on a no-change reconfigure Save.
     """
     chosen: Mapping[str, Any] = source.get(CONF_COMPONENTS, {})
     fields: dict[Any, Any] = {}
     for c in optional():
-        default = chosen.get(c.id, c.default_enabled if new_install else False)
-        fields[vol.Required(c.id, default=default)] = bool
+        fields[vol.Required(c.id, default=chosen.get(c.id, False))] = bool
     # Voice sub-config (meaningful only when voice is checked; validated leniently).
     fields[
         vol.Required(
@@ -1375,8 +1359,8 @@ def _components_schema_fields(
     ] = vol.In(list(VOICE_WAKE_WORDS))
     fields[vol.Optional(CONF_VOICE_HA_HOST, default=source.get(CONF_VOICE_HA_HOST, ""))] = str
     # Hue CA-recovery sub-config (meaningful only when hue_ca is checked).
-    fields[vol.Optional(CONF_HUE_CA_CERT, default=source.get(CONF_HUE_CA_CERT, ""))] = TextSelector(
-        TextSelectorConfig(multiline=True)
+    fields[vol.Optional(CONF_HUE_CA_CERT, default=source.get(CONF_HUE_CA_CERT, ""))] = (
+        _PUBLIC_CA_SELECTOR
     )
     return fields
 

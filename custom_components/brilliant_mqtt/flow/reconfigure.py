@@ -15,11 +15,6 @@ from typing import TYPE_CHECKING, Any
 import asyncssh
 import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry, ConfigFlow, ConfigFlowResult
-from homeassistant.helpers.selector import (
-    TextSelector,
-    TextSelectorConfig,
-    TextSelectorType,
-)
 
 from .. import panel_ops
 from ..components import REGISTRY, optional
@@ -46,6 +41,7 @@ from ..const import (
 from ..voice_payload import VoicePayloadError
 from . import gateway
 from .schemas import (
+    _PASSWORD_SELECTOR,
     _components_schema_fields,
     _control_schema_fields,
     _has_control_char,
@@ -67,8 +63,6 @@ RECONFIGURE_MENU_OPTIONS = (
     "reconfigure_ha_control",
     "reconfigure_advanced",
 )
-
-_PASSWORD_SELECTOR = TextSelector(TextSelectorConfig(type=TextSelectorType.PASSWORD))
 
 
 class LegacyPanelReconfigureFlow(_Base):
@@ -276,7 +270,7 @@ class LegacyPanelReconfigureFlow(_Base):
                     return result
         return self._legacy_section_form(
             "reconfigure_mqtt",
-            _mqtt_schema_fields(entry.data, secret_optional=True),
+            _mqtt_schema_fields(entry.data),
             errors,
             user_input,
         )
@@ -316,7 +310,7 @@ class LegacyPanelReconfigureFlow(_Base):
                     return result
         return self._legacy_section_form(
             "reconfigure_components",
-            _components_schema_fields(entry.data, new_install=False),
+            _components_schema_fields(entry.data),
             errors,
             user_input,
         )
