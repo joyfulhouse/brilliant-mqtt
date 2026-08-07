@@ -104,22 +104,22 @@ table and transport details.
 Initial setup is fleet-first:
 
 1. Choose **Home Assistant Mosquitto add-on (Recommended)** or **Existing MQTT
-   broker**, then enter the dedicated Brilliant broker profile. The same form
-   has one optional **Enable Home Assistant control and scenes** checkbox. It
-   defaults off and must be chosen here if the first panel should run the scene
-   bridge; changing that flag after panels exist requires a guided agent rollout.
+   broker**, then enter the dedicated Brilliant broker profile.
 2. Home Assistant runs the identical behavioral validation described above.
    A failure creates no Brilliant entry or panel side effect.
-3. After validation succeeds, Home Assistant creates and durably verifies an
-   empty Brilliant MQTT fleet. Only then does it chain into the first **Add
-   Brilliant panel** flow.
-4. Enter only the panel address and root password. Home Assistant obtains the
+3. After validation succeeds, a **Fleet features** step offers one optional
+   **Enable Home Assistant control and scenes** checkbox. It defaults off and
+   must be chosen here if the first panel should run the scene bridge;
+   changing that flag after panels exist requires a guided agent rollout.
+4. Home Assistant then creates and durably verifies an empty Brilliant MQTT
+   fleet. Only then does it chain into the first **Add Brilliant panel** flow.
+5. Enter only the panel address and root password. Home Assistant obtains the
    SSH host key before authentication, pins that exact candidate for the
    authenticated inspection, and shows the detected fingerprint and panel
    facts before provisioning.
-5. Give the panel a friendly name. Home Assistant allocates its immutable MQTT
+6. Give the panel a friendly name. Home Assistant allocates its immutable MQTT
    slug and the next unused positive mesh priority automatically.
-6. Provisioning snapshots the current state, stages the candidate release,
+7. Provisioning snapshots the current state, stages the candidate release,
    validates MQTT from the panel path, activates it, and waits for fresh
    availability, metadata, state, and Discovery. A failed candidate is rolled
    back.
@@ -253,6 +253,15 @@ Each panel subentry has focused day-two actions:
 Normal repair, update, and address changes never auto-repin a new host key. An
 unexpected mismatch fails closed; verify the address and network before using
 the explicit rebind action.
+
+A not-yet-migrated legacy panel entry (one config entry per panel) keeps its
+own **Reconfigure** action. It opens a menu of focused sections — **Panel
+connection**, **MQTT broker**, **Components and features**, **Home Assistant
+control and scenes**, and **Advanced (mesh priority)** — so you edit only the
+section you picked; everything else stays untouched. Every field is prefilled
+with the stored value, and password fields left blank silently keep the stored
+credential (stored secrets are never redisplayed). Section saves are verified
+against the pinned SSH host key and pushed to the panel over SSH.
 
 <a id="rebind_blocked_by_panel_onboarding"></a>
 ### Rebind blocked by panel onboarding or recovery
