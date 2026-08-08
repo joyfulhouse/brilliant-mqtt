@@ -347,6 +347,10 @@ class LegacyPanelReconfigureFlow(_Base):
             return self.async_abort(reason="reconfigure_not_supported")
         errors: dict[str, str] = {}
         if user_input is not None:
+            # Gate the RAW label as well as the stripped one below: str.strip()
+            # counts U+001C-U+001F as whitespace, so a label ending in one of
+            # those would reach _validated_control_input already trimmed and slip
+            # past its check. This gate is load-bearing, not redundant.
             errors = control_char_errors(
                 user_input,
                 (CONF_HA_CONTROL_LABEL,),

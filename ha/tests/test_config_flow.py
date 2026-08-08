@@ -339,6 +339,18 @@ def _schema_defaults(result: Mapping[str, Any]) -> dict[str, object]:
     }
 
 
+def _schema_suggested(result: Mapping[str, Any], key: str) -> object:
+    """Return the suggested (redisplayed) value Home Assistant would prefill."""
+    schema = result["data_schema"]
+    assert isinstance(schema, vol.Schema)
+    for marker in schema.schema:
+        if str(marker) != key:
+            continue
+        description = getattr(marker, "description", None)
+        return description.get("suggested_value") if isinstance(description, Mapping) else None
+    raise AssertionError(f"missing schema field: {key}")
+
+
 def _schema_validator(result: Mapping[str, Any], key: str) -> object:
     schema = result["data_schema"]
     assert isinstance(schema, vol.Schema)
@@ -4606,6 +4618,126 @@ async def test_legacy_reconfigure_ha_control_updates_globals_and_fans_out(
     assert other.data[CONF_HA_CONTROL_ENABLED] is True
     assert other.data[CONF_HA_CONTROL_LABEL] == "Panels"
     assert other.data[CONF_ROOT_PASSWORD] == "kitchen-root-password"
+
+
+@pytest.mark.parametrize(
+    ("label", "accepted"),
+    (
+        ("Pan\u001fels", False),
+        ("Pan\u007fels", True),
+        ("Pan\u0085els", True),
+        ("Pan\u009bels", True),
+    ),
+    ids=("c0-unit-separator", "del", "c1-nel", "c1-csi"),
+)
+async def test_legacy_reconfigure_ha_control_label_keeps_c0_only_parity(
+    hass: HomeAssistant,
+    label: str,
+    accepted: bool,
+) -> None:
+    """The HA-control label rejects C0 only, exactly as the pre-split step did.
+
+    Each control character sits mid-string: ``str.strip()`` treats U+001C-U+001F
+    and U+0085 as whitespace, so a trailing one would be silently removed before
+    the label is ever validated.
+    """
+    entry = _legacy_entry(hass)
+    form = await _open_legacy_reconfigure_step(hass, entry, "reconfigure_ha_control")
+
+    result = await _submit_legacy_reconfigure(
+        hass,
+        form,
+        {**_schema_defaults(form), CONF_HA_CONTROL_LABEL: label},
+        AsyncMock(return_value=_PUBLIC_KEY),
+    )
+
+    if accepted:
+        assert result["reason"] == "reconfigure_successful"
+        assert entry.data[CONF_HA_CONTROL_LABEL] == label
+    else:
+        assert result["type"] is FlowResultType.FORM
+        assert result["errors"] == {CONF_HA_CONTROL_LABEL: "invalid_value"}
+        assert entry.data[CONF_HA_CONTROL_LABEL] == DEFAULT_HA_CONTROL_LABEL
+
+
+@pytest.mark.parametrize(
+    ("marker", "accepted"),
+    (
+        ("\u001f", False),
+        ("\u007f", True),
+        ("\u0085", True),
+        ("\u009b", True),
+    ),
+    ids=("c0-unit-separator", "del", "c1-nel", "c1-csi"),
+)
+async def test_legacy_reconfigure_ha_control_json_keeps_c0_only_parity(
+    hass: HomeAssistant,
+    marker: str,
+    accepted: bool,
+) -> None:
+    """Room-override and scene-action JSON reject C0 only, as before the split."""
+    entry = _legacy_entry(hass)
+    form = await _open_legacy_reconfigure_step(hass, entry, "reconfigure_ha_control")
+    overrides = {"area-office": f"Office{marker}Suite"}
+    actions = {
+        "office:scene-1": {
+            "domain": "light",
+            "service": "turn_on",
+            "target": {"entity_id": "light.office"},
+            "data": {"note": f"soft{marker}glow"},
+        }
+    }
+
+    result = await _submit_legacy_reconfigure(
+        hass,
+        form,
+        {
+            **_schema_defaults(form),
+            CONF_ROOM_OVERRIDES: json.dumps(overrides),
+            CONF_SCENE_ACTIONS: json.dumps(actions),
+        },
+        AsyncMock(return_value=_PUBLIC_KEY),
+    )
+
+    if accepted:
+        assert result["reason"] == "reconfigure_successful"
+        assert entry.data[CONF_ROOM_OVERRIDES] == overrides
+        assert entry.data[CONF_SCENE_ACTIONS] == actions
+    else:
+        assert result["type"] is FlowResultType.FORM
+        assert result["errors"] == {
+            CONF_ROOM_OVERRIDES: "invalid_value",
+            CONF_SCENE_ACTIONS: "invalid_value",
+        }
+        assert entry.data[CONF_ROOM_OVERRIDES] == {}
+
+
+async def test_legacy_reconfigure_ha_control_redisplay_keeps_del_bearing_json(
+    hass: HomeAssistant,
+) -> None:
+    """An error redisplay echoes DEL-bearing JSON back instead of blanking it."""
+    entry = _legacy_entry(hass)
+    form = await _open_legacy_reconfigure_step(hass, entry, "reconfigure_ha_control")
+    # ensure_ascii=False keeps the DEL literal in the submitted text: the
+    # redisplay guard inspects the raw string, so an escaped \u007f would not
+    # exercise it (json.loads only revives the real character further down).
+    overrides = json.dumps({"area-office": "Office\u007fSuite"}, ensure_ascii=False)
+    assert "\u007f" in overrides
+
+    result = await _submit_legacy_reconfigure(
+        hass,
+        form,
+        {
+            **_schema_defaults(form),
+            CONF_ROOM_OVERRIDES: overrides,
+            CONF_MAX_MIRRORED_ENTITIES: 0,
+        },
+        AsyncMock(return_value=_PUBLIC_KEY),
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {CONF_MAX_MIRRORED_ENTITIES: "invalid_value"}
+    assert _schema_suggested(result, CONF_ROOM_OVERRIDES) == overrides
 
 
 async def test_legacy_reconfigure_advanced_updates_mesh_priority(

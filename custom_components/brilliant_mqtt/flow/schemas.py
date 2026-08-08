@@ -140,10 +140,15 @@ def _has_control_char(value: str) -> bool:
 def _has_c0_control_char(value: str) -> bool:
     """Reject C0 controls only, leaving DEL (U+007F) and C1 (U+0080-U+009F) alone.
 
-    The legacy per-panel reconfigure steps have always used this narrower check,
-    so an existing panel whose stored credential holds a DEL or C1 byte keeps
-    saving exactly as it did before those steps moved into this package. New
-    onboarding input goes through the stricter :func:`_has_control_char`.
+    This governs the whole legacy per-panel reconfigure surface, which has always
+    used the narrower check: the host/credential and broker fields, the
+    HA-control label, the redisplay guard in
+    :func:`_safe_control_redisplay_values`, and the room-override and
+    scene-action JSON validated by :func:`_validated_control_input` (threaded
+    into the shared decoders as their ``detector``). An existing panel whose
+    stored label, credential, or override JSON holds a DEL or C1 byte therefore
+    keeps saving exactly as it did before those steps moved into this package.
+    New onboarding input goes through the stricter :func:`_has_control_char`.
     """
     return any(ord(character) < 32 for character in value)
 
@@ -572,6 +577,7 @@ def _validate_json_value(
     *,
     depth: int,
     remaining: list[int],
+    detector: Callable[[str], bool] = _has_control_char,
 ) -> None:
     remaining[0] -= 1
     if remaining[0] < 0 or depth > _MAX_JSON_DEPTH:
@@ -583,7 +589,7 @@ def _validate_json_value(
             raise ValueError
         return
     if isinstance(value, str):
-        if len(value) > _MAX_JSON_STRING_LENGTH or _has_control_char(value):
+        if len(value) > _MAX_JSON_STRING_LENGTH or detector(value):
             raise ValueError
         return
     if isinstance(value, list):
@@ -592,26 +598,28 @@ def _validate_json_value(
                 item,
                 depth=depth + 1,
                 remaining=remaining,
+                detector=detector,
             )
         return
     if isinstance(value, dict):
         for key, item in value.items():
-            if (
-                not isinstance(key, str)
-                or len(key) > _MAX_JSON_STRING_LENGTH
-                or _has_control_char(key)
-            ):
+            if not isinstance(key, str) or len(key) > _MAX_JSON_STRING_LENGTH or detector(key):
                 raise ValueError
             _validate_json_value(
                 item,
                 depth=depth + 1,
                 remaining=remaining,
+                detector=detector,
             )
         return
     raise ValueError
 
 
-def _decode_json_object(raw: object) -> dict[str, object]:
+def _decode_json_object(
+    raw: object,
+    *,
+    detector: Callable[[str], bool] = _has_control_char,
+) -> dict[str, object]:
     if not isinstance(raw, str) or len(raw) > _MAX_JSON_TEXT:
         raise ValueError
     try:
@@ -629,12 +637,17 @@ def _decode_json_object(raw: object) -> dict[str, object]:
         decoded,
         depth=0,
         remaining=[_MAX_JSON_NODES],
+        detector=detector,
     )
     return decoded
 
 
-def _decode_room_overrides(raw: object) -> dict[str, str]:
-    loaded = _decode_json_object(raw)
+def _decode_room_overrides(
+    raw: object,
+    *,
+    detector: Callable[[str], bool] = _has_control_char,
+) -> dict[str, str]:
+    loaded = _decode_json_object(raw, detector=detector)
     if len(loaded) > _MAX_ROOM_OVERRIDES:
         raise ValueError
     decoded: dict[str, str] = {}
@@ -654,8 +667,10 @@ def _decode_room_overrides(raw: object) -> dict[str, str]:
 def _decode_scene_actions(
     raw: object,
     panel_slugs: frozenset[str],
+    *,
+    detector: Callable[[str], bool] = _has_control_char,
 ) -> dict[str, object]:
-    loaded = _decode_json_object(raw)
+    loaded = _decode_json_object(raw, detector=detector)
     if len(loaded) > _MAX_SCENE_ACTIONS:
         raise ValueError
     decoded: dict[str, object] = {}
@@ -1408,13 +1423,18 @@ class _RawRange(vol.Range):
 
 
 def _safe_control_redisplay_values(user_input: Mapping[str, Any]) -> dict[str, Any]:
-    """Keep ordinary edits, but never echo credentials or unsafe JSON text."""
+    """Keep ordinary edits, but never echo credentials or unsafe JSON text.
+
+    Reconfigure-only, so it uses the C0-only detector: blanking a stored
+    override JSON that merely carries a DEL or C1 byte would silently discard
+    the operator's edits on an error redisplay.
+    """
     values = dict(user_input)
     values.pop(CONF_ROOT_PASSWORD, None)
     values.pop(CONF_MQTT_PASSWORD, None)
     for key in (CONF_ROOM_OVERRIDES, CONF_SCENE_ACTIONS):
         raw = values.get(key)
-        if not isinstance(raw, str) or len(raw) > _MAX_JSON_TEXT or _has_control_char(raw):
+        if not isinstance(raw, str) or len(raw) > _MAX_JSON_TEXT or _has_c0_control_char(raw):
             values[key] = "{}"
     return values
 
@@ -1457,15 +1477,25 @@ def _control_schema_fields(source: Mapping[str, Any], *, panel_default: str) -> 
 def _validated_control_input(
     user_input: Mapping[str, Any], *, panels: frozenset[str], default_panel: str
 ) -> tuple[dict[str, str], dict[str, Any]]:
+    """Validate the HA-control globals submitted by the legacy reconfigure step.
+
+    Reconfigure-only, so every control-character check here (and in the shared
+    JSON decoders it drives) uses the C0-only detector this surface has always
+    had. Onboarding reaches those decoders through ``normalize_fleet_*_input``,
+    which keeps the stricter full-Cc default.
+    """
     errors: dict[str, str] = {}
     values: dict[str, Any] = {}
     label = str(user_input.get(CONF_HA_CONTROL_LABEL, "")).strip()
-    if not label or len(label) > 256 or _has_control_char(label):
+    if not label or len(label) > 256 or _has_c0_control_char(label):
         errors[CONF_HA_CONTROL_LABEL] = "invalid_value"
     else:
         values[CONF_HA_CONTROL_LABEL] = label
     try:
-        values[CONF_ROOM_OVERRIDES] = _decode_room_overrides(user_input.get(CONF_ROOM_OVERRIDES))
+        values[CONF_ROOM_OVERRIDES] = _decode_room_overrides(
+            user_input.get(CONF_ROOM_OVERRIDES),
+            detector=_has_c0_control_char,
+        )
     except ValueError:
         errors[CONF_ROOM_OVERRIDES] = "invalid_value"
 
@@ -1497,7 +1527,9 @@ def _validated_control_input(
         values[CONF_SCENE_PANEL] = scene_panel
     try:
         values[CONF_SCENE_ACTIONS] = _decode_scene_actions(
-            user_input.get(CONF_SCENE_ACTIONS), panels
+            user_input.get(CONF_SCENE_ACTIONS),
+            panels,
+            detector=_has_c0_control_char,
         )
     except ValueError:
         errors[CONF_SCENE_ACTIONS] = "invalid_value"

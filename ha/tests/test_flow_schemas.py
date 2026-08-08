@@ -766,6 +766,29 @@ def test_fleet_control_rejects_untyped_or_unbounded_values(
     assert repr(value) not in repr(raised.value)
 
 
+@pytest.mark.parametrize(
+    "marker",
+    ("\u001f", "\u007f", "\u0085", "\u009b"),
+    ids=("c0-unit-separator", "del", "c1-nel", "c1-csi"),
+)
+def test_fleet_control_json_keeps_the_strict_cc_default_for_onboarding(
+    marker: str,
+) -> None:
+    """The shared JSON decoders stay full-Cc for every non-reconfigure caller.
+
+    The legacy reconfigure step opts into the narrower C0-only detector; nothing
+    else does, so DEL and C1 must still be rejected here.
+    """
+    submitted = _valid_control_input(
+        **{CONF_ROOM_OVERRIDES: json.dumps({"Office": f"Off{marker}ice"})}
+    )
+
+    with pytest.raises(FlowInputError) as raised:
+        flow_schemas.normalize_fleet_control_input(submitted)
+
+    assert dict(raised.value.errors) == {CONF_ROOM_OVERRIDES: "invalid_value"}
+
+
 def test_fleet_scenes_separates_subentry_owners_from_action_panel_slugs() -> None:
     source = {
         CONF_SCENE_PANEL: "panel-subentry-office",
