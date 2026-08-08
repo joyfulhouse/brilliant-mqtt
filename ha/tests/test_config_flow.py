@@ -4661,6 +4661,38 @@ async def test_legacy_reconfigure_ha_control_label_keeps_c0_only_parity(
 
 
 @pytest.mark.parametrize(
+    "label",
+    ("Panels\u001f", "Panels\t", "Panels\r"),
+    ids=("trailing-unit-separator", "trailing-tab", "trailing-carriage-return"),
+)
+async def test_legacy_reconfigure_ha_control_label_gate_reads_the_raw_value(
+    hass: HomeAssistant,
+    label: str,
+) -> None:
+    """A trailing C0 character is rejected even though str.strip() would hide it.
+
+    str.strip() discards U+0009-U+000D and U+001C-U+001F, so the stripped check
+    inside _validated_control_input only ever sees "Panels" here and accepts it.
+    Only the raw-value gate in async_step_reconfigure_ha_control can reject
+    these, which is what makes that gate load-bearing rather than redundant.
+    """
+    entry = _legacy_entry(hass)
+    form = await _open_legacy_reconfigure_step(hass, entry, "reconfigure_ha_control")
+    assert label.strip() == "Panels"
+
+    result = await _submit_legacy_reconfigure(
+        hass,
+        form,
+        {**_schema_defaults(form), CONF_HA_CONTROL_LABEL: label},
+        AsyncMock(return_value=_PUBLIC_KEY),
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {CONF_HA_CONTROL_LABEL: "invalid_value"}
+    assert entry.data[CONF_HA_CONTROL_LABEL] == DEFAULT_HA_CONTROL_LABEL
+
+
+@pytest.mark.parametrize(
     ("marker", "accepted"),
     (
         ("\u001f", False),

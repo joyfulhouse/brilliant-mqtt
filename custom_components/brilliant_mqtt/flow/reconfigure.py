@@ -348,9 +348,11 @@ class LegacyPanelReconfigureFlow(_Base):
         errors: dict[str, str] = {}
         if user_input is not None:
             # Gate the RAW label as well as the stripped one below: str.strip()
-            # counts U+001C-U+001F as whitespace, so a label ending in one of
-            # those would reach _validated_control_input already trimmed and slip
-            # past its check. This gate is load-bearing, not redundant.
+            # discards every C0 character Python calls whitespace — U+0009-U+000D
+            # (tab, newline, vertical tab, form feed, carriage return) and
+            # U+001C-U+001F (the file/group/record/unit separators) — so a label
+            # ending in any of them would reach _validated_control_input already
+            # trimmed and slip past its check. Load-bearing, not redundant.
             errors = control_char_errors(
                 user_input,
                 (CONF_HA_CONTROL_LABEL,),

@@ -789,6 +789,30 @@ def test_fleet_control_json_keeps_the_strict_cc_default_for_onboarding(
     assert dict(raised.value.errors) == {CONF_ROOM_OVERRIDES: "invalid_value"}
 
 
+@pytest.mark.parametrize(
+    "marker",
+    ("\u001f", "\u007f", "\u0085", "\u009b"),
+    ids=("c0-unit-separator", "del", "c1-nel", "c1-csi"),
+)
+def test_fleet_scenes_json_keeps_the_strict_cc_default_for_onboarding(
+    marker: str,
+) -> None:
+    """scene_actions keeps the full-Cc default for every non-reconfigure caller."""
+    action = {**_scene_action(), "data": {"note": f"soft{marker}glow"}}
+
+    with pytest.raises(FlowInputError) as raised:
+        flow_schemas.normalize_fleet_scenes_input(
+            {
+                CONF_SCENE_PANEL: "panel-subentry-office",
+                CONF_SCENE_ACTIONS: json.dumps({"office:movie": action}),
+            },
+            panel_subentry_ids=("panel-subentry-office",),
+            panel_slugs=("office",),
+        )
+
+    assert dict(raised.value.errors) == {CONF_SCENE_ACTIONS: "invalid_value"}
+
+
 def test_fleet_scenes_separates_subentry_owners_from_action_panel_slugs() -> None:
     source = {
         CONF_SCENE_PANEL: "panel-subentry-office",
