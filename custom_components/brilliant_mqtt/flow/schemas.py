@@ -7,8 +7,9 @@ import json
 import math
 import re
 import unicodedata
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from types import MappingProxyType
+from typing import Any
 
 import voluptuous as vol
 from homeassistant.const import CONF_NAME
@@ -20,9 +21,11 @@ from homeassistant.helpers.selector import (
     TextSelectorType,
 )
 
-from .broker import BrokerKind
-from .const import (
+from ..broker import BrokerKind
+from ..components import optional
+from ..const import (
     CONF_BROKER_KIND,
+    CONF_COMPONENTS,
     CONF_HA_CONTROL_DOMAINS,
     CONF_HA_CONTROL_ENABLED,
     CONF_HA_CONTROL_LABEL,
@@ -57,7 +60,7 @@ from .const import (
     OPT_REPAIR_COOLDOWN_MINUTES,
     VOICE_WAKE_WORDS,
 )
-from .panel_ops import MAX_MQTT_CA_BYTES
+from ..panel_ops import MAX_MQTT_CA_BYTES
 
 ADVANCED_SECTION = "advanced"
 DEFAULT_SSH_USERNAME = "root"
@@ -130,7 +133,24 @@ class _StrictInteger(vol.Coerce):
 
 
 def _has_control_char(value: str) -> bool:
+    """Reject the whole Unicode Cc category: C0, DEL, and the C1 range."""
     return any(unicodedata.category(character) == "Cc" for character in value)
+
+
+def _has_c0_control_char(value: str) -> bool:
+    """Reject C0 controls only, leaving DEL (U+007F) and C1 (U+0080-U+009F) alone.
+
+    This governs the whole legacy per-panel reconfigure surface, which has always
+    used the narrower check: the host/credential and broker fields, the
+    HA-control label, the redisplay guard in
+    :func:`_safe_control_redisplay_values`, and the room-override and
+    scene-action JSON validated by :func:`_validated_control_input` (threaded
+    into the shared decoders as their ``detector``). An existing panel whose
+    stored label, credential, or override JSON holds a DEL or C1 byte therefore
+    keeps saving exactly as it did before those steps moved into this package.
+    New onboarding input goes through the stricter :func:`_has_control_char`.
+    """
+    return any(ord(character) < 32 for character in value)
 
 
 def _encoded_length(value: str) -> int | None:
@@ -238,12 +258,18 @@ def _source_default(source: Mapping[str, object], key: str) -> object:
 def control_char_errors(
     values: Mapping[str, object],
     keys: Iterable[str],
+    *,
+    detector: Callable[[str], bool] = _has_control_char,
 ) -> dict[str, str]:
-    """Return field errors without ever including the submitted values."""
+    """Return field errors without ever including the submitted values.
+
+    *detector* defaults to the full-Cc check the onboarding schemas use; the
+    legacy reconfigure steps pass the narrower C0-only detector they inherited.
+    """
     return {
         key: "invalid_value"
         for key in keys
-        if isinstance((value := values.get(key)), str) and _has_control_char(value)
+        if isinstance((value := values.get(key)), str) and detector(value)
     }
 
 
@@ -551,6 +577,7 @@ def _validate_json_value(
     *,
     depth: int,
     remaining: list[int],
+    detector: Callable[[str], bool] = _has_control_char,
 ) -> None:
     remaining[0] -= 1
     if remaining[0] < 0 or depth > _MAX_JSON_DEPTH:
@@ -562,7 +589,7 @@ def _validate_json_value(
             raise ValueError
         return
     if isinstance(value, str):
-        if len(value) > _MAX_JSON_STRING_LENGTH or _has_control_char(value):
+        if len(value) > _MAX_JSON_STRING_LENGTH or detector(value):
             raise ValueError
         return
     if isinstance(value, list):
@@ -571,26 +598,28 @@ def _validate_json_value(
                 item,
                 depth=depth + 1,
                 remaining=remaining,
+                detector=detector,
             )
         return
     if isinstance(value, dict):
         for key, item in value.items():
-            if (
-                not isinstance(key, str)
-                or len(key) > _MAX_JSON_STRING_LENGTH
-                or _has_control_char(key)
-            ):
+            if not isinstance(key, str) or len(key) > _MAX_JSON_STRING_LENGTH or detector(key):
                 raise ValueError
             _validate_json_value(
                 item,
                 depth=depth + 1,
                 remaining=remaining,
+                detector=detector,
             )
         return
     raise ValueError
 
 
-def _decode_json_object(raw: object) -> dict[str, object]:
+def _decode_json_object(
+    raw: object,
+    *,
+    detector: Callable[[str], bool] = _has_control_char,
+) -> dict[str, object]:
     if not isinstance(raw, str) or len(raw) > _MAX_JSON_TEXT:
         raise ValueError
     try:
@@ -608,12 +637,17 @@ def _decode_json_object(raw: object) -> dict[str, object]:
         decoded,
         depth=0,
         remaining=[_MAX_JSON_NODES],
+        detector=detector,
     )
     return decoded
 
 
-def _decode_room_overrides(raw: object) -> dict[str, str]:
-    loaded = _decode_json_object(raw)
+def _decode_room_overrides(
+    raw: object,
+    *,
+    detector: Callable[[str], bool] = _has_control_char,
+) -> dict[str, str]:
+    loaded = _decode_json_object(raw, detector=detector)
     if len(loaded) > _MAX_ROOM_OVERRIDES:
         raise ValueError
     decoded: dict[str, str] = {}
@@ -633,8 +667,10 @@ def _decode_room_overrides(raw: object) -> dict[str, str]:
 def _decode_scene_actions(
     raw: object,
     panel_slugs: frozenset[str],
+    *,
+    detector: Callable[[str], bool] = _has_control_char,
 ) -> dict[str, object]:
-    loaded = _decode_json_object(raw)
+    loaded = _decode_json_object(raw, detector=detector)
     if len(loaded) > _MAX_SCENE_ACTIONS:
         raise ValueError
     decoded: dict[str, object] = {}
@@ -1315,3 +1351,192 @@ def allocate_mesh_priority(existing_priorities: Iterable[int]) -> int:
         if candidate not in used:
             return candidate
     raise FlowInputError({"base": "mesh_priority_exhausted"})
+
+
+def _mqtt_schema_fields(source: Mapping[str, Any]) -> dict[Any, Any]:
+    """The four broker fields for the legacy reconfigure MQTT section.
+
+    Defaults come from *source* (the entry being reconfigured); the three string
+    fields fall back to blank, the port to 1883. The password field is optional
+    and defaults to blank — a blank submission re-uses the stored password.
+    """
+    return {
+        vol.Required(CONF_MQTT_HOST, default=source.get(CONF_MQTT_HOST, vol.UNDEFINED)): str,
+        vol.Required(CONF_MQTT_PORT, default=source.get(CONF_MQTT_PORT, 1883)): vol.All(
+            vol.Coerce(int), vol.Range(min=1, max=65535)
+        ),
+        vol.Required(
+            CONF_MQTT_USERNAME, default=source.get(CONF_MQTT_USERNAME, vol.UNDEFINED)
+        ): str,
+        vol.Optional(CONF_MQTT_PASSWORD, default=""): _PASSWORD_SELECTOR,
+    }
+
+
+def _components_schema_fields(source: Mapping[str, Any]) -> dict[Any, Any]:
+    """One checkbox per OPTIONAL component (bridge is implicit/locked), plus voice sub-fields.
+
+    Keys absent from the entry's CONF_COMPONENTS dict fall back to ``False`` so a
+    panel that was onboarded before the component existed does NOT accidentally get
+    it installed on a no-change reconfigure Save.
+    """
+    chosen: Mapping[str, Any] = source.get(CONF_COMPONENTS, {})
+    fields: dict[Any, Any] = {}
+    for c in optional():
+        fields[vol.Required(c.id, default=chosen.get(c.id, False))] = bool
+    # Voice sub-config (meaningful only when voice is checked; validated leniently).
+    fields[
+        vol.Required(
+            CONF_VOICE_WAKE_WORD,
+            default=source.get(CONF_VOICE_WAKE_WORD, DEFAULT_VOICE_WAKE_WORD),
+        )
+    ] = vol.In(list(VOICE_WAKE_WORDS))
+    fields[vol.Optional(CONF_VOICE_HA_HOST, default=source.get(CONF_VOICE_HA_HOST, ""))] = str
+    # Hue CA-recovery sub-config (meaningful only when hue_ca is checked).
+    fields[vol.Optional(CONF_HUE_CA_CERT, default=source.get(CONF_HUE_CA_CERT, ""))] = (
+        _PUBLIC_CA_SELECTOR
+    )
+    return fields
+
+
+class _RawMultiSelect(cv.multi_select):
+    """Expose a serializable multi-select while deferring trust-boundary validation."""
+
+    def __call__(self, selected: Any) -> Any:
+        return selected
+
+
+class _RawInteger(vol.Coerce):
+    """Expose an integer field without coercing booleans or strings before validation."""
+
+    def __init__(self) -> None:
+        super().__init__(int)
+
+    def __call__(self, value: Any) -> Any:
+        return value
+
+
+class _RawRange(vol.Range):
+    """Expose numeric bounds while leaving the raw value for strict validation."""
+
+    def __call__(self, value: Any) -> Any:
+        return value
+
+
+def _safe_control_redisplay_values(user_input: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep ordinary edits, but never echo credentials or unsafe JSON text.
+
+    Reconfigure-only, so it uses the C0-only detector: blanking a stored
+    override JSON that merely carries a DEL or C1 byte would silently discard
+    the operator's edits on an error redisplay.
+    """
+    values = dict(user_input)
+    values.pop(CONF_ROOT_PASSWORD, None)
+    values.pop(CONF_MQTT_PASSWORD, None)
+    for key in (CONF_ROOM_OVERRIDES, CONF_SCENE_ACTIONS):
+        raw = values.get(key)
+        if not isinstance(raw, str) or len(raw) > _MAX_JSON_TEXT or _has_c0_control_char(raw):
+            values[key] = "{}"
+    return values
+
+
+def _control_schema_fields(source: Mapping[str, Any], *, panel_default: str) -> dict[Any, Any]:
+    overrides = source.get(CONF_ROOM_OVERRIDES, {})
+    actions = source.get(CONF_SCENE_ACTIONS, {})
+    return {
+        vol.Required(
+            CONF_HA_CONTROL_ENABLED,
+            default=source.get(CONF_HA_CONTROL_ENABLED, DEFAULT_HA_CONTROL_ENABLED),
+        ): bool,
+        vol.Required(
+            CONF_HA_CONTROL_LABEL,
+            default=source.get(CONF_HA_CONTROL_LABEL, DEFAULT_HA_CONTROL_LABEL),
+        ): str,
+        vol.Required(
+            CONF_ROOM_OVERRIDES,
+            default=_canonical_json(overrides) if isinstance(overrides, Mapping) else "{}",
+        ): str,
+        vol.Required(
+            CONF_HA_CONTROL_DOMAINS,
+            default=list(source.get(CONF_HA_CONTROL_DOMAINS, DEFAULT_HA_CONTROL_DOMAINS)),
+        ): _RawMultiSelect({domain: domain for domain in HA_CONTROL_DOMAINS}),
+        vol.Required(
+            CONF_MAX_MIRRORED_ENTITIES,
+            default=source.get(CONF_MAX_MIRRORED_ENTITIES, DEFAULT_MAX_MIRRORED_ENTITIES),
+        ): vol.All(_RawInteger(), _RawRange(min=1, max=200)),
+        vol.Required(
+            CONF_SCENE_PANEL,
+            default=source.get(CONF_SCENE_PANEL, panel_default),
+        ): str,
+        vol.Required(
+            CONF_SCENE_ACTIONS,
+            default=_canonical_json(actions) if isinstance(actions, Mapping) else "{}",
+        ): str,
+    }
+
+
+def _validated_control_input(
+    user_input: Mapping[str, Any], *, panels: frozenset[str], default_panel: str
+) -> tuple[dict[str, str], dict[str, Any]]:
+    """Validate the HA-control globals submitted by the legacy reconfigure step.
+
+    Reconfigure-only, so every control-character check here (and in the shared
+    JSON decoders it drives) uses the C0-only detector this surface has always
+    had. Onboarding reaches those decoders through ``normalize_fleet_*_input``,
+    which keeps the stricter full-Cc default.
+    """
+    errors: dict[str, str] = {}
+    values: dict[str, Any] = {}
+    label = str(user_input.get(CONF_HA_CONTROL_LABEL, "")).strip()
+    if not label or len(label) > 256 or _has_c0_control_char(label):
+        errors[CONF_HA_CONTROL_LABEL] = "invalid_value"
+    else:
+        values[CONF_HA_CONTROL_LABEL] = label
+    try:
+        values[CONF_ROOM_OVERRIDES] = _decode_room_overrides(
+            user_input.get(CONF_ROOM_OVERRIDES),
+            detector=_has_c0_control_char,
+        )
+    except ValueError:
+        errors[CONF_ROOM_OVERRIDES] = "invalid_value"
+
+    raw_domains = user_input.get(CONF_HA_CONTROL_DOMAINS)
+    if (
+        not isinstance(raw_domains, list)
+        or any(
+            not isinstance(domain, str) or domain not in HA_CONTROL_DOMAINS
+            for domain in raw_domains
+        )
+        or len(raw_domains) != len(set(raw_domains))
+    ):
+        errors[CONF_HA_CONTROL_DOMAINS] = "invalid_value"
+    else:
+        values[CONF_HA_CONTROL_DOMAINS] = [
+            domain for domain in HA_CONTROL_DOMAINS if domain in raw_domains
+        ]
+
+    maximum = user_input.get(CONF_MAX_MIRRORED_ENTITIES)
+    if type(maximum) is not int or not 1 <= maximum <= 200:
+        errors[CONF_MAX_MIRRORED_ENTITIES] = "invalid_value"
+    else:
+        values[CONF_MAX_MIRRORED_ENTITIES] = maximum
+
+    scene_panel = str(user_input.get(CONF_SCENE_PANEL, "")).strip() or default_panel
+    if scene_panel not in panels:
+        errors[CONF_SCENE_PANEL] = "invalid_value"
+    else:
+        values[CONF_SCENE_PANEL] = scene_panel
+    try:
+        values[CONF_SCENE_ACTIONS] = _decode_scene_actions(
+            user_input.get(CONF_SCENE_ACTIONS),
+            panels,
+            detector=_has_c0_control_char,
+        )
+    except ValueError:
+        errors[CONF_SCENE_ACTIONS] = "invalid_value"
+
+    enabled = user_input.get(CONF_HA_CONTROL_ENABLED)
+    if type(enabled) is not bool:
+        errors[CONF_HA_CONTROL_ENABLED] = "invalid_value"
+    else:
+        values[CONF_HA_CONTROL_ENABLED] = enabled
+    return errors, values

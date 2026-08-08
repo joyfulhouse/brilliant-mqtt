@@ -8,7 +8,7 @@ from typing import Any, cast
 
 from custom_components.brilliant_mqtt import errors as operation_errors
 from custom_components.brilliant_mqtt import panel_inspection, panel_provisioner, shell
-from custom_components.brilliant_mqtt.flow_schemas import BROKER_MENU_OPTIONS
+from custom_components.brilliant_mqtt.flow.schemas import BROKER_MENU_OPTIONS
 
 _REPOSITORY_ROOT = Path(__file__).parents[2]
 _STRINGS_PATH = _REPOSITORY_ROOT / "custom_components/brilliant_mqtt/strings.json"

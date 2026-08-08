@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Awaitable, Callable, Iterable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from types import MappingProxyType
 from typing import Any, cast
 from unittest.mock import AsyncMock, patch
 from uuid import UUID
 
+import asyncssh
 import pytest
 import voluptuous as vol
 from homeassistant.components.http import ApiConfig
@@ -24,6 +26,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.brilliant_mqtt import _fleet_lock, config_flow
 from custom_components.brilliant_mqtt.broker import BrokerKind, BrokerProfile
+from custom_components.brilliant_mqtt.components import REGISTRY
 from custom_components.brilliant_mqtt.const import (
     COMPONENT_BRIDGE,
     COMPONENT_BUS_WATCHDOG,
@@ -84,7 +87,9 @@ from custom_components.brilliant_mqtt.entry_data import (
 )
 from custom_components.brilliant_mqtt.errors import OperationError, OperationStage
 from custom_components.brilliant_mqtt.fleet_manager import FleetManager
-from custom_components.brilliant_mqtt.flow_schemas import (
+from custom_components.brilliant_mqtt.flow import gateway as flow_gateway
+from custom_components.brilliant_mqtt.flow import support as flow_support
+from custom_components.brilliant_mqtt.flow.schemas import (
     ADVANCED_SECTION,
     BROKER_MENU_OPTIONS,
     SECRET_UNCHANGED,
@@ -145,7 +150,7 @@ _PANEL_INPUT = {
 def _prove_config_entry_persistence(monkeypatch: pytest.MonkeyPatch) -> None:
     """HA's test Store is in-memory; focused fleet tests cover real disk polling."""
     monkeypatch.setattr(
-        config_flow,
+        flow_gateway,
         "_async_wait_config_entry_persisted",
         AsyncMock(),
     )
@@ -334,6 +339,18 @@ def _schema_defaults(result: Mapping[str, Any]) -> dict[str, object]:
     }
 
 
+def _schema_suggested(result: Mapping[str, Any], key: str) -> object:
+    """Return the suggested (redisplayed) value Home Assistant would prefill."""
+    schema = result["data_schema"]
+    assert isinstance(schema, vol.Schema)
+    for marker in schema.schema:
+        if str(marker) != key:
+            continue
+        description = getattr(marker, "description", None)
+        return description.get("suggested_value") if isinstance(description, Mapping) else None
+    raise AssertionError(f"missing schema field: {key}")
+
+
 def _schema_validator(result: Mapping[str, Any], key: str) -> object:
     schema = result["data_schema"]
     assert isinstance(schema, vol.Schema)
@@ -358,7 +375,7 @@ def test_broker_fallback_failure_links_to_mqtt_guide(
     code: str,
     documentation_slug: str,
 ) -> None:
-    placeholders = config_flow._panel_failure(
+    placeholders = flow_support._panel_failure(
         code,
         stage="broker_validation",
     ).placeholders()
@@ -536,7 +553,7 @@ async def _prepare_fleet_broker_commit(
         CONF_MQTT_HOST: "replacement-broker.iot.example",
         CONF_MQTT_PASSWORD: SECRET_UNCHANGED,
     }
-    with patch.object(config_flow, "_broker_validator", return_value=validator):
+    with patch.object(flow_gateway, "_broker_validator", return_value=validator):
         progress = await hass.config_entries.options.async_configure(
             form["flow_id"],
             submitted,
@@ -593,17 +610,27 @@ async def _submit_broker_create(
     validator: _FakeValidator,
     *,
     broker_input: dict[str, object] | None = None,
+    features_input: dict[str, object] | None = None,
 ) -> dict[str, Any]:
     if validator.gate is None:
         validator.gate = asyncio.Event()
-    with patch.object(config_flow, "_broker_validator", return_value=validator):
+    with patch.object(flow_gateway, "_broker_validator", return_value=validator):
         progress = await hass.config_entries.flow.async_configure(
             result["flow_id"],
             broker_input or _BROKER_INPUT,
         )
     assert progress["type"] is FlowResultType.SHOW_PROGRESS
     validator.gate.set()
-    return await _drain_progress(hass.config_entries.flow, result["flow_id"])
+    created = await _drain_progress(hass.config_entries.flow, result["flow_id"])
+    if created["type"] is FlowResultType.FORM and created["step_id"] == "fleet_features":
+        created = cast(
+            dict[str, Any],
+            await hass.config_entries.flow.async_configure(
+                result["flow_id"],
+                features_input or {},
+            ),
+        )
+    return created
 
 
 async def _submit_broker(
@@ -664,12 +691,12 @@ async def _start_initial_confirm(
     assert panel_connect["step_id"] == "panel_connect"
     with (
         patch.object(
-            config_flow,
+            flow_gateway,
             "async_fetch_host_identity",
             return_value=candidate,
         ),
         patch.object(
-            config_flow,
+            flow_gateway,
             "_async_inspect_candidate",
             return_value=_facts(candidate),
         ),
@@ -696,12 +723,12 @@ async def _start_subentry_confirm(
     )
     with (
         patch.object(
-            config_flow,
+            flow_gateway,
             "async_fetch_host_identity",
             return_value=candidate,
         ),
         patch.object(
-            config_flow,
+            flow_gateway,
             "_async_inspect_candidate",
             return_value=_facts(candidate),
         ),
@@ -753,7 +780,6 @@ async def test_official_broker_prefills_editable_local_host_and_port(
     assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "broker"
     assert _schema_keys(result) == {
-        CONF_HA_CONTROL_ENABLED,
         CONF_MQTT_HOST,
         CONF_MQTT_PORT,
         CONF_MQTT_USERNAME,
@@ -761,7 +787,6 @@ async def test_official_broker_prefills_editable_local_host_and_port(
         ADVANCED_SECTION,
     }
     defaults = _schema_defaults(result)
-    assert defaults[CONF_HA_CONTROL_ENABLED] is False
     assert defaults[CONF_MQTT_HOST] == "192.0.2.10"
     assert defaults[CONF_MQTT_PORT] == 1883
     validated = result["data_schema"](
@@ -781,7 +806,6 @@ async def test_existing_broker_has_normal_fields_and_shared_advanced_tls(
     result = await _start_broker_form(hass, BrokerKind.EXISTING_BROKER)
 
     assert _schema_keys(result) == {
-        CONF_HA_CONTROL_ENABLED,
         CONF_MQTT_HOST,
         CONF_MQTT_PORT,
         CONF_MQTT_USERNAME,
@@ -854,10 +878,7 @@ async def test_broker_readiness_failure_preserves_only_nonsecret_input(
         hass,
         broker,
         validator,
-        broker_input={
-            **_BROKER_INPUT,
-            CONF_HA_CONTROL_ENABLED: True,
-        },
+        broker_input=_BROKER_INPUT,
     )
 
     assert result["type"] is FlowResultType.FORM
@@ -871,7 +892,6 @@ async def test_broker_readiness_failure_preserves_only_nonsecret_input(
     assert defaults[CONF_MQTT_HOST] == "mqtt.iot.example"
     assert defaults[CONF_MQTT_PORT] == 1883
     assert defaults[CONF_MQTT_USERNAME] == "brilliant-fleet"
-    assert defaults[CONF_HA_CONTROL_ENABLED] is True
     assert _BROKER_PASSWORD not in repr(result)
     assert not hass.config_entries.async_entries(DOMAIN)
 
@@ -887,7 +907,6 @@ async def test_broker_field_error_preserves_only_valid_nonsecret_input(
         {
             **_TLS_BROKER_INPUT,
             CONF_MQTT_PASSWORD: submitted_password,
-            CONF_HA_CONTROL_ENABLED: True,
         },
     )
 
@@ -898,7 +917,6 @@ async def test_broker_field_error_preserves_only_valid_nonsecret_input(
     assert defaults[CONF_MQTT_HOST] == "mqtt.iot.example"
     assert defaults[CONF_MQTT_PORT] == 8883
     assert defaults[CONF_MQTT_USERNAME] == "brilliant-fleet"
-    assert defaults[CONF_HA_CONTROL_ENABLED] is True
     assert defaults[ADVANCED_SECTION] == {
         CONF_MQTT_TLS_ENABLED: True,
         CONF_MQTT_TLS_CA: _CA_PEM,
@@ -948,7 +966,7 @@ async def test_broker_progress_task_cannot_be_double_submitted(
     broker = await _start_broker_form(hass, BrokerKind.EXISTING_BROKER)
     gate = asyncio.Event()
     validator = _FakeValidator(gate=gate)
-    with patch.object(config_flow, "_broker_validator", return_value=validator):
+    with patch.object(flow_gateway, "_broker_validator", return_value=validator):
         first = await hass.config_entries.flow.async_configure(
             broker["flow_id"],
             _BROKER_INPUT,
@@ -963,6 +981,12 @@ async def test_broker_progress_task_cannot_be_double_submitted(
     assert len(validator.calls) == 1
     gate.set()
     result = await _drain_progress(hass.config_entries.flow, broker["flow_id"])
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "fleet_features"
+    result = cast(
+        dict[str, Any],
+        await hass.config_entries.flow.async_configure(broker["flow_id"], {}),
+    )
     assert result["type"] is FlowResultType.CREATE_ENTRY
     _flow_type, flow_id = result["next_flow"]
     assert hass.config_entries.subentries.async_get(flow_id)["step_id"] == "panel_connect"
@@ -996,12 +1020,12 @@ async def test_broker_validation_creates_durable_empty_fleet_and_chains_first_pa
             new=AsyncMock(side_effect=setup_entry),
         ),
         patch.object(
-            config_flow,
+            flow_gateway,
             "_async_wait_config_entry_persisted",
             side_effect=prove_persistence,
         ),
         patch.object(
-            config_flow,
+            flow_gateway,
             "async_fetch_host_identity",
             identity_fetch,
         ),
@@ -1023,20 +1047,18 @@ async def test_broker_validation_creates_durable_empty_fleet_and_chains_first_pa
     identity_fetch.assert_not_awaited()
 
 
-async def test_initial_broker_form_enables_ha_control_before_first_panel(
+async def test_initial_flow_collects_ha_control_on_its_own_features_step(
     hass: HomeAssistant,
 ) -> None:
-    """The broker page is the only pre-panel decision point for HA control."""
+    """Broker credentials and fleet features are separate pre-panel steps."""
     broker = await _start_broker_form(hass, BrokerKind.EXISTING_BROKER)
+    assert CONF_HA_CONTROL_ENABLED not in _schema_keys(broker)
 
     created = await _submit_broker_create(
         hass,
         broker,
         _FakeValidator(),
-        broker_input={
-            **_BROKER_INPUT,
-            CONF_HA_CONTROL_ENABLED: True,
-        },
+        features_input={CONF_HA_CONTROL_ENABLED: True},
     )
 
     assert created["type"] is FlowResultType.CREATE_ENTRY
@@ -1044,6 +1066,18 @@ async def test_initial_broker_form_enables_ha_control_before_first_panel(
     assert entry.data[CONF_HA_CONTROL_ENABLED] is True
     _flow_type, flow_id = created["next_flow"]
     assert hass.config_entries.subentries.async_get(flow_id)["step_id"] == "panel_connect"
+
+
+async def test_initial_features_step_defaults_ha_control_off(
+    hass: HomeAssistant,
+) -> None:
+    """Submitting the features step with defaults keeps HA control disabled."""
+    broker = await _start_broker_form(hass, BrokerKind.EXISTING_BROKER)
+
+    created = await _submit_broker_create(hass, broker, _FakeValidator())
+
+    assert created["type"] is FlowResultType.CREATE_ENTRY
+    assert created["result"].data[CONF_HA_CONTROL_ENABLED] is False
 
 
 async def test_created_fleet_mutation_blocks_persistence_and_first_panel_chain(
@@ -1078,7 +1112,7 @@ async def test_created_fleet_mutation_blocks_persistence_and_first_panel_chain(
             new=mutate_before_callback,
         ),
         patch.object(
-            config_flow,
+            flow_gateway,
             "_async_wait_config_entry_persisted",
             persisted,
         ),
@@ -1120,7 +1154,7 @@ async def test_unproven_fleet_storage_keeps_empty_entry_and_one_redacted_repair(
 
     with (
         patch.object(
-            config_flow,
+            flow_gateway,
             "_async_wait_config_entry_persisted",
             side_effect=OSError(secret),
         ),
@@ -1156,7 +1190,7 @@ async def test_unproven_fleet_storage_keeps_empty_entry_and_one_redacted_repair(
     confirm = await _start_subentry_confirm(hass, entry)
     provisioner = _FakeProvisioner(_identity(), gate=asyncio.Event())
     with patch.object(
-        config_flow,
+        flow_gateway,
         "_get_panel_provisioner",
         return_value=provisioner,
     ):
@@ -1187,12 +1221,12 @@ async def test_panel_confirm_storage_failure_is_fixed_redacted_and_write_free(
 
     with (
         patch.object(
-            config_flow,
+            flow_gateway,
             "_async_wait_config_entry_persisted",
             side_effect=OSError(secret),
         ),
         patch.object(
-            config_flow,
+            flow_gateway,
             "_get_panel_provisioner",
             get_provisioner,
         ),
@@ -1241,9 +1275,9 @@ async def test_panel_connect_fetches_identity_before_password_authentication(
         return _facts(identity)
 
     with (
-        patch.object(config_flow, "async_fetch_host_identity", side_effect=fetch),
-        patch.object(config_flow, "FleetAsyncsshShell", side_effect=shell_factory),
-        patch.object(config_flow, "async_inspect_panel", side_effect=inspect),
+        patch.object(flow_gateway, "async_fetch_host_identity", side_effect=fetch),
+        patch.object(flow_gateway, "FleetAsyncsshShell", side_effect=shell_factory),
+        patch.object(flow_gateway, "async_inspect_panel", side_effect=inspect),
     ):
         result = await hass.config_entries.subentries.async_configure(
             panel_connect["flow_id"],
@@ -1271,15 +1305,15 @@ async def test_panel_inspection_preserves_cancellation_while_closing(
 
     shell.close.side_effect = close
     with (
-        patch.object(config_flow, "FleetAsyncsshShell", return_value=shell),
+        patch.object(flow_gateway, "FleetAsyncsshShell", return_value=shell),
         patch.object(
-            config_flow,
+            flow_gateway,
             "async_inspect_panel",
             side_effect=OSError("inspection failed"),
         ),
     ):
         task = asyncio.create_task(
-            config_flow._async_inspect_candidate(
+            flow_gateway._async_inspect_candidate(
                 hass,
                 "office.iot.example",
                 _ROOT_PASSWORD,
@@ -1361,7 +1395,7 @@ def test_canonical_handoff_rejects_component_or_override_mismatch(
         feature_overrides=MappingProxyType({}),
     )
     provisioned = _provisioned(request, identity)
-    assert config_flow._provisioned_matches_request(
+    assert flow_support._provisioned_matches_request(
         provisioned,
         request,
         identity,
@@ -1372,7 +1406,7 @@ def test_canonical_handoff_rejects_component_or_override_mismatch(
         panel_data=CanonicalPanelData(MappingProxyType(mismatched_data)),
     )
 
-    assert not config_flow._provisioned_matches_request(
+    assert not flow_support._provisioned_matches_request(
         mismatched,
         request,
         identity,
@@ -1386,7 +1420,7 @@ async def test_panel_connect_error_is_redacted_and_creates_nothing(
     panel_connect = await _submit_broker(hass, broker, _FakeValidator())
 
     with patch.object(
-        config_flow,
+        flow_gateway,
         "async_fetch_host_identity",
         side_effect=OSError(_ROOT_PASSWORD),
     ):
@@ -1439,7 +1473,7 @@ async def test_panel_identity_error_uses_translated_stable_code(
     panel_connect = await _submit_broker(hass, broker, _FakeValidator())
 
     with patch.object(
-        config_flow,
+        flow_gateway,
         "async_fetch_host_identity",
         side_effect=PanelIdentityError("host_unreachable"),
     ):
@@ -1468,12 +1502,12 @@ async def test_panel_compatibility_error_uses_stable_code_without_secret(
 
     with (
         patch.object(
-            config_flow,
+            flow_gateway,
             "async_fetch_host_identity",
             return_value=_identity(),
         ),
         patch.object(
-            config_flow,
+            flow_gateway,
             "_async_inspect_candidate",
             side_effect=PanelCompatibilityError("insufficient_memory"),
         ),
@@ -1513,7 +1547,7 @@ async def test_first_panel_progress_cannot_double_submit_and_creates_subentry(
 
     with (
         patch.object(
-            config_flow,
+            flow_gateway,
             "_get_panel_provisioner",
             return_value=provisioner,
         ) as get_provisioner,
@@ -1575,7 +1609,7 @@ async def test_first_panel_provision_failure_returns_to_confirm_without_secret_l
     )
 
     with patch.object(
-        config_flow,
+        flow_gateway,
         "_get_panel_provisioner",
         return_value=provisioner,
     ):
@@ -1616,7 +1650,7 @@ async def test_first_panel_mark_pending_failure_clears_flow_transaction(
     )
 
     with patch.object(
-        config_flow,
+        flow_gateway,
         "_get_panel_provisioner",
         return_value=provisioner,
     ):
@@ -1659,7 +1693,7 @@ async def test_mark_pending_cancellation_drains_recovery_then_propagates(
     )
 
     with patch.object(
-        config_flow,
+        flow_gateway,
         "_get_panel_provisioner",
         return_value=provisioner,
     ):
@@ -1708,7 +1742,7 @@ async def test_mismatched_provisioner_result_is_recovered_before_retry(
     )
 
     with patch.object(
-        config_flow,
+        flow_gateway,
         "_get_panel_provisioner",
         return_value=provisioner,
     ):
@@ -1831,7 +1865,7 @@ async def test_add_panel_inherits_fleet_and_creates_panel_only_subentry(
     )
 
     with patch.object(
-        config_flow,
+        flow_gateway,
         "_get_panel_provisioner",
         return_value=provisioner,
     ) as get_provisioner:
@@ -1922,7 +1956,7 @@ async def test_add_panel_allocates_first_available_slug_and_priority(
     provisioner = _FakeProvisioner(third_identity, gate=asyncio.Event())
 
     with patch.object(
-        config_flow,
+        flow_gateway,
         "_get_panel_provisioner",
         return_value=provisioner,
     ):
@@ -1958,7 +1992,7 @@ async def test_exhausted_mesh_priorities_redisplay_without_starting_provision(
     entry = _fleet_entry(hass, *panels)
     confirm = await _start_subentry_confirm(hass, entry)
 
-    with patch.object(config_flow, "_get_panel_provisioner") as get_provisioner:
+    with patch.object(flow_gateway, "_get_panel_provisioner") as get_provisioner:
         result = await hass.config_entries.subentries.async_configure(
             confirm["flow_id"],
             {CONF_NAME: "New panel"},
@@ -1980,7 +2014,7 @@ async def test_subentry_progress_abandonment_invokes_removal_recovery(
     provisioner = _FakeProvisioner(candidate, gate=asyncio.Event())
 
     with patch.object(
-        config_flow,
+        flow_gateway,
         "_get_panel_provisioner",
         return_value=provisioner,
     ):
@@ -2031,7 +2065,7 @@ async def test_add_panel_aborts_if_fleet_changes_during_install(
     provisioner = _FakeProvisioner(candidate, gate=asyncio.Event())
 
     with patch.object(
-        config_flow,
+        flow_gateway,
         "_get_panel_provisioner",
         return_value=provisioner,
     ):
@@ -2074,7 +2108,7 @@ async def test_add_panel_aborts_if_parent_is_removed_during_install(
     provisioner = _FakeProvisioner(candidate, gate=asyncio.Event())
 
     with patch.object(
-        config_flow,
+        flow_gateway,
         "_get_panel_provisioner",
         return_value=provisioner,
     ):
@@ -2115,7 +2149,7 @@ async def test_post_install_abort_surfaces_recovery_failure(
     )
 
     with patch.object(
-        config_flow,
+        flow_gateway,
         "_get_panel_provisioner",
         return_value=provisioner,
     ):
@@ -2168,7 +2202,7 @@ async def test_add_panel_rechecks_storage_conflicts_after_install(
     provisioner = _FakeProvisioner(candidate, gate=asyncio.Event())
 
     with patch.object(
-        config_flow,
+        flow_gateway,
         "_get_panel_provisioner",
         return_value=provisioner,
     ):
@@ -2217,11 +2251,11 @@ async def test_duplicate_fingerprint_aborts_before_password_authentication(
 
     with (
         patch.object(
-            config_flow,
+            flow_gateway,
             "async_fetch_host_identity",
             return_value=_identity(),
         ),
-        patch.object(config_flow, "FleetAsyncsshShell") as shell_constructor,
+        patch.object(flow_gateway, "FleetAsyncsshShell") as shell_constructor,
     ):
         result = await hass.config_entries.subentries.async_configure(
             result["flow_id"],
@@ -2255,11 +2289,11 @@ async def test_add_panel_reserves_rebound_panel_management_identity_before_authe
 
     with (
         patch.object(
-            config_flow,
+            flow_gateway,
             "async_fetch_host_identity",
             return_value=_identity(),
         ),
-        patch.object(config_flow, "_async_inspect_candidate", inspect),
+        patch.object(flow_gateway, "_async_inspect_candidate", inspect),
     ):
         result = await hass.config_entries.subentries.async_configure(
             result["flow_id"],
@@ -2288,7 +2322,7 @@ async def test_subentry_provisioning_error_keeps_parent_and_secrets_redacted(
     )
 
     with patch.object(
-        config_flow,
+        flow_gateway,
         "_get_panel_provisioner",
         return_value=provisioner,
     ):
@@ -2400,7 +2434,7 @@ async def test_fleet_broker_options_field_error_clears_stale_validation_help(
         ),
         gate=asyncio.Event(),
     )
-    with patch.object(config_flow, "_broker_validator", return_value=validator):
+    with patch.object(flow_gateway, "_broker_validator", return_value=validator):
         progress = await hass.config_entries.options.async_configure(
             form["flow_id"],
             {
@@ -2460,7 +2494,7 @@ async def test_empty_fleet_broker_options_validates_then_updates_profile(
         CONF_MQTT_PASSWORD: "SECRET-replacement-broker-password",
     }
 
-    with patch.object(config_flow, "_broker_validator", return_value=validator):
+    with patch.object(flow_gateway, "_broker_validator", return_value=validator):
         progress = await hass.config_entries.options.async_configure(
             form["flow_id"],
             submitted,
@@ -2498,7 +2532,7 @@ async def test_populated_fleet_identical_broker_profile_is_validation_only(
         },
     }
 
-    with patch.object(config_flow, "_broker_validator", return_value=validator):
+    with patch.object(flow_gateway, "_broker_validator", return_value=validator):
         progress = await hass.config_entries.options.async_configure(
             form["flow_id"],
             submitted,
@@ -2526,7 +2560,7 @@ async def test_populated_fleet_broker_change_requires_guided_flow_without_valida
     form = await _start_fleet_broker_options(hass, entry)
     validator = _FakeValidator()
 
-    with patch.object(config_flow, "_broker_validator", return_value=validator):
+    with patch.object(flow_gateway, "_broker_validator", return_value=validator):
         result = await hass.config_entries.options.async_configure(
             form["flow_id"],
             {
@@ -2557,7 +2591,7 @@ async def test_fleet_broker_validation_failure_is_actionable_and_redacted(
         gate=asyncio.Event(),
     )
 
-    with patch.object(config_flow, "_broker_validator", return_value=validator):
+    with patch.object(flow_gateway, "_broker_validator", return_value=validator):
         progress = await hass.config_entries.options.async_configure(
             form["flow_id"],
             {
@@ -2591,7 +2625,7 @@ async def test_empty_fleet_broker_update_fails_closed_if_panel_appears_during_va
     form = await _start_fleet_broker_options(hass, entry)
     validator = _FakeValidator(gate=asyncio.Event())
 
-    with patch.object(config_flow, "_broker_validator", return_value=validator):
+    with patch.object(flow_gateway, "_broker_validator", return_value=validator):
         progress = await hass.config_entries.options.async_configure(
             form["flow_id"],
             {
@@ -2631,7 +2665,7 @@ async def test_empty_fleet_broker_update_does_not_overwrite_concurrent_profile_c
     form = await _start_fleet_broker_options(hass, entry)
     validator = _FakeValidator(gate=asyncio.Event())
 
-    with patch.object(config_flow, "_broker_validator", return_value=validator):
+    with patch.object(flow_gateway, "_broker_validator", return_value=validator):
         progress = await hass.config_entries.options.async_configure(
             form["flow_id"],
             {
@@ -2802,7 +2836,7 @@ async def test_empty_fleet_broker_update_waits_for_real_provisioner_operation_lo
     entry = _fleet_entry(hass)
     original_data = dict(entry.data)
     options_flow_id = await _prepare_fleet_broker_commit(hass, entry)
-    provisioner = config_flow._get_panel_provisioner(
+    provisioner = flow_gateway._get_panel_provisioner(
         hass,
         expected_identity=_identity(),
     )
@@ -2852,7 +2886,7 @@ async def test_fleet_broker_failure_retry_keeps_new_pending_password(
         CONF_MQTT_PASSWORD: replacement_password,
     }
 
-    with patch.object(config_flow, "_broker_validator", return_value=failed):
+    with patch.object(flow_gateway, "_broker_validator", return_value=failed):
         progress = await hass.config_entries.options.async_configure(
             form["flow_id"],
             submitted,
@@ -2869,7 +2903,7 @@ async def test_fleet_broker_failure_retry_keeps_new_pending_password(
     assert replacement_password not in repr(retry)
 
     succeeded = _FakeValidator(gate=asyncio.Event())
-    with patch.object(config_flow, "_broker_validator", return_value=succeeded):
+    with patch.object(flow_gateway, "_broker_validator", return_value=succeeded):
         progress = await hass.config_entries.options.async_configure(
             retry["flow_id"],
             {
@@ -2903,7 +2937,7 @@ async def test_populated_fleet_can_correct_guidance_only_broker_kind(
     )
     validator = _FakeValidator(gate=asyncio.Event())
 
-    with patch.object(config_flow, "_broker_validator", return_value=validator):
+    with patch.object(flow_gateway, "_broker_validator", return_value=validator):
         progress = await hass.config_entries.options.async_configure(
             form["flow_id"],
             {
@@ -2949,7 +2983,7 @@ async def test_fleet_broker_commit_rejects_ownership_envelope_drift(
     form = await _start_fleet_broker_options(hass, entry)
     validator = _FakeValidator(gate=asyncio.Event())
 
-    with patch.object(config_flow, "_broker_validator", return_value=validator):
+    with patch.object(flow_gateway, "_broker_validator", return_value=validator):
         progress = await hass.config_entries.options.async_configure(
             form["flow_id"],
             {
@@ -2982,7 +3016,7 @@ async def test_fleet_broker_commit_handles_parent_removal_during_validation(
     form = await _start_fleet_broker_options(hass, entry)
     validator = _FakeValidator(gate=asyncio.Event())
 
-    with patch.object(config_flow, "_broker_validator", return_value=validator):
+    with patch.object(flow_gateway, "_broker_validator", return_value=validator):
         progress = await hass.config_entries.options.async_configure(
             form["flow_id"],
             {
@@ -3295,11 +3329,11 @@ async def test_panel_address_rejects_changed_identity_before_password_authentica
 
     with (
         patch.object(
-            config_flow,
+            flow_gateway,
             "async_fetch_host_identity",
             AsyncMock(return_value=_identity(other=True)),
         ) as fetch_identity,
-        patch.object(config_flow, "_async_inspect_candidate", inspect),
+        patch.object(flow_gateway, "_async_inspect_candidate", inspect),
     ):
         result = await hass.config_entries.subentries.async_configure(
             form["flow_id"],
@@ -3333,11 +3367,11 @@ async def test_panel_address_authenticates_only_after_existing_identity_matches(
 
     with (
         patch.object(
-            config_flow,
+            flow_gateway,
             "async_fetch_host_identity",
             AsyncMock(return_value=identity),
         ),
-        patch.object(config_flow, "_async_inspect_candidate", inspect),
+        patch.object(flow_gateway, "_async_inspect_candidate", inspect),
     ):
         result = await hass.config_entries.subentries.async_configure(
             form["flow_id"],
@@ -3378,11 +3412,11 @@ async def test_panel_credential_repair_rechecks_identity_and_never_redisplays_se
 
     with (
         patch.object(
-            config_flow,
+            flow_gateway,
             "async_fetch_host_identity",
             AsyncMock(return_value=identity),
         ),
-        patch.object(config_flow, "_async_inspect_candidate", inspect),
+        patch.object(flow_gateway, "_async_inspect_candidate", inspect),
     ):
         result = await hass.config_entries.subentries.async_configure(
             form["flow_id"],
@@ -3713,8 +3747,8 @@ async def test_explicit_rebind_verifies_new_identity_then_requires_confirmation(
     inspect = AsyncMock(return_value=_facts(candidate))
 
     with (
-        patch.object(config_flow, "async_fetch_host_identity", fetch_identity),
-        patch.object(config_flow, "_async_inspect_candidate", inspect),
+        patch.object(flow_gateway, "async_fetch_host_identity", fetch_identity),
+        patch.object(flow_gateway, "_async_inspect_candidate", inspect),
         patch.object(runtime, "async_rebind_panel", rebind_panel),
     ):
         confirm = await hass.config_entries.subentries.async_configure(
@@ -3788,11 +3822,11 @@ async def test_explicit_rebind_rejects_current_or_duplicate_identity_before_auth
         inspect = AsyncMock()
         with (
             patch.object(
-                config_flow,
+                flow_gateway,
                 "async_fetch_host_identity",
                 AsyncMock(return_value=identity),
             ),
-            patch.object(config_flow, "_async_inspect_candidate", inspect),
+            patch.object(flow_gateway, "_async_inspect_candidate", inspect),
         ):
             result = await hass.config_entries.subentries.async_configure(
                 form["flow_id"],
@@ -3837,12 +3871,12 @@ async def test_explicit_rebind_allows_target_reserved_management_identity(
 
     with (
         patch.object(
-            config_flow,
+            flow_gateway,
             "async_fetch_host_identity",
             AsyncMock(return_value=candidate),
         ),
         patch.object(
-            config_flow,
+            flow_gateway,
             "_async_inspect_candidate",
             AsyncMock(return_value=_facts(candidate)),
         ),
@@ -3893,11 +3927,11 @@ async def test_explicit_rebind_rejects_another_panels_reserved_management_identi
 
     with (
         patch.object(
-            config_flow,
+            flow_gateway,
             "async_fetch_host_identity",
             AsyncMock(return_value=_identity()),
         ),
-        patch.object(config_flow, "_async_inspect_candidate", AsyncMock()),
+        patch.object(flow_gateway, "_async_inspect_candidate", AsyncMock()),
     ):
         result = await hass.config_entries.subentries.async_configure(
             form["flow_id"],
@@ -3935,12 +3969,12 @@ async def test_explicit_rebind_requires_positive_confirmation_without_mutation(
 
     with (
         patch.object(
-            config_flow,
+            flow_gateway,
             "async_fetch_host_identity",
             AsyncMock(return_value=candidate),
         ),
         patch.object(
-            config_flow,
+            flow_gateway,
             "_async_inspect_candidate",
             AsyncMock(return_value=_facts(candidate)),
         ),
@@ -3984,9 +4018,9 @@ async def test_explicit_rebind_rechecks_identity_at_confirmation(
     )
 
     with (
-        patch.object(config_flow, "async_fetch_host_identity", fetch_identity),
+        patch.object(flow_gateway, "async_fetch_host_identity", fetch_identity),
         patch.object(
-            config_flow,
+            flow_gateway,
             "_async_inspect_candidate",
             AsyncMock(return_value=_facts(candidate)),
         ),
@@ -4044,12 +4078,12 @@ async def test_explicit_rebind_maps_locked_manager_failures(
 
     with (
         patch.object(
-            config_flow,
+            flow_gateway,
             "async_fetch_host_identity",
             AsyncMock(side_effect=(candidate, candidate)),
         ),
         patch.object(
-            config_flow,
+            flow_gateway,
             "_async_inspect_candidate",
             AsyncMock(return_value=_facts(candidate)),
         ),
@@ -4092,10 +4126,67 @@ async def test_fleet_reconfigure_aborts_without_indexing_panel_secrets(
     assert _BROKER_PASSWORD not in repr(result)
 
 
-async def test_legacy_reconfigure_passwords_are_masked_and_never_redisplayed(
+_RECONFIGURE_MENU = (
+    "reconfigure_connection",
+    "reconfigure_mqtt",
+    "reconfigure_components",
+    "reconfigure_ha_control",
+    "reconfigure_advanced",
+)
+
+
+async def _open_legacy_reconfigure_step(
+    hass: HomeAssistant,
+    entry: MockConfigEntry,
+    step_id: str,
+) -> dict[str, Any]:
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={
+            "source": "reconfigure",
+            "entry_id": entry.entry_id,
+        },
+    )
+    assert result["type"] is FlowResultType.MENU
+    return cast(
+        dict[str, Any],
+        await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {"next_step_id": step_id},
+        ),
+    )
+
+
+async def _submit_legacy_reconfigure(
+    hass: HomeAssistant,
+    form: Mapping[str, Any],
+    user_input: dict[str, Any],
+    apply: AsyncMock,
+) -> dict[str, Any]:
+    """Submit one reconfigure section with the SSH apply and reload isolated."""
+    with (
+        patch.object(flow_gateway, "_apply_config", apply),
+        patch(
+            "custom_components.brilliant_mqtt.async_setup_entry",
+            AsyncMock(return_value=True),
+        ),
+        patch(
+            "custom_components.brilliant_mqtt.async_unload_entry",
+            AsyncMock(return_value=True),
+        ),
+    ):
+        result = await hass.config_entries.flow.async_configure(
+            form["flow_id"],
+            user_input,
+        )
+        await hass.async_block_till_done()
+    return cast(dict[str, Any], result)
+
+
+async def test_legacy_reconfigure_is_a_menu_of_focused_sections(
     hass: HomeAssistant,
 ) -> None:
-    """Stored and just-submitted credentials never become schema defaults."""
+    """Reconfigure offers focused sections instead of one wall of inputs."""
     entry = _legacy_entry(hass)
     result = await hass.config_entries.flow.async_init(
         DOMAIN,
@@ -4105,34 +4196,603 @@ async def test_legacy_reconfigure_passwords_are_masked_and_never_redisplayed(
         },
     )
 
-    assert result["type"] is FlowResultType.FORM
-    for key in (CONF_ROOT_PASSWORD, CONF_MQTT_PASSWORD):
-        selector = _schema_validator(result, key)
-        assert isinstance(selector, TextSelector)
-        assert selector.config["type"] == TextSelectorType.PASSWORD
+    assert result["type"] is FlowResultType.MENU
+    assert tuple(cast(Iterable[str], result["menu_options"])) == _RECONFIGURE_MENU
     assert _ROOT_PASSWORD not in repr(result)
     assert _BROKER_PASSWORD not in repr(result)
 
-    submitted = {
-        **_schema_defaults(result),
-        CONF_ROOT_PASSWORD: "SECRET-new-root-password",
-        CONF_MQTT_PASSWORD: "SECRET-new-mqtt-password",
-    }
+
+async def test_legacy_reconfigure_connection_blank_password_reuses_stored_secret(
+    hass: HomeAssistant,
+) -> None:
+    """The connection step prefills the host and keeps the stored root password."""
+    entry = _legacy_entry(hass)
+    form = await _open_legacy_reconfigure_step(hass, entry, "reconfigure_connection")
+
+    assert form["type"] is FlowResultType.FORM
+    assert form["step_id"] == "reconfigure_connection"
+    defaults = _schema_defaults(form)
+    assert defaults[CONF_HOST] == "office.iot.example"
+    assert defaults[CONF_ROOT_PASSWORD] == ""
+    selector = _schema_validator(form, CONF_ROOT_PASSWORD)
+    assert isinstance(selector, TextSelector)
+    assert selector.config["type"] == TextSelectorType.PASSWORD
+    assert _ROOT_PASSWORD not in repr(form)
+
+    apply = AsyncMock(return_value=_PUBLIC_KEY)
+    result = await _submit_legacy_reconfigure(
+        hass,
+        form,
+        {CONF_HOST: "office.iot.example", CONF_ROOT_PASSWORD: ""},
+        apply,
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+    assert apply.await_count == 1
+    call = apply.await_args
+    assert call is not None
+    assert call.args[1] == "office.iot.example"
+    assert call.args[2] == _ROOT_PASSWORD
+    assert call.kwargs["pinned_key"] == _PUBLIC_KEY
+    assert call.kwargs["expected_panel"] == "office"
+    assert entry.data[CONF_ROOT_PASSWORD] == _ROOT_PASSWORD
+    assert entry.data[CONF_MQTT_PASSWORD] == _BROKER_PASSWORD
+
+
+async def test_legacy_reconfigure_connection_new_password_is_stored(
+    hass: HomeAssistant,
+) -> None:
+    """A typed replacement root password is offered over SSH and then stored."""
+    entry = _legacy_entry(hass)
+    form = await _open_legacy_reconfigure_step(hass, entry, "reconfigure_connection")
+
+    apply = AsyncMock(return_value=_PUBLIC_KEY)
+    result = await _submit_legacy_reconfigure(
+        hass,
+        form,
+        {CONF_HOST: "office.iot.example", CONF_ROOT_PASSWORD: "rotated-root-password"},
+        apply,
+    )
+
+    assert result["reason"] == "reconfigure_successful"
+    call = apply.await_args
+    assert call is not None
+    assert call.args[2] == "rotated-root-password"
+    assert entry.data[CONF_ROOT_PASSWORD] == "rotated-root-password"
+
+
+async def test_legacy_reconfigure_mqtt_blank_password_reuses_stored_secret(
+    hass: HomeAssistant,
+) -> None:
+    """The MQTT step prefills broker fields and keeps the stored password."""
+    entry = _legacy_entry(hass)
+    form = await _open_legacy_reconfigure_step(hass, entry, "reconfigure_mqtt")
+
+    assert form["step_id"] == "reconfigure_mqtt"
+    defaults = _schema_defaults(form)
+    assert defaults[CONF_MQTT_HOST] == "mqtt.iot.example"
+    assert defaults[CONF_MQTT_PORT] == 1883
+    assert defaults[CONF_MQTT_USERNAME] == "brilliant-fleet"
+    assert defaults[CONF_MQTT_PASSWORD] == ""
+    assert _BROKER_PASSWORD not in repr(form)
+
+    apply = AsyncMock(return_value=_PUBLIC_KEY)
+    result = await _submit_legacy_reconfigure(
+        hass,
+        form,
+        {
+            CONF_MQTT_HOST: "replacement.iot.example",
+            CONF_MQTT_PORT: 1883,
+            CONF_MQTT_USERNAME: "brilliant-fleet",
+            CONF_MQTT_PASSWORD: "",
+        },
+        apply,
+    )
+
+    assert result["reason"] == "reconfigure_successful"
+    call = apply.await_args
+    assert call is not None
+    assert call.args[2] == _ROOT_PASSWORD
+    env = call.kwargs["env_content"]
+    assert "replacement.iot.example" in env
+    assert _BROKER_PASSWORD in env
+    assert entry.data[CONF_MQTT_HOST] == "replacement.iot.example"
+    assert entry.data[CONF_MQTT_PASSWORD] == _BROKER_PASSWORD
+    assert entry.data[CONF_HOST] == "office.iot.example"
+
+
+async def test_legacy_reconfigure_secrets_are_masked_and_never_redisplayed(
+    hass: HomeAssistant,
+) -> None:
+    """Stored and just-submitted credentials never become schema defaults."""
+    entry = _legacy_entry(hass)
+    form = await _open_legacy_reconfigure_step(hass, entry, "reconfigure_connection")
+
     with patch.object(
-        config_flow,
+        flow_gateway,
         "_apply_config",
         side_effect=OSError("transient connection failure"),
     ):
         result = await hass.config_entries.flow.async_configure(
-            result["flow_id"],
-            submitted,
+            form["flow_id"],
+            {
+                CONF_HOST: "office.iot.example",
+                CONF_ROOT_PASSWORD: "SECRET-new-root-password",
+            },
         )
 
     assert result["type"] is FlowResultType.FORM
     assert result["errors"] == {"base": "cannot_connect"}
     assert "SECRET-new-root-password" not in repr(result)
-    assert "SECRET-new-mqtt-password" not in repr(result)
     assert _ROOT_PASSWORD not in repr(result)
-    assert _BROKER_PASSWORD not in repr(result)
-    assert CONF_ROOT_PASSWORD not in _schema_defaults(result)
-    assert CONF_MQTT_PASSWORD not in _schema_defaults(result)
+    assert _schema_defaults(result).get(CONF_ROOT_PASSWORD, "") == ""
+    assert entry.data[CONF_ROOT_PASSWORD] == _ROOT_PASSWORD
+
+
+async def test_legacy_reconfigure_connection_whitespace_password_reuses_stored_secret(
+    hass: HomeAssistant,
+) -> None:
+    """A root password of only spaces means "keep current", never a new credential."""
+    entry = _legacy_entry(hass)
+    form = await _open_legacy_reconfigure_step(hass, entry, "reconfigure_connection")
+
+    apply = AsyncMock(return_value=_PUBLIC_KEY)
+    result = await _submit_legacy_reconfigure(
+        hass,
+        form,
+        {CONF_HOST: "office.iot.example", CONF_ROOT_PASSWORD: "   "},
+        apply,
+    )
+
+    assert result["reason"] == "reconfigure_successful"
+    call = apply.await_args
+    assert call is not None
+    assert call.args[2] == _ROOT_PASSWORD
+    assert entry.data[CONF_ROOT_PASSWORD] == _ROOT_PASSWORD
+
+
+async def test_legacy_reconfigure_mqtt_whitespace_password_reuses_stored_secret(
+    hass: HomeAssistant,
+) -> None:
+    """A whitespace-only broker password is never stored nor pushed to the panel."""
+    entry = _legacy_entry(hass)
+    form = await _open_legacy_reconfigure_step(hass, entry, "reconfigure_mqtt")
+
+    apply = AsyncMock(return_value=_PUBLIC_KEY)
+    result = await _submit_legacy_reconfigure(
+        hass,
+        form,
+        {
+            CONF_MQTT_HOST: "mqtt.iot.example",
+            CONF_MQTT_PORT: 1883,
+            CONF_MQTT_USERNAME: "brilliant-fleet",
+            CONF_MQTT_PASSWORD: " ",
+        },
+        apply,
+    )
+
+    assert result["reason"] == "reconfigure_successful"
+    call = apply.await_args
+    assert call is not None
+    assert _BROKER_PASSWORD in call.kwargs["env_content"]
+    assert entry.data[CONF_MQTT_PASSWORD] == _BROKER_PASSWORD
+
+
+async def test_legacy_reconfigure_mqtt_new_password_is_applied_and_stored(
+    hass: HomeAssistant,
+) -> None:
+    """A non-blank broker password replaces the stored one and reaches the panel."""
+    entry = _legacy_entry(hass)
+    form = await _open_legacy_reconfigure_step(hass, entry, "reconfigure_mqtt")
+
+    apply = AsyncMock(return_value=_PUBLIC_KEY)
+    result = await _submit_legacy_reconfigure(
+        hass,
+        form,
+        {
+            CONF_MQTT_HOST: "mqtt.iot.example",
+            CONF_MQTT_PORT: 1883,
+            CONF_MQTT_USERNAME: "brilliant-fleet",
+            CONF_MQTT_PASSWORD: "rotated-broker-password",
+        },
+        apply,
+    )
+
+    assert result["reason"] == "reconfigure_successful"
+    call = apply.await_args
+    assert call is not None
+    env = call.kwargs["env_content"]
+    assert "rotated-broker-password" in env
+    assert _BROKER_PASSWORD not in env
+    assert entry.data[CONF_MQTT_PASSWORD] == "rotated-broker-password"
+
+
+@pytest.mark.parametrize(
+    ("error", "code"),
+    (
+        (flow_gateway._WrongPanelError("kitchen"), "wrong_panel"),
+        (asyncssh.HostKeyNotVerifiable("host key changed"), "host_key_changed"),
+    ),
+)
+async def test_legacy_reconfigure_section_refuses_an_unproven_panel(
+    hass: HomeAssistant,
+    error: Exception,
+    code: str,
+) -> None:
+    """A foreign panel or a rotated host key fails closed and stores nothing."""
+    entry = _legacy_entry(hass)
+    original = dict(entry.data)
+    form = await _open_legacy_reconfigure_step(hass, entry, "reconfigure_connection")
+
+    result = await _submit_legacy_reconfigure(
+        hass,
+        form,
+        {CONF_HOST: "office.iot.example", CONF_ROOT_PASSWORD: "rotated-root-password"},
+        AsyncMock(side_effect=error),
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": code}
+    assert dict(entry.data) == original
+
+
+async def test_legacy_reconfigure_section_fails_closed_without_a_stored_pin(
+    hass: HomeAssistant,
+) -> None:
+    """An unpinned same-host entry never re-offers the root password over SSH."""
+    entry = _legacy_entry(hass)
+    hass.config_entries.async_update_entry(
+        entry,
+        data={key: value for key, value in entry.data.items() if key != CONF_SSH_HOST_KEY},
+    )
+    form = await _open_legacy_reconfigure_step(hass, entry, "reconfigure_connection")
+
+    apply = AsyncMock(return_value=_PUBLIC_KEY)
+    result = await _submit_legacy_reconfigure(
+        hass,
+        form,
+        {CONF_HOST: "office.iot.example", CONF_ROOT_PASSWORD: "rotated-root-password"},
+        apply,
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": "host_key_changed"}
+    apply.assert_not_awaited()
+    assert CONF_SSH_HOST_KEY not in entry.data
+    assert entry.data[CONF_ROOT_PASSWORD] == _ROOT_PASSWORD
+
+
+async def test_legacy_reconfigure_keeps_c0_only_control_char_parity(
+    hass: HomeAssistant,
+) -> None:
+    """These steps reject C0 controls but still accept DEL, exactly as before the split."""
+    entry = _legacy_entry(hass)
+    form = await _open_legacy_reconfigure_step(hass, entry, "reconfigure_connection")
+
+    rejected = await _submit_legacy_reconfigure(
+        hass,
+        form,
+        {CONF_HOST: "office.iot.example", CONF_ROOT_PASSWORD: "bad\x1fpassword"},
+        AsyncMock(return_value=_PUBLIC_KEY),
+    )
+
+    assert rejected["type"] is FlowResultType.FORM
+    assert rejected["errors"] == {CONF_ROOT_PASSWORD: "invalid_value"}
+    assert entry.data[CONF_ROOT_PASSWORD] == _ROOT_PASSWORD
+
+    accepted = await _submit_legacy_reconfigure(
+        hass,
+        rejected,
+        {CONF_HOST: "office.iot.example", CONF_ROOT_PASSWORD: "kept\x7fpassword"},
+        AsyncMock(return_value=_PUBLIC_KEY),
+    )
+
+    assert accepted["reason"] == "reconfigure_successful"
+    assert entry.data[CONF_ROOT_PASSWORD] == "kept\x7fpassword"
+
+
+def test_config_flow_entry_module_exposes_only_the_ha_required_flow_classes() -> None:
+    """Home Assistant needs the flow classes here; nothing else is a patch target."""
+    assert set(config_flow.__all__) == {
+        "BrilliantMqttConfigFlow",
+        "PanelSubentryFlow",
+    }
+    assert not hasattr(config_flow, "REGISTRY")
+
+
+async def test_legacy_reconfigure_components_prefill_and_no_change_is_push_only(
+    hass: HomeAssistant,
+) -> None:
+    """The components step prefills installed state; a no-change save runs no ops."""
+    entry = _legacy_entry(hass)
+    form = await _open_legacy_reconfigure_step(hass, entry, "reconfigure_components")
+
+    assert form["step_id"] == "reconfigure_components"
+    defaults = _schema_defaults(form)
+    assert defaults[COMPONENT_WIFI_WATCHDOG] is True
+    assert defaults[COMPONENT_BUS_WATCHDOG] is True
+    assert defaults[COMPONENT_VOICE] is False
+    assert defaults[CONF_VOICE_WAKE_WORD] == DEFAULT_VOICE_WAKE_WORD
+
+    apply = AsyncMock(return_value=_PUBLIC_KEY)
+    session = AsyncMock()
+    with patch.object(flow_gateway, "_panel_session", session):
+        result = await _submit_legacy_reconfigure(
+            hass,
+            form,
+            dict(defaults),
+            apply,
+        )
+
+    assert result["reason"] == "reconfigure_successful"
+    session.assert_not_called()
+    components = entry.data[CONF_COMPONENTS]
+    assert components[COMPONENT_BRIDGE] is True
+    assert components[COMPONENT_WIFI_WATCHDOG] is True
+    assert components[COMPONENT_VOICE] is False
+
+
+async def test_legacy_reconfigure_components_diff_installs_with_stored_secrets(
+    hass: HomeAssistant,
+) -> None:
+    """Enabling a component installs it using the stored SSH credential."""
+    entry = _legacy_entry(hass)
+    form = await _open_legacy_reconfigure_step(hass, entry, "reconfigure_components")
+    defaults = _schema_defaults(form)
+
+    install = AsyncMock()
+    voice = replace(REGISTRY[COMPONENT_VOICE], install=install)
+    session_passwords: list[str] = []
+
+    @asynccontextmanager
+    async def fake_session(
+        _hass: HomeAssistant,
+        _host: str,
+        password: str,
+        _key: str | None,
+    ) -> AsyncIterator[object]:
+        session_passwords.append(password)
+        yield object()
+
+    apply = AsyncMock(return_value=_PUBLIC_KEY)
+    with (
+        patch.object(flow_gateway, "_panel_session", fake_session),
+        patch.dict(REGISTRY, {COMPONENT_VOICE: voice}),
+    ):
+        result = await _submit_legacy_reconfigure(
+            hass,
+            form,
+            {**defaults, COMPONENT_VOICE: True},
+            apply,
+        )
+
+    assert result["reason"] == "reconfigure_successful"
+    install.assert_awaited_once()
+    assert session_passwords == [_ROOT_PASSWORD]
+    assert entry.data[CONF_COMPONENTS][COMPONENT_VOICE] is True
+
+
+async def test_legacy_reconfigure_ha_control_updates_globals_and_fans_out(
+    hass: HomeAssistant,
+) -> None:
+    """The HA-control step updates globals here and on every other entry."""
+    entry = _legacy_entry(hass)
+    other = MockConfigEntry(
+        domain=DOMAIN,
+        title="Other Brilliant panel",
+        version=CONFIG_ENTRY_VERSION,
+        data={
+            **_fleet_data(),
+            CONF_ENTRY_KIND: ENTRY_KIND_LEGACY_PENDING_CONSOLIDATION,
+            CONF_HOST: "kitchen.iot.example",
+            CONF_ROOT_PASSWORD: "kitchen-root-password",
+            CONF_SSH_HOST_KEY: _OTHER_PUBLIC_KEY,
+            CONF_PANEL: "kitchen",
+            CONF_MESH_PRIORITY: 2,
+            CONF_SCENE_PANEL: "kitchen",
+        },
+    )
+    other.add_to_hass(hass)
+    form = await _open_legacy_reconfigure_step(hass, entry, "reconfigure_ha_control")
+
+    assert form["step_id"] == "reconfigure_ha_control"
+    defaults = _schema_defaults(form)
+    assert defaults[CONF_HA_CONTROL_LABEL] == DEFAULT_HA_CONTROL_LABEL
+
+    apply = AsyncMock(return_value=_PUBLIC_KEY)
+    result = await _submit_legacy_reconfigure(
+        hass,
+        form,
+        {
+            **defaults,
+            CONF_HA_CONTROL_ENABLED: True,
+            CONF_HA_CONTROL_LABEL: "Panels",
+        },
+        apply,
+    )
+
+    assert result["reason"] == "reconfigure_successful"
+    assert entry.data[CONF_HA_CONTROL_ENABLED] is True
+    assert entry.data[CONF_HA_CONTROL_LABEL] == "Panels"
+    assert other.data[CONF_HA_CONTROL_ENABLED] is True
+    assert other.data[CONF_HA_CONTROL_LABEL] == "Panels"
+    assert other.data[CONF_ROOT_PASSWORD] == "kitchen-root-password"
+
+
+@pytest.mark.parametrize(
+    ("label", "accepted"),
+    (
+        ("Pan\u001fels", False),
+        ("Pan\u007fels", True),
+        ("Pan\u0085els", True),
+        ("Pan\u009bels", True),
+    ),
+    ids=("c0-unit-separator", "del", "c1-nel", "c1-csi"),
+)
+async def test_legacy_reconfigure_ha_control_label_keeps_c0_only_parity(
+    hass: HomeAssistant,
+    label: str,
+    accepted: bool,
+) -> None:
+    """The HA-control label rejects C0 only, exactly as the pre-split step did.
+
+    Each control character sits mid-string: ``str.strip()`` treats U+001C-U+001F
+    and U+0085 as whitespace, so a trailing one would be silently removed before
+    the label is ever validated.
+    """
+    entry = _legacy_entry(hass)
+    form = await _open_legacy_reconfigure_step(hass, entry, "reconfigure_ha_control")
+
+    result = await _submit_legacy_reconfigure(
+        hass,
+        form,
+        {**_schema_defaults(form), CONF_HA_CONTROL_LABEL: label},
+        AsyncMock(return_value=_PUBLIC_KEY),
+    )
+
+    if accepted:
+        assert result["reason"] == "reconfigure_successful"
+        assert entry.data[CONF_HA_CONTROL_LABEL] == label
+    else:
+        assert result["type"] is FlowResultType.FORM
+        assert result["errors"] == {CONF_HA_CONTROL_LABEL: "invalid_value"}
+        assert entry.data[CONF_HA_CONTROL_LABEL] == DEFAULT_HA_CONTROL_LABEL
+
+
+@pytest.mark.parametrize(
+    "label",
+    ("Panels\u001f", "Panels\t", "Panels\r"),
+    ids=("trailing-unit-separator", "trailing-tab", "trailing-carriage-return"),
+)
+async def test_legacy_reconfigure_ha_control_label_gate_reads_the_raw_value(
+    hass: HomeAssistant,
+    label: str,
+) -> None:
+    """A trailing C0 character is rejected even though str.strip() would hide it.
+
+    str.strip() discards U+0009-U+000D and U+001C-U+001F, so the stripped check
+    inside _validated_control_input only ever sees "Panels" here and accepts it.
+    Only the raw-value gate in async_step_reconfigure_ha_control can reject
+    these, which is what makes that gate load-bearing rather than redundant.
+    """
+    entry = _legacy_entry(hass)
+    form = await _open_legacy_reconfigure_step(hass, entry, "reconfigure_ha_control")
+    assert label.strip() == "Panels"
+
+    result = await _submit_legacy_reconfigure(
+        hass,
+        form,
+        {**_schema_defaults(form), CONF_HA_CONTROL_LABEL: label},
+        AsyncMock(return_value=_PUBLIC_KEY),
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {CONF_HA_CONTROL_LABEL: "invalid_value"}
+    assert entry.data[CONF_HA_CONTROL_LABEL] == DEFAULT_HA_CONTROL_LABEL
+
+
+@pytest.mark.parametrize(
+    ("marker", "accepted"),
+    (
+        ("\u001f", False),
+        ("\u007f", True),
+        ("\u0085", True),
+        ("\u009b", True),
+    ),
+    ids=("c0-unit-separator", "del", "c1-nel", "c1-csi"),
+)
+async def test_legacy_reconfigure_ha_control_json_keeps_c0_only_parity(
+    hass: HomeAssistant,
+    marker: str,
+    accepted: bool,
+) -> None:
+    """Room-override and scene-action JSON reject C0 only, as before the split."""
+    entry = _legacy_entry(hass)
+    form = await _open_legacy_reconfigure_step(hass, entry, "reconfigure_ha_control")
+    overrides = {"area-office": f"Office{marker}Suite"}
+    actions = {
+        "office:scene-1": {
+            "domain": "light",
+            "service": "turn_on",
+            "target": {"entity_id": "light.office"},
+            "data": {"note": f"soft{marker}glow"},
+        }
+    }
+
+    result = await _submit_legacy_reconfigure(
+        hass,
+        form,
+        {
+            **_schema_defaults(form),
+            CONF_ROOM_OVERRIDES: json.dumps(overrides),
+            CONF_SCENE_ACTIONS: json.dumps(actions),
+        },
+        AsyncMock(return_value=_PUBLIC_KEY),
+    )
+
+    if accepted:
+        assert result["reason"] == "reconfigure_successful"
+        assert entry.data[CONF_ROOM_OVERRIDES] == overrides
+        assert entry.data[CONF_SCENE_ACTIONS] == actions
+    else:
+        assert result["type"] is FlowResultType.FORM
+        assert result["errors"] == {
+            CONF_ROOM_OVERRIDES: "invalid_value",
+            CONF_SCENE_ACTIONS: "invalid_value",
+        }
+        assert entry.data[CONF_ROOM_OVERRIDES] == {}
+
+
+async def test_legacy_reconfigure_ha_control_redisplay_keeps_del_bearing_json(
+    hass: HomeAssistant,
+) -> None:
+    """An error redisplay echoes DEL-bearing JSON back instead of blanking it."""
+    entry = _legacy_entry(hass)
+    form = await _open_legacy_reconfigure_step(hass, entry, "reconfigure_ha_control")
+    # ensure_ascii=False keeps the DEL literal in the submitted text: the
+    # redisplay guard inspects the raw string, so an escaped \u007f would not
+    # exercise it (json.loads only revives the real character further down).
+    overrides = json.dumps({"area-office": "Office\u007fSuite"}, ensure_ascii=False)
+    assert "\u007f" in overrides
+
+    result = await _submit_legacy_reconfigure(
+        hass,
+        form,
+        {
+            **_schema_defaults(form),
+            CONF_ROOM_OVERRIDES: overrides,
+            CONF_MAX_MIRRORED_ENTITIES: 0,
+        },
+        AsyncMock(return_value=_PUBLIC_KEY),
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {CONF_MAX_MIRRORED_ENTITIES: "invalid_value"}
+    assert _schema_suggested(result, CONF_ROOM_OVERRIDES) == overrides
+
+
+async def test_legacy_reconfigure_advanced_updates_mesh_priority(
+    hass: HomeAssistant,
+) -> None:
+    """The advanced step edits only the mesh priority and pushes it to the panel."""
+    entry = _legacy_entry(hass)
+    form = await _open_legacy_reconfigure_step(hass, entry, "reconfigure_advanced")
+
+    assert form["step_id"] == "reconfigure_advanced"
+    assert _schema_defaults(form)[CONF_MESH_PRIORITY] == 1
+
+    apply = AsyncMock(return_value=_PUBLIC_KEY)
+    result = await _submit_legacy_reconfigure(
+        hass,
+        form,
+        {CONF_MESH_PRIORITY: 7},
+        apply,
+    )
+
+    assert result["reason"] == "reconfigure_successful"
+    call = apply.await_args
+    assert call is not None
+    assert "MESH_PRIORITY=7" in call.kwargs["env_content"]
+    assert entry.data[CONF_MESH_PRIORITY] == 7
+    assert entry.data[CONF_HOST] == "office.iot.example"

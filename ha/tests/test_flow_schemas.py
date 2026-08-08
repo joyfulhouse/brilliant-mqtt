@@ -12,7 +12,6 @@ import voluptuous_serialize
 from homeassistant.const import CONF_NAME
 from homeassistant.helpers import config_validation as cv
 
-from custom_components.brilliant_mqtt import flow_schemas
 from custom_components.brilliant_mqtt.broker import BrokerKind
 from custom_components.brilliant_mqtt.const import (
     CONF_BROKER_KIND,
@@ -50,12 +49,14 @@ from custom_components.brilliant_mqtt.const import (
     OPT_OFFLINE_GRACE_MINUTES,
     OPT_REPAIR_COOLDOWN_MINUTES,
 )
-from custom_components.brilliant_mqtt.flow_schemas import (
+from custom_components.brilliant_mqtt.flow import schemas as flow_schemas
+from custom_components.brilliant_mqtt.flow.schemas import (
     ADVANCED_SECTION,
     BROKER_MENU_OPTIONS,
     DEFAULT_SSH_USERNAME,
     SECRET_UNCHANGED,
     FlowInputError,
+    _has_c0_control_char,
     allocate_mesh_priority,
     allocate_panel_slug,
     broker_advanced_schema,
@@ -486,6 +487,25 @@ def test_control_char_errors_is_field_scoped_and_value_safe() -> None:
     }
 
 
+def test_control_char_detectors_split_c0_only_from_the_full_cc_category() -> None:
+    """Onboarding rejects DEL/C1; the legacy reconfigure detector accepts them."""
+    values: Mapping[str, object] = {
+        "del": "value\u007f",
+        "c1": "value\u0085",
+        "c0": "value\u001f",
+    }
+    keys = ("del", "c1", "c0")
+
+    assert control_char_errors(values, keys) == {
+        "del": "invalid_value",
+        "c1": "invalid_value",
+        "c0": "invalid_value",
+    }
+    assert control_char_errors(values, keys, detector=_has_c0_control_char) == {
+        "c0": "invalid_value"
+    }
+
+
 def test_broker_port_rejects_boolean_and_out_of_range_values() -> None:
     schema = broker_schema(BrokerKind.EXISTING_BROKER)
     for value in (True, 0, 65536):
@@ -744,6 +764,53 @@ def test_fleet_control_rejects_untyped_or_unbounded_values(
 
     assert dict(raised.value.errors) == {field: "invalid_value"}
     assert repr(value) not in repr(raised.value)
+
+
+@pytest.mark.parametrize(
+    "marker",
+    ("\u001f", "\u007f", "\u0085", "\u009b"),
+    ids=("c0-unit-separator", "del", "c1-nel", "c1-csi"),
+)
+def test_fleet_control_json_keeps_the_strict_cc_default_for_onboarding(
+    marker: str,
+) -> None:
+    """The shared JSON decoders stay full-Cc for every non-reconfigure caller.
+
+    The legacy reconfigure step opts into the narrower C0-only detector; nothing
+    else does, so DEL and C1 must still be rejected here.
+    """
+    submitted = _valid_control_input(
+        **{CONF_ROOM_OVERRIDES: json.dumps({"Office": f"Off{marker}ice"})}
+    )
+
+    with pytest.raises(FlowInputError) as raised:
+        flow_schemas.normalize_fleet_control_input(submitted)
+
+    assert dict(raised.value.errors) == {CONF_ROOM_OVERRIDES: "invalid_value"}
+
+
+@pytest.mark.parametrize(
+    "marker",
+    ("\u001f", "\u007f", "\u0085", "\u009b"),
+    ids=("c0-unit-separator", "del", "c1-nel", "c1-csi"),
+)
+def test_fleet_scenes_json_keeps_the_strict_cc_default_for_onboarding(
+    marker: str,
+) -> None:
+    """scene_actions keeps the full-Cc default for every non-reconfigure caller."""
+    action = {**_scene_action(), "data": {"note": f"soft{marker}glow"}}
+
+    with pytest.raises(FlowInputError) as raised:
+        flow_schemas.normalize_fleet_scenes_input(
+            {
+                CONF_SCENE_PANEL: "panel-subentry-office",
+                CONF_SCENE_ACTIONS: json.dumps({"office:movie": action}),
+            },
+            panel_subentry_ids=("panel-subentry-office",),
+            panel_slugs=("office",),
+        )
+
+    assert dict(raised.value.errors) == {CONF_SCENE_ACTIONS: "invalid_value"}
 
 
 def test_fleet_scenes_separates_subentry_owners_from_action_panel_slugs() -> None:

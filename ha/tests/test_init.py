@@ -74,7 +74,7 @@ def test_config_flow_resolves_production_provisioner_from_package_root(
     hass: HomeAssistant,
 ) -> None:
     """The lazy config-flow seam resolves without tests patching its factory."""
-    from custom_components.brilliant_mqtt.config_flow import _get_panel_provisioner
+    from custom_components.brilliant_mqtt.flow.gateway import _get_panel_provisioner
 
     provisioner = _get_panel_provisioner(
         hass,
