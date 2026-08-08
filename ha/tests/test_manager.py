@@ -19,6 +19,7 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import (
     MockConfigEntry,
+    async_capture_events,
     async_fire_mqtt_message,
     async_fire_time_changed,
 )
@@ -157,9 +158,17 @@ def _fleet_panel_manager(
 
 
 def _capture_events(hass: HomeAssistant) -> list[Event]:
-    events: list[Event] = []
-    hass.bus.async_listen(EVENT_TYPE, events.append)
-    return events
+    """Capture events inline with the harness's @callback to avoid executor races.
+
+    The harness listener is decorated @callback, so HassJob types it Callback and
+    async_fire_internal runs it inline; an undecorated target (a bare events.append)
+    would type as Executor and be dispatched to a thread-pool worker, racing callers here that read
+    `events` without awaiting async_block_till_done — a race lost most often under CPU load (#43).
+    The cast is load-bearing, not a suppression: the harness ships no py.typed and this
+    project's mypy config gives it ignore_missing_imports, so the call is Any and
+    --strict's warn_return_any rejects returning it directly (see _timer_cancelled).
+    """
+    return cast(list[Event], async_capture_events(hass, EVENT_TYPE))
 
 
 def _types(events: list[Event]) -> list[str]:
