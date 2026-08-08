@@ -12,6 +12,7 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, patch
 from uuid import UUID
 
+import asyncssh
 import pytest
 import voluptuous as vol
 from homeassistant.components.http import ApiConfig
@@ -25,6 +26,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.brilliant_mqtt import _fleet_lock, config_flow
 from custom_components.brilliant_mqtt.broker import BrokerKind, BrokerProfile
+from custom_components.brilliant_mqtt.components import REGISTRY
 from custom_components.brilliant_mqtt.const import (
     COMPONENT_BRIDGE,
     COMPONENT_BUS_WATCHDOG,
@@ -4316,6 +4318,177 @@ async def test_legacy_reconfigure_secrets_are_masked_and_never_redisplayed(
     assert entry.data[CONF_ROOT_PASSWORD] == _ROOT_PASSWORD
 
 
+async def test_legacy_reconfigure_connection_whitespace_password_reuses_stored_secret(
+    hass: HomeAssistant,
+) -> None:
+    """A root password of only spaces means "keep current", never a new credential."""
+    entry = _legacy_entry(hass)
+    form = await _open_legacy_reconfigure_step(hass, entry, "reconfigure_connection")
+
+    apply = AsyncMock(return_value=_PUBLIC_KEY)
+    result = await _submit_legacy_reconfigure(
+        hass,
+        form,
+        {CONF_HOST: "office.iot.example", CONF_ROOT_PASSWORD: "   "},
+        apply,
+    )
+
+    assert result["reason"] == "reconfigure_successful"
+    call = apply.await_args
+    assert call is not None
+    assert call.args[2] == _ROOT_PASSWORD
+    assert entry.data[CONF_ROOT_PASSWORD] == _ROOT_PASSWORD
+
+
+async def test_legacy_reconfigure_mqtt_whitespace_password_reuses_stored_secret(
+    hass: HomeAssistant,
+) -> None:
+    """A whitespace-only broker password is never stored nor pushed to the panel."""
+    entry = _legacy_entry(hass)
+    form = await _open_legacy_reconfigure_step(hass, entry, "reconfigure_mqtt")
+
+    apply = AsyncMock(return_value=_PUBLIC_KEY)
+    result = await _submit_legacy_reconfigure(
+        hass,
+        form,
+        {
+            CONF_MQTT_HOST: "mqtt.iot.example",
+            CONF_MQTT_PORT: 1883,
+            CONF_MQTT_USERNAME: "brilliant-fleet",
+            CONF_MQTT_PASSWORD: " ",
+        },
+        apply,
+    )
+
+    assert result["reason"] == "reconfigure_successful"
+    call = apply.await_args
+    assert call is not None
+    assert _BROKER_PASSWORD in call.kwargs["env_content"]
+    assert entry.data[CONF_MQTT_PASSWORD] == _BROKER_PASSWORD
+
+
+async def test_legacy_reconfigure_mqtt_new_password_is_applied_and_stored(
+    hass: HomeAssistant,
+) -> None:
+    """A non-blank broker password replaces the stored one and reaches the panel."""
+    entry = _legacy_entry(hass)
+    form = await _open_legacy_reconfigure_step(hass, entry, "reconfigure_mqtt")
+
+    apply = AsyncMock(return_value=_PUBLIC_KEY)
+    result = await _submit_legacy_reconfigure(
+        hass,
+        form,
+        {
+            CONF_MQTT_HOST: "mqtt.iot.example",
+            CONF_MQTT_PORT: 1883,
+            CONF_MQTT_USERNAME: "brilliant-fleet",
+            CONF_MQTT_PASSWORD: "rotated-broker-password",
+        },
+        apply,
+    )
+
+    assert result["reason"] == "reconfigure_successful"
+    call = apply.await_args
+    assert call is not None
+    env = call.kwargs["env_content"]
+    assert "rotated-broker-password" in env
+    assert _BROKER_PASSWORD not in env
+    assert entry.data[CONF_MQTT_PASSWORD] == "rotated-broker-password"
+
+
+@pytest.mark.parametrize(
+    ("error", "code"),
+    (
+        (flow_gateway._WrongPanelError("kitchen"), "wrong_panel"),
+        (asyncssh.HostKeyNotVerifiable("host key changed"), "host_key_changed"),
+    ),
+)
+async def test_legacy_reconfigure_section_refuses_an_unproven_panel(
+    hass: HomeAssistant,
+    error: Exception,
+    code: str,
+) -> None:
+    """A foreign panel or a rotated host key fails closed and stores nothing."""
+    entry = _legacy_entry(hass)
+    original = dict(entry.data)
+    form = await _open_legacy_reconfigure_step(hass, entry, "reconfigure_connection")
+
+    result = await _submit_legacy_reconfigure(
+        hass,
+        form,
+        {CONF_HOST: "office.iot.example", CONF_ROOT_PASSWORD: "rotated-root-password"},
+        AsyncMock(side_effect=error),
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": code}
+    assert dict(entry.data) == original
+
+
+async def test_legacy_reconfigure_section_fails_closed_without_a_stored_pin(
+    hass: HomeAssistant,
+) -> None:
+    """An unpinned same-host entry never re-offers the root password over SSH."""
+    entry = _legacy_entry(hass)
+    hass.config_entries.async_update_entry(
+        entry,
+        data={key: value for key, value in entry.data.items() if key != CONF_SSH_HOST_KEY},
+    )
+    form = await _open_legacy_reconfigure_step(hass, entry, "reconfigure_connection")
+
+    apply = AsyncMock(return_value=_PUBLIC_KEY)
+    result = await _submit_legacy_reconfigure(
+        hass,
+        form,
+        {CONF_HOST: "office.iot.example", CONF_ROOT_PASSWORD: "rotated-root-password"},
+        apply,
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": "host_key_changed"}
+    apply.assert_not_awaited()
+    assert CONF_SSH_HOST_KEY not in entry.data
+    assert entry.data[CONF_ROOT_PASSWORD] == _ROOT_PASSWORD
+
+
+async def test_legacy_reconfigure_keeps_c0_only_control_char_parity(
+    hass: HomeAssistant,
+) -> None:
+    """These steps reject C0 controls but still accept DEL, exactly as before the split."""
+    entry = _legacy_entry(hass)
+    form = await _open_legacy_reconfigure_step(hass, entry, "reconfigure_connection")
+
+    rejected = await _submit_legacy_reconfigure(
+        hass,
+        form,
+        {CONF_HOST: "office.iot.example", CONF_ROOT_PASSWORD: "bad\x1fpassword"},
+        AsyncMock(return_value=_PUBLIC_KEY),
+    )
+
+    assert rejected["type"] is FlowResultType.FORM
+    assert rejected["errors"] == {CONF_ROOT_PASSWORD: "invalid_value"}
+    assert entry.data[CONF_ROOT_PASSWORD] == _ROOT_PASSWORD
+
+    accepted = await _submit_legacy_reconfigure(
+        hass,
+        rejected,
+        {CONF_HOST: "office.iot.example", CONF_ROOT_PASSWORD: "kept\x7fpassword"},
+        AsyncMock(return_value=_PUBLIC_KEY),
+    )
+
+    assert accepted["reason"] == "reconfigure_successful"
+    assert entry.data[CONF_ROOT_PASSWORD] == "kept\x7fpassword"
+
+
+def test_config_flow_entry_module_exposes_only_the_ha_required_flow_classes() -> None:
+    """Home Assistant needs the flow classes here; nothing else is a patch target."""
+    assert set(config_flow.__all__) == {
+        "BrilliantMqttConfigFlow",
+        "PanelSubentryFlow",
+    }
+    assert not hasattr(config_flow, "REGISTRY")
+
+
 async def test_legacy_reconfigure_components_prefill_and_no_change_is_push_only(
     hass: HomeAssistant,
 ) -> None:
@@ -4357,7 +4530,7 @@ async def test_legacy_reconfigure_components_diff_installs_with_stored_secrets(
     defaults = _schema_defaults(form)
 
     install = AsyncMock()
-    voice = replace(config_flow.REGISTRY[COMPONENT_VOICE], install=install)
+    voice = replace(REGISTRY[COMPONENT_VOICE], install=install)
     session_passwords: list[str] = []
 
     @asynccontextmanager
@@ -4373,7 +4546,7 @@ async def test_legacy_reconfigure_components_diff_installs_with_stored_secrets(
     apply = AsyncMock(return_value=_PUBLIC_KEY)
     with (
         patch.object(flow_gateway, "_panel_session", fake_session),
-        patch.dict(config_flow.REGISTRY, {COMPONENT_VOICE: voice}),
+        patch.dict(REGISTRY, {COMPONENT_VOICE: voice}),
     ):
         result = await _submit_legacy_reconfigure(
             hass,

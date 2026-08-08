@@ -259,9 +259,12 @@ own **Reconfigure** action. It opens a menu of focused sections — **Panel
 connection**, **MQTT broker**, **Components and features**, **Home Assistant
 control and scenes**, and **Advanced (mesh priority)** — so you edit only the
 section you picked; everything else stays untouched. Every field is prefilled
-with the stored value, and password fields left blank silently keep the stored
-credential (stored secrets are never redisplayed). Section saves are verified
-against the pinned SSH host key and pushed to the panel over SSH.
+with the stored value, and password fields left blank — or holding only
+whitespace — silently keep the stored credential (stored secrets are never
+redisplayed). Because blank means "keep", reconfigure cannot clear a stored
+password back to empty; anonymous MQTT is not a supported broker profile.
+Section saves are verified against the pinned SSH host key and pushed to the
+panel over SSH.
 
 <a id="rebind_blocked_by_panel_onboarding"></a>
 ### Rebind blocked by panel onboarding or recovery

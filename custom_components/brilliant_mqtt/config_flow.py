@@ -5,12 +5,10 @@ re-exports them here. Tests patch runtime boundaries on ``flow.gateway`` and
 call helpers from ``flow.support`` / ``flow.schemas`` directly.
 """
 
-from .components import REGISTRY
 from .flow.fleet import BrilliantMqttConfigFlow
 from .flow.subentry import PanelSubentryFlow
 
 __all__ = [
-    "REGISTRY",
     "BrilliantMqttConfigFlow",
     "PanelSubentryFlow",
 ]

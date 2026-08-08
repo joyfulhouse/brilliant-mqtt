@@ -44,7 +44,7 @@ from .schemas import (
     _PASSWORD_SELECTOR,
     _components_schema_fields,
     _control_schema_fields,
-    _has_control_char,
+    _has_c0_control_char,
     _mqtt_schema_fields,
     _safe_control_redisplay_values,
     _validated_control_input,
@@ -55,6 +55,20 @@ if TYPE_CHECKING:
     _Base = ConfigFlow
 else:
     _Base = object
+
+
+def _resolved_secret(typed: object, stored: object) -> str:
+    """Return the secret to apply: a blank submission keeps the stored one.
+
+    "Blank" means empty after stripping. A password of nothing but whitespace is
+    never a credential the operator meant to set, and storing it would push an
+    unusable secret to the panel and lock Home Assistant out of it. Anything else
+    is used verbatim and never stripped — leading or trailing whitespace can be
+    a legitimate part of a real password.
+    """
+    candidate = str(typed or "")
+    return candidate if candidate.strip() else str(stored)
+
 
 RECONFIGURE_MENU_OPTIONS = (
     "reconfigure_connection",
@@ -220,14 +234,20 @@ class LegacyPanelReconfigureFlow(_Base):
             # Reject control chars on the RAW input first, THEN strip benign
             # surrounding whitespace — otherwise a stray trailing space would read
             # as a "different" host and downgrade the pinned check to a fresh TOFU.
-            errors = control_char_errors(user_input, (CONF_HOST, CONF_ROOT_PASSWORD))
+            errors = control_char_errors(
+                user_input,
+                (CONF_HOST, CONF_ROOT_PASSWORD),
+                detector=_has_c0_control_char,
+            )
             if not errors:
-                typed_password = str(user_input.get(CONF_ROOT_PASSWORD) or "")
                 errors, result = await self._async_apply_legacy_section(
                     entry,
                     {
                         CONF_HOST: str(user_input[CONF_HOST]).strip(),
-                        CONF_ROOT_PASSWORD: (typed_password or str(entry.data[CONF_ROOT_PASSWORD])),
+                        CONF_ROOT_PASSWORD: _resolved_secret(
+                            user_input.get(CONF_ROOT_PASSWORD),
+                            entry.data[CONF_ROOT_PASSWORD],
+                        ),
                     },
                 )
                 if result is not None:
@@ -254,16 +274,19 @@ class LegacyPanelReconfigureFlow(_Base):
             errors = control_char_errors(
                 user_input,
                 (CONF_MQTT_HOST, CONF_MQTT_USERNAME, CONF_MQTT_PASSWORD),
+                detector=_has_c0_control_char,
             )
             if not errors:
-                typed_password = str(user_input.get(CONF_MQTT_PASSWORD) or "")
                 errors, result = await self._async_apply_legacy_section(
                     entry,
                     {
                         CONF_MQTT_HOST: user_input[CONF_MQTT_HOST],
                         CONF_MQTT_PORT: user_input[CONF_MQTT_PORT],
                         CONF_MQTT_USERNAME: user_input[CONF_MQTT_USERNAME],
-                        CONF_MQTT_PASSWORD: (typed_password or str(entry.data[CONF_MQTT_PASSWORD])),
+                        CONF_MQTT_PASSWORD: _resolved_secret(
+                            user_input.get(CONF_MQTT_PASSWORD),
+                            entry.data[CONF_MQTT_PASSWORD],
+                        ),
                     },
                 )
                 if result is not None:
@@ -285,7 +308,7 @@ class LegacyPanelReconfigureFlow(_Base):
         errors: dict[str, str] = {}
         if user_input is not None:
             # A control char in voice_ha_host crashes render_voice_env → _env_quote.
-            if _has_control_char(str(user_input.get(CONF_VOICE_HA_HOST, ""))):
+            if _has_c0_control_char(str(user_input.get(CONF_VOICE_HA_HOST, ""))):
                 errors[CONF_VOICE_HA_HOST] = "invalid_value"
             if not errors:
                 current: dict[str, Any] = dict(entry.data.get(CONF_COMPONENTS) or {})
@@ -324,7 +347,11 @@ class LegacyPanelReconfigureFlow(_Base):
             return self.async_abort(reason="reconfigure_not_supported")
         errors: dict[str, str] = {}
         if user_input is not None:
-            errors = control_char_errors(user_input, (CONF_HA_CONTROL_LABEL,))
+            errors = control_char_errors(
+                user_input,
+                (CONF_HA_CONTROL_LABEL,),
+                detector=_has_c0_control_char,
+            )
             panels = frozenset(
                 str(candidate.data[CONF_PANEL])
                 for candidate in self.hass.config_entries.async_entries(DOMAIN)

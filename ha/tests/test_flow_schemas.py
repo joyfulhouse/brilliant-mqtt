@@ -56,6 +56,7 @@ from custom_components.brilliant_mqtt.flow.schemas import (
     DEFAULT_SSH_USERNAME,
     SECRET_UNCHANGED,
     FlowInputError,
+    _has_c0_control_char,
     allocate_mesh_priority,
     allocate_panel_slug,
     broker_advanced_schema,
@@ -483,6 +484,25 @@ def test_control_char_errors_is_field_scoped_and_value_safe() -> None:
 
     assert control_char_errors(values, ("missing", "bad", "safe", "not_text")) == {
         "bad": "invalid_value"
+    }
+
+
+def test_control_char_detectors_split_c0_only_from_the_full_cc_category() -> None:
+    """Onboarding rejects DEL/C1; the legacy reconfigure detector accepts them."""
+    values: Mapping[str, object] = {
+        "del": "value\u007f",
+        "c1": "value\u0085",
+        "c0": "value\u001f",
+    }
+    keys = ("del", "c1", "c0")
+
+    assert control_char_errors(values, keys) == {
+        "del": "invalid_value",
+        "c1": "invalid_value",
+        "c0": "invalid_value",
+    }
+    assert control_char_errors(values, keys, detector=_has_c0_control_char) == {
+        "c0": "invalid_value"
     }
 
 

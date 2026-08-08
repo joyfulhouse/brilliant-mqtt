@@ -7,7 +7,7 @@ import json
 import math
 import re
 import unicodedata
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from types import MappingProxyType
 from typing import Any
 
@@ -133,7 +133,19 @@ class _StrictInteger(vol.Coerce):
 
 
 def _has_control_char(value: str) -> bool:
+    """Reject the whole Unicode Cc category: C0, DEL, and the C1 range."""
     return any(unicodedata.category(character) == "Cc" for character in value)
+
+
+def _has_c0_control_char(value: str) -> bool:
+    """Reject C0 controls only, leaving DEL (U+007F) and C1 (U+0080-U+009F) alone.
+
+    The legacy per-panel reconfigure steps have always used this narrower check,
+    so an existing panel whose stored credential holds a DEL or C1 byte keeps
+    saving exactly as it did before those steps moved into this package. New
+    onboarding input goes through the stricter :func:`_has_control_char`.
+    """
+    return any(ord(character) < 32 for character in value)
 
 
 def _encoded_length(value: str) -> int | None:
@@ -241,12 +253,18 @@ def _source_default(source: Mapping[str, object], key: str) -> object:
 def control_char_errors(
     values: Mapping[str, object],
     keys: Iterable[str],
+    *,
+    detector: Callable[[str], bool] = _has_control_char,
 ) -> dict[str, str]:
-    """Return field errors without ever including the submitted values."""
+    """Return field errors without ever including the submitted values.
+
+    *detector* defaults to the full-Cc check the onboarding schemas use; the
+    legacy reconfigure steps pass the narrower C0-only detector they inherited.
+    """
     return {
         key: "invalid_value"
         for key in keys
-        if isinstance((value := values.get(key)), str) and _has_control_char(value)
+        if isinstance((value := values.get(key)), str) and detector(value)
     }
 
 
