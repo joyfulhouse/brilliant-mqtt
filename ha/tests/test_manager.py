@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import asyncssh
 import pytest
 from homeassistant.config_entries import ConfigSubentry
-from homeassistant.core import Event, HomeAssistant
+from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import (
@@ -157,8 +157,22 @@ def _fleet_panel_manager(
 
 
 def _capture_events(hass: HomeAssistant) -> list[Event]:
+    """Collect fired events into a list the caller can read WITHOUT yielding first.
+
+    The listener must be a @callback: HassJob classifies an undecorated target as
+    HassJobType.Executor, and async_fire_internal then hands it to a worker thread
+    (loop.run_in_executor), so the append lands only once the pool gets around to it
+    — joined by hass.async_block_till_done(), which most callers here have no reason
+    to await. A @callback listener runs inline inside async_fire_internal instead, so
+    `events` is complete the moment the code under test returns.
+    """
     events: list[Event] = []
-    hass.bus.async_listen(EVENT_TYPE, events.append)
+
+    @callback
+    def _collect(event: Event) -> None:
+        events.append(event)
+
+    hass.bus.async_listen(EVENT_TYPE, _collect)
     return events
 
 
