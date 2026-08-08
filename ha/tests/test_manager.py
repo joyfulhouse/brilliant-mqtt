@@ -162,8 +162,8 @@ def _capture_events(hass: HomeAssistant) -> list[Event]:
 
     The harness listener is decorated @callback, so HassJob types it Callback and
     async_fire_internal runs it inline; an undecorated target (a bare events.append)
-    would type as Executor and be dispatched to a thread-pool worker, leaving `events`
-    empty for every caller here that reads it without awaiting async_block_till_done.
+    would type as Executor and be dispatched to a thread-pool worker, racing callers here that
+    read `events` without awaiting async_block_till_done — a race lost only under CPU load (#43).
     The cast is load-bearing, not a suppression: the harness ships no py.typed and this
     project's mypy config gives it ignore_missing_imports, so the call is Any and
     --strict's warn_return_any rejects returning it directly (see _timer_cancelled).
