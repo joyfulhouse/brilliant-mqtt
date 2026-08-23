@@ -142,6 +142,21 @@ async def _wait_for_publish(mqtt: FakeMqtt, topic: str, count: int = 1) -> None:
     pytest.fail(f"timed out waiting for {count} publication(s) on {topic}")
 
 
+async def _wait_for_bus_commands(bus: FakeBus, count: int) -> None:
+    """Wait until at least ``count`` bus writes have landed.
+
+    The command handler dispatches the bus write on a background task (so a hung
+    write cannot block the command or its timeout), so ``bus.commands`` is only
+    populated once that task runs. Assertions on ``bus.commands`` must wait for
+    it rather than assuming it completed synchronously with ``mqtt.inject``.
+    """
+    for _ in range(200):
+        if len(bus.commands) >= count:
+            return
+        await asyncio.sleep(0.001)
+    pytest.fail(f"timed out waiting for {count} bus command(s); got {len(bus.commands)}")
+
+
 async def _started(
     tmp_path: Path,
     *,
@@ -276,6 +291,7 @@ async def test_valid_commands_write_only_execution_variables_and_wait_for_confir
     await mqtt.inject(scene_command_topic(_PANEL), _command(scene_id, "scene", "all_off"))
     await mqtt.inject(mode_command_topic(_PANEL), _command(mode_id, "mode", "away"))
 
+    await _wait_for_bus_commands(bus, 2)
     assert bus.commands == [
         (_DEVICE_ID, "execution_peripheral", [VarSet("last_executed_scene_id", "all_off")]),
         (_DEVICE_ID, "execution_peripheral", [VarSet("manual_mode_id", "away")]),
@@ -335,6 +351,7 @@ async def test_matching_execution_publishes_event_before_accepted_result_and_cac
     command_id = "22222222-2222-4222-8222-222222222222"
     command = _command(command_id, "scene", "all_off")
     await mqtt.inject(scene_command_topic(_PANEL), command)
+    await _wait_for_bus_commands(bus, 1)
 
     await bus.emit(_execution("all_off", 1234))
     await _wait_for_publish(mqtt, scene_result_topic(command_id))
@@ -369,6 +386,7 @@ async def test_completed_command_does_not_replay_after_original_command_ttl(tmp_
     command_id = "22222222-2222-4222-8222-222222222222"
     command = _command(command_id, "scene", "all_off")
     await mqtt.inject(scene_command_topic(_PANEL), command)
+    await _wait_for_bus_commands(bus, 1)
     await bus.emit(_execution("all_off", 1_234))
     await _wait_for_publish(mqtt, scene_result_topic(command_id))
     first = _published(mqtt, scene_result_topic(command_id))[-1]
@@ -431,6 +449,7 @@ async def test_unsafe_or_duplicate_scene_commands_never_write(tmp_path: Path, ca
 
     await mqtt.inject(scene_command_topic(_PANEL), command, retained=case == "retained")
     if case == "duplicate_pending":
+        await _wait_for_bus_commands(bus, 1)
         await mqtt.inject(scene_command_topic(_PANEL), command)
 
     assert len(bus.commands) == (1 if case == "duplicate_pending" else 0)
@@ -839,6 +858,7 @@ async def test_completed_id_reuse_validates_context_and_fingerprint_before_repla
     command_id = "22222222-2222-4222-8222-222222222222"
     original = _command(command_id, "scene", "all_off")
     await mqtt.inject(scene_command_topic(_PANEL), original)
+    await _wait_for_bus_commands(bus, 1)
     await bus.emit(_execution("all_off", 500))
     await _wait_for_publish(mqtt, scene_result_topic(command_id))
     original_results = len(_published(mqtt, scene_result_topic(command_id)))
@@ -1016,6 +1036,7 @@ async def test_result_capacity_never_discards_undelivered_outcome(
     bridge = SceneBridge(bus, mqtt, _PANEL, tmp_path / "state.json", FakeClockMs(_NOW_MS))
     await bridge.async_start()
     await mqtt.inject(scene_command_topic(_PANEL), _command(first_id, "scene", "all_off"))
+    await _wait_for_bus_commands(bus, 1)
     await bus.emit(_execution("all_off", 500))
     await mqtt.inject(scene_command_topic(_PANEL), _command(second_id, "scene", "all_off"))
 
@@ -1038,11 +1059,13 @@ async def test_delivered_result_at_capacity_is_evicted_for_new_physical_command(
         scene_ids=("all_off", "all_on"),
     )
     await mqtt.inject(scene_command_topic(_PANEL), _command(first_id, "scene", "all_off"))
+    await _wait_for_bus_commands(bus, 1)
     await bus.emit(_execution("all_off", 500))
     await _wait_for_publish(mqtt, scene_result_topic(first_id))
 
     await mqtt.inject(scene_command_topic(_PANEL), _command(second_id, "scene", "all_on"))
 
+    await _wait_for_bus_commands(bus, 2)
     assert len(bus.commands) == 2
     await bridge.async_shutdown()
 
@@ -1093,6 +1116,7 @@ async def test_inflight_command_is_durable_before_write_and_never_rewrites_after
     await first.async_start()
 
     await first_mqtt.inject(scene_command_topic(_PANEL), command)
+    await _wait_for_bus_commands(first_bus, 1)
     assert len(first_bus.commands) == 1
     await first.async_shutdown()
     assert f"scene:{command_id}" in json.loads(path.read_text())["pending"]
@@ -1459,6 +1483,7 @@ async def test_pending_capacity_blocks_every_additional_physical_command(
         _command("44444444-4444-4444-8444-444444444444", "scene", "all_on"),
     )
 
+    await _wait_for_bus_commands(bus, 1)
     assert len(bus.commands) == 1
     await bridge.async_shutdown()
 
@@ -1563,6 +1588,7 @@ async def test_reconcile_discards_snapshot_older_than_same_epoch_live_change(
         _command("22222222-2222-4222-8222-222222222222", "scene", "all_off"),
     )
 
+    await _wait_for_bus_commands(bus, 1)
     assert bus.commands[-1][0] == "new-panel"
     await bridge.async_shutdown()
 
