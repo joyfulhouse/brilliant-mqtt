@@ -40,14 +40,19 @@ jobs:
       - name: Base entity sets has_entity_name; runtime-data + unique config in place
         run: |
           python3 - <<'PY'
-          import os
+          import os, pathlib
           comp = os.environ["COMP"]
           assert "has_entity_name = True" in open(f"{comp}/entity.py").read(), "entity.py: missing has_entity_name"
           init = open(f"{comp}/__init__.py").read()
           assert "entry.runtime_data" in init, "__init__.py: missing runtime_data usage"
-          cf = open(f"{comp}/config_flow.py").read()
-          assert "async_set_unique_id" in cf, "config_flow.py: missing async_set_unique_id"
-          assert "_abort_if_unique_id_configured" in cf, "config_flow.py: missing _abort_if_unique_id_configured"
+          # The config flow spans config_flow.py plus the flow/ package: the flow
+          # refactor split the steps into flow/*.py, so scan the whole surface.
+          flow_src = open(f"{comp}/config_flow.py").read()
+          flow_dir = pathlib.Path(comp) / "flow"
+          if flow_dir.is_dir():
+              flow_src += "".join(p.read_text() for p in sorted(flow_dir.rglob("*.py")))
+          assert "async_set_unique_id" in flow_src, "config flow: missing async_set_unique_id"
+          assert "_abort_if_unique_id_configured" in flow_src, "config flow: missing _abort_if_unique_id_configured"
           print("OK entity/runtime-data/unique-config")
           PY
 
