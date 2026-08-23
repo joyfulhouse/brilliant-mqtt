@@ -406,11 +406,11 @@ def _layout_probe_command() -> str:
         "        check=False, text=True,\n"
         "    )\n"
         "    value = result.stdout.strip()\n"
-        # Older systemd writes an unknown unit to stderr and leaves stdout empty.
-        # is-active still prints a usable state there, so only is-enabled needs
-        # the "not-found" default; "unknown" is is-active's documented fallback.
-        "    if not value:\n"
-        "        value = 'not-found' if operation == 'is-enabled' else 'unknown'\n"
+        # Older systemd can leave stdout empty for is-enabled on an absent unit,
+        # so default that case to "not-found". is-active always prints a usable
+        # state; leaving it empty makes SystemExit(45) fail the probe closed.
+        "    if not value and operation == 'is-enabled':\n"
+        "        value = 'not-found'\n"
         "    if value in truthy:\n"
         "        return True\n"
         "    if value in falsey:\n"
