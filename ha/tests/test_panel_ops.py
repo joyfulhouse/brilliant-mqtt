@@ -2306,6 +2306,37 @@ def test_snapshot_layout_probe_accepts_is_enabled_without_stdout(tmp_path: Path)
     assert all(state == {"active": False, "enabled": False} for state in services.values())
 
 
+def test_snapshot_layout_probe_fails_closed_without_is_active_stdout(
+    tmp_path: Path,
+) -> None:
+    """An empty is-active result must abort the layout snapshot."""
+    stub = tmp_path / "systemctl"
+    stub.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "is-enabled" ]; then\n'
+        "  printf 'disabled\\n'\n"
+        "  exit 1\n"
+        "fi\n"
+        'echo "Failed to get properties: Connection refused" >&2\n'
+        "exit 1\n"
+    )
+    stub.chmod(0o755)
+    command = panel_ops.SNAPSHOT_LAYOUT_COMMAND.replace(
+        panel_ops._PANEL_PYTHON, shlex.quote(sys.executable)
+    )
+
+    result = subprocess.run(
+        ["/bin/sh", "-c", command],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        env={**os.environ, "PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}"},
+    )
+
+    assert result.returncode == 45
+
+
 def test_release_symlink_validation_preserves_find_failure() -> None:
     command = panel_ops._no_symlinks_command("/dev/null")
     script = f"find() {{ return 23; }}; {command}"
