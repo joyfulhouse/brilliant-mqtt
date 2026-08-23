@@ -9,6 +9,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import subprocess
 import sys
 from dataclasses import replace
@@ -2242,6 +2243,67 @@ def test_toolchain_accepts_documented_is_enabled_states(result: str) -> None:
     script = f"systemctl() {{ printf '%s\\n' {result}; return 1; }}; {command}"
 
     assert subprocess.run(["sh", "-c", script], check=False).returncode == 0
+
+
+def test_toolchain_accepts_is_enabled_without_stdout() -> None:
+    """An unknown unit prints nothing on stdout on older systemd.
+
+    systemd 250 (Brilliant firmware v26.07.15.1) reports an unknown unit on
+    stderr and exits non-zero, leaving stdout empty, where newer systemd prints
+    ``not-found``. Inspection must read that as ``not-found`` rather than
+    rejecting the panel with ``unsupported_panel_toolchain`` -- otherwise a
+    first install can never pass, because the probed unit is the one the
+    integration has not installed yet.
+    """
+    command = next(
+        command
+        for _key, capability, command in panel_inspection._TOOLCHAIN_PROBES
+        if capability == "systemd_is_enabled"
+    )
+    script = (
+        "systemctl() { "
+        "printf '%s\\n' 'Failed to get unit file state for brilliant-mqtt.service: "
+        "No such file or directory' >&2; "
+        "return 1; }; "
+    ) + command
+
+    assert subprocess.run(["sh", "-c", script], check=False).returncode == 0
+
+
+def test_snapshot_layout_probe_accepts_is_enabled_without_stdout(tmp_path: Path) -> None:
+    """The layout probe must not abort when a core unit is absent on systemd 250.
+
+    ``state()`` raises SystemExit(45) for any value outside its known set, and
+    an empty string is outside that set, so a panel with no bridge units yet
+    fails the snapshot with ``snapshot_failed``.
+    """
+    stub = tmp_path / "systemctl"
+    stub.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "is-enabled" ]; then\n'
+        '  echo "Failed to get unit file state for $2: No such file or directory" >&2\n'
+        "  exit 1\n"
+        "fi\n"
+        "printf 'inactive\\n'\n"
+    )
+    stub.chmod(0o755)
+    command = panel_ops.SNAPSHOT_LAYOUT_COMMAND.replace(
+        panel_ops._PANEL_PYTHON, shlex.quote(sys.executable)
+    )
+
+    result = subprocess.run(
+        ["/bin/sh", "-c", command],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        env={**os.environ, "PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    services = json.loads(result.stdout)["services"]
+    assert services
+    assert all(state == {"active": False, "enabled": False} for state in services.values())
 
 
 def test_release_symlink_validation_preserves_find_failure() -> None:

@@ -170,6 +170,9 @@ _TOOLCHAIN_PROBES = (
         "systemd_is_enabled",
         (
             f'state="$(systemctl is-enabled {SERVICE_NAME} 2>/dev/null || true)"; '
+            # Older systemd reports an unknown unit on stderr only, leaving stdout
+            # empty where newer systemd prints "not-found".
+            '[ -z "$state" ] && state=not-found; '
             f'case "$state" in {"|".join(sorted(_ENABLED_SERVICE_STATES))}) '
             "true ;; *) false ;; esac"
         ),
