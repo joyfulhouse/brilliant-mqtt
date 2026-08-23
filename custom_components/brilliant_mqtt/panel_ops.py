@@ -1044,9 +1044,16 @@ def _stop_service_command(service_name: str) -> str:
     )
 
 
-def _disabled_state_command(service_name: str) -> str:
+def _is_enabled_state_capture(service_name: str) -> str:
     return (
         f'state="$(systemctl is-enabled {service_name} 2>/dev/null || true)"; '
+        '[ -z "$state" ] && state=not-found;'
+    )
+
+
+def _disabled_state_command(service_name: str) -> str:
+    return (
+        f"{_is_enabled_state_capture(service_name)} "
         'case "$state" in '
         "disabled|generated|indirect|masked|not-found|static|transient) ;; "
         "*) exit 48 ;; esac"
