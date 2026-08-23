@@ -2337,6 +2337,50 @@ def test_snapshot_layout_probe_fails_closed_without_is_active_stdout(
     assert result.returncode == 45
 
 
+def test_disabled_state_command_accepts_is_enabled_without_stdout(tmp_path: Path) -> None:
+    """An absent unit is a valid disabled state on systemd 250."""
+    stub = tmp_path / "systemctl"
+    stub.write_text(
+        "#!/bin/sh\n"
+        'echo "Failed to get unit file state for $2: No such file or directory" >&2\n'
+        "exit 1\n"
+    )
+    stub.chmod(0o755)
+
+    result = subprocess.run(
+        ["/bin/sh", "-c", panel_ops._disabled_state_command(SERVICE_NAME)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}"},
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_disabled_state_command_rejects_enabled_unit(tmp_path: Path) -> None:
+    """The empty-stdout default must not weaken the disabled assertion.
+
+    ``_disabled_state_command`` exists to assert the unit is *not* enabled, so a
+    unit that reports ``enabled`` must still fail with 48. This guards the
+    systemd-250 empty->not-found default from being an accidentally permissive
+    classifier that accepts any state.
+    """
+    stub = tmp_path / "systemctl"
+    stub.write_text("#!/bin/sh\nprintf 'enabled\\n'\n")
+    stub.chmod(0o755)
+
+    result = subprocess.run(
+        ["/bin/sh", "-c", panel_ops._disabled_state_command(SERVICE_NAME)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}"},
+    )
+
+    assert result.returncode == 48, result.stdout
+
+
 def test_release_symlink_validation_preserves_find_failure() -> None:
     command = panel_ops._no_symlinks_command("/dev/null")
     script = f"find() {{ return 23; }}; {command}"
