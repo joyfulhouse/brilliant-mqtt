@@ -288,6 +288,39 @@ class _RawDevice:
         self.peripherals = peripherals
 
 
+class _DeviceReadObserver:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def get_device(self, device_id: str) -> _RawDevice:
+        self.calls.append(device_id)
+        return _RawDevice(device_id, {f"{device_id}-peripheral": _RawPeripheral()})
+
+
+class TestGetAllScope:
+    async def test_without_extras_reads_only_own_device(self) -> None:
+        adapter = RpcBusAdapter(extra_device_ids=("ble_mesh",))
+        observer = _DeviceReadObserver()
+        adapter._obs = observer
+        adapter._own_device_id = "own-device"
+
+        devices = await adapter.get_all(include_extras=False)
+
+        assert observer.calls == ["own-device"]
+        assert [device.device_id for device in devices] == ["own-device"]
+
+    async def test_default_read_still_includes_extras(self) -> None:
+        adapter = RpcBusAdapter(extra_device_ids=("ble_mesh",))
+        observer = _DeviceReadObserver()
+        adapter._obs = observer
+        adapter._own_device_id = "own-device"
+
+        devices = await adapter.get_all()
+
+        assert observer.calls == ["own-device", "ble_mesh"]
+        assert [device.device_id for device in devices] == ["own-device", "ble_mesh"]
+
+
 class TestDispatchFanout:
     """_dispatch_raw_device is plain code (its input is duck-typed), so the M11
     changes are pinned off-panel: the normalized device_id comes from the RAW

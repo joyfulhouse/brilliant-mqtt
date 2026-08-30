@@ -47,6 +47,7 @@ class Settings:
     mqtt_tls_ca_file: str | None = None
     deployment_id: str | None = None
     retained_topics_file: str = "/var/brilliant-mqtt/state/owned-topics.json"
+    # Level-triggered retained discovery/state repair cadence. Must be > 0.
     resync_seconds: int = 300
     log_level: str = "INFO"
     # Cadence of the scoped get-device poll that bounds state staleness even
@@ -100,9 +101,10 @@ class Settings:
     # window; 0 pulses only on the spike tick). 60 is the calibration-
     # validated sweet spot (dining, 2026-07-02).
     motion_derived_hold_s: float = 60.0
-    # Bus-liveness heartbeat: stamped on every successful bus read so the
-    # independent bus-watchdog can detect a wedged message_bus session. tmpfs
-    # default (no flash wear); empty disables emission.
+    # Bus-liveness heartbeat: offered after every successful bus read and
+    # written at most every ten seconds so the independent bus-watchdog can
+    # detect a wedged message_bus session. tmpfs default (no flash wear);
+    # empty disables emission.
     bus_heartbeat_file: str = "/run/brilliant-mqtt/bus-heartbeat"
     # Bidirectional Brilliant scene/mode transport. Opt-in until panel and HA
     # rollout validation is complete; its replay/outbox state must persist.
@@ -117,7 +119,7 @@ class Settings:
         Optional: MQTT_PORT (default 1883), MQTT_TLS_ENABLED (default "0"),
                   MQTT_TLS_CA_FILE (default unset), RETAINED_TOPICS_FILE (default
                   "/var/brilliant-mqtt/state/owned-topics.json"),
-                  RESYNC_SECONDS (default 300),
+                  RESYNC_SECONDS (default 300, must be > 0),
                   LOG_LEVEL (default "INFO"), HOT_POLL_SECONDS (default 2.0),
                   BUS_STALE_SECONDS (default 900), MESH_PRIORITY (default 0:
                   never participate in mesh publishing),
@@ -176,6 +178,8 @@ class Settings:
         if not retained_topics_file.startswith("/var/brilliant-mqtt/"):
             raise ValueError("RETAINED_TOPICS_FILE must be below /var/brilliant-mqtt/")
         resync_seconds = int(env.get("RESYNC_SECONDS", "300"))
+        if resync_seconds <= 0:
+            raise ValueError("RESYNC_SECONDS must be > 0")
         log_level = env.get("LOG_LEVEL", "INFO")
         hot_poll_seconds = float(env.get("HOT_POLL_SECONDS", "2.0"))
         bus_stale_seconds = float(env.get("BUS_STALE_SECONDS", "900"))

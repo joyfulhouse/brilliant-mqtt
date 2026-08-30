@@ -51,6 +51,11 @@ class HotPollReadTimeout(RuntimeError):
     """A hot-poll snapshot read missed its panel RPC deadline."""
 
 
+def _encode_fields(fields: dict[str, object]) -> str:
+    """Serialise projected state fields — THE wire encoding for state payloads."""
+    return json.dumps(fields, sort_keys=True)
+
+
 def _state_payload(device: BrilliantDevice) -> str:
     """Build a sorted-keys JSON state payload for *device*.
 
@@ -58,7 +63,7 @@ def _state_payload(device: BrilliantDevice) -> str:
     source of truth shared with discovery) and serialises the result. Returns
     ``"{}"`` for kinds that contribute no fields.
     """
-    return json.dumps(payload_fields(device), sort_keys=True)
+    return _encode_fields(payload_fields(device))
 
 
 def _sw_version_from(devices: list[BrilliantDevice]) -> str | None:
@@ -123,8 +128,8 @@ class Bridge:
         # the stored snapshot, payload_fields, and the diff cache all see
         # the derived value.
         self._deriver = deriver
-        # Bus-liveness heartbeat (None => no-op): stamped after every successful
-        # get_all so an independent watchdog can detect a wedged bus session.
+        # Bus-liveness heartbeat (None => no-op): offered after successful
+        # bridge-owned reads; shared-read callers own the single offer.
         self._heartbeat = heartbeat
         self._reconcile_min_interval_s = reconcile_min_interval_s
         self._reconcile_max_writes_per_tick = reconcile_max_writes_per_tick
@@ -151,6 +156,10 @@ class Bridge:
         # peripheral_id → last published state payload. Lets the hot poll (and
         # pushes/echoes) skip MQTT publishes when nothing actually changed.
         self._last_state_payload: dict[str, str] = {}
+        # peripheral_id → projected state fields. The hot poll compares this
+        # before JSON serialization; the payload cache preserves wire-level
+        # publish decisions for any projections with equivalent JSON.
+        self._last_state_fields: dict[str, dict[str, object]] = {}
 
         bus.on_change(self._on_change)
         mqtt.on_command(self._on_command)
@@ -227,8 +236,9 @@ class Bridge:
             # the device contributes any payload fields. Forced: reconcile is
             # the level-triggered repair pass, so it republishes even when the
             # payload is unchanged (and re-primes the diff cache).
-            if payload_fields(device):
-                await self._publish_state(device, force=True)
+            fields = payload_fields(device)
+            if fields:
+                await self._publish_state(device, fields, force=True)
 
             # Subscribe command topics: the primary JSON topic for light/switch,
             # plus a per-variable topic for every aux switch/number/button.
@@ -286,6 +296,7 @@ class Bridge:
                 logger.exception("withdraw: unsubscribe failed for %s; continuing", topic)
         self._by_cmd_topic.clear()
         self._last_state_payload.clear()
+        self._last_state_fields.clear()
         self._devices.clear()
         if self._deriver is not None:
             # An ex-leader must not carry hold state into a re-acquisition;
@@ -293,7 +304,7 @@ class Bridge:
             self._deriver.clear()
         logger.info("withdraw: %d command topics unsubscribed", unsubscribed)
 
-    async def poll_once(self) -> None:
+    async def poll_once(self, devices: list[BrilliantDevice] | None = None) -> None:
         """Hot poll: fetch the current devices and publish only changed payloads.
 
         This bounds state staleness at the poll cadence even when the bus push
@@ -301,15 +312,19 @@ class Bridge:
         stream can die without an error, freezing pushes until the processor
         reconnects). Discovery/subscribe stay reconcile-only; the diff cache
         keeps the fast cadence from spamming identical retained payloads.
+
+        A pre-fetched *devices* snapshot lets multiple bridge scopes share one
+        bus read. The caller that owns that read also owns its heartbeat.
         """
-        try:
-            devices = await self._bus.get_all()
-        except (TimeoutError, asyncio.TimeoutError) as error:
-            # Type only the scoped READ boundary. The session coordinator may
-            # grant one retry without also swallowing MQTT publish or desired
-            # write timeouts from the rest of this method.
-            raise HotPollReadTimeout("hot poll bus read timed out") from error
-        self._beat()
+        if devices is None:
+            try:
+                devices = await self._bus.get_all()
+            except (TimeoutError, asyncio.TimeoutError) as error:
+                # Type only the scoped READ boundary. The session coordinator may
+                # grant one retry without also swallowing MQTT publish or desired
+                # write timeouts from the rest of this method.
+                raise HotPollReadTimeout("hot poll bus read timed out") from error
+            self._beat()
         for device in devices:
             # Same scope filter as reconcile: the shared get_all returns every
             # bus device, including the other bridge's.
@@ -319,8 +334,9 @@ class Bridge:
                 continue
             device = self._derived(device)
             self._devices[device.peripheral_id] = device
-            if payload_fields(device):
-                await self._publish_state(device, force=False)
+            fields = payload_fields(device)
+            if fields:
+                await self._publish_state(device, fields, force=False)
         await self._enforce_desired(devices)
 
     async def _enforce_desired(self, devices: list[BrilliantDevice]) -> None:
@@ -411,19 +427,34 @@ class Bridge:
                     device.peripheral_id,
                 )
 
-    async def _publish_state(self, device: BrilliantDevice, *, force: bool) -> None:
+    async def _publish_state(
+        self,
+        device: BrilliantDevice,
+        fields: dict[str, object],
+        *,
+        force: bool,
+    ) -> None:
         """Publish *device*'s shared state payload through the diff cache.
 
-        Skips the publish when the payload matches the last one sent for this
-        peripheral, unless *force* (reconcile's level-triggered repair).
+        Skips serialization when the projected fields match, then preserves
+        the wire-payload comparison for publish parity. *force* bypasses both
+        checks for reconcile's level-triggered repair.
         """
-        payload = _state_payload(device)
-        if not force and self._last_state_payload.get(device.peripheral_id) == payload:
+        peripheral_id = device.peripheral_id
+        # Accepted parity exception: dict equality treats numerically-equal
+        # values as equal (-0.0 == 0.0, 1 == 1.0), so such a re-rendering keeps
+        # the older wire bytes. Every payload key's TYPE is static per spec
+        # (mapping._render_aux), so no HA-observable state can be suppressed.
+        if not force and self._last_state_fields.get(peripheral_id) == fields:
             return
-        self._last_state_payload[device.peripheral_id] = payload
-        logger.debug("state publish for %s%s", device.peripheral_id, " (forced)" if force else "")
+        payload = _encode_fields(fields)
+        self._last_state_fields[peripheral_id] = fields
+        if not force and self._last_state_payload.get(peripheral_id) == payload:
+            return
+        self._last_state_payload[peripheral_id] = payload
+        logger.debug("state publish for %s%s", peripheral_id, " (forced)" if force else "")
         await self._async_publish_retained(
-            state_topic(self._panel, device.peripheral_id),
+            state_topic(self._panel, peripheral_id),
             payload,
         )
 
@@ -451,8 +482,9 @@ class Bridge:
         device = self._derived(device)
         self._devices[device.peripheral_id] = device
 
-        if payload_fields(device):
-            await self._publish_state(device, force=False)
+        fields = payload_fields(device)
+        if fields:
+            await self._publish_state(device, fields, force=False)
 
     async def _on_command(self, topic: str, payload: str) -> None:
         """Handle an inbound MQTT command: translate and write to the bus.
@@ -550,5 +582,6 @@ class Bridge:
         updated = replace(device, variables=new_vars)
         self._devices[peripheral_id] = updated
 
-        if payload_fields(updated):
-            await self._publish_state(updated, force=False)
+        fields = payload_fields(updated)
+        if fields:
+            await self._publish_state(updated, fields, force=False)

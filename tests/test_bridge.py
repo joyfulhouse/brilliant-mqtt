@@ -19,6 +19,7 @@ import pytest
 from brilliant_mqtt import __version__
 from brilliant_mqtt.bridge import Bridge, _state_payload
 from brilliant_mqtt.commands import VarSet
+from brilliant_mqtt.mapping import payload_fields
 from brilliant_mqtt.model import BrilliantDevice, DeviceKind, Variable
 from brilliant_mqtt.retained_topics import RetainedTopicLedger
 from tests.fakes import FakeBus, FakeMqtt
@@ -832,6 +833,40 @@ class TestRealtimePolling:
         await bridge.poll_once()
         assert mqtt.published == []
 
+    async def test_poll_unchanged_projects_once_without_serializing(
+        self,
+        dimmer: BrilliantDevice,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        bus = FakeBus([dimmer])
+        mqtt = FakeMqtt()
+        bridge = Bridge(bus, mqtt, PANEL)
+        await bridge.reconcile()
+        mqtt.published.clear()
+        projections = 0
+        serializations = 0
+        real_payload_fields = payload_fields
+        real_dumps = json.dumps
+
+        def counted_payload_fields(device: BrilliantDevice) -> dict[str, object]:
+            nonlocal projections
+            projections += 1
+            return real_payload_fields(device)
+
+        def counted_dumps(value: object, *, sort_keys: bool = False) -> str:
+            nonlocal serializations
+            serializations += 1
+            return real_dumps(value, sort_keys=sort_keys)
+
+        monkeypatch.setattr("brilliant_mqtt.bridge.payload_fields", counted_payload_fields)
+        monkeypatch.setattr(json, "dumps", counted_dumps)
+
+        await bridge.poll_once()
+
+        assert projections == 1
+        assert serializations == 0
+        assert mqtt.published == []
+
     async def test_poll_changed_variable_publishes_once(self, dimmer: BrilliantDevice) -> None:
         bus = FakeBus([dimmer])
         mqtt = FakeMqtt()
@@ -852,6 +887,35 @@ class TestRealtimePolling:
         mqtt.published.clear()
         await bridge.poll_once()
         assert mqtt.published == []
+
+    async def test_poll_changed_serializes_once_with_identical_wire_payload(
+        self,
+        dimmer: BrilliantDevice,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        bus = FakeBus([dimmer])
+        mqtt = FakeMqtt()
+        bridge = Bridge(bus, mqtt, PANEL)
+        await bridge.reconcile()
+        mqtt.published.clear()
+        serializations = 0
+        real_dumps = json.dumps
+
+        def counted_dumps(value: object, *, sort_keys: bool = False) -> str:
+            nonlocal serializations
+            serializations += 1
+            return real_dumps(value, sort_keys=sort_keys)
+
+        monkeypatch.setattr(json, "dumps", counted_dumps)
+        bus.set_devices([_dimmer_on(dimmer)])
+
+        await bridge.poll_once()
+
+        topic = f"brilliant/{PANEL}/gangbox_peripheral_0/state"
+        assert mqtt.published == [
+            (topic, '{"brightness": 255, "state": "ON"}', True),
+        ]
+        assert serializations == 1
 
     async def test_poll_updates_snapshot_for_commands(self, dimmer: BrilliantDevice) -> None:
         """Commands translate against the freshest polled snapshot."""

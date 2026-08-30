@@ -406,7 +406,7 @@ class RpcBusAdapter:
             except Exception:
                 logger.exception("reconnect callback failed")
 
-    async def get_all(self) -> list[BrilliantDevice]:
+    async def get_all(self, *, include_extras: bool = True) -> list[BrilliantDevice]:
         """Return the normalized peripherals of every bridged bus device.
 
         Fetches the panel's own CONTROL device plus each configured extra
@@ -423,10 +423,14 @@ class RpcBusAdapter:
         The panel RPC layer's ``TimeoutError`` deliberately propagates so each
         caller can apply its own policy (best-effort hot poll versus fatal
         startup/reconcile).
+
+        ``include_extras=False`` restricts a standby hot poll to the panel's
+        own device. Full reads remain the default for reconcile callers.
         """
         obs, own_id = self._require_started()
         devices: list[BrilliantDevice] = []
-        for device_id in (own_id, *self._extra_device_ids):
+        device_ids = (own_id, *self._extra_device_ids) if include_extras else (own_id,)
+        for device_id in device_ids:
             raw_device = await obs.get_device(device_id)
             if raw_device is None or getattr(raw_device, "peripherals", None) is None:
                 label = "own device" if device_id == own_id else "extra device"
