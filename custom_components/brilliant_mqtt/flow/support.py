@@ -27,11 +27,13 @@ from ..const import (
     CONF_ENTRY_KIND,
     CONF_FEATURE_OVERRIDES,
     CONF_HOST,
+    CONF_HOT_POLL_SECONDS,
     CONF_IDENTITY_FINGERPRINT,
     CONF_MANAGEMENT_ID,
     CONF_MESH_PRIORITY,
     CONF_PANEL,
     CONF_PROVISIONING_TRANSACTION_ID,
+    CONF_RESYNC_SECONDS,
     CONF_ROOT_PASSWORD,
     CONF_SCHEMA_VERSION,
     CONF_SSH_HOST_KEY,
@@ -314,5 +316,7 @@ def _provisioned_matches_request(
         and data.get(CONF_COMPONENTS) == expected_components
         and data.get(CONF_FEATURE_OVERRIDES) == dict(request.feature_overrides)
         and data.get(CONF_MESH_PRIORITY) == request.mesh_priority
+        and data.get(CONF_HOT_POLL_SECONDS) == request.hot_poll_seconds
+        and data.get(CONF_RESYNC_SECONDS) == request.resync_seconds
         and data.get(CONF_PROVISIONING_TRANSACTION_ID) == str(provisioned.transaction_id)
     )

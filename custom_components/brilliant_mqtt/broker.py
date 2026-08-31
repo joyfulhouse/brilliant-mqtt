@@ -340,6 +340,8 @@ class BrokerProfile(_BrokerSecrets):
         scene_bridge_enabled: bool,
         mqtt_ca_path: str | None = None,
         deployment_id: str | None = None,
+        hot_poll_seconds: int | None = None,
+        resync_seconds: int | None = None,
     ) -> PanelBrokerReleaseSettings:
         """Render the panel transport contract without exporting secret fields."""
         from .panel_ops import render_env
@@ -369,6 +371,8 @@ class BrokerProfile(_BrokerSecrets):
                 mqtt_tls_enabled=self.tls_enabled,
                 mqtt_tls_ca_file=mqtt_ca_path,
                 deployment_id=deployment_id,
+                hot_poll_seconds=hot_poll_seconds,
+                resync_seconds=resync_seconds,
             )
             settings = PanelBrokerReleaseSettings(
                 environment=environment,

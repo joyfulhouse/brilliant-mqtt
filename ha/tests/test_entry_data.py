@@ -27,6 +27,7 @@ from custom_components.brilliant_mqtt.const import (
     CONF_HA_CONTROL_ENABLED,
     CONF_HA_CONTROL_LABEL,
     CONF_HOST,
+    CONF_HOT_POLL_SECONDS,
     CONF_IDENTITY_FINGERPRINT,
     CONF_MANAGEMENT_ID,
     CONF_MAX_MIRRORED_ENTITIES,
@@ -40,6 +41,7 @@ from custom_components.brilliant_mqtt.const import (
     CONF_NEXT_MESH_PRIORITY,
     CONF_PANEL,
     CONF_PROVISIONING_TRANSACTION_ID,
+    CONF_RESYNC_SECONDS,
     CONF_ROOM_OVERRIDES,
     CONF_ROOT_PASSWORD,
     CONF_SCENE_ACTIONS,
@@ -352,6 +354,40 @@ def test_panel_mesh_priority_rejects_invalid_values(mesh_priority: object) -> No
         PanelConfig.from_subentry(_subentry(mesh_priority=mesh_priority))
 
 
+def test_panel_agent_cadences_are_optional_bounded_integers() -> None:
+    defaults = PanelConfig.from_subentry(_subentry())
+    tuned = PanelConfig.from_subentry(_subentry(hot_poll_seconds=0, resync_seconds=86400))
+
+    assert defaults.hot_poll_seconds is None
+    assert defaults.resync_seconds is None
+    assert tuned.hot_poll_seconds == 0
+    assert tuned.resync_seconds == 86400
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    (
+        (CONF_HOT_POLL_SECONDS, -1),
+        (CONF_HOT_POLL_SECONDS, 61),
+        (CONF_HOT_POLL_SECONDS, True),
+        (CONF_RESYNC_SECONDS, 59),
+        (CONF_RESYNC_SECONDS, 86401),
+        (CONF_RESYNC_SECONDS, False),
+    ),
+)
+def test_panel_agent_cadences_reject_invalid_values(
+    key: str,
+    value: object,
+) -> None:
+    subentry = (
+        _subentry(hot_poll_seconds=value)
+        if key == CONF_HOT_POLL_SECONDS
+        else _subentry(resync_seconds=value)
+    )
+    with pytest.raises(EntryDataError):
+        PanelConfig.from_subentry(subentry)
+
+
 @pytest.mark.parametrize(("option", "value"), _INVALID_RESILIENCE_OPTIONS)
 def test_panel_resilience_overrides_reject_invalid_types_and_ranges(
     option: str,
@@ -465,6 +501,69 @@ async def test_legacy_store_rejects_noncanonical_slug(
     entry.add_to_hass(hass)
     with pytest.raises(EntryDataError):
         LegacyPanelStore(hass, entry)
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    (
+        (CONF_HOT_POLL_SECONDS, 5.9),
+        (CONF_RESYNC_SECONDS, 0),
+    ),
+    ids=("float", "out-of-range"),
+)
+async def test_legacy_store_rejects_tampered_agent_cadences(
+    hass: HomeAssistant,
+    key: str,
+    value: object,
+) -> None:
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        version=3,
+        data={
+            CONF_PANEL: "legacy",
+            key: value,
+        },
+    )
+    entry.add_to_hass(hass)
+
+    with pytest.raises(EntryDataError, match="invalid_legacy_panel_entry_data"):
+        LegacyPanelStore(hass, entry)
+
+
+async def test_legacy_store_round_trips_valid_agent_cadences(
+    hass: HomeAssistant,
+) -> None:
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        version=3,
+        data={
+            CONF_PANEL: "legacy",
+            CONF_HOT_POLL_SECONDS: 5,
+            CONF_RESYNC_SECONDS: 900,
+        },
+    )
+    entry.add_to_hass(hass)
+
+    store = LegacyPanelStore(hass, entry)
+
+    assert store.data[CONF_HOT_POLL_SECONDS] == 5
+    assert store.data[CONF_RESYNC_SECONDS] == 900
+
+
+async def test_legacy_store_loads_absent_agent_cadences_as_none(
+    hass: HomeAssistant,
+) -> None:
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        version=3,
+        data={CONF_PANEL: "legacy"},
+    )
+    entry.add_to_hass(hass)
+
+    store = LegacyPanelStore(hass, entry)
+
+    assert store.data.get(CONF_HOT_POLL_SECONDS) is None
+    assert store.data.get(CONF_RESYNC_SECONDS) is None
 
 
 async def test_legacy_store_exposes_version_three_shape_unchanged(

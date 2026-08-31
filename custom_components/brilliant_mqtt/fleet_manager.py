@@ -66,6 +66,7 @@ from .entry_data import (
     LegacyPanelStore,
     PanelConfig,
     PanelConfigStore,
+    _panel_agent_cadences,
 )
 from .manager import PanelManager, async_delete_panel_issues
 from .panel_health import PanelHealthObserver
@@ -811,6 +812,10 @@ def legacy_fleet_config(entry: ConfigEntry[Any]) -> FleetConfig:
     panel = data.get(CONF_PANEL)
     if not isinstance(panel, str) or not panel:
         raise EntryDataError("invalid_legacy_fleet_data")
+    try:
+        _panel_agent_cadences(data)
+    except EntryDataError:
+        raise EntryDataError("invalid_legacy_fleet_data") from None
 
     broker_data = dict(data)
     broker_data.setdefault(CONF_BROKER_KIND, BrokerKind.EXISTING_BROKER.value)

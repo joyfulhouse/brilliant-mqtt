@@ -1592,6 +1592,8 @@ ENV_MQTT_TLS_CA_FILE = "MQTT_TLS_CA_FILE"
 ENV_RETAINED_TOPICS_FILE = "RETAINED_TOPICS_FILE"
 ENV_MESH_PRIORITY = "MESH_PRIORITY"
 ENV_SCENE_BRIDGE_ENABLED = "SCENE_BRIDGE_ENABLED"
+ENV_HOT_POLL_SECONDS = "HOT_POLL_SECONDS"
+ENV_RESYNC_SECONDS = "RESYNC_SECONDS"
 
 _MQTT_TLS_TRUE_VALUES = frozenset({"1", "true", "on", "yes"})
 _MQTT_TLS_FALSE_VALUES = frozenset({"0", "false", "off", "no"})
@@ -1615,6 +1617,8 @@ def render_env(
     mqtt_tls_enabled: bool = False,
     mqtt_tls_ca_file: str | None = None,
     deployment_id: str | None = None,
+    hot_poll_seconds: int | None = None,
+    resync_seconds: int | None = None,
 ) -> str:
     """Render /etc/brilliant-mqtt.env — exactly what the agent's config.py reads.
 
@@ -1632,6 +1636,14 @@ def render_env(
         raise ValueError("invalid_mqtt_tls_ca_file")
     if deployment_id is not None and re.fullmatch(r"[0-9a-f]{32}", deployment_id) is None:
         raise ValueError("invalid_deployment_id")
+    if hot_poll_seconds is not None and (
+        type(hot_poll_seconds) is not int or not 0 <= hot_poll_seconds <= 60
+    ):
+        raise ValueError("invalid_hot_poll_seconds")
+    if resync_seconds is not None and (
+        type(resync_seconds) is not int or not 60 <= resync_seconds <= 86400
+    ):
+        raise ValueError("invalid_resync_seconds")
 
     broker_env = (
         f"{ENV_PANEL}={_env_quote(panel)}\n"
@@ -1645,10 +1657,16 @@ def render_env(
         broker_env += f"{ENV_DEPLOYMENT_ID}={deployment_id}\n"
     if mqtt_tls_ca_file:
         broker_env += f"{ENV_MQTT_TLS_CA_FILE}={mqtt_tls_ca_file}\n"
+    cadence_env = ""
+    if hot_poll_seconds is not None:
+        cadence_env += f"{ENV_HOT_POLL_SECONDS}={hot_poll_seconds}\n"
+    if resync_seconds is not None:
+        cadence_env += f"{ENV_RESYNC_SECONDS}={resync_seconds}\n"
     return (
         broker_env + f"{ENV_RETAINED_TOPICS_FILE}={PANEL_RETAINED_TOPICS_FILE}\n"
         f"{ENV_MESH_PRIORITY}={mesh_priority}\n"
         f"{ENV_SCENE_BRIDGE_ENABLED}={1 if scene_bridge_enabled else 0}\n"
+        f"{cadence_env}"
         f"LOG_LEVEL=INFO\n"
     )
 

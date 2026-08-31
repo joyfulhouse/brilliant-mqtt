@@ -125,6 +125,7 @@ class HaControlPlane:
         self._entries: dict[str, BrilliantMqttConfigEntry] = {}
         self._manifest: ManifestSnapshot | None = None
         self._manifest_body: str | None = None
+        self._manifest_by_entity_id: dict[str, ManifestEntity] = {}
         self._state_sequences: defaultdict[str, int] = defaultdict(int)
         self._unsubscribers: list[CALLBACK_TYPE] = []
         self._debounce_cancel: CALLBACK_TYPE | None = None
@@ -422,6 +423,9 @@ class HaControlPlane:
             )
             self._manifest = candidate
             self._manifest_body = body
+            self._manifest_by_entity_id = {
+                entity.entity_id: entity for entity in candidate.entities
+            }
         except BaseException:
             # Manifest-last means a failed candidate never displaced the previous
             # broker manifest. Reopen that old authority when it exists; initial
@@ -460,10 +464,7 @@ class HaControlPlane:
             entity_id = event.data.get("entity_id")
             if not isinstance(entity_id, str):
                 return
-            entity = next(
-                (item for item in self._manifest.entities if item.entity_id == entity_id),
-                None,
-            )
+            entity = self._manifest_by_entity_id.get(entity_id)
             if entity is not None:
                 await self._async_publish_state(entity)
 

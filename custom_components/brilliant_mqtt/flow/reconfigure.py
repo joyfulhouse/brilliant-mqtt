@@ -26,12 +26,14 @@ from ..const import (
     CONF_HA_CONTROL_ENABLED,
     CONF_HA_CONTROL_LABEL,
     CONF_HOST,
+    CONF_HOT_POLL_SECONDS,
     CONF_MESH_PRIORITY,
     CONF_MQTT_HOST,
     CONF_MQTT_PASSWORD,
     CONF_MQTT_PORT,
     CONF_MQTT_USERNAME,
     CONF_PANEL,
+    CONF_RESYNC_SECONDS,
     CONF_ROOT_PASSWORD,
     CONF_VOICE_HA_HOST,
     DATA_SSH_HOST_KEY,
@@ -46,7 +48,9 @@ from .schemas import (
     _control_schema_fields,
     _has_c0_control_char,
     _mqtt_schema_fields,
+    _panel_cadence_schema_fields,
     _safe_control_redisplay_values,
+    _validated_bounded_integer,
     _validated_control_input,
     control_char_errors,
 )
@@ -113,6 +117,7 @@ class LegacyPanelReconfigureFlow(_Base):
         *,
         control_values: dict[str, Any] | None = None,
         desired_components: dict[str, bool] | None = None,
+        remove_keys: frozenset[str] = frozenset(),
     ) -> tuple[dict[str, str], ConfigFlowResult | None]:
         """Push the merged config to the panel, then persist one section's edits.
 
@@ -123,6 +128,8 @@ class LegacyPanelReconfigureFlow(_Base):
         """
         data = entry.data
         merged: dict[str, Any] = {**data, **updates, **(control_values or {})}
+        for key in remove_keys:
+            merged.pop(key, None)
         host = str(merged[CONF_HOST])
         password = str(merged[CONF_ROOT_PASSWORD])
         panel = str(data[CONF_PANEL])
@@ -144,6 +151,8 @@ class LegacyPanelReconfigureFlow(_Base):
             mqtt_username=str(merged[CONF_MQTT_USERNAME]),
             mqtt_password=str(merged[CONF_MQTT_PASSWORD]),
             scene_bridge_enabled=bool(merged.get(CONF_HA_CONTROL_ENABLED, False)),
+            hot_poll_seconds=merged.get(CONF_HOT_POLL_SECONDS),
+            resync_seconds=merged.get(CONF_RESYNC_SECONDS),
         )
         try:
             host_key = await gateway._apply_config(
@@ -170,6 +179,8 @@ class LegacyPanelReconfigureFlow(_Base):
             return {"base": "cannot_apply"}, None
 
         new_data: dict[str, Any] = {**data, **updates, DATA_SSH_HOST_KEY: host_key}
+        for key in remove_keys:
+            new_data.pop(key, None)
         if desired_components is not None:
             current: dict[str, Any] = dict(data.get(CONF_COMPONENTS) or {})
             new_data[CONF_COMPONENTS] = desired_components
@@ -393,12 +404,36 @@ class LegacyPanelReconfigureFlow(_Base):
             return self.async_abort(reason="reconfigure_not_supported")
         errors: dict[str, str] = {}
         if user_input is not None:
-            errors, result = await self._async_apply_legacy_section(
-                entry,
-                {CONF_MESH_PRIORITY: int(user_input[CONF_MESH_PRIORITY])},
-            )
-            if result is not None:
-                return result
+            updates = {CONF_MESH_PRIORITY: int(user_input[CONF_MESH_PRIORITY])}
+            for key, minimum, maximum in (
+                (CONF_HOT_POLL_SECONDS, 0, 60),
+                (CONF_RESYNC_SECONDS, 60, 86400),
+            ):
+                if key not in user_input:
+                    continue
+                value = _validated_bounded_integer(
+                    user_input[key],
+                    minimum=minimum,
+                    maximum=maximum,
+                )
+                if value is None:
+                    # Cadence-specific key: the shared invalid_value copy talks
+                    # about control characters — misleading for a range error.
+                    errors[key] = "invalid_cadence"
+                else:
+                    updates[key] = value
+            if not errors:
+                errors, result = await self._async_apply_legacy_section(
+                    entry,
+                    updates,
+                    remove_keys=frozenset(
+                        key
+                        for key in (CONF_HOT_POLL_SECONDS, CONF_RESYNC_SECONDS)
+                        if key not in user_input
+                    ),
+                )
+                if result is not None:
+                    return result
         return self._legacy_section_form(
             "reconfigure_advanced",
             {
@@ -406,6 +441,7 @@ class LegacyPanelReconfigureFlow(_Base):
                     CONF_MESH_PRIORITY,
                     default=entry.data.get(CONF_MESH_PRIORITY, 0),
                 ): vol.All(vol.Coerce(int), vol.Range(min=0, max=99)),
+                **_panel_cadence_schema_fields(entry.data),
             },
             errors,
             user_input,

@@ -25,6 +25,7 @@ from .const import (
     COMPONENT_WIFI_WATCHDOG,
     CONF_COMPONENTS,
     CONF_HA_CONTROL_ENABLED,
+    CONF_HOT_POLL_SECONDS,
     CONF_HUE_CA_CERT,
     CONF_MESH_PRIORITY,
     CONF_MQTT_HOST,
@@ -34,6 +35,7 @@ from .const import (
     CONF_MQTT_TLS_ENABLED,
     CONF_MQTT_USERNAME,
     CONF_PANEL,
+    CONF_RESYNC_SECONDS,
     CONF_VOICE_HA_HOST,
     CONF_VOICE_WAKE_WORD,
     DEFAULT_HA_CONTROL_ENABLED,
@@ -104,6 +106,8 @@ async def _bridge_install(hass: HomeAssistant, shell: PanelShell, data: Mapping[
         scene_bridge_enabled=data.get(CONF_HA_CONTROL_ENABLED, DEFAULT_HA_CONTROL_ENABLED) is True,
         mqtt_tls_enabled=mqtt_tls_enabled,
         mqtt_tls_ca_file=mqtt_tls_ca_file,
+        hot_poll_seconds=data.get(CONF_HOT_POLL_SECONDS),
+        resync_seconds=data.get(CONF_RESYNC_SECONDS),
     )
     await panel_ops.async_assert_no_mqtt_tls_downgrade(shell, env)
     await panel_ops.deploy_payload(shell, str(payload_dir), version)

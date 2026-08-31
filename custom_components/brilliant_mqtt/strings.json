@@ -70,7 +70,7 @@
           "reconfigure_mqtt": "MQTT broker",
           "reconfigure_components": "Components and features",
           "reconfigure_ha_control": "Home Assistant control and scenes",
-          "reconfigure_advanced": "Advanced (mesh priority)"
+          "reconfigure_advanced": "Advanced (mesh priority and agent cadence)"
         }
       },
       "reconfigure_connection": {
@@ -143,12 +143,16 @@
       },
       "reconfigure_advanced": {
         "title": "Advanced",
-        "description": "Change this panel's mesh leader-election priority. The new value is pushed to the panel over SSH.",
+        "description": "Change this panel's mesh leader-election priority and optional agent cadences. The new values are pushed to the panel over SSH.",
         "data": {
-          "mesh_priority": "Mesh priority"
+          "mesh_priority": "Mesh priority",
+          "hot_poll_seconds": "Hot-poll interval (seconds)",
+          "resync_seconds": "Full resync interval (seconds)"
         },
         "data_description": {
-          "mesh_priority": "Lower numbers win the BLE-mesh leader election. Each panel needs a unique priority."
+          "mesh_priority": "Lower numbers win the BLE-mesh leader election. Each panel needs a unique priority.",
+          "hot_poll_seconds": "Optional agent state-poll cadence from 0 to 60 seconds. Use 0 to disable polling; leave blank to use the agent default.",
+          "resync_seconds": "Optional full discovery and state resync cadence from 60 to 86400 seconds. Leave blank to use the agent default."
         }
       }
     },
@@ -186,7 +190,8 @@
       "cannot_install": "Connected, but installing the agent on the panel failed. Check the panel and try again.",
       "cannot_install_voice": "The bridge agent installed, but installing the voice satellite failed (its payload may not be downloadable yet, or the panel rejected it). Untick \"Enable voice satellite\" to finish without it, or try again.",
       "wrong_panel": "That host already runs a different Brilliant panel's agent. Check the IP — applying here would overwrite and restart the wrong panel.",
-      "host_key_changed": "The panel's SSH host key changed. For a fleet panel, verify the physical replacement and use Replace physical panel for an explicit identity rebind. For a legacy entry, remove and re-add the verified panel to re-pin it. If the change is unexpected, do not continue; check the address and network for impersonation."
+      "host_key_changed": "The panel's SSH host key changed. For a fleet panel, verify the physical replacement and use Replace physical panel for an explicit identity rebind. For a legacy entry, remove and re-add the verified panel to re-pin it. If the change is unexpected, do not continue; check the address and network for impersonation.",
+      "invalid_cadence": "Enter a whole number of seconds within the documented range."
     },
     "abort": {
       "already_configured": "A Brilliant MQTT fleet is already configured.",
@@ -238,7 +243,7 @@
             "address": "Change network address",
             "repair_credentials": "Repair SSH credentials",
             "components": "Manage installed components",
-            "overrides": "Edit feature overrides",
+            "overrides": "Edit feature overrides & advanced settings",
             "rebind": "Replace physical panel"
           }
         },
@@ -277,17 +282,21 @@
           "description": "Component switches and selectors live with this panel's Home Assistant device so their state and failures remain observable."
         },
         "overrides": {
-          "title": "Edit panel feature overrides",
-          "description": "Set supported voice and certificate values before enabling their component. For an active Voice satellite, change the wake word with its selector; disable Voice or Hue CA recovery before changing another value, then enable it again. Fleet repair behavior and pinned identity are not changed.",
+          "title": "Edit panel feature overrides & advanced settings",
+          "description": "Set supported voice and certificate feature overrides plus the top-level hot-poll and full resync cadence settings for this panel. For an active Voice satellite, change the wake word with its selector; disable Voice or Hue CA recovery before changing another value, then enable it again. Fleet repair behavior and pinned identity are not changed.",
           "data": {
             "voice_wake_word": "Wake word",
             "voice_ha_host": "Home Assistant host override",
-            "hue_ca_cert": "diyHue CA certificate"
+            "hue_ca_cert": "diyHue CA certificate",
+            "hot_poll_seconds": "Hot-poll interval (seconds)",
+            "resync_seconds": "Full resync interval (seconds)"
           },
           "data_description": {
             "voice_wake_word": "Wake word used on the next Voice satellite install. If Voice is active, use the panel's Wake word selector instead.",
             "voice_ha_host": "Optional hostname=IP mapping for a panel that cannot resolve the Home Assistant hostname. Disable Voice before changing this active value; leave blank to use panel DNS.",
-            "hue_ca_cert": "Optional public PEM certificate chain for diyHue CA recovery. Disable Hue CA recovery before changing its active certificate. Never paste a private key."
+            "hue_ca_cert": "Optional public PEM certificate chain for diyHue CA recovery. Disable Hue CA recovery before changing its active certificate. Never paste a private key.",
+            "hot_poll_seconds": "Optional agent state-poll cadence from 0 to 60 seconds. Use 0 to disable polling; leave blank to use the agent default.",
+            "resync_seconds": "Optional full discovery and state resync cadence from 60 to 86400 seconds. Leave blank to use the agent default."
           }
         },
         "rebind": {
@@ -382,7 +391,8 @@
         "rollback_failed": "Automatic rollback did not finish. Follow the provisioning recovery instructions before retrying.",
         "recovery_failed": "A prior provisioning transaction could not be recovered automatically.",
         "transaction_in_progress": "Another panel provisioning transaction is still being recovered.",
-        "provisioning_failed": "Panel provisioning failed. Review the integration logs and recovery instructions before retrying."
+        "provisioning_failed": "Panel provisioning failed. Review the integration logs and recovery instructions before retrying.",
+        "invalid_cadence": "Enter a whole number of seconds within the documented range."
       },
       "abort": {
         "already_configured": "Panel `{panel_name}` is already configured.",

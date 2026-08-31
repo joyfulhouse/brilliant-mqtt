@@ -176,6 +176,52 @@ def test_render_env_matches_agent_config_contract() -> None:
     ]
 
 
+def test_render_env_emits_optional_agent_cadence_overrides() -> None:
+    env = panel_ops.render_env(
+        panel="office",
+        mesh_priority=1,
+        mqtt_host="192.168.1.250",
+        mqtt_port=1883,
+        mqtt_username="brilliant",
+        mqtt_password="secret",
+        hot_poll_seconds=5,
+        resync_seconds=900,
+    )
+
+    parsed = panel_ops.parse_env(env)
+    assert parsed["HOT_POLL_SECONDS"] == "5"
+    assert parsed["RESYNC_SECONDS"] == "900"
+
+
+@pytest.mark.parametrize(
+    ("hot_poll_seconds", "resync_seconds", "error"),
+    (
+        (-1, None, "invalid_hot_poll_seconds"),
+        (61, None, "invalid_hot_poll_seconds"),
+        (True, None, "invalid_hot_poll_seconds"),
+        (None, 59, "invalid_resync_seconds"),
+        (None, 86401, "invalid_resync_seconds"),
+        (None, False, "invalid_resync_seconds"),
+    ),
+)
+def test_render_env_rejects_invalid_agent_cadence_overrides(
+    hot_poll_seconds: int | None,
+    resync_seconds: int | None,
+    error: str,
+) -> None:
+    with pytest.raises(ValueError, match=error):
+        panel_ops.render_env(
+            panel="office",
+            mesh_priority=1,
+            mqtt_host="192.168.1.250",
+            mqtt_port=1883,
+            mqtt_username="brilliant",
+            mqtt_password="secret",
+            hot_poll_seconds=hot_poll_seconds,
+            resync_seconds=resync_seconds,
+        )
+
+
 def test_render_env_custom_tls_uses_only_content_addressed_ca_path() -> None:
     env = panel_ops.render_env(
         panel="office",

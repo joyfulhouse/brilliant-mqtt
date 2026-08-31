@@ -63,6 +63,12 @@ environment.
 | `HOT_POLL_SECONDS` | no | `2.0` seconds | Cadence of the scoped state poll that bounds staleness when bus push notifications die silently. Only changed payloads are published. `0` disables the hot poll. |
 | `BUS_STALE_SECONDS` | no | `900` (15 min) | Rebuild the bus session when no push has arrived for this many seconds (half-dead stream watchdog). `0` disables. |
 
+Home Assistant-managed panels can persist integer `HOT_POLL_SECONDS` overrides
+from `0` to `60` and `RESYNC_SECONDS` overrides from `60` to `86400` in the
+panel's advanced settings. Provisioning, repair, and update render those values
+back into the panel environment. Leaving either setting blank omits its line so
+the agent's own default remains authoritative.
+
 ### Reconnect-storm breaker
 
 | Variable | Required | Default | Meaning |

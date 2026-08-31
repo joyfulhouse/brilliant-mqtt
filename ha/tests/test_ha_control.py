@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from datetime import timedelta
 from types import MappingProxyType
 from typing import Any
@@ -69,7 +69,7 @@ from custom_components.brilliant_mqtt.const import (
 )
 from custom_components.brilliant_mqtt.entry_data import EntryDataError
 from custom_components.brilliant_mqtt.ha_control import get_control_plane
-from custom_components.brilliant_mqtt.ha_control_manifest import build_manifest
+from custom_components.brilliant_mqtt.ha_control_manifest import ManifestEntity, build_manifest
 from custom_components.brilliant_mqtt.ha_control_protocol import (
     MAPPING_VERSION,
     SCHEMA_VERSION,
@@ -94,6 +94,21 @@ COMMAND_CASES: tuple[tuple[str, object, str, str, dict[str, int]], ...] = (
 )
 
 ALL_DOMAINS = ("light", "switch", "lock", "cover")
+
+
+class _CountingEntities(tuple[ManifestEntity, ...]):
+    """Manifest tuple shim exposing accidental event-time iteration."""
+
+    iterations: int
+
+    def __new__(cls, entities: tuple[ManifestEntity, ...]) -> _CountingEntities:
+        instance = super().__new__(cls, entities)
+        instance.iterations = 0
+        return instance
+
+    def __iter__(self) -> Iterator[ManifestEntity]:
+        self.iterations += 1
+        return super().__iter__()
 
 
 def _entry(
@@ -573,6 +588,28 @@ async def test_state_changes_publish_immediately_with_monotonic_sequence(
     assert calls[0].args[3] is True
     assert _payload(calls[0])["sequence"] == 2
     assert _published(mqtt_mock, manifest_topic()) == []
+    await plane.async_detach(entry.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_unrelated_state_change_does_not_iterate_manifest(
+    hass: HomeAssistant, mqtt_mock: MqttMockHAClient
+) -> None:
+    _selected_entity(hass, "switch.office")
+    plane = get_control_plane(hass)
+    entry = _entry(hass, "office")
+    await plane.async_attach(entry)
+    manifest = plane._manifest
+    assert manifest is not None
+    counting_entities = _CountingEntities(manifest.entities)
+    object.__setattr__(manifest, "entities", counting_entities)
+    mqtt_mock.async_publish.reset_mock()
+
+    hass.states.async_set("sensor.not_in_brilliant_manifest", "on")
+    await hass.async_block_till_done()
+
+    assert counting_entities.iterations == 0
+    assert mqtt_mock.async_publish.call_count == 0
     await plane.async_detach(entry.entry_id)
 
 
