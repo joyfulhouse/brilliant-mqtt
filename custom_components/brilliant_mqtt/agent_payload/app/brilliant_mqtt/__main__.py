@@ -254,9 +254,18 @@ async def _run_session(
             # bridge's diff cache keeps unchanged payloads off MQTT.
             if settings.hot_poll_seconds > 0:
                 try:
-                    await panel_bridge.poll_once()
+                    try:
+                        devices = await bus.get_all(
+                            include_extras=participating and leader.is_leader
+                        )
+                    except (TimeoutError, asyncio.TimeoutError) as error:
+                        # Type only the shared scoped read. Neither bridge sees
+                        # this tick unless the complete snapshot is available.
+                        raise HotPollReadTimeout("hot poll bus read timed out") from error
+                    _beat()
+                    await panel_bridge.poll_once(devices)
                     if participating and leader.is_leader:
-                        await mesh_bridge.poll_once()
+                        await mesh_bridge.poll_once(devices)
                 except HotPollReadTimeout:
                     if consecutive_hot_poll_timeouts >= 1:
                         raise

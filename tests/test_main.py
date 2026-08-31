@@ -345,6 +345,10 @@ class _SessionBus:
     def __init__(self, events: list[str]) -> None:
         self.events = events
         self.reconnect_callback: Callable[[], Awaitable[None]] | None = None
+        self.snapshot = [_panel_dimmer(), _mesh_dimmer()]
+        self.get_all_calls: list[bool] = []
+        self.get_all_effects: list[BaseException | None] = []
+        self.get_device_calls: list[str] = []
 
     def on_reconnect(self, callback: Callable[[], Awaitable[None]]) -> None:
         self.events.append("bus_reconnect_callback")
@@ -355,6 +359,18 @@ class _SessionBus:
 
     async def shutdown(self) -> None:
         self.events.append("bus_shutdown")
+
+    async def get_all(self, *, include_extras: bool = True) -> list[BrilliantDevice]:
+        self.events.append("bus_get_all")
+        self.get_all_calls.append(include_extras)
+        self.get_device_calls.append("own-device")
+        if include_extras:
+            self.get_device_calls.append("ble_mesh")
+        if self.get_all_effects:
+            effect = self.get_all_effects.pop(0)
+            if effect is not None:
+                raise effect
+        return self.snapshot
 
     def seconds_since_last_push(self) -> float | None:
         return None
@@ -405,16 +421,23 @@ class _SessionHarness:
         scene_shutdown_error: RuntimeError | None = None,
         bridge_reconcile_error: Exception | None = None,
         bridge_poll_effects: dict[str, list[BaseException | None]] | None = None,
+        bus_get_all_effects: list[BaseException | None] | None = None,
+        leader_is_leader: bool = True,
     ) -> None:
         self.events: list[str] = []
         self.ready = asyncio.Event()
         self.bus = _SessionBus(self.events)
+        self.bus.get_all_effects = list(bus_get_all_effects or ())
         self.mqtt = _SessionMqtt(self.events)
         self.scene_start_error = scene_start_error
         self.scene_shutdown_error = scene_shutdown_error
         self.bridge_reconcile_error = bridge_reconcile_error
         self.bridge_poll_effects = {
             scope: list(effects) for scope, effects in (bridge_poll_effects or {}).items()
+        }
+        self.poll_snapshots: dict[str, list[list[BrilliantDevice] | None]] = {
+            "panel": [],
+            "mesh": [],
         }
         self.scene_instances: list[object] = []
         self.scene_bus: object | None = None
@@ -438,8 +461,9 @@ class _SessionHarness:
                 if self._scope == "panel":
                     harness.ready.set()
 
-            async def poll_once(self) -> None:
+            async def poll_once(self, devices: list[BrilliantDevice] | None = None) -> None:
                 harness.events.append(f"{self._scope}_poll")
+                harness.poll_snapshots[self._scope].append(devices)
                 effects = harness.bridge_poll_effects.get(self._scope)
                 if effects:
                     effect = effects.pop(0)
@@ -452,7 +476,7 @@ class _SessionHarness:
         class SessionLeader:
             def __init__(self, *args: object, **kwargs: object) -> None:
                 del args, kwargs
-                self.is_leader = True
+                self.is_leader = leader_is_leader
 
             async def start(self) -> None:
                 harness.events.append("leader_start")
@@ -519,6 +543,100 @@ def _hot_poll_settings(*, mesh: bool = False, resync_seconds: int = 3_600) -> Se
     object.__setattr__(settings, "resync_seconds", resync_seconds)
     object.__setattr__(settings, "mesh_priority", 1 if mesh else 0)
     return settings
+
+
+class TestSharedHotPollSnapshot:
+    async def test_leader_tick_reads_beats_once_and_shares_snapshot(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        harness = _SessionHarness(
+            monkeypatch,
+            bridge_poll_effects={"mesh": [asyncio.CancelledError()]},
+        )
+        beats: list[str] = []
+        monkeypatch.setattr(
+            main_mod,
+            "write_heartbeat",
+            lambda path, clock: beats.append(path),
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await main_mod._run_session(_hot_poll_settings(mesh=True), None, None)
+
+        assert harness.bus.get_all_calls == [True]
+        assert harness.poll_snapshots == {
+            "panel": [harness.bus.snapshot],
+            "mesh": [harness.bus.snapshot],
+        }
+        assert harness.poll_snapshots["panel"][0] is harness.poll_snapshots["mesh"][0]
+        assert harness.bus.get_device_calls.count("ble_mesh") == 1
+        assert len(beats) == 1
+
+    async def test_standby_tick_never_reads_ble_mesh(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        harness = _SessionHarness(
+            monkeypatch,
+            bridge_poll_effects={"panel": [asyncio.CancelledError()]},
+            leader_is_leader=False,
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await main_mod._run_session(_hot_poll_settings(mesh=True), None, None)
+
+        assert harness.bus.get_all_calls == [False]
+        assert harness.bus.get_device_calls.count("ble_mesh") == 0
+
+    @pytest.mark.parametrize(
+        "timeout_error",
+        # Python 3.10: asyncio.TimeoutError is a DISTINCT class from the
+        # builtin (unified only in 3.11) — the shared-read boundary must
+        # catch both.
+        [TimeoutError("first"), asyncio.TimeoutError()],
+        ids=["builtin", "asyncio"],
+    )
+    async def test_shared_read_timeout_retries_without_half_applying(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        timeout_error: BaseException,
+    ) -> None:
+        harness = _SessionHarness(
+            monkeypatch,
+            bus_get_all_effects=[timeout_error, asyncio.CancelledError()],
+        )
+        beats: list[str] = []
+        monkeypatch.setattr(
+            main_mod,
+            "write_heartbeat",
+            lambda path, clock: beats.append(path),
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await main_mod._run_session(_hot_poll_settings(mesh=True), None, None)
+
+        assert harness.bus.get_all_calls == [True, True]
+        assert harness.poll_snapshots == {"panel": [], "mesh": []}
+        assert beats == []
+
+    async def test_second_shared_read_timeout_rebuilds_without_half_applying(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        first = TimeoutError("first")
+        second = TimeoutError("second")
+        harness = _SessionHarness(
+            monkeypatch,
+            bus_get_all_effects=[first, second],
+        )
+
+        with pytest.raises(HotPollReadTimeout) as raised:
+            await main_mod._run_session(_hot_poll_settings(mesh=True), None, None)
+
+        assert raised.value.__cause__ is second
+        assert harness.bus.get_all_calls == [True, True]
+        assert harness.poll_snapshots == {"panel": [], "mesh": []}
 
 
 class TestHotPollReadTimeoutPolicy:

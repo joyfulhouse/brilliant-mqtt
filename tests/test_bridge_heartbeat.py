@@ -162,6 +162,18 @@ async def test_poll_beats() -> None:
 
 
 @pytest.mark.asyncio
+async def test_prefetched_poll_does_not_read_or_beat() -> None:
+    beats: list[int] = []
+    mqtt = FakeMqtt()
+    b = Bridge(_RaisingBus([]), mqtt, "mesh", heartbeat=lambda: beats.append(1))
+
+    await b.poll_once([_light()])
+
+    assert beats == []
+    assert mqtt.published
+
+
+@pytest.mark.asyncio
 async def test_no_heartbeat_is_noop() -> None:
     b = Bridge(FakeBus([_light()]), FakeMqtt(), "mesh")  # heartbeat=None
     await b.reconcile()

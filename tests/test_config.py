@@ -54,6 +54,21 @@ class TestSettings:
         assert s.log_level == "INFO"
         assert s.deployment_id is None
 
+    @pytest.mark.parametrize("raw", ["0", "-1"])
+    def test_resync_seconds_must_be_positive(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        raw: str,
+    ) -> None:
+        monkeypatch.setenv("BRILLIANT_PANEL", "office")
+        monkeypatch.setenv("MQTT_HOST", "10.0.0.1")
+        monkeypatch.setenv("MQTT_USERNAME", "brilliant")
+        monkeypatch.setenv("MQTT_PASSWORD", "s3cr3t")
+        monkeypatch.setenv("RESYNC_SECONDS", raw)
+
+        with pytest.raises(ValueError, match="RESYNC_SECONDS must be > 0"):
+            Settings.from_env()
+
     @pytest.mark.parametrize(
         "deployment_id",
         [

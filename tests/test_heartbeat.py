@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from brilliant_mqtt.heartbeat import write_heartbeat
+from tests.fakes import FakeClock
 
 
 def test_writes_epoch_and_creates_parent(tmp_path: Path) -> None:
@@ -17,9 +18,26 @@ def test_writes_epoch_and_creates_parent(tmp_path: Path) -> None:
 
 def test_overwrites(tmp_path: Path) -> None:
     p = tmp_path / "hb"
-    write_heartbeat(str(p), lambda: 1.0)
-    write_heartbeat(str(p), lambda: 2.0)
+    monotonic = FakeClock()
+    write_heartbeat(str(p), lambda: 1.0, monotonic)
+    monotonic.advance(10.0)
+    write_heartbeat(str(p), lambda: 2.0, monotonic)
     assert p.read_text().strip() == "2.0"
+
+
+def test_rate_limits_writes_to_once_per_ten_seconds(tmp_path: Path) -> None:
+    p = tmp_path / "hb"
+    monotonic = FakeClock()
+
+    write_heartbeat(str(p), lambda: 1.0, monotonic)
+    write_heartbeat(str(p), lambda: 2.0, monotonic)
+    monotonic.advance(9.999)
+    write_heartbeat(str(p), lambda: 3.0, monotonic)
+    assert p.read_text().strip() == "1.0"
+
+    monotonic.advance(0.001)
+    write_heartbeat(str(p), lambda: 4.0, monotonic)
+    assert p.read_text().strip() == "4.0"
 
 
 def test_empty_path_is_noop(tmp_path: Path) -> None:
