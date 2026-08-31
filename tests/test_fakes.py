@@ -35,11 +35,12 @@ class TestFakeBusFanout:
             seen_b.append(device.peripheral_id)
 
         bus.on_change(cb_a)
-        bus.on_change(cb_b)
+        bus.on_change(cb_b, coalesce_pushes=False)
         await bus.emit(_mesh_switch())
 
         assert seen_a == ["mesh_switch_1"]
         assert seen_b == ["mesh_switch_1"]
+        assert bus.change_callback_modes == [True, False]
 
     async def test_reconnect_reaches_all_registered_callbacks(self) -> None:
         bus = FakeBus([])

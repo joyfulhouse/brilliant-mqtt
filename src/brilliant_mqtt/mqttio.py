@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import ssl
+from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
@@ -21,11 +22,20 @@ import aiomqtt
 
 from brilliant_mqtt.config import Settings
 from brilliant_mqtt.discovery import availability_topic
+from brilliant_mqtt.mapping import AUX_SPECS
 
 logger = logging.getLogger(__name__)
 
 _DISCONNECT_ERROR = "MQTT disconnect failed"
 _LIFECYCLE_ERROR = "MQTT adapter cannot be reused"
+_TOPIC_QUEUE_MAXSIZE = 8
+_SHUTDOWN_DRAIN_DEADLINE_S = 5.0
+# Post-cancel settlement bound: workers SHOULD exit promptly on cancel, but a
+# callback that swallows CancelledError must not wedge disconnect (finding 4).
+_SHUTDOWN_WORKER_SETTLE_S = 1.0
+_NUMBER_AUX_VARS = frozenset(
+    spec.var for specs in AUX_SPECS.values() for spec in specs if spec.component == "number"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,6 +44,184 @@ class MqttPayloadDecodeError:
 
     topic: str
     retained: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _InboundMessage:
+    topic: str
+    payload: str
+    retained: bool
+    command_cbs: tuple[Callable[[str, str], Awaitable[None]], ...]
+    message_cbs: tuple[Callable[[str, str, bool], Awaitable[None]], ...]
+
+
+class _LaneQueue:
+    """Bounded FIFO with filtered latest-wins replacement by exact topic."""
+
+    def __init__(self, maxsize: int) -> None:
+        self._maxsize = maxsize
+        self._pending: deque[_InboundMessage] = deque()
+        self._condition = asyncio.Condition()
+        self._unfinished_tasks = 0
+        self._finished = asyncio.Event()
+        self._finished.set()
+
+    @property
+    def unfinished_tasks(self) -> int:
+        return self._unfinished_tasks
+
+    async def put(self, message: _InboundMessage, *, latest_wins: bool) -> None:
+        async with self._condition:
+            if latest_wins:
+                for index, pending in enumerate(self._pending):
+                    if pending.topic == message.topic:
+                        self._pending[index] = message
+                        return
+            await self._condition.wait_for(lambda: len(self._pending) < self._maxsize)
+            self._pending.append(message)
+            self._unfinished_tasks += 1
+            self._finished.clear()
+            self._condition.notify()
+
+    async def get(self) -> _InboundMessage:
+        async with self._condition:
+            await self._condition.wait_for(lambda: bool(self._pending))
+            message = self._pending.popleft()
+            self._condition.notify_all()
+            return message
+
+    def task_done(self) -> None:
+        if self._unfinished_tasks <= 0:
+            raise ValueError("task_done() called too many times")
+        self._unfinished_tasks -= 1
+        if self._unfinished_tasks == 0:
+            self._finished.set()
+
+    async def join(self) -> None:
+        await self._finished.wait()
+
+
+class _TopicDispatcher:
+    """Serialize peripheral commands while retaining cross-lane concurrency."""
+
+    def __init__(
+        self,
+        handler: Callable[[_InboundMessage], Awaitable[None]],
+    ) -> None:
+        self._handler = handler
+        self._queues: dict[str, _LaneQueue] = {}
+        self._workers: dict[str, asyncio.Task[None]] = {}
+        self._closing = False
+        self._shutdown_task: asyncio.Task[None] | None = None
+        # Cancelled workers that outlived the settle bound — held so the
+        # abandoned tasks are not garbage-collected mid-flight.
+        self._abandoned: set[asyncio.Task[None]] = set()
+
+    async def dispatch(self, message: _InboundMessage, *, latest_wins: bool) -> None:
+        """Queue one message, replacing only safely superseded pending work."""
+        if self._closing:
+            return
+        lane = _command_lane_key(message.topic)
+        queue = self._queues.get(lane)
+        if queue is None:
+            queue = _LaneQueue(maxsize=_TOPIC_QUEUE_MAXSIZE)
+            self._queues[lane] = queue
+            self._workers[lane] = asyncio.create_task(
+                self._run_worker(queue),
+                name="brilliant-mqtt-command-lane-worker",
+            )
+        await queue.put(message, latest_wins=latest_wins)
+
+    async def shutdown(self) -> None:
+        """Drain accepted messages, then cancel and forget the idle workers."""
+        self._closing = True
+        if self._shutdown_task is None:
+            self._shutdown_task = asyncio.create_task(
+                self._drain_and_cancel(),
+                name="brilliant-mqtt-topic-shutdown",
+            )
+        cancellation: asyncio.CancelledError | None = None
+        while True:
+            try:
+                await asyncio.shield(self._shutdown_task)
+            except asyncio.CancelledError as error:
+                if self._shutdown_task.cancelled():
+                    raise
+                if cancellation is None:
+                    cancellation = error
+                continue
+            break
+        if cancellation is not None:
+            raise cancellation from None
+
+    async def _drain_and_cancel(self) -> None:
+        try:
+            if self._queues:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*(queue.join() for queue in self._queues.values())),
+                        timeout=_SHUTDOWN_DRAIN_DEADLINE_S,
+                    )
+                except asyncio.TimeoutError:
+                    undrained = sum(queue.unfinished_tasks for queue in self._queues.values())
+                    logger.warning(
+                        "MQTT dispatcher shutdown deadline expired; "
+                        "%d undrained commands were abandoned",
+                        undrained,
+                    )
+        finally:
+            workers = list(self._workers.values())
+            for worker in workers:
+                worker.cancel()
+            if workers:
+                # Cancellation is cooperative: a callback that swallows or
+                # delays CancelledError must not hold session teardown open
+                # forever. asyncio.wait (unlike wait_for) imposes the bound
+                # WITHOUT needing the stragglers to be cancellable — wait_for
+                # would await the uncancellable gather and wedge anyway.
+                _done, pending = await asyncio.wait(workers, timeout=_SHUTDOWN_WORKER_SETTLE_S)
+                if pending:
+                    logger.warning(
+                        "MQTT dispatcher workers did not settle after cancel; abandoning"
+                    )
+                    # Keep strong references until the stragglers finish.
+                    for task in pending:
+                        self._abandoned.add(task)
+                        task.add_done_callback(self._abandoned.discard)
+            self._workers.clear()
+            self._queues.clear()
+
+    async def _run_worker(self, queue: _LaneQueue) -> None:
+        while True:
+            message = await queue.get()
+            try:
+                await self._handler(message)
+            finally:
+                queue.task_done()
+
+
+def _is_latest_wins_topic(topic: str) -> bool:
+    """Whether queued payloads on *topic* may safely supersede each other."""
+    parts = topic.split("/")
+    if len(parts) != 4 or parts[0] != "brilliant" or parts[1] == "ha-control":
+        return False
+    command = parts[3]
+    if command == "set":
+        return True
+    if not command.startswith("set_"):
+        return False
+    return command.removeprefix("set_") in _NUMBER_AUX_VARS
+
+
+def _command_lane_key(topic: str) -> str:
+    """Group primary and auxiliary commands by their target peripheral."""
+    parts = topic.split("/")
+    if len(parts) != 4 or parts[0] != "brilliant":
+        return topic
+    command = parts[3]
+    if command != "set" and not command.startswith("set_"):
+        return topic
+    return "/".join(parts[:3])
 
 
 def build_tls_context(settings: Settings) -> ssl.SSLContext | None:
@@ -78,6 +266,7 @@ class AioMqttAdapter:
         self._payload_decode_error_cbs: list[
             Callable[[MqttPayloadDecodeError], Awaitable[None]]
         ] = []
+        self._topic_dispatcher = _TopicDispatcher(self._dispatch_inbound)
         self._reader_task: asyncio.Task[None] | None = None
         self._avail_topic = availability_topic(settings.panel)
         # A distinct broker ClientID is REQUIRED for any second connection on the
@@ -153,76 +342,104 @@ class AioMqttAdapter:
         """Dispatch inbound messages to every registered command callback.
 
         Guarded so a single malformed message (bad UTF-8) or one failing
-        callback cannot kill the loop OR starve the other callbacks — one bad
-        command must not silence all future commands, and one consumer's bug
-        must not break the others sharing this connection.
+        callback cannot kill the loop OR starve the other callbacks. Valid
+        messages are handed to per-peripheral workers: one slow bus command
+        cannot block another peripheral, while every command for one peripheral
+        retains strict ordering.
         """
-        async for message in self._client.messages:
-            command_cbs = list(self._command_cbs)
-            message_cbs = list(self._message_cbs)
-            payload_decode_error_cbs = list(self._payload_decode_error_cbs)
-            if not command_cbs and not message_cbs and not payload_decode_error_cbs:
-                # No consumer registered yet — drop (reconcile re-subscribes).
-                continue
-            try:
-                topic = str(message.topic)
-            except Exception:
+        dispatcher = self._get_topic_dispatcher()
+        try:
+            async for message in self._client.messages:
+                command_cbs = tuple(self._command_cbs)
+                message_cbs = tuple(self._message_cbs)
+                payload_decode_error_cbs = list(self._payload_decode_error_cbs)
+                if not command_cbs and not message_cbs and not payload_decode_error_cbs:
+                    # No consumer registered yet — drop (reconcile re-subscribes).
+                    continue
+                try:
+                    topic = str(message.topic)
+                except Exception:
+                    if self._redacted_logging:
+                        logger.warning("failed decoding temporary MQTT message; continuing")
+                    else:
+                        logger.exception("failed decoding MQTT message; continuing")
+                    continue
+                try:
+                    payload = _decode_payload(message.payload)
+                except UnicodeDecodeError:
+                    if self._redacted_logging:
+                        logger.warning("failed decoding temporary MQTT message; continuing")
+                    else:
+                        logger.exception("failed decoding MQTT message; continuing")
+                    decode_error = MqttPayloadDecodeError(
+                        topic=topic,
+                        retained=bool(message.retain),
+                    )
+                    for payload_decode_error_cb in payload_decode_error_cbs:
+                        try:
+                            await payload_decode_error_cb(decode_error)
+                        except Exception:
+                            if self._redacted_logging:
+                                logger.warning(
+                                    "temporary MQTT payload decode callback failed; continuing"
+                                )
+                            else:
+                                logger.exception("payload decode callback failed; continuing")
+                    continue
+                except Exception:
+                    # Broad by design: keep the reader alive across any single
+                    # message's decode failure.
+                    if self._redacted_logging:
+                        logger.warning("failed decoding temporary MQTT message; continuing")
+                    else:
+                        logger.exception("failed decoding MQTT message; continuing")
+                    continue
                 if self._redacted_logging:
-                    logger.warning("failed decoding temporary MQTT message; continuing")
+                    logger.debug("temporary MQTT message received (%d bytes)", len(payload))
                 else:
-                    logger.exception("failed decoding MQTT message; continuing")
-                continue
-            try:
-                payload = _decode_payload(message.payload)
-            except UnicodeDecodeError:
-                if self._redacted_logging:
-                    logger.warning("failed decoding temporary MQTT message; continuing")
-                else:
-                    logger.exception("failed decoding MQTT message; continuing")
-                decode_error = MqttPayloadDecodeError(
-                    topic=topic,
-                    retained=bool(message.retain),
+                    logger.debug("mqtt message on %s (%d bytes)", topic, len(payload))
+                # Accepted lossless-FIFO trade-off: a saturated lane
+                # backpressures this one broker reader, delaying every later
+                # topic so bounded lossless pending commands are never dropped.
+                await dispatcher.dispatch(
+                    _InboundMessage(
+                        topic=topic,
+                        payload=payload,
+                        retained=bool(message.retain),
+                        command_cbs=command_cbs,
+                        message_cbs=message_cbs,
+                    ),
+                    latest_wins=_is_latest_wins_topic(topic),
                 )
-                for payload_decode_error_cb in payload_decode_error_cbs:
-                    try:
-                        await payload_decode_error_cb(decode_error)
-                    except Exception:
-                        if self._redacted_logging:
-                            logger.warning(
-                                "temporary MQTT payload decode callback failed; continuing"
-                            )
-                        else:
-                            logger.exception("payload decode callback failed; continuing")
-                continue
+        finally:
+            await dispatcher.shutdown()
+
+    def _get_topic_dispatcher(self) -> _TopicDispatcher:
+        """Return the dispatcher, lazily covering off-panel object doubles."""
+        dispatcher = getattr(self, "_topic_dispatcher", None)
+        if dispatcher is None:
+            dispatcher = _TopicDispatcher(self._dispatch_inbound)
+            self._topic_dispatcher = dispatcher
+        return dispatcher
+
+    async def _dispatch_inbound(self, message: _InboundMessage) -> None:
+        """Invoke every callback for one message inside its topic worker."""
+        for command_cb in message.command_cbs:
+            try:
+                await command_cb(message.topic, message.payload)
             except Exception:
-                # Broad by design: keep the reader alive across any single
-                # message's decode failure.
                 if self._redacted_logging:
-                    logger.warning("failed decoding temporary MQTT message; continuing")
+                    logger.warning("temporary MQTT command callback failed; continuing")
                 else:
-                    logger.exception("failed decoding MQTT message; continuing")
-                continue
-            if self._redacted_logging:
-                logger.debug("temporary MQTT message received (%d bytes)", len(payload))
-            else:
-                logger.debug("mqtt message on %s (%d bytes)", topic, len(payload))
-            for command_cb in command_cbs:
-                try:
-                    await command_cb(topic, payload)
-                except Exception:
-                    # Broad by design — see the docstring.
-                    if self._redacted_logging:
-                        logger.warning("temporary MQTT command callback failed; continuing")
-                    else:
-                        logger.exception("command callback failed; continuing")
-            for message_cb in message_cbs:
-                try:
-                    await message_cb(topic, payload, bool(message.retain))
-                except Exception:
-                    if self._redacted_logging:
-                        logger.warning("temporary MQTT message callback failed; continuing")
-                    else:
-                        logger.exception("message callback failed; continuing")
+                    logger.exception("command callback failed; continuing")
+        for message_cb in message.message_cbs:
+            try:
+                await message_cb(message.topic, message.payload, message.retained)
+            except Exception:
+                if self._redacted_logging:
+                    logger.warning("temporary MQTT message callback failed; continuing")
+                else:
+                    logger.exception("message callback failed; continuing")
 
     async def disconnect(self) -> None:
         """Publish a clean offline LWT, stop the reader, and close the client.
@@ -279,8 +496,16 @@ class AioMqttAdapter:
                 name="brilliant-mqtt-reader-stop",
             )
 
-        # Start raw exit before draining the reader: aiomqtt's message iterator
-        # can depend on the context manager reaching its disconnected state.
+        # Let every accepted command finish before closing MQTT so a bridge
+        # callback can still publish its post-write state echo. Idle workers
+        # are cancelled after their queues drain.
+        try:
+            await self._topic_dispatcher.shutdown()
+        except asyncio.CancelledError as error:
+            cancellation = cancellation or error
+
+        # The reader was cancelled above but may need the raw context manager
+        # to reach its disconnected state before its iterator fully settles.
         exit_task = asyncio.create_task(
             self._attempt_raw_exit(),
             name="brilliant-mqtt-exit",

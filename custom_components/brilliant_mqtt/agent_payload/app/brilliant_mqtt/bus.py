@@ -19,6 +19,7 @@ import logging
 import math
 import secrets
 import time
+from collections import deque
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -33,6 +34,12 @@ _SOCKET_PATH = "/var/run/brilliant/server_socket"
 # connected in <1 s in practice; 10 s is a generous ceiling).
 _CONNECT_TIMEOUT_S = 10.0
 _CONNECT_POLL_S = 0.25
+# Last-resort RPC backstops. Healthy panel calls complete in tens of
+# milliseconds; these only prevent a wedged bus request from holding its
+# caller forever. ``asyncio.wait_for`` preserves the TimeoutError surface that
+# hot-poll callers already handle on the panel's Python 3.10 runtime.
+_READ_DEADLINE_S = 5.0
+_WRITE_DEADLINE_S = 5.0
 
 
 def _session_client_name(base: str) -> str:
@@ -227,7 +234,7 @@ class RpcBusAdapter:
         self._own_device_id: str | None = None
         # Multiple consumers (panel bridge + mesh publisher) may each register
         # a change callback; every change fans out to all of them.
-        self._change_cbs: list[Callable[[BrilliantDevice], Awaitable[None]]] = []
+        self._change_cbs: list[tuple[Callable[[BrilliantDevice], Awaitable[None]], bool]] = []
         self._reconnect_cbs: list[Callable[[], Awaitable[None]]] = []
         # Re-issues this session's subscription; bound as a closure in start()
         # so the reconnect path never needs panel imports of its own.
@@ -238,9 +245,23 @@ class RpcBusAdapter:
         # recent_reconnects() prunes anything outside the queried window so the
         # list stays bounded. Feeds the run loop's reconnect-storm breaker.
         self._reconnect_times: list[float] = []
+        # A cancelled closed-source write may leave its transport unusable.
+        # The session tick consumes this latch and rebuilds the whole session.
+        self._write_timed_out = False
         # Retain fired callback tasks so they are not garbage-collected mid-flight
         # (asyncio holds only weak references to tasks). Done-callback discards.
         self._pending_tasks: set[asyncio.Task[None]] = set()
+        # Coalescing callbacks keep one newest snapshot per raw device. Lossless
+        # callbacks use one callback-wide FIFO so distinct scene/mode executions
+        # retain their arrival order even when several raw devices are involved.
+        self._pending_pushes: dict[
+            tuple[str | None, Callable[[BrilliantDevice], Awaitable[None]]],
+            deque[list[BrilliantDevice]],
+        ] = {}
+        self._push_tasks: dict[
+            tuple[str | None, Callable[[BrilliantDevice], Awaitable[None]]],
+            asyncio.Task[None],
+        ] = {}
 
     async def start(self) -> None:
         """Connect to the bus following the poc-findings §2 recipe."""
@@ -316,11 +337,12 @@ class RpcBusAdapter:
         return self._obs, self._own_device_id
 
     def _dispatch_raw_device(self, raw_device: Any) -> None:
-        """Normalize each peripheral of a changed device and fire ALL callbacks.
+        """Normalize a full changed device and dispatch by callback policy.
 
-        Pushing every peripheral on a device update (rather than diffing) is
-        acceptable: the bridge republishes retained state idempotently, and the
-        periodic resync also covers any gaps (poc-findings §8 / design §5).
+        Every peripheral is normalized on every push because the bus delta
+        metadata is not trusted. A coalescing callback replaces its pending
+        snapshot for this raw device with the newest one; a lossless callback
+        drains every full snapshot in arrival order after any in-flight call.
 
         The device id comes from the RAW device itself (the bus device the
         peripherals actually live on — "ble_mesh" for mesh pushes, the own
@@ -341,14 +363,50 @@ class RpcBusAdapter:
         peripherals = getattr(raw_device, "peripherals", None)
         if not peripherals:
             return
-        for peripheral_id, raw_peripheral in dict(peripherals).items():
-            device = normalize_peripheral(device_id, peripheral_id, raw_peripheral)
-            for cb in cbs:
-                self._spawn(cb(device))
+        devices = [
+            normalize_peripheral(device_id, peripheral_id, raw_peripheral)
+            for peripheral_id, raw_peripheral in dict(peripherals).items()
+        ]
+        for cb, coalesce_pushes in cbs:
+            key = (device_id if coalesce_pushes else None, cb)
+            pending = self._pending_pushes.setdefault(key, deque())
+            if coalesce_pushes:
+                pending.clear()
+            pending.append(devices)
+            if key in self._push_tasks:
+                continue
+            task = asyncio.ensure_future(self._drain_pushes(key, cb))
+            self._push_tasks[key] = task
+            self._track_task(task)
+
+    async def _drain_pushes(
+        self,
+        key: tuple[str | None, Callable[[BrilliantDevice], Awaitable[None]]],
+        cb: Callable[[BrilliantDevice], Awaitable[None]],
+    ) -> None:
+        """Deliver queued whole-device snapshots serially for one callback."""
+        try:
+            while True:
+                pending = self._pending_pushes.get(key)
+                if not pending:
+                    self._pending_pushes.pop(key, None)
+                    return
+                devices = pending.popleft()
+                for device in devices:
+                    try:
+                        await cb(device)
+                    except Exception:
+                        logger.exception("bus change callback failed; continuing")
+        finally:
+            self._push_tasks.pop(key, None)
 
     def _spawn(self, coro: Awaitable[None]) -> None:
         """Schedule *coro* on the running loop, retaining a strong reference."""
         task = asyncio.ensure_future(coro)
+        self._track_task(task)
+
+    def _track_task(self, task: asyncio.Task[None]) -> None:
+        """Retain *task* until completion."""
         self._pending_tasks.add(task)
         task.add_done_callback(self._pending_tasks.discard)
 
@@ -431,7 +489,10 @@ class RpcBusAdapter:
         devices: list[BrilliantDevice] = []
         device_ids = (own_id, *self._extra_device_ids) if include_extras else (own_id,)
         for device_id in device_ids:
-            raw_device = await obs.get_device(device_id)
+            raw_device = await asyncio.wait_for(
+                obs.get_device(device_id),
+                timeout=_READ_DEADLINE_S,
+            )
             if raw_device is None or getattr(raw_device, "peripherals", None) is None:
                 label = "own device" if device_id == own_id else "extra device"
                 logger.warning("%s id=%s not returned by get_device()", label, device_id)
@@ -450,13 +511,24 @@ class RpcBusAdapter:
             return None
         return normalize_peripheral(device_id, peripheral_id, raw)
 
-    def on_change(self, cb: Callable[[BrilliantDevice], Awaitable[None]]) -> None:
+    def on_change(
+        self,
+        cb: Callable[[BrilliantDevice], Awaitable[None]],
+        *,
+        coalesce_pushes: bool = True,
+    ) -> None:
         """Register a change callback fired by :meth:`_dispatch_raw_device`.
 
         May be called more than once: the panel bridge and the mesh publisher
         each consume the same bus stream, so changes fan out to ALL callbacks.
         """
-        self._change_cbs.append(cb)
+        self._change_cbs.append((cb, coalesce_pushes))
+
+    def consume_write_timeout(self) -> bool:
+        """Return and clear the outbound-write timeout latch."""
+        timed_out = self._write_timed_out
+        self._write_timed_out = False
+        return timed_out
 
     async def set_variables(self, device_id: str, peripheral_id: str, sets: list[VarSet]) -> None:
         """Write variables to *peripheral_id* on *device_id* (poc-findings §7).
@@ -466,11 +538,18 @@ class RpcBusAdapter:
         so the caller passes the device id from its snapshot.
         """
         obs, _ = self._require_started()
-        response = await obs.request_set_variables_in_peripheral(
-            peripheral_id,
-            {s.name: s.value for s in sets},
-            device_id=device_id,
-        )
+        try:
+            response = await asyncio.wait_for(
+                obs.request_set_variables_in_peripheral(
+                    peripheral_id,
+                    {s.name: s.value for s in sets},
+                    device_id=device_id,
+                ),
+                timeout=_WRITE_DEADLINE_S,
+            )
+        except asyncio.TimeoutError:
+            self._write_timed_out = True
+            raise
         logger.debug("set_variables(%s/%s) response: %s", device_id, peripheral_id, response)
 
     async def shutdown(self) -> None:

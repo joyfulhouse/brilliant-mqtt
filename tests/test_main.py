@@ -107,6 +107,53 @@ class TestReconnectStormBreaker:
         assert bus.reconnect_window_queried == 42.0
 
 
+class TestReconnectReconcileCoalescing:
+    async def test_burst_runs_one_in_flight_and_exactly_one_trailing_call(self) -> None:
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        calls = 0
+        active = 0
+        max_active = 0
+
+        async def reconcile() -> None:
+            nonlocal calls, active, max_active
+            calls += 1
+            active += 1
+            max_active = max(max_active, active)
+            try:
+                if calls == 1:
+                    first_started.set()
+                    await release_first.wait()
+            finally:
+                active -= 1
+
+        coalesced = main_mod._CoalescingCallback(reconcile)
+        first = asyncio.create_task(coalesced())
+        await asyncio.wait_for(first_started.wait(), timeout=0.1)
+
+        await asyncio.gather(coalesced(), coalesced(), coalesced())
+        assert calls == 1
+        release_first.set()
+        await first
+
+        assert calls == 2
+        assert max_active == 1
+
+    async def test_request_after_idle_starts_a_new_call(self) -> None:
+        calls = 0
+
+        async def reconcile() -> None:
+            nonlocal calls
+            calls += 1
+
+        coalesced = main_mod._CoalescingCallback(reconcile)
+
+        await coalesced()
+        await coalesced()
+
+        assert calls == 2
+
+
 def _data_topics(mqtt: FakeMqtt) -> list[str]:
     """Topics published OTHER than the leadership claim (the gated output)."""
     return [p[0] for p in mqtt.published if p[0] != MESH_LEADER_TOPIC]
@@ -349,6 +396,8 @@ class _SessionBus:
         self.get_all_calls: list[bool] = []
         self.get_all_effects: list[BaseException | None] = []
         self.get_device_calls: list[str] = []
+        self.write_timeout_latched = False
+        self.write_timeout_checks = 0
 
     def on_reconnect(self, callback: Callable[[], Awaitable[None]]) -> None:
         self.events.append("bus_reconnect_callback")
@@ -378,6 +427,12 @@ class _SessionBus:
     def recent_reconnects(self, window_seconds: float) -> int:
         del window_seconds
         return 0
+
+    def consume_write_timeout(self) -> bool:
+        self.write_timeout_checks += 1
+        latched = self.write_timeout_latched
+        self.write_timeout_latched = False
+        return latched
 
 
 class _SessionMqtt:
@@ -637,6 +692,41 @@ class TestSharedHotPollSnapshot:
         assert raised.value.__cause__ is second
         assert harness.bus.get_all_calls == [True, True]
         assert harness.poll_snapshots == {"panel": [], "mesh": []}
+
+
+class TestWriteTimeoutRecovery:
+    async def test_latched_write_timeout_rebuilds_session_on_next_tick(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        harness = _SessionHarness(monkeypatch)
+        harness.bus.write_timeout_latched = True
+
+        with pytest.raises(main_mod.BusWriteStuckError):
+            await asyncio.wait_for(
+                main_mod._run_session(_hot_poll_settings(), None, None),
+                timeout=1,
+            )
+
+        assert harness.bus.write_timeout_checks == 1
+        assert harness.events[-2:] == ["bus_shutdown", "mqtt_disconnect"]
+
+    async def test_session_without_write_timeout_never_trips_breaker(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        harness = _SessionHarness(
+            monkeypatch,
+            bridge_poll_effects={"panel": [asyncio.CancelledError()]},
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(
+                main_mod._run_session(_hot_poll_settings(), None, None),
+                timeout=1,
+            )
+
+        assert harness.bus.write_timeout_checks == 1
 
 
 class TestHotPollReadTimeoutPolicy:
