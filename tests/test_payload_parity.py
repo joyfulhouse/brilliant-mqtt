@@ -26,7 +26,7 @@ PAYLOAD_WORKFLOWS = (
 )
 PAYLOAD_RELATIVE_PATH = Path("custom_components/brilliant_mqtt/agent_payload")
 PAYLOAD_VERSION_FILE = REPOSITORY_ROOT / PAYLOAD_RELATIVE_PATH / "VERSION"
-EXPECTED_PAYLOAD_VERSION = "0.7.0"
+EXPECTED_PAYLOAD_VERSION = "0.8.0"
 RELEASE_SERVICE_TEMPLATES = (
     "brilliant-mqtt-release.service",
     "brilliant-wifi-watchdog-release.service",
