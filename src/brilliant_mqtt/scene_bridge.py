@@ -175,7 +175,10 @@ class SceneBridge:
                 self._startup_active = True
                 self._startup_buffered_execution = None
                 if not self._callbacks_registered:
-                    self._bus.on_change(self._bus_change_callback)
+                    self._bus.on_change(
+                        self._bus_change_callback,
+                        coalesce_pushes=False,
+                    )
                     self._bus.on_reconnect(self._reconnect_callback)
                     self._mqtt.on_message(self._mqtt_message_callback)
                     self._callbacks_registered = True

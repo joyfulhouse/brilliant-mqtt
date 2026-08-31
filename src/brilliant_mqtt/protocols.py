@@ -36,8 +36,17 @@ class BusClient(Protocol):
         """Return one peripheral via a scoped on-demand read, if present."""
         ...
 
-    def on_change(self, cb: Callable[[BrilliantDevice], Awaitable[None]]) -> None:
-        """Register a callback invoked when any peripheral changes."""
+    def on_change(
+        self,
+        cb: Callable[[BrilliantDevice], Awaitable[None]],
+        *,
+        coalesce_pushes: bool = True,
+    ) -> None:
+        """Register a callback invoked when any peripheral changes.
+
+        Coalescing consumers receive the newest pending device snapshot;
+        lossless consumers receive every pushed snapshot in arrival order.
+        """
         ...
 
     def on_reconnect(self, cb: Callable[[], Awaitable[None]]) -> None:
@@ -64,6 +73,10 @@ class BusClient(Protocol):
         invisible to seconds_since_last_push because each reconnect resets the
         push clock — and rebuild the session instead of amplifying the storm.
         """
+        ...
+
+    def consume_write_timeout(self) -> bool:
+        """Return and clear whether an outbound bus write timed out."""
         ...
 
     async def set_variables(self, device_id: str, peripheral_id: str, sets: list[VarSet]) -> None:

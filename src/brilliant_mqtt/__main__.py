@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from brilliant_mqtt import __version__
@@ -53,9 +54,43 @@ class BusStaleError(RuntimeError):
     """No bus push for longer than BUS_STALE_SECONDS — session presumed dead."""
 
 
+class BusWriteStuckError(RuntimeError):
+    """A bus write missed its deadline — rebuild the possibly poisoned session."""
+
+
 class BusReconnectStormError(RuntimeError):
     """Bus reconnected past the rate threshold — session torn down to break the
     self-reinforcing storm (live incident, 2026-06-13)."""
+
+
+class _CoalescingCallback:
+    """Collapse requests received during one callback into one trailing run."""
+
+    def __init__(self, callback: Callable[[], Awaitable[None]]) -> None:
+        self._callback = callback
+        self._running = False
+        self._dirty = False
+
+    async def __call__(self) -> None:
+        if self._running:
+            self._dirty = True
+            return
+        self._running = True
+        first_error: Exception | None = None
+        try:
+            while True:
+                self._dirty = False
+                try:
+                    await self._callback()
+                except Exception as error:
+                    if first_error is None:
+                        first_error = error
+                if not self._dirty:
+                    break
+        finally:
+            self._running = False
+        if first_error is not None:
+            raise first_error
 
 
 def _is_reconnect_storm(bus: BusClient, settings: Settings) -> bool:
@@ -201,14 +236,14 @@ async def _run_session(
             else None
         )
 
-        async def _on_bus_reconnect() -> None:
+        async def _reconcile_after_bus_reconnect() -> None:
             # After a bus reconnect, pushes (and the observer's get_all mirror)
             # may have missed changes — re-reconcile to republish the truth.
             await panel_bridge.reconcile()
             if participating and leader.is_leader:
                 await mesh_bridge.reconcile()
 
-        bus.on_reconnect(_on_bus_reconnect)
+        bus.on_reconnect(_CoalescingCallback(_reconcile_after_bus_reconnect))
 
         await mqtt.connect()
         mqtt_connected = True
@@ -226,6 +261,11 @@ async def _run_session(
         consecutive_hot_poll_timeouts = 0
         while True:
             await asyncio.sleep(tick)
+
+            # wait_for() cancelled a closed-source outbound RPC. Its transport
+            # integrity is unprovable, so rebuild even if pushes remain healthy.
+            if bus.consume_write_timeout():
+                raise BusWriteStuckError("bus write timed out — rebuilding session")
 
             # Stale-stream watchdog: a silently dead notification stream
             # freezes pushes AND get_all (pilot finding 2026-06-12) — only

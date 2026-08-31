@@ -30,6 +30,7 @@ class FakeBus:
         # Multiple consumers (panel bridge + mesh publisher) each register their
         # own change callback on the one shared bus — mirror the adapter's fan-out.
         self._change_cbs: list[Callable[[BrilliantDevice], Awaitable[None]]] = []
+        self.change_callback_modes: list[bool] = []
         self._reconnect_cbs: list[Callable[[], Awaitable[None]]] = []
         # Each entry is (device_id, peripheral_id, [VarSet, ...]): writes are
         # ROUTED to the bus device owning the peripheral (the panel's own
@@ -41,6 +42,7 @@ class FakeBus:
         # is recorded so tests can assert the run loop forwards the config value.
         self.reconnect_count: int = 0
         self.reconnect_window_queried: float | None = None
+        self.write_timeout_latched = False
 
     async def start(self) -> None:
         pass
@@ -55,8 +57,14 @@ class FakeBus:
                 return device
         return None
 
-    def on_change(self, cb: Callable[[BrilliantDevice], Awaitable[None]]) -> None:
+    def on_change(
+        self,
+        cb: Callable[[BrilliantDevice], Awaitable[None]],
+        *,
+        coalesce_pushes: bool = True,
+    ) -> None:
         self._change_cbs.append(cb)
+        self.change_callback_modes.append(coalesce_pushes)
 
     def on_reconnect(self, cb: Callable[[], Awaitable[None]]) -> None:
         self._reconnect_cbs.append(cb)
@@ -67,6 +75,11 @@ class FakeBus:
     def recent_reconnects(self, window_s: float) -> int:
         self.reconnect_window_queried = window_s
         return self.reconnect_count
+
+    def consume_write_timeout(self) -> bool:
+        timed_out = self.write_timeout_latched
+        self.write_timeout_latched = False
+        return timed_out
 
     async def set_variables(self, device_id: str, peripheral_id: str, sets: list[VarSet]) -> None:
         self.commands.append((device_id, peripheral_id, list(sets)))

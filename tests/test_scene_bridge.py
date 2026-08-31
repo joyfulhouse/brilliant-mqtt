@@ -204,6 +204,7 @@ async def test_start_seeds_history_persists_privately_and_publishes_scoped_catal
     assert _published(mqtt, scene_catalog_topic(_PANEL))[-1][2] is True
     assert _published(mqtt, mode_catalog_topic(_PANEL))[-1][2] is True
     assert mqtt.subscriptions == [scene_command_topic(_PANEL), mode_command_topic(_PANEL)]
+    assert bus.change_callback_modes == [False]
 
     await bridge.async_shutdown()
 

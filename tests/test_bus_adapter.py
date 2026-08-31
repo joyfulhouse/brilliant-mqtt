@@ -16,7 +16,11 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
+from brilliant_mqtt import bus as bus_mod
 from brilliant_mqtt.bus import RpcBusAdapter, _session_client_name
+from brilliant_mqtt.commands import VarSet
 from brilliant_mqtt.model import BrilliantDevice
 from tests.fakes import FakeClock
 
@@ -269,10 +273,10 @@ class _RawVariable:
 class _RawPeripheral:
     """Duck-typed stand-in for a bus Peripheral."""
 
-    def __init__(self) -> None:
+    def __init__(self, value: str = "1", variable_name: str = "on") -> None:
         self.name = "Mesh Switch"
         self.peripheral_type = 1
-        self.variables = {"on": _RawVariable("1")}
+        self.variables = {variable_name: _RawVariable(value)}
 
 
 class _RawDevice:
@@ -319,6 +323,77 @@ class TestGetAllScope:
 
         assert observer.calls == ["own-device", "ble_mesh"]
         assert [device.device_id for device in devices] == ["own-device", "ble_mesh"]
+
+
+class _BlockingRpcObserver:
+    def __init__(self) -> None:
+        self.read_cancelled = False
+        self.write_cancelled = False
+
+    async def get_device(self, device_id: str) -> _RawDevice:
+        del device_id
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            self.read_cancelled = True
+            raise
+        raise AssertionError("unreachable")
+
+    async def request_set_variables_in_peripheral(
+        self,
+        peripheral_id: str,
+        values: dict[str, str],
+        *,
+        device_id: str,
+    ) -> None:
+        del peripheral_id, values, device_id
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            self.write_cancelled = True
+            raise
+
+
+class TestRpcDeadlines:
+    def test_defaults_are_five_second_backstops(self) -> None:
+        assert bus_mod._READ_DEADLINE_S == 5.0
+        assert bus_mod._WRITE_DEADLINE_S == 5.0
+
+    async def test_get_all_scoped_read_times_out_and_cancels_rpc(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(bus_mod, "_READ_DEADLINE_S", 0.01)
+        adapter = RpcBusAdapter()
+        observer = _BlockingRpcObserver()
+        adapter._obs = observer
+        adapter._own_device_id = "own-device"
+
+        with pytest.raises((TimeoutError, asyncio.TimeoutError)):
+            await adapter.get_all()
+
+        assert observer.read_cancelled is True
+
+    async def test_set_variables_times_out_and_cancels_rpc(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(bus_mod, "_WRITE_DEADLINE_S", 0.01)
+        adapter = RpcBusAdapter()
+        observer = _BlockingRpcObserver()
+        adapter._obs = observer
+        adapter._own_device_id = "own-device"
+
+        with pytest.raises((TimeoutError, asyncio.TimeoutError)):
+            await adapter.set_variables(
+                "own-device",
+                "gangbox_peripheral_0",
+                [VarSet("on", "1")],
+            )
+
+        assert observer.write_cancelled is True
+        assert adapter.consume_write_timeout() is True
+        assert adapter.consume_write_timeout() is False
 
 
 class TestDispatchFanout:
@@ -378,3 +453,77 @@ class TestDispatchFanout:
         await asyncio.gather(*adapter._pending_tasks)
 
         assert seen == []
+
+
+class TestPushDispatchCoalescing:
+    async def test_callbacks_choose_coalesced_or_lossless_push_delivery(self) -> None:
+        adapter = RpcBusAdapter()
+        coalescing_started = asyncio.Event()
+        scene_started = asyncio.Event()
+        release = asyncio.Event()
+        coalesced: list[str] = []
+        scene_events: list[str] = []
+        variable_name = "execution_state:scene_execution_handler:scene:movie"
+
+        async def coalescing_consumer(device: BrilliantDevice) -> None:
+            value = device.variables[variable_name].value
+            coalesced.append(value)
+            if value == "watermark-1":
+                coalescing_started.set()
+                await release.wait()
+
+        async def scene_consumer(device: BrilliantDevice) -> None:
+            value = device.variables[variable_name].value
+            scene_events.append(value)
+            if value == "watermark-1":
+                scene_started.set()
+                await release.wait()
+
+        adapter.on_change(coalescing_consumer)
+        adapter.on_change(scene_consumer, coalesce_pushes=False)
+
+        def push(watermark: str) -> None:
+            adapter._dispatch_raw_device(
+                _RawDevice(
+                    "configuration_virtual_device",
+                    {"execution_peripheral": _RawPeripheral(watermark, variable_name)},
+                )
+            )
+
+        push("watermark-1")
+        await asyncio.wait_for(coalescing_started.wait(), timeout=0.1)
+        await asyncio.wait_for(scene_started.wait(), timeout=0.1)
+        push("watermark-2")
+        push("watermark-3")
+        release.set()
+        await asyncio.gather(*adapter._pending_tasks)
+
+        assert coalesced == ["watermark-1", "watermark-3"]
+        assert scene_events == ["watermark-1", "watermark-2", "watermark-3"]
+
+    async def test_push_during_callback_keeps_only_one_trailing_snapshot(self) -> None:
+        adapter = RpcBusAdapter()
+        started = asyncio.Event()
+        release = asyncio.Event()
+        seen: list[str] = []
+
+        async def consumer(device: BrilliantDevice) -> None:
+            value = device.variables["on"].value
+            seen.append(value)
+            if value == "1":
+                started.set()
+                await release.wait()
+
+        adapter.on_change(consumer)
+        adapter._dispatch_raw_device(_RawDevice("ble_mesh", {"load": _RawPeripheral("1")}))
+        await asyncio.wait_for(started.wait(), timeout=0.1)
+        task = next(iter(adapter._pending_tasks))
+
+        adapter._dispatch_raw_device(_RawDevice("ble_mesh", {"load": _RawPeripheral("2")}))
+        adapter._dispatch_raw_device(_RawDevice("ble_mesh", {"load": _RawPeripheral("3")}))
+
+        assert adapter._pending_tasks == {task}
+        release.set()
+        await task
+
+        assert seen == ["1", "3"]
