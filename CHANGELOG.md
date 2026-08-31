@@ -7,6 +7,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-08-31
+
+The on-panel agent moves to 0.8.0 — panels need a redeploy (per-panel bridge
+update entity) to pick up the agent-side performance work.
+
+### Added
+
+- **Durable per-panel agent cadence settings.** `HOT_POLL_SECONDS` (0–60) and
+  `RESYNC_SECONDS` (60–86400) can now be set per panel through the config
+  flow's advanced settings (fleet and legacy flows), are validated at every
+  ingress, and are rendered into the panel environment on provision, repair,
+  and update — so operator tuning survives redeploys. Unset means the agent's
+  own defaults apply. (#56)
+
+### Performance
+
+- **Agent hot path:** the main loop reads one shared bus snapshot per tick for
+  both bridges; mesh standbys no longer fetch the ~40 `ble_mesh` peripherals
+  at all and the mesh leader fetches them exactly once; per-tick state
+  projection is computed once and compared before JSON serialization, so an
+  unchanged device costs zero serializations. Heartbeat writes are
+  rate-limited to one per 10 s. Live-measured: the bridge's CPU share fell
+  from ~9.4% to ~1.6% of a core on the pilot panel. (#54)
+- **Command latency and burst robustness:** 5 s deadlines on bus RPCs (a write
+  timeout latches and rebuilds the session — an outbound-poisoned session is
+  invisible to the existing watchdogs); inbound MQTT commands run on
+  per-peripheral lanes so a slow write no longer delays unrelated peripherals,
+  with latest-wins supersession only for stateful topics (scene/HA-control,
+  mesh claims, and buttons stay lossless FIFO); the scene bridge receives
+  every push snapshot in order while state bridges coalesce to the newest;
+  reconnect reconciles coalesce to one in flight plus one trailing run;
+  dispatcher shutdown is double-bounded. (#55)
+- **Integration:** the HA-control state listener looks the manifest up by
+  entity id (O(1) instead of scanning up to 200 entries on every state event
+  in the instance), and availability/problem updates notify listeners once
+  per effective change. (#56)
+
+### Fixed
+
+- **First install on systemd 250 panels (firmware v26.07.15.1).** On that
+  systemd, `systemctl is-enabled <absent-unit>` prints nothing on stdout, so
+  three stdout-parsing probes rejected panels that were merely missing the
+  not-yet-installed units: the toolchain probe (`unsupported_panel_toolchain`),
+  the layout snapshot (`snapshot_failed`), and `_disabled_state_command` —
+  the last reachable on the safety-critical first-install **rollback** path
+  (`rollback_failed`) and on optional-component deselection
+  (`activation_failed`). All three now treat empty output as `not-found`.
+  (#48, #49)
+- **Layout snapshot fails closed on an empty `is-active`.** A broken
+  `systemctl`/D-Bus that returns empty output for a running service aborts
+  the snapshot instead of silently recording the service as inactive —
+  protecting the snapshot that rollback later trusts. (#50)
+- `RESYNC_SECONDS` must now be > 0 (0 would have forced a full retained
+  replay every poll tick), and tampered or out-of-range stored cadence values
+  are rejected at load instead of crashing repair/update. (#54, #56)
+
+### CI
+
+- The Quality Scale bronze check follows the config-flow package split
+  (`flow/*.py`), un-reddening the workflow. (#51)
+- The scene-bridge command-write tests synchronize on the deferred bus write,
+  fixing an intermittent CI-only failure. (#52)
+
 ## [0.7.1] - 2026-08-02
 
 Integration-only patch release — the on-panel agent stays at 0.7.0 and no
