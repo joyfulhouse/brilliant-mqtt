@@ -39,6 +39,8 @@ CONF_HOST = "host"
 CONF_ROOT_PASSWORD = "root_password"
 CONF_PANEL = "panel"
 CONF_MESH_PRIORITY = "mesh_priority"
+CONF_HOT_POLL_SECONDS = "hot_poll_seconds"
+CONF_RESYNC_SECONDS = "resync_seconds"
 # Broker credentials written into the panel's env file (PANEL_ENV_FILE) over SSH at
 # deploy/repair — the integration itself talks to MQTT only via HA's mqtt integration
 # (see manifest dependencies).

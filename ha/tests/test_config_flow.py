@@ -41,6 +41,7 @@ from custom_components.brilliant_mqtt.const import (
     CONF_HA_CONTROL_ENABLED,
     CONF_HA_CONTROL_LABEL,
     CONF_HOST,
+    CONF_HOT_POLL_SECONDS,
     CONF_HUE_CA_CERT,
     CONF_IDENTITY_FINGERPRINT,
     CONF_MANAGEMENT_ID,
@@ -55,6 +56,7 @@ from custom_components.brilliant_mqtt.const import (
     CONF_NEXT_MESH_PRIORITY,
     CONF_PANEL,
     CONF_PROVISIONING_TRANSACTION_ID,
+    CONF_RESYNC_SECONDS,
     CONF_ROOM_OVERRIDES,
     CONF_ROOT_PASSWORD,
     CONF_SCENE_ACTIONS,
@@ -83,6 +85,7 @@ from custom_components.brilliant_mqtt.const import (
 from custom_components.brilliant_mqtt.entry_data import (
     EntryDataError,
     FleetConfig,
+    FleetPanelStore,
     PanelConfig,
 )
 from custom_components.brilliant_mqtt.errors import OperationError, OperationStage
@@ -94,6 +97,7 @@ from custom_components.brilliant_mqtt.flow.schemas import (
     BROKER_MENU_OPTIONS,
     SECRET_UNCHANGED,
 )
+from custom_components.brilliant_mqtt.manager import PanelManager
 from custom_components.brilliant_mqtt.panel_health import PanelHealthEvidence
 from custom_components.brilliant_mqtt.panel_inspection import (
     PanelCompatibilityError,
@@ -203,6 +207,16 @@ def _panel_data(
                 },
                 CONF_FEATURE_OVERRIDES: {},
                 CONF_MESH_PRIORITY: request.mesh_priority,
+                **(
+                    {CONF_HOT_POLL_SECONDS: request.hot_poll_seconds}
+                    if request.hot_poll_seconds is not None
+                    else {}
+                ),
+                **(
+                    {CONF_RESYNC_SECONDS: request.resync_seconds}
+                    if request.resync_seconds is not None
+                    else {}
+                ),
                 CONF_PROVISIONING_TRANSACTION_ID: str(_TRANSACTION_ID),
             }
         )
@@ -424,6 +438,8 @@ def _subentry(
     priority: int = 1,
     subentry_id: str = "panel-office",
     management_id: str | None = None,
+    hot_poll_seconds: int | None = None,
+    resync_seconds: int | None = None,
 ) -> ConfigSubentry:
     return ConfigSubentry(
         data=MappingProxyType(
@@ -443,6 +459,12 @@ def _subentry(
                 },
                 CONF_FEATURE_OVERRIDES: {},
                 CONF_MESH_PRIORITY: priority,
+                **(
+                    {CONF_HOT_POLL_SECONDS: hot_poll_seconds}
+                    if hot_poll_seconds is not None
+                    else {}
+                ),
+                **({CONF_RESYNC_SECONDS: resync_seconds} if resync_seconds is not None else {}),
             }
         ),
         subentry_type=SUBENTRY_TYPE_PANEL,
@@ -1406,6 +1428,60 @@ def test_canonical_handoff_rejects_component_or_override_mismatch(
         panel_data=CanonicalPanelData(MappingProxyType(mismatched_data)),
     )
 
+    assert not flow_support._provisioned_matches_request(
+        mismatched,
+        request,
+        identity,
+    )
+
+
+@pytest.mark.parametrize(
+    "panel_override",
+    (
+        {CONF_HOT_POLL_SECONDS: 6},
+        {CONF_RESYNC_SECONDS: 901},
+    ),
+    ids=("hot-poll", "resync"),
+)
+def test_canonical_handoff_requires_exact_agent_cadences(
+    panel_override: dict[str, object],
+) -> None:
+    identity = _identity()
+    request = PanelInstallRequest(
+        host="office.iot.example",
+        ssh_username="root",
+        root_password=_ROOT_PASSWORD,
+        display_name="Office",
+        slug="office",
+        mesh_priority=1,
+        selected_components=(
+            COMPONENT_BRIDGE,
+            COMPONENT_WIFI_WATCHDOG,
+            COMPONENT_BUS_WATCHDOG,
+        ),
+        feature_overrides=MappingProxyType({}),
+        hot_poll_seconds=5,
+        resync_seconds=900,
+    )
+    provisioned = _provisioned(request, identity)
+
+    assert flow_support._provisioned_matches_request(
+        provisioned,
+        request,
+        identity,
+    )
+
+    mismatched = replace(
+        provisioned,
+        panel_data=CanonicalPanelData(
+            MappingProxyType(
+                {
+                    **provisioned.panel_data.as_dict(),
+                    **panel_override,
+                }
+            )
+        ),
+    )
     assert not flow_support._provisioned_matches_request(
         mismatched,
         request,
@@ -3484,6 +3560,79 @@ async def test_panel_feature_overrides_are_allowlisted_and_preserve_resilience(
     }
 
 
+async def test_panel_overrides_store_agent_cadences_as_panel_config(
+    hass: HomeAssistant,
+) -> None:
+    panel = _subentry()
+    entry = _fleet_entry(hass, panel)
+    stored = entry.subentries[panel.subentry_id]
+    form = await _start_panel_reconfigure_step(
+        hass,
+        entry,
+        stored,
+        "overrides",
+    )
+
+    result = await hass.config_entries.subentries.async_configure(
+        form["flow_id"],
+        {
+            CONF_VOICE_WAKE_WORD: DEFAULT_VOICE_WAKE_WORD,
+            CONF_VOICE_HA_HOST: "",
+            CONF_HUE_CA_CERT: "",
+            CONF_HOT_POLL_SECONDS: 5,
+            CONF_RESYNC_SECONDS: 900,
+        },
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+    assert stored.data[CONF_HOT_POLL_SECONDS] == 5
+    assert stored.data[CONF_RESYNC_SECONDS] == 900
+    assert CONF_HOT_POLL_SECONDS not in stored.data[CONF_FEATURE_OVERRIDES]
+    assert CONF_RESYNC_SECONDS not in stored.data[CONF_FEATURE_OVERRIDES]
+
+
+async def test_panel_overrides_clear_agent_cadences_from_next_render(
+    hass: HomeAssistant,
+) -> None:
+    panel = _subentry(
+        hot_poll_seconds=5,
+        resync_seconds=900,
+    )
+    entry = _fleet_entry(hass, panel)
+    stored = entry.subentries[panel.subentry_id]
+    form = await _start_panel_reconfigure_step(
+        hass,
+        entry,
+        stored,
+        "overrides",
+    )
+
+    result = await hass.config_entries.subentries.async_configure(
+        form["flow_id"],
+        {
+            CONF_VOICE_WAKE_WORD: DEFAULT_VOICE_WAKE_WORD,
+            CONF_VOICE_HA_HOST: "",
+            CONF_HUE_CA_CERT: "",
+        },
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+    assert CONF_HOT_POLL_SECONDS not in stored.data
+    assert CONF_RESYNC_SECONDS not in stored.data
+
+    manager = PanelManager(
+        hass,
+        FleetPanelStore(hass, entry, stored),
+        FleetConfig.from_entry(entry),
+        asyncio.Lock(),
+    )
+    env = manager._broker_release_settings().environment
+    assert "HOT_POLL_SECONDS=" not in env
+    assert "RESYNC_SECONDS=" not in env
+
+
 @pytest.mark.parametrize(
     "submitted",
     (
@@ -4796,3 +4945,124 @@ async def test_legacy_reconfigure_advanced_updates_mesh_priority(
     assert "MESH_PRIORITY=7" in call.kwargs["env_content"]
     assert entry.data[CONF_MESH_PRIORITY] == 7
     assert entry.data[CONF_HOST] == "office.iot.example"
+
+
+async def test_legacy_reconfigure_advanced_persists_agent_cadences(
+    hass: HomeAssistant,
+) -> None:
+    entry = _legacy_entry(hass)
+    form = await _open_legacy_reconfigure_step(hass, entry, "reconfigure_advanced")
+
+    apply = AsyncMock(return_value=_PUBLIC_KEY)
+    result = await _submit_legacy_reconfigure(
+        hass,
+        form,
+        {
+            CONF_MESH_PRIORITY: 1,
+            CONF_HOT_POLL_SECONDS: 5,
+            CONF_RESYNC_SECONDS: 900,
+        },
+        apply,
+    )
+
+    assert result["reason"] == "reconfigure_successful"
+    call = apply.await_args
+    assert call is not None
+    env = call.kwargs["env_content"]
+    assert "HOT_POLL_SECONDS=5" in env.splitlines()
+    assert "RESYNC_SECONDS=900" in env.splitlines()
+    assert entry.data[CONF_HOT_POLL_SECONDS] == 5
+    assert entry.data[CONF_RESYNC_SECONDS] == 900
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    (
+        (CONF_HOT_POLL_SECONDS, True),
+        (CONF_HOT_POLL_SECONDS, 5.9),
+        (CONF_RESYNC_SECONDS, 0),
+        (CONF_RESYNC_SECONDS, "x"),
+    ),
+    ids=("bool", "float", "out-of-range", "non-integer"),
+)
+async def test_legacy_reconfigure_advanced_rejects_raw_invalid_cadences(
+    hass: HomeAssistant,
+    key: str,
+    value: object,
+) -> None:
+    entry = _legacy_entry(hass)
+    form = await _open_legacy_reconfigure_step(hass, entry, "reconfigure_advanced")
+    apply = AsyncMock(return_value=_PUBLIC_KEY)
+
+    result = await _submit_legacy_reconfigure(
+        hass,
+        form,
+        {
+            CONF_MESH_PRIORITY: 1,
+            key: value,
+        },
+        apply,
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "reconfigure_advanced"
+    assert result["errors"] == {key: "invalid_cadence"}
+    apply.assert_not_awaited()
+    assert CONF_HOT_POLL_SECONDS not in entry.data
+    assert CONF_RESYNC_SECONDS not in entry.data
+
+
+async def test_legacy_reconfigure_advanced_keeps_absent_cadences_unset(
+    hass: HomeAssistant,
+) -> None:
+    entry = _legacy_entry(hass)
+    form = await _open_legacy_reconfigure_step(hass, entry, "reconfigure_advanced")
+    apply = AsyncMock(return_value=_PUBLIC_KEY)
+
+    result = await _submit_legacy_reconfigure(
+        hass,
+        form,
+        {CONF_MESH_PRIORITY: 2},
+        apply,
+    )
+
+    assert result["reason"] == "reconfigure_successful"
+    call = apply.await_args
+    assert call is not None
+    env = call.kwargs["env_content"]
+    assert "HOT_POLL_SECONDS=" not in env
+    assert "RESYNC_SECONDS=" not in env
+    assert CONF_HOT_POLL_SECONDS not in entry.data
+    assert CONF_RESYNC_SECONDS not in entry.data
+
+
+async def test_legacy_reconfigure_advanced_clears_cadences_from_next_render(
+    hass: HomeAssistant,
+) -> None:
+    entry = _legacy_entry(hass)
+    hass.config_entries.async_update_entry(
+        entry,
+        data={
+            **entry.data,
+            CONF_HOT_POLL_SECONDS: 5,
+            CONF_RESYNC_SECONDS: 900,
+        },
+    )
+    form = await _open_legacy_reconfigure_step(hass, entry, "reconfigure_advanced")
+    apply = AsyncMock(return_value=_PUBLIC_KEY)
+
+    result = await _submit_legacy_reconfigure(
+        hass,
+        form,
+        {CONF_MESH_PRIORITY: 1},
+        apply,
+    )
+
+    assert result["reason"] == "reconfigure_successful"
+    call = apply.await_args
+    assert call is not None
+    env = call.kwargs["env_content"]
+    assert "HOT_POLL_SECONDS=" not in env
+    assert "RESYNC_SECONDS=" not in env
+    assert CONF_HOT_POLL_SECONDS not in entry.data
+    assert CONF_RESYNC_SECONDS not in entry.data

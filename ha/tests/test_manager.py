@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import asyncssh
 import pytest
+from homeassistant.components.mqtt.models import ReceiveMessage
 from homeassistant.config_entries import ConfigSubentry
 from homeassistant.core import Event, HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
@@ -40,10 +41,12 @@ from custom_components.brilliant_mqtt.const import (
     CONF_HA_MIRROR_LEADER_PRIORITY,
     CONF_HA_MIRROR_TOKEN,
     CONF_HA_MIRROR_WS_URL,
+    CONF_HOT_POLL_SECONDS,
     CONF_HUE_CA_CERT,
     CONF_MQTT_TLS_CA,
     CONF_MQTT_TLS_ENABLED,
     CONF_PANEL,
+    CONF_RESYNC_SECONDS,
     CONF_VOICE_ENABLED,
     CONF_VOICE_HA_HOST,
     CONF_VOICE_WAKE_WORD,
@@ -187,6 +190,49 @@ def _timer_cancelled(cancel: object) -> bool:
     return handle.cancelled()
 
 
+def _availability_message(payload: str) -> ReceiveMessage:
+    return ReceiveMessage(
+        topic="brilliant/office/availability",
+        payload=payload,
+        qos=0,
+        retain=True,
+        subscribed_topic="brilliant/office/availability",
+        timestamp=dt_util.utcnow().timestamp(),
+    )
+
+
+@pytest.mark.parametrize(
+    ("availability", "problem", "reason", "notifications"),
+    (
+        ("online", False, None, 0),
+        ("offline", False, None, 1),
+        ("offline", True, "panel repair failed", 1),
+    ),
+    ids=("online-noop", "offline-to-online", "problem-cleared-with-online"),
+)
+async def test_availability_update_notifies_once_per_effective_state_change(
+    hass: HomeAssistant,
+    availability: str,
+    problem: bool,
+    reason: str | None,
+    notifications: int,
+) -> None:
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    manager = _legacy_manager(hass, entry)
+    manager.availability = availability
+    manager.problem = problem
+    manager.problem_reason = reason
+
+    with patch.object(manager, "_notify") as notify:
+        await manager._on_availability(_availability_message("online"))
+
+    assert notify.call_count == notifications
+    assert manager.availability == "online"
+    assert manager.problem is False
+    assert manager.problem_reason is None
+
+
 async def test_shutdown_drains_every_subscription_when_one_callback_raises(
     hass: HomeAssistant,
 ) -> None:
@@ -219,6 +265,62 @@ async def test_manager_renders_scene_bridge_toggle_from_entry_data(
     manager = _legacy_manager(hass, entry)
     env = manager._broker_release_settings().environment
     assert f"SCENE_BRIDGE_ENABLED={line}" in env.splitlines()
+
+
+def test_manager_renders_durable_panel_agent_cadences(hass: HomeAssistant) -> None:
+    _entry, manager = _fleet_panel_manager(
+        hass,
+        panel_overrides={
+            CONF_HOT_POLL_SECONDS: 5,
+            CONF_RESYNC_SECONDS: 900,
+        },
+    )
+
+    env = manager._broker_release_settings().environment
+    assert "HOT_POLL_SECONDS=5" in env.splitlines()
+    assert "RESYNC_SECONDS=900" in env.splitlines()
+
+
+async def test_retained_ledger_availability_notifies_only_on_real_change(
+    hass: HomeAssistant,
+) -> None:
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    manager = _legacy_manager(hass, entry)
+    degraded = ReceiveMessage(
+        topic="brilliant/office/bridge",
+        payload='{"agent_version":"0.7.0","degraded":"retained_ledger"}',
+        qos=1,
+        retain=True,
+        subscribed_topic="brilliant/office/bridge",
+        timestamp=dt_util.utcnow().timestamp(),
+    )
+    online = ReceiveMessage(
+        topic="brilliant/office/availability",
+        payload="online",
+        qos=0,
+        retain=True,
+        subscribed_topic="brilliant/office/availability",
+        timestamp=dt_util.utcnow().timestamp(),
+    )
+    offline = ReceiveMessage(
+        topic="brilliant/office/availability",
+        payload="offline",
+        qos=0,
+        retain=True,
+        subscribed_topic="brilliant/office/availability",
+        timestamp=dt_util.utcnow().timestamp(),
+    )
+
+    await manager._on_meta(degraded)
+    manager.availability = "online"
+    with patch.object(manager, "_notify") as notify:
+        await manager._on_availability(online)
+        await manager._on_availability(online)
+        notify.assert_not_called()
+
+        await manager._on_availability(offline)
+        notify.assert_called_once_with()
 
 
 def test_manager_uses_strict_fleet_shell_and_private_legacy_adapter(

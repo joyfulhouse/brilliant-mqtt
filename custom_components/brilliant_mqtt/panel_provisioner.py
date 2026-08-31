@@ -26,11 +26,13 @@ from .const import (
     CONF_COMPONENTS,
     CONF_FEATURE_OVERRIDES,
     CONF_HOST,
+    CONF_HOT_POLL_SECONDS,
     CONF_IDENTITY_FINGERPRINT,
     CONF_MANAGEMENT_ID,
     CONF_MESH_PRIORITY,
     CONF_PANEL,
     CONF_PROVISIONING_TRANSACTION_ID,
+    CONF_RESYNC_SECONDS,
     CONF_ROOT_PASSWORD,
     CONF_SSH_HOST_KEY,
     CONF_SSH_USERNAME,
@@ -292,6 +294,8 @@ class PanelInstallRequest:
     mesh_priority: int
     selected_components: tuple[str, ...]
     feature_overrides: Mapping[str, JsonValue] = field(repr=False)
+    hot_poll_seconds: int | None = None
+    resync_seconds: int | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -312,6 +316,10 @@ class PanelInstallRequest:
             or COMPONENT_BRIDGE not in self.selected_components
             or len(set(self.selected_components)) != len(self.selected_components)
             or any(component not in _CORE_COMPONENTS for component in self.selected_components)
+            or self.hot_poll_seconds is not None
+            and (type(self.hot_poll_seconds) is not int or not 0 <= self.hot_poll_seconds <= 60)
+            or self.resync_seconds is not None
+            and (type(self.resync_seconds) is not int or not 60 <= self.resync_seconds <= 86400)
         ):
             raise _invalid_request()
         normalized_components = tuple(
@@ -501,6 +509,8 @@ def panel_release_provider(hass: HomeAssistant) -> PanelReleaseProvider:
                 scene_bridge_enabled=fleet.ha_control_enabled,
                 mqtt_ca_path=mqtt_ca_path,
                 deployment_id=transaction_id.hex,
+                hot_poll_seconds=request.hot_poll_seconds,
+                resync_seconds=request.resync_seconds,
             )
             bundle = PanelReleaseBundle(
                 local_payload_dir=str(payload_dir),
@@ -1807,6 +1817,16 @@ def _panel_data(
                 CONF_COMPONENTS: components,
                 CONF_FEATURE_OVERRIDES: dict(feature_overrides),
                 CONF_MESH_PRIORITY: request.mesh_priority,
+                **(
+                    {CONF_HOT_POLL_SECONDS: request.hot_poll_seconds}
+                    if request.hot_poll_seconds is not None
+                    else {}
+                ),
+                **(
+                    {CONF_RESYNC_SECONDS: request.resync_seconds}
+                    if request.resync_seconds is not None
+                    else {}
+                ),
                 CONF_PROVISIONING_TRANSACTION_ID: str(transaction_id),
             }
         )

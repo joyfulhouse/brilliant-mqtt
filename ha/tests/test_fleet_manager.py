@@ -33,6 +33,7 @@ from custom_components.brilliant_mqtt.const import (
     CONF_HA_CONTROL_ENABLED,
     CONF_HA_CONTROL_LABEL,
     CONF_HOST,
+    CONF_HOT_POLL_SECONDS,
     CONF_IDENTITY_FINGERPRINT,
     CONF_MANAGEMENT_ID,
     CONF_MAX_MIRRORED_ENTITIES,
@@ -46,6 +47,7 @@ from custom_components.brilliant_mqtt.const import (
     CONF_NEXT_MESH_PRIORITY,
     CONF_PANEL,
     CONF_PROVISIONING_TRANSACTION_ID,
+    CONF_RESYNC_SECONDS,
     CONF_ROOM_OVERRIDES,
     CONF_ROOT_PASSWORD,
     CONF_SCENE_ACTIONS,
@@ -78,6 +80,7 @@ from custom_components.brilliant_mqtt.fleet_manager import (
     async_recover_removed_entry,
     async_wait_config_entry_persisted,
     get_panel_provisioner,
+    legacy_fleet_config,
     pending_scene_owner,
 )
 from custom_components.brilliant_mqtt.manager import PanelManager
@@ -327,6 +330,59 @@ def _legacy_entry() -> MockConfigEntry:
             CONF_SCENE_ACTIONS: {},
         },
     )
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    (
+        (CONF_HOT_POLL_SECONDS, 5.9),
+        (CONF_RESYNC_SECONDS, 0),
+    ),
+    ids=("float", "out-of-range"),
+)
+def test_legacy_fleet_config_rejects_tampered_agent_cadences(
+    key: str,
+    value: object,
+) -> None:
+    legacy = _legacy_entry()
+    malformed = MockConfigEntry(
+        domain=DOMAIN,
+        version=legacy.version,
+        data={
+            **legacy.data,
+            key: value,
+        },
+    )
+
+    with pytest.raises(EntryDataError, match="invalid_legacy_fleet_data"):
+        legacy_fleet_config(malformed)
+
+
+@pytest.mark.parametrize(
+    "cadences",
+    (
+        {},
+        {
+            CONF_HOT_POLL_SECONDS: 5,
+            CONF_RESYNC_SECONDS: 900,
+        },
+    ),
+    ids=("absent", "configured"),
+)
+def test_legacy_fleet_config_accepts_compatible_agent_cadences(
+    cadences: dict[str, int],
+) -> None:
+    legacy = _legacy_entry()
+    compatible = MockConfigEntry(
+        domain=DOMAIN,
+        version=legacy.version,
+        data={
+            **legacy.data,
+            **cadences,
+        },
+    )
+
+    legacy_fleet_config(compatible)
 
 
 async def _noop_setup(manager: PanelManager) -> None:

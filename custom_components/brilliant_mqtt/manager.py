@@ -46,9 +46,11 @@ from .const import (
     CONF_HA_MIRROR_TOKEN,
     CONF_HA_MIRROR_WS_URL,
     CONF_HOST,
+    CONF_HOT_POLL_SECONDS,
     CONF_HUE_CA_CERT,
     CONF_MESH_PRIORITY,
     CONF_PANEL,
+    CONF_RESYNC_SECONDS,
     CONF_ROOT_PASSWORD,
     CONF_VOICE_HA_HOST,
     CONF_VOICE_WAKE_WORD,
@@ -539,14 +541,22 @@ class PanelManager:
         )
 
     @callback
-    def _set_problem(self, problem: bool, reason: str | None) -> None:
+    def _set_problem(
+        self,
+        problem: bool,
+        reason: str | None,
+        *,
+        notify: bool = True,
+    ) -> None:
+        changed = (self.problem, self.problem_reason) != (problem, reason)
         self.problem = problem
         self.problem_reason = reason
         if not problem:
             # The panel recovered (or the problem otherwise cleared): drop any open
             # "needs attention" repair issue so it doesn't linger after recovery.
             ir.async_delete_issue(self.hass, DOMAIN, self._issue_id)
-        self._notify()
+        if notify and changed:
+            self._notify()
 
     def _legacy_retirement_evidence(self, *, include_verified_history: bool = False) -> bool:
         if not isinstance(self.store, LegacyPanelStore):
@@ -730,6 +740,7 @@ class PanelManager:
     async def _on_availability(self, msg: ReceiveMessage) -> None:
         if self._shutting_down:
             return  # defense-in-depth: never arm a timer on a torn-down entry
+        previous_state = (self.availability, self.problem, self.problem_reason)
         payload = str(msg.payload)
         self.availability = payload
         if payload == AVAILABILITY_ONLINE:
@@ -739,13 +750,12 @@ class PanelManager:
                 self._fire(EVENT_REPAIR_SUCCEEDED)
             # A retained online value can predate a newer bridge diagnostic.
             # Only ordinary bridge meta proves the ledger itself recovered.
-            if self.problem_reason == _RETAINED_LEDGER_PROBLEM:
-                self._notify()
-            else:
-                self._set_problem(False, None)
+            if self.problem_reason != _RETAINED_LEDGER_PROBLEM:
+                self._set_problem(False, None, notify=False)
         elif payload == AVAILABILITY_OFFLINE:
             self._arm_offline_grace()
-        self._notify()
+        if previous_state != (self.availability, self.problem, self.problem_reason):
+            self._notify()
 
     async def _grace_expired(self, _now: datetime) -> None:
         self._grace_cancel = None
@@ -810,6 +820,8 @@ class PanelManager:
             mesh_priority=self.store.data[CONF_MESH_PRIORITY],
             scene_bridge_enabled=self.fleet.ha_control_enabled,
             mqtt_ca_path=mqtt_ca_path,
+            hot_poll_seconds=self.store.data.get(CONF_HOT_POLL_SECONDS),
+            resync_seconds=self.store.data.get(CONF_RESYNC_SECONDS),
         )
 
     async def _async_stage_broker_ca(self, shell: PanelShell) -> str:
@@ -822,6 +834,8 @@ class PanelManager:
                 mesh_priority=self.store.data[CONF_MESH_PRIORITY],
                 scene_bridge_enabled=self.fleet.ha_control_enabled,
                 mqtt_ca_path=staged_path,
+                hot_poll_seconds=self.store.data.get(CONF_HOT_POLL_SECONDS),
+                resync_seconds=self.store.data.get(CONF_RESYNC_SECONDS),
             )
             if staged_path not in settings.environment:
                 raise PanelOpError("staged MQTT CA path did not match rendered environment")

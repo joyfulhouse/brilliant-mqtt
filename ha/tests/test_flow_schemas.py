@@ -20,6 +20,7 @@ from custom_components.brilliant_mqtt.const import (
     CONF_HA_CONTROL_ENABLED,
     CONF_HA_CONTROL_LABEL,
     CONF_HOST,
+    CONF_HOT_POLL_SECONDS,
     CONF_HUE_CA_CERT,
     CONF_IDENTITY_FINGERPRINT,
     CONF_MAX_MIRRORED_ENTITIES,
@@ -29,6 +30,7 @@ from custom_components.brilliant_mqtt.const import (
     CONF_MQTT_TLS_CA,
     CONF_MQTT_TLS_ENABLED,
     CONF_MQTT_USERNAME,
+    CONF_RESYNC_SECONDS,
     CONF_ROOM_OVERRIDES,
     CONF_ROOT_PASSWORD,
     CONF_SCENE_ACTIONS,
@@ -1030,6 +1032,8 @@ def test_panel_feature_overrides_are_typed_and_allowlisted() -> None:
             CONF_VOICE_WAKE_WORD: "hey_jarvis",
             CONF_VOICE_HA_HOST: "ha.internal",
             CONF_HUE_CA_CERT: certificate,
+            CONF_HOT_POLL_SECONDS: 5,
+            CONF_RESYNC_SECONDS: 900,
             CONF_FEATURE_OVERRIDES: {"unexpected": True},
         }
     )
@@ -1038,6 +1042,8 @@ def test_panel_feature_overrides_are_typed_and_allowlisted() -> None:
         CONF_VOICE_WAKE_WORD,
         CONF_VOICE_HA_HOST,
         CONF_HUE_CA_CERT,
+        CONF_HOT_POLL_SECONDS,
+        CONF_RESYNC_SECONDS,
     }
     assert _field_default(schema, CONF_VOICE_WAKE_WORD) == "hey_jarvis"
     assert _field_default(schema, CONF_VOICE_HA_HOST) == "ha.internal"
@@ -1046,11 +1052,15 @@ def test_panel_feature_overrides_are_typed_and_allowlisted() -> None:
             CONF_VOICE_WAKE_WORD: "hey_mycroft",
             CONF_VOICE_HA_HOST: " ha.internal ",
             CONF_HUE_CA_CERT: certificate,
+            CONF_HOT_POLL_SECONDS: 5,
+            CONF_RESYNC_SECONDS: 900,
         }
     ) == {
         CONF_VOICE_WAKE_WORD: "hey_mycroft",
         CONF_VOICE_HA_HOST: "ha.internal",
         CONF_HUE_CA_CERT: certificate,
+        CONF_HOT_POLL_SECONDS: 5,
+        CONF_RESYNC_SECONDS: 900,
     }
 
 
@@ -1064,6 +1074,8 @@ def test_panel_feature_overrides_are_typed_and_allowlisted() -> None:
             CONF_HUE_CA_CERT,
             "-----BEGIN PRIVATE KEY-----\nTRANSIENT-PRIVATE-SECRET\n-----END PRIVATE KEY-----",
         ),
+        (CONF_HOT_POLL_SECONDS, 61),
+        (CONF_RESYNC_SECONDS, 0),
     ],
 )
 def test_panel_feature_overrides_reject_unknown_or_unsafe_values(
@@ -1081,5 +1093,10 @@ def test_panel_feature_overrides_reject_unknown_or_unsafe_values(
         flow_schemas.normalize_panel_feature_overrides_input(submitted)
 
     expected_field = field if field != "unexpected" else "base"
-    assert dict(raised.value.errors) == {expected_field: "invalid_value"}
+    expected_error = (
+        "invalid_cadence"
+        if field in (CONF_HOT_POLL_SECONDS, CONF_RESYNC_SECONDS)
+        else "invalid_value"
+    )
+    assert dict(raised.value.errors) == {expected_field: expected_error}
     assert repr(value) not in repr(raised.value)

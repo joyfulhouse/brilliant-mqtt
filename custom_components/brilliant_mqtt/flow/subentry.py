@@ -25,9 +25,11 @@ from ..const import (
     COMPONENT_VOICE,
     CONF_FEATURE_OVERRIDES,
     CONF_HOST,
+    CONF_HOT_POLL_SECONDS,
     CONF_HUE_CA_CERT,
     CONF_MESH_PRIORITY,
     CONF_PANEL,
+    CONF_RESYNC_SECONDS,
     CONF_ROOT_PASSWORD,
     CONF_VOICE_HA_HOST,
     CONF_VOICE_WAKE_WORD,
@@ -454,24 +456,47 @@ class PanelSubentryFlow(ConfigSubentryFlow, _PanelOnboardingMixin):
                             reason="feature_override_change_requires_agent_rollout",
                         )
 
+                    cadence_values = {
+                        key: normalized.pop(key)
+                        for key in (CONF_HOT_POLL_SECONDS, CONF_RESYNC_SECONDS)
+                        if key in normalized
+                    }
                     overrides = {
                         **latest.feature_overrides,
                         **normalized,
                     }
-                    if overrides == latest.feature_overrides:
+                    updated_data = {
+                        **subentry.data,
+                        CONF_FEATURE_OVERRIDES: overrides,
+                    }
+                    for key in (CONF_HOT_POLL_SECONDS, CONF_RESYNC_SECONDS):
+                        if key in cadence_values:
+                            updated_data[key] = cadence_values[key]
+                        else:
+                            updated_data.pop(key, None)
+                    if updated_data == subentry.data:
                         return self.async_abort(reason="reconfigure_successful")
                     return self.async_update_and_abort(
                         entry,
                         subentry,
-                        data={
-                            **subentry.data,
-                            CONF_FEATURE_OVERRIDES: overrides,
-                        },
+                        data=updated_data,
                     )
         return self.async_show_form(
             step_id="overrides",
             data_schema=panel_feature_overrides_schema(
-                current.feature_overrides,
+                {
+                    **current.feature_overrides,
+                    **(
+                        {CONF_HOT_POLL_SECONDS: current.hot_poll_seconds}
+                        if current.hot_poll_seconds is not None
+                        else {}
+                    ),
+                    **(
+                        {CONF_RESYNC_SECONDS: current.resync_seconds}
+                        if current.resync_seconds is not None
+                        else {}
+                    ),
+                },
             ),
             errors=errors,
         )

@@ -24,6 +24,7 @@ from .const import (
     CONF_HA_CONTROL_ENABLED,
     CONF_HA_CONTROL_LABEL,
     CONF_HOST,
+    CONF_HOT_POLL_SECONDS,
     CONF_IDENTITY_FINGERPRINT,
     CONF_MANAGEMENT_ID,
     CONF_MAX_MIRRORED_ENTITIES,
@@ -37,6 +38,7 @@ from .const import (
     CONF_NEXT_MESH_PRIORITY,
     CONF_PANEL,
     CONF_PROVISIONING_TRANSACTION_ID,
+    CONF_RESYNC_SECONDS,
     CONF_ROOM_OVERRIDES,
     CONF_ROOT_PASSWORD,
     CONF_SCENE_ACTIONS,
@@ -97,10 +99,16 @@ _PANEL_KEYS = frozenset(
         CONF_COMPONENTS,
         CONF_FEATURE_OVERRIDES,
         CONF_MESH_PRIORITY,
+        CONF_HOT_POLL_SECONDS,
+        CONF_RESYNC_SECONDS,
         CONF_PROVISIONING_TRANSACTION_ID,
     }
 )
-_PANEL_REQUIRED_KEYS = _PANEL_KEYS - {CONF_PROVISIONING_TRANSACTION_ID}
+_PANEL_REQUIRED_KEYS = _PANEL_KEYS - {
+    CONF_HOT_POLL_SECONDS,
+    CONF_PROVISIONING_TRANSACTION_ID,
+    CONF_RESYNC_SECONDS,
+}
 
 
 class EntryDataError(ValueError):
@@ -131,6 +139,39 @@ def _required_nonnegative_int(data: Mapping[str, Any], key: str) -> int:
     if type(value) is not int or value < 0:
         raise _invalid("invalid_entry_data")
     return value
+
+
+def _optional_bounded_int(
+    data: Mapping[str, Any],
+    key: str,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int | None:
+    if key not in data:
+        return None
+    value = data[key]
+    if type(value) is not int or not minimum <= value <= maximum:
+        raise _invalid("invalid_entry_data")
+    return value
+
+
+def _panel_agent_cadences(data: Mapping[str, Any]) -> tuple[int | None, int | None]:
+    """Validate the optional panel-agent cadence contract without coercion."""
+    return (
+        _optional_bounded_int(
+            data,
+            CONF_HOT_POLL_SECONDS,
+            minimum=0,
+            maximum=60,
+        ),
+        _optional_bounded_int(
+            data,
+            CONF_RESYNC_SECONDS,
+            minimum=60,
+            maximum=86400,
+        ),
+    )
 
 
 def _copy_json(value: Any, *, depth: int = 0) -> JsonValue:
@@ -290,6 +331,8 @@ class PanelConfig:
     components: MappingProxyType[str, bool]
     feature_overrides: MappingProxyType[str, JsonValue] = field(repr=False)
     mesh_priority: int
+    hot_poll_seconds: int | None
+    resync_seconds: int | None
     provisioning_transaction_id: str | None
 
     @classmethod
@@ -324,6 +367,7 @@ class PanelConfig:
                 feature_overrides,
                 error_code="invalid_panel_entry_data",
             )
+            hot_poll_seconds, resync_seconds = _panel_agent_cadences(data)
             return cls(
                 identity_fingerprint=identity_fingerprint,
                 ssh_host_key=_required_string(data, CONF_SSH_HOST_KEY),
@@ -336,6 +380,8 @@ class PanelConfig:
                 components=_components_mapping(data[CONF_COMPONENTS]),
                 feature_overrides=feature_overrides,
                 mesh_priority=_required_nonnegative_int(data, CONF_MESH_PRIORITY),
+                hot_poll_seconds=hot_poll_seconds,
+                resync_seconds=resync_seconds,
                 provisioning_transaction_id=transaction_id,
             )
         except EntryDataError:
@@ -480,6 +526,10 @@ class LegacyPanelStore:
         panel = entry.data.get(CONF_PANEL)
         if not isinstance(panel, str) or _LEGACY_PANEL_SLUG.fullmatch(panel) is None:
             raise _invalid("invalid_legacy_panel_entry_data")
+        try:
+            _panel_agent_cadences(entry.data)
+        except EntryDataError:
+            raise _invalid("invalid_legacy_panel_entry_data") from None
         self.hass = hass
         self.entry = entry
 

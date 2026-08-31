@@ -30,6 +30,7 @@ from ..const import (
     CONF_HA_CONTROL_ENABLED,
     CONF_HA_CONTROL_LABEL,
     CONF_HOST,
+    CONF_HOT_POLL_SECONDS,
     CONF_HUE_CA_CERT,
     CONF_MAX_MIRRORED_ENTITIES,
     CONF_MQTT_HOST,
@@ -38,6 +39,7 @@ from ..const import (
     CONF_MQTT_TLS_CA,
     CONF_MQTT_TLS_ENABLED,
     CONF_MQTT_USERNAME,
+    CONF_RESYNC_SECONDS,
     CONF_ROOM_OVERRIDES,
     CONF_ROOT_PASSWORD,
     CONF_SCENE_ACTIONS,
@@ -1249,22 +1251,40 @@ def panel_feature_overrides_schema(
         and (not raw_hue_ca.strip() or _is_public_certificate_chain(raw_hue_ca))
         else ""
     )
-    return vol.Schema(
-        {
-            vol.Required(
-                CONF_VOICE_WAKE_WORD,
-                default=wake_word_default,
-            ): vol.In(VOICE_WAKE_WORDS),
-            vol.Optional(
-                CONF_VOICE_HA_HOST,
-                default=ha_host_default,
-            ): str,
-            vol.Optional(
-                CONF_HUE_CA_CERT,
-                default=hue_ca_default,
-            ): _PUBLIC_CA_SELECTOR,
-        }
-    )
+    fields: dict[Any, Any] = {
+        vol.Required(
+            CONF_VOICE_WAKE_WORD,
+            default=wake_word_default,
+        ): vol.In(VOICE_WAKE_WORDS),
+        vol.Optional(
+            CONF_VOICE_HA_HOST,
+            default=ha_host_default,
+        ): str,
+        vol.Optional(
+            CONF_HUE_CA_CERT,
+            default=hue_ca_default,
+        ): _PUBLIC_CA_SELECTOR,
+    }
+    fields.update(_panel_cadence_schema_fields(values))
+    return vol.Schema(fields)
+
+
+def _panel_cadence_schema_fields(source: Mapping[str, object]) -> dict[Any, Any]:
+    """Expose optional per-panel agent cadences without inventing defaults."""
+    fields: dict[Any, Any] = {}
+    for key, minimum, maximum in (
+        (CONF_HOT_POLL_SECONDS, 0, 60),
+        (CONF_RESYNC_SECONDS, 60, 86400),
+    ):
+        marker = vol.Optional(key)
+        value = source.get(key)
+        if type(value) is int and minimum <= value <= maximum:
+            marker.description = {"suggested_value": value}
+        fields[marker] = vol.All(
+            _RawInteger(),
+            _RawRange(min=minimum, max=maximum),
+        )
+    return fields
 
 
 def normalize_panel_feature_overrides_input(
@@ -1278,6 +1298,8 @@ def normalize_panel_feature_overrides_input(
                 CONF_VOICE_WAKE_WORD,
                 CONF_VOICE_HA_HOST,
                 CONF_HUE_CA_CERT,
+                CONF_HOT_POLL_SECONDS,
+                CONF_RESYNC_SECONDS,
             }
         ),
     )
@@ -1309,6 +1331,24 @@ def normalize_panel_feature_overrides_input(
             normalized[CONF_HUE_CA_CERT] = raw_hue_ca
     else:
         normalized[CONF_HUE_CA_CERT] = ""
+
+    for key, minimum, maximum in (
+        (CONF_HOT_POLL_SECONDS, 0, 60),
+        (CONF_RESYNC_SECONDS, 60, 86400),
+    ):
+        if key not in user_input:
+            continue
+        value = _validated_bounded_integer(
+            user_input[key],
+            minimum=minimum,
+            maximum=maximum,
+        )
+        if value is None:
+            # Cadence-specific key: the shared invalid_value copy talks about
+            # control characters, which misleads for an out-of-range number.
+            errors[key] = "invalid_cadence"
+        else:
+            normalized[key] = value
 
     if errors:
         raise FlowInputError(errors)

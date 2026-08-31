@@ -171,6 +171,8 @@ def test_panel_day_two_actions_translate_every_reachable_surface() -> None:
             "voice_wake_word",
             "voice_ha_host",
             "hue_ca_cert",
+            "hot_poll_seconds",
+            "resync_seconds",
         },
         "rebind": {"host", "root_password"},
         "rebind_confirm": {"confirm"},
@@ -197,6 +199,11 @@ def test_panel_day_two_actions_translate_every_reachable_surface() -> None:
         "overrides",
         "rebind",
     }
+    assert "advanced" in steps["reconfigure"]["menu_options"]["overrides"].casefold()
+    assert "advanced" in steps["overrides"]["title"].casefold()
+    description = steps["overrides"]["description"].casefold()
+    assert "hot-poll" in description
+    assert "resync" in description
     for step_id, fields in required_fields.items():
         _assert_nonempty_keys(steps[step_id]["data"], fields)
         _assert_nonempty_keys(steps[step_id]["data_description"], fields)
