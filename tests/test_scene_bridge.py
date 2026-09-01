@@ -388,6 +388,49 @@ async def test_poll_commits_fingerprint_captured_before_processing(
     await bridge.async_shutdown()
 
 
+async def test_reconcile_absence_fences_inflight_poll_fingerprint_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge, bus, mqtt, _, _ = await _started(tmp_path)
+    execution = _execution("all_off", 200)
+    process = bridge._async_process_execution
+    processed = asyncio.Event()
+    release = asyncio.Event()
+
+    async def process_then_wait(
+        device: BrilliantDevice,
+        *,
+        emit_events: bool,
+        epoch: int,
+    ) -> None:
+        await process(device, emit_events=emit_events, epoch=epoch)
+        processed.set()
+        await release.wait()
+
+    monkeypatch.setattr(bridge, "_async_process_execution", process_then_wait)
+    poll = asyncio.create_task(bridge.poll_executions([execution]))
+    await asyncio.wait_for(processed.wait(), timeout=0.1)
+    bus.set_devices([])
+    await bridge.async_reconcile()
+    release.set()
+    await poll
+
+    reappeared = _device(
+        "execution_peripheral",
+        _execution("all_off", 200).variables,
+        device_id="reappeared-panel",
+    )
+    await bridge.poll_executions([reappeared])
+
+    assert bridge._execution_available is True
+    command_id = "22222222-2222-4222-8222-222222222222"
+    await mqtt.inject(scene_command_topic(_PANEL), _command(command_id, "scene", "all_off"))
+    await _wait_for_bus_commands(bus, 1)
+    assert bus.commands[-1][0] == "reappeared-panel"
+    await bridge.async_shutdown()
+
+
 async def test_reappearing_execution_with_identical_values_restores_route(
     tmp_path: Path,
 ) -> None:

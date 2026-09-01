@@ -646,6 +646,7 @@ class SceneBridge:
             if (
                 epoch == self._epoch
                 and generation == self._operation_generation
+                and self._execution is not None
                 and not self._stopping
             ):
                 self._processed_execution_variables = fingerprint
