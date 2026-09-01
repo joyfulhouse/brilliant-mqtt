@@ -4414,11 +4414,7 @@ async def test_legacy_reconfigure_connection_new_password_is_stored(
 async def test_legacy_reconfigure_completion_updates_without_flow_reload(
     hass: HomeAssistant,
 ) -> None:
-    """Completing a section persists data and aborts; the flow itself never reloads.
-
-    From HA 2026.12 a reloading config-flow method may not coexist with the
-    integration's update listener — that listener is the single reload authority.
-    """
+    """Completing a section persists data and aborts; only the listener may reload."""
     entry = _legacy_entry(hass)
     form = await _open_legacy_reconfigure_step(hass, entry, "reconfigure_connection")
 
@@ -4440,18 +4436,14 @@ async def test_legacy_reconfigure_completion_updates_without_flow_reload(
 async def test_legacy_reconfigure_applies_via_update_listener_without_reload(
     hass: HomeAssistant,
 ) -> None:
-    """SSH-password and MQTT-endpoint edits reach the live runtime listener-only.
-
-    With the running FleetManager's update listener registered, completing the
-    connection and MQTT sections must live-apply through that listener without
-    any reload — neither from the flow nor scheduled by the reconcile.
-    """
+    """SSH-password and MQTT-endpoint edits live-apply via the update listener alone."""
     entry = _legacy_entry(hass)
     fleet = FleetManager(hass, entry)
 
     async def noop(manager: PanelManager) -> None:
         return None
 
+    apply = AsyncMock(return_value=_PUBLIC_KEY)
     with (
         patch(
             "custom_components.brilliant_mqtt.fleet_manager.mqtt.is_connected",
@@ -4468,31 +4460,27 @@ async def test_legacy_reconfigure_applies_via_update_listener_without_reload(
         await fleet.async_setup()
         assert fleet._update_unsub is not None
 
-        apply = AsyncMock(return_value=_PUBLIC_KEY)
         form = await _open_legacy_reconfigure_step(hass, entry, "reconfigure_connection")
-        with patch.object(flow_gateway, "_apply_config", apply):
-            result = await hass.config_entries.flow.async_configure(
-                form["flow_id"],
-                {
-                    CONF_HOST: "office.iot.example",
-                    CONF_ROOT_PASSWORD: "rotated-root-password",
-                },
-            )
-            await hass.async_block_till_done()
+        result = await _submit_legacy_reconfigure(
+            hass,
+            form,
+            {CONF_HOST: "office.iot.example", CONF_ROOT_PASSWORD: "rotated-root-password"},
+            apply,
+        )
         assert result["reason"] == "reconfigure_successful"
 
         form = await _open_legacy_reconfigure_step(hass, entry, "reconfigure_mqtt")
-        with patch.object(flow_gateway, "_apply_config", apply):
-            result = await hass.config_entries.flow.async_configure(
-                form["flow_id"],
-                {
-                    CONF_MQTT_HOST: "mqtt-new.iot.example",
-                    CONF_MQTT_PORT: 8883,
-                    CONF_MQTT_USERNAME: "brilliant-fleet",
-                    CONF_MQTT_PASSWORD: "",
-                },
-            )
-            await hass.async_block_till_done()
+        result = await _submit_legacy_reconfigure(
+            hass,
+            form,
+            {
+                CONF_MQTT_HOST: "mqtt-new.iot.example",
+                CONF_MQTT_PORT: 8883,
+                CONF_MQTT_USERNAME: "brilliant-fleet",
+                CONF_MQTT_PASSWORD: "",
+            },
+            apply,
+        )
         assert result["reason"] == "reconfigure_successful"
 
         assert entry.data[CONF_ROOT_PASSWORD] == "rotated-root-password"

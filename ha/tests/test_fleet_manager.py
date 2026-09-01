@@ -4854,12 +4854,7 @@ async def test_rejected_fleet_snapshot_does_not_reload_control_plane(
 async def test_update_listener_schedules_reload_when_live_reconcile_rejects(
     hass: HomeAssistant,
 ) -> None:
-    """An identity re-pin (host + SSH host key) applies via a scheduled reload.
-
-    The config flow no longer reloads on completion (HA 2026.12 forbids a
-    reloading flow method next to an update listener), so a snapshot the live
-    reconcile refuses must not be dropped — the listener schedules the reload.
-    """
+    """A snapshot the live reconcile refuses still applies via a scheduled reload."""
     entry = _fleet_entry(_panel("office", "SHA256:office", subentry_id="panel-office"))
     entry.add_to_hass(hass)
     fleet = FleetManager(hass, entry)

@@ -213,9 +213,8 @@ class LegacyPanelReconfigureFlow(_Base):
                     fleet_entry,
                     data={**fleet_entry.data, **copy.deepcopy(control_values)},
                 )
-        # Non-reloading on purpose: HA 2026.12 forbids a reloading flow method
-        # next to an update listener, so the FleetManager update listener is the
-        # single reload authority — it live-applies or schedules any reload.
+        # Non-reloading on purpose (HA 2026.12 forbids a reloading flow method
+        # next to an update listener): the FleetManager listener owns any reload.
         return {}, self.async_update_and_abort(entry, data=new_data)
 
     def _legacy_section_form(

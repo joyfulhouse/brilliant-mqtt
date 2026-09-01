@@ -1537,11 +1537,10 @@ class FleetManager:
             _LOGGER.warning("Fleet reconciliation deferred; a reload retry is scheduled")
             return
         except EntryDataError:
-            # This listener is the single reload authority — the config flow's
-            # completion no longer reloads (HA 2026.12 forbids a reloading flow
-            # method next to an update listener). A snapshot the live reconcile
-            # refuses (e.g. a host change re-pinning the SSH host key) must
-            # apply through a full entry reload instead of being dropped.
+            # The flow's completion no longer reloads (HA 2026.12 forbids that
+            # next to an update listener), so a snapshot the live reconcile
+            # refuses — e.g. a host change re-pinning the SSH host key — must
+            # apply via a full reload instead of being silently dropped.
             _LOGGER.warning("Fleet reconciliation rejected a live apply; a reload is scheduled")
             self._async_schedule_reload_once()
             return
