@@ -245,15 +245,18 @@ class SceneBridge:
                 return
             if execution.variables == self._execution_variables:
                 return
-            self._execution_variables = dict(execution.variables)
             self._operation_generation += 1
-            self._execution = execution
-            self._execution_available = True
+            self._set_execution(execution)
             epoch = self._epoch
         try:
             await self._async_process_execution(execution, emit_events=True, epoch=epoch)
         except Exception:
             logger.exception("scene bridge execution poll failed; continuing")
+
+    def _set_execution(self, execution: BrilliantDevice | None) -> None:
+        self._execution = execution
+        self._execution_variables = None if execution is None else dict(execution.variables)
+        self._execution_available = execution is not None
 
     async def async_shutdown(self) -> None:
         """Fence callbacks, bound task drain, and release exact subscriptions."""
@@ -465,9 +468,7 @@ class SceneBridge:
             self._mode_catalog_healthy = mode_healthy
             stale = not during_start and generation != self._operation_generation
             if not stale:
-                self._execution = execution
-                self._execution_variables = None if execution is None else dict(execution.variables)
-                self._execution_available = execution is not None
+                self._set_execution(execution)
         if stale:
             await self._async_health_status("scene")
             await self._async_health_status("mode")
@@ -494,9 +495,7 @@ class SceneBridge:
                     self._schedule_pending_deadlines()
                     self._schedule_delivery()
                     break
-                self._execution = buffered
-                self._execution_variables = dict(buffered.variables)
-                self._execution_available = True
+                self._set_execution(buffered)
             await self._async_process_execution(buffered, emit_events=True, epoch=epoch)
         await self._async_health_status("scene")
         await self._async_health_status("mode")
@@ -586,9 +585,7 @@ class SceneBridge:
             if self._startup_active:
                 self._startup_buffered_execution = device
                 return
-            self._execution = device
-            self._execution_variables = dict(device.variables)
-            self._execution_available = True
+            self._set_execution(device)
             epoch = self._epoch
         try:
             await self._async_process_execution(device, emit_events=True, epoch=epoch)
