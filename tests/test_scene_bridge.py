@@ -245,6 +245,71 @@ async def test_later_scene_event_publishes_once_and_reconnect_restart_replay_is_
     await restarted.async_shutdown()
 
 
+async def test_poll_only_execution_publishes_event_and_persists_watermark(
+    tmp_path: Path,
+) -> None:
+    bridge, _, mqtt, _, path = await _started(tmp_path)
+    mqtt.published.clear()
+
+    await bridge.poll_executions([_execution("all_off", 200)])
+    await _wait_for_publish(mqtt, scene_event_topic(_PANEL))
+
+    assert len(_published(mqtt, scene_event_topic(_PANEL))) == 1
+    persisted = json.loads(path.read_text())
+    assert persisted["watermarks"][_PANEL]["all_off"]["executed_at_ms"] == 200
+    await bridge.async_shutdown()
+
+
+async def test_unchanged_poll_skips_publishes_and_state_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    writes: list[Path] = []
+    real_write = scene_state.atomic_write_state
+
+    def observed_write(path: Path, state: scene_state.SceneState) -> None:
+        writes.append(path)
+        real_write(path, state)
+
+    monkeypatch.setattr(scene_bridge_module, "atomic_write_state", observed_write)
+    execution = _execution("all_off", 100)
+    bridge, _, mqtt, _, _ = await _started(tmp_path, execution=execution)
+    writes.clear()
+    mqtt.published.clear()
+
+    await bridge.poll_executions([execution])
+
+    assert mqtt.published == []
+    assert writes == []
+    await bridge.async_shutdown()
+
+
+async def test_same_execution_from_push_then_poll_publishes_once(tmp_path: Path) -> None:
+    bridge, bus, mqtt, _, _ = await _started(tmp_path)
+    execution = _execution("all_off", 200)
+    mqtt.published.clear()
+
+    await bus.emit(execution)
+    await bridge.poll_executions([execution])
+    await _wait_for_publish(mqtt, scene_event_topic(_PANEL))
+
+    assert len(_published(mqtt, scene_event_topic(_PANEL))) == 1
+    await bridge.async_shutdown()
+
+
+async def test_poll_execution_never_republishes_retained_catalogs(tmp_path: Path) -> None:
+    bridge, _, mqtt, _, _ = await _started(tmp_path)
+    mqtt.published.clear()
+
+    await bridge.poll_executions([_execution("all_off", 200)])
+    await _wait_for_publish(mqtt, scene_event_topic(_PANEL))
+
+    assert _published(mqtt, scene_catalog_topic(_PANEL)) == []
+    assert _published(mqtt, mode_catalog_topic(_PANEL)) == []
+    assert all(not retained for _, _, retained in mqtt.published)
+    await bridge.async_shutdown()
+
+
 async def test_watermark_update_preserves_other_panel_records(tmp_path: Path) -> None:
     path = tmp_path / "scene-watermarks.json"
     path.write_text(

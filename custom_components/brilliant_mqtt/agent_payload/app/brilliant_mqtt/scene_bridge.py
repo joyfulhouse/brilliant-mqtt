@@ -33,7 +33,7 @@ from brilliant_mqtt.ha_control_protocol import (
     validate_mode_command_context,
     validate_scene_command_context,
 )
-from brilliant_mqtt.model import BrilliantDevice
+from brilliant_mqtt.model import BrilliantDevice, Variable
 from brilliant_mqtt.protocols import BusClient, MqttClient
 from brilliant_mqtt.scene_codec import (
     ModeExecution,
@@ -131,6 +131,7 @@ class SceneBridge:
         self._callbacks_registered = False
         self._subscribed_topics: list[str] = []
         self._execution: BrilliantDevice | None = None
+        self._execution_variables: dict[str, Variable] | None = None
         self._execution_available = False
         self._scene_ids: frozenset[str] = frozenset()
         self._mode_ids: frozenset[str] = frozenset()
@@ -230,6 +231,29 @@ class SceneBridge:
         if not self._started or self._stopping:
             return
         await self._async_reconcile_work(epoch, emit_history=True, during_start=False)
+
+    async def poll_executions(self, devices: list[BrilliantDevice]) -> None:
+        """Process a changed execution peripheral from a shared bus snapshot."""
+        execution = next(
+            (device for device in devices if device.peripheral_id == _EXECUTION_PERIPHERAL_ID),
+            None,
+        )
+        if execution is None:
+            return
+        async with self._lock:
+            if not self._started or self._stopping:
+                return
+            if execution.variables == self._execution_variables:
+                return
+            self._execution_variables = dict(execution.variables)
+            self._operation_generation += 1
+            self._execution = execution
+            self._execution_available = True
+            epoch = self._epoch
+        try:
+            await self._async_process_execution(execution, emit_events=True, epoch=epoch)
+        except Exception:
+            logger.exception("scene bridge execution poll failed; continuing")
 
     async def async_shutdown(self) -> None:
         """Fence callbacks, bound task drain, and release exact subscriptions."""
@@ -442,6 +466,7 @@ class SceneBridge:
             stale = not during_start and generation != self._operation_generation
             if not stale:
                 self._execution = execution
+                self._execution_variables = None if execution is None else dict(execution.variables)
                 self._execution_available = execution is not None
         if stale:
             await self._async_health_status("scene")
@@ -470,6 +495,7 @@ class SceneBridge:
                     self._schedule_delivery()
                     break
                 self._execution = buffered
+                self._execution_variables = dict(buffered.variables)
                 self._execution_available = True
             await self._async_process_execution(buffered, emit_events=True, epoch=epoch)
         await self._async_health_status("scene")
@@ -561,6 +587,7 @@ class SceneBridge:
                 self._startup_buffered_execution = device
                 return
             self._execution = device
+            self._execution_variables = dict(device.variables)
             self._execution_available = True
             epoch = self._epoch
         try:

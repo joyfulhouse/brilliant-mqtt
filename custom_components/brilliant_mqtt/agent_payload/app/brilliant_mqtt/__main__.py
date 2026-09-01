@@ -306,6 +306,8 @@ async def _run_session(
                     await panel_bridge.poll_once(devices)
                     if participating and leader.is_leader:
                         await mesh_bridge.poll_once(devices)
+                    if scene_bridge is not None:
+                        await scene_bridge.poll_executions(devices)
                 except HotPollReadTimeout:
                     if consecutive_hot_poll_timeouts >= 1:
                         raise

@@ -494,6 +494,7 @@ class _SessionHarness:
             "panel": [],
             "mesh": [],
         }
+        self.scene_poll_snapshots: list[list[BrilliantDevice]] = []
         self.scene_instances: list[object] = []
         self.scene_bus: object | None = None
         self.scene_mqtt: object | None = None
@@ -565,6 +566,10 @@ class _SessionHarness:
                 harness.events.append("scene_bridge_shutdown")
                 if harness.scene_shutdown_error is not None:
                     raise harness.scene_shutdown_error
+
+            async def poll_executions(self, devices: list[BrilliantDevice]) -> None:
+                harness.events.append("scene_poll")
+                harness.scene_poll_snapshots.append(devices)
 
         def mqtt_factory(settings: Settings) -> _SessionMqtt:
             del settings
@@ -643,6 +648,33 @@ class TestSharedHotPollSnapshot:
 
         assert harness.bus.get_all_calls == [False]
         assert harness.bus.get_device_calls.count("ble_mesh") == 0
+
+    async def test_hot_poll_snapshot_reaches_scene_bridge_only_when_enabled(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        enabled = _SessionHarness(
+            monkeypatch,
+            bridge_poll_effects={"panel": [None, asyncio.CancelledError()]},
+        )
+        settings = _scene_settings(True, str(tmp_path / "scene-state.json"))
+        object.__setattr__(settings, "hot_poll_seconds", 0.001)
+        object.__setattr__(settings, "bus_stale_seconds", 0)
+
+        with pytest.raises(asyncio.CancelledError):
+            await main_mod._run_session(settings, None, None)
+
+        disabled = _SessionHarness(
+            monkeypatch,
+            bridge_poll_effects={"panel": [asyncio.CancelledError()]},
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await main_mod._run_session(_hot_poll_settings(), None, None)
+
+        assert enabled.scene_poll_snapshots == [enabled.bus.snapshot]
+        assert enabled.scene_poll_snapshots[0] is enabled.poll_snapshots["panel"][0]
+        assert disabled.scene_poll_snapshots == []
 
     @pytest.mark.parametrize(
         "timeout_error",
