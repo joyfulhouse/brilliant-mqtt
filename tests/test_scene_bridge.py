@@ -307,7 +307,7 @@ async def test_failed_older_poll_does_not_clobber_newer_execution(
     )
     newer = _device(
         "execution_peripheral",
-        _execution("all_off", 300).variables,
+        _execution("all_off", 200).variables,
         device_id="new-panel",
     )
     older_started = asyncio.Event()
@@ -339,7 +339,7 @@ async def test_failed_older_poll_does_not_clobber_newer_execution(
     await _wait_for_publish(mqtt, scene_event_topic(_PANEL))
 
     event = _payload(_published(mqtt, scene_event_topic(_PANEL))[-1])
-    assert event["executed_at_ms"] == 300
+    assert event["executed_at_ms"] == 200
     await bridge.poll_executions([newer])
     assert processed == [older, newer]
     command_id = "22222222-2222-4222-8222-222222222222"
