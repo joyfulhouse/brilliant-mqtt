@@ -763,12 +763,10 @@ def test_payload_fields_light_full() -> None:
 
 def test_payload_fields_always_on() -> None:
     payload = payload_fields(_always_on())
-    # power="52" is deciwatts on the bus; published as 5.2 W (#36).
     assert payload == {"power": 5.2, "temperature": 43.6, "fault": False}
 
 
 def test_power_scaled_from_bus_deciwatts() -> None:
-    """Issue #36: the bus reports deciwatts; the sensor publishes watts."""
     assert payload_fields(_mesh_dimmer_with_power("418"))["power"] == 41.8
 
 

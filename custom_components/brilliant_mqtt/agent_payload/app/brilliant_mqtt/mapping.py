@@ -60,10 +60,8 @@ class AuxSpec:
     # "bool"`` only (enforced in ``__post_init__``), since the disabled-state
     # value is a boolean False.
     gate_var: str | None = None
-    # Multiplier applied to the rendered float at the payload boundary when the
-    # raw bus unit differs from the published unit (power: the bus reports
-    # deciwatts, the sensor publishes watts). Descriptor metadata (``unit``,
-    # ``device_class``) always describes the PUBLISHED, scaled value.
+    # Applied to rendered floats when bus and published units differ. Descriptor
+    # metadata always describes the published value.
     scale: float | None = None
 
     def __post_init__(self) -> None:
@@ -97,8 +95,7 @@ _LOAD_AUX: tuple[AuxSpec, ...] = (
         # "-1" is the bus sentinel for "no reading" (uncalibrated mesh loads);
         # panel loads always report a reading, so this never gates them.
         skip_values=("-1",),
-        # The bus reports power in deciwatts (0.1 W units); scale to watts at
-        # the render boundary so the published sensor reads real watts (#36).
+        # Bus power is deciwatts; publish watts at 0.1 W resolution (#36).
         scale=0.1,
     ),
     AuxSpec(
@@ -811,9 +808,6 @@ def payload_fields(device: BrilliantDevice) -> dict[str, object]:
         rendered = _render_aux(var, spec.value_kind, spec.invert)
         if rendered is None:
             continue
-        # Unit conversion at the render boundary (e.g. power: bus deciwatts ->
-        # published watts at 0.1 W resolution), mirroring how brightness is
-        # scaled inline above.
         if spec.scale is not None and isinstance(rendered, float):
             rendered = round(rendered * spec.scale, 1)
         # Gate: a bool reading that is only valid while a sibling variable is
