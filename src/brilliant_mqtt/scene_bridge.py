@@ -472,7 +472,7 @@ class SceneBridge:
         if epoch != self._epoch or self._stopping:
             return
         scene_ids, scene_healthy, mode_ids, mode_healthy = await self._async_read_catalogs(epoch)
-        # None intentionally allows processing but skips the fingerprint commit.
+        # None = stale reconcile or absent peripheral; narrows the processing call below.
         fingerprint: dict[str, str] | None = None
         async with self._lock:
             if epoch != self._epoch or self._stopping:
