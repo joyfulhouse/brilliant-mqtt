@@ -4,6 +4,62 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
+verify_armv7_shared_objects() {
+  local payload_dir="$1" readelf_bin="${READELF:-}" so
+  local file_output readelf_output failed=0 count=0
+
+  if [ -z "$readelf_bin" ]; then
+    readelf_bin="$(command -v readelf || command -v greadelf || true)"
+  fi
+  if [ -z "$readelf_bin" ]; then
+    echo "ERROR: readelf is required to verify payload architecture" >&2
+    return 1
+  fi
+
+  while IFS= read -r -d '' so; do
+    if [[ "$(basename "$so")" =~ \.so(\.[0-9]+)*$ ]]; then
+      :
+    else
+      continue
+    fi
+    count=$((count + 1))
+    file_output="$(file -bL "$so")"
+    if ! readelf_output="$("$readelf_bin" -h "$so" 2>&1)"; then
+      readelf_output="readelf failed: ${readelf_output}"
+    fi
+
+    if [[ "$file_output" != *"ELF 32-bit"* ||
+          "$file_output" != *"ARM"* ||
+          "$file_output" != *"EABI5"* ||
+          "$readelf_output" != *"Class:"*"ELF32"* ||
+          "$readelf_output" != *"Machine:"*"ARM"* ||
+          "$readelf_output" != *"Version5 EABI"* ]]; then
+      echo "ERROR: ${so} is not ELF 32-bit ARM (EABI5)" >&2
+      echo "  file: ${file_output}" >&2
+      echo "  readelf: ${readelf_output}" >&2
+      failed=1
+    fi
+  done < <(find "$payload_dir" \( -type f -o -type l \) -name '*.so*' -print0)
+
+  if [ "$count" -eq 0 ]; then
+    echo "ERROR: no shared objects found under ${payload_dir}" >&2
+    return 1
+  fi
+  if [ "$failed" -ne 0 ]; then
+    return 1
+  fi
+  echo "verified ${count} shared objects: all ELF 32-bit ARM (EABI5)"
+}
+
+if [ "${1:-}" = "--verify-architecture" ]; then
+  if [ "$#" -ne 2 ]; then
+    echo "usage: $0 --verify-architecture PAYLOAD_DIR" >&2
+    exit 2
+  fi
+  verify_armv7_shared_objects "$2"
+  exit
+fi
+
 # ── pinned artifact identifiers ───────────────────────────────────────────────
 PY_TAG="20260610"
 PY_ASSET="cpython-3.11.15+20260610-armv7-unknown-linux-gnueabihf-install_only_stripped.tar.gz"
@@ -20,7 +76,7 @@ DEB_GFORTRAN_SHA256="5aeff120a11bee91544f409d35a8236bd490e513735cf58f0ceb8362da6
 DEB_LIBSTDCXX="https://ports.ubuntu.com/ubuntu-ports/pool/main/g/gcc-12/libstdc++6_12.3.0-1ubuntu1~22.04.3_armhf.deb"
 DEB_LIBSTDCXX_SHA256="f9901b20640ebd7f6f75c528d67d2f4e4c58c8ecfb39877a4f48cbc3db96cf2c"
 
-PKGS="aioesphomeapi==45.3.1 netifaces2==0.0.22 numpy>=2,<3 pymicro-wakeword>=2,<3 pyopen-wakeword>=1,<2 zeroconf<1 getmac<1"
+PKGS="aioesphomeapi==45.3.1 netifaces2==0.0.22 numpy>=2,<3 pymicro-wakeword>=2,<3 pyopen-wakeword>=1,<2 webrtc_noise_gain==1.3.0 zeroconf<1 getmac<1"
 
 # ── staging paths ─────────────────────────────────────────────────────────────
 DEST="${ROOT}/custom_components/brilliant_mqtt/voice_payload/build/brilliant-voice"
@@ -53,10 +109,16 @@ echo "==> [2/6] Downloading armv7 cp311 wheels…"
 # shellcheck disable=SC2086
 uv run --with pip python -m pip download $PKGS \
   --only-binary=:all: --python-version 3.11 --implementation cp --abi cp311 \
-  --platform manylinux2014_armv7l --platform manylinux_2_17_armv7l \
+  --platform manylinux_2_35_armv7l --platform manylinux2014_armv7l \
+  --platform manylinux_2_17_armv7l \
   --platform manylinux_2_31_armv7l --platform linux_armv7l \
   --extra-index-url https://www.piwheels.org/simple -d "$WHEELS" >/dev/null
 for whl in "$WHEELS"/*.whl; do unzip -qo "$whl" -d "$DEST/site"; done
+# piwheels' pyopen-wakeword armv7 wheel contains an x86-64 tflite library.
+# Both wake-word packages use the same tflite C API, so replace it with the
+# genuine armv7 library from PyPI's preferred pymicro-wakeword wheel.
+cp "$DEST/site/pymicro_wakeword/lib/libtensorflowlite_c.so" \
+   "$DEST/site/pyopen_wakeword/lib/libtensorflowlite_c.so"
 rm -rf "$DEST"/site/*.dist-info
 
 # ── 3. Native libs → libs/ ───────────────────────────────────────────────────
@@ -133,6 +195,9 @@ find "$DEST/app" -name __pycache__ -type d -prune -exec rm -rf {} +
 cp "${ROOT}/deploy/voice/aec_daemon.py"       "$DEST/aec/aec_daemon.py"
 cp "${ROOT}/deploy/brilliant-voice.service"   "$DEST/brilliant-voice.service"
 printf '%s' "${VOICE_VERSION}" > "$DEST/VOICE_VERSION"
+
+echo "==> Verifying bundled shared-object architecture…"
+verify_armv7_shared_objects "$DEST"
 
 # ── 6. Tarball ────────────────────────────────────────────────────────────────
 echo "==> [6/6] Packing tarball…"

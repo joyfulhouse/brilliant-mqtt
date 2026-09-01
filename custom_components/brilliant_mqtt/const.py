@@ -170,7 +170,7 @@ def voice_asset_url(integration_version: str) -> str:
 # Voice payload version + selectable wake words.
 # Must equal src/brilliant_voice/__init__.py __version__ (a release-workflow guard
 # enforces the match). The integration downloads the matching release asset.
-VOICE_PAYLOAD_VERSION = "0.1.0"
+VOICE_PAYLOAD_VERSION = "0.1.1"
 # Bundled microWakeWord models the wake-word select offers.
 VOICE_WAKE_WORDS = ("okay_nabu", "hey_jarvis", "hey_mycroft")
 DEFAULT_VOICE_WAKE_WORD = "okay_nabu"
