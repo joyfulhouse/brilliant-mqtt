@@ -79,12 +79,17 @@ class BusClient(Protocol):
         """Return and clear whether an outbound bus write timed out."""
         ...
 
-    async def set_variables(self, device_id: str, peripheral_id: str, sets: list[VarSet]) -> None:
+    async def set_variables(self, device_id: str, peripheral_id: str, sets: list[VarSet]) -> str:
         """Write one or more variable values to the given peripheral.
 
         *device_id* routes the write to the bus device that OWNS the
         peripheral: panel loads use the panel's own CONTROL device id; mesh
         loads (plug-in switches/dimmers) use the virtual "ble_mesh" device.
+
+        Returns a SMALL normalized receipt describing the transport's
+        acknowledgement — a bounded plain string, never the closed-source
+        response object itself. Purely observational (callers may log it);
+        nothing gates on its content.
         """
         ...
 
