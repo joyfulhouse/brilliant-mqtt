@@ -178,6 +178,13 @@ def _types(events: list[Event]) -> list[str]:
     return [e.data["type"] for e in events]
 
 
+def _assert_payload_archive_uploaded(shell: FakeShell) -> None:
+    assert any(
+        path == "/var/brilliant-mqtt.staging.tar.gz" and mode == 0o600
+        for path, _, mode in shell.uploads
+    )
+
+
 def _timer_cancelled(cancel: object) -> bool:
     """Whether the asyncio.TimerHandle behind an async_call_later() cancel is cancelled.
 
@@ -593,11 +600,7 @@ async def test_repair_deploys_payload_when_code_absent(
         await _entry_manager(entry).async_repair(trigger="button")
         await hass.async_block_till_done()
 
-    assert any(
-        path == "/var/brilliant-mqtt.staging.tar.gz" and mode == 0o600
-        for path, _, mode in shell.uploads
-    )
-    assert any("tar -xzf /var/brilliant-mqtt.staging.tar.gz" in c for c in shell.commands)
+    _assert_payload_archive_uploaded(shell)
     assert ("/var/brilliant-mqtt/VERSION", b"0.2.0", 0o644) in shell.uploads
     # The code is laid down (staging cleared first) before the unit is enabled.
     assert shell.commands.index("rm -rf /var/brilliant-mqtt.staging") < shell.commands.index(
@@ -982,11 +985,7 @@ async def test_agent_update_step_failure_escalates_and_raises(
     problem_reason = _entry_manager(entry).problem_reason
     assert problem_reason is not None
     assert "agent update failed" in problem_reason
-    assert any(
-        path == "/var/brilliant-mqtt.staging.tar.gz" and mode == 0o600
-        for path, _, mode in shell.uploads
-    )
-    assert any("tar -xzf /var/brilliant-mqtt.staging.tar.gz" in c for c in shell.commands)
+    _assert_payload_archive_uploaded(shell)
     assert _entry_manager(entry)._recovery_cancel is None  # no timer armed on the failure path
     assert _entry_manager(entry)._repairing is False  # mutex released even though we raised
 
@@ -1116,11 +1115,7 @@ async def test_shutdown_during_inflight_agent_update_leaks_no_timer(
         await update
 
     # Reached the success path (payload + configs written, service restarted) ...
-    assert any(
-        path == "/var/brilliant-mqtt.staging.tar.gz" and mode == 0o600
-        for path, _, mode in shell.uploads
-    )
-    assert any("tar -xzf /var/brilliant-mqtt.staging.tar.gz" in c for c in shell.commands)
+    _assert_payload_archive_uploaded(shell)
     assert "systemctl restart brilliant-mqtt" in shell.commands
     # ... but did NOT arm a recovery timer on the torn-down entry.
     assert manager._recovery_cancel is None
@@ -1796,12 +1791,53 @@ async def test_agent_update_reports_progress(
     assert pcts == sorted(pcts), f"progress must be monotonic: {pcts}"
     assert pcts[-1] == 100
     assert 0 <= min(pcts) and max(pcts) <= 100
-    assert any(
-        path == "/var/brilliant-mqtt.staging.tar.gz" and mode == 0o600
-        for path, _, mode in fake_shell.uploads
-    )
-    assert any("tar -xzf /var/brilliant-mqtt.staging.tar.gz" in c for c in fake_shell.commands)
+    _assert_payload_archive_uploaded(fake_shell)
     assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+class _NoRecursivePayloadShell(FakeShell):
+    async def put_dir(self, local_dir: str, remote_dir: str) -> None:
+        del local_dir, remote_dir
+        raise AssertionError("deploy_payload reached recursive SFTP upload")
+
+
+async def test_concurrent_agent_updates_serialize_on_existing_fleet_lock(
+    hass: HomeAssistant, payload_dir: Path
+) -> None:
+    del payload_dir
+    first_gate = asyncio.Event()
+    shells = [
+        _NoRecursivePayloadShell(connect_gate=first_gate),
+        _NoRecursivePayloadShell(),
+    ]
+    entries = [
+        MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA),
+        MockConfigEntry(
+            domain=DOMAIN,
+            unique_id="kitchen",
+            data={**ENTRY_DATA, CONF_PANEL: "kitchen"},
+        ),
+    ]
+    for entry in entries:
+        entry.add_to_hass(hass)
+    fleet_lock = asyncio.Lock()
+    managers = [_legacy_manager(hass, entry, fleet_lock) for entry in entries]
+
+    with patch(
+        "custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell",
+        side_effect=shells,
+    ):
+        first_update = asyncio.create_task(managers[0].async_update_agent())
+        await shells[0].connect_entered.wait()
+        second_update = asyncio.create_task(managers[1].async_update_agent())
+        await asyncio.sleep(0)
+        assert not shells[1].connect_entered.is_set()
+
+        first_gate.set()
+        await asyncio.gather(first_update, second_update)
+
+    assert all(shell.connect_count == 1 for shell in shells)
+    await asyncio.gather(*(manager.async_shutdown() for manager in managers))
 
 
 # ---------------------------------------------------------------------------

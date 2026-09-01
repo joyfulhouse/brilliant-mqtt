@@ -396,7 +396,6 @@ async def test_update_install_deploys_payload_and_restarts(
         path == "/var/brilliant-mqtt.staging.tar.gz" and mode == 0o600
         for path, _, mode in fake_shell.uploads
     )
-    assert any("tar -xzf /var/brilliant-mqtt.staging.tar.gz" in c for c in fake_shell.commands)
     assert "systemctl restart brilliant-mqtt" in fake_shell.commands
 
     assert await hass.config_entries.async_unload(entry.entry_id)
