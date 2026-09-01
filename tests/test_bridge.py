@@ -2124,3 +2124,69 @@ class TestMeshConfirmedWrites:
         assert [json.loads(p[1]) for p in _mesh_states(mqtt)] == [
             {"state": "OFF", "brightness": 153}
         ]
+
+    async def test_commands_queued_at_withdraw_cannot_write_or_arm(self) -> None:
+        """Tribunal r2-1: a command already queued in the MQTT lane that
+        begins mid-withdraw finds no route — no ex-leader bus write, no
+        fresh pending/confirm task, no state:null."""
+        bus = FakeBus([_mesh_dimmer_at("1")])
+        mqtt = _BlockingUnsubscribeMqtt()
+        bridge, _clock, sleeper = _mesh_bridge_parts(bus, mqtt)
+        await bridge.reconcile()
+        mqtt.published.clear()
+
+        handoff = asyncio.create_task(bridge.withdraw())
+        await asyncio.wait_for(mqtt.unsubscribe_started.wait(), timeout=1.0)
+        # The queued command begins while withdraw awaits the broker.
+        await mqtt.inject(MESH_SET_TOPIC, json.dumps({"state": "OFF"}))
+
+        assert bus.commands == []  # no ex-leader bus write
+        await asyncio.sleep(0)
+        assert sleeper.requested == []  # no confirm task armed
+        assert _mesh_states(mqtt) == []  # no state:null published
+
+        mqtt.release_unsubscribe.set()
+        await handoff
+        await sleeper.release_all()  # nothing survives the handoff
+        assert _mesh_states(mqtt) == []
+
+    async def test_failed_pending_null_publish_repairs_on_next_observation(self) -> None:
+        """Tribunal r2-2: an MQTT failure on the initial state:null publish
+        must not poison the diff caches — a matching observation during the
+        hold republishes the null projection."""
+        bus = FakeBus([_mesh_dimmer_at("1")])
+        mqtt = _FlakyPublishMqtt()
+        bridge, _clock, _sleeper = _mesh_bridge_parts(bus, mqtt)
+        await bridge.reconcile()
+        mqtt.published.clear()
+
+        mqtt.fail_next_publish = True
+        with pytest.raises(RuntimeError):
+            await mqtt.inject(MESH_SET_TOPIC, json.dumps({"state": "OFF"}))
+
+        assert _mesh_states(mqtt) == []  # the null publish never hit the wire
+
+        # The mirror echoes the accepted value — matching, so the hold stays,
+        # and the failed null projection must now reach the wire.
+        await bus.emit(_mesh_dimmer_at("0"))
+        assert [json.loads(p[1]) for p in _mesh_states(mqtt)] == [
+            {"state": None, "brightness": 153}
+        ]
+        await bridge.withdraw()
+
+    async def test_completed_resolver_clears_its_registry_entry(self) -> None:
+        """Tribunal r2-3: a resolver that runs to completion removes its own
+        registry handle (identity-guarded), so the registry keeps meaning
+        'confirmation in progress'."""
+        bus, mqtt, bridge, clock, sleeper = _mesh_bridge([_mesh_dimmer_at("1")])
+        await bridge.reconcile()
+        await mqtt.inject(MESH_SET_TOPIC, json.dumps({"state": "OFF"}))
+        await asyncio.sleep(0)
+        assert MESH_PID in bridge._mesh_confirm_tasks  # armed while pending
+
+        clock.advance(75.0)
+        await bus.emit(_mesh_dimmer_at("0"))
+        clock.advance(5.0)
+        await sleeper.release_all()  # the confirm completes
+
+        assert bridge._mesh_confirm_tasks == {}

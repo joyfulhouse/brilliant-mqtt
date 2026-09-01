@@ -342,20 +342,28 @@ class Bridge:
         everything fresh via reconcile(). Safe to call on a bridge that never
         reconciled (no-op).
         """
-        # Revoke mesh pendings and their confirm timers FIRST, synchronously,
-        # before ANY await: an ex-leader must not resolve confirmations it no
-        # longer owns, and a deadline elapsing during the unsubscribe handoff
-        # below must not publish one. The registry union also reaches a
-        # resolver already past its pending entry (mid-publish).
+        # Step down SYNCHRONOUSLY, before ANY await. Clearing the command
+        # routing first means a command already queued in the MQTT lane that
+        # begins mid-withdraw finds no route — it can neither perform an
+        # ex-leader bus write nor arm a fresh pending/confirm task the sweep
+        # below would never see. Then revoke mesh pendings and their confirm
+        # timers: an ex-leader must not resolve confirmations it no longer
+        # owns, and a deadline elapsing during the unsubscribe handoff must
+        # not publish one (the registry union also reaches a resolver already
+        # past its pending entry, mid-publish).
+        topics = list(self._by_cmd_topic)
+        self._by_cmd_topic.clear()
         for peripheral_id in set(self._pending_mesh) | set(self._mesh_confirm_tasks):
             self._drop_pending_mesh(peripheral_id)
         # Invalidate — never clear — the write generations: a pre-withdraw bus
-        # write still stalled in flight must not match a generation minted
-        # after re-acquisition and resurrect its stale command (ABA).
+        # write still in flight (it looked up its route before this point)
+        # must not match a generation minted after re-acquisition and
+        # resurrect its stale command (ABA); its completion is rejected, so it
+        # cannot arm a pending or publish either.
         for peripheral_id in self._mesh_write_generation:
             self._mesh_write_generation[peripheral_id] += 1
         unsubscribed = 0
-        for topic in list(self._by_cmd_topic):
+        for topic in topics:
             # A failed unsubscribe must not abort the rest — a step-down must
             # always complete so the routing/state caches are reliably cleared.
             try:
@@ -363,7 +371,6 @@ class Bridge:
                 unsubscribed += 1
             except Exception:
                 logger.exception("withdraw: unsubscribe failed for %s; continuing", topic)
-        self._by_cmd_topic.clear()
         self._last_state_payload.clear()
         self._last_state_fields.clear()
         self._devices.clear()
@@ -513,6 +520,11 @@ class Bridge:
         The pending-mesh overlay is applied BEFORE either cache, so every
         publish path — echo, push, poll, and forced reconcile alike — holds
         `state: null` while a mesh write awaits confirmation.
+
+        The caches commit only AFTER the broker accepted the publish: a failed
+        publish must not leave them claiming the wire carries this payload, or
+        every identical next tick would be diff-suppressed and the retained
+        topic would stay stale until the value changed again.
         """
         peripheral_id = device.peripheral_id
         fields = self._project_pending_mesh(peripheral_id, fields)
@@ -523,15 +535,17 @@ class Bridge:
         if not force and self._last_state_fields.get(peripheral_id) == fields:
             return
         payload = _encode_fields(fields)
-        self._last_state_fields[peripheral_id] = fields
         if not force and self._last_state_payload.get(peripheral_id) == payload:
+            # Equivalent re-rendering: adopt the new projection, keep the wire.
+            self._last_state_fields[peripheral_id] = fields
             return
-        self._last_state_payload[peripheral_id] = payload
         logger.debug("state publish for %s%s", peripheral_id, " (forced)" if force else "")
         await self._async_publish_retained(
             state_topic(self._panel, peripheral_id),
             payload,
         )
+        self._last_state_fields[peripheral_id] = fields
+        self._last_state_payload[peripheral_id] = payload
 
     async def _async_publish_retained(self, topic: str, payload: str) -> None:
         """Publish through the panel ledger, or directly for the mesh bridge."""
@@ -727,34 +741,37 @@ class Bridge:
                 MESH_CONFIRM_SECONDS,
                 pending.receipt,
             )
-            return
-        self._mesh_confirm_count += 1
-        if self._mesh_confirm_count % _MESH_RECEIPT_LOG_SAMPLE_EVERY == 1:
-            logger.info(
-                "mesh write confirmed by observation for %s: %s (receipt: %s)",
-                peripheral_id,
-                pending.targets,
-                pending.receipt,
-            )
-        try:
-            await self._echo_state(
-                peripheral_id,
-                [VarSet(name, value) for name, value in pending.targets.items()],
-            )
-        except Exception:
-            # _publish_state advanced the diff caches before the publish
-            # failed, so the identical next observation would be suppressed
-            # and the retained topic would stay null. Drop the caches so the
-            # next observation republishes and repairs it (no auto-retry by
-            # design). CancelledError passes through untouched.
-            self._last_state_payload.pop(peripheral_id, None)
-            self._last_state_fields.pop(peripheral_id, None)
-            logger.warning(
-                "mesh confirm publish failed for %s; retained state repairs "
-                "on the next observation",
-                peripheral_id,
-                exc_info=True,
-            )
+        else:
+            self._mesh_confirm_count += 1
+            if self._mesh_confirm_count % _MESH_RECEIPT_LOG_SAMPLE_EVERY == 1:
+                logger.info(
+                    "mesh write confirmed by observation for %s: %s (receipt: %s)",
+                    peripheral_id,
+                    pending.targets,
+                    pending.receipt,
+                )
+            try:
+                await self._echo_state(
+                    peripheral_id,
+                    [VarSet(name, value) for name, value in pending.targets.items()],
+                )
+            except Exception:
+                # The diff caches only commit after a successful publish, so
+                # the next observation republishes and repairs the retained
+                # topic (no auto-retry by design). CancelledError passes
+                # through untouched.
+                logger.warning(
+                    "mesh confirm publish failed for %s; retained state repairs "
+                    "on the next observation",
+                    peripheral_id,
+                    exc_info=True,
+                )
+        # Registry hygiene: a completed resolver removes its own handle — but
+        # ONLY under an identity guard, so this cleanup can never strip a
+        # successor's cancellation handle. (A cancelled resolver never gets
+        # here; its canceller already popped the entry.)
+        if self._mesh_confirm_tasks.get(peripheral_id) is asyncio.current_task():
+            del self._mesh_confirm_tasks[peripheral_id]
 
     def _observe_mesh_pending(self, device: BrilliantDevice) -> None:
         """Feed one bus observation into the pending-write state machine.
