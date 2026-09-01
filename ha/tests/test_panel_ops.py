@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import io
 import json
 import os
 import re
@@ -12,6 +13,8 @@ import secrets
 import shlex
 import subprocess
 import sys
+import tarfile
+import threading
 from dataclasses import replace
 from pathlib import Path
 from uuid import UUID
@@ -1301,32 +1304,81 @@ _EXPECTED_SWAP = " && ".join(
 )
 
 
-async def test_deploy_payload_uploads_tree_then_swaps() -> None:
+async def test_deploy_payload_builds_archive_off_loop_then_extracts_and_swaps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = tmp_path / "payload"
+    app_file = payload / "app" / "brilliant_mqtt" / "__main__.py"
+    vendor_file = payload / "vendor" / "dependency.py"
+    app_file.parent.mkdir(parents=True)
+    vendor_file.parent.mkdir()
+    app_file.write_text("main = True\n")
+    vendor_file.write_text("dependency = True\n")
+    app_file.chmod(0o751)
+
+    loop_thread = threading.get_ident()
+    builder_threads: list[int] = []
+    original_builder = panel_ops._build_payload_archive
+
+    def tracking_builder(local_payload_dir: str) -> bytes:
+        builder_threads.append(threading.get_ident())
+        return original_builder(local_payload_dir)
+
+    monkeypatch.setattr(panel_ops, "_build_payload_archive", tracking_builder)
     shell = await _connected(FakeShell())
-    await panel_ops.deploy_payload(shell, "/local/payload", version="9.9.9")
+    await panel_ops.deploy_payload(shell, str(payload), version="9.9.9")
+
+    assert builder_threads and builder_threads != [loop_thread]
     assert shell.commands[0] == "rm -rf /var/brilliant-mqtt.staging"
-    assert shell.dir_uploads == [("/local/payload", "/var/brilliant-mqtt.staging")]
+    assert shell.dir_uploads == []
+    archive_path, archive_bytes, mode = shell.uploads[0]
+    assert archive_path == "/var/brilliant-mqtt.staging.tar.gz"
+    assert mode == 0o600
+    with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as archive:
+        members = {member.name: member for member in archive.getmembers()}
+        assert "./app/brilliant_mqtt/__main__.py" in members
+        assert "./vendor/dependency.py" in members
+        assert members["./app/brilliant_mqtt/__main__.py"].mode == 0o751
+    assert shell.commands[1] == (
+        "mkdir -p /var/brilliant-mqtt.staging && "
+        "tar -xzf /var/brilliant-mqtt.staging.tar.gz -C /var/brilliant-mqtt.staging && "
+        "rm -f /var/brilliant-mqtt.staging.tar.gz"
+    )
     assert _EXPECTED_SWAP in shell.commands
     assert ("/var/brilliant-mqtt/VERSION", b"9.9.9", 0o644) in shell.uploads
 
 
-async def test_deploy_payload_failed_upload_records_no_destructive_swap() -> None:
-    # A failed transfer must never half-replace a working install: only the
-    # pre-stage `rm -rf <staging>` may run before put_dir; nothing after.
-    shell = await _connected(FakeShell(put_dir_error=OSError("transfer aborted")))
-    with pytest.raises(OSError, match="transfer aborted"):
-        await panel_ops.deploy_payload(shell, "/local/payload", version="9.9.9")
-    assert shell.commands == ["rm -rf /var/brilliant-mqtt.staging"]
-    assert shell.uploads == []  # VERSION not written
+async def test_deploy_payload_failed_extraction_cannot_swap_partial_tree(tmp_path: Path) -> None:
+    payload = tmp_path / "payload"
+    (payload / "app").mkdir(parents=True)
+    (payload / "vendor").mkdir()
+    extract_command = (
+        "mkdir -p /var/brilliant-mqtt.staging && "
+        "tar -xzf /var/brilliant-mqtt.staging.tar.gz -C /var/brilliant-mqtt.staging && "
+        "rm -f /var/brilliant-mqtt.staging.tar.gz"
+    )
+    shell = await _connected(
+        FakeShell(responses={extract_command: RunResult(2, "", "invalid archive\n")})
+    )
+
+    with pytest.raises(panel_ops.PanelOpError, match="exited 2"):
+        await panel_ops.deploy_payload(shell, str(payload), version="9.9.9")
+
+    assert shell.commands == ["rm -rf /var/brilliant-mqtt.staging", extract_command]
+    assert _EXPECTED_SWAP not in shell.commands
+    assert all(path != "/var/brilliant-mqtt/VERSION" for path, _, _ in shell.uploads)
 
 
-async def test_deploy_payload_raises_and_skips_version_when_swap_fails() -> None:
+async def test_deploy_payload_raises_and_skips_version_when_swap_fails(tmp_path: Path) -> None:
     # The swap goes through _checked: a non-zero swap aborts before VERSION lands,
     # so a panel that failed to swap is never stamped with the new version.
+    payload = tmp_path / "payload"
+    (payload / "app").mkdir(parents=True)
+    (payload / "vendor").mkdir()
     shell = await _connected(FakeShell(responses={_EXPECTED_SWAP: RunResult(1, "", "mv failed\n")}))
     with pytest.raises(panel_ops.PanelOpError, match="exited 1"):
-        await panel_ops.deploy_payload(shell, "/local/payload", version="9.9.9")
-    assert shell.uploads == []  # VERSION not written
+        await panel_ops.deploy_payload(shell, str(payload), version="9.9.9")
+    assert all(path != "/var/brilliant-mqtt/VERSION" for path, _, _ in shell.uploads)
 
 
 async def test_uninstall_sequence_and_paths() -> None:

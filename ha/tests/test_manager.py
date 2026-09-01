@@ -593,7 +593,11 @@ async def test_repair_deploys_payload_when_code_absent(
         await _entry_manager(entry).async_repair(trigger="button")
         await hass.async_block_till_done()
 
-    assert shell.dir_uploads  # deploy_payload uploaded app/+vendor/
+    assert any(
+        path == "/var/brilliant-mqtt.staging.tar.gz" and mode == 0o600
+        for path, _, mode in shell.uploads
+    )
+    assert any("tar -xzf /var/brilliant-mqtt.staging.tar.gz" in c for c in shell.commands)
     assert ("/var/brilliant-mqtt/VERSION", b"0.2.0", 0o644) in shell.uploads
     # The code is laid down (staging cleared first) before the unit is enabled.
     assert shell.commands.index("rm -rf /var/brilliant-mqtt.staging") < shell.commands.index(
@@ -978,7 +982,11 @@ async def test_agent_update_step_failure_escalates_and_raises(
     problem_reason = _entry_manager(entry).problem_reason
     assert problem_reason is not None
     assert "agent update failed" in problem_reason
-    assert shell.dir_uploads  # payload reached the panel before the failing restart
+    assert any(
+        path == "/var/brilliant-mqtt.staging.tar.gz" and mode == 0o600
+        for path, _, mode in shell.uploads
+    )
+    assert any("tar -xzf /var/brilliant-mqtt.staging.tar.gz" in c for c in shell.commands)
     assert _entry_manager(entry)._recovery_cancel is None  # no timer armed on the failure path
     assert _entry_manager(entry)._repairing is False  # mutex released even though we raised
 
@@ -1108,7 +1116,11 @@ async def test_shutdown_during_inflight_agent_update_leaks_no_timer(
         await update
 
     # Reached the success path (payload + configs written, service restarted) ...
-    assert shell.dir_uploads
+    assert any(
+        path == "/var/brilliant-mqtt.staging.tar.gz" and mode == 0o600
+        for path, _, mode in shell.uploads
+    )
+    assert any("tar -xzf /var/brilliant-mqtt.staging.tar.gz" in c for c in shell.commands)
     assert "systemctl restart brilliant-mqtt" in shell.commands
     # ... but did NOT arm a recovery timer on the torn-down entry.
     assert manager._recovery_cancel is None
@@ -1784,7 +1796,11 @@ async def test_agent_update_reports_progress(
     assert pcts == sorted(pcts), f"progress must be monotonic: {pcts}"
     assert pcts[-1] == 100
     assert 0 <= min(pcts) and max(pcts) <= 100
-    assert fake_shell.dir_uploads  # the deploy actually ran
+    assert any(
+        path == "/var/brilliant-mqtt.staging.tar.gz" and mode == 0o600
+        for path, _, mode in fake_shell.uploads
+    )
+    assert any("tar -xzf /var/brilliant-mqtt.staging.tar.gz" in c for c in fake_shell.commands)
     assert await hass.config_entries.async_unload(entry.entry_id)
 
 
