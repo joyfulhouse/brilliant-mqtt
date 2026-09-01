@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable
 from copy import deepcopy
 from datetime import UTC, datetime
@@ -4848,6 +4849,44 @@ async def test_rejected_fleet_snapshot_does_not_reload_control_plane(
         assert fleet.fleet.ha_control_label == "brilliant"
         get_control_plane.assert_not_called()
         control_plane.async_reload_settings.assert_not_awaited()
+        await fleet.async_shutdown()
+
+
+async def test_update_listener_schedules_reload_when_live_reconcile_rejects(
+    hass: HomeAssistant,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A snapshot the live reconcile refuses still applies via a scheduled reload."""
+    caplog.set_level(logging.INFO, logger="custom_components.brilliant_mqtt.fleet_manager")
+    entry = _fleet_entry(_panel("office", "SHA256:office", subentry_id="panel-office"))
+    entry.add_to_hass(hass)
+    fleet = FleetManager(hass, entry)
+
+    with (
+        patch.object(PanelManager, "async_setup", _noop_setup),
+        patch.object(PanelManager, "async_shutdown", _noop_shutdown),
+        patch.object(hass.config_entries, "async_schedule_reload") as schedule_reload,
+    ):
+        await fleet.async_setup()
+        assert fleet._update_unsub is not None
+        stored_office = entry.subentries["panel-office"]
+        assert hass.config_entries.async_update_subentry(
+            entry,
+            stored_office,
+            data={
+                **stored_office.data,
+                CONF_HOST: "office-moved.example.com",
+                CONF_SSH_HOST_KEY: _OTHER_PUBLIC_KEY,
+                CONF_IDENTITY_FINGERPRINT: _OTHER_FINGERPRINT,
+            },
+            unique_id=_OTHER_FINGERPRINT,
+        )
+        await hass.async_block_till_done()
+
+        schedule_reload.assert_called_once_with(entry.entry_id)
+        # Pin the EntryDataError branch specifically: a reload scheduled by the
+        # ordinary reload_required=True return would not emit this line.
+        assert "requires a reload to apply this change" in caplog.text
         await fleet.async_shutdown()
 
 
