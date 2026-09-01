@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from time import monotonic
@@ -10,11 +11,12 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from homeassistant.components import mqtt
-from homeassistant.components.mqtt.models import ReceiveMessage
+from homeassistant.components.mqtt import ReceiveMessage
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from paho.mqtt.client import topic_matches_sub
 
+from custom_components.brilliant_mqtt import discovery_gc
 from custom_components.brilliant_mqtt.discovery_gc import (
     DISCOVERY_CONFIG_FILTER,
     async_purge_stale_discovery_configs,
@@ -30,15 +32,24 @@ LEGAL_OFFICE = "homeassistant/light/brilliant_office_HA_Backyard_Lamp_1/config"
 STALE_UNMANAGED = "homeassistant/light/brilliant_porch_HA Lamp 2/config"
 FOREIGN = "homeassistant/light/other vendor thing/config"
 
+# Real (broker-like) retained replays arrive asynchronously after SUBACK, so
+# collection only works while the GC actually sleeps its bounded window.
+SMALL_WINDOW = 0.05
+
 
 @dataclass(slots=True)
 class _FakeRetainedBroker:
-    """Retained-topic store standing in for HA's mqtt subscribe/publish seam."""
+    """Retained-topic store standing in for HA's mqtt subscribe/publish seam.
+
+    Retained and live replays are delivered asynchronously (``call_soon``) and
+    stop at unsubscribe, so a GC that skips its collection window sees nothing.
+    """
 
     retained: dict[str, str] = field(default_factory=dict)
     live_topics: list[str] = field(default_factory=list)
+    publish_errors: set[str] = field(default_factory=set)
     published: list[tuple[str, str, int, bool]] = field(default_factory=list)
-    subscribed: list[str] = field(default_factory=list)
+    subscribed: list[tuple[str, int]] = field(default_factory=list)
     unsubscribed: list[str] = field(default_factory=list)
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -53,16 +64,25 @@ class _FakeRetainedBroker:
         qos: int = 0,
         encoding: str | None = "utf-8",
     ) -> Callable[[], None]:
-        del hass, qos, encoding
-        self.subscribed.append(topic)
+        del hass, encoding
+        self.subscribed.append((topic, qos))
+        active = True
+
+        def deliver(message: ReceiveMessage) -> None:
+            if active:
+                callback(message)
+
+        loop = asyncio.get_running_loop()
         for retained_topic in sorted(self.retained):
             if topic_matches_sub(topic, retained_topic):
-                callback(self._message(topic, retained_topic, retain=True))
+                loop.call_soon(deliver, self._message(topic, retained_topic, retain=True))
         for live_topic in self.live_topics:
             if topic_matches_sub(topic, live_topic):
-                callback(self._message(topic, live_topic, retain=False))
+                loop.call_soon(deliver, self._message(topic, live_topic, retain=False))
 
         def unsubscribe() -> None:
+            nonlocal active
+            active = False
             self.unsubscribed.append(topic)
 
         return unsubscribe
@@ -77,6 +97,8 @@ class _FakeRetainedBroker:
     ) -> None:
         del hass
         self.published.append((topic, payload, qos, retain))
+        if topic in self.publish_errors:
+            raise RuntimeError("publish rejected")
         if not retain:
             return
         if payload:
@@ -88,7 +110,7 @@ class _FakeRetainedBroker:
         return ReceiveMessage(
             topic=topic,
             payload=self.retained.get(topic, "{}"),
-            qos=0,
+            qos=1,
             retain=retain,
             subscribed_topic=subscribed_topic,
             timestamp=monotonic(),
@@ -137,20 +159,24 @@ def test_matcher_owns_only_illegal_managed_configs(topic: str, stale: bool) -> N
 async def test_deletes_exactly_the_illegal_managed_retained_configs(
     hass: HomeAssistant,
     broker: _FakeRetainedBroker,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Only retained managed-panel configs with illegal object ids are deleted."""
     broker.live_topics.append("homeassistant/light/brilliant_office_live bad/config")
 
-    deleted = await async_purge_stale_discovery_configs(hass, PANELS, collection_window=0)
+    deleted = await async_purge_stale_discovery_configs(
+        hass, PANELS, collection_window=SMALL_WINDOW
+    )
 
     assert deleted == 2
-    assert broker.subscribed == [DISCOVERY_CONFIG_FILTER]
+    assert broker.subscribed == [(DISCOVERY_CONFIG_FILTER, 1)]
     assert broker.unsubscribed == [DISCOVERY_CONFIG_FILTER]
     assert broker.published == [
         (STALE_OFFICE, "", 1, True),
         (STALE_KITCHEN, "", 1, True),
     ]
     assert set(broker.retained) == {LEGAL_OFFICE, STALE_UNMANAGED, FOREIGN}
+    assert "Published 2 retained discovery-config deletions" in caplog.text
 
 
 async def test_second_run_deletes_nothing_new(
@@ -158,12 +184,50 @@ async def test_second_run_deletes_nothing_new(
     broker: _FakeRetainedBroker,
 ) -> None:
     """After one pass the stale topics are gone, so a rerun is a no-op."""
-    first = await async_purge_stale_discovery_configs(hass, PANELS, collection_window=0)
-    second = await async_purge_stale_discovery_configs(hass, PANELS, collection_window=0)
+    first = await async_purge_stale_discovery_configs(hass, PANELS, collection_window=SMALL_WINDOW)
+    second = await async_purge_stale_discovery_configs(hass, PANELS, collection_window=SMALL_WINDOW)
 
     assert first == 2
     assert second == 0
     assert len(broker.published) == 2
+
+
+async def test_cap_truncation_warns_and_still_makes_progress(
+    hass: HomeAssistant,
+    broker: _FakeRetainedBroker,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Hitting the cap deletes what was collected and never claims completion."""
+    monkeypatch.setattr(discovery_gc, "_MAX_STALE_TOPICS", 1)
+
+    deleted = await async_purge_stale_discovery_configs(
+        hass, PANELS, collection_window=SMALL_WINDOW
+    )
+
+    assert deleted == 1
+    assert broker.published == [(STALE_OFFICE, "", 1, True)]
+    assert STALE_KITCHEN in broker.retained
+    assert "truncated at 1 topics" in caplog.text
+
+
+async def test_publish_failure_is_contained_per_topic(
+    hass: HomeAssistant,
+    broker: _FakeRetainedBroker,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """One rejected deletion never aborts the rest of the batch."""
+    broker.publish_errors.add(STALE_OFFICE)
+
+    deleted = await async_purge_stale_discovery_configs(
+        hass, PANELS, collection_window=SMALL_WINDOW
+    )
+
+    assert deleted == 1
+    assert [entry[0] for entry in broker.published] == [STALE_OFFICE, STALE_KITCHEN]
+    assert STALE_OFFICE in broker.retained
+    assert STALE_KITCHEN not in broker.retained
+    assert "Published 1 of 2 retained discovery-config deletions; 1 failed" in caplog.text
 
 
 async def test_invalid_panel_slugs_are_ignored_fail_closed(
@@ -174,7 +238,7 @@ async def test_invalid_panel_slugs_are_ignored_fail_closed(
     broker.retained["homeassistant/light/brilliant_Bad Slug_x y/config"] = "{}"
 
     deleted = await async_purge_stale_discovery_configs(
-        hass, frozenset({"Bad Slug", ""}), collection_window=0
+        hass, frozenset({"Bad Slug", ""}), collection_window=SMALL_WINDOW
     )
 
     assert deleted == 0
@@ -185,6 +249,7 @@ async def test_invalid_panel_slugs_are_ignored_fail_closed(
 async def test_mqtt_failure_is_contained(
     hass: HomeAssistant,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A broken MQTT seam is attempted, swallowed, and publishes nothing."""
     attempts: list[str] = []
@@ -203,6 +268,7 @@ async def test_mqtt_failure_is_contained(
     assert deleted == 0
     assert attempts == [DISCOVERY_CONFIG_FILTER]
     publish.assert_not_awaited()
+    assert "mqtt_not_setup_cannot_subscribe" in caplog.text
 
 
 def _patched_fleet_status(monkeypatch: pytest.MonkeyPatch) -> None:

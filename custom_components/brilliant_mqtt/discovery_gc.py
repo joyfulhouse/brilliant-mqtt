@@ -9,6 +9,13 @@ recorded. This module is the designated backstop: one bounded pass per fleet
 setup deletes every retained config that is prefix-owned by a managed panel
 (the agent's ledger ownership rule, restated) AND has an object id the
 sanitizer can never emit, so an illegal id can never be current.
+
+Deleting a retained topic requires the broker principal behind Home
+Assistant's MQTT session to hold write access on ``homeassistant/#`` (in the
+reference deployment, the full-access ``ha`` user — the panels' write-only
+``brilliant`` user is the agent's principal, not this one). A restrictive ACL
+can drop the empty retained publish without any error, so this module reports
+deletions as published attempts, never as confirmed removals.
 """
 
 from __future__ import annotations
@@ -18,7 +25,7 @@ import logging
 import re
 
 from homeassistant.components import mqtt
-from homeassistant.components.mqtt.models import ReceiveMessage
+from homeassistant.components.mqtt import ReceiveMessage
 from homeassistant.core import HomeAssistant, callback
 
 _LOGGER = logging.getLogger(__name__)
@@ -58,41 +65,72 @@ async def async_purge_stale_discovery_configs(
     *,
     collection_window: float = _COLLECTION_WINDOW_SECONDS,
 ) -> int:
-    """Delete stale retained configs, containing every failure; return the count."""
+    """Publish deletions for stale retained configs, containing every failure.
+
+    Returns how many deletion publishes were handed to the broker session,
+    which is an attempt count, not a confirmed removal count.
+    """
     try:
         slugs = frozenset(panel for panel in panels if _PANEL_SLUG.fullmatch(panel))
         if not slugs:
             return 0
         stale: set[str] = set()
+        truncated = False
 
         @callback
         def collect(message: ReceiveMessage) -> None:
-            if (
-                message.subscribed_topic == DISCOVERY_CONFIG_FILTER
-                and message.retain is True
-                and len(stale) < _MAX_STALE_TOPICS
-                and is_stale_owned_discovery_topic(message.topic, slugs)
+            nonlocal truncated
+            if message.retain is not True or not is_stale_owned_discovery_topic(
+                message.topic, slugs
             ):
-                stale.add(message.topic)
+                return
+            if len(stale) >= _MAX_STALE_TOPICS and message.topic not in stale:
+                truncated = True
+                return
+            stale.add(message.topic)
 
-        unsubscribe = await mqtt.async_subscribe(hass, DISCOVERY_CONFIG_FILTER, collect)
+        unsubscribe = await mqtt.async_subscribe(hass, DISCOVERY_CONFIG_FILTER, collect, qos=1)
         try:
+            # One bounded window per fleet setup: this is a restart-time
+            # backstop, and a retained replay missed here is collected again
+            # by the next setup pass, so late arrivals self-heal.
             await asyncio.sleep(collection_window)
         finally:
             unsubscribe()
+        if truncated:
+            _LOGGER.warning(
+                "Retained discovery-config collection truncated at %d topics; "
+                "each pass deletes what it collected, so the next setup pass "
+                "continues the cleanup",
+                _MAX_STALE_TOPICS,
+            )
+        failed = 0
         for topic in sorted(stale):
-            await mqtt.async_publish(hass, topic, "", qos=1, retain=True)
-        if stale:
+            try:
+                await mqtt.async_publish(hass, topic, "", qos=1, retain=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                failed += 1
+        if failed:
+            _LOGGER.warning(
+                "Published %d of %d retained discovery-config deletions; %d failed",
+                len(stale) - failed,
+                len(stale),
+                failed,
+            )
+        elif stale:
             _LOGGER.info(
-                "Deleted %d stale pre-ledger retained discovery configs",
+                "Published %d retained discovery-config deletions",
                 len(stale),
             )
-        return len(stale)
+        return len(stale) - failed
     except asyncio.CancelledError:
         raise
     except Exception as error:
         _LOGGER.warning(
-            "Retained discovery-config cleanup failed (%s)",
+            "Retained discovery-config cleanup failed (%s: %s)",
             type(error).__name__,
+            error,
         )
         return 0
