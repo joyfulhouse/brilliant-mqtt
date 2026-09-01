@@ -260,6 +260,95 @@ async def test_poll_only_execution_publishes_event_and_persists_watermark(
     await bridge.async_shutdown()
 
 
+async def test_failed_poll_processing_retries_identical_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge, _, mqtt, _, _ = await _started(tmp_path)
+    execution = _execution("all_off", 200)
+    process = bridge._async_process_execution
+    attempts = 0
+
+    async def fail_once(
+        device: BrilliantDevice,
+        *,
+        emit_events: bool,
+        epoch: int,
+    ) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("transient processing failure")
+        await process(device, emit_events=emit_events, epoch=epoch)
+
+    monkeypatch.setattr(bridge, "_async_process_execution", fail_once)
+    mqtt.published.clear()
+
+    await bridge.poll_executions([execution])
+    assert _published(mqtt, scene_event_topic(_PANEL)) == []
+
+    await bridge.poll_executions([execution])
+    await _wait_for_publish(mqtt, scene_event_topic(_PANEL))
+
+    assert attempts == 2
+    assert len(_published(mqtt, scene_event_topic(_PANEL))) == 1
+    await bridge.async_shutdown()
+
+
+async def test_failed_older_poll_does_not_clobber_newer_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge, bus, mqtt, _, _ = await _started(tmp_path)
+    older = _device(
+        "execution_peripheral",
+        _execution("all_off", 200).variables,
+        device_id="old-panel",
+    )
+    newer = _device(
+        "execution_peripheral",
+        _execution("all_off", 300).variables,
+        device_id="new-panel",
+    )
+    older_started = asyncio.Event()
+    release_older = asyncio.Event()
+    process = bridge._async_process_execution
+    processed: list[BrilliantDevice] = []
+
+    async def fail_older(
+        device: BrilliantDevice,
+        *,
+        emit_events: bool,
+        epoch: int,
+    ) -> None:
+        processed.append(device)
+        if device is older:
+            older_started.set()
+            await release_older.wait()
+            raise RuntimeError("older processing failure")
+        await process(device, emit_events=emit_events, epoch=epoch)
+
+    monkeypatch.setattr(bridge, "_async_process_execution", fail_older)
+    mqtt.published.clear()
+
+    older_task = asyncio.create_task(bridge.poll_executions([older]))
+    await asyncio.wait_for(older_started.wait(), timeout=0.1)
+    await bridge.poll_executions([newer])
+    release_older.set()
+    await older_task
+    await _wait_for_publish(mqtt, scene_event_topic(_PANEL))
+
+    event = _payload(_published(mqtt, scene_event_topic(_PANEL))[-1])
+    assert event["executed_at_ms"] == 300
+    await bridge.poll_executions([newer])
+    assert processed == [older, newer]
+    command_id = "22222222-2222-4222-8222-222222222222"
+    await mqtt.inject(scene_command_topic(_PANEL), _command(command_id, "scene", "all_off"))
+    await _wait_for_bus_commands(bus, 1)
+    assert bus.commands[-1][0] == "new-panel"
+    await bridge.async_shutdown()
+
+
 async def test_unchanged_poll_skips_publishes_and_state_writes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

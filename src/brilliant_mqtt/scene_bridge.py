@@ -131,7 +131,7 @@ class SceneBridge:
         self._callbacks_registered = False
         self._subscribed_topics: list[str] = []
         self._execution: BrilliantDevice | None = None
-        self._execution_variables: dict[str, Variable] | None = None
+        self._processed_execution_variables: dict[str, Variable] | None = None
         self._execution_available = False
         self._scene_ids: frozenset[str] = frozenset()
         self._mode_ids: frozenset[str] = frozenset()
@@ -243,19 +243,24 @@ class SceneBridge:
         async with self._lock:
             if not self._started or self._stopping:
                 return
-            if execution.variables == self._execution_variables:
+            if execution.variables == self._processed_execution_variables:
                 return
             self._operation_generation += 1
+            generation = self._operation_generation
             self._set_execution(execution)
             epoch = self._epoch
         try:
-            await self._async_process_execution(execution, emit_events=True, epoch=epoch)
+            await self._async_process_execution_snapshot(
+                execution,
+                emit_events=True,
+                epoch=epoch,
+                generation=generation,
+            )
         except Exception:
             logger.exception("scene bridge execution poll failed; continuing")
 
     def _set_execution(self, execution: BrilliantDevice | None) -> None:
         self._execution = execution
-        self._execution_variables = None if execution is None else dict(execution.variables)
         self._execution_available = execution is not None
 
     async def async_shutdown(self) -> None:
@@ -474,7 +479,12 @@ class SceneBridge:
             await self._async_health_status("mode")
             return
         if execution is not None:
-            await self._async_process_execution(execution, emit_events=emit_history, epoch=epoch)
+            await self._async_process_execution_snapshot(
+                execution,
+                emit_events=emit_history,
+                epoch=epoch,
+                generation=generation,
+            )
         if not during_start:
             await self._async_health_status("scene")
             await self._async_health_status("mode")
@@ -495,8 +505,14 @@ class SceneBridge:
                     self._schedule_pending_deadlines()
                     self._schedule_delivery()
                     break
+                generation = self._operation_generation
                 self._set_execution(buffered)
-            await self._async_process_execution(buffered, emit_events=True, epoch=epoch)
+            await self._async_process_execution_snapshot(
+                buffered,
+                emit_events=True,
+                epoch=epoch,
+                generation=generation,
+            )
         await self._async_health_status("scene")
         await self._async_health_status("mode")
 
@@ -585,12 +601,35 @@ class SceneBridge:
             if self._startup_active:
                 self._startup_buffered_execution = device
                 return
+            generation = self._operation_generation
             self._set_execution(device)
             epoch = self._epoch
         try:
-            await self._async_process_execution(device, emit_events=True, epoch=epoch)
+            await self._async_process_execution_snapshot(
+                device,
+                emit_events=True,
+                epoch=epoch,
+                generation=generation,
+            )
         except Exception:
             logger.exception("scene bridge execution callback failed; continuing")
+
+    async def _async_process_execution_snapshot(
+        self,
+        device: BrilliantDevice,
+        *,
+        emit_events: bool,
+        epoch: int,
+        generation: int,
+    ) -> None:
+        await self._async_process_execution(device, emit_events=emit_events, epoch=epoch)
+        async with self._lock:
+            if (
+                epoch == self._epoch
+                and generation == self._operation_generation
+                and not self._stopping
+            ):
+                self._processed_execution_variables = dict(device.variables)
 
     async def _async_process_execution(
         self,
