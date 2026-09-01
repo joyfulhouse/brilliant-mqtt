@@ -59,6 +59,7 @@ from .const import (
     FLEET_UNIQUE_ID,
     SUBENTRY_TYPE_PANEL,
 )
+from .discovery_gc import async_purge_stale_discovery_configs
 from .entry_data import (
     EntryDataError,
     FleetConfig,
@@ -1516,6 +1517,14 @@ class FleetManager:
                     self.hass, self._async_broker_status
                 )
                 self._async_broker_status(mqtt.is_connected(self.hass))
+                self.entry.async_create_background_task(
+                    self.hass,
+                    async_purge_stale_discovery_configs(
+                        self.hass,
+                        frozenset(manager.panel for manager in self._panels.values()),
+                    ),
+                    "brilliant-mqtt-discovery-gc",
+                )
             except BaseException:
                 await _async_settle_cleanup(
                     self._async_cleanup_failed_setup(tuple(managers.values()))
