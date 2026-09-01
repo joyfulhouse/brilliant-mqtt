@@ -11,7 +11,7 @@ import asyncio
 import json
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 
 from brilliant_mqtt import __version__
@@ -37,6 +37,45 @@ logger = logging.getLogger(__name__)
 # Reserved pseudo-panel slug — the mesh bridge instance publishes no meta topic
 # (there is no single host behind it; see discovery.config_payload's mesh branch).
 _MESH_PANEL = "mesh"
+
+# The virtual bus device carrying every BLE-mesh load. Primary commands routed
+# here get observation-confirmed writes instead of the optimistic echo (issues
+# #46/#47): the BLE layer can silently drop an RPC-accepted write, and the
+# notification-fed mirror carries the accepted value until the backend
+# reconciles (75.2s observed maximum), so neither the ack nor an early read-back
+# can attest the outcome.
+_MESH_DEVICE_ID = "ble_mesh"
+
+# How long a commanded mesh value must be observed stable before it is
+# published as truth. Clears the 75.2s measured revert tail (495 recorded
+# false-off events, p99 59.5s). Fixed by design — deliberately not
+# configurable.
+MESH_CONFIRM_SECONDS = 80.0
+
+# An observation older than this at the confirm deadline cannot attest the
+# outcome — the pending closes unconfirmed and state stays unknown (the
+# stale-stream watchdog owns stream recovery).
+MESH_CONFIRM_MAX_OBSERVATION_AGE_S = 10.0
+
+# Confirm receipts log at INFO once every N confirmations (contradiction
+# receipts always log at WARNING — those are the known-failed deliveries).
+_MESH_RECEIPT_LOG_SAMPLE_EVERY = 10
+
+
+@dataclass
+class _PendingMeshWrite:
+    """One in-flight mesh primary write awaiting observation-based confirmation."""
+
+    generation: int
+    # Commanded variable values (name -> string value), compared verbatim
+    # against observed snapshots: any differing value is a contradiction.
+    targets: dict[str, str]
+    # Normalized transport-ack receipt from BusClient.set_variables — logged
+    # on contradiction (known-failed delivery) and sampled on confirm.
+    receipt: str
+    # Bridge-clock time of the newest observation matching the targets.
+    last_observed_at: float | None = None
+    task: asyncio.Task[None] | None = None
 
 
 @dataclass
@@ -106,6 +145,7 @@ class Bridge:
         reconcile_max_writes_per_tick: int = 4,
         reconcile_min_write_spacing_s: float = 0.5,
         clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], Awaitable[None]] | None = None,
         write_throttle: WriteThrottle | None = None,
         owned_topics: RetainedTopicLedger | None = None,
         deployment_id: str | None = None,
@@ -135,6 +175,8 @@ class Bridge:
         self._reconcile_max_writes_per_tick = reconcile_max_writes_per_tick
         self._reconcile_min_write_spacing_s = reconcile_min_write_spacing_s
         self._clock = clock
+        # Test seam only (like clock): the mesh confirm deadline sleeps here.
+        self._sleep: Callable[[float], Awaitable[None]] = asyncio.sleep if sleep is None else sleep
         self._owned_topics = owned_topics
         # (peripheral_id, var) -> monotonic time of last re-assert attempt.
         self._last_reassert: dict[tuple[str, str], float] = {}
@@ -160,6 +202,13 @@ class Bridge:
         # before JSON serialization; the payload cache preserves wire-level
         # publish decisions for any projections with equivalent JSON.
         self._last_state_fields: dict[str, dict[str, object]] = {}
+        # Mesh primaries only (issues #46/#47): peripheral_id → in-flight write
+        # awaiting observation-based confirmation, plus the generation counter
+        # that lets a newer command supersede an older one whose async
+        # completions may still be in flight.
+        self._pending_mesh: dict[str, _PendingMeshWrite] = {}
+        self._mesh_write_generation: dict[str, int] = {}
+        self._mesh_confirm_count = 0
 
         bus.on_change(self._on_change)
         mqtt.on_command(self._on_command)
@@ -224,6 +273,7 @@ class Bridge:
 
             device = self._derived(device)
             self._devices[device.peripheral_id] = device
+            self._observe_mesh_pending(device)
 
             # Publish one discovery config per entity descriptor.
             for descriptor in descriptors:
@@ -298,6 +348,11 @@ class Bridge:
         self._last_state_payload.clear()
         self._last_state_fields.clear()
         self._devices.clear()
+        # An ex-leader must not resolve confirmations it no longer owns — the
+        # new leader's observations decide; no write is retried.
+        for peripheral_id in list(self._pending_mesh):
+            self._drop_pending_mesh(peripheral_id)
+        self._mesh_write_generation.clear()
         if self._deriver is not None:
             # An ex-leader must not carry hold state into a re-acquisition;
             # the new session starts cold (motion off until the next spike).
@@ -334,6 +389,7 @@ class Bridge:
                 continue
             device = self._derived(device)
             self._devices[device.peripheral_id] = device
+            self._observe_mesh_pending(device)
             fields = payload_fields(device)
             if fields:
                 await self._publish_state(device, fields, force=False)
@@ -439,8 +495,13 @@ class Bridge:
         Skips serialization when the projected fields match, then preserves
         the wire-payload comparison for publish parity. *force* bypasses both
         checks for reconcile's level-triggered repair.
+
+        The pending-mesh overlay is applied BEFORE either cache, so every
+        publish path — echo, push, poll, and forced reconcile alike — holds
+        `state: null` while a mesh write awaits confirmation.
         """
         peripheral_id = device.peripheral_id
+        fields = self._project_pending_mesh(peripheral_id, fields)
         # Accepted parity exception: dict equality treats numerically-equal
         # values as equal (-0.0 == 0.0, 1 == 1.0), so such a re-rendering keeps
         # the older wire bytes. Every payload key's TYPE is static per spec
@@ -481,6 +542,7 @@ class Bridge:
 
         device = self._derived(device)
         self._devices[device.peripheral_id] = device
+        self._observe_mesh_pending(device)
 
         fields = payload_fields(device)
         if fields:
@@ -529,8 +591,13 @@ class Bridge:
                 peripheral_id,
                 {s.name: s.value for s in sets},
             )
+            if device.device_id == _MESH_DEVICE_ID:
+                # Mesh primaries: no optimistic echo — observation-confirmed
+                # write with a pending-visible (state: null) window instead.
+                await self._write_mesh_primary(device, peripheral_id, sets)
+                return
             # Route the write to the bus device owning the peripheral (the
-            # panel's own CONTROL device, or "ble_mesh" for mesh loads).
+            # panel's own CONTROL device for wired loads).
             await self._bus.set_variables(device.device_id, peripheral_id, sets)
             await self._echo_state(peripheral_id, sets)
 
@@ -558,6 +625,160 @@ class Bridge:
         sets = [VarSet(d.command_var, value)]
         await self._bus.set_variables(device.device_id, peripheral_id, sets)
         await self._echo_state(peripheral_id, sets)
+
+    async def _write_mesh_primary(
+        self, device: BrilliantDevice, peripheral_id: str, sets: list[VarSet]
+    ) -> None:
+        """Mesh primary write with observation-confirmed publication (#46/#47).
+
+        A mesh ``set_variables`` can be RPC-accepted yet never actuate: the BLE
+        layer drops it silently and the notification-fed mirror carries the
+        accepted value until the backend reconciles (75.2s observed maximum) —
+        so a matching observation proves nothing, while a CONTRADICTING one
+        proves failure. Until :meth:`_resolve_pending_mesh` settles the write,
+        every publish for the peripheral holds ``state: null`` (HA `unknown`);
+        aux keys keep their live values throughout (a null aux key would render
+        as a false OFF through the aux value templates — exactly the defect
+        this exists to eliminate).
+        """
+        # Generation FIRST, before any await: a newer command supersedes this
+        # one even while this write is still in flight on the bus.
+        generation = self._mesh_write_generation.get(peripheral_id, 0) + 1
+        self._mesh_write_generation[peripheral_id] = generation
+        try:
+            receipt = await self._bus.set_variables(device.device_id, peripheral_id, sets)
+        except Exception:
+            if self._mesh_write_generation.get(peripheral_id) != generation:
+                # Superseded mid-flight — the newer command owns the pending
+                # state now; surface the failure through the command lane only.
+                raise
+            # Mode A (bounded write failure): nothing was fabricated, so the
+            # last observed snapshot is still the best truth — force it back
+            # out past every cache and terminate any pending hold.
+            self._drop_pending_mesh(peripheral_id)
+            logger.warning(
+                "mesh write failed for %s/%s; republishing last observed state",
+                device.device_id,
+                peripheral_id,
+                exc_info=True,
+            )
+            observed = self._devices.get(peripheral_id)
+            if observed is not None:
+                fields = payload_fields(observed)
+                if fields:
+                    await self._publish_state(observed, fields, force=True)
+            return
+
+        if self._mesh_write_generation.get(peripheral_id) != generation:
+            # A newer command started while this write awaited; its pending
+            # (and confirm timer) already superseded this one.
+            return
+        self._drop_pending_mesh(peripheral_id)
+        pending = _PendingMeshWrite(
+            generation=generation,
+            targets={s.name: s.value for s in sets},
+            receipt=receipt,
+        )
+        self._pending_mesh[peripheral_id] = pending
+        pending.task = asyncio.create_task(
+            self._resolve_pending_mesh(peripheral_id, generation),
+            name=f"brilliant-mqtt-mesh-confirm-{peripheral_id}",
+        )
+        snapshot = self._devices.get(peripheral_id)
+        if snapshot is not None:
+            fields = payload_fields(snapshot)
+            if fields:
+                await self._publish_state(snapshot, fields, force=False)
+
+    async def _resolve_pending_mesh(self, peripheral_id: str, generation: int) -> None:
+        """Deadline arm of the pending-write state machine (background task).
+
+        Runs OUTSIDE the MQTT command lane so confirmation never blocks the
+        next command. Sleeps out the confirmation window, then — if this
+        generation still owns the pending — publishes the commanded value only
+        when a fresh observation backs it; otherwise closes unconfirmed and
+        leaves state unknown (the stale-stream watchdog owns stream recovery).
+        """
+        await self._sleep(MESH_CONFIRM_SECONDS)
+        pending = self._pending_mesh.get(peripheral_id)
+        if pending is None or pending.generation != generation:
+            return
+        del self._pending_mesh[peripheral_id]
+        if (
+            pending.last_observed_at is None
+            or (self._clock() - pending.last_observed_at) > MESH_CONFIRM_MAX_OBSERVATION_AGE_S
+        ):
+            logger.warning(
+                "mesh write for %s unconfirmed after %.0fs (no fresh observation); "
+                "state stays unknown (receipt: %s)",
+                peripheral_id,
+                MESH_CONFIRM_SECONDS,
+                pending.receipt,
+            )
+            return
+        self._mesh_confirm_count += 1
+        if self._mesh_confirm_count % _MESH_RECEIPT_LOG_SAMPLE_EVERY == 1:
+            logger.info(
+                "mesh write confirmed by observation for %s: %s (receipt: %s)",
+                peripheral_id,
+                pending.targets,
+                pending.receipt,
+            )
+        await self._echo_state(
+            peripheral_id,
+            [VarSet(name, value) for name, value in pending.targets.items()],
+        )
+
+    def _observe_mesh_pending(self, device: BrilliantDevice) -> None:
+        """Feed one bus observation into the pending-write state machine.
+
+        A value CONTRADICTING the commanded target proves the write did not
+        take (the mirror only ever lies TOWARD the accepted value) — cancel
+        immediately; the caller's publish that follows surfaces the observed
+        truth. A MATCHING value is deliberately NOT confirmation (the mirror
+        can carry the accepted-but-undelivered value for ~75s); it only
+        refreshes the observation clock the confirm deadline checks.
+        """
+        pending = self._pending_mesh.get(device.peripheral_id)
+        if pending is None:
+            return
+        observed = {name: device.variables.get(name) for name in pending.targets}
+        for name, want in pending.targets.items():
+            var = observed[name]
+            if var is not None and var.value != want:
+                self._drop_pending_mesh(device.peripheral_id)
+                logger.warning(
+                    "mesh write contradicted by observation for %s (%s=%s, wanted %s); "
+                    "publishing observed state (receipt: %s)",
+                    device.peripheral_id,
+                    name,
+                    var.value,
+                    want,
+                    pending.receipt,
+                )
+                return
+        if all(var is not None for var in observed.values()):
+            pending.last_observed_at = self._clock()
+
+    def _drop_pending_mesh(self, peripheral_id: str) -> None:
+        """Remove and cancel any pending confirmation for *peripheral_id*."""
+        pending = self._pending_mesh.pop(peripheral_id, None)
+        if pending is not None and pending.task is not None:
+            pending.task.cancel()
+
+    def _project_pending_mesh(
+        self, peripheral_id: str, fields: dict[str, object]
+    ) -> dict[str, object]:
+        """Overlay ``state: null`` while a mesh write awaits confirmation.
+
+        ONLY the primary state key is withheld — null renders `unknown`
+        through the primary light/switch template. Every aux key keeps its
+        real observed value: the aux value templates collapse null into a
+        false OFF (issue #47), which would invert safety-meaning entities.
+        """
+        if peripheral_id not in self._pending_mesh or "state" not in fields:
+            return fields
+        return {**fields, "state": None}
 
     async def _echo_state(self, peripheral_id: str, sets: list[VarSet]) -> None:
         """Optimistically fold written VarSets into the snapshot and republish state.

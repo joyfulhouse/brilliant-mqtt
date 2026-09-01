@@ -43,6 +43,11 @@ class FakeBus:
         self.reconnect_count: int = 0
         self.reconnect_window_queried: float | None = None
         self.write_timeout_latched = False
+        # Raised (when set) by every set_variables call — simulates a failed
+        # bus write; the attempt is NOT recorded in ``commands``.
+        self.set_variables_error: Exception | None = None
+        # Returned by set_variables as the normalized transport-ack receipt.
+        self.set_variables_receipt: str = "FakeSetVariablesResponse()"
 
     async def start(self) -> None:
         pass
@@ -81,8 +86,11 @@ class FakeBus:
         self.write_timeout_latched = False
         return timed_out
 
-    async def set_variables(self, device_id: str, peripheral_id: str, sets: list[VarSet]) -> None:
+    async def set_variables(self, device_id: str, peripheral_id: str, sets: list[VarSet]) -> str:
+        if self.set_variables_error is not None:
+            raise self.set_variables_error
         self.commands.append((device_id, peripheral_id, list(sets)))
+        return self.set_variables_receipt
 
     async def shutdown(self) -> None:
         pass
@@ -122,6 +130,39 @@ class FakeClock:
 
     def advance(self, seconds: float) -> None:
         self.now += seconds
+
+
+class FakeSleeper:
+    """Deterministic replacement for asyncio.sleep: callers block until released.
+
+    Injected as the Bridge's ``sleep`` seam so the mesh confirmation deadline
+    fires exactly when a test releases it, never on real time. Requested
+    durations are recorded so tests can assert the confirmation window.
+    """
+
+    def __init__(self) -> None:
+        self.requested: list[float] = []
+        self._waiters: list[asyncio.Future[None]] = []
+
+    async def __call__(self, seconds: float) -> None:
+        self.requested.append(seconds)
+        future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._waiters.append(future)
+        try:
+            await future
+        finally:
+            if future in self._waiters:
+                self._waiters.remove(future)
+
+    async def release_all(self) -> None:
+        """Wake every blocked sleeper, then let the released tasks run."""
+        # Let freshly-created tasks reach their sleep before releasing.
+        await asyncio.sleep(0)
+        for future in list(self._waiters):
+            if not future.done():
+                future.set_result(None)
+        for _ in range(3):
+            await asyncio.sleep(0)
 
 
 class FakeClockMs:

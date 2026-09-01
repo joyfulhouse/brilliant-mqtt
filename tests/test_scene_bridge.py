@@ -315,7 +315,7 @@ async def test_hung_write_does_not_block_timeout_or_shutdown(tmp_path: Path) -> 
 
         async def set_variables(
             self, device_id: str, peripheral_id: str, sets: list[VarSet]
-        ) -> None:
+        ) -> str:
             await super().set_variables(device_id, peripheral_id, sets)
             self.write_started.set()
             try:
@@ -323,6 +323,7 @@ async def test_hung_write_does_not_block_timeout_or_shutdown(tmp_path: Path) -> 
             except asyncio.CancelledError:
                 self.write_cancelled.set()
                 raise
+            raise AssertionError("unreachable: the write only ends by cancellation")
 
     bus = HangingBus()
     mqtt = FakeMqtt()
@@ -474,7 +475,7 @@ async def test_write_failure_is_sanitized_and_cached(tmp_path: Path) -> None:
     class FailingBus(FakeBus):
         async def set_variables(
             self, device_id: str, peripheral_id: str, sets: list[VarSet]
-        ) -> None:
+        ) -> str:
             await super().set_variables(device_id, peripheral_id, sets)
             raise RuntimeError("token=secret\nunsafe")
 
@@ -1247,13 +1248,14 @@ async def test_shutdown_abandons_write_that_delays_cancellation(tmp_path: Path) 
 
         async def set_variables(
             self, device_id: str, peripheral_id: str, sets: list[VarSet]
-        ) -> None:
+        ) -> str:
             await super().set_variables(device_id, peripheral_id, sets)
             self.started.set()
             try:
                 await asyncio.Future()
             except asyncio.CancelledError:
                 await self.release.wait()
+            return self.set_variables_receipt
 
     bus = DelayedCancellationBus()
     mqtt = FakeMqtt()

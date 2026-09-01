@@ -11,7 +11,9 @@ Fixtures mirror the real office panel:
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -22,7 +24,7 @@ from brilliant_mqtt.commands import VarSet
 from brilliant_mqtt.mapping import payload_fields
 from brilliant_mqtt.model import BrilliantDevice, DeviceKind, Variable
 from brilliant_mqtt.retained_topics import RetainedTopicLedger
-from tests.fakes import FakeBus, FakeMqtt
+from tests.fakes import FakeBus, FakeClock, FakeMqtt, FakeSleeper
 
 PANEL = "office"
 
@@ -699,6 +701,10 @@ class TestOptimisticEcho:
 
     Pilot finding: the bus never pushed a notification for a successful muted=1
     write, leaving HA stale until the periodic resync.
+
+    Scope (issues #46/#47): this echo covers WIRED primaries and every aux
+    write. Mesh (ble_mesh) primaries never echo — they get observation-
+    confirmed writes instead (see TestMeshConfirmedWrites).
     """
 
     async def test_aux_write_echoes_state(self, hardware: BrilliantDevice) -> None:
@@ -1575,3 +1581,362 @@ class TestMeshMotionAuxCommands:
         bus.commands.clear()
         await mqtt.inject(f"brilliant/{MESH_PANEL}/{MESH_PID}/set_motion_low_threshold", "15")
         assert bus.commands[-1] == ("ble_mesh", MESH_PID, [VarSet("motion_low_threshold", "15")])
+
+
+# ===========================================================================
+# Issues #46/#47 — observation-confirmed mesh primary writes
+# ===========================================================================
+#
+# A mesh set_variables can be RPC-accepted yet never actuate: the BLE layer
+# drops it silently and the notification-fed mirror carries the accepted value
+# until the backend reconciles (75.2s observed maximum). Mesh primaries
+# therefore never echo optimistically: HA sees `state: null` (unknown) until
+# the commanded value has been observed stable for MESH_CONFIRM_SECONDS, a
+# contradicting observation cancels immediately, and a write error restores
+# the last observed truth. Wired primaries and ALL aux paths keep the echo.
+
+MESH_SET_TOPIC = f"brilliant/{MESH_PANEL}/{MESH_PID}/set"
+MESH_STATE_TOPIC = f"brilliant/{MESH_PANEL}/{MESH_PID}/state"
+
+
+def _mesh_dimmer_at(on: str, intensity: str = "600") -> BrilliantDevice:
+    """The mesh_dimmer fixture's shape at an arbitrary observed on/intensity."""
+    return BrilliantDevice(
+        device_id="ble_mesh",
+        peripheral_id=MESH_PID,
+        name="Office Desk Lights",
+        kind=DeviceKind.LIGHT,
+        peripheral_type=27,
+        variables={
+            "on": Variable("on", on),
+            "intensity": Variable("intensity", intensity),
+        },
+    )
+
+
+def _mesh_motion_dimmer_at(on: str, enable_motion_score: str = "1") -> BrilliantDevice:
+    """A mesh dimmer whose motion aux subsystem contributes live payload keys."""
+    return BrilliantDevice(
+        device_id="ble_mesh",
+        peripheral_id=MESH_PID,
+        name="Office Desk Lights",
+        kind=DeviceKind.LIGHT,
+        peripheral_type=27,
+        variables={
+            "on": Variable("on", on),
+            "intensity": Variable("intensity", "600"),
+            "movement_detected": Variable("movement_detected", "1"),
+            "motion_score": Variable("motion_score", "42"),
+            "enable_motion_score": Variable("enable_motion_score", enable_motion_score),
+            "motion_high_threshold": Variable("motion_high_threshold", "70"),
+            "motion_low_threshold": Variable("motion_low_threshold", "20"),
+        },
+    )
+
+
+def _mesh_bridge(
+    devices: list[BrilliantDevice],
+) -> tuple[FakeBus, FakeMqtt, Bridge, FakeClock, FakeSleeper]:
+    bus = FakeBus(devices)
+    mqtt = FakeMqtt()
+    clock = FakeClock()
+    sleeper = FakeSleeper()
+    bridge = Bridge(bus, mqtt, MESH_PANEL, include=_is_mesh, clock=clock, sleep=sleeper)
+    return bus, mqtt, bridge, clock, sleeper
+
+
+def _mesh_states(mqtt: FakeMqtt) -> list[tuple[str, str, bool]]:
+    return [p for p in mqtt.published if p[0] == MESH_STATE_TOPIC]
+
+
+class TestMeshConfirmedWrites:
+    async def test_accepted_off_publishes_unknown_not_optimistic_off(self) -> None:
+        """A silently-accepted mesh OFF must never fabricate `state: OFF` (#46)."""
+        bus, mqtt, bridge, _clock, _sleeper = _mesh_bridge([_mesh_dimmer_at("1")])
+        await bridge.reconcile()
+        mqtt.published.clear()
+
+        await mqtt.inject(MESH_SET_TOPIC, json.dumps({"state": "OFF"}))
+
+        assert bus.commands == [("ble_mesh", MESH_PID, [VarSet("on", "0")])]
+        states = _mesh_states(mqtt)
+        assert len(states) == 1
+        payload = json.loads(states[0][1])
+        assert payload["state"] is None  # wire null -> HA `unknown`, never OFF
+        assert payload["brightness"] == 153  # companion keys keep observed values
+        assert states[0][2] is True
+        await bridge.withdraw()
+
+    async def test_pending_null_never_reaches_aux_keys(self) -> None:
+        """Aux keys keep LIVE values while pending — null there renders a
+        false OFF through the aux value templates (#47)."""
+        bus, mqtt, bridge, _clock, _sleeper = _mesh_bridge([_mesh_motion_dimmer_at("1")])
+        await bridge.reconcile()
+        mqtt.published.clear()
+
+        await mqtt.inject(MESH_SET_TOPIC, json.dumps({"state": "OFF"}))
+
+        states = _mesh_states(mqtt)
+        assert len(states) == 1
+        payload = json.loads(states[0][1])
+        assert payload["state"] is None
+        assert payload["enable_motion_score"] is True
+        assert payload["motion"] is True
+        assert payload["motion_score"] == 42
+        await bridge.withdraw()
+
+    async def test_matching_observation_is_not_confirmation(self) -> None:
+        """The mirror carries the accepted value even when delivery failed, so
+        a matching observation must keep the state withheld."""
+        bus, mqtt, bridge, _clock, _sleeper = _mesh_bridge([_mesh_dimmer_at("1")])
+        await bridge.reconcile()
+        await mqtt.inject(MESH_SET_TOPIC, json.dumps({"state": "OFF"}))
+        mqtt.published.clear()
+
+        await bus.emit(_mesh_dimmer_at("0"))  # mirror echoes the accepted value
+
+        assert _mesh_states(mqtt) == []  # projection holds; no OFF escapes
+        await bridge.withdraw()
+
+    async def test_reverting_observation_cancels_and_publishes_observed(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        bus, mqtt, bridge, clock, sleeper = _mesh_bridge([_mesh_dimmer_at("1")])
+        await bridge.reconcile()
+        await mqtt.inject(MESH_SET_TOPIC, json.dumps({"state": "OFF"}))
+        mqtt.published.clear()
+
+        await bus.emit(_mesh_dimmer_at("0"))  # mirror at the accepted value
+        clock.advance(30.0)
+        with caplog.at_level(logging.WARNING, logger="brilliant_mqtt.bridge"):
+            await bus.emit(_mesh_dimmer_at("1"))  # backend reconciled: write lost
+
+        states = _mesh_states(mqtt)
+        assert [json.loads(p[1]) for p in states] == [{"state": "ON", "brightness": 153}]
+        warning = next(r for r in caplog.records if "contradicted" in r.getMessage())
+        assert bus.set_variables_receipt in warning.getMessage()
+
+        # The confirm timer is gone with the pending: releasing it is a no-op.
+        await sleeper.release_all()
+        assert len(_mesh_states(mqtt)) == 1
+
+    async def test_stable_target_confirms_exactly_once(self) -> None:
+        bus, mqtt, bridge, clock, sleeper = _mesh_bridge([_mesh_dimmer_at("1")])
+        await bridge.reconcile()
+        await mqtt.inject(MESH_SET_TOPIC, json.dumps({"state": "OFF"}))
+        mqtt.published.clear()
+        await asyncio.sleep(0)  # let the confirm task reach its sleep
+        assert sleeper.requested == [80.0]  # the fixed confirmation window
+
+        # Matching observations via BOTH push and poll during the window.
+        await bus.emit(_mesh_dimmer_at("0"))
+        bus.set_devices([_mesh_dimmer_at("0")])
+        await bridge.poll_once()
+        clock.advance(75.0)
+        await bus.emit(_mesh_dimmer_at("0"))  # fresh (<=10s) at the deadline
+        clock.advance(5.0)
+        await sleeper.release_all()
+
+        states = _mesh_states(mqtt)
+        assert [json.loads(p[1]) for p in states] == [{"state": "OFF", "brightness": 153}]
+
+        # Post-confirm observations of the same value stay diff-suppressed.
+        await bus.emit(_mesh_dimmer_at("0"))
+        await bridge.poll_once()
+        assert len(_mesh_states(mqtt)) == 1
+
+    async def test_stale_stream_at_deadline_closes_unconfirmed(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        bus, mqtt, bridge, clock, sleeper = _mesh_bridge([_mesh_dimmer_at("1")])
+        await bridge.reconcile()
+        await mqtt.inject(MESH_SET_TOPIC, json.dumps({"state": "OFF"}))
+        mqtt.published.clear()
+
+        clock.advance(5.0)
+        await bus.emit(_mesh_dimmer_at("0"))  # last observation at t=5
+        clock.advance(75.0)  # deadline at t=80: observation is 75s stale
+        with caplog.at_level(logging.WARNING, logger="brilliant_mqtt.bridge"):
+            await sleeper.release_all()
+
+        assert _mesh_states(mqtt) == []  # state stays unknown
+        assert any("unconfirmed" in r.getMessage() for r in caplog.records)
+
+        # The pending is closed: the next observation publishes the truth.
+        await bus.emit(_mesh_dimmer_at("1"))
+        assert [json.loads(p[1]) for p in _mesh_states(mqtt)] == [
+            {"state": "ON", "brightness": 153}
+        ]
+
+    async def test_write_error_republishes_observed_state(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Mode A: a failed write fabricates nothing and force-restores truth."""
+        bus, mqtt, bridge, _clock, sleeper = _mesh_bridge([_mesh_dimmer_at("1")])
+        await bridge.reconcile()
+        mqtt.published.clear()
+        bus.set_variables_error = TimeoutError("No response received!")
+
+        with caplog.at_level(logging.WARNING, logger="brilliant_mqtt.bridge"):
+            await mqtt.inject(MESH_SET_TOPIC, json.dumps({"state": "OFF"}))
+
+        assert bus.commands == []
+        # Forced past the diff cache: the identical payload reconcile already
+        # published goes out again, guaranteeing the retained topic holds truth.
+        states = _mesh_states(mqtt)
+        assert [json.loads(p[1]) for p in states] == [{"state": "ON", "brightness": 153}]
+        await asyncio.sleep(0)
+        assert sleeper.requested == []  # no pending, no confirm timer
+        assert any("mesh write failed" in r.getMessage() for r in caplog.records)
+
+    async def test_write_error_terminates_prior_pending(self) -> None:
+        bus, mqtt, bridge, _clock, sleeper = _mesh_bridge([_mesh_dimmer_at("1")])
+        await bridge.reconcile()
+        await mqtt.inject(MESH_SET_TOPIC, json.dumps({"state": "OFF"}))  # pending
+        mqtt.published.clear()
+
+        bus.set_variables_error = RuntimeError("bus boom")
+        await mqtt.inject(MESH_SET_TOPIC, json.dumps({"state": "ON"}))
+
+        # The prior OFF pending is terminated and observed truth republished.
+        states = _mesh_states(mqtt)
+        assert [json.loads(p[1]) for p in states] == [{"state": "ON", "brightness": 153}]
+        await sleeper.release_all()  # the cancelled OFF timer must not fire
+        assert len(_mesh_states(mqtt)) == 1
+
+    async def test_off_then_on_supersession_confirms_only_newest(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        bus, mqtt, bridge, clock, sleeper = _mesh_bridge([_mesh_dimmer_at("1")])
+        await bridge.reconcile()
+        mqtt.published.clear()
+
+        with caplog.at_level(logging.WARNING, logger="brilliant_mqtt.bridge"):
+            await mqtt.inject(MESH_SET_TOPIC, json.dumps({"state": "OFF"}))
+            await asyncio.sleep(0)  # the OFF confirm timer arms...
+            await mqtt.inject(MESH_SET_TOPIC, json.dumps({"state": "ON"}))
+            await asyncio.sleep(0)  # ...and supersession replaces it
+            assert sleeper.requested == [80.0, 80.0]
+
+            clock.advance(75.0)
+            await bus.emit(_mesh_dimmer_at("1"))  # matches the NEWEST target
+            clock.advance(5.0)
+            await sleeper.release_all()
+
+        # Supersession, not contradiction: the ON observation against the stale
+        # OFF pending must not have logged a failed-delivery warning.
+        assert not any("contradicted" in r.getMessage() for r in caplog.records)
+        payloads = [json.loads(p[1]) for p in _mesh_states(mqtt)]
+        assert payloads == [
+            {"state": None, "brightness": 153},  # pending window
+            {"state": "ON", "brightness": 153},  # only the newest confirms
+        ]
+        assert not any(p.get("state") == "OFF" for p in payloads)
+
+    async def test_stale_write_completion_does_not_resurrect_pending(self) -> None:
+        """A write still in flight when a newer command lands must no-op on
+        completion — its generation lost ownership of the pending."""
+
+        class _StallableBus(FakeBus):
+            def __init__(self, devices: list[BrilliantDevice]) -> None:
+                super().__init__(devices)
+                self.stall: asyncio.Event | None = None
+
+            async def set_variables(
+                self, device_id: str, peripheral_id: str, sets: list[VarSet]
+            ) -> str:
+                stall = self.stall
+                if stall is not None:
+                    self.stall = None
+                    await stall.wait()
+                return await super().set_variables(device_id, peripheral_id, sets)
+
+        bus = _StallableBus([_mesh_dimmer_at("1")])
+        mqtt = FakeMqtt()
+        clock = FakeClock()
+        sleeper = FakeSleeper()
+        bridge = Bridge(bus, mqtt, MESH_PANEL, include=_is_mesh, clock=clock, sleep=sleeper)
+        await bridge.reconcile()
+        mqtt.published.clear()
+
+        gate = asyncio.Event()
+        bus.stall = gate
+        first = asyncio.create_task(mqtt.inject(MESH_SET_TOPIC, json.dumps({"state": "OFF"})))
+        await asyncio.sleep(0)  # let the OFF write reach the stalled bus call
+        await mqtt.inject(MESH_SET_TOPIC, json.dumps({"state": "ON"}))
+        gate.set()
+        await first  # the stale OFF completion must not create a pending
+
+        await asyncio.sleep(0)
+        assert sleeper.requested == [80.0]  # only the ON command armed a timer
+        clock.advance(80.0)
+        await bus.emit(_mesh_dimmer_at("1"))
+        await sleeper.release_all()
+        payloads = [json.loads(p[1]) for p in _mesh_states(mqtt)]
+        assert payloads == [
+            {"state": None, "brightness": 153},
+            {"state": "ON", "brightness": 153},
+        ]
+
+    async def test_forced_reconcile_cannot_bypass_the_hold(self) -> None:
+        bus, mqtt, bridge, _clock, _sleeper = _mesh_bridge([_mesh_dimmer_at("1")])
+        await bridge.reconcile()
+        await mqtt.inject(MESH_SET_TOPIC, json.dumps({"state": "OFF"}))
+        mqtt.published.clear()
+
+        bus.set_devices([_mesh_dimmer_at("0")])  # mirror at the accepted value
+        await bridge.reconcile()  # level-triggered forced republish
+
+        states = _mesh_states(mqtt)
+        assert len(states) == 1
+        assert json.loads(states[0][1]) == {"state": None, "brightness": 153}
+        await bridge.withdraw()
+
+    async def test_withdraw_clears_pending(self) -> None:
+        bus, mqtt, bridge, _clock, sleeper = _mesh_bridge([_mesh_dimmer_at("1")])
+        await bridge.reconcile()
+        await mqtt.inject(MESH_SET_TOPIC, json.dumps({"state": "OFF"}))
+
+        await bridge.withdraw()
+        mqtt.published.clear()
+
+        await sleeper.release_all()  # the ex-leader's timer must never fire
+        assert _mesh_states(mqtt) == []
+
+        # Re-acquisition publishes observed truth with no leftover hold.
+        bus.set_devices([_mesh_dimmer_at("1")])
+        await bridge.reconcile()
+        assert [json.loads(p[1]) for p in _mesh_states(mqtt)] == [
+            {"state": "ON", "brightness": 153}
+        ]
+
+    async def test_mesh_aux_write_still_echoes_optimistically(self) -> None:
+        """Scope guard: ONLY mesh primaries confirm — aux writes keep the echo."""
+        bus, mqtt, bridge, _clock, sleeper = _mesh_bridge([_mesh_motion_dimmer_at("0", "0")])
+        await bridge.reconcile()
+        mqtt.published.clear()
+
+        await mqtt.inject(f"brilliant/{MESH_PANEL}/{MESH_PID}/set_enable_motion_score", "ON")
+
+        states = _mesh_states(mqtt)
+        assert len(states) == 1
+        payload = json.loads(states[0][1])
+        assert payload["enable_motion_score"] is True  # immediate echo
+        assert payload["state"] == "OFF"  # primary untouched — no pending hold
+        await asyncio.sleep(0)
+        assert sleeper.requested == []
+
+    async def test_aux_echo_during_pending_keeps_state_null(self) -> None:
+        bus, mqtt, bridge, _clock, _sleeper = _mesh_bridge([_mesh_motion_dimmer_at("1", "0")])
+        await bridge.reconcile()
+        await mqtt.inject(MESH_SET_TOPIC, json.dumps({"state": "OFF"}))
+        mqtt.published.clear()
+
+        await mqtt.inject(f"brilliant/{MESH_PANEL}/{MESH_PID}/set_enable_motion_score", "ON")
+
+        states = _mesh_states(mqtt)
+        assert len(states) == 1
+        payload = json.loads(states[0][1])
+        assert payload["enable_motion_score"] is True  # aux echo still lands
+        assert payload["state"] is None  # the primary hold survives the echo
+        await bridge.withdraw()

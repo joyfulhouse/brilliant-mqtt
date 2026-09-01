@@ -180,10 +180,10 @@ async def test_enforce_continues_after_write_error(tmp_path: Path) -> None:
     class FlakyBus(FakeBus):
         async def set_variables(
             self, device_id: str, peripheral_id: str, sets: list[VarSet]
-        ) -> None:
+        ) -> str:
             if peripheral_id == "pidA":
                 raise RuntimeError("bus boom")
-            await super().set_variables(device_id, peripheral_id, sets)
+            return await super().set_variables(device_id, peripheral_id, sets)
 
     devs = [
         _mesh_light("pidA", enable_motion_score="0", on="0"),
@@ -297,7 +297,7 @@ async def test_enforce_spacing_backs_off_on_write_failure(tmp_path: Path) -> Non
 
         async def set_variables(
             self, device_id: str, peripheral_id: str, sets: list[VarSet]
-        ) -> None:
+        ) -> str:
             self.attempts += 1
             raise RuntimeError("bus down")
 
@@ -465,7 +465,7 @@ async def test_enforce_retries_failed_write_after_interval(tmp_path: Path) -> No
 
         async def set_variables(
             self, device_id: str, peripheral_id: str, sets: list[VarSet]
-        ) -> None:
+        ) -> str:
             self.attempts += 1
             raise RuntimeError("bus down")
 
@@ -562,7 +562,7 @@ async def test_enforce_failed_write_does_not_echo(tmp_path: Path) -> None:
     class AlwaysFailBus(FakeBus):
         async def set_variables(
             self, device_id: str, peripheral_id: str, sets: list[VarSet]
-        ) -> None:
+        ) -> str:
             raise RuntimeError("bus down")
 
     dev = _mesh_light("pidA", enable_motion_score="0", on="0")

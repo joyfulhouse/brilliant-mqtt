@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -11,8 +12,12 @@ from typing import Any, cast
 import pytest
 
 from brilliant_mqtt import mqttio
+from brilliant_mqtt.bridge import Bridge
+from brilliant_mqtt.commands import VarSet
 from brilliant_mqtt.config import Settings
+from brilliant_mqtt.model import BrilliantDevice, DeviceKind, Variable
 from brilliant_mqtt.mqttio import AioMqttAdapter
+from tests.fakes import FakeBus, FakeClock, FakeMqtt, FakeSleeper
 
 
 @dataclass
@@ -647,3 +652,54 @@ async def test_publish_rejects_invalid_qos_before_calling_client(qos: int) -> No
         await adapter.publish("probe/topic", "nonce", qos=qos)
 
     assert client.calls == []
+
+
+async def test_mesh_confirmation_never_blocks_the_command_lane() -> None:
+    """Issues #46/#47: mesh confirmation is background bridge state — the
+    per-peripheral command lane must stay free to run the newest queued
+    command while the previous write is still unconfirmed, and no optimistic
+    primary state may be fabricated meanwhile."""
+    device = BrilliantDevice(
+        device_id="ble_mesh",
+        peripheral_id="mesh_light_1",
+        name="Dining",
+        kind=DeviceKind.LIGHT,
+        peripheral_type=27,
+        variables={"on": Variable("on", "1")},
+    )
+    bus = FakeBus([device])
+    mqtt = FakeMqtt()
+    sleeper = FakeSleeper()
+    bridge = Bridge(bus, mqtt, "mesh", clock=FakeClock(), sleep=sleeper)
+    await bridge.reconcile()
+    mqtt.published.clear()
+
+    topic = "brilliant/mesh/mesh_light_1/set"
+    adapter = object.__new__(AioMqttAdapter)
+    adapter._client = cast(
+        Any,
+        _Client(
+            [
+                _Message(topic, json.dumps({"state": "OFF"}).encode(), False),
+                _Message(topic, json.dumps({"state": "ON"}).encode(), False),
+            ]
+        ),
+    )
+    # Wire the SAME callback the bridge registered on its MQTT client.
+    adapter._command_cbs = list(mqtt._command_cbs)
+    adapter._message_cbs = []
+    adapter._payload_decode_error_cbs = []
+    adapter._redacted_logging = False
+
+    # Bounded: if confirmation ran inside the callback, the lane would sit on
+    # the 80s window and this would time out.
+    await asyncio.wait_for(adapter._read_loop(), timeout=1.0)
+
+    # The newest command reached the bus through the lane...
+    assert bus.commands[-1] == ("ble_mesh", "mesh_light_1", [VarSet("on", "1")])
+    # ...while confirmation stays pending in the background: every state
+    # publish so far withholds the primary (no optimistic ON/OFF escaped).
+    states = [p for p in mqtt.published if p[0] == "brilliant/mesh/mesh_light_1/state"]
+    assert states
+    assert all(json.loads(p[1])["state"] is None for p in states)
+    await bridge.withdraw()

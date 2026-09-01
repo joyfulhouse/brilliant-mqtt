@@ -527,3 +527,59 @@ class TestPushDispatchCoalescing:
         await task
 
         assert seen == ["1", "3"]
+
+
+class _AckRpcObserver:
+    """Observer whose set-variables RPC resolves with a canned response object."""
+
+    def __init__(self, response: object) -> None:
+        self._response = response
+        self.calls: list[tuple[str, str, dict[str, str]]] = []
+
+    async def request_set_variables_in_peripheral(
+        self,
+        peripheral_id: str,
+        values: dict[str, str],
+        *,
+        device_id: str,
+    ) -> object:
+        self.calls.append((device_id, peripheral_id, dict(values)))
+        return self._response
+
+
+class _ReprBomb:
+    """Response whose repr raises — the receipt must still normalize."""
+
+    def __repr__(self) -> str:
+        raise RuntimeError("closed-source repr exploded")
+
+
+class TestSetVariablesReceipt:
+    """Issue #46 passive ack instrumentation: set_variables returns a SMALL
+    normalized receipt string — never the closed-source response object —
+    bounded against pathological reprs. Nothing gates on its content."""
+
+    async def _write(self, response: object) -> str:
+        adapter = RpcBusAdapter()
+        adapter._obs = _AckRpcObserver(response)
+        adapter._own_device_id = "own-device"
+        return await adapter.set_variables("ble_mesh", "mesh_light_1", [VarSet("on", "0")])
+
+    async def test_receipt_is_the_response_repr(self) -> None:
+        class SetVariablesResponse:
+            def __repr__(self) -> str:
+                return "SetVariablesResponse(status=0)"
+
+        receipt = await self._write(SetVariablesResponse())
+        assert receipt == "SetVariablesResponse(status=0)"
+
+    async def test_none_response_normalizes(self) -> None:
+        assert await self._write(None) == "None"
+
+    async def test_oversized_repr_is_truncated(self) -> None:
+        receipt = await self._write("x" * 500)
+        assert len(receipt) == bus_mod._RECEIPT_MAX_CHARS + len("...")
+        assert receipt.endswith("...")
+
+    async def test_raising_repr_normalizes(self) -> None:
+        assert await self._write(_ReprBomb()) == "<unreprable response>"
