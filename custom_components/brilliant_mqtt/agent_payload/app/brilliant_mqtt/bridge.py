@@ -78,7 +78,6 @@ class _PendingMeshWrite:
     receipt: str
     # Bridge-clock time of the newest observation matching the targets.
     last_observed_at: float | None = None
-    task: asyncio.Task[None] | None = None
 
 
 @dataclass
@@ -206,10 +205,15 @@ class Bridge:
         # publish decisions for any projections with equivalent JSON.
         self._last_state_fields: dict[str, dict[str, object]] = {}
         # Mesh primaries only (issues #46/#47): peripheral_id → in-flight write
-        # awaiting observation-based confirmation, plus the generation counter
-        # that lets a newer command supersede an older one whose async
-        # completions may still be in flight.
+        # awaiting observation-based confirmation.
         self._pending_mesh: dict[str, _PendingMeshWrite] = {}
+        # Confirm timers, keyed OUTSIDE the pending record: a resolver deletes
+        # its pending entry before publishing the confirmation, and must stay
+        # cancellable (supersession, withdraw) through that final publish.
+        self._mesh_confirm_tasks: dict[str, asyncio.Task[None]] = {}
+        # Monotonic per-peripheral command counter — NEVER cleared or reused
+        # within a Bridge lifetime, so a stalled bus write from before a
+        # withdraw can never match a generation minted after re-acquisition.
         self._mesh_write_generation: dict[str, int] = {}
         self._mesh_confirm_count = 0
 
@@ -338,6 +342,18 @@ class Bridge:
         everything fresh via reconcile(). Safe to call on a bridge that never
         reconciled (no-op).
         """
+        # Revoke mesh pendings and their confirm timers FIRST, synchronously,
+        # before ANY await: an ex-leader must not resolve confirmations it no
+        # longer owns, and a deadline elapsing during the unsubscribe handoff
+        # below must not publish one. The registry union also reaches a
+        # resolver already past its pending entry (mid-publish).
+        for peripheral_id in set(self._pending_mesh) | set(self._mesh_confirm_tasks):
+            self._drop_pending_mesh(peripheral_id)
+        # Invalidate — never clear — the write generations: a pre-withdraw bus
+        # write still stalled in flight must not match a generation minted
+        # after re-acquisition and resurrect its stale command (ABA).
+        for peripheral_id in self._mesh_write_generation:
+            self._mesh_write_generation[peripheral_id] += 1
         unsubscribed = 0
         for topic in list(self._by_cmd_topic):
             # A failed unsubscribe must not abort the rest — a step-down must
@@ -351,11 +367,6 @@ class Bridge:
         self._last_state_payload.clear()
         self._last_state_fields.clear()
         self._devices.clear()
-        # An ex-leader must not resolve confirmations it no longer owns — the
-        # new leader's observations decide; no write is retried.
-        for peripheral_id in list(self._pending_mesh):
-            self._drop_pending_mesh(peripheral_id)
-        self._mesh_write_generation.clear()
         if self._deriver is not None:
             # An ex-leader must not carry hold state into a re-acquisition;
             # the new session starts cold (motion off until the next spike).
@@ -644,10 +655,14 @@ class Bridge:
         as a false OFF through the aux value templates — exactly the defect
         this exists to eliminate).
         """
-        # Generation FIRST, before any await: a newer command supersedes this
-        # one even while this write is still in flight on the bus.
+        # Generation bump AND old-pending revocation FIRST, before any await:
+        # a newer command supersedes an older one the moment it starts, even
+        # while this write is in flight — the old pending must not keep
+        # confirming, contradicting, or expiring against a target that is no
+        # longer wanted.
         generation = self._mesh_write_generation.get(peripheral_id, 0) + 1
         self._mesh_write_generation[peripheral_id] = generation
+        self._drop_pending_mesh(peripheral_id)
         try:
             receipt = await self._bus.set_variables(device.device_id, peripheral_id, sets)
         except Exception:
@@ -657,8 +672,7 @@ class Bridge:
                 raise
             # Mode A (bounded write failure): nothing was fabricated, so the
             # last observed snapshot is still the best truth — force it back
-            # out past every cache and terminate any pending hold.
-            self._drop_pending_mesh(peripheral_id)
+            # out past every cache.
             logger.warning(
                 "mesh write failed for %s/%s; republishing last observed state",
                 device.device_id,
@@ -672,13 +686,12 @@ class Bridge:
             # Superseded while this write awaited; the newer command's pending
             # (and confirm timer) owns the peripheral now.
             return
-        self._drop_pending_mesh(peripheral_id)
         pending = _PendingMeshWrite(
             targets={s.name: s.value for s in sets},
             receipt=receipt,
         )
         self._pending_mesh[peripheral_id] = pending
-        pending.task = asyncio.create_task(
+        self._mesh_confirm_tasks[peripheral_id] = asyncio.create_task(
             self._resolve_pending_mesh(peripheral_id, pending),
             name=f"brilliant-mqtt-mesh-confirm-{peripheral_id}",
         )
@@ -692,6 +705,12 @@ class Bridge:
         still owns the peripheral — publishes the commanded value only when a
         fresh observation backs it; otherwise closes unconfirmed and leaves
         state unknown (the stale-stream watchdog owns stream recovery).
+
+        Ownership gate at publish time: the identity check below and the start
+        of the confirm publish sit in one event-loop slice (no await between
+        them), and any later ownership change (supersession, withdraw) reaches
+        this task through the _mesh_confirm_tasks registry as cancellation —
+        including while the final publish is still in flight.
         """
         await self._sleep(MESH_CONFIRM_SECONDS)
         if self._pending_mesh.get(peripheral_id) is not pending:
@@ -717,10 +736,25 @@ class Bridge:
                 pending.targets,
                 pending.receipt,
             )
-        await self._echo_state(
-            peripheral_id,
-            [VarSet(name, value) for name, value in pending.targets.items()],
-        )
+        try:
+            await self._echo_state(
+                peripheral_id,
+                [VarSet(name, value) for name, value in pending.targets.items()],
+            )
+        except Exception:
+            # _publish_state advanced the diff caches before the publish
+            # failed, so the identical next observation would be suppressed
+            # and the retained topic would stay null. Drop the caches so the
+            # next observation republishes and repairs it (no auto-retry by
+            # design). CancelledError passes through untouched.
+            self._last_state_payload.pop(peripheral_id, None)
+            self._last_state_fields.pop(peripheral_id, None)
+            logger.warning(
+                "mesh confirm publish failed for %s; retained state repairs "
+                "on the next observation",
+                peripheral_id,
+                exc_info=True,
+            )
 
     def _observe_mesh_pending(self, device: BrilliantDevice) -> None:
         """Feed one bus observation into the pending-write state machine.
@@ -756,10 +790,16 @@ class Bridge:
             pending.last_observed_at = self._clock()
 
     def _drop_pending_mesh(self, peripheral_id: str) -> None:
-        """Remove and cancel any pending confirmation for *peripheral_id*."""
-        pending = self._pending_mesh.pop(peripheral_id, None)
-        if pending is not None and pending.task is not None:
-            pending.task.cancel()
+        """Revoke any pending confirmation for *peripheral_id* and its timer.
+
+        The timer is cancelled through the registry, not the record, so a
+        resolver that already removed its pending entry to publish the
+        confirmation is still reached — even mid-publish.
+        """
+        self._pending_mesh.pop(peripheral_id, None)
+        task = self._mesh_confirm_tasks.pop(peripheral_id, None)
+        if task is not None:
+            task.cancel()
 
     async def _republish_snapshot(self, peripheral_id: str, *, force: bool) -> None:
         """Publish the stored snapshot's current payload (no-op without one)."""
