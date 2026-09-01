@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable
 from copy import deepcopy
 from datetime import UTC, datetime
@@ -4853,8 +4854,10 @@ async def test_rejected_fleet_snapshot_does_not_reload_control_plane(
 
 async def test_update_listener_schedules_reload_when_live_reconcile_rejects(
     hass: HomeAssistant,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A snapshot the live reconcile refuses still applies via a scheduled reload."""
+    caplog.set_level(logging.INFO, logger="custom_components.brilliant_mqtt.fleet_manager")
     entry = _fleet_entry(_panel("office", "SHA256:office", subentry_id="panel-office"))
     entry.add_to_hass(hass)
     fleet = FleetManager(hass, entry)
@@ -4881,6 +4884,9 @@ async def test_update_listener_schedules_reload_when_live_reconcile_rejects(
         await hass.async_block_till_done()
 
         schedule_reload.assert_called_once_with(entry.entry_id)
+        # Pin the EntryDataError branch specifically: a reload scheduled by the
+        # ordinary reload_required=True return would not emit this line.
+        assert "requires a reload to apply this change" in caplog.text
         await fleet.async_shutdown()
 
 

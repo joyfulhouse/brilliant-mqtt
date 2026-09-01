@@ -1541,7 +1541,9 @@ class FleetManager:
             # next to an update listener), so a snapshot the live reconcile
             # refuses — e.g. a host change re-pinning the SSH host key — must
             # apply via a full reload instead of being silently dropped.
-            _LOGGER.warning("Fleet reconciliation rejected a live apply; a reload is scheduled")
+            _LOGGER.info(
+                "Fleet reconciliation requires a reload to apply this change; scheduling it"
+            )
             self._async_schedule_reload_once()
             return
         if reload_required:
