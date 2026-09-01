@@ -64,7 +64,7 @@ verify_armv7_shared_objects() {
 
   while IFS= read -r -d '' so; do
     name="${so##*/}"
-    if [[ "$name" == *.so*-gdb.py ]]; then
+    if [[ "$name" =~ \.so(\.[0-9]+)*-gdb\.py$ ]]; then
       echo "skipping (recognized ancillary file): ${so}"
       continue
     fi
