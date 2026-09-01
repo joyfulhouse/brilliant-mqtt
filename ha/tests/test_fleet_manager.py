@@ -2639,9 +2639,8 @@ async def test_rebind_durably_adopts_exact_identity_and_audits_after_proof(
     fleet = FleetManager(hass, entry)
     order: list[str] = []
     immutable_checks: list[tuple[PanelConfig, PanelConfig]] = []
-    # @callback capture so dispatch is inline — a bare `def` listener types as
-    # HassJobType.Executor and races the reads below (#45). Cast: the harness ships
-    # no py.typed, so the call is Any (see test_manager._capture_events).
+    # Inline @callback capture — a bare `def` listener would type as HassJobType.Executor
+    # and race the reads below (#45); cast rationale in test_manager._capture_events.
     events = cast(list[Event[dict[str, Any]]], async_capture_events(hass, EVENT_TYPE))
     with (
         patch.object(PanelManager, "async_setup", _noop_setup),

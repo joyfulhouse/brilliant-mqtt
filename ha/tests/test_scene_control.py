@@ -60,15 +60,11 @@ _SUBSCRIPTIONS = {
 
 
 def _capture_events(hass: HomeAssistant, event_type: str) -> list[Event[dict[str, object]]]:
-    """Capture EVENT_SCENE/EVENT_MODE inline with the harness's @callback listener.
+    """Capture EVENT_SCENE/EVENT_MODE inline via the harness's @callback listener.
 
-    A bare `events.append` passed to async_listen types as HassJobType.Executor and
-    is dispatched to a thread-pool worker joined only by async_block_till_done — a
-    latent race lost under CPU load (#45). The harness listener is @callback, so
-    async_fire_internal runs it inline. The cast is load-bearing, not a suppression:
-    the harness ships no py.typed and this project's mypy config gives it
-    ignore_missing_imports, so the call is Any and --strict's warn_return_any
-    rejects returning it directly (see test_manager._capture_events).
+    A bare `events.append` would type as HassJobType.Executor and race readers from
+    a thread-pool worker (#45); the cast is load-bearing under --strict, not a
+    suppression — full rationale in test_manager._capture_events.
     """
     return cast(list[Event[dict[str, object]]], async_capture_events(hass, event_type))
 
