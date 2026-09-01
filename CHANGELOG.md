@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Power sensor units.** Brilliant bus readings are deciwatts and are now
+  published as watts instead of values 10× too high. Power sensors keep
+  `state_class="measurement"`, so existing long-term statistics are not
+  migrated automatically; after upgrading, purge or correct affected power
+  statistics in **Settings → Developer tools → Statistics**. (#36)
+
 ## [0.8.0] - 2026-08-31
 
 The on-panel agent moves to 0.8.0 — panels need a redeploy (per-panel bridge

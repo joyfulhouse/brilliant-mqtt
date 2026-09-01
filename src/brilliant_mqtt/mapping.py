@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import cast
 
 from brilliant_mqtt.model import BrilliantDevice, DeviceKind, Variable
 
@@ -60,8 +61,8 @@ class AuxSpec:
     # "bool"`` only (enforced in ``__post_init__``), since the disabled-state
     # value is a boolean False.
     gate_var: str | None = None
-    # Applied to rendered floats when bus and published units differ. Descriptor
-    # metadata always describes the published value.
+    # Applied to rendered floats when bus and published units differ. Values are
+    # published at 0.1-unit resolution; metadata describes the published value.
     scale: float | None = None
 
     def __post_init__(self) -> None:
@@ -72,6 +73,11 @@ class AuxSpec:
         if self.gate_var is not None and self.value_kind != "bool":
             raise ValueError(
                 f"gate_var is only supported for value_kind='bool', "
+                f"not {self.value_kind!r} (spec var={self.var!r})"
+            )
+        if self.scale is not None and self.value_kind != "float":
+            raise ValueError(
+                f"scale is only supported for value_kind='float', "
                 f"not {self.value_kind!r} (spec var={self.var!r})"
             )
 
@@ -808,8 +814,8 @@ def payload_fields(device: BrilliantDevice) -> dict[str, object]:
         rendered = _render_aux(var, spec.value_kind, spec.invert)
         if rendered is None:
             continue
-        if spec.scale is not None and isinstance(rendered, float):
-            rendered = round(rendered * spec.scale, 1)
+        if spec.scale is not None:
+            rendered = round(cast(float, rendered) * spec.scale, 1)
         # Gate: a bool reading that is only valid while a sibling variable is
         # enabled collapses to a concrete False when that gate is absent or off
         # (stale subsystem). Only the VALUE is forced — the payload key is still

@@ -770,6 +770,10 @@ def test_power_scaled_from_bus_deciwatts() -> None:
     assert payload_fields(_mesh_dimmer_with_power("418"))["power"] == 41.8
 
 
+def test_unscaled_float_aux_passes_through() -> None:
+    assert payload_fields(_always_on())["temperature"] == 43.6
+
+
 def test_payload_fields_fault_true_when_unsafe() -> None:
     device = _always_on()
     device.variables["is_safe"] = Variable("is_safe", "0")
@@ -897,8 +901,8 @@ def test_power_descriptor_gated_by_sentinel() -> None:
     assert f"brilliant_mesh_{MESH_PID}_power" not in uids
 
 
-def test_power_payload_key_gated_by_sentinel() -> None:
-    assert "power" not in payload_fields(_mesh_dimmer())
+def test_power_sentinel_not_scaled() -> None:
+    assert "power" not in payload_fields(_mesh_dimmer_with_power("-1"))
 
 
 def test_mesh_dimmer_sentinel_yields_only_primary_light() -> None:
@@ -1420,6 +1424,12 @@ def test_gate_var_rejected_on_non_bool_spec() -> None:
     AuxSpec(var="x", component="binary_sensor", name="X", value_kind="bool", gate_var="g")  # ok
     with pytest.raises(ValueError, match="value_kind='bool'"):
         AuxSpec(var="y", component="sensor", name="Y", value_kind="int", gate_var="g")
+
+
+def test_scale_rejected_on_non_float_spec() -> None:
+    AuxSpec(var="x", component="sensor", name="X", value_kind="float", scale=0.1)
+    with pytest.raises(ValueError, match="value_kind='float'"):
+        AuxSpec(var="y", component="sensor", name="Y", value_kind="int", scale=0.1)
 
 
 # --- ALWAYS_ON cross-kind coverage ------------------------------------------
