@@ -133,9 +133,13 @@ PKGS=(
   "aioesphomeapi==45.3.1"
   "netifaces2==0.0.22"
   "numpy>=2,<3"
-  # COUPLED: see tflite copy below; re-verify ABI on any bump.
+  # COUPLED: see tflite copy below. On any bump, diff the old/new resolved
+  # pyopen_wakeword/wakeword.py ctypes blocks: symbols, TfLiteQuantizationParams,
+  # and argtypes. The 16-symbol gate cannot catch signature or struct drift.
   "pymicro-wakeword>=2,<3"
-  # COUPLED: see tflite copy below; re-verify ABI on any bump.
+  # COUPLED: see tflite copy below. On any bump, diff the old/new resolved
+  # pyopen_wakeword/wakeword.py ctypes blocks: symbols, TfLiteQuantizationParams,
+  # and argtypes. The 16-symbol gate cannot catch signature or struct drift.
   "pyopen-wakeword>=1,<2"
   "webrtc_noise_gain==1.3.0"
   "zeroconf<1"
@@ -170,6 +174,8 @@ cp -R "$TMP/python/." "$DEST/python/"
 
 # ── 2. LVA py3.11 deps → site/ ───────────────────────────────────────────────
 echo "==> [2/6] Downloading armv7 cp311 wheels…"
+# Platform order is only a best-effort equal-version tie-break (pip expands tags
+# in order); a newer piwheels build still wins. The arch/ABI gates are authoritative.
 uv run --with pip python -m pip download "${PKGS[@]}" \
   --only-binary=:all: --python-version 3.11 --implementation cp --abi cp311 \
   --platform manylinux_2_35_armv7l --platform manylinux2014_armv7l \
