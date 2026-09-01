@@ -133,14 +133,14 @@ PKGS=(
   "aioesphomeapi==45.3.1"
   "netifaces2==0.0.22"
   "numpy>=2,<3"
-  # COUPLED: see tflite copy below. On any bump, diff the old/new resolved
+  # COUPLED: bumping this pin triggers ABI review. Diff the old/new resolved
   # pyopen_wakeword/wakeword.py ctypes blocks: symbols, TfLiteQuantizationParams,
   # and argtypes. The 16-symbol gate cannot catch signature or struct drift.
-  "pymicro-wakeword>=2,<3"
-  # COUPLED: see tflite copy below. On any bump, diff the old/new resolved
+  "pymicro-wakeword==2.4.1"
+  # COUPLED: bumping this pin triggers ABI review. Diff the old/new resolved
   # pyopen_wakeword/wakeword.py ctypes blocks: symbols, TfLiteQuantizationParams,
   # and argtypes. The 16-symbol gate cannot catch signature or struct drift.
-  "pyopen-wakeword>=1,<2"
+  "pyopen-wakeword==1.1.0"
   "webrtc_noise_gain==1.3.0"
   "zeroconf<1"
   "getmac<1"
