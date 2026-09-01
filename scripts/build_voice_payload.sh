@@ -13,7 +13,7 @@ if [[ -z "$FILE_BIN" || -z "$READELF_BIN" ]]; then
 fi
 
 verify_pyopen_tflite_abi() {
-  local library="$1" dynsyms symbol missing=0
+  local library="$1" dynsyms defined_exports symbol missing=0
   # Derived from every lib.TfLite* ctypes lookup in pyopen_wakeword/wakeword.py.
   local -a required_symbols=(
     TfLiteModelCreateFromFile
@@ -38,8 +38,10 @@ verify_pyopen_tflite_abi() {
     echo "ERROR: could not read dynamic symbols from ${library}: ${dynsyms}" >&2
     return 1
   fi
+  # ctypes can resolve only GLOBAL/WEAK exports with a defined section index.
+  defined_exports="$(awk '$7 != "UND" && ($5 == "GLOBAL" || $5 == "WEAK")' <<< "$dynsyms")"
   for symbol in "${required_symbols[@]}"; do
-    if ! grep -Eq "[[:space:]]${symbol}(@@[^[:space:]]+)?$" <<< "$dynsyms"; then
+    if ! grep -Eq "[[:space:]]${symbol}(@{1,2}[^[:space:]]+)?$" <<< "$defined_exports"; then
       echo "ERROR: ${library} does not export required symbol ${symbol}" >&2
       missing=1
     fi
@@ -49,30 +51,33 @@ verify_pyopen_tflite_abi() {
 }
 
 verify_armv7_shared_objects() {
-  local payload_dir="$1" manifest so
+  local payload_dir="$1" manifest so name
   local file_output readelf_output failed=0 count=0
 
   # Scope: bundled shared-object candidates (*.so*) only, not native executables.
   manifest="$(mktemp)"
+  trap 'rm -f "$manifest"; trap - RETURN' RETURN
   if ! find "$payload_dir" \( -type f -o -type l \) -name '*.so*' -print0 > "$manifest"; then
     echo "ERROR: could not enumerate shared objects under ${payload_dir}" >&2
-    rm -f "$manifest"
     return 1
   fi
 
   while IFS= read -r -d '' so; do
-    if ! file_output="$(LC_ALL=C "$FILE_BIN" -bL "$so" 2>&1)"; then
-      file_output="file failed: ${file_output}"
-      echo "ERROR: could not inspect ${so}: ${file_output}" >&2
-      failed=1
+    name="${so##*/}"
+    if [[ "$name" == *.so.*-gdb.py ]]; then
+      echo "skipping (recognized ancillary file): ${so}"
       continue
     fi
-    if [[ "$file_output" != *"ELF"* ]]; then
-      echo "skipping (not a shared object): ${so}"
+    if [[ ! "$name" =~ \.so(\.[0-9]+)*$ ]]; then
+      echo "ERROR: unrecognized shared-object candidate name: ${so}" >&2
+      failed=1
       continue
     fi
 
     count=$((count + 1))
+    if ! file_output="$(LC_ALL=C "$FILE_BIN" -bL "$so" 2>&1)"; then
+      file_output="file failed: ${file_output}"
+    fi
     if ! readelf_output="$(LC_ALL=C "$READELF_BIN" -h "$so" 2>&1)"; then
       readelf_output="readelf failed: ${readelf_output}"
     fi
@@ -89,7 +94,6 @@ verify_armv7_shared_objects() {
       failed=1
     fi
   done < "$manifest"
-  rm -f "$manifest"
 
   if ((count == 0)); then
     echo "ERROR: no shared objects found under ${payload_dir}" >&2
