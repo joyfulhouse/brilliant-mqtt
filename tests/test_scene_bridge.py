@@ -245,6 +245,349 @@ async def test_later_scene_event_publishes_once_and_reconnect_restart_replay_is_
     await restarted.async_shutdown()
 
 
+async def test_poll_only_execution_publishes_event_and_persists_watermark(
+    tmp_path: Path,
+) -> None:
+    bridge, _, mqtt, _, path = await _started(tmp_path)
+    mqtt.published.clear()
+
+    await bridge.poll_executions([_execution("all_off", 200)])
+    await _wait_for_publish(mqtt, scene_event_topic(_PANEL))
+
+    assert len(_published(mqtt, scene_event_topic(_PANEL))) == 1
+    persisted = json.loads(path.read_text())
+    assert persisted["watermarks"][_PANEL]["all_off"]["executed_at_ms"] == 200
+    await bridge.async_shutdown()
+
+
+async def test_repeated_scene_poll_with_new_execution_time_publishes_again(
+    tmp_path: Path,
+) -> None:
+    bridge, _, mqtt, _, _ = await _started(tmp_path)
+    mqtt.published.clear()
+
+    await bridge.poll_executions([_execution("all_off", 200)])
+    await _wait_for_publish(mqtt, scene_event_topic(_PANEL))
+    await bridge.poll_executions([_execution("all_off", 300)])
+    await _wait_for_publish(mqtt, scene_event_topic(_PANEL), count=2)
+
+    assert [
+        _payload(item)["executed_at_ms"] for item in _published(mqtt, scene_event_topic(_PANEL))
+    ] == [200, 300]
+    await bridge.async_shutdown()
+
+
+async def test_failed_poll_processing_retries_identical_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge, _, mqtt, _, _ = await _started(tmp_path)
+    execution = _execution("all_off", 200)
+    process = bridge._async_process_execution
+    attempts = 0
+
+    async def fail_once(
+        device: BrilliantDevice,
+        *,
+        emit_events: bool,
+        epoch: int,
+    ) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("transient processing failure")
+        await process(device, emit_events=emit_events, epoch=epoch)
+
+    monkeypatch.setattr(bridge, "_async_process_execution", fail_once)
+    mqtt.published.clear()
+
+    await bridge.poll_executions([execution])
+    assert _published(mqtt, scene_event_topic(_PANEL)) == []
+
+    await bridge.poll_executions([execution])
+    await _wait_for_publish(mqtt, scene_event_topic(_PANEL))
+
+    assert attempts == 2
+    assert len(_published(mqtt, scene_event_topic(_PANEL))) == 1
+    await bridge.async_shutdown()
+
+
+async def test_failed_older_poll_does_not_clobber_newer_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge, bus, mqtt, _, _ = await _started(tmp_path)
+    older = _device(
+        "execution_peripheral",
+        _execution("all_off", 200).variables,
+        device_id="old-panel",
+    )
+    newer = _device(
+        "execution_peripheral",
+        _execution("all_off", 200).variables,
+        device_id="new-panel",
+    )
+    older_started = asyncio.Event()
+    release_older = asyncio.Event()
+    process = bridge._async_process_execution
+    processed: list[BrilliantDevice] = []
+
+    async def fail_older(
+        device: BrilliantDevice,
+        *,
+        emit_events: bool,
+        epoch: int,
+    ) -> None:
+        processed.append(device)
+        if device is older:
+            older_started.set()
+            await release_older.wait()
+            raise RuntimeError("older processing failure")
+        await process(device, emit_events=emit_events, epoch=epoch)
+
+    monkeypatch.setattr(bridge, "_async_process_execution", fail_older)
+    mqtt.published.clear()
+
+    older_task = asyncio.create_task(bridge.poll_executions([older]))
+    await asyncio.wait_for(older_started.wait(), timeout=0.1)
+    await bridge.poll_executions([newer])
+    release_older.set()
+    await older_task
+    await _wait_for_publish(mqtt, scene_event_topic(_PANEL))
+
+    event = _payload(_published(mqtt, scene_event_topic(_PANEL))[-1])
+    assert event["executed_at_ms"] == 200
+    await bridge.poll_executions([newer])
+    assert processed == [older, newer]
+    command_id = "22222222-2222-4222-8222-222222222222"
+    await mqtt.inject(scene_command_topic(_PANEL), _command(command_id, "scene", "all_off"))
+    await _wait_for_bus_commands(bus, 1)
+    assert bus.commands[-1][0] == "new-panel"
+    await bridge.async_shutdown()
+
+
+async def test_poll_commits_fingerprint_captured_before_processing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge, _, mqtt, _, _ = await _started(tmp_path)
+    execution = _execution("all_off", 200)
+    process = bridge._async_process_execution
+    processed = asyncio.Event()
+    release = asyncio.Event()
+
+    async def process_then_wait(
+        device: BrilliantDevice,
+        *,
+        emit_events: bool,
+        epoch: int,
+    ) -> None:
+        await process(device, emit_events=emit_events, epoch=epoch)
+        processed.set()
+        await release.wait()
+
+    monkeypatch.setattr(bridge, "_async_process_execution", process_then_wait)
+    mqtt.published.clear()
+
+    first_poll = asyncio.create_task(bridge.poll_executions([execution]))
+    await asyncio.wait_for(processed.wait(), timeout=0.1)
+    execution.variables.clear()
+    execution.variables.update(_execution("all_off", 300).variables)
+    release.set()
+    await first_poll
+
+    await bridge.poll_executions([execution])
+    await _wait_for_publish(mqtt, scene_event_topic(_PANEL), count=2)
+
+    assert [
+        _payload(item)["executed_at_ms"] for item in _published(mqtt, scene_event_topic(_PANEL))
+    ] == [200, 300]
+    await bridge.async_shutdown()
+
+
+async def test_reconcile_absence_fences_inflight_poll_fingerprint_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge, bus, mqtt, _, _ = await _started(tmp_path)
+    execution = _execution("all_off", 200)
+    process = bridge._async_process_execution
+    processed = asyncio.Event()
+    release = asyncio.Event()
+
+    async def process_then_wait(
+        device: BrilliantDevice,
+        *,
+        emit_events: bool,
+        epoch: int,
+    ) -> None:
+        await process(device, emit_events=emit_events, epoch=epoch)
+        processed.set()
+        await release.wait()
+
+    monkeypatch.setattr(bridge, "_async_process_execution", process_then_wait)
+    poll = asyncio.create_task(bridge.poll_executions([execution]))
+    await asyncio.wait_for(processed.wait(), timeout=0.1)
+    bus.set_devices([])
+    await bridge.async_reconcile()
+    release.set()
+    await poll
+
+    reappeared = _device(
+        "execution_peripheral",
+        _execution("all_off", 200).variables,
+        device_id="reappeared-panel",
+    )
+    await bridge.poll_executions([reappeared])
+
+    assert bridge._execution_available is True
+    command_id = "22222222-2222-4222-8222-222222222222"
+    await mqtt.inject(scene_command_topic(_PANEL), _command(command_id, "scene", "all_off"))
+    await _wait_for_bus_commands(bus, 1)
+    assert bus.commands[-1][0] == "reappeared-panel"
+    await bridge.async_shutdown()
+
+
+async def test_reappearing_execution_with_identical_values_restores_route(
+    tmp_path: Path,
+) -> None:
+    initial = _execution("all_off", 100)
+    bridge, bus, mqtt, _, _ = await _started(tmp_path, execution=initial)
+    bus.set_devices([])
+    await bridge.async_reconcile()
+
+    reappeared = _device(
+        "execution_peripheral",
+        _execution("all_off", 100).variables,
+        device_id="restarted-panel",
+    )
+    await bridge.poll_executions([reappeared])
+
+    assert _published(mqtt, scene_event_topic(_PANEL)) == []
+    status = _payload(_published(mqtt, transport_status_topic("scene", _PANEL))[-1])
+    assert status["available"] is True
+    command_id = "22222222-2222-4222-8222-222222222222"
+    await mqtt.inject(scene_command_topic(_PANEL), _command(command_id, "scene", "all_off"))
+    await _wait_for_bus_commands(bus, 1)
+    assert bus.commands[-1][0] == "restarted-panel"
+    await bridge.async_shutdown()
+
+
+async def test_poll_gate_ignores_timestamp_only_variable_refresh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    initial = _execution("all_off", 100)
+    bridge, _, _, _, _ = await _started(tmp_path, execution=initial)
+    process = bridge._async_process_execution
+    processed: list[BrilliantDevice] = []
+
+    async def observed_process(
+        device: BrilliantDevice,
+        *,
+        emit_events: bool,
+        epoch: int,
+    ) -> None:
+        processed.append(device)
+        await process(device, emit_events=emit_events, epoch=epoch)
+
+    monkeypatch.setattr(bridge, "_async_process_execution", observed_process)
+    refreshed = _device(
+        "execution_peripheral",
+        {
+            name: Variable(
+                name,
+                variable.value,
+                externally_settable=variable.externally_settable,
+                timestamp_ms=999,
+            )
+            for name, variable in initial.variables.items()
+        },
+    )
+
+    await bridge.poll_executions([refreshed])
+
+    assert processed == []
+    await bridge.async_shutdown()
+
+
+async def test_poll_during_shutdown_skips_processing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge, _, _, _, _ = await _started(tmp_path)
+    process = bridge._async_process_execution
+    processed: list[BrilliantDevice] = []
+
+    async def observed_process(
+        device: BrilliantDevice,
+        *,
+        emit_events: bool,
+        epoch: int,
+    ) -> None:
+        processed.append(device)
+        await process(device, emit_events=emit_events, epoch=epoch)
+
+    monkeypatch.setattr(bridge, "_async_process_execution", observed_process)
+    bridge._stopping = True
+
+    await bridge.poll_executions([_execution("all_off", 200)])
+
+    assert processed == []
+    bridge._stopping = False
+    await bridge.async_shutdown()
+
+
+async def test_unchanged_poll_skips_publishes_and_state_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    writes: list[Path] = []
+    real_write = scene_state.atomic_write_state
+
+    def observed_write(path: Path, state: scene_state.SceneState) -> None:
+        writes.append(path)
+        real_write(path, state)
+
+    monkeypatch.setattr(scene_bridge_module, "atomic_write_state", observed_write)
+    execution = _execution("all_off", 100)
+    bridge, _, mqtt, _, _ = await _started(tmp_path, execution=execution)
+    writes.clear()
+    mqtt.published.clear()
+
+    await bridge.poll_executions([_execution("all_off", 100)])
+
+    assert mqtt.published == []
+    assert writes == []
+    await bridge.async_shutdown()
+
+
+async def test_same_execution_from_push_then_poll_publishes_once(tmp_path: Path) -> None:
+    bridge, bus, mqtt, _, _ = await _started(tmp_path)
+    execution = _execution("all_off", 200)
+    mqtt.published.clear()
+
+    await bus.emit(execution)
+    await bridge.poll_executions([execution])
+    await _wait_for_publish(mqtt, scene_event_topic(_PANEL))
+
+    assert len(_published(mqtt, scene_event_topic(_PANEL))) == 1
+    await bridge.async_shutdown()
+
+
+async def test_poll_execution_never_republishes_retained_catalogs(tmp_path: Path) -> None:
+    bridge, _, mqtt, _, _ = await _started(tmp_path)
+    mqtt.published.clear()
+
+    await bridge.poll_executions([_execution("all_off", 200)])
+    await _wait_for_publish(mqtt, scene_event_topic(_PANEL))
+
+    assert _published(mqtt, scene_catalog_topic(_PANEL)) == []
+    assert _published(mqtt, mode_catalog_topic(_PANEL)) == []
+    assert all(not retained for _, _, retained in mqtt.published)
+    await bridge.async_shutdown()
+
+
 async def test_watermark_update_preserves_other_panel_records(tmp_path: Path) -> None:
     path = tmp_path / "scene-watermarks.json"
     path.write_text(

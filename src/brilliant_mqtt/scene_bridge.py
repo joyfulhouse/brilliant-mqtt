@@ -102,6 +102,11 @@ def _is_new(previous: Watermark | None, current: SceneExecution) -> bool:
     )
 
 
+def _execution_fingerprint(device: BrilliantDevice) -> dict[str, str]:
+    snapshot = dict(device.variables)
+    return {name: variable.value for name, variable in snapshot.items()}
+
+
 class SceneBridge:
     """Safely bridge panel scene/mode records and commands over existing clients."""
 
@@ -131,6 +136,7 @@ class SceneBridge:
         self._callbacks_registered = False
         self._subscribed_topics: list[str] = []
         self._execution: BrilliantDevice | None = None
+        self._processed_execution_fingerprint: dict[str, str] | None = None
         self._execution_available = False
         self._scene_ids: frozenset[str] = frozenset()
         self._mode_ids: frozenset[str] = frozenset()
@@ -230,6 +236,42 @@ class SceneBridge:
         if not self._started or self._stopping:
             return
         await self._async_reconcile_work(epoch, emit_history=True, during_start=False)
+
+    async def poll_executions(self, devices: list[BrilliantDevice]) -> None:
+        """Process a changed execution peripheral from a shared bus snapshot."""
+        execution = next(
+            (device for device in devices if device.peripheral_id == _EXECUTION_PERIPHERAL_ID),
+            None,
+        )
+        if execution is None:
+            # Absence stays reconcile-owned; push handling owns live route changes.
+            return
+        async with self._lock:
+            if not self._started or self._stopping:
+                return
+            fingerprint = _execution_fingerprint(execution)
+            if fingerprint == self._processed_execution_fingerprint:
+                return
+            self._operation_generation += 1
+            generation = self._operation_generation
+            self._set_execution(execution)
+            epoch = self._epoch
+        try:
+            await self._async_process_execution_snapshot(
+                execution,
+                emit_events=True,
+                epoch=epoch,
+                generation=generation,
+                fingerprint=fingerprint,
+            )
+        except Exception:
+            logger.exception("scene bridge execution poll failed; continuing")
+
+    def _set_execution(self, execution: BrilliantDevice | None) -> None:
+        self._execution = execution
+        self._execution_available = execution is not None
+        if execution is None:
+            self._processed_execution_fingerprint = None
 
     async def async_shutdown(self) -> None:
         """Fence callbacks, bound task drain, and release exact subscriptions."""
@@ -430,6 +472,8 @@ class SceneBridge:
         if epoch != self._epoch or self._stopping:
             return
         scene_ids, scene_healthy, mode_ids, mode_healthy = await self._async_read_catalogs(epoch)
+        # None = stale reconcile or absent peripheral; narrows the processing call below.
+        fingerprint: dict[str, str] | None = None
         async with self._lock:
             if epoch != self._epoch or self._stopping:
                 return
@@ -441,14 +485,21 @@ class SceneBridge:
             self._mode_catalog_healthy = mode_healthy
             stale = not during_start and generation != self._operation_generation
             if not stale:
-                self._execution = execution
-                self._execution_available = execution is not None
+                self._set_execution(execution)
+                if execution is not None:
+                    fingerprint = _execution_fingerprint(execution)
         if stale:
             await self._async_health_status("scene")
             await self._async_health_status("mode")
             return
-        if execution is not None:
-            await self._async_process_execution(execution, emit_events=emit_history, epoch=epoch)
+        if execution is not None and fingerprint is not None:
+            await self._async_process_execution_snapshot(
+                execution,
+                emit_events=emit_history,
+                epoch=epoch,
+                generation=generation,
+                fingerprint=fingerprint,
+            )
         if not during_start:
             await self._async_health_status("scene")
             await self._async_health_status("mode")
@@ -469,9 +520,16 @@ class SceneBridge:
                     self._schedule_pending_deadlines()
                     self._schedule_delivery()
                     break
-                self._execution = buffered
-                self._execution_available = True
-            await self._async_process_execution(buffered, emit_events=True, epoch=epoch)
+                generation = self._operation_generation
+                fingerprint = _execution_fingerprint(buffered)
+                self._set_execution(buffered)
+            await self._async_process_execution_snapshot(
+                buffered,
+                emit_events=True,
+                epoch=epoch,
+                generation=generation,
+                fingerprint=fingerprint,
+            )
         await self._async_health_status("scene")
         await self._async_health_status("mode")
 
@@ -560,13 +618,40 @@ class SceneBridge:
             if self._startup_active:
                 self._startup_buffered_execution = device
                 return
-            self._execution = device
-            self._execution_available = True
+            generation = self._operation_generation
+            fingerprint = _execution_fingerprint(device)
+            self._set_execution(device)
             epoch = self._epoch
         try:
-            await self._async_process_execution(device, emit_events=True, epoch=epoch)
+            await self._async_process_execution_snapshot(
+                device,
+                emit_events=True,
+                epoch=epoch,
+                generation=generation,
+                fingerprint=fingerprint,
+            )
         except Exception:
             logger.exception("scene bridge execution callback failed; continuing")
+
+    async def _async_process_execution_snapshot(
+        self,
+        device: BrilliantDevice,
+        *,
+        emit_events: bool,
+        epoch: int,
+        generation: int,
+        fingerprint: dict[str, str],
+    ) -> None:
+        # Reprocessing is safe: handlers emit only when their watermark advances.
+        await self._async_process_execution(device, emit_events=emit_events, epoch=epoch)
+        async with self._lock:
+            if (
+                epoch == self._epoch
+                and generation == self._operation_generation
+                and self._execution is not None
+                and not self._stopping
+            ):
+                self._processed_execution_fingerprint = fingerprint
 
     async def _async_process_execution(
         self,
