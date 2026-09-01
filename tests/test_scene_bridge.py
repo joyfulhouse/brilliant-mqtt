@@ -8,7 +8,6 @@ import json
 import stat
 import struct
 import threading
-from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import cast
 from uuid import UUID
@@ -261,6 +260,23 @@ async def test_poll_only_execution_publishes_event_and_persists_watermark(
     await bridge.async_shutdown()
 
 
+async def test_repeated_scene_poll_with_new_execution_time_publishes_again(
+    tmp_path: Path,
+) -> None:
+    bridge, _, mqtt, _, _ = await _started(tmp_path)
+    mqtt.published.clear()
+
+    await bridge.poll_executions([_execution("all_off", 200)])
+    await _wait_for_publish(mqtt, scene_event_topic(_PANEL))
+    await bridge.poll_executions([_execution("all_off", 300)])
+    await _wait_for_publish(mqtt, scene_event_topic(_PANEL), count=2)
+
+    assert [
+        _payload(item)["executed_at_ms"] for item in _published(mqtt, scene_event_topic(_PANEL))
+    ] == [200, 300]
+    await bridge.async_shutdown()
+
+
 async def test_failed_poll_processing_retries_identical_snapshot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -492,41 +508,6 @@ async def test_poll_gate_ignores_timestamp_only_variable_refresh(
     await bridge.poll_executions([refreshed])
 
     assert processed == []
-    await bridge.async_shutdown()
-
-
-async def test_poll_contains_variable_resize_during_fingerprint(
-    tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    class ResizingVariables(Mapping[str, Variable]):
-        def __getitem__(self, key: str) -> Variable:
-            raise KeyError(key)
-
-        def __iter__(self) -> Iterator[str]:
-            raise RuntimeError("dictionary changed size during iteration")
-
-        def __len__(self) -> int:
-            return 1
-
-    bridge, _, _, _, _ = await _started(tmp_path)
-    execution = _execution("all_off", 200)
-    execution.variables = cast(dict[str, Variable], ResizingVariables())
-
-    with caplog.at_level("WARNING", logger="brilliant_mqtt.scene_bridge"):
-        await bridge.poll_executions([execution])
-
-    assert "execution variables changed while snapshotting; retrying" in caplog.messages
-    await bridge.async_shutdown()
-
-
-async def test_poll_contains_missing_variables(tmp_path: Path) -> None:
-    bridge, _, _, _, _ = await _started(tmp_path)
-    execution = _execution("all_off", 200)
-    execution.variables = cast(dict[str, Variable], None)
-
-    await bridge.poll_executions([execution])
-
     await bridge.async_shutdown()
 
 

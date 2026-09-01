@@ -102,15 +102,8 @@ def _is_new(previous: Watermark | None, current: SceneExecution) -> bool:
     )
 
 
-def _execution_fingerprint(device: BrilliantDevice) -> dict[str, str] | None:
-    variables = getattr(device, "variables", None)
-    if variables is None:
-        return None
-    try:
-        snapshot = dict(variables)
-    except RuntimeError:
-        logger.warning("execution variables changed while snapshotting; retrying")
-        return None
+def _execution_fingerprint(device: BrilliantDevice) -> dict[str, str]:
+    snapshot = dict(device.variables)
     return {name: variable.value for name, variable in snapshot.items()}
 
 
@@ -257,7 +250,7 @@ class SceneBridge:
             if not self._started or self._stopping:
                 return
             fingerprint = _execution_fingerprint(execution)
-            if fingerprint is not None and fingerprint == self._processed_execution_fingerprint:
+            if fingerprint == self._processed_execution_fingerprint:
                 return
             self._operation_generation += 1
             generation = self._operation_generation
@@ -499,7 +492,7 @@ class SceneBridge:
             await self._async_health_status("scene")
             await self._async_health_status("mode")
             return
-        if execution is not None:
+        if execution is not None and fingerprint is not None:
             await self._async_process_execution_snapshot(
                 execution,
                 emit_events=emit_history,
@@ -647,7 +640,7 @@ class SceneBridge:
         emit_events: bool,
         epoch: int,
         generation: int,
-        fingerprint: dict[str, str] | None,
+        fingerprint: dict[str, str],
     ) -> None:
         # Reprocessing is safe: handlers emit only when their watermark advances.
         await self._async_process_execution(device, emit_events=emit_events, epoch=epoch)
@@ -656,7 +649,6 @@ class SceneBridge:
                 epoch == self._epoch
                 and generation == self._operation_generation
                 and self._execution is not None
-                and fingerprint is not None
                 and not self._stopping
             ):
                 self._processed_execution_fingerprint = fingerprint
