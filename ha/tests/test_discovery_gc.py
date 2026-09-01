@@ -13,6 +13,7 @@ from homeassistant.components import mqtt
 from homeassistant.components.mqtt.models import ReceiveMessage
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
+from paho.mqtt.client import topic_matches_sub
 
 from custom_components.brilliant_mqtt.discovery_gc import (
     DISCOVERY_CONFIG_FILTER,
@@ -28,16 +29,6 @@ STALE_KITCHEN = "homeassistant/sensor/brilliant_kitchen_bad id/config"
 LEGAL_OFFICE = "homeassistant/light/brilliant_office_HA_Backyard_Lamp_1/config"
 STALE_UNMANAGED = "homeassistant/light/brilliant_porch_HA Lamp 2/config"
 FOREIGN = "homeassistant/light/other vendor thing/config"
-
-type MessageCallback = Callable[[ReceiveMessage], Any]
-
-
-def _filter_matches(topic_filter: str, topic: str) -> bool:
-    filter_parts = topic_filter.split("/")
-    parts = topic.split("/")
-    return len(filter_parts) == len(parts) and all(
-        expected in ("+", actual) for expected, actual in zip(filter_parts, parts, strict=True)
-    )
 
 
 @dataclass(slots=True)
@@ -58,17 +49,17 @@ class _FakeRetainedBroker:
         self,
         hass: HomeAssistant,
         topic: str,
-        callback: MessageCallback,
+        callback: Callable[[ReceiveMessage], Any],
         qos: int = 0,
         encoding: str | None = "utf-8",
     ) -> Callable[[], None]:
         del hass, qos, encoding
         self.subscribed.append(topic)
         for retained_topic in sorted(self.retained):
-            if _filter_matches(topic, retained_topic):
+            if topic_matches_sub(topic, retained_topic):
                 callback(self._message(topic, retained_topic, retain=True))
         for live_topic in self.live_topics:
-            if _filter_matches(topic, live_topic):
+            if topic_matches_sub(topic, live_topic):
                 callback(self._message(topic, live_topic, retain=False))
 
         def unsubscribe() -> None:
@@ -198,15 +189,9 @@ async def test_mqtt_failure_is_contained(
     """A broken MQTT seam is attempted, swallowed, and publishes nothing."""
     attempts: list[str] = []
 
-    async def failing_subscribe(
-        hass_: HomeAssistant,
-        topic: str,
-        callback: MessageCallback,
-        qos: int = 0,
-        encoding: str | None = "utf-8",
-    ) -> Callable[[], None]:
-        del hass_, callback, qos, encoding
-        attempts.append(topic)
+    async def failing_subscribe(*args: Any, **kwargs: Any) -> Callable[[], None]:
+        del kwargs
+        attempts.append(args[1])
         raise HomeAssistantError("mqtt_not_setup_cannot_subscribe")
 
     publish = AsyncMock()

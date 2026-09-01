@@ -56,11 +56,38 @@ async def async_purge_stale_discovery_configs(
     hass: HomeAssistant,
     panels: frozenset[str],
     *,
-    collection_window: float | None = None,
+    collection_window: float = _COLLECTION_WINDOW_SECONDS,
 ) -> int:
     """Delete stale retained configs, containing every failure; return the count."""
     try:
-        return await _async_purge(hass, panels, collection_window)
+        slugs = frozenset(panel for panel in panels if _PANEL_SLUG.fullmatch(panel))
+        if not slugs:
+            return 0
+        stale: set[str] = set()
+
+        @callback
+        def collect(message: ReceiveMessage) -> None:
+            if (
+                message.subscribed_topic == DISCOVERY_CONFIG_FILTER
+                and message.retain is True
+                and len(stale) < _MAX_STALE_TOPICS
+                and is_stale_owned_discovery_topic(message.topic, slugs)
+            ):
+                stale.add(message.topic)
+
+        unsubscribe = await mqtt.async_subscribe(hass, DISCOVERY_CONFIG_FILTER, collect)
+        try:
+            await asyncio.sleep(collection_window)
+        finally:
+            unsubscribe()
+        for topic in sorted(stale):
+            await mqtt.async_publish(hass, topic, "", qos=1, retain=True)
+        if stale:
+            _LOGGER.info(
+                "Deleted %d stale pre-ledger retained discovery configs",
+                len(stale),
+            )
+        return len(stale)
     except asyncio.CancelledError:
         raise
     except Exception as error:
@@ -69,40 +96,3 @@ async def async_purge_stale_discovery_configs(
             type(error).__name__,
         )
         return 0
-
-
-async def _async_purge(
-    hass: HomeAssistant,
-    panels: frozenset[str],
-    collection_window: float | None,
-) -> int:
-    slugs = frozenset(panel for panel in panels if _PANEL_SLUG.fullmatch(panel))
-    if not slugs:
-        return 0
-    stale: set[str] = set()
-
-    @callback
-    def collect(message: ReceiveMessage) -> None:
-        if (
-            message.subscribed_topic == DISCOVERY_CONFIG_FILTER
-            and message.retain is True
-            and len(stale) < _MAX_STALE_TOPICS
-            and is_stale_owned_discovery_topic(message.topic, slugs)
-        ):
-            stale.add(message.topic)
-
-    unsubscribe = await mqtt.async_subscribe(hass, DISCOVERY_CONFIG_FILTER, collect)
-    try:
-        await asyncio.sleep(
-            _COLLECTION_WINDOW_SECONDS if collection_window is None else collection_window
-        )
-    finally:
-        unsubscribe()
-    for topic in sorted(stale):
-        await mqtt.async_publish(hass, topic, "", qos=1, retain=True)
-    if stale:
-        _LOGGER.info(
-            "Deleted %d stale pre-ledger retained discovery configs",
-            len(stale),
-        )
-    return len(stale)
