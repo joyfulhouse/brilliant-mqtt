@@ -12,10 +12,13 @@ import asyncio
 import base64
 import binascii
 import hashlib
+import io
 import json
 import os
 import re
 import secrets
+import stat
+import tarfile
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
@@ -69,6 +72,7 @@ from .setup_protocol import PreflightRequest
 from .shell import PanelProcess, PanelShell, RunResult
 
 _STAGING_DIR = f"{PANEL_VAR_DIR}.staging"
+_STAGING_TARBALL = f"{_STAGING_DIR}.tar.gz"
 _STAGED_UNIT = f"{PANEL_STAGED_DIR}/{SERVICE_NAME}.service"
 _STAGED_ENV = f"{PANEL_STAGED_DIR}/{SERVICE_NAME}.env"
 
@@ -2143,14 +2147,48 @@ async def deploy_payload(shell: PanelShell, local_payload_dir: str, version: str
     """Upload the bundled agent payload and swap it into place.
 
     *local_payload_dir* must contain app/ and vendor/ (built by
-    scripts/build_payload.sh). Full upload into a staging dir first so a failed
-    transfer never half-replaces a working install; the in-place swap moves the
-    current app/vendor aside (not rm) so a mid-swap mv failure stays recoverable.
+    scripts/build_payload.sh). An in-memory archive is uploaded and extracted into
+    staging before the swap, briefly using space for the live tree, staging tree,
+    and tarball. The current app/vendor are moved aside (not rm) so a mid-swap mv
+    failure stays recoverable.
     """
-    await shell.run(f"rm -rf {_STAGING_DIR}")
-    await shell.put_dir(local_payload_dir, _STAGING_DIR)
+    loop = asyncio.get_running_loop()
+    archive = await loop.run_in_executor(None, _build_payload_archive, local_payload_dir)
+    await _checked(shell, f"rm -rf {_STAGING_DIR} {_STAGING_TARBALL}")
+    await shell.put_bytes(archive, _STAGING_TARBALL, 0o600)
+    await _checked(shell, _extract_payload_command())
     await _checked(shell, _swap_command())
     await shell.put_bytes(version.encode(), PANEL_VERSION_FILE, 0o644)
+
+
+def _build_payload_archive(local_payload_dir: str) -> bytes:
+    """Build an in-memory payload archive; callers must run this off-loop."""
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        archive.add(local_payload_dir, arcname=".", filter=_normalize_payload_member)
+    return buffer.getvalue()
+
+
+def _normalize_payload_member(member: tarfile.TarInfo) -> tarfile.TarInfo:
+    if not (member.isfile() or member.isdir() or member.issym()):
+        raise OSError("payload contains unsupported file type")
+    member.uid = member.gid = 0
+    member.uname = member.gname = "root"
+    if member.isdir():
+        member.mode = 0o755
+    elif member.isfile():
+        member.mode = 0o755 if member.mode & stat.S_IXUSR else 0o644
+    return member
+
+
+def _extract_payload_command() -> str:
+    return " && ".join(
+        [
+            f"mkdir -p {_STAGING_DIR}",
+            f"tar xzf {_STAGING_TARBALL} -C {_STAGING_DIR}",
+            f"rm -f {_STAGING_TARBALL}",
+        ]
+    )
 
 
 def _swap_command() -> str:
@@ -2182,7 +2220,7 @@ async def uninstall(shell: PanelShell) -> None:
     """
     await shell.run(f"systemctl disable --now {SERVICE_NAME} 2>/dev/null || true")
     await _checked(shell, f"rm -f {PANEL_UNIT_FILE} {PANEL_ENV_FILE}")
-    await _checked(shell, f"rm -rf {PANEL_VAR_DIR} {_STAGING_DIR}")
+    await _checked(shell, f"rm -rf {PANEL_VAR_DIR} {_STAGING_DIR} {_STAGING_TARBALL}")
     await _checked(shell, "systemctl daemon-reload")
 
 

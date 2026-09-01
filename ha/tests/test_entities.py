@@ -392,7 +392,10 @@ async def test_update_install_deploys_payload_and_restarts(
     await hass.async_block_till_done()
     await hass.services.async_call("update", "install", {"entity_id": UPDATE}, blocking=True)
     await hass.async_block_till_done()
-    assert fake_shell.dir_uploads  # payload tree uploaded
+    assert any(
+        path == "/var/brilliant-mqtt.staging.tar.gz" and mode == 0o600
+        for path, _, mode in fake_shell.uploads
+    )
     assert "systemctl restart brilliant-mqtt" in fake_shell.commands
 
     assert await hass.config_entries.async_unload(entry.entry_id)
