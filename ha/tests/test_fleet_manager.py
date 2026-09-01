@@ -4851,6 +4851,44 @@ async def test_rejected_fleet_snapshot_does_not_reload_control_plane(
         await fleet.async_shutdown()
 
 
+async def test_update_listener_schedules_reload_when_live_reconcile_rejects(
+    hass: HomeAssistant,
+) -> None:
+    """An identity re-pin (host + SSH host key) applies via a scheduled reload.
+
+    The config flow no longer reloads on completion (HA 2026.12 forbids a
+    reloading flow method next to an update listener), so a snapshot the live
+    reconcile refuses must not be dropped — the listener schedules the reload.
+    """
+    entry = _fleet_entry(_panel("office", "SHA256:office", subentry_id="panel-office"))
+    entry.add_to_hass(hass)
+    fleet = FleetManager(hass, entry)
+
+    with (
+        patch.object(PanelManager, "async_setup", _noop_setup),
+        patch.object(PanelManager, "async_shutdown", _noop_shutdown),
+        patch.object(hass.config_entries, "async_schedule_reload") as schedule_reload,
+    ):
+        await fleet.async_setup()
+        assert fleet._update_unsub is not None
+        stored_office = entry.subentries["panel-office"]
+        assert hass.config_entries.async_update_subentry(
+            entry,
+            stored_office,
+            data={
+                **stored_office.data,
+                CONF_HOST: "office-moved.example.com",
+                CONF_SSH_HOST_KEY: _OTHER_PUBLIC_KEY,
+                CONF_IDENTITY_FINGERPRINT: _OTHER_FINGERPRINT,
+            },
+            unique_id=_OTHER_FINGERPRINT,
+        )
+        await hass.async_block_till_done()
+
+        schedule_reload.assert_called_once_with(entry.entry_id)
+        await fleet.async_shutdown()
+
+
 async def test_panel_host_only_change_does_not_reload_control_plane(
     hass: HomeAssistant,
 ) -> None:
