@@ -1315,6 +1315,9 @@ async def test_deploy_payload_builds_archive_off_loop_then_extracts_and_swaps(
     app_file.write_text("main = True\n")
     vendor_file.write_text("dependency = True\n")
     app_file.chmod(0o751)
+    symlink = app_file.with_name("main.py")
+    symlink.symlink_to(app_file.name)
+    symlink_mode = os.lstat(symlink).st_mode & 0o777
 
     loop_thread = threading.get_ident()
     builder_threads: list[int] = []
@@ -1328,8 +1331,11 @@ async def test_deploy_payload_builds_archive_off_loop_then_extracts_and_swaps(
     shell = await _connected(FakeShell())
     await panel_ops.deploy_payload(shell, str(payload), version="9.9.9")
 
-    assert builder_threads and builder_threads != [loop_thread]
-    assert shell.commands[0] == "rm -rf /var/brilliant-mqtt.staging"
+    assert len(builder_threads) == 1
+    assert all(thread != loop_thread for thread in builder_threads)
+    assert shell.commands[0] == (
+        "rm -rf /var/brilliant-mqtt.staging /var/brilliant-mqtt.staging.tar.gz"
+    )
     assert shell.dir_uploads == []
     archive_path, archive_bytes, mode = shell.uploads[0]
     assert archive_path == "/var/brilliant-mqtt.staging.tar.gz"
@@ -1337,26 +1343,44 @@ async def test_deploy_payload_builds_archive_off_loop_then_extracts_and_swaps(
     with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as archive:
         members = {member.name: member for member in archive.getmembers()}
         assert "./app/brilliant_mqtt/__main__.py" in members
+        assert members["./app/brilliant_mqtt/main.py"].issym()
         assert "./vendor/dependency.py" in members
-        assert members["./app/brilliant_mqtt/__main__.py"].mode == 0o751
+        assert all(
+            (member.uid, member.gid, member.uname, member.gname) == (0, 0, "root", "root")
+            for member in members.values()
+        )
+        assert members["."].mode == 0o755
+        assert members["./app/brilliant_mqtt/__main__.py"].mode == 0o755
+        assert members["./app/brilliant_mqtt/main.py"].mode == symlink_mode
+        assert members["./vendor/dependency.py"].mode == 0o644
     assert shell.commands[1] == (
         "mkdir -p /var/brilliant-mqtt.staging && "
-        "tar -xzf /var/brilliant-mqtt.staging.tar.gz -C /var/brilliant-mqtt.staging && "
+        "tar xzf /var/brilliant-mqtt.staging.tar.gz -C /var/brilliant-mqtt.staging && "
         "rm -f /var/brilliant-mqtt.staging.tar.gz"
     )
     assert _EXPECTED_SWAP in shell.commands
     assert ("/var/brilliant-mqtt/VERSION", b"9.9.9", 0o644) in shell.uploads
 
 
-async def test_deploy_payload_failed_extraction_cannot_swap_partial_tree(tmp_path: Path) -> None:
+def test_build_payload_archive_rejects_special_members(tmp_path: Path) -> None:
+    payload = tmp_path / "payload"
+    payload.mkdir()
+    os.mkfifo(payload / "pipe")
+
+    with pytest.raises(OSError, match="unsupported file type"):
+        panel_ops._build_payload_archive(str(payload))
+
+
+async def test_deploy_payload_failed_extraction_recovers_on_retry(tmp_path: Path) -> None:
     payload = tmp_path / "payload"
     (payload / "app").mkdir(parents=True)
     (payload / "vendor").mkdir()
     extract_command = (
         "mkdir -p /var/brilliant-mqtt.staging && "
-        "tar -xzf /var/brilliant-mqtt.staging.tar.gz -C /var/brilliant-mqtt.staging && "
+        "tar xzf /var/brilliant-mqtt.staging.tar.gz -C /var/brilliant-mqtt.staging && "
         "rm -f /var/brilliant-mqtt.staging.tar.gz"
     )
+    cleanup_command = "rm -rf /var/brilliant-mqtt.staging /var/brilliant-mqtt.staging.tar.gz"
     shell = await _connected(
         FakeShell(responses={extract_command: RunResult(2, "", "invalid archive\n")})
     )
@@ -1364,9 +1388,21 @@ async def test_deploy_payload_failed_extraction_cannot_swap_partial_tree(tmp_pat
     with pytest.raises(panel_ops.PanelOpError, match="exited 2"):
         await panel_ops.deploy_payload(shell, str(payload), version="9.9.9")
 
-    assert shell.commands == ["rm -rf /var/brilliant-mqtt.staging", extract_command]
+    assert shell.commands == [cleanup_command, extract_command]
     assert _EXPECTED_SWAP not in shell.commands
     assert all(path != "/var/brilliant-mqtt/VERSION" for path, _, _ in shell.uploads)
+
+    shell.responses[extract_command] = RunResult(0, "", "")
+    await panel_ops.deploy_payload(shell, str(payload), version="9.9.9")
+
+    assert shell.commands == [
+        cleanup_command,
+        extract_command,
+        cleanup_command,
+        extract_command,
+        _EXPECTED_SWAP,
+    ]
+    assert ("/var/brilliant-mqtt/VERSION", b"9.9.9", 0o644) in shell.uploads
 
 
 async def test_deploy_payload_raises_and_skips_version_when_swap_fails(tmp_path: Path) -> None:
@@ -1387,7 +1423,7 @@ async def test_uninstall_sequence_and_paths() -> None:
     assert shell.commands == [
         "systemctl disable --now brilliant-mqtt 2>/dev/null || true",
         "rm -f /etc/systemd/system/brilliant-mqtt.service /etc/brilliant-mqtt.env",
-        "rm -rf /var/brilliant-mqtt /var/brilliant-mqtt.staging",
+        "rm -rf /var/brilliant-mqtt /var/brilliant-mqtt.staging /var/brilliant-mqtt.staging.tar.gz",
         "systemctl daemon-reload",
     ]
     # Every absolute-path token references only the four owned path constants

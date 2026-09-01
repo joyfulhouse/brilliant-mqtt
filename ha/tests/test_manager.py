@@ -603,9 +603,9 @@ async def test_repair_deploys_payload_when_code_absent(
     _assert_payload_archive_uploaded(shell)
     assert ("/var/brilliant-mqtt/VERSION", b"0.2.0", 0o644) in shell.uploads
     # The code is laid down (staging cleared first) before the unit is enabled.
-    assert shell.commands.index("rm -rf /var/brilliant-mqtt.staging") < shell.commands.index(
-        "systemctl enable --now brilliant-mqtt"
-    )
+    assert shell.commands.index(
+        "rm -rf /var/brilliant-mqtt.staging /var/brilliant-mqtt.staging.tar.gz"
+    ) < shell.commands.index("systemctl enable --now brilliant-mqtt")
 
     assert await hass.config_entries.async_unload(entry.entry_id)
 
@@ -1795,10 +1795,30 @@ async def test_agent_update_reports_progress(
     assert await hass.config_entries.async_unload(entry.entry_id)
 
 
-class _NoRecursivePayloadShell(FakeShell):
+class _OrderedPayloadShell(FakeShell):
+    def __init__(
+        self,
+        label: str,
+        timeline: list[str],
+        *,
+        connect_gate: asyncio.Event | None = None,
+    ) -> None:
+        super().__init__(connect_gate=connect_gate)
+        self._label = label
+        self._timeline = timeline
+
+    async def connect(self) -> None:
+        self._timeline.append(f"{self._label}:connect-enter")
+        await super().connect()
+
     async def put_dir(self, local_dir: str, remote_dir: str) -> None:
         del local_dir, remote_dir
         raise AssertionError("deploy_payload reached recursive SFTP upload")
+
+    async def put_bytes(self, data: bytes, remote_path: str, mode: int) -> None:
+        await super().put_bytes(data, remote_path, mode)
+        if remote_path == "/var/brilliant-mqtt/VERSION":
+            self._timeline.append(f"{self._label}:deploy-complete")
 
 
 async def test_concurrent_agent_updates_serialize_on_existing_fleet_lock(
@@ -1806,9 +1826,10 @@ async def test_concurrent_agent_updates_serialize_on_existing_fleet_lock(
 ) -> None:
     del payload_dir
     first_gate = asyncio.Event()
+    timeline: list[str] = []
     shells = [
-        _NoRecursivePayloadShell(connect_gate=first_gate),
-        _NoRecursivePayloadShell(),
+        _OrderedPayloadShell("first", timeline, connect_gate=first_gate),
+        _OrderedPayloadShell("second", timeline),
     ]
     entries = [
         MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA),
@@ -1830,14 +1851,13 @@ async def test_concurrent_agent_updates_serialize_on_existing_fleet_lock(
         first_update = asyncio.create_task(managers[0].async_update_agent())
         await shells[0].connect_entered.wait()
         second_update = asyncio.create_task(managers[1].async_update_agent())
-        await asyncio.sleep(0)
-        assert not shells[1].connect_entered.is_set()
 
         first_gate.set()
         await asyncio.gather(first_update, second_update)
 
-    assert all(shell.connect_count == 1 for shell in shells)
     await asyncio.gather(*(manager.async_shutdown() for manager in managers))
+    assert all(shell.connect_count == 1 for shell in shells)
+    assert timeline.index("first:deploy-complete") < timeline.index("second:connect-enter")
 
 
 # ---------------------------------------------------------------------------
