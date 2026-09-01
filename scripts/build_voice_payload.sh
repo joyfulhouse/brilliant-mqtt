@@ -3,22 +3,77 @@
 # Fetch-only; NO compilation (panel is armv7 Cortex-A9; everything is prebuilt).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+FILE_BIN="$(command -v file || true)"
+READELF_BIN="${READELF:-$(command -v readelf || command -v greadelf || true)}"
+readonly FILE_BIN READELF_BIN
+
+if [[ -z "$FILE_BIN" || -z "$READELF_BIN" ]]; then
+  echo "ERROR: file and readelf are required to verify payload architecture" >&2
+  exit 1
+fi
+
+verify_pyopen_tflite_abi() {
+  local library="$1" dynsyms symbol missing=0
+  # Derived from every lib.TfLite* ctypes lookup in pyopen_wakeword/wakeword.py.
+  local -a required_symbols=(
+    TfLiteModelCreateFromFile
+    TfLiteInterpreterCreate
+    TfLiteInterpreterAllocateTensors
+    TfLiteInterpreterInvoke
+    TfLiteInterpreterGetInputTensor
+    TfLiteInterpreterGetOutputTensor
+    TfLiteTensorByteSize
+    TfLiteTensorNumDims
+    TfLiteTensorDim
+    TfLiteTensorType
+    TfLiteTensorQuantizationParams
+    TfLiteInterpreterResizeInputTensor
+    TfLiteTensorCopyFromBuffer
+    TfLiteTensorCopyToBuffer
+    TfLiteInterpreterDelete
+    TfLiteModelDelete
+  )
+
+  if ! dynsyms="$(LC_ALL=C "$READELF_BIN" --wide --dyn-syms "$library" 2>&1)"; then
+    echo "ERROR: could not read dynamic symbols from ${library}: ${dynsyms}" >&2
+    return 1
+  fi
+  for symbol in "${required_symbols[@]}"; do
+    if ! grep -Eq "[[:space:]]${symbol}(@@[^[:space:]]+)?$" <<< "$dynsyms"; then
+      echo "ERROR: ${library} does not export required symbol ${symbol}" >&2
+      missing=1
+    fi
+  done
+  ((missing == 0)) || return 1
+  echo "verified pyopen-wakeword tflite ABI: ${#required_symbols[@]} required symbols exported"
+}
 
 verify_armv7_shared_objects() {
-  local payload_dir="$1" so
-  local readelf_bin="${READELF:-$(command -v readelf || command -v greadelf || true)}"
+  local payload_dir="$1" manifest so
   local file_output readelf_output failed=0 count=0
 
-  if [[ -z "$readelf_bin" ]]; then
-    echo "ERROR: readelf is required to verify payload architecture" >&2
+  # Scope: bundled shared-object candidates (*.so*) only, not native executables.
+  manifest="$(mktemp)"
+  if ! find "$payload_dir" \( -type f -o -type l \) -name '*.so*' -print0 > "$manifest"; then
+    echo "ERROR: could not enumerate shared objects under ${payload_dir}" >&2
+    rm -f "$manifest"
     return 1
   fi
 
   while IFS= read -r -d '' so; do
-    [[ "$(basename "$so")" =~ \.so(\.[0-9]+)*$ ]] || continue
+    if ! file_output="$(LC_ALL=C "$FILE_BIN" -bL "$so" 2>&1)"; then
+      file_output="file failed: ${file_output}"
+      echo "ERROR: could not inspect ${so}: ${file_output}" >&2
+      failed=1
+      continue
+    fi
+    if [[ "$file_output" != *"ELF"* ]]; then
+      echo "skipping (not a shared object): ${so}"
+      continue
+    fi
+
     count=$((count + 1))
-    file_output="$(file -bL "$so")"
-    if ! readelf_output="$("$readelf_bin" -h "$so" 2>&1)"; then
+    if ! readelf_output="$(LC_ALL=C "$READELF_BIN" -h "$so" 2>&1)"; then
       readelf_output="readelf failed: ${readelf_output}"
     fi
 
@@ -33,7 +88,8 @@ verify_armv7_shared_objects() {
       echo "  readelf: ${readelf_output}" >&2
       failed=1
     fi
-  done < <(find "$payload_dir" \( -type f -o -type l \) -name '*.so*' -print0)
+  done < "$manifest"
+  rm -f "$manifest"
 
   if ((count == 0)); then
     echo "ERROR: no shared objects found under ${payload_dir}" >&2
@@ -43,6 +99,7 @@ verify_armv7_shared_objects() {
   echo "verified ${count} shared objects: all ELF 32-bit ARM (EABI5)"
 }
 
+# Release maintainers use this mode to inspect an extracted asset without rebuilding it.
 if [ "${1:-}" = "--verify-architecture" ]; then
   if [ "$#" -ne 2 ]; then
     echo "usage: $0 --verify-architecture PAYLOAD_DIR" >&2
@@ -68,7 +125,18 @@ DEB_GFORTRAN_SHA256="5aeff120a11bee91544f409d35a8236bd490e513735cf58f0ceb8362da6
 DEB_LIBSTDCXX="https://ports.ubuntu.com/ubuntu-ports/pool/main/g/gcc-12/libstdc++6_12.3.0-1ubuntu1~22.04.3_armhf.deb"
 DEB_LIBSTDCXX_SHA256="f9901b20640ebd7f6f75c528d67d2f4e4c58c8ecfb39877a4f48cbc3db96cf2c"
 
-PKGS="aioesphomeapi==45.3.1 netifaces2==0.0.22 numpy>=2,<3 pymicro-wakeword>=2,<3 pyopen-wakeword>=1,<2 webrtc_noise_gain==1.3.0 zeroconf<1 getmac<1"
+PKGS=(
+  "aioesphomeapi==45.3.1"
+  "netifaces2==0.0.22"
+  "numpy>=2,<3"
+  # COUPLED: see tflite copy below; re-verify ABI on any bump.
+  "pymicro-wakeword>=2,<3"
+  # COUPLED: see tflite copy below; re-verify ABI on any bump.
+  "pyopen-wakeword>=1,<2"
+  "webrtc_noise_gain==1.3.0"
+  "zeroconf<1"
+  "getmac<1"
+)
 
 # ── staging paths ─────────────────────────────────────────────────────────────
 DEST="${ROOT}/custom_components/brilliant_mqtt/voice_payload/build/brilliant-voice"
@@ -98,8 +166,7 @@ cp -R "$TMP/python/." "$DEST/python/"
 
 # ── 2. LVA py3.11 deps → site/ ───────────────────────────────────────────────
 echo "==> [2/6] Downloading armv7 cp311 wheels…"
-# shellcheck disable=SC2086
-uv run --with pip python -m pip download $PKGS \
+uv run --with pip python -m pip download "${PKGS[@]}" \
   --only-binary=:all: --python-version 3.11 --implementation cp --abi cp311 \
   --platform manylinux_2_35_armv7l --platform manylinux2014_armv7l \
   --platform manylinux_2_17_armv7l \
@@ -111,6 +178,7 @@ for whl in "$WHEELS"/*.whl; do unzip -qo "$whl" -d "$DEST/site"; done
 # genuine armv7 library from PyPI's preferred pymicro-wakeword wheel.
 cp "$DEST/site/pymicro_wakeword/lib/libtensorflowlite_c.so" \
    "$DEST/site/pyopen_wakeword/lib/libtensorflowlite_c.so"
+verify_pyopen_tflite_abi "$DEST/site/pyopen_wakeword/lib/libtensorflowlite_c.so"
 rm -rf "$DEST"/site/*.dist-info
 
 # ── 3. Native libs → libs/ ───────────────────────────────────────────────────
