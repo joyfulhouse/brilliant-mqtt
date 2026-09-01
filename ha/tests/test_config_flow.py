@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from dataclasses import replace
 from types import MappingProxyType
 from typing import Any, cast
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 from uuid import UUID
 
 import asyncssh
@@ -4409,6 +4409,101 @@ async def test_legacy_reconfigure_connection_new_password_is_stored(
     assert call is not None
     assert call.args[2] == "rotated-root-password"
     assert entry.data[CONF_ROOT_PASSWORD] == "rotated-root-password"
+
+
+async def test_legacy_reconfigure_completion_updates_without_flow_reload(
+    hass: HomeAssistant,
+) -> None:
+    """Completing a section persists data and aborts; the flow itself never reloads.
+
+    From HA 2026.12 a reloading config-flow method may not coexist with the
+    integration's update listener — that listener is the single reload authority.
+    """
+    entry = _legacy_entry(hass)
+    form = await _open_legacy_reconfigure_step(hass, entry, "reconfigure_connection")
+
+    apply = AsyncMock(return_value=_PUBLIC_KEY)
+    with patch.object(hass.config_entries, "async_schedule_reload") as schedule_reload:
+        result = await _submit_legacy_reconfigure(
+            hass,
+            form,
+            {CONF_HOST: "office-moved.iot.example", CONF_ROOT_PASSWORD: ""},
+            apply,
+        )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+    assert entry.data[CONF_HOST] == "office-moved.iot.example"
+    schedule_reload.assert_not_called()
+
+
+async def test_legacy_reconfigure_applies_via_update_listener_without_reload(
+    hass: HomeAssistant,
+) -> None:
+    """SSH-password and MQTT-endpoint edits reach the live runtime listener-only.
+
+    With the running FleetManager's update listener registered, completing the
+    connection and MQTT sections must live-apply through that listener without
+    any reload — neither from the flow nor scheduled by the reconcile.
+    """
+    entry = _legacy_entry(hass)
+    fleet = FleetManager(hass, entry)
+
+    async def noop(manager: PanelManager) -> None:
+        return None
+
+    with (
+        patch(
+            "custom_components.brilliant_mqtt.fleet_manager.mqtt.is_connected",
+            return_value=True,
+        ),
+        patch(
+            "custom_components.brilliant_mqtt.fleet_manager.mqtt.async_subscribe_connection_status",
+            return_value=Mock(),
+        ),
+        patch.object(PanelManager, "async_setup", noop),
+        patch.object(PanelManager, "async_shutdown", noop),
+        patch.object(hass.config_entries, "async_schedule_reload") as schedule_reload,
+    ):
+        await fleet.async_setup()
+        assert fleet._update_unsub is not None
+
+        apply = AsyncMock(return_value=_PUBLIC_KEY)
+        form = await _open_legacy_reconfigure_step(hass, entry, "reconfigure_connection")
+        with patch.object(flow_gateway, "_apply_config", apply):
+            result = await hass.config_entries.flow.async_configure(
+                form["flow_id"],
+                {
+                    CONF_HOST: "office.iot.example",
+                    CONF_ROOT_PASSWORD: "rotated-root-password",
+                },
+            )
+            await hass.async_block_till_done()
+        assert result["reason"] == "reconfigure_successful"
+
+        form = await _open_legacy_reconfigure_step(hass, entry, "reconfigure_mqtt")
+        with patch.object(flow_gateway, "_apply_config", apply):
+            result = await hass.config_entries.flow.async_configure(
+                form["flow_id"],
+                {
+                    CONF_MQTT_HOST: "mqtt-new.iot.example",
+                    CONF_MQTT_PORT: 8883,
+                    CONF_MQTT_USERNAME: "brilliant-fleet",
+                    CONF_MQTT_PASSWORD: "",
+                },
+            )
+            await hass.async_block_till_done()
+        assert result["reason"] == "reconfigure_successful"
+
+        assert entry.data[CONF_ROOT_PASSWORD] == "rotated-root-password"
+        assert entry.data[CONF_MQTT_HOST] == "mqtt-new.iot.example"
+        assert entry.data[CONF_MQTT_PORT] == 8883
+        assert entry.data[CONF_MQTT_PASSWORD] == _BROKER_PASSWORD
+        manager = fleet.panels[entry.entry_id]
+        assert manager.store.data[CONF_ROOT_PASSWORD] == "rotated-root-password"
+        assert manager.fleet.broker.host == "mqtt-new.iot.example"
+        schedule_reload.assert_not_called()
+        await fleet.async_shutdown()
 
 
 async def test_legacy_reconfigure_mqtt_blank_password_reuses_stored_secret(
