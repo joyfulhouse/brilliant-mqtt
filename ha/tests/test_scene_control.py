@@ -6,13 +6,17 @@ import asyncio
 import json
 import traceback
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from homeassistant.core import CALLBACK_TYPE, Event, HomeAssistant, ServiceCall
 from homeassistant.exceptions import HomeAssistantError
-from pytest_homeassistant_custom_component.common import MockConfigEntry, async_fire_mqtt_message
+from pytest_homeassistant_custom_component.common import (
+    MockConfigEntry,
+    async_capture_events,
+    async_fire_mqtt_message,
+)
 from pytest_homeassistant_custom_component.typing import MqttMockHAClient
 
 from custom_components.brilliant_mqtt import scene_control as scene_control_module
@@ -53,6 +57,16 @@ _SUBSCRIPTIONS = {
     "brilliant/ha-control/v1/status/scene/+",
     "brilliant/ha-control/v1/status/mode/+",
 }
+
+
+def _capture_events(hass: HomeAssistant, event_type: str) -> list[Event[dict[str, object]]]:
+    """Capture EVENT_SCENE/EVENT_MODE inline via the harness's @callback listener.
+
+    A bare `events.append` would type as HassJobType.Executor and race readers from
+    a thread-pool worker (#45); the cast is load-bearing under --strict, not a
+    suppression — full rationale in test_manager._capture_events.
+    """
+    return cast(list[Event[dict[str, object]]], async_capture_events(hass, event_type))
 
 
 def _scene_catalog(
@@ -308,9 +322,8 @@ async def test_scene_event_fires_before_action_and_deduplicates_or_rejects_stale
 async def test_distinct_scene_events_at_same_millisecond_are_not_dropped(
     hass: HomeAssistant, mqtt_mock: MqttMockHAClient
 ) -> None:
-    events: list[Event[dict[str, object]]] = []
+    events = _capture_events(hass, EVENT_SCENE)
     actions: list[ServiceCall] = []
-    hass.bus.async_listen(EVENT_SCENE, events.append)
     hass.services.async_register("scene", "turn_on", actions.append)
     action = {
         "domain": "scene",
@@ -518,8 +531,7 @@ async def test_stop_fails_pending_service_and_removes_every_subscription(
 async def test_mode_catalog_event_and_rejected_confirmation_are_symmetric(
     hass: HomeAssistant, mqtt_mock: MqttMockHAClient
 ) -> None:
-    events: list[Event[dict[str, object]]] = []
-    hass.bus.async_listen(EVENT_MODE, events.append)
+    events = _capture_events(hass, EVENT_MODE)
     runtime = SceneControl(hass)
     await runtime.async_start({"office"}, default_panel="office", actions={})
     async_fire_mqtt_message(
@@ -706,9 +718,8 @@ async def test_malformed_actions_fail_closed_without_suppressing_events(
     mqtt_mock: MqttMockHAClient,
     actions: Mapping[str, object],
 ) -> None:
-    events: list[Event[dict[str, object]]] = []
+    events = _capture_events(hass, EVENT_SCENE)
     calls: list[ServiceCall] = []
-    hass.bus.async_listen(EVENT_SCENE, events.append)
     hass.services.async_register("scene", "turn_on", calls.append)
     runtime = SceneControl(hass)
     await runtime.async_start({"office"}, default_panel="office", actions=actions)
@@ -729,9 +740,8 @@ async def test_malformed_actions_fail_closed_without_suppressing_events(
 async def test_oversized_action_mapping_fails_closed_without_suppressing_events(
     hass: HomeAssistant, mqtt_mock: MqttMockHAClient
 ) -> None:
-    events: list[Event[dict[str, object]]] = []
+    events = _capture_events(hass, EVENT_SCENE)
     calls: list[ServiceCall] = []
-    hass.bus.async_listen(EVENT_SCENE, events.append)
     hass.services.async_register("scene", "turn_on", calls.append)
     action: dict[str, object] = {
         "domain": "scene",
@@ -884,8 +894,7 @@ async def test_future_event_timestamps_cannot_poison_ordering_or_deduplication(
     hass: HomeAssistant, mqtt_mock: MqttMockHAClient
 ) -> None:
     now_ms = 1_700_000_000_000
-    events: list[Event[dict[str, object]]] = []
-    hass.bus.async_listen(EVENT_SCENE, events.append)
+    events = _capture_events(hass, EVENT_SCENE)
     runtime = SceneControl(hass)
     with patch.object(scene_control_module, "_timestamp_ms", return_value=now_ms):
         await runtime.async_start({"office"}, default_panel="office", actions={})
@@ -1106,8 +1115,7 @@ async def test_control_plane_owns_one_runtime_and_reconfigures_attached_panels(
 async def test_noncanonical_deduplication_key_is_rejected(
     hass: HomeAssistant, mqtt_mock: MqttMockHAClient
 ) -> None:
-    events: list[Event[dict[str, object]]] = []
-    hass.bus.async_listen(EVENT_SCENE, events.append)
+    events = _capture_events(hass, EVENT_SCENE)
     runtime = SceneControl(hass)
     await runtime.async_start({"office"}, default_panel="office", actions={})
     payload = json.loads(_scene_event(10))

@@ -18,7 +18,7 @@ from homeassistant.const import CONF_NAME
 from homeassistant.core import Event, HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers import issue_registry as ir
-from pytest_homeassistant_custom_component.common import MockConfigEntry
+from pytest_homeassistant_custom_component.common import MockConfigEntry, async_capture_events
 
 from custom_components.brilliant_mqtt.broker import BrokerKind
 from custom_components.brilliant_mqtt.components import REGISTRY
@@ -2640,12 +2640,9 @@ async def test_rebind_durably_adopts_exact_identity_and_audits_after_proof(
     fleet = FleetManager(hass, entry)
     order: list[str] = []
     immutable_checks: list[tuple[PanelConfig, PanelConfig]] = []
-    events: list[Event[dict[str, Any]]] = []
-
-    def capture_event(event: Event[dict[str, Any]]) -> None:
-        events.append(event)
-
-    hass.bus.async_listen(EVENT_TYPE, capture_event)
+    # Inline @callback capture — a bare `def` listener would type as HassJobType.Executor
+    # and race the reads below (#45); cast rationale in test_manager._capture_events.
+    events = cast(list[Event[dict[str, Any]]], async_capture_events(hass, EVENT_TYPE))
     with (
         patch.object(PanelManager, "async_setup", _noop_setup),
         patch.object(PanelManager, "async_shutdown", _noop_shutdown),
