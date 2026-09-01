@@ -64,7 +64,7 @@ verify_armv7_shared_objects() {
 
   while IFS= read -r -d '' so; do
     name="${so##*/}"
-    if [[ "$name" == *.so.*-gdb.py ]]; then
+    if [[ "$name" == *.so*-gdb.py ]]; then
       echo "skipping (recognized ancillary file): ${so}"
       continue
     fi
@@ -110,6 +110,11 @@ if [ "${1:-}" = "--verify-architecture" ]; then
     exit 2
   fi
   verify_armv7_shared_objects "$2"
+  if [[ -e "$2/site/pyopen_wakeword/lib/libtensorflowlite_c.so" ]]; then
+    verify_pyopen_tflite_abi "$2/site/pyopen_wakeword/lib/libtensorflowlite_c.so"
+  else
+    echo "skipping pyopen-wakeword tflite ABI check: copied library is absent"
+  fi
   exit
 fi
 
