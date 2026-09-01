@@ -1536,13 +1536,14 @@ class FleetManager:
         except ConfigEntryNotReady:
             _LOGGER.warning("Fleet reconciliation deferred; a reload retry is scheduled")
             return
-        except EntryDataError:
+        except EntryDataError as error:
             # The flow's completion no longer reloads (HA 2026.12 forbids that
             # next to an update listener), so a snapshot the live reconcile
             # refuses — e.g. a host change re-pinning the SSH host key — must
             # apply via a full reload instead of being silently dropped.
             _LOGGER.info(
-                "Fleet reconciliation requires a reload to apply this change; scheduling it"
+                "Fleet reconciliation requires a reload to apply this change (%s); scheduling it",
+                error,
             )
             self._async_schedule_reload_once()
             return
