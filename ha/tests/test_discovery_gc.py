@@ -227,7 +227,10 @@ async def test_publish_failure_is_contained_per_topic(
     assert [entry[0] for entry in broker.published] == [STALE_OFFICE, STALE_KITCHEN]
     assert STALE_OFFICE in broker.retained
     assert STALE_KITCHEN not in broker.retained
-    assert "Published 1 of 2 retained discovery-config deletions; 1 failed" in caplog.text
+    assert (
+        "Published 1 of 2 retained discovery-config deletions; 1 failed "
+        f"(first: {STALE_OFFICE}: RuntimeError: publish rejected)"
+    ) in caplog.text
 
 
 async def test_invalid_panel_slugs_are_ignored_fail_closed(

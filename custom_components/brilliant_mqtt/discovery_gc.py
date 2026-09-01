@@ -105,19 +105,27 @@ async def async_purge_stale_discovery_configs(
                 _MAX_STALE_TOPICS,
             )
         failed = 0
+        first_failure: tuple[str, Exception] | None = None
         for topic in sorted(stale):
             try:
                 await mqtt.async_publish(hass, topic, "", qos=1, retain=True)
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as error:
                 failed += 1
-        if failed:
+                if first_failure is None:
+                    first_failure = (topic, error)
+                _LOGGER.debug("Deletion publish failed for %s", topic)
+        if first_failure is not None:
             _LOGGER.warning(
-                "Published %d of %d retained discovery-config deletions; %d failed",
+                "Published %d of %d retained discovery-config deletions; %d failed "
+                "(first: %s: %s: %s)",
                 len(stale) - failed,
                 len(stale),
                 failed,
+                first_failure[0],
+                type(first_failure[1]).__name__,
+                first_failure[1],
             )
         elif stale:
             _LOGGER.info(
