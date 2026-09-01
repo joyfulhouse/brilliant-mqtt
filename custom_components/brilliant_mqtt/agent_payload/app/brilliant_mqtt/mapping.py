@@ -815,6 +815,8 @@ def payload_fields(device: BrilliantDevice) -> dict[str, object]:
         if rendered is None:
             continue
         if spec.scale is not None:
+            # Safe by __post_init__: scaled specs render float | None, and None
+            # already continued above.
             rendered = round(cast(float, rendered) * spec.scale, 1)
         # Gate: a bool reading that is only valid while a sibling variable is
         # enabled collapses to a concrete False when that gate is absent or off
