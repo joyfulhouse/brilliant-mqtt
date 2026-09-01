@@ -8,6 +8,7 @@ import json
 import stat
 import struct
 import threading
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import cast
 from uuid import UUID
@@ -491,6 +492,41 @@ async def test_poll_gate_ignores_timestamp_only_variable_refresh(
     await bridge.poll_executions([refreshed])
 
     assert processed == []
+    await bridge.async_shutdown()
+
+
+async def test_poll_contains_variable_resize_during_fingerprint(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class ResizingVariables(Mapping[str, Variable]):
+        def __getitem__(self, key: str) -> Variable:
+            raise KeyError(key)
+
+        def __iter__(self) -> Iterator[str]:
+            raise RuntimeError("dictionary changed size during iteration")
+
+        def __len__(self) -> int:
+            return 1
+
+    bridge, _, _, _, _ = await _started(tmp_path)
+    execution = _execution("all_off", 200)
+    execution.variables = cast(dict[str, Variable], ResizingVariables())
+
+    with caplog.at_level("WARNING", logger="brilliant_mqtt.scene_bridge"):
+        await bridge.poll_executions([execution])
+
+    assert "execution variables changed while snapshotting; retrying" in caplog.messages
+    await bridge.async_shutdown()
+
+
+async def test_poll_contains_missing_variables(tmp_path: Path) -> None:
+    bridge, _, _, _, _ = await _started(tmp_path)
+    execution = _execution("all_off", 200)
+    execution.variables = cast(dict[str, Variable], None)
+
+    await bridge.poll_executions([execution])
+
     await bridge.async_shutdown()
 
 

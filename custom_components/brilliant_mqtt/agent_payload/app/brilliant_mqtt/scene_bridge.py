@@ -102,8 +102,16 @@ def _is_new(previous: Watermark | None, current: SceneExecution) -> bool:
     )
 
 
-def _execution_fingerprint(device: BrilliantDevice) -> dict[str, str]:
-    return {name: variable.value for name, variable in device.variables.items()}
+def _execution_fingerprint(device: BrilliantDevice) -> dict[str, str] | None:
+    variables = getattr(device, "variables", None)
+    if variables is None:
+        return None
+    try:
+        snapshot = dict(variables)
+    except RuntimeError:
+        logger.warning("execution variables changed while snapshotting; retrying")
+        return None
+    return {name: variable.value for name, variable in snapshot.items()}
 
 
 class SceneBridge:
@@ -135,7 +143,7 @@ class SceneBridge:
         self._callbacks_registered = False
         self._subscribed_topics: list[str] = []
         self._execution: BrilliantDevice | None = None
-        self._processed_execution_variables: dict[str, str] | None = None
+        self._processed_execution_fingerprint: dict[str, str] | None = None
         self._execution_available = False
         self._scene_ids: frozenset[str] = frozenset()
         self._mode_ids: frozenset[str] = frozenset()
@@ -249,7 +257,7 @@ class SceneBridge:
             if not self._started or self._stopping:
                 return
             fingerprint = _execution_fingerprint(execution)
-            if fingerprint == self._processed_execution_variables:
+            if fingerprint is not None and fingerprint == self._processed_execution_fingerprint:
                 return
             self._operation_generation += 1
             generation = self._operation_generation
@@ -270,7 +278,7 @@ class SceneBridge:
         self._execution = execution
         self._execution_available = execution is not None
         if execution is None:
-            self._processed_execution_variables = None
+            self._processed_execution_fingerprint = None
 
     async def async_shutdown(self) -> None:
         """Fence callbacks, bound task drain, and release exact subscriptions."""
@@ -471,6 +479,7 @@ class SceneBridge:
         if epoch != self._epoch or self._stopping:
             return
         scene_ids, scene_healthy, mode_ids, mode_healthy = await self._async_read_catalogs(epoch)
+        # None intentionally allows processing but skips the fingerprint commit.
         fingerprint: dict[str, str] | None = None
         async with self._lock:
             if epoch != self._epoch or self._stopping:
@@ -490,7 +499,7 @@ class SceneBridge:
             await self._async_health_status("scene")
             await self._async_health_status("mode")
             return
-        if execution is not None and fingerprint is not None:
+        if execution is not None:
             await self._async_process_execution_snapshot(
                 execution,
                 emit_events=emit_history,
@@ -638,7 +647,7 @@ class SceneBridge:
         emit_events: bool,
         epoch: int,
         generation: int,
-        fingerprint: dict[str, str],
+        fingerprint: dict[str, str] | None,
     ) -> None:
         # Reprocessing is safe: handlers emit only when their watermark advances.
         await self._async_process_execution(device, emit_events=emit_events, epoch=epoch)
@@ -647,9 +656,10 @@ class SceneBridge:
                 epoch == self._epoch
                 and generation == self._operation_generation
                 and self._execution is not None
+                and fingerprint is not None
                 and not self._stopping
             ):
-                self._processed_execution_variables = fingerprint
+                self._processed_execution_fingerprint = fingerprint
 
     async def _async_process_execution(
         self,
