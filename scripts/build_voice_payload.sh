@@ -5,23 +5,17 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 verify_armv7_shared_objects() {
-  local payload_dir="$1" readelf_bin="${READELF:-}" so
+  local payload_dir="$1" so
+  local readelf_bin="${READELF:-$(command -v readelf || command -v greadelf || true)}"
   local file_output readelf_output failed=0 count=0
 
-  if [ -z "$readelf_bin" ]; then
-    readelf_bin="$(command -v readelf || command -v greadelf || true)"
-  fi
-  if [ -z "$readelf_bin" ]; then
+  if [[ -z "$readelf_bin" ]]; then
     echo "ERROR: readelf is required to verify payload architecture" >&2
     return 1
   fi
 
   while IFS= read -r -d '' so; do
-    if [[ "$(basename "$so")" =~ \.so(\.[0-9]+)*$ ]]; then
-      :
-    else
-      continue
-    fi
+    [[ "$(basename "$so")" =~ \.so(\.[0-9]+)*$ ]] || continue
     count=$((count + 1))
     file_output="$(file -bL "$so")"
     if ! readelf_output="$("$readelf_bin" -h "$so" 2>&1)"; then
@@ -41,13 +35,11 @@ verify_armv7_shared_objects() {
     fi
   done < <(find "$payload_dir" \( -type f -o -type l \) -name '*.so*' -print0)
 
-  if [ "$count" -eq 0 ]; then
+  if ((count == 0)); then
     echo "ERROR: no shared objects found under ${payload_dir}" >&2
     return 1
   fi
-  if [ "$failed" -ne 0 ]; then
-    return 1
-  fi
+  ((failed == 0)) || return 1
   echo "verified ${count} shared objects: all ELF 32-bit ARM (EABI5)"
 }
 
