@@ -64,9 +64,12 @@ _MESH_RECEIPT_LOG_SAMPLE_EVERY = 10
 
 @dataclass
 class _PendingMeshWrite:
-    """One in-flight mesh primary write awaiting observation-based confirmation."""
+    """One in-flight mesh primary write awaiting observation-based confirmation.
 
-    generation: int
+    Each command creates a fresh record, so object identity IS the generation
+    tag: a stale confirm task detects supersession by identity check.
+    """
+
     # Commanded variable values (name -> string value), compared verbatim
     # against observed snapshots: any differing value is a contradiction.
     targets: dict[str, str]
@@ -662,46 +665,36 @@ class Bridge:
                 peripheral_id,
                 exc_info=True,
             )
-            observed = self._devices.get(peripheral_id)
-            if observed is not None:
-                fields = payload_fields(observed)
-                if fields:
-                    await self._publish_state(observed, fields, force=True)
+            await self._republish_snapshot(peripheral_id, force=True)
             return
 
         if self._mesh_write_generation.get(peripheral_id) != generation:
-            # A newer command started while this write awaited; its pending
-            # (and confirm timer) already superseded this one.
+            # Superseded while this write awaited; the newer command's pending
+            # (and confirm timer) owns the peripheral now.
             return
         self._drop_pending_mesh(peripheral_id)
         pending = _PendingMeshWrite(
-            generation=generation,
             targets={s.name: s.value for s in sets},
             receipt=receipt,
         )
         self._pending_mesh[peripheral_id] = pending
         pending.task = asyncio.create_task(
-            self._resolve_pending_mesh(peripheral_id, generation),
+            self._resolve_pending_mesh(peripheral_id, pending),
             name=f"brilliant-mqtt-mesh-confirm-{peripheral_id}",
         )
-        snapshot = self._devices.get(peripheral_id)
-        if snapshot is not None:
-            fields = payload_fields(snapshot)
-            if fields:
-                await self._publish_state(snapshot, fields, force=False)
+        await self._republish_snapshot(peripheral_id, force=False)
 
-    async def _resolve_pending_mesh(self, peripheral_id: str, generation: int) -> None:
+    async def _resolve_pending_mesh(self, peripheral_id: str, pending: _PendingMeshWrite) -> None:
         """Deadline arm of the pending-write state machine (background task).
 
         Runs OUTSIDE the MQTT command lane so confirmation never blocks the
-        next command. Sleeps out the confirmation window, then — if this
-        generation still owns the pending — publishes the commanded value only
-        when a fresh observation backs it; otherwise closes unconfirmed and
-        leaves state unknown (the stale-stream watchdog owns stream recovery).
+        next command. Sleeps out the confirmation window, then — if *pending*
+        still owns the peripheral — publishes the commanded value only when a
+        fresh observation backs it; otherwise closes unconfirmed and leaves
+        state unknown (the stale-stream watchdog owns stream recovery).
         """
         await self._sleep(MESH_CONFIRM_SECONDS)
-        pending = self._pending_mesh.get(peripheral_id)
-        if pending is None or pending.generation != generation:
+        if self._pending_mesh.get(peripheral_id) is not pending:
             return
         del self._pending_mesh[peripheral_id]
         if (
@@ -742,10 +735,12 @@ class Bridge:
         pending = self._pending_mesh.get(device.peripheral_id)
         if pending is None:
             return
-        observed = {name: device.variables.get(name) for name in pending.targets}
+        fully_matched = True
         for name, want in pending.targets.items():
-            var = observed[name]
-            if var is not None and var.value != want:
+            var = device.variables.get(name)
+            if var is None:
+                fully_matched = False
+            elif var.value != want:
                 self._drop_pending_mesh(device.peripheral_id)
                 logger.warning(
                     "mesh write contradicted by observation for %s (%s=%s, wanted %s); "
@@ -757,7 +752,7 @@ class Bridge:
                     pending.receipt,
                 )
                 return
-        if all(var is not None for var in observed.values()):
+        if fully_matched:
             pending.last_observed_at = self._clock()
 
     def _drop_pending_mesh(self, peripheral_id: str) -> None:
@@ -765,6 +760,15 @@ class Bridge:
         pending = self._pending_mesh.pop(peripheral_id, None)
         if pending is not None and pending.task is not None:
             pending.task.cancel()
+
+    async def _republish_snapshot(self, peripheral_id: str, *, force: bool) -> None:
+        """Publish the stored snapshot's current payload (no-op without one)."""
+        device = self._devices.get(peripheral_id)
+        if device is None:
+            return
+        fields = payload_fields(device)
+        if fields:
+            await self._publish_state(device, fields, force=force)
 
     def _project_pending_mesh(
         self, peripheral_id: str, fields: dict[str, object]

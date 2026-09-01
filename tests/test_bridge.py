@@ -1616,22 +1616,17 @@ def _mesh_dimmer_at(on: str, intensity: str = "600") -> BrilliantDevice:
 
 def _mesh_motion_dimmer_at(on: str, enable_motion_score: str = "1") -> BrilliantDevice:
     """A mesh dimmer whose motion aux subsystem contributes live payload keys."""
-    return BrilliantDevice(
-        device_id="ble_mesh",
-        peripheral_id=MESH_PID,
-        name="Office Desk Lights",
-        kind=DeviceKind.LIGHT,
-        peripheral_type=27,
-        variables={
-            "on": Variable("on", on),
-            "intensity": Variable("intensity", "600"),
+    device = _mesh_dimmer_at(on)
+    device.variables.update(
+        {
             "movement_detected": Variable("movement_detected", "1"),
             "motion_score": Variable("motion_score", "42"),
             "enable_motion_score": Variable("enable_motion_score", enable_motion_score),
             "motion_high_threshold": Variable("motion_high_threshold", "70"),
             "motion_low_threshold": Variable("motion_low_threshold", "20"),
-        },
+        }
     )
+    return device
 
 
 def _mesh_bridge(
