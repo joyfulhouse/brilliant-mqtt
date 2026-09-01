@@ -763,7 +763,13 @@ def test_payload_fields_light_full() -> None:
 
 def test_payload_fields_always_on() -> None:
     payload = payload_fields(_always_on())
-    assert payload == {"power": 52.0, "temperature": 43.6, "fault": False}
+    # power="52" is deciwatts on the bus; published as 5.2 W (#36).
+    assert payload == {"power": 5.2, "temperature": 43.6, "fault": False}
+
+
+def test_power_scaled_from_bus_deciwatts() -> None:
+    """Issue #36: the bus reports deciwatts; the sensor publishes watts."""
+    assert payload_fields(_mesh_dimmer_with_power("418"))["power"] == 41.8
 
 
 def test_payload_fields_fault_true_when_unsafe() -> None:
@@ -957,7 +963,7 @@ def test_power_descriptor_present_when_real() -> None:
 
 def test_power_payload_present_when_real() -> None:
     payload = payload_fields(_mesh_dimmer_with_power("52"))
-    assert payload["power"] == 52.0
+    assert payload["power"] == 5.2
 
 
 def test_zero_power_is_a_real_reading_not_gated() -> None:

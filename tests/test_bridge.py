@@ -509,7 +509,7 @@ def always_on_powered() -> BrilliantDevice:
 class TestM10StatePayloadDelegation:
     def test_always_on_payload(self, always_on_powered: BrilliantDevice) -> None:
         payload = json.loads(_state_payload(always_on_powered))
-        assert payload == {"power": 52.0, "temperature": 43.6, "fault": False}
+        assert payload == {"power": 5.2, "temperature": 43.6, "fault": False}
 
     def test_hardware_payload(self, hardware: BrilliantDevice) -> None:
         payload = json.loads(_state_payload(hardware))
@@ -528,7 +528,7 @@ class TestM10ReconcileStateTopics:
         topic = f"brilliant/{PANEL}/gangbox_peripheral_1/state"
         states = [p for p in mqtt.published if p[0] == topic]
         assert len(states) == 1
-        assert json.loads(states[0][1]) == {"power": 52.0, "temperature": 43.6, "fault": False}
+        assert json.loads(states[0][1]) == {"power": 5.2, "temperature": 43.6, "fault": False}
 
     async def test_hardware_ui_wifi_state_published(
         self,
