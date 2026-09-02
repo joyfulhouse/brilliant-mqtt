@@ -17,6 +17,7 @@ from homeassistant.components.mqtt.models import ReceiveMessage
 from homeassistant.config_entries import ConfigSubentry
 from homeassistant.core import Event, HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.event import async_call_later
 from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import (
     MockConfigEntry,
@@ -214,10 +215,13 @@ async def test_bytes_online_clears_problem_and_cancels_offline_grace(
     entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
     entry.add_to_hass(hass)
     manager = _legacy_manager(hass, entry)
+    events = _capture_events(hass)
 
     await manager._on_availability(_availability_message("offline"))
     pending_grace = manager._grace_cancel
     assert pending_grace is not None
+    manager._recovery_cancel = async_call_later(hass, 60, manager._recovery_timeout)
+    pending_recovery = manager._recovery_cancel
     manager.problem = True
     manager.problem_reason = "bridge recovery timed out"
 
@@ -225,13 +229,48 @@ async def test_bytes_online_clears_problem_and_cancels_offline_grace(
     availability = manager.availability
     problem = manager.problem
     grace_cancel = manager._grace_cancel
+    recovery_cancel = manager._recovery_cancel
     pending_grace_cancelled = _timer_cancelled(pending_grace)
+    pending_recovery_cancelled = _timer_cancelled(pending_recovery)
     await manager.async_shutdown()
 
     assert availability == "online"
     assert problem is False
     assert grace_cancel is None
+    assert recovery_cancel is None
     assert pending_grace_cancelled is True
+    assert pending_recovery_cancelled is True
+    assert _types(events) == ["repair_succeeded"]
+
+
+async def test_invalid_bytes_mark_availability_unknown_and_preserve_grace(
+    hass: HomeAssistant,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    manager = _legacy_manager(hass, entry)
+
+    await manager._on_availability(_availability_message("offline"))
+    pending_grace = manager._grace_cancel
+    assert pending_grace is not None
+    caplog.set_level(logging.WARNING, logger="custom_components.brilliant_mqtt.manager")
+
+    try:
+        with patch.object(manager, "_notify") as notify:
+            await manager._on_availability(_availability_message(b"\xff"))
+            availability = manager.availability
+            grace_cancel = manager._grace_cancel
+            pending_grace_cancelled = _timer_cancelled(pending_grace)
+            notify_count = notify.call_count
+    finally:
+        await manager.async_shutdown()
+
+    assert availability is None
+    assert grace_cancel is pending_grace
+    assert pending_grace_cancelled is False
+    assert notify_count == 1
+    assert "discarded invalid bridge availability payload" in caplog.text
 
 
 async def test_on_meta_accepts_bytes_json_payload(hass: HomeAssistant) -> None:
