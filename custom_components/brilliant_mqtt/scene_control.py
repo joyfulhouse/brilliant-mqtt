@@ -31,6 +31,7 @@ from .ha_control_protocol import (
     mode_command_topic,
     scene_command_topic,
 )
+from .mqtt_payload import decode_mqtt_payload
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -434,7 +435,7 @@ class SceneControl:
             if route is None:
                 return
             category, kind, topic_value = route
-            payload = _decode_payload(str(message.payload))
+            payload = _decode_payload(decode_mqtt_payload(message.payload))
             if category == "catalog":
                 await self._async_catalog(kind, topic_value, payload, retained=message.retain)
             elif category == "status":

@@ -62,6 +62,7 @@ from .ha_control_protocol import (
     state_topic,
     validate_entity_command_context,
 )
+from .mqtt_payload import decode_mqtt_payload
 from .scene_control import SceneControl
 
 if TYPE_CHECKING:
@@ -503,7 +504,11 @@ class HaControlPlane:
         hard_fenced_at_receipt: bool,
     ) -> None:
         started = _monotonic()
-        raw_payload = str(message.payload)
+        try:
+            raw_payload = decode_mqtt_payload(message.payload)
+        except (TypeError, UnicodeDecodeError):
+            _LOGGER.warning("Ignored invalid HA control MQTT payload")
+            return
         raw_command_id, raw_stable_id = _extract_wire_ids(raw_payload)
         command_id = raw_command_id
         entity_stable_id = raw_stable_id or _topic_stable_id(message.topic)

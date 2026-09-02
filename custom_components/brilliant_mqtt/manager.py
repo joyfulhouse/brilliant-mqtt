@@ -86,6 +86,7 @@ from .const import (
     panel_device_name,
 )
 from .entry_data import FleetConfig, LegacyPanelStore, PanelConfigStore
+from .mqtt_payload import decode_mqtt_payload
 from .panel_ops import PanelOpError
 from .shell import (
     AsyncsshShell as _StrictAsyncsshShell,
@@ -741,7 +742,11 @@ class PanelManager:
         if self._shutting_down:
             return  # defense-in-depth: never arm a timer on a torn-down entry
         previous_state = (self.availability, self.problem, self.problem_reason)
-        payload = str(msg.payload)
+        try:
+            payload = decode_mqtt_payload(msg.payload)
+        except (TypeError, UnicodeDecodeError):
+            _LOGGER.warning("%s: discarded invalid bridge availability payload", self.panel)
+            return
         self.availability = payload
         if payload == AVAILABILITY_ONLINE:
             self._cancel("_grace_cancel")
@@ -1661,8 +1666,8 @@ class PanelManager:
         if self._shutting_down:
             return  # defense-in-depth: don't spawn a staged-copy task on a dead entry
         try:
-            meta = json.loads(str(msg.payload))
-        except ValueError:
+            meta = json.loads(decode_mqtt_payload(msg.payload))
+        except (TypeError, ValueError):
             _LOGGER.warning("%s: discarded invalid bridge meta payload", self.panel)
             return
         if not isinstance(meta, dict):

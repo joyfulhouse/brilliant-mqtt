@@ -197,7 +197,7 @@ def _timer_cancelled(cancel: object) -> bool:
     return handle.cancelled()
 
 
-def _availability_message(payload: str) -> ReceiveMessage:
+def _availability_message(payload: str | bytes) -> ReceiveMessage:
     return ReceiveMessage(
         topic="brilliant/office/availability",
         payload=payload,
@@ -206,6 +206,50 @@ def _availability_message(payload: str) -> ReceiveMessage:
         subscribed_topic="brilliant/office/availability",
         timestamp=dt_util.utcnow().timestamp(),
     )
+
+
+async def test_bytes_online_clears_problem_and_cancels_offline_grace(
+    hass: HomeAssistant,
+) -> None:
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    manager = _legacy_manager(hass, entry)
+
+    await manager._on_availability(_availability_message("offline"))
+    pending_grace = manager._grace_cancel
+    assert pending_grace is not None
+    manager.problem = True
+    manager.problem_reason = "bridge recovery timed out"
+
+    await manager._on_availability(_availability_message(b"online"))
+    availability = manager.availability
+    problem = manager.problem
+    grace_cancel = manager._grace_cancel
+    pending_grace_cancelled = _timer_cancelled(pending_grace)
+    await manager.async_shutdown()
+
+    assert availability == "online"
+    assert problem is False
+    assert grace_cancel is None
+    assert pending_grace_cancelled is True
+
+
+async def test_on_meta_accepts_bytes_json_payload(hass: HomeAssistant) -> None:
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    manager = _legacy_manager(hass, entry)
+    message = ReceiveMessage(
+        topic="brilliant/office/bridge",
+        payload=b'{"agent_version":"0.9.0"}',
+        qos=0,
+        retain=True,
+        subscribed_topic="brilliant/office/bridge",
+        timestamp=dt_util.utcnow().timestamp(),
+    )
+
+    await manager._on_meta(message)
+
+    assert manager.meta == {"agent_version": "0.9.0"}
 
 
 @pytest.mark.parametrize(
