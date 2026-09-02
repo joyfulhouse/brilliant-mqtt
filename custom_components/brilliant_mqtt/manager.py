@@ -997,9 +997,10 @@ class PanelManager:
                     self._last_repair_mono = time.monotonic()
                     if self._shutting_down:
                         return  # entry torn down mid-repair: do not re-arm a timer
-                    self._grace_cancel = async_call_later(
-                        self.hass, _UNREACHABLE_RECHECK_SECONDS, self._grace_expired
-                    )
+                    if self.availability is not None:
+                        self._grace_cancel = async_call_later(
+                            self.hass, _UNREACHABLE_RECHECK_SECONDS, self._grace_expired
+                        )
                     return
                 try:
                     retirement_result: bool | None = None

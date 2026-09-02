@@ -919,6 +919,32 @@ async def test_unreachable_panel_reports_and_schedules_recheck(
     assert await hass.config_entries.async_unload(entry.entry_id)
 
 
+async def test_manual_unreachable_recheck_without_availability_is_noop(
+    hass: HomeAssistant,
+) -> None:
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    manager = _legacy_manager(hass, entry)
+    events = _capture_events(hass)
+    shell = FakeShell(connect_error=OSError("unreachable"))
+
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
+        await manager.async_repair(trigger="manual")
+        unreachable_reason = manager.problem_reason
+        assert unreachable_reason == "panel unreachable during repair"
+        assert manager.availability is None
+        assert shell.connect_count == 1
+
+        async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=301))
+        await hass.async_block_till_done()
+
+    assert manager._grace_cancel is None
+    assert manager.problem is True
+    assert manager.problem_reason == unreachable_reason
+    assert shell.connect_count == 1
+    assert _types(events) == ["repair_started", "repair_failed"]
+
+
 async def test_unload_cancels_pending_timers(hass: HomeAssistant) -> None:
     """Going offline schedules a grace timer; async_shutdown() must cancel it.
 
