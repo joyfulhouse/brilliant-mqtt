@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import TypeVar
 
 import pytest
 
@@ -436,15 +437,20 @@ class _GatedRpcObserver:
         self.in_flight += 1
         self.max_in_flight = max(self.max_in_flight, self.in_flight)
         try:
-            await self.release.wait()
-        except asyncio.CancelledError:
-            self.write_cancelled = True
-            raise
+            await self._block()
         finally:
             self.in_flight -= 1
         if self._fail_with is not None:
             raise self._fail_with
         return "ok"
+
+    async def _block(self) -> None:
+        """The blocking core of a write; subclasses vary the cancellation reaction."""
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.write_cancelled = True
+            raise
 
     async def shutdown(self) -> None:
         self.shutdowns += 1
@@ -460,35 +466,29 @@ class _StickyRpcObserver(_GatedRpcObserver):
         self.cancel_release = asyncio.Event()
         self.cancel_swallowed = False
 
-    async def request_set_variables_in_peripheral(
-        self,
-        peripheral_id: str,
-        values: dict[str, str],
-        *,
-        device_id: str,
-    ) -> str:
-        del values
-        self.writes.append((device_id, peripheral_id))
-        self.in_flight += 1
-        self.max_in_flight = max(self.max_in_flight, self.in_flight)
+    async def _block(self) -> None:
         try:
-            await self.release.wait()
+            await super()._block()
         except asyncio.CancelledError:
             self.cancel_swallowed = True
             await self.cancel_release.wait()
-        finally:
-            self.in_flight -= 1
-        return "ok"
+
+
+_ObserverT = TypeVar("_ObserverT", bound=_GatedRpcObserver)
+
+
+def _adapter_for(observer: _ObserverT) -> tuple[_ObserverT, RpcBusAdapter]:
+    """A started-looking adapter wired to ``observer`` (no real bus)."""
+    adapter = RpcBusAdapter(extra_device_ids=("ble_mesh",))
+    adapter._obs = observer
+    adapter._own_device_id = "own-device"
+    return observer, adapter
 
 
 def _gated_adapter(
     *, fail_with: Exception | None = None
 ) -> tuple[_GatedRpcObserver, RpcBusAdapter]:
-    observer = _GatedRpcObserver(fail_with=fail_with)
-    adapter = RpcBusAdapter(extra_device_ids=("ble_mesh",))
-    adapter._obs = observer
-    adapter._own_device_id = "own-device"
-    return observer, adapter
+    return _adapter_for(_GatedRpcObserver(fail_with=fail_with))
 
 
 async def _detached_write(
@@ -603,10 +603,7 @@ class TestShutdownLifecycle:
         """A lane callback that reaches set_variables() after shutdown()
         started must be rejected — never a fresh task nobody settles."""
         monkeypatch.setattr(bus_mod, "_WRITE_DEADLINE_S", 0.01)
-        observer = _StickyRpcObserver()
-        adapter = RpcBusAdapter(extra_device_ids=("ble_mesh",))
-        adapter._obs = observer
-        adapter._own_device_id = "own-device"
+        observer, adapter = _adapter_for(_StickyRpcObserver())
         outstanding = await _detached_write(adapter)
 
         shutting_down = asyncio.create_task(adapter.shutdown())
@@ -634,10 +631,7 @@ class TestShutdownLifecycle:
         the observer is still closed after the fixed settlement bound."""
         monkeypatch.setattr(bus_mod, "_WRITE_DEADLINE_S", 0.01)
         monkeypatch.setattr(bus_mod, "_WRITE_SETTLE_TIMEOUT_S", 0.05)
-        observer = _StickyRpcObserver()
-        adapter = RpcBusAdapter(extra_device_ids=("ble_mesh",))
-        adapter._obs = observer
-        adapter._own_device_id = "own-device"
+        observer, adapter = _adapter_for(_StickyRpcObserver())
         straggler = await _detached_write(adapter)
 
         with caplog.at_level(logging.WARNING, logger="brilliant_mqtt.bus"):
