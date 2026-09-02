@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-09-02
+
+The on-panel agent and Home Assistant integration move to 0.9.1. Every panel
+needs an agent update through its per-panel bridge **Update** entity. Mesh
+writes now serialize per device; after a slow write, Home Assistant shows
+`unknown` until observed state confirms or contradicts it. The voice payload
+remains at 0.1.1 and is unchanged.
+
 ### Changed
 
 - **Bus writes serialize per device and no longer rebuild the session on a
@@ -24,6 +32,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   live. Effect on the 0.9.0 pilot incident: no `offline`/`online` flap and
   no mesh-leader churn from two commands 30 ms apart.
   (#72)
+
+### Fixed
+
+- **MQTT byte payloads no longer create false bridge-health failures.**
+  Availability, bridge metadata, HA-control, and scene-control payloads are
+  decoded bytes-aware before comparison or JSON parsing. Home Assistant can
+  deliver raw bytes when another same-topic subscriber uses `encoding=None`,
+  including the MQTT **Listen to a topic** tool; this previously produced
+  `"b'online'"` and a false bridge-health problem after `update.install`.
+  Undecodable availability now becomes unknown instead of preserving stale
+  `online`, and a manual-Repair recheck on a never-seen panel no longer
+  escalates. (#70)
 
 ## [0.9.0] - 2026-09-02
 
@@ -555,7 +575,8 @@ panel redeploy is needed.
 - JoyfulHouse OSS docs standard: LICENSE (MIT), INSTALL.md, CHANGELOG.md,
   FUNDING.yml, CODEOWNERS, and the canonical `docs/` set.
 
-[Unreleased]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.9.1...HEAD
+[0.9.1]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.7.0...v0.7.1
