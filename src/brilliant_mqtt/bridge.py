@@ -61,6 +61,12 @@ MESH_CONFIRM_MAX_OBSERVATION_AGE_S = 10.0
 # receipts always log at WARNING — those are the known-failed deliveries).
 _MESH_RECEIPT_LOG_SAMPLE_EVERY = 10
 
+# Placeholder receipt for a mesh write whose RPC outrun the bus adapter's
+# caller deadline (#72): the write is UNRESOLVED, not failed — it keeps running
+# detached in the adapter — so the pending record is armed exactly as for an
+# accepted write and observations settle it. Logged wherever a receipt is.
+_PENDING_RPC_RECEIPT = "<rpc pending after caller deadline>"
+
 
 @dataclass
 class _PendingMeshWrite:
@@ -679,6 +685,23 @@ class Bridge:
         self._drop_pending_mesh(peripheral_id)
         try:
             receipt = await self._bus.set_variables(device.device_id, peripheral_id, sets)
+        except (asyncio.TimeoutError, TimeoutError):
+            # Both classes: they are distinct on the panel's Python 3.10, and
+            # the bus adapter raises the asyncio one while the panel lib's own
+            # "No response received!" is the builtin.
+            if self._mesh_write_generation.get(peripheral_id) != generation:
+                raise
+            # Unresolved, not failed: the RPC may still actuate (it keeps
+            # running detached in the adapter), so the outcome is unknown —
+            # exactly what the pending hold expresses. Republishing the last
+            # snapshot here would assert a state nobody can attest.
+            logger.warning(
+                "mesh write for %s/%s unresolved at the caller deadline; holding state "
+                "unknown until an observation settles it",
+                device.device_id,
+                peripheral_id,
+            )
+            receipt = _PENDING_RPC_RECEIPT
         except Exception:
             if self._mesh_write_generation.get(peripheral_id) != generation:
                 # Superseded mid-flight — the newer command owns the pending

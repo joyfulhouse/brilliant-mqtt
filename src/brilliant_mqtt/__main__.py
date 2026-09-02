@@ -262,8 +262,9 @@ async def _run_session(
         while True:
             await asyncio.sleep(tick)
 
-            # wait_for() cancelled a closed-source outbound RPC. Its transport
-            # integrity is unprovable, so rebuild even if pushes remain healthy.
+            # An (uncancelled) closed-source write exceeded the bus adapter's
+            # fixed hard cap without settling — a wedged transport, so rebuild
+            # even if pushes remain healthy (#72).
             if bus.consume_write_timeout():
                 raise BusWriteStuckError("bus write timed out — rebuilding session")
 

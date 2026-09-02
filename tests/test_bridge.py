@@ -1831,11 +1831,13 @@ class TestMeshConfirmedWrites:
     async def test_write_error_republishes_observed_state(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """Mode A: a failed write fabricates nothing and force-restores truth."""
+        """Mode A: a failed (rejected) write fabricates nothing and
+        force-restores truth. A TIMEOUT is not a rejection — see
+        TestMeshWriteTimeout (#72)."""
         bus, mqtt, bridge, _clock, sleeper = _mesh_bridge([_mesh_dimmer_at("1")])
         await bridge.reconcile()
         mqtt.published.clear()
-        bus.set_variables_error = TimeoutError("No response received!")
+        bus.set_variables_error = RuntimeError("bus rejected the write")
 
         with caplog.at_level(logging.WARNING, logger="brilliant_mqtt.bridge"):
             await mqtt.inject(MESH_SET_TOPIC, json.dumps({"state": "OFF"}))
@@ -2190,3 +2192,98 @@ class TestMeshConfirmedWrites:
         await sleeper.release_all()  # the confirm completes
 
         assert bridge._mesh_confirm_tasks == {}
+
+
+class TestMeshWriteTimeout:
+    """Issue #72: a mesh primary write that hits the caller deadline is
+    UNRESOLVED, not failed — the RPC keeps running detached in the bus
+    adapter. The bridge arms a real pending record (placeholder receipt,
+    normal confirm window) so `state: null` flows through every publish path
+    until an observation settles it."""
+
+    async def _timed_out_off(
+        self, error: Exception
+    ) -> tuple[FakeBus, FakeMqtt, Bridge, FakeClock, FakeSleeper]:
+        bus, mqtt, bridge, clock, sleeper = _mesh_bridge([_mesh_dimmer_at("1")])
+        await bridge.reconcile()
+        mqtt.published.clear()
+        bus.set_variables_error = error
+        await mqtt.inject(MESH_SET_TOPIC, json.dumps({"state": "OFF"}))
+        bus.set_variables_error = None
+        await asyncio.sleep(0)  # let the confirm timer arm
+        return bus, mqtt, bridge, clock, sleeper
+
+    async def test_timeout_arms_pending_and_publishes_unknown(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.WARNING, logger="brilliant_mqtt.bridge"):
+            bus, mqtt, bridge, _clock, sleeper = await self._timed_out_off(asyncio.TimeoutError())
+
+        assert bus.commands == []
+        assert [json.loads(p[1]) for p in _mesh_states(mqtt)] == [
+            {"state": None, "brightness": 153}
+        ]
+        assert sleeper.requested == [80.0]  # the normal resolver, not a one-off null
+        assert any("unresolved" in r.getMessage() for r in caplog.records)
+        assert not any("republishing last observed" in r.getMessage() for r in caplog.records)
+        await bridge.withdraw()
+
+    async def test_builtin_timeout_error_also_arms_pending(self) -> None:
+        """py3.10: asyncio.TimeoutError and TimeoutError are distinct classes;
+        the panel lib's own 'No response received!' timeout is the builtin."""
+        bus, mqtt, bridge, _clock, sleeper = await self._timed_out_off(
+            TimeoutError("No response received!")
+        )
+
+        assert [json.loads(p[1]) for p in _mesh_states(mqtt)] == [
+            {"state": None, "brightness": 153}
+        ]
+        assert sleeper.requested == [80.0]
+        await bridge.withdraw()
+
+    async def test_contradicting_observation_drops_the_pending(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        bus, mqtt, bridge, _clock, sleeper = await self._timed_out_off(asyncio.TimeoutError())
+        mqtt.published.clear()
+
+        with caplog.at_level(logging.WARNING, logger="brilliant_mqtt.bridge"):
+            await bus.emit(_mesh_dimmer_at("1"))  # still ON: the OFF never actuated
+
+        assert [json.loads(p[1]) for p in _mesh_states(mqtt)] == [
+            {"state": "ON", "brightness": 153}
+        ]
+        contradicted = [r.getMessage() for r in caplog.records if "contradicted" in r.getMessage()]
+        assert contradicted and "rpc pending" in contradicted[0]  # the placeholder receipt
+        await sleeper.release_all()  # the dropped timer must not fire
+        assert len(_mesh_states(mqtt)) == 1
+
+    async def test_matching_observation_holds_null_until_confirm_window(self) -> None:
+        bus, mqtt, bridge, clock, sleeper = await self._timed_out_off(asyncio.TimeoutError())
+        mqtt.published.clear()
+
+        clock.advance(75.0)
+        await bus.emit(_mesh_dimmer_at("0"))  # matches the target: not confirmation
+        assert _mesh_states(mqtt) == []  # projection holds
+
+        clock.advance(5.0)
+        await sleeper.release_all()
+
+        assert [json.loads(p[1]) for p in _mesh_states(mqtt)] == [
+            {"state": "OFF", "brightness": 153}
+        ]
+
+    async def test_aux_fields_stay_live_while_timed_out_write_pends(self) -> None:
+        bus, mqtt, bridge, _clock, _sleeper = _mesh_bridge([_mesh_motion_dimmer_at("1")])
+        await bridge.reconcile()
+        mqtt.published.clear()
+        bus.set_variables_error = asyncio.TimeoutError()
+
+        await mqtt.inject(MESH_SET_TOPIC, json.dumps({"state": "OFF"}))
+
+        payload = json.loads(_mesh_states(mqtt)[0][1])
+        assert payload["state"] is None
+        assert payload["enable_motion_score"] is True
+        assert payload["motion"] is True
+        assert payload["motion_score"] == 42
+        await bridge.withdraw()

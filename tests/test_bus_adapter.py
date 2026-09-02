@@ -15,6 +15,8 @@ bridge-level callback.
 from __future__ import annotations
 
 import asyncio
+import logging
+from typing import TypeVar
 
 import pytest
 
@@ -355,9 +357,10 @@ class _BlockingRpcObserver:
 
 
 class TestRpcDeadlines:
-    def test_defaults_are_five_second_backstops(self) -> None:
+    def test_defaults_are_fixed_backstops(self) -> None:
         assert bus_mod._READ_DEADLINE_S == 5.0
         assert bus_mod._WRITE_DEADLINE_S == 5.0
+        assert bus_mod._WRITE_HARD_CAP_S == 15.0
 
     async def test_get_all_scoped_read_times_out_and_cancels_rpc(
         self,
@@ -374,26 +377,380 @@ class TestRpcDeadlines:
 
         assert observer.read_cancelled is True
 
-    async def test_set_variables_times_out_and_cancels_rpc(
+    async def test_set_variables_deadline_detaches_without_cancelling_rpc(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        """Issue #72: the caller deadline no longer cancels the closed-source
+        write nor latches a session rebuild — the RPC keeps running detached."""
         monkeypatch.setattr(bus_mod, "_WRITE_DEADLINE_S", 0.01)
         adapter = RpcBusAdapter()
         observer = _BlockingRpcObserver()
         adapter._obs = observer
         adapter._own_device_id = "own-device"
 
-        with pytest.raises((TimeoutError, asyncio.TimeoutError)):
+        with pytest.raises(asyncio.TimeoutError):
             await adapter.set_variables(
                 "own-device",
                 "gangbox_peripheral_0",
                 [VarSet("on", "1")],
             )
 
-        assert observer.write_cancelled is True
+        assert observer.write_cancelled is False
+        assert len(adapter._write_tasks) == 1
+        assert not next(iter(adapter._write_tasks)).done()
+        assert adapter.consume_write_timeout() is False
+        await adapter.shutdown()
+
+
+class _GatedRpcObserver:
+    """Observer whose writes block until ``release`` is set.
+
+    Tracks write concurrency (the per-device lock contract), cancellation
+    (the detach contract) and whether reads got through while a write was
+    blocked (reads must never queue behind a stalled write).
+    """
+
+    def __init__(self, *, fail_with: Exception | None = None) -> None:
+        self.release = asyncio.Event()
+        self.in_flight = 0
+        self.max_in_flight = 0
+        self.write_cancelled = False
+        self.writes: list[tuple[str, str]] = []
+        self.reads: list[str] = []
+        self.shutdowns = 0
+        self._fail_with = fail_with
+
+    async def get_device(self, device_id: str) -> _RawDevice:
+        self.reads.append(device_id)
+        return _RawDevice(device_id, {f"{device_id}-peripheral": _RawPeripheral()})
+
+    async def request_set_variables_in_peripheral(
+        self,
+        peripheral_id: str,
+        values: dict[str, str],
+        *,
+        device_id: str,
+    ) -> str:
+        del values
+        self.writes.append((device_id, peripheral_id))
+        self.in_flight += 1
+        self.max_in_flight = max(self.max_in_flight, self.in_flight)
+        try:
+            await self._block()
+        finally:
+            self.in_flight -= 1
+        if self._fail_with is not None:
+            raise self._fail_with
+        return "ok"
+
+    async def _block(self) -> None:
+        """The blocking core of a write; subclasses vary the cancellation reaction."""
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.write_cancelled = True
+            raise
+
+    async def shutdown(self) -> None:
+        self.shutdowns += 1
+
+
+class _StickyRpcObserver(_GatedRpcObserver):
+    """Gated observer whose write SWALLOWS cancellation and keeps waiting on
+    ``cancel_release`` — models a closed-source coroutine that delays or
+    suppresses cancellation during session teardown."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.cancel_release = asyncio.Event()
+        self.cancel_swallowed = False
+
+    async def _block(self) -> None:
+        try:
+            await super()._block()
+        except asyncio.CancelledError:
+            self.cancel_swallowed = True
+            await self.cancel_release.wait()
+
+
+_ObserverT = TypeVar("_ObserverT", bound=_GatedRpcObserver)
+
+
+def _adapter_for(observer: _ObserverT) -> tuple[_ObserverT, RpcBusAdapter]:
+    """A started-looking adapter wired to ``observer`` (no real bus)."""
+    adapter = RpcBusAdapter(extra_device_ids=("ble_mesh",))
+    adapter._obs = observer
+    adapter._own_device_id = "own-device"
+    return observer, adapter
+
+
+def _gated_adapter(
+    *, fail_with: Exception | None = None
+) -> tuple[_GatedRpcObserver, RpcBusAdapter]:
+    return _adapter_for(_GatedRpcObserver(fail_with=fail_with))
+
+
+async def _detached_write(
+    adapter: RpcBusAdapter, device_id: str = "ble_mesh", peripheral_id: str = "mesh_light_1"
+) -> asyncio.Task[str]:
+    """Issue a write that hits the caller deadline; return its still-running task."""
+    before = set(adapter._write_tasks)
+    with pytest.raises(asyncio.TimeoutError):
+        await adapter.set_variables(device_id, peripheral_id, [VarSet("on", "0")])
+    (task,) = adapter._write_tasks - before
+    return task
+
+
+async def _settle(n: int = 3) -> None:
+    """Yield a few loop iterations so freshly created tasks reach their awaits."""
+    for _ in range(n):
+        await asyncio.sleep(0)
+
+
+class TestDetachedWrites:
+    """Issue #72: writes past the caller deadline run on detached; only the
+    fixed hard cap latches a session rebuild."""
+
+    async def test_late_completion_resolves_and_logs_without_latching(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        monkeypatch.setattr(bus_mod, "_WRITE_DEADLINE_S", 0.01)
+        observer, adapter = _gated_adapter()
+
+        with caplog.at_level(logging.DEBUG, logger="brilliant_mqtt.bus"):
+            task = await _detached_write(adapter)
+            observer.release.set()
+            assert await task == "'ok'"
+            await _settle()
+
+        assert adapter._write_tasks == set()
+        assert adapter.consume_write_timeout() is False
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("detach" in m for m in messages)
+        late = [m for m in messages if "completed" in m and "ble_mesh/mesh_light_1" in m]
+        assert late and "'ok'" in late[0]
+        assert any("queue wait" in m for m in messages)
+
+    async def test_late_exception_is_retrieved_and_logged(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        monkeypatch.setattr(bus_mod, "_WRITE_DEADLINE_S", 0.01)
+        observer, adapter = _gated_adapter(fail_with=RuntimeError("late boom"))
+
+        with caplog.at_level(logging.WARNING, logger="brilliant_mqtt.bus"):
+            task = await _detached_write(adapter)
+            observer.release.set()
+            with pytest.raises(RuntimeError, match="late boom"):
+                await task
+            await _settle()
+
+        assert adapter._write_tasks == set()
+        assert adapter.consume_write_timeout() is False
+        failed = [r for r in caplog.records if "failed" in r.getMessage()]
+        assert failed and failed[0].exc_info is not None
+        # The task's exception was retrieved (no "never retrieved" at GC).
+        assert task.exception() is not None
+
+    async def test_hard_cap_latches_once_for_several_capped_writes(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(bus_mod, "_WRITE_DEADLINE_S", 0.005)
+        monkeypatch.setattr(bus_mod, "_WRITE_HARD_CAP_S", 0.02)
+        observer, adapter = _gated_adapter()
+
+        for device_id in ("own-device", "ble_mesh"):
+            await _detached_write(adapter, device_id, "p")
+        assert adapter.consume_write_timeout() is False  # deadline alone never latches
+
+        await asyncio.sleep(0.05)  # both writes cross the cap
+
         assert adapter.consume_write_timeout() is True
         assert adapter.consume_write_timeout() is False
+        observer.release.set()
+        await asyncio.gather(*adapter._write_tasks)
+        assert adapter.consume_write_timeout() is False  # completion after the cap adds nothing
+
+    async def test_shutdown_settles_outstanding_detached_write(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(bus_mod, "_WRITE_DEADLINE_S", 0.01)
+        observer, adapter = _gated_adapter()
+
+        task = await _detached_write(adapter)
+
+        await adapter.shutdown()
+
+        assert task.done()
+        assert adapter._write_tasks == set()
+        assert observer.write_cancelled is True
+        assert observer.shutdowns == 1
+
+
+class TestShutdownLifecycle:
+    """Tribunal round 1 (#73): teardown must be race-free and bounded."""
+
+    async def test_shutdown_rejects_writes_issued_during_settlement(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A lane callback that reaches set_variables() after shutdown()
+        started must be rejected — never a fresh task nobody settles."""
+        monkeypatch.setattr(bus_mod, "_WRITE_DEADLINE_S", 0.01)
+        observer, adapter = _adapter_for(_StickyRpcObserver())
+        outstanding = await _detached_write(adapter)
+
+        shutting_down = asyncio.create_task(adapter.shutdown())
+        await _settle()
+        assert observer.cancel_swallowed is True  # settlement is blocked mid-way
+
+        with pytest.raises(RuntimeError, match="shutting down"):
+            await asyncio.wait_for(
+                adapter.set_variables("ble_mesh", "mesh_light_2", [VarSet("on", "1")]),
+                timeout=0.5,
+            )
+
+        assert adapter._write_tasks == {outstanding}
+        observer.cancel_release.set()
+        await asyncio.wait_for(shutting_down, timeout=1)
+        assert observer.shutdowns == 1
+        assert adapter._write_tasks == set()
+
+    async def test_shutdown_bounds_settlement_and_still_closes_observer(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A write that never honours cancellation must not hang teardown:
+        the observer is still closed after the fixed settlement bound."""
+        monkeypatch.setattr(bus_mod, "_WRITE_DEADLINE_S", 0.01)
+        monkeypatch.setattr(bus_mod, "_WRITE_SETTLE_TIMEOUT_S", 0.05)
+        observer, adapter = _adapter_for(_StickyRpcObserver())
+        straggler = await _detached_write(adapter)
+
+        with caplog.at_level(logging.WARNING, logger="brilliant_mqtt.bus"):
+            await asyncio.wait_for(adapter.shutdown(), timeout=1)
+
+        assert observer.shutdowns == 1
+        assert not straggler.done()
+        assert adapter._write_tasks == {straggler}
+        stragglers = [r.getMessage() for r in caplog.records if "did not settle" in r.getMessage()]
+        assert stragglers and "ble_mesh/mesh_light_1" in stragglers[0]
+
+        # Whenever it finally settles, the done-callback still consumes it.
+        observer.cancel_release.set()
+        assert await straggler == "'ok'"
+        await _settle()
+        assert adapter._write_tasks == set()
+
+    async def test_caller_released_when_write_task_cancelled_before_start(self) -> None:
+        """A write task cancelled before its first step never runs _run_write,
+        so nothing inside it can release the caller — the caller must still
+        not hang."""
+        observer, adapter = _gated_adapter()
+        caller = asyncio.create_task(
+            adapter.set_variables("ble_mesh", "mesh_light_1", [VarSet("on", "0")])
+        )
+        await asyncio.sleep(0)  # the caller created its write task; it has not run yet
+        (task,) = adapter._write_tasks
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(caller, timeout=0.5)
+
+        assert observer.writes == []
+        assert adapter._write_tasks == set()
+
+
+class TestPerDeviceWriteLock:
+    async def test_same_device_writes_serialize(self) -> None:
+        observer, adapter = _gated_adapter()
+
+        first = asyncio.create_task(
+            adapter.set_variables("ble_mesh", "mesh_light_1", [VarSet("on", "0")])
+        )
+        second = asyncio.create_task(
+            adapter.set_variables("ble_mesh", "mesh_light_2", [VarSet("on", "0")])
+        )
+        await _settle()
+        assert observer.in_flight == 1
+        observer.release.set()
+        assert list(await asyncio.gather(first, second)) == ["'ok'", "'ok'"]
+
+        assert observer.max_in_flight == 1
+        assert observer.writes == [("ble_mesh", "mesh_light_1"), ("ble_mesh", "mesh_light_2")]
+
+    async def test_different_devices_write_concurrently(self) -> None:
+        observer, adapter = _gated_adapter()
+
+        mesh = asyncio.create_task(
+            adapter.set_variables("ble_mesh", "mesh_light_1", [VarSet("on", "0")])
+        )
+        own = asyncio.create_task(
+            adapter.set_variables("own-device", "gangbox_peripheral_0", [VarSet("on", "0")])
+        )
+        await _settle()
+        assert observer.in_flight == 2
+        observer.release.set()
+        await asyncio.gather(mesh, own)
+
+        assert observer.max_in_flight == 2
+
+    async def test_read_is_not_queued_behind_a_blocked_write(self) -> None:
+        observer, adapter = _gated_adapter()
+
+        write = asyncio.create_task(
+            adapter.set_variables("ble_mesh", "mesh_light_1", [VarSet("on", "0")])
+        )
+        await _settle()
+        assert observer.in_flight == 1
+
+        devices = await asyncio.wait_for(adapter.get_all(), timeout=0.1)
+
+        assert observer.reads == ["own-device", "ble_mesh"]
+        assert [d.device_id for d in devices] == ["own-device", "ble_mesh"]
+        assert observer.in_flight == 1  # the write is still blocked, untouched
+        observer.release.set()
+        await write
+
+    async def test_deadline_is_measured_after_lock_acquisition(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A writer queued behind a slow same-device write must not burn its
+        own deadline while waiting for the lock — and the slow write keeps
+        the lock past its caller's deadline (asserted event-based, before
+        the observer is released; no timer-order dependence)."""
+        monkeypatch.setattr(bus_mod, "_WRITE_DEADLINE_S", 0.05)
+        observer, adapter = _gated_adapter()
+
+        first = asyncio.create_task(
+            adapter.set_variables("ble_mesh", "mesh_light_1", [VarSet("on", "0")])
+        )
+        second = asyncio.create_task(
+            adapter.set_variables("ble_mesh", "mesh_light_2", [VarSet("on", "0")])
+        )
+        with pytest.raises(asyncio.TimeoutError):
+            await first  # the slow write detached at its deadline...
+
+        # ...and STILL holds the device lock: exactly one observer write has
+        # started, the second is queued behind it, not running concurrently.
+        assert observer.writes == [("ble_mesh", "mesh_light_1")]
+        assert observer.in_flight == 1
+        assert observer.max_in_flight == 1
+        assert not second.done()
+
+        await asyncio.sleep(0.06)  # total queue wait now exceeds the deadline
+        observer.release.set()
+        assert await second == "'ok'"  # queue wait did not count against it
+        assert observer.max_in_flight == 1
+        await asyncio.gather(*adapter._write_tasks)
 
 
 class TestDispatchFanout:

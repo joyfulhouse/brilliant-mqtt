@@ -68,7 +68,25 @@ bidirectional control.
 - **Command path:** HA publishes JSON to `brilliant/<panel>/<device>/set`; the
   bridge translates it (e.g. HA brightness 0–255 → device range) and calls
   `request_set_variables_in_peripheral` on the bus, then optimistically echoes
-  the commanded state. The bus notification/poll confirms it.
+  the commanded state. The bus notification/poll confirms it. Mesh primaries
+  skip the echo: their state is held at `null` (HA `unknown`) until an
+  observation confirms or contradicts the write (issue #66).
+- **Bus write path:** every write takes a per-bus-device `asyncio.Lock`
+  (the panel's own CONTROL id, `ble_mesh`) so same-device writes serialize
+  and a newer command can never actuate before an older one still in flight;
+  reads (`get_all`/`get_device`/`get_peripheral`) never take it, so a stalled
+  mesh write cannot freeze the hot poll. The 5 s caller deadline starts only
+  once the lock is held (queue wait and RPC time are logged separately). At
+  the deadline the caller gets `TimeoutError` but the closed-source RPC is
+  **not cancelled**: it runs on detached, keeps its device lock until it
+  settles, and logs its late completion or exception with the total latency
+  and receipt. A mesh primary that times out this way arms the normal
+  pending record (placeholder receipt), so HA shows `unknown` until an
+  observation settles it — the last snapshot is never republished as truth.
+  Only a write still unresolved at the fixed 15 s hard cap latches the
+  write-timeout flag, and the coordinator rebuilds the session on its next
+  tick; a single 5 s timeout no longer triggers a rebuild. No retry,
+  coalescing or batching happens at the bus layer (issue #72).
 - **Availability:** `brilliant/<panel>/availability` with an MQTT LWT —
   `offline` the moment the agent dies; systemd restarts it; reconnect
   re-reconciles.

@@ -13,13 +13,17 @@ import asyncio
 import json
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 import brilliant_mqtt.__main__ as main_mod
 from brilliant_mqtt import __version__
+from brilliant_mqtt import bus as bus_mod
 from brilliant_mqtt.__main__ import _is_panel_device, _is_reconnect_storm, _make_desired
 from brilliant_mqtt.bridge import Bridge, HotPollReadTimeout
+from brilliant_mqtt.bus import RpcBusAdapter
+from brilliant_mqtt.commands import VarSet
 from brilliant_mqtt.config import Settings
 from brilliant_mqtt.desired_state import DesiredState
 from brilliant_mqtt.ha_control_protocol import mode_command_topic, scene_command_topic
@@ -759,6 +763,99 @@ class TestWriteTimeoutRecovery:
             )
 
         assert harness.bus.write_timeout_checks == 1
+
+
+class _LatchProbeObserver:
+    """Fake RPCObserver: reads answer at once, writes block until released."""
+
+    def __init__(self) -> None:
+        self.release = asyncio.Event()
+        self.write_cancelled = False
+
+    async def get_device(self, device_id: str) -> object:
+        return SimpleNamespace(id=device_id, peripherals={})
+
+    async def request_set_variables_in_peripheral(
+        self,
+        peripheral_id: str,
+        values: dict[str, str],
+        *,
+        device_id: str,
+    ) -> str:
+        del peripheral_id, values, device_id
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.write_cancelled = True
+            raise
+        return "ok"
+
+    async def shutdown(self) -> None:
+        return
+
+
+def _real_bus_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[_SessionHarness, RpcBusAdapter, _LatchProbeObserver]:
+    """Session harness whose bus is the REAL adapter over a fake observer, so
+    the coordinator's latch check exercises the genuine write-timeout path."""
+    harness = _SessionHarness(
+        monkeypatch,
+        bridge_poll_effects={"panel": [asyncio.CancelledError()]},
+    )
+    observer = _LatchProbeObserver()
+    adapter = RpcBusAdapter()
+    adapter._obs = observer
+    adapter._own_device_id = "own-device"
+
+    async def no_start() -> None:
+        return
+
+    monkeypatch.setattr(adapter, "start", no_start)
+
+    def bus_factory(*, extra_device_ids: tuple[str, ...]) -> RpcBusAdapter:
+        del extra_device_ids
+        return adapter
+
+    monkeypatch.setattr(main_mod, "RpcBusAdapter", bus_factory)
+    return harness, adapter, observer
+
+
+class TestWriteTimeoutLatchSource:
+    """Issue #72: only the fixed hard cap latches; a single caller deadline
+    (5 s) leaves the session running."""
+
+    async def test_tick_after_single_write_deadline_does_not_rebuild(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(bus_mod, "_WRITE_DEADLINE_S", 0.005)
+        harness, adapter, observer = _real_bus_session(monkeypatch)
+        with pytest.raises(asyncio.TimeoutError):
+            await adapter.set_variables("own-device", "gangbox_peripheral_0", [VarSet("on", "1")])
+
+        with pytest.raises(asyncio.CancelledError):  # the poll effect, not the breaker
+            await asyncio.wait_for(main_mod._run_session(_hot_poll_settings(), None, None), 1)
+
+        assert "panel_poll" in harness.events
+        assert observer.write_cancelled is True  # settled at session teardown only
+
+    async def test_tick_after_hard_cap_rebuilds(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(bus_mod, "_WRITE_DEADLINE_S", 0.005)
+        monkeypatch.setattr(bus_mod, "_WRITE_HARD_CAP_S", 0.02)
+        harness, adapter, _observer = _real_bus_session(monkeypatch)
+        with pytest.raises(asyncio.TimeoutError):
+            await adapter.set_variables("own-device", "gangbox_peripheral_0", [VarSet("on", "1")])
+        await asyncio.sleep(0.05)
+
+        with pytest.raises(main_mod.BusWriteStuckError):
+            await asyncio.wait_for(main_mod._run_session(_hot_poll_settings(), None, None), 1)
+
+        assert "panel_poll" not in harness.events
+        assert harness.events[-1] == "mqtt_disconnect"
 
 
 class TestHotPollReadTimeoutPolicy:
