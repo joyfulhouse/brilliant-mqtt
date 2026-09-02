@@ -202,7 +202,7 @@ def _availability_message(payload: str | bytes) -> ReceiveMessage:
         topic="brilliant/office/availability",
         payload=payload,
         qos=0,
-        retain=True,
+        retain=False,
         subscribed_topic="brilliant/office/availability",
         timestamp=dt_util.utcnow().timestamp(),
     )
@@ -242,7 +242,7 @@ async def test_on_meta_accepts_bytes_json_payload(hass: HomeAssistant) -> None:
         topic="brilliant/office/bridge",
         payload=b'{"agent_version":"0.9.0"}',
         qos=0,
-        retain=True,
+        retain=False,
         subscribed_topic="brilliant/office/bridge",
         timestamp=dt_util.utcnow().timestamp(),
     )
@@ -250,6 +250,31 @@ async def test_on_meta_accepts_bytes_json_payload(hass: HomeAssistant) -> None:
     await manager._on_meta(message)
 
     assert manager.meta == {"agent_version": "0.9.0"}
+
+
+async def test_invalid_bytes_after_update_cannot_preserve_stale_online(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    manager = _legacy_manager(hass, entry)
+    manager.availability = "online"
+    shell = FakeShell()
+
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
+        await manager.async_update_agent()
+        assert manager._recovery_cancel is not None
+
+        await manager._on_availability(_availability_message(b"\xff\xfe"))
+        availability = manager.availability
+
+        async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=61))
+        await hass.async_block_till_done()
+
+    assert availability is None
+    assert manager._recovery_cancel is None
+    assert manager.problem is True
 
 
 @pytest.mark.parametrize(

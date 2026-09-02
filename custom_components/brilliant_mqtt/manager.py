@@ -746,7 +746,7 @@ class PanelManager:
             payload = decode_mqtt_payload(msg.payload)
         except (TypeError, UnicodeDecodeError):
             _LOGGER.warning("%s: discarded invalid bridge availability payload", self.panel)
-            return
+            payload = None
         self.availability = payload
         if payload == AVAILABILITY_ONLINE:
             self._cancel("_grace_cancel")
