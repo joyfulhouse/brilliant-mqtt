@@ -17,6 +17,7 @@ from homeassistant.components.mqtt.models import ReceiveMessage
 from homeassistant.config_entries import ConfigSubentry
 from homeassistant.core import Event, HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.event import async_call_later
 from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import (
     MockConfigEntry,
@@ -197,15 +198,150 @@ def _timer_cancelled(cancel: object) -> bool:
     return handle.cancelled()
 
 
-def _availability_message(payload: str) -> ReceiveMessage:
+def _availability_message(payload: str | bytes) -> ReceiveMessage:
     return ReceiveMessage(
         topic="brilliant/office/availability",
         payload=payload,
         qos=0,
-        retain=True,
+        retain=False,
         subscribed_topic="brilliant/office/availability",
         timestamp=dt_util.utcnow().timestamp(),
     )
+
+
+async def test_bytes_online_clears_problem_and_cancels_offline_grace(
+    hass: HomeAssistant,
+) -> None:
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    manager = _legacy_manager(hass, entry)
+    events = _capture_events(hass)
+
+    await manager._on_availability(_availability_message("offline"))
+    pending_grace = manager._grace_cancel
+    assert pending_grace is not None
+    manager._recovery_cancel = async_call_later(hass, 60, manager._recovery_timeout)
+    pending_recovery = manager._recovery_cancel
+    manager.problem = True
+    manager.problem_reason = "bridge recovery timed out"
+
+    await manager._on_availability(_availability_message(b"online"))
+    availability = manager.availability
+    problem = manager.problem
+    grace_cancel = manager._grace_cancel
+    recovery_cancel = manager._recovery_cancel
+    pending_grace_cancelled = _timer_cancelled(pending_grace)
+    pending_recovery_cancelled = _timer_cancelled(pending_recovery)
+    await manager.async_shutdown()
+
+    assert availability == "online"
+    assert problem is False
+    assert grace_cancel is None
+    assert recovery_cancel is None
+    assert pending_grace_cancelled is True
+    assert pending_recovery_cancelled is True
+    assert _types(events) == ["repair_succeeded"]
+
+
+async def test_invalid_bytes_mark_availability_unknown_and_preserve_grace(
+    hass: HomeAssistant,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    manager = _legacy_manager(hass, entry)
+
+    await manager._on_availability(_availability_message("offline"))
+    pending_grace = manager._grace_cancel
+    assert pending_grace is not None
+    caplog.set_level(logging.WARNING, logger="custom_components.brilliant_mqtt.manager")
+
+    try:
+        with patch.object(manager, "_notify") as notify:
+            await manager._on_availability(_availability_message(b"\xff"))
+            availability = manager.availability
+            grace_cancel = manager._grace_cancel
+            pending_grace_cancelled = _timer_cancelled(pending_grace)
+            notify_count = notify.call_count
+    finally:
+        await manager.async_shutdown()
+
+    assert availability is None
+    assert grace_cancel is pending_grace
+    assert pending_grace_cancelled is False
+    assert notify_count == 1
+    assert "discarded invalid bridge availability payload" in caplog.text
+
+
+async def test_invalid_bytes_preserve_offline_grace_escalation(hass: HomeAssistant) -> None:
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="office",
+        data=ENTRY_DATA,
+        options={
+            OPT_AUTO_REPAIR: False,
+            OPT_OFFLINE_GRACE_MINUTES: 1,
+        },
+    )
+    entry.add_to_hass(hass)
+    manager = _legacy_manager(hass, entry)
+    events = _capture_events(hass)
+
+    await manager._on_availability(_availability_message("offline"))
+    assert manager._grace_cancel is not None
+    await manager._on_availability(_availability_message(b"\xff"))
+    assert manager.availability is None
+
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(minutes=2))
+    await hass.async_block_till_done()
+
+    assert manager._grace_cancel is None
+    assert manager.problem is True
+    assert manager.problem_reason == "bridge offline past grace period (auto-repair is off)"
+    assert _types(events) == ["needs_attention"]
+
+
+async def test_on_meta_accepts_bytes_json_payload(hass: HomeAssistant) -> None:
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    manager = _legacy_manager(hass, entry)
+    message = ReceiveMessage(
+        topic="brilliant/office/bridge",
+        payload=b'{"agent_version":"0.9.0"}',
+        qos=0,
+        retain=False,
+        subscribed_topic="brilliant/office/bridge",
+        timestamp=dt_util.utcnow().timestamp(),
+    )
+
+    await manager._on_meta(message)
+
+    assert manager.meta == {"agent_version": "0.9.0"}
+
+
+async def test_invalid_bytes_after_update_cannot_preserve_stale_online(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    manager = _legacy_manager(hass, entry)
+    manager.availability = "online"
+    shell = FakeShell()
+
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
+        await manager.async_update_agent()
+        assert manager._recovery_cancel is not None
+
+        await manager._on_availability(_availability_message(b"\xff\xfe"))
+        availability = manager.availability
+
+        async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=61))
+        await hass.async_block_till_done()
+
+    assert availability is None
+    assert manager._recovery_cancel is None
+    assert manager.problem is True
 
 
 @pytest.mark.parametrize(
@@ -781,6 +917,32 @@ async def test_unreachable_panel_reports_and_schedules_recheck(
     # The recheck timer was consumed by the escalate path; nothing scheduled a new
     # one (cooldown holds), so unloading the entry leaves no manager timer.
     assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_manual_unreachable_recheck_without_availability_is_noop(
+    hass: HomeAssistant,
+) -> None:
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    manager = _legacy_manager(hass, entry)
+    events = _capture_events(hass)
+    shell = FakeShell(connect_error=OSError("unreachable"))
+
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
+        await manager.async_repair(trigger="manual")
+        unreachable_reason = manager.problem_reason
+        assert unreachable_reason == "panel unreachable during repair"
+        assert manager.availability is None
+        assert shell.connect_count == 1
+
+        async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=301))
+        await hass.async_block_till_done()
+
+    assert manager._grace_cancel is None
+    assert manager.problem is True
+    assert manager.problem_reason == unreachable_reason
+    assert shell.connect_count == 1
+    assert _types(events) == ["repair_started", "repair_failed"]
 
 
 async def test_unload_cancels_pending_timers(hass: HomeAssistant) -> None:

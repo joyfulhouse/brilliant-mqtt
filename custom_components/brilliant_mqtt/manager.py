@@ -86,6 +86,7 @@ from .const import (
     panel_device_name,
 )
 from .entry_data import FleetConfig, LegacyPanelStore, PanelConfigStore
+from .mqtt_payload import decode_mqtt_payload
 from .panel_ops import PanelOpError
 from .shell import (
     AsyncsshShell as _StrictAsyncsshShell,
@@ -741,7 +742,11 @@ class PanelManager:
         if self._shutting_down:
             return  # defense-in-depth: never arm a timer on a torn-down entry
         previous_state = (self.availability, self.problem, self.problem_reason)
-        payload = str(msg.payload)
+        try:
+            payload = decode_mqtt_payload(msg.payload)
+        except (TypeError, UnicodeDecodeError):
+            _LOGGER.warning("%s: discarded invalid bridge availability payload", self.panel)
+            payload = None
         self.availability = payload
         if payload == AVAILABILITY_ONLINE:
             self._cancel("_grace_cancel")
@@ -763,7 +768,7 @@ class PanelManager:
             return
         if self.problem_reason == _RETAINED_LEDGER_PROBLEM:
             return
-        if self.availability != AVAILABILITY_OFFLINE:
+        if self.availability not in (AVAILABILITY_OFFLINE, None):
             return
         if not self._opt(OPT_AUTO_REPAIR, DEFAULT_AUTO_REPAIR):
             self._escalate("bridge offline past grace period (auto-repair is off)")
@@ -992,9 +997,10 @@ class PanelManager:
                     self._last_repair_mono = time.monotonic()
                     if self._shutting_down:
                         return  # entry torn down mid-repair: do not re-arm a timer
-                    self._grace_cancel = async_call_later(
-                        self.hass, _UNREACHABLE_RECHECK_SECONDS, self._grace_expired
-                    )
+                    if self.availability is not None:
+                        self._grace_cancel = async_call_later(
+                            self.hass, _UNREACHABLE_RECHECK_SECONDS, self._grace_expired
+                        )
                     return
                 try:
                     retirement_result: bool | None = None
@@ -1661,8 +1667,8 @@ class PanelManager:
         if self._shutting_down:
             return  # defense-in-depth: don't spawn a staged-copy task on a dead entry
         try:
-            meta = json.loads(str(msg.payload))
-        except ValueError:
+            meta = json.loads(decode_mqtt_payload(msg.payload))
+        except (TypeError, ValueError):
             _LOGGER.warning("%s: discarded invalid bridge meta payload", self.panel)
             return
         if not isinstance(meta, dict):

@@ -18,6 +18,7 @@ from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from .const import AVAILABILITY_OFFLINE, AVAILABILITY_ONLINE, MESH_PANEL
 from .const import availability_topic as panel_availability_topic
 from .const import meta_topic as panel_meta_topic
+from .mqtt_payload import decode_mqtt_payload
 
 MAX_HEALTH_PAYLOAD_BYTES = 16 * 1024
 
@@ -540,18 +541,16 @@ def _valid_deployment_id(value: object) -> bool:
 
 
 def _decode_payload(payload: object) -> str:
-    if isinstance(payload, bytes):
+    if isinstance(payload, (bytes, bytearray)):
         if len(payload) > MAX_HEALTH_PAYLOAD_BYTES:
             raise ValueError
-        return payload.decode("utf-8", errors="strict")
-    if not isinstance(payload, str):
-        raise TypeError
-    if len(payload) > MAX_HEALTH_PAYLOAD_BYTES:
+    decoded = decode_mqtt_payload(payload)
+    if len(decoded) > MAX_HEALTH_PAYLOAD_BYTES:
         raise ValueError
-    encoded = payload.encode("utf-8", errors="strict")
+    encoded = decoded.encode("utf-8", errors="strict")
     if len(encoded) > MAX_HEALTH_PAYLOAD_BYTES:
         raise ValueError
-    return payload
+    return decoded
 
 
 def _decode_json_object(payload: object) -> dict[str, Any]:
