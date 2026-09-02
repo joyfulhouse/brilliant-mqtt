@@ -356,7 +356,7 @@ class _BlockingRpcObserver:
 
 
 class TestRpcDeadlines:
-    def test_defaults_are_five_second_backstops(self) -> None:
+    def test_defaults_are_fixed_backstops(self) -> None:
         assert bus_mod._READ_DEADLINE_S == 5.0
         assert bus_mod._WRITE_DEADLINE_S == 5.0
         assert bus_mod._WRITE_HARD_CAP_S == 15.0
@@ -450,11 +450,25 @@ class _GatedRpcObserver:
         self.shutdowns += 1
 
 
-def _gated_adapter(observer: _GatedRpcObserver) -> RpcBusAdapter:
+def _gated_adapter(
+    *, fail_with: Exception | None = None
+) -> tuple[_GatedRpcObserver, RpcBusAdapter]:
+    observer = _GatedRpcObserver(fail_with=fail_with)
     adapter = RpcBusAdapter(extra_device_ids=("ble_mesh",))
     adapter._obs = observer
     adapter._own_device_id = "own-device"
-    return adapter
+    return observer, adapter
+
+
+async def _detached_write(
+    adapter: RpcBusAdapter, device_id: str = "ble_mesh", peripheral_id: str = "mesh_light_1"
+) -> asyncio.Task[str]:
+    """Issue a write that hits the caller deadline; return its still-running task."""
+    before = set(adapter._write_tasks)
+    with pytest.raises(asyncio.TimeoutError):
+        await adapter.set_variables(device_id, peripheral_id, [VarSet("on", "0")])
+    (task,) = adapter._write_tasks - before
+    return task
 
 
 async def _settle(n: int = 3) -> None:
@@ -473,13 +487,10 @@ class TestDetachedWrites:
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         monkeypatch.setattr(bus_mod, "_WRITE_DEADLINE_S", 0.01)
-        observer = _GatedRpcObserver()
-        adapter = _gated_adapter(observer)
+        observer, adapter = _gated_adapter()
 
         with caplog.at_level(logging.DEBUG, logger="brilliant_mqtt.bus"):
-            with pytest.raises(asyncio.TimeoutError):
-                await adapter.set_variables("ble_mesh", "mesh_light_1", [VarSet("on", "0")])
-            task = next(iter(adapter._write_tasks))
+            task = await _detached_write(adapter)
             observer.release.set()
             assert await task == "'ok'"
             await _settle()
@@ -498,13 +509,10 @@ class TestDetachedWrites:
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         monkeypatch.setattr(bus_mod, "_WRITE_DEADLINE_S", 0.01)
-        observer = _GatedRpcObserver(fail_with=RuntimeError("late boom"))
-        adapter = _gated_adapter(observer)
+        observer, adapter = _gated_adapter(fail_with=RuntimeError("late boom"))
 
         with caplog.at_level(logging.WARNING, logger="brilliant_mqtt.bus"):
-            with pytest.raises(asyncio.TimeoutError):
-                await adapter.set_variables("ble_mesh", "mesh_light_1", [VarSet("on", "0")])
-            task = next(iter(adapter._write_tasks))
+            task = await _detached_write(adapter)
             observer.release.set()
             with pytest.raises(RuntimeError, match="late boom"):
                 await task
@@ -523,12 +531,10 @@ class TestDetachedWrites:
     ) -> None:
         monkeypatch.setattr(bus_mod, "_WRITE_DEADLINE_S", 0.005)
         monkeypatch.setattr(bus_mod, "_WRITE_HARD_CAP_S", 0.02)
-        observer = _GatedRpcObserver()
-        adapter = _gated_adapter(observer)
+        observer, adapter = _gated_adapter()
 
         for device_id in ("own-device", "ble_mesh"):
-            with pytest.raises(asyncio.TimeoutError):
-                await adapter.set_variables(device_id, "p", [VarSet("on", "0")])
+            await _detached_write(adapter, device_id, "p")
         assert adapter.consume_write_timeout() is False  # deadline alone never latches
 
         await asyncio.sleep(0.05)  # both writes cross the cap
@@ -544,12 +550,9 @@ class TestDetachedWrites:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         monkeypatch.setattr(bus_mod, "_WRITE_DEADLINE_S", 0.01)
-        observer = _GatedRpcObserver()
-        adapter = _gated_adapter(observer)
+        observer, adapter = _gated_adapter()
 
-        with pytest.raises(asyncio.TimeoutError):
-            await adapter.set_variables("ble_mesh", "mesh_light_1", [VarSet("on", "0")])
-        task = next(iter(adapter._write_tasks))
+        task = await _detached_write(adapter)
 
         await adapter.shutdown()
 
@@ -561,8 +564,7 @@ class TestDetachedWrites:
 
 class TestPerDeviceWriteLock:
     async def test_same_device_writes_serialize(self) -> None:
-        observer = _GatedRpcObserver()
-        adapter = _gated_adapter(observer)
+        observer, adapter = _gated_adapter()
 
         first = asyncio.create_task(
             adapter.set_variables("ble_mesh", "mesh_light_1", [VarSet("on", "0")])
@@ -579,8 +581,7 @@ class TestPerDeviceWriteLock:
         assert observer.writes == [("ble_mesh", "mesh_light_1"), ("ble_mesh", "mesh_light_2")]
 
     async def test_different_devices_write_concurrently(self) -> None:
-        observer = _GatedRpcObserver()
-        adapter = _gated_adapter(observer)
+        observer, adapter = _gated_adapter()
 
         mesh = asyncio.create_task(
             adapter.set_variables("ble_mesh", "mesh_light_1", [VarSet("on", "0")])
@@ -596,8 +597,7 @@ class TestPerDeviceWriteLock:
         assert observer.max_in_flight == 2
 
     async def test_read_is_not_queued_behind_a_blocked_write(self) -> None:
-        observer = _GatedRpcObserver()
-        adapter = _gated_adapter(observer)
+        observer, adapter = _gated_adapter()
 
         write = asyncio.create_task(
             adapter.set_variables("ble_mesh", "mesh_light_1", [VarSet("on", "0")])
@@ -620,8 +620,7 @@ class TestPerDeviceWriteLock:
         """A writer queued behind a slow same-device write must not burn its
         own deadline while waiting for the lock."""
         monkeypatch.setattr(bus_mod, "_WRITE_DEADLINE_S", 0.05)
-        observer = _GatedRpcObserver()
-        adapter = _gated_adapter(observer)
+        observer, adapter = _gated_adapter()
 
         first = asyncio.create_task(
             adapter.set_variables("ble_mesh", "mesh_light_1", [VarSet("on", "0")])
