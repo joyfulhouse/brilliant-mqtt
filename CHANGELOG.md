@@ -48,11 +48,11 @@ also moves to 0.9.0.
   statistics in **Settings → Developer tools → Statistics**. (#65; #36)
 - **armv7 voice payload validation.** Voice payload builds now prefer genuine
   ARM libraries, replace the defective x86-64 TensorFlow Lite library, and
-  fail packaging unless every shared object is ELF32 ARM EABI5. Panels already
-  holding voice payload 0.1.0 do not receive 0.1.1 automatically because agent
-  update and repair deploy voice only when the payload is absent. After
-  upgrading, turn the panel's **Voice satellite** switch off, then on, to
-  redeploy 0.1.1. (#67; #35)
+  fail packaging unless every shared object is ELF32 ARM EABI5. The voice
+  payload version is now 0.1.1. Panels already holding voice payload 0.1.0 do
+  not receive 0.1.1 automatically because agent update and repair deploy voice
+  only when the payload is absent. After upgrading, turn the panel's **Voice
+  satellite** switch off, then on, to redeploy 0.1.1. (#67; #35)
 - **Retained discovery-config cleanup.** On setup, the integration performs a
   bounded, fail-closed garbage-collection pass for illegal pre-ledger retained
   discovery configs owned by managed panels. The first Home Assistant restart
@@ -537,7 +537,12 @@ panel redeploy is needed.
 - JoyfulHouse OSS docs standard: LICENSE (MIT), INSTALL.md, CHANGELOG.md,
   FUNDING.yml, CODEOWNERS, and the canonical `docs/` set.
 
-[Unreleased]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.5.6...HEAD
+[Unreleased]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.8.0...v0.9.0
+[0.8.0]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.7.1...v0.8.0
+[0.7.1]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.7.0...v0.7.1
+[0.7.0]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.6.0...v0.7.0
+[0.6.0]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.5.6...v0.6.0
 [0.5.6]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.5.5...v0.5.6
 [0.5.5]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.5.0...v0.5.5
 [0.5.0]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.4.0...v0.5.0
