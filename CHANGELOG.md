@@ -21,6 +21,10 @@ also moves to 0.9.0.
   observation cancels the pending command immediately, while a fresh matching
   observation confirms it at the deadline. Auxiliary values remain live, and
   wired-panel and auxiliary writes keep their existing optimistic behavior.
+  Home Assistant therefore shows the held `state: null` as `unknown` for up to
+  80 seconds after a mesh primary command; automations and conditions
+  expecting the commanded state immediately must tolerate `unknown` during
+  that window.
   (#66; #46, #47)
 
 ### Fixed
@@ -44,7 +48,11 @@ also moves to 0.9.0.
   statistics in **Settings → Developer tools → Statistics**. (#65; #36)
 - **armv7 voice payload validation.** Voice payload builds now prefer genuine
   ARM libraries, replace the defective x86-64 TensorFlow Lite library, and
-  fail packaging unless every shared object is ELF32 ARM EABI5. (#67; #35)
+  fail packaging unless every shared object is ELF32 ARM EABI5. Panels already
+  holding voice payload 0.1.0 do not receive 0.1.1 automatically because agent
+  update and repair deploy voice only when the payload is absent. After
+  upgrading, turn the panel's **Voice satellite** switch off, then on, to
+  redeploy 0.1.1. (#67; #35)
 - **Retained discovery-config cleanup.** On setup, the integration performs a
   bounded, fail-closed garbage-collection pass for illegal pre-ledger retained
   discovery configs owned by managed panels. The first Home Assistant restart
