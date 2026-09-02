@@ -273,6 +273,34 @@ async def test_invalid_bytes_mark_availability_unknown_and_preserve_grace(
     assert "discarded invalid bridge availability payload" in caplog.text
 
 
+async def test_invalid_bytes_preserve_offline_grace_escalation(hass: HomeAssistant) -> None:
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="office",
+        data=ENTRY_DATA,
+        options={
+            OPT_AUTO_REPAIR: False,
+            OPT_OFFLINE_GRACE_MINUTES: 1,
+        },
+    )
+    entry.add_to_hass(hass)
+    manager = _legacy_manager(hass, entry)
+    events = _capture_events(hass)
+
+    await manager._on_availability(_availability_message("offline"))
+    assert manager._grace_cancel is not None
+    await manager._on_availability(_availability_message(b"\xff"))
+    assert manager.availability is None
+
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(minutes=2))
+    await hass.async_block_till_done()
+
+    assert manager._grace_cancel is None
+    assert manager.problem is True
+    assert manager.problem_reason == "bridge offline past grace period (auto-repair is off)"
+    assert _types(events) == ["needs_attention"]
+
+
 async def test_on_meta_accepts_bytes_json_payload(hass: HomeAssistant) -> None:
     entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
     entry.add_to_hass(hass)

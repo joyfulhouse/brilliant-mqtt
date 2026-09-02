@@ -768,7 +768,7 @@ class PanelManager:
             return
         if self.problem_reason == _RETAINED_LEDGER_PROBLEM:
             return
-        if self.availability != AVAILABILITY_OFFLINE:
+        if self.availability not in (AVAILABILITY_OFFLINE, None):
             return
         if not self._opt(OPT_AUTO_REPAIR, DEFAULT_AUTO_REPAIR):
             self._escalate("bridge offline past grace period (auto-repair is off)")
