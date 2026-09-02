@@ -7,13 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-09-02
+
+The on-panel agent moves to 0.9.0 — panels need a redeploy (per-panel bridge
+update entity) to pick up the agent-side fixes. The Home Assistant integration
+also moves to 0.9.0.
+
+### Changed
+
+- **Observation-confirmed mesh primary writes.** Mesh primary commands no
+  longer optimistically report success. Their primary `state` is held at
+  `null` for up to 80 seconds while observations settle; a contradictory
+  observation cancels the pending command immediately, while a fresh matching
+  observation confirms it at the deadline. Auxiliary values remain live, and
+  wired-panel and auxiliary writes keep their existing optimistic behavior.
+  Home Assistant therefore shows the held `state: null` as `unknown` for up to
+  80 seconds after a mesh primary command; automations and conditions
+  expecting the commanded state immediately must tolerate `unknown` during
+  that window.
+  (#66; #46, #47)
+
 ### Fixed
 
+- **Native scene execution detection.** The scene bridge now consumes the
+  existing shared hot-poll snapshot, so native panel scene executions are
+  detected even when execution push callbacks are delayed or absent, without
+  adding another bus read. (#61; #39)
+- **Legacy reconfigure remains supported in Home Assistant 2026.12.** The
+  update listener now owns reload scheduling and legacy reconfigure uses the
+  non-reloading completion helper, removing the deprecated listener plus
+  reloading-flow pairing. Upgrade the integration before Home Assistant
+  2026.12; panels and agents are unaffected. (#62; #59)
+- **Panel deploy staging no longer blocks Home Assistant's event loop.** Agent
+  payloads are archived off-loop, uploaded as bytes, and extracted through the
+  existing fail-closed staging-and-swap path. (#63; #58)
 - **Power sensor units.** Brilliant bus readings are deciwatts and are now
   published as watts instead of values 10× too high. Power sensors keep
   `state_class="measurement"`, so existing long-term statistics are not
   migrated automatically; after upgrading, purge or correct affected power
-  statistics in **Settings → Developer tools → Statistics**. (#36)
+  statistics in **Settings → Developer tools → Statistics**. (#65; #36)
+- **armv7 voice payload validation.** Voice payload builds now prefer genuine
+  ARM libraries, replace the defective x86-64 TensorFlow Lite library, and
+  fail packaging unless every shared object is ELF32 ARM EABI5. The voice
+  payload version is now 0.1.1. Panels already holding voice payload 0.1.0 do
+  not receive 0.1.1 automatically because agent update and repair deploy voice
+  only when the payload is absent. After upgrading, turn the panel's **Voice
+  satellite** switch off, then on, to redeploy 0.1.1. (#67; #35)
+- **Retained discovery-config cleanup.** On setup, the integration performs a
+  bounded, fail-closed garbage-collection pass for illegal pre-ledger retained
+  discovery configs owned by managed panels. The first Home Assistant restart
+  after upgrading performs the one-time cleanup. (#68; #60)
+
+### Tests
+
+- Home Assistant bus-event tests now use inline callback listeners, removing
+  a latent thread-pool timing race under CPU load. (#64; #45)
 
 ## [0.8.0] - 2026-08-31
 
@@ -489,7 +537,12 @@ panel redeploy is needed.
 - JoyfulHouse OSS docs standard: LICENSE (MIT), INSTALL.md, CHANGELOG.md,
   FUNDING.yml, CODEOWNERS, and the canonical `docs/` set.
 
-[Unreleased]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.5.6...HEAD
+[Unreleased]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.8.0...v0.9.0
+[0.8.0]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.7.1...v0.8.0
+[0.7.1]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.7.0...v0.7.1
+[0.7.0]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.6.0...v0.7.0
+[0.6.0]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.5.6...v0.6.0
 [0.5.6]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.5.5...v0.5.6
 [0.5.5]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.5.0...v0.5.5
 [0.5.0]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.4.0...v0.5.0
