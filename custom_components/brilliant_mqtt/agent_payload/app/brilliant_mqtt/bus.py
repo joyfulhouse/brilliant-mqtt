@@ -49,6 +49,13 @@ _WRITE_DEADLINE_S = 5.0
 # the whole session on its next tick. Fixed by design — deliberately not
 # configurable (#72).
 _WRITE_HARD_CAP_S = 15.0
+# How long shutdown() waits for cancelled write tasks to settle before closing
+# the observer anyway. A closed-source coroutine may delay or swallow
+# cancellation — exactly the wedged-write case teardown exists to recover
+# from — so the wait is bounded. 2 s sits well inside the coordinator's
+# 5 s rebuild backoff (__main__._BACKOFF_S) and leaves room for the observer
+# and processor shutdowns that follow.
+_WRITE_SETTLE_TIMEOUT_S = 2.0
 # Upper bound on the normalized set-variables receipt (issue #46): the RPC
 # response type is closed-source and undocumented, so only a bounded repr
 # string ever crosses the adapter boundary.
@@ -300,6 +307,10 @@ class RpcBusAdapter:
         # Strong refs to every write task (queued, running, or detached past
         # its caller deadline). shutdown() settles whatever is left.
         self._write_tasks: set[asyncio.Task[str]] = set()
+        # Set synchronously at the top of shutdown(): a lane callback that
+        # reaches set_variables() afterwards is rejected instead of creating
+        # a task nobody settles (the bus closes before MQTT disconnects).
+        self._shutting_down = False
         # Retain fired callback tasks so they are not garbage-collected mid-flight
         # (asyncio holds only weak references to tasks). Done-callback discards.
         self._pending_tasks: set[asyncio.Task[None]] = set()
@@ -600,6 +611,8 @@ class RpcBusAdapter:
         :func:`_normalize_receipt`); the response object stays here.
         """
         obs, _ = self._require_started()
+        if self._shutting_down:
+            raise RuntimeError("bus adapter shutting down; write rejected")
         record = _WriteRecord(label=f"{device_id}/{peripheral_id}", queued_at=self._clock())
         acquired: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         task = asyncio.ensure_future(
@@ -612,9 +625,13 @@ class RpcBusAdapter:
                 acquired,
             )
         )
+        task.set_name(record.label)
         self._write_tasks.add(task)
         task.add_done_callback(self._settle_write)
-        await acquired
+        # Wake on lock acquisition OR on the task settling first (a task
+        # cancelled before its first step never runs _run_write at all).
+        waiters: list[asyncio.Future[Any]] = [acquired, task]
+        await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
         try:
             return await asyncio.wait_for(asyncio.shield(task), timeout=_WRITE_DEADLINE_S)
         except asyncio.TimeoutError:
@@ -639,45 +656,37 @@ class RpcBusAdapter:
     ) -> str:
         """The write task: hold the device lock for the RPC's whole lifetime."""
         lock = self._write_locks.setdefault(device_id, asyncio.Lock())
-        try:
-            async with lock:
-                record.started_at = self._clock()
-                if not acquired.done():
-                    acquired.set_result(None)
-                logger.debug(
-                    "set_variables(%s) acquired device lock after %.3fs queue wait",
-                    record.label,
-                    self._queue_wait(record),
-                )
-                cap = asyncio.get_running_loop().call_later(
-                    _WRITE_HARD_CAP_S, self._cap_write, record
-                )
-                try:
-                    response = await obs.request_set_variables_in_peripheral(
-                        peripheral_id,
-                        values,
-                        device_id=device_id,
-                    )
-                except asyncio.CancelledError:
-                    logger.info("set_variables(%s) cancelled at session teardown", record.label)
-                    raise
-                except Exception:
-                    if record.detached:
-                        logger.warning(
-                            "detached set_variables(%s) failed after %.1fs (queue wait %.3fs)",
-                            record.label,
-                            self._rpc_elapsed(record),
-                            self._queue_wait(record),
-                            exc_info=True,
-                        )
-                    raise
-                finally:
-                    cap.cancel()
-        finally:
-            # A task settled (cancelled/failed) before it ever acquired the
-            # lock must still release its caller.
+        async with lock:
+            record.started_at = self._clock()
             if not acquired.done():
                 acquired.set_result(None)
+            logger.debug(
+                "set_variables(%s) acquired device lock after %.3fs queue wait",
+                record.label,
+                self._queue_wait(record),
+            )
+            cap = asyncio.get_running_loop().call_later(_WRITE_HARD_CAP_S, self._cap_write, record)
+            try:
+                response = await obs.request_set_variables_in_peripheral(
+                    peripheral_id,
+                    values,
+                    device_id=device_id,
+                )
+            except asyncio.CancelledError:
+                logger.info("set_variables(%s) cancelled at session teardown", record.label)
+                raise
+            except Exception:
+                if record.detached:
+                    logger.warning(
+                        "detached set_variables(%s) failed after %.1fs (queue wait %.3fs)",
+                        record.label,
+                        self._rpc_elapsed(record),
+                        self._queue_wait(record),
+                        exc_info=True,
+                    )
+                raise
+            finally:
+                cap.cancel()
         receipt = _normalize_receipt(response)
         if record.detached:
             logger.warning(
@@ -726,7 +735,12 @@ class RpcBusAdapter:
         return self._clock() - started
 
     async def _settle_writes(self) -> None:
-        """Session teardown: cancel and await every outstanding write task."""
+        """Session teardown: cancel every outstanding write task, wait a bounded time.
+
+        Stragglers that outlive _WRITE_SETTLE_TIMEOUT_S are logged and left to
+        finish on their own: they stay strongly referenced in _write_tasks and
+        their done-callback (_settle_write) still consumes any exception.
+        """
         outstanding = [task for task in self._write_tasks if not task.done()]
         if not outstanding:
             return
@@ -735,10 +749,19 @@ class RpcBusAdapter:
         )
         for task in outstanding:
             task.cancel()
-        await asyncio.gather(*outstanding, return_exceptions=True)
+        _, pending = await asyncio.wait(outstanding, timeout=_WRITE_SETTLE_TIMEOUT_S)
+        if pending:
+            logger.error(
+                "%d bus write(s) did not settle within %.0fs of cancellation; closing the "
+                "observer anyway: %s",
+                len(pending),
+                _WRITE_SETTLE_TIMEOUT_S,
+                sorted(task.get_name() for task in pending),
+            )
 
     async def shutdown(self) -> None:
         """Best-effort teardown; tolerant of a never-started adapter."""
+        self._shutting_down = True
         await self._settle_writes()
         if self._obs is not None:
             try:
