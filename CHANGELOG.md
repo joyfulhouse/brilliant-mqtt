@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Bus writes serialize per device and no longer rebuild the session on a
+  single timeout.** The on-panel agent now takes one write lock per bus
+  device (the panel's own loads, `ble_mesh`), so near-simultaneous commands
+  for different mesh peripherals run one after another instead of
+  saturating the bus; reads are never queued behind a write. The 5 s write
+  deadline starts after the lock is acquired, and reaching it no longer
+  cancels the write or rebuilds the session — the write runs on detached and
+  its late outcome is logged. Only a write still unresolved after a fixed
+  15 s cap triggers the session rebuild. A mesh primary command whose write
+  times out is now treated as unresolved: Home Assistant shows `unknown`
+  until an observation confirms or contradicts it (the previous snapshot is
+  no longer republished as if it were confirmed). Auxiliary values stay
+  live. Effect on the 0.9.0 pilot incident: no `offline`/`online` flap and
+  no mesh-leader churn from two commands 30 ms apart.
+  (#72)
+
 ## [0.9.0] - 2026-09-02
 
 The on-panel agent moves to 0.9.0 — panels need a redeploy (per-panel bridge
