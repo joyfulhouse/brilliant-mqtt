@@ -15,7 +15,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from brilliant_mqtt import __version__
-from brilliant_mqtt.bridge import Bridge, HotPollReadTimeout, WriteThrottle
+from brilliant_mqtt.bridge import Bridge, CommandSubscribeError, HotPollReadTimeout, WriteThrottle
 from brilliant_mqtt.bus import RpcBusAdapter
 from brilliant_mqtt.config import Settings
 from brilliant_mqtt.desired_state import DesiredState
@@ -259,6 +259,7 @@ async def _run_session(
         tick = settings.hot_poll_seconds if settings.hot_poll_seconds > 0 else _IDLE_TICK_S
         next_resync = time.monotonic() + settings.resync_seconds
         consecutive_hot_poll_timeouts = 0
+        consecutive_resync_failures = 0
         while True:
             await asyncio.sleep(tick)
 
@@ -325,10 +326,20 @@ async def _run_session(
 
             # Periodic level-triggered resync: republishes retained discovery
             # + state, covering any push notifications that were missed.
+            # A single missed SUBACK gets one retry on the next tick — the
+            # same grace as the hot poll — before the session is rebuilt (#76).
             if time.monotonic() >= next_resync:
-                await panel_bridge.reconcile()
-                if participating and leader.is_leader:
-                    await mesh_bridge.reconcile()
+                try:
+                    await panel_bridge.reconcile()
+                    if participating and leader.is_leader:
+                        await mesh_bridge.reconcile()
+                except CommandSubscribeError as error:
+                    if consecutive_resync_failures >= 1:
+                        raise
+                    consecutive_resync_failures = 1
+                    log.warning("resync %s; retrying once before rebuilding session", error)
+                    continue
+                consecutive_resync_failures = 0
                 next_resync = time.monotonic() + settings.resync_seconds
     except RetainedLedgerError:
         # The ownership ledger is deliberately fail-closed: publishing retained
