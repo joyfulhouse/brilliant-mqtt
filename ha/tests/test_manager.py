@@ -344,6 +344,155 @@ async def test_invalid_bytes_after_update_cannot_preserve_stale_online(
     assert manager.problem is True
 
 
+_NEUTRAL_RECOVERY_REASON = "bridge did not come back within 60 s after the update"
+_EXTENDED_RECOVERY_REASON = "bridge did not come back within 150 s after the update"
+
+
+async def _update_and_arm_recovery(
+    hass: HomeAssistant, manager: PanelManager, shell: FakeShell
+) -> None:
+    """Run update.install so the production arm site starts the recovery timer."""
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
+        await manager.async_update_agent()
+    assert manager._recovery_cancel is not None
+
+
+async def test_recovery_timeout_without_activity_escalates_neutral_reason(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """(a) #77: still offline at 60 s with a silent broker → escalate, no API-drift claim."""
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    manager = _legacy_manager(hass, entry)
+    manager.availability = "offline"
+    events = _capture_events(hass)
+    shell = FakeShell()
+    await _update_and_arm_recovery(hass, manager, shell)
+
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
+        async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=61))
+        await hass.async_block_till_done()
+    recovery_cancel = manager._recovery_cancel
+    await manager.async_shutdown()
+
+    assert recovery_cancel is None
+    assert manager.problem is True
+    assert manager.problem_reason == _NEUTRAL_RECOVERY_REASON
+    assert "API drift" not in manager.problem_reason
+    assert _types(events)[-2:] == ["repair_failed", "needs_attention"]
+
+
+async def test_recovery_extends_once_on_activity_then_online_succeeds(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """(b) #77: an offline LWT inside the window buys one extension; online at 90 s wins."""
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    manager = _legacy_manager(hass, entry)
+    manager.availability = "offline"
+    events = _capture_events(hass)
+    shell = FakeShell()
+    await _update_and_arm_recovery(hass, manager, shell)
+
+    await manager._on_availability(_availability_message("offline"))
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
+        async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=61))
+        await hass.async_block_till_done()
+    extended = manager._recovery_cancel
+    problem_after_first_window = manager.problem
+
+    await manager._on_availability(_availability_message("online"))
+    await manager.async_shutdown()
+
+    assert extended is not None
+    assert problem_after_first_window is False
+    assert manager._recovery_cancel is None
+    assert _timer_cancelled(extended) is True
+    assert "needs_attention" not in _types(events)
+    assert _types(events)[-1] == "repair_succeeded"
+
+
+async def test_recovery_extension_is_bounded_then_escalates_with_full_window(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """(c) #77: a meta publish extends once; further activity cannot extend again."""
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    manager = _legacy_manager(hass, entry)
+    manager.availability = "offline"
+    events = _capture_events(hass)
+    shell = FakeShell()
+    await _update_and_arm_recovery(hass, manager, shell)
+
+    await manager._on_meta(
+        ReceiveMessage(
+            topic="brilliant/office/bridge",
+            payload='{"agent_version":"0.9.1"}',
+            qos=0,
+            retain=False,
+            subscribed_topic="brilliant/office/bridge",
+            timestamp=dt_util.utcnow().timestamp(),
+        )
+    )
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
+        async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=61))
+        await hass.async_block_till_done()
+        extended = manager._recovery_cancel
+        # Activity during the extension must not buy a second one.
+        await manager._on_availability(_availability_message("offline"))
+        async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=61 + 91))
+        await hass.async_block_till_done()
+    recovery_cancel = manager._recovery_cancel
+    await manager.async_shutdown()
+
+    assert extended is not None
+    assert recovery_cancel is None
+    assert manager.problem is True
+    assert manager.problem_reason == _EXTENDED_RECOVERY_REASON
+    assert _types(events).count("needs_attention") == 1
+    assert _types(events)[-2:] == ["repair_failed", "needs_attention"]
+
+
+@pytest.mark.parametrize(
+    "journal",
+    [
+        "ImportError: cannot import name 'RPCObserver' "
+        "from 'lib.message_bus_api.observer_interface'",
+        "ModuleNotFoundError: No module named 'lib.message_bus_api'",
+        "AttributeError: 'RPCObserver' object has no attribute 'get_all_peripherals'",
+    ],
+)
+async def test_recovery_timeout_names_api_drift_only_with_journal_signature(
+    hass: HomeAssistant,
+    journal: str,
+) -> None:
+    """(d) #77: API drift is claimed only when the journal shows the bus-lib failure."""
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    manager = _legacy_manager(hass, entry)
+    manager.availability = "offline"
+    shell = FakeShell()
+
+    with (
+        patch.object(manager, "_shell", return_value=shell),
+        patch.object(
+            panel_ops,
+            "collect_journal",
+            return_value=f"Traceback (most recent call last):\n  ...\n{journal}\n",
+        ),
+    ):
+        await manager._recovery_timeout(dt_util.utcnow())
+
+    assert manager.problem is True
+    assert manager.problem_reason is not None
+    assert manager.problem_reason.startswith(_NEUTRAL_RECOVERY_REASON)
+    assert "API drift" in manager.problem_reason
+    assert journal not in manager.problem_reason
+
+
 @pytest.mark.parametrize(
     ("availability", "problem", "reason", "notifications"),
     (

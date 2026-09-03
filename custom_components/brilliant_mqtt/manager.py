@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
@@ -104,6 +105,16 @@ LegacyAsyncsshShell = _LegacyAsyncsshShell
 _LOGGER = logging.getLogger(__name__)
 
 _RECOVERY_SECONDS = 60.0
+# One bounded extension when the broker saw the bridge trying to come back (an
+# LWT, an availability change, a meta publish) but it is not online yet: weak-Wi-Fi
+# panels routinely need more than _RECOVERY_SECONDS to settle after a restart (#77).
+_RECOVERY_EXTENSION_SECONDS = 90.0
+# The agent's only panel-library import is ``lib.message_bus_api...RPCObserver``
+# (bus.load_rpc_observer_class). A journal line pairing an import/attribute error
+# with that library or class is the bus-lib API-drift signature; nothing else is.
+_BUS_LIB_DRIFT_SIGNATURE = re.compile(
+    r"(?:ImportError|ModuleNotFoundError|AttributeError).*(?:message_bus_api|RPCObserver)"
+)
 _UNREACHABLE_RECHECK_SECONDS = 300.0
 _LEGACY_RETIRE_TIMEOUT_SECONDS = 30.0
 _SHELL_CLOSE_TIMEOUT_SECONDS = 5.0
@@ -237,6 +248,8 @@ class PanelManager:
         self._unsubs: list[Any] = []
         self._grace_cancel: CALLBACK_TYPE | None = None
         self._recovery_cancel: CALLBACK_TYPE | None = None
+        self._recovery_activity = False
+        self._recovery_window = _RECOVERY_SECONDS
         self._last_repair_mono: float | None = None
         self._repairing = False
         self._abandoned_close_tasks: set[asyncio.Task[None]] = set()
@@ -747,6 +760,10 @@ class PanelManager:
         except (TypeError, UnicodeDecodeError):
             _LOGGER.warning("%s: discarded invalid bridge availability payload", self.panel)
             payload = None
+        else:
+            # Any decodable LWT/availability publish is the bridge (or its broker
+            # session) showing signs of life; undecodable bytes prove nothing.
+            self._recovery_activity = True
         self.availability = payload
         if payload == AVAILABILITY_ONLINE:
             self._cancel("_grace_cancel")
@@ -1101,9 +1118,7 @@ class PanelManager:
                 return  # entry torn down mid-repair: do not re-arm a timer
             if self.problem_reason == _RETAINED_LEDGER_PROBLEM:
                 return  # preserve the storage diagnosis; another restart cannot repair it
-            self._recovery_cancel = async_call_later(
-                self.hass, _RECOVERY_SECONDS, self._recovery_timeout
-            )
+            self._arm_recovery()
         finally:
             self._repairing = False
 
@@ -1210,9 +1225,7 @@ class PanelManager:
             # Cancel any prior recovery handle (e.g. a repair's, if this update lands in
             # its window) BEFORE re-arming, so the old TimerHandle can't be orphaned.
             self._cancel("_recovery_cancel")
-            self._recovery_cancel = async_call_later(
-                self.hass, _RECOVERY_SECONDS, self._recovery_timeout
-            )
+            self._arm_recovery()
         finally:
             self._repairing = False
 
@@ -1629,6 +1642,14 @@ class PanelManager:
                 ) from None
         self._notify()
 
+    def _arm_recovery(self) -> None:
+        """Start the post-restart window that decides repair_succeeded vs escalation."""
+        self._recovery_activity = False
+        self._recovery_window = _RECOVERY_SECONDS
+        self._recovery_cancel = async_call_later(
+            self.hass, _RECOVERY_SECONDS, self._recovery_timeout
+        )
+
     async def _recovery_timeout(self, _now: datetime) -> None:
         self._recovery_cancel = None
         if self._shutting_down:
@@ -1637,12 +1658,27 @@ class PanelManager:
             return
         if self.availability == AVAILABILITY_ONLINE:
             return
+        if self._recovery_activity and self._recovery_window == _RECOVERY_SECONDS:
+            # The bridge is visibly trying (LWT/meta traffic) but not online yet —
+            # typically a slow weak-Wi-Fi reconnect. Wait once more, then judge.
+            self._recovery_window += _RECOVERY_EXTENSION_SECONDS
+            _LOGGER.info(
+                "%s: bridge not back after %.0f s but the broker saw activity; waiting %.0f s more",
+                self.panel,
+                _RECOVERY_SECONDS,
+                _RECOVERY_EXTENSION_SECONDS,
+            )
+            self._recovery_cancel = async_call_later(
+                self.hass, _RECOVERY_EXTENSION_SECONDS, self._recovery_timeout
+            )
+            return
+        journal = ""
         try:
             async with self._ssh_lock:
                 shell = self._shell()
                 await shell.connect()
                 try:
-                    await panel_ops.collect_journal(shell, 50)
+                    journal = await panel_ops.collect_journal(shell, 50)
                 finally:
                     await shell.close()
         except (OSError, asyncssh.Error, PanelOpError):
@@ -1658,14 +1694,20 @@ class PanelManager:
         ):
             return
         self._fire(EVENT_REPAIR_FAILED, {"reason": "still_offline"})
-        self._escalate(
-            "repair ran but the bridge did not come back — probable bus-lib API drift "
-            "after the firmware update; the agent needs a code fix"
-        )
+        reason = f"bridge did not come back within {self._recovery_window:.0f} s after the update"
+        if _BUS_LIB_DRIFT_SIGNATURE.search(journal):
+            # Only the journal can tell a slow reconnect from a broken agent; the
+            # raw journal text itself stays on this side (never exported).
+            reason += (
+                "; the panel journal shows a bus-lib import/attribute failure "
+                "(probable API drift after the firmware update; the agent needs a code fix)"
+            )
+        self._escalate(reason)
 
     async def _on_meta(self, msg: ReceiveMessage) -> None:
         if self._shutting_down:
             return  # defense-in-depth: don't spawn a staged-copy task on a dead entry
+        self._recovery_activity = True
         try:
             meta = json.loads(decode_mqtt_payload(msg.payload))
         except (TypeError, ValueError):
