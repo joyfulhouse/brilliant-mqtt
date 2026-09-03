@@ -531,6 +531,49 @@ async def test_recovery_timeout_names_api_drift_only_with_journal_signature(
 
 
 @pytest.mark.parametrize(
+    "journal",
+    [
+        # An import failure, but from an unrelated library — not the bus lib.
+        "ImportError: cannot import name 'foo' from 'unrelated_lib'",
+        # A generic timeout traceback with none of the bus-lib signature tokens.
+        "TimeoutError: bus notification stream read timed out",
+        # ModuleNotFoundError for something other than message_bus_api.
+        "ModuleNotFoundError: No module named 'json'",
+    ],
+)
+async def test_recovery_timeout_omits_api_drift_for_non_signature_journal(
+    hass: HomeAssistant,
+    journal: str,
+) -> None:
+    """(d) negative: a non-bus-lib traceback must NOT claim API drift.
+
+    Guards the drift signature against a regex-broadening mutant (e.g. dropping the
+    `(?:message_bus_api|RPCObserver)` group): such a mutant would match these generic
+    tracebacks and wrongly append the drift suffix, so this test kills it.
+    """
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    manager = _legacy_manager(hass, entry)
+    manager.availability = "offline"
+    shell = FakeShell()
+
+    with (
+        patch.object(manager, "_shell", return_value=shell),
+        patch.object(
+            panel_ops,
+            "collect_journal",
+            return_value=f"Traceback (most recent call last):\n  ...\n{journal}\n",
+        ),
+    ):
+        await manager._recovery_timeout(dt_util.utcnow())
+
+    assert manager.problem is True
+    assert manager.problem_reason is not None
+    assert manager.problem_reason.startswith(_NEUTRAL_RECOVERY_REASON)
+    assert "API drift" not in manager.problem_reason
+
+
+@pytest.mark.parametrize(
     ("availability", "problem", "reason", "notifications"),
     (
         ("online", False, None, 0),
@@ -1541,6 +1584,49 @@ async def test_update_during_repair_recovery_window_leaks_no_timer(
     assert manager._recovery_cancel is not prior_recovery  # a fresh handle
     assert _timer_cancelled(manager._recovery_cancel) is False  # the update's timer is live
     assert manager._grace_cancel is None
+
+    # Shutdown cancels the one live timer; the strict guard proves nothing lingers.
+    await manager.async_shutdown()
+    assert manager._recovery_cancel is None
+
+
+async def test_repair_during_update_recovery_window_leaks_no_timer(
+    hass: HomeAssistant, payload_dir: Path
+) -> None:
+    """C1 (reversed): a repair inside an update's recovery window must not orphan a timer.
+
+    The mirror of test_update_during_repair_recovery_window_leaks_no_timer. An update
+    completes with its recovery timer pending; a Repair then lands inside that window and
+    re-arms _recovery_cancel. Unless the re-arm cancels the prior handle FIRST, the
+    update's live TimerHandle is overwritten and survives async_shutdown (which cancels
+    only the current handle), firing _recovery_timeout on a torn-down entry. Moving the
+    cancel into _arm_recovery itself closes both directions; here we prove the update's
+    handle is cancelled and exactly one live recovery timer (the repair's) remains.
+    """
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    manager = _legacy_manager(hass, entry)
+
+    # First a clean update so we are genuinely inside its recovery window.
+    update_shell = FakeShell()
+    await _update_and_arm_recovery(hass, manager, update_shell)
+    prior_recovery = manager._recovery_cancel
+    assert prior_recovery is not None  # recovery timer armed by the update
+    assert _timer_cancelled(prior_recovery) is False  # the update's timer is live
+
+    # Now a repair lands inside that window and re-arms recovery.
+    repair_shell = FakeShell()
+    with patch(
+        "custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=repair_shell
+    ):
+        await manager.async_repair(trigger="button")
+
+    # The update's recovery handle was cancelled before the repair re-armed, so exactly
+    # ONE live recovery timer remains (the repair's, a NEW handle) — no orphan.
+    assert _timer_cancelled(prior_recovery) is True  # old timer killed, not orphaned
+    assert manager._recovery_cancel is not None
+    assert manager._recovery_cancel is not prior_recovery  # a fresh handle
+    assert _timer_cancelled(manager._recovery_cancel) is False  # the repair's timer is live
 
     # Shutdown cancels the one live timer; the strict guard proves nothing lingers.
     await manager.async_shutdown()

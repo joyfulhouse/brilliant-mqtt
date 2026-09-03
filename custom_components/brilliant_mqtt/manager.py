@@ -1227,9 +1227,8 @@ class PanelManager:
                 return  # entry torn down mid-update: do not re-arm a timer
             if self.problem_reason == _RETAINED_LEDGER_PROBLEM:
                 return  # healthy bridge meta, not a generic timeout, must clear this fault
-            # Cancel any prior recovery handle (e.g. a repair's, if this update lands in
-            # its window) BEFORE re-arming, so the old TimerHandle can't be orphaned.
-            self._cancel("_recovery_cancel")
+            # _arm_recovery cancels any prior pending recovery handle itself, so a repair's
+            # timer (if this update lands in its window) can't be orphaned.
             self._arm_recovery("update")
         finally:
             self._repairing = False
@@ -1649,6 +1648,11 @@ class PanelManager:
 
     def _arm_recovery(self, origin: _RecoveryOrigin) -> None:
         """Start the post-restart window that decides repair_succeeded vs escalation."""
+        # Cancel any prior pending recovery handle FIRST, so re-arming from either
+        # direction (a repair inside an update's window, or an update inside a repair's)
+        # can never orphan the earlier TimerHandle — an orphan survives async_shutdown
+        # and fires _recovery_timeout on a torn-down entry.
+        self._cancel("_recovery_cancel")
         self._recovery_activity = False
         self._recovery_window = _RECOVERY_SECONDS
         self._recovery_origin = origin
