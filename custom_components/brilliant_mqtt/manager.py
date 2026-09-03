@@ -255,6 +255,12 @@ class PanelManager:
         self._recovery_activity = False
         self._recovery_window = _RECOVERY_SECONDS
         self._recovery_origin: _RecoveryOrigin = "update"
+        # Monotonic marker of the current recovery window. A running _recovery_timeout
+        # captures it before its SSH/journal await and defers if it changed — a fresh
+        # window superseded this one. The nullable _recovery_cancel handle cannot serve
+        # this role: a fresh _recovery_timeout nulls it at its own entry before taking
+        # the ssh lock, which would fool a stale timeout into a second escalation.
+        self._recovery_generation = 0
         self._last_repair_mono: float | None = None
         self._repairing = False
         self._abandoned_close_tasks: set[asyncio.Task[None]] = set()
@@ -1653,6 +1659,7 @@ class PanelManager:
         # can never orphan the earlier TimerHandle — an orphan survives async_shutdown
         # and fires _recovery_timeout on a torn-down entry.
         self._cancel("_recovery_cancel")
+        self._recovery_generation += 1
         self._recovery_activity = False
         self._recovery_window = _RECOVERY_SECONDS
         self._recovery_origin = origin
@@ -1661,6 +1668,7 @@ class PanelManager:
         )
 
     async def _recovery_timeout(self, _now: datetime) -> None:
+        my_generation = self._recovery_generation
         self._recovery_cancel = None
         if self._shutting_down:
             return
@@ -1711,7 +1719,10 @@ class PanelManager:
             return
         # A fresh recovery window armed during the await (an update/repair landed):
         # defer to it rather than escalating this now-superseded window's expiry.
-        if self._recovery_cancel is not None:
+        # Gate on the monotonic generation, NOT on _recovery_cancel: a fresh
+        # _recovery_timeout nulls that handle at its own entry before taking the ssh
+        # lock, so a nulled handle no longer proves this window is still current.
+        if my_generation != self._recovery_generation:
             return
         self._fire(EVENT_REPAIR_FAILED, {"reason": "still_offline"})
         reason = f"bridge did not come back within {window:.0f} s after the {origin}"

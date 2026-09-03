@@ -543,6 +543,74 @@ async def test_recovery_timeout_defers_to_window_rearmed_during_journal_await(
     assert manager._recovery_window == 60.0
 
 
+async def test_recovery_timeout_defers_when_fresh_timer_fired_during_await(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """#77 race (codex): a fresh timer that FIRES mid-await must not double-escalate.
+
+    The `_recovery_cancel is not None` deferral is insufficient: a FRESH
+    `_recovery_timeout` nulls `_recovery_cancel` at its own entry (manager.py:1664)
+    BEFORE it takes the ssh lock. So the sequence is:
+      (1) the stale timeout fires and enters the SSH/journal await;
+      (2) an update/repair arms a fresh window (`_arm_recovery` sets `_recovery_cancel`);
+      (3) the fresh 60 s timer fires DURING the stale await -> its `_recovery_timeout`
+          clears `_recovery_cancel = None` at entry;
+      (4) the stale timeout finishes, sees `_recovery_cancel is None`, and escalates —
+          then the fresh window ALSO escalates on its own expiry -> TWO escalations.
+    A monotonic generation counter (not the nullable handle) must gate the defer, so
+    the stale window steps aside and EXACTLY ONE escalation (the fresh window's) fires.
+    """
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    manager = _legacy_manager(hass, entry)
+    manager.availability = "offline"
+    events = _capture_events(hass)
+    shell = FakeShell()
+    # A repair's window is expiring (origin=repair); drive _recovery_timeout directly.
+    manager._recovery_origin = "repair"
+
+    def _fresh_window_arms_and_its_timer_fires(*_args: object, **_kwargs: object) -> str:
+        # (2) a fresh window arms during the stale await, then (3) its own timer fires:
+        # the fresh _recovery_timeout nulls _recovery_cancel at entry BEFORE taking the
+        # ssh lock. The stale timeout still holds the lock, so we cannot reentrantly run
+        # the fresh body here; we replicate the exact state its entry leaves behind — a
+        # fresh generation armed AND _recovery_cancel nulled — which is all the stale
+        # guard observes. The fresh window's real timer (armed below) still fires later.
+        manager._arm_recovery("update")
+        manager._recovery_cancel = None
+        return "boot: system starting normally\n"
+
+    with (
+        patch.object(manager, "_shell", return_value=shell),
+        patch.object(
+            panel_ops, "collect_journal", side_effect=_fresh_window_arms_and_its_timer_fires
+        ),
+    ):
+        await manager._recovery_timeout(dt_util.utcnow())  # the STALE timeout
+
+    # (4) the stale timeout must DEFER to the fresh generation, not escalate on the
+    # nulled handle. Under the old `is not None` guard it escalated here (RED).
+    assert "repair_failed" not in _types(events)
+    assert "needs_attention" not in _types(events)
+    assert manager.problem is False
+    assert manager.problem_reason is None
+
+    # The fresh window remains live and escalates EXACTLY once on its own expiry.
+    with (
+        patch.object(manager, "_shell", return_value=shell),
+        patch.object(panel_ops, "collect_journal", return_value="boot: system starting normally\n"),
+    ):
+        async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=61))
+        await hass.async_block_till_done()
+    await manager.async_shutdown()
+
+    assert _types(events).count("repair_failed") == 1
+    assert _types(events).count("needs_attention") == 1
+    assert manager.problem is True
+    assert manager.problem_reason == "bridge did not come back within 60 s after the update"
+
+
 async def test_recovery_timeout_drift_suffix_names_repair_origin_not_firmware(
     hass: HomeAssistant,
     payload_dir: Path,
