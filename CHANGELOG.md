@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-09-03
+
+The on-panel agent and Home Assistant integration move to 0.9.2. Update every
+panel through its per-panel bridge **Update** entity. The voice payload remains
+at 0.1.1 and is unchanged.
+
+### Fixed
+
+- **Connect-stage failures now carry actionable diagnostics.** All four
+  integration connect-stage handlers log the panel identity and exception
+  class; `OSError` includes its errno and strerror, while AsyncSSH failures
+  include their class and message. User-facing Repairs summaries and the
+  allow-listed panel-operation path are unchanged.
+  ([#79](https://github.com/joyfulhouse/brilliant-mqtt/pull/79); #75)
+- **MQTT subscription hardening prevents avoidable session rebuilds.** SUBACK
+  reason codes are validated, command-topic subscriptions are deduplicated per
+  session, and periodic resync gets one retry before two consecutive subscribe
+  failures rebuild the session; initial reconcile remains fail-fast. This
+  directly targets the multi-minute availability outages observed on weak-Wi-Fi
+  Guest Bathroom and Office Bathroom panels after SUBACK-timeout session
+  rebuilds.
+  ([#78](https://github.com/joyfulhouse/brilliant-mqtt/pull/78); #76)
+- **Post-update and repair recovery reports its true origin and tolerates
+  reconnect activity.** Timeout reasons now name whether an update or repair
+  failed to recover, and append the API-drift diagnosis only when the journal
+  contains its signature. A reconnecting panel receives one bounded 90 s
+  extension after the existing 60 s window; a silent panel still escalates at
+  60 s. Recovery timers use monotonic generations, cannot be orphaned, snapshot
+  await-race state consistently, and classify diagnostics against the actual
+  recovery origin. This changes the post-update/repair health-escalation reason
+  text and caps the extended recovery window at 150 s.
+  ([#80](https://github.com/joyfulhouse/brilliant-mqtt/pull/80); #77)
+
 ## [0.9.1] - 2026-09-02
 
 The on-panel agent and Home Assistant integration move to 0.9.1. Every panel
@@ -575,7 +608,8 @@ panel redeploy is needed.
 - JoyfulHouse OSS docs standard: LICENSE (MIT), INSTALL.md, CHANGELOG.md,
   FUNDING.yml, CODEOWNERS, and the canonical `docs/` set.
 
-[Unreleased]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.9.1...HEAD
+[Unreleased]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.9.2...HEAD
+[0.9.2]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.7.1...v0.8.0
