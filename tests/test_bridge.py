@@ -23,6 +23,7 @@ from brilliant_mqtt.bridge import Bridge, _state_payload
 from brilliant_mqtt.commands import VarSet
 from brilliant_mqtt.mapping import payload_fields
 from brilliant_mqtt.model import BrilliantDevice, DeviceKind, Variable
+from brilliant_mqtt.protocols import CommandSubscribeError
 from brilliant_mqtt.retained_topics import RetainedTopicLedger
 from tests.fakes import FakeBus, FakeClock, FakeMqtt, FakeSleeper
 
@@ -2287,3 +2288,111 @@ class TestMeshWriteTimeout:
         assert payload["motion"] is True
         assert payload["motion_score"] == 42
         await bridge.withdraw()
+
+
+# ---------------------------------------------------------------------------
+# Issue #76: per-session subscribe dedupe + SUBACK-timeout signalling
+# ---------------------------------------------------------------------------
+
+
+class _FlakySubscribeMqtt(FakeMqtt):
+    """FakeMqtt whose subscribe() raises the queued effects, one per call."""
+
+    def __init__(self, effects: list[BaseException | None]) -> None:
+        super().__init__()
+        self.effects = list(effects)
+
+    async def subscribe(self, topic: str) -> None:
+        if self.effects:
+            effect = self.effects.pop(0)
+            if effect is not None:
+                raise effect
+        await super().subscribe(topic)
+
+
+class TestReconcileSubscribeDedupe:
+    async def test_second_reconcile_in_same_session_issues_no_subscribes(
+        self, hardware: BrilliantDevice, dimmer: BrilliantDevice
+    ) -> None:
+        bus = FakeBus([hardware, dimmer])
+        mqtt = FakeMqtt()
+        bridge = Bridge(bus, mqtt, PANEL)
+        await bridge.reconcile()
+        first = list(mqtt.subscriptions)
+        assert len(first) > 1  # sanity: several command topics in play
+
+        await bridge.reconcile()
+
+        assert mqtt.subscriptions == first  # zero new subscribe() calls
+
+    async def test_rebuilt_session_resubscribes_every_topic(
+        self, hardware: BrilliantDevice, dimmer: BrilliantDevice
+    ) -> None:
+        bus = FakeBus([hardware, dimmer])
+        mqtt = FakeMqtt()
+        await Bridge(bus, mqtt, PANEL).reconcile()
+        first = list(mqtt.subscriptions)
+
+        # A rebuilt session is a fresh Bridge on a fresh connection: the
+        # dedupe set must not leak across sessions.
+        await Bridge(bus, mqtt, PANEL).reconcile()
+
+        assert mqtt.subscriptions == first + first
+
+    async def test_withdraw_resets_dedupe_so_reacquire_resubscribes(
+        self, hardware: BrilliantDevice
+    ) -> None:
+        bus = FakeBus([hardware])
+        mqtt = FakeMqtt()
+        bridge = Bridge(bus, mqtt, PANEL)
+        await bridge.reconcile()
+        first = list(mqtt.subscriptions)
+        await bridge.withdraw()
+        assert mqtt.subscriptions == []
+
+        await bridge.reconcile()
+
+        assert sorted(mqtt.subscriptions) == sorted(first)
+
+    async def test_command_subscribe_error_does_not_mark_topic_subscribed(
+        self, dimmer: BrilliantDevice
+    ) -> None:
+        cause = CommandSubscribeError(
+            f"subscribe failed for brilliant/{PANEL}/gangbox_peripheral_0/set"
+        )
+        bus = FakeBus([dimmer])
+        mqtt = _FlakySubscribeMqtt([cause])
+        bridge = Bridge(bus, mqtt, PANEL)
+
+        with pytest.raises(CommandSubscribeError) as raised:
+            await bridge.reconcile()
+
+        assert f"brilliant/{PANEL}/gangbox_peripheral_0/set" in str(raised.value)
+        assert raised.value is cause
+        assert mqtt.subscriptions == []
+
+    async def test_failed_subscribe_is_retried_by_the_next_reconcile(
+        self, dimmer: BrilliantDevice
+    ) -> None:
+        bus = FakeBus([dimmer])
+        mqtt = _FlakySubscribeMqtt([CommandSubscribeError("Operation timed out")])
+        bridge = Bridge(bus, mqtt, PANEL)
+        with pytest.raises(CommandSubscribeError):
+            await bridge.reconcile()
+
+        await bridge.reconcile()
+
+        assert mqtt.subscriptions == [f"brilliant/{PANEL}/gangbox_peripheral_0/set"]
+
+    async def test_non_mqtt_subscribe_failure_propagates_unchanged(
+        self, dimmer: BrilliantDevice
+    ) -> None:
+        failure = RuntimeError("adapter misuse")
+        bus = FakeBus([dimmer])
+        mqtt = _FlakySubscribeMqtt([failure])
+        bridge = Bridge(bus, mqtt, PANEL)
+
+        with pytest.raises(RuntimeError) as raised:
+            await bridge.reconcile()
+
+        assert raised.value is failure

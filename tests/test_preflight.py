@@ -303,12 +303,13 @@ class _ConcretePreflightClient:
         if topic == self._topics.retained and retain:
             self._retained_payload = payload
 
-    async def subscribe(self, topic: str) -> None:
+    async def subscribe(self, topic: str) -> tuple[int, ...]:
         if topic == self._topics.retained and self._retained_payload:
             payload = self.retained_replay_payload
             if payload is None:
                 payload = self._retained_payload
             self.messages.feed(topic, payload, retained=True)
+        return (0,)
 
     async def unsubscribe(self, topic: str) -> None:
         self.unsubscriptions.append(topic)
@@ -436,10 +437,11 @@ class _AckRacePreflightClient(_ConcretePreflightClient):
         await super().publish(topic, payload, retain=retain, qos=qos)
         await self._hold_ack("publish", topic)
 
-    async def subscribe(self, topic: str) -> None:
+    async def subscribe(self, topic: str) -> tuple[int, ...]:
         self.operations.append(("subscribe", topic))
-        await super().subscribe(topic)
+        result = await super().subscribe(topic)
         await self._hold_ack("subscribe", topic)
+        return result
 
     async def unsubscribe(self, topic: str) -> None:
         self.operations.append(("unsubscribe", topic))

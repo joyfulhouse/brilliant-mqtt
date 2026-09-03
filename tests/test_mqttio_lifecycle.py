@@ -16,9 +16,12 @@ from dataclasses import dataclass, field
 
 import aiomqtt
 import pytest
+from paho.mqtt.packettypes import PacketTypes
+from paho.mqtt.reasoncodes import ReasonCode
 
 from brilliant_mqtt.config import Settings
 from brilliant_mqtt.mqttio import AioMqttAdapter, build_tls_context
+from brilliant_mqtt.protocols import CommandSubscribeError
 
 
 async def _empty_messages() -> AsyncIterator[object]:
@@ -33,6 +36,8 @@ class _FakeAiomqttClient:
     enter_error: BaseException | None = None
     exit_error: BaseException | None = None
     publish_error: BaseException | None = None
+    subscribe_error: BaseException | None = None
+    subscribe_result: tuple[int, ...] | list[ReasonCode] = (0,)
     enter_gate: asyncio.Event | None = None
     exit_gate: asyncio.Event | None = None
     enter_calls: int = 0
@@ -62,8 +67,10 @@ class _FakeAiomqttClient:
             raise self.publish_error
         self.published.append((topic, payload, retain, qos))
 
-    async def subscribe(self, topic: str) -> None:
-        pass
+    async def subscribe(self, topic: str) -> tuple[int, ...] | list[ReasonCode]:
+        if self.subscribe_error is not None:
+            raise self.subscribe_error
+        return self.subscribe_result
 
     async def unsubscribe(self, topic: str) -> None:
         pass
@@ -219,6 +226,31 @@ async def test_publish_availability_true_publishes_clean_offline_on_disconnect()
     await adapter.disconnect()
 
     assert fake.published == [("brilliant/office/availability", "offline", True, 0)]
+
+
+async def test_rejected_suback_surfaces_project_error() -> None:
+    adapter = _adapter(_FakeAiomqttClient(subscribe_result=(0x80,)))
+
+    with pytest.raises(CommandSubscribeError, match="brilliant/office/light/set"):
+        await adapter.subscribe("brilliant/office/light/set")
+
+
+async def test_rejected_mqtt_v5_suback_surfaces_project_error() -> None:
+    rejection = ReasonCode(PacketTypes.SUBACK, identifier=0x87)
+    adapter = _adapter(_FakeAiomqttClient(subscribe_result=[rejection]))
+
+    with pytest.raises(CommandSubscribeError, match="Not authorized"):
+        await adapter.subscribe("brilliant/office/light/set")
+
+
+async def test_subscribe_transport_error_is_translated_to_project_error() -> None:
+    cause = aiomqtt.MqttError("Operation timed out")
+    adapter = _adapter(_FakeAiomqttClient(subscribe_error=cause))
+
+    with pytest.raises(CommandSubscribeError) as raised:
+        await adapter.subscribe("brilliant/office/light/set")
+
+    assert raised.value.__cause__ is cause
 
 
 # -- Cancellation shields the executor/lifecycle-backed work --------------------

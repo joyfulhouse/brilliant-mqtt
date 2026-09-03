@@ -203,6 +203,10 @@ class Bridge:
         # command topic → (peripheral_id, descriptor). descriptor is None for the
         # PRIMARY JSON light/switch topic; an EntityDescriptor for each aux topic.
         self._by_cmd_topic: dict[str, tuple[str, EntityDescriptor | None]] = {}
+        # Command topics this session has already SUBSCRIBEd (#76): the periodic
+        # resync must not re-issue them. Bridge lifetime == MQTT session, and
+        # withdraw() clears it, so a rebuilt session re-subscribes everything.
+        self._subscribed: set[str] = set()
         # peripheral_id → last published state payload. Lets the hot poll (and
         # pushes/echoes) skip MQTT publishes when nothing actually changed.
         self._last_state_payload: dict[str, str] = {}
@@ -241,8 +245,8 @@ class Bridge:
     async def reconcile(self) -> None:
         """Publish availability, discovery configs, and initial state for all devices.
 
-        Idempotent for re-publishing and additions: safe to call repeatedly, and
-        duplicate subscribe() calls on the MQTT client are acceptable. Stale
+        Idempotent for re-publishing and additions: safe to call repeatedly;
+        already-subscribed command topics are skipped. Stale
         peripherals are NOT pruned — out of scope; removal is handled
         operationally by clearing the retained config topic (see
         docs/reference/deployment.md).
@@ -308,8 +312,10 @@ class Bridge:
             for descriptor in descriptors:
                 self._register_command_topic(device.peripheral_id, descriptor)
                 topic = self._command_topic_for(device.peripheral_id, descriptor)
-                if topic is not None:
-                    await self._mqtt.subscribe(topic)
+                if topic is None or topic in self._subscribed:
+                    continue
+                await self._mqtt.subscribe(topic)
+                self._subscribed.add(topic)
 
         logger.info(
             "reconcile: %d devices -> %d entities, %d command topics registered",
@@ -359,6 +365,7 @@ class Bridge:
         # past its pending entry, mid-publish).
         topics = list(self._by_cmd_topic)
         self._by_cmd_topic.clear()
+        self._subscribed.clear()
         for peripheral_id in set(self._pending_mesh) | set(self._mesh_confirm_tasks):
             self._drop_pending_mesh(peripheral_id)
         # Invalidate — never clear — the write generations: a pre-withdraw bus

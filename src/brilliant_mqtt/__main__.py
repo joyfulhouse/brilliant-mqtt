@@ -25,7 +25,7 @@ from brilliant_mqtt.mesh_leader import MeshLeader
 from brilliant_mqtt.model import BrilliantDevice
 from brilliant_mqtt.motion_derive import MotionDeriver
 from brilliant_mqtt.mqttio import AioMqttAdapter
-from brilliant_mqtt.protocols import BusClient
+from brilliant_mqtt.protocols import BusClient, CommandSubscribeError
 from brilliant_mqtt.retained_topics import RetainedLedgerError, RetainedTopicLedger
 from brilliant_mqtt.scene_bridge import SceneBridge
 
@@ -259,6 +259,7 @@ async def _run_session(
         tick = settings.hot_poll_seconds if settings.hot_poll_seconds > 0 else _IDLE_TICK_S
         next_resync = time.monotonic() + settings.resync_seconds
         consecutive_hot_poll_timeouts = 0
+        consecutive_resync_failures = 0
         while True:
             await asyncio.sleep(tick)
 
@@ -325,10 +326,20 @@ async def _run_session(
 
             # Periodic level-triggered resync: republishes retained discovery
             # + state, covering any push notifications that were missed.
+            # A single missed SUBACK gets one retry on the next tick — the
+            # same grace as the hot poll — before the session is rebuilt (#76).
             if time.monotonic() >= next_resync:
-                await panel_bridge.reconcile()
-                if participating and leader.is_leader:
-                    await mesh_bridge.reconcile()
+                try:
+                    await panel_bridge.reconcile()
+                    if participating and leader.is_leader:
+                        await mesh_bridge.reconcile()
+                except CommandSubscribeError as error:
+                    if consecutive_resync_failures >= 1:
+                        raise
+                    consecutive_resync_failures = 1
+                    log.warning("resync %s; retrying once before rebuilding session", error)
+                    continue
+                consecutive_resync_failures = 0
                 next_resync = time.monotonic() + settings.resync_seconds
     except RetainedLedgerError:
         # The ownership ledger is deliberately fail-closed: publishing retained

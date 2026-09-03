@@ -23,6 +23,7 @@ import aiomqtt
 from brilliant_mqtt.config import Settings
 from brilliant_mqtt.discovery import availability_topic
 from brilliant_mqtt.mapping import AUX_SPECS
+from brilliant_mqtt.protocols import CommandSubscribeError
 
 logger = logging.getLogger(__name__)
 
@@ -588,7 +589,19 @@ class AioMqttAdapter:
         self._payload_decode_error_cbs.append(cb)
 
     async def subscribe(self, topic: str) -> None:
-        await self._client.subscribe(topic)
+        try:
+            reason_codes = await self._client.subscribe(topic)
+        except aiomqtt.MqttError as error:
+            raise CommandSubscribeError(f"subscribe failed for {topic}: {error}") from error
+
+        rejected = [
+            code
+            for code in reason_codes
+            if (code >= 0x80 if isinstance(code, int) else code.is_failure)
+        ]
+        if rejected:
+            reasons = ", ".join(str(code) for code in rejected)
+            raise CommandSubscribeError(f"subscribe rejected for {topic}: {reasons}")
 
     async def unsubscribe(self, topic: str) -> None:
         # Like subscribe/publish, delegates straight to aiomqtt — which raises
