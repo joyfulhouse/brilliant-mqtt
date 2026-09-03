@@ -16,13 +16,12 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from aiomqtt import MqttError
 
 import brilliant_mqtt.__main__ as main_mod
 from brilliant_mqtt import __version__
 from brilliant_mqtt import bus as bus_mod
 from brilliant_mqtt.__main__ import _is_panel_device, _is_reconnect_storm, _make_desired
-from brilliant_mqtt.bridge import Bridge, CommandSubscribeError, HotPollReadTimeout
+from brilliant_mqtt.bridge import Bridge, HotPollReadTimeout
 from brilliant_mqtt.bus import RpcBusAdapter
 from brilliant_mqtt.commands import VarSet
 from brilliant_mqtt.config import Settings
@@ -30,6 +29,7 @@ from brilliant_mqtt.desired_state import DesiredState
 from brilliant_mqtt.ha_control_protocol import mode_command_topic, scene_command_topic
 from brilliant_mqtt.mesh_leader import MESH_LEADER_TOPIC, MeshLeader
 from brilliant_mqtt.model import BrilliantDevice, DeviceKind, Variable
+from brilliant_mqtt.protocols import CommandSubscribeError
 from brilliant_mqtt.retained_topics import RetainedLedgerError
 from tests.fakes import FakeBus, FakeClock, FakeMqtt
 
@@ -1197,7 +1197,13 @@ class TestResyncSubscribeEndToEnd:
         harness.mqtt = mqtt = _OfflineOnDisconnectMqtt(harness.events)
         # Initial reconcile subscribes the dimmer; the periodic resync finds the
         # new switch and its SUBSCRIBE gets no SUBACK once.
-        mqtt.subscribe_effects = [None, MqttError("Operation timed out")]
+        mqtt.subscribe_effects = [
+            None,
+            CommandSubscribeError(
+                "subscribe failed for brilliant/office/gangbox_peripheral_1/set: "
+                "Operation timed out"
+            ),
+        ]
         settings = _hot_poll_settings(resync_seconds=0)
         object.__setattr__(settings, "retained_topics_file", str(tmp_path / "owned.json"))
         object.__setattr__(settings, "bus_heartbeat_file", "")
@@ -1209,7 +1215,7 @@ class TestResyncSubscribeEndToEnd:
                 {session, retried}, timeout=1, return_when=asyncio.FIRST_COMPLETED
             )
         try:
-            assert retried in done  # RED today: the session task ends with MqttError
+            assert retried in done
             assert not session.done()
             assert "mqtt_disconnect" not in harness.events
             assert all(payload != "offline" for _t, payload, _r, _q in mqtt.published)
@@ -1223,7 +1229,7 @@ class TestResyncSubscribeEndToEnd:
         finally:
             retried.cancel()
             session.cancel()
-            with pytest.raises((asyncio.CancelledError, MqttError)):
+            with pytest.raises((asyncio.CancelledError, CommandSubscribeError)):
                 await session
 
 

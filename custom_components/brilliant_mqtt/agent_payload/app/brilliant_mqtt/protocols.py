@@ -16,6 +16,10 @@ from brilliant_mqtt.commands import VarSet
 from brilliant_mqtt.model import BrilliantDevice
 
 
+class CommandSubscribeError(RuntimeError):
+    """A command-topic SUBSCRIBE failed at the MQTT adapter boundary."""
+
+
 class BusClient(Protocol):
     """Adapter for the Brilliant panel's internal message bus."""
 

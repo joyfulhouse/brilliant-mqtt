@@ -15,7 +15,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from brilliant_mqtt import __version__
-from brilliant_mqtt.bridge import Bridge, CommandSubscribeError, HotPollReadTimeout, WriteThrottle
+from brilliant_mqtt.bridge import Bridge, HotPollReadTimeout, WriteThrottle
 from brilliant_mqtt.bus import RpcBusAdapter
 from brilliant_mqtt.config import Settings
 from brilliant_mqtt.desired_state import DesiredState
@@ -25,7 +25,7 @@ from brilliant_mqtt.mesh_leader import MeshLeader
 from brilliant_mqtt.model import BrilliantDevice
 from brilliant_mqtt.motion_derive import MotionDeriver
 from brilliant_mqtt.mqttio import AioMqttAdapter
-from brilliant_mqtt.protocols import BusClient
+from brilliant_mqtt.protocols import BusClient, CommandSubscribeError
 from brilliant_mqtt.retained_topics import RetainedLedgerError, RetainedTopicLedger
 from brilliant_mqtt.scene_bridge import SceneBridge
 

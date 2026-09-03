@@ -14,8 +14,6 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 
-from aiomqtt import MqttError
-
 from brilliant_mqtt import __version__
 from brilliant_mqtt.commands import VarSet, translate_aux, translate_command
 from brilliant_mqtt.desired_state import RECONCILED_VARS, DesiredState
@@ -98,10 +96,6 @@ class WriteThrottle:
 
 class HotPollReadTimeout(RuntimeError):
     """A hot-poll snapshot read missed its panel RPC deadline."""
-
-
-class CommandSubscribeError(RuntimeError):
-    """A command-topic SUBSCRIBE failed at the MQTT layer (e.g. no SUBACK) (#76)."""
 
 
 def _encode_fields(fields: dict[str, object]) -> str:
@@ -320,12 +314,7 @@ class Bridge:
                 topic = self._command_topic_for(device.peripheral_id, descriptor)
                 if topic is None or topic in self._subscribed:
                     continue
-                try:
-                    await self._mqtt.subscribe(topic)
-                except MqttError as error:
-                    # Typed so the run loop can grant a periodic resync one
-                    # retry instead of rebuilding the whole session (#76).
-                    raise CommandSubscribeError(f"subscribe failed for {topic}: {error}") from error
+                await self._mqtt.subscribe(topic)
                 self._subscribed.add(topic)
 
         logger.info(

@@ -17,13 +17,13 @@ import logging
 from pathlib import Path
 
 import pytest
-from aiomqtt import MqttError
 
 from brilliant_mqtt import __version__
-from brilliant_mqtt.bridge import Bridge, CommandSubscribeError, _state_payload
+from brilliant_mqtt.bridge import Bridge, _state_payload
 from brilliant_mqtt.commands import VarSet
 from brilliant_mqtt.mapping import payload_fields
 from brilliant_mqtt.model import BrilliantDevice, DeviceKind, Variable
+from brilliant_mqtt.protocols import CommandSubscribeError
 from brilliant_mqtt.retained_topics import RetainedTopicLedger
 from tests.fakes import FakeBus, FakeClock, FakeMqtt, FakeSleeper
 
@@ -2354,10 +2354,12 @@ class TestReconcileSubscribeDedupe:
 
         assert sorted(mqtt.subscriptions) == sorted(first)
 
-    async def test_mqtt_error_on_subscribe_is_a_command_subscribe_error_naming_topic(
+    async def test_command_subscribe_error_does_not_mark_topic_subscribed(
         self, dimmer: BrilliantDevice
     ) -> None:
-        cause = MqttError("Operation timed out")
+        cause = CommandSubscribeError(
+            f"subscribe failed for brilliant/{PANEL}/gangbox_peripheral_0/set"
+        )
         bus = FakeBus([dimmer])
         mqtt = _FlakySubscribeMqtt([cause])
         bridge = Bridge(bus, mqtt, PANEL)
@@ -2366,14 +2368,14 @@ class TestReconcileSubscribeDedupe:
             await bridge.reconcile()
 
         assert f"brilliant/{PANEL}/gangbox_peripheral_0/set" in str(raised.value)
-        assert raised.value.__cause__ is cause
+        assert raised.value is cause
         assert mqtt.subscriptions == []
 
     async def test_failed_subscribe_is_retried_by_the_next_reconcile(
         self, dimmer: BrilliantDevice
     ) -> None:
         bus = FakeBus([dimmer])
-        mqtt = _FlakySubscribeMqtt([MqttError("Operation timed out")])
+        mqtt = _FlakySubscribeMqtt([CommandSubscribeError("Operation timed out")])
         bridge = Bridge(bus, mqtt, PANEL)
         with pytest.raises(CommandSubscribeError):
             await bridge.reconcile()
