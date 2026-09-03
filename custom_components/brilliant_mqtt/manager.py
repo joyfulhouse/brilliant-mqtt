@@ -13,13 +13,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 import asyncssh
 from homeassistant.components import mqtt, persistent_notification
@@ -103,7 +104,21 @@ LegacyAsyncsshShell = _LegacyAsyncsshShell
 
 _LOGGER = logging.getLogger(__name__)
 
+# Which operation armed the recovery timer, so its escalation reason names the
+# real preceding action (#77 honesty): a repair with no update must not claim one.
+_RecoveryOrigin = Literal["update", "repair"]
+
 _RECOVERY_SECONDS = 60.0
+# One bounded extension when the broker saw the bridge trying to come back (an
+# LWT, an availability change, a meta publish) but it is not online yet: weak-Wi-Fi
+# panels routinely need more than _RECOVERY_SECONDS to settle after a restart (#77).
+_RECOVERY_EXTENSION_SECONDS = 90.0
+# The agent's only panel-library import is ``lib.message_bus_api...RPCObserver``
+# (bus.load_rpc_observer_class). A journal line pairing an import/attribute error
+# with that library or class is the bus-lib API-drift signature; nothing else is.
+_BUS_LIB_DRIFT_SIGNATURE = re.compile(
+    r"(?:ImportError|ModuleNotFoundError|AttributeError).*(?:message_bus_api|RPCObserver)"
+)
 _UNREACHABLE_RECHECK_SECONDS = 300.0
 _LEGACY_RETIRE_TIMEOUT_SECONDS = 30.0
 _SHELL_CLOSE_TIMEOUT_SECONDS = 5.0
@@ -248,6 +263,15 @@ class PanelManager:
         self._unsubs: list[Any] = []
         self._grace_cancel: CALLBACK_TYPE | None = None
         self._recovery_cancel: CALLBACK_TYPE | None = None
+        self._recovery_activity = False
+        self._recovery_window = _RECOVERY_SECONDS
+        self._recovery_origin: _RecoveryOrigin = "update"
+        # Monotonic marker of the current recovery window. A running _recovery_timeout
+        # captures it before its SSH/journal await and defers if it changed — a fresh
+        # window superseded this one. The nullable _recovery_cancel handle cannot serve
+        # this role: a fresh _recovery_timeout nulls it at its own entry before taking
+        # the ssh lock, which would fool a stale timeout into a second escalation.
+        self._recovery_generation = 0
         self._last_repair_mono: float | None = None
         self._repairing = False
         self._abandoned_close_tasks: set[asyncio.Task[None]] = set()
@@ -758,6 +782,10 @@ class PanelManager:
         except (TypeError, UnicodeDecodeError):
             _LOGGER.warning("%s: discarded invalid bridge availability payload", self.panel)
             payload = None
+        else:
+            # Any decodable LWT/availability publish is the bridge (or its broker
+            # session) showing signs of life; undecodable bytes prove nothing.
+            self._recovery_activity = True
         self.availability = payload
         if payload == AVAILABILITY_ONLINE:
             self._cancel("_grace_cancel")
@@ -1112,9 +1140,7 @@ class PanelManager:
                 return  # entry torn down mid-repair: do not re-arm a timer
             if self.problem_reason == _RETAINED_LEDGER_PROBLEM:
                 return  # preserve the storage diagnosis; another restart cannot repair it
-            self._recovery_cancel = async_call_later(
-                self.hass, _RECOVERY_SECONDS, self._recovery_timeout
-            )
+            self._arm_recovery("repair")
         finally:
             self._repairing = False
 
@@ -1219,12 +1245,9 @@ class PanelManager:
                 return  # entry torn down mid-update: do not re-arm a timer
             if self.problem_reason == _RETAINED_LEDGER_PROBLEM:
                 return  # healthy bridge meta, not a generic timeout, must clear this fault
-            # Cancel any prior recovery handle (e.g. a repair's, if this update lands in
-            # its window) BEFORE re-arming, so the old TimerHandle can't be orphaned.
-            self._cancel("_recovery_cancel")
-            self._recovery_cancel = async_call_later(
-                self.hass, _RECOVERY_SECONDS, self._recovery_timeout
-            )
+            # _arm_recovery cancels any prior pending recovery handle itself, so a repair's
+            # timer (if this update lands in its window) can't be orphaned.
+            self._arm_recovery("update")
         finally:
             self._repairing = False
 
@@ -1644,7 +1667,23 @@ class PanelManager:
                 ) from None
         self._notify()
 
+    def _arm_recovery(self, origin: _RecoveryOrigin) -> None:
+        """Start the post-restart window that decides repair_succeeded vs escalation."""
+        # Cancel any prior pending recovery handle FIRST, so re-arming from either
+        # direction (a repair inside an update's window, or an update inside a repair's)
+        # can never orphan the earlier TimerHandle — an orphan survives async_shutdown
+        # and fires _recovery_timeout on a torn-down entry.
+        self._cancel("_recovery_cancel")
+        self._recovery_generation += 1
+        self._recovery_activity = False
+        self._recovery_window = _RECOVERY_SECONDS
+        self._recovery_origin = origin
+        self._recovery_cancel = async_call_later(
+            self.hass, _RECOVERY_SECONDS, self._recovery_timeout
+        )
+
     async def _recovery_timeout(self, _now: datetime) -> None:
+        my_generation = self._recovery_generation
         self._recovery_cancel = None
         if self._shutting_down:
             return
@@ -1652,12 +1691,33 @@ class PanelManager:
             return
         if self.availability == AVAILABILITY_ONLINE:
             return
+        if self._recovery_activity and self._recovery_window == _RECOVERY_SECONDS:
+            # The bridge is visibly trying (LWT/meta traffic) but not online yet —
+            # typically a slow weak-Wi-Fi reconnect. Wait once more, then judge.
+            self._recovery_window += _RECOVERY_EXTENSION_SECONDS
+            _LOGGER.info(
+                "%s: bridge not back after %.0f s but the broker saw activity; waiting %.0f s more",
+                self.panel,
+                _RECOVERY_SECONDS,
+                _RECOVERY_EXTENSION_SECONDS,
+            )
+            self._recovery_cancel = async_call_later(
+                self.hass, _RECOVERY_EXTENSION_SECONDS, self._recovery_timeout
+            )
+            return
+        # Snapshot the window/origin THIS timeout is judging BEFORE the awaits below.
+        # A repair/update landing during the SSH block calls _arm_recovery, mutating
+        # self._recovery_window/_recovery_origin; building the reason from the live
+        # attributes afterwards would misattribute this expiry to the new arm's origin.
+        window = self._recovery_window
+        origin = self._recovery_origin
+        journal = ""
         try:
             async with self._ssh_lock:
                 shell = self._shell()
                 await shell.connect()
                 try:
-                    await panel_ops.collect_journal(shell, 50)
+                    journal = await panel_ops.collect_journal(shell, 50)
                 finally:
                     await shell.close()
         except (OSError, asyncssh.Error, PanelOpError):
@@ -1672,15 +1732,29 @@ class PanelManager:
             or self.availability == AVAILABILITY_ONLINE
         ):
             return
+        # A fresh recovery window armed during the await (an update/repair landed):
+        # defer to it rather than escalating this now-superseded window's expiry.
+        # Gate on the monotonic generation, NOT on _recovery_cancel: a fresh
+        # _recovery_timeout nulls that handle at its own entry before taking the ssh
+        # lock, so a nulled handle no longer proves this window is still current.
+        if my_generation != self._recovery_generation:
+            return
         self._fire(EVENT_REPAIR_FAILED, {"reason": "still_offline"})
-        self._escalate(
-            "repair ran but the bridge did not come back — probable bus-lib API drift "
-            "after the firmware update; the agent needs a code fix"
-        )
+        reason = f"bridge did not come back within {window:.0f} s after the {origin}"
+        if _BUS_LIB_DRIFT_SIGNATURE.search(journal):
+            # Only the journal can tell a slow reconnect from a broken agent; the
+            # raw journal text itself stays on this side (never exported). Name the
+            # real origin — a repair-origin drift must not falsely blame firmware.
+            reason += (
+                "; the panel journal shows a bus-lib import/attribute failure "
+                f"(probable API drift after the {origin}; the agent needs a code fix)"
+            )
+        self._escalate(reason)
 
     async def _on_meta(self, msg: ReceiveMessage) -> None:
         if self._shutting_down:
             return  # defense-in-depth: don't spawn a staged-copy task on a dead entry
+        self._recovery_activity = True
         try:
             meta = json.loads(decode_mqtt_payload(msg.payload))
         except (TypeError, ValueError):

@@ -141,7 +141,7 @@ def _problem_reason_diagnostics(value: object) -> str | None:
         ("panel repair step failed", "repair_step_failed"),
         ("agent update", "agent_update_failed"),
         ("agent uninstall", "agent_uninstall_failed"),
-        ("repair ran but the bridge did not come back", "repair_recovery_timeout"),
+        ("bridge did not come back within", "repair_recovery_timeout"),
         ("agent retained-topic ownership ledger", "retained_ledger"),
     ):
         if value.startswith(prefix):

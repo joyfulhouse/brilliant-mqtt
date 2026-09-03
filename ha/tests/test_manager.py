@@ -344,6 +344,385 @@ async def test_invalid_bytes_after_update_cannot_preserve_stale_online(
     assert manager.problem is True
 
 
+_NEUTRAL_RECOVERY_REASON = "bridge did not come back within 60 s after the update"
+_EXTENDED_RECOVERY_REASON = "bridge did not come back within 150 s after the update"
+
+
+async def _update_and_arm_recovery(manager: PanelManager, shell: FakeShell) -> None:
+    """Run update.install so the production arm site starts the recovery timer."""
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
+        await manager.async_update_agent()
+    assert manager._recovery_cancel is not None
+
+
+async def _repair_and_arm_recovery(manager: PanelManager, shell: FakeShell) -> None:
+    """Run a successful repair so the production arm site starts the recovery timer."""
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
+        await manager.async_repair(trigger="button")
+    assert manager._recovery_cancel is not None
+
+
+async def test_recovery_timeout_without_activity_escalates_neutral_reason(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """(a) #77: still offline at 60 s with a silent broker → escalate, no API-drift claim."""
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    manager = _legacy_manager(hass, entry)
+    manager.availability = "offline"
+    events = _capture_events(hass)
+    shell = FakeShell()
+    await _update_and_arm_recovery(manager, shell)
+
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
+        async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=61))
+        await hass.async_block_till_done()
+    recovery_cancel = manager._recovery_cancel
+    await manager.async_shutdown()
+
+    assert recovery_cancel is None
+    assert manager.problem is True
+    assert manager.problem_reason == _NEUTRAL_RECOVERY_REASON
+    assert "API drift" not in manager.problem_reason
+    assert _types(events)[-2:] == ["repair_failed", "needs_attention"]
+
+
+async def test_recovery_extends_once_on_activity_then_online_succeeds(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """(b) #77: an offline LWT inside the window buys one extension; online at 90 s wins."""
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    manager = _legacy_manager(hass, entry)
+    manager.availability = "offline"
+    events = _capture_events(hass)
+    shell = FakeShell()
+    await _update_and_arm_recovery(manager, shell)
+
+    await manager._on_availability(_availability_message("offline"))
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
+        async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=61))
+        await hass.async_block_till_done()
+    extended = manager._recovery_cancel
+    problem_after_first_window = manager.problem
+
+    await manager._on_availability(_availability_message("online"))
+    await manager.async_shutdown()
+
+    assert extended is not None
+    assert problem_after_first_window is False
+    assert manager._recovery_cancel is None
+    assert _timer_cancelled(extended) is True
+    assert "needs_attention" not in _types(events)
+    assert _types(events)[-1] == "repair_succeeded"
+
+
+async def test_recovery_extension_is_bounded_then_escalates_with_full_window(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """(c) #77: a meta publish extends once; further activity cannot extend again."""
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    manager = _legacy_manager(hass, entry)
+    manager.availability = "offline"
+    events = _capture_events(hass)
+    shell = FakeShell()
+    await _update_and_arm_recovery(manager, shell)
+
+    await manager._on_meta(
+        ReceiveMessage(
+            topic="brilliant/office/bridge",
+            payload='{"agent_version":"0.9.1"}',
+            qos=0,
+            retain=False,
+            subscribed_topic="brilliant/office/bridge",
+            timestamp=dt_util.utcnow().timestamp(),
+        )
+    )
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
+        async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=61))
+        await hass.async_block_till_done()
+        extended = manager._recovery_cancel
+        # Activity during the extension must not buy a second one.
+        await manager._on_availability(_availability_message("offline"))
+        async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=61 + 91))
+        await hass.async_block_till_done()
+    recovery_cancel = manager._recovery_cancel
+    await manager.async_shutdown()
+
+    assert extended is not None
+    assert recovery_cancel is None
+    assert manager.problem is True
+    assert manager.problem_reason == _EXTENDED_RECOVERY_REASON
+    assert _types(events).count("needs_attention") == 1
+    assert _types(events)[-2:] == ["repair_failed", "needs_attention"]
+
+
+async def test_repair_recovery_timeout_escalates_repair_accurate_reason(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """#77 honesty: a repair with NO preceding update must escalate 'after the repair'.
+
+    The recovery timer is shared with the update path, whose neutral reason says
+    'after the update'. A repair-armed timeout must not claim a phantom update.
+    """
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    manager = _legacy_manager(hass, entry)
+    manager.availability = "offline"
+    events = _capture_events(hass)
+    shell = FakeShell()
+    await _repair_and_arm_recovery(manager, shell)
+
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
+        async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=61))
+        await hass.async_block_till_done()
+    await manager.async_shutdown()
+
+    assert manager.problem is True
+    assert manager.problem_reason == "bridge did not come back within 60 s after the repair"
+    assert "after the update" not in manager.problem_reason
+    assert _types(events)[-2:] == ["repair_failed", "needs_attention"]
+
+
+async def test_recovery_timeout_defers_to_window_rearmed_during_journal_await(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """#77 race: a fresh window armed during the SSH/journal await must not be escalated over.
+
+    The repair's 60 s timeout fires and enters the SSH/journal block. While it awaits,
+    an update lands and calls _arm_recovery('update'), opening a NEW window. The stale
+    repair timeout must (a) not escalate — a fresh window is now live — and (b) not build
+    its reason from the new arm's origin/window (which would falsely say 'after the update'
+    for the repair's expiry). We assert no escalation fired and the fresh window's
+    origin/window are uncorrupted.
+    """
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    manager = _legacy_manager(hass, entry)
+    manager.availability = "offline"
+    events = _capture_events(hass)
+    shell = FakeShell()
+    # A repair's window is expiring (origin=repair); drive _recovery_timeout directly so
+    # the only real timer in flight is the fresh one _arm_recovery opens mid-await.
+    manager._recovery_origin = "repair"
+
+    def _rearm_update_window(*_args: object, **_kwargs: object) -> str:
+        # An update lands mid-await and opens a fresh recovery window (origin=update).
+        manager._arm_recovery("update")
+        return "Traceback (most recent call last):\n  ...\nTimeoutError: bus stream\n"
+
+    with (
+        patch.object(manager, "_shell", return_value=shell),
+        patch.object(panel_ops, "collect_journal", side_effect=_rearm_update_window),
+    ):
+        await manager._recovery_timeout(dt_util.utcnow())
+
+    fresh_window = manager._recovery_cancel
+    await manager.async_shutdown()
+
+    # The stale repair timeout deferred to the fresh update window — no escalation.
+    assert manager.problem is False
+    assert manager.problem_reason is None
+    assert "needs_attention" not in _types(events)
+    assert "repair_failed" not in _types(events)
+    # The re-armed window's own state is intact (not consumed by the stale timeout).
+    assert fresh_window is not None
+    # cast defeats mypy's literal-narrowing from the direct assignment above; the value
+    # is genuinely re-set by _arm_recovery('update') inside the patched journal await.
+    assert cast(str, manager._recovery_origin) == "update"
+    assert manager._recovery_window == 60.0
+
+
+async def test_recovery_timeout_defers_when_fresh_timer_fired_during_await(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """#77 race (codex): a fresh timer that FIRES mid-await must not double-escalate.
+
+    The `_recovery_cancel is not None` deferral is insufficient: a FRESH
+    `_recovery_timeout` nulls `_recovery_cancel` at its own entry (manager.py:1664)
+    BEFORE it takes the ssh lock. So the sequence is:
+      (1) the stale timeout fires and enters the SSH/journal await;
+      (2) an update/repair arms a fresh window (`_arm_recovery` sets `_recovery_cancel`);
+      (3) the fresh 60 s timer fires DURING the stale await -> its `_recovery_timeout`
+          clears `_recovery_cancel = None` at entry;
+      (4) the stale timeout finishes, sees `_recovery_cancel is None`, and escalates —
+          then the fresh window ALSO escalates on its own expiry -> TWO escalations.
+    A monotonic generation counter (not the nullable handle) must gate the defer, so
+    the stale window steps aside and EXACTLY ONE escalation (the fresh window's) fires.
+    """
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    manager = _legacy_manager(hass, entry)
+    manager.availability = "offline"
+    events = _capture_events(hass)
+    shell = FakeShell()
+    # A repair's window is expiring (origin=repair); drive _recovery_timeout directly.
+    manager._recovery_origin = "repair"
+
+    def _fresh_window_arms_and_its_timer_fires(*_args: object, **_kwargs: object) -> str:
+        # (2) a fresh window arms during the stale await, then (3) its own timer fires:
+        # the fresh _recovery_timeout nulls _recovery_cancel at entry BEFORE taking the
+        # ssh lock. The stale timeout still holds the lock, so we cannot reentrantly run
+        # the fresh body here; we replicate the exact state its entry leaves behind — a
+        # fresh generation armed AND _recovery_cancel nulled — which is all the stale
+        # guard observes. The fresh window's real timer (armed below) still fires later.
+        manager._arm_recovery("update")
+        manager._recovery_cancel = None
+        return "boot: system starting normally\n"
+
+    with (
+        patch.object(manager, "_shell", return_value=shell),
+        patch.object(
+            panel_ops, "collect_journal", side_effect=_fresh_window_arms_and_its_timer_fires
+        ),
+    ):
+        await manager._recovery_timeout(dt_util.utcnow())  # the STALE timeout
+
+    # (4) the stale timeout must DEFER to the fresh generation, not escalate on the
+    # nulled handle. Under the old `is not None` guard it escalated here (RED).
+    assert "repair_failed" not in _types(events)
+    assert "needs_attention" not in _types(events)
+    assert manager.problem is False
+    assert manager.problem_reason is None
+
+    # The fresh window remains live and escalates EXACTLY once on its own expiry.
+    with (
+        patch.object(manager, "_shell", return_value=shell),
+        patch.object(panel_ops, "collect_journal", return_value="boot: system starting normally\n"),
+    ):
+        async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=61))
+        await hass.async_block_till_done()
+    await manager.async_shutdown()
+
+    assert _types(events).count("repair_failed") == 1
+    assert _types(events).count("needs_attention") == 1
+    assert manager.problem is True
+    assert manager.problem_reason == "bridge did not come back within 60 s after the update"
+
+
+async def test_recovery_timeout_drift_suffix_names_repair_origin_not_firmware(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """#77 honesty: a repair-origin drift escalation must NOT claim a firmware update.
+
+    The bus-lib drift suffix previously hardcoded 'after the firmware update' regardless
+    of origin, so a repair that hits the drift signature would falsely blame firmware —
+    the same dishonesty #77 removes. The suffix must be origin-aware.
+    """
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    manager = _legacy_manager(hass, entry)
+    manager.availability = "offline"
+    shell = FakeShell()
+    manager._recovery_origin = "repair"
+    drift = (
+        "Traceback (most recent call last):\n  ...\n"
+        "ModuleNotFoundError: No module named 'lib.message_bus_api'\n"
+    )
+
+    with (
+        patch.object(manager, "_shell", return_value=shell),
+        patch.object(panel_ops, "collect_journal", return_value=drift),
+    ):
+        await manager._recovery_timeout(dt_util.utcnow())
+
+    assert manager.problem is True
+    assert manager.problem_reason is not None
+    assert manager.problem_reason.startswith(
+        "bridge did not come back within 60 s after the repair"
+    )
+    assert "API drift" in manager.problem_reason
+    assert "firmware update" not in manager.problem_reason
+
+
+@pytest.mark.parametrize(
+    "journal",
+    [
+        "ImportError: cannot import name 'RPCObserver' "
+        "from 'lib.message_bus_api.observer_interface'",
+        "ModuleNotFoundError: No module named 'lib.message_bus_api'",
+        "AttributeError: 'RPCObserver' object has no attribute 'get_all_peripherals'",
+    ],
+)
+async def test_recovery_timeout_names_api_drift_only_with_journal_signature(
+    hass: HomeAssistant,
+    journal: str,
+) -> None:
+    """(d) #77: API drift is claimed only when the journal shows the bus-lib failure."""
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    manager = _legacy_manager(hass, entry)
+    manager.availability = "offline"
+    shell = FakeShell()
+
+    with (
+        patch.object(manager, "_shell", return_value=shell),
+        patch.object(
+            panel_ops,
+            "collect_journal",
+            return_value=f"Traceback (most recent call last):\n  ...\n{journal}\n",
+        ),
+    ):
+        await manager._recovery_timeout(dt_util.utcnow())
+
+    assert manager.problem is True
+    assert manager.problem_reason is not None
+    assert manager.problem_reason.startswith(_NEUTRAL_RECOVERY_REASON)
+    assert "API drift" in manager.problem_reason
+    assert journal not in manager.problem_reason
+
+
+@pytest.mark.parametrize(
+    "journal",
+    [
+        # An import failure, but from an unrelated library — not the bus lib.
+        "ImportError: cannot import name 'foo' from 'unrelated_lib'",
+        # A generic timeout traceback with none of the bus-lib signature tokens.
+        "TimeoutError: bus notification stream read timed out",
+        # ModuleNotFoundError for something other than message_bus_api.
+        "ModuleNotFoundError: No module named 'json'",
+    ],
+)
+async def test_recovery_timeout_omits_api_drift_for_non_signature_journal(
+    hass: HomeAssistant,
+    journal: str,
+) -> None:
+    """(d) negative: a non-bus-lib traceback must NOT claim API drift.
+
+    Guards the drift signature against a regex-broadening mutant (e.g. dropping the
+    `(?:message_bus_api|RPCObserver)` group): such a mutant would match these generic
+    tracebacks and wrongly append the drift suffix, so this test kills it.
+    """
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    manager = _legacy_manager(hass, entry)
+    manager.availability = "offline"
+    shell = FakeShell()
+
+    with (
+        patch.object(manager, "_shell", return_value=shell),
+        patch.object(
+            panel_ops,
+            "collect_journal",
+            return_value=f"Traceback (most recent call last):\n  ...\n{journal}\n",
+        ),
+    ):
+        await manager._recovery_timeout(dt_util.utcnow())
+
+    assert manager.problem is True
+    assert manager.problem_reason is not None
+    assert manager.problem_reason.startswith(_NEUTRAL_RECOVERY_REASON)
+    assert "API drift" not in manager.problem_reason
+
+
 @pytest.mark.parametrize(
     ("availability", "problem", "reason", "notifications"),
     (
@@ -1399,6 +1778,49 @@ async def test_update_during_repair_recovery_window_leaks_no_timer(
     assert manager._recovery_cancel is not prior_recovery  # a fresh handle
     assert _timer_cancelled(manager._recovery_cancel) is False  # the update's timer is live
     assert manager._grace_cancel is None
+
+    # Shutdown cancels the one live timer; the strict guard proves nothing lingers.
+    await manager.async_shutdown()
+    assert manager._recovery_cancel is None
+
+
+async def test_repair_during_update_recovery_window_leaks_no_timer(
+    hass: HomeAssistant, payload_dir: Path
+) -> None:
+    """C1 (reversed): a repair inside an update's recovery window must not orphan a timer.
+
+    The mirror of test_update_during_repair_recovery_window_leaks_no_timer. An update
+    completes with its recovery timer pending; a Repair then lands inside that window and
+    re-arms _recovery_cancel. Unless the re-arm cancels the prior handle FIRST, the
+    update's live TimerHandle is overwritten and survives async_shutdown (which cancels
+    only the current handle), firing _recovery_timeout on a torn-down entry. Moving the
+    cancel into _arm_recovery itself closes both directions; here we prove the update's
+    handle is cancelled and exactly one live recovery timer (the repair's) remains.
+    """
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    manager = _legacy_manager(hass, entry)
+
+    # First a clean update so we are genuinely inside its recovery window.
+    update_shell = FakeShell()
+    await _update_and_arm_recovery(manager, update_shell)
+    prior_recovery = manager._recovery_cancel
+    assert prior_recovery is not None  # recovery timer armed by the update
+    assert _timer_cancelled(prior_recovery) is False  # the update's timer is live
+
+    # Now a repair lands inside that window and re-arms recovery.
+    repair_shell = FakeShell()
+    with patch(
+        "custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=repair_shell
+    ):
+        await manager.async_repair(trigger="button")
+
+    # The update's recovery handle was cancelled before the repair re-armed, so exactly
+    # ONE live recovery timer remains (the repair's, a NEW handle) — no orphan.
+    assert _timer_cancelled(prior_recovery) is True  # old timer killed, not orphaned
+    assert manager._recovery_cancel is not None
+    assert manager._recovery_cancel is not prior_recovery  # a fresh handle
+    assert _timer_cancelled(manager._recovery_cancel) is False  # the repair's timer is live
 
     # Shutdown cancels the one live timer; the strict guard proves nothing lingers.
     await manager.async_shutdown()
