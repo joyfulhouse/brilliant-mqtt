@@ -135,6 +135,17 @@ def _safe_failure_summary(summary: str, error: BaseException | None = None) -> s
     return summary
 
 
+def _log_connect_failure(panel: str, error: OSError | asyncssh.Error) -> None:
+    """Log the connect exception type and operator-safe diagnostic fields."""
+    details = f"{error.errno} {error.strerror}" if isinstance(error, OSError) else str(error)
+    _LOGGER.warning(
+        "%s: panel connect failed: %s %s",
+        panel,
+        type(error).__name__,
+        details,
+    )
+
+
 @callback
 def async_delete_panel_issues(hass: HomeAssistant, management_id: str) -> None:
     """Delete every repair issue owned by one removed panel runtime."""
@@ -1164,6 +1175,7 @@ class PanelManager:
                         translation_domain=DOMAIN, translation_key="host_key_changed"
                     ) from None
                 except (OSError, asyncssh.Error) as err:
+                    _log_connect_failure(self.panel, err)
                     summary = _safe_failure_summary(
                         "agent update could not connect to the panel",
                         err,
@@ -1236,6 +1248,7 @@ class PanelManager:
                     translation_domain=DOMAIN, translation_key="host_key_changed"
                 ) from None
             except (OSError, asyncssh.Error) as err:
+                _log_connect_failure(self.panel, err)
                 summary = _safe_failure_summary(
                     "agent uninstall could not connect to the panel",
                     err,
@@ -1296,6 +1309,7 @@ class PanelManager:
                     translation_domain=DOMAIN, translation_key="host_key_changed"
                 ) from None
             except (OSError, asyncssh.Error) as err:
+                _log_connect_failure(self.panel, err)
                 summary = _safe_failure_summary(
                     "panel reboot could not connect to the panel",
                     err,
@@ -1359,6 +1373,7 @@ class PanelManager:
                     translation_domain=DOMAIN, translation_key="host_key_changed"
                 ) from None
             except (OSError, asyncssh.Error) as err:
+                _log_connect_failure(self.panel, err)
                 summary = _safe_failure_summary(
                     "voice satellite could not connect to the panel",
                     err,
