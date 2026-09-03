@@ -357,6 +357,15 @@ async def _update_and_arm_recovery(
     assert manager._recovery_cancel is not None
 
 
+async def _repair_and_arm_recovery(
+    hass: HomeAssistant, manager: PanelManager, shell: FakeShell
+) -> None:
+    """Run a successful repair so the production arm site starts the recovery timer."""
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
+        await manager.async_repair(trigger="button")
+    assert manager._recovery_cancel is not None
+
+
 async def test_recovery_timeout_without_activity_escalates_neutral_reason(
     hass: HomeAssistant,
     payload_dir: Path,
@@ -453,6 +462,34 @@ async def test_recovery_extension_is_bounded_then_escalates_with_full_window(
     assert manager.problem is True
     assert manager.problem_reason == _EXTENDED_RECOVERY_REASON
     assert _types(events).count("needs_attention") == 1
+    assert _types(events)[-2:] == ["repair_failed", "needs_attention"]
+
+
+async def test_repair_recovery_timeout_escalates_repair_accurate_reason(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """#77 honesty: a repair with NO preceding update must escalate 'after the repair'.
+
+    The recovery timer is shared with the update path, whose neutral reason says
+    'after the update'. A repair-armed timeout must not claim a phantom update.
+    """
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    manager = _legacy_manager(hass, entry)
+    manager.availability = "offline"
+    events = _capture_events(hass)
+    shell = FakeShell()
+    await _repair_and_arm_recovery(hass, manager, shell)
+
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
+        async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=61))
+        await hass.async_block_till_done()
+    await manager.async_shutdown()
+
+    assert manager.problem is True
+    assert manager.problem_reason == "bridge did not come back within 60 s after the repair"
+    assert "after the update" not in manager.problem_reason
     assert _types(events)[-2:] == ["repair_failed", "needs_attention"]
 
 

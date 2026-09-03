@@ -20,7 +20,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 import asyncssh
 from homeassistant.components import mqtt, persistent_notification
@@ -103,6 +103,10 @@ AsyncsshShell = _StrictAsyncsshShell
 LegacyAsyncsshShell = _LegacyAsyncsshShell
 
 _LOGGER = logging.getLogger(__name__)
+
+# Which operation armed the recovery timer, so its escalation reason names the
+# real preceding action (#77 honesty): a repair with no update must not claim one.
+_RecoveryOrigin = Literal["update", "repair"]
 
 _RECOVERY_SECONDS = 60.0
 # One bounded extension when the broker saw the bridge trying to come back (an
@@ -250,6 +254,7 @@ class PanelManager:
         self._recovery_cancel: CALLBACK_TYPE | None = None
         self._recovery_activity = False
         self._recovery_window = _RECOVERY_SECONDS
+        self._recovery_origin: _RecoveryOrigin = "update"
         self._last_repair_mono: float | None = None
         self._repairing = False
         self._abandoned_close_tasks: set[asyncio.Task[None]] = set()
@@ -1118,7 +1123,7 @@ class PanelManager:
                 return  # entry torn down mid-repair: do not re-arm a timer
             if self.problem_reason == _RETAINED_LEDGER_PROBLEM:
                 return  # preserve the storage diagnosis; another restart cannot repair it
-            self._arm_recovery()
+            self._arm_recovery("repair")
         finally:
             self._repairing = False
 
@@ -1225,7 +1230,7 @@ class PanelManager:
             # Cancel any prior recovery handle (e.g. a repair's, if this update lands in
             # its window) BEFORE re-arming, so the old TimerHandle can't be orphaned.
             self._cancel("_recovery_cancel")
-            self._arm_recovery()
+            self._arm_recovery("update")
         finally:
             self._repairing = False
 
@@ -1642,10 +1647,11 @@ class PanelManager:
                 ) from None
         self._notify()
 
-    def _arm_recovery(self) -> None:
+    def _arm_recovery(self, origin: _RecoveryOrigin) -> None:
         """Start the post-restart window that decides repair_succeeded vs escalation."""
         self._recovery_activity = False
         self._recovery_window = _RECOVERY_SECONDS
+        self._recovery_origin = origin
         self._recovery_cancel = async_call_later(
             self.hass, _RECOVERY_SECONDS, self._recovery_timeout
         )
@@ -1694,7 +1700,10 @@ class PanelManager:
         ):
             return
         self._fire(EVENT_REPAIR_FAILED, {"reason": "still_offline"})
-        reason = f"bridge did not come back within {self._recovery_window:.0f} s after the update"
+        reason = (
+            f"bridge did not come back within {self._recovery_window:.0f} s "
+            f"after the {self._recovery_origin}"
+        )
         if _BUS_LIB_DRIFT_SIGNATURE.search(journal):
             # Only the journal can tell a slow reconnect from a broken agent; the
             # raw journal text itself stays on this side (never exported).
