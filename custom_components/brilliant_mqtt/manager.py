@@ -1682,6 +1682,12 @@ class PanelManager:
                 self.hass, _RECOVERY_EXTENSION_SECONDS, self._recovery_timeout
             )
             return
+        # Snapshot the window/origin THIS timeout is judging BEFORE the awaits below.
+        # A repair/update landing during the SSH block calls _arm_recovery, mutating
+        # self._recovery_window/_recovery_origin; building the reason from the live
+        # attributes afterwards would misattribute this expiry to the new arm's origin.
+        window = self._recovery_window
+        origin = self._recovery_origin
         journal = ""
         try:
             async with self._ssh_lock:
@@ -1703,17 +1709,19 @@ class PanelManager:
             or self.availability == AVAILABILITY_ONLINE
         ):
             return
+        # A fresh recovery window armed during the await (an update/repair landed):
+        # defer to it rather than escalating this now-superseded window's expiry.
+        if self._recovery_cancel is not None:
+            return
         self._fire(EVENT_REPAIR_FAILED, {"reason": "still_offline"})
-        reason = (
-            f"bridge did not come back within {self._recovery_window:.0f} s "
-            f"after the {self._recovery_origin}"
-        )
+        reason = f"bridge did not come back within {window:.0f} s after the {origin}"
         if _BUS_LIB_DRIFT_SIGNATURE.search(journal):
             # Only the journal can tell a slow reconnect from a broken agent; the
-            # raw journal text itself stays on this side (never exported).
+            # raw journal text itself stays on this side (never exported). Name the
+            # real origin — a repair-origin drift must not falsely blame firmware.
             reason += (
                 "; the panel journal shows a bus-lib import/attribute failure "
-                "(probable API drift after the firmware update; the agent needs a code fix)"
+                f"(probable API drift after the {origin}; the agent needs a code fix)"
             )
         self._escalate(reason)
 

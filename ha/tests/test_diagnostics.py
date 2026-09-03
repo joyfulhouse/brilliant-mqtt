@@ -497,6 +497,8 @@ async def test_diagnostics_missing_control_runtime_values_are_none(
         ("panel repair step failed", "repair_step_failed"),
         ("agent update could not connect", "agent_update_failed"),
         ("agent uninstall completed but close was unverified", "agent_uninstall_failed"),
+        ("bridge did not come back within 60 s after the update", "repair_recovery_timeout"),
+        ("bridge did not come back within 150 s after the repair", "repair_recovery_timeout"),
     ],
 )
 async def test_diagnostics_never_export_raw_panel_problem_text(

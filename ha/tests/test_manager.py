@@ -493,6 +493,92 @@ async def test_repair_recovery_timeout_escalates_repair_accurate_reason(
     assert _types(events)[-2:] == ["repair_failed", "needs_attention"]
 
 
+async def test_recovery_timeout_defers_to_window_rearmed_during_journal_await(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """#77 race: a fresh window armed during the SSH/journal await must not be escalated over.
+
+    The repair's 60 s timeout fires and enters the SSH/journal block. While it awaits,
+    an update lands and calls _arm_recovery('update'), opening a NEW window. The stale
+    repair timeout must (a) not escalate — a fresh window is now live — and (b) not build
+    its reason from the new arm's origin/window (which would falsely say 'after the update'
+    for the repair's expiry). We assert no escalation fired and the fresh window's
+    origin/window are uncorrupted.
+    """
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    manager = _legacy_manager(hass, entry)
+    manager.availability = "offline"
+    events = _capture_events(hass)
+    shell = FakeShell()
+    # A repair's window is expiring (origin=repair); drive _recovery_timeout directly so
+    # the only real timer in flight is the fresh one _arm_recovery opens mid-await.
+    manager._recovery_origin = "repair"
+
+    def _rearm_update_window(*_args: object, **_kwargs: object) -> str:
+        # An update lands mid-await and opens a fresh recovery window (origin=update).
+        manager._arm_recovery("update")
+        return "Traceback (most recent call last):\n  ...\nTimeoutError: bus stream\n"
+
+    with (
+        patch.object(manager, "_shell", return_value=shell),
+        patch.object(panel_ops, "collect_journal", side_effect=_rearm_update_window),
+    ):
+        await manager._recovery_timeout(dt_util.utcnow())
+
+    fresh_window = manager._recovery_cancel
+    await manager.async_shutdown()
+
+    # The stale repair timeout deferred to the fresh update window — no escalation.
+    assert manager.problem is False
+    assert manager.problem_reason is None
+    assert "needs_attention" not in _types(events)
+    assert "repair_failed" not in _types(events)
+    # The re-armed window's own state is intact (not consumed by the stale timeout).
+    assert fresh_window is not None
+    # cast defeats mypy's literal-narrowing from the direct assignment above; the value
+    # is genuinely re-set by _arm_recovery('update') inside the patched journal await.
+    assert cast(str, manager._recovery_origin) == "update"
+    assert manager._recovery_window == 60.0
+
+
+async def test_recovery_timeout_drift_suffix_names_repair_origin_not_firmware(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """#77 honesty: a repair-origin drift escalation must NOT claim a firmware update.
+
+    The bus-lib drift suffix previously hardcoded 'after the firmware update' regardless
+    of origin, so a repair that hits the drift signature would falsely blame firmware —
+    the same dishonesty #77 removes. The suffix must be origin-aware.
+    """
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    manager = _legacy_manager(hass, entry)
+    manager.availability = "offline"
+    shell = FakeShell()
+    manager._recovery_origin = "repair"
+    drift = (
+        "Traceback (most recent call last):\n  ...\n"
+        "ModuleNotFoundError: No module named 'lib.message_bus_api'\n"
+    )
+
+    with (
+        patch.object(manager, "_shell", return_value=shell),
+        patch.object(panel_ops, "collect_journal", return_value=drift),
+    ):
+        await manager._recovery_timeout(dt_util.utcnow())
+
+    assert manager.problem is True
+    assert manager.problem_reason is not None
+    assert manager.problem_reason.startswith(
+        "bridge did not come back within 60 s after the repair"
+    )
+    assert "API drift" in manager.problem_reason
+    assert "firmware update" not in manager.problem_reason
+
+
 @pytest.mark.parametrize(
     "journal",
     [
