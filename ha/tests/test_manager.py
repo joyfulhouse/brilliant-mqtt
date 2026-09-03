@@ -348,18 +348,14 @@ _NEUTRAL_RECOVERY_REASON = "bridge did not come back within 60 s after the updat
 _EXTENDED_RECOVERY_REASON = "bridge did not come back within 150 s after the update"
 
 
-async def _update_and_arm_recovery(
-    hass: HomeAssistant, manager: PanelManager, shell: FakeShell
-) -> None:
+async def _update_and_arm_recovery(manager: PanelManager, shell: FakeShell) -> None:
     """Run update.install so the production arm site starts the recovery timer."""
     with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
         await manager.async_update_agent()
     assert manager._recovery_cancel is not None
 
 
-async def _repair_and_arm_recovery(
-    hass: HomeAssistant, manager: PanelManager, shell: FakeShell
-) -> None:
+async def _repair_and_arm_recovery(manager: PanelManager, shell: FakeShell) -> None:
     """Run a successful repair so the production arm site starts the recovery timer."""
     with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
         await manager.async_repair(trigger="button")
@@ -377,7 +373,7 @@ async def test_recovery_timeout_without_activity_escalates_neutral_reason(
     manager.availability = "offline"
     events = _capture_events(hass)
     shell = FakeShell()
-    await _update_and_arm_recovery(hass, manager, shell)
+    await _update_and_arm_recovery(manager, shell)
 
     with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
         async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=61))
@@ -403,7 +399,7 @@ async def test_recovery_extends_once_on_activity_then_online_succeeds(
     manager.availability = "offline"
     events = _capture_events(hass)
     shell = FakeShell()
-    await _update_and_arm_recovery(hass, manager, shell)
+    await _update_and_arm_recovery(manager, shell)
 
     await manager._on_availability(_availability_message("offline"))
     with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
@@ -434,7 +430,7 @@ async def test_recovery_extension_is_bounded_then_escalates_with_full_window(
     manager.availability = "offline"
     events = _capture_events(hass)
     shell = FakeShell()
-    await _update_and_arm_recovery(hass, manager, shell)
+    await _update_and_arm_recovery(manager, shell)
 
     await manager._on_meta(
         ReceiveMessage(
@@ -480,7 +476,7 @@ async def test_repair_recovery_timeout_escalates_repair_accurate_reason(
     manager.availability = "offline"
     events = _capture_events(hass)
     shell = FakeShell()
-    await _repair_and_arm_recovery(hass, manager, shell)
+    await _repair_and_arm_recovery(manager, shell)
 
     with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
         async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=61))
@@ -1763,7 +1759,7 @@ async def test_repair_during_update_recovery_window_leaks_no_timer(
 
     # First a clean update so we are genuinely inside its recovery window.
     update_shell = FakeShell()
-    await _update_and_arm_recovery(hass, manager, update_shell)
+    await _update_and_arm_recovery(manager, update_shell)
     prior_recovery = manager._recovery_cancel
     assert prior_recovery is not None  # recovery timer armed by the update
     assert _timer_cancelled(prior_recovery) is False  # the update's timer is live
