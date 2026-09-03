@@ -1154,6 +1154,50 @@ async def test_agent_update_step_failure_escalates_and_raises(
     assert await hass.config_entries.async_unload(entry.entry_id)
 
 
+@pytest.mark.parametrize(
+    ("connect_error", "expected_diagnostic"),
+    [
+        (OSError(113, "No route to host"), "OSError 113 No route to host"),
+        (
+            asyncssh.KeyExchangeFailed("key exchange failed"),
+            "KeyExchangeFailed key exchange failed",
+        ),
+    ],
+)
+async def test_agent_update_connect_failure_logs_diagnostics_without_changing_repair(
+    hass: HomeAssistant,
+    payload_dir: Path,
+    caplog: pytest.LogCaptureFixture,
+    connect_error: OSError | asyncssh.Error,
+    expected_diagnostic: str,
+) -> None:
+    """Connect failures retain the fixed Repair while logging their safe type details."""
+    from homeassistant.helpers import issue_registry as ir
+
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    manager = _legacy_manager(hass, entry)
+    caplog.set_level(logging.WARNING, logger="custom_components.brilliant_mqtt.manager")
+
+    with (
+        patch.object(manager, "_connect_for_repair", side_effect=connect_error),
+        pytest.raises(HomeAssistantError) as raised,
+    ):
+        await manager.async_update_agent()
+
+    reason = "agent update could not connect to the panel"
+    issue = ir.async_get(hass).async_get_issue(DOMAIN, manager._issue_id)
+    assert issue is not None
+    assert manager.problem_reason == reason
+    assert issue.translation_placeholders == {"panel": "office", "reason": reason}
+    assert raised.value.translation_placeholders == {"error": reason}
+    expected_message = f"office: panel connect failed: {expected_diagnostic}"
+    assert any(
+        record.levelno == logging.WARNING and record.getMessage() == expected_message
+        for record in caplog.records
+    )
+
+
 async def test_agent_update_failure_redacts_every_outward_surface(
     hass: HomeAssistant,
     payload_dir: Path,
