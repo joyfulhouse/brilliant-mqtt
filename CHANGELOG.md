@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Ring live-view bus stalls no longer trigger eager agent session rebuilds.**
+  Periodic resync reads now get one retry 30 seconds after a timeout, and a due
+  resync is deferred while a hot-poll stall backoff is active. A first hot-poll
+  timeout suppresses further hot polls for 30 seconds while command handling
+  and the stale-stream watchdog remain active. A second consecutive read miss
+  still rebuilds the session. (#83)
+
 ## [0.9.2] - 2026-09-03
 
 The on-panel agent and Home Assistant integration move to 0.9.2. Update every

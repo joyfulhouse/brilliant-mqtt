@@ -39,6 +39,11 @@ _BACKOFF_S = 5
 _LEDGER_BACKOFF_S = 60.0
 # Loop tick when the hot poll is disabled (stale checks still need a cadence).
 _IDLE_TICK_S = 30.0
+# Version 0.9.2 detected a dead bus in roughly 1.5 hot-poll cycles (~12-20s,
+# cadence-dependent). This quiet period moves detection to ~30s plus one poll
+# cycle and read deadline (~40-45s). The stale-stream watchdog keeps running,
+# but its 900s default means hot polling remains the first detector.
+_HOT_POLL_TIMEOUT_BACKOFF_S = 30.0
 
 # The virtual bus device carrying whole-home mesh loads. Published under the
 # reserved "mesh" pseudo-panel by the elected leader, never the panel bridge.
@@ -258,7 +263,9 @@ async def _run_session(
 
         tick = settings.hot_poll_seconds if settings.hot_poll_seconds > 0 else _IDLE_TICK_S
         next_resync = time.monotonic() + settings.resync_seconds
-        consecutive_hot_poll_timeouts = 0
+        # Set after a first hot-poll read timeout: the earliest monotonic time
+        # the single retry may run. None means no retry is pending.
+        hot_poll_retry_at: float | None = None
         consecutive_resync_failures = 0
         while True:
             await asyncio.sleep(tick)
@@ -294,7 +301,9 @@ async def _run_session(
 
             # Hot poll: bounds state staleness at the poll cadence; the
             # bridge's diff cache keeps unchanged payloads off MQTT.
-            if settings.hot_poll_seconds > 0:
+            if settings.hot_poll_seconds > 0 and (
+                hot_poll_retry_at is None or time.monotonic() >= hot_poll_retry_at
+            ):
                 try:
                     try:
                         devices = await bus.get_all(
@@ -311,28 +320,43 @@ async def _run_session(
                     if scene_bridge is not None:
                         await scene_bridge.poll_executions(devices)
                 except HotPollReadTimeout:
-                    if consecutive_hot_poll_timeouts >= 1:
+                    # A timeout on the retry itself is the second consecutive
+                    # miss: rebuild the session.
+                    if hot_poll_retry_at is not None:
                         raise
-                    consecutive_hot_poll_timeouts = 1
+                    hot_poll_retry_at = time.monotonic() + _HOT_POLL_TIMEOUT_BACKOFF_S
                     log.warning(
-                        "hot poll bus read timed out; retrying once before rebuilding session"
+                        "hot poll bus read timed out; backing off for %.0fs before retrying once",
+                        _HOT_POLL_TIMEOUT_BACKOFF_S,
                     )
                     # Treat panel + elected-mesh polling as one atomic health
-                    # cycle. Do not run a due reconcile after a partial read.
+                    # cycle. Leave a due resync deferred while this known-stall
+                    # retry remains pending instead of spending resync strikes.
                     continue
                 else:
                     # Only a fully successful combined cycle earns fresh grace.
-                    consecutive_hot_poll_timeouts = 0
+                    hot_poll_retry_at = None
 
             # Periodic level-triggered resync: republishes retained discovery
             # + state, covering any push notifications that were missed.
-            # A single missed SUBACK gets one retry on the next tick — the
-            # same grace as the hot poll — before the session is rebuilt (#76).
-            if time.monotonic() >= next_resync:
+            # A single missed bus read retries after the bounded stall window;
+            # a missed SUBACK retains its next-tick retry from #76. A due resync
+            # stays deferred while a hot-poll retry marks the bus known-stalled.
+            if hot_poll_retry_at is None and time.monotonic() >= next_resync:
                 try:
                     await panel_bridge.reconcile()
                     if participating and leader.is_leader:
                         await mesh_bridge.reconcile()
+                except (TimeoutError, asyncio.TimeoutError):
+                    if consecutive_resync_failures >= 1:
+                        raise
+                    consecutive_resync_failures = 1
+                    next_resync = time.monotonic() + _HOT_POLL_TIMEOUT_BACKOFF_S
+                    log.warning(
+                        "resync bus read timed out; backing off for %.0fs before retrying once",
+                        _HOT_POLL_TIMEOUT_BACKOFF_S,
+                    )
+                    continue
                 except CommandSubscribeError as error:
                     if consecutive_resync_failures >= 1:
                         raise
