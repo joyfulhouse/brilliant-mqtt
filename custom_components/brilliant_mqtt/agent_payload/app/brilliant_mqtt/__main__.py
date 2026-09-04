@@ -39,9 +39,10 @@ _BACKOFF_S = 5
 _LEDGER_BACKOFF_S = 60.0
 # Loop tick when the hot poll is disabled (stale checks still need a cadence).
 _IDLE_TICK_S = 30.0
-# Quiet period after the first hot-poll read timeout. This moves dead-bus
-# detection through hot polling from about 10s to about 35s; the stale-stream
-# watchdog still covers stream death and keeps running while polls are skipped.
+# Version 0.9.2 detected a dead bus in roughly 1.5 hot-poll cycles (~12-20s,
+# cadence-dependent). This quiet period moves detection to ~30s plus one poll
+# cycle and read deadline (~40-45s). The stale-stream watchdog keeps running,
+# but its 900s default means hot polling remains the first detector.
 _HOT_POLL_TIMEOUT_BACKOFF_S = 30.0
 
 # The virtual bus device carrying whole-home mesh loads. Published under the
@@ -329,7 +330,8 @@ async def _run_session(
                         _HOT_POLL_TIMEOUT_BACKOFF_S,
                     )
                     # Treat panel + elected-mesh polling as one atomic health
-                    # cycle. Do not run a due reconcile after a partial read.
+                    # cycle. Leave a due resync deferred while this known-stall
+                    # retry remains pending instead of spending resync strikes.
                     continue
                 else:
                     # Only a fully successful combined cycle earns fresh grace.
@@ -337,10 +339,10 @@ async def _run_session(
 
             # Periodic level-triggered resync: republishes retained discovery
             # + state, covering any push notifications that were missed.
-            # A single missed bus read or SUBACK gets one retry on the next
-            # tick — the same grace as the hot poll — before the session is
-            # rebuilt (#76, #83).
-            if time.monotonic() >= next_resync:
+            # A single missed bus read retries after the bounded stall window;
+            # a missed SUBACK retains its next-tick retry from #76. A due resync
+            # stays deferred while a hot-poll retry marks the bus known-stalled.
+            if hot_poll_retry_at is None and time.monotonic() >= next_resync:
                 try:
                     await panel_bridge.reconcile()
                     if participating and leader.is_leader:
@@ -349,8 +351,10 @@ async def _run_session(
                     if consecutive_resync_failures >= 1:
                         raise
                     consecutive_resync_failures = 1
+                    next_resync = time.monotonic() + _HOT_POLL_TIMEOUT_BACKOFF_S
                     log.warning(
-                        "resync bus read timed out; retrying once before rebuilding session"
+                        "resync bus read timed out; backing off for %.0fs before retrying once",
+                        _HOT_POLL_TIMEOUT_BACKOFF_S,
                     )
                     continue
                 except CommandSubscribeError as error:

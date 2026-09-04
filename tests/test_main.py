@@ -1323,12 +1323,96 @@ class TestResyncSubscribePolicy:
 
 
 class TestResyncReadTimeoutPolicy:
+    async def test_due_resync_waits_for_active_hot_poll_backoff(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        harness = _SessionHarness(
+            monkeypatch,
+            bus_get_all_effects=[TimeoutError("hot poll stalled"), None],
+            bridge_reconcile_effects={"panel": [None, asyncio.CancelledError()]},
+        )
+        settings = _hot_poll_settings(resync_seconds=3, hot_poll_seconds=2.0)
+        clock = _SessionLoopClock()
+        _install_session_loop_clock(monkeypatch, clock)
+
+        with caplog.at_level("WARNING", logger="brilliant_mqtt.__main__"):
+            with pytest.raises(asyncio.CancelledError):
+                await main_mod._run_session(settings, None, None)
+
+        assert clock.now == 32.0
+        assert harness.bus.get_all_calls == [False, False]
+        assert harness.events.count("panel_reconcile") == 2
+        assert not any(message.startswith("resync ") for message in caplog.messages)
+
     @pytest.mark.parametrize(
         "timeout_error",
         [TimeoutError("builtin"), asyncio.TimeoutError()],
         ids=["builtin", "asyncio"],
     )
-    async def test_first_periodic_read_timeout_warns_and_retries_next_tick(
+    async def test_first_periodic_read_timeout_retries_after_backoff(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        timeout_error: BaseException,
+    ) -> None:
+        harness = _SessionHarness(
+            monkeypatch,
+            bridge_reconcile_effects={"panel": [None, timeout_error, asyncio.CancelledError()]},
+        )
+        settings = _hot_poll_settings(resync_seconds=1, hot_poll_seconds=2.0)
+        clock = _SessionLoopClock()
+        _install_session_loop_clock(monkeypatch, clock)
+
+        with caplog.at_level("WARNING", logger="brilliant_mqtt.__main__"):
+            with pytest.raises(asyncio.CancelledError):
+                await main_mod._run_session(settings, None, None)
+
+        assert clock.now == 32.0
+        assert harness.events.count("panel_reconcile") == 3
+        assert (
+            caplog.messages.count(
+                "resync bus read timed out; backing off for 30s before retrying once"
+            )
+            == 1
+        )
+
+    async def test_second_periodic_read_timeout_after_backoff_rebuilds_session(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        first = TimeoutError("first")
+        second = asyncio.TimeoutError()
+        harness = _SessionHarness(
+            monkeypatch,
+            bridge_reconcile_effects={"panel": [None, first, second]},
+        )
+        settings = _hot_poll_settings(resync_seconds=1, hot_poll_seconds=2.0)
+        clock = _SessionLoopClock()
+        _install_session_loop_clock(monkeypatch, clock)
+
+        with caplog.at_level("WARNING", logger="brilliant_mqtt.__main__"):
+            with pytest.raises(asyncio.TimeoutError) as raised:
+                await main_mod._run_session(settings, None, None)
+
+        assert raised.value is second
+        assert clock.now == 32.0
+        assert harness.events.count("panel_reconcile") == 3
+        assert (
+            caplog.messages.count(
+                "resync bus read timed out; backing off for 30s before retrying once"
+            )
+            == 1
+        )
+
+    @pytest.mark.parametrize(
+        "timeout_error",
+        [TimeoutError("builtin"), asyncio.TimeoutError()],
+        ids=["builtin", "asyncio"],
+    )
+    async def test_real_bridge_read_timeout_warns_and_retries_after_backoff(
         self,
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
@@ -1353,7 +1437,7 @@ class TestResyncReadTimeoutPolicy:
         assert harness.bus.get_all_calls == [True, True, True]
         assert (
             caplog.messages.count(
-                "resync bus read timed out; retrying once before rebuilding session"
+                "resync bus read timed out; backing off for 30s before retrying once"
             )
             == 1
         )
@@ -1386,7 +1470,7 @@ class TestResyncReadTimeoutPolicy:
         assert harness.bus.get_all_calls == [True, True, True]
         assert (
             caplog.messages.count(
-                "resync bus read timed out; retrying once before rebuilding session"
+                "resync bus read timed out; backing off for 30s before retrying once"
             )
             == 1
         )
