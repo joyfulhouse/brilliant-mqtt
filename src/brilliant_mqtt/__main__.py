@@ -39,6 +39,10 @@ _BACKOFF_S = 5
 _LEDGER_BACKOFF_S = 60.0
 # Loop tick when the hot poll is disabled (stale checks still need a cadence).
 _IDLE_TICK_S = 30.0
+# Quiet period after the first hot-poll read timeout. This moves dead-bus
+# detection through hot polling from about 10s to about 35s; the stale-stream
+# watchdog still covers stream death and keeps running while polls are skipped.
+_HOT_POLL_TIMEOUT_BACKOFF_S = 30.0
 
 # The virtual bus device carrying whole-home mesh loads. Published under the
 # reserved "mesh" pseudo-panel by the elected leader, never the panel bridge.
@@ -259,6 +263,7 @@ async def _run_session(
         tick = settings.hot_poll_seconds if settings.hot_poll_seconds > 0 else _IDLE_TICK_S
         next_resync = time.monotonic() + settings.resync_seconds
         consecutive_hot_poll_timeouts = 0
+        hot_poll_retry_at = 0.0
         consecutive_resync_failures = 0
         while True:
             await asyncio.sleep(tick)
@@ -294,7 +299,7 @@ async def _run_session(
 
             # Hot poll: bounds state staleness at the poll cadence; the
             # bridge's diff cache keeps unchanged payloads off MQTT.
-            if settings.hot_poll_seconds > 0:
+            if settings.hot_poll_seconds > 0 and time.monotonic() >= hot_poll_retry_at:
                 try:
                     try:
                         devices = await bus.get_all(
@@ -314,8 +319,10 @@ async def _run_session(
                     if consecutive_hot_poll_timeouts >= 1:
                         raise
                     consecutive_hot_poll_timeouts = 1
+                    hot_poll_retry_at = time.monotonic() + _HOT_POLL_TIMEOUT_BACKOFF_S
                     log.warning(
-                        "hot poll bus read timed out; retrying once before rebuilding session"
+                        "hot poll bus read timed out; backing off for %.0fs before retrying once",
+                        _HOT_POLL_TIMEOUT_BACKOFF_S,
                     )
                     # Treat panel + elected-mesh polling as one atomic health
                     # cycle. Do not run a due reconcile after a partial read.
@@ -323,16 +330,26 @@ async def _run_session(
                 else:
                     # Only a fully successful combined cycle earns fresh grace.
                     consecutive_hot_poll_timeouts = 0
+                    hot_poll_retry_at = 0.0
 
             # Periodic level-triggered resync: republishes retained discovery
             # + state, covering any push notifications that were missed.
-            # A single missed SUBACK gets one retry on the next tick — the
-            # same grace as the hot poll — before the session is rebuilt (#76).
+            # A single missed bus read or SUBACK gets one retry on the next
+            # tick — the same grace as the hot poll — before the session is
+            # rebuilt (#76, #83).
             if time.monotonic() >= next_resync:
                 try:
                     await panel_bridge.reconcile()
                     if participating and leader.is_leader:
                         await mesh_bridge.reconcile()
+                except (TimeoutError, asyncio.TimeoutError):
+                    if consecutive_resync_failures >= 1:
+                        raise
+                    consecutive_resync_failures = 1
+                    log.warning(
+                        "resync bus read timed out; retrying once before rebuilding session"
+                    )
+                    continue
                 except CommandSubscribeError as error:
                     if consecutive_resync_failures >= 1:
                         raise

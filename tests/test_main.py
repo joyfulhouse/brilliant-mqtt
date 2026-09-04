@@ -403,6 +403,8 @@ class _SessionBus:
         self.get_device_calls: list[str] = []
         self.write_timeout_latched = False
         self.write_timeout_checks = 0
+        self.last_push_age: float | None = None
+        self.commands: list[tuple[str, str, list[VarSet]]] = []
 
     def on_reconnect(self, callback: Callable[[], Awaitable[None]]) -> None:
         self.events.append("bus_reconnect_callback")
@@ -435,7 +437,7 @@ class _SessionBus:
         return self.snapshot
 
     def seconds_since_last_push(self) -> float | None:
-        return None
+        return self.last_push_age
 
     def recent_reconnects(self, window_seconds: float) -> int:
         del window_seconds
@@ -447,6 +449,15 @@ class _SessionBus:
         self.write_timeout_latched = False
         return latched
 
+    async def set_variables(
+        self,
+        device_id: str,
+        peripheral_id: str,
+        sets: list[VarSet],
+    ) -> str:
+        self.commands.append((device_id, peripheral_id, list(sets)))
+        return "FakeSetVariablesResponse()"
+
 
 class _SessionMqtt:
     def __init__(self, events: list[str]) -> None:
@@ -456,9 +467,14 @@ class _SessionMqtt:
         self.connect_error: Exception | None = None
         self.publish_error: Exception | None = None
         self.subscribe_effects: list[BaseException | None] = []
+        self.command_callbacks: list[Callable[[str, str], Awaitable[None]]] = []
 
     def on_command(self, callback: Callable[[str, str], Awaitable[None]]) -> None:
-        del callback
+        self.command_callbacks.append(callback)
+
+    async def inject_command(self, topic: str, payload: str) -> None:
+        for callback in self.command_callbacks:
+            await callback(topic, payload)
 
     async def connect(self) -> None:
         self.events.append("mqtt_connect")
@@ -638,6 +654,52 @@ def _hot_poll_settings(*, mesh: bool = False, resync_seconds: int = 3_600) -> Se
     return settings
 
 
+class _SessionLoopClock(FakeClock):
+    """Deterministic clock/sleeper for the session coordinator's infinite loop."""
+
+    def __init__(
+        self,
+        *,
+        cancel_on_sleep: int | None = None,
+        on_sleep: Callable[[int], Awaitable[None]] | None = None,
+    ) -> None:
+        super().__init__()
+        self.cancel_on_sleep = cancel_on_sleep
+        self.on_sleep = on_sleep
+        self.sleeps: list[float] = []
+
+    async def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.advance(seconds)
+        sleep_number = len(self.sleeps)
+        if self.on_sleep is not None:
+            await self.on_sleep(sleep_number)
+        if sleep_number == self.cancel_on_sleep:
+            raise asyncio.CancelledError
+        if sleep_number > 100:
+            raise AssertionError("session loop did not reach the expected terminal condition")
+
+
+def _install_session_loop_clock(
+    monkeypatch: pytest.MonkeyPatch,
+    clock: _SessionLoopClock,
+) -> None:
+    monkeypatch.setattr(
+        main_mod,
+        "time",
+        SimpleNamespace(monotonic=clock, time=clock),
+    )
+    monkeypatch.setattr(
+        main_mod,
+        "asyncio",
+        SimpleNamespace(
+            CancelledError=asyncio.CancelledError,
+            TimeoutError=asyncio.TimeoutError,
+            sleep=clock.sleep,
+        ),
+    )
+
+
 class TestSharedHotPollSnapshot:
     async def test_leader_tick_reads_beats_once_and_shares_snapshot(
         self,
@@ -732,9 +794,13 @@ class TestSharedHotPollSnapshot:
             "write_heartbeat",
             lambda path, clock: beats.append(path),
         )
+        settings = _hot_poll_settings(mesh=True)
+        object.__setattr__(settings, "hot_poll_seconds", 2.0)
+        clock = _SessionLoopClock()
+        _install_session_loop_clock(monkeypatch, clock)
 
         with pytest.raises(asyncio.CancelledError):
-            await main_mod._run_session(_hot_poll_settings(mesh=True), None, None)
+            await main_mod._run_session(settings, None, None)
 
         assert harness.bus.get_all_calls == [True, True]
         assert harness.poll_snapshots == {"panel": [], "mesh": []}
@@ -750,9 +816,13 @@ class TestSharedHotPollSnapshot:
             monkeypatch,
             bus_get_all_effects=[first, second],
         )
+        settings = _hot_poll_settings(mesh=True)
+        object.__setattr__(settings, "hot_poll_seconds", 2.0)
+        clock = _SessionLoopClock()
+        _install_session_loop_clock(monkeypatch, clock)
 
         with pytest.raises(HotPollReadTimeout) as raised:
-            await main_mod._run_session(_hot_poll_settings(mesh=True), None, None)
+            await main_mod._run_session(settings, None, None)
 
         assert raised.value.__cause__ is second
         assert harness.bus.get_all_calls == [True, True]
@@ -888,7 +958,115 @@ class TestWriteTimeoutLatchSource:
 
 
 class TestHotPollReadTimeoutPolicy:
-    async def test_first_timeout_gets_one_grace_and_skips_resync(
+    async def test_second_tick_inside_backoff_does_not_retry_or_rebuild(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        first = TimeoutError("first")
+        second = TimeoutError("second")
+        harness = _SessionHarness(
+            monkeypatch,
+            bus_get_all_effects=[first, second],
+        )
+        settings = _hot_poll_settings()
+        object.__setattr__(settings, "hot_poll_seconds", 2.0)
+        clock = _SessionLoopClock(cancel_on_sleep=3)
+        _install_session_loop_clock(monkeypatch, clock)
+
+        with caplog.at_level("WARNING", logger="brilliant_mqtt.__main__"):
+            with pytest.raises(asyncio.CancelledError):
+                await main_mod._run_session(settings, None, None)
+
+        assert harness.bus.get_all_calls == [False]
+        assert harness.bus.get_all_effects == [second]
+        assert clock.now == 6.0
+        assert harness.events[-2:] == ["bus_shutdown", "mqtt_disconnect"]
+
+    async def test_timeout_after_backoff_rebuilds_session(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        first = TimeoutError("first")
+        second = TimeoutError("second")
+        harness = _SessionHarness(
+            monkeypatch,
+            bus_get_all_effects=[first, second],
+        )
+        settings = _hot_poll_settings()
+        object.__setattr__(settings, "hot_poll_seconds", 2.0)
+        clock = _SessionLoopClock()
+        _install_session_loop_clock(monkeypatch, clock)
+
+        with pytest.raises(HotPollReadTimeout) as raised:
+            await main_mod._run_session(settings, None, None)
+
+        assert raised.value.__cause__ is second
+        assert harness.bus.get_all_calls == [False, False]
+        assert clock.now == 32.0
+        assert harness.events[-2:] == ["bus_shutdown", "mqtt_disconnect"]
+
+    async def test_command_is_handled_while_hot_poll_is_backed_off(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        first = TimeoutError("first")
+        second = TimeoutError("second")
+        harness = _SessionHarness(
+            monkeypatch,
+            bus_get_all_effects=[None, first, second],
+            real_bridge=True,
+        )
+        settings = _hot_poll_settings()
+        object.__setattr__(settings, "hot_poll_seconds", 2.0)
+        object.__setattr__(settings, "retained_topics_file", str(tmp_path / "owned.json"))
+        object.__setattr__(settings, "bus_heartbeat_file", "")
+
+        async def inject_on_second_tick(sleep_number: int) -> None:
+            if sleep_number == 2:
+                await harness.mqtt.inject_command(
+                    "brilliant/office/gangbox_peripheral_0/set",
+                    '{"state": "ON"}',
+                )
+
+        clock = _SessionLoopClock(cancel_on_sleep=3, on_sleep=inject_on_second_tick)
+        _install_session_loop_clock(monkeypatch, clock)
+
+        with pytest.raises(asyncio.CancelledError):
+            await main_mod._run_session(settings, None, None)
+
+        assert harness.bus.commands == [("device_001", "gangbox_peripheral_0", [VarSet("on", "1")])]
+        assert harness.bus.get_all_calls == [True, False]
+        assert harness.bus.get_all_effects == [second]
+
+    async def test_stale_watchdog_runs_while_hot_poll_is_backed_off(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        harness = _SessionHarness(
+            monkeypatch,
+            bus_get_all_effects=[TimeoutError("first"), None],
+        )
+        settings = _hot_poll_settings()
+        object.__setattr__(settings, "hot_poll_seconds", 2.0)
+        object.__setattr__(settings, "bus_stale_seconds", 10.0)
+
+        async def mark_stale_on_third_tick(sleep_number: int) -> None:
+            if sleep_number == 3:
+                harness.bus.last_push_age = 11.0
+
+        clock = _SessionLoopClock(on_sleep=mark_stale_on_third_tick)
+        _install_session_loop_clock(monkeypatch, clock)
+
+        with pytest.raises(main_mod.BusStaleError):
+            await main_mod._run_session(settings, None, None)
+
+        assert harness.bus.get_all_calls == [False]
+        assert clock.now == 6.0
+        assert harness.events[-2:] == ["bus_shutdown", "mqtt_disconnect"]
+
+    async def test_first_timeout_gets_one_grace_and_skips_same_tick_resync(
         self,
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
@@ -896,25 +1074,22 @@ class TestHotPollReadTimeoutPolicy:
         timeout = HotPollReadTimeout("private panel detail")
         harness = _SessionHarness(
             monkeypatch,
-            bridge_poll_effects={"panel": [timeout, asyncio.CancelledError()]},
+            bridge_poll_effects={"panel": [timeout]},
         )
+        settings = _hot_poll_settings(resync_seconds=0)
+        object.__setattr__(settings, "hot_poll_seconds", 2.0)
+        clock = _SessionLoopClock(cancel_on_sleep=2)
+        _install_session_loop_clock(monkeypatch, clock)
 
         with caplog.at_level("WARNING", logger="brilliant_mqtt.__main__"):
             with pytest.raises(asyncio.CancelledError):
-                await asyncio.wait_for(
-                    main_mod._run_session(
-                        _hot_poll_settings(resync_seconds=0),
-                        None,
-                        None,
-                    ),
-                    timeout=1,
-                )
+                await main_mod._run_session(settings, None, None)
 
-        assert harness.events.count("panel_poll") == 2
+        assert harness.events.count("panel_poll") == 1
         assert harness.events.count("panel_reconcile") == 1
         assert (
             caplog.messages.count(
-                "hot poll bus read timed out; retrying once before rebuilding session"
+                "hot poll bus read timed out; backing off for 30s before retrying once"
             )
             == 1
         )
@@ -933,12 +1108,13 @@ class TestHotPollReadTimeoutPolicy:
                 "mesh": [first, second],
             },
         )
+        settings = _hot_poll_settings(mesh=True)
+        object.__setattr__(settings, "hot_poll_seconds", 2.0)
+        clock = _SessionLoopClock()
+        _install_session_loop_clock(monkeypatch, clock)
 
         with pytest.raises(HotPollReadTimeout) as raised:
-            await asyncio.wait_for(
-                main_mod._run_session(_hot_poll_settings(mesh=True), None, None),
-                timeout=1,
-            )
+            await main_mod._run_session(settings, None, None)
 
         assert raised.value is second
         poll_events = [event for event in harness.events if event.endswith("_poll")]
@@ -961,13 +1137,14 @@ class TestHotPollReadTimeoutPolicy:
                 ],
             },
         )
+        settings = _hot_poll_settings(mesh=True)
+        object.__setattr__(settings, "hot_poll_seconds", 2.0)
+        clock = _SessionLoopClock()
+        _install_session_loop_clock(monkeypatch, clock)
 
         with caplog.at_level("WARNING", logger="brilliant_mqtt.__main__"):
             with pytest.raises(asyncio.CancelledError):
-                await asyncio.wait_for(
-                    main_mod._run_session(_hot_poll_settings(mesh=True), None, None),
-                    timeout=1,
-                )
+                await main_mod._run_session(settings, None, None)
 
         poll_events = [event for event in harness.events if event.endswith("_poll")]
         assert poll_events == [
@@ -981,7 +1158,7 @@ class TestHotPollReadTimeoutPolicy:
         ]
         assert (
             caplog.messages.count(
-                "hot poll bus read timed out; retrying once before rebuilding session"
+                "hot poll bus read timed out; backing off for 30s before retrying once"
             )
             == 2
         )
@@ -1146,6 +1323,79 @@ class TestResyncSubscribePolicy:
 
         assert raised.value is failure
         assert harness.events.count("panel_reconcile") == 2
+        assert harness.events[-2:] == ["bus_shutdown", "mqtt_disconnect"]
+
+
+class TestResyncReadTimeoutPolicy:
+    @pytest.mark.parametrize(
+        "timeout_error",
+        [TimeoutError("builtin"), asyncio.TimeoutError()],
+        ids=["builtin", "asyncio"],
+    )
+    async def test_first_periodic_read_timeout_warns_and_retries_next_tick(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        timeout_error: BaseException,
+    ) -> None:
+        harness = _SessionHarness(
+            monkeypatch,
+            bus_get_all_effects=[None, timeout_error, None],
+            real_bridge=True,
+        )
+        settings = _hot_poll_settings(resync_seconds=1)
+        object.__setattr__(settings, "hot_poll_seconds", 0.0)
+        object.__setattr__(settings, "retained_topics_file", str(tmp_path / "owned.json"))
+        object.__setattr__(settings, "bus_heartbeat_file", "")
+        clock = _SessionLoopClock(cancel_on_sleep=3)
+        _install_session_loop_clock(monkeypatch, clock)
+
+        with caplog.at_level("WARNING", logger="brilliant_mqtt.__main__"):
+            with pytest.raises(asyncio.CancelledError):
+                await main_mod._run_session(settings, None, None)
+
+        assert harness.bus.get_all_calls == [True, True, True]
+        assert (
+            caplog.messages.count(
+                "resync bus read timed out; retrying once before rebuilding session"
+            )
+            == 1
+        )
+        assert harness.events[-2:] == ["bus_shutdown", "mqtt_disconnect"]
+
+    async def test_two_consecutive_periodic_read_timeouts_rebuild_session(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        first = TimeoutError("first")
+        second = asyncio.TimeoutError()
+        harness = _SessionHarness(
+            monkeypatch,
+            bus_get_all_effects=[None, first, second],
+            real_bridge=True,
+        )
+        settings = _hot_poll_settings(resync_seconds=1)
+        object.__setattr__(settings, "hot_poll_seconds", 0.0)
+        object.__setattr__(settings, "retained_topics_file", str(tmp_path / "owned.json"))
+        object.__setattr__(settings, "bus_heartbeat_file", "")
+        clock = _SessionLoopClock()
+        _install_session_loop_clock(monkeypatch, clock)
+
+        with caplog.at_level("WARNING", logger="brilliant_mqtt.__main__"):
+            with pytest.raises(asyncio.TimeoutError) as raised:
+                await main_mod._run_session(settings, None, None)
+
+        assert raised.value is second
+        assert harness.bus.get_all_calls == [True, True, True]
+        assert (
+            caplog.messages.count(
+                "resync bus read timed out; retrying once before rebuilding session"
+            )
+            == 1
+        )
         assert harness.events[-2:] == ["bus_shutdown", "mqtt_disconnect"]
 
 
