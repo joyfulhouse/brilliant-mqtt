@@ -262,8 +262,9 @@ async def _run_session(
 
         tick = settings.hot_poll_seconds if settings.hot_poll_seconds > 0 else _IDLE_TICK_S
         next_resync = time.monotonic() + settings.resync_seconds
-        consecutive_hot_poll_timeouts = 0
-        hot_poll_retry_at = 0.0
+        # Set after a first hot-poll read timeout: the earliest monotonic time
+        # the single retry may run. None means no retry is pending.
+        hot_poll_retry_at: float | None = None
         consecutive_resync_failures = 0
         while True:
             await asyncio.sleep(tick)
@@ -299,7 +300,9 @@ async def _run_session(
 
             # Hot poll: bounds state staleness at the poll cadence; the
             # bridge's diff cache keeps unchanged payloads off MQTT.
-            if settings.hot_poll_seconds > 0 and time.monotonic() >= hot_poll_retry_at:
+            if settings.hot_poll_seconds > 0 and (
+                hot_poll_retry_at is None or time.monotonic() >= hot_poll_retry_at
+            ):
                 try:
                     try:
                         devices = await bus.get_all(
@@ -316,9 +319,10 @@ async def _run_session(
                     if scene_bridge is not None:
                         await scene_bridge.poll_executions(devices)
                 except HotPollReadTimeout:
-                    if consecutive_hot_poll_timeouts >= 1:
+                    # A timeout on the retry itself is the second consecutive
+                    # miss: rebuild the session.
+                    if hot_poll_retry_at is not None:
                         raise
-                    consecutive_hot_poll_timeouts = 1
                     hot_poll_retry_at = time.monotonic() + _HOT_POLL_TIMEOUT_BACKOFF_S
                     log.warning(
                         "hot poll bus read timed out; backing off for %.0fs before retrying once",
@@ -329,8 +333,7 @@ async def _run_session(
                     continue
                 else:
                     # Only a fully successful combined cycle earns fresh grace.
-                    consecutive_hot_poll_timeouts = 0
-                    hot_poll_retry_at = 0.0
+                    hot_poll_retry_at = None
 
             # Periodic level-triggered resync: republishes retained discovery
             # + state, covering any push notifications that were missed.

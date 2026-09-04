@@ -645,9 +645,14 @@ async def _cancel_ready_session(harness: _SessionHarness, settings: Settings) ->
         await task
 
 
-def _hot_poll_settings(*, mesh: bool = False, resync_seconds: int = 3_600) -> Settings:
+def _hot_poll_settings(
+    *,
+    mesh: bool = False,
+    resync_seconds: int = 3_600,
+    hot_poll_seconds: float = 0.001,
+) -> Settings:
     settings = _settings()
-    object.__setattr__(settings, "hot_poll_seconds", 0.001)
+    object.__setattr__(settings, "hot_poll_seconds", hot_poll_seconds)
     object.__setattr__(settings, "bus_stale_seconds", 0)
     object.__setattr__(settings, "resync_seconds", resync_seconds)
     object.__setattr__(settings, "mesh_priority", 1 if mesh else 0)
@@ -794,8 +799,7 @@ class TestSharedHotPollSnapshot:
             "write_heartbeat",
             lambda path, clock: beats.append(path),
         )
-        settings = _hot_poll_settings(mesh=True)
-        object.__setattr__(settings, "hot_poll_seconds", 2.0)
+        settings = _hot_poll_settings(mesh=True, hot_poll_seconds=2.0)
         clock = _SessionLoopClock()
         _install_session_loop_clock(monkeypatch, clock)
 
@@ -816,8 +820,7 @@ class TestSharedHotPollSnapshot:
             monkeypatch,
             bus_get_all_effects=[first, second],
         )
-        settings = _hot_poll_settings(mesh=True)
-        object.__setattr__(settings, "hot_poll_seconds", 2.0)
+        settings = _hot_poll_settings(mesh=True, hot_poll_seconds=2.0)
         clock = _SessionLoopClock()
         _install_session_loop_clock(monkeypatch, clock)
 
@@ -969,8 +972,7 @@ class TestHotPollReadTimeoutPolicy:
             monkeypatch,
             bus_get_all_effects=[first, second],
         )
-        settings = _hot_poll_settings()
-        object.__setattr__(settings, "hot_poll_seconds", 2.0)
+        settings = _hot_poll_settings(hot_poll_seconds=2.0)
         clock = _SessionLoopClock(cancel_on_sleep=3)
         _install_session_loop_clock(monkeypatch, clock)
 
@@ -993,8 +995,7 @@ class TestHotPollReadTimeoutPolicy:
             monkeypatch,
             bus_get_all_effects=[first, second],
         )
-        settings = _hot_poll_settings()
-        object.__setattr__(settings, "hot_poll_seconds", 2.0)
+        settings = _hot_poll_settings(hot_poll_seconds=2.0)
         clock = _SessionLoopClock()
         _install_session_loop_clock(monkeypatch, clock)
 
@@ -1018,8 +1019,7 @@ class TestHotPollReadTimeoutPolicy:
             bus_get_all_effects=[None, first, second],
             real_bridge=True,
         )
-        settings = _hot_poll_settings()
-        object.__setattr__(settings, "hot_poll_seconds", 2.0)
+        settings = _hot_poll_settings(hot_poll_seconds=2.0)
         object.__setattr__(settings, "retained_topics_file", str(tmp_path / "owned.json"))
         object.__setattr__(settings, "bus_heartbeat_file", "")
 
@@ -1048,8 +1048,7 @@ class TestHotPollReadTimeoutPolicy:
             monkeypatch,
             bus_get_all_effects=[TimeoutError("first"), None],
         )
-        settings = _hot_poll_settings()
-        object.__setattr__(settings, "hot_poll_seconds", 2.0)
+        settings = _hot_poll_settings(hot_poll_seconds=2.0)
         object.__setattr__(settings, "bus_stale_seconds", 10.0)
 
         async def mark_stale_on_third_tick(sleep_number: int) -> None:
@@ -1076,8 +1075,7 @@ class TestHotPollReadTimeoutPolicy:
             monkeypatch,
             bridge_poll_effects={"panel": [timeout]},
         )
-        settings = _hot_poll_settings(resync_seconds=0)
-        object.__setattr__(settings, "hot_poll_seconds", 2.0)
+        settings = _hot_poll_settings(resync_seconds=0, hot_poll_seconds=2.0)
         clock = _SessionLoopClock(cancel_on_sleep=2)
         _install_session_loop_clock(monkeypatch, clock)
 
@@ -1108,8 +1106,7 @@ class TestHotPollReadTimeoutPolicy:
                 "mesh": [first, second],
             },
         )
-        settings = _hot_poll_settings(mesh=True)
-        object.__setattr__(settings, "hot_poll_seconds", 2.0)
+        settings = _hot_poll_settings(mesh=True, hot_poll_seconds=2.0)
         clock = _SessionLoopClock()
         _install_session_loop_clock(monkeypatch, clock)
 
@@ -1137,8 +1134,7 @@ class TestHotPollReadTimeoutPolicy:
                 ],
             },
         )
-        settings = _hot_poll_settings(mesh=True)
-        object.__setattr__(settings, "hot_poll_seconds", 2.0)
+        settings = _hot_poll_settings(mesh=True, hot_poll_seconds=2.0)
         clock = _SessionLoopClock()
         _install_session_loop_clock(monkeypatch, clock)
 
@@ -1344,8 +1340,7 @@ class TestResyncReadTimeoutPolicy:
             bus_get_all_effects=[None, timeout_error, None],
             real_bridge=True,
         )
-        settings = _hot_poll_settings(resync_seconds=1)
-        object.__setattr__(settings, "hot_poll_seconds", 0.0)
+        settings = _hot_poll_settings(resync_seconds=1, hot_poll_seconds=0.0)
         object.__setattr__(settings, "retained_topics_file", str(tmp_path / "owned.json"))
         object.__setattr__(settings, "bus_heartbeat_file", "")
         clock = _SessionLoopClock(cancel_on_sleep=3)
@@ -1377,8 +1372,7 @@ class TestResyncReadTimeoutPolicy:
             bus_get_all_effects=[None, first, second],
             real_bridge=True,
         )
-        settings = _hot_poll_settings(resync_seconds=1)
-        object.__setattr__(settings, "hot_poll_seconds", 0.0)
+        settings = _hot_poll_settings(resync_seconds=1, hot_poll_seconds=0.0)
         object.__setattr__(settings, "retained_topics_file", str(tmp_path / "owned.json"))
         object.__setattr__(settings, "bus_heartbeat_file", "")
         clock = _SessionLoopClock()
