@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-09-05
+
+The on-panel agent and Home Assistant integration versions move to 0.9.3.
+This is an agent-only release; integration code is unchanged. Update every
+panel through its per-panel bridge **Update** entity. The voice payload remains
+at 0.1.1 and is unchanged.
+
 ### Fixed
 
 - **Ring live-view bus stalls no longer trigger eager agent session rebuilds.**
@@ -14,7 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resync is deferred while a hot-poll stall backoff is active. A first hot-poll
   timeout suppresses further hot polls for 30 seconds while command handling
   and the stale-stream watchdog remain active. A second consecutive read miss
-  still rebuilds the session. (#83)
+  still rebuilds the session.
+  ([#84](https://github.com/joyfulhouse/brilliant-mqtt/pull/84);
+  [#83](https://github.com/joyfulhouse/brilliant-mqtt/issues/83))
+  **Operator note:** this bounded grace trades faster recovery from Ring-doorbell
+  live-view popup bus stalls for slower detection of a genuinely dead bus:
+  approximately 40–45 s instead of 12–20 s.
 
 ## [0.9.2] - 2026-09-03
 
@@ -617,7 +629,8 @@ panel redeploy is needed.
 - JoyfulHouse OSS docs standard: LICENSE (MIT), INSTALL.md, CHANGELOG.md,
   FUNDING.yml, CODEOWNERS, and the canonical `docs/` set.
 
-[Unreleased]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.9.2...HEAD
+[Unreleased]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.9.3...HEAD
+[0.9.3]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.8.0...v0.9.0
