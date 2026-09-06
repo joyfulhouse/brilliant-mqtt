@@ -75,11 +75,12 @@ class BusReconnectStormError(RuntimeError):
 class MqttTransportOverloadError(RuntimeError):
     """Inbound MQTT transport backlog exceeded its count/byte bound — shed the
     excess commands and rebuild the session, instead of aiomqtt silently
-    discarding them (#90). This is admission control, not a lossless promise: the
-    broker has already PUBACK'd every QoS-0 inbound, so the excess is genuinely
-    dropped — but observably, via a loud fail + reconnect, not silently. The
-    detached reader task never surfaces this; only the session-loop accessor
-    check does."""
+    discarding them (#90). This is admission control, not a lossless promise:
+    QoS-0 inbound has no broker acknowledgment or retry semantics at all, so a
+    shed message is simply gone — never redelivered by the broker regardless of
+    session persistence. The excess is genuinely dropped, but observably, via a
+    loud fail + reconnect, not silently. The detached reader task never surfaces
+    this; only the session-loop accessor check does."""
 
 
 class _CoalescingCallback:

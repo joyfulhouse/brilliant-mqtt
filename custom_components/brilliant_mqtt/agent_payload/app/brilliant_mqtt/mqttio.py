@@ -312,11 +312,24 @@ class _BoundedTransportQueue(asyncio.Queue[aiomqtt.Message]):
         if _is_latest_wins_topic(topic):
             for index, pending in enumerate(self._queue):
                 if str(pending.topic) == topic:
-                    # Latest-wins: the newest payload supersedes its pending twin
-                    # (mirrors _LaneQueue.put) — replace in place first, so a
-                    # pre-rebuild drain applies the NEWEST value, THEN trip if the
-                    # swap pushed total bytes over budget. Replacing does not grow
-                    # the count backlog, so this never widens the queue.
+                    if item_bytes > self._max_bytes:
+                        # A single latest-wins payload too big to EVER fit the
+                        # budget on its own: refuse it and keep the pending twin,
+                        # so _queued_bytes stays hard-capped at the budget like
+                        # every other admission path (replacing first here could
+                        # overshoot by an arbitrary amount). A message this large
+                        # can never be admitted, so keeping the older value does
+                        # not reintroduce the round-2 stale-payload bug — both are
+                        # discarded on the ensuing rebuild regardless.
+                        self._trip("payload-byte")
+                    # The new payload fits the budget on its own. Latest-wins: it
+                    # supersedes its pending twin (mirrors _LaneQueue.put) —
+                    # replace in place first (count unchanged, so this never
+                    # widens the queue), THEN trip if the CUMULATIVE total now
+                    # exceeds budget. On that trip the new message is KEPT (a
+                    # pre-rebuild drain applies the NEWEST value); what is shed is
+                    # the OLD pending value, despite aiomqtt's generic "Discarding
+                    # message" log framing this as a drop of the new one.
                     self._queued_bytes += item_bytes - _message_bytes(pending)
                     self._queue[index] = item
                     if self._queued_bytes > self._max_bytes:
@@ -774,9 +787,11 @@ class AioMqttAdapter:
         Mirrors :meth:`bus.RpcBusAdapter.consume_write_timeout`: the runner
         checks this each session tick and rebuilds the session when overload is
         latched, turning aiomqtt's silent 'Discarding message' drop into an
-        observable fail + reconnect. The overload SHEDS the excess commands (the
-        broker has already PUBACK'd the QoS-0 inbound, so a reconnect does not
-        redeliver them) and rebuilds — admission control, not a lossless promise.
+        observable fail + reconnect. The overload SHEDS the excess commands
+        (QoS-0 inbound has no broker acknowledgment or retry semantics at all, so
+        a shed message is simply gone — never redelivered on reconnect regardless
+        of session persistence) and rebuilds — admission control, not a lossless
+        promise.
         """
         return self._transport_overload.consume()
 

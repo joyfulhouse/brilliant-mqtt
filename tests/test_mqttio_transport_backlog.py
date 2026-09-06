@@ -193,26 +193,49 @@ def test_non_coalescible_flood_stays_bounded_and_observably_overloads() -> None:
     assert latch.consume() is True
 
 
-# -- Latest-wins replacement over the byte budget keeps the NEWEST -------------
+# -- Latest-wins replacement and the byte budget ------------------------------
 
 
-def test_latest_wins_replacement_over_budget_keeps_newest_then_trips() -> None:
-    """A latest-wins replacement whose newer payload pushes total over the byte
-    budget must keep the NEWEST value (the point of latest-wins) and only THEN
-    trip — a pre-rebuild drain applies the freshest command, not a stale one."""
+def test_latest_wins_replacement_over_cumulative_budget_keeps_newest() -> None:
+    """A latest-wins replacement whose OWN cost fits the budget but pushes the
+    CUMULATIVE total over it keeps the NEWEST value (the point of latest-wins)
+    and only then trips — a pre-rebuild drain applies the freshest command."""
     latch = mqttio._TransportOverloadLatch()
-    small = b"a" * 100
-    big = b"b" * 400
-    # Budget admits the small pending but not the larger replacement.
-    budget = mqttio._message_bytes(_msg(_LIGHT, small)) + 50
+    a_old = _msg(_LIGHT, b"x" * 40)
+    filler = _msg(_MUTE, b"y" * 40)  # non-coalescing: distinct queued work
+    a_new = _msg(_LIGHT, b"z" * 90)  # own cost fits budget; cumulative does not
+    budget = mqttio._message_bytes(filler) + mqttio._message_bytes(a_new) - 1
+    assert mqttio._message_bytes(a_new) <= budget  # the replacement fits on its own
     queue = mqttio._BoundedTransportQueue(maxsize=8, max_bytes=budget, overload=latch)
 
-    queue.put_nowait(_msg(_LIGHT, small))
+    queue.put_nowait(a_old)
+    queue.put_nowait(filler)
     with pytest.raises(asyncio.QueueFull):
-        queue.put_nowait(_msg(_LIGHT, big))  # over budget -> trips
+        queue.put_nowait(a_new)  # cumulative over budget -> trips, newest kept
 
-    assert queue.qsize() == 1  # coalesced in place, not grown
-    assert queue.get_nowait().payload == big  # latest-wins: newest survives
+    assert queue.get_nowait().payload == b"z" * 90  # latest-wins: newest survives
+    assert latch.consume() is True
+
+
+def test_latest_wins_oversized_replacement_refused_without_exceeding_budget() -> None:
+    """A single latest-wins payload whose OWN byte cost exceeds the budget is
+    refused (kept pending) rather than stored-then-tripped, so _queued_bytes
+    stays hard-capped at the budget — a message too big to ever fit cannot
+    overshoot the memory bound by an arbitrary amount (#90)."""
+    latch = mqttio._TransportOverloadLatch()
+    small = _msg(_LIGHT, b"a" * 40)
+    budget = mqttio._message_bytes(small) + 50
+    queue = mqttio._BoundedTransportQueue(maxsize=8, max_bytes=budget, overload=latch)
+
+    queue.put_nowait(small)
+    baseline = queue.queued_bytes
+    huge = _msg(_LIGHT, b"z" * (budget * 4))  # own cost alone dwarfs the budget
+    with pytest.raises(asyncio.QueueFull):
+        queue.put_nowait(huge)
+
+    assert queue.queued_bytes <= budget  # hard cap held — no arbitrary overshoot
+    assert queue.queued_bytes == baseline  # oversized item never stored
+    assert queue.get_nowait().payload == b"a" * 40  # pending twin kept
     assert latch.consume() is True
 
 
