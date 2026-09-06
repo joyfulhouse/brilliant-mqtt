@@ -42,9 +42,15 @@ class _Bus:
 
 
 class _Mqtt:
-    def __init__(self, connect_error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        connect_error: Exception | None = None,
+        subscribe_error: Exception | None = None,
+    ) -> None:
         self.connect_error = connect_error
+        self.subscribe_error = subscribe_error
         self.connect_calls = 0
+        self.subscribe_calls = 0
 
     async def connect(self) -> None:
         self.connect_calls += 1
@@ -63,12 +69,24 @@ class _Mqtt:
     ) -> None:
         del topic, payload, retain, qos
 
+    def on_command(self, callback: Callable[[str, str], Awaitable[None]]) -> None:
+        del callback
+
+    async def subscribe(self, topic: str) -> None:
+        del topic
+        self.subscribe_calls += 1
+        if self.subscribe_error is not None:
+            raise self.subscribe_error
+
 
 class _NoopBridge:
     def __init__(self, *args: object, **kwargs: object) -> None:
         del args, kwargs
 
     async def reconcile(self) -> None:
+        return
+
+    async def withdraw(self) -> None:
         return
 
 
@@ -83,7 +101,7 @@ class _ReadOnceBridge:
         raise asyncio.CancelledError
 
 
-def _settings(tmp_path: Path) -> Settings:
+def _settings(tmp_path: Path, mesh_priority: int = 0) -> Settings:
     return Settings(
         panel="office",
         mqtt_host="broker",
@@ -92,6 +110,7 @@ def _settings(tmp_path: Path) -> Settings:
         retained_topics_file=str(tmp_path / "owned-topics.json"),
         bus_heartbeat_file=str(tmp_path / "bus-heartbeat"),
         bus_phase_file=str(tmp_path / "bus-phase"),
+        mesh_priority=mesh_priority,
     )
 
 
@@ -124,6 +143,35 @@ async def test_broker_outage_never_qualifies_as_a_bus_wedge(
     assert confirmed is False
     assert not should_reboot(
         age=1900.0,
+        stale_after=1800.0,
+        bridge_active=True,
+        gateway_up=True,
+        bus_confirmed=confirmed,
+    )
+
+
+async def test_mesh_election_failure_stays_pre_bus_despite_mqtt_connect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A mesh-election join failure is an MQTT/mesh-side startup failure, not
+    a bus failure — it must not leave the phase stamped "bus" even though
+    mqtt.connect() already succeeded (issue #87 acceptance: distinguish
+    explicit local bus failure from inability to reach MQTT)."""
+    bus = _Bus()
+    mqtt = _Mqtt(subscribe_error=ConnectionError("mesh claim subscribe failed"))
+    settings = _settings(tmp_path, mesh_priority=1)
+    _install_session_fakes(monkeypatch, bus, mqtt)
+
+    with pytest.raises(ConnectionError, match="mesh claim subscribe failed"):
+        await main_mod._run_session(settings, None, None)
+
+    confirmed = bus_confirmed(settings.bus_phase_file)
+    assert mqtt.connect_calls == 1
+    assert mqtt.subscribe_calls == 1
+    assert bus.start_calls == 0
+    assert confirmed is False
+    assert not should_reboot(
+        age=99_999.0,
         stale_after=1800.0,
         bridge_active=True,
         gateway_up=True,
@@ -183,6 +231,12 @@ async def test_sustained_bus_handshake_failure_still_uses_reboot_guard(
     decision = should_reboot(
         age=age,
         stale_after=1800.0,
+        # Assumes the systemd supervisor's restart backoff keeps
+        # brilliant-mqtt.service reported "active" through repeated
+        # in-process bus-handshake failures — see the finally-block comment
+        # in __main__.py about backoff being far shorter than stale_after.
+        # This test exercises the predicate's boolean math only; it does not
+        # exercise systemd's actual crash-loop/backoff behavior end to end.
         bridge_active=True,
         gateway_up=True,
         bus_confirmed=confirmed,

@@ -253,11 +253,18 @@ async def _run_session(
 
         await mqtt.connect()
         mqtt_connected = True
-        write_phase(settings.bus_phase_file, "bus")
         if participating:
             # Join the election before bus data flows; the FIRST mesh
             # reconcile is acquisition's job (on_acquire), not startup's.
             await leader.start()
+        # Stamped right at the local-bus handshake boundary: a failure here
+        # (or in bus.start() itself) is a genuine bus-side failure and must
+        # leave the phase at "bus" (contract: sustained handshake failures
+        # still qualify for the reboot guard). Anything that fails BEFORE
+        # this line — mqtt.connect(), the mesh-election join — is an
+        # MQTT/mesh-side startup failure, not a bus failure, and must leave
+        # the phase at "pre_bus".
+        write_phase(settings.bus_phase_file, "bus")
         await bus.start()
         if scene_bridge is not None:
             await scene_bridge.async_start()

@@ -21,6 +21,24 @@ _last_attempt: dict[str, float] = {}
 BusPhase = Literal["pre_bus", "bus"]
 
 
+def _atomic_write(path: str, text: str) -> None:
+    """Write *text* into *path* via tmp-file + ``os.replace``.
+
+    Both heartbeat and phase files live under the same runtime directory
+    (tmpfs, e.g. ``/run/brilliant-mqtt/``), which may not exist yet on first
+    boot — creating the parent here is deliberate for both callers, not an
+    accident of one writer. Raises ``OSError`` on failure; callers decide
+    whether/how to swallow it.
+    """
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
 def write_heartbeat(
     path: str,
     clock: Callable[[], float],
@@ -38,13 +56,7 @@ def write_heartbeat(
         return
     _last_attempt[path] = now
     try:
-        parent = os.path.dirname(path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        tmp = f"{path}.tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(f"{clock()}")
-        os.replace(tmp, path)
+        _atomic_write(path, f"{clock()}")
     except OSError:
         logger.debug("heartbeat write failed for %s", path, exc_info=True)
 
@@ -54,12 +66,6 @@ def write_phase(path: str, phase: BusPhase) -> None:
     if not path:
         return
     try:
-        parent = os.path.dirname(path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        tmp = f"{path}.tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(phase)
-        os.replace(tmp, path)
+        _atomic_write(path, phase)
     except OSError:
         logger.debug("bus phase write failed for %s", path, exc_info=True)
