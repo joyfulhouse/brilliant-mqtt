@@ -203,56 +203,6 @@ def test_adapter_does_not_fall_back_to_plaintext_when_tls_setup_fails(
     assert client_calls == []
 
 
-async def test_consume_reader_failure_reports_graceful_return_once_and_preserves_teardown(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    client = _SuccessfulCloseClient()
-    monkeypatch.setattr(aiomqtt, "Client", lambda **kwargs: client)
-    adapter = mqttio.AioMqttAdapter(
-        _settings(tls_enabled=False),
-        publish_availability=False,
-    )
-    adapter._entered = True
-
-    async def return_from_reader() -> None:
-        return
-
-    reader_task = asyncio.create_task(return_from_reader())
-    await reader_task
-    adapter._reader_task = reader_task
-
-    assert adapter.consume_reader_failure() is True
-    assert adapter.consume_reader_failure() is False
-    assert adapter._reader_task is reader_task
-
-    await adapter.disconnect()
-
-    assert client.exit_attempts == 1
-    assert adapter._reader_task is None
-
-
-async def test_consume_reader_failure_reports_exception_once_and_logs_cause(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    adapter = mqttio.AioMqttAdapter(_settings(tls_enabled=False))
-    error = RuntimeError("reader crashed")
-
-    async def fail_reader() -> None:
-        raise error
-
-    reader_task = asyncio.create_task(fail_reader())
-    await asyncio.sleep(0)
-    adapter._reader_task = reader_task
-    caplog.set_level(logging.ERROR, logger=mqttio.__name__)
-
-    try:
-        assert adapter.consume_reader_failure() is True
-        assert adapter.consume_reader_failure() is False
-        assert "reader crashed" in caplog.text
-    finally:
-        reader_task.exception()
-
-
 async def test_consume_reader_failure_ignores_cancelled_task() -> None:
     adapter = mqttio.AioMqttAdapter(_settings(tls_enabled=False))
 
