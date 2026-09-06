@@ -10,6 +10,7 @@ cancellation-shield semantics.
 from __future__ import annotations
 
 import asyncio
+import logging
 import ssl
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -19,6 +20,7 @@ import pytest
 from paho.mqtt.packettypes import PacketTypes
 from paho.mqtt.reasoncodes import ReasonCode
 
+from brilliant_mqtt import mqttio
 from brilliant_mqtt.config import Settings
 from brilliant_mqtt.mqttio import AioMqttAdapter, build_tls_context
 from brilliant_mqtt.protocols import CommandSubscribeError
@@ -27,6 +29,11 @@ from brilliant_mqtt.protocols import CommandSubscribeError
 async def _empty_messages() -> AsyncIterator[object]:
     return
     yield  # pragma: no cover - makes this an async generator, never reached
+
+
+async def _raising_messages() -> AsyncIterator[object]:
+    raise RuntimeError("reader crashed")
+    yield  # pragma: no cover - unreachable; makes this an async generator
 
 
 @dataclass
@@ -157,6 +164,47 @@ async def test_disconnect_after_close_is_a_noop() -> None:
     await adapter.disconnect()  # already closed — must not re-run teardown
 
     assert fake.exit_calls == 1
+
+
+async def test_reader_disappearance_after_connect_is_consumed_before_clean_disconnect() -> None:
+    fake = _FakeAiomqttClient()
+    adapter = _adapter(fake, publish_availability=False)
+
+    await adapter.connect()
+    await _wait_until(lambda: adapter._reader_task is not None and adapter._reader_task.done())
+
+    assert adapter.consume_reader_failure() is True
+    assert adapter.consume_reader_failure() is False
+
+    await adapter.disconnect()
+
+    assert fake.enter_calls == 1
+    assert fake.exit_calls == 1
+    assert adapter._reader_task is None
+    assert adapter._closed is True
+
+
+async def test_reader_crash_after_connect_is_consumed_and_logged_before_clean_disconnect(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    fake = _FakeAiomqttClient(messages=_raising_messages())
+    adapter = _adapter(fake, publish_availability=False)
+    caplog.set_level(logging.ERROR, logger=mqttio.__name__)
+
+    await adapter.connect()
+    await _wait_until(lambda: adapter._reader_task is not None and adapter._reader_task.done())
+
+    assert adapter.consume_reader_failure() is True
+    assert adapter.consume_reader_failure() is False
+    assert "MQTT reader task failed" in caplog.text
+    assert "reader crashed" in caplog.text
+
+    await adapter.disconnect()
+
+    assert fake.enter_calls == 1
+    assert fake.exit_calls == 1
+    assert adapter._reader_task is None
+    assert adapter._closed is True
 
 
 # -- checked_disconnect (preflight) vs best-effort (resident) ------------------

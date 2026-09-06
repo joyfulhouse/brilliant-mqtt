@@ -269,6 +269,7 @@ class AioMqttAdapter:
         ] = []
         self._topic_dispatcher = _TopicDispatcher(self._dispatch_inbound)
         self._reader_task: asyncio.Task[None] | None = None
+        self._reader_failure_consumed = False
         self._avail_topic = availability_topic(settings.panel)
         # A distinct broker ClientID is REQUIRED for any second connection on the
         # same panel: two clients sharing an id force the broker to disconnect the
@@ -569,6 +570,23 @@ class AioMqttAdapter:
         return None
 
     # -- MqttClient Protocol -------------------------------------------------
+
+    def consume_reader_failure(self) -> bool:
+        """Return an unexpected reader completion once without clearing its task."""
+        reader_task = self._reader_task
+        if reader_task is None or not reader_task.done() or self._reader_failure_consumed:
+            return False
+        try:
+            error = reader_task.exception()
+        except asyncio.CancelledError:
+            return False
+        self._reader_failure_consumed = True
+        if error is not None:
+            logger.error(
+                "MQTT reader task failed",
+                exc_info=(type(error), error, error.__traceback__),
+            )
+        return True
 
     async def publish(self, topic: str, payload: str, retain: bool = False, qos: int = 0) -> None:
         if qos not in (0, 1, 2):
