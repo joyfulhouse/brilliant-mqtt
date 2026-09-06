@@ -31,12 +31,9 @@ async def _empty_messages() -> AsyncIterator[object]:
     yield  # pragma: no cover - makes this an async generator, never reached
 
 
-def _raising_messages(error: BaseException) -> AsyncIterator[object]:
-    async def _iter() -> AsyncIterator[object]:
-        raise error
-        yield  # pragma: no cover - unreachable; makes this an async generator
-
-    return _iter()
+async def _raising_messages(error: BaseException) -> AsyncIterator[object]:
+    raise error
+    yield  # pragma: no cover - unreachable; makes this an async generator
 
 
 @dataclass
