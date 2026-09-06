@@ -384,6 +384,48 @@ class TestSupervisorBackoff:
 
         assert sleeps == [5]
 
+    async def test_sustained_transport_overload_paces_rebuilds_by_backoff(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A sustained flood raises MqttTransportOverloadError every session; the
+        supervisor gates each rebuild behind the same outer _BACKOFF_S every
+        session-ending fault takes, so the flood cannot spin the rebuild loop
+        unbounded (#90 reconnect-storm concern — no new mechanism needed)."""
+        # The error must be an ordinary Exception so run()'s outer `except
+        # Exception` paces it, rather than a BaseException that would propagate
+        # and kill the supervisor — that pacing is the whole storm defense here.
+        assert issubclass(main_mod.MqttTransportOverloadError, Exception)
+        assert not issubclass(main_mod.MqttTransportOverloadError, asyncio.CancelledError)
+
+        session_calls = 0
+        sleeps: list[float] = []
+
+        async def overloaded_session(
+            settings: Settings,
+            desired_panel: DesiredState | None,
+            desired_mesh: DesiredState | None,
+        ) -> None:
+            del settings, desired_panel, desired_mesh
+            nonlocal session_calls
+            session_calls += 1
+            raise main_mod.MqttTransportOverloadError("transport backlog exceeded")
+
+        async def cancel_on_third_sleep(delay: float) -> None:
+            sleeps.append(delay)
+            if len(sleeps) >= 3:
+                raise asyncio.CancelledError
+
+        monkeypatch.setattr(main_mod, "_run_session", overloaded_session)
+        monkeypatch.setattr(asyncio, "sleep", cancel_on_third_sleep)
+
+        with pytest.raises(asyncio.CancelledError):
+            await main_mod.run(_desired_settings(motion_reconcile_enabled=False))
+
+        # One _BACKOFF_S gate per rebuild — paced, never a tight/unbounded spin.
+        assert sleeps == [5, 5, 5]
+        assert session_calls == 3
+
 
 def _scene_settings(enabled: bool, watermark_file: str) -> Settings:
     """Build settings for scene session tests before and after the fields exist."""
@@ -635,8 +677,8 @@ class _SessionHarness:
                 harness.events.append("scene_poll")
                 harness.scene_poll_snapshots.append(devices)
 
-        def mqtt_factory(settings: Settings, *, persistent_session: bool = False) -> _SessionMqtt:
-            del settings, persistent_session
+        def mqtt_factory(settings: Settings) -> _SessionMqtt:
+            del settings
             self.events.append("mqtt_construct")
             return self.mqtt
 

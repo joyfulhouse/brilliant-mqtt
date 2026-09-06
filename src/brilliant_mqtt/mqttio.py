@@ -283,8 +283,9 @@ class _BoundedTransportQueue(asyncio.Queue[aiomqtt.Message]):
     :meth:`_LaneQueue.put` one layer earlier, so an idempotent absolute-state
     setter replaces a pending twin instead of consuming budget) and TRIPS an
     observable latch before raising ``QueueFull`` — the drop becomes a loud,
-    recoverable overload rather than a silent loss. ``QueueFull`` is raised (not
-    a bespoke error) because paho re-raises anything else escaping the callback.
+    observable overload the runner sheds-and-rebuilds on, rather than aiomqtt's
+    silent discard. ``QueueFull`` is raised (not a bespoke error) because paho
+    re-raises anything else escaping the callback.
     """
 
     _queue: deque[aiomqtt.Message]
@@ -311,11 +312,15 @@ class _BoundedTransportQueue(asyncio.Queue[aiomqtt.Message]):
         if _is_latest_wins_topic(topic):
             for index, pending in enumerate(self._queue):
                 if str(pending.topic) == topic:
-                    projected = self._queued_bytes - _message_bytes(pending) + item_bytes
-                    if projected > self._max_bytes:
-                        self._trip("payload-byte")
+                    # Latest-wins: the newest payload supersedes its pending twin
+                    # (mirrors _LaneQueue.put) — replace in place first, so a
+                    # pre-rebuild drain applies the NEWEST value, THEN trip if the
+                    # swap pushed total bytes over budget. Replacing does not grow
+                    # the count backlog, so this never widens the queue.
+                    self._queued_bytes += item_bytes - _message_bytes(pending)
                     self._queue[index] = item
-                    self._queued_bytes = projected
+                    if self._queued_bytes > self._max_bytes:
+                        self._trip("payload-byte")
                     return
         if self.full():
             self._trip("message-count")
@@ -392,7 +397,6 @@ class AioMqttAdapter:
         publish_availability: bool = True,
         checked_disconnect: bool = False,
         redacted_logging: bool = False,
-        persistent_session: bool = False,
     ) -> None:
         self._settings = settings
         # Multiple consumers (panel bridge + mesh publisher) each register a
@@ -405,7 +409,6 @@ class AioMqttAdapter:
         # Tripped by the bounded transport queue (below) when a count/byte bound
         # is exceeded; drained by the runner via consume_transport_overload().
         self._transport_overload = _TransportOverloadLatch()
-        self._persistent_session = persistent_session
         self._topic_dispatcher = _TopicDispatcher(self._dispatch_inbound)
         self._reader_task: asyncio.Task[None] | None = None
         self._reader_failure_consumed = False
@@ -444,10 +447,6 @@ class AioMqttAdapter:
             # observably tripping on overload instead of aiomqtt's silent drop.
             queue_type=_transport_queue_type(self._transport_overload),
             max_queued_incoming_messages=_TRANSPORT_QUEUE_MAXSIZE,
-            # A persistent (non-clean) session lets the broker redeliver in-flight
-            # QoS-1 commands after an overload-triggered reconnect; ephemeral
-            # preflight clients keep the default clean session.
-            clean_session=False if persistent_session else None,
             will=will,
             tls_context=build_tls_context(settings),
         )
@@ -775,21 +774,15 @@ class AioMqttAdapter:
         Mirrors :meth:`bus.RpcBusAdapter.consume_write_timeout`: the runner
         checks this each session tick and rebuilds the session when overload is
         latched, turning aiomqtt's silent 'Discarding message' drop into an
-        observable fail + reconnect (the persistent QoS-1 session then redelivers
-        the in-flight command backlog).
+        observable fail + reconnect. The overload SHEDS the excess commands (the
+        broker has already PUBACK'd the QoS-0 inbound, so a reconnect does not
+        redeliver them) and rebuilds — admission control, not a lossless promise.
         """
         return self._transport_overload.consume()
 
     async def subscribe(self, topic: str) -> None:
-        # Resident (persistent-session) clients subscribe command topics at QoS 1
-        # so the broker redelivers any in-flight command after an
-        # overload-triggered reconnect; ephemeral preflight clients keep the
-        # default QoS 0 (and its plain single-arg subscribe call).
         try:
-            if self._persistent_session:
-                reason_codes = await self._client.subscribe(topic, qos=1)
-            else:
-                reason_codes = await self._client.subscribe(topic)
+            reason_codes = await self._client.subscribe(topic)
         except aiomqtt.MqttError as error:
             raise CommandSubscribeError(f"subscribe failed for {topic}: {error}") from error
 

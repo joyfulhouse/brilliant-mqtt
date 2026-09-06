@@ -194,12 +194,33 @@ def test_non_coalescible_flood_stays_bounded_and_observably_overloads() -> None:
     assert latch.consume() is True
 
 
-# -- Adapter wiring: bounded queue, persistent session, QoS 1 -----------------
+# -- Latest-wins replacement over the byte budget keeps the NEWEST -------------
 
 
-def test_persistent_adapter_wires_bounded_queue_and_non_clean_session(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_latest_wins_replacement_over_budget_keeps_newest_then_trips() -> None:
+    """A latest-wins replacement whose newer payload pushes total over the byte
+    budget must keep the NEWEST value (the point of latest-wins) and only THEN
+    trip — a pre-rebuild drain applies the freshest command, not a stale one."""
+    latch = mqttio._TransportOverloadLatch()
+    small = b"a" * 100
+    big = b"b" * 400
+    # Budget admits the small pending but not the larger replacement.
+    budget = mqttio._message_bytes(_msg(_LIGHT, small)) + 50
+    queue = mqttio._BoundedTransportQueue(maxsize=8, max_bytes=budget, overload=latch)
+
+    queue.put_nowait(_msg(_LIGHT, small))
+    with pytest.raises(asyncio.QueueFull):
+        queue.put_nowait(_msg(_LIGHT, big))  # over budget -> trips
+
+    assert queue.qsize() == 1  # coalesced in place, not grown
+    assert queue.get_nowait().payload == big  # latest-wins: newest survives
+    assert latch.consume() is True
+
+
+# -- Adapter wiring: bounded queue on every client ----------------------------
+
+
+def test_adapter_wires_bounded_transport_queue(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, object] = {}
 
     def client_factory(**kwargs: object) -> object:
@@ -208,9 +229,8 @@ def test_persistent_adapter_wires_bounded_queue_and_non_clean_session(
 
     monkeypatch.setattr(aiomqtt, "Client", client_factory)
 
-    adapter = AioMqttAdapter(_settings(), persistent_session=True)
+    adapter = AioMqttAdapter(_settings())
 
-    assert captured["clean_session"] is False  # persistent (redelivery) session
     assert captured["max_queued_incoming_messages"] == mqttio._TRANSPORT_QUEUE_MAXSIZE
     queue_type = captured["queue_type"]
     assert isinstance(queue_type, type)
@@ -224,52 +244,6 @@ def test_persistent_adapter_wires_bounded_queue_and_non_clean_session(
         queue.put_nowait(_msg(_MUTE, b"true"))
     assert adapter.consume_transport_overload() is True
     assert adapter.consume_transport_overload() is False
-
-
-def test_default_adapter_keeps_a_clean_session(monkeypatch: pytest.MonkeyPatch) -> None:
-    captured: dict[str, object] = {}
-
-    def client_factory(**kwargs: object) -> object:
-        captured.update(kwargs)
-        return object()
-
-    monkeypatch.setattr(aiomqtt, "Client", client_factory)
-
-    AioMqttAdapter(_settings())  # persistent_session defaults False (preflight)
-
-    assert captured["clean_session"] is None  # aiomqtt/paho default: clean
-    # Even the ephemeral client bounds its transport queue.
-    assert captured["max_queued_incoming_messages"] == mqttio._TRANSPORT_QUEUE_MAXSIZE
-
-
-class _SubscribeRecordingClient:
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, int]] = []
-
-    async def subscribe(self, topic: str, qos: int = 0) -> tuple[int, ...]:
-        self.calls.append((topic, qos))
-        return (0,)
-
-
-async def test_subscribe_qos_tracks_session_persistence() -> None:
-    """The QoS is a function of session persistence: a resident (persistent)
-    client upgrades to QoS 1 for redelivery, while an ephemeral preflight client
-    stays at QoS 0. Asserted differentially in one test so reverting the fix
-    (which collapses persistent to the unchanged single-arg subscribe) turns the
-    persistent leg RED — a clean-only assertion cannot, as that path is untouched
-    — while still guarding that command eligibility is not widened (#90 AC3)."""
-    clean = AioMqttAdapter(_settings())
-    clean_client = _SubscribeRecordingClient()
-    clean._client = clean_client  # type: ignore[assignment]
-    await clean.subscribe(_LIGHT)
-
-    persistent = AioMqttAdapter(_settings(), persistent_session=True)
-    persistent_client = _SubscribeRecordingClient()
-    persistent._client = persistent_client  # type: ignore[assignment]
-    await persistent.subscribe(_LIGHT)
-
-    assert clean_client.calls == [(_LIGHT, 0)]  # preflight/clean: unchanged
-    assert persistent_client.calls == [(_LIGHT, 1)]  # resident: upgraded
 
 
 # -- End-to-end stress: blocked bus command + saturated lane + flood ----------
@@ -300,7 +274,7 @@ async def test_blocked_bus_command_bounds_transport_backlog_end_to_end(
     sustained traffic through the real put_nowait/reader/dispatcher path, and
     verify bounded queued work/memory plus observable (not silent) overload."""
     caplog.set_level(logging.ERROR, logger=mqttio.__name__)
-    adapter = AioMqttAdapter(_settings(), persistent_session=True)
+    adapter = AioMqttAdapter(_settings())
     latch = adapter._transport_overload
     # The bounded queue aiomqtt WOULD build, bound to the adapter's real latch.
     queue = _queue(latch, maxsize=mqttio._TRANSPORT_QUEUE_MAXSIZE)

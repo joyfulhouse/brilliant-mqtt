@@ -45,7 +45,6 @@ class _FakeAiomqttClient:
     publish_error: BaseException | None = None
     subscribe_error: BaseException | None = None
     subscribe_result: tuple[int, ...] | list[ReasonCode] = (0,)
-    subscribe_qos: list[int] = field(default_factory=list)
     enter_gate: asyncio.Event | None = None
     exit_gate: asyncio.Event | None = None
     enter_calls: int = 0
@@ -75,8 +74,7 @@ class _FakeAiomqttClient:
             raise self.publish_error
         self.published.append((topic, payload, retain, qos))
 
-    async def subscribe(self, topic: str, qos: int = 0) -> tuple[int, ...] | list[ReasonCode]:
-        self.subscribe_qos.append(qos)
+    async def subscribe(self, topic: str) -> tuple[int, ...] | list[ReasonCode]:
         if self.subscribe_error is not None:
             raise self.subscribe_error
         return self.subscribe_result

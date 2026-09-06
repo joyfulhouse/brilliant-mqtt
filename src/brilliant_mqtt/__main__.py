@@ -73,11 +73,13 @@ class BusReconnectStormError(RuntimeError):
 
 
 class MqttTransportOverloadError(RuntimeError):
-    """Inbound MQTT transport backlog exceeded its count/byte bound — rebuild the
-    session so the persistent QoS-1 broker session redelivers the in-flight
-    command backlog after reconnect, instead of aiomqtt silently dropping it
-    (#90). The detached reader task never surfaces this; only the session-loop
-    accessor check does."""
+    """Inbound MQTT transport backlog exceeded its count/byte bound — shed the
+    excess commands and rebuild the session, instead of aiomqtt silently
+    discarding them (#90). This is admission control, not a lossless promise: the
+    broker has already PUBACK'd every QoS-0 inbound, so the excess is genuinely
+    dropped — but observably, via a loud fail + reconnect, not silently. The
+    detached reader task never surfaces this; only the session-loop accessor
+    check does."""
 
 
 class _CoalescingCallback:
@@ -162,9 +164,7 @@ async def _run_session(
     """
     write_phase(settings.bus_phase_file, "pre_bus")
     participating = settings.mesh_priority >= 1
-    # The resident client owns a persistent (non-clean) QoS-1 session so an
-    # overload-triggered reconnect redelivers the in-flight command backlog (#90).
-    mqtt = AioMqttAdapter(settings, persistent_session=True)
+    mqtt = AioMqttAdapter(settings)
     bus = RpcBusAdapter(extra_device_ids=(_MESH_DEVICE_ID,) if participating else ())
     scene_bridge: SceneBridge | None = None
     mqtt_connected = False
@@ -306,9 +306,10 @@ async def _run_session(
 
             # Inbound MQTT transport backlog exceeded its count/byte bound: a
             # stalled command lane backpressured the sole broker reader while
-            # commands kept arriving (#90). Fail loudly and rebuild rather than
-            # letting aiomqtt silently discard — the persistent QoS-1 session
-            # redelivers the in-flight backlog on reconnect.
+            # commands kept arriving (#90). Fail loudly and rebuild — shedding the
+            # excess — rather than letting aiomqtt silently discard. The rebuild
+            # takes run()'s outer _BACKOFF_S like every session-ending fault, so a
+            # sustained flood cannot spin the rebuild loop unbounded.
             if mqtt.consume_transport_overload():
                 raise MqttTransportOverloadError(
                     "MQTT transport backlog exceeded its bound — rebuilding session"
