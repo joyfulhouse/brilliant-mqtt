@@ -323,11 +323,10 @@ class _BoundedTransportQueue(asyncio.Queue[aiomqtt.Message]):
                     if item_bytes > self._max_bytes:
                         # A single latest-wins payload too big to EVER fit the
                         # budget on its own: refuse it and keep the pending twin,
-                        # so _queued_bytes stays hard-capped at the budget like
-                        # every other admission path (replacing first here could
-                        # overshoot by an arbitrary amount). A message this large
-                        # can never be admitted, so keeping the older value does
-                        # not reintroduce the round-2 stale-payload bug — both are
+                        # so _queued_bytes stays hard-capped like every other
+                        # admission path (replacing first could overshoot by an
+                        # arbitrary amount). A message this large can never be
+                        # admitted, so keeping the older value is safe — both are
                         # discarded on the ensuing rebuild regardless.
                         self._trip("payload-byte")
                     # The new payload fits the budget on its own. Latest-wins: it
@@ -337,12 +336,9 @@ class _BoundedTransportQueue(asyncio.Queue[aiomqtt.Message]):
                     # exceeds budget. On that trip the new message is KEPT (a
                     # pre-rebuild drain applies the NEWEST value); what is shed is
                     # the OLD pending value, despite aiomqtt's generic "Discarding
-                    # message" log framing this as a drop of the new one. Storing
-                    # before the check makes _max_bytes a per-admission SOFT bound
-                    # here (see _TRANSPORT_QUEUE_MAX_BYTES): the total can briefly
-                    # exceed it by one item per distinct latest-wins topic until
-                    # the next-tick rebuild — bounded by count * max_bytes, never
-                    # unbounded.
+                    # message" log. Storing before the check makes _max_bytes a
+                    # per-admission soft bound here — see the
+                    # _TRANSPORT_QUEUE_MAX_BYTES comment.
                     self._queued_bytes += item_bytes - _message_bytes(pending)
                     self._queue[index] = item
                     if self._queued_bytes > self._max_bytes:
