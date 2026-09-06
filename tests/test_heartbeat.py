@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from brilliant_mqtt.heartbeat import write_heartbeat
+from brilliant_mqtt.heartbeat import write_heartbeat, write_phase
 from tests.fakes import FakeClock
 
 
@@ -63,3 +63,20 @@ def test_swallows_permission_error(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
     p = tmp_path / "sub" / "bus-heartbeat"
     write_heartbeat(str(p), lambda: 1.0)  # no exception
     assert not p.exists()
+
+
+def test_write_phase_atomically_replaces_the_current_phase(tmp_path: Path) -> None:
+    phase = tmp_path / "runtime" / "bus-phase"
+
+    write_phase(str(phase), "pre_bus")
+    write_phase(str(phase), "bus")
+
+    assert phase.read_text(encoding="utf-8") == "bus"
+
+
+def test_write_phase_is_best_effort(tmp_path: Path) -> None:
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory", encoding="utf-8")
+
+    write_phase("", "pre_bus")
+    write_phase(str(blocker / "bus-phase"), "bus")

@@ -3,23 +3,38 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import NoReturn
 
+import pytest
+
 from brilliant_bus_watchdog.run import _service_active, handle, load_config, should_reboot
 
 
-def test_should_reboot_all_true() -> None:
-    assert should_reboot(age=1900.0, bridge_active=True, gateway_up=True, stale_after=1800.0)
-
-
-def test_not_stale() -> None:
-    assert not should_reboot(age=100.0, bridge_active=True, gateway_up=True, stale_after=1800.0)
-
-
-def test_bridge_inactive_blocks() -> None:
-    assert not should_reboot(age=9999.0, bridge_active=False, gateway_up=True, stale_after=1800.0)
-
-
-def test_gateway_down_blocks() -> None:
-    assert not should_reboot(age=9999.0, bridge_active=True, gateway_up=False, stale_after=1800.0)
+@pytest.mark.parametrize(
+    ("age", "bridge_active", "gateway_up", "bus_confirmed", "expected"),
+    [
+        (1900.0, True, True, True, True),
+        (100.0, True, True, True, False),
+        (9999.0, False, True, True, False),
+        (9999.0, True, False, True, False),
+        (9999.0, True, True, False, False),
+    ],
+)
+def test_should_reboot_requires_every_bus_wedge_signal(
+    age: float,
+    bridge_active: bool,
+    gateway_up: bool,
+    bus_confirmed: bool,
+    expected: bool,
+) -> None:
+    assert (
+        should_reboot(
+            age=age,
+            bridge_active=bridge_active,
+            gateway_up=gateway_up,
+            bus_confirmed=bus_confirmed,
+            stale_after=1800.0,
+        )
+        is expected
+    )
 
 
 def test_handle_reboots_when_guard_allows_record_before_reboot() -> None:
@@ -76,6 +91,14 @@ def test_load_config_defaults() -> None:
 def test_load_config_overrides() -> None:
     c = load_config({"BUS_WATCHDOG_STALE_AFTER": "600", "BUS_HEARTBEAT_FILE": "/x"})
     assert c.stale_after == 600.0 and c.heartbeat_path == "/x"
+
+
+@pytest.mark.parametrize(
+    ("environ", "expected"),
+    [({}, "/run/brilliant-mqtt/bus-phase"), ({"BUS_PHASE_FILE": "/phase"}, "/phase")],
+)
+def test_load_config_bus_phase_path(environ: dict[str, str], expected: str) -> None:
+    assert load_config(environ).phase_path == expected
 
 
 def test_service_active_true_when_stdout_active() -> None:

@@ -20,7 +20,7 @@ from brilliant_mqtt.bus import RpcBusAdapter
 from brilliant_mqtt.config import Settings
 from brilliant_mqtt.desired_state import DesiredState
 from brilliant_mqtt.discovery import meta_topic
-from brilliant_mqtt.heartbeat import write_heartbeat
+from brilliant_mqtt.heartbeat import write_heartbeat, write_phase
 from brilliant_mqtt.mesh_leader import MeshLeader
 from brilliant_mqtt.model import BrilliantDevice
 from brilliant_mqtt.motion_derive import MotionDeriver
@@ -148,6 +148,7 @@ async def _run_session(
     The desired-state stores are constructed by :func:`run` (process scope)
     and only wired here — see the comment there for why.
     """
+    write_phase(settings.bus_phase_file, "pre_bus")
     participating = settings.mesh_priority >= 1
     mqtt = AioMqttAdapter(settings)
     bus = RpcBusAdapter(extra_device_ids=(_MESH_DEVICE_ID,) if participating else ())
@@ -252,6 +253,7 @@ async def _run_session(
 
         await mqtt.connect()
         mqtt_connected = True
+        write_phase(settings.bus_phase_file, "bus")
         if participating:
             # Join the election before bus data flows; the FIRST mesh
             # reconcile is acquisition's job (on_acquire), not startup's.
@@ -400,6 +402,8 @@ async def _run_session(
             log.exception("could not publish retained-ledger degraded diagnostic")
         raise
     finally:
+        # Keep "bus" through teardown: both supervisor backoffs are far shorter
+        # than stale_after, and the next attempt writes "pre_bus" at entry.
         # Best-effort teardown; consumers stop before the shared adapters, and
         # every component tolerates a never-fully-started state.
         if scene_bridge is not None:

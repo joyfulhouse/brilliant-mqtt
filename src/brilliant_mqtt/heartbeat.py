@@ -11,11 +11,14 @@ import logging
 import os
 import time
 from collections.abc import Callable
+from typing import Literal
 
 logger = logging.getLogger(__name__)
 
 _MIN_WRITE_INTERVAL_S = 10.0
 _last_attempt: dict[str, float] = {}
+
+BusPhase = Literal["pre_bus", "bus"]
 
 
 def write_heartbeat(
@@ -44,3 +47,19 @@ def write_heartbeat(
         os.replace(tmp, path)
     except OSError:
         logger.debug("heartbeat write failed for %s", path, exc_info=True)
+
+
+def write_phase(path: str, phase: BusPhase) -> None:
+    """Atomically record the session's bus phase without disrupting startup."""
+    if not path:
+        return
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(phase)
+        os.replace(tmp, path)
+    except OSError:
+        logger.debug("bus phase write failed for %s", path, exc_info=True)

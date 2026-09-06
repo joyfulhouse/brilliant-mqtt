@@ -528,6 +528,22 @@ class TestSettings:
         s = Settings.from_env()
         assert s.bus_heartbeat_file == "/x"
 
+    @pytest.mark.parametrize(
+        ("configured", "expected"),
+        [(None, "/run/brilliant-mqtt/bus-phase"), ("/phase", "/phase")],
+    )
+    def test_bus_phase_file(self, configured: str | None, expected: str) -> None:
+        env = {
+            "BRILLIANT_PANEL": "office",
+            "MQTT_HOST": "10.0.0.1",
+            "MQTT_USERNAME": "brilliant",
+            "MQTT_PASSWORD": "s3cr3t",
+        }
+        if configured is not None:
+            env["BUS_PHASE_FILE"] = configured
+
+        assert Settings.from_env(env).bus_phase_file == expected
+
     def test_scene_bridge_defaults_disabled_with_persistent_watermark_path(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

@@ -106,6 +106,9 @@ class Settings:
     # detect a wedged message_bus session. tmpfs default (no flash wear);
     # empty disables emission.
     bus_heartbeat_file: str = "/run/brilliant-mqtt/bus-heartbeat"
+    # Session phase shared with the bus watchdog. "bus" means MQTT connected
+    # and the local bus was attempted; empty disables emission.
+    bus_phase_file: str = "/run/brilliant-mqtt/bus-phase"
     # Bidirectional Brilliant scene/mode transport. Opt-in until panel and HA
     # rollout validation is complete; its replay/outbox state must persist.
     scene_bridge_enabled: bool = False
@@ -140,6 +143,8 @@ class Settings:
                   passes through unchanged),
                   MOTION_DERIVED_HOLD_S (default 60.0 seconds, must be >= 0),
                   BUS_HEARTBEAT_FILE (default "/run/brilliant-mqtt/bus-heartbeat";
+                  empty disables),
+                  BUS_PHASE_FILE (default "/run/brilliant-mqtt/bus-phase";
                   empty disables),
                   SCENE_BRIDGE_ENABLED (default "0"; accepted boolean spellings
                   match MOTION_RECONCILE_ENABLED),
@@ -209,6 +214,7 @@ class Settings:
         if motion_derived_hold_s < 0:
             raise ValueError("MOTION_DERIVED_HOLD_S must be >= 0")
         bus_heartbeat_file = env.get("BUS_HEARTBEAT_FILE", "/run/brilliant-mqtt/bus-heartbeat")
+        bus_phase_file = env.get("BUS_PHASE_FILE", "/run/brilliant-mqtt/bus-phase")
         scene_bridge_enabled = _env_bool(env, "SCENE_BRIDGE_ENABLED", "0")
         scene_watermark_file = env.get(
             "SCENE_WATERMARK_FILE", "/data/brilliant-mqtt/scene-watermarks.json"
@@ -240,6 +246,7 @@ class Settings:
             motion_derived_enabled=motion_derived_enabled,
             motion_derived_hold_s=motion_derived_hold_s,
             bus_heartbeat_file=bus_heartbeat_file,
+            bus_phase_file=bus_phase_file,
             scene_bridge_enabled=scene_bridge_enabled,
             scene_watermark_file=scene_watermark_file,
         )

@@ -3,6 +3,15 @@
 from __future__ import annotations
 
 
+def bus_confirmed(path: str) -> bool:
+    """Whether the bridge reached the local-bus phase in its latest attempt."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read().strip() == "bus"
+    except OSError:
+        return False
+
+
 def heartbeat_age(path: str, *, now: float, started_at: float) -> float:
     """Seconds since the bridge last stamped *path*. If the file is absent or
     unparsable, age is measured from *started_at* (the watchdog's own start) so
