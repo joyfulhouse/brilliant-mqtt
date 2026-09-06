@@ -203,7 +203,9 @@ def test_adapter_does_not_fall_back_to_plaintext_when_tls_setup_fails(
     assert client_calls == []
 
 
-async def test_consume_reader_failure_ignores_cancelled_task() -> None:
+async def test_consume_reader_failure_ignores_cancelled_task_during_teardown() -> None:
+    # A reader cancelled as part of this adapter's own teardown (_closing set)
+    # is an expected stop, not a failure — it must not signal a rebuild.
     adapter = mqttio.AioMqttAdapter(_settings(tls_enabled=False))
 
     async def wait_for_cancellation() -> None:
@@ -214,6 +216,7 @@ async def test_consume_reader_failure_ignores_cancelled_task() -> None:
     with pytest.raises(asyncio.CancelledError):
         await reader_task
     adapter._reader_task = reader_task
+    adapter._closing = True
 
     assert adapter.consume_reader_failure() is False
     assert adapter.consume_reader_failure() is False

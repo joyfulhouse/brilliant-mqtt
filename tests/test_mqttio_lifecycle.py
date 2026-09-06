@@ -31,9 +31,12 @@ async def _empty_messages() -> AsyncIterator[object]:
     yield  # pragma: no cover - makes this an async generator, never reached
 
 
-async def _raising_messages() -> AsyncIterator[object]:
-    raise RuntimeError("reader crashed")
-    yield  # pragma: no cover - unreachable; makes this an async generator
+def _raising_messages(error: BaseException) -> AsyncIterator[object]:
+    async def _iter() -> AsyncIterator[object]:
+        raise error
+        yield  # pragma: no cover - unreachable; makes this an async generator
+
+    return _iter()
 
 
 @dataclass
@@ -166,15 +169,20 @@ async def test_disconnect_after_close_is_a_noop() -> None:
     assert fake.exit_calls == 1
 
 
-async def test_reader_disappearance_after_connect_is_consumed_before_clean_disconnect() -> None:
+async def test_reader_disappearance_after_connect_is_consumed_before_clean_disconnect(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     fake = _FakeAiomqttClient()
     adapter = _adapter(fake, publish_availability=False)
+    caplog.set_level(logging.WARNING, logger=mqttio.__name__)
 
     await adapter.connect()
     await _wait_until(lambda: adapter._reader_task is not None and adapter._reader_task.done())
 
     assert adapter.consume_reader_failure() is True
     assert adapter.consume_reader_failure() is False
+    # A graceful (no-exception) stop is still reported, mirroring the crash path.
+    assert "MQTT reader stopped unexpectedly without an exception" in caplog.text
 
     await adapter.disconnect()
 
@@ -184,10 +192,19 @@ async def test_reader_disappearance_after_connect_is_consumed_before_clean_disco
     assert adapter._closed is True
 
 
+@pytest.mark.parametrize(
+    "error",
+    [
+        RuntimeError("reader crashed"),
+        aiomqtt.MqttError("broker gone"),
+    ],
+    ids=["runtime-error", "mqtt-error"],
+)
 async def test_reader_crash_after_connect_is_consumed_and_logged_before_clean_disconnect(
+    error: BaseException,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    fake = _FakeAiomqttClient(messages=_raising_messages())
+    fake = _FakeAiomqttClient(messages=_raising_messages(error))
     adapter = _adapter(fake, publish_availability=False)
     caplog.set_level(logging.ERROR, logger=mqttio.__name__)
 
@@ -197,7 +214,32 @@ async def test_reader_crash_after_connect_is_consumed_and_logged_before_clean_di
     assert adapter.consume_reader_failure() is True
     assert adapter.consume_reader_failure() is False
     assert "MQTT reader task failed" in caplog.text
-    assert "reader crashed" in caplog.text
+    assert str(error) in caplog.text
+
+    await adapter.disconnect()
+
+    # The dead reader is reported exactly once (by consume_reader_failure); the
+    # disconnect teardown must not re-log the same traceback as a cancellation.
+    assert caplog.text.count("MQTT reader task failed") == 1
+    assert "reader task raised during cancellation" not in caplog.text
+    assert caplog.text.count(str(error)) == 1
+    assert fake.enter_calls == 1
+    assert fake.exit_calls == 1
+    assert adapter._reader_task is None
+    assert adapter._closed is True
+
+
+async def test_reader_cancelled_while_live_is_reported_as_failure_before_clean_disconnect() -> None:
+    # A CancelledError surfacing from inside the client while this adapter is
+    # live (not our own teardown) is an unexpected death that must rebuild (#89).
+    fake = _FakeAiomqttClient(messages=_raising_messages(asyncio.CancelledError()))
+    adapter = _adapter(fake, publish_availability=False)
+
+    await adapter.connect()
+    await _wait_until(lambda: adapter._reader_task is not None and adapter._reader_task.done())
+
+    assert adapter.consume_reader_failure() is True
+    assert adapter.consume_reader_failure() is False
 
     await adapter.disconnect()
 

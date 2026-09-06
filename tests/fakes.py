@@ -220,6 +220,10 @@ class FakeMqtt:
         self.disconnect_count += 1
 
     def consume_reader_failure(self) -> bool:
+        # Test double: read-and-clear a latch the test sets to inject one
+        # reader failure per check. The real adapter latches permanently after
+        # its first True; here each check simply reflects the flag's current
+        # value, so tests stay in full control of when a failure is signalled.
         failed = self.reader_failure_latched
         self.reader_failure_latched = False
         return failed
