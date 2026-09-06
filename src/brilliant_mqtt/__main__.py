@@ -72,6 +72,14 @@ class BusReconnectStormError(RuntimeError):
     self-reinforcing storm (live incident, 2026-06-13)."""
 
 
+class MqttTransportOverloadError(RuntimeError):
+    """Inbound MQTT transport backlog exceeded its count/byte bound — rebuild the
+    session so the persistent QoS-1 broker session redelivers the in-flight
+    command backlog after reconnect, instead of aiomqtt silently dropping it
+    (#90). The detached reader task never surfaces this; only the session-loop
+    accessor check does."""
+
+
 class _CoalescingCallback:
     """Collapse requests received during one callback into one trailing run."""
 
@@ -154,7 +162,9 @@ async def _run_session(
     """
     write_phase(settings.bus_phase_file, "pre_bus")
     participating = settings.mesh_priority >= 1
-    mqtt = AioMqttAdapter(settings)
+    # The resident client owns a persistent (non-clean) QoS-1 session so an
+    # overload-triggered reconnect redelivers the in-flight command backlog (#90).
+    mqtt = AioMqttAdapter(settings, persistent_session=True)
     bus = RpcBusAdapter(extra_device_ids=(_MESH_DEVICE_ID,) if participating else ())
     scene_bridge: SceneBridge | None = None
     mqtt_connected = False
@@ -293,6 +303,16 @@ async def _run_session(
             # even if pushes remain healthy (#72).
             if bus.consume_write_timeout():
                 raise BusWriteStuckError("bus write timed out — rebuilding session")
+
+            # Inbound MQTT transport backlog exceeded its count/byte bound: a
+            # stalled command lane backpressured the sole broker reader while
+            # commands kept arriving (#90). Fail loudly and rebuild rather than
+            # letting aiomqtt silently discard — the persistent QoS-1 session
+            # redelivers the in-flight backlog on reconnect.
+            if mqtt.consume_transport_overload():
+                raise MqttTransportOverloadError(
+                    "MQTT transport backlog exceeded its bound — rebuilding session"
+                )
 
             # Stale-stream watchdog: a silently dead notification stream
             # freezes pushes AND get_all (pilot finding 2026-06-12) — only

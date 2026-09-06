@@ -470,6 +470,14 @@ class _SessionMqtt:
         self.command_callbacks: list[Callable[[str, str], Awaitable[None]]] = []
         self.reader_failure_latched = False
         self.reader_failure_checks = 0
+        self.transport_overload_latched = False
+        self.transport_overload_checks = 0
+
+    def consume_transport_overload(self) -> bool:
+        self.transport_overload_checks += 1
+        latched = self.transport_overload_latched
+        self.transport_overload_latched = False
+        return latched
 
     def on_command(self, callback: Callable[[str, str], Awaitable[None]]) -> None:
         self.command_callbacks.append(callback)
@@ -627,8 +635,8 @@ class _SessionHarness:
                 harness.events.append("scene_poll")
                 harness.scene_poll_snapshots.append(devices)
 
-        def mqtt_factory(settings: Settings) -> _SessionMqtt:
-            del settings
+        def mqtt_factory(settings: Settings, *, persistent_session: bool = False) -> _SessionMqtt:
+            del settings, persistent_session
             self.events.append("mqtt_construct")
             return self.mqtt
 
@@ -928,6 +936,43 @@ class TestMqttReaderFailureRecovery:
         assert harness.mqtt.reader_failure_checks == 1
         assert harness.bus.get_all_calls == [False]
         assert harness.events[-2:] == ["bus_shutdown", "mqtt_disconnect"]
+
+
+class TestTransportOverloadRecovery:
+    async def test_latched_transport_overload_rebuilds_session_on_next_tick(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        harness = _SessionHarness(monkeypatch)
+        harness.mqtt.transport_overload_latched = True
+
+        with pytest.raises(main_mod.MqttTransportOverloadError):
+            await asyncio.wait_for(
+                main_mod._run_session(_hot_poll_settings(), None, None),
+                timeout=1,
+            )
+
+        assert harness.mqtt.transport_overload_checks == 1
+        # The detached reader task never surfaces this: only the session-loop
+        # accessor check rebuilds, tearing down the shared adapters in order.
+        assert harness.events[-2:] == ["bus_shutdown", "mqtt_disconnect"]
+
+    async def test_session_without_transport_overload_never_trips_breaker(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        harness = _SessionHarness(
+            monkeypatch,
+            bridge_poll_effects={"panel": [asyncio.CancelledError()]},
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(
+                main_mod._run_session(_hot_poll_settings(), None, None),
+                timeout=1,
+            )
+
+        assert harness.mqtt.transport_overload_checks == 1
 
 
 class _LatchProbeObserver:
