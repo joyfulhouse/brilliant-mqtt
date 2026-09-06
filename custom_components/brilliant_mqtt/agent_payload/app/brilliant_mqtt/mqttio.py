@@ -44,7 +44,15 @@ _TRANSPORT_QUEUE_MAXSIZE = _TOPIC_QUEUE_MAXSIZE * 8
 # are small (absolute-state setters, scene ids), so this ceiling binds only on
 # pathological large payloads, capping the backlog at a small, defensible
 # fraction (~0.27%) of the service MemoryMax=96M with wide headroom for the rest
-# of the agent's working set.
+# of the agent's working set. On every fresh-admission path this is a HARD cap
+# (a put that would exceed it trips before storing). In the latest-wins
+# coalesce-replace path (put_nowait) it is a per-admission SOFT bound: a
+# replacement is stored before the cumulative total is checked, so the total can
+# transiently exceed this by up to one admitted item per distinct latest-wins
+# topic before the runner's next tick consumes the overload latch and rebuilds.
+# The hard worst case until that rebuild is therefore bounded by
+# _TRANSPORT_QUEUE_MAXSIZE * _TRANSPORT_QUEUE_MAX_BYTES (~16 MiB), not this
+# single value — still bounded (no unbounded growth), just not a strict ceiling.
 _TRANSPORT_QUEUE_MAX_BYTES = 256 * 1024
 _SHUTDOWN_DRAIN_DEADLINE_S = 5.0
 # Post-cancel settlement bound: workers SHOULD exit promptly on cancel, but a
@@ -329,7 +337,12 @@ class _BoundedTransportQueue(asyncio.Queue[aiomqtt.Message]):
                     # exceeds budget. On that trip the new message is KEPT (a
                     # pre-rebuild drain applies the NEWEST value); what is shed is
                     # the OLD pending value, despite aiomqtt's generic "Discarding
-                    # message" log framing this as a drop of the new one.
+                    # message" log framing this as a drop of the new one. Storing
+                    # before the check makes _max_bytes a per-admission SOFT bound
+                    # here (see _TRANSPORT_QUEUE_MAX_BYTES): the total can briefly
+                    # exceed it by one item per distinct latest-wins topic until
+                    # the next-tick rebuild — bounded by count * max_bytes, never
+                    # unbounded.
                     self._queued_bytes += item_bytes - _message_bytes(pending)
                     self._queue[index] = item
                     if self._queued_bytes > self._max_bytes:
