@@ -999,6 +999,41 @@ class TestTransportOverloadRecovery:
         # accessor check rebuilds, tearing down the shared adapters in order.
         assert harness.events[-2:] == ["bus_shutdown", "mqtt_disconnect"]
 
+    async def test_transport_overload_rebuild_side_effects_match_sibling_trigger(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """#90 'defined health/election behavior': an overload-triggered rebuild
+        runs _run_session's single, trigger-agnostic ``finally`` teardown — the
+        SAME availability/LWT (via mqtt.disconnect, which publishes the retained
+        "offline") and bus/leader shutdown side effects as every other trigger in
+        this loop. Proven by comparing the whole recorded lifecycle against the
+        BusWriteStuckError sibling armed the same way: identical traces =>
+        identical side effects. (The fake mqtt/leader do not model LWT-publish or
+        leader step-down as distinct events — a pre-existing harness trait shared
+        by ALL triggers, not specific to overload; the real LWT publish lives in
+        AioMqttAdapter.disconnect and is covered in test_mqttio_lifecycle.)"""
+        overload = _SessionHarness(monkeypatch)
+        overload.mqtt.transport_overload_latched = True
+        with pytest.raises(main_mod.MqttTransportOverloadError):
+            await asyncio.wait_for(
+                main_mod._run_session(_hot_poll_settings(), None, None),
+                timeout=1,
+            )
+
+        write_stuck = _SessionHarness(monkeypatch)
+        write_stuck.bus.write_timeout_latched = True
+        with pytest.raises(main_mod.BusWriteStuckError):
+            await asyncio.wait_for(
+                main_mod._run_session(_hot_poll_settings(), None, None),
+                timeout=1,
+            )
+
+        # Both faults trip on the first tick before any poll, then tear down via
+        # the one shared finally — so the recorded lifecycles are identical.
+        assert overload.events == write_stuck.events
+        assert overload.events[-2:] == ["bus_shutdown", "mqtt_disconnect"]
+
     async def test_session_without_transport_overload_never_trips_breaker(
         self,
         monkeypatch: pytest.MonkeyPatch,

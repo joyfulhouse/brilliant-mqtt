@@ -22,9 +22,10 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import AsyncIterator
-from typing import cast
+from typing import Protocol, cast
 
 import aiomqtt
+import paho.mqtt.client as paho
 import pytest
 
 from brilliant_mqtt import mqttio
@@ -32,15 +33,13 @@ from brilliant_mqtt.config import Settings
 from brilliant_mqtt.mqttio import AioMqttAdapter
 
 
-def _settings(**overrides: object) -> Settings:
-    base: dict[str, object] = {
-        "panel": "office",
-        "mqtt_host": "broker.invalid",
-        "mqtt_username": "u",
-        "mqtt_password": "p",
-    }
-    base.update(overrides)
-    return Settings(**base)  # type: ignore[arg-type]
+def _settings() -> Settings:
+    return Settings(
+        panel="office",
+        mqtt_host="broker.invalid",
+        mqtt_username="u",
+        mqtt_password="p",
+    )
 
 
 def _msg(topic: str, payload: bytes = b"x") -> aiomqtt.Message:
@@ -246,6 +245,52 @@ def test_adapter_wires_bounded_transport_queue(monkeypatch: pytest.MonkeyPatch) 
     assert adapter.consume_transport_overload() is False
 
 
+def _paho_message(topic: str, payload: bytes) -> paho.MQTTMessage:
+    """A minimal paho message as its socket callback hands to aiomqtt."""
+    message = paho.MQTTMessage(mid=0, topic=topic.encode())
+    message.payload = payload
+    message.qos = 1
+    return message
+
+
+class _AiomqttClientInternals(Protocol):
+    """The private aiomqtt.Client surface this seam test drives (client.py): the
+    incoming queue built via our ``queue_type`` hook, and the paho message
+    callback. Declared so the test type-checks with no suppression."""
+
+    _queue: mqttio._BoundedTransportQueue
+
+    def _on_message(self, client: object, userdata: object, message: paho.MQTTMessage) -> None: ...
+
+
+async def test_queuefull_is_swallowed_by_real_aiomqtt_on_message(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Seam test: our bounded queue's overload signal must integrate with the
+    REAL aiomqtt callback. aiomqtt's _on_message wraps put_nowait in
+    ``except asyncio.QueueFull`` (client.py) and re-raises anything else into
+    paho, breaking the read loop — so _trip MUST raise exactly QueueFull. Drive
+    the real _on_message against a saturated real queue and assert it returns
+    without propagating (aiomqtt's 'Discarding message' path) while OUR latch
+    still trips. Constructs a real aiomqtt.Client (needs a running loop), so
+    this is async."""
+    caplog.set_level(logging.ERROR, logger=mqttio.__name__)
+    adapter = AioMqttAdapter(_settings())
+    # The REAL aiomqtt.Client, built with our queue_type; reach its private
+    # incoming queue + callback through a typed Protocol (no suppression).
+    client = cast(_AiomqttClientInternals, adapter._client)
+    for _ in range(mqttio._TRANSPORT_QUEUE_MAXSIZE):  # saturate to the count bound
+        client._queue.put_nowait(_msg(_MUTE, b"true"))
+
+    # One more, through aiomqtt's REAL socket-callback entrypoint. If _trip raised
+    # anything but QueueFull this would propagate out of _on_message; it must not.
+    client._on_message(None, None, _paho_message(_MUTE, b"true"))
+
+    assert client._queue.qsize() == mqttio._TRANSPORT_QUEUE_MAXSIZE  # bounded, not grown
+    assert adapter.consume_transport_overload() is True  # our overload observed
+    assert any("transport backlog exceeded" in record.message for record in caplog.records)
+
+
 # -- End-to-end stress: blocked bus command + saturated lane + flood ----------
 
 
@@ -269,6 +314,7 @@ class _QueueDrainingClient:
 
 async def test_blocked_bus_command_bounds_transport_backlog_end_to_end(
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Issue repro shape: block the handler, saturate a lossless lane, inject
     sustained traffic through the real put_nowait/reader/dispatcher path, and
@@ -278,7 +324,9 @@ async def test_blocked_bus_command_bounds_transport_backlog_end_to_end(
     latch = adapter._transport_overload
     # The bounded queue aiomqtt WOULD build, bound to the adapter's real latch.
     queue = _queue(latch, maxsize=mqttio._TRANSPORT_QUEUE_MAXSIZE)
-    adapter._client = _QueueDrainingClient(queue)  # type: ignore[assignment]
+    # Swap the real aiomqtt client for a queue-draining fake via setattr (the
+    # idiom used across the suite) — no assignment type-ignore needed.
+    monkeypatch.setattr(adapter, "_client", _QueueDrainingClient(queue))
 
     handler_entered = asyncio.Event()
     release = asyncio.Event()
