@@ -55,6 +55,10 @@ def _clock_ms() -> int:
     return int(time.time() * 1_000)
 
 
+class MqttReaderDeadError(RuntimeError):
+    """The MQTT receive loop stopped unexpectedly, so rebuild the session."""
+
+
 class BusStaleError(RuntimeError):
     """No bus push for longer than BUS_STALE_SECONDS — session presumed dead."""
 
@@ -269,6 +273,11 @@ async def _run_session(
         consecutive_resync_failures = 0
         while True:
             await asyncio.sleep(tick)
+
+            # The MQTT reader is intended to remain alive for the whole
+            # session; either an exception or a plain return requires rebuild.
+            if mqtt.consume_reader_failure():
+                raise MqttReaderDeadError("MQTT reader stopped — rebuilding session")
 
             # An (uncancelled) closed-source write exceeded the bus adapter's
             # fixed hard cap without settling — a wedged transport, so rebuild

@@ -105,6 +105,10 @@ class BusClient(Protocol):
 class MqttClient(Protocol):
     """Adapter for the central MQTT broker."""
 
+    def consume_reader_failure(self) -> bool:
+        """Return and clear whether the inbound reader stopped without cancellation."""
+        ...
+
     async def publish(self, topic: str, payload: str, retain: bool = False, qos: int = 0) -> None:
         """Publish *payload* to *topic* with the requested retain flag and QoS."""
         ...

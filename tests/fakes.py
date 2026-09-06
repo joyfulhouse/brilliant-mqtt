@@ -211,12 +211,18 @@ class FakeMqtt:
         self._message_cbs: list[Callable[[str, str, bool], Awaitable[None]]] = []
         self.connect_count = 0
         self.disconnect_count = 0
+        self.reader_failure_latched = False
 
     async def connect(self) -> None:
         self.connect_count += 1
 
     async def disconnect(self) -> None:
         self.disconnect_count += 1
+
+    def consume_reader_failure(self) -> bool:
+        failed = self.reader_failure_latched
+        self.reader_failure_latched = False
+        return failed
 
     async def publish(self, topic: str, payload: str, retain: bool = False, qos: int = 0) -> None:
         self.published.append((topic, payload, retain))
