@@ -16,10 +16,13 @@ import brilliant_mqtt.__main__ as main_mod
 from brilliant_bus_watchdog.health import bus_confirmed, heartbeat_age
 from brilliant_bus_watchdog.reboot_guard import GuardPolicy, RebootGuard
 from brilliant_bus_watchdog.run import handle, should_reboot
+from brilliant_mqtt.bridge import Bridge
 from brilliant_mqtt.config import Settings
+from brilliant_mqtt.heartbeat import write_heartbeat
 from brilliant_mqtt.model import BrilliantDevice
 from brilliant_mqtt.protocols import CommandSubscribeError
 from brilliant_mqtt.retained_topics import RetainedLedgerError
+from tests.fakes import FakeBus, FakeMqtt
 
 
 class _Bus:
@@ -133,24 +136,6 @@ class _ReadOnceBridge:
         raise asyncio.CancelledError
 
 
-class _BeatingBridge:
-    """A panel bridge whose reconcile does one bus read then beats — the real
-    Bridge.reconcile contract (bridge.py: ``get_all`` then ``_beat``), and
-    returns normally so the session proceeds past reconcile. Reaching reconcile
-    therefore leaves a FRESH heartbeat on disk."""
-
-    def __init__(self, *args: object, **kwargs: object) -> None:
-        self._bus = cast(_Bus, args[0])
-        self._heartbeat = cast(Callable[[], None], kwargs["heartbeat"])
-
-    async def reconcile(self) -> None:
-        await self._bus.get_all()
-        self._heartbeat()
-
-    async def withdraw(self) -> None:
-        return
-
-
 def _settings(
     tmp_path: Path,
     mesh_priority: int = 0,
@@ -182,7 +167,7 @@ def _install_session_fakes(
     monkeypatch: pytest.MonkeyPatch,
     bus: _Bus,
     mqtt: _Mqtt,
-    bridge: type[_NoopBridge] | type[_ReadOnceBridge] | type[_BeatingBridge] = _NoopBridge,
+    bridge: type[_NoopBridge] | type[_ReadOnceBridge] = _NoopBridge,
 ) -> None:
     monkeypatch.setattr(main_mod, "RpcBusAdapter", lambda **kwargs: bus)
     monkeypatch.setattr(main_mod, "AioMqttAdapter", lambda settings: mqtt)
@@ -401,14 +386,18 @@ async def test_successful_bus_read_refreshes_heartbeat_without_resetting_phase(
     )
 
 
-# --- issue #87 audit follow-up: two ways a broker-only fault can reboot a
-# HEALTHY panel. Each test below MUST fail on unmodified main (it proves the
-# defect); the fix, where applied, turns it green while the AC3 test
-# test_sustained_bus_handshake_failure_still_uses_reboot_guard stays green.
+# --- issue #87 audit follow-up: broker-only faults that can reboot a HEALTHY
+# panel while the phase reads "bus". The ROOT cause is that the liveness
+# heartbeat is not stamped until AFTER broker-dependent work. The fix stamps it
+# first inside Bridge.reconcile (see test_reconcile_beats_before_broker_publish,
+# GREEN); two residual windows that a tight, AC3-preserving fix cannot close are
+# kept as strict xfail demonstrations. AC3
+# (test_sustained_bus_handshake_failure_still_uses_reboot_guard) stays green.
 
 
 @pytest.mark.xfail(
     strict=True,
+    raises=AssertionError,
     reason=(
         "issue #87 DEFECT #1: the phase is stamped 'bus' before bus.start(), so "
         "bus_confirmed is True during the Thrift handshake window; a clean fix "
@@ -465,32 +454,48 @@ async def test_broker_recovery_bus_start_window_does_not_reboot_healthy_panel(
             await task
 
 
+@pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason=(
+        "issue #87 DEFECT #2 (scene-subscribe path): the scene bridge SUBSCRIBEs "
+        "before the first panel reconcile, so a persistent scene-topic subscribe "
+        "rejection tears the session down before any beat. The beat-first "
+        "reconcile fix (see test_reconcile_beats_before_broker_publish) does not "
+        "reach reconcile here; the clean fix (reconcile before scene start) needs "
+        "SceneBridge to register its callbacks at construction to avoid the "
+        "scene-blind reconcile window — out of scope. See PR body. Kept red."
+    ),
+)
 async def test_scene_subscribe_failure_never_reboots_a_healthy_panel(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """DEFECT #2 (issue #87 audit follow-up): with the scene bridge enabled the
-    session ran ``scene_bridge.async_start()`` — which SUBSCRIBEs to MQTT —
-    BEFORE the first panel reconcile/bus read.
+    """DEFECT #2 (issue #87 audit follow-up), scene-subscribe path: with the
+    scene bridge enabled the session runs ``scene_bridge.async_start()`` — which
+    SUBSCRIBEs to MQTT — BEFORE the first panel reconcile/bus read.
 
     A persistent subscribe rejection (a broker ACL that forbids the scene topic,
     or a SUBACK that never arrives) raises ``CommandSubscribeError`` every
     attempt: ``bus.start()`` has already succeeded and the phase is "bus", but
-    NO heartbeat is ever written, so the heartbeat goes stale while the phase
-    reads confirmed and the watchdog reboots a HEALTHY panel over a broker-only
-    fault. Deterministic, not a timing window.
+    NO heartbeat is ever written (only reconcile/poll beat, and reconcile is
+    never reached), so the heartbeat goes stale while the phase reads confirmed
+    and the watchdog reboots a HEALTHY panel over a broker-only fault.
+    Deterministic, not a timing window.
 
-    Reproduced with the REAL SceneBridge and a fake MQTT whose subscribe raises;
-    the fix runs the first reconcile (a real bus read + heartbeat) BEFORE the
-    scene subscribe can fail, so the heartbeat stays fresh.
+    Reproduced with the REAL SceneBridge and a fake MQTT whose subscribe raises.
+    Kept as a strict xfail: the beat-first reconcile fix cannot help because
+    reconcile is not reached, and the clean fix (run reconcile first) needs a
+    SceneBridge lifecycle change (register callbacks at construction) to avoid
+    reintroducing the scene-blind reconcile window — deferred; see PR body.
     """
     settings = _settings(tmp_path, scene_enabled=True)
-    # A prior healthy session's heartbeat; the first reconcile must refresh it,
-    # or it reads as stale.
+    # A prior healthy session's heartbeat; nothing refreshes it because the scene
+    # subscribe fails before the beating reconcile, so it reads as stale.
     _seed(settings.bus_heartbeat_file, "100.0")
 
     bus = _Bus()  # the local bus handshakes fine
     mqtt = _Mqtt(subscribe_error=CommandSubscribeError("scene command topic rejected"))
-    _install_session_fakes(monkeypatch, bus, mqtt, _BeatingBridge)
+    _install_session_fakes(monkeypatch, bus, mqtt)
 
     with pytest.raises(CommandSubscribeError, match="scene command topic rejected"):
         await main_mod._run_session(settings, None, None)
@@ -499,8 +504,6 @@ async def test_scene_subscribe_failure_never_reboots_a_healthy_panel(
     age = heartbeat_age(settings.bus_heartbeat_file, now=time.time(), started_at=0.0)
     assert bus.start_calls == 1  # the local bus was healthy...
     assert confirmed is True  # ...and the phase reached "bus"
-    # With the fix the first reconcile has already refreshed the heartbeat, so a
-    # broker-only scene-subscribe fault is not mistaken for a dead bus.
     assert age < 1800.0
     assert not should_reboot(
         age=age,
@@ -508,4 +511,59 @@ async def test_scene_subscribe_failure_never_reboots_a_healthy_panel(
         bridge_active=True,
         gateway_up=True,
         bus_confirmed=confirmed,
+    )
+
+
+class _AvailabilityPublishFailsMqtt(FakeMqtt):
+    """A broker that accepts everything except the retained availability PUBLISH
+    — models a broker that CONNECTs but rejects/hangs the first publish (an ACL
+    denial, or a QoS-1 PUBACK that never arrives)."""
+
+    async def publish(self, topic: str, payload: str, retain: bool = False, qos: int = 0) -> None:
+        if topic.endswith("/availability"):
+            raise ConnectionError("broker rejected the availability publish")
+        await super().publish(topic, payload, retain, qos)
+
+
+async def test_reconcile_beats_before_broker_publish(tmp_path: Path) -> None:
+    """DEFECT #2 root cause (issue #87 audit follow-up): ``Bridge.reconcile``
+    must stamp the liveness heartbeat BEFORE its first broker-dependent publish.
+
+    Reconcile's first act is a retained availability PUBLISH. A broker that
+    CONNECTs but rejects or hangs that publish makes reconcile raise; if the beat
+    came after the publish, no heartbeat is ever written and the heartbeat goes
+    stale while the phase reads "bus" — the bus watchdog then reboots a HEALTHY
+    panel over a broker-only fault. The fix reads the bus and beats FIRST, so a
+    broker-only publish failure leaves the heartbeat fresh.
+
+    Uses the REAL ``Bridge`` (not a fake) so it exercises reconcile's true
+    ordering; it fails without the beat-first fix and passes with it.
+    """
+    heartbeat_file = str(tmp_path / "bus-heartbeat")
+    # A prior healthy session's heartbeat; only a reconcile beat can refresh it.
+    _seed(heartbeat_file, "100.0")
+
+    def _beat() -> None:
+        write_heartbeat(heartbeat_file, time.time)
+
+    bus = FakeBus([])  # the bus answers a read fine
+    mqtt = _AvailabilityPublishFailsMqtt()
+    bridge = Bridge(bus, mqtt, "office", heartbeat=_beat)
+
+    with pytest.raises(ConnectionError, match="broker rejected the availability publish"):
+        await bridge.reconcile()
+
+    age = heartbeat_age(heartbeat_file, now=time.time(), started_at=0.0)
+    # Beat-first: the bus read + heartbeat happen before the availability publish,
+    # so a broker-only publish failure leaves the heartbeat fresh.
+    assert age < 1800.0
+    assert not should_reboot(
+        age=age,
+        stale_after=1800.0,
+        bridge_active=True,
+        gateway_up=True,
+        # The session stamps the phase "bus" before this reconcile, so the
+        # watchdog would treat the panel as confirmed; only the fresh heartbeat
+        # holds the reboot back.
+        bus_confirmed=True,
     )

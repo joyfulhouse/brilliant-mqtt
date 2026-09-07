@@ -281,17 +281,9 @@ async def _run_session(
         # the phase at "pre_bus".
         write_phase(settings.bus_phase_file, "bus")
         await bus.start()
-        # The first reconcile is a real bus read that also stamps the liveness
-        # heartbeat; run it BEFORE the scene bridge subscribes. A persistent
-        # scene-topic SUBSCRIBE rejection (a broker ACL fault, or a SUBACK that
-        # never arrives) raises every startup attempt without ever reading the
-        # bus, so subscribing first would leave the heartbeat starved while the
-        # phase says "bus" — and the bus watchdog would reboot a healthy panel
-        # over a broker-only fault (#87). Reconciling first keeps the heartbeat
-        # fresh; a real bus/handshake failure still fails reconcile itself.
-        await panel_bridge.reconcile()
         if scene_bridge is not None:
             await scene_bridge.async_start()
+        await panel_bridge.reconcile()
 
         tick = settings.hot_poll_seconds if settings.hot_poll_seconds > 0 else _IDLE_TICK_S
         next_resync = time.monotonic() + settings.resync_seconds
