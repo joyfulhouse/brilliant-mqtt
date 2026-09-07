@@ -1847,9 +1847,10 @@ class PanelManager:
             # HA cannot observe the bridge's availability LWT while its own broker link
             # is down, so "did not come back" is unknowable and an escalation would be
             # misleading (#95). SUSPEND the verdict (do not fall to grace): remember this
-            # window so async_broker_reconnected re-arms RECOVERY with the same origin —
-            # an 'online' LWT still fires repair_succeeded, a still-offline panel still
-            # gets the correct 'did not come back' repair_failed. Skips the journal SSH.
+            # verdict so async_broker_reconnected re-arms a fresh RECOVERY window with
+            # the same origin — an 'online' LWT still fires repair_succeeded, a
+            # still-offline panel still gets the correct 'did not come back'
+            # repair_failed. Skips the journal SSH.
             self._defer_recovery_verdict()
             return
         if self._recovery_activity and self._recovery_window == _RECOVERY_SECONDS:
@@ -1875,6 +1876,13 @@ class PanelManager:
         journal = ""
         try:
             async with self._ssh_lock:
+                if (
+                    self._shutting_down
+                    or self.problem_reason == _RETAINED_LEDGER_PROBLEM
+                    or self.availability == AVAILABILITY_ONLINE
+                    or my_generation != self._recovery_generation
+                ):
+                    return
                 if self._broker_unavailable():
                     self._defer_recovery_verdict()
                     return
@@ -1906,6 +1914,7 @@ class PanelManager:
         if self._broker_unavailable():
             self._defer_recovery_verdict()
             return
+        self._cancel("_grace_cancel")
         self._fire(EVENT_REPAIR_FAILED, {"reason": "still_offline"})
         reason = f"bridge did not come back within {window:.0f} s after the {origin}"
         if _BUS_LIB_DRIFT_SIGNATURE.search(journal):
