@@ -1084,6 +1084,13 @@ class _StartHarness:
         mod("thrift_types.message_bus.ttypes", SubscriptionRequest=_FakeSubscriptionRequest)
 
 
+def _assert_unwound(harness: _StartHarness, adapter: RpcBusAdapter) -> None:
+    """A failed start() left no live processor/observer and never marked ready."""
+    assert harness.live_procs == []
+    assert harness.live_observers == []
+    assert adapter._own_device_id is None
+
+
 class TestPartialStartupUnwind:
     """#88: own obs/proc BEFORE starting them and unwind on any
     exception/cancellation, so a failure between the first allocation and the
@@ -1099,11 +1106,9 @@ class TestPartialStartupUnwind:
         with pytest.raises(RuntimeError, match="proc start boom"):
             await adapter.start()
 
-        assert harness.live_procs == []  # the constructed processor was shut down
-        assert harness.live_observers == []  # and the constructed observer
-        assert adapter._obs is None
+        _assert_unwound(harness, adapter)  # constructed proc + observer both shut down
+        assert adapter._obs is None  # cleared by the shared close helper
         assert adapter._proc is None
-        assert adapter._own_device_id is None  # never marked ready
         assert adapter._pending_tasks == set()
         assert adapter._write_tasks == set()
 
@@ -1118,9 +1123,7 @@ class TestPartialStartupUnwind:
         with pytest.raises(TimeoutError):
             await adapter.start()
 
-        assert harness.live_procs == []  # proc started then shut down
-        assert harness.live_observers == []
-        assert adapter._own_device_id is None
+        _assert_unwound(harness, adapter)  # proc started then shut down
 
     async def test_observer_start_failure_closes_everything(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1131,9 +1134,7 @@ class TestPartialStartupUnwind:
         with pytest.raises(RuntimeError, match="obs start boom"):
             await adapter.start()
 
-        assert harness.live_procs == []
-        assert harness.live_observers == []
-        assert adapter._own_device_id is None
+        _assert_unwound(harness, adapter)
 
     async def test_own_subscription_failure_closes_everything(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1145,9 +1146,7 @@ class TestPartialStartupUnwind:
             await adapter.start()
 
         assert harness.subscribed == ["own-device"]  # failed on the own-device sub
-        assert harness.live_procs == []
-        assert harness.live_observers == []
-        assert adapter._own_device_id is None
+        _assert_unwound(harness, adapter)
 
     async def test_extra_subscription_failure_closes_everything(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1159,9 +1158,7 @@ class TestPartialStartupUnwind:
             await adapter.start()
 
         assert harness.subscribed == ["own-device", "ble_mesh"]  # own ok, extra failed
-        assert harness.live_procs == []
-        assert harness.live_observers == []
-        assert adapter._own_device_id is None
+        _assert_unwound(harness, adapter)
 
     async def test_cancellation_during_startup_unwinds(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1176,9 +1173,7 @@ class TestPartialStartupUnwind:
         with pytest.raises(asyncio.CancelledError):
             await task
 
-        assert harness.live_procs == []
-        assert harness.live_observers == []
-        assert adapter._own_device_id is None
+        _assert_unwound(harness, adapter)
 
     async def test_three_failed_starts_do_not_accumulate(
         self, monkeypatch: pytest.MonkeyPatch

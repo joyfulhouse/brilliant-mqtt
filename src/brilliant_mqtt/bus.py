@@ -614,22 +614,22 @@ class RpcBusAdapter:
         """Add a callback fired after the bus session reconnects."""
         self._reconnect_cbs.append(cb)
 
-    def _on_proc_reconnect(self, session: int | None = None, *args: Any, **kwargs: Any) -> None:
+    def _on_proc_reconnect(self, session: int | None = None) -> None:
         """Processor reconnect signal (runs on the loop) → async fan-out.
 
-        Accepts any args defensively: the closed lib does not document the
-        callback signature (start() registers a wrapper that marshals it onto
-        the loop and passes this session's token). A reconnect proves the
-        stream is alive again, so the stale clock resets here — otherwise the
-        watchdog could tear down a session that just recovered.
+        ``start()`` registers a wrapper that absorbs the lib's undocumented
+        callback args, marshals this onto the loop, and passes the session
+        token. A reconnect proves the stream is alive again, so the stale clock
+        resets here — otherwise the watchdog could tear down a session that just
+        recovered.
 
         Reconnect-admission fence (#88): dropped once the adapter is tearing
         down, or if it belongs to a prior session — otherwise a stale reconnect
         would reset the new session's clocks and spawn work against it.
         """
-        if self._shutting_down:
-            return
-        if session is not None and session != self._session:
+        if session is None:
+            session = self._session
+        if self._shutting_down or session != self._session:
             return
         logger.warning("bus processor reconnected; re-subscribing and re-reconciling")
         self._note_push()
