@@ -138,6 +138,8 @@ def test_reboot_not_lost_when_guard_read_would_flap() -> None:
         action = lad.observe(gateway_up=False, now=wall, reboot_eligible=eligible)
         if action != Action.NONE:
             run.handle(action, guard=g, now=wall, recovery_mod=rec, reboot_eligible=eligible)
+        if action == Action.GPIO_RESET_REBOOT:
+            break  # a successful request replaces the running process
     assert rec.calls.count("reboot") == 1  # fired once, never lost
     assert g.recorded == [360.0]  # and recorded against the cap
 

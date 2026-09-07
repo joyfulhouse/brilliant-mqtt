@@ -27,6 +27,21 @@ class _LadderLike(Protocol):
     def observe(self, *, gateway_up: bool, now: float, reboot_eligible: bool) -> Action: ...
 
 
+def _can_request(guard: _GuardLike, now: float) -> bool:
+    request_check = getattr(guard, "can_request", None)
+    if callable(request_check):
+        return bool(request_check(now))
+    return guard.can_reboot(now)
+
+
+def _record_request(guard: _GuardLike, now: float) -> None:
+    request_record = getattr(guard, "record_request", None)
+    if callable(request_record):
+        request_record(now)
+    else:
+        guard.record(now)
+
+
 @dataclass(frozen=True)
 class Config:
     interval: float
@@ -73,7 +88,7 @@ def handle(
     now: float,
     reboot_eligible: bool = False,
     recovery_mod: Any = recovery,
-) -> None:
+) -> int | None:
     if action == Action.SOFT_RECONNECT:
         _LOG.warning("gateway down ~90s: connman reconnect")
         recovery_mod.soft_reconnect()
@@ -89,16 +104,24 @@ def handle(
         )
     elif action == Action.GPIO_RESET_REBOOT:
         # Act on the SAME eligibility the ladder used this poll (passed in) — a
-        # second, independent guard read here could disagree and, since the ladder
-        # commits "reboot" only on an actual fire, silently strand it.  Defense in
-        # depth: never reboot unless that shared read said eligible; if not, the
-        # ladder has already deferred, so just log the blocked path (never silent).
+        # second, independent guard read here could disagree with the ladder's
+        # pending-request latch. Defense in depth: never reboot unless that shared
+        # read said eligible; otherwise log the blocked path (never silent).
         if reboot_eligible:
             _LOG.error("gateway down ~360s: GPIO/SDIO reset + reboot")
-            guard.record(now)
-            recovery_mod.gpio_reset_and_reboot()
+            _record_request(guard, now)
+            result = recovery_mod.gpio_reset_and_reboot()
+            if isinstance(result, int):
+                if result == 0:
+                    _LOG.error("reboot requested; waiting for a new boot identity")
+                else:
+                    _LOG.error(
+                        "reboot request failed with status %d; recovery remains pending", result
+                    )
+                return result
         else:
             _LOG.error("gateway down ~360s but reboot guard blocked (cooldown/cap) — notify only")
+    return None
 
 
 def _configure_logging(path: str) -> None:
@@ -125,7 +148,7 @@ def _poll_once(cfg: Config, *, guard: _GuardLike, ladder: _LadderLike) -> None:
     # never act on disagreeing eligibility (rung-elapsed math stays monotonic;
     # only the guard-facing timestamp is wall-clock).
     wall = time.time()
-    eligible = guard.can_reboot(wall)
+    eligible = _can_request(guard, wall)
     action = ladder.observe(gateway_up=gateway_up, now=time.monotonic(), reboot_eligible=eligible)
     if action != Action.NONE:
         handle(action, guard=guard, now=wall, reboot_eligible=eligible)
