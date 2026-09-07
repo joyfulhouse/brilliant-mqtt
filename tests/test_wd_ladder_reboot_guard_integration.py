@@ -53,16 +53,16 @@ def _poll(
 ) -> tuple[Action, bool]:
     """One watchdog iteration, mirroring ``run.main()``'s ladder/guard coupling.
 
-    ``run.main()`` reads guard eligibility once from wall-clock time, feeds it to
-    ``observe``, and hands any non-NONE action to ``handle`` (which records the
-    stamp for a real reboot).  A single ``t`` stands in for both the wall clock
-    (guard) and the monotonic clock (ladder); in production they advance together.
-    Returns the action and the eligibility the guard reported this poll.
+    ``run.main()`` reads guard eligibility ONCE from wall-clock time and shares it
+    with both ``observe`` and ``handle`` (no second, independent guard read that
+    could desync); ``handle`` records the stamp for a real reboot.  A single ``t``
+    stands in for both the wall clock (guard) and the monotonic clock (ladder); in
+    production they advance together.  Returns the action and this poll's eligibility.
     """
     eligible = guard.can_reboot(t)
     action = ladder.observe(gateway_up=gateway_up, now=t, reboot_eligible=eligible)
     if action != Action.NONE:
-        run.handle(action, guard=guard, now=t, recovery_mod=rec)
+        run.handle(action, guard=guard, now=t, recovery_mod=rec, reboot_eligible=eligible)
     return action, eligible
 
 

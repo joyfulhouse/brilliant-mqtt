@@ -65,20 +65,16 @@ class Ladder:
         for name, action in reversed(_RUNGS):
             if elapsed < self._threshold(name) or name in self._fired:
                 continue
-            if name != "reboot":
-                # soft/restart are never blocked → mark fired-forever for this outage.
-                self._fired.add(name)
-                return action
-            # Reboot is gated by the persistent guard.  Only mark it fired once it
-            # actually fires; while blocked it stays pending so a later eligible
-            # poll re-arms it — no connectivity recovery required (issue #91).
-            if reboot_eligible:
-                self._fired.add(name)
+            if name == "reboot" and not reboot_eligible:
+                # Reboot is due but the guard blocks it.  Never mark it fired, so a
+                # later eligible poll re-arms it (issue #91); notify once, then keep
+                # walking to the cheaper rungs so a poll gap can't starve soft/restart.
+                if not self._reboot_deferred:
+                    self._reboot_deferred = True
+                    return Action.ESCALATE_NOTIFY
+                continue
+            self._fired.add(name)
+            if name == "reboot":
                 self._reboot_deferred = False
-                return action
-            if not self._reboot_deferred:
-                # First blocked poll of this outage: notify once, then stay quiet.
-                self._reboot_deferred = True
-                return Action.ESCALATE_NOTIFY
-            return Action.NONE
+            return action
         return Action.NONE
