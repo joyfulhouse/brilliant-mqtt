@@ -1826,6 +1826,14 @@ class PanelManager:
             self.hass, _RECOVERY_SECONDS, self._recovery_timeout
         )
 
+    def _defer_recovery_verdict(self) -> None:
+        self._recovery_deferred = True
+        _LOGGER.info(
+            "%s: recovery window elapsed but HA's MQTT broker is unavailable; "
+            "deferring the recovery verdict until the broker reconnects",
+            self.panel,
+        )
+
     async def _recovery_timeout(self, _now: datetime) -> None:
         my_generation = self._recovery_generation
         self._recovery_cancel = None
@@ -1842,12 +1850,7 @@ class PanelManager:
             # window so async_broker_reconnected re-arms RECOVERY with the same origin —
             # an 'online' LWT still fires repair_succeeded, a still-offline panel still
             # gets the correct 'did not come back' repair_failed. Skips the journal SSH.
-            self._recovery_deferred = True
-            _LOGGER.info(
-                "%s: recovery window elapsed but HA's MQTT broker is unavailable; "
-                "deferring the recovery verdict until the broker reconnects",
-                self.panel,
-            )
+            self._defer_recovery_verdict()
             return
         if self._recovery_activity and self._recovery_window == _RECOVERY_SECONDS:
             # The bridge is visibly trying (LWT/meta traffic) but not online yet —
@@ -1873,12 +1876,7 @@ class PanelManager:
         try:
             async with self._ssh_lock:
                 if self._broker_unavailable():
-                    self._recovery_deferred = True
-                    _LOGGER.info(
-                        "%s: recovery window elapsed but HA's MQTT broker is unavailable; "
-                        "deferring the recovery verdict until the broker reconnects",
-                        self.panel,
-                    )
+                    self._defer_recovery_verdict()
                     return
                 shell = self._shell()
                 await shell.connect()
@@ -1906,12 +1904,7 @@ class PanelManager:
         if my_generation != self._recovery_generation:
             return
         if self._broker_unavailable():
-            self._recovery_deferred = True
-            _LOGGER.info(
-                "%s: recovery window elapsed but HA's MQTT broker is unavailable; "
-                "deferring the recovery verdict until the broker reconnects",
-                self.panel,
-            )
+            self._defer_recovery_verdict()
             return
         self._fire(EVENT_REPAIR_FAILED, {"reason": "still_offline"})
         reason = f"bridge did not come back within {window:.0f} s after the {origin}"
