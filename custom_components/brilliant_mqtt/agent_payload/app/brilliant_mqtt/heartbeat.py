@@ -29,6 +29,7 @@ DEAD_WRITER_RETENTION_S = BRIDGE_SERVICE_RESTART_SEC * 60
 PHASE_RECORD_VERSION = "v2"
 PHASE_ATTEMPT = "attempt"
 PHASE_SUCCESS = "success"
+PHASE_UNARMED = "unarmed"
 MAX_PID = 2**31 - 1
 _last_attempt: dict[str, float] = {}
 
@@ -46,15 +47,21 @@ class PhaseRecord:
     bus_read_succeeded: bool | None
 
     def encode(self) -> str:
-        timing = (
-            ("-", "-", "-")
-            if self.failure_started_at is None
-            else (
+        if self.failure_started_at is None:
+            timing = ("-", "-", "-")
+        else:
+            status = (
+                PHASE_UNARMED
+                if self.bus_read_succeeded is None
+                else PHASE_SUCCESS
+                if self.bus_read_succeeded
+                else PHASE_ATTEMPT
+            )
+            timing = (
                 repr(self.failure_started_at),
                 repr(self.bus_updated_at),
-                PHASE_SUCCESS if self.bus_read_succeeded else PHASE_ATTEMPT,
+                status,
             )
-        )
         return " ".join(
             (
                 PHASE_RECORD_VERSION,
@@ -95,7 +102,7 @@ class PhaseRecord:
             timing: tuple[float | None, float | None] = (None, None)
             read_succeeded: bool | None = None
         else:
-            if timing_parts[2] not in (PHASE_ATTEMPT, PHASE_SUCCESS):
+            if timing_parts[2] not in (PHASE_ATTEMPT, PHASE_SUCCESS, PHASE_UNARMED):
                 return None
             try:
                 parsed = (float(timing_parts[0]), float(timing_parts[1]))
@@ -107,7 +114,9 @@ class PhaseRecord:
             ):
                 return None
             timing = parsed
-            read_succeeded = timing_parts[2] == PHASE_SUCCESS
+            read_succeeded = (
+                None if timing_parts[2] == PHASE_UNARMED else timing_parts[2] == PHASE_SUCCESS
+            )
         phase: BusPhase = "pre_bus" if parts[1] == "pre_bus" else "bus"
         return cls(
             phase=phase,
@@ -242,17 +251,26 @@ def _inheritable_history(
     return record
 
 
-def _invalidate_failed_write(path: str, write_error: BaseException) -> None:
+def _invalidate_failed_write(
+    path: str,
+    write_error: BaseException,
+    *,
+    repeated: bool = False,
+) -> None:
+    warning_level = logging.DEBUG if repeated else logging.WARNING
+    error_level = logging.DEBUG if repeated else logging.ERROR
     try:
         os.unlink(path)
     except FileNotFoundError:
-        logger.warning(
+        logger.log(
+            warning_level,
             "bus phase write failed for %s; marker absent and reboot guard disabled",
             path,
             exc_info=(type(write_error), write_error, write_error.__traceback__),
         )
     except OSError as invalidation_error:
-        logger.error(
+        logger.log(
+            error_level,
             "bus phase write failed for %s and marker invalidation failed: %s; "
             "stale marker remains but its live-writer lease was released",
             path,
@@ -260,7 +278,8 @@ def _invalidate_failed_write(path: str, write_error: BaseException) -> None:
             exc_info=(type(write_error), write_error, write_error.__traceback__),
         )
     else:
-        logger.warning(
+        logger.log(
+            warning_level,
             "bus phase write failed for %s; marker cleared and reboot guard disabled",
             path,
             exc_info=(type(write_error), write_error, write_error.__traceback__),
@@ -337,6 +356,17 @@ def write_phase(
         return True
     now = monotonic_clock()
     lease = _phase_leases.get(path)
+    if phase == "pre_bus":
+        _last_attempt.pop(path, None)
+    last_failed_attempt = _last_attempt.get(path)
+    repeated_failure = last_failed_attempt is not None
+    if (
+        phase == "bus"
+        and bus_read_succeeded
+        and last_failed_attempt is not None
+        and now - last_failed_attempt < _MIN_WRITE_INTERVAL_S
+    ):
+        return False
     if (
         phase == "bus"
         and bus_read_succeeded
@@ -392,7 +422,14 @@ def write_phase(
             bus_read_succeeded=read_succeeded,
         )
         encoded = record.encode()
-        written_record = replace(record, phase="pre_bus") if phase == "bus" else record
+        if phase == "bus" and lease is not None and owned and _rewrite_phase_lease(path, encoded):
+            _owned_phase_records[path] = record
+            lease.last_success_write = now if bus_read_succeeded else None
+            _last_attempt.pop(path, None)
+            return True
+        written_record = (
+            replace(record, phase="pre_bus", bus_read_succeeded=None) if phase == "bus" else record
+        )
         try:
             _atomic_write(path, written_record.encode())
         except (OSError, UnicodeError) as write_error:
@@ -408,10 +445,12 @@ def write_phase(
                     path,
                     exc_info=(type(write_error), write_error, write_error.__traceback__),
                 )
+                _last_attempt.pop(path, None)
                 return True
             _owned_phase_records.pop(path, None)
             _release_phase_lease(path)
-            _invalidate_failed_write(path, write_error)
+            _last_attempt[path] = now
+            _invalidate_failed_write(path, write_error, repeated=repeated_failure)
             return False
         _owned_phase_records[path] = written_record
         _release_phase_lease(path)
@@ -420,16 +459,19 @@ def write_phase(
                 _acquire_phase_lease(path, now if bus_read_succeeded else None)
             except BlockingIOError:
                 _owned_phase_records.pop(path, None)
-                logger.warning(
+                logger.log(
+                    logging.DEBUG if repeated_failure else logging.WARNING,
                     "bus phase lease unavailable for %s after bounded retries; "
                     "reboot guard disabled",
                     path,
                     exc_info=True,
                 )
+                _last_attempt[path] = now
                 return False
             if not _rewrite_phase_lease(path, encoded):
                 raise OSError("cannot arm bus phase marker")
             _owned_phase_records[path] = record
+        _last_attempt.pop(path, None)
         return True
     except BlockingIOError:
         _release_phase_lease(path)
@@ -437,5 +479,6 @@ def write_phase(
     except (OSError, UnicodeError) as error:
         _owned_phase_records.pop(path, None)
         _release_phase_lease(path)
-        _invalidate_failed_write(path, error)
+        _last_attempt[path] = now
+        _invalidate_failed_write(path, error, repeated=repeated_failure)
         return False

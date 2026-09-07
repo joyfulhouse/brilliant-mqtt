@@ -10,6 +10,7 @@ from typing import Literal
 PHASE_RECORD_VERSION = "v2"
 PHASE_ATTEMPT = "attempt"
 PHASE_SUCCESS = "success"
+PHASE_UNARMED = "unarmed"
 DEAD_WRITER_RETENTION_S = 300.0
 MAX_PID = 2**31 - 1
 
@@ -56,7 +57,7 @@ class PhaseRecord:
             timing: tuple[float | None, float | None] = (None, None)
             read_succeeded: bool | None = None
         else:
-            if timing_parts[2] not in (PHASE_ATTEMPT, PHASE_SUCCESS):
+            if timing_parts[2] not in (PHASE_ATTEMPT, PHASE_SUCCESS, PHASE_UNARMED):
                 return None
             try:
                 parsed = (float(timing_parts[0]), float(timing_parts[1]))
@@ -68,7 +69,9 @@ class PhaseRecord:
             ):
                 return None
             timing = parsed
-            read_succeeded = timing_parts[2] == PHASE_SUCCESS
+            read_succeeded = (
+                None if timing_parts[2] == PHASE_UNARMED else timing_parts[2] == PHASE_SUCCESS
+            )
 
         phase: BusPhase = "pre_bus" if parts[1] == "pre_bus" else "bus"
         return cls(

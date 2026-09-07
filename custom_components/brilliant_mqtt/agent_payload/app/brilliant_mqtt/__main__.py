@@ -171,6 +171,7 @@ async def _run_session(
     bus = RpcBusAdapter(extra_device_ids=(_MESH_DEVICE_ID,) if participating else ())
     scene_bridge: SceneBridge | None = None
     mqtt_connected = False
+    phase_marker_failure_logged = False
     try:
         owned_topics = RetainedTopicLedger(
             settings.panel,
@@ -194,9 +195,14 @@ async def _run_session(
         )
 
         def _beat() -> None:
+            nonlocal phase_marker_failure_logged
             write_heartbeat(settings.bus_heartbeat_file, time.time)
             if not write_phase(settings.bus_phase_file, "bus", bus_read_succeeded=True):
-                log.error("bus phase marker unavailable; reboot guard disabled")
+                log.log(
+                    logging.DEBUG if phase_marker_failure_logged else logging.ERROR,
+                    "bus phase marker unavailable; reboot guard disabled",
+                )
+                phase_marker_failure_logged = True
 
         # Bridges register their bus/mqtt callbacks in __init__, BEFORE any I/O
         # starts — so no early change/command event is missed.
@@ -294,6 +300,7 @@ async def _run_session(
         # the phase at "pre_bus".
         if not write_phase(settings.bus_phase_file, "bus"):
             log.error("bus phase marker unavailable; reboot guard disabled")
+            phase_marker_failure_logged = True
         await bus.start()
         await panel_bridge.reconcile()
         if scene_bridge is not None:
