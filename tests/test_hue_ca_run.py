@@ -133,6 +133,26 @@ def test_run_once_returns_zero_when_restart_fails_and_marks_pending() -> None:
     assert load_pending(fs, "/state.json") is not None  # reload owed, persisted
 
 
+def test_run_once_returns_one_when_reload_owed_but_unrecordable() -> None:
+    # finding #1: appended, restart failed, AND the marker could not be recorded
+    # (state dir unwritable) -> nothing will retry, so run_once must FAIL (rc 1),
+    # not report a healthy "will retry".
+    class UnwritableFS(FakeFS):
+        def write_text(self, path: str, text: str) -> None:
+            raise OSError(30, "EROFS")
+
+    fs = UnwritableFS({"/b": True}, {"/b": ""})  # empty bundle -> CA absent
+    coord = FakeCoord(running=True, fail=True)  # restart fails
+    rc = run_once(
+        {"HUE_CA_BUNDLE_PATH": "/b", "HUE_CA_STATE_PATH": "/state.json"},
+        fs=fs,
+        coordinator=coord,
+        read_ca=lambda _p: CA,
+    )
+    assert rc == 1
+    assert coord.attempts == 1  # restart was still attempted
+
+
 def test_run_once_survives_unreadable_state_file() -> None:
     # An OSError reading an existing state file must not crash run_once or be
     # misdiagnosed as a bundle-write failure: rc == 0 and the reload is requested.

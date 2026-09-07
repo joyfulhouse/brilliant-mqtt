@@ -46,6 +46,10 @@ class Outcome:
     # True when, after this pass, a coordinator reload is still owed (marker set
     # or a torn marker seen): the restart failed, was killed, or was paced/held.
     reload_pending: bool = False
+    # False only when a reload is owed but its marker could NOT be recorded (the
+    # state dir is unwritable) — nothing on disk can drive a retry, so a pending
+    # reload with marker_persisted=False is a hard failure, not "will retry".
+    marker_persisted: bool = True
 
 
 def cert_fingerprint(pem: str) -> str:
@@ -176,7 +180,12 @@ def _reconcile_present(
     pending = load_pending(fs, state_path)
     if pending is not None:
         if pending.fingerprint != want_fp:
-            return Outcome(True, False, False, path)  # marker is for another CA
+            # Marker is for a retired CA (its fingerprint isn't the one now in the
+            # bundle). Per the contract that reload is deliberately dropped; clear
+            # the stale marker so the state file returns to the sentinel instead of
+            # being re-read and ignored on every tick forever.
+            _clear_marker(fs, state_path)
+            return Outcome(True, False, False, path)
         # Same CA (its fingerprint is in the bundle). The stored bundle_path may
         # differ from the path resolved this run (operator changed
         # HUE_CA_BUNDLE_PATH, or a glob resolved differently) — the reload is
@@ -242,20 +251,27 @@ def reconcile(
         )
 
     running = coordinator.is_running()
-    if running and not _save_marker(fs, state_path, PendingReload(path, want_fp, now)):
+    marker_persisted = True
+    if running:
         # Reload will be owed: persist the marker BEFORE the append so a kill in
         # the marker->append->restart window is always recoverable. A failed
         # write here is only warned — on a first append the reload is definitely
         # owed and there's no prior marker to loop on, so the restart must still
-        # be attempted (issue #96 round 1).
-        _LOG.warning(
-            "could not persist pending-reload marker at %s; reload still attempted",
-            state_path,
-        )
+        # be attempted (issue #96 round 1). But if the marker did NOT persist and
+        # the restart then fails, nothing on disk can drive a retry — we surface
+        # that via marker_persisted so run_once can flag it (round 3).
+        marker_persisted = _save_marker(fs, state_path, PendingReload(path, want_fp, now))
+        if not marker_persisted:
+            _LOG.warning(
+                "could not persist pending-reload marker at %s; reload still attempted",
+                state_path,
+            )
     fs.append_text(path, _appendable(ca_pem))
     if not running:
         # Not the Hue host: no coordinator to reload, so nothing is owed and no
         # marker is created.
         return Outcome(True, True, False, path)
     restarted = _restart_and_clear(fs, coordinator, state_path)
-    return Outcome(True, True, restarted, path, reload_pending=not restarted)
+    return Outcome(
+        True, True, restarted, path, reload_pending=not restarted, marker_persisted=marker_persisted
+    )

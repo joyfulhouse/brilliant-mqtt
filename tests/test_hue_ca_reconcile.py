@@ -713,3 +713,99 @@ def test_marker_with_stale_bundle_path_but_matching_fp_is_not_orphaned() -> None
     )
     assert coord.attempts == 1  # reload owed for the CA now present
     assert load_pending(fs, STATE) is None  # marker cleared after the reload
+
+
+# --- tribunal round 3: unrecordable owed reload, retired-CA marker cleanup -----
+
+
+def test_first_append_unrecordable_reload_is_not_falsely_retryable() -> None:
+    # finding #1: first append with an unwritable state dir AND a failed restart
+    # -> the reload is owed but NO marker persists, so nothing can drive a retry.
+    # reconcile must report marker_persisted=False (so run_once can flag it), not
+    # a false "will retry".
+    fs = UnwritableFS({"/b": CA_B}, {})
+    fs.raising = True  # state dir read-only from the start
+    coord = FakeCoord(running=True, fail_first=1)  # restart fails this run
+    out = reconcile(
+        fs,
+        coord,
+        bundle_path="/b",
+        site_packages_root="/sp",
+        ca_pem=CA_A,
+        state_path=STATE,
+        min_retry_interval_s=INTERVAL,
+        now=1000.0,
+    )
+    assert out.appended is True
+    assert out.reload_pending is True
+    assert out.marker_persisted is False  # marker could not be recorded
+    assert load_pending(fs, STATE) is None  # nothing on disk to drive a retry
+
+    # A fresh run cannot resurrect it (documents the limitation): cert now present
+    # but no marker exists, so it's a silent healthy no-op.
+    out2 = reconcile(
+        fs,
+        coord,
+        bundle_path="/b",
+        site_packages_root="/sp",
+        ca_pem=CA_A,
+        state_path=STATE,
+        min_retry_interval_s=INTERVAL,
+        now=2000.0,
+    )
+    assert out2.reload_pending is False
+    assert out2.coordinator_restarted is False
+
+
+def test_first_append_owed_reload_is_retryable_when_state_dir_writable() -> None:
+    # The contrast to the case above: a writable state dir records the marker, so
+    # marker_persisted stays True and a fresh run genuinely retries.
+    fs = FakeFS({"/b": CA_B}, {})
+    coord = FakeCoord(running=True, fail_first=1)
+    out = reconcile(
+        fs,
+        coord,
+        bundle_path="/b",
+        site_packages_root="/sp",
+        ca_pem=CA_A,
+        state_path=STATE,
+        min_retry_interval_s=INTERVAL,
+        now=1000.0,
+    )
+    assert out.reload_pending is True
+    assert out.marker_persisted is True
+    assert load_pending(fs, STATE) is not None  # marker recorded -> retryable
+
+    out2 = reconcile(
+        fs,
+        coord,
+        bundle_path="/b",
+        site_packages_root="/sp",
+        ca_pem=CA_A,
+        state_path=STATE,
+        min_retry_interval_s=INTERVAL,
+        now=2000.0,
+    )
+    assert out2.coordinator_restarted is True  # fresh run completed the reload
+
+
+def test_retired_ca_marker_is_cleared() -> None:
+    # finding #2: a valid marker for a retired CA (fingerprint differs from the CA
+    # now in the bundle) is dropped per contract, but must be CLEARED so the state
+    # file returns to the sentinel instead of being re-read/ignored forever.
+    fs = FakeFS({"/b": CA_B + CA_A}, {})
+    save_pending(fs, STATE, PendingReload("/b", cert_fingerprint(CA_B), last_attempt_at=0.0))
+    coord = FakeCoord(running=True)
+    for i in range(3):
+        reconcile(
+            fs,
+            coord,
+            bundle_path="/b",
+            site_packages_root="/sp",
+            ca_pem=CA_A,
+            state_path=STATE,
+            min_retry_interval_s=INTERVAL,
+            now=1000.0 * (i + 1),
+        )
+    assert load_pending(fs, STATE) is None  # sentinel restored
+    assert coord.attempts == 0  # no restart fired for the retired CA

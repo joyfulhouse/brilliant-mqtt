@@ -62,6 +62,18 @@ def run_once(
             cfg.site_packages_root,
         )
     elif outcome.appended:
+        if outcome.reload_pending and not outcome.marker_persisted:
+            # Appended, restart failed, AND the marker could not be recorded
+            # (state dir unwritable): nothing on disk will drive a retry, so this
+            # is NOT the self-healing "will retry" case. Fail the oneshot so it
+            # shows FAILED under systemd rather than a misleading healthy exit.
+            _LOG.error(
+                "appended CA to %s but the coordinator reload is owed and could NOT "
+                "be recorded (state dir unwritable); the next run will NOT retry — "
+                "manual intervention required",
+                outcome.bundle_path,
+            )
+            return 1
         _LOG.info(
             "appended CA to %s; coordinator_restarted=%s",
             outcome.bundle_path,
