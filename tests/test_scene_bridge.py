@@ -2137,6 +2137,11 @@ async def test_poll_gate_suppresses_identical_mode_value_and_timestamp(
     await bridge.poll_executions([_execution(mode_id="away", mode_at_ms=500)])
 
     assert processed == []
+    # Pin the fix: the seeded away@500 fingerprint must carry the synthetic mode
+    # timestamp key. A value-only fingerprint would omit it, leaving this test
+    # unable to distinguish the fixed gate from the buggy one.
+    fingerprint = scene_bridge_module._execution_fingerprint(seeded)
+    assert fingerprint["@manual_mode_id.timestamp_ms"] == str(500)
     await bridge.async_shutdown()
 
 
