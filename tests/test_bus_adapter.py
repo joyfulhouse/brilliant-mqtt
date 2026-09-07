@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import TypeVar
+import sys
+import types
+from typing import Any, TypeVar
 
 import pytest
 
@@ -940,3 +942,407 @@ class TestSetVariablesReceipt:
 
     async def test_raising_repr_normalizes(self) -> None:
         assert await self._write(_ReprBomb()) == "<unreprable response>"
+
+
+class _StartHarness:
+    """Fakes the panel libraries into ``sys.modules`` so ``RpcBusAdapter.start()``
+    runs off-panel, and records every processor/observer it constructs.
+
+    #88: start() must own the observer/processor before starting them and unwind
+    a partial startup on any failure. ``fail_at`` injects a failure at a chosen
+    stage; the recorded ``procs``/``observers`` then prove the constructed
+    resources were shut down (``live_*`` empty) rather than stranded.
+    """
+
+    def __init__(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        fail_at: str | tuple[str, str] | None = None,
+        block_proc_start: bool = False,
+    ) -> None:
+        self.fail_at = fail_at
+        self.block_proc_start = block_proc_start
+        self.procs: list[Any] = []
+        self.observers: list[Any] = []
+        self.subscribed: list[str] = []
+        self._proc_start_gate = asyncio.Event()
+        self._install(monkeypatch)
+
+    @property
+    def live_procs(self) -> list[Any]:
+        return [p for p in self.procs if not p.shut_down]
+
+    @property
+    def live_observers(self) -> list[Any]:
+        return [o for o in self.observers if not o.shut_down]
+
+    def release_proc_start(self) -> None:
+        self._proc_start_gate.set()
+
+    def _install(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        harness = self
+
+        class _FakeObserverBase:
+            def __init__(self, loop: Any) -> None:
+                self.loop = loop
+                self.started = False
+                self.shut_down = False
+                harness.observers.append(self)
+
+            async def start(self, proc: Any, _extra: Any) -> None:
+                if harness.fail_at == "obs_start":
+                    raise RuntimeError("obs start boom")
+                self.started = True
+
+            def get_owning_device_id(self) -> str:
+                return "own-device"
+
+            async def subscribe(self, request: Any) -> None:
+                device_id = str(request.device_id)
+                harness.subscribed.append(device_id)
+                if harness.fail_at == "own_sub" and device_id == "own-device":
+                    raise RuntimeError("own subscribe boom")
+                if harness.fail_at == ("extra_sub", device_id):
+                    raise RuntimeError(f"extra subscribe boom: {device_id}")
+
+            async def request_set_variables_in_peripheral(
+                self, peripheral_id: str, values: dict[str, str], *, device_id: str
+            ) -> str:
+                del peripheral_id, values, device_id
+                return "ok"
+
+            async def shutdown(self) -> None:
+                self.shut_down = True
+
+        class _FakeProc:
+            def __init__(
+                self,
+                *,
+                socket_path: str,
+                my_name: str,
+                handler: Any,
+                client_class: Any,
+                loop: Any,
+            ) -> None:
+                del socket_path, handler, client_class, loop
+                self.my_name = my_name
+                self.started = False
+                self.shut_down = False
+                self.reconnect_cbs: list[Any] = []
+                harness.procs.append(self)
+
+            async def start(self) -> None:
+                if harness.fail_at == "proc_start":
+                    raise RuntimeError("proc start boom")
+                if harness.block_proc_start:
+                    await harness._proc_start_gate.wait()
+                self.started = True
+
+            def is_connected(self) -> bool:
+                return harness.fail_at != "handshake"
+
+            def add_reconnect_callback(self, cb: Any) -> None:
+                self.reconnect_cbs.append(cb)
+
+            async def shutdown(self) -> None:
+                self.shut_down = True
+
+        class _FakeSubscriptionRequest:
+            def __init__(self, device_id: str) -> None:
+                self.device_id = device_id
+
+        class _FakePeripheralServer:
+            def __init__(self, observer: Any) -> None:
+                self.observer = observer
+
+        class _FakeMessageBusClient:
+            pass
+
+        def mod(name: str, **attrs: Any) -> types.ModuleType:
+            module = types.ModuleType(name)
+            for key, value in attrs.items():
+                setattr(module, key, value)
+            monkeypatch.setitem(sys.modules, name, module)
+            if "." in name:
+                parent_name, child = name.rsplit(".", 1)
+                setattr(sys.modules[parent_name], child, module)
+            return module
+
+        mod("lib")
+        mod("lib.protocol")
+        mod(
+            "lib.protocol.message_bus_peer_service",
+            PeripheralServer=_FakePeripheralServer,
+            MessageBusClient=_FakeMessageBusClient,
+        )
+        mod("lib.protocol.processor", SinglePeerProcessor=_FakeProc)
+        mod("lib.message_bus_api")
+        mod("lib.message_bus_api.observer_interface", RPCObserver=_FakeObserverBase)
+        mod("thrift_types")
+        mod("thrift_types.message_bus")
+        mod("thrift_types.message_bus.ttypes", SubscriptionRequest=_FakeSubscriptionRequest)
+
+
+class TestPartialStartupUnwind:
+    """#88: own obs/proc BEFORE starting them and unwind on any
+    exception/cancellation, so a failure between the first allocation and the
+    final commit never strands a live processor (which owns automatic-reconnect
+    work). Reproduces the issue's own injection points."""
+
+    async def test_processor_start_failure_closes_everything(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        harness = _StartHarness(monkeypatch, fail_at="proc_start")
+        adapter = RpcBusAdapter()
+
+        with pytest.raises(RuntimeError, match="proc start boom"):
+            await adapter.start()
+
+        assert harness.live_procs == []  # the constructed processor was shut down
+        assert harness.live_observers == []  # and the constructed observer
+        assert adapter._obs is None
+        assert adapter._proc is None
+        assert adapter._own_device_id is None  # never marked ready
+        assert adapter._pending_tasks == set()
+        assert adapter._write_tasks == set()
+
+    async def test_handshake_timeout_closes_everything(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(bus_mod, "_CONNECT_TIMEOUT_S", 0.02)
+        monkeypatch.setattr(bus_mod, "_CONNECT_POLL_S", 0.005)
+        harness = _StartHarness(monkeypatch, fail_at="handshake")
+        adapter = RpcBusAdapter()
+
+        with pytest.raises(TimeoutError):
+            await adapter.start()
+
+        assert harness.live_procs == []  # proc started then shut down
+        assert harness.live_observers == []
+        assert adapter._own_device_id is None
+
+    async def test_observer_start_failure_closes_everything(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        harness = _StartHarness(monkeypatch, fail_at="obs_start")
+        adapter = RpcBusAdapter()
+
+        with pytest.raises(RuntimeError, match="obs start boom"):
+            await adapter.start()
+
+        assert harness.live_procs == []
+        assert harness.live_observers == []
+        assert adapter._own_device_id is None
+
+    async def test_own_subscription_failure_closes_everything(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        harness = _StartHarness(monkeypatch, fail_at="own_sub")
+        adapter = RpcBusAdapter()
+
+        with pytest.raises(RuntimeError, match="own subscribe boom"):
+            await adapter.start()
+
+        assert harness.subscribed == ["own-device"]  # failed on the own-device sub
+        assert harness.live_procs == []
+        assert harness.live_observers == []
+        assert adapter._own_device_id is None
+
+    async def test_extra_subscription_failure_closes_everything(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        harness = _StartHarness(monkeypatch, fail_at=("extra_sub", "ble_mesh"))
+        adapter = RpcBusAdapter(extra_device_ids=("ble_mesh",))
+
+        with pytest.raises(RuntimeError, match="extra subscribe boom"):
+            await adapter.start()
+
+        assert harness.subscribed == ["own-device", "ble_mesh"]  # own ok, extra failed
+        assert harness.live_procs == []
+        assert harness.live_observers == []
+        assert adapter._own_device_id is None
+
+    async def test_cancellation_during_startup_unwinds(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        harness = _StartHarness(monkeypatch, block_proc_start=True)
+        adapter = RpcBusAdapter()
+
+        task = asyncio.create_task(adapter.start())
+        await _settle()  # reaches the blocked proc.start()
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert harness.live_procs == []
+        assert harness.live_observers == []
+        assert adapter._own_device_id is None
+
+    async def test_three_failed_starts_do_not_accumulate(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The issue's own reproduction: repeated failed attempts on the SAME
+        instance must not accumulate live processors/observers/tasks."""
+        harness = _StartHarness(monkeypatch, fail_at="proc_start")
+        adapter = RpcBusAdapter()
+
+        for _ in range(3):
+            with pytest.raises(RuntimeError, match="proc start boom"):
+                await adapter.start()
+
+        assert len(harness.procs) == 3  # one per attempt
+        assert len(harness.observers) == 3
+        assert harness.live_procs == []  # every one shut down: zero accumulated
+        assert harness.live_observers == []
+        assert adapter._pending_tasks == set()
+        assert adapter._write_tasks == set()
+
+
+class TestReusedSessionSafety:
+    """#88 criterion 4: a reused adapter's second start() must not stay stuck in
+    the first shutdown()'s ``_shutting_down`` state (which would reject every
+    write), and repeated start/shutdown cycles must not accumulate resources."""
+
+    async def test_cycles_do_not_accumulate_and_writes_work_after_restart(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        harness = _StartHarness(monkeypatch)
+        adapter = RpcBusAdapter()
+
+        for _ in range(3):
+            await adapter.start()
+            # A write must succeed after each (re)start: the shutting-down fence
+            # from the previous cycle has to have been reset for the new session.
+            receipt = await adapter.set_variables("own-device", "p", [VarSet("on", "1")])
+            assert receipt == "'ok'"
+            await adapter.shutdown()
+
+        assert len(harness.procs) == 3
+        assert len(harness.observers) == 3
+        assert harness.live_procs == []
+        assert harness.live_observers == []
+        assert adapter._pending_tasks == set()
+        assert adapter._write_tasks == set()
+
+    async def test_each_start_regenerates_the_peer_name(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A fresh peer-name suffix per start() so a ghost registration left by a
+        failed attempt can never lock the reattempt out (#88, adu-bath ghost)."""
+        harness = _StartHarness(monkeypatch)
+        adapter = RpcBusAdapter()
+
+        await adapter.start()
+        await adapter.shutdown()
+        await adapter.start()
+        await adapter.shutdown()
+
+        names = [proc.my_name for proc in harness.procs]
+        assert len(names) == 2
+        assert names[0] != names[1]
+        assert all(name.startswith("brilliant_mqtt-") for name in names)
+
+
+class TestStaleCallbackFencing:
+    """#88 criteria 2/3: a tracked callback that swallows cancellation must not
+    hang teardown, and — once torn down — must not touch a subsequent session's
+    state."""
+
+    async def test_blocked_push_callback_is_bounded_and_cleared_at_shutdown(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(bus_mod, "_PENDING_SETTLE_TIMEOUT_S", 0.05, raising=False)
+        harness = _StartHarness(monkeypatch)
+        adapter = RpcBusAdapter()
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+        release = asyncio.Event()
+        seen: list[str] = []
+
+        async def sticky(device: BrilliantDevice) -> None:
+            seen.append(device.variables["on"].value)
+            started.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                await release.wait()  # non-cooperative: swallow the cancel
+
+        adapter.on_change(sticky)
+        await adapter.start()
+        adapter._dispatch_raw_device(_RawDevice("own-device", {"load": _RawPeripheral("v1")}))
+        await asyncio.wait_for(started.wait(), timeout=1)
+
+        try:
+            # Bounded even though the callback swallows cancellation.
+            await asyncio.wait_for(adapter.shutdown(), timeout=1)
+            assert cancelled.is_set()  # settle_pending did cancel the drain worker
+            assert harness.live_observers == []  # bus closed despite the straggler
+            assert adapter._push_tasks == {}  # snapshots cleared, not leaked
+            assert adapter._pending_pushes == {}
+
+            # When it finally settles its done-callback still discards it.
+            release.set()
+            await _settle()
+            assert adapter._pending_tasks == set()
+            assert seen == ["v1"]
+        finally:
+            # Always release the non-cooperative worker so a failed assertion
+            # can't leave it blocking the event-loop teardown (it would swallow
+            # the teardown cancel and re-block forever).
+            release.set()
+            await _settle()
+
+    async def test_straggler_does_not_touch_the_next_session(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(bus_mod, "_PENDING_SETTLE_TIMEOUT_S", 0.05, raising=False)
+        _StartHarness(monkeypatch)  # installs the fake panel libs (side effect)
+        adapter = RpcBusAdapter()
+        release = asyncio.Event()
+        started = asyncio.Event()
+        seen: list[str] = []
+
+        async def sticky(device: BrilliantDevice) -> None:
+            seen.append(device.variables["on"].value)
+            started.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                await release.wait()  # swallow: survive this session's teardown
+
+        adapter.on_change(sticky)
+
+        try:
+            # Session 1: a push whose callback blocks and swallows cancellation.
+            await adapter.start()
+            adapter._dispatch_raw_device(_RawDevice("own-device", {"load": _RawPeripheral("s1")}))
+            await asyncio.wait_for(started.wait(), timeout=1)
+            (straggler,) = adapter._pending_tasks
+            await asyncio.wait_for(adapter.shutdown(), timeout=1)
+            assert adapter._push_tasks == {}  # fenced/cleared at teardown
+
+            # Session 2: a fresh start + push must get a NEW drain worker.
+            started.clear()
+            await adapter.start()
+            adapter._dispatch_raw_device(_RawDevice("own-device", {"load": _RawPeripheral("s2")}))
+            await asyncio.wait_for(started.wait(), timeout=1)
+            (key,) = adapter._push_tasks
+            session2_worker = adapter._push_tasks[key]
+            assert session2_worker is not straggler
+
+            # Release both: the session-1 straggler must NOT evict session-2's live
+            # worker entry, nor drain session-2's push with the stale worker.
+            release.set()
+            await _settle()
+            assert straggler.done()
+            assert adapter._push_tasks == {}  # session-2 worker cleaned up its own entry
+            assert adapter._pending_tasks == set()
+            assert seen == ["s1", "s2"]  # the straggler did not drain session-2's push
+        finally:
+            # Always release the non-cooperative worker(s) so a failed assertion
+            # can't leave one blocking the event-loop teardown.
+            release.set()
+            await _settle()

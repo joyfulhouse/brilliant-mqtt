@@ -56,6 +56,13 @@ _WRITE_HARD_CAP_S = 15.0
 # 5 s rebuild backoff (__main__._BACKOFF_S) and leaves room for the observer
 # and processor shutdowns that follow.
 _WRITE_SETTLE_TIMEOUT_S = 2.0
+# Companion to _WRITE_SETTLE_TIMEOUT_S for the tracked callback tasks
+# (push-drain, reconnect fan-out): shutdown() cancels them and waits this long
+# before closing the observer/processor anyway (issue #88). These are our own
+# coroutines and honour cancellation immediately; the bound only matters for a
+# change callback that itself swallows cancellation. It runs AFTER _settle_writes,
+# so the two bounds are sequential — both are kept small for that reason.
+_PENDING_SETTLE_TIMEOUT_S = 2.0
 # Upper bound on the normalized set-variables receipt (issue #46): the RPC
 # response type is closed-source and undocumented, so only a bounded repr
 # string ever crosses the adapter boundary.
@@ -272,6 +279,10 @@ class RpcBusAdapter:
         # A UNIQUE name per session (see _session_client_name): the bus peer key
         # is <owning_device_id>.<my_name>, so a constant name lets a half-bound
         # ghost registration lock the bridge out forever with NameInUseError.
+        # The base is retained so each start() can regenerate a fresh suffix —
+        # a reused adapter's second attempt must not reuse the first's name, or
+        # a ghost left by a failed first attempt locks the reattempt out (#88).
+        self._my_name_base = my_name
         self._my_name = _session_client_name(my_name)
         # Injectable monotonic clock (tests drive it deterministically); backs
         # both the push-liveness clock and the reconnect-rate window.
@@ -284,6 +295,12 @@ class RpcBusAdapter:
         self._obs: Any = None
         self._proc: Any = None
         self._own_device_id: str | None = None
+        # Monotonic session token, bumped by every start() (see _begin_session).
+        # Work admitted for session N (pushes, reconnect fan-out, push-drain
+        # tasks) checks it before mutating shared state, so a straggler that
+        # outlived a prior session's bounded teardown can never touch a newer
+        # session's bookkeeping (#88).
+        self._session = 0
         # Multiple consumers (panel bridge + mesh publisher) may each register
         # a change callback; every change fans out to all of them.
         self._change_cbs: list[tuple[Callable[[BrilliantDevice], Awaitable[None]], bool]] = []
@@ -307,9 +324,12 @@ class RpcBusAdapter:
         # Strong refs to every write task (queued, running, or detached past
         # its caller deadline). shutdown() settles whatever is left.
         self._write_tasks: set[asyncio.Task[str]] = set()
-        # Set synchronously at the top of shutdown(): a lane callback that
-        # reaches set_variables() afterwards is rejected instead of creating
-        # a task nobody settles (the bus closes before MQTT disconnects).
+        # The common admission fence for writes, notification dispatch and
+        # reconnect handling. Held True during start() (set by _begin_session)
+        # until the session commits, set True again synchronously at the top of
+        # shutdown(). A lane callback that reaches set_variables() while it is
+        # True is rejected instead of creating a task nobody settles (the bus
+        # closes before MQTT disconnects); dispatch/reconnect are dropped too.
         self._shutting_down = False
         # Retain fired callback tasks so they are not garbage-collected mid-flight
         # (asyncio holds only weak references to tasks). Done-callback discards.
@@ -326,8 +346,44 @@ class RpcBusAdapter:
             asyncio.Task[None],
         ] = {}
 
+    def _begin_session(self) -> int:
+        """Reset per-session state at the top of start() and return a fresh token.
+
+        A REUSED adapter (repeated start()/shutdown(), exactly the failure
+        population of #88) must not inherit the prior session's blocked-write
+        latch, ghost peer name, stale liveness/reconnect clocks, or readiness —
+        and stale work from the prior session must be fenced out of the new one
+        via the bumped token. The task/write SETS (``_pending_tasks`` /
+        ``_write_tasks``) are deliberately NOT reset here: dropping the strong
+        reference to a still-running straggler would expose it to GC mid-flight;
+        their done-callbacks discard each task by identity when it finally ends.
+        """
+        self._session += 1
+        # Not ready until this start() commits: _require_started keeps gating on
+        # _own_device_id, so owning _obs/_proc early (below) never opens a window
+        # for a caller to use a half-started adapter.
+        self._own_device_id = None
+        # Block admission (writes/dispatch/reconnect) until the session commits.
+        self._shutting_down = True
+        self._write_timed_out = False
+        self._write_locks = {}
+        self._reconnect_times = []
+        self._last_push = None
+        self._resubscribe = None
+        # Fresh peer-name suffix per attempt so a ghost registration left by a
+        # prior failed attempt can never lock this one out (see _my_name_base).
+        self._my_name = _session_client_name(self._my_name_base)
+        return self._session
+
     async def start(self) -> None:
-        """Connect to the bus following the poc-findings §2 recipe."""
+        """Connect to the bus following the poc-findings §2 recipe.
+
+        Owns the observer and processor (assigns ``self._obs``/``self._proc``)
+        BEFORE starting either, and unwinds a partial startup on any
+        exception/cancellation, so a failure between the first allocation and
+        the final commit can never strand a live processor (which owns the
+        automatic-reconnect work) — #88.
+        """
         # Deferred imports — see the module docstring. Never hoist these.
         import lib.protocol.message_bus_peer_service as mbps
         from lib.message_bus_api.observer_interface import RPCObserver
@@ -335,9 +391,20 @@ class RpcBusAdapter:
         from thrift_types.message_bus.ttypes import SubscriptionRequest
 
         loop = asyncio.get_running_loop()
+        session = self._begin_session()
 
         observer_cls = _make_observer_class(RPCObserver)
-        obs = observer_cls(loop, self._dispatch_raw_device, self._note_push)
+        # Bind this session's token into the observer's callbacks so a late push
+        # from a torn-down prior session (a stale observer that outlived its
+        # shutdown) is dropped rather than dispatched into — or resetting the
+        # liveness clock of — the current session.
+        obs = observer_cls(
+            loop,
+            lambda raw: self._dispatch_raw_device(raw, session),
+            lambda: self._note_push(session),
+        )
+        # Own the observer BEFORE constructing/starting anything that can fail.
+        self._obs = obs
         proc = SinglePeerProcessor(
             socket_path=_SOCKET_PATH,
             my_name=self._my_name,
@@ -345,49 +412,67 @@ class RpcBusAdapter:
             client_class=mbps.MessageBusClient,
             loop=loop,
         )
-        await proc.start()
-
-        # Poll until the handshake completes (poc-findings §2). Fail fast on timeout.
-        waited = 0.0
-        while not proc.is_connected():
-            if waited >= _CONNECT_TIMEOUT_S:
-                raise TimeoutError(f"message bus did not connect within {_CONNECT_TIMEOUT_S:.0f}s")
-            await asyncio.sleep(_CONNECT_POLL_S)
-            waited += _CONNECT_POLL_S
-
-        # Observer must start AFTER the processor is connected (poc-findings §2:
-        # otherwise the observer's first client call hits a NoneType client).
-        await obs.start(proc, None)
-
-        own_device_id = obs.get_owning_device_id()
-        obs.bind_device_ids(frozenset({own_device_id, *self._extra_device_ids}))
-
-        async def resubscribe() -> None:
-            # Re-issue EVERY subscription (own + extras): the closure runs at
-            # connect time AND after each processor reconnect, where the bus
-            # forgets all of this session's subscriptions.
-            await obs.subscribe(SubscriptionRequest(device_id=own_device_id))
-            for extra in self._extra_device_ids:
-                await obs.subscribe(SubscriptionRequest(device_id=extra))
-
-        await resubscribe()
-        self._resubscribe = resubscribe
-
-        # The pilot showed the notification stream can die and recover with the
-        # underlying connection (2026-06-12: pushes silently lost for minutes,
-        # the observer's get_all mirror frozen, then both self-healed). Hook the
-        # processor's reconnect signal so the bridge can re-reconcile the gap.
-        proc.add_reconnect_callback(self._on_proc_reconnect)
-
-        # Start the stale-stream clock at connect time so a quiet-but-healthy
-        # session reads as "old push", not "no push ever".
-        self._note_push()
-
-        # Only assign instance state once everything succeeded.
+        # Own the processor immediately too: it owns automatic-reconnect work,
+        # so a failure past this point must be able to shut it down.
         self._proc = proc
-        self._obs = obs
-        self._own_device_id = own_device_id
-        logger.info("bus connected; owning device id=%s", own_device_id)
+        try:
+            await proc.start()
+
+            # Poll until the handshake completes (poc-findings §2). Fail fast on timeout.
+            waited = 0.0
+            while not proc.is_connected():
+                if waited >= _CONNECT_TIMEOUT_S:
+                    raise TimeoutError(
+                        f"message bus did not connect within {_CONNECT_TIMEOUT_S:.0f}s"
+                    )
+                await asyncio.sleep(_CONNECT_POLL_S)
+                waited += _CONNECT_POLL_S
+
+            # Observer must start AFTER the processor is connected (poc-findings §2:
+            # otherwise the observer's first client call hits a NoneType client).
+            await obs.start(proc, None)
+
+            own_device_id = obs.get_owning_device_id()
+            obs.bind_device_ids(frozenset({own_device_id, *self._extra_device_ids}))
+
+            async def resubscribe() -> None:
+                # Re-issue EVERY subscription (own + extras): the closure runs at
+                # connect time AND after each processor reconnect, where the bus
+                # forgets all of this session's subscriptions.
+                await obs.subscribe(SubscriptionRequest(device_id=own_device_id))
+                for extra in self._extra_device_ids:
+                    await obs.subscribe(SubscriptionRequest(device_id=extra))
+
+            await resubscribe()
+            self._resubscribe = resubscribe
+
+            # The pilot showed the notification stream can die and recover with the
+            # underlying connection (2026-06-12: pushes silently lost for minutes,
+            # the observer's get_all mirror frozen, then both self-healed). Hook the
+            # processor's reconnect signal so the bridge can re-reconcile the gap.
+            # The lib does not document the callback's invocation thread, so marshal
+            # the work onto the loop and scope it to this session (#88).
+            def reconnect_hook(*args: Any, **kwargs: Any) -> None:
+                loop.call_soon_threadsafe(self._on_proc_reconnect, session)
+
+            proc.add_reconnect_callback(reconnect_hook)
+
+            # Start the stale-stream clock at connect time so a quiet-but-healthy
+            # session reads as "old push", not "no push ever".
+            self._note_push(session)
+
+            # Commit: the session is fully live. Open admission (writes/dispatch/
+            # reconnect) and mark readiness LAST so no earlier failure leaves a
+            # half-started adapter usable.
+            self._shutting_down = False
+            self._own_device_id = own_device_id
+            logger.info("bus connected; owning device id=%s", own_device_id)
+        except BaseException:
+            # Unwind whatever was constructed/started — however far we got
+            # (proc-start, handshake, observer start, any subscription) or if we
+            # were cancelled. The shared close helper releases obs then proc.
+            await self._close_bus_resources()
+            raise
 
     def _require_started(self) -> tuple[Any, str]:
         """Return ``(observer, owning_device_id)`` or raise if not started.
@@ -399,7 +484,7 @@ class RpcBusAdapter:
             raise RuntimeError("RpcBusAdapter.start() must be called before use")
         return self._obs, self._own_device_id
 
-    def _dispatch_raw_device(self, raw_device: Any) -> None:
+    def _dispatch_raw_device(self, raw_device: Any, session: int | None = None) -> None:
         """Normalize a full changed device and dispatch by callback policy.
 
         Every peripheral is normalized on every push because the bus delta
@@ -412,7 +497,17 @@ class RpcBusAdapter:
         32-hex id otherwise), so each normalized BrilliantDevice carries its
         true owner and writes can be routed back. A missing/falsy raw id falls
         back to our own device id (the pre-M11 behaviour).
+
+        This is the notification-admission choke point (runs synchronously on
+        the observer's own loop, no interleaving await before the fence): a
+        dispatch is dropped when the adapter is tearing down or when it belongs
+        to a prior session (#88). ``session`` defaults to the current one for
+        direct callers; the observer passes its bound session token.
         """
+        if session is None:
+            session = self._session
+        if self._shutting_down or session != self._session:
+            return
         cbs = list(self._change_cbs)
         if not cbs:
             return
@@ -438,7 +533,7 @@ class RpcBusAdapter:
             pending.append(devices)
             if key in self._push_tasks:
                 continue
-            task = asyncio.ensure_future(self._drain_pushes(key, cb))
+            task = asyncio.ensure_future(self._drain_pushes(key, cb, session))
             self._push_tasks[key] = task
             self._track_task(task)
 
@@ -446,10 +541,20 @@ class RpcBusAdapter:
         self,
         key: tuple[str | None, Callable[[BrilliantDevice], Awaitable[None]]],
         cb: Callable[[BrilliantDevice], Awaitable[None]],
+        session: int,
     ) -> None:
-        """Deliver queued whole-device snapshots serially for one callback."""
+        """Deliver queued whole-device snapshots serially for one callback.
+
+        Session-scoped (#88): a non-cooperative callback can keep this task
+        alive past its own session's bounded teardown. If a new session has
+        since started, stop draining and do NOT pop ``_push_tasks`` — that key
+        may now hold the NEW session's live drain worker, and evicting it would
+        let a duplicate worker spawn for it.
+        """
         try:
             while True:
+                if session != self._session:
+                    return
                 pending = self._pending_pushes.get(key)
                 if not pending:
                     self._pending_pushes.pop(key, None)
@@ -461,7 +566,8 @@ class RpcBusAdapter:
                     except Exception:
                         logger.exception("bus change callback failed; continuing")
         finally:
-            self._push_tasks.pop(key, None)
+            if session == self._session:
+                self._push_tasks.pop(key, None)
 
     def _spawn(self, coro: Awaitable[None]) -> None:
         """Schedule *coro* on the running loop, retaining a strong reference."""
@@ -473,8 +579,15 @@ class RpcBusAdapter:
         self._pending_tasks.add(task)
         task.add_done_callback(self._pending_tasks.discard)
 
-    def _note_push(self) -> None:
-        """Record that an inbound push arrived (stale-stream watchdog clock)."""
+    def _note_push(self, session: int | None = None) -> None:
+        """Record that an inbound push arrived (stale-stream watchdog clock).
+
+        Epoch-gated (#88): a late push from a torn-down prior session must not
+        reset the new session's watchdog clock. ``session`` defaults to the
+        current one for direct callers; the observer passes its bound token.
+        """
+        if session is not None and session != self._session:
+            return
         self._last_push = self._clock()
 
     def seconds_since_last_push(self) -> float | None:
@@ -501,14 +614,23 @@ class RpcBusAdapter:
         """Add a callback fired after the bus session reconnects."""
         self._reconnect_cbs.append(cb)
 
-    def _on_proc_reconnect(self, *args: Any, **kwargs: Any) -> None:
-        """Processor reconnect signal (sync, lib-invoked) → async fan-out.
+    def _on_proc_reconnect(self, session: int | None = None, *args: Any, **kwargs: Any) -> None:
+        """Processor reconnect signal (runs on the loop) → async fan-out.
 
         Accepts any args defensively: the closed lib does not document the
-        callback signature. A reconnect proves the stream is alive again, so
-        the stale clock resets here — otherwise the watchdog could tear down a
-        session that just recovered.
+        callback signature (start() registers a wrapper that marshals it onto
+        the loop and passes this session's token). A reconnect proves the
+        stream is alive again, so the stale clock resets here — otherwise the
+        watchdog could tear down a session that just recovered.
+
+        Reconnect-admission fence (#88): dropped once the adapter is tearing
+        down, or if it belongs to a prior session — otherwise a stale reconnect
+        would reset the new session's clocks and spawn work against it.
         """
+        if self._shutting_down:
+            return
+        if session is not None and session != self._session:
+            return
         logger.warning("bus processor reconnected; re-subscribing and re-reconciling")
         self._note_push()
         self._note_reconnect()
@@ -759,19 +881,75 @@ class RpcBusAdapter:
                 sorted(task.get_name() for task in pending),
             )
 
+    async def _settle_pending(self) -> None:
+        """Session teardown: cancel every tracked callback task, wait a bounded time.
+
+        Mirrors :meth:`_settle_writes` for the ``_pending_tasks`` collection
+        (push-drain workers and reconnect fan-out): snapshot, cancel each, wait
+        up to ``_PENDING_SETTLE_TIMEOUT_S``, then log any straggler and leave it
+        tracked — its done-callback (``_pending_tasks.discard``) still removes it
+        by identity when it finally ends, and the session token keeps it from
+        touching a newer session. Kept separate from _settle_writes so #73's
+        write semantics (the hard-cap / _write_timed_out latch) are untouched.
+        """
+        outstanding = [task for task in self._pending_tasks if not task.done()]
+        if not outstanding:
+            return
+        logger.warning(
+            "cancelling %d outstanding bus callback task(s) at session teardown",
+            len(outstanding),
+        )
+        for task in outstanding:
+            task.cancel()
+        _, pending = await asyncio.wait(outstanding, timeout=_PENDING_SETTLE_TIMEOUT_S)
+        if pending:
+            logger.error(
+                "%d bus callback task(s) did not settle within %.0fs of cancellation; "
+                "closing the bus anyway",
+                len(pending),
+                _PENDING_SETTLE_TIMEOUT_S,
+            )
+
+    async def _close_bus_resources(self) -> None:
+        """Release the observer then the processor, best-effort; log, never raise.
+
+        The single place that knows how to close these two resources, shared by
+        :meth:`shutdown` and :meth:`start`'s partial-startup unwind so it runs
+        correctly however far startup got. Clears ``self._obs``/``self._proc``
+        first so a second call (double shutdown, or shutdown after a failed
+        start) is a no-op rather than a double close.
+        """
+        obs = self._obs
+        proc = self._proc
+        self._obs = None
+        self._proc = None
+        if obs is not None:
+            try:
+                await obs.shutdown()
+            except Exception:
+                # Best-effort cleanup — log and continue; never raise here.
+                logger.exception("observer shutdown failed")
+        if proc is not None:
+            try:
+                await proc.shutdown()
+            except Exception:
+                # Best-effort cleanup — log and continue; never raise here.
+                logger.exception("processor shutdown failed")
+
     async def shutdown(self) -> None:
-        """Best-effort teardown; tolerant of a never-started adapter."""
+        """Best-effort teardown; tolerant of a never-started adapter.
+
+        Order matters (#88): fence admission, settle the detached writes (#73)
+        and then the tracked callback tasks, clear the push snapshots, and only
+        then close the observer/processor — so no tracked callback can keep
+        reconciling/publishing against a session whose bus is already gone.
+        """
         self._shutting_down = True
         await self._settle_writes()
-        if self._obs is not None:
-            try:
-                await self._obs.shutdown()
-            except Exception:
-                # Best-effort cleanup — log and continue; never raise from shutdown.
-                logger.exception("observer shutdown failed")
-        if self._proc is not None:
-            try:
-                await self._proc.shutdown()
-            except Exception:
-                # Best-effort cleanup — log and continue; never raise from shutdown.
-                logger.exception("processor shutdown failed")
+        await self._settle_pending()
+        # A cancelled _drain_pushes lands its CancelledError inside the awaited
+        # cb() and can skip its own deque cleanup, so clear the snapshots
+        # explicitly rather than relying on task self-cleanup.
+        self._pending_pushes.clear()
+        self._push_tasks.clear()
+        await self._close_bus_resources()
