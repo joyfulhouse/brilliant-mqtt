@@ -149,7 +149,5 @@ def reconcile(
     # Owed a reload. _attempt_restart persists the marker before touching the
     # coordinator, so a kill during restart still leaves durable evidence.
     pending = PendingReload(path, want_fp, now)
-    restarted = _attempt_restart(
-        fs, coordinator, state_path=state_path, pending=pending, now=now
-    )
+    restarted = _attempt_restart(fs, coordinator, state_path=state_path, pending=pending, now=now)
     return Outcome(True, True, restarted, path, reload_pending=not restarted)

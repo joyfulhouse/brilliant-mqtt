@@ -45,9 +45,14 @@ def run_once(
             bundle_path=cfg.bundle_path,
             site_packages_root=cfg.site_packages_root,
             ca_pem=ca_pem,
+            state_path=cfg.state_path,
+            min_retry_interval_s=cfg.min_retry_interval_s,
         )
     except OSError:
-        _LOG.exception("reconcile failed writing the bundle")
+        # Genuine filesystem-write failure (bundle or state file). A failed
+        # coordinator restart is NOT this path — reconcile() catches that and
+        # defers it as a pending reload (see below).
+        _LOG.exception("reconcile failed writing the bundle or state file")
         return 1
     if not outcome.bundle_found:
         _LOG.warning(
@@ -60,6 +65,18 @@ def run_once(
             "appended CA to %s; coordinator_restarted=%s",
             outcome.bundle_path,
             outcome.coordinator_restarted,
+        )
+        if outcome.reload_pending:
+            _LOG.warning(
+                "coordinator reload pending for %s (restart not confirmed); will retry next run",
+                outcome.bundle_path,
+            )
+    elif outcome.reload_pending:
+        # Cert already present but a prior run's reload is still owed — the
+        # expected, self-healing state, so exit 0 and let the timer retry.
+        _LOG.warning(
+            "coordinator reload still pending for %s (retrying/paced); will retry next run",
+            outcome.bundle_path,
         )
     else:
         _LOG.debug("CA already present in %s; no-op", outcome.bundle_path)

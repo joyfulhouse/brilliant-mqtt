@@ -197,8 +197,14 @@ def test_restart_oserror_then_next_run_completes_retry() -> None:
     coord = FakeCoord(running=True, fail_first=1)
 
     out = reconcile(
-        fs, coord, bundle_path="/b", site_packages_root="/sp", ca_pem=CA_A,
-        state_path=STATE, min_retry_interval_s=INTERVAL, now=1000.0,
+        fs,
+        coord,
+        bundle_path="/b",
+        site_packages_root="/sp",
+        ca_pem=CA_A,
+        state_path=STATE,
+        min_retry_interval_s=INTERVAL,
+        now=1000.0,
     )
     assert out.appended is True
     assert out.coordinator_restarted is False  # first restart did NOT succeed
@@ -210,8 +216,14 @@ def test_restart_oserror_then_next_run_completes_retry() -> None:
     for _ in range(10):
         now += INTERVAL + 1
         out = reconcile(
-            fs, coord, bundle_path="/b", site_packages_root="/sp", ca_pem=CA_A,
-            state_path=STATE, min_retry_interval_s=INTERVAL, now=now,
+            fs,
+            coord,
+            bundle_path="/b",
+            site_packages_root="/sp",
+            ca_pem=CA_A,
+            state_path=STATE,
+            min_retry_interval_s=INTERVAL,
+            now=now,
         )
     assert coord.successes == 1  # completed exactly once...
     assert coord.attempts == 2  # ...and stopped retrying after it succeeded
@@ -228,8 +240,14 @@ def test_interruption_after_append_is_retried_by_fresh_run() -> None:
     dying = KilledDuringRestart()
     with pytest.raises(KeyboardInterrupt):
         reconcile(
-            fs, dying, bundle_path="/b", site_packages_root="/sp", ca_pem=CA_A,
-            state_path=STATE, min_retry_interval_s=INTERVAL, now=1000.0,
+            fs,
+            dying,
+            bundle_path="/b",
+            site_packages_root="/sp",
+            ca_pem=CA_A,
+            state_path=STATE,
+            min_retry_interval_s=INTERVAL,
+            now=1000.0,
         )
     assert dying.attempts == 1
     assert CA_A.strip() in fs.files["/b"]  # cert was appended before the kill
@@ -237,8 +255,14 @@ def test_interruption_after_append_is_retried_by_fresh_run() -> None:
 
     fresh = FakeCoord(running=True)  # a new oneshot, nothing in memory
     out = reconcile(
-        fs, fresh, bundle_path="/b", site_packages_root="/sp", ca_pem=CA_A,
-        state_path=STATE, min_retry_interval_s=INTERVAL, now=2000.0,
+        fs,
+        fresh,
+        bundle_path="/b",
+        site_packages_root="/sp",
+        ca_pem=CA_A,
+        state_path=STATE,
+        min_retry_interval_s=INTERVAL,
+        now=2000.0,
     )
     assert out.appended is False  # no duplicate append
     assert fresh.successes == 1  # reload completed on the fresh run
@@ -250,21 +274,39 @@ def test_retry_is_paced_between_attempts() -> None:
     fs = FakeFS({"/b": CA_B}, {})
     coord = FakeCoord(running=True, fail_first=99)  # restart always fails
     reconcile(
-        fs, coord, bundle_path="/b", site_packages_root="/sp", ca_pem=CA_A,
-        state_path=STATE, min_retry_interval_s=INTERVAL, now=1000.0,
+        fs,
+        coord,
+        bundle_path="/b",
+        site_packages_root="/sp",
+        ca_pem=CA_A,
+        state_path=STATE,
+        min_retry_interval_s=INTERVAL,
+        now=1000.0,
     )
     assert coord.attempts == 1
 
     out = reconcile(  # too soon after the last attempt: must NOT re-attempt
-        fs, coord, bundle_path="/b", site_packages_root="/sp", ca_pem=CA_A,
-        state_path=STATE, min_retry_interval_s=INTERVAL, now=1010.0,
+        fs,
+        coord,
+        bundle_path="/b",
+        site_packages_root="/sp",
+        ca_pem=CA_A,
+        state_path=STATE,
+        min_retry_interval_s=INTERVAL,
+        now=1010.0,
     )
     assert coord.attempts == 1
     assert out.reload_pending is True  # still owed, just paced
 
     reconcile(  # interval elapsed: attempt again
-        fs, coord, bundle_path="/b", site_packages_root="/sp", ca_pem=CA_A,
-        state_path=STATE, min_retry_interval_s=INTERVAL, now=1000.0 + INTERVAL + 1,
+        fs,
+        coord,
+        bundle_path="/b",
+        site_packages_root="/sp",
+        ca_pem=CA_A,
+        state_path=STATE,
+        min_retry_interval_s=INTERVAL,
+        now=1000.0 + INTERVAL + 1,
     )
     assert coord.attempts == 2
 
@@ -273,8 +315,14 @@ def test_ca_present_with_no_pending_state_is_noop() -> None:
     fs = FakeFS({"/b": CA_B + CA_A}, {})
     coord = FakeCoord(running=True)
     out = reconcile(
-        fs, coord, bundle_path="/b", site_packages_root="/sp", ca_pem=CA_A,
-        state_path=STATE, min_retry_interval_s=INTERVAL, now=1000.0,
+        fs,
+        coord,
+        bundle_path="/b",
+        site_packages_root="/sp",
+        ca_pem=CA_A,
+        state_path=STATE,
+        min_retry_interval_s=INTERVAL,
+        now=1000.0,
     )
     assert out == Outcome(
         bundle_found=True, appended=False, coordinator_restarted=False, bundle_path="/b"
@@ -289,8 +337,14 @@ def test_non_host_appends_without_restart_and_creates_no_pending() -> None:
     fs = FakeFS({"/b": CA_B}, {})
     coord = FakeCoord(running=False)
     out = reconcile(
-        fs, coord, bundle_path="/b", site_packages_root="/sp", ca_pem=CA_A,
-        state_path=STATE, min_retry_interval_s=INTERVAL, now=1000.0,
+        fs,
+        coord,
+        bundle_path="/b",
+        site_packages_root="/sp",
+        ca_pem=CA_A,
+        state_path=STATE,
+        min_retry_interval_s=INTERVAL,
+        now=1000.0,
     )
     assert out.appended is True
     assert out.coordinator_restarted is False
@@ -303,19 +357,37 @@ def test_pending_cleared_after_success_then_noop() -> None:
     fs = FakeFS({"/b": CA_B}, {})
     coord = FakeCoord(running=True, fail_first=1)
     reconcile(
-        fs, coord, bundle_path="/b", site_packages_root="/sp", ca_pem=CA_A,
-        state_path=STATE, min_retry_interval_s=INTERVAL, now=1000.0,
+        fs,
+        coord,
+        bundle_path="/b",
+        site_packages_root="/sp",
+        ca_pem=CA_A,
+        state_path=STATE,
+        min_retry_interval_s=INTERVAL,
+        now=1000.0,
     )
     reconcile(  # retry succeeds, clears the marker
-        fs, coord, bundle_path="/b", site_packages_root="/sp", ca_pem=CA_A,
-        state_path=STATE, min_retry_interval_s=INTERVAL, now=2000.0,
+        fs,
+        coord,
+        bundle_path="/b",
+        site_packages_root="/sp",
+        ca_pem=CA_A,
+        state_path=STATE,
+        min_retry_interval_s=INTERVAL,
+        now=2000.0,
     )
     assert coord.successes == 1
     assert load_pending(fs, STATE) is None
 
     out = reconcile(  # clean no-op afterwards
-        fs, coord, bundle_path="/b", site_packages_root="/sp", ca_pem=CA_A,
-        state_path=STATE, min_retry_interval_s=INTERVAL, now=3000.0,
+        fs,
+        coord,
+        bundle_path="/b",
+        site_packages_root="/sp",
+        ca_pem=CA_A,
+        state_path=STATE,
+        min_retry_interval_s=INTERVAL,
+        now=3000.0,
     )
     assert out.reload_pending is False
     assert coord.attempts == 2  # unchanged: no run-3 attempt
@@ -326,12 +398,16 @@ def test_stale_marker_for_other_generation_does_not_fire() -> None:
     # different generation). It must not trigger a restart against CA_A.
     fs = FakeFS({"/b": CA_B + CA_A}, {})
     coord = FakeCoord(running=True)
-    save_pending(
-        fs, STATE, PendingReload("/b", cert_fingerprint(CA_B), last_attempt_at=0.0)
-    )
+    save_pending(fs, STATE, PendingReload("/b", cert_fingerprint(CA_B), last_attempt_at=0.0))
     out = reconcile(
-        fs, coord, bundle_path="/b", site_packages_root="/sp", ca_pem=CA_A,
-        state_path=STATE, min_retry_interval_s=INTERVAL, now=10_000.0,
+        fs,
+        coord,
+        bundle_path="/b",
+        site_packages_root="/sp",
+        ca_pem=CA_A,
+        state_path=STATE,
+        min_retry_interval_s=INTERVAL,
+        now=10_000.0,
     )
     assert out.appended is False
     assert out.reload_pending is False
