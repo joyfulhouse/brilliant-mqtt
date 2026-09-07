@@ -40,7 +40,14 @@ def _settings(
     reconnect_storm_threshold: int = 20,
     reconnect_storm_window_seconds: float = 60.0,
 ) -> Settings:
-    """A Settings with required fields filled and the breaker knobs overridable."""
+    """A Settings with required fields filled and the breaker knobs overridable.
+
+    The bus heartbeat/phase files are blanked so no session test touches the
+    host's real ``/run`` (write_heartbeat/write_phase no-op on an empty path).
+    This is the single source: every ``_run_session`` test builds its Settings
+    through here (directly or via ``_hot_poll_settings``), so a session can
+    never makedirs('/run/brilliant-mqtt') or stamp a pid file on the runner,
+    and a failed-stamp WARNING from the real /run can't skew warning counts."""
     return Settings(
         panel="office",
         mqtt_host="h",
@@ -48,6 +55,8 @@ def _settings(
         mqtt_password="p",
         reconnect_storm_threshold=reconnect_storm_threshold,
         reconnect_storm_window_seconds=reconnect_storm_window_seconds,
+        bus_heartbeat_file="",
+        bus_phase_file="",
     )
 
 
@@ -1206,7 +1215,6 @@ class TestHotPollReadTimeoutPolicy:
         )
         settings = _hot_poll_settings(hot_poll_seconds=2.0)
         object.__setattr__(settings, "retained_topics_file", str(tmp_path / "owned.json"))
-        object.__setattr__(settings, "bus_heartbeat_file", "")
 
         async def inject_on_second_tick(sleep_number: int) -> None:
             if sleep_number == 2:
@@ -1387,11 +1395,7 @@ class TestResyncSubscribePolicy:
                 )
 
         assert harness.events.count("panel_reconcile") == 4
-        warnings = [
-            record
-            for record in caplog.records
-            if record.levelname == "WARNING" and record.name == "brilliant_mqtt.__main__"
-        ]
+        warnings = [record for record in caplog.records if record.levelname == "WARNING"]
         assert len(warnings) == 1
         assert "brilliant/office/p0/set" in warnings[0].getMessage()
         assert "retrying" in warnings[0].getMessage()
@@ -1446,14 +1450,7 @@ class TestResyncSubscribePolicy:
                 )
 
         assert harness.events.count("panel_reconcile") == 5
-        assert (
-            sum(
-                1
-                for r in caplog.records
-                if r.levelname == "WARNING" and r.name == "brilliant_mqtt.__main__"
-            )
-            == 2
-        )
+        assert sum(1 for r in caplog.records if r.levelname == "WARNING") == 2
 
     async def test_mesh_resync_subscribe_failure_gets_the_same_grace(
         self,
@@ -1478,14 +1475,7 @@ class TestResyncSubscribePolicy:
                 )
 
         assert harness.events.count("mesh_reconcile") == 2
-        assert (
-            sum(
-                1
-                for r in caplog.records
-                if r.levelname == "WARNING" and r.name == "brilliant_mqtt.__main__"
-            )
-            == 1
-        )
+        assert sum(1 for r in caplog.records if r.levelname == "WARNING") == 1
 
     async def test_initial_reconcile_subscribe_failure_stays_fail_fast(
         self,
@@ -1629,7 +1619,6 @@ class TestResyncReadTimeoutPolicy:
         )
         settings = _hot_poll_settings(resync_seconds=1, hot_poll_seconds=0.0)
         object.__setattr__(settings, "retained_topics_file", str(tmp_path / "owned.json"))
-        object.__setattr__(settings, "bus_heartbeat_file", "")
         clock = _SessionLoopClock(cancel_on_sleep=3)
         _install_session_loop_clock(monkeypatch, clock)
 
@@ -1661,7 +1650,6 @@ class TestResyncReadTimeoutPolicy:
         )
         settings = _hot_poll_settings(resync_seconds=1, hot_poll_seconds=0.0)
         object.__setattr__(settings, "retained_topics_file", str(tmp_path / "owned.json"))
-        object.__setattr__(settings, "bus_heartbeat_file", "")
         clock = _SessionLoopClock()
         _install_session_loop_clock(monkeypatch, clock)
 
@@ -1737,7 +1725,6 @@ class TestResyncSubscribeEndToEnd:
         ]
         settings = _hot_poll_settings(resync_seconds=0)
         object.__setattr__(settings, "retained_topics_file", str(tmp_path / "owned.json"))
-        object.__setattr__(settings, "bus_heartbeat_file", "")
 
         session = asyncio.create_task(main_mod._run_session(settings, None, None))
         retried = asyncio.create_task(mqtt.retried.wait())
@@ -1754,11 +1741,7 @@ class TestResyncSubscribeEndToEnd:
                 "brilliant/office/gangbox_peripheral_0/set",
                 "brilliant/office/gangbox_peripheral_1/set",
             ]
-            warnings = [
-                r.getMessage()
-                for r in caplog.records
-                if r.levelname == "WARNING" and r.name == "brilliant_mqtt.__main__"
-            ]
+            warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
             assert len(warnings) == 1
             assert "brilliant/office/gangbox_peripheral_1/set" in warnings[0]
         finally:
