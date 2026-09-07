@@ -161,6 +161,16 @@ def _log_connect_failure(panel: str, error: OSError | asyncssh.Error) -> None:
     )
 
 
+def _broker_assumed_available() -> bool:
+    """Fallback broker-health reader for a runtime that wires none (tests/tools).
+
+    Production always threads FleetManager's live flag; when nothing is wired the
+    safe default is "available" so a directly constructed PanelManager keeps its
+    pre-#95 behaviour and never gates on a broker signal it cannot observe.
+    """
+    return True
+
+
 @callback
 def async_delete_panel_issues(hass: HomeAssistant, management_id: str) -> None:
     """Delete every repair issue owned by one removed panel runtime."""
@@ -249,12 +259,17 @@ class PanelManager:
         store: PanelConfigStore,
         fleet: FleetConfig,
         ssh_lock: asyncio.Lock,
+        broker_available: Callable[[], bool | None] = _broker_assumed_available,
     ) -> None:
         self.hass = hass
         self.store = store
         self.fleet = fleet
         self.panel: str = str(store.data[CONF_PANEL])
         self._ssh_lock = ssh_lock  # fleet-wide: ONE panel SSH op at a time
+        # Reads FleetManager's single live broker-connection flag at DECISION time
+        # (grace expiry, after the SSH lock, recovery expiry) — never a construction
+        # snapshot — so automatic repair/escalation is gated on current broker health.
+        self._broker_available = broker_available
         self.availability: str | None = None  # None until the retained LWT arrives
         self.meta: dict[str, Any] | None = None
         self.problem = False
@@ -266,6 +281,12 @@ class PanelManager:
         self._recovery_activity = False
         self._recovery_window = _RECOVERY_SECONDS
         self._recovery_origin: _RecoveryOrigin = "update"
+        # A recovery window whose verdict was suspended because HA's broker link was
+        # down when the timer fired (#95). It preserves RECOVERY semantics across the
+        # outage: async_broker_reconnected re-arms the recovery window (not grace) so an
+        # 'online' LWT still fires repair_succeeded and a still-offline panel still gets
+        # the correct 'did not come back' repair_failed with journal diagnosis.
+        self._recovery_deferred = False
         # Monotonic marker of the current recovery window. A running _recovery_timeout
         # captures it before its SSH/journal await and defers if it changed — a fresh
         # window superseded this one. The nullable _recovery_cancel handle cannot serve
@@ -749,6 +770,38 @@ class PanelManager:
             cancel()
             setattr(self, attr, None)
 
+    def _broker_unavailable(self) -> bool:
+        """True only when HA's own link to the MQTT broker is known to be down.
+
+        A panel that merely LOOKS offline because HA itself lost the broker (not
+        the panel) must not be auto-repaired or escalated (#95): the LWT/meta
+        evidence the state machine reads is unobservable while the broker link is
+        down. Unknown (None, before the first connection-status callback) and
+        connected both read as available, so nothing is gated spuriously.
+        """
+        return self._broker_available() is False
+
+    @callback
+    def async_broker_reconnected(self) -> None:
+        """Re-drive whatever automatic work the broker outage deferred (#95).
+
+        Two kinds of work are DEFERRED (not escalated) while the broker is down:
+          - a RECOVERY verdict suspended by _recovery_timeout: re-arm the SAME recovery
+            window (origin preserved) so an 'online' LWT still reports repair_succeeded
+            and a still-offline panel still gets the correct 'did not come back' verdict;
+          - a grace-expiry auto-repair deferred by _grace_expired: a fresh grace window
+            re-judges the still-offline panel from post-reconnect availability evidence.
+        _arm_offline_grace is a guarded no-op for an online/repairing panel, one that
+        already has a timer, or a retained-ledger fault, so re-arming never duplicates
+        work; the recovery re-arm is likewise skipped while shutting down or repairing.
+        """
+        if self._recovery_deferred:
+            self._recovery_deferred = False
+            if not self._shutting_down and not self._repairing:
+                self._arm_recovery(self._recovery_origin)
+            return
+        self._arm_offline_grace()
+
     @callback
     def _arm_offline_grace(self) -> None:
         """Ensure an offline panel retains exactly one path to recovery."""
@@ -758,8 +811,13 @@ class PanelManager:
             or self.problem_reason == _RETAINED_LEDGER_PROBLEM
             or self._grace_cancel is not None
             or self._recovery_cancel is not None
+            or self._recovery_deferred
             or self._repairing
         ):
+            # _recovery_deferred is a recovery window suspended by a broker outage (#95):
+            # its verdict is re-armed as RECOVERY by async_broker_reconnected, so an
+            # offline LWT / ledger-clear landing meanwhile must NOT also start a grace
+            # timer that could race the reconnect into a within-cooldown escalation.
             return
         grace_s = self._opt(OPT_OFFLINE_GRACE_MINUTES, DEFAULT_OFFLINE_GRACE_MINUTES) * 60
         _LOGGER.info(
@@ -789,8 +847,11 @@ class PanelManager:
         self.availability = payload
         if payload == AVAILABILITY_ONLINE:
             self._cancel("_grace_cancel")
-            if self._recovery_cancel is not None:
+            if self._recovery_cancel is not None or self._recovery_deferred:
+                # A pending recovery window OR one whose verdict was broker-outage
+                # deferred (#95): the bridge is back → the repair succeeded.
                 self._cancel("_recovery_cancel")
+                self._recovery_deferred = False
                 self._fire(EVENT_REPAIR_SUCCEEDED)
             # A retained online value can predate a newer bridge diagnostic.
             # Only ordinary bridge meta proves the ledger itself recovered.
@@ -808,6 +869,26 @@ class PanelManager:
         if self.problem_reason == _RETAINED_LEDGER_PROBLEM:
             return
         if self.availability not in (AVAILABILITY_OFFLINE, None):
+            return
+        if self._broker_unavailable():
+            # availability is OFFLINE or None here (checked just above). A panel can only
+            # look offline THROUGH the broker; while HA's own link is down that evidence is
+            # untrustworthy — defer BOTH auto-repair and the offline escalations below so a
+            # broker outage triggers no SSH work and no misleading per-panel issue (#95).
+            # async_broker_reconnected re-arms grace on reconnect, but only for an OFFLINE
+            # panel; a None-availability panel it cannot re-arm, so arm an unreachable-style
+            # _grace_expired recheck DIRECTLY (grace was cleared at the top of this call → no
+            # stacking) rather than falling through to async_repair, which would spam
+            # repair_started + payload fetches for the whole outage.
+            if self.availability is None:
+                self._grace_cancel = async_call_later(
+                    self.hass, _UNREACHABLE_RECHECK_SECONDS, self._grace_expired
+                )
+            _LOGGER.info(
+                "%s: bridge appears offline but HA's MQTT broker is unavailable; "
+                "deferring auto-repair until the broker reconnects",
+                self.panel,
+            )
             return
         if not self._opt(OPT_AUTO_REPAIR, DEFAULT_AUTO_REPAIR):
             self._escalate("bridge offline past grace period (auto-repair is off)")
@@ -985,6 +1066,51 @@ class PanelManager:
             return err
         return None
 
+    def _auto_repair_still_warranted(self) -> bool:
+        """Re-confirm an automatic repair is still needed after the fleet SSH-lock wait.
+
+        An auto-repair queued behind the fleet-wide SSH lock can go stale while it
+        waits (#95): the entry began shutting down, the panel reported back online, or
+        HA lost the broker (so the offline evidence is no longer trustworthy). Any of
+        these means the queued automatic mutation must be skipped rather than SSHing
+        and rewriting config on a panel that no longer needs it. Manual repairs never
+        consult this — an operator's explicit request runs regardless (criterion 3).
+        """
+        return not (
+            self._shutting_down
+            or self.availability not in (AVAILABILITY_OFFLINE, None)
+            or self._broker_unavailable()
+        )
+
+    def _skip_stale_auto_repair(self) -> None:
+        """Close out an auto-repair abandoned after the fleet SSH lock (#95).
+
+        EVENT_REPAIR_STARTED already fired, so the started→terminal contract must be
+        honoured: a panel that recovered on its own (online) met the repair's goal →
+        repair_succeeded and the problem clears. A broker-drop/shutdown skip is a
+        defer/abort with no verdict (re-driven by reconnect/teardown), logged only.
+        No cooldown is recorded and no recovery timer is armed.
+
+        The one exception is a broker-down skip while availability is UNKNOWN (None):
+        async_broker_reconnected re-arms grace only for an OFFLINE panel, so a None
+        panel would otherwise be re-drivable only by a fresh LWT. Arm an unreachable-
+        style _grace_expired recheck (mirrors async_repair's connect-failure path) so
+        it is re-evaluated after the broker likely returns.
+        """
+        if self.availability == AVAILABILITY_ONLINE:
+            self._fire(EVENT_REPAIR_SUCCEEDED)
+            if self.problem_reason != _RETAINED_LEDGER_PROBLEM:
+                self._set_problem(False, None)
+        elif self.availability is None and not self._shutting_down and self._grace_cancel is None:
+            self._grace_cancel = async_call_later(
+                self.hass, _UNREACHABLE_RECHECK_SECONDS, self._grace_expired
+            )
+        _LOGGER.info(
+            "%s: auto-repair no longer warranted after the fleet SSH wait "
+            "(shutting down, panel back online, or broker unavailable); skipping",
+            self.panel,
+        )
+
     async def async_repair(self, trigger: str = "manual") -> None:
         """Restore unit/env + enable; recovery is confirmed by the availability LWT."""
         if self._repairing:
@@ -1011,6 +1137,13 @@ class PanelManager:
                         self.panel,
                     )
             async with self._ssh_lock:
+                if trigger == "auto" and not self._auto_repair_still_warranted():
+                    # Revalidated AFTER acquiring the fleet-wide SSH lock (#95): a panel
+                    # that recovered, a broker that dropped, or a shutdown that began
+                    # while this auto-repair queued makes the work obsolete. Skip the
+                    # connect/mutate entirely — no cooldown, no recovery timer.
+                    self._skip_stale_auto_repair()
+                    return
                 try:
                     shell = await self._connect_for_repair()
                 except _HostKeyChanged:
@@ -1045,6 +1178,16 @@ class PanelManager:
                     retirement_result: bool | None = None
                     state = await panel_ops.inspect_panel(shell)
                     unit = await self._unit_contents()
+                    # Re-validate ONE more time immediately before the FIRST remote mutation
+                    # (#95 criterion 2 — "before automatic remote mutations"): the panel can
+                    # recover, the broker can drop, or shutdown can begin DURING the slow
+                    # connect/inspect awaits above. inspect_panel + _unit_contents are pure
+                    # reads, but _async_stage_broker_ca below stages the CA file on the panel
+                    # (a remote write) — so this gate must precede it. Skip cleanly — the
+                    # finally still closes the shell, and nothing is staged / written / enabled.
+                    if trigger == "auto" and not self._auto_repair_still_warranted():
+                        self._skip_stale_auto_repair()
+                        return
                     env = await self._async_stage_broker_ca(shell)
                     # Bootstrap a code-less panel (never installed, or its /var code was
                     # lost): lay the agent payload down BEFORE enabling the unit, so the
@@ -1674,6 +1817,7 @@ class PanelManager:
         # can never orphan the earlier TimerHandle — an orphan survives async_shutdown
         # and fires _recovery_timeout on a torn-down entry.
         self._cancel("_recovery_cancel")
+        self._recovery_deferred = False  # a fresh window supersedes any suspended verdict
         self._recovery_generation += 1
         self._recovery_activity = False
         self._recovery_window = _RECOVERY_SECONDS
@@ -1690,6 +1834,20 @@ class PanelManager:
         if self.problem_reason == _RETAINED_LEDGER_PROBLEM:
             return
         if self.availability == AVAILABILITY_ONLINE:
+            return
+        if self._broker_unavailable():
+            # HA cannot observe the bridge's availability LWT while its own broker link
+            # is down, so "did not come back" is unknowable and an escalation would be
+            # misleading (#95). SUSPEND the verdict (do not fall to grace): remember this
+            # window so async_broker_reconnected re-arms RECOVERY with the same origin —
+            # an 'online' LWT still fires repair_succeeded, a still-offline panel still
+            # gets the correct 'did not come back' repair_failed. Skips the journal SSH.
+            self._recovery_deferred = True
+            _LOGGER.info(
+                "%s: recovery window elapsed but HA's MQTT broker is unavailable; "
+                "deferring the recovery verdict until the broker reconnects",
+                self.panel,
+            )
             return
         if self._recovery_activity and self._recovery_window == _RECOVERY_SECONDS:
             # The bridge is visibly trying (LWT/meta traffic) but not online yet —
