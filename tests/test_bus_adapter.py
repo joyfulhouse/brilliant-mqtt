@@ -960,12 +960,22 @@ class _StartHarness:
         *,
         fail_at: str | tuple[str, str] | None = None,
         block_proc_start: bool = False,
+        gated_writes: bool = False,
     ) -> None:
         self.fail_at = fail_at
         self.block_proc_start = block_proc_start
+        self.gated_writes = gated_writes
         self.procs: list[Any] = []
         self.observers: list[Any] = []
         self.subscribed: list[str] = []
+        # Gated-write bookkeeping (gated_writes=True): every set-variables RPC
+        # blocks on write_release, recording the device order it actually
+        # started on and the peak concurrency, so a test can prove same-device
+        # writes serialize (max_writes_in_flight stays 1) across a restart.
+        self.write_release = asyncio.Event()
+        self.writes_in_flight = 0
+        self.max_writes_in_flight = 0
+        self.write_starts: list[str] = []
         self._proc_start_gate = asyncio.Event()
         self._install(monkeypatch)
 
@@ -1009,7 +1019,24 @@ class _StartHarness:
             async def request_set_variables_in_peripheral(
                 self, peripheral_id: str, values: dict[str, str], *, device_id: str
             ) -> str:
-                del peripheral_id, values, device_id
+                del peripheral_id, values
+                if not harness.gated_writes:
+                    return "ok"
+                harness.write_starts.append(device_id)
+                harness.writes_in_flight += 1
+                harness.max_writes_in_flight = max(
+                    harness.max_writes_in_flight, harness.writes_in_flight
+                )
+                try:
+                    try:
+                        await harness.write_release.wait()
+                    except asyncio.CancelledError:
+                        # Wedged closed-source write: swallow the teardown cancel
+                        # and keep holding the device lock until finally released
+                        # (models the #73 detached-straggler case).
+                        await harness.write_release.wait()
+                finally:
+                    harness.writes_in_flight -= 1
                 return "ok"
 
             async def shutdown(self) -> None:
@@ -1238,6 +1265,56 @@ class TestReusedSessionSafety:
         assert len(names) == 2
         assert names[0] != names[1]
         assert all(name.startswith("brilliant_mqtt-") for name in names)
+
+    async def test_restart_serializes_write_behind_prior_detached_write(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A prior session's detached write keeps holding its per-device lock
+        (#73); a restart must NOT hand the same device a fresh lock, or the new
+        session's write would race the still-live straggler (#88 tribunal)."""
+        monkeypatch.setattr(bus_mod, "_WRITE_DEADLINE_S", 0.01)
+        monkeypatch.setattr(bus_mod, "_WRITE_SETTLE_TIMEOUT_S", 0.05)
+        harness = _StartHarness(monkeypatch, gated_writes=True)
+        adapter = RpcBusAdapter()
+        second_caller: asyncio.Task[str] | None = None
+
+        try:
+            # Session 1: a write to own-device blocks, detaches at its deadline,
+            # and (swallowing the teardown cancel) keeps holding the device lock.
+            await adapter.start()
+            with pytest.raises(asyncio.TimeoutError):
+                await adapter.set_variables("own-device", "p", [VarSet("on", "1")])
+            (straggler,) = adapter._write_tasks
+            assert harness.write_starts == ["own-device"]
+            await asyncio.wait_for(adapter.shutdown(), timeout=1)
+            assert not straggler.done()  # survived teardown, still holds the lock
+
+            # Session 2 on the SAME adapter: a write to the SAME device must
+            # queue behind the straggler, not race it on a fresh lock.
+            await adapter.start()
+            second_caller = asyncio.create_task(
+                adapter.set_variables("own-device", "p", [VarSet("on", "0")])
+            )
+            await _settle(5)  # the second write reaches the device lock and blocks
+            assert len(adapter._write_tasks) == 2
+            assert harness.write_starts == ["own-device"]  # second RPC has NOT started
+            assert harness.max_writes_in_flight == 1  # never concurrent
+
+            # Release: the straggler finishes, THEN the second write runs serially.
+            harness.write_release.set()
+            assert await asyncio.wait_for(second_caller, timeout=1) == "'ok'"
+            assert harness.write_starts == ["own-device", "own-device"]
+            assert harness.max_writes_in_flight == 1
+        finally:
+            # Release the non-cooperative straggler so a failed assertion can't
+            # leave it (and the queued write) blocking the event-loop teardown.
+            harness.write_release.set()
+            await _settle(5)
+            pending = list(adapter._write_tasks)
+            if second_caller is not None:
+                pending.append(second_caller)
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
 
 
 class TestStaleCallbackFencing:

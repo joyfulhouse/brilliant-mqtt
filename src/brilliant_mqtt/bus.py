@@ -353,10 +353,17 @@ class RpcBusAdapter:
         population of #88) must not inherit the prior session's blocked-write
         latch, ghost peer name, stale liveness/reconnect clocks, or readiness —
         and stale work from the prior session must be fenced out of the new one
-        via the bumped token. The task/write SETS (``_pending_tasks`` /
-        ``_write_tasks``) are deliberately NOT reset here: dropping the strong
-        reference to a still-running straggler would expose it to GC mid-flight;
-        their done-callbacks discard each task by identity when it finally ends.
+        via the bumped token.
+
+        Deliberately NOT reset here:
+        - ``_pending_tasks`` / ``_write_tasks`` — dropping the strong reference
+          to a still-running straggler would expose it to GC mid-flight; their
+          done-callbacks discard each task by identity when it finally ends.
+        - ``_write_locks`` — the per-device lock must survive a restart so a new
+          session's write to a device whose PRIOR write detached and is still in
+          flight (holding that lock up to the #73 hard cap) serializes behind it
+          rather than racing it on a fresh lock. Locks are keyed by device id,
+          not session, and an idle entry just sits in the (bounded) dict.
         """
         self._session += 1
         # Not ready until this start() commits: _require_started keeps gating on
@@ -366,7 +373,6 @@ class RpcBusAdapter:
         # Block admission (writes/dispatch/reconnect) until the session commits.
         self._shutting_down = True
         self._write_timed_out = False
-        self._write_locks = {}
         self._reconnect_times = []
         self._last_push = None
         self._resubscribe = None
