@@ -58,6 +58,23 @@ class _OpaqueReceipt(str):
         )
 
 
+class _HoldingWriteBus(FakeBus):
+    def __init__(self, execution: BrilliantDevice, *mode_ids: str) -> None:
+        super().__init__(
+            [execution],
+            scoped_devices=[_scene_catalog("all_off"), _mode_catalog(*mode_ids)],
+        )
+        self.set_variables_receipt = _OpaqueReceipt("opaque transport acknowledgement")
+        self.write_started = asyncio.Event()
+        self.release_write = asyncio.Event()
+
+    async def set_variables(self, device_id: str, peripheral_id: str, sets: list[VarSet]) -> str:
+        receipt = await super().set_variables(device_id, peripheral_id, sets)
+        self.write_started.set()
+        await self.release_write.wait()
+        return receipt
+
+
 def _field_string(field_id: int, value: str) -> bytes:
     encoded = value.encode()
     return b"\x0b" + struct.pack(">hI", field_id, len(encoded)) + encoded
@@ -2825,25 +2842,7 @@ async def test_malformed_execution_never_confirms_pending_scene_command(tmp_path
 async def test_requesting_current_mode_confirms_immediately_without_execution_stamp(
     tmp_path: Path,
 ) -> None:
-    class CompletingBus(FakeBus):
-        def __init__(self) -> None:
-            super().__init__(
-                [_execution(mode_id="away", mode_at_ms=_NOW_MS - 1_000)],
-                scoped_devices=[_scene_catalog("all_off"), _mode_catalog("away")],
-            )
-            self.set_variables_receipt = _OpaqueReceipt("opaque transport acknowledgement")
-            self.write_started = asyncio.Event()
-            self.release_write = asyncio.Event()
-
-        async def set_variables(
-            self, device_id: str, peripheral_id: str, sets: list[VarSet]
-        ) -> str:
-            receipt = await super().set_variables(device_id, peripheral_id, sets)
-            self.write_started.set()
-            await self.release_write.wait()
-            return receipt
-
-    bus = CompletingBus()
+    bus = _HoldingWriteBus(_execution(mode_id="away", mode_at_ms=_NOW_MS - 1_000), "away")
     mqtt = FakeMqtt()
     clock = FakeClockMs(_NOW_MS)
     bridge = SceneBridge(bus, mqtt, _PANEL, tmp_path / "state.json", clock)
@@ -2879,29 +2878,8 @@ async def test_requesting_current_mode_confirms_immediately_without_execution_st
 async def test_pre_request_stamp_during_mode_write_cannot_trigger_equality_confirmation(
     tmp_path: Path,
 ) -> None:
-    class HoldingBus(FakeBus):
-        def __init__(self) -> None:
-            super().__init__(
-                [_execution(mode_id="home", mode_at_ms=150)],
-                scoped_devices=[
-                    _scene_catalog("all_off"),
-                    _mode_catalog("away", "home"),
-                ],
-            )
-            self.set_variables_receipt = _OpaqueReceipt("opaque transport acknowledgement")
-            self.write_started = asyncio.Event()
-            self.release_write = asyncio.Event()
-
-        async def set_variables(
-            self, device_id: str, peripheral_id: str, sets: list[VarSet]
-        ) -> str:
-            receipt = await super().set_variables(device_id, peripheral_id, sets)
-            self.write_started.set()
-            await self.release_write.wait()
-            return receipt
-
     clock = FakeClockMs(200)
-    bus = HoldingBus()
+    bus = _HoldingWriteBus(_execution(mode_id="home", mode_at_ms=150), "away", "home")
     mqtt = FakeMqtt()
     bridge = SceneBridge(bus, mqtt, _PANEL, tmp_path / "state.json", clock)
     await bridge.async_start()
@@ -2934,28 +2912,8 @@ async def test_pre_request_stamp_during_mode_write_cannot_trigger_equality_confi
 
 
 async def test_rejected_mode_snapshot_cannot_confirm_later_request(tmp_path: Path) -> None:
-    class HoldingBus(FakeBus):
-        def __init__(self) -> None:
-            super().__init__(
-                [_execution(mode_id="home", mode_at_ms=150)],
-                scoped_devices=[
-                    _scene_catalog("all_off"),
-                    _mode_catalog("away", "home"),
-                ],
-            )
-            self.write_started = asyncio.Event()
-            self.release_write = asyncio.Event()
-
-        async def set_variables(
-            self, device_id: str, peripheral_id: str, sets: list[VarSet]
-        ) -> str:
-            receipt = await super().set_variables(device_id, peripheral_id, sets)
-            self.write_started.set()
-            await self.release_write.wait()
-            return receipt
-
     clock = FakeClockMs(200)
-    bus = HoldingBus()
+    bus = _HoldingWriteBus(_execution(mode_id="home", mode_at_ms=150), "away", "home")
     mqtt = FakeMqtt()
     bridge = SceneBridge(bus, mqtt, _PANEL, tmp_path / "state.json", clock)
     await bridge.async_start()
