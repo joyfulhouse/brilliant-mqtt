@@ -13,6 +13,7 @@ from typing import Literal, cast
 from uuid import UUID
 
 from brilliant_mqtt.ha_control_protocol import (
+    COMMAND_TTL_MS,
     MAPPING_VERSION,
     SCHEMA_VERSION,
     encode_json,
@@ -82,6 +83,10 @@ class StatePending:
     panel: str
     issued_at_ms: int
     expires_at_ms: int
+    # #94: the command's panel-clock baseline; an execution confirms this command
+    # only if executed_at_ms >= confirm_after_ms. Persisted so a reconnect/restart
+    # still rejects a pre-baseline (delayed/historical) replay.
+    confirm_after_ms: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,6 +184,7 @@ def state_payload(state: SceneState) -> dict[str, object]:
             "panel": record.panel,
             "issued_at_ms": record.issued_at_ms,
             "expires_at_ms": record.expires_at_ms,
+            "confirm_after_ms": record.confirm_after_ms,
         }
         for (kind, command_id), record in state.pending
     }
@@ -488,10 +494,13 @@ def _parse_state(raw: object) -> SceneState:
             "issued_at_ms",
             "expires_at_ms",
         }
+        # #94: confirm_after_ms is an OPTIONAL key. Reject unknown keys as before,
+        # but tolerate the field's presence or absence so STATE_VERSION stays 1 and
+        # old fleet files load trusted (no version bump, no state invalidation).
         if (
             not isinstance(pending_key, str)
             or not isinstance(value, dict)
-            or set(value) != required
+            or not required <= set(value) <= required | {"confirm_after_ms"}
         ):
             raise StateValidationError("invalid pending entry")
         kind = _validated_kind(value["kind"])
@@ -513,6 +522,19 @@ def _parse_state(raw: object) -> SceneState:
             and expires_at_ms >= 0
         ):
             raise StateValidationError("invalid pending value")
+        # Present: validate the explicit baseline. Absent (old files): reconstruct
+        # it exactly from the single shared clock read at creation, where
+        # expires_at_ms = now + COMMAND_TTL_MS and confirm_after_ms = now.
+        if "confirm_after_ms" in value:
+            confirm_after_ms = value["confirm_after_ms"]
+            if not (type(confirm_after_ms) is int and 0 <= confirm_after_ms <= expires_at_ms):
+                raise StateValidationError("invalid pending confirm baseline")
+        elif expires_at_ms < COMMAND_TTL_MS:
+            # Reject at load (not at the writer's later re-validation): the
+            # reconstructed baseline would be negative for this old entry.
+            raise StateValidationError("invalid pending confirm baseline")
+        else:
+            confirm_after_ms = expires_at_ms - COMMAND_TTL_MS
         UUID(command_id)
         if fingerprint != command_fingerprint_fields(
             kind, command_id, command_panel, command_value, issued_at_ms
@@ -532,6 +554,7 @@ def _parse_state(raw: object) -> SceneState:
                     command_panel,
                     issued_at_ms,
                     expires_at_ms,
+                    confirm_after_ms,
                 ),
             )
         )

@@ -91,6 +91,9 @@ class _Pending:
     fingerprint: str
     panel: str
     issued_at_ms: int
+    # #94: panel-clock baseline; an execution confirms this command only if
+    # executed_at_ms >= confirm_after_ms (see _apply_scene_execution).
+    confirm_after_ms: int
     timeout_task: asyncio.Task[None] | None
     write_task: asyncio.Task[None] | None = None
 
@@ -465,6 +468,7 @@ class SceneBridge:
                 record.fingerprint,
                 record.panel,
                 record.issued_at_ms,
+                record.confirm_after_ms,
                 None,
             )
             target = self._scene_pending if kind == "scene" else self._mode_pending
@@ -752,11 +756,30 @@ class SceneBridge:
             }
         )
         event_key = f"scene:{self._panel}:{execution.scene_id}:{execution.executed_at_ms}"
-        matching = [
-            (command_id, pending)
-            for command_id, pending in self._scene_pending.items()
-            if pending.value == execution.scene_id
-        ]
+        matching: list[tuple[str, _Pending]] = []
+        for command_id, pending in self._scene_pending.items():
+            if pending.value != execution.scene_id:
+                continue
+            # #94: confirm a scene command only with execution evidence at or
+            # after the command's own panel-clock baseline. executed_at_ms is a
+            # verified panel epoch-ms stamp (scene_codec) and confirm_after_ms is
+            # read from the same clock, so this is a same-domain comparison. `>=`
+            # means a tie confirms: an execution stamped exactly at the baseline
+            # instant is valid evidence for the command issued at that instant.
+            if execution.executed_at_ms >= pending.confirm_after_ms:
+                matching.append((command_id, pending))
+            else:
+                # A by-identity match older than the baseline is a delayed or
+                # historical execution (or a backward NTP step). It still advances
+                # the watermark and may emit its native event below, but it must
+                # never confirm the command.
+                logger.warning(
+                    "scene execution predates command baseline; not confirming "
+                    "(scene_id=%s executed_at_ms=%d confirm_after_ms=%d)",
+                    execution.scene_id,
+                    execution.executed_at_ms,
+                    pending.confirm_after_ms,
+                )
         publish_event = emit_event or bool(matching)
         if publish_event and not self._reserve_event(event_key):
             return False
@@ -789,6 +812,16 @@ class SceneBridge:
         return True
 
     def _apply_mode_execution(self, execution: ModeExecution, *, emit_event: bool) -> bool:
+        # #94 mode deferral: the mode path intentionally has NO request-relative
+        # confirm gate (unlike _apply_scene_execution). A mode execution's
+        # timestamp comes from the bus Variable.timestamp, whose units and clock
+        # domain are UNVERIFIED and cannot be verified without live-panel
+        # hardware. Gating on it risks breaking legitimate mode commands on
+        # production in-wall panels. Before adding a gate here, verify on hardware:
+        #   1. Variable.timestamp UNITS (seconds vs milliseconds).
+        #   2. Panel-clock vs writer/phone-supplied (change a mode from a phone
+        #      vs from the bridge and compare to _clock_ms()).
+        #   3. Whether a redundant same-mode set re-stamps the timestamp.
         current = (execution.executed_at_ms, execution.mode_id)
         previous = self._mode_watermarks.get(self._panel)
         if previous is not None and current <= previous:
@@ -942,6 +975,11 @@ class SceneBridge:
                         self._state_reason = "state_capacity"
                         needs_health = True
                     else:
+                        # One clock read shared by the TTL deadline and the #94
+                        # confirm baseline, so the durable-file fallback
+                        # (expires_at_ms - COMMAND_TTL_MS) reconstructs the
+                        # baseline exactly for old files that lack the field.
+                        now = self._clock_ms()
                         record = _StoredPending(
                             state_kind,
                             command.command_id,
@@ -949,7 +987,8 @@ class SceneBridge:
                             fingerprint,
                             command.panel,
                             command.issued_at_ms,
-                            self._clock_ms() + COMMAND_TTL_MS,
+                            now + COMMAND_TTL_MS,
+                            now,
                         )
                         self._pending_records[cache_key] = record
                         pending[command.command_id] = _Pending(
@@ -957,6 +996,7 @@ class SceneBridge:
                             fingerprint,
                             command.panel,
                             command.issued_at_ms,
+                            now,
                             None,
                         )
                         execution_device_id = self._execution.device_id
@@ -1061,6 +1101,10 @@ class SceneBridge:
             pending_map = self._scene_pending if kind == "scene" else self._mode_pending
             pending = pending_map.get(command_id)
             if pending is None:
+                # #94: a missing pending here is the intended terminal state after
+                # an at-or-after-baseline confirmation removed it. An external
+                # same-id execution issued after the command is a semantically
+                # valid confirmation, not a bug.
                 return
             if expected_write is not None and pending.write_task is not expected_write:
                 return
