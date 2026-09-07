@@ -75,13 +75,21 @@ def handle(
     elif action == Action.RESTART_SERVICES:
         _LOG.warning("gateway down ~180s: restarting connman + wpa_supplicant")
         recovery_mod.restart_services()
+    elif action == Action.ESCALATE_NOTIFY:
+        # Reboot wanted but the ladder saw the guard block it (cooldown/cap).  It
+        # stays pending and re-arms automatically once the guard clears; log once.
+        _LOG.error(
+            "gateway down ~360s: reboot deferred by guard (cooldown/cap) "
+            "— will retry automatically once eligible"
+        )
     elif action == Action.GPIO_RESET_REBOOT:
+        # Defense in depth: never reboot without independently confirming the
+        # guard allows it.  The ladder already gates on the same eligibility, so
+        # this check should always pass here — but handle() must never trust that.
         if guard.can_reboot(now):
             _LOG.error("gateway down ~360s: GPIO/SDIO reset + reboot")
             guard.record(now)
             recovery_mod.gpio_reset_and_reboot()
-        else:
-            _LOG.error("gateway down ~360s but reboot guard blocked (cooldown/cap) — notify only")
 
 
 def _configure_logging(path: str) -> None:
@@ -102,9 +110,16 @@ def main() -> None:  # pragma: no cover - thin loop
         if cfg.broker_host:
             broker_up = probe.tcp_open(cfg.broker_host, cfg.broker_port)
             _LOG.info("gateway=%s up=%s broker_up=%s", gw, gateway_up, broker_up)
-        action = ladder.observe(gateway_up=gateway_up, now=time.monotonic())
+        # Read wall-clock once and reuse it for both the eligibility check and
+        # handle(), so the ladder and handle() see the exact same guard state
+        # (rung-elapsed math stays on the monotonic clock).
+        wall = time.time()
+        eligible = guard.can_reboot(wall)
+        action = ladder.observe(
+            gateway_up=gateway_up, now=time.monotonic(), reboot_eligible=eligible
+        )
         if action != Action.NONE:
-            handle(action, guard=guard, now=time.time())
+            handle(action, guard=guard, now=wall)
         time.sleep(cfg.interval)
 
 

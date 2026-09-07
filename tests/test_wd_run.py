@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import logging
+
+import pytest
+
 from brilliant_wifi_watchdog import run
 from brilliant_wifi_watchdog.ladder import Action, Thresholds
 from brilliant_wifi_watchdog.reboot_guard import GuardPolicy
@@ -42,6 +46,17 @@ def test_reboot_blocked_when_guard_denies() -> None:
     g, rec = FakeGuard(False), FakeRecovery()
     run.handle(Action.GPIO_RESET_REBOOT, guard=g, now=0.0, recovery_mod=rec)
     assert rec.calls == [] and g.recorded == []  # no reboot, not recorded
+
+
+def test_escalate_notify_logs_once_without_side_effects(caplog: pytest.LogCaptureFixture) -> None:
+    """A deferred reboot notifies (one log line) and touches neither guard nor
+    recovery — the retry re-arms automatically once the guard clears (issue #91)."""
+    g, rec = FakeGuard(True), FakeRecovery()
+    with caplog.at_level(logging.ERROR, logger="brilliant_wifi_watchdog"):
+        run.handle(Action.ESCALATE_NOTIFY, guard=g, now=0.0, recovery_mod=rec)
+    assert rec.calls == [] and g.recorded == []  # no reboot, nothing recorded
+    notices = [r for r in caplog.records if "deferred" in r.getMessage()]
+    assert len(notices) == 1
 
 
 def test_reboot_runs_and_records_when_allowed() -> None:

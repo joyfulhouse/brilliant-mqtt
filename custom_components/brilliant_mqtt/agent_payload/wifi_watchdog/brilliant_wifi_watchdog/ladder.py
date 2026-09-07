@@ -36,11 +36,13 @@ class Ladder:
         self._fails = 0
         self._down_since: float | None = None
         self._fired: set[str] = set()
+        self._reboot_deferred = False
 
     def reset(self) -> None:
         self._fails = 0
         self._down_since = None
         self._fired.clear()
+        self._reboot_deferred = False
 
     def _threshold(self, name: str) -> float:
         return {
@@ -49,7 +51,7 @@ class Ladder:
             "reboot": self._t.reboot_after,
         }[name]
 
-    def observe(self, *, gateway_up: bool, now: float) -> Action:
+    def observe(self, *, gateway_up: bool, now: float, reboot_eligible: bool = True) -> Action:
         if gateway_up:
             self.reset()
             return Action.NONE
@@ -61,7 +63,22 @@ class Ladder:
         elapsed = now - self._down_since
         # Fire the highest-threshold rung whose time has passed and which hasn't fired.
         for name, action in reversed(_RUNGS):
-            if elapsed >= self._threshold(name) and name not in self._fired:
+            if elapsed < self._threshold(name) or name in self._fired:
+                continue
+            if name != "reboot":
+                # soft/restart are never blocked → mark fired-forever for this outage.
                 self._fired.add(name)
                 return action
+            # Reboot is gated by the persistent guard.  Only mark it fired once it
+            # actually fires; while blocked it stays pending so a later eligible
+            # poll re-arms it — no connectivity recovery required (issue #91).
+            if reboot_eligible:
+                self._fired.add("reboot")
+                self._reboot_deferred = False
+                return Action.GPIO_RESET_REBOOT
+            if not self._reboot_deferred:
+                # First blocked poll of this outage: notify once, then stay quiet.
+                self._reboot_deferred = True
+                return Action.ESCALATE_NOTIFY
+            return Action.NONE
         return Action.NONE
