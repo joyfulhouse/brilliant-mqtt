@@ -10,6 +10,7 @@ class FileSystem(Protocol):
     def exists(self, path: str) -> bool: ...
     def read_text(self, path: str) -> str: ...
     def append_text(self, path: str, text: str) -> None: ...
+    def write_text(self, path: str, text: str) -> None: ...
     def glob(self, root: str, name: str) -> str | None: ...
 
 
@@ -23,6 +24,14 @@ class RealFileSystem:
 
     def append_text(self, path: str, text: str) -> None:
         with open(path, "a", encoding="utf-8") as f:
+            f.write(text)
+
+    def write_text(self, path: str, text: str) -> None:
+        # Overwrite (truncating) — used for the small pending-reload state file,
+        # which must reflect only the latest generation, never accumulate. The
+        # parent dir is created so a first write on a fresh panel can't fail.
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
             f.write(text)
 
     def glob(self, root: str, name: str) -> str | None:

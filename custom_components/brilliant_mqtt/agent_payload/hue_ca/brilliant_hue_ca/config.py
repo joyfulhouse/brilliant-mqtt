@@ -15,11 +15,19 @@ class Config:
     site_packages_root: str
     vassal_ini_path: str
     log_path: str
+    state_path: str
+    min_retry_interval_s: float
 
 
 def load_config(environ: Mapping[str, str]) -> Config:
     def s(key: str, default: str) -> str:
         return environ.get(key, default)
+
+    def f(key: str, default: float) -> float:
+        try:
+            return float(environ[key])
+        except (KeyError, ValueError):
+            return default
 
     return Config(
         ca_cert_path=s("HUE_CA_CERT_PATH", "/var/brilliant-hue-ca/injected-ca.pem"),
@@ -30,4 +38,9 @@ def load_config(environ: Mapping[str, str]) -> Config:
             "/var/run/brilliant/processes/hue_bridge_peripherals.ini",
         ),
         log_path=s("HUE_CA_LOG", "/var/log/brilliant-hue-ca.log"),
+        state_path=s("HUE_CA_STATE_PATH", "/var/brilliant-hue-ca/pending-reload.json"),
+        # 5 min: well under the 15-min timer cadence, so a real restart failure
+        # still retries within one or two ticks, but immune to back-to-back
+        # restart storms if reconcile is somehow called in quick succession.
+        min_retry_interval_s=f("HUE_CA_MIN_RETRY_INTERVAL_S", 300.0),
     )
