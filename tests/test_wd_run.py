@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from brilliant_wifi_watchdog import bounded, probe, run
+from brilliant_wifi_watchdog import bounded, probe, recovery, run
 from brilliant_wifi_watchdog.ladder import Action, Ladder, Thresholds
 from brilliant_wifi_watchdog.reboot_guard import GuardPolicy, RebootGuard
 
@@ -145,7 +145,11 @@ def test_reboot_not_lost_when_guard_read_would_flap() -> None:
         eligible = g.can_request(wall)  # the ONLY read this poll
         action = lad.observe(gateway_up=False, now=wall, reboot_eligible=eligible)
         if action != Action.NONE:
-            run.handle(action, guard=g, now=wall, recovery_mod=rec, reboot_eligible=eligible)
+            result = run.handle(
+                action, guard=g, now=wall, recovery_mod=rec, reboot_eligible=eligible
+            )
+            if result is not None:
+                lad.reboot_request_returned()
     assert rec.calls.count("reboot") == 1  # fired once, never lost
     assert g.recorded == [360.0]  # and recorded against the cap
 
@@ -284,14 +288,14 @@ def _run_reboot_schedule(
     requests: list[float] = []
 
     monkeypatch.setattr(probe, "gateway_probe", lambda gateway: (gateway, probe.TcpProbe.CLOSED))
-    monkeypatch.setattr(run.recovery, "soft_reconnect", lambda: None)
-    monkeypatch.setattr(run.recovery, "restart_services", lambda: None)
+    monkeypatch.setattr(recovery, "soft_reconnect", lambda: None)
+    monkeypatch.setattr(recovery, "restart_services", lambda: None)
 
     def request_reboot() -> int:
         requests.append(now[0])
         return bounded.TIMEOUT_RC
 
-    monkeypatch.setattr(run.recovery, "gpio_reset_and_reboot", request_reboot)
+    monkeypatch.setattr(recovery, "gpio_reset_and_reboot", request_reboot)
     monkeypatch.setattr(run, "time", SimpleNamespace(time=lambda: now[0], monotonic=lambda: now[0]))
     for value in times:
         now[0] = value

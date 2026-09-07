@@ -58,15 +58,17 @@ def _poll(
 
     ``run.main()`` reads request eligibility ONCE from wall-clock time and shares it
     with both ``observe`` and ``handle`` (no second, independent guard read that
-    could desync); ``handle`` persists a request reservation before recovery. A
-    single ``t`` stands in for both the wall clock (guard) and the monotonic clock
-    (ladder); in production they advance together. Returns the action and this
-    poll's eligibility.
+    could desync); ``handle`` records the attempt and pending boot identity before
+    recovery. A single ``t`` stands in for both the wall clock (guard) and the
+    monotonic clock (ladder); in production they advance together. Returns the
+    action and this poll's eligibility.
     """
     eligible = guard.can_request(t)
     action = ladder.observe(gateway_up=gateway_up, now=t, reboot_eligible=eligible)
     if action != Action.NONE:
-        run.handle(action, guard=guard, now=t, recovery_mod=rec, reboot_eligible=eligible)
+        result = run.handle(action, guard=guard, now=t, recovery_mod=rec, reboot_eligible=eligible)
+        if result is not None:
+            ladder.reboot_request_returned()
     return action, eligible
 
 
@@ -93,6 +95,7 @@ def test_deferred_reboot_rearms_after_cooldown_expires(tmp_path: Path) -> None:
         action, eligible = _poll(ladder, guard, rec, gateway_up=rebooted, t=t)
         log.append((t, action, eligible))
         if action == Action.GPIO_RESET_REBOOT:
+            assert _stamps(state) == [0.0, t]
             boot_id[0] = "boot-b"
             ladder = Ladder(T)  # the new boot starts a fresh daemon process
             rebooted = True
@@ -140,6 +143,7 @@ def test_deferred_reboot_rearms_after_cap_window_expires(tmp_path: Path) -> None
         action, eligible = _poll(ladder, guard, rec, gateway_up=rebooted, t=t)
         log.append((t, action, eligible))
         if action == Action.GPIO_RESET_REBOOT:
+            assert _stamps(state) == [3601.0, 7202.0, t]
             boot_id[0] = "boot-b"
             ladder = Ladder(T)
             rebooted = True

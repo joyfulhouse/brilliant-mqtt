@@ -27,15 +27,6 @@ def _run_probe(argv: list[str], capture: bool) -> bounded.Completed:
     return bounded.run_bounded(argv, timeout=_PROBE_TIMEOUT, capture=capture)
 
 
-def _run_out(argv: list[str]) -> tuple[int, str]:
-    r = bounded.run_bounded(argv, timeout=_PROBE_TIMEOUT, capture=True)
-    return r.returncode, r.stdout
-
-
-def _run_rc(argv: list[str]) -> int:
-    return bounded.run_bounded(argv, timeout=_PROBE_TIMEOUT).returncode
-
-
 def _parse_default_gateway(out: str) -> str | None:
     for line in out.splitlines():
         parts = line.split()
@@ -46,15 +37,12 @@ def _parse_default_gateway(out: str) -> str | None:
     return None
 
 
-def default_gateway(run: Callable[[list[str]], tuple[int, str]] = _run_out) -> str | None:
-    rc, out = run(["ip", "route", "show", "default"])
-    if rc != 0:
-        return None
-    return _parse_default_gateway(out)
-
-
-def ping(host: str, run: Callable[[list[str]], int] = _run_rc) -> bool:
-    return run(["ping", "-c", "1", "-W", "2", host]) == 0
+def ping(host: str, run: Callable[[list[str]], int] | None = None) -> bool:
+    argv = ["ping", "-c", "1", "-W", "2", host]
+    returncode = (
+        bounded.run_bounded(argv, timeout=_PROBE_TIMEOUT).returncode if run is None else run(argv)
+    )
+    return returncode == 0
 
 
 class TcpProbe(enum.Enum):

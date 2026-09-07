@@ -18,28 +18,15 @@ _LOG = logging.getLogger("brilliant_wifi_watchdog")
 
 
 class _GuardLike(Protocol):
-    def can_reboot(self, now: float) -> bool: ...
+    def can_request(self, now: float) -> bool: ...
 
-    def record(self, now: float) -> None: ...
+    def record_request(self, now: float) -> None: ...
 
 
 class _LadderLike(Protocol):
     def observe(self, *, gateway_up: bool | None, now: float, reboot_eligible: bool) -> Action: ...
 
-
-def _can_request(guard: _GuardLike, now: float) -> bool:
-    request_check = getattr(guard, "can_request", None)
-    if callable(request_check):
-        return bool(request_check(now))
-    return guard.can_reboot(now)
-
-
-def _record_request(guard: _GuardLike, now: float) -> None:
-    request_record = getattr(guard, "record_request", None)
-    if callable(request_record):
-        request_record(now)
-    else:
-        guard.record(now)
+    def reboot_request_returned(self) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -109,16 +96,13 @@ def handle(
         # read said eligible; otherwise log the blocked path (never silent).
         if reboot_eligible:
             _LOG.error("gateway down ~360s: GPIO/SDIO reset + reboot")
-            _record_request(guard, now)
-            result = recovery_mod.gpio_reset_and_reboot()
-            if isinstance(result, int):
-                if result == 0:
-                    _LOG.error("reboot requested; waiting for a new boot identity")
-                else:
-                    _LOG.error(
-                        "reboot request failed with status %d; recovery remains pending", result
-                    )
-                return result
+            guard.record_request(now)
+            result: int = recovery_mod.gpio_reset_and_reboot()
+            if result == 0:
+                _LOG.error("reboot requested; waiting for a new boot identity")
+            else:
+                _LOG.error("reboot request failed with status %d; recovery remains pending", result)
+            return result
         else:
             _LOG.error("gateway down ~360s but reboot guard blocked (cooldown/cap) — notify only")
     return None
@@ -151,10 +135,12 @@ def _poll_once(cfg: Config, *, guard: _GuardLike, ladder: _LadderLike) -> None:
     # never act on disagreeing eligibility (rung-elapsed math stays monotonic;
     # only the guard-facing timestamp is wall-clock).
     wall = time.time()
-    eligible = _can_request(guard, wall)
+    eligible = guard.can_request(wall)
     action = ladder.observe(gateway_up=gateway_up, now=time.monotonic(), reboot_eligible=eligible)
     if action != Action.NONE:
-        handle(action, guard=guard, now=wall, reboot_eligible=eligible)
+        result = handle(action, guard=guard, now=wall, reboot_eligible=eligible)
+        if result is not None:
+            ladder.reboot_request_returned()
 
 
 def main() -> None:  # pragma: no cover - thin loop

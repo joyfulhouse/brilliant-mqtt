@@ -48,6 +48,10 @@ class Ladder:
         self._reboot_deferred = False
         self._reboot_requested = False
 
+    def reboot_request_returned(self) -> None:
+        """Re-arm a reboot command that returned without replacing this process."""
+        self._reboot_requested = False
+
     def _threshold(self, name: str) -> float:
         return {
             "soft": self._t.soft_after,
