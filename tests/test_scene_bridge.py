@@ -130,6 +130,17 @@ def _published(mqtt: FakeMqtt, topic: str) -> list[tuple[str, str, bool]]:
     return [item for item in mqtt.published if item[0] == topic]
 
 
+def _published_qos(mqtt: FakeMqtt, topic: str) -> list[int]:
+    """QoS levels seen on the wire for ``topic``, in publish order.
+
+    ``FakeMqtt.published`` and ``FakeMqtt.published_qos`` are index-aligned, so
+    this reports the QoS the delivery loop actually passed for each frame.
+    """
+    return [
+        mqtt.published_qos[index] for index, item in enumerate(mqtt.published) if item[0] == topic
+    ]
+
+
 def _payload(item: tuple[str, str, bool]) -> dict[str, object]:
     return cast(dict[str, object], json.loads(item[1]))
 
@@ -1117,6 +1128,238 @@ async def test_event_outbox_survives_restart_and_gates_accepted_result(tmp_path:
     await restarted.async_shutdown()
 
 
+async def test_outbox_event_and_result_publish_at_qos1(tmp_path: Path) -> None:
+    # Issue #92: durable outbox frames must go out at QoS 1 so publish() blocks
+    # on the broker PUBACK before the record is committed delivered.
+    bridge, bus, mqtt, _, _ = await _started(tmp_path)
+    command_id = "22222222-2222-4222-8222-222222222222"
+    await mqtt.inject(scene_command_topic(_PANEL), _command(command_id, "scene", "all_off"))
+    await _wait_for_bus_commands(bus, 1)
+    await bus.emit(_execution("all_off", 1234))
+    await _wait_for_publish(mqtt, scene_result_topic(command_id))
+
+    assert _published_qos(mqtt, scene_event_topic(_PANEL)) == [1]
+    assert _published_qos(mqtt, scene_result_topic(command_id)) == [1]
+    # The default QoS 0 stays for the out-of-scope retained catalog publishes.
+    assert _published(mqtt, scene_catalog_topic(_PANEL))
+    assert all(qos == 0 for qos in _published_qos(mqtt, scene_catalog_topic(_PANEL)))
+    await bridge.async_shutdown()
+
+
+async def test_event_publish_without_puback_replays_same_key_at_qos1(tmp_path: Path) -> None:
+    # A disconnect between local send and PUBACK surfaces as a publish() raise.
+    # The event record must stay undelivered and replay the identical dedup
+    # key/topic/payload at QoS 1 on the next attempt (event still before result).
+    command_id = "22222222-2222-4222-8222-222222222222"
+
+    class FirstEventNoPubackMqtt(FakeMqtt):
+        def __init__(self) -> None:
+            super().__init__()
+            self.event_attempts = 0
+
+        async def publish(
+            self, topic: str, payload: str, retain: bool = False, qos: int = 0
+        ) -> None:
+            if topic == scene_event_topic(_PANEL):
+                self.event_attempts += 1
+                if self.event_attempts == 1:
+                    raise RuntimeError("disconnected before PUBACK")
+            await super().publish(topic, payload, retain, qos)
+
+    bus = FakeBus([_execution()], scoped_devices=[_scene_catalog("all_off"), _mode_catalog("away")])
+    mqtt = FirstEventNoPubackMqtt()
+    clock = FakeClockMs(_NOW_MS)
+    bridge = SceneBridge(bus, mqtt, _PANEL, tmp_path / "state.json", clock)
+    await bridge.async_start()
+    await mqtt.inject(scene_command_topic(_PANEL), _command(command_id, "scene", "all_off"))
+    await bus.emit(_execution("all_off", 500))
+    for _ in range(200):
+        if mqtt.event_attempts >= 1:
+            break
+        await asyncio.sleep(0.001)
+    assert mqtt.event_attempts >= 1
+    # No PUBACK -> nothing committed on the wire, and the result stays gated.
+    assert _published(mqtt, scene_event_topic(_PANEL)) == []
+    assert _published(mqtt, scene_result_topic(command_id)) == []
+
+    await clock.advance_ms(1_000)
+    await _wait_for_publish(mqtt, scene_result_topic(command_id))
+
+    events = _published(mqtt, scene_event_topic(_PANEL))
+    assert len(events) == 1
+    assert _published_qos(mqtt, scene_event_topic(_PANEL)) == [1]
+    event_index = next(
+        i for i, item in enumerate(mqtt.published) if item[0] == scene_event_topic(_PANEL)
+    )
+    result_index = next(
+        i for i, item in enumerate(mqtt.published) if item[0] == scene_result_topic(command_id)
+    )
+    assert event_index < result_index
+    await bridge.async_shutdown()
+
+
+async def test_result_publish_without_puback_replays_same_command_id_at_qos1(
+    tmp_path: Path,
+) -> None:
+    # Same guarantee for the command result: a raise before PUBACK leaves it
+    # undelivered and the identical command_id/payload is replayed at QoS 1.
+    command_id = "22222222-2222-4222-8222-222222222222"
+
+    class FirstResultNoPubackMqtt(FakeMqtt):
+        def __init__(self) -> None:
+            super().__init__()
+            self.result_attempts = 0
+
+        async def publish(
+            self, topic: str, payload: str, retain: bool = False, qos: int = 0
+        ) -> None:
+            if topic == scene_result_topic(command_id):
+                self.result_attempts += 1
+                if self.result_attempts == 1:
+                    raise RuntimeError("disconnected before PUBACK")
+            await super().publish(topic, payload, retain, qos)
+
+    bus = FakeBus([_execution()], scoped_devices=[_scene_catalog("all_off"), _mode_catalog("away")])
+    mqtt = FirstResultNoPubackMqtt()
+    clock = FakeClockMs(_NOW_MS)
+    bridge = SceneBridge(bus, mqtt, _PANEL, tmp_path / "state.json", clock)
+    await bridge.async_start()
+    await mqtt.inject(scene_command_topic(_PANEL), _command(command_id, "scene", "all_off"))
+    await bus.emit(_execution("all_off", 500))
+    await _wait_for_publish(mqtt, scene_event_topic(_PANEL))
+    for _ in range(200):
+        if mqtt.result_attempts >= 1:
+            break
+        await asyncio.sleep(0.001)
+    assert mqtt.result_attempts >= 1
+    assert _published(mqtt, scene_result_topic(command_id)) == []
+
+    await clock.advance_ms(1_000)
+    await _wait_for_publish(mqtt, scene_result_topic(command_id))
+
+    results = _published(mqtt, scene_result_topic(command_id))
+    assert len(results) == 1
+    assert _payload(results[0])["command_id"] == command_id
+    assert _payload(results[0])["accepted"] is True
+    assert _published_qos(mqtt, scene_result_topic(command_id)) == [1]
+    await bridge.async_shutdown()
+
+
+async def test_undelivered_event_and_result_replay_identically_at_qos1_after_restart(
+    tmp_path: Path,
+) -> None:
+    # End-to-end durability: with the broker offline both outbox frames persist
+    # undelivered; a fresh process reconstructed from that file replays the exact
+    # same payloads at QoS 1, event before result.
+    command_id = "22222222-2222-4222-8222-222222222222"
+
+    class OfflineOutboxMqtt(FakeMqtt):
+        async def publish(
+            self, topic: str, payload: str, retain: bool = False, qos: int = 0
+        ) -> None:
+            if topic in (scene_event_topic(_PANEL), scene_result_topic(command_id)):
+                raise RuntimeError("offline before PUBACK")
+            await super().publish(topic, payload, retain, qos)
+
+    path = tmp_path / "state.json"
+    bus = FakeBus([_execution()], scoped_devices=[_scene_catalog("all_off"), _mode_catalog("away")])
+    mqtt = OfflineOutboxMqtt()
+    clock = FakeClockMs(_NOW_MS)
+    bridge = SceneBridge(bus, mqtt, _PANEL, path, clock)
+    await bridge.async_start()
+    await mqtt.inject(scene_command_topic(_PANEL), _command(command_id, "scene", "all_off"))
+    await bus.emit(_execution("all_off", 500))
+    await asyncio.sleep(0)
+    await bridge.async_shutdown()
+
+    stored = json.loads(path.read_text())
+    stored_event = next(iter(stored["events"].values()))
+    assert stored_event["delivered"] is False
+    stored_result = stored["results"][f"scene:{command_id}"]
+    assert stored_result["delivered"] is False
+
+    restarted_bus = FakeBus(
+        [_execution("all_off", 500)],
+        scoped_devices=[_scene_catalog("all_off"), _mode_catalog("away")],
+    )
+    restarted_mqtt = FakeMqtt()
+    restarted = SceneBridge(restarted_bus, restarted_mqtt, _PANEL, path, clock)
+    await restarted.async_start()
+    await _wait_for_publish(restarted_mqtt, scene_result_topic(command_id))
+
+    assert [item[1] for item in _published(restarted_mqtt, scene_event_topic(_PANEL))] == [
+        stored_event["payload"]
+    ]
+    assert [item[1] for item in _published(restarted_mqtt, scene_result_topic(command_id))] == [
+        stored_result["payload"]
+    ]
+    assert _published_qos(restarted_mqtt, scene_event_topic(_PANEL)) == [1]
+    assert _published_qos(restarted_mqtt, scene_result_topic(command_id)) == [1]
+    event_index = next(
+        i for i, item in enumerate(restarted_mqtt.published) if item[0] == scene_event_topic(_PANEL)
+    )
+    result_index = next(
+        i
+        for i, item in enumerate(restarted_mqtt.published)
+        if item[0] == scene_result_topic(command_id)
+    )
+    assert event_index < result_index
+    await restarted.async_shutdown()
+
+
+async def test_lost_puback_after_broker_receipt_republishes_identical_duplicate_at_qos1(
+    tmp_path: Path,
+) -> None:
+    # PUBACK lost after the broker already stored the frame: publish() still
+    # raises, so the loop replays the SAME command_id/payload at QoS 1 -> a
+    # duplicate on the wire, not a fabricated second record. Downstream HA-side
+    # dedup on command_id makes the duplicate safe (stated in the PR contract).
+    command_id = "22222222-2222-4222-8222-222222222222"
+
+    class LostPubackMqtt(FakeMqtt):
+        def __init__(self) -> None:
+            super().__init__()
+            self.result_attempts = 0
+
+        async def publish(
+            self, topic: str, payload: str, retain: bool = False, qos: int = 0
+        ) -> None:
+            if topic == scene_result_topic(command_id):
+                self.result_attempts += 1
+                if self.result_attempts == 1:
+                    # Broker got the frame; record it, then the PUBACK is lost.
+                    await super().publish(topic, payload, retain, qos)
+                    raise RuntimeError("PUBACK lost after broker receipt")
+            await super().publish(topic, payload, retain, qos)
+
+    path = tmp_path / "state.json"
+    bus = FakeBus([_execution()], scoped_devices=[_scene_catalog("all_off"), _mode_catalog("away")])
+    mqtt = LostPubackMqtt()
+    clock = FakeClockMs(_NOW_MS)
+    bridge = SceneBridge(bus, mqtt, _PANEL, path, clock)
+    await bridge.async_start()
+    await mqtt.inject(scene_command_topic(_PANEL), _command(command_id, "scene", "all_off"))
+    await bus.emit(_execution("all_off", 500))
+    await _wait_for_publish(mqtt, scene_result_topic(command_id))
+    for _ in range(200):
+        if mqtt.result_attempts >= 1:
+            break
+        await asyncio.sleep(0.001)
+
+    await clock.advance_ms(1_000)
+    await _wait_for_publish(mqtt, scene_result_topic(command_id), count=2)
+    await bridge.async_shutdown()
+
+    results = _published(mqtt, scene_result_topic(command_id))
+    assert len(results) == 2
+    assert results[0][1] == results[1][1]
+    assert _payload(results[0])["command_id"] == command_id
+    assert _payload(results[1])["command_id"] == command_id
+    assert _published_qos(mqtt, scene_result_topic(command_id)) == [1, 1]
+    stored = json.loads(path.read_text())
+    assert [key for key in stored["results"] if command_id in key] == [f"scene:{command_id}"]
+
+
 async def test_corrupt_state_seeds_baseline_without_history_and_normalizes_permissions(
     tmp_path: Path,
 ) -> None:
@@ -2078,4 +2321,90 @@ async def test_restart_is_fail_closed_until_abandoned_unsubscribe_finishes(
         await asyncio.sleep(0.001)
     await bridge.async_start()
     assert mqtt.subscriptions == [scene_command_topic(_PANEL), mode_command_topic(_PANEL)]
+    await bridge.async_shutdown()
+
+
+async def test_poll_confirms_repeated_same_mode_activation_with_new_timestamp(
+    tmp_path: Path,
+) -> None:
+    # Issue #93: the same mode re-activates with a new bus timestamp, but its
+    # real-time push is missed and it surfaces only through the hot poll. The
+    # value-only fingerprint is unchanged, so the manual_mode_id timestamp must
+    # gate the poll or the activation (and its pending command) is dropped.
+    seeded = _execution(mode_id="away", mode_at_ms=_NOW_MS - 1_000)
+    bridge, bus, mqtt, clock, _ = await _started(tmp_path, execution=seeded)
+    mqtt.published.clear()
+
+    command_id = "33333333-3333-4333-8333-333333333333"
+    await mqtt.inject(mode_command_topic(_PANEL), _command(command_id, "mode", "away"))
+    await _wait_for_bus_commands(bus, 1)
+
+    # Missed push: the re-activation reaches the bridge only via poll_executions.
+    await bridge.poll_executions([_execution(mode_id="away", mode_at_ms=_NOW_MS + 1)])
+    await _wait_for_publish(mqtt, mode_result_topic(command_id))
+
+    assert len(_published(mqtt, mode_event_topic(_PANEL))) == 1
+    result = _payload(_published(mqtt, mode_result_topic(command_id))[-1])
+    assert result["accepted"] is True
+    assert "error" not in result
+
+    # The confirmation cancels the pending timeout: advancing past the TTL emits
+    # no further (timeout) result.
+    await clock.advance_ms(15_000)
+    assert len(_published(mqtt, mode_result_topic(command_id))) == 1
+    await bridge.async_shutdown()
+
+
+async def test_poll_gate_suppresses_identical_mode_value_and_timestamp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A poll delivering the SAME mode value AND the SAME bus timestamp is a pure
+    # re-read and must remain gated (no reprocessing, no duplicate event).
+    seeded = _execution(mode_id="away", mode_at_ms=500)
+    bridge, _, _, _, _ = await _started(tmp_path, execution=seeded)
+    process = bridge._async_process_execution
+    processed: list[BrilliantDevice] = []
+
+    async def observed_process(
+        device: BrilliantDevice,
+        *,
+        emit_events: bool,
+        epoch: int,
+    ) -> None:
+        processed.append(device)
+        await process(device, emit_events=emit_events, epoch=epoch)
+
+    monkeypatch.setattr(bridge, "_async_process_execution", observed_process)
+
+    await bridge.poll_executions([_execution(mode_id="away", mode_at_ms=500)])
+
+    assert processed == []
+    # Pin the fix: the seeded away@500 fingerprint must carry the synthetic mode
+    # timestamp key. A value-only fingerprint would omit it, leaving this test
+    # unable to distinguish the fixed gate from the buggy one.
+    fingerprint = scene_bridge_module._execution_fingerprint(seeded)
+    assert fingerprint["@manual_mode_id.timestamp_ms"] == str(500)
+    await bridge.async_shutdown()
+
+
+async def test_poll_recovers_mode_health_when_invalid_timestamp_becomes_valid(
+    tmp_path: Path,
+) -> None:
+    # Malformed-to-valid recovery: the seed carries an invalid (None) mode
+    # timestamp, so decode_mode_execution raises and mode health is False. A
+    # later poll delivers the SAME mode value with a now-valid timestamp; the
+    # folded-in timestamp makes the fingerprint change, so the poll reprocesses,
+    # health recovers, and the activation event emits.
+    seeded = _execution(mode_id="away", mode_at_ms=None)
+    bridge, _, mqtt, _, _ = await _started(tmp_path, execution=seeded)
+    assert bridge._mode_execution_healthy is False
+    assert _published(mqtt, mode_event_topic(_PANEL)) == []
+    mqtt.published.clear()
+
+    await bridge.poll_executions([_execution(mode_id="away", mode_at_ms=700)])
+    await _wait_for_publish(mqtt, mode_event_topic(_PANEL))
+
+    assert len(_published(mqtt, mode_event_topic(_PANEL))) == 1
+    assert bridge._mode_execution_healthy is True
     await bridge.async_shutdown()

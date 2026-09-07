@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from brilliant_wifi_watchdog import probe, run
-from brilliant_wifi_watchdog.ladder import Action, Thresholds
+from brilliant_wifi_watchdog.ladder import Action, Ladder, Thresholds
 from brilliant_wifi_watchdog.reboot_guard import GuardPolicy
 
 
@@ -16,6 +18,21 @@ class FakeGuard:
 
     def can_reboot(self, now: float) -> bool:
         return self.ok
+
+    def record(self, now: float) -> None:
+        self.recorded.append(now)
+
+
+class FlappingGuard:
+    """A guard whose reads flap; an independent second read could catch a different
+    answer than the first, as a transient flash hiccup (OSError → []) can too."""
+
+    def __init__(self, answers: list[bool]) -> None:
+        self.answers = list(answers)
+        self.recorded: list[float] = []
+
+    def can_reboot(self, now: float) -> bool:
+        return self.answers.pop(0) if self.answers else True
 
     def record(self, now: float) -> None:
         self.recorded.append(now)
@@ -40,10 +57,28 @@ class FakeRecovery:
 # ---------------------------------------------------------------------------
 
 
-def test_reboot_blocked_when_guard_denies() -> None:
-    g, rec = FakeGuard(False), FakeRecovery()
-    run.handle(Action.GPIO_RESET_REBOOT, guard=g, now=0.0, recovery_mod=rec)
+def test_reboot_blocked_when_guard_denies(caplog: pytest.LogCaptureFixture) -> None:
+    """handle() acts on the eligibility passed in (the ladder's own guard read this
+    poll), not a second independent read that could desync.  An ineligible reboot is
+    never silent — it logs the blocked path and does nothing (issue #91)."""
+    g, rec = FakeGuard(True), FakeRecovery()  # guard.can_reboot is not consulted here
+    with caplog.at_level(logging.ERROR, logger="brilliant_wifi_watchdog"):
+        run.handle(
+            Action.GPIO_RESET_REBOOT, guard=g, now=0.0, recovery_mod=rec, reboot_eligible=False
+        )
     assert rec.calls == [] and g.recorded == []  # no reboot, not recorded
+    assert any("blocked" in r.getMessage() for r in caplog.records)  # observable, not silent
+
+
+def test_escalate_notify_logs_once_without_side_effects(caplog: pytest.LogCaptureFixture) -> None:
+    """A deferred reboot notifies (one log line) and touches neither guard nor
+    recovery — the retry re-arms automatically once the guard clears (issue #91)."""
+    g, rec = FakeGuard(True), FakeRecovery()
+    with caplog.at_level(logging.ERROR, logger="brilliant_wifi_watchdog"):
+        run.handle(Action.ESCALATE_NOTIFY, guard=g, now=0.0, recovery_mod=rec)
+    assert rec.calls == [] and g.recorded == []  # no reboot, nothing recorded
+    notices = [r for r in caplog.records if "deferred" in r.getMessage()]
+    assert len(notices) == 1
 
 
 def test_reboot_runs_and_records_when_allowed() -> None:
@@ -61,7 +96,7 @@ def test_reboot_runs_and_records_when_allowed() -> None:
             order.append("reboot")
 
     g, rec = TrackingGuard(True), TrackingRecovery()
-    run.handle(Action.GPIO_RESET_REBOOT, guard=g, now=5.0, recovery_mod=rec)
+    run.handle(Action.GPIO_RESET_REBOOT, guard=g, now=5.0, recovery_mod=rec, reboot_eligible=True)
     assert rec.calls == ["reboot"] and g.recorded == [5.0]
     # Stamp written to disk before the reboot command fires so a crash/power cut
     # during reboot still counts against the cap (no infinite reboot loop).
@@ -83,6 +118,28 @@ def test_restart_services_dispatches() -> None:
     g, rec = FakeGuard(True), FakeRecovery()
     run.handle(Action.RESTART_SERVICES, guard=g, now=0.0, recovery_mod=rec)
     assert rec.calls == ["restart"]
+
+
+# ---------------------------------------------------------------------------
+# ladder + handle wiring — a single guard read shared per poll (issue #91)
+# ---------------------------------------------------------------------------
+
+
+def test_reboot_not_lost_when_guard_read_would_flap() -> None:
+    """One guard read per poll, shared by observe() and handle() (the exact wiring
+    main() uses).  A guard whose answer flaps — which a second, independent read in
+    handle() could catch mid-False after the ladder already committed "reboot" to
+    _fired — can no longer strand the reboot and drop it silently (issue #91)."""
+    g = FlappingGuard([True] * 13 + [False])  # a double read would disagree at t=360
+    rec, lad = FakeRecovery(), Ladder(Thresholds())
+    for i in range(60):
+        wall = 30.0 * i
+        eligible = g.can_reboot(wall)  # the ONLY read this poll
+        action = lad.observe(gateway_up=False, now=wall, reboot_eligible=eligible)
+        if action != Action.NONE:
+            run.handle(action, guard=g, now=wall, recovery_mod=rec, reboot_eligible=eligible)
+    assert rec.calls.count("reboot") == 1  # fired once, never lost
+    assert g.recorded == [360.0]  # and recorded against the cap
 
 
 # ---------------------------------------------------------------------------
@@ -142,9 +199,11 @@ class SpyLadder:
     def __init__(self, action: Action = Action.NONE) -> None:
         self._action = action
         self.observed: list[bool] = []
+        self.eligibility: list[bool] = []
 
-    def observe(self, *, gateway_up: bool, now: float) -> Action:
+    def observe(self, *, gateway_up: bool, now: float, reboot_eligible: bool) -> Action:
         self.observed.append(gateway_up)
+        self.eligibility.append(reboot_eligible)
         return self._action
 
 
@@ -162,6 +221,7 @@ def test_poll_once_reaches_ladder_when_broker_diagnostic_is_inconclusive(
     # The ladder was reached on every cycle (diagnostic never blocked it), and it
     # saw only the ping-derived health — a timed-out diagnostic drove no reboot.
     assert ladder.observed == [True, True]
+    assert ladder.eligibility == [True, True]  # the single shared guard read reached the ladder
     assert guard.recorded == []
 
 

@@ -43,3 +43,41 @@ def test_recovery_resets_ladder() -> None:
     assert lad.observe(gateway_up=True, now=210.0) == Action.NONE
     # fresh outage starts the ladder over (soft fires again later)
     assert _down(lad, 240.0, 120.0).count(Action.SOFT_RECONNECT) == 1
+
+
+def test_reboot_deferred_when_ineligible_then_rearms_when_eligible() -> None:
+    """When the guard blocks the reboot, the rung stays pending: it defers once
+    (ESCALATE_NOTIFY), stays silent while still blocked, and re-arms the instant
+    the guard clears — no connectivity recovery required (issue #91)."""
+    lad = Ladder(T)
+    out, t = [], 0.0
+    while t <= 400.0:  # climb to the reboot threshold with the guard ineligible
+        out.append(lad.observe(gateway_up=False, now=t, reboot_eligible=False))
+        t += 30.0
+    assert out.count(Action.ESCALATE_NOTIFY) == 1  # deferred once, not per-poll
+    assert Action.GPIO_RESET_REBOOT not in out  # never rebooted while blocked
+    # Still blocked → keeps deferring silently (no repeat notify).
+    assert lad.observe(gateway_up=False, now=430.0, reboot_eligible=False) == Action.NONE
+    # Guard clears → the pending reboot re-arms immediately...
+    assert (
+        lad.observe(gateway_up=False, now=460.0, reboot_eligible=True) == Action.GPIO_RESET_REBOOT
+    )
+    # ...and only once (now marked fired for this outage).
+    assert lad.observe(gateway_up=False, now=490.0, reboot_eligible=True) == Action.NONE
+
+
+def test_blocked_reboot_does_not_starve_cheaper_rungs() -> None:
+    """A blocked reboot must not short-circuit the cheaper rungs.  If a poll gap
+    (e.g. a starved daemon) crosses the reboot threshold before soft/restart have
+    fired, the ladder still climbs down to them on later polls instead of only ever
+    doing the most destructive action once the guard clears (issue #91)."""
+    lad = Ladder(Thresholds())
+    for t in (0.0, 30.0, 60.0):
+        assert lad.observe(gateway_up=False, now=t, reboot_eligible=False) == Action.NONE
+    # First poll after a long gap: reboot is due but blocked → notify once.
+    assert lad.observe(gateway_up=False, now=400.0, reboot_eligible=False) == Action.ESCALATE_NOTIFY
+    # Subsequent blocked polls fire the still-unfired restart/soft rungs, not silence.
+    got = [
+        lad.observe(gateway_up=False, now=t, reboot_eligible=False) for t in (430.0, 460.0, 490.0)
+    ]
+    assert Action.RESTART_SERVICES in got and Action.SOFT_RECONNECT in got
