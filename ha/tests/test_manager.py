@@ -42,6 +42,7 @@ from custom_components.brilliant_mqtt.const import (
     CONF_HA_MIRROR_LEADER_PRIORITY,
     CONF_HA_MIRROR_TOKEN,
     CONF_HA_MIRROR_WS_URL,
+    CONF_HOST,
     CONF_HOT_POLL_SECONDS,
     CONF_HUE_CA_CERT,
     CONF_MQTT_TLS_CA,
@@ -1255,6 +1256,140 @@ async def test_recovery_timeout_defers_while_broker_down(
 
     assert manager.problem is False  # no false "did not come back" escalation
     assert "needs_attention" not in _types(events)
+
+
+async def test_queued_auto_repairs_skip_only_recovered_panels(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """#95 criterion 4: several auto-repairs queued behind the ONE shared fleet SSH lock
+    each re-decide at their own acquisition time — panels that recovered while queued (at
+    staggered moments) skip with no obsolete SSH/config writes and no recovery timer, while
+    a still-offline panel repairs exactly once (no duplicate work)."""
+    lock = asyncio.Lock()
+    broker = SimpleNamespace(available=True)
+    installed = RunResult(
+        0, "unit=1\nenv=1\nenabled=1\nactive=1\nsunit=1\nsenv=1\npayload=1\n0.2.0\n", ""
+    )
+    hosts = {"office": "192.168.1.10", "kitchen": "192.168.1.11", "bedroom": "192.168.1.12"}
+    shells = {
+        host: FakeShell(responses={panel_ops.INSPECT_COMMAND: installed}) for host in hosts.values()
+    }
+    managers: dict[str, PanelManager] = {}
+    for slug, host in hosts.items():
+        entry = MockConfigEntry(
+            domain=DOMAIN, unique_id=slug, data={**ENTRY_DATA, CONF_PANEL: slug, CONF_HOST: host}
+        )
+        entry.add_to_hass(hass)
+        manager = _broker_gated_manager(hass, entry, broker, lock)
+        manager.availability = "offline"
+        managers[slug] = manager
+
+    with patch(
+        "custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell",
+        side_effect=lambda host, *args, **kwargs: shells[host],
+    ):
+        await lock.acquire()  # a fleet SSH op is in flight; every repair queues on this lock
+        tasks = [
+            asyncio.create_task(manager.async_repair(trigger="auto"))
+            for manager in managers.values()
+        ]
+        await asyncio.sleep(0)  # every queued repair reaches the shared-lock await
+
+        # A subset recovers while queued, at staggered moments (different times):
+        managers["kitchen"].availability = "online"
+        await asyncio.sleep(0)
+        managers["bedroom"].availability = "online"
+
+        lock.release()
+        await asyncio.gather(*tasks)
+        await hass.async_block_till_done()
+
+    # 'office' stayed offline: its queued repair ran exactly once — no duplicate work.
+    assert shells[hosts["office"]].commands.count("systemctl enable --now brilliant-mqtt") == 1
+    assert managers["office"]._recovery_cancel is not None  # recovery armed for the real repair
+    # 'kitchen' + 'bedroom' recovered while queued: skipped entirely, no obsolete SSH/config.
+    for slug in ("kitchen", "bedroom"):
+        assert not shells[hosts[slug]].commands
+        assert managers[slug]._recovery_cancel is None
+
+    for manager in managers.values():
+        await manager.async_shutdown()
+
+
+async def test_broker_reconnect_does_not_duplicate_a_pending_grace_timer(
+    hass: HomeAssistant,
+) -> None:
+    """#95 criterion 4: a stale timer must not create duplicate work. With a grace timer
+    already pending, async_broker_reconnected must not stack a second one — exercise (do
+    not patch) _arm_offline_grace's guard against re-arming an already-armed panel."""
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    broker = SimpleNamespace(available=True)
+    manager = _broker_gated_manager(hass, entry, broker)
+    manager.availability = "offline"
+
+    manager._arm_offline_grace()  # a real grace timer is armed and pending
+    pending = manager._grace_cancel
+    assert pending is not None
+
+    manager.async_broker_reconnected()  # broker reconnect while a grace timer is pending
+
+    assert manager._grace_cancel is pending  # SAME handle: no second timer stacked
+    await manager.async_shutdown()
+
+
+async def test_broker_reconnect_does_not_arm_grace_while_recovery_pending(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """#95 criterion 4: with a recovery timer already pending, async_broker_reconnected must
+    not also arm a grace timer — _arm_offline_grace's guard covers the recovery-pending case,
+    so a reconnect during the post-repair window creates no duplicate/competing timer."""
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    broker = SimpleNamespace(available=True)
+    manager = _broker_gated_manager(hass, entry, broker)
+    manager.availability = "offline"
+    shell = FakeShell()
+    await _repair_and_arm_recovery(manager, shell)  # arms a real recovery timer
+    assert manager._recovery_cancel is not None
+    assert manager._grace_cancel is None
+
+    manager.async_broker_reconnected()  # broker reconnect while the recovery timer is pending
+
+    assert manager._grace_cancel is None  # guard held: no grace timer stacked onto recovery
+    await manager.async_shutdown()
+
+
+async def test_armed_grace_timer_firing_during_broker_outage_defers_escalation(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """#95 criterion 4: a REAL armed grace timer that FIRES while the broker is down must
+    not raise a false per-panel repair issue. Timer-driven counterpart to the direct-call
+    tests: arm the grace timer, drop the broker, let the timer fire (auto-repair OFF so the
+    only possible outcome is the offline escalation, which the broker gate must suppress)."""
+    entry = MockConfigEntry(
+        domain=DOMAIN, unique_id="office", data=ENTRY_DATA, options={OPT_AUTO_REPAIR: False}
+    )
+    entry.add_to_hass(hass)
+    broker = SimpleNamespace(available=True)
+    manager = _broker_gated_manager(hass, entry, broker)
+    manager.availability = "offline"
+    events = _capture_events(hass)
+
+    manager._arm_offline_grace()  # arm a real grace timer while the broker is up
+    assert manager._grace_cancel is not None
+
+    broker.available = False  # broker drops before the grace window elapses
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(minutes=11))
+    await hass.async_block_till_done()
+
+    assert manager.problem is False  # stale timer fired during outage → no false escalation
+    assert "needs_attention" not in _types(events)
+    assert manager._grace_cancel is None  # the fired timer cleared itself; nothing re-armed
+    await manager.async_shutdown()
 
 
 @pytest.mark.allow_lingering_timers
