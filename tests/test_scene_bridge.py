@@ -2079,3 +2079,85 @@ async def test_restart_is_fail_closed_until_abandoned_unsubscribe_finishes(
     await bridge.async_start()
     assert mqtt.subscriptions == [scene_command_topic(_PANEL), mode_command_topic(_PANEL)]
     await bridge.async_shutdown()
+
+
+async def test_poll_confirms_repeated_same_mode_activation_with_new_timestamp(
+    tmp_path: Path,
+) -> None:
+    # Issue #93: the same mode re-activates with a new bus timestamp, but its
+    # real-time push is missed and it surfaces only through the hot poll. The
+    # value-only fingerprint is unchanged, so the manual_mode_id timestamp must
+    # gate the poll or the activation (and its pending command) is dropped.
+    clock = FakeClockMs(_NOW_MS)
+    seeded = _execution(mode_id="away", mode_at_ms=_NOW_MS - 1_000)
+    bridge, bus, mqtt, clock, _ = await _started(tmp_path, execution=seeded, clock=clock)
+    mqtt.published.clear()
+
+    command_id = "33333333-3333-4333-8333-333333333333"
+    await mqtt.inject(mode_command_topic(_PANEL), _command(command_id, "mode", "away"))
+    await _wait_for_bus_commands(bus, 1)
+
+    # Missed push: the re-activation reaches the bridge only via poll_executions.
+    await bridge.poll_executions([_execution(mode_id="away", mode_at_ms=_NOW_MS + 1)])
+    await _wait_for_publish(mqtt, mode_result_topic(command_id))
+
+    assert len(_published(mqtt, mode_event_topic(_PANEL))) == 1
+    result = _payload(_published(mqtt, mode_result_topic(command_id))[-1])
+    assert result["accepted"] is True
+    assert "error" not in result
+
+    # The confirmation cancels the pending timeout: advancing past the TTL emits
+    # no further (timeout) result.
+    await clock.advance_ms(15_000)
+    assert len(_published(mqtt, mode_result_topic(command_id))) == 1
+    await bridge.async_shutdown()
+
+
+async def test_poll_gate_suppresses_identical_mode_value_and_timestamp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A poll delivering the SAME mode value AND the SAME bus timestamp is a pure
+    # re-read and must remain gated (no reprocessing, no duplicate event).
+    seeded = _execution(mode_id="away", mode_at_ms=500)
+    bridge, _, _, _, _ = await _started(tmp_path, execution=seeded)
+    process = bridge._async_process_execution
+    processed: list[BrilliantDevice] = []
+
+    async def observed_process(
+        device: BrilliantDevice,
+        *,
+        emit_events: bool,
+        epoch: int,
+    ) -> None:
+        processed.append(device)
+        await process(device, emit_events=emit_events, epoch=epoch)
+
+    monkeypatch.setattr(bridge, "_async_process_execution", observed_process)
+
+    await bridge.poll_executions([_execution(mode_id="away", mode_at_ms=500)])
+
+    assert processed == []
+    await bridge.async_shutdown()
+
+
+async def test_poll_recovers_mode_health_when_invalid_timestamp_becomes_valid(
+    tmp_path: Path,
+) -> None:
+    # Malformed-to-valid recovery: the seed carries an invalid (None) mode
+    # timestamp, so decode_mode_execution raises and mode health is False. A
+    # later poll delivers the SAME mode value with a now-valid timestamp; the
+    # folded-in timestamp makes the fingerprint change, so the poll reprocesses,
+    # health recovers, and the activation event emits.
+    seeded = _execution(mode_id="away", mode_at_ms=None)
+    bridge, _, mqtt, _, _ = await _started(tmp_path, execution=seeded)
+    assert bridge._mode_execution_healthy is False
+    assert _published(mqtt, mode_event_topic(_PANEL)) == []
+    mqtt.published.clear()
+
+    await bridge.poll_executions([_execution(mode_id="away", mode_at_ms=700)])
+    await _wait_for_publish(mqtt, mode_event_topic(_PANEL))
+
+    assert len(_published(mqtt, mode_event_topic(_PANEL))) == 1
+    assert bridge._mode_execution_healthy is True
+    await bridge.async_shutdown()

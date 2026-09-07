@@ -102,9 +102,27 @@ def _is_new(previous: Watermark | None, current: SceneExecution) -> bool:
     )
 
 
+_MANUAL_MODE_ID_VARIABLE = "manual_mode_id"
+# Synthetic fingerprint key folding in the manual_mode_id variable's bus
+# timestamp_ms. decode_mode_execution() treats that timestamp (not the value) as
+# the identity of a mode activation (ModeExecution.executed_at_ms), so a same-mode
+# re-activation that surfaces only through the hot poll (its push was missed)
+# leaves the value-only fingerprint unchanged and would be dropped by the poll
+# gate. We fold in ONLY this one variable's timestamp; scene execution blobs
+# already encode their own execution time inside the decoded value, so a blanket
+# per-variable timestamp would defeat that suppression. The "@"-prefixed key sits
+# outside the bus variable namespace (":"-delimited or plain snake_case), so it
+# cannot collide with any real variable name.
+_MODE_TIMESTAMP_FINGERPRINT_KEY = "@manual_mode_id.timestamp_ms"
+
+
 def _execution_fingerprint(device: BrilliantDevice) -> dict[str, str]:
     snapshot = dict(device.variables)
-    return {name: variable.value for name, variable in snapshot.items()}
+    fingerprint = {name: variable.value for name, variable in snapshot.items()}
+    mode_variable = snapshot.get(_MANUAL_MODE_ID_VARIABLE)
+    if mode_variable is not None:
+        fingerprint[_MODE_TIMESTAMP_FINGERPRINT_KEY] = str(mode_variable.timestamp_ms)
+    return fingerprint
 
 
 class SceneBridge:
