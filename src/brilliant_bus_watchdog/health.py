@@ -11,19 +11,22 @@ def _writer_alive(pid: int) -> bool:
 
     Signal 0 performs the existence/permission check without delivering a
     signal: ``ProcessLookupError`` means the writer is gone, ``PermissionError``
-    means it is alive but owned by another user (treat as alive). A non-positive
-    pid would target a process group rather than an individual writer, so it is
-    rejected. Any other error fails closed (unconfirmed) — including
-    ``OverflowError`` (an ``ArithmeticError``, not an ``OSError``), which
-    ``os.kill`` raises for a pid beyond the C ``pid_t``/``long`` range, e.g. a
-    torn/corrupt phase file like ``bus 2147483648``.
+    means it is alive but owned by another user (treat as alive). A pid <= 1 is
+    rejected: 0 and negative pids would target a process group rather than an
+    individual writer, and pid 1 (init) always exists yet never names our
+    writer, so a torn/truncated marker like ``bus 1`` must not read as a live
+    writer (which would suppress reboots forever, fail-open). Any other error
+    fails closed (unconfirmed) — including ``OverflowError`` (an
+    ``ArithmeticError``, not an ``OSError``), which ``os.kill`` raises for a pid
+    beyond the C ``pid_t``/``long`` range, e.g. a torn/corrupt phase file like
+    ``bus 2147483648``.
 
     Best-effort by nature: PID reuse means a stale marker whose pid was recycled
     by an unrelated process would read as alive. The real guard against a stale
     marker is the ``pre_bus`` re-stamp at session entry (see
     :func:`brilliant_mqtt.heartbeat.write_phase`), not this check alone.
     """
-    if pid <= 0:
+    if pid <= 1:
         return False
     try:
         os.kill(pid, 0)
