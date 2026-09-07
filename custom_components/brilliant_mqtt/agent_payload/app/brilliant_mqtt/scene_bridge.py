@@ -117,12 +117,19 @@ class SceneBridge:
         panel: str,
         watermark_path: str | Path,
         clock_ms: Callable[[], int],
+        want_device: Callable[[str], bool] | None = None,
     ) -> None:
         self._bus = bus
         self._mqtt = mqtt
         self._panel = panel
         self._watermark_path = Path(watermark_path)
         self._clock_ms = clock_ms
+        # Bus scope pre-filter keyed by device id (issue #98): the execution
+        # peripheral lives on the panel's own device, so a push for a device
+        # this predicate rejects (e.g. the mesh device) is dropped by the bus
+        # before normalization rather than normalized here and discarded by the
+        # peripheral-id filter. None = wants every device (the default).
+        self._want_device = want_device
         injected_sleep = getattr(clock_ms, "sleep", None)
         self._sleep = cast(
             Callable[[float], Awaitable[None]],
@@ -184,6 +191,7 @@ class SceneBridge:
                     self._bus.on_change(
                         self._bus_change_callback,
                         coalesce_pushes=False,
+                        want_device=self._want_device,
                     )
                     self._bus.on_reconnect(self._reconnect_callback)
                     self._mqtt.on_message(self._mqtt_message_callback)

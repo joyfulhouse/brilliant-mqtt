@@ -302,8 +302,13 @@ class RpcBusAdapter:
         # session's bookkeeping (#88).
         self._session = 0
         # Multiple consumers (panel bridge + mesh publisher) may each register
-        # a change callback; every change fans out to all of them.
-        self._change_cbs: list[tuple[Callable[[BrilliantDevice], Awaitable[None]], bool]] = []
+        # a change callback; every change fans out to all of them. Each entry is
+        # (callback, coalesce_pushes, want_device); want_device is a live
+        # device-id scope predicate (None = wants everything) consulted BEFORE
+        # any normalization so an unwanted push costs nothing (issue #98).
+        self._change_cbs: list[
+            tuple[Callable[[BrilliantDevice], Awaitable[None]], bool, Callable[[str], bool] | None]
+        ] = []
         self._reconnect_cbs: list[Callable[[], Awaitable[None]]] = []
         # Re-issues this session's subscription; bound as a closure in start()
         # so the reconnect path never needs panel imports of its own.
@@ -493,9 +498,12 @@ class RpcBusAdapter:
         return self._obs, self._own_device_id
 
     def _dispatch_raw_device(self, raw_device: Any, session: int | None = None) -> None:
-        """Normalize a full changed device and dispatch by callback policy.
+        """Normalize a wanted changed device and dispatch by callback policy.
 
-        Every peripheral is normalized on every push because the bus delta
+        A live per-callback scope predicate (``want_device``) is evaluated on
+        the raw device id FIRST: if no registered callback wants this device the
+        push is dropped before any peripheral is normalized (issue #98). Every
+        peripheral of a wanted device is then normalized because the bus delta
         metadata is not trusted. A coalescing callback replaces its pending
         snapshot for this raw device with the newest one; a lossless callback
         drains every full snapshot in arrival order after any in-flight call.
@@ -523,6 +531,20 @@ class RpcBusAdapter:
         device_id = str(raw_id) if raw_id else self._own_device_id
         if device_id is None:
             return
+        # Scope pre-filter (issue #98): decide which callbacks want THIS device
+        # by its id BEFORE touching its peripherals. A device no registered
+        # consumer currently wants — a mesh push while this panel is a mesh
+        # standby, or the mesh device seen by the panel bridge — is dropped here
+        # having done zero normalization and zero Variable allocation. Each
+        # want_device predicate is opaque (str -> bool): the adapter never
+        # learns about panels, "ble_mesh", or leadership.
+        admitted = [
+            (cb, coalesce_pushes)
+            for cb, coalesce_pushes, want_device in cbs
+            if want_device is None or want_device(device_id)
+        ]
+        if not admitted:
+            return
         # Same defensive access as get_all(): a peripheral-less housekeeping
         # notification is routine, not worth a logger.exception from the
         # handler's broad catch.
@@ -533,7 +555,7 @@ class RpcBusAdapter:
             normalize_peripheral(device_id, peripheral_id, raw_peripheral)
             for peripheral_id, raw_peripheral in dict(peripherals).items()
         ]
-        for cb, coalesce_pushes in cbs:
+        for cb, coalesce_pushes in admitted:
             key = (device_id if coalesce_pushes else None, cb)
             pending = self._pending_pushes.setdefault(key, deque())
             if coalesce_pushes:
@@ -728,13 +750,20 @@ class RpcBusAdapter:
         cb: Callable[[BrilliantDevice], Awaitable[None]],
         *,
         coalesce_pushes: bool = True,
+        want_device: Callable[[str], bool] | None = None,
     ) -> None:
         """Register a change callback fired by :meth:`_dispatch_raw_device`.
 
         May be called more than once: the panel bridge and the mesh publisher
         each consume the same bus stream, so changes fan out to ALL callbacks.
+
+        *want_device* is a live device-id scope predicate (``None`` = wants
+        every device). :meth:`_dispatch_raw_device` evaluates it BEFORE
+        normalizing a push, so a device no registered callback wants is dropped
+        with zero normalization/allocation (issue #98). The adapter stays
+        Bridge/mesh-agnostic — it only ever calls an opaque ``str -> bool``.
         """
-        self._change_cbs.append((cb, coalesce_pushes))
+        self._change_cbs.append((cb, coalesce_pushes, want_device))
 
     def consume_write_timeout(self) -> bool:
         """Return and clear the outbound-write timeout latch."""

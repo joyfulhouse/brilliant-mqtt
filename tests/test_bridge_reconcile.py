@@ -413,7 +413,7 @@ async def test_enforce_skips_out_of_scope_devices(tmp_path: Path) -> None:
     ds.record("pidA", "enable_motion_score", "1")
     in_scope = False
     bridge = Bridge(
-        bus, FakeMqtt(), "mesh", include=lambda d: in_scope, desired=ds, clock=FakeClock()
+        bus, FakeMqtt(), "mesh", include=lambda _did: in_scope, desired=ds, clock=FakeClock()
     )
 
     await bridge._enforce_desired([dev])

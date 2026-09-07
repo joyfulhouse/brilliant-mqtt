@@ -79,10 +79,10 @@ def _panel_dimmer() -> BrilliantDevice:
 
 class TestPanelScopePredicate:
     def test_panel_device_in_scope(self) -> None:
-        assert _is_panel_device(_panel_dimmer()) is True
+        assert _is_panel_device(_panel_dimmer().device_id) is True
 
     def test_mesh_device_out_of_scope(self) -> None:
-        assert _is_panel_device(_mesh_dimmer()) is False
+        assert _is_panel_device(_mesh_dimmer().device_id) is False
 
 
 class TestReconnectStormBreaker:
@@ -178,9 +178,9 @@ class TestLeadershipGate:
         mqtt = FakeMqtt()
         clock = FakeClock()
 
-        def _mesh_in_scope(d: BrilliantDevice) -> bool:
+        def _mesh_in_scope(device_id: str) -> bool:
             # Mirrors the late-binding closure in __main__._run_session.
-            return d.device_id == "ble_mesh" and leader.is_leader
+            return device_id == "ble_mesh" and leader.is_leader
 
         mesh_bridge = Bridge(bus, mqtt, "mesh", include=_mesh_in_scope)
         leader = MeshLeader(
@@ -457,8 +457,9 @@ class _SessionBus:
         callback: Callable[[BrilliantDevice], Awaitable[None]],
         *,
         coalesce_pushes: bool = True,
+        want_device: Callable[[str], bool] | None = None,
     ) -> None:
-        del callback, coalesce_pushes
+        del callback, coalesce_pushes, want_device
 
     async def start(self) -> None:
         self.events.append("bus_start")
@@ -654,6 +655,7 @@ class _SessionHarness:
                 panel: str,
                 watermark_path: str | Path,
                 clock_ms: Callable[[], int],
+                want_device: Callable[[str], bool] | None = None,
             ) -> None:
                 harness.events.append("scene_bridge_construct")
                 harness.scene_instances.append(self)
@@ -662,6 +664,9 @@ class _SessionHarness:
                 harness.scene_panel = panel
                 harness.scene_watermark_path = watermark_path
                 harness.scene_clock_ms = clock_ms
+                # want_device is accepted (wiring parity with the real bridge)
+                # but not asserted on here — swallow it like the other stubs.
+                del want_device
 
             async def async_start(self) -> None:
                 harness.events.append("scene_bridge_start")

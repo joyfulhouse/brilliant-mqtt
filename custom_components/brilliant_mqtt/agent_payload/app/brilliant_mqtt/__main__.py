@@ -22,7 +22,6 @@ from brilliant_mqtt.desired_state import DesiredState
 from brilliant_mqtt.discovery import meta_topic
 from brilliant_mqtt.heartbeat import write_heartbeat, write_phase
 from brilliant_mqtt.mesh_leader import MeshLeader
-from brilliant_mqtt.model import BrilliantDevice
 from brilliant_mqtt.motion_derive import MotionDeriver
 from brilliant_mqtt.mqttio import AioMqttAdapter
 from brilliant_mqtt.protocols import BusClient, CommandSubscribeError
@@ -138,14 +137,17 @@ def _make_desired(settings: Settings, name: str) -> DesiredState | None:
     return ds
 
 
-def _is_panel_device(device: BrilliantDevice) -> bool:
-    """Panel-bridge scope: everything EXCEPT the virtual mesh device.
+def _is_panel_device(device_id: str) -> bool:
+    """Panel-bridge scope: every bus device EXCEPT the virtual mesh device.
 
-    The mesh device belongs to the elected fleet-wide leader under the "mesh"
-    pseudo-panel; letting it leak into the panel namespace would duplicate
-    every mesh entity on every participating panel.
+    Keyed by device id so ONE predicate serves as both the bridge's include
+    check and the bus ``want_device`` pre-filter (issue #98). The mesh device
+    belongs to the elected fleet-wide leader under the "mesh" pseudo-panel;
+    letting it leak into the panel namespace would duplicate every mesh entity
+    on every participating panel. The scene bridge shares this same panel scope
+    (its execution peripheral lives on the panel's own device, never on mesh).
     """
-    return device.device_id != _MESH_DEVICE_ID
+    return device_id != _MESH_DEVICE_ID
 
 
 async def _run_session(
@@ -214,13 +216,16 @@ async def _run_session(
 
         if participating:
 
-            def _mesh_in_scope(device: BrilliantDevice) -> bool:
+            def _mesh_in_scope(device_id: str) -> bool:
                 # Leadership gates pushes AND polls: a non-leader (or fresh
                 # ex-leader, whose _on_change stays registered after
                 # withdraw()) must publish nothing on the mesh namespace.
                 # `leader` is late-bound on purpose — callbacks first fire
-                # after bus.start(), by which time it is assigned below.
-                return device.device_id == _MESH_DEVICE_ID and leader.is_leader
+                # after bus.start(), by which time it is assigned below. The bus
+                # consults this SAME live closure as want_device (issue #98), so
+                # the first push after leader.tick() flips is_leader is admitted
+                # and normalized — no stale cached leadership snapshot.
+                return device_id == _MESH_DEVICE_ID and leader.is_leader
 
             mesh_bridge = Bridge(
                 bus,
@@ -252,6 +257,12 @@ async def _run_session(
                 settings.panel,
                 Path(settings.scene_watermark_file),
                 _clock_ms,
+                # Same panel scope as the panel bridge (issue #98): the scene
+                # execution peripheral lives on the panel's own device, never on
+                # the mesh device, so a mesh push is skipped before normalization
+                # instead of normalized and then dropped by the peripheral-id
+                # filter. Admits the own device (never under-admits an execution).
+                want_device=_is_panel_device,
             )
             if settings.scene_bridge_enabled
             else None
