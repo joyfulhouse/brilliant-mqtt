@@ -67,6 +67,7 @@ def handle(
     *,
     guard: _GuardLike,
     now: float,
+    reboot_eligible: bool = False,
     recovery_mod: Any = recovery,
 ) -> None:
     if action == Action.SOFT_RECONNECT:
@@ -75,8 +76,20 @@ def handle(
     elif action == Action.RESTART_SERVICES:
         _LOG.warning("gateway down ~180s: restarting connman + wpa_supplicant")
         recovery_mod.restart_services()
+    elif action == Action.ESCALATE_NOTIFY:
+        # Reboot wanted but the ladder saw the guard block it (cooldown/cap).  It
+        # stays pending and re-arms automatically once the guard clears; log once.
+        _LOG.error(
+            "gateway down ~360s: reboot deferred by guard (cooldown/cap) "
+            "— will retry automatically once eligible"
+        )
     elif action == Action.GPIO_RESET_REBOOT:
-        if guard.can_reboot(now):
+        # Act on the SAME eligibility the ladder used this poll (passed in) — a
+        # second, independent guard read here could disagree and, since the ladder
+        # commits "reboot" only on an actual fire, silently strand it.  Defense in
+        # depth: never reboot unless that shared read said eligible; if not, the
+        # ladder has already deferred, so just log the blocked path (never silent).
+        if reboot_eligible:
             _LOG.error("gateway down ~360s: GPIO/SDIO reset + reboot")
             guard.record(now)
             recovery_mod.gpio_reset_and_reboot()
@@ -102,9 +115,16 @@ def main() -> None:  # pragma: no cover - thin loop
         if cfg.broker_host:
             broker_up = probe.tcp_open(cfg.broker_host, cfg.broker_port)
             _LOG.info("gateway=%s up=%s broker_up=%s", gw, gateway_up, broker_up)
-        action = ladder.observe(gateway_up=gateway_up, now=time.monotonic())
+        # One guard read per poll, shared by the ladder and handle() so they can
+        # never act on disagreeing eligibility (rung-elapsed math stays monotonic;
+        # only the guard-facing timestamp is wall-clock).
+        wall = time.time()
+        eligible = guard.can_reboot(wall)
+        action = ladder.observe(
+            gateway_up=gateway_up, now=time.monotonic(), reboot_eligible=eligible
+        )
         if action != Action.NONE:
-            handle(action, guard=guard, now=time.time())
+            handle(action, guard=guard, now=wall, reboot_eligible=eligible)
         time.sleep(cfg.interval)
 
 
