@@ -812,12 +812,10 @@ class SceneBridge:
         return True
 
     def _apply_mode_execution(self, execution: ModeExecution, *, emit_event: bool) -> bool:
-        # #94/#119: live verification established that Variable.timestamp is
-        # server-assigned panel epoch-ms, in the same clock domain as _clock_ms().
-        # A value change re-stamps it, while a redundant same-mode write does not.
-        # Therefore mode confirmation uses the scene path's request-relative gate
-        # (option (a)); same-mode requests are handled by state equality at request
-        # time because no newer execution stamp can arrive for them.
+        # 2026-09-07 on-panel verification: Variable.timestamp is the panel clock
+        # in epoch milliseconds at write time and is writer-independent. A value
+        # change re-stamps it; a redundant same-mode write does not. Changed modes
+        # therefore use the scene path's request-relative confirmation gate.
         current = (execution.executed_at_ms, execution.mode_id)
         previous = self._mode_watermarks.get(self._panel)
         if previous is not None and current <= previous:
@@ -960,28 +958,6 @@ class SceneBridge:
                             needs_delivery = True
                         else:
                             needs_health = True
-                    elif (
-                        kind == "mode"
-                        and self._execution is not None
-                        and (manual_mode := self._execution.variables.get("manual_mode_id"))
-                        is not None
-                        and manual_mode.value == value
-                    ):
-                        if self._store_result(
-                            kind,
-                            command.command_id,
-                            value,
-                            fingerprint,
-                            command.panel,
-                            command.issued_at_ms,
-                            accepted=True,
-                            error=None,
-                            event_key=None,
-                        ):
-                            snapshot = self._capture_state()
-                            needs_delivery = True
-                        else:
-                            needs_health = True
                     elif self._execution is None:
                         if self._store_result(
                             kind,
@@ -1088,16 +1064,24 @@ class SceneBridge:
         value: str,
     ) -> None:
         try:
-            await self._bus.set_variables(
+            receipt = await self._bus.set_variables(
                 device_id,
                 _EXECUTION_PERIPHERAL_ID,
                 [VarSet(name=variable, value=value)],
             )
+            if kind == "mode" and "modified_variables=()" in receipt:
+                await self._async_settle_pending(
+                    kind,
+                    command_id,
+                    value,
+                    error=None,
+                    expected_write=asyncio.current_task(),
+                )
         except asyncio.CancelledError:
             raise
         except Exception as error:
             logger.warning("scene bridge write failed (%s)", type(error).__name__)
-            await self._async_fail_pending(
+            await self._async_settle_pending(
                 kind,
                 command_id,
                 value,
@@ -1108,17 +1092,17 @@ class SceneBridge:
     async def _async_timeout(self, kind: str, command_id: str, delay_seconds: float) -> None:
         try:
             await self._sleep(delay_seconds)
-            await self._async_fail_pending(kind, command_id, None, error="timeout")
+            await self._async_settle_pending(kind, command_id, None, error="timeout")
         except asyncio.CancelledError:
             raise
 
-    async def _async_fail_pending(
+    async def _async_settle_pending(
         self,
         kind: str,
         command_id: str,
         value: str | None,
         *,
-        error: str,
+        error: str | None,
         expected_write: asyncio.Task[None] | None = None,
     ) -> None:
         epoch = self._epoch
@@ -1140,7 +1124,7 @@ class SceneBridge:
             self._pending_records.pop(state_key, None)
             if error == "timeout" and pending.write_task is not None:
                 pending.write_task.cancel()
-            if error == "write_failed" and pending.timeout_task is not None:
+            if error != "timeout" and pending.timeout_task is not None:
                 pending.timeout_task.cancel()
             stored = self._store_result(
                 kind,
@@ -1149,7 +1133,7 @@ class SceneBridge:
                 pending.fingerprint,
                 pending.panel,
                 pending.issued_at_ms,
-                accepted=False,
+                accepted=error is None,
                 error=error,
                 event_key=None,
             )
