@@ -73,9 +73,9 @@ class Ladder:
             # actually fires; while blocked it stays pending so a later eligible
             # poll re-arms it — no connectivity recovery required (issue #91).
             if reboot_eligible:
-                self._fired.add("reboot")
+                self._fired.add(name)
                 self._reboot_deferred = False
-                return Action.GPIO_RESET_REBOOT
+                return action
             if not self._reboot_deferred:
                 # First blocked poll of this outage: notify once, then stay quiet.
                 self._reboot_deferred = True
