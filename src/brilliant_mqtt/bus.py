@@ -175,13 +175,15 @@ def _coerce_name(raw_name: Any) -> str | bytes | None:
     """Capture a raw peripheral name as an immutable value (issue #98).
 
     ``str``/``bytes``/``None`` are already immutable and pass through unchanged,
-    so :func:`_resolve_name` sees the identical value. A ``bytearray`` is
-    MUTABLE (a name with no ``display_name`` var comes from the notification-fed
-    mirror, poc-findings §8b) and must not be retained: capture its exact
-    ``str()`` when truthy — which is precisely what ``_resolve_name`` would
-    render — and ``None`` when empty, so its truthiness (empty → the
-    peripheral-id fallback) is preserved too. Any other (possibly mutable) type
-    is captured the same way, matching ``_resolve_name``'s ``str()`` exactly.
+    so :func:`_resolve_name` sees the identical value. Any other type — a
+    ``bytearray`` name (no ``display_name`` var) comes from the notification-fed
+    mutable mirror (poc-findings §8b) and must not be retained by reference — is
+    captured as ``str(value)`` when truthy, else ``None``. Real Thrift string/
+    binary names are always str/bytes, so this matches today's delivered name;
+    the only difference is the pathological case of a truthy object whose
+    ``str()`` is empty, where the captured ``""`` resolves via the peripheral-id
+    fallback at delivery rather than as an empty name (harmless, and unreachable
+    from real bus values).
     """
     if raw_name is None or isinstance(raw_name, (str, bytes)):
         return raw_name
