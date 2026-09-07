@@ -203,11 +203,22 @@ missing file is not an error) — there is no separate env file.
 | `HUE_CA_SITE_PACKAGES` | no | the panel's Python 3.10 `site-packages` root | Glob-fallback root searched for `hue-bridge-ca-certs.pem` when `HUE_CA_BUNDLE_PATH` doesn't exist (e.g. after a firmware version bump moves the path). |
 | `HUE_CA_VASSAL_INI` | no | `/var/run/brilliant/processes/hue_bridge_peripherals.ini` | The Hue coordinator's uWSGI vassal control file. Its presence means this panel currently hosts Hue; touching it (`os.utime`) triggers the emperor to reload that vassal — the "restart" this hook performs after appending. |
 | `HUE_CA_LOG` | no | `/var/log/brilliant-hue-ca.log` | Rotating log file (256 KB × 2 backups) for each oneshot run. |
+| `HUE_CA_STATE_PATH` | no | `/var/brilliant-hue-ca/pending-reload.json` | Where the durable "coordinator reload still owed" marker is written, keyed to the appended CA's bundle path + fingerprint. Lets a later run retry a reload that a crash or a transient restart error left unconfirmed. Under `/var` so it survives an OTA like the unit itself. |
+| `HUE_CA_MIN_RETRY_INTERVAL_S` | no | `300` | Minimum seconds between coordinator-reload retries when one is outstanding. Well under the ~15-minute timer cadence so a genuine failure still retries promptly, but immune to back-to-back restart storms. |
 
 Each run is idempotent: the hook compares certificates by SHA-256 fingerprint
 of the DER encoding, so it only appends (and only restarts the coordinator)
 when your CA is actually missing from the bundle — a no-op run on every other
 timer tick.
+
+If the coordinator restart fails (e.g. a transient error touching the vassal
+file) or the oneshot is killed between appending the CA and confirming the
+reload, the owed reload is recorded to `HUE_CA_STATE_PATH` *before* the restart
+is attempted and cleared only once a restart succeeds. A later timer run sees
+the marker still set — even though the CA is already present in the bundle — and
+retries the reload (paced by `HUE_CA_MIN_RETRY_INTERVAL_S`), so a running
+coordinator can't be left serving stale TLS trust while every check reports
+healthy.
 
 ### Bus-health watchdog
 
