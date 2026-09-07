@@ -2183,6 +2183,38 @@ async def test_pre_baseline_record_never_confirms_and_pending_times_out(
     await bridge.async_shutdown()
 
 
+async def test_stale_record_does_not_consume_pending_then_genuine_confirms(
+    tmp_path: Path,
+) -> None:
+    # Regression guard: a pre-baseline (stale) record must NOT consume the pending
+    # -- a later at/after-baseline execution must still confirm the SAME command.
+    bridge, bus, mqtt, clock, _ = await _started(
+        tmp_path, execution=_execution("all_off", _NOW_MS - 3_000)
+    )
+    command_id = "22222222-2222-4222-8222-222222222222"
+    await mqtt.inject(scene_command_topic(_PANEL), _command(command_id, "scene", "all_off"))
+    await _wait_for_bus_commands(bus, 1)
+
+    # Stale: newer than the watermark (T-3000), older than the baseline (T). It
+    # publishes its event but must neither confirm nor consume the pending.
+    await bus.emit(_execution("all_off", _NOW_MS - 1_500))
+    await _wait_for_publish(mqtt, scene_event_topic(_PANEL))
+    assert _published(mqtt, scene_result_topic(command_id)) == []
+
+    # Genuine: at/after the baseline -> confirms the still-open pending.
+    await bus.emit(_execution("all_off", _NOW_MS + 100))
+    await _wait_for_publish(mqtt, scene_result_topic(command_id))
+    assert _payload(_published(mqtt, scene_result_topic(command_id))[-1])["accepted"] is True
+
+    # The genuine execution consumed the pending, so advancing past the TTL yields
+    # no timeout: the sole result stays the accepted confirmation.
+    await clock.advance_ms(COMMAND_TTL_MS + 1_000)
+    await asyncio.sleep(0)
+    results = _published(mqtt, scene_result_topic(command_id))
+    assert [_payload(item)["accepted"] for item in results] == [True]
+    await bridge.async_shutdown()
+
+
 async def test_execution_equal_to_baseline_confirms_scene_command(tmp_path: Path) -> None:
     """Tie semantics: executed_at_ms == confirm_after_ms confirms (>=)."""
     bridge, bus, mqtt, _, _ = await _started(tmp_path)
