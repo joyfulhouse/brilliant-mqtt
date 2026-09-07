@@ -36,11 +36,13 @@ class Ladder:
         self._fails = 0
         self._down_since: float | None = None
         self._fired: set[str] = set()
+        self._reboot_deferred = False
 
     def reset(self) -> None:
         self._fails = 0
         self._down_since = None
         self._fired.clear()
+        self._reboot_deferred = False
 
     def _threshold(self, name: str) -> float:
         return {
@@ -49,7 +51,7 @@ class Ladder:
             "reboot": self._t.reboot_after,
         }[name]
 
-    def observe(self, *, gateway_up: bool, now: float) -> Action:
+    def observe(self, *, gateway_up: bool, now: float, reboot_eligible: bool = True) -> Action:
         if gateway_up:
             self.reset()
             return Action.NONE
@@ -61,7 +63,18 @@ class Ladder:
         elapsed = now - self._down_since
         # Fire the highest-threshold rung whose time has passed and which hasn't fired.
         for name, action in reversed(_RUNGS):
-            if elapsed >= self._threshold(name) and name not in self._fired:
-                self._fired.add(name)
-                return action
+            if elapsed < self._threshold(name) or name in self._fired:
+                continue
+            if name == "reboot" and not reboot_eligible:
+                # Reboot is due but the guard blocks it.  Never mark it fired, so a
+                # later eligible poll re-arms it (issue #91); notify once, then keep
+                # walking to the cheaper rungs so a poll gap can't starve soft/restart.
+                if not self._reboot_deferred:
+                    self._reboot_deferred = True
+                    return Action.ESCALATE_NOTIFY
+                continue
+            self._fired.add(name)
+            if name == "reboot":
+                self._reboot_deferred = False
+            return action
         return Action.NONE
