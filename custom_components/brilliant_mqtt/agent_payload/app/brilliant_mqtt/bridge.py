@@ -258,17 +258,24 @@ class Bridge:
         operationally by clearing the retained config topic (see
         docs/reference/deployment.md).
         """
+        # Read the bus and stamp the liveness heartbeat BEFORE any broker-dependent
+        # publish. A broker that rejects or hangs the availability PUBLISH (or
+        # never PUBACKs it) must not starve the heartbeat while the phase reads
+        # "bus" — otherwise the bus watchdog reboots a healthy panel over a
+        # broker-only fault (#87). A failing bus read here is a genuine bus fault
+        # and still raises before the beat, so a dead bus does not get a false
+        # heartbeat. The scope filter also runs here (before the sw_version
+        # pre-pass and entity computation) so the mesh bridge does not pick up the
+        # panel's HARDWARE firmware tag through the shared get_all (ble_mesh has no
+        # HARDWARE peripheral, so its sw_version is naturally None).
+        devices = [d for d in await self._bus.get_all() if self._included(d)]
+        self._beat()
+
         await self._async_publish_retained(
             availability_topic(self._panel),
             "online",
         )
 
-        # Scope filter BEFORE the sw_version pre-pass and entity computation:
-        # the mesh bridge must not pick up the panel's HARDWARE firmware tag
-        # through the shared get_all (ble_mesh has no HARDWARE peripheral, so
-        # its sw_version is naturally None).
-        devices = [d for d in await self._bus.get_all() if self._included(d)]
-        self._beat()
         # Pre-pass: the panel firmware version (from the HARDWARE peripheral) is
         # attached to every entity's HA device block so the device page shows it.
         sw_version = _sw_version_from(devices)
