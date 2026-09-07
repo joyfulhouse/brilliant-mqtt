@@ -7,18 +7,283 @@ far longer. tmpfs remains the default, so there is no flash wear.
 
 from __future__ import annotations
 
+import fcntl
 import logging
+import math
 import os
 import time
 from collections.abc import Callable
-from typing import Literal
+from dataclasses import dataclass, replace
+from typing import Literal, TextIO
 
 logger = logging.getLogger(__name__)
 
 _MIN_WRITE_INTERVAL_S = 10.0
+_PHASE_LEASE_ATTEMPTS = 3
+_PHASE_LEASE_RETRY_S = 0.01
+MAX_SESSION_RETRY_BACKOFF_S = 60.0
+# Must exceed systemd's deploy/brilliant-mqtt.service RestartSec so a crashed
+# bus-attempt writer can hand evidence to its replacement.
+BRIDGE_SERVICE_RESTART_SEC = 5.0
+DEAD_WRITER_RETENTION_S = BRIDGE_SERVICE_RESTART_SEC * 60
+PHASE_RECORD_VERSION = "v2"
+PHASE_ATTEMPT = "attempt"
+PHASE_SUCCESS = "success"
+PHASE_UNARMED = "unarmed"
+MAX_PID = 2**31 - 1
 _last_attempt: dict[str, float] = {}
 
 BusPhase = Literal["pre_bus", "bus"]
+
+
+@dataclass(frozen=True, slots=True)
+class PhaseRecord:
+    phase: BusPhase
+    pid: int
+    process_generation: str
+    boot_id: str
+    failure_started_at: float | None
+    bus_updated_at: float | None
+    bus_read_succeeded: bool | None
+
+    def encode(self) -> str:
+        if self.failure_started_at is None:
+            timing = ("-", "-", "-")
+        else:
+            status = (
+                PHASE_UNARMED
+                if self.bus_read_succeeded is None
+                else PHASE_SUCCESS
+                if self.bus_read_succeeded
+                else PHASE_ATTEMPT
+            )
+            timing = (
+                repr(self.failure_started_at),
+                repr(self.bus_updated_at),
+                status,
+            )
+        return " ".join(
+            (
+                PHASE_RECORD_VERSION,
+                self.phase,
+                str(self.pid),
+                self.process_generation,
+                self.boot_id,
+                *timing,
+            )
+        )
+
+    @classmethod
+    def parse(cls, text: str) -> PhaseRecord | None:
+        parts = text.split()
+        if (
+            len(parts) != 8
+            or parts[0] != PHASE_RECORD_VERSION
+            or parts[1] not in ("pre_bus", "bus")
+        ):
+            return None
+        try:
+            pid = int(parts[2])
+        except ValueError:
+            return None
+        generation = parts[3]
+        boot_id = parts[4]
+        if (
+            not 1 < pid <= MAX_PID
+            or not generation.isdecimal()
+            or not boot_id
+            or len(boot_id) > 128
+        ):
+            return None
+        timing_parts = parts[5:]
+        if timing_parts == ["-", "-", "-"]:
+            if parts[1] == "bus":
+                return None
+            timing: tuple[float | None, float | None] = (None, None)
+            read_succeeded: bool | None = None
+        else:
+            if timing_parts[2] not in (PHASE_ATTEMPT, PHASE_SUCCESS, PHASE_UNARMED):
+                return None
+            try:
+                parsed = (float(timing_parts[0]), float(timing_parts[1]))
+            except ValueError:
+                return None
+            if (
+                not all(math.isfinite(value) and value >= 0.0 for value in parsed)
+                or parsed[0] > parsed[1]
+            ):
+                return None
+            timing = parsed
+            read_succeeded = (
+                None if timing_parts[2] == PHASE_UNARMED else timing_parts[2] == PHASE_SUCCESS
+            )
+        phase: BusPhase = "pre_bus" if parts[1] == "pre_bus" else "bus"
+        return cls(
+            phase=phase,
+            pid=pid,
+            process_generation=generation,
+            boot_id=boot_id,
+            failure_started_at=timing[0],
+            bus_updated_at=timing[1],
+            bus_read_succeeded=read_succeeded,
+        )
+
+
+@dataclass(slots=True)
+class _PhaseLease:
+    stream: TextIO
+    last_success_write: float | None
+
+
+_phase_leases: dict[str, _PhaseLease] = {}
+_owned_phase_records: dict[str, PhaseRecord] = {}
+
+
+def current_boot_id() -> str | None:
+    try:
+        with open("/proc/sys/kernel/random/boot_id", encoding="utf-8") as stream:
+            boot_id = stream.read().strip()
+    except (OSError, UnicodeError):
+        return None
+    return boot_id or None
+
+
+def process_generation(pid: int) -> str | None:
+    """Return Linux's per-process start tick, which disambiguates PID reuse."""
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as stream:
+            stat = stream.read()
+    except (OSError, UnicodeError):
+        return None
+    command_end = stat.rfind(")")
+    if command_end < 0:
+        return None
+    fields_after_command = stat[command_end + 1 :].split()
+    if len(fields_after_command) <= 19:
+        return None
+    start_tick = fields_after_command[19]
+    return start_tick if start_tick.isdecimal() else None
+
+
+def process_is_absent(pid: int) -> bool:
+    """Return true only when the kernel confirms that *pid* does not exist."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except (OSError, OverflowError):
+        return False
+    return False
+
+
+def read_phase_record(path: str) -> PhaseRecord | None:
+    try:
+        with open(path, encoding="utf-8") as stream:
+            return PhaseRecord.parse(stream.read())
+    except (OSError, UnicodeError):
+        return None
+
+
+def _release_phase_lease(path: str) -> None:
+    lease = _phase_leases.pop(path, None)
+    if lease is not None:
+        lease.stream.close()
+
+
+def _acquire_phase_lease(path: str, last_success_write: float | None) -> None:
+    stream = open(path, "r+", encoding="utf-8")
+    try:
+        for attempt in range(_PHASE_LEASE_ATTEMPTS):
+            try:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                if attempt == _PHASE_LEASE_ATTEMPTS - 1:
+                    raise
+                time.sleep(_PHASE_LEASE_RETRY_S)
+            else:
+                break
+    except BaseException:
+        stream.close()
+        raise
+    _phase_leases[path] = _PhaseLease(stream, last_success_write)
+
+
+def _rewrite_phase_lease(path: str, text: str) -> bool:
+    lease = _phase_leases.get(path)
+    if lease is None:
+        return False
+    try:
+        lease.stream.seek(0)
+        lease.stream.write(text)
+        lease.stream.truncate()
+        lease.stream.flush()
+    except (OSError, UnicodeError, ValueError):
+        return False
+    return True
+
+
+def _inheritable_history(
+    record: PhaseRecord | None,
+    *,
+    boot_id: str,
+    pid: int,
+    generation: str,
+    owned: bool,
+    now: float,
+) -> PhaseRecord | None:
+    if (
+        record is None
+        or record.boot_id != boot_id
+        or record.failure_started_at is None
+        or record.bus_updated_at is None
+        or record.bus_read_succeeded is None
+        or record.failure_started_at > now
+        or record.bus_updated_at > now
+        or now - record.bus_updated_at > DEAD_WRITER_RETENTION_S
+    ):
+        return None
+    if record.pid == pid:
+        if not owned or record.process_generation != generation:
+            return None
+        return None if record.bus_read_succeeded else record
+    if record.bus_read_succeeded or not process_is_absent(record.pid):
+        return None
+    return record
+
+
+def _invalidate_failed_write(
+    path: str,
+    write_error: BaseException,
+    *,
+    repeated: bool = False,
+) -> None:
+    warning_level = logging.DEBUG if repeated else logging.WARNING
+    error_level = logging.DEBUG if repeated else logging.ERROR
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        logger.log(
+            warning_level,
+            "bus phase write failed for %s; marker absent and reboot guard disabled",
+            path,
+            exc_info=(type(write_error), write_error, write_error.__traceback__),
+        )
+    except OSError as invalidation_error:
+        logger.log(
+            error_level,
+            "bus phase write failed for %s and marker invalidation failed: %s; "
+            "stale marker remains but its live-writer lease was released",
+            path,
+            invalidation_error,
+            exc_info=(type(write_error), write_error, write_error.__traceback__),
+        )
+    else:
+        logger.log(
+            warning_level,
+            "bus phase write failed for %s; marker cleared and reboot guard disabled",
+            path,
+            exc_info=(type(write_error), write_error, write_error.__traceback__),
+        )
 
 
 def _atomic_write(path: str, text: str) -> None:
@@ -70,54 +335,142 @@ def write_heartbeat(
         logger.debug("heartbeat write failed for %s", path, exc_info=True)
 
 
-def write_phase(path: str, phase: BusPhase) -> None:
-    """Atomically record the session's bus phase without disrupting startup.
+def write_phase(
+    path: str,
+    phase: BusPhase,
+    *,
+    bus_read_succeeded: bool = False,
+    monotonic_clock: Callable[[], float] = time.monotonic,
+) -> bool:
+    """Record timed, boot-aware local-bus attribution before bus startup.
 
-    Writes ``"<phase> <pid>"`` — the writer's own pid lets the reader
-    (:func:`brilliant_bus_watchdog.health.bus_confirmed`) verify the writer is
-    still alive, so a stale ``bus`` marker from a dead/reverted process does not
-    read as a live confirmed bus.
-
-    A failed write is best-effort for EVERY phase, ``pre_bus`` included: on any
-    failure the phase file is cleared best-effort and the error is swallowed,
-    never re-raised. Two things force this:
-
-    * The ``pre_bus`` stamp runs at :mod:`brilliant_mqtt.__main__` *before* the
-      session ``try``, so re-raising would make the supervisor back off and
-      retry forever and the bridge would never connect to anything.
-    * :func:`brilliant_mqtt.__main__.run` retries ``_run_session`` in the SAME
-      process while teardown deliberately KEEPS the ``bus`` marker, so a
-      leftover ``bus <pid>`` names THIS still-live process. Merely swallowing a
-      failed re-stamp would leave that live-pid marker readable, so
-      :func:`brilliant_bus_watchdog.health.bus_confirmed` would return True and
-      — with a stale heartbeat during a broker-only outage — reboot a healthy
-      panel in a loop (issue #87). The pid liveness check does NOT save us here
-      (the pid is alive), so the failed stamp must ACTIVELY clear the marker.
-
-    Removing the file disables the reboot guard (a cleared/absent marker reads
-    as unconfirmed), which is fail-safe. Every error is swallowed — including
-    the unlink's (``FileNotFoundError``, ``IsADirectoryError``,
-    ``NotADirectoryError``, ``PermissionError``, …): phase tracking degrading to
-    "off" is safe, a re-raise is not. ``_atomic_write`` already removes its own
-    ``.tmp`` scratch file, so a failed replace never leaks it.
-
-    Contract: this writer and its reader
-    (:func:`brilliant_bus_watchdog.health.bus_confirmed`) must be rolled out
-    and rolled back TOGETHER. If only one side is reverted, delete the phase
-    file (default ``/run/brilliant-mqtt/bus-phase``) so a stale marker can't
-    be misread as bus-confirmed.
+    A live ``bus`` writer holds an exclusive lock on the marker inode. A failed
+    ``pre_bus`` replacement rewrites that leased inode before releasing it, so
+    the old bus attempt cannot become valid evidence after writer death. Recent
+    records from dead writers remain bounded evidence for native-crash loops;
+    boot IDs, process start ticks, and retention reject PID reuse and ancient
+    records. A false return disables reboot attribution; it must not stop the
+    bridge.
     """
     if not path:
-        return
+        return True
+    now = monotonic_clock()
+    lease = _phase_leases.get(path)
+    if phase == "pre_bus":
+        _last_attempt.pop(path, None)
+    last_failed_attempt = _last_attempt.get(path)
+    repeated_failure = last_failed_attempt is not None
+    if (
+        phase == "bus"
+        and bus_read_succeeded
+        and last_failed_attempt is not None
+        and now - last_failed_attempt < _MIN_WRITE_INTERVAL_S
+    ):
+        return False
+    if (
+        phase == "bus"
+        and bus_read_succeeded
+        and lease is not None
+        and lease.last_success_write is not None
+        and now - lease.last_success_write < _MIN_WRITE_INTERVAL_S
+    ):
+        return True
+    previous = read_phase_record(path)
+    owned = _owned_phase_records.get(path) == previous
+    _owned_phase_records.pop(path, None)
     try:
-        _atomic_write(path, f"{phase} {os.getpid()}")
-    except OSError:
-        # A failed stamp must not take the bridge down AND must not leave a
-        # stale (same-pid) marker readable. Log, clear the marker best-effort so
-        # the watchdog fails closed (reboot guard disabled), and swallow every
-        # error — the unlink's included.
-        logger.warning("bus phase write failed for %s; reboot guard disabled", path, exc_info=True)
+        boot_id = current_boot_id()
+        pid = os.getpid()
+        generation = process_generation(pid)
+        if boot_id is None or generation is None:
+            raise OSError("cannot establish boot/process generation")
+        history = _inheritable_history(
+            previous,
+            boot_id=boot_id,
+            pid=pid,
+            generation=generation,
+            owned=owned,
+            now=now,
+        )
+        if phase == "pre_bus":
+            failure_started_at = history.failure_started_at if history is not None else None
+            bus_updated_at = history.bus_updated_at if history is not None else None
+            read_succeeded = history.bus_read_succeeded if history is not None else None
+        else:
+            failure_started_at = (
+                history.failure_started_at
+                if history is not None and not bus_read_succeeded
+                else now
+            )
+            bus_updated_at = now
+            read_succeeded = bus_read_succeeded
+        record = PhaseRecord(
+            phase=phase,
+            pid=pid,
+            process_generation=generation,
+            boot_id=boot_id,
+            failure_started_at=failure_started_at,
+            bus_updated_at=bus_updated_at,
+            bus_read_succeeded=read_succeeded,
+        )
+        encoded = record.encode()
+        if phase == "bus" and lease is not None and owned and _rewrite_phase_lease(path, encoded):
+            _owned_phase_records[path] = record
+            lease.last_success_write = now if bus_read_succeeded else None
+            _last_attempt.pop(path, None)
+            return True
+        written_record = (
+            replace(record, phase="pre_bus", bus_read_succeeded=None) if phase == "bus" else record
+        )
         try:
-            os.unlink(path)
-        except OSError:
-            pass
+            _atomic_write(path, written_record.encode())
+        except (OSError, UnicodeError) as write_error:
+            if _rewrite_phase_lease(path, encoded):
+                _owned_phase_records[path] = record
+                if phase == "pre_bus":
+                    _release_phase_lease(path)
+                else:
+                    current_lease = _phase_leases[path]
+                    current_lease.last_success_write = now if bus_read_succeeded else None
+                logger.warning(
+                    "bus phase atomic replacement failed for %s; marker updated in place",
+                    path,
+                    exc_info=(type(write_error), write_error, write_error.__traceback__),
+                )
+                _last_attempt.pop(path, None)
+                return True
+            _owned_phase_records.pop(path, None)
+            _release_phase_lease(path)
+            _last_attempt[path] = now
+            _invalidate_failed_write(path, write_error, repeated=repeated_failure)
+            return False
+        _owned_phase_records[path] = written_record
+        _release_phase_lease(path)
+        if phase == "bus":
+            try:
+                _acquire_phase_lease(path, now if bus_read_succeeded else None)
+            except BlockingIOError:
+                _owned_phase_records.pop(path, None)
+                logger.log(
+                    logging.DEBUG if repeated_failure else logging.WARNING,
+                    "bus phase lease unavailable for %s after bounded retries; "
+                    "reboot guard disabled",
+                    path,
+                    exc_info=True,
+                )
+                _last_attempt[path] = now
+                return False
+            if not _rewrite_phase_lease(path, encoded):
+                raise OSError("cannot arm bus phase marker")
+            _owned_phase_records[path] = record
+        _last_attempt.pop(path, None)
+        return True
+    except BlockingIOError:
+        _release_phase_lease(path)
+        return False
+    except (OSError, UnicodeError) as error:
+        _owned_phase_records.pop(path, None)
+        _release_phase_lease(path)
+        _last_attempt[path] = now
+        _invalidate_failed_write(path, error, repeated=repeated_failure)
+        return False

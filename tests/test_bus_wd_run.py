@@ -1,29 +1,37 @@
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 from typing import Any, NoReturn
 
 import pytest
 
 from brilliant_bus_watchdog import bounded
-from brilliant_bus_watchdog.run import _service_active, handle, load_config, should_reboot
+from brilliant_bus_watchdog.run import (
+    _service_active,
+    _service_started_at,
+    handle,
+    load_config,
+    should_reboot,
+)
 
 
 @pytest.mark.parametrize(
-    ("age", "bridge_active", "gateway_up", "bus_confirmed", "expected"),
+    ("age", "bridge_active", "gateway_up", "bus_failure_age", "expected"),
     [
-        (1900.0, True, True, True, True),
-        (100.0, True, True, True, False),
-        (9999.0, False, True, True, False),
-        (9999.0, True, False, True, False),
-        (9999.0, True, True, False, False),
+        (1900.0, True, True, 1900.0, True),
+        (100.0, True, True, 1900.0, False),
+        (9999.0, False, True, 9999.0, False),
+        (9999.0, True, False, 9999.0, False),
+        (9999.0, True, True, None, False),
+        (9999.0, True, True, 1799.9, False),
     ],
 )
 def test_should_reboot_requires_every_bus_wedge_signal(
     age: float,
     bridge_active: bool,
     gateway_up: bool,
-    bus_confirmed: bool,
+    bus_failure_age: float | None,
     expected: bool,
 ) -> None:
     assert (
@@ -31,7 +39,7 @@ def test_should_reboot_requires_every_bus_wedge_signal(
             age=age,
             bridge_active=bridge_active,
             gateway_up=gateway_up,
-            bus_confirmed=bus_confirmed,
+            bus_failure_age=bus_failure_age,
             stale_after=1800.0,
         )
         is expected
@@ -102,9 +110,10 @@ def test_load_config_bus_phase_path(environ: dict[str, str], expected: str) -> N
     assert load_config(environ).phase_path == expected
 
 
-def test_service_active_true_when_stdout_active() -> None:
+@pytest.mark.parametrize("state", ["active", "activating"])
+def test_service_active_true_while_running_or_restarting(state: str) -> None:
     def run(argv: list[str]) -> SimpleNamespace:
-        return SimpleNamespace(stdout="active\n")
+        return SimpleNamespace(stdout=f"{state}\n")
 
     assert _service_active("brilliant-mqtt", run=run) is True
 
@@ -146,3 +155,83 @@ def test_service_active_timeout_reads_as_inactive(monkeypatch: pytest.MonkeyPatc
 
     monkeypatch.setattr(bounded, "run_bounded", spy)
     assert _service_active("brilliant-mqtt") is False
+
+
+def test_service_start_generation_uses_systemd_monotonic_timestamp() -> None:
+    calls: list[list[str]] = []
+
+    def run(argv: list[str]) -> SimpleNamespace:
+        calls.append(argv)
+        return SimpleNamespace(stdout="ExecMainStartTimestampMonotonic=1901000000\n")
+
+    assert _service_started_at("brilliant-mqtt", run=run) == 1901.0
+    assert calls == [
+        [
+            "systemctl",
+            "show",
+            "--property=ExecMainStartTimestampMonotonic",
+            "brilliant-mqtt",
+        ]
+    ]
+
+
+def test_empty_service_start_generation_disables_reboot_with_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def run(argv: list[str]) -> SimpleNamespace:
+        del argv
+        return SimpleNamespace(stdout="")
+
+    with caplog.at_level(logging.WARNING, logger="brilliant_bus_watchdog"):
+        started_at = _service_started_at("brilliant-mqtt", run=run)
+
+    assert started_at is None
+    assert not should_reboot(
+        age=1900.0,
+        bridge_active=True,
+        gateway_up=True,
+        bus_failure_age=None,
+        stale_after=1800.0,
+    )
+    assert any(
+        "ExecMainStartTimestampMonotonic unavailable" in record.getMessage()
+        and "reboot guard disabled" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.parametrize(
+    ("stdout", "returncode"),
+    [
+        pytest.param(
+            "ExecMainStartTimestampMonotonic=garbage",
+            0,
+            id="non-integer-value",
+        ),
+        pytest.param("ExecMainStartTimestampMonotonic=0", 0, id="zero-value"),
+        pytest.param("ExecMainStartTimestampMonotonic=-1", 0, id="negative-value"),
+        pytest.param(
+            "ExecMainStartTimestampMonotonic=1901000000",
+            1,
+            id="systemctl-failure",
+        ),
+    ],
+)
+def test_unknown_service_start_generation_fails_closed(
+    stdout: str,
+    returncode: int,
+) -> None:
+    def run(argv: list[str]) -> SimpleNamespace:
+        del argv
+        return SimpleNamespace(stdout=stdout, returncode=returncode)
+
+    started_at = _service_started_at("brilliant-mqtt", run=run)
+
+    assert started_at is None
+    assert not should_reboot(
+        age=1900.0,
+        bridge_active=True,
+        gateway_up=True,
+        bus_failure_age=started_at,
+        stale_after=1800.0,
+    )

@@ -1,9 +1,10 @@
-"""Bus-watchdog daemon: reboot the panel when the bridge can't hold a
-message-bus session for >=stale_after, the bridge unit is active, the gateway
-is reachable, AND the last session actually reached the local-bus phase with a
-live writer (bus_confirmed) — so a broker/DNS/TLS/auth startup failure, which
-never reaches the bus, cannot reboot a healthy panel. Logic in
-should_reboot()/handle(); main() is thin."""
+"""Bus-watchdog daemon: reboot only after sustained, attributable bus failure.
+
+Heartbeat staleness and timed local-bus attribution must both exceed the
+threshold while the bridge is active and its gateway is reachable. Broker-only
+startup failures and a newly entered bus handshake therefore cannot borrow an
+older heartbeat's age. Logic lives in should_reboot()/handle(); main() is thin.
+"""
 
 from __future__ import annotations
 
@@ -16,7 +17,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from . import bounded, probe
-from .health import bus_confirmed, heartbeat_age
+from .health import bus_failure_age, heartbeat_age
 from .reboot import reboot as _reboot
 from .reboot_guard import GuardPolicy, RebootGuard
 
@@ -75,10 +76,16 @@ def should_reboot(
     age: float,
     bridge_active: bool,
     gateway_up: bool,
-    bus_confirmed: bool,
+    bus_failure_age: float | None,
     stale_after: float,
 ) -> bool:
-    return age >= stale_after and bridge_active and gateway_up and bus_confirmed
+    return (
+        age >= stale_after
+        and bridge_active
+        and gateway_up
+        and bus_failure_age is not None
+        and bus_failure_age >= stale_after
+    )
 
 
 def handle(*, should: bool, guard: _GuardLike, now: float, reboot_fn: Any = _reboot) -> None:
@@ -96,9 +103,40 @@ def _service_active(service: str, run: Any = None) -> bool:
     runner = run or (lambda argv: bounded.run_bounded(argv, timeout=_SERVICE_TIMEOUT, capture=True))
     try:
         r = runner(["systemctl", "is-active", service])
-        return (r.stdout or "").strip() == "active"
+        return (r.stdout or "").strip() in {"active", "activating"}
     except OSError:
         return False
+
+
+def _service_started_at(service: str, run: Any = None) -> float | None:
+    runner = run or (lambda argv: bounded.run_bounded(argv, timeout=_SERVICE_TIMEOUT, capture=True))
+    property_name = "ExecMainStartTimestampMonotonic"
+    try:
+        result = runner(
+            [
+                "systemctl",
+                "show",
+                f"--property={property_name}",
+                service,
+            ]
+        )
+    except OSError:
+        _LOG.warning("%s unavailable for %s; reboot guard disabled", property_name, service)
+        return None
+    output = (result.stdout or "").strip()
+    key, separator, value = output.partition("=")
+    if getattr(result, "returncode", 0) != 0 or key != property_name or not separator or not value:
+        _LOG.warning("%s unavailable for %s; reboot guard disabled", property_name, service)
+        return None
+    try:
+        started_at_us = int(value)
+    except ValueError:
+        _LOG.warning("%s unavailable for %s; reboot guard disabled", property_name, service)
+        return None
+    if started_at_us <= 0:
+        _LOG.warning("%s unavailable for %s; reboot guard disabled", property_name, service)
+        return None
+    return started_at_us / 1_000_000
 
 
 def _configure_logging(path: str) -> None:
@@ -119,20 +157,29 @@ def main() -> None:  # pragma: no cover - thin loop
         gw = cfg.gateway or probe.default_gateway()
         gateway_up = probe.ping(gw) if gw else False
         active = _service_active(cfg.bridge_service)
-        confirmed = bus_confirmed(cfg.phase_path)
+        service_started_at = _service_started_at(cfg.bridge_service)
+        failure_age = (
+            bus_failure_age(
+                cfg.phase_path,
+                now=time.monotonic(),
+                service_started_at=service_started_at,
+            )
+            if service_started_at is not None
+            else None
+        )
         should = should_reboot(
             age=age,
             bridge_active=active,
             gateway_up=gateway_up,
-            bus_confirmed=confirmed,
+            bus_failure_age=failure_age,
             stale_after=cfg.stale_after,
         )
         _LOG.info(
-            "age=%.0fs bridge_active=%s gateway_up=%s bus_confirmed=%s should=%s",
+            "age=%.0fs bridge_active=%s gateway_up=%s bus_failure_age=%s should=%s",
             age,
             active,
             gateway_up,
-            confirmed,
+            "none" if failure_age is None else f"{failure_age:.0f}s",
             should,
         )
         handle(should=should, guard=guard, now=now)

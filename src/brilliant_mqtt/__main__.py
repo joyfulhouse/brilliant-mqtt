@@ -20,7 +20,7 @@ from brilliant_mqtt.bus import RpcBusAdapter
 from brilliant_mqtt.config import Settings
 from brilliant_mqtt.desired_state import DesiredState
 from brilliant_mqtt.discovery import meta_topic
-from brilliant_mqtt.heartbeat import write_heartbeat, write_phase
+from brilliant_mqtt.heartbeat import MAX_SESSION_RETRY_BACKOFF_S, write_heartbeat, write_phase
 from brilliant_mqtt.mesh_leader import MeshLeader
 from brilliant_mqtt.motion_derive import MotionDeriver
 from brilliant_mqtt.mqttio import AioMqttAdapter
@@ -35,7 +35,7 @@ _BACKOFF_S = 5
 # A ledger failure requires operator action (repair the file/filesystem), not a
 # hot reconnect loop. Keep retrying so recovery is automatic, but slowly enough
 # that one affected panel cannot churn the broker.
-_LEDGER_BACKOFF_S = 60.0
+_LEDGER_BACKOFF_S = MAX_SESSION_RETRY_BACKOFF_S
 # Loop tick when the hot poll is disabled (stale checks still need a cadence).
 _IDLE_TICK_S = 30.0
 # Version 0.9.2 detected a dead bus in roughly 1.5 hot-poll cycles (~12-20s,
@@ -171,6 +171,7 @@ async def _run_session(
     bus = RpcBusAdapter(extra_device_ids=(_MESH_DEVICE_ID,) if participating else ())
     scene_bridge: SceneBridge | None = None
     mqtt_connected = False
+    phase_marker_failure_logged = False
     try:
         owned_topics = RetainedTopicLedger(
             settings.panel,
@@ -194,7 +195,14 @@ async def _run_session(
         )
 
         def _beat() -> None:
+            nonlocal phase_marker_failure_logged
             write_heartbeat(settings.bus_heartbeat_file, time.time)
+            if not write_phase(settings.bus_phase_file, "bus", bus_read_succeeded=True):
+                log.log(
+                    logging.DEBUG if phase_marker_failure_logged else logging.ERROR,
+                    "bus phase marker unavailable; reboot guard disabled",
+                )
+                phase_marker_failure_logged = True
 
         # Bridges register their bus/mqtt callbacks in __init__, BEFORE any I/O
         # starts — so no early change/command event is missed.
@@ -290,11 +298,13 @@ async def _run_session(
         # this line — mqtt.connect(), the mesh-election join — is an
         # MQTT/mesh-side startup failure, not a bus failure, and must leave
         # the phase at "pre_bus".
-        write_phase(settings.bus_phase_file, "bus")
+        if not write_phase(settings.bus_phase_file, "bus"):
+            log.error("bus phase marker unavailable; reboot guard disabled")
+            phase_marker_failure_logged = True
         await bus.start()
+        await panel_bridge.reconcile()
         if scene_bridge is not None:
             await scene_bridge.async_start()
-        await panel_bridge.reconcile()
 
         tick = settings.hot_poll_seconds if settings.hot_poll_seconds > 0 else _IDLE_TICK_S
         next_resync = time.monotonic() + settings.resync_seconds

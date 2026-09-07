@@ -2,15 +2,48 @@
 
 from __future__ import annotations
 
+import fcntl
 import logging
 import os
+import time
 from pathlib import Path
 
 import pytest
 
-from brilliant_bus_watchdog.health import bus_confirmed
-from brilliant_mqtt.heartbeat import write_heartbeat, write_phase
+from brilliant_bus_watchdog import phase_record
+from brilliant_bus_watchdog.health import bus_failure_age
+from brilliant_bus_watchdog.run import should_reboot
+from brilliant_mqtt import heartbeat
+from brilliant_mqtt.heartbeat import DEAD_WRITER_RETENTION_S, write_heartbeat, write_phase
 from tests.fakes import FakeClock
+
+
+def test_writer_and_watchdog_phase_contract_constants_match() -> None:
+    names = (
+        "PHASE_RECORD_VERSION",
+        "PHASE_ATTEMPT",
+        "PHASE_SUCCESS",
+        "PHASE_UNARMED",
+        "MAX_PID",
+        "DEAD_WRITER_RETENTION_S",
+    )
+
+    assert tuple(getattr(heartbeat, name) for name in names) == tuple(
+        getattr(phase_record, name) for name in names
+    )
+
+
+def test_dead_writer_retention_exceeds_systemd_restart_delay() -> None:
+    service = Path(__file__).parents[1] / "deploy" / "brilliant-mqtt.service"
+    restart_line = next(
+        line
+        for line in service.read_text(encoding="utf-8").splitlines()
+        if line.startswith("RestartSec=")
+    )
+
+    restart_seconds = float(restart_line.partition("=")[2])
+    assert heartbeat.BRIDGE_SERVICE_RESTART_SEC == restart_seconds
+    assert DEAD_WRITER_RETENTION_S > restart_seconds
 
 
 def test_writes_epoch_and_creates_parent(tmp_path: Path) -> None:
@@ -74,8 +107,158 @@ def test_write_phase_atomically_replaces_the_current_phase(tmp_path: Path) -> No
     write_phase(str(phase), "pre_bus")
     write_phase(str(phase), "bus")
 
-    # write_phase appends the writer's pid so the reader can check liveness.
-    assert phase.read_text(encoding="utf-8") == f"bus {os.getpid()}"
+    record = heartbeat.read_phase_record(str(phase))
+    assert record is not None
+    assert record.phase == "bus"
+    assert record.pid == os.getpid()
+    assert record.failure_started_at is not None
+    assert record.bus_read_succeeded is False
+
+
+def test_successful_bus_read_resets_preserved_failure_history(tmp_path: Path) -> None:
+    phase = tmp_path / "bus-phase"
+    write_phase(str(phase), "bus", monotonic_clock=lambda: 100.0)
+    write_phase(str(phase), "pre_bus", monotonic_clock=lambda: 300.0)
+    write_phase(str(phase), "bus", monotonic_clock=lambda: 300.0)
+    assert bus_failure_age(str(phase), now=400.0) == 300.0
+
+    write_phase(
+        str(phase),
+        "bus",
+        bus_read_succeeded=True,
+        monotonic_clock=lambda: 400.0,
+    )
+
+    assert bus_failure_age(str(phase), now=400.0) == 0.0
+    record = heartbeat.read_phase_record(str(phase))
+    assert record is not None
+    assert record.bus_read_succeeded is True
+
+
+def test_failure_after_success_starts_fresh_attribution(tmp_path: Path) -> None:
+    phase = tmp_path / "bus-phase"
+    write_phase(str(phase), "bus", monotonic_clock=lambda: 100.0)
+    write_phase(
+        str(phase),
+        "bus",
+        bus_read_succeeded=True,
+        monotonic_clock=lambda: 200.0,
+    )
+
+    write_phase(str(phase), "pre_bus", monotonic_clock=lambda: 250.0)
+    write_phase(str(phase), "bus", monotonic_clock=lambda: 250.0)
+
+    assert bus_failure_age(str(phase), now=250.0) == 0.0
+
+
+@pytest.mark.parametrize(
+    ("spacing", "expected_age"),
+    [
+        (DEAD_WRITER_RETENTION_S - 1.0, DEAD_WRITER_RETENTION_S - 1.0),
+        (DEAD_WRITER_RETENTION_S + 1.0, 0.0),
+    ],
+)
+def test_bus_failure_history_obeys_retry_gap_bound(
+    tmp_path: Path, spacing: float, expected_age: float
+) -> None:
+    phase = tmp_path / f"bus-phase-{spacing}"
+    write_phase(str(phase), "bus", monotonic_clock=lambda: 100.0)
+    retry_at = 100.0 + spacing
+
+    write_phase(str(phase), "pre_bus", monotonic_clock=lambda: retry_at)
+    write_phase(str(phase), "bus", monotonic_clock=lambda: retry_at)
+
+    assert bus_failure_age(str(phase), now=retry_at) == expected_age
+
+
+def test_phase_lease_retries_a_transient_watchdog_lock_collision(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    phase = tmp_path / "bus-phase"
+    real_flock = fcntl.flock
+    collisions = 0
+
+    def _flock(fd: int, operation: int) -> None:
+        nonlocal collisions
+        if operation == fcntl.LOCK_EX | fcntl.LOCK_NB and collisions == 0:
+            collisions += 1
+            raise BlockingIOError
+        real_flock(fd, operation)
+
+    monkeypatch.setattr("brilliant_mqtt.heartbeat.fcntl.flock", _flock)
+    write_phase(
+        str(phase),
+        "bus",
+        bus_read_succeeded=True,
+        monotonic_clock=lambda: 100.0,
+    )
+
+    assert collisions == 1
+    assert bus_failure_age(str(phase), now=100.0) == 0.0
+
+
+def test_owned_phase_lease_is_updated_without_atomic_replacement(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    phase = tmp_path / "bus-phase"
+    assert write_phase(str(phase), "bus", monotonic_clock=lambda: 100.0)
+    atomic_writes = 0
+
+    def _unexpected_atomic_write(path: str, text: str) -> None:
+        nonlocal atomic_writes
+        del path, text
+        atomic_writes += 1
+        raise OSError("atomic replacement should not run for an owned lease")
+
+    monkeypatch.setattr(heartbeat, "_atomic_write", _unexpected_atomic_write)
+
+    assert write_phase(
+        str(phase),
+        "bus",
+        bus_read_succeeded=True,
+        monotonic_clock=lambda: 111.0,
+    )
+    assert atomic_writes == 0
+    assert bus_failure_age(str(phase), now=111.0) == 0.0
+
+
+def test_failed_success_phase_write_attempts_are_rate_limited(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    phase = tmp_path / "bus-phase"
+    assert write_phase(str(phase), "bus", monotonic_clock=lambda: 100.0)
+    atomic_writes = 0
+
+    def _failed_atomic_write(path: str, text: str) -> None:
+        nonlocal atomic_writes
+        del path, text
+        atomic_writes += 1
+        raise OSError("phase directory is persistently unwritable")
+
+    monkeypatch.setattr(heartbeat, "_atomic_write", _failed_atomic_write)
+    monkeypatch.setattr(heartbeat, "_rewrite_phase_lease", lambda path, text: False)
+
+    assert not write_phase(
+        str(phase),
+        "bus",
+        bus_read_succeeded=True,
+        monotonic_clock=lambda: 200.0,
+    )
+    assert not write_phase(
+        str(phase),
+        "bus",
+        bus_read_succeeded=True,
+        monotonic_clock=lambda: 200.0,
+    )
+    assert atomic_writes == 1
+
+    assert not write_phase(
+        str(phase),
+        "bus",
+        bus_read_succeeded=True,
+        monotonic_clock=lambda: 211.0,
+    )
+    assert atomic_writes == 2
 
 
 def test_write_phase_is_best_effort(tmp_path: Path) -> None:
@@ -110,68 +293,73 @@ def test_write_phase_pre_bus_is_best_effort_when_path_is_dir(tmp_path: Path) -> 
     assert not (tmp_path / "bus-phase.tmp").exists()
 
 
-def test_failed_pre_bus_restamp_must_not_leave_live_pid_bus_marker_confirmed(
+def test_failed_pre_bus_replacement_invalidates_live_bus_marker_in_place(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A failed pre_bus re-stamp must ACTIVELY clear any leftover ``bus``
+    """A failed pre_bus replacement must actively invalidate a leftover ``bus``
     marker, not merely swallow the error. ``run()`` retries ``_run_session`` in
     the SAME process while teardown keeps the ``bus`` marker, so a leftover
     ``bus <pid>`` names THIS still-live process — the reader's pid-liveness
     check would read it as confirmed. If the re-stamp fails and the marker is
     left in place, a stale heartbeat during a broker-only outage would reboot a
-    healthy panel in a loop (issue #87). So after a failed pre_bus write over a
-    live-pid marker, the file must be gone and bus_confirmed must be False, with
-    no exception raised."""
+    healthy panel in a loop (issue #87)."""
     phase = tmp_path / "bus-phase"
-    phase.write_text(f"bus {os.getpid()}", encoding="utf-8")  # leftover, live pid
-    assert bus_confirmed(str(phase)) is True  # would fire a reboot if left
+    write_phase(
+        str(phase),
+        "bus",
+        bus_read_succeeded=True,
+        monotonic_clock=lambda: 100.0,
+    )
+    assert bus_failure_age(str(phase), now=100.0) == 0.0
 
     def _raise(*args: object, **kwargs: object) -> None:
         raise OSError(28, "No space left on device")
 
     monkeypatch.setattr("brilliant_mqtt.heartbeat._atomic_write", _raise)
-    write_phase(str(phase), "pre_bus")  # must not raise
+    assert write_phase(str(phase), "pre_bus")
 
-    assert not phase.exists()
-    assert bus_confirmed(str(phase)) is False
+    record = heartbeat.read_phase_record(str(phase))
+    assert record is not None
+    assert record.phase == "pre_bus"
+    assert bus_failure_age(str(phase), now=100.0) is None
 
 
-def test_real_write_failure_clears_live_pid_bus_marker(tmp_path: Path) -> None:
+def test_real_atomic_write_failure_invalidates_live_bus_marker_in_place(tmp_path: Path) -> None:
     """The REAL failure -> propagate -> clear chain, with no monkeypatch of
     _atomic_write: a pre-existing ``bus-phase.tmp`` directory makes the real
     ``open(tmp, "w")`` inside _atomic_write raise IsADirectoryError, which must
-    propagate out of _atomic_write so write_phase's handler clears the leftover
-    live-pid marker. This pins _atomic_write's re-raise (a mutant that swallows
-    its OSError instead of re-raising leaves the marker confirmed)."""
+    propagate out of _atomic_write so write_phase rewrites the already-leased
+    inode as a durable pre_bus revocation."""
     phase = tmp_path / "bus-phase"
-    phase.write_text(f"bus {os.getpid()}", encoding="utf-8")  # leftover, live pid
+    write_phase(str(phase), "bus", bus_read_succeeded=True)
     (tmp_path / "bus-phase.tmp").mkdir()  # real open() failure, no monkeypatch
-    assert bus_confirmed(str(phase)) is True  # would fire a reboot if left
+    assert bus_failure_age(str(phase), now=time.monotonic()) is not None
 
-    write_phase(str(phase), "pre_bus")  # must not raise
+    assert write_phase(str(phase), "pre_bus")
 
-    assert not phase.exists()
-    assert bus_confirmed(str(phase)) is False
+    record = heartbeat.read_phase_record(str(phase))
+    assert record is not None
+    assert record.phase == "pre_bus"
+    assert bus_failure_age(str(phase), now=time.monotonic()) is None
 
 
-def test_write_phase_bus_failure_also_clears_marker(
+def test_write_phase_bus_atomic_failure_updates_leased_marker_in_place(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The contract is best-effort clear for EVERY phase, not just pre_bus: a
-    failed ``bus`` upgrade must also clear the leftover marker (a failed bus
-    stamp that left the prior marker readable would misreport the phase). This
-    pins the clear against a mutant that guards the unlink with
-    ``if phase != "pre_bus": return``."""
+    """A failed atomic ``bus`` upgrade must still update the leased inode."""
     phase = tmp_path / "bus-phase"
-    phase.write_text(f"bus {os.getpid()}", encoding="utf-8")
+    write_phase(str(phase), "bus", bus_read_succeeded=True)
 
     def _raise(*args: object, **kwargs: object) -> None:
         raise OSError(28, "No space left on device")
 
     monkeypatch.setattr("brilliant_mqtt.heartbeat._atomic_write", _raise)
-    write_phase(str(phase), "bus")  # must not raise
+    assert write_phase(str(phase), "bus")
 
-    assert not phase.exists()
+    record = heartbeat.read_phase_record(str(phase))
+    assert record is not None
+    assert record.phase == "bus"
+    assert record.bus_read_succeeded is False
 
 
 def test_failed_stamp_logs_warning_reboot_guard_disabled(
@@ -196,3 +384,64 @@ def test_failed_stamp_logs_warning_reboot_guard_disabled(
         if r.levelname == "WARNING" and "reboot guard disabled" in r.getMessage()
     ]
     assert len(warnings) == 1
+
+
+def test_failed_phase_write_and_failed_unlink_do_not_authorize_reboot(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    phase = tmp_path / "bus-phase"
+    write_phase(
+        str(phase),
+        "bus",
+        bus_read_succeeded=True,
+        monotonic_clock=lambda: 100.0,
+    )
+
+    def _denied(*args: object, **kwargs: object) -> None:
+        raise PermissionError("readable marker in unwritable directory")
+
+    monkeypatch.setattr(heartbeat, "_atomic_write", _denied)
+    monkeypatch.setattr("brilliant_mqtt.heartbeat.os.unlink", _denied)
+    with caplog.at_level(logging.WARNING, logger="brilliant_mqtt.heartbeat"):
+        heartbeat.write_phase(str(phase), "pre_bus")
+
+    failure_age = bus_failure_age(str(phase), now=1900.0)
+    assert not should_reboot(
+        age=1900.0,
+        stale_after=1800.0,
+        bridge_active=True,
+        gateway_up=True,
+        bus_failure_age=failure_age,
+    )
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("marker updated in place" in message for message in messages)
+    assert not any("reboot guard disabled" in message for message in messages)
+
+
+def test_real_unwritable_phase_directory_does_not_leave_reboot_armed(tmp_path: Path) -> None:
+    if os.geteuid() == 0:
+        pytest.skip("permission reproduction requires an unprivileged process")
+    directory = tmp_path / "readonly"
+    directory.mkdir()
+    phase = directory / "bus-phase"
+    write_phase(
+        str(phase),
+        "bus",
+        bus_read_succeeded=True,
+        monotonic_clock=lambda: 100.0,
+    )
+    directory.chmod(0o500)
+    try:
+        heartbeat.write_phase(str(phase), "pre_bus")
+        assert bus_failure_age(str(phase), now=1900.0) is None
+        assert not should_reboot(
+            age=1900.0,
+            stale_after=1800.0,
+            bridge_active=True,
+            gateway_up=True,
+            bus_failure_age=bus_failure_age(str(phase), now=1900.0),
+        )
+    finally:
+        directory.chmod(0o700)

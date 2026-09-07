@@ -329,6 +329,20 @@ variables so the specs auto-gate (no special-casing needed).
   are compiled Cython `.so` (no readable source anywhere in site-packages);
   everything above came from runtime introspection + one live session.
 
+### systemd monotonic generation probe (2026-09-07)
+
+Read-only diagnostics on panel `office.iot` at approximately 17:20 UTC found
+firmware Python 3.10.9 and `systemd 250 (250.5+)`:
+
+- `brilliant-mqtt` reported `ExecMainStartTimestampMonotonic=47613417`,
+  `ExecMainPID=495`, `ActiveState=active`, `SubState=running`, and `NRestarts=0`.
+- The bus-watchdog unit reported
+  `ExecMainStartTimestampMonotonic=23332379` and `ActiveState=active`.
+- `/proc/uptime` was `106374.06`. The property is `CLOCK_MONOTONIC` in
+  microseconds (`47613417us` = 47.6 seconds after boot).
+- On this firmware, `systemctl is-enabled` can emit empty stdout. Probes that
+  parse stdout must treat empty output as not found.
+
 ## 10. Reconciliation for Milestones 3–6 (normalized model)
 
 The plan's representative snippets used `BrilliantDevice(power, brightness)`.

@@ -157,7 +157,7 @@ class SceneBridge:
 
         self._lock = asyncio.Lock()
         self._started = False
-        self._startup_active = False
+        self._startup_active = True
         self._startup_buffered_execution: BrilliantDevice | None = None
         self._callbacks_registered = False
         self._subscribed_topics: list[str] = []
@@ -191,9 +191,20 @@ class SceneBridge:
         self._state_version = 0
         self._persisted_version = 0
         self._abandoned_cleanup_tasks: set[asyncio.Task[None]] = set()
+        self._register_callbacks()
+
+    def _register_callbacks(self) -> None:
+        self._bus.on_change(
+            self._bus_change_callback,
+            coalesce_pushes=False,
+            want_device=self._want_device,
+        )
+        self._bus.on_reconnect(self._reconnect_callback)
+        self._mqtt.on_message(self._mqtt_message_callback)
+        self._callbacks_registered = True
 
     async def async_start(self) -> None:
-        """Register callbacks, seed history, publish catalogs, and accept commands."""
+        """Seed history, publish catalogs, and accept commands."""
         async with self._lock:
             if self._started:
                 return
@@ -205,16 +216,8 @@ class SceneBridge:
                 self._stopping = False
                 self._epoch += 1
                 self._startup_active = True
-                self._startup_buffered_execution = None
                 if not self._callbacks_registered:
-                    self._bus.on_change(
-                        self._bus_change_callback,
-                        coalesce_pushes=False,
-                        want_device=self._want_device,
-                    )
-                    self._bus.on_reconnect(self._reconnect_callback)
-                    self._mqtt.on_message(self._mqtt_message_callback)
-                    self._callbacks_registered = True
+                    self._register_callbacks()
                 startup_task = self._track_task(self._async_start_io(self._epoch))
                 self._start_task = startup_task
                 startup_task.add_done_callback(self._start_task_done)
