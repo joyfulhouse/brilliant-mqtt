@@ -468,6 +468,8 @@ class _SessionMqtt:
         self.publish_error: Exception | None = None
         self.subscribe_effects: list[BaseException | None] = []
         self.command_callbacks: list[Callable[[str, str], Awaitable[None]]] = []
+        self.reader_failure_latched = False
+        self.reader_failure_checks = 0
 
     def on_command(self, callback: Callable[[str, str], Awaitable[None]]) -> None:
         self.command_callbacks.append(callback)
@@ -483,6 +485,12 @@ class _SessionMqtt:
 
     async def disconnect(self) -> None:
         self.events.append("mqtt_disconnect")
+
+    def consume_reader_failure(self) -> bool:
+        self.reader_failure_checks += 1
+        failed = self.reader_failure_latched
+        self.reader_failure_latched = False
+        return failed
 
     async def publish(
         self,
@@ -865,6 +873,61 @@ class TestWriteTimeoutRecovery:
             )
 
         assert harness.bus.write_timeout_checks == 1
+
+
+class TestMqttReaderFailureRecovery:
+    async def test_latched_reader_failure_preempts_idle_bus_checks_on_next_tick(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        harness = _SessionHarness(monkeypatch)
+        harness.mqtt.reader_failure_latched = True
+        harness.bus.write_timeout_latched = True
+        settings = _hot_poll_settings(resync_seconds=3_600, hot_poll_seconds=2.0)
+        clock = _SessionLoopClock()
+        _install_session_loop_clock(monkeypatch, clock)
+
+        with pytest.raises(main_mod.MqttReaderDeadError):
+            await main_mod._run_session(settings, None, None)
+
+        assert harness.mqtt.reader_failure_checks == 1
+        assert harness.bus.write_timeout_checks == 0
+        assert harness.bus.get_all_calls == []
+        assert clock.now < settings.resync_seconds
+        assert harness.events[-2:] == ["bus_shutdown", "mqtt_disconnect"]
+
+    async def test_latched_reader_failure_uses_idle_tick_when_hot_poll_disabled(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        harness = _SessionHarness(monkeypatch)
+        harness.mqtt.reader_failure_latched = True
+        settings = _hot_poll_settings(resync_seconds=3_600, hot_poll_seconds=0.0)
+        clock = _SessionLoopClock()
+        _install_session_loop_clock(monkeypatch, clock)
+
+        with pytest.raises(main_mod.MqttReaderDeadError):
+            await main_mod._run_session(settings, None, None)
+
+        assert clock.sleeps == [main_mod._IDLE_TICK_S]
+        assert harness.mqtt.reader_failure_checks == 1
+        assert harness.bus.get_all_calls == []
+
+    async def test_unlatched_reader_does_not_interfere_with_cancellation_teardown(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        harness = _SessionHarness(monkeypatch)
+        settings = _hot_poll_settings(resync_seconds=3_600, hot_poll_seconds=2.0)
+        clock = _SessionLoopClock(cancel_on_sleep=2)
+        _install_session_loop_clock(monkeypatch, clock)
+
+        with pytest.raises(asyncio.CancelledError):
+            await main_mod._run_session(settings, None, None)
+
+        assert harness.mqtt.reader_failure_checks == 1
+        assert harness.bus.get_all_calls == [False]
+        assert harness.events[-2:] == ["bus_shutdown", "mqtt_disconnect"]
 
 
 class _LatchProbeObserver:

@@ -269,6 +269,7 @@ class AioMqttAdapter:
         ] = []
         self._topic_dispatcher = _TopicDispatcher(self._dispatch_inbound)
         self._reader_task: asyncio.Task[None] | None = None
+        self._reader_failure_consumed = False
         self._avail_topic = availability_topic(settings.panel)
         # A distinct broker ClientID is REQUIRED for any second connection on the
         # same panel: two clients sharing an id force the broker to disconnect the
@@ -525,7 +526,11 @@ class AioMqttAdapter:
         self._closing = False
         self._closed = True
 
-        if reader_error is not None:
+        # A reader failure already surfaced by consume_reader_failure() was
+        # logged there; re-reporting the same dead task here as a cancellation
+        # failure is misleading (it did not raise during cancellation) and
+        # doubles the traceback on every reader-crash rebuild (#89).
+        if reader_error is not None and not self._reader_failure_consumed:
             if self._checked_disconnect:
                 failed = True
                 logger.error("reader task failed during cancellation")
@@ -569,6 +574,34 @@ class AioMqttAdapter:
         return None
 
     # -- MqttClient Protocol -------------------------------------------------
+
+    def consume_reader_failure(self) -> bool:
+        """Return True exactly once if the inbound reader ended without this adapter
+        cancelling it."""
+        reader_task = self._reader_task
+        if reader_task is None or not reader_task.done() or self._reader_failure_consumed:
+            return False
+        if self._closing or self._closed:
+            # This adapter is tearing the reader down itself — an expected stop,
+            # not a failure, even when the task ends cancelled.
+            return False
+        self._reader_failure_consumed = True
+        try:
+            error: BaseException | None = reader_task.exception()
+        except asyncio.CancelledError:
+            # Cancelled while this adapter was live (not by our own teardown) —
+            # still an unexpected death that must rebuild the session (#89).
+            error = None
+        if error is not None:
+            logger.error(
+                "MQTT reader task failed",
+                exc_info=(type(error), error, error.__traceback__),
+            )
+        else:
+            # Graceful return or a cancellation not initiated by our teardown —
+            # no traceback to surface, but still an unexpected stop worth a line.
+            logger.warning("MQTT reader stopped unexpectedly without an exception")
+        return True
 
     async def publish(self, topic: str, payload: str, retain: bool = False, qos: int = 0) -> None:
         if qos not in (0, 1, 2):

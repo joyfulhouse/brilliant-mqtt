@@ -10,6 +10,7 @@ cancellation-shield semantics.
 from __future__ import annotations
 
 import asyncio
+import logging
 import ssl
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -19,6 +20,7 @@ import pytest
 from paho.mqtt.packettypes import PacketTypes
 from paho.mqtt.reasoncodes import ReasonCode
 
+from brilliant_mqtt import mqttio
 from brilliant_mqtt.config import Settings
 from brilliant_mqtt.mqttio import AioMqttAdapter, build_tls_context
 from brilliant_mqtt.protocols import CommandSubscribeError
@@ -27,6 +29,11 @@ from brilliant_mqtt.protocols import CommandSubscribeError
 async def _empty_messages() -> AsyncIterator[object]:
     return
     yield  # pragma: no cover - makes this an async generator, never reached
+
+
+async def _raising_messages(error: BaseException) -> AsyncIterator[object]:
+    raise error
+    yield  # pragma: no cover - unreachable; makes this an async generator
 
 
 @dataclass
@@ -157,6 +164,86 @@ async def test_disconnect_after_close_is_a_noop() -> None:
     await adapter.disconnect()  # already closed — must not re-run teardown
 
     assert fake.exit_calls == 1
+
+
+async def test_reader_disappearance_after_connect_is_consumed_before_clean_disconnect(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    fake = _FakeAiomqttClient()
+    adapter = _adapter(fake, publish_availability=False)
+    caplog.set_level(logging.WARNING, logger=mqttio.__name__)
+
+    await adapter.connect()
+    await _wait_until(lambda: adapter._reader_task is not None and adapter._reader_task.done())
+
+    assert adapter.consume_reader_failure() is True
+    assert adapter.consume_reader_failure() is False
+    # A graceful (no-exception) stop is still reported, mirroring the crash path.
+    assert "MQTT reader stopped unexpectedly without an exception" in caplog.text
+
+    await adapter.disconnect()
+
+    assert fake.enter_calls == 1
+    assert fake.exit_calls == 1
+    assert adapter._reader_task is None
+    assert adapter._closed is True
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        RuntimeError("reader crashed"),
+        aiomqtt.MqttError("broker gone"),
+    ],
+    ids=["runtime-error", "mqtt-error"],
+)
+async def test_reader_crash_after_connect_is_consumed_and_logged_before_clean_disconnect(
+    error: BaseException,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    fake = _FakeAiomqttClient(messages=_raising_messages(error))
+    adapter = _adapter(fake, publish_availability=False)
+    caplog.set_level(logging.ERROR, logger=mqttio.__name__)
+
+    await adapter.connect()
+    await _wait_until(lambda: adapter._reader_task is not None and adapter._reader_task.done())
+
+    assert adapter.consume_reader_failure() is True
+    assert adapter.consume_reader_failure() is False
+    assert "MQTT reader task failed" in caplog.text
+    assert str(error) in caplog.text
+
+    await adapter.disconnect()
+
+    # The dead reader is reported exactly once (by consume_reader_failure); the
+    # disconnect teardown must not re-log the same traceback as a cancellation.
+    assert caplog.text.count("MQTT reader task failed") == 1
+    assert "reader task raised during cancellation" not in caplog.text
+    assert caplog.text.count(str(error)) == 1
+    assert fake.enter_calls == 1
+    assert fake.exit_calls == 1
+    assert adapter._reader_task is None
+    assert adapter._closed is True
+
+
+async def test_reader_cancelled_while_live_is_reported_as_failure_before_clean_disconnect() -> None:
+    # A CancelledError surfacing from inside the client while this adapter is
+    # live (not our own teardown) is an unexpected death that must rebuild (#89).
+    fake = _FakeAiomqttClient(messages=_raising_messages(asyncio.CancelledError()))
+    adapter = _adapter(fake, publish_availability=False)
+
+    await adapter.connect()
+    await _wait_until(lambda: adapter._reader_task is not None and adapter._reader_task.done())
+
+    assert adapter.consume_reader_failure() is True
+    assert adapter.consume_reader_failure() is False
+
+    await adapter.disconnect()
+
+    assert fake.enter_calls == 1
+    assert fake.exit_calls == 1
+    assert adapter._reader_task is None
+    assert adapter._closed is True
 
 
 # -- checked_disconnect (preflight) vs best-effort (resident) ------------------
