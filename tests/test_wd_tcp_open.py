@@ -89,6 +89,48 @@ def test_closed_when_all_candidates_refuse() -> None:
     assert len(seen) == 2
 
 
+def test_blackholed_first_candidate_falls_through_to_next() -> None:
+    """A blackholed candidate (e.g. an IPv6 address returned first, whose upstream
+    isn't routed) that TIMES OUT must not starve a reachable later candidate: the
+    loop falls through within the one deadline, exactly as create_connection did
+    per-address. Regression guard for the IPv6-first home shape."""
+    seen: list[Any] = []
+
+    def connect(family: int, socktype: int, proto: int, sockaddr: Any, timeout: float) -> None:
+        seen.append(sockaddr)
+        if family == socket.AF_INET6:
+            raise TimeoutError("blackholed IPv6")  # first candidate hangs to its budget
+
+    clock = iter([0.0, 0.0, 0.0, 1.0])
+    result = probe.tcp_open(
+        "broker",
+        1883,
+        resolve=_resolve(_A2, _A1),  # AAAA (v6) before A (v4), as getaddrinfo orders
+        connect=connect,
+        monotonic=lambda: next(clock),
+    )
+    assert result is TcpProbe.OPEN
+    assert seen == [_A2[4], _A1[4]]  # BOTH attempted; v6 timed out, then v4 connected
+
+
+def test_all_candidates_timing_out_is_inconclusive_not_closed() -> None:
+    """If every candidate times out (none conclusively refuse), the verdict is
+    INCONCLUSIVE — a timeout is never proof the broker is down."""
+
+    def connect(family: int, socktype: int, proto: int, sockaddr: Any, timeout: float) -> None:
+        raise TimeoutError("blackholed")
+
+    clock = iter([0.0, 0.0, 0.0, 1.0])
+    result = probe.tcp_open(
+        "broker",
+        1883,
+        resolve=_resolve(_A1, _A2),
+        connect=connect,
+        monotonic=lambda: next(clock),
+    )
+    assert result is TcpProbe.INCONCLUSIVE
+
+
 def test_inconclusive_when_no_addresses() -> None:
     result = probe.tcp_open("broker", 1883, timeout=1.0, resolve=_resolve(), connect=_never_connect)
     assert result is TcpProbe.INCONCLUSIVE
@@ -138,9 +180,10 @@ def test_resolution_shares_the_total_deadline() -> None:
     assert seen_budget and seen_budget[0] == pytest.approx(2.5, abs=0.2)
 
 
-def test_budget_shrinks_across_candidates() -> None:
-    """Each connect gets the remaining budget, not a fresh full timeout, so
-    multiple resolved addresses cannot multiply the total wait."""
+def test_budget_is_a_fair_share_across_candidates() -> None:
+    """Each connect is capped at remaining/(candidates left), not the full
+    remaining budget, so one slow candidate cannot starve the rest — while the
+    sum stays within the one total deadline."""
     timeouts: list[float] = []
 
     def connect(family: int, socktype: int, proto: int, sockaddr: Any, timeout: float) -> None:
@@ -159,7 +202,8 @@ def test_budget_shrinks_across_candidates() -> None:
         monotonic=lambda: next(clock),
     )
     assert result is TcpProbe.OPEN
-    assert timeouts == [pytest.approx(0.5), pytest.approx(0.1)]  # shrinking remaining budget
+    # iter1: remaining 0.5 / 2 left = 0.25 ; iter2: remaining 0.1 / 1 left = 0.1
+    assert timeouts == [pytest.approx(0.25), pytest.approx(0.1)]
 
 
 def test_stops_when_total_deadline_exceeded_between_candidates() -> None:
@@ -214,7 +258,7 @@ def test_off_main_thread_shrinking_budget_holds() -> None:
     t.join(timeout=5.0)
     assert not t.is_alive()
     assert box["r"] is TcpProbe.OPEN
-    assert timeouts == [pytest.approx(0.5), pytest.approx(0.1)]  # shrinking budget, on a thread
+    assert timeouts == [pytest.approx(0.25), pytest.approx(0.1)]  # fair-share budget, on a thread
 
 
 # ---------------------------------------------------------------------------

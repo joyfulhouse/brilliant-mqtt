@@ -73,7 +73,10 @@ _RESOLVER_SCRIPT = (
     "import socket, sys\n"
     "try:\n"
     "    infos = socket.getaddrinfo("
-    "sys.argv[1], int(sys.argv[2]), socket.AF_UNSPEC, socket.SOCK_STREAM)\n"
+    "sys.argv[1], int(sys.argv[2]), socket.AF_UNSPEC, socket.SOCK_STREAM,\n"
+    # AI_ADDRCONFIG: only return AAAA when the panel has a real (non-loopback)
+    # IPv6 address, so an IPv4-only panel wastes no budget on IPv6 candidates.
+    "        flags=socket.AI_ADDRCONFIG)\n"
     "except OSError:\n"
     "    sys.exit(3)\n"
     "seen = set()\n"
@@ -195,20 +198,32 @@ def tcp_open(
     if infos is None:
         return TcpProbe.INCONCLUSIVE  # resolution could not complete in budget
     attempted = False
-    for family, socktype, proto, _canon, sockaddr in infos:
+    timed_out_any = False
+    total = len(infos)
+    for i, (family, socktype, proto, _canon, sockaddr) in enumerate(infos):
         remaining = deadline - monotonic()
         if remaining <= 0:
-            return TcpProbe.INCONCLUSIVE  # deadline passed mid-list; a partial probe
+            return TcpProbe.INCONCLUSIVE  # total deadline hit; a partial probe
         attempted = True
+        # Fair share of the remaining budget across the candidates not yet tried,
+        # so one slow/blackholed address (e.g. an IPv6 with no routed upstream,
+        # returned before the reachable IPv4) cannot starve the rest — while the
+        # sum of attempts stays within the one total deadline (contract 1).
+        per_candidate = remaining / (total - i)
         try:
-            connect(family, socktype, proto, sockaddr, remaining)
+            connect(family, socktype, proto, sockaddr, per_candidate)
             return TcpProbe.OPEN
         except TimeoutError:
-            return TcpProbe.INCONCLUSIVE  # ran out this candidate's budget
+            timed_out_any = True
+            continue  # slow/blackholed — try the next resolved address in budget
         except OSError as exc:
             if exc.errno in _LOCAL_ERRNOS:
-                # Local resource exhaustion (fd/buffer/memory), not a broker
-                # refusal — inconclusive, so we don't log a false broker outage.
+                # Local resource exhaustion (fd/buffer/memory) is host-wide, not a
+                # broker refusal — inconclusive, and retrying won't help.
                 return TcpProbe.INCONCLUSIVE
             continue  # refused/unreachable — try the next resolved address
-    return TcpProbe.CLOSED if attempted else TcpProbe.INCONCLUSIVE
+    if not attempted:
+        return TcpProbe.INCONCLUSIVE
+    # Every candidate was tried without connecting: a timed-out candidate makes
+    # this inconclusive (never proof of down); only all-conclusive refusals are CLOSED.
+    return TcpProbe.INCONCLUSIVE if timed_out_any else TcpProbe.CLOSED
