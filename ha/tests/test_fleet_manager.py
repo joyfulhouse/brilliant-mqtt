@@ -5631,3 +5631,25 @@ async def test_broker_reconnect_reassesses_every_panel(hass: HomeAssistant) -> N
             kitchen_reassess.assert_called_once_with()
 
         await fleet.async_shutdown()
+
+
+async def test_broker_status_none_to_true_does_not_reassess(hass: HomeAssistant) -> None:
+    """#95 finding 6: the INITIAL None→True broker status (the flag was never known-down,
+    e.g. mqtt.is_connected at setup) must NOT reassess panels — only a genuine down→up
+    transition (previously_available is False) does. Mutation-proof for the None→True case."""
+    entry = _fleet_entry(_panel("office", "SHA256:office", subentry_id="panel-office"))
+    fleet = FleetManager(hass, entry)
+    panel = Mock()
+    fleet._panels["panel-office"] = panel
+    assert fleet.broker_available is None  # fresh: broker state never observed yet
+
+    with (
+        patch("custom_components.brilliant_mqtt.fleet_manager.ir.async_create_issue"),
+        patch("custom_components.brilliant_mqtt.fleet_manager.ir.async_delete_issue"),
+    ):
+        fleet._async_broker_status(True)  # initial None→True: NOT a recovery from a known outage
+        panel.async_broker_reconnected.assert_not_called()
+
+        fleet._async_broker_status(False)  # a real outage (True→False)
+        fleet._async_broker_status(True)  # down→up transition → reassess
+        panel.async_broker_reconnected.assert_called_once_with()

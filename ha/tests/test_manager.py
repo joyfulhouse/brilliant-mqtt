@@ -1209,7 +1209,9 @@ async def test_queued_auto_repair_skips_when_panel_recovers_behind_lock(
 
     assert not fake_shell.commands  # obsolete repair skipped: no connect, no config write
     assert manager._recovery_cancel is None  # and no recovery timer for a skipped repair
-    assert _types(events) == ["repair_started"]  # started fired pre-lock; no succeeded/failed
+    # The panel recovered on its own → close the started→succeeded contract (#95, finding 3).
+    assert _types(events) == ["repair_started", "repair_succeeded"]
+    assert manager.problem is False
     await manager.async_shutdown()
 
 
@@ -1258,22 +1260,151 @@ async def test_recovery_timeout_defers_while_broker_down(
     assert "needs_attention" not in _types(events)
 
 
+async def test_deferred_recovery_reconnect_then_online_reports_success(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """#95 finding 1: a recovery verdict deferred during a broker outage is PRESERVED as a
+    recovery window — after the broker returns and an 'online' LWT arrives, repair_succeeded
+    still fires (the started→succeeded contract is not lost to a stale grace timer)."""
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    broker = SimpleNamespace(available=True)
+    manager = _broker_gated_manager(hass, entry, broker)
+    manager.availability = "offline"
+    events = _capture_events(hass)
+    shell = FakeShell()
+    await _repair_and_arm_recovery(manager, shell)  # broker up: arms the recovery timer
+
+    broker.available = False  # broker drops before the window elapses
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
+        async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=61))
+        await hass.async_block_till_done()
+    assert manager._recovery_deferred is True  # verdict suspended, not discarded
+
+    broker.available = True
+    manager.async_broker_reconnected()  # re-arms the RECOVERY window (not grace)
+    assert manager._recovery_cancel is not None
+    assert manager._grace_cancel is None
+
+    await manager._on_availability(_availability_message("online"))
+    await manager.async_shutdown()
+
+    assert "repair_succeeded" in _types(events)
+    assert manager._recovery_deferred is False
+    assert manager.problem is False
+
+
+async def test_deferred_recovery_reconnect_still_offline_reports_did_not_come_back(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """#95 finding 1: a deferred recovery verdict, once the broker returns and the panel is
+    STILL offline, escalates the correct 'did not come back' repair_failed with the repair
+    origin — NOT a stale 'offline again within the repair cooldown' grace escalation."""
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    broker = SimpleNamespace(available=True)
+    manager = _broker_gated_manager(hass, entry, broker)
+    manager.availability = "offline"
+    events = _capture_events(hass)
+    shell = FakeShell()
+    await _repair_and_arm_recovery(manager, shell)  # arms recovery, origin=repair
+
+    broker.available = False
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
+        async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=61))  # defer
+        await hass.async_block_till_done()
+
+        broker.available = True
+        manager.async_broker_reconnected()  # re-arm RECOVERY (60 s), not grace
+        async_fire_time_changed(hass, dt_util.utcnow() + timedelta(minutes=11))  # window elapses
+        await hass.async_block_till_done()
+    await manager.async_shutdown()
+
+    assert manager.problem_reason is not None
+    assert manager.problem_reason.startswith("bridge did not come back")
+    assert "within the repair cooldown" not in manager.problem_reason
+    assert "repair_failed" in _types(events)
+
+
+async def test_auto_repair_skips_when_panel_recovers_during_connect(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """#95 finding 2: the post-lock revalidation must run again immediately BEFORE the first
+    mutation — a panel that comes back online DURING the connect/inspect/stage awaits must
+    not be mutated. The panel recovered, so the started→succeeded contract is closed."""
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    broker = SimpleNamespace(available=True)
+    manager = _broker_gated_manager(hass, entry, broker)
+    manager.availability = "offline"
+    events = _capture_events(hass)
+    installed = RunResult(
+        0, "unit=1\nenv=1\nenabled=1\nactive=1\nsunit=1\nsenv=1\npayload=1\n0.2.0\n", ""
+    )
+    gate = asyncio.Event()
+    shell = FakeShell(responses={panel_ops.INSPECT_COMMAND: installed}, connect_gate=gate)
+
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
+        repair = asyncio.create_task(manager.async_repair(trigger="auto"))
+        await shell.connect_entered.wait()  # still offline at the pre-connect recheck
+        manager.availability = "online"  # recovers DURING the connect await
+        gate.set()
+        await repair
+        await hass.async_block_till_done()
+
+    assert "systemctl enable --now brilliant-mqtt" not in shell.commands  # not mutated
+    assert manager._recovery_cancel is None  # clean no-op: no recovery timer
+    assert _types(events) == ["repair_started", "repair_succeeded"]  # recovered → contract closed
+    await manager.async_shutdown()
+
+
+async def test_grace_expiry_with_none_availability_is_not_broker_deferred(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """#95 finding 4: a grace expiry with UNKNOWN availability (None) while the broker is down
+    must NOT enter the broker-defer state — _arm_offline_grace can only re-arm an OFFLINE
+    panel, so a None defer would be un-reassessable. None falls through to auto-repair (which
+    then skips at its own broker gate), never getting stuck."""
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    broker = SimpleNamespace(available=False)
+    manager = _broker_gated_manager(hass, entry, broker)
+    manager.availability = None  # e.g. an undecodable LWT left it unknown
+
+    with patch.object(manager, "async_repair", AsyncMock()) as repair:
+        await manager._grace_expired(dt_util.utcnow())
+        await hass.async_block_till_done()
+
+    repair.assert_awaited_once_with(trigger="auto")  # fell through, not broker-deferred
+    await manager.async_shutdown()
+
+
 async def test_queued_auto_repairs_skip_only_recovered_panels(
     hass: HomeAssistant,
     payload_dir: Path,
 ) -> None:
     """#95 criterion 4: several auto-repairs queued behind the ONE shared fleet SSH lock
-    each re-decide at their own acquisition time — panels that recovered while queued (at
-    staggered moments) skip with no obsolete SSH/config writes and no recovery timer, while
-    a still-offline panel repairs exactly once (no duplicate work)."""
+    each re-decide at their own acquisition time, and recovery is honoured whenever it lands:
+    'kitchen' recovers while queued (caught by the pre-connect recheck — never connects),
+    'office' recovers MID-CHAIN from inside its own connect() (caught by the pre-mutation
+    recheck — connects but never enables), and still-offline 'bedroom' repairs exactly once."""
     lock = asyncio.Lock()
     broker = SimpleNamespace(available=True)
     installed = RunResult(
         0, "unit=1\nenv=1\nenabled=1\nactive=1\nsunit=1\nsenv=1\npayload=1\n0.2.0\n", ""
     )
+    office_gate = asyncio.Event()
     hosts = {"office": "192.168.1.10", "kitchen": "192.168.1.11", "bedroom": "192.168.1.12"}
     shells = {
-        host: FakeShell(responses={panel_ops.INSPECT_COMMAND: installed}) for host in hosts.values()
+        host: FakeShell(
+            responses={panel_ops.INSPECT_COMMAND: installed},
+            connect_gate=office_gate if slug == "office" else None,
+        )
+        for slug, host in hosts.items()
     }
     managers: dict[str, PanelManager] = {}
     for slug, host in hosts.items():
@@ -1296,22 +1427,33 @@ async def test_queued_auto_repairs_skip_only_recovered_panels(
         ]
         await asyncio.sleep(0)  # every queued repair reaches the shared-lock await
 
-        # A subset recovers while queued, at staggered moments (different times):
-        managers["kitchen"].availability = "online"
-        await asyncio.sleep(0)
-        managers["bedroom"].availability = "online"
-
+        managers["kitchen"].availability = "online"  # recovered while queued (pre-connect)
         lock.release()
+
+        # 'office' (FIFO head) acquires the lock and is now blocked INSIDE connect(); flip it
+        # online mid-chain so only the pre-mutation recheck can catch it, then let it proceed.
+        await shells[hosts["office"]].connect_entered.wait()
+        managers["office"].availability = "online"
+        office_gate.set()
+
         await asyncio.gather(*tasks)
         await hass.async_block_till_done()
 
-    # 'office' stayed offline: its queued repair ran exactly once — no duplicate work.
-    assert shells[hosts["office"]].commands.count("systemctl enable --now brilliant-mqtt") == 1
-    assert managers["office"]._recovery_cancel is not None  # recovery armed for the real repair
-    # 'kitchen' + 'bedroom' recovered while queued: skipped entirely, no obsolete SSH/config.
-    for slug in ("kitchen", "bedroom"):
-        assert not shells[hosts[slug]].commands
-        assert managers[slug]._recovery_cancel is None
+    enable = "systemctl enable --now brilliant-mqtt"
+    # 'office' connected (mid-chain recovery) but the pre-mutation recheck skipped the enable.
+    assert shells[hosts["office"]].connect_count == 1
+    assert enable not in shells[hosts["office"]].commands
+    assert managers["office"]._recovery_cancel is None
+    # 'kitchen' recovered before its turn: the pre-connect recheck skipped it — never connected.
+    assert shells[hosts["kitchen"]].connect_count == 0
+    assert not shells[hosts["kitchen"]].commands
+    assert managers["kitchen"]._recovery_cancel is None
+    # still-offline 'bedroom' repaired exactly once — no duplicate work.
+    assert shells[hosts["bedroom"]].commands.count(enable) == 1
+    assert managers["bedroom"]._recovery_cancel is not None
+
+    for manager in managers.values():
+        await manager.async_shutdown()
 
     for manager in managers.values():
         await manager.async_shutdown()
@@ -1756,6 +1898,11 @@ async def test_shutdown_during_inflight_repair_leaks_no_timer(
     traverses the SUCCESS path to the recovery-timer schedule site. Without it,
     _unit_contents() raises FileNotFoundError, the C2 step handler returns first, and
     the success-site guard is never reached (the bug the re-review caught).
+
+    Uses a MANUAL trigger ("button"): an auto trigger now short-circuits at the
+    pre-mutation recheck (#95 finding 2) and never reaches the success site, whereas
+    a manual repair has no such recheck, so the success-site guard is its ONLY
+    shutdown protection — exactly what this test exercises.
     """
     import asyncio
 
@@ -1767,7 +1914,7 @@ async def test_shutdown_during_inflight_repair_leaks_no_timer(
     with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
         manager = _legacy_manager(hass, entry)
 
-        repair = hass.async_create_task(manager.async_repair(trigger="auto"))
+        repair = hass.async_create_task(manager.async_repair(trigger="button"))
         # Deterministically wait until the repair is wedged inside connect() (gated)
         # — at which point _repairing is already True and it holds the ssh_lock.
         await shell.connect_entered.wait()
