@@ -3,16 +3,21 @@ attempt, returning a tri-state so a timed-out diagnostic is never mistaken for
 proof the broker is down.
 
 DNS is bounded by resolving in a killed-and-reaped child (a Python SIGALRM
-cannot abort glibc's in-C resolver), so these tests inject the resolve/connect
-seams for deterministic logic coverage and drive `_resolve_bounded` with an
-injected child runner — no real DNS, no real network. The real killed-and-reaped
-child behaviour is proven in test_wd_bounded.py."""
+cannot abort glibc's in-C resolver). Most tests inject the resolve/connect seams
+for deterministic logic coverage; the tests at the end exercise the REAL
+_RESOLVER_SCRIPT child end-to-end (localhost via /etc/hosts, a poisoned
+PYTHONPATH, and a hung child that must be killed) so its syntax, argv, exit
+codes and isolation are actually verified — no real network is required."""
 
 from __future__ import annotations
 
+import errno
+import os
 import socket
 import sys
 import threading
+import time
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -22,6 +27,10 @@ from brilliant_wifi_watchdog.probe import TcpProbe
 
 _A1 = (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.1", 1883))
 _A2 = (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("::1", 1883, 0, 0))
+
+_LINUX = pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="/proc cmdline scan is Linux-only"
+)
 
 
 def _resolve(*infos: tuple[Any, ...]) -> probe._Resolve:
@@ -263,6 +272,7 @@ def test_resolve_hostname_success_parses_ips_via_python_child() -> None:
     assert infos is not None
     assert any(ai[4][0] == "127.0.0.1" for ai in infos)  # child IP rebuilt into an addrinfo
     assert seen["argv"][0] == sys.executable  # dependency-free child (no assumed tool)
+    assert "-I" in seen["argv"] and "-S" in seen["argv"]  # isolated, no site
     assert seen["timeout"] == 2.0  # the child gets the full remaining budget
     assert seen["capture"] is True
 
@@ -272,3 +282,98 @@ def test_resolve_hostname_no_budget_skips_child() -> None:
         raise AssertionError("no budget: the resolver child must not be spawned")
 
     assert probe._resolve_bounded("broker.local", 1883, 0.0, run=run) is None
+
+
+# ---------------------------------------------------------------------------
+# The optional diagnostic must NEVER crash the poll loop, and a local resource
+# failure must not be logged as a broker outage.
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_child_fork_failure_returns_none() -> None:
+    """A fork/exec failure (EAGAIN/ENOMEM under MemoryMax/pids pressure, or a
+    missing interpreter) must be swallowed as INCONCLUSIVE, not propagate and kill
+    the watchdog (which would reset the in-memory escalation ladder)."""
+
+    def run(*args: Any, **kwargs: Any) -> bounded.Completed:
+        raise OSError(errno.ENOMEM, "Cannot allocate memory")
+
+    assert probe._resolve_bounded("broker.local", 1883, 1.0, run=run) is None
+
+
+def test_tcp_open_inconclusive_when_resolver_raises() -> None:
+    def resolve(host: str, port: int, budget: float) -> list[tuple[Any, ...]] | None:
+        raise OSError(errno.ENOMEM, "Cannot allocate memory")
+
+    result = probe.tcp_open("broker", 1883, timeout=1.0, resolve=resolve, connect=_never_connect)
+    assert result is TcpProbe.INCONCLUSIVE  # diagnostic failure never crashes the loop
+
+
+def test_local_socket_exhaustion_is_inconclusive_not_closed() -> None:
+    """A local fd/buffer/memory exhaustion on connect is not a broker refusal, so
+    it reads INCONCLUSIVE — not CLOSED, which would log a false broker outage."""
+
+    def connect(family: int, socktype: int, proto: int, sockaddr: Any, timeout: float) -> None:
+        raise OSError(errno.EMFILE, "Too many open files")
+
+    result = probe.tcp_open(
+        "broker", 1883, timeout=1.0, resolve=_resolve(_A1, _A2), connect=connect
+    )
+    assert result is TcpProbe.INCONCLUSIVE
+
+
+# ---------------------------------------------------------------------------
+# The REAL _RESOLVER_SCRIPT child (no injected run) — proves its syntax, argv,
+# exit codes, stdout format, and isolation actually work end-to-end.
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_localhost_with_real_child() -> None:
+    """Default run spawns the real child, which resolves 'localhost' via
+    /etc/hosts (no network) — exercising the actual _RESOLVER_SCRIPT."""
+    infos = probe._resolve_bounded("localhost", 1883, 5.0)
+    assert infos is not None
+    assert any(ai[4][0] == "127.0.0.1" for ai in infos)
+
+
+def test_resolver_child_ignores_poisoned_pythonpath(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """-I -S makes the child ignore PYTHONPATH/site, so a stray module on the
+    panel's path cannot corrupt or block the dependency-free probe."""
+    (tmp_path / "socket.py").write_text("raise RuntimeError('poisoned socket module')\n")
+    (tmp_path / "sitecustomize.py").write_text("raise RuntimeError('poisoned site')\n")
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path))
+    infos = probe._resolve_bounded("localhost", 1883, 5.0)  # real child, isolated
+    assert infos is not None
+    assert any(ai[4][0] == "127.0.0.1" for ai in infos)
+
+
+def _cmdline_present(marker: str) -> bool:
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/cmdline", "rb") as f:
+                cmd = f.read()
+        except OSError:
+            continue
+        if marker.encode() in cmd:
+            return True
+    return False
+
+
+@_LINUX
+def test_tcp_open_bounded_when_real_resolver_child_hangs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A real resolver child that hangs is killed and reaped: tcp_open returns
+    INCONCLUSIVE within budget and no resolver process lingers."""
+    monkeypatch.setattr(probe, "_RESOLVER_SCRIPT", "import time; time.sleep(30)")
+    start = time.monotonic()
+    result = probe.tcp_open("stuck.example.test", 1883, timeout=0.5, connect=_never_connect)
+    elapsed = time.monotonic() - start
+    assert result is TcpProbe.INCONCLUSIVE
+    assert elapsed < 5.0  # bounded near 0.5s, not the 30s sleep
+    deadline = time.monotonic() + 5.0
+    while _cmdline_present("stuck.example.test") and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert not _cmdline_present("stuck.example.test")  # no lingering resolver child

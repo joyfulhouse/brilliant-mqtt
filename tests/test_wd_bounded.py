@@ -4,9 +4,13 @@ reported as a bounded failure so the watchdog loop keeps running."""
 
 from __future__ import annotations
 
+import logging
+import os
+import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -108,3 +112,83 @@ def test_run_bounded_sigkills_child_that_ignores_sigterm() -> None:
     elapsed = time.monotonic() - start
     assert result.timed_out is True
     assert elapsed < 10.0
+
+
+# ---------------------------------------------------------------------------
+# Cleanup edge cases with a fake process (deterministic, no real child):
+# a D-state child that survives SIGKILL, and a kill() that races a reap.
+# ---------------------------------------------------------------------------
+
+
+def _raise_lookup(*args: Any, **kwargs: Any) -> int:
+    raise ProcessLookupError
+
+
+def test_run_bounded_logs_and_bounds_when_child_survives_sigkill(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A child stuck in uninterruptible (D-state) kernel sleep survives even
+    SIGKILL until its syscall returns. Rather than a silent lingering process, the
+    reap timeout is logged; the call still reports timed_out."""
+
+    class FakeProc:
+        pid = 4321
+        stdout = None
+
+        def communicate(
+            self, input: str | None = None, timeout: float | None = None
+        ) -> tuple[str, str]:
+            raise subprocess.TimeoutExpired(cmd="x", timeout=timeout or 0.0)
+
+        def kill(self) -> None:
+            pass
+
+        def wait(self, timeout: float | None = None) -> int:
+            raise subprocess.TimeoutExpired(cmd="x", timeout=timeout or 0.0)  # D-state: never dies
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: FakeProc())
+    monkeypatch.setattr(os, "getpgid", lambda pid: pid)
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: None)
+    with caplog.at_level(logging.WARNING, logger="brilliant_wifi_watchdog.bounded"):
+        result = bounded.run_bounded(["x"], timeout=0.01)
+    assert result.timed_out is True
+    assert result.returncode == bounded.TIMEOUT_RC
+    assert any("D-state" in r.getMessage() for r in caplog.records)
+
+
+def test_run_bounded_reaps_and_closes_even_if_kill_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """If the group signal fails and the fallback proc.kill() itself raises
+    (child already reaped), cleanup must still wait() and close the pipe — no fd
+    leak, no exception out of run_bounded."""
+    closed: list[bool] = []
+
+    class FakeStdout:
+        def close(self) -> None:
+            closed.append(True)
+
+    class FakeProc:
+        pid = 4321
+
+        def __init__(self) -> None:
+            self.stdout = FakeStdout()
+            self.waited = False
+
+        def communicate(
+            self, input: str | None = None, timeout: float | None = None
+        ) -> tuple[str, str]:
+            raise subprocess.TimeoutExpired(cmd="x", timeout=timeout or 0.0)
+
+        def kill(self) -> None:
+            raise ProcessLookupError  # already reaped
+
+        def wait(self, timeout: float | None = None) -> int:
+            self.waited = True
+            return 0
+
+    fp = FakeProc()
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: fp)
+    monkeypatch.setattr(os, "getpgid", _raise_lookup)  # force the fallback kill() path
+    result = bounded.run_bounded(["x"], timeout=0.01, capture=True)
+    assert result.timed_out is True
+    assert fp.waited is True  # reaped despite kill() raising
+    assert closed == [True]  # stdout closed — no fd leak

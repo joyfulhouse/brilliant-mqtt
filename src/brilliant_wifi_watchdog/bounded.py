@@ -17,16 +17,19 @@ self-contained on the panel interpreter (Python 3.10) with only this package on
 
 from __future__ import annotations
 
+import logging
 import os
 import signal
 import subprocess
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+_LOG = logging.getLogger(__name__)
+
 # Exit status reported for a timed-out child, mirroring the shell's timeout(1).
 TIMEOUT_RC = 124
-# Bound on reaping a SIGKILLed group; it dies promptly, so this only guards
-# against the watchdog ever blocking here — never reached in practice.
+# Bound on reaping a SIGKILLed group; it dies promptly, so this is only reached
+# if the child sits in uninterruptible (D-state) kernel sleep — logged, not silent.
 _REAP_TIMEOUT = 5.0
 
 
@@ -51,12 +54,19 @@ def _kill_and_reap(proc: subprocess.Popen[str]) -> None:
     """
     try:
         os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-    except (ProcessLookupError, PermissionError, OSError):
-        proc.kill()  # child already gone, or no group — at least kill the child
+    except OSError:  # no group, or already gone — at least kill the child
+        try:
+            proc.kill()
+        except OSError:
+            pass  # child already reaped; wait()+close() below must still run
     try:
         proc.wait(timeout=_REAP_TIMEOUT)
-    except subprocess.TimeoutExpired:  # pragma: no cover - unreachable after SIGKILL
-        pass
+    except subprocess.TimeoutExpired:
+        # A child in uninterruptible (D-state) kernel sleep — plausible for a
+        # probe against a wedged Wi-Fi driver — survives even SIGKILL until the
+        # syscall returns. Surface it (one per occurrence) rather than leaving a
+        # process to linger invisibly; the call still reports timed_out.
+        _LOG.warning("child pid %s did not die after SIGKILL (D-state?)", proc.pid)
     finally:
         if proc.stdout is not None:
             proc.stdout.close()

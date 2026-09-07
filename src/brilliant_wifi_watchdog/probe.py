@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import enum
+import errno
 import socket
 import sys
 import time
@@ -10,6 +11,11 @@ from collections.abc import Callable
 from typing import Any
 
 from . import bounded
+
+# errnos that mean a LOCAL resource ran out (fd/buffer/memory exhaustion), not a
+# broker refusal — a connect failing with one of these proves nothing about the
+# broker, so it must read as INCONCLUSIVE rather than a conclusive "down".
+_LOCAL_ERRNOS = frozenset({errno.EMFILE, errno.ENFILE, errno.ENOBUFS, errno.ENOMEM})
 
 # Wall-clock bound for a single probe child. `ip route`/`ping` are local and
 # fast; the bound guards the pathological case where the child never returns
@@ -116,9 +122,20 @@ def _resolve_bounded(
         return numeric
     if budget <= 0:
         return None
-    result = run(
-        [sys.executable, "-c", _RESOLVER_SCRIPT, host, str(port)], timeout=budget, capture=True
-    )
+    try:
+        # -I -S: isolated, no site — the child ignores the panel's PYTHONPATH,
+        # cwd, PYTHON* env and any .pth/sitecustomize, so a stray module cannot
+        # corrupt this dependency-free probe (and startup is cheaper under CPUQuota).
+        result = run(
+            [sys.executable, "-I", "-S", "-c", _RESOLVER_SCRIPT, host, str(port)],
+            timeout=budget,
+            capture=True,
+        )
+    except OSError:
+        # Fork/exec failure (EAGAIN/ENOMEM under MemoryMax/pids pressure, or a
+        # missing/unexecutable interpreter). The optional diagnostic must never
+        # crash the poll loop — treat it as inconclusive.
+        return None
     if result.timed_out or result.returncode != 0:
         return None  # stuck DNS child killed+reaped, or resolution failed
     infos: list[_AddrInfo] = []
@@ -169,7 +186,12 @@ def tcp_open(
     if timeout <= 0:
         return TcpProbe.INCONCLUSIVE
     deadline = monotonic() + timeout
-    infos = resolve(host, port, deadline - monotonic())
+    try:
+        infos = resolve(host, port, deadline - monotonic())
+    except OSError:
+        # The optional diagnostic must never crash the poll loop; a resolver
+        # failure is never proof the broker is down.
+        return TcpProbe.INCONCLUSIVE
     if infos is None:
         return TcpProbe.INCONCLUSIVE  # resolution could not complete in budget
     attempted = False
@@ -183,6 +205,10 @@ def tcp_open(
             return TcpProbe.OPEN
         except TimeoutError:
             return TcpProbe.INCONCLUSIVE  # ran out this candidate's budget
-        except OSError:
+        except OSError as exc:
+            if exc.errno in _LOCAL_ERRNOS:
+                # Local resource exhaustion (fd/buffer/memory), not a broker
+                # refusal — inconclusive, so we don't log a false broker outage.
+                return TcpProbe.INCONCLUSIVE
             continue  # refused/unreachable — try the next resolved address
     return TcpProbe.CLOSED if attempted else TcpProbe.INCONCLUSIVE
