@@ -87,16 +87,16 @@ class RebootGuard:
             return None
         return boot_id.strip() if boot_id else None
 
-    def _confirmed_stamps(self, now: float) -> tuple[list[float], str | None, float | None]:
+    def _confirmed_stamps(self, now: float) -> tuple[list[float], float | None]:
         stamps = [t for t in self._load() if now - t <= self._p.window]
         request = self._load_request()
         boot_id = self._boot_id()
         if request is None:
-            return stamps, boot_id, None
+            return stamps, None
 
         request_boot_id, requested_at = request
         if boot_id is not None and request_boot_id == boot_id:
-            return stamps, boot_id, requested_at
+            return stamps, requested_at
 
         # A changed boot confirms the request worked. If boot identity is
         # unavailable, counting it is the conservative fail-safe.
@@ -104,7 +104,7 @@ class RebootGuard:
             stamps.append(requested_at)
         self._save(stamps)
         self._clear_request()
-        return stamps, boot_id, None
+        return stamps, None
 
     def _history_allows(self, stamps: list[float], now: float) -> bool:
         if stamps and now - max(stamps) < self._p.cooldown:
@@ -112,11 +112,11 @@ class RebootGuard:
         return len(stamps) < self._p.cap
 
     def can_reboot(self, now: float) -> bool:
-        stamps, _boot_id, _requested_at = self._confirmed_stamps(now)
+        stamps, _ = self._confirmed_stamps(now)
         return self._history_allows(stamps, now)
 
     def can_request(self, now: float) -> bool:
-        stamps, _boot_id, requested_at = self._confirmed_stamps(now)
+        stamps, requested_at = self._confirmed_stamps(now)
         if not self._history_allows(stamps, now):
             return False
         return requested_at is None or now - requested_at >= self._p.cooldown
