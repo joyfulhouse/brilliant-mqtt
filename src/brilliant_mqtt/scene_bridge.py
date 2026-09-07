@@ -1214,15 +1214,22 @@ class SceneBridge:
         self._clear_capacity_if_room()
         return True
 
-    def _prune_events(self) -> None:
+    def _prune_events(self) -> bool:
+        changed = False
+        for result_key, result in list(self._results.items()):
+            if result.delivered and result.event_key is not None:
+                self._results[result_key] = replace(result, event_key=None)
+                changed = True
         dependencies = {
             result.event_key
             for result in self._results.values()
             if not result.delivered and result.event_key is not None
         }
-        for key, event in list(self._events.items()):
-            if event.delivered and key not in dependencies:
-                self._events.pop(key)
+        for event_key, event in list(self._events.items()):
+            if event.delivered and event_key not in dependencies:
+                self._events.pop(event_key)
+                changed = True
+        return changed
 
     def _within_capacity(self) -> bool:
         return (
@@ -1289,11 +1296,17 @@ class SceneBridge:
                 continue
             if not await self._async_persist_state(*snapshot, epoch):
                 return
+            pruned_snapshot: tuple[int, SceneState] | None = None
             async with self._lock:
                 if self._stopping or epoch != self._epoch:
                     return
-                self._prune_events()
+                if self._prune_events():
+                    pruned_snapshot = self._capture_state()
                 self._clear_capacity_if_room()
+            if pruned_snapshot is not None and not await self._async_persist_state(
+                *pruned_snapshot, epoch
+            ):
+                return
             await self._async_health_status("scene")
             await self._async_health_status("mode")
 
