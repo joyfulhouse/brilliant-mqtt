@@ -1455,9 +1455,6 @@ async def test_queued_auto_repairs_skip_only_recovered_panels(
     for manager in managers.values():
         await manager.async_shutdown()
 
-    for manager in managers.values():
-        await manager.async_shutdown()
-
 
 async def test_broker_reconnect_does_not_duplicate_a_pending_grace_timer(
     hass: HomeAssistant,
