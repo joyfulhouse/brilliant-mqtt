@@ -195,6 +195,7 @@ async def _run_session(
 
         def _beat() -> None:
             write_heartbeat(settings.bus_heartbeat_file, time.time)
+            write_phase(settings.bus_phase_file, "bus", bus_read_succeeded=True)
 
         # Bridges register their bus/mqtt callbacks in __init__, BEFORE any I/O
         # starts — so no early change/command event is missed.
@@ -292,9 +293,9 @@ async def _run_session(
         # the phase at "pre_bus".
         write_phase(settings.bus_phase_file, "bus")
         await bus.start()
+        await panel_bridge.reconcile()
         if scene_bridge is not None:
             await scene_bridge.async_start()
-        await panel_bridge.reconcile()
 
         tick = settings.hot_poll_seconds if settings.hot_poll_seconds > 0 else _IDLE_TICK_S
         next_resync = time.monotonic() + settings.resync_seconds

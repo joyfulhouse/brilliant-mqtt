@@ -1,9 +1,13 @@
-"""Watchdog health reads — fail closed and never raise. ``heartbeat_age`` is a
-pure single read; ``bus_confirmed`` also checks that the writer is still alive."""
+"""Watchdog health reads: fail closed and never raise."""
 
 from __future__ import annotations
 
+import fcntl
 import os
+import time
+from collections.abc import Callable
+
+from brilliant_mqtt.heartbeat import PhaseRecord, current_boot_id, process_generation
 
 
 def _writer_alive(pid: int) -> bool:
@@ -40,36 +44,61 @@ def _writer_alive(pid: int) -> bool:
 
 
 def bus_confirmed(path: str) -> bool:
-    """Whether the bridge reached the local-bus phase AND the writer that
-    stamped it is still alive.
+    """Whether a live, generation-matched writer holds the bus-phase lease."""
+    record, leased = _read_phase_record_and_lease(path)
+    return bool(
+        record is not None
+        and record.phase == "bus"
+        and record.boot_id == current_boot_id()
+        and _writer_alive(record.pid)
+        and process_generation(record.pid) == record.process_generation
+        and leased
+    )
 
-    The bridge writes ``"<phase> <pid>"`` (see
-    :func:`brilliant_mqtt.heartbeat.write_phase`); this reads as confirmed only
-    when the phase token is exactly ``bus`` and that pid is a live process. So a
-    stale ``bus`` marker left in tmpfs by a dead or reverted writer — which
-    survives a service restart and is only cleared when a reboot wipes ``/run``
-    — reads as unconfirmed rather than as a live confirmed bus.
 
-    Fails closed and never raises: a missing/unreadable file (OSError), bytes
-    that are not valid UTF-8 (UnicodeError), a wrong/absent phase token, a
-    non-integer or out-of-range pid, or a dead writer all read as unconfirmed.
-
-    The pid liveness check is best-effort (PID reuse could make a recycled pid
-    read as alive); the ``pre_bus`` re-stamp at session entry is the real guard
-    against a stale marker.
-    """
+def _read_phase_record_and_lease(path: str) -> tuple[PhaseRecord | None, bool]:
     try:
-        with open(path, encoding="utf-8") as f:
-            parts = f.read().split()
+        with open(path, encoding="utf-8") as stream:
+            try:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError:
+                leased = True
+            except OSError:
+                return None, False
+            else:
+                leased = False
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+            return PhaseRecord.parse(stream.read()), leased
     except (OSError, UnicodeError):
-        return False
-    if len(parts) != 2 or parts[0] != "bus":
-        return False
-    try:
-        pid = int(parts[1])
-    except ValueError:
-        return False
-    return _writer_alive(pid)
+        return None, False
+
+
+def bus_failure_age(
+    path: str,
+    *,
+    now: float | None = None,
+    monotonic_clock: Callable[[], float] = time.monotonic,
+) -> float | None:
+    """Age of attributable local-bus failure, including bounded crash evidence."""
+    sampled_at = monotonic_clock() if now is None else now
+    record, leased = _read_phase_record_and_lease(path)
+    if (
+        record is None
+        or record.phase != "bus"
+        or record.boot_id != current_boot_id()
+        or record.failure_started_at is None
+        or record.bus_updated_at is None
+        or record.retain_until is None
+        or record.failure_started_at > sampled_at
+        or record.bus_updated_at > sampled_at
+    ):
+        return None
+    if _writer_alive(record.pid):
+        if process_generation(record.pid) != record.process_generation or not leased:
+            return None
+    elif leased or sampled_at > record.retain_until:
+        return None
+    return sampled_at - record.failure_started_at
 
 
 def heartbeat_age(path: str, *, now: float, started_at: float) -> float:
