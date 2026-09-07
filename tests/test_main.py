@@ -384,6 +384,48 @@ class TestSupervisorBackoff:
 
         assert sleeps == [5]
 
+    async def test_sustained_transport_overload_paces_rebuilds_by_backoff(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A sustained flood raises MqttTransportOverloadError every session; the
+        supervisor gates each rebuild behind the same outer _BACKOFF_S every
+        session-ending fault takes, so the flood cannot spin the rebuild loop
+        unbounded (#90 reconnect-storm concern — no new mechanism needed)."""
+        # The error must be an ordinary Exception so run()'s outer `except
+        # Exception` paces it, rather than a BaseException that would propagate
+        # and kill the supervisor — that pacing is the whole storm defense here.
+        assert issubclass(main_mod.MqttTransportOverloadError, Exception)
+        assert not issubclass(main_mod.MqttTransportOverloadError, asyncio.CancelledError)
+
+        session_calls = 0
+        sleeps: list[float] = []
+
+        async def overloaded_session(
+            settings: Settings,
+            desired_panel: DesiredState | None,
+            desired_mesh: DesiredState | None,
+        ) -> None:
+            del settings, desired_panel, desired_mesh
+            nonlocal session_calls
+            session_calls += 1
+            raise main_mod.MqttTransportOverloadError("transport backlog exceeded")
+
+        async def cancel_on_third_sleep(delay: float) -> None:
+            sleeps.append(delay)
+            if len(sleeps) >= 3:
+                raise asyncio.CancelledError
+
+        monkeypatch.setattr(main_mod, "_run_session", overloaded_session)
+        monkeypatch.setattr(asyncio, "sleep", cancel_on_third_sleep)
+
+        with pytest.raises(asyncio.CancelledError):
+            await main_mod.run(_desired_settings(motion_reconcile_enabled=False))
+
+        # One _BACKOFF_S gate per rebuild — paced, never a tight/unbounded spin.
+        assert sleeps == [5, 5, 5]
+        assert session_calls == 3
+
 
 def _scene_settings(enabled: bool, watermark_file: str) -> Settings:
     """Build settings for scene session tests before and after the fields exist."""
@@ -470,6 +512,14 @@ class _SessionMqtt:
         self.command_callbacks: list[Callable[[str, str], Awaitable[None]]] = []
         self.reader_failure_latched = False
         self.reader_failure_checks = 0
+        self.transport_overload_latched = False
+        self.transport_overload_checks = 0
+
+    def consume_transport_overload(self) -> bool:
+        self.transport_overload_checks += 1
+        latched = self.transport_overload_latched
+        self.transport_overload_latched = False
+        return latched
 
     def on_command(self, callback: Callable[[str, str], Awaitable[None]]) -> None:
         self.command_callbacks.append(callback)
@@ -928,6 +978,78 @@ class TestMqttReaderFailureRecovery:
         assert harness.mqtt.reader_failure_checks == 1
         assert harness.bus.get_all_calls == [False]
         assert harness.events[-2:] == ["bus_shutdown", "mqtt_disconnect"]
+
+
+class TestTransportOverloadRecovery:
+    async def test_latched_transport_overload_rebuilds_session_on_next_tick(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        harness = _SessionHarness(monkeypatch)
+        harness.mqtt.transport_overload_latched = True
+
+        with pytest.raises(main_mod.MqttTransportOverloadError):
+            await asyncio.wait_for(
+                main_mod._run_session(_hot_poll_settings(), None, None),
+                timeout=1,
+            )
+
+        assert harness.mqtt.transport_overload_checks == 1
+        # The detached reader task never surfaces this: only the session-loop
+        # accessor check rebuilds, tearing down the shared adapters in order.
+        assert harness.events[-2:] == ["bus_shutdown", "mqtt_disconnect"]
+
+    async def test_transport_overload_rebuild_side_effects_match_sibling_trigger(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """#90 'defined health/election behavior': an overload-triggered rebuild
+        runs _run_session's single, trigger-agnostic ``finally`` teardown — the
+        SAME availability/LWT (via mqtt.disconnect, which publishes the retained
+        "offline") and bus/leader shutdown side effects as every other trigger in
+        this loop. Proven by comparing the whole recorded lifecycle against the
+        BusWriteStuckError sibling armed the same way: identical traces =>
+        identical side effects. (The fake mqtt/leader do not model LWT-publish or
+        leader step-down as distinct events — a pre-existing harness trait shared
+        by ALL triggers, not specific to overload; the real LWT publish lives in
+        AioMqttAdapter.disconnect and is covered in test_mqttio_lifecycle.)"""
+        overload = _SessionHarness(monkeypatch)
+        overload.mqtt.transport_overload_latched = True
+        with pytest.raises(main_mod.MqttTransportOverloadError):
+            await asyncio.wait_for(
+                main_mod._run_session(_hot_poll_settings(), None, None),
+                timeout=1,
+            )
+
+        write_stuck = _SessionHarness(monkeypatch)
+        write_stuck.bus.write_timeout_latched = True
+        with pytest.raises(main_mod.BusWriteStuckError):
+            await asyncio.wait_for(
+                main_mod._run_session(_hot_poll_settings(), None, None),
+                timeout=1,
+            )
+
+        # Both faults trip on the first tick before any poll, then tear down via
+        # the one shared finally — so the recorded lifecycles are identical.
+        assert overload.events == write_stuck.events
+        assert overload.events[-2:] == ["bus_shutdown", "mqtt_disconnect"]
+
+    async def test_session_without_transport_overload_never_trips_breaker(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        harness = _SessionHarness(
+            monkeypatch,
+            bridge_poll_effects={"panel": [asyncio.CancelledError()]},
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(
+                main_mod._run_session(_hot_poll_settings(), None, None),
+                timeout=1,
+            )
+
+        assert harness.mqtt.transport_overload_checks == 1
 
 
 class _LatchProbeObserver:

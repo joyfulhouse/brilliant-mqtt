@@ -17,6 +17,7 @@ import ssl
 from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from typing import NoReturn
 
 import aiomqtt
 
@@ -30,6 +31,29 @@ logger = logging.getLogger(__name__)
 _DISCONNECT_ERROR = "MQTT disconnect failed"
 _LIFECYCLE_ERROR = "MQTT adapter cannot be reused"
 _TOPIC_QUEUE_MAXSIZE = 8
+# Transport-level admission bound, upstream of the per-command lanes (#90).
+# aiomqtt 2.5.1 defaults its incoming queue to maxsize=0 (unbounded); a stalled
+# bus command backpressures the sole reader while paho keeps enqueueing, so
+# memory grows until the 96 MiB-capped service (deploy/brilliant-mqtt.service:23)
+# is restarted. Sized to eight full command lanes so a whole-home multi-
+# peripheral burst — each distinct peripheral is one un-coalescible admission —
+# is absorbed without a false overload rebuild, while the byte budget below is
+# the true memory guard.
+_TRANSPORT_QUEUE_MAXSIZE = _TOPIC_QUEUE_MAXSIZE * 8
+# Cumulative encoded topic+payload byte budget for the admission queue. Commands
+# are small (absolute-state setters, scene ids), so this ceiling binds only on
+# pathological large payloads, capping the backlog at a small, defensible
+# fraction (~0.27%) of the service MemoryMax=96M with wide headroom for the rest
+# of the agent's working set. On every fresh-admission path this is a HARD cap
+# (a put that would exceed it trips before storing). In the latest-wins
+# coalesce-replace path (put_nowait) it is a per-admission SOFT bound: a
+# replacement is stored before the cumulative total is checked, so the total can
+# transiently exceed this by up to one admitted item per distinct latest-wins
+# topic before the runner's next tick consumes the overload latch and rebuilds.
+# The hard worst case until that rebuild is therefore bounded by
+# _TRANSPORT_QUEUE_MAXSIZE * _TRANSPORT_QUEUE_MAX_BYTES (~16 MiB), not this
+# single value — still bounded (no unbounded growth), just not a strict ceiling.
+_TRANSPORT_QUEUE_MAX_BYTES = 256 * 1024
 _SHUTDOWN_DRAIN_DEADLINE_S = 5.0
 # Post-cancel settlement bound: workers SHOULD exit promptly on cancel, but a
 # callback that swallows CancelledError must not wedge disconnect (finding 4).
@@ -225,6 +249,143 @@ def _command_lane_key(topic: str) -> str:
     return "/".join(parts[:3])
 
 
+def _message_bytes(message: aiomqtt.Message) -> int:
+    """Encoded topic+payload byte cost of one queued transport message."""
+    return len(str(message.topic).encode("utf-8")) + len(message.payload)
+
+
+class _TransportOverloadLatch:
+    """Latch tripped when the bounded transport queue rejects a message.
+
+    aiomqtt's incoming queue drops on ``QueueFull`` with only a 'Discarding
+    message' log (``client._on_message``); this latch makes that overload
+    OBSERVABLE to the runner, which rebuilds the session — a loud fail, not a
+    silent drop (#90). Set on the event-loop thread (aiomqtt runs ``_on_message``
+    there) and read+cleared by the session loop, mirroring the single-bool latch
+    behind :meth:`bus.RpcBusAdapter.consume_write_timeout`.
+    """
+
+    def __init__(self) -> None:
+        self._overloaded = False
+
+    def trip(self) -> bool:
+        """Latch overload; return True only for the first trip since a consume."""
+        first = not self._overloaded
+        self._overloaded = True
+        return first
+
+    def consume(self) -> bool:
+        """Return and clear the overload latch."""
+        overloaded = self._overloaded
+        self._overloaded = False
+        return overloaded
+
+
+class _BoundedTransportQueue(asyncio.Queue[aiomqtt.Message]):
+    """aiomqtt incoming-message queue bounded by count AND payload bytes (#90).
+
+    aiomqtt builds this via its ``queue_type`` hook and, on ``QueueFull``, logs
+    'Discarding message' and drops (``client._on_message``). On top of
+    ``asyncio.Queue``'s count ``maxsize`` this enforces a cumulative payload-byte
+    budget, coalesces latest-wins command topics at admission (mirroring
+    :meth:`_LaneQueue.put` one layer earlier, so an idempotent absolute-state
+    setter replaces a pending twin instead of consuming budget) and TRIPS an
+    observable latch before raising ``QueueFull`` — the drop becomes a loud,
+    observable overload the runner sheds-and-rebuilds on, rather than aiomqtt's
+    silent discard. ``QueueFull`` is raised (not a bespoke error) because paho
+    re-raises anything else escaping the callback.
+    """
+
+    _queue: deque[aiomqtt.Message]
+
+    def __init__(
+        self,
+        maxsize: int = 0,
+        *,
+        max_bytes: int,
+        overload: _TransportOverloadLatch,
+    ) -> None:
+        super().__init__(maxsize)
+        self._max_bytes = max_bytes
+        self._overload = overload
+        self._queued_bytes = 0
+
+    @property
+    def queued_bytes(self) -> int:
+        return self._queued_bytes
+
+    def put_nowait(self, item: aiomqtt.Message) -> None:
+        item_bytes = _message_bytes(item)
+        topic = str(item.topic)
+        if _is_latest_wins_topic(topic):
+            for index, pending in enumerate(self._queue):
+                if str(pending.topic) == topic:
+                    if item_bytes > self._max_bytes:
+                        # A single latest-wins payload too big to EVER fit the
+                        # budget on its own: refuse it and keep the pending twin,
+                        # so _queued_bytes stays hard-capped like every other
+                        # admission path (replacing first could overshoot by an
+                        # arbitrary amount). A message this large can never be
+                        # admitted, so keeping the older value is safe — both are
+                        # discarded on the ensuing rebuild regardless.
+                        self._trip("payload-byte")
+                    # The new payload fits the budget on its own. Latest-wins: it
+                    # supersedes its pending twin (mirrors _LaneQueue.put) —
+                    # replace in place first (count unchanged, so this never
+                    # widens the queue), THEN trip if the CUMULATIVE total now
+                    # exceeds budget. On that trip the new message is KEPT (a
+                    # pre-rebuild drain applies the NEWEST value); what is shed is
+                    # the OLD pending value, despite aiomqtt's generic "Discarding
+                    # message" log. Storing before the check makes _max_bytes a
+                    # per-admission soft bound here — see the
+                    # _TRANSPORT_QUEUE_MAX_BYTES comment.
+                    self._queued_bytes += item_bytes - _message_bytes(pending)
+                    self._queue[index] = item
+                    if self._queued_bytes > self._max_bytes:
+                        self._trip("payload-byte")
+                    return
+        if self.full():
+            self._trip("message-count")
+        if self._queued_bytes + item_bytes > self._max_bytes:
+            self._trip("payload-byte")
+        super().put_nowait(item)
+        self._queued_bytes += item_bytes
+
+    def _get(self) -> aiomqtt.Message:
+        item = super()._get()
+        self._queued_bytes -= _message_bytes(item)
+        return item
+
+    def _trip(self, budget: str) -> NoReturn:
+        if self._overload.trip():
+            logger.error(
+                "MQTT transport backlog exceeded its %s budget; "
+                "rebuilding session to shed the overload (#90)",
+                budget,
+            )
+        raise asyncio.QueueFull
+
+
+def _transport_queue_type(
+    overload: _TransportOverloadLatch,
+) -> type[asyncio.Queue[aiomqtt.Message]]:
+    """Bind one adapter's overload latch into aiomqtt's ``queue_type`` hook.
+
+    aiomqtt instantiates the returned class as ``queue_type(maxsize=...)`` with
+    only the count maxsize, so the byte budget and latch are captured here.
+    """
+
+    class _AdapterTransportQueue(_BoundedTransportQueue):
+        def __init__(self, maxsize: int = 0) -> None:
+            super().__init__(
+                maxsize,
+                max_bytes=_TRANSPORT_QUEUE_MAX_BYTES,
+                overload=overload,
+            )
+
+    return _AdapterTransportQueue
+
+
 def build_tls_context(settings: Settings) -> ssl.SSLContext | None:
     """Build a strict server-authenticated TLS context when TLS is enabled."""
     if not settings.mqtt_tls_enabled:
@@ -267,6 +428,9 @@ class AioMqttAdapter:
         self._payload_decode_error_cbs: list[
             Callable[[MqttPayloadDecodeError], Awaitable[None]]
         ] = []
+        # Tripped by the bounded transport queue (below) when a count/byte bound
+        # is exceeded; drained by the runner via consume_transport_overload().
+        self._transport_overload = _TransportOverloadLatch()
         self._topic_dispatcher = _TopicDispatcher(self._dispatch_inbound)
         self._reader_task: asyncio.Task[None] | None = None
         self._reader_failure_consumed = False
@@ -300,6 +464,11 @@ class AioMqttAdapter:
             username=settings.mqtt_username,
             password=settings.mqtt_password,
             identifier=self._identifier,
+            # Bound the inbound transport backlog upstream of the command lanes
+            # (#90): a custom queue enforcing a count AND payload-byte budget,
+            # observably tripping on overload instead of aiomqtt's silent drop.
+            queue_type=_transport_queue_type(self._transport_overload),
+            max_queued_incoming_messages=_TRANSPORT_QUEUE_MAXSIZE,
             will=will,
             tls_context=build_tls_context(settings),
         )
@@ -620,6 +789,20 @@ class AioMqttAdapter:
     ) -> None:
         """Register metadata-only handling for inbound invalid UTF-8."""
         self._payload_decode_error_cbs.append(cb)
+
+    def consume_transport_overload(self) -> bool:
+        """Return and clear the inbound transport-overload latch (#90).
+
+        Mirrors :meth:`bus.RpcBusAdapter.consume_write_timeout`: the runner
+        checks this each session tick and rebuilds the session when overload is
+        latched, turning aiomqtt's silent 'Discarding message' drop into an
+        observable fail + reconnect. The overload SHEDS the excess commands
+        (QoS-0 inbound has no broker acknowledgment or retry semantics at all, so
+        a shed message is simply gone — never redelivered on reconnect regardless
+        of session persistence) and rebuilds — admission control, not a lossless
+        promise.
+        """
+        return self._transport_overload.consume()
 
     async def subscribe(self, topic: str) -> None:
         try:

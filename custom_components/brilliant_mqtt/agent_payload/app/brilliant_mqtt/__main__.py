@@ -72,6 +72,17 @@ class BusReconnectStormError(RuntimeError):
     self-reinforcing storm (live incident, 2026-06-13)."""
 
 
+class MqttTransportOverloadError(RuntimeError):
+    """Inbound MQTT transport backlog exceeded its count/byte bound — shed the
+    excess commands and rebuild the session, instead of aiomqtt silently
+    discarding them (#90). This is admission control, not a lossless promise:
+    QoS-0 inbound has no broker acknowledgment or retry semantics at all, so a
+    shed message is simply gone — never redelivered by the broker regardless of
+    session persistence. The excess is genuinely dropped, but observably, via a
+    loud fail + reconnect, not silently. The detached reader task never surfaces
+    this; only the session-loop accessor check does."""
+
+
 class _CoalescingCallback:
     """Collapse requests received during one callback into one trailing run."""
 
@@ -293,6 +304,17 @@ async def _run_session(
             # even if pushes remain healthy (#72).
             if bus.consume_write_timeout():
                 raise BusWriteStuckError("bus write timed out — rebuilding session")
+
+            # Inbound MQTT transport backlog exceeded its count/byte bound: a
+            # stalled command lane backpressured the sole broker reader while
+            # commands kept arriving (#90). Fail loudly and rebuild — shedding the
+            # excess — rather than letting aiomqtt silently discard. The rebuild
+            # takes run()'s outer _BACKOFF_S like every session-ending fault, so a
+            # sustained flood cannot spin the rebuild loop unbounded.
+            if mqtt.consume_transport_overload():
+                raise MqttTransportOverloadError(
+                    "MQTT transport backlog exceeded its bound — rebuilding session"
+                )
 
             # Stale-stream watchdog: a silently dead notification stream
             # freezes pushes AND get_all (pilot finding 2026-06-12) — only
