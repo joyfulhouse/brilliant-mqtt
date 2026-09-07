@@ -35,14 +35,18 @@ class Ladder:
         self._t = thresholds
         self._fails = 0
         self._down_since: float | None = None
+        self._last_observed_at: float | None = None
         self._fired: set[str] = set()
         self._reboot_deferred = False
+        self._reboot_requested = False
 
     def reset(self) -> None:
         self._fails = 0
         self._down_since = None
+        self._last_observed_at = None
         self._fired.clear()
         self._reboot_deferred = False
+        self._reboot_requested = False
 
     def _threshold(self, name: str) -> float:
         return {
@@ -51,10 +55,20 @@ class Ladder:
             "reboot": self._t.reboot_after,
         }[name]
 
-    def observe(self, *, gateway_up: bool, now: float, reboot_eligible: bool = True) -> Action:
+    def observe(
+        self, *, gateway_up: bool | None, now: float, reboot_eligible: bool = True
+    ) -> Action:
+        if gateway_up is None:
+            if not reboot_eligible:
+                self._reboot_requested = False
+            if self._down_since is not None and self._last_observed_at is not None:
+                self._down_since += max(0.0, now - self._last_observed_at)
+            self._last_observed_at = now
+            return Action.NONE
         if gateway_up:
             self.reset()
             return Action.NONE
+        self._last_observed_at = now
         self._fails += 1
         if self._down_since is None:
             self._down_since = now
@@ -66,6 +80,7 @@ class Ladder:
             if elapsed < self._threshold(name) or name in self._fired:
                 continue
             if name == "reboot" and not reboot_eligible:
+                self._reboot_requested = False
                 # Reboot is due but the guard blocks it.  Never mark it fired, so a
                 # later eligible poll re-arms it (issue #91); notify once, then keep
                 # walking to the cheaper rungs so a poll gap can't starve soft/restart.
@@ -73,8 +88,15 @@ class Ladder:
                     self._reboot_deferred = True
                     return Action.ESCALATE_NOTIFY
                 continue
-            self._fired.add(name)
             if name == "reboot":
-                self._reboot_deferred = False
+                if self._reboot_requested:
+                    continue
+                # A successful reboot replaces this process. Until then, the
+                # request-aware guard clears this latch during its cooldown and
+                # re-arms the pending rung without committing it to _fired.
+                self._reboot_requested = True
+                self._reboot_deferred = True
+            else:
+                self._fired.add(name)
             return action
         return Action.NONE
