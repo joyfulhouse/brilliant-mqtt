@@ -46,7 +46,7 @@ def _writer_alive(pid: int) -> bool:
 def bus_confirmed(path: str) -> bool:
     """Whether a live, generation-matched writer holds the bus-phase lease."""
     record, leased = _read_phase_record_and_lease(path)
-    return bool(
+    return (
         record is not None
         and record.phase == "bus"
         and record.boot_id == current_boot_id()
@@ -63,8 +63,6 @@ def _read_phase_record_and_lease(path: str) -> tuple[PhaseRecord | None, bool]:
                 fcntl.flock(stream.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
             except BlockingIOError:
                 leased = True
-            except OSError:
-                return None, False
             else:
                 leased = False
                 fcntl.flock(stream.fileno(), fcntl.LOCK_UN)

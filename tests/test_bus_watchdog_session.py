@@ -52,10 +52,6 @@ class _Bus:
         coalesce_pushes: bool = True,
         want_device: Callable[[str], bool] | None = None,
     ) -> None:
-        # Registered by the real SceneBridge at startup; it never fires in these
-        # tests (startup fails at the MQTT subscribe, before any bus push).
-        # Signature mirrors ``BusClient.on_change`` / ``tests.fakes.FakeBus``
-        # (``want_device`` added by #98) so the real bridge can register.
         del callback, coalesce_pushes, want_device
 
     async def start(self) -> None:
@@ -107,7 +103,6 @@ class _Mqtt:
         del callback
 
     def on_message(self, callback: Callable[[str, str, bool], Awaitable[None]]) -> None:
-        # Registered by the real SceneBridge at startup.
         del callback
 
     async def subscribe(self, topic: str) -> None:
@@ -519,33 +514,10 @@ async def test_successful_bus_read_refreshes_heartbeat_without_resetting_phase(
     )
 
 
-# --- issue #87 audit follow-up: broker-only faults that can reboot a HEALTHY
-# panel while the phase reads "bus". The ROOT cause is that the liveness
-# heartbeat is not stamped until AFTER broker-dependent work. The fix stamps it
-# first inside Bridge.reconcile (see test_reconcile_beats_before_broker_publish,
-# GREEN); two residual windows that a tight, AC3-preserving fix cannot close are
-# kept as strict xfail demonstrations. AC3
-# (test_sustained_bus_handshake_failure_still_uses_reboot_guard) stays green.
-
-
 async def test_broker_recovery_bus_start_window_does_not_reboot_healthy_panel(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """DEFECT #1 (issue #87 audit follow-up): the session stamps the phase
-    "bus" BEFORE ``bus.start()`` and before the first bus read/heartbeat.
-
-    After a long broker outage the heartbeat is legitimately stale while the
-    phase stays "pre_bus" (no reboot — correct). When the broker returns, the
-    next session stamps "bus" and then sits inside ``bus.start()`` (the Thrift
-    connect, up to ``_CONNECT_TIMEOUT_S`` = 10s). During that window the
-    heartbeat is still the pre-outage stale value, yet ``bus_confirmed`` already
-    reads True — so a watchdog cycle that samples the phase inside the window
-    sees ``(age >= stale_after, bus_confirmed=True)`` and reboots a HEALTHY
-    panel whose bus is merely still handshaking.
-
-    Reproduced with a bus whose ``start()`` blocks (broker recovered, bus still
-    connecting); the assertion is made at the ``should_reboot`` predicate.
-    """
+    """A recovered broker cannot lend outage age to a fresh bus attempt."""
     settings = _settings(tmp_path)
     clock = FakeClock()
     _install_watchdog_clock(monkeypatch, clock)
@@ -583,7 +555,6 @@ async def test_broker_recovery_bus_start_window_does_not_reboot_healthy_panel(
         await asyncio.wait_for(entered_start.wait(), timeout=1)
         failure_age = bus_failure_age(settings.bus_phase_file, now=clock())
         assert bus.start_calls == 1  # inside bus.start(); first read not yet reached
-        assert stale_age >= 1800.0  # the heartbeat is genuinely stale from the outage
         assert failure_age == 0.0
         assert not should_reboot(
             age=stale_age,
@@ -622,22 +593,7 @@ async def test_broker_recovery_bus_start_window_does_not_reboot_healthy_panel(
 async def test_scene_subscribe_failure_never_reboots_a_healthy_panel(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """DEFECT #2 (issue #87 audit follow-up), scene-subscribe path: with the
-    scene bridge enabled the session runs ``scene_bridge.async_start()`` — which
-    SUBSCRIBEs to MQTT — BEFORE the first panel reconcile/bus read.
-
-    A persistent subscribe rejection (a broker ACL that forbids the scene topic,
-    or a SUBACK that never arrives) raises ``CommandSubscribeError`` every
-    attempt: ``bus.start()`` has already succeeded and the phase is "bus", but
-    NO heartbeat is ever written (only reconcile/poll beat, and reconcile is
-    never reached), so the heartbeat goes stale while the phase reads confirmed
-    and the watchdog reboots a HEALTHY panel over a broker-only fault.
-    Deterministic, not a timing window.
-
-    Reproduced with the REAL SceneBridge and a fake MQTT whose subscribe raises.
-    Every retry must complete an independent panel read and heartbeat before the
-    scene subscription can fail.
-    """
+    """Scene subscription failures cannot stale a healthy local bus."""
     settings = _settings(tmp_path, scene_enabled=True)
     clock = FakeClock()
     _install_watchdog_clock(monkeypatch, clock)

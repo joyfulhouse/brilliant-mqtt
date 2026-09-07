@@ -202,7 +202,7 @@ class SceneBridge:
         self._callbacks_registered = True
 
     async def async_start(self) -> None:
-        """Register callbacks, seed history, publish catalogs, and accept commands."""
+        """Seed history, publish catalogs, and accept commands."""
         async with self._lock:
             if self._started:
                 return

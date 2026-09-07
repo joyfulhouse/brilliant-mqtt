@@ -80,12 +80,11 @@ class PhaseRecord:
             except ValueError:
                 return None
             if (
-                len(parsed) != 3
-                or not all(math.isfinite(value) and value >= 0.0 for value in parsed)
+                not all(math.isfinite(value) and value >= 0.0 for value in parsed)
                 or not parsed[0] <= parsed[1] <= parsed[2]
             ):
                 return None
-            timing = parsed
+            timing = (parsed[0], parsed[1], parsed[2])
         phase: BusPhase = "pre_bus" if parts[1] == "pre_bus" else "bus"
         return cls(
             phase=phase,
@@ -158,7 +157,7 @@ def _acquire_phase_lease(path: str, last_success_write: float | None) -> None:
 
 
 def _history_is_current(record: PhaseRecord | None, boot_id: str, now: float) -> bool:
-    return bool(
+    return (
         record is not None
         and record.boot_id == boot_id
         and record.failure_started_at is not None
