@@ -64,6 +64,12 @@ _WRITE_SETTLE_TIMEOUT_S = 2.0
 # change callback that itself swallows cancellation. It runs AFTER _settle_writes,
 # so the two bounds are sequential — both are kept small for that reason.
 _PENDING_SETTLE_TIMEOUT_S = 2.0
+# One shared deadline for observer and processor cleanup. Their closed-source
+# shutdown coroutines may ignore cancellation, so they run as separately owned
+# tasks and are observed with asyncio.wait(), which never waits for cancellation.
+_RESOURCE_CLOSE_TIMEOUT_S = 2.0
+# Process-wide because the supervisor constructs a fresh adapter per retry.
+_RESOURCE_CLOSE_TASKS: set[asyncio.Task[None]] = set()
 # Upper bound on the normalized set-variables receipt (issue #46): the RPC
 # response type is closed-source and undocumented, so only a bounded repr
 # string ever crosses the adapter boundary.
@@ -479,6 +485,10 @@ class RpcBusAdapter:
         # Retain fired callback tasks so they are not garbage-collected mid-flight
         # (asyncio holds only weak references to tasks). Done-callback discards.
         self._pending_tasks: set[asyncio.Task[None]] = set()
+        # Observer/processor shutdowns that outlive the shared close deadline
+        # stay strongly referenced and fence another adapter from allocating a
+        # peer on the next supervisor retry.
+        self._resource_close_tasks = _RESOURCE_CLOSE_TASKS
         # Coalescing callbacks keep one newest snapshot per raw device. Lossless
         # callbacks use one callback-wide FIFO so distinct scene/mode executions
         # retain their arrival order even when several raw devices are involved.
@@ -509,12 +519,19 @@ class RpcBusAdapter:
         - ``_pending_tasks`` / ``_write_tasks`` — dropping the strong reference
           to a still-running straggler would expose it to GC mid-flight; their
           done-callbacks discard each task by identity when it finally ends.
+        - ``_resource_close_tasks`` — process-wide because the supervisor uses a
+          fresh adapter per attempt; any unresolved close fences this start.
         - ``_write_locks`` — the per-device lock must survive a restart so a new
           session's write to a device whose PRIOR write detached and is still in
           flight (holding that lock up to the #73 hard cap) serializes behind it
           rather than racing it on a fresh lock. Locks are keyed by device id,
           not session, and an idle entry just sits in the (bounded) dict.
         """
+        unresolved_closes = [task for task in self._resource_close_tasks if not task.done()]
+        if unresolved_closes:
+            raise RuntimeError(
+                f"prior bus resource shutdown still pending ({len(unresolved_closes)} task(s))"
+            )
         self._session += 1
         # Not ready until this start() commits: _require_started keeps gating on
         # _own_device_id, so owning _obs/_proc early (below) never opens a window
@@ -1154,8 +1171,21 @@ class RpcBusAdapter:
                 _PENDING_SETTLE_TIMEOUT_S,
             )
 
+    async def _shutdown_bus_resource(self, resource: Any, label: str) -> None:
+        """Close one bus resource, logging ordinary failures without raising."""
+        try:
+            await resource.shutdown()
+        except Exception:
+            logger.exception("%s shutdown failed", label)
+
+    def _resource_close_finished(self, task: asyncio.Task[None]) -> None:
+        """Release a completed close-task reference and retrieve its outcome."""
+        self._resource_close_tasks.discard(task)
+        if not task.cancelled():
+            task.exception()
+
     async def _close_bus_resources(self) -> None:
-        """Release the observer then the processor, best-effort; log, never raise.
+        """Release observer and processor within one total best-effort deadline.
 
         The single place that knows how to close these two resources, shared by
         :meth:`shutdown` and :meth:`start`'s partial-startup unwind so it runs
@@ -1163,30 +1193,41 @@ class RpcBusAdapter:
         first so a second call (double shutdown, or shutdown after a failed
         start) is a no-op rather than a double close.
 
-        The processor close is in a ``finally`` (#88): if the observer close is
-        cancelled or raises a ``BaseException`` — which the per-resource
-        ``except Exception`` deliberately does not catch — the processor (which
-        owns automatic-reconnect work) must STILL be closed, or it leaks with
-        ``self._proc`` already cleared so no retry can reach it.
+        Each resource gets its own retained task so processor cleanup starts even
+        if observer cleanup stalls. ``asyncio.wait`` applies one shared deadline
+        without cancelling or awaiting cancellation-resistant stragglers. Any
+        such task stays tracked process-wide and fences the supervisor's next
+        adapter from allocating another peer until it settles.
         """
         obs = self._obs
         proc = self._proc
         self._obs = None
         self._proc = None
-        try:
-            if obs is not None:
-                try:
-                    await obs.shutdown()
-                except Exception:
-                    # Best-effort cleanup — log and continue; never raise here.
-                    logger.exception("observer shutdown failed")
-        finally:
-            if proc is not None:
-                try:
-                    await proc.shutdown()
-                except Exception:
-                    # Best-effort cleanup — log and continue; never raise here.
-                    logger.exception("processor shutdown failed")
+        close_tasks: list[asyncio.Task[None]] = []
+        for resource, label in ((obs, "observer"), (proc, "processor")):
+            if resource is None:
+                continue
+            task = asyncio.create_task(
+                self._shutdown_bus_resource(resource, label),
+                name=f"bus-{label}-shutdown",
+            )
+            self._resource_close_tasks.add(task)
+            task.add_done_callback(self._resource_close_finished)
+            close_tasks.append(task)
+        if not close_tasks:
+            return
+
+        done, pending = await asyncio.wait(close_tasks, timeout=_RESOURCE_CLOSE_TIMEOUT_S)
+        if pending:
+            logger.error(
+                "%d bus resource shutdown(s) did not settle within the %.0fs total "
+                "deadline; retaining and fencing the stragglers: %s",
+                len(pending),
+                _RESOURCE_CLOSE_TIMEOUT_S,
+                sorted(task.get_name() for task in pending),
+            )
+        for task in done:
+            task.result()
 
     async def shutdown(self) -> None:
         """Best-effort teardown; tolerant of a never-started adapter.
