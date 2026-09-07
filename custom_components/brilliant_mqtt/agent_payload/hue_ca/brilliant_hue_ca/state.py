@@ -16,7 +16,7 @@ of the oneshot. Stdlib-only so it runs on the panel's Python 3.10."""
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 from .fs import FileSystem
 
@@ -49,16 +49,7 @@ def load_pending(fs: FileSystem, state_path: str) -> PendingReload | None:
 
 def save_pending(fs: FileSystem, state_path: str, pending: PendingReload) -> None:
     """Overwrite the state file with the given marker (latest generation wins)."""
-    fs.write_text(
-        state_path,
-        json.dumps(
-            {
-                "bundle_path": pending.bundle_path,
-                "fingerprint": pending.fingerprint,
-                "last_attempt_at": pending.last_attempt_at,
-            }
-        ),
-    )
+    fs.write_text(state_path, json.dumps(asdict(pending)))
 
 
 def clear_pending(fs: FileSystem, state_path: str) -> None:
