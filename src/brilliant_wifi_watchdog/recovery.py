@@ -63,7 +63,7 @@ def gpio_reset_and_reboot(
     write: Callable[[str, str], None] = _write,
     read_alias: Callable[[], str | None] = _read_alias,
     sleep: Callable[[float], None] = time.sleep,
-) -> None:
+) -> int:
     controller = read_alias()
     if controller:
         write("/sys/bus/platform/drivers/sdhci-esdhc-imx/unbind", controller)
@@ -72,4 +72,4 @@ def gpio_reset_and_reboot(
     sleep(1)
     write("/sys/class/gpio/unexport", str(WL_REG_ON_GPIO))
     write("/sys/class/gpio/unexport", str(BT_REG_ON_GPIO))
-    run(["systemctl", "reboot"])
+    return run(["systemctl", "reboot"])

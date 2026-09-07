@@ -34,7 +34,9 @@ def test_restart_services_sequence() -> None:
 
 def test_gpio_reset_then_reboot() -> None:
     r = Rec()
-    recovery.gpio_reset_and_reboot(run=r.run, write=r.write, read_alias=lambda: "2194000.mmc")
+    result = recovery.gpio_reset_and_reboot(
+        run=r.run, write=r.write, read_alias=lambda: "2194000.mmc"
+    )
     # unbind the wifi usdhc controller
     assert ("/sys/bus/platform/drivers/sdhci-esdhc-imx/unbind", "2194000.mmc") in r.writes
     # WL_REG_ON (gpio2) + BT_REG_ON (gpio5) exported, driven low, unexported
@@ -53,6 +55,7 @@ def test_gpio_reset_then_reboot() -> None:
     assert ub < e2 < u2
     # reboot is LAST
     assert r.cmds[-1] == ["systemctl", "reboot"]
+    assert result == 0
 
 
 # ---------------------------------------------------------------------------

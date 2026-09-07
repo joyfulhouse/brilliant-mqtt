@@ -35,12 +35,14 @@ class Ladder:
         self._t = thresholds
         self._fails = 0
         self._down_since: float | None = None
+        self._last_observed_at: float | None = None
         self._fired: set[str] = set()
         self._reboot_deferred = False
 
     def reset(self) -> None:
         self._fails = 0
         self._down_since = None
+        self._last_observed_at = None
         self._fired.clear()
         self._reboot_deferred = False
 
@@ -51,10 +53,18 @@ class Ladder:
             "reboot": self._t.reboot_after,
         }[name]
 
-    def observe(self, *, gateway_up: bool, now: float, reboot_eligible: bool = True) -> Action:
+    def observe(
+        self, *, gateway_up: bool | None, now: float, reboot_eligible: bool = True
+    ) -> Action:
+        if gateway_up is None:
+            if self._down_since is not None and self._last_observed_at is not None:
+                self._down_since += max(0.0, now - self._last_observed_at)
+            self._last_observed_at = now
+            return Action.NONE
         if gateway_up:
             self.reset()
             return Action.NONE
+        self._last_observed_at = now
         self._fails += 1
         if self._down_since is None:
             self._down_since = now
@@ -73,8 +83,9 @@ class Ladder:
                     self._reboot_deferred = True
                     return Action.ESCALATE_NOTIFY
                 continue
-            self._fired.add(name)
             if name == "reboot":
-                self._reboot_deferred = False
+                self._reboot_deferred = True
+            else:
+                self._fired.add(name)
             return action
         return Action.NONE

@@ -33,13 +33,22 @@ class RebootGuard:
             json.dump(stamps, f)
         os.replace(tmp, self._path)
 
-    def can_reboot(self, now: float) -> bool:
-        stamps = [t for t in self._load() if now - t <= self._p.window]
+    def _history_allows(self, stamps: list[float], now: float) -> bool:
         if stamps and now - max(stamps) < self._p.cooldown:
             return False
         return len(stamps) < self._p.cap
+
+    def can_reboot(self, now: float) -> bool:
+        stamps = [t for t in self._load() if now - t <= self._p.window]
+        return self._history_allows(stamps, now)
+
+    def can_request(self, now: float) -> bool:
+        return self.can_reboot(now)
 
     def record(self, now: float) -> None:
         stamps = [t for t in self._load() if now - t <= self._p.window]
         stamps.append(now)
         self._save(stamps)
+
+    def record_request(self, now: float) -> None:
+        self.record(now)
