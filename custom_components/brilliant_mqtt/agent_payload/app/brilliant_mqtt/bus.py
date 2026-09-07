@@ -409,19 +409,21 @@ class RpcBusAdapter:
             lambda raw: self._dispatch_raw_device(raw, session),
             lambda: self._note_push(session),
         )
-        # Own the observer BEFORE constructing/starting anything that can fail.
-        self._obs = obs
-        proc = SinglePeerProcessor(
-            socket_path=_SOCKET_PATH,
-            my_name=self._my_name,
-            handler=mbps.PeripheralServer(obs),
-            client_class=mbps.MessageBusClient,
-            loop=loop,
-        )
-        # Own the processor immediately too: it owns automatic-reconnect work,
-        # so a failure past this point must be able to shut it down.
-        self._proc = proc
         try:
+            # Own the observer BEFORE constructing/starting anything that can
+            # fail — inside the try, so even a raising SinglePeerProcessor(...)
+            # constructor unwinds the already-owned observer (#88).
+            self._obs = obs
+            proc = SinglePeerProcessor(
+                socket_path=_SOCKET_PATH,
+                my_name=self._my_name,
+                handler=mbps.PeripheralServer(obs),
+                client_class=mbps.MessageBusClient,
+                loop=loop,
+            )
+            # Own the processor immediately too: it owns automatic-reconnect
+            # work, so a failure past this point must be able to shut it down.
+            self._proc = proc
             await proc.start()
 
             # Poll until the handshake completes (poc-findings §2). Fail fast on timeout.
@@ -555,7 +557,10 @@ class RpcBusAdapter:
         alive past its own session's bounded teardown. If a new session has
         since started, stop draining and do NOT pop ``_push_tasks`` — that key
         may now hold the NEW session's live drain worker, and evicting it would
-        let a duplicate worker spawn for it.
+        let a duplicate worker spawn for it. The check is repeated inside the
+        per-device loop too, so a session boundary that lands between two
+        devices of one snapshot stops delivery immediately rather than draining
+        the rest of that snapshot into the callback.
         """
         try:
             while True:
@@ -567,6 +572,8 @@ class RpcBusAdapter:
                     return
                 devices = pending.popleft()
                 for device in devices:
+                    if session != self._session:
+                        return
                     try:
                         await cb(device)
                     except Exception:
@@ -640,16 +647,30 @@ class RpcBusAdapter:
         logger.warning("bus processor reconnected; re-subscribing and re-reconciling")
         self._note_push()
         self._note_reconnect()
-        self._spawn(self._after_reconnect())
+        self._spawn(self._after_reconnect(session))
 
-    async def _after_reconnect(self) -> None:
-        """Re-subscribe (belt-and-braces) then notify the bridge to reconcile."""
+    async def _after_reconnect(self, session: int | None = None) -> None:
+        """Re-subscribe (belt-and-braces) then notify the bridge to reconcile.
+
+        Session-scoped (#88), like :meth:`_drain_pushes`: a slow or
+        non-cooperative reconnect callback can keep this coroutine alive past
+        its session's bounded teardown, so re-check the token after each await
+        and stop before re-subscribing the new session's observer or firing
+        bridge reconciles against it. ``session`` defaults to the current one
+        for direct callers; ``_on_proc_reconnect`` passes its bound token.
+        """
+        if session is None:
+            session = self._session
+        if session != self._session:
+            return
         if self._resubscribe is not None:
             try:
                 await self._resubscribe()
             except Exception:
                 logger.exception("re-subscribe after reconnect failed")
         for cb in list(self._reconnect_cbs):
+            if session != self._session:
+                return
             try:
                 await cb()
             except Exception:
@@ -924,23 +945,31 @@ class RpcBusAdapter:
         correctly however far startup got. Clears ``self._obs``/``self._proc``
         first so a second call (double shutdown, or shutdown after a failed
         start) is a no-op rather than a double close.
+
+        The processor close is in a ``finally`` (#88): if the observer close is
+        cancelled or raises a ``BaseException`` — which the per-resource
+        ``except Exception`` deliberately does not catch — the processor (which
+        owns automatic-reconnect work) must STILL be closed, or it leaks with
+        ``self._proc`` already cleared so no retry can reach it.
         """
         obs = self._obs
         proc = self._proc
         self._obs = None
         self._proc = None
-        if obs is not None:
-            try:
-                await obs.shutdown()
-            except Exception:
-                # Best-effort cleanup — log and continue; never raise here.
-                logger.exception("observer shutdown failed")
-        if proc is not None:
-            try:
-                await proc.shutdown()
-            except Exception:
-                # Best-effort cleanup — log and continue; never raise here.
-                logger.exception("processor shutdown failed")
+        try:
+            if obs is not None:
+                try:
+                    await obs.shutdown()
+                except Exception:
+                    # Best-effort cleanup — log and continue; never raise here.
+                    logger.exception("observer shutdown failed")
+        finally:
+            if proc is not None:
+                try:
+                    await proc.shutdown()
+                except Exception:
+                    # Best-effort cleanup — log and continue; never raise here.
+                    logger.exception("processor shutdown failed")
 
     async def shutdown(self) -> None:
         """Best-effort teardown; tolerant of a never-started adapter.

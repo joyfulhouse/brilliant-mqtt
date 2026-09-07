@@ -961,10 +961,14 @@ class _StartHarness:
         fail_at: str | tuple[str, str] | None = None,
         block_proc_start: bool = False,
         gated_writes: bool = False,
+        obs_shutdown_raises: BaseException | None = None,
     ) -> None:
         self.fail_at = fail_at
         self.block_proc_start = block_proc_start
         self.gated_writes = gated_writes
+        # When set, the observer's shutdown() raises this (e.g. CancelledError)
+        # to prove _close_bus_resources still closes the processor afterwards.
+        self.obs_shutdown_raises = obs_shutdown_raises
         self.procs: list[Any] = []
         self.observers: list[Any] = []
         self.subscribed: list[str] = []
@@ -1040,6 +1044,8 @@ class _StartHarness:
                 return "ok"
 
             async def shutdown(self) -> None:
+                if harness.obs_shutdown_raises is not None:
+                    raise harness.obs_shutdown_raises
                 self.shut_down = True
 
         class _FakeProc:
@@ -1053,6 +1059,8 @@ class _StartHarness:
                 loop: Any,
             ) -> None:
                 del socket_path, handler, client_class, loop
+                if harness.fail_at == "proc_construct":
+                    raise RuntimeError("proc construct boom")
                 self.my_name = my_name
                 self.started = False
                 self.shut_down = False
@@ -1220,6 +1228,39 @@ class TestPartialStartupUnwind:
         assert harness.live_observers == []
         assert adapter._pending_tasks == set()
         assert adapter._write_tasks == set()
+
+    async def test_processor_construction_failure_closes_observer(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """grok r1 #3: the observer is owned before the processor is
+        constructed, so a raising SinglePeerProcessor(...) constructor must
+        still unwind (close) the already-owned observer rather than leak it."""
+        harness = _StartHarness(monkeypatch, fail_at="proc_construct")
+        adapter = RpcBusAdapter()
+
+        with pytest.raises(RuntimeError, match="proc construct boom"):
+            await adapter.start()
+
+        assert harness.procs == []  # the processor never finished constructing
+        _assert_unwound(harness, adapter)  # the owned observer was still closed
+        assert adapter._obs is None
+
+    async def test_processor_closed_even_when_observer_close_is_cancelled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """grok r1 #1: if the observer close is cancelled/raises a BaseException
+        (which the per-resource except-Exception does not catch), the processor
+        — which owns automatic-reconnect work — must STILL be closed via the
+        shared helper's finally, or it leaks with self._proc already cleared."""
+        harness = _StartHarness(monkeypatch, obs_shutdown_raises=asyncio.CancelledError())
+        adapter = RpcBusAdapter()
+
+        await adapter.start()
+        proc = harness.procs[0]
+        with pytest.raises(asyncio.CancelledError):
+            await adapter.shutdown()
+
+        assert proc.shut_down is True  # closed despite the observer close cancel
 
 
 class TestReusedSessionSafety:
@@ -1418,3 +1459,85 @@ class TestStaleCallbackFencing:
             # can't leave one blocking the event-loop teardown.
             release.set()
             await _settle()
+
+    async def test_stale_reconnect_fanout_does_not_fire_into_next_session(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """grok r1 #2: _after_reconnect must be session-scoped like _drain_pushes
+        — a reconnect callback blocked past its session's teardown must not let
+        the fan-out continue firing LATER callbacks against the next session."""
+        monkeypatch.setattr(bus_mod, "_PENDING_SETTLE_TIMEOUT_S", 0.05, raising=False)
+        _StartHarness(monkeypatch)  # installs the fake panel libs (side effect)
+        adapter = RpcBusAdapter()
+        release = asyncio.Event()
+        cb1_started = asyncio.Event()
+        cb2_sessions: list[int] = []
+
+        async def cb1() -> None:
+            cb1_started.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                await release.wait()  # swallow: survive this session's teardown
+
+        async def cb2() -> None:
+            cb2_sessions.append(adapter._session)
+
+        adapter.on_reconnect(cb1)
+        adapter.on_reconnect(cb2)
+
+        try:
+            await adapter.start()
+            adapter._on_proc_reconnect()  # session-1 reconnect fan-out
+            await asyncio.wait_for(cb1_started.wait(), timeout=1)  # parked in cb1
+            await asyncio.wait_for(adapter.shutdown(), timeout=1)  # cancels fan-out; cb1 swallows
+
+            await adapter.start()  # session 2
+            release.set()  # cb1 returns; an unfenced fan-out would reach cb2 next
+            await _settle(5)
+            assert cb2_sessions == []  # cb2 was NOT fired against the new session
+        finally:
+            release.set()
+            await _settle(5)
+
+    async def test_drain_stops_mid_snapshot_when_session_moves(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """grok r1 #4: _drain_pushes must re-check the session token inside the
+        per-device loop, so a session boundary that lands between two devices of
+        one snapshot stops delivery instead of draining the rest into the cb."""
+        monkeypatch.setattr(bus_mod, "_PENDING_SETTLE_TIMEOUT_S", 0.05, raising=False)
+        _StartHarness(monkeypatch)  # installs the fake panel libs (side effect)
+        adapter = RpcBusAdapter()
+        release = asyncio.Event()
+        first_started = asyncio.Event()
+        seen: list[str] = []
+
+        async def cb(device: BrilliantDevice) -> None:
+            seen.append(device.peripheral_id)
+            if device.peripheral_id == "p1":
+                first_started.set()
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    await release.wait()  # swallow: survive this session's teardown
+
+        # Lossless so the whole [p1, p2] snapshot is retained and drained in order.
+        adapter.on_change(cb, coalesce_pushes=False)
+
+        try:
+            await adapter.start()
+            # One raw device with TWO peripherals => one snapshot of [p1, p2].
+            adapter._dispatch_raw_device(
+                _RawDevice("own-device", {"p1": _RawPeripheral(), "p2": _RawPeripheral()})
+            )
+            await asyncio.wait_for(first_started.wait(), timeout=1)  # parked in cb(p1)
+            await asyncio.wait_for(adapter.shutdown(), timeout=1)  # cancels drain; cb swallows
+
+            await adapter.start()  # session 2
+            release.set()  # cb(p1) returns; the stale drain would deliver p2 next
+            await _settle(5)
+            assert seen == ["p1"]  # p2 (rest of the session-1 snapshot) not delivered
+        finally:
+            release.set()
+            await _settle(5)
