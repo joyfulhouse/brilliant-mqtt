@@ -885,6 +885,23 @@ class PanelManager:
                 self.panel,
             )
             return
+        if self.availability is None and self._broker_unavailable():
+            # A None-availability panel (e.g. an undecodable LWT) while the broker is down.
+            # Do NOT fall through to async_repair: it would fire EVENT_REPAIR_STARTED (with no
+            # terminal) and re-fetch the payload on every recheck for the whole outage (#95).
+            # async_broker_reconnected re-arms grace only for an OFFLINE panel, so arm an
+            # unreachable-style _grace_expired recheck DIRECTLY to re-drive after reconnect.
+            # _grace_cancel was cleared at the top of this call, so this cannot stack a timer.
+            if self._grace_cancel is None:
+                self._grace_cancel = async_call_later(
+                    self.hass, _UNREACHABLE_RECHECK_SECONDS, self._grace_expired
+                )
+            _LOGGER.info(
+                "%s: bridge availability is unknown and HA's MQTT broker is unavailable; "
+                "will re-check after the broker reconnects",
+                self.panel,
+            )
+            return
         if not self._opt(OPT_AUTO_REPAIR, DEFAULT_AUTO_REPAIR):
             self._escalate("bridge offline past grace period (auto-repair is off)")
             return

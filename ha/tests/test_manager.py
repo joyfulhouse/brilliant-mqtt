@@ -1402,26 +1402,33 @@ async def test_auto_repair_skips_when_panel_recovers_during_connect(
     await manager.async_shutdown()
 
 
-async def test_grace_expiry_with_none_availability_is_not_broker_deferred(
+async def test_grace_expiry_none_broker_down_rechecks_without_repair_started(
     hass: HomeAssistant,
     payload_dir: Path,
 ) -> None:
-    """#95 finding 4: a grace expiry with UNKNOWN availability (None) while the broker is down
-    must NOT enter the broker-defer state — _arm_offline_grace can only re-arm an OFFLINE
-    panel, so a None defer would be un-reassessable. None falls THROUGH to auto-repair (rather
-    than being deferred at grace); the re-drive after skip is covered by
-    test_none_availability_broker_down_auto_repair_arms_recheck."""
+    """#95 round-3: a grace expiry with UNKNOWN availability (None) while the broker is down
+    arms an unreachable-style recheck DIRECTLY and returns — it must NOT loop through
+    async_repair, which would emit an EVENT_REPAIR_STARTED (with no terminal, breaking the
+    started→succeeded|failed contract) and re-fetch the payload every recheck for the whole
+    outage. It stays re-drivable (a recheck is always armed); the re-drive once the broker
+    returns is covered by test_none_availability_broker_down_auto_repair_arms_recheck."""
     entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
     entry.add_to_hass(hass)
     broker = SimpleNamespace(available=False)
     manager = _broker_gated_manager(hass, entry, broker)
-    manager.availability = None  # e.g. an undecodable LWT left it unknown
+    manager.availability = None  # unknown (e.g. an undecodable LWT), broker down
+    events = _capture_events(hass)
 
-    with patch.object(manager, "async_repair", AsyncMock()) as repair:
-        await manager._grace_expired(dt_util.utcnow())
-        await hass.async_block_till_done()
+    base = dt_util.utcnow()
+    await manager._grace_expired(base)  # cycle 1 (direct): arm the recheck, no async_repair
+    assert manager._grace_cancel is not None
 
-    repair.assert_awaited_once_with(trigger="auto")  # fell through, not broker-deferred
+    # cycle 2: the armed recheck fires while the broker is still down → it re-arms, no repair.
+    async_fire_time_changed(hass, base + timedelta(seconds=_UNREACHABLE_RECHECK_SECONDS + 1))
+    await hass.async_block_till_done()
+
+    assert manager._grace_cancel is not None  # re-armed for the next cycle (not stranded)
+    assert "repair_started" not in _types(events)  # no async_repair front-half / payload fetch
     await manager.async_shutdown()
 
 
@@ -1430,10 +1437,11 @@ async def test_none_availability_broker_down_auto_repair_arms_recheck(
     fake_shell: FakeShell,
     payload_dir: Path,
 ) -> None:
-    """#95 finding 3: a None-availability panel that reaches auto-repair while the broker is
-    down skips WITHOUT mutating, but arms an unreachable-style recheck so it is re-driven once
-    the broker returns — async_broker_reconnected cannot re-arm grace for a non-OFFLINE panel,
-    so without the recheck it would strand until a fresh LWT."""
+    """#95 finding 3: the genuine queued-then-broker-dropped case — a real auto-repair was
+    dispatched (broker up at grace) and the broker dropped while it queued behind the fleet SSH
+    lock, so async_repair is entered with availability None + broker down. It skips WITHOUT
+    mutating but arms an unreachable-style recheck (async_broker_reconnected cannot re-arm grace
+    for a non-OFFLINE panel), and once the broker returns the recheck re-drives a real repair."""
     entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
     entry.add_to_hass(hass)
     broker = SimpleNamespace(available=False)
