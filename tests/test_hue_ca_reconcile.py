@@ -1,9 +1,12 @@
+import pytest
+
 from brilliant_hue_ca.reconcile import (
     Outcome,
     cert_fingerprint,
     reconcile,
     split_pem_certs,
 )
+from brilliant_hue_ca.state import PendingReload, load_pending, save_pending
 
 # Two distinct self-signed EC P-256 certs generated once and pasted as
 # fixtures (openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256
@@ -64,15 +67,40 @@ class FakeFS:
 
 
 class FakeCoord:
-    def __init__(self, running: bool) -> None:
+    def __init__(self, running: bool, fail_first: int = 0) -> None:
         self._running = running
-        self.restarted = False
+        self._fail_remaining = fail_first
+        self.restarted = False  # kept for existing tests: last restart succeeded
+        self.attempts = 0  # total restart() calls (including ones that raise)
+        self.successes = 0  # restart() calls that returned without raising
 
     def is_running(self) -> bool:
         return self._running
 
     def restart(self) -> None:
+        self.attempts += 1
+        if self._fail_remaining > 0:
+            self._fail_remaining -= 1
+            raise OSError("simulated transient vassal-touch failure")
         self.restarted = True
+        self.successes += 1
+
+
+class KilledDuringRestart:
+    """Models the oneshot being hard-killed *during* the restart call: restart
+    raises something reconcile does NOT catch (only OSError is caught), so it
+    propagates like a real crash. The pending marker must already have been
+    persisted to disk *before* restart was invoked."""
+
+    def __init__(self) -> None:
+        self.attempts = 0
+
+    def is_running(self) -> bool:
+        return True
+
+    def restart(self) -> None:
+        self.attempts += 1
+        raise KeyboardInterrupt
 
 
 def test_fingerprint_matches_across_rewrapped_pem() -> None:
@@ -153,3 +181,158 @@ def test_unparseable_block_in_bundle_is_skipped_not_fatal() -> None:
     coord = FakeCoord(running=False)
     out = reconcile(fs, coord, bundle_path="/b", site_packages_root="/sp", ca_pem=CA_A)
     assert out.appended is True  # CA_A not present -> appended; garbage block skipped
+
+
+# --- issue #96: retry the coordinator reload after a partial recovery ---------
+
+STATE = "/state.json"
+INTERVAL = 300.0
+
+
+def test_restart_oserror_then_next_run_completes_retry() -> None:
+    # The literal repro: first restart raises OSError; running ten subsequent
+    # reconciles (each a fresh oneshot, `now` advanced past the interval) must
+    # eventually land exactly one successful restart and then stop retrying.
+    fs = FakeFS({"/b": CA_B}, {})
+    coord = FakeCoord(running=True, fail_first=1)
+
+    out = reconcile(
+        fs, coord, bundle_path="/b", site_packages_root="/sp", ca_pem=CA_A,
+        state_path=STATE, min_retry_interval_s=INTERVAL, now=1000.0,
+    )
+    assert out.appended is True
+    assert out.coordinator_restarted is False  # first restart did NOT succeed
+    assert out.reload_pending is True
+    assert coord.attempts == 1 and coord.successes == 0
+    assert CA_A.strip() in fs.files["/b"]
+
+    now = 1000.0
+    for _ in range(10):
+        now += INTERVAL + 1
+        out = reconcile(
+            fs, coord, bundle_path="/b", site_packages_root="/sp", ca_pem=CA_A,
+            state_path=STATE, min_retry_interval_s=INTERVAL, now=now,
+        )
+    assert coord.successes == 1  # completed exactly once...
+    assert coord.attempts == 2  # ...and stopped retrying after it succeeded
+    assert out.reload_pending is False
+    assert load_pending(fs, STATE) is None
+    assert len(fs.appended) == 1  # cert appended once, never duplicated
+
+
+def test_interruption_after_append_is_retried_by_fresh_run() -> None:
+    # Append + persist-marker happen, then the process is killed mid-restart
+    # (uncaught). A brand-new process must still complete the reload, driven by
+    # the on-disk marker (nothing survives in memory across oneshot runs).
+    fs = FakeFS({"/b": CA_B}, {})
+    dying = KilledDuringRestart()
+    with pytest.raises(KeyboardInterrupt):
+        reconcile(
+            fs, dying, bundle_path="/b", site_packages_root="/sp", ca_pem=CA_A,
+            state_path=STATE, min_retry_interval_s=INTERVAL, now=1000.0,
+        )
+    assert dying.attempts == 1
+    assert CA_A.strip() in fs.files["/b"]  # cert was appended before the kill
+    assert load_pending(fs, STATE) is not None  # marker durable on disk
+
+    fresh = FakeCoord(running=True)  # a new oneshot, nothing in memory
+    out = reconcile(
+        fs, fresh, bundle_path="/b", site_packages_root="/sp", ca_pem=CA_A,
+        state_path=STATE, min_retry_interval_s=INTERVAL, now=2000.0,
+    )
+    assert out.appended is False  # no duplicate append
+    assert fresh.successes == 1  # reload completed on the fresh run
+    assert out.reload_pending is False
+    assert load_pending(fs, STATE) is None
+
+
+def test_retry_is_paced_between_attempts() -> None:
+    fs = FakeFS({"/b": CA_B}, {})
+    coord = FakeCoord(running=True, fail_first=99)  # restart always fails
+    reconcile(
+        fs, coord, bundle_path="/b", site_packages_root="/sp", ca_pem=CA_A,
+        state_path=STATE, min_retry_interval_s=INTERVAL, now=1000.0,
+    )
+    assert coord.attempts == 1
+
+    out = reconcile(  # too soon after the last attempt: must NOT re-attempt
+        fs, coord, bundle_path="/b", site_packages_root="/sp", ca_pem=CA_A,
+        state_path=STATE, min_retry_interval_s=INTERVAL, now=1010.0,
+    )
+    assert coord.attempts == 1
+    assert out.reload_pending is True  # still owed, just paced
+
+    reconcile(  # interval elapsed: attempt again
+        fs, coord, bundle_path="/b", site_packages_root="/sp", ca_pem=CA_A,
+        state_path=STATE, min_retry_interval_s=INTERVAL, now=1000.0 + INTERVAL + 1,
+    )
+    assert coord.attempts == 2
+
+
+def test_ca_present_with_no_pending_state_is_noop() -> None:
+    fs = FakeFS({"/b": CA_B + CA_A}, {})
+    coord = FakeCoord(running=True)
+    out = reconcile(
+        fs, coord, bundle_path="/b", site_packages_root="/sp", ca_pem=CA_A,
+        state_path=STATE, min_retry_interval_s=INTERVAL, now=1000.0,
+    )
+    assert out == Outcome(
+        bundle_found=True, appended=False, coordinator_restarted=False, bundle_path="/b"
+    )
+    assert out.reload_pending is False
+    assert coord.attempts == 0
+    assert fs.appended == []
+    assert load_pending(fs, STATE) is None  # no spurious marker created
+
+
+def test_non_host_appends_without_restart_and_creates_no_pending() -> None:
+    fs = FakeFS({"/b": CA_B}, {})
+    coord = FakeCoord(running=False)
+    out = reconcile(
+        fs, coord, bundle_path="/b", site_packages_root="/sp", ca_pem=CA_A,
+        state_path=STATE, min_retry_interval_s=INTERVAL, now=1000.0,
+    )
+    assert out.appended is True
+    assert out.coordinator_restarted is False
+    assert out.reload_pending is False
+    assert coord.attempts == 0
+    assert load_pending(fs, STATE) is None  # non-host: nothing owed, no marker
+
+
+def test_pending_cleared_after_success_then_noop() -> None:
+    fs = FakeFS({"/b": CA_B}, {})
+    coord = FakeCoord(running=True, fail_first=1)
+    reconcile(
+        fs, coord, bundle_path="/b", site_packages_root="/sp", ca_pem=CA_A,
+        state_path=STATE, min_retry_interval_s=INTERVAL, now=1000.0,
+    )
+    reconcile(  # retry succeeds, clears the marker
+        fs, coord, bundle_path="/b", site_packages_root="/sp", ca_pem=CA_A,
+        state_path=STATE, min_retry_interval_s=INTERVAL, now=2000.0,
+    )
+    assert coord.successes == 1
+    assert load_pending(fs, STATE) is None
+
+    out = reconcile(  # clean no-op afterwards
+        fs, coord, bundle_path="/b", site_packages_root="/sp", ca_pem=CA_A,
+        state_path=STATE, min_retry_interval_s=INTERVAL, now=3000.0,
+    )
+    assert out.reload_pending is False
+    assert coord.attempts == 2  # unchanged: no run-3 attempt
+
+
+def test_stale_marker_for_other_generation_does_not_fire() -> None:
+    # Bundle already contains CA_A, but the on-disk marker is for CA_B (a
+    # different generation). It must not trigger a restart against CA_A.
+    fs = FakeFS({"/b": CA_B + CA_A}, {})
+    coord = FakeCoord(running=True)
+    save_pending(
+        fs, STATE, PendingReload("/b", cert_fingerprint(CA_B), last_attempt_at=0.0)
+    )
+    out = reconcile(
+        fs, coord, bundle_path="/b", site_packages_root="/sp", ca_pem=CA_A,
+        state_path=STATE, min_retry_interval_s=INTERVAL, now=10_000.0,
+    )
+    assert out.appended is False
+    assert out.reload_pending is False
+    assert coord.attempts == 0
