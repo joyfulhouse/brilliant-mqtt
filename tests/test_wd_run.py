@@ -207,22 +207,27 @@ class SpyLadder:
         return self._action
 
 
-def test_poll_once_reaches_ladder_when_broker_diagnostic_is_inconclusive(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    "broker_result",
+    [probe.TcpProbe.OPEN, probe.TcpProbe.CLOSED, probe.TcpProbe.INCONCLUSIVE],
+)
+def test_poll_once_broker_diagnostic_never_influences_the_decision(
+    monkeypatch: pytest.MonkeyPatch, broker_result: probe.TcpProbe
 ) -> None:
+    """Whatever the broker diagnostic reports — up, down, or timed out — the ladder
+    is reached each cycle and observes ONLY the ping-derived health, and no reboot
+    is driven. The diagnostic is log-only (contract 5)."""
     monkeypatch.setattr(probe, "ping", lambda gw: True)  # gateway healthy
-    monkeypatch.setattr(probe, "tcp_open", lambda h, p: probe.TcpProbe.INCONCLUSIVE)
+    monkeypatch.setattr(probe, "tcp_open", lambda h, p: broker_result)
     cfg = run.load_config({"MQTT_HOST": "broker", "WIFI_WATCHDOG_GATEWAY": "10.0.0.1"})
     guard, ladder = FakeGuard(True), SpyLadder(Action.NONE)
 
     run._poll_once(cfg, guard=guard, ladder=ladder)
     run._poll_once(cfg, guard=guard, ladder=ladder)  # continues polling after the diagnostic
 
-    # The ladder was reached on every cycle (diagnostic never blocked it), and it
-    # saw only the ping-derived health — a timed-out diagnostic drove no reboot.
-    assert ladder.observed == [True, True]
+    assert ladder.observed == [True, True]  # ping-only health, independent of broker_result
     assert ladder.eligibility == [True, True]  # the single shared guard read reached the ladder
-    assert guard.recorded == []
+    assert guard.recorded == []  # diagnostic drove no reboot in any state
 
 
 def test_poll_once_dispatches_the_action_the_ladder_returns(

@@ -33,9 +33,7 @@ def _spy_run_bounded(
 ) -> list[dict[str, Any]]:
     calls: list[dict[str, Any]] = []
 
-    def spy(
-        argv: Any, *, timeout: float, capture: bool = False, popen: Any = None
-    ) -> bounded.Completed:
+    def spy(argv: Any, *, timeout: float, capture: bool = False) -> bounded.Completed:
         calls.append({"argv": list(argv), "timeout": timeout, "capture": capture})
         return bounded.Completed(returncode=returncode, stdout=stdout, timed_out=timed_out)
 

@@ -1,87 +1,110 @@
-"""Bounded child-process execution: a hung probe/recovery child must be killed,
-reaped, and reported as a bounded failure so the watchdog loop keeps running."""
+"""Bounded child-process execution, proven against REAL child processes: a hung
+child (and any grandchild holding its stdout pipe) is killed, reaped, and
+reported as a bounded failure so the watchdog loop keeps running."""
 
 from __future__ import annotations
 
-import subprocess
+import sys
+import time
+from pathlib import Path
+
+import pytest
 
 from brilliant_bus_watchdog import bounded
 
-
-class FakePopen:
-    """A stand-in for :class:`subprocess.Popen` that records kill/reap calls.
-
-    ``communicate`` raises :class:`subprocess.TimeoutExpired` on its first call
-    when ``timeout_first`` is set (the hung-child case); the caller must then
-    ``kill`` and ``communicate`` again to reap, which we count.
-    """
-
-    def __init__(self, *, timeout_first: bool = False, returncode: int = 0, out: str = "") -> None:
-        self._timeout_first = timeout_first
-        self._out = out
-        self.returncode = returncode
-        self.kill_calls = 0
-        self.communicate_calls = 0
-
-    def communicate(
-        self, input: str | None = None, timeout: float | None = None
-    ) -> tuple[str, str]:
-        self.communicate_calls += 1
-        if self._timeout_first and self.communicate_calls == 1:
-            raise subprocess.TimeoutExpired(cmd="fake", timeout=timeout or 0.0)
-        return (self._out, "")
-
-    def kill(self) -> None:
-        self.kill_calls += 1
+# Process-group kill and /proc liveness are Linux-specific; the watchdog is a
+# Linux on-panel agent, so gate the kill/reap tests there. The success/rc tests
+# below are portable and run everywhere.
+_LINUX = pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="process-group kill + /proc liveness are Linux-only",
+)
 
 
-def test_run_bounded_success_returns_rc_and_stdout() -> None:
-    fake = FakePopen(returncode=0, out="hello\n")
-    result = bounded.run_bounded(
-        ["echo", "hi"], timeout=5.0, capture=True, popen=lambda *a, **k: fake
-    )
+def _proc_state(pid: int) -> str | None:
+    """The /proc state char for *pid* ('R','S','D' alive; 'Z' zombie), or None if
+    the process is gone. comm (field 2) is parenthesized and may contain spaces,
+    so read the state as the char two positions after the final ')'."""
+    try:
+        with open(f"/proc/{pid}/stat", encoding="ascii") as f:
+            data = f.read()
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    return data[data.rfind(")") + 2]
+
+
+def _wait_killed(pid: int, timeout: float) -> bool:
+    """True once *pid* is gone or a zombie (i.e. killed), False if it stays alive."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _proc_state(pid) in (None, "Z"):
+            return True
+        time.sleep(0.02)
+    return _proc_state(pid) in (None, "Z")
+
+
+def test_run_bounded_success_zero_rc() -> None:
+    result = bounded.run_bounded([sys.executable, "-c", "pass"], timeout=10.0)
     assert result.timed_out is False
     assert result.returncode == 0
-    assert result.stdout == "hello\n"
+
+
+def test_run_bounded_captures_stdout() -> None:
+    result = bounded.run_bounded([sys.executable, "-c", "print('hi')"], timeout=10.0, capture=True)
+    assert result.timed_out is False
+    assert result.returncode == 0
+    assert result.stdout == "hi\n"
 
 
 def test_run_bounded_nonzero_rc_is_not_a_timeout() -> None:
-    fake = FakePopen(returncode=1)
-    result = bounded.run_bounded(["false"], timeout=5.0, popen=lambda *a, **k: fake)
+    result = bounded.run_bounded([sys.executable, "-c", "import sys; sys.exit(3)"], timeout=10.0)
     assert result.timed_out is False
-    assert result.returncode == 1
+    assert result.returncode == 3
 
 
-def test_run_bounded_timeout_kills_and_reaps_child() -> None:
-    """The hung-child + cleanup case: kill the child, then reap it (a second
-    communicate) so no zombie or lingering process remains."""
-    fake = FakePopen(timeout_first=True)
-    result = bounded.run_bounded(["sleep", "999"], timeout=0.01, popen=lambda *a, **k: fake)
+@_LINUX
+def test_run_bounded_hung_child_is_bounded_and_reaped() -> None:
+    start = time.monotonic()
+    result = bounded.run_bounded([sys.executable, "-c", "import time; time.sleep(30)"], timeout=0.3)
+    elapsed = time.monotonic() - start
     assert result.timed_out is True
     assert result.returncode == bounded.TIMEOUT_RC
-    assert fake.kill_calls == 1  # child was killed
-    assert fake.communicate_calls == 2  # first timed out, second reaped the killed child
+    assert elapsed < 10.0  # bounded near the 0.3s deadline, not the 30s sleep
 
 
-def test_run_bounded_timeout_does_not_raise_so_loop_continues() -> None:
-    """A timeout is reported, never raised, so the watchdog proceeds to its next
-    check instead of dying on an unhandled TimeoutExpired."""
-    fake = FakePopen(timeout_first=True)
-    # Must not raise:
-    result = bounded.run_bounded(["hang"], timeout=0.01, popen=lambda *a, **k: fake)
+@_LINUX
+def test_run_bounded_kills_grandchild_holding_the_stdout_pipe(tmp_path: Path) -> None:
+    """The HIGH case: with capture=True a grandchild inheriting the stdout pipe
+    would block a read-to-EOF reap for its whole lifetime. Killing the process
+    group (not just the direct child) and reaping with wait() bounds it and
+    leaves no lingering grandchild."""
+    pidfile = tmp_path / "gc.pid"
+    script = (
+        "import subprocess, sys, time\n"
+        # grandchild inherits our stdout (the capture pipe) and holds it open
+        "gc = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+        "open(sys.argv[1], 'w').write(str(gc.pid))\n"
+        "time.sleep(30)\n"
+    )
+    start = time.monotonic()
+    result = bounded.run_bounded(
+        [sys.executable, "-c", script, str(pidfile)], timeout=0.3, capture=True
+    )
+    elapsed = time.monotonic() - start
     assert result.timed_out is True
+    assert elapsed < 10.0  # NOT ~30s: the grandchild no longer wedges the reap
+    gc_pid = int(pidfile.read_text())
+    assert _wait_killed(gc_pid, timeout=5.0)  # grandchild killed, not lingering
 
 
-def test_run_bounded_passes_timeout_through_to_communicate() -> None:
-    seen: list[float | None] = []
-
-    class RecordingPopen(FakePopen):
-        def communicate(
-            self, input: str | None = None, timeout: float | None = None
-        ) -> tuple[str, str]:
-            seen.append(timeout)
-            return super().communicate(timeout=timeout)
-
-    rec = RecordingPopen(returncode=0)
-    bounded.run_bounded(["x"], timeout=2.5, popen=lambda *a, **k: rec)
-    assert seen == [2.5]
+@_LINUX
+def test_run_bounded_sigkills_child_that_ignores_sigterm() -> None:
+    """A child that ignores catchable termination signals — as glibc's C resolver
+    effectively ignores a Python-level alarm — is still bounded: the group is sent
+    the uncatchable SIGKILL."""
+    script = "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)"
+    start = time.monotonic()
+    result = bounded.run_bounded([sys.executable, "-c", script], timeout=0.3)
+    elapsed = time.monotonic() - start
+    assert result.timed_out is True
+    assert elapsed < 10.0

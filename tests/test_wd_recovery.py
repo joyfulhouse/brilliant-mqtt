@@ -64,9 +64,7 @@ def test_gpio_reset_then_reboot() -> None:
 def test_recovery_default_runner_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
     seen: list[tuple[list[str], float]] = []
 
-    def spy(
-        argv: Any, *, timeout: float, capture: bool = False, popen: Any = None
-    ) -> bounded.Completed:
+    def spy(argv: Any, *, timeout: float, capture: bool = False) -> bounded.Completed:
         seen.append((list(argv), timeout))
         return bounded.Completed(returncode=0, stdout="", timed_out=False)
 

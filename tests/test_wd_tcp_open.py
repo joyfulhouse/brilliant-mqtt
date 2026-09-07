@@ -2,43 +2,53 @@
 attempt, returning a tri-state so a timed-out diagnostic is never mistaken for
 proof the broker is down.
 
-Logic is exercised with injected resolver/connect/monotonic (no real network);
-one integration test drives the real fractional-second SIGALRM to prove a hung
-getaddrinfo is actually interrupted."""
+DNS is bounded by resolving in a killed-and-reaped child (a Python SIGALRM
+cannot abort glibc's in-C resolver), so these tests inject the resolve/connect
+seams for deterministic logic coverage and drive `_resolve_bounded` with an
+injected child runner — no real DNS, no real network. The real killed-and-reaped
+child behaviour is proven in test_wd_bounded.py."""
 
 from __future__ import annotations
 
-import signal
 import socket
+import sys
 import threading
-import time
 from typing import Any
 
 import pytest
 
-from brilliant_wifi_watchdog import probe
+from brilliant_wifi_watchdog import bounded, probe
 from brilliant_wifi_watchdog.probe import TcpProbe
 
 _A1 = (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.1", 1883))
 _A2 = (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("::1", 1883, 0, 0))
 
 
-def _resolver(*infos: tuple[Any, ...]) -> Any:
-    def resolve(host: str, port: int, family: int, socktype: int) -> list[tuple[Any, ...]]:
+def _resolve(*infos: tuple[Any, ...]) -> probe._Resolve:
+    def resolve(host: str, port: int, budget: float) -> list[tuple[Any, ...]] | None:
         return list(infos)
 
     return resolve
 
 
+def _never_connect(family: int, socktype: int, proto: int, sockaddr: Any, timeout: float) -> None:
+    raise AssertionError("connect should not be called")
+
+
+# ---------------------------------------------------------------------------
+# tcp_open — connect-loop logic over injected resolution
+# ---------------------------------------------------------------------------
+
+
 def test_open_on_first_candidate() -> None:
-    called: list[Any] = []
+    seen: list[Any] = []
 
     def connect(family: int, socktype: int, proto: int, sockaddr: Any, timeout: float) -> None:
-        called.append(sockaddr)
+        seen.append(sockaddr)
 
-    result = probe.tcp_open("broker", 1883, timeout=1.0, resolver=_resolver(_A1), connect=connect)
+    result = probe.tcp_open("broker", 1883, timeout=1.0, resolve=_resolve(_A1), connect=connect)
     assert result is TcpProbe.OPEN
-    assert called == [_A1[4]]
+    assert seen == [_A1[4]]
 
 
 def test_tries_next_candidate_then_open() -> None:
@@ -50,7 +60,7 @@ def test_tries_next_candidate_then_open() -> None:
             raise OSError("connection refused")  # first address fails
 
     result = probe.tcp_open(
-        "broker", 1883, timeout=1.0, resolver=_resolver(_A1, _A2), connect=connect
+        "broker", 1883, timeout=1.0, resolve=_resolve(_A1, _A2), connect=connect
     )
     assert result is TcpProbe.OPEN
     assert seen == [_A1[4], _A2[4]]  # both candidates attempted, in order
@@ -64,46 +74,59 @@ def test_closed_when_all_candidates_refuse() -> None:
         raise OSError("connection refused")
 
     result = probe.tcp_open(
-        "broker", 1883, timeout=1.0, resolver=_resolver(_A1, _A2), connect=connect
+        "broker", 1883, timeout=1.0, resolve=_resolve(_A1, _A2), connect=connect
     )
     assert result is TcpProbe.CLOSED  # a conclusive, in-budget "down"
     assert len(seen) == 2
 
 
 def test_inconclusive_when_no_addresses() -> None:
-    result = probe.tcp_open(
-        "broker", 1883, timeout=1.0, resolver=_resolver(), connect=_never_called
-    )
+    result = probe.tcp_open("broker", 1883, timeout=1.0, resolve=_resolve(), connect=_never_connect)
     assert result is TcpProbe.INCONCLUSIVE
 
 
-def test_inconclusive_on_dns_failure() -> None:
-    def resolve(host: str, port: int, family: int, socktype: int) -> list[tuple[Any, ...]]:
-        raise socket.gaierror("name resolution failed")
+def test_inconclusive_when_resolution_fails() -> None:
+    """resolve() returns None when the (bounded) resolver could not complete —
+    a stuck/killed/failed DNS. That is INCONCLUSIVE, never proof of down."""
 
-    result = probe.tcp_open("broker", 1883, timeout=1.0, resolver=resolve, connect=_never_called)
-    assert result is TcpProbe.INCONCLUSIVE  # DNS failure proves nothing about the broker
+    def resolve(host: str, port: int, budget: float) -> list[tuple[Any, ...]] | None:
+        return None
+
+    result = probe.tcp_open("broker", 1883, timeout=1.0, resolve=resolve, connect=_never_connect)
+    assert result is TcpProbe.INCONCLUSIVE
 
 
 def test_inconclusive_when_timeout_non_positive() -> None:
-    resolver_calls: list[Any] = []
+    calls: list[str] = []
 
-    def resolve(host: str, port: int, family: int, socktype: int) -> list[tuple[Any, ...]]:
-        resolver_calls.append(host)
+    def resolve(host: str, port: int, budget: float) -> list[tuple[Any, ...]] | None:
+        calls.append(host)
         return [_A1]
 
-    result = probe.tcp_open("broker", 1883, timeout=0.0, resolver=resolve, connect=_never_called)
+    result = probe.tcp_open("broker", 1883, timeout=0.0, resolve=resolve, connect=_never_connect)
     assert result is TcpProbe.INCONCLUSIVE
-    assert resolver_calls == []  # no budget to even resolve
+    assert calls == []  # no budget to even resolve
 
 
 def test_connect_timeout_is_inconclusive_not_closed() -> None:
     def connect(family: int, socktype: int, proto: int, sockaddr: Any, timeout: float) -> None:
         raise TimeoutError("connect timed out")
 
-    result = probe.tcp_open("broker", 1883, timeout=1.0, resolver=_resolver(_A1), connect=connect)
-    # A connect that ran out its budget is inconclusive — not proof the broker is down.
-    assert result is TcpProbe.INCONCLUSIVE
+    result = probe.tcp_open("broker", 1883, timeout=1.0, resolve=_resolve(_A1), connect=connect)
+    assert result is TcpProbe.INCONCLUSIVE  # a budget-exhausted connect proves nothing
+
+
+def test_resolution_shares_the_total_deadline() -> None:
+    """resolve() is handed the remaining budget, so a slow resolution eats into
+    the same deadline the connects use (one total deadline)."""
+    seen_budget: list[float] = []
+
+    def resolve(host: str, port: int, budget: float) -> list[tuple[Any, ...]] | None:
+        seen_budget.append(budget)
+        return [_A1]
+
+    probe.tcp_open("broker", 1883, timeout=2.5, resolve=resolve, connect=lambda *a: None)
+    assert seen_budget and seen_budget[0] == pytest.approx(2.5, abs=0.2)
 
 
 def test_budget_shrinks_across_candidates() -> None:
@@ -116,13 +139,13 @@ def test_budget_shrinks_across_candidates() -> None:
         if sockaddr == _A1[4]:
             raise OSError("refused")
 
-    # monotonic: deadline calc (0.0) -> iter1 remaining (0.5) -> iter2 remaining (0.9)
-    clock = iter([0.0, 0.5, 0.9])
+    # monotonic: deadline calc (0.0) -> resolve budget (0.0) -> iter1 (0.5) -> iter2 (0.9)
+    clock = iter([0.0, 0.0, 0.5, 0.9])
     result = probe.tcp_open(
         "broker",
         1883,
         timeout=1.0,
-        resolver=_resolver(_A1, _A2),
+        resolve=_resolve(_A1, _A2),
         connect=connect,
         monotonic=lambda: next(clock),
     )
@@ -139,13 +162,13 @@ def test_stops_when_total_deadline_exceeded_between_candidates() -> None:
         seen.append(sockaddr)
         raise OSError("refused")
 
-    # deadline calc (0.0) -> iter1 remaining=0.5 (>0, attempt) -> iter2 remaining=-0.5 (stop)
-    clock = iter([0.0, 0.5, 1.5])
+    # deadline (0.0) -> resolve budget (0.0) -> iter1 remaining=0.5 -> iter2 remaining=-0.5
+    clock = iter([0.0, 0.0, 0.5, 1.5])
     result = probe.tcp_open(
         "broker",
         1883,
         timeout=1.0,
-        resolver=_resolver(_A1, _A2),
+        resolve=_resolve(_A1, _A2),
         connect=connect,
         monotonic=lambda: next(clock),
     )
@@ -153,33 +176,28 @@ def test_stops_when_total_deadline_exceeded_between_candidates() -> None:
     assert len(seen) == 1  # second candidate skipped — the total deadline had passed
 
 
-def test_signal_state_restored_after_call() -> None:
-    """No lingering alarm or handler: the itimer is cleared and the previous
-    SIGALRM handler is restored, so repeated probes don't accumulate signal
-    state (analogous to not leaking resolver threads)."""
-    if not hasattr(signal, "setitimer"):
-        pytest.skip("no SIGALRM/setitimer on this platform")
-    before = signal.getsignal(signal.SIGALRM)
+def test_off_main_thread_shrinking_budget_holds() -> None:
+    """No signals are used, so the deadline/shrinking-budget behaviour holds on a
+    worker thread too — asserted via recorded connect timeouts, not merely 'no
+    crash'. (DNS bounding off the main thread relies on the child resolver, which
+    is likewise thread-agnostic.)"""
+    box: dict[str, Any] = {}
+    timeouts: list[float] = []
 
     def connect(family: int, socktype: int, proto: int, sockaddr: Any, timeout: float) -> None:
-        pass
-
-    probe.tcp_open("broker", 1883, timeout=1.0, resolver=_resolver(_A1), connect=connect)
-    assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)  # disarmed
-    assert signal.getsignal(signal.SIGALRM) is before  # handler restored
-
-
-def test_off_main_thread_does_not_crash_and_still_bounds() -> None:
-    """setitimer/signal are main-thread only; off the main thread the alarm is a
-    graceful no-op and the monotonic budget still bounds the connect loop."""
-    box: dict[str, TcpProbe] = {}
-
-    def connect(family: int, socktype: int, proto: int, sockaddr: Any, timeout: float) -> None:
-        pass
+        timeouts.append(timeout)
+        if sockaddr == _A1[4]:
+            raise OSError("refused")
 
     def worker() -> None:
+        clock = iter([0.0, 0.0, 0.5, 0.9])
         box["r"] = probe.tcp_open(
-            "broker", 1883, timeout=1.0, resolver=_resolver(_A1), connect=connect
+            "broker",
+            1883,
+            timeout=1.0,
+            resolve=_resolve(_A1, _A2),
+            connect=connect,
+            monotonic=lambda: next(clock),
         )
 
     t = threading.Thread(target=worker)
@@ -187,25 +205,70 @@ def test_off_main_thread_does_not_crash_and_still_bounds() -> None:
     t.join(timeout=5.0)
     assert not t.is_alive()
     assert box["r"] is TcpProbe.OPEN
+    assert timeouts == [pytest.approx(0.5), pytest.approx(0.1)]  # shrinking budget, on a thread
 
 
-@pytest.mark.skipif(not hasattr(signal, "setitimer"), reason="no SIGALRM/setitimer")
-def test_delayed_dns_is_interrupted_within_deadline() -> None:
-    """The core fix: a hung getaddrinfo is interrupted by the fractional-second
-    SIGALRM instead of blocking far past the intended timeout."""
-
-    def slow_resolver(host: str, port: int, family: int, socktype: int) -> list[tuple[Any, ...]]:
-        time.sleep(3.0)  # simulate a wedged resolver
-        return [_A1]
-
-    start = time.monotonic()
-    result = probe.tcp_open(
-        "broker", 1883, timeout=0.05, resolver=slow_resolver, connect=_never_called
-    )
-    elapsed = time.monotonic() - start
-    assert result is TcpProbe.INCONCLUSIVE
-    assert elapsed < 1.0  # returned near the 0.05s deadline, not after the 3s sleep
+# ---------------------------------------------------------------------------
+# _resolve_bounded — IP literals resolve in-process; hostnames via a bounded,
+# killed-and-reaped child (the real bounding is proven in test_wd_bounded.py).
+# ---------------------------------------------------------------------------
 
 
-def _never_called(family: int, socktype: int, proto: int, sockaddr: Any, timeout: float) -> None:
-    raise AssertionError("connect should not be called")
+def _boom_run(*args: Any, **kwargs: Any) -> bounded.Completed:
+    raise AssertionError("run_bounded must not be called for an IP literal")
+
+
+def test_resolve_ip_literal_uses_no_child() -> None:
+    infos = probe._resolve_bounded("127.0.0.1", 1883, 1.0, run=_boom_run)
+    assert infos is not None
+    assert any(ai[4][0] == "127.0.0.1" for ai in infos)  # resolved numerically, no child spawned
+
+
+def test_resolve_ipv6_literal_uses_no_child() -> None:
+    infos = probe._resolve_bounded("::1", 1883, 1.0, run=_boom_run)
+    assert infos is not None
+    assert any(ai[4][0] == "::1" for ai in infos)
+
+
+def test_resolve_hostname_timeout_returns_none() -> None:
+    """A DNS child that hangs is killed by run_bounded (timed_out=True); the
+    resolver reports None so tcp_open is bounded regardless of whether the stuck
+    C resolver would honour any signal."""
+
+    def run(*args: Any, **kwargs: Any) -> bounded.Completed:
+        return bounded.Completed(returncode=bounded.TIMEOUT_RC, stdout="", timed_out=True)
+
+    assert probe._resolve_bounded("broker.invalid", 1883, 1.0, run=run) is None
+
+
+def test_resolve_hostname_failure_returns_none() -> None:
+    def run(*args: Any, **kwargs: Any) -> bounded.Completed:
+        return bounded.Completed(
+            returncode=3, stdout="", timed_out=False
+        )  # child getaddrinfo error
+
+    assert probe._resolve_bounded("broker.invalid", 1883, 1.0, run=run) is None
+
+
+def test_resolve_hostname_success_parses_ips_via_python_child() -> None:
+    seen: dict[str, Any] = {}
+
+    def run(argv: Any, *, timeout: float, capture: bool = False) -> bounded.Completed:
+        seen["argv"] = list(argv)
+        seen["timeout"] = timeout
+        seen["capture"] = capture
+        return bounded.Completed(returncode=0, stdout="127.0.0.1\n", timed_out=False)
+
+    infos = probe._resolve_bounded("broker.local", 1883, 2.0, run=run)
+    assert infos is not None
+    assert any(ai[4][0] == "127.0.0.1" for ai in infos)  # child IP rebuilt into an addrinfo
+    assert seen["argv"][0] == sys.executable  # dependency-free child (no assumed tool)
+    assert seen["timeout"] == 2.0  # the child gets the full remaining budget
+    assert seen["capture"] is True
+
+
+def test_resolve_hostname_no_budget_skips_child() -> None:
+    def run(*args: Any, **kwargs: Any) -> bounded.Completed:
+        raise AssertionError("no budget: the resolver child must not be spawned")
+
+    assert probe._resolve_bounded("broker.local", 1883, 0.0, run=run) is None

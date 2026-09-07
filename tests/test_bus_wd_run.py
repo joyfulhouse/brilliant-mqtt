@@ -126,9 +126,7 @@ def test_service_active_false_when_runner_raises_oserror() -> None:
 def test_service_active_default_runner_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[dict[str, Any]] = []
 
-    def spy(
-        argv: Any, *, timeout: float, capture: bool = False, popen: Any = None
-    ) -> bounded.Completed:
+    def spy(argv: Any, *, timeout: float, capture: bool = False) -> bounded.Completed:
         calls.append({"argv": list(argv), "timeout": timeout, "capture": capture})
         return bounded.Completed(returncode=0, stdout="active\n", timed_out=False)
 
@@ -143,9 +141,7 @@ def test_service_active_timeout_reads_as_inactive(monkeypatch: pytest.MonkeyPatc
     """A hung `systemctl is-active` must not read as active — that would let the
     watchdog believe the bridge is up when it cannot actually tell."""
 
-    def spy(
-        argv: Any, *, timeout: float, capture: bool = False, popen: Any = None
-    ) -> bounded.Completed:
+    def spy(argv: Any, *, timeout: float, capture: bool = False) -> bounded.Completed:
         return bounded.Completed(returncode=bounded.TIMEOUT_RC, stdout="", timed_out=True)
 
     monkeypatch.setattr(bounded, "run_bounded", spy)
