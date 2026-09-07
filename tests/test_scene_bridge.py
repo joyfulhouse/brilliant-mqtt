@@ -2845,6 +2845,54 @@ async def test_poll_confirms_repeated_same_mode_activation_with_new_timestamp(
     await bridge.async_shutdown()
 
 
+async def test_mode_watermark_rejects_old_stamp_but_delayed_pre_request_stamp_confirms(
+    tmp_path: Path,
+) -> None:
+    """Characterize the mode chronology limitation deferred to live-panel work."""
+    seeded_at_ms = _NOW_MS - 2_000
+    bridge, bus, mqtt, clock, _ = await _started(
+        tmp_path,
+        execution=_execution(mode_id="away", mode_at_ms=seeded_at_ms),
+        mode_ids=("away", "home"),
+    )
+    mqtt.published.clear()
+    timeout_id = "22222222-2222-4222-8222-222222222222"
+    delayed_id = "44444444-4444-4444-8444-444444444444"
+    await mqtt.inject(mode_command_topic(_PANEL), _command(timeout_id, "mode", "home"))
+    await mqtt.inject(mode_command_topic(_PANEL), _command(delayed_id, "mode", "away"))
+    await _wait_for_bus_commands(bus, 2)
+
+    await bridge.poll_executions([_execution(mode_id="away", mode_at_ms=seeded_at_ms - 1)])
+
+    assert bridge._mode_watermarks[_PANEL] == (seeded_at_ms, "away")
+    assert _published(mqtt, mode_event_topic(_PANEL)) == []
+    assert _published(mqtt, mode_result_topic(delayed_id)) == []
+
+    # Current limitation: although this previously unseen stamp predates both
+    # requests, it is newer than the global watermark and confirms by mode id.
+    await bridge.poll_executions([_execution(mode_id="away", mode_at_ms=_NOW_MS - 1_000)])
+    await _wait_for_publish(mqtt, mode_result_topic(delayed_id))
+    delayed = _payload(_published(mqtt, mode_result_topic(delayed_id))[-1])
+    assert delayed["accepted"] is True
+    delivery_task = bridge._delivery_task
+    assert delivery_task is not None
+    await asyncio.wait_for(delivery_task, timeout=2)
+
+    timeout_task = bridge._mode_pending[timeout_id].timeout_task
+    assert timeout_task is not None
+    await clock.advance_ms(COMMAND_TTL_MS)
+    await timeout_task
+    delivery_task = bridge._delivery_task
+    assert delivery_task is not None
+    await asyncio.wait_for(delivery_task, timeout=2)
+    await _wait_for_publish(mqtt, mode_result_topic(timeout_id))
+    timed_out = _payload(_published(mqtt, mode_result_topic(timeout_id))[-1])
+    assert timed_out["accepted"] is False
+    assert timed_out["error"] == "timeout"
+    assert bridge._state_trusted is True
+    await bridge.async_shutdown()
+
+
 async def test_poll_gate_suppresses_identical_mode_value_and_timestamp(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

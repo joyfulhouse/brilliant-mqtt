@@ -816,12 +816,17 @@ class SceneBridge:
         # confirm gate (unlike _apply_scene_execution). A mode execution's
         # timestamp comes from the bus Variable.timestamp, whose units and clock
         # domain are UNVERIFIED and cannot be verified without live-panel
-        # hardware. Gating on it risks breaking legitimate mode commands on
-        # production in-wall panels. Before adding a gate here, verify on hardware:
+        # hardware. The delayed-case false-confirm therefore remains: a previously
+        # unseen stamp newer than the global watermark can have been caused before
+        # the request yet still confirm it by mode id. Gating on it risks breaking
+        # legitimate mode commands on production in-wall panels. Before adding a
+        # request-relative gate here, verify on hardware:
         #   1. Variable.timestamp UNITS (seconds vs milliseconds).
-        #   2. Panel-clock vs writer/phone-supplied (change a mode from a phone
-        #      vs from the bridge and compare to _clock_ms()).
+        #   2. Panel-clock vs phone/writer-supplied clock (change a mode from a
+        #      phone vs from the bridge and compare to _clock_ms()).
         #   3. Whether a redundant same-mode set re-stamps the timestamp.
+        # Option (c), copying the global watermark at request time, is a no-op:
+        # every stamp it rejects is already rejected by current <= previous below.
         current = (execution.executed_at_ms, execution.mode_id)
         previous = self._mode_watermarks.get(self._panel)
         if previous is not None and current <= previous:
