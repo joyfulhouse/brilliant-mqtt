@@ -68,11 +68,8 @@ def run_bounded(
     injectable for tests; it defaults to :class:`subprocess.Popen`.
     """
     out = subprocess.PIPE if capture else subprocess.DEVNULL
-    proc: _Process
-    if popen is not None:
-        proc = popen(list(argv), stdout=out, stderr=subprocess.DEVNULL, text=True)
-    else:
-        proc = subprocess.Popen(list(argv), stdout=out, stderr=subprocess.DEVNULL, text=True)
+    factory: Callable[..., _Process] = popen or subprocess.Popen
+    proc: _Process = factory(list(argv), stdout=out, stderr=subprocess.DEVNULL, text=True)
     try:
         stdout, _ = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
