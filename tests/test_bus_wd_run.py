@@ -10,20 +10,21 @@ from brilliant_bus_watchdog.run import _service_active, handle, load_config, sho
 
 
 @pytest.mark.parametrize(
-    ("age", "bridge_active", "gateway_up", "bus_confirmed", "expected"),
+    ("age", "bridge_active", "gateway_up", "bus_failure_age", "expected"),
     [
-        (1900.0, True, True, True, True),
-        (100.0, True, True, True, False),
-        (9999.0, False, True, True, False),
-        (9999.0, True, False, True, False),
-        (9999.0, True, True, False, False),
+        (1900.0, True, True, 1900.0, True),
+        (100.0, True, True, 1900.0, False),
+        (9999.0, False, True, 9999.0, False),
+        (9999.0, True, False, 9999.0, False),
+        (9999.0, True, True, None, False),
+        (9999.0, True, True, 1799.9, False),
     ],
 )
 def test_should_reboot_requires_every_bus_wedge_signal(
     age: float,
     bridge_active: bool,
     gateway_up: bool,
-    bus_confirmed: bool,
+    bus_failure_age: float | None,
     expected: bool,
 ) -> None:
     assert (
@@ -31,7 +32,7 @@ def test_should_reboot_requires_every_bus_wedge_signal(
             age=age,
             bridge_active=bridge_active,
             gateway_up=gateway_up,
-            bus_confirmed=bus_confirmed,
+            bus_failure_age=bus_failure_age,
             stale_after=1800.0,
         )
         is expected

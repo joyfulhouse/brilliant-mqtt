@@ -8,7 +8,9 @@ from pathlib import Path
 
 import pytest
 
-from brilliant_bus_watchdog.health import bus_confirmed
+from brilliant_bus_watchdog.health import bus_confirmed, bus_failure_age
+from brilliant_bus_watchdog.run import should_reboot
+from brilliant_mqtt import heartbeat
 from brilliant_mqtt.heartbeat import write_heartbeat, write_phase
 from tests.fakes import FakeClock
 
@@ -74,8 +76,28 @@ def test_write_phase_atomically_replaces_the_current_phase(tmp_path: Path) -> No
     write_phase(str(phase), "pre_bus")
     write_phase(str(phase), "bus")
 
-    # write_phase appends the writer's pid so the reader can check liveness.
-    assert phase.read_text(encoding="utf-8") == f"bus {os.getpid()}"
+    record = heartbeat.read_phase_record(str(phase))
+    assert record is not None
+    assert record.phase == "bus"
+    assert record.pid == os.getpid()
+    assert record.failure_started_at is not None
+
+
+def test_successful_bus_read_resets_preserved_failure_history(tmp_path: Path) -> None:
+    phase = tmp_path / "bus-phase"
+    write_phase(str(phase), "bus", monotonic_clock=lambda: 100.0)
+    write_phase(str(phase), "pre_bus", monotonic_clock=lambda: 300.0)
+    write_phase(str(phase), "bus", monotonic_clock=lambda: 300.0)
+    assert bus_failure_age(str(phase), now=400.0) == 300.0
+
+    write_phase(
+        str(phase),
+        "bus",
+        bus_read_succeeded=True,
+        monotonic_clock=lambda: 400.0,
+    )
+
+    assert bus_failure_age(str(phase), now=400.0) == 0.0
 
 
 def test_write_phase_is_best_effort(tmp_path: Path) -> None:
@@ -123,7 +145,12 @@ def test_failed_pre_bus_restamp_must_not_leave_live_pid_bus_marker_confirmed(
     live-pid marker, the file must be gone and bus_confirmed must be False, with
     no exception raised."""
     phase = tmp_path / "bus-phase"
-    phase.write_text(f"bus {os.getpid()}", encoding="utf-8")  # leftover, live pid
+    write_phase(
+        str(phase),
+        "bus",
+        bus_read_succeeded=True,
+        monotonic_clock=lambda: 100.0,
+    )
     assert bus_confirmed(str(phase)) is True  # would fire a reboot if left
 
     def _raise(*args: object, **kwargs: object) -> None:
@@ -144,7 +171,7 @@ def test_real_write_failure_clears_live_pid_bus_marker(tmp_path: Path) -> None:
     live-pid marker. This pins _atomic_write's re-raise (a mutant that swallows
     its OSError instead of re-raising leaves the marker confirmed)."""
     phase = tmp_path / "bus-phase"
-    phase.write_text(f"bus {os.getpid()}", encoding="utf-8")  # leftover, live pid
+    write_phase(str(phase), "bus", bus_read_succeeded=True)
     (tmp_path / "bus-phase.tmp").mkdir()  # real open() failure, no monkeypatch
     assert bus_confirmed(str(phase)) is True  # would fire a reboot if left
 
@@ -163,7 +190,7 @@ def test_write_phase_bus_failure_also_clears_marker(
     pins the clear against a mutant that guards the unlink with
     ``if phase != "pre_bus": return``."""
     phase = tmp_path / "bus-phase"
-    phase.write_text(f"bus {os.getpid()}", encoding="utf-8")
+    write_phase(str(phase), "bus", bus_read_succeeded=True)
 
     def _raise(*args: object, **kwargs: object) -> None:
         raise OSError(28, "No space left on device")
@@ -196,3 +223,64 @@ def test_failed_stamp_logs_warning_reboot_guard_disabled(
         if r.levelname == "WARNING" and "reboot guard disabled" in r.getMessage()
     ]
     assert len(warnings) == 1
+
+
+def test_failed_phase_write_and_failed_unlink_do_not_authorize_reboot(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    phase = tmp_path / "bus-phase"
+    write_phase(
+        str(phase),
+        "bus",
+        bus_read_succeeded=True,
+        monotonic_clock=lambda: 100.0,
+    )
+
+    def _denied(*args: object, **kwargs: object) -> None:
+        raise PermissionError("readable marker in unwritable directory")
+
+    monkeypatch.setattr(heartbeat, "_atomic_write", _denied)
+    monkeypatch.setattr("brilliant_mqtt.heartbeat.os.unlink", _denied)
+    with caplog.at_level(logging.WARNING, logger="brilliant_mqtt.heartbeat"):
+        heartbeat.write_phase(str(phase), "pre_bus")
+
+    failure_age = bus_failure_age(str(phase), now=1900.0)
+    assert not should_reboot(
+        age=1900.0,
+        stale_after=1800.0,
+        bridge_active=True,
+        gateway_up=True,
+        bus_failure_age=failure_age,
+    )
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("invalidation failed" in message for message in messages)
+    assert not any("reboot guard disabled" in message for message in messages)
+
+
+def test_real_unwritable_phase_directory_does_not_leave_reboot_armed(tmp_path: Path) -> None:
+    if os.geteuid() == 0:
+        pytest.skip("permission reproduction requires an unprivileged process")
+    directory = tmp_path / "readonly"
+    directory.mkdir()
+    phase = directory / "bus-phase"
+    write_phase(
+        str(phase),
+        "bus",
+        bus_read_succeeded=True,
+        monotonic_clock=lambda: 100.0,
+    )
+    directory.chmod(0o500)
+    try:
+        heartbeat.write_phase(str(phase), "pre_bus")
+        assert not bus_confirmed(str(phase)), phase.read_text(encoding="utf-8")
+        assert not should_reboot(
+            age=1900.0,
+            stale_after=1800.0,
+            bridge_active=True,
+            gateway_up=True,
+            bus_failure_age=bus_failure_age(str(phase), now=1900.0),
+        )
+    finally:
+        directory.chmod(0o700)

@@ -1,11 +1,33 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
-from brilliant_bus_watchdog.health import bus_confirmed, heartbeat_age
+from brilliant_bus_watchdog.health import bus_confirmed, bus_failure_age, heartbeat_age
+from brilliant_bus_watchdog.run import should_reboot
+from brilliant_mqtt.heartbeat import DEAD_WRITER_RETENTION_S, write_phase
+
+_CHILD_PHASE_WRITER = """
+import sys
+from brilliant_mqtt.heartbeat import write_phase
+
+path, phase, raw_now = sys.argv[1:]
+now = float(raw_now)
+if phase == "bus":
+    write_phase(path, "pre_bus", monotonic_clock=lambda: now)
+write_phase(path, phase, monotonic_clock=lambda: now)
+"""
+
+
+def _write_phase_in_short_lived_process(path: Path, phase: str, now: float) -> None:
+    subprocess.run(
+        [sys.executable, "-c", _CHILD_PHASE_WRITER, str(path), phase, str(now)],
+        check=True,
+    )
 
 
 def test_fresh(tmp_path: Path) -> None:
@@ -42,7 +64,7 @@ def test_unparsable_measures_from_start(tmp_path: Path) -> None:
         ("bus", False, False),  # old bare-string format: no pid -> fail closed
         ("bus unavailable", False, False),  # non-integer pid -> fail closed
         ("bus 0", False, False),  # non-positive pid -> fail closed
-        (f" bus {os.getpid()}\n", False, True),  # live writer (whitespace-tolerant)
+        (f" bus {os.getpid()}\n", False, False),  # retired untimed format
     ],
 )
 def test_bus_confirmed_fails_closed(
@@ -58,6 +80,76 @@ def test_bus_confirmed_fails_closed(
         phase.write_text(contents, encoding="utf-8")
 
     assert bus_confirmed(str(phase)) is expected
+
+
+def test_bus_confirmed_accepts_live_generation_with_active_lease(tmp_path: Path) -> None:
+    phase = tmp_path / "bus-phase"
+    write_phase(str(phase), "bus")
+
+    assert bus_confirmed(str(phase)) is True
+
+
+def test_repeated_dead_bus_writers_preserve_bounded_failure_history(tmp_path: Path) -> None:
+    phase = tmp_path / "bus-phase"
+    samples = [100.0, 400.0, 700.0, 1000.0, 1300.0, 1600.0, 1900.0]
+
+    decisions: list[bool] = []
+    for now in samples:
+        _write_phase_in_short_lived_process(phase, "bus", now)
+        failure_age = bus_failure_age(str(phase), now=now)
+        decisions.append(
+            should_reboot(
+                age=1900.0,
+                stale_after=1800.0,
+                bridge_active=True,
+                gateway_up=True,
+                bus_failure_age=failure_age,
+            )
+        )
+
+    assert decisions[:-1] == [False] * 6
+    assert bus_confirmed(str(phase)) is False
+    assert bus_failure_age(str(phase), now=samples[-1]) == 1800.0
+    assert decisions[-1] is True
+
+
+def test_dead_pre_bus_writers_never_attribute_broker_only_startup(tmp_path: Path) -> None:
+    phase = tmp_path / "bus-phase"
+    _write_phase_in_short_lived_process(phase, "bus", 100.0)
+    for now in (200.0, 300.0, 400.0):
+        _write_phase_in_short_lived_process(phase, "pre_bus", now)
+
+    assert bus_failure_age(str(phase), now=400.0) is None
+
+
+def test_dead_bus_record_expires_after_its_service_generation_window(tmp_path: Path) -> None:
+    phase = tmp_path / "bus-phase"
+    _write_phase_in_short_lived_process(phase, "bus", 100.0)
+
+    assert (
+        bus_failure_age(str(phase), now=100.0 + DEAD_WRITER_RETENTION_S) == DEAD_WRITER_RETENTION_S
+    )
+    assert bus_failure_age(str(phase), now=100.0 + DEAD_WRITER_RETENTION_S + 0.001) is None
+
+
+def test_bus_record_from_an_earlier_boot_is_rejected(tmp_path: Path) -> None:
+    phase = tmp_path / "bus-phase"
+    write_phase(str(phase), "bus", monotonic_clock=lambda: 100.0)
+    parts = phase.read_text(encoding="utf-8").split()
+    parts[4] = "earlier-boot"
+    phase.write_text(" ".join(parts), encoding="utf-8")
+
+    assert bus_failure_age(str(phase), now=1900.0) is None
+
+
+def test_bus_record_from_an_earlier_process_generation_is_rejected(tmp_path: Path) -> None:
+    phase = tmp_path / "bus-phase"
+    write_phase(str(phase), "bus", monotonic_clock=lambda: 100.0)
+    parts = phase.read_text(encoding="utf-8").split()
+    parts[3] = str(int(parts[3]) + 1)
+    phase.write_text(" ".join(parts), encoding="utf-8")
+
+    assert bus_failure_age(str(phase), now=1900.0) is None
 
 
 @pytest.mark.parametrize("pid", [1, 0, -1])

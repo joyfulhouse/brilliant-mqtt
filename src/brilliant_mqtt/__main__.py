@@ -195,6 +195,7 @@ async def _run_session(
 
         def _beat() -> None:
             write_heartbeat(settings.bus_heartbeat_file, time.time)
+            write_phase(settings.bus_phase_file, "bus", bus_read_succeeded=True)
 
         # Bridges register their bus/mqtt callbacks in __init__, BEFORE any I/O
         # starts — so no early change/command event is missed.
