@@ -816,12 +816,17 @@ class SceneBridge:
         # confirm gate (unlike _apply_scene_execution). A mode execution's
         # timestamp comes from the bus Variable.timestamp, whose units and clock
         # domain are UNVERIFIED and cannot be verified without live-panel
-        # hardware. Gating on it risks breaking legitimate mode commands on
-        # production in-wall panels. Before adding a gate here, verify on hardware:
+        # hardware. The delayed-case false-confirm therefore remains: a previously
+        # unseen stamp newer than the global watermark can have been caused before
+        # the request yet still confirm it by mode id. Gating on it risks breaking
+        # legitimate mode commands on production in-wall panels. Before adding a
+        # request-relative gate here, verify on hardware:
         #   1. Variable.timestamp UNITS (seconds vs milliseconds).
-        #   2. Panel-clock vs writer/phone-supplied (change a mode from a phone
-        #      vs from the bridge and compare to _clock_ms()).
+        #   2. Panel-clock vs phone/writer-supplied clock (change a mode from a
+        #      phone vs from the bridge and compare to _clock_ms()).
         #   3. Whether a redundant same-mode set re-stamps the timestamp.
+        # Option (c), copying the global watermark at request time, is a no-op:
+        # every stamp it rejects is already rejected by current <= previous below.
         current = (execution.executed_at_ms, execution.mode_id)
         previous = self._mode_watermarks.get(self._panel)
         if previous is not None and current <= previous:
@@ -1214,15 +1219,22 @@ class SceneBridge:
         self._clear_capacity_if_room()
         return True
 
-    def _prune_events(self) -> None:
+    def _prune_events(self) -> bool:
+        changed = False
+        for result_key, result in list(self._results.items()):
+            if result.delivered and result.event_key is not None:
+                self._results[result_key] = replace(result, event_key=None)
+                changed = True
         dependencies = {
             result.event_key
             for result in self._results.values()
             if not result.delivered and result.event_key is not None
         }
-        for key, event in list(self._events.items()):
-            if event.delivered and key not in dependencies:
-                self._events.pop(key)
+        for event_key, event in list(self._events.items()):
+            if event.delivered and event_key not in dependencies:
+                self._events.pop(event_key)
+                changed = True
+        return changed
 
     def _within_capacity(self) -> bool:
         return (
@@ -1289,11 +1301,17 @@ class SceneBridge:
                 continue
             if not await self._async_persist_state(*snapshot, epoch):
                 return
+            pruned_snapshot: tuple[int, SceneState] | None = None
             async with self._lock:
                 if self._stopping or epoch != self._epoch:
                     return
-                self._prune_events()
+                if self._prune_events():
+                    pruned_snapshot = self._capture_state()
                 self._clear_capacity_if_room()
+            if pruned_snapshot is not None and not await self._async_persist_state(
+                *pruned_snapshot, epoch
+            ):
+                return
             await self._async_health_status("scene")
             await self._async_health_status("mode")
 
