@@ -28,15 +28,24 @@ def _atomic_write(path: str, text: str) -> None:
     (tmpfs, e.g. ``/run/brilliant-mqtt/``), which may not exist yet on first
     boot — creating the parent here is deliberate for both callers, not an
     accident of one writer. Raises ``OSError`` on failure; callers decide
-    whether/how to swallow it.
+    whether/how to swallow it. On a failed write the tmp scratch file is
+    removed best-effort first, so a failed ``os.replace`` (e.g. the destination
+    is a directory) never leaks ``<path>.tmp``.
     """
     parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, exist_ok=True)
     tmp = f"{path}.tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(text)
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def write_heartbeat(
@@ -69,13 +78,16 @@ def write_phase(path: str, phase: BusPhase) -> None:
     still alive, so a stale ``bus`` marker from a dead/reverted process does not
     read as a live confirmed bus.
 
-    A failed ``bus`` write is swallowed (logged): a missing stamp reads as
-    unconfirmed, which is fail-safe. A failed ``pre_bus`` write is NOT — a
-    stale ``bus`` marker left by a prior successful session would still read
-    as bus-confirmed, so a broker-only outage could reboot a healthy panel.
-    On a failed ``pre_bus`` write we therefore remove the phase file so the
-    watchdog fails closed; if that removal itself fails we re-raise, because
-    phase tracking is broken and the session must not proceed as if safe.
+    A failed write is best-effort for EVERY phase, ``pre_bus`` included: it is
+    logged and swallowed, never re-raised. The ``pre_bus`` stamp runs at
+    :mod:`brilliant_mqtt.__main__` *before* the session ``try``, so re-raising
+    it would make the supervisor back off and retry forever and the bridge
+    would never connect to anything — a re-raise that buys no safety. A failed
+    stamp instead degrades the reboot guard to disabled, which is fail-safe:
+    the reader (:func:`brilliant_bus_watchdog.health.bus_confirmed`) already
+    fails closed on an absent/unreadable/torn marker, and a stale ``bus``
+    marker from a prior session names that session's now-dead pid, which the
+    reader's liveness check rejects.
 
     Contract: this writer and its reader
     (:func:`brilliant_bus_watchdog.health.bus_confirmed`) must be rolled out
@@ -88,15 +100,8 @@ def write_phase(path: str, phase: BusPhase) -> None:
     try:
         _atomic_write(path, f"{phase} {os.getpid()}")
     except OSError:
-        if phase != "pre_bus":
-            logger.debug("bus phase write failed for %s", path, exc_info=True)
-            return
-        # A failed pre_bus stamp is fail-unsafe: clear any stale marker so the
-        # watchdog cannot read a prior session's "bus" as today's truth. If the
-        # file is already gone we are safe; any other removal failure propagates
-        # so the caller learns phase tracking is broken.
-        logger.debug("pre_bus phase write failed for %s; clearing phase file", path, exc_info=True)
-        try:
-            os.unlink(path)
-        except FileNotFoundError:
-            pass
+        # Best-effort for every phase: never let a failed phase stamp take the
+        # bridge down. _atomic_write already cleans up its tmp file, so nothing
+        # leaks. A missing/failed stamp reads as unconfirmed (reboot guard
+        # disabled), which is fail-safe.
+        logger.debug("bus phase write failed for %s; reboot guard disabled", path, exc_info=True)

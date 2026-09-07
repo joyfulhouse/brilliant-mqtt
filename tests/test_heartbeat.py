@@ -84,13 +84,38 @@ def test_write_phase_is_best_effort(tmp_path: Path) -> None:
     write_phase(str(blocker / "bus-phase"), "bus")
 
 
-def test_write_phase_pre_bus_failure_clears_stale_bus_marker(
+def test_write_phase_pre_bus_is_best_effort_when_parent_is_file(tmp_path: Path) -> None:
+    """A pre_bus stamp whose parent path is a regular file must be swallowed,
+    never re-raised. The stamp happens at ``__main__`` *before* the session
+    ``try``: a re-raise would make the supervisor back off and retry forever,
+    so the bridge would never connect to anything. A missing/failed stamp
+    instead reads as unconfirmed (reboot guard disabled), which is fail-safe."""
+    blocker = tmp_path / "blocker"
+    blocker.write_text("x", encoding="utf-8")
+
+    write_phase(str(blocker / "bus-phase"), "pre_bus")  # must not raise
+
+
+def test_write_phase_pre_bus_is_best_effort_when_path_is_dir(tmp_path: Path) -> None:
+    """A pre_bus stamp whose target path is itself a directory must be
+    swallowed (``os.replace`` raises ``IsADirectoryError``) and must not leak
+    the ``bus-phase.tmp`` scratch file left behind by the failed replace."""
+    phase = tmp_path / "bus-phase"
+    phase.mkdir()
+
+    write_phase(str(phase), "pre_bus")  # must not raise
+
+    assert not (tmp_path / "bus-phase.tmp").exists()
+
+
+def test_write_phase_pre_bus_failure_does_not_clear_live_marker_and_never_raises(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A failed pre_bus write must not leave a prior session's "bus" marker
-    readable — otherwise a broker-only outage would still read as
-    bus-confirmed and could reboot a healthy panel. Remove it so the watchdog
-    fails closed."""
+    """A transient pre_bus write failure is swallowed and must NOT re-raise
+    even when the phase file already holds a marker: the reboot guard degrades
+    to disabled (fail-safe) rather than taking the bridge down. A leftover
+    ``bus <pid>`` from a prior session is handled by the reader's pid-liveness
+    check (that pid is dead), not by clearing here."""
     phase = tmp_path / "bus-phase"
     phase.write_text(f"bus {os.getpid()}", encoding="utf-8")  # leftover session
 
@@ -99,26 +124,3 @@ def test_write_phase_pre_bus_failure_clears_stale_bus_marker(
 
     monkeypatch.setattr("brilliant_mqtt.heartbeat._atomic_write", _raise)
     write_phase(str(phase), "pre_bus")  # must not raise
-
-    assert not phase.exists()
-
-
-def test_write_phase_pre_bus_reraises_when_cleanup_also_fails(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """If clearing the stale marker itself fails, phase tracking is broken —
-    re-raise so the session doesn't silently continue in a fail-unsafe state."""
-    phase = tmp_path / "bus-phase"
-    phase.write_text(f"bus {os.getpid()}", encoding="utf-8")
-
-    def _raise_write(*args: object, **kwargs: object) -> None:
-        raise OSError("write failed")
-
-    def _raise_unlink(*args: object, **kwargs: object) -> None:
-        raise PermissionError("cannot remove")
-
-    monkeypatch.setattr("brilliant_mqtt.heartbeat._atomic_write", _raise_write)
-    monkeypatch.setattr("brilliant_mqtt.heartbeat.os.unlink", _raise_unlink)
-
-    with pytest.raises(PermissionError, match="cannot remove"):
-        write_phase(str(phase), "pre_bus")
