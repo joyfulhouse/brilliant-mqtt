@@ -43,8 +43,19 @@ _NOW_MS = 1_700_000_010_000
 
 
 class _OpaqueReceipt(str):
+    def __eq__(self, other: object) -> bool:
+        raise AssertionError(f"transport receipt must not be compared with {other!r}")
+
     def __contains__(self, item: object) -> bool:
         raise AssertionError(f"transport receipt must not be inspected for {item!r}")
+
+    def find(self, *args: object, **kwargs: object) -> int:
+        raise AssertionError(f"transport receipt must not be searched with {args!r}, {kwargs!r}")
+
+    def startswith(self, *args: object, **kwargs: object) -> bool:
+        raise AssertionError(
+            f"transport receipt prefix must not be checked with {args!r}, {kwargs!r}"
+        )
 
 
 def _field_string(field_id: int, value: str) -> bytes:
@@ -2820,6 +2831,7 @@ async def test_requesting_current_mode_confirms_immediately_without_execution_st
                 [_execution(mode_id="away", mode_at_ms=_NOW_MS - 1_000)],
                 scoped_devices=[_scene_catalog("all_off"), _mode_catalog("away")],
             )
+            self.set_variables_receipt = _OpaqueReceipt("opaque transport acknowledgement")
             self.write_started = asyncio.Event()
             self.release_write = asyncio.Event()
 
@@ -2841,7 +2853,9 @@ async def test_requesting_current_mode_confirms_immediately_without_execution_st
     command_id = "33333333-3333-4333-8333-333333333333"
     await mqtt.inject(mode_command_topic(_PANEL), _command(command_id, "mode", "away"))
     await asyncio.wait_for(bus.write_started.wait(), timeout=0.1)
-    timeout_task = bridge._mode_pending[command_id].timeout_task
+    pending = bridge._mode_pending[command_id]
+    assert pending.equal_at_request is True
+    timeout_task = pending.timeout_task
     assert timeout_task is not None
     bus.release_write.set()
     await _wait_for_publish(mqtt, mode_result_topic(command_id))
@@ -2859,6 +2873,63 @@ async def test_requesting_current_mode_confirms_immediately_without_execution_st
 
     await clock.advance_ms(COMMAND_TTL_MS + 1)
     assert len(_published(mqtt, mode_result_topic(command_id))) == 1
+    await bridge.async_shutdown()
+
+
+async def test_pre_request_stamp_during_mode_write_cannot_trigger_equality_confirmation(
+    tmp_path: Path,
+) -> None:
+    class HoldingBus(FakeBus):
+        def __init__(self) -> None:
+            super().__init__(
+                [_execution(mode_id="home", mode_at_ms=150)],
+                scoped_devices=[
+                    _scene_catalog("all_off"),
+                    _mode_catalog("away", "home"),
+                ],
+            )
+            self.set_variables_receipt = _OpaqueReceipt("opaque transport acknowledgement")
+            self.write_started = asyncio.Event()
+            self.release_write = asyncio.Event()
+
+        async def set_variables(
+            self, device_id: str, peripheral_id: str, sets: list[VarSet]
+        ) -> str:
+            receipt = await super().set_variables(device_id, peripheral_id, sets)
+            self.write_started.set()
+            await self.release_write.wait()
+            return receipt
+
+    clock = FakeClockMs(200)
+    bus = HoldingBus()
+    mqtt = FakeMqtt()
+    bridge = SceneBridge(bus, mqtt, _PANEL, tmp_path / "state.json", clock)
+    await bridge.async_start()
+    mqtt.published.clear()
+
+    command_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    await mqtt.inject(
+        mode_command_topic(_PANEL),
+        _command(command_id, "mode", "away", issued_at_ms=clock.now_ms),
+    )
+    await asyncio.wait_for(bus.write_started.wait(), timeout=0.1)
+    pending = bridge._mode_pending[command_id]
+    assert pending.equal_at_request is False
+    write_task = pending.write_task
+    assert write_task is not None
+
+    await bus.emit(_execution(mode_id="away", mode_at_ms=151))
+    await _wait_for_publish(mqtt, mode_event_topic(_PANEL))
+    assert _published(mqtt, mode_result_topic(command_id)) == []
+
+    bus.release_write.set()
+    await asyncio.wait_for(write_task, timeout=2)
+    assert _published(mqtt, mode_result_topic(command_id)) == []
+    assert command_id in bridge._mode_pending
+
+    await bus.emit(_execution(mode_id="away", mode_at_ms=clock.now_ms))
+    await _wait_for_publish(mqtt, mode_result_topic(command_id))
+    assert _payload(_published(mqtt, mode_result_topic(command_id))[-1])["accepted"] is True
     await bridge.async_shutdown()
 
 
