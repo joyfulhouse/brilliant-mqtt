@@ -1455,14 +1455,30 @@ class FleetManager:
         self._reload_scheduled = True
         self.hass.config_entries.async_schedule_reload(self.entry.entry_id)
 
+    def _current_broker_available(self) -> bool | None:
+        """Expose the single live broker-connection flag for panel decision points.
+
+        Passed to every PanelManager so it reads CURRENT broker health at decision
+        time (grace expiry, after the SSH lock, recovery expiry) rather than a
+        construction-time snapshot — one source of truth, this flag (#95).
+        """
+        return self.broker_available
+
     @callback
     def _async_broker_status(self, connected: bool) -> None:
         """Maintain one broker issue rather than one issue per panel."""
         if self._shutting_down:
             return
+        previously_available = self.broker_available
         self.broker_available = connected
         if connected:
             ir.async_delete_issue(self.hass, DOMAIN, self.broker_issue_id)
+            if previously_available is False:
+                # Broker link restored after a KNOWN outage (not the initial None→True
+                # at setup): let every panel whose automatic recovery was deferred
+                # during the outage reassess from fresh availability evidence (#95).
+                for panel in self._panels.values():
+                    panel.async_broker_reconnected()
             return
         ir.async_create_issue(
             self.hass,
@@ -1486,7 +1502,9 @@ class FleetManager:
             await self._async_prepare_provisioning()
             fleet, built, legacy = self._build_stores()
             managers = {
-                panel_id: PanelManager(self.hass, store, fleet, self._ssh_lock)
+                panel_id: PanelManager(
+                    self.hass, store, fleet, self._ssh_lock, self._current_broker_available
+                )
                 for panel_id, (store, _config) in built.items()
             }
             self._fleet = fleet
@@ -1593,6 +1611,7 @@ class FleetManager:
                             store,
                             fleet,
                             self._ssh_lock,
+                            self._current_broker_available,
                         )
                 for panel_id, manager in staged.items():
                     if await self._async_setup_manager(manager):

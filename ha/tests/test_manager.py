@@ -1094,6 +1094,169 @@ async def test_offline_grace_triggers_auto_repair_then_recovery(
     assert await hass.config_entries.async_unload(entry.entry_id)
 
 
+def _broker_gated_manager(
+    hass: HomeAssistant,
+    entry: MockConfigEntry,
+    broker: SimpleNamespace,
+    lock: asyncio.Lock | None = None,
+) -> PanelManager:
+    """A legacy PanelManager whose broker-health reader tracks *broker.available* (#95)."""
+    return PanelManager(
+        hass,
+        LegacyPanelStore(hass, entry),
+        legacy_fleet_config(entry),
+        lock or asyncio.Lock(),
+        lambda: broker.available,
+    )
+
+
+async def test_grace_expiry_defers_auto_repair_while_broker_down(
+    hass: HomeAssistant,
+) -> None:
+    """#95: a grace timer firing while HA's broker link is down must not even reach
+    auto-repair — 'offline' is untrustworthy when it is HA itself that cannot hear it."""
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    broker = SimpleNamespace(available=False)
+    manager = _broker_gated_manager(hass, entry, broker)
+    manager.availability = "offline"
+    events = _capture_events(hass)
+
+    with patch.object(manager, "async_repair", AsyncMock()) as repair:
+        await manager._grace_expired(dt_util.utcnow())
+        await hass.async_block_till_done()
+
+    repair.assert_not_called()  # auto-repair deferred at the grace level (broker down)
+    assert manager.problem is False  # and no misleading per-panel escalation
+    assert "needs_attention" not in _types(events)
+    await manager.async_shutdown()
+
+
+async def test_grace_expiry_defers_escalation_while_broker_down(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """#95 criterion 1: per-panel escalation is suspended while the broker is down —
+    even with auto-repair OFF, a broker outage must not raise a needs_attention issue."""
+    entry = MockConfigEntry(
+        domain=DOMAIN, unique_id="office", data=ENTRY_DATA, options={OPT_AUTO_REPAIR: False}
+    )
+    entry.add_to_hass(hass)
+    broker = SimpleNamespace(available=False)
+    manager = _broker_gated_manager(hass, entry, broker)
+    manager.availability = "offline"
+    events = _capture_events(hass)
+
+    await manager._grace_expired(dt_util.utcnow())
+    await hass.async_block_till_done()
+
+    assert manager.problem is False
+    assert "needs_attention" not in _types(events)
+    await manager.async_shutdown()
+
+
+async def test_broker_reconnect_rearms_grace_then_repairs(
+    hass: HomeAssistant,
+    fake_shell: FakeShell,
+    payload_dir: Path,
+) -> None:
+    """#95 criterion 1: a repair deferred during a broker outage is reassessed once the
+    broker returns — a fresh grace window is armed and, if still offline, repair runs."""
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    broker = SimpleNamespace(available=False)
+    manager = _broker_gated_manager(hass, entry, broker)
+    manager.availability = "offline"
+
+    await manager._grace_expired(dt_util.utcnow())  # broker down → deferred
+    assert not fake_shell.commands
+    assert manager._grace_cancel is None  # nothing left armed
+
+    broker.available = True
+    manager.async_broker_reconnected()  # broker back → reassess
+    assert manager._grace_cancel is not None  # a fresh grace window
+
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(minutes=11))
+    await hass.async_block_till_done()
+
+    assert "systemctl enable --now brilliant-mqtt" in fake_shell.commands
+    await manager.async_shutdown()
+
+
+async def test_queued_auto_repair_skips_when_panel_recovers_behind_lock(
+    hass: HomeAssistant,
+    fake_shell: FakeShell,
+    payload_dir: Path,
+) -> None:
+    """#95 criterion 2: an auto-repair queued behind the fleet SSH lock rechecks state
+    after acquiring it — a panel that recovered while waiting gets no obsolete repair."""
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    lock = asyncio.Lock()
+    broker = SimpleNamespace(available=True)
+    manager = _broker_gated_manager(hass, entry, broker, lock)
+    manager.availability = "offline"
+    events = _capture_events(hass)
+
+    await lock.acquire()  # another panel holds the fleet-wide SSH lock
+    repair = asyncio.create_task(manager.async_repair(trigger="auto"))
+    await asyncio.sleep(0)  # let the repair reach the SSH-lock await
+    manager.availability = "online"  # panel recovers while queued
+    lock.release()
+    await repair
+    await hass.async_block_till_done()
+
+    assert not fake_shell.commands  # obsolete repair skipped: no connect, no config write
+    assert manager._recovery_cancel is None  # and no recovery timer for a skipped repair
+    assert _types(events) == ["repair_started"]  # started fired pre-lock; no succeeded/failed
+    await manager.async_shutdown()
+
+
+async def test_manual_repair_runs_despite_broker_down(
+    hass: HomeAssistant,
+    fake_shell: FakeShell,
+    payload_dir: Path,
+) -> None:
+    """#95 criterion 3: an operator's explicit repair (trigger='manual') is NEVER gated
+    by broker health or apparent recovery — it runs even if the panel looks online."""
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    broker = SimpleNamespace(available=False)
+    manager = _broker_gated_manager(hass, entry, broker)
+    manager.availability = "online"  # would trip the auto gate; must NOT trip manual
+
+    await manager.async_repair(trigger="manual")
+    await hass.async_block_till_done()
+
+    assert "systemctl enable --now brilliant-mqtt" in fake_shell.commands
+    await manager.async_shutdown()
+
+
+async def test_recovery_timeout_defers_while_broker_down(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """#95: a recovery window elapsing during a broker outage must not escalate — HA
+    cannot observe the LWT, so 'did not come back' is unknowable, not a failure."""
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    broker = SimpleNamespace(available=True)
+    manager = _broker_gated_manager(hass, entry, broker)
+    manager.availability = "offline"
+    events = _capture_events(hass)
+    shell = FakeShell()
+    await _repair_and_arm_recovery(manager, shell)  # broker up: arms the recovery timer
+
+    broker.available = False  # broker drops before the window elapses
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
+        async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=61))
+        await hass.async_block_till_done()
+    await manager.async_shutdown()
+
+    assert manager.problem is False  # no false "did not come back" escalation
+    assert "needs_attention" not in _types(events)
+
+
 @pytest.mark.allow_lingering_timers
 async def test_repair_deploys_payload_when_code_absent(
     hass: HomeAssistant,

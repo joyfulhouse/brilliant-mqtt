@@ -5577,3 +5577,57 @@ async def test_mqtt_connection_status_owns_one_redacted_fleet_issue(
         await fleet.async_shutdown()
 
     unsubscribe.assert_called_once_with()
+
+
+async def test_broker_reconnect_reassesses_every_panel(hass: HomeAssistant) -> None:
+    """#95: restoring the broker link after a KNOWN outage lets each panel reassess
+    (async_broker_reconnected), and each panel reads the fleet's single live flag."""
+    entry = _fleet_entry(
+        _panel("office", "SHA256:office", subentry_id="panel-office"),
+        _panel("kitchen", "SHA256:kitchen", subentry_id="panel-kitchen"),
+    )
+    fleet = FleetManager(hass, entry)
+    callbacks: list[Callable[[bool], None]] = []
+
+    def subscribe(hass_arg: HomeAssistant, callback: Callable[[bool], None]) -> Callable[[], None]:
+        callbacks.append(callback)
+        return Mock()
+
+    with (
+        patch.object(PanelManager, "async_setup", _noop_setup),
+        patch.object(PanelManager, "async_shutdown", _noop_shutdown),
+        patch(
+            "custom_components.brilliant_mqtt.fleet_manager.mqtt.async_subscribe_connection_status",
+            side_effect=subscribe,
+        ),
+        patch(
+            "custom_components.brilliant_mqtt.fleet_manager.mqtt.is_connected",
+            return_value=True,
+        ),
+        patch("custom_components.brilliant_mqtt.fleet_manager.ir.async_create_issue"),
+        patch("custom_components.brilliant_mqtt.fleet_manager.ir.async_delete_issue"),
+    ):
+        await fleet.async_setup()
+        office = fleet.panels["panel-office"]
+
+        # Wiring: a panel reads the fleet's live flag, not a construction snapshot.
+        fleet.broker_available = False
+        assert office._broker_available() is False
+        fleet.broker_available = True
+        assert office._broker_available() is True
+
+        with (
+            patch.object(office, "async_broker_reconnected") as office_reassess,
+            patch.object(
+                fleet.panels["panel-kitchen"], "async_broker_reconnected"
+            ) as kitchen_reassess,
+        ):
+            callbacks[0](True)  # already connected, no prior outage: nothing to reassess
+            office_reassess.assert_not_called()
+
+            callbacks[0](False)  # broker outage
+            callbacks[0](True)  # link restored → reassess every panel
+            office_reassess.assert_called_once_with()
+            kitchen_reassess.assert_called_once_with()
+
+        await fleet.async_shutdown()
