@@ -54,6 +54,8 @@ def bus_failure_age(
     if live_generation is not None:
         if live_generation != record.process_generation or not leased:
             return None
+    # A read-only filesystem can hide a recovered bus before this writer dies;
+    # its bounded attempt is intentionally indistinguishable from #133. See #143.
     elif not process_is_absent(record.pid) or (
         leased
         or record.bus_read_succeeded

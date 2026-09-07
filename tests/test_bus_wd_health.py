@@ -54,6 +54,19 @@ for now in range(100, 1901, 300):
     write_phase(path, "bus", monotonic_clock=lambda: float(now))
 """
 
+_UNARMED_PHASE_WRITER = """
+import sys
+from brilliant_mqtt import heartbeat
+
+path, raw_now = sys.argv[1:]
+now = float(raw_now)
+heartbeat._acquire_phase_lease = lambda path, last_success_write: (_ for _ in ()).throw(
+    BlockingIOError("lease unavailable")
+)
+assert heartbeat.write_phase(path, "pre_bus", monotonic_clock=lambda: now)
+assert not heartbeat.write_phase(path, "bus", monotonic_clock=lambda: now)
+"""
+
 _FAILED_INVALIDATION_WRITER = """
 import asyncio
 import builtins
@@ -307,6 +320,30 @@ def test_dead_pre_bus_writers_never_attribute_broker_only_startup(tmp_path: Path
         age=1900.0,
         stale_after=1800.0,
         bridge_active=_service_is("activating"),
+        gateway_up=True,
+        bus_failure_age=failure_age,
+    )
+
+
+def test_dead_unarmed_writers_do_not_pass_history_to_a_healthy_handshake(
+    tmp_path: Path,
+) -> None:
+    phase = tmp_path / "bus-phase"
+    for now in (100.0, 400.0, 700.0, 1000.0, 1300.0, 1600.0):
+        subprocess.run(
+            [sys.executable, "-c", _UNARMED_PHASE_WRITER, str(phase), str(now)],
+            check=True,
+        )
+
+    write_phase(str(phase), "pre_bus", monotonic_clock=lambda: 1900.0)
+    assert write_phase(str(phase), "bus", monotonic_clock=lambda: 1900.0)
+    failure_age = bus_failure_age(str(phase), now=1900.0)
+
+    assert failure_age == 0.0
+    assert not should_reboot(
+        age=1900.0,
+        stale_after=1800.0,
+        bridge_active=True,
         gateway_up=True,
         bus_failure_age=failure_age,
     )

@@ -169,6 +169,13 @@ class _ReadThenWedgeBridge(_ReadingBridge):
         await self._bus.get_all()
 
 
+class _RepeatedBeatBridge(_ReadingBridge):
+    async def reconcile(self) -> None:
+        for _ in range(3):
+            self._heartbeat()
+        raise asyncio.CancelledError
+
+
 def _settings(
     tmp_path: Path,
     mesh_priority: int = 0,
@@ -205,6 +212,7 @@ def _install_session_fakes(
         | type[_ReadOnceBridge]
         | type[_ReadingBridge]
         | type[_ReadThenWedgeBridge]
+        | type[_RepeatedBeatBridge]
         | type[Bridge]
     ) = _NoopBridge,
 ) -> None:
@@ -608,7 +616,7 @@ async def test_short_broker_blip_preserves_current_bus_failure_history(
             await task
 
 
-async def test_bus_start_waits_until_phase_lease_retry_is_armed(
+async def test_lease_exhaustion_proceeds_unleased_without_attribution(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     settings = _settings(tmp_path)
@@ -662,6 +670,36 @@ async def test_bus_start_waits_until_phase_lease_retry_is_armed(
             await task
 
 
+async def test_persistent_phase_failure_logs_error_once_per_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    settings = _settings(tmp_path)
+    _install_session_fakes(monkeypatch, _Bus(), _Mqtt(), _RepeatedBeatBridge)
+
+    def _write_phase(
+        path: str,
+        phase: BusPhase,
+        *,
+        bus_read_succeeded: bool = False,
+    ) -> bool:
+        del path
+        return not (phase == "bus" and bus_read_succeeded)
+
+    monkeypatch.setattr(main_mod, "write_phase", _write_phase)
+    with caplog.at_level(logging.DEBUG, logger="brilliant_mqtt.__main__"):
+        with pytest.raises(asyncio.CancelledError):
+            await main_mod._run_session(settings, None, None)
+
+    marker_logs = [
+        record for record in caplog.records if "bus phase marker unavailable" in record.getMessage()
+    ]
+    assert [record.levelno for record in marker_logs] == [
+        logging.ERROR,
+        logging.DEBUG,
+        logging.DEBUG,
+    ]
+
+
 async def test_failed_success_stamp_keeps_bridge_up_without_reboot_attribution(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -691,6 +729,17 @@ async def test_failed_success_stamp_keeps_bridge_up_without_reboot_attribution(
         real_flock(fd, operation)
 
     monkeypatch.setattr("brilliant_mqtt.heartbeat.fcntl.flock", _flock)
+    real_rewrite = heartbeat._rewrite_phase_lease
+    reject_success_update = True
+
+    def _rewrite_phase_lease(path: str, text: str) -> bool:
+        nonlocal reject_success_update
+        if reject_success_update and text.endswith(" success"):
+            reject_success_update = False
+            return False
+        return real_rewrite(path, text)
+
+    monkeypatch.setattr(heartbeat, "_rewrite_phase_lease", _rewrite_phase_lease)
     with caplog.at_level(logging.ERROR, logger="brilliant_mqtt.__main__"):
         task = asyncio.create_task(main_mod._run_session(settings, None, None))
         try:

@@ -110,20 +110,33 @@ def _service_active(service: str, run: Any = None) -> bool:
 
 def _service_started_at(service: str, run: Any = None) -> float | None:
     runner = run or (lambda argv: bounded.run_bounded(argv, timeout=_SERVICE_TIMEOUT, capture=True))
+    property_name = "ExecMainStartTimestampMonotonic"
     try:
         result = runner(
             [
                 "systemctl",
                 "show",
-                "--property=ExecMainStartTimestampMonotonic",
-                "--value",
+                f"--property={property_name}",
                 service,
             ]
         )
-        started_at_us = int((result.stdout or "").strip())
-    except (OSError, ValueError):
+    except OSError:
+        _LOG.warning("%s unavailable for %s; reboot guard disabled", property_name, service)
         return None
-    return started_at_us / 1_000_000 if started_at_us > 0 else None
+    output = (result.stdout or "").strip()
+    key, separator, value = output.partition("=")
+    if getattr(result, "returncode", 0) != 0 or key != property_name or not separator or not value:
+        _LOG.warning("%s unavailable for %s; reboot guard disabled", property_name, service)
+        return None
+    try:
+        started_at_us = int(value)
+    except ValueError:
+        _LOG.warning("%s unavailable for %s; reboot guard disabled", property_name, service)
+        return None
+    if started_at_us <= 0:
+        _LOG.warning("%s unavailable for %s; reboot guard disabled", property_name, service)
+        return None
+    return started_at_us / 1_000_000
 
 
 def _configure_logging(path: str) -> None:

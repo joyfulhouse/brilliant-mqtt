@@ -109,7 +109,9 @@ over WebSockets are unsupported by the panel transport.
   marker before starting either service: `rm -f /run/brilliant-mqtt/bus-phase`.
   If the marker cannot be written or leased, the bridge logs an error and keeps
   serving; the watchdog treats the marker as unattributable and degrades to no
-  reboot rather than risking a false panel reboot.
+  reboot rather than risking a false panel reboot. The watchdog also requires
+  `systemctl show` for the bridge unit to succeed; a failed or empty query
+  likewise degrades to no reboot.
 
 > **Office safety stop:** Office is reserved for the existing-external-broker,
 > software-only canary. Keep its broker endpoint, TLS profile, and credentials

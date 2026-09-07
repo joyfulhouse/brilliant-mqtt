@@ -23,6 +23,7 @@ def test_writer_and_watchdog_phase_contract_constants_match() -> None:
         "PHASE_RECORD_VERSION",
         "PHASE_ATTEMPT",
         "PHASE_SUCCESS",
+        "PHASE_UNARMED",
         "MAX_PID",
         "DEAD_WRITER_RETENTION_S",
     )
@@ -194,6 +195,70 @@ def test_phase_lease_retries_a_transient_watchdog_lock_collision(
 
     assert collisions == 1
     assert bus_failure_age(str(phase), now=100.0) == 0.0
+
+
+def test_owned_phase_lease_is_updated_without_atomic_replacement(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    phase = tmp_path / "bus-phase"
+    assert write_phase(str(phase), "bus", monotonic_clock=lambda: 100.0)
+    atomic_writes = 0
+
+    def _unexpected_atomic_write(path: str, text: str) -> None:
+        nonlocal atomic_writes
+        del path, text
+        atomic_writes += 1
+        raise OSError("atomic replacement should not run for an owned lease")
+
+    monkeypatch.setattr(heartbeat, "_atomic_write", _unexpected_atomic_write)
+
+    assert write_phase(
+        str(phase),
+        "bus",
+        bus_read_succeeded=True,
+        monotonic_clock=lambda: 111.0,
+    )
+    assert atomic_writes == 0
+    assert bus_failure_age(str(phase), now=111.0) == 0.0
+
+
+def test_failed_success_phase_write_attempts_are_rate_limited(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    phase = tmp_path / "bus-phase"
+    assert write_phase(str(phase), "bus", monotonic_clock=lambda: 100.0)
+    atomic_writes = 0
+
+    def _failed_atomic_write(path: str, text: str) -> None:
+        nonlocal atomic_writes
+        del path, text
+        atomic_writes += 1
+        raise OSError("phase directory is persistently unwritable")
+
+    monkeypatch.setattr(heartbeat, "_atomic_write", _failed_atomic_write)
+    monkeypatch.setattr(heartbeat, "_rewrite_phase_lease", lambda path, text: False)
+
+    assert not write_phase(
+        str(phase),
+        "bus",
+        bus_read_succeeded=True,
+        monotonic_clock=lambda: 200.0,
+    )
+    assert not write_phase(
+        str(phase),
+        "bus",
+        bus_read_succeeded=True,
+        monotonic_clock=lambda: 200.0,
+    )
+    assert atomic_writes == 1
+
+    assert not write_phase(
+        str(phase),
+        "bus",
+        bus_read_succeeded=True,
+        monotonic_clock=lambda: 211.0,
+    )
+    assert atomic_writes == 2
 
 
 def test_write_phase_is_best_effort(tmp_path: Path) -> None:

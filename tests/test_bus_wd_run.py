@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 from typing import Any, NoReturn
 
@@ -161,7 +162,7 @@ def test_service_start_generation_uses_systemd_monotonic_timestamp() -> None:
 
     def run(argv: list[str]) -> SimpleNamespace:
         calls.append(argv)
-        return SimpleNamespace(stdout="1901000000\n")
+        return SimpleNamespace(stdout="ExecMainStartTimestampMonotonic=1901000000\n")
 
     assert _service_started_at("brilliant-mqtt", run=run) == 1901.0
     assert calls == [
@@ -169,10 +170,34 @@ def test_service_start_generation_uses_systemd_monotonic_timestamp() -> None:
             "systemctl",
             "show",
             "--property=ExecMainStartTimestampMonotonic",
-            "--value",
             "brilliant-mqtt",
         ]
     ]
+
+
+def test_empty_service_start_generation_disables_reboot_with_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def run(argv: list[str]) -> SimpleNamespace:
+        del argv
+        return SimpleNamespace(stdout="")
+
+    with caplog.at_level(logging.WARNING, logger="brilliant_bus_watchdog"):
+        started_at = _service_started_at("brilliant-mqtt", run=run)
+
+    assert started_at is None
+    assert not should_reboot(
+        age=1900.0,
+        bridge_active=True,
+        gateway_up=True,
+        bus_failure_age=None,
+        stale_after=1800.0,
+    )
+    assert any(
+        "ExecMainStartTimestampMonotonic unavailable" in record.getMessage()
+        and "reboot guard disabled" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 @pytest.mark.parametrize("stdout", ["", "garbage", "0", "-1"])
