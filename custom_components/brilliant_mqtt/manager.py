@@ -1872,6 +1872,14 @@ class PanelManager:
         journal = ""
         try:
             async with self._ssh_lock:
+                if self._broker_unavailable():
+                    self._recovery_deferred = True
+                    _LOGGER.info(
+                        "%s: recovery window elapsed but HA's MQTT broker is unavailable; "
+                        "deferring the recovery verdict until the broker reconnects",
+                        self.panel,
+                    )
+                    return
                 shell = self._shell()
                 await shell.connect()
                 try:
@@ -1896,6 +1904,14 @@ class PanelManager:
         # _recovery_timeout nulls that handle at its own entry before taking the ssh
         # lock, so a nulled handle no longer proves this window is still current.
         if my_generation != self._recovery_generation:
+            return
+        if self._broker_unavailable():
+            self._recovery_deferred = True
+            _LOGGER.info(
+                "%s: recovery window elapsed but HA's MQTT broker is unavailable; "
+                "deferring the recovery verdict until the broker reconnects",
+                self.panel,
+            )
             return
         self._fire(EVENT_REPAIR_FAILED, {"reason": "still_offline"})
         reason = f"bridge did not come back within {window:.0f} s after the {origin}"
