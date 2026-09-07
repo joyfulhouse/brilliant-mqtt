@@ -95,9 +95,6 @@ class Ladder:
             if name == "reboot":
                 if self._reboot_requested:
                     continue
-                # A successful reboot replaces this process. Until then, the
-                # request-aware guard clears this latch during its cooldown and
-                # re-arms the pending rung without committing it to _fired.
                 self._reboot_requested = True
                 self._reboot_deferred = True
             else:

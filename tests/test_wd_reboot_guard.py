@@ -1,4 +1,3 @@
-import json
 from pathlib import Path
 
 import pytest
@@ -6,10 +5,6 @@ import pytest
 from brilliant_wifi_watchdog.reboot_guard import GuardPolicy, RebootGuard
 
 P = GuardPolicy(cooldown=3600.0, cap=3, window=21600.0)
-
-
-def _stamps(path: Path) -> list[float]:
-    return [float(value) for value in json.loads(path.read_text(encoding="utf-8"))]
 
 
 def test_cooldown_blocks(tmp_path: Path) -> None:
@@ -51,43 +46,17 @@ def test_persists_across_instances(tmp_path: Path) -> None:
     assert RebootGuard(path, P).can_reboot(1800.0) is False
 
 
-def test_boot_change_persistence_failure_keeps_decisions_conservative(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    boot_id = ["boot-a"]
-    guard = RebootGuard(str(tmp_path / "state"), P, read_boot_id=lambda: boot_id[0])
-    guard.record_request(100.0)
-    boot_id[0] = "boot-b"
-
-    def read_only(*args: object) -> None:
-        raise OSError("read-only state directory")
-
-    monkeypatch.setattr("brilliant_wifi_watchdog.reboot_guard.os.replace", read_only)
-    monkeypatch.setattr("brilliant_wifi_watchdog.reboot_guard.os.unlink", read_only)
-
-    assert guard.can_reboot(101.0) is False
-    assert guard.can_request(101.0) is False
-
-
-def test_boot_id_fallback_clears_the_previous_request(tmp_path: Path) -> None:
+@pytest.mark.parametrize("state_kind", ["unreadable", "corrupt"])
+def test_decisions_tolerate_unreadable_or_corrupt_state(tmp_path: Path, state_kind: str) -> None:
     state = tmp_path / "state"
-    boot_id: list[str | None] = ["boot-a"]
-    guard = RebootGuard(str(state), P, read_boot_id=lambda: boot_id[0])
-    guard.record_request(100.0)
+    if state_kind == "unreadable":
+        state.mkdir()
+    else:
+        state.write_text("not JSON", encoding="utf-8")
+    guard = RebootGuard(str(state), P)
 
-    boot_id[0] = None
-    guard.record_request(3700.0)
-
-    assert _stamps(state) == [100.0, 3700.0]
-    assert not Path(f"{state}.request").exists()
-
-
-def test_unconfirmed_request_sidecar_expires_after_cooldown(tmp_path: Path) -> None:
-    state = tmp_path / "state"
-    guard = RebootGuard(str(state), P, read_boot_id=lambda: "boot-a")
-    guard.record_request(100.0)
-    request = Path(f"{state}.request")
-    assert request.exists()
-
-    assert guard.can_request(3700.0) is True
-    assert not request.exists()
+    try:
+        assert guard.can_reboot(100.0) is True
+        assert guard.can_request(100.0) is True
+    except OSError as exc:
+        pytest.fail(f"guard decision raised on {state_kind} state: {exc}")

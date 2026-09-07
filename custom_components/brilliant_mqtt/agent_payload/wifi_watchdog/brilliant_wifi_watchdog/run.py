@@ -99,7 +99,7 @@ def handle(
             guard.record_request(now)
             result: int = recovery_mod.gpio_reset_and_reboot()
             if result == 0:
-                _LOG.error("reboot requested; waiting for a new boot identity")
+                _LOG.error("reboot requested")
             else:
                 _LOG.error("reboot request failed with status %d; recovery remains pending", result)
             return result

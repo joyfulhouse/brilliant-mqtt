@@ -282,7 +282,7 @@ def _run_reboot_schedule(
             "WIFI_WATCHDOG_REBOOT_COOLDOWN": str(cooldown),
         }
     )
-    guard = RebootGuard(str(tmp_path / "guard"), cfg.policy, read_boot_id=lambda: "boot-a")
+    guard = RebootGuard(str(tmp_path / "guard"), cfg.policy)
     ladder = Ladder(cfg.thresholds)
     now = [0.0]
     requests: list[float] = []
