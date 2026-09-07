@@ -991,9 +991,6 @@ class _StartHarness:
     def live_observers(self) -> list[Any]:
         return [o for o in self.observers if not o.shut_down]
 
-    def release_proc_start(self) -> None:
-        self._proc_start_gate.set()
-
     def _install(self, monkeypatch: pytest.MonkeyPatch) -> None:
         harness = self
 
