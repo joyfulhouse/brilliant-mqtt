@@ -94,6 +94,7 @@ class _Pending:
     # #94: panel-clock baseline; an execution confirms this command only if
     # executed_at_ms >= confirm_after_ms (see _apply_scene_execution).
     confirm_after_ms: int
+    # In-memory: request-time validated watermark; write-task-only, never persisted or mirror-read.
     equal_at_request: bool
     timeout_task: asyncio.Task[None] | None
     write_task: asyncio.Task[None] | None = None
