@@ -14,6 +14,24 @@ def test_real_fs_read_append_exists(tmp_path: Path) -> None:
     assert fs.read_text(str(p)) == "A\nB\n"
 
 
+def test_real_fs_write_text_overwrites(tmp_path: Path) -> None:
+    fs = RealFileSystem()
+    p = tmp_path / "state.json"
+    fs.write_text(str(p), "first")
+    assert fs.read_text(str(p)) == "first"
+    # write_text must overwrite (unlike append_text), so the second write
+    # replaces the file rather than growing it.
+    fs.write_text(str(p), "second")
+    assert fs.read_text(str(p)) == "second"
+
+
+def test_real_fs_write_text_creates_missing_parent_dir(tmp_path: Path) -> None:
+    fs = RealFileSystem()
+    p = tmp_path / "sub" / "dir" / "state.json"
+    fs.write_text(str(p), "x")
+    assert fs.read_text(str(p)) == "x"
+
+
 def test_real_fs_glob_finds_nested(tmp_path: Path) -> None:
     fs = RealFileSystem()
     nested = tmp_path / "a" / "b" / "certs"

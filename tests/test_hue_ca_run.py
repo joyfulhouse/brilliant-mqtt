@@ -26,6 +26,9 @@ class FakeFS:
     def append_text(self, path: str, text: str) -> None:
         self.appended.append((path, text))
 
+    def write_text(self, path: str, text: str) -> None:
+        self._files[path] = text
+
     def glob(self, root: str, name: str) -> str | None:
         return None
 

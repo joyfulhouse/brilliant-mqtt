@@ -56,6 +56,9 @@ class FakeFS:
         self.files[path] = self.files.get(path, "") + text
         self.appended.append((path, text))
 
+    def write_text(self, path: str, text: str) -> None:
+        self.files[path] = text  # overwrite semantics (state file)
+
     def glob(self, root: str, name: str) -> str | None:
         return self.globs.get((root, name))
 
