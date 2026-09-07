@@ -139,6 +139,19 @@ class _ReadOnceBridge:
         raise asyncio.CancelledError
 
 
+class _ReadingBridge:
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        self._bus = cast(_Bus, args[0])
+        self._heartbeat = cast(Callable[[], None], kwargs["heartbeat"])
+
+    async def reconcile(self) -> None:
+        await self._bus.get_all()
+        self._heartbeat()
+
+    async def withdraw(self) -> None:
+        return
+
+
 def _settings(
     tmp_path: Path,
     mesh_priority: int = 0,
@@ -170,7 +183,7 @@ def _install_session_fakes(
     monkeypatch: pytest.MonkeyPatch,
     bus: _Bus,
     mqtt: _Mqtt,
-    bridge: type[_NoopBridge] | type[_ReadOnceBridge] = _NoopBridge,
+    bridge: type[_NoopBridge] | type[_ReadOnceBridge] | type[_ReadingBridge] = _NoopBridge,
 ) -> None:
     monkeypatch.setattr(main_mod, "RpcBusAdapter", lambda **kwargs: bus)
     monkeypatch.setattr(main_mod, "AioMqttAdapter", lambda settings: mqtt)
@@ -502,19 +515,6 @@ async def test_broker_recovery_bus_start_window_does_not_reboot_healthy_panel(
             await task
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "issue #87 DEFECT #2 (scene-subscribe path): the scene bridge SUBSCRIBEs "
-        "before the first panel reconcile, so a persistent scene-topic subscribe "
-        "rejection tears the session down before any beat. The beat-first "
-        "reconcile fix (see test_reconcile_beats_before_broker_publish) does not "
-        "reach reconcile here; the clean fix (reconcile before scene start) needs "
-        "SceneBridge to register its callbacks at construction to avoid the "
-        "scene-blind reconcile window — out of scope. See PR body. Kept red."
-    ),
-)
 async def test_scene_subscribe_failure_never_reboots_a_healthy_panel(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -531,10 +531,8 @@ async def test_scene_subscribe_failure_never_reboots_a_healthy_panel(
     Deterministic, not a timing window.
 
     Reproduced with the REAL SceneBridge and a fake MQTT whose subscribe raises.
-    Kept as a strict xfail: the beat-first reconcile fix cannot help because
-    reconcile is not reached, and the clean fix (run reconcile first) needs a
-    SceneBridge lifecycle change (register callbacks at construction) to avoid
-    reintroducing the scene-blind reconcile window — deferred; see PR body.
+    Every retry must complete an independent panel read and heartbeat before the
+    scene subscription can fail.
     """
     settings = _settings(tmp_path, scene_enabled=True)
     # A prior healthy session's heartbeat; nothing refreshes it because the scene
@@ -543,14 +541,16 @@ async def test_scene_subscribe_failure_never_reboots_a_healthy_panel(
 
     bus = _Bus()  # the local bus handshakes fine
     mqtt = _Mqtt(subscribe_error=CommandSubscribeError("scene command topic rejected"))
-    _install_session_fakes(monkeypatch, bus, mqtt)
+    _install_session_fakes(monkeypatch, bus, mqtt, _ReadingBridge)
 
-    with pytest.raises(CommandSubscribeError, match="scene command topic rejected"):
-        await main_mod._run_session(settings, None, None)
+    for _ in range(3):
+        with pytest.raises(CommandSubscribeError, match="scene command topic rejected"):
+            await main_mod._run_session(settings, None, None)
 
     confirmed = bus_confirmed(settings.bus_phase_file)
     age = heartbeat_age(settings.bus_heartbeat_file, now=time.time(), started_at=0.0)
-    assert bus.start_calls == 1  # the local bus was healthy...
+    assert bus.start_calls == 3  # the local bus was healthy on every retry...
+    assert bus.read_calls == 3
     assert confirmed is True  # ...and the phase reached "bus"
     assert age < 1800.0
     assert not should_reboot(
