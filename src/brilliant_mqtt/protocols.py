@@ -45,11 +45,20 @@ class BusClient(Protocol):
         cb: Callable[[BrilliantDevice], Awaitable[None]],
         *,
         coalesce_pushes: bool = True,
+        want_device: Callable[[str], bool] | None = None,
     ) -> None:
         """Register a callback invoked when any peripheral changes.
 
         Coalescing consumers receive the newest pending device snapshot;
         lossless consumers receive every pushed snapshot in arrival order.
+
+        *want_device* is a live scope predicate keyed by the raw push's bus
+        device id (``None`` = wants every device, the default). The adapter
+        evaluates it BEFORE normalizing anything, so a push no registered
+        consumer wants costs zero normalization/allocation (issue #98). It may
+        over-admit (a false positive just wastes one normalization) but MUST
+        never be narrower than this callback's own downstream include check, or
+        real state would be silently dropped.
         """
         ...
 

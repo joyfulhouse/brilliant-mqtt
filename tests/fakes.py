@@ -31,6 +31,10 @@ class FakeBus:
         # own change callback on the one shared bus — mirror the adapter's fan-out.
         self._change_cbs: list[Callable[[BrilliantDevice], Awaitable[None]]] = []
         self.change_callback_modes: list[bool] = []
+        # want_device scope predicate recorded per registration (issue #98):
+        # None means the callback wants every device. emit() applies it so the
+        # fake mirrors the real adapter's pre-filter skip.
+        self.change_callback_wants: list[Callable[[str], bool] | None] = []
         self._reconnect_cbs: list[Callable[[], Awaitable[None]]] = []
         # Each entry is (device_id, peripheral_id, [VarSet, ...]): writes are
         # ROUTED to the bus device owning the peripheral (the panel's own
@@ -67,9 +71,11 @@ class FakeBus:
         cb: Callable[[BrilliantDevice], Awaitable[None]],
         *,
         coalesce_pushes: bool = True,
+        want_device: Callable[[str], bool] | None = None,
     ) -> None:
         self._change_cbs.append(cb)
         self.change_callback_modes.append(coalesce_pushes)
+        self.change_callback_wants.append(want_device)
 
     def on_reconnect(self, cb: Callable[[], Awaitable[None]]) -> None:
         self._reconnect_cbs.append(cb)
@@ -96,10 +102,16 @@ class FakeBus:
         pass
 
     async def emit(self, device: BrilliantDevice) -> None:
-        """Test helper: invoke every registered on_change callback with *device*."""
+        """Test helper: invoke every in-scope on_change callback with *device*.
+
+        Mirrors the real adapter's pre-filter (issue #98): a callback whose
+        want_device predicate rejects this device's id is skipped, exactly as
+        the adapter would drop the push before normalization.
+        """
         assert self._change_cbs, "on_change was never registered"
-        for cb in list(self._change_cbs):
-            await cb(device)
+        for cb, want in zip(list(self._change_cbs), list(self.change_callback_wants), strict=True):
+            if want is None or want(device.device_id):
+                await cb(device)
 
     def set_devices(self, devices: list[BrilliantDevice]) -> None:
         """Test helper: replace what subsequent get_all() calls return."""

@@ -1092,12 +1092,12 @@ MESH_PID = "018691f1749b000701c4e689967b8e62"
 MESH_PANEL = "mesh"
 
 
-def _is_mesh(device: BrilliantDevice) -> bool:
-    return device.device_id == "ble_mesh"
+def _is_mesh(device_id: str) -> bool:
+    return device_id == "ble_mesh"
 
 
-def _is_panel(device: BrilliantDevice) -> bool:
-    return device.device_id != "ble_mesh"
+def _is_panel(device_id: str) -> bool:
+    return device_id != "ble_mesh"
 
 
 @pytest.fixture()

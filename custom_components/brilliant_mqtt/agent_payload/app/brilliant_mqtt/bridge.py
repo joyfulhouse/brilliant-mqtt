@@ -145,7 +145,7 @@ class Bridge:
         mqtt: MqttClient,
         panel: str,
         *,
-        include: Callable[[BrilliantDevice], bool] | None = None,
+        include: Callable[[str], bool] | None = None,
         desired: DesiredState | None = None,
         deriver: MotionDeriver | None = None,
         heartbeat: Callable[[], None] | None = None,
@@ -162,12 +162,15 @@ class Bridge:
         self._mqtt = mqtt
         self._panel = panel
         self._deployment_id = deployment_id
-        # Scope filter; None means everything (the single-bridge default).
-        # The mesh milestone runs TWO Bridge instances on the SAME bus in one
-        # process — the panel bridge excludes "ble_mesh", the mesh bridge
-        # selects only it — and the bus fan-out delivers every device to both,
-        # so each bridge must drop out-of-scope devices before computing
-        # entities or storing snapshots.
+        # Scope filter keyed by bus DEVICE ID; None means everything (the
+        # single-bridge default). The mesh milestone runs TWO Bridge instances
+        # on the SAME bus in one process — the panel bridge excludes "ble_mesh",
+        # the mesh bridge selects only it — and the bus fan-out delivers every
+        # device to both, so each bridge must drop out-of-scope devices before
+        # computing entities or storing snapshots. This SAME predicate is handed
+        # to the bus as ``want_device`` (issue #98) so an out-of-scope push is
+        # skipped before normalization; one source of truth means the pre-filter
+        # can never be narrower than this downstream check and drop real state.
         self._include = include
         # Desired-state reconciliation (None => disabled; behaves as before).
         self._desired = desired
@@ -227,12 +230,16 @@ class Bridge:
         self._mesh_write_generation: dict[str, int] = {}
         self._mesh_confirm_count = 0
 
-        bus.on_change(self._on_change)
+        bus.on_change(self._on_change, want_device=self._include)
         mqtt.on_command(self._on_command)
 
     def _included(self, device: BrilliantDevice) -> bool:
-        """True when *device* is in this bridge's scope (no filter = everything)."""
-        return self._include is None or self._include(device)
+        """True when *device* is in this bridge's scope (no filter = everything).
+
+        Keyed by device id — the SAME predicate the bus uses as ``want_device``
+        (issue #98), so the pre-filter and this check can never disagree.
+        """
+        return self._include is None or self._include(device.device_id)
 
     def _derived(self, device: BrilliantDevice) -> BrilliantDevice:
         """Apply score-derived motion to *device* (identity when disabled)."""
