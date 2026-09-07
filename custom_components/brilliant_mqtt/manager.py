@@ -870,35 +870,23 @@ class PanelManager:
             return
         if self.availability not in (AVAILABILITY_OFFLINE, None):
             return
-        if self.availability == AVAILABILITY_OFFLINE and self._broker_unavailable():
-            # A panel can only look offline THROUGH the broker; while HA's own broker
-            # link is down that evidence is untrustworthy. Defer BOTH auto-repair and
-            # the offline escalations below — a broker outage must not trigger SSH work
-            # or raise a misleading per-panel repair issue (#95). async_broker_reconnected
-            # re-arms this grace window from fresh evidence once the broker returns.
-            # Gate ONLY on OFFLINE, never None: _arm_offline_grace can re-arm only an
-            # OFFLINE panel, so a None-availability defer could never be reassessed —
-            # let None fall through (it is skipped again at async_repair's broker gate).
-            _LOGGER.info(
-                "%s: bridge appears offline but HA's MQTT broker is unavailable; "
-                "deferring auto-repair until the broker reconnects",
-                self.panel,
-            )
-            return
-        if self.availability is None and self._broker_unavailable():
-            # A None-availability panel (e.g. an undecodable LWT) while the broker is down.
-            # Do NOT fall through to async_repair: it would fire EVENT_REPAIR_STARTED (with no
-            # terminal) and re-fetch the payload on every recheck for the whole outage (#95).
-            # async_broker_reconnected re-arms grace only for an OFFLINE panel, so arm an
-            # unreachable-style _grace_expired recheck DIRECTLY to re-drive after reconnect.
-            # _grace_cancel was cleared at the top of this call, so this cannot stack a timer.
-            if self._grace_cancel is None:
+        if self._broker_unavailable():
+            # availability is OFFLINE or None here (checked just above). A panel can only
+            # look offline THROUGH the broker; while HA's own link is down that evidence is
+            # untrustworthy — defer BOTH auto-repair and the offline escalations below so a
+            # broker outage triggers no SSH work and no misleading per-panel issue (#95).
+            # async_broker_reconnected re-arms grace on reconnect, but only for an OFFLINE
+            # panel; a None-availability panel it cannot re-arm, so arm an unreachable-style
+            # _grace_expired recheck DIRECTLY (grace was cleared at the top of this call → no
+            # stacking) rather than falling through to async_repair, which would spam
+            # repair_started + payload fetches for the whole outage.
+            if self.availability is None:
                 self._grace_cancel = async_call_later(
                     self.hass, _UNREACHABLE_RECHECK_SECONDS, self._grace_expired
                 )
             _LOGGER.info(
-                "%s: bridge availability is unknown and HA's MQTT broker is unavailable; "
-                "will re-check after the broker reconnects",
+                "%s: bridge appears offline but HA's MQTT broker is unavailable; "
+                "deferring auto-repair until the broker reconnects",
                 self.panel,
             )
             return
