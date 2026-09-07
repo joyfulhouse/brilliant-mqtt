@@ -200,10 +200,38 @@ def test_empty_service_start_generation_disables_reboot_with_warning(
     )
 
 
-@pytest.mark.parametrize("stdout", ["", "garbage", "0", "-1"])
-def test_unknown_service_start_generation_fails_closed(stdout: str) -> None:
+@pytest.mark.parametrize(
+    ("stdout", "returncode"),
+    [
+        pytest.param(
+            "ExecMainStartTimestampMonotonic=garbage",
+            0,
+            id="non-integer-value",
+        ),
+        pytest.param("ExecMainStartTimestampMonotonic=0", 0, id="zero-value"),
+        pytest.param("ExecMainStartTimestampMonotonic=-1", 0, id="negative-value"),
+        pytest.param(
+            "ExecMainStartTimestampMonotonic=1901000000",
+            1,
+            id="systemctl-failure",
+        ),
+    ],
+)
+def test_unknown_service_start_generation_fails_closed(
+    stdout: str,
+    returncode: int,
+) -> None:
     def run(argv: list[str]) -> SimpleNamespace:
         del argv
-        return SimpleNamespace(stdout=stdout)
+        return SimpleNamespace(stdout=stdout, returncode=returncode)
 
-    assert _service_started_at("brilliant-mqtt", run=run) is None
+    started_at = _service_started_at("brilliant-mqtt", run=run)
+
+    assert started_at is None
+    assert not should_reboot(
+        age=1900.0,
+        bridge_active=True,
+        gateway_up=True,
+        bus_failure_age=started_at,
+        stale_after=1800.0,
+    )
