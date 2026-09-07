@@ -962,6 +962,8 @@ class _StartHarness:
         block_proc_start: bool = False,
         gated_writes: bool = False,
         obs_shutdown_raises: BaseException | None = None,
+        hang_obs_shutdown: bool = False,
+        hang_proc_shutdown: bool = False,
     ) -> None:
         self.fail_at = fail_at
         self.block_proc_start = block_proc_start
@@ -969,9 +971,14 @@ class _StartHarness:
         # When set, the observer's shutdown() raises this (e.g. CancelledError)
         # to prove _close_bus_resources still closes the processor afterwards.
         self.obs_shutdown_raises = obs_shutdown_raises
+        self.hang_obs_shutdown = hang_obs_shutdown
+        self.hang_proc_shutdown = hang_proc_shutdown
         self.procs: list[Any] = []
         self.observers: list[Any] = []
         self.subscribed: list[str] = []
+        self.obs_shutdown_started = asyncio.Event()
+        self.proc_shutdown_started = asyncio.Event()
+        self.shutdown_release = asyncio.Event()
         # Gated-write bookkeeping (gated_writes=True): every set-variables RPC
         # blocks on write_release, recording the device order it actually
         # started on and the peak concurrency, so a test can prove same-device
@@ -1041,8 +1048,14 @@ class _StartHarness:
                 return "ok"
 
             async def shutdown(self) -> None:
+                harness.obs_shutdown_started.set()
                 if harness.obs_shutdown_raises is not None:
                     raise harness.obs_shutdown_raises
+                if harness.hang_obs_shutdown:
+                    try:
+                        await harness.shutdown_release.wait()
+                    except asyncio.CancelledError:
+                        await harness.shutdown_release.wait()
                 self.shut_down = True
 
         class _FakeProc:
@@ -1078,6 +1091,12 @@ class _StartHarness:
                 self.reconnect_cbs.append(cb)
 
             async def shutdown(self) -> None:
+                harness.proc_shutdown_started.set()
+                if harness.hang_proc_shutdown:
+                    try:
+                        await harness.shutdown_release.wait()
+                    except asyncio.CancelledError:
+                        await harness.shutdown_release.wait()
                 self.shut_down = True
 
         class _FakeSubscriptionRequest:
@@ -1245,10 +1264,9 @@ class TestPartialStartupUnwind:
     async def test_processor_closed_even_when_observer_close_is_cancelled(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """grok r1 #1: if the observer close is cancelled/raises a BaseException
-        (which the per-resource except-Exception does not catch), the processor
-        — which owns automatic-reconnect work — must STILL be closed via the
-        shared helper's finally, or it leaks with self._proc already cleared."""
+        """If observer close raises cancellation, its independent processor
+        close task must still run before the cancellation reaches the caller.
+        """
         harness = _StartHarness(monkeypatch, obs_shutdown_raises=asyncio.CancelledError())
         adapter = RpcBusAdapter()
 
@@ -1258,6 +1276,114 @@ class TestPartialStartupUnwind:
             await adapter.shutdown()
 
         assert proc.shut_down is True  # closed despite the observer close cancel
+
+
+class TestBoundedResourceShutdown:
+    @pytest.mark.parametrize("hung_resource", ["observer", "processor"])
+    async def test_normal_teardown_has_one_total_resource_deadline(
+        self, monkeypatch: pytest.MonkeyPatch, hung_resource: str
+    ) -> None:
+        """Issue #130: either closed-source close may ignore cancellation,
+        while observer and processor cleanup must both be attempted promptly.
+        """
+        monkeypatch.setattr(bus_mod, "_RESOURCE_CLOSE_TIMEOUT_S", 0.05, raising=False)
+        harness = _StartHarness(
+            monkeypatch,
+            hang_obs_shutdown=hung_resource == "observer",
+            hang_proc_shutdown=hung_resource == "processor",
+        )
+        adapter = RpcBusAdapter()
+        await adapter.start()
+        shutdown = asyncio.create_task(adapter.shutdown())
+
+        try:
+            await asyncio.wait_for(harness.obs_shutdown_started.wait(), timeout=1)
+            await asyncio.wait_for(harness.proc_shutdown_started.wait(), timeout=1)
+            await asyncio.sleep(0.1)
+
+            assert shutdown.done()
+            await shutdown
+            assert len(adapter._resource_close_tasks) == 1
+        finally:
+            harness.shutdown_release.set()
+            await asyncio.gather(shutdown, return_exceptions=True)
+            await _settle(5)
+
+    @pytest.mark.parametrize("hung_resource", ["observer", "processor"])
+    async def test_partial_startup_unwind_has_one_total_resource_deadline(
+        self, monkeypatch: pytest.MonkeyPatch, hung_resource: str
+    ) -> None:
+        """Issue #130: failure unwind is bounded by the same total resource
+        deadline and still reports the original startup failure afterward.
+        """
+        monkeypatch.setattr(bus_mod, "_RESOURCE_CLOSE_TIMEOUT_S", 0.05, raising=False)
+        harness = _StartHarness(
+            monkeypatch,
+            fail_at="proc_start",
+            hang_obs_shutdown=hung_resource == "observer",
+            hang_proc_shutdown=hung_resource == "processor",
+        )
+        adapter = RpcBusAdapter()
+        startup = asyncio.create_task(adapter.start())
+
+        try:
+            await asyncio.wait_for(harness.obs_shutdown_started.wait(), timeout=1)
+            await asyncio.wait_for(harness.proc_shutdown_started.wait(), timeout=1)
+            await asyncio.sleep(0.1)
+
+            assert startup.done()
+            with pytest.raises(RuntimeError, match="proc start boom"):
+                await startup
+            assert len(adapter._resource_close_tasks) == 1
+        finally:
+            harness.shutdown_release.set()
+            await asyncio.gather(startup, return_exceptions=True)
+            await _settle(5)
+
+    async def test_unresolved_close_fences_fresh_adapter_until_it_settles(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Issue #130: the supervisor constructs a fresh adapter per attempt,
+        which must still see and fence an unresolved peer close from its retry.
+        """
+        monkeypatch.setattr(bus_mod, "_RESOURCE_CLOSE_TIMEOUT_S", 0.05, raising=False)
+        harness = _StartHarness(
+            monkeypatch,
+            fail_at="proc_start",
+            hang_obs_shutdown=True,
+        )
+        first_adapter = RpcBusAdapter()
+        retry_adapter = RpcBusAdapter()
+        startup = asyncio.create_task(first_adapter.start())
+
+        try:
+            await asyncio.wait_for(harness.obs_shutdown_started.wait(), timeout=1)
+            await asyncio.sleep(0.1)
+            assert startup.done()
+            with pytest.raises(RuntimeError, match="proc start boom"):
+                await startup
+            assert len(first_adapter._resource_close_tasks) == 1
+
+            with pytest.raises(RuntimeError, match="resource shutdown still pending"):
+                await retry_adapter.start()
+            assert len(harness.observers) == 1
+            assert len(harness.procs) == 1
+            assert retry_adapter._resource_close_tasks is first_adapter._resource_close_tasks
+            assert len(retry_adapter._resource_close_tasks) == 1
+
+            harness.shutdown_release.set()
+            await _settle(5)
+            assert retry_adapter._resource_close_tasks == set()
+
+            harness.fail_at = None
+            await retry_adapter.start()
+            assert len(harness.observers) == 2
+            assert len(harness.procs) == 2
+            await retry_adapter.shutdown()
+        finally:
+            harness.shutdown_release.set()
+            await asyncio.gather(startup, return_exceptions=True)
+            await _settle(5)
 
 
 class TestReusedSessionSafety:
@@ -1535,6 +1661,103 @@ class TestStaleCallbackFencing:
             release.set()  # cb(p1) returns; the stale drain would deliver p2 next
             await _settle(5)
             assert seen == ["p1"]  # p2 (rest of the session-1 snapshot) not delivered
+        finally:
+            release.set()
+            await _settle(5)
+
+    async def test_shutdown_fences_rest_of_snapshot_without_restart(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Issue #131: production discards the old adapter after shutdown, so
+        its session token never advances to fence a cancellation-resistant
+        drain worker. The shutdown fence itself must stop both normalization
+        and callback delivery for the rest of the already-popped snapshot.
+        """
+        monkeypatch.setattr(bus_mod, "_PENDING_SETTLE_TIMEOUT_S", 0.05)
+        _StartHarness(monkeypatch)
+        adapter = RpcBusAdapter()
+        release = asyncio.Event()
+        first_started = asyncio.Event()
+        normalized: list[str] = []
+        seen: list[str] = []
+        real_normalize = bus_mod.normalize_peripheral
+
+        def recording_normalize(
+            device_id: str, peripheral_id: str, raw_peripheral: Any
+        ) -> BrilliantDevice:
+            normalized.append(peripheral_id)
+            return real_normalize(device_id, peripheral_id, raw_peripheral)
+
+        async def callback(device: BrilliantDevice) -> None:
+            seen.append(device.peripheral_id)
+            if device.peripheral_id != "first":
+                return
+            first_started.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                await release.wait()
+
+        monkeypatch.setattr(bus_mod, "normalize_peripheral", recording_normalize)
+        adapter.on_change(callback, coalesce_pushes=False)
+
+        try:
+            await adapter.start()
+            adapter._dispatch_raw_device(
+                _RawDevice(
+                    "own-device",
+                    {"first": _RawPeripheral(), "second": _RawPeripheral()},
+                )
+            )
+            await asyncio.wait_for(first_started.wait(), timeout=1)
+            await asyncio.wait_for(adapter.shutdown(), timeout=1)
+
+            release.set()
+            await _settle(5)
+
+            assert seen == ["first"]
+            assert normalized == ["first"]
+        finally:
+            release.set()
+            await _settle(5)
+
+    async def test_shutdown_fences_reconnect_fanout_without_restart(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Issue #131: a reconnect fan-out that survives shutdown must not
+        continue to its remaining callbacks on an old, never-restarted adapter.
+        """
+        monkeypatch.setattr(bus_mod, "_PENDING_SETTLE_TIMEOUT_S", 0.05)
+        _StartHarness(monkeypatch)
+        adapter = RpcBusAdapter()
+        release = asyncio.Event()
+        first_started = asyncio.Event()
+        seen: list[str] = []
+
+        async def first() -> None:
+            seen.append("first")
+            first_started.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                await release.wait()
+
+        async def second() -> None:
+            seen.append("second")
+
+        adapter.on_reconnect(first)
+        adapter.on_reconnect(second)
+
+        try:
+            await adapter.start()
+            adapter._on_proc_reconnect()
+            await asyncio.wait_for(first_started.wait(), timeout=1)
+            await asyncio.wait_for(adapter.shutdown(), timeout=1)
+
+            release.set()
+            await _settle(5)
+
+            assert seen == ["first"]
         finally:
             release.set()
             await _settle(5)
