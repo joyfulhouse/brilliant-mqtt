@@ -1064,18 +1064,25 @@ class SceneBridge:
         value: str,
     ) -> None:
         try:
-            receipt = await self._bus.set_variables(
+            await self._bus.set_variables(
                 device_id,
                 _EXECUTION_PERIPHERAL_ID,
                 [VarSet(name=variable, value=value)],
             )
-            if kind == "mode" and "modified_variables=()" in receipt:
+            if kind == "mode":
+                # RPC success proves the panel holds the requested value. A
+                # matching mirror settles a same-value write that cannot re-stamp;
+                # a differing or absent mirror stays pending for stamped evidence.
+                # A stale differing mirror may conservatively time out, but cannot
+                # false-confirm. ponytail: a typed no-op signal is the ceiling;
+                # upgrade after an operator-approved on-panel response-type capture.
                 await self._async_settle_pending(
                     kind,
                     command_id,
                     value,
                     error=None,
                     expected_write=asyncio.current_task(),
+                    require_current_mode=True,
                 )
         except asyncio.CancelledError:
             raise
@@ -1104,6 +1111,7 @@ class SceneBridge:
         *,
         error: str | None,
         expected_write: asyncio.Task[None] | None = None,
+        require_current_mode: bool = False,
     ) -> None:
         epoch = self._epoch
         async with self._lock:
@@ -1119,6 +1127,14 @@ class SceneBridge:
                 return
             if expected_write is not None and pending.write_task is not expected_write:
                 return
+            if require_current_mode:
+                manual_mode = (
+                    None
+                    if self._execution is None
+                    else self._execution.variables.get("manual_mode_id")
+                )
+                if manual_mode is None or manual_mode.value != value:
+                    return
             pending_map.pop(command_id, None)
             state_key: StateKey = (cast(StateKind, kind), command_id)
             self._pending_records.pop(state_key, None)

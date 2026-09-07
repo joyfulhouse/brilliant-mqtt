@@ -42,6 +42,11 @@ _SCENE_PREFIX = "execution_state:scene_execution_handler:scene:"
 _NOW_MS = 1_700_000_010_000
 
 
+class _OpaqueReceipt(str):
+    def __contains__(self, item: object) -> bool:
+        raise AssertionError(f"transport receipt must not be inspected for {item!r}")
+
+
 def _field_string(field_id: int, value: str) -> bytes:
     encoded = value.encode()
     return b"\x0b" + struct.pack(">hI", field_id, len(encoded)) + encoded
@@ -930,6 +935,7 @@ async def test_new_mode_execution_at_baseline_confirms_only_mode_pending_request
         execution=_execution(mode_id="home", mode_at_ms=_NOW_MS - 1_000),
         mode_ids=("away", "home"),
     )
+    bus.set_variables_receipt = _OpaqueReceipt("opaque transport acknowledgement")
     scene_command_id = "22222222-2222-4222-8222-222222222222"
     mode_command_id = "33333333-3333-4333-8333-333333333333"
     await mqtt.inject(scene_command_topic(_PANEL), _command(scene_command_id, "scene", "all_off"))
@@ -2808,14 +2814,36 @@ async def test_malformed_execution_never_confirms_pending_scene_command(tmp_path
 async def test_requesting_current_mode_confirms_immediately_without_execution_stamp(
     tmp_path: Path,
 ) -> None:
-    seeded = _execution(mode_id="away", mode_at_ms=_NOW_MS - 1_000)
-    bridge, bus, mqtt, clock, _ = await _started(tmp_path, execution=seeded)
-    bus.set_variables_receipt = f"SetVariableResponse(timestamp={_NOW_MS}, modified_variables=())"
+    class CompletingBus(FakeBus):
+        def __init__(self) -> None:
+            super().__init__(
+                [_execution(mode_id="away", mode_at_ms=_NOW_MS - 1_000)],
+                scoped_devices=[_scene_catalog("all_off"), _mode_catalog("away")],
+            )
+            self.write_started = asyncio.Event()
+            self.release_write = asyncio.Event()
+
+        async def set_variables(
+            self, device_id: str, peripheral_id: str, sets: list[VarSet]
+        ) -> str:
+            receipt = await super().set_variables(device_id, peripheral_id, sets)
+            self.write_started.set()
+            await self.release_write.wait()
+            return receipt
+
+    bus = CompletingBus()
+    mqtt = FakeMqtt()
+    clock = FakeClockMs(_NOW_MS)
+    bridge = SceneBridge(bus, mqtt, _PANEL, tmp_path / "state.json", clock)
+    await bridge.async_start()
     mqtt.published.clear()
 
     command_id = "33333333-3333-4333-8333-333333333333"
     await mqtt.inject(mode_command_topic(_PANEL), _command(command_id, "mode", "away"))
-    await _wait_for_bus_commands(bus, 1)
+    await asyncio.wait_for(bus.write_started.wait(), timeout=0.1)
+    timeout_task = bridge._mode_pending[command_id].timeout_task
+    assert timeout_task is not None
+    bus.release_write.set()
     await _wait_for_publish(mqtt, mode_result_topic(command_id))
 
     assert bus.commands == [
@@ -2827,6 +2855,7 @@ async def test_requesting_current_mode_confirms_immediately_without_execution_st
     result = _payload(_published(mqtt, mode_result_topic(command_id))[-1])
     assert result["accepted"] is True
     assert "error" not in result
+    assert timeout_task.cancelled()
 
     await clock.advance_ms(COMMAND_TTL_MS + 1)
     assert len(_published(mqtt, mode_result_topic(command_id))) == 1
@@ -2984,6 +3013,7 @@ async def test_mode_execution_newer_than_watermark_but_before_request_does_not_c
 ) -> None:
     clock = FakeClockMs(200)
     bridge, bus, mqtt, _, _ = await _started(tmp_path, clock=clock)
+    bus.set_variables_receipt = _OpaqueReceipt("opaque transport acknowledgement")
     bridge._mode_watermarks[_PANEL] = (100, "away")
     command_id = "55555555-5555-4555-8555-555555555555"
 
