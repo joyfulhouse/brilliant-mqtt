@@ -94,6 +94,7 @@ class _Pending:
     # #94: panel-clock baseline; an execution confirms this command only if
     # executed_at_ms >= confirm_after_ms (see _apply_scene_execution).
     confirm_after_ms: int
+    equal_at_request: bool
     timeout_task: asyncio.Task[None] | None
     write_task: asyncio.Task[None] | None = None
 
@@ -469,6 +470,7 @@ class SceneBridge:
                 record.panel,
                 record.issued_at_ms,
                 record.confirm_after_ms,
+                record.equal_at_request,
                 None,
             )
             target = self._scene_pending if kind == "scene" else self._mode_pending
@@ -983,6 +985,12 @@ class SceneBridge:
                         # (expires_at_ms - COMMAND_TTL_MS) reconstructs the
                         # baseline exactly for old files that lack the field.
                         now = self._clock_ms()
+                        manual_mode = self._execution.variables.get("manual_mode_id")
+                        equal_at_request = (
+                            kind == "mode"
+                            and manual_mode is not None
+                            and manual_mode.value == value
+                        )
                         record = _StoredPending(
                             state_kind,
                             command.command_id,
@@ -992,6 +1000,7 @@ class SceneBridge:
                             command.issued_at_ms,
                             now + COMMAND_TTL_MS,
                             now,
+                            equal_at_request,
                         )
                         self._pending_records[cache_key] = record
                         pending[command.command_id] = _Pending(
@@ -1000,6 +1009,7 @@ class SceneBridge:
                             command.panel,
                             command.issued_at_ms,
                             now,
+                            equal_at_request,
                             None,
                         )
                         execution_device_id = self._execution.device_id
@@ -1070,19 +1080,18 @@ class SceneBridge:
                 [VarSet(name=variable, value=value)],
             )
             if kind == "mode":
-                # RPC success proves the panel holds the requested value. A
-                # matching mirror settles a same-value write that cannot re-stamp;
-                # a differing or absent mirror stays pending for stamped evidence.
-                # A stale differing mirror may conservatively time out, but cannot
-                # false-confirm. ponytail: a typed no-op signal is the ceiling;
-                # upgrade after an operator-approved on-panel response-type capture.
+                # RPC success proves a mode equal when the request was issued still
+                # holds. Changed modes stay pending for request-relative stamped
+                # evidence; a stale mirror may conservatively time out rather than
+                # false-confirm. A typed bus no-op signal would be stronger; add it
+                # only after an operator-approved on-panel response-type capture.
                 await self._async_settle_pending(
                     kind,
                     command_id,
                     value,
                     error=None,
                     expected_write=asyncio.current_task(),
-                    require_current_mode=True,
+                    require_equal_at_request=True,
                 )
         except asyncio.CancelledError:
             raise
@@ -1099,6 +1108,7 @@ class SceneBridge:
     async def _async_timeout(self, kind: str, command_id: str, delay_seconds: float) -> None:
         try:
             await self._sleep(delay_seconds)
+            # Mode timeouts intentionally never trust a later mirror value.
             await self._async_settle_pending(kind, command_id, None, error="timeout")
         except asyncio.CancelledError:
             raise
@@ -1111,7 +1121,7 @@ class SceneBridge:
         *,
         error: str | None,
         expected_write: asyncio.Task[None] | None = None,
-        require_current_mode: bool = False,
+        require_equal_at_request: bool = False,
     ) -> None:
         epoch = self._epoch
         async with self._lock:
@@ -1127,14 +1137,8 @@ class SceneBridge:
                 return
             if expected_write is not None and pending.write_task is not expected_write:
                 return
-            if require_current_mode:
-                manual_mode = (
-                    None
-                    if self._execution is None
-                    else self._execution.variables.get("manual_mode_id")
-                )
-                if manual_mode is None or manual_mode.value != value:
-                    return
+            if require_equal_at_request and not pending.equal_at_request:
+                return
             pending_map.pop(command_id, None)
             state_key: StateKey = (cast(StateKind, kind), command_id)
             self._pending_records.pop(state_key, None)
