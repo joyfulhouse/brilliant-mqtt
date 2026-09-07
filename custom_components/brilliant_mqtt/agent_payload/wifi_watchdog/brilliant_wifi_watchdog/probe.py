@@ -23,19 +23,11 @@ _LOCAL_ERRNOS = frozenset({errno.EMFILE, errno.ENFILE, errno.ENOBUFS, errno.ENOM
 _PROBE_TIMEOUT = 5.0
 
 
-def _run_out(argv: list[str]) -> tuple[int, str]:
-    r = bounded.run_bounded(argv, timeout=_PROBE_TIMEOUT, capture=True)
-    return r.returncode, r.stdout
+def _run_probe(argv: list[str], capture: bool) -> bounded.Completed:
+    return bounded.run_bounded(argv, timeout=_PROBE_TIMEOUT, capture=capture)
 
 
-def _run_rc(argv: list[str]) -> int:
-    return bounded.run_bounded(argv, timeout=_PROBE_TIMEOUT).returncode
-
-
-def default_gateway(run: Callable[[list[str]], tuple[int, str]] = _run_out) -> str | None:
-    rc, out = run(["ip", "route", "show", "default"])
-    if rc != 0:
-        return None
+def _parse_default_gateway(out: str) -> str | None:
     for line in out.splitlines():
         parts = line.split()
         if "via" in parts:
@@ -45,16 +37,49 @@ def default_gateway(run: Callable[[list[str]], tuple[int, str]] = _run_out) -> s
     return None
 
 
-def ping(host: str, run: Callable[[list[str]], int] = _run_rc) -> bool:
-    return run(["ping", "-c", "1", "-W", "2", host]) == 0
+def ping(host: str, run: Callable[[list[str]], int] | None = None) -> bool:
+    argv = ["ping", "-c", "1", "-W", "2", host]
+    returncode = (
+        bounded.run_bounded(argv, timeout=_PROBE_TIMEOUT).returncode if run is None else run(argv)
+    )
+    return returncode == 0
 
 
 class TcpProbe(enum.Enum):
-    """Result of a bounded TCP reachability probe."""
+    """Conclusive or inconclusive result from a bounded connectivity probe."""
 
-    OPEN = "open"  # a connection was established
-    CLOSED = "closed"  # every resolved address refused/failed conclusively, in budget
-    INCONCLUSIVE = "inconclusive"  # DNS/budget could not complete — proves nothing
+    OPEN = "open"  # the requested connectivity check succeeded
+    CLOSED = "closed"  # the check completed and failed conclusively, in budget
+    INCONCLUSIVE = "inconclusive"  # the local check could not complete — proves nothing
+
+
+_GatewayRun = Callable[[list[str], bool], bounded.Completed]
+
+
+def _completed_state(result: bounded.Completed) -> TcpProbe:
+    if result.timed_out:
+        return TcpProbe.INCONCLUSIVE
+    return TcpProbe.OPEN if result.returncode == 0 else TcpProbe.CLOSED
+
+
+def gateway_probe(
+    configured_gateway: str | None,
+    *,
+    run: _GatewayRun = _run_probe,
+) -> tuple[str | None, TcpProbe]:
+    """Discover and ping the gateway without losing timeout information."""
+    gateway = configured_gateway
+    if gateway is None:
+        route = run(["ip", "route", "show", "default"], True)
+        route_state = _completed_state(route)
+        if route_state != TcpProbe.OPEN:
+            return None, route_state
+        gateway = _parse_default_gateway(route.stdout)
+        if gateway is None:
+            return None, TcpProbe.CLOSED
+
+    ping_result = run(["ping", "-c", "1", "-W", "2", gateway], False)
+    return gateway, _completed_state(ping_result)
 
 
 _AddrInfo = tuple[Any, ...]
