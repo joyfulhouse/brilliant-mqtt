@@ -1387,7 +1387,11 @@ class TestResyncSubscribePolicy:
                 )
 
         assert harness.events.count("panel_reconcile") == 4
-        warnings = [record for record in caplog.records if record.levelname == "WARNING"]
+        warnings = [
+            record
+            for record in caplog.records
+            if record.levelname == "WARNING" and record.name == "brilliant_mqtt.__main__"
+        ]
         assert len(warnings) == 1
         assert "brilliant/office/p0/set" in warnings[0].getMessage()
         assert "retrying" in warnings[0].getMessage()
@@ -1442,7 +1446,14 @@ class TestResyncSubscribePolicy:
                 )
 
         assert harness.events.count("panel_reconcile") == 5
-        assert sum(1 for r in caplog.records if r.levelname == "WARNING") == 2
+        assert (
+            sum(
+                1
+                for r in caplog.records
+                if r.levelname == "WARNING" and r.name == "brilliant_mqtt.__main__"
+            )
+            == 2
+        )
 
     async def test_mesh_resync_subscribe_failure_gets_the_same_grace(
         self,
@@ -1467,7 +1478,14 @@ class TestResyncSubscribePolicy:
                 )
 
         assert harness.events.count("mesh_reconcile") == 2
-        assert sum(1 for r in caplog.records if r.levelname == "WARNING") == 1
+        assert (
+            sum(
+                1
+                for r in caplog.records
+                if r.levelname == "WARNING" and r.name == "brilliant_mqtt.__main__"
+            )
+            == 1
+        )
 
     async def test_initial_reconcile_subscribe_failure_stays_fail_fast(
         self,
@@ -1736,7 +1754,11 @@ class TestResyncSubscribeEndToEnd:
                 "brilliant/office/gangbox_peripheral_0/set",
                 "brilliant/office/gangbox_peripheral_1/set",
             ]
-            warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+            warnings = [
+                r.getMessage()
+                for r in caplog.records
+                if r.levelname == "WARNING" and r.name == "brilliant_mqtt.__main__"
+            ]
             assert len(warnings) == 1
             assert "brilliant/office/gangbox_peripheral_1/set" in warnings[0]
         finally:

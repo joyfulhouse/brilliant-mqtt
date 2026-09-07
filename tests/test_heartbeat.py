@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from brilliant_bus_watchdog.health import bus_confirmed
 from brilliant_mqtt.heartbeat import write_heartbeat, write_phase
 from tests.fakes import FakeClock
 
@@ -108,19 +109,27 @@ def test_write_phase_pre_bus_is_best_effort_when_path_is_dir(tmp_path: Path) -> 
     assert not (tmp_path / "bus-phase.tmp").exists()
 
 
-def test_write_phase_pre_bus_failure_does_not_clear_live_marker_and_never_raises(
+def test_failed_pre_bus_restamp_must_not_leave_live_pid_bus_marker_confirmed(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A transient pre_bus write failure is swallowed and must NOT re-raise
-    even when the phase file already holds a marker: the reboot guard degrades
-    to disabled (fail-safe) rather than taking the bridge down. A leftover
-    ``bus <pid>`` from a prior session is handled by the reader's pid-liveness
-    check (that pid is dead), not by clearing here."""
+    """A failed pre_bus re-stamp must ACTIVELY clear any leftover ``bus``
+    marker, not merely swallow the error. ``run()`` retries ``_run_session`` in
+    the SAME process while teardown keeps the ``bus`` marker, so a leftover
+    ``bus <pid>`` names THIS still-live process — the reader's pid-liveness
+    check would read it as confirmed. If the re-stamp fails and the marker is
+    left in place, a stale heartbeat during a broker-only outage would reboot a
+    healthy panel in a loop (issue #87). So after a failed pre_bus write over a
+    live-pid marker, the file must be gone and bus_confirmed must be False, with
+    no exception raised."""
     phase = tmp_path / "bus-phase"
-    phase.write_text(f"bus {os.getpid()}", encoding="utf-8")  # leftover session
+    phase.write_text(f"bus {os.getpid()}", encoding="utf-8")  # leftover, live pid
+    assert bus_confirmed(str(phase)) is True  # would fire a reboot if left
 
     def _raise(*args: object, **kwargs: object) -> None:
-        raise OSError("write failed")
+        raise OSError(28, "No space left on device")
 
     monkeypatch.setattr("brilliant_mqtt.heartbeat._atomic_write", _raise)
     write_phase(str(phase), "pre_bus")  # must not raise
+
+    assert not phase.exists()
+    assert bus_confirmed(str(phase)) is False

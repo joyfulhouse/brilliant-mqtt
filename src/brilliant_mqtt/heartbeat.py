@@ -78,16 +78,28 @@ def write_phase(path: str, phase: BusPhase) -> None:
     still alive, so a stale ``bus`` marker from a dead/reverted process does not
     read as a live confirmed bus.
 
-    A failed write is best-effort for EVERY phase, ``pre_bus`` included: it is
-    logged and swallowed, never re-raised. The ``pre_bus`` stamp runs at
-    :mod:`brilliant_mqtt.__main__` *before* the session ``try``, so re-raising
-    it would make the supervisor back off and retry forever and the bridge
-    would never connect to anything — a re-raise that buys no safety. A failed
-    stamp instead degrades the reboot guard to disabled, which is fail-safe:
-    the reader (:func:`brilliant_bus_watchdog.health.bus_confirmed`) already
-    fails closed on an absent/unreadable/torn marker, and a stale ``bus``
-    marker from a prior session names that session's now-dead pid, which the
-    reader's liveness check rejects.
+    A failed write is best-effort for EVERY phase, ``pre_bus`` included: on any
+    failure the phase file is cleared best-effort and the error is swallowed,
+    never re-raised. Two things force this:
+
+    * The ``pre_bus`` stamp runs at :mod:`brilliant_mqtt.__main__` *before* the
+      session ``try``, so re-raising would make the supervisor back off and
+      retry forever and the bridge would never connect to anything.
+    * :func:`brilliant_mqtt.__main__.run` retries ``_run_session`` in the SAME
+      process while teardown deliberately KEEPS the ``bus`` marker, so a
+      leftover ``bus <pid>`` names THIS still-live process. Merely swallowing a
+      failed re-stamp would leave that live-pid marker readable, so
+      :func:`brilliant_bus_watchdog.health.bus_confirmed` would return True and
+      — with a stale heartbeat during a broker-only outage — reboot a healthy
+      panel in a loop (issue #87). The pid liveness check does NOT save us here
+      (the pid is alive), so the failed stamp must ACTIVELY clear the marker.
+
+    Removing the file disables the reboot guard (a cleared/absent marker reads
+    as unconfirmed), which is fail-safe. Every error is swallowed — including
+    the unlink's (``FileNotFoundError``, ``IsADirectoryError``,
+    ``NotADirectoryError``, ``PermissionError``, …): phase tracking degrading to
+    "off" is safe, a re-raise is not. ``_atomic_write`` already removes its own
+    ``.tmp`` scratch file, so a failed replace never leaks it.
 
     Contract: this writer and its reader
     (:func:`brilliant_bus_watchdog.health.bus_confirmed`) must be rolled out
@@ -100,8 +112,12 @@ def write_phase(path: str, phase: BusPhase) -> None:
     try:
         _atomic_write(path, f"{phase} {os.getpid()}")
     except OSError:
-        # Best-effort for every phase: never let a failed phase stamp take the
-        # bridge down. _atomic_write already cleans up its tmp file, so nothing
-        # leaks. A missing/failed stamp reads as unconfirmed (reboot guard
-        # disabled), which is fail-safe.
-        logger.debug("bus phase write failed for %s; reboot guard disabled", path, exc_info=True)
+        # A failed stamp must not take the bridge down AND must not leave a
+        # stale (same-pid) marker readable. Log, clear the marker best-effort so
+        # the watchdog fails closed (reboot guard disabled), and swallow every
+        # error — the unlink's included.
+        logger.warning("bus phase write failed for %s; reboot guard disabled", path, exc_info=True)
+        try:
+            os.unlink(path)
+        except OSError:
+            pass

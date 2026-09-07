@@ -202,6 +202,51 @@ async def test_stale_bus_phase_and_heartbeat_do_not_reboot_on_broker_outage(
     )
 
 
+async def test_failed_pre_bus_restamp_does_not_reboot_on_broker_outage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #87 regression, the in-process retry path: run() retries
+    _run_session in the SAME process and teardown deliberately keeps the "bus"
+    marker, so a leftover marker carries THIS still-live pid. If session N's
+    pre_bus re-stamp FAILS (ENOSPC/EROFS/perm on the /run tmpfs) and is merely
+    swallowed, that live-pid "bus" marker stays readable — bus_confirmed returns
+    True (the pid is alive), and a stale heartbeat during a broker-only outage
+    reboots a healthy panel in a loop. Proving the failed stamp actively clears
+    the marker: seed a live-pid "bus" + stale heartbeat, make the pre_bus stamp
+    fail, and assert the outage does NOT qualify as a bus wedge."""
+    settings = _settings(tmp_path)
+    _seed(settings.bus_phase_file, f"bus {os.getpid()}")  # leftover, live pid
+    _seed(settings.bus_heartbeat_file, "100.0")
+
+    def _fail_stamp(*args: object, **kwargs: object) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr("brilliant_mqtt.heartbeat._atomic_write", _fail_stamp)
+
+    bus = _Bus()
+    mqtt = _Mqtt(ConnectionError("broker refused"))
+    _install_session_fakes(monkeypatch, bus, mqtt)
+
+    with pytest.raises(ConnectionError, match="broker refused"):
+        await main_mod._run_session(settings, None, None)
+
+    confirmed = bus_confirmed(settings.bus_phase_file)
+    age = heartbeat_age(settings.bus_heartbeat_file, now=100_000.0, started_at=0.0)
+    assert bus.start_calls == 0  # the local bus was never reached
+    # The failed pre_bus stamp cleared the live-pid "bus" leftover...
+    assert confirmed is False
+    # ...and the heartbeat is genuinely stale, so it is the cleared marker (not
+    # a fresh heartbeat) that holds the reboot back.
+    assert age >= 1800.0
+    assert not should_reboot(
+        age=age,
+        stale_after=1800.0,
+        bridge_active=True,
+        gateway_up=True,
+        bus_confirmed=confirmed,
+    )
+
+
 async def test_mesh_election_failure_stays_pre_bus_despite_mqtt_connect(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
