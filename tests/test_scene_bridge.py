@@ -189,6 +189,157 @@ async def _started(
     return bridge, bus, mqtt, clock, path
 
 
+def _write_delivered_result_state(
+    path: Path,
+    kind: scene_state.StateKind,
+) -> tuple[str, str]:
+    command_id = "22222222-2222-4222-8222-222222222222"
+    value = "all_off" if kind == "scene" else "away"
+    executed_at_ms = _NOW_MS - 1
+    event_key = f"{kind}:{_PANEL}:{value}:{executed_at_ms}"
+    event_topic = scene_event_topic(_PANEL) if kind == "scene" else mode_event_topic(_PANEL)
+    result_topic = (
+        scene_result_topic(command_id) if kind == "scene" else mode_result_topic(command_id)
+    )
+    event_payload = encode_json(
+        {
+            "schema_version": SCHEMA_VERSION,
+            "mapping_version": MAPPING_VERSION,
+            "panel": _PANEL,
+            f"{kind}_id": value,
+            "executed_at_ms": executed_at_ms,
+            "deduplication_key": f"{_PANEL}:{value}:{executed_at_ms}",
+        }
+    )
+    result_payload = encode_json(
+        {
+            "schema_version": SCHEMA_VERSION,
+            "mapping_version": MAPPING_VERSION,
+            "command_id": command_id,
+            "panel": _PANEL,
+            f"{kind}_id": value,
+            "accepted": True,
+            "timestamp_ms": executed_at_ms,
+        }
+    )
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "watermarks": {},
+                "mode_watermarks": {},
+                "events": {
+                    event_key: {
+                        "topic": event_topic,
+                        "payload": event_payload,
+                        "delivered": True,
+                        "created_at_ms": executed_at_ms,
+                    }
+                },
+                "results": {
+                    f"{kind}:{command_id}": {
+                        "kind": kind,
+                        "command_id": command_id,
+                        "fingerprint": scene_state.command_fingerprint_fields(
+                            kind,
+                            command_id,
+                            _PANEL,
+                            value,
+                            executed_at_ms,
+                        ),
+                        "command_panel": _PANEL,
+                        "command_value": value,
+                        "issued_at_ms": executed_at_ms,
+                        "topic": result_topic,
+                        "payload": result_payload,
+                        "delivered": True,
+                        "expires_at_ms": _NOW_MS + COMMAND_TTL_MS,
+                        "event_key": event_key,
+                    }
+                },
+                "pending": {},
+            }
+        )
+    )
+    return command_id, value
+
+
+async def _assert_second_command_after_delivery_and_prune(
+    tmp_path: Path,
+    kind: scene_state.StateKind,
+) -> None:
+    bridge, bus, mqtt, _, path = await _started(tmp_path)
+    first_id = "22222222-2222-4222-8222-222222222222"
+    second_id = "44444444-4444-4444-8444-444444444444"
+    command_topic = scene_command_topic(_PANEL) if kind == "scene" else mode_command_topic(_PANEL)
+    result_topic = scene_result_topic(first_id) if kind == "scene" else mode_result_topic(first_id)
+    execution = (
+        _execution("all_off", _NOW_MS + 1)
+        if kind == "scene"
+        else _execution(mode_id="away", mode_at_ms=_NOW_MS + 1)
+    )
+    value = "all_off" if kind == "scene" else "away"
+    try:
+        await mqtt.inject(command_topic, _command(first_id, kind, value))
+        await _wait_for_bus_commands(bus, 1)
+        await bus.emit(execution)
+        await _wait_for_publish(mqtt, result_topic)
+        delivery_task = bridge._delivery_task
+        assert delivery_task is not None
+        await asyncio.wait_for(delivery_task, timeout=2)
+
+        first_result = bridge._results[(kind, first_id)]
+        assert first_result.delivered is True
+        assert first_result.event_key is None
+        assert bridge._events == {}
+        stored = json.loads(path.read_text())
+        assert stored["results"][f"{kind}:{first_id}"]["event_key"] is None
+        assert stored["events"] == {}
+
+        await mqtt.inject(command_topic, _command(second_id, kind, value))
+        assert bridge._state_trusted is True
+        await _wait_for_bus_commands(bus, 2)
+        assert len(bus.commands) == 2
+    finally:
+        await bridge.async_shutdown()
+
+
+async def _assert_restart_repairs_delivered_result_dependency(
+    tmp_path: Path,
+    kind: scene_state.StateKind,
+) -> None:
+    path = tmp_path / "state.json"
+    first_id, value = _write_delivered_result_state(path, kind)
+    assert scene_state.load_state(path).trusted is True
+    bus = FakeBus(
+        [_execution()],
+        scoped_devices=[_scene_catalog("all_off"), _mode_catalog("away")],
+    )
+    mqtt = FakeMqtt()
+    bridge = SceneBridge(bus, mqtt, _PANEL, path, FakeClockMs(_NOW_MS))
+    try:
+        await bridge.async_start()
+
+        assert bridge._state_trusted is True
+        assert bridge._results[(kind, first_id)].event_key is None
+        assert bridge._events == {}
+        status = _payload(_published(mqtt, transport_status_topic(kind, _PANEL))[-1])
+        assert status["available"] is True
+        stored = json.loads(path.read_text())
+        assert stored["results"][f"{kind}:{first_id}"]["event_key"] is None
+        assert stored["events"] == {}
+
+        second_id = "44444444-4444-4444-8444-444444444444"
+        command_topic = (
+            scene_command_topic(_PANEL) if kind == "scene" else mode_command_topic(_PANEL)
+        )
+        await mqtt.inject(command_topic, _command(second_id, kind, value))
+        await _wait_for_bus_commands(bus, 1)
+        assert bridge._state_trusted is True
+    finally:
+        await bridge.async_shutdown()
+
+
 async def test_start_seeds_history_persists_privately_and_publishes_scoped_catalogs(
     tmp_path: Path,
 ) -> None:
@@ -704,7 +855,7 @@ async def test_hung_write_does_not_block_timeout_or_shutdown(tmp_path: Path) -> 
 async def test_matching_execution_publishes_event_before_accepted_result_and_caches_replay(
     tmp_path: Path,
 ) -> None:
-    bridge, bus, mqtt, _, _ = await _started(tmp_path)
+    bridge, bus, mqtt, _, path = await _started(tmp_path)
     command_id = "22222222-2222-4222-8222-222222222222"
     command = _command(command_id, "scene", "all_off")
     await mqtt.inject(scene_command_topic(_PANEL), command)
@@ -732,6 +883,13 @@ async def test_matching_execution_publishes_event_before_accepted_result_and_cac
         "schema_version": SCHEMA_VERSION,
         "timestamp_ms": _NOW_MS,
     }
+    delivery_task = bridge._delivery_task
+    assert delivery_task is not None
+    await asyncio.wait_for(delivery_task, timeout=2)
+    assert bridge._results[("scene", command_id)].event_key is None
+    stored_result = json.loads(path.read_text())["results"][f"scene:{command_id}"]
+    assert stored_result["event_key"] is None
+    assert stored_result["delivered"] is True
     await mqtt.inject(scene_command_topic(_PANEL), command)
 
     assert len(bus.commands) == 1
@@ -1316,6 +1474,22 @@ async def test_undelivered_event_and_result_replay_identically_at_qos1_after_res
     )
     assert event_index < result_index
     await restarted.async_shutdown()
+
+
+async def test_second_command_after_delivery_and_prune(tmp_path: Path) -> None:
+    await _assert_second_command_after_delivery_and_prune(tmp_path, "scene")
+
+
+async def test_second_mode_command_after_delivery_and_prune(tmp_path: Path) -> None:
+    await _assert_second_command_after_delivery_and_prune(tmp_path, "mode")
+
+
+async def test_restart_repairs_delivered_scene_result_dependency(tmp_path: Path) -> None:
+    await _assert_restart_repairs_delivered_result_dependency(tmp_path, "scene")
+
+
+async def test_restart_repairs_delivered_mode_result_dependency(tmp_path: Path) -> None:
+    await _assert_restart_repairs_delivered_result_dependency(tmp_path, "mode")
 
 
 async def test_lost_puback_after_broker_receipt_republishes_identical_duplicate_at_qos1(
@@ -2492,7 +2666,7 @@ async def test_multiple_pending_same_scene_confirm_by_baseline_band(
 ) -> None:
     """Two commands for one scene with baselines B1 < B2: an execution at E
     confirms exactly those whose confirm_after_ms <= E."""
-    bridge, bus, mqtt, clock, _ = await _started(tmp_path)
+    bridge, bus, mqtt, clock, path = await _started(tmp_path)
     ids = {
         "first": "22222222-2222-4222-8222-222222222222",  # baseline B1 = T
         "second": "44444444-4444-4444-8444-444444444444",  # baseline B2 = T + 1000
@@ -2511,9 +2685,28 @@ async def test_multiple_pending_same_scene_confirm_by_baseline_band(
         await _wait_for_publish(mqtt, scene_result_topic(command_id))
         assert _payload(_published(mqtt, scene_result_topic(command_id))[-1])["accepted"] is True
 
+    delivery_task = bridge._delivery_task
+    assert delivery_task is not None
+    await asyncio.wait_for(delivery_task, timeout=2)
+    if expected:
+        stored_result = json.loads(path.read_text())["results"][f"scene:{ids[expected[0]]}"]
+        assert stored_result["event_key"] is None
+        assert stored_result["delivered"] is True
+
     # Settle every non-confirmed command to a timeout so an over-confirmation (a
     # wrong accepted:true) is caught, rather than checked before a result lands.
+    timeout_tasks: list[asyncio.Task[None]] = []
+    for name, command_id in ids.items():
+        if name in expected:
+            continue
+        timeout_task = bridge._scene_pending[command_id].timeout_task
+        assert timeout_task is not None
+        timeout_tasks.append(timeout_task)
     await clock.advance_ms(COMMAND_TTL_MS)
+    await asyncio.gather(*timeout_tasks)
+    delivery_task = bridge._delivery_task
+    assert delivery_task is not None
+    await asyncio.wait_for(delivery_task, timeout=2)
     for name, command_id in ids.items():
         if name in expected:
             continue
@@ -2521,6 +2714,18 @@ async def test_multiple_pending_same_scene_confirm_by_baseline_band(
         results = _published(mqtt, scene_result_topic(command_id))
         assert [_payload(item)["accepted"] for item in results] == [False]
         assert _payload(results[-1])["error"] == "timeout"
+
+    stored = json.loads(path.read_text())
+    assert set(stored["results"]) == {f"scene:{command_id}" for command_id in ids.values()}
+    assert all(result["delivered"] is True for result in stored["results"].values())
+    assert all(result["event_key"] is None for result in stored["results"].values())
+    assert stored["events"] == {}
+    status_topics = {
+        transport_status_topic("scene", _PANEL),
+        transport_status_topic("mode", _PANEL),
+    }
+    statuses = [_payload(item) for item in mqtt.published if item[0] in status_topics]
+    assert all(status["reason"] != "state_untrusted" for status in statuses)
     await bridge.async_shutdown()
 
 
@@ -2611,6 +2816,54 @@ async def test_poll_confirms_repeated_same_mode_activation_with_new_timestamp(
     # no further (timeout) result.
     await clock.advance_ms(15_000)
     assert len(_published(mqtt, mode_result_topic(command_id))) == 1
+    await bridge.async_shutdown()
+
+
+async def test_mode_watermark_rejects_old_stamp_but_delayed_pre_request_stamp_confirms(
+    tmp_path: Path,
+) -> None:
+    """Characterize the mode chronology limitation deferred to live-panel work."""
+    seeded_at_ms = _NOW_MS - 2_000
+    bridge, bus, mqtt, clock, _ = await _started(
+        tmp_path,
+        execution=_execution(mode_id="away", mode_at_ms=seeded_at_ms),
+        mode_ids=("away", "home"),
+    )
+    mqtt.published.clear()
+    timeout_id = "22222222-2222-4222-8222-222222222222"
+    delayed_id = "44444444-4444-4444-8444-444444444444"
+    await mqtt.inject(mode_command_topic(_PANEL), _command(timeout_id, "mode", "home"))
+    await mqtt.inject(mode_command_topic(_PANEL), _command(delayed_id, "mode", "away"))
+    await _wait_for_bus_commands(bus, 2)
+
+    await bridge.poll_executions([_execution(mode_id="away", mode_at_ms=seeded_at_ms - 1)])
+
+    assert bridge._mode_watermarks[_PANEL] == (seeded_at_ms, "away")
+    assert _published(mqtt, mode_event_topic(_PANEL)) == []
+    assert _published(mqtt, mode_result_topic(delayed_id)) == []
+
+    # Current limitation: although this previously unseen stamp predates both
+    # requests, it is newer than the global watermark and confirms by mode id.
+    await bridge.poll_executions([_execution(mode_id="away", mode_at_ms=_NOW_MS - 1_000)])
+    await _wait_for_publish(mqtt, mode_result_topic(delayed_id))
+    delayed = _payload(_published(mqtt, mode_result_topic(delayed_id))[-1])
+    assert delayed["accepted"] is True
+    delivery_task = bridge._delivery_task
+    assert delivery_task is not None
+    await asyncio.wait_for(delivery_task, timeout=2)
+
+    timeout_task = bridge._mode_pending[timeout_id].timeout_task
+    assert timeout_task is not None
+    await clock.advance_ms(COMMAND_TTL_MS)
+    await timeout_task
+    delivery_task = bridge._delivery_task
+    assert delivery_task is not None
+    await asyncio.wait_for(delivery_task, timeout=2)
+    await _wait_for_publish(mqtt, mode_result_topic(timeout_id))
+    timed_out = _payload(_published(mqtt, mode_result_topic(timeout_id))[-1])
+    assert timed_out["accepted"] is False
+    assert timed_out["error"] == "timeout"
+    assert bridge._state_trusted is True
     await bridge.async_shutdown()
 
 

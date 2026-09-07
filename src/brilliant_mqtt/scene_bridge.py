@@ -816,12 +816,17 @@ class SceneBridge:
         # confirm gate (unlike _apply_scene_execution). A mode execution's
         # timestamp comes from the bus Variable.timestamp, whose units and clock
         # domain are UNVERIFIED and cannot be verified without live-panel
-        # hardware. Gating on it risks breaking legitimate mode commands on
-        # production in-wall panels. Before adding a gate here, verify on hardware:
+        # hardware. The delayed-case false-confirm therefore remains: a previously
+        # unseen stamp newer than the global watermark can have been caused before
+        # the request yet still confirm it by mode id. Gating on it risks breaking
+        # legitimate mode commands on production in-wall panels. Before adding a
+        # request-relative gate here, verify on hardware:
         #   1. Variable.timestamp UNITS (seconds vs milliseconds).
-        #   2. Panel-clock vs writer/phone-supplied (change a mode from a phone
-        #      vs from the bridge and compare to _clock_ms()).
+        #   2. Panel-clock vs phone/writer-supplied clock (change a mode from a
+        #      phone vs from the bridge and compare to _clock_ms()).
         #   3. Whether a redundant same-mode set re-stamps the timestamp.
+        # Option (c), copying the global watermark at request time, is a no-op:
+        # every stamp it rejects is already rejected by current <= previous below.
         current = (execution.executed_at_ms, execution.mode_id)
         previous = self._mode_watermarks.get(self._panel)
         if previous is not None and current <= previous:
@@ -1215,14 +1220,17 @@ class SceneBridge:
         return True
 
     def _prune_events(self) -> None:
+        for result_key, result in list(self._results.items()):
+            if result.delivered and result.event_key is not None:
+                self._results[result_key] = replace(result, event_key=None)
         dependencies = {
             result.event_key
             for result in self._results.values()
             if not result.delivered and result.event_key is not None
         }
-        for key, event in list(self._events.items()):
-            if event.delivered and key not in dependencies:
-                self._events.pop(key)
+        for event_key, event in list(self._events.items()):
+            if event.delivered and event_key not in dependencies:
+                self._events.pop(event_key)
 
     def _within_capacity(self) -> bool:
         return (
@@ -1274,26 +1282,26 @@ class SceneBridge:
             async with self._lock:
                 if self._stopping or epoch != self._epoch:
                     return
+                delivered = False
                 if item_type == "event":
                     event = self._events.get(cast(str, key))
                     if event is not None and event.payload == payload and not event.delivered:
                         self._events[cast(str, key)] = replace(event, delivered=True)
-                        snapshot = self._capture_state()
+                        delivered = True
                 else:
                     result_key = cast(tuple[StateKind, str], key)
                     result = self._results.get(result_key)
                     if result is not None and result.payload == payload and not result.delivered:
                         self._results[result_key] = replace(result, delivered=True)
-                        snapshot = self._capture_state()
+                        delivered = True
+                if delivered:
+                    self._prune_events()
+                    self._clear_capacity_if_room()
+                    snapshot = self._capture_state()
             if snapshot is None:
                 continue
             if not await self._async_persist_state(*snapshot, epoch):
                 return
-            async with self._lock:
-                if self._stopping or epoch != self._epoch:
-                    return
-                self._prune_events()
-                self._clear_capacity_if_room()
             await self._async_health_status("scene")
             await self._async_health_status("mode")
 
