@@ -71,6 +71,18 @@ def test_bus_confirmed_false_for_dead_writer_pid(tmp_path: Path) -> None:
     assert bus_confirmed(str(phase)) is False
 
 
+@pytest.mark.parametrize("pid", [2**31, 2**64])
+def test_bus_confirmed_fails_closed_on_out_of_range_pid(tmp_path: Path, pid: int) -> None:
+    """A pid beyond the C ``pid_t``/``long`` range makes ``os.kill`` raise
+    ``OverflowError`` (an ``ArithmeticError``, not an ``OSError``). A torn/corrupt
+    phase file like ``bus 2147483648`` must still fail closed rather than raise
+    and crash the watchdog loop."""
+    phase = tmp_path / "bus-phase"
+    phase.write_text(f"bus {pid}", encoding="utf-8")
+
+    assert bus_confirmed(str(phase)) is False
+
+
 def test_bus_confirmed_fails_closed_on_invalid_utf8(tmp_path: Path) -> None:
     """Invalid UTF-8 bytes raise UnicodeDecodeError (a UnicodeError, NOT an
     OSError). bus_confirmed must fail closed rather than let that kill the
