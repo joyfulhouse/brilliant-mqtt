@@ -62,10 +62,36 @@ def write_heartbeat(
 
 
 def write_phase(path: str, phase: BusPhase) -> None:
-    """Atomically record the session's bus phase without disrupting startup."""
+    """Atomically record the session's bus phase without disrupting startup.
+
+    A failed ``bus`` write is swallowed (logged): a missing stamp reads as
+    unconfirmed, which is fail-safe. A failed ``pre_bus`` write is NOT — a
+    stale ``bus`` marker left by a prior successful session would still read
+    as bus-confirmed, so a broker-only outage could reboot a healthy panel.
+    On a failed ``pre_bus`` write we therefore remove the phase file so the
+    watchdog fails closed; if that removal itself fails we re-raise, because
+    phase tracking is broken and the session must not proceed as if safe.
+
+    Contract: this writer and its reader
+    (:func:`brilliant_bus_watchdog.health.bus_confirmed`) must be rolled out
+    and rolled back TOGETHER. If only one side is reverted, delete the phase
+    file (default ``/run/brilliant-mqtt/bus-phase``) so a stale marker can't
+    be misread as bus-confirmed.
+    """
     if not path:
         return
     try:
         _atomic_write(path, phase)
     except OSError:
-        logger.debug("bus phase write failed for %s", path, exc_info=True)
+        if phase != "pre_bus":
+            logger.debug("bus phase write failed for %s", path, exc_info=True)
+            return
+        # A failed pre_bus stamp is fail-unsafe: clear any stale marker so the
+        # watchdog cannot read a prior session's "bus" as today's truth. If the
+        # file is already gone we are safe; any other removal failure propagates
+        # so the caller learns phase tracking is broken.
+        logger.debug("pre_bus phase write failed for %s; clearing phase file", path, exc_info=True)
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass

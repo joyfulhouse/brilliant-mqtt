@@ -4,11 +4,16 @@ from __future__ import annotations
 
 
 def bus_confirmed(path: str) -> bool:
-    """Whether the bridge reached the local-bus phase in its latest attempt."""
+    """Whether the bridge reached the local-bus phase in its latest attempt.
+
+    Fails closed: a missing/unreadable file (OSError) or a phase file whose
+    bytes are not valid UTF-8 (UnicodeError, e.g. a truncated/torn write)
+    reads as unconfirmed rather than raising — never crash the watchdog loop.
+    """
     try:
         with open(path, encoding="utf-8") as f:
             return f.read().strip() == "bus"
-    except OSError:
+    except (OSError, UnicodeError):
         return False
 
 

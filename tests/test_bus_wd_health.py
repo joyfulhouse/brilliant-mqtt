@@ -54,3 +54,13 @@ def test_bus_confirmed_fails_closed(
         phase.write_text(contents, encoding="utf-8")
 
     assert bus_confirmed(str(phase)) is expected
+
+
+def test_bus_confirmed_fails_closed_on_invalid_utf8(tmp_path: Path) -> None:
+    """Invalid UTF-8 bytes raise UnicodeDecodeError (a UnicodeError, NOT an
+    OSError). bus_confirmed must fail closed rather than let that kill the
+    watchdog run.py loop."""
+    phase = tmp_path / "bus-phase"
+    phase.write_bytes(b"\xff\xfe bus")  # not decodable as UTF-8
+
+    assert bus_confirmed(str(phase)) is False

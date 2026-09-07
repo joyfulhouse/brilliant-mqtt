@@ -80,3 +80,43 @@ def test_write_phase_is_best_effort(tmp_path: Path) -> None:
 
     write_phase("", "pre_bus")
     write_phase(str(blocker / "bus-phase"), "bus")
+
+
+def test_write_phase_pre_bus_failure_clears_stale_bus_marker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A failed pre_bus write must not leave a prior session's "bus" marker
+    readable — otherwise a broker-only outage would still read as
+    bus-confirmed and could reboot a healthy panel. Remove it so the watchdog
+    fails closed."""
+    phase = tmp_path / "bus-phase"
+    phase.write_text("bus", encoding="utf-8")  # leftover from a prior session
+
+    def _raise(*args: object, **kwargs: object) -> None:
+        raise OSError("write failed")
+
+    monkeypatch.setattr("brilliant_mqtt.heartbeat._atomic_write", _raise)
+    write_phase(str(phase), "pre_bus")  # must not raise
+
+    assert not phase.exists()
+
+
+def test_write_phase_pre_bus_reraises_when_cleanup_also_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """If clearing the stale marker itself fails, phase tracking is broken —
+    re-raise so the session doesn't silently continue in a fail-unsafe state."""
+    phase = tmp_path / "bus-phase"
+    phase.write_text("bus", encoding="utf-8")
+
+    def _raise_write(*args: object, **kwargs: object) -> None:
+        raise OSError("write failed")
+
+    def _raise_unlink(*args: object, **kwargs: object) -> None:
+        raise PermissionError("cannot remove")
+
+    monkeypatch.setattr("brilliant_mqtt.heartbeat._atomic_write", _raise_write)
+    monkeypatch.setattr("brilliant_mqtt.heartbeat.os.unlink", _raise_unlink)
+
+    with pytest.raises(PermissionError, match="cannot remove"):
+        write_phase(str(phase), "pre_bus")
