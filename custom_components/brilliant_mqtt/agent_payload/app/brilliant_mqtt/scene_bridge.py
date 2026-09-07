@@ -470,7 +470,7 @@ class SceneBridge:
                 record.panel,
                 record.issued_at_ms,
                 record.confirm_after_ms,
-                record.equal_at_request,
+                False,
                 None,
             )
             target = self._scene_pending if kind == "scene" else self._mode_pending
@@ -985,12 +985,12 @@ class SceneBridge:
                         # (expires_at_ms - COMMAND_TTL_MS) reconstructs the
                         # baseline exactly for old files that lack the field.
                         now = self._clock_ms()
-                        manual_mode = self._execution.variables.get("manual_mode_id")
-                        equal_at_request = (
-                            kind == "mode"
-                            and manual_mode is not None
-                            and manual_mode.value == value
-                        )
+                        equal_at_request = False
+                        if kind == "mode":
+                            mode_watermark = self._mode_watermarks.get(self._panel)
+                            equal_at_request = (
+                                mode_watermark is not None and mode_watermark[1] == value
+                            )
                         record = _StoredPending(
                             state_kind,
                             command.command_id,
@@ -1000,7 +1000,6 @@ class SceneBridge:
                             command.issued_at_ms,
                             now + COMMAND_TTL_MS,
                             now,
-                            equal_at_request,
                         )
                         self._pending_records[cache_key] = record
                         pending[command.command_id] = _Pending(
