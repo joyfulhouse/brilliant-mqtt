@@ -114,6 +114,12 @@ def _settings(tmp_path: Path, mesh_priority: int = 0) -> Settings:
     )
 
 
+def _seed(path: str, contents: str) -> None:
+    """Write a runtime file synchronously (setup helper; keeps blocking file
+    I/O out of the async test bodies, per ruff ASYNC240)."""
+    Path(path).write_text(contents, encoding="utf-8")
+
+
 def _install_session_fakes(
     monkeypatch: pytest.MonkeyPatch,
     bus: _Bus,
@@ -143,6 +149,48 @@ async def test_broker_outage_never_qualifies_as_a_bus_wedge(
     assert confirmed is False
     assert not should_reboot(
         age=1900.0,
+        stale_after=1800.0,
+        bridge_active=True,
+        gateway_up=True,
+        bus_confirmed=confirmed,
+    )
+
+
+async def test_stale_bus_phase_and_heartbeat_do_not_reboot_on_broker_outage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A prior HEALTHY session leaves "bus" and a fresh heartbeat on disk;
+    later the heartbeat goes stale while the broker is down. Today's
+    broker-only outage must NOT read those leftovers as a bus wedge: entering
+    _run_session stamps "pre_bus" BEFORE mqtt.connect(), so once the broker
+    refusal short-circuits startup, bus_confirmed is False even though the
+    stale heartbeat age alone would otherwise qualify. Unlike its empty-file
+    siblings above, this seeds the fail-unsafe leftovers explicitly so the
+    test would catch a startup that wrote a fake heartbeat or let a stale
+    "bus" marker survive the refusal."""
+    settings = _settings(tmp_path)
+    # Leftovers from a prior successful session, before this outage begins.
+    _seed(settings.bus_phase_file, "bus")
+    _seed(settings.bus_heartbeat_file, "100.0")
+
+    bus = _Bus()
+    mqtt = _Mqtt(ConnectionError("broker refused"))
+    _install_session_fakes(monkeypatch, bus, mqtt)
+
+    with pytest.raises(ConnectionError, match="broker refused"):
+        await main_mod._run_session(settings, None, None)
+
+    confirmed = bus_confirmed(settings.bus_phase_file)
+    age = heartbeat_age(settings.bus_heartbeat_file, now=100_000.0, started_at=0.0)
+    assert bus.start_calls == 0  # the local bus was never reached
+    assert mqtt.connect_calls == 1
+    # The pre_bus stamp at session entry overwrote the stale "bus" marker...
+    assert confirmed is False
+    # ...and the seeded heartbeat is genuinely stale, so this test proves it is
+    # bus_confirmed (not a fresh heartbeat) that holds the reboot back.
+    assert age >= 1800.0
+    assert not should_reboot(
+        age=age,
         stale_after=1800.0,
         bridge_active=True,
         gateway_up=True,
@@ -249,11 +297,21 @@ async def test_sustained_bus_handshake_failure_still_uses_reboot_guard(
     reboots: list[str] = []
     guard = RebootGuard(
         str(tmp_path / "reboot-guard.json"),
-        GuardPolicy(cooldown=0.0, cap=1, window=21_600.0),
+        # cap=2 leaves headroom so the second decision's suppression can only be
+        # the cooldown, not the cap; a non-zero cooldown makes that gate real.
+        GuardPolicy(cooldown=300.0, cap=2, window=21_600.0),
     )
+    # First qualifying decision reboots and records the stamp.
     handle(should=decision, guard=guard, now=1900.0, reboot_fn=lambda: reboots.append("reboot"))
-    handle(should=decision, guard=guard, now=1901.0, reboot_fn=lambda: reboots.append("reboot"))
+    # 100s later — inside the 300s cooldown — the cap (2) would still allow a
+    # reboot, so this suppression proves the cooldown is what gates it.
+    handle(should=decision, guard=guard, now=2000.0, reboot_fn=lambda: reboots.append("reboot"))
     assert reboots == ["reboot"]
+    # Once the cooldown elapses (400s > 300s) and the cap still has headroom, the
+    # next decision reboots again — confirming the cooldown, not the cap, held
+    # the second one back.
+    handle(should=decision, guard=guard, now=2300.0, reboot_fn=lambda: reboots.append("reboot"))
+    assert reboots == ["reboot", "reboot"]
 
 
 async def test_successful_bus_read_refreshes_heartbeat_without_resetting_phase(
