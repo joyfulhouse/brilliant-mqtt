@@ -81,3 +81,16 @@ def test_blocked_reboot_does_not_starve_cheaper_rungs() -> None:
         lad.observe(gateway_up=False, now=t, reboot_eligible=False) for t in (430.0, 460.0, 490.0)
     ]
     assert Action.RESTART_SERVICES in got and Action.SOFT_RECONNECT in got
+
+
+def test_inconclusive_samples_pause_the_outage_clock() -> None:
+    ladder = Ladder(T)
+    for now in (0.0, 30.0, 60.0):
+        assert ladder.observe(gateway_up=False, now=now) == Action.NONE
+
+    for now in range(90, 391, 30):
+        assert ladder.observe(gateway_up=None, now=float(now)) == Action.NONE
+
+    # Sixty seconds of confirmed failure before the pause plus thirty after it
+    # reaches the 90-second soft rung; the inconclusive interval contributes zero.
+    assert ladder.observe(gateway_up=False, now=420.0) == Action.SOFT_RECONNECT
