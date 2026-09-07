@@ -24,7 +24,7 @@ class _GuardLike(Protocol):
 
 
 class _LadderLike(Protocol):
-    def observe(self, *, gateway_up: bool, now: float, reboot_eligible: bool) -> Action: ...
+    def observe(self, *, gateway_up: bool | None, now: float, reboot_eligible: bool) -> Action: ...
 
 
 def _can_request(guard: _GuardLike, now: float) -> bool:
@@ -134,13 +134,16 @@ def _configure_logging(path: str) -> None:
 def _poll_once(cfg: Config, *, guard: _GuardLike, ladder: _LadderLike) -> None:
     """One watchdog cycle: probe, decide, dispatch.
 
-    The recovery ladder's health signal is the gateway ping alone. The broker TCP
-    check is a bounded, log-only diagnostic — being bounded it can never delay
-    reaching the ladder, and its tri-state result never feeds the decision, so a
-    timed-out (INCONCLUSIVE) diagnostic can neither block nor force recovery.
+    The recovery ladder's health signal is the gateway probe alone. A completed
+    failure advances recovery, a success resets it, and an inconclusive local probe
+    pauses it. The broker TCP check remains a bounded, log-only diagnostic.
     """
-    gw = cfg.gateway or probe.default_gateway()
-    gateway_up = probe.ping(gw) if gw else False
+    gw, gateway_state = probe.gateway_probe(cfg.gateway)
+    gateway_up = {
+        probe.TcpProbe.OPEN: True,
+        probe.TcpProbe.CLOSED: False,
+        probe.TcpProbe.INCONCLUSIVE: None,
+    }[gateway_state]
     if cfg.broker_host:
         broker = probe.tcp_open(cfg.broker_host, cfg.broker_port)
         _LOG.info("gateway=%s up=%s broker=%s", gw, gateway_up, broker.value)

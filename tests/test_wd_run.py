@@ -202,10 +202,10 @@ def test_load_config_invalid_float_falls_back_to_default() -> None:
 class SpyLadder:
     def __init__(self, action: Action = Action.NONE) -> None:
         self._action = action
-        self.observed: list[bool] = []
+        self.observed: list[bool | None] = []
         self.eligibility: list[bool] = []
 
-    def observe(self, *, gateway_up: bool, now: float, reboot_eligible: bool) -> Action:
+    def observe(self, *, gateway_up: bool | None, now: float, reboot_eligible: bool) -> Action:
         self.observed.append(gateway_up)
         self.eligibility.append(reboot_eligible)
         return self._action
@@ -219,9 +219,11 @@ def test_poll_once_broker_diagnostic_never_influences_the_decision(
     monkeypatch: pytest.MonkeyPatch, broker_result: probe.TcpProbe
 ) -> None:
     """Whatever the broker diagnostic reports — up, down, or timed out — the ladder
-    is reached each cycle and observes ONLY the ping-derived health, and no reboot
+    is reached each cycle and observes ONLY gateway-derived health, and no reboot
     is driven. The diagnostic is log-only (contract 5)."""
-    monkeypatch.setattr(probe, "ping", lambda gw: True)  # gateway healthy
+    monkeypatch.setattr(
+        probe, "gateway_probe", lambda gw: (gw, probe.TcpProbe.OPEN)
+    )  # gateway healthy
     monkeypatch.setattr(probe, "tcp_open", lambda h, p: broker_result)
     cfg = run.load_config({"MQTT_HOST": "broker", "WIFI_WATCHDOG_GATEWAY": "10.0.0.1"})
     guard, ladder = FakeGuard(True), SpyLadder(Action.NONE)
@@ -237,7 +239,7 @@ def test_poll_once_broker_diagnostic_never_influences_the_decision(
 def test_poll_once_dispatches_the_action_the_ladder_returns(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(probe, "ping", lambda gw: False)  # gateway down
+    monkeypatch.setattr(probe, "gateway_probe", lambda gw: (gw, probe.TcpProbe.CLOSED))
     handled: list[Action] = []
     monkeypatch.setattr(run, "handle", lambda action, **kw: handled.append(action))
     cfg = run.load_config({"WIFI_WATCHDOG_GATEWAY": "10.0.0.1"})  # no broker diagnostic
@@ -246,7 +248,7 @@ def test_poll_once_dispatches_the_action_the_ladder_returns(
 
 
 def test_poll_once_skips_broker_diagnostic_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(probe, "ping", lambda gw: True)
+    monkeypatch.setattr(probe, "gateway_probe", lambda gw: (gw, probe.TcpProbe.OPEN))
 
     def _boom(host: str, port: int) -> probe.TcpProbe:
         raise AssertionError("tcp_open must not be called when no broker host is configured")

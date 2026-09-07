@@ -57,8 +57,7 @@ def test_ping_default_runner_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None
 
 
 def test_ping_timeout_reads_as_down(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A hung ping (run_bounded times out -> rc=124) must read as 'not up' so the
-    watchdog treats it conservatively and proceeds."""
+    """The compatibility bool API stays false; the poller uses the tri-state API."""
     _spy_run_bounded(monkeypatch, returncode=bounded.TIMEOUT_RC, timed_out=True)
     assert probe.ping("192.168.1.1") is False
 
