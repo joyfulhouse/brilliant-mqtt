@@ -74,7 +74,10 @@ from custom_components.brilliant_mqtt.fleet_manager import (
     FleetManager,
     legacy_fleet_config,
 )
-from custom_components.brilliant_mqtt.manager import PanelManager
+from custom_components.brilliant_mqtt.manager import (
+    _UNREACHABLE_RECHECK_SECONDS,
+    PanelManager,
+)
 from custom_components.brilliant_mqtt.shell import (
     AsyncsshShell,
     PanelIdentityError,
@@ -932,6 +935,44 @@ async def test_fleet_custom_ca_is_staged_and_exact_returned_path_is_rendered(
     await manager.async_shutdown()
 
 
+async def test_recovered_auto_repair_stages_no_ca_before_the_skip(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """#95 finding 1: the pre-mutation recheck must precede _async_stage_broker_ca (which
+    stages the CA file on the panel — a remote write). A panel that recovers during connect
+    must have NO CA staged and NO unit enabled: the skip lands before the first remote write."""
+    ca_pem = "-----BEGIN CERTIFICATE-----\nZmFrZS1wdWJsaWMtY2E=\n-----END CERTIFICATE-----"
+    _entry, manager = _fleet_panel_manager(
+        hass,
+        fleet_overrides={CONF_MQTT_TLS_ENABLED: True, CONF_MQTT_TLS_CA: ca_pem},
+    )
+    manager.availability = "offline"
+    installed = RunResult(
+        0, "unit=1\nenv=1\nenabled=1\nactive=1\nsunit=1\nsenv=1\npayload=1\n0.2.0\n", ""
+    )
+    gate = asyncio.Event()
+    shell = FakeShell(responses={panel_ops.INSPECT_COMMAND: installed}, connect_gate=gate)
+    stage = AsyncMock(return_value="/var/brilliant-mqtt/tls/mqtt-ca-0123456789abcdef.pem")
+
+    with (
+        patch("custom_components.brilliant_mqtt.manager.AsyncsshShell", return_value=shell),
+        patch("custom_components.brilliant_mqtt.manager.panel_ops.stage_mqtt_ca", stage),
+    ):
+        repair = asyncio.create_task(manager.async_repair(trigger="auto"))
+        await (
+            shell.connect_entered.wait()
+        )  # inside connect(), still offline at the pre-connect recheck
+        manager.availability = "online"  # recovers DURING the connect await
+        gate.set()
+        await repair
+        await hass.async_block_till_done()
+
+    stage.assert_not_awaited()  # CA never staged: skip precedes the first remote write
+    assert "systemctl enable --now brilliant-mqtt" not in shell.commands
+    await manager.async_shutdown()
+
+
 async def test_fleet_overrides_cannot_shadow_panel_identity_and_wake_word_stays_owned(
     hass: HomeAssistant,
 ) -> None:
@@ -1367,8 +1408,9 @@ async def test_grace_expiry_with_none_availability_is_not_broker_deferred(
 ) -> None:
     """#95 finding 4: a grace expiry with UNKNOWN availability (None) while the broker is down
     must NOT enter the broker-defer state — _arm_offline_grace can only re-arm an OFFLINE
-    panel, so a None defer would be un-reassessable. None falls through to auto-repair (which
-    then skips at its own broker gate), never getting stuck."""
+    panel, so a None defer would be un-reassessable. None falls THROUGH to auto-repair (rather
+    than being deferred at grace); the re-drive after skip is covered by
+    test_none_availability_broker_down_auto_repair_arms_recheck."""
     entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
     entry.add_to_hass(hass)
     broker = SimpleNamespace(available=False)
@@ -1380,6 +1422,65 @@ async def test_grace_expiry_with_none_availability_is_not_broker_deferred(
         await hass.async_block_till_done()
 
     repair.assert_awaited_once_with(trigger="auto")  # fell through, not broker-deferred
+    await manager.async_shutdown()
+
+
+async def test_none_availability_broker_down_auto_repair_arms_recheck(
+    hass: HomeAssistant,
+    fake_shell: FakeShell,
+    payload_dir: Path,
+) -> None:
+    """#95 finding 3: a None-availability panel that reaches auto-repair while the broker is
+    down skips WITHOUT mutating, but arms an unreachable-style recheck so it is re-driven once
+    the broker returns — async_broker_reconnected cannot re-arm grace for a non-OFFLINE panel,
+    so without the recheck it would strand until a fresh LWT."""
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    broker = SimpleNamespace(available=False)
+    manager = _broker_gated_manager(hass, entry, broker)
+    manager.availability = None  # unknown (e.g. an undecodable LWT)
+
+    await manager.async_repair(trigger="auto")  # broker down → skips at the pre-connect recheck
+    assert not fake_shell.commands  # no mutation
+    assert manager._grace_cancel is not None  # armed a recheck — not stranded
+
+    broker.available = True  # broker returns
+    async_fire_time_changed(
+        hass, dt_util.utcnow() + timedelta(seconds=_UNREACHABLE_RECHECK_SECONDS + 1)
+    )
+    await hass.async_block_till_done()
+
+    assert "systemctl enable --now brilliant-mqtt" in fake_shell.commands  # re-driven
+    await manager.async_shutdown()
+
+
+async def test_offline_lwt_during_deferred_recovery_arms_no_grace(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """#95 finding 2: while a recovery verdict is broker-outage-suspended, an offline LWT must
+    NOT arm a grace timer alongside it — async_broker_reconnected re-arms RECOVERY, and a
+    competing grace timer could fire first into a within-cooldown escalation."""
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    broker = SimpleNamespace(available=True)
+    manager = _broker_gated_manager(hass, entry, broker)
+    manager.availability = "offline"
+    shell = FakeShell()
+    await _repair_and_arm_recovery(manager, shell)  # arms the recovery timer
+
+    broker.available = False
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
+        async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=61))  # suspend recovery
+        await hass.async_block_till_done()
+    assert manager._recovery_deferred is True
+    assert manager._grace_cancel is None
+
+    await manager._on_availability(_availability_message("offline"))  # an offline LWT lands
+
+    assert (
+        manager._grace_cancel is None
+    )  # guard held: no grace armed alongside the suspended verdict
     await manager.async_shutdown()
 
 

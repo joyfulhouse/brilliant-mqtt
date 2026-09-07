@@ -811,8 +811,13 @@ class PanelManager:
             or self.problem_reason == _RETAINED_LEDGER_PROBLEM
             or self._grace_cancel is not None
             or self._recovery_cancel is not None
+            or self._recovery_deferred
             or self._repairing
         ):
+            # _recovery_deferred is a recovery window suspended by a broker outage (#95):
+            # its verdict is re-armed as RECOVERY by async_broker_reconnected, so an
+            # offline LWT / ledger-clear landing meanwhile must NOT also start a grace
+            # timer that could race the reconnect into a within-cooldown escalation.
             return
         grace_s = self._opt(OPT_OFFLINE_GRACE_MINUTES, DEFAULT_OFFLINE_GRACE_MINUTES) * 60
         _LOGGER.info(
@@ -1079,12 +1084,22 @@ class PanelManager:
         honoured: a panel that recovered on its own (online) met the repair's goal →
         repair_succeeded and the problem clears. A broker-drop/shutdown skip is a
         defer/abort with no verdict (re-driven by reconnect/teardown), logged only.
-        Either way no cooldown is recorded and no recovery timer is armed.
+        No cooldown is recorded and no recovery timer is armed.
+
+        The one exception is a broker-down skip while availability is UNKNOWN (None):
+        async_broker_reconnected re-arms grace only for an OFFLINE panel, so a None
+        panel would otherwise be re-drivable only by a fresh LWT. Arm an unreachable-
+        style _grace_expired recheck (mirrors async_repair's connect-failure path) so
+        it is re-evaluated after the broker likely returns.
         """
         if self.availability == AVAILABILITY_ONLINE:
             self._fire(EVENT_REPAIR_SUCCEEDED)
             if self.problem_reason != _RETAINED_LEDGER_PROBLEM:
                 self._set_problem(False, None)
+        elif self.availability is None and not self._shutting_down and self._grace_cancel is None:
+            self._grace_cancel = async_call_later(
+                self.hass, _UNREACHABLE_RECHECK_SECONDS, self._grace_expired
+            )
         _LOGGER.info(
             "%s: auto-repair no longer warranted after the fleet SSH wait "
             "(shutting down, panel back online, or broker unavailable); skipping",
@@ -1158,15 +1173,17 @@ class PanelManager:
                     retirement_result: bool | None = None
                     state = await panel_ops.inspect_panel(shell)
                     unit = await self._unit_contents()
-                    env = await self._async_stage_broker_ca(shell)
                     # Re-validate ONE more time immediately before the FIRST remote mutation
                     # (#95 criterion 2 — "before automatic remote mutations"): the panel can
                     # recover, the broker can drop, or shutdown can begin DURING the slow
-                    # connect/inspect/stage awaits above. Skip cleanly here too — the finally
-                    # still closes the shell, and no config is written / unit enabled.
+                    # connect/inspect awaits above. inspect_panel + _unit_contents are pure
+                    # reads, but _async_stage_broker_ca below stages the CA file on the panel
+                    # (a remote write) — so this gate must precede it. Skip cleanly — the
+                    # finally still closes the shell, and nothing is staged / written / enabled.
                     if trigger == "auto" and not self._auto_repair_still_warranted():
                         self._skip_stale_auto_repair()
                         return
+                    env = await self._async_stage_broker_ca(shell)
                     # Bootstrap a code-less panel (never installed, or its /var code was
                     # lost): lay the agent payload down BEFORE enabling the unit, so the
                     # Repair button / auto-repair can install from scratch rather than
