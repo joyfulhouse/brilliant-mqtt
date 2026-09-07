@@ -42,6 +42,9 @@ CA_A_REWRAPPED = (
     + "\n-----END CERTIFICATE-----\n"
 )
 
+STATE = "/state.json"
+INTERVAL = 300.0
+
 
 class FakeFS:
     def __init__(self, files: dict[str, str], globs: dict[tuple[str, str], str | None]) -> None:
@@ -103,6 +106,26 @@ class KilledDuringRestart:
         raise KeyboardInterrupt
 
 
+class RaisingFS(FakeFS):
+    """FakeFS whose write_text raises a preloaded exception on its next call,
+    then behaves normally — models a crash (KeyboardInterrupt) or a read-only /
+    full /var (OSError) hitting the marker write at a chosen moment. Unlike the
+    base FakeFS's atomic dict-assign, this can fail mid-decision."""
+
+    def __init__(self, files: dict[str, str], globs: dict[tuple[str, str], str | None]) -> None:
+        super().__init__(files, globs)
+        self.raise_next: BaseException | None = None
+        self.write_calls = 0
+
+    def write_text(self, path: str, text: str) -> None:
+        self.write_calls += 1
+        if self.raise_next is not None:
+            exc = self.raise_next
+            self.raise_next = None
+            raise exc
+        super().write_text(path, text)
+
+
 def test_fingerprint_matches_across_rewrapped_pem() -> None:
     assert cert_fingerprint(CA_A) == cert_fingerprint(CA_A_REWRAPPED)
     assert cert_fingerprint(CA_A) != cert_fingerprint(CA_B)
@@ -116,7 +139,9 @@ def test_split_pem_certs_counts_blocks() -> None:
 def test_ca_absent_and_host_running_appends_and_restarts() -> None:
     fs = FakeFS({"/b": CA_B}, {})
     coord = FakeCoord(running=True)
-    out = reconcile(fs, coord, bundle_path="/b", site_packages_root="/sp", ca_pem=CA_A)
+    out = reconcile(
+        fs, coord, bundle_path="/b", site_packages_root="/sp", ca_pem=CA_A, state_path=STATE
+    )
     assert out == Outcome(
         bundle_found=True, appended=True, coordinator_restarted=True, bundle_path="/b"
     )
@@ -127,7 +152,9 @@ def test_ca_absent_and_host_running_appends_and_restarts() -> None:
 def test_ca_absent_and_not_host_appends_without_restart() -> None:
     fs = FakeFS({"/b": CA_B}, {})
     coord = FakeCoord(running=False)
-    out = reconcile(fs, coord, bundle_path="/b", site_packages_root="/sp", ca_pem=CA_A)
+    out = reconcile(
+        fs, coord, bundle_path="/b", site_packages_root="/sp", ca_pem=CA_A, state_path=STATE
+    )
     assert out.appended is True
     assert out.coordinator_restarted is False
     assert coord.restarted is False
@@ -136,7 +163,9 @@ def test_ca_absent_and_not_host_appends_without_restart() -> None:
 def test_ca_present_is_noop() -> None:
     fs = FakeFS({"/b": CA_B + CA_A}, {})
     coord = FakeCoord(running=True)
-    out = reconcile(fs, coord, bundle_path="/b", site_packages_root="/sp", ca_pem=CA_A)
+    out = reconcile(
+        fs, coord, bundle_path="/b", site_packages_root="/sp", ca_pem=CA_A, state_path=STATE
+    )
     assert out == Outcome(
         bundle_found=True, appended=False, coordinator_restarted=False, bundle_path="/b"
     )
@@ -147,7 +176,9 @@ def test_ca_present_is_noop() -> None:
 def test_ca_present_even_when_rewrapped_is_noop() -> None:
     fs = FakeFS({"/b": CA_A_REWRAPPED}, {})
     coord = FakeCoord(running=True)
-    out = reconcile(fs, coord, bundle_path="/b", site_packages_root="/sp", ca_pem=CA_A)
+    out = reconcile(
+        fs, coord, bundle_path="/b", site_packages_root="/sp", ca_pem=CA_A, state_path=STATE
+    )
     assert out.appended is False
 
 
@@ -157,7 +188,9 @@ def test_bundle_missing_at_path_uses_glob() -> None:
         {("/sp", "hue-bridge-ca-certs.pem"): "/sp/lib/certs/hue-bridge-ca-certs.pem"},
     )
     coord = FakeCoord(running=False)
-    out = reconcile(fs, coord, bundle_path="/missing", site_packages_root="/sp", ca_pem=CA_A)
+    out = reconcile(
+        fs, coord, bundle_path="/missing", site_packages_root="/sp", ca_pem=CA_A, state_path=STATE
+    )
     assert out.bundle_found is True
     assert out.bundle_path == "/sp/lib/certs/hue-bridge-ca-certs.pem"
     assert out.appended is True
@@ -166,7 +199,9 @@ def test_bundle_missing_at_path_uses_glob() -> None:
 def test_bundle_not_found_anywhere() -> None:
     fs = FakeFS({}, {})
     coord = FakeCoord(running=True)
-    out = reconcile(fs, coord, bundle_path="/missing", site_packages_root="/sp", ca_pem=CA_A)
+    out = reconcile(
+        fs, coord, bundle_path="/missing", site_packages_root="/sp", ca_pem=CA_A, state_path=STATE
+    )
     assert out == Outcome(
         bundle_found=False, appended=False, coordinator_restarted=False, bundle_path=None
     )
@@ -179,14 +214,13 @@ def test_unparseable_block_in_bundle_is_skipped_not_fatal() -> None:
         {},
     )
     coord = FakeCoord(running=False)
-    out = reconcile(fs, coord, bundle_path="/b", site_packages_root="/sp", ca_pem=CA_A)
+    out = reconcile(
+        fs, coord, bundle_path="/b", site_packages_root="/sp", ca_pem=CA_A, state_path=STATE
+    )
     assert out.appended is True  # CA_A not present -> appended; garbage block skipped
 
 
 # --- issue #96: retry the coordinator reload after a partial recovery ---------
-
-STATE = "/state.json"
-INTERVAL = 300.0
 
 
 def test_restart_oserror_then_next_run_completes_retry() -> None:
@@ -412,3 +446,163 @@ def test_stale_marker_for_other_generation_does_not_fire() -> None:
     assert out.appended is False
     assert out.reload_pending is False
     assert coord.attempts == 0
+
+
+# --- tribunal round 1: marker ordering, state-write survival, clock, staleness --
+
+
+def test_interruption_in_append_marker_window_is_retried_by_fresh_run() -> None:
+    # Cert absent, coordinator running. The pre-append marker write is
+    # interrupted (hard kill). Because the marker is written BEFORE the append,
+    # the cert is never appended, so a fresh run simply re-appends and reloads.
+    fs = RaisingFS({"/b": CA_B}, {})
+    coord = FakeCoord(running=True)
+    fs.raise_next = KeyboardInterrupt()
+    with pytest.raises(KeyboardInterrupt):
+        reconcile(
+            fs,
+            coord,
+            bundle_path="/b",
+            site_packages_root="/sp",
+            ca_pem=CA_A,
+            state_path=STATE,
+            min_retry_interval_s=INTERVAL,
+            now=1000.0,
+        )
+    assert fs.appended == []  # died before the append (marker write comes first)
+    assert coord.attempts == 0
+    assert load_pending(fs, STATE) is None
+
+    out = reconcile(  # fresh oneshot: cert still absent -> normal append + reload
+        fs,
+        coord,
+        bundle_path="/b",
+        site_packages_root="/sp",
+        ca_pem=CA_A,
+        state_path=STATE,
+        min_retry_interval_s=INTERVAL,
+        now=1001.0,
+    )
+    assert out.appended is True
+    assert coord.attempts == 1 and coord.successes == 1
+    assert load_pending(fs, STATE) is None  # cleared after the reload confirmed
+
+
+def test_state_write_failure_does_not_skip_restart_and_fresh_run_retries() -> None:
+    # A reload is genuinely owed (marker present). The re-stamp write hits a
+    # read-only/full /var (OSError); the restart must still be attempted, and the
+    # surviving marker lets a fresh run retry — never a stranded stale trust.
+    fs = RaisingFS({"/b": CA_B + CA_A}, {})
+    save_pending(fs, STATE, PendingReload("/b", cert_fingerprint(CA_A), last_attempt_at=0.0))
+    coord = FakeCoord(running=True, fail_first=1)  # restart fails this run
+
+    fs.raise_next = OSError("read-only /var")
+    out = reconcile(  # must NOT raise: the state-write OSError is swallowed
+        fs,
+        coord,
+        bundle_path="/b",
+        site_packages_root="/sp",
+        ca_pem=CA_A,
+        state_path=STATE,
+        min_retry_interval_s=INTERVAL,
+        now=10_000.0,
+    )
+    assert coord.attempts == 1  # restart still attempted despite the failed write
+    assert out.reload_pending is True
+    assert load_pending(fs, STATE) is not None  # old marker survived
+
+    out = reconcile(  # fresh run: writes work now, retry completes
+        fs,
+        coord,
+        bundle_path="/b",
+        site_packages_root="/sp",
+        ca_pem=CA_A,
+        state_path=STATE,
+        min_retry_interval_s=INTERVAL,
+        now=20_000.0,
+    )
+    assert coord.attempts == 2 and coord.successes == 1
+    assert load_pending(fs, STATE) is None
+
+
+@pytest.mark.parametrize("torn", ["", "garbage-not-json", '{"bundle_path": "/b"}'])
+def test_cert_present_torn_marker_requests_reload(torn: str) -> None:
+    # Cert already present but the marker is torn/garbled (not the clean "{}"
+    # sentinel). A reload may be owed, so it must be requested, not a silent
+    # no-op.
+    fs = FakeFS({"/b": CA_B + CA_A, STATE: torn}, {})
+    coord = FakeCoord(running=True)
+    out = reconcile(
+        fs,
+        coord,
+        bundle_path="/b",
+        site_packages_root="/sp",
+        ca_pem=CA_A,
+        state_path=STATE,
+        min_retry_interval_s=INTERVAL,
+        now=5000.0,
+    )
+    assert coord.attempts == 1  # reload requested despite the unreadable marker
+    assert out.coordinator_restarted is True
+    assert load_pending(fs, STATE) is None  # cleared after the successful reload
+
+
+def test_cert_present_cleared_sentinel_is_noop() -> None:
+    # The clean "{}" sentinel means nothing is owed -> no restart storm.
+    fs = FakeFS({"/b": CA_B + CA_A, STATE: "{}"}, {})
+    coord = FakeCoord(running=True)
+    out = reconcile(
+        fs,
+        coord,
+        bundle_path="/b",
+        site_packages_root="/sp",
+        ca_pem=CA_A,
+        state_path=STATE,
+        min_retry_interval_s=INTERVAL,
+        now=5000.0,
+    )
+    assert coord.attempts == 0
+    assert out.reload_pending is False
+
+
+def test_future_clock_marker_is_not_skipped() -> None:
+    # Marker stamped in the future (panels have no reliable RTC; NTP can step the
+    # clock back after boot). Negative elapsed must count as "interval up", not
+    # pace the owed reload away forever.
+    fs = FakeFS({"/b": CA_B + CA_A}, {})
+    save_pending(fs, STATE, PendingReload("/b", cert_fingerprint(CA_A), last_attempt_at=5000.0))
+    coord = FakeCoord(running=True)
+    out = reconcile(
+        fs,
+        coord,
+        bundle_path="/b",
+        site_packages_root="/sp",
+        ca_pem=CA_A,
+        state_path=STATE,
+        min_retry_interval_s=INTERVAL,
+        now=1000.0,  # BEFORE the marker's stamp
+    )
+    assert coord.attempts == 1  # not skipped
+    assert out.coordinator_restarted is True
+
+
+def test_matching_marker_but_coordinator_stopped_clears_marker() -> None:
+    # A matching marker but the coordinator isn't running (not the Hue host):
+    # nothing is owed, so the stale marker is dropped (it must not fire a restart
+    # if the vassal later returns).
+    fs = FakeFS({"/b": CA_B + CA_A}, {})
+    save_pending(fs, STATE, PendingReload("/b", cert_fingerprint(CA_A), last_attempt_at=0.0))
+    coord = FakeCoord(running=False)
+    out = reconcile(
+        fs,
+        coord,
+        bundle_path="/b",
+        site_packages_root="/sp",
+        ca_pem=CA_A,
+        state_path=STATE,
+        min_retry_interval_s=INTERVAL,
+        now=10_000.0,
+    )
+    assert coord.attempts == 0
+    assert out.reload_pending is False
+    assert load_pending(fs, STATE) is None  # stale marker cleared

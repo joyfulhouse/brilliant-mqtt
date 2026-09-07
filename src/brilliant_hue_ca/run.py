@@ -49,10 +49,10 @@ def run_once(
             min_retry_interval_s=cfg.min_retry_interval_s,
         )
     except OSError:
-        # Genuine filesystem-write failure (bundle or state file). A failed
-        # coordinator restart is NOT this path — reconcile() catches that and
-        # defers it as a pending reload (see below).
-        _LOG.exception("reconcile failed writing the bundle or state file")
+        # Only a genuine bundle-write failure reaches here. Restart failures and
+        # state-file write failures are handled inside reconcile() (deferred as a
+        # pending reload), so they never abort the run.
+        _LOG.exception("reconcile failed writing the bundle")
         return 1
     if not outcome.bundle_found:
         _LOG.warning(

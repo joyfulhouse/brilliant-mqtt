@@ -27,12 +27,18 @@ class RealFileSystem:
             f.write(text)
 
     def write_text(self, path: str, text: str) -> None:
-        # Overwrite (truncating) — used for the small pending-reload state file,
-        # which must reflect only the latest generation, never accumulate. The
+        # Atomic replace — used for the small pending-reload state file. Writing
+        # to a sibling temp file, fsyncing, then os.replace() means a crash mid
+        # write can only leave the *previous* marker (or nothing), never a torn
+        # one that load_pending would misread as "nothing owed" (issue #96). The
         # parent dir is created so a first write on a fresh panel can't fail.
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
 
     def glob(self, root: str, name: str) -> str | None:
         for dirpath, _dirs, files in os.walk(root):
