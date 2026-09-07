@@ -1,3 +1,4 @@
+import math
 from collections.abc import Callable
 from typing import Any
 
@@ -57,6 +58,29 @@ def test_ping_timeout_reads_as_down(monkeypatch: pytest.MonkeyPatch) -> None:
     """The compatibility bool API stays false; the poller uses the tri-state API."""
     _spy_run_bounded(monkeypatch, returncode=bounded.TIMEOUT_RC, timed_out=True)
     assert probe.ping("192.168.1.1") is False
+
+
+def test_gateway_probe_default_runner_bounds_discovery_and_ping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _spy_run_bounded(
+        monkeypatch,
+        returncode=0,
+        stdout="default via 192.0.2.1 dev wlan0\n",
+    )
+
+    assert probe.gateway_probe(None) == ("192.0.2.1", probe.TcpProbe.OPEN)
+    assert probe.gateway_probe("198.51.100.1") == ("198.51.100.1", probe.TcpProbe.OPEN)
+    assert [call["argv"] for call in calls] == [
+        ["ip", "route", "show", "default"],
+        ["ping", "-c", "1", "-W", "2", "192.0.2.1"],
+        ["ping", "-c", "1", "-W", "2", "198.51.100.1"],
+    ]
+    assert [call["capture"] for call in calls] == [True, False, False]
+    for call in calls:
+        timeout = call["timeout"]
+        assert timeout == probe._PROBE_TIMEOUT
+        assert timeout > 0 and math.isfinite(timeout)
 
 
 def test_gateway_probe_configured_gateway_preserves_completed_state() -> None:

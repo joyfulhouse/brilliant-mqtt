@@ -26,15 +26,12 @@ def test_debounce_no_action_before_three_fails() -> None:
     assert lad.observe(gateway_up=False, now=60) == Action.NONE
 
 
-def test_soft_then_restart_then_reboot_each_once() -> None:
+def test_soft_and_restart_fire_once_while_eligible_reboot_rearms() -> None:
     lad = Ladder(T)
     actions = _down(lad, 0.0, 400.0)
-    assert Action.SOFT_RECONNECT in actions
-    assert Action.RESTART_SERVICES in actions
-    assert Action.GPIO_RESET_REBOOT in actions
     assert actions.count(Action.SOFT_RECONNECT) == 1
     assert actions.count(Action.RESTART_SERVICES) == 1
-    assert actions.count(Action.GPIO_RESET_REBOOT) == 1
+    assert actions[-2:] == [Action.GPIO_RESET_REBOOT, Action.GPIO_RESET_REBOOT]
 
 
 def test_recovery_resets_ladder() -> None:
@@ -45,7 +42,7 @@ def test_recovery_resets_ladder() -> None:
     assert _down(lad, 240.0, 120.0).count(Action.SOFT_RECONNECT) == 1
 
 
-def test_reboot_deferred_when_ineligible_then_rearms_when_eligible() -> None:
+def test_reboot_deferred_once_then_rearms_while_eligible() -> None:
     """When the guard blocks the reboot, the rung stays pending: it defers once
     (ESCALATE_NOTIFY), stays silent while still blocked, and re-arms the instant
     the guard clears — no connectivity recovery required (issue #91)."""
@@ -58,12 +55,13 @@ def test_reboot_deferred_when_ineligible_then_rearms_when_eligible() -> None:
     assert Action.GPIO_RESET_REBOOT not in out  # never rebooted while blocked
     # Still blocked → keeps deferring silently (no repeat notify).
     assert lad.observe(gateway_up=False, now=430.0, reboot_eligible=False) == Action.NONE
-    # Guard clears → the pending reboot re-arms immediately...
+    # Guard clears → the pending reboot re-arms immediately and remains pending.
     assert (
         lad.observe(gateway_up=False, now=460.0, reboot_eligible=True) == Action.GPIO_RESET_REBOOT
     )
-    # ...and only once (now marked fired for this outage).
-    assert lad.observe(gateway_up=False, now=490.0, reboot_eligible=True) == Action.NONE
+    assert (
+        lad.observe(gateway_up=False, now=490.0, reboot_eligible=True) == Action.GPIO_RESET_REBOOT
+    )
 
 
 def test_blocked_reboot_does_not_starve_cheaper_rungs() -> None:

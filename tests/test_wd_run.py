@@ -145,11 +145,7 @@ def test_reboot_not_lost_when_guard_read_would_flap() -> None:
         eligible = g.can_request(wall)  # the ONLY read this poll
         action = lad.observe(gateway_up=False, now=wall, reboot_eligible=eligible)
         if action != Action.NONE:
-            result = run.handle(
-                action, guard=g, now=wall, recovery_mod=rec, reboot_eligible=eligible
-            )
-            if result is not None:
-                lad.reboot_request_returned()
+            run.handle(action, guard=g, now=wall, recovery_mod=rec, reboot_eligible=eligible)
     assert rec.calls.count("reboot") == 1  # fired once, never lost
     assert g.recorded == [360.0]  # and recorded against the cap
 
@@ -217,9 +213,6 @@ class SpyLadder:
         self.observed.append(gateway_up)
         self.eligibility.append(reboot_eligible)
         return self._action
-
-    def reboot_request_returned(self) -> None:
-        pass
 
 
 @pytest.mark.parametrize(

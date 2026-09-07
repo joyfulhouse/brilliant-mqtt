@@ -65,9 +65,7 @@ def _poll(
     eligible = guard.can_request(t)
     action = ladder.observe(gateway_up=gateway_up, now=t, reboot_eligible=eligible)
     if action != Action.NONE:
-        result = run.handle(action, guard=guard, now=t, recovery_mod=rec, reboot_eligible=eligible)
-        if result is not None:
-            ladder.reboot_request_returned()
+        run.handle(action, guard=guard, now=t, recovery_mod=rec, reboot_eligible=eligible)
     return action, eligible
 
 

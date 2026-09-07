@@ -38,7 +38,6 @@ class Ladder:
         self._last_observed_at: float | None = None
         self._fired: set[str] = set()
         self._reboot_deferred = False
-        self._reboot_requested = False
 
     def reset(self) -> None:
         self._fails = 0
@@ -46,11 +45,6 @@ class Ladder:
         self._last_observed_at = None
         self._fired.clear()
         self._reboot_deferred = False
-        self._reboot_requested = False
-
-    def reboot_request_returned(self) -> None:
-        """Re-arm a reboot command that returned without replacing this process."""
-        self._reboot_requested = False
 
     def _threshold(self, name: str) -> float:
         return {
@@ -63,8 +57,6 @@ class Ladder:
         self, *, gateway_up: bool | None, now: float, reboot_eligible: bool = True
     ) -> Action:
         if gateway_up is None:
-            if not reboot_eligible:
-                self._reboot_requested = False
             if self._down_since is not None and self._last_observed_at is not None:
                 self._down_since += max(0.0, now - self._last_observed_at)
             self._last_observed_at = now
@@ -84,7 +76,6 @@ class Ladder:
             if elapsed < self._threshold(name) or name in self._fired:
                 continue
             if name == "reboot" and not reboot_eligible:
-                self._reboot_requested = False
                 # Reboot is due but the guard blocks it.  Never mark it fired, so a
                 # later eligible poll re-arms it (issue #91); notify once, then keep
                 # walking to the cheaper rungs so a poll gap can't starve soft/restart.
@@ -93,9 +84,6 @@ class Ladder:
                     return Action.ESCALATE_NOTIFY
                 continue
             if name == "reboot":
-                if self._reboot_requested:
-                    continue
-                self._reboot_requested = True
                 self._reboot_deferred = True
             else:
                 self._fired.add(name)

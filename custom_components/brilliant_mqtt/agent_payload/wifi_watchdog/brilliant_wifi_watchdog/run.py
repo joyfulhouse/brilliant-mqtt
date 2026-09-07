@@ -26,8 +26,6 @@ class _GuardLike(Protocol):
 class _LadderLike(Protocol):
     def observe(self, *, gateway_up: bool | None, now: float, reboot_eligible: bool) -> Action: ...
 
-    def reboot_request_returned(self) -> None: ...
-
 
 @dataclass(frozen=True)
 class Config:
@@ -92,8 +90,8 @@ def handle(
     elif action == Action.GPIO_RESET_REBOOT:
         # Act on the SAME eligibility the ladder used this poll (passed in) — a
         # second, independent guard read here could disagree with the ladder's
-        # pending-request latch. Defense in depth: never reboot unless that shared
-        # read said eligible; otherwise log the blocked path (never silent).
+        # decision. Defense in depth: never reboot unless that shared read said
+        # eligible; otherwise log the blocked path (never silent).
         if reboot_eligible:
             _LOG.error("gateway down ~360s: GPIO/SDIO reset + reboot")
             guard.record_request(now)
@@ -138,9 +136,7 @@ def _poll_once(cfg: Config, *, guard: _GuardLike, ladder: _LadderLike) -> None:
     eligible = guard.can_request(wall)
     action = ladder.observe(gateway_up=gateway_up, now=time.monotonic(), reboot_eligible=eligible)
     if action != Action.NONE:
-        result = handle(action, guard=guard, now=wall, reboot_eligible=eligible)
-        if result is not None:
-            ladder.reboot_request_returned()
+        handle(action, guard=guard, now=wall, reboot_eligible=eligible)
 
 
 def main() -> None:  # pragma: no cover - thin loop
