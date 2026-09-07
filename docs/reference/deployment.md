@@ -102,11 +102,11 @@ over WebSockets are unsupported by the panel transport.
   (`BUS_PHASE_FILE`, default `/run/brilliant-mqtt/bus-phase`) that the
   bus-watchdog reads to gate reboots (see
   [CONFIGURATION.md → Bus-health watchdog](../CONFIGURATION.md#bus-health-watchdog)).
-  Writer and reader must be upgraded and rolled back **together**. If a
-  deploy/rollback ever leaves only one side updated (agent without watchdog or
-  vice versa), delete the marker so a stale `bus` value from tmpfs (which
-  survives a service restart and is only cleared on reboot) can't be misread as
-  a live confirmed bus: `rm -f /run/brilliant-mqtt/bus-phase`.
+  Its versioned on-disk format is a shared contract even though each service
+  carries its own parser. Unknown or version-skewed records fail safe to no
+  reboot, but writer and reader must still be upgraded and rolled back
+  **together**. If a deploy/rollback leaves only one side updated, delete the
+  marker before starting either service: `rm -f /run/brilliant-mqtt/bus-phase`.
 
 > **Office safety stop:** Office is reserved for the existing-external-broker,
 > software-only canary. Keep its broker endpoint, TLS profile, and credentials

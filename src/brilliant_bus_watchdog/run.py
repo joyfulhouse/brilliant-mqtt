@@ -103,7 +103,7 @@ def _service_active(service: str, run: Any = None) -> bool:
     runner = run or (lambda argv: bounded.run_bounded(argv, timeout=_SERVICE_TIMEOUT, capture=True))
     try:
         r = runner(["systemctl", "is-active", service])
-        return (r.stdout or "").strip() == "active"
+        return (r.stdout or "").strip() in {"active", "activating"}
     except OSError:
         return False
 

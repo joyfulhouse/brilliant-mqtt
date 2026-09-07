@@ -13,14 +13,14 @@ from typing import cast
 import pytest
 
 import brilliant_mqtt.__main__ as main_mod
-from brilliant_bus_watchdog.health import bus_confirmed, bus_failure_age, heartbeat_age
+from brilliant_bus_watchdog.health import bus_failure_age, heartbeat_age
 from brilliant_bus_watchdog.reboot_guard import GuardPolicy, RebootGuard
 from brilliant_bus_watchdog.run import handle, should_reboot
+from brilliant_mqtt import heartbeat
 from brilliant_mqtt.bridge import Bridge
 from brilliant_mqtt.config import Settings
 from brilliant_mqtt.heartbeat import BusPhase, write_heartbeat, write_phase
 from brilliant_mqtt.model import BrilliantDevice
-from brilliant_mqtt.protocols import CommandSubscribeError
 from brilliant_mqtt.retained_topics import RetainedLedgerError
 from tests.fakes import FakeBus, FakeClock, FakeMqtt
 
@@ -32,10 +32,12 @@ class _Bus:
         *,
         block_start_until: asyncio.Event | None = None,
         entered_start: asyncio.Event | None = None,
+        read_error: Exception | None = None,
     ) -> None:
         self.start_error = start_error
         self.start_calls = 0
         self.read_calls = 0
+        self.read_error = read_error
         # When set, start() parks on this event (a bus still handshaking), and
         # signals entered_start once it has been reached — so a test can inspect
         # the phase/heartbeat mid-handshake.
@@ -65,6 +67,8 @@ class _Bus:
 
     async def get_all(self) -> list[BrilliantDevice]:
         self.read_calls += 1
+        if self.read_error is not None:
+            raise self.read_error
         return []
 
     async def shutdown(self) -> None:
@@ -178,7 +182,9 @@ def _install_session_fakes(
     monkeypatch: pytest.MonkeyPatch,
     bus: _Bus,
     mqtt: _Mqtt,
-    bridge: type[_NoopBridge] | type[_ReadOnceBridge] | type[_ReadingBridge] = _NoopBridge,
+    bridge: type[_NoopBridge] | type[_ReadOnceBridge] | type[_ReadingBridge] | type[Bridge] = (
+        _NoopBridge
+    ),
 ) -> None:
     monkeypatch.setattr(main_mod, "RpcBusAdapter", lambda **kwargs: bus)
     monkeypatch.setattr(main_mod, "AioMqttAdapter", lambda settings: mqtt)
@@ -219,16 +225,16 @@ async def test_broker_outage_never_qualifies_as_a_bus_wedge(
         with pytest.raises(ConnectionError, match="broker refused"):
             await main_mod._run_session(settings, None, None)
 
-    confirmed = bus_confirmed(settings.bus_phase_file)
+    failure_age = bus_failure_age(settings.bus_phase_file, now=time.monotonic())
     assert bus.start_calls == 0
     assert mqtt.connect_calls == 3
-    assert confirmed is False
+    assert failure_age is None
     assert not should_reboot(
         age=1900.0,
         stale_after=1800.0,
         bridge_active=True,
         gateway_up=True,
-        bus_failure_age=None,
+        bus_failure_age=failure_age,
     )
 
 
@@ -239,7 +245,7 @@ async def test_stale_bus_phase_and_heartbeat_do_not_reboot_on_broker_outage(
     later the heartbeat goes stale while the broker is down. Today's
     broker-only outage must NOT read those leftovers as a bus wedge: entering
     _run_session stamps "pre_bus" BEFORE mqtt.connect(), so once the broker
-    refusal short-circuits startup, bus_confirmed is False even though the
+    refusal short-circuits startup, bus_failure_age returns None even though the
     stale heartbeat age alone would otherwise qualify. Unlike its empty-file
     siblings above, this seeds the fail-unsafe leftovers explicitly so the
     test would catch a startup that wrote a fake heartbeat or let a stale
@@ -264,21 +270,21 @@ async def test_stale_bus_phase_and_heartbeat_do_not_reboot_on_broker_outage(
     with pytest.raises(ConnectionError, match="broker refused"):
         await main_mod._run_session(settings, None, None)
 
-    confirmed = bus_confirmed(settings.bus_phase_file)
+    failure_age = bus_failure_age(settings.bus_phase_file, now=time.monotonic())
     age = heartbeat_age(settings.bus_heartbeat_file, now=100_000.0, started_at=0.0)
     assert bus.start_calls == 0  # the local bus was never reached
     assert mqtt.connect_calls == 1
     # The pre_bus stamp at session entry overwrote the stale "bus" marker...
-    assert confirmed is False
+    assert failure_age is None
     # ...and the seeded heartbeat is genuinely stale, so this test proves it is
-    # bus_confirmed (not a fresh heartbeat) that holds the reboot back.
+    # missing bus-failure attribution (not a fresh heartbeat) that holds the reboot back.
     assert age >= 1800.0
     assert not should_reboot(
         age=age,
         stale_after=1800.0,
         bridge_active=True,
         gateway_up=True,
-        bus_failure_age=None,
+        bus_failure_age=failure_age,
     )
 
 
@@ -289,8 +295,8 @@ async def test_failed_pre_bus_restamp_does_not_reboot_on_broker_outage(
     _run_session in the SAME process and teardown deliberately keeps the "bus"
     marker, so a leftover marker carries THIS still-live pid. If session N's
     pre_bus re-stamp FAILS (ENOSPC/EROFS/perm on the /run tmpfs) and is merely
-    swallowed, that live-pid "bus" marker stays readable — bus_confirmed returns
-    True (the pid is alive), and a stale heartbeat during a broker-only outage
+    swallowed, that live-pid "bus" marker stays readable and could retain
+    attribution, so a stale heartbeat during a broker-only outage could
     reboots a healthy panel in a loop. Proving the failed stamp actively clears
     the marker: seed a live-pid "bus" + stale heartbeat, make the pre_bus stamp
     fail, and assert the outage does NOT qualify as a bus wedge."""
@@ -310,11 +316,11 @@ async def test_failed_pre_bus_restamp_does_not_reboot_on_broker_outage(
     with pytest.raises(ConnectionError, match="broker refused"):
         await main_mod._run_session(settings, None, None)
 
-    confirmed = bus_confirmed(settings.bus_phase_file)
+    failure_age = bus_failure_age(settings.bus_phase_file, now=time.monotonic())
     age = heartbeat_age(settings.bus_heartbeat_file, now=100_000.0, started_at=0.0)
     assert bus.start_calls == 0  # the local bus was never reached
     # The failed pre_bus stamp cleared the live-pid "bus" leftover...
-    assert confirmed is False
+    assert failure_age is None
     # ...and the heartbeat is genuinely stale, so it is the cleared marker (not
     # a fresh heartbeat) that holds the reboot back.
     assert age >= 1800.0
@@ -323,7 +329,7 @@ async def test_failed_pre_bus_restamp_does_not_reboot_on_broker_outage(
         stale_after=1800.0,
         bridge_active=True,
         gateway_up=True,
-        bus_failure_age=None,
+        bus_failure_age=failure_age,
     )
 
 
@@ -383,17 +389,17 @@ async def test_mesh_election_failure_stays_pre_bus_despite_mqtt_connect(
     with pytest.raises(ConnectionError, match="mesh claim subscribe failed"):
         await main_mod._run_session(settings, None, None)
 
-    confirmed = bus_confirmed(settings.bus_phase_file)
+    failure_age = bus_failure_age(settings.bus_phase_file, now=time.monotonic())
     assert mqtt.connect_calls == 1
     assert mqtt.subscribe_calls == 1
     assert bus.start_calls == 0
-    assert confirmed is False
+    assert failure_age is None
     assert not should_reboot(
         age=99_999.0,
         stale_after=1800.0,
         bridge_active=True,
         gateway_up=True,
-        bus_failure_age=None,
+        bus_failure_age=failure_age,
     )
 
 
@@ -418,17 +424,17 @@ async def test_retained_ledger_failure_stays_pre_bus(
     with pytest.raises(RetainedLedgerError) as raised:
         await main_mod._run_session(settings, None, None)
 
-    confirmed = bus_confirmed(settings.bus_phase_file)
+    failure_age = bus_failure_age(settings.bus_phase_file, now=time.monotonic())
     assert raised.value is ledger_error
     assert bus.start_calls == 0
     assert mqtt.connect_calls == 1  # diagnostic publish only
-    assert confirmed is False
+    assert failure_age is None
     assert not should_reboot(
         age=99_999.0,
         stale_after=1800.0,
         bridge_active=True,
         gateway_up=True,
-        bus_failure_age=None,
+        bus_failure_age=failure_age,
     )
 
 
@@ -446,9 +452,8 @@ async def test_sustained_bus_handshake_failure_still_uses_reboot_guard(
         with pytest.raises(ConnectionError, match="bus handshake failed"):
             await main_mod._run_session(settings, None, None)
         if attempt < 6:
-            clock.advance(300.0)
+            clock.advance(301.0)
 
-    confirmed = bus_confirmed(settings.bus_phase_file)
     failure_age = bus_failure_age(settings.bus_phase_file, now=clock())
     age = heartbeat_age(settings.bus_heartbeat_file, now=1900.0, started_at=0.0)
     decision = should_reboot(
@@ -464,8 +469,7 @@ async def test_sustained_bus_handshake_failure_still_uses_reboot_guard(
     )
     assert bus.start_calls == 7
     assert mqtt.connect_calls == 7
-    assert confirmed is True
-    assert failure_age == 1800.0
+    assert failure_age == 1806.0
     assert decision is True
 
     reboots: list[str] = []
@@ -499,18 +503,19 @@ async def test_successful_bus_read_refreshes_heartbeat_without_resetting_phase(
     with pytest.raises(asyncio.CancelledError):
         await main_mod._run_session(settings, None, None)
 
-    confirmed = bus_confirmed(settings.bus_phase_file)
+    failure_age = bus_failure_age(settings.bus_phase_file)
     age = heartbeat_age(settings.bus_heartbeat_file, now=time.time(), started_at=0.0)
     assert bus.start_calls == 1
     assert bus.read_calls == 1
-    assert confirmed is True
+    assert failure_age is not None
+    assert 0.0 <= failure_age < 1.0
     assert 0.0 <= age < 1.0
     assert not should_reboot(
         age=age,
         stale_after=1800.0,
         bridge_active=True,
         gateway_up=True,
-        bus_failure_age=bus_failure_age(settings.bus_phase_file),
+        bus_failure_age=failure_age,
     )
 
 
@@ -599,13 +604,13 @@ async def test_scene_subscribe_failure_never_reboots_a_healthy_panel(
     _install_watchdog_clock(monkeypatch, clock)
     _seed(settings.bus_heartbeat_file, "100.0")
 
-    bus = _Bus()  # the local bus handshakes fine
-    mqtt = _Mqtt(subscribe_error=CommandSubscribeError("scene command topic rejected"))
-    _install_session_fakes(monkeypatch, bus, mqtt, _ReadingBridge)
+    bus = _Bus()
+    mqtt = _Mqtt(subscribe_error=TimeoutError("scene subscribe timed out"))
+    _install_session_fakes(monkeypatch, bus, mqtt, Bridge)
 
     decisions: list[bool] = []
-    for attempt in range(4):
-        with pytest.raises(CommandSubscribeError, match="scene command topic rejected"):
+    for attempt in range(31):
+        with pytest.raises(TimeoutError, match="scene subscribe timed out"):
             await main_mod._run_session(settings, None, None)
         age = heartbeat_age(
             settings.bus_heartbeat_file,
@@ -621,21 +626,39 @@ async def test_scene_subscribe_failure_never_reboots_a_healthy_panel(
                 bus_failure_age=bus_failure_age(settings.bus_phase_file, now=clock()),
             )
         )
-        if attempt < 3:
-            clock.advance(700.0)
+        if attempt < 30:
+            clock.advance(60.0)
 
-    confirmed = bus_confirmed(settings.bus_phase_file)
     age = heartbeat_age(
         settings.bus_heartbeat_file,
         now=clock() + 100.0,
         started_at=0.0,
     )
-    assert clock() > 1800.0
-    assert bus.start_calls == 4  # the local bus was healthy on every retry...
-    assert bus.read_calls == 4
-    assert confirmed is True  # ...and the phase reached "bus"
+    assert clock() == 1800.0
+    assert decisions == [False] * 31
+    assert bus.start_calls == 31
+    assert bus.read_calls == 31
     assert age < 1800.0
-    assert decisions == [False] * 4
+
+
+async def test_failed_initial_bus_read_does_not_write_success_heartbeat_or_phase(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    clock = FakeClock()
+    _install_watchdog_clock(monkeypatch, clock)
+    bus = _Bus(read_error=ConnectionError("panel read failed"))
+    mqtt = _Mqtt()
+    _install_session_fakes(monkeypatch, bus, mqtt, Bridge)
+
+    with pytest.raises(ConnectionError, match="panel read failed"):
+        await main_mod._run_session(settings, None, None)
+
+    assert bus.read_calls == 1
+    assert not await asyncio.to_thread(Path(settings.bus_heartbeat_file).exists)
+    record = await asyncio.to_thread(heartbeat.read_phase_record, settings.bus_phase_file)
+    assert record is not None
+    assert record.bus_read_succeeded is False
 
 
 class _AvailabilityPublishFailsMqtt(FakeMqtt):

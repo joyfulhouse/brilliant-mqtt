@@ -103,9 +103,10 @@ def test_load_config_bus_phase_path(environ: dict[str, str], expected: str) -> N
     assert load_config(environ).phase_path == expected
 
 
-def test_service_active_true_when_stdout_active() -> None:
+@pytest.mark.parametrize("state", ["active", "activating"])
+def test_service_active_true_while_running_or_restarting(state: str) -> None:
     def run(argv: list[str]) -> SimpleNamespace:
-        return SimpleNamespace(stdout="active\n")
+        return SimpleNamespace(stdout=f"{state}\n")
 
     assert _service_active("brilliant-mqtt", run=run) is True
 

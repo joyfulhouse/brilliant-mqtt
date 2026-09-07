@@ -20,7 +20,7 @@ from brilliant_mqtt.bus import RpcBusAdapter
 from brilliant_mqtt.config import Settings
 from brilliant_mqtt.desired_state import DesiredState
 from brilliant_mqtt.discovery import meta_topic
-from brilliant_mqtt.heartbeat import write_heartbeat, write_phase
+from brilliant_mqtt.heartbeat import MAX_SESSION_RETRY_BACKOFF_S, write_heartbeat, write_phase
 from brilliant_mqtt.mesh_leader import MeshLeader
 from brilliant_mqtt.motion_derive import MotionDeriver
 from brilliant_mqtt.mqttio import AioMqttAdapter
@@ -35,7 +35,7 @@ _BACKOFF_S = 5
 # A ledger failure requires operator action (repair the file/filesystem), not a
 # hot reconnect loop. Keep retrying so recovery is automatic, but slowly enough
 # that one affected panel cannot churn the broker.
-_LEDGER_BACKOFF_S = 60.0
+_LEDGER_BACKOFF_S = MAX_SESSION_RETRY_BACKOFF_S
 # Loop tick when the hot poll is disabled (stale checks still need a cadence).
 _IDLE_TICK_S = 30.0
 # Version 0.9.2 detected a dead bus in roughly 1.5 hot-poll cycles (~12-20s,

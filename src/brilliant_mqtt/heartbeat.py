@@ -19,7 +19,14 @@ from typing import Literal, TextIO
 logger = logging.getLogger(__name__)
 
 _MIN_WRITE_INTERVAL_S = 10.0
-DEAD_WRITER_RETENTION_S = 300.0
+_PHASE_LEASE_ATTEMPTS = 3
+_PHASE_LEASE_RETRY_S = 0.01
+MAX_SESSION_RETRY_BACKOFF_S = 60.0
+DEAD_WRITER_RETENTION_S = MAX_SESSION_RETRY_BACKOFF_S * 5
+PHASE_RECORD_VERSION = "v2"
+PHASE_ATTEMPT = "attempt"
+PHASE_SUCCESS = "success"
+_MAX_PID = 2**31 - 1
 _last_attempt: dict[str, float] = {}
 
 BusPhase = Literal["pre_bus", "bus"]
@@ -33,7 +40,7 @@ class PhaseRecord:
     boot_id: str
     failure_started_at: float | None
     bus_updated_at: float | None
-    retain_until: float | None
+    bus_read_succeeded: bool | None
 
     def encode(self) -> str:
         timing = (
@@ -42,12 +49,12 @@ class PhaseRecord:
             else (
                 repr(self.failure_started_at),
                 repr(self.bus_updated_at),
-                repr(self.retain_until),
+                PHASE_SUCCESS if self.bus_read_succeeded else PHASE_ATTEMPT,
             )
         )
         return " ".join(
             (
-                "v2",
+                PHASE_RECORD_VERSION,
                 self.phase,
                 str(self.pid),
                 self.process_generation,
@@ -59,7 +66,11 @@ class PhaseRecord:
     @classmethod
     def parse(cls, text: str) -> PhaseRecord | None:
         parts = text.split()
-        if len(parts) != 8 or parts[0] != "v2" or parts[1] not in ("pre_bus", "bus"):
+        if (
+            len(parts) != 8
+            or parts[0] != PHASE_RECORD_VERSION
+            or parts[1] not in ("pre_bus", "bus")
+        ):
             return None
         try:
             pid = int(parts[2])
@@ -67,24 +78,33 @@ class PhaseRecord:
             return None
         generation = parts[3]
         boot_id = parts[4]
-        if pid <= 1 or not generation.isdecimal() or not boot_id or len(boot_id) > 128:
+        if (
+            not 1 < pid <= _MAX_PID
+            or not generation.isdecimal()
+            or not boot_id
+            or len(boot_id) > 128
+        ):
             return None
         timing_parts = parts[5:]
         if timing_parts == ["-", "-", "-"]:
             if parts[1] == "bus":
                 return None
-            timing: tuple[float | None, float | None, float | None] = (None, None, None)
+            timing: tuple[float | None, float | None] = (None, None)
+            read_succeeded: bool | None = None
         else:
+            if timing_parts[2] not in (PHASE_ATTEMPT, PHASE_SUCCESS):
+                return None
             try:
-                parsed = tuple(float(value) for value in timing_parts)
+                parsed = (float(timing_parts[0]), float(timing_parts[1]))
             except ValueError:
                 return None
             if (
                 not all(math.isfinite(value) and value >= 0.0 for value in parsed)
-                or not parsed[0] <= parsed[1] <= parsed[2]
+                or parsed[0] > parsed[1]
             ):
                 return None
-            timing = (parsed[0], parsed[1], parsed[2])
+            timing = parsed
+            read_succeeded = timing_parts[2] == PHASE_SUCCESS
         phase: BusPhase = "pre_bus" if parts[1] == "pre_bus" else "bus"
         return cls(
             phase=phase,
@@ -93,7 +113,7 @@ class PhaseRecord:
             boot_id=boot_id,
             failure_started_at=timing[0],
             bus_updated_at=timing[1],
-            retain_until=timing[2],
+            bus_read_succeeded=read_succeeded,
         )
 
 
@@ -104,6 +124,7 @@ class _PhaseLease:
 
 
 _phase_leases: dict[str, _PhaseLease] = {}
+_owned_phase_records: dict[str, PhaseRecord] = {}
 
 
 def current_boot_id() -> str | None:
@@ -149,22 +170,51 @@ def _release_phase_lease(path: str) -> None:
 def _acquire_phase_lease(path: str, last_success_write: float | None) -> None:
     stream = open(path, encoding="utf-8")
     try:
-        fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        for attempt in range(_PHASE_LEASE_ATTEMPTS):
+            try:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                if attempt == _PHASE_LEASE_ATTEMPTS - 1:
+                    raise
+                time.sleep(_PHASE_LEASE_RETRY_S)
+            else:
+                break
     except BaseException:
         stream.close()
         raise
     _phase_leases[path] = _PhaseLease(stream, last_success_write)
 
 
-def _history_is_current(record: PhaseRecord | None, boot_id: str, now: float) -> bool:
-    return (
-        record is not None
-        and record.boot_id == boot_id
-        and record.failure_started_at is not None
-        and record.bus_updated_at is not None
-        and record.retain_until is not None
-        and record.bus_updated_at <= now <= record.retain_until
-    )
+def _inheritable_history(
+    record: PhaseRecord | None,
+    *,
+    boot_id: str,
+    pid: int,
+    generation: str,
+    owned: bool,
+    now: float,
+) -> PhaseRecord | None:
+    if (
+        record is None
+        or record.boot_id != boot_id
+        or record.failure_started_at is None
+        or record.bus_updated_at is None
+        or record.bus_read_succeeded is None
+        or record.failure_started_at > now
+        or record.bus_updated_at > now
+    ):
+        return None
+    if record.pid == pid:
+        if not owned or record.process_generation != generation:
+            return None
+        return None if record.bus_read_succeeded else record
+    if (
+        record.bus_read_succeeded
+        or now > record.bus_updated_at + DEAD_WRITER_RETENTION_S
+        or process_generation(record.pid) is not None
+    ):
+        return None
+    return record
 
 
 def _invalidate_failed_write(path: str, write_error: BaseException) -> None:
@@ -270,6 +320,8 @@ def write_phase(
     ):
         return
     previous = read_phase_record(path)
+    owned = _owned_phase_records.get(path) == previous
+    _owned_phase_records.pop(path, None)
     _release_phase_lease(path)
     try:
         boot_id = current_boot_id()
@@ -277,11 +329,18 @@ def write_phase(
         generation = process_generation(pid)
         if boot_id is None or generation is None:
             raise OSError("cannot establish boot/process generation")
-        history = previous if _history_is_current(previous, boot_id, now) else None
+        history = _inheritable_history(
+            previous,
+            boot_id=boot_id,
+            pid=pid,
+            generation=generation,
+            owned=owned,
+            now=now,
+        )
         if phase == "pre_bus":
             failure_started_at = history.failure_started_at if history is not None else None
             bus_updated_at = history.bus_updated_at if history is not None else None
-            retain_until = history.retain_until if history is not None else None
+            read_succeeded = history.bus_read_succeeded if history is not None else None
         else:
             failure_started_at = (
                 history.failure_started_at
@@ -289,7 +348,7 @@ def write_phase(
                 else now
             )
             bus_updated_at = now
-            retain_until = now + DEAD_WRITER_RETENTION_S
+            read_succeeded = bus_read_succeeded
         record = PhaseRecord(
             phase=phase,
             pid=pid,
@@ -297,11 +356,19 @@ def write_phase(
             boot_id=boot_id,
             failure_started_at=failure_started_at,
             bus_updated_at=bus_updated_at,
-            retain_until=retain_until,
+            bus_read_succeeded=read_succeeded,
         )
         _atomic_write(path, record.encode())
         if phase == "bus":
             _acquire_phase_lease(path, now if bus_read_succeeded else None)
+        _owned_phase_records[path] = record
+    except BlockingIOError:
+        _release_phase_lease(path)
+        logger.warning(
+            "bus phase lease unavailable for %s after bounded retries; marker remains unleased",
+            path,
+            exc_info=True,
+        )
     except (OSError, UnicodeError) as error:
         _release_phase_lease(path)
         _invalidate_failed_write(path, error)

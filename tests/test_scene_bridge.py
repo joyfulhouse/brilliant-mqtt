@@ -2168,6 +2168,24 @@ async def test_execution_before_async_start_is_buffered_and_delivered(tmp_path: 
     await bridge.async_shutdown()
 
 
+async def test_shutdown_discards_buffered_execution_before_same_instance_restart(
+    tmp_path: Path,
+) -> None:
+    bus = FakeBus(
+        [_execution()],
+        scoped_devices=[_scene_catalog("all_off"), _mode_catalog("away")],
+    )
+    mqtt = FakeMqtt()
+    bridge = SceneBridge(bus, mqtt, _PANEL, tmp_path / "state.json", FakeClockMs(_NOW_MS))
+
+    await bus.emit(_execution("all_off", 500))
+    await bridge.async_shutdown()
+    await bridge.async_start()
+
+    assert _published(mqtt, scene_event_topic(_PANEL)) == []
+    await bridge.async_shutdown()
+
+
 async def test_reconcile_discards_snapshot_older_than_same_epoch_live_change(
     tmp_path: Path,
 ) -> None:
