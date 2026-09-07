@@ -291,7 +291,8 @@ async def _run_session(
         # this line — mqtt.connect(), the mesh-election join — is an
         # MQTT/mesh-side startup failure, not a bus failure, and must leave
         # the phase at "pre_bus".
-        write_phase(settings.bus_phase_file, "bus")
+        if not write_phase(settings.bus_phase_file, "bus"):
+            raise RuntimeError("bus failure attribution unavailable")
         await bus.start()
         await panel_bridge.reconcile()
         if scene_bridge is not None:

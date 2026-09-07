@@ -10,6 +10,7 @@ from .phase_record import (
     PhaseRecord,
     current_boot_id,
     process_generation,
+    process_is_absent,
 )
 
 
@@ -51,7 +52,7 @@ def bus_failure_age(
     if live_generation is not None:
         if live_generation != record.process_generation or not leased:
             return None
-    elif (
+    elif not process_is_absent(record.pid) or (
         leased
         or record.bus_read_succeeded
         or sampled_at > record.bus_updated_at + DEAD_WRITER_RETENTION_S

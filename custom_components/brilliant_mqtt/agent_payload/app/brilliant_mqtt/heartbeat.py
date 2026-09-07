@@ -22,11 +22,15 @@ _MIN_WRITE_INTERVAL_S = 10.0
 _PHASE_LEASE_ATTEMPTS = 3
 _PHASE_LEASE_RETRY_S = 0.01
 MAX_SESSION_RETRY_BACKOFF_S = 60.0
-DEAD_WRITER_RETENTION_S = MAX_SESSION_RETRY_BACKOFF_S * 5
+# Must exceed systemd's deploy/brilliant-mqtt.service RestartSec so a crashed
+# bus-attempt writer can hand evidence to its replacement.
+BRIDGE_SERVICE_RESTART_SEC = 5.0
+DEAD_WRITER_RETENTION_S = BRIDGE_SERVICE_RESTART_SEC * 60
+assert DEAD_WRITER_RETENTION_S > BRIDGE_SERVICE_RESTART_SEC
 PHASE_RECORD_VERSION = "v2"
 PHASE_ATTEMPT = "attempt"
 PHASE_SUCCESS = "success"
-_MAX_PID = 2**31 - 1
+MAX_PID = 2**31 - 1
 _last_attempt: dict[str, float] = {}
 
 BusPhase = Literal["pre_bus", "bus"]
@@ -79,7 +83,7 @@ class PhaseRecord:
         generation = parts[3]
         boot_id = parts[4]
         if (
-            not 1 < pid <= _MAX_PID
+            not 1 < pid <= MAX_PID
             or not generation.isdecimal()
             or not boot_id
             or len(boot_id) > 128
@@ -125,6 +129,7 @@ class _PhaseLease:
 
 _phase_leases: dict[str, _PhaseLease] = {}
 _owned_phase_records: dict[str, PhaseRecord] = {}
+_pending_failure_history: dict[str, PhaseRecord] = {}
 
 
 def current_boot_id() -> str | None:
@@ -153,6 +158,17 @@ def process_generation(pid: int) -> str | None:
     return start_tick if start_tick.isdecimal() else None
 
 
+def process_is_absent(pid: int) -> bool:
+    """Return true only when the kernel confirms that *pid* does not exist."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except (OSError, OverflowError):
+        return False
+    return False
+
+
 def read_phase_record(path: str) -> PhaseRecord | None:
     try:
         with open(path, encoding="utf-8") as stream:
@@ -168,7 +184,7 @@ def _release_phase_lease(path: str) -> None:
 
 
 def _acquire_phase_lease(path: str, last_success_write: float | None) -> None:
-    stream = open(path, encoding="utf-8")
+    stream = open(path, "r+", encoding="utf-8")
     try:
         for attempt in range(_PHASE_LEASE_ATTEMPTS):
             try:
@@ -183,6 +199,20 @@ def _acquire_phase_lease(path: str, last_success_write: float | None) -> None:
         stream.close()
         raise
     _phase_leases[path] = _PhaseLease(stream, last_success_write)
+
+
+def _rewrite_phase_lease(path: str, text: str) -> bool:
+    lease = _phase_leases.get(path)
+    if lease is None:
+        return False
+    try:
+        lease.stream.seek(0)
+        lease.stream.write(text)
+        lease.stream.truncate()
+        lease.stream.flush()
+    except (OSError, UnicodeError, ValueError):
+        return False
+    return True
 
 
 def _inheritable_history(
@@ -211,7 +241,7 @@ def _inheritable_history(
     if (
         record.bus_read_succeeded
         or now > record.bus_updated_at + DEAD_WRITER_RETENTION_S
-        or process_generation(record.pid) is not None
+        or not process_is_absent(record.pid)
     ):
         return None
     return record
@@ -297,18 +327,18 @@ def write_phase(
     *,
     bus_read_succeeded: bool = False,
     monotonic_clock: Callable[[], float] = time.monotonic,
-) -> None:
-    """Record timed, boot-aware local-bus attribution without disrupting startup.
+) -> bool:
+    """Record timed, boot-aware local-bus attribution before bus startup.
 
-    A live ``bus`` writer holds an exclusive lock on the marker inode. Moving to
-    ``pre_bus`` releases that lease before any filesystem write, so even a
-    failed replacement plus failed unlink cannot leave an old live-PID marker
-    authoritative. Recent records from dead writers remain bounded evidence for
-    native-crash loops; boot IDs, process start ticks, and retention reject PID
-    reuse and ancient records.
+    A live ``bus`` writer holds an exclusive lock on the marker inode. A failed
+    ``pre_bus`` replacement rewrites that leased inode before releasing it, so
+    the old bus attempt cannot become valid evidence after writer death. Recent
+    records from dead writers remain bounded evidence for native-crash loops;
+    boot IDs, process start ticks, and retention reject PID reuse and ancient
+    records. Bus startup must stop when this returns false.
     """
     if not path:
-        return
+        return True
     now = monotonic_clock()
     lease = _phase_leases.get(path)
     if (
@@ -318,30 +348,43 @@ def write_phase(
         and lease.last_success_write is not None
         and now - lease.last_success_write < _MIN_WRITE_INTERVAL_S
     ):
-        return
+        return True
     previous = read_phase_record(path)
     owned = _owned_phase_records.get(path) == previous
     _owned_phase_records.pop(path, None)
-    _release_phase_lease(path)
     try:
         boot_id = current_boot_id()
         pid = os.getpid()
         generation = process_generation(pid)
         if boot_id is None or generation is None:
             raise OSError("cannot establish boot/process generation")
-        history = _inheritable_history(
-            previous,
-            boot_id=boot_id,
-            pid=pid,
-            generation=generation,
-            owned=owned,
-            now=now,
-        )
         if phase == "pre_bus":
-            failure_started_at = history.failure_started_at if history is not None else None
-            bus_updated_at = history.bus_updated_at if history is not None else None
-            read_succeeded = history.bus_read_succeeded if history is not None else None
+            history = _inheritable_history(
+                previous,
+                boot_id=boot_id,
+                pid=pid,
+                generation=generation,
+                owned=owned,
+                now=now,
+            )
+            _pending_failure_history.pop(path, None)
+            if history is not None and previous is not None and previous.phase == "bus":
+                _pending_failure_history[path] = history
+            failure_started_at = None
+            bus_updated_at = None
+            read_succeeded = None
         else:
+            if previous is not None and previous.phase == "pre_bus":
+                history = _pending_failure_history.pop(path, None) if owned else None
+            else:
+                history = _inheritable_history(
+                    previous,
+                    boot_id=boot_id,
+                    pid=pid,
+                    generation=generation,
+                    owned=owned,
+                    now=now,
+                )
             failure_started_at = (
                 history.failure_started_at
                 if history is not None and not bus_read_succeeded
@@ -358,17 +401,46 @@ def write_phase(
             bus_updated_at=bus_updated_at,
             bus_read_succeeded=read_succeeded,
         )
-        _atomic_write(path, record.encode())
-        if phase == "bus":
-            _acquire_phase_lease(path, now if bus_read_succeeded else None)
+        encoded = record.encode()
+        try:
+            _atomic_write(path, encoded)
+        except (OSError, UnicodeError) as write_error:
+            if _rewrite_phase_lease(path, encoded):
+                _owned_phase_records[path] = record
+                if phase == "pre_bus":
+                    _release_phase_lease(path)
+                else:
+                    current_lease = _phase_leases[path]
+                    current_lease.last_success_write = now if bus_read_succeeded else None
+                logger.warning(
+                    "bus phase atomic replacement failed for %s; marker updated in place",
+                    path,
+                    exc_info=(type(write_error), write_error, write_error.__traceback__),
+                )
+                return True
+            _pending_failure_history.pop(path, None)
+            _release_phase_lease(path)
+            _invalidate_failed_write(path, write_error)
+            return False
         _owned_phase_records[path] = record
+        _release_phase_lease(path)
+        if phase == "bus":
+            try:
+                _acquire_phase_lease(path, now if bus_read_succeeded else None)
+            except BlockingIOError:
+                logger.warning(
+                    "bus phase lease unavailable for %s after bounded retries; "
+                    "bus startup remains blocked",
+                    path,
+                    exc_info=True,
+                )
+                return False
+        return True
     except BlockingIOError:
         _release_phase_lease(path)
-        logger.warning(
-            "bus phase lease unavailable for %s after bounded retries; marker remains unleased",
-            path,
-            exc_info=True,
-        )
+        return False
     except (OSError, UnicodeError) as error:
+        _pending_failure_history.pop(path, None)
         _release_phase_lease(path)
         _invalidate_failed_write(path, error)
+        return False

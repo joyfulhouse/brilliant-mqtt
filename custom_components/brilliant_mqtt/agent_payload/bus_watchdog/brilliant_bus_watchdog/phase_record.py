@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from typing import Literal
 
@@ -10,7 +11,7 @@ PHASE_RECORD_VERSION = "v2"
 PHASE_ATTEMPT = "attempt"
 PHASE_SUCCESS = "success"
 DEAD_WRITER_RETENTION_S = 300.0
-_MAX_PID = 2**31 - 1
+MAX_PID = 2**31 - 1
 
 BusPhase = Literal["pre_bus", "bus"]
 
@@ -41,7 +42,7 @@ class PhaseRecord:
         generation = parts[3]
         boot_id = parts[4]
         if (
-            not 1 < pid <= _MAX_PID
+            not 1 < pid <= MAX_PID
             or not generation.isdecimal()
             or not boot_id
             or len(boot_id) > 128
@@ -105,3 +106,14 @@ def process_generation(pid: int) -> str | None:
         return None
     start_tick = fields_after_command[19]
     return start_tick if start_tick.isdecimal() else None
+
+
+def process_is_absent(pid: int) -> bool:
+    """Return true only when the kernel confirms that *pid* does not exist."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except (OSError, OverflowError):
+        return False
+    return False
