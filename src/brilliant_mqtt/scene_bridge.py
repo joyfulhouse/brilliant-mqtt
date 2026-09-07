@@ -812,21 +812,12 @@ class SceneBridge:
         return True
 
     def _apply_mode_execution(self, execution: ModeExecution, *, emit_event: bool) -> bool:
-        # #94 mode deferral: the mode path intentionally has NO request-relative
-        # confirm gate (unlike _apply_scene_execution). A mode execution's
-        # timestamp comes from the bus Variable.timestamp, whose units and clock
-        # domain are UNVERIFIED and cannot be verified without live-panel
-        # hardware. The delayed-case false-confirm therefore remains: a previously
-        # unseen stamp newer than the global watermark can have been caused before
-        # the request yet still confirm it by mode id. Gating on it risks breaking
-        # legitimate mode commands on production in-wall panels. Before adding a
-        # request-relative gate here, verify on hardware:
-        #   1. Variable.timestamp UNITS (seconds vs milliseconds).
-        #   2. Panel-clock vs phone/writer-supplied clock (change a mode from a
-        #      phone vs from the bridge and compare to _clock_ms()).
-        #   3. Whether a redundant same-mode set re-stamps the timestamp.
-        # Option (c), copying the global watermark at request time, is a no-op:
-        # every stamp it rejects is already rejected by current <= previous below.
+        # #94/#119: live verification established that Variable.timestamp is
+        # server-assigned panel epoch-ms, in the same clock domain as _clock_ms().
+        # A value change re-stamps it, while a redundant same-mode write does not.
+        # Therefore mode confirmation uses the scene path's request-relative gate
+        # (option (a)); same-mode requests are handled by state equality at request
+        # time because no newer execution stamp can arrive for them.
         current = (execution.executed_at_ms, execution.mode_id)
         previous = self._mode_watermarks.get(self._panel)
         if previous is not None and current <= previous:
@@ -847,11 +838,20 @@ class SceneBridge:
             }
         )
         event_key = f"mode:{self._panel}:{execution.mode_id}:{execution.executed_at_ms}"
-        matching = [
-            (command_id, pending)
-            for command_id, pending in self._mode_pending.items()
-            if pending.value == execution.mode_id
-        ]
+        matching: list[tuple[str, _Pending]] = []
+        for command_id, pending in self._mode_pending.items():
+            if pending.value != execution.mode_id:
+                continue
+            if execution.executed_at_ms >= pending.confirm_after_ms:
+                matching.append((command_id, pending))
+            else:
+                logger.warning(
+                    "mode execution predates command baseline; not confirming "
+                    "(mode_id=%s executed_at_ms=%d confirm_after_ms=%d)",
+                    execution.mode_id,
+                    execution.executed_at_ms,
+                    pending.confirm_after_ms,
+                )
         publish_event = emit_event or bool(matching)
         if publish_event and not self._reserve_event(event_key):
             return False
@@ -954,6 +954,28 @@ class SceneBridge:
                             command.issued_at_ms,
                             accepted=False,
                             error=f"unknown_{kind}",
+                            event_key=None,
+                        ):
+                            snapshot = self._capture_state()
+                            needs_delivery = True
+                        else:
+                            needs_health = True
+                    elif (
+                        kind == "mode"
+                        and self._execution is not None
+                        and (manual_mode := self._execution.variables.get("manual_mode_id"))
+                        is not None
+                        and manual_mode.value == value
+                    ):
+                        if self._store_result(
+                            kind,
+                            command.command_id,
+                            value,
+                            fingerprint,
+                            command.panel,
+                            command.issued_at_ms,
+                            accepted=True,
+                            error=None,
                             event_key=None,
                         ):
                             snapshot = self._capture_state()

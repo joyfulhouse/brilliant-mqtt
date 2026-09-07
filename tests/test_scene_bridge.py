@@ -298,8 +298,14 @@ async def _assert_second_command_after_delivery_and_prune(
 
         await mqtt.inject(command_topic, _command(second_id, kind, value))
         assert bridge._state_trusted is True
-        await _wait_for_bus_commands(bus, 2)
-        assert len(bus.commands) == 2
+        if kind == "mode":
+            await _wait_for_publish(mqtt, mode_result_topic(second_id))
+            assert len(bus.commands) == 1
+            result = _payload(_published(mqtt, mode_result_topic(second_id))[-1])
+            assert result["accepted"] is True
+        else:
+            await _wait_for_bus_commands(bus, 2)
+            assert len(bus.commands) == 2
     finally:
         await bridge.async_shutdown()
 
@@ -918,17 +924,30 @@ async def test_completed_command_does_not_replay_after_original_command_ttl(tmp_
     await bridge.async_shutdown()
 
 
-async def test_matching_mode_execution_confirms_only_mode_pending_request(tmp_path: Path) -> None:
-    bridge, bus, mqtt, _, _ = await _started(tmp_path)
+async def test_new_mode_execution_at_baseline_confirms_only_mode_pending_request(
+    tmp_path: Path,
+) -> None:
+    bridge, bus, mqtt, _, _ = await _started(
+        tmp_path,
+        execution=_execution(mode_id="home", mode_at_ms=_NOW_MS - 1_000),
+        mode_ids=("away", "home"),
+    )
     scene_command_id = "22222222-2222-4222-8222-222222222222"
     mode_command_id = "33333333-3333-4333-8333-333333333333"
     await mqtt.inject(scene_command_topic(_PANEL), _command(scene_command_id, "scene", "all_off"))
     await mqtt.inject(mode_command_topic(_PANEL), _command(mode_command_id, "mode", "away"))
 
-    await bus.emit(_execution(mode_id="away", mode_at_ms=222))
+    await bus.emit(_execution(mode_id="away", mode_at_ms=_NOW_MS - 1))
+    await _wait_for_publish(mqtt, mode_event_topic(_PANEL))
+    delivery_task = bridge._delivery_task
+    assert delivery_task is not None
+    await asyncio.wait_for(delivery_task, timeout=2)
+    assert _published(mqtt, mode_result_topic(mode_command_id)) == []
+
+    await bus.emit(_execution(mode_id="away", mode_at_ms=_NOW_MS))
     await _wait_for_publish(mqtt, mode_result_topic(mode_command_id))
 
-    assert len(_published(mqtt, mode_event_topic(_PANEL))) == 1
+    assert len(_published(mqtt, mode_event_topic(_PANEL))) == 2
     assert len(_published(mqtt, mode_result_topic(mode_command_id))) == 1
     assert _published(mqtt, scene_result_topic(scene_command_id)) == []
     await bridge.async_shutdown()
@@ -2788,82 +2807,110 @@ async def test_malformed_execution_never_confirms_pending_scene_command(tmp_path
     await bridge.async_shutdown()
 
 
-async def test_poll_confirms_repeated_same_mode_activation_with_new_timestamp(
+async def test_requesting_current_mode_confirms_immediately_without_execution_stamp(
     tmp_path: Path,
 ) -> None:
-    # Issue #93: the same mode re-activates with a new bus timestamp, but its
-    # real-time push is missed and it surfaces only through the hot poll. The
-    # value-only fingerprint is unchanged, so the manual_mode_id timestamp must
-    # gate the poll or the activation (and its pending command) is dropped.
+    # The bus does not re-stamp a same-value write, so state equality must settle
+    # the request without creating a pending command that can only time out.
     seeded = _execution(mode_id="away", mode_at_ms=_NOW_MS - 1_000)
-    bridge, bus, mqtt, clock, _ = await _started(tmp_path, execution=seeded)
+    bridge, bus, mqtt, _, _ = await _started(tmp_path, execution=seeded)
     mqtt.published.clear()
 
     command_id = "33333333-3333-4333-8333-333333333333"
     await mqtt.inject(mode_command_topic(_PANEL), _command(command_id, "mode", "away"))
-    await _wait_for_bus_commands(bus, 1)
-
-    # Missed push: the re-activation reaches the bridge only via poll_executions.
-    await bridge.poll_executions([_execution(mode_id="away", mode_at_ms=_NOW_MS + 1)])
     await _wait_for_publish(mqtt, mode_result_topic(command_id))
 
-    assert len(_published(mqtt, mode_event_topic(_PANEL))) == 1
+    assert bus.commands == []
+    assert command_id not in bridge._mode_pending
+    assert ("mode", command_id) not in bridge._pending_records
+    assert _published(mqtt, mode_event_topic(_PANEL)) == []
     result = _payload(_published(mqtt, mode_result_topic(command_id))[-1])
     assert result["accepted"] is True
     assert "error" not in result
-
-    # The confirmation cancels the pending timeout: advancing past the TTL emits
-    # no further (timeout) result.
-    await clock.advance_ms(15_000)
-    assert len(_published(mqtt, mode_result_topic(command_id))) == 1
     await bridge.async_shutdown()
 
 
-async def test_mode_watermark_rejects_old_stamp_but_delayed_pre_request_stamp_confirms(
+async def test_mode_watermark_and_request_baseline_reject_old_execution_stamps(
     tmp_path: Path,
 ) -> None:
-    """Characterize the mode chronology limitation deferred to live-panel work."""
-    seeded_at_ms = _NOW_MS - 2_000
+    seeded_at_ms = _NOW_MS - 3_000
     bridge, bus, mqtt, clock, _ = await _started(
         tmp_path,
         execution=_execution(mode_id="away", mode_at_ms=seeded_at_ms),
         mode_ids=("away", "home"),
     )
+    # Move current state away from the requested value while retaining chronology
+    # that began at away@T-3000.
+    await bridge.poll_executions([_execution(mode_id="home", mode_at_ms=_NOW_MS - 2_000)])
+    await _wait_for_publish(mqtt, mode_event_topic(_PANEL))
+    delivery_task = bridge._delivery_task
+    assert delivery_task is not None
+    await asyncio.wait_for(delivery_task, timeout=2)
     mqtt.published.clear()
-    timeout_id = "22222222-2222-4222-8222-222222222222"
     delayed_id = "44444444-4444-4444-8444-444444444444"
-    await mqtt.inject(mode_command_topic(_PANEL), _command(timeout_id, "mode", "home"))
     await mqtt.inject(mode_command_topic(_PANEL), _command(delayed_id, "mode", "away"))
-    await _wait_for_bus_commands(bus, 2)
+    await _wait_for_bus_commands(bus, 1)
 
     await bridge.poll_executions([_execution(mode_id="away", mode_at_ms=seeded_at_ms - 1)])
 
-    assert bridge._mode_watermarks[_PANEL] == (seeded_at_ms, "away")
+    assert bridge._mode_watermarks[_PANEL] == (_NOW_MS - 2_000, "home")
     assert _published(mqtt, mode_event_topic(_PANEL)) == []
     assert _published(mqtt, mode_result_topic(delayed_id)) == []
 
-    # Current limitation: although this previously unseen stamp predates both
-    # requests, it is newer than the global watermark and confirms by mode id.
+    # This stamp is newer than the global watermark but still predates the
+    # request, so it may emit an event but must not confirm the pending command.
     await bridge.poll_executions([_execution(mode_id="away", mode_at_ms=_NOW_MS - 1_000)])
-    await _wait_for_publish(mqtt, mode_result_topic(delayed_id))
-    delayed = _payload(_published(mqtt, mode_result_topic(delayed_id))[-1])
-    assert delayed["accepted"] is True
+    await _wait_for_publish(mqtt, mode_event_topic(_PANEL))
     delivery_task = bridge._delivery_task
     assert delivery_task is not None
     await asyncio.wait_for(delivery_task, timeout=2)
 
-    timeout_task = bridge._mode_pending[timeout_id].timeout_task
+    timeout_task = bridge._mode_pending[delayed_id].timeout_task
     assert timeout_task is not None
     await clock.advance_ms(COMMAND_TTL_MS)
     await timeout_task
     delivery_task = bridge._delivery_task
     assert delivery_task is not None
     await asyncio.wait_for(delivery_task, timeout=2)
-    await _wait_for_publish(mqtt, mode_result_topic(timeout_id))
-    timed_out = _payload(_published(mqtt, mode_result_topic(timeout_id))[-1])
+    await _wait_for_publish(mqtt, mode_result_topic(delayed_id))
+    timed_out = _payload(_published(mqtt, mode_result_topic(delayed_id))[-1])
     assert timed_out["accepted"] is False
     assert timed_out["error"] == "timeout"
     assert bridge._state_trusted is True
+    await bridge.async_shutdown()
+
+
+async def test_mode_execution_newer_than_watermark_but_before_request_does_not_confirm(
+    tmp_path: Path,
+) -> None:
+    clock = FakeClockMs(200)
+    bridge, bus, mqtt, _, _ = await _started(tmp_path, clock=clock)
+    bridge._mode_watermarks[_PANEL] = (100, "away")
+    command_id = "55555555-5555-4555-8555-555555555555"
+
+    await mqtt.inject(
+        mode_command_topic(_PANEL),
+        _command(command_id, "mode", "away", issued_at_ms=clock.now_ms),
+    )
+    await _wait_for_bus_commands(bus, 1)
+
+    # away@101 is previously unseen and newer than away@100, but both executions
+    # occurred before the request baseline at 200.
+    await bus.emit(_execution(mode_id="away", mode_at_ms=101))
+    await _wait_for_publish(mqtt, mode_event_topic(_PANEL))
+    delivery_task = bridge._delivery_task
+    assert delivery_task is not None
+    await asyncio.wait_for(delivery_task, timeout=2)
+    assert _published(mqtt, mode_result_topic(command_id)) == []
+
+    timeout_task = bridge._mode_pending[command_id].timeout_task
+    assert timeout_task is not None
+    await clock.advance_ms(COMMAND_TTL_MS)
+    await timeout_task
+    await _wait_for_publish(mqtt, mode_result_topic(command_id))
+    result = _payload(_published(mqtt, mode_result_topic(command_id))[-1])
+    assert result["accepted"] is False
+    assert result["error"] == "timeout"
     await bridge.async_shutdown()
 
 
