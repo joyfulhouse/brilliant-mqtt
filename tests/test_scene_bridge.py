@@ -18,6 +18,7 @@ from brilliant_mqtt import scene_bridge as scene_bridge_module
 from brilliant_mqtt import scene_state
 from brilliant_mqtt.commands import VarSet
 from brilliant_mqtt.ha_control_protocol import (
+    COMMAND_TTL_MS,
     MAPPING_VERSION,
     SCHEMA_VERSION,
     encode_json,
@@ -698,7 +699,9 @@ async def test_matching_execution_publishes_event_before_accepted_result_and_cac
     await mqtt.inject(scene_command_topic(_PANEL), command)
     await _wait_for_bus_commands(bus, 1)
 
-    await bus.emit(_execution("all_off", 1234))
+    # #94: the confirming execution must be stamped at or after the command's
+    # panel-clock baseline (the injected clock at issue time == _NOW_MS).
+    await bus.emit(_execution("all_off", _NOW_MS))
     await _wait_for_publish(mqtt, scene_result_topic(command_id))
 
     event_index = next(
@@ -732,7 +735,8 @@ async def test_completed_command_does_not_replay_after_original_command_ttl(tmp_
     command = _command(command_id, "scene", "all_off")
     await mqtt.inject(scene_command_topic(_PANEL), command)
     await _wait_for_bus_commands(bus, 1)
-    await bus.emit(_execution("all_off", 1_234))
+    # #94: confirming execution stamped at the command baseline (_NOW_MS).
+    await bus.emit(_execution("all_off", _NOW_MS))
     await _wait_for_publish(mqtt, scene_result_topic(command_id))
     first = _published(mqtt, scene_result_topic(command_id))[-1]
 
@@ -939,7 +943,8 @@ async def test_failed_terminal_result_publish_retries_until_delivered(tmp_path: 
     bridge = SceneBridge(bus, mqtt, _PANEL, tmp_path / "watermarks.json", clock)
     await bridge.async_start()
     await mqtt.inject(scene_command_topic(_PANEL), _command(command_id, "scene", "all_off"))
-    await bus.emit(_execution("all_off", 500))
+    # #94: confirming execution stamped at the command baseline (_NOW_MS).
+    await bus.emit(_execution("all_off", _NOW_MS))
     for _ in range(200):
         if mqtt.failed:
             break
@@ -1039,7 +1044,8 @@ async def test_undelivered_accepted_result_survives_process_restart(tmp_path: Pa
     await bridge.async_start()
     command = _command(command_id, "scene", "all_off")
     await mqtt.inject(scene_command_topic(_PANEL), command)
-    await bus.emit(_execution("all_off", 500))
+    # #94: confirming execution stamped at the command baseline (_NOW_MS).
+    await bus.emit(_execution("all_off", _NOW_MS))
     await asyncio.sleep(0)
     await bridge.async_shutdown()
 
@@ -1087,7 +1093,8 @@ async def test_event_outbox_survives_restart_and_gates_accepted_result(tmp_path:
     bridge = SceneBridge(bus, mqtt, _PANEL, path, clock)
     await bridge.async_start()
     await mqtt.inject(scene_command_topic(_PANEL), _command(command_id, "scene", "all_off"))
-    await bus.emit(_execution("all_off", 500))
+    # #94: confirming execution stamped at the command baseline (_NOW_MS).
+    await bus.emit(_execution("all_off", _NOW_MS))
     await asyncio.sleep(0)
 
     assert _published(mqtt, scene_result_topic(command_id)) == []
@@ -1204,7 +1211,8 @@ async def test_completed_id_reuse_validates_context_and_fingerprint_before_repla
     original = _command(command_id, "scene", "all_off")
     await mqtt.inject(scene_command_topic(_PANEL), original)
     await _wait_for_bus_commands(bus, 1)
-    await bus.emit(_execution("all_off", 500))
+    # #94: confirming execution stamped at the command baseline (_NOW_MS).
+    await bus.emit(_execution("all_off", _NOW_MS))
     await _wait_for_publish(mqtt, scene_result_topic(command_id))
     original_results = len(_published(mqtt, scene_result_topic(command_id)))
 
@@ -1382,7 +1390,8 @@ async def test_result_capacity_never_discards_undelivered_outcome(
     await bridge.async_start()
     await mqtt.inject(scene_command_topic(_PANEL), _command(first_id, "scene", "all_off"))
     await _wait_for_bus_commands(bus, 1)
-    await bus.emit(_execution("all_off", 500))
+    # #94: confirming execution stamped at the command baseline (_NOW_MS).
+    await bus.emit(_execution("all_off", _NOW_MS))
     await mqtt.inject(scene_command_topic(_PANEL), _command(second_id, "scene", "all_off"))
 
     assert len(bus.commands) == 1
@@ -1405,7 +1414,8 @@ async def test_delivered_result_at_capacity_is_evicted_for_new_physical_command(
     )
     await mqtt.inject(scene_command_topic(_PANEL), _command(first_id, "scene", "all_off"))
     await _wait_for_bus_commands(bus, 1)
-    await bus.emit(_execution("all_off", 500))
+    # #94: confirming execution stamped at the command baseline (_NOW_MS).
+    await bus.emit(_execution("all_off", _NOW_MS))
     await _wait_for_publish(mqtt, scene_result_topic(first_id))
 
     await mqtt.inject(scene_command_topic(_PANEL), _command(second_id, "scene", "all_on"))
@@ -1475,7 +1485,9 @@ async def test_inflight_command_is_durable_before_write_and_never_rewrites_after
     await second_mqtt.inject(scene_command_topic(_PANEL), command)
 
     assert second_bus.commands == []
-    await second_bus.emit(_execution("all_off", 500))
+    # #94: the persisted pending's confirm_after_ms is the original baseline
+    # (_NOW_MS); a confirming execution must be stamped at or after it.
+    await second_bus.emit(_execution("all_off", _NOW_MS))
     await _wait_for_publish(second_mqtt, scene_result_topic(command_id))
     assert _payload(_published(second_mqtt, scene_result_topic(command_id))[-1])["accepted"] is True
     await second.async_shutdown()
@@ -2078,4 +2090,184 @@ async def test_restart_is_fail_closed_until_abandoned_unsubscribe_finishes(
         await asyncio.sleep(0.001)
     await bridge.async_start()
     assert mqtt.subscriptions == [scene_command_topic(_PANEL), mode_command_topic(_PANEL)]
+    await bridge.async_shutdown()
+
+
+# --- #94: request-relative execution evidence before confirming scene commands ---
+
+
+async def test_delayed_historical_execution_never_confirms_scene_command(tmp_path: Path) -> None:
+    """The #94 repro: an execution newer than the per-scene watermark but older
+    than a just-issued command's panel-clock baseline must NOT confirm it. The
+    delayed record still emits its native event and advances the watermark."""
+    # Seed an ancient watermark (T-2000) silently at start.
+    bridge, bus, mqtt, clock, _ = await _started(
+        tmp_path, execution=_execution("all_off", _NOW_MS - 2_000)
+    )
+    command_id = "22222222-2222-4222-8222-222222222222"
+    await mqtt.inject(scene_command_topic(_PANEL), _command(command_id, "scene", "all_off"))
+    await _wait_for_bus_commands(bus, 1)  # command issued at T; bus write completed
+
+    # Delayed/historical execution: newer than the watermark (T-2000) but stamped
+    # before the command baseline (T). It must publish, never confirm.
+    await bus.emit(_execution("all_off", _NOW_MS - 1_000))
+    await _wait_for_publish(mqtt, scene_event_topic(_PANEL))
+
+    assert len(_published(mqtt, scene_event_topic(_PANEL))) == 1
+    assert _payload(_published(mqtt, scene_event_topic(_PANEL))[-1])["executed_at_ms"] == (
+        _NOW_MS - 1_000
+    )
+    assert _published(mqtt, scene_result_topic(command_id)) == []
+
+    # The command stays pending and can only terminate by timeout: the sole
+    # result is the timeout, and no accepted:true is ever emitted.
+    await clock.advance_ms(COMMAND_TTL_MS)
+    await _wait_for_publish(mqtt, scene_result_topic(command_id))
+    results = _published(mqtt, scene_result_topic(command_id))
+    assert [_payload(item)["accepted"] for item in results] == [False]
+    assert _payload(results[-1])["error"] == "timeout"
+    await bridge.async_shutdown()
+
+
+async def test_execution_at_or_after_baseline_confirms_scene_command(tmp_path: Path) -> None:
+    """Fresh success: an execution stamped after the command baseline confirms."""
+    bridge, bus, mqtt, _, _ = await _started(tmp_path)
+    command_id = "22222222-2222-4222-8222-222222222222"
+    await mqtt.inject(scene_command_topic(_PANEL), _command(command_id, "scene", "all_off"))
+    await _wait_for_bus_commands(bus, 1)
+
+    await bus.emit(_execution("all_off", _NOW_MS + 500))
+    await _wait_for_publish(mqtt, scene_result_topic(command_id))
+
+    assert _payload(_published(mqtt, scene_result_topic(command_id))[-1])["accepted"] is True
+    await bridge.async_shutdown()
+
+
+async def test_pre_baseline_record_leaves_pending_open_for_later_confirmation(
+    tmp_path: Path,
+) -> None:
+    """A stale record older than the baseline (but newer than the prior watermark)
+    never confirms, and it must not consume the pending: a later at-or-after
+    baseline execution still confirms the same command."""
+    bridge, bus, mqtt, _, _ = await _started(
+        tmp_path, execution=_execution("all_off", _NOW_MS - 3_000)
+    )
+    command_id = "22222222-2222-4222-8222-222222222222"
+    await mqtt.inject(scene_command_topic(_PANEL), _command(command_id, "scene", "all_off"))
+    await _wait_for_bus_commands(bus, 1)
+
+    # Newer than the watermark (T-3000) yet older than the baseline (T): no confirm.
+    await bus.emit(_execution("all_off", _NOW_MS - 1_500))
+    await _wait_for_publish(mqtt, scene_event_topic(_PANEL))
+    assert _published(mqtt, scene_result_topic(command_id)) == []
+
+    # A later at-or-after-baseline execution confirms the still-open pending.
+    await bus.emit(_execution("all_off", _NOW_MS + 100))
+    await _wait_for_publish(mqtt, scene_result_topic(command_id))
+    assert _payload(_published(mqtt, scene_result_topic(command_id))[-1])["accepted"] is True
+    await bridge.async_shutdown()
+
+
+async def test_execution_equal_to_baseline_confirms_scene_command(tmp_path: Path) -> None:
+    """Tie semantics: executed_at_ms == confirm_after_ms confirms (>=)."""
+    bridge, bus, mqtt, _, _ = await _started(tmp_path)
+    command_id = "22222222-2222-4222-8222-222222222222"
+    await mqtt.inject(scene_command_topic(_PANEL), _command(command_id, "scene", "all_off"))
+    await _wait_for_bus_commands(bus, 1)
+
+    await bus.emit(_execution("all_off", _NOW_MS))  # exactly at the baseline
+    await _wait_for_publish(mqtt, scene_result_topic(command_id))
+
+    assert _payload(_published(mqtt, scene_result_topic(command_id))[-1])["accepted"] is True
+    await bridge.async_shutdown()
+
+
+@pytest.mark.parametrize(
+    ("executed_at_ms", "expected"),
+    [
+        (_NOW_MS - 500, ()),  # E < B1: neither confirms
+        (_NOW_MS + 500, ("first",)),  # B1 <= E < B2: first only
+        (_NOW_MS + 2_000, ("first", "second")),  # E >= B2: both
+    ],
+)
+async def test_multiple_pending_same_scene_confirm_by_baseline_band(
+    tmp_path: Path,
+    executed_at_ms: int,
+    expected: tuple[str, ...],
+) -> None:
+    """Two commands for one scene with baselines B1 < B2: an execution at E
+    confirms exactly those whose confirm_after_ms <= E."""
+    bridge, bus, mqtt, clock, _ = await _started(tmp_path)
+    ids = {
+        "first": "22222222-2222-4222-8222-222222222222",  # baseline B1 = T
+        "second": "44444444-4444-4444-8444-444444444444",  # baseline B2 = T + 1000
+    }
+    await mqtt.inject(scene_command_topic(_PANEL), _command(ids["first"], "scene", "all_off"))
+    await _wait_for_bus_commands(bus, 1)
+    await clock.advance_ms(1_000)
+    await mqtt.inject(scene_command_topic(_PANEL), _command(ids["second"], "scene", "all_off"))
+    await _wait_for_bus_commands(bus, 2)
+
+    await bus.emit(_execution("all_off", executed_at_ms))
+    await _wait_for_publish(mqtt, scene_event_topic(_PANEL))
+
+    for name, command_id in ids.items():
+        if name in expected:
+            await _wait_for_publish(mqtt, scene_result_topic(command_id))
+            assert (
+                _payload(_published(mqtt, scene_result_topic(command_id))[-1])["accepted"] is True
+            )
+        else:
+            assert _published(mqtt, scene_result_topic(command_id)) == []
+    await bridge.async_shutdown()
+
+
+async def test_persisted_baseline_rejects_pre_baseline_replay_after_restart(
+    tmp_path: Path,
+) -> None:
+    """confirm_after_ms is persisted on the durable pending, so after a restart a
+    pre-baseline (delayed/historical) execution still refuses to confirm."""
+    command_id = "22222222-2222-4222-8222-222222222222"
+    command = _command(command_id, "scene", "all_off")
+    path = tmp_path / "state.json"
+    first_bus = FakeBus(
+        [_execution()], scoped_devices=[_scene_catalog("all_off"), _mode_catalog("away")]
+    )
+    first_mqtt = FakeMqtt()
+    first = SceneBridge(first_bus, first_mqtt, _PANEL, path, FakeClockMs(_NOW_MS))
+    await first.async_start()
+    await first_mqtt.inject(scene_command_topic(_PANEL), command)
+    await _wait_for_bus_commands(first_bus, 1)
+    await first.async_shutdown()
+
+    entry = json.loads(path.read_text())["pending"][f"scene:{command_id}"]
+    assert entry["confirm_after_ms"] == _NOW_MS
+    assert entry["expires_at_ms"] == _NOW_MS + COMMAND_TTL_MS
+
+    second_bus = FakeBus(
+        [_execution()], scoped_devices=[_scene_catalog("all_off"), _mode_catalog("away")]
+    )
+    second_mqtt = FakeMqtt()
+    second = SceneBridge(second_bus, second_mqtt, _PANEL, path, FakeClockMs(_NOW_MS))
+    await second.async_start()
+    assert second_bus.commands == []
+
+    await second_bus.emit(_execution("all_off", _NOW_MS - 1_000))
+    await _wait_for_publish(second_mqtt, scene_event_topic(_PANEL))
+    assert _published(second_mqtt, scene_result_topic(command_id)) == []
+    await second.async_shutdown()
+
+
+async def test_malformed_execution_never_confirms_pending_scene_command(tmp_path: Path) -> None:
+    """A missing/invalid execution timestamp is dropped upstream by the codec, so
+    it can never confirm a pending command (behavior unchanged by #94)."""
+    bridge, bus, mqtt, _, _ = await _started(tmp_path)
+    command_id = "22222222-2222-4222-8222-222222222222"
+    await mqtt.inject(scene_command_topic(_PANEL), _command(command_id, "scene", "all_off"))
+    await _wait_for_bus_commands(bus, 1)
+
+    await bus.emit(_execution("all_off", malformed_scene=True))
+    await asyncio.sleep(0)
+
+    assert _published(mqtt, scene_result_topic(command_id)) == []
     await bridge.async_shutdown()

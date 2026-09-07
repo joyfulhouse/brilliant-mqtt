@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from brilliant_mqtt.ha_control_protocol import (
+    COMMAND_TTL_MS,
     MAPPING_VERSION,
     SCHEMA_VERSION,
     encode_json,
@@ -247,8 +248,109 @@ def test_scene_state_is_immutable() -> None:
     new_value = (
         (
             ("scene", _COMMAND_ID),
-            StatePending("scene", _COMMAND_ID, _SCENE_ID, "a" * 64, _PANEL, 1, 2),
+            StatePending("scene", _COMMAND_ID, _SCENE_ID, "a" * 64, _PANEL, 1, 2, 0),
         ),
     )
     with pytest.raises(AttributeError):
         setattr(state, field_name, new_value)
+
+
+# --- #94: confirm_after_ms durable baseline + strict-loader migration (F5) ---
+
+
+def _pending_entry(
+    *,
+    expires_at_ms: int,
+    confirm_after_ms: int | None = None,
+) -> dict[str, object]:
+    entry: dict[str, object] = {
+        "kind": "scene",
+        "command_id": _COMMAND_ID,
+        "value": _SCENE_ID,
+        "fingerprint": command_fingerprint_fields(
+            "scene", _COMMAND_ID, _PANEL, _SCENE_ID, _ISSUED_AT_MS
+        ),
+        "panel": _PANEL,
+        "issued_at_ms": _ISSUED_AT_MS,
+        "expires_at_ms": expires_at_ms,
+    }
+    if confirm_after_ms is not None:
+        entry["confirm_after_ms"] = confirm_after_ms
+    return entry
+
+
+def _pending_state_file(tmp_path: Path, entry: dict[str, object]) -> Path:
+    raw = state_payload(SceneState())
+    raw["pending"] = {f"scene:{_COMMAND_ID}": entry}
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps(raw))
+    return path
+
+
+def test_pending_confirm_after_ms_round_trips(tmp_path: Path) -> None:
+    fingerprint = command_fingerprint_fields("scene", _COMMAND_ID, _PANEL, _SCENE_ID, _ISSUED_AT_MS)
+    pending = StatePending(
+        "scene", _COMMAND_ID, _SCENE_ID, fingerprint, _PANEL, _ISSUED_AT_MS, 20_000, 5_000
+    )
+    state = SceneState(pending=((("scene", _COMMAND_ID), pending),))
+    path = tmp_path / "private" / "state.json"
+
+    atomic_write_state(path, state)
+    loaded = load_state(path)
+
+    assert loaded.trusted is True
+    assert loaded.state == state
+    persisted = json.loads(path.read_text())["pending"][f"scene:{_COMMAND_ID}"]
+    assert persisted["confirm_after_ms"] == 5_000
+
+
+def test_load_pending_with_confirm_after_ms_is_preserved(tmp_path: Path) -> None:
+    path = _pending_state_file(
+        tmp_path, _pending_entry(expires_at_ms=COMMAND_TTL_MS + 5_000, confirm_after_ms=5_000)
+    )
+
+    loaded = load_state(path)
+
+    assert loaded.trusted is True
+    assert loaded.reason is None
+    ((_, pending),) = loaded.state.pending
+    assert pending.confirm_after_ms == 5_000
+
+
+def test_load_pending_without_confirm_after_ms_reconstructs_fallback_baseline(
+    tmp_path: Path,
+) -> None:
+    # An old fleet file predates the field: STATE_VERSION stays 1, the file loads
+    # trusted, and the baseline is reconstructed exactly as expires_at_ms - TTL
+    # (creation used a single shared clock read).
+    expires_at_ms = COMMAND_TTL_MS + 1_000
+    path = _pending_state_file(tmp_path, _pending_entry(expires_at_ms=expires_at_ms))
+
+    loaded = load_state(path)
+
+    assert loaded.trusted is True
+    assert loaded.reason is None
+    ((_, pending),) = loaded.state.pending
+    assert pending.confirm_after_ms == expires_at_ms - COMMAND_TTL_MS
+
+
+@pytest.mark.parametrize("bad", [-1, "5000", 20_001, 1.5])
+def test_load_rejects_invalid_confirm_after_ms(tmp_path: Path, bad: object) -> None:
+    entry = _pending_entry(expires_at_ms=20_000)
+    entry["confirm_after_ms"] = bad
+    path = _pending_state_file(tmp_path, entry)
+
+    loaded = load_state(path)
+
+    assert loaded.trusted is False
+    assert loaded.reason == "state_untrusted"
+
+
+def test_load_rejects_unknown_pending_key_even_with_confirm_after_ms(tmp_path: Path) -> None:
+    entry = _pending_entry(expires_at_ms=20_000, confirm_after_ms=5_000)
+    entry["bogus"] = 1
+    path = _pending_state_file(tmp_path, entry)
+
+    loaded = load_state(path)
+
+    assert loaded.trusted is False
