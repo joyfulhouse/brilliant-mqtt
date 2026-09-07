@@ -45,9 +45,15 @@ def run_once(
             bundle_path=cfg.bundle_path,
             site_packages_root=cfg.site_packages_root,
             ca_pem=ca_pem,
+            state_path=cfg.state_path,
+            min_retry_interval_s=cfg.min_retry_interval_s,
         )
     except OSError:
-        _LOG.exception("reconcile failed writing the bundle")
+        # Reaches here only on an unrecoverable error reading or writing the
+        # bundle itself. Restart failures and state-file read/write failures are
+        # handled inside reconcile() (deferred as a pending reload), so they never
+        # abort the run.
+        _LOG.exception("reconcile failed accessing the bundle")
         return 1
     if not outcome.bundle_found:
         _LOG.warning(
@@ -56,10 +62,34 @@ def run_once(
             cfg.site_packages_root,
         )
     elif outcome.appended:
+        if outcome.reload_pending and not outcome.marker_persisted:
+            # Appended, restart failed, AND the marker could not be recorded
+            # (state dir unwritable): nothing on disk will drive a retry, so this
+            # is NOT the self-healing "will retry" case. Fail the oneshot so it
+            # shows FAILED under systemd rather than a misleading healthy exit.
+            _LOG.error(
+                "appended CA to %s but the coordinator reload is owed and could NOT "
+                "be recorded (state dir unwritable); the next run will NOT retry — "
+                "manual intervention required",
+                outcome.bundle_path,
+            )
+            return 1
         _LOG.info(
             "appended CA to %s; coordinator_restarted=%s",
             outcome.bundle_path,
             outcome.coordinator_restarted,
+        )
+        if outcome.reload_pending:
+            _LOG.warning(
+                "coordinator reload pending for %s (restart not confirmed); will retry next run",
+                outcome.bundle_path,
+            )
+    elif outcome.reload_pending:
+        # Cert already present but a prior run's reload is still owed — the
+        # expected, self-healing state, so exit 0 and let the timer retry.
+        _LOG.warning(
+            "coordinator reload still pending for %s (retrying/paced); will retry next run",
+            outcome.bundle_path,
         )
     else:
         _LOG.debug("CA already present in %s; no-op", outcome.bundle_path)

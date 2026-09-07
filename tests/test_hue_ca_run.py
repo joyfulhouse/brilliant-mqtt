@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from brilliant_hue_ca.run import run_once
+from brilliant_hue_ca.state import load_pending
 
 # PEM_cert_to_DER_cert only base64-decodes the body (no DER/X.509 structure
 # validation), so a valid-base64 placeholder is enough here: run_once/reconcile
@@ -26,18 +27,28 @@ class FakeFS:
     def append_text(self, path: str, text: str) -> None:
         self.appended.append((path, text))
 
+    def write_text(self, path: str, text: str) -> None:
+        self._files[path] = text
+        self._exists[path] = True  # keep exists() consistent with writes
+
     def glob(self, root: str, name: str) -> str | None:
         return None
 
 
 class FakeCoord:
-    def __init__(self) -> None:
+    def __init__(self, running: bool = False, fail: bool = False) -> None:
+        self._running = running
+        self._fail = fail
         self.restarted = False
+        self.attempts = 0
 
     def is_running(self) -> bool:
-        return False
+        return self._running
 
     def restart(self) -> None:
+        self.attempts += 1
+        if self._fail:
+            raise OSError("simulated transient vassal-touch failure")
         self.restarted = True
 
 
@@ -101,3 +112,85 @@ def test_run_once_returns_one_when_ca_corrupt() -> None:
         read_ca=lambda _p: corrupt,
     )
     assert rc == 1
+
+
+def test_run_once_returns_zero_when_restart_fails_and_marks_pending() -> None:
+    # Cert absent, coordinator running, but restart raises OSError. A caught,
+    # self-healing restart failure must NOT be conflated with the fatal
+    # bundle-write path: run_once returns 0 and leaves a durable marker so the
+    # next timer run retries.
+    fs = FakeFS({"/b": True}, {"/b": ""})  # empty bundle -> CA is absent
+    coord = FakeCoord(running=True, fail=True)
+    rc = run_once(
+        {"HUE_CA_BUNDLE_PATH": "/b", "HUE_CA_STATE_PATH": "/state.json"},
+        fs=fs,
+        coordinator=coord,
+        read_ca=lambda _p: CA,
+    )
+    assert rc == 0
+    assert coord.attempts == 1
+    assert fs.appended  # the CA was appended
+    assert load_pending(fs, "/state.json") is not None  # reload owed, persisted
+
+
+def test_run_once_returns_one_when_reload_owed_but_unrecordable() -> None:
+    # finding #1: appended, restart failed, AND the marker could not be recorded
+    # (state dir unwritable) -> nothing will retry, so run_once must FAIL (rc 1),
+    # not report a healthy "will retry".
+    class UnwritableFS(FakeFS):
+        def write_text(self, path: str, text: str) -> None:
+            raise OSError(30, "EROFS")
+
+    fs = UnwritableFS({"/b": True}, {"/b": ""})  # empty bundle -> CA absent
+    coord = FakeCoord(running=True, fail=True)  # restart fails
+    rc = run_once(
+        {"HUE_CA_BUNDLE_PATH": "/b", "HUE_CA_STATE_PATH": "/state.json"},
+        fs=fs,
+        coordinator=coord,
+        read_ca=lambda _p: CA,
+    )
+    assert rc == 1
+    assert coord.attempts == 1  # restart was still attempted
+
+
+def test_run_once_survives_unreadable_state_file() -> None:
+    # An OSError reading an existing state file must not crash run_once or be
+    # misdiagnosed as a bundle-write failure: rc == 0 and the reload is requested.
+    class ReadFailFS(FakeFS):
+        def __init__(
+            self, exists_map: dict[str, bool], files: dict[str, str], *, fail_read: str
+        ) -> None:
+            super().__init__(exists_map, files)
+            self._fail_read = fail_read
+
+        def read_text(self, path: str) -> str:
+            if path == self._fail_read:
+                raise OSError(5, "EIO")
+            return super().read_text(path)
+
+    fs = ReadFailFS({"/b": True, "/state.json": True}, {"/b": CA}, fail_read="/state.json")
+    coord = FakeCoord(running=True)
+    rc = run_once(
+        {"HUE_CA_BUNDLE_PATH": "/b", "HUE_CA_STATE_PATH": "/state.json"},
+        fs=fs,
+        coordinator=coord,
+        read_ca=lambda _p: CA,
+    )
+    assert rc == 0
+    assert coord.attempts == 1
+
+
+def test_run_once_completes_reload_and_clears_pending_when_host_running() -> None:
+    # Cert absent, coordinator running, restart succeeds -> reload confirmed,
+    # marker cleared, exit 0. Proves state_path threads through run_once.
+    fs = FakeFS({"/b": True}, {"/b": ""})
+    coord = FakeCoord(running=True, fail=False)
+    rc = run_once(
+        {"HUE_CA_BUNDLE_PATH": "/b", "HUE_CA_STATE_PATH": "/state.json"},
+        fs=fs,
+        coordinator=coord,
+        read_ca=lambda _p: CA,
+    )
+    assert rc == 0
+    assert coord.restarted is True
+    assert load_pending(fs, "/state.json") is None  # cleared on success
