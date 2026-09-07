@@ -263,9 +263,9 @@ def reconcile(
         # the marker->append->restart window is always recoverable. A failed
         # write here is only warned — on a first append the reload is definitely
         # owed and there's no prior marker to loop on, so the restart must still
-        # be attempted (issue #96 round 1). But if the marker did NOT persist and
-        # the restart then fails, nothing on disk can drive a retry — we surface
-        # that via marker_persisted so run_once can flag it (round 3).
+        # be attempted. But if the marker did NOT persist and the restart then
+        # fails, nothing on disk can drive a retry — we surface that via
+        # marker_persisted so run_once can flag it.
         marker_persisted = _save_marker(fs, state_path, PendingReload(path, want_fp, now))
         if not marker_persisted:
             _LOG.warning(
