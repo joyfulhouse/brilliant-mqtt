@@ -133,6 +133,33 @@ def test_run_once_returns_zero_when_restart_fails_and_marks_pending() -> None:
     assert load_pending(fs, "/state.json") is not None  # reload owed, persisted
 
 
+def test_run_once_survives_unreadable_state_file() -> None:
+    # An OSError reading an existing state file must not crash run_once or be
+    # misdiagnosed as a bundle-write failure: rc == 0 and the reload is requested.
+    class ReadFailFS(FakeFS):
+        def __init__(
+            self, exists_map: dict[str, bool], files: dict[str, str], *, fail_read: str
+        ) -> None:
+            super().__init__(exists_map, files)
+            self._fail_read = fail_read
+
+        def read_text(self, path: str) -> str:
+            if path == self._fail_read:
+                raise OSError(5, "EIO")
+            return super().read_text(path)
+
+    fs = ReadFailFS({"/b": True, "/state.json": True}, {"/b": CA}, fail_read="/state.json")
+    coord = FakeCoord(running=True)
+    rc = run_once(
+        {"HUE_CA_BUNDLE_PATH": "/b", "HUE_CA_STATE_PATH": "/state.json"},
+        fs=fs,
+        coordinator=coord,
+        read_ca=lambda _p: CA,
+    )
+    assert rc == 0
+    assert coord.attempts == 1
+
+
 def test_run_once_completes_reload_and_clears_pending_when_host_running() -> None:
     # Cert absent, coordinator running, restart succeeds -> reload confirmed,
     # marker cleared, exit 0. Proves state_path threads through run_once.

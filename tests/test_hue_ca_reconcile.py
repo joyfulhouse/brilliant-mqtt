@@ -126,6 +126,40 @@ class RaisingFS(FakeFS):
         super().write_text(path, text)
 
 
+class ReadFailFS(FakeFS):
+    """FakeFS whose read_text raises OSError for one chosen path — models EIO /
+    EACCES on an *existing* state file (exists() still True)."""
+
+    def __init__(
+        self,
+        files: dict[str, str],
+        globs: dict[tuple[str, str], str | None],
+        *,
+        fail_read: str,
+    ) -> None:
+        super().__init__(files, globs)
+        self._fail_read = fail_read
+
+    def read_text(self, path: str) -> str:
+        if path == self._fail_read:
+            raise OSError(5, "EIO")
+        return super().read_text(path)
+
+
+class UnwritableFS(FakeFS):
+    """FakeFS whose write_text always raises once `raising` is set — models a
+    persistently read-only/full state dir (EROFS/ENOSPC on /var)."""
+
+    def __init__(self, files: dict[str, str], globs: dict[tuple[str, str], str | None]) -> None:
+        super().__init__(files, globs)
+        self.raising = False
+
+    def write_text(self, path: str, text: str) -> None:
+        if self.raising:
+            raise OSError(30, "EROFS")
+        super().write_text(path, text)
+
+
 def test_fingerprint_matches_across_rewrapped_pem() -> None:
     assert cert_fingerprint(CA_A) == cert_fingerprint(CA_A_REWRAPPED)
     assert cert_fingerprint(CA_A) != cert_fingerprint(CA_B)
@@ -488,15 +522,14 @@ def test_interruption_in_append_marker_window_is_retried_by_fresh_run() -> None:
     assert load_pending(fs, STATE) is None  # cleared after the reload confirmed
 
 
-def test_state_write_failure_does_not_skip_restart_and_fresh_run_retries() -> None:
-    # A reload is genuinely owed (marker present). The re-stamp write hits a
-    # read-only/full /var (OSError); the restart must still be attempted, and the
-    # surviving marker lets a fresh run retry — never a stranded stale trust.
-    fs = RaisingFS({"/b": CA_B + CA_A}, {})
-    save_pending(fs, STATE, PendingReload("/b", cert_fingerprint(CA_A), last_attempt_at=0.0))
-    coord = FakeCoord(running=True, fail_first=1)  # restart fails this run
-
-    fs.raise_next = OSError("read-only /var")
+def test_state_write_failure_on_first_append_does_not_skip_restart() -> None:
+    # First append (cert absent, coordinator running): the pre-append marker write
+    # hits a read-only/full /var (OSError). The reload is definitely owed and
+    # there's no prior marker to loop on, so the restart MUST still be attempted
+    # (round 1 finding #2 stands for the first-append path).
+    fs = RaisingFS({"/b": CA_B}, {})
+    coord = FakeCoord(running=True)
+    fs.raise_next = OSError("read-only /var")  # fails the pre-append marker save
     out = reconcile(  # must NOT raise: the state-write OSError is swallowed
         fs,
         coord,
@@ -505,24 +538,10 @@ def test_state_write_failure_does_not_skip_restart_and_fresh_run_retries() -> No
         ca_pem=CA_A,
         state_path=STATE,
         min_retry_interval_s=INTERVAL,
-        now=10_000.0,
+        now=1000.0,
     )
-    assert coord.attempts == 1  # restart still attempted despite the failed write
-    assert out.reload_pending is True
-    assert load_pending(fs, STATE) is not None  # old marker survived
-
-    out = reconcile(  # fresh run: writes work now, retry completes
-        fs,
-        coord,
-        bundle_path="/b",
-        site_packages_root="/sp",
-        ca_pem=CA_A,
-        state_path=STATE,
-        min_retry_interval_s=INTERVAL,
-        now=20_000.0,
-    )
-    assert coord.attempts == 2 and coord.successes == 1
-    assert load_pending(fs, STATE) is None
+    assert out.appended is True
+    assert coord.attempts == 1 and coord.successes == 1  # restart still attempted
 
 
 @pytest.mark.parametrize("torn", ["", "garbage-not-json", '{"bundle_path": "/b"}'])
@@ -606,3 +625,91 @@ def test_matching_marker_but_coordinator_stopped_clears_marker() -> None:
     assert coord.attempts == 0
     assert out.reload_pending is False
     assert load_pending(fs, STATE) is None  # stale marker cleared
+
+
+# --- tribunal round 2: read crash, restart storm, torn non-host, orphaned path --
+
+
+def test_unreadable_state_file_does_not_crash_and_requests_reload() -> None:
+    # finding #1: an OSError reading an EXISTING marker (EIO/EACCES) must not
+    # crash the oneshot; it is treated as torn -> reload requested.
+    fs = ReadFailFS({"/b": CA_B + CA_A, STATE: "x"}, {}, fail_read=STATE)
+    coord = FakeCoord(running=True)
+    out = reconcile(  # must NOT raise
+        fs,
+        coord,
+        bundle_path="/b",
+        site_packages_root="/sp",
+        ca_pem=CA_A,
+        state_path=STATE,
+        min_retry_interval_s=INTERVAL,
+        now=5000.0,
+    )
+    assert coord.attempts == 1
+    assert out.coordinator_restarted is True
+
+
+@pytest.mark.parametrize("seed_torn", [None, "", "garbage-not-json"])
+def test_no_restart_storm_when_state_dir_unwritable(seed_torn: str | None) -> None:
+    # finding #2: a persistently unwritable state dir with an existing marker
+    # (valid or torn) for the current generation must NOT restart on every tick.
+    fs = UnwritableFS({"/b": CA_B + CA_A}, {})
+    if seed_torn is None:
+        save_pending(fs, STATE, PendingReload("/b", cert_fingerprint(CA_A), last_attempt_at=0.0))
+    else:
+        fs.files[STATE] = seed_torn  # torn marker seeded directly
+    fs.raising = True  # /var now read-only for every write
+    coord = FakeCoord(running=True)
+    for i in range(4):  # four ticks, well past the interval each time
+        reconcile(
+            fs,
+            coord,
+            bundle_path="/b",
+            site_packages_root="/sp",
+            ca_pem=CA_A,
+            state_path=STATE,
+            min_retry_interval_s=INTERVAL,
+            now=900.0 * (i + 1),
+        )
+    assert coord.successes <= 1  # no restart storm
+
+
+def test_torn_marker_on_non_host_is_cleared_not_warned_forever() -> None:
+    # finding #3: a torn marker on a non-host (coordinator not running) owes no
+    # reload — clear it so it doesn't warn every tick forever.
+    fs = FakeFS({"/b": CA_B + CA_A, STATE: "garbage"}, {})
+    coord = FakeCoord(running=False)
+    out = reconcile(
+        fs,
+        coord,
+        bundle_path="/b",
+        site_packages_root="/sp",
+        ca_pem=CA_A,
+        state_path=STATE,
+        min_retry_interval_s=INTERVAL,
+        now=5000.0,
+    )
+    assert out.reload_pending is False
+    assert coord.attempts == 0
+    assert fs.files[STATE] == "{}"  # torn marker cleared to the sentinel
+
+
+def test_marker_with_stale_bundle_path_but_matching_fp_is_not_orphaned() -> None:
+    # finding #5: a marker whose bundle_path differs from the path resolved this
+    # run but whose fingerprint matches the CA in the bundle (operator changed
+    # HUE_CA_BUNDLE_PATH / glob flip) must not be a permanent orphan.
+    fs = FakeFS({"/b": CA_B + CA_A}, {})
+    save_pending(fs, STATE, PendingReload("/old", cert_fingerprint(CA_A), last_attempt_at=0.0))
+    coord = FakeCoord(running=True)
+    reconcile(
+        fs,
+        coord,
+        bundle_path="/b",
+        site_packages_root="/sp",
+        ca_pem=CA_A,
+        state_path=STATE,
+        min_retry_interval_s=INTERVAL,
+        now=10_000.0,
+    )
+    assert coord.attempts == 1  # reload owed for the CA now present
+    assert load_pending(fs, STATE) is None  # marker cleared after the reload

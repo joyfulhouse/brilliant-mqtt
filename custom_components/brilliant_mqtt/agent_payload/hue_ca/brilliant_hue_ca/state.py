@@ -31,9 +31,12 @@ class PendingReload:
 def load_pending(fs: FileSystem, state_path: str) -> PendingReload | None:
     """Return the persisted pending-reload marker, or None when none is owed.
 
-    Anything that isn't a well-formed marker — missing file, invalid JSON, a
-    non-object, or missing/mis-typed fields — is reported as "no pending"
-    rather than raised, so a garbled state file can never crash the oneshot."""
+    Anything that isn't a well-formed marker — missing file, an unreadable file
+    (OSError, e.g. EIO/EACCES on flash), invalid JSON, a non-object, or
+    missing/mis-typed fields — is reported as "no pending" rather than raised, so
+    a garbled or unreadable state file can never crash the oneshot. (An
+    unreadable but present file is separately detected as "torn" by reconcile, so
+    it is not mistaken for a clean no-op.)"""
     if not fs.exists(state_path):
         return None
     try:
@@ -43,7 +46,7 @@ def load_pending(fs: FileSystem, state_path: str) -> PendingReload | None:
             fingerprint=str(raw["fingerprint"]),
             last_attempt_at=float(raw["last_attempt_at"]),
         )
-    except (ValueError, TypeError, KeyError):
+    except (OSError, ValueError, TypeError, KeyError):
         return None
 
 

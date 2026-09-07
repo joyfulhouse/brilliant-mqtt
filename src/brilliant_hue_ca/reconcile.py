@@ -86,18 +86,15 @@ def _appendable(ca_pem: str) -> str:
     return ca_pem if ca_pem.startswith("\n") else "\n" + ca_pem
 
 
-def _save_marker(fs: FileSystem, state_path: str, pending: PendingReload) -> None:
-    """Persist the owed-reload marker, swallowing a state-write OSError so a
-    read-only or full /var can never abort the reload it guards — the restart is
-    still attempted this run (issue #96)."""
+def _save_marker(fs: FileSystem, state_path: str, pending: PendingReload) -> bool:
+    """Persist the owed-reload marker. Returns True on success, False on OSError
+    (a read-only/full /var). Never raises, so a state-write failure can't crash
+    the oneshot; the caller decides whether a failure is fatal to this pass."""
     try:
         save_pending(fs, state_path, pending)
     except OSError:
-        _LOG.warning(
-            "could not persist pending-reload marker at %s; reload still attempted",
-            state_path,
-            exc_info=True,
-        )
+        return False
+    return True
 
 
 def _clear_marker(fs: FileSystem, state_path: str) -> None:
@@ -139,6 +136,31 @@ def _marker_is_torn(fs: FileSystem, state_path: str) -> bool:
         return True
 
 
+def _request_reload(
+    fs: FileSystem,
+    coordinator: Coordinator,
+    *,
+    path: str,
+    want_fp: str,
+    state_path: str,
+    now: float,
+) -> Outcome:
+    """Re-stamp the marker for this attempt, then restart. If the re-stamp WRITE
+    fails, we must NOT restart: a restart we can't record would repeat every tick
+    (a restart storm), so we hold the reload for a writable tick instead. Only for
+    the cert-present retry paths — the first append restarts even on a save
+    failure (no prior marker to loop on)."""
+    if not _save_marker(fs, state_path, PendingReload(path, want_fp, now)):
+        _LOG.error(
+            "cannot record pending-reload marker at %s (state dir unwritable); "
+            "holding reload to avoid a restart storm",
+            state_path,
+        )
+        return Outcome(True, False, False, path, reload_pending=True)
+    restarted = _restart_and_clear(fs, coordinator, state_path)
+    return Outcome(True, False, restarted, path, reload_pending=not restarted)
+
+
 def _reconcile_present(
     fs: FileSystem,
     coordinator: Coordinator,
@@ -153,8 +175,12 @@ def _reconcile_present(
     reload for this generation is still owed (issue #96)."""
     pending = load_pending(fs, state_path)
     if pending is not None:
-        if pending.bundle_path != path or pending.fingerprint != want_fp:
+        if pending.fingerprint != want_fp:
             return Outcome(True, False, False, path)  # marker is for another CA
+        # Same CA (its fingerprint is in the bundle). The stored bundle_path may
+        # differ from the path resolved this run (operator changed
+        # HUE_CA_BUNDLE_PATH, or a glob resolved differently) — the reload is
+        # still owed for the CA now present; the re-stamp migrates it to `path`.
         if not coordinator.is_running():
             # Coordinator gone / not the Hue host: it owes no reload. Drop the
             # stale marker so it can't fire a spurious restart if the vassal
@@ -164,18 +190,21 @@ def _reconcile_present(
         elapsed = now - pending.last_attempt_at
         if 0 <= elapsed < min_retry_interval_s:
             return Outcome(True, False, False, path, reload_pending=True)  # paced
-        _save_marker(fs, state_path, PendingReload(path, want_fp, now))  # re-stamp
-        restarted = _restart_and_clear(fs, coordinator, state_path)
-        return Outcome(True, False, restarted, path, reload_pending=not restarted)
+        return _request_reload(
+            fs, coordinator, path=path, want_fp=want_fp, state_path=state_path, now=now
+        )
     if _marker_is_torn(fs, state_path):
         # A torn marker while the cert is already present may hide an owed reload
         # — do not treat it as a clean no-op.
         _LOG.warning("pending-reload marker at %s is unreadable; a reload may be owed", state_path)
         if not coordinator.is_running():
-            return Outcome(True, False, False, path, reload_pending=True)
-        _save_marker(fs, state_path, PendingReload(path, want_fp, now))
-        restarted = _restart_and_clear(fs, coordinator, state_path)
-        return Outcome(True, False, restarted, path, reload_pending=not restarted)
+            # Non-host owes no reload: clear the torn marker so it stops warning
+            # every tick (consistent with the valid-marker non-host rule above).
+            _clear_marker(fs, state_path)
+            return Outcome(True, False, False, path)
+        return _request_reload(
+            fs, coordinator, path=path, want_fp=want_fp, state_path=state_path, now=now
+        )
     return Outcome(True, False, False, path)  # healthy steady state
 
 
@@ -213,10 +242,16 @@ def reconcile(
         )
 
     running = coordinator.is_running()
-    if running:
+    if running and not _save_marker(fs, state_path, PendingReload(path, want_fp, now)):
         # Reload will be owed: persist the marker BEFORE the append so a kill in
-        # the marker->append->restart window is always recoverable.
-        _save_marker(fs, state_path, PendingReload(path, want_fp, now))
+        # the marker->append->restart window is always recoverable. A failed
+        # write here is only warned — on a first append the reload is definitely
+        # owed and there's no prior marker to loop on, so the restart must still
+        # be attempted (issue #96 round 1).
+        _LOG.warning(
+            "could not persist pending-reload marker at %s; reload still attempted",
+            state_path,
+        )
     fs.append_text(path, _appendable(ca_pem))
     if not running:
         # Not the Hue host: no coordinator to reload, so nothing is owed and no

@@ -1,3 +1,5 @@
+import pytest
+
 from brilliant_hue_ca.config import Config, load_config
 
 
@@ -14,6 +16,14 @@ def test_load_config_defaults() -> None:
 
 def test_min_retry_interval_invalid_falls_back_to_default() -> None:
     cfg = load_config({"HUE_CA_MIN_RETRY_INTERVAL_S": "not-a-number"})
+    assert cfg.min_retry_interval_s == 300.0
+
+
+@pytest.mark.parametrize("bad", ["inf", "-inf", "nan", "-5", "-0.1"])
+def test_min_retry_interval_non_finite_or_negative_falls_back(bad: str) -> None:
+    # nan/negative would defeat pacing (retry every tick); inf would pace the
+    # reload away forever. All must fall back to the safe default.
+    cfg = load_config({"HUE_CA_MIN_RETRY_INTERVAL_S": bad})
     assert cfg.min_retry_interval_s == 300.0
 
 

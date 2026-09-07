@@ -34,6 +34,19 @@ def test_load_missing_file_is_no_pending() -> None:
     assert load_pending(fs, "/state.json") is None
 
 
+def test_load_unreadable_existing_file_is_no_pending_not_fatal() -> None:
+    # An OSError reading an EXISTING state file (EIO/EACCES on flash) must be
+    # reported as "no pending" rather than raised, so it can never crash the
+    # oneshot (reconcile separately detects it as torn -> reload owed).
+    class BoomFS(FakeFS):
+        def read_text(self, path: str) -> str:
+            raise OSError(5, "EIO")
+
+    fs = BoomFS()
+    fs.files["/state.json"] = "present-but-unreadable"  # exists() True
+    assert load_pending(fs, "/state.json") is None
+
+
 def test_save_then_load_round_trips() -> None:
     fs = FakeFS()
     pending = PendingReload(bundle_path="/b", fingerprint="abc123", last_attempt_at=1000.0)

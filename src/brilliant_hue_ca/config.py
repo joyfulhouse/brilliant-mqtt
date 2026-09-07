@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -25,9 +26,14 @@ def load_config(environ: Mapping[str, str]) -> Config:
 
     def f(key: str, default: float) -> float:
         try:
-            return float(environ[key])
+            v = float(environ[key])
         except (KeyError, ValueError):
             return default
+        # Reject nan/inf/negatives: nan or a negative defeats pacing (retry every
+        # tick), inf paces the reload away forever. Fall back to the safe default.
+        if not math.isfinite(v) or v < 0:
+            return default
+        return v
 
     return Config(
         ca_cert_path=s("HUE_CA_CERT_PATH", "/var/brilliant-hue-ca/injected-ca.pem"),
