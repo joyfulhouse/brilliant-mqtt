@@ -18,10 +18,10 @@ class FakeGuard:
         self.ok = ok
         self.recorded: list[float] = []
 
-    def can_reboot(self, now: float) -> bool:
+    def can_request(self, now: float) -> bool:
         return self.ok
 
-    def record(self, now: float) -> None:
+    def record_request(self, now: float) -> None:
         self.recorded.append(now)
 
 
@@ -32,20 +32,25 @@ class FlappingGuard:
     def __init__(self, answers: list[bool]) -> None:
         self.answers = list(answers)
         self.recorded: list[float] = []
+        self.requested = False
 
-    def can_reboot(self, now: float) -> bool:
+    def can_request(self, now: float) -> bool:
+        if self.requested:
+            return False
         return self.answers.pop(0) if self.answers else True
 
-    def record(self, now: float) -> None:
+    def record_request(self, now: float) -> None:
         self.recorded.append(now)
+        self.requested = True
 
 
 class FakeRecovery:
     def __init__(self) -> None:
         self.calls: list[str] = []
 
-    def gpio_reset_and_reboot(self) -> None:
+    def gpio_reset_and_reboot(self) -> int:
         self.calls.append("reboot")
+        return 0
 
     def soft_reconnect(self) -> None:
         self.calls.append("soft")
@@ -63,7 +68,7 @@ def test_reboot_blocked_when_guard_denies(caplog: pytest.LogCaptureFixture) -> N
     """handle() acts on the eligibility passed in (the ladder's own guard read this
     poll), not a second independent read that could desync.  An ineligible reboot is
     never silent — it logs the blocked path and does nothing (issue #91)."""
-    g, rec = FakeGuard(True), FakeRecovery()  # guard.can_reboot is not consulted here
+    g, rec = FakeGuard(True), FakeRecovery()  # guard.can_request is not consulted here
     with caplog.at_level(logging.ERROR, logger="brilliant_wifi_watchdog"):
         run.handle(
             Action.GPIO_RESET_REBOOT, guard=g, now=0.0, recovery_mod=rec, reboot_eligible=False
@@ -88,14 +93,15 @@ def test_reboot_runs_and_records_when_allowed() -> None:
     order: list[str] = []
 
     class TrackingGuard(FakeGuard):
-        def record(self, now: float) -> None:
-            super().record(now)
+        def record_request(self, now: float) -> None:
+            super().record_request(now)
             order.append("record")
 
     class TrackingRecovery(FakeRecovery):
-        def gpio_reset_and_reboot(self) -> None:
-            super().gpio_reset_and_reboot()
+        def gpio_reset_and_reboot(self) -> int:
+            result = super().gpio_reset_and_reboot()
             order.append("reboot")
+            return result
 
     g, rec = TrackingGuard(True), TrackingRecovery()
     run.handle(Action.GPIO_RESET_REBOOT, guard=g, now=5.0, recovery_mod=rec, reboot_eligible=True)
@@ -136,12 +142,10 @@ def test_reboot_not_lost_when_guard_read_would_flap() -> None:
     rec, lad = FakeRecovery(), Ladder(Thresholds())
     for i in range(60):
         wall = 30.0 * i
-        eligible = g.can_reboot(wall)  # the ONLY read this poll
+        eligible = g.can_request(wall)  # the ONLY read this poll
         action = lad.observe(gateway_up=False, now=wall, reboot_eligible=eligible)
         if action != Action.NONE:
             run.handle(action, guard=g, now=wall, recovery_mod=rec, reboot_eligible=eligible)
-        if action == Action.GPIO_RESET_REBOOT:
-            break  # a successful request replaces the running process
     assert rec.calls.count("reboot") == 1  # fired once, never lost
     assert g.recorded == [360.0]  # and recorded against the cap
 
@@ -210,6 +214,9 @@ class SpyLadder:
         self.eligibility.append(reboot_eligible)
         return self._action
 
+    def reboot_request_returned(self) -> None:
+        pass
+
 
 @pytest.mark.parametrize(
     "broker_result",
@@ -258,6 +265,64 @@ def test_poll_once_skips_broker_diagnostic_when_unset(monkeypatch: pytest.Monkey
     run._poll_once(cfg, guard=FakeGuard(True), ladder=SpyLadder(Action.NONE))
 
 
+def _run_reboot_schedule(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    times: list[float],
+    cooldown: float,
+) -> list[float]:
+    cfg = run.load_config(
+        {
+            "WIFI_WATCHDOG_GATEWAY": "192.0.2.1",
+            "WIFI_WATCHDOG_REBOOT_COOLDOWN": str(cooldown),
+        }
+    )
+    guard = RebootGuard(str(tmp_path / "guard"), cfg.policy, read_boot_id=lambda: "boot-a")
+    ladder = Ladder(cfg.thresholds)
+    now = [0.0]
+    requests: list[float] = []
+
+    monkeypatch.setattr(probe, "gateway_probe", lambda gateway: (gateway, probe.TcpProbe.CLOSED))
+    monkeypatch.setattr(run.recovery, "soft_reconnect", lambda: None)
+    monkeypatch.setattr(run.recovery, "restart_services", lambda: None)
+
+    def request_reboot() -> int:
+        requests.append(now[0])
+        return bounded.TIMEOUT_RC
+
+    monkeypatch.setattr(run.recovery, "gpio_reset_and_reboot", request_reboot)
+    monkeypatch.setattr(run, "time", SimpleNamespace(time=lambda: now[0], monotonic=lambda: now[0]))
+    for value in times:
+        now[0] = value
+        run._poll_once(cfg, guard=guard, ladder=ladder)
+    return requests
+
+
+def test_sparse_polling_retries_at_the_next_eligible_sample(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests = _run_reboot_schedule(
+        tmp_path,
+        monkeypatch,
+        times=[0.0, 30.0, 60.0, 90.0, 180.0, 360.0, 4000.0],
+        cooldown=3600.0,
+    )
+    assert requests == [360.0, 4000.0]
+
+
+def test_zero_cooldown_retries_until_the_attempt_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests = _run_reboot_schedule(
+        tmp_path,
+        monkeypatch,
+        times=[float(value) for value in range(0, 451, 30)],
+        cooldown=0.0,
+    )
+    assert requests == [360.0, 390.0, 420.0]
+
+
 @pytest.mark.parametrize(
     "gateway_env",
     [{}, {"WIFI_WATCHDOG_GATEWAY": "192.0.2.1"}],
@@ -294,10 +359,8 @@ def test_timed_out_gateway_probes_do_not_authorize_wifi_reboot(
 def test_completed_gateway_failure_still_escalates(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    gateway_probe = getattr(probe, "gateway_probe", None)
-    assert callable(gateway_probe)
     completed_failure = bounded.Completed(1, "", False)
-    assert gateway_probe("192.0.2.1", run=lambda argv, capture: completed_failure) == (
+    assert probe.gateway_probe("192.0.2.1", run=lambda argv, capture: completed_failure) == (
         "192.0.2.1",
         probe.TcpProbe.CLOSED,
     )
@@ -321,11 +384,9 @@ def test_completed_gateway_failure_still_escalates(
 def test_completed_gateway_success_resets_the_outage(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    gateway_probe = getattr(probe, "gateway_probe", None)
-    assert callable(gateway_probe)
     completed_failure = bounded.Completed(1, "", False)
     completed_success = bounded.Completed(0, "", False)
-    assert gateway_probe("192.0.2.1", run=lambda argv, capture: completed_success) == (
+    assert probe.gateway_probe("192.0.2.1", run=lambda argv, capture: completed_success) == (
         "192.0.2.1",
         probe.TcpProbe.OPEN,
     )

@@ -16,7 +16,6 @@ the defect lives in how the ladder and the guard are wired together.
 
 from __future__ import annotations
 
-import inspect
 import json
 from pathlib import Path
 
@@ -82,17 +81,21 @@ def _stamps(path: Path) -> list[float]:
 
 def test_deferred_reboot_rearms_after_cooldown_expires(tmp_path: Path) -> None:
     state = tmp_path / "s.json"
-    guard = RebootGuard(str(state), P)
+    boot_id = ["boot-a"]
+    guard = RebootGuard(str(state), P, read_boot_id=lambda: boot_id[0])
     guard.record(0.0)  # a previous reboot → cooldown blocks reboots until t>=3600
     ladder, rec = Ladder(T), FakeRecovery()
 
     log: list[tuple[float, Action, bool]] = []
+    rebooted = False
     t = 100.0  # continuous outage begins at t=100 (issue's numbers)
     while t <= 25000.0:  # poll well past the 3600s cooldown
-        action, eligible = _poll(ladder, guard, rec, gateway_up=False, t=t)
+        action, eligible = _poll(ladder, guard, rec, gateway_up=rebooted, t=t)
         log.append((t, action, eligible))
         if action == Action.GPIO_RESET_REBOOT:
-            break
+            boot_id[0] = "boot-b"
+            ladder = Ladder(T)  # the new boot starts a fresh daemon process
+            rebooted = True
         t += 30.0
 
     escalations = [(ts, e) for ts, a, e in log if a == Action.ESCALATE_NOTIFY]
@@ -104,16 +107,16 @@ def test_deferred_reboot_rearms_after_cooldown_expires(tmp_path: Path) -> None:
     # The ladder never returned a reboot while the guard blocked it (it defends
     # the guard: handle's own can_reboot check is therefore never the blocker).
     assert all(eligible is True for _, eligible in reboots)
-    # Exactly one request, only after cooldown expired. A real successful reboot
-    # terminates this process, so this #91 test stops at the dispatch boundary.
+    # Exactly one request, only after cooldown expired. Polling continues after a
+    # real boot transition and confirmed recovery without re-firing or notifying.
     assert len(reboots) == 1
     reboot_t, reboot_eligible = reboots[0]
     assert reboot_t >= 3600.0
     assert reboot_eligible is True
     assert rec.calls == ["soft", "restart", "reboot"]
-    # The same-boot request reserves the cooldown without spending the cap.
-    assert _stamps(state) == [0.0]
-    assert guard.can_reboot(reboot_t + 30.0) is True
+    assert _stamps(state) == [0.0, reboot_t]
+    assert not Path(f"{state}.request").exists()
+    assert guard.can_reboot(reboot_t + 30.0) is False
     assert guard.can_request(reboot_t + 30.0) is False
 
 
@@ -124,18 +127,22 @@ def test_deferred_reboot_rearms_after_cooldown_expires(tmp_path: Path) -> None:
 
 def test_deferred_reboot_rearms_after_cap_window_expires(tmp_path: Path) -> None:
     state = tmp_path / "s.json"
-    guard = RebootGuard(str(state), P)
+    boot_id = ["boot-a"]
+    guard = RebootGuard(str(state), P, read_boot_id=lambda: boot_id[0])
     for stamp in (0.0, 3601.0, 7202.0):  # fill the cap, cooldown-spaced
         guard.record(stamp)
     ladder, rec = Ladder(T), FakeRecovery()
 
     log: list[tuple[float, Action, bool]] = []
+    rebooted = False
     t = 8000.0  # outage begins while the cap is full
     while t <= 30000.0:  # poll past the 21600s rolling window
-        action, eligible = _poll(ladder, guard, rec, gateway_up=False, t=t)
+        action, eligible = _poll(ladder, guard, rec, gateway_up=rebooted, t=t)
         log.append((t, action, eligible))
         if action == Action.GPIO_RESET_REBOOT:
-            break
+            boot_id[0] = "boot-b"
+            ladder = Ladder(T)
+            rebooted = True
         t += 30.0
 
     escalations = [(ts, e) for ts, a, e in log if a == Action.ESCALATE_NOTIFY]
@@ -147,7 +154,10 @@ def test_deferred_reboot_rearms_after_cap_window_expires(tmp_path: Path) -> None
     assert all(eligible is True for _, eligible in reboots)
     # Re-armed once the oldest stamp aged out and reopened the cap.
     assert len(reboots) == 1
-    assert reboots[0][1] is True
+    reboot_t, reboot_eligible = reboots[0]
+    assert reboot_eligible is True
+    assert _stamps(state) == [3601.0, 7202.0, reboot_t]
+    assert not Path(f"{state}.request").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -207,15 +217,16 @@ def test_reboot_without_recovery_does_not_refire_or_loop(tmp_path: Path) -> None
     # It was eligible the moment it hit the threshold, so it fired without deferring.
     assert len(reboots) == 1
     assert escalations == []
-    # The request reservation blocks every following poll without spending the cap,
-    # and the ladder neither re-fires nor loop-notifies during the cooldown.
+    # The recorded attempt blocks every following poll, and the ladder neither
+    # re-fires nor loop-notifies during the cooldown.
     after = [(a, e) for ts, a, e in log if ts > reboots[0]]
     assert all(e is False for _, e in after)  # fresh cooldown blocks the guard
     assert all(a == Action.NONE for a, _ in after)  # no re-fire, no notify loop
+    assert _stamps(tmp_path / "s.json") == reboots
 
 
 @pytest.mark.parametrize("reboot_rc", [bounded.TIMEOUT_RC, 0], ids=["failed", "unconfirmed"])
-def test_failed_or_unconfirmed_reboot_request_retries_without_spending_cap(
+def test_failed_or_unconfirmed_reboot_request_retries_within_cap(
     tmp_path: Path, reboot_rc: int
 ) -> None:
     guard = RebootGuard(str(tmp_path / "guard"), P)
@@ -249,8 +260,7 @@ def test_failed_or_unconfirmed_reboot_request_retries_without_spending_cap(
 
     for now in range(0, 25001, 30):
         clock[0] = float(now)
-        request_check = getattr(guard, "can_request", guard.can_reboot)
-        eligible = request_check(now)
+        eligible = guard.can_request(now)
         action = ladder.observe(gateway_up=False, now=now, reboot_eligible=eligible)
         if action != Action.NONE:
             outcomes.append(
@@ -265,32 +275,30 @@ def test_failed_or_unconfirmed_reboot_request_retries_without_spending_cap(
 
     request_times = [when for when, argv in calls if argv == ["systemctl", "reboot"]]
     assert writes, "GPIO reset path was exercised with all writes intercepted"
-    assert guard.can_reboot(25000) is True
     assert len(request_times) > 1, f"reboot request was stranded: {calls}"
     assert all(
         later - earlier >= P.cooldown
         for earlier, later in zip(request_times, request_times[1:], strict=False)
     )
+    assert all(
+        sum(now - earlier <= P.window for earlier in request_times if earlier <= now) <= P.cap
+        for now in request_times
+    ), request_times
     assert [outcome for outcome in outcomes if outcome is not None] == [reboot_rc] * len(calls)
 
 
-def test_request_counts_against_guard_only_after_boot_id_changes(tmp_path: Path) -> None:
-    assert "read_boot_id" in inspect.signature(RebootGuard).parameters
+def test_request_attempt_is_counted_once_before_and_after_boot_change(tmp_path: Path) -> None:
     state = tmp_path / "guard"
     boot_id = ["boot-a"]
     guard = RebootGuard(str(state), P, read_boot_id=lambda: boot_id[0])
 
     guard.record_request(100.0)
-    assert guard.can_reboot(101.0) is True
+    assert guard.can_reboot(101.0) is False
     assert guard.can_request(101.0) is False
+    assert _stamps(state) == [100.0]
 
     boot_id[0] = "boot-b"
     restarted = RebootGuard(str(state), P, read_boot_id=lambda: boot_id[0])
     assert restarted.can_reboot(101.0) is False
     assert _stamps(state) == [100.0]
-
-    fallback_state = tmp_path / "fallback"
-    fallback = RebootGuard(str(fallback_state), P, read_boot_id=lambda: None)
-    fallback.record_request(200.0)
-    assert fallback.can_reboot(201.0) is False
-    assert _stamps(fallback_state) == [200.0]
+    assert not Path(f"{state}.request").exists()
