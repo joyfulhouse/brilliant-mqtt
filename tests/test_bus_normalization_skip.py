@@ -45,9 +45,10 @@ class _RawVar:
 
 
 class _RawPeripheral:
-    """Duck-typed bus Peripheral."""
+    """Duck-typed bus Peripheral (``name`` is deliberately loosely typed: the
+    real bus delivers a str, but a mutable bytearray name is exercised too)."""
 
-    def __init__(self, peripheral_type: int, name: str, variables: dict[str, _RawVar]) -> None:
+    def __init__(self, peripheral_type: int, name: object, variables: dict[str, _RawVar]) -> None:
         self.peripheral_type = peripheral_type
         self.name = name
         self.variables = variables
@@ -306,17 +307,19 @@ class TestArrivalSnapshotIsImmutable:
     the raw struct, which the panel library may mutate in place before delivery.
     """
 
-    async def test_value_mutated_after_dispatch_does_not_reach_the_consumer(
+    async def test_value_name_and_timestamp_survive_raw_mutation_after_dispatch(
         self,
     ) -> None:
         adapter = RpcBusAdapter()
         adapter._own_device_id = _OWN_DEVICE_ID
         started = asyncio.Event()
         release = asyncio.Event()
-        seen: list[str] = []
+        # (value, name, timestamp_ms) as each delivered device presents them.
+        seen: list[tuple[str, str, int | None]] = []
 
         async def consumer(device: BrilliantDevice) -> None:
-            seen.append(device.variables["on"].value)
+            var = device.variables["on"]
+            seen.append((var.value, device.name, var.timestamp_ms))
             if len(seen) == 1:
                 started.set()
                 await release.wait()
@@ -325,20 +328,170 @@ class TestArrivalSnapshotIsImmutable:
 
         # First push occupies the drain and blocks it.
         adapter._dispatch_raw_device(
-            _RawDevice(_OWN_DEVICE_ID, {"load": _RawPeripheral(27, "Load", {"on": _RawVar("1")})})
+            _RawDevice(
+                _OWN_DEVICE_ID,
+                {"load": _RawPeripheral(27, "First", {"on": _RawVar("1", timestamp=10)})},
+            )
         )
         await asyncio.wait_for(started.wait(), timeout=1.0)
 
-        # Second push: capture its raw variable, then MUTATE it in place after
-        # dispatch returns — exactly what the notification-fed mirror can do to a
-        # queued reference. Include a mutable bytearray to prove eager decoding.
-        mutable = _RawVar("2")
+        # Second push: a peripheral with a MUTABLE bytearray name (no display_name
+        # var, so the name resolves from it) and a mutable variable. Capture what
+        # the snapshot must preserve, then mutate every raw field in place / by
+        # reassignment after dispatch — exactly what the notification-fed mirror
+        # can do to a queued reference.
+        name = bytearray(b"alpha")
+        expected_name = str(name)
+        var = _RawVar("2", timestamp=111)
         adapter._dispatch_raw_device(
-            _RawDevice(_OWN_DEVICE_ID, {"load": _RawPeripheral(27, "Load", {"on": mutable})})
+            _RawDevice(_OWN_DEVICE_ID, {"load": _RawPeripheral(27, name, {"on": var})})
         )
-        mutable.value = bytearray(b"999")
+        var.value = bytearray(b"999")
+        var.timestamp = 222
+        name[:] = b"betaXX"
         release.set()
         await asyncio.gather(*adapter._pending_tasks)
 
-        # The consumer must see the value AS IT WAS AT DISPATCH, not the mutation.
-        assert seen == ["1", "2"]
+        # Every field must be AS IT WAS AT DISPATCH, not the post-dispatch mutation.
+        assert seen == [("1", "First", 10), ("2", expected_name, 111)]
+
+
+class TestSharedNormalizationAcrossConsumers:
+    """Fix A: a push delivered to several consumers is normalized once TOTAL.
+
+    Production registers BOTH the panel Bridge (coalescing) and the SceneBridge
+    (lossless) on the SAME own device. Deferring normalization to delivery must
+    not normalize each delivered peripheral once PER consumer (strictly more
+    than main, which shared one BrilliantDevice); the result is memoized on the
+    shared per-peripheral holder so it is built at most once and reused.
+    """
+
+    async def test_two_consumers_normalize_each_peripheral_once_total(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        counters = _install_counters(monkeypatch)
+        adapter = RpcBusAdapter()
+        adapter._own_device_id = _OWN_DEVICE_ID
+        coalescing_seen: list[str] = []
+        lossless_seen: list[str] = []
+
+        async def coalescing(device: BrilliantDevice) -> None:
+            coalescing_seen.append(device.peripheral_id)
+
+        async def lossless(device: BrilliantDevice) -> None:
+            lossless_seen.append(device.peripheral_id)
+
+        adapter.on_change(coalescing)  # panel-like (coalescing)
+        adapter.on_change(lossless, coalesce_pushes=False)  # scene-like (lossless)
+
+        adapter._dispatch_raw_device(_raw_snapshot(_OWN_DEVICE_ID, "push"))
+        await asyncio.gather(*adapter._pending_tasks)
+
+        # Both consumers received every peripheral...
+        assert len(coalescing_seen) == _N_PERIPHERALS
+        assert len(lossless_seen) == _N_PERIPHERALS
+        # ...but each distinct peripheral was normalized ONCE total, not per
+        # consumer (which would be 2 * _N_PERIPHERALS).
+        assert counters.normalizations == _N_PERIPHERALS
+        assert counters.variables == _N_PERIPHERALS * _N_VARIABLES
+
+
+class TestNormalizeFailureDoesNotKillDrain:
+    """Fix C: a normalize failure logs and skips that peripheral, exactly as
+    main's broad handler catch did — it must not kill the drain worker, drop the
+    peripheral's siblings, or strand queued snapshots.
+    """
+
+    async def test_normalize_error_skips_peripheral_and_delivers_siblings(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        adapter = RpcBusAdapter()
+        adapter._own_device_id = _OWN_DEVICE_ID
+        real_normalize = bus_mod.normalize_peripheral
+
+        def maybe_raise(device_id: str, peripheral_id: str, raw: Any) -> BrilliantDevice:
+            if peripheral_id == "p1":
+                raise RuntimeError("boom normalizing p1")
+            return real_normalize(device_id, peripheral_id, raw)
+
+        monkeypatch.setattr(bus_mod, "normalize_peripheral", maybe_raise)
+        seen: list[str] = []
+
+        async def consumer(device: BrilliantDevice) -> None:
+            seen.append(device.peripheral_id)
+
+        adapter.on_change(consumer, coalesce_pushes=False)
+        adapter._dispatch_raw_device(
+            _RawDevice(
+                _OWN_DEVICE_ID,
+                {
+                    "p0": _RawPeripheral(27, "P0", {"on": _RawVar("1")}),
+                    "p1": _RawPeripheral(27, "P1", {"on": _RawVar("1")}),
+                    "p2": _RawPeripheral(27, "P2", {"on": _RawVar("1")}),
+                },
+            )
+        )
+        results = await asyncio.gather(*adapter._pending_tasks, return_exceptions=True)
+
+        assert all(not isinstance(r, BaseException) for r in results)  # worker survived
+        assert seen == ["p0", "p2"]  # p1 skipped, siblings delivered
+
+
+class TestTimestampCoercion:
+    """Fix D: the raw timestamp is captured as an immutable scalar at snapshot,
+    preserving normalize's downstream branches exactly.
+    """
+
+    async def test_bool_timestamp_delivers_none_through_the_pipeline(self) -> None:
+        adapter = RpcBusAdapter()
+        adapter._own_device_id = _OWN_DEVICE_ID
+        seen: list[int | None] = []
+
+        async def consumer(device: BrilliantDevice) -> None:
+            seen.append(device.variables["on"].timestamp_ms)
+
+        adapter.on_change(consumer, coalesce_pushes=False)
+        adapter._dispatch_raw_device(
+            _RawDevice(
+                _OWN_DEVICE_ID,
+                {"load": _RawPeripheral(27, "L", {"on": _RawVar("1", timestamp=True)})},
+            )
+        )
+        await asyncio.gather(*adapter._pending_tasks)
+
+        assert seen == [None]  # the bool guard still fires end to end
+
+    def test_nonscalar_timestamp_is_coerced_to_none_at_snapshot(self) -> None:
+        raw = _RawPeripheral(27, "L", {"on": _RawVar("1", timestamp=[1, 2, 3])})
+        snapshot = bus_mod._snapshot_peripheral(raw)
+        # An arbitrary (mutable) timestamp object must not be retained by ref.
+        assert snapshot.variables["on"].timestamp is None
+
+
+class TestDeliveryTimeScopeGuard:
+    """Fix E3: the want_device pre-filter admits by device id at DISPATCH, but
+    Bridge._included must still guard DELIVERY — a push admitted while leader is
+    dropped if leadership is lost before it is delivered (withdraw window).
+    """
+
+    async def test_included_guards_delivery_after_leadership_lost(self) -> None:
+        adapter = RpcBusAdapter()
+        adapter._own_device_id = _OWN_DEVICE_ID
+        mqtt = FakeMqtt()
+        leader = _Leader(is_leader=True)
+        Bridge(
+            adapter,
+            mqtt,
+            "mesh",
+            include=lambda did: did == _MESH_DEVICE_ID and leader.is_leader,
+        )
+
+        # Admitted at dispatch (leader); _dispatch only SCHEDULES the drain.
+        adapter._dispatch_raw_device(_raw_snapshot(_MESH_DEVICE_ID, "leader"))
+        # Leadership lost before the scheduled drain delivers to _on_change.
+        leader.is_leader = False
+        await asyncio.gather(*adapter._pending_tasks)
+
+        # Bridge._included rejects at DELIVERY, so nothing is published — proving
+        # the pre-filter did not replace the delivery-time scope guard.
+        assert _mesh_state_publishes(mqtt) == []

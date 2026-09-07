@@ -20,8 +20,9 @@ import math
 import secrets
 import time
 from collections import deque
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any, NamedTuple
 
 from brilliant_mqtt.commands import VarSet
@@ -157,6 +158,36 @@ def _coerce_scalar(value: Any) -> Any:
     return str(value)
 
 
+def _coerce_timestamp(ts: Any) -> bool | int | float | None:
+    """Capture a raw variable timestamp as an immutable scalar (issue #98).
+
+    Only ``bool``/``int``/``float`` (all immutable) are retained; anything else
+    becomes ``None``. This preserves :func:`normalize_peripheral`'s downstream
+    branches EXACTLY — the ``bool`` guard still maps ``True``→``None``, ``int``
+    is kept, finite ``float`` is truncated, and a non-scalar object still lands
+    in the trailing ``None`` case — while ensuring no arbitrary (possibly
+    mutable) object is retained across the dispatch→drain boundary.
+    """
+    return ts if isinstance(ts, (bool, int, float)) else None
+
+
+def _coerce_name(raw_name: Any) -> str | bytes | None:
+    """Capture a raw peripheral name as an immutable value (issue #98).
+
+    ``str``/``bytes``/``None`` are already immutable and pass through unchanged,
+    so :func:`_resolve_name` sees the identical value. A ``bytearray`` is
+    MUTABLE (a name with no ``display_name`` var comes from the notification-fed
+    mirror, poc-findings §8b) and must not be retained: capture its exact
+    ``str()`` when truthy — which is precisely what ``_resolve_name`` would
+    render — and ``None`` when empty, so its truthiness (empty → the
+    peripheral-id fallback) is preserved too. Any other (possibly mutable) type
+    is captured the same way, matching ``_resolve_name``'s ``str()`` exactly.
+    """
+    if raw_name is None or isinstance(raw_name, (str, bytes)):
+        return raw_name
+    return str(raw_name) if raw_name else None
+
+
 class _VarSnapshot(NamedTuple):
     """Immutable, primitive-only capture of one raw bus Variable (issue #98).
 
@@ -169,22 +200,46 @@ class _VarSnapshot(NamedTuple):
 
     value: Any
     externally_settable: bool
-    timestamp: Any
+    timestamp: bool | int | float | None
 
 
 class _PeripheralSnapshot(NamedTuple):
     """Immutable, primitive-only capture of one raw bus Peripheral (issue #98).
 
     Duck-typed to :func:`normalize_peripheral`'s ``peripheral_type``/``name``/
-    ``variables`` reads. ``name`` is retained as-is: a Thrift ``string`` is an
-    immutable ``str`` (``binary`` an immutable ``bytes``); neither is a mutable
-    ``bytearray``, so retaining it is safe and preserves the exact name
-    resolution behaviour.
+    ``variables`` reads. Every field holds only immutable data — a coerced
+    ``name`` (:func:`_coerce_name`), coerced scalar variable values, and a
+    read-only ``variables`` view (:class:`~types.MappingProxyType`) — so a
+    single snapshot can be shared by reference across every admitted callback
+    and queued across the dispatch→drain await with nothing the notification-fed
+    mirror could mutate underneath it.
     """
 
     peripheral_type: int
-    name: Any
-    variables: dict[str, _VarSnapshot]
+    name: str | bytes | None
+    variables: Mapping[str, _VarSnapshot]
+
+
+class _PendingPeripheral:
+    """One peripheral's immutable snapshot plus a write-once normalized memo.
+
+    Shared by reference across every admitted callback for a push, so the
+    :class:`BrilliantDevice` is built AT MOST ONCE total and reused — exactly as
+    main shared one ``BrilliantDevice`` across callbacks — while a snapshot no
+    consumer ever delivers (superseded in a coalescing deque, or a standby scope
+    with no admitted callback) is still never normalized (issue #98). Only
+    ``normalized`` is ever written, once, at first delivery; the snapshot inputs
+    are read-only. A single memo slot is sufficient: a holder is created per push
+    and only ever normalized with that push's device id and its own
+    peripheral id.
+    """
+
+    __slots__ = ("peripheral_id", "snapshot", "normalized")
+
+    def __init__(self, peripheral_id: str, snapshot: _PeripheralSnapshot) -> None:
+        self.peripheral_id = peripheral_id
+        self.snapshot = snapshot
+        self.normalized: BrilliantDevice | None = None
 
 
 def _snapshot_peripheral(raw: Any) -> _PeripheralSnapshot:
@@ -192,21 +247,26 @@ def _snapshot_peripheral(raw: Any) -> _PeripheralSnapshot:
 
     Runs SYNCHRONOUSLY inside :meth:`RpcBusAdapter._dispatch_raw_device` (no
     interleaving await), eagerly extracting every field into immutable scalars
-    via :func:`_coerce_scalar`. The expensive part — building :class:`Variable`
-    objects, the kind lookup, name resolution and :class:`BrilliantDevice`
-    assembly — is deferred to delivery (:func:`normalize_peripheral` on the
-    popped snapshot), so a coalescing queue discards a superseded snapshot's
-    cheap primitive copy before that expensive work ever runs (issue #98).
+    (:func:`_coerce_scalar`/:func:`_coerce_name`/:func:`_coerce_timestamp`). The
+    expensive part — building :class:`Variable` objects, the kind lookup, name
+    resolution and :class:`BrilliantDevice` assembly — is deferred to delivery
+    (:func:`normalize_peripheral` on the popped snapshot), so a coalescing queue
+    discards a superseded snapshot's cheap primitive copy before that expensive
+    work ever runs (issue #98).
     """
     variables = {
         var_name: _VarSnapshot(
             _coerce_scalar(raw_var.value),
             bool(raw_var.externally_settable),
-            getattr(raw_var, "timestamp", None),
+            _coerce_timestamp(getattr(raw_var, "timestamp", None)),
         )
         for var_name, raw_var in dict(raw.variables).items()
     }
-    return _PeripheralSnapshot(int(raw.peripheral_type), getattr(raw, "name", None), variables)
+    return _PeripheralSnapshot(
+        int(raw.peripheral_type),
+        _coerce_name(getattr(raw, "name", None)),
+        MappingProxyType(variables),
+    )
 
 
 def normalize_peripheral(device_id: str, peripheral_id: str, raw: Any) -> BrilliantDevice:
@@ -420,12 +480,14 @@ class RpcBusAdapter:
         # Coalescing callbacks keep one newest snapshot per raw device. Lossless
         # callbacks use one callback-wide FIFO so distinct scene/mode executions
         # retain their arrival order even when several raw devices are involved.
-        # Each queued item is a (device_id, [(peripheral_id, _PeripheralSnapshot)])
+        # Each queued item is a (device_id, tuple[_PendingPeripheral, ...])
         # immutable primitive capture (issue #98), normalized only at delivery so
-        # a superseded snapshot is discarded before that expensive work runs.
+        # a superseded snapshot is discarded before that expensive work runs; the
+        # per-peripheral holder memoizes its BrilliantDevice so a push delivered
+        # to several callbacks is normalized at most once total.
         self._pending_pushes: dict[
             tuple[str | None, Callable[[BrilliantDevice], Awaitable[None]]],
-            deque[tuple[str, list[tuple[str, _PeripheralSnapshot]]]],
+            deque[tuple[str, tuple[_PendingPeripheral, ...]]],
         ] = {}
         self._push_tasks: dict[
             tuple[str | None, Callable[[BrilliantDevice], Awaitable[None]]],
@@ -643,13 +705,16 @@ class RpcBusAdapter:
         # retained past this point, only the plain-scalar snapshot, which the
         # notification-fed mirror can never mutate (poc-findings §8b). The
         # expensive normalize (Variable/BrilliantDevice construction, kind
-        # lookup, name resolution) is deferred to delivery. Shared across every
-        # admitted callback: the snapshot is immutable, so a shared reference is
-        # safe and avoids re-capturing per callback.
-        snapshot = [
-            (peripheral_id, _snapshot_peripheral(raw_peripheral))
+        # lookup, name resolution) is deferred to delivery. The tuple of holders
+        # is shared read-only across every admitted callback: the snapshot
+        # inputs are immutable, and each holder memoizes its normalized
+        # BrilliantDevice so a push delivered to several callbacks (the panel
+        # bridge AND the lossless scene bridge on the own device) is normalized
+        # at most once total — like main, which shared one BrilliantDevice.
+        snapshot = tuple(
+            _PendingPeripheral(peripheral_id, _snapshot_peripheral(raw_peripheral))
             for peripheral_id, raw_peripheral in dict(peripherals).items()
-        ]
+        )
         for cb, coalesce_pushes in admitted:
             key = (device_id if coalesce_pushes else None, cb)
             pending = self._pending_pushes.setdefault(key, deque())
@@ -674,9 +739,13 @@ class RpcBusAdapter:
         """Deliver queued whole-device snapshots serially for one callback.
 
         Each queued item is an immutable primitive snapshot; the expensive
-        normalization runs HERE, per peripheral, right before delivery (issue
-        #98) — so a snapshot a coalescing consumer superseded (and cleared from
-        the queue) is never normalized at all.
+        normalization runs HERE, right before delivery (issue #98), and is
+        memoized on the shared per-peripheral holder so a push delivered to
+        several callbacks normalizes at most once total — while a snapshot a
+        coalescing consumer superseded (and cleared from the queue) is never
+        normalized at all. Normalize runs inside the per-peripheral guard, so a
+        normalize failure logs and skips that peripheral rather than killing the
+        worker and dropping its siblings.
 
         Session-scoped (#88): a non-cooperative callback can keep this task
         alive past its own session's bounded teardown. If a new session has
@@ -696,11 +765,24 @@ class RpcBusAdapter:
                     self._pending_pushes.pop(key, None)
                     return
                 device_id, peripherals = pending.popleft()
-                for peripheral_id, snapshot in peripherals:
+                for pending_peripheral in peripherals:
                     if session != self._session:
                         return
-                    device = normalize_peripheral(device_id, peripheral_id, snapshot)
                     try:
+                        # Normalize inside the guard so a normalize failure logs
+                        # and skips this peripheral (as main's broad handler
+                        # catch did) instead of killing the worker and silently
+                        # dropping siblings/queued snapshots. Memoized on the
+                        # shared holder: at most one normalize per delivered
+                        # peripheral, reused across every consumer (issue #98).
+                        device = pending_peripheral.normalized
+                        if device is None:
+                            device = normalize_peripheral(
+                                device_id,
+                                pending_peripheral.peripheral_id,
+                                pending_peripheral.snapshot,
+                            )
+                            pending_peripheral.normalized = device
                         await cb(device)
                     except Exception:
                         logger.exception("bus change callback failed; continuing")

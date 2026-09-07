@@ -603,6 +603,7 @@ class _SessionHarness:
         self.scene_panel: str | None = None
         self.scene_watermark_path: object | None = None
         self.scene_clock_ms: Callable[[], int] | None = None
+        self.scene_want_device: Callable[[str], bool] | None = None
 
         harness = self
 
@@ -664,9 +665,7 @@ class _SessionHarness:
                 harness.scene_panel = panel
                 harness.scene_watermark_path = watermark_path
                 harness.scene_clock_ms = clock_ms
-                # want_device is accepted (wiring parity with the real bridge)
-                # but not asserted on here — swallow it like the other stubs.
-                del want_device
+                harness.scene_want_device = want_device
 
             async def async_start(self) -> None:
                 harness.events.append("scene_bridge_start")
@@ -1769,6 +1768,12 @@ class TestSceneBridgeSessionWiring:
         assert isinstance(harness.scene_watermark_path, Path)
         assert harness.scene_clock_ms is not None
         assert isinstance(harness.scene_clock_ms(), int)
+        # The scene bridge is wired with the panel scope predicate (issue #98):
+        # it must reject the mesh device and accept a non-mesh id, so dropping
+        # the want_device=_is_panel_device wiring would fail here.
+        assert harness.scene_want_device is not None
+        assert harness.scene_want_device("ble_mesh") is False
+        assert harness.scene_want_device("device_001") is True
 
         order = harness.events.index
         assert order("panel_bridge_construct") < order("mqtt_connect")
