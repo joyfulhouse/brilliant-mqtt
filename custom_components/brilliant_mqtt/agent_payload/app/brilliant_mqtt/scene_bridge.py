@@ -94,6 +94,8 @@ class _Pending:
     # #94: panel-clock baseline; an execution confirms this command only if
     # executed_at_ms >= confirm_after_ms (see _apply_scene_execution).
     confirm_after_ms: int
+    # In-memory: request-time validated watermark; write-task-only, never persisted or mirror-read.
+    equal_at_request: bool
     timeout_task: asyncio.Task[None] | None
     write_task: asyncio.Task[None] | None = None
 
@@ -472,6 +474,7 @@ class SceneBridge:
                 record.panel,
                 record.issued_at_ms,
                 record.confirm_after_ms,
+                False,
                 None,
             )
             target = self._scene_pending if kind == "scene" else self._mode_pending
@@ -815,21 +818,10 @@ class SceneBridge:
         return True
 
     def _apply_mode_execution(self, execution: ModeExecution, *, emit_event: bool) -> bool:
-        # #94 mode deferral: the mode path intentionally has NO request-relative
-        # confirm gate (unlike _apply_scene_execution). A mode execution's
-        # timestamp comes from the bus Variable.timestamp, whose units and clock
-        # domain are UNVERIFIED and cannot be verified without live-panel
-        # hardware. The delayed-case false-confirm therefore remains: a previously
-        # unseen stamp newer than the global watermark can have been caused before
-        # the request yet still confirm it by mode id. Gating on it risks breaking
-        # legitimate mode commands on production in-wall panels. Before adding a
-        # request-relative gate here, verify on hardware:
-        #   1. Variable.timestamp UNITS (seconds vs milliseconds).
-        #   2. Panel-clock vs phone/writer-supplied clock (change a mode from a
-        #      phone vs from the bridge and compare to _clock_ms()).
-        #   3. Whether a redundant same-mode set re-stamps the timestamp.
-        # Option (c), copying the global watermark at request time, is a no-op:
-        # every stamp it rejects is already rejected by current <= previous below.
+        # 2026-09-07 on-panel verification: Variable.timestamp is the panel clock
+        # in epoch milliseconds at write time and is writer-independent. A value
+        # change re-stamps it; a redundant same-mode write does not. Changed modes
+        # therefore use the scene path's request-relative confirmation gate.
         current = (execution.executed_at_ms, execution.mode_id)
         previous = self._mode_watermarks.get(self._panel)
         if previous is not None and current <= previous:
@@ -850,11 +842,20 @@ class SceneBridge:
             }
         )
         event_key = f"mode:{self._panel}:{execution.mode_id}:{execution.executed_at_ms}"
-        matching = [
-            (command_id, pending)
-            for command_id, pending in self._mode_pending.items()
-            if pending.value == execution.mode_id
-        ]
+        matching: list[tuple[str, _Pending]] = []
+        for command_id, pending in self._mode_pending.items():
+            if pending.value != execution.mode_id:
+                continue
+            if execution.executed_at_ms >= pending.confirm_after_ms:
+                matching.append((command_id, pending))
+            else:
+                logger.warning(
+                    "mode execution predates command baseline; not confirming "
+                    "(mode_id=%s executed_at_ms=%d confirm_after_ms=%d)",
+                    execution.mode_id,
+                    execution.executed_at_ms,
+                    pending.confirm_after_ms,
+                )
         publish_event = emit_event or bool(matching)
         if publish_event and not self._reserve_event(event_key):
             return False
@@ -988,6 +989,12 @@ class SceneBridge:
                         # (expires_at_ms - COMMAND_TTL_MS) reconstructs the
                         # baseline exactly for old files that lack the field.
                         now = self._clock_ms()
+                        equal_at_request = False
+                        if kind == "mode":
+                            mode_watermark = self._mode_watermarks.get(self._panel)
+                            equal_at_request = (
+                                mode_watermark is not None and mode_watermark[1] == value
+                            )
                         record = _StoredPending(
                             state_kind,
                             command.command_id,
@@ -1005,6 +1012,7 @@ class SceneBridge:
                             command.panel,
                             command.issued_at_ms,
                             now,
+                            equal_at_request,
                             None,
                         )
                         execution_device_id = self._execution.device_id
@@ -1074,11 +1082,25 @@ class SceneBridge:
                 _EXECUTION_PERIPHERAL_ID,
                 [VarSet(name=variable, value=value)],
             )
+            if kind == "mode":
+                # RPC success proves a mode equal when the request was issued still
+                # holds. Changed modes stay pending for request-relative stamped
+                # evidence; a stale mirror may conservatively time out rather than
+                # false-confirm. A typed bus no-op signal would be stronger; add it
+                # only after an operator-approved on-panel response-type capture.
+                await self._async_settle_pending(
+                    kind,
+                    command_id,
+                    value,
+                    error=None,
+                    expected_write=asyncio.current_task(),
+                    require_equal_at_request=True,
+                )
         except asyncio.CancelledError:
             raise
         except Exception as error:
             logger.warning("scene bridge write failed (%s)", type(error).__name__)
-            await self._async_fail_pending(
+            await self._async_settle_pending(
                 kind,
                 command_id,
                 value,
@@ -1089,18 +1111,20 @@ class SceneBridge:
     async def _async_timeout(self, kind: str, command_id: str, delay_seconds: float) -> None:
         try:
             await self._sleep(delay_seconds)
-            await self._async_fail_pending(kind, command_id, None, error="timeout")
+            # Mode timeouts intentionally never trust a later mirror value.
+            await self._async_settle_pending(kind, command_id, None, error="timeout")
         except asyncio.CancelledError:
             raise
 
-    async def _async_fail_pending(
+    async def _async_settle_pending(
         self,
         kind: str,
         command_id: str,
         value: str | None,
         *,
-        error: str,
+        error: str | None,
         expected_write: asyncio.Task[None] | None = None,
+        require_equal_at_request: bool = False,
     ) -> None:
         epoch = self._epoch
         async with self._lock:
@@ -1116,12 +1140,14 @@ class SceneBridge:
                 return
             if expected_write is not None and pending.write_task is not expected_write:
                 return
+            if require_equal_at_request and not pending.equal_at_request:
+                return
             pending_map.pop(command_id, None)
             state_key: StateKey = (cast(StateKind, kind), command_id)
             self._pending_records.pop(state_key, None)
             if error == "timeout" and pending.write_task is not None:
                 pending.write_task.cancel()
-            if error == "write_failed" and pending.timeout_task is not None:
+            if error != "timeout" and pending.timeout_task is not None:
                 pending.timeout_task.cancel()
             stored = self._store_result(
                 kind,
@@ -1130,7 +1156,7 @@ class SceneBridge:
                 pending.fingerprint,
                 pending.panel,
                 pending.issued_at_ms,
-                accepted=False,
+                accepted=error is None,
                 error=error,
                 event_key=None,
             )
