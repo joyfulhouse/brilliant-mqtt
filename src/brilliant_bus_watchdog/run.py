@@ -1,6 +1,9 @@
 """Bus-watchdog daemon: reboot the panel when the bridge can't hold a
-message-bus session for >=stale_after, the bridge unit is active, and the
-gateway is reachable. Logic in should_reboot()/handle(); main() is thin."""
+message-bus session for >=stale_after, the bridge unit is active, the gateway
+is reachable, AND the last session actually reached the local-bus phase with a
+live writer (bus_confirmed) — so a broker/DNS/TLS/auth startup failure, which
+never reaches the bus, cannot reboot a healthy panel. Logic in
+should_reboot()/handle(); main() is thin."""
 
 from __future__ import annotations
 

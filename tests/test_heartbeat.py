@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -71,7 +72,8 @@ def test_write_phase_atomically_replaces_the_current_phase(tmp_path: Path) -> No
     write_phase(str(phase), "pre_bus")
     write_phase(str(phase), "bus")
 
-    assert phase.read_text(encoding="utf-8") == "bus"
+    # write_phase appends the writer's pid so the reader can check liveness.
+    assert phase.read_text(encoding="utf-8") == f"bus {os.getpid()}"
 
 
 def test_write_phase_is_best_effort(tmp_path: Path) -> None:
@@ -90,7 +92,7 @@ def test_write_phase_pre_bus_failure_clears_stale_bus_marker(
     bus-confirmed and could reboot a healthy panel. Remove it so the watchdog
     fails closed."""
     phase = tmp_path / "bus-phase"
-    phase.write_text("bus", encoding="utf-8")  # leftover from a prior session
+    phase.write_text(f"bus {os.getpid()}", encoding="utf-8")  # leftover session
 
     def _raise(*args: object, **kwargs: object) -> None:
         raise OSError("write failed")
@@ -107,7 +109,7 @@ def test_write_phase_pre_bus_reraises_when_cleanup_also_fails(
     """If clearing the stale marker itself fails, phase tracking is broken —
     re-raise so the session doesn't silently continue in a fail-unsafe state."""
     phase = tmp_path / "bus-phase"
-    phase.write_text("bus", encoding="utf-8")
+    phase.write_text(f"bus {os.getpid()}", encoding="utf-8")
 
     def _raise_write(*args: object, **kwargs: object) -> None:
         raise OSError("write failed")

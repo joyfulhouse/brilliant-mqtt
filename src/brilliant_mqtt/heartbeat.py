@@ -64,6 +64,11 @@ def write_heartbeat(
 def write_phase(path: str, phase: BusPhase) -> None:
     """Atomically record the session's bus phase without disrupting startup.
 
+    Writes ``"<phase> <pid>"`` — the writer's own pid lets the reader
+    (:func:`brilliant_bus_watchdog.health.bus_confirmed`) verify the writer is
+    still alive, so a stale ``bus`` marker from a dead/reverted process does not
+    read as a live confirmed bus.
+
     A failed ``bus`` write is swallowed (logged): a missing stamp reads as
     unconfirmed, which is fail-safe. A failed ``pre_bus`` write is NOT — a
     stale ``bus`` marker left by a prior successful session would still read
@@ -81,7 +86,7 @@ def write_phase(path: str, phase: BusPhase) -> None:
     if not path:
         return
     try:
-        _atomic_write(path, phase)
+        _atomic_write(path, f"{phase} {os.getpid()}")
     except OSError:
         if phase != "pre_bus":
             logger.debug("bus phase write failed for %s", path, exc_info=True)

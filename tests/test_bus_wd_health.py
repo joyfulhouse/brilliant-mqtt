@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -37,8 +38,11 @@ def test_unparsable_measures_from_start(tmp_path: Path) -> None:
         (None, False, False),
         (None, True, False),
         ("pre_bus", False, False),
-        ("bus unavailable", False, False),
-        (" bus\n", False, True),
+        (f"pre_bus {os.getpid()}", False, False),
+        ("bus", False, False),  # old bare-string format: no pid -> fail closed
+        ("bus unavailable", False, False),  # non-integer pid -> fail closed
+        ("bus 0", False, False),  # non-positive pid -> fail closed
+        (f" bus {os.getpid()}\n", False, True),  # live writer (whitespace-tolerant)
     ],
 )
 def test_bus_confirmed_fails_closed(
@@ -54,6 +58,17 @@ def test_bus_confirmed_fails_closed(
         phase.write_text(contents, encoding="utf-8")
 
     assert bus_confirmed(str(phase)) is expected
+
+
+def test_bus_confirmed_false_for_dead_writer_pid(tmp_path: Path) -> None:
+    """A leftover ``bus <pid>`` whose pid is no live process (a dead or reverted
+    writer, whose tmpfs marker survives until the next reboot) must read as
+    unconfirmed — not as a live confirmed bus."""
+    phase = tmp_path / "bus-phase"
+    dead_pid = 2**31 - 1  # far beyond /proc/sys/kernel/pid_max: no such process
+    phase.write_text(f"bus {dead_pid}", encoding="utf-8")
+
+    assert bus_confirmed(str(phase)) is False
 
 
 def test_bus_confirmed_fails_closed_on_invalid_utf8(tmp_path: Path) -> None:

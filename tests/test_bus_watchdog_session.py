@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -169,8 +170,11 @@ async def test_stale_bus_phase_and_heartbeat_do_not_reboot_on_broker_outage(
     test would catch a startup that wrote a fake heartbeat or let a stale
     "bus" marker survive the refusal."""
     settings = _settings(tmp_path)
-    # Leftovers from a prior successful session, before this outage begins.
-    _seed(settings.bus_phase_file, "bus")
+    # Leftovers from a prior successful session, before this outage begins. The
+    # phase carries THIS (live) process's pid so it would read as confirmed on
+    # its own — proving the pre_bus stamp, not a dead-writer check, is what
+    # clears it.
+    _seed(settings.bus_phase_file, f"bus {os.getpid()}")
     _seed(settings.bus_heartbeat_file, "100.0")
 
     bus = _Bus()
