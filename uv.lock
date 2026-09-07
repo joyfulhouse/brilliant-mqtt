@@ -127,7 +127,7 @@ wheels = [
 
 [[package]]
 name = "brilliant-mqtt"
-version = "0.9.1"
+version = "0.9.3"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
