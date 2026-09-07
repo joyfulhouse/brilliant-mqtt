@@ -3,17 +3,23 @@
 
 from __future__ import annotations
 
-import subprocess
 import time
 from collections.abc import Callable
+
+from . import bounded
 
 WL_REG_ON_GPIO = 2
 BT_REG_ON_GPIO = 5
 _ALIAS_PATH = "/sys/firmware/devicetree/base/aliases/mmc1"
 
+# Recovery commands act on network daemons (connman/wpa_supplicant) that may be
+# exactly the thing that is stuck; give them a generous but finite deadline so a
+# hung restart is killed and reaped rather than wedging the watchdog forever.
+_RECOVERY_TIMEOUT = 30.0
+
 
 def _run(argv: list[str]) -> int:
-    return subprocess.run(argv, check=False).returncode
+    return bounded.run_bounded(argv, timeout=_RECOVERY_TIMEOUT).returncode
 
 
 def _write(path: str, val: str) -> None:

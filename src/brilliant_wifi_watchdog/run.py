@@ -23,6 +23,10 @@ class _GuardLike(Protocol):
     def record(self, now: float) -> None: ...
 
 
+class _LadderLike(Protocol):
+    def observe(self, *, gateway_up: bool, now: float, reboot_eligible: bool) -> Action: ...
+
+
 @dataclass(frozen=True)
 class Config:
     interval: float
@@ -104,27 +108,36 @@ def _configure_logging(path: str) -> None:
     _LOG.setLevel(logging.INFO)
 
 
+def _poll_once(cfg: Config, *, guard: _GuardLike, ladder: _LadderLike) -> None:
+    """One watchdog cycle: probe, decide, dispatch.
+
+    The recovery ladder's health signal is the gateway ping alone. The broker TCP
+    check is a bounded, log-only diagnostic — being bounded it can never delay
+    reaching the ladder, and its tri-state result never feeds the decision, so a
+    timed-out (INCONCLUSIVE) diagnostic can neither block nor force recovery.
+    """
+    gw = cfg.gateway or probe.default_gateway()
+    gateway_up = probe.ping(gw) if gw else False
+    if cfg.broker_host:
+        broker = probe.tcp_open(cfg.broker_host, cfg.broker_port)
+        _LOG.info("gateway=%s up=%s broker=%s", gw, gateway_up, broker.value)
+    # One guard read per poll, shared by the ladder and handle() so they can
+    # never act on disagreeing eligibility (rung-elapsed math stays monotonic;
+    # only the guard-facing timestamp is wall-clock).
+    wall = time.time()
+    eligible = guard.can_reboot(wall)
+    action = ladder.observe(gateway_up=gateway_up, now=time.monotonic(), reboot_eligible=eligible)
+    if action != Action.NONE:
+        handle(action, guard=guard, now=wall, reboot_eligible=eligible)
+
+
 def main() -> None:  # pragma: no cover - thin loop
     cfg = load_config(os.environ)
     _configure_logging(cfg.log_path)
     guard = RebootGuard(cfg.state_path, cfg.policy)
     ladder = Ladder(cfg.thresholds)
     while True:
-        gw = cfg.gateway or probe.default_gateway()
-        gateway_up = probe.ping(gw) if gw else False
-        if cfg.broker_host:
-            broker_up = probe.tcp_open(cfg.broker_host, cfg.broker_port)
-            _LOG.info("gateway=%s up=%s broker_up=%s", gw, gateway_up, broker_up)
-        # One guard read per poll, shared by the ladder and handle() so they can
-        # never act on disagreeing eligibility (rung-elapsed math stays monotonic;
-        # only the guard-facing timestamp is wall-clock).
-        wall = time.time()
-        eligible = guard.can_reboot(wall)
-        action = ladder.observe(
-            gateway_up=gateway_up, now=time.monotonic(), reboot_eligible=eligible
-        )
-        if action != Action.NONE:
-            handle(action, guard=guard, now=wall, reboot_eligible=eligible)
+        _poll_once(cfg, guard=guard, ladder=ladder)
         time.sleep(cfg.interval)
 
 

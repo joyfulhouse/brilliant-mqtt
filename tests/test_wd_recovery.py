@@ -1,4 +1,8 @@
-from brilliant_wifi_watchdog import recovery
+from typing import Any
+
+import pytest
+
+from brilliant_wifi_watchdog import bounded, recovery
 
 
 class Rec:
@@ -49,3 +53,26 @@ def test_gpio_reset_then_reboot() -> None:
     assert ub < e2 < u2
     # reboot is LAST
     assert r.cmds[-1] == ["systemctl", "reboot"]
+
+
+# ---------------------------------------------------------------------------
+# The DEFAULT recovery runner must be bounded — a recovery command against a
+# stuck network daemon may hang, and it must not wedge the watchdog.
+# ---------------------------------------------------------------------------
+
+
+def test_recovery_default_runner_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[tuple[list[str], float]] = []
+
+    def spy(argv: Any, *, timeout: float, capture: bool = False) -> bounded.Completed:
+        seen.append((list(argv), timeout))
+        return bounded.Completed(returncode=0, stdout="", timed_out=False)
+
+    monkeypatch.setattr(bounded, "run_bounded", spy)
+    recovery.soft_reconnect()
+    recovery.restart_services()
+    argvs = [a for a, _ in seen]
+    assert ["connmanctl", "enable", "wifi"] in argvs
+    assert ["systemctl", "restart", "connman"] in argvs
+    assert seen  # sanity: the default runner was actually exercised
+    assert all(t > 0 for _, t in seen)  # every recovery child got a wall-clock deadline

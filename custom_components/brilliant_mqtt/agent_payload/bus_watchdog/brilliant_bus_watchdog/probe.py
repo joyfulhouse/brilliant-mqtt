@@ -2,17 +2,23 @@
 
 from __future__ import annotations
 
-import subprocess
 from collections.abc import Callable
+
+from . import bounded
+
+# Wall-clock bound for a single probe child. `ip route`/`ping` are local and
+# fast; the bound guards the pathological case where the child never returns
+# (a hung network stack), which would otherwise wedge the watchdog loop.
+_PROBE_TIMEOUT = 5.0
 
 
 def _run_out(argv: list[str]) -> tuple[int, str]:
-    p = subprocess.run(argv, check=False, capture_output=True, text=True)
-    return p.returncode, p.stdout
+    r = bounded.run_bounded(argv, timeout=_PROBE_TIMEOUT, capture=True)
+    return r.returncode, r.stdout
 
 
 def _run_rc(argv: list[str]) -> int:
-    return subprocess.run(argv, check=False, capture_output=True).returncode
+    return bounded.run_bounded(argv, timeout=_PROBE_TIMEOUT).returncode
 
 
 def default_gateway(run: Callable[[list[str]], tuple[int, str]] = _run_out) -> str | None:
