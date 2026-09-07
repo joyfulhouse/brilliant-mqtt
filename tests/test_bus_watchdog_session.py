@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import fcntl
 import logging
 import time
 from collections.abc import Awaitable, Callable
@@ -197,8 +198,8 @@ def _install_watchdog_clock(monkeypatch: pytest.MonkeyPatch, clock: FakeClock) -
         phase: BusPhase,
         *,
         bus_read_succeeded: bool = False,
-    ) -> None:
-        write_phase(
+    ) -> bool:
+        return write_phase(
             path,
             phase,
             bus_read_succeeded=bus_read_succeeded,
@@ -370,7 +371,7 @@ async def test_failed_phase_write_and_unlink_do_not_reboot_on_broker_outage(
         bus_failure_age=failure_age,
     )
     messages = [record.getMessage() for record in caplog.records]
-    assert any("invalidation failed" in message for message in messages)
+    assert any("marker updated in place" in message for message in messages)
     assert not any("reboot guard disabled" in message for message in messages)
 
 
@@ -490,6 +491,99 @@ async def test_sustained_bus_handshake_failure_still_uses_reboot_guard(
     # the second one back.
     handle(should=decision, guard=guard, now=2300.0, reboot_fn=lambda: reboots.append("reboot"))
     assert reboots == ["reboot", "reboot"]
+
+
+async def test_broker_only_gap_breaks_prior_bus_failure_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    clock = FakeClock()
+    _install_watchdog_clock(monkeypatch, clock)
+
+    failed_bus = _Bus(ConnectionError("bus handshake failed"))
+    _install_session_fakes(monkeypatch, failed_bus, _Mqtt())
+    with pytest.raises(ConnectionError, match="bus handshake failed"):
+        await main_mod._run_session(settings, None, None)
+
+    clock.advance(100.0)
+    for elapsed in (0.0, 1900.0):
+        clock.advance(elapsed)
+        _install_session_fakes(
+            monkeypatch,
+            _Bus(),
+            _Mqtt(ConnectionError("broker refused")),
+        )
+        with pytest.raises(ConnectionError, match="broker refused"):
+            await main_mod._run_session(settings, None, None)
+
+    entered_start = asyncio.Event()
+    finish_start = asyncio.Event()
+    recovered_bus = _Bus(block_start_until=finish_start, entered_start=entered_start)
+    _install_session_fakes(monkeypatch, recovered_bus, _Mqtt(), _ReadingBridge)
+    task = asyncio.create_task(main_mod._run_session(settings, None, None))
+    try:
+        await asyncio.wait_for(entered_start.wait(), timeout=1.0)
+        failure_age = bus_failure_age(settings.bus_phase_file, now=clock())
+        assert clock() == 2000.0
+        assert failure_age == 0.0
+        assert not should_reboot(
+            age=2000.0,
+            stale_after=1800.0,
+            bridge_active=True,
+            gateway_up=True,
+            bus_failure_age=failure_age,
+        )
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+async def test_bus_start_waits_until_phase_lease_retry_is_armed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    clock = FakeClock()
+    _install_watchdog_clock(monkeypatch, clock)
+    entered_start = asyncio.Event()
+    finish_start = asyncio.Event()
+    bus = _Bus(block_start_until=finish_start, entered_start=entered_start)
+    mqtt = _Mqtt()
+    _install_session_fakes(monkeypatch, bus, mqtt, _ReadingBridge)
+
+    real_flock = fcntl.flock
+    collisions_remaining = 3
+
+    def _flock(fd: int, operation: int) -> None:
+        nonlocal collisions_remaining
+        if operation == fcntl.LOCK_EX | fcntl.LOCK_NB and collisions_remaining:
+            collisions_remaining -= 1
+            raise BlockingIOError
+        real_flock(fd, operation)
+
+    monkeypatch.setattr("brilliant_mqtt.heartbeat.fcntl.flock", _flock)
+    with pytest.raises(RuntimeError, match="bus failure attribution unavailable"):
+        await asyncio.wait_for(main_mod._run_session(settings, None, None), timeout=1.0)
+    assert bus.start_calls == 0
+
+    clock.advance(1900.0)
+    task = asyncio.create_task(main_mod._run_session(settings, None, None))
+    try:
+        await asyncio.wait_for(entered_start.wait(), timeout=1.0)
+        failure_age = bus_failure_age(settings.bus_phase_file, now=clock())
+        assert bus.start_calls == 1
+        assert failure_age == 1900.0
+        assert should_reboot(
+            age=1900.0,
+            stale_after=1800.0,
+            bridge_active=True,
+            gateway_up=True,
+            bus_failure_age=failure_age,
+        )
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
 
 async def test_successful_bus_read_refreshes_heartbeat_without_resetting_phase(

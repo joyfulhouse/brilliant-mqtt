@@ -2178,7 +2178,9 @@ async def test_shutdown_discards_buffered_execution_before_same_instance_restart
     mqtt = FakeMqtt()
     bridge = SceneBridge(bus, mqtt, _PANEL, tmp_path / "state.json", FakeClockMs(_NOW_MS))
 
-    await bus.emit(_execution("all_off", 500))
+    execution = _execution("all_off", 500)
+    await bus.emit(execution)
+    assert bridge._startup_buffered_execution is execution
     await bridge.async_shutdown()
     await bridge.async_start()
 

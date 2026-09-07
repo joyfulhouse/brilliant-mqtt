@@ -10,9 +10,16 @@ from types import SimpleNamespace
 
 import pytest
 
+import brilliant_bus_watchdog.health as health_mod
 from brilliant_bus_watchdog.health import bus_failure_age, heartbeat_age
 from brilliant_bus_watchdog.run import _service_active, should_reboot
-from brilliant_mqtt.heartbeat import DEAD_WRITER_RETENTION_S, current_boot_id, write_phase
+from brilliant_mqtt import heartbeat
+from brilliant_mqtt.heartbeat import (
+    DEAD_WRITER_RETENTION_S,
+    current_boot_id,
+    process_generation,
+    write_phase,
+)
 
 _CHILD_PHASE_WRITER = """
 import sys
@@ -46,10 +53,12 @@ import sys
 from brilliant_mqtt import __main__ as main_mod, heartbeat
 from brilliant_mqtt.config import Settings
 
-class Bus:
+class RecoveredBus:
     def on_reconnect(self, callback):
         pass
     def on_change(self, callback, **kwargs):
+        pass
+    async def start(self):
         pass
     async def shutdown(self):
         pass
@@ -68,14 +77,14 @@ path = sys.argv[1]
 heartbeat.write_phase(
     path,
     "bus",
-    bus_read_succeeded=True,
     monotonic_clock=lambda: 100.0,
 )
+heartbeat.write_phase(path, "bus", monotonic_clock=lambda: 1900.0)
 def denied(*args, **kwargs):
     raise PermissionError("read-only phase directory")
 heartbeat._atomic_write = denied
 heartbeat.os.unlink = denied
-main_mod.RpcBusAdapter = lambda **kwargs: Bus()
+main_mod.RpcBusAdapter = lambda **kwargs: RecoveredBus()
 main_mod.AioMqttAdapter = lambda settings: BrokerFailure()
 settings = Settings(
     panel="office",
@@ -214,19 +223,24 @@ def test_killed_bus_writers_qualify_during_service_restart_backoff(tmp_path: Pat
     decisions: list[bool] = []
     for now in samples:
         process = _start_phase_writer(phase, now)
-        assert bus_failure_age(str(phase), now=now) == now - samples[0]
-        process.kill()
-        assert process.wait(timeout=5.0) == -signal.SIGKILL
-        failure_age = bus_failure_age(str(phase), now=now)
-        decisions.append(
-            should_reboot(
-                age=2200.0,
-                stale_after=1800.0,
-                bridge_active=_service_is("activating"),
-                gateway_up=True,
-                bus_failure_age=failure_age,
+        try:
+            assert bus_failure_age(str(phase), now=now) == now - samples[0]
+            process.kill()
+            assert process.wait(timeout=5.0) == -signal.SIGKILL
+            failure_age = bus_failure_age(str(phase), now=now)
+            decisions.append(
+                should_reboot(
+                    age=2200.0,
+                    stale_after=1800.0,
+                    bridge_active=_service_is("activating"),
+                    gateway_up=True,
+                    bus_failure_age=failure_age,
+                )
             )
-        )
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5.0)
 
     assert decisions[:-1] == [False] * 7
     assert bus_failure_age(str(phase), now=samples[-1]) == samples[-1] - samples[0]
@@ -307,15 +321,61 @@ def test_failed_invalidation_stays_revoked_after_writer_death(tmp_path: Path) ->
     )
     assert process.returncode == -signal.SIGKILL
 
-    failure_age = bus_failure_age(str(phase), now=151.0)
+    failure_age = bus_failure_age(str(phase), now=1901.0)
     assert failure_age is None
     assert not should_reboot(
-        age=51.0,
-        stale_after=50.0,
+        age=1801.0,
+        stale_after=1800.0,
         bridge_active=_service_is("activating"),
         gateway_up=True,
         bus_failure_age=failure_age,
     )
+
+
+def test_unknown_live_process_generation_does_not_count_as_writer_death(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    phase = tmp_path / "bus-phase"
+    boot_id = current_boot_id()
+    generation = process_generation(os.getpid())
+    assert boot_id is not None
+    assert generation is not None
+    phase.write_text(
+        f"v2 bus {os.getpid()} {generation} {boot_id} 100.0 100.0 attempt",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(health_mod, "process_generation", lambda pid: None)
+
+    assert bus_failure_age(str(phase), now=200.0) is None
+
+
+def test_live_writer_with_unknown_generation_is_not_inherited(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    phase = tmp_path / "bus-phase"
+    process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        boot_id = current_boot_id()
+        generation = process_generation(process.pid)
+        assert boot_id is not None
+        assert generation is not None
+        phase.write_text(
+            f"v2 bus {process.pid} {generation} {boot_id} 100.0 100.0 attempt",
+            encoding="utf-8",
+        )
+        real_process_generation = heartbeat.process_generation
+
+        def _generation(pid: int) -> str | None:
+            return None if pid == process.pid else real_process_generation(pid)
+
+        monkeypatch.setattr(heartbeat, "process_generation", _generation)
+        write_phase(str(phase), "pre_bus", monotonic_clock=lambda: 200.0)
+        write_phase(str(phase), "bus", monotonic_clock=lambda: 200.0)
+
+        assert bus_failure_age(str(phase), now=200.0) == 0.0
+    finally:
+        process.kill()
+        process.wait(timeout=5.0)
 
 
 @pytest.mark.parametrize("pid", [1, 0, -1])
