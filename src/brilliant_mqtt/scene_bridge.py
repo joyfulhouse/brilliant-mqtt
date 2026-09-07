@@ -104,7 +104,21 @@ def _is_new(previous: Watermark | None, current: SceneExecution) -> bool:
 
 def _execution_fingerprint(device: BrilliantDevice) -> dict[str, str]:
     snapshot = dict(device.variables)
-    return {name: variable.value for name, variable in snapshot.items()}
+    fingerprint = {name: variable.value for name, variable in snapshot.items()}
+    # decode_mode_execution() keys a mode activation off the manual_mode_id
+    # variable's bus timestamp_ms, not its value, so fold that timestamp in or
+    # a same-mode re-activation seen only via the hot poll would leave the
+    # value-only fingerprint unchanged and be dropped. Only this variable: scene
+    # blobs embed their own execution time in the decoded value. The "@" prefix
+    # keeps the key clear of real variable names by convention — bus.py does not
+    # validate names, but firmware names them as plain identifiers, none of which
+    # begin with "@". Aligning the poll path with the push path this way means a
+    # bare manual_mode_id timestamp refresh (no value change) now emits a mode
+    # event on the poll path too, exactly as the push path already does.
+    mode_variable = snapshot.get("manual_mode_id")
+    if mode_variable is not None:
+        fingerprint["@manual_mode_id.timestamp_ms"] = str(mode_variable.timestamp_ms)
+    return fingerprint
 
 
 class SceneBridge:
