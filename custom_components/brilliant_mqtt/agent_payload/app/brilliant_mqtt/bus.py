@@ -760,7 +760,7 @@ class RpcBusAdapter:
         """
         try:
             while True:
-                if session != self._session:
+                if self._shutting_down or session != self._session:
                     return
                 pending = self._pending_pushes.get(key)
                 if not pending:
@@ -768,7 +768,7 @@ class RpcBusAdapter:
                     return
                 device_id, peripherals = pending.popleft()
                 for pending_peripheral in peripherals:
-                    if session != self._session:
+                    if self._shutting_down or session != self._session:
                         return
                     try:
                         # Normalize inside the guard so a normalize failure logs
@@ -871,7 +871,7 @@ class RpcBusAdapter:
         """
         if session is None:
             session = self._session
-        if session != self._session:
+        if self._shutting_down or session != self._session:
             return
         if self._resubscribe is not None:
             try:
@@ -879,7 +879,7 @@ class RpcBusAdapter:
             except Exception:
                 logger.exception("re-subscribe after reconnect failed")
         for cb in list(self._reconnect_cbs):
-            if session != self._session:
+            if self._shutting_down or session != self._session:
                 return
             try:
                 await cb()

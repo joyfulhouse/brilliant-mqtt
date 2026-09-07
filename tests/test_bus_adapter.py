@@ -1538,3 +1538,100 @@ class TestStaleCallbackFencing:
         finally:
             release.set()
             await _settle(5)
+
+    async def test_shutdown_fences_rest_of_snapshot_without_restart(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Issue #131: production discards the old adapter after shutdown, so
+        its session token never advances to fence a cancellation-resistant
+        drain worker. The shutdown fence itself must stop both normalization
+        and callback delivery for the rest of the already-popped snapshot.
+        """
+        monkeypatch.setattr(bus_mod, "_PENDING_SETTLE_TIMEOUT_S", 0.05)
+        _StartHarness(monkeypatch)
+        adapter = RpcBusAdapter()
+        release = asyncio.Event()
+        first_started = asyncio.Event()
+        normalized: list[str] = []
+        seen: list[str] = []
+        real_normalize = bus_mod.normalize_peripheral
+
+        def recording_normalize(
+            device_id: str, peripheral_id: str, raw_peripheral: Any
+        ) -> BrilliantDevice:
+            normalized.append(peripheral_id)
+            return real_normalize(device_id, peripheral_id, raw_peripheral)
+
+        async def callback(device: BrilliantDevice) -> None:
+            seen.append(device.peripheral_id)
+            if device.peripheral_id != "first":
+                return
+            first_started.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                await release.wait()
+
+        monkeypatch.setattr(bus_mod, "normalize_peripheral", recording_normalize)
+        adapter.on_change(callback, coalesce_pushes=False)
+
+        try:
+            await adapter.start()
+            adapter._dispatch_raw_device(
+                _RawDevice(
+                    "own-device",
+                    {"first": _RawPeripheral(), "second": _RawPeripheral()},
+                )
+            )
+            await asyncio.wait_for(first_started.wait(), timeout=1)
+            await asyncio.wait_for(adapter.shutdown(), timeout=1)
+
+            release.set()
+            await _settle(5)
+
+            assert seen == ["first"]
+            assert normalized == ["first"]
+        finally:
+            release.set()
+            await _settle(5)
+
+    async def test_shutdown_fences_reconnect_fanout_without_restart(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Issue #131: a reconnect fan-out that survives shutdown must not
+        continue to its remaining callbacks on an old, never-restarted adapter.
+        """
+        monkeypatch.setattr(bus_mod, "_PENDING_SETTLE_TIMEOUT_S", 0.05)
+        _StartHarness(monkeypatch)
+        adapter = RpcBusAdapter()
+        release = asyncio.Event()
+        first_started = asyncio.Event()
+        seen: list[str] = []
+
+        async def first() -> None:
+            seen.append("first")
+            first_started.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                await release.wait()
+
+        async def second() -> None:
+            seen.append("second")
+
+        adapter.on_reconnect(first)
+        adapter.on_reconnect(second)
+
+        try:
+            await adapter.start()
+            adapter._on_proc_reconnect()
+            await asyncio.wait_for(first_started.wait(), timeout=1)
+            await asyncio.wait_for(adapter.shutdown(), timeout=1)
+
+            release.set()
+            await _settle(5)
+
+            assert seen == ["first"]
+        finally:
+            release.set()
+            await _settle(5)
