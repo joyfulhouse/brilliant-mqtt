@@ -1219,12 +1219,10 @@ class SceneBridge:
         self._clear_capacity_if_room()
         return True
 
-    def _prune_events(self) -> bool:
-        changed = False
+    def _prune_events(self) -> None:
         for result_key, result in list(self._results.items()):
             if result.delivered and result.event_key is not None:
                 self._results[result_key] = replace(result, event_key=None)
-                changed = True
         dependencies = {
             result.event_key
             for result in self._results.values()
@@ -1233,8 +1231,6 @@ class SceneBridge:
         for event_key, event in list(self._events.items()):
             if event.delivered and event_key not in dependencies:
                 self._events.pop(event_key)
-                changed = True
-        return changed
 
     def _within_capacity(self) -> bool:
         return (
@@ -1286,31 +1282,25 @@ class SceneBridge:
             async with self._lock:
                 if self._stopping or epoch != self._epoch:
                     return
+                delivered = False
                 if item_type == "event":
                     event = self._events.get(cast(str, key))
                     if event is not None and event.payload == payload and not event.delivered:
                         self._events[cast(str, key)] = replace(event, delivered=True)
-                        snapshot = self._capture_state()
+                        delivered = True
                 else:
                     result_key = cast(tuple[StateKind, str], key)
                     result = self._results.get(result_key)
                     if result is not None and result.payload == payload and not result.delivered:
                         self._results[result_key] = replace(result, delivered=True)
-                        snapshot = self._capture_state()
+                        delivered = True
+                if delivered:
+                    self._prune_events()
+                    self._clear_capacity_if_room()
+                    snapshot = self._capture_state()
             if snapshot is None:
                 continue
             if not await self._async_persist_state(*snapshot, epoch):
-                return
-            pruned_snapshot: tuple[int, SceneState] | None = None
-            async with self._lock:
-                if self._stopping or epoch != self._epoch:
-                    return
-                if self._prune_events():
-                    pruned_snapshot = self._capture_state()
-                self._clear_capacity_if_room()
-            if pruned_snapshot is not None and not await self._async_persist_state(
-                *pruned_snapshot, epoch
-            ):
                 return
             await self._async_health_status("scene")
             await self._async_health_status("mode")

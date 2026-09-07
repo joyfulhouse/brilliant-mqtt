@@ -169,26 +169,6 @@ async def _wait_for_bus_commands(bus: FakeBus, count: int) -> None:
     pytest.fail(f"timed out waiting for {count} bus command(s); got {len(bus.commands)}")
 
 
-async def _wait_for_stored_result(
-    path: Path,
-    result_key: str,
-    *,
-    delivered: bool,
-    event_key: str | None,
-) -> None:
-    for _ in range(200):
-        stored = json.loads(await asyncio.to_thread(path.read_text))
-        result = stored["results"].get(result_key)
-        if (
-            result is not None
-            and result["delivered"] is delivered
-            and result["event_key"] == event_key
-        ):
-            return
-        await asyncio.sleep(0.001)
-    pytest.fail(f"timed out waiting for stored result {result_key}")
-
-
 async def _started(
     tmp_path: Path,
     *,
@@ -907,12 +887,9 @@ async def test_matching_execution_publishes_event_before_accepted_result_and_cac
     assert delivery_task is not None
     await asyncio.wait_for(delivery_task, timeout=2)
     assert bridge._results[("scene", command_id)].event_key is None
-    await _wait_for_stored_result(
-        path,
-        f"scene:{command_id}",
-        delivered=True,
-        event_key=None,
-    )
+    stored_result = json.loads(path.read_text())["results"][f"scene:{command_id}"]
+    assert stored_result["event_key"] is None
+    assert stored_result["delivered"] is True
     await mqtt.inject(scene_command_topic(_PANEL), command)
 
     assert len(bus.commands) == 1
@@ -2708,16 +2685,13 @@ async def test_multiple_pending_same_scene_confirm_by_baseline_band(
         await _wait_for_publish(mqtt, scene_result_topic(command_id))
         assert _payload(_published(mqtt, scene_result_topic(command_id))[-1])["accepted"] is True
 
-    if expected:
-        await _wait_for_stored_result(
-            path,
-            f"scene:{ids[expected[0]]}",
-            delivered=True,
-            event_key=None,
-        )
     delivery_task = bridge._delivery_task
     assert delivery_task is not None
     await asyncio.wait_for(delivery_task, timeout=2)
+    if expected:
+        stored_result = json.loads(path.read_text())["results"][f"scene:{ids[expected[0]]}"]
+        assert stored_result["event_key"] is None
+        assert stored_result["delivered"] is True
 
     # Settle every non-confirmed command to a timeout so an over-confirmation (a
     # wrong accepted:true) is caught, rather than checked before a result lands.
