@@ -268,7 +268,8 @@ async def _assert_second_command_after_delivery_and_prune(
     tmp_path: Path,
     kind: scene_state.StateKind,
 ) -> None:
-    bridge, bus, mqtt, _, path = await _started(tmp_path)
+    mode_ids = ("away", "home") if kind == "mode" else ("away",)
+    bridge, bus, mqtt, _, path = await _started(tmp_path, mode_ids=mode_ids)
     first_id = "22222222-2222-4222-8222-222222222222"
     second_id = "44444444-4444-4444-8444-444444444444"
     command_topic = scene_command_topic(_PANEL) if kind == "scene" else mode_command_topic(_PANEL)
@@ -279,6 +280,7 @@ async def _assert_second_command_after_delivery_and_prune(
         else _execution(mode_id="away", mode_at_ms=_NOW_MS + 1)
     )
     value = "all_off" if kind == "scene" else "away"
+    second_value = "home" if kind == "mode" else value
     try:
         await mqtt.inject(command_topic, _command(first_id, kind, value))
         await _wait_for_bus_commands(bus, 1)
@@ -296,16 +298,12 @@ async def _assert_second_command_after_delivery_and_prune(
         assert stored["results"][f"{kind}:{first_id}"]["event_key"] is None
         assert stored["events"] == {}
 
-        await mqtt.inject(command_topic, _command(second_id, kind, value))
-        assert bridge._state_trusted is True
         if kind == "mode":
-            await _wait_for_publish(mqtt, mode_result_topic(second_id))
-            assert len(bus.commands) == 1
-            result = _payload(_published(mqtt, mode_result_topic(second_id))[-1])
-            assert result["accepted"] is True
-        else:
-            await _wait_for_bus_commands(bus, 2)
-            assert len(bus.commands) == 2
+            await bus.emit(_execution(mode_id="home", mode_at_ms=_NOW_MS))
+        await mqtt.inject(command_topic, _command(second_id, kind, second_value))
+        assert bridge._state_trusted is True
+        await _wait_for_bus_commands(bus, 2)
+        assert len(bus.commands) == 2
     finally:
         await bridge.async_shutdown()
 
@@ -2810,23 +2808,124 @@ async def test_malformed_execution_never_confirms_pending_scene_command(tmp_path
 async def test_requesting_current_mode_confirms_immediately_without_execution_stamp(
     tmp_path: Path,
 ) -> None:
-    # The bus does not re-stamp a same-value write, so state equality must settle
-    # the request without creating a pending command that can only time out.
     seeded = _execution(mode_id="away", mode_at_ms=_NOW_MS - 1_000)
-    bridge, bus, mqtt, _, _ = await _started(tmp_path, execution=seeded)
+    bridge, bus, mqtt, clock, _ = await _started(tmp_path, execution=seeded)
+    bus.set_variables_receipt = f"SetVariableResponse(timestamp={_NOW_MS}, modified_variables=())"
     mqtt.published.clear()
 
     command_id = "33333333-3333-4333-8333-333333333333"
     await mqtt.inject(mode_command_topic(_PANEL), _command(command_id, "mode", "away"))
+    await _wait_for_bus_commands(bus, 1)
     await _wait_for_publish(mqtt, mode_result_topic(command_id))
 
-    assert bus.commands == []
+    assert bus.commands == [
+        (_DEVICE_ID, "execution_peripheral", [VarSet("manual_mode_id", "away")])
+    ]
     assert command_id not in bridge._mode_pending
     assert ("mode", command_id) not in bridge._pending_records
     assert _published(mqtt, mode_event_topic(_PANEL)) == []
     result = _payload(_published(mqtt, mode_result_topic(command_id))[-1])
     assert result["accepted"] is True
     assert "error" not in result
+
+    await clock.advance_ms(COMMAND_TTL_MS + 1)
+    assert len(_published(mqtt, mode_result_topic(command_id))) == 1
+    await bridge.async_shutdown()
+
+
+async def test_rejected_mode_snapshot_cannot_confirm_later_request(tmp_path: Path) -> None:
+    clock = FakeClockMs(200)
+    bridge, bus, mqtt, _, _ = await _started(
+        tmp_path,
+        clock=clock,
+        execution=_execution(mode_id="home", mode_at_ms=150),
+        mode_ids=("away", "home"),
+    )
+    mqtt.published.clear()
+
+    await bus.emit(_execution(mode_id="away", mode_at_ms=100))
+    assert bridge._mode_watermarks[_PANEL] == (150, "home")
+
+    command_id = "66666666-6666-4666-8666-666666666666"
+    await mqtt.inject(
+        mode_command_topic(_PANEL),
+        _command(command_id, "mode", "away", issued_at_ms=clock.now_ms),
+    )
+    await _wait_for_bus_commands(bus, 1)
+
+    assert bus.commands == [
+        (_DEVICE_ID, "execution_peripheral", [VarSet("manual_mode_id", "away")])
+    ]
+    assert _published(mqtt, mode_result_topic(command_id)) == []
+
+    await bus.emit(_execution(mode_id="away", mode_at_ms=clock.now_ms))
+    await _wait_for_publish(mqtt, mode_result_topic(command_id))
+    result = _payload(_published(mqtt, mode_result_topic(command_id))[-1])
+    assert result["accepted"] is True
+    await bridge.async_shutdown()
+
+
+async def test_differing_pending_mode_requests_preserve_last_command_wins(
+    tmp_path: Path,
+) -> None:
+    bridge, bus, mqtt, _, _ = await _started(
+        tmp_path,
+        execution=_execution(mode_id="away", mode_at_ms=_NOW_MS - 1_000),
+        mode_ids=("away", "home"),
+    )
+    first_id = "77777777-7777-4777-8777-777777777777"
+    second_id = "88888888-8888-4888-8888-888888888888"
+
+    await mqtt.inject(mode_command_topic(_PANEL), _command(first_id, "mode", "home"))
+    await _wait_for_bus_commands(bus, 1)
+    await mqtt.inject(mode_command_topic(_PANEL), _command(second_id, "mode", "away"))
+    await _wait_for_bus_commands(bus, 2)
+
+    assert bus.commands == [
+        (_DEVICE_ID, "execution_peripheral", [VarSet("manual_mode_id", "home")]),
+        (_DEVICE_ID, "execution_peripheral", [VarSet("manual_mode_id", "away")]),
+    ]
+    assert _published(mqtt, mode_result_topic(first_id)) == []
+    assert _published(mqtt, mode_result_topic(second_id)) == []
+
+    await bus.emit(_execution(mode_id="home", mode_at_ms=_NOW_MS))
+    await _wait_for_publish(mqtt, mode_result_topic(first_id))
+    await bus.emit(_execution(mode_id="away", mode_at_ms=_NOW_MS + 1))
+    await _wait_for_publish(mqtt, mode_result_topic(second_id))
+
+    assert _payload(_published(mqtt, mode_result_topic(first_id))[-1])["accepted"] is True
+    assert _payload(_published(mqtt, mode_result_topic(second_id))[-1])["accepted"] is True
+    assert bridge._execution is not None
+    assert bridge._execution.variables["manual_mode_id"].value == "away"
+    await bridge.async_shutdown()
+
+
+async def test_poll_confirms_mode_change_when_push_was_missed(tmp_path: Path) -> None:
+    seeded = _execution(mode_id="home", mode_at_ms=_NOW_MS - 1_000)
+    bridge, bus, mqtt, clock, _ = await _started(
+        tmp_path,
+        execution=seeded,
+        mode_ids=("away", "home"),
+    )
+    mqtt.published.clear()
+
+    await bus.emit(_execution(mode_id="away", mode_at_ms=_NOW_MS - 2_000))
+    assert bridge._mode_watermarks[_PANEL] == (_NOW_MS - 1_000, "home")
+
+    command_id = "99999999-9999-4999-8999-999999999999"
+    await mqtt.inject(mode_command_topic(_PANEL), _command(command_id, "mode", "away"))
+    await _wait_for_bus_commands(bus, 1)
+
+    await bridge.poll_executions([_execution(mode_id="away", mode_at_ms=_NOW_MS + 1)])
+    await _wait_for_publish(mqtt, mode_result_topic(command_id))
+
+    assert len(_published(mqtt, mode_event_topic(_PANEL))) == 1
+    result = _payload(_published(mqtt, mode_result_topic(command_id))[-1])
+    assert result["accepted"] is True
+    assert "error" not in result
+
+    await clock.advance_ms(COMMAND_TTL_MS + 1)
+    assert len(_published(mqtt, mode_result_topic(command_id))) == 1
     await bridge.async_shutdown()
 
 
