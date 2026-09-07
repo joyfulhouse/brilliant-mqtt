@@ -2088,9 +2088,8 @@ async def test_poll_confirms_repeated_same_mode_activation_with_new_timestamp(
     # real-time push is missed and it surfaces only through the hot poll. The
     # value-only fingerprint is unchanged, so the manual_mode_id timestamp must
     # gate the poll or the activation (and its pending command) is dropped.
-    clock = FakeClockMs(_NOW_MS)
     seeded = _execution(mode_id="away", mode_at_ms=_NOW_MS - 1_000)
-    bridge, bus, mqtt, clock, _ = await _started(tmp_path, execution=seeded, clock=clock)
+    bridge, bus, mqtt, clock, _ = await _started(tmp_path, execution=seeded)
     mqtt.published.clear()
 
     command_id = "33333333-3333-4333-8333-333333333333"
