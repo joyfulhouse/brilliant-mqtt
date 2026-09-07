@@ -33,6 +33,7 @@ def bus_failure_age(
     path: str,
     *,
     now: float | None = None,
+    service_started_at: float | None = None,
 ) -> float | None:
     """Age of attributable local-bus failure, including bounded crash evidence."""
     sampled_at = time.monotonic() if now is None else now
@@ -44,6 +45,7 @@ def bus_failure_age(
         or record.failure_started_at is None
         or record.bus_updated_at is None
         or record.bus_read_succeeded is None
+        or (service_started_at is not None and record.bus_updated_at < service_started_at)
         or record.failure_started_at > sampled_at
         or record.bus_updated_at > sampled_at
     ):

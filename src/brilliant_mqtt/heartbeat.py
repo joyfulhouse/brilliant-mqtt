@@ -13,7 +13,7 @@ import math
 import os
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal, TextIO
 
 logger = logging.getLogger(__name__)
@@ -26,7 +26,6 @@ MAX_SESSION_RETRY_BACKOFF_S = 60.0
 # bus-attempt writer can hand evidence to its replacement.
 BRIDGE_SERVICE_RESTART_SEC = 5.0
 DEAD_WRITER_RETENTION_S = BRIDGE_SERVICE_RESTART_SEC * 60
-assert DEAD_WRITER_RETENTION_S > BRIDGE_SERVICE_RESTART_SEC
 PHASE_RECORD_VERSION = "v2"
 PHASE_ATTEMPT = "attempt"
 PHASE_SUCCESS = "success"
@@ -129,7 +128,6 @@ class _PhaseLease:
 
 _phase_leases: dict[str, _PhaseLease] = {}
 _owned_phase_records: dict[str, PhaseRecord] = {}
-_pending_failure_history: dict[str, PhaseRecord] = {}
 
 
 def current_boot_id() -> str | None:
@@ -232,17 +230,14 @@ def _inheritable_history(
         or record.bus_read_succeeded is None
         or record.failure_started_at > now
         or record.bus_updated_at > now
+        or now - record.bus_updated_at > DEAD_WRITER_RETENTION_S
     ):
         return None
     if record.pid == pid:
         if not owned or record.process_generation != generation:
             return None
         return None if record.bus_read_succeeded else record
-    if (
-        record.bus_read_succeeded
-        or now > record.bus_updated_at + DEAD_WRITER_RETENTION_S
-        or not process_is_absent(record.pid)
-    ):
+    if record.bus_read_succeeded or not process_is_absent(record.pid):
         return None
     return record
 
@@ -335,7 +330,8 @@ def write_phase(
     the old bus attempt cannot become valid evidence after writer death. Recent
     records from dead writers remain bounded evidence for native-crash loops;
     boot IDs, process start ticks, and retention reject PID reuse and ancient
-    records. Bus startup must stop when this returns false.
+    records. A false return disables reboot attribution; it must not stop the
+    bridge.
     """
     if not path:
         return True
@@ -367,24 +363,18 @@ def write_phase(
                 owned=owned,
                 now=now,
             )
-            _pending_failure_history.pop(path, None)
-            if history is not None and previous is not None and previous.phase == "bus":
-                _pending_failure_history[path] = history
-            failure_started_at = None
-            bus_updated_at = None
-            read_succeeded = None
+            failure_started_at = history.failure_started_at if history is not None else None
+            bus_updated_at = history.bus_updated_at if history is not None else None
+            read_succeeded = history.bus_read_succeeded if history is not None else None
         else:
-            if previous is not None and previous.phase == "pre_bus":
-                history = _pending_failure_history.pop(path, None) if owned else None
-            else:
-                history = _inheritable_history(
-                    previous,
-                    boot_id=boot_id,
-                    pid=pid,
-                    generation=generation,
-                    owned=owned,
-                    now=now,
-                )
+            history = _inheritable_history(
+                previous,
+                boot_id=boot_id,
+                pid=pid,
+                generation=generation,
+                owned=owned,
+                now=now,
+            )
             failure_started_at = (
                 history.failure_started_at
                 if history is not None and not bus_read_succeeded
@@ -402,8 +392,9 @@ def write_phase(
             bus_read_succeeded=read_succeeded,
         )
         encoded = record.encode()
+        written_record = replace(record, phase="pre_bus") if phase == "bus" else record
         try:
-            _atomic_write(path, encoded)
+            _atomic_write(path, written_record.encode())
         except (OSError, UnicodeError) as write_error:
             if _rewrite_phase_lease(path, encoded):
                 _owned_phase_records[path] = record
@@ -418,29 +409,33 @@ def write_phase(
                     exc_info=(type(write_error), write_error, write_error.__traceback__),
                 )
                 return True
-            _pending_failure_history.pop(path, None)
+            _owned_phase_records.pop(path, None)
             _release_phase_lease(path)
             _invalidate_failed_write(path, write_error)
             return False
-        _owned_phase_records[path] = record
+        _owned_phase_records[path] = written_record
         _release_phase_lease(path)
         if phase == "bus":
             try:
                 _acquire_phase_lease(path, now if bus_read_succeeded else None)
             except BlockingIOError:
+                _owned_phase_records.pop(path, None)
                 logger.warning(
                     "bus phase lease unavailable for %s after bounded retries; "
-                    "bus startup remains blocked",
+                    "reboot guard disabled",
                     path,
                     exc_info=True,
                 )
                 return False
+            if not _rewrite_phase_lease(path, encoded):
+                raise OSError("cannot arm bus phase marker")
+            _owned_phase_records[path] = record
         return True
     except BlockingIOError:
         _release_phase_lease(path)
         return False
     except (OSError, UnicodeError) as error:
-        _pending_failure_history.pop(path, None)
+        _owned_phase_records.pop(path, None)
         _release_phase_lease(path)
         _invalidate_failed_write(path, error)
         return False

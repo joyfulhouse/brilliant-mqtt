@@ -6,7 +6,13 @@ from typing import Any, NoReturn
 import pytest
 
 from brilliant_bus_watchdog import bounded
-from brilliant_bus_watchdog.run import _service_active, handle, load_config, should_reboot
+from brilliant_bus_watchdog.run import (
+    _service_active,
+    _service_started_at,
+    handle,
+    load_config,
+    should_reboot,
+)
 
 
 @pytest.mark.parametrize(
@@ -148,3 +154,31 @@ def test_service_active_timeout_reads_as_inactive(monkeypatch: pytest.MonkeyPatc
 
     monkeypatch.setattr(bounded, "run_bounded", spy)
     assert _service_active("brilliant-mqtt") is False
+
+
+def test_service_start_generation_uses_systemd_monotonic_timestamp() -> None:
+    calls: list[list[str]] = []
+
+    def run(argv: list[str]) -> SimpleNamespace:
+        calls.append(argv)
+        return SimpleNamespace(stdout="1901000000\n")
+
+    assert _service_started_at("brilliant-mqtt", run=run) == 1901.0
+    assert calls == [
+        [
+            "systemctl",
+            "show",
+            "--property=ExecMainStartTimestampMonotonic",
+            "--value",
+            "brilliant-mqtt",
+        ]
+    ]
+
+
+@pytest.mark.parametrize("stdout", ["", "garbage", "0", "-1"])
+def test_unknown_service_start_generation_fails_closed(stdout: str) -> None:
+    def run(argv: list[str]) -> SimpleNamespace:
+        del argv
+        return SimpleNamespace(stdout=stdout)
+
+    assert _service_started_at("brilliant-mqtt", run=run) is None

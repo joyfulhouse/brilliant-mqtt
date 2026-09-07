@@ -107,6 +107,9 @@ over WebSockets are unsupported by the panel transport.
   reboot, but writer and reader must still be upgraded and rolled back
   **together**. If a deploy/rollback leaves only one side updated, delete the
   marker before starting either service: `rm -f /run/brilliant-mqtt/bus-phase`.
+  If the marker cannot be written or leased, the bridge logs an error and keeps
+  serving; the watchdog treats the marker as unattributable and degrades to no
+  reboot rather than risking a false panel reboot.
 
 > **Office safety stop:** Office is reserved for the existing-external-broker,
 > software-only canary. Keep its broker endpoint, TLS profile, and credentials

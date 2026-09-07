@@ -45,8 +45,18 @@ print("ready", flush=True)
 time.sleep(60.0)
 """
 
+_ATTEMPT_HISTORY_WRITER = """
+import sys
+from brilliant_mqtt.heartbeat import write_phase
+
+path = sys.argv[1]
+for now in range(100, 1901, 300):
+    write_phase(path, "bus", monotonic_clock=lambda: float(now))
+"""
+
 _FAILED_INVALIDATION_WRITER = """
 import asyncio
+import builtins
 import os
 import signal
 import sys
@@ -74,16 +84,24 @@ class BrokerFailure:
         pass
 
 path = sys.argv[1]
-heartbeat.write_phase(
-    path,
-    "bus",
-    monotonic_clock=lambda: 100.0,
-)
-heartbeat.write_phase(path, "bus", monotonic_clock=lambda: 1900.0)
 def denied(*args, **kwargs):
     raise PermissionError("read-only phase directory")
+real_open = builtins.open
+def denied_update(file, mode="r", *args, **kwargs):
+    if str(file) == path and mode == "r+":
+        raise PermissionError("read-only phase marker")
+    return real_open(file, mode, *args, **kwargs)
+def write_phase(path, phase, *, bus_read_succeeded=False):
+    return heartbeat.write_phase(
+        path,
+        phase,
+        bus_read_succeeded=bus_read_succeeded,
+        monotonic_clock=lambda: 1901.0,
+    )
 heartbeat._atomic_write = denied
 heartbeat.os.unlink = denied
+heartbeat.open = denied_update
+main_mod.write_phase = write_phase
 main_mod.RpcBusAdapter = lambda **kwargs: RecoveredBus()
 main_mod.AioMqttAdapter = lambda settings: BrokerFailure()
 settings = Settings(
@@ -224,10 +242,22 @@ def test_killed_bus_writers_qualify_during_service_restart_backoff(tmp_path: Pat
     for now in samples:
         process = _start_phase_writer(phase, now)
         try:
-            assert bus_failure_age(str(phase), now=now) == now - samples[0]
+            service_started_at = now - 1.0
+            assert (
+                bus_failure_age(
+                    str(phase),
+                    now=now,
+                    service_started_at=service_started_at,
+                )
+                == now - samples[0]
+            )
             process.kill()
             assert process.wait(timeout=5.0) == -signal.SIGKILL
-            failure_age = bus_failure_age(str(phase), now=now)
+            failure_age = bus_failure_age(
+                str(phase),
+                now=now,
+                service_started_at=service_started_at,
+            )
             decisions.append(
                 should_reboot(
                     age=2200.0,
@@ -243,14 +273,25 @@ def test_killed_bus_writers_qualify_during_service_restart_backoff(tmp_path: Pat
                 process.wait(timeout=5.0)
 
     assert decisions[:-1] == [False] * 7
-    assert bus_failure_age(str(phase), now=samples[-1]) == samples[-1] - samples[0]
+    assert (
+        bus_failure_age(
+            str(phase),
+            now=samples[-1],
+            service_started_at=samples[-1] - 1.0,
+        )
+        == samples[-1] - samples[0]
+    )
     assert decisions[-1] is True
     assert not should_reboot(
         age=2200.0,
         stale_after=1800.0,
         bridge_active=_service_is("inactive"),
         gateway_up=True,
-        bus_failure_age=bus_failure_age(str(phase), now=samples[-1]),
+        bus_failure_age=bus_failure_age(
+            str(phase),
+            now=samples[-1],
+            service_started_at=samples[-1] - 1.0,
+        ),
     )
 
 
@@ -315,13 +356,21 @@ def test_bus_record_from_an_earlier_process_generation_is_rejected(tmp_path: Pat
 
 def test_failed_invalidation_stays_revoked_after_writer_death(tmp_path: Path) -> None:
     phase = tmp_path / "bus-phase"
+    subprocess.run(
+        [sys.executable, "-c", _ATTEMPT_HISTORY_WRITER, str(phase)],
+        check=True,
+    )
     process = subprocess.run(
         [sys.executable, "-c", _FAILED_INVALIDATION_WRITER, str(phase)],
         check=False,
     )
     assert process.returncode == -signal.SIGKILL
 
-    failure_age = bus_failure_age(str(phase), now=1901.0)
+    failure_age = bus_failure_age(
+        str(phase),
+        now=1901.0,
+        service_started_at=1901.0,
+    )
     assert failure_age is None
     assert not should_reboot(
         age=1801.0,

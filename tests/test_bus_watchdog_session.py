@@ -34,11 +34,17 @@ class _Bus:
         block_start_until: asyncio.Event | None = None,
         entered_start: asyncio.Event | None = None,
         read_error: Exception | None = None,
+        block_read_at: int | None = None,
+        entered_read: asyncio.Event | None = None,
+        release_read: asyncio.Event | None = None,
     ) -> None:
         self.start_error = start_error
         self.start_calls = 0
         self.read_calls = 0
         self.read_error = read_error
+        self._block_read_at = block_read_at
+        self._entered_read = entered_read
+        self._release_read = release_read
         # When set, start() parks on this event (a bus still handshaking), and
         # signals entered_start once it has been reached — so a test can inspect
         # the phase/heartbeat mid-handshake.
@@ -68,6 +74,11 @@ class _Bus:
 
     async def get_all(self) -> list[BrilliantDevice]:
         self.read_calls += 1
+        if self.read_calls == self._block_read_at:
+            assert self._entered_read is not None
+            assert self._release_read is not None
+            self._entered_read.set()
+            await self._release_read.wait()
         if self.read_error is not None:
             raise self.read_error
         return []
@@ -152,6 +163,12 @@ class _ReadingBridge:
         return
 
 
+class _ReadThenWedgeBridge(_ReadingBridge):
+    async def reconcile(self) -> None:
+        await super().reconcile()
+        await self._bus.get_all()
+
+
 def _settings(
     tmp_path: Path,
     mesh_priority: int = 0,
@@ -183,9 +200,13 @@ def _install_session_fakes(
     monkeypatch: pytest.MonkeyPatch,
     bus: _Bus,
     mqtt: _Mqtt,
-    bridge: type[_NoopBridge] | type[_ReadOnceBridge] | type[_ReadingBridge] | type[Bridge] = (
-        _NoopBridge
-    ),
+    bridge: (
+        type[_NoopBridge]
+        | type[_ReadOnceBridge]
+        | type[_ReadingBridge]
+        | type[_ReadThenWedgeBridge]
+        | type[Bridge]
+    ) = _NoopBridge,
 ) -> None:
     monkeypatch.setattr(main_mod, "RpcBusAdapter", lambda **kwargs: bus)
     monkeypatch.setattr(main_mod, "AioMqttAdapter", lambda settings: mqtt)
@@ -449,11 +470,11 @@ async def test_sustained_bus_handshake_failure_still_uses_reboot_guard(
     settings = _settings(tmp_path)
     _install_session_fakes(monkeypatch, bus, mqtt)
 
-    for attempt in range(7):
+    for attempt in range(8):
         with pytest.raises(ConnectionError, match="bus handshake failed"):
             await main_mod._run_session(settings, None, None)
-        if attempt < 6:
-            clock.advance(301.0)
+        if attempt < 7:
+            clock.advance(299.0)
 
     failure_age = bus_failure_age(settings.bus_phase_file, now=clock())
     age = heartbeat_age(settings.bus_heartbeat_file, now=1900.0, started_at=0.0)
@@ -468,9 +489,9 @@ async def test_sustained_bus_handshake_failure_still_uses_reboot_guard(
         gateway_up=True,
         bus_failure_age=failure_age,
     )
-    assert bus.start_calls == 7
-    assert mqtt.connect_calls == 7
-    assert failure_age == 1806.0
+    assert bus.start_calls == 8
+    assert mqtt.connect_calls == 8
+    assert failure_age == 2093.0
     assert decision is True
 
     reboots: list[str] = []
@@ -539,17 +560,62 @@ async def test_broker_only_gap_breaks_prior_bus_failure_history(
             await task
 
 
-async def test_bus_start_waits_until_phase_lease_retry_is_armed(
+async def test_short_broker_blip_preserves_current_bus_failure_history(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     settings = _settings(tmp_path)
     clock = FakeClock()
     _install_watchdog_clock(monkeypatch, clock)
+
+    _install_session_fakes(
+        monkeypatch,
+        _Bus(ConnectionError("bus handshake failed")),
+        _Mqtt(),
+    )
+    with pytest.raises(ConnectionError, match="bus handshake failed"):
+        await main_mod._run_session(settings, None, None)
+
+    clock.advance(100.0)
+    _install_session_fakes(
+        monkeypatch,
+        _Bus(),
+        _Mqtt(ConnectionError("broker refused")),
+    )
+    with pytest.raises(ConnectionError, match="broker refused"):
+        await main_mod._run_session(settings, None, None)
+
+    clock.advance(100.0)
     entered_start = asyncio.Event()
     finish_start = asyncio.Event()
-    bus = _Bus(block_start_until=finish_start, entered_start=entered_start)
-    mqtt = _Mqtt()
-    _install_session_fakes(monkeypatch, bus, mqtt, _ReadingBridge)
+    recovered_bus = _Bus(block_start_until=finish_start, entered_start=entered_start)
+    _install_session_fakes(monkeypatch, recovered_bus, _Mqtt(), _ReadingBridge)
+
+    task = asyncio.create_task(main_mod._run_session(settings, None, None))
+    try:
+        await asyncio.wait_for(entered_start.wait(), timeout=1.0)
+        failure_age = bus_failure_age(settings.bus_phase_file, now=clock())
+        assert failure_age == 200.0
+        assert not should_reboot(
+            age=200.0,
+            stale_after=1800.0,
+            bridge_active=True,
+            gateway_up=True,
+            bus_failure_age=failure_age,
+        )
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+async def test_bus_start_waits_until_phase_lease_retry_is_armed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    settings = _settings(tmp_path)
+    clock = FakeClock()
+    _install_watchdog_clock(monkeypatch, clock)
+    bus = _Bus(ConnectionError("bus handshake failed"))
+    _install_session_fakes(monkeypatch, bus, _Mqtt(), _ReadingBridge)
 
     real_flock = fcntl.flock
     collisions_remaining = 3
@@ -562,18 +628,28 @@ async def test_bus_start_waits_until_phase_lease_retry_is_armed(
         real_flock(fd, operation)
 
     monkeypatch.setattr("brilliant_mqtt.heartbeat.fcntl.flock", _flock)
-    with pytest.raises(RuntimeError, match="bus failure attribution unavailable"):
-        await asyncio.wait_for(main_mod._run_session(settings, None, None), timeout=1.0)
-    assert bus.start_calls == 0
+    with caplog.at_level(logging.ERROR, logger="brilliant_mqtt.__main__"):
+        with pytest.raises(ConnectionError, match="bus handshake failed"):
+            await main_mod._run_session(settings, None, None)
+    assert bus.start_calls == 1
+    assert bus_failure_age(settings.bus_phase_file, now=clock()) is None
+    failed_record = heartbeat.read_phase_record(settings.bus_phase_file)
+    assert failed_record is not None
+    assert failed_record.phase == "pre_bus"
+    assert any("reboot guard disabled" in record.getMessage() for record in caplog.records)
 
-    clock.advance(1900.0)
+    clock.advance(100.0)
+    entered_start = asyncio.Event()
+    finish_start = asyncio.Event()
+    bus = _Bus(block_start_until=finish_start, entered_start=entered_start)
+    _install_session_fakes(monkeypatch, bus, _Mqtt(), _ReadingBridge)
     task = asyncio.create_task(main_mod._run_session(settings, None, None))
     try:
         await asyncio.wait_for(entered_start.wait(), timeout=1.0)
         failure_age = bus_failure_age(settings.bus_phase_file, now=clock())
         assert bus.start_calls == 1
-        assert failure_age == 1900.0
-        assert should_reboot(
+        assert failure_age == 0.0
+        assert not should_reboot(
             age=1900.0,
             stale_after=1800.0,
             bridge_active=True,
@@ -584,6 +660,59 @@ async def test_bus_start_waits_until_phase_lease_retry_is_armed(
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
+
+
+async def test_failed_success_stamp_keeps_bridge_up_without_reboot_attribution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    settings = _settings(tmp_path)
+    clock = FakeClock()
+    _install_watchdog_clock(monkeypatch, clock)
+    entered_wedge = asyncio.Event()
+    release_wedge = asyncio.Event()
+    bus = _Bus(
+        block_read_at=2,
+        entered_read=entered_wedge,
+        release_read=release_wedge,
+    )
+    _install_session_fakes(monkeypatch, bus, _Mqtt(), _ReadThenWedgeBridge)
+
+    real_flock = fcntl.flock
+    lease_attempt = 0
+
+    def _flock(fd: int, operation: int) -> None:
+        nonlocal lease_attempt
+        if operation == fcntl.LOCK_EX | fcntl.LOCK_NB:
+            lease_attempt += 1
+            if 2 <= lease_attempt <= 4:
+                raise BlockingIOError
+        real_flock(fd, operation)
+
+    monkeypatch.setattr("brilliant_mqtt.heartbeat.fcntl.flock", _flock)
+    with caplog.at_level(logging.ERROR, logger="brilliant_mqtt.__main__"):
+        task = asyncio.create_task(main_mod._run_session(settings, None, None))
+        try:
+            await asyncio.wait_for(entered_wedge.wait(), timeout=1.0)
+            clock.advance(1900.0)
+            failure_age = bus_failure_age(settings.bus_phase_file, now=clock())
+            assert not task.done()
+            assert bus.start_calls == 1
+            assert bus.read_calls == 2
+            assert failure_age is None
+            assert not should_reboot(
+                age=1900.0,
+                stale_after=1800.0,
+                bridge_active=True,
+                gateway_up=True,
+                bus_failure_age=failure_age,
+            )
+            assert any("reboot guard disabled" in record.getMessage() for record in caplog.records)
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
 
 async def test_successful_bus_read_refreshes_heartbeat_without_resetting_phase(

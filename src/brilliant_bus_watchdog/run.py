@@ -108,6 +108,24 @@ def _service_active(service: str, run: Any = None) -> bool:
         return False
 
 
+def _service_started_at(service: str, run: Any = None) -> float | None:
+    runner = run or (lambda argv: bounded.run_bounded(argv, timeout=_SERVICE_TIMEOUT, capture=True))
+    try:
+        result = runner(
+            [
+                "systemctl",
+                "show",
+                "--property=ExecMainStartTimestampMonotonic",
+                "--value",
+                service,
+            ]
+        )
+        started_at_us = int((result.stdout or "").strip())
+    except (OSError, ValueError):
+        return None
+    return started_at_us / 1_000_000 if started_at_us > 0 else None
+
+
 def _configure_logging(path: str) -> None:
     handler = logging.handlers.RotatingFileHandler(path, maxBytes=512_000, backupCount=3)
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
@@ -126,7 +144,16 @@ def main() -> None:  # pragma: no cover - thin loop
         gw = cfg.gateway or probe.default_gateway()
         gateway_up = probe.ping(gw) if gw else False
         active = _service_active(cfg.bridge_service)
-        failure_age = bus_failure_age(cfg.phase_path, now=time.monotonic())
+        service_started_at = _service_started_at(cfg.bridge_service)
+        failure_age = (
+            bus_failure_age(
+                cfg.phase_path,
+                now=time.monotonic(),
+                service_started_at=service_started_at,
+            )
+            if service_started_at is not None
+            else None
+        )
         should = should_reboot(
             age=age,
             bridge_active=active,

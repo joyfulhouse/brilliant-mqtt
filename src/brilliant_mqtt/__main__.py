@@ -195,7 +195,8 @@ async def _run_session(
 
         def _beat() -> None:
             write_heartbeat(settings.bus_heartbeat_file, time.time)
-            write_phase(settings.bus_phase_file, "bus", bus_read_succeeded=True)
+            if not write_phase(settings.bus_phase_file, "bus", bus_read_succeeded=True):
+                log.error("bus phase marker unavailable; reboot guard disabled")
 
         # Bridges register their bus/mqtt callbacks in __init__, BEFORE any I/O
         # starts — so no early change/command event is missed.
@@ -292,7 +293,7 @@ async def _run_session(
         # MQTT/mesh-side startup failure, not a bus failure, and must leave
         # the phase at "pre_bus".
         if not write_phase(settings.bus_phase_file, "bus"):
-            raise RuntimeError("bus failure attribution unavailable")
+            log.error("bus phase marker unavailable; reboot guard disabled")
         await bus.start()
         await panel_bridge.reconcile()
         if scene_bridge is not None:

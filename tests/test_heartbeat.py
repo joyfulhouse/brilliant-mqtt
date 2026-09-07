@@ -151,10 +151,15 @@ def test_failure_after_success_starts_fresh_attribution(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    "spacing",
-    [DEAD_WRITER_RETENTION_S - 1.0, DEAD_WRITER_RETENTION_S + 1.0],
+    ("spacing", "expected_age"),
+    [
+        (DEAD_WRITER_RETENTION_S - 1.0, DEAD_WRITER_RETENTION_S - 1.0),
+        (DEAD_WRITER_RETENTION_S + 1.0, 0.0),
+    ],
 )
-def test_live_writer_failure_history_survives_retry_spacing(tmp_path: Path, spacing: float) -> None:
+def test_bus_failure_history_obeys_retry_gap_bound(
+    tmp_path: Path, spacing: float, expected_age: float
+) -> None:
     phase = tmp_path / f"bus-phase-{spacing}"
     write_phase(str(phase), "bus", monotonic_clock=lambda: 100.0)
     retry_at = 100.0 + spacing
@@ -162,7 +167,7 @@ def test_live_writer_failure_history_survives_retry_spacing(tmp_path: Path, spac
     write_phase(str(phase), "pre_bus", monotonic_clock=lambda: retry_at)
     write_phase(str(phase), "bus", monotonic_clock=lambda: retry_at)
 
-    assert bus_failure_age(str(phase), now=retry_at) == spacing
+    assert bus_failure_age(str(phase), now=retry_at) == expected_age
 
 
 def test_phase_lease_retries_a_transient_watchdog_lock_collision(
