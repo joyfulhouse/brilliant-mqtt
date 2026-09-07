@@ -384,27 +384,19 @@ def write_phase(
         generation = process_generation(pid)
         if boot_id is None or generation is None:
             raise OSError("cannot establish boot/process generation")
+        history = _inheritable_history(
+            previous,
+            boot_id=boot_id,
+            pid=pid,
+            generation=generation,
+            owned=owned,
+            now=now,
+        )
         if phase == "pre_bus":
-            history = _inheritable_history(
-                previous,
-                boot_id=boot_id,
-                pid=pid,
-                generation=generation,
-                owned=owned,
-                now=now,
-            )
             failure_started_at = history.failure_started_at if history is not None else None
             bus_updated_at = history.bus_updated_at if history is not None else None
             read_succeeded = history.bus_read_succeeded if history is not None else None
         else:
-            history = _inheritable_history(
-                previous,
-                boot_id=boot_id,
-                pid=pid,
-                generation=generation,
-                owned=owned,
-                now=now,
-            )
             failure_started_at = (
                 history.failure_started_at
                 if history is not None and not bus_read_succeeded
