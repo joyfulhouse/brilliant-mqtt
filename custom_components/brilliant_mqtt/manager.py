@@ -1827,6 +1827,7 @@ class PanelManager:
         )
 
     def _defer_recovery_verdict(self) -> None:
+        self._cancel("_grace_cancel")
         self._recovery_deferred = True
         _LOGGER.info(
             "%s: recovery window elapsed but HA's MQTT broker is unavailable; "
