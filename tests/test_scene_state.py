@@ -262,15 +262,13 @@ def _pending_entry(
     *,
     expires_at_ms: int,
     confirm_after_ms: int | None = None,
-    equal_at_request: bool | None = None,
-    kind: StateKind = "scene",
 ) -> dict[str, object]:
     entry: dict[str, object] = {
-        "kind": kind,
+        "kind": "scene",
         "command_id": _COMMAND_ID,
         "value": _SCENE_ID,
         "fingerprint": command_fingerprint_fields(
-            kind, _COMMAND_ID, _PANEL, _SCENE_ID, _ISSUED_AT_MS
+            "scene", _COMMAND_ID, _PANEL, _SCENE_ID, _ISSUED_AT_MS
         ),
         "panel": _PANEL,
         "issued_at_ms": _ISSUED_AT_MS,
@@ -278,33 +276,23 @@ def _pending_entry(
     }
     if confirm_after_ms is not None:
         entry["confirm_after_ms"] = confirm_after_ms
-    if equal_at_request is not None:
-        entry["equal_at_request"] = equal_at_request
     return entry
 
 
 def _pending_state_file(tmp_path: Path, entry: dict[str, object]) -> Path:
     raw = state_payload(SceneState())
-    raw["pending"] = {f"{entry['kind']}:{_COMMAND_ID}": entry}
+    raw["pending"] = {f"scene:{_COMMAND_ID}": entry}
     path = tmp_path / "state.json"
     path.write_text(json.dumps(raw))
     return path
 
 
-def test_pending_confirmation_fields_round_trip(tmp_path: Path) -> None:
-    fingerprint = command_fingerprint_fields("mode", _COMMAND_ID, _PANEL, _SCENE_ID, _ISSUED_AT_MS)
+def test_pending_confirm_after_ms_round_trips(tmp_path: Path) -> None:
+    fingerprint = command_fingerprint_fields("scene", _COMMAND_ID, _PANEL, _SCENE_ID, _ISSUED_AT_MS)
     pending = StatePending(
-        "mode",
-        _COMMAND_ID,
-        _SCENE_ID,
-        fingerprint,
-        _PANEL,
-        _ISSUED_AT_MS,
-        20_000,
-        5_000,
-        True,
+        "scene", _COMMAND_ID, _SCENE_ID, fingerprint, _PANEL, _ISSUED_AT_MS, 20_000, 5_000
     )
-    state = SceneState(pending=((("mode", _COMMAND_ID), pending),))
+    state = SceneState(pending=((("scene", _COMMAND_ID), pending),))
     path = tmp_path / "private" / "state.json"
 
     atomic_write_state(path, state)
@@ -312,9 +300,8 @@ def test_pending_confirmation_fields_round_trip(tmp_path: Path) -> None:
 
     assert loaded.trusted is True
     assert loaded.state == state
-    persisted = json.loads(path.read_text())["pending"][f"mode:{_COMMAND_ID}"]
+    persisted = json.loads(path.read_text())["pending"][f"scene:{_COMMAND_ID}"]
     assert persisted["confirm_after_ms"] == 5_000
-    assert persisted["equal_at_request"] is True
 
 
 def test_load_pending_with_confirm_after_ms_is_preserved(tmp_path: Path) -> None:
@@ -328,26 +315,6 @@ def test_load_pending_with_confirm_after_ms_is_preserved(tmp_path: Path) -> None
     assert loaded.reason is None
     ((_, pending),) = loaded.state.pending
     assert pending.confirm_after_ms == 5_000
-
-
-def test_load_pending_with_equal_at_request_is_preserved(tmp_path: Path) -> None:
-    path = _pending_state_file(
-        tmp_path,
-        _pending_entry(expires_at_ms=20_000, equal_at_request=True, kind="mode"),
-    )
-
-    loaded = load_state(path)
-
-    assert loaded.trusted is True
-    ((_, pending),) = loaded.state.pending
-    assert pending.equal_at_request is True
-
-    for bad in (0, 1, "true", None):
-        entry = _pending_entry(expires_at_ms=20_000, kind="mode")
-        entry["equal_at_request"] = bad
-        invalid = load_state(_pending_state_file(tmp_path, entry))
-        assert invalid.trusted is False
-        assert invalid.reason == "state_untrusted"
 
 
 def test_load_pending_without_confirm_after_ms_reconstructs_fallback_baseline(
@@ -365,7 +332,6 @@ def test_load_pending_without_confirm_after_ms_reconstructs_fallback_baseline(
     assert loaded.reason is None
     ((_, pending),) = loaded.state.pending
     assert pending.confirm_after_ms == expires_at_ms - COMMAND_TTL_MS
-    assert pending.equal_at_request is False
 
 
 @pytest.mark.parametrize("bad", [-1, "5000", 20_001, 1.5])

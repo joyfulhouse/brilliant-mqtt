@@ -2934,13 +2934,31 @@ async def test_pre_request_stamp_during_mode_write_cannot_trigger_equality_confi
 
 
 async def test_rejected_mode_snapshot_cannot_confirm_later_request(tmp_path: Path) -> None:
+    class HoldingBus(FakeBus):
+        def __init__(self) -> None:
+            super().__init__(
+                [_execution(mode_id="home", mode_at_ms=150)],
+                scoped_devices=[
+                    _scene_catalog("all_off"),
+                    _mode_catalog("away", "home"),
+                ],
+            )
+            self.write_started = asyncio.Event()
+            self.release_write = asyncio.Event()
+
+        async def set_variables(
+            self, device_id: str, peripheral_id: str, sets: list[VarSet]
+        ) -> str:
+            receipt = await super().set_variables(device_id, peripheral_id, sets)
+            self.write_started.set()
+            await self.release_write.wait()
+            return receipt
+
     clock = FakeClockMs(200)
-    bridge, bus, mqtt, _, _ = await _started(
-        tmp_path,
-        clock=clock,
-        execution=_execution(mode_id="home", mode_at_ms=150),
-        mode_ids=("away", "home"),
-    )
+    bus = HoldingBus()
+    mqtt = FakeMqtt()
+    bridge = SceneBridge(bus, mqtt, _PANEL, tmp_path / "state.json", clock)
+    await bridge.async_start()
     mqtt.published.clear()
 
     await bus.emit(_execution(mode_id="away", mode_at_ms=100))
@@ -2951,7 +2969,15 @@ async def test_rejected_mode_snapshot_cannot_confirm_later_request(tmp_path: Pat
         mode_command_topic(_PANEL),
         _command(command_id, "mode", "away", issued_at_ms=clock.now_ms),
     )
-    await _wait_for_bus_commands(bus, 1)
+    await asyncio.wait_for(bus.write_started.wait(), timeout=0.1)
+    pending = bridge._mode_pending[command_id]
+    write_task = pending.write_task
+    assert write_task is not None
+    bus.release_write.set()
+    await asyncio.wait_for(write_task, timeout=2)
+    delivery_task = bridge._delivery_task
+    assert delivery_task is not None
+    await asyncio.wait_for(delivery_task, timeout=2)
 
     assert bus.commands == [
         (_DEVICE_ID, "execution_peripheral", [VarSet("manual_mode_id", "away")])
@@ -3083,9 +3109,15 @@ async def test_mode_execution_newer_than_watermark_but_before_request_does_not_c
     tmp_path: Path,
 ) -> None:
     clock = FakeClockMs(200)
-    bridge, bus, mqtt, _, _ = await _started(tmp_path, clock=clock)
+    bridge, bus, mqtt, _, _ = await _started(
+        tmp_path,
+        clock=clock,
+        execution=_execution(mode_id="home", mode_at_ms=100),
+        mode_ids=("away", "home"),
+    )
     bus.set_variables_receipt = _OpaqueReceipt("opaque transport acknowledgement")
-    bridge._mode_watermarks[_PANEL] = (100, "away")
+    await bus.emit(_execution(mode_id="away", mode_at_ms=99))
+    assert bridge._mode_watermarks[_PANEL] == (100, "home")
     command_id = "55555555-5555-4555-8555-555555555555"
 
     await mqtt.inject(
@@ -3094,7 +3126,7 @@ async def test_mode_execution_newer_than_watermark_but_before_request_does_not_c
     )
     await _wait_for_bus_commands(bus, 1)
 
-    # away@101 is previously unseen and newer than away@100, but both executions
+    # away@101 is previously unseen and newer than home@100, but it still
     # occurred before the request baseline at 200.
     await bus.emit(_execution(mode_id="away", mode_at_ms=101))
     await _wait_for_publish(mqtt, mode_event_topic(_PANEL))

@@ -87,7 +87,6 @@ class StatePending:
     # only if executed_at_ms >= confirm_after_ms. Persisted so a reconnect/restart
     # still rejects a pre-baseline (delayed/historical) replay.
     confirm_after_ms: int
-    equal_at_request: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,7 +185,6 @@ def state_payload(state: SceneState) -> dict[str, object]:
             "issued_at_ms": record.issued_at_ms,
             "expires_at_ms": record.expires_at_ms,
             "confirm_after_ms": record.confirm_after_ms,
-            "equal_at_request": record.equal_at_request,
         }
         for (kind, command_id), record in state.pending
     }
@@ -496,11 +494,13 @@ def _parse_state(raw: object) -> SceneState:
             "issued_at_ms",
             "expires_at_ms",
         }
-        optional = {"confirm_after_ms", "equal_at_request"}
+        # #94: confirm_after_ms is an OPTIONAL key. Reject unknown keys as before,
+        # but tolerate the field's presence or absence so STATE_VERSION stays 1 and
+        # old fleet files load trusted (no version bump, no state invalidation).
         if (
             not isinstance(pending_key, str)
             or not isinstance(value, dict)
-            or not required <= set(value) <= required | optional
+            or not required <= set(value) <= required | {"confirm_after_ms"}
         ):
             raise StateValidationError("invalid pending entry")
         kind = _validated_kind(value["kind"])
@@ -535,9 +535,6 @@ def _parse_state(raw: object) -> SceneState:
             raise StateValidationError("invalid pending confirm baseline")
         else:
             confirm_after_ms = expires_at_ms - COMMAND_TTL_MS
-        equal_at_request = value.get("equal_at_request", False)
-        if type(equal_at_request) is not bool:
-            raise StateValidationError("invalid pending request equality")
         UUID(command_id)
         if fingerprint != command_fingerprint_fields(
             kind, command_id, command_panel, command_value, issued_at_ms
@@ -558,7 +555,6 @@ def _parse_state(raw: object) -> SceneState:
                     issued_at_ms,
                     expires_at_ms,
                     confirm_after_ms,
-                    equal_at_request,
                 ),
             )
         )
