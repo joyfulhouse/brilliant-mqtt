@@ -10,18 +10,22 @@ from __future__ import annotations
 import logging
 import logging.handlers
 import os
-import subprocess
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from . import probe
+from . import bounded, probe
 from .health import bus_confirmed, heartbeat_age
 from .reboot import reboot as _reboot
 from .reboot_guard import GuardPolicy, RebootGuard
 
 _LOG = logging.getLogger("brilliant_bus_watchdog")
+
+# Wall-clock bound for the `systemctl is-active` probe; a hung systemd query must
+# not read as active (which would wrongly let the watchdog believe the bridge is
+# up) and must not wedge the loop.
+_SERVICE_TIMEOUT = 5.0
 
 
 class _GuardLike(Protocol):
@@ -89,7 +93,7 @@ def handle(*, should: bool, guard: _GuardLike, now: float, reboot_fn: Any = _reb
 
 
 def _service_active(service: str, run: Any = None) -> bool:
-    runner = run or (lambda argv: subprocess.run(argv, capture_output=True, text=True))
+    runner = run or (lambda argv: bounded.run_bounded(argv, timeout=_SERVICE_TIMEOUT, capture=True))
     try:
         r = runner(["systemctl", "is-active", service])
         return (r.stdout or "").strip() == "active"
