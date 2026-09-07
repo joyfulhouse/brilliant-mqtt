@@ -50,10 +50,13 @@ class _Bus:
         callback: Callable[[BrilliantDevice], Awaitable[None]],
         *,
         coalesce_pushes: bool = True,
+        want_device: Callable[[str], bool] | None = None,
     ) -> None:
         # Registered by the real SceneBridge at startup; it never fires in these
         # tests (startup fails at the MQTT subscribe, before any bus push).
-        del callback, coalesce_pushes
+        # Signature mirrors ``BusClient.on_change`` / ``tests.fakes.FakeBus``
+        # (``want_device`` added by #98) so the real bridge can register.
+        del callback, coalesce_pushes, want_device
 
     async def start(self) -> None:
         self.start_calls += 1
