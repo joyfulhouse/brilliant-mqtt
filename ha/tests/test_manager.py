@@ -1301,6 +1301,218 @@ async def test_recovery_timeout_defers_while_broker_down(
     assert "needs_attention" not in _types(events)
 
 
+async def test_recovery_timeout_defers_broker_loss_behind_ssh_lock(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """#132: broker loss while queued for fleet SSH must skip SSH and defer."""
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    broker = SimpleNamespace(available=True)
+    lock = asyncio.Lock()
+    manager = _broker_gated_manager(hass, entry, broker, lock)
+    manager.availability = "offline"
+    manager._recovery_origin = "repair"
+    events = _capture_events(hass)
+    shell = FakeShell()
+
+    await lock.acquire()
+    with patch.object(manager, "_shell", return_value=shell):
+        timeout = hass.async_create_task(manager._recovery_timeout(dt_util.utcnow()))
+        await asyncio.sleep(0)
+        broker.available = False
+        lock.release()
+        await timeout
+    await hass.async_block_till_done()
+
+    assert (
+        shell.connect_count,
+        _types(events),
+        manager._recovery_deferred,
+        manager.problem,
+    ) == (0, [], True, False)
+    await manager.async_shutdown()
+
+
+async def test_obsolete_recovery_timeout_does_not_defer_broker_loss_behind_ssh_lock(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """#132: a stale queued timeout must not defer a fresh recovery window."""
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    broker = SimpleNamespace(available=True)
+    lock = asyncio.Lock()
+    manager = _broker_gated_manager(hass, entry, broker, lock)
+    manager.availability = "offline"
+    manager._recovery_origin = "repair"
+    events = _capture_events(hass)
+    shell = FakeShell()
+
+    await lock.acquire()
+    with patch.object(manager, "_shell", return_value=shell):
+        timeout = hass.async_create_task(manager._recovery_timeout(dt_util.utcnow()))
+        await asyncio.sleep(0)
+        manager._arm_recovery("update")
+        broker.available = False
+        lock.release()
+        await timeout
+
+    try:
+        assert shell.connect_count == 0
+        assert manager._recovery_deferred is False
+        assert manager._recovery_cancel is not None
+        assert cast(str, manager._recovery_origin) == "update"
+        assert _types(events) == []
+    finally:
+        await manager.async_shutdown()
+
+
+async def test_recovery_timeout_defers_broker_loss_during_journal_collection(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """#132: broker loss during journal I/O makes the recovery verdict unknowable."""
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    broker = SimpleNamespace(available=True)
+    manager = _broker_gated_manager(hass, entry, broker)
+    manager.availability = "offline"
+    manager._recovery_origin = "repair"
+    events = _capture_events(hass)
+    shell = FakeShell()
+    journal_started = asyncio.Event()
+    release_journal = asyncio.Event()
+
+    async def blocked_collect_journal(_shell: FakeShell, _lines: int) -> str:
+        journal_started.set()
+        await release_journal.wait()
+        return "bridge remains offline"
+
+    with (
+        patch.object(manager, "_shell", return_value=shell),
+        patch.object(panel_ops, "collect_journal", side_effect=blocked_collect_journal),
+    ):
+        timeout = hass.async_create_task(manager._recovery_timeout(dt_util.utcnow()))
+        await journal_started.wait()
+        broker.available = False
+        release_journal.set()
+        await timeout
+    await hass.async_block_till_done()
+
+    assert (
+        shell.connect_count,
+        _types(events),
+        manager._recovery_deferred,
+        manager.problem,
+    ) == (1, [], True, False)
+    await manager.async_shutdown()
+
+
+async def test_recovery_timeout_verdicts_after_broker_recovers_during_journal(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """A transient outage must not stick or leave grace beside the recovery verdict."""
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    broker = SimpleNamespace(available=True)
+    manager = _broker_gated_manager(hass, entry, broker)
+    manager.availability = "offline"
+    manager._recovery_origin = "repair"
+    events = _capture_events(hass)
+    shell = FakeShell()
+    journal_started = asyncio.Event()
+    release_journal = asyncio.Event()
+
+    async def blocked_collect_journal(_shell: FakeShell, _lines: int) -> str:
+        journal_started.set()
+        await release_journal.wait()
+        return "bridge remains offline"
+
+    with (
+        patch.object(manager, "_shell", return_value=shell),
+        patch.object(panel_ops, "collect_journal", side_effect=blocked_collect_journal),
+    ):
+        timeout = hass.async_create_task(manager._recovery_timeout(dt_util.utcnow()))
+        await journal_started.wait()
+        broker.available = False
+        await asyncio.sleep(0)
+        broker.available = True
+        manager.async_broker_reconnected()
+        release_journal.set()
+        await timeout
+    await hass.async_block_till_done()
+
+    try:
+        assert shell.connect_count == 1
+        assert manager._recovery_deferred is False
+        assert manager.problem_reason == "bridge did not come back within 60 s after the repair"
+        assert _types(events) == ["repair_failed", "needs_attention"]
+        assert manager._grace_cancel is None
+        assert manager._recovery_cancel is None
+    finally:
+        await manager.async_shutdown()
+
+
+async def test_recovery_timeout_post_journal_defer_cancels_reconnect_grace(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """A second broker loss defers recovery without retaining reconnect grace."""
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    broker = SimpleNamespace(available=True)
+    manager = _broker_gated_manager(hass, entry, broker)
+    manager.availability = "offline"
+    manager._recovery_origin = "repair"
+    generation = manager._recovery_generation
+    events = _capture_events(hass)
+    shell = FakeShell()
+    journal_started = asyncio.Event()
+    release_journal = asyncio.Event()
+
+    async def blocked_collect_journal(_shell: FakeShell, _lines: int) -> str:
+        journal_started.set()
+        await release_journal.wait()
+        return "bridge remains offline"
+
+    with (
+        patch.object(manager, "_shell", return_value=shell),
+        patch.object(panel_ops, "collect_journal", side_effect=blocked_collect_journal),
+    ):
+        timeout = hass.async_create_task(manager._recovery_timeout(dt_util.utcnow()))
+        await journal_started.wait()
+        broker.available = False
+        await asyncio.sleep(0)
+        broker.available = True
+        manager.async_broker_reconnected()
+        grace_was_armed = manager._grace_cancel is not None
+        broker.available = False
+        release_journal.set()
+        await timeout
+    await hass.async_block_till_done()
+
+    try:
+        assert grace_was_armed is True
+        assert _types(events) == []
+        assert manager._recovery_deferred is True
+        assert manager._recovery_generation == generation
+        assert cast(str, manager._recovery_origin) == "repair"
+        assert manager._grace_cancel is None
+        assert manager._recovery_cancel is None
+
+        broker.available = True
+        manager.async_broker_reconnected()
+        assert manager._recovery_deferred is False
+        assert manager._recovery_generation == generation + 1
+        assert cast(str, manager._recovery_origin) == "repair"
+        assert manager._recovery_cancel is not None
+        assert manager._grace_cancel is None
+    finally:
+        await manager.async_shutdown()
+
+
 async def test_deferred_recovery_reconnect_then_online_reports_success(
     hass: HomeAssistant,
     payload_dir: Path,
