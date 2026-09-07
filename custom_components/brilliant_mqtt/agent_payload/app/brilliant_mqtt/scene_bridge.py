@@ -1190,7 +1190,15 @@ class SceneBridge:
                 return
             item_type, key, topic, payload = item
             try:
-                await self._mqtt.publish(topic, payload, retain=False)
+                # QoS 1 so publish() blocks until the broker PUBACKs before we
+                # commit delivered=True below. On disconnect/timeout aiomqtt
+                # raises, the record stays delivered=False, and the same dedup
+                # key/topic/payload is replayed on the next iteration (and
+                # across process restart, since delivered=True is persisted only
+                # after this returns). PUBACK confirms broker receipt of the
+                # transport frame ONLY — never that Home Assistant consumed or
+                # acted on the event/result.
+                await self._mqtt.publish(topic, payload, retain=False, qos=1)
             except asyncio.CancelledError:
                 raise
             except Exception:
