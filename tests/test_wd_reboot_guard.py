@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from brilliant_wifi_watchdog.reboot_guard import GuardPolicy, RebootGuard
 
 P = GuardPolicy(cooldown=3600.0, cap=3, window=21600.0)
@@ -42,3 +44,19 @@ def test_persists_across_instances(tmp_path: Path) -> None:
     path = str(tmp_path / "s.json")
     RebootGuard(path, P).record(0.0)
     assert RebootGuard(path, P).can_reboot(1800.0) is False
+
+
+@pytest.mark.parametrize("state_kind", ["unreadable", "corrupt"])
+def test_decisions_tolerate_unreadable_or_corrupt_state(tmp_path: Path, state_kind: str) -> None:
+    state = tmp_path / "state"
+    if state_kind == "unreadable":
+        state.mkdir()
+    else:
+        state.write_text("not JSON", encoding="utf-8")
+    guard = RebootGuard(str(state), P)
+
+    try:
+        assert guard.can_reboot(100.0) is True
+        assert guard.can_request(100.0) is True
+    except OSError as exc:
+        pytest.fail(f"guard decision raised on {state_kind} state: {exc}")
