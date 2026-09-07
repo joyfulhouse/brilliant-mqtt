@@ -209,7 +209,20 @@ daemon reboots the panel when the Brilliant message bus wedges — the bridge ca
 no longer read the bus and only a reboot clears it — after the bus-liveness
 heartbeat has been stale for `BUS_WATCHDOG_STALE_AFTER` (default 30 min), and
 only while the bridge unit is still active and the gateway pings (a plain
-network outage is left to the Wi-Fi watchdog, so the two never fight).
+network outage is left to the Wi-Fi watchdog, so the two never fight). Since
+issue #87 it also requires `bus_confirmed`: the last session must have actually
+reached the local-bus phase with a still-live writer (recorded in
+`BUS_PHASE_FILE`), so a broker/DNS/TLS/auth or ledger startup failure — which
+never reaches the bus — no longer counts as a wedge and cannot reboot a healthy
+panel.
+
+**After a partial upgrade or rollback:** the bridge (phase writer) and this
+watchdog (phase reader) must move together. If you revert only one side, delete
+the phase file so a stale `bus` marker can't be misread as confirmed:
+
+```bash
+rm -f /run/brilliant-mqtt/bus-phase
+```
 
 **Confirm it was the watchdog:** on the panel,
 

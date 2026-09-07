@@ -98,6 +98,15 @@ over WebSockets are unsupported by the panel transport.
   (see `docs/ha-integration.md`) automates exactly this: it watches the panel's
   availability LWT + `brilliant/<panel>/bridge` meta topic, and restores the
   unit/env from the copies it stages under `/var/brilliant-mqtt/system/`.
+- **Bus-watchdog phase-file coupling.** The bridge stamps the bus-phase marker
+  (`BUS_PHASE_FILE`, default `/run/brilliant-mqtt/bus-phase`) that the
+  bus-watchdog reads to gate reboots (see
+  [CONFIGURATION.md → Bus-health watchdog](../CONFIGURATION.md#bus-health-watchdog)).
+  Writer and reader must be upgraded and rolled back **together**. If a
+  deploy/rollback ever leaves only one side updated (agent without watchdog or
+  vice versa), delete the marker so a stale `bus` value from tmpfs (which
+  survives a service restart and is only cleared on reboot) can't be misread as
+  a live confirmed bus: `rm -f /run/brilliant-mqtt/bus-phase`.
 
 > **Office safety stop:** Office is reserved for the existing-external-broker,
 > software-only canary. Keep its broker endpoint, TLS profile, and credentials

@@ -232,8 +232,16 @@ separate env file.
 The bridge stamps a heartbeat file after every successful bus read
 (`BUS_HEARTBEAT_FILE`, below) — a tmpfs path by default, so there is no flash
 wear. During a wedge, the bus read never completes, so the heartbeat naturally
-stops updating with no special wedge-detection needed in the bridge itself;
-the watchdog just measures how stale that one file is.
+stops updating with no special wedge-detection needed in the bridge itself.
+
+Staleness alone is not enough to reboot, though. The bridge also stamps a
+**bus-phase** marker (`BUS_PHASE_FILE`, below) recording whether the latest
+session actually reached the local-bus handshake (`pre_bus` before it, `bus`
+after), tagged with the writer's pid. The watchdog reboots only when the
+heartbeat is stale **and** that marker confirms the bus was reached by a
+still-live writer (`bus_confirmed`). This distinguishes a genuine bus wedge
+from a broker/DNS/TLS/auth or retained-ledger startup failure — which never
+reaches the bus, so must not reboot an otherwise-healthy panel (issue #87).
 
 | Variable | Required | Default | Meaning |
 |---|---|---|---|
@@ -241,6 +249,7 @@ the watchdog just measures how stale that one file is.
 | `BUS_WATCHDOG_STALE_AFTER` | no | `1800` seconds (30 min) | Heartbeat age that triggers a reboot, once the gating conditions above also hold. |
 | `BUS_WATCHDOG_GATEWAY` | no | _(auto)_ | Gateway IP to probe for the network-up gate. Blank auto-detects the default gateway from the routing table every cycle. |
 | `BUS_HEARTBEAT_FILE` | no | `/run/brilliant-mqtt/bus-heartbeat` | **Shared with the bridge** (same variable name on both sides) — tmpfs path the bridge stamps and the watchdog reads. An empty value on the bridge disables emission; leave it set for the watchdog to have anything to check. |
+| `BUS_PHASE_FILE` | no | `/run/brilliant-mqtt/bus-phase` | **Shared with the bridge** (same variable name on both sides) — tmpfs path the bridge stamps with the session's bus phase (`pre_bus` before the local-bus handshake, `bus` after) plus its own pid, and the watchdog reads to gate reboots on a confirmed, still-live bus. Empty on the bridge disables emission. **Rollback contract:** the bridge (writer) and this watchdog (reader) must be upgraded and rolled back TOGETHER; if you revert only one side, `rm -f /run/brilliant-mqtt/bus-phase` so a stale `bus` marker can't be misread as confirmed. |
 | `BUS_WATCHDOG_STATE` | no | `/var/brilliant-mqtt/bus-watchdog.state` | Where reboot timestamps persist (its own file — deliberately separate from the Wi-Fi watchdog's ledger, so the two guards never race on the same file). |
 | `BUS_WATCHDOG_LOG` | no | `/var/brilliant-mqtt/bus-watchdog.log` | Rotating log file (3 × 512 KB backups). |
 | `BUS_WATCHDOG_REBOOT_COOLDOWN` | no | `3600` seconds (1 h) | Minimum gap between guard-permitted reboots. |

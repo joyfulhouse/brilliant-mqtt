@@ -1,6 +1,9 @@
 """Bus-watchdog daemon: reboot the panel when the bridge can't hold a
-message-bus session for >=stale_after, the bridge unit is active, and the
-gateway is reachable. Logic in should_reboot()/handle(); main() is thin."""
+message-bus session for >=stale_after, the bridge unit is active, the gateway
+is reachable, AND the last session actually reached the local-bus phase with a
+live writer (bus_confirmed) — so a broker/DNS/TLS/auth startup failure, which
+never reaches the bus, cannot reboot a healthy panel. Logic in
+should_reboot()/handle(); main() is thin."""
 
 from __future__ import annotations
 
@@ -14,7 +17,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from . import probe
-from .health import heartbeat_age
+from .health import bus_confirmed, heartbeat_age
 from .reboot import reboot as _reboot
 from .reboot_guard import GuardPolicy, RebootGuard
 
@@ -31,6 +34,7 @@ class Config:
     interval: float
     stale_after: float
     heartbeat_path: str
+    phase_path: str
     state_path: str
     log_path: str
     bridge_service: str
@@ -49,6 +53,7 @@ def load_config(environ: Mapping[str, str]) -> Config:
         interval=f("BUS_WATCHDOG_INTERVAL", 60.0),
         stale_after=f("BUS_WATCHDOG_STALE_AFTER", 1800.0),
         heartbeat_path=environ.get("BUS_HEARTBEAT_FILE", "/run/brilliant-mqtt/bus-heartbeat"),
+        phase_path=environ.get("BUS_PHASE_FILE", "/run/brilliant-mqtt/bus-phase"),
         state_path=environ.get("BUS_WATCHDOG_STATE", "/var/brilliant-mqtt/bus-watchdog.state"),
         log_path=environ.get("BUS_WATCHDOG_LOG", "/var/brilliant-mqtt/bus-watchdog.log"),
         bridge_service=environ.get("BRIDGE_SERVICE", "brilliant-mqtt"),
@@ -61,8 +66,15 @@ def load_config(environ: Mapping[str, str]) -> Config:
     )
 
 
-def should_reboot(*, age: float, bridge_active: bool, gateway_up: bool, stale_after: float) -> bool:
-    return age >= stale_after and bridge_active and gateway_up
+def should_reboot(
+    *,
+    age: float,
+    bridge_active: bool,
+    gateway_up: bool,
+    bus_confirmed: bool,
+    stale_after: float,
+) -> bool:
+    return age >= stale_after and bridge_active and gateway_up and bus_confirmed
 
 
 def handle(*, should: bool, guard: _GuardLike, now: float, reboot_fn: Any = _reboot) -> None:
@@ -103,11 +115,21 @@ def main() -> None:  # pragma: no cover - thin loop
         gw = cfg.gateway or probe.default_gateway()
         gateway_up = probe.ping(gw) if gw else False
         active = _service_active(cfg.bridge_service)
+        confirmed = bus_confirmed(cfg.phase_path)
         should = should_reboot(
-            age=age, bridge_active=active, gateway_up=gateway_up, stale_after=cfg.stale_after
+            age=age,
+            bridge_active=active,
+            gateway_up=gateway_up,
+            bus_confirmed=confirmed,
+            stale_after=cfg.stale_after,
         )
         _LOG.info(
-            "age=%.0fs bridge_active=%s gateway_up=%s should=%s", age, active, gateway_up, should
+            "age=%.0fs bridge_active=%s gateway_up=%s bus_confirmed=%s should=%s",
+            age,
+            active,
+            gateway_up,
+            confirmed,
+            should,
         )
         handle(should=should, guard=guard, now=now)
         time.sleep(cfg.interval)
