@@ -171,6 +171,7 @@ def _reconcile_present(
     *,
     path: str,
     want_fp: str,
+    bundle_text: str,
     state_path: str,
     min_retry_interval_s: float,
     now: float,
@@ -179,17 +180,20 @@ def _reconcile_present(
     reload for this generation is still owed (issue #96)."""
     pending = load_pending(fs, state_path)
     if pending is not None:
-        if pending.fingerprint != want_fp:
-            # Marker is for a retired CA (its fingerprint isn't the one now in the
-            # bundle). Per the contract that reload is deliberately dropped; clear
-            # the stale marker so the state file returns to the sentinel instead of
-            # being re-read and ignored on every tick forever.
+        if not _bundle_contains(bundle_text, pending.fingerprint):
+            # The marker's CA is no longer in the bundle: the bundle was replaced
+            # (e.g. a firmware bump reset it), so the append that marker tracked is
+            # gone and its reload is moot. This is the ONLY legitimate "stale"
+            # case — clear the marker back to the sentinel. (A pending reload is
+            # owed whenever the marker's CA is *still* present, regardless of which
+            # cert this run carries: appends accumulate and one reload covers them
+            # all, so keying "owed" off want_fp alone would drop a real reload.)
             _clear_marker(fs, state_path)
             return Outcome(True, False, False, path)
-        # Same CA (its fingerprint is in the bundle). The stored bundle_path may
-        # differ from the path resolved this run (operator changed
-        # HUE_CA_BUNDLE_PATH, or a glob resolved differently) — the reload is
-        # still owed for the CA now present; the re-stamp migrates it to `path`.
+        # The marker's CA is still in the bundle, so a reload is still owed. The
+        # stored bundle_path may differ from the path resolved this run (operator
+        # changed HUE_CA_BUNDLE_PATH, or a glob resolved differently) — the
+        # re-stamp migrates the marker to `path`/want_fp.
         if not coordinator.is_running():
             # Coordinator gone / not the Hue host: it owes no reload. Drop the
             # stale marker so it can't fire a spurious restart if the vassal
@@ -239,12 +243,14 @@ def reconcile(
         return Outcome(False, False, False, None)
 
     want_fp = cert_fingerprint(ca_pem)
-    if _bundle_contains(fs.read_text(path), want_fp):
+    bundle_text = fs.read_text(path)
+    if _bundle_contains(bundle_text, want_fp):
         return _reconcile_present(
             fs,
             coordinator,
             path=path,
             want_fp=want_fp,
+            bundle_text=bundle_text,
             state_path=state_path,
             min_retry_interval_s=min_retry_interval_s,
             now=now,

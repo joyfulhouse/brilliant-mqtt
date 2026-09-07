@@ -462,9 +462,11 @@ def test_pending_cleared_after_success_then_noop() -> None:
 
 
 def test_stale_marker_for_other_generation_does_not_fire() -> None:
-    # Bundle already contains CA_A, but the on-disk marker is for CA_B (a
-    # different generation). It must not trigger a restart against CA_A.
-    fs = FakeFS({"/b": CA_B + CA_A}, {})
+    # Bundle-replacement case: the bundle contains only CA_A, and the on-disk
+    # marker is for CA_B which is NO LONGER in the bundle (its append was wiped,
+    # e.g. by a firmware bump). That reload is genuinely moot -> no restart, and
+    # the stale marker is cleared back to the sentinel.
+    fs = FakeFS({"/b": CA_A}, {})
     coord = FakeCoord(running=True)
     save_pending(fs, STATE, PendingReload("/b", cert_fingerprint(CA_B), last_attempt_at=0.0))
     out = reconcile(
@@ -480,6 +482,7 @@ def test_stale_marker_for_other_generation_does_not_fire() -> None:
     assert out.appended is False
     assert out.reload_pending is False
     assert coord.attempts == 0
+    assert load_pending(fs, STATE) is None  # stale (replaced-away) marker cleared
 
 
 # --- tribunal round 1: marker ordering, state-write survival, clock, staleness --
@@ -789,23 +792,87 @@ def test_first_append_owed_reload_is_retryable_when_state_dir_writable() -> None
     assert out2.coordinator_restarted is True  # fresh run completed the reload
 
 
-def test_retired_ca_marker_is_cleared() -> None:
-    # finding #2: a valid marker for a retired CA (fingerprint differs from the CA
-    # now in the bundle) is dropped per contract, but must be CLEARED so the state
-    # file returns to the sentinel instead of being re-read/ignored forever.
-    fs = FakeFS({"/b": CA_B + CA_A}, {})
+# --- tribunal round 4: a marker is owed while its CA is still in the bundle ----
+
+
+def test_ca_rotation_under_failing_restarts_still_reloads() -> None:
+    # finding (round 4): CA rotation while restarts fail must not lose the owed
+    # reload. run1 appends A (restart fails, marker A); run2 appends B (restart
+    # fails, marker B); run3 with CA_A and a WORKING coordinator sees marker B —
+    # but B is still in the bundle, so a reload IS still owed and must fire.
+    fs = FakeFS({"/b": ""}, {})  # empty bundle to start
+    reconcile(  # run1: append A, restart fails -> marker A
+        fs,
+        FakeCoord(running=True, fail_first=1),
+        bundle_path="/b",
+        site_packages_root="/sp",
+        ca_pem=CA_A,
+        state_path=STATE,
+        min_retry_interval_s=INTERVAL,
+        now=1000.0,
+    )
+    reconcile(  # run2: append B, restart fails -> marker B overwrites marker A
+        fs,
+        FakeCoord(running=True, fail_first=1),
+        bundle_path="/b",
+        site_packages_root="/sp",
+        ca_pem=CA_B,
+        state_path=STATE,
+        min_retry_interval_s=INTERVAL,
+        now=2000.0,
+    )
+    coord3 = FakeCoord(running=True)  # fresh oneshot, working coordinator
+    reconcile(  # run3: CA_A present, marker B still in bundle -> reload owed
+        fs,
+        coord3,
+        bundle_path="/b",
+        site_packages_root="/sp",
+        ca_pem=CA_A,
+        state_path=STATE,
+        min_retry_interval_s=INTERVAL,
+        now=3000.0,
+    )
+    assert coord3.attempts == 1  # the reload finally fired
+    assert coord3.successes == 1
+    assert CA_A.strip() in fs.files["/b"] and CA_B.strip() in fs.files["/b"]
+    assert load_pending(fs, STATE) is None  # cleared after the successful reload
+
+
+def test_marker_for_earlier_ca_still_in_bundle_is_owed() -> None:
+    # One-run variant: bundle contains both A and B, marker is for CA_B, this run
+    # carries CA_A. CA_B is still present, so the reload is still owed -> restart.
+    fs = FakeFS({"/b": CA_A + CA_B}, {})
     save_pending(fs, STATE, PendingReload("/b", cert_fingerprint(CA_B), last_attempt_at=0.0))
     coord = FakeCoord(running=True)
-    for i in range(3):
-        reconcile(
-            fs,
-            coord,
-            bundle_path="/b",
-            site_packages_root="/sp",
-            ca_pem=CA_A,
-            state_path=STATE,
-            min_retry_interval_s=INTERVAL,
-            now=1000.0 * (i + 1),
-        )
-    assert load_pending(fs, STATE) is None  # sentinel restored
-    assert coord.attempts == 0  # no restart fired for the retired CA
+    reconcile(
+        fs,
+        coord,
+        bundle_path="/b",
+        site_packages_root="/sp",
+        ca_pem=CA_A,
+        state_path=STATE,
+        min_retry_interval_s=INTERVAL,
+        now=10_000.0,
+    )
+    assert coord.attempts == 1
+
+
+def test_marker_ca_replaced_away_is_cleared_as_stale() -> None:
+    # The legitimate stale case: the marker's CA (CA_B) is NOT in the bundle (it
+    # was replaced away), so its reload is moot -> no restart, marker cleared.
+    fs = FakeFS({"/b": CA_A}, {})
+    save_pending(fs, STATE, PendingReload("/b", cert_fingerprint(CA_B), last_attempt_at=0.0))
+    coord = FakeCoord(running=True)
+    out = reconcile(
+        fs,
+        coord,
+        bundle_path="/b",
+        site_packages_root="/sp",
+        ca_pem=CA_A,
+        state_path=STATE,
+        min_retry_interval_s=INTERVAL,
+        now=10_000.0,
+    )
+    assert coord.attempts == 0
+    assert out.reload_pending is False
+    assert load_pending(fs, STATE) is None  # stale marker cleared
