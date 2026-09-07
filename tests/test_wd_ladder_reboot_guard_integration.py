@@ -16,10 +16,13 @@ the defect lives in how the ladder and the guard are wired together.
 
 from __future__ import annotations
 
+import inspect
 import json
 from pathlib import Path
 
-from brilliant_wifi_watchdog import run
+import pytest
+
+from brilliant_wifi_watchdog import bounded, recovery, run
 from brilliant_wifi_watchdog.ladder import Action, Ladder, Thresholds
 from brilliant_wifi_watchdog.reboot_guard import GuardPolicy, RebootGuard
 
@@ -200,3 +203,79 @@ def test_reboot_without_recovery_does_not_refire_or_loop(tmp_path: Path) -> None
     after = [(a, e) for ts, a, e in log if ts > reboots[0]]
     assert all(e is False for _, e in after)  # fresh cooldown blocks the guard
     assert all(a == Action.NONE for a, _ in after)  # no re-fire, no notify loop
+
+
+@pytest.mark.parametrize("reboot_rc", [bounded.TIMEOUT_RC, 0], ids=["failed", "unconfirmed"])
+def test_failed_or_unconfirmed_reboot_request_retries_without_spending_cap(
+    tmp_path: Path, reboot_rc: int
+) -> None:
+    guard = RebootGuard(str(tmp_path / "guard"), P)
+    ladder = Ladder(T)
+    calls: list[tuple[float, list[str]]] = []
+    writes: list[tuple[str, str]] = []
+    outcomes: list[int | None] = []
+    clock = [0.0]
+
+    def command(argv: list[str]) -> int:
+        calls.append((clock[0], argv))
+        return reboot_rc
+
+    class Recovery:
+        @staticmethod
+        def soft_reconnect() -> None:
+            pass
+
+        @staticmethod
+        def restart_services() -> None:
+            pass
+
+        @staticmethod
+        def gpio_reset_and_reboot() -> int:
+            return recovery.gpio_reset_and_reboot(
+                run=command,
+                write=lambda path, value: writes.append((path, value)),
+                read_alias=lambda: "fake.mmc",
+                sleep=lambda _: None,
+            )
+
+    for now in range(0, 25001, 30):
+        clock[0] = float(now)
+        request_check = getattr(guard, "can_request", guard.can_reboot)
+        eligible = request_check(now)
+        action = ladder.observe(gateway_up=False, now=now, reboot_eligible=eligible)
+        if action != Action.NONE:
+            outcomes.append(
+                run.handle(
+                    action,
+                    guard=guard,
+                    now=now,
+                    reboot_eligible=eligible,
+                    recovery_mod=Recovery,
+                )
+            )
+
+    request_times = [when for when, argv in calls if argv == ["systemctl", "reboot"]]
+    assert writes, "GPIO reset path was exercised with all writes intercepted"
+    assert guard.can_reboot(25000) is True
+    assert len(request_times) > 1, f"reboot request was stranded: {calls}"
+    assert all(
+        later - earlier >= P.cooldown
+        for earlier, later in zip(request_times, request_times[1:], strict=False)
+    )
+    assert [outcome for outcome in outcomes if outcome is not None] == [reboot_rc] * len(calls)
+
+
+def test_request_counts_against_guard_only_after_boot_id_changes(tmp_path: Path) -> None:
+    assert "read_boot_id" in inspect.signature(RebootGuard).parameters
+    state = tmp_path / "guard"
+    boot_id = ["boot-a"]
+    guard = RebootGuard(str(state), P, read_boot_id=lambda: boot_id[0])
+
+    guard.record_request(100.0)
+    assert guard.can_reboot(101.0) is True
+    assert guard.can_request(101.0) is False
+
+    boot_id[0] = "boot-b"
+    restarted = RebootGuard(str(state), P, read_boot_id=lambda: boot_id[0])
+    assert restarted.can_reboot(101.0) is False
+    assert _stamps(state) == [100.0]
