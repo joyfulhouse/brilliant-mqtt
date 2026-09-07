@@ -60,6 +60,19 @@ def test_bus_confirmed_fails_closed(
     assert bus_confirmed(str(phase)) is expected
 
 
+@pytest.mark.parametrize("pid", [1, 0, -1])
+def test_bus_confirmed_fails_closed_on_pid_le_one(tmp_path: Path, pid: int) -> None:
+    """A marker naming pid <= 1 must read as unconfirmed. pid 1 (init) always
+    exists, so a torn/truncated ``bus 1`` marker would otherwise read as
+    confirmed forever and suppress reboots indefinitely (fail-open). pid 0 and
+    negative pids would target a process group rather than an individual
+    writer, so they are rejected too."""
+    phase = tmp_path / "bus-phase"
+    phase.write_text(f"bus {pid}", encoding="utf-8")
+
+    assert bus_confirmed(str(phase)) is False
+
+
 def test_bus_confirmed_false_for_dead_writer_pid(tmp_path: Path) -> None:
     """A leftover ``bus <pid>`` whose pid is no live process (a dead or reverted
     writer, whose tmpfs marker survives until the next reboot) must read as

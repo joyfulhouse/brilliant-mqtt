@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 
 import pytest
 
+from brilliant_bus_watchdog.health import bus_confirmed
 from brilliant_mqtt.heartbeat import write_heartbeat, write_phase
 from tests.fakes import FakeClock
 
@@ -84,41 +86,113 @@ def test_write_phase_is_best_effort(tmp_path: Path) -> None:
     write_phase(str(blocker / "bus-phase"), "bus")
 
 
-def test_write_phase_pre_bus_failure_clears_stale_bus_marker(
+def test_write_phase_pre_bus_is_best_effort_when_parent_is_file(tmp_path: Path) -> None:
+    """A pre_bus stamp whose parent path is a regular file must be swallowed,
+    never re-raised. The stamp happens at ``__main__`` *before* the session
+    ``try``: a re-raise would make the supervisor back off and retry forever,
+    so the bridge would never connect to anything. A missing/failed stamp
+    instead reads as unconfirmed (reboot guard disabled), which is fail-safe."""
+    blocker = tmp_path / "blocker"
+    blocker.write_text("x", encoding="utf-8")
+
+    write_phase(str(blocker / "bus-phase"), "pre_bus")  # must not raise
+
+
+def test_write_phase_pre_bus_is_best_effort_when_path_is_dir(tmp_path: Path) -> None:
+    """A pre_bus stamp whose target path is itself a directory must be
+    swallowed (``os.replace`` raises ``IsADirectoryError``) and must not leak
+    the ``bus-phase.tmp`` scratch file left behind by the failed replace."""
+    phase = tmp_path / "bus-phase"
+    phase.mkdir()
+
+    write_phase(str(phase), "pre_bus")  # must not raise
+
+    assert not (tmp_path / "bus-phase.tmp").exists()
+
+
+def test_failed_pre_bus_restamp_must_not_leave_live_pid_bus_marker_confirmed(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A failed pre_bus write must not leave a prior session's "bus" marker
-    readable — otherwise a broker-only outage would still read as
-    bus-confirmed and could reboot a healthy panel. Remove it so the watchdog
-    fails closed."""
+    """A failed pre_bus re-stamp must ACTIVELY clear any leftover ``bus``
+    marker, not merely swallow the error. ``run()`` retries ``_run_session`` in
+    the SAME process while teardown keeps the ``bus`` marker, so a leftover
+    ``bus <pid>`` names THIS still-live process — the reader's pid-liveness
+    check would read it as confirmed. If the re-stamp fails and the marker is
+    left in place, a stale heartbeat during a broker-only outage would reboot a
+    healthy panel in a loop (issue #87). So after a failed pre_bus write over a
+    live-pid marker, the file must be gone and bus_confirmed must be False, with
+    no exception raised."""
     phase = tmp_path / "bus-phase"
-    phase.write_text(f"bus {os.getpid()}", encoding="utf-8")  # leftover session
+    phase.write_text(f"bus {os.getpid()}", encoding="utf-8")  # leftover, live pid
+    assert bus_confirmed(str(phase)) is True  # would fire a reboot if left
 
     def _raise(*args: object, **kwargs: object) -> None:
-        raise OSError("write failed")
+        raise OSError(28, "No space left on device")
 
     monkeypatch.setattr("brilliant_mqtt.heartbeat._atomic_write", _raise)
     write_phase(str(phase), "pre_bus")  # must not raise
 
     assert not phase.exists()
+    assert bus_confirmed(str(phase)) is False
 
 
-def test_write_phase_pre_bus_reraises_when_cleanup_also_fails(
+def test_real_write_failure_clears_live_pid_bus_marker(tmp_path: Path) -> None:
+    """The REAL failure -> propagate -> clear chain, with no monkeypatch of
+    _atomic_write: a pre-existing ``bus-phase.tmp`` directory makes the real
+    ``open(tmp, "w")`` inside _atomic_write raise IsADirectoryError, which must
+    propagate out of _atomic_write so write_phase's handler clears the leftover
+    live-pid marker. This pins _atomic_write's re-raise (a mutant that swallows
+    its OSError instead of re-raising leaves the marker confirmed)."""
+    phase = tmp_path / "bus-phase"
+    phase.write_text(f"bus {os.getpid()}", encoding="utf-8")  # leftover, live pid
+    (tmp_path / "bus-phase.tmp").mkdir()  # real open() failure, no monkeypatch
+    assert bus_confirmed(str(phase)) is True  # would fire a reboot if left
+
+    write_phase(str(phase), "pre_bus")  # must not raise
+
+    assert not phase.exists()
+    assert bus_confirmed(str(phase)) is False
+
+
+def test_write_phase_bus_failure_also_clears_marker(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """If clearing the stale marker itself fails, phase tracking is broken —
-    re-raise so the session doesn't silently continue in a fail-unsafe state."""
+    """The contract is best-effort clear for EVERY phase, not just pre_bus: a
+    failed ``bus`` upgrade must also clear the leftover marker (a failed bus
+    stamp that left the prior marker readable would misreport the phase). This
+    pins the clear against a mutant that guards the unlink with
+    ``if phase != "pre_bus": return``."""
     phase = tmp_path / "bus-phase"
     phase.write_text(f"bus {os.getpid()}", encoding="utf-8")
 
-    def _raise_write(*args: object, **kwargs: object) -> None:
-        raise OSError("write failed")
+    def _raise(*args: object, **kwargs: object) -> None:
+        raise OSError(28, "No space left on device")
 
-    def _raise_unlink(*args: object, **kwargs: object) -> None:
-        raise PermissionError("cannot remove")
+    monkeypatch.setattr("brilliant_mqtt.heartbeat._atomic_write", _raise)
+    write_phase(str(phase), "bus")  # must not raise
 
-    monkeypatch.setattr("brilliant_mqtt.heartbeat._atomic_write", _raise_write)
-    monkeypatch.setattr("brilliant_mqtt.heartbeat.os.unlink", _raise_unlink)
+    assert not phase.exists()
 
-    with pytest.raises(PermissionError, match="cannot remove"):
+
+def test_failed_stamp_logs_warning_reboot_guard_disabled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A failed stamp now means the reboot guard is disabled, and the default
+    LOG_LEVEL is INFO, so the message must be logged at WARNING (not debug) or
+    it is invisible in the journal. Pins the level against a warning->debug
+    downgrade mutant."""
+    phase = tmp_path / "bus-phase"
+
+    def _raise(*args: object, **kwargs: object) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr("brilliant_mqtt.heartbeat._atomic_write", _raise)
+    with caplog.at_level(logging.WARNING, logger="brilliant_mqtt.heartbeat"):
         write_phase(str(phase), "pre_bus")
+
+    warnings = [
+        r
+        for r in caplog.records
+        if r.levelname == "WARNING" and "reboot guard disabled" in r.getMessage()
+    ]
+    assert len(warnings) == 1
