@@ -2143,28 +2143,43 @@ async def test_execution_at_or_after_baseline_confirms_scene_command(tmp_path: P
     await bridge.async_shutdown()
 
 
-async def test_pre_baseline_record_leaves_pending_open_for_later_confirmation(
+async def test_pre_baseline_record_never_confirms_and_pending_times_out(
     tmp_path: Path,
 ) -> None:
     """A stale record older than the baseline (but newer than the prior watermark)
-    never confirms, and it must not consume the pending: a later at-or-after
-    baseline execution still confirms the same command."""
-    bridge, bus, mqtt, _, _ = await _started(
+    never confirms: the command stays pending and settles to a timeout (proving no
+    silent confirmation). The mechanism still confirms a fresh command whose
+    execution is at/after its own baseline."""
+    bridge, bus, mqtt, clock, _ = await _started(
         tmp_path, execution=_execution("all_off", _NOW_MS - 3_000)
     )
-    command_id = "22222222-2222-4222-8222-222222222222"
-    await mqtt.inject(scene_command_topic(_PANEL), _command(command_id, "scene", "all_off"))
+    first_id = "22222222-2222-4222-8222-222222222222"
+    await mqtt.inject(scene_command_topic(_PANEL), _command(first_id, "scene", "all_off"))
     await _wait_for_bus_commands(bus, 1)
 
-    # Newer than the watermark (T-3000) yet older than the baseline (T): no confirm.
+    # Newer than the watermark (T-3000) yet older than the baseline (T): must not
+    # confirm. Settle the negative by letting the command time out -- had the stale
+    # record wrongly confirmed, an accepted:true would appear here instead of the
+    # timeout (checking right after the event lands would be too early to notice).
     await bus.emit(_execution("all_off", _NOW_MS - 1_500))
     await _wait_for_publish(mqtt, scene_event_topic(_PANEL))
-    assert _published(mqtt, scene_result_topic(command_id)) == []
+    await clock.advance_ms(COMMAND_TTL_MS)
+    await _wait_for_publish(mqtt, scene_result_topic(first_id))
+    first_results = _published(mqtt, scene_result_topic(first_id))
+    assert [_payload(item)["accepted"] for item in first_results] == [False]
+    assert _payload(first_results[-1])["error"] == "timeout"
 
-    # A later at-or-after-baseline execution confirms the still-open pending.
-    await bus.emit(_execution("all_off", _NOW_MS + 100))
-    await _wait_for_publish(mqtt, scene_result_topic(command_id))
-    assert _payload(_published(mqtt, scene_result_topic(command_id))[-1])["accepted"] is True
+    # A fresh command still confirms when its execution is at/after its baseline
+    # (the clock is now T + COMMAND_TTL_MS).
+    second_id = "44444444-4444-4444-8444-444444444444"
+    await mqtt.inject(
+        scene_command_topic(_PANEL),
+        _command(second_id, "scene", "all_off", issued_at_ms=clock.now_ms),
+    )
+    await _wait_for_bus_commands(bus, 2)
+    await bus.emit(_execution("all_off", clock.now_ms))
+    await _wait_for_publish(mqtt, scene_result_topic(second_id))
+    assert _payload(_published(mqtt, scene_result_topic(second_id))[-1])["accepted"] is True
     await bridge.async_shutdown()
 
 
@@ -2211,14 +2226,21 @@ async def test_multiple_pending_same_scene_confirm_by_baseline_band(
     await bus.emit(_execution("all_off", executed_at_ms))
     await _wait_for_publish(mqtt, scene_event_topic(_PANEL))
 
+    for name in expected:
+        command_id = ids[name]
+        await _wait_for_publish(mqtt, scene_result_topic(command_id))
+        assert _payload(_published(mqtt, scene_result_topic(command_id))[-1])["accepted"] is True
+
+    # Settle every non-confirmed command to a timeout so an over-confirmation (a
+    # wrong accepted:true) is caught, rather than checked before a result lands.
+    await clock.advance_ms(COMMAND_TTL_MS)
     for name, command_id in ids.items():
         if name in expected:
-            await _wait_for_publish(mqtt, scene_result_topic(command_id))
-            assert (
-                _payload(_published(mqtt, scene_result_topic(command_id))[-1])["accepted"] is True
-            )
-        else:
-            assert _published(mqtt, scene_result_topic(command_id)) == []
+            continue
+        await _wait_for_publish(mqtt, scene_result_topic(command_id))
+        results = _published(mqtt, scene_result_topic(command_id))
+        assert [_payload(item)["accepted"] for item in results] == [False]
+        assert _payload(results[-1])["error"] == "timeout"
     await bridge.async_shutdown()
 
 
@@ -2248,13 +2270,21 @@ async def test_persisted_baseline_rejects_pre_baseline_replay_after_restart(
         [_execution()], scoped_devices=[_scene_catalog("all_off"), _mode_catalog("away")]
     )
     second_mqtt = FakeMqtt()
-    second = SceneBridge(second_bus, second_mqtt, _PANEL, path, FakeClockMs(_NOW_MS))
+    second_clock = FakeClockMs(_NOW_MS)
+    second = SceneBridge(second_bus, second_mqtt, _PANEL, path, second_clock)
     await second.async_start()
     assert second_bus.commands == []
 
+    # Pre-baseline replay must not confirm the restored pending. Settle to a
+    # timeout: had the persisted confirm_after_ms failed to reject the replay, an
+    # accepted:true would appear here instead of the timeout.
     await second_bus.emit(_execution("all_off", _NOW_MS - 1_000))
     await _wait_for_publish(second_mqtt, scene_event_topic(_PANEL))
-    assert _published(second_mqtt, scene_result_topic(command_id)) == []
+    await second_clock.advance_ms(COMMAND_TTL_MS)
+    await _wait_for_publish(second_mqtt, scene_result_topic(command_id))
+    results = _published(second_mqtt, scene_result_topic(command_id))
+    assert [_payload(item)["accepted"] for item in results] == [False]
+    assert _payload(results[-1])["error"] == "timeout"
     await second.async_shutdown()
 
 

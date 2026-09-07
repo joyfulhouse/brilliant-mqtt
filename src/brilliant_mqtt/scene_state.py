@@ -529,6 +529,10 @@ def _parse_state(raw: object) -> SceneState:
             confirm_after_ms = value["confirm_after_ms"]
             if not (type(confirm_after_ms) is int and 0 <= confirm_after_ms <= expires_at_ms):
                 raise StateValidationError("invalid pending confirm baseline")
+        elif expires_at_ms < COMMAND_TTL_MS:
+            # Reject at load (not at the writer's later re-validation): the
+            # reconstructed baseline would be negative for this old entry.
+            raise StateValidationError("invalid pending confirm baseline")
         else:
             confirm_after_ms = expires_at_ms - COMMAND_TTL_MS
         UUID(command_id)

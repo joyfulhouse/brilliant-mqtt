@@ -354,3 +354,14 @@ def test_load_rejects_unknown_pending_key_even_with_confirm_after_ms(tmp_path: P
     loaded = load_state(path)
 
     assert loaded.trusted is False
+
+
+def test_load_rejects_absent_confirm_after_ms_when_expires_below_ttl(tmp_path: Path) -> None:
+    # An old-format entry whose reconstructed baseline (expires_at_ms - TTL) would
+    # be negative must be rejected AT LOAD, not deferred to the writer.
+    path = _pending_state_file(tmp_path, _pending_entry(expires_at_ms=COMMAND_TTL_MS - 1))
+
+    loaded = load_state(path)
+
+    assert loaded.trusted is False
+    assert loaded.reason == "state_untrusted"
