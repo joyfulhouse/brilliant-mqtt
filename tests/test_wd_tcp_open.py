@@ -328,6 +328,21 @@ def test_resolve_hostname_no_budget_skips_child() -> None:
     assert probe._resolve_bounded("broker.local", 1883, 0.0, run=run) is None
 
 
+def test_resolve_orders_ipv4_before_ipv6() -> None:
+    """getaddrinfo may return AAAA before A; the resolver reorders so the reachable
+    IPv4 path is attempted before a possibly-blackholed IPv6 (the first candidate
+    would otherwise burn the first attempt/budget slice on it)."""
+
+    def run(argv: Any, *, timeout: float, capture: bool = False) -> bounded.Completed:
+        return bounded.Completed(returncode=0, stdout="::1\n127.0.0.1\n", timed_out=False)
+
+    infos = probe._resolve_bounded("dual.example", 1883, 2.0, run=run)
+    assert infos is not None
+    families = [ai[0] for ai in infos]
+    assert families[0] == socket.AF_INET  # IPv4 first, despite the child listing ::1 first
+    assert socket.AF_INET6 in families  # v6 still present, just after v4
+
+
 # ---------------------------------------------------------------------------
 # The optional diagnostic must NEVER crash the poll loop, and a local resource
 # failure must not be logged as a broker outage.
@@ -374,10 +389,16 @@ def test_local_socket_exhaustion_is_inconclusive_not_closed() -> None:
 
 def test_resolve_localhost_with_real_child() -> None:
     """Default run spawns the real child, which resolves 'localhost' via
-    /etc/hosts (no network) — exercising the actual _RESOLVER_SCRIPT."""
+    /etc/hosts (no network) — exercising the actual _RESOLVER_SCRIPT. Asserts
+    127.0.0.1 is among the results (robust on any runner) and, only when ::1 is
+    also present, that IPv4 is ordered before IPv6."""
     infos = probe._resolve_bounded("localhost", 1883, 5.0)
     assert infos is not None
-    assert any(ai[4][0] == "127.0.0.1" for ai in infos)
+    v4_positions = [i for i, ai in enumerate(infos) if ai[4][0] == "127.0.0.1"]
+    v6_positions = [i for i, ai in enumerate(infos) if ai[0] == socket.AF_INET6]
+    assert v4_positions  # 127.0.0.1 resolved
+    if v6_positions:
+        assert min(v4_positions) < min(v6_positions)  # IPv4 before IPv6 when both present
 
 
 def test_resolver_child_ignores_poisoned_pythonpath(

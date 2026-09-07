@@ -73,10 +73,7 @@ _RESOLVER_SCRIPT = (
     "import socket, sys\n"
     "try:\n"
     "    infos = socket.getaddrinfo("
-    "sys.argv[1], int(sys.argv[2]), socket.AF_UNSPEC, socket.SOCK_STREAM,\n"
-    # AI_ADDRCONFIG: only return AAAA when the panel has a real (non-loopback)
-    # IPv6 address, so an IPv4-only panel wastes no budget on IPv6 candidates.
-    "        flags=socket.AI_ADDRCONFIG)\n"
+    "sys.argv[1], int(sys.argv[2]), socket.AF_UNSPEC, socket.SOCK_STREAM)\n"
     "except OSError:\n"
     "    sys.exit(3)\n"
     "seen = set()\n"
@@ -146,6 +143,14 @@ def _resolve_bounded(
         rebuilt = _numeric_addrinfo(ip, port)
         if rebuilt is not None:
             infos.extend(rebuilt)
+    # Try IPv4 candidates first. getaddrinfo often returns AAAA before A, and a
+    # home router advertising an IPv6 prefix with no routed upstream would else
+    # spend the first attempt (and its budget slice) on a blackholed v6 before the
+    # reachable IPv4 broker. AI_ADDRCONFIG does NOT avoid this — glibc counts a
+    # link-local fe80:: (present on every up interface) as "IPv6 configured", so
+    # AAAA is returned even on IPv4-only panels; the ordering here is what helps.
+    # Stable sort keeps each family's own order.
+    infos.sort(key=lambda ai: ai[0] != socket.AF_INET)
     return infos or None
 
 
