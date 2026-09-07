@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import time
 from collections.abc import Awaitable, Callable
@@ -17,20 +18,46 @@ from brilliant_bus_watchdog.reboot_guard import GuardPolicy, RebootGuard
 from brilliant_bus_watchdog.run import handle, should_reboot
 from brilliant_mqtt.config import Settings
 from brilliant_mqtt.model import BrilliantDevice
+from brilliant_mqtt.protocols import CommandSubscribeError
 from brilliant_mqtt.retained_topics import RetainedLedgerError
 
 
 class _Bus:
-    def __init__(self, start_error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        start_error: Exception | None = None,
+        *,
+        block_start_until: asyncio.Event | None = None,
+        entered_start: asyncio.Event | None = None,
+    ) -> None:
         self.start_error = start_error
         self.start_calls = 0
         self.read_calls = 0
+        # When set, start() parks on this event (a bus still handshaking), and
+        # signals entered_start once it has been reached — so a test can inspect
+        # the phase/heartbeat mid-handshake.
+        self._block_start_until = block_start_until
+        self._entered_start = entered_start
 
     def on_reconnect(self, callback: Callable[[], Awaitable[None]]) -> None:
         del callback
 
+    def on_change(
+        self,
+        callback: Callable[[BrilliantDevice], Awaitable[None]],
+        *,
+        coalesce_pushes: bool = True,
+    ) -> None:
+        # Registered by the real SceneBridge at startup; it never fires in these
+        # tests (startup fails at the MQTT subscribe, before any bus push).
+        del callback, coalesce_pushes
+
     async def start(self) -> None:
         self.start_calls += 1
+        if self._entered_start is not None:
+            self._entered_start.set()
+        if self._block_start_until is not None:
+            await self._block_start_until.wait()
         if self.start_error is not None:
             raise self.start_error
 
@@ -73,6 +100,10 @@ class _Mqtt:
     def on_command(self, callback: Callable[[str, str], Awaitable[None]]) -> None:
         del callback
 
+    def on_message(self, callback: Callable[[str, str, bool], Awaitable[None]]) -> None:
+        # Registered by the real SceneBridge at startup.
+        del callback
+
     async def subscribe(self, topic: str) -> None:
         del topic
         self.subscribe_calls += 1
@@ -102,7 +133,31 @@ class _ReadOnceBridge:
         raise asyncio.CancelledError
 
 
-def _settings(tmp_path: Path, mesh_priority: int = 0) -> Settings:
+class _BeatingBridge:
+    """A panel bridge whose reconcile does one bus read then beats — the real
+    Bridge.reconcile contract (bridge.py: ``get_all`` then ``_beat``), and
+    returns normally so the session proceeds past reconcile. Reaching reconcile
+    therefore leaves a FRESH heartbeat on disk."""
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        self._bus = cast(_Bus, args[0])
+        self._heartbeat = cast(Callable[[], None], kwargs["heartbeat"])
+
+    async def reconcile(self) -> None:
+        await self._bus.get_all()
+        self._heartbeat()
+
+    async def withdraw(self) -> None:
+        return
+
+
+def _settings(
+    tmp_path: Path,
+    mesh_priority: int = 0,
+    *,
+    scene_enabled: bool = False,
+    scene_watermark: Path | None = None,
+) -> Settings:
     return Settings(
         panel="office",
         mqtt_host="broker",
@@ -112,6 +167,8 @@ def _settings(tmp_path: Path, mesh_priority: int = 0) -> Settings:
         bus_heartbeat_file=str(tmp_path / "bus-heartbeat"),
         bus_phase_file=str(tmp_path / "bus-phase"),
         mesh_priority=mesh_priority,
+        scene_bridge_enabled=scene_enabled,
+        scene_watermark_file=str(scene_watermark or (tmp_path / "scene-watermarks.json")),
     )
 
 
@@ -125,7 +182,7 @@ def _install_session_fakes(
     monkeypatch: pytest.MonkeyPatch,
     bus: _Bus,
     mqtt: _Mqtt,
-    bridge: type[_NoopBridge] | type[_ReadOnceBridge] = _NoopBridge,
+    bridge: type[_NoopBridge] | type[_ReadOnceBridge] | type[_BeatingBridge] = _NoopBridge,
 ) -> None:
     monkeypatch.setattr(main_mod, "RpcBusAdapter", lambda **kwargs: bus)
     monkeypatch.setattr(main_mod, "AioMqttAdapter", lambda settings: mqtt)
@@ -335,6 +392,116 @@ async def test_successful_bus_read_refreshes_heartbeat_without_resetting_phase(
     assert bus.read_calls == 1
     assert confirmed is True
     assert 0.0 <= age < 1.0
+    assert not should_reboot(
+        age=age,
+        stale_after=1800.0,
+        bridge_active=True,
+        gateway_up=True,
+        bus_confirmed=confirmed,
+    )
+
+
+# --- issue #87 audit follow-up: two ways a broker-only fault can reboot a
+# HEALTHY panel. Each test below MUST fail on unmodified main (it proves the
+# defect); the fix, where applied, turns it green while the AC3 test
+# test_sustained_bus_handshake_failure_still_uses_reboot_guard stays green.
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "issue #87 DEFECT #1: the phase is stamped 'bus' before bus.start(), so "
+        "bus_confirmed is True during the Thrift handshake window; a clean fix "
+        "cannot be phase-only because a slow-but-succeeding bus.start() and a "
+        "sustained handshake failure (AC3) leave the SAME pre-handshake phase "
+        "with a stale heartbeat — see PR body. Demonstration kept red on purpose."
+    ),
+)
+async def test_broker_recovery_bus_start_window_does_not_reboot_healthy_panel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DEFECT #1 (issue #87 audit follow-up): the session stamps the phase
+    "bus" BEFORE ``bus.start()`` and before the first bus read/heartbeat.
+
+    After a long broker outage the heartbeat is legitimately stale while the
+    phase stays "pre_bus" (no reboot — correct). When the broker returns, the
+    next session stamps "bus" and then sits inside ``bus.start()`` (the Thrift
+    connect, up to ``_CONNECT_TIMEOUT_S`` = 10s). During that window the
+    heartbeat is still the pre-outage stale value, yet ``bus_confirmed`` already
+    reads True — so a watchdog cycle that samples the phase inside the window
+    sees ``(age >= stale_after, bus_confirmed=True)`` and reboots a HEALTHY
+    panel whose bus is merely still handshaking.
+
+    Reproduced with a bus whose ``start()`` blocks (broker recovered, bus still
+    connecting); the assertion is made at the ``should_reboot`` predicate.
+    """
+    settings = _settings(tmp_path)
+    # A prior healthy session's heartbeat, now stale after the long outage.
+    _seed(settings.bus_heartbeat_file, "100.0")
+
+    entered_start = asyncio.Event()
+    still_handshaking = asyncio.Event()  # never set: the bus stays mid-handshake
+    bus = _Bus(block_start_until=still_handshaking, entered_start=entered_start)
+    mqtt = _Mqtt()  # the broker has recovered: connect succeeds
+    _install_session_fakes(monkeypatch, bus, mqtt)
+
+    task = asyncio.create_task(main_mod._run_session(settings, None, None))
+    try:
+        await asyncio.wait_for(entered_start.wait(), timeout=1)
+        confirmed = bus_confirmed(settings.bus_phase_file)
+        age = heartbeat_age(settings.bus_heartbeat_file, now=time.time(), started_at=0.0)
+        assert bus.start_calls == 1  # inside bus.start(); first read not yet reached
+        assert age >= 1800.0  # the heartbeat is genuinely stale from the outage
+        assert not should_reboot(
+            age=age,
+            stale_after=1800.0,
+            bridge_active=True,
+            gateway_up=True,
+            bus_confirmed=confirmed,
+        )
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+async def test_scene_subscribe_failure_never_reboots_a_healthy_panel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DEFECT #2 (issue #87 audit follow-up): with the scene bridge enabled the
+    session ran ``scene_bridge.async_start()`` — which SUBSCRIBEs to MQTT —
+    BEFORE the first panel reconcile/bus read.
+
+    A persistent subscribe rejection (a broker ACL that forbids the scene topic,
+    or a SUBACK that never arrives) raises ``CommandSubscribeError`` every
+    attempt: ``bus.start()`` has already succeeded and the phase is "bus", but
+    NO heartbeat is ever written, so the heartbeat goes stale while the phase
+    reads confirmed and the watchdog reboots a HEALTHY panel over a broker-only
+    fault. Deterministic, not a timing window.
+
+    Reproduced with the REAL SceneBridge and a fake MQTT whose subscribe raises;
+    the fix runs the first reconcile (a real bus read + heartbeat) BEFORE the
+    scene subscribe can fail, so the heartbeat stays fresh.
+    """
+    settings = _settings(tmp_path, scene_enabled=True)
+    # A prior healthy session's heartbeat; the first reconcile must refresh it,
+    # or it reads as stale.
+    _seed(settings.bus_heartbeat_file, "100.0")
+
+    bus = _Bus()  # the local bus handshakes fine
+    mqtt = _Mqtt(subscribe_error=CommandSubscribeError("scene command topic rejected"))
+    _install_session_fakes(monkeypatch, bus, mqtt, _BeatingBridge)
+
+    with pytest.raises(CommandSubscribeError, match="scene command topic rejected"):
+        await main_mod._run_session(settings, None, None)
+
+    confirmed = bus_confirmed(settings.bus_phase_file)
+    age = heartbeat_age(settings.bus_heartbeat_file, now=time.time(), started_at=0.0)
+    assert bus.start_calls == 1  # the local bus was healthy...
+    assert confirmed is True  # ...and the phase reached "bus"
+    # With the fix the first reconcile has already refreshed the heartbeat, so a
+    # broker-only scene-subscribe fault is not mistaken for a dead bus.
+    assert age < 1800.0
     assert not should_reboot(
         age=age,
         stale_after=1800.0,
