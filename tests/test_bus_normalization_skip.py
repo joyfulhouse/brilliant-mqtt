@@ -199,3 +199,146 @@ class TestLeadershipTransitionAdmitsFirstPush:
         assert counters.normalizations == _N_PERIPHERALS
         assert counters.variables == _N_PERIPHERALS * _N_VARIABLES
         assert len(_mesh_state_publishes(mqtt)) == _N_PERIPHERALS
+
+
+async def _block_on_first(started: asyncio.Event, release: asyncio.Event, seen: list[str]) -> Any:
+    """A coalescing consumer that blocks after its FIRST peripheral callback."""
+
+    async def consumer(device: BrilliantDevice) -> None:
+        seen.append(device.variables["on"].value)
+        if len(seen) == 1:
+            started.set()
+            await release.wait()
+
+    return consumer
+
+
+class TestSupersededSnapshotsSkipNormalization:
+    """(a) A coalescing consumer's superseded snapshots never get normalized.
+
+    The issue's audit: with the consumer blocked after its first snapshot and
+    100 further snapshots injected, only the first and final snapshots reach the
+    consumer (80 peripheral callbacks) yet 4,040 peripheral normalizations and
+    121,200 Variable constructions happened — the 99 discarded snapshots paid
+    3,960 normalizations and 118,800 Variable constructions for nothing.
+
+    With normalization deferred to delivery, both counts scale with DELIVERED
+    snapshots (the first + the final = 80 peripherals).
+    """
+
+    async def test_normalization_scales_with_delivered_not_received(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        counters = _install_counters(monkeypatch)
+        adapter = RpcBusAdapter()
+        adapter._own_device_id = _OWN_DEVICE_ID
+        started = asyncio.Event()
+        release = asyncio.Event()
+        seen: list[str] = []
+        adapter.on_change(await _block_on_first(started, release, seen))
+
+        adapter._dispatch_raw_device(_raw_snapshot(_OWN_DEVICE_ID, "first"))
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+        # 100 further snapshots arrive while the consumer is blocked: all but the
+        # newest are superseded in the coalescing queue.
+        for i in range(100):
+            adapter._dispatch_raw_device(_raw_snapshot(_OWN_DEVICE_ID, f"super{i}"))
+        release.set()
+        await asyncio.gather(*adapter._pending_tasks)
+
+        # Only the first and final snapshots are delivered (80 peripherals).
+        delivered = 2 * _N_PERIPHERALS
+        assert len(seen) == delivered
+        assert counters.normalizations == delivered
+        assert counters.variables == delivered * _N_VARIABLES
+
+
+class TestLosslessStreamUnaffected:
+    """(d) The lossless (scene) stream still gets every snapshot, in order.
+
+    Deferral changes WHEN normalization happens, never the order or content a
+    lossless consumer sees; every snapshot is delivered exactly once, in arrival
+    order, so its normalization count equals the number pushed (none coalesced).
+    """
+
+    async def test_lossless_delivers_every_snapshot_in_arrival_order(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        counters = _install_counters(monkeypatch)
+        adapter = RpcBusAdapter()
+        adapter._own_device_id = _OWN_DEVICE_ID
+        started = asyncio.Event()
+        release = asyncio.Event()
+        seen: list[str] = []
+
+        async def consumer(device: BrilliantDevice) -> None:
+            seen.append(device.variables["on"].value)
+            if len(seen) == 1:
+                started.set()
+                await release.wait()
+
+        adapter.on_change(consumer, coalesce_pushes=False)
+
+        # Single-peripheral pushes with distinct values, queued behind the block.
+        def push(value: str) -> None:
+            adapter._dispatch_raw_device(
+                _RawDevice(
+                    _OWN_DEVICE_ID,
+                    {"load": _RawPeripheral(27, "Load", {"on": _RawVar(value)})},
+                )
+            )
+
+        push("0")
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+        for value in ("1", "2", "3"):
+            push(value)
+        release.set()
+        await asyncio.gather(*adapter._pending_tasks)
+
+        assert seen == ["0", "1", "2", "3"]  # every snapshot, in arrival order
+        assert counters.normalizations == 4  # one per delivered snapshot
+
+
+class TestArrivalSnapshotIsImmutable:
+    """Acceptance criterion 3 / poc-findings §8b: the raw push comes from a
+    mutable, notification-fed observer mirror, so a deferred consumer must
+    normalize from a SAFE synchronous snapshot — never a retained reference to
+    the raw struct, which the panel library may mutate in place before delivery.
+    """
+
+    async def test_value_mutated_after_dispatch_does_not_reach_the_consumer(
+        self,
+    ) -> None:
+        adapter = RpcBusAdapter()
+        adapter._own_device_id = _OWN_DEVICE_ID
+        started = asyncio.Event()
+        release = asyncio.Event()
+        seen: list[str] = []
+
+        async def consumer(device: BrilliantDevice) -> None:
+            seen.append(device.variables["on"].value)
+            if len(seen) == 1:
+                started.set()
+                await release.wait()
+
+        adapter.on_change(consumer, coalesce_pushes=False)
+
+        # First push occupies the drain and blocks it.
+        adapter._dispatch_raw_device(
+            _RawDevice(_OWN_DEVICE_ID, {"load": _RawPeripheral(27, "Load", {"on": _RawVar("1")})})
+        )
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+
+        # Second push: capture its raw variable, then MUTATE it in place after
+        # dispatch returns — exactly what the notification-fed mirror can do to a
+        # queued reference. Include a mutable bytearray to prove eager decoding.
+        mutable = _RawVar("2")
+        adapter._dispatch_raw_device(
+            _RawDevice(_OWN_DEVICE_ID, {"load": _RawPeripheral(27, "Load", {"on": mutable})})
+        )
+        mutable.value = bytearray(b"999")
+        release.set()
+        await asyncio.gather(*adapter._pending_tasks)
+
+        # The consumer must see the value AS IT WAS AT DISPATCH, not the mutation.
+        assert seen == ["1", "2"]
