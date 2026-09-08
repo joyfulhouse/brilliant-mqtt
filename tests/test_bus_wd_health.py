@@ -14,11 +14,13 @@ import brilliant_bus_watchdog.health as health_mod
 from brilliant_bus_watchdog.health import bus_failure_age, heartbeat_age
 from brilliant_bus_watchdog.run import _service_active, should_reboot
 from brilliant_mqtt import heartbeat
-from brilliant_mqtt.heartbeat import (
-    DEAD_WRITER_RETENTION_S,
-    current_boot_id,
-    process_generation,
-    write_phase,
+from brilliant_mqtt.heartbeat import DEAD_WRITER_RETENTION_S, write_phase
+
+# Child-process writers stamp the marker with the real /proc boot id and start
+# tick; the tests/conftest.py stand-in cannot reach a separate interpreter.
+_requires_linux_proc = pytest.mark.skipif(
+    not os.path.exists("/proc/sys/kernel/random/boot_id"),
+    reason="child phase writers need the Linux /proc boot/process attribution",
 )
 
 _CHILD_PHASE_WRITER = """
@@ -247,6 +249,7 @@ def test_bus_failure_age_accepts_live_generation_with_active_lease(tmp_path: Pat
     assert bus_failure_age(str(phase), now=100.0) == 0.0
 
 
+@_requires_linux_proc
 def test_killed_bus_writers_qualify_during_service_restart_backoff(tmp_path: Path) -> None:
     phase = tmp_path / "bus-phase"
     samples = [100.0 + 299.0 * index for index in range(8)]
@@ -325,6 +328,7 @@ def test_dead_pre_bus_writers_never_attribute_broker_only_startup(tmp_path: Path
     )
 
 
+@_requires_linux_proc
 def test_dead_unarmed_writers_do_not_pass_history_to_a_healthy_handshake(
     tmp_path: Path,
 ) -> None:
@@ -349,6 +353,7 @@ def test_dead_unarmed_writers_do_not_pass_history_to_a_healthy_handshake(
     )
 
 
+@_requires_linux_proc
 def test_dead_bus_record_expires_after_its_service_generation_window(tmp_path: Path) -> None:
     phase = tmp_path / "bus-phase"
     _write_phase_in_short_lived_process(phase, "bus", 100.0)
@@ -422,8 +427,8 @@ def test_unknown_live_process_generation_does_not_count_as_writer_death(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     phase = tmp_path / "bus-phase"
-    boot_id = current_boot_id()
-    generation = process_generation(os.getpid())
+    boot_id = heartbeat.current_boot_id()
+    generation = heartbeat.process_generation(os.getpid())
     assert boot_id is not None
     assert generation is not None
     phase.write_text(
@@ -441,8 +446,8 @@ def test_live_writer_with_unknown_generation_is_not_inherited(
     phase = tmp_path / "bus-phase"
     process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
     try:
-        boot_id = current_boot_id()
-        generation = process_generation(process.pid)
+        boot_id = heartbeat.current_boot_id()
+        generation = heartbeat.process_generation(process.pid)
         assert boot_id is not None
         assert generation is not None
         phase.write_text(
@@ -492,7 +497,7 @@ def test_legacy_dead_writer_marker_fails_closed(tmp_path: Path) -> None:
 def test_bus_failure_age_fails_closed_on_out_of_range_pid(tmp_path: Path, pid: int) -> None:
     """A pid outside Linux's signed ``pid_t`` range cannot identify a writer."""
     phase = tmp_path / "bus-phase"
-    boot_id = current_boot_id()
+    boot_id = heartbeat.current_boot_id()
     assert boot_id is not None
     phase.write_text(f"v2 bus {pid} 1 {boot_id} 100.0 100.0 attempt", encoding="utf-8")
 
