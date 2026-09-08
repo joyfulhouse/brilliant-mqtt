@@ -7,6 +7,234 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-09-08
+
+The on-panel agent and Home Assistant integration both move to 0.10.0. Update
+every panel through its per-panel bridge **Update** entity. The voice payload
+remains at 0.1.1 and is unchanged.
+
+**Upgrade the bridge and the bus-health watchdog together.** The bridge now
+stamps a bus-phase marker (`BUS_PHASE_FILE`, default
+`/run/brilliant-mqtt/bus-phase`) that the bus-health watchdog reads before it
+may reboot a panel. The marker's on-disk format is a shared, versioned
+contract: writer and reader must be upgraded and rolled back as a pair. If a
+deploy or rollback leaves only one side updated, delete the marker before
+starting either service: `rm -f /run/brilliant-mqtt/bus-phase`. Unknown or
+version-skewed records fail safe to no reboot. See
+`docs/reference/deployment.md` (bus-watchdog phase-file coupling) and
+`docs/CONFIGURATION.md` (Bus-health watchdog → `BUS_PHASE_FILE`).
+
+Canary: pilot panel (Office) ran this exact payload under systemd before
+release — bus + broker connect, discovery/telemetry, bus-phase marker
+stamped and read by the watchdog, and LWT/restart recovery all verified.
+
+### Fixed
+
+#### On-panel agent
+
+- **Bus session teardown no longer leaks resources or lets stale callbacks
+  touch the next session.** The observer and processor are owned before they
+  are started and unwound on any startup failure or cancellation (a handshake
+  failure used to leave the processor's reconnect work alive, and three
+  retries stacked three live peers); teardown is fenced by a session token
+  and the shutdown flag, so a callback that outlives shutdown cannot deliver
+  the rest of its snapshot or continue reconnect fan-out; observer and
+  processor close under one total deadline, with an unresolved close fencing
+  the next session's start instead of allocating another peer.
+  ([#104](https://github.com/joyfulhouse/brilliant-mqtt/pull/104),
+  [#135](https://github.com/joyfulhouse/brilliant-mqtt/pull/135);
+  [#88](https://github.com/joyfulhouse/brilliant-mqtt/issues/88),
+  [#130](https://github.com/joyfulhouse/brilliant-mqtt/issues/130),
+  [#131](https://github.com/joyfulhouse/brilliant-mqtt/issues/131))
+- **Quiet panels reconnect promptly after the MQTT reader dies.** An
+  unexpected end of the MQTT receive loop is consumed on the next session
+  tick and rebuilds the session, instead of going unnoticed until the next
+  publish or the periodic resync on a panel whose state was not changing.
+  ([#100](https://github.com/joyfulhouse/brilliant-mqtt/pull/100);
+  [#89](https://github.com/joyfulhouse/brilliant-mqtt/issues/89))
+- **Inbound MQTT backlog is bounded**, so a stalled bus write plus an
+  automation burst can no longer grow memory until the 96 MB service cap
+  restarts the agent. The transport queue upstream of the per-peripheral
+  command lanes is capped at 64 messages / 256 KiB of payload, with
+  latest-wins coalescing for idempotent setters at admission. Exceeding a
+  bound is an observable overload: the excess is shed and logged and the
+  session is rebuilt through the normal backoff, never dropped silently.
+  ([#101](https://github.com/joyfulhouse/brilliant-mqtt/pull/101);
+  [#90](https://github.com/joyfulhouse/brilliant-mqtt/issues/90))
+- **Scene events and command results survive a disconnect between local
+  send and broker receipt.** The durable outbox publishes at QoS 1 and marks
+  a record delivered only after the broker's PUBACK; an unacknowledged record
+  is replayed with the same dedup key / command id, including across a
+  restart. Broker acknowledgment is a transport guarantee only, not proof
+  that Home Assistant processed the message.
+  ([#107](https://github.com/joyfulhouse/brilliant-mqtt/pull/107);
+  [#92](https://github.com/joyfulhouse/brilliant-mqtt/issues/92))
+- **A second scene or mode command after a delivered result reaches the
+  bus.** Outbox pruning could drop an event still referenced by a delivered
+  result; the next state snapshot then failed validation, marked the scene
+  state untrusted, and routed every later command to health only. Pruning
+  now clears the dependency first and persists once per delivery; a state
+  file written by the old rule self-heals on load.
+  ([#136](https://github.com/joyfulhouse/brilliant-mqtt/pull/136);
+  [#124](https://github.com/joyfulhouse/brilliant-mqtt/issues/124),
+  [#122](https://github.com/joyfulhouse/brilliant-mqtt/issues/122))
+- **Repeated same-mode activations are detected through polling when the
+  push is missed.** The hot-poll change fingerprint includes the
+  `manual_mode_id` timestamp, so re-activating the current mode with a new
+  bus timestamp emits its event and confirms a pending command instead of
+  timing out. Scene blobs, whose value already embeds the execution time,
+  keep their timestamp-only refreshes suppressed.
+  ([#105](https://github.com/joyfulhouse/brilliant-mqtt/pull/105);
+  [#93](https://github.com/joyfulhouse/brilliant-mqtt/issues/93))
+- **Scene and mode commands are confirmed only by executions at or after the
+  request.** Each pending command records a panel-clock baseline; a delayed
+  or historical execution newer than the watermark but older than the
+  request still emits its native event but no longer returns
+  `accepted: true`. Mode `Variable.timestamp` is panel-clock epoch-ms and a
+  same-value write does not re-stamp, so a request for the already-active
+  mode is settled by the successful write RPC rather than waiting for a
+  stamp that never comes.
+  ([#116](https://github.com/joyfulhouse/brilliant-mqtt/pull/116),
+  [#141](https://github.com/joyfulhouse/brilliant-mqtt/pull/141);
+  [#94](https://github.com/joyfulhouse/brilliant-mqtt/issues/94),
+  [#119](https://github.com/joyfulhouse/brilliant-mqtt/issues/119))
+  **Operator note:** the scene state file gains a `confirm_after_ms` field
+  (no version bump; old files load and are migrated on first save). A state
+  file written by 0.10.0 and read by an older agent trips `state_untrusted`
+  (a fail-safe drop, not corruption) until the agent is upgraded again.
+- **The liveness heartbeat is stamped before broker-dependent work.** Startup
+  runs a real bus read and heartbeat before the scene bridge's MQTT
+  subscriptions, and `reconcile` beats before publishing availability, so a
+  broker that rejects a publish or never SUBACKs cannot starve the heartbeat
+  and provoke a bus-watchdog reboot of a healthy panel. Scene callbacks are
+  registered at construction and early executions buffered, so nothing is
+  lost during the startup window.
+  ([#118](https://github.com/joyfulhouse/brilliant-mqtt/pull/118),
+  [#139](https://github.com/joyfulhouse/brilliant-mqtt/pull/139);
+  [#87](https://github.com/joyfulhouse/brilliant-mqtt/issues/87),
+  [#125](https://github.com/joyfulhouse/brilliant-mqtt/issues/125))
+
+#### Bus-health watchdog
+
+- **Broker-only outages no longer reboot a healthy panel.** A stale
+  heartbeat alone is no longer enough: the watchdog also requires the
+  bus-phase marker to attribute the stall to the local bus. Broker refusal,
+  DNS/TLS/auth failures, and retained-ledger errors never reach the bus, so
+  they read as `pre_bus` and cannot qualify; a sustained bus handshake/read
+  failure still reboots under the existing cooldown/cap. A failed stamp
+  disables only the reboot guard (logged at WARNING) and never takes the
+  bridge down; a marker naming pid <= 1 is rejected. Attribution is timed
+  and generation-aware: only an unbroken run of validated bus-attempt
+  failures within a 300 s continuity bound counts, a successful read resets
+  it, an attempt is not authoritative until its lease is acquired, and
+  evidence older than the bridge unit's current systemd start generation is
+  discarded. The watchdog needs `systemctl show` on the bridge unit to
+  succeed; a failed or empty query degrades to no reboot.
+  ([#99](https://github.com/joyfulhouse/brilliant-mqtt/pull/99),
+  [#115](https://github.com/joyfulhouse/brilliant-mqtt/pull/115),
+  [#139](https://github.com/joyfulhouse/brilliant-mqtt/pull/139);
+  [#87](https://github.com/joyfulhouse/brilliant-mqtt/issues/87),
+  [#111](https://github.com/joyfulhouse/brilliant-mqtt/issues/111),
+  [#126](https://github.com/joyfulhouse/brilliant-mqtt/issues/126),
+  [#127](https://github.com/joyfulhouse/brilliant-mqtt/issues/127),
+  [#133](https://github.com/joyfulhouse/brilliant-mqtt/issues/133))
+  **Operator note:** see the paired-upgrade contract at the top of this
+  release. Known residual: on a read-only filesystem a recovered-but-
+  unrecorded bus whose writer then dies can be honored as a stale attempt
+  for up to ~300 s during restart backoff
+  ([#143](https://github.com/joyfulhouse/brilliant-mqtt/issues/143)).
+- **Every probe, recovery, and reboot child process is bounded** (`ip
+  route`, `ping`, `systemctl is-active`, `systemctl reboot`): on timeout the
+  whole process group is killed and reaped, the result reads conservatively,
+  and the poll loop continues instead of wedging alive-but-stuck.
+  ([#117](https://github.com/joyfulhouse/brilliant-mqtt/pull/117);
+  [#97](https://github.com/joyfulhouse/brilliant-mqtt/issues/97))
+
+#### Wi-Fi watchdog
+
+- **A reboot deferred or unconfirmed during an outage is retried.** The
+  reboot rung used to latch as fired the moment it was wanted, so a reboot
+  blocked by the 1 h cooldown or the rolling cap — or one whose `systemctl
+  reboot` timed out or failed after the GPIO/SDIO reset — was never
+  requested again until connectivity returned or the daemon restarted. The
+  rung now stays re-armable on every guard-eligible poll, every destructive
+  attempt is charged to the persisted cooldown/cap (the sole rate limiter),
+  and a blocked reboot logs its deferral once rather than looping.
+  Soft-reconnect and service-restart rungs remain one-shot.
+  ([#106](https://github.com/joyfulhouse/brilliant-mqtt/pull/106),
+  [#138](https://github.com/joyfulhouse/brilliant-mqtt/pull/138);
+  [#91](https://github.com/joyfulhouse/brilliant-mqtt/issues/91),
+  [#128](https://github.com/joyfulhouse/brilliant-mqtt/issues/128))
+- **Inconclusive probes cannot drive a destructive recovery.** Route
+  discovery and gateway ping are tri-state; a local timeout pauses outage
+  evidence instead of counting as a confirmed failure, so a panel whose
+  probes merely could not finish is not GPIO-reset or rebooted. The optional
+  broker TCP diagnostic resolves DNS in a killed-and-reaped child under one
+  total deadline shared with every connect attempt (IPv4 candidates first,
+  fair-share slices), reports `INCONCLUSIVE` on any timeout, and stays
+  log-only — it never feeds the ladder.
+  ([#117](https://github.com/joyfulhouse/brilliant-mqtt/pull/117),
+  [#138](https://github.com/joyfulhouse/brilliant-mqtt/pull/138);
+  [#97](https://github.com/joyfulhouse/brilliant-mqtt/issues/97),
+  [#129](https://github.com/joyfulhouse/brilliant-mqtt/issues/129))
+
+#### Hue CA hook
+
+- **A Hue coordinator reload that failed or was interrupted is retried.**
+  The oneshot appends the operator CA and then restarts the coordinator; if
+  the restart raised or the run was killed in between, every later run saw
+  the CA present and no-op'd, leaving the coordinator on stale TLS trust
+  indefinitely. The owed reload is now recorded durably before the restart
+  attempt and cleared only on success, so a later timer run retries it. New
+  env vars: `HUE_CA_STATE_PATH` (default
+  `/var/brilliant-hue-ca/pending-reload.json`) and
+  `HUE_CA_MIN_RETRY_INTERVAL_S` (default `300`).
+  ([#108](https://github.com/joyfulhouse/brilliant-mqtt/pull/108);
+  [#96](https://github.com/joyfulhouse/brilliant-mqtt/issues/96))
+
+#### Home Assistant integration
+
+- **Automatic panel repair and offline escalation are suspended while Home
+  Assistant has lost its MQTT broker.** A panel that only looks offline
+  because HA cannot see the broker is not repaired over SSH or flagged
+  `needs_attention`; a queued auto-repair re-checks shutdown state, panel
+  availability, and broker health after acquiring the fleet SSH lock and
+  skips itself if the panel recovered meanwhile; the post-repair recovery
+  verdict re-checks broker health after the lock wait and after journal
+  collection, deferring rather than escalating when HA cannot observe the
+  panel. When the broker returns, every still-offline panel is re-judged
+  from a fresh grace window. Manual **Repair** is ungated.
+  ([#110](https://github.com/joyfulhouse/brilliant-mqtt/pull/110),
+  [#134](https://github.com/joyfulhouse/brilliant-mqtt/pull/134);
+  [#95](https://github.com/joyfulhouse/brilliant-mqtt/issues/95),
+  [#132](https://github.com/joyfulhouse/brilliant-mqtt/issues/132))
+
+### Performance
+
+- **Bus pushes nobody wants cost nothing.** Each bridge hands the bus
+  adapter a device-scope predicate, so a mesh standby (and the panel bridge
+  seeing the `ble_mesh` device) drops the raw push before any normalization;
+  for wanted devices, normalization is deferred to delivery from an
+  immutable primitive snapshot, so a superseded coalesced snapshot is
+  discarded unnormalized. Operation-count evidence only (no on-panel CPU
+  measurement): 100 mesh snapshots on a standby went from 4,000
+  normalizations to 0.
+  ([#109](https://github.com/joyfulhouse/brilliant-mqtt/pull/109);
+  [#98](https://github.com/joyfulhouse/brilliant-mqtt/issues/98))
+
+### Tests
+
+- The local `_Bus` fake in the watchdog session tests accepts the
+  `want_device` keyword added by #98, restoring the agent CI job that a
+  semantic merge conflict between #109 and #118 had turned red.
+  ([#121](https://github.com/joyfulhouse/brilliant-mqtt/pull/121);
+  [#120](https://github.com/joyfulhouse/brilliant-mqtt/issues/120))
+- The agent test suite now runs on non-Linux developer machines: a
+  `tests/conftest.py` stand-in replaces the Linux-only `/proc` boot-id /
+  process-generation helpers when `/proc` is absent, and the three
+  child-process phase-writer tests are skipped there (CI on Linux still
+  exercises the real helpers).
+
 ## [0.9.3] - 2026-09-05
 
 The on-panel agent and Home Assistant integration versions move to 0.9.3.
@@ -629,7 +857,8 @@ panel redeploy is needed.
 - JoyfulHouse OSS docs standard: LICENSE (MIT), INSTALL.md, CHANGELOG.md,
   FUNDING.yml, CODEOWNERS, and the canonical `docs/` set.
 
-[Unreleased]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.9.3...HEAD
+[Unreleased]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.9.3...v0.10.0
 [0.9.3]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.9.0...v0.9.1
