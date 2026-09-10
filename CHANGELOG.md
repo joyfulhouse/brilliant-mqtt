@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.2] - 2026-09-10
+
+The on-panel agent and Home Assistant integration both move to 0.10.2. The
+agent's code is unchanged from 0.10.1; the version bump exists so every panel's
+per-panel bridge **Update** entity offers this release and re-runs the deploy
+through the hardened path below. The voice payload remains at 0.1.1 and is
+unchanged.
+
+This release hardens the HA-side deploy machinery after a live finding during
+the 0.10.1 fleet rollout — nothing in the panel agent changed.
+
+Canary: the hardened watchdog deploy (`deploy_bus_watchdog` streaming one
+tarball + the relay's carried restart) was exercised against the pilot panel
+(Office) before release — bus watchdog marker `0.10.1 → 0.10.2`, watchdog
+restarted, bus-phase marker `success`, LWT online.
+
+### Fixed
+
+- Integration: on a panel with a marginal Wi-Fi link (guest-bath, during the
+  0.10.1 rollout) the bus watchdog's recursive SFTP `put_dir` stalled past the
+  120 s operation timeout while the bridge tarball deployed fine. The relay had
+  already swapped the new watchdog tree and stamped its `VERSION` marker when it
+  died at the restart step, so every later converge read "already converged"
+  and skipped the restart — leaving the previous process running code it had
+  never loaded (a manual `systemctl restart` fixed it live). Three fixes:
+  `deploy_wifi_watchdog` / `deploy_bus_watchdog` now ship ONE gzipped tarball
+  (built off-loop, streamed in a single SFTP write, extracted into staging,
+  then swapped) — the same transport the bridge payload already uses, instead
+  of asyncssh's one-round-trip-per-file recursive put; `_relay_watchdog`
+  retries a failed converge once and carries a restart owed by this call's
+  deploy across the retry even when the `VERSION` marker already reads
+  converged, and force-restarts once more when both attempts fail while the
+  marker says the new code is live; and `shell.put_dir` pre-walks the local
+  tree in an executor (HA's event-loop watchdog had logged a blocking `scandir`
+  for asyncssh's recursive put during the rollout).
+
 ## [0.10.1] - 2026-09-10
 
 The on-panel agent and Home Assistant integration both move to 0.10.1. The
