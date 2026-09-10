@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any, Protocol, get_type_hints
 
 import asyncssh
@@ -995,3 +996,53 @@ async def test_fake_shell_exposes_the_same_explicit_process_lifecycle() -> None:
     assert scripted.terminate_count == 1
     assert scripted.running is False
     assert shell.commands == ["preflight"]
+
+
+class _FakeSFTP:
+    """Records recursive puts; stands in for asyncssh.SFTPClient."""
+
+    def __init__(self, connection: _SftpConnection) -> None:
+        self._connection = connection
+
+    async def __aenter__(self) -> _FakeSFTP:
+        return self
+
+    async def __aexit__(self, *exc: object) -> bool:
+        return False
+
+    async def put(self, local: str, remote: str, recurse: bool = False) -> None:
+        self._connection.sftp_puts.append((local, remote, recurse))
+
+
+class _SftpConnection(_FakeConnection):
+    """_FakeConnection extended with an SFTP client factory."""
+
+    def __init__(self, host_key: _FakeServerHostKey | None) -> None:
+        super().__init__(host_key)
+        self.sftp_puts: list[tuple[str, str, bool]] = []
+
+    async def start_sftp_client(self) -> _FakeSFTP:
+        return _FakeSFTP(self)
+
+
+async def test_put_dir_walks_off_loop_then_uploads_recursively(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """put_dir must not run the blocking local-tree walk inside the event loop.
+
+    HA logged "Detected blocking call to scandir" for asyncssh's recursive put
+    during the 0.10.1 rollout; the walk now runs via _list_local_tree in an
+    executor, then one recursive put does the SFTP writes.
+    """
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "run.py").write_text("# x\n")
+    conn = _SftpConnection(_FakeServerHostKey(b"ssh-ed25519 K\n"))
+    _patch_connect(monkeypatch, conn)
+    shell = AsyncsshShell("panel.local", "pw", _REAL_ED25519_PUB)
+    await shell.connect()
+
+    await shell.put_dir(str(tmp_path), "/remote/dir")
+
+    assert conn.sftp_puts == [(str(tmp_path), "/remote/dir", True)]
+    assert shell_module._list_local_tree(str(tmp_path)) == [str(package / "run.py")]

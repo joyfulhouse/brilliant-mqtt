@@ -1946,40 +1946,92 @@ _EXPECTED_WATCHDOG_SWAP = " && ".join(
 )
 
 
-async def test_deploy_wifi_watchdog_uploads_tree_then_swaps() -> None:
+async def test_deploy_wifi_watchdog_uploads_tree_then_swaps(
+    wifi_watchdog_tree: Path,
+) -> None:
     shell = await _connected(FakeShell())
-    await panel_ops.deploy_wifi_watchdog(shell, "/local/wifi_watchdog", "0.10.1")
-    assert shell.commands[0] == "rm -rf /var/brilliant-mqtt/wifi_watchdog.staging"
-    assert shell.dir_uploads == [
-        ("/local/wifi_watchdog", "/var/brilliant-mqtt/wifi_watchdog.staging")
-    ]
+    await panel_ops.deploy_wifi_watchdog(shell, str(wifi_watchdog_tree), "0.10.1")
+    assert shell.commands[0] == (
+        "rm -rf /var/brilliant-mqtt/wifi_watchdog.staging "
+        "/var/brilliant-mqtt/wifi_watchdog.staging.tar.gz"
+    )
+    # ONE streamed tarball upload (not a per-file recursive put) — the fix for
+    # the marginal-link stall that left the process stale while the marker read
+    # converged.
+    assert shell.dir_uploads == []
+    assert shell.uploads[0][0] == "/var/brilliant-mqtt/wifi_watchdog.staging.tar.gz"
+    assert shell.uploads[0][2] == 0o600
+    assert any(
+        c.startswith("mkdir -p /var/brilliant-mqtt/wifi_watchdog.staging && tar xzf")
+        for c in shell.commands
+    )
     assert _EXPECTED_WATCHDOG_SWAP in shell.commands
+    # The VERSION marker lands only after the swap, so it always describes the
+    # tree that is actually live.
+    assert shell.uploads[-1] == (
+        "/var/brilliant-mqtt/wifi_watchdog/VERSION",
+        b"0.10.1",
+        0o644,
+    )
 
 
-async def test_deploy_wifi_watchdog_failed_upload_records_no_destructive_swap() -> None:
-    """A failed put_dir must not trigger the swap — no partial-replace of working install."""
-    shell = await _connected(FakeShell(put_dir_error=OSError("transfer aborted")))
+@pytest.fixture
+def wifi_watchdog_tree(tmp_path: Path) -> Path:
+    """A minimal real tree: the deploy tars it in memory off-loop."""
+    tree = tmp_path / "wifi_watchdog"
+    package = tree / "brilliant_wifi_watchdog"
+    package.mkdir(parents=True)
+    (package / "run.py").write_text("# watchdog\n")
+    return tree
+
+
+@pytest.fixture
+def bus_watchdog_tree(tmp_path: Path) -> Path:
+    tree = tmp_path / "bus_watchdog"
+    package = tree / "brilliant_bus_watchdog"
+    package.mkdir(parents=True)
+    (package / "run.py").write_text("# watchdog\n")
+    return tree
+
+
+async def test_deploy_wifi_watchdog_failed_upload_records_no_destructive_swap(
+    wifi_watchdog_tree: Path,
+) -> None:
+    """A failed tarball upload must not trigger the swap — no partial-replace."""
+    shell = await _connected(FakeShell(put_bytes_error=OSError("transfer aborted")))
     with pytest.raises(OSError, match="transfer aborted"):
-        await panel_ops.deploy_wifi_watchdog(shell, "/local/wifi_watchdog", "0.10.1")
-    assert shell.commands == ["rm -rf /var/brilliant-mqtt/wifi_watchdog.staging"]
+        await panel_ops.deploy_wifi_watchdog(shell, str(wifi_watchdog_tree), "0.10.1")
+    assert shell.commands == [
+        "rm -rf /var/brilliant-mqtt/wifi_watchdog.staging "
+        "/var/brilliant-mqtt/wifi_watchdog.staging.tar.gz"
+    ]
     assert shell.uploads == []
-    assert shell.dir_uploads == []  # the put_dir failed → staging dir was never uploaded
+    assert shell.dir_uploads == []
 
 
-async def test_deploy_wifi_watchdog_raises_when_swap_fails() -> None:
+async def test_deploy_wifi_watchdog_raises_when_swap_fails(
+    wifi_watchdog_tree: Path,
+) -> None:
     shell = await _connected(
         FakeShell(responses={_EXPECTED_WATCHDOG_SWAP: RunResult(1, "", "mv failed\n")})
     )
     with pytest.raises(panel_ops.PanelOpError, match="exited 1"):
-        await panel_ops.deploy_wifi_watchdog(shell, "/local/wifi_watchdog", "0.10.1")
+        await panel_ops.deploy_wifi_watchdog(shell, str(wifi_watchdog_tree), "0.10.1")
     # A failed swap never stamps the marker — the marker means "this tree is live".
-    assert shell.uploads == []
+    assert [u[0] for u in shell.uploads] == ["/var/brilliant-mqtt/wifi_watchdog.staging.tar.gz"]
 
 
-async def test_deploy_wifi_watchdog_writes_version_marker_after_swap() -> None:
+async def test_deploy_wifi_watchdog_writes_version_marker_after_swap(
+    wifi_watchdog_tree: Path,
+) -> None:
     shell = await _connected(FakeShell())
-    await panel_ops.deploy_wifi_watchdog(shell, "/local/wifi_watchdog", "0.10.1")
-    assert shell.uploads == [("/var/brilliant-mqtt/wifi_watchdog/VERSION", b"0.10.1", 0o644)]
+    await panel_ops.deploy_wifi_watchdog(shell, str(wifi_watchdog_tree), "0.10.1")
+    assert shell.uploads[0][0] == "/var/brilliant-mqtt/wifi_watchdog.staging.tar.gz"
+    assert shell.uploads[-1] == (
+        "/var/brilliant-mqtt/wifi_watchdog/VERSION",
+        b"0.10.1",
+        0o644,
+    )
     assert shell.commands[-1] == _EXPECTED_WATCHDOG_SWAP
 
 
@@ -2140,39 +2192,68 @@ _EXPECTED_BUS_WATCHDOG_SWAP = " && ".join(
 )
 
 
-async def test_deploy_bus_watchdog_uploads_tree_then_swaps() -> None:
+async def test_deploy_bus_watchdog_uploads_tree_then_swaps(
+    bus_watchdog_tree: Path,
+) -> None:
     shell = await _connected(FakeShell())
-    await panel_ops.deploy_bus_watchdog(shell, "/local/bus_watchdog", "0.10.1")
-    assert shell.commands[0] == "rm -rf /var/brilliant-mqtt/bus_watchdog.staging"
-    assert shell.dir_uploads == [
-        ("/local/bus_watchdog", "/var/brilliant-mqtt/bus_watchdog.staging")
-    ]
+    await panel_ops.deploy_bus_watchdog(shell, str(bus_watchdog_tree), "0.10.1")
+    assert shell.commands[0] == (
+        "rm -rf /var/brilliant-mqtt/bus_watchdog.staging "
+        "/var/brilliant-mqtt/bus_watchdog.staging.tar.gz"
+    )
+    assert shell.dir_uploads == []
+    assert shell.uploads[0][0] == "/var/brilliant-mqtt/bus_watchdog.staging.tar.gz"
+    assert any(
+        c.startswith("mkdir -p /var/brilliant-mqtt/bus_watchdog.staging && tar xzf")
+        for c in shell.commands
+    )
     assert _EXPECTED_BUS_WATCHDOG_SWAP in shell.commands
+    assert shell.uploads[-1] == (
+        "/var/brilliant-mqtt/bus_watchdog/VERSION",
+        b"0.10.1",
+        0o644,
+    )
 
 
-async def test_deploy_bus_watchdog_failed_upload_records_no_destructive_swap() -> None:
-    """A failed put_dir must not trigger the swap — no partial-replace of working install."""
-    shell = await _connected(FakeShell(put_dir_error=OSError("transfer aborted")))
+async def test_deploy_bus_watchdog_failed_upload_records_no_destructive_swap(
+    bus_watchdog_tree: Path,
+) -> None:
+    """A failed tarball upload must not trigger the swap — no partial-replace."""
+    shell = await _connected(FakeShell(put_bytes_error=OSError("transfer aborted")))
     with pytest.raises(OSError, match="transfer aborted"):
-        await panel_ops.deploy_bus_watchdog(shell, "/local/bus_watchdog", "0.10.1")
-    assert shell.commands == ["rm -rf /var/brilliant-mqtt/bus_watchdog.staging"]
+        await panel_ops.deploy_bus_watchdog(shell, str(bus_watchdog_tree), "0.10.1")
+    assert shell.commands == [
+        "rm -rf /var/brilliant-mqtt/bus_watchdog.staging "
+        "/var/brilliant-mqtt/bus_watchdog.staging.tar.gz"
+    ]
     assert shell.uploads == []
-    assert shell.dir_uploads == []  # the put_dir failed → staging dir was never uploaded
+    assert shell.dir_uploads == []
 
 
-async def test_deploy_bus_watchdog_raises_when_swap_fails() -> None:
+async def test_deploy_bus_watchdog_raises_when_swap_fails(
+    bus_watchdog_tree: Path,
+) -> None:
     shell = await _connected(
         FakeShell(responses={_EXPECTED_BUS_WATCHDOG_SWAP: RunResult(1, "", "mv failed\n")})
     )
     with pytest.raises(panel_ops.PanelOpError, match="exited 1"):
-        await panel_ops.deploy_bus_watchdog(shell, "/local/bus_watchdog", "0.10.1")
-    assert shell.uploads == []
+        await panel_ops.deploy_bus_watchdog(shell, str(bus_watchdog_tree), "0.10.1")
+    # Only the tarball upload happened; the VERSION stamp must not follow a
+    # failed swap.
+    assert [u[0] for u in shell.uploads] == ["/var/brilliant-mqtt/bus_watchdog.staging.tar.gz"]
 
 
-async def test_deploy_bus_watchdog_writes_version_marker_after_swap() -> None:
+async def test_deploy_bus_watchdog_writes_version_marker_after_swap(
+    bus_watchdog_tree: Path,
+) -> None:
     shell = await _connected(FakeShell())
-    await panel_ops.deploy_bus_watchdog(shell, "/local/bus_watchdog", "0.10.1")
-    assert shell.uploads == [("/var/brilliant-mqtt/bus_watchdog/VERSION", b"0.10.1", 0o644)]
+    await panel_ops.deploy_bus_watchdog(shell, str(bus_watchdog_tree), "0.10.1")
+    assert shell.uploads[0][0] == "/var/brilliant-mqtt/bus_watchdog.staging.tar.gz"
+    assert shell.uploads[-1] == (
+        "/var/brilliant-mqtt/bus_watchdog/VERSION",
+        b"0.10.1",
+        0o644,
+    )
     assert shell.commands[-1] == _EXPECTED_BUS_WATCHDOG_SWAP
 
 

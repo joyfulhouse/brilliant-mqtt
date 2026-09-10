@@ -2551,9 +2551,9 @@ async def deploy_wifi_watchdog(shell: PanelShell, local_dir: str, version: str) 
     """Upload local_dir (contains brilliant_wifi_watchdog/) and swap into place.
 
     *local_dir* is the integration payload's agent_payload/wifi_watchdog/, which
-    contains the brilliant_wifi_watchdog/ package. Stage+swap via put_dir so a
-    failed transfer never half-replaces a working install; the current dir is moved
-    aside (.bak) so a mid-swap failure stays recoverable.
+    contains the brilliant_wifi_watchdog/ package. Shipped as ONE gzipped
+    tarball (see _deploy_watchdog_tarball); the current dir is moved aside
+    (.bak) so a mid-swap failure stays recoverable.
 
     *version* is the bundled payload release (agent_payload/VERSION); it is
     stamped to {PANEL_WIFI_WATCHDOG_DIR}/VERSION only AFTER the swap succeeds, so the marker always
@@ -2561,10 +2561,15 @@ async def deploy_wifi_watchdog(shell: PanelShell, local_dir: str, version: str) 
 
     Result on panel: {PANEL_WIFI_WATCHDOG_DIR}/brilliant_wifi_watchdog/run.py + VERSION.
     """
-    await shell.run(f"rm -rf {_WATCHDOG_STAGING_DIR}")
-    await shell.put_dir(local_dir, _WATCHDOG_STAGING_DIR)
-    await _checked(shell, _watchdog_swap_command())
-    await shell.put_bytes(version.encode(), f"{PANEL_WIFI_WATCHDOG_DIR}/VERSION", 0o644)
+    await _deploy_watchdog_tarball(
+        shell,
+        local_dir,
+        _WATCHDOG_STAGING_DIR,
+        f"{_WATCHDOG_STAGING_DIR}.tar.gz",
+        _watchdog_swap_command(),
+        f"{PANEL_WIFI_WATCHDOG_DIR}/VERSION",
+        version,
+    )
 
 
 def _watchdog_swap_command() -> str:
@@ -2674,9 +2679,9 @@ async def deploy_bus_watchdog(shell: PanelShell, local_dir: str, version: str) -
     """Upload local_dir (contains brilliant_bus_watchdog/) and swap into place.
 
     *local_dir* is the integration payload's agent_payload/bus_watchdog/, which
-    contains the brilliant_bus_watchdog/ package. Stage+swap via put_dir so a
-    failed transfer never half-replaces a working install; the current dir is moved
-    aside (.bak) so a mid-swap failure stays recoverable.
+    contains the brilliant_bus_watchdog/ package. Shipped as ONE gzipped
+    tarball (see _deploy_watchdog_tarball); the current dir is moved aside
+    (.bak) so a mid-swap failure stays recoverable.
 
     *version* is the bundled payload release (agent_payload/VERSION); it is
     stamped to {PANEL_BUS_WATCHDOG_DIR}/VERSION only AFTER the swap succeeds, so the marker always
@@ -2684,10 +2689,62 @@ async def deploy_bus_watchdog(shell: PanelShell, local_dir: str, version: str) -
 
     Result on panel: {PANEL_BUS_WATCHDOG_DIR}/brilliant_bus_watchdog/run.py + VERSION.
     """
-    await shell.run(f"rm -rf {_BUS_WATCHDOG_STAGING_DIR}")
-    await shell.put_dir(local_dir, _BUS_WATCHDOG_STAGING_DIR)
-    await _checked(shell, _bus_watchdog_swap_command())
-    await shell.put_bytes(version.encode(), f"{PANEL_BUS_WATCHDOG_DIR}/VERSION", 0o644)
+    await _deploy_watchdog_tarball(
+        shell,
+        local_dir,
+        _BUS_WATCHDOG_STAGING_DIR,
+        f"{_BUS_WATCHDOG_STAGING_DIR}.tar.gz",
+        _bus_watchdog_swap_command(),
+        f"{PANEL_BUS_WATCHDOG_DIR}/VERSION",
+        version,
+    )
+
+
+async def _deploy_watchdog_tarball(
+    shell: PanelShell,
+    local_dir: str,
+    staging_dir: str,
+    staging_tarball: str,
+    swap_command: str,
+    version_file: str,
+    version: str,
+) -> None:
+    """Ship a watchdog payload as ONE gzipped tarball, extract, then swap.
+
+    The 2026-09-10 guest-bath failure showed asyncssh's recursive put_dir stalls
+    past the 120 s SFTP timeout on marginal Wi-Fi links (one round trip per
+    file), so a watchdog redeploy could fail while the bridge update — one
+    streamed tarball — succeeded in the same SSH session, silently leaving the
+    VERSION marker converged but the running process stale. The watchdog
+    payload is ~20 KB, so it gets the same treatment as deploy_payload: the
+    tree is tarred off-loop in memory and streamed in one SFTP write. A failed
+    transfer never triggers the swap, so it can never half-replace a working
+    install.
+    """
+    loop = asyncio.get_running_loop()
+    archive = await loop.run_in_executor(None, _build_watchdog_archive, local_dir)
+    await shell.run(f"rm -rf {staging_dir} {staging_tarball}")
+    await shell.put_bytes(archive, staging_tarball, 0o600)
+    await _checked(
+        shell,
+        " && ".join(
+            [
+                f"mkdir -p {staging_dir}",
+                f"tar xzf {staging_tarball} -C {staging_dir}",
+                f"rm -f {staging_tarball}",
+            ]
+        ),
+    )
+    await _checked(shell, swap_command)
+    await shell.put_bytes(version.encode(), version_file, 0o644)
+
+
+def _build_watchdog_archive(local_dir: str) -> bytes:
+    """Build the watchdog payload tarball off-loop; reuses the payload normalizer."""
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        archive.add(local_dir, arcname=".", filter=_normalize_payload_member)
+    return buffer.getvalue()
 
 
 def _bus_watchdog_swap_command() -> str:

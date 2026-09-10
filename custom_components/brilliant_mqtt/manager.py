@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import re
+import tarfile
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
@@ -257,6 +258,8 @@ _BUS_WATCHDOG_RELAY = _WatchdogRelaySpec(
     enable=panel_ops.enable_bus_watchdog,
     restart=panel_ops.restart_bus_watchdog,
 )
+
+_WATCHDOG_RELAY_RETRY_DELAY_S = 15
 
 # _relay_selected_components warning suffix per calling site (texts preserved from
 # the three formerly duplicated relay blocks so log greps keep working).
@@ -1038,23 +1041,61 @@ class PanelManager:
         together). The unit is always re-laid + enabled (OTA hygiene), and the
         service is restarted ONLY when code was redeployed: `enable --now` does not
         reload a running service, and a needless restart would just churn it.
+
+        A failed converge is retried once after a short delay (the relay runs
+        inside a longer operation — a repair or an Update-entity install —
+        whose SSH session is often slow on marginal links). A restart owed by
+        this call's deploy is carried across the retry even when the VERSION
+        marker already reads converged, and, when both attempts fail while the
+        marker says the new code is live, the service is force-restarted once
+        more. That closes the 2026-09-10 guest-bath hole: the first attempt
+        failed AFTER the swap + VERSION stamp, and anything that trusts the
+        marker alone skips the restart, leaving the pre-update process running
+        code it never loaded.
         """
-        try:
-            payload_dir = _payload_dir()
-            unit = await self.hass.async_add_executor_job(
-                (payload_dir / spec.service_filename).read_text
-            )
-            state = await spec.inspect(shell)
-            redeployed = not state.payload_present or state.version != version
-            if redeployed:
-                await spec.deploy(shell, str(payload_dir / spec.payload_subdir), version)
-            await spec.ensure_unit(shell, unit)
-            await spec.enable(shell)
-            if redeployed:
-                await spec.restart(shell)
-        except (OSError, asyncssh.Error, PanelOpError) as err:
-            return err
-        return None
+        payload_dir = _payload_dir()
+        error: Exception | None = None
+        owes_restart = False
+        for attempt in range(2):
+            if attempt:
+                await asyncio.sleep(_WATCHDOG_RELAY_RETRY_DELAY_S)
+            try:
+                # The unit read stays inside the attempt: a missing/unreadable
+                # bundled unit must degrade to a warning, never fail the bridge
+                # operation the relay rides on.
+                unit = await self.hass.async_add_executor_job(
+                    (payload_dir / spec.service_filename).read_text
+                )
+                state = await spec.inspect(shell)
+                if not state.payload_present or state.version != version:
+                    await spec.deploy(shell, str(payload_dir / spec.payload_subdir), version)
+                    owes_restart = True
+                await spec.ensure_unit(shell, unit)
+                await spec.enable(shell)
+                if owes_restart:
+                    # Owed by THIS call's deploy (or carried from the failed
+                    # previous attempt): the VERSION marker alone must never
+                    # excuse skipping it — the running process may predate the
+                    # stamp (the 2026-09-10 guest-bath hole).
+                    await spec.restart(shell)
+                    owes_restart = False
+            except (OSError, asyncssh.Error, PanelOpError, tarfile.TarError) as err:
+                error = err
+                continue
+            return None
+        if error is not None and owes_restart:
+            # Both attempts failed while owing a restart; the marker may still
+            # say the new code is live, so try once more before giving up.
+            try:
+                state = await spec.inspect(shell)
+            except (OSError, asyncssh.Error, PanelOpError, tarfile.TarError):
+                return error
+            if state.payload_present and state.version == version:
+                try:
+                    await spec.restart(shell)
+                except (OSError, asyncssh.Error, PanelOpError):
+                    pass
+        return error
 
     async def _relay_selected_components(
         self, shell: PanelShell, *, context: str, version: str

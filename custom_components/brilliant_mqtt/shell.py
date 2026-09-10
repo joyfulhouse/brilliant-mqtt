@@ -9,6 +9,7 @@ at the bottom of this module until its entries are consolidated.
 from __future__ import annotations
 
 import asyncio
+import os
 from dataclasses import dataclass
 from typing import Protocol, cast
 
@@ -18,6 +19,20 @@ from asyncssh import SFTPAttrs
 _CONNECT_TIMEOUT = 15
 _LOGIN_TIMEOUT = 15
 _OPERATION_TIMEOUT = 120
+
+
+def _list_local_tree(local_dir: str) -> list[str]:
+    """Pre-walk a local tree in an executor so the event loop never blocks.
+
+    Returns the list so the call itself is observable; the real value is that
+    os.walk runs the blocking scandir/stat syscalls off-loop. Callers must pass
+    the result to asyncssh's recursive put on the loop immediately after, so
+    the tree cannot change between the walk and the upload in practice (staging
+    dirs are ours alone).
+    """
+    return [os.path.join(root, name) for root, _dirs, files in os.walk(local_dir) for name in files]
+
+
 _CLOSE_TIMEOUT = 15
 PANEL_PROCESS_OUTPUT_LIMIT = 32 * 1024
 _PROCESS_READ_SIZE = 4096

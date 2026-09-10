@@ -50,6 +50,7 @@ class FakeShell:
         responses: dict[str, RunResult] | None = None,
         connect_error: Exception | None = None,
         put_dir_error: Exception | None = None,
+        put_bytes_error: Exception | None = None,
         connect_gate: asyncio.Event | None = None,
         pinned: str | None = "ssh-ed25519 FAKEKEY",
         run_errors: dict[str, Exception] | None = None,
@@ -58,6 +59,9 @@ class FakeShell:
         self.responses = dict(responses or {})
         self.connect_error = connect_error
         self.put_dir_error = put_dir_error
+        # Models a mid-transfer SFTP failure on a streamed upload (tarball /
+        # unit bytes); recorded only on success, like put_dir_error.
+        self.put_bytes_error = put_bytes_error
         # Commands whose run() raises the mapped exception (models a mid-command
         # transport drop — e.g. the reboot disconnect, or a dead diagnostics probe).
         self.run_errors = dict(run_errors or {})
@@ -122,6 +126,8 @@ class FakeShell:
 
     async def put_bytes(self, data: bytes, remote_path: str, mode: int) -> None:
         self._require_connected()
+        if self.put_bytes_error is not None:
+            raise self.put_bytes_error
         self.uploads.append((remote_path, data, mode))
 
     async def put_dir(self, local_dir: str, remote_dir: str) -> None:
