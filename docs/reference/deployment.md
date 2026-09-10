@@ -98,6 +98,15 @@ over WebSockets are unsupported by the panel transport.
   (see `docs/ha-integration.md`) automates exactly this: it watches the panel's
   availability LWT + `brilliant/<panel>/bridge` meta topic, and restores the
   unit/env from the copies it stages under `/var/brilliant-mqtt/system/`.
+- **Watchdog release markers.** The integration stamps the release it deployed
+  to `/var/brilliant-mqtt/wifi_watchdog/VERSION` and
+  `/var/brilliant-mqtt/bus_watchdog/VERSION` (same value as
+  `/var/brilliant-mqtt/VERSION`), written only after the code swap succeeds.
+  Every repair, post-OTA refresh and Update-entity install compares that
+  marker to the bundled payload and redeploys + restarts the watchdog when it
+  is missing (pre-0.10.1 install) or differs — so the bridge and the
+  bus-watchdog cannot drift apart across releases. Hand-installed layouts can
+  write the marker themselves to opt out of the one-time redeploy.
 - **Bus-watchdog phase-file coupling.** The bridge stamps the bus-phase marker
   (`BUS_PHASE_FILE`, default `/run/brilliant-mqtt/bus-phase`) that the
   bus-watchdog reads to gate reboots (see
