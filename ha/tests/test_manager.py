@@ -88,6 +88,15 @@ from tests.conftest import REPIN_NEW_KEY, RepinShells
 from tests.fakes import FakeShell
 from tests.test_init import ENTRY_DATA
 
+
+@pytest.fixture(autouse=True)
+def _no_watchdog_relay_retry_delay(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Relay tests must not wait the production 15 s retry delay."""
+    from custom_components.brilliant_mqtt import manager as manager_module
+
+    monkeypatch.setattr(manager_module, "_WATCHDOG_RELAY_RETRY_DELAY_S", 0)
+
+
 _SECRET_FAILURE_CANARY = "MQTT_PASSWORD=manager-outward-secret"
 
 
@@ -4595,7 +4604,7 @@ async def _repair_with(hass: HomeAssistant, shell: FakeShell, entry_data: dict[s
 
 
 def _assert_bus_watchdog_redeployed_and_restarted(shell: FakeShell) -> None:
-    assert any("bus_watchdog" in local for (local, _remote) in shell.dir_uploads)
+    assert any(path.endswith("bus_watchdog.staging.tar.gz") for (path, _d, _m) in shell.uploads)
     assert ("/var/brilliant-mqtt/bus_watchdog/VERSION", b"0.2.0", 0o644) in shell.uploads
     assert "systemctl enable --now brilliant-bus-watchdog" in shell.commands
     assert "systemctl restart brilliant-bus-watchdog" in shell.commands
@@ -4704,6 +4713,102 @@ async def test_update_agent_survives_bus_watchdog_relay_failure(
     await _update_with(hass, shell, _bus_watchdog_entry_data())
     assert "systemctl restart brilliant-mqtt" in shell.commands
     assert "bus watchdog update failed" in caplog.text
+
+
+class _RelayVersionAwareShell(FakeShell):
+    """Inspect reports the version from the VERSION marker upload, when stamped.
+
+    Models the guest-bath 0.10.1 failure: the first relay attempt deployed the
+    new code and stamped the VERSION marker but died at the restart, so a later
+    converge must NOT skip the restart as "already converged".
+    """
+
+    async def run(self, command: str) -> RunResult:
+        result = await super().run(command)
+        if command == panel_ops.BUS_WATCHDOG_INSPECT_COMMAND:
+            stamped = next(
+                (
+                    data.decode()
+                    for path, data, _m in self.uploads
+                    # The bridge stamps /var/brilliant-mqtt/VERSION too — only
+                    # the watchdog's own marker says anything about its code.
+                    if path.endswith("bus_watchdog/VERSION")
+                ),
+                None,
+            )
+            if stamped:
+                result = RunResult(
+                    result.exit_status,
+                    result.stdout.rstrip("\n")[: -len("0.1.0")] + stamped + "\n",
+                    result.stderr,
+                )
+        return result
+
+
+class _FirstPutBytesFails(FakeShell):
+    """First streamed upload aborts mid-transfer; everything after succeeds."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._failed_once = False
+
+    async def put_bytes(self, data: bytes, remote_path: str, mode: int) -> None:
+        if not self._failed_once and remote_path.endswith("bus_watchdog.staging.tar.gz"):
+            self._failed_once = True
+            raise OSError("sftp write stalled")
+        await super().put_bytes(data, remote_path, mode)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_update_agent_recovers_watchdog_relay_on_retry(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    payload_dir: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """One stalled tarball upload is retried once and converges without a warning."""
+    shell = _FirstPutBytesFails(
+        responses={
+            panel_ops.BUS_WATCHDOG_INSPECT_COMMAND: RunResult(
+                0, "unit=1\nenabled=1\nactive=1\npayload=1\n0.1.0\n", ""
+            )
+        }
+    )
+    await _update_with(hass, shell, _bus_watchdog_entry_data())
+    assert any(u[0].endswith("bus_watchdog.staging.tar.gz") for u in shell.uploads)
+    assert shell.commands.count("systemctl restart brilliant-bus-watchdog") == 1
+    assert "bus watchdog update failed" not in caplog.text
+    assert "systemctl restart brilliant-mqtt" in shell.commands
+
+
+@pytest.mark.allow_lingering_timers
+async def test_update_agent_force_restarts_watchdog_when_converged_but_failed(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    payload_dir: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Both relay attempts fail AFTER the swap+VERSION stamp: force-restart anyway.
+
+    Regression for the guest-bath 0.10.1 install: the relay failed at the
+    restart step twice (inspect says "0.1.0" while running), and without the
+    forced restart the process keeps running the old code while the marker
+    claims 0.10.1.
+    """
+    shell = _RelayVersionAwareShell(
+        responses={
+            panel_ops.BUS_WATCHDOG_INSPECT_COMMAND: RunResult(
+                0, "unit=1\nenabled=1\nactive=1\npayload=1\n0.1.0\n", ""
+            )
+        },
+        run_errors={"systemctl restart brilliant-bus-watchdog": OSError("restart dropped")},
+    )
+    await _update_with(hass, shell, _bus_watchdog_entry_data())
+    # attempt 1 + attempt 2 (redeploy path) + forced restart after the final
+    # inspect saw the live VERSION marker
+    assert shell.commands.count("systemctl restart brilliant-bus-watchdog") == 3
+    assert "bus watchdog update failed" in caplog.text
+    assert "systemctl restart brilliant-mqtt" in shell.commands
 
 
 # ---------------------------------------------------------------------------

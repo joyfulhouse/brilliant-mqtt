@@ -381,8 +381,7 @@ async def test_bus_watchdog_install_stamps_bundled_version(
     shell = FakeShell()
     await shell.connect()
     await comp._bus_install(hass, shell, {})
-    assert shell.dir_uploads == [
-        (str(payload_dir / "bus_watchdog"), "/var/brilliant-mqtt/bus_watchdog.staging")
-    ]
+    assert shell.dir_uploads == []
+    assert any(path.endswith("bus_watchdog.staging.tar.gz") for (path, _d, _m) in shell.uploads)
     assert ("/var/brilliant-mqtt/bus_watchdog/VERSION", b"0.2.0", 0o644) in shell.uploads
     assert "systemctl enable --now brilliant-bus-watchdog" in shell.commands
