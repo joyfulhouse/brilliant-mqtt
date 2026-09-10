@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-09-10
+
+The on-panel agent and Home Assistant integration both move to 0.10.1. The
+agent's code is unchanged from 0.10.0; the version bump exists so every panel's
+per-panel bridge **Update** entity offers this release, and installing it is
+what brings the bus-health watchdog on each panel up to the same release as
+the bridge (see Fixed). The voice payload remains at 0.1.1 and is unchanged.
+
+Canary: the release's panel recipes (`deploy_payload` + bus-watchdog
+inspect/redeploy/restart, exactly what the Update entity now runs) were
+executed against the pilot panel (Office, flat legacy layout) before release —
+watchdog marker converged `None → 0.10.1`, bridge and watchdog restarted
+cleanly, bus-phase marker `success`, LWT online.
+
 ### Fixed
 
 - Integration: the per-panel **Update** entity install (and the
