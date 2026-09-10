@@ -2482,6 +2482,24 @@ async def uninstall_ha_mirror(shell: PanelShell) -> None:
     await _checked(shell, "systemctl daemon-reload")
 
 
+def _parse_watchdog_probe(stdout: str) -> tuple[dict[str, bool], str | None]:
+    """Split a watchdog inspect probe into its key=value flags + the VERSION marker.
+
+    The marker is the last non-empty line that is not a ``key=value`` flag (the
+    ``cat VERSION`` tail of the probe); it is None when the file is absent — a
+    legacy install that predates the marker.
+    """
+    flags: dict[str, bool] = {}
+    version: str | None = None
+    for line in stdout.splitlines():
+        key, sep, value = line.partition("=")
+        if sep and key in ("unit", "enabled", "active", "payload"):
+            flags[key] = value == "1"
+        elif line.strip():
+            version = line.strip()
+    return flags, version
+
+
 # ---------------------------------------------------------------------------
 # Wi-Fi watchdog recipes
 # ---------------------------------------------------------------------------
@@ -2498,7 +2516,8 @@ WIFI_WATCHDOG_INSPECT_COMMAND = (
     f"systemctl is-active {WIFI_WATCHDOG_SERVICE_NAME} >/dev/null 2>&1"
     f" && echo active=1 || echo active=0; "
     f"test -f {PANEL_WIFI_WATCHDOG_DIR}/brilliant_wifi_watchdog/run.py "
-    f"&& echo payload=1 || echo payload=0"
+    f"&& echo payload=1 || echo payload=0; "
+    f"cat {PANEL_WIFI_WATCHDOG_DIR}/VERSION 2>/dev/null || true"
 )
 
 
@@ -2510,25 +2529,25 @@ class WifiWatchdogState:
     enabled: bool
     active: bool
     payload_present: bool  # run.py entrypoint present inside PANEL_WIFI_WATCHDOG_DIR
+    # Release marker written by deploy_*_watchdog (PANEL_WIFI_WATCHDOG_DIR/VERSION); None on a
+    # legacy install that predates the marker, so a relay converges it too.
+    version: str | None = None
 
 
 async def inspect_wifi_watchdog(shell: PanelShell) -> WifiWatchdogState:
     """Probe Wi-Fi watchdog install/health state in one shell round-trip."""
     result = await shell.run(WIFI_WATCHDOG_INSPECT_COMMAND)
-    flags: dict[str, bool] = {}
-    for line in result.stdout.splitlines():
-        key, sep, value = line.partition("=")
-        if sep and key in ("unit", "enabled", "active", "payload"):
-            flags[key] = value == "1"
+    flags, version = _parse_watchdog_probe(result.stdout)
     return WifiWatchdogState(
         unit_present=flags.get("unit", False),
         enabled=flags.get("enabled", False),
         active=flags.get("active", False),
         payload_present=flags.get("payload", False),
+        version=version,
     )
 
 
-async def deploy_wifi_watchdog(shell: PanelShell, local_dir: str) -> None:
+async def deploy_wifi_watchdog(shell: PanelShell, local_dir: str, version: str) -> None:
     """Upload local_dir (contains brilliant_wifi_watchdog/) and swap into place.
 
     *local_dir* is the integration payload's agent_payload/wifi_watchdog/, which
@@ -2536,11 +2555,16 @@ async def deploy_wifi_watchdog(shell: PanelShell, local_dir: str) -> None:
     failed transfer never half-replaces a working install; the current dir is moved
     aside (.bak) so a mid-swap failure stays recoverable.
 
-    Result on panel: {PANEL_WIFI_WATCHDOG_DIR}/brilliant_wifi_watchdog/run.py.
+    *version* is the bundled payload release (agent_payload/VERSION); it is
+    stamped to {PANEL_WIFI_WATCHDOG_DIR}/VERSION only AFTER the swap succeeds, so the marker always
+    describes the tree that is actually live and a relay can converge on it.
+
+    Result on panel: {PANEL_WIFI_WATCHDOG_DIR}/brilliant_wifi_watchdog/run.py + VERSION.
     """
     await shell.run(f"rm -rf {_WATCHDOG_STAGING_DIR}")
     await shell.put_dir(local_dir, _WATCHDOG_STAGING_DIR)
     await _checked(shell, _watchdog_swap_command())
+    await shell.put_bytes(version.encode(), f"{PANEL_WIFI_WATCHDOG_DIR}/VERSION", 0o644)
 
 
 def _watchdog_swap_command() -> str:
@@ -2580,6 +2604,11 @@ async def enable_wifi_watchdog(shell: PanelShell) -> None:
     await _checked(shell, f"systemctl enable --now {WIFI_WATCHDOG_SERVICE_NAME}")
 
 
+async def restart_wifi_watchdog(shell: PanelShell) -> None:
+    """Restart the running watchdog so freshly deployed code is actually loaded."""
+    await _checked(shell, f"systemctl restart {WIFI_WATCHDOG_SERVICE_NAME}")
+
+
 async def uninstall_wifi_watchdog(shell: PanelShell) -> None:
     """Stop + disable + remove everything the Wi-Fi watchdog owns on the panel.
 
@@ -2610,7 +2639,8 @@ BUS_WATCHDOG_INSPECT_COMMAND = (
     f"systemctl is-active {BUS_WATCHDOG_SERVICE_NAME} >/dev/null 2>&1"
     f" && echo active=1 || echo active=0; "
     f"test -f {PANEL_BUS_WATCHDOG_DIR}/brilliant_bus_watchdog/run.py "
-    f"&& echo payload=1 || echo payload=0"
+    f"&& echo payload=1 || echo payload=0; "
+    f"cat {PANEL_BUS_WATCHDOG_DIR}/VERSION 2>/dev/null || true"
 )
 
 
@@ -2622,25 +2652,25 @@ class BusWatchdogState:
     enabled: bool
     active: bool
     payload_present: bool  # run.py entrypoint present inside PANEL_BUS_WATCHDOG_DIR
+    # Release marker written by deploy_*_watchdog (PANEL_BUS_WATCHDOG_DIR/VERSION); None on a
+    # legacy install that predates the marker, so a relay converges it too.
+    version: str | None = None
 
 
 async def inspect_bus_watchdog(shell: PanelShell) -> BusWatchdogState:
     """Probe bus-health watchdog install/health state in one shell round-trip."""
     result = await shell.run(BUS_WATCHDOG_INSPECT_COMMAND)
-    flags: dict[str, bool] = {}
-    for line in result.stdout.splitlines():
-        key, sep, value = line.partition("=")
-        if sep and key in ("unit", "enabled", "active", "payload"):
-            flags[key] = value == "1"
+    flags, version = _parse_watchdog_probe(result.stdout)
     return BusWatchdogState(
         unit_present=flags.get("unit", False),
         enabled=flags.get("enabled", False),
         active=flags.get("active", False),
         payload_present=flags.get("payload", False),
+        version=version,
     )
 
 
-async def deploy_bus_watchdog(shell: PanelShell, local_dir: str) -> None:
+async def deploy_bus_watchdog(shell: PanelShell, local_dir: str, version: str) -> None:
     """Upload local_dir (contains brilliant_bus_watchdog/) and swap into place.
 
     *local_dir* is the integration payload's agent_payload/bus_watchdog/, which
@@ -2648,11 +2678,16 @@ async def deploy_bus_watchdog(shell: PanelShell, local_dir: str) -> None:
     failed transfer never half-replaces a working install; the current dir is moved
     aside (.bak) so a mid-swap failure stays recoverable.
 
-    Result on panel: {PANEL_BUS_WATCHDOG_DIR}/brilliant_bus_watchdog/run.py.
+    *version* is the bundled payload release (agent_payload/VERSION); it is
+    stamped to {PANEL_BUS_WATCHDOG_DIR}/VERSION only AFTER the swap succeeds, so the marker always
+    describes the tree that is actually live and a relay can converge on it.
+
+    Result on panel: {PANEL_BUS_WATCHDOG_DIR}/brilliant_bus_watchdog/run.py + VERSION.
     """
     await shell.run(f"rm -rf {_BUS_WATCHDOG_STAGING_DIR}")
     await shell.put_dir(local_dir, _BUS_WATCHDOG_STAGING_DIR)
     await _checked(shell, _bus_watchdog_swap_command())
+    await shell.put_bytes(version.encode(), f"{PANEL_BUS_WATCHDOG_DIR}/VERSION", 0o644)
 
 
 def _bus_watchdog_swap_command() -> str:
@@ -2690,6 +2725,11 @@ async def ensure_bus_watchdog_unit(shell: PanelShell, unit_content: str) -> None
 
 async def enable_bus_watchdog(shell: PanelShell) -> None:
     await _checked(shell, f"systemctl enable --now {BUS_WATCHDOG_SERVICE_NAME}")
+
+
+async def restart_bus_watchdog(shell: PanelShell) -> None:
+    """Restart the running watchdog so freshly deployed code is actually loaded."""
+    await _checked(shell, f"systemctl restart {BUS_WATCHDOG_SERVICE_NAME}")
 
 
 async def uninstall_bus_watchdog(shell: PanelShell) -> None:
