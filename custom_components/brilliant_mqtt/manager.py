@@ -221,33 +221,50 @@ class _PayloadState(Protocol):
     @property
     def payload_present(self) -> bool: ...
 
+    @property
+    def version(self) -> str | None: ...
+
 
 @dataclass(frozen=True)
 class _WatchdogRelaySpec:
+    label: str  # log noun: "watchdog" (Wi-Fi) / "bus watchdog"
     service_filename: str
     payload_subdir: str
     inspect: Callable[[PanelShell], Awaitable[_PayloadState]]
-    deploy: Callable[[PanelShell, str], Awaitable[None]]
+    deploy: Callable[[PanelShell, str, str], Awaitable[None]]
     ensure_unit: Callable[[PanelShell, str], Awaitable[None]]
     enable: Callable[[PanelShell], Awaitable[None]]
+    restart: Callable[[PanelShell], Awaitable[None]]
 
 
 _WIFI_WATCHDOG_RELAY = _WatchdogRelaySpec(
+    label="watchdog",
     service_filename="brilliant-wifi-watchdog.service",
     payload_subdir="wifi_watchdog",
     inspect=panel_ops.inspect_wifi_watchdog,
     deploy=panel_ops.deploy_wifi_watchdog,
     ensure_unit=panel_ops.ensure_wifi_watchdog_unit,
     enable=panel_ops.enable_wifi_watchdog,
+    restart=panel_ops.restart_wifi_watchdog,
 )
 _BUS_WATCHDOG_RELAY = _WatchdogRelaySpec(
+    label="bus watchdog",
     service_filename="brilliant-bus-watchdog.service",
     payload_subdir="bus_watchdog",
     inspect=panel_ops.inspect_bus_watchdog,
     deploy=panel_ops.deploy_bus_watchdog,
     ensure_unit=panel_ops.ensure_bus_watchdog_unit,
     enable=panel_ops.enable_bus_watchdog,
+    restart=panel_ops.restart_bus_watchdog,
 )
+
+# _relay_selected_components warning suffix per calling site (texts preserved from
+# the three formerly duplicated relay blocks so log greps keep working).
+_RELAY_CONTEXT_SUFFIX = {
+    "repair": "repair failed",
+    "refresh": "refresh failed; will retry next reconcile",
+    "update": "update failed",
+}
 
 
 class PanelManager:
@@ -1009,21 +1026,63 @@ class PanelManager:
         self,
         shell: PanelShell,
         spec: _WatchdogRelaySpec,
+        version: str,
     ) -> Exception | None:
-        """Restore one selected watchdog without blocking the bridge operation."""
+        """Restore one selected watchdog without blocking the bridge operation.
+
+        Converges the watchdog code on *version* (the bundled payload release): the
+        tree is redeployed when it is missing OR when its VERSION marker differs —
+        including a legacy install with no marker at all — so an Update-entity
+        install that ships the bridge can no longer leave the watchdog on the
+        previous release (the 0.10.0 bus-phase contract requires the pair to move
+        together). The unit is always re-laid + enabled (OTA hygiene), and the
+        service is restarted ONLY when code was redeployed: `enable --now` does not
+        reload a running service, and a needless restart would just churn it.
+        """
         try:
             payload_dir = _payload_dir()
             unit = await self.hass.async_add_executor_job(
                 (payload_dir / spec.service_filename).read_text
             )
             state = await spec.inspect(shell)
-            if not state.payload_present:
-                await spec.deploy(shell, str(payload_dir / spec.payload_subdir))
+            redeployed = not state.payload_present or state.version != version
+            if redeployed:
+                await spec.deploy(shell, str(payload_dir / spec.payload_subdir), version)
             await spec.ensure_unit(shell, unit)
             await spec.enable(shell)
+            if redeployed:
+                await spec.restart(shell)
         except (OSError, asyncssh.Error, PanelOpError) as err:
             return err
         return None
+
+    async def _relay_selected_components(
+        self, shell: PanelShell, *, context: str, version: str
+    ) -> None:
+        """Re-lay every selected companion component on a connected shell.
+
+        Shared by async_repair, _refresh_staged_copies and async_update_agent. An
+        OTA wipes /etc/systemd/system/ (units) — and for hue-ca also /data — even
+        though the code in /var survives, so each selected component gets its unit
+        re-laid, its code redeployed when missing or version-skewed (watchdogs),
+        and its service (re)enabled. Every failure is logged and swallowed: a
+        companion outage must never block or fail the bridge operation itself.
+        *context* selects the warning suffix ("repair" / "refresh" / "update").
+        """
+        from .components import selected_ids  # lazy: components imports manager
+
+        suffix = _RELAY_CONTEXT_SUFFIX[context]
+        selected = selected_ids(self.store.data)
+        for component_id, spec in (
+            (COMPONENT_WIFI_WATCHDOG, _WIFI_WATCHDOG_RELAY),
+            (COMPONENT_BUS_WATCHDOG, _BUS_WATCHDOG_RELAY),
+        ):
+            if component_id in selected:
+                if await self._relay_watchdog(shell, spec, version):
+                    _LOGGER.warning("%s: %s %s", self.panel, spec.label, suffix)
+        if COMPONENT_HUE_CA in selected:
+            if await self._relay_hue_ca(shell):
+                _LOGGER.warning("%s: hue-ca %s", self.panel, suffix)
 
     async def _relay_hue_ca(self, shell: PanelShell) -> Exception | None:
         """Restore the selected hue-ca recovery hook without blocking the bridge op.
@@ -1219,37 +1278,12 @@ class PanelManager:
                             )
                         else:
                             ir.async_delete_issue(self.hass, DOMAIN, self._voice_issue_id)
-                    # Wi-Fi watchdog re-lay: re-write unit to /etc if selected.
-                    # OTA wipes /etc/systemd/system/ so the unit disappears after a
-                    # firmware update even though the code survives in /var.  Lay it
-                    # back down (and redeploy the code if /var was also wiped) so the
-                    # watchdog keeps running across OTAs.  Failure is logged and
-                    # swallowed — a watchdog outage must not block the bridge repair.
-                    from .components import selected_ids  # lazy: components imports manager
-
-                    selected = selected_ids(self.store.data)
-                    if COMPONENT_WIFI_WATCHDOG in selected:
-                        if await self._relay_watchdog(shell, _WIFI_WATCHDOG_RELAY):
-                            _LOGGER.warning("%s: watchdog repair failed", self.panel)
-                    # Bus watchdog re-lay: re-write unit to /etc if selected.
-                    # OTA wipes /etc/systemd/system/ so the unit disappears after a
-                    # firmware update even though the code survives in /var.  Lay it
-                    # back down (and redeploy the code if /var was also wiped) so the
-                    # watchdog keeps running across OTAs.  Failure is logged and
-                    # swallowed — a watchdog outage must not block the bridge repair.
-                    if COMPONENT_BUS_WATCHDOG in selected:
-                        if await self._relay_watchdog(shell, _BUS_WATCHDOG_RELAY):
-                            _LOGGER.warning("%s: bus watchdog repair failed", self.panel)
-                    # Hue CA recovery hook re-lay: re-write its units to /etc if selected.
-                    # OTA wipes /etc/systemd/system/ (and /data — what the hook itself
-                    # recovers), so the timer disappears after a firmware update even
-                    # though the code + previously-written CA survive in /var. Lay it
-                    # back down (and redeploy code+CA if /var was also wiped) so the
-                    # hook keeps re-appending the CA across OTAs. Failure is logged and
-                    # swallowed — a hue-ca outage must not block the bridge repair.
-                    if COMPONENT_HUE_CA in selected:
-                        if await self._relay_hue_ca(shell):
-                            _LOGGER.warning("%s: hue-ca repair failed", self.panel)
+                    # Companion components (watchdogs, hue-ca): re-lay units wiped by an
+                    # OTA and converge watchdog code on the bundled release. Failures
+                    # are logged and swallowed — they must not block the bridge repair.
+                    await self._relay_selected_components(
+                        shell, context="repair", version=await self._payload_version()
+                    )
                     try:
                         retirement_result = await self._async_retire_legacy_ha_mirror_on_shell(
                             shell
@@ -1361,6 +1395,13 @@ class PanelManager:
                     await panel_ops.deploy_payload(shell, str(_payload_dir()), version)
                     _p(80)
                     await panel_ops.ensure_configs(shell, unit, env)
+                    # Ship the selected companion components with the bridge so an
+                    # Update-entity install can no longer leave a watchdog on the previous
+                    # release (0.10.0 bus-phase contract: bridge + bus watchdog move as a
+                    # pair). Runs before the bridge restart so both come up on *version*;
+                    # relay failures are logged and never fail the update.
+                    await self._relay_selected_components(shell, context="update", version=version)
+                    _p(85)
                     _p(90)
                     await panel_ops.restart(shell)
                     try:
@@ -1986,34 +2027,11 @@ class PanelManager:
                     unit = await self._unit_contents()
                     env = await self._async_stage_broker_ca(shell)
                     await panel_ops.ensure_configs(shell, unit, env)
-                    # Wi-Fi watchdog: also re-lay its unit when selected — OTA wipes /etc
-                    # and the watchdog unit disappears even though the code in /var survives.
-                    from .components import selected_ids  # lazy: components imports manager
-
-                    selected = selected_ids(self.store.data)
-                    if COMPONENT_WIFI_WATCHDOG in selected:
-                        if await self._relay_watchdog(shell, _WIFI_WATCHDOG_RELAY):
-                            _LOGGER.warning(
-                                "%s: watchdog refresh failed; will retry next reconcile",
-                                self.panel,
-                            )
-                    # Bus watchdog: also re-lay its unit when selected — OTA wipes /etc
-                    # and the watchdog unit disappears even though the code in /var survives.
-                    if COMPONENT_BUS_WATCHDOG in selected:
-                        if await self._relay_watchdog(shell, _BUS_WATCHDOG_RELAY):
-                            _LOGGER.warning(
-                                "%s: bus watchdog refresh failed; will retry next reconcile",
-                                self.panel,
-                            )
-                    # Hue CA recovery hook: also re-lay its units when selected — OTA
-                    # wipes /etc and the timer disappears even though the code +
-                    # previously-written CA in /var survive.
-                    if COMPONENT_HUE_CA in selected:
-                        if await self._relay_hue_ca(shell):
-                            _LOGGER.warning(
-                                "%s: hue-ca refresh failed; will retry next reconcile",
-                                self.panel,
-                            )
+                    # Companion components: re-lay units the OTA wiped (code in /var
+                    # survives) and converge watchdog code on the bundled release.
+                    await self._relay_selected_components(
+                        shell, context="refresh", version=await self._payload_version()
+                    )
                     try:
                         retirement_result = await self._async_retire_legacy_ha_mirror_on_shell(
                             shell

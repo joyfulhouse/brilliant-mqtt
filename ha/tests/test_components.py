@@ -371,3 +371,18 @@ async def test_bridge_install_rejects_invalid_tls_before_any_panel_mutation(
     assert shell.commands == []
     assert shell.uploads == []
     assert shell.dir_uploads == []
+
+
+async def test_bus_watchdog_install_stamps_bundled_version(
+    hass: HomeAssistant, payload_dir: Path
+) -> None:
+    """Component install deploys the tree AND writes the release marker the relay
+    later converges on (agent_payload/VERSION → /var/.../bus_watchdog/VERSION)."""
+    shell = FakeShell()
+    await shell.connect()
+    await comp._bus_install(hass, shell, {})
+    assert shell.dir_uploads == [
+        (str(payload_dir / "bus_watchdog"), "/var/brilliant-mqtt/bus_watchdog.staging")
+    ]
+    assert ("/var/brilliant-mqtt/bus_watchdog/VERSION", b"0.2.0", 0o644) in shell.uploads
+    assert "systemctl enable --now brilliant-bus-watchdog" in shell.commands

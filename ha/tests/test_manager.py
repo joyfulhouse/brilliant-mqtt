@@ -4407,7 +4407,7 @@ async def test_repair_relays_watchdog_unit_when_selected(
         0, "unit=1\nenv=1\nenabled=1\nactive=1\nsunit=1\nsenv=1\npayload=1\n0.2.0\n", ""
     )
     # Watchdog code lives in /var (OTA-persistent); /etc unit wiped by OTA.
-    wd_payload_ok = RunResult(0, "unit=0\nenabled=0\nactive=0\npayload=1\n", "")
+    wd_payload_ok = RunResult(0, "unit=0\nenabled=0\nactive=0\npayload=1\n0.2.0\n", "")
     shell = FakeShell(
         responses={
             panel_ops.INSPECT_COMMAND: agent_ok,
@@ -4493,7 +4493,7 @@ async def test_repair_relays_bus_watchdog_unit_when_selected(
         0, "unit=1\nenv=1\nenabled=1\nactive=1\nsunit=1\nsenv=1\npayload=1\n0.2.0\n", ""
     )
     # Watchdog code lives in /var (OTA-persistent); /etc unit wiped by OTA.
-    bwd_payload_ok = RunResult(0, "unit=0\nenabled=0\nactive=0\npayload=1\n", "")
+    bwd_payload_ok = RunResult(0, "unit=0\nenabled=0\nactive=0\npayload=1\n0.2.0\n", "")
     shell = FakeShell(
         responses={
             panel_ops.INSPECT_COMMAND: agent_ok,
@@ -4516,8 +4516,9 @@ async def test_repair_relays_bus_watchdog_unit_when_selected(
     assert any("brilliant-bus-watchdog.service" in p for (p, _d, _m) in shell.uploads)
     # enable_bus_watchdog issued the systemctl command.
     assert "systemctl enable --now brilliant-bus-watchdog" in shell.commands
-    # Payload was present in /var → no redeploy of the watchdog code tree.
+    # Payload was present in /var at the bundled version → no redeploy, no restart.
     assert not any("bus_watchdog" in local for (local, _remote) in shell.dir_uploads)
+    assert "systemctl restart brilliant-bus-watchdog" not in shell.commands
 
     assert await hass.config_entries.async_unload(entry.entry_id)
 
@@ -4555,6 +4556,157 @@ async def test_repair_skips_bus_watchdog_when_not_selected(
 
 
 # ---------------------------------------------------------------------------
+# Watchdog release-version convergence (legacy layout: Update entity shipped app
+# only, leaving the bus watchdog code at the previous release — 0.10.0 gap)
+# ---------------------------------------------------------------------------
+
+_AGENT_OK_INSPECT = RunResult(
+    0, "unit=1\nenv=1\nenabled=1\nactive=1\nsunit=1\nsenv=1\npayload=1\n0.2.0\n", ""
+)
+
+
+def _bus_watchdog_entry_data() -> dict[str, Any]:
+    return {
+        **ENTRY_DATA,
+        CONF_COMPONENTS: {COMPONENT_BRIDGE: True, COMPONENT_BUS_WATCHDOG: True},
+    }
+
+
+def _bus_watchdog_shell(inspect_stdout: str) -> FakeShell:
+    from custom_components.brilliant_mqtt import panel_ops
+
+    return FakeShell(
+        responses={
+            panel_ops.INSPECT_COMMAND: _AGENT_OK_INSPECT,
+            panel_ops.BUS_WATCHDOG_INSPECT_COMMAND: RunResult(0, inspect_stdout, ""),
+        }
+    )
+
+
+async def _repair_with(hass: HomeAssistant, shell: FakeShell, entry_data: dict[str, Any]) -> None:
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
+        entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=entry_data, version=2)
+        entry.add_to_hass(hass)
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        await _entry_manager(entry).async_repair(trigger="button")
+        await hass.async_block_till_done()
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+def _assert_bus_watchdog_redeployed_and_restarted(shell: FakeShell) -> None:
+    assert any("bus_watchdog" in local for (local, _remote) in shell.dir_uploads)
+    assert ("/var/brilliant-mqtt/bus_watchdog/VERSION", b"0.2.0", 0o644) in shell.uploads
+    assert "systemctl enable --now brilliant-bus-watchdog" in shell.commands
+    assert "systemctl restart brilliant-bus-watchdog" in shell.commands
+    # Restart only after the unit was re-laid and enabled (code + unit both fresh).
+    assert shell.commands.index("systemctl restart brilliant-bus-watchdog") > shell.commands.index(
+        "systemctl enable --now brilliant-bus-watchdog"
+    )
+
+
+@pytest.mark.allow_lingering_timers
+async def test_repair_redeploys_bus_watchdog_on_version_skew(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    payload_dir: Path,
+) -> None:
+    """Code present but at an older release → redeploy the tree, stamp, restart."""
+    shell = _bus_watchdog_shell("unit=1\nenabled=1\nactive=1\npayload=1\n0.1.0\n")
+    await _repair_with(hass, shell, _bus_watchdog_entry_data())
+    _assert_bus_watchdog_redeployed_and_restarted(shell)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_repair_redeploys_bus_watchdog_without_version_marker(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    payload_dir: Path,
+) -> None:
+    """A legacy install (code present, no VERSION marker) converges on the first relay."""
+    shell = _bus_watchdog_shell("unit=1\nenabled=1\nactive=1\npayload=1\n")
+    await _repair_with(hass, shell, _bus_watchdog_entry_data())
+    _assert_bus_watchdog_redeployed_and_restarted(shell)
+
+
+async def _update_with(hass: HomeAssistant, shell: FakeShell, entry_data: dict[str, Any]) -> None:
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
+        entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=entry_data, version=2)
+        entry.add_to_hass(hass)
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        manager = _entry_manager(entry)
+        await manager.async_update_agent()
+        await hass.async_block_till_done()
+        assert manager._recovery_cancel is not None, "update must still arm recovery"
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_update_agent_converges_selected_bus_watchdog(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    payload_dir: Path,
+) -> None:
+    """The Update entity install ships the selected watchdogs with the bridge.
+
+    Before this, async_update_agent deployed app+vendor only, so a fleet updated
+    through the Update entity kept the previous release's bus watchdog — breaking
+    the 0.10.0 "upgrade bridge + bus watchdog together" contract.
+    """
+    shell = _bus_watchdog_shell("unit=1\nenabled=1\nactive=1\npayload=1\n0.1.0\n")
+    await _update_with(hass, shell, _bus_watchdog_entry_data())
+    _assert_bus_watchdog_redeployed_and_restarted(shell)
+    # Watchdog converged BEFORE the bridge restart so both come up on the new release.
+    assert shell.commands.index("systemctl restart brilliant-bus-watchdog") < shell.commands.index(
+        "systemctl restart brilliant-mqtt"
+    )
+
+
+@pytest.mark.allow_lingering_timers
+async def test_update_agent_leaves_matching_bus_watchdog_alone(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    payload_dir: Path,
+) -> None:
+    shell = _bus_watchdog_shell("unit=1\nenabled=1\nactive=1\npayload=1\n0.2.0\n")
+    await _update_with(hass, shell, _bus_watchdog_entry_data())
+    assert not any("bus_watchdog" in local for (local, _remote) in shell.dir_uploads)
+    assert "systemctl restart brilliant-bus-watchdog" not in shell.commands
+    # The unit is still re-laid + enabled (OTA hygiene), as the repair path does.
+    assert "systemctl enable --now brilliant-bus-watchdog" in shell.commands
+
+
+@pytest.mark.allow_lingering_timers
+async def test_update_agent_skips_bus_watchdog_when_not_selected(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    payload_dir: Path,
+) -> None:
+    shell = _bus_watchdog_shell("unit=1\nenabled=1\nactive=1\npayload=1\n0.1.0\n")
+    await _update_with(hass, shell, {**ENTRY_DATA, CONF_COMPONENTS: {COMPONENT_BRIDGE: True}})
+    assert not any("bus-watchdog" in c or "bus_watchdog" in c for c in shell.commands)
+    assert not any("bus_watchdog" in local for (local, _remote) in shell.dir_uploads)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_update_agent_survives_bus_watchdog_relay_failure(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    payload_dir: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A watchdog relay failure is logged and swallowed — the bridge update proceeds."""
+    from custom_components.brilliant_mqtt import panel_ops
+
+    shell = _bus_watchdog_shell("unit=1\nenabled=1\nactive=1\npayload=1\n0.1.0\n")
+    shell.responses[panel_ops._bus_watchdog_swap_command()] = RunResult(1, "", "mv failed\n")
+    await _update_with(hass, shell, _bus_watchdog_entry_data())
+    assert "systemctl restart brilliant-mqtt" in shell.commands
+    assert "bus watchdog update failed" in caplog.text
+
+
+# ---------------------------------------------------------------------------
 # Wi-Fi watchdog staged-copy refresh re-lay (same OTA gap, the non-outage path)
 # ---------------------------------------------------------------------------
 
@@ -4570,7 +4722,7 @@ async def test_refresh_staged_copies_relays_wifi_watchdog_unit_when_selected(
     from custom_components.brilliant_mqtt.shell import RunResult
 
     # Watchdog code lives in /var (OTA-persistent); /etc unit wiped by OTA.
-    wd_payload_ok = RunResult(0, "unit=0\nenabled=0\nactive=0\npayload=1\n", "")
+    wd_payload_ok = RunResult(0, "unit=0\nenabled=0\nactive=0\npayload=1\n0.2.0\n", "")
     shell = FakeShell(responses={panel_ops.WIFI_WATCHDOG_INSPECT_COMMAND: wd_payload_ok})
     entry_data = {
         **ENTRY_DATA,
@@ -4622,7 +4774,7 @@ async def test_refresh_staged_copies_relays_bus_watchdog_unit_when_selected(
     from custom_components.brilliant_mqtt.shell import RunResult
 
     # Watchdog code lives in /var (OTA-persistent); /etc unit wiped by OTA.
-    bwd_payload_ok = RunResult(0, "unit=0\nenabled=0\nactive=0\npayload=1\n", "")
+    bwd_payload_ok = RunResult(0, "unit=0\nenabled=0\nactive=0\npayload=1\n0.2.0\n", "")
     shell = FakeShell(responses={panel_ops.BUS_WATCHDOG_INSPECT_COMMAND: bwd_payload_ok})
     entry_data = {
         **ENTRY_DATA,
@@ -4650,8 +4802,9 @@ async def test_refresh_staged_copies_relays_bus_watchdog_unit_when_selected(
     assert any("brilliant-bus-watchdog.service" in p for (p, _d, _m) in shell.uploads)
     # enable_bus_watchdog issued the systemctl command.
     assert "systemctl enable --now brilliant-bus-watchdog" in shell.commands
-    # Payload was present in /var → no redeploy of the watchdog code tree.
+    # Payload was present in /var at the bundled version → no redeploy, no restart.
     assert not any("bus_watchdog" in local for (local, _remote) in shell.dir_uploads)
+    assert "systemctl restart brilliant-bus-watchdog" not in shell.commands
 
     assert await hass.config_entries.async_unload(entry.entry_id)
 

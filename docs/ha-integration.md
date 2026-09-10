@@ -288,7 +288,7 @@ Assistant control** option is on (production default: off):
 
 | Entity | What it is |
 |---|---|
-| `update.brilliant_<panel>_bridge` | Agent **update** entity. Installed version comes from the panel's retained bridge-meta (`agent_version`); latest from the bundled payload's `VERSION`. Installing pushes the bundled payload and restarts the agent. |
+| `update.brilliant_<panel>_bridge` | Agent **update** entity. Installed version comes from the panel's retained bridge-meta (`agent_version`); latest from the bundled payload's `VERSION`. Installing pushes the bundled payload, converges every **selected** companion component on the same release (the Wi-Fi/bus watchdog code is redeployed and restarted when its `VERSION` marker is missing or differs; units are re-laid), then restarts the agent. |
 | `binary_sensor.brilliant_<panel>_bridge_health` | Bridge **health** (device class `problem`). `on` = needs attention (offline past grace with auto-repair off, a repair step failed, or a repair ran but the bridge stayed offline). Attributes: `reason`, `availability`. |
 | `button.brilliant_<panel>_repair_bridge` | **Manual repair** — restores the unit/env and starts the agent (installs agent code first if missing), bypassing the auto-repair cooldown. |
 | `button.brilliant_<panel>_reboot_panel` | **Reboot panel** (device class `restart`) — captures a secret-safe diagnostics summary over SSH, then reboots the panel. Typed service-journal categories and probe metrics are saved before volatile logs disappear; raw log text is never persisted. |

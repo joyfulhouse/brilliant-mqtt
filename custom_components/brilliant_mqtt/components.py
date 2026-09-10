@@ -144,14 +144,15 @@ async def _install_watchdog(
     *,
     service_filename: str,
     payload_subdir: str,
-    deploy: Callable[[PanelShell, str], Awaitable[None]],
+    deploy: Callable[[PanelShell, str, str], Awaitable[None]],
     ensure_unit: Callable[[PanelShell, str], Awaitable[None]],
     enable: Callable[[PanelShell], Awaitable[None]],
 ) -> None:
-    """Deploy and enable one watchdog from the bundled payload."""
+    """Deploy and enable one watchdog from the bundled payload (stamped with its version)."""
     payload_dir = _mgr._payload_dir()
     unit = await hass.async_add_executor_job((payload_dir / service_filename).read_text)
-    await deploy(shell, str(payload_dir / payload_subdir))
+    version = (await hass.async_add_executor_job((payload_dir / "VERSION").read_text)).strip()
+    await deploy(shell, str(payload_dir / payload_subdir), version)
     await ensure_unit(shell, unit)
     await enable(shell)
 

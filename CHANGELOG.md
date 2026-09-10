@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-09-10
+
+The on-panel agent and Home Assistant integration both move to 0.10.1. The
+agent's code is unchanged from 0.10.0; the version bump exists so every panel's
+per-panel bridge **Update** entity offers this release, and installing it is
+what brings the bus-health watchdog on each panel up to the same release as
+the bridge (see Fixed). The voice payload remains at 0.1.1 and is unchanged.
+
+Canary: the release's panel recipes (`deploy_payload` + bus-watchdog
+inspect/redeploy/restart, exactly what the Update entity now runs) were
+executed against the pilot panel (Office, flat legacy layout) before release —
+watchdog marker converged `None → 0.10.1`, bridge and watchdog restarted
+cleanly, bus-phase marker `success`, LWT online.
+
+### Fixed
+
+- Integration: the per-panel **Update** entity install (and the
+  `brilliant_mqtt.redeploy` service) shipped the bridge app only, so a fleet
+  updated that way kept the previous release's bus-health watchdog code —
+  silently breaking the 0.10.0 "upgrade the bridge and the bus watchdog
+  together" contract (the old watchdog reads the new bus-phase marker as
+  unknown and fails safe to no reboot). The Wi-Fi and bus watchdogs now carry a
+  `VERSION` marker under their `/var/brilliant-mqtt/<name>/` directory, and
+  every repair, post-OTA refresh and Update-entity install redeploys and
+  restarts a selected watchdog whose marker is missing or differs from the
+  bundled release. The Update entity converges the companion components before
+  restarting the bridge; a companion failure is logged and never fails the
+  bridge update.
+
 ## [0.10.0] - 2026-09-08
 
 The on-panel agent and Home Assistant integration both move to 0.10.0. Update
