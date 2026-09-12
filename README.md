@@ -11,6 +11,7 @@ cloud, no HomeKit pairing, no flaky BLE.
 [![Project Maintenance][maintenance-shield]][maintenance]
 [![GitHub Sponsors][sponsors-shield]][sponsors]
 [![Ko-fi][kofi-shield]][kofi]
+[![Built with Omnigent][omnigent-shield]][omnigent]
 
 > For **Brilliant NextGen** in-wall panels ([brilliant.tech](https://www.brilliant.tech)) —
 > not the Australian "Brilliant Smart" plug/bulb brand. See [Credits](#credits).
@@ -188,6 +189,14 @@ for details.
   bridge uses — nothing is modified or jailbroken; Root SSH is an official
   panel feature.
 
+---
+
+<p align="center">
+  <a href="https://github.com/omnigent-ai/omnigent"><img src="https://raw.githubusercontent.com/joyfulhouse/.github/main/assets/badges/built-with-omnigent.svg" alt="Built with Omnigent"></a>
+  <br>
+  <sub>Built with <a href="https://github.com/omnigent-ai/omnigent">Omnigent</a> — the open-source AI agent framework and meta-harness.</sub>
+</p>
+
 <!-- Badge links -->
 [releases-shield]: https://img.shields.io/github/release/joyfulhouse/brilliant-mqtt.svg?style=for-the-badge
 [releases]: https://github.com/joyfulhouse/brilliant-mqtt/releases
@@ -204,3 +213,5 @@ for details.
 [sponsors]: https://github.com/sponsors/btli
 [kofi-shield]: https://img.shields.io/badge/Ko--fi-donate-FF5E5B.svg?style=for-the-badge&logo=ko-fi&logoColor=white
 [kofi]: https://ko-fi.com/bryanli
+[omnigent-shield]: https://raw.githubusercontent.com/joyfulhouse/.github/main/assets/badges/built-with-omnigent.svg
+[omnigent]: https://github.com/omnigent-ai/omnigent
