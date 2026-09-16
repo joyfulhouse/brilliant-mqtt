@@ -191,6 +191,8 @@ class Bridge:
         self._owned_topics = owned_topics
         # (peripheral_id, var) -> monotonic time of last re-assert attempt.
         self._last_reassert: dict[tuple[str, str], float] = {}
+        # Failed writes double their per-variable retry delay up to five minutes.
+        self._reassert_retry_interval_s: dict[tuple[str, str], float] = {}
         # (peripheral_id, var) pairs already reported as not exposed by their
         # snapshot — a peripheral that stops advertising a desired var exits
         # reconciliation silently otherwise (log once, not every tick).
@@ -476,8 +478,10 @@ class Bridge:
                     continue
                 if str(cur.value) == str(want):
                     continue
-                last = self._last_reassert.get((device.peripheral_id, var))
-                if last is not None and (now - last) < self._reconcile_min_interval_s:
+                key = (device.peripheral_id, var)
+                last = self._last_reassert.get(key)
+                interval = self._reassert_retry_interval_s.get(key, self._reconcile_min_interval_s)
+                if last is not None and (now - last) < interval:
                     continue
                 drifted.append(VarSet(var, want))
             if not drifted:
@@ -513,20 +517,40 @@ class Bridge:
             self._throttle.last_ts = now
             writes += 1
             try:
-                await self._bus.set_variables(device.device_id, device.peripheral_id, drifted)
-                logger.info(
-                    "reconcile-desired %s/%s: %s",
+                await self._bus.set_variables(
                     device.device_id,
                     device.peripheral_id,
-                    {vs.name: vs.value for vs in drifted},
+                    drifted,
                 )
+            except Exception:
+                for vs in drifted:
+                    key = (device.peripheral_id, vs.name)
+                    interval = self._reassert_retry_interval_s.get(
+                        key, self._reconcile_min_interval_s
+                    )
+                    self._reassert_retry_interval_s[key] = min(interval * 2.0, 300.0)
+                logger.exception(
+                    "reconcile-desired write failed for %s/%s; continuing",
+                    device.device_id,
+                    device.peripheral_id,
+                )
+                continue
+            for vs in drifted:
+                self._reassert_retry_interval_s.pop((device.peripheral_id, vs.name), None)
+            logger.info(
+                "reconcile-desired %s/%s: %s",
+                device.device_id,
+                device.peripheral_id,
+                {vs.name: vs.value for vs in drifted},
+            )
+            try:
                 # Echo like the command path does: without it, HA shows the
                 # firmware's reverted value until the next poll — a phantom
                 # OFF blip in history/automations on every revert cycle.
                 await self._echo_state(device.peripheral_id, drifted)
             except Exception:
                 logger.exception(
-                    "reconcile-desired write/echo failed for %s/%s; continuing",
+                    "reconcile-desired echo failed for %s/%s; continuing",
                     device.device_id,
                     device.peripheral_id,
                 )
