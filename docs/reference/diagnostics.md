@@ -118,3 +118,12 @@ Within `diag.v = 1`, schema evolution is additive only. Renaming a key is
 forbidden: add a new key and document deprecation of the old one. Breaking
 semantic changes require a new `v`. A future integration can expose these keys
 as entities without changing the agent's publishing behavior.
+
+Because the agent and its consumers are released separately, consumers MUST
+ignore unknown keys inside `diag` without failing or warning. A missing `diag`
+means diagnostics are unavailable or unsupported, never measured zeros.
+Retained metadata survives an agent rollback until replaced. Each full meta
+republish replaces the entire retained payload rather than merging fields;
+the ledger-degraded publish, for example, omits `diag`. Consumers MUST tolerate
+both missing diagnostics and stale diagnostics left by a previous agent version,
+and MUST NOT treat a retained replay as fresh evidence.
