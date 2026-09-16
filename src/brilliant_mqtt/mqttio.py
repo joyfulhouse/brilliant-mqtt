@@ -22,6 +22,7 @@ from typing import NoReturn
 import aiomqtt
 
 from brilliant_mqtt.config import Settings
+from brilliant_mqtt.diagnostics import ResponseDiagnostics
 from brilliant_mqtt.discovery import availability_topic
 from brilliant_mqtt.mapping import AUX_SPECS
 from brilliant_mqtt.protocols import CommandSubscribeError
@@ -83,8 +84,9 @@ class _InboundMessage:
 class _LaneQueue:
     """Bounded FIFO with filtered latest-wins replacement by exact topic."""
 
-    def __init__(self, maxsize: int) -> None:
+    def __init__(self, maxsize: int, *, diagnostics: ResponseDiagnostics | None = None) -> None:
         self._maxsize = maxsize
+        self._diagnostics = diagnostics
         self._pending: deque[_InboundMessage] = deque()
         self._condition = asyncio.Condition()
         self._unfinished_tasks = 0
@@ -101,6 +103,11 @@ class _LaneQueue:
                 for index, pending in enumerate(self._pending):
                     if pending.topic == message.topic:
                         self._pending[index] = message
+                        # Transport and lane queues own disjoint pending sets:
+                        # moving a command removes it upstream, and a replaced
+                        # command never advances, so it can be counted only once.
+                        if self._diagnostics is not None:
+                            self._diagnostics.note_superseded()
                         return
             await self._condition.wait_for(lambda: len(self._pending) < self._maxsize)
             self._pending.append(message)
@@ -132,8 +139,11 @@ class _TopicDispatcher:
     def __init__(
         self,
         handler: Callable[[_InboundMessage], Awaitable[None]],
+        *,
+        diagnostics: ResponseDiagnostics | None = None,
     ) -> None:
         self._handler = handler
+        self._diagnostics = diagnostics
         self._queues: dict[str, _LaneQueue] = {}
         self._workers: dict[str, asyncio.Task[None]] = {}
         self._closing = False
@@ -149,7 +159,7 @@ class _TopicDispatcher:
         lane = _command_lane_key(message.topic)
         queue = self._queues.get(lane)
         if queue is None:
-            queue = _LaneQueue(maxsize=_TOPIC_QUEUE_MAXSIZE)
+            queue = _LaneQueue(maxsize=_TOPIC_QUEUE_MAXSIZE, diagnostics=self._diagnostics)
             self._queues[lane] = queue
             self._workers[lane] = asyncio.create_task(
                 self._run_worker(queue),
@@ -304,8 +314,10 @@ class _BoundedTransportQueue(asyncio.Queue[aiomqtt.Message]):
         *,
         max_bytes: int,
         overload: _TransportOverloadLatch,
+        diagnostics: ResponseDiagnostics | None = None,
     ) -> None:
         super().__init__(maxsize)
+        self._diagnostics = diagnostics
         self._max_bytes = max_bytes
         self._overload = overload
         self._queued_bytes = 0
@@ -341,6 +353,8 @@ class _BoundedTransportQueue(asyncio.Queue[aiomqtt.Message]):
                     # _TRANSPORT_QUEUE_MAX_BYTES comment.
                     self._queued_bytes += item_bytes - _message_bytes(pending)
                     self._queue[index] = item
+                    if self._diagnostics is not None:
+                        self._diagnostics.note_superseded()
                     if self._queued_bytes > self._max_bytes:
                         self._trip("payload-byte")
                     return
@@ -368,6 +382,7 @@ class _BoundedTransportQueue(asyncio.Queue[aiomqtt.Message]):
 
 def _transport_queue_type(
     overload: _TransportOverloadLatch,
+    diagnostics: ResponseDiagnostics | None = None,
 ) -> type[asyncio.Queue[aiomqtt.Message]]:
     """Bind one adapter's overload latch into aiomqtt's ``queue_type`` hook.
 
@@ -381,6 +396,7 @@ def _transport_queue_type(
                 maxsize,
                 max_bytes=_TRANSPORT_QUEUE_MAX_BYTES,
                 overload=overload,
+                diagnostics=diagnostics,
             )
 
     return _AdapterTransportQueue
@@ -419,8 +435,10 @@ class AioMqttAdapter:
         publish_availability: bool = True,
         checked_disconnect: bool = False,
         redacted_logging: bool = False,
+        diagnostics: ResponseDiagnostics | None = None,
     ) -> None:
         self._settings = settings
+        self._diagnostics = diagnostics
         # Multiple consumers (panel bridge + mesh publisher) each register a
         # command callback on this one shared connection — fan out to all.
         self._command_cbs: list[Callable[[str, str], Awaitable[None]]] = []
@@ -431,7 +449,7 @@ class AioMqttAdapter:
         # Tripped by the bounded transport queue (below) when a count/byte bound
         # is exceeded; drained by the runner via consume_transport_overload().
         self._transport_overload = _TransportOverloadLatch()
-        self._topic_dispatcher = _TopicDispatcher(self._dispatch_inbound)
+        self._topic_dispatcher = _TopicDispatcher(self._dispatch_inbound, diagnostics=diagnostics)
         self._reader_task: asyncio.Task[None] | None = None
         self._reader_failure_consumed = False
         self._avail_topic = availability_topic(settings.panel)
@@ -467,7 +485,7 @@ class AioMqttAdapter:
             # Bound the inbound transport backlog upstream of the command lanes
             # (#90): a custom queue enforcing a count AND payload-byte budget,
             # observably tripping on overload instead of aiomqtt's silent drop.
-            queue_type=_transport_queue_type(self._transport_overload),
+            queue_type=_transport_queue_type(self._transport_overload, diagnostics),
             max_queued_incoming_messages=_TRANSPORT_QUEUE_MAXSIZE,
             will=will,
             tls_context=build_tls_context(settings),
@@ -589,7 +607,9 @@ class AioMqttAdapter:
         """Return the dispatcher, lazily covering off-panel object doubles."""
         dispatcher = getattr(self, "_topic_dispatcher", None)
         if dispatcher is None:
-            dispatcher = _TopicDispatcher(self._dispatch_inbound)
+            dispatcher = _TopicDispatcher(
+                self._dispatch_inbound, diagnostics=getattr(self, "_diagnostics", None)
+            )
             self._topic_dispatcher = dispatcher
         return dispatcher
 

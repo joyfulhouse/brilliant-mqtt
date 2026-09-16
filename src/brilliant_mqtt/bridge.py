@@ -18,6 +18,7 @@ from dataclasses import dataclass, replace
 from brilliant_mqtt import __version__
 from brilliant_mqtt.commands import VarSet, translate_aux, translate_command
 from brilliant_mqtt.desired_state import RECONCILED_VARS, DesiredState
+from brilliant_mqtt.diagnostics import ResponseDiagnostics
 from brilliant_mqtt.discovery import (
     aux_command_topic,
     availability_topic,
@@ -162,11 +163,13 @@ class Bridge:
         write_throttle: WriteThrottle | None = None,
         owned_topics: RetainedTopicLedger | None = None,
         deployment_id: str | None = None,
+        diagnostics: ResponseDiagnostics | None = None,
     ) -> None:
         self._bus = bus
         self._mqtt = mqtt
         self._panel = panel
         self._deployment_id = deployment_id
+        self._diagnostics = diagnostics
         # Scope filter keyed by bus DEVICE ID; None means everything (the
         # single-bridge default). The mesh milestone runs TWO Bridge instances
         # on the SAME bus in one process — the panel bridge excludes "ble_mesh",
@@ -294,11 +297,13 @@ class Bridge:
         # Bridge meta: the companion integration's machine contract. Retained and
         # republished on every reconcile (idempotent, like discovery configs).
         if self._panel != _MESH_PANEL:
-            meta: dict[str, str] = {"agent_version": __version__}
+            meta: dict[str, object] = {"agent_version": __version__}
             if self._deployment_id is not None:
                 meta["deployment_id"] = self._deployment_id
             if sw_version is not None:
                 meta["panel_firmware"] = sw_version
+            if self._diagnostics is not None:
+                meta["diag"] = self._diagnostics.snapshot()
             await self._async_publish_retained(
                 meta_topic(self._panel),
                 json.dumps(meta, sort_keys=True),

@@ -217,7 +217,7 @@ def _install_session_fakes(
     ) = _NoopBridge,
 ) -> None:
     monkeypatch.setattr(main_mod, "RpcBusAdapter", lambda **kwargs: bus)
-    monkeypatch.setattr(main_mod, "AioMqttAdapter", lambda settings: mqtt)
+    monkeypatch.setattr(main_mod, "AioMqttAdapter", lambda settings, **kwargs: mqtt)
     monkeypatch.setattr(main_mod, "Bridge", bridge)
 
 

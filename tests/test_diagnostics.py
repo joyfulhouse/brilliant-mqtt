@@ -4,15 +4,28 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
+from dataclasses import replace
+from pathlib import Path
+from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
+from brilliant_mqtt import __main__ as main_mod
+from brilliant_mqtt import __version__, mqttio
 from brilliant_mqtt import bus as bus_mod
+from brilliant_mqtt.bridge import Bridge
 from brilliant_mqtt.bus import RpcBusAdapter
 from brilliant_mqtt.commands import VarSet
+from brilliant_mqtt.config import Settings
+from brilliant_mqtt.desired_state import DesiredState
 from brilliant_mqtt.diagnostics import ResponseDiagnostics, WriteOutcome
-from tests.fakes import FakeClock
+from brilliant_mqtt.retained_topics import RetainedLedgerError
+from tests.fakes import FakeBus, FakeClock, FakeMqtt, FakeSleeper
 from tests.test_bus_adapter import _GatedRpcObserver, _settle, _StartHarness
+from tests.test_main import _panel_dimmer
+from tests.test_mqttio_transport_backlog import _AiomqttClientInternals, _msg
 
 
 def test_snapshot_has_fixed_numeric_schema_and_is_an_independent_copy() -> None:
@@ -83,6 +96,9 @@ def test_recorder_totals_are_cumulative_and_outcomes_are_exhaustive() -> None:
     snapshot = recorder.snapshot()
     assert snapshot["write_total"] == len(outcomes)
     assert all(snapshot[f"write_{outcome}"] == 1 for outcome in outcomes)
+    assert snapshot["write_total"] == sum(
+        cast(int, snapshot[f"write_{outcome}"]) for outcome in outcomes
+    )
     assert snapshot["queue_wait_s_sum"] == 14.0
     assert snapshot["queue_wait_s_count"] == 7
     assert snapshot["rpc_s_sum"] == 21.0
@@ -156,6 +172,14 @@ async def test_write_outcomes_include_timeouts_in_rpc_population(
     clock = FakeClock()
     recorder = ResponseDiagnostics(clock=clock)
     observer, adapter = _write_adapter(recorder, clock, error)
+    clock_calls = 0
+
+    def counted_clock() -> float:
+        nonlocal clock_calls
+        clock_calls += 1
+        return clock()
+
+    adapter._clock = counted_clock
     caller = _start_write(adapter)
     await _settle()
     clock.advance(2.5)
@@ -171,6 +195,9 @@ async def test_write_outcomes_include_timeouts_in_rpc_population(
     assert snapshot["rpc_s_count"] == 1
     assert snapshot["queue_wait_s_count"] == 1
     assert snapshot["queue_wait_s_sum"] == 0.0
+    # Existing enqueue/start and successful-response logging stamps, plus
+    # exactly one new metric stamp for every RPC settlement.
+    assert clock_calls == (4 if error is None else 3)
     assert "synthetic" not in json.dumps(snapshot)
     await adapter.shutdown()
 
@@ -230,7 +257,7 @@ async def test_caller_deadline_counts_only_the_later_detached_settlement(
     assert recorder.snapshot() == snapshot
 
 
-@pytest.mark.parametrize("phase", ["before_step", "queued", "rpc"])
+@pytest.mark.parametrize("phase", ["before_step", "queued", "rpc", "shutdown"])
 async def test_write_cancellation_counts_once_and_omits_unmeasured_timings(phase: str) -> None:
     clock = FakeClock()
     recorder = ResponseDiagnostics(clock=clock)
@@ -245,20 +272,24 @@ async def test_write_cancellation_counts_once_and_omits_unmeasured_timings(phase
     if phase != "before_step":
         await _settle()
     clock.advance(4.0)
-    task.cancel()
+    if phase == "shutdown":
+        await adapter.shutdown()
+    else:
+        task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await caller
     if lock.locked():
         lock.release()
     await _settle()
     snapshot = recorder.snapshot()
+    ran_rpc = phase in ("rpc", "shutdown")
     assert snapshot["write_cancelled"] == snapshot["write_total"] == 1
-    assert snapshot["queue_wait_s_count"] == (1 if phase == "rpc" else 0)
-    assert snapshot["queue_wait_s_recent_max"] == (0.0 if phase == "rpc" else None)
-    assert snapshot["rpc_s_count"] == (1 if phase == "rpc" else 0)
-    assert snapshot["rpc_s_sum"] == (4.0 if phase == "rpc" else 0.0)
-    assert snapshot["rpc_s_recent_max"] == (4.0 if phase == "rpc" else None)
-    assert bool(observer.writes) == (phase == "rpc")
+    assert snapshot["queue_wait_s_count"] == (1 if ran_rpc else 0)
+    assert snapshot["queue_wait_s_recent_max"] == (0.0 if ran_rpc else None)
+    assert snapshot["rpc_s_count"] == (1 if ran_rpc else 0)
+    assert snapshot["rpc_s_sum"] == (4.0 if ran_rpc else 0.0)
+    assert snapshot["rpc_s_recent_max"] == (4.0 if ran_rpc else None)
+    assert bool(observer.writes) == ran_rpc
     await adapter.shutdown()
     assert recorder.snapshot() == snapshot
 
@@ -326,3 +357,257 @@ async def test_bus_reconnect_counts_only_admitted_callbacks_after_initial_start(
     await _settle()
     assert recorder.snapshot()["bus_reconnect_total"] == 2
     await adapter.shutdown()
+
+
+def _settings() -> Settings:
+    return Settings(
+        panel="synthetic-panel",
+        mqtt_host="broker.invalid",
+        mqtt_username="u",
+        mqtt_password="p",
+        motion_reconcile_enabled=False,
+        bus_heartbeat_file="",
+        bus_phase_file="",
+    )
+
+
+async def test_supersession_moves_between_disjoint_transport_and_lane_pending_sets() -> None:
+    recorder = ResponseDiagnostics(clock=FakeClock())
+    adapter = mqttio.AioMqttAdapter(_settings(), diagnostics=recorder)
+    client = cast(_AiomqttClientInternals, adapter._client)
+    transport = client._queue
+    topic = "brilliant/synthetic-panel/light/set"
+    transport.put_nowait(_msg(topic, b"first"))
+    transport.put_nowait(_msg(topic, b"second"))
+    assert recorder.snapshot()["superseded_before_dispatch"] == 1
+
+    # The first command died in transport; only the second can reach the lane.
+    lane = mqttio._LaneQueue(8, diagnostics=recorder)
+    moved = transport.get_nowait()
+    await lane.put(
+        mqttio._InboundMessage(str(moved.topic), "second", False, (), ()), latest_wins=True
+    )
+    transport.task_done()
+    assert transport.empty()
+    third = mqttio._InboundMessage(topic, "third", False, (), ())
+    await lane.put(third, latest_wins=True)
+    assert recorder.snapshot()["superseded_before_dispatch"] == 2
+    assert await lane.get() is third
+    lane.task_done()
+    await lane.join()
+    # Arrival behind an already-dispatched command replaces nothing.
+    await lane.put(third, latest_wins=True)
+    assert recorder.snapshot()["superseded_before_dispatch"] == 2
+    await lane.get()
+    lane.task_done()
+    await adapter.disconnect()
+
+
+async def test_adapter_dispatcher_injects_recorder_without_counting_lossless_commands() -> None:
+    recorder = ResponseDiagnostics(clock=FakeClock())
+    adapter = mqttio.AioMqttAdapter(_settings(), diagnostics=recorder)
+    released = asyncio.Event()
+    entered = asyncio.Event()
+    seen: list[str] = []
+
+    async def handle(topic: str, payload: str) -> None:
+        seen.append(payload)
+        entered.set()
+        await released.wait()
+
+    adapter.on_command(handle)
+    dispatcher = adapter._get_topic_dispatcher()
+    topic = "brilliant/synthetic-panel/light/set"
+    for payload in ("running", "superseded", "newest"):
+        await dispatcher.dispatch(
+            mqttio._InboundMessage(topic, payload, False, (handle,), ()), latest_wins=True
+        )
+        if payload == "running":
+            await entered.wait()
+    for payload in ("lossless-one", "lossless-two"):
+        await dispatcher.dispatch(
+            mqttio._InboundMessage(topic, payload, False, (handle,), ()), latest_wins=False
+        )
+    assert recorder.snapshot()["superseded_before_dispatch"] == 1
+    released.set()
+    await dispatcher.shutdown()
+    assert seen == ["running", "newest", "lossless-one", "lossless-two"]
+    assert recorder.snapshot()["superseded_before_dispatch"] == 1
+    await adapter.disconnect()
+
+
+@pytest.mark.parametrize("oversized", [False, True])
+def test_transport_overload_counts_only_payloads_actually_replaced(oversized: bool) -> None:
+    recorder = ResponseDiagnostics(clock=FakeClock())
+    topic = "brilliant/synthetic-panel/light/set"
+    old = _msg(topic, b"a" * 40)
+    filler = _msg("brilliant/synthetic-panel/media/set_muted", b"b" * 40)
+    newest = _msg(topic, b"c" * 90)
+    budget = mqttio._message_bytes(filler) + mqttio._message_bytes(newest) - 1
+    queue = mqttio._BoundedTransportQueue(
+        maxsize=8,
+        max_bytes=budget,
+        overload=mqttio._TransportOverloadLatch(),
+        diagnostics=recorder,
+    )
+    queue.put_nowait(old)
+    queue.put_nowait(filler)
+    if oversized:
+        with pytest.raises(asyncio.QueueFull):
+            queue.put_nowait(_msg(topic, b"d" * (budget + 1)))
+        assert recorder.snapshot()["superseded_before_dispatch"] == 0
+    # A kept replacement counts even when the cumulative byte budget trips.
+    with pytest.raises(asyncio.QueueFull):
+        queue.put_nowait(newest)
+    assert recorder.snapshot()["superseded_before_dispatch"] == 1
+    assert queue.get_nowait() is newest
+
+
+@pytest.mark.parametrize(
+    ("error", "reason"),
+    [
+        (main_mod.MqttReaderDeadError(), "mqtt_reader_dead"),
+        (main_mod.BusStaleError(), "bus_stale"),
+        (main_mod.BusWriteStuckError(), "bus_write_stuck"),
+        (main_mod.BusReconnectStormError(), "bus_reconnect_storm"),
+        (main_mod.MqttTransportOverloadError(), "mqtt_transport_overload"),
+        (RuntimeError(), "other"),
+        (RetainedLedgerError("synthetic ledger failure"), "other"),
+    ],
+)
+async def test_supervisor_recorder_survives_rebuild_and_counts_typed_reason(
+    monkeypatch: pytest.MonkeyPatch, error: Exception, reason: str
+) -> None:
+    seen: list[ResponseDiagnostics] = []
+
+    async def session(
+        settings: Settings,
+        desired_panel: DesiredState | None,
+        desired_mesh: DesiredState | None,
+        diagnostics: ResponseDiagnostics | None = None,
+    ) -> None:
+        # Cancel instead of raising an assertion in the retry loop if not wired.
+        if diagnostics is None:
+            raise asyncio.CancelledError
+        seen.append(diagnostics)
+        if len(seen) == 1:
+            diagnostics.note_write_settled("ok", 2.0, 3.0)
+            diagnostics.note_bus_reconnect()
+            raise error
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(main_mod, "_run_session", session)
+    monkeypatch.setattr(main_mod, "_BACKOFF_S", 0)
+    monkeypatch.setattr(main_mod, "_LEDGER_BACKOFF_S", 0)
+    with pytest.raises(asyncio.CancelledError):
+        await main_mod.run(_settings())
+    assert len(seen) == 2
+    assert seen[0] is seen[1]
+    snapshot = seen[1].snapshot()
+    assert snapshot["write_total"] == snapshot["bus_reconnect_total"] == 1
+    assert snapshot["rpc_s_sum"] == 3.0
+    reasons = snapshot["session_rebuild"]
+    assert isinstance(reasons, dict)
+    assert reasons[reason] == 1
+    assert sum(reasons.values()) == 1
+
+
+async def test_session_wires_one_recorder_and_shutdown_adds_no_diagnostic_publish(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    recorder = ResponseDiagnostics(clock=FakeClock())
+    bus = FakeBus([_panel_dimmer()])
+    mqtt = FakeMqtt()
+    injected: list[ResponseDiagnostics | None] = []
+
+    def bus_factory(
+        *, extra_device_ids: tuple[str, ...], diagnostics: ResponseDiagnostics | None = None
+    ) -> FakeBus:
+        injected.append(diagnostics)
+        return bus
+
+    def mqtt_factory(
+        settings: Settings, *, diagnostics: ResponseDiagnostics | None = None
+    ) -> FakeMqtt:
+        injected.append(diagnostics)
+        return mqtt
+
+    sleeper = FakeSleeper()
+    ready = asyncio.Event()
+
+    async def sleep(seconds: float) -> None:
+        ready.set()
+        await sleeper(seconds)
+
+    monkeypatch.setattr(main_mod, "RpcBusAdapter", bus_factory)
+    monkeypatch.setattr(main_mod, "AioMqttAdapter", mqtt_factory)
+    # Patch the supervisor's module reference, preserving asyncio in the fakes.
+    monkeypatch.setattr(
+        main_mod, "asyncio", SimpleNamespace(sleep=sleep, CancelledError=asyncio.CancelledError)
+    )
+    settings = replace(
+        _settings(), retained_topics_file=str(tmp_path / "owned.json"), deployment_id="a" * 32
+    )
+    task = asyncio.create_task(main_mod._run_session(settings, None, None, recorder))
+    task.add_done_callback(lambda _: ready.set())
+    try:
+        await asyncio.wait_for(ready.wait(), timeout=2)
+        if task.done():
+            await task
+        assert sleeper.requested, "session never reached its normal loop"
+        assert injected == [recorder, recorder]
+        meta = [
+            json.loads(payload) for topic, payload, _ in mqtt.published if topic.endswith("/bridge")
+        ]
+        assert len(meta) == 1
+        assert meta[0]["diag"] == recorder.snapshot()
+        before_shutdown = list(mqtt.published)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert mqtt.disconnect_count == 1
+    assert mqtt.published == before_shutdown
+    assert [
+        (payload, retained)
+        for topic, payload, retained in mqtt.published
+        if topic.endswith("/availability")
+    ] == [("online", True)]
+
+
+async def test_meta_diag_is_additive_panel_only_and_preserves_command_and_entity_behavior() -> None:
+    recorder = ResponseDiagnostics(clock=FakeClock())
+    recorder.note_write_settled("ok", 1.0, 2.0)
+    mqtt = FakeMqtt()
+    baseline_mqtt = FakeMqtt()
+    bus = FakeBus([_panel_dimmer()])
+    baseline_bus = FakeBus([_panel_dimmer()])
+    bridge = Bridge(bus, mqtt, "synthetic-panel", diagnostics=recorder, deployment_id="a" * 32)
+    baseline = Bridge(baseline_bus, baseline_mqtt, "synthetic-panel", deployment_id="a" * 32)
+    await baseline.reconcile()
+    await bridge.reconcile()
+    assert len(mqtt.published) == len(baseline_mqtt.published)
+    for actual, expected in zip(mqtt.published, baseline_mqtt.published, strict=True):
+        topic, payload, retained = actual
+        if topic.endswith("/bridge"):
+            meta = json.loads(payload)
+            assert meta.pop("diag") == recorder.snapshot()
+            assert meta == json.loads(expected[1])
+            assert meta["agent_version"] == __version__
+            assert re.fullmatch(r"[0-9a-f]{32}", meta["deployment_id"])
+            assert retained is True
+        else:
+            assert actual == expected
+    await mqtt.inject("brilliant/synthetic-panel/gangbox_peripheral_0/set", '{"state":"ON"}')
+    await baseline_mqtt.inject(
+        "brilliant/synthetic-panel/gangbox_peripheral_0/set", '{"state":"ON"}'
+    )
+    assert bus.commands == baseline_bus.commands
+    assert bus.commands
+    # Publication doesn't reset counters; the mesh pseudo-panel publishes no meta.
+    await bridge.reconcile()
+    assert recorder.snapshot()["write_total"] == 1
+    mesh_mqtt = FakeMqtt()
+    mesh = Bridge(FakeBus([]), mesh_mqtt, "mesh", diagnostics=recorder)
+    await mesh.reconcile()
+    assert all(not topic.endswith("/bridge") for topic, _, _ in mesh_mqtt.published)

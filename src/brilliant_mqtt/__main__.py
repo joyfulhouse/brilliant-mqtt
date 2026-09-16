@@ -19,6 +19,7 @@ from brilliant_mqtt.bridge import Bridge, HotPollReadTimeout, WriteThrottle
 from brilliant_mqtt.bus import RpcBusAdapter
 from brilliant_mqtt.config import Settings
 from brilliant_mqtt.desired_state import DesiredState
+from brilliant_mqtt.diagnostics import ResponseDiagnostics, SessionRebuildReason
 from brilliant_mqtt.discovery import meta_topic
 from brilliant_mqtt.heartbeat import MAX_SESSION_RETRY_BACKOFF_S, write_heartbeat, write_phase
 from brilliant_mqtt.mesh_leader import MeshLeader
@@ -80,6 +81,15 @@ class MqttTransportOverloadError(RuntimeError):
     session persistence. The excess is genuinely dropped, but observably, via a
     loud fail + reconnect, not silently. The detached reader task never surfaces
     this; only the session-loop accessor check does."""
+
+
+_REBUILD_REASONS: dict[type[Exception], SessionRebuildReason] = {
+    MqttReaderDeadError: "mqtt_reader_dead",
+    BusStaleError: "bus_stale",
+    BusWriteStuckError: "bus_write_stuck",
+    BusReconnectStormError: "bus_reconnect_storm",
+    MqttTransportOverloadError: "mqtt_transport_overload",
+}
 
 
 class _CoalescingCallback:
@@ -154,6 +164,7 @@ async def _run_session(
     settings: Settings,
     desired_panel: DesiredState | None,
     desired_mesh: DesiredState | None,
+    diagnostics: ResponseDiagnostics | None = None,
 ) -> None:
     """Run ONE bridge session: construct the adapters, serve forever, tear down.
 
@@ -167,8 +178,10 @@ async def _run_session(
     """
     write_phase(settings.bus_phase_file, "pre_bus")
     participating = settings.mesh_priority >= 1
-    mqtt = AioMqttAdapter(settings)
-    bus = RpcBusAdapter(extra_device_ids=(_MESH_DEVICE_ID,) if participating else ())
+    mqtt = AioMqttAdapter(settings, diagnostics=diagnostics)
+    bus = RpcBusAdapter(
+        extra_device_ids=(_MESH_DEVICE_ID,) if participating else (), diagnostics=diagnostics
+    )
     mesh_bridge: Bridge | None = None
     scene_bridge: SceneBridge | None = None
     mqtt_connected = False
@@ -221,6 +234,7 @@ async def _run_session(
             write_throttle=write_throttle,
             owned_topics=owned_topics,
             deployment_id=settings.deployment_id,
+            diagnostics=diagnostics,
         )
 
         if participating:
@@ -488,6 +502,9 @@ async def _run_session(
 
 async def run(settings: Settings) -> None:
     """Supervise the bridge forever: (re)connect, reconcile, periodically resync."""
+    # PROCESS-lifetime like DesiredState: rebuilds must not erase their own
+    # diagnostic history. All sessions share this recorder; no disk persistence.
+    diagnostics = ResponseDiagnostics()
     # Desired-state stores are PROCESS-lifetime, not session-lifetime: sessions
     # rebuild routinely (stale watchdog / storm breaker), and a rebuild must not
     # discard in-memory intent recorded while persistence was failing, nor
@@ -497,14 +514,16 @@ async def run(settings: Settings) -> None:
     desired_mesh = _make_desired(settings, "mesh") if settings.mesh_priority >= 1 else None
     while True:
         try:
-            await _run_session(settings, desired_panel, desired_mesh)
+            await _run_session(settings, desired_panel, desired_mesh, diagnostics)
         except asyncio.CancelledError:
             raise
         except RetainedLedgerError:
+            diagnostics.note_session_rebuild("other")
             log.exception("retained ledger unavailable; will reconnect after extended backoff")
             await asyncio.sleep(_LEDGER_BACKOFF_S)
             continue
-        except Exception:
+        except Exception as error:
+            diagnostics.note_session_rebuild(_REBUILD_REASONS.get(type(error), "other"))
             log.exception("bridge session failed; will reconnect after backoff")
         await asyncio.sleep(_BACKOFF_S)
 

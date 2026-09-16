@@ -26,6 +26,7 @@ from brilliant_mqtt.bus import RpcBusAdapter
 from brilliant_mqtt.commands import VarSet
 from brilliant_mqtt.config import Settings
 from brilliant_mqtt.desired_state import DesiredState
+from brilliant_mqtt.diagnostics import ResponseDiagnostics
 from brilliant_mqtt.ha_control_protocol import mode_command_topic, scene_command_topic
 from brilliant_mqtt.mesh_leader import MESH_LEADER_TOPIC, MeshLeader
 from brilliant_mqtt.model import BrilliantDevice, DeviceKind, Variable
@@ -277,11 +278,15 @@ class TestProcessLifetimeDesiredState:
         seen: list[DesiredState | None] = []
         calls = 0
 
+        diagnostics_seen: list[ResponseDiagnostics | None] = []
+
         async def fake_session(
             settings: Settings,
             desired_panel: DesiredState | None = None,
             desired_mesh: DesiredState | None = None,
+            diagnostics: ResponseDiagnostics | None = None,
         ) -> None:
+            diagnostics_seen.append(diagnostics)
             nonlocal calls
             calls += 1
             seen.append(desired_panel)
@@ -304,17 +309,23 @@ class TestProcessLifetimeDesiredState:
         # must never re-load stale disk state over live in-memory intent.
         assert len(loads) == 1
 
+        assert diagnostics_seen and all(item is not None for item in diagnostics_seen)
+
     async def test_run_builds_separate_stores_when_mesh_participates(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(main_mod, "_BACKOFF_S", 0)
         seen: list[DesiredState | None] = []
 
+        diagnostics_seen: list[ResponseDiagnostics | None] = []
+
         async def fake_session(
             settings: Settings,
             desired_panel: DesiredState | None = None,
             desired_mesh: DesiredState | None = None,
+            diagnostics: ResponseDiagnostics | None = None,
         ) -> None:
+            diagnostics_seen.append(diagnostics)
             seen.append(desired_panel)
             seen.append(desired_mesh)
             raise asyncio.CancelledError
@@ -335,6 +346,8 @@ class TestProcessLifetimeDesiredState:
         assert seen[0] is not None and seen[1] is not None
         assert seen[0] is not seen[1]  # faceplate and mesh stores stay separate
 
+        assert diagnostics_seen and all(item is not None for item in diagnostics_seen)
+
 
 class TestSupervisorBackoff:
     async def test_retained_ledger_failure_uses_sixty_second_backoff(
@@ -344,11 +357,15 @@ class TestSupervisorBackoff:
         session_calls = 0
         sleeps: list[float] = []
 
+        diagnostics_seen: list[ResponseDiagnostics | None] = []
+
         async def failing_session(
             settings: Settings,
             desired_panel: DesiredState | None,
             desired_mesh: DesiredState | None,
+            diagnostics: ResponseDiagnostics | None = None,
         ) -> None:
+            diagnostics_seen.append(diagnostics)
             del settings, desired_panel, desired_mesh
             nonlocal session_calls
             session_calls += 1
@@ -367,17 +384,23 @@ class TestSupervisorBackoff:
         assert session_calls == 1
         assert sleeps == [60.0]
 
+        assert diagnostics_seen and all(item is not None for item in diagnostics_seen)
+
     async def test_transient_session_failure_keeps_five_second_backoff(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         sleeps: list[float] = []
 
+        diagnostics_seen: list[ResponseDiagnostics | None] = []
+
         async def failing_session(
             settings: Settings,
             desired_panel: DesiredState | None,
             desired_mesh: DesiredState | None,
+            diagnostics: ResponseDiagnostics | None = None,
         ) -> None:
+            diagnostics_seen.append(diagnostics)
             del settings, desired_panel, desired_mesh
             raise RuntimeError("transient session failure")
 
@@ -392,6 +415,8 @@ class TestSupervisorBackoff:
             await main_mod.run(_desired_settings(motion_reconcile_enabled=False))
 
         assert sleeps == [5]
+
+        assert diagnostics_seen and all(item is not None for item in diagnostics_seen)
 
     async def test_sustained_transport_overload_paces_rebuilds_by_backoff(
         self,
@@ -410,11 +435,15 @@ class TestSupervisorBackoff:
         session_calls = 0
         sleeps: list[float] = []
 
+        diagnostics_seen: list[ResponseDiagnostics | None] = []
+
         async def overloaded_session(
             settings: Settings,
             desired_panel: DesiredState | None,
             desired_mesh: DesiredState | None,
+            diagnostics: ResponseDiagnostics | None = None,
         ) -> None:
+            diagnostics_seen.append(diagnostics)
             del settings, desired_panel, desired_mesh
             nonlocal session_calls
             session_calls += 1
@@ -434,6 +463,8 @@ class TestSupervisorBackoff:
         # One _BACKOFF_S gate per rebuild — paced, never a tight/unbounded spin.
         assert sleeps == [5, 5, 5]
         assert session_calls == 3
+
+        assert diagnostics_seen and all(item is not None for item in diagnostics_seen)
 
 
 def _scene_settings(enabled: bool, watermark_file: str) -> Settings:
@@ -695,12 +726,16 @@ class _SessionHarness:
                 harness.events.append("scene_poll")
                 harness.scene_poll_snapshots.append(devices)
 
-        def mqtt_factory(settings: Settings) -> _SessionMqtt:
+        def mqtt_factory(
+            settings: Settings, *, diagnostics: ResponseDiagnostics | None = None
+        ) -> _SessionMqtt:
             del settings
             self.events.append("mqtt_construct")
             return self.mqtt
 
-        def bus_factory(*, extra_device_ids: tuple[str, ...]) -> _SessionBus:
+        def bus_factory(
+            *, extra_device_ids: tuple[str, ...], diagnostics: ResponseDiagnostics | None = None
+        ) -> _SessionBus:
             del extra_device_ids
             self.events.append("bus_construct")
             return self.bus
@@ -1134,7 +1169,9 @@ def _real_bus_session(
 
     monkeypatch.setattr(adapter, "start", no_start)
 
-    def bus_factory(*, extra_device_ids: tuple[str, ...]) -> RpcBusAdapter:
+    def bus_factory(
+        *, extra_device_ids: tuple[str, ...], diagnostics: ResponseDiagnostics | None = None
+    ) -> RpcBusAdapter:
         del extra_device_ids
         return adapter
 
