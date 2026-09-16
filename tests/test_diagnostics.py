@@ -20,7 +20,7 @@ from brilliant_mqtt.bus import RpcBusAdapter
 from brilliant_mqtt.commands import VarSet
 from brilliant_mqtt.config import Settings
 from brilliant_mqtt.desired_state import DesiredState
-from brilliant_mqtt.diagnostics import ResponseDiagnostics, WriteOutcome
+from brilliant_mqtt.diagnostics import ResponseDiagnostics, SessionRebuildReason, WriteOutcome
 from brilliant_mqtt.retained_topics import RetainedLedgerError
 from tests.fakes import FakeBus, FakeClock, FakeMqtt, FakeSleeper
 from tests.test_bus_adapter import _GatedRpcObserver, _settle, _StartHarness
@@ -110,6 +110,66 @@ def test_recorder_totals_are_cumulative_and_outcomes_are_exhaustive() -> None:
     assert isinstance(reasons, dict)
     assert reasons["bus_stale"] == 1
     assert recorder.snapshot() == snapshot
+
+
+def test_populated_snapshot_stays_under_size_bound_as_observations_grow() -> None:
+    clock = FakeClock()
+    recorder = ResponseDiagnostics(clock=clock)
+    outcomes: tuple[WriteOutcome, ...] = (
+        "ok",
+        "error",
+        "timeout_bus",
+        "timeout_async",
+        "cancelled",
+        "detached_late_ok",
+        "detached_late_error",
+    )
+    rebuild_reasons: tuple[SessionRebuildReason, ...] = (
+        "mqtt_reader_dead",
+        "bus_stale",
+        "bus_write_stuck",
+        "bus_reconnect_storm",
+        "mqtt_transport_overload",
+        "other",
+    )
+    # Arithmetic leaves long decimal representations, unlike rounded fixture values.
+    queue_wait_s = 0.1 + 0.2
+    rpc_s = 15.1 - 0.3
+
+    def observe(count: int) -> None:
+        for index in range(count):
+            recorder.note_write_settled(outcomes[index % len(outcomes)], queue_wait_s, rpc_s)
+            recorder.note_superseded()
+            recorder.note_bus_reconnect()
+            recorder.note_hard_cap()
+            recorder.note_session_rebuild(rebuild_reasons[index % len(rebuild_reasons)])
+            clock.advance(queue_wait_s + rpc_s)
+
+    observe(64)
+    snapshot = recorder.snapshot()
+    assert snapshot["queue_wait_s_count"] == snapshot["rpc_s_count"] == 64
+    for value in snapshot.values():
+        if isinstance(value, dict):
+            assert all(count > 0 for count in value.values())
+        else:
+            assert value is not None and value > 0
+    assert snapshot["queue_wait_s_recent_max"] == queue_wait_s
+    assert snapshot["rpc_s_recent_max"] == rpc_s
+    assert len(json.dumps(snapshot["queue_wait_s_recent_max"])) >= 18
+    assert len(json.dumps(snapshot["rpc_s_recent_max"])) >= 18
+    populated_size = len(json.dumps(snapshot).encode())
+    assert populated_size < 4096
+
+    observe(64_000)
+    later_snapshot = recorder.snapshot()
+    assert (
+        later_snapshot["write_total"]
+        == later_snapshot["queue_wait_s_count"]
+        == later_snapshot["rpc_s_count"]
+        == 64_064
+    )
+    later_size = len(json.dumps(later_snapshot).encode())
+    assert later_size < 4096
 
 
 def test_recent_max_keeps_only_64_measured_samples_without_fabricated_zeroes() -> None:
