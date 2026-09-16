@@ -10,6 +10,31 @@ import json
 
 from brilliant_mqtt.mapping import EntityDescriptor
 
+# MQTT templates run on message receipt. expire_after also bounds silence;
+# the fixed UTC deadline makes retained replay self-checking after a crash.
+_MESH_WRITE_STATUS_TEMPLATE = """
+{%- set status = value_json.get('mesh_write_status') -%}
+{%- set deadline = value_json.get('mesh_write_deadline') -%}
+{%- if status == 'pending' -%}
+  {%- set current = as_timestamp(now()) -%}
+  {%- if deadline is number and deadline is not boolean
+      and deadline - deadline == 0
+      and deadline <= current + 80 -%}
+    {{- 'unconfirmed' if deadline <= current else 'pending' -}}
+  {%- else -%}unknown{%- endif -%}
+{%- elif status in ['idle', 'unconfirmed', 'contradicted', 'failed', 'superseded'] -%}
+  {{- status -}}
+{%- else -%}unknown{%- endif -%}
+""".strip()
+
+_MESH_WRITE_ATTRIBUTES_TEMPLATE = """
+{%- set requested = value_json.get('mesh_requested') -%}
+{%- set deadline = value_json.get('mesh_write_deadline') -%}
+{{- {'mesh_requested': requested if requested is mapping else {},
+     'mesh_write_deadline': deadline if deadline is number and deadline is not boolean
+       and deadline - deadline == 0 else none} | tojson -}}
+""".strip()
+
 # ---------------------------------------------------------------------------
 # Topic builders
 # ---------------------------------------------------------------------------
@@ -134,6 +159,11 @@ def config_payload(e: EntityDescriptor, sw_version: str | None = None) -> str:
         if e.unit is not None:
             payload["unit_of_measurement"] = e.unit
         payload["value_template"] = f"{{{{ value_json.{e.value_key} }}}}"
+        if e.value_key == "mesh_write_status":
+            payload["value_template"] = _MESH_WRITE_STATUS_TEMPLATE
+            payload["expire_after"] = 80
+            payload["json_attributes_topic"] = _state_topic
+            payload["json_attributes_template"] = _MESH_WRITE_ATTRIBUTES_TEMPLATE
 
     elif e.component == "number":
         payload["command_topic"] = aux_command_topic(e.panel, e.peripheral_id, e.command_var or "")

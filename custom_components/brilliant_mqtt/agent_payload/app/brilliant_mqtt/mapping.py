@@ -605,6 +605,20 @@ _COMMANDABLE_COMPONENTS = {"switch", "number", "button"}
 # (pilot finding 2026-06-12). Singleton kinds keep the short spec names.
 _LOAD_KINDS = {DeviceKind.LIGHT, DeviceKind.SWITCH, DeviceKind.ALWAYS_ON}
 
+# Bridge-owned feedback has no native bus variable or skip sentinel.
+_MESH_WRITE_STATUS = AuxSpec(
+    var="mesh_write_status",
+    component="sensor",
+    name="Write status",
+    value_kind="str",
+    entity_category="diagnostic",
+    enabled_by_default=False,
+)
+
+
+def _has_mesh_feedback(device: BrilliantDevice) -> bool:
+    return device.device_id == "ble_mesh" and device.kind in (DeviceKind.LIGHT, DeviceKind.SWITCH)
+
 
 @dataclass(frozen=True)
 class EntityDescriptor:
@@ -657,12 +671,14 @@ def _aux_descriptors(device: BrilliantDevice, panel: str) -> list[EntityDescript
     entity set and the payload keys stay in lockstep.
     """
     specs = AUX_SPECS.get(device.kind, ())
+    if _has_mesh_feedback(device):
+        specs = (*specs, _MESH_WRITE_STATUS)
     base_uid = _discovery_object_id(panel, device.peripheral_id)
     prefix = f"{device.name} " if device.kind in _LOAD_KINDS else ""
     descriptors: list[EntityDescriptor] = []
     for spec in specs:
         var = device.variables.get(spec.var)
-        if var is None or var.value in spec.skip_values:
+        if spec is not _MESH_WRITE_STATUS and (var is None or var.value in spec.skip_values):
             continue
         command_var = spec.var if spec.component in _COMMANDABLE_COMPONENTS else None
         descriptors.append(
@@ -793,6 +809,8 @@ def payload_fields(device: BrilliantDevice) -> dict[str, object]:
         data["state"] = "ON" if device.is_on else "OFF"
         if device.is_dimmable and device.intensity is not None:
             data["brightness"] = round(device.intensity / device.max_intensity * 255)
+        if _has_mesh_feedback(device):
+            data.update(mesh_write_status="idle", mesh_requested={}, mesh_write_deadline=None)
 
     elif device.kind is DeviceKind.BINARY_SENSOR:
         # motion_detected is None when absent — collapse to False so HA always
