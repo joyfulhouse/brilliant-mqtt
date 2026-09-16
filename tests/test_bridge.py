@@ -1328,9 +1328,9 @@ class TestM11MeshEndToEnd:
 
         power_config = f"homeassistant/sensor/brilliant_mesh_{MESH_PID}_power/config"
         assert all(p[0] != power_config for p in mqtt.published)
-        # The light's config is the ONLY discovery publish for this load.
+        # The light and its write-status diagnostic are the only discovery configs.
         configs = [p for p in mqtt.published if p[0].startswith("homeassistant/")]
-        assert len(configs) == 1
+        assert len(configs) == 2
 
     async def test_mesh_state_payload(self, mesh_dimmer: BrilliantDevice) -> None:
         bus = FakeBus([mesh_dimmer])
@@ -1342,7 +1342,7 @@ class TestM11MeshEndToEnd:
         states = [p for p in mqtt.published if p[0] == topic]
         assert len(states) == 1
         # brightness scales against the 1000 fallback; power is gated out.
-        assert json.loads(states[0][1]) == {"state": "OFF", "brightness": 153}
+        assert json.loads(states[0][1]) == _mesh_feedback_payload("OFF")
         assert states[0][2] is True
 
     async def test_mesh_command_routes_to_ble_mesh_device(
@@ -1634,6 +1634,7 @@ def _mesh_bridge_parts(bus: FakeBus, mqtt: FakeMqtt) -> tuple[Bridge, FakeClock,
     clock = FakeClock()
     sleeper = FakeSleeper()
     bridge = Bridge(bus, mqtt, MESH_PANEL, include=_is_mesh, clock=clock, sleep=sleeper)
+    bridge._wall_clock = lambda: 1000.0
     return bridge, clock, sleeper
 
 
@@ -1710,6 +1711,21 @@ def _mesh_states(mqtt: FakeMqtt) -> list[tuple[str, str, bool]]:
     return [p for p in mqtt.published if p[0] == MESH_STATE_TOPIC]
 
 
+def _mesh_feedback_payload(
+    state: str | None,
+    status: str = "idle",
+    requested: dict[str, str] | None = None,
+    deadline: float | None = None,
+) -> dict[str, object]:
+    return {
+        "state": state,
+        "brightness": 153,
+        "mesh_write_status": status,
+        "mesh_requested": requested if requested is not None else {},
+        "mesh_write_deadline": deadline,
+    }
+
+
 class TestMeshConfirmedWrites:
     async def test_accepted_off_publishes_unknown_not_optimistic_off(self) -> None:
         """A silently-accepted mesh OFF must never fabricate `state: OFF` (#46)."""
@@ -1773,7 +1789,7 @@ class TestMeshConfirmedWrites:
             await bus.emit(_mesh_dimmer_at("1"))  # backend reconciled: write lost
 
         states = _mesh_states(mqtt)
-        assert [json.loads(p[1]) for p in states] == [{"state": "ON", "brightness": 153}]
+        assert [json.loads(p[1]) for p in states] == [_mesh_feedback_payload("ON", "contradicted")]
         warning = next(r for r in caplog.records if "contradicted" in r.getMessage())
         assert bus.set_variables_receipt in warning.getMessage()
 
@@ -1799,7 +1815,7 @@ class TestMeshConfirmedWrites:
         await sleeper.release_all()
 
         states = _mesh_states(mqtt)
-        assert [json.loads(p[1]) for p in states] == [{"state": "OFF", "brightness": 153}]
+        assert [json.loads(p[1]) for p in states] == [_mesh_feedback_payload("OFF")]
 
         # Post-confirm observations of the same value stay diff-suppressed.
         await bus.emit(_mesh_dimmer_at("0"))
@@ -1820,14 +1836,15 @@ class TestMeshConfirmedWrites:
         with caplog.at_level(logging.WARNING, logger="brilliant_mqtt.bridge"):
             await sleeper.release_all()
 
-        assert _mesh_states(mqtt) == []  # state stays unknown
+        assert [json.loads(p[1]) for p in _mesh_states(mqtt)] == [
+            _mesh_feedback_payload(None, "unconfirmed")
+        ]  # terminal feedback preserves unknown
         assert any("unconfirmed" in r.getMessage() for r in caplog.records)
 
         # The pending is closed: the next observation publishes the truth.
+        mqtt.published.clear()
         await bus.emit(_mesh_dimmer_at("1"))
-        assert [json.loads(p[1]) for p in _mesh_states(mqtt)] == [
-            {"state": "ON", "brightness": 153}
-        ]
+        assert [json.loads(p[1]) for p in _mesh_states(mqtt)] == [_mesh_feedback_payload("ON")]
 
     async def test_write_error_republishes_observed_state(
         self, caplog: pytest.LogCaptureFixture
@@ -1847,7 +1864,7 @@ class TestMeshConfirmedWrites:
         # Forced past the diff cache: the identical payload reconcile already
         # published goes out again, guaranteeing the retained topic holds truth.
         states = _mesh_states(mqtt)
-        assert [json.loads(p[1]) for p in states] == [{"state": "ON", "brightness": 153}]
+        assert [json.loads(p[1]) for p in states] == [_mesh_feedback_payload("ON", "failed")]
         await asyncio.sleep(0)
         assert sleeper.requested == []  # no pending, no confirm timer
         assert any("mesh write failed" in r.getMessage() for r in caplog.records)
@@ -1863,7 +1880,7 @@ class TestMeshConfirmedWrites:
 
         # The prior OFF pending is terminated and observed truth republished.
         states = _mesh_states(mqtt)
-        assert [json.loads(p[1]) for p in states] == [{"state": "ON", "brightness": 153}]
+        assert [json.loads(p[1]) for p in states] == [_mesh_feedback_payload("ON", "failed")]
         await sleeper.release_all()  # the cancelled OFF timer must not fire
         assert len(_mesh_states(mqtt)) == 1
 
@@ -1891,8 +1908,9 @@ class TestMeshConfirmedWrites:
         assert not any("contradicted" in r.getMessage() for r in caplog.records)
         payloads = [json.loads(p[1]) for p in _mesh_states(mqtt)]
         assert payloads == [
-            {"state": None, "brightness": 153},  # pending window
-            {"state": "ON", "brightness": 153},  # only the newest confirms
+            _mesh_feedback_payload(None, "pending", {"on": "0"}, 1080.0),
+            _mesh_feedback_payload(None, "pending", {"on": "1"}, 1080.0),  # newest target
+            _mesh_feedback_payload("ON"),  # only the newest confirms
         ]
         assert not any(p.get("state") == "OFF" for p in payloads)
 
@@ -1920,8 +1938,8 @@ class TestMeshConfirmedWrites:
         await sleeper.release_all()
         payloads = [json.loads(p[1]) for p in _mesh_states(mqtt)]
         assert payloads == [
-            {"state": None, "brightness": 153},
-            {"state": "ON", "brightness": 153},
+            _mesh_feedback_payload(None, "pending", {"on": "1"}, 1080.0),
+            _mesh_feedback_payload("ON"),
         ]
 
     async def test_forced_reconcile_cannot_bypass_the_hold(self) -> None:
@@ -1935,7 +1953,9 @@ class TestMeshConfirmedWrites:
 
         states = _mesh_states(mqtt)
         assert len(states) == 1
-        assert json.loads(states[0][1]) == {"state": None, "brightness": 153}
+        assert json.loads(states[0][1]) == _mesh_feedback_payload(
+            None, "pending", {"on": "0"}, 1080.0
+        )
         await bridge.withdraw()
 
     async def test_withdraw_clears_pending(self) -> None:
@@ -1952,9 +1972,7 @@ class TestMeshConfirmedWrites:
         # Re-acquisition publishes observed truth with no leftover hold.
         bus.set_devices([_mesh_dimmer_at("1")])
         await bridge.reconcile()
-        assert [json.loads(p[1]) for p in _mesh_states(mqtt)] == [
-            {"state": "ON", "brightness": 153}
-        ]
+        assert [json.loads(p[1]) for p in _mesh_states(mqtt)] == [_mesh_feedback_payload("ON")]
 
     async def test_mesh_aux_write_still_echoes_optimistically(self) -> None:
         """Scope guard: ONLY mesh primaries confirm — aux writes keep the echo."""
@@ -2096,9 +2114,7 @@ class TestMeshConfirmedWrites:
         await bus.emit(_mesh_dimmer_at("1"))
         clock.advance(5.0)
         await sleeper.release_all()
-        assert [json.loads(p[1]) for p in _mesh_states(mqtt)] == [
-            {"state": "ON", "brightness": 153}
-        ]
+        assert [json.loads(p[1]) for p in _mesh_states(mqtt)] == [_mesh_feedback_payload("ON")]
 
     async def test_confirm_publish_failure_repairs_on_next_observation(
         self, caplog: pytest.LogCaptureFixture
@@ -2124,9 +2140,7 @@ class TestMeshConfirmedWrites:
         assert _mesh_states(mqtt) == []
 
         await bus.emit(_mesh_dimmer_at("0"))  # the next observation repairs it
-        assert [json.loads(p[1]) for p in _mesh_states(mqtt)] == [
-            {"state": "OFF", "brightness": 153}
-        ]
+        assert [json.loads(p[1]) for p in _mesh_states(mqtt)] == [_mesh_feedback_payload("OFF")]
 
     async def test_commands_queued_at_withdraw_cannot_write_or_arm(self) -> None:
         """Tribunal r2-1: a command already queued in the MQTT lane that
@@ -2173,7 +2187,7 @@ class TestMeshConfirmedWrites:
         # and the failed null projection must now reach the wire.
         await bus.emit(_mesh_dimmer_at("0"))
         assert [json.loads(p[1]) for p in _mesh_states(mqtt)] == [
-            {"state": None, "brightness": 153}
+            _mesh_feedback_payload(None, "pending", {"on": "0"}, 1080.0)
         ]
         await bridge.withdraw()
 
@@ -2222,7 +2236,7 @@ class TestMeshWriteTimeout:
 
         assert bus.commands == []
         assert [json.loads(p[1]) for p in _mesh_states(mqtt)] == [
-            {"state": None, "brightness": 153}
+            _mesh_feedback_payload(None, "pending", {"on": "0"}, 1080.0)
         ]
         assert sleeper.requested == [80.0]  # the normal resolver, not a one-off null
         assert any("unresolved" in r.getMessage() for r in caplog.records)
@@ -2237,7 +2251,7 @@ class TestMeshWriteTimeout:
         )
 
         assert [json.loads(p[1]) for p in _mesh_states(mqtt)] == [
-            {"state": None, "brightness": 153}
+            _mesh_feedback_payload(None, "pending", {"on": "0"}, 1080.0)
         ]
         assert sleeper.requested == [80.0]
         await bridge.withdraw()
@@ -2252,7 +2266,7 @@ class TestMeshWriteTimeout:
             await bus.emit(_mesh_dimmer_at("1"))  # still ON: the OFF never actuated
 
         assert [json.loads(p[1]) for p in _mesh_states(mqtt)] == [
-            {"state": "ON", "brightness": 153}
+            _mesh_feedback_payload("ON", "contradicted")
         ]
         contradicted = [r.getMessage() for r in caplog.records if "contradicted" in r.getMessage()]
         assert contradicted and "rpc pending" in contradicted[0]  # the placeholder receipt
@@ -2270,9 +2284,7 @@ class TestMeshWriteTimeout:
         clock.advance(5.0)
         await sleeper.release_all()
 
-        assert [json.loads(p[1]) for p in _mesh_states(mqtt)] == [
-            {"state": "OFF", "brightness": 153}
-        ]
+        assert [json.loads(p[1]) for p in _mesh_states(mqtt)] == [_mesh_feedback_payload("OFF")]
 
     async def test_aux_fields_stay_live_while_timed_out_write_pends(self) -> None:
         bus, mqtt, bridge, _clock, _sleeper = _mesh_bridge([_mesh_motion_dimmer_at("1")])
