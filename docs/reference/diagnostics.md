@@ -27,6 +27,8 @@ recovery. Publishing a snapshot never resets them. Nothing is persisted, and
 there is no disk I/O on the metric path. Process exit loses the observations;
 process restart begins again at zero. Diagnostics do not determine availability
 or change the existing retained `online` / `offline` behavior.
+After a rollback, the retained meta topic can still show a stale `diag` from
+the previous agent version until the next full meta republish replaces it.
 
 ## Schema v1
 
