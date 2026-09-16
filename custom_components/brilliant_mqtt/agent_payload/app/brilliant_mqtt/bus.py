@@ -1018,6 +1018,9 @@ class RpcBusAdapter:
         try:
             return await asyncio.wait_for(asyncio.shield(task), timeout=_WRITE_DEADLINE_S)
         except asyncio.TimeoutError:
+            if task.done():
+                # The RPC itself raised TimeoutError; no live write was detached.
+                raise
             record.detached = True
             logger.warning(
                 "set_variables(%s) unresolved after %.0fs; detaching from the caller "
