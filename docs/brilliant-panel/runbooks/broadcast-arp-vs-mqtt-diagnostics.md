@@ -173,6 +173,8 @@ Continue this passive session observation through the following bounded captures
 
 ## Phase 3: bounded inbound broadcast/multicast capture
 
+Exhaust Phase 1's read-only STA/link, `power_save`, and watchdog/agent evidence and pass Phases 1-2 before this more invasive on-panel capture.
+
 1. Predeclare the broadcast class and multicast group/protocol to observe, the
    expected sender, and why **both** receivers should receive it. Verify relevant
    group membership, AP policy, and direction. Seeing outbound discovery requests
@@ -186,20 +188,32 @@ Continue this passive session observation through the following bounded captures
 3. In each already-authorized operator session, use the template below only if
    the installed tools support these options. Substitute the interface and a new
    private output path from private inventory. Never overwrite earlier evidence.
+   Set `CAPTURE_FILTER` to the predeclared class's protocol/group and expected
+   sender where appropriate; verify it matches eligible traffic at the control.
+   Use a separate deciding capture per class. A broad all-broadcast/multicast
+   filter is suitable only for an optional orientation pass, never the deciding capture.
 
 ```sh
 : "${CAPTURE_IFACE:?set the approved receiver interface privately}"
 : "${PRIVATE_CAPTURE:?set a new private capture path}"
+: "${CAPTURE_FILTER:?set the narrow predeclared-class filter privately}"
 umask 077
 timeout --signal=INT --kill-after=5s 60s \
   tcpdump -i "$CAPTURE_IFACE" -Q in -nn -e -s 128 -c 2000 \
-  -w "$PRIVATE_CAPTURE" \
-  'arp or ether broadcast or ether multicast or ip multicast or ip6 multicast'
+  -w "$PRIVATE_CAPTURE" "$CAPTURE_FILTER"
 ```
 
 This is a 60 s capture budget with a 5 s shutdown allowance, a 2,000-packet cap,
 and a 128-byte snapshot limit. All are collection limits, not measured traffic
-rates. IP multicast filters also cover AP multicast-to-unicast conversion.
+rates. Reaching the frame cap without observing the predeclared class is
+**INCONCLUSIVE, never PASS or FAIL**. For a new capture, narrow the filter further,
+remove `-c 2000` to use the time bound alone, or record and justify a different cap;
+retain the time and snapshot limits. Do not infer absence from a truncated window.
+
+An `ip multicast` filter covers AP multicast-to-unicast conversion only while the
+IPv4 destination remains in `224/4`; `ip6 multicast` likewise requires an IPv6
+multicast destination. An `ether multicast` term does **not** match frames whose
+L2 destination has been rewritten to unicast.
 Check capture start/end, interface/direction support, packet-drop statistics,
 and whether the count cap ended collection early. Timeout termination is an
 expected bound, not evidence of a network failure. Unsupported tools, forced
