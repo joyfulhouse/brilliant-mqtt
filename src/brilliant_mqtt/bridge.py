@@ -209,6 +209,9 @@ class Bridge:
         # command topic → (peripheral_id, descriptor). descriptor is None for the
         # PRIMARY JSON light/switch topic; an EntityDescriptor for each aux topic.
         self._by_cmd_topic: dict[str, tuple[str, EntityDescriptor | None]] = {}
+        # Admission ownership, separate from mesh confirmation generations.
+        # Keep epochs across withdrawal/rebinding to reject an A -> B -> A route.
+        self._command_generation: dict[str, int] = {}
         # Command topics this session has already SUBSCRIBEd (#76): the periodic
         # resync must not re-issue them. Bridge lifetime == MQTT session, and
         # withdraw() clears it, so a rebuilt session re-subscribes everything.
@@ -247,6 +250,22 @@ class Bridge:
     def _derived(self, device: BrilliantDevice) -> BrilliantDevice:
         """Apply score-derived motion to *device* (identity when disabled)."""
         return device if self._deriver is None else self._deriver.apply(device)
+
+    def _remember_device(self, device: BrilliantDevice) -> None:
+        previous = self._devices.get(device.peripheral_id)
+        if (
+            previous is None
+            or (previous.device_id, previous.peripheral_id)
+            != (device.device_id, device.peripheral_id)
+            or (previous.kind, previous.is_dimmable, previous.max_intensity)
+            != (device.kind, device.is_dimmable, device.max_intensity)
+        ):
+            # These are translate_command's snapshot inputs. Observed values
+            # and a new snapshot object do not change the command binding.
+            self._command_generation[device.peripheral_id] = (
+                self._command_generation.get(device.peripheral_id, 0) + 1
+            )
+        self._devices[device.peripheral_id] = device
 
     def _beat(self) -> None:
         if self._heartbeat is not None:
@@ -306,7 +325,7 @@ class Bridge:
             n_entities += len(descriptors)
 
             device = self._derived(device)
-            self._devices[device.peripheral_id] = device
+            self._remember_device(device)
             self._observe_mesh_pending(device)
 
             # Publish one discovery config per entity descriptor.
@@ -356,11 +375,16 @@ class Bridge:
         The PRIMARY light/switch JSON topic maps to (peripheral_id, None); each
         aux switch/number/button maps its per-variable topic to (peripheral_id, d).
         """
-        if d.component in ("light", "switch") and d.command_var is None:
-            self._by_cmd_topic[command_topic(self._panel, peripheral_id)] = (peripheral_id, None)
-        elif d.command_var is not None:
-            topic = aux_command_topic(self._panel, peripheral_id, d.command_var)
-            self._by_cmd_topic[topic] = (peripheral_id, d)
+        topic = self._command_topic_for(peripheral_id, d)
+        if topic is None:
+            return
+        route = (peripheral_id, d if d.command_var is not None else None)
+        previous = self._by_cmd_topic.get(topic)
+        if previous is not None and previous != route:
+            self._command_generation[peripheral_id] = (
+                self._command_generation.get(peripheral_id, 0) + 1
+            )
+        self._by_cmd_topic[topic] = route
 
     async def withdraw(self) -> None:
         """Step down as publisher: drop command subscriptions and cached state.
@@ -381,6 +405,8 @@ class Bridge:
         # not publish one (the registry union also reaches a resolver already
         # past its pending entry, mid-publish).
         topics = list(self._by_cmd_topic)
+        for peripheral_id in self._command_generation:
+            self._command_generation[peripheral_id] += 1
         self._by_cmd_topic.clear()
         self._subscribed.clear()
         for peripheral_id in set(self._pending_mesh) | set(self._mesh_confirm_tasks):
@@ -439,7 +465,7 @@ class Bridge:
             if not entities_for(device, self._panel):
                 continue
             device = self._derived(device)
-            self._devices[device.peripheral_id] = device
+            self._remember_device(device)
             self._observe_mesh_pending(device)
             fields = payload_fields(device)
             if fields:
@@ -622,7 +648,7 @@ class Bridge:
             return
 
         device = self._derived(device)
-        self._devices[device.peripheral_id] = device
+        self._remember_device(device)
         self._observe_mesh_pending(device)
 
         fields = payload_fields(device)
@@ -667,18 +693,25 @@ class Bridge:
         sets: list[VarSet] = translate_command(device, parsed)
         if sets:
             route = self._by_cmd_topic.get(topic)
+            target = (device.device_id, device.peripheral_id)
+            translation = (device.kind, device.is_dimmable, device.max_intensity)
+            generation = self._command_generation.setdefault(peripheral_id, 0)
 
             def decode(new_payload: str) -> list[VarSet]:
+                current = self._devices.get(peripheral_id)
                 if (
-                    self._by_cmd_topic.get(topic) is not route
-                    or self._devices.get(peripheral_id) is not device
+                    self._command_generation.get(peripheral_id) != generation
+                    or self._by_cmd_topic.get(topic) != route
+                    or current is None
+                    or (current.device_id, current.peripheral_id) != target
+                    or (current.kind, current.is_dimmable, current.max_intensity) != translation
                 ):
                     return []
                 try:
                     value = json.loads(new_payload)
                 except (json.JSONDecodeError, ValueError):
                     return []
-                return translate_command(device, value) if isinstance(value, dict) else []
+                return translate_command(current, value) if isinstance(value, dict) else []
 
             logger.info(
                 "command %s -> %s: %s",
@@ -721,11 +754,16 @@ class Bridge:
         logger.info("aux command %s -> %s: %s=%s", topic, peripheral_id, d.command_var, value)
         sets = [VarSet(d.command_var, value)]
         route = self._by_cmd_topic.get(topic)
+        target = (device.device_id, device.peripheral_id)
+        generation = self._command_generation.setdefault(peripheral_id, 0)
 
         def decode(new_payload: str) -> list[VarSet]:
+            current = self._devices.get(peripheral_id)
             if (
-                self._by_cmd_topic.get(topic) is not route
-                or self._devices.get(peripheral_id) is not device
+                self._command_generation.get(peripheral_id) != generation
+                or self._by_cmd_topic.get(topic) != route
+                or current is None
+                or (current.device_id, current.peripheral_id) != target
             ):
                 return []
             value = translate_aux(new_payload, d.value_kind, d.invert, d.min_value, d.max_value)
@@ -994,7 +1032,7 @@ class Bridge:
             settable = old.externally_settable if old is not None else True
             new_vars[s.name] = Variable(s.name, s.value, externally_settable=settable)
         updated = replace(device, variables=new_vars)
-        self._devices[peripheral_id] = updated
+        self._remember_device(updated)
 
         fields = payload_fields(updated)
         if fields:

@@ -18,6 +18,7 @@ import asyncio
 import logging
 import sys
 import types
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -313,6 +314,145 @@ class _DeviceReadObserver:
 
 
 class TestInteractiveScheduling:
+    @pytest.mark.parametrize(
+        ("refresh", "auxiliary", "invalidate"),
+        [
+            ("poll", False, None),
+            ("push", False, None),
+            ("poll", True, None),
+            ("push", True, None),
+            ("routes", False, None),
+            ("routes", True, None),
+            ("poll", False, "withdraw"),
+            ("push", True, "withdraw"),
+            ("poll", False, "target"),
+            ("push", True, "target"),
+            ("poll", False, "kind"),
+            ("poll", False, "dimming"),
+            ("poll", False, "scale"),
+            ("push", True, "range"),
+            ("push", True, "component"),
+            ("poll", False, "removed"),
+            ("push", True, "removed"),
+        ],
+    )
+    async def test_refresh_preserves_admission_until_binding_changes(
+        self, refresh: str, auxiliary: bool, invalidate: str | None
+    ) -> None:
+        observer, adapter = _adapter_for(_SchedulingObserver())
+        device = BrilliantDevice(
+            device_id="shared",
+            peripheral_id="slider",
+            name="Synthetic light",
+            kind=DeviceKind.LIGHT,
+            variables={
+                "on": Variable("on", "0"),
+                "intensity": Variable("intensity", "0"),
+                "max_intensity_value": Variable("max_intensity_value", "255"),
+            },
+        )
+        descriptor = EntityDescriptor(
+            "number" if auxiliary else "light",
+            "synthetic-control",
+            "Control",
+            "test",
+            "slider",
+            command_var="screen_brightness" if auxiliary else None,
+            value_kind="int" if auxiliary else "bool",
+        )
+        bridge = Bridge(adapter, FakeMqtt(), "test")
+        topic = "brilliant/test/slider/" + ("set_screen_brightness" if auxiliary else "set")
+        bridge._devices["slider"] = device
+        bridge._register_command_topic("slider", descriptor)
+
+        async def handle(message: _InboundMessage) -> None:
+            await bridge._on_command(message.topic, message.payload)
+
+        dispatcher = _TopicDispatcher(handle)
+
+        async def dispatch(value: int) -> None:
+            await dispatcher.dispatch(
+                _InboundMessage(
+                    topic, str(value) if auxiliary else f'{{"brightness":{value}}}', False, (), ()
+                ),
+                latest_wins=True,
+            )
+
+        async def update(snapshot: BrilliantDevice) -> None:
+            if refresh == "push":
+                await bridge._on_change(snapshot)
+            else:
+                await bridge.poll_once([snapshot])
+
+        blocker = asyncio.create_task(
+            adapter.set_variables("shared", "blocker", [VarSet("on", "1")])
+        )
+        try:
+            await _settle(10)
+            await dispatch(40)
+            await _settle(10)
+            if refresh == "routes":
+                route = bridge._by_cmd_topic[topic]
+                bridge._register_command_topic("slider", replace(descriptor))
+                assert bridge._by_cmd_topic[topic] == route
+                assert bridge._by_cmd_topic[topic] is not route
+            else:
+                await update(replace(device))
+                assert bridge._devices["slider"] == device
+                assert bridge._devices["slider"] is not device
+            await dispatch(80)
+            await _settle(10)
+
+            if invalidate == "withdraw":
+                await bridge.withdraw()
+                await update(replace(device))
+                bridge._register_command_topic("slider", replace(descriptor))
+            elif invalidate in ("target", "kind", "dimming", "scale"):
+                changed = replace(device, variables=dict(device.variables))
+                if invalidate == "target":
+                    changed.device_id = "other-device"
+                elif invalidate == "kind":
+                    changed.kind = DeviceKind.SWITCH
+                elif invalidate == "dimming":
+                    del changed.variables["intensity"]
+                else:
+                    changed.variables["max_intensity_value"] = Variable(
+                        "max_intensity_value", "100"
+                    )
+                await update(changed)
+                await update(replace(device))
+            elif invalidate in ("range", "component"):
+                changed_descriptor = (
+                    replace(descriptor, max_value=50.0)
+                    if invalidate == "range"
+                    else replace(descriptor, component="switch")
+                )
+                bridge._register_command_topic("slider", changed_descriptor)
+                bridge._register_command_topic("slider", replace(descriptor))
+            elif invalidate == "removed":
+                bridge._devices.pop("slider")
+
+            await dispatch(120)
+            if invalidate == "removed":
+                await update(replace(device))
+            await _settle(10)
+            observer.release.set()
+            await blocker
+            await dispatcher.shutdown()
+            key = "screen_brightness" if auxiliary else "intensity"
+            expected = [{"on": "1"}]
+            if invalidate is not None:
+                expected.append({key: "80"})
+            expected.append({key: "120"})
+            assert [values for _, _, values in observer.payloads] == expected
+            assert observer.max_in_flight == 1
+            assert not adapter._write_admissions
+        finally:
+            observer.release.set()
+            await dispatcher.shutdown()
+            await adapter.shutdown()
+            await asyncio.gather(blocker, return_exceptions=True)
+
     @pytest.mark.parametrize("auxiliary", [False, True])
     async def test_withdrawn_route_rejects_active_replacement(self, auxiliary: bool) -> None:
         observer, adapter = _adapter_for(_SchedulingObserver())
