@@ -25,19 +25,14 @@ they do not establish an upstream implementation owner below the project level.
 
 | Evidence | What it supports | What remains unknown |
 |---|---|---|
-| [docs/brilliant-panel/diyhue-bridge.md:162](diyhue-bridge.md#L162) | The diyHue **10 s state poll** is the integration record's own unverified observation, not a measured or guaranteed value; this repository records no measurement method or provenance. | This is not a documented minimum or a guarantee for every upstream version/configuration. Confirm the actual deployment before choosing a comparator. |
+| [docs/brilliant-panel/diyhue-bridge.md:162](diyhue-bridge.md#L162) | The integration record is the provenance of the only reflection-path timing recorded here; its measurement method is undocumented. | Apply that record's qualification before using the observation as a baseline or comparator; the running deployment still needs measurement. |
 | [docs/brilliant-panel/diyhue-bridge.md:36](diyhue-bridge.md#L36) | The native panel is a Hue API v1 polling client. | Its polling interval, scheduling, and idle/active behavior are undocumented here. Changing diyHue reflection does not change that firmware-owned cadence. |
 | [docs/brilliant-panel/diyhue-bridge.md:97](diyhue-bridge.md#L97) | A missing inclusion tag leaves the light unreachable in the documented integration. | This establishes **missing-tag unreachability only**. It does not establish a translation of HA `unavailable` into Hue `reachable`; that is a design decision proposed below. |
 | [docs/reference/poc-findings.md:238](../reference/poc-findings.md#L238) | A **Brilliant bus** notification stream stopped delivering while its notification-fed mirror became stale. | This is a transferable caution about silent divergence, **not verified evidence of a diyHue or HA WebSocket failure**. It does not establish an upstream failure rate or timing. |
 
-The diyHue 10 s state poll is the only reflection-path timing recorded here. It is
-the integration record's own unverified observation, not a measured or guaranteed
-value; this repository records no measurement method or provenance. There is no
-repository-backed claim here about an activity-dependent wait,
-an idle synchronization period, or immediate command forwarding. Those behaviors
-remain unmeasured and require their own traces. A claim of worthwhile display
-gain is not yet falsifiable without a measured panel-poll term, a baseline, and
-a declared acceptance criterion.
+Activity-dependent waits, idle synchronization, and command-forwarding latency
+remain unmeasured and require their own traces. A claim of worthwhile display gain
+needs a measured panel-poll term, a baseline, and a declared acceptance criterion.
 
 ### Live local design precedent, retired deployment
 
@@ -50,29 +45,26 @@ or retired code: the package remains in the wheel
 ([pyproject.toml:44](../../pyproject.toml#L44)); the narrow framework exception
 names the hosting adapter, not the HA client
 ([pyproject.toml:59](../../pyproject.toml#L59)).
-
-Retirement applies to the old **deployment** path: the guide forbids the old
-manual deployment/direct-HA/physical-host instructions
+Only the old **deployment** path is retired
 ([docs/ha-mirror.md:222](../ha-mirror.md#L222)), and the architecture documents
 cleanup of those experiments
-([docs/ARCHITECTURE.md:56](../ARCHITECTURE.md#L56)). This precedent is not a
-recommendation to deploy that path or copy it into diyHue. It also does not already
-satisfy the proposed contract: for example, its event parser ignores a removed
-state ([src/brilliant_ha_mirror/ha_client.py:162](../../src/brilliant_ha_mirror/ha_client.py#L162)),
+([docs/ARCHITECTURE.md:56](../ARCHITECTURE.md#L56)). Use this as a design precedent,
+not a deployment recommendation or a complete implementation: its parser ignores
+a removed state ([src/brilliant_ha_mirror/ha_client.py:162](../../src/brilliant_ha_mirror/ha_client.py#L162)),
 whereas this proposal requires an explicit tombstone.
 
 ## Conditional latency model and the cheaper comparator
 
 Let `D` be the diyHue reflection polling period and `P` the firmware-owned native
-panel polling period. **`P` is an explicit free parameter to be measured**, not
-a repository fact. Assuming **independent uniform phases and negligible service
-time**, mean displayed delay is `D/2 + P/2`. Transport, processing, and rendering
+panel polling period. **Both `D` and `P` are free parameters to be measured**;
+neither has a verified value here. Assuming **independent uniform phases and
+negligible service time**, mean displayed delay is `D/2 + P/2`. Transport, processing, and rendering
 overheads are neglected in this model and must be measured in real qualification.
 Ideal events set the modeled upstream waiting term to zero; they do not assert
 zero real event-delivery cost.
 
 Every delay cell is a **CONDITIONAL PREDICTION**, not a measured display gain.
-The illustrative `P` values below are scenarios, not panel timing observations.
+The illustrative `D` and `P` values below are scenarios, not verified deployment timings.
 
 | Panel period, free parameter | 10 s polling | 2 s polling | Ideal events |
 |---|---|---|---|
@@ -80,29 +72,30 @@ The illustrative `P` values below are scenarios, not panel timing observations.
 | P = 10 s | 10 s (CONDITIONAL PREDICTION) | 6 s (CONDITIONAL PREDICTION) | 5 s (CONDITIONAL PREDICTION) |
 | P = 60 s | 35 s (CONDITIONAL PREDICTION) | 31 s (CONDITIONAL PREDICTION) | 30 s (CONDITIONAL PREDICTION) |
 
-**At P = 60 s, the entire event-driven redesign moves the conditional mean from
-35 s to 30 s.** It does not remove the firmware's remaining wait. Under these same
-assumptions, tightening diyHue polling from 10 s to 2 s removes about **80% of the
-mean upstream polling wait** (5 s to 1 s); ideal events save roughly **one further
-second**. These are analytical consequences, not measured improvements or claims
-that the proposed poll period is supported or safe for a particular deployment.
+**At D = 10 s and P = 60 s, the entire event-driven redesign moves the conditional
+mean from 35 s to 30 s, roughly 14% of displayed delay.** It does not remove the
+firmware's remaining wait. Under these same assumptions, tightening diyHue polling
+from 10 s to 2 s removes about **80% of the
+mean upstream polling wait (`D/2`) only**, not 80% of displayed latency (5 s to 1 s
+upstream); ideal events save roughly **one further second**. These are analytical
+consequences, not measured improvements or claims that the proposed poll period
+is supported or safe for a particular deployment.
 
-Measure `P` and both latency paths below before deciding whether that incremental
-benefit justifies the event path's ordering, authentication, and recovery costs.
+**CONDITIONAL PREDICTION: worst-case polling wait is bounded by `D + P`, about 70 s at `D = 10 s`, `P = 60 s`, under the same negligible-service assumptions; real tails remain unmeasured.**
+
+Measure `D`, `P`, and both latency paths below before deciding whether that
+incremental benefit justifies the event path's ordering, authentication, and recovery costs.
 Compare the current poll with a separately approved shorter poll before proposing
 a default change. A sweep of this formula would not discover `P` or add a distinct
 falsifiable prediction, so this proposal deliberately supplies the table rather
 than a synthetic benchmark implementation.
 
-### Recorded dissent
-
-The second independent review seat argued for a hard-capped, stdlib-only Python
-3.10 deterministic sweep under tests: **fewer than 300 lines, no I/O, and no
-reimplementation**, because the panel-poll term is unknown. This remains a live
-minority view. The current ruling is documentation only; the reversal condition
-is **measured traces exposing phase-locking, bursts, or tail behavior that a mean
-calculation cannot represent**. Such evidence would justify upstream replay tests
-later, rather than treating the analytical mean as sufficient for those behaviors.
+An alternative remains a hard-capped, stdlib-only Python 3.10 deterministic sweep:
+**fewer than 300 lines, no I/O, and no reimplementation**, motivated by the unknown
+panel-poll term. **Measured traces exposing phase-locking, bursts, or tail behavior
+that a mean calculation cannot represent** would justify upstream replay tests
+and revisiting the analytical-only choice. No such traces or benchmark were
+produced here.
 
 ## Proposed upstream contract, conditional on measured benefit
 
@@ -195,11 +188,13 @@ not invented defaults in this proposal.
 ### Authentication is a separate boundary
 
 Authenticate the outbound HA subscription separately from inbound Hue access.
+Require TLS with certificate verification for that outbound subscription.
 Do not reuse Hue client credentials as HA authorization or expose HA credentials
 in served Hue objects, requests, logs, traces, or error payloads. Store HA access
 material in the operator's supported secret store or restricted configuration,
 with access limited to the upstream service. Preserve the existing inbound Hue
 authentication contract and v1 client behavior.
+Record the credential-leak discovery route, named revocation owner, and measured discovery-to-revocation time during approved qualification; it remains unmeasured here.
 
 Credential rotation must replace the outbound session, fence the old session's
 callbacks/results with a new epoch, authenticate using the replacement material,
@@ -266,13 +261,37 @@ unmeasured here; without them, benefit/safety qualification is **INCONCLUSIVE**.
 |---|---|---|
 | Measure the existing deployment | Both benchmark definitions are executable; current `D`, observed `P`, workload, client behavior, and clock uncertainty are recorded. | Event flag stays off; no event candidate is deployed by this documentation. |
 | Test the cheap poll comparator | Isolated shorter-poll result for A and B, HA load, client compatibility, and covered recurrence window. | Event flag remains off; restore the exact previous poll settings. |
-| Qualify an additive upstream candidate | Prove reducer ordering, stale-poll fencing, full reconnect baseline, permanent repair polling, availability/deletion behavior, and separate authentication handling before opt-in. | **Flag-off at this phase**, fence/drain stale event work, and retain the existing polling/cache path. |
+| Qualify an additive upstream candidate | Exercise the source-aligned comparator below in shadow/replay before events can write served state; prove reducer ordering, stale-poll fencing, full reconnect baseline, permanent repair polling, availability/deletion behavior, and separate authentication handling before opt-in. | **Flag-off at this phase**, fence/drain stale event work, and retain the existing polling/cache path. |
 | Separately approved opt-in | A improves and B meets the predeclared display-benefit criterion without HA load/client regressions, divergence, or reconnect-bound breaches across the declared recurrence window. | **Flag-off at this phase**, fence the event epoch, restore baseline polling settings, and reconcile/verify the served state. |
 
 Abort the event candidate on **event/poll divergence, reconnect-storm bound breach,
-HA load regression, or absent display benefit**. Compare event and poll values at
-a common guarded generation so an expected in-flight transition is not mislabeled
-as divergence; unexplained disagreement is an abort, not a warning to ignore.
+HA load regression, or absent display benefit**. A common local generation does
+not establish comparable source state: a poll can see a new HA value before its
+event arrives. Before events ever write served state, exercise this comparator
+in shadow/replay, including that ordering and delayed, missing, or reordered events:
+
+- Compare independent event-derived and authoritative poll-derived candidates,
+  preserved before reconciliation can overwrite either, at the **same source
+  revision/cut**. The cut must cover inventory and registry changes as well as
+  values; local epochs, equal receipt times, or equal values do not prove it.
+  Record the source-supported revision or replay barrier that establishes the
+  cut. This proposal does not assume HA supplies such a revision; if the running
+  source cannot establish one, runtime parity remains `INCONCLUSIVE`.
+- Compare the included object set, existence/tombstones, HA-to-Hue mappings,
+  capabilities, `reachable`, and applicable v1 state fields `on`, `bri`, `hue`,
+  `sat`, `ct`, `xy`, and `colormode`, using the same deterministic translation
+  and canonical representation on both sides. Require exact parity, including
+  field presence; exclude transport timestamps and local generation counters.
+- Allow a **5 s transition window**, a proposed qualification budget with
+  **unmeasured deployment suitability**, starting at the first candidate for a
+  cut. Do not reset the deadline on further arrivals. Unequal/unproven cuts during
+  that window are pending alignment, not divergence. Compare settled candidates
+  once both have consumed the cut; a same-cut mismatch persisting at the deadline
+  is divergence and aborts. If a cut cannot be established or completed by the
+  deadline, record `INCONCLUSIVE`, keep/return the flag off, and retain polling
+  and bounded reconciliation. Never convert missing alignment into `PASS` or
+  extend the window silently; a changed budget requires fresh shadow qualification.
+
 Flag-off is available at **every phase**. Because the candidate is additive and
 removes no baseline polling path, software reversal is small, but rollback is
 complete only when stale writers are fenced and authoritative served state and

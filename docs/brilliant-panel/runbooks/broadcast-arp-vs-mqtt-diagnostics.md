@@ -34,13 +34,31 @@ are separately cited. Record actual elapsed time and incomplete coverage.
   ambiguous evidence, or an interrupted observation. Neither permits recovery
   changes under this diagnostic procedure.
 
+**Before any RF-affecting action, account for the existing Wi-Fi watchdog.** Its
+recovery ladder can reconnect Wi-Fi, restart `connman`/`wpa_supplicant`, or
+**REBOOT the panel** ([docs/CONFIGURATION.md:132](../../CONFIGURATION.md#L132)).
+An RF experiment can trip that ladder, invalidate the measurement, and power-cycle
+a production in-wall panel. First read its enabled/running state, effective
+thresholds, pending recovery and reboot-guard state; record the operator's plan
+for that risk and physical recovery. If these cannot be established, stop before
+intervention. Do not enable, disable, restart, or invoke the watchdog to collect
+evidence; any change to its operation needs separate approval and restoration.
+
 ## Keep the evidence paths separate
 
 | Path | What the evidence establishes | What it cannot establish |
 |---|---|---|
-| Already-established unicast MQTT connection | Retained `online` was published after MQTT connection and a successful local-bus read. The retained QoS-0 LWT is `offline`; the client inherits the default 60 s keepalive. These are connection/birth semantics, not a fresh probe ([src/brilliant_mqtt/mqttio.py:454](../../../src/brilliant_mqtt/mqttio.py#L454), [src/brilliant_mqtt/__main__.py:288](../../../src/brilliant_mqtt/__main__.py#L288), [src/brilliant_mqtt/bridge.py:252](../../../src/brilliant_mqtt/bridge.py#L252)). | A retained value alone cannot date the last successful exchange. With contemporaneous broker keepalive/session evidence, usability is established as of that last exchange only. It proves nothing about inbound broadcast/multicast or fresh neighbor resolution. |
+| Already-established unicast MQTT connection | Retained `online` follows a successful local-bus read over an established MQTT connection ([src/brilliant_mqtt/bridge.py:271](../../../src/brilliant_mqtt/bridge.py#L271)); the retained QoS-0 LWT is `offline` ([src/brilliant_mqtt/mqttio.py:457](../../../src/brilliant_mqtt/mqttio.py#L457)). These are connection/birth semantics, not a fresh probe. | A retained value alone cannot date the last successful exchange. With contemporaneous broker keepalive/session evidence, usability is established as of that last exchange only. It proves nothing about inbound broadcast/multicast or fresh neighbor resolution. |
 | Neighbor resolution (ARP) | A fresh ordinary ARP request and attributable reply test address-to-link-layer resolution on this segment, in this direction, during this window. | An existing TCP session can keep using cached neighbor information. Its health cannot substitute for a fresh ARP exchange. |
 | Discovery and broadcast/multicast receipt | An expected frame observed at a receiver establishes delivery of that frame. Discovery application processing requires separate evidence. | HA MQTT discovery is retained MQTT over the broker TCP session, not a broadcast test ([src/brilliant_mqtt/bridge.py:252](../../../src/brilliant_mqtt/bridge.py#L252)). The scoped bridge/integration review found no mDNS, SSDP, or ARP implementation. Native Hue discovery uses mDNS, but the documented credential-injection path bypasses discovery ([docs/brilliant-panel/diyhue-bridge.md:46](../diyhue-bridge.md#L46)). |
+
+The panel agent's staged dependency declares a 60 s default as `keepalive: int = 60`
+([custom_components/brilliant_mqtt/agent_payload/vendor/aiomqtt/client.py:226](../../../custom_components/brilliant_mqtt/agent_payload/vendor/aiomqtt/client.py#L226)).
+The adapter supplies no override
+([src/brilliant_mqtt/mqttio.py:461](../../../src/brilliant_mqtt/mqttio.py#L461)).
+This is an **inherited vendored-library default**, not a configured or tuned
+deployment setting; confirm the effective value against the running session's
+existing telemetry. An unavailable session value remains unverified.
 
 **Healthy MQTT does not imply healthy multicast.** Failed ICMP to a broker VIP
 does not prove failed MQTT: a VIP commonly does not answer ICMP while its TCP
@@ -49,9 +67,44 @@ credential-injected Hue control as proof of discovery delivery.
 
 ## Phase 1: eliminate agent-side explanations first
 
-Review existing, timestamped logs for a 20-minute lookback ending at the incident,
-then observe for 5 minutes without issuing test commands. Record deployed version,
-effective settings, available log levels, gaps, restarts, and the symptom window.
+This is a **read-only first gate over shipped surfaces**, before any new procedure.
+Use the existing HA-side `wifi_link` and `wifi_power_save` probes
+([custom_components/brilliant_mqtt/panel_ops.py:1914](../../../custom_components/brilliant_mqtt/panel_ops.py#L1914),
+[custom_components/brilliant_mqtt/panel_ops.py:1915](../../../custom_components/brilliant_mqtt/panel_ops.py#L1915))
+through independently approved read-only access. Their parsed summaries expose
+link state/signal and `power_save`
+([custom_components/brilliant_mqtt/panel_ops.py:2030](../../../custom_components/brilliant_mqtt/panel_ops.py#L2030),
+[custom_components/brilliant_mqtt/panel_ops.py:2046](../../../custom_components/brilliant_mqtt/panel_ops.py#L2046)).
+Require a timestamped runtime read from the current boot: a stale saved summary
+does not establish current power-save state. **Do not invoke HA's Reboot action
+to obtain diagnostics**: that action captures them and then reboots
+([custom_components/brilliant_mqtt/manager.py:1536](../../../custom_components/brilliant_mqtt/manager.py#L1536)).
+If no independent read-only route is available, record `INCONCLUSIVE` and stop.
+
+`power_save=on` is an **agent-side FAIL** with a documented cause: the service
+unit identifies power-save dropping inbound packets as a cause of MQTT keepalive
+flaps ([deploy/brilliant-mqtt.service:13](../../../deploy/brilliant-mqtt.service#L13)).
+Its disable command is strictly best-effort, including the `-` prefix
+([deploy/brilliant-mqtt.service:17](../../../deploy/brilliant-mqtt.service#L17));
+runtime state **must be read, never assumed** from an active service or unit text.
+Route remediation separately; do not alter power-save during this baseline.
+
+Read existing watchdog/agent telemetry for a 20-minute lookback ending at the
+incident, then observe for 5 minutes without issuing test commands. Use the
+watchdog's existing log and persistent reboot-guard record
+([docs/CONFIGURATION.md:153](../../CONFIGURATION.md#L153)), not new ICMP or TCP
+probes. Its broker TCP-open result is already logged as
+`gateway=%s up=%s broker=%s`
+([src/brilliant_wifi_watchdog/run.py:131](../../../src/brilliant_wifi_watchdog/run.py#L131));
+it is informational and does not drive recovery
+([docs/CONFIGURATION.md:156](../../CONFIGURATION.md#L156)). `INCONCLUSIVE` probe
+results are not proof that the broker is down
+([src/brilliant_wifi_watchdog/probe.py:213](../../../src/brilliant_wifi_watchdog/probe.py#L213)).
+Record any recovery actions; an action during collection invalidates causal
+comparison. Do not start an absent watchdog merely to obtain its log.
+
+Record deployed version, effective settings, available log levels, gaps, restarts,
+and the symptom window before continuing with the existing agent checks below.
 Read only the named non-secret settings through the approved operator interface;
 do not dump an environment file. Defaults are not proof of deployed values.
 
@@ -100,9 +153,9 @@ detection and its successful deployment does not qualify Wi-Fi health
 
 | Verdict | Agent gate |
 |---|---|
-| PASS | The symptom window is covered, expected agent activity is evidenced, and neither a stream fault nor queue/RPC timing explains the symptom. This only permits the network investigation. |
-| FAIL | A correlated stale-stream, reconnect storm, read fault, or measured queue/RPC delay supplies an agent/native-path explanation. Stop network attribution and route that evidence to its owner. |
-| INCONCLUSIVE | Logs, timing, effective settings, or incident coverage are missing; only retained state or a quiet mirror is available. Preserve the gap; do not claim the agent is eliminated. |
+| PASS | Runtime power-save is off, watchdog state/risk is accounted for, the symptom window is covered, and neither a stream fault nor queue/RPC timing explains the symptom. This only permits the network investigation. |
+| FAIL | Runtime `power_save=on`, or a correlated stale-stream, reconnect storm, read fault, or measured queue/RPC delay supplies an agent/native-path explanation. Stop network attribution and route that evidence to its owner. |
+| INCONCLUSIVE | Runtime power-save, watchdog state, logs, timing, effective settings, or incident coverage are missing, or a watchdog action interrupted collection. Preserve the gap; do not claim the agent is eliminated. |
 
 ## Phase 2: qualify the established session
 
@@ -216,6 +269,8 @@ qualified operator action executed outside this repository**. First identify
 the affected component from evidence and obtain the operator's approved change
 and rollback procedure. This runbook does not prescribe an AP restart or fleet
 reconfiguration. Keep agent/native-path explanations and incomplete gates visible.
+Recheck the watchdog risk gate before an RF-affecting recovery; its automatic
+reconnect/restart/reboot can otherwise change the experiment without the operator.
 
 1. Preserve the before-state, configuration baseline, per-path verdicts, working
    control, and incident timestamps. Check client compatibility and management/
@@ -261,6 +316,7 @@ labels, cardinality scheme, or new sampling implementation.
 ```text
 operator / approval / private inventory reference:
 code and firmware versions / effective non-secret settings:
+runtime power_save / read timestamp and boot / watchdog state, guard and actions:
 suspect role / working comparison role / segment and policy equivalence:
 incident UTC / observation start UTC / end UTC / actual duration:
 agent signals / queue wait / RPC duration / missing timing:

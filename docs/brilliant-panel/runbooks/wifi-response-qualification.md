@@ -38,11 +38,25 @@ state-reflection delay, a polling interval, or MQTT availability.
   and packet/log contents private. Public records use synthetic role labels and
   measured durations/counts only. Do not paste environment files or binding blobs.
 
+**Before any RF-affecting step, account for the existing Wi-Fi watchdog:** it can
+reconnect Wi-Fi, restart `connman`/`wpa_supplicant`, or **REBOOT the panel**
+([docs/CONFIGURATION.md:132](../../CONFIGURATION.md#L132)). An RF experiment can
+trip that ladder, destroy the measurement, and power-cycle a production in-wall
+panel. Complete the read-only watchdog risk gate linked below; unknown state or
+recovery access is a hard stop. Do not start or reconfigure it to collect evidence.
+
+This idle baseline does not sample the reported control gesture. It cannot by
+itself separate RF, native-peer, binding, and scheduling contributions to control
+latency. **The overall control-latency verdict defaults to INCONCLUSIVE until a
+separately approved single-gesture sample in Phase 4 exists.** Individual health
+`FAIL` results remain reportable; they do not establish the cause of gesture delay.
+
 ## Phase 1: agent and binding gates before RF attribution
 
 First complete the agent-side gate in the
 [broadcast/ARP runbook, Phase 1](broadcast-arp-vs-mqtt-diagnostics.md#phase-1-eliminate-agent-side-explanations-first).
-It supplies the exact log strings and settings for hot diff-poll, stale-stream
+It first checks runtime power-save and the existing watchdog/agent telemetry, then
+supplies the exact log strings and settings for hot diff-poll, stale-stream
 rebuild, and **bus** reconnect-storm detection. Preserve that gate's `PASS`, `FAIL`,
 or `INCONCLUSIVE`; a missing log is not a zero counter. Do not confuse bus
 reconnect events with MQTT reconnects. The v0.10.2 / #146 changes concern HA-side
@@ -74,40 +88,13 @@ current ownership by itself
 | FAIL | The control resolves to the wrong, stale, offline, duplicated, or unintended grouped target. Stop RF tuning and route a separately approved native-UI correction with exact baseline/restore evidence. |
 | INCONCLUSIVE | Inventory, native selection, fresh ownership, or group resolution cannot be established within the window. Do not repair by guessing or writing raw binding configuration. |
 
-### Separate queue wait, RPC acceptance, and observation
-
-Writes serialize **per owning bus device**; reads remain independent. Queue wait
-ends when the write acquires that device's lock; RPC latency starts there. The
-normal DEBUG log formats are:
-
-```text
-set_variables(%s) acquired device lock after %.3fs queue wait
-set_variables(%s) receipt: %s (rpc %.3fs, queue wait %.3fs)
-```
-
-Source: [src/brilliant_mqtt/bus.py:1047](../../../src/brilliant_mqtt/bus.py#L1047)
-and [src/brilliant_mqtt/bus.py:1084](../../../src/brilliant_mqtt/bus.py#L1084).
-Use timestamped, already available logs; redact target identities. When DEBUG
-evidence is absent, record timing as unmeasured. Any temporary logging change
-requires its own bounded operator approval and restoration of the original level.
-
-The 5 s caller deadline begins after lock acquisition and **detaches** the RPC;
-the RPC keeps running with its device lock held and its late outcome handled.
-The write is unresolved, not lost. The 15 s hard cap latches a session rebuild
-([src/brilliant_mqtt/bus.py:44](../../../src/brilliant_mqtt/bus.py#L44),
-[src/brilliant_mqtt/bus.py:979](../../../src/brilliant_mqtt/bus.py#L979)).
-Record late completion/failure separately; never send a replacement command simply
-because the caller timed out. The detached completion log format is
-`detached set_variables(%s) completed after %.1fs (queue wait %.3fs); receipt: %s`
-([src/brilliant_mqtt/bus.py:1076](../../../src/brilliant_mqtt/bus.py#L1076)).
-
-The fixed **80 s mesh confirmation wait is expected policy, not a symptom**.
-It outlasts the measured false-ack/revert tail, runs in a background task off the
-command lane, does not delay command dispatch, and is superseded by a newer
-command ([src/brilliant_mqtt/bridge.py:49](../../../src/brilliant_mqtt/bridge.py#L49),
-[src/brilliant_mqtt/bridge.py:699](../../../src/brilliant_mqtt/bridge.py#L699),
-[src/brilliant_mqtt/bridge.py:758](../../../src/brilliant_mqtt/bridge.py#L758)).
-Do not count that interval as Wi-Fi latency or shorten it as RF tuning.
+For separate queue/RPC timing, detached-write handling, and the expected mesh
+confirmation policy, use the same
+[agent gate](broadcast-arp-vs-mqtt-diagnostics.md#phase-1-eliminate-agent-side-explanations-first).
+Its normal timing logs require DEBUG; the default INFO level does not emit them
+([src/brilliant_mqtt/config.py:52](../../../src/brilliant_mqtt/config.py#L52)).
+Missing timing remains unmeasured. Any temporary logging change needs separate
+bounded approval and restoration; this baseline does not enable it.
 
 ## Phase 2: independent, timestamped baseline measurements
 
@@ -121,17 +108,20 @@ uncertainty. A controller's sample age is part of the evidence.
 | Measurement | Its observation interval | Method and limit of inference |
 |---|---|---|
 | Signal and link rates | Sample every 10 s for 5 minutes. | Read the existing AP/client diagnostic surface. Record signal units, transmit and receive rates separately, association/roaming changes, and sample age. Rates are link selections, not delivered application throughput. A station-wide average cannot isolate this panel. |
-| Gateway TCP latency | One connect-only attempt every 30 s for 5 minutes, each with a 2 s timeout. | From the panel's own network path, measure TCP connect time to an approved, known listening gateway service. Use installed approved tooling, a monotonic timer, and no application request. Confirm that the same listener works for the comparison device. If there is no approved listener, mark this measurement `INCONCLUSIVE`; do not scan ports or substitute ICMP. |
-| Broker TCP latency | One connect-only attempt every 30 s for 5 minutes, each with a 2 s timeout, offset from gateway probes so attempts do not overlap on a device. | Measure the actual configured broker TCP service from the same source path. Distinguish TCP connect from TLS/authentication and MQTT-session health. Label these diagnostic connections so they are not counted as reconnects of the established agent client. A refusal or timeout needs listener/policy evidence before it can be attributed to RF. |
+| Gateway TCP latency | Observe existing timestamped samples for 5 minutes; record their actual cadence and age. | Use passive telemetry from an already-established panel-to-gateway TCP session, if one exists and exposes timing. Record the timing statistic and source; do not open a connection, scan, or substitute ICMP. Existing watchdog gateway reachability is not TCP latency. No such telemetry means latency is unmeasured and this row is `INCONCLUSIVE`. |
+| Broker TCP latency | Observe existing timestamped samples for a separate 5-minute window; record its offset, actual cadence, and sample age. | Use the established agent session's TCP timing, if already exposed, and correlate the existing watchdog broker log (`gateway=%s up=%s broker=%s`, [src/brilliant_wifi_watchdog/run.py:131](../../../src/brilliant_wifi_watchdog/run.py#L131)). The log reports TCP-open reachability, not duration; it cannot supply latency. Missing timing is `INCONCLUSIVE`. Do not initiate a connection or invoke the watchdog probe. |
 | Retransmission/failure counters | Two timestamped reads exactly 60 s apart, within the baseline; record actual elapsed time. | Use the same AP/client or TCP socket counter, direction, units, and reset generation at both reads. Record radio retries, radio failures, and TCP retransmissions separately. A global host counter cannot identify which session lost data. Apply the delta rules below. |
-| MQTT reconnect events | Observe continuously for the full 10 minutes. | Use existing broker records for the established agent client and timestamped agent logs. Count completed MQTT reconnects separately from bus reconnects, startup, diagnostic TCP connections, and HA consumer activity. The exact agent connect log format is `connected to MQTT broker %s:%s` ([src/brilliant_mqtt/mqttio.py:500](../../../src/brilliant_mqtt/mqttio.py#L500)); correlate it with session identity/reason privately. |
+| MQTT reconnect events | Observe continuously for the full 10 minutes. | Use existing broker records for the established agent client and timestamped agent logs. Count completed MQTT reconnects separately from bus reconnects, startup, existing watchdog TCP checks, and HA consumer activity. The exact agent connect log format is `connected to MQTT broker %s:%s` ([src/brilliant_mqtt/mqttio.py:500](../../../src/brilliant_mqtt/mqttio.py#L500)); correlate it with session identity/reason privately. |
 | Native peer-RPC timing | Observe existing, authorized traffic for 5 minutes, recording each write's queue wait and RPC duration separately. | Correlate by owning-device role, target role, and event order. Keep caller detachment and late outcome in the same record. No writes or missing DEBUG logs means unmeasured timing, not a fast path. RPC duration is native-path time, not an RF measurement. |
 
 A laptop on the same SSID is not the panel's source path for a TCP latency
-measurement. If safe installed tooling or access to that path is absent, record
+measurement. If existing passive telemetry for that path is absent, record
 `INCONCLUSIVE` rather than copying a laptop's result into the panel row. Keep
-TCP timeouts as censored failures; do not average them as successful 2 s samples.
-Do not capture application payloads or send MQTT commands for these measurements.
+RTT, connect time, and application response time distinct; never substitute one
+for another. Watchdog `INCONCLUSIVE` is not proof of broker failure
+([src/brilliant_wifi_watchdog/probe.py:213](../../../src/brilliant_wifi_watchdog/probe.py#L213)).
+No new TCP/ICMP probes, application payload capture, or MQTT commands are authorized
+by this baseline.
 
 ### Counter delta rule
 
@@ -163,7 +153,7 @@ precludes claiming an improvement passed its target.
 |---|---|
 | PASS | Complete comparable samples fall within the declared baseline/tolerance, with no correlated fault for that measurement. This does not clear another path. |
 | FAIL | Valid samples show a reproducible regression or a fault against that row's declared criterion during the symptom. Record the measured path; do not infer its root cause from one counter. |
-| INCONCLUSIVE | Missing source-path access, unsupported/stale counters, absent listener, inadequate timestamp correlation, insufficient samples, no native writes, reset counters, or uncontrolled comparison. Preserve these as gaps. |
+| INCONCLUSIVE | Missing source-path telemetry, unsupported/stale counters, inadequate timestamp correlation, insufficient samples, no native writes, reset counters, or uncontrolled comparison. Preserve these as gaps. |
 
 | Candidate cause | Evidence needed to support attribution | What does not establish it |
 |---|---|---|
@@ -185,6 +175,9 @@ after baseline and binding/agent evidence justify that action. Select **one chan
 at a time** from the table. Record exact before/after settings and all affected
 clients privately. Check compatibility and recovery access **for every change**;
 association alone is insufficient if normal client functions stop working.
+Recheck watchdog state, thresholds, pending recovery, and reboot guards before
+each change. An automatic reconnect/restart/reboot interrupts the comparison;
+record it and restore the baseline rather than attributing its effects to RF tuning.
 
 | Experiment | Hold constant and record | Compatibility and rollback gate |
 |---|---|---|
@@ -207,8 +200,8 @@ Use this bounded sequence for each approved experiment:
 4. Watch for recurrence using existing passive telemetry for a declared 24 hours,
    including the original symptom trigger. Repeat the bounded baseline measurements
    at the end. This is an observation budget, not a measured recurrence period;
-   if the trigger or a suspected longer cycle is absent, record `INCONCLUSIVE` and
-   seek a separately bounded follow-up window before claiming durable recovery.
+   if the trigger or a suspected longer cycle is absent, record `INCONCLUSIVE`
+   and follow the restoration/extension rule below before ending the experiment.
 5. Restore the original baseline before testing a different variable unless the
    operator explicitly accepts the measured candidate as the new baseline. Record
    that decision and a fresh baseline; never attribute a combined sequence to one
@@ -218,7 +211,14 @@ Use this bounded sequence for each approved experiment:
 |---|---|
 | PASS | The targeted measured path meets its predeclared improvement criterion, comparison and all compatibility checks pass, and the covered recurrence window includes the original trigger without recurrence. Limit the claim to those conditions. |
 | FAIL | The candidate fails its criterion, the fault recurs, or any client/control regresses. Roll back and verify restoration. |
-| INCONCLUSIVE | Uncontrolled changes, incomplete client checks, missing measurements, or absent trigger/recurrence coverage prevent attribution. Do not label an immediate improvement a recovery. |
+| INCONCLUSIVE | Uncontrolled changes, interrupted collection, incomplete client checks, missing measurements, or absent trigger/recurrence coverage prevent attribution. Default to verified baseline restoration; do not leave an unqualified change applied. |
+
+After a post-change `INCONCLUSIVE`, restore and verify the baseline before handoff.
+Retention requires explicit operator approval, a named owner, and a finite UTC
+extension deadline with the missing evidence to collect; restore at that deadline
+if qualification is still incomplete. Record exactly what was partially applied,
+restored, or still pending and who owns verification. Unverified restoration is
+a hard stop requiring the approved recovery plan, not a completed rollback.
 
 ## Phase 4: separately approved physical slider qualification
 
@@ -255,7 +255,8 @@ binding change immediately after the trial; never write raw binding blobs.
 
 ## Rollback and sibling-stream boundaries
 
-On an experiment failure, stop measurements and restore the exact pre-change
+On an experiment failure or post-change `INCONCLUSIVE` without an approved finite
+extension, stop measurements and restore the exact pre-change
 placement/settings through the approved infrastructure procedure. Verify all
 affected clients, native controls, management access, and the original measured
 paths. If restoration cannot be verified, stop further experiments and use the
@@ -278,6 +279,9 @@ This runbook specifies no metric endpoint, label surface, or cardinality design.
 Missing hooks remain unmeasured; an absent scheduling metric is not proof of no
 scheduling delay.
 
+Before handoff, record the last rehearsal date, supported tool versions, and the
+receiving operator's acceptance of pending evidence, restoration, and deadlines.
+
 ## Evidence record
 
 ```text
@@ -286,10 +290,11 @@ version / firmware / effective non-secret settings / clocks and uncertainty:
 symptom: actuation / displayed state / both
 affected-control pattern / intended target / native binding verdict:
 agent gate / bus reconnect events / queue wait / RPC duration / late outcome:
+runtime power_save / timestamp and boot / watchdog state, guard and actions:
 baseline UTC start/end / comparison role / workload / declared tolerances:
 signal/rates: source, sample interval, count, age, values, verdict
-gateway TCP: source path, listener validation, interval, times/timeouts, verdict
-broker TCP: source path, listener validation, interval, times/timeouts, verdict
+gateway TCP: existing session/source path, statistic, interval, age, timing or gap, verdict
+broker TCP: existing session timing or gap, interval, age, watchdog log result, verdict
 counters: scope/direction/units/generation, t0/C0, t1/C1, delta, verdict
 counter denominator: matching reads or unavailable; no inferred loss percentage
 MQTT reconnects: observation start/end, events/reasons, verdict
@@ -302,6 +307,9 @@ recurrence window / original trigger coverage / result:
 physical slider trial: not performed / separate approval reference
 gesture / actuation / displayed state / receipt / reflection / confirmation times:
 restored load, binding, infrastructure and logging / verification:
-overall result: PASS / FAIL / INCONCLUSIVE
+partial application/restoration / outstanding items and owner:
+INCONCLUSIVE retention: approval / owner / finite UTC deadline / missing evidence:
+last rehearsal date / supported tool versions / operator handoff acceptance:
+overall control-latency result: INCONCLUSIVE until Phase 4; then PASS / FAIL / INCONCLUSIVE
 claim scope / unmeasured paths / remaining evidence needed:
 ```
