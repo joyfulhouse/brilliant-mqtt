@@ -633,8 +633,11 @@ class Bridge:
 
     def _set_mesh_feedback(self, peripheral_id: str, record: _PendingMeshWrite | None) -> None:
         for task, pid in self._mesh_feedback_tasks.items():
-            if pid == peripheral_id:
-                task.cancel()
+            if pid == peripheral_id and task.cancel():
+                # Bytes may already be retained before local completion/cache commit.
+                # The next publish must repair that uncertain broker state.
+                self._last_state_fields.pop(peripheral_id, None)
+                self._last_state_payload.pop(peripheral_id, None)
         if record is None:
             self._mesh_feedback.pop(peripheral_id, None)
         else:

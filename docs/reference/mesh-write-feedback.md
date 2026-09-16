@@ -70,6 +70,12 @@ It uses the same state topic and expires after 80 seconds without messages.
 Existing primary entities and consumers ignoring the new keys retain their
 prior behavior.
 
+On rollback or downgrade, an older agent does not remove this diagnostic's
+retained discovery configuration, so an orphaned entity can remain. Remove
+it manually using the same convention as a stale peripheral's discovery:
+publish an empty retained payload to
+`homeassistant/sensor/<existing sanitized base>_mesh_write_status/config`.
+
 The status template uses guarded lookups. Old agents with absent fields,
 missing/null/unrecognized status, and malformed pending deadlines render
 literal `unknown`. Pending deadlines must be finite non-boolean numbers and

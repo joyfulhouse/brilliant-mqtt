@@ -19,6 +19,7 @@ from tests.fakes import FakeBus, FakeClock, FakeMqtt, FakeSleeper
 from tests.test_bridge import (
     MESH_PID,
     MESH_SET_TOPIC,
+    MESH_STATE_TOPIC,
     _BlockingStatePublishMqtt,
     _mesh_bridge,
     _mesh_bridge_parts,
@@ -312,6 +313,70 @@ async def test_contradiction_revokes_blocked_publish_with_same_generation() -> N
         _mesh_feedback_payload("ON", "contradicted")
     ]
     await bridge.withdraw()
+
+
+class _DelayedPendingCompletionMqtt(FakeMqtt):
+    """Record pending at the broker, then delay local publish completion."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.delay_pending = False
+        self.pending_recorded = asyncio.Event()
+        self.release_pending = asyncio.Event()
+        self.retained_state: dict[str, object] = {}
+
+    async def publish(self, topic: str, payload: str, retain: bool = False, qos: int = 0) -> None:
+        await super().publish(topic, payload, retain, qos)
+        if topic == MESH_STATE_TOPIC and retain:
+            self.retained_state = json.loads(payload)
+            if self.delay_pending and self.retained_state["mesh_write_status"] == "pending":
+                self.pending_recorded.set()
+                await self.release_pending.wait()
+
+
+@pytest.mark.parametrize("confirm", [True, False], ids=["confirmed", "unconfirmed"])
+async def test_terminal_publish_repairs_cancelled_pending_already_at_broker(confirm: bool) -> None:
+    bus = FakeBus([_mesh_dimmer_at("1")])
+    mqtt = _DelayedPendingCompletionMqtt()
+    bridge, clock, sleeper = _mesh_bridge_parts(bus, mqtt)
+    await bridge.reconcile()
+    expected = _mesh_feedback_payload("ON")
+    if not confirm:
+        # Cache a prior unconfirmed result, identical to the next expiry's fields.
+        await mqtt.inject(MESH_SET_TOPIC, '{"state":"ON"}')
+        clock.advance(80.0)
+        await sleeper.release_all()
+        expected = _mesh_feedback_payload(None, "unconfirmed")
+    assert mqtt.retained_state == expected
+
+    mqtt.delay_pending = True
+    command = asyncio.create_task(mqtt.inject(MESH_SET_TOPIC, '{"state":"ON"}'))
+    observation: asyncio.Task[None] | None = None
+    try:
+        await asyncio.wait_for(mqtt.pending_recorded.wait(), 1)
+        assert mqtt.retained_state == _mesh_feedback_payload(None, "pending", {"on": "1"}, 1080.0)
+        clock.advance(75.0)
+        if confirm:
+            mqtt.pending_recorded.clear()
+            observation = asyncio.create_task(bus.emit(_mesh_dimmer_at("1")))
+            await asyncio.wait_for(mqtt.pending_recorded.wait(), 1)
+        assert bridge._last_state_fields[MESH_PID] == expected
+        published = len(_mesh_states(mqtt))
+        resolver = bridge._mesh_confirm_tasks[MESH_PID]
+        clock.advance(5.0)
+        await sleeper.release_all()
+        await resolver
+        await command
+        if observation is not None:
+            await observation
+
+        # No reconcile or extra observation: the resolver's next publish must repair it.
+        assert mqtt.retained_state == expected
+        assert len(_mesh_states(mqtt)) == published + 1
+        assert all(seconds == 80.0 for seconds in sleeper.requested)
+    finally:
+        await bridge.withdraw()
+        await asyncio.gather(command, *([observation] if observation is not None else []))
 
 
 @pytest.mark.parametrize("late_error", [False, True], ids=["late_receipt", "late_error"])
