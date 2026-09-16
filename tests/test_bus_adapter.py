@@ -32,7 +32,13 @@ from brilliant_mqtt.desired_state import DesiredState
 from brilliant_mqtt.mapping import EntityDescriptor
 from brilliant_mqtt.model import BrilliantDevice, DeviceKind, Variable
 from brilliant_mqtt.mqttio import _InboundMessage, _TopicDispatcher
-from brilliant_mqtt.write_admission import AdmissionTicket, Superseded, WriteClass, WriteResult
+from brilliant_mqtt.write_admission import (
+    AdmissionTicket,
+    Superseded,
+    WriteClass,
+    WriteResult,
+    command_admission,
+)
 from tests.fakes import FakeClock, FakeMqtt, FakeSleeper
 from tests.test_write_admission import _Harness
 
@@ -314,6 +320,97 @@ class _DeviceReadObserver:
 
 
 class TestInteractiveScheduling:
+    @pytest.mark.parametrize("auxiliary", [False, True], ids=["primary", "number-aux"])
+    async def test_rebinding_between_fold_and_adoption_preserves_ticket_epoch(
+        self, auxiliary: bool
+    ) -> None:
+        observer, adapter = _adapter_for(_SchedulingObserver())
+        device = BrilliantDevice(
+            "shared",
+            "slider",
+            "Synthetic light",
+            DeviceKind.LIGHT,
+            variables={
+                "intensity": Variable("intensity", "0"),
+                "max_intensity_value": Variable("max_intensity_value", "255"),
+            },
+        )
+        bridge = Bridge(adapter, FakeMqtt(), "test")
+        bridge._remember_device(device)
+        bridge._register_command_topic(
+            "slider",
+            EntityDescriptor(
+                "number" if auxiliary else "light",
+                "synthetic-control",
+                "Control",
+                "test",
+                "slider",
+                command_var="screen_brightness" if auxiliary else None,
+                value_kind="int" if auxiliary else "bool",
+            ),
+        )
+        topic = "brilliant/test/slider/" + ("set_screen_brightness" if auxiliary else "set")
+        tickets: list[AdmissionTicket] = []
+
+        async def handle(message: _InboundMessage) -> None:
+            admission = command_admission.get()
+            assert admission is not None
+            tickets.append(admission.ticket)
+            await bridge._on_command(message.topic, message.payload)
+
+        dispatcher = _TopicDispatcher(handle)
+
+        async def dispatch(value: int) -> None:
+            await dispatcher.dispatch(
+                _InboundMessage(
+                    topic, str(value) if auxiliary else f'{{"brightness":{value}}}', False, (), ()
+                ),
+                latest_wins=True,
+            )
+
+        blocker = asyncio.create_task(
+            adapter.set_variables("shared", "blocker", [VarSet("on", "1")])
+        )
+        try:
+            await _settle(10)
+            await dispatch(40)
+            await _settle(10)
+            original = adapter._write_admissions[tickets[0]].result
+            await dispatch(80)
+            assert isinstance(original.result(), Superseded)
+            assert len(tickets) == 1
+            assert len(dispatcher._folded) == 1
+            replacement = adapter._write_admissions[tickets[0]].result
+
+            # No yield between the accepted fold and A -> B -> A rebinding:
+            # the worker has not yet re-entered the handler to adopt 80.
+            bridge._remember_device(replace(device, device_id="other-device"))
+            bridge._remember_device(replace(device))
+            await _settle(10)
+            assert tickets == [tickets[0], tickets[0]]
+            await dispatch(120)
+            await _settle(10)
+            observer.release.set()
+            await blocker
+            await dispatcher.shutdown()
+
+            key = "screen_brightness" if auxiliary else "intensity"
+            assert observer.payloads == [
+                ("shared", "blocker", {"on": "1"}),
+                ("shared", "slider", {key: "80"}),
+                ("shared", "slider", {key: "120"}),
+            ]
+            assert isinstance(replacement.result(), str)
+            assert len(tickets) == 3
+            assert tickets[2] is not tickets[0]
+            assert observer.max_in_flight == 1
+            assert not adapter._write_admissions
+        finally:
+            observer.release.set()
+            await dispatcher.shutdown()
+            await adapter.shutdown()
+            await asyncio.gather(blocker, return_exceptions=True)
+
     @pytest.mark.parametrize(
         ("refresh", "auxiliary", "invalidate"),
         [

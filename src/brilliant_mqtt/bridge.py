@@ -70,6 +70,18 @@ _PENDING_RPC_RECEIPT = "<rpc pending after caller deadline>"
 
 
 @dataclass
+class _CommandSupersession:
+    """Keep the original decoder and binding epoch for the ticket's lifetime."""
+
+    generation: int
+    supersede: Callable[[str], bool]
+    enabled: bool = True
+
+    def __call__(self, payload: str) -> bool:
+        return self.enabled and self.supersede(payload)
+
+
+@dataclass
 class _PendingMeshWrite:
     """One in-flight mesh primary write awaiting observation-based confirmation.
 
@@ -785,12 +797,22 @@ class Bridge:
     ) -> WriteResult:
         admission = command_admission.get() if decode is not None else None
         if admission is not None and decode is not None:
+            hook = admission.try_supersede
+            if isinstance(hook, _CommandSupersession):
+                # Adoption still settles the accepted replacement. It cannot
+                # refresh the ticket's binding after a fold/rebinding race.
+                hook.enabled &= hook.generation == self._command_generation.get(peripheral_id)
+            elif hook is None:
 
-            def supersede(payload: str) -> bool:
-                replacement = decode(payload)
-                return bool(replacement) and self._bus.try_supersede(admission.ticket, replacement)
+                def supersede(payload: str) -> bool:
+                    replacement = decode(payload)
+                    return bool(replacement) and self._bus.try_supersede(
+                        admission.ticket, replacement
+                    )
 
-            admission.try_supersede = supersede
+                admission.try_supersede = _CommandSupersession(
+                    self._command_generation[peripheral_id], supersede
+                )
         return await self._bus.set_variables(
             device.device_id,
             peripheral_id,
