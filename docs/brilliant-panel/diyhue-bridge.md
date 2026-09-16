@@ -160,7 +160,9 @@ A firmware OTA wipes **both** `/data` (the CA bundle) and `/etc/systemd/system/`
 - **Proven end-to-end:** panel → diyHue (TLS via our CA) → HA → real bulb, both
   shed and backyard lamps; on/off exact.
 - **Soft spots:** HA→panel *reflection* is poll-bounded: this record reports a
-  diyHue 10 s state poll, not a documented minimum; the panel's own polling cadence
+  diyHue 10 s state poll, not a documented minimum; this is a recorded observation
+  with no documented measurement method. Confirm it against the running deployment
+  before using it as a baseline or comparator. The panel's own polling cadence
   is undocumented. Display latency remains unmeasured, and command latency cannot
   be inferred from these intervals. See the
   [measure-first event-reflection proposal](diyhue-event-reflection-proposal.md)

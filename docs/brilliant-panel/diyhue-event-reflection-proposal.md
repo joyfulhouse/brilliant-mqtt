@@ -25,13 +25,15 @@ they do not establish an upstream implementation owner below the project level.
 
 | Evidence | What it supports | What remains unknown |
 |---|---|---|
-| [docs/brilliant-panel/diyhue-bridge.md:162](diyhue-bridge.md#L162) | The integration record reports a diyHue **10 s state poll**. | This is not a documented minimum or a guarantee for every upstream version/configuration. Confirm the actual deployment before choosing a comparator. |
+| [docs/brilliant-panel/diyhue-bridge.md:162](diyhue-bridge.md#L162) | The diyHue **10 s state poll** is the integration record's own unverified observation, not a measured or guaranteed value; this repository records no measurement method or provenance. | This is not a documented minimum or a guarantee for every upstream version/configuration. Confirm the actual deployment before choosing a comparator. |
 | [docs/brilliant-panel/diyhue-bridge.md:36](diyhue-bridge.md#L36) | The native panel is a Hue API v1 polling client. | Its polling interval, scheduling, and idle/active behavior are undocumented here. Changing diyHue reflection does not change that firmware-owned cadence. |
 | [docs/brilliant-panel/diyhue-bridge.md:97](diyhue-bridge.md#L97) | A missing inclusion tag leaves the light unreachable in the documented integration. | This establishes **missing-tag unreachability only**. It does not establish a translation of HA `unavailable` into Hue `reachable`; that is a design decision proposed below. |
 | [docs/reference/poc-findings.md:238](../reference/poc-findings.md#L238) | A **Brilliant bus** notification stream stopped delivering while its notification-fed mirror became stale. | This is a transferable caution about silent divergence, **not verified evidence of a diyHue or HA WebSocket failure**. It does not establish an upstream failure rate or timing. |
 
-Only the diyHue 10 s state poll is repo-corroborated timing in this reflection
-path. There is no repository-backed claim here about an activity-dependent wait,
+The diyHue 10 s state poll is the only reflection-path timing recorded here. It is
+the integration record's own unverified observation, not a measured or guaranteed
+value; this repository records no measurement method or provenance. There is no
+repository-backed claim here about an activity-dependent wait,
 an idle synchronization period, or immediate command forwarding. Those behaviors
 remain unmeasured and require their own traces. A claim of worthwhile display
 gain is not yet falsifiable without a measured panel-poll term, a baseline, and
