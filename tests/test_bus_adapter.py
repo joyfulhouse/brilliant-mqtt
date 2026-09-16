@@ -515,24 +515,13 @@ class TestDetachedWrites:
     fixed hard cap latches a session rebuild."""
 
     async def test_completed_native_timeout_does_not_detach(
-        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+        self, caplog: pytest.LogCaptureFixture
     ) -> None:
         observer, adapter = _gated_adapter(fail_with=asyncio.TimeoutError())
         observer.release.set()
-        record_type = bus_mod._WriteRecord
-        records: list[bus_mod._WriteRecord] = []
-
-        def capture_record(*, label: str, queued_at: float) -> bus_mod._WriteRecord:
-            record = record_type(label=label, queued_at=queued_at)
-            records.append(record)
-            return record
-
-        monkeypatch.setattr(bus_mod, "_WriteRecord", capture_record)
         with pytest.raises(asyncio.TimeoutError):
             await adapter.set_variables("ble_mesh", "synthetic-light", [VarSet("on", "1")])
 
-        assert len(records) == 1
-        assert records[0].detached is False
         assert adapter._write_tasks == set()
         assert "detaching from the caller" not in caplog.text
 

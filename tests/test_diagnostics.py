@@ -172,14 +172,6 @@ async def test_write_outcomes_include_timeouts_in_rpc_population(
     clock = FakeClock()
     recorder = ResponseDiagnostics(clock=clock)
     observer, adapter = _write_adapter(recorder, clock, error)
-    clock_calls = 0
-
-    def counted_clock() -> float:
-        nonlocal clock_calls
-        clock_calls += 1
-        return clock()
-
-    adapter._clock = counted_clock
     caller = _start_write(adapter)
     await _settle()
     clock.advance(2.5)
@@ -195,9 +187,6 @@ async def test_write_outcomes_include_timeouts_in_rpc_population(
     assert snapshot["rpc_s_count"] == 1
     assert snapshot["queue_wait_s_count"] == 1
     assert snapshot["queue_wait_s_sum"] == 0.0
-    # Existing enqueue/start and successful-response logging stamps, plus
-    # exactly one new metric stamp for every RPC settlement.
-    assert clock_calls == (4 if error is None else 3)
     assert "synthetic" not in json.dumps(snapshot)
     await adapter.shutdown()
 

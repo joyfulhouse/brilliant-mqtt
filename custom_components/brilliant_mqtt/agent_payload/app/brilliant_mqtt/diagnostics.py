@@ -39,7 +39,6 @@ class ResponseDiagnostics:
     def __init__(self, *, clock: Callable[[], float] = time.monotonic) -> None:
         self._clock = clock
         self._started_at = clock()
-        self._write_total = 0
         self._outcomes: dict[WriteOutcome, int] = {
             "ok": 0,
             "error": 0,
@@ -75,7 +74,6 @@ class ResponseDiagnostics:
     ) -> None:
         """Count one outcome; absent measurements never enter timing populations."""
         self._outcomes[outcome] += 1
-        self._write_total += 1
         if queue_wait_s is not None:
             self._queue_wait_s_sum += queue_wait_s
             self._queue_wait_s_count += 1
@@ -102,7 +100,7 @@ class ResponseDiagnostics:
         return {
             "v": 1,
             "uptime_s": self._clock() - self._started_at,
-            "write_total": self._write_total,
+            "write_total": sum(self._outcomes.values()),
             **{f"write_{outcome}": count for outcome, count in self._outcomes.items()},
             "write_hard_cap_total": self._hard_cap_total,
             "superseded_before_dispatch": self._superseded,
