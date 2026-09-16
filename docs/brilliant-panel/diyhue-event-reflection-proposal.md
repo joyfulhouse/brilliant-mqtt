@@ -45,7 +45,7 @@ contains authenticated HA event subscription, and
 contains registry/state reads. This is **live, mypy-covered source code**, not dead
 or retired code: the package remains in the wheel
 ([pyproject.toml:74](../../pyproject.toml#L74)) and under the strict `src` mypy gate
-([pyproject.toml:43](../../pyproject.toml#L43)); the narrow framework exception
+([pyproject.toml:44](../../pyproject.toml#L44)); the narrow framework exception
 names the hosting adapter, not the HA client
 ([pyproject.toml:59](../../pyproject.toml#L59)).
 
