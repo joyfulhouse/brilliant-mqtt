@@ -22,10 +22,12 @@ import time
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+from functools import partial
 from types import MappingProxyType
 from typing import Any, NamedTuple
 
 from brilliant_mqtt.commands import VarSet
+from brilliant_mqtt.diagnostics import ResponseDiagnostics, WriteOutcome
 from brilliant_mqtt.model import BrilliantDevice, Variable, kind_for_peripheral_type
 
 logger = logging.getLogger(__name__)
@@ -106,6 +108,7 @@ class _WriteRecord:
     queued_at: float
     started_at: float | None = None
     detached: bool = False
+    settled: bool = False
 
 
 def _session_client_name(base: str) -> str:
@@ -421,7 +424,9 @@ class RpcBusAdapter:
         my_name: str = "brilliant_mqtt",
         extra_device_ids: tuple[str, ...] = (),
         clock: Callable[[], float] = time.monotonic,
+        diagnostics: ResponseDiagnostics | None = None,
     ) -> None:
+        self._diagnostics = diagnostics
         # A UNIQUE name per session (see _session_client_name): the bus peer key
         # is <owning_device_id>.<my_name>, so a constant name lets a half-bound
         # ghost registration lock the bridge out forever with NameInUseError.
@@ -839,6 +844,10 @@ class RpcBusAdapter:
     def _note_reconnect(self) -> None:
         """Record that the processor reconnected (reconnect-rate clock)."""
         self._reconnect_times.append(self._clock())
+        # The library hook marshals onto the loop; the admission fence in
+        # _on_proc_reconnect has already passed, before asynchronous fan-out.
+        if self._diagnostics is not None:
+            self._diagnostics.note_bus_reconnect()
 
     def recent_reconnects(self, window_s: float) -> int:
         """Count processor reconnects within the last *window_s* seconds.
@@ -1010,7 +1019,7 @@ class RpcBusAdapter:
         )
         task.set_name(record.label)
         self._write_tasks.add(task)
-        task.add_done_callback(self._settle_write)
+        task.add_done_callback(partial(self._settle_write, record=record))
         # Wake on lock acquisition OR on the task settling first (a task
         # cancelled before its first step never runs _run_write at all).
         waiters: list[asyncio.Future[Any]] = [acquired, task]
@@ -1042,37 +1051,65 @@ class RpcBusAdapter:
     ) -> str:
         """The write task: hold the device lock for the RPC's whole lifetime."""
         lock = self._write_locks.setdefault(device_id, asyncio.Lock())
-        async with lock:
-            record.started_at = self._clock()
-            if not acquired.done():
-                acquired.set_result(None)
-            logger.debug(
-                "set_variables(%s) acquired device lock after %.3fs queue wait",
-                record.label,
-                self._queue_wait(record),
-            )
-            cap = asyncio.get_running_loop().call_later(_WRITE_HARD_CAP_S, self._cap_write, record)
-            try:
-                response = await obs.request_set_variables_in_peripheral(
-                    peripheral_id,
-                    values,
-                    device_id=device_id,
+        outcome: WriteOutcome = "cancelled"
+        queue_wait_s: float | None = None
+        rpc_s: float | None = None
+        try:
+            async with lock:
+                record.started_at = self._clock()
+                if not acquired.done():
+                    acquired.set_result(None)
+                logger.debug(
+                    "set_variables(%s) acquired device lock after %.3fs queue wait",
+                    record.label,
+                    self._queue_wait(record),
                 )
-            except asyncio.CancelledError:
-                logger.info("set_variables(%s) cancelled at session teardown", record.label)
-                raise
-            except Exception:
-                if record.detached:
-                    logger.warning(
-                        "detached set_variables(%s) failed after %.1fs (queue wait %.3fs)",
-                        record.label,
-                        self._rpc_elapsed(record),
-                        self._queue_wait(record),
-                        exc_info=True,
+                cap = asyncio.get_running_loop().call_later(
+                    _WRITE_HARD_CAP_S, self._cap_write, record
+                )
+                try:
+                    response = await obs.request_set_variables_in_peripheral(
+                        peripheral_id,
+                        values,
+                        device_id=device_id,
                     )
-                raise
-            finally:
-                cap.cancel()
+                except asyncio.CancelledError:
+                    logger.info("set_variables(%s) cancelled at session teardown", record.label)
+                    raise
+                except Exception:
+                    if record.detached:
+                        logger.warning(
+                            "detached set_variables(%s) failed after %.1fs (queue wait %.3fs)",
+                            record.label,
+                            self._rpc_elapsed(record),
+                            self._queue_wait(record),
+                            exc_info=True,
+                        )
+                    raise
+                finally:
+                    cap.cancel()
+                    if self._diagnostics is not None:
+                        # One additional stamp at RPC settlement for ALL outcomes,
+                        # including timeouts. Queue wait uses the existing stamps.
+                        settled_at = self._clock()
+                        rpc_s = settled_at - record.started_at
+                        queue_wait_s = record.started_at - record.queued_at
+        except Exception as error:
+            # These timeout classes are unrelated on the panel's Python 3.10;
+            # subclasses remain ordinary errors, per the exact-type taxonomy.
+            if type(error) is TimeoutError:
+                outcome = "timeout_bus"
+            elif type(error) is asyncio.TimeoutError:
+                outcome = "timeout_async"
+            else:
+                outcome = "detached_late_error" if record.detached else "error"
+            raise
+        else:
+            outcome = "detached_late_ok" if record.detached else "ok"
+        finally:
+            record.settled = True
+            if self._diagnostics is not None:
+                self._diagnostics.note_write_settled(outcome, queue_wait_s, rpc_s)
         receipt = _normalize_receipt(response)
         if record.detached:
             logger.warning(
@@ -1101,14 +1138,21 @@ class RpcBusAdapter:
             _WRITE_HARD_CAP_S,
         )
         self._write_timed_out = True
+        if self._diagnostics is not None:
+            self._diagnostics.note_hard_cap()
 
-    def _settle_write(self, task: asyncio.Task[str]) -> None:
+    def _settle_write(self, task: asyncio.Task[str], *, record: _WriteRecord) -> None:
         """Done-callback: drop the strong ref and mark any exception retrieved.
 
         A detached caller never awaits its task, so without this asyncio would
         log "Task exception was never retrieved" at garbage collection.
         """
         self._write_tasks.discard(task)
+        # Only cancellation before the coroutine's first step skips its finally.
+        # Started tasks (including lock waiters) count there; these sites cannot
+        # count the same write twice. Neither duration was measured in this case.
+        if task.cancelled() and not record.settled and self._diagnostics is not None:
+            self._diagnostics.note_write_settled("cancelled", None, None)
         if not task.cancelled():
             task.exception()
 
