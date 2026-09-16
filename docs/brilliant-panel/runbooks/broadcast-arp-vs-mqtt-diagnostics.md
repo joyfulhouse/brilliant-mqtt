@@ -38,11 +38,15 @@ are separately cited. Record actual elapsed time and incomplete coverage.
 recovery ladder can reconnect Wi-Fi, restart `connman`/`wpa_supplicant`, or
 **REBOOT the panel** ([docs/CONFIGURATION.md:132](../../CONFIGURATION.md#L132)).
 An RF experiment can trip that ladder, invalidate the measurement, and power-cycle
-a production in-wall panel. First read its enabled/running state, effective
-thresholds, pending recovery and reboot-guard state; record the operator's plan
-for that risk and physical recovery. If these cannot be established, stop before
-intervention. Do not enable, disable, restart, or invoke the watchdog to collect
-evidence; any change to its operation needs separate approval and restoration.
+a production in-wall panel. The watchdog is optional and separately installed
+([docs/CONFIGURATION.md:132](../../CONFIGURATION.md#L132)). Confirmed absent or
+disabled with no running watchdog counts as **accounted for**: its ladder cannot
+fire, and watchdog logs/guard data are not required. Unknown presence or state is
+`INCONCLUSIVE` and remains a hard stop on RF-affecting changes. For an active
+watchdog, read its effective thresholds, pending recovery and reboot-guard state;
+record the operator's plan for that risk and physical recovery. If these cannot
+be established, stop before intervention. Do not enable, disable, restart, or
+invoke the watchdog to collect evidence; any change needs separate approval and restoration.
 
 ## Keep the evidence paths separate
 
@@ -68,18 +72,16 @@ credential-injected Hue control as proof of discovery delivery.
 ## Phase 1: eliminate agent-side explanations first
 
 This is a **read-only first gate over shipped surfaces**, before any new procedure.
-Use the existing HA-side `wifi_link` and `wifi_power_save` probes
+Read the outputs of `iw dev wlan0 link` and `iw dev wlan0 get power_save` through
+the same already-approved read-only operator access used for journal reads and
+captures. The in-repo sources of these exact command strings are
 ([custom_components/brilliant_mqtt/panel_ops.py:1914](../../../custom_components/brilliant_mqtt/panel_ops.py#L1914),
-[custom_components/brilliant_mqtt/panel_ops.py:1915](../../../custom_components/brilliant_mqtt/panel_ops.py#L1915))
-through independently approved read-only access. Their parsed summaries expose
-link state/signal and `power_save`
-([custom_components/brilliant_mqtt/panel_ops.py:2030](../../../custom_components/brilliant_mqtt/panel_ops.py#L2030),
-[custom_components/brilliant_mqtt/panel_ops.py:2046](../../../custom_components/brilliant_mqtt/panel_ops.py#L2046)).
+[custom_components/brilliant_mqtt/panel_ops.py:1915](../../../custom_components/brilliant_mqtt/panel_ops.py#L1915)).
 Require a timestamped runtime read from the current boot: a stale saved summary
 does not establish current power-save state. **Do not invoke HA's Reboot action
 to obtain diagnostics**: that action captures them and then reboots
 ([custom_components/brilliant_mqtt/manager.py:1536](../../../custom_components/brilliant_mqtt/manager.py#L1536)).
-If no independent read-only route is available, record `INCONCLUSIVE` and stop.
+If that read-only access is unavailable, record `INCONCLUSIVE` and stop.
 
 `power_save=on` is an **agent-side FAIL** with a documented cause: the service
 unit identifies power-save dropping inbound packets as a cause of MQTT keepalive
@@ -89,9 +91,9 @@ Its disable command is strictly best-effort, including the `-` prefix
 runtime state **must be read, never assumed** from an active service or unit text.
 Route remediation separately; do not alter power-save during this baseline.
 
-Read existing watchdog/agent telemetry for a 20-minute lookback ending at the
-incident, then observe for 5 minutes without issuing test commands. Use the
-watchdog's existing log and persistent reboot-guard record
+Read existing agent telemetry for a 20-minute lookback ending at the incident,
+then observe for 5 minutes without issuing test commands. For an active watchdog,
+also use its existing log and persistent reboot-guard record
 ([docs/CONFIGURATION.md:153](../../CONFIGURATION.md#L153)), not new ICMP or TCP
 probes. Its broker TCP-open result is already logged as
 `gateway=%s up=%s broker=%s`
@@ -99,7 +101,7 @@ probes. Its broker TCP-open result is already logged as
 it is informational and does not drive recovery
 ([docs/CONFIGURATION.md:156](../../CONFIGURATION.md#L156)). `INCONCLUSIVE` probe
 results are not proof that the broker is down
-([src/brilliant_wifi_watchdog/probe.py:213](../../../src/brilliant_wifi_watchdog/probe.py#L213)).
+([src/brilliant_wifi_watchdog/probe.py:215](../../../src/brilliant_wifi_watchdog/probe.py#L215)).
 Record any recovery actions; an action during collection invalidates causal
 comparison. Do not start an absent watchdog merely to obtain its log.
 
@@ -132,6 +134,7 @@ which the supervisor consumes on its next tick
 [src/brilliant_mqtt/bus.py:979](../../../src/brilliant_mqtt/bus.py#L979),
 [src/brilliant_mqtt/__main__.py:323](../../../src/brilliant_mqtt/__main__.py#L323)).
 Do not retry a load command just because its caller detached.
+The detached completion format is `detached set_variables(%s) completed after %.1fs (queue wait %.3fs); receipt: %s`, logged at WARNING and visible at the default INFO level ([src/brilliant_mqtt/bus.py:1076](../../../src/brilliant_mqtt/bus.py#L1076)).
 
 The fixed **80 s mesh confirmation wait is expected policy, not a fault**. It
 outlasts the measured false-ack/revert tail, runs in a background task off the
@@ -155,7 +158,7 @@ detection and its successful deployment does not qualify Wi-Fi health
 |---|---|
 | PASS | Runtime power-save is off, watchdog state/risk is accounted for, the symptom window is covered, and neither a stream fault nor queue/RPC timing explains the symptom. This only permits the network investigation. |
 | FAIL | Runtime `power_save=on`, or a correlated stale-stream, reconnect storm, read fault, or measured queue/RPC delay supplies an agent/native-path explanation. Stop network attribution and route that evidence to its owner. |
-| INCONCLUSIVE | Runtime power-save, watchdog state, logs, timing, effective settings, or incident coverage are missing, or a watchdog action interrupted collection. Preserve the gap; do not claim the agent is eliminated. |
+| INCONCLUSIVE | Runtime power-save, watchdog presence/state, required active-watchdog or agent evidence, timing, effective settings, or incident coverage are unknown, or a watchdog action interrupted collection. Confirmed absence/disablement alone is not a gap. Preserve missing evidence; do not claim the agent is eliminated. |
 
 ## Phase 2: qualify the established session
 
@@ -163,17 +166,25 @@ During a 5-minute window, use existing broker/session telemetry and normal traff
 to timestamp successful exchanges for the suspect and comparison device. Record
 session continuity, most recent keepalive or application exchange, and reconnect
 events. Do not reconnect the panel or send a load command to prove connectivity.
-Continue this passive session observation through the following bounded captures.
+**Admission** to Phase 3 requires Phase 1 `PASS` and observed successful exchanges
+for both devices during this initial window; it does not require a final Phase 2
+verdict yet. Continue passive session telemetry **throughout the capture and ARP
+test**, then finalize Phase 2 from the full window. If either session's continuity
+fails or becomes unobservable at any point, the comparison is **INVALIDATED**:
+record the broadcast/ARP comparison as `INCONCLUSIVE`, not a `FAIL` of the
+broadcast hypothesis, and investigate the session or evidence gap separately.
 
-| Verdict | Established-session gate |
+| Verdict | Final established-session gate, after capture/ARP |
 |---|---|
 | PASS | Both devices have contemporaneous successful exchanges in their established sessions, including during the subsequent delivery/ARP test. |
-| FAIL | The suspect's established session demonstrably stops exchanging traffic or reconnects during the test; the working-session premise is false for that window. Investigate unicast/session health separately. |
+| FAIL | Either established session demonstrably stops exchanging traffic or reconnects during the test; the working-session premise is false for that window. Investigate unicast/session health separately. |
 | INCONCLUSIVE | Only retained `online`, an ICMP result, an uncorrelated TCP connection, or incomplete broker evidence is available. Do not call the session currently healthy. |
 
 ## Phase 3: bounded inbound broadcast/multicast capture
 
-Exhaust Phase 1's read-only STA/link, `power_save`, and watchdog/agent evidence and pass Phases 1-2 before this more invasive on-panel capture.
+Start this more invasive on-panel capture only after Phase 1 `PASS` and Phase 2
+**admission** based on the initial session-observation window; the final Phase 2
+verdict follows the capture/ARP test.
 
 1. Predeclare the broadcast class and multicast group/protocol to observe, the
    expected sender, and why **both** receivers should receive it. Verify relevant

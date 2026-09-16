@@ -119,7 +119,7 @@ measurement. If existing passive telemetry for that path is absent, record
 `INCONCLUSIVE` rather than copying a laptop's result into the panel row. Keep
 RTT, connect time, and application response time distinct; never substitute one
 for another. Watchdog `INCONCLUSIVE` is not proof of broker failure
-([src/brilliant_wifi_watchdog/probe.py:213](../../../src/brilliant_wifi_watchdog/probe.py#L213)).
+([src/brilliant_wifi_watchdog/probe.py:215](../../../src/brilliant_wifi_watchdog/probe.py#L215)).
 No new TCP/ICMP probes, application payload capture, or MQTT commands are authorized
 by this baseline.
 

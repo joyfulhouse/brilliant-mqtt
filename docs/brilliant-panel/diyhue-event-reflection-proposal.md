@@ -275,16 +275,19 @@ in shadow/replay, including that ordering and delayed, missing, or reordered eve
   revision/cut**. The cut must cover inventory and registry changes as well as
   values; local epochs, equal receipt times, or equal values do not prove it.
   Record the source-supported revision or replay barrier that establishes the
-  cut. This proposal does not assume HA supplies such a revision; if the running
-  source cannot establish one, runtime parity remains `INCONCLUSIVE`.
+  cut. HA may not supply a source revision at all; if the running source cannot
+  establish the cut, runtime parity is `INCONCLUSIVE`, never `PASS`.
 - Compare the included object set, existence/tombstones, HA-to-Hue mappings,
   capabilities, `reachable`, and applicable v1 state fields `on`, `bri`, `hue`,
   `sat`, `ct`, `xy`, and `colormode`, using the same deterministic translation
   and canonical representation on both sides. Require exact parity, including
   field presence; exclude transport timestamps and local generation counters.
-- Allow a **5 s transition window**, a proposed qualification budget with
-  **unmeasured deployment suitability**, starting at the first candidate for a
-  cut. Do not reset the deadline on further arrivals. Unequal/unproven cuts during
+- Declare the transition window **after measuring `D`** and bounding worst-case
+  event skew for the qualified conditions; it must be at least
+  `max(measured D, worst-case event skew)`, with scheduling/read margin included.
+  These bounds remain unmeasured here; without them, qualification is
+  `INCONCLUSIVE`. Start the window at the first candidate for a cut.
+  Do not reset the deadline on further arrivals. Unequal/unproven cuts during
   that window are pending alignment, not divergence. Compare settled candidates
   once both have consumed the cut; a same-cut mismatch persisting at the deadline
   is divergence and aborts. If a cut cannot be established or completed by the
