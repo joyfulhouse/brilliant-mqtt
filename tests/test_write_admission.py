@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 
 import pytest
@@ -445,6 +446,35 @@ async def test_repeated_supersession_settles_each_predecessor_exactly_once(
         ("ble_mesh", "light", {"intensity": "30"}),
     ]
     assert not harness.adapter.try_supersede(ticket, [VarSet("intensity", "40")])
+
+
+async def test_supersession_logs_label_and_keys_without_values(
+    harness: _Harness, caplog: pytest.LogCaptureFixture
+) -> None:
+    await harness.queue("blocker", {"on": "1"})
+    ticket = AdmissionTicket()
+    original = await harness.queue(
+        "light", {"on": "before-value"}, write_class=WriteClass.INTERACTIVE_LATEST, ticket=ticket
+    )
+    with caplog.at_level(logging.DEBUG, logger="brilliant_mqtt.bus"):
+        assert harness.adapter.try_supersede(
+            ticket, [VarSet("on", "after-value"), VarSet("intensity", "80")]
+        )
+        assert not harness.adapter.try_supersede(ticket, [VarSet("on", "rejected-value")])
+    messages = [record.getMessage() for record in caplog.records if "superseded" in record.message]
+    assert messages == [
+        "set_variables(ble_mesh/light) superseded before issue; "
+        "old keys=['on']; new keys=['intensity', 'on']"
+    ]
+    assert all(value not in messages[0] for value in ("before-value", "after-value", "80"))
+    assert isinstance(await original, Superseded)
+    await harness.queue(
+        "light",
+        {"on": "after-value", "intensity": "80"},
+        write_class=WriteClass.INTERACTIVE_LATEST,
+        ticket=ticket,
+    )
+    await harness.drain()
 
 
 async def test_superseded_caller_cancellation_cannot_cancel_replacement(harness: _Harness) -> None:

@@ -27,7 +27,13 @@ from typing import Any, NamedTuple
 
 from brilliant_mqtt.commands import VarSet
 from brilliant_mqtt.model import BrilliantDevice, Variable, kind_for_peripheral_type
-from brilliant_mqtt.write_admission import AdmissionTicket, Superseded, WriteClass, WriteResult
+from brilliant_mqtt.write_admission import (
+    AdmissionTicket,
+    Superseded,
+    WriteCancelled,
+    WriteClass,
+    WriteResult,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1023,6 +1029,12 @@ class RpcBusAdapter:
         if any(item.peripheral_id == admission.peripheral_id for item in after):
             return False
         predecessor, previous_acquired = admission.result, admission.acquired
+        logger.debug(
+            "set_variables(%s) superseded before issue; old keys=%s; new keys=%s",
+            admission.record.label,
+            sorted(admission.values),
+            sorted(values),
+        )
         admission.values = values
         admission.result = asyncio.get_running_loop().create_future()
         admission.acquired = asyncio.get_running_loop().create_future()
@@ -1125,7 +1137,13 @@ class RpcBusAdapter:
             # Await directly so Task.cancel() synchronously tombstones this
             # future, even before the caller gets its next event-loop turn.
             await acquired
-            return await asyncio.wait_for(asyncio.shield(result), timeout=_WRITE_DEADLINE_S)
+            # Python 3.10 wait_for can swallow caller cancellation when its
+            # future finishes concurrently. wait preserves that cancellation
+            # without cancelling the independently owned admission result.
+            done, _ = await asyncio.wait({result}, timeout=_WRITE_DEADLINE_S)
+            if not done:
+                raise asyncio.TimeoutError
+            return result.result()
         except asyncio.CancelledError:
             if result is not admission.result:
                 # Cancellation of an already superseded caller cannot revoke
@@ -1160,7 +1178,8 @@ class RpcBusAdapter:
             admission.acquired.set_result(None)
         if not admission.result.done():
             if task.cancelled():
-                admission.result.cancel()
+                admission.result.set_exception(WriteCancelled())
+                admission.result.exception()
             elif (error := task.exception()) is not None:
                 admission.result.set_exception(error)
                 # A detached/cancelled caller may never retrieve this future.
@@ -1278,7 +1297,8 @@ class RpcBusAdapter:
         for admission in list(self._write_admissions.values()):
             admission.ticket._cancel_waiting = None
             if not admission.result.done():
-                admission.result.cancel()
+                admission.result.set_exception(WriteCancelled())
+                admission.result.exception()
             if not admission.acquired.done():
                 admission.acquired.set_result(None)
         self._write_admissions.clear()

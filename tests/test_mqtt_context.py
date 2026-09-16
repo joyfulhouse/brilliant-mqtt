@@ -20,6 +20,7 @@ from brilliant_mqtt.mapping import EntityDescriptor
 from brilliant_mqtt.model import BrilliantDevice, DeviceKind, Variable
 from brilliant_mqtt.mqttio import AioMqttAdapter
 from tests.fakes import FakeBus, FakeClock, FakeMqtt, FakeSleeper
+from tests.test_write_admission import _Harness, _settle
 
 
 @dataclass
@@ -455,6 +456,82 @@ async def test_invalid_number_during_admission_does_not_stop_reader() -> None:
         observer.release.set()
         await bus.shutdown()
         await asyncio.gather(reader, blocker, return_exceptions=True)
+
+
+@pytest.mark.parametrize("abort", ["session", "ticket", "teardown"])
+async def test_adapter_aborted_write_preserves_lane_and_worker_cancellation(abort: str) -> None:
+    harness = _Harness()
+    bus = harness.adapter
+    bridge = Bridge(bus, FakeMqtt(), "test")
+    topic = "brilliant/test/slider/set"
+    bridge._devices["slider"] = BrilliantDevice(
+        "shared",
+        "slider",
+        "Synthetic light",
+        DeviceKind.LIGHT,
+        variables={
+            "intensity": Variable("intensity", "0"),
+            "max_intensity_value": Variable("max_intensity_value", "255"),
+        },
+    )
+    bridge._by_cmd_topic[topic] = ("slider", None)
+    mqtt = object.__new__(AioMqttAdapter)
+    mqtt._redacted_logging = False
+    dispatcher = mqttio._TopicDispatcher(mqtt._dispatch_inbound)
+
+    async def dispatch(value: int) -> None:
+        await dispatcher.dispatch(
+            mqttio._InboundMessage(
+                topic, f'{{"brightness":{value}}}', False, (bridge._on_command,), ()
+            ),
+            latest_wins=True,
+        )
+        await _settle()
+
+    try:
+        await harness.queue("blocker", {"on": "1"}, device="shared")
+        await dispatch(40)
+        worker = next(iter(dispatcher._workers.values()))
+        if abort == "session":
+            bus._session += 1
+        elif abort == "ticket":
+            next(iter(dispatcher._active.values()))[1].ticket.cancel_waiting()
+        else:
+            await bus._settle_writes()
+        await harness.release(0)
+        assert not worker.done()
+        assert harness.observer.calls == [("shared", "blocker", {"on": "1"})]
+
+        await dispatch(80)
+        assert next(iter(dispatcher._workers.values())) is worker
+        assert harness.observer.calls[-1] == ("shared", "slider", {"intensity": "80"})
+        await harness.release(1)
+        assert not worker.done()
+        assert next(iter(dispatcher._queues.values())).unfinished_tasks == 0
+
+        # Race a completed write-abort signal against actual worker cancellation.
+        # Python 3.10 wait_for can otherwise replace the latter with the former.
+        await dispatch(120)
+        native = next(task for task in bus._write_tasks if task.get_name() == "shared/slider")
+
+        def cancel_worker(_done: asyncio.Task[str]) -> None:
+            asyncio.get_running_loop().call_soon(worker.cancel)
+
+        native.add_done_callback(cancel_worker)
+        native.cancel()
+        await _settle()
+        assert worker.cancelled()
+        assert not bus._write_tasks
+    finally:
+        harness.observer.release_all = True
+        for gate in harness.observer.gates:
+            gate.set()
+        for lane_worker in dispatcher._workers.values():
+            lane_worker.cancel()
+        await asyncio.gather(*dispatcher._workers.values(), return_exceptions=True)
+        await dispatcher.shutdown()
+        await bus.shutdown()
+        await asyncio.gather(*harness.callers, return_exceptions=True)
 
 
 async def test_scene_topic_burst_is_never_dropped() -> None:

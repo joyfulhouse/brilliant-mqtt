@@ -25,7 +25,7 @@ from brilliant_mqtt.config import Settings
 from brilliant_mqtt.discovery import availability_topic
 from brilliant_mqtt.mapping import AUX_SPECS
 from brilliant_mqtt.protocols import CommandSubscribeError
-from brilliant_mqtt.write_admission import CommandAdmission, command_admission
+from brilliant_mqtt.write_admission import CommandAdmission, WriteCancelled, command_admission
 
 logger = logging.getLogger(__name__)
 
@@ -254,6 +254,10 @@ class _TopicDispatcher:
                     if replacement is None:
                         break
                     message = replacement
+            except WriteCancelled:
+                # A bus admission can end independently of this worker. Actual
+                # Task.cancel() still propagates as ordinary CancelledError.
+                logger.debug("MQTT command write cancelled; continuing lane")
             finally:
                 # A folded replacement can still belong to the lane before
                 # its callback adopts it. Do not orphan it on cancellation.

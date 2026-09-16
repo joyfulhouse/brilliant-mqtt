@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -20,6 +21,10 @@ class Superseded:
 
 
 WriteResult = str | Superseded
+
+
+class WriteCancelled(asyncio.CancelledError):
+    """The adapter aborted this write; it did not cancel the caller's task."""
 
 
 @dataclass(eq=False)
