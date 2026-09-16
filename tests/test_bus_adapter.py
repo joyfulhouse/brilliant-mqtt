@@ -18,15 +18,22 @@ import asyncio
 import logging
 import sys
 import types
+from pathlib import Path
 from typing import Any, TypeVar
 
 import pytest
 
 from brilliant_mqtt import bus as bus_mod
+from brilliant_mqtt.bridge import Bridge
 from brilliant_mqtt.bus import RpcBusAdapter, _session_client_name
 from brilliant_mqtt.commands import VarSet
-from brilliant_mqtt.model import BrilliantDevice
-from tests.fakes import FakeClock
+from brilliant_mqtt.desired_state import DesiredState
+from brilliant_mqtt.mapping import EntityDescriptor
+from brilliant_mqtt.model import BrilliantDevice, DeviceKind, Variable
+from brilliant_mqtt.mqttio import _InboundMessage, _TopicDispatcher
+from brilliant_mqtt.write_admission import AdmissionTicket, Superseded, WriteClass, WriteResult
+from tests.fakes import FakeClock, FakeMqtt, FakeSleeper
+from tests.test_write_admission import _Harness
 
 
 class TestSessionClientName:
@@ -305,6 +312,349 @@ class _DeviceReadObserver:
         return _RawDevice(device_id, {f"{device_id}-peripheral": _RawPeripheral()})
 
 
+class TestInteractiveScheduling:
+    @pytest.mark.parametrize("auxiliary", [False, True])
+    async def test_withdrawn_route_rejects_active_replacement(self, auxiliary: bool) -> None:
+        observer, adapter = _adapter_for(_SchedulingObserver())
+        device = BrilliantDevice(
+            device_id="shared",
+            peripheral_id="slider",
+            name="Synthetic light",
+            kind=DeviceKind.LIGHT,
+            variables={
+                "intensity": Variable("intensity", "0"),
+                "max_intensity_value": Variable("max_intensity_value", "255"),
+            },
+        )
+        bridge = Bridge(adapter, FakeMqtt(), "test")
+        topic = "brilliant/test/slider/" + ("set_screen_brightness" if auxiliary else "set")
+        descriptor = (
+            EntityDescriptor(
+                "number",
+                "synthetic-number",
+                "Number",
+                "test",
+                "slider",
+                command_var="screen_brightness",
+                value_kind="int",
+            )
+            if auxiliary
+            else None
+        )
+        bridge._devices["slider"] = device
+        bridge._by_cmd_topic[topic] = ("slider", descriptor)
+
+        async def handle(message: _InboundMessage) -> None:
+            await bridge._on_command(message.topic, message.payload)
+
+        dispatcher = _TopicDispatcher(handle)
+        blocker = asyncio.create_task(
+            adapter.set_variables("shared", "blocker", [VarSet("on", "1")])
+        )
+        try:
+            await _settle(10)
+            for value in (20, 40):
+                await dispatcher.dispatch(
+                    _InboundMessage(
+                        topic,
+                        str(value) if auxiliary else f'{{"brightness":{value}}}',
+                        False,
+                        (),
+                        (),
+                    ),
+                    latest_wins=True,
+                )
+                await _settle(10)
+            await bridge.withdraw()
+            await dispatcher.dispatch(
+                _InboundMessage(topic, "80" if auxiliary else '{"brightness":80}', False, (), ()),
+                latest_wins=True,
+            )
+            observer.release.set()
+            await blocker
+            await dispatcher.shutdown()
+            assert observer.payloads == [
+                ("shared", "blocker", {"on": "1"}),
+                ("shared", "slider", {"screen_brightness" if auxiliary else "intensity": "40"}),
+            ]
+            assert not adapter._write_admissions
+        finally:
+            observer.release.set()
+            await dispatcher.shutdown()
+            await adapter.shutdown()
+            await asyncio.gather(blocker, return_exceptions=True)
+
+    @pytest.mark.parametrize("issued", [False, True])
+    async def test_cancelled_lane_revokes_folded_waiter_but_retains_issued_rpc(
+        self, issued: bool
+    ) -> None:
+        harness = _Harness()
+        device = BrilliantDevice(
+            device_id="ble_mesh",
+            peripheral_id="slider",
+            name="Synthetic light",
+            kind=DeviceKind.LIGHT,
+            variables={
+                "intensity": Variable("intensity", "0"),
+                "max_intensity_value": Variable("max_intensity_value", "255"),
+            },
+        )
+        bridge = Bridge(harness.adapter, FakeMqtt(), "test", sleep=FakeSleeper())
+        topic = "brilliant/test/slider/set"
+        bridge._devices["slider"] = device
+        bridge._by_cmd_topic[topic] = ("slider", None)
+
+        async def handle(message: _InboundMessage) -> None:
+            await bridge._on_command(message.topic, message.payload)
+
+        dispatcher = _TopicDispatcher(handle)
+        try:
+            await harness.queue("blocker", {"on": "1"})
+            await dispatcher.dispatch(
+                _InboundMessage(topic, '{"brightness":20}', False, (), ()), latest_wins=True
+            )
+            await _settle(10)
+            await dispatcher.dispatch(
+                _InboundMessage(topic, '{"brightness":80}', False, (), ()), latest_wins=True
+            )
+            if issued:
+                await harness.release(0)
+                assert harness.observer.calls[-1] == ("ble_mesh", "slider", {"intensity": "80"})
+            worker = next(iter(dispatcher._workers.values()))
+            worker.cancel()
+            await asyncio.gather(worker, return_exceptions=True)
+            if issued:
+                await harness.queue("successor", {"on": "1"})
+                assert len(harness.observer.calls) == 2
+                assert harness.observer.in_flight["ble_mesh"] == 1
+                assert harness.observer.cancelled == 0
+                await harness.release(1)
+            else:
+                await harness.release(0)
+                assert harness.observer.calls == [("ble_mesh", "blocker", {"on": "1"})]
+            await harness.drain()
+            assert harness.observer.max_in_flight == {"ble_mesh": 1}
+            assert not harness.adapter._write_admissions
+            assert not bridge._pending_mesh
+        finally:
+            await harness.drain()
+            await dispatcher.shutdown()
+            await harness.adapter.shutdown()
+            await bridge.withdraw()
+
+    async def test_bus_only_newest_payload_issues_after_gate_opens(self) -> None:
+        observer, adapter = _adapter_for(_SchedulingObserver())
+        blocker = asyncio.create_task(
+            adapter.set_variables("shared", "blocker", [VarSet("on", "1")])
+        )
+        callers: list[asyncio.Task[WriteResult]] = [blocker]
+        ticket = AdmissionTicket()
+        try:
+            await _settle(10)
+            for intensity in ("40", "80", "120"):
+                if intensity != "40":
+                    assert adapter.try_supersede(ticket, [VarSet("intensity", intensity)])
+                    assert isinstance(await callers[-1], Superseded)
+                callers.append(
+                    asyncio.create_task(
+                        adapter.set_variables(
+                            "shared",
+                            "slider",
+                            [VarSet("intensity", intensity)],
+                            write_class=WriteClass.INTERACTIVE_LATEST,
+                            ticket=ticket,
+                        )
+                    )
+                )
+                await _settle(10)
+            observer.release.set()
+            await asyncio.gather(*callers)
+            assert observer.payloads == [
+                ("shared", "blocker", {"on": "1"}),
+                ("shared", "slider", {"intensity": "120"}),
+            ]
+        finally:
+            observer.release.set()
+            await adapter.shutdown()
+            await asyncio.gather(*callers, return_exceptions=True)
+
+    @pytest.mark.parametrize("device_id", ["shared", "ble_mesh"])
+    @pytest.mark.parametrize("auxiliary", [False, True])
+    async def test_ingress_only_newest_payload_issues_after_gate_opens(
+        self, device_id: str, auxiliary: bool
+    ) -> None:
+        observer, adapter = _adapter_for(_SchedulingObserver())
+        device = BrilliantDevice(
+            device_id=device_id,
+            peripheral_id="slider",
+            name="Synthetic light",
+            kind=DeviceKind.LIGHT,
+            variables={
+                "intensity": Variable("intensity", "0"),
+                "max_intensity_value": Variable("max_intensity_value", "255"),
+            },
+        )
+        sleeper = FakeSleeper()
+        bridge = Bridge(adapter, FakeMqtt(), "test", sleep=sleeper)
+        topic = (
+            "brilliant/test/slider/set_screen_brightness"
+            if auxiliary
+            else "brilliant/test/slider/set"
+        )
+        bridge._devices["slider"] = device
+        descriptor = (
+            EntityDescriptor(
+                "number",
+                "synthetic-number",
+                "Synthetic number",
+                "test",
+                "slider",
+                command_var="screen_brightness",
+                value_kind="int",
+            )
+            if auxiliary
+            else None
+        )
+        bridge._by_cmd_topic[topic] = ("slider", descriptor)
+
+        async def handle(message: _InboundMessage) -> None:
+            await bridge._on_command(message.topic, message.payload)
+
+        dispatcher = _TopicDispatcher(handle)
+        blocker = asyncio.create_task(
+            adapter.set_variables(device_id, "blocker", [VarSet("on", "1")])
+        )
+        try:
+            await _settle(10)
+            for value in (40, 80, 120):
+                await dispatcher.dispatch(
+                    _InboundMessage(
+                        topic,
+                        str(value) if auxiliary else f'{{"brightness":{value}}}',
+                        False,
+                        (),
+                        (),
+                    ),
+                    latest_wins=True,
+                )
+                await _settle(10)
+            observer.release.set()
+            await blocker
+            await dispatcher.shutdown()
+            assert observer.payloads == [
+                (device_id, "blocker", {"on": "1"}),
+                (device_id, "slider", {"screen_brightness" if auxiliary else "intensity": "120"}),
+            ]
+            assert observer.max_in_flight == 1
+            if device_id == "ble_mesh" and not auxiliary:
+                assert bridge._pending_mesh["slider"].targets == {"intensity": "120"}
+                assert sleeper.requested == [80.0]
+        finally:
+            observer.release.set()
+            await dispatcher.shutdown()
+            await adapter.shutdown()
+            await bridge.withdraw()
+            await asyncio.gather(blocker, return_exceptions=True)
+
+    async def test_interactive_precedes_waiting_maintenance(self, tmp_path: Path) -> None:
+        observer, adapter = _adapter_for(_SchedulingObserver())
+        device = BrilliantDevice(
+            device_id="shared",
+            peripheral_id="repair",
+            name="Synthetic repair",
+            kind=DeviceKind.LIGHT,
+            variables={"enable_motion_score": Variable("enable_motion_score", "0")},
+        )
+        desired = DesiredState(tmp_path / "desired.json")
+        desired.record("repair", "enable_motion_score", "1")
+        bridge = Bridge(adapter, FakeMqtt(), "test", desired=desired)
+        blocker = asyncio.create_task(
+            adapter.set_variables("shared", "blocker", [VarSet("on", "1")])
+        )
+        await _settle(10)
+        repair = asyncio.create_task(bridge._enforce_desired([device]))
+        await _settle(10)
+        interactive = asyncio.create_task(
+            adapter.set_variables("shared", "slider", [VarSet("intensity", "120")])
+        )
+        await _settle(10)
+        observer.release.set()
+        try:
+            await asyncio.gather(blocker, repair, interactive)
+            assert [pid for _, pid in observer.writes] == ["blocker", "slider", "repair"]
+            assert observer.max_in_flight == 1
+        finally:
+            await adapter.shutdown()
+
+    @pytest.mark.parametrize("barrier", [False, True])
+    async def test_ingress_preserves_partial_payload_and_button_order(self, barrier: bool) -> None:
+        observer, adapter = _adapter_for(_SchedulingObserver())
+        device = BrilliantDevice(
+            device_id="shared",
+            peripheral_id="slider",
+            name="Synthetic light",
+            kind=DeviceKind.LIGHT,
+            variables={
+                "intensity": Variable("intensity", "0"),
+                "max_intensity_value": Variable("max_intensity_value", "255"),
+            },
+        )
+        bridge = Bridge(adapter, FakeMqtt(), "test")
+        primary, button = "brilliant/test/slider/set", "brilliant/test/slider/set_reset"
+        bridge._devices["slider"] = device
+        bridge._by_cmd_topic[primary] = ("slider", None)
+        bridge._by_cmd_topic[button] = (
+            "slider",
+            EntityDescriptor(
+                "button", "synthetic-reset", "Reset", "test", "slider", command_var="reset"
+            ),
+        )
+
+        async def handle(message: _InboundMessage) -> None:
+            await bridge._on_command(message.topic, message.payload)
+
+        dispatcher = _TopicDispatcher(handle)
+        blocker = asyncio.create_task(
+            adapter.set_variables("shared", "blocker", [VarSet("on", "1")])
+        )
+        try:
+            await _settle(10)
+            initial = '{"brightness":20}' if barrier else '{"state":"ON","brightness":20}'
+            await dispatcher.dispatch(
+                _InboundMessage(primary, initial, False, (), ()), latest_wins=True
+            )
+            await _settle(10)
+            replacement = '{"brightness":40}' if barrier else '{"state":"ON","brightness":40}'
+            await dispatcher.dispatch(
+                _InboundMessage(primary, replacement, False, (), ()), latest_wins=True
+            )
+            await _settle(10)
+            if barrier:
+                await dispatcher.dispatch(
+                    _InboundMessage(button, "PRESS", False, (), ()), latest_wins=False
+                )
+            await dispatcher.dispatch(
+                _InboundMessage(primary, '{"brightness":120}', False, (), ()), latest_wins=True
+            )
+            await _settle(10)
+            observer.release.set()
+            await blocker
+            await dispatcher.shutdown()
+            expected = [
+                {"on": "1"},
+                {"intensity": "40"} if barrier else {"on": "1", "intensity": "40"},
+            ]
+            if barrier:
+                expected.append({"reset": "1"})
+            expected.append({"intensity": "120"})
+            assert [values for _, _, values in observer.payloads] == expected
+        finally:
+            observer.release.set()
+            await dispatcher.shutdown()
+            await adapter.shutdown()
+            await asyncio.gather(blocker, return_exceptions=True)
+
+
 class TestGetAllScope:
     async def test_without_extras_reads_only_own_device(self) -> None:
         adapter = RpcBusAdapter(extra_device_ids=("ble_mesh",))
@@ -456,6 +806,20 @@ class _GatedRpcObserver:
 
     async def shutdown(self) -> None:
         self.shutdowns += 1
+
+
+class _SchedulingObserver(_GatedRpcObserver):
+    def __init__(self) -> None:
+        super().__init__()
+        self.payloads: list[tuple[str, str, dict[str, str]]] = []
+
+    async def request_set_variables_in_peripheral(
+        self, peripheral_id: str, values: dict[str, str], *, device_id: str
+    ) -> str:
+        self.payloads.append((device_id, peripheral_id, dict(values)))
+        return await super().request_set_variables_in_peripheral(
+            peripheral_id, values, device_id=device_id
+        )
 
 
 class _StickyRpcObserver(_GatedRpcObserver):
@@ -922,7 +1286,9 @@ class TestSetVariablesReceipt:
         adapter = RpcBusAdapter()
         adapter._obs = _AckRpcObserver(response)
         adapter._own_device_id = "own-device"
-        return await adapter.set_variables("ble_mesh", "mesh_light_1", [VarSet("on", "0")])
+        result = await adapter.set_variables("ble_mesh", "mesh_light_1", [VarSet("on", "0")])
+        assert isinstance(result, str)
+        return result
 
     async def test_receipt_is_the_response_repr(self) -> None:
         class SetVariablesResponse:
@@ -1440,7 +1806,7 @@ class TestReusedSessionSafety:
         monkeypatch.setattr(bus_mod, "_WRITE_SETTLE_TIMEOUT_S", 0.05)
         harness = _StartHarness(monkeypatch, gated_writes=True)
         adapter = RpcBusAdapter()
-        second_caller: asyncio.Task[str] | None = None
+        second_caller: asyncio.Task[WriteResult] | None = None
 
         try:
             # Session 1: a write to own-device blocks, detaches at its deadline,
@@ -1474,7 +1840,9 @@ class TestReusedSessionSafety:
             # leave it (and the queued write) blocking the event-loop teardown.
             harness.write_release.set()
             await _settle(5)
-            pending = list(adapter._write_tasks)
+            pending: list[asyncio.Task[str] | asyncio.Task[WriteResult]] = list(
+                adapter._write_tasks
+            )
             if second_caller is not None:
                 pending.append(second_caller)
             if pending:

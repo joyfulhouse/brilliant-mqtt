@@ -31,6 +31,7 @@ from brilliant_mqtt.model import BrilliantDevice, DeviceKind, Variable
 from brilliant_mqtt.motion_derive import MotionDeriver
 from brilliant_mqtt.protocols import BusClient, MqttClient
 from brilliant_mqtt.retained_topics import RetainedTopicLedger
+from brilliant_mqtt.write_admission import Superseded, WriteClass, WriteResult, command_admission
 
 logger = logging.getLogger(__name__)
 
@@ -521,6 +522,7 @@ class Bridge:
                     device.device_id,
                     device.peripheral_id,
                     drifted,
+                    write_class=WriteClass.MAINTENANCE,
                 )
             except Exception:
                 for vs in drifted:
@@ -664,6 +666,20 @@ class Bridge:
 
         sets: list[VarSet] = translate_command(device, parsed)
         if sets:
+            route = self._by_cmd_topic.get(topic)
+
+            def decode(new_payload: str) -> list[VarSet]:
+                if (
+                    self._by_cmd_topic.get(topic) is not route
+                    or self._devices.get(peripheral_id) is not device
+                ):
+                    return []
+                try:
+                    value = json.loads(new_payload)
+                except (json.JSONDecodeError, ValueError):
+                    return []
+                return translate_command(device, value) if isinstance(value, dict) else []
+
             logger.info(
                 "command %s -> %s: %s",
                 topic,
@@ -673,11 +689,13 @@ class Bridge:
             if device.device_id == _MESH_DEVICE_ID:
                 # Mesh primaries: no optimistic echo — observation-confirmed
                 # write with a pending-visible (state: null) window instead.
-                await self._write_mesh_primary(device, peripheral_id, sets)
+                await self._write_mesh_primary(device, peripheral_id, sets, decode=decode)
                 return
             # Route the write to the bus device owning the peripheral (the
             # panel's own CONTROL device for wired loads).
-            await self._bus.set_variables(device.device_id, peripheral_id, sets)
+            result = await self._write_command(device, peripheral_id, sets, decode)
+            if isinstance(result, Superseded):
+                return
             await self._echo_state(peripheral_id, sets)
 
     async def _handle_aux_command(
@@ -702,11 +720,54 @@ class Bridge:
             return
         logger.info("aux command %s -> %s: %s=%s", topic, peripheral_id, d.command_var, value)
         sets = [VarSet(d.command_var, value)]
-        await self._bus.set_variables(device.device_id, peripheral_id, sets)
+        route = self._by_cmd_topic.get(topic)
+
+        def decode(new_payload: str) -> list[VarSet]:
+            if (
+                self._by_cmd_topic.get(topic) is not route
+                or self._devices.get(peripheral_id) is not device
+            ):
+                return []
+            value = translate_aux(new_payload, d.value_kind, d.invert, d.min_value, d.max_value)
+            return [VarSet(d.command_var, value)] if value is not None and d.command_var else []
+
+        result = await self._write_command(
+            device, peripheral_id, sets, decode if d.component == "number" else None
+        )
+        if isinstance(result, Superseded):
+            return
         await self._echo_state(peripheral_id, sets)
 
+    async def _write_command(
+        self,
+        device: BrilliantDevice,
+        peripheral_id: str,
+        sets: list[VarSet],
+        decode: Callable[[str], list[VarSet]] | None,
+    ) -> WriteResult:
+        admission = command_admission.get() if decode is not None else None
+        if admission is not None and decode is not None:
+
+            def supersede(payload: str) -> bool:
+                replacement = decode(payload)
+                return bool(replacement) and self._bus.try_supersede(admission.ticket, replacement)
+
+            admission.try_supersede = supersede
+        return await self._bus.set_variables(
+            device.device_id,
+            peripheral_id,
+            sets,
+            write_class=(WriteClass.INTERACTIVE_LATEST if decode else WriteClass.INTERACTIVE_FIFO),
+            ticket=admission.ticket if admission else None,
+        )
+
     async def _write_mesh_primary(
-        self, device: BrilliantDevice, peripheral_id: str, sets: list[VarSet]
+        self,
+        device: BrilliantDevice,
+        peripheral_id: str,
+        sets: list[VarSet],
+        *,
+        decode: Callable[[str], list[VarSet]] | None = None,
     ) -> None:
         """Mesh primary write with observation-confirmed publication (#46/#47).
 
@@ -729,7 +790,10 @@ class Bridge:
         self._mesh_write_generation[peripheral_id] = generation
         self._drop_pending_mesh(peripheral_id)
         try:
-            receipt = await self._bus.set_variables(device.device_id, peripheral_id, sets)
+            result = await self._write_command(device, peripheral_id, sets, decode)
+            if isinstance(result, Superseded):
+                return
+            receipt = result
         except (asyncio.TimeoutError, TimeoutError):
             # Both classes: they are distinct on the panel's Python 3.10, and
             # the bus adapter raises the asyncio one while the panel lib's own

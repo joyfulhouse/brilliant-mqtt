@@ -13,8 +13,10 @@ import pytest
 
 from brilliant_mqtt import mqttio
 from brilliant_mqtt.bridge import Bridge
+from brilliant_mqtt.bus import RpcBusAdapter
 from brilliant_mqtt.commands import VarSet
 from brilliant_mqtt.config import Settings
+from brilliant_mqtt.mapping import EntityDescriptor
 from brilliant_mqtt.model import BrilliantDevice, DeviceKind, Variable
 from brilliant_mqtt.mqttio import AioMqttAdapter
 from tests.fakes import FakeBus, FakeClock, FakeMqtt, FakeSleeper
@@ -361,6 +363,98 @@ async def test_latest_wins_replaces_only_its_topic_within_peripheral_lane() -> N
         (primary, "primary-2"),
         (auxiliary, "aux-2"),
     ]
+
+
+async def test_lane_latest_wins_does_not_cross_button_barrier() -> None:
+    queue = mqttio._LaneQueue(maxsize=8)
+    primary = "brilliant/test/light/set"
+    button = "brilliant/test/light/set_reset"
+    for topic, payload in [(primary, "first"), (button, "PRESS"), (primary, "last")]:
+        await queue.put(
+            mqttio._InboundMessage(topic, payload, False, (), ()),
+            latest_wins=mqttio._is_latest_wins_topic(topic),
+        )
+    assert queue.unfinished_tasks == 3
+    assert [(await queue.get()).payload for _ in range(3)] == ["first", "PRESS", "last"]
+
+
+async def test_invalid_number_during_admission_does_not_stop_reader() -> None:
+    class Observer:
+        def __init__(self) -> None:
+            self.release = asyncio.Event()
+            self.calls: list[tuple[str, dict[str, str]]] = []
+
+        async def request_set_variables_in_peripheral(
+            self, peripheral_id: str, values: dict[str, str], *, device_id: str
+        ) -> str:
+            self.calls.append((peripheral_id, values))
+            if peripheral_id == "blocker":
+                await self.release.wait()
+            return "ok"
+
+        async def shutdown(self) -> None:
+            pass
+
+    class Messages:
+        def __init__(self) -> None:
+            self.queue: asyncio.Queue[_Message | None] = asyncio.Queue()
+
+        async def __aiter__(self) -> AsyncIterator[_Message]:
+            while (message := await self.queue.get()) is not None:
+                yield message
+
+    observer = Observer()
+    bus = RpcBusAdapter()
+    bus._obs, bus._own_device_id = observer, "shared"
+    bridge = Bridge(bus, FakeMqtt(), "test")
+    topic = "brilliant/test/number/set_screen_brightness"
+    later_topic = "brilliant/test/other/set_screen_brightness"
+    for peripheral, command_topic in [("number", topic), ("other", later_topic)]:
+        bridge._devices[peripheral] = BrilliantDevice(
+            "shared", peripheral, "Synthetic number", DeviceKind.LIGHT, variables={}
+        )
+        bridge._by_cmd_topic[command_topic] = (
+            peripheral,
+            EntityDescriptor(
+                "number",
+                peripheral,
+                "Number",
+                "test",
+                peripheral,
+                command_var="screen_brightness",
+                value_kind="int",
+            ),
+        )
+    messages = Messages()
+    mqtt = object.__new__(AioMqttAdapter)
+    mqtt._client = cast(Any, type("Client", (), {"messages": messages})())
+    mqtt._command_cbs = [bridge._on_command]
+    mqtt._message_cbs = []
+    mqtt._payload_decode_error_cbs = []
+    mqtt._redacted_logging = False
+    blocker = asyncio.create_task(bus.set_variables("shared", "blocker", [VarSet("on", "1")]))
+    reader = asyncio.create_task(mqtt._read_loop())
+    try:
+        await messages.queue.put(_Message(topic, b"40", False))
+        for _ in range(20):
+            await asyncio.sleep(0)
+        await messages.queue.put(_Message(topic, b"1e309", False))
+        await messages.queue.put(_Message(later_topic, b"80", False))
+        await messages.queue.put(None)
+        for _ in range(20):
+            await asyncio.sleep(0)
+        observer.release.set()
+        await asyncio.wait_for(reader, timeout=2)
+        await blocker
+        assert observer.calls == [
+            ("blocker", {"on": "1"}),
+            ("number", {"screen_brightness": "40"}),
+            ("other", {"screen_brightness": "80"}),
+        ]
+    finally:
+        observer.release.set()
+        await bus.shutdown()
+        await asyncio.gather(reader, blocker, return_exceptions=True)
 
 
 async def test_scene_topic_burst_is_never_dropped() -> None:

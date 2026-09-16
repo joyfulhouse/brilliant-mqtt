@@ -27,6 +27,7 @@ from typing import Any, NamedTuple
 
 from brilliant_mqtt.commands import VarSet
 from brilliant_mqtt.model import BrilliantDevice, Variable, kind_for_peripheral_type
+from brilliant_mqtt.write_admission import AdmissionTicket, Superseded, WriteClass, WriteResult
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +75,10 @@ _RESOURCE_CLOSE_TASKS: set[asyncio.Task[None]] = set()
 # response type is closed-source and undocumented, so only a bounded repr
 # string ever crosses the adapter boundary.
 _RECEIPT_MAX_CHARS = 160
+# Derived from half the 60s reconciliation window (config.py) and one MQTT
+# lane depth (mqttio.py). These are policy bounds, NOT measured optima.
+_MAINTENANCE_AGE_S = 30.0
+_MAINTENANCE_BYPASSES = 8
 
 
 def _normalize_receipt(response: object) -> str:
@@ -106,6 +111,24 @@ class _WriteRecord:
     queued_at: float
     started_at: float | None = None
     detached: bool = False
+
+
+@dataclass(eq=False)
+class _WriteAdmission:
+    ticket: AdmissionTicket
+    device_id: str
+    peripheral_id: str
+    values: dict[str, str]
+    write_class: WriteClass
+    session: int
+    record: _WriteRecord
+    ready: asyncio.Event
+    acquired: asyncio.Future[None]
+    result: asyncio.Future[WriteResult]
+    task: asyncio.Task[str] | None = None
+    bypasses: int = 0
+    issued: bool = False
+    tombstoned: bool = False
 
 
 def _session_client_name(base: str) -> str:
@@ -475,6 +498,9 @@ class RpcBusAdapter:
         # Strong refs to every write task (queued, running, or detached past
         # its caller deadline). shutdown() settles whatever is left.
         self._write_tasks: set[asyncio.Task[str]] = set()
+        self._write_admissions: dict[AdmissionTicket, _WriteAdmission] = {}
+        self._write_waiters: dict[str, list[_WriteAdmission]] = {}
+        self._write_serving: dict[str, _WriteAdmission] = {}
         # The common admission fence for writes, notification dispatch and
         # reconnect handling. Held True during start() (set by _begin_session)
         # until the session commits, set True again synchronously at the top of
@@ -976,70 +1002,190 @@ class RpcBusAdapter:
         self._write_timed_out = False
         return timed_out
 
-    async def set_variables(self, device_id: str, peripheral_id: str, sets: list[VarSet]) -> str:
-        """Write variables to *peripheral_id* on *device_id* (poc-findings §7).
+    def try_supersede(self, ticket: AdmissionTicket, new_payload: list[VarSet]) -> bool:
+        admission = self._write_admissions.get(ticket)
+        values = {item.name: item.value for item in new_payload}
+        if (
+            admission is None
+            or self._shutting_down
+            or admission.session != self._session
+            or admission.issued
+            or admission.tombstoned
+            or admission.acquired.cancelled()
+            or admission.result.done()
+            or admission.write_class is not WriteClass.INTERACTIVE_LATEST
+            or not values.keys() >= admission.values.keys()
+        ):
+            return False
+        # The ticket cannot jump another admission for the same RPC target.
+        waiters = self._write_waiters.get(admission.device_id, [])
+        after = waiters[waiters.index(admission) + 1 :] if admission in waiters else waiters
+        if any(item.peripheral_id == admission.peripheral_id for item in after):
+            return False
+        predecessor, previous_acquired = admission.result, admission.acquired
+        admission.values = values
+        admission.result = asyncio.get_running_loop().create_future()
+        admission.acquired = asyncio.get_running_loop().create_future()
+        # No await: payload replacement and predecessor settlement are atomic.
+        predecessor.set_result(Superseded())
+        if not previous_acquired.done():
+            previous_acquired.set_result(None)
+        return True
 
-        The write must target the bus device that OWNS the peripheral — the
-        panel's own CONTROL id for local loads, "ble_mesh" for mesh loads —
-        so the caller passes the device id from its snapshot.
+    def _serve_next(self, device_id: str) -> None:
+        if device_id in self._write_serving:
+            return
+        waiters = self._write_waiters.get(device_id, [])
+        if not waiters:
+            return
+        # Per-target order > effective class priority > FIFO. Only the first
+        # waiter for each target is eligible, including aged maintenance.
+        seen: set[str] = set()
+        eligible: list[_WriteAdmission] = []
+        for item in waiters:
+            if item.peripheral_id not in seen:
+                eligible.append(item)
+                seen.add(item.peripheral_id)
+        now = self._clock()
 
-        Writes to the same device serialize on a per-device lock; the caller
-        deadline starts only once the lock is held (queue wait is the previous
-        write's time, not this RPC's). At the deadline the caller gets
-        ``asyncio.TimeoutError`` while the RPC keeps running detached — it is
-        never cancelled, keeps its device lock until it settles, and logs its
-        own late outcome. Only the fixed hard cap latches a session rebuild.
+        def priority(item: _WriteAdmission) -> bool:
+            return (
+                item.write_class is WriteClass.MAINTENANCE
+                and now - item.record.queued_at < _MAINTENANCE_AGE_S
+                and item.bypasses < _MAINTENANCE_BYPASSES
+            )
 
-        Returns the normalized transport-ack receipt (see
-        :func:`_normalize_receipt`); the response object stays here.
+        selected = min(eligible, key=priority)
+        waiters.remove(selected)
+        self._write_serving[device_id] = selected
+        selected.ready.set()
+
+    def _cancel_waiting(self, ticket: AdmissionTicket) -> None:
+        admission = self._write_admissions.pop(ticket, None)
+        ticket._cancel_waiting = None
+        if admission is not None and not admission.issued and admission.task is not None:
+            admission.tombstoned = True
+            admission.task.cancel()
+
+    async def set_variables(
+        self,
+        device_id: str,
+        peripheral_id: str,
+        sets: list[VarSet],
+        *,
+        write_class: WriteClass = WriteClass.INTERACTIVE_FIFO,
+        ticket: AdmissionTicket | None = None,
+    ) -> WriteResult:
+        """Admit a write; the response deadline still starts after lock acquisition.
+
+        Superseded callers settle without an error. The lane reuses their ticket
+        for the replacement, so it observes the same native write, never a copy.
+        Caller cancellation tombstones waiting work; issued RPCs retain the lock.
         """
         obs, _ = self._require_started()
         if self._shutting_down:
             raise RuntimeError("bus adapter shutting down; write rejected")
-        record = _WriteRecord(label=f"{device_id}/{peripheral_id}", queued_at=self._clock())
-        acquired: asyncio.Future[None] = asyncio.get_running_loop().create_future()
-        task = asyncio.ensure_future(
-            self._run_write(
-                obs,
+        ticket = AdmissionTicket() if ticket is None else ticket
+        admission = self._write_admissions.get(ticket)
+        values = {s.name: s.value for s in sets}
+        if admission is None:
+            if ticket._owner is not None:
+                raise ValueError("admission ticket belongs to another or completed write")
+            ticket._owner = self
+            loop = asyncio.get_running_loop()
+            admission = _WriteAdmission(
+                ticket,
                 device_id,
                 peripheral_id,
-                {s.name: s.value for s in sets},
-                record,
-                acquired,
+                values,
+                write_class,
+                self._session,
+                _WriteRecord(label=f"{device_id}/{peripheral_id}", queued_at=self._clock()),
+                asyncio.Event(),
+                loop.create_future(),
+                loop.create_future(),
             )
-        )
-        task.set_name(record.label)
-        self._write_tasks.add(task)
-        task.add_done_callback(self._settle_write)
-        # Wake on lock acquisition OR on the task settling first (a task
-        # cancelled before its first step never runs _run_write at all).
-        waiters: list[asyncio.Future[Any]] = [acquired, task]
-        await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+            self._write_admissions[ticket] = admission
+            ticket._cancel_waiting = lambda: self._cancel_waiting(ticket)
+            self._write_waiters.setdefault(device_id, []).append(admission)
+            task = asyncio.create_task(self._run_write(obs, admission), name=admission.record.label)
+            admission.task = task
+            self._write_tasks.add(task)
+            task.add_done_callback(lambda done: self._finish_admission(admission, done))
+            self._serve_next(device_id)
+        elif (
+            admission.session != self._session
+            or (admission.device_id, admission.peripheral_id) != (device_id, peripheral_id)
+            or admission.values != values
+            or admission.write_class is not write_class
+        ):
+            raise ValueError("admission ticket does not match this write")
+        result, acquired = admission.result, admission.acquired
         try:
-            return await asyncio.wait_for(asyncio.shield(task), timeout=_WRITE_DEADLINE_S)
+            # Await directly so Task.cancel() synchronously tombstones this
+            # future, even before the caller gets its next event-loop turn.
+            await acquired
+            return await asyncio.wait_for(asyncio.shield(result), timeout=_WRITE_DEADLINE_S)
+        except asyncio.CancelledError:
+            if result is not admission.result:
+                # Cancellation of an already superseded caller cannot revoke
+                # the replacement's independently owned admission.
+                raise
+            if not admission.issued and admission.task is not None:
+                self._cancel_waiting(ticket)
+            raise
         except asyncio.TimeoutError:
-            record.detached = True
+            admission.record.detached = True
             logger.warning(
                 "set_variables(%s) unresolved after %.0fs; detaching from the caller "
                 "(RPC keeps running, device lock held; queue wait %.3fs)",
-                record.label,
+                admission.record.label,
                 _WRITE_DEADLINE_S,
-                self._queue_wait(record),
+                self._queue_wait(admission.record),
             )
             raise
+        finally:
+            if not (
+                result.done()
+                and not result.cancelled()
+                and result.exception() is None
+                and isinstance(result.result(), Superseded)
+            ):
+                self._write_admissions.pop(ticket, None)
+                ticket._cancel_waiting = None
 
-    async def _run_write(
-        self,
-        obs: Any,
-        device_id: str,
-        peripheral_id: str,
-        values: dict[str, str],
-        record: _WriteRecord,
-        acquired: asyncio.Future[None],
-    ) -> str:
-        """The write task: hold the device lock for the RPC's whole lifetime."""
-        lock = self._write_locks.setdefault(device_id, asyncio.Lock())
+    def _finish_admission(self, admission: _WriteAdmission, task: asyncio.Task[str]) -> None:
+        self._settle_write(task)
+        if not admission.acquired.done():
+            admission.acquired.set_result(None)
+        if not admission.result.done():
+            if task.cancelled():
+                admission.result.cancel()
+            elif (error := task.exception()) is not None:
+                admission.result.set_exception(error)
+                # A detached/cancelled caller may never retrieve this future.
+                admission.result.exception()
+            else:
+                admission.result.set_result(task.result())
+        waiters = self._write_waiters.get(admission.device_id, [])
+        if admission in waiters:
+            waiters.remove(admission)
+        if self._write_serving.get(admission.device_id) is admission:
+            del self._write_serving[admission.device_id]
+        self._serve_next(admission.device_id)
+
+    async def _run_write(self, obs: Any, admission: _WriteAdmission) -> str:
+        """Keep native task ownership independent of waiter/ticket membership."""
+        await admission.ready.wait()
+        lock = self._write_locks.setdefault(admission.device_id, asyncio.Lock())
         async with lock:
+            if (
+                admission.session != self._session
+                or self._shutting_down
+                or admission.acquired.cancelled()
+            ):
+                raise asyncio.CancelledError
+            record, acquired = admission.record, admission.acquired
             record.started_at = self._clock()
             if not acquired.done():
                 acquired.set_result(None)
@@ -1050,10 +1196,15 @@ class RpcBusAdapter:
             )
             cap = asyncio.get_running_loop().call_later(_WRITE_HARD_CAP_S, self._cap_write, record)
             try:
+                admission.issued = True
+                if admission.write_class is not WriteClass.MAINTENANCE:
+                    for waiter in self._write_waiters.get(admission.device_id, []):
+                        if waiter.write_class is WriteClass.MAINTENANCE:
+                            waiter.bypasses += 1
                 response = await obs.request_set_variables_in_peripheral(
-                    peripheral_id,
-                    values,
-                    device_id=device_id,
+                    admission.peripheral_id,
+                    admission.values,
+                    device_id=admission.device_id,
                 )
             except asyncio.CancelledError:
                 logger.info("set_variables(%s) cancelled at session teardown", record.label)
@@ -1124,6 +1275,13 @@ class RpcBusAdapter:
         finish on their own: they stay strongly referenced in _write_tasks and
         their done-callback (_settle_write) still consumes any exception.
         """
+        for admission in list(self._write_admissions.values()):
+            admission.ticket._cancel_waiting = None
+            if not admission.result.done():
+                admission.result.cancel()
+            if not admission.acquired.done():
+                admission.acquired.set_result(None)
+        self._write_admissions.clear()
         outstanding = [task for task in self._write_tasks if not task.done()]
         if not outstanding:
             return

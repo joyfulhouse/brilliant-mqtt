@@ -25,6 +25,7 @@ from brilliant_mqtt.mapping import payload_fields
 from brilliant_mqtt.model import BrilliantDevice, DeviceKind, Variable
 from brilliant_mqtt.protocols import CommandSubscribeError
 from brilliant_mqtt.retained_topics import RetainedTopicLedger
+from brilliant_mqtt.write_admission import AdmissionTicket, WriteClass
 from tests.fakes import FakeBus, FakeClock, FakeMqtt, FakeSleeper
 
 PANEL = "office"
@@ -1653,12 +1654,22 @@ class _StallableBus(FakeBus):
         super().__init__(devices)
         self.stall: asyncio.Event | None = None
 
-    async def set_variables(self, device_id: str, peripheral_id: str, sets: list[VarSet]) -> str:
+    async def set_variables(
+        self,
+        device_id: str,
+        peripheral_id: str,
+        sets: list[VarSet],
+        *,
+        write_class: WriteClass = WriteClass.INTERACTIVE_FIFO,
+        ticket: AdmissionTicket | None = None,
+    ) -> str:
         stall = self.stall
         if stall is not None:
             self.stall = None
             await stall.wait()
-        return await super().set_variables(device_id, peripheral_id, sets)
+        return await super().set_variables(
+            device_id, peripheral_id, sets, write_class=write_class, ticket=ticket
+        )
 
 
 class _BlockingUnsubscribeMqtt(FakeMqtt):
