@@ -23,6 +23,10 @@ class Superseded:
 WriteResult = str | Superseded
 
 
+class TicketAdoptionError(ValueError):
+    """The supplied ticket cannot be adopted for this write."""
+
+
 class WriteCancelled(asyncio.CancelledError):
     """The adapter aborted this write; it did not cancel the caller's task.
 
@@ -30,21 +34,7 @@ class WriteCancelled(asyncio.CancelledError):
     machinery can tell an INTERNAL supersession apart from a genuine
     ``asyncio.Task.cancel()`` (which raises a base ``CancelledError``). This
     discriminator must be preserved; contain it at the PUBLIC maintenance/
-    reconcile boundary (see :class:`WriteAborted`) rather than by widening it.
-    """
-
-
-class WriteAborted(RuntimeError):
-    """A write ended WITHOUT issuing (e.g. an internal supersession) surfaced to a
-    maintenance/reconcile caller as an ordinary Exception.
-
-    :class:`WriteCancelled` is a BaseException (a ``CancelledError`` subclass) so
-    it escapes every ``except Exception`` boundary — which would let an internal
-    supersession propagate a stray cancellation into ``reconcile()``, the
-    reconnect re-reconcile task, or the mesh-leader tick (terminating the
-    supervisor). Converting it to this RuntimeError at that boundary lets the
-    existing ``except Exception`` contain it, while a genuine
-    ``asyncio.CancelledError`` still propagates untouched.
+    reconcile boundary as a benign no-op rather than by widening it.
     """
 
 

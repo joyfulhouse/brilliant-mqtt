@@ -34,7 +34,7 @@ from brilliant_mqtt.protocols import BusClient, MqttClient
 from brilliant_mqtt.retained_topics import RetainedTopicLedger
 from brilliant_mqtt.write_admission import (
     Superseded,
-    WriteAborted,
+    TicketAdoptionError,
     WriteCancelled,
     WriteClass,
     WriteResult,
@@ -573,30 +573,21 @@ class Bridge:
             self._throttle.last_ts = now
             writes += 1
             try:
-                try:
-                    await self._bus.set_variables(
-                        device.device_id,
-                        device.peripheral_id,
-                        drifted,
-                        write_class=WriteClass.MAINTENANCE,
-                    )
-                except WriteCancelled as superseded:
-                    # An INTERNAL supersession surfaces as WriteCancelled, a
-                    # BaseException (asyncio.CancelledError subclass) by design so
-                    # the admission machinery can tell it apart from a genuine
-                    # Task.cancel(). This is the SINGLE maintenance/reconcile
-                    # boundary where that must be contained: reconcile() runs on
-                    # the mesh-leader tick (a stray CancelledError there hits the
-                    # supervisor's `except asyncio.CancelledError: raise` and
-                    # terminates the whole bridge) and inside the fire-and-forget
-                    # reconnect re-reconcile (where it silently kills the task).
-                    # Convert it to an ordinary Exception so the `except
-                    # Exception` below contains it. A genuine asyncio.CancelledError
-                    # (base class) is NOT a WriteCancelled and still propagates.
-                    raise WriteAborted(
-                        "maintenance write aborted before issue "
-                        "(internal settlement or teardown surfaced out of the write path)"
-                    ) from superseded
+                await self._bus.set_variables(
+                    device.device_id,
+                    device.peripheral_id,
+                    drifted,
+                    write_class=WriteClass.MAINTENANCE,
+                )
+            except WriteCancelled:
+                # Keep desired state and retry timing; skip the unconfirmed echo.
+                # A genuine Task.cancel() raises the base CancelledError and escapes.
+                logger.debug(
+                    "reconcile-desired write superseded internally for %s/%s; continuing",
+                    device.device_id,
+                    device.peripheral_id,
+                )
+                continue
             except Exception:
                 for vs in drifted:
                     key = (device.peripheral_id, vs.name)
@@ -932,7 +923,7 @@ class Bridge:
                 write_class=write_class,
                 ticket=ticket,
             )
-        except ValueError:
+        except TicketAdoptionError:
             if not reused_ticket or ticket is None:
                 raise
             # Re-handling a folded write after a mid-burst re-type: the target's

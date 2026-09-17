@@ -30,6 +30,7 @@ from brilliant_mqtt.model import BrilliantDevice, Variable, kind_for_peripheral_
 from brilliant_mqtt.write_admission import (
     AdmissionTicket,
     Superseded,
+    TicketAdoptionError,
     WriteCancelled,
     WriteClass,
     WriteResult,
@@ -1108,7 +1109,7 @@ class RpcBusAdapter:
         values = {s.name: s.value for s in sets}
         if admission is None:
             if ticket._owner is not None:
-                raise ValueError("admission ticket belongs to another or completed write")
+                raise TicketAdoptionError("admission ticket belongs to another or completed write")
             ticket._owner = self
             loop = asyncio.get_running_loop()
             admission = _WriteAdmission(
@@ -1137,7 +1138,7 @@ class RpcBusAdapter:
             or admission.values != values
             or admission.write_class is not write_class
         ):
-            raise ValueError("admission ticket does not match this write")
+            raise TicketAdoptionError("admission ticket does not match this write")
         result, acquired = admission.result, admission.acquired
         try:
             # Await directly so Task.cancel() synchronously tombstones this
