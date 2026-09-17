@@ -159,6 +159,48 @@ async def test_waiting_ticket_accepts_superset_and_issues_only_replacement(
     ]
 
 
+async def test_supersession_retains_original_slot_ahead_of_other_target(harness: _Harness) -> None:
+    async def enqueue(
+        peripheral: str, value: str, *, ticket: AdmissionTicket | None = None
+    ) -> asyncio.Task[WriteResult]:
+        admitted = asyncio.Event()
+
+        async def write() -> WriteResult:
+            # This callback runs after set_variables reaches its admission wait.
+            asyncio.get_running_loop().call_soon(admitted.set)
+            return await harness.adapter.set_variables(
+                "shared",
+                peripheral,
+                [VarSet("intensity", value)],
+                write_class=WriteClass.INTERACTIVE_LATEST,
+                ticket=ticket,
+            )
+
+        caller = asyncio.create_task(write())
+        harness.callers.append(caller)
+        await admitted.wait()
+        return caller
+
+    await enqueue("blocker", "0")
+    ticket = AdmissionTicket()
+    original = await enqueue("a", "10", ticket=ticket)
+    await enqueue("b", "30")
+    assert harness.observer.calls == [("shared", "blocker", {"intensity": "0"})]
+
+    assert harness.adapter.try_supersede(ticket, [VarSet("intensity", "20")])
+    assert isinstance(await original, Superseded)
+    replacement = await enqueue("a", "20", ticket=ticket)
+    await harness.drain()
+
+    assert harness.observer.calls == [
+        ("shared", "blocker", {"intensity": "0"}),
+        ("shared", "a", {"intensity": "20"}),
+        ("shared", "b", {"intensity": "30"}),
+    ]
+    assert await replacement == "'ok'"
+    assert harness.observer.max_in_flight["shared"] == 1
+
+
 async def test_non_superset_rejection_retains_both_writes_in_order(harness: _Harness) -> None:
     await harness.queue("blocker", {"on": "1"})
     ticket = AdmissionTicket()

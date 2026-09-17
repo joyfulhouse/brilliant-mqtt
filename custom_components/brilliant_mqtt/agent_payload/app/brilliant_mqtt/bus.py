@@ -1035,6 +1035,12 @@ class RpcBusAdapter:
             sorted(admission.values),
             sorted(values),
         )
+        # D12: replace the payload in place, retaining the predecessor's queue
+        # position. The survivor does not re-arrive: P1 class FIFO orders slots
+        # by original arrival, not payload revisions. This preserves baseline
+        # order and prevents slider revisions from starving their own slot by
+        # repeatedly moving it to the tail. The same-peripheral guard above
+        # separately preserves higher-precedence per-target order and barriers.
         admission.values = values
         admission.result = asyncio.get_running_loop().create_future()
         admission.acquired = asyncio.get_running_loop().create_future()
