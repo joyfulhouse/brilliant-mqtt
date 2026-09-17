@@ -31,6 +31,7 @@ from brilliant_mqtt.mesh_leader import MESH_LEADER_TOPIC, MeshLeader
 from brilliant_mqtt.model import BrilliantDevice, DeviceKind, Variable
 from brilliant_mqtt.protocols import CommandSubscribeError
 from brilliant_mqtt.retained_topics import RetainedLedgerError
+from brilliant_mqtt.write_admission import AdmissionTicket, WriteClass
 from tests.fakes import FakeBus, FakeClock, FakeMqtt, _panel_dimmer
 
 HB = 10.0
@@ -498,11 +499,17 @@ class _SessionBus:
         self.write_timeout_latched = False
         return latched
 
+    def try_supersede(self, ticket: AdmissionTicket, new_payload: list[VarSet]) -> bool:
+        return False
+
     async def set_variables(
         self,
         device_id: str,
         peripheral_id: str,
         sets: list[VarSet],
+        *,
+        write_class: WriteClass = WriteClass.INTERACTIVE_FIFO,
+        ticket: AdmissionTicket | None = None,
     ) -> str:
         self.commands.append((device_id, peripheral_id, list(sets)))
         return "FakeSetVariablesResponse()"

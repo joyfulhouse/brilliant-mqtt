@@ -22,6 +22,7 @@ from brilliant_ha_mirror.mapping import HaEntity, PeripheralSpec, ServiceCall
 from brilliant_mqtt import mqttio
 from brilliant_mqtt.commands import VarSet
 from brilliant_mqtt.model import BrilliantDevice, DeviceKind, Variable
+from brilliant_mqtt.write_admission import AdmissionTicket, WriteClass
 
 
 class FakeBus:
@@ -100,7 +101,18 @@ class FakeBus:
         self.write_timeout_latched = False
         return timed_out
 
-    async def set_variables(self, device_id: str, peripheral_id: str, sets: list[VarSet]) -> str:
+    def try_supersede(self, ticket: AdmissionTicket, new_payload: list[VarSet]) -> bool:
+        return False
+
+    async def set_variables(
+        self,
+        device_id: str,
+        peripheral_id: str,
+        sets: list[VarSet],
+        *,
+        write_class: WriteClass = WriteClass.INTERACTIVE_FIFO,
+        ticket: AdmissionTicket | None = None,
+    ) -> str:
         if self.set_variables_error is not None:
             raise self.set_variables_error
         self.commands.append((device_id, peripheral_id, list(sets)))

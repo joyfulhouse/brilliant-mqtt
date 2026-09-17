@@ -21,7 +21,14 @@ from brilliant_mqtt.commands import VarSet
 from brilliant_mqtt.config import Settings
 from brilliant_mqtt.desired_state import DesiredState
 from brilliant_mqtt.diagnostics import ResponseDiagnostics, SessionRebuildReason, WriteOutcome
+from brilliant_mqtt.model import Variable
 from brilliant_mqtt.retained_topics import RetainedLedgerError
+from brilliant_mqtt.write_admission import (
+    AdmissionTicket,
+    Superseded,
+    WriteClass,
+    WriteResult,
+)
 from tests.fakes import (
     FakeBus,
     FakeClock,
@@ -49,6 +56,7 @@ def test_snapshot_has_fixed_numeric_schema_and_is_an_independent_copy() -> None:
         "write_timeout_bus": 0,
         "write_timeout_async": 0,
         "write_cancelled": 0,
+        "write_ticket_revoked_before_rpc": 0,
         "write_detached_late_ok": 0,
         "write_detached_late_error": 0,
         "write_hard_cap_total": 0,
@@ -98,6 +106,7 @@ def test_recorder_totals_are_cumulative_and_outcomes_are_exhaustive() -> None:
     for outcome in outcomes:
         recorder.note_write_settled(outcome, 2.0, 3.0)
     recorder.note_superseded()
+    recorder.note_ticket_revoked_before_rpc()
     recorder.note_bus_reconnect()
     recorder.note_hard_cap()
     recorder.note_session_rebuild("bus_stale")
@@ -112,6 +121,7 @@ def test_recorder_totals_are_cumulative_and_outcomes_are_exhaustive() -> None:
     assert snapshot["rpc_s_sum"] == 21.0
     assert snapshot["rpc_s_count"] == 7
     assert snapshot["superseded_before_dispatch"] == 1
+    assert snapshot["write_ticket_revoked_before_rpc"] == 1
     assert snapshot["bus_reconnect_total"] == 1
     assert snapshot["write_hard_cap_total"] == 1
     reasons = snapshot["session_rebuild"]
@@ -148,6 +158,7 @@ def test_populated_snapshot_stays_under_size_bound_as_observations_grow() -> Non
         for index in range(count):
             recorder.note_write_settled(outcomes[index % len(outcomes)], queue_wait_s, rpc_s)
             recorder.note_superseded()
+            recorder.note_ticket_revoked_before_rpc()
             recorder.note_bus_reconnect()
             recorder.note_hard_cap()
             recorder.note_session_rebuild(rebuild_reasons[index % len(rebuild_reasons)])
@@ -209,7 +220,9 @@ def _write_adapter(
     return observer, adapter
 
 
-def _start_write(adapter: RpcBusAdapter, peripheral: str = "synthetic-light") -> asyncio.Task[str]:
+def _start_write(
+    adapter: RpcBusAdapter, peripheral: str = "synthetic-light"
+) -> asyncio.Task[WriteResult]:
     return asyncio.create_task(
         adapter.set_variables("synthetic-device", peripheral, [VarSet("on", "1")])
     )
@@ -235,7 +248,7 @@ class _AsyncTimeoutSubclass(asyncio.TimeoutError):
     ],
 )
 async def test_write_outcomes_include_timeouts_in_rpc_population(
-    error: Exception | None, outcome: str
+    error: Exception | None, outcome: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     clock = FakeClock()
     recorder = ResponseDiagnostics(clock=clock)
@@ -248,8 +261,19 @@ async def test_write_outcomes_include_timeouts_in_rpc_population(
         return clock()
 
     adapter._clock = counted_clock
+    record_settlement = recorder.note_write_settled
+    locks_at_settlement: list[bool] = []
+
+    def record_after_release(
+        outcome: WriteOutcome, queue_wait_s: float | None, rpc_s: float | None
+    ) -> None:
+        locks_at_settlement.append(adapter._write_locks["synthetic-device"].locked())
+        record_settlement(outcome, queue_wait_s, rpc_s)
+
+    monkeypatch.setattr(recorder, "note_write_settled", record_after_release)
     caller = _start_write(adapter)
     await _settle()
+    (admission,) = adapter._write_admissions.values()
     clock.advance(2.5)
     observer.release.set()
     if error is None:
@@ -263,9 +287,16 @@ async def test_write_outcomes_include_timeouts_in_rpc_population(
     assert snapshot["rpc_s_count"] == 1
     assert snapshot["queue_wait_s_count"] == 1
     assert snapshot["queue_wait_s_sum"] == 0.0
+    assert not admission.record.detached
+    assert locks_at_settlement == [False]
     # Clock-read work is part of #152's low-overhead contract: reject extra
-    # per-write metric reads. Enqueue + start + settlement, plus success logging.
-    assert clock_calls == (4 if error is None else 3)
+    # metric reads. Enqueue + scheduling + start + settlement, plus success logging.
+    assert clock_calls == (5 if error is None else 4)
+    assert admission.task is not None
+    adapter._finish_admission(admission, admission.task)
+    assert clock_calls == (5 if error is None else 4)
+    assert recorder.snapshot() == snapshot
+    assert locks_at_settlement == [False]
     assert "synthetic" not in json.dumps(snapshot)
     await adapter.shutdown()
 
@@ -279,6 +310,10 @@ async def test_queue_wait_ends_at_lock_acquisition_and_reads_bypass_writes() -> 
     clock.advance(2.0)
     second = _start_write(adapter, "second")
     await _settle()
+    (waiting,) = adapter._write_waiters["synthetic-device"]
+    assert waiting.record.started_at is None
+    assert waiting.record.queued_at == clock()
+    assert not waiting.acquired.done()
     assert observer.writes == [("synthetic-device", "first")]
     assert await adapter.get_all()
     clock.advance(3.0)
@@ -294,9 +329,17 @@ async def test_queue_wait_ends_at_lock_acquisition_and_reads_bypass_writes() -> 
     await adapter.shutdown()
 
 
-@pytest.mark.parametrize("error", [None, RuntimeError("synthetic late failure")])
+@pytest.mark.parametrize(
+    ("error", "outcome"),
+    [
+        (None, "detached_late_ok"),
+        (RuntimeError("synthetic late failure"), "detached_late_error"),
+        (TimeoutError("synthetic late timeout"), "timeout_bus"),
+        (asyncio.TimeoutError("synthetic late timeout"), "timeout_async"),
+    ],
+)
 async def test_caller_deadline_counts_only_the_later_detached_settlement(
-    monkeypatch: pytest.MonkeyPatch, error: Exception | None
+    monkeypatch: pytest.MonkeyPatch, error: Exception | None, outcome: str
 ) -> None:
     monkeypatch.setattr(bus_mod, "_WRITE_DEADLINE_S", 0)
     clock = FakeClock()
@@ -306,21 +349,34 @@ async def test_caller_deadline_counts_only_the_later_detached_settlement(
         await adapter.set_variables("synthetic-device", "synthetic-light", [VarSet("on", "1")])
     assert recorder.snapshot()["write_total"] == 0
     (task,) = adapter._write_tasks
+    admission = adapter._write_serving["synthetic-device"]
     assert not task.done()
+    settlement_clock_reads = 0
+
+    def counted_clock() -> float:
+        nonlocal settlement_clock_reads
+        settlement_clock_reads += 1
+        return clock()
+
+    adapter._clock = counted_clock
     clock.advance(7.0)
     observer.release.set()
     if error is None:
         await task
     else:
-        with pytest.raises(RuntimeError):
+        with pytest.raises(type(error)):
             await task
     await _settle()
     snapshot = recorder.snapshot()
-    outcome = "write_detached_late_ok" if error is None else "write_detached_late_error"
-    assert snapshot["write_total"] == snapshot[outcome] == 1
-    assert snapshot["write_timeout_async"] == snapshot["write_hard_cap_total"] == 0
+    assert snapshot["write_total"] == snapshot[f"write_{outcome}"] == 1
+    assert snapshot["write_hard_cap_total"] == 0
     assert snapshot["rpc_s_count"] == 1
     assert snapshot["rpc_s_sum"] == 7.0
+    # One existing late-outcome log read, plus one diagnostic settlement stamp.
+    assert settlement_clock_reads == 2
+    adapter._finish_admission(admission, task)
+    assert settlement_clock_reads == 2
+    assert recorder.snapshot() == snapshot
     await adapter.shutdown()
     assert recorder.snapshot() == snapshot
 
@@ -337,9 +393,18 @@ async def test_write_cancellation_counts_once_and_omits_unmeasured_timings(phase
     caller = _start_write(adapter)
     await asyncio.sleep(0)
     (task,) = adapter._write_tasks
+    (admission,) = adapter._write_admissions.values()
     if phase != "before_step":
         await _settle()
     clock.advance(4.0)
+    settlement_clock_reads = 0
+
+    def counted_clock() -> float:
+        nonlocal settlement_clock_reads
+        settlement_clock_reads += 1
+        return clock()
+
+    adapter._clock = counted_clock
     if phase == "shutdown":
         await adapter.shutdown()
     else:
@@ -352,12 +417,17 @@ async def test_write_cancellation_counts_once_and_omits_unmeasured_timings(phase
     snapshot = recorder.snapshot()
     ran_rpc = phase in ("rpc", "shutdown")
     assert snapshot["write_cancelled"] == snapshot["write_total"] == 1
+    assert snapshot["write_ticket_revoked_before_rpc"] == 0
     assert snapshot["queue_wait_s_count"] == (1 if ran_rpc else 0)
     assert snapshot["queue_wait_s_recent_max"] == (0.0 if ran_rpc else None)
     assert snapshot["rpc_s_count"] == (1 if ran_rpc else 0)
     assert snapshot["rpc_s_sum"] == (4.0 if ran_rpc else 0.0)
     assert snapshot["rpc_s_recent_max"] == (4.0 if ran_rpc else None)
     assert bool(observer.writes) == ran_rpc
+    assert settlement_clock_reads == 1
+    adapter._finish_admission(admission, task)
+    assert settlement_clock_reads == 1
+    assert recorder.snapshot() == snapshot
     await adapter.shutdown()
     assert recorder.snapshot() == snapshot
 
@@ -379,6 +449,194 @@ async def test_caller_cancellation_leaves_write_attached_until_shutdown() -> Non
     assert recorder.snapshot()["write_ok"] == 1
     assert recorder.snapshot()["write_detached_late_ok"] == 0
     await adapter.shutdown()
+
+
+async def test_admission_replacements_count_supersession_without_settling_native_write() -> None:
+    clock = FakeClock()
+    recorder = ResponseDiagnostics(clock=clock)
+    observer, adapter = _write_adapter(recorder, clock)
+    blocker = _start_write(adapter, "blocker")
+    ticket = AdmissionTicket()
+
+    def submit(value: str) -> asyncio.Task[WriteResult]:
+        return asyncio.create_task(
+            adapter.set_variables(
+                "synthetic-device",
+                "slider",
+                [VarSet("on", value)],
+                write_class=WriteClass.INTERACTIVE_LATEST,
+                ticket=ticket,
+            )
+        )
+
+    await _settle()
+    first = submit("0")
+    await _settle()
+    admission = adapter._write_admissions[ticket]
+    assert not adapter.try_supersede(ticket, [VarSet("different-key", "1")])
+    assert recorder.snapshot()["superseded_before_dispatch"] == 0
+    assert adapter.try_supersede(ticket, [VarSet("on", "1")])
+    assert isinstance(await first, Superseded)
+    second = submit("1")
+    await _settle()
+    assert adapter.try_supersede(ticket, [VarSet("on", "2")])
+    assert isinstance(await second, Superseded)
+    assert recorder.snapshot()["superseded_before_dispatch"] == 2
+    assert recorder.snapshot()["write_total"] == 0
+    assert adapter._write_admissions[ticket] is admission
+    assert len(adapter._write_tasks) == 2
+    survivor = submit("2")
+    await _settle()
+    clock.advance(3.0)
+    observer.release.set()
+    await asyncio.gather(blocker, survivor)
+    snapshot = recorder.snapshot()
+    assert snapshot["write_total"] == snapshot["write_ok"] == 2
+    assert snapshot["queue_wait_s_sum"] == 3.0
+    assert snapshot["write_ticket_revoked_before_rpc"] == 0
+    assert snapshot["superseded_before_dispatch"] == 2
+    assert not adapter.try_supersede(ticket, [VarSet("on", "3")])
+    assert recorder.snapshot() == snapshot
+    await adapter.shutdown()
+
+
+@pytest.mark.parametrize("phase", ["before_step", "admission_queue", "issued", "caller_cancel"])
+async def test_ticket_revocation_is_distinct_from_pending_payload_replacement(phase: str) -> None:
+    clock = FakeClock()
+    recorder = ResponseDiagnostics(clock=clock)
+    observer, adapter = _write_adapter(recorder, clock)
+    ticket = AdmissionTicket()
+    blocker = _start_write(adapter, "blocker") if phase != "issued" else None
+    await _settle()
+    caller = asyncio.create_task(
+        adapter.set_variables(
+            "synthetic-device",
+            "revoked",
+            [VarSet("on", "1")],
+            ticket=ticket,
+        )
+    )
+    await asyncio.sleep(0)
+    admission = adapter._write_admissions[ticket]
+    if phase != "before_step":
+        await _settle()
+    if phase == "caller_cancel":
+        caller.cancel()
+    else:
+        ticket.cancel_waiting()
+        ticket.cancel_waiting()
+    if phase == "issued":
+        await _settle()
+        assert not caller.done()
+        assert recorder.snapshot()["write_total"] == 0
+        observer.release.set()
+        await caller
+    else:
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        await _settle()
+    snapshot = recorder.snapshot()
+    assert snapshot["write_total"] == 1
+    assert (
+        snapshot["write_cancelled"]
+        == snapshot["write_ticket_revoked_before_rpc"]
+        == (0 if phase == "issued" else 1)
+    )
+    assert snapshot["superseded_before_dispatch"] == 0
+    assert (
+        snapshot["rpc_s_count"] == snapshot["queue_wait_s_count"] == (1 if phase == "issued" else 0)
+    )
+    assert observer.write_cancelled is False
+    assert admission.task is not None
+    adapter._finish_admission(admission, admission.task)
+    assert recorder.snapshot() == snapshot
+    observer.release.set()
+    if blocker is not None:
+        await blocker
+    await adapter.shutdown()
+
+
+async def test_maintenance_revocation_records_cancellation_without_backoff_or_echo(
+    tmp_path: Path,
+) -> None:
+    clock = FakeClock()
+    recorder = ResponseDiagnostics(clock=clock)
+    observer, adapter = _write_adapter(recorder, clock)
+    desired = DesiredState(tmp_path / "desired.json")
+    desired.record("repair", "enable_motion_score", "1")
+    bridge = Bridge(adapter, FakeMqtt(), "synthetic-panel", desired=desired, clock=clock)
+    device = replace(
+        _panel_dimmer(),
+        device_id="synthetic-device",
+        peripheral_id="repair",
+        variables={"enable_motion_score": Variable("enable_motion_score", "0")},
+    )
+    bridge._devices["repair"] = device
+    key = ("repair", "enable_motion_score")
+    bridge._reassert_retry_interval_s[key] = 120.0
+    blocker = _start_write(adapter, "blocker")
+    enforce = asyncio.create_task(bridge._enforce_desired([device]))
+    try:
+        await _settle(10)
+        (waiting,) = adapter._write_waiters["synthetic-device"]
+        assert waiting.write_class is WriteClass.MAINTENANCE
+        waiting.ticket.cancel_waiting()
+        await enforce
+        assert not enforce.cancelled()
+        assert bridge._reassert_retry_interval_s[key] == 120.0
+        assert desired.wanted("repair") == {"enable_motion_score": "1"}
+        assert bridge._devices["repair"].variables["enable_motion_score"].value == "0"
+        snapshot = recorder.snapshot()
+        assert snapshot["write_total"] == snapshot["write_cancelled"] == 1
+        assert snapshot["write_ticket_revoked_before_rpc"] == 1
+        assert snapshot["write_error"] == snapshot["superseded_before_dispatch"] == 0
+        assert snapshot["rpc_s_count"] == snapshot["queue_wait_s_count"] == 0
+    finally:
+        observer.release.set()
+        await adapter.shutdown()
+        await asyncio.gather(blocker, enforce, return_exceptions=True)
+
+
+async def test_shutdown_result_does_not_record_until_native_task_releases_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(bus_mod, "_WRITE_SETTLE_TIMEOUT_S", 0)
+    clock = FakeClock()
+    recorder = ResponseDiagnostics(clock=clock)
+    observer, adapter = _write_adapter(recorder, clock)
+    cancelled = asyncio.Event()
+
+    async def delay_cancellation() -> None:
+        try:
+            await observer.release.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            await observer.release.wait()
+
+    monkeypatch.setattr(observer, "_block", delay_cancellation)
+    caller = _start_write(adapter)
+    await _settle()
+    (admission,) = adapter._write_admissions.values()
+    await adapter.shutdown()
+    assert cancelled.is_set()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    assert admission.result.done()
+    assert admission.task is not None and not admission.task.done()
+    assert adapter._write_locks["synthetic-device"].locked()
+    assert recorder.snapshot()["write_total"] == 0
+    clock.advance(8.0)
+    observer.release.set()
+    await admission.task
+    await _settle()
+    snapshot = recorder.snapshot()
+    assert snapshot["write_total"] == snapshot["write_ok"] == 1
+    assert snapshot["write_cancelled"] == snapshot["write_ticket_revoked_before_rpc"] == 0
+    assert snapshot["rpc_s_sum"] == 8.0
+    assert snapshot["rpc_s_count"] == snapshot["queue_wait_s_count"] == 1
+    assert not adapter._write_locks["synthetic-device"].locked()
+    adapter._finish_admission(admission, admission.task)
+    assert recorder.snapshot() == snapshot
 
 
 async def test_hard_cap_is_separate_from_the_settlement_outcome(

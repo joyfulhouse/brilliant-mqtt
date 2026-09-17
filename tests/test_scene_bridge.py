@@ -16,6 +16,7 @@ import pytest
 
 from brilliant_mqtt import scene_bridge as scene_bridge_module
 from brilliant_mqtt import scene_state
+from brilliant_mqtt.bus import RpcBusAdapter
 from brilliant_mqtt.commands import VarSet
 from brilliant_mqtt.ha_control_protocol import (
     COMMAND_TTL_MS,
@@ -34,6 +35,7 @@ from brilliant_mqtt.ha_control_protocol import (
 )
 from brilliant_mqtt.model import BrilliantDevice, DeviceKind, Variable
 from brilliant_mqtt.scene_bridge import SceneBridge
+from brilliant_mqtt.write_admission import AdmissionTicket, WriteClass
 from tests.fakes import FakeBus, FakeClockMs, FakeMqtt
 
 _PANEL = "office"
@@ -68,8 +70,18 @@ class _HoldingWriteBus(FakeBus):
         self.write_started = asyncio.Event()
         self.release_write = asyncio.Event()
 
-    async def set_variables(self, device_id: str, peripheral_id: str, sets: list[VarSet]) -> str:
-        receipt = await super().set_variables(device_id, peripheral_id, sets)
+    async def set_variables(
+        self,
+        device_id: str,
+        peripheral_id: str,
+        sets: list[VarSet],
+        *,
+        write_class: WriteClass = WriteClass.INTERACTIVE_FIFO,
+        ticket: AdmissionTicket | None = None,
+    ) -> str:
+        receipt = await super().set_variables(
+            device_id, peripheral_id, sets, write_class=write_class, ticket=ticket
+        )
         self.write_started.set()
         await self.release_write.wait()
         return receipt
@@ -857,9 +869,17 @@ async def test_hung_write_does_not_block_timeout_or_shutdown(tmp_path: Path) -> 
             self.write_cancelled = asyncio.Event()
 
         async def set_variables(
-            self, device_id: str, peripheral_id: str, sets: list[VarSet]
+            self,
+            device_id: str,
+            peripheral_id: str,
+            sets: list[VarSet],
+            *,
+            write_class: WriteClass = WriteClass.INTERACTIVE_FIFO,
+            ticket: AdmissionTicket | None = None,
         ) -> str:
-            await super().set_variables(device_id, peripheral_id, sets)
+            await super().set_variables(
+                device_id, peripheral_id, sets, write_class=write_class, ticket=ticket
+            )
             self.write_started.set()
             try:
                 await asyncio.Future()
@@ -887,6 +907,88 @@ async def test_hung_write_does_not_block_timeout_or_shutdown(tmp_path: Path) -> 
     assert result["error"] == "timeout"
     await asyncio.wait_for(bridge.async_shutdown(), timeout=0.1)
     assert bus.write_cancelled.is_set()
+
+
+async def test_scene_timeout_tombstones_waiter_but_preserves_issued_native_rpc(
+    tmp_path: Path,
+) -> None:
+    class Observer:
+        def __init__(self) -> None:
+            self.release = asyncio.Event()
+            self.started = asyncio.Event()
+            self.calls: list[str] = []
+            self.cancelled = 0
+            self.in_flight = 0
+            self.max_in_flight = 0
+
+        async def request_set_variables_in_peripheral(
+            self, peripheral_id: str, values: dict[str, str], *, device_id: str
+        ) -> str:
+            self.calls.append(peripheral_id)
+            self.in_flight += 1
+            self.max_in_flight = max(self.max_in_flight, self.in_flight)
+            self.started.set()
+            try:
+                await self.release.wait()
+            except asyncio.CancelledError:
+                self.cancelled += 1
+                raise
+            finally:
+                self.in_flight -= 1
+            return "ok"
+
+        async def shutdown(self) -> None:
+            pass
+
+    bridge, _, mqtt, clock, _ = await _started(tmp_path)
+    observer = Observer()
+    adapter = RpcBusAdapter()
+    adapter._obs, adapter._own_device_id = observer, _DEVICE_ID
+    bridge._bus = adapter
+    blocker = asyncio.create_task(adapter.set_variables(_DEVICE_ID, "blocker", [VarSet("on", "1")]))
+    try:
+        await observer.started.wait()
+        queued_id = "22222222-2222-4222-8222-222222222222"
+        await mqtt.inject(scene_command_topic(_PANEL), _command(queued_id, "scene", "all_off"))
+        for _ in range(20):
+            await asyncio.sleep(0)
+        await clock.advance_ms(15_000)
+        await _wait_for_publish(mqtt, scene_result_topic(queued_id))
+        assert _payload(_published(mqtt, scene_result_topic(queued_id))[-1])["error"] == "timeout"
+        observer.release.set()
+        await blocker
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert observer.calls == ["blocker"]
+
+        observer.release.clear()
+        observer.started.clear()
+        issued_id = "33333333-3333-4333-8333-333333333333"
+        await mqtt.inject(
+            scene_command_topic(_PANEL),
+            _command(issued_id, "scene", "all_off", issued_at_ms=clock.now_ms),
+        )
+        await observer.started.wait()
+        successor = asyncio.create_task(
+            adapter.set_variables(_DEVICE_ID, "successor", [VarSet("on", "0")])
+        )
+        await clock.advance_ms(15_000)
+        await _wait_for_publish(mqtt, scene_result_topic(issued_id))
+        assert _payload(_published(mqtt, scene_result_topic(issued_id))[-1])["error"] == "timeout"
+        assert observer.calls == ["blocker", "execution_peripheral"]
+        assert observer.cancelled == 0
+        assert observer.in_flight == 1
+        assert not successor.done()
+        observer.release.set()
+        assert await asyncio.wait_for(successor, timeout=2) == "'ok'"
+        assert observer.calls == ["blocker", "execution_peripheral", "successor"]
+        assert observer.max_in_flight == 1
+        assert len(_published(mqtt, scene_result_topic(issued_id))) == 1
+    finally:
+        observer.release.set()
+        await bridge.async_shutdown()
+        await adapter.shutdown()
+        await asyncio.gather(blocker, return_exceptions=True)
 
 
 async def test_matching_execution_publishes_event_before_accepted_result_and_caches_replay(
@@ -1041,9 +1143,17 @@ async def test_wrong_topic_panel_and_malformed_payload_never_write(tmp_path: Pat
 async def test_write_failure_is_sanitized_and_cached(tmp_path: Path) -> None:
     class FailingBus(FakeBus):
         async def set_variables(
-            self, device_id: str, peripheral_id: str, sets: list[VarSet]
+            self,
+            device_id: str,
+            peripheral_id: str,
+            sets: list[VarSet],
+            *,
+            write_class: WriteClass = WriteClass.INTERACTIVE_FIFO,
+            ticket: AdmissionTicket | None = None,
         ) -> str:
-            await super().set_variables(device_id, peripheral_id, sets)
+            await super().set_variables(
+                device_id, peripheral_id, sets, write_class=write_class, ticket=ticket
+            )
             raise RuntimeError("token=secret\nunsafe")
 
     execution = _execution()
@@ -2075,9 +2185,17 @@ async def test_shutdown_abandons_write_that_delays_cancellation(tmp_path: Path) 
             self.release = asyncio.Event()
 
         async def set_variables(
-            self, device_id: str, peripheral_id: str, sets: list[VarSet]
+            self,
+            device_id: str,
+            peripheral_id: str,
+            sets: list[VarSet],
+            *,
+            write_class: WriteClass = WriteClass.INTERACTIVE_FIFO,
+            ticket: AdmissionTicket | None = None,
         ) -> str:
-            await super().set_variables(device_id, peripheral_id, sets)
+            await super().set_variables(
+                device_id, peripheral_id, sets, write_class=write_class, ticket=ticket
+            )
             self.started.set()
             try:
                 await asyncio.Future()

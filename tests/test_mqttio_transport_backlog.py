@@ -116,6 +116,19 @@ def test_get_nowait_releases_the_byte_budget() -> None:
 # -- Latest-wins coalescing at admission --------------------------------------
 
 
+def test_transport_latest_wins_does_not_cross_button_barrier() -> None:
+    queue = _queue(mqttio._TransportOverloadLatch(), maxsize=8)
+    primary = "brilliant/test/light/set"
+    for topic, payload in [
+        (primary, b"first"),
+        ("brilliant/test/light/set_reset", b"PRESS"),
+        (primary, b"last"),
+    ]:
+        queue.put_nowait(_msg(topic, payload))
+    assert queue.qsize() == 3
+    assert [queue.get_nowait().payload for _ in range(3)] == [b"first", b"PRESS", b"last"]
+
+
 def test_latest_wins_topic_coalesces_at_admission_without_growing_backlog() -> None:
     latch = mqttio._TransportOverloadLatch()
     queue = _queue(latch, maxsize=3)

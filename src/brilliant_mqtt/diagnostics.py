@@ -50,6 +50,7 @@ class ResponseDiagnostics:
         }
         self._hard_cap_total = 0
         self._superseded = 0
+        self._ticket_revoked_before_rpc = 0
         self._bus_reconnect_total = 0
         self._session_rebuild: dict[SessionRebuildReason, int] = {
             "mqtt_reader_dead": 0,
@@ -68,6 +69,9 @@ class ResponseDiagnostics:
 
     def note_superseded(self) -> None:
         self._superseded += 1
+
+    def note_ticket_revoked_before_rpc(self) -> None:
+        self._ticket_revoked_before_rpc += 1
 
     def note_write_settled(
         self, outcome: WriteOutcome, queue_wait_s: float | None, rpc_s: float | None
@@ -104,6 +108,7 @@ class ResponseDiagnostics:
             **{f"write_{outcome}": count for outcome, count in self._outcomes.items()},
             "write_hard_cap_total": self._hard_cap_total,
             "superseded_before_dispatch": self._superseded,
+            "write_ticket_revoked_before_rpc": self._ticket_revoked_before_rpc,
             "bus_reconnect_total": self._bus_reconnect_total,
             "session_rebuild": rebuilds,
             "queue_wait_s_sum": self._queue_wait_s_sum,

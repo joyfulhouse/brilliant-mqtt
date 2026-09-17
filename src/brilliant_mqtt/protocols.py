@@ -14,6 +14,7 @@ from typing import Protocol
 
 from brilliant_mqtt.commands import VarSet
 from brilliant_mqtt.model import BrilliantDevice
+from brilliant_mqtt.write_admission import AdmissionTicket, WriteClass, WriteResult
 
 
 class CommandSubscribeError(RuntimeError):
@@ -92,7 +93,19 @@ class BusClient(Protocol):
         """Return and clear whether an outbound bus write timed out."""
         ...
 
-    async def set_variables(self, device_id: str, peripheral_id: str, sets: list[VarSet]) -> str:
+    def try_supersede(self, ticket: AdmissionTicket, new_payload: list[VarSet]) -> bool:
+        """Replace an unissued latest-wins admission only with a covering payload."""
+        ...
+
+    async def set_variables(
+        self,
+        device_id: str,
+        peripheral_id: str,
+        sets: list[VarSet],
+        *,
+        write_class: WriteClass = WriteClass.INTERACTIVE_FIFO,
+        ticket: AdmissionTicket | None = None,
+    ) -> WriteResult:
         """Write one or more variable values to the given peripheral.
 
         *device_id* routes the write to the bus device that OWNS the
@@ -100,9 +113,8 @@ class BusClient(Protocol):
         loads (plug-in switches/dimmers) use the virtual "ble_mesh" device.
 
         Returns a SMALL normalized receipt describing the transport's
-        acknowledgement — a bounded plain string, never the closed-source
-        response object itself. Purely observational (callers may log it);
-        nothing gates on its content.
+        acknowledgement, or the explicit non-error Superseded outcome. A ticket
+        lets the command lane adopt the replacement without admitting it twice.
         """
         ...
 

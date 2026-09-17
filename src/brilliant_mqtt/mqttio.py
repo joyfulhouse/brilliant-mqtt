@@ -26,6 +26,7 @@ from brilliant_mqtt.diagnostics import ResponseDiagnostics
 from brilliant_mqtt.discovery import availability_topic
 from brilliant_mqtt.mapping import AUX_SPECS
 from brilliant_mqtt.protocols import CommandSubscribeError
+from brilliant_mqtt.write_admission import CommandAdmission, WriteCancelled, command_admission
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +101,10 @@ class _LaneQueue:
     async def put(self, message: _InboundMessage, *, latest_wins: bool) -> None:
         async with self._condition:
             if latest_wins:
-                for index, pending in enumerate(self._pending):
+                for index in range(len(self._pending) - 1, -1, -1):
+                    pending = self._pending[index]
+                    if not _is_latest_wins_topic(pending.topic):
+                        break
                     if pending.topic == message.topic:
                         self._pending[index] = message
                         # Transport and lane queues own disjoint pending sets:
@@ -146,6 +150,8 @@ class _TopicDispatcher:
         self._diagnostics = diagnostics
         self._queues: dict[str, _LaneQueue] = {}
         self._workers: dict[str, asyncio.Task[None]] = {}
+        self._active: dict[str, tuple[_InboundMessage, CommandAdmission]] = {}
+        self._folded: dict[str, _InboundMessage] = {}
         self._closing = False
         self._shutdown_task: asyncio.Task[None] | None = None
         # Cancelled workers that outlived the settle bound — held so the
@@ -162,9 +168,28 @@ class _TopicDispatcher:
             queue = _LaneQueue(maxsize=_TOPIC_QUEUE_MAXSIZE, diagnostics=self._diagnostics)
             self._queues[lane] = queue
             self._workers[lane] = asyncio.create_task(
-                self._run_worker(queue),
+                self._run_worker(lane, queue),
                 name="brilliant-mqtt-command-lane-worker",
             )
+        active = self._active.get(lane)
+        if latest_wins and active is not None and not queue._pending:
+            previous, admission = active
+            if (
+                previous.topic == message.topic
+                and previous.command_cbs == message.command_cbs
+                and previous.message_cbs == message.message_cbs
+                and previous.retained == message.retained
+                and admission.try_supersede is not None
+            ):
+                try:
+                    folded = admission.try_supersede(message.payload)
+                except Exception:
+                    # Preserve the normal callback's error boundary: malformed
+                    # input must not escape this optimization into the reader.
+                    folded = False
+                if folded:
+                    self._folded[lane] = message
+                    return
         await queue.put(message, latest_wins=latest_wins)
 
     async def shutdown(self) -> None:
@@ -226,12 +251,30 @@ class _TopicDispatcher:
             self._workers.clear()
             self._queues.clear()
 
-    async def _run_worker(self, queue: _LaneQueue) -> None:
+    async def _run_worker(self, lane: str, queue: _LaneQueue) -> None:
         while True:
             message = await queue.get()
+            admission = CommandAdmission()
+            token = command_admission.set(admission)
             try:
-                await self._handler(message)
+                while True:
+                    self._active[lane] = (message, admission)
+                    await self._handler(message)
+                    replacement = self._folded.pop(lane, None)
+                    if replacement is None:
+                        break
+                    message = replacement
+            except WriteCancelled:
+                # A bus admission can end independently of this worker. Actual
+                # Task.cancel() still propagates as ordinary CancelledError.
+                logger.debug("MQTT command write cancelled; continuing lane")
             finally:
+                # A folded replacement can still belong to the lane before
+                # its callback adopts it. Do not orphan it on cancellation.
+                admission.ticket.cancel_waiting()
+                command_admission.reset(token)
+                self._active.pop(lane, None)
+                self._folded.pop(lane, None)
                 queue.task_done()
 
 
@@ -330,7 +373,13 @@ class _BoundedTransportQueue(asyncio.Queue[aiomqtt.Message]):
         item_bytes = _message_bytes(item)
         topic = str(item.topic)
         if _is_latest_wins_topic(topic):
-            for index, pending in enumerate(self._queue):
+            for index in range(len(self._queue) - 1, -1, -1):
+                pending = self._queue[index]
+                pending_topic = str(pending.topic)
+                if _command_lane_key(pending_topic) == _command_lane_key(
+                    topic
+                ) and not _is_latest_wins_topic(pending_topic):
+                    break
                 if str(pending.topic) == topic:
                     if item_bytes > self._max_bytes:
                         # A single latest-wins payload too big to EVER fit the
