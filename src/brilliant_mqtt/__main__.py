@@ -169,6 +169,7 @@ async def _run_session(
     participating = settings.mesh_priority >= 1
     mqtt = AioMqttAdapter(settings)
     bus = RpcBusAdapter(extra_device_ids=(_MESH_DEVICE_ID,) if participating else ())
+    mesh_bridge: Bridge | None = None
     scene_bridge: SceneBridge | None = None
     mqtt_connected = False
     phase_marker_failure_logged = False
@@ -280,7 +281,7 @@ async def _run_session(
             # After a bus reconnect, pushes (and the observer's get_all mirror)
             # may have missed changes — re-reconcile to republish the truth.
             await panel_bridge.reconcile()
-            if participating and leader.is_leader:
+            if mesh_bridge is not None and leader.is_leader:
                 await mesh_bridge.reconcile()
 
         bus.on_reconnect(_CoalescingCallback(_reconcile_after_bus_reconnect))
@@ -376,7 +377,7 @@ async def _run_session(
                         raise HotPollReadTimeout("hot poll bus read timed out") from error
                     _beat()
                     await panel_bridge.poll_once(devices)
-                    if participating and leader.is_leader:
+                    if mesh_bridge is not None and leader.is_leader:
                         await mesh_bridge.poll_once(devices)
                     if scene_bridge is not None:
                         await scene_bridge.poll_executions(devices)
@@ -406,7 +407,7 @@ async def _run_session(
             if hot_poll_retry_at is None and time.monotonic() >= next_resync:
                 try:
                     await panel_bridge.reconcile()
-                    if participating and leader.is_leader:
+                    if mesh_bridge is not None and leader.is_leader:
                         await mesh_bridge.reconcile()
                 except (TimeoutError, asyncio.TimeoutError):
                     if consecutive_resync_failures >= 1:
@@ -465,6 +466,11 @@ async def _run_session(
         # than stale_after, and the next attempt writes "pre_bus" at entry.
         # Best-effort teardown; consumers stop before the shared adapters, and
         # every component tolerates a never-fully-started state.
+        if mesh_bridge is not None:
+            try:
+                await mesh_bridge.shutdown_mesh_feedback()
+            except Exception:
+                log.exception("mesh feedback shutdown failed during cleanup")
         if scene_bridge is not None:
             try:
                 await scene_bridge.async_shutdown()

@@ -907,7 +907,7 @@ def test_power_sentinel_not_scaled() -> None:
 
 def test_mesh_dimmer_sentinel_yields_only_primary_light() -> None:
     result = entities_for(_mesh_dimmer(), "mesh")
-    assert [d.component for d in result] == ["light"]
+    assert [d.component for d in result] == ["light", "sensor"]
     assert result[0].unique_id == f"brilliant_mesh_{MESH_PID}"
     assert result[0].supports_brightness is True
 
@@ -930,7 +930,8 @@ def test_unique_id_replaces_ha_illegal_peripheral_characters() -> None:
     [a-zA-Z0-9_-] and silently drops the entity, so the unique_id (the
     discovery topic node) maps every illegal character to "_". Display name
     and peripheral_id — hence state/command topics — stay raw."""
-    (d,) = entities_for(_mesh_dimmer_named("HA Backyard Lamp 1"), "mesh")
+    (d, status) = entities_for(_mesh_dimmer_named("HA Backyard Lamp 1"), "mesh")
+    assert status.unique_id == "brilliant_mesh_HA_Backyard_Lamp_1_mesh_write_status"
     assert d.unique_id == "brilliant_mesh_HA_Backyard_Lamp_1"
     assert d.name == "HA Backyard Lamp 1"
     assert d.peripheral_id == "HA Backyard Lamp 1"
@@ -946,14 +947,21 @@ def test_aux_unique_id_replaces_ha_illegal_peripheral_characters() -> None:
 def test_unique_id_keeps_legal_peripheral_ids_verbatim() -> None:
     """Legal IDs must stay byte-identical — a rename would orphan every
     existing entity in HA's registry fleet-wide."""
-    (d,) = entities_for(_mesh_dimmer(), "mesh")
+    (d, status) = entities_for(_mesh_dimmer(), "mesh")
+    assert status.unique_id == f"brilliant_mesh_{MESH_PID}_mesh_write_status"
     assert d.unique_id == f"brilliant_mesh_{MESH_PID}"
 
 
 def test_mesh_dimmer_payload_brightness_uses_fallback_scale() -> None:
     """No max_intensity_value on mesh dimmers — brightness scales against 1000."""
     payload = payload_fields(_mesh_dimmer())
-    assert payload == {"state": "OFF", "brightness": 153}
+    assert payload == {
+        "state": "OFF",
+        "brightness": 153,
+        "mesh_write_status": "idle",
+        "mesh_requested": {},
+        "mesh_write_deadline": None,
+    }
 
 
 def test_power_descriptor_present_when_real() -> None:
@@ -1326,6 +1334,9 @@ def test_mesh_dimmer_with_motion_payload_fields() -> None:
     assert payload == {
         "state": "OFF",
         "brightness": 153,
+        "mesh_write_status": "idle",
+        "mesh_requested": {},
+        "mesh_write_deadline": None,
         "motion": False,
         "motion_score": 0,
         "enable_motion_score": False,
@@ -1477,9 +1488,9 @@ def test_panel_light_full_no_motion_uid() -> None:
 
 
 def test_mesh_dimmer_sentinel_no_motion_vars_still_one_entity() -> None:
-    """_mesh_dimmer() (without motion vars) still yields exactly one entity."""
+    """Without motion vars, only the primary and write-status diagnostic exist."""
     result = entities_for(_mesh_dimmer(), "mesh")
-    assert [d.component for d in result] == ["light"]
+    assert [d.component for d in result] == ["light", "sensor"]
     uids = {d.unique_id for d in result}
     assert f"brilliant_mesh_{MESH_PID}_movement_detected" not in uids
 
