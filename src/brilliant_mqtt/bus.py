@@ -1291,6 +1291,8 @@ class RpcBusAdapter:
 
         A detached caller never awaits its task, so without this asyncio would
         log "Task exception was never retrieved" at garbage collection.
+        The diagnostics path reads ``self._clock()`` exactly once per settled write.
+        The ``record.settled`` latch rejects repeat callbacks and double-recording.
         """
         self._write_tasks.discard(task)
         error = None if task.cancelled() else task.exception()
