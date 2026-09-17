@@ -31,7 +31,14 @@ from brilliant_mqtt.model import BrilliantDevice, DeviceKind, Variable
 from brilliant_mqtt.motion_derive import MotionDeriver
 from brilliant_mqtt.protocols import BusClient, MqttClient
 from brilliant_mqtt.retained_topics import RetainedTopicLedger
-from brilliant_mqtt.write_admission import Superseded, WriteClass, WriteResult, command_admission
+from brilliant_mqtt.write_admission import (
+    Superseded,
+    WriteAborted,
+    WriteCancelled,
+    WriteClass,
+    WriteResult,
+    command_admission,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -556,12 +563,27 @@ class Bridge:
             self._throttle.last_ts = now
             writes += 1
             try:
-                await self._bus.set_variables(
-                    device.device_id,
-                    device.peripheral_id,
-                    drifted,
-                    write_class=WriteClass.MAINTENANCE,
-                )
+                try:
+                    await self._bus.set_variables(
+                        device.device_id,
+                        device.peripheral_id,
+                        drifted,
+                        write_class=WriteClass.MAINTENANCE,
+                    )
+                except WriteCancelled as superseded:
+                    # An INTERNAL supersession surfaces as WriteCancelled, a
+                    # BaseException (asyncio.CancelledError subclass) by design so
+                    # the admission machinery can tell it apart from a genuine
+                    # Task.cancel(). This is the SINGLE maintenance/reconcile
+                    # boundary where that must be contained: reconcile() runs on
+                    # the mesh-leader tick (a stray CancelledError there hits the
+                    # supervisor's `except asyncio.CancelledError: raise` and
+                    # terminates the whole bridge) and inside the fire-and-forget
+                    # reconnect re-reconcile (where it silently kills the task).
+                    # Convert it to an ordinary Exception so the `except
+                    # Exception` below contains it. A genuine asyncio.CancelledError
+                    # (base class) is NOT a WriteCancelled and still propagates.
+                    raise WriteAborted("maintenance write superseded before issue") from superseded
             except Exception:
                 for vs in drifted:
                     key = (device.peripheral_id, vs.name)
@@ -796,11 +818,15 @@ class Bridge:
         decode: Callable[[str], list[VarSet]] | None,
     ) -> WriteResult:
         admission = command_admission.get() if decode is not None else None
+        write_class = WriteClass.INTERACTIVE_LATEST if decode else WriteClass.INTERACTIVE_FIFO
+        reused_ticket = False
         if admission is not None and decode is not None:
             hook = admission.try_supersede
             if isinstance(hook, _CommandSupersession):
-                # Adoption still settles the accepted replacement. It cannot
-                # refresh the ticket's binding after a fold/rebinding race.
+                # Re-handle of a folded write reusing the same ticket. Adoption
+                # still settles the accepted replacement; the hook cannot refresh
+                # the ticket's binding after a fold/rebinding race.
+                reused_ticket = True
                 hook.enabled &= hook.generation == self._command_generation.get(peripheral_id)
             elif hook is None:
 
@@ -813,13 +839,36 @@ class Bridge:
                 admission.try_supersede = _CommandSupersession(
                     self._command_generation[peripheral_id], supersede
                 )
-        return await self._bus.set_variables(
-            device.device_id,
-            peripheral_id,
-            sets,
-            write_class=(WriteClass.INTERACTIVE_LATEST if decode else WriteClass.INTERACTIVE_FIFO),
-            ticket=admission.ticket if admission else None,
-        )
+        ticket = admission.ticket if admission is not None else None
+        try:
+            return await self._bus.set_variables(
+                device.device_id,
+                peripheral_id,
+                sets,
+                write_class=write_class,
+                ticket=ticket,
+            )
+        except ValueError:
+            if not reused_ticket or ticket is None:
+                raise
+            # Re-handling a folded write after a mid-burst re-type: the target's
+            # translation/route rebound since the fold, so the reused ticket
+            # still carries the payload translated against the OLD snapshot and
+            # the bus rejected adoption of the freshly-decoded NEWEST value
+            # (#149). Without recovery the worker's cancel_waiting() then drops
+            # the folded write and the newest interactive intent is silently
+            # lost. Abandon the stale waiting write and re-issue the newest value
+            # on a FRESH ticket so it still reaches the bus — and only the
+            # newest: cancel_waiting() tombstones the stale intermediate so it is
+            # never issued ahead of it (D12/#150 retain-position ordering).
+            ticket.cancel_waiting()
+            return await self._bus.set_variables(
+                device.device_id,
+                peripheral_id,
+                sets,
+                write_class=write_class,
+                ticket=None,
+            )
 
     async def _write_mesh_primary(
         self,
