@@ -35,7 +35,12 @@ from brilliant_mqtt.desired_state import DesiredState
 from brilliant_mqtt.mesh_leader import MeshLeader
 from brilliant_mqtt.model import BrilliantDevice, DeviceKind, Variable
 from brilliant_mqtt.mqttio import _InboundMessage, _TopicDispatcher
-from brilliant_mqtt.write_admission import AdmissionTicket, WriteCancelled, WriteClass
+from brilliant_mqtt.write_admission import (
+    AdmissionTicket,
+    TicketAdoptionError,
+    WriteCancelled,
+    WriteClass,
+)
 from tests.fakes import FakeBus, FakeClock, FakeMqtt
 from tests.test_bus_adapter import _adapter_for, _SchedulingObserver, _settle
 
@@ -164,6 +169,140 @@ async def test_folded_retype_does_not_issue_stale_intermediate_before_newest() -
         await asyncio.gather(blocker, return_exceptions=True)
 
 
+async def _ready_turns() -> None:
+    """Drain ready callbacks without sleeps or wall-clock deadlines."""
+    loop = asyncio.get_running_loop()
+    for _ in range(10):
+        checkpoint: asyncio.Future[None] = loop.create_future()
+        loop.call_soon(checkpoint.set_result, None)
+        await checkpoint
+
+
+async def test_already_issued_folded_retype_converges_to_newest() -> None:
+    """An issued stale fold cannot be retracted, but the fresh re-issue wins."""
+    observer, adapter = _adapter_for(_SchedulingObserver())
+    bridge = Bridge(adapter, FakeMqtt(), "test")
+    topic = "brilliant/test/slider/set"
+    bridge._devices["slider"] = _light("255")
+    bridge._by_cmd_topic[topic] = ("slider", None)
+    dispatcher = _TopicDispatcher(lambda message: _dispatch_handler(bridge, message))
+    blocker = asyncio.create_task(adapter.set_variables("shared", "blocker", [VarSet("on", "1")]))
+    try:
+        await _ready_turns()
+        await dispatcher.dispatch(
+            _InboundMessage(topic, '{"state":"ON","brightness":100}', False, (), ()),
+            latest_wins=True,
+        )
+        await _ready_turns()
+        # Queue the blocker release before folding wakes the lane worker.
+        # Dispatch and re-type do not yield, so the stale fold issues first.
+        observer.release.set()
+        await dispatcher.dispatch(
+            _InboundMessage(topic, '{"state":"ON","brightness":200}', False, (), ()),
+            latest_wins=True,
+        )
+        bridge._remember_device(_light("100"))
+        await blocker
+        await dispatcher.shutdown()
+
+        intensities = [
+            values["intensity"] for _, pid, values in observer.payloads if pid == "slider"
+        ]
+        assert intensities == ["200", "78"]
+        assert intensities[-1] == "78"
+        assert observer.max_in_flight == 1
+        assert not adapter._write_admissions
+    finally:
+        observer.release.set()
+        await dispatcher.shutdown()
+        await adapter.shutdown()
+        await asyncio.gather(blocker, return_exceptions=True)
+
+
+async def test_reused_ticket_native_value_error_propagates_without_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observer, adapter = _adapter_for(_SchedulingObserver())
+    error = ValueError("native RPC rejected value")
+    native_write = observer.request_set_variables_in_peripheral
+
+    async def fail_slider(peripheral_id: str, values: dict[str, str], *, device_id: str) -> str:
+        result = await native_write(peripheral_id, values, device_id=device_id)
+        if peripheral_id == "slider":
+            raise error
+        return result
+
+    monkeypatch.setattr(observer, "request_set_variables_in_peripheral", fail_slider)
+    bridge = Bridge(adapter, FakeMqtt(), "test")
+    topic = "brilliant/test/slider/set"
+    bridge._devices["slider"] = _light("255")
+    bridge._by_cmd_topic[topic] = ("slider", None)
+    propagated: list[ValueError] = []
+
+    async def handler(message: _InboundMessage) -> None:
+        try:
+            await bridge._on_command(message.topic, message.payload)
+        except ValueError as caught:
+            propagated.append(caught)
+
+    dispatcher = _TopicDispatcher(handler)
+    blocker = asyncio.create_task(adapter.set_variables("shared", "blocker", [VarSet("on", "1")]))
+    try:
+        await _ready_turns()
+        await dispatcher.dispatch(
+            _InboundMessage(topic, '{"state":"ON","brightness":100}', False, (), ()),
+            latest_wins=True,
+        )
+        await _ready_turns()
+        await dispatcher.dispatch(
+            _InboundMessage(topic, '{"state":"ON","brightness":200}', False, (), ()),
+            latest_wins=True,
+        )
+        await _ready_turns()  # The folded write adopts the ticket before native issue.
+        observer.release.set()
+        await blocker
+        await dispatcher.shutdown()
+
+        intensities = [
+            values["intensity"] for _, pid, values in observer.payloads if pid == "slider"
+        ]
+        assert intensities == ["200"]
+        assert propagated == [error]
+        assert observer.max_in_flight == 1
+        assert not adapter._write_admissions
+    finally:
+        observer.release.set()
+        await dispatcher.shutdown()
+        await adapter.shutdown()
+        await asyncio.gather(blocker, return_exceptions=True)
+
+
+@pytest.mark.parametrize("mismatch", ["payload", "completed", "foreign"])
+async def test_ticket_adoption_errors_remain_value_errors(mismatch: str) -> None:
+    observer, adapter = _adapter_for(_SchedulingObserver())
+    ticket = AdmissionTicket()
+    original = asyncio.create_task(
+        adapter.set_variables("shared", "slider", [VarSet("intensity", "100")], ticket=ticket)
+    )
+    try:
+        await _ready_turns()
+        if mismatch == "completed":
+            observer.release.set()
+            await original
+        elif mismatch == "foreign":
+            ticket = AdmissionTicket()
+            ticket._owner = object()
+        with pytest.raises(ValueError) as caught:
+            await adapter.set_variables(
+                "shared", "slider", [VarSet("intensity", "200")], ticket=ticket
+            )
+        assert isinstance(caught.value, TicketAdoptionError)
+    finally:
+        observer.release.set()
+        await asyncio.gather(original, return_exceptions=True)
+        await adapter.shutdown()
+
+
 # --------------------------------------------------------------------------- #
 # Q2: WriteCancelled (a BaseException) escaping the maintenance/reconcile
 # boundaries — enforce_desired, the reconnect re-reconcile, and the mesh-leader
@@ -210,6 +349,78 @@ def _drifted_bridge(bus: FakeBus, tmp_path: Path) -> tuple[Bridge, BrilliantDevi
         variables={"enable_motion_score": Variable("enable_motion_score", "0")},
     )
     return bridge, device
+
+
+@pytest.mark.parametrize("retry_interval", [60.0, 120.0])
+async def test_internal_supersession_retains_desired_and_retry_interval(
+    retry_interval: float, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    bus = _RaisingBus(WriteCancelled())
+    bridge, device = _drifted_bridge(bus, tmp_path)
+    clock = FakeClock()
+    bridge._clock = clock
+    bridge._devices[device.peripheral_id] = device
+    key = ("repair", "enable_motion_score")
+    bridge._reassert_retry_interval_s[key] = retry_interval
+
+    with caplog.at_level(logging.DEBUG, logger="brilliant_mqtt.bridge"):
+        await bridge._enforce_desired([device])
+
+    assert bus.set_variables_calls == 1
+    assert bridge._reassert_retry_interval_s[key] == retry_interval
+    assert bridge._desired is not None
+    assert bridge._desired.wanted("repair") == {"enable_motion_score": "1"}
+    assert bridge._devices["repair"].variables["enable_motion_score"].value == "0"
+    assert "superseded internally" in caplog.text
+    assert all(
+        record.exc_info is None and record.levelno <= logging.INFO for record in caplog.records
+    )
+
+    clock.advance(retry_interval - 1)
+    await bridge._enforce_desired([device])
+    assert bus.set_variables_calls == 1
+    clock.advance(1)
+    await bridge._enforce_desired([device])
+    assert bus.set_variables_calls == 2
+
+
+async def test_enforce_desired_propagates_genuine_task_cancellation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    bus = FakeBus([])
+    started = asyncio.Event()
+    pending = asyncio.Event()
+
+    async def blocked_write(
+        device_id: str,
+        peripheral_id: str,
+        sets: list[VarSet],
+        *,
+        write_class: WriteClass = WriteClass.INTERACTIVE_FIFO,
+        ticket: AdmissionTicket | None = None,
+    ) -> str:
+        started.set()
+        await pending.wait()
+        return "ok"
+
+    monkeypatch.setattr(bus, "set_variables", blocked_write)
+    bridge, device = _drifted_bridge(bus, tmp_path)
+    bridge._devices[device.peripheral_id] = device
+    task = asyncio.create_task(bridge._enforce_desired([device]))
+    try:
+        await started.wait()
+        with caplog.at_level(logging.DEBUG, logger="brilliant_mqtt.bridge"):
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError) as caught:
+                await task
+        assert type(caught.value) is asyncio.CancelledError
+        assert task.cancelled()
+        assert not caplog.records
+        assert not bridge._reassert_retry_interval_s
+        assert bridge._devices["repair"].variables["enable_motion_score"].value == "0"
+    finally:
+        pending.set()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 async def test_real_enforce_desired_contains_internal_write_cancelled(
@@ -307,7 +518,7 @@ async def test_reconnect_re_reconcile_survives_write_cancelled(tmp_path: Path) -
     ids=["writecancelled-defect", "runtimeerror-control"],
 )
 async def test_mesh_leader_acquire_does_not_terminate_supervisor(
-    error: BaseException, tmp_path: Path
+    error: BaseException, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Path (c) — the worst one: on_acquire=reconcile runs on the mesh-leader
     tick in the MAIN loop. A WriteCancelled propagating out of tick() hits the
@@ -361,3 +572,8 @@ async def test_mesh_leader_acquire_does_not_terminate_supervisor(
     assert not supervisor_terminated
     assert not supervisor_contained
     assert leader.is_leader
+    if isinstance(error, WriteCancelled):
+        assert not bridge._reassert_retry_interval_s
+        assert not any(record.exc_info for record in caplog.records)
+        assert bridge._desired is not None
+        assert bridge._desired.wanted("repair") == {"enable_motion_score": "1"}
