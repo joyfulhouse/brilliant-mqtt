@@ -33,6 +33,14 @@ from brilliant_mqtt.model import BrilliantDevice, DeviceKind, Variable
 from brilliant_mqtt.motion_derive import MotionDeriver
 from brilliant_mqtt.protocols import BusClient, MqttClient
 from brilliant_mqtt.retained_topics import RetainedTopicLedger
+from brilliant_mqtt.write_admission import (
+    Superseded,
+    TicketAdoptionError,
+    WriteCancelled,
+    WriteClass,
+    WriteResult,
+    command_admission,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +76,18 @@ _MESH_RECEIPT_LOG_SAMPLE_EVERY = 10
 # detached in the adapter — so the pending record is armed exactly as for an
 # accepted write and observations settle it. Logged wherever a receipt is.
 _PENDING_RPC_RECEIPT = "<rpc pending after caller deadline>"
+
+
+@dataclass
+class _CommandSupersession:
+    """Keep the original decoder and binding epoch for the ticket's lifetime."""
+
+    generation: int
+    supersede: Callable[[str], bool]
+    enabled: bool = True
+
+    def __call__(self, payload: str) -> bool:
+        return self.enabled and self.supersede(payload)
 
 
 @dataclass
@@ -200,6 +220,8 @@ class Bridge:
         self._owned_topics = owned_topics
         # (peripheral_id, var) -> monotonic time of last re-assert attempt.
         self._last_reassert: dict[tuple[str, str], float] = {}
+        # Failed writes double their per-variable retry delay up to five minutes.
+        self._reassert_retry_interval_s: dict[tuple[str, str], float] = {}
         # (peripheral_id, var) pairs already reported as not exposed by their
         # snapshot — a peripheral that stops advertising a desired var exits
         # reconciliation silently otherwise (log once, not every tick).
@@ -215,6 +237,9 @@ class Bridge:
         # command topic → (peripheral_id, descriptor). descriptor is None for the
         # PRIMARY JSON light/switch topic; an EntityDescriptor for each aux topic.
         self._by_cmd_topic: dict[str, tuple[str, EntityDescriptor | None]] = {}
+        # Admission ownership, separate from mesh confirmation generations.
+        # Keep epochs across withdrawal/rebinding to reject an A -> B -> A route.
+        self._command_generation: dict[str, int] = {}
         # Command topics this session has already SUBSCRIBEd (#76): the periodic
         # resync must not re-issue them. Bridge lifetime == MQTT session, and
         # withdraw() clears it, so a rebuilt session re-subscribes everything.
@@ -257,6 +282,22 @@ class Bridge:
     def _derived(self, device: BrilliantDevice) -> BrilliantDevice:
         """Apply score-derived motion to *device* (identity when disabled)."""
         return device if self._deriver is None else self._deriver.apply(device)
+
+    def _remember_device(self, device: BrilliantDevice) -> None:
+        previous = self._devices.get(device.peripheral_id)
+        if (
+            previous is None
+            or (previous.device_id, previous.peripheral_id)
+            != (device.device_id, device.peripheral_id)
+            or (previous.kind, previous.is_dimmable, previous.max_intensity)
+            != (device.kind, device.is_dimmable, device.max_intensity)
+        ):
+            # These are translate_command's snapshot inputs. Observed values
+            # and a new snapshot object do not change the command binding.
+            self._command_generation[device.peripheral_id] = (
+                self._command_generation.get(device.peripheral_id, 0) + 1
+            )
+        self._devices[device.peripheral_id] = device
 
     def _beat(self) -> None:
         if self._heartbeat is not None:
@@ -319,7 +360,7 @@ class Bridge:
             n_entities += len(descriptors)
 
             device = self._derived(device)
-            self._devices[device.peripheral_id] = device
+            self._remember_device(device)
             self._observe_mesh_pending(device)
 
             # Publish one discovery config per entity descriptor.
@@ -369,11 +410,16 @@ class Bridge:
         The PRIMARY light/switch JSON topic maps to (peripheral_id, None); each
         aux switch/number/button maps its per-variable topic to (peripheral_id, d).
         """
-        if d.component in ("light", "switch") and d.command_var is None:
-            self._by_cmd_topic[command_topic(self._panel, peripheral_id)] = (peripheral_id, None)
-        elif d.command_var is not None:
-            topic = aux_command_topic(self._panel, peripheral_id, d.command_var)
-            self._by_cmd_topic[topic] = (peripheral_id, d)
+        topic = self._command_topic_for(peripheral_id, d)
+        if topic is None:
+            return
+        route = (peripheral_id, d if d.command_var is not None else None)
+        previous = self._by_cmd_topic.get(topic)
+        if previous is not None and previous != route:
+            self._command_generation[peripheral_id] = (
+                self._command_generation.get(peripheral_id, 0) + 1
+            )
+        self._by_cmd_topic[topic] = route
 
     async def withdraw(self) -> None:
         """Step down as publisher: drop command subscriptions and cached state.
@@ -394,6 +440,8 @@ class Bridge:
         # not publish one (the registry union also reaches a resolver already
         # past its pending entry, mid-publish).
         topics = list(self._by_cmd_topic)
+        for peripheral_id in self._command_generation:
+            self._command_generation[peripheral_id] += 1
         self._by_cmd_topic.clear()
         self._subscribed.clear()
         for peripheral_id in set(self._pending_mesh) | set(self._mesh_confirm_tasks):
@@ -451,7 +499,7 @@ class Bridge:
             if not entities_for(device, self._panel):
                 continue
             device = self._derived(device)
-            self._devices[device.peripheral_id] = device
+            self._remember_device(device)
             self._observe_mesh_pending(device)
             fields = payload_fields(device)
             if fields:
@@ -491,8 +539,10 @@ class Bridge:
                     continue
                 if str(cur.value) == str(want):
                     continue
-                last = self._last_reassert.get((device.peripheral_id, var))
-                if last is not None and (now - last) < self._reconcile_min_interval_s:
+                key = (device.peripheral_id, var)
+                last = self._last_reassert.get(key)
+                interval = self._reassert_retry_interval_s.get(key, self._reconcile_min_interval_s)
+                if last is not None and (now - last) < interval:
                     continue
                 drifted.append(VarSet(var, want))
             if not drifted:
@@ -528,20 +578,50 @@ class Bridge:
             self._throttle.last_ts = now
             writes += 1
             try:
-                await self._bus.set_variables(device.device_id, device.peripheral_id, drifted)
-                logger.info(
-                    "reconcile-desired %s/%s: %s",
+                await self._bus.set_variables(
                     device.device_id,
                     device.peripheral_id,
-                    {vs.name: vs.value for vs in drifted},
+                    drifted,
+                    write_class=WriteClass.MAINTENANCE,
                 )
+            except WriteCancelled:
+                # Keep desired state and retry timing; skip the unconfirmed echo.
+                # A genuine Task.cancel() raises the base CancelledError and escapes.
+                logger.debug(
+                    "reconcile-desired write superseded internally for %s/%s; continuing",
+                    device.device_id,
+                    device.peripheral_id,
+                )
+                continue
+            except Exception:
+                for vs in drifted:
+                    key = (device.peripheral_id, vs.name)
+                    interval = self._reassert_retry_interval_s.get(
+                        key, self._reconcile_min_interval_s
+                    )
+                    self._reassert_retry_interval_s[key] = min(interval * 2.0, 300.0)
+                logger.exception(
+                    "reconcile-desired write failed for %s/%s; continuing",
+                    device.device_id,
+                    device.peripheral_id,
+                )
+                continue
+            for vs in drifted:
+                self._reassert_retry_interval_s.pop((device.peripheral_id, vs.name), None)
+            logger.info(
+                "reconcile-desired %s/%s: %s",
+                device.device_id,
+                device.peripheral_id,
+                {vs.name: vs.value for vs in drifted},
+            )
+            try:
                 # Echo like the command path does: without it, HA shows the
                 # firmware's reverted value until the next poll — a phantom
                 # OFF blip in history/automations on every revert cycle.
                 await self._echo_state(device.peripheral_id, drifted)
             except Exception:
                 logger.exception(
-                    "reconcile-desired write/echo failed for %s/%s; continuing",
+                    "reconcile-desired echo failed for %s/%s; continuing",
                     device.device_id,
                     device.peripheral_id,
                 )
@@ -682,7 +762,7 @@ class Bridge:
             return
 
         device = self._derived(device)
-        self._devices[device.peripheral_id] = device
+        self._remember_device(device)
         self._observe_mesh_pending(device)
 
         fields = payload_fields(device)
@@ -726,6 +806,27 @@ class Bridge:
 
         sets: list[VarSet] = translate_command(device, parsed)
         if sets:
+            route = self._by_cmd_topic.get(topic)
+            target = (device.device_id, device.peripheral_id)
+            translation = (device.kind, device.is_dimmable, device.max_intensity)
+            generation = self._command_generation.setdefault(peripheral_id, 0)
+
+            def decode(new_payload: str) -> list[VarSet]:
+                current = self._devices.get(peripheral_id)
+                if (
+                    self._command_generation.get(peripheral_id) != generation
+                    or self._by_cmd_topic.get(topic) != route
+                    or current is None
+                    or (current.device_id, current.peripheral_id) != target
+                    or (current.kind, current.is_dimmable, current.max_intensity) != translation
+                ):
+                    return []
+                try:
+                    value = json.loads(new_payload)
+                except (json.JSONDecodeError, ValueError):
+                    return []
+                return translate_command(current, value) if isinstance(value, dict) else []
+
             logger.info(
                 "command %s -> %s: %s",
                 topic,
@@ -735,11 +836,13 @@ class Bridge:
             if device.device_id == _MESH_DEVICE_ID:
                 # Mesh primaries: no optimistic echo — observation-confirmed
                 # write with a pending-visible (state: null) window instead.
-                await self._write_mesh_primary(device, peripheral_id, sets)
+                await self._write_mesh_primary(device, peripheral_id, sets, decode=decode)
                 return
             # Route the write to the bus device owning the peripheral (the
             # panel's own CONTROL device for wired loads).
-            await self._bus.set_variables(device.device_id, peripheral_id, sets)
+            result = await self._write_command(device, peripheral_id, sets, decode)
+            if isinstance(result, Superseded):
+                return
             await self._echo_state(peripheral_id, sets)
 
     async def _handle_aux_command(
@@ -764,11 +867,111 @@ class Bridge:
             return
         logger.info("aux command %s -> %s: %s=%s", topic, peripheral_id, d.command_var, value)
         sets = [VarSet(d.command_var, value)]
-        await self._bus.set_variables(device.device_id, peripheral_id, sets)
+        route = self._by_cmd_topic.get(topic)
+        target = (device.device_id, device.peripheral_id)
+        generation = self._command_generation.setdefault(peripheral_id, 0)
+
+        def decode(new_payload: str) -> list[VarSet]:
+            current = self._devices.get(peripheral_id)
+            if (
+                self._command_generation.get(peripheral_id) != generation
+                or self._by_cmd_topic.get(topic) != route
+                or current is None
+                or (current.device_id, current.peripheral_id) != target
+            ):
+                return []
+            value = translate_aux(new_payload, d.value_kind, d.invert, d.min_value, d.max_value)
+            return [VarSet(d.command_var, value)] if value is not None and d.command_var else []
+
+        result = await self._write_command(
+            device, peripheral_id, sets, decode if d.component == "number" else None
+        )
+        if isinstance(result, Superseded):
+            return
         await self._echo_state(peripheral_id, sets)
 
+    async def _write_command(
+        self,
+        device: BrilliantDevice,
+        peripheral_id: str,
+        sets: list[VarSet],
+        decode: Callable[[str], list[VarSet]] | None,
+    ) -> WriteResult:
+        admission = command_admission.get() if decode is not None else None
+        write_class = WriteClass.INTERACTIVE_LATEST if decode else WriteClass.INTERACTIVE_FIFO
+        reused_ticket = False
+        if admission is not None and decode is not None:
+            hook = admission.try_supersede
+            if isinstance(hook, _CommandSupersession):
+                # Re-handle of a folded write reusing the same ticket. Adoption
+                # still settles the accepted replacement; the hook cannot refresh
+                # the ticket's binding after a fold/rebinding race.
+                reused_ticket = True
+                hook.enabled &= hook.generation == self._command_generation.get(peripheral_id)
+            elif hook is None:
+
+                def supersede(payload: str) -> bool:
+                    replacement = decode(payload)
+                    return bool(replacement) and self._bus.try_supersede(
+                        admission.ticket, replacement
+                    )
+
+                admission.try_supersede = _CommandSupersession(
+                    self._command_generation[peripheral_id], supersede
+                )
+        ticket = admission.ticket if admission is not None else None
+        try:
+            return await self._bus.set_variables(
+                device.device_id,
+                peripheral_id,
+                sets,
+                write_class=write_class,
+                ticket=ticket,
+            )
+        except TicketAdoptionError:
+            if not reused_ticket or ticket is None:
+                raise
+            # Re-handling a folded write after a mid-burst re-type: the target's
+            # translation/route rebound since the fold, so the reused ticket
+            # still carries the payload translated against the OLD snapshot and
+            # the bus rejected adoption of the freshly-decoded NEWEST value
+            # (#149). Without recovery the worker's cancel_waiting() then drops
+            # the folded write and the newest interactive intent is silently
+            # lost. Abandon the stale waiting write and re-issue the newest value
+            # on a FRESH ticket so it still reaches the bus — and, while the
+            # stale write is still WAITING, only the newest: cancel_waiting()
+            # tombstones the stale intermediate so it is never issued ahead of it
+            # (D12/#150 retain-position ordering).
+            #
+            # Known limitation (inherent, accepted): cancel_waiting() can only
+            # tombstone a write that has NOT been issued. If the folded write
+            # already acquired the device lock in the fold->re-handle gap
+            # (admission.issued is True), cancel_waiting() no-ops (bus
+            # _cancel_waiting only cancels a not-yet-issued write) and the
+            # already-issued stale value cannot be retracted — the observed
+            # native sequence is then [stale, newest] rather than [newest]. This
+            # is still a strict improvement over the pre-fix behaviour (which
+            # left the STALE value as the FINAL state and lost the newest): the
+            # newest re-issue here still wins as the FINAL state. Removing the
+            # residual would require PREEMPTING an already-issued RPC — forbidden
+            # by the per-device single-native-writer contract (#72) — or
+            # reintroducing the wrong-final-value bug, so it is left as-is.
+            ticket.cancel_waiting()
+            return await self._bus.set_variables(
+                device.device_id,
+                peripheral_id,
+                sets,
+                write_class=write_class,
+                ticket=None,
+            )
+
     async def _write_mesh_primary(
-        self, device: BrilliantDevice, peripheral_id: str, sets: list[VarSet]
+        self,
+        device: BrilliantDevice,
+        peripheral_id: str,
+        sets: list[VarSet],
+        *,
+        decode: Callable[[str], list[VarSet]] | None = None,
     ) -> None:
         """Mesh primary write with observation-confirmed publication (#46/#47).
 
@@ -797,7 +1000,10 @@ class Bridge:
             else None,
         )
         try:
-            receipt = await self._bus.set_variables(device.device_id, peripheral_id, sets)
+            result = await self._write_command(device, peripheral_id, sets, decode)
+            if isinstance(result, Superseded):
+                return
+            receipt = result
         except (asyncio.TimeoutError, TimeoutError):
             # Both classes: they are distinct on the panel's Python 3.10, and
             # the bus adapter raises the asyncio one while the panel lib's own
@@ -1037,7 +1243,7 @@ class Bridge:
             settable = old.externally_settable if old is not None else True
             new_vars[s.name] = Variable(s.name, s.value, externally_settable=settable)
         updated = replace(device, variables=new_vars)
-        self._devices[peripheral_id] = updated
+        self._remember_device(updated)
 
         fields = payload_fields(updated)
         if fields:
