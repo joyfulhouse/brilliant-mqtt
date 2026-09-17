@@ -583,7 +583,10 @@ class Bridge:
                     # Convert it to an ordinary Exception so the `except
                     # Exception` below contains it. A genuine asyncio.CancelledError
                     # (base class) is NOT a WriteCancelled and still propagates.
-                    raise WriteAborted("maintenance write superseded before issue") from superseded
+                    raise WriteAborted(
+                        "maintenance write aborted before issue "
+                        "(internal settlement or teardown surfaced out of the write path)"
+                    ) from superseded
             except Exception:
                 for vs in drifted:
                     key = (device.peripheral_id, vs.name)
@@ -858,9 +861,24 @@ class Bridge:
             # (#149). Without recovery the worker's cancel_waiting() then drops
             # the folded write and the newest interactive intent is silently
             # lost. Abandon the stale waiting write and re-issue the newest value
-            # on a FRESH ticket so it still reaches the bus — and only the
-            # newest: cancel_waiting() tombstones the stale intermediate so it is
-            # never issued ahead of it (D12/#150 retain-position ordering).
+            # on a FRESH ticket so it still reaches the bus — and, while the
+            # stale write is still WAITING, only the newest: cancel_waiting()
+            # tombstones the stale intermediate so it is never issued ahead of it
+            # (D12/#150 retain-position ordering).
+            #
+            # Known limitation (inherent, accepted): cancel_waiting() can only
+            # tombstone a write that has NOT been issued. If the folded write
+            # already acquired the device lock in the fold->re-handle gap
+            # (admission.issued is True), cancel_waiting() no-ops (bus
+            # _cancel_waiting only cancels a not-yet-issued write) and the
+            # already-issued stale value cannot be retracted — the observed
+            # native sequence is then [stale, newest] rather than [newest]. This
+            # is still a strict improvement over the pre-fix behaviour (which
+            # left the STALE value as the FINAL state and lost the newest): the
+            # newest re-issue here still wins as the FINAL state. Removing the
+            # residual would require PREEMPTING an already-issued RPC — forbidden
+            # by the per-device single-native-writer contract (#72) — or
+            # reintroducing the wrong-final-value bug, so it is left as-is.
             ticket.cancel_waiting()
             return await self._bus.set_variables(
                 device.device_id,
