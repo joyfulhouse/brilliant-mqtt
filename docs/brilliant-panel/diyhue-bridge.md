@@ -159,8 +159,15 @@ A firmware OTA wipes **both** `/data` (the CA bundle) and `/etc/systemd/system/`
 
 - **Proven end-to-end:** panel → diyHue (TLS via our CA) → HA → real bulb, both
   shed and backyard lamps; on/off exact.
-- **Soft spots:** HA→panel *reflection* is poll-bounded (diyHue 10 s state poll +
-  the panel's own poll) — display lag, not command lag. Brightness is approximate
+- **Soft spots:** HA→panel *reflection* is poll-bounded: this record reports a
+  diyHue 10 s state poll, not a documented minimum; this is a recorded observation
+  with no documented measurement method. Confirm it against the running deployment
+  before using it as a baseline or comparator. The panel's own polling cadence
+  is undocumented. Display latency remains unmeasured, and command latency cannot
+  be inferred from these intervals. See the
+  [measure-first event-reflection proposal](diyhue-event-reflection-proposal.md)
+  for conditional predictions, the shorter-poll comparator, and separate upstream
+  qualification. No physical slider latency fix is claimed. Brightness is approximate
   (intensity 0–1000 ↔ HA 0–255, localtuya calibration slop); on/off is exact.
 
 ## Operational runbook

@@ -15,6 +15,7 @@ The central finding is that the panel is not a collection of isolated integratio
 | [Native HA slider validation status](native-ha-slider-validation-status.md) | Exact live evidence, safety record, confirmed/unknown boundaries, implemented probes, and ordered remaining gates |
 | [HA entity to physical-slider feasibility](slider-bridge-feasibility.md) | Decompiled slider eligibility, required Virtual Control/light contract, provisioning boundary, and live acceptance gates |
 | [diyHue local control path](diyhue-bridge.md) | **PROVEN** — the panel's native Hue client drives HA lights via a local diyHue bridge: the three walls (mDNS discovery, link-button pairing, pinned-cert TLS) and how each is handled, credential injection, leadership moves, the CA-recovery component, and the operational runbook |
+| [diyHue event-reflection proposal](diyhue-event-reflection-proposal.md) | Measure-first upstream proposal, conditional latency model, permanent reconciliation, and separate cache/display qualification |
 | [Native partner-stub feasibility](native-partner-stub-feasibility.md) | Shipped `stubbed=True` partner-host mechanism, sanitized live inventory, stub-first shade/lock decision, PowerView cover fallback, media boundary, safety constraints, and ordered validation gates |
 | [Virtual Control runtime contract](virtual-control-runtime-contract.md) | Recovered stock vassal lifecycle, local addressing, configuration host, privilege handoff, isolated path surface, emulator boundary, and no-start manifest |
 | [Coordinated VC session](coordinated-session-design.md) | Implemented one-shot approval, staged-source gate, non-root coordinator/service, exact deadlines, monitoring, cleanup, and remaining live proof |
@@ -24,6 +25,8 @@ The central finding is that the panel is not a collection of isolated integratio
 | [Home Assistant support matrix](home-assistant-support-matrix.md) | Implemented, partially implemented, missing, inappropriate, and recommended capabilities |
 | [Home Assistant control and scene bridge](home-assistant-integration.md) | Authoritative ownership model, configuration, MQTT contract, HA surfaces, safety, diagnostics, and migration |
 | [Validation runbook](validation-runbook.md) | Safe static, read-only, telemetry, and write-validation procedures |
+| [Broadcast, ARP, and established MQTT qualification](runbooks/broadcast-arp-vs-mqtt-diagnostics.md) | Agent-first elimination, bounded same-segment comparison, independent delivery/neighbor verdicts, and separately qualified recovery |
+| [Wi-Fi and native response qualification](runbooks/wifi-response-qualification.md) | Separate RF, binding, queue/RPC, and displayed-state measurements; controlled changes and physical-slider qualification boundaries |
 | [Office scene-bridge pilot](runbooks/scene-bridge-pilot.md) | Hardware acceptance, restart/replay checks, rollback, evidence, and legacy-removal gate |
 | [Virtual Control research toolkit](virtual-control-toolkit.md) | What `tools/brilliant_vc` is, its fail-closed safety model, module inventory, and the reference deploy units |
 | [Virtual Control feasibility gates](runbooks/virtual-control-gates.md) | Official token/provisioning boundary, PKCS#12 materialization, isolated uWSGI runtime contract, monitor, and native-light gates |
