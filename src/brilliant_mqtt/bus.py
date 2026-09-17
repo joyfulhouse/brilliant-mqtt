@@ -1158,21 +1158,8 @@ class RpcBusAdapter:
             # future finishes concurrently. wait preserves that cancellation
             # without cancelling the independently owned admission result.
             done, _ = await asyncio.wait({result}, timeout=_WRITE_DEADLINE_S)
-            if not done:
-                raise asyncio.TimeoutError
-            return result.result()
-        except asyncio.CancelledError:
-            if result is not admission.result:
-                # Cancellation of an already superseded caller cannot revoke
-                # the replacement's independently owned admission.
-                raise
-            if not admission.issued and admission.task is not None:
-                self._cancel_waiting(ticket)
-            raise
-        except asyncio.TimeoutError:
-            if result.done():
-                # A completed native timeout is not a detached live write.
-                raise
+            if done:
+                return result.result()
             admission.record.detached = True
             logger.warning(
                 "set_variables(%s) unresolved after %.0fs; detaching from the caller "
@@ -1181,6 +1168,14 @@ class RpcBusAdapter:
                 _WRITE_DEADLINE_S,
                 self._queue_wait(admission.record),
             )
+            raise asyncio.TimeoutError
+        except asyncio.CancelledError:
+            if result is not admission.result:
+                # Cancellation of an already superseded caller cannot revoke
+                # the replacement's independently owned admission.
+                raise
+            if not admission.issued and admission.task is not None:
+                self._cancel_waiting(ticket)
             raise
         finally:
             if not (
