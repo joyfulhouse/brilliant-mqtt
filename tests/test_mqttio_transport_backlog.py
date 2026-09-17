@@ -22,7 +22,7 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import AsyncIterator
-from typing import Protocol, cast
+from typing import cast
 
 import aiomqtt
 import paho.mqtt.client as paho
@@ -31,6 +31,7 @@ import pytest
 from brilliant_mqtt import mqttio
 from brilliant_mqtt.config import Settings
 from brilliant_mqtt.mqttio import AioMqttAdapter
+from tests.fakes import _AiomqttClientInternals, _msg
 
 
 def _settings() -> Settings:
@@ -39,18 +40,6 @@ def _settings() -> Settings:
         mqtt_host="broker.invalid",
         mqtt_username="u",
         mqtt_password="p",
-    )
-
-
-def _msg(topic: str, payload: bytes = b"x") -> aiomqtt.Message:
-    """A production-shaped inbound message (paho hands aiomqtt bytes payloads)."""
-    return aiomqtt.Message(
-        topic=topic,
-        payload=payload,
-        qos=1,
-        retain=False,
-        mid=0,
-        properties=None,
     )
 
 
@@ -274,16 +263,6 @@ def _paho_message(topic: str, payload: bytes) -> paho.MQTTMessage:
     message.payload = payload
     message.qos = 1
     return message
-
-
-class _AiomqttClientInternals(Protocol):
-    """The private aiomqtt.Client surface this seam test drives (client.py): the
-    incoming queue built via our ``queue_type`` hook, and the paho message
-    callback. Declared so the test type-checks with no suppression."""
-
-    _queue: mqttio._BoundedTransportQueue
-
-    def _on_message(self, client: object, userdata: object, message: paho.MQTTMessage) -> None: ...
 
 
 async def test_queuefull_is_swallowed_by_real_aiomqtt_on_message(

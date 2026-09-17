@@ -31,7 +31,7 @@ from brilliant_mqtt.mesh_leader import MESH_LEADER_TOPIC, MeshLeader
 from brilliant_mqtt.model import BrilliantDevice, DeviceKind, Variable
 from brilliant_mqtt.protocols import CommandSubscribeError
 from brilliant_mqtt.retained_topics import RetainedLedgerError
-from tests.fakes import FakeBus, FakeClock, FakeMqtt
+from tests.fakes import FakeBus, FakeClock, FakeMqtt, _panel_dimmer
 
 HB = 10.0
 
@@ -73,16 +73,6 @@ def _mesh_dimmer() -> BrilliantDevice:
             "intensity": Variable("intensity", "600"),
             "dimmable": Variable("dimmable", "1"),
         },
-    )
-
-
-def _panel_dimmer() -> BrilliantDevice:
-    return BrilliantDevice(
-        device_id="device_001",
-        peripheral_id="gangbox_peripheral_0",
-        name="Lights",
-        kind=DeviceKind.LIGHT,
-        variables={"on": Variable("on", "0")},
     )
 
 
