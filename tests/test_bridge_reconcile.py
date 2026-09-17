@@ -13,6 +13,7 @@ from brilliant_mqtt.commands import VarSet
 from brilliant_mqtt.desired_state import DesiredState
 from brilliant_mqtt.discovery import state_topic
 from brilliant_mqtt.model import BrilliantDevice, DeviceKind, Variable
+from brilliant_mqtt.write_admission import AdmissionTicket, WriteClass
 from tests.fakes import FakeBus, FakeClock, FakeMqtt
 
 
@@ -179,11 +180,19 @@ async def test_enforce_noop_when_desired_none() -> None:
 async def test_enforce_continues_after_write_error(tmp_path: Path) -> None:
     class FlakyBus(FakeBus):
         async def set_variables(
-            self, device_id: str, peripheral_id: str, sets: list[VarSet]
+            self,
+            device_id: str,
+            peripheral_id: str,
+            sets: list[VarSet],
+            *,
+            write_class: WriteClass = WriteClass.INTERACTIVE_FIFO,
+            ticket: AdmissionTicket | None = None,
         ) -> str:
             if peripheral_id == "pidA":
                 raise RuntimeError("bus boom")
-            return await super().set_variables(device_id, peripheral_id, sets)
+            return await super().set_variables(
+                device_id, peripheral_id, sets, write_class=write_class, ticket=ticket
+            )
 
     devs = [
         _mesh_light("pidA", enable_motion_score="0", on="0"),
@@ -296,7 +305,13 @@ async def test_enforce_spacing_backs_off_on_write_failure(tmp_path: Path) -> Non
             self.attempts = 0
 
         async def set_variables(
-            self, device_id: str, peripheral_id: str, sets: list[VarSet]
+            self,
+            device_id: str,
+            peripheral_id: str,
+            sets: list[VarSet],
+            *,
+            write_class: WriteClass = WriteClass.INTERACTIVE_FIFO,
+            ticket: AdmissionTicket | None = None,
         ) -> str:
             self.attempts += 1
             raise RuntimeError("bus down")
@@ -454,9 +469,8 @@ async def test_enforce_all_drifted_converge_across_ticks(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
-async def test_enforce_retries_failed_write_after_interval(tmp_path: Path) -> None:
-    """A forever-failing peripheral is retried at min-interval cadence — not
-    never again, and not on every tick."""
+async def test_enforce_retries_failed_write_with_capped_backoff(tmp_path: Path) -> None:
+    """Failed retries double their delay up to five minutes and retain intent."""
 
     class AlwaysFailBus(FakeBus):
         def __init__(self, devices: list[BrilliantDevice]) -> None:
@@ -464,7 +478,13 @@ async def test_enforce_retries_failed_write_after_interval(tmp_path: Path) -> No
             self.attempts = 0
 
         async def set_variables(
-            self, device_id: str, peripheral_id: str, sets: list[VarSet]
+            self,
+            device_id: str,
+            peripheral_id: str,
+            sets: list[VarSet],
+            *,
+            write_class: WriteClass = WriteClass.INTERACTIVE_FIFO,
+            ticket: AdmissionTicket | None = None,
         ) -> str:
             self.attempts += 1
             raise RuntimeError("bus down")
@@ -480,9 +500,85 @@ async def test_enforce_retries_failed_write_after_interval(tmp_path: Path) -> No
     assert bus.attempts == 1
     await bridge._enforce_desired([dev])  # same instant: window already consumed
     assert bus.attempts == 1
-    clock.advance(61.0)
+    for attempts, interval in enumerate((120.0, 240.0, 300.0, 300.0), start=1):
+        clock.advance(interval - 1.0)
+        await bridge._enforce_desired([dev])
+        assert bus.attempts == attempts
+        clock.advance(1.0)
+        await bridge._enforce_desired([dev])
+        assert bus.attempts == attempts + 1
+        assert ds.wanted("pidA") == {"enable_motion_score": "1"}
+
+    restored = DesiredState(tmp_path / "mesh.json")
+    restored.load()
+    assert restored.wanted("pidA") == {"enable_motion_score": "1"}
+
+
+@pytest.mark.asyncio
+async def test_enforce_backoff_is_per_variable_and_success_resets_it(tmp_path: Path) -> None:
+    class RecordingBus(FakeBus):
+        def __init__(self, devices: list[BrilliantDevice]) -> None:
+            super().__init__(devices)
+            self.attempts: list[list[VarSet]] = []
+
+        async def set_variables(
+            self,
+            device_id: str,
+            peripheral_id: str,
+            sets: list[VarSet],
+            *,
+            write_class: WriteClass = WriteClass.INTERACTIVE_FIFO,
+            ticket: AdmissionTicket | None = None,
+        ) -> str:
+            self.attempts.append(list(sets))
+            return await super().set_variables(
+                device_id, peripheral_id, sets, write_class=write_class, ticket=ticket
+            )
+
+    dev = _mesh_light("pidA", enable_motion_score="0", enable_pir_motion_score="0", on="0")
+    bus = RecordingBus([dev])
+    ds = DesiredState(tmp_path / "mesh.json")
+    ds.record("pidA", "enable_motion_score", "1")
+    clock = FakeClock()
+    bridge = Bridge(bus, FakeMqtt(), "mesh", desired=ds, reconcile_min_interval_s=60.0, clock=clock)
+    motion = _vs("enable_motion_score", "1")
+    pir = _vs("enable_pir_motion_score", "1")
+
+    bus.set_variables_error = RuntimeError("bus down")
     await bridge._enforce_desired([dev])
-    assert bus.attempts == 2
+    assert bus.attempts == [[motion]]
+
+    clock.advance(60.0)
+    ds.record("pidA", "enable_pir_motion_score", "1")
+    bus.set_variables_error = None
+    await bridge._enforce_desired([dev])
+    assert bus.attempts == [[motion], [pir]]
+
+    clock.advance(59.0)
+    await bridge._enforce_desired([dev])
+    assert len(bus.attempts) == 2
+    clock.advance(1.0)
+    await bridge._enforce_desired([dev])
+    assert bus.attempts == [[motion], [pir], [motion, pir]]
+
+    # The successful write restores the base interval for subsequent drift.
+    clock.advance(59.0)
+    await bridge._enforce_desired([dev])
+    assert len(bus.attempts) == 3
+    clock.advance(1.0)
+    bus.set_variables_error = RuntimeError("bus down again")
+    await bridge._enforce_desired([dev])
+    assert bus.attempts == [[motion], [pir], [motion, pir], [motion, pir]]
+
+    # A new failure starts at twice the base, rather than retaining old failures.
+    clock.advance(119.0)
+    await bridge._enforce_desired([dev])
+    assert len(bus.attempts) == 4
+    clock.advance(1.0)
+    bus.set_variables_error = None
+    await bridge._enforce_desired([dev])
+    assert bus.attempts == [[motion], [pir], [motion, pir], [motion, pir], [motion, pir]]
+    assert ds.wanted("pidA") == {"enable_motion_score": "1", "enable_pir_motion_score": "1"}
 
 
 @pytest.mark.asyncio
@@ -561,7 +657,13 @@ async def test_enforce_failed_write_does_not_echo(tmp_path: Path) -> None:
 
     class AlwaysFailBus(FakeBus):
         async def set_variables(
-            self, device_id: str, peripheral_id: str, sets: list[VarSet]
+            self,
+            device_id: str,
+            peripheral_id: str,
+            sets: list[VarSet],
+            *,
+            write_class: WriteClass = WriteClass.INTERACTIVE_FIFO,
+            ticket: AdmissionTicket | None = None,
         ) -> str:
             raise RuntimeError("bus down")
 
