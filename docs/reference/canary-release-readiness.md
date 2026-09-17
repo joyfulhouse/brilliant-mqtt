@@ -90,17 +90,26 @@ parity means an empty byte-for-byte diff between:
    Assistant; and
 3. the `panel-release` manifest of the release the panel actually loaded.
 
-In particular, require the final panel comparison to be empty:
+The deployment gate writes these three payload manifests as
+`repository-payload.sha256`, `home-assistant-payload.sha256`, and
+`office-active-payload.sha256`. Require both payload legs to be empty using
+those exact emitted filenames:
 
 ```bash
+parity_evidence=artifacts/brilliant-panel/pilots/office-bundle-parity
 diff -u \
-  artifacts/canary/candidate-payload.sha256 \
-  artifacts/canary/panel-active-payload.sha256
+  "$parity_evidence/repository-payload.sha256" \
+  "$parity_evidence/home-assistant-payload.sha256"
+diff -u \
+  "$parity_evidence/repository-payload.sha256" \
+  "$parity_evidence/office-active-payload.sha256"
 ```
 
 Use the host-key-pinned collection commands in the deployment reference rather
-than copying them here. Record the installed manifest digest and confirm it is
-the candidate digest above. `VERSION == 0.10.2` alone does not pass this gate.
+than copying them here; those commands create every referenced file and also
+compare the complete integration manifests. Record the installed payload
+manifest digest and confirm it is the candidate digest above.
+`VERSION == 0.10.2` alone does not pass this gate.
 
 ### Manual-update downgrade blocker
 
@@ -109,15 +118,21 @@ agent update** (the Update entity's install action or the equivalent service).
 The manual `async_update_agent` path unconditionally calls `deploy_payload`
 ([`manager.py` lines 1365-1384](../../custom_components/brilliant_mqtt/manager.py#L1365),
 [`manager.py` lines 1430-1447](../../custom_components/brilliant_mqtt/manager.py#L1430));
-that function swaps bytes and writes only `VERSION`, with no manifest guard or
-journaled rollback
-([`panel_ops.py` lines 2146-2161](../../custom_components/brilliant_mqtt/panel_ops.py#L2146)).
-An older HACS bundle also labelled `0.10.2` can therefore overwrite the
-candidate. This action is manual, not scheduled. Automatic repair only lays
-down the currently bundled payload when the payload is absent
+that function swaps the fixed legacy `/var/brilliant-mqtt/app` and `vendor`
+trees and writes the shared root `VERSION`, with no manifest guard or journaled
+rollback
+([`panel_ops.py` lines 2146-2161](../../custom_components/brilliant_mqtt/panel_ops.py#L2146),
+[`panel_ops.py` lines 2194-2210](../../custom_components/brilliant_mqtt/panel_ops.py#L2194)).
+After immutable migration it does **not** overwrite the active candidate below
+`current/`; instead, an older same-version HACS bundle destroys the leftover
+legacy app/vendor bytes that are the de-facto prior-code source and makes the
+root `VERSION` diverge from the active release. Before migration, those fixed
+paths are still active and can be overwritten directly. This action is manual,
+not scheduled. Automatic repair probes the same fixed payload path
+([`panel_ops.py` lines 1535-1559](../../custom_components/brilliant_mqtt/panel_ops.py#L1535))
+and deploys only when that path is absent
 ([`manager.py` lines 1292-1303](../../custom_components/brilliant_mqtt/manager.py#L1292));
-with the loaded HA bundle pinned by the parity gate, that is the same candidate.
-It does not make a later bundle change or manual update safe. Keep the loaded HA
+it does not make a later bundle change or manual update safe. Keep the loaded HA
 bundle pinned and record an operator change freeze as the temporary mitigation.
 Durable hardening is tracked in
 [#165](https://github.com/joyfulhouse/brilliant-mqtt/issues/165).
@@ -127,7 +142,9 @@ Durable hardening is tracked in
 The journaled provisioner is the rollback authority. Its durable
 `StoredPanelSnapshot` covers layout, active release target, environment and
 version file content/mode, and bridge, Wi-Fi-watchdog, and bus-watchdog unit
-content/mode/enabled/active state
+content/mode/enabled/active state. It also stores `selected_components`, a
+validated derivative of which of those three unit files exist, rather than an
+independently restored resource
 ([`provisioning_journal.py` lines 476-569](../../custom_components/brilliant_mqtt/provisioning_journal.py#L476)).
 Rollback stops services, restores those files and modes, restores the selector,
 reloads systemd, restores each recorded service state, and re-snapshots for
@@ -142,27 +159,46 @@ the journal clears only after that asserted verification
 Two known gaps are hard pre-activation gates under
 [#166](https://github.com/joyfulhouse/brilliant-mqtt/issues/166):
 
-- preflight must prove that a missing prior immutable tree can be restored
-  before any mutation; and
+- for the expected first legacy-to-immutable migration, the snapshot contains
+  no app/vendor bytes and has no active release target. Its rollback only
+  removes `current`; it relies on the fixed legacy app/vendor tree remaining
+  untouched
+  ([`panel_ops.py` lines 1260-1277](../../custom_components/brilliant_mqtt/panel_ops.py#L1260)).
+  Preflight must therefore explicitly retain and prove restoration of those
+  prior code bytes before any mutation; and
 - rollback must not be marked verified until a **fresh prior-version MQTT
   health probe** succeeds. Current exact-restore tests use fakes and mocked
-  snapshots rather than an exercised panel restore
+  snapshots rather than an exercised panel restore, while the provisioner
+  passes `verified=True` immediately after restore and cleanup without that
+  probe
   ([`test_panel_ops.py` lines 3543-3561](../../ha/tests/test_panel_ops.py#L3543),
-  [`test_panel_provisioner.py` lines 707-720](../../ha/tests/test_panel_provisioner.py#L707)).
+  [`panel_provisioner.py` lines 1243-1257](../../custom_components/brilliant_mqtt/panel_provisioner.py#L1243)).
 
 A successful provisioning commit clears the journal
 ([`provisioning_journal.py` lines 915-938](../../custom_components/brilliant_mqtt/provisioning_journal.py#L915)).
-Before activation, the operator must prove that the rollback snapshot and
-complete prior release remain retained by the approved recovery mechanism and
-that rollback stays callable for the **entire** soak. Do not interpret a prior
-release directory alone as a complete snapshot of files, modes, and service
-states.
+The journal API has no export, import, or re-arm operation
+([`provisioning_journal.py` lines 861-969](../../custom_components/brilliant_mqtt/provisioning_journal.py#L861));
+after commit, the journaled rollback path therefore has no snapshot to execute.
+#166 must define and prove a **named** retention-and-restore mechanism that
+preserves the complete snapshot plus the prior legacy app/vendor bytes and can
+reinstate them into a supported executable rollback path. No such mechanism is
+currently defined, and an external Home Assistant backup is only an operator
+precaution, not this canary gate
+([`deployment.md` lines 241-252](deployment.md#L241)). Until that mechanism
+exists, rollback is unavailable during the post-commit soak.
 
-Rollback is forward-only for state outside that snapshot: candidate-published
-retained MQTT topics can remain, Home Assistant entity/registry state can
-remain, and the panel's OSTree firmware is not rolled back. Inspect and
-reconcile those separately; never claim this application rollback reversed
-them.
+Effects outside the core snapshot are forward-only; this list is
+non-exhaustive. Candidate-published retained MQTT topics and the on-panel
+owned-topics ledger can remain
+([`const.py` lines 178-190](../../custom_components/brilliant_mqtt/const.py#L178)),
+as can Home Assistant entity **and device** registry state
+([`__init__.py` lines 249-269](../../custom_components/brilliant_mqtt/__init__.py#L249)),
+the hue-ca, voice, and retired HA-mirror subsystems
+([`const.py` lines 195-229](../../custom_components/brilliant_mqtt/const.py#L195)),
+and the retained mesh-leader claim
+([`mesh_leader.py` lines 203-208](../../src/brilliant_mqtt/mesh_leader.py#L203)).
+The panel's OSTree firmware is not rolled back either. Inspect and reconcile
+these separately; never claim this application rollback reversed them.
 
 ### Required restore rehearsal
 
@@ -170,8 +206,9 @@ Before the candidate is allowed onto the designated panel, exercise the same
 journaled path against a safe representative installation and retain sanitized
 evidence that all of these pass:
 
-1. restore from a deliberately absent prior tree using the approved retained
-   snapshot, with exact manifest, file-mode, selector, and service-state proof;
+1. restore a first-migration legacy app/vendor tree after deliberately removing
+   the prior code bytes, using the named retained snapshot-and-bytes mechanism,
+   with exact manifest, file-mode, selector, and service-state proof;
 2. interrupt at a documented post-mutation crash cut point, restart recovery,
    and prove it converges to the complete prior state without a partial layout;
 3. measure a fresh prior-version MQTT offline -> online transition and health
@@ -180,19 +217,21 @@ evidence that all of these pass:
 4. prove the candidate staging/release is cleaned, the journal reaches its
    verified terminal behavior, and no persistent rollback repair remains; and
 5. repeat the recovery invocation or equivalent read-only audit to demonstrate
-   idempotence, then prove the retained snapshot and prior release will remain
-   available throughout a one-day-or-longer soak.
+   idempotence, then prove the named mechanism can reinstate the snapshot and
+   prior bytes throughout a one-day-or-longer post-commit soak.
 
 Passing unit tests alone does not satisfy this rehearsal.
 
 ## Qualification boundaries and diagnostics
 
-Qualify idempotent, single-field write behavior with the existing deterministic
-fake tests
-([`test_mqttio_transport_backlog.py` lines 143-167](../../tests/test_mqttio_transport_backlog.py#L143),
-[`test_bus_adapter.py` lines 625-655](../../tests/test_bus_adapter.py#L625)). A
-live scalar write is outside this software-health claim unless separately
-authorized; if authorized, constrain it with the existing validation runbook's
+Existing deterministic fake tests establish narrower software behavior: only
+the newest single-field intensity value issues after a blocked bus gate, and
+supersession retains its original order ahead of another target
+([`test_bus_adapter.py` lines 682-712](../../tests/test_bus_adapter.py#L682),
+[`test_write_admission.py` lines 162-201](../../tests/test_write_admission.py#L162)).
+They do not by themselves qualify end-to-end idempotent writes. A live scalar
+write is outside this software-health claim unless separately authorized; if
+authorized, constrain it with the existing validation runbook's
 [scalar write/restore protocol](../brilliant-panel/validation-runbook.md#5-scalar-writerestore-protocol)
 and still make no physical-actuation or latency claim. Do not send mixed-field
 write traffic during qualification. The lane queue replaces a pending
@@ -224,12 +263,12 @@ the cited issue and operator evidence satisfy the pass criteria.
 | Gate | How verified | Pass criteria | Current status |
 | --- | --- | --- | --- |
 | Candidate identity | Rebuild, clean mirror diff, hash sorted manifest ([CI parity](../../.github/workflows/ci.yml#L16)) | Commit and manifest digest equal the values above | **MET** |
-| Legacy -> immutable upgrade | Journaled snapshot/stage/atomic-select path only ([provisioner](../../custom_components/brilliant_mqtt/panel_provisioner.py#L991)) | Exercised migration retains a complete recoverable prior state | **BLOCKED - #166 rehearsal** |
+| Legacy -> immutable upgrade | Journaled snapshot/stage/atomic-select path only ([provisioner](../../custom_components/brilliant_mqtt/panel_provisioner.py#L991)) | Exercised migration explicitly retains and restores the journal snapshot plus legacy app/vendor bytes | **BLOCKED - #166 rehearsal** |
 | `panel-release` exact-release gate | Run the deployment reference's panel manifest command ([selector rules](../../scripts/brilliant-panel/bundle_manifest.py#L378)) | Exit 0 with `current -> releases/<direct-child>`; no legacy fallback | **BLOCKED - #166 must clear before migration/activation** |
 | Exact HA/panel parity | Empty candidate/loaded-HA/active-panel manifest diffs ([deployment gate](deployment.md#office-exact-bundle-parity-gate)) | Every normalized path and SHA-256 matches; installed manifest digest recorded | **BLOCKED - #166 prevents the install evidence** |
-| Exercised complete rollback | Missing-tree and crash rehearsals plus measured fresh prior MQTT health ([current mocked test](../../ha/tests/test_panel_ops.py#L3543)) | Exact restore and fresh MQTT health within 90 seconds | **BLOCKED - #166** |
-| Rollback available throughout soak | Audit retained snapshot/prior tree after journal clear ([commit clear](../../custom_components/brilliant_mqtt/provisioning_journal.py#L915)) | Recovery remains callable through the final soak observation | **BLOCKED - #166 / retention evidence absent** |
-| Same-version update footgun | Operator change freeze; audit that no manual update is invoked ([unguarded deploy](../../custom_components/brilliant_mqtt/panel_ops.py#L2146)) | Written do-not-update control covers install and full soak | **BLOCKED - #165 until control is attested** |
+| Exercised complete rollback | Missing-prior-legacy-bytes and crash rehearsals plus measured fresh prior MQTT health ([current mocked test](../../ha/tests/test_panel_ops.py#L3543)) | Exact snapshot and legacy-byte restore plus fresh MQTT health within 90 seconds | **BLOCKED - #166** |
+| Rollback available throughout soak | Exercise the named snapshot-and-bytes retention mechanism after journal clear ([commit clear](../../custom_components/brilliant_mqtt/provisioning_journal.py#L915)) | Named mechanism is defined, exercised, and can reinstate an executable rollback through the final post-commit soak observation | **BLOCKED - #166 / mechanism undefined** |
+| Same-version update footgun | Operator change freeze; audit that no manual update is invoked ([unguarded deploy](../../custom_components/brilliant_mqtt/panel_ops.py#L2146)) | Written do-not-update control protects legacy prior bytes and root `VERSION` through install and soak | **BLOCKED - #165 until control is attested** |
 | Multi-field correctness excluded | Review traffic plan and #159; use only single-field writes ([queue replacement](../../src/brilliant_mqtt/mqttio.py#L99)) | No mixed-field traffic or claim; any future claim waits for #159 | **MET - multi-field remains blocked by #159** |
 | Diagnostics excluded | Pin commit; record #152/#157/#162 exclusion and #161 limitation | Evidence makes no diagnostics-based or physical-actuation claim | **MET** |
 
@@ -260,7 +299,8 @@ fresh pre-deploy MQTT software-health evidence + timestamp:
 process restart/reconnect counters:
 resource observations (RSS/CPU/load/free memory):
 configured MemoryMax / CPUQuota / Nice:
-rollback snapshot + prior release retained (contents kept private): yes/no
+named rollback retention-and-restore mechanism:
+rollback snapshot + prior legacy app/vendor bytes retained (contents kept private): yes/no
 
 DEPLOYMENT
 journaled provisioner transaction reference (identifier kept private):
@@ -273,10 +313,11 @@ MemoryMax / CPUQuota / Nice observed after deploy:
 unexpected restarts/reconnects or resource-cap events:
 
 ROLLBACK READINESS
-missing-prior-tree rehearsal result + artifact reference:
+missing-prior-legacy-bytes rehearsal result + artifact reference:
 crash-recovery rehearsal result + artifact reference:
 measured fresh prior-version MQTT reconnect/health time:
-rollback retained and callable through soak: yes/no
+post-commit snapshot/prior-byte reinstatement exercised: yes/no
+rollback mechanism callable through soak: yes/no
 manual agent-update freeze attested: yes/no
 
 SOAK (one panel, >= 1 day)
@@ -294,7 +335,7 @@ CLAIM BOUNDARY
 software health demonstrated:
 physical actuation measured: no / separately authorized evidence reference
 physical slider latency claimed: no
-forward-only retained MQTT / HA registry / OSTree reconciliation:
+forward-only MQTT topics/ledger, HA registries, companion state, and OSTree reconciliation:
 ```
 
 The release unit specifies `Nice=10`, `MemoryMax=96M`, and `CPUQuota=20%`
@@ -322,7 +363,11 @@ Abort the canary immediately on any of these conditions:
 - rollback retention/callability, the manual-update freeze, or the single-field
   traffic boundary can no longer be proven.
 
-On abort, stop qualification traffic and invoke only the rehearsed journaled
-rollback. Measure fresh prior-version MQTT health; do not treat HomeKit fallback,
-a process restart, a bus acknowledgement, or a restored `VERSION` label as
-proof that rollback completed or that a physical load actuated.
+On a pre-commit abort, stop qualification traffic and invoke only the rehearsed
+journaled rollback. On a post-commit soak abort, that journal has been cleared:
+use only the named, rehearsed #166 retention-and-restore mechanism. Until that
+mechanism exists, no executable rollback is available; stop traffic, preserve
+evidence, and escalate without improvising a partial redeploy. After any
+rollback, measure fresh prior-version MQTT health; do not treat HomeKit
+fallback, a process restart, a bus acknowledgement, or a restored `VERSION`
+label as proof that rollback completed or that a physical load actuated.
