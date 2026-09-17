@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
@@ -102,6 +103,9 @@ class _PendingMeshWrite:
     # Normalized transport-ack receipt from BusClient.set_variables — logged
     # on contradiction (known-failed delivery) and sampled on confirm.
     receipt: str
+    generation: int
+    status: str = "pending"
+    deadline: float | None = None
     # Bridge-clock time of the newest observation matching the targets.
     last_observed_at: float | None = None
 
@@ -173,6 +177,7 @@ class Bridge:
         reconcile_max_writes_per_tick: int = 4,
         reconcile_min_write_spacing_s: float = 0.5,
         clock: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], float] = time.time,
         sleep: Callable[[float], Awaitable[None]] | None = None,
         write_throttle: WriteThrottle | None = None,
         owned_topics: RetainedTopicLedger | None = None,
@@ -206,6 +211,7 @@ class Bridge:
         self._reconcile_max_writes_per_tick = reconcile_max_writes_per_tick
         self._reconcile_min_write_spacing_s = reconcile_min_write_spacing_s
         self._clock = clock
+        self._wall_clock = wall_clock
         # Test seam only (like clock): the mesh confirm deadline sleeps here.
         self._sleep: Callable[[float], Awaitable[None]] = asyncio.sleep if sleep is None else sleep
         self._owned_topics = owned_topics
@@ -253,6 +259,10 @@ class Bridge:
         # within a Bridge lifetime, so a stalled bus write from before a
         # withdraw can never match a generation minted after re-acquisition.
         self._mesh_write_generation: dict[str, int] = {}
+        self._mesh_feedback: dict[str, _PendingMeshWrite] = {}
+        # Only the new feedback publications, NOT the existing confirm timers.
+        self._mesh_feedback_tasks: dict[asyncio.Task[None], str] = {}
+        self._mesh_feedback_enabled = True
         self._mesh_confirm_count = 0
 
         bus.on_change(self._on_change, want_device=self._include)
@@ -311,6 +321,7 @@ class Bridge:
         # HARDWARE peripheral, so its sw_version is naturally None).
         devices = [d for d in await self._bus.get_all() if self._included(d)]
         self._beat()
+        self._mesh_feedback_enabled = True
 
         await self._async_publish_retained(
             availability_topic(self._panel),
@@ -435,8 +446,7 @@ class Bridge:
         # must not match a generation minted after re-acquisition and
         # resurrect its stale command (ABA); its completion is rejected, so it
         # cannot arm a pending or publish either.
-        for peripheral_id in self._mesh_write_generation:
-            self._mesh_write_generation[peripheral_id] += 1
+        await self.shutdown_mesh_feedback()
         unsubscribed = 0
         for topic in topics:
             # A failed unsubscribe must not abort the rest — a step-down must
@@ -644,6 +654,9 @@ class Bridge:
         """
         peripheral_id = device.peripheral_id
         fields = self._project_pending_mesh(peripheral_id, fields)
+        mesh_feedback = "mesh_write_status" in fields
+        if mesh_feedback and (not self._mesh_feedback_enabled or not self._included(device)):
+            return
         # Accepted parity exception: dict equality treats numerically-equal
         # values as equal (-0.0 == 0.0, 1 == 1.0), so such a re-rendering keeps
         # the older wire bytes. Every payload key's TYPE is static per spec
@@ -656,12 +669,80 @@ class Bridge:
             self._last_state_fields[peripheral_id] = fields
             return
         logger.debug("state publish for %s%s", peripheral_id, " (forced)" if force else "")
+        if mesh_feedback:
+            generation = self._mesh_write_generation.get(peripheral_id, 0)
+            record = self._mesh_feedback.get(peripheral_id)
+            task = asyncio.create_task(
+                self._publish_mesh_feedback(device, fields, payload, generation, record),
+                name=f"brilliant-mqtt-mesh-feedback-{peripheral_id}",
+            )
+            self._mesh_feedback_tasks[task] = peripheral_id
+            try:
+                await task
+            except asyncio.CancelledError:
+                if self._owns_mesh_feedback(peripheral_id, generation, record):
+                    raise
+                # Revocation cancelled this publication, not its command/poll owner.
+            finally:
+                self._mesh_feedback_tasks.pop(task, None)
+            return
         await self._async_publish_retained(
             state_topic(self._panel, peripheral_id),
             payload,
         )
         self._last_state_fields[peripheral_id] = fields
         self._last_state_payload[peripheral_id] = payload
+
+    def _owns_mesh_feedback(
+        self, peripheral_id: str, generation: int, record: _PendingMeshWrite | None
+    ) -> bool:
+        return (
+            self._mesh_feedback_enabled
+            and self._mesh_write_generation.get(peripheral_id, 0) == generation
+            and self._mesh_feedback.get(peripheral_id) is record
+        )
+
+    async def _publish_mesh_feedback(
+        self,
+        device: BrilliantDevice,
+        fields: dict[str, object],
+        payload: str,
+        generation: int,
+        record: _PendingMeshWrite | None,
+    ) -> None:
+        peripheral_id = device.peripheral_id
+        if not self._owns_mesh_feedback(peripheral_id, generation, record) or not self._included(
+            device
+        ):
+            return
+        await self._async_publish_retained(state_topic(self._panel, peripheral_id), payload)
+        if self._owns_mesh_feedback(peripheral_id, generation, record):
+            self._last_state_fields[peripheral_id] = fields
+            self._last_state_payload[peripheral_id] = payload
+
+    def _set_mesh_feedback(self, peripheral_id: str, record: _PendingMeshWrite | None) -> None:
+        for task, pid in self._mesh_feedback_tasks.items():
+            if pid == peripheral_id and task.cancel():
+                # Bytes may already be retained before local completion/cache commit.
+                # The next publish must repair that uncertain broker state.
+                self._last_state_fields.pop(peripheral_id, None)
+                self._last_state_payload.pop(peripheral_id, None)
+        if record is None:
+            self._mesh_feedback.pop(peripheral_id, None)
+        else:
+            self._mesh_feedback[peripheral_id] = record
+
+    async def shutdown_mesh_feedback(self) -> None:
+        """Revoke and join feedback publishes without sweeping existing confirm timers."""
+        self._mesh_feedback_enabled = False
+        self._mesh_feedback.clear()
+        for peripheral_id in self._mesh_write_generation:
+            self._mesh_write_generation[peripheral_id] += 1
+        tasks = list(self._mesh_feedback_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _async_publish_retained(self, topic: str, payload: str) -> None:
         """Publish through the panel ledger, or directly for the mesh bridge."""
@@ -916,6 +997,12 @@ class Bridge:
         generation = self._mesh_write_generation.get(peripheral_id, 0) + 1
         self._mesh_write_generation[peripheral_id] = generation
         self._drop_pending_mesh(peripheral_id)
+        self._set_mesh_feedback(
+            peripheral_id,
+            _PendingMeshWrite(targets={}, receipt="", generation=generation, status="superseded")
+            if peripheral_id in self._mesh_feedback
+            else None,
+        )
         try:
             result = await self._write_command(device, peripheral_id, sets, decode)
             if isinstance(result, Superseded):
@@ -952,6 +1039,10 @@ class Bridge:
                 peripheral_id,
                 exc_info=True,
             )
+            self._set_mesh_feedback(
+                peripheral_id,
+                _PendingMeshWrite(targets={}, receipt="", generation=generation, status="failed"),
+            )
             await self._republish_snapshot(peripheral_id, force=True)
             return
 
@@ -959,11 +1050,15 @@ class Bridge:
             # Superseded while this write awaited; the newer command's pending
             # (and confirm timer) owns the peripheral now.
             return
+        deadline = self._wall_clock() + MESH_CONFIRM_SECONDS
         pending = _PendingMeshWrite(
             targets={s.name: s.value for s in sets},
             receipt=receipt,
+            generation=generation,
+            deadline=deadline if math.isfinite(deadline) else None,
         )
         self._pending_mesh[peripheral_id] = pending
+        self._set_mesh_feedback(peripheral_id, pending)
         self._mesh_confirm_tasks[peripheral_id] = asyncio.create_task(
             self._resolve_pending_mesh(peripheral_id, pending),
             name=f"brilliant-mqtt-mesh-confirm-{peripheral_id}",
@@ -986,7 +1081,9 @@ class Bridge:
         including while the final publish is still in flight.
         """
         await self._sleep(MESH_CONFIRM_SECONDS)
-        if self._pending_mesh.get(peripheral_id) is not pending:
+        if self._pending_mesh.get(peripheral_id) is not pending or not self._owns_mesh_feedback(
+            peripheral_id, pending.generation, pending
+        ):
             return
         del self._pending_mesh[peripheral_id]
         if (
@@ -1000,7 +1097,16 @@ class Bridge:
                 MESH_CONFIRM_SECONDS,
                 pending.receipt,
             )
+            self._set_mesh_feedback(
+                peripheral_id,
+                replace(pending, targets={}, status="unconfirmed", deadline=None),
+            )
+            try:
+                await self._republish_snapshot(peripheral_id, force=False)
+            except Exception:
+                logger.warning("mesh expiry publish failed for %s", peripheral_id, exc_info=True)
         else:
+            self._set_mesh_feedback(peripheral_id, None)
             self._mesh_confirm_count += 1
             if self._mesh_confirm_count % _MESH_RECEIPT_LOG_SAMPLE_EVERY == 1:
                 logger.info(
@@ -1044,6 +1150,11 @@ class Bridge:
         """
         pending = self._pending_mesh.get(device.peripheral_id)
         if pending is None:
+            feedback = self._mesh_feedback.get(device.peripheral_id)
+            if feedback is not None and feedback.status != "superseded":
+                self._set_mesh_feedback(device.peripheral_id, None)
+            return
+        if not self._owns_mesh_feedback(device.peripheral_id, pending.generation, pending):
             return
         fully_matched = True
         for name, want in pending.targets.items():
@@ -1052,6 +1163,10 @@ class Bridge:
                 fully_matched = False
             elif var.value != want:
                 self._drop_pending_mesh(device.peripheral_id)
+                self._set_mesh_feedback(
+                    device.peripheral_id,
+                    replace(pending, targets={}, status="contradicted", deadline=None),
+                )
                 logger.warning(
                     "mesh write contradicted by observation for %s (%s=%s, wanted %s); "
                     "publishing observed state (receipt: %s)",
@@ -1096,9 +1211,20 @@ class Bridge:
         real observed value: the aux value templates collapse null into a
         false OFF (issue #47), which would invert safety-meaning entities.
         """
-        if peripheral_id not in self._pending_mesh or "state" not in fields:
+        if "mesh_write_status" not in fields:
             return fields
-        return {**fields, "state": None}
+        feedback = self._mesh_feedback.get(peripheral_id)
+        if feedback is None:
+            return fields
+        projected = {
+            **fields,
+            "mesh_write_status": feedback.status,
+            "mesh_requested": feedback.targets,
+            "mesh_write_deadline": feedback.deadline,
+        }
+        if feedback.status in ("pending", "unconfirmed"):
+            projected["state"] = None
+        return projected
 
     async def _echo_state(self, peripheral_id: str, sets: list[VarSet]) -> None:
         """Optimistically fold written VarSets into the snapshot and republish state.

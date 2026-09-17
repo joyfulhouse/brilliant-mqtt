@@ -653,6 +653,11 @@ class _SessionHarness:
             async def withdraw(self) -> None:
                 return
 
+            async def shutdown_mesh_feedback(self) -> None:
+                return
+
+        self.bridge_type = SessionBridge
+
         class SessionLeader:
             def __init__(self, *args: object, **kwargs: object) -> None:
                 del args, kwargs
@@ -721,6 +726,22 @@ async def _cancel_ready_session(harness: _SessionHarness, settings: Settings) ->
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+async def test_session_joins_mesh_feedback_before_adapters_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _SessionHarness(monkeypatch)
+
+    async def tracked_shutdown(bridge: Bridge) -> None:
+        del bridge
+        assert "bus_shutdown" not in harness.events
+        assert "mqtt_disconnect" not in harness.events
+        harness.events.append("mesh_feedback_joined")
+
+    monkeypatch.setattr(harness.bridge_type, "shutdown_mesh_feedback", tracked_shutdown)
+    await _cancel_ready_session(harness, _hot_poll_settings(mesh=True))
+    assert harness.events[-3:] == ["mesh_feedback_joined", "bus_shutdown", "mqtt_disconnect"]
 
 
 def _hot_poll_settings(
