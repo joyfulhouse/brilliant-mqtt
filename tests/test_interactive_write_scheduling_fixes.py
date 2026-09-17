@@ -178,9 +178,27 @@ async def _ready_turns() -> None:
         await checkpoint
 
 
-async def test_already_issued_folded_retype_converges_to_newest() -> None:
-    """An issued stale fold cannot be retracted, but the fresh re-issue wins."""
+async def test_already_issued_folded_retype_converges_to_newest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recovery waits for the in-flight stale fold without cancelling it."""
     observer, adapter = _adapter_for(_SchedulingObserver())
+    stale_started = asyncio.Event()
+    release_stale = asyncio.Event()
+    original_block = observer._block
+
+    async def block_stale_separately() -> None:
+        if observer.payloads[-1][2].get("intensity") != "200":
+            await original_block()
+            return
+        stale_started.set()
+        try:
+            await release_stale.wait()
+        except asyncio.CancelledError:
+            observer.write_cancelled = True
+            raise
+
+    monkeypatch.setattr(observer, "_block", block_stale_separately)
     bridge = Bridge(adapter, FakeMqtt(), "test")
     topic = "brilliant/test/slider/set"
     bridge._devices["slider"] = _light("255")
@@ -194,8 +212,13 @@ async def test_already_issued_folded_retype_converges_to_newest() -> None:
             latest_wins=True,
         )
         await _ready_turns()
+        stale_admission = next(
+            admission
+            for admission in adapter._write_admissions.values()
+            if admission.peripheral_id == "slider"
+        )
         # Queue the blocker release before folding wakes the lane worker.
-        # Dispatch and re-type do not yield, so the stale fold issues first.
+        # The stale fold issues first and stays gated throughout recovery.
         observer.release.set()
         await dispatcher.dispatch(
             _InboundMessage(topic, '{"state":"ON","brightness":200}', False, (), ()),
@@ -203,6 +226,23 @@ async def test_already_issued_folded_retype_converges_to_newest() -> None:
         )
         bridge._remember_device(_light("100"))
         await blocker
+        await _ready_turns()
+
+        assert stale_started.is_set()
+        assert not observer.write_cancelled
+        assert stale_admission.issued
+        assert stale_admission.task is not None and not stale_admission.task.done()
+        # Recovery has admitted 78, but it cannot issue until 200 finishes.
+        (fresh_admission,) = adapter._write_admissions.values()
+        assert fresh_admission is not stale_admission
+        assert fresh_admission.values == {"on": "1", "intensity": "78"}
+        assert not fresh_admission.issued
+        assert [values["intensity"] for _, pid, values in observer.payloads if pid == "slider"] == [
+            "200"
+        ]
+        assert observer.in_flight == observer.max_in_flight == 1
+
+        release_stale.set()
         await dispatcher.shutdown()
 
         intensities = [
@@ -210,9 +250,12 @@ async def test_already_issued_folded_retype_converges_to_newest() -> None:
         ]
         assert intensities == ["200", "78"]
         assert intensities[-1] == "78"
+        assert not observer.write_cancelled
+        assert observer.in_flight == 0
         assert observer.max_in_flight == 1
         assert not adapter._write_admissions
     finally:
+        release_stale.set()
         observer.release.set()
         await dispatcher.shutdown()
         await adapter.shutdown()
