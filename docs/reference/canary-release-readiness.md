@@ -124,11 +124,19 @@ rollback
 ([`panel_ops.py` lines 2146-2161](../../custom_components/brilliant_mqtt/panel_ops.py#L2146),
 [`panel_ops.py` lines 2194-2210](../../custom_components/brilliant_mqtt/panel_ops.py#L2194)).
 After immutable migration it does **not** overwrite the active candidate below
-`current/`; instead, an older same-version HACS bundle destroys the leftover
-legacy app/vendor bytes that are the de-facto prior-code source and makes the
-root `VERSION` diverge from the active release. Before migration, those fixed
-paths are still active and can be overwritten directly. This action is manual,
-not scheduled. Automatic repair probes the same fixed payload path
+`current/`. However, the bundled bridge unit's `PYTHONPATH` still selects those
+fixed app/vendor paths
+([`brilliant-mqtt.service` lines 9-18](../../custom_components/brilliant_mqtt/agent_payload/brilliant-mqtt.service#L9)).
+The update reinstalls that unit and restarts the bridge, so the running service
+comes back on the overwritten older bytes even while `current/` remains intact;
+it also destroys the leftover legacy app/vendor tree that was the de-facto
+prior-code source. Because both bundles are labelled `0.10.2` and
+the candidate's
+[`agent_payload/VERSION`](../../custom_components/brilliant_mqtt/agent_payload/VERSION)
+confirms that label, `deploy_payload` writes `0.10.2` back to the root `VERSION`;
+version equality survives and masks the downgrade. Before migration, those
+fixed paths are already active and can be overwritten directly. This action is
+manual, not scheduled. Automatic repair probes the same fixed payload path
 ([`panel_ops.py` lines 1535-1559](../../custom_components/brilliant_mqtt/panel_ops.py#L1535))
 and deploys only when that path is absent
 ([`manager.py` lines 1292-1303](../../custom_components/brilliant_mqtt/manager.py#L1292));
@@ -145,7 +153,7 @@ version file content/mode, and bridge, Wi-Fi-watchdog, and bus-watchdog unit
 content/mode/enabled/active state. It also stores `selected_components`, a
 validated derivative of which of those three unit files exist, rather than an
 independently restored resource
-([`provisioning_journal.py` lines 476-569](../../custom_components/brilliant_mqtt/provisioning_journal.py#L476)).
+([`provisioning_journal.py` lines 559-618](../../custom_components/brilliant_mqtt/provisioning_journal.py#L559)).
 Rollback stops services, restores those files and modes, restores the selector,
 reloads systemd, restores each recorded service state, and re-snapshots for
 equality
@@ -184,7 +192,7 @@ preserves the complete snapshot plus the prior legacy app/vendor bytes and can
 reinstate them into a supported executable rollback path. No such mechanism is
 currently defined, and an external Home Assistant backup is only an operator
 precaution, not this canary gate
-([`deployment.md` lines 241-252](deployment.md#L241)). Until that mechanism
+([`deployment.md` lines 241-257](deployment.md#L241)). Until that mechanism
 exists, rollback is unavailable during the post-commit soak.
 
 Effects outside the core snapshot are forward-only; this list is
@@ -268,7 +276,7 @@ the cited issue and operator evidence satisfy the pass criteria.
 | Exact HA/panel parity | Empty candidate/loaded-HA/active-panel manifest diffs ([deployment gate](deployment.md#office-exact-bundle-parity-gate)) | Every normalized path and SHA-256 matches; installed manifest digest recorded | **BLOCKED - #166 prevents the install evidence** |
 | Exercised complete rollback | Missing-prior-legacy-bytes and crash rehearsals plus measured fresh prior MQTT health ([current mocked test](../../ha/tests/test_panel_ops.py#L3543)) | Exact snapshot and legacy-byte restore plus fresh MQTT health within 90 seconds | **BLOCKED - #166** |
 | Rollback available throughout soak | Exercise the named snapshot-and-bytes retention mechanism after journal clear ([commit clear](../../custom_components/brilliant_mqtt/provisioning_journal.py#L915)) | Named mechanism is defined, exercised, and can reinstate an executable rollback through the final post-commit soak observation | **BLOCKED - #166 / mechanism undefined** |
-| Same-version update footgun | Operator change freeze; audit that no manual update is invoked ([unguarded deploy](../../custom_components/brilliant_mqtt/panel_ops.py#L2146)) | Written do-not-update control protects legacy prior bytes and root `VERSION` through install and soak | **BLOCKED - #165 until control is attested** |
+| Same-version update footgun | Operator change freeze; audit that no manual update is invoked ([unguarded deploy](../../custom_components/brilliant_mqtt/panel_ops.py#L2146)) | Written do-not-update control prevents a live fixed-path downgrade and protects legacy prior bytes through install and soak | **BLOCKED - #165 until control is attested** |
 | Multi-field correctness excluded | Review traffic plan and #159; use only single-field writes ([queue replacement](../../src/brilliant_mqtt/mqttio.py#L99)) | No mixed-field traffic or claim; any future claim waits for #159 | **MET - multi-field remains blocked by #159** |
 | Diagnostics excluded | Pin commit; record #152/#157/#162 exclusion and #161 limitation | Evidence makes no diagnostics-based or physical-actuation claim | **MET** |
 
