@@ -149,6 +149,11 @@ Before any Office update or redeploy, prove byte parity against the actual
 integration loaded by Home Assistant—not a nearby checkout or a matching
 version label.
 
+For the same-version responsiveness candidate at pinned commit `e4ae3176`,
+first satisfy the
+[single-panel canary release readiness runbook](canary-release-readiness.md),
+including its hard upgrade, rollback-rehearsal, update-freeze, and soak gates.
+
 The deterministic helper
 [`scripts/brilliant-panel/bundle_manifest.py`](../../scripts/brilliant-panel/bundle_manifest.py)
 emits exactly `<logical-path><TAB><sha256>`, rejects symlinks and special
