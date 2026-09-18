@@ -41,8 +41,8 @@ from brilliant_mqtt.write_admission import (
     WriteCancelled,
     WriteClass,
 )
-from tests.fakes import FakeBus, FakeClock, FakeMqtt
-from tests.test_bus_adapter import _adapter_for, _SchedulingObserver, _settle
+from tests.fakes import FakeBus, FakeClock, FakeMqtt, _settle
+from tests.test_bus_adapter import _adapter_for, _SchedulingObserver
 
 # --------------------------------------------------------------------------- #
 # Q1: silent lost / stale interactive write on the fold -> re-handle re-type race

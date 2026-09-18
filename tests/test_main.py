@@ -32,7 +32,7 @@ from brilliant_mqtt.model import BrilliantDevice, DeviceKind, Variable
 from brilliant_mqtt.protocols import CommandSubscribeError
 from brilliant_mqtt.retained_topics import RetainedLedgerError
 from brilliant_mqtt.write_admission import AdmissionTicket, WriteClass
-from tests.fakes import FakeBus, FakeClock, FakeMqtt
+from tests.fakes import FakeBus, FakeClock, FakeMqtt, _panel_dimmer
 
 HB = 10.0
 
@@ -74,16 +74,6 @@ def _mesh_dimmer() -> BrilliantDevice:
             "intensity": Variable("intensity", "600"),
             "dimmable": Variable("dimmable", "1"),
         },
-    )
-
-
-def _panel_dimmer() -> BrilliantDevice:
-    return BrilliantDevice(
-        device_id="device_001",
-        peripheral_id="gangbox_peripheral_0",
-        name="Lights",
-        kind=DeviceKind.LIGHT,
-        variables={"on": Variable("on", "0")},
     )
 
 
@@ -282,7 +272,9 @@ class TestProcessLifetimeDesiredState:
             settings: Settings,
             desired_panel: DesiredState | None = None,
             desired_mesh: DesiredState | None = None,
+            diagnostics: object | None = None,
         ) -> None:
+            del diagnostics
             nonlocal calls
             calls += 1
             seen.append(desired_panel)
@@ -315,7 +307,9 @@ class TestProcessLifetimeDesiredState:
             settings: Settings,
             desired_panel: DesiredState | None = None,
             desired_mesh: DesiredState | None = None,
+            diagnostics: object | None = None,
         ) -> None:
+            del diagnostics
             seen.append(desired_panel)
             seen.append(desired_mesh)
             raise asyncio.CancelledError
@@ -349,8 +343,9 @@ class TestSupervisorBackoff:
             settings: Settings,
             desired_panel: DesiredState | None,
             desired_mesh: DesiredState | None,
+            diagnostics: object | None = None,
         ) -> None:
-            del settings, desired_panel, desired_mesh
+            del settings, desired_panel, desired_mesh, diagnostics
             nonlocal session_calls
             session_calls += 1
             raise RetainedLedgerError("persistent ledger failure")
@@ -378,8 +373,9 @@ class TestSupervisorBackoff:
             settings: Settings,
             desired_panel: DesiredState | None,
             desired_mesh: DesiredState | None,
+            diagnostics: object | None = None,
         ) -> None:
-            del settings, desired_panel, desired_mesh
+            del settings, desired_panel, desired_mesh, diagnostics
             raise RuntimeError("transient session failure")
 
         async def cancel_on_sleep(delay: float) -> None:
@@ -415,8 +411,9 @@ class TestSupervisorBackoff:
             settings: Settings,
             desired_panel: DesiredState | None,
             desired_mesh: DesiredState | None,
+            diagnostics: object | None = None,
         ) -> None:
-            del settings, desired_panel, desired_mesh
+            del settings, desired_panel, desired_mesh, diagnostics
             nonlocal session_calls
             session_calls += 1
             raise main_mod.MqttTransportOverloadError("transport backlog exceeded")
@@ -702,13 +699,13 @@ class _SessionHarness:
                 harness.events.append("scene_poll")
                 harness.scene_poll_snapshots.append(devices)
 
-        def mqtt_factory(settings: Settings) -> _SessionMqtt:
-            del settings
+        def mqtt_factory(settings: Settings, **kwargs: object) -> _SessionMqtt:
+            del settings, kwargs
             self.events.append("mqtt_construct")
             return self.mqtt
 
-        def bus_factory(*, extra_device_ids: tuple[str, ...]) -> _SessionBus:
-            del extra_device_ids
+        def bus_factory(*, extra_device_ids: tuple[str, ...], **kwargs: object) -> _SessionBus:
+            del extra_device_ids, kwargs
             self.events.append("bus_construct")
             return self.bus
 
@@ -1141,8 +1138,8 @@ def _real_bus_session(
 
     monkeypatch.setattr(adapter, "start", no_start)
 
-    def bus_factory(*, extra_device_ids: tuple[str, ...]) -> RpcBusAdapter:
-        del extra_device_ids
+    def bus_factory(*, extra_device_ids: tuple[str, ...], **kwargs: object) -> RpcBusAdapter:
+        del extra_device_ids, kwargs
         return adapter
 
     monkeypatch.setattr(main_mod, "RpcBusAdapter", bus_factory)

@@ -26,6 +26,7 @@ from types import MappingProxyType
 from typing import Any, NamedTuple
 
 from brilliant_mqtt.commands import VarSet
+from brilliant_mqtt.diagnostics import ResponseDiagnostics, WriteOutcome
 from brilliant_mqtt.model import BrilliantDevice, Variable, kind_for_peripheral_type
 from brilliant_mqtt.write_admission import (
     AdmissionTicket,
@@ -118,6 +119,7 @@ class _WriteRecord:
     queued_at: float
     started_at: float | None = None
     detached: bool = False
+    settled: bool = False
 
 
 @dataclass(eq=False)
@@ -451,7 +453,9 @@ class RpcBusAdapter:
         my_name: str = "brilliant_mqtt",
         extra_device_ids: tuple[str, ...] = (),
         clock: Callable[[], float] = time.monotonic,
+        diagnostics: ResponseDiagnostics | None = None,
     ) -> None:
+        self._diagnostics = diagnostics
         # A UNIQUE name per session (see _session_client_name): the bus peer key
         # is <owning_device_id>.<my_name>, so a constant name lets a half-bound
         # ghost registration lock the bridge out forever with NameInUseError.
@@ -872,6 +876,10 @@ class RpcBusAdapter:
     def _note_reconnect(self) -> None:
         """Record that the processor reconnected (reconnect-rate clock)."""
         self._reconnect_times.append(self._clock())
+        # The library hook marshals onto the loop; the admission fence in
+        # _on_proc_reconnect has already passed, before asynchronous fan-out.
+        if self._diagnostics is not None:
+            self._diagnostics.note_bus_reconnect()
 
     def recent_reconnects(self, window_s: float) -> int:
         """Count processor reconnects within the last *window_s* seconds.
@@ -1049,6 +1057,8 @@ class RpcBusAdapter:
         predecessor.set_result(Superseded())
         if not previous_acquired.done():
             previous_acquired.set_result(None)
+        if self._diagnostics is not None:
+            self._diagnostics.note_superseded()
         return True
 
     def _serve_next(self, device_id: str) -> None:
@@ -1148,18 +1158,8 @@ class RpcBusAdapter:
             # future finishes concurrently. wait preserves that cancellation
             # without cancelling the independently owned admission result.
             done, _ = await asyncio.wait({result}, timeout=_WRITE_DEADLINE_S)
-            if not done:
-                raise asyncio.TimeoutError
-            return result.result()
-        except asyncio.CancelledError:
-            if result is not admission.result:
-                # Cancellation of an already superseded caller cannot revoke
-                # the replacement's independently owned admission.
-                raise
-            if not admission.issued and admission.task is not None:
-                self._cancel_waiting(ticket)
-            raise
-        except asyncio.TimeoutError:
+            if done:
+                return result.result()
             admission.record.detached = True
             logger.warning(
                 "set_variables(%s) unresolved after %.0fs; detaching from the caller "
@@ -1168,6 +1168,14 @@ class RpcBusAdapter:
                 _WRITE_DEADLINE_S,
                 self._queue_wait(admission.record),
             )
+            raise asyncio.TimeoutError
+        except asyncio.CancelledError:
+            if result is not admission.result:
+                # Cancellation of an already superseded caller cannot revoke
+                # the replacement's independently owned admission.
+                raise
+            if not admission.issued and admission.task is not None:
+                self._cancel_waiting(ticket)
             raise
         finally:
             if not (
@@ -1180,7 +1188,7 @@ class RpcBusAdapter:
                 ticket._cancel_waiting = None
 
     def _finish_admission(self, admission: _WriteAdmission, task: asyncio.Task[str]) -> None:
-        self._settle_write(task)
+        self._settle_write(task, admission=admission)
         if not admission.acquired.done():
             admission.acquired.set_result(None)
         if not admission.result.done():
@@ -1275,16 +1283,47 @@ class RpcBusAdapter:
             _WRITE_HARD_CAP_S,
         )
         self._write_timed_out = True
+        if self._diagnostics is not None:
+            self._diagnostics.note_hard_cap()
 
-    def _settle_write(self, task: asyncio.Task[str]) -> None:
+    def _settle_write(self, task: asyncio.Task[str], *, admission: _WriteAdmission) -> None:
         """Done-callback: drop the strong ref and mark any exception retrieved.
 
         A detached caller never awaits its task, so without this asyncio would
         log "Task exception was never retrieved" at garbage collection.
+        The diagnostics path reads ``self._clock()`` exactly once per settled write.
+        The ``record.settled`` latch rejects repeat callbacks and double-recording.
         """
         self._write_tasks.discard(task)
-        if not task.cancelled():
-            task.exception()
+        error = None if task.cancelled() else task.exception()
+        record = admission.record
+        if record.settled:
+            return
+        record.settled = True
+        if self._diagnostics is None:
+            return
+        # Every native task reaches this boundary, including pre-step cancellation.
+        # Its lock is released and the scheduler has not admitted the next write.
+        settled_at = self._clock()
+        queue_wait_s = rpc_s = None
+        if record.started_at is not None:
+            queue_wait_s = record.started_at - record.queued_at
+            rpc_s = settled_at - record.started_at
+        outcome: WriteOutcome
+        if task.cancelled():
+            outcome = "cancelled"
+            if admission.tombstoned and not admission.issued:
+                self._diagnostics.note_ticket_revoked_before_rpc()
+        # These are distinct classes on Python 3.10; subclasses are ordinary errors.
+        elif type(error) is TimeoutError:
+            outcome = "timeout_bus"
+        elif type(error) is asyncio.TimeoutError:
+            outcome = "timeout_async"
+        elif error is not None:
+            outcome = "detached_late_error" if record.detached else "error"
+        else:
+            outcome = "detached_late_ok" if record.detached else "ok"
+        self._diagnostics.note_write_settled(outcome, queue_wait_s, rpc_s)
 
     def _queue_wait(self, record: _WriteRecord) -> float:
         started = record.started_at if record.started_at is not None else self._clock()

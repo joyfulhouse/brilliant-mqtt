@@ -95,6 +95,9 @@ bidirectional control.
   machine contract for the companion HA integration (OTA detection + agent-update
   entity); the firmware tag is also exposed as a per-panel diagnostic sensor.
   Never published for the reserved `mesh` pseudo-panel.
+  The nested `diag` object carries bounded, process-lifetime response counters
+  and timing samples; see [Response diagnostics](reference/diagnostics.md) for
+  the schema, timing populations, and transport-acknowledgment limitations.
 - **Self-healing:** the panel lib's notification stream can die *silently*
   while the process lives, freezing both pushes and the observer's
   `get_all()` mirror (live pilot finding). Three layers compensate: the
