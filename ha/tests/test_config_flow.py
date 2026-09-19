@@ -293,14 +293,18 @@ class _FakeProvisioner:
         self.recover_started = asyncio.Event()
         self.install_calls: list[tuple[PanelInstallRequest, FleetConfig]] = []
         self.marked_transactions: list[UUID] = []
+        self.overrides: list[Mapping[str, object] | None] = []
 
     async def async_install(
         self,
         request: PanelInstallRequest,
         fleet: FleetConfig,
         progress: Callable[[ProvisioningProgress], Awaitable[None]],
+        *,
+        release_override: Mapping[str, object] | None = None,
     ) -> ProvisionedPanel:
         del progress
+        self.overrides.append(release_override)
         self.install_calls.append((request, fleet))
         if self.gate is not None:
             await self.gate.wait()
@@ -1363,6 +1367,7 @@ async def test_panel_confirm_shows_allowlisted_facts_and_only_name_is_editable(
     assert _schema_keys(result) == {CONF_NAME}
     assert _schema_defaults(result)[CONF_NAME] == "Office Panel"
     assert result["description_placeholders"] == {
+        "release_override": "",
         "fingerprint": _FINGERPRINT,
         "hostname": "office-panel",
         "model": "Brilliant Control Development Board",
@@ -1713,6 +1718,47 @@ async def test_first_panel_provision_failure_returns_to_confirm_without_secret_l
     entries = hass.config_entries.async_entries(DOMAIN)
     assert len(entries) == 1
     assert entries[0].subentries == {}
+
+
+@pytest.mark.parametrize("unchanged", [False, True])
+async def test_onboarding_identity_outcome_requires_explicit_override(
+    hass: HomeAssistant,
+    unchanged: bool,
+) -> None:
+    confirm = await _start_initial_confirm(hass)
+    binding = {"panel": "office", "transaction": "c" * 32, "incumbent": {}, "candidate": {}}
+    provisioner = _FakeProvisioner(
+        _identity(),
+        gate=asyncio.Event(),
+        error=PanelProvisioningError(
+            "release_unchanged" if unchanged else "release_identity_blocked",
+            release_override=None if unchanged else binding,
+        ),
+    )
+    with patch.object(flow_gateway, "_get_panel_provisioner", return_value=provisioner):
+        await hass.config_entries.subentries.async_configure(
+            confirm["flow_id"], {CONF_NAME: "Office"}
+        )
+        assert provisioner.gate is not None
+        provisioner.gate.set()
+        result = await _drain_progress(hass.config_entries.subentries, confirm["flow_id"])
+        if unchanged:
+            assert result["type"] is FlowResultType.ABORT
+            assert result["reason"] == "release_unchanged"
+            assert provisioner.marked_transactions == []
+        else:
+            assert "release_override" in _schema_keys(result)
+            assert json.loads(result["description_placeholders"]["release_override"]) == binding
+            assert provisioner.overrides == [None]
+            provisioner.error = None
+            provisioner.gate.clear()
+            await hass.config_entries.subentries.async_configure(
+                confirm["flow_id"],
+                {CONF_NAME: "Office", "release_override": binding},
+            )
+            provisioner.gate.set()
+            await _drain_progress(hass.config_entries.subentries, confirm["flow_id"])
+            assert provisioner.overrides == [None, binding]
 
 
 async def test_first_panel_mark_pending_failure_clears_flow_transaction(

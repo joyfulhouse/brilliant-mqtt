@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import Mapping
 from types import MappingProxyType
@@ -86,6 +87,8 @@ class _PanelOnboardingMixin:
     _provision_fleet: FleetConfig | None
     _recovery_task: asyncio.Task[bool] | None
     _onboarding_committed: bool
+    _release_override: Mapping[str, object] | None
+    _identity_refusal: Mapping[str, object] | None
 
     def _init_panel_onboarding(self) -> None:
         self._panel_host = None
@@ -105,6 +108,8 @@ class _PanelOnboardingMixin:
         self._provision_fleet = None
         self._recovery_task = None
         self._onboarding_committed = False
+        self._release_override = None
+        self._identity_refusal = None
 
     def _onboarding_parent_entry(self) -> ConfigEntry[Any] | None:
         raise NotImplementedError
@@ -305,6 +310,8 @@ class _PanelOnboardingMixin:
         user_input: dict[str, Any] | None = None,
     ) -> _OnboardingResult:
         flow = cast(_FlowSurface, self)
+        if self._panel_failure is not None and self._panel_failure.code == "release_unchanged":
+            return flow.async_abort(reason="release_unchanged")
         identity = self._panel_identity
         facts = self._panel_facts
         if identity is None or facts is None:
@@ -383,6 +390,10 @@ class _PanelOnboardingMixin:
                         )
                         self._provisioned = None
                         self._panel_failure = None
+                        override = user_input.get("release_override")
+                        self._release_override = (
+                            dict(override) if isinstance(override, dict) else None
+                        )
                         self._provision_task = flow.hass.async_create_task(
                             self._async_provision(),
                             "brilliant-mqtt-panel-provision",
@@ -393,10 +404,15 @@ class _PanelOnboardingMixin:
         suggested_name = self._panel_name or _suggested_panel_name(facts)
         return flow.async_show_form(
             step_id="panel_confirm",
-            data_schema=panel_confirm_schema(suggested_name),
+            data_schema=panel_confirm_schema(
+                suggested_name, allow_override=self._identity_refusal is not None
+            ),
             errors=errors or ({"base": failure.code} if failure is not None else {}),
             description_placeholders={
                 **_facts_placeholders(facts),
+                "release_override": json.dumps(dict(self._identity_refusal))
+                if self._identity_refusal
+                else "",
                 **(
                     failure.placeholders()
                     if failure is not None
@@ -440,6 +456,7 @@ class _PanelOnboardingMixin:
             request,
             fleet,
             self._async_report_provisioning_progress,
+            **({"release_override": self._release_override} if self._release_override else {}),
         )
         context = cast(dict[str, Any], cast(_FlowSurface, self).context)
         context[CONF_PROVISIONING_TRANSACTION_ID] = str(provisioned.transaction_id)
@@ -479,6 +496,8 @@ class _PanelOnboardingMixin:
         except asyncio.CancelledError:
             raise
         except PanelProvisioningError as error:
+            self._release_override = None
+            self._identity_refusal = error.release_override
             self._panel_failure = _provisioning_failure(error)
             cast(dict[str, Any], flow.context).pop(
                 CONF_PROVISIONING_TRANSACTION_ID,

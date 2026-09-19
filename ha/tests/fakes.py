@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import io
+import json
+import re
+import tarfile
 
 from custom_components.brilliant_mqtt.shell import PanelProcess, RunResult
 
@@ -81,6 +86,16 @@ class FakeShell:
         self.dir_uploads: list[tuple[str, str]] = []
         self.file_uploads: list[tuple[str, str, int]] = []
         self.started_processes: list[PanelProcess] = []
+        # Identity protocol traffic is tracked separately from recipe commands.
+        self.identity_commands: list[str] = []
+        self.identity_uploads: list[tuple[str, bytes, int]] = []
+        self.release_identities: dict[str, dict[str, object] | None] = {
+            "bridge": None,
+            "wifi_watchdog": None,
+            "bus_watchdog": None,
+        }
+        self._pending_identities: dict[str, dict[str, object]] = {}
+        self._identity_audits: set[str] = set()
 
     def pinned_host_key(self) -> str | None:
         return self._pinned
@@ -112,6 +127,32 @@ class FakeShell:
 
     async def run(self, command: str) -> RunResult:
         self._require_connected()
+        if "BRILLIANT_BASELINE_RETAINED" in command:
+            return RunResult(0, "0", "")
+        if "BRILLIANT_BASELINE_ACTION" in command:
+            return _OK
+        if "BRILLIANT_RELEASE_IDENTITY_PREPARE" in command:
+            self.identity_commands.append(command)
+            return _OK
+        if "BRILLIANT_RELEASE_IDENTITY_READ" in command:
+            self.identity_commands.append(command)
+            return self.responses.get(
+                command, RunResult(0, json.dumps(self.release_identities), "")
+            )
+        if "BRILLIANT_RELEASE_IDENTITY_WRITE" in command:
+            self.identity_commands.append(command)
+            path, data, _mode = self.identity_uploads[-1]
+            if "override-" in path:
+                transaction = str(json.loads(data)["transaction"])
+                if transaction in self._identity_audits:
+                    return RunResult(1, "", "already consumed")
+                self._identity_audits.add(transaction)
+            else:
+                for component in self.release_identities:
+                    if f".release-{component}-" in path:
+                        self.release_identities[component] = json.loads(data)
+                        self._pending_identities[component] = json.loads(data)
+            return _OK
         self.commands.append(command)  # recorded even when it raises: proves it was attempted
         if command in self.run_errors:
             raise self.run_errors[command]
@@ -119,6 +160,10 @@ class FakeShell:
 
     async def start(self, command: str) -> PanelProcess:
         self._require_connected()
+        if "BRILLIANT_BASELINE_RETAINED" in command:
+            return FakePanelProcess(RunResult(0, "0", ""))
+        if "BRILLIANT_BASELINE_ACTION" in command:
+            return FakePanelProcess()
         self.commands.append(command)
         process = self.processes.get(command, FakePanelProcess(self.responses.get(command, _OK)))
         self.started_processes.append(process)
@@ -128,7 +173,73 @@ class FakeShell:
         self._require_connected()
         if self.put_bytes_error is not None:
             raise self.put_bytes_error
+        if "/.release-" in remote_path:
+            self.identity_uploads.append((remote_path, data, mode))
+            return
         self.uploads.append((remote_path, data, mode))
+        if remote_path == "/etc/brilliant-mqtt.env":
+            deployment = next(
+                (
+                    line.partition("=")[2].strip('"')
+                    for line in data.decode().splitlines()
+                    if line.startswith("BRILLIANT_DEPLOYMENT_ID=")
+                ),
+                None,
+            )
+            for correlated_identity in (
+                *self.release_identities.values(),
+                *self._pending_identities.values(),
+            ):
+                if correlated_identity is not None:
+                    correlated_identity["deployment_id"] = deployment
+        if remote_path.endswith("/VERSION"):
+            component = next(
+                (name for name in ("wifi_watchdog", "bus_watchdog") if f"/{name}/" in remote_path),
+                "bridge",
+            )
+            archive_path = (
+                "/var/brilliant-mqtt.staging.tar.gz"
+                if component == "bridge"
+                else f"/var/brilliant-mqtt/{component}.staging.tar.gz"
+            )
+            archives = [content for path, content, _mode in self.uploads if path == archive_path]
+            if archives:
+                entries: dict[str, str] = {}
+                with tarfile.open(fileobj=io.BytesIO(archives[-1]), mode="r:gz") as archive:
+                    for member in archive.getmembers():
+                        path = member.name.removeprefix("./")
+                        if (
+                            not member.isfile()
+                            or "__pycache__" in path
+                            or re.search(r"\.py[co]$", path)
+                        ):
+                            continue
+                        if component == "bridge" and not path.startswith(("app/", "vendor/")):
+                            continue
+                        source = archive.extractfile(member)
+                        assert source is not None
+                        logical = path if component == "bridge" else f"{component}/{path}"
+                        entries[logical] = hashlib.sha256(source.read()).hexdigest()
+                wire = "".join(f"{path}\t{entries[path]}\n" for path in sorted(entries))
+                identity: dict[str, object] = {
+                    "version": data.decode(),
+                    "release_ordinal": None,
+                    "digest": hashlib.sha256(wire.encode()).hexdigest(),
+                    "deployment_id": None,
+                    "layout": "legacy_fixed",
+                }
+                self._pending_identities[component] = identity
+                incumbent = self.release_identities[component]
+                if incumbent is None or incumbent["layout"] == "legacy_fixed":
+                    self.release_identities[component] = identity
+        for component, identity in self._pending_identities.items():
+            service = (
+                "brilliant-mqtt"
+                if component == "bridge"
+                else "brilliant-" + component.replace("_", "-")
+            )
+            if remote_path == f"/etc/systemd/system/{service}.service":
+                self.release_identities[component] = identity
 
     async def put_dir(self, local_dir: str, remote_dir: str) -> None:
         self._require_connected()
