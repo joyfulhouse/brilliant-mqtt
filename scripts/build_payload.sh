@@ -8,6 +8,8 @@ trap 'rm -rf "$WHEELS"' EXIT
 
 rm -rf "$DEST"
 mkdir -p "$DEST/app" "$DEST/vendor"
+cp "$ROOT/deploy/RELEASE_ORDINAL" "$DEST/RELEASE_ORDINAL"
+cp "$ROOT/scripts/brilliant-panel/bundle_manifest.py" "$DEST/bundle_manifest.py"
 cp -R "$ROOT/src/brilliant_mqtt" "$DEST/app/brilliant_mqtt"
 find "$DEST/app" -name __pycache__ -type d -prune -exec rm -rf {} +
 find "$DEST/app" -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete

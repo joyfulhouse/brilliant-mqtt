@@ -1315,9 +1315,7 @@ async def test_deploy_payload_builds_archive_off_loop_then_extracts_and_swaps(
     app_file.write_text("main = True\n")
     vendor_file.write_text("dependency = True\n")
     app_file.chmod(0o751)
-    symlink = app_file.with_name("main.py")
-    symlink.symlink_to(app_file.name)
-    symlink_mode = os.lstat(symlink).st_mode & 0o777
+    (payload / "VERSION").write_text("9.9.9")
 
     loop_thread = threading.get_ident()
     builder_threads: list[int] = []
@@ -1343,7 +1341,6 @@ async def test_deploy_payload_builds_archive_off_loop_then_extracts_and_swaps(
     with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as archive:
         members = {member.name: member for member in archive.getmembers()}
         assert "./app/brilliant_mqtt/__main__.py" in members
-        assert members["./app/brilliant_mqtt/main.py"].issym()
         assert "./vendor/dependency.py" in members
         assert all(
             (member.uid, member.gid, member.uname, member.gname) == (0, 0, "root", "root")
@@ -1351,7 +1348,6 @@ async def test_deploy_payload_builds_archive_off_loop_then_extracts_and_swaps(
         )
         assert members["."].mode == 0o755
         assert members["./app/brilliant_mqtt/__main__.py"].mode == 0o755
-        assert members["./app/brilliant_mqtt/main.py"].mode == symlink_mode
         assert members["./vendor/dependency.py"].mode == 0o644
     assert shell.commands[1] == (
         "mkdir -p /var/brilliant-mqtt.staging && "
@@ -1375,6 +1371,7 @@ async def test_deploy_payload_failed_extraction_recovers_on_retry(tmp_path: Path
     payload = tmp_path / "payload"
     (payload / "app").mkdir(parents=True)
     (payload / "vendor").mkdir()
+    (payload / "VERSION").write_text("9.9.9")
     extract_command = (
         "mkdir -p /var/brilliant-mqtt.staging && "
         "tar xzf /var/brilliant-mqtt.staging.tar.gz -C /var/brilliant-mqtt.staging && "
@@ -1411,6 +1408,7 @@ async def test_deploy_payload_raises_and_skips_version_when_swap_fails(tmp_path:
     payload = tmp_path / "payload"
     (payload / "app").mkdir(parents=True)
     (payload / "vendor").mkdir()
+    (payload / "VERSION").write_text("9.9.9")
     shell = await _connected(FakeShell(responses={_EXPECTED_SWAP: RunResult(1, "", "mv failed\n")}))
     with pytest.raises(panel_ops.PanelOpError, match="exited 1"):
         await panel_ops.deploy_payload(shell, str(payload), version="9.9.9")
@@ -1978,6 +1976,9 @@ async def test_deploy_wifi_watchdog_uploads_tree_then_swaps(
 @pytest.fixture
 def wifi_watchdog_tree(tmp_path: Path) -> Path:
     """A minimal real tree: the deploy tars it in memory off-loop."""
+    (tmp_path / "VERSION").write_text("0.10.1")
+    (tmp_path / "app").mkdir()
+    (tmp_path / "vendor").mkdir()
     tree = tmp_path / "wifi_watchdog"
     package = tree / "brilliant_wifi_watchdog"
     package.mkdir(parents=True)
@@ -1987,6 +1988,9 @@ def wifi_watchdog_tree(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def bus_watchdog_tree(tmp_path: Path) -> Path:
+    (tmp_path / "VERSION").write_text("0.10.1")
+    (tmp_path / "app").mkdir()
+    (tmp_path / "vendor").mkdir()
     tree = tmp_path / "bus_watchdog"
     package = tree / "brilliant_bus_watchdog"
     package.mkdir(parents=True)

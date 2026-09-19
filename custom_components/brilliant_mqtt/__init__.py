@@ -295,7 +295,14 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
             await manager.async_repair(trigger="service")
 
     async def _redeploy(call: ServiceCall) -> None:
-        await _apply_to_all(call, lambda m: m.async_update_agent())
+        override = call.data.get("release_override")
+        if override is None:
+            await _apply_to_all(call, lambda m: m.async_update_agent())
+            return
+        managers = await _managers_for(call)
+        if len(managers) != 1 or not isinstance(override, dict):
+            raise HomeAssistantError("release_override requires exactly one targeted panel")
+        await managers[0].async_update_agent(release_override=override)
 
     async def _uninstall(call: ServiceCall) -> None:
         await _apply_to_all(call, lambda m: m.async_uninstall())

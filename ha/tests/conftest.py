@@ -113,6 +113,7 @@ def payload_dir(tmp_path: Path) -> Iterator[Path]:
     (tmp_path / "app" / "brilliant_mqtt").mkdir(parents=True)
     (tmp_path / "vendor").mkdir()
     (tmp_path / "VERSION").write_text("0.2.0")
+    (tmp_path / "RELEASE_ORDINAL").write_text("1\n")
     (tmp_path / "brilliant-mqtt.service").write_text("[Unit]\nDescription=test unit\n")
     (tmp_path / "brilliant-wifi-watchdog.service").write_text(
         "[Unit]\nDescription=test wifi watchdog unit\n"
@@ -129,7 +130,14 @@ def payload_dir(tmp_path: Path) -> Iterator[Path]:
     )
     (tmp_path / "ha_mirror" / "brilliant_ha_mirror").mkdir(parents=True)
     (tmp_path / "ha_mirror" / "brilliant_ha_mirror" / "__main__.py").write_text("# stub\n")
-    with patch("custom_components.brilliant_mqtt.manager._payload_dir", return_value=tmp_path):
+    with (
+        patch("custom_components.brilliant_mqtt.manager._payload_dir", return_value=tmp_path),
+        patch(
+            "custom_components.brilliant_mqtt.panel_ops._identity_payload_dir",
+            return_value=tmp_path,
+            create=True,
+        ),
+    ):
         yield tmp_path
 
 
