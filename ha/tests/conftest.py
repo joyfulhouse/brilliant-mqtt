@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import shutil
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
@@ -39,6 +40,19 @@ from custom_components.brilliant_mqtt.fleet_manager import legacy_fleet_config
 from custom_components.brilliant_mqtt.manager import PanelManager
 from tests.fakes import FakeShell
 from tests.test_init import ENTRY_DATA
+
+
+@pytest.fixture(autouse=True)
+def canary_rehearsal_umask(request: pytest.FixtureRequest) -> Iterator[None]:
+    """Keep rehearsal filesystem modes independent of the invoking host's umask."""
+    if request.path.name not in {"test_canary_rollback.py", "test_canary_broker.py"}:
+        yield
+        return
+    previous = os.umask(0o022)
+    try:
+        yield
+    finally:
+        os.umask(previous)
 
 
 @pytest.fixture(autouse=True)
