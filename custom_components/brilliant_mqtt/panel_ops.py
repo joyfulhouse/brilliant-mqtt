@@ -262,14 +262,11 @@ async def _admit_identities(
         raise PanelOpError("release_identity_invalid: selected component missing from payload")
     incumbent = {key: installed.get(key) for key in selected}
     candidate = {key: candidate[key] for key in selected}
-    expected_transaction = transaction
     transaction = transaction or uuid4().hex
     if override is not None:
         value = override.get("transaction")
         if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{32}", value) is None:
             raise PanelOpError("release_override_invalid")
-        if expected_transaction is not None and value != expected_transaction:
-            raise PanelOpError("release_override_mismatch")
         transaction = value
     binding = _identity_binding(panel, incumbent, candidate, transaction)
     if override is not None and dict(override) != binding:
@@ -1656,20 +1653,12 @@ async def activate_staged(
     """Atomically select a validated release and converge only fleet core units."""
     if not isinstance(staged, StagedRelease) or not callable(on_services_stopped):
         raise PanelOpError("invalid_staged_release")
-    admission = _RELEASE_ADMISSION.get()
-    if admission is not None:
-        admission = await _guard_release(shell, components=staged.selected_components)
-        if admission.noop:
-            return
-    candidate = await _read_staged_identities(shell, staged)
-    if admission is None:
-        admission = await _admit_identities(
-            shell, candidate, "connected-panel", staged.selected_components, None
-        )
-    elif candidate != admission.candidate:
-        raise PanelOpError("release_candidate_changed")
+    admission = await _guard_release(shell, components=staged.selected_components)
     if admission.noop:
         return
+    candidate = await _read_staged_identities(shell, staged)
+    if candidate != admission.candidate:
+        raise PanelOpError("release_candidate_changed")
     if not all(admission.changes.values()):
         raise PanelOpError("release_selection_conflict")
     await _provisioning_run(

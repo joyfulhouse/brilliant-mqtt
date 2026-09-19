@@ -124,6 +124,10 @@ also refuses to destroy a retained baseline; finalize intentionally first.
 - HA stores passive retained metadata separately from the execution journal using
   its existing private atomic Store. The retained record omits `root_password`.
   The temporary execution journal still needs that credential for crash recovery.
+  Interrupted onboarding compensation resumes from that matching active journal,
+  even before the HA panel owner has been created. Its distinct onboarding rollback
+  operation preserves this authority across a restart. Post-soak named rollback
+  still requires the current matching HA owner; retained storage gains no root password.
   Byte-exact environment recovery also duplicates the **live MQTT broker credential**
   in the retained HA `.storage` record and the on-panel archive during soak. The
   on-panel `complete.json` is private capture metadata (hashes, paths and identity),

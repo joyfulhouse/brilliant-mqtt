@@ -1597,7 +1597,9 @@ class PanelProvisioner:
             if retained.state == "finalizing":
                 await self._async_finalize(retained)
             elif retained.state == "restore_requested":
-                password = await self._resolve_credential(retained.record.panel_request)
+                password = retained.compensation_password(await self._journal.async_load())
+                if password is None:
+                    password = await self._resolve_credential(retained.record.panel_request)
                 await self._journal.async_begin_restore(retained.record.transaction_id, password)
         record = await self._journal.async_load()
         if record is not None:

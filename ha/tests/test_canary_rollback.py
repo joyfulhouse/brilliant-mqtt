@@ -261,6 +261,195 @@ async def test_capture_retry_reconciles_pin_after_fsync_crash(
         await panel_ops.capture_baseline(shell, snapshot)
 
 
+async def test_capture_retry_after_pin_creation_before_identifier_flush(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shell = RehearsalShell(tmp_path)
+    release = shell.install(release=True)
+    snapshot = await panel_ops.snapshot_panel(shell)
+    original_source = panel_ops._identity_source
+
+    async def interrupted_source() -> str:
+        source = await original_source()
+        assert source.count("stream.write(identifier)") == 1
+        return source.replace("stream.write(identifier)", "os._exit(79)")
+
+    with monkeypatch.context() as fault:
+        fault.setattr(panel_ops, "_identity_source", interrupted_source)
+        with pytest.raises(panel_ops.PanelOpError):
+            await panel_ops.capture_baseline(shell, snapshot)
+    marker = release / ".rollback-retained"
+    if marker.exists():
+        assert marker.read_bytes() == b""
+    assert not await panel_ops.baseline_retained(shell)
+    with pytest.raises(panel_ops.PanelOpError, match="baseline_incomplete"):
+        await panel_ops.verify_baseline(shell, snapshot)
+    captured = await panel_ops.capture_baseline(shell, snapshot)
+    assert captured.baseline is not None
+    assert marker.read_text() == captured.baseline.identifier
+    await panel_ops.verify_baseline(shell, captured)
+
+
+async def test_standalone_activation_rejects_untrusted_higher_ordinal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from custom_components.brilliant_mqtt.release_identity import ReleaseIdentity
+    from custom_components.brilliant_mqtt.shell import RunResult
+    from tests.fakes import FakeShell
+
+    shell = FakeShell()
+    transaction = uuid4()
+    staged = panel_ops.StagedRelease(
+        "0.10.2",
+        transaction,
+        f"/var/brilliant-mqtt/releases/0.10.2--{transaction.hex}",
+        ("bridge",),
+    )
+    trusted = ReleaseIdentity("0.10.2", 2, "a" * 64, None, "candidate")
+    incumbent = replace(trusted, release_ordinal=1, digest="b" * 64, layout="legacy_fixed")
+    forged = replace(trusted, release_ordinal=99, digest="c" * 64)
+    local = AsyncMock(return_value={"bridge": trusted})
+    monkeypatch.setattr(panel_ops, "candidate_identities", local)
+    monkeypatch.setattr(
+        panel_ops, "_read_release_identities", AsyncMock(return_value={"bridge": incumbent})
+    )
+    monkeypatch.setattr(
+        panel_ops, "_read_staged_identities", AsyncMock(return_value={"bridge": forged})
+    )
+    monkeypatch.setattr(panel_ops, "_complete_identity", AsyncMock())
+    mutate = AsyncMock(return_value=RunResult(0, "", ""))
+    monkeypatch.setattr(panel_ops, "_provisioning_run", mutate)
+    with pytest.raises(panel_ops.PanelOpError, match="release_candidate_changed"):
+        await panel_ops.activate_staged(shell, staged, on_services_stopped=lambda: None)
+    local.assert_awaited_once()
+    mutate.assert_not_awaited()
+
+
+@pytest.mark.parametrize("route", ["fleet", "provisioner"])
+@pytest.mark.parametrize("crash_point", ["intent", "operation"])
+@pytest.mark.parametrize(
+    "operation", [ProvisioningOperation.INSTALL, ProvisioningOperation.UPGRADE]
+)
+async def test_onboarding_compensation_recovers_without_created_owner(
+    hass: HomeAssistant,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    route: str,
+    crash_point: str,
+    operation: ProvisioningOperation,
+) -> None:
+    from unittest.mock import Mock
+
+    from custom_components.brilliant_mqtt import fleet_manager
+    from tests.test_fleet_manager import _provisioning_entry
+    from tests.test_panel_provisioner import _FakeObserver, _health
+
+    shell = RehearsalShell(tmp_path)
+    code = shell.install()
+    snapshot = await panel_ops.capture_baseline(shell, await panel_ops.snapshot_panel(shell))
+    record = replace(
+        _record(),
+        operation=operation,
+        panel_request=replace(_record().panel_request, selected_components=("bridge",)),
+        prior_snapshot=stored_snapshot_from_panel(snapshot),
+    )
+    journal = ProvisioningJournal(hass)
+    await journal.async_create(record)
+    record = await journal.async_transition(
+        record.transaction_id, ProvisioningPhase.ACTIVATION_PENDING
+    )
+    (code / "vendor/original.py").write_text("candidate = True\n")
+    shell._pinned = record.panel_request.public_key
+    provisioner = _Harness().provisioner()
+    provisioner._journal = journal
+    provisioner._operations = panel_ops
+    provisioner._shell_factory = lambda _host, _password, _key: shell
+    provisioner._health_observer_factory = lambda _slug: _FakeObserver([], _health())
+    provisioner._credential_resolver = AsyncMock(return_value=None)
+    staged = panel_ops.StagedRelease(
+        record.staged_version,
+        record.transaction_id,
+        f"/var/brilliant-mqtt/releases/{record.staged_version}--{record.transaction_id.hex}",
+        ("bridge",),
+    )
+    begin = ProvisioningJournal.async_begin_restore
+
+    async def crash(self: ProvisioningJournal, transaction_id: object, password: str) -> None:
+        assert transaction_id == record.transaction_id
+        if crash_point == "operation":
+            await begin(self, record.transaction_id, password)
+        raise RuntimeError("disposable process loss")
+
+    with monkeypatch.context() as fault:
+        fault.setattr(ProvisioningJournal, "async_begin_restore", crash)
+        with pytest.raises(RuntimeError, match="disposable process loss"):
+            await provisioner._async_recovery_rollback(
+                record,
+                shell,
+                snapshot,
+                staged,
+                original_code="health_failed",
+            )
+    journal = ProvisioningJournal(hass)
+    retained = await journal.async_retained(record.transaction_id)
+    assert retained is not None and retained.state == "restore_requested"
+    assert "root_password" not in json.dumps(retained._to_storage())
+    if route == "fleet":
+        entry = _provisioning_entry(scene_owner="")
+        entry.add_to_hass(hass)
+        manager = fleet_manager.FleetManager(hass, entry)
+        schedule = Mock()
+        monkeypatch.setattr(manager, "_async_schedule_background_recovery", schedule)
+        await manager._async_prepare_provisioning()
+        schedule.assert_called_once()
+    provisioner._journal = journal
+    await provisioner.async_recover()
+    assert await journal.async_load() is None
+    retained = await journal.async_retained(record.transaction_id)
+    assert retained is not None and retained.state == "restored"
+    assert (code / "vendor/original.py").read_text() == "original = True\n"
+
+
+@pytest.mark.parametrize("route", ["fleet", "provisioner"])
+async def test_named_rollback_recovery_rejects_foreign_owner(
+    hass: HomeAssistant,
+    tmp_path: Path,
+    route: str,
+) -> None:
+    from functools import partial
+
+    from custom_components.brilliant_mqtt import fleet_manager
+    from custom_components.brilliant_mqtt.entry_data import EntryDataError
+    from tests.test_fleet_manager import _panel, _provisioning_entry
+
+    shell = RehearsalShell(tmp_path)
+    shell.install()
+    snapshot = await panel_ops.capture_baseline(shell, await panel_ops.snapshot_panel(shell))
+    record = replace(_record(), prior_snapshot=stored_snapshot_from_panel(snapshot))
+    journal = ProvisioningJournal(hass)
+    await journal.async_arm(record)
+    await journal.async_retained_state(record.transaction_id, "soak")
+    await journal.async_request_restore(record.transaction_id)
+    await journal.async_begin_restore(record.transaction_id, record.panel_request.root_password)
+    entry = _provisioning_entry(
+        _panel("office", "SHA256:kitchen", subentry_id="foreign", host=record.panel_request.host),
+        scene_owner="foreign",
+    )
+    entry.add_to_hass(hass)
+    before = await journal.async_load()
+    if route == "fleet":
+        manager = fleet_manager.FleetManager(hass, entry)
+        with pytest.raises(EntryDataError, match="rollback_credentials_unavailable"):
+            await manager._async_prepare_provisioning()
+    else:
+        provisioner = _Harness().provisioner()
+        provisioner._journal = journal
+        provisioner._credential_resolver = partial(fleet_manager._async_rollback_credential, hass)
+        with pytest.raises(PanelProvisioningError, match="rollback_credentials_unavailable"):
+            await provisioner.async_recover()
+    assert await journal.async_load() == before
+
+
 @pytest.mark.parametrize("policy", ["blocked", "unchanged", "override"])
 async def test_migration_inherits_shared_identity_admission(
     hass: HomeAssistant,
@@ -537,7 +726,11 @@ async def test_rollback_intent_creates_explicit_operation_and_preserves_baseline
     await journal.async_begin_restore(record.transaction_id, record.panel_request.root_password)
     restored_journal = await ProvisioningJournal(hass).async_load()
     assert restored_journal is not None
-    assert restored_journal.operation.value == "rollback"
+    assert restored_journal.operation is (
+        ProvisioningOperation.ONBOARDING_ROLLBACK
+        if interrupted_staging
+        else ProvisioningOperation.ROLLBACK
+    )
     assert restored_journal.phase is ProvisioningPhase.ROLLBACK_PENDING
     assert restored_journal.prior_snapshot == record.prior_snapshot
 

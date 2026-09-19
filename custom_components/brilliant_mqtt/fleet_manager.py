@@ -1175,10 +1175,14 @@ class FleetManager:
         try:
             record = await journal.async_load()
             for retained in await journal.async_retained_records():
-                if retained.state == "restore_requested" and record is None:
-                    password = await _async_rollback_credential(
-                        self.hass, retained.record.panel_request
-                    )
+                password = retained.compensation_password(record)
+                if retained.state == "restore_requested" and (
+                    record is None or password is not None
+                ):
+                    if password is None:
+                        password = await _async_rollback_credential(
+                            self.hass, retained.record.panel_request
+                        )
                     if password is None:
                         raise EntryDataError("rollback_credentials_unavailable")
                     await journal.async_begin_restore(retained.record.transaction_id, password)
@@ -1195,6 +1199,13 @@ class FleetManager:
         if record is None:
             self._assert_no_orphaned_handoff()
             await self._async_persist_parent_normalization(None)
+            return
+
+        if record.operation is ProvisioningOperation.ONBOARDING_ROLLBACK:
+            compensation = await journal.async_retained(record.transaction_id)
+            if compensation is None or compensation.compensation_password(record) is None:
+                raise EntryDataError("rollback_credentials_unavailable")
+            self._async_schedule_background_recovery(record)
             return
 
         if record.operation is ProvisioningOperation.ROLLBACK:

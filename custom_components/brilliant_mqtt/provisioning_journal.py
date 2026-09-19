@@ -166,6 +166,7 @@ class ProvisioningOperation(StrEnum):
     UPGRADE = "upgrade"
     UPDATE = "update"
     ROLLBACK = "rollback"
+    ONBOARDING_ROLLBACK = "onboarding_rollback"
 
 
 class ProvisioningPhase(StrEnum):
@@ -897,6 +898,40 @@ class RetainedRollback:
     def __repr__(self) -> str:
         return "RetainedRollback(<redacted>)"
 
+    def compensation_password(self, current: ProvisioningRecord | None) -> str | None:
+        """Use only the matching active onboarding journal's temporary authority."""
+        if current is None or self.record.operation not in {
+            ProvisioningOperation.INSTALL,
+            ProvisioningOperation.UPGRADE,
+        }:
+            return None
+        if current.operation is ProvisioningOperation.ONBOARDING_ROLLBACK:
+            if self.state not in {
+                "restore_requested",
+                "restored",
+                "rollback_failed",
+            } or current.phase not in {
+                ProvisioningPhase.ROLLBACK_PENDING,
+                ProvisioningPhase.ROLLED_BACK,
+            }:
+                return None
+        elif (
+            current.operation is not self.record.operation
+            or self.state != "restore_requested"
+            or current.phase in {ProvisioningPhase.COMMITTED, ProvisioningPhase.ROLLED_BACK}
+        ):
+            return None
+        provenance = replace(
+            current,
+            operation=self.record.operation,
+            phase=self.record.phase,
+            last_error=self.record.last_error,
+            panel_request=replace(current.panel_request, root_password=_CREDENTIAL_PLACEHOLDER),
+        )
+        if provenance != self.record:
+            return None
+        return current.panel_request.root_password
+
     def _to_storage(self) -> dict[str, object]:
         record = self.record._to_storage()
         request = self.record.panel_request._to_storage()
@@ -1095,7 +1130,11 @@ class ProvisioningJournal:
                 raise ProvisioningJournalError("journal_transaction_in_progress")
             record = replace(
                 retained.record,
-                operation=ProvisioningOperation.ROLLBACK,
+                operation=(
+                    ProvisioningOperation.ONBOARDING_ROLLBACK
+                    if retained.compensation_password(self._coordinator.record) is not None
+                    else ProvisioningOperation.ROLLBACK
+                ),
                 phase=ProvisioningPhase.ROLLBACK_PENDING,
                 panel_request=replace(
                     retained.record.panel_request, root_password=_secret_text(root_password)

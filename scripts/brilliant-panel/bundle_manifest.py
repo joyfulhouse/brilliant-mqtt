@@ -738,11 +738,15 @@ def capture_baseline(
                 marker.unlink()
                 _sync_directory(parent)
                 _sync_directory(release)
-            with marker.open("x") as stream:
+            pending_marker = temporary / "release-pin"
+            with pending_marker.open("x") as stream:
                 os.fchmod(stream.fileno(), 0o600)
                 stream.write(identifier)
                 stream.flush()
                 os.fsync(stream.fileno())
+            # Publish a complete identifier without replacing an existing pin.
+            os.link(pending_marker, marker, follow_symlinks=False)
+            pending_marker.unlink()
             _sync_directory(release)
         with archive.open("rb") as stream:
             archive_digest = hashlib.sha256(stream.read()).hexdigest()
