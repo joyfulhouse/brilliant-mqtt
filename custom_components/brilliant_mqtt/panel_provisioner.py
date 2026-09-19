@@ -6,8 +6,8 @@ import asyncio
 import math
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
-from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -54,6 +54,8 @@ from .panel_ops import (
     FileSnapshot,
     PanelLayout,
     PanelSnapshot,
+    ReleaseAdmission,
+    ReleaseIdentityBlocked,
     ServiceSnapshot,
 )
 from .panel_ops import (
@@ -104,6 +106,9 @@ _ERROR_CODES = frozenset(
         "progress_failed",
         "recovery_failed",
         "release_prepare_failed",
+        "release_identity_blocked",
+        "release_unchanged",
+        "release_selection_conflict",
         "rollback_failed",
         "rollback_health_failed",
         "rollback_deadline_exceeded",
@@ -202,7 +207,7 @@ class ProvisioningFailureDetail:
 class PanelProvisioningError(RuntimeError):
     """One allowlisted orchestration failure without raw dependency context."""
 
-    __slots__ = ("capability", "cleanup_code", "code", "detail")
+    __slots__ = ("capability", "cleanup_code", "code", "detail", "release_override")
 
     def __init__(
         self,
@@ -211,6 +216,7 @@ class PanelProvisioningError(RuntimeError):
         detail: ProvisioningFailureDetail | None = None,
         cleanup_code: str | None = None,
         capability: str | None = None,
+        release_override: Mapping[str, object] | None = None,
     ) -> None:
         valid_toolchain_capability = (
             isinstance(capability, str) and capability in PANEL_TOOLCHAIN_CAPABILITIES
@@ -229,6 +235,7 @@ class PanelProvisioningError(RuntimeError):
             and capability is not None
         ):
             raise ValueError("invalid_panel_provisioning_error_code")
+        self.release_override = release_override
         self.code = code
         self.detail = detail
         self.cleanup_code = cleanup_code
@@ -672,6 +679,17 @@ class PanelBrokerValidator(Protocol):
 
 
 class PanelOperations(Protocol):
+    def release_transaction(
+        self,
+        shell: PanelShell,
+        local_payload_dir: str,
+        *,
+        panel: str,
+        components: tuple[str, ...] = (),
+        override: Mapping[str, object] | None = None,
+        transaction_id: UUID | None = None,
+    ) -> AbstractAsyncContextManager[ReleaseAdmission]: ...
+
     async def capture_baseline(
         self, shell: PanelShell, snapshot: PanelSnapshot
     ) -> PanelSnapshot: ...
@@ -854,6 +872,8 @@ class PanelProvisioner:
         request: PanelInstallRequest,
         fleet: FleetConfig,
         progress: ProgressReporter,
+        *,
+        release_override: Mapping[str, object] | None = None,
     ) -> ProvisionedPanel:
         """Install and verify one inactive release, retaining the journal."""
         if not isinstance(request, PanelInstallRequest) or not isinstance(fleet, FleetConfig):
@@ -869,6 +889,11 @@ class PanelProvisioner:
                     fleet,
                     progress,
                     state,
+                    release_override,
+                )
+            except ReleaseIdentityBlocked as error:
+                primary = PanelProvisioningError(
+                    "release_identity_blocked", release_override=error.override
                 )
             except asyncio.CancelledError as error:
                 cancellation = error
@@ -988,9 +1013,15 @@ class PanelProvisioner:
             raise PanelProvisioningError("baseline_incomplete")
         await self._operations.verify_baseline(shell, snapshot)
         transaction = uuid4()
+        request = replace(
+            request,
+            selected_components=self._staged_release_factory(
+                version, transaction, request.selected_components
+            ).selected_components,
+        )
         record = ProvisioningRecord(
             transaction,
-            ProvisioningOperation.UPGRADE,
+            ProvisioningOperation.UPDATE,
             ProvisioningPhase.STAGED,
             uuid4(),
             request,
@@ -1042,6 +1073,7 @@ class PanelProvisioner:
         fleet: FleetConfig,
         progress: ProgressReporter,
         state: _InstallState,
+        release_override: Mapping[str, object] | None,
     ) -> ProvisionedPanel:
         state.failure_code = "progress_failed"
         state.failure_stage = "progress"
@@ -1095,22 +1127,19 @@ class PanelProvisioner:
         if await self._duplicate_fingerprint(identity.fingerprint):
             raise PanelProvisioningError("duplicate_panel")
 
-        state.failure_code = "progress_failed"
-        state.failure_stage = "progress"
-        await _report(progress, ProvisioningProgressStage.SNAPSHOTTING)
-        state.failure_code = "snapshot_failed"
-        state.failure_stage = "snapshot"
-        state.snapshot = await self._operations.snapshot_panel(state.shell)
-        state.snapshot = await self._operations.capture_baseline(state.shell, state.snapshot)
-        if state.snapshot.baseline is None:
-            raise PanelProvisioningError("snapshot_failed")
-        await self._operations.verify_baseline(state.shell, state.snapshot)
-        state.stored_snapshot = self._snapshot_to_stored(state.snapshot)
-        if not isinstance(state.stored_snapshot, StoredPanelSnapshot):
-            raise PanelProvisioningError("snapshot_failed")
-
         state.transaction_id = self._next_id()
         state.setup_id = self._next_id()
+        if release_override is not None:
+            value = release_override.get("transaction")
+            if not isinstance(value, str):
+                raise PanelProvisioningError("release_identity_blocked")
+            try:
+                transaction = UUID(hex=value)
+            except ValueError:
+                raise PanelProvisioningError("release_identity_blocked") from None
+            if not _is_uuid4(transaction):
+                raise PanelProvisioningError("release_identity_blocked")
+            state.transaction_id = transaction
         state.failure_code = "release_prepare_failed"
         state.failure_stage = "release"
         bundle = await self._release_provider(
@@ -1125,6 +1154,49 @@ class PanelProvisioner:
             or fleet.broker.has_custom_ca != (bundle.mqtt_ca is not None)
         ):
             raise PanelProvisioningError("release_prepare_failed")
+
+        async with self._operations.release_transaction(
+            state.shell,
+            bundle.local_payload_dir,
+            panel=request.slug,
+            components=request.selected_components,
+            override=release_override,
+            transaction_id=state.transaction_id,
+        ) as admission:
+            if admission.noop:
+                raise PanelProvisioningError("release_unchanged")
+            if not all(admission.changes.values()):
+                raise PanelProvisioningError("release_selection_conflict")
+            return await self._async_install_admitted(
+                request, fleet, progress, state, identity, facts, bundle
+            )
+
+    async def _async_install_admitted(
+        self,
+        request: PanelInstallRequest,
+        fleet: FleetConfig,
+        progress: ProgressReporter,
+        state: _InstallState,
+        identity: HostIdentity,
+        facts: PanelFacts,
+        bundle: PanelReleaseBundle,
+    ) -> ProvisionedPanel:
+        assert state.shell is not None
+        assert state.transaction_id is not None
+        assert state.setup_id is not None
+        state.failure_code = "progress_failed"
+        state.failure_stage = "progress"
+        await _report(progress, ProvisioningProgressStage.SNAPSHOTTING)
+        state.failure_code = "snapshot_failed"
+        state.failure_stage = "snapshot"
+        state.snapshot = await self._operations.snapshot_panel(state.shell)
+        state.snapshot = await self._operations.capture_baseline(state.shell, state.snapshot)
+        if state.snapshot.baseline is None:
+            raise PanelProvisioningError("snapshot_failed")
+        await self._operations.verify_baseline(state.shell, state.snapshot)
+        state.stored_snapshot = self._snapshot_to_stored(state.snapshot)
+        if not isinstance(state.stored_snapshot, StoredPanelSnapshot):
+            raise PanelProvisioningError("snapshot_failed")
 
         state.staged = self._staged_release_factory(
             bundle.version,
@@ -1596,11 +1668,15 @@ class PanelProvisioner:
                 await self._operations.cleanup_staged(shell, staged)
                 await self._journal.async_complete_cleanup(record.transaction_id)
                 await self._repair_reporter.async_clear_rollback_failure(record.transaction_id)
-            elif record.phase in {
-                ProvisioningPhase.ACTIVATION_PENDING,
-                ProvisioningPhase.ROLLBACK_PENDING,
-                ProvisioningPhase.PENDING_CONFIG_COMMIT,
-            }:
+            elif (
+                record.phase
+                in {
+                    ProvisioningPhase.ACTIVATION_PENDING,
+                    ProvisioningPhase.ROLLBACK_PENDING,
+                    ProvisioningPhase.PENDING_CONFIG_COMMIT,
+                }
+                or record.operation is ProvisioningOperation.UPDATE
+            ):
                 await self._async_recovery_rollback(
                     record,
                     shell,
@@ -1717,7 +1793,15 @@ class PanelProvisioner:
         original_code: str,
     ) -> None:
         current = record
-        if current.phase is not ProvisioningPhase.ROLLBACK_PENDING:
+        if current.prior_snapshot.baseline is not None:
+            await self._journal.async_retained_state(current.transaction_id, "restore_requested")
+            await self._journal.async_begin_restore(
+                current.transaction_id, current.panel_request.root_password
+            )
+            current = await self._journal.async_record_error(
+                current.transaction_id, StoredJournalError(stage="recovery", code=original_code)
+            )
+        elif current.phase is not ProvisioningPhase.ROLLBACK_PENDING:
             current = await self._journal.async_transition(
                 current.transaction_id,
                 ProvisioningPhase.ROLLBACK_PENDING,

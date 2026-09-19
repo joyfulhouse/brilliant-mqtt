@@ -164,6 +164,7 @@ class ProvisioningOperation(StrEnum):
 
     INSTALL = "install"
     UPGRADE = "upgrade"
+    UPDATE = "update"
     ROLLBACK = "rollback"
 
 

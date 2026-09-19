@@ -54,7 +54,7 @@ from custom_components.brilliant_mqtt.const import (
     VOICE_SERVICE_NAME,
     WIFI_WATCHDOG_SERVICE_NAME,
 )
-from custom_components.brilliant_mqtt.release_identity import RollbackBaseline
+from custom_components.brilliant_mqtt.release_identity import ReleaseIdentity, RollbackBaseline
 from custom_components.brilliant_mqtt.setup_protocol import PreflightRequest
 from custom_components.brilliant_mqtt.shell import RunResult
 from tests.fakes import FakePanelProcess, FakeShell
@@ -69,6 +69,39 @@ _TEST_MQTT_CA = b"test-ca\n"
 _TEST_MQTT_CA_DIGEST = hashlib.sha256(_TEST_MQTT_CA).hexdigest()
 _TEST_MQTT_CA_PATH = f"/var/brilliant-mqtt/tls/mqtt-ca-{_TEST_MQTT_CA_DIGEST[:16]}.pem"
 _TEMP_TOKEN = "0" * 32
+
+
+@pytest.fixture(autouse=True)
+def staged_recipe_identity_inputs(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recipe tests fake hashing; real staged admission is rehearsed in canary tests."""
+    if not request.node.name.startswith(("test_stage_", "test_activate_")):
+        return
+    candidates = {
+        component: ReleaseIdentity("0.6.0", 1, "d" * 64, None, "candidate")
+        for component in (COMPONENT_BRIDGE, COMPONENT_WIFI_WATCHDOG, COMPONENT_BUS_WATCHDOG)
+    }
+
+    async def local(_path: str) -> dict[str, ReleaseIdentity]:
+        return candidates
+
+    async def remote(_shell: object, staged: panel_ops.StagedRelease) -> dict[str, ReleaseIdentity]:
+        return {key: candidates[key] for key in staged.selected_components}
+
+    async def publish(
+        _shell: object,
+        admission: panel_ops.ReleaseAdmission,
+        component: str,
+    ) -> None:
+        admission.incumbent[component] = replace(candidates[component], layout="release_link")
+
+    monkeypatch.setattr(panel_ops, "candidate_identities", local)
+    monkeypatch.setattr(panel_ops, "_read_staged_identities", remote)
+    monkeypatch.setattr(panel_ops, "_complete_identity", publish)
+
+
 _TEST_MQTT_CA_TEMP_PATH = f"{_TEST_MQTT_CA_PATH}.tmp-{_TEMP_TOKEN}"
 _VERIFY_MQTT_CA_COMMAND = f"/usr/bin/sha256sum -- {_TEST_MQTT_CA_TEMP_PATH}"
 _PROMOTE_MQTT_CA_COMMAND = f"ln {_TEST_MQTT_CA_TEMP_PATH} {_TEST_MQTT_CA_PATH}"

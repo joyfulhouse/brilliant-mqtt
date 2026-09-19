@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from types import MappingProxyType
@@ -539,7 +540,12 @@ class _FakeJournal:
         pass
 
     async def async_begin_restore(self, transaction_id: UUID, root_password: str) -> None:
-        raise AssertionError("unexpected named restore")
+        assert self.record is not None
+        self.record = replace(
+            self.record,
+            operation=ProvisioningOperation.ROLLBACK,
+            phase=ProvisioningPhase.ROLLBACK_PENDING,
+        )
 
     async def async_remove_retained(self, transaction_id: UUID) -> None:
         pass
@@ -677,6 +683,19 @@ class _FakeOperations:
     activation_started: asyncio.Event = field(default_factory=asyncio.Event)
     rollback_started: asyncio.Event = field(default_factory=asyncio.Event)
     rolled_back_snapshot: panel_ops.PanelSnapshot | None = None
+
+    @asynccontextmanager
+    async def release_transaction(
+        self,
+        shell: PanelShell,
+        local_payload_dir: str,
+        *,
+        panel: str,
+        components: tuple[str, ...] = (),
+        override: Mapping[str, object] | None = None,
+        transaction_id: UUID | None = None,
+    ) -> AsyncIterator[panel_ops.ReleaseAdmission]:
+        yield panel_ops.ReleaseAdmission(shell, {}, {}, {"bridge": True}, "c" * 32)
 
     async def capture_baseline(
         self, shell: PanelShell, snapshot: panel_ops.PanelSnapshot
@@ -1091,8 +1110,8 @@ async def test_install_has_exact_durable_order_and_returns_canonical_panel_data(
         ("shell_connect",),
         ("inspect",),
         ("duplicate", _FINGERPRINT),
-        ("snapshot",),
         ("release", _TRANSACTION_ID, _SETUP_ID),
+        ("snapshot",),
         ("journal_create", ProvisioningPhase.STAGED.value),
         (
             "stage",

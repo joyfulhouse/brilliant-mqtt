@@ -16,6 +16,7 @@ from homeassistant.const import CONF_NAME
 from homeassistant.data_entry_flow import section
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.selector import (
+    ObjectSelector,
     TextSelector,
     TextSelectorConfig,
     TextSelectorType,
@@ -531,9 +532,12 @@ def panel_connect_form_source(user_input: Mapping[str, object]) -> dict[str, obj
     return {CONF_HOST: raw_host.strip()}
 
 
-def panel_confirm_schema(suggested_name: str) -> vol.Schema:
+def panel_confirm_schema(suggested_name: str, *, allow_override: bool = False) -> vol.Schema:
     """Build the confirmation form whose sole editable field is the panel name."""
-    return vol.Schema({vol.Required(CONF_NAME, default=suggested_name): str})
+    fields: dict[Any, Any] = {vol.Required(CONF_NAME, default=suggested_name): str}
+    if allow_override:
+        fields[vol.Optional("release_override")] = ObjectSelector()
+    return vol.Schema(fields)
 
 
 def normalize_panel_name(user_input: Mapping[str, object]) -> str:

@@ -12,6 +12,12 @@ publishes are needed for these operations.
    by selecting a reviewed newer ordinal or explicitly reviewing the exact
    single-operation `release_override` shown by `redeploy`. Never put an override
    into an automation or repair configuration.
+   Onboarding/migration uses the same admission policy before capture or staging.
+   If refused, review the displayed binding and explicitly paste it into the
+   optional release-override field to authorize that one transaction. An identical
+   payload ends with no staging or layout change. A migration with a mixture of
+   unchanged and differing components is refused so unchanged selectors survive;
+   use the targeted component management path instead.
 2. Run the targeted update. Before any CA, config, or code mutation, the integration
    captures a complete baseline and durably records `armed`. Capture fails closed
    if code is missing, deployment correlation is unsupported, the prior bridge
@@ -99,7 +105,11 @@ data:
 
 `finalizing` is saved before deleting artifacts. If HA restarts, the existing
 recovery runner finishes deletion. Download diagnostics and confirm the name no
-longer appears. An in-flight execution journal prevents finalization. Uninstall
+longer appears. Successful finalization synchronously purges the named HA retained
+record and the on-panel archive and `complete.json`; no deferred garbage collection
+is required. Finalize promptly at the agreed soak end to bound the extra credential
+storage window. Until explicitly finalized, the baseline has no automatic expiry.
+An in-flight execution journal prevents finalization. Uninstall
 also refuses to destroy a retained baseline; finalize intentionally first.
 
 ## Storage, limits, and evidence
@@ -114,6 +124,14 @@ also refuses to destroy a retained baseline; finalize intentionally first.
 - HA stores passive retained metadata separately from the execution journal using
   its existing private atomic Store. The retained record omits `root_password`.
   The temporary execution journal still needs that credential for crash recovery.
+  Byte-exact environment recovery also duplicates the **live MQTT broker credential**
+  in the retained HA `.storage` record and the on-panel archive during soak. The
+  on-panel `complete.json` is private capture metadata (hashes, paths and identity),
+  not raw environment bytes; it is purged alongside the archive. Thus the widened
+  at-rest footprint includes `root_password` in the temporary execution journal
+  and the live MQTT broker credential in both that journal and the retained baseline.
+  Secret-bearing files and `complete.json` have mode `0600`; on-panel capture
+  directories have mode `0700`. These copies are necessary for crash-safe recovery.
   Private permissions and redacting representations are not encryption: theft of
   HA storage or the panel archive requires rotation of exposed broker credentials
   (and the root password if the execution journal/configuration was stolen), then

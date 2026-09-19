@@ -48,6 +48,8 @@ def canary_rehearsal_umask(request: pytest.FixtureRequest) -> Iterator[None]:
     if request.path.name not in {"test_canary_rollback.py", "test_canary_broker.py"}:
         yield
         return
+    # Model ordinary unit/code creation with 022. Secret paths must explicitly
+    # enforce 0700/0600; a restrictive host mask would hide permission regressions.
     previous = os.umask(0o022)
     try:
         yield

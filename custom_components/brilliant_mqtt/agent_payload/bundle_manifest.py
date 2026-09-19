@@ -722,7 +722,22 @@ def capture_baseline(
                 raise ManifestError("baseline_changed")
             marker = release / ".rollback-retained"
             if marker.exists():
-                raise ManifestError("baseline_already_retained")
+                stranded = marker.read_text()
+                if (
+                    marker.is_symlink()
+                    or re.fullmatch(r"[0-9a-f]{32}", stranded) is None
+                    or os.path.lexists(parent / stranded)
+                    or os.path.lexists(parent / ("." + stranded + ".finalizing"))
+                ):
+                    raise ManifestError("baseline_already_retained")
+                # A pin without published completion never authorized mutation.
+                # Reconcile only that exact abandoned capture under the panel lock.
+                partial = parent / ("." + stranded + ".tmp")
+                if partial.exists():
+                    shutil.rmtree(partial)
+                marker.unlink()
+                _sync_directory(parent)
+                _sync_directory(release)
             with marker.open("x") as stream:
                 os.fchmod(stream.fileno(), 0o600)
                 stream.write(identifier)

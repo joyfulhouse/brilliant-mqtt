@@ -109,7 +109,13 @@ class RehearsalShell(FakeShell):
         await asyncio.to_thread(path.chmod, mode)
 
     async def put_dir(self, local_dir: str, remote_dir: str) -> None:
-        shutil.copytree(local_dir, self.translate(remote_dir))
+        def copy() -> None:
+            destination = Path(self.translate(remote_dir))
+            shutil.copytree(local_dir, destination)
+            for unit in destination.glob("*.service"):
+                unit.write_text(self.translate(unit.read_text()))
+
+        await asyncio.to_thread(copy)
 
     def install(self, *, release: bool = False) -> Path:
         code = self.panel

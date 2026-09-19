@@ -204,6 +204,235 @@ async def test_named_baseline_survives_commit_without_root_password(
     assert record.panel_request.root_password not in encoded
     assert "root_password" not in encoded
     assert "fixture-secret" not in repr(retained)
+    retained_path = Path(journal._retained_storage().path)
+    assert snapshot.baseline is not None
+    artifact = shell.panel / ".rollback" / snapshot.baseline.identifier
+    assert (await asyncio.to_thread(retained_path.stat)).st_mode & 0o777 == 0o600
+    assert (artifact / "complete.json").stat().st_mode & 0o777 == 0o600
+    assert (artifact / "baseline.tar").stat().st_mode & 0o777 == 0o600
+    assert artifact.stat().st_mode & 0o777 == 0o700
+    assert artifact.parent.stat().st_mode & 0o777 == 0o700
+    provisioner = _Harness().provisioner()
+    provisioner._journal = journal
+    provisioner._operations = panel_ops
+    shell._pinned = record.panel_request.public_key
+    provisioner._shell_factory = lambda _host, _password, _key: shell
+
+    async def credential(_request: object) -> str:
+        return record.panel_request.root_password
+
+    provisioner._credential_resolver = credential
+    await provisioner.async_finalize(record.transaction_id)
+    assert await journal.async_retained(record.transaction_id) is None
+    assert not artifact.exists()
+    assert json.loads(await asyncio.to_thread(retained_path.read_bytes))["data"] == {"records": {}}
+
+
+async def test_capture_retry_reconciles_pin_after_fsync_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shell = RehearsalShell(tmp_path)
+    release = shell.install(release=True)
+    snapshot = await panel_ops.snapshot_panel(shell)
+    original_source = panel_ops._identity_source
+
+    async def interrupted_source() -> str:
+        return (await original_source()).replace(
+            'with archive.open("rb") as stream:',
+            'os._exit(79)\n        with archive.open("rb") as stream:',
+            1,
+        )
+
+    with monkeypatch.context() as fault:
+        fault.setattr(panel_ops, "_identity_source", interrupted_source)
+        with pytest.raises(panel_ops.PanelOpError):
+            await panel_ops.capture_baseline(shell, snapshot)
+    marker = release / ".rollback-retained"
+    stranded = marker.read_text()
+    assert not await panel_ops.baseline_retained(shell)
+    with pytest.raises(panel_ops.PanelOpError, match="baseline_incomplete"):
+        await panel_ops.verify_baseline(shell, snapshot)
+    captured = await panel_ops.capture_baseline(shell, snapshot)
+    assert captured.baseline is not None
+    assert marker.read_text() == captured.baseline.identifier != stranded
+    assert not (shell.panel / ".rollback" / ("." + stranded + ".tmp")).exists()
+    await panel_ops.verify_baseline(shell, captured)
+    with pytest.raises(panel_ops.PanelOpError):
+        await panel_ops.capture_baseline(shell, snapshot)
+
+
+@pytest.mark.parametrize("policy", ["blocked", "unchanged", "override"])
+async def test_migration_inherits_shared_identity_admission(
+    hass: HomeAssistant,
+    tmp_path: Path,
+    policy: str,
+) -> None:
+    from collections.abc import Mapping
+    from uuid import UUID
+
+    from custom_components.brilliant_mqtt.entry_data import FleetConfig
+    from custom_components.brilliant_mqtt.panel_provisioner import (
+        PanelInstallRequest,
+        PanelReleaseBundle,
+    )
+
+    shell = RehearsalShell(tmp_path / "panel")
+    code = shell.install()
+    payload = panel_ops._identity_payload_dir()
+    if policy == "unchanged":
+        for tree in ("app", "vendor"):
+            shutil.rmtree(code / tree)
+            shutil.copytree(payload / tree, code / tree)
+    harness = _Harness()
+    provisioner = harness.provisioner()
+    shell._pinned = harness.shell.pinned_host_key()
+    provisioner._shell_factory = lambda _host, _password, _key: shell
+    provisioner._operations = panel_ops
+    journal = ProvisioningJournal(hass)
+    provisioner._journal = journal
+    request = replace(_request(), selected_components=("bridge",))
+
+    async def release(
+        requested: PanelInstallRequest,
+        fleet: FleetConfig,
+        transaction: UUID,
+        setup: UUID,
+    ) -> PanelReleaseBundle:
+        bundle = await harness.release(requested, fleet, transaction, setup)
+        return replace(bundle, local_payload_dir=str(payload), version="0.10.2")
+
+    provisioner._release_provider = release
+    before = await panel_ops.snapshot_panel(shell)
+    if policy == "override":
+        override: Mapping[str, object] | None = None
+        with pytest.raises(panel_ops.ReleaseIdentityBlocked) as blocked:
+            async with panel_ops.release_transaction(shell, str(payload), panel=request.slug):
+                pytest.fail("unknown incumbent ordinal must block")
+        override = blocked.value.override
+        await provisioner.async_install(
+            request,
+            _fleet(),
+            harness.progress,
+            release_override=override,
+        )
+        installed = await panel_ops._read_release_identities(shell)
+        expected = (await panel_ops.candidate_identities(str(payload)))["bridge"]
+        assert installed["bridge"] is not None
+        assert installed["bridge"].digest == expected.digest
+        assert installed["bridge"].release_ordinal == expected.release_ordinal
+        assert installed["bridge"].deployment_id == override["transaction"]
+        assert installed["bridge"].layout == "release_link"
+        assert list((shell.panel / ".release-identities").glob("override-*.json"))
+    else:
+        with pytest.raises(
+            PanelProvisioningError,
+            match="release_identity_blocked" if policy == "blocked" else "release_unchanged",
+        ):
+            await provisioner.async_install(request, _fleet(), harness.progress)
+        assert await panel_ops.snapshot_panel(shell) == before
+        assert not (shell.panel / "releases").exists()
+        assert not await panel_ops.baseline_retained(shell)
+        assert await journal.async_load() is None
+
+
+@pytest.mark.parametrize("boundary", ["stage", "activate"])
+async def test_staged_mutation_boundaries_cannot_bypass_identity(
+    tmp_path: Path,
+    boundary: str,
+) -> None:
+    shell = RehearsalShell(tmp_path)
+    shell.install()
+    payload = panel_ops._identity_payload_dir()
+    transaction = uuid4()
+    staged = panel_ops.StagedRelease(
+        "0.10.2",
+        transaction,
+        f"/var/brilliant-mqtt/releases/0.10.2--{transaction.hex}",
+        ("bridge",),
+    )
+    if boundary == "activate":
+        target = Path(shell.translate(staged.release_target))
+        target.parent.mkdir(parents=True)
+        await shell.put_dir(str(payload), staged.release_target)
+    before = await panel_ops.snapshot_panel(shell)
+    with pytest.raises(panel_ops.ReleaseIdentityBlocked):
+        if boundary == "stage":
+            await panel_ops.stage_release(
+                shell,
+                str(payload),
+                "0.10.2",
+                "MQTT_PASSWORD=fixture\n",
+                ("bridge",),
+                transaction,
+            )
+        else:
+            await panel_ops.activate_staged(shell, staged, on_services_stopped=lambda: None)
+    assert await panel_ops.snapshot_panel(shell) == before
+
+
+@pytest.mark.parametrize("restore_fails", [False, True])
+async def test_commit_save_failure_after_soak_has_replayable_compensation(
+    hass: HomeAssistant, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, restore_fails: bool
+) -> None:
+    from custom_components.brilliant_mqtt.provisioning_journal import (
+        ProvisioningJournalError,
+        ProvisioningRecord,
+    )
+    from tests.test_panel_provisioner import _FakeObserver, _health
+
+    shell = RehearsalShell(tmp_path)
+    shell.install()
+    journal = ProvisioningJournal(hass)
+    provisioner = _Harness().provisioner()
+    provisioner._journal = journal
+    provisioner._operations = panel_ops
+    provisioner._health_observer_factory = lambda _slug: _FakeObserver([], _health())
+    original_save = ProvisioningJournal._async_save
+    original_restore = panel_ops.rollback_snapshot
+    intents: list[str] = []
+
+    async def failed_commit(self: ProvisioningJournal, record: ProvisioningRecord) -> None:
+        if record.phase is ProvisioningPhase.COMMITTED:
+            retained = await self._async_retained_load()
+            assert retained[str(record.transaction_id)].state == "soak"
+            raise ProvisioningJournalError("journal_save_failed")
+        await original_save(self, record)
+
+    async def restore(
+        active: PanelShell, snapshot: panel_ops.PanelSnapshot, staged: panel_ops.StagedRelease
+    ) -> None:
+        retained = await journal.async_retained(staged.transaction_id)
+        current = await journal.async_load()
+        assert retained is not None and retained.state == "restore_requested"
+        assert current is not None and current.operation is ProvisioningOperation.ROLLBACK
+        intents.append(retained.state)
+        if restore_fails:
+            raise panel_ops.PanelOpError("rollback_restore_failed")
+        await original_restore(active, snapshot, staged)
+
+    monkeypatch.setattr(ProvisioningJournal, "_async_save", failed_commit)
+    monkeypatch.setattr(panel_ops, "rollback_snapshot", restore)
+    record = _record()
+    with pytest.raises((PanelProvisioningError, ProvisioningJournalError)):
+        async with provisioner._lock:
+            async with provisioner.async_managed_update(
+                shell,
+                replace(record.panel_request, selected_components=("bridge",)),
+                record.fleet_profile,
+                record.staged_version,
+                subentry_id="fixture-owner",
+            ) as transaction:
+                (shell.panel / "vendor/original.py").write_text("candidate = True\n")
+    assert intents == ["restore_requested"]
+    retained = await journal.async_retained(transaction)
+    assert retained is not None
+    assert retained.state == ("rollback_failed" if restore_fails else "restored")
+    current = await journal.async_load()
+    if restore_fails:
+        assert current is not None and current.operation is ProvisioningOperation.ROLLBACK
+        assert current.last_error is not None and current.last_error.code == "rollback_failed"
+    else:
+        assert current is None
 
 
 @pytest.mark.parametrize("completion", ["commit", "restore"])
@@ -548,6 +777,145 @@ async def test_manual_update_arms_before_mutation_and_retains_soak(
     assert await journal.async_load() is None
     retained = await journal.async_retained(transaction)
     assert retained is not None and retained.state == "soak"
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("extra_component", [False, True])
+@pytest.mark.parametrize(
+    "phase",
+    [
+        ProvisioningPhase.STAGED,
+        ProvisioningPhase.ACTIVATION_PENDING,
+        ProvisioningPhase.ACTIVATED,
+        ProvisioningPhase.VERIFYING,
+    ],
+)
+async def test_owned_managed_update_schedules_restart_recovery(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    legacy: bool,
+    phase: ProvisioningPhase,
+    extra_component: bool,
+) -> None:
+    from unittest.mock import Mock
+
+    from custom_components.brilliant_mqtt import fleet_manager
+    from custom_components.brilliant_mqtt.const import (
+        CONF_COMPONENTS,
+        CONF_HOST,
+        CONF_PANEL,
+        CONF_ROOT_PASSWORD,
+        CONF_SSH_HOST_KEY,
+    )
+    from tests.test_fleet_manager import (
+        _OFFICE_FINGERPRINT,
+        _legacy_entry,
+        _panel,
+        _pending_record,
+        _provisioning_entry,
+    )
+
+    pending = _pending_record()
+    entry = _provisioning_entry(
+        _panel(
+            "office", "SHA256:office", subentry_id="panel-office", management_id=_OFFICE_FINGERPRINT
+        ),
+        scene_owner="panel-office",
+    )
+    if legacy:
+        entry = _legacy_entry()
+        entry.add_to_hass(hass)
+        hass.config_entries.async_update_entry(
+            entry,
+            data={
+                **entry.data,
+                CONF_HOST: pending.panel_request.host,
+                CONF_PANEL: pending.panel_request.slug,
+                CONF_ROOT_PASSWORD: pending.panel_request.root_password,
+                CONF_SSH_HOST_KEY: pending.panel_request.public_key,
+            },
+        )
+        pending = replace(
+            pending,
+            panel_request=replace(
+                pending.panel_request,
+                selected_components=("bridge",),
+            ),
+        )
+    else:
+        entry.add_to_hass(hass)
+    if extra_component:
+        if legacy:
+            hass.config_entries.async_update_entry(
+                entry,
+                data={
+                    **entry.data,
+                    CONF_COMPONENTS: {"bridge": True, "hue_ca": True},
+                },
+            )
+        else:
+            owner = entry.subentries["panel-office"]
+            hass.config_entries.async_update_subentry(
+                entry,
+                owner,
+                data={
+                    **owner.data,
+                    CONF_COMPONENTS: {**owner.data[CONF_COMPONENTS], "hue_ca": True},
+                },
+            )
+    harness = _Harness()
+    provisioner = harness.provisioner()
+    async with provisioner._lock:
+        async with provisioner.async_managed_update(
+            harness.shell,
+            pending.panel_request,
+            pending.fleet_profile,
+            pending.staged_version,
+            subentry_id="fixture-owner",
+        ):
+            recorded = await harness.journal.async_load()
+    assert recorded is not None
+    recorded = replace(recorded, phase=phase)
+    journal = Mock(
+        async_retained_records=AsyncMock(return_value=()),
+        async_load=AsyncMock(return_value=recorded),
+    )
+    monkeypatch.setattr(fleet_manager, "ProvisioningJournal", lambda _hass: journal)
+    manager = fleet_manager.FleetManager(hass, entry)
+    schedule = Mock()
+    monkeypatch.setattr(manager, "_async_schedule_background_recovery", schedule)
+    await manager._async_prepare_provisioning()
+    schedule.assert_called_once_with(recorded)
+    lookup = await fleet_manager._async_transaction_lookup(hass, recorded.transaction_id)
+    assert lookup.state.value == "matched"
+
+
+@pytest.mark.parametrize("phase", [ProvisioningPhase.ACTIVATED, ProvisioningPhase.VERIFYING])
+async def test_managed_update_restart_restores_without_a_staged_release(
+    phase: ProvisioningPhase,
+) -> None:
+    harness = _Harness()
+    provisioner = harness.provisioner()
+    record = _record()
+    request = replace(
+        record.panel_request, selected_components=("bridge", "bus_watchdog", "wifi_watchdog")
+    )
+    async with provisioner._lock:
+        async with provisioner.async_managed_update(
+            harness.shell,
+            request,
+            record.fleet_profile,
+            record.staged_version,
+            subentry_id="fixture-owner",
+        ):
+            captured = await harness.journal.async_load()
+    assert captured is not None
+    harness.journal.record = replace(captured, phase=phase)
+    provisioner._shell_factory = lambda _host, _password, _key: harness.shell
+    harness.shell._pinned = request.public_key
+    await provisioner.async_recover()
+    assert harness.journal.record is None
+    assert harness.operations.rolled_back_snapshot is not None
 
 
 async def test_snapshot_uses_actual_unit_selection_with_surviving_old_current(

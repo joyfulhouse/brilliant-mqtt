@@ -242,19 +242,34 @@ async def _admit_release(
     panel: str,
     components: tuple[str, ...],
     override: Mapping[str, object] | None,
+    transaction: str | None = None,
 ) -> ReleaseAdmission:
     candidate = await candidate_identities(local_payload_dir)
+    return await _admit_identities(shell, candidate, panel, components, override, transaction)
+
+
+async def _admit_identities(
+    shell: PanelShell,
+    candidate: dict[str, ReleaseIdentity],
+    panel: str,
+    components: tuple[str, ...],
+    override: Mapping[str, object] | None,
+    transaction: str | None = None,
+) -> ReleaseAdmission:
     installed = await _read_release_identities(shell)
     selected = tuple(dict.fromkeys(("bridge", *components)))
     if any(key not in candidate for key in selected):
         raise PanelOpError("release_identity_invalid: selected component missing from payload")
     incumbent = {key: installed.get(key) for key in selected}
     candidate = {key: candidate[key] for key in selected}
-    transaction = uuid4().hex
+    expected_transaction = transaction
+    transaction = transaction or uuid4().hex
     if override is not None:
         value = override.get("transaction")
         if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{32}", value) is None:
             raise PanelOpError("release_override_invalid")
+        if expected_transaction is not None and value != expected_transaction:
+            raise PanelOpError("release_override_mismatch")
         transaction = value
     binding = _identity_binding(panel, incumbent, candidate, transaction)
     if override is not None and dict(override) != binding:
@@ -282,11 +297,19 @@ async def release_transaction(
     panel: str,
     components: tuple[str, ...] = (),
     override: Mapping[str, object] | None = None,
+    transaction_id: UUID | None = None,
 ) -> AsyncIterator[ReleaseAdmission]:
     """Admit every selected writer before CA/config writes; never retain an override."""
     if _RELEASE_ADMISSION.get() is not None:
         raise PanelOpError("release_transaction_nested")
-    admission = await _admit_release(shell, local_payload_dir, panel, components, override)
+    admission = await _admit_release(
+        shell,
+        local_payload_dir,
+        panel,
+        components,
+        override,
+        transaction_id.hex if transaction_id is not None else None,
+    )
     token = _RELEASE_ADMISSION.set(admission)
     try:
         yield admission
@@ -299,6 +322,8 @@ async def _guard_release(
     shell: PanelShell,
     component: str = "bridge",
     local_payload_dir: str | None = None,
+    *,
+    components: tuple[str, ...] = (),
 ) -> ReleaseAdmission:
     admission = _RELEASE_ADMISSION.get()
     if admission is None:
@@ -306,14 +331,14 @@ async def _guard_release(
             shell,
             local_payload_dir or str(_identity_payload_dir()),
             "connected-panel",
-            (component,),
+            (component, *components),
             None,
         )
     if (
         not admission.active
         or admission.shell is not shell
         or admission.owner is not asyncio.current_task()
-        or component not in admission.changes
+        or any(key not in admission.changes for key in (component, *components))
     ):
         raise PanelOpError("release_transaction_mismatch")
     await _revalidate_release(shell, admission, local_payload_dir)
@@ -1349,6 +1374,14 @@ async def stage_release(
         raise PanelOpError("invalid_staged_release")
     mqtt_ca_digest = hashlib.sha256(mqtt_ca).hexdigest() if mqtt_ca is not None else None
 
+    admission = await _guard_release(
+        shell, local_payload_dir=local_payload_dir, components=normalized
+    )
+    if admission.noop:
+        return staged
+    if not all(admission.changes.values()):
+        raise PanelOpError("release_selection_conflict")
+
     failure: BaseException | None = None
     try:
         await _provisioning_run(
@@ -1590,6 +1623,30 @@ async def _converge_service(
     )
 
 
+async def _read_staged_identities(
+    shell: PanelShell, staged: StagedRelease
+) -> dict[str, ReleaseIdentity]:
+    result = await _provisioning_run(
+        shell,
+        _identity_command(
+            await _identity_source(),
+            f"root = Path({staged.release_target!r})\n"
+            "print(json.dumps({key: {'version': (root / 'VERSION').read_text().strip(), "
+            "'release_ordinal': release_ordinal(root), 'digest': code_digest(root, key), "
+            "'deployment_id': None, 'layout': 'candidate'} "
+            f"for key in {staged.selected_components!r}" + "}))",
+            "BRILLIANT_STAGED_IDENTITY_READ",
+        ),
+        "release_identity_read_failed",
+    )
+    try:
+        raw = json.loads(result.stdout)
+        candidate = {key: ReleaseIdentity.from_dict(value) for key, value in raw.items()}
+    except (AttributeError, TypeError, ValueError):
+        raise PanelOpError("release_identity_read_failed") from None
+    return candidate
+
+
 async def activate_staged(
     shell: PanelShell,
     staged: StagedRelease,
@@ -1599,6 +1656,22 @@ async def activate_staged(
     """Atomically select a validated release and converge only fleet core units."""
     if not isinstance(staged, StagedRelease) or not callable(on_services_stopped):
         raise PanelOpError("invalid_staged_release")
+    admission = _RELEASE_ADMISSION.get()
+    if admission is not None:
+        admission = await _guard_release(shell, components=staged.selected_components)
+        if admission.noop:
+            return
+    candidate = await _read_staged_identities(shell, staged)
+    if admission is None:
+        admission = await _admit_identities(
+            shell, candidate, "connected-panel", staged.selected_components, None
+        )
+    elif candidate != admission.candidate:
+        raise PanelOpError("release_candidate_changed")
+    if admission.noop:
+        return
+    if not all(admission.changes.values()):
+        raise PanelOpError("release_selection_conflict")
     await _provisioning_run(
         shell,
         _release_validation_command(staged, promoted=True),
@@ -1634,6 +1707,8 @@ async def activate_staged(
         _activation_commit_command(staged),
         "activation_commit_failed",
     )
+    for component in staged.selected_components:
+        await _complete_identity(shell, admission, component)
     await _provisioning_run(
         shell,
         "systemctl daemon-reload",

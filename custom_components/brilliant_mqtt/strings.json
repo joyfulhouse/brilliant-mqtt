@@ -221,12 +221,14 @@
         },
         "panel_confirm": {
           "title": "Confirm Brilliant panel",
-          "description": "Detected `{hostname}` ({model}, {architecture}) with SSH fingerprint `{fingerprint}`. Name the panel to continue. Home Assistant will verify durable fleet storage before making any panel changes. [Open troubleshooting]({documentation_url})",
+          "description": "Detected `{hostname}` ({model}, {architecture}) with SSH fingerprint `{fingerprint}`. Name the panel to continue. Home Assistant will verify durable fleet storage before making any panel changes. [Open troubleshooting]({documentation_url}) Release override binding (only after identity refusal): {release_override}",
           "data": {
-            "name": "Panel name"
+            "name": "Panel name",
+            "release_override": "Reviewed single-operation release override"
           },
           "data_description": {
-            "name": "A friendly name used in Home Assistant. A stable MQTT slug is allocated automatically."
+            "name": "A friendly name used in Home Assistant. A stable MQTT slug is allocated automatically.",
+            "release_override": "Optional: paste the exact displayed binding only after reviewing this panel and candidate. It is consumed once and never reused by automatic repair."
           }
         },
         "panel_provision": {
@@ -396,7 +398,10 @@
         "baseline_incomplete": "The complete rollback baseline is unavailable. Keep the installed release and follow docs/canary-rollback.md before retrying.",
         "rollback_credentials_unavailable": "Rollback cannot resolve the exact panel owner and pinned credentials. Restore the panel configuration before retrying.",
         "rollback_deadline_exceeded": "Rollback exceeded its recovery deadline and remains unverified. Keep the journal and baseline, resolve connectivity or storage delays, then retry.",
-        "rollback_health_failed": "Restored bytes did not pass fresh MQTT verification. Keep the baseline and journal, check panel and broker connectivity, then retry."
+        "rollback_health_failed": "Restored bytes did not pass fresh MQTT verification. Keep the baseline and journal, check panel and broker connectivity, then retry.",
+        "release_identity_blocked": "Installed code differs and release ordering is unknown or not increasing. Review the exact release override before retrying.",
+        "release_unchanged": "The selected installed code already matches. Code selection and layout are unchanged.",
+        "release_selection_conflict": "Some installed components already match. Update differing components individually to preserve their code selection."
       },
       "abort": {
         "already_configured": "Panel `{panel_name}` is already configured.",
@@ -414,7 +419,8 @@
         "config_entry_storage_unavailable": "Home Assistant could not prove the replacement identity or an exact restoration in durable storage. Stop panel operations, repair Home Assistant storage, and follow the fleet repair issue before retrying.",
         "rebind_identity_changed": "The replacement SSH identity changed after confirmation. Nothing was accepted. Verify the address and start Replace physical panel again to review the current fingerprint.",
         "cannot_connect": "The replacement stopped answering during the final SSH identity check. Nothing was accepted. Verify its address, network access, and SSH service, then restart Replace physical panel.",
-        "rebind_failed": "The replacement panel could not be bound safely. Nothing was accepted unless Home Assistant shows a fleet storage repair issue; resolve any such issue before retrying."
+        "rebind_failed": "The replacement panel could not be bound safely. Nothing was accepted unless Home Assistant shows a fleet storage repair issue; resolve any such issue before retrying.",
+        "release_unchanged": "The selected installed code already matches. No staging, configuration or code selection changes were made."
       }
     }
   },
