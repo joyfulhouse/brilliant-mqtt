@@ -54,6 +54,7 @@ from custom_components.brilliant_mqtt.const import (
     VOICE_SERVICE_NAME,
     WIFI_WATCHDOG_SERVICE_NAME,
 )
+from custom_components.brilliant_mqtt.release_identity import RollbackBaseline
 from custom_components.brilliant_mqtt.setup_protocol import PreflightRequest
 from custom_components.brilliant_mqtt.shell import RunResult
 from tests.fakes import FakePanelProcess, FakeShell
@@ -3552,6 +3553,7 @@ async def test_rollback_restores_exact_files_link_and_every_service_state(
         wifi_state=(False, True),
         bus_state=(True, True),
     )
+    snapshot = replace(snapshot, baseline=RollbackBaseline("c" * 32, "d" * 64, {}))
     shell = await _connected(FakeShell())
     observed = 0
 
@@ -3590,7 +3592,7 @@ async def test_rollback_restores_exact_files_link_and_every_service_state(
 async def test_first_install_rollback_removes_candidate_files_and_verifies_inactive(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    snapshot = _absent_snapshot()
+    snapshot = replace(_absent_snapshot(), baseline=RollbackBaseline("c" * 32, "d" * 64, {}))
     shell = await _connected(FakeShell())
     monkeypatch.setattr(panel_ops, "snapshot_panel", lambda _shell: _async_value(snapshot))
 
@@ -3630,7 +3632,9 @@ async def test_first_install_rollback_removes_candidate_files_and_verifies_inact
 async def test_rollback_restores_bridge_less_legacy_watchdog_residue_exactly(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    snapshot = _watchdog_residue_snapshot()
+    snapshot = replace(
+        _watchdog_residue_snapshot(), baseline=RollbackBaseline("c" * 32, "d" * 64, {})
+    )
     shell = await _connected(FakeShell())
     observed: list[panel_ops.PanelSnapshot] = []
 
@@ -3669,7 +3673,7 @@ async def _async_value[T](value: T) -> T:
 async def test_rollback_requires_exact_resnapshot_equality(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    snapshot = _release_snapshot()
+    snapshot = replace(_release_snapshot(), baseline=RollbackBaseline("c" * 32, "d" * 64, {}))
     mismatched = replace(
         snapshot,
         active_release_target=(
@@ -3688,7 +3692,7 @@ async def test_rollback_requires_exact_resnapshot_equality(
 async def test_rollback_surfaces_nonzero_temporary_cleanup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    snapshot = _release_snapshot()
+    snapshot = replace(_release_snapshot(), baseline=RollbackBaseline("c" * 32, "d" * 64, {}))
     staged = _staged()
     cleanup_command = panel_ops._rollback_cleanup_command(staged)
     shell = await _connected(
@@ -3718,7 +3722,7 @@ async def test_rollback_surfaces_nonzero_temporary_cleanup(
 async def test_rollback_preserves_cancellation_when_temporary_cleanup_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    snapshot = _release_snapshot()
+    snapshot = replace(_release_snapshot(), baseline=RollbackBaseline("c" * 32, "d" * 64, {}))
     staged = _staged()
     cleanup_command = panel_ops._rollback_cleanup_command(staged)
     shell = await _connected(

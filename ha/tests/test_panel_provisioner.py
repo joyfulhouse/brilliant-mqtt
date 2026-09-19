@@ -62,6 +62,7 @@ from custom_components.brilliant_mqtt.provisioning_journal import (
     ProvisioningOperation,
     ProvisioningPhase,
     ProvisioningRecord,
+    RetainedRollback,
     StoredFileSnapshot,
     StoredFleetProfile,
     StoredJournalError,
@@ -70,6 +71,7 @@ from custom_components.brilliant_mqtt.provisioning_journal import (
     StoredPanelSnapshot,
     StoredServiceSnapshot,
 )
+from custom_components.brilliant_mqtt.release_identity import ReleaseIdentity, RollbackBaseline
 from custom_components.brilliant_mqtt.setup_protocol import PreflightRequest
 from custom_components.brilliant_mqtt.shell import HostIdentity, PanelShell
 from tests.fakes import FakePanelProcess, FakeShell
@@ -370,6 +372,7 @@ def _absent_snapshot() -> StoredPanelSnapshot:
         wifi_watchdog_service=missing_service,
         bus_watchdog_service=missing_service,
         selected_components=(),
+        baseline=RollbackBaseline("c" * 32, "d" * 64, {}),
     )
 
 
@@ -401,6 +404,13 @@ def _release_link_snapshot() -> StoredPanelSnapshot:
             COMPONENT_BRIDGE,
             COMPONENT_WIFI_WATCHDOG,
             COMPONENT_BUS_WATCHDOG,
+        ),
+        baseline=RollbackBaseline(
+            "c" * 32,
+            "d" * 64,
+            {
+                "bridge": ReleaseIdentity("0.6.0", None, "e" * 64, "b" * 32, "release_link"),
+            },
         ),
     )
 
@@ -512,6 +522,35 @@ class _FakeJournal:
     pending_commit_started: asyncio.Event = field(default_factory=asyncio.Event)
     complete_commit_started: asyncio.Event = field(default_factory=asyncio.Event)
     created_record: ProvisioningRecord | None = None
+
+    async def async_retained_records(self) -> tuple[RetainedRollback, ...]:
+        return ()
+
+    async def async_retained(self, transaction_id: UUID) -> RetainedRollback | None:
+        return None
+
+    async def async_retained_state(
+        self,
+        transaction_id: UUID,
+        state: str,
+        *,
+        evidence: str | None = None,
+    ) -> None:
+        pass
+
+    async def async_begin_restore(self, transaction_id: UUID, root_password: str) -> None:
+        raise AssertionError("unexpected named restore")
+
+    async def async_remove_retained(self, transaction_id: UUID) -> None:
+        pass
+
+    async def async_complete_cleanup(self, transaction_id: UUID) -> None:
+        self.events.append(("journal_cleanup_complete",))
+        self.record = None
+
+    async def async_complete_absent_rollback(self, transaction_id: UUID) -> None:
+        self.events.append(("journal_absent_rollback_complete",))
+        self.record = None
 
     async def async_load(self) -> ProvisioningRecord | None:
         self.events.append(("journal_load",))
@@ -639,6 +678,27 @@ class _FakeOperations:
     rollback_started: asyncio.Event = field(default_factory=asyncio.Event)
     rolled_back_snapshot: panel_ops.PanelSnapshot | None = None
 
+    async def capture_baseline(
+        self, shell: PanelShell, snapshot: panel_ops.PanelSnapshot
+    ) -> panel_ops.PanelSnapshot:
+        return snapshot
+
+    async def verify_baseline(self, shell: PanelShell, snapshot: panel_ops.PanelSnapshot) -> None:
+        pass
+
+    async def finalize_baseline(self, shell: PanelShell, snapshot: panel_ops.PanelSnapshot) -> None:
+        pass
+
+    async def restart_restored(
+        self,
+        shell: PanelShell,
+        snapshot: panel_ops.PanelSnapshot,
+        deployment_id: str,
+        *,
+        on_service_stopped: Callable[[], None],
+    ) -> None:
+        on_service_stopped()
+
     async def snapshot_panel(self, shell: PanelShell) -> panel_ops.PanelSnapshot:
         del shell
         self.events.append(("snapshot",))
@@ -750,6 +810,9 @@ class _FakeObserver:
         expected_version: str,
         expected_deployment_id: str,
     ) -> None:
+        self.evidence = replace(
+            self.evidence, agent_version=expected_version, deployment_id=expected_deployment_id
+        )
         self.events.append(
             (
                 "health_boundary",
@@ -909,8 +972,9 @@ class _Harness:
 
     def observer_factory(self, slug: str) -> _FakeObserver:
         assert slug == "office"
+        recovering = any(event[0] == "health_factory" for event in self.events)
         self.events.append(("health_factory", slug))
-        return self.observer
+        return _FakeObserver(self.events, _health()) if recovering else self.observer
 
     async def transaction_lookup(self, transaction_id: UUID) -> TransactionLookup:
         self.events.append(("transaction_lookup", transaction_id))
@@ -1468,7 +1532,7 @@ async def test_activation_failure_durably_rolls_back_and_clears_journal() -> Non
         StoredPanelLayout.ABSENT.value,
         _TRANSACTION_ID,
     ) in harness.events
-    assert ("journal_rollback_complete", True) in harness.events
+    assert ("journal_absent_rollback_complete",) in harness.events
     assert harness.events.index(rollback_pending) < next(
         index for index, event in enumerate(harness.events) if event[0] == "rollback"
     )
@@ -1975,7 +2039,7 @@ async def test_post_activation_rollback_prunes_candidate_before_journal_clear() 
     journal_clear = next(
         index
         for index, event in enumerate(harness.events)
-        if event[0] == "journal_rollback_complete"
+        if event[0] == "journal_absent_rollback_complete"
     )
     assert rollback < cleanup < journal_clear
     assert raised.value.code == "activation_failed"

@@ -392,7 +392,11 @@
         "recovery_failed": "A prior provisioning transaction could not be recovered automatically.",
         "transaction_in_progress": "Another panel provisioning transaction is still being recovered.",
         "provisioning_failed": "Panel provisioning failed. Review the integration logs and recovery instructions before retrying.",
-        "invalid_cadence": "Enter a whole number of seconds within the documented range."
+        "invalid_cadence": "Enter a whole number of seconds within the documented range.",
+        "baseline_incomplete": "The complete rollback baseline is unavailable. Keep the installed release and follow docs/canary-rollback.md before retrying.",
+        "rollback_credentials_unavailable": "Rollback cannot resolve the exact panel owner and pinned credentials. Restore the panel configuration before retrying.",
+        "rollback_deadline_exceeded": "Rollback exceeded its recovery deadline and remains unverified. Keep the journal and baseline, resolve connectivity or storage delays, then retry.",
+        "rollback_health_failed": "Restored bytes did not pass fresh MQTT verification. Keep the baseline and journal, check panel and broker connectivity, then retry."
       },
       "abort": {
         "already_configured": "Panel `{panel_name}` is already configured.",

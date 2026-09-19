@@ -127,6 +127,10 @@ class FakeShell:
 
     async def run(self, command: str) -> RunResult:
         self._require_connected()
+        if "BRILLIANT_BASELINE_RETAINED" in command:
+            return RunResult(0, "0", "")
+        if "BRILLIANT_BASELINE_ACTION" in command:
+            return _OK
         if "BRILLIANT_RELEASE_IDENTITY_PREPARE" in command:
             self.identity_commands.append(command)
             return _OK
@@ -156,6 +160,10 @@ class FakeShell:
 
     async def start(self, command: str) -> PanelProcess:
         self._require_connected()
+        if "BRILLIANT_BASELINE_RETAINED" in command:
+            return FakePanelProcess(RunResult(0, "0", ""))
+        if "BRILLIANT_BASELINE_ACTION" in command:
+            return FakePanelProcess()
         self.commands.append(command)
         process = self.processes.get(command, FakePanelProcess(self.responses.get(command, _OK)))
         self.started_processes.append(process)
@@ -169,6 +177,21 @@ class FakeShell:
             self.identity_uploads.append((remote_path, data, mode))
             return
         self.uploads.append((remote_path, data, mode))
+        if remote_path == "/etc/brilliant-mqtt.env":
+            deployment = next(
+                (
+                    line.partition("=")[2].strip('"')
+                    for line in data.decode().splitlines()
+                    if line.startswith("BRILLIANT_DEPLOYMENT_ID=")
+                ),
+                None,
+            )
+            for correlated_identity in (
+                *self.release_identities.values(),
+                *self._pending_identities.values(),
+            ):
+                if correlated_identity is not None:
+                    correlated_identity["deployment_id"] = deployment
         if remote_path.endswith("/VERSION"):
             component = next(
                 (name for name in ("wifi_watchdog", "bus_watchdog") if f"/{name}/" in remote_path),

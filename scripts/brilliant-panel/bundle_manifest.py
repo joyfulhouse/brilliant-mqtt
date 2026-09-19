@@ -8,9 +8,12 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import stat
 import sys
+import tarfile
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -515,6 +518,364 @@ def installed_identities(
     if selector is not None:
         _verify_panel_selector(selector)
     return output
+
+
+def _sync_directory(path: Path) -> None:
+    descriptor = os.open(path, _DIRECTORY_FLAGS)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _baseline_roots(root: Path) -> list[Path]:
+    return [
+        *(
+            root / name
+            for name in (
+                "app",
+                "vendor",
+                "wifi_watchdog",
+                "bus_watchdog",
+                "VERSION",
+                "RELEASE_ORDINAL",
+                "tls",
+                "system",
+            )
+        ),
+        *(root / ".release-identities" / (name + ".json") for name in CORE_TREES),
+        Path("/etc/brilliant-mqtt.env"),
+        *(
+            Path("/etc/systemd/system") / (name + ".service")
+            for name in (
+                "brilliant-mqtt",
+                "brilliant-wifi-watchdog",
+                "brilliant-bus-watchdog",
+            )
+        ),
+    ]
+
+
+def _baseline_ca_fallback(root: Path, release: Path | None) -> list[Path]:
+    environment = Path("/etc/brilliant-mqtt.env")
+    if not environment.exists():
+        return []
+    assignments = [
+        line.partition("=")[2].strip().strip('"')
+        for line in environment.read_text().splitlines()
+        if line.partition("=")[0].strip() == "MQTT_TLS_CA_FILE"
+    ]
+    if not assignments:
+        return []
+    if len(assignments) != 1:
+        raise ManifestError("baseline_ca_invalid")
+    path = Path(assignments[0])
+    if not path.is_file() or path.is_symlink():
+        raise ManifestError("baseline_ca_missing")
+    if path.parent == root / "tls" or release is not None and path == release / "mqtt-ca.pem":
+        return []
+    if (
+        re.fullmatch(
+            re.escape(str(root)) + r"/releases/[0-9A-Za-z._+-]+--[0-9a-f]{32}/mqtt-ca.pem",
+            str(path),
+        )
+        is None
+    ):
+        raise ManifestError("baseline_ca_invalid")
+    return [path]
+
+
+def _baseline_inventory(
+    roots: list[Path],
+    maximum_bytes: int,
+    maximum_entries: int,
+    deadline: float,
+) -> dict[str, dict[str, object]]:
+    """Bound traversal before reading bytes; reject links/devices and racing files."""
+    pending = list(roots)
+    entries: dict[str, dict[str, object]] = {}
+    size = 0
+    while pending:
+        path = pending.pop()
+        if time.monotonic() >= deadline or len(entries) >= maximum_entries:
+            raise ManifestError("baseline_capture_bound")
+        if not os.path.lexists(path):
+            entries[str(path)] = {"kind": "absent"}
+            continue
+        metadata = path.lstat()
+        mode = stat.S_IMODE(metadata.st_mode)
+        if stat.S_ISDIR(metadata.st_mode):
+            entries[str(path)] = {"kind": "directory", "mode": mode}
+            with os.scandir(path) as children:
+                for child in children:
+                    if child.name == ".rollback-retained":
+                        continue
+                    pending.append(Path(child.path))
+                    if len(entries) + len(pending) > maximum_entries:
+                        raise ManifestError("baseline_capture_bound")
+        elif stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1:
+            size += metadata.st_size
+            if size > maximum_bytes:
+                raise ManifestError("baseline_capture_bound")
+            parent = os.open(path.parent, _DIRECTORY_FLAGS)
+            try:
+                digest = _hash_file_at(parent, path.name, "baseline file")
+            finally:
+                os.close(parent)
+            entries[str(path)] = {
+                "kind": "file",
+                "mode": mode,
+                "size": metadata.st_size,
+                "digest": digest,
+            }
+        else:
+            raise ManifestError("baseline_unsafe_tree")
+    return entries
+
+
+def capture_baseline(
+    root: Path,
+    identifier: str,
+    *,
+    maximum_bytes: int = 32 * 1024 * 1024,
+    maximum_entries: int = 4096,
+    capture_seconds: int = 120,
+    free_reserve: int = 32 * 1024 * 1024,
+) -> dict[str, object]:
+    """Publish one bounded complete archive and/or immutable release reference."""
+    if re.fullmatch(r"[0-9a-f]{32}", identifier) is None:
+        raise ManifestError("baseline_invalid")
+    deadline = time.monotonic() + capture_seconds
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    identities = installed_identities(root)
+    for component, identity in identities.items():
+        service = (
+            "brilliant-mqtt"
+            if component == "bridge"
+            else "brilliant-" + component.replace("_", "-")
+        )
+        unit = service + ".service"
+        staged = root / ("system" if component == "bridge" else component) / unit
+        if identity is None and (staged.exists() or (Path("/etc/systemd/system") / unit).exists()):
+            raise ManifestError("baseline_code_missing")
+    bridge = identities["bridge"]
+    release: Path | None = None
+    if any(
+        identity is not None and identity["layout"] == "release_link"
+        for identity in identities.values()
+    ):
+        release = _panel_release_selector(root).active_root
+    source = release if bridge is not None and bridge["layout"] == "release_link" else root
+    if source is None:
+        raise ManifestError("baseline_code_missing")
+    if bridge is not None:
+        config = source / "app/brilliant_mqtt/config.py"
+        main = source / "app/brilliant_mqtt/__main__.py"
+        if (
+            not config.is_file()
+            or not main.is_file()
+            or b"BRILLIANT_DEPLOYMENT_ID" not in config.read_bytes()
+            or b'"deployment_id"' not in main.read_bytes()
+            or b"settings.deployment_id" not in main.read_bytes()
+        ):
+            raise ManifestError("baseline_correlation_unsupported")
+    elif any(path.exists() for path in _baseline_roots(root)):
+        raise ManifestError("baseline_code_missing")
+    roots = _baseline_roots(root) + _baseline_ca_fallback(root, release)
+    # Fixed trees may still be independently selected companions. Preserve those
+    # once; the immutable release itself is verified and pinned, never copied.
+    files = _baseline_inventory(roots, maximum_bytes, maximum_entries, deadline)
+    pinned = (
+        _baseline_inventory([release], maximum_bytes, maximum_entries, deadline)
+        if release is not None
+        else {}
+    )
+    combined = list(files.values()) + list(pinned.values())
+    expanded = sum(size for item in combined if isinstance(size := item.get("size"), int))
+    if expanded > maximum_bytes or len(combined) > maximum_entries:
+        raise ManifestError("baseline_capture_bound")
+    archive_budget = expanded + len(files) * 2048 + 10240
+    if shutil.disk_usage(root).free < archive_budget + free_reserve:
+        raise ManifestError("baseline_space_insufficient")
+    parent = root / ".rollback"
+    parent.mkdir(mode=0o700, exist_ok=True)
+    if parent.is_symlink():
+        raise ManifestError("baseline_unsafe_tree")
+    parent.chmod(0o700)
+    _sync_directory(root)
+    temporary = parent / ("." + identifier + ".tmp")
+    destination = parent / identifier
+    temporary.mkdir(mode=0o700)
+    try:
+        archive = temporary / "baseline.tar"
+        with tarfile.open(archive, "w") as output:
+            for name, metadata in sorted(files.items()):
+                if time.monotonic() >= deadline:
+                    raise ManifestError("baseline_capture_bound")
+                if metadata["kind"] != "absent":
+                    output.add(name, arcname=name.lstrip("/"), recursive=False)
+        archive.chmod(0o600)
+        if files != _baseline_inventory(roots, maximum_bytes, maximum_entries, deadline):
+            raise ManifestError("baseline_changed")
+        if release is not None:
+            if pinned != _baseline_inventory([release], maximum_bytes, maximum_entries, deadline):
+                raise ManifestError("baseline_changed")
+            marker = release / ".rollback-retained"
+            if marker.exists():
+                raise ManifestError("baseline_already_retained")
+            with marker.open("x") as stream:
+                os.fchmod(stream.fileno(), 0o600)
+                stream.write(identifier)
+                stream.flush()
+                os.fsync(stream.fileno())
+            _sync_directory(release)
+        with archive.open("rb") as stream:
+            archive_digest = hashlib.sha256(stream.read()).hexdigest()
+            os.fsync(stream.fileno())
+        manifest = {
+            "identifier": identifier,
+            "files": files,
+            "roots": [str(path) for path in roots],
+            "release_target": str(release) if release else None,
+            "pinned": pinned,
+            "archive_digest": archive_digest,
+            "identities": identities,
+            "limits": {
+                "maximum_bytes": maximum_bytes,
+                "maximum_entries": maximum_entries,
+                "capture_seconds": capture_seconds,
+            },
+        }
+        encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+        complete = temporary / "complete.json"
+        with complete.open("wb") as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        _sync_directory(temporary)
+        os.rename(temporary, destination)
+        _sync_directory(parent)
+        return {
+            "identifier": identifier,
+            "digest": hashlib.sha256(encoded).hexdigest(),
+            "identities": identities,
+        }
+    finally:
+        if temporary.exists():
+            shutil.rmtree(temporary)
+
+
+def baseline_action(root: Path, identifier: str, digest: str, action: str) -> None:
+    """Verify before restoring; replay safely after interruption; finalize explicitly."""
+    if re.fullmatch(r"[0-9a-f]{32}", identifier) is None:
+        raise ManifestError("baseline_invalid")
+    directory = root / ".rollback" / identifier
+    retired = directory.with_name("." + identifier + ".finalizing")
+    if action == "finalize" and not directory.exists():
+        if retired.exists():
+            shutil.rmtree(retired)
+            _sync_directory(retired.parent)
+        return
+    encoded = (directory / "complete.json").read_bytes()
+    if hashlib.sha256(encoded).hexdigest() != digest:
+        raise ManifestError("baseline_digest_mismatch")
+    manifest = json.loads(encoded)
+    limits = manifest["limits"]
+    maximum_bytes = limits["maximum_bytes"]
+    maximum_entries = limits["maximum_entries"]
+    deadline = time.monotonic() + limits["capture_seconds"]
+    release = Path(manifest["release_target"]) if manifest["release_target"] else None
+    if action == "finalize":
+        if release is not None:
+            (release / ".rollback-retained").unlink(missing_ok=True)
+            _sync_directory(release)
+        # Publish deletion intent on-panel too, so a lost complete.json during
+        # recursive removal cannot make a durable FINALIZING record unreplayable.
+        os.rename(directory, retired)
+        _sync_directory(directory.parent)
+        directory = retired
+        shutil.rmtree(directory)
+        _sync_directory(directory.parent)
+        return
+    if release is not None:
+        observed = _baseline_inventory([release], maximum_bytes, maximum_entries, deadline)
+        if observed != manifest["pinned"] or not (release / ".rollback-retained").is_file():
+            raise ManifestError("baseline_pinned_release_changed")
+    archive = directory / "baseline.tar"
+    if hashlib.sha256(archive.read_bytes()).hexdigest() != manifest["archive_digest"]:
+        raise ManifestError("baseline_archive_changed")
+    if action == "verify":
+        return
+    roots = [Path(name) for name in manifest["roots"]]
+    expected_roots = _baseline_roots(root)
+    extras = roots[len(expected_roots) :]
+    if (
+        roots[: len(expected_roots)] != expected_roots
+        or len(extras) > 1
+        or any(
+            re.fullmatch(
+                re.escape(str(root)) + r"/releases/[0-9A-Za-z._+-]+--[0-9a-f]{32}/mqtt-ca.pem",
+                str(path),
+            )
+            is None
+            for path in extras
+        )
+    ):
+        raise ManifestError("baseline_invalid")
+    if action == "check_restored":
+        if (
+            _baseline_inventory(roots, maximum_bytes, maximum_entries, deadline)
+            != manifest["files"]
+        ):
+            raise ManifestError("baseline_restore_mismatch")
+        return
+    if action != "restore":
+        raise ManifestError("baseline_invalid")
+    extracted = directory / "restore.tmp"
+    if extracted.exists():
+        shutil.rmtree(extracted)
+    extracted.mkdir(mode=0o700)
+    with tarfile.open(archive) as source:
+        for member in source.getmembers():
+            if (
+                "/" + member.name not in manifest["files"]
+                or not (member.isfile() or member.isdir())
+                or ".." in Path(member.name).parts
+                or member.name.startswith("/")
+            ):
+                raise ManifestError("baseline_archive_unsafe")
+        source.extractall(extracted)
+    for path in roots:
+        metadata = manifest["files"][str(path)]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.is_symlink():
+            raise ManifestError("baseline_restore_unsafe")
+        temporary = path.with_name(path.name + ".restore-" + identifier)
+        if temporary.exists():
+            if temporary.is_dir():
+                shutil.rmtree(temporary)
+            else:
+                temporary.unlink()
+        if metadata["kind"] != "absent":
+            original = extracted / str(path).lstrip("/")
+            if original.is_dir():
+                shutil.copytree(original, temporary)
+            else:
+                shutil.copy2(original, temporary)
+            for entry in [temporary] if temporary.is_file() else temporary.rglob("*"):
+                if entry.is_file():
+                    with entry.open("rb") as stream:
+                        os.fsync(stream.fileno())
+        if path.is_dir():
+            shutil.rmtree(path)
+        if metadata["kind"] == "absent":
+            path.unlink(missing_ok=True)
+        else:
+            os.replace(temporary, path)
+        _sync_directory(path.parent)
+    shutil.rmtree(extracted)
+    baseline_action(root, identifier, digest, "check_restored")
 
 
 def _verify_panel_selector(selector: _PanelSelector) -> None:

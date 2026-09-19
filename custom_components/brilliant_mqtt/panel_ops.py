@@ -72,7 +72,7 @@ from .const import (
     VOICE_SERVICE_NAME,
     WIFI_WATCHDOG_SERVICE_NAME,
 )
-from .release_identity import ReleaseIdentity, admit_identity
+from .release_identity import ReleaseIdentity, RollbackBaseline, admit_identity
 from .setup_protocol import PreflightRequest
 from .shell import PanelProcess, PanelShell, RunResult
 
@@ -496,6 +496,7 @@ class PanelSnapshot:
     wifi_watchdog_service: ServiceSnapshot
     bus_watchdog_service: ServiceSnapshot
     selected_components: tuple[str, ...]
+    baseline: RollbackBaseline | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -603,7 +604,33 @@ async def _provisioning_run(
     failed = False
     result: RunResult | None = None
     try:
-        result = await shell.run(command)
+        if error_code.startswith(("baseline_", "rollback_")):
+            process = await shell.start(command)
+            settlement = asyncio.create_task(process.wait())
+            try:
+                result = await asyncio.shield(settlement)
+            except BaseException:
+                process.terminate()
+                closing = asyncio.create_task(shell.close())
+                while not closing.done():
+                    try:
+                        await asyncio.shield(closing)
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                if not closing.cancelled():
+                    closing.exception()
+                # The shared operation lock must not be released while a remote
+                # restore could still write. Shell close bounds and fences exit.
+                while not settlement.done():
+                    try:
+                        await asyncio.shield(settlement)
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                if not settlement.cancelled():
+                    settlement.exception()
+                raise
+        else:
+            result = await shell.run(command)
     except asyncio.CancelledError:
         raise
     except Exception:
@@ -669,6 +696,17 @@ def _layout_probe_command() -> str:
     services = tuple(
         (component_id, service_name) for component_id, service_name, _ in _CORE_SERVICES
     )
+    unit_choices = (
+        (PANEL_UNIT_FILE, _STAGED_UNIT),
+        (
+            PANEL_WIFI_WATCHDOG_UNIT_FILE,
+            f"{PANEL_WIFI_WATCHDOG_DIR}/{WIFI_WATCHDOG_SERVICE_NAME}.service",
+        ),
+        (
+            PANEL_BUS_WATCHDOG_UNIT_FILE,
+            f"{PANEL_BUS_WATCHDOG_DIR}/{BUS_WATCHDOG_SERVICE_NAME}.service",
+        ),
+    )
     return (
         f"{_PANEL_PYTHON} - <<'BRILLIANT_MQTT_SNAPSHOT'\n"
         "import json, os, subprocess\n"
@@ -680,6 +718,15 @@ def _layout_probe_command() -> str:
         "        raise SystemExit(41)\n"
         "    layout = 'release_link'\n"
         "    target = os.readlink(current)\n"
+        "    selections = []\n"
+        f"    for unit, staged in {unit_choices!r}:\n"
+        "        if not os.path.exists(unit): unit = staged\n"
+        "        if os.path.isfile(unit):\n"
+        "            with open(unit, 'rb') as selected:\n"
+        f"                selections.append({f'{PANEL_CURRENT_LINK}/'.encode()!r} "
+        "in selected.read())\n"
+        "    if selections and not any(selections):\n"
+        "        layout, target = 'legacy_fixed', None\n"
         "else:\n"
         "    legacy = any(os.path.lexists(path) for path in legacy_paths)\n"
         "    layout = 'legacy_fixed' if legacy else 'absent'\n"
@@ -953,6 +1000,112 @@ async def snapshot_panel(shell: PanelShell) -> PanelSnapshot:
     if invalid or snapshot is None:
         raise PanelOpError("snapshot_payload_invalid")
     return snapshot
+
+
+async def capture_baseline(
+    shell: PanelShell,
+    snapshot: PanelSnapshot,
+    *,
+    maximum_bytes: int = 32 * 1024 * 1024,
+    maximum_entries: int = 4096,
+    capture_seconds: int = 120,
+    free_reserve: int = 32 * 1024 * 1024,
+) -> PanelSnapshot:
+    """Complete and publish the bounded code/config baseline before admitting writes."""
+    if snapshot.baseline is not None:
+        await verify_baseline(shell, snapshot)
+        return snapshot
+    if snapshot.layout is not PanelLayout.ABSENT and (
+        not snapshot.bridge_service.active or snapshot.environment_file.content is None
+    ):
+        raise PanelOpError("baseline_correlation_unsupported")
+    command = _identity_command(
+        await _identity_source(),
+        "import signal\n"
+        f"signal.alarm({capture_seconds})\n"
+        f"print(json.dumps(capture_baseline(Path({PANEL_VAR_DIR!r}), {uuid4().hex!r}, "
+        f"maximum_bytes={maximum_bytes}, maximum_entries={maximum_entries}, "
+        f"capture_seconds={capture_seconds}, free_reserve={free_reserve})))",
+        "BRILLIANT_BASELINE_CAPTURE",
+    )
+    result = await _provisioning_run(shell, command, "baseline_capture_failed")
+    try:
+        if len(result.stdout) > 16384:
+            raise ValueError
+        baseline = RollbackBaseline.from_dict(json.loads(result.stdout))
+    except (ValueError, TypeError):
+        raise PanelOpError("baseline_capture_invalid") from None
+    observed = await snapshot_panel(shell)
+    if observed != snapshot:
+        raise PanelOpError("baseline_changed")
+    return replace(snapshot, baseline=baseline)
+
+
+async def _baseline_action(shell: PanelShell, snapshot: PanelSnapshot, action: str) -> None:
+    baseline = snapshot.baseline
+    if baseline is None:
+        raise PanelOpError("baseline_incomplete")
+    command = _identity_command(
+        await _identity_source(),
+        f"baseline_action(Path({PANEL_VAR_DIR!r}), {baseline.identifier!r}, "
+        f"{baseline.digest!r}, {action!r})",
+        "BRILLIANT_BASELINE_ACTION",
+    )
+    await _provisioning_run(shell, command, "baseline_" + action + "_failed")
+
+
+async def verify_baseline(shell: PanelShell, snapshot: PanelSnapshot) -> None:
+    await _baseline_action(shell, snapshot, "verify")
+
+
+async def finalize_baseline(shell: PanelShell, snapshot: PanelSnapshot) -> None:
+    await _baseline_action(shell, snapshot, "finalize")
+
+
+async def baseline_retained(shell: PanelShell) -> bool:
+    result = await _provisioning_run(
+        shell,
+        f"{_PANEL_PYTHON} - <<'BRILLIANT_BASELINE_RETAINED'\n"
+        "from pathlib import Path\n"
+        f"print(int(any(Path({PANEL_VAR_DIR!r}).glob('.rollback/[0-9a-f]*/complete.json'))))\n"
+        "BRILLIANT_BASELINE_RETAINED",
+        "baseline_read_failed",
+    )
+    if result.stdout.strip() not in {"0", "1"}:
+        raise PanelOpError("baseline_read_failed")
+    return result.stdout.strip() == "1"
+
+
+async def restart_restored(
+    shell: PanelShell,
+    snapshot: PanelSnapshot,
+    deployment_id: str,
+    *,
+    on_service_stopped: Callable[[], None],
+) -> None:
+    """Change only deployment correlation after exact restoration was verified."""
+    if re.fullmatch(r"[0-9a-f]{32}", deployment_id) is None:
+        raise PanelOpError("baseline_invalid")
+    await _provisioning_run(shell, _stop_service_command(SERVICE_NAME), "rollback_service_failed")
+    content = snapshot.environment_file.content
+    if content is None or not snapshot.bridge_service.active:
+        raise PanelOpError("baseline_correlation_unsupported")
+    lines = content.splitlines(keepends=True)
+    content = b"".join(
+        line for line in lines if not line.strip().startswith(b"BRILLIANT_DEPLOYMENT_ID=")
+    )
+    if content and not content.endswith(b"\n"):
+        content += b"\n"
+    content += f"BRILLIANT_DEPLOYMENT_ID={deployment_id}\n".encode()
+    transaction = uuid4()
+    staged = StagedRelease(
+        "recovery", transaction, f"{PANEL_RELEASES_DIR}/recovery--{transaction.hex}", ("bridge",)
+    )
+    await _restore_file(
+        shell, PANEL_ENV_FILE, FileSnapshot(content, snapshot.environment_file.mode), staged
+    )
+    on_service_stopped()
+    await _provisioning_run(shell, f"systemctl start {SERVICE_NAME}", "rollback_service_failed")
 
 
 def _staged_temp_path(staged: StagedRelease) -> str:
@@ -1614,6 +1767,7 @@ async def rollback_snapshot(
         raise PanelOpError("invalid_panel_snapshot")
     if not isinstance(staged, StagedRelease):
         raise PanelOpError("invalid_staged_release")
+    await verify_baseline(shell, snapshot)
     failure: BaseException | None = None
     try:
         for _, service_name, _ in _CORE_SERVICES:
@@ -1622,6 +1776,7 @@ async def rollback_snapshot(
                 _stop_service_command(service_name),
                 "rollback_service_failed",
             )
+        await _baseline_action(shell, snapshot, "restore")
         for service_name, service_snapshot in (
             (SERVICE_NAME, snapshot.bridge_service),
             (
@@ -1684,7 +1839,11 @@ async def rollback_snapshot(
             raise
         except Exception:
             verification_failed = True
-        if verification_failed or observed != snapshot:
+        if (
+            verification_failed
+            or observed is None
+            or replace(observed, baseline=None) != replace(snapshot, baseline=None)
+        ):
             observed = None
             raise PanelOpError("rollback_verification_failed")
     except BaseException as error:
@@ -1706,6 +1865,7 @@ def _cleanup_staged_command(staged: StagedRelease) -> str:
     temporary = _staged_temp_path(staged)
     return (
         f"rm -rf -- {temporary}; "
+        f"test ! -e {staged.release_target}/.rollback-retained || exit 49; "
         f"if [ -e {PANEL_CURRENT_LINK} ] || [ -L {PANEL_CURRENT_LINK} ]; then "
         f"test -L {PANEL_CURRENT_LINK} || exit 46; "
         f'test "$(readlink {PANEL_CURRENT_LINK})" != {staged.release_target} '
@@ -2133,6 +2293,7 @@ async def ensure_configs(shell: PanelShell, unit_content: str, env_content: str)
         await _ensure_preserved_unit(shell, admission, "bridge", unit_content)
         for path in (PANEL_ENV_FILE, _STAGED_ENV):
             await _write_identity_config(shell, path, env_content.encode(), 0o600)
+        await _refresh_admitted_correlation(shell, admission, env_content)
         return
     await _checked(shell, f"mkdir -p {PANEL_STAGED_DIR}")
     await shell.put_bytes(unit_content.encode(), PANEL_UNIT_FILE, 0o644)
@@ -2142,6 +2303,23 @@ async def ensure_configs(shell: PanelShell, unit_content: str, env_content: str)
     await _checked(shell, "systemctl daemon-reload")
     if "bridge" in admission.pending:
         await _complete_identity(shell, admission, "bridge")
+    await _refresh_admitted_correlation(shell, admission, env_content)
+
+
+async def _refresh_admitted_correlation(
+    shell: PanelShell,
+    admission: ReleaseAdmission,
+    environment: str,
+) -> None:
+    deployment_id = parse_env(environment).get(ENV_DEPLOYMENT_ID)
+    if deployment_id is None:
+        return
+    observed = await _read_release_identities(shell)
+    for component, identity in admission.incumbent.items():
+        expected = replace(identity, deployment_id=deployment_id) if identity else None
+        if observed.get(component) != expected:
+            raise PanelOpError("release_identity_changed")
+        admission.incumbent[component] = expected
 
 
 async def _identity_file(shell: PanelShell, path: str) -> FileSnapshot:
@@ -2588,6 +2766,8 @@ async def uninstall(shell: PanelShell) -> None:
     but the removals and the reload must actually succeed or we'd leave orphaned
     files behind a "removed" config entry.
     """
+    if await baseline_retained(shell):
+        raise PanelOpError("baseline_retained_finalize_first")
     await shell.run(f"systemctl disable --now {SERVICE_NAME} 2>/dev/null || true")
     await _checked(shell, f"rm -f {PANEL_UNIT_FILE} {PANEL_ENV_FILE}")
     await _checked(shell, f"rm -rf {PANEL_VAR_DIR} {_STAGING_DIR} {_STAGING_TARBALL}")

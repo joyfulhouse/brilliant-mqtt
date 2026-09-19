@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import shutil
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
+from uuid import UUID
 
 import asyncssh
 import pytest
@@ -37,6 +39,34 @@ from custom_components.brilliant_mqtt.fleet_manager import legacy_fleet_config
 from custom_components.brilliant_mqtt.manager import PanelManager
 from tests.fakes import FakeShell
 from tests.test_init import ENTRY_DATA
+
+
+@pytest.fixture(autouse=True)
+def isolated_manager_canary_dependency(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Manager unit tests isolate the journal; canary rehearsals use the real coordinator."""
+    if request.path.name not in {
+        "test_manager.py",
+        "test_update.py",
+        "test_entities.py",
+        "test_repairs.py",
+        "test_release_identity.py",
+    }:
+        return
+    from custom_components.brilliant_mqtt.manager import PanelManager
+    from custom_components.brilliant_mqtt.shell import PanelShell
+
+    @asynccontextmanager
+    async def admitted_update(
+        manager: PanelManager,
+        shell: PanelShell,
+        version: str,
+    ) -> AsyncIterator[UUID]:
+        yield UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
+
+    monkeypatch.setattr(PanelManager, "_async_canary_update", admitted_update)
+
 
 # The key an unpinned re-pin connect captures (mirrors the rotated server key).
 REPIN_NEW_KEY = "ssh-ed25519 NEWKEY"

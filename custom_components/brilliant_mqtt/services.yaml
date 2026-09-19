@@ -21,6 +21,32 @@ redeploy:
       required: false
       selector:
         object:
+canary_rollback:
+  name: Roll back retained canary
+  description: Restore one named baseline and require a fresh MQTT session. Select exactly one panel.
+  target:
+    entity:
+      integration: brilliant_mqtt
+  fields:
+    name:
+      name: Retained baseline name
+      description: The transaction UUID in the integration diagnostics provisioning.retained list.
+      required: true
+      selector:
+        text:
+canary_finalize:
+  name: Finalize retained canary
+  description: Permanently discard one named baseline and its rollback guarantee. Select exactly one panel.
+  target:
+    entity:
+      integration: brilliant_mqtt
+  fields:
+    name:
+      name: Retained baseline name
+      description: The transaction UUID in the integration diagnostics provisioning.retained list.
+      required: true
+      selector:
+        text:
 uninstall:
   name: Uninstall agent
   description: Stop, disable, and remove the agent from the panel (explicit only).

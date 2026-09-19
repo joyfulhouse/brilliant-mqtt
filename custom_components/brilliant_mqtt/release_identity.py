@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
+from types import MappingProxyType
 
 
 @dataclass(frozen=True, repr=False)
@@ -53,6 +55,55 @@ class ReleaseIdentity:
         ):
             raise ValueError("invalid_release_identity")
         return cls(version, ordinal, digest, deployment, layout)
+
+
+@dataclass(frozen=True, repr=False)
+class RollbackBaseline:
+    """A content-bound reference to a durably completed private panel capture."""
+
+    identifier: str
+    digest: str
+    identities: Mapping[str, ReleaseIdentity]
+
+    def __post_init__(self) -> None:
+        if (
+            re.fullmatch(r"[0-9a-f]{32}", self.identifier) is None
+            or re.fullmatch(r"[0-9a-f]{64}", self.digest) is None
+            or not set(self.identities) <= {"bridge", "wifi_watchdog", "bus_watchdog"}
+            or not all(isinstance(value, ReleaseIdentity) for value in self.identities.values())
+        ):
+            raise ValueError("baseline_invalid")
+        object.__setattr__(self, "identities", MappingProxyType(dict(self.identities)))
+
+    def __repr__(self) -> str:
+        return "RollbackBaseline(<redacted>)"
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "identifier": self.identifier,
+            "digest": self.digest,
+            "identities": {key: value.as_dict() for key, value in self.identities.items()},
+        }
+
+    @classmethod
+    def from_dict(cls, value: object) -> RollbackBaseline:
+        if (
+            not isinstance(value, dict)
+            or set(value) != {"identifier", "digest", "identities"}
+            or not isinstance(value["identifier"], str)
+            or not isinstance(value["digest"], str)
+            or not isinstance(value["identities"], dict)
+        ):
+            raise ValueError("baseline_invalid")
+        return cls(
+            value["identifier"],
+            value["digest"],
+            {
+                key: ReleaseIdentity.from_dict(item)
+                for key, item in value["identities"].items()
+                if item is not None
+            },
+        )
 
 
 def admit_identity(incumbent: ReleaseIdentity | None, candidate: ReleaseIdentity) -> bool:

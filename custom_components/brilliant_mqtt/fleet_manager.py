@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from collections.abc import Coroutine, Iterable, Mapping
 from dataclasses import dataclass
 from functools import partial
@@ -74,6 +75,7 @@ from .panel_health import PanelHealthObserver
 from .panel_inspection import async_inspect_panel
 from .panel_provisioner import (
     PanelProvisioner,
+    PanelProvisioningError,
     TransactionLookup,
     TransactionLookupState,
     panel_release_provider,
@@ -83,8 +85,10 @@ from .panel_provisioner import (
 )
 from .provisioning_journal import (
     ProvisioningJournal,
+    ProvisioningOperation,
     ProvisioningPhase,
     ProvisioningRecord,
+    StoredPanelRequest,
 )
 from .shell import (
     AsyncsshShell,
@@ -206,7 +210,9 @@ class _ProvisioningRepairReporter:
         original_code: str,
         rollback_code: str,
     ) -> None:
-        del original_code, rollback_code
+        def safe_code(value: str) -> str:
+            return value if re.fullmatch(r"[a-z][a-z0-9_]{0,63}", value) else "recovery_failed"
+
         ir.async_create_issue(
             self._hass,
             DOMAIN,
@@ -216,7 +222,13 @@ class _ProvisioningRepairReporter:
             translation_key="needs_attention",
             translation_placeholders={
                 "panel": "Brilliant MQTT provisioning",
-                "reason": _PROVISIONING_REPAIR_REASON,
+                "reason": (
+                    _PROVISIONING_REPAIR_REASON
+                    + " "
+                    + safe_code(original_code)
+                    + "; "
+                    + safe_code(rollback_code)
+                ),
             },
             learn_more_url=(
                 "https://github.com/joyfulhouse/brilliant-mqtt/blob/main/docs/ha-integration.md"
@@ -564,6 +576,28 @@ async def _async_transaction_lookup(
     return TransactionLookup(TransactionLookupState.FLOW_ABORTED_OR_ABSENT)
 
 
+async def _async_rollback_credential(
+    hass: HomeAssistant, request: StoredPanelRequest
+) -> str | None:
+    """Resolve the login only from a current, exactly matching config owner."""
+    matches: list[str] = []
+    for entry in hass.config_entries.async_entries(DOMAIN):
+        owners = (
+            [subentry.data for subentry in entry.subentries.values()]
+            if entry.subentries
+            else [entry.data]
+        )
+        for data in owners:
+            if (
+                data.get(CONF_HOST) == request.host
+                and data.get(CONF_PANEL) == request.slug
+                and data.get(CONF_SSH_HOST_KEY) == request.public_key
+                and isinstance(data.get(CONF_ROOT_PASSWORD), str)
+            ):
+                matches.append(data[CONF_ROOT_PASSWORD])
+    return matches[0] if len(matches) == 1 else None
+
+
 def _build_panel_provisioner(
     hass: HomeAssistant,
     identity_fetcher: Any,
@@ -588,6 +622,7 @@ def _build_panel_provisioner(
         preflight_launcher_factory=panel_ops.panel_preflight_launcher,
         broker_validator=validator,
         health_observer_factory=partial(PanelHealthObserver, hass),
+        credential_resolver=partial(_async_rollback_credential, hass),
         transaction_lookup=partial(_async_transaction_lookup, hass),
         repair_reporter=_ProvisioningRepairReporter(hass),
     )
@@ -1036,11 +1071,13 @@ class FleetManager:
             remaining = await ProvisioningJournal(self.hass).async_load()
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as error:
             await reporter.async_report_rollback_failure(
                 record.transaction_id,
                 original_code="restart_recovery",
-                rollback_code="recovery_failed",
+                rollback_code=(
+                    error.code if isinstance(error, PanelProvisioningError) else "recovery_failed"
+                ),
             )
             return
         if remaining is not None and remaining.transaction_id == record.transaction_id:
@@ -1089,6 +1126,17 @@ class FleetManager:
         journal = ProvisioningJournal(self.hass)
         try:
             record = await journal.async_load()
+            for retained in await journal.async_retained_records():
+                if retained.state == "restore_requested" and record is None:
+                    password = await _async_rollback_credential(
+                        self.hass, retained.record.panel_request
+                    )
+                    if password is None:
+                        raise EntryDataError("rollback_credentials_unavailable")
+                    await journal.async_begin_restore(retained.record.transaction_id, password)
+                    record = await journal.async_load()
+                elif retained.state == "finalizing":
+                    self._async_schedule_background_recovery(retained.record)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -1099,6 +1147,12 @@ class FleetManager:
         if record is None:
             self._assert_no_orphaned_handoff()
             await self._async_persist_parent_normalization(None)
+            return
+
+        if record.operation is ProvisioningOperation.ROLLBACK:
+            if await _async_rollback_credential(self.hass, record.panel_request) is None:
+                raise EntryDataError("rollback_credentials_unavailable")
+            self._async_schedule_background_recovery(record)
             return
 
         if _has_other_domain_entry(self.hass, self.entry):
