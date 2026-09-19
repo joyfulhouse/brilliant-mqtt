@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from collections.abc import Coroutine, Iterable, Mapping
 from dataclasses import dataclass
 from functools import partial
@@ -74,6 +75,7 @@ from .panel_health import PanelHealthObserver
 from .panel_inspection import async_inspect_panel
 from .panel_provisioner import (
     PanelProvisioner,
+    PanelProvisioningError,
     TransactionLookup,
     TransactionLookupState,
     panel_release_provider,
@@ -83,8 +85,10 @@ from .panel_provisioner import (
 )
 from .provisioning_journal import (
     ProvisioningJournal,
+    ProvisioningOperation,
     ProvisioningPhase,
     ProvisioningRecord,
+    StoredPanelRequest,
 )
 from .shell import (
     AsyncsshShell,
@@ -206,7 +210,9 @@ class _ProvisioningRepairReporter:
         original_code: str,
         rollback_code: str,
     ) -> None:
-        del original_code, rollback_code
+        def safe_code(value: str) -> str:
+            return value if re.fullmatch(r"[a-z][a-z0-9_]{0,63}", value) else "recovery_failed"
+
         ir.async_create_issue(
             self._hass,
             DOMAIN,
@@ -216,7 +222,13 @@ class _ProvisioningRepairReporter:
             translation_key="needs_attention",
             translation_placeholders={
                 "panel": "Brilliant MQTT provisioning",
-                "reason": _PROVISIONING_REPAIR_REASON,
+                "reason": (
+                    _PROVISIONING_REPAIR_REASON
+                    + " "
+                    + safe_code(original_code)
+                    + "; "
+                    + safe_code(rollback_code)
+                ),
             },
             learn_more_url=(
                 "https://github.com/joyfulhouse/brilliant-mqtt/blob/main/docs/ha-integration.md"
@@ -259,6 +271,8 @@ def _enabled_components(data: Mapping[str, Any]) -> frozenset[str] | None:
 def _matches_record_identity(
     subentry: ConfigSubentry,
     record: ProvisioningRecord,
+    *,
+    managed_update: bool = False,
 ) -> bool:
     """Match every journaled panel owner field without exposing credential values."""
     request = record.panel_request
@@ -272,7 +286,8 @@ def _matches_record_identity(
         and data.get(CONF_ROOT_PASSWORD) == request.root_password
         and data.get(CONF_PANEL) == request.slug
         and data.get(CONF_MANAGEMENT_ID) == request.fingerprint
-        and _enabled_components(data) == frozenset(request.selected_components)
+        and (_managed_components(data) if managed_update else _enabled_components(data))
+        == frozenset(request.selected_components)
     )
 
 
@@ -534,6 +549,9 @@ async def _async_transaction_lookup(
     record = await ProvisioningJournal(hass).async_load()
     if record is None or record.transaction_id != transaction_id:
         return TransactionLookup(TransactionLookupState.FLOW_ABORTED_OR_ABSENT)
+    if record.operation is ProvisioningOperation.UPDATE:
+        _entry, panel_id = _managed_update_owner(hass, record)
+        return TransactionLookup(TransactionLookupState.MATCHED, panel_id)
     matches: list[ConfigSubentry] = []
     for entry in hass.config_entries.async_entries(DOMAIN):
         if entry.data.get(CONF_ENTRY_KIND) != ENTRY_KIND_FLEET:
@@ -564,6 +582,70 @@ async def _async_transaction_lookup(
     return TransactionLookup(TransactionLookupState.FLOW_ABORTED_OR_ABSENT)
 
 
+def _managed_update_owner(
+    hass: HomeAssistant, record: ProvisioningRecord
+) -> tuple[ConfigEntry[Any], str]:
+    """Bind updates to an existing exact owner, independently of onboarding markers."""
+    matches: list[tuple[ConfigEntry[Any], str]] = []
+    request = record.panel_request
+    for entry in hass.config_entries.async_entries(DOMAIN):
+        if entry.data.get(CONF_ENTRY_KIND) == ENTRY_KIND_FLEET:
+            if not _is_exact_fleet_entry(entry) or not _matches_record_fleet(entry, record):
+                continue
+            for panel in entry.subentries.values():
+                if (
+                    _matches_record_identity(panel, record, managed_update=True)
+                    and panel.data.get(CONF_PROVISIONING_TRANSACTION_ID) is None
+                ):
+                    matches.append((entry, panel.subentry_id))
+        else:
+            data = entry.data
+            broker = legacy_fleet_config(entry).broker
+            if (
+                broker.host == record.fleet_profile.host
+                and broker.port == record.fleet_profile.port
+                and broker.tls_enabled is record.fleet_profile.tls_enabled
+                and data.get(CONF_HOST) == request.host
+                and data.get(CONF_PANEL) == request.slug
+                and data.get(CONF_SSH_HOST_KEY) == request.public_key
+                and data.get(CONF_ROOT_PASSWORD) == request.root_password
+                and data.get(CONF_SSH_USERNAME, "root") == request.ssh_username
+                and _managed_components(data) == frozenset(request.selected_components)
+                and data.get(CONF_PROVISIONING_TRANSACTION_ID) is None
+            ):
+                matches.append((entry, entry.entry_id))
+    if len(matches) != 1:
+        raise EntryDataError("provisioning_ownership_mismatch")
+    return matches[0]
+
+
+def _managed_components(data: Mapping[str, Any]) -> frozenset[str] | None:
+    selected = _enabled_components(data)
+    return None if selected is None else selected & {"bridge", "wifi_watchdog", "bus_watchdog"}
+
+
+async def _async_rollback_credential(
+    hass: HomeAssistant, request: StoredPanelRequest
+) -> str | None:
+    """Resolve the login only from a current, exactly matching config owner."""
+    matches: list[str] = []
+    for entry in hass.config_entries.async_entries(DOMAIN):
+        owners = (
+            [subentry.data for subentry in entry.subentries.values()]
+            if entry.subentries
+            else [entry.data]
+        )
+        for data in owners:
+            if (
+                data.get(CONF_HOST) == request.host
+                and data.get(CONF_PANEL) == request.slug
+                and data.get(CONF_SSH_HOST_KEY) == request.public_key
+                and isinstance(data.get(CONF_ROOT_PASSWORD), str)
+            ):
+                matches.append(data[CONF_ROOT_PASSWORD])
+    return matches[0] if len(matches) == 1 else None
+
+
 def _build_panel_provisioner(
     hass: HomeAssistant,
     identity_fetcher: Any,
@@ -588,6 +670,7 @@ def _build_panel_provisioner(
         preflight_launcher_factory=panel_ops.panel_preflight_launcher,
         broker_validator=validator,
         health_observer_factory=partial(PanelHealthObserver, hass),
+        credential_resolver=partial(_async_rollback_credential, hass),
         transaction_lookup=partial(_async_transaction_lookup, hass),
         repair_reporter=_ProvisioningRepairReporter(hass),
     )
@@ -1036,11 +1119,13 @@ class FleetManager:
             remaining = await ProvisioningJournal(self.hass).async_load()
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as error:
             await reporter.async_report_rollback_failure(
                 record.transaction_id,
                 original_code="restart_recovery",
-                rollback_code="recovery_failed",
+                rollback_code=(
+                    error.code if isinstance(error, PanelProvisioningError) else "recovery_failed"
+                ),
             )
             return
         if remaining is not None and remaining.transaction_id == record.transaction_id:
@@ -1089,6 +1174,21 @@ class FleetManager:
         journal = ProvisioningJournal(self.hass)
         try:
             record = await journal.async_load()
+            for retained in await journal.async_retained_records():
+                password = retained.compensation_password(record)
+                if retained.state == "restore_requested" and (
+                    record is None or password is not None
+                ):
+                    if password is None:
+                        password = await _async_rollback_credential(
+                            self.hass, retained.record.panel_request
+                        )
+                    if password is None:
+                        raise EntryDataError("rollback_credentials_unavailable")
+                    await journal.async_begin_restore(retained.record.transaction_id, password)
+                    record = await journal.async_load()
+                elif retained.state == "finalizing":
+                    self._async_schedule_background_recovery(retained.record)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -1099,6 +1199,25 @@ class FleetManager:
         if record is None:
             self._assert_no_orphaned_handoff()
             await self._async_persist_parent_normalization(None)
+            return
+
+        if record.operation is ProvisioningOperation.ONBOARDING_ROLLBACK:
+            compensation = await journal.async_retained(record.transaction_id)
+            if compensation is None or compensation.compensation_password(record) is None:
+                raise EntryDataError("rollback_credentials_unavailable")
+            self._async_schedule_background_recovery(record)
+            return
+
+        if record.operation is ProvisioningOperation.ROLLBACK:
+            if await _async_rollback_credential(self.hass, record.panel_request) is None:
+                raise EntryDataError("rollback_credentials_unavailable")
+            self._async_schedule_background_recovery(record)
+            return
+
+        if record.operation is ProvisioningOperation.UPDATE:
+            owner, _panel_id = _managed_update_owner(self.hass, record)
+            if owner.entry_id == self.entry.entry_id:
+                self._async_schedule_background_recovery(record)
             return
 
         if _has_other_domain_entry(self.hass, self.entry):

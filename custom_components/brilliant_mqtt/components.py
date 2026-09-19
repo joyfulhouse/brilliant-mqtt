@@ -93,26 +93,32 @@ async def _bridge_install(hass: HomeAssistant, shell: PanelShell, data: Mapping[
     payload_dir = _mgr._payload_dir()
     unit = await hass.async_add_executor_job((payload_dir / "brilliant-mqtt.service").read_text)
     version = (await hass.async_add_executor_job((payload_dir / "VERSION").read_text)).strip()
-    mqtt_tls_ca_file = (
-        await panel_ops.stage_mqtt_ca(shell, mqtt_tls_ca) if mqtt_tls_ca is not None else None
-    )
-    env = panel_ops.render_env(
-        panel=data[CONF_PANEL],
-        mesh_priority=data[CONF_MESH_PRIORITY],
-        mqtt_host=data[CONF_MQTT_HOST],
-        mqtt_port=data[CONF_MQTT_PORT],
-        mqtt_username=data[CONF_MQTT_USERNAME],
-        mqtt_password=data[CONF_MQTT_PASSWORD],
-        scene_bridge_enabled=data.get(CONF_HA_CONTROL_ENABLED, DEFAULT_HA_CONTROL_ENABLED) is True,
-        mqtt_tls_enabled=mqtt_tls_enabled,
-        mqtt_tls_ca_file=mqtt_tls_ca_file,
-        hot_poll_seconds=data.get(CONF_HOT_POLL_SECONDS),
-        resync_seconds=data.get(CONF_RESYNC_SECONDS),
-    )
-    await panel_ops.async_assert_no_mqtt_tls_downgrade(shell, env)
-    await panel_ops.deploy_payload(shell, str(payload_dir), version)
-    await panel_ops.ensure_configs(shell, unit, env)
-    await panel_ops.enable_now(shell)
+    async with panel_ops.release_transaction(
+        shell, str(payload_dir), panel=data[CONF_PANEL]
+    ) as admission:
+        if admission.noop:
+            return
+        mqtt_tls_ca_file = (
+            await panel_ops.stage_mqtt_ca(shell, mqtt_tls_ca) if mqtt_tls_ca is not None else None
+        )
+        env = panel_ops.render_env(
+            panel=data[CONF_PANEL],
+            mesh_priority=data[CONF_MESH_PRIORITY],
+            mqtt_host=data[CONF_MQTT_HOST],
+            mqtt_port=data[CONF_MQTT_PORT],
+            mqtt_username=data[CONF_MQTT_USERNAME],
+            mqtt_password=data[CONF_MQTT_PASSWORD],
+            scene_bridge_enabled=data.get(CONF_HA_CONTROL_ENABLED, DEFAULT_HA_CONTROL_ENABLED)
+            is True,
+            mqtt_tls_enabled=mqtt_tls_enabled,
+            mqtt_tls_ca_file=mqtt_tls_ca_file,
+            hot_poll_seconds=data.get(CONF_HOT_POLL_SECONDS),
+            resync_seconds=data.get(CONF_RESYNC_SECONDS),
+        )
+        await panel_ops.async_assert_no_mqtt_tls_downgrade(shell, env)
+        await panel_ops.deploy_payload(shell, str(payload_dir), version)
+        await panel_ops.ensure_configs(shell, unit, env)
+        await panel_ops.enable_now(shell)
 
 
 async def _voice_present(shell: PanelShell) -> bool:
@@ -152,9 +158,14 @@ async def _install_watchdog(
     payload_dir = _mgr._payload_dir()
     unit = await hass.async_add_executor_job((payload_dir / service_filename).read_text)
     version = (await hass.async_add_executor_job((payload_dir / "VERSION").read_text)).strip()
-    await deploy(shell, str(payload_dir / payload_subdir), version)
-    await ensure_unit(shell, unit)
-    await enable(shell)
+    async with panel_ops.release_transaction(
+        shell, str(payload_dir), panel="connected-panel", components=(payload_subdir,)
+    ) as admission:
+        if admission.noop:
+            return
+        await deploy(shell, str(payload_dir / payload_subdir), version)
+        await ensure_unit(shell, unit)
+        await enable(shell)
 
 
 async def _wd_install(hass: HomeAssistant, shell: PanelShell, data: Mapping[str, Any]) -> None:

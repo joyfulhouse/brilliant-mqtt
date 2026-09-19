@@ -6,10 +6,47 @@ repair:
       integration: brilliant_mqtt
 redeploy:
   name: Redeploy agent
-  description: Force-push the bundled agent payload and restart the bridge.
+  description: Install the bundled release when its identity is admitted, then restart the bridge.
   target:
     entity:
       integration: brilliant_mqtt
+  fields:
+    release_override:
+      name: Single-operation release override
+      description: >-
+        For one targeted panel only. Copy the exact release_override object from
+        a release_identity_blocked failure after reviewing the candidate. It binds
+        the panel, incumbent bytes/layout, candidate identity, and transaction.
+        An override is consumed once and is never used by automatic repair.
+      required: false
+      selector:
+        object:
+canary_rollback:
+  name: Roll back retained canary
+  description: Restore one named baseline and require a fresh MQTT session. Select exactly one panel.
+  target:
+    entity:
+      integration: brilliant_mqtt
+  fields:
+    name:
+      name: Retained baseline name
+      description: The transaction UUID in the integration diagnostics provisioning.retained list.
+      required: true
+      selector:
+        text:
+canary_finalize:
+  name: Finalize retained canary
+  description: Permanently discard one named baseline and its rollback guarantee. Select exactly one panel.
+  target:
+    entity:
+      integration: brilliant_mqtt
+  fields:
+    name:
+      name: Retained baseline name
+      description: The transaction UUID in the integration diagnostics provisioning.retained list.
+      required: true
+      selector:
+        text:
 uninstall:
   name: Uninstall agent
   description: Stop, disable, and remove the agent from the panel (explicit only).

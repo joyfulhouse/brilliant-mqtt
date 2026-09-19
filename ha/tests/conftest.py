@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import shutil
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
+from uuid import UUID
 
 import asyncssh
 import pytest
@@ -37,6 +40,49 @@ from custom_components.brilliant_mqtt.fleet_manager import legacy_fleet_config
 from custom_components.brilliant_mqtt.manager import PanelManager
 from tests.fakes import FakeShell
 from tests.test_init import ENTRY_DATA
+
+
+@pytest.fixture(autouse=True)
+def canary_rehearsal_umask(request: pytest.FixtureRequest) -> Iterator[None]:
+    """Keep rehearsal filesystem modes independent of the invoking host's umask."""
+    if request.path.name not in {"test_canary_rollback.py", "test_canary_broker.py"}:
+        yield
+        return
+    # Model ordinary unit/code creation with 022. Secret paths must explicitly
+    # enforce 0700/0600; a restrictive host mask would hide permission regressions.
+    previous = os.umask(0o022)
+    try:
+        yield
+    finally:
+        os.umask(previous)
+
+
+@pytest.fixture(autouse=True)
+def isolated_manager_canary_dependency(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Manager unit tests isolate the journal; canary rehearsals use the real coordinator."""
+    if request.path.name not in {
+        "test_manager.py",
+        "test_update.py",
+        "test_entities.py",
+        "test_repairs.py",
+        "test_release_identity.py",
+    }:
+        return
+    from custom_components.brilliant_mqtt.manager import PanelManager
+    from custom_components.brilliant_mqtt.shell import PanelShell
+
+    @asynccontextmanager
+    async def admitted_update(
+        manager: PanelManager,
+        shell: PanelShell,
+        version: str,
+    ) -> AsyncIterator[UUID]:
+        yield UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
+
+    monkeypatch.setattr(PanelManager, "_async_canary_update", admitted_update)
+
 
 # The key an unpinned re-pin connect captures (mirrors the rotated server key).
 REPIN_NEW_KEY = "ssh-ed25519 NEWKEY"
@@ -113,6 +159,7 @@ def payload_dir(tmp_path: Path) -> Iterator[Path]:
     (tmp_path / "app" / "brilliant_mqtt").mkdir(parents=True)
     (tmp_path / "vendor").mkdir()
     (tmp_path / "VERSION").write_text("0.2.0")
+    (tmp_path / "RELEASE_ORDINAL").write_text("1\n")
     (tmp_path / "brilliant-mqtt.service").write_text("[Unit]\nDescription=test unit\n")
     (tmp_path / "brilliant-wifi-watchdog.service").write_text(
         "[Unit]\nDescription=test wifi watchdog unit\n"
@@ -129,7 +176,14 @@ def payload_dir(tmp_path: Path) -> Iterator[Path]:
     )
     (tmp_path / "ha_mirror" / "brilliant_ha_mirror").mkdir(parents=True)
     (tmp_path / "ha_mirror" / "brilliant_ha_mirror" / "__main__.py").write_text("# stub\n")
-    with patch("custom_components.brilliant_mqtt.manager._payload_dir", return_value=tmp_path):
+    with (
+        patch("custom_components.brilliant_mqtt.manager._payload_dir", return_value=tmp_path),
+        patch(
+            "custom_components.brilliant_mqtt.panel_ops._identity_payload_dir",
+            return_value=tmp_path,
+            create=True,
+        ),
+    ):
         yield tmp_path
 
 
