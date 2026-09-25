@@ -149,6 +149,11 @@ Before any Office update or redeploy, prove byte parity against the actual
 integration loaded by Home Assistant—not a nearby checkout or a matching
 version label.
 
+For a responsiveness release, first satisfy the
+[single-panel canary release readiness runbook](canary-release-readiness.md).
+Record the final commit and bundle digests, qualify the actual installed layout,
+and retain verified rollback through the final-candidate responsiveness and soak gates.
+
 The deterministic helper
 [`scripts/brilliant-panel/bundle_manifest.py`](../../scripts/brilliant-panel/bundle_manifest.py)
 emits exactly `<logical-path><TAB><sha256>`, rejects symlinks and special
