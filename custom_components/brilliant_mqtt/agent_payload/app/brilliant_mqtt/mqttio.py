@@ -62,6 +62,8 @@ _SHUTDOWN_DRAIN_DEADLINE_S = 5.0
 # Post-cancel settlement bound: workers SHOULD exit promptly on cancel, but a
 # callback that swallows CancelledError must not wedge disconnect (finding 4).
 _SHUTDOWN_WORKER_SETTLE_S = 1.0
+_LANE_RESTART_BASE_DELAY_S = 0.1
+_LANE_RESTART_MAX_DELAY_S = 0.5
 _NUMBER_AUX_VARS = frozenset(
     spec.var for specs in AUX_SPECS.values() for spec in specs if spec.component == "number"
 )
@@ -160,11 +162,15 @@ class _TopicDispatcher:
         handler: Callable[[_InboundMessage], Awaitable[None]],
         *,
         diagnostics: ResponseDiagnostics | None = None,
+        restart_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self._handler = handler
         self._diagnostics = diagnostics
+        self._restart_sleep = restart_sleep
         self._queues: dict[str, _LaneQueue] = {}
         self._workers: dict[str, asyncio.Task[None]] = {}
+        self._recoveries: dict[str, asyncio.Task[None]] = {}
+        self._restart_delays: dict[str, float] = {}
         self._active: dict[str, tuple[_InboundMessage, CommandAdmission]] = {}
         self._folded: dict[str, _InboundMessage] = {}
         self._closing = False
@@ -182,10 +188,7 @@ class _TopicDispatcher:
         if queue is None:
             queue = _LaneQueue(maxsize=_TOPIC_QUEUE_MAXSIZE, diagnostics=self._diagnostics)
             self._queues[lane] = queue
-            self._workers[lane] = asyncio.create_task(
-                self._run_worker(lane, queue),
-                name="brilliant-mqtt-command-lane-worker",
-            )
+            self._start_worker(lane, queue)
         active = self._active.get(lane)
         if latest_wins and active is not None and not queue._pending:
             previous, admission = active
@@ -201,6 +204,7 @@ class _TopicDispatcher:
                 except Exception:
                     # Preserve the normal callback's error boundary: malformed
                     # input must not escape this optimization into the reader.
+                    logger.warning("MQTT command fold hook failed; falling back to queued dispatch")
                     folded = False
                 if folded:
                     self._folded[lane] = message
@@ -245,6 +249,12 @@ class _TopicDispatcher:
                         undrained,
                     )
         finally:
+            recoveries = list(self._recoveries.values())
+            for recovery in recoveries:
+                recovery.cancel()
+            if recoveries:
+                await asyncio.gather(*recoveries, return_exceptions=True)
+            self._recoveries.clear()
             workers = list(self._workers.values())
             for worker in workers:
                 worker.cancel()
@@ -266,6 +276,54 @@ class _TopicDispatcher:
             self._workers.clear()
             self._queues.clear()
 
+    def _start_worker(self, lane: str, queue: _LaneQueue) -> None:
+        worker = asyncio.create_task(
+            self._run_worker(lane, queue),
+            name="brilliant-mqtt-command-lane-worker",
+        )
+        self._workers[lane] = worker
+        worker.add_done_callback(lambda completed: self._worker_done(lane, queue, completed))
+
+    def _worker_done(
+        self,
+        lane: str,
+        queue: _LaneQueue,
+        worker: asyncio.Task[None],
+    ) -> None:
+        if self._workers.get(lane) is not worker or self._closing or worker.cancelled():
+            return
+        worker.exception()
+        delay = self._restart_delays.get(lane, _LANE_RESTART_BASE_DELAY_S)
+        self._restart_delays[lane] = min(delay * 2, _LANE_RESTART_MAX_DELAY_S)
+        logger.error(
+            "MQTT command lane worker died unexpectedly; restarting in %.3fs "
+            "(%d admitted commands pending)",
+            delay,
+            queue.unfinished_tasks,
+        )
+        recovery = asyncio.create_task(
+            self._recover_worker(lane, queue, worker, delay),
+            name="brilliant-mqtt-command-lane-recovery",
+        )
+        self._recoveries[lane] = recovery
+
+    async def _recover_worker(
+        self,
+        lane: str,
+        queue: _LaneQueue,
+        dead_worker: asyncio.Task[None],
+        delay: float,
+    ) -> None:
+        try:
+            await self._restart_sleep(delay)
+            if self._closing or self._workers.get(lane) is not dead_worker:
+                return
+            self._start_worker(lane, queue)
+        finally:
+            recovery = asyncio.current_task()
+            if self._recoveries.get(lane) is recovery:
+                self._recoveries.pop(lane, None)
+
     async def _run_worker(self, lane: str, queue: _LaneQueue) -> None:
         while True:
             message = await queue.get()
@@ -277,19 +335,23 @@ class _TopicDispatcher:
                     await self._handler(message)
                     replacement = self._folded.pop(lane, None)
                     if replacement is None:
+                        self._restart_delays.pop(lane, None)
                         break
                     message = replacement
             except WriteCancelled:
                 # A bus admission can end independently of this worker. Actual
                 # Task.cancel() still propagates as ordinary CancelledError.
                 logger.debug("MQTT command write cancelled; continuing lane")
+                self._restart_delays.pop(lane, None)
             finally:
                 # A folded replacement can still belong to the lane before
                 # its callback adopts it. Do not orphan it on cancellation.
                 admission.ticket.cancel_waiting()
                 command_admission.reset(token)
                 self._active.pop(lane, None)
-                self._folded.pop(lane, None)
+                discarded = self._folded.pop(lane, None)
+                if discarded is not None:
+                    logger.debug("MQTT command lane discarded a folded replacement during cleanup")
                 queue.task_done()
 
 
