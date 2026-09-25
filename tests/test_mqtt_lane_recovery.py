@@ -12,6 +12,8 @@ from brilliant_mqtt import mqttio
 from brilliant_mqtt.mqttio import _InboundMessage, _LaneQueue, _TopicDispatcher
 
 _PRIVATE_TOPIC = "brilliant/private-panel/private-peripheral/set_screen_on"
+_PRIMARY_TOPIC = "brilliant/private-panel/private-peripheral/set"
+_BUTTON_TOPIC = "brilliant/private-panel/private-peripheral/set_reset"
 _OTHER_TOPIC = "brilliant/private-panel/independent-peripheral/set_screen_on"
 _PRIVATE_PAYLOAD = "private-payload-secret"
 
@@ -71,10 +73,22 @@ async def test_dead_lane_recovers_saturated_work_without_blocking_independent_la
     try:
         await dispatcher.dispatch(_message("fatal"), latest_wins=False)
         await asyncio.wait_for(fatal_started.wait(), timeout=0.2)
-        pending_payloads = [str(index) for index in range(mqttio._TOPIC_QUEUE_MAXSIZE)]
-        for payload in pending_payloads:
-            await dispatcher.dispatch(_message(payload), latest_wins=False)
-        overflow = asyncio.create_task(dispatcher.dispatch(_message("overflow"), latest_wins=False))
+        # PR170's two safe partials merge into one admitted entry, while the
+        # invalid primary command becomes a barrier for every later command.
+        pending = [
+            (_message('{"state":"ON"}', topic=_PRIMARY_TOPIC), True),
+            (_message('{"brightness":120}', topic=_PRIMARY_TOPIC), True),
+            (_message('{"state":"TOGGLE"}', topic=_PRIMARY_TOPIC), True),
+            (_message('{"brightness":80}', topic=_PRIMARY_TOPIC), True),
+            *[(_message(f"barrier-{index}", topic=_BUTTON_TOPIC), False) for index in range(5)],
+        ]
+        for message, latest_wins in pending:
+            await dispatcher.dispatch(message, latest_wins=latest_wins)
+        lane_queue = dispatcher._queues[mqttio._command_lane_key(_PRIVATE_TOPIC)]
+        assert len(lane_queue._pending) == mqttio._TOPIC_QUEUE_MAXSIZE
+        overflow = asyncio.create_task(
+            dispatcher.dispatch(_message("overflow", topic=_BUTTON_TOPIC), latest_wins=False)
+        )
         await _turns()
         assert not overflow.done()
 
@@ -97,8 +111,15 @@ async def test_dead_lane_recovers_saturated_work_without_blocking_independent_la
             timeout=0.2,
         )
 
-        lane_payloads = [payload for topic, payload in seen if topic == _PRIVATE_TOPIC]
-        assert lane_payloads == ["fatal", *pending_payloads, "overflow"]
+        lane_messages = [item for item in seen if item != (_OTHER_TOPIC, "independent")]
+        assert lane_messages == [
+            (_PRIVATE_TOPIC, "fatal"),
+            (_PRIMARY_TOPIC, '{"state":"ON","brightness":120}'),
+            (_PRIMARY_TOPIC, '{"state":"TOGGLE"}'),
+            (_PRIMARY_TOPIC, '{"brightness":80}'),
+            *[(_BUTTON_TOPIC, f"barrier-{index}") for index in range(5)],
+            (_BUTTON_TOPIC, "overflow"),
+        ]
         assert all(queue.unfinished_tasks == 0 for queue in dispatcher._queues.values())
         assert "MQTT command lane worker died unexpectedly" in caplog.text
         assert _PRIVATE_PAYLOAD not in caplog.text
