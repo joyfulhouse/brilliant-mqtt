@@ -12,6 +12,7 @@ import asyncio
 import sys
 import types
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import replace
 from typing import Any, Protocol
 
 import aiomqtt
@@ -21,7 +22,7 @@ import pytest
 from brilliant_ha_mirror.mapping import HaEntity, PeripheralSpec, ServiceCall
 from brilliant_mqtt import mqttio
 from brilliant_mqtt.commands import VarSet
-from brilliant_mqtt.model import BrilliantDevice, DeviceKind, Variable
+from brilliant_mqtt.model import BrilliantDevice, CaptureProvenance, DeviceKind, Variable
 from brilliant_mqtt.write_admission import AdmissionTicket, WriteClass
 
 
@@ -61,19 +62,33 @@ class FakeBus:
         self.set_variables_error: Exception | None = None
         # Returned by set_variables as the normalized transport-ack receipt.
         self.set_variables_receipt: str = "FakeSetVariablesResponse()"
+        self._capture_generation = 1
+        self._capture_sequence = 0
 
     async def start(self) -> None:
         pass
 
     async def get_all(self) -> list[BrilliantDevice]:
-        return list(self._devices)
+        return [self._captured(device) for device in self._devices]
 
     async def get_peripheral(self, device_id: str, peripheral_id: str) -> BrilliantDevice | None:
         self.scoped_reads.append((device_id, peripheral_id))
         for device in self._devices + self._scoped_devices:
             if device.device_id == device_id and device.peripheral_id == peripheral_id:
-                return device
+                return self._captured(device)
         return None
+
+    def _next_provenance(self) -> CaptureProvenance:
+        self._capture_sequence += 1
+        return CaptureProvenance(self._capture_generation, self._capture_sequence)
+
+    def _captured(self, device: BrilliantDevice) -> BrilliantDevice:
+        if device.device_id == "ble_mesh" or device.kind not in (
+            DeviceKind.LIGHT,
+            DeviceKind.SWITCH,
+        ):
+            return device
+        return replace(device, capture_provenance=self._next_provenance())
 
     def on_change(
         self,
@@ -113,6 +128,8 @@ class FakeBus:
         write_class: WriteClass = WriteClass.INTERACTIVE_FIFO,
         ticket: AdmissionTicket | None = None,
     ) -> str:
+        if ticket is not None:
+            ticket.mark_issued(self._next_provenance())
         if self.set_variables_error is not None:
             raise self.set_variables_error
         self.commands.append((device_id, peripheral_id, list(sets)))
@@ -129,6 +146,8 @@ class FakeBus:
         the adapter would drop the push before normalization.
         """
         assert self._change_cbs, "on_change was never registered"
+        if device.capture_provenance is None:
+            device = self._captured(device)
         for cb, want in zip(list(self._change_cbs), list(self.change_callback_wants), strict=True):
             if want is None or want(device.device_id):
                 await cb(device)
@@ -140,6 +159,8 @@ class FakeBus:
     async def fire_reconnect(self) -> None:
         """Test helper: invoke the registered on_reconnect callback."""
         assert self._reconnect_cbs, "on_reconnect was never registered"
+        self._capture_generation += 1
+        self._capture_sequence = 0
         for reconnect_cb in list(self._reconnect_cbs):
             try:
                 await reconnect_cb()

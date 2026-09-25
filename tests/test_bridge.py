@@ -755,7 +755,12 @@ class TestOptimisticEcho:
         topic = f"brilliant/{PANEL}/gangbox_peripheral_0/state"
         states = [p for p in mqtt.published if p[0] == topic]
         assert len(states) == 1
-        assert json.loads(states[0][1]) == {"state": "ON", "brightness": 255}
+        payload = json.loads(states[0][1])
+        assert payload["state"] == "ON"
+        assert payload["brightness"] == 255
+        assert payload["wired_write_status"] == "provisional"
+        assert payload["wired_requested"] == {"intensity": "1000", "on": "1"}
+        assert isinstance(payload["wired_write_deadline"], float)
         assert states[0][2] is True
 
     async def test_failed_aux_translate_no_publish(self, hardware: BrilliantDevice) -> None:

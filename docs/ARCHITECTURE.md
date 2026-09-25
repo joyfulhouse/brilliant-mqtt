@@ -67,10 +67,13 @@ bidirectional control.
   (level-triggered).
 - **Command path:** HA publishes JSON to `brilliant/<panel>/<device>/set`; the
   bridge translates it (e.g. HA brightness 0–255 → device range) and calls
-  `request_set_variables_in_peripheral` on the bus, then optimistically echoes
-  the commanded state. The bus notification/poll confirms it. Mesh primaries
-  skip the echo: their state is held at `null` (HA `unknown`) until an
-  observation confirms or contradicts the write (issue #66).
+  `request_set_variables_in_peripheral` on the bus. Wired primaries publish a
+  bounded provisional projection while keeping native observations separate;
+  later native values are labelled as observed, ambiguous, or unconfirmed
+  rather than claimed as physical confirmation. See
+  [wired-write-feedback.md](reference/wired-write-feedback.md). Mesh primaries
+  retain their separate behavior: state is held at `null` (HA `unknown`) until
+  the existing mesh resolver settles the write (issue #66).
 - **Bus write path:** every write takes a per-bus-device `asyncio.Lock`
   (the panel's own CONTROL id, `ble_mesh`) so same-device writes serialize
   and a newer command can never actuate before an older one still in flight;

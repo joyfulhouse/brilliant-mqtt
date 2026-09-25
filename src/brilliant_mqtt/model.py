@@ -79,6 +79,18 @@ class Variable:
             return None
 
 
+@dataclass(frozen=True)
+class CaptureProvenance:
+    """Adapter-local ordering for a native snapshot or write-issue boundary.
+
+    This is not a native revision or a physical timestamp. It only establishes
+    which captures happened before an issued write in one adapter generation.
+    """
+
+    source_generation: int
+    sequence: int
+
+
 @dataclass
 class BrilliantDevice:
     """Normalized representation of one load/sensor peripheral on a Brilliant panel."""
@@ -89,6 +101,7 @@ class BrilliantDevice:
     kind: DeviceKind
     peripheral_type: int = 0
     variables: dict[str, Variable] = field(default_factory=dict)
+    capture_provenance: CaptureProvenance | None = None
 
     # Deliberate asymmetry: is_on collapses an absent "on" variable to False (a load
     # without "on" is just off/uncontrollable), while motion_detected preserves None

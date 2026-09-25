@@ -21,13 +21,18 @@ import secrets
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Any, NamedTuple
 
 from brilliant_mqtt.commands import VarSet
 from brilliant_mqtt.diagnostics import ResponseDiagnostics, WriteOutcome
-from brilliant_mqtt.model import BrilliantDevice, Variable, kind_for_peripheral_type
+from brilliant_mqtt.model import (
+    BrilliantDevice,
+    CaptureProvenance,
+    Variable,
+    kind_for_peripheral_type,
+)
 from brilliant_mqtt.write_admission import (
     AdmissionTicket,
     Superseded,
@@ -274,11 +279,17 @@ class _PendingPeripheral:
     peripheral id.
     """
 
-    __slots__ = ("peripheral_id", "snapshot", "normalized")
+    __slots__ = ("capture_provenance", "peripheral_id", "snapshot", "normalized")
 
-    def __init__(self, peripheral_id: str, snapshot: _PeripheralSnapshot) -> None:
+    def __init__(
+        self,
+        peripheral_id: str,
+        snapshot: _PeripheralSnapshot,
+        capture_provenance: CaptureProvenance,
+    ) -> None:
         self.peripheral_id = peripheral_id
         self.snapshot = snapshot
+        self.capture_provenance = capture_provenance
         self.normalized: BrilliantDevice | None = None
 
 
@@ -309,7 +320,11 @@ def _snapshot_peripheral(raw: Any) -> _PeripheralSnapshot:
     )
 
 
-def normalize_peripheral(device_id: str, peripheral_id: str, raw: Any) -> BrilliantDevice:
+def normalize_peripheral(
+    device_id: str,
+    peripheral_id: str,
+    raw: Any,
+) -> BrilliantDevice:
     """Translate a raw bus Peripheral into a normalized :class:`BrilliantDevice`.
 
     PURE function (no panel imports) so it is unit-testable off-panel. ``raw`` is
@@ -481,6 +496,11 @@ class RpcBusAdapter:
         # outlived a prior session's bounded teardown can never touch a newer
         # session's bookkeeping (#88).
         self._session = 0
+        # Local ordering only: incremented exactly where raw observations are
+        # captured and where a native write is issued. A processor reconnect
+        # starts a new incomparable source generation.
+        self._capture_generation = 0
+        self._capture_sequence = 0
         # Multiple consumers (panel bridge + mesh publisher) may each register
         # a change callback; every change fans out to all of them. Each entry is
         # (callback, coalesce_pushes, want_device); want_device is a live
@@ -570,6 +590,7 @@ class RpcBusAdapter:
                 f"prior bus resource shutdown still pending ({len(unresolved_closes)} task(s))"
             )
         self._session += 1
+        self._advance_capture_generation()
         # Not ready until this start() commits: _require_started keeps gating on
         # _own_device_id, so owning _obs/_proc early (below) never opens a window
         # for a caller to use a half-started adapter.
@@ -584,6 +605,14 @@ class RpcBusAdapter:
         # prior failed attempt can never lock this one out (see _my_name_base).
         self._my_name = _session_client_name(self._my_name_base)
         return self._session
+
+    def _advance_capture_generation(self) -> None:
+        self._capture_generation += 1
+        self._capture_sequence = 0
+
+    def _next_capture_provenance(self) -> CaptureProvenance:
+        self._capture_sequence += 1
+        return CaptureProvenance(self._capture_generation, self._capture_sequence)
 
     async def start(self) -> None:
         """Connect to the bus following the poc-findings §2 recipe.
@@ -767,8 +796,13 @@ class RpcBusAdapter:
         # BrilliantDevice so a push delivered to several callbacks (the panel
         # bridge AND the lossless scene bridge on the own device) is normalized
         # at most once total — like main, which shared one BrilliantDevice.
+        capture_provenance = self._next_capture_provenance()
         snapshot = tuple(
-            _PendingPeripheral(peripheral_id, _snapshot_peripheral(raw_peripheral))
+            _PendingPeripheral(
+                peripheral_id,
+                _snapshot_peripheral(raw_peripheral),
+                capture_provenance,
+            )
             for peripheral_id, raw_peripheral in dict(peripherals).items()
         )
         for cb, coalesce_pushes in admitted:
@@ -833,10 +867,13 @@ class RpcBusAdapter:
                         # peripheral, reused across every consumer (issue #98).
                         device = pending_peripheral.normalized
                         if device is None:
-                            device = normalize_peripheral(
-                                device_id,
-                                pending_peripheral.peripheral_id,
-                                pending_peripheral.snapshot,
+                            device = replace(
+                                normalize_peripheral(
+                                    device_id,
+                                    pending_peripheral.peripheral_id,
+                                    pending_peripheral.snapshot,
+                                ),
+                                capture_provenance=pending_peripheral.capture_provenance,
                             )
                             pending_peripheral.normalized = device
                         await cb(device)
@@ -913,6 +950,7 @@ class RpcBusAdapter:
         if self._shutting_down or session != self._session:
             return
         logger.warning("bus processor reconnected; re-subscribing and re-reconciling")
+        self._advance_capture_generation()
         self._note_push()
         self._note_reconnect()
         self._spawn(self._after_reconnect(session))
@@ -977,8 +1015,12 @@ class RpcBusAdapter:
                 label = "own device" if device_id == own_id else "extra device"
                 logger.warning("%s id=%s not returned by get_device()", label, device_id)
                 continue
+            capture_provenance = self._next_capture_provenance()
             devices.extend(
-                normalize_peripheral(device_id, peripheral_id, raw_peripheral)
+                replace(
+                    normalize_peripheral(device_id, peripheral_id, raw_peripheral),
+                    capture_provenance=capture_provenance,
+                )
                 for peripheral_id, raw_peripheral in dict(raw_device.peripherals).items()
             )
         return devices
@@ -989,7 +1031,10 @@ class RpcBusAdapter:
         raw = await obs.get_peripheral(device_id, peripheral_id)
         if raw is None:
             return None
-        return normalize_peripheral(device_id, peripheral_id, raw)
+        return replace(
+            normalize_peripheral(device_id, peripheral_id, raw),
+            capture_provenance=self._next_capture_provenance(),
+        )
 
     def on_change(
         self,
@@ -1231,6 +1276,13 @@ class RpcBusAdapter:
             cap = asyncio.get_running_loop().call_later(_WRITE_HARD_CAP_S, self._cap_write, record)
             try:
                 admission.issued = True
+                try:
+                    admission.ticket.mark_issued(self._next_capture_provenance())
+                except Exception:
+                    logger.exception(
+                        "set_variables(%s) issue callback failed; continuing",
+                        record.label,
+                    )
                 if admission.write_class is not WriteClass.MAINTENANCE:
                     for waiter in self._write_waiters.get(admission.device_id, []):
                         if waiter.write_class is WriteClass.MAINTENANCE:
