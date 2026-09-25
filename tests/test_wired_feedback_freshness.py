@@ -779,6 +779,9 @@ async def test_reconnect_without_device_retires_wired_state() -> None:
 
     assert PID not in bridge._pending_wired
     assert PID not in bridge._wired_native_provenance
+    await bus.emit(_dimmer(on="0", on_timestamp=4000))
+    assert _states(mqtt)[-1]["state"] == "OFF"
+    assert "wired_write_status" not in _states(mqtt)[-1]
     await _shutdown_feedback(bridge)
 
 
@@ -804,6 +807,9 @@ async def test_failed_reconnect_read_still_retires_wired_state() -> None:
 
     assert PID not in bridge._pending_wired
     assert PID not in bridge._wired_native_provenance
+    await bus.emit(_dimmer(on="0", on_timestamp=4000))
+    assert _states(mqtt)[-1]["state"] == "OFF"
+    assert "wired_write_status" not in _states(mqtt)[-1]
     await _shutdown_feedback(bridge)
 
 

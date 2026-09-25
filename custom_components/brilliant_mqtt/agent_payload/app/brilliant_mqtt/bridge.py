@@ -501,6 +501,7 @@ class Bridge:
     async def reconcile_after_reconnect(self) -> None:
         """Retire session-local wired evidence before reading a new bus generation."""
         await self.shutdown_wired_feedback()
+        self._wired_feedback_enabled = True
         await self.reconcile()
 
     def _command_topic_for(self, peripheral_id: str, d: EntityDescriptor) -> str | None:
