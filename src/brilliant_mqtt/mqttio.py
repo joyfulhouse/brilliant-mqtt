@@ -16,9 +16,11 @@ import json
 import logging
 import math
 import ssl
+import traceback
 from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import NoReturn
 
 import aiomqtt
@@ -66,6 +68,7 @@ _LANE_RESTART_BASE_DELAY_S = 0.1
 _LANE_RESTART_MAX_DELAY_S = 0.5
 _LANE_RESTART_MAX_FAILURES = 5
 _LANE_REOPEN_COOLDOWN_S = 30.0
+_LANE_FAILURE_FRAME_LIMIT = 3
 _NUMBER_AUX_VARS = frozenset(
     spec.var for specs in AUX_SPECS.values() for spec in specs if spec.component == "number"
 )
@@ -92,6 +95,16 @@ class _InboundMessage:
 class _ClosedLaneState:
     reopen_at: float
     rejected: int = 0
+
+
+def _worker_failure_metadata(error: BaseException | None) -> tuple[str, str]:
+    if error is None:
+        return "none", "none"
+    frames = traceback.extract_tb(error.__traceback__, limit=-_LANE_FAILURE_FRAME_LIMIT)
+    locations = ",".join(
+        f"{Path(frame.filename).name}:{frame.lineno}:{frame.name}" for frame in frames
+    )
+    return type(error).__qualname__, locations or "none"
 
 
 class _LaneQueue:
@@ -262,9 +275,8 @@ class _TopicDispatcher:
         closed.rejected += 1
         if closed.rejected == 1:
             logger.warning(
-                "MQTT command rejected during lane recovery cooldown "
-                "(rejected commands: %d; further rejection logs suppressed)",
-                closed.rejected,
+                "MQTT command rejected during lane recovery cooldown; "
+                "further rejection logs suppressed"
             )
 
     async def shutdown(self) -> None:
@@ -291,14 +303,36 @@ class _TopicDispatcher:
 
     async def _drain_and_cancel(self) -> None:
         try:
-            if self._queues:
+            drainable: list[_LaneQueue] = []
+            undrainable = 0
+            for lane, queue in self._queues.items():
+                worker = self._workers.get(lane)
+                if worker is not None and not worker.done():
+                    drainable.append(queue)
+                    continue
+                discarded = await self._close_lane(
+                    lane,
+                    queue,
+                    worker,
+                    cooldown=False,
+                )
+                if discarded is not None:
+                    undrainable += discarded
+            if undrainable:
+                suffix = "" if undrainable == 1 else "s"
+                logger.warning(
+                    "MQTT dispatcher discarded %d undrainable command%s during teardown",
+                    undrainable,
+                    suffix,
+                )
+            if drainable:
                 try:
                     await asyncio.wait_for(
-                        asyncio.gather(*(queue.join() for queue in self._queues.values())),
+                        asyncio.gather(*(queue.join() for queue in drainable)),
                         timeout=_SHUTDOWN_DRAIN_DEADLINE_S,
                     )
                 except asyncio.TimeoutError:
-                    undrained = sum(queue.unfinished_tasks for queue in self._queues.values())
+                    undrained = sum(queue.unfinished_tasks for queue in drainable)
                     logger.warning(
                         "MQTT dispatcher shutdown deadline expired; "
                         "%d undrained commands were abandoned",
@@ -332,6 +366,13 @@ class _TopicDispatcher:
             self._workers.clear()
             self._queues.clear()
             self._worker_failures.clear()
+            for closed in self._closed_lanes.values():
+                if closed.rejected:
+                    logger.warning(
+                        "MQTT command lane remained closed through teardown "
+                        "(rejected commands while closed: %d)",
+                        closed.rejected,
+                    )
             self._closed_lanes.clear()
 
     def _start_worker(self, lane: str, queue: _LaneQueue) -> None:
@@ -348,9 +389,25 @@ class _TopicDispatcher:
         queue: _LaneQueue,
         worker: asyncio.Task[None],
     ) -> None:
-        if self._workers.get(lane) is not worker or self._closing or worker.cancelled():
+        error = None if worker.cancelled() else worker.exception()
+        if self._workers.get(lane) is not worker or self._closing:
+            if error is not None:
+                failure_type, failure_frames = _worker_failure_metadata(error)
+                logger.error(
+                    "MQTT command lane worker failed during teardown or after replacement "
+                    "(type=%s; frames=%s)",
+                    failure_type,
+                    failure_frames,
+                )
             return
-        worker.exception()
+        if worker.cancelled():
+            closure = asyncio.create_task(
+                self._close_cancelled_worker(lane, queue, worker),
+                name="brilliant-mqtt-command-lane-closure",
+            )
+            self._recoveries[lane] = closure
+            return
+        failure_type, failure_frames = _worker_failure_metadata(error)
         failures = self._worker_failures.get(lane, 0) + 1
         self._worker_failures[lane] = failures
         delay = min(
@@ -359,17 +416,57 @@ class _TopicDispatcher:
         )
         logger.error(
             "MQTT command lane worker died unexpectedly; recovery %d/%d in %.3fs "
-            "(%d admitted commands pending)",
+            "(%d admitted commands pending; type=%s; frames=%s)",
             failures,
             _LANE_RESTART_MAX_FAILURES,
             delay,
             queue.unfinished_tasks,
+            failure_type,
+            failure_frames,
         )
         recovery = asyncio.create_task(
             self._recover_worker(lane, queue, worker, failures, delay),
             name="brilliant-mqtt-command-lane-recovery",
         )
         self._recoveries[lane] = recovery
+
+    async def _close_lane(
+        self,
+        lane: str,
+        queue: _LaneQueue,
+        worker: asyncio.Task[None] | None,
+        *,
+        cooldown: bool,
+    ) -> int | None:
+        if self._queues.get(lane) is not queue or self._workers.get(lane) is not worker:
+            return None
+        self._workers.pop(lane, None)
+        if cooldown:
+            self._closed_lanes[lane] = _ClosedLaneState(
+                reopen_at=asyncio.get_running_loop().time() + _LANE_REOPEN_COOLDOWN_S
+            )
+        return await queue.discard_pending()
+
+    async def _close_cancelled_worker(
+        self,
+        lane: str,
+        queue: _LaneQueue,
+        worker: asyncio.Task[None],
+    ) -> None:
+        try:
+            if self._closing:
+                return
+            discarded = await self._close_lane(lane, queue, worker, cooldown=True)
+            if discarded is not None:
+                logger.error(
+                    "MQTT command lane worker cancelled outside teardown; "
+                    "%d admitted commands discarded and lane closed for cooldown",
+                    discarded,
+                )
+        finally:
+            closure = asyncio.current_task()
+            if self._recoveries.get(lane) is closure:
+                self._recoveries.pop(lane, None)
 
     async def _recover_worker(
         self,
@@ -384,11 +481,14 @@ class _TopicDispatcher:
             if self._closing or self._workers.get(lane) is not dead_worker:
                 return
             if failures >= _LANE_RESTART_MAX_FAILURES:
-                self._workers.pop(lane, None)
-                self._closed_lanes[lane] = _ClosedLaneState(
-                    reopen_at=asyncio.get_running_loop().time() + _LANE_REOPEN_COOLDOWN_S
+                discarded = await self._close_lane(
+                    lane,
+                    queue,
+                    dead_worker,
+                    cooldown=True,
                 )
-                discarded = await queue.discard_pending()
+                if discarded is None:
+                    return
                 logger.error(
                     "MQTT command lane recovery exhausted after %d consecutive worker deaths; "
                     "%d admitted commands discarded and future commands rejected during cooldown "
