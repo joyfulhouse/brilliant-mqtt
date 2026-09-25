@@ -12,6 +12,7 @@ import pytest
 
 from brilliant_mqtt import mqttio
 from brilliant_mqtt.mqttio import AioMqttAdapter, _InboundMessage, _LaneQueue, _TopicDispatcher
+from brilliant_mqtt.write_admission import WriteCancelled
 
 _PRIVATE_TOPIC = "brilliant/private-panel/private-peripheral/set_screen_on"
 _PRIMARY_TOPIC = "brilliant/private-panel/private-peripheral/set"
@@ -32,6 +33,22 @@ def _message(
 async def _turns(count: int = 10) -> None:
     for _ in range(count):
         await asyncio.sleep(0)
+
+
+def _reader_adapter(
+    messages: AsyncIterator[SimpleNamespace], dispatcher: _TopicDispatcher
+) -> AioMqttAdapter:
+    async def registered_callback(_topic: str, _payload: str) -> None:
+        raise AssertionError("the injected dispatcher handler owns this test")
+
+    adapter = object.__new__(AioMqttAdapter)
+    adapter._client = cast(Any, SimpleNamespace(messages=messages))
+    adapter._command_cbs = [registered_callback]
+    adapter._message_cbs = []
+    adapter._payload_decode_error_cbs = []
+    adapter._redacted_logging = False
+    adapter._topic_dispatcher = dispatcher
+    return adapter
 
 
 class _RestartGate:
@@ -153,6 +170,20 @@ class _BackoffRecorder:
             await asyncio.Future()
 
 
+class _ExhaustionGate:
+    def __init__(self) -> None:
+        self.delays: list[float] = []
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def __call__(self, delay: float) -> None:
+        self.delays.append(delay)
+        self.entered.set()
+        await self.release.wait()
+        if len(self.delays) > 5:
+            await asyncio.Future()
+
+
 async def test_permanently_dead_lane_uses_capped_backoff_without_spinning(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -185,6 +216,82 @@ async def test_permanently_dead_lane_uses_capped_backoff_without_spinning(
         assert _PRIVATE_PAYLOAD not in caplog.text
     finally:
         await dispatcher.shutdown()
+
+
+class _DeadPrivateLaneDispatcher(_TopicDispatcher):
+    async def _run_worker(self, lane: str, queue: _LaneQueue) -> None:
+        if lane == mqttio._command_lane_key(_PRIVATE_TOPIC):
+            raise RuntimeError(_PRIVATE_PAYLOAD)
+        await super()._run_worker(lane, queue)
+
+
+async def test_reader_progresses_after_dead_lane_saturates(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(mqttio, "_SHUTDOWN_DRAIN_DEADLINE_S", 0.01)
+    restart = _ExhaustionGate()
+    finish = asyncio.Event()
+    independent_seen = asyncio.Event()
+    seen: list[str] = []
+    saturating_messages = [
+        (_PRIMARY_TOPIC, '{"state":"ON"}'),
+        (_PRIMARY_TOPIC, '{"brightness":120}'),
+        (_PRIMARY_TOPIC, '{"state":"TOGGLE"}'),
+        (_PRIMARY_TOPIC, '{"brightness":80}'),
+        *((_BUTTON_TOPIC, f"barrier-{index}") for index in range(5)),
+        (_BUTTON_TOPIC, "overflow"),
+    ]
+
+    async def handler(message: _InboundMessage) -> None:
+        seen.append(message.payload)
+        if seen == ["independent-1", "independent-2"]:
+            independent_seen.set()
+
+    async def messages() -> AsyncIterator[SimpleNamespace]:
+        for topic, payload in saturating_messages:
+            yield SimpleNamespace(topic=topic, payload=payload.encode(), retain=False)
+        yield SimpleNamespace(topic=_OTHER_TOPIC, payload=b"independent-1", retain=False)
+        yield SimpleNamespace(topic=_PRIVATE_TOPIC, payload=b"rejected", retain=False)
+        yield SimpleNamespace(topic=_OTHER_TOPIC, payload=b"independent-2", retain=False)
+        await finish.wait()
+
+    dispatcher = _DeadPrivateLaneDispatcher(handler, restart_sleep=restart)
+    adapter = _reader_adapter(messages(), dispatcher)
+    caplog.set_level(logging.ERROR, logger="brilliant_mqtt.mqttio")
+    reader = asyncio.create_task(adapter._read_loop())
+    try:
+        await asyncio.wait_for(restart.entered.wait(), timeout=0.2)
+        dead_queue = dispatcher._queues[mqttio._command_lane_key(_PRIVATE_TOPIC)]
+        for _ in range(20):
+            if len(dead_queue._pending) == mqttio._TOPIC_QUEUE_MAXSIZE:
+                break
+            await asyncio.sleep(0)
+        assert len(dead_queue._pending) == mqttio._TOPIC_QUEUE_MAXSIZE
+        assert not independent_seen.is_set()
+
+        restart.release.set()
+        await asyncio.wait_for(independent_seen.wait(), timeout=0.2)
+        await asyncio.wait_for(
+            dispatcher._queues[mqttio._command_lane_key(_OTHER_TOPIC)].join(), timeout=0.2
+        )
+
+        assert seen == ["independent-1", "independent-2"]
+        assert dead_queue.unfinished_tasks == 0
+        assert list(dead_queue._pending) == []
+        assert len(restart.delays) == 5
+        await _turns(20)
+        assert len(restart.delays) == 5
+        assert mqttio._command_lane_key(_PRIVATE_TOPIC) not in dispatcher._workers
+        assert "MQTT command lane recovery exhausted" in caplog.text
+        assert "8 admitted commands discarded" in caplog.text
+        assert "future commands rejected until reconnect" in caplog.text
+        assert _PRIVATE_PAYLOAD not in caplog.text
+        assert "private-panel" not in caplog.text
+    finally:
+        finish.set()
+        reader.cancel()
+        await asyncio.gather(reader, return_exceptions=True)
 
 
 async def test_shutdown_during_restart_backoff_never_resurrects_lane(
@@ -222,24 +329,12 @@ async def test_reader_reconnect_teardown_during_backoff_never_resurrects_lane() 
         calls += 1
         raise RuntimeError(_PRIVATE_PAYLOAD)
 
-    async def registered_callback(_topic: str, _payload: str) -> None:
-        raise AssertionError("the injected dispatcher handler owns this test")
-
     async def reconnect_messages() -> AsyncIterator[SimpleNamespace]:
         yield SimpleNamespace(topic=_PRIVATE_TOPIC, payload=b"fatal", retain=False)
         await restart.entered.wait()
 
     dispatcher = _TopicDispatcher(handler, restart_sleep=restart)
-    adapter = object.__new__(AioMqttAdapter)
-    adapter._client = cast(
-        Any,
-        SimpleNamespace(messages=reconnect_messages()),
-    )
-    adapter._command_cbs = [registered_callback]
-    adapter._message_cbs = []
-    adapter._payload_decode_error_cbs = []
-    adapter._redacted_logging = False
-    adapter._topic_dispatcher = dispatcher
+    adapter = _reader_adapter(reconnect_messages(), dispatcher)
 
     await asyncio.wait_for(adapter._read_loop(), timeout=0.2)
     await _turns()
@@ -278,6 +373,42 @@ async def test_genuine_worker_cancellation_is_not_restarted_or_logged_as_death(
     assert restart_delays == []
     assert "worker died unexpectedly" not in caplog.text
     await dispatcher.shutdown()
+
+
+async def test_write_cancelled_continues_on_same_worker(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(mqttio, "_SHUTDOWN_DRAIN_DEADLINE_S", 0.01)
+    restart_delays: list[float] = []
+    seen: list[str] = []
+
+    async def restart_sleep(delay: float) -> None:
+        restart_delays.append(delay)
+
+    async def handler(message: _InboundMessage) -> None:
+        seen.append(message.payload)
+        if message.payload == "cancelled":
+            raise WriteCancelled()
+
+    dispatcher = _TopicDispatcher(handler, restart_sleep=restart_sleep)
+    caplog.set_level(logging.DEBUG, logger="brilliant_mqtt.mqttio")
+    try:
+        await dispatcher.dispatch(_message("cancelled"), latest_wins=False)
+        worker = next(iter(dispatcher._workers.values()))
+        await dispatcher.dispatch(_message("next"), latest_wins=False)
+        queue = next(iter(dispatcher._queues.values()))
+        await asyncio.wait_for(queue.join(), timeout=0.2)
+
+        assert seen == ["cancelled", "next"]
+        assert next(iter(dispatcher._workers.values())) is worker
+        assert not worker.done()
+        assert queue.unfinished_tasks == 0
+        assert restart_delays == []
+        assert "MQTT command write cancelled; continuing lane" in caplog.text
+        assert "worker died unexpectedly" not in caplog.text
+    finally:
+        await dispatcher.shutdown()
 
 
 async def test_failed_fold_hook_logs_metadata_only_before_queue_fallback(

@@ -64,6 +64,7 @@ _SHUTDOWN_DRAIN_DEADLINE_S = 5.0
 _SHUTDOWN_WORKER_SETTLE_S = 1.0
 _LANE_RESTART_BASE_DELAY_S = 0.1
 _LANE_RESTART_MAX_DELAY_S = 0.5
+_LANE_RESTART_MAX_FAILURES = 5
 _NUMBER_AUX_VARS = frozenset(
     spec.var for specs in AUX_SPECS.values() for spec in specs if spec.component == "number"
 )
@@ -97,13 +98,16 @@ class _LaneQueue:
         self._unfinished_tasks = 0
         self._finished = asyncio.Event()
         self._finished.set()
+        self._accepting = True
 
     @property
     def unfinished_tasks(self) -> int:
         return self._unfinished_tasks
 
-    async def put(self, message: _InboundMessage, *, latest_wins: bool) -> None:
+    async def put(self, message: _InboundMessage, *, latest_wins: bool) -> bool:
         async with self._condition:
+            if not self._accepting:
+                return False
             if latest_wins:
                 for index in range(len(self._pending) - 1, -1, -1):
                     pending = self._pending[index]
@@ -129,12 +133,17 @@ class _LaneQueue:
                         # command never advances, so it can be counted only once.
                         if self._diagnostics is not None:
                             self._diagnostics.note_superseded()
-                        return
-            await self._condition.wait_for(lambda: len(self._pending) < self._maxsize)
+                        return True
+            await self._condition.wait_for(
+                lambda: not self._accepting or len(self._pending) < self._maxsize
+            )
+            if not self._accepting:
+                return False
             self._pending.append(message)
             self._unfinished_tasks += 1
             self._finished.clear()
             self._condition.notify()
+            return True
 
     async def get(self) -> _InboundMessage:
         async with self._condition:
@@ -153,6 +162,16 @@ class _LaneQueue:
     async def join(self) -> None:
         await self._finished.wait()
 
+    async def discard_pending(self) -> int:
+        async with self._condition:
+            self._accepting = False
+            discarded = len(self._pending)
+            self._pending.clear()
+            for _ in range(discarded):
+                self.task_done()
+            self._condition.notify_all()
+            return discarded
+
 
 class _TopicDispatcher:
     """Serialize peripheral commands while retaining cross-lane concurrency."""
@@ -170,7 +189,7 @@ class _TopicDispatcher:
         self._queues: dict[str, _LaneQueue] = {}
         self._workers: dict[str, asyncio.Task[None]] = {}
         self._recoveries: dict[str, asyncio.Task[None]] = {}
-        self._restart_delays: dict[str, float] = {}
+        self._worker_failures: dict[str, int] = {}
         self._active: dict[str, tuple[_InboundMessage, CommandAdmission]] = {}
         self._folded: dict[str, _InboundMessage] = {}
         self._closing = False
@@ -275,6 +294,7 @@ class _TopicDispatcher:
                         task.add_done_callback(self._abandoned.discard)
             self._workers.clear()
             self._queues.clear()
+            self._worker_failures.clear()
 
     def _start_worker(self, lane: str, queue: _LaneQueue) -> None:
         worker = asyncio.create_task(
@@ -293,16 +313,22 @@ class _TopicDispatcher:
         if self._workers.get(lane) is not worker or self._closing or worker.cancelled():
             return
         worker.exception()
-        delay = self._restart_delays.get(lane, _LANE_RESTART_BASE_DELAY_S)
-        self._restart_delays[lane] = min(delay * 2, _LANE_RESTART_MAX_DELAY_S)
+        failures = self._worker_failures.get(lane, 0) + 1
+        self._worker_failures[lane] = failures
+        delay = min(
+            _LANE_RESTART_BASE_DELAY_S * 2 ** (failures - 1),
+            _LANE_RESTART_MAX_DELAY_S,
+        )
         logger.error(
-            "MQTT command lane worker died unexpectedly; restarting in %.3fs "
+            "MQTT command lane worker died unexpectedly; recovery %d/%d in %.3fs "
             "(%d admitted commands pending)",
+            failures,
+            _LANE_RESTART_MAX_FAILURES,
             delay,
             queue.unfinished_tasks,
         )
         recovery = asyncio.create_task(
-            self._recover_worker(lane, queue, worker, delay),
+            self._recover_worker(lane, queue, worker, failures, delay),
             name="brilliant-mqtt-command-lane-recovery",
         )
         self._recoveries[lane] = recovery
@@ -312,11 +338,22 @@ class _TopicDispatcher:
         lane: str,
         queue: _LaneQueue,
         dead_worker: asyncio.Task[None],
+        failures: int,
         delay: float,
     ) -> None:
         try:
             await self._restart_sleep(delay)
             if self._closing or self._workers.get(lane) is not dead_worker:
+                return
+            if failures >= _LANE_RESTART_MAX_FAILURES:
+                discarded = await queue.discard_pending()
+                self._workers.pop(lane, None)
+                logger.error(
+                    "MQTT command lane recovery exhausted after %d consecutive worker deaths; "
+                    "%d admitted commands discarded and future commands rejected until reconnect",
+                    failures,
+                    discarded,
+                )
                 return
             self._start_worker(lane, queue)
         finally:
@@ -333,16 +370,16 @@ class _TopicDispatcher:
                 while True:
                     self._active[lane] = (message, admission)
                     await self._handler(message)
+                    self._worker_failures.pop(lane, None)
                     replacement = self._folded.pop(lane, None)
                     if replacement is None:
-                        self._restart_delays.pop(lane, None)
                         break
                     message = replacement
             except WriteCancelled:
                 # A bus admission can end independently of this worker. Actual
                 # Task.cancel() still propagates as ordinary CancelledError.
                 logger.debug("MQTT command write cancelled; continuing lane")
-                self._restart_delays.pop(lane, None)
+                self._worker_failures.pop(lane, None)
             finally:
                 # A folded replacement can still belong to the lane before
                 # its callback adopts it. Do not orphan it on cancellation.
@@ -770,9 +807,9 @@ class AioMqttAdapter:
                     logger.debug("temporary MQTT message received (%d bytes)", len(payload))
                 else:
                     logger.debug("mqtt message on %s (%d bytes)", topic, len(payload))
-                # Accepted lossless-FIFO trade-off: a saturated lane
-                # backpressures this one broker reader, delaying every later
-                # topic so bounded lossless pending commands are never dropped.
+                # A healthy saturated lane backpressures this broker reader to
+                # preserve its bounded FIFO. Exhausted recovery closes only the
+                # failed lane's queue and wakes this await.
                 await dispatcher.dispatch(
                     _InboundMessage(
                         topic=topic,
