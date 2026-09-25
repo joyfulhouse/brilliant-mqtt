@@ -318,7 +318,7 @@ async def test_brightness_burst_always_executes_latest_payload() -> None:
     await adapter._read_loop()
 
     assert 1 <= len(payloads) <= 5
-    assert payloads[-1] == '{"brightness": 5}'
+    assert json.loads(payloads[-1]) == {"brightness": 5}
 
 
 async def test_latest_wins_replaces_only_its_topic_within_peripheral_lane() -> None:
@@ -331,10 +331,10 @@ async def test_latest_wins_replaces_only_its_topic_within_peripheral_lane() -> N
         _Client(
             [
                 _Message(blocker, b"block", False),
-                _Message(primary, b"primary-1", False),
-                _Message(auxiliary, b"aux-1", False),
-                _Message(primary, b"primary-2", False),
-                _Message(auxiliary, b"aux-2", False),
+                _Message(primary, b'{"brightness":1}', False),
+                _Message(auxiliary, b"10", False),
+                _Message(primary, b'{"brightness":2}', False),
+                _Message(auxiliary, b"20", False),
             ]
         ),
     )
@@ -361,8 +361,8 @@ async def test_latest_wins_replaces_only_its_topic_within_peripheral_lane() -> N
 
     assert calls == [
         (blocker, "block"),
-        (primary, "primary-2"),
-        (auxiliary, "aux-2"),
+        (primary, '{"brightness":2}'),
+        (auxiliary, "20"),
     ]
 
 
