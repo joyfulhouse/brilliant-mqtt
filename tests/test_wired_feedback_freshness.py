@@ -137,6 +137,20 @@ async def test_stale_then_post_issue_observation_never_flickers_off() -> None:
     await _shutdown_feedback(bridge)
 
 
+async def test_postissue_contradiction_is_not_fenced_by_later_capture() -> None:
+    bus, mqtt, bridge = await _bridged(_dimmer())
+    await mqtt.inject(SET_TOPIC, '{"state":"ON","brightness":200}')
+    captured_after_issue = (await bus.get_all())[0]
+    await bus.emit(_dimmer(on="1", intensity="333", on_timestamp=2000))
+
+    await bus.emit(captured_after_issue)
+
+    states = _states(mqtt)
+    await _shutdown_feedback(bridge)
+    assert states[-1]["state"] == "OFF"
+    assert states[-1]["wired_write_status"] == "ambiguous"
+
+
 async def test_hot_poll_pre_read_snapshot_is_capture_fenced() -> None:
     bus, mqtt, bridge = await _bridged(_dimmer())
     captured = await bus.get_all()
@@ -502,6 +516,82 @@ async def test_new_request_cancels_blocked_older_feedback_publish() -> None:
     await _shutdown_feedback(bridge)
 
 
+async def test_contradiction_invalidates_blocked_provisional_publish() -> None:
+    mqtt = _BlockingStateMqtt()
+    bus, _mqtt, bridge = await _bridged(_dimmer(), mqtt=mqtt)
+    mqtt.armed = True
+
+    command = asyncio.create_task(mqtt.inject(SET_TOPIC, '{"state":"ON","brightness":85}'))
+    await mqtt.blocked.wait()
+    await bus.emit(_dimmer(on="0", on_timestamp=3000))
+    mqtt.release.set()
+    await command
+
+    states = _states(mqtt)
+    await _shutdown_feedback(bridge)
+    assert states[-1]["state"] == "OFF"
+    assert states[-1]["wired_write_status"] == "ambiguous"
+
+
+async def test_expiry_invalidates_blocked_provisional_publish() -> None:
+    mqtt = _BlockingStateMqtt()
+    sleeper = FakeSleeper()
+    clock = FakeClock()
+    _bus, _mqtt, bridge = await _bridged(
+        _dimmer(),
+        mqtt=mqtt,
+        wall_clock=clock,
+        sleeper=sleeper,
+    )
+    mqtt.armed = True
+
+    command = asyncio.create_task(mqtt.inject(SET_TOPIC, '{"state":"ON","brightness":85}'))
+    await mqtt.blocked.wait()
+    clock.advance(20)
+    await sleeper.release_all()
+    mqtt.release.set()
+    await command
+
+    states = _states(mqtt)
+    await _shutdown_feedback(bridge)
+    assert states[-1]["state"] == "OFF"
+    assert states[-1]["wired_write_status"] == "unconfirmed"
+
+
+async def test_resolution_invalidates_blocked_provisional_publish() -> None:
+    mqtt = _BlockingStateMqtt()
+    bus, _mqtt, bridge = await _bridged(_dimmer(), mqtt=mqtt)
+    mqtt.armed = True
+
+    command = asyncio.create_task(mqtt.inject(SET_TOPIC, '{"state":"ON","brightness":85}'))
+    await mqtt.blocked.wait()
+    await bus.emit(_dimmer(on="1", intensity="333", on_timestamp=3000))
+    mqtt.release.set()
+    await command
+
+    states = _states(mqtt)
+    await _shutdown_feedback(bridge)
+    assert states[-1]["state"] == "ON"
+    assert states[-1]["wired_write_status"] == "observed"
+
+
+async def test_preissue_native_publish_rechecks_projection_after_await() -> None:
+    mqtt = _BlockingStateMqtt()
+    bus, _mqtt, bridge = await _bridged(_dimmer(), mqtt=mqtt)
+    mqtt.armed = True
+
+    observation = asyncio.create_task(bus.emit(_dimmer(intensity="400")))
+    await mqtt.blocked.wait()
+    await mqtt.inject(SET_TOPIC, '{"state":"ON","brightness":85}')
+    mqtt.release.set()
+    await observation
+
+    states = _states(mqtt)
+    await _shutdown_feedback(bridge)
+    assert states[-1]["state"] == "ON"
+    assert states[-1]["wired_write_status"] == "provisional"
+
+
 async def test_inflight_completion_cannot_revive_feedback_after_reacquisition() -> None:
     bus = _FirstWriteBlockedBus([_dimmer()])
     _bus, mqtt, bridge = await _bridged(_dimmer(), bus=bus)
@@ -676,6 +766,61 @@ async def test_soft_reconnect_retires_old_comparison_provenance() -> None:
     marker = provenance["intensity"]
     assert marker is not None
     assert marker.source_generation == 2
+    await _shutdown_feedback(bridge)
+
+
+async def test_reconnect_without_device_retires_wired_state() -> None:
+    bus, mqtt, bridge = await _bridged(_dimmer())
+    await mqtt.inject(SET_TOPIC, '{"state":"ON","brightness":85}')
+    bus.on_reconnect(bridge.reconcile_after_reconnect)
+    bus.set_devices([])
+
+    await bus.fire_reconnect()
+
+    assert PID not in bridge._pending_wired
+    assert PID not in bridge._wired_native_provenance
+    await _shutdown_feedback(bridge)
+
+
+class _FailingReconnectReadBus(FakeBus):
+    def __init__(self, devices: list[BrilliantDevice]) -> None:
+        super().__init__(devices)
+        self.fail_reads = False
+
+    async def get_all(self) -> list[BrilliantDevice]:
+        if self.fail_reads:
+            raise TimeoutError("reconnect read failed")
+        return await super().get_all()
+
+
+async def test_failed_reconnect_read_still_retires_wired_state() -> None:
+    bus = _FailingReconnectReadBus([_dimmer()])
+    _bus, mqtt, bridge = await _bridged(_dimmer(), bus=bus)
+    await mqtt.inject(SET_TOPIC, '{"state":"ON","brightness":85}')
+    bus.on_reconnect(bridge.reconcile_after_reconnect)
+    bus.fail_reads = True
+
+    await bus.fire_reconnect()
+
+    assert PID not in bridge._pending_wired
+    assert PID not in bridge._wired_native_provenance
+    await _shutdown_feedback(bridge)
+
+
+async def test_reconnect_retires_preboundary_command_completion() -> None:
+    bus = _FirstWriteBlockedBus([_dimmer()])
+    _bus, mqtt, bridge = await _bridged(_dimmer(), bus=bus)
+    bus.on_reconnect(bridge.reconcile_after_reconnect)
+
+    command = asyncio.create_task(mqtt.inject(SET_TOPIC, '{"state":"ON","brightness":85}'))
+    await bus.first_started.wait()
+    await bus.fire_reconnect()
+    mqtt.published.clear()
+    bus.release_first.set()
+    await command
+
+    assert _states(mqtt) == []
+    assert PID not in bridge._wired_feedback
     await _shutdown_feedback(bridge)
 
 

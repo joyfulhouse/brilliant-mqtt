@@ -14,6 +14,7 @@ import json
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -32,7 +33,7 @@ from brilliant_mqtt.model import BrilliantDevice, DeviceKind, Variable
 from brilliant_mqtt.protocols import CommandSubscribeError
 from brilliant_mqtt.retained_topics import RetainedLedgerError
 from brilliant_mqtt.write_admission import AdmissionTicket, WriteClass
-from tests.fakes import FakeBus, FakeClock, FakeMqtt, _panel_dimmer
+from tests.fakes import FakeBus, FakeClock, FakeMqtt, FakeSleeper, _panel_dimmer
 
 HB = 10.0
 
@@ -638,6 +639,9 @@ class _SessionHarness:
                 if self._scope == "panel":
                     harness.ready.set()
 
+            async def reconcile_after_reconnect(self) -> None:
+                await self.reconcile()
+
             async def poll_once(self, devices: list[BrilliantDevice] | None = None) -> None:
                 harness.events.append(f"{self._scope}_poll")
                 harness.poll_snapshots[self._scope].append(devices)
@@ -651,6 +655,9 @@ class _SessionHarness:
                 return
 
             async def shutdown_mesh_feedback(self) -> None:
+                return
+
+            async def shutdown_wired_feedback(self) -> None:
                 return
 
         self.bridge_type = SessionBridge
@@ -739,6 +746,56 @@ async def test_session_joins_mesh_feedback_before_adapters_close(
     monkeypatch.setattr(harness.bridge_type, "shutdown_mesh_feedback", tracked_shutdown)
     await _cancel_ready_session(harness, _hot_poll_settings(mesh=True))
     assert harness.events[-3:] == ["mesh_feedback_joined", "bus_shutdown", "mqtt_disconnect"]
+
+
+async def test_session_teardown_retires_wired_feedback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    ready = asyncio.Event()
+
+    class ReadyMqtt(FakeMqtt):
+        async def subscribe(self, topic: str) -> None:
+            await super().subscribe(topic)
+            if topic == "brilliant/office/gangbox_peripheral_0/set":
+                ready.set()
+
+    bus = FakeBus([_panel_dimmer()])
+    mqtt = ReadyMqtt()
+    sleeper = FakeSleeper()
+    bridges: list[Bridge] = []
+
+    def make_bridge(*args: Any, **kwargs: Any) -> Bridge:
+        bridge = Bridge(*args, **kwargs, sleep=sleeper, wall_clock=FakeClock())
+        bridges.append(bridge)
+        return bridge
+
+    monkeypatch.setattr(main_mod, "RpcBusAdapter", lambda **_kwargs: bus)
+    monkeypatch.setattr(main_mod, "AioMqttAdapter", lambda *_args, **_kwargs: mqtt)
+    monkeypatch.setattr(main_mod, "Bridge", make_bridge)
+    settings = _settings()
+    object.__setattr__(settings, "retained_topics_file", str(tmp_path / "owned.json"))
+
+    session = asyncio.create_task(main_mod._run_session(settings, None, None))
+    await ready.wait()
+    await mqtt.inject(
+        "brilliant/office/gangbox_peripheral_0/set",
+        '{"state":"ON","brightness":85}',
+    )
+    bridge = bridges[0]
+    deadlines = list(bridge._wired_deadline_tasks.values())
+
+    session.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await session
+    assert all(task.done() for task in deadlines)
+    mqtt.published.clear()
+    await sleeper.release_all()
+    await asyncio.gather(*deadlines, return_exceptions=True)
+
+    assert not bridge._pending_wired
+    assert not bridge._wired_native_provenance
+    assert not mqtt.published
 
 
 def _hot_poll_settings(

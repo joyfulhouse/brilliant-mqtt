@@ -21,6 +21,14 @@ the active projection for the commanded field. Unrelated fields from the same
 capture still apply. Source generations are incomparable; reconnect or session
 replacement retires the old projection and comparison state.
 
+Capture sequence is compared only with the relevant write-issue boundary; it
+is not an observation high-water mark. A post-issue contradiction therefore
+remains publishable even when it is delivered after a later-captured record.
+All wired-primary state publications share per-peripheral revision ownership
+and serialization, so a blocked older payload cannot finish after the latest
+projection decision. Reconnect retirement happens before the replacement read,
+and session teardown cancels and joins wired feedback work before adapters close.
+
 Capture order is not physical chronology. In particular, these histories are
 indistinguishable after the fact: an OFF snapshot captured before an effective
 ON write and delivered late, or an accepted but ineffective ON write followed
