@@ -346,6 +346,7 @@ class _TopicDispatcher:
                 await asyncio.gather(*recoveries, return_exceptions=True)
             self._recoveries.clear()
             workers = list(self._workers.values())
+            self._workers.clear()
             for worker in workers:
                 worker.cancel()
             if workers:
@@ -363,7 +364,8 @@ class _TopicDispatcher:
                     for task in pending:
                         self._abandoned.add(task)
                         task.add_done_callback(self._abandoned.discard)
-            self._workers.clear()
+            for queue in self._queues.values():
+                await queue.discard_pending()
             self._queues.clear()
             self._worker_failures.clear()
             for closed in self._closed_lanes.values():

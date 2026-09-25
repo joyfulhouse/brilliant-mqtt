@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import gc
 import logging
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -457,6 +457,83 @@ async def test_shutdown_discards_dead_lane_without_waiting_for_default_deadline(
     assert list(queue._pending) == []
     assert "MQTT dispatcher discarded 1 undrainable command during teardown" in caplog.text
     assert _PRIVATE_PAYLOAD not in caplog.text
+
+
+async def test_idle_shutdown_does_not_spawn_lane_closures(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    create_task = asyncio.create_task
+    closure_tasks = 0
+
+    def observed_create_task(
+        coroutine: Coroutine[Any, Any, None],
+        *,
+        name: str | None = None,
+    ) -> asyncio.Task[None]:
+        nonlocal closure_tasks
+        if name == "brilliant-mqtt-command-lane-closure":
+            closure_tasks += 1
+        return create_task(coroutine, name=name)
+
+    monkeypatch.setattr(asyncio, "create_task", observed_create_task)
+    dispatcher = _TopicDispatcher(lambda _message: asyncio.sleep(0))
+    caplog.set_level(logging.DEBUG, logger="brilliant_mqtt.mqttio")
+    for index in range(3):
+        await dispatcher.dispatch(
+            _message(
+                f"command-{index}",
+                topic=f"brilliant/private-panel/peripheral-{index}/set_screen_on",
+            ),
+            latest_wins=False,
+        )
+    await asyncio.gather(*(queue.join() for queue in dispatcher._queues.values()))
+
+    await dispatcher.shutdown()
+
+    assert closure_tasks == 0
+    assert dispatcher._workers == {}
+    assert dispatcher._recoveries == {}
+    assert caplog.records == []
+
+
+async def test_shutdown_deadline_logs_one_disposition_and_settles_pending(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(mqttio, "_SHUTDOWN_DRAIN_DEADLINE_S", 0.01)
+    started = asyncio.Event()
+
+    async def handler(_message: _InboundMessage) -> None:
+        started.set()
+        await asyncio.Future()
+
+    dispatcher = _TopicDispatcher(handler)
+    caplog.set_level(logging.WARNING, logger="brilliant_mqtt.mqttio")
+    await dispatcher.dispatch(_message("active"), latest_wins=False)
+    await asyncio.wait_for(started.wait(), timeout=0.2)
+    await dispatcher.dispatch(_message("pending-1", topic=_BUTTON_TOPIC), latest_wins=False)
+    await dispatcher.dispatch(_message("pending-2", topic=_BUTTON_TOPIC), latest_wins=False)
+    queue = dispatcher._queues[mqttio._command_lane_key(_PRIVATE_TOPIC)]
+
+    await asyncio.wait_for(dispatcher.shutdown(), timeout=0.2)
+
+    disposition_records = [
+        record.getMessage()
+        for record in caplog.records
+        if "commands were abandoned" in record.getMessage()
+        or record.getMessage().startswith("MQTT command lane discarded")
+    ]
+    assert disposition_records == [
+        "MQTT dispatcher shutdown deadline expired; 3 undrained commands were abandoned"
+    ]
+    assert queue.unfinished_tasks == 0
+    assert list(queue._pending) == []
+    assert not queue._accepting
+    assert dispatcher._workers == {}
+    assert dispatcher._recoveries == {}
+    assert _PRIVATE_PAYLOAD not in caplog.text
+    assert "private-panel" not in caplog.text
 
 
 async def test_reader_reconnect_teardown_during_backoff_never_resurrects_lane() -> None:
