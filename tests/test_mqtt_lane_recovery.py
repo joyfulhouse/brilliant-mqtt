@@ -5,11 +5,12 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
+from typing import Any, cast
 
 import pytest
 
 from brilliant_mqtt import mqttio
-from brilliant_mqtt.mqttio import _InboundMessage, _LaneQueue, _TopicDispatcher
+from brilliant_mqtt.mqttio import AioMqttAdapter, _InboundMessage, _LaneQueue, _TopicDispatcher
 
 _PRIVATE_TOPIC = "brilliant/private-panel/private-peripheral/set_screen_on"
 _PRIMARY_TOPIC = "brilliant/private-panel/private-peripheral/set"
@@ -211,6 +212,61 @@ async def test_shutdown_during_restart_backoff_never_resurrects_lane(
     assert dispatcher._workers == {}
     assert dispatcher._recoveries == {}
     assert _PRIVATE_PAYLOAD not in caplog.text
+
+
+class _ReconnectMessage:
+    topic = _PRIVATE_TOPIC
+    payload = b"fatal"
+    retain = False
+
+
+class _ReconnectMessages:
+    def __init__(self, restart_entered: asyncio.Event) -> None:
+        self._restart_entered = restart_entered
+        self._sent = False
+
+    def __aiter__(self) -> _ReconnectMessages:
+        return self
+
+    async def __anext__(self) -> _ReconnectMessage:
+        if not self._sent:
+            self._sent = True
+            return _ReconnectMessage()
+        await self._restart_entered.wait()
+        raise StopAsyncIteration
+
+
+async def test_reader_reconnect_teardown_during_backoff_never_resurrects_lane() -> None:
+    restart = _RestartGate()
+    calls = 0
+
+    async def handler(_message: _InboundMessage) -> None:
+        nonlocal calls
+        calls += 1
+        raise RuntimeError(_PRIVATE_PAYLOAD)
+
+    async def registered_callback(_topic: str, _payload: str) -> None:
+        raise AssertionError("the injected dispatcher handler owns this test")
+
+    dispatcher = _TopicDispatcher(handler, restart_sleep=restart)
+    adapter = object.__new__(AioMqttAdapter)
+    adapter._client = cast(
+        Any,
+        type("ReconnectClient", (), {"messages": _ReconnectMessages(restart.entered)})(),
+    )
+    adapter._command_cbs = [registered_callback]
+    adapter._message_cbs = []
+    adapter._payload_decode_error_cbs = []
+    adapter._redacted_logging = False
+    adapter._topic_dispatcher = dispatcher
+
+    await asyncio.wait_for(adapter._read_loop(), timeout=0.2)
+    await _turns()
+
+    assert calls == 1
+    assert restart.cancelled
+    assert dispatcher._workers == {}
+    assert dispatcher._recoveries == {}
 
 
 async def test_genuine_worker_cancellation_is_not_restarted_or_logged_as_death(
