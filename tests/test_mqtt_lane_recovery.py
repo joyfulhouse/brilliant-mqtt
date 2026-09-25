@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -74,16 +75,14 @@ async def test_dead_lane_recovers_saturated_work_without_blocking_independent_la
     try:
         await dispatcher.dispatch(_message("fatal"), latest_wins=False)
         await asyncio.wait_for(fatal_started.wait(), timeout=0.2)
-        # PR170's two safe partials merge into one admitted entry, while the
-        # invalid primary command becomes a barrier for every later command.
-        pending = [
+        saturating_messages = [
             (_message('{"state":"ON"}', topic=_PRIMARY_TOPIC), True),
             (_message('{"brightness":120}', topic=_PRIMARY_TOPIC), True),
             (_message('{"state":"TOGGLE"}', topic=_PRIMARY_TOPIC), True),
             (_message('{"brightness":80}', topic=_PRIMARY_TOPIC), True),
             *[(_message(f"barrier-{index}", topic=_BUTTON_TOPIC), False) for index in range(5)],
         ]
-        for message, latest_wins in pending:
+        for message, latest_wins in saturating_messages:
             await dispatcher.dispatch(message, latest_wins=latest_wins)
         lane_queue = dispatcher._queues[mqttio._command_lane_key(_PRIVATE_TOPIC)]
         assert len(lane_queue._pending) == mqttio._TOPIC_QUEUE_MAXSIZE
@@ -214,28 +213,6 @@ async def test_shutdown_during_restart_backoff_never_resurrects_lane(
     assert _PRIVATE_PAYLOAD not in caplog.text
 
 
-class _ReconnectMessage:
-    topic = _PRIVATE_TOPIC
-    payload = b"fatal"
-    retain = False
-
-
-class _ReconnectMessages:
-    def __init__(self, restart_entered: asyncio.Event) -> None:
-        self._restart_entered = restart_entered
-        self._sent = False
-
-    def __aiter__(self) -> _ReconnectMessages:
-        return self
-
-    async def __anext__(self) -> _ReconnectMessage:
-        if not self._sent:
-            self._sent = True
-            return _ReconnectMessage()
-        await self._restart_entered.wait()
-        raise StopAsyncIteration
-
-
 async def test_reader_reconnect_teardown_during_backoff_never_resurrects_lane() -> None:
     restart = _RestartGate()
     calls = 0
@@ -248,11 +225,15 @@ async def test_reader_reconnect_teardown_during_backoff_never_resurrects_lane() 
     async def registered_callback(_topic: str, _payload: str) -> None:
         raise AssertionError("the injected dispatcher handler owns this test")
 
+    async def reconnect_messages() -> AsyncIterator[SimpleNamespace]:
+        yield SimpleNamespace(topic=_PRIVATE_TOPIC, payload=b"fatal", retain=False)
+        await restart.entered.wait()
+
     dispatcher = _TopicDispatcher(handler, restart_sleep=restart)
     adapter = object.__new__(AioMqttAdapter)
     adapter._client = cast(
         Any,
-        type("ReconnectClient", (), {"messages": _ReconnectMessages(restart.entered)})(),
+        SimpleNamespace(messages=reconnect_messages()),
     )
     adapter._command_cbs = [registered_callback]
     adapter._message_cbs = []
