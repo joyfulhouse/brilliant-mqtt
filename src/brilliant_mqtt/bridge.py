@@ -364,18 +364,6 @@ class Bridge:
             and capture.sequence < issue.sequence
         )
 
-    @staticmethod
-    def _capture_is_older(
-        capture: CaptureProvenance | None,
-        previous: CaptureProvenance | None,
-    ) -> bool:
-        return (
-            capture is not None
-            and previous is not None
-            and capture.source_generation == previous.source_generation
-            and capture.sequence < previous.sequence
-        )
-
     def _remember_native_observation(self, observed: BrilliantDevice) -> BrilliantDevice:
         """Retain native fields by local capture order, never native timestamp."""
         if not self._is_wired_primary(observed):
@@ -394,7 +382,7 @@ class Bridge:
         variables = dict(observed.variables)
         if previous is not None and self._is_wired_primary(previous):
             for name in observed.variables:
-                if self._capture_is_older(
+                if self._capture_precedes(
                     observed.capture_provenance,
                     provenance.get(name),
                 ):
@@ -868,7 +856,7 @@ class Bridge:
         peripheral_id: str,
         record: _WiredWriteFeedback | None,
     ) -> None:
-        for task, pid in list(self._wired_feedback_tasks.items()):
+        for task, pid in self._wired_feedback_tasks.items():
             if pid == peripheral_id and task.cancel():
                 self._last_state_fields.pop(peripheral_id, None)
                 self._last_state_payload.pop(peripheral_id, None)
@@ -975,8 +963,6 @@ class Bridge:
         provenance = self._wired_native_provenance.get(peripheral_id, {})
         for name in pending.targets:
             capture = provenance.get(name)
-            if self._capture_precedes(capture, issue):
-                continue
             self._classify_wired_field(
                 pending,
                 name,
@@ -1049,8 +1035,6 @@ class Bridge:
             if name not in observed.variables:
                 continue
             field_capture = provenance.get(name)
-            if self._capture_precedes(field_capture, issue):
-                continue
             self._classify_wired_field(
                 pending,
                 name,
