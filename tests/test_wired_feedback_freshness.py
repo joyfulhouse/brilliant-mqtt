@@ -137,6 +137,35 @@ async def test_stale_then_post_issue_observation_never_flickers_off() -> None:
     await _shutdown_feedback(bridge)
 
 
+async def test_preissue_snapshot_cannot_replace_a_resolved_field_of_active_request() -> None:
+    bus, mqtt, bridge = await _bridged(_dimmer())
+    captured_before_issue = (await bus.get_all())[0]
+
+    await mqtt.inject(SET_TOPIC, '{"state":"ON","brightness":200}')
+    partial = _dimmer(on="1", on_timestamp=2000)
+    del partial.variables["intensity"]
+    await bus.emit(partial)
+    await bus.emit(captured_before_issue)
+
+    state = _states(mqtt)[-1]
+    assert state["state"] == "ON"
+    assert state["brightness"] == 200
+    _assert_feedback(
+        state,
+        "provisional",
+        {"intensity": "784", "on": "1"},
+        20.0,
+    )
+
+    final = _dimmer(intensity="784", intensity_timestamp=2001)
+    del final.variables["on"]
+    await bus.emit(final)
+    state = _states(mqtt)[-1]
+    assert state["state"] == "ON"
+    assert state["wired_write_status"] == "observed"
+    await _shutdown_feedback(bridge)
+
+
 async def test_postissue_contradiction_is_not_fenced_by_later_capture() -> None:
     bus, mqtt, bridge = await _bridged(_dimmer())
     await mqtt.inject(SET_TOPIC, '{"state":"ON","brightness":200}')
@@ -463,9 +492,10 @@ class _FirstWriteBlockedBus(FakeBus):
         return result
 
 
-class _BlockingStateMqtt(FakeMqtt):
-    def __init__(self) -> None:
+class _BlockingPublishMqtt(FakeMqtt):
+    def __init__(self, topic_suffix: str) -> None:
         super().__init__()
+        self.topic_suffix = topic_suffix
         self.armed = False
         self.blocked = asyncio.Event()
         self.release = asyncio.Event()
@@ -477,10 +507,39 @@ class _BlockingStateMqtt(FakeMqtt):
         retain: bool = False,
         qos: int = 0,
     ) -> None:
-        if self.armed and topic == STATE_TOPIC and not self.blocked.is_set():
+        if self.armed and topic.endswith(self.topic_suffix) and not self.blocked.is_set():
             self.blocked.set()
             await self.release.wait()
         await super().publish(topic, payload, retain, qos)
+
+
+@pytest.mark.parametrize(
+    ("old_on", "new_on", "command_state"),
+    [("0", "1", "ON"), ("1", "0", "OFF")],
+)
+async def test_reconcile_rebuilds_wired_state_after_discovery_await(
+    old_on: str,
+    new_on: str,
+    command_state: str,
+) -> None:
+    mqtt = _BlockingPublishMqtt("/config")
+    bus, _mqtt, bridge = await _bridged(_dimmer(on=old_on), mqtt=mqtt)
+    mqtt.armed = True
+
+    reconcile = asyncio.create_task(bridge.reconcile())
+    await mqtt.blocked.wait()
+    await mqtt.inject(
+        SET_TOPIC,
+        json.dumps({"state": command_state, "brightness": 85}),
+    )
+    await bus.emit(_dimmer(on=new_on, on_timestamp=2000))
+    mqtt.release.set()
+    await reconcile
+
+    state = _states(mqtt)[-1]
+    assert state["state"] == command_state
+    assert state["wired_write_status"] == "observed"
+    await _shutdown_feedback(bridge)
 
 
 async def test_obsolete_command_completion_cannot_revive_older_projection() -> None:
@@ -500,7 +559,7 @@ async def test_obsolete_command_completion_cannot_revive_older_projection() -> N
 
 
 async def test_new_request_cancels_blocked_older_feedback_publish() -> None:
-    mqtt = _BlockingStateMqtt()
+    mqtt = _BlockingPublishMqtt("/state")
     _bus, _mqtt, bridge = await _bridged(_dimmer(), mqtt=mqtt)
     mqtt.armed = True
 
@@ -517,7 +576,7 @@ async def test_new_request_cancels_blocked_older_feedback_publish() -> None:
 
 
 async def test_contradiction_invalidates_blocked_provisional_publish() -> None:
-    mqtt = _BlockingStateMqtt()
+    mqtt = _BlockingPublishMqtt("/state")
     bus, _mqtt, bridge = await _bridged(_dimmer(), mqtt=mqtt)
     mqtt.armed = True
 
@@ -534,7 +593,7 @@ async def test_contradiction_invalidates_blocked_provisional_publish() -> None:
 
 
 async def test_expiry_invalidates_blocked_provisional_publish() -> None:
-    mqtt = _BlockingStateMqtt()
+    mqtt = _BlockingPublishMqtt("/state")
     sleeper = FakeSleeper()
     clock = FakeClock()
     _bus, _mqtt, bridge = await _bridged(
@@ -559,7 +618,7 @@ async def test_expiry_invalidates_blocked_provisional_publish() -> None:
 
 
 async def test_resolution_invalidates_blocked_provisional_publish() -> None:
-    mqtt = _BlockingStateMqtt()
+    mqtt = _BlockingPublishMqtt("/state")
     bus, _mqtt, bridge = await _bridged(_dimmer(), mqtt=mqtt)
     mqtt.armed = True
 
@@ -576,7 +635,7 @@ async def test_resolution_invalidates_blocked_provisional_publish() -> None:
 
 
 async def test_preissue_native_publish_rechecks_projection_after_await() -> None:
-    mqtt = _BlockingStateMqtt()
+    mqtt = _BlockingPublishMqtt("/state")
     bus, _mqtt, bridge = await _bridged(_dimmer(), mqtt=mqtt)
     mqtt.armed = True
 
@@ -670,6 +729,70 @@ class _CancelledBus(FakeBus):
         ticket: AdmissionTicket | None = None,
     ) -> str:
         raise WriteCancelled
+
+
+class _ReplacementOutcomeBus(FakeBus):
+    def __init__(self, devices: list[BrilliantDevice], outcome: str) -> None:
+        super().__init__(devices)
+        self.outcome = outcome
+
+    async def set_variables(
+        self,
+        device_id: str,
+        peripheral_id: str,
+        sets: list[VarSet],
+        *,
+        write_class: WriteClass = WriteClass.INTERACTIVE_FIFO,
+        ticket: AdmissionTicket | None = None,
+    ) -> str:
+        if not self.commands:
+            return await super().set_variables(
+                device_id,
+                peripheral_id,
+                sets,
+                write_class=write_class,
+                ticket=ticket,
+            )
+        if ticket is not None:
+            ticket.mark_issued(self._next_provenance())
+        if self.outcome == "failed":
+            raise RuntimeError("replacement failed")
+        if self.outcome == "cancelled":
+            raise WriteCancelled
+        return cast(str, Superseded())
+
+
+@pytest.mark.parametrize("outcome", ["failed", "cancelled", "superseded"])
+async def test_unsuccessful_replacement_retires_prior_projection_to_native(
+    outcome: str,
+) -> None:
+    clock = FakeClock()
+    sleeper = FakeSleeper()
+    bus = _ReplacementOutcomeBus([_dimmer()], outcome)
+    _bus, mqtt, bridge = await _bridged(
+        _dimmer(),
+        bus=bus,
+        wall_clock=clock,
+        sleeper=sleeper,
+    )
+    await mqtt.inject(SET_TOPIC, '{"state":"ON","brightness":85}')
+
+    if outcome == "failed":
+        with pytest.raises(RuntimeError, match="replacement failed"):
+            await mqtt.inject(SET_TOPIC, '{"state":"ON","brightness":200}')
+    elif outcome == "cancelled":
+        with pytest.raises(asyncio.CancelledError):
+            await mqtt.inject(SET_TOPIC, '{"state":"ON","brightness":200}')
+    else:
+        await mqtt.inject(SET_TOPIC, '{"state":"ON","brightness":200}')
+    clock.advance(25.0)
+    await sleeper.release_all()
+
+    state = _states(mqtt)[-1]
+    assert state["state"] == "OFF"
+    assert state["brightness"] == 85
+    _assert_feedback(state, "unconfirmed", {}, None)
+    await _shutdown_feedback(bridge)
 
 
 @pytest.mark.parametrize("bus_type", [_SupersededBus, _CancelledBus])
