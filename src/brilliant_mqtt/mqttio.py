@@ -390,7 +390,7 @@ class _TopicDispatcher:
         worker: asyncio.Task[None],
     ) -> None:
         error = None if worker.cancelled() else worker.exception()
-        if self._workers.get(lane) is not worker or self._closing:
+        if self._workers.get(lane) is not worker:
             if error is not None:
                 failure_type, failure_frames = _worker_failure_metadata(error)
                 logger.error(
@@ -400,9 +400,23 @@ class _TopicDispatcher:
                     failure_frames,
                 )
             return
+        if self._closing:
+            if error is not None:
+                failure_type, failure_frames = _worker_failure_metadata(error)
+                logger.error(
+                    "MQTT command lane worker failed during teardown (type=%s; frames=%s)",
+                    failure_type,
+                    failure_frames,
+                )
+            closure = asyncio.create_task(
+                self._close_completed_worker(lane, queue, worker, cooldown=False),
+                name="brilliant-mqtt-command-lane-closure",
+            )
+            self._recoveries[lane] = closure
+            return
         if worker.cancelled():
             closure = asyncio.create_task(
-                self._close_cancelled_worker(lane, queue, worker),
+                self._close_completed_worker(lane, queue, worker, cooldown=True),
                 name="brilliant-mqtt-command-lane-closure",
             )
             self._recoveries[lane] = closure
@@ -447,17 +461,19 @@ class _TopicDispatcher:
             )
         return await queue.discard_pending()
 
-    async def _close_cancelled_worker(
+    async def _close_completed_worker(
         self,
         lane: str,
         queue: _LaneQueue,
         worker: asyncio.Task[None],
+        *,
+        cooldown: bool,
     ) -> None:
         try:
-            if self._closing:
+            if cooldown and self._closing:
                 return
-            discarded = await self._close_lane(lane, queue, worker, cooldown=True)
-            if discarded is not None:
+            discarded = await self._close_lane(lane, queue, worker, cooldown=cooldown)
+            if cooldown and discarded is not None:
                 logger.error(
                     "MQTT command lane worker cancelled outside teardown; "
                     "%d admitted commands discarded and lane closed for cooldown",

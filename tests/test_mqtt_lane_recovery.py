@@ -503,6 +503,7 @@ async def test_worker_death_logs_sanitized_type_and_location(
 
 
 async def test_worker_death_during_drain_logs_sanitized_metadata(
+    monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     started = asyncio.Event()
@@ -517,13 +518,30 @@ async def test_worker_death_during_drain_logs_sanitized_metadata(
     caplog.set_level(logging.ERROR, logger="brilliant_mqtt.mqttio")
     await dispatcher.dispatch(_message("fatal"), latest_wins=False)
     await asyncio.wait_for(started.wait(), timeout=0.2)
+    await dispatcher.dispatch(_message("pending"), latest_wins=False)
+    queue = dispatcher._queues[mqttio._command_lane_key(_PRIVATE_TOPIC)]
+    assert len(queue._pending) == 1
+    assert mqttio._SHUTDOWN_DRAIN_DEADLINE_S == 5.0
+    draining = asyncio.Event()
+    join = queue.join
+
+    async def observed_join() -> None:
+        draining.set()
+        await join()
+
+    monkeypatch.setattr(queue, "join", observed_join)
     shutdown = asyncio.create_task(dispatcher.shutdown())
-    await _turns()
+    await asyncio.wait_for(draining.wait(), timeout=0.2)
     assert dispatcher._closing
 
+    before_release = asyncio.get_running_loop().time()
     release.set()
-    await asyncio.wait_for(shutdown, timeout=0.2)
+    await shutdown
+    elapsed = asyncio.get_running_loop().time() - before_release
 
+    assert elapsed < 0.5
+    assert queue.unfinished_tasks == 0
+    assert list(queue._pending) == []
     assert "MQTT command lane worker failed during teardown" in caplog.text
     assert "type=RuntimeError" in caplog.text
     assert "failing_handler" in caplog.text
@@ -622,7 +640,6 @@ async def test_cancelled_worker_closes_saturated_lane_and_releases_reader(
     caplog.set_level(logging.ERROR, logger="brilliant_mqtt.mqttio")
     reader = asyncio.create_task(adapter._read_loop())
     lane = mqttio._command_lane_key(_PRIVATE_TOPIC)
-    queue: _LaneQueue | None = None
     try:
         await asyncio.wait_for(started.wait(), timeout=0.2)
         queue = dispatcher._queues[lane]
@@ -653,8 +670,6 @@ async def test_cancelled_worker_closes_saturated_lane_and_releases_reader(
         assert "private-panel" not in caplog.text
     finally:
         finish.set()
-        if queue is not None and queue.unfinished_tasks:
-            await queue.discard_pending()
         reader.cancel()
         await asyncio.gather(reader, return_exceptions=True)
         await dispatcher.shutdown()
