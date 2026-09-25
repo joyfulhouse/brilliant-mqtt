@@ -479,6 +479,11 @@ class _TopicDispatcher:
                     "%d admitted commands discarded and lane closed for cooldown",
                     discarded,
                 )
+            elif discarded:
+                logger.warning(
+                    "MQTT command lane discarded %d admitted commands during teardown",
+                    discarded,
+                )
         finally:
             closure = asyncio.current_task()
             if self._recoveries.get(lane) is closure:

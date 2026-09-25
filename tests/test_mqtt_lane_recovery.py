@@ -36,6 +36,18 @@ async def _turns(count: int = 10) -> None:
         await asyncio.sleep(0)
 
 
+def _observe_join(monkeypatch: pytest.MonkeyPatch, queue: _LaneQueue) -> asyncio.Event:
+    draining = asyncio.Event()
+    join = queue.join
+
+    async def observed_join() -> None:
+        draining.set()
+        await join()
+
+    monkeypatch.setattr(queue, "join", observed_join)
+    return draining
+
+
 def _reader_adapter(
     messages: AsyncIterator[SimpleNamespace], dispatcher: _TopicDispatcher
 ) -> AioMqttAdapter:
@@ -522,14 +534,7 @@ async def test_worker_death_during_drain_logs_sanitized_metadata(
     queue = dispatcher._queues[mqttio._command_lane_key(_PRIVATE_TOPIC)]
     assert len(queue._pending) == 1
     assert mqttio._SHUTDOWN_DRAIN_DEADLINE_S == 5.0
-    draining = asyncio.Event()
-    join = queue.join
-
-    async def observed_join() -> None:
-        draining.set()
-        await join()
-
-    monkeypatch.setattr(queue, "join", observed_join)
+    draining = _observe_join(monkeypatch, queue)
     shutdown = asyncio.create_task(dispatcher.shutdown())
     await asyncio.wait_for(draining.wait(), timeout=0.2)
     assert dispatcher._closing
@@ -547,6 +552,57 @@ async def test_worker_death_during_drain_logs_sanitized_metadata(
     assert "failing_handler" in caplog.text
     assert _PRIVATE_PAYLOAD not in caplog.text
     assert all(record.exc_info is None for record in caplog.records)
+
+
+async def test_cancelled_worker_during_drain_logs_discarded_pending_work(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    started = asyncio.Event()
+
+    async def handler(message: _InboundMessage) -> None:
+        if message.payload == _PRIVATE_PAYLOAD:
+            started.set()
+            await asyncio.Future()
+
+    dispatcher = _TopicDispatcher(handler)
+    await dispatcher.dispatch(_message(_PRIVATE_PAYLOAD), latest_wins=False)
+    await asyncio.wait_for(started.wait(), timeout=0.2)
+    await dispatcher.dispatch(_message("pending-1", topic=_BUTTON_TOPIC), latest_wins=False)
+    await dispatcher.dispatch(_message("pending-2", topic=_BUTTON_TOPIC), latest_wins=False)
+    lane = mqttio._command_lane_key(_PRIVATE_TOPIC)
+    queue = dispatcher._queues[lane]
+    worker = dispatcher._workers[lane]
+    assert len(queue._pending) == 2
+    assert mqttio._SHUTDOWN_DRAIN_DEADLINE_S == 5.0
+    draining = _observe_join(monkeypatch, queue)
+    caplog.set_level(logging.WARNING, logger="brilliant_mqtt.mqttio")
+    shutdown = asyncio.create_task(dispatcher.shutdown())
+    await asyncio.wait_for(draining.wait(), timeout=0.2)
+
+    before_cancel = asyncio.get_running_loop().time()
+    worker.cancel()
+    await asyncio.gather(worker, return_exceptions=True)
+    await shutdown
+    elapsed = asyncio.get_running_loop().time() - before_cancel
+
+    disposition_records = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("MQTT command lane discarded")
+    ]
+    assert disposition_records == [
+        "MQTT command lane discarded 2 admitted commands during teardown"
+    ]
+    assert worker.cancelled()
+    assert elapsed < 0.5
+    assert queue.unfinished_tasks == 0
+    assert list(queue._pending) == []
+    assert dispatcher._workers == {}
+    assert dispatcher._recoveries == {}
+    assert dispatcher._closed_lanes == {}
+    assert _PRIVATE_PAYLOAD not in caplog.text
+    assert "private-panel" not in caplog.text
 
 
 async def test_post_shutdown_straggler_exception_is_retrieved_and_sanitized(
