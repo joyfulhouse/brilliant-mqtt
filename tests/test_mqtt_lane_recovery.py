@@ -225,6 +225,16 @@ class _DeadPrivateLaneDispatcher(_TopicDispatcher):
         await super()._run_worker(lane, queue)
 
 
+class _FiveDeathsDispatcher(_TopicDispatcher):
+    _deaths_remaining = 5
+
+    async def _run_worker(self, lane: str, queue: _LaneQueue) -> None:
+        if lane == mqttio._command_lane_key(_PRIVATE_TOPIC) and self._deaths_remaining:
+            self._deaths_remaining -= 1
+            raise RuntimeError(_PRIVATE_PAYLOAD)
+        await super()._run_worker(lane, queue)
+
+
 async def test_reader_progresses_after_dead_lane_saturates(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -285,13 +295,97 @@ async def test_reader_progresses_after_dead_lane_saturates(
         assert mqttio._command_lane_key(_PRIVATE_TOPIC) not in dispatcher._workers
         assert "MQTT command lane recovery exhausted" in caplog.text
         assert "8 admitted commands discarded" in caplog.text
-        assert "future commands rejected until reconnect" in caplog.text
+        assert "future commands rejected during cooldown" in caplog.text
         assert _PRIVATE_PAYLOAD not in caplog.text
         assert "private-panel" not in caplog.text
     finally:
         finish.set()
         reader.cancel()
         await asyncio.gather(reader, return_exceptions=True)
+
+
+async def test_closed_lane_rejection_logs_once_and_settles(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    restart = _ExhaustionGate()
+    dispatcher = _AlwaysDeadDispatcher(lambda _message: asyncio.sleep(0), restart_sleep=restart)
+    caplog.set_level(logging.WARNING, logger="brilliant_mqtt.mqttio")
+    try:
+        await dispatcher.dispatch(_message("pending"), latest_wins=False)
+        await asyncio.wait_for(restart.entered.wait(), timeout=0.2)
+        restart.release.set()
+        lane = mqttio._command_lane_key(_PRIVATE_TOPIC)
+        for _ in range(20):
+            if lane not in dispatcher._workers:
+                break
+            await asyncio.sleep(0)
+        assert lane not in dispatcher._workers
+        queue = dispatcher._queues[lane]
+
+        for index in range(3):
+            await dispatcher.dispatch(_message(f"rejected-{index}"), latest_wins=False)
+
+        assert queue.unfinished_tasks == 0
+        assert list(queue._pending) == []
+        assert caplog.text.count("MQTT command rejected during lane recovery cooldown") == 1
+        assert "further rejection logs suppressed" in caplog.text
+        assert _PRIVATE_PAYLOAD not in caplog.text
+        assert "private-panel" not in caplog.text
+    finally:
+        restart.release.set()
+        await dispatcher.shutdown()
+
+
+async def test_closed_lane_reopens_after_cooldown(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(mqttio, "_LANE_REOPEN_COOLDOWN_S", 0.01)
+    restart = _ExhaustionGate()
+    handled = asyncio.Event()
+    seen: list[str] = []
+
+    async def handler(message: _InboundMessage) -> None:
+        seen.append(message.payload)
+        handled.set()
+
+    dispatcher = _FiveDeathsDispatcher(handler, restart_sleep=restart)
+    caplog.set_level(logging.INFO, logger="brilliant_mqtt.mqttio")
+    try:
+        await dispatcher.dispatch(_message("pending"), latest_wins=False)
+        await asyncio.wait_for(restart.entered.wait(), timeout=0.2)
+        restart.release.set()
+        lane = mqttio._command_lane_key(_PRIVATE_TOPIC)
+        for _ in range(20):
+            if lane not in dispatcher._workers:
+                break
+            await asyncio.sleep(0)
+        assert lane not in dispatcher._workers
+        assert lane not in dispatcher._recoveries
+        closed_queue = dispatcher._queues[lane]
+
+        await dispatcher.dispatch(_message("too-soon"), latest_wins=False)
+        assert not handled.is_set()
+        await asyncio.sleep(0.02)
+        await dispatcher.dispatch(_message("after-cooldown"), latest_wins=False)
+        await asyncio.wait_for(handled.wait(), timeout=0.2)
+        await asyncio.wait_for(dispatcher._queues[lane].join(), timeout=0.2)
+
+        assert seen == ["after-cooldown"]
+        assert dispatcher._queues[lane] is not closed_queue
+        assert lane in dispatcher._workers
+        assert lane not in dispatcher._recoveries
+        assert "MQTT command lane reopened after recovery cooldown" in caplog.text
+        assert "rejected commands while closed: 1" in caplog.text
+
+        await dispatcher.shutdown()
+        await asyncio.sleep(0.02)
+        await dispatcher.dispatch(_message("after-shutdown"), latest_wins=False)
+        assert seen == ["after-cooldown"]
+        assert dispatcher._workers == {}
+        assert dispatcher._recoveries == {}
+    finally:
+        await dispatcher.shutdown()
 
 
 async def test_shutdown_during_restart_backoff_never_resurrects_lane(

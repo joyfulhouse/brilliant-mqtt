@@ -65,6 +65,7 @@ _SHUTDOWN_WORKER_SETTLE_S = 1.0
 _LANE_RESTART_BASE_DELAY_S = 0.1
 _LANE_RESTART_MAX_DELAY_S = 0.5
 _LANE_RESTART_MAX_FAILURES = 5
+_LANE_REOPEN_COOLDOWN_S = 30.0
 _NUMBER_AUX_VARS = frozenset(
     spec.var for specs in AUX_SPECS.values() for spec in specs if spec.component == "number"
 )
@@ -85,6 +86,12 @@ class _InboundMessage:
     retained: bool
     command_cbs: tuple[Callable[[str, str], Awaitable[None]], ...]
     message_cbs: tuple[Callable[[str, str, bool], Awaitable[None]], ...]
+
+
+@dataclass(slots=True)
+class _ClosedLaneState:
+    reopen_at: float
+    rejected: int = 0
 
 
 class _LaneQueue:
@@ -190,6 +197,7 @@ class _TopicDispatcher:
         self._workers: dict[str, asyncio.Task[None]] = {}
         self._recoveries: dict[str, asyncio.Task[None]] = {}
         self._worker_failures: dict[str, int] = {}
+        self._closed_lanes: dict[str, _ClosedLaneState] = {}
         self._active: dict[str, tuple[_InboundMessage, CommandAdmission]] = {}
         self._folded: dict[str, _InboundMessage] = {}
         self._closing = False
@@ -204,6 +212,23 @@ class _TopicDispatcher:
             return
         lane = _command_lane_key(message.topic)
         queue = self._queues.get(lane)
+        closed = self._closed_lanes.get(lane)
+        if (
+            closed is not None
+            and asyncio.get_running_loop().time() >= closed.reopen_at
+            and lane not in self._workers
+            and lane not in self._recoveries
+        ):
+            self._closed_lanes.pop(lane, None)
+            self._worker_failures.pop(lane, None)
+            queue = _LaneQueue(maxsize=_TOPIC_QUEUE_MAXSIZE, diagnostics=self._diagnostics)
+            self._queues[lane] = queue
+            self._start_worker(lane, queue)
+            logger.info(
+                "MQTT command lane reopened after recovery cooldown "
+                "(rejected commands while closed: %d)",
+                closed.rejected,
+            )
         if queue is None:
             queue = _LaneQueue(maxsize=_TOPIC_QUEUE_MAXSIZE, diagnostics=self._diagnostics)
             self._queues[lane] = queue
@@ -228,7 +253,19 @@ class _TopicDispatcher:
                 if folded:
                     self._folded[lane] = message
                     return
-        await queue.put(message, latest_wins=latest_wins)
+        accepted = await queue.put(message, latest_wins=latest_wins)
+        if accepted:
+            return
+        closed = self._closed_lanes.get(lane)
+        if closed is None:
+            return
+        closed.rejected += 1
+        if closed.rejected == 1:
+            logger.warning(
+                "MQTT command rejected during lane recovery cooldown "
+                "(rejected commands: %d; further rejection logs suppressed)",
+                closed.rejected,
+            )
 
     async def shutdown(self) -> None:
         """Drain accepted messages, then cancel and forget the idle workers."""
@@ -295,6 +332,7 @@ class _TopicDispatcher:
             self._workers.clear()
             self._queues.clear()
             self._worker_failures.clear()
+            self._closed_lanes.clear()
 
     def _start_worker(self, lane: str, queue: _LaneQueue) -> None:
         worker = asyncio.create_task(
@@ -346,13 +384,18 @@ class _TopicDispatcher:
             if self._closing or self._workers.get(lane) is not dead_worker:
                 return
             if failures >= _LANE_RESTART_MAX_FAILURES:
-                discarded = await queue.discard_pending()
                 self._workers.pop(lane, None)
+                self._closed_lanes[lane] = _ClosedLaneState(
+                    reopen_at=asyncio.get_running_loop().time() + _LANE_REOPEN_COOLDOWN_S
+                )
+                discarded = await queue.discard_pending()
                 logger.error(
                     "MQTT command lane recovery exhausted after %d consecutive worker deaths; "
-                    "%d admitted commands discarded and future commands rejected until reconnect",
+                    "%d admitted commands discarded and future commands rejected during cooldown "
+                    "(%.0fs)",
                     failures,
                     discarded,
+                    _LANE_REOPEN_COOLDOWN_S,
                 )
                 return
             self._start_worker(lane, queue)
