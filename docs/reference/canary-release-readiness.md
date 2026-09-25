@@ -1,381 +1,321 @@
 # Single-panel canary release readiness
 
-This runbook decides whether the single-panel **software** canary for the
-responsiveness work merged in
-[#156](https://github.com/joyfulhouse/brilliant-mqtt/pull/156),
-[#158](https://github.com/joyfulhouse/brilliant-mqtt/pull/158), and
-[#163](https://github.com/joyfulhouse/brilliant-mqtt/pull/163) may start. It
-extends the existing [deployment parity and soak procedure](deployment.md#roll-out-order)
-and [validation evidence levels](../brilliant-panel/validation-runbook.md#evidence-levels);
-it does not replace either one.
+Use this runbook to qualify the final responsiveness release on one designated
+panel before fleet rollout. It complements the [deployment procedure](deployment.md),
+[validation evidence levels](../brilliant-panel/validation-runbook.md#evidence-levels),
+and [retained rollback procedure](../canary-rollback.md).
 
-This is not a fleet release or permission to operate arbitrary loads. The
-qualification is limited to software health and deterministic idempotent,
-single-field write behavior. An MQTT or bus acknowledgement does not prove
-physical actuation, and this canary makes no physical slider-latency claim.
+A software-health soak, a reported Home Assistant state change, and a physically
+observed light response are different measurements. Record each separately. A
+bus acknowledgement or a retained MQTT `online` message does not establish
+physical actuation or native panel-slider responsiveness.
 
-## Candidate identity and provenance
+## Candidate scope and identity
 
-The candidate identity is the tuple:
+Do not deploy the old `e4ae3176` documentation candidate or select a checkout by
+its branch name or `0.10.2` label. Several byte-distinct candidates used that
+version. Record the exact final commit, version, release ordinal, integration
+manifest and payload manifest in the deployment evidence for each attempt.
 
-- commit `e4ae3176b605f5f7ac8e971823ec47ba506af1b8`; and
-- SHA-256 digest
-  `20763b35a4ed6f2d45a74f9c48b11ae913a9b2b73e5866060216955f660b6cb6`
-  of the sorted `payload-release` path/hash manifest.
+The release must include these independently reviewed changes:
 
-The payload `VERSION` is `0.10.2`, but that label is necessary and not
-sufficient: several byte-distinct revisions can share it. Reproduce and record
-the identity from a qualified repository checkout:
+| Change | Tracking | Qualification consequence |
+| --- | --- | --- |
+| Pending mesh feedback and interactive scheduling | #156, #158, #163 | Distinguish pending intent from observed state; preserve one native writer per target |
+| Bounded response diagnostics | #157 / #152 | Measure queue wait, native RPC duration, timeouts and session rebuilds; diagnostics are included in current main |
+| Identity admission and retained rollback | #168 / #165 / #166 | Require guarded updates and a complete named predecessor baseline throughout soak |
+| Partial command preservation | #170 / #159 | Include partial and overlapping fields in the final correctness tests |
+| Dead lane recovery and fold evidence | #160, #161 | Verify bounded worker recovery, independent lane progress and observable failed folds |
+
+PR links and passing checks are not proof that a candidate contains those
+changes. Inspect the final commit's ancestry and source, regenerate its payload,
+and verify both runtime gates on the actual combined tree. Resolve outstanding
+reviews before declaring the candidate ready. #162's earlier branch conflict is
+historical; it is not a reason to exclude diagnostics from the final release.
+
+Use an isolated clean checkout. Never deploy an operator's dirty development
+checkout. From the selected committed candidate:
 
 ```bash
-git checkout --detach e4ae3176b605f5f7ac8e971823ec47ba506af1b8
+set -e
+umask 0022
+git rev-parse HEAD
 scripts/build_payload.sh
 git diff --exit-code -- custom_components/brilliant_mqtt/agent_payload
+test -z "$(git ls-files --others --exclude-standard -- custom_components/brilliant_mqtt/agent_payload)"
+test -z "$(git ls-files --others --ignored --exclude-standard -- custom_components/brilliant_mqtt/agent_payload)"
 
 candidate_manifest=artifacts/canary/candidate-payload.sha256
 mkdir -p "$(dirname "$candidate_manifest")"
 uv run python scripts/brilliant-panel/bundle_manifest.py payload-release \
   custom_components/brilliant_mqtt/agent_payload > "$candidate_manifest"
 sha256sum "$candidate_manifest"
-# Record and compare with: <recorded-64-hex-manifest-digest>
 ```
 
-The build script creates the committed mirror from source and writes its
-version ([`build_payload.sh` lines 9-13 and 69-70](../../scripts/build_payload.sh#L9)).
-CI rebuilds it and requires a clean diff plus no untracked or ignored mirror
-files ([`ci.yml` lines 16-22](../../.github/workflows/ci.yml#L16)); release CI
-does the same and puts that mirror in the shipped HACS zip
-([`release.yml` lines 28-36](../../.github/workflows/release.yml#L28)). The
-manifest helper hashes required release files, adds normalized installed-file
-aliases, and emits sorted path/hash rows
-([`bundle_manifest.py` lines 329-356](../../scripts/brilliant-panel/bundle_manifest.py#L329),
-[`bundle_manifest.py` line 484](../../scripts/brilliant-panel/bundle_manifest.py#L484)).
-Thus checkout -> rebuild -> clean mirror diff -> manifest digest proves
-commit-to-bytes independently of the zip checksum and `VERSION` label.
+Record the output instead of copying a digest from this document. The
+[payload builder](../../scripts/build_payload.sh), [manifest helper](../../scripts/brilliant-panel/bundle_manifest.py),
+[CI](../../.github/workflows/ci.yml), and [release workflow](../../.github/workflows/release.yml)
+define commit-to-bundle parity. A new release needs a distinct semantic version
+and the reviewed next release ordinal; neither replaces digest verification.
 
-No new provenance file is needed. The existing manifest distinguishes bytes
-that share `0.10.2`. Embedding the enclosing Git SHA in the committed generated
-mirror would be circular: changing the embedded SHA changes the commit, and the
-mirror could not both name its enclosing commit and remain clean under the CI
-diff gate.
+## Guarded deployment and installed parity
 
-## Supported upgrade and exact parity
+Use the integration's supported, journaled update or onboarding/migration path.
+The shared [release identity policy](../../custom_components/brilliant_mqtt/release_identity.py)
+admits equal code without changing selection, or different code with a strictly
+newer known ordinal. Unknown, equal-ordinal or older differing code requires an
+explicitly reviewed, bound, single-operation override. Never configure an
+override for automatic repair or bypass an identity refusal with a manual copy.
 
-Use only the journaled panel provisioner for this canary. It detects an absent,
-legacy fixed, or release-link layout
-([`panel_ops.py` lines 376-405](../../custom_components/brilliant_mqtt/panel_ops.py#L376)),
-captures the prior snapshot before staging
-([`panel_provisioner.py` lines 991-1067](../../custom_components/brilliant_mqtt/panel_provisioner.py#L991)),
-stages an immutable `releases/<version>--<UUID>` tree
-([`panel_ops.py` lines 862-887](../../custom_components/brilliant_mqtt/panel_ops.py#L862)),
-then stops the owned services and atomically switches `current` before
-restarting them
-([`panel_ops.py` lines 1074-1117](../../custom_components/brilliant_mqtt/panel_ops.py#L1074),
-[`panel_ops.py` lines 1159-1214](../../custom_components/brilliant_mqtt/panel_ops.py#L1159)).
-Do not use the legacy manual installer or invent a parallel migration path.
+The [provisioner](../../custom_components/brilliant_mqtt/panel_provisioner.py)
+and [panel operations](../../custom_components/brilliant_mqtt/panel_ops.py)
+capture the predecessor before mutation. Keep the loaded HA integration pinned
+to the reviewed candidate throughout qualification. Avoid concurrent updates,
+credential changes or unrelated component changes during the attempt.
 
-The post-install `panel-release` gate deliberately requires `current` to select
-one direct child of `releases`; a missing directory/link fails with exit 2.
-There is no legacy fallback
-([`bundle_manifest.py` lines 378-416](../../scripts/brilliant-panel/bundle_manifest.py#L378),
-[`bundle_manifest.py` lines 502-514](../../scripts/brilliant-panel/bundle_manifest.py#L502)).
-Do not weaken or bypass that failure.
+Record the actual layout selected by each running service, not merely the
+existence of a `current` symlink. Supported targeted updates may preserve a
+legacy fixed layout. A surviving release selector does not prove that the unit
+executes that release.
 
-Before declaring the installed software an active canary, run the complete
-[exact-bundle parity gate](deployment.md#office-exact-bundle-parity-gate). Exact
-parity means an empty byte-for-byte diff between:
+For release-link layouts, run the complete
+[exact-bundle parity gate](deployment.md#office-exact-bundle-parity-gate): compare
+the committed payload, the integration actually loaded by HA, and the panel's
+active `panel-release` manifests. Require empty diffs. The `panel-release`
+command requires `current` to select one direct child of `releases`; its failure
+on a legacy layout must not be suppressed or relabeled as a pass.
 
-1. the `payload-release` manifest rebuilt from the pinned committed mirror;
-2. the `payload-release` manifest from the integration actually loaded by Home
-   Assistant; and
-3. the `panel-release` manifest of the release the panel actually loaded.
+For a retained legacy layout, record that the release-link gate is inapplicable
+and verify the complete selected component code digests through the supported
+identity-admission/verification path. Compare each selected bridge/watchdog
+component against the candidate, and separately verify its installed unit,
+configuration, version, resource limits and restarted process. The helper's
+`installed_identities` hashes actual service-selected trees; identity enrollment
+may write its private record. Do not describe enrollment as a read-only probe.
+A match for only `bus.py`, `mqttio.py`, or `VERSION` is useful evidence but does
+not substitute for complete component parity.
 
-The deployment gate writes these three payload manifests as
-`repository-payload.sha256`, `home-assistant-payload.sha256`, and
-`office-active-payload.sha256`. Require both payload legs to be empty using
-those exact emitted filenames:
+### Collecting legacy component evidence
+
+Run the following from the qualified candidate checkout. The SSH aliases must
+already have verified host-key pins, as in the deployment reference. Set
+`selected_components` to the reviewed selection; do not omit a failing component
+to obtain a passing comparison. The example qualifies all three core services.
+
+First run the repository and loaded-HA **integration and payload** manifest
+commands and their two comparisons from the deployment reference. Those legs
+apply to both layouts. Omit only its release-link-specific panel command and
+panel comparison for an explicitly retained legacy layout. Then collect the
+service-selected component identities with the same trusted helper used by
+`panel_ops._read_release_identities`:
 
 ```bash
-parity_evidence=artifacts/brilliant-panel/pilots/office-bundle-parity
-diff -u \
-  "$parity_evidence/repository-payload.sha256" \
-  "$parity_evidence/home-assistant-payload.sha256"
-diff -u \
-  "$parity_evidence/repository-payload.sha256" \
-  "$parity_evidence/office-active-payload.sha256"
+set -euo pipefail
+legacy_evidence=artifacts/canary/legacy-parity
+mkdir -p "$legacy_evidence"
+uv run python - "$legacy_evidence" <<'PY'
+import json
+import runpy
+import sys
+from pathlib import Path
+
+out = Path(sys.argv[1])
+helper = Path("scripts/brilliant-panel/bundle_manifest.py")
+api = runpy.run_path(str(helper), run_name="canary_identity")
+payload = Path("custom_components/brilliant_mqtt/agent_payload")
+selected_components = ("bridge", "wifi_watchdog", "bus_watchdog")
+candidate_ordinal = api["release_ordinal"](payload)
+assert type(candidate_ordinal) is int and candidate_ordinal > 0, "candidate ordinal required"
+expected = {
+    component: {
+        "digest": api["code_digest"](payload, component),
+        "version": (payload / "VERSION").read_text().strip(),
+        "release_ordinal": candidate_ordinal,
+    }
+    for component in selected_components
+}
+assert all(item["digest"] is not None for item in expected.values())
+(out / "expected.json").write_text(json.dumps(expected, sort_keys=True))
+# Match the existing integration's helper-loading convention. This source comes
+# from the qualified local checkout, never from an unverified panel helper.
+source = helper.read_text().rsplit('if __name__ == "__main__":', 1)[0]
+source += '\nidentities = installed_identities(Path("/var/brilliant-mqtt"))\n'
+source += f'selected = {selected_components!r}\n'
+source += '''print(json.dumps({
+    name: ({key: identities[name][key]
+            for key in ("digest", "version", "release_ordinal", "layout")}
+           if identities[name] is not None else None)
+    for name in selected
+}, sort_keys=True))
+'''
+(out / "collect-identities.py").write_text(source)
+PY
+
+# This can enroll/update private identity records; it does not update code.
+ssh office-qualified '/data/switch-embedded/env/bin/python3 -' \
+  < "$legacy_evidence/collect-identities.py" \
+  > "$legacy_evidence/installed.json"
+
+uv run python - "$legacy_evidence" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+expected = json.loads((root / "expected.json").read_text())
+installed = json.loads((root / "installed.json").read_text())
+assert installed.keys() == expected.keys(), "component selection differs"
+for component, wanted in expected.items():
+    actual = installed[component]
+    assert actual is not None, f"missing component: {component}"
+    assert actual["layout"] in ("legacy_fixed", "release_link")
+    assert all(actual[key] == value for key, value in wanted.items()), component
+print("Selected component identity, version and ordinal match")
+PY
 ```
 
-Use the host-key-pinned collection commands in the deployment reference rather
-than copying them here; those commands create every referenced file and also
-compare the complete integration manifests. Record the installed payload
-manifest digest and confirm it is the candidate digest above.
-`VERSION == 0.10.2` alone does not pass this gate.
+Keep the layout report as evidence, and repeat collection and comparison at the
+end of soak from the same qualified checkout. Never treat a null/unknown ordinal
+as equal to the candidate ordinal. If the compare fails, stop qualification and
+investigate the guarded deployment instead of editing the identity record.
+These component digests cover code, not the complete installed unit or mutable
+configuration: retain the provisioner's verified unit/configuration evidence and
+check the actual systemd process and resource limits separately. The collector
+prints no environment contents, credentials, deployment ID or private hostname.
 
-### Manual-update downgrade blocker
+## Retained rollback gate
 
-During candidate installation and the entire soak, **do not trigger a manual
-agent update** (the Update entity's install action or the equivalent service).
-The manual `async_update_agent` path unconditionally calls `deploy_payload`
-([`manager.py` lines 1365-1384](../../custom_components/brilliant_mqtt/manager.py#L1365),
-[`manager.py` lines 1430-1447](../../custom_components/brilliant_mqtt/manager.py#L1430));
-that function swaps the fixed legacy `/var/brilliant-mqtt/app` and `vendor`
-trees and writes the shared root `VERSION`, with no manifest guard or journaled
-rollback
-([`panel_ops.py` lines 2146-2161](../../custom_components/brilliant_mqtt/panel_ops.py#L2146),
-[`panel_ops.py` lines 2194-2210](../../custom_components/brilliant_mqtt/panel_ops.py#L2194)).
-After immutable migration it does **not** overwrite the active candidate below
-`current/`. However, the bundled bridge unit's `PYTHONPATH` still selects those
-fixed app/vendor paths
-([`brilliant-mqtt.service` lines 9-18](../../custom_components/brilliant_mqtt/agent_payload/brilliant-mqtt.service#L9)).
-The update reinstalls that unit and restarts the bridge, so the running service
-comes back on the overwritten older bytes even while `current/` remains intact;
-it also destroys the leftover legacy app/vendor tree that was the de-facto
-prior-code source. Because both bundles are labelled `0.10.2` and
-the candidate's
-[`agent_payload/VERSION`](../../custom_components/brilliant_mqtt/agent_payload/VERSION)
-confirms that label, `deploy_payload` writes `0.10.2` back to the root `VERSION`;
-version equality survives and masks the downgrade. Before migration, those
-fixed paths are already active and can be overwritten directly. This action is
-manual, not scheduled. Automatic repair probes the same fixed payload path
-([`panel_ops.py` lines 1535-1559](../../custom_components/brilliant_mqtt/panel_ops.py#L1535))
-and deploys only when that path is absent
-([`manager.py` lines 1292-1303](../../custom_components/brilliant_mqtt/manager.py#L1292));
-it does not make a later bundle change or manual update safe. Keep the loaded HA
-bundle pinned and record an operator change freeze as the temporary mitigation.
-Durable hardening is tracked in
-[#165](https://github.com/joyfulhouse/brilliant-mqtt/issues/165).
+#168 provides a named baseline retained after successful provisioning clears the
+execution journal. This mechanism replaces the earlier requirement to invent an
+export/re-arm path. Follow the [rollback runbook](../canary-rollback.md) for exact
+service targeting, recovery deadlines, restart recovery and finalization.
 
-## Complete rollback gate
+Before mutation, require a complete durable predecessor baseline. Depending on
+layout it uses a verified pinned release, a bounded private archive, or both.
+It covers prior code, configuration/CA, units, service state and selectors.
+An incomplete capture, missing predecessor code, unsupported correlation or
+insufficient storage must refuse the update.
 
-The journaled provisioner is the rollback authority. Its durable
-`StoredPanelSnapshot` covers layout, active release target, environment and
-version file content/mode, and bridge, Wi-Fi-watchdog, and bus-watchdog unit
-content/mode/enabled/active state. It also stores `selected_components`, a
-validated derivative of which of those three unit files exist, rather than an
-independently restored resource
-([`provisioning_journal.py` lines 559-618](../../custom_components/brilliant_mqtt/provisioning_journal.py#L559)).
-Rollback stops services, restores those files and modes, restores the selector,
-reloads systemd, restores each recorded service state, and re-snapshots for
-equality
-([`panel_ops.py` lines 1326-1421](../../custom_components/brilliant_mqtt/panel_ops.py#L1326)).
-The provisioner then removes the staged candidate and calls
-`async_complete_rollback(verified=True)`
-([`panel_provisioner.py` lines 1218-1258](../../custom_components/brilliant_mqtt/panel_provisioner.py#L1218));
-the journal clears only after that asserted verification
-([`provisioning_journal.py` lines 952-969](../../custom_components/brilliant_mqtt/provisioning_journal.py#L952)).
+Record the baseline name and `armed` then `soak` state in private evidence. The
+baseline has no automatic expiry. An existing retained baseline blocks another
+manual update: finish its documented qualification or recovery and explicitly
+finalize it before creating a new attempt. Never delete its record or archive
+to get past admission.
 
-Two known gaps are hard pre-activation gates under
-[#166](https://github.com/joyfulhouse/brilliant-mqtt/issues/166):
+Exercise recovery with the production recipes in the disposable filesystem and
+loopback-broker tests, including interrupted mutation and restart recovery. Then
+record the agreed live canary recovery evidence separately. Unit tests, fixture
+publishers and simulated systemd state cannot prove hardware recovery.
 
-- for the expected first legacy-to-immutable migration, the snapshot contains
-  no app/vendor bytes and has no active release target. Its rollback only
-  removes `current`; it relies on the fixed legacy app/vendor tree remaining
-  untouched
-  ([`panel_ops.py` lines 1260-1277](../../custom_components/brilliant_mqtt/panel_ops.py#L1260)).
-  Preflight must therefore explicitly retain and prove restoration of those
-  prior code bytes before any mutation; and
-- rollback must not be marked verified until a **fresh prior-version MQTT
-  health probe** succeeds. Current exact-restore tests use fakes and mocked
-  snapshots rather than an exercised panel restore, while the provisioner
-  passes `verified=True` immediately after restore and cleanup without that
-  probe
-  ([`test_panel_ops.py` lines 3543-3561](../../ha/tests/test_panel_ops.py#L3543),
-  [`panel_provisioner.py` lines 1243-1257](../../custom_components/brilliant_mqtt/panel_provisioner.py#L1243)).
+A successful named rollback requires exact predecessor restoration, followed by
+fresh MQTT evidence correlated to a new recovery deployment ID. Allow up to
+300 seconds overall, including a 90-second MQTT verification window. The live
+deployment-correlation environment field intentionally changes; this exception
+prevents stale messages from certifying recovery. Verify the retained state is
+`restored`, inspect actual service/code identity, and record recovery time.
 
-A successful provisioning commit clears the journal
-([`provisioning_journal.py` lines 915-938](../../custom_components/brilliant_mqtt/provisioning_journal.py#L915)).
-The journal API has no export, import, or re-arm operation
-([`provisioning_journal.py` lines 861-969](../../custom_components/brilliant_mqtt/provisioning_journal.py#L861));
-after commit, the journaled rollback path therefore has no snapshot to execute.
-#166 must define and prove a **named** retention-and-restore mechanism that
-preserves the complete snapshot plus the prior legacy app/vendor bytes and can
-reinstate them into a supported executable rollback path. No such mechanism is
-currently defined, and an external Home Assistant backup is only an operator
-precaution, not this canary gate
-([`deployment.md` lines 241-257](deployment.md#L241)). Until that mechanism
-exists, rollback is unavailable during the post-commit soak.
+Keep the baseline callable through the entire soak. Finalize only after the
+qualification decision and recovery/signoff; finalization purges retained
+credential-bearing material and is not a harmless status reset. #169 tracks the
+ownerless-restored finalization edge case; an affected attempt needs explicit
+operator reauthorization, not deletion or long-term credential retention.
 
-Effects outside the core snapshot are forward-only; this list is
-non-exhaustive. Candidate-published retained MQTT topics and the on-panel
-owned-topics ledger can remain
-([`const.py` lines 178-190](../../custom_components/brilliant_mqtt/const.py#L178)),
-as can Home Assistant entity **and device** registry state
-([`__init__.py` lines 249-269](../../custom_components/brilliant_mqtt/__init__.py#L249)),
-the hue-ca, voice, and retired HA-mirror subsystems
-([`const.py` lines 195-229](../../custom_components/brilliant_mqtt/const.py#L195)),
-and the retained mesh-leader claim
-([`mesh_leader.py` lines 203-208](../../src/brilliant_mqtt/mesh_leader.py#L203)).
-The panel's OSTree firmware is not rolled back either. Inspect and reconcile
-these separately; never claim this application rollback reversed them.
+## Responsiveness qualification
 
-### Required restore rehearsal
+Use only designated, authorized test loads, record their starting state, and
+restore that state after testing. Follow the
+[write/restore protocol](../brilliant-panel/validation-runbook.md#5-scalar-writerestore-protocol).
+Set the acceptable response-time and reliability thresholds before testing;
+report measured results even when they miss those thresholds.
 
-Before the candidate is allowed onto the designated panel, exercise the same
-journaled path against a safe representative installation and retain sanitized
-evidence that all of these pass:
+Collect a bounded, timestamped trace for:
 
-1. restore a first-migration legacy app/vendor tree after deliberately removing
-   the prior code bytes, using the named retained snapshot-and-bytes mechanism,
-   with exact manifest, file-mode, selector, and service-state proof;
-2. interrupt at a documented post-mutation crash cut point, restart recovery,
-   and prove it converges to the complete prior state without a partial layout;
-3. measure a fresh prior-version MQTT offline -> online transition and health
-   publication within 90 seconds after rollback; record elapsed time and prior
-   byte identity, not raw topics, logs, or private host data;
-4. prove the candidate staging/release is cleaned, the journal reaches its
-   verified terminal behavior, and no persistent rollback repair remains; and
-5. repeat the recovery invocation or equivalent read-only audit to demonstrate
-   idempotence, then prove the named mechanism can reinstate the snapshot and
-   prior bytes throughout a one-day-or-longer post-commit soak.
+1. Sequential ON/OFF and brightness commands, including brightness zero.
+2. A rapid slider-like burst with the final requested value recorded. Verify the
+   final observed state, intermediate contradictions and time from the last
+   request to that state. Do not count API acceptance as completion.
+3. Partial and overlapping state/brightness payloads after #159 is included.
+   Check OFF ordering and unsupported/non-idempotent barriers using deterministic
+   tests; do not issue unsupported commands to a live load as a probe.
+4. Another independent target making progress while one target is busy. Use
+   synthetic tests for lane death and cancellation; do not kill production
+   workers to reproduce #160.
+5. Physical/native-slider response when direct observation is available. Without
+   that evidence, mark physical latency unmeasured rather than inferred from HA.
 
-Passing unit tests alone does not satisfy this rehearsal.
+Compare like-for-like before/after traces where available. Distinguish panel-local
+loads from mesh loads and identify whether the state came from bridge feedback
+or a separate physical observation. Record polling resolution, requested values,
+final-state accuracy, queue wait, native RPC time, timeout/cancellation counters,
+and session-rebuild deltas from the same running process. Counter resets or
+stale retained snapshots invalidate simple subtraction.
 
-## Qualification boundaries and diagnostics
+#157 exposes bounded timing and rebuild diagnostics. #161 improves evidence when
+folding fails or pending folds are discarded. Neither proves physical actuation.
+Zero systemd restarts does not mean zero MQTT sessions or native-bus failures.
+A mean native RPC duration across maintenance and interactive writes is not an
+isolated slider-latency measurement.
 
-Existing deterministic fake tests establish narrower software behavior: only
-the newest single-field intensity value issues after a blocked bus gate, and
-supersession retains its original order ahead of another target
-([`test_bus_adapter.py` lines 682-712](../../tests/test_bus_adapter.py#L682),
-[`test_write_admission.py` lines 162-201](../../tests/test_write_admission.py#L162)).
-They do not by themselves qualify end-to-end idempotent writes. A live scalar
-write is outside this software-health claim unless separately authorized; if
-authorized, constrain it with the existing validation runbook's
-[scalar write/restore protocol](../brilliant-panel/validation-runbook.md#5-scalar-writerestore-protocol)
-and still make no physical-actuation or latency claim. Do not send mixed-field
-write traffic during qualification. The lane queue replaces a pending
-same-topic message as a whole payload
-([`mqttio.py` lines 84-111](../../src/brilliant_mqtt/mqttio.py#L84)).
-[#159](https://github.com/joyfulhouse/brilliant-mqtt/issues/159) documents the
-pre-existing latest-wins field-loss defect and blocks every multi-field
-correctness claim; a multi-field canary must wait for #159. The unreaped lane
-worker risk in [#160](https://github.com/joyfulhouse/brilliant-mqtt/issues/160)
-also remains a monitored residual.
+## Soak, abort and fleet gate
 
-Bounded response diagnostics from
-[#152](https://github.com/joyfulhouse/brilliant-mqtt/issues/152) and
-[#157](https://github.com/joyfulhouse/brilliant-mqtt/pull/157) are **excluded**
-from the candidate at `e4ae3176`; they are separate-branch work, and the
-combined-branch conflict remains tracked in
-[#162](https://github.com/joyfulhouse/brilliant-mqtt/issues/162). Consequently,
-the missing coalescing evidence described by
-[#161](https://github.com/joyfulhouse/brilliant-mqtt/issues/161) reduces soak
-observability. Do not infer an absence of folding/coalescing anomalies from an
-absence of diagnostics.
+Qualify exactly one panel for at least one day on the **final candidate bytes**.
+An earlier build's elapsed soak cannot qualify changed code. Observe process and
+session stability, actual MemoryMax/CPUQuota/Nice, memory and CPU pressure,
+command outcomes, and identity/rollback retention at the end.
 
-## Readiness and blocker matrix
+Stop qualification traffic and classify the attempt as failed or inconclusive
+if identity drifts, fresh health is absent for 90 seconds, a resource limit is
+breached, native UI behavior deteriorates, commands lose intent, final state is
+wrong, response thresholds are missed, unexpected restarts/reconnects occur, or
+rollback is no longer provable. Investigate the event and use the rehearsed
+rollback procedure when recovery is needed. Do not silently waive failures
+because retained availability remains online. A new qualification window starts
+only after the cause/disposition is recorded and the candidate remains valid.
 
-`MET` means evidence already exists for this exact candidate or the scope has
-been explicitly constrained. `BLOCKED` means the canary must not activate until
-the cited issue and operator evidence satisfy the pass criteria.
+The first six rows below are prerequisites for publication and starting rollout.
+The final two rows apply during rollout and at completion; they cannot be
+preconditions for starting the first batch:
 
-| Gate | How verified | Pass criteria | Current status |
-| --- | --- | --- | --- |
-| Candidate identity | Rebuild, clean mirror diff, hash sorted manifest ([CI parity](../../.github/workflows/ci.yml#L16)) | Commit and manifest digest equal the values above | **MET** |
-| Legacy -> immutable upgrade | Journaled snapshot/stage/atomic-select path only ([provisioner](../../custom_components/brilliant_mqtt/panel_provisioner.py#L991)) | Exercised migration explicitly retains and restores the journal snapshot plus legacy app/vendor bytes | **BLOCKED - #166 rehearsal** |
-| `panel-release` exact-release gate | Run the deployment reference's panel manifest command ([selector rules](../../scripts/brilliant-panel/bundle_manifest.py#L378)) | Exit 0 with `current -> releases/<direct-child>`; no legacy fallback | **BLOCKED - #166 must clear before migration/activation** |
-| Exact HA/panel parity | Empty candidate/loaded-HA/active-panel manifest diffs ([deployment gate](deployment.md#office-exact-bundle-parity-gate)) | Every normalized path and SHA-256 matches; installed manifest digest recorded | **BLOCKED - #166 prevents the install evidence** |
-| Exercised complete rollback | Missing-prior-legacy-bytes and crash rehearsals plus measured fresh prior MQTT health ([current mocked test](../../ha/tests/test_panel_ops.py#L3543)) | Exact snapshot and legacy-byte restore plus fresh MQTT health within 90 seconds | **BLOCKED - #166** |
-| Rollback available throughout soak | Exercise the named snapshot-and-bytes retention mechanism after journal clear ([commit clear](../../custom_components/brilliant_mqtt/provisioning_journal.py#L915)) | Named mechanism is defined, exercised, and can reinstate an executable rollback through the final post-commit soak observation | **BLOCKED - #166 / mechanism undefined** |
-| Same-version update footgun | Operator change freeze; audit that no manual update is invoked ([unguarded deploy](../../custom_components/brilliant_mqtt/panel_ops.py#L2146)) | Written do-not-update control prevents a live fixed-path downgrade and protects legacy prior bytes through install and soak | **BLOCKED - #165 until control is attested** |
-| Multi-field correctness excluded | Review traffic plan and #159; use only single-field writes ([queue replacement](../../src/brilliant_mqtt/mqttio.py#L99)) | No mixed-field traffic or claim; any future claim waits for #159 | **MET - multi-field remains blocked by #159** |
-| Diagnostics excluded | Pin commit; record #152/#157/#162 exclusion and #161 limitation | Evidence makes no diagnostics-based or physical-actuation claim | **MET** |
+| Gate | Required evidence |
+| --- | --- |
+| Final code and review | Exact combined commit, independent review, both runtime gates, hosted CI |
+| Distinct release identity | Consistent agent/integration version, ordinal, regenerated payload and hashes |
+| Installed parity | Loaded HA and actual selected panel components match the candidate |
+| Recovery | Complete named retained baseline, rehearsal evidence, agreed live recovery verification |
+| Responsiveness | Authorized sequential/burst/partial-command results meet predefined thresholds; physical claims independently supported |
+| Final-candidate soak | At least one day, with failures investigated and resolved or explicitly blocking |
+| Batch advancement | Small batches; per-panel bridge/watchdog identity, restarted process and fresh health verified |
+| Completion | Inaccessible or failed panels reported as incomplete; retained baselines finalized only after signoff |
 
-## Deployment evidence template
+The fleet is not current merely because an update service accepted a request.
+Record each panel's actual code/version and health, including selected watchdogs.
+Keep release publication, successful canary qualification and completed fleet
+rollout as separate recorded outcomes.
 
-Keep public evidence generic and sanitized. Store path/hash-only manifests and
-diffs as directed by the [deployment reference](deployment.md#office-exact-bundle-parity-gate).
-Do not publish credentials, hostnames, addresses, panel identifiers, private
-topology, journal contents, raw topics, or raw logs.
+## Evidence template
+
+Keep public evidence generic. Store credentials, private topology, panel and
+transaction identifiers, raw topics/logs and retained journals only in the
+operator's private evidence location. Publish sanitized timing summaries and
+path/hash manifests where appropriate.
 
 ```text
-CANARY DECISION
-date/time + timezone:
-operator/reviewer roles:
-result: GO / NO-GO / ABORTED
-
-CANDIDATE
-commit: e4ae3176b605f5f7ac8e971823ec47ba506af1b8
-VERSION label: 0.10.2 (necessary, not sufficient)
-candidate payload-release manifest digest:
-loaded-HA payload-release manifest digest:
-active-panel panel-release manifest digest:
-all exact manifest diffs empty: yes/no
-
-BASELINE (read-only)
-installed layout + byte identity:
-fresh pre-deploy MQTT software-health evidence + timestamp:
-process restart/reconnect counters:
-resource observations (RSS/CPU/load/free memory):
-configured MemoryMax / CPUQuota / Nice:
-named rollback retention-and-restore mechanism:
-rollback snapshot + prior legacy app/vendor bytes retained (contents kept private): yes/no
-
-DEPLOYMENT
-journaled provisioner transaction reference (identifier kept private):
-legacy-to-immutable migration result:
-panel-release exact gate result:
-candidate manifest digest installed:
-services stopped before atomic in-place swap: yes/no
-fresh post-deploy MQTT software-health evidence + elapsed time:
-MemoryMax / CPUQuota / Nice observed after deploy:
-unexpected restarts/reconnects or resource-cap events:
-
-ROLLBACK READINESS
-missing-prior-legacy-bytes rehearsal result + artifact reference:
-crash-recovery rehearsal result + artifact reference:
-measured fresh prior-version MQTT reconnect/health time:
-post-commit snapshot/prior-byte reinstatement exercised: yes/no
-rollback mechanism callable through soak: yes/no
-manual agent-update freeze attested: yes/no
-
-SOAK (one panel, >= 1 day)
-start/end + elapsed duration:
-software-health samples and resource results:
-identity/digest rechecked at end:
-unexpected restarts/reconnects:
-single-field qualification performed (if authorized):
-mixed-field traffic excluded: yes/no
-diagnostics exclusion/#161 limitation acknowledged: yes/no
-abort criteria encountered:
-result: PASS / FAIL / INCONCLUSIVE
-
-CLAIM BOUNDARY
-software health demonstrated:
-physical actuation measured: no / separately authorized evidence reference
-physical slider latency claimed: no
-forward-only MQTT topics/ledger, HA registries, companion state, and OSTree reconciliation:
+Decision: GO / NO-GO / ABORTED / INCONCLUSIVE
+Timestamp and operator/reviewer:
+Candidate commit / version / ordinal:
+Repository and loaded-HA manifest digests:
+Actual per-component panel layout / digests / versions:
+Installed unit and resource-limit verification:
+Named baseline state and private evidence reference:
+Disposable recovery / live recovery evidence and measured duration:
+Starting load state / restored load state:
+Predefined response and reliability thresholds:
+Sequential / burst / partial-command observations:
+API acceptance / HA state / independent physical observation times:
+Queue-wait / RPC / timeout / session-rebuild deltas and process identity:
+Physical slider latency: measured evidence reference / unmeasured
+Final-candidate soak start / end / duration:
+Failures, disposition and renewed qualification window:
+Fleet per-panel completion record / outstanding panels:
+Release publication / finalization decision:
 ```
-
-The release unit specifies `Nice=10`, `MemoryMax=96M`, and `CPUQuota=20%`
-([`brilliant-mqtt-release.service` lines 19-24](../../deploy/brilliant-mqtt-release.service#L19));
-record what systemd actually reports rather than copying those desired values
-into the evidence.
-
-## Soak and abort
-
-The deployment is an in-place atomic swap, not an A/B run: all owned services
-stop before the selector changes, then the selected services restart
-([`panel_ops.py` lines 1178-1214](../../custom_components/brilliant_mqtt/panel_ops.py#L1178)).
-Keep HomeKit paired as an independent operator fallback, as required by the
-[validation preflight](../brilliant-panel/validation-runbook.md#1-preflight).
-After every readiness row passes, soak exactly one panel for at least one day
-using the existing [roll-out order](deployment.md#roll-out-order).
-
-Abort the canary immediately on any of these conditions:
-
-- candidate, loaded-HA, or panel manifest identity drifts;
-- an unexpected process restart, MQTT reconnect, or bus reconnect occurs;
-- no fresh MQTT software-health evidence arrives for 90 seconds;
-- an observed resource cap differs from the reviewed unit, a cap is breached,
-  or resource pressure threatens the native UI; or
-- rollback retention/callability, the manual-update freeze, or the single-field
-  traffic boundary can no longer be proven.
-
-On a pre-commit abort, stop qualification traffic and invoke only the rehearsed
-journaled rollback. On a post-commit soak abort, that journal has been cleared:
-use only the named, rehearsed #166 retention-and-restore mechanism. Until that
-mechanism exists, no executable rollback is available; stop traffic, preserve
-evidence, and escalate without improvising a partial redeploy. After any
-rollback, measure fresh prior-version MQTT health; do not treat HomeKit
-fallback, a process restart, a bus acknowledgement, or a restored `VERSION`
-label as proof that rollback completed or that a physical load actuated.
