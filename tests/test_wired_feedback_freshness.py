@@ -972,6 +972,35 @@ async def test_owner_rebinding_retires_wired_projection() -> None:
     await _shutdown_feedback(bridge)
 
 
+@pytest.mark.parametrize("binding", ["owner", "scale"])
+async def test_late_preissue_rebinding_keeps_new_native_off(binding: str) -> None:
+    bus, mqtt, bridge = await _bridged(_dimmer())
+    rebound = _dimmer(on="0")
+    if binding == "owner":
+        rebound.device_id = "new_owner"
+    else:
+        rebound.variables["max_intensity_value"] = Variable("max_intensity_value", "2000")
+    bus.set_devices([rebound])
+    captured_rebound = (await bus.get_all())[0]
+
+    await mqtt.inject(SET_TOPIC, '{"state":"ON","brightness":85}')
+    await bus.emit(_dimmer(on="1", on_timestamp=2000))
+    await bus.emit(captured_rebound)
+
+    stored = bridge._devices[PID]
+    state = _states(mqtt)[-1]
+    assert stored.variables["on"].value == "0"
+    assert state["state"] == "OFF"
+    assert "wired_write_status" not in state
+    assert PID not in bridge._wired_issue_boundary
+    assert PID not in bridge._pending_wired
+    if binding == "owner":
+        assert stored.device_id == "new_owner"
+    else:
+        assert stored.max_intensity == 2000
+    await _shutdown_feedback(bridge)
+
+
 async def test_successful_request_still_echoes_immediately() -> None:
     _bus, mqtt, bridge = await _bridged(_dimmer())
 

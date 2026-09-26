@@ -332,16 +332,19 @@ class Bridge:
         """Apply score-derived motion to *device* (identity when disabled)."""
         return device if self._deriver is None else self._deriver.apply(device)
 
+    @staticmethod
+    def _same_binding(previous: BrilliantDevice, device: BrilliantDevice) -> bool:
+        return (
+            previous.device_id == device.device_id
+            and previous.peripheral_id == device.peripheral_id
+            and previous.kind == device.kind
+            and previous.is_dimmable == device.is_dimmable
+            and previous.max_intensity == device.max_intensity
+        )
+
     def _remember_device(self, device: BrilliantDevice) -> None:
         previous = self._devices.get(device.peripheral_id)
-        rebound = (
-            previous is None
-            or (previous.device_id, previous.peripheral_id)
-            != (device.device_id, device.peripheral_id)
-            or (previous.kind, previous.is_dimmable, previous.max_intensity)
-            != (device.kind, device.is_dimmable, device.max_intensity)
-        )
-        if rebound:
+        if previous is None or not self._same_binding(previous, device):
             # These are translate_command's snapshot inputs. Observed values
             # and a new snapshot object do not change the command binding.
             self._command_generation[device.peripheral_id] = (
@@ -381,6 +384,19 @@ class Bridge:
 
         peripheral_id = observed.peripheral_id
         previous = self._devices.get(peripheral_id)
+        variables = dict(observed.variables)
+        if previous is not None and self._is_wired_primary(previous):
+            pending = self._pending_wired.get(peripheral_id)
+            if pending is not None:
+                for name in pending.targets:
+                    if name not in variables and name in previous.variables:
+                        variables[name] = previous.variables[name]
+            if not self._same_binding(previous, replace(observed, variables=variables)):
+                # Compare the effective partial snapshot first, then retire the
+                # old boundary before copying any prior native evidence.
+                self._remember_device(observed)
+                previous = None
+                variables = dict(observed.variables)
         provenance = self._wired_native_provenance.setdefault(peripheral_id, {})
         capture = observed.capture_provenance
         if capture is not None and any(
@@ -388,7 +404,6 @@ class Bridge:
             for marker in provenance.values()
         ):
             provenance.clear()
-        variables = dict(observed.variables)
         if previous is not None and self._is_wired_primary(previous):
             boundary = self._wired_issue_boundary.get(peripheral_id)
             issue = boundary[0] if boundary is not None else None
@@ -400,7 +415,6 @@ class Bridge:
                     and self._capture_precedes(capture, issue)
                     and not self._capture_precedes(old_capture, issue)
                     and name in previous.variables
-                    and previous.kind == observed.kind
                 ):
                     if capture is not None:
                         self._wired_preissue_evidence.setdefault(peripheral_id, {})[name] = (
@@ -410,11 +424,6 @@ class Bridge:
                     variables[name] = previous.variables[name]
                 else:
                     provenance[name] = capture
-            pending = self._pending_wired.get(peripheral_id)
-            if pending is not None:
-                for name in pending.targets:
-                    if name not in variables and name in previous.variables:
-                        variables[name] = previous.variables[name]
         else:
             provenance.clear()
             provenance.update({name: observed.capture_provenance for name in observed.variables})
@@ -496,17 +505,7 @@ class Bridge:
 
             if self._is_wired_primary(device):
                 current = self._devices.get(device.peripheral_id)
-                if current is None or (
-                    current.device_id,
-                    current.kind,
-                    current.is_dimmable,
-                    current.max_intensity,
-                ) != (
-                    device.device_id,
-                    device.kind,
-                    device.is_dimmable,
-                    device.max_intensity,
-                ):
+                if current is None or not self._same_binding(current, device):
                     continue
                 device = current
             else:
@@ -523,17 +522,7 @@ class Bridge:
 
             if self._is_wired_primary(device):
                 current = self._devices.get(device.peripheral_id)
-                if current is None or (
-                    current.device_id,
-                    current.kind,
-                    current.is_dimmable,
-                    current.max_intensity,
-                ) != (
-                    device.device_id,
-                    device.kind,
-                    device.is_dimmable,
-                    device.max_intensity,
-                ):
+                if current is None or not self._same_binding(current, device):
                     continue
                 device = current
 
