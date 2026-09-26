@@ -315,7 +315,6 @@ class Bridge:
         # normalized snapshot shares the same local capture marker.
         self._wired_native_provenance: dict[str, dict[str, CaptureProvenance | None]] = {}
         self._wired_issue_boundary: dict[str, tuple[CaptureProvenance, frozenset[str]]] = {}
-        self._wired_preissue_evidence: dict[str, dict[str, tuple[Variable, CaptureProvenance]]] = {}
 
         bus.on_change(self._on_change, want_device=self._include)
         mqtt.on_command(self._on_command)
@@ -354,7 +353,6 @@ class Bridge:
                 self._retire_wired_feedback(device.peripheral_id)
                 self._wired_native_provenance.pop(device.peripheral_id, None)
                 self._wired_issue_boundary.pop(device.peripheral_id, None)
-                self._wired_preissue_evidence.pop(device.peripheral_id, None)
         self._devices[device.peripheral_id] = device
 
     @staticmethod
@@ -372,8 +370,13 @@ class Bridge:
         return (
             capture is not None
             and issue is not None
-            and capture.source_generation == issue.source_generation
-            and capture.sequence < issue.sequence
+            and (
+                capture.source_generation < issue.source_generation
+                or (
+                    capture.source_generation == issue.source_generation
+                    and capture.sequence < issue.sequence
+                )
+            )
         )
 
     def _remember_native_observation(self, observed: BrilliantDevice) -> BrilliantDevice:
@@ -384,23 +387,38 @@ class Bridge:
 
         peripheral_id = observed.peripheral_id
         previous = self._devices.get(peripheral_id)
+        capture = observed.capture_provenance
         variables = dict(observed.variables)
         if previous is not None and self._is_wired_primary(previous):
-            pending = self._pending_wired.get(peripheral_id)
-            if pending is not None:
-                for name in pending.targets:
+            retained_capabilities: dict[str, Variable] = {}
+            if previous.device_id == observed.device_id and previous.kind == observed.kind:
+                # A partial capture cannot revoke an established capability.
+                # Explicitly supplied metadata still changes the binding.
+                for name in ("intensity", "max_intensity_value"):
                     if name not in variables and name in previous.variables:
-                        variables[name] = previous.variables[name]
+                        retained_capabilities[name] = previous.variables[name]
+                variables.update(retained_capabilities)
+                pending = self._pending_wired.get(peripheral_id)
+                if pending is not None:
+                    for name in pending.targets:
+                        if name not in variables and name in previous.variables:
+                            variables[name] = previous.variables[name]
             if not self._same_binding(previous, replace(observed, variables=variables)):
+                boundary = self._wired_issue_boundary.get(peripheral_id)
+                if (
+                    capture is not None
+                    and boundary is not None
+                    and capture.source_generation < boundary[0].source_generation
+                ):
+                    return previous
                 # Compare the effective partial snapshot first, then retire the
                 # old boundary before copying any prior native evidence.
-                self._remember_device(observed)
+                variables = {**observed.variables, **retained_capabilities}
+                self._remember_device(replace(observed, variables=variables))
                 previous = None
-                variables = dict(observed.variables)
         provenance = self._wired_native_provenance.setdefault(peripheral_id, {})
-        capture = observed.capture_provenance
         if capture is not None and any(
-            marker is not None and marker.source_generation != capture.source_generation
+            marker is not None and marker.source_generation < capture.source_generation
             for marker in provenance.values()
         ):
             provenance.clear()
@@ -408,7 +426,7 @@ class Bridge:
             boundary = self._wired_issue_boundary.get(peripheral_id)
             issue = boundary[0] if boundary is not None else None
             targets = boundary[1] if boundary is not None else frozenset()
-            for name, variable in observed.variables.items():
+            for name in observed.variables:
                 old_capture = provenance.get(name)
                 if (
                     name in targets
@@ -416,11 +434,6 @@ class Bridge:
                     and not self._capture_precedes(old_capture, issue)
                     and name in previous.variables
                 ):
-                    if capture is not None:
-                        self._wired_preissue_evidence.setdefault(peripheral_id, {})[name] = (
-                            variable,
-                            capture,
-                        )
                     variables[name] = previous.variables[name]
                 else:
                     provenance[name] = capture
@@ -500,31 +513,41 @@ class Bridge:
             if not descriptors:
                 # UNKNOWN / SENSOR — no HA entity; skip entirely.
                 continue
-            n_devices += 1
-            n_entities += len(descriptors)
-
             if self._is_wired_primary(device):
                 current = self._devices.get(device.peripheral_id)
-                if current is None or not self._same_binding(current, device):
+                if current is None:
+                    continue
+                device = current
+                # Discovery may await the broker while a push rebinds this load.
+                # Publish the new binding's config before using its descriptors.
+                while True:
+                    descriptors = entities_for(device, self._panel)
+                    if not descriptors:
+                        break
+                    for descriptor in descriptors:
+                        await self._async_publish_retained(
+                            config_topic(descriptor),
+                            config_payload(descriptor, sw_version=sw_version),
+                        )
+                    current = self._devices.get(device.peripheral_id)
+                    if current is None or self._same_binding(current, device):
+                        break
+                    device = current
+                if current is None or not descriptors:
                     continue
                 device = current
             else:
                 observed = self._derived(device)
                 device = self._remember_native_observation(observed)
                 self._observe_mesh_pending(device)
+                for descriptor in descriptors:
+                    await self._async_publish_retained(
+                        config_topic(descriptor),
+                        config_payload(descriptor, sw_version=sw_version),
+                    )
 
-            # Publish one discovery config per entity descriptor.
-            for descriptor in descriptors:
-                await self._async_publish_retained(
-                    config_topic(descriptor),
-                    config_payload(descriptor, sw_version=sw_version),
-                )
-
-            if self._is_wired_primary(device):
-                current = self._devices.get(device.peripheral_id)
-                if current is None or not self._same_binding(current, device):
-                    continue
-                device = current
+            n_devices += 1
+            n_entities += len(descriptors)
 
             # Publish exactly ONE shared state payload per peripheral, whenever
             # the device contributes any payload fields. Forced: reconcile is
@@ -946,7 +969,6 @@ class Bridge:
         self._set_wired_feedback(peripheral_id, None)
         self._wired_native_fallback_required.pop(peripheral_id, None)
         self._wired_issue_boundary.pop(peripheral_id, None)
-        self._wired_preissue_evidence.pop(peripheral_id, None)
 
     async def shutdown_wired_feedback(self) -> None:
         """Revoke wired feedback deadlines and in-flight publications."""
@@ -969,7 +991,6 @@ class Bridge:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._wired_native_provenance.clear()
         self._wired_issue_boundary.clear()
-        self._wired_preissue_evidence.clear()
 
     def _begin_wired_attempt(
         self,
@@ -1011,7 +1032,6 @@ class Bridge:
             provenance,
             frozenset(attempt.targets),
         )
-        self._wired_preissue_evidence.pop(peripheral_id, None)
 
     def _classify_wired_field(
         self,
@@ -1044,7 +1064,7 @@ class Bridge:
         if (
             issue is not None
             and device.capture_provenance is not None
-            and device.capture_provenance.source_generation != issue.source_generation
+            and device.capture_provenance.source_generation > issue.source_generation
         ):
             return False
         deadline = self._wall_clock() + WIRED_PROVISIONAL_SECONDS
@@ -1177,9 +1197,11 @@ class Bridge:
         if (
             capture is not None
             and issue is not None
-            and capture.source_generation != issue.source_generation
+            and capture.source_generation > issue.source_generation
         ):
             self._retire_wired_feedback(peripheral_id)
+            return
+        if self._capture_precedes(capture, issue):
             return
         native = self._devices.get(peripheral_id)
         provenance = self._wired_native_provenance.get(peripheral_id, {})
@@ -1405,7 +1427,6 @@ class Bridge:
                     await self._publish_wired_native_fallback(peripheral_id, attempt.generation)
                 raise
             if isinstance(result, Superseded):
-                await self._publish_wired_native_fallback(peripheral_id, attempt.generation)
                 return
             if not await self._arm_wired_feedback(peripheral_id, attempt):
                 await self._publish_wired_native_fallback(peripheral_id, attempt.generation)

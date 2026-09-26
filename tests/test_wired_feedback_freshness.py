@@ -608,6 +608,35 @@ async def test_reconcile_early_await_does_not_apply_obsolete_capture(suffix: str
     await _shutdown_feedback(bridge)
 
 
+@pytest.mark.parametrize("suffix", ["/availability", "/bridge", "/config"])
+async def test_reconcile_rebinding_still_discovers_and_subscribes(suffix: str) -> None:
+    bus = FakeBus([_dimmer()])
+    mqtt = _BlockingPublishMqtt(suffix)
+    mqtt.armed = True
+    bridge = Bridge(bus, mqtt, PANEL, clock=FakeClock(), sleep=FakeSleeper())
+    reconcile = asyncio.create_task(bridge.reconcile())
+    await mqtt.blocked.wait()
+    rebound = _dimmer(on="1", on_timestamp=2000)
+    if suffix == "/config":
+        rebound.kind = DeviceKind.SWITCH
+        rebound.peripheral_type = 26
+        del rebound.variables["intensity"]
+    else:
+        rebound.variables["max_intensity_value"] = Variable("max_intensity_value", "2000")
+    await bus.emit(rebound)
+    mqtt.release.set()
+    await reconcile
+
+    assert SET_TOPIC in mqtt.subscriptions
+    configs = [topic for topic, _payload, _retain in mqtt.published if topic.endswith("/config")]
+    assert configs
+    if suffix == "/config":
+        assert any(topic.startswith("homeassistant/switch/") for topic in configs)
+    else:
+        assert bridge._devices[PID].max_intensity == 2000
+    await _shutdown_feedback(bridge)
+
+
 async def test_obsolete_command_completion_cannot_revive_older_projection() -> None:
     bus = _FirstWriteBlockedBus([_dimmer()])
     _bus, mqtt, bridge = await _bridged(_dimmer(), bus=bus)
@@ -878,9 +907,12 @@ async def test_waiting_replacement_preserves_old_deadline_fallback() -> None:
         _dimmer(), bus=bus, clock=clock, wall_clock=clock, sleeper=sleeper
     )
     await mqtt.inject(SET_TOPIC, '{"state":"ON","brightness":85}')
+    clock.advance(7)
     replacement = asyncio.create_task(mqtt.inject(SET_TOPIC, '{"state":"ON","brightness":200}'))
     await bus.blocked.wait()
-    clock.advance(20)
+    await asyncio.sleep(0)
+    assert sleeper.requested[-1] == 13.0
+    clock.advance(13)
     await sleeper.release_all()
 
     state = _states(mqtt)[-1]
@@ -923,6 +955,23 @@ async def test_unsuccessful_replacement_retires_prior_projection_to_native(
     assert state["state"] == "OFF"
     assert state["brightness"] == 85
     _assert_feedback(state, "unconfirmed", {}, None)
+    await _shutdown_feedback(bridge)
+
+
+async def test_superseded_replacement_waits_for_inherited_deadline() -> None:
+    clock = FakeClock()
+    sleeper = FakeSleeper()
+    bus = _ReplacementOutcomeBus([_dimmer()], "superseded")
+    _bus, mqtt, bridge = await _bridged(_dimmer(), bus=bus, clock=clock, sleeper=sleeper)
+    await mqtt.inject(SET_TOPIC, '{"state":"ON","brightness":85}')
+    mqtt.published.clear()
+
+    await mqtt.inject(SET_TOPIC, '{"state":"ON","brightness":200}')
+    assert _states(mqtt) == []
+    assert PID in bridge._wired_deadline_tasks
+    clock.advance(20)
+    await sleeper.release_all()
+    _assert_feedback(_states(mqtt)[-1], "unconfirmed", {}, None)
     await _shutdown_feedback(bridge)
 
 
@@ -969,6 +1018,63 @@ async def test_owner_rebinding_retires_wired_projection() -> None:
     assert PID not in bridge._wired_deadline_tasks
     assert state["state"] == "OFF"
     assert "wired_write_status" not in state
+    await _shutdown_feedback(bridge)
+
+
+@pytest.mark.parametrize("omitted", ["intensity", "max_intensity_value"])
+async def test_preissue_partial_capability_omission_keeps_projection(omitted: str) -> None:
+    initial = _dimmer(power="0")
+    if omitted == "max_intensity_value":
+        initial.variables[omitted] = Variable(omitted, "2000")
+    bus, mqtt, bridge = await _bridged(initial)
+    partial = replace(initial, variables=dict(initial.variables))
+    del partial.variables[omitted]
+    partial.variables["power"] = Variable("power", "22")
+    bus.set_devices([partial])
+    captured = (await bus.get_all())[0]
+
+    await mqtt.inject(SET_TOPIC, '{"state":"ON"}')
+    timer = bridge._wired_deadline_tasks[PID]
+    generation = bridge._wired_write_generation[PID]
+    await bus.emit(captured)
+
+    state = _states(mqtt)[-1]
+    assert state["state"] == "ON"
+    assert state["power"] == 2.2
+    assert state["wired_write_status"] == "provisional"
+    assert bridge._wired_deadline_tasks[PID] is timer
+    assert bridge._wired_write_generation[PID] == generation
+    await _shutdown_feedback(bridge)
+
+
+async def test_postissue_off_without_scale_keeps_ambiguous_feedback() -> None:
+    initial = _dimmer()
+    initial.variables["max_intensity_value"] = Variable("max_intensity_value", "2000")
+    bus, mqtt, bridge = await _bridged(initial)
+    await mqtt.inject(SET_TOPIC, '{"state":"ON","brightness":200}')
+    await bus.emit(_dimmer(on="0", on_timestamp=None))
+
+    state = _states(mqtt)[-1]
+    assert state["state"] == "OFF"
+    assert state["wired_write_status"] == "ambiguous"
+    assert PID in bridge._pending_wired
+    await _shutdown_feedback(bridge)
+
+
+async def test_explicit_scale_rebinding_keeps_omitted_dimmer_capability() -> None:
+    bus, mqtt, bridge = await _bridged(_dimmer())
+    rebound = _dimmer(on="0")
+    del rebound.variables["intensity"]
+    rebound.variables["max_intensity_value"] = Variable("max_intensity_value", "2000")
+    prior_generation = bridge._command_generation[PID]
+
+    await bus.emit(rebound)
+
+    stored = bridge._devices[PID]
+    assert stored.max_intensity == 2000
+    assert stored.is_dimmable
+    assert bridge._command_generation[PID] == prior_generation + 1
+    assert _states(mqtt)[-1]["state"] == "OFF"
     await _shutdown_feedback(bridge)
 
 
@@ -1064,6 +1170,56 @@ async def test_soft_reconnect_retires_old_comparison_provenance() -> None:
     marker = provenance["intensity"]
     assert marker is not None
     assert marker.source_generation == 2
+    await _shutdown_feedback(bridge)
+
+
+async def test_older_generation_capture_does_not_retire_new_request() -> None:
+    bus, mqtt, bridge = await _bridged(_dimmer())
+    captured_before_reconnect = (await bus.get_all())[0]
+    bus._capture_generation += 1
+    bus._capture_sequence = 0
+    await bridge.reconcile_after_reconnect()
+    mqtt.published.clear()
+
+    await mqtt.inject(SET_TOPIC, '{"state":"ON","brightness":85}')
+    await bus.emit(captured_before_reconnect)
+
+    state = _states(mqtt)[-1]
+    assert state["state"] == "ON"
+    assert state["wired_write_status"] == "provisional"
+    assert PID in bridge._pending_wired
+    await _shutdown_feedback(bridge)
+
+
+@pytest.mark.parametrize("binding", ["owner", "scale"])
+async def test_older_generation_binding_cannot_replace_new_session(binding: str) -> None:
+    initial = _dimmer()
+    if binding == "scale":
+        initial.variables["max_intensity_value"] = Variable("max_intensity_value", "1000")
+    bus, mqtt, bridge = await _bridged(initial)
+    old_binding = (await bus.get_all())[0]
+    rebound = _dimmer()
+    if binding == "owner":
+        rebound.device_id = "new_owner"
+    else:
+        rebound.variables["max_intensity_value"] = Variable("max_intensity_value", "2000")
+    bus.set_devices([rebound])
+    bus._capture_generation += 1
+    bus._capture_sequence = 0
+    await bridge.reconcile_after_reconnect()
+    mqtt.published.clear()
+
+    await mqtt.inject(SET_TOPIC, '{"state":"ON"}')
+    await bus.emit(old_binding)
+
+    state = _states(mqtt)[-1]
+    assert state["state"] == "ON"
+    assert state["wired_write_status"] == "provisional"
+    assert PID in bridge._pending_wired
+    if binding == "owner":
+        assert bridge._devices[PID].device_id == "new_owner"
+    else:
+        assert bridge._devices[PID].max_intensity == 2000
     await _shutdown_feedback(bridge)
 
 

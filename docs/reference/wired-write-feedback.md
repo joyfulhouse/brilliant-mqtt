@@ -16,13 +16,14 @@ The bridge keeps two forms of state for a wired primary load:
 The adapter records a local source generation and capture sequence when it
 actually copies a push/read result. The same sequence is sampled when a native
 write is issued, after admission and the per-device lock. A capture positively
-known to precede that boundary remains separate evidence, but it cannot erase
+known to precede that boundary cannot erase
 post-issue native evidence for the commanded field or restore a displaced
 projection. Unrelated fields from the same capture still apply. The issue
 boundary remains available after visible feedback clears so a late pre-issue
-capture cannot overwrite a later native observation. Source generations are
-incomparable; reconnect or session replacement retires the old projection and
-comparison state.
+capture cannot overwrite a later native observation. Adapter-local source
+generations identify captures taken before or after the issue's generation;
+native timestamps are never used for that comparison. Reconnect or session
+replacement retires the old projection and comparison state.
 
 Capture sequence is compared only with the relevant write-issue boundary; it
 is not an observation high-water mark. A post-issue contradiction therefore
