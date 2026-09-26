@@ -182,6 +182,7 @@ async def _run_session(
     bus = RpcBusAdapter(
         extra_device_ids=(_MESH_DEVICE_ID,) if participating else (), diagnostics=diagnostics
     )
+    panel_bridge: Bridge | None = None
     mesh_bridge: Bridge | None = None
     scene_bridge: SceneBridge | None = None
     mqtt_connected = False
@@ -294,7 +295,7 @@ async def _run_session(
         async def _reconcile_after_bus_reconnect() -> None:
             # After a bus reconnect, pushes (and the observer's get_all mirror)
             # may have missed changes — re-reconcile to republish the truth.
-            await panel_bridge.reconcile()
+            await panel_bridge.reconcile_after_reconnect()
             if mesh_bridge is not None and leader.is_leader:
                 await mesh_bridge.reconcile()
 
@@ -485,6 +486,11 @@ async def _run_session(
                 await mesh_bridge.shutdown_mesh_feedback()
             except Exception:
                 log.exception("mesh feedback shutdown failed during cleanup")
+        if panel_bridge is not None:
+            try:
+                await panel_bridge.shutdown_wired_feedback()
+            except Exception:
+                log.exception("wired feedback shutdown failed during cleanup")
         if scene_bridge is not None:
             try:
                 await scene_bridge.async_shutdown()

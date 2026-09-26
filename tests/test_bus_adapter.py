@@ -402,7 +402,7 @@ class TestInteractiveScheduling:
             ("poll", False, "target"),
             ("push", True, "target"),
             ("poll", False, "kind"),
-            ("poll", False, "dimming"),
+            ("poll", False, "partial"),
             ("poll", False, "scale"),
             ("push", True, "range"),
             ("push", True, "component"),
@@ -481,13 +481,13 @@ class TestInteractiveScheduling:
                 await bridge.withdraw()
                 await update(replace(device))
                 bridge._register_command_topic("slider", replace(descriptor))
-            elif invalidate in ("target", "kind", "dimming", "scale"):
+            elif invalidate in ("target", "kind", "partial", "scale"):
                 changed = replace(device, variables=dict(device.variables))
                 if invalidate == "target":
                     changed.device_id = "other-device"
                 elif invalidate == "kind":
                     changed.kind = DeviceKind.SWITCH
-                elif invalidate == "dimming":
+                elif invalidate == "partial":
                     del changed.variables["intensity"]
                 else:
                     changed.variables["max_intensity_value"] = Variable(
@@ -515,7 +515,7 @@ class TestInteractiveScheduling:
             await dispatcher.shutdown()
             key = "screen_brightness" if auxiliary else "intensity"
             expected = [{"on": "1"}]
-            if invalidate is not None:
+            if invalidate is not None and invalidate != "partial":
                 expected.append({key: "80"})
             expected.append({key: "120"})
             assert [values for _, _, values in observer.payloads] == expected
