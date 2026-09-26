@@ -130,6 +130,7 @@ class _WiredWriteFeedback:
     issue_provenance: CaptureProvenance | None
     status: str = "provisional"
     deadline: float | None = None
+    expires_at: float | None = None
 
 
 @dataclass
@@ -139,7 +140,6 @@ class _WiredWriteAttempt:
     targets: dict[str, str]
     generation: int
     issue_provenance: CaptureProvenance | None = None
-    native_at_issue: dict[str, Variable] | None = None
 
 
 @dataclass
@@ -307,11 +307,15 @@ class Bridge:
         self._wired_feedback_tasks: dict[asyncio.Task[None], str] = {}
         self._wired_publish_revision: dict[str, int] = {}
         self._wired_publish_locks: dict[str, asyncio.Lock] = {}
-        self._wired_native_fallback_required: set[str] = set()
+        # A replacement inherits the prior request's monotonic deadline until
+        # it issues or native fallback is published. None means no prior timer.
+        self._wired_native_fallback_required: dict[str, float | None] = {}
         self._wired_feedback_enabled = True
         # Provenance is per native variable even though every variable in one
         # normalized snapshot shares the same local capture marker.
         self._wired_native_provenance: dict[str, dict[str, CaptureProvenance | None]] = {}
+        self._wired_issue_boundary: dict[str, tuple[CaptureProvenance, frozenset[str]]] = {}
+        self._wired_preissue_evidence: dict[str, dict[str, tuple[Variable, CaptureProvenance]]] = {}
 
         bus.on_change(self._on_change, want_device=self._include)
         mqtt.on_command(self._on_command)
@@ -346,6 +350,8 @@ class Bridge:
             if previous is not None:
                 self._retire_wired_feedback(device.peripheral_id)
                 self._wired_native_provenance.pop(device.peripheral_id, None)
+                self._wired_issue_boundary.pop(device.peripheral_id, None)
+                self._wired_preissue_evidence.pop(device.peripheral_id, None)
         self._devices[device.peripheral_id] = device
 
     @staticmethod
@@ -368,7 +374,7 @@ class Bridge:
         )
 
     def _remember_native_observation(self, observed: BrilliantDevice) -> BrilliantDevice:
-        """Retain native fields by local capture order, never native timestamp."""
+        """Retain native fields; a known pre-issue capture cannot erase later evidence."""
         if not self._is_wired_primary(observed):
             self._remember_device(observed)
             return observed
@@ -384,7 +390,26 @@ class Bridge:
             provenance.clear()
         variables = dict(observed.variables)
         if previous is not None and self._is_wired_primary(previous):
-            provenance.update({name: capture for name in observed.variables})
+            boundary = self._wired_issue_boundary.get(peripheral_id)
+            issue = boundary[0] if boundary is not None else None
+            targets = boundary[1] if boundary is not None else frozenset()
+            for name, variable in observed.variables.items():
+                old_capture = provenance.get(name)
+                if (
+                    name in targets
+                    and self._capture_precedes(capture, issue)
+                    and not self._capture_precedes(old_capture, issue)
+                    and name in previous.variables
+                    and previous.kind == observed.kind
+                ):
+                    if capture is not None:
+                        self._wired_preissue_evidence.setdefault(peripheral_id, {})[name] = (
+                            variable,
+                            capture,
+                        )
+                    variables[name] = previous.variables[name]
+                else:
+                    provenance[name] = capture
             pending = self._pending_wired.get(peripheral_id)
             if pending is not None:
                 for name in pending.targets:
@@ -428,6 +453,14 @@ class Bridge:
         self._mesh_feedback_enabled = True
         self._wired_feedback_enabled = True
 
+        # A broker await may admit a command or native push. Apply this captured
+        # wired batch before those awaits so it cannot later overwrite their state.
+        for captured in devices:
+            if self._is_wired_primary(captured) and entities_for(captured, self._panel):
+                observed = self._derived(captured)
+                self._remember_native_observation(observed)
+                self._observe_wired_pending(observed)
+
         await self._async_publish_retained(
             availability_topic(self._panel),
             "online",
@@ -461,10 +494,25 @@ class Bridge:
             n_devices += 1
             n_entities += len(descriptors)
 
-            observed = self._derived(device)
-            device = self._remember_native_observation(observed)
-            self._observe_wired_pending(observed)
-            self._observe_mesh_pending(device)
+            if self._is_wired_primary(device):
+                current = self._devices.get(device.peripheral_id)
+                if current is None or (
+                    current.device_id,
+                    current.kind,
+                    current.is_dimmable,
+                    current.max_intensity,
+                ) != (
+                    device.device_id,
+                    device.kind,
+                    device.is_dimmable,
+                    device.max_intensity,
+                ):
+                    continue
+                device = current
+            else:
+                observed = self._derived(device)
+                device = self._remember_native_observation(observed)
+                self._observe_mesh_pending(device)
 
             # Publish one discovery config per entity descriptor.
             for descriptor in descriptors:
@@ -475,7 +523,17 @@ class Bridge:
 
             if self._is_wired_primary(device):
                 current = self._devices.get(device.peripheral_id)
-                if current is None or current.device_id != device.device_id:
+                if current is None or (
+                    current.device_id,
+                    current.kind,
+                    current.is_dimmable,
+                    current.max_intensity,
+                ) != (
+                    device.device_id,
+                    device.kind,
+                    device.is_dimmable,
+                    device.max_intensity,
+                ):
                     continue
                 device = current
 
@@ -888,7 +946,7 @@ class Bridge:
     def _drop_pending_wired(self, peripheral_id: str) -> None:
         self._pending_wired.pop(peripheral_id, None)
         task = self._wired_deadline_tasks.pop(peripheral_id, None)
-        if task is not None:
+        if task is not None and task is not asyncio.current_task():
             task.cancel()
 
     def _retire_wired_feedback(self, peripheral_id: str) -> None:
@@ -897,7 +955,9 @@ class Bridge:
         )
         self._drop_pending_wired(peripheral_id)
         self._set_wired_feedback(peripheral_id, None)
-        self._wired_native_fallback_required.discard(peripheral_id)
+        self._wired_native_fallback_required.pop(peripheral_id, None)
+        self._wired_issue_boundary.pop(peripheral_id, None)
+        self._wired_preissue_evidence.pop(peripheral_id, None)
 
     async def shutdown_wired_feedback(self) -> None:
         """Revoke wired feedback deadlines and in-flight publications."""
@@ -919,6 +979,8 @@ class Bridge:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._wired_native_provenance.clear()
+        self._wired_issue_boundary.clear()
+        self._wired_preissue_evidence.clear()
 
     def _begin_wired_attempt(
         self,
@@ -927,10 +989,21 @@ class Bridge:
     ) -> _WiredWriteAttempt:
         generation = self._wired_write_generation.get(peripheral_id, 0) + 1
         self._wired_write_generation[peripheral_id] = generation
+        previous = self._pending_wired.get(peripheral_id)
+        fallback_at = (
+            previous.expires_at
+            if previous is not None
+            else self._wired_native_fallback_required.get(peripheral_id)
+        )
         self._drop_pending_wired(peripheral_id)
         if peripheral_id in self._wired_feedback:
-            self._wired_native_fallback_required.add(peripheral_id)
+            self._wired_native_fallback_required[peripheral_id] = fallback_at
             self._set_wired_feedback(peripheral_id, None)
+        if peripheral_id in self._wired_native_fallback_required and fallback_at is not None:
+            self._wired_deadline_tasks[peripheral_id] = asyncio.create_task(
+                self._resolve_replaced_wired(peripheral_id, generation, fallback_at),
+                name=f"brilliant-mqtt-wired-fallback-{peripheral_id}",
+            )
         return _WiredWriteAttempt(
             targets={item.name: item.value for item in sets},
             generation=generation,
@@ -943,8 +1016,13 @@ class Bridge:
         provenance: CaptureProvenance,
     ) -> None:
         attempt.issue_provenance = provenance
-        native = self._devices.get(peripheral_id)
-        attempt.native_at_issue = None if native is None else dict(native.variables)
+        if self._wired_write_generation.get(peripheral_id) != attempt.generation:
+            return
+        self._wired_issue_boundary[peripheral_id] = (
+            provenance,
+            frozenset(attempt.targets),
+        )
+        self._wired_preissue_evidence.pop(peripheral_id, None)
 
     def _classify_wired_field(
         self,
@@ -954,7 +1032,6 @@ class Bridge:
         capture: CaptureProvenance | None,
     ) -> None:
         if self._capture_precedes(capture, pending.issue_provenance):
-            pending.projected.add(name)
             return
         pending.projected.discard(name)
         if variable is not None and variable.value == pending.targets[name]:
@@ -990,6 +1067,7 @@ class Bridge:
             generation=attempt.generation,
             issue_provenance=issue,
             deadline=deadline if math.isfinite(deadline) else None,
+            expires_at=self._clock() + WIRED_PROVISIONAL_SECONDS,
         )
         provenance = self._wired_native_provenance.get(peripheral_id, {})
         for name in pending.targets:
@@ -1004,17 +1082,19 @@ class Bridge:
             pending.status = "observed"
             pending.projected.clear()
             self._set_wired_feedback(peripheral_id, pending)
-            self._wired_native_fallback_required.discard(peripheral_id)
+            self._drop_pending_wired(peripheral_id)
+            self._wired_native_fallback_required.pop(peripheral_id, None)
             await self._republish_snapshot(peripheral_id, force=False)
             return True
         pending.status = "ambiguous" if pending.ambiguous else "provisional"
+        self._drop_pending_wired(peripheral_id)
         self._pending_wired[peripheral_id] = pending
         self._set_wired_feedback(peripheral_id, pending)
         self._wired_deadline_tasks[peripheral_id] = asyncio.create_task(
             self._resolve_pending_wired(peripheral_id, pending),
             name=f"brilliant-mqtt-wired-deadline-{peripheral_id}",
         )
-        self._wired_native_fallback_required.discard(peripheral_id)
+        self._wired_native_fallback_required.pop(peripheral_id, None)
         await self._republish_snapshot(peripheral_id, force=False)
         return True
 
@@ -1051,7 +1131,14 @@ class Bridge:
             )
         else:
             if self._owns_wired_feedback(peripheral_id, generation, feedback):
-                self._wired_native_fallback_required.discard(peripheral_id)
+                self._wired_native_fallback_required.pop(peripheral_id, None)
+                self._drop_pending_wired(peripheral_id)
+
+    async def _resolve_replaced_wired(
+        self, peripheral_id: str, generation: int, expires_at: float
+    ) -> None:
+        await self._sleep(max(0.0, expires_at - self._clock()))
+        await self._publish_wired_native_fallback(peripheral_id, generation)
 
     async def _resolve_pending_wired(
         self,
@@ -1069,6 +1156,7 @@ class Bridge:
         pending.projected.clear()
         pending.ambiguous.clear()
         pending.deadline = None
+        pending.expires_at = None
         self._set_wired_feedback(peripheral_id, pending)
         try:
             await self._republish_snapshot(peripheral_id, force=True)
@@ -1087,7 +1175,12 @@ class Bridge:
         peripheral_id = observed.peripheral_id
         pending = self._pending_wired.get(peripheral_id)
         if pending is None:
-            if peripheral_id in self._wired_feedback:
+            feedback = self._wired_feedback.get(peripheral_id)
+            if feedback is not None and not any(
+                name in observed.variables
+                and self._capture_precedes(observed.capture_provenance, feedback.issue_provenance)
+                for name in feedback.targets
+            ):
                 self._set_wired_feedback(peripheral_id, None)
             return
         capture = observed.capture_provenance
@@ -1115,6 +1208,8 @@ class Bridge:
             self._drop_pending_wired(peripheral_id)
             pending.status = "observed"
             pending.deadline = None
+            pending.expires_at = None
+            pending.projected.clear()
             self._set_wired_feedback(peripheral_id, pending)
             return
         pending.status = "ambiguous" if pending.ambiguous else "provisional"

@@ -16,10 +16,13 @@ The bridge keeps two forms of state for a wired primary load:
 The adapter records a local source generation and capture sequence when it
 actually copies a push/read result. The same sequence is sampled when a native
 write is issued, after admission and the per-device lock. A capture positively
-known to precede that boundary remains native evidence, but it cannot override
-the active projection for the commanded field. Unrelated fields from the same
-capture still apply. Source generations are incomparable; reconnect or session
-replacement retires the old projection and comparison state.
+known to precede that boundary remains separate evidence, but it cannot erase
+post-issue native evidence for the commanded field or restore a displaced
+projection. Unrelated fields from the same capture still apply. The issue
+boundary remains available after visible feedback clears so a late pre-issue
+capture cannot overwrite a later native observation. Source generations are
+incomparable; reconnect or session replacement retires the old projection and
+comparison state.
 
 Capture sequence is compared only with the relevant write-issue boundary; it
 is not an observation high-water mark. A post-issue contradiction therefore
@@ -61,5 +64,7 @@ The fixed, non-renewing provisional interval is 20 seconds
 mirror observed in the pilot and bounds how long requested values can be shown.
 Its timer runs outside the MQTT command lane. Expiry publishes the latest native
 observation as `unconfirmed`; it does not retry, reassert, or read back the
-command. Mesh primary, mesh auxiliary, writer serialization, and admission
-semantics are unchanged.
+command. A replacement waiting for admission inherits the previous request's
+remaining deadline for native fallback; waiting cannot extend that deadline.
+Mesh primary, mesh auxiliary, writer serialization, and admission semantics
+are unchanged.
