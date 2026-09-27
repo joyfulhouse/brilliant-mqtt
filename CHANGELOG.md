@@ -7,6 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-09-27
+
+The on-panel agent and Home Assistant integration both move to 0.11.0. The
+bundled bridge and watchdog payload carries release ordinal 2; the separately
+versioned voice payload remains at 0.1.1. Update through the per-panel bridge
+**Update** entity after qualifying the release candidate on a canary panel.
+
+### Added
+
+- Panel response diagnostics distinguish command queue/native-write timing,
+  outcomes, ticket revocations, and reconnect degradation from basic online
+  status in bounded retained bridge metadata. The operational runbooks cover
+  Wi-Fi/broadcast response qualification and a diyHue reflection proposal;
+  the project documentation also gains a Built with Omnigent badge and footer.
+  ([#152](https://github.com/joyfulhouse/brilliant-mqtt/pull/152),
+  [#157](https://github.com/joyfulhouse/brilliant-mqtt/pull/157),
+  [#154](https://github.com/joyfulhouse/brilliant-mqtt/pull/154))
+- Mesh writes expose pending feedback separately from confirmed physical state;
+  cancelled publishes invalidate feedback caches.
+  ([#156](https://github.com/joyfulhouse/brilliant-mqtt/pull/156))
+- Canary updates retain a verified predecessor baseline through the soak period,
+  with explicit single-panel rollback/finalization and recovery after interrupted
+  operations. Release identity admission checks selected code digests and ordinal
+  before mutation; same-version but different code cannot silently overwrite an
+  incumbent, and legacy unknown-ordinal installations require a bound override.
+  ([#168](https://github.com/joyfulhouse/brilliant-mqtt/pull/168);
+  [#165](https://github.com/joyfulhouse/brilliant-mqtt/issues/165),
+  [#166](https://github.com/joyfulhouse/brilliant-mqtt/issues/166))
+
+### Changed
+
+- Interactive writes take priority over maintenance without breaking target
+  ordering; newer waiting intents supersede stale ones, while maintenance
+  retries back off after failures. Ticket recovery preserves the newest write
+  across a route change and contains benign write cancellation.
+  ([#158](https://github.com/joyfulhouse/brilliant-mqtt/pull/158),
+  [#163](https://github.com/joyfulhouse/brilliant-mqtt/pull/163))
+
+### Fixed
+
+- Compatible partial MQTT setters now merge before dispatch rather than losing
+  earlier fields; unsafe commands remain FIFO barriers.
+  ([#170](https://github.com/joyfulhouse/brilliant-mqtt/pull/170);
+  [#159](https://github.com/joyfulhouse/brilliant-mqtt/issues/159))
+- Failed or cancelled per-peripheral command workers no longer strand queued
+  commands or stall teardown. Bounded recovery, cooldown, and discard logging
+  make lane failures and active-fold fallback observable without exposing
+  command contents.
+  ([#171](https://github.com/joyfulhouse/brilliant-mqtt/pull/171);
+  [#160](https://github.com/joyfulhouse/brilliant-mqtt/issues/160),
+  [#161](https://github.com/joyfulhouse/brilliant-mqtt/issues/161))
+- Wired light and switch feedback no longer lets a delayed pre-command snapshot
+  overwrite the requested state (the ON -> OFF -> ON flicker). Native
+  observations are kept separate from a provisional request that expires after
+  a fixed 20-second window; contradictions that metadata cannot resolve are
+  published as `ambiguous` rather than suppressed, and the device's own state is
+  published once the window ends. Mesh behaviour is unchanged. New
+  `wired_write_status`, `wired_requested` and `wired_write_deadline` keys
+  appear while a write is pending.
+  ([#174](https://github.com/joyfulhouse/brilliant-mqtt/pull/174);
+  [#172](https://github.com/joyfulhouse/brilliant-mqtt/issues/172))
+
 ## [0.10.2] - 2026-09-10
 
 The on-panel agent and Home Assistant integration both move to 0.10.2. The
