@@ -1046,6 +1046,31 @@ def _gated_adapter(
     return _adapter_for(_GatedRpcObserver(fail_with=fail_with))
 
 
+async def test_issue_callback_failure_log_contains_only_event_and_class(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    observer, adapter = _gated_adapter()
+    observer.release.set()
+    ticket = AdmissionTicket()
+
+    def fail_issue(_provenance: object) -> None:
+        raise RuntimeError("private-payload-sentinel")
+
+    ticket.set_issue_callback(fail_issue)
+    try:
+        with caplog.at_level(logging.WARNING, logger="brilliant_mqtt.bus"):
+            await adapter.set_variables(
+                "private-owner-sentinel", "load", [VarSet("on", "1")], ticket=ticket
+            )
+        assert len(caplog.records) == 1
+        assert caplog.records[0].getMessage() == "WIRED_ISSUE_CALLBACK_FAILED RuntimeError"
+        assert caplog.records[0].exc_info is None
+        assert "private-payload-sentinel" not in caplog.text
+        assert "private-owner-sentinel" not in caplog.text
+    finally:
+        await adapter.shutdown()
+
+
 async def _detached_write(
     adapter: RpcBusAdapter, device_id: str = "ble_mesh", peripheral_id: str = "mesh_light_1"
 ) -> asyncio.Task[str]:

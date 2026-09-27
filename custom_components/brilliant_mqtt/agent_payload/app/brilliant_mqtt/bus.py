@@ -1326,11 +1326,8 @@ class RpcBusAdapter:
                             issued_values=tuple(admission.values.items()),
                         )
                     )
-                except Exception:
-                    logger.exception(
-                        "set_variables(%s) issue callback failed; continuing",
-                        record.label,
-                    )
+                except Exception as error:
+                    logger.warning("WIRED_ISSUE_CALLBACK_FAILED %s", type(error).__name__)
                 if admission.write_class is not WriteClass.MAINTENANCE:
                     for waiter in self._write_waiters.get(admission.device_id, []):
                         if waiter.write_class is WriteClass.MAINTENANCE:
