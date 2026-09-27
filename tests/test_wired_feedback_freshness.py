@@ -206,10 +206,11 @@ async def test_terminal_observed_has_no_projection_after_late_preissue_capture()
     del final.variables["on"]
     await bus.emit(final)
 
-    record = bridge._wired_feedback[PID]
-    assert record.status == "observed"
-    assert not record.projected
-    assert PID not in bridge._wired_deadline_tasks
+    feedback = bridge._wired[PID].record.feedback
+    assert feedback is not None and feedback.status == "observed"
+    assert not feedback.projected
+    assert bridge._wired[PID].timer is None
+    assert _states(mqtt)[-1]["wired_write_status"] == "observed"
     assert _states(mqtt)[-1]["state"] == "ON"
     await _shutdown_feedback(bridge)
 
@@ -258,8 +259,7 @@ class _AdmissionWaitBus(FakeBus):
     ) -> str:
         self.admitted.set()
         await self.release_issue.wait()
-        if ticket is not None:
-            ticket.mark_issued(self._next_provenance())
+        self._mark_issued(device_id, peripheral_id, sets, ticket)
         self.commands.append((device_id, peripheral_id, list(sets)))
         return self.set_variables_receipt
 
@@ -694,6 +694,7 @@ async def test_expiry_invalidates_blocked_provisional_publish() -> None:
     _bus, _mqtt, bridge = await _bridged(
         _dimmer(),
         mqtt=mqtt,
+        clock=clock,
         wall_clock=clock,
         sleeper=sleeper,
     )
@@ -778,7 +779,7 @@ async def test_inflight_completion_cannot_revive_feedback_after_reacquisition() 
     await command
 
     assert _states(mqtt) == []
-    assert PID not in bridge._wired_feedback
+    assert bridge._wired[PID].record.feedback is None
     await _shutdown_feedback(bridge)
 
 
@@ -813,7 +814,8 @@ async def test_write_failure_still_publishes_no_success_projection() -> None:
     with pytest.raises(RuntimeError, match="bus boom"):
         await mqtt.inject(SET_TOPIC, '{"state":"ON","brightness":85}')
 
-    assert _states(mqtt) == []
+    assert _states(mqtt)[-1]["state"] == "OFF"
+    assert _states(mqtt)[-1]["wired_write_status"] == "unconfirmed"
     assert bridge._devices[PID].variables["on"].value == "0"
     await _shutdown_feedback(bridge)
 
@@ -867,7 +869,7 @@ class _ReplacementOutcomeBus(FakeBus):
                 ticket=ticket,
             )
         if ticket is not None:
-            ticket.mark_issued(self._next_provenance())
+            self._mark_issued(device_id, peripheral_id, sets, ticket)
         if self.outcome == "failed":
             raise RuntimeError("replacement failed")
         if self.outcome == "cancelled":
@@ -907,18 +909,21 @@ async def test_waiting_replacement_preserves_old_deadline_fallback() -> None:
         _dimmer(), bus=bus, clock=clock, wall_clock=clock, sleeper=sleeper
     )
     await mqtt.inject(SET_TOPIC, '{"state":"ON","brightness":85}')
+    original_timer = bridge._wired[PID].timer
     clock.advance(7)
     replacement = asyncio.create_task(mqtt.inject(SET_TOPIC, '{"state":"ON","brightness":200}'))
     await bus.blocked.wait()
     await asyncio.sleep(0)
-    assert sleeper.requested[-1] == 13.0
+    assert bridge._wired[PID].timer is original_timer
+    assert bridge._wired[PID].record.deadline_at == 20.0
+    assert sleeper.requested[-1] == 20.0
     clock.advance(13)
     await sleeper.release_all()
 
     state = _states(mqtt)[-1]
     _assert_feedback(state, "unconfirmed", {}, None)
     assert state["state"] == "OFF"
-    assert PID not in bridge._wired_deadline_tasks
+    assert bridge._wired[PID].timer is None
     bus.release.set()
     with pytest.raises(RuntimeError, match="replacement failed"):
         await replacement
@@ -935,6 +940,7 @@ async def test_unsuccessful_replacement_retires_prior_projection_to_native(
     _bus, mqtt, bridge = await _bridged(
         _dimmer(),
         bus=bus,
+        clock=clock,
         wall_clock=clock,
         sleeper=sleeper,
     )
@@ -968,7 +974,7 @@ async def test_superseded_replacement_waits_for_inherited_deadline() -> None:
 
     await mqtt.inject(SET_TOPIC, '{"state":"ON","brightness":200}')
     assert _states(mqtt) == []
-    assert PID in bridge._wired_deadline_tasks
+    assert bridge._wired[PID].timer is not None
     clock.advance(20)
     await sleeper.release_all()
     _assert_feedback(_states(mqtt)[-1], "unconfirmed", {}, None)
@@ -988,7 +994,11 @@ async def test_superseded_or_cancelled_write_still_has_no_echo(
     else:
         await mqtt.inject(SET_TOPIC, '{"state":"ON","brightness":85}')
 
-    assert _states(mqtt) == []
+    if bus_type is _CancelledBus:
+        assert _states(mqtt)[-1]["state"] == "OFF"
+        assert _states(mqtt)[-1]["wired_write_status"] == "unconfirmed"
+    else:
+        assert _states(mqtt) == []
     await _shutdown_feedback(bridge)
 
 
@@ -1014,10 +1024,10 @@ async def test_owner_rebinding_retires_wired_projection() -> None:
     await bus.emit(switch)
 
     state = _states(mqtt)[-1]
-    assert PID not in bridge._pending_wired
-    assert PID not in bridge._wired_deadline_tasks
+    assert bridge._wired[PID].record.feedback is None
+    assert bridge._wired[PID].timer is None
     assert state["state"] == "OFF"
-    assert "wired_write_status" not in state
+    assert state["wired_write_status"] == "unconfirmed"
     await _shutdown_feedback(bridge)
 
 
@@ -1031,19 +1041,19 @@ async def test_preissue_partial_capability_omission_keeps_projection(omitted: st
     del partial.variables[omitted]
     partial.variables["power"] = Variable("power", "22")
     bus.set_devices([partial])
-    captured = (await bus.get_all())[0]
+    captured = replace((await bus.get_all())[0], capture_complete=False)
 
     await mqtt.inject(SET_TOPIC, '{"state":"ON"}')
-    timer = bridge._wired_deadline_tasks[PID]
-    generation = bridge._wired_write_generation[PID]
+    timer = bridge._wired[PID].timer
+    generation = bridge._wired[PID].record.generation
     await bus.emit(captured)
 
     state = _states(mqtt)[-1]
     assert state["state"] == "ON"
     assert state["power"] == 2.2
     assert state["wired_write_status"] == "provisional"
-    assert bridge._wired_deadline_tasks[PID] is timer
-    assert bridge._wired_write_generation[PID] == generation
+    assert bridge._wired[PID].timer is timer
+    assert bridge._wired[PID].record.generation == generation
     await _shutdown_feedback(bridge)
 
 
@@ -1057,7 +1067,7 @@ async def test_postissue_off_without_scale_keeps_ambiguous_feedback() -> None:
     state = _states(mqtt)[-1]
     assert state["state"] == "OFF"
     assert state["wired_write_status"] == "ambiguous"
-    assert PID in bridge._pending_wired
+    assert bridge._wired[PID].record.feedback is not None
     await _shutdown_feedback(bridge)
 
 
@@ -1097,9 +1107,9 @@ async def test_late_preissue_rebinding_keeps_new_native_off(binding: str) -> Non
     state = _states(mqtt)[-1]
     assert stored.variables["on"].value == "0"
     assert state["state"] == "OFF"
-    assert "wired_write_status" not in state
-    assert PID not in bridge._wired_issue_boundary
-    assert PID not in bridge._pending_wired
+    assert state["wired_write_status"] == "unconfirmed"
+    assert bridge._wired[PID].record.attempt is None
+    assert bridge._wired[PID].record.feedback is None
     if binding == "owner":
         assert stored.device_id == "new_owner"
     else:
@@ -1151,7 +1161,7 @@ async def test_soft_reconnect_retires_old_request_ownership() -> None:
     await bus.fire_reconnect()
 
     assert _states(mqtt)[-1]["state"] == "OFF"
-    assert "wired_write_status" not in _states(mqtt)[-1]
+    assert _states(mqtt)[-1]["wired_write_status"] == "unconfirmed"
     await _shutdown_feedback(bridge)
 
 
@@ -1165,11 +1175,9 @@ async def test_soft_reconnect_retires_old_comparison_provenance() -> None:
 
     await bus.fire_reconnect()
 
-    provenance = bridge._wired_native_provenance[PID]
-    assert set(provenance) == {"intensity"}
-    marker = provenance["intensity"]
-    assert marker is not None
-    assert marker.source_generation == 2
+    record = bridge._wired[PID].record
+    assert record.source_generation == 2
+    assert set(dict(record.native_eras)) == {"intensity"}
     await _shutdown_feedback(bridge)
 
 
@@ -1187,7 +1195,7 @@ async def test_older_generation_capture_does_not_retire_new_request() -> None:
     state = _states(mqtt)[-1]
     assert state["state"] == "ON"
     assert state["wired_write_status"] == "provisional"
-    assert PID in bridge._pending_wired
+    assert bridge._wired[PID].record.feedback is not None
     await _shutdown_feedback(bridge)
 
 
@@ -1215,7 +1223,7 @@ async def test_older_generation_binding_cannot_replace_new_session(binding: str)
     state = _states(mqtt)[-1]
     assert state["state"] == "ON"
     assert state["wired_write_status"] == "provisional"
-    assert PID in bridge._pending_wired
+    assert bridge._wired[PID].record.feedback is not None
     if binding == "owner":
         assert bridge._devices[PID].device_id == "new_owner"
     else:
@@ -1231,8 +1239,7 @@ async def test_reconnect_without_device_retires_wired_state() -> None:
 
     await bus.fire_reconnect()
 
-    assert PID not in bridge._pending_wired
-    assert PID not in bridge._wired_native_provenance
+    assert PID not in bridge._wired
     await bus.emit(_dimmer(on="0", on_timestamp=4000))
     assert _states(mqtt)[-1]["state"] == "OFF"
     assert "wired_write_status" not in _states(mqtt)[-1]
@@ -1259,8 +1266,7 @@ async def test_failed_reconnect_read_still_retires_wired_state() -> None:
 
     await bus.fire_reconnect()
 
-    assert PID not in bridge._pending_wired
-    assert PID not in bridge._wired_native_provenance
+    assert PID not in bridge._wired
     await bus.emit(_dimmer(on="0", on_timestamp=4000))
     assert _states(mqtt)[-1]["state"] == "OFF"
     assert "wired_write_status" not in _states(mqtt)[-1]
@@ -1280,7 +1286,7 @@ async def test_reconnect_retires_preboundary_command_completion() -> None:
     await command
 
     assert _states(mqtt) == []
-    assert PID not in bridge._wired_feedback
+    assert bridge._wired[PID].record.feedback is None
     await _shutdown_feedback(bridge)
 
 

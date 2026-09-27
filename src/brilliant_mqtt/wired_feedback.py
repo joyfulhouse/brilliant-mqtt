@@ -40,6 +40,7 @@ class Record:
     deadline_at: float | None = None
     deadline_wall: float | None = None
     native_debt: bool = False
+    native_debt_epoch: int = 0
     revision: int = 0
     closed: bool = False
 
@@ -58,6 +59,7 @@ class Begin:
 class Issue:
     generation: int
     fields: tuple[tuple[str, int], ...]
+    values: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -87,6 +89,7 @@ class Rebind:
 class PublishAccepted:
     revision: int
     native: bool
+    debt_epoch: int | None = None
 
 
 @dataclass(frozen=True)
@@ -143,7 +146,7 @@ def render(record: Record) -> Rendered | None:
         return None
     feedback = record.feedback
     variables = dict(record.native.variables)
-    if feedback is not None:
+    if feedback is not None and (not record.native_debt or not feedback.projected):
         for name, value in feedback.targets:
             if name in feedback.projected:
                 old = variables.get(name)
@@ -153,11 +156,20 @@ def render(record: Record) -> Rendered | None:
                     externally_settable=old.externally_settable if old is not None else True,
                 )
     fields = payload_fields(replace(record.native, variables=variables))
+    if record.unknown & {"intensity", "max_intensity_value"}:
+        fields.pop("brightness", None)
     if "on" not in variables or (
-        "on" in record.unknown and not (feedback is not None and "on" in feedback.projected)
+        "on" in record.unknown
+        and not (feedback is not None and not record.native_debt and "on" in feedback.projected)
     ):
         fields["state"] = None
-    if feedback is not None:
+    if record.native_debt and feedback is not None and feedback.projected:
+        fields.update(
+            wired_write_status="unconfirmed",
+            wired_requested={},
+            wired_write_deadline=None,
+        )
+    elif feedback is not None:
         pending = feedback.status in ("provisional", "ambiguous")
         fields.update(
             wired_write_status=feedback.status,
@@ -170,7 +182,7 @@ def render(record: Record) -> Rendered | None:
             wired_requested={},
             wired_write_deadline=None,
         )
-    return Rendered(fields, feedback is None or not feedback.projected)
+    return Rendered(fields, feedback is None or not feedback.projected or record.native_debt)
 
 
 def _binding(device: BrilliantDevice) -> tuple[str, object, bool, int]:
@@ -181,6 +193,13 @@ def _era(provenance: CaptureProvenance | None, name: str) -> int | None:
     if provenance is None:
         return None
     return dict(provenance.field_eras).get(name, 0)
+
+
+def _not_known_preissue(
+    provenance: CaptureProvenance | None, name: str, issued: dict[str, int]
+) -> bool:
+    captured = _era(provenance, name)
+    return name not in issued or captured is None or captured >= issued[name]
 
 
 def _capture(record: Record, incoming: BrilliantDevice) -> Record:
@@ -225,8 +244,9 @@ def _capture(record: Record, incoming: BrilliantDevice) -> Record:
             unknown.add(name)
             if name == "on":
                 variables.pop(name, None)
-            elif name in ("intensity", "max_intensity_value") and name not in variables:
-                variables[name] = Variable(name, "")
+            elif name in ("intensity", "max_intensity_value"):
+                if name not in variables:
+                    variables[name] = Variable(name, "")
             else:
                 variables.pop(name, None)
         else:
@@ -243,6 +263,10 @@ def _capture(record: Record, incoming: BrilliantDevice) -> Record:
     if rebound and previous is not None:
         # Never carry old-owner or old-translation fields into a new binding.
         variables = dict(incoming.variables)
+        if same_owner_kind and not incoming.capture_complete:
+            for name in ("intensity", "max_intensity_value"):
+                if name not in present and name in previous.variables:
+                    variables[name] = previous.variables[name]
         native = replace(incoming, variables=variables)
         eras = {name: era for name, era in eras.items() if name in present}
         unknown = set(incoming.capture_unknown) | (set(previous.variables) - set(present))
@@ -252,7 +276,16 @@ def _capture(record: Record, incoming: BrilliantDevice) -> Record:
     deadline_at = None if newer_source or rebound else record.deadline_at
     deadline_wall = None if newer_source or rebound else record.deadline_wall
     debt = record.native_debt or ((newer_source or rebound) and record.feedback is not None)
-    if feedback is not None:
+    new_obligation = (newer_source or rebound) and record.feedback is not None
+    if feedback is not None and feedback.status in ("observed", "unconfirmed") and not debt:
+        issued = dict(feedback.issued_eras)
+        if any(
+            name in changed and _not_known_preissue(provenance, name, issued)
+            for name, _value in feedback.targets
+        ):
+            feedback = None
+    if feedback is not None and feedback.status != "unconfirmed":
+        prior_projected = feedback.projected
         projected = set(feedback.projected)
         unresolved = set(feedback.unresolved)
         ambiguous = set(feedback.ambiguous)
@@ -275,6 +308,10 @@ def _capture(record: Record, incoming: BrilliantDevice) -> Record:
         if not unresolved:
             projected.clear()
             debt = True
+            new_obligation = True
+        elif prior_projected and not projected:
+            debt = True
+            new_obligation = True
         feedback = replace(
             feedback,
             projected=frozenset(projected),
@@ -294,6 +331,7 @@ def _capture(record: Record, incoming: BrilliantDevice) -> Record:
         deadline_at=deadline_at,
         deadline_wall=deadline_wall,
         native_debt=debt,
+        native_debt_epoch=record.native_debt_epoch + int(new_obligation),
         revision=record.revision + 1,
     )
 
@@ -312,7 +350,14 @@ def reduce(record: Record, event: Event) -> Transition:
         updated = replace(record, generation=generation, attempt=Attempt(generation, event.targets))
     elif isinstance(event, Issue):
         if record.attempt is not None and record.attempt.generation == event.generation:
-            updated = replace(record, attempt=replace(record.attempt, issued_eras=event.fields))
+            updated = replace(
+                record,
+                attempt=replace(
+                    record.attempt,
+                    issued_eras=event.fields,
+                    targets=event.values or record.attempt.targets,
+                ),
+            )
     elif isinstance(event, Outcome):
         attempt = record.attempt
         if attempt is not None and attempt.generation == event.generation:
@@ -326,6 +371,7 @@ def reduce(record: Record, event: Event) -> Transition:
                     deadline_at=None,
                     deadline_wall=None,
                     native_debt=True,
+                    native_debt_epoch=record.native_debt_epoch + 1,
                     revision=record.revision + 1,
                 )
                 publish = True
@@ -352,30 +398,29 @@ def reduce(record: Record, event: Event) -> Transition:
                 )
                 deadline = record.deadline_at
                 wall = record.deadline_wall
-                if deadline is None and not record.native_debt:
+                if deadline is None:
                     deadline = event.now + WIRED_PROVISIONAL_SECONDS
                     wall = event.wall_now + WIRED_PROVISIONAL_SECONDS
-                # An expired native debt remains visible until MQTT accepts it.
-                if record.native_debt and deadline is None:
-                    updated = replace(record, attempt=None)
-                else:
-                    updated = replace(
-                        record,
-                        attempt=None,
-                        feedback=Feedback(
-                            attempt.targets,
-                            attempt.issued_eras,
-                            frozenset(projected),
-                            frozenset(unresolved),
-                            frozenset(ambiguous),
-                            status,
-                        ),
-                        deadline_at=deadline,
-                        deadline_wall=wall,
-                        native_debt=not unresolved,
-                        revision=record.revision + 1,
-                    )
-                    publish = True
+                debt = record.native_debt or not unresolved
+                updated = replace(
+                    record,
+                    attempt=None,
+                    feedback=Feedback(
+                        attempt.targets,
+                        attempt.issued_eras,
+                        frozenset(projected),
+                        frozenset(unresolved),
+                        frozenset(ambiguous),
+                        status,
+                    ),
+                    deadline_at=deadline,
+                    deadline_wall=wall,
+                    native_debt=debt,
+                    native_debt_epoch=record.native_debt_epoch
+                    + int(not record.native_debt and debt),
+                    revision=record.revision + 1,
+                )
+                publish = True
     elif isinstance(event, Expire):
         if record.deadline_at is not None and event.now >= record.deadline_at:
             feedback = record.feedback
@@ -391,6 +436,7 @@ def reduce(record: Record, event: Event) -> Transition:
                 deadline_at=None,
                 deadline_wall=None,
                 native_debt=True,
+                native_debt_epoch=record.native_debt_epoch + 1,
                 revision=record.revision + 1,
             )
             publish = True
@@ -406,6 +452,7 @@ def reduce(record: Record, event: Event) -> Transition:
                 deadline_at=None,
                 deadline_wall=None,
                 native_debt=record.native_debt or record.feedback is not None,
+                native_debt_epoch=record.native_debt_epoch + int(record.feedback is not None),
                 revision=record.revision + 1,
             )
             publish = record.feedback is not None
@@ -419,26 +466,37 @@ def reduce(record: Record, event: Event) -> Transition:
             deadline_wall=None,
             native_eras=(),
             native_debt=record.native_debt or record.feedback is not None,
+            native_debt_epoch=record.native_debt_epoch + int(record.feedback is not None),
             revision=record.revision + 1,
         )
         publish = record.feedback is not None
     elif isinstance(event, PublishAccepted):
-        if event.revision == record.revision and event.native:
+        matches_debt = (
+            event.debt_epoch == record.native_debt_epoch
+            if event.debt_epoch is not None
+            else event.revision == record.revision
+        )
+        if event.native and matches_debt:
             feedback = record.feedback
             if feedback is not None and feedback.status in ("observed", "unconfirmed"):
-                feedback = None
                 updated = replace(
                     record,
-                    feedback=None,
                     native_debt=False,
                     deadline_at=None,
                     deadline_wall=None,
                 )
             else:
                 updated = replace(record, native_debt=False)
+            if record.native_debt and feedback is not None and feedback.projected:
+                updated = replace(updated, revision=record.revision + 1)
+                publish = True
     elif isinstance(event, PublishFailed):
         if event.revision == record.revision and event.native:
-            updated = replace(record, native_debt=True)
+            updated = replace(
+                record,
+                native_debt=True,
+                native_debt_epoch=record.native_debt_epoch + int(not record.native_debt),
+            )
     elif isinstance(event, Shutdown):
         updated = replace(
             record,

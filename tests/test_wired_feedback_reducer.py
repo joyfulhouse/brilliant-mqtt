@@ -169,6 +169,26 @@ def test_raw_none_on_is_unknown_and_never_invented_off() -> None:
     assert _render(record)["state"] is None
 
 
+@pytest.mark.parametrize("name", ["intensity", "max_intensity_value"])
+def test_raw_none_capability_is_unknown_without_rebinding(name: str) -> None:
+    initial = _device(on="1")
+    initial.variables["max_intensity_value"] = Variable("max_intensity_value", "2000")
+    initial.capture_present = frozenset(initial.variables)
+    record = reduce(Record(), Capture(initial)).record
+    unknown = _device(on="1", complete=False)
+    unknown.variables.pop("intensity")
+    unknown.capture_present = frozenset({"on", name})
+    unknown.capture_unknown = frozenset({name})
+    before_generation = record.generation
+
+    record = reduce(record, Capture(unknown)).record
+
+    assert record.native is not None and record.native.is_dimmable
+    assert record.native.max_intensity == 2000
+    assert record.generation == before_generation
+    assert "brightness" not in _render(record)
+
+
 def test_older_write_era_cannot_erase_newer_native_during_second_command() -> None:
     record = reduce(Record(), Capture(_device())).record
     record = _success(record)
@@ -198,6 +218,26 @@ def test_delayed_success_starts_its_window_when_success_arrives() -> None:
     record = reduce(record, Outcome(record.generation, "success", 37.0, 1037.0)).record
     assert timer_deadline(record) == 57.0
     assert _render(record)["wired_write_deadline"] == 1057.0
+
+
+def test_success_during_native_debt_waits_for_acceptance_without_renewing_old_window() -> None:
+    record = _success(reduce(Record(), Capture(_device())).record)
+    record = reduce(record, Expire(20.0)).record
+    old_revision = record.revision
+    debt_epoch = record.native_debt_epoch
+    record = reduce(record, Begin((("on", "1"),))).record
+    record = reduce(record, Issue(record.generation, (("on", 2),))).record
+    record = reduce(record, Outcome(record.generation, "success", 23.0, 23.0)).record
+
+    assert record.native_debt
+    assert _render(record)["state"] == "OFF"
+    assert timer_deadline(record) == 43.0
+    record = reduce(
+        record, PublishAccepted(old_revision, native=True, debt_epoch=debt_epoch)
+    ).record
+    assert not record.native_debt
+    assert _render(record)["state"] == "ON"
+    assert timer_deadline(record) == 43.0
 
 
 @pytest.mark.parametrize("outcome", ["failed", "cancelled"])

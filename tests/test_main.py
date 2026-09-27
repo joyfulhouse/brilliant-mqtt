@@ -783,7 +783,7 @@ async def test_session_teardown_retires_wired_feedback(
         '{"state":"ON","brightness":85}',
     )
     bridge = bridges[0]
-    deadlines = list(bridge._wired_deadline_tasks.values())
+    deadlines = [slot.timer for slot in bridge._wired.values() if slot.timer is not None]
 
     session.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -793,8 +793,7 @@ async def test_session_teardown_retires_wired_feedback(
     await sleeper.release_all()
     await asyncio.gather(*deadlines, return_exceptions=True)
 
-    assert not bridge._pending_wired
-    assert not bridge._wired_native_provenance
+    assert not bridge._wired
     assert not mqtt.published
 
 

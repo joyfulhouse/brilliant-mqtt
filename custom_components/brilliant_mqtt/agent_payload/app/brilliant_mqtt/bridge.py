@@ -33,6 +33,26 @@ from brilliant_mqtt.model import BrilliantDevice, CaptureProvenance, DeviceKind,
 from brilliant_mqtt.motion_derive import MotionDeriver
 from brilliant_mqtt.protocols import BusClient, MqttClient
 from brilliant_mqtt.retained_topics import RetainedTopicLedger
+from brilliant_mqtt.wired_feedback import (
+    Begin,
+    Capture,
+    Event,
+    Expire,
+    Issue,
+    Outcome,
+    PublishAccepted,
+    PublishFailed,
+    Record,
+    Shutdown,
+    SourceGeneration,
+    timer_deadline,
+)
+from brilliant_mqtt.wired_feedback import (
+    reduce as reduce_wired,
+)
+from brilliant_mqtt.wired_feedback import (
+    render as render_wired,
+)
 from brilliant_mqtt.write_admission import (
     AdmissionTicket,
     Superseded,
@@ -67,12 +87,6 @@ MESH_CONFIRM_SECONDS = 80.0
 # outcome — the pending closes unconfirmed and state stays unknown (the
 # stale-stream watchdog owns stream recovery).
 MESH_CONFIRM_MAX_OBSERVATION_AGE_S = 10.0
-
-# The pilot's frozen observer mirror was about 20 seconds old. Keep a wired
-# request projection for at most that fixed interval, then fall back to the
-# latest native observation as explicitly unconfirmed. Observations never
-# renew this monotonic deadline.
-WIRED_PROVISIONAL_SECONDS = 20.0
 
 # Confirm receipts log at INFO once every N confirmations (contradiction
 # receipts always log at WARNING — those are the known-failed deliveries).
@@ -119,27 +133,16 @@ class _PendingMeshWrite:
 
 
 @dataclass
-class _WiredWriteFeedback:
-    """Request-owned wired-primary projection and its uncertainty metadata."""
+class _WiredSlot:
+    """One reducer record, deadline and serialized publisher for a wired load."""
 
-    targets: dict[str, str]
-    unresolved: set[str]
-    projected: set[str]
-    ambiguous: set[str]
-    generation: int
-    issue_provenance: CaptureProvenance | None
-    status: str = "provisional"
-    deadline: float | None = None
-    expires_at: float | None = None
-
-
-@dataclass
-class _WiredWriteAttempt:
-    """A command generation before its transport outcome is known."""
-
-    targets: dict[str, str]
-    generation: int
-    issue_provenance: CaptureProvenance | None = None
+    record: Record
+    timer: asyncio.Task[None] | None = None
+    timer_at: float | None = None
+    publisher: asyncio.Task[None] | None = None
+    publishing_revision: int | None = None
+    dirty: bool = False
+    force: bool = False
 
 
 @dataclass
@@ -298,23 +301,9 @@ class Bridge:
         self._mesh_feedback_tasks: dict[asyncio.Task[None], str] = {}
         self._mesh_feedback_enabled = True
         self._mesh_confirm_count = 0
-        # Wired-primary state keeps native Variables in _devices. Successful
-        # requests live only in this separate projection/feedback state.
-        self._wired_write_generation: dict[str, int] = {}
-        self._pending_wired: dict[str, _WiredWriteFeedback] = {}
-        self._wired_feedback: dict[str, _WiredWriteFeedback] = {}
-        self._wired_deadline_tasks: dict[str, asyncio.Task[None]] = {}
-        self._wired_feedback_tasks: dict[asyncio.Task[None], str] = {}
-        self._wired_publish_revision: dict[str, int] = {}
-        self._wired_publish_locks: dict[str, asyncio.Lock] = {}
-        # A replacement inherits the prior request's monotonic deadline until
-        # it issues or native fallback is published. None means no prior timer.
-        self._wired_native_fallback_required: dict[str, float | None] = {}
+        self._wired: dict[str, _WiredSlot] = {}
+        self._wired_source_generation = 0
         self._wired_feedback_enabled = True
-        # Provenance is per native variable even though every variable in one
-        # normalized snapshot shares the same local capture marker.
-        self._wired_native_provenance: dict[str, dict[str, CaptureProvenance | None]] = {}
-        self._wired_issue_boundary: dict[str, tuple[CaptureProvenance, frozenset[str]]] = {}
 
         bus.on_change(self._on_change, want_device=self._include)
         mqtt.on_command(self._on_command)
@@ -349,10 +338,6 @@ class Bridge:
             self._command_generation[device.peripheral_id] = (
                 self._command_generation.get(device.peripheral_id, 0) + 1
             )
-            if previous is not None:
-                self._retire_wired_feedback(device.peripheral_id)
-                self._wired_native_provenance.pop(device.peripheral_id, None)
-                self._wired_issue_boundary.pop(device.peripheral_id, None)
         self._devices[device.peripheral_id] = device
 
     @staticmethod
@@ -362,89 +347,38 @@ class Bridge:
             DeviceKind.SWITCH,
         )
 
-    @staticmethod
-    def _capture_precedes(
-        capture: CaptureProvenance | None,
-        issue: CaptureProvenance | None,
-    ) -> bool:
-        return (
-            capture is not None
-            and issue is not None
-            and (
-                capture.source_generation < issue.source_generation
-                or (
-                    capture.source_generation == issue.source_generation
-                    and capture.sequence < issue.sequence
-                )
-            )
+    def _wired_slot(self, peripheral_id: str) -> _WiredSlot:
+        return self._wired.setdefault(
+            peripheral_id, _WiredSlot(Record(source_generation=self._wired_source_generation))
         )
 
+    def _wired_event(self, peripheral_id: str, event: Event) -> _WiredSlot:
+        slot = self._wired_slot(peripheral_id)
+        if slot.record.source_generation < self._wired_source_generation:
+            slot.record = reduce_wired(
+                slot.record, SourceGeneration(self._wired_source_generation)
+            ).record
+        slot.record = reduce_wired(slot.record, event).record
+        self._sync_wired_timer(peripheral_id, slot)
+        return slot
+
     def _remember_native_observation(self, observed: BrilliantDevice) -> BrilliantDevice:
-        """Retain native fields; a known pre-issue capture cannot erase later evidence."""
+        """Reduce wired captures before any broker await or publication."""
         if not self._is_wired_primary(observed):
             self._remember_device(observed)
             return observed
-
         peripheral_id = observed.peripheral_id
-        previous = self._devices.get(peripheral_id)
-        capture = observed.capture_provenance
-        variables = dict(observed.variables)
-        if previous is not None and self._is_wired_primary(previous):
-            retained_capabilities: dict[str, Variable] = {}
-            if previous.device_id == observed.device_id and previous.kind == observed.kind:
-                # A partial capture cannot revoke an established capability.
-                # Explicitly supplied metadata still changes the binding.
-                for name in ("intensity", "max_intensity_value"):
-                    if name not in variables and name in previous.variables:
-                        retained_capabilities[name] = previous.variables[name]
-                variables.update(retained_capabilities)
-                pending = self._pending_wired.get(peripheral_id)
-                if pending is not None:
-                    for name in pending.targets:
-                        if name not in variables and name in previous.variables:
-                            variables[name] = previous.variables[name]
-            if not self._same_binding(previous, replace(observed, variables=variables)):
-                boundary = self._wired_issue_boundary.get(peripheral_id)
-                if (
-                    capture is not None
-                    and boundary is not None
-                    and capture.source_generation < boundary[0].source_generation
-                ):
-                    return previous
-                # Compare the effective partial snapshot first, then retire the
-                # old boundary before copying any prior native evidence.
-                variables = {**observed.variables, **retained_capabilities}
-                self._remember_device(replace(observed, variables=variables))
-                previous = None
-        provenance = self._wired_native_provenance.setdefault(peripheral_id, {})
-        if capture is not None and any(
-            marker is not None and marker.source_generation < capture.source_generation
-            for marker in provenance.values()
-        ):
-            provenance.clear()
-        if previous is not None and self._is_wired_primary(previous):
-            boundary = self._wired_issue_boundary.get(peripheral_id)
-            issue = boundary[0] if boundary is not None else None
-            targets = boundary[1] if boundary is not None else frozenset()
-            for name in observed.variables:
-                old_capture = provenance.get(name)
-                if (
-                    name in targets
-                    and self._capture_precedes(capture, issue)
-                    and not self._capture_precedes(old_capture, issue)
-                    and name in previous.variables
-                ):
-                    variables[name] = previous.variables[name]
-                else:
-                    provenance[name] = capture
-        else:
-            provenance.clear()
-            provenance.update({name: observed.capture_provenance for name in observed.variables})
-        for name in list(provenance):
-            if name not in variables:
-                del provenance[name]
-        native = replace(observed, variables=variables)
-        self._remember_device(native)
+        if not self._wired_feedback_enabled:
+            return self._devices.get(peripheral_id, observed)
+        slot = self._wired_event(peripheral_id, Capture(observed))
+        native = slot.record.native
+        if native is None:
+            return self._devices.get(peripheral_id, observed)
+        self._wired_source_generation = max(
+            self._wired_source_generation, slot.record.source_generation
+        )
+        if self._devices.get(peripheral_id) is not native:
+            self._remember_device(native)
         return native
 
     def _beat(self) -> None:
@@ -481,7 +415,6 @@ class Bridge:
             if self._is_wired_primary(captured) and entities_for(captured, self._panel):
                 observed = self._derived(captured)
                 self._remember_native_observation(observed)
-                self._observe_wired_pending(observed)
 
         await self._async_publish_retained(
             availability_topic(self._panel),
@@ -577,6 +510,9 @@ class Bridge:
 
     async def reconcile_after_reconnect(self) -> None:
         """Retire session-local wired evidence before reading a new bus generation."""
+        self._wired_source_generation += 1
+        for peripheral_id in list(self._wired):
+            self._wired_event(peripheral_id, SourceGeneration(self._wired_source_generation))
         await self.shutdown_wired_feedback()
         self._wired_feedback_enabled = True
         await self.reconcile()
@@ -650,7 +586,6 @@ class Bridge:
         self._last_state_payload.clear()
         self._last_state_fields.clear()
         self._devices.clear()
-        self._wired_native_provenance.clear()
         if self._deriver is not None:
             # An ex-leader must not carry hold state into a re-acquisition;
             # the new session starts cold (motion off until the next spike).
@@ -687,7 +622,6 @@ class Bridge:
                 continue
             observed = self._derived(device)
             device = self._remember_native_observation(observed)
-            self._observe_wired_pending(observed)
             self._observe_mesh_pending(device)
             fields = payload_fields(device)
             if fields:
@@ -840,10 +774,9 @@ class Bridge:
         wired_primary = self._is_wired_primary(device)
         if wired_primary and (not self._wired_feedback_enabled or not self._included(device)):
             return
-        wired_revision = (
-            self._invalidate_wired_publications(peripheral_id) if wired_primary else None
-        )
-        fields = self._project_wired_feedback(device, fields)
+        if wired_primary:
+            await self._publish_wired_slot(peripheral_id, force=force)
+            return
         fields = self._project_pending_mesh(peripheral_id, fields)
         mesh_feedback = "mesh_write_status" in fields
         if mesh_feedback and (not self._mesh_feedback_enabled or not self._included(device)):
@@ -860,20 +793,6 @@ class Bridge:
             self._last_state_fields[peripheral_id] = fields
             return
         logger.debug("state publish for %s%s", peripheral_id, " (forced)" if force else "")
-        if wired_revision is not None:
-            task = asyncio.create_task(
-                self._publish_wired_state(device, fields, payload, wired_revision),
-                name=f"brilliant-mqtt-wired-state-{peripheral_id}",
-            )
-            self._wired_feedback_tasks[task] = peripheral_id
-            try:
-                await task
-            except asyncio.CancelledError:
-                if self._owns_wired_publication(peripheral_id, wired_revision):
-                    raise
-            finally:
-                self._wired_feedback_tasks.pop(task, None)
-            return
         if mesh_feedback:
             generation = self._mesh_write_generation.get(peripheral_id, 0)
             mesh_record = self._mesh_feedback.get(peripheral_id)
@@ -898,360 +817,110 @@ class Bridge:
         self._last_state_fields[peripheral_id] = fields
         self._last_state_payload[peripheral_id] = payload
 
-    def _owns_wired_feedback(
-        self,
-        peripheral_id: str,
-        generation: int,
-        record: _WiredWriteFeedback | None,
-    ) -> bool:
-        return (
-            self._wired_feedback_enabled
-            and self._wired_write_generation.get(peripheral_id, 0) == generation
-            and self._wired_feedback.get(peripheral_id) is record
-        )
+    def _sync_wired_timer(self, peripheral_id: str, slot: _WiredSlot) -> None:
+        deadline = timer_deadline(slot.record)
+        if deadline == slot.timer_at and slot.timer is not None and not slot.timer.done():
+            return
+        prior = slot.timer
+        if prior is not None and prior is not asyncio.current_task():
+            prior.cancel()
+        slot.timer = None
+        slot.timer_at = deadline
+        if deadline is not None and self._wired_feedback_enabled:
+            slot.timer = asyncio.create_task(self._wired_expire(peripheral_id, slot, deadline))
 
-    def _owns_wired_publication(self, peripheral_id: str, revision: int) -> bool:
-        return (
-            self._wired_feedback_enabled
-            and self._wired_publish_revision.get(peripheral_id, 0) == revision
-        )
+    async def _wired_expire(self, peripheral_id: str, slot: _WiredSlot, deadline: float) -> None:
+        await self._sleep(max(0.0, deadline - self._clock()))
+        if self._wired.get(peripheral_id) is not slot or not self._wired_feedback_enabled:
+            return
+        if slot.record.deadline_at != deadline:
+            return
+        self._wired_event(peripheral_id, Expire(self._clock()))
+        try:
+            await self._republish_snapshot(peripheral_id, force=True)
+        except Exception as error:
+            logger.warning("WIRED_PUBLISH_FAILED %s", type(error).__name__)
 
-    def _invalidate_wired_publications(self, peripheral_id: str) -> int:
-        revision = self._wired_publish_revision.get(peripheral_id, 0) + 1
-        self._wired_publish_revision[peripheral_id] = revision
-        for task, pid in self._wired_feedback_tasks.items():
-            if pid == peripheral_id and task.cancel():
-                self._last_state_fields.pop(peripheral_id, None)
-                self._last_state_payload.pop(peripheral_id, None)
-        return revision
+    async def _publish_wired_slot(self, peripheral_id: str, *, force: bool) -> None:
+        slot = self._wired.get(peripheral_id)
+        if slot is None or slot.record.closed or not self._wired_feedback_enabled:
+            return
+        slot.dirty = True
+        slot.force |= force
+        if slot.publisher is not None and not slot.publisher.done():
+            if slot.publishing_revision != slot.record.revision:
+                slot.publisher.cancel()
+            return
+        slot.publisher = asyncio.create_task(self._run_wired_publisher(peripheral_id, slot))
+        await asyncio.shield(slot.publisher)
 
-    async def _publish_wired_state(
-        self,
-        device: BrilliantDevice,
-        fields: dict[str, object],
-        payload: str,
-        revision: int,
-    ) -> None:
-        peripheral_id = device.peripheral_id
-        lock = self._wired_publish_locks.setdefault(peripheral_id, asyncio.Lock())
-        async with lock:
-            if not self._owns_wired_publication(peripheral_id, revision) or not self._included(
-                device
-            ):
+    async def _run_wired_publisher(self, peripheral_id: str, slot: _WiredSlot) -> None:
+        while slot.dirty and self._wired.get(peripheral_id) is slot:
+            if slot.record.closed or not self._wired_feedback_enabled:
                 return
-            await self._async_publish_retained(state_topic(self._panel, peripheral_id), payload)
-            if self._owns_wired_publication(peripheral_id, revision) and self._included(device):
-                self._last_state_fields[peripheral_id] = fields
-                self._last_state_payload[peripheral_id] = payload
-
-    def _set_wired_feedback(
-        self,
-        peripheral_id: str,
-        record: _WiredWriteFeedback | None,
-    ) -> None:
-        self._invalidate_wired_publications(peripheral_id)
-        if record is None:
-            self._wired_feedback.pop(peripheral_id, None)
-        else:
-            self._wired_feedback[peripheral_id] = record
-
-    def _drop_pending_wired(self, peripheral_id: str) -> None:
-        self._pending_wired.pop(peripheral_id, None)
-        task = self._wired_deadline_tasks.pop(peripheral_id, None)
-        if task is not None and task is not asyncio.current_task():
-            task.cancel()
-
-    def _retire_wired_feedback(self, peripheral_id: str) -> None:
-        self._wired_write_generation[peripheral_id] = (
-            self._wired_write_generation.get(peripheral_id, 0) + 1
-        )
-        self._drop_pending_wired(peripheral_id)
-        self._set_wired_feedback(peripheral_id, None)
-        self._wired_native_fallback_required.pop(peripheral_id, None)
-        self._wired_issue_boundary.pop(peripheral_id, None)
+            slot.dirty = False
+            force = slot.force
+            slot.force = False
+            rendered = render_wired(slot.record)
+            if rendered is None or not rendered.fields:
+                continue
+            fields = rendered.fields
+            if (
+                not force
+                and not slot.record.native_debt
+                and self._last_state_fields.get(peripheral_id) == fields
+            ):
+                continue
+            payload = _encode_fields(fields)
+            revision = slot.record.revision
+            debt_epoch = slot.record.native_debt_epoch
+            slot.publishing_revision = revision
+            try:
+                await self._async_publish_retained(state_topic(self._panel, peripheral_id), payload)
+            except asyncio.CancelledError:
+                if slot.record.closed or not self._wired_feedback_enabled:
+                    raise
+                slot.dirty = True
+                continue
+            except Exception as error:
+                if self._wired.get(peripheral_id) is slot:
+                    slot.record = reduce_wired(
+                        slot.record, PublishFailed(revision, rendered.native)
+                    ).record
+                logger.warning("WIRED_PUBLISH_FAILED %s", type(error).__name__)
+                if slot.dirty:
+                    continue
+                return
+            finally:
+                slot.publishing_revision = None
+            if self._wired.get(peripheral_id) is not slot or slot.record.closed:
+                return
+            transition = reduce_wired(
+                slot.record,
+                PublishAccepted(revision, rendered.native, debt_epoch=debt_epoch),
+            )
+            slot.record = transition.record
+            self._last_state_fields[peripheral_id] = fields
+            self._last_state_payload[peripheral_id] = payload
+            self._sync_wired_timer(peripheral_id, slot)
+            if transition.effects.publish or slot.record.revision != revision:
+                # Accepted old bytes still need a current retained publication.
+                slot.dirty = True
 
     async def shutdown_wired_feedback(self) -> None:
-        """Revoke wired feedback deadlines and in-flight publications."""
+        """Terminally retire wired work and join its one timer/publisher per load."""
         self._wired_feedback_enabled = False
-        deadline_tasks = list(self._wired_deadline_tasks.values())
-        peripheral_ids = (
-            set(self._wired_write_generation)
-            | set(self._pending_wired)
-            | set(self._wired_feedback)
-            | set(self._wired_publish_revision)
-            | set(self._wired_native_provenance)
-            | set(self._wired_feedback_tasks.values())
-        )
-        for peripheral_id in peripheral_ids:
-            self._retire_wired_feedback(peripheral_id)
-        tasks = deadline_tasks + list(self._wired_feedback_tasks)
-        for task in tasks:
-            task.cancel()
+        slots = list(self._wired.values())
+        tasks: list[asyncio.Task[None]] = []
+        for slot in slots:
+            slot.record = reduce_wired(slot.record, Shutdown()).record
+            for task in (slot.timer, slot.publisher):
+                if task is not None:
+                    task.cancel()
+                    tasks.append(task)
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-        self._wired_native_provenance.clear()
-        self._wired_issue_boundary.clear()
-
-    def _begin_wired_attempt(
-        self,
-        peripheral_id: str,
-        sets: list[VarSet],
-    ) -> _WiredWriteAttempt:
-        generation = self._wired_write_generation.get(peripheral_id, 0) + 1
-        self._wired_write_generation[peripheral_id] = generation
-        previous = self._pending_wired.get(peripheral_id)
-        fallback_at = (
-            previous.expires_at
-            if previous is not None
-            else self._wired_native_fallback_required.get(peripheral_id)
-        )
-        self._drop_pending_wired(peripheral_id)
-        if peripheral_id in self._wired_feedback:
-            self._wired_native_fallback_required[peripheral_id] = fallback_at
-            self._set_wired_feedback(peripheral_id, None)
-        if peripheral_id in self._wired_native_fallback_required and fallback_at is not None:
-            self._wired_deadline_tasks[peripheral_id] = asyncio.create_task(
-                self._resolve_replaced_wired(peripheral_id, generation, fallback_at),
-                name=f"brilliant-mqtt-wired-fallback-{peripheral_id}",
-            )
-        return _WiredWriteAttempt(
-            targets={item.name: item.value for item in sets},
-            generation=generation,
-        )
-
-    def _note_wired_issue(
-        self,
-        peripheral_id: str,
-        attempt: _WiredWriteAttempt,
-        provenance: CaptureProvenance,
-    ) -> None:
-        attempt.issue_provenance = provenance
-        if self._wired_write_generation.get(peripheral_id) != attempt.generation:
-            return
-        self._wired_issue_boundary[peripheral_id] = (
-            provenance,
-            frozenset(attempt.targets),
-        )
-
-    def _classify_wired_field(
-        self,
-        pending: _WiredWriteFeedback,
-        name: str,
-        variable: Variable | None,
-        capture: CaptureProvenance | None,
-    ) -> None:
-        if self._capture_precedes(capture, pending.issue_provenance):
-            return
-        pending.projected.discard(name)
-        if variable is not None and variable.value == pending.targets[name]:
-            pending.unresolved.discard(name)
-            pending.ambiguous.discard(name)
-        else:
-            pending.unresolved.add(name)
-            pending.ambiguous.add(name)
-
-    async def _arm_wired_feedback(
-        self,
-        peripheral_id: str,
-        attempt: _WiredWriteAttempt,
-    ) -> bool:
-        if self._wired_write_generation.get(peripheral_id) != attempt.generation:
-            return False
-        device = self._devices.get(peripheral_id)
-        if device is None or not self._is_wired_primary(device):
-            return False
-        issue = attempt.issue_provenance
-        if (
-            issue is not None
-            and device.capture_provenance is not None
-            and device.capture_provenance.source_generation > issue.source_generation
-        ):
-            return False
-        deadline = self._wall_clock() + WIRED_PROVISIONAL_SECONDS
-        pending = _WiredWriteFeedback(
-            targets=dict(attempt.targets),
-            unresolved=set(attempt.targets),
-            projected=set(attempt.targets),
-            ambiguous=set(),
-            generation=attempt.generation,
-            issue_provenance=issue,
-            deadline=deadline if math.isfinite(deadline) else None,
-            expires_at=self._clock() + WIRED_PROVISIONAL_SECONDS,
-        )
-        provenance = self._wired_native_provenance.get(peripheral_id, {})
-        for name in pending.targets:
-            capture = provenance.get(name)
-            self._classify_wired_field(
-                pending,
-                name,
-                device.variables.get(name),
-                capture,
-            )
-        if not pending.unresolved:
-            pending.status = "observed"
-            pending.projected.clear()
-            self._set_wired_feedback(peripheral_id, pending)
-            self._drop_pending_wired(peripheral_id)
-            self._wired_native_fallback_required.pop(peripheral_id, None)
-            await self._republish_snapshot(peripheral_id, force=False)
-            return True
-        pending.status = "ambiguous" if pending.ambiguous else "provisional"
-        self._drop_pending_wired(peripheral_id)
-        self._pending_wired[peripheral_id] = pending
-        self._set_wired_feedback(peripheral_id, pending)
-        self._wired_deadline_tasks[peripheral_id] = asyncio.create_task(
-            self._resolve_pending_wired(peripheral_id, pending),
-            name=f"brilliant-mqtt-wired-deadline-{peripheral_id}",
-        )
-        self._wired_native_fallback_required.pop(peripheral_id, None)
-        await self._republish_snapshot(peripheral_id, force=False)
-        return True
-
-    async def _publish_wired_native_fallback(
-        self,
-        peripheral_id: str,
-        generation: int,
-    ) -> None:
-        if (
-            peripheral_id not in self._wired_native_fallback_required
-            or self._wired_write_generation.get(peripheral_id) != generation
-        ):
-            return
-        device = self._devices.get(peripheral_id)
-        if device is None or not self._is_wired_primary(device):
-            return
-        feedback = _WiredWriteFeedback(
-            targets={},
-            unresolved=set(),
-            projected=set(),
-            ambiguous=set(),
-            generation=generation,
-            issue_provenance=None,
-            status="unconfirmed",
-        )
-        self._set_wired_feedback(peripheral_id, feedback)
-        try:
-            await self._republish_snapshot(peripheral_id, force=True)
-        except Exception:
-            logger.warning(
-                "wired native fallback publish failed for %s",
-                peripheral_id,
-                exc_info=True,
-            )
-        else:
-            if self._owns_wired_feedback(peripheral_id, generation, feedback):
-                self._wired_native_fallback_required.pop(peripheral_id, None)
-                self._drop_pending_wired(peripheral_id)
-
-    async def _resolve_replaced_wired(
-        self, peripheral_id: str, generation: int, expires_at: float
-    ) -> None:
-        await self._sleep(max(0.0, expires_at - self._clock()))
-        await self._publish_wired_native_fallback(peripheral_id, generation)
-
-    async def _resolve_pending_wired(
-        self,
-        peripheral_id: str,
-        pending: _WiredWriteFeedback,
-    ) -> None:
-        await self._sleep(WIRED_PROVISIONAL_SECONDS)
-        if self._pending_wired.get(peripheral_id) is not pending or not self._owns_wired_feedback(
-            peripheral_id, pending.generation, pending
-        ):
-            return
-        del self._pending_wired[peripheral_id]
-        pending.status = "unconfirmed"
-        pending.unresolved.clear()
-        pending.projected.clear()
-        pending.ambiguous.clear()
-        pending.deadline = None
-        pending.expires_at = None
-        self._set_wired_feedback(peripheral_id, pending)
-        try:
-            await self._republish_snapshot(peripheral_id, force=True)
-        except Exception:
-            logger.warning(
-                "wired feedback expiry publish failed for %s",
-                peripheral_id,
-                exc_info=True,
-            )
-        if self._wired_deadline_tasks.get(peripheral_id) is asyncio.current_task():
-            del self._wired_deadline_tasks[peripheral_id]
-
-    def _observe_wired_pending(self, observed: BrilliantDevice) -> None:
-        if not self._is_wired_primary(observed):
-            return
-        peripheral_id = observed.peripheral_id
-        pending = self._pending_wired.get(peripheral_id)
-        if pending is None:
-            feedback = self._wired_feedback.get(peripheral_id)
-            if feedback is not None and not any(
-                name in observed.variables
-                and self._capture_precedes(observed.capture_provenance, feedback.issue_provenance)
-                for name in feedback.targets
-            ):
-                self._set_wired_feedback(peripheral_id, None)
-            return
-        capture = observed.capture_provenance
-        issue = pending.issue_provenance
-        if (
-            capture is not None
-            and issue is not None
-            and capture.source_generation > issue.source_generation
-        ):
-            self._retire_wired_feedback(peripheral_id)
-            return
-        if self._capture_precedes(capture, issue):
-            return
-        native = self._devices.get(peripheral_id)
-        provenance = self._wired_native_provenance.get(peripheral_id, {})
-        for name in pending.targets:
-            if name not in observed.variables:
-                continue
-            field_capture = provenance.get(name)
-            self._classify_wired_field(
-                pending,
-                name,
-                None if native is None else native.variables.get(name),
-                field_capture,
-            )
-        if not pending.unresolved:
-            self._drop_pending_wired(peripheral_id)
-            pending.status = "observed"
-            pending.deadline = None
-            pending.expires_at = None
-            pending.projected.clear()
-            self._set_wired_feedback(peripheral_id, pending)
-            return
-        pending.status = "ambiguous" if pending.ambiguous else "provisional"
-        self._set_wired_feedback(peripheral_id, pending)
-
-    def _project_wired_feedback(
-        self,
-        device: BrilliantDevice,
-        fields: dict[str, object],
-    ) -> dict[str, object]:
-        feedback = self._wired_feedback.get(device.peripheral_id)
-        if feedback is None or not self._is_wired_primary(device):
-            return fields
-        pending = self._pending_wired.get(device.peripheral_id)
-        projected_fields = fields
-        if feedback.projected:
-            variables = dict(device.variables)
-            for name in feedback.projected:
-                old = variables.get(name)
-                variables[name] = Variable(
-                    name,
-                    feedback.targets[name],
-                    externally_settable=(old.externally_settable if old is not None else True),
-                )
-            projected_fields = payload_fields(replace(device, variables=variables))
-        return {
-            **projected_fields,
-            "wired_write_status": feedback.status,
-            "wired_requested": feedback.targets if pending is feedback else {},
-            "wired_write_deadline": feedback.deadline if pending is feedback else None,
-        }
+        self._wired.clear()
 
     def _owns_mesh_feedback(
         self, peripheral_id: str, generation: int, record: _PendingMeshWrite | None
@@ -1317,6 +986,8 @@ class Bridge:
         # bridge — an out-of-scope device must not even be snapshotted.
         if not self._included(device):
             return
+        if self._is_wired_primary(device) and not self._wired_feedback_enabled:
+            return
 
         # Discovery/subscribe is reconcile-only by design: a change event for a
         # never-reconciled peripheral publishes state HA ignores until the
@@ -1327,7 +998,6 @@ class Bridge:
 
         observed = self._derived(device)
         device = self._remember_native_observation(observed)
-        self._observe_wired_pending(observed)
         self._observe_mesh_pending(device)
 
         fields = payload_fields(device)
@@ -1343,7 +1013,7 @@ class Bridge:
         """
         route = self._by_cmd_topic.get(topic)
         if route is None:
-            logger.debug("command on unknown topic %s; ignoring", topic)
+            logger.debug("COMMAND_ROUTE_UNKNOWN")
             return
         peripheral_id, descriptor = route
 
@@ -1357,16 +1027,18 @@ class Bridge:
         try:
             parsed = json.loads(payload)
         except (json.JSONDecodeError, ValueError):
-            logger.debug("command on %s is not JSON; ignoring", topic)
+            logger.debug("COMMAND_JSON_INVALID")
             return
 
         if not isinstance(parsed, dict):
-            logger.debug("command on %s is not a JSON object; ignoring", topic)
+            logger.debug("COMMAND_OBJECT_INVALID")
             return
 
         device = self._devices.get(peripheral_id)
         if device is None:
-            logger.debug("command for unknown peripheral %s; ignoring", peripheral_id)
+            logger.debug("COMMAND_DEVICE_UNKNOWN")
+            return
+        if self._is_wired_primary(device) and not self._wired_feedback_enabled:
             return
 
         sets: list[VarSet] = translate_command(device, parsed)
@@ -1392,24 +1064,27 @@ class Bridge:
                     return []
                 return translate_command(current, value) if isinstance(value, dict) else []
 
-            logger.info(
-                "command %s -> %s: %s",
-                topic,
-                peripheral_id,
-                {s.name: s.value for s in sets},
-            )
+            logger.info("COMMAND_ACCEPTED")
             if device.device_id == _MESH_DEVICE_ID:
                 # Mesh primaries: no optimistic echo — observation-confirmed
                 # write with a pending-visible (state: null) window instead.
                 await self._write_mesh_primary(device, peripheral_id, sets, decode=decode)
                 return
-            # A wired primary gets request-owned provisional feedback. The
-            # ticket callback records the boundary where the adapter actually
-            # issues the native RPC, after any admission/lock wait.
-            attempt = self._begin_wired_attempt(peripheral_id, sets)
+            slot = self._wired_event(
+                peripheral_id, Begin(tuple((item.name, item.value) for item in sets))
+            )
+            attempt_generation = slot.record.generation
 
             def on_issued(provenance: CaptureProvenance) -> None:
-                self._note_wired_issue(peripheral_id, attempt, provenance)
+                if self._wired.get(peripheral_id) is slot:
+                    self._wired_event(
+                        peripheral_id,
+                        Issue(
+                            attempt_generation,
+                            provenance.field_eras,
+                            provenance.issued_values,
+                        ),
+                    )
 
             try:
                 result = await self._write_command(
@@ -1420,16 +1095,29 @@ class Bridge:
                     on_issued=on_issued,
                 )
             except BaseException:
-                if self._wired_write_generation.get(peripheral_id) == attempt.generation:
-                    self._drop_pending_wired(peripheral_id)
-                    if peripheral_id in self._wired_feedback:
-                        self._set_wired_feedback(peripheral_id, None)
-                    await self._publish_wired_native_fallback(peripheral_id, attempt.generation)
+                if self._wired.get(peripheral_id) is slot:
+                    self._wired_event(
+                        peripheral_id,
+                        Outcome(attempt_generation, "failed", self._clock(), self._wall_clock()),
+                    )
+                    try:
+                        await self._republish_snapshot(peripheral_id, force=True)
+                    except Exception as error:
+                        logger.warning("WIRED_PUBLISH_FAILED %s", type(error).__name__)
                 raise
-            if isinstance(result, Superseded):
+            if self._wired.get(peripheral_id) is not slot:
                 return
-            if not await self._arm_wired_feedback(peripheral_id, attempt):
-                await self._publish_wired_native_fallback(peripheral_id, attempt.generation)
+            if isinstance(result, Superseded):
+                self._wired_event(
+                    peripheral_id,
+                    Outcome(attempt_generation, "superseded", self._clock(), self._wall_clock()),
+                )
+                return
+            self._wired_event(
+                peripheral_id,
+                Outcome(attempt_generation, "success", self._clock(), self._wall_clock()),
+            )
+            await self._republish_snapshot(peripheral_id, force=False)
 
     async def _handle_aux_command(
         self, topic: str, peripheral_id: str, d: EntityDescriptor, payload: str

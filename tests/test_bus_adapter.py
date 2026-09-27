@@ -38,6 +38,7 @@ from brilliant_mqtt.write_admission import (
     command_admission,
 )
 from tests.fakes import (
+    FakeBus,
     FakeClock,
     FakeMqtt,
     FakeSleeper,
@@ -402,7 +403,7 @@ class TestInteractiveScheduling:
             ("poll", False, "target"),
             ("push", True, "target"),
             ("poll", False, "kind"),
-            ("poll", False, "partial"),
+            ("poll", False, "dimming"),
             ("poll", False, "scale"),
             ("push", True, "range"),
             ("push", True, "component"),
@@ -479,15 +480,16 @@ class TestInteractiveScheduling:
 
             if invalidate == "withdraw":
                 await bridge.withdraw()
+                await bridge.reconcile()
                 await update(replace(device))
                 bridge._register_command_topic("slider", replace(descriptor))
-            elif invalidate in ("target", "kind", "partial", "scale"):
+            elif invalidate in ("target", "kind", "dimming", "scale"):
                 changed = replace(device, variables=dict(device.variables))
                 if invalidate == "target":
                     changed.device_id = "other-device"
                 elif invalidate == "kind":
                     changed.kind = DeviceKind.SWITCH
-                elif invalidate == "partial":
+                elif invalidate == "dimming":
                     del changed.variables["intensity"]
                 else:
                     changed.variables["max_intensity_value"] = Variable(
@@ -515,7 +517,7 @@ class TestInteractiveScheduling:
             await dispatcher.shutdown()
             key = "screen_brightness" if auxiliary else "intensity"
             expected = [{"on": "1"}]
-            if invalidate is not None and invalidate != "partial":
+            if invalidate is not None:
                 expected.append({key: "80"})
             expected.append({key: "120"})
             assert [values for _, _, values in observer.payloads] == expected
@@ -526,6 +528,32 @@ class TestInteractiveScheduling:
             await dispatcher.shutdown()
             await adapter.shutdown()
             await asyncio.gather(blocker, return_exceptions=True)
+
+    async def test_partial_push_omission_keeps_dimming_until_full_capture(self) -> None:
+        device = BrilliantDevice(
+            device_id="shared",
+            peripheral_id="slider",
+            name="Synthetic light",
+            kind=DeviceKind.LIGHT,
+            variables={
+                "on": Variable("on", "0"),
+                "intensity": Variable("intensity", "100"),
+            },
+        )
+        bus = FakeBus([device])
+        bridge = Bridge(bus, FakeMqtt(), "test")
+        await bridge.reconcile()
+        generation = bridge._command_generation["slider"]
+        partial = replace(device, variables={"on": device.variables["on"]})
+
+        await bus.emit(partial)
+        assert bridge._devices["slider"].is_dimmable
+        assert bridge._command_generation["slider"] == generation
+
+        await bus.emit_full(partial)
+        assert not bridge._devices["slider"].is_dimmable
+        assert bridge._command_generation["slider"] == generation + 1
+        await bridge.shutdown_wired_feedback()
 
     @pytest.mark.parametrize("auxiliary", [False, True])
     async def test_withdrawn_route_rejects_active_replacement(self, auxiliary: bool) -> None:

@@ -1316,11 +1316,14 @@ class RpcBusAdapter:
                         self._field_eras[key] = self._field_eras.get(key, 0) + 1
                     boundary = self._next_capture_provenance()
                     admission.ticket.mark_issued(
-                        self._field_capture(
-                            boundary,
-                            admission.device_id,
-                            admission.peripheral_id,
-                            admission.values,
+                        replace(
+                            self._field_capture(
+                                boundary,
+                                admission.device_id,
+                                admission.peripheral_id,
+                                admission.values,
+                            ),
+                            issued_values=tuple(admission.values.items()),
                         )
                     )
                 except Exception:

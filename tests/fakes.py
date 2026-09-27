@@ -140,6 +140,19 @@ class FakeBus:
         write_class: WriteClass = WriteClass.INTERACTIVE_FIFO,
         ticket: AdmissionTicket | None = None,
     ) -> str:
+        self._mark_issued(device_id, peripheral_id, sets, ticket)
+        if self.set_variables_error is not None:
+            raise self.set_variables_error
+        self.commands.append((device_id, peripheral_id, list(sets)))
+        return self.set_variables_receipt
+
+    def _mark_issued(
+        self,
+        device_id: str,
+        peripheral_id: str,
+        sets: list[VarSet],
+        ticket: AdmissionTicket | None,
+    ) -> None:
         for item in sets:
             key = (device_id, peripheral_id, item.name)
             self._field_eras[key] = self._field_eras.get(key, 0) + 1
@@ -152,11 +165,9 @@ class FakeBus:
         )
         boundary = self._next_provenance(device)
         if ticket is not None:
-            ticket.mark_issued(boundary)
-        if self.set_variables_error is not None:
-            raise self.set_variables_error
-        self.commands.append((device_id, peripheral_id, list(sets)))
-        return self.set_variables_receipt
+            ticket.mark_issued(
+                replace(boundary, issued_values=tuple((item.name, item.value) for item in sets))
+            )
 
     async def shutdown(self) -> None:
         pass
