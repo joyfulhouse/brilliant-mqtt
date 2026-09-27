@@ -321,12 +321,45 @@ fan out across every targeted panel:
 | Service | What it does |
 |---|---|
 | `brilliant_mqtt.repair` | Restore unit/env from known-good sources and start the agent (same as the repair button). Failures are escalated per panel, not raised. |
-| `brilliant_mqtt.redeploy` | Force-push the bundled agent payload and restart — the fleet-wide equivalent of the update entity's install. |
+| `brilliant_mqtt.redeploy` | Install the bundled agent payload when its release identity is admitted, then restart; identical code preserves the installed selection. |
 | `brilliant_mqtt.uninstall` | Stop, disable, and **remove** the agent from the panel (explicit only — never on entry removal). |
 
 `redeploy` and `uninstall` attempt **every** targeted panel and then raise one
 aggregated error naming any that failed (so a single bad panel never silently
 skips the rest of a fleet wave).
+
+### Release identity admission
+
+Update, redeploy, repair, bridge installation, and selected watchdog writers share
+one release policy. Equal code digests keep the installed code and layout. Different
+code requires a strictly greater, known `release_ordinal` on both sides. Equal
+version strings do not establish identity, and digests are never ordered by age.
+Admission happens before the operation stages a CA or changes configuration.
+Same-code configuration repair preserves the live unit, or restores a missing
+release-layout unit from `current`, without selecting the bundled legacy unit.
+
+Existing installations are enrolled by hashing their selected code trees. Their
+ordinal is initially **unknown**, even if their `VERSION` matches the bundle.
+They therefore require explicit approval for the first change to different code.
+On-panel records live under `/var/brilliant-mqtt/.release-identities/` (directory
+0700, records 0600), with one identity for each independently selectable bridge or
+watchdog. Records contain version, ordinal, digest, deployment ID, and layout;
+they contain no broker or SSH credentials. These permissions are not encryption.
+
+A `release_identity_blocked` error includes a `release_override` object. Review
+the intended candidate, then call `brilliant_mqtt.redeploy` with **exactly one**
+panel target and that exact object in the `release_override` field. It binds the
+panel, incumbent digest/layout, candidate identities, and transaction. A changed
+identity requires a fresh object. Approval is durably recorded and consumed once,
+including when a later deployment step fails; automatic repair never inherits it.
+The override approves a particular replacement without asserting which code is
+newer. Normal multi-panel redeploy remains available without an override.
+
+Release maintainers assign and review `deploy/RELEASE_ORDINAL` alongside payload
+changes, increasing it for each new release. The build copies this integer
+verbatim beside `VERSION`, and the existing payload-release manifest hashes it.
+The initial assigned ordinal is 1; legacy unknown identities are never treated as
+0. The build does not derive an ordinal from time, version, Git, or a digest.
 
 Two further services run existing Brilliant scenes and modes:
 

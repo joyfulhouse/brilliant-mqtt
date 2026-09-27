@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, Protocol
+from uuid import UUID
 
 import asyncssh
 from homeassistant.components import mqtt, persistent_notification
@@ -132,8 +133,33 @@ _SAFE_PANEL_OP_DETAILS = {
     "mqtt_ca_promotion_failed": "mqtt_ca_promotion_failed",
     "mqtt_ca_verification_failed": "mqtt_ca_verification_failed",
     "mqtt_tls_downgrade_refused": "mqtt_tls_downgrade_refused",
+    "release_identity_read_failed": "release_identity_read_failed: inspect the installed release",
+    "release_identity_changed": "release_identity_changed: inspect the panel and retry",
+    "release_candidate_changed": "release_candidate_changed: rebuild the reviewed payload",
+    "release_identity_invalid": "release_identity_invalid: rebuild the reviewed payload",
+    "release_payload_required": "release_payload_required: run an admitted redeploy",
+    "release_override_mismatch": "release_override_mismatch: obtain a fresh single-panel override",
+    "release_override_used_or_write_failed": (
+        "release_override_used_or_write_failed: obtain a fresh override"
+    ),
 }
 _PANEL_OP_CODE_PREFIX_LIMIT = 64
+for _canary_code in (
+    "baseline_capture_failed",
+    "baseline_capture_invalid",
+    "baseline_changed",
+    "baseline_incomplete",
+    "baseline_correlation_unsupported",
+    "baseline_verify_failed",
+    "baseline_read_failed",
+    "baseline_retained_finalize_first",
+    "transaction_in_progress",
+    "rollback_failed",
+    "rollback_health_failed",
+    "rollback_deadline_exceeded",
+    "health_failed",
+):
+    _SAFE_PANEL_OP_DETAILS[_canary_code] = f"{_canary_code}: see docs/canary-rollback.md"
 
 
 class _HostKeyChanged(Exception):
@@ -142,6 +168,8 @@ class _HostKeyChanged(Exception):
 
 def _safe_failure_summary(summary: str, error: BaseException | None = None) -> str:
     """Return fixed context plus an explicitly allowlisted panel-operation code."""
+    if isinstance(error, panel_ops.ReleaseIdentityBlocked):
+        return str(error)
     if isinstance(error, PanelOpError):
         # Panel operations may append diagnostics after ``"<stable-code>: "``.
         # Match only the bounded code field and never export the appended detail.
@@ -724,6 +752,8 @@ class PanelManager:
 
     async def _async_retire_legacy_ha_mirror_on_shell(self, shell: PanelShell) -> bool | None:
         """Uninstall and prove absence; the shell owner finalizes after close."""
+        if await panel_ops.baseline_retained(shell):
+            return None
         initial = await panel_ops.inspect_ha_mirror(shell)
         evidence = self._legacy_retirement_evidence() or not self._ha_mirror_absent(initial)
         if not evidence:
@@ -986,6 +1016,11 @@ class PanelManager:
                 raise PanelOpError("staged MQTT CA path did not match rendered environment")
         return settings.environment
 
+    def _identity_components(self) -> tuple[str, ...]:
+        from .components import selected_core_ids
+
+        return selected_core_ids(self.store.data)
+
     async def _unit_contents(self) -> str:
         """Read the bundled service unit without creating a throwaway broker env."""
         return await self.hass.async_add_executor_job(
@@ -1067,7 +1102,11 @@ class PanelManager:
                     (payload_dir / spec.service_filename).read_text
                 )
                 state = await spec.inspect(shell)
-                if not state.payload_present or state.version != version:
+                if (
+                    not state.payload_present
+                    or state.version != version
+                    or panel_ops.release_component_changed(spec.payload_subdir)
+                ):
                     await spec.deploy(shell, str(payload_dir / spec.payload_subdir), version)
                     owes_restart = True
                 await spec.ensure_unit(shell, unit)
@@ -1080,6 +1119,8 @@ class PanelManager:
                     await spec.restart(shell)
                     owes_restart = False
             except (OSError, asyncssh.Error, PanelOpError, tarfile.TarError) as err:
+                if isinstance(err, panel_ops.ReleaseIdentityBlocked):
+                    raise
                 error = err
                 continue
             return None
@@ -1121,7 +1162,7 @@ class PanelManager:
             if component_id in selected:
                 if await self._relay_watchdog(shell, spec, version):
                     _LOGGER.warning("%s: %s %s", self.panel, spec.label, suffix)
-        if COMPONENT_HUE_CA in selected:
+        if COMPONENT_HUE_CA in selected and not await panel_ops.baseline_retained(shell):
             if await self._relay_hue_ca(shell):
                 _LOGGER.warning("%s: hue-ca %s", self.panel, suffix)
 
@@ -1288,51 +1329,63 @@ class PanelManager:
                     if trigger == "auto" and not self._auto_repair_still_warranted():
                         self._skip_stale_auto_repair()
                         return
-                    env = await self._async_stage_broker_ca(shell)
-                    # Bootstrap a code-less panel (never installed, or its /var code was
-                    # lost): lay the agent payload down BEFORE enabling the unit, so the
-                    # Repair button / auto-repair can install from scratch rather than
-                    # enable a unit whose ExecStart points at code that isn't there. An
-                    # already-installed panel (the common OTA-wiped-/etc case) keeps the
-                    # light path — rewrite config + enable, no re-upload.
-                    if not state.payload_present:
-                        await panel_ops.async_assert_no_mqtt_tls_downgrade(shell, env)
-                        await panel_ops.deploy_payload(
-                            shell, str(_payload_dir()), await self._payload_version()
-                        )
-                    await panel_ops.ensure_configs(shell, unit, env)
-                    await panel_ops.enable_now(shell)
-                    if voice_tarball is not None:
-                        try:
-                            await self._deploy_voice(shell, voice_tarball)
-                        except (OSError, asyncssh.Error, PanelOpError):
-                            _LOGGER.warning("%s: voice repair failed", self.panel)
-                            ir.async_create_issue(
-                                self.hass,
-                                DOMAIN,
-                                self._voice_issue_id,
-                                is_fixable=False,
-                                severity=ir.IssueSeverity.WARNING,
-                                translation_key="voice_missing",
-                                translation_placeholders={"panel": self.panel},
-                                learn_more_url="https://github.com/joyfulhouse/brilliant-mqtt/blob/main/docs/ha-integration.md",
+                    async with panel_ops.release_transaction(
+                        shell,
+                        str(_payload_dir()),
+                        panel=self.panel,
+                        components=self._identity_components(),
+                    ) as admission:
+                        if trigger == "auto" and not self._auto_repair_still_warranted():
+                            self._skip_stale_auto_repair()
+                            return
+                        env = await self._async_stage_broker_ca(shell)
+                        # Bootstrap a code-less panel (never installed, or its /var code was
+                        # lost): lay the agent payload down BEFORE enabling the unit, so the
+                        # Repair button / auto-repair can install from scratch rather than
+                        # enable a unit whose ExecStart points at code that isn't there. An
+                        # already-installed panel (the common OTA-wiped-/etc case) keeps the
+                        # light path — rewrite config + enable, no re-upload.
+                        if not state.payload_present or (
+                            admission.incumbent["bridge"] is not None
+                            and admission.changes["bridge"]
+                        ):
+                            await panel_ops.async_assert_no_mqtt_tls_downgrade(shell, env)
+                            await panel_ops.deploy_payload(
+                                shell, str(_payload_dir()), await self._payload_version()
                             )
-                        else:
-                            ir.async_delete_issue(self.hass, DOMAIN, self._voice_issue_id)
-                    # Companion components (watchdogs, hue-ca): re-lay units wiped by an
-                    # OTA and converge watchdog code on the bundled release. Failures
-                    # are logged and swallowed — they must not block the bridge repair.
-                    await self._relay_selected_components(
-                        shell, context="repair", version=await self._payload_version()
-                    )
-                    try:
-                        retirement_result = await self._async_retire_legacy_ha_mirror_on_shell(
-                            shell
+                        await panel_ops.ensure_configs(shell, unit, env)
+                        await panel_ops.enable_now(shell)
+                        if voice_tarball is not None:
+                            try:
+                                await self._deploy_voice(shell, voice_tarball)
+                            except (OSError, asyncssh.Error, PanelOpError):
+                                _LOGGER.warning("%s: voice repair failed", self.panel)
+                                ir.async_create_issue(
+                                    self.hass,
+                                    DOMAIN,
+                                    self._voice_issue_id,
+                                    is_fixable=False,
+                                    severity=ir.IssueSeverity.WARNING,
+                                    translation_key="voice_missing",
+                                    translation_placeholders={"panel": self.panel},
+                                    learn_more_url="https://github.com/joyfulhouse/brilliant-mqtt/blob/main/docs/ha-integration.md",
+                                )
+                            else:
+                                ir.async_delete_issue(self.hass, DOMAIN, self._voice_issue_id)
+                        # Companion components (watchdogs, hue-ca): re-lay units wiped by an
+                        # OTA and converge watchdog code on the bundled release. Failures
+                        # are logged and swallowed — they must not block the bridge repair.
+                        await self._relay_selected_components(
+                            shell, context="repair", version=await self._payload_version()
                         )
-                    except (OSError, asyncssh.Error, PanelOpError):
-                        self.legacy_mirror_problem = (
-                            "Legacy HA mirror retirement could not be verified"
-                        )
+                        try:
+                            retirement_result = await self._async_retire_legacy_ha_mirror_on_shell(
+                                shell
+                            )
+                        except (OSError, asyncssh.Error, PanelOpError):
+                            self.legacy_mirror_problem = (
+                                "Legacy HA mirror retirement could not be verified"
+                            )
                 except (OSError, asyncssh.Error, PanelOpError) as repair_err:
                     # A checked step (mkdir/daemon-reload/systemctl) exited non-zero.
                     # The panel is half-broken; surface it loudly instead of letting
@@ -1362,7 +1415,75 @@ class PanelManager:
         finally:
             self._repairing = False
 
-    async def async_update_agent(self, progress: Callable[[int], None] | None = None) -> None:
+    @asynccontextmanager
+    async def _async_canary_update(self, shell: PanelShell, version: str) -> AsyncIterator[UUID]:
+        from .fleet_manager import _get_recovery_provisioner
+        from .panel_provisioner import PanelProvisioningError
+        from .provisioning_journal import StoredFleetProfile, StoredPanelRequest
+
+        key = shell.pinned_host_key()
+        if key is None:
+            raise PanelOpError("baseline_identity_missing")
+        fingerprint = asyncssh.import_public_key(key).get_fingerprint("sha256")
+        request = StoredPanelRequest(
+            host=str(self.store.data[CONF_HOST]),
+            ssh_username="root",
+            root_password=str(self.store.data[CONF_ROOT_PASSWORD]),
+            public_key=key,
+            fingerprint=fingerprint,
+            slug=self.panel,
+            selected_components=self._identity_components(),
+        )
+        broker = self.fleet.broker
+        profile = StoredFleetProfile(broker.kind, broker.host, broker.port, broker.tls_enabled)
+        try:
+            async with _get_recovery_provisioner(self.hass).async_managed_update(
+                shell,
+                request,
+                profile,
+                version,
+                subentry_id=self.store.panel_id,
+            ) as transaction:
+                yield transaction
+        except PanelProvisioningError as error:
+            raise PanelOpError(error.code) from None
+
+    async def async_canary_operation(self, operation: str, name: str) -> None:
+        """Bind an explicitly named rollback/finalization to this one panel owner."""
+        from .fleet_manager import _get_recovery_provisioner
+        from .provisioning_journal import ProvisioningJournal
+
+        try:
+            transaction = UUID(name)
+            retained = await ProvisioningJournal(self.hass).async_retained(transaction)
+            if retained is None:
+                raise ValueError("baseline_missing")
+            request = retained.record.panel_request
+            if (
+                request.slug != self.panel
+                or request.host != self.store.data[CONF_HOST]
+                or request.public_key != self.store.data.get(DATA_SSH_HOST_KEY)
+            ):
+                raise ValueError("baseline_owner_mismatch")
+            provisioner = _get_recovery_provisioner(self.hass)
+            if operation == "rollback":
+                await provisioner.async_rollback(transaction)
+            elif operation == "finalize":
+                await provisioner.async_finalize(transaction)
+            else:
+                raise ValueError("invalid_canary_operation")
+        except Exception as error:
+            code = getattr(error, "code", "canary_operation_failed")
+            if not isinstance(code, str) or re.fullmatch(r"[a-z_]{1,64}", code) is None:
+                code = "canary_operation_failed"
+            raise HomeAssistantError(f"{code}: see docs/canary-rollback.md") from None
+
+    async def async_update_agent(
+        self,
+        progress: Callable[[int], None] | None = None,
+        *,
+        release_override: Mapping[str, object] | None = None,
+    ) -> None:
         """Push the bundled agent payload, refresh configs, restart, verify via LWT.
 
         *progress*, when given, is called with a 0-100 percentage at each deploy stage
@@ -1429,31 +1550,44 @@ class PanelManager:
                 _p(25)
                 try:
                     retirement_result: bool | None = None
-                    unit = await self._unit_contents()
-                    env = await self._async_stage_broker_ca(shell)
-                    await panel_ops.async_assert_no_mqtt_tls_downgrade(shell, env)
-                    _p(40)
-                    await panel_ops.deploy_payload(shell, str(_payload_dir()), version)
-                    _p(80)
-                    await panel_ops.ensure_configs(shell, unit, env)
-                    # Ship the selected companion components with the bridge so an
-                    # Update-entity install can no longer leave a watchdog on the previous
-                    # release (0.10.0 bus-phase contract: bridge + bus watchdog move as a
-                    # pair). Runs before the bridge restart so both come up on *version*;
-                    # relay failures are logged and never fail the update.
-                    await self._relay_selected_components(shell, context="update", version=version)
-                    _p(85)
-                    _p(90)
-                    await panel_ops.restart(shell)
-                    try:
-                        retirement_result = await self._async_retire_legacy_ha_mirror_on_shell(
-                            shell
-                        )
-                    except (OSError, asyncssh.Error, PanelOpError):
-                        self.legacy_mirror_problem = (
-                            "Legacy HA mirror retirement could not be verified"
-                        )
-                    _p(95)
+                    async with panel_ops.release_transaction(
+                        shell,
+                        str(_payload_dir()),
+                        panel=self.panel,
+                        components=self._identity_components(),
+                        override=release_override,
+                    ) as admission:
+                        if admission.noop:
+                            return
+                        async with self._async_canary_update(shell, version) as transaction:
+                            unit = await self._unit_contents()
+                            env = await self._async_stage_broker_ca(shell)
+                            env += f"\nBRILLIANT_DEPLOYMENT_ID={transaction.hex}\n"
+                            await panel_ops.async_assert_no_mqtt_tls_downgrade(shell, env)
+                            _p(40)
+                            await panel_ops.deploy_payload(shell, str(_payload_dir()), version)
+                            _p(80)
+                            await panel_ops.ensure_configs(shell, unit, env)
+                            # Ship the selected companion components with the bridge so an
+                            # Update-entity install can no longer leave a watchdog on the previous
+                            # release (0.10.0 bus-phase contract: bridge + bus watchdog move as a
+                            # pair). Runs before the bridge restart so both come up on *version*;
+                            # relay failures are logged and never fail the update.
+                            await self._relay_selected_components(
+                                shell, context="update", version=version
+                            )
+                            _p(85)
+                            _p(90)
+                            await panel_ops.restart(shell)
+                            try:
+                                retirement_result = (
+                                    await self._async_retire_legacy_ha_mirror_on_shell(shell)
+                                )
+                            except (OSError, asyncssh.Error, PanelOpError):
+                                self.legacy_mirror_problem = (
+                                    "Legacy HA mirror retirement could not be verified"
+                                )
+                            _p(95)
                 except (OSError, asyncssh.Error, PanelOpError) as err:
                     summary = _safe_failure_summary(
                         "agent update failed during deployment",
@@ -1650,12 +1784,22 @@ class PanelManager:
 
     async def _async_install_bridge(self, shell: PanelShell) -> None:
         """Install the bridge using the broker's non-exporting render seam."""
-        unit = await self._unit_contents()
-        env = await self._async_stage_broker_ca(shell)
-        await panel_ops.async_assert_no_mqtt_tls_downgrade(shell, env)
-        await panel_ops.deploy_payload(shell, str(_payload_dir()), await self._payload_version())
-        await panel_ops.ensure_configs(shell, unit, env)
-        await panel_ops.enable_now(shell)
+        async with panel_ops.release_transaction(
+            shell,
+            str(_payload_dir()),
+            panel=self.panel,
+            components=self._identity_components(),
+        ) as admission:
+            if admission.noop:
+                return
+            unit = await self._unit_contents()
+            env = await self._async_stage_broker_ca(shell)
+            await panel_ops.async_assert_no_mqtt_tls_downgrade(shell, env)
+            await panel_ops.deploy_payload(
+                shell, str(_payload_dir()), await self._payload_version()
+            )
+            await panel_ops.ensure_configs(shell, unit, env)
+            await panel_ops.enable_now(shell)
 
     def _component_install_data(self, component_id: str) -> Mapping[str, Any]:
         """Expose only the fields one optional component deliberately consumes."""
@@ -2065,24 +2209,40 @@ class PanelManager:
                 await shell.connect()
                 try:
                     retirement_result: bool | None = None
-                    unit = await self._unit_contents()
-                    env = await self._async_stage_broker_ca(shell)
-                    await panel_ops.ensure_configs(shell, unit, env)
-                    # Companion components: re-lay units the OTA wiped (code in /var
-                    # survives) and converge watchdog code on the bundled release.
-                    await self._relay_selected_components(
-                        shell, context="refresh", version=await self._payload_version()
-                    )
-                    try:
-                        retirement_result = await self._async_retire_legacy_ha_mirror_on_shell(
-                            shell
+                    async with panel_ops.release_transaction(
+                        shell,
+                        str(_payload_dir()),
+                        panel=self.panel,
+                        components=self._identity_components(),
+                    ) as admission:
+                        if (
+                            admission.incumbent["bridge"] is not None
+                            and admission.changes["bridge"]
+                        ):
+                            raise PanelOpError(
+                                "release_payload_required: run an admitted redeploy "
+                                "before config refresh"
+                            )
+                        unit = await self._unit_contents()
+                        env = await self._async_stage_broker_ca(shell)
+                        await panel_ops.ensure_configs(shell, unit, env)
+                        # Companion components: re-lay units the OTA wiped (code in /var
+                        # survives) and converge watchdog code on the bundled release.
+                        await self._relay_selected_components(
+                            shell, context="refresh", version=await self._payload_version()
                         )
-                    except (OSError, asyncssh.Error, PanelOpError):
-                        self.legacy_mirror_problem = (
-                            "Legacy HA mirror retirement could not be verified"
-                        )
+                        try:
+                            retirement_result = await self._async_retire_legacy_ha_mirror_on_shell(
+                                shell
+                            )
+                        except (OSError, asyncssh.Error, PanelOpError):
+                            self.legacy_mirror_problem = (
+                                "Legacy HA mirror retirement could not be verified"
+                            )
                 finally:
                     close_ok = await self._async_close_shell(shell)
                 self._complete_ha_mirror_retirement_after_close(retirement_result, close_ok)
-        except (OSError, asyncssh.Error, PanelOpError):
+        except (OSError, asyncssh.Error, PanelOpError) as error:
+            if isinstance(error, panel_ops.ReleaseIdentityBlocked):
+                self._escalate(str(error))
             _LOGGER.warning("%s: staged-copy refresh failed; will retry next reconcile", self.panel)

@@ -19,13 +19,17 @@ import re
 import secrets
 import stat
 import tarfile
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
-from uuid import RFC_4122, UUID
+from pathlib import Path
+from uuid import RFC_4122, UUID, uuid4
 
 import asyncssh
 
+from .agent_payload import bundle_manifest
 from .const import (
     BUS_WATCHDOG_SERVICE_NAME,
     COMPONENT_BRIDGE,
@@ -68,6 +72,7 @@ from .const import (
     VOICE_SERVICE_NAME,
     WIFI_WATCHDOG_SERVICE_NAME,
 )
+from .release_identity import ReleaseIdentity, RollbackBaseline, admit_identity
 from .setup_protocol import PreflightRequest
 from .shell import PanelProcess, PanelShell, RunResult
 
@@ -86,6 +91,304 @@ _HA_MIRROR_STAGED_ENV = f"{PANEL_HA_MIRROR_STAGED_DIR}/{HA_MIRROR_SERVICE_NAME}.
 
 class PanelOpError(RuntimeError):
     """A panel shell command exited non-zero."""
+
+
+class ReleaseIdentityBlocked(PanelOpError):
+    """An actionable, explicitly safe identity refusal with one-operation binding."""
+
+    def __init__(self, override: dict[str, object]) -> None:
+        self.override = override
+        super().__init__(
+            "release_identity_blocked: installed code differs and release ordering is "
+            "unknown or not increasing. Install a reviewed newer release, or explicitly "
+            "retry brilliant_mqtt.redeploy for this panel with release_override="
+            + json.dumps(override, sort_keys=True, separators=(",", ":"))
+        )
+
+    def __repr__(self) -> str:
+        return "ReleaseIdentityBlocked(<redacted>)"
+
+
+@dataclass(repr=False)
+class ReleaseAdmission:
+    shell: PanelShell
+    candidate: dict[str, ReleaseIdentity]
+    incumbent: dict[str, ReleaseIdentity | None]
+    changes: dict[str, bool]
+    transaction: str
+    pending: set[str] = field(default_factory=set)
+    owner: asyncio.Task[object] | None = field(default_factory=asyncio.current_task)
+    active: bool = True
+
+    @property
+    def noop(self) -> bool:
+        return not any(self.changes.values())
+
+    def __repr__(self) -> str:
+        return "ReleaseAdmission(<redacted>)"
+
+
+_RELEASE_ADMISSION: ContextVar[ReleaseAdmission | None] = ContextVar(
+    "release_admission", default=None
+)
+
+
+def _identity_payload_dir() -> Path:
+    return Path(__file__).parent / "agent_payload"
+
+
+def _candidate_identities(local_payload_dir: str) -> dict[str, ReleaseIdentity]:
+    root = Path(local_payload_dir)
+    ordinal = bundle_manifest.release_ordinal(root)
+    version = (root / "VERSION").read_text().strip()
+    identities: dict[str, ReleaseIdentity] = {}
+    for component in bundle_manifest.CORE_TREES:
+        digest = bundle_manifest.code_digest(root, component)
+        if digest is not None:
+            identities[component] = ReleaseIdentity(version, ordinal, digest, None, "candidate")
+    if "bridge" not in identities:
+        raise ValueError("invalid_release_identity")
+    return identities
+
+
+async def candidate_identities(local_payload_dir: str) -> dict[str, ReleaseIdentity]:
+    try:
+        return await asyncio.to_thread(_candidate_identities, local_payload_dir)
+    except (OSError, ValueError, bundle_manifest.ManifestError):
+        raise PanelOpError("release_identity_invalid: rebuild the reviewed payload") from None
+
+
+def _identity_command(source: str, action: str, marker: str) -> str:
+    # Execute the same stdlib hasher on both hosts without trusting on-panel tools.
+    source = source.rsplit('if __name__ == "__main__":', 1)[0]
+    return f"{_PANEL_PYTHON} - <<'{marker}'\n{source}\n{action}\n{marker}"
+
+
+async def _identity_source() -> str:
+    return await asyncio.to_thread(Path(bundle_manifest.__file__).read_text)
+
+
+async def _read_release_identities(shell: PanelShell) -> dict[str, ReleaseIdentity | None]:
+    command = _identity_command(
+        await _identity_source(),
+        f"print(json.dumps(installed_identities(Path({PANEL_VAR_DIR!r}))))",
+        "BRILLIANT_RELEASE_IDENTITY_READ",
+    )
+    result = await _provisioning_run(shell, command, "release_identity_read_failed")
+    try:
+        if len(result.stdout) > 16384:
+            raise ValueError
+        raw = json.loads(result.stdout)
+        if not isinstance(raw, dict) or set(raw) != bundle_manifest.CORE_TREES.keys():
+            raise ValueError
+        return {
+            component: ReleaseIdentity.from_dict(value) if value is not None else None
+            for component, value in raw.items()
+        }
+    except (ValueError, TypeError):
+        del result
+        raise PanelOpError("release_identity_read_failed") from None
+
+
+async def _write_release_record(
+    shell: PanelShell, name: str, value: dict[str, object], *, exclusive: bool = False
+) -> None:
+    temporary = f"{PANEL_VAR_DIR}/.release-{name}-{secrets.token_hex(16)}.tmp"
+    await _provisioning_run(
+        shell,
+        f"mkdir -p {PANEL_VAR_DIR} # BRILLIANT_RELEASE_IDENTITY_PREPARE",
+        "release_identity_write_failed",
+    )
+    await _provisioning_put_bytes(
+        shell,
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode(),
+        temporary,
+        0o600,
+        "release_identity_write_failed",
+    )
+    command = _identity_command(
+        await _identity_source(),
+        f"temporary = Path({temporary!r})\n"
+        "try:\n"
+        f"    private_record(Path({PANEL_VAR_DIR!r}), {name!r},\n"
+        f"                   json.loads(temporary.read_bytes()), exclusive={exclusive!r})\n"
+        "finally:\n    temporary.unlink()",
+        "BRILLIANT_RELEASE_IDENTITY_WRITE",
+    )
+    await _provisioning_run(
+        shell,
+        command,
+        "release_override_used_or_write_failed" if exclusive else "release_identity_write_failed",
+    )
+
+
+def _identity_binding(
+    panel: str,
+    incumbent: dict[str, ReleaseIdentity | None],
+    candidate: dict[str, ReleaseIdentity],
+    transaction: str,
+) -> dict[str, object]:
+    return {
+        "panel": panel,
+        "transaction": transaction,
+        "incumbent": {key: value.as_dict() if value else None for key, value in incumbent.items()},
+        "candidate": {key: value.as_dict() for key, value in candidate.items()},
+    }
+
+
+async def _admit_release(
+    shell: PanelShell,
+    local_payload_dir: str,
+    panel: str,
+    components: tuple[str, ...],
+    override: Mapping[str, object] | None,
+    transaction: str | None = None,
+) -> ReleaseAdmission:
+    candidate = await candidate_identities(local_payload_dir)
+    return await _admit_identities(shell, candidate, panel, components, override, transaction)
+
+
+async def _admit_identities(
+    shell: PanelShell,
+    candidate: dict[str, ReleaseIdentity],
+    panel: str,
+    components: tuple[str, ...],
+    override: Mapping[str, object] | None,
+    transaction: str | None = None,
+) -> ReleaseAdmission:
+    installed = await _read_release_identities(shell)
+    selected = tuple(dict.fromkeys(("bridge", *components)))
+    if any(key not in candidate for key in selected):
+        raise PanelOpError("release_identity_invalid: selected component missing from payload")
+    incumbent = {key: installed.get(key) for key in selected}
+    candidate = {key: candidate[key] for key in selected}
+    transaction = transaction or uuid4().hex
+    if override is not None:
+        value = override.get("transaction")
+        if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{32}", value) is None:
+            raise PanelOpError("release_override_invalid")
+        transaction = value
+    binding = _identity_binding(panel, incumbent, candidate, transaction)
+    if override is not None and dict(override) != binding:
+        raise PanelOpError("release_override_mismatch: inspect the current panel and retry")
+    changes: dict[str, bool] = {}
+    for component in selected:
+        try:
+            changes[component] = admit_identity(incumbent[component], candidate[component])
+        except ValueError:
+            if override is None:
+                raise ReleaseIdentityBlocked(binding) from None
+            changes[component] = True
+    if override is not None:
+        # Atomic no-replace publication consumes the transaction even if subsequent
+        # mutation fails. A retry needs a new explicit, freshly bound approval.
+        await _write_release_record(shell, "override-" + transaction, binding, exclusive=True)
+    return ReleaseAdmission(shell, candidate, incumbent, changes, transaction)
+
+
+@asynccontextmanager
+async def release_transaction(
+    shell: PanelShell,
+    local_payload_dir: str,
+    *,
+    panel: str,
+    components: tuple[str, ...] = (),
+    override: Mapping[str, object] | None = None,
+    transaction_id: UUID | None = None,
+) -> AsyncIterator[ReleaseAdmission]:
+    """Admit every selected writer before CA/config writes; never retain an override."""
+    if _RELEASE_ADMISSION.get() is not None:
+        raise PanelOpError("release_transaction_nested")
+    admission = await _admit_release(
+        shell,
+        local_payload_dir,
+        panel,
+        components,
+        override,
+        transaction_id.hex if transaction_id is not None else None,
+    )
+    token = _RELEASE_ADMISSION.set(admission)
+    try:
+        yield admission
+    finally:
+        admission.active = False
+        _RELEASE_ADMISSION.reset(token)
+
+
+async def _guard_release(
+    shell: PanelShell,
+    component: str = "bridge",
+    local_payload_dir: str | None = None,
+    *,
+    components: tuple[str, ...] = (),
+) -> ReleaseAdmission:
+    admission = _RELEASE_ADMISSION.get()
+    if admission is None:
+        return await _admit_release(
+            shell,
+            local_payload_dir or str(_identity_payload_dir()),
+            "connected-panel",
+            (component, *components),
+            None,
+        )
+    if (
+        not admission.active
+        or admission.shell is not shell
+        or admission.owner is not asyncio.current_task()
+        or any(key not in admission.changes for key in (component, *components))
+    ):
+        raise PanelOpError("release_transaction_mismatch")
+    await _revalidate_release(shell, admission, local_payload_dir)
+    return admission
+
+
+async def _revalidate_release(
+    shell: PanelShell,
+    admission: ReleaseAdmission,
+    local_payload_dir: str | None = None,
+) -> None:
+    observed = await _read_release_identities(shell)
+    if any(observed.get(key) != identity for key, identity in admission.incumbent.items()):
+        raise PanelOpError("release_identity_changed: inspect the current panel and retry")
+    if local_payload_dir is not None:
+        candidates = await candidate_identities(local_payload_dir)
+        if any(candidates.get(key) != value for key, value in admission.candidate.items()):
+            raise PanelOpError("release_candidate_changed")
+
+
+async def _complete_identity(
+    shell: PanelShell, admission: ReleaseAdmission, component: str
+) -> None:
+    """Publish authority only after hashing the newly selected bytes."""
+    observed = await _read_release_identities(shell)
+    identity = observed.get(component)
+    if identity is None or identity.digest != admission.candidate[component].digest:
+        raise PanelOpError("release_identity_verification_failed")
+    identity = replace(identity, release_ordinal=admission.candidate[component].release_ordinal)
+    await _write_release_record(shell, component, identity.as_dict())
+    admission.incumbent[component] = identity
+    admission.pending.discard(component)
+
+
+def release_component_changed(component: str) -> bool:
+    admission = _RELEASE_ADMISSION.get()
+    return (
+        admission is not None
+        and admission.incumbent.get(component) is not None
+        and admission.changes.get(component, False)
+    )
+
+
+def _require_candidate_code(admission: ReleaseAdmission, component: str) -> None:
+    incumbent = admission.incumbent[component]
+    if (
+        incumbent is not None
+        and component not in admission.pending
+        and incumbent.digest != admission.candidate[component].digest
+    ):
+        raise PanelOpError(
+            "release_payload_required: deploy admitted code before selecting its unit"
+        )
 
 
 _CORE_COMPONENT_ORDER = (
@@ -215,6 +518,7 @@ class PanelSnapshot:
     wifi_watchdog_service: ServiceSnapshot
     bus_watchdog_service: ServiceSnapshot
     selected_components: tuple[str, ...]
+    baseline: RollbackBaseline | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -322,7 +626,33 @@ async def _provisioning_run(
     failed = False
     result: RunResult | None = None
     try:
-        result = await shell.run(command)
+        if error_code.startswith(("baseline_", "rollback_")):
+            process = await shell.start(command)
+            settlement = asyncio.create_task(process.wait())
+            try:
+                result = await asyncio.shield(settlement)
+            except BaseException:
+                process.terminate()
+                closing = asyncio.create_task(shell.close())
+                while not closing.done():
+                    try:
+                        await asyncio.shield(closing)
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                if not closing.cancelled():
+                    closing.exception()
+                # The shared operation lock must not be released while a remote
+                # restore could still write. Shell close bounds and fences exit.
+                while not settlement.done():
+                    try:
+                        await asyncio.shield(settlement)
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                if not settlement.cancelled():
+                    settlement.exception()
+                raise
+        else:
+            result = await shell.run(command)
     except asyncio.CancelledError:
         raise
     except Exception:
@@ -388,6 +718,17 @@ def _layout_probe_command() -> str:
     services = tuple(
         (component_id, service_name) for component_id, service_name, _ in _CORE_SERVICES
     )
+    unit_choices = (
+        (PANEL_UNIT_FILE, _STAGED_UNIT),
+        (
+            PANEL_WIFI_WATCHDOG_UNIT_FILE,
+            f"{PANEL_WIFI_WATCHDOG_DIR}/{WIFI_WATCHDOG_SERVICE_NAME}.service",
+        ),
+        (
+            PANEL_BUS_WATCHDOG_UNIT_FILE,
+            f"{PANEL_BUS_WATCHDOG_DIR}/{BUS_WATCHDOG_SERVICE_NAME}.service",
+        ),
+    )
     return (
         f"{_PANEL_PYTHON} - <<'BRILLIANT_MQTT_SNAPSHOT'\n"
         "import json, os, subprocess\n"
@@ -399,6 +740,15 @@ def _layout_probe_command() -> str:
         "        raise SystemExit(41)\n"
         "    layout = 'release_link'\n"
         "    target = os.readlink(current)\n"
+        "    selections = []\n"
+        f"    for unit, staged in {unit_choices!r}:\n"
+        "        if not os.path.exists(unit): unit = staged\n"
+        "        if os.path.isfile(unit):\n"
+        "            with open(unit, 'rb') as selected:\n"
+        f"                selections.append({f'{PANEL_CURRENT_LINK}/'.encode()!r} "
+        "in selected.read())\n"
+        "    if selections and not any(selections):\n"
+        "        layout, target = 'legacy_fixed', None\n"
         "else:\n"
         "    legacy = any(os.path.lexists(path) for path in legacy_paths)\n"
         "    layout = 'legacy_fixed' if legacy else 'absent'\n"
@@ -674,6 +1024,112 @@ async def snapshot_panel(shell: PanelShell) -> PanelSnapshot:
     return snapshot
 
 
+async def capture_baseline(
+    shell: PanelShell,
+    snapshot: PanelSnapshot,
+    *,
+    maximum_bytes: int = 32 * 1024 * 1024,
+    maximum_entries: int = 4096,
+    capture_seconds: int = 120,
+    free_reserve: int = 32 * 1024 * 1024,
+) -> PanelSnapshot:
+    """Complete and publish the bounded code/config baseline before admitting writes."""
+    if snapshot.baseline is not None:
+        await verify_baseline(shell, snapshot)
+        return snapshot
+    if snapshot.layout is not PanelLayout.ABSENT and (
+        not snapshot.bridge_service.active or snapshot.environment_file.content is None
+    ):
+        raise PanelOpError("baseline_correlation_unsupported")
+    command = _identity_command(
+        await _identity_source(),
+        "import signal\n"
+        f"signal.alarm({capture_seconds})\n"
+        f"print(json.dumps(capture_baseline(Path({PANEL_VAR_DIR!r}), {uuid4().hex!r}, "
+        f"maximum_bytes={maximum_bytes}, maximum_entries={maximum_entries}, "
+        f"capture_seconds={capture_seconds}, free_reserve={free_reserve})))",
+        "BRILLIANT_BASELINE_CAPTURE",
+    )
+    result = await _provisioning_run(shell, command, "baseline_capture_failed")
+    try:
+        if len(result.stdout) > 16384:
+            raise ValueError
+        baseline = RollbackBaseline.from_dict(json.loads(result.stdout))
+    except (ValueError, TypeError):
+        raise PanelOpError("baseline_capture_invalid") from None
+    observed = await snapshot_panel(shell)
+    if observed != snapshot:
+        raise PanelOpError("baseline_changed")
+    return replace(snapshot, baseline=baseline)
+
+
+async def _baseline_action(shell: PanelShell, snapshot: PanelSnapshot, action: str) -> None:
+    baseline = snapshot.baseline
+    if baseline is None:
+        raise PanelOpError("baseline_incomplete")
+    command = _identity_command(
+        await _identity_source(),
+        f"baseline_action(Path({PANEL_VAR_DIR!r}), {baseline.identifier!r}, "
+        f"{baseline.digest!r}, {action!r})",
+        "BRILLIANT_BASELINE_ACTION",
+    )
+    await _provisioning_run(shell, command, "baseline_" + action + "_failed")
+
+
+async def verify_baseline(shell: PanelShell, snapshot: PanelSnapshot) -> None:
+    await _baseline_action(shell, snapshot, "verify")
+
+
+async def finalize_baseline(shell: PanelShell, snapshot: PanelSnapshot) -> None:
+    await _baseline_action(shell, snapshot, "finalize")
+
+
+async def baseline_retained(shell: PanelShell) -> bool:
+    result = await _provisioning_run(
+        shell,
+        f"{_PANEL_PYTHON} - <<'BRILLIANT_BASELINE_RETAINED'\n"
+        "from pathlib import Path\n"
+        f"print(int(any(Path({PANEL_VAR_DIR!r}).glob('.rollback/[0-9a-f]*/complete.json'))))\n"
+        "BRILLIANT_BASELINE_RETAINED",
+        "baseline_read_failed",
+    )
+    if result.stdout.strip() not in {"0", "1"}:
+        raise PanelOpError("baseline_read_failed")
+    return result.stdout.strip() == "1"
+
+
+async def restart_restored(
+    shell: PanelShell,
+    snapshot: PanelSnapshot,
+    deployment_id: str,
+    *,
+    on_service_stopped: Callable[[], None],
+) -> None:
+    """Change only deployment correlation after exact restoration was verified."""
+    if re.fullmatch(r"[0-9a-f]{32}", deployment_id) is None:
+        raise PanelOpError("baseline_invalid")
+    await _provisioning_run(shell, _stop_service_command(SERVICE_NAME), "rollback_service_failed")
+    content = snapshot.environment_file.content
+    if content is None or not snapshot.bridge_service.active:
+        raise PanelOpError("baseline_correlation_unsupported")
+    lines = content.splitlines(keepends=True)
+    content = b"".join(
+        line for line in lines if not line.strip().startswith(b"BRILLIANT_DEPLOYMENT_ID=")
+    )
+    if content and not content.endswith(b"\n"):
+        content += b"\n"
+    content += f"BRILLIANT_DEPLOYMENT_ID={deployment_id}\n".encode()
+    transaction = uuid4()
+    staged = StagedRelease(
+        "recovery", transaction, f"{PANEL_RELEASES_DIR}/recovery--{transaction.hex}", ("bridge",)
+    )
+    await _restore_file(
+        shell, PANEL_ENV_FILE, FileSnapshot(content, snapshot.environment_file.mode), staged
+    )
+    on_service_stopped()
+    await _provisioning_run(shell, f"systemctl start {SERVICE_NAME}", "rollback_service_failed")
+
+
 def _staged_temp_path(staged: StagedRelease) -> str:
     return f"{PANEL_RELEASES_DIR}/.{staged.version}--{staged.transaction_id.hex}.tmp"
 
@@ -914,6 +1370,14 @@ async def stage_release(
         mqtt_ca = None
         raise PanelOpError("invalid_staged_release")
     mqtt_ca_digest = hashlib.sha256(mqtt_ca).hexdigest() if mqtt_ca is not None else None
+
+    admission = await _guard_release(
+        shell, local_payload_dir=local_payload_dir, components=normalized
+    )
+    if admission.noop:
+        return staged
+    if not all(admission.changes.values()):
+        raise PanelOpError("release_selection_conflict")
 
     failure: BaseException | None = None
     try:
@@ -1156,6 +1620,30 @@ async def _converge_service(
     )
 
 
+async def _read_staged_identities(
+    shell: PanelShell, staged: StagedRelease
+) -> dict[str, ReleaseIdentity]:
+    result = await _provisioning_run(
+        shell,
+        _identity_command(
+            await _identity_source(),
+            f"root = Path({staged.release_target!r})\n"
+            "print(json.dumps({key: {'version': (root / 'VERSION').read_text().strip(), "
+            "'release_ordinal': release_ordinal(root), 'digest': code_digest(root, key), "
+            "'deployment_id': None, 'layout': 'candidate'} "
+            f"for key in {staged.selected_components!r}" + "}))",
+            "BRILLIANT_STAGED_IDENTITY_READ",
+        ),
+        "release_identity_read_failed",
+    )
+    try:
+        raw = json.loads(result.stdout)
+        candidate = {key: ReleaseIdentity.from_dict(value) for key, value in raw.items()}
+    except (AttributeError, TypeError, ValueError):
+        raise PanelOpError("release_identity_read_failed") from None
+    return candidate
+
+
 async def activate_staged(
     shell: PanelShell,
     staged: StagedRelease,
@@ -1165,6 +1653,14 @@ async def activate_staged(
     """Atomically select a validated release and converge only fleet core units."""
     if not isinstance(staged, StagedRelease) or not callable(on_services_stopped):
         raise PanelOpError("invalid_staged_release")
+    admission = await _guard_release(shell, components=staged.selected_components)
+    if admission.noop:
+        return
+    candidate = await _read_staged_identities(shell, staged)
+    if candidate != admission.candidate:
+        raise PanelOpError("release_candidate_changed")
+    if not all(admission.changes.values()):
+        raise PanelOpError("release_selection_conflict")
     await _provisioning_run(
         shell,
         _release_validation_command(staged, promoted=True),
@@ -1200,6 +1696,8 @@ async def activate_staged(
         _activation_commit_command(staged),
         "activation_commit_failed",
     )
+    for component in staged.selected_components:
+        await _complete_identity(shell, admission, component)
     await _provisioning_run(
         shell,
         "systemctl daemon-reload",
@@ -1333,6 +1831,7 @@ async def rollback_snapshot(
         raise PanelOpError("invalid_panel_snapshot")
     if not isinstance(staged, StagedRelease):
         raise PanelOpError("invalid_staged_release")
+    await verify_baseline(shell, snapshot)
     failure: BaseException | None = None
     try:
         for _, service_name, _ in _CORE_SERVICES:
@@ -1341,6 +1840,7 @@ async def rollback_snapshot(
                 _stop_service_command(service_name),
                 "rollback_service_failed",
             )
+        await _baseline_action(shell, snapshot, "restore")
         for service_name, service_snapshot in (
             (SERVICE_NAME, snapshot.bridge_service),
             (
@@ -1403,7 +1903,11 @@ async def rollback_snapshot(
             raise
         except Exception:
             verification_failed = True
-        if verification_failed or observed != snapshot:
+        if (
+            verification_failed
+            or observed is None
+            or replace(observed, baseline=None) != replace(snapshot, baseline=None)
+        ):
             observed = None
             raise PanelOpError("rollback_verification_failed")
     except BaseException as error:
@@ -1425,6 +1929,7 @@ def _cleanup_staged_command(staged: StagedRelease) -> str:
     temporary = _staged_temp_path(staged)
     return (
         f"rm -rf -- {temporary}; "
+        f"test ! -e {staged.release_target}/.rollback-retained || exit 49; "
         f"if [ -e {PANEL_CURRENT_LINK} ] || [ -L {PANEL_CURRENT_LINK} ]; then "
         f"test -L {PANEL_CURRENT_LINK} || exit 46; "
         f'test "$(readlink {PANEL_CURRENT_LINK})" != {staged.release_target} '
@@ -1539,8 +2044,10 @@ INSPECT_COMMAND = (
     f"systemctl is-active {SERVICE_NAME} >/dev/null 2>&1 && echo active=1 || echo active=0; "
     f"test -f {_STAGED_UNIT} && echo sunit=1 || echo sunit=0; "
     f"test -f {_STAGED_ENV} && echo senv=1 || echo senv=0; "
-    f"test -f {PANEL_VAR_DIR}/app/brilliant_mqtt/__main__.py "
-    f"&& test -d {PANEL_VAR_DIR}/vendor && echo payload=1 || echo payload=0; "
+    f"{{ test -f {PANEL_CURRENT_LINK}/app/brilliant_mqtt/__main__.py "
+    f"&& test -d {PANEL_CURRENT_LINK}/vendor; }} || "
+    f"{{ test -f {PANEL_VAR_DIR}/app/brilliant_mqtt/__main__.py "
+    f"&& test -d {PANEL_VAR_DIR}/vendor; }} && echo payload=1 || echo payload=0; "
     f"cat {PANEL_VERSION_FILE} 2>/dev/null || true"
 )
 
@@ -1837,13 +2344,108 @@ async def ensure_configs(shell: PanelShell, unit_content: str, env_content: str)
     The staged copies are the OTA-proof restore source: /var survives firmware
     updates, /etc may not. Env files carry the broker password → 0600 both places.
     """
+    admission = await _guard_release(shell)
+    _require_candidate_code(admission, "bridge")
+    incumbent = admission.incumbent["bridge"]
+    if incumbent is not None and incumbent.deployment_id is not None:
+        # Keep the selected release's provenance when legacy configuration rendering
+        # does not carry the field. Fresh recovery correlation is a separate operation.
+        if ENV_DEPLOYMENT_ID not in parse_env(env_content):
+            env_content += f"\n{ENV_DEPLOYMENT_ID}={incumbent.deployment_id}\n"
     await async_assert_no_mqtt_tls_downgrade(shell, env_content)
+    if not admission.changes["bridge"]:
+        await _ensure_preserved_unit(shell, admission, "bridge", unit_content)
+        for path in (PANEL_ENV_FILE, _STAGED_ENV):
+            await _write_identity_config(shell, path, env_content.encode(), 0o600)
+        await _refresh_admitted_correlation(shell, admission, env_content)
+        return
     await _checked(shell, f"mkdir -p {PANEL_STAGED_DIR}")
     await shell.put_bytes(unit_content.encode(), PANEL_UNIT_FILE, 0o644)
     await shell.put_bytes(env_content.encode(), PANEL_ENV_FILE, 0o600)
     await shell.put_bytes(unit_content.encode(), _STAGED_UNIT, 0o644)
     await shell.put_bytes(env_content.encode(), _STAGED_ENV, 0o600)
     await _checked(shell, "systemctl daemon-reload")
+    if "bridge" in admission.pending:
+        await _complete_identity(shell, admission, "bridge")
+    await _refresh_admitted_correlation(shell, admission, env_content)
+
+
+async def _refresh_admitted_correlation(
+    shell: PanelShell,
+    admission: ReleaseAdmission,
+    environment: str,
+) -> None:
+    deployment_id = parse_env(environment).get(ENV_DEPLOYMENT_ID)
+    if deployment_id is None:
+        return
+    observed = await _read_release_identities(shell)
+    for component, identity in admission.incumbent.items():
+        expected = replace(identity, deployment_id=deployment_id) if identity else None
+        if observed.get(component) != expected:
+            raise PanelOpError("release_identity_changed")
+        admission.incumbent[component] = expected
+
+
+async def _identity_file(shell: PanelShell, path: str) -> FileSnapshot:
+    result = await _provisioning_run(
+        shell, _file_probe_command(path, MAX_SNAPSHOT_FILE_BYTES), "release_config_read_failed"
+    )
+    snapshot = _parse_file_snapshot(result.stdout, MAX_SNAPSHOT_FILE_BYTES)
+    if snapshot is None:
+        raise PanelOpError("release_config_read_failed")
+    return snapshot
+
+
+async def _write_identity_config(shell: PanelShell, path: str, content: bytes, mode: int) -> bool:
+    existing = await _identity_file(shell, path)
+    if existing.content == content and existing.mode == mode:
+        return False
+    await _provisioning_run(
+        shell, f"mkdir -p {os.path.dirname(path)}", "release_config_write_failed"
+    )
+    await _provisioning_put_bytes(shell, content, path, mode, "release_config_write_failed")
+    return True
+
+
+async def _ensure_preserved_unit(
+    shell: PanelShell,
+    admission: ReleaseAdmission,
+    component: str,
+    fallback: str,
+) -> None:
+    service, live, staged = {
+        "bridge": (SERVICE_NAME, PANEL_UNIT_FILE, _STAGED_UNIT),
+        "wifi_watchdog": (
+            WIFI_WATCHDOG_SERVICE_NAME,
+            PANEL_WIFI_WATCHDOG_UNIT_FILE,
+            _WATCHDOG_STAGED_UNIT,
+        ),
+        "bus_watchdog": (
+            BUS_WATCHDOG_SERVICE_NAME,
+            PANEL_BUS_WATCHDOG_UNIT_FILE,
+            _BUS_WATCHDOG_STAGED_UNIT,
+        ),
+    }[component]
+    incumbent = admission.incumbent[component]
+    assert incumbent is not None
+    existing = await _identity_file(shell, live)
+    content = existing.content
+    if content is None:
+        if incumbent.layout == "release_link":
+            selected = await _identity_file(
+                shell, f"{PANEL_CURRENT_LINK}/{service}-release.service"
+            )
+            content = selected.content
+            if content is None:
+                raise PanelOpError("release_config_source_missing")
+        else:
+            selected = await _identity_file(shell, staged)
+            content = selected.content if selected.content is not None else fallback.encode()
+    await _revalidate_release(shell, admission)
+    changed = await _write_identity_config(shell, live, content, 0o644)
+    changed = await _write_identity_config(shell, staged, content, 0o644) or changed
+    if changed:
+        await _provisioning_run(shell, "systemctl daemon-reload", "release_config_write_failed")
 
 
 async def enable_now(shell: PanelShell) -> None:
@@ -2152,13 +2754,23 @@ async def deploy_payload(shell: PanelShell, local_payload_dir: str, version: str
     and tarball. The current app/vendor are moved aside (not rm) so a mid-swap mv
     failure stays recoverable.
     """
+    admission = await _guard_release(shell, local_payload_dir=local_payload_dir)
+    if not admission.changes["bridge"]:
+        return
+    if version != admission.candidate["bridge"].version:
+        raise PanelOpError("release_candidate_changed")
     loop = asyncio.get_running_loop()
     archive = await loop.run_in_executor(None, _build_payload_archive, local_payload_dir)
     await _checked(shell, f"rm -rf {_STAGING_DIR} {_STAGING_TARBALL}")
     await shell.put_bytes(archive, _STAGING_TARBALL, 0o600)
     await _checked(shell, _extract_payload_command())
+    await _revalidate_release(shell, admission, local_payload_dir)
     await _checked(shell, _swap_command())
     await shell.put_bytes(version.encode(), PANEL_VERSION_FILE, 0o644)
+    admission.pending.add("bridge")
+    incumbent = admission.incumbent["bridge"]
+    if incumbent is None or incumbent.layout == "legacy_fixed":
+        await _complete_identity(shell, admission, "bridge")
 
 
 def _build_payload_archive(local_payload_dir: str) -> bytes:
@@ -2218,6 +2830,8 @@ async def uninstall(shell: PanelShell) -> None:
     but the removals and the reload must actually succeed or we'd leave orphaned
     files behind a "removed" config entry.
     """
+    if await baseline_retained(shell):
+        raise PanelOpError("baseline_retained_finalize_first")
     await shell.run(f"systemctl disable --now {SERVICE_NAME} 2>/dev/null || true")
     await _checked(shell, f"rm -f {PANEL_UNIT_FILE} {PANEL_ENV_FILE}")
     await _checked(shell, f"rm -rf {PANEL_VAR_DIR} {_STAGING_DIR} {_STAGING_TARBALL}")
@@ -2598,11 +3212,18 @@ async def ensure_wifi_watchdog_unit(shell: PanelShell, unit_content: str) -> Non
     The watchdog has no env file of its own; the systemd unit uses
     EnvironmentFile=-/etc/brilliant-mqtt.env (optional, shared with the bridge).
     """
+    admission = await _guard_release(shell, "wifi_watchdog")
+    if not admission.changes["wifi_watchdog"]:
+        await _ensure_preserved_unit(shell, admission, "wifi_watchdog", unit_content)
+        return
+    _require_candidate_code(admission, "wifi_watchdog")
     await _checked(shell, f"mkdir -p {PANEL_WIFI_WATCHDOG_DIR}")
     unit_bytes = unit_content.encode()
     await shell.put_bytes(unit_bytes, PANEL_WIFI_WATCHDOG_UNIT_FILE, 0o644)
     await shell.put_bytes(unit_bytes, _WATCHDOG_STAGED_UNIT, 0o644)
     await _checked(shell, "systemctl daemon-reload")
+    if "wifi_watchdog" in admission.pending:
+        await _complete_identity(shell, admission, "wifi_watchdog")
 
 
 async def enable_wifi_watchdog(shell: PanelShell) -> None:
@@ -2721,6 +3342,17 @@ async def _deploy_watchdog_tarball(
     transfer never triggers the swap, so it can never half-replace a working
     install.
     """
+    component = (
+        "wifi_watchdog"
+        if version_file.startswith(PANEL_WIFI_WATCHDOG_DIR + "/")
+        else "bus_watchdog"
+    )
+    payload_dir = str(Path(local_dir).parent)
+    admission = await _guard_release(shell, component, payload_dir)
+    if not admission.changes[component]:
+        return
+    if version != admission.candidate[component].version:
+        raise PanelOpError("release_candidate_changed")
     loop = asyncio.get_running_loop()
     archive = await loop.run_in_executor(None, _build_watchdog_archive, local_dir)
     await shell.run(f"rm -rf {staging_dir} {staging_tarball}")
@@ -2735,8 +3367,13 @@ async def _deploy_watchdog_tarball(
             ]
         ),
     )
+    await _revalidate_release(shell, admission, payload_dir)
     await _checked(shell, swap_command)
     await shell.put_bytes(version.encode(), version_file, 0o644)
+    admission.pending.add(component)
+    incumbent = admission.incumbent[component]
+    if incumbent is None or incumbent.layout == "legacy_fixed":
+        await _complete_identity(shell, admission, component)
 
 
 def _build_watchdog_archive(local_dir: str) -> bytes:
@@ -2773,11 +3410,18 @@ async def ensure_bus_watchdog_unit(shell: PanelShell, unit_content: str) -> None
     The watchdog has no env file of its own; the systemd unit uses
     EnvironmentFile=-/etc/brilliant-mqtt.env (optional, shared with the bridge).
     """
+    admission = await _guard_release(shell, "bus_watchdog")
+    if not admission.changes["bus_watchdog"]:
+        await _ensure_preserved_unit(shell, admission, "bus_watchdog", unit_content)
+        return
+    _require_candidate_code(admission, "bus_watchdog")
     await _checked(shell, f"mkdir -p {PANEL_BUS_WATCHDOG_DIR}")
     unit_bytes = unit_content.encode()
     await shell.put_bytes(unit_bytes, PANEL_BUS_WATCHDOG_UNIT_FILE, 0o644)
     await shell.put_bytes(unit_bytes, _BUS_WATCHDOG_STAGED_UNIT, 0o644)
     await _checked(shell, "systemctl daemon-reload")
+    if "bus_watchdog" in admission.pending:
+        await _complete_identity(shell, admission, "bus_watchdog")
 
 
 async def enable_bus_watchdog(shell: PanelShell) -> None:

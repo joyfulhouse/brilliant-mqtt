@@ -18,6 +18,7 @@ from homeassistant.helpers.storage import Store as HomeAssistantStore
 from homeassistant.util import json as json_util
 
 from .broker import BrokerKind
+from .release_identity import RollbackBaseline
 from .shell import HostIdentity, PanelIdentityError, known_hosts_line
 
 JOURNAL_STORAGE_VERSION = 1
@@ -115,6 +116,7 @@ _FILE_KEYS = frozenset({"content", "mode"})
 _SERVICE_KEYS = frozenset({"unit_file", "enabled", "active"})
 _SNAPSHOT_KEYS = frozenset(
     {
+        "baseline",
         "layout",
         "active_release_target",
         "environment_file",
@@ -162,6 +164,9 @@ class ProvisioningOperation(StrEnum):
 
     INSTALL = "install"
     UPGRADE = "upgrade"
+    UPDATE = "update"
+    ROLLBACK = "rollback"
+    ONBOARDING_ROLLBACK = "onboarding_rollback"
 
 
 class ProvisioningPhase(StrEnum):
@@ -568,6 +573,7 @@ class StoredPanelSnapshot:
     wifi_watchdog_service: StoredServiceSnapshot = field(repr=False)
     bus_watchdog_service: StoredServiceSnapshot = field(repr=False)
     selected_components: tuple[str, ...]
+    baseline: RollbackBaseline | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.layout, StoredPanelLayout):
@@ -638,10 +644,13 @@ class StoredPanelSnapshot:
             "wifi_watchdog_service": self.wifi_watchdog_service._to_storage(),
             "bus_watchdog_service": self.bus_watchdog_service._to_storage(),
             "selected_components": list(self.selected_components),
+            "baseline": self.baseline.as_dict() if self.baseline is not None else None,
         }
 
     @classmethod
     def _from_storage(cls, raw: object) -> Self:
+        if isinstance(raw, dict) and "baseline" not in raw:
+            raw = {**raw, "baseline": None}
         value = _exact_keys(raw, _SNAPSHOT_KEYS)
         raw_layout = _string(value["layout"])
         layout_failed = False
@@ -665,6 +674,11 @@ class StoredPanelSnapshot:
             selected_components=_components(
                 value["selected_components"],
                 allow_empty=True,
+            ),
+            baseline=(
+                RollbackBaseline.from_dict(value["baseline"])
+                if value["baseline"] is not None
+                else None
             ),
         )
 
@@ -836,10 +850,119 @@ async def _async_settle_storage(
     )
 
 
+_RETAINED_STATES = frozenset(
+    {
+        "armed",
+        "soak",
+        "restore_requested",
+        "restored",
+        "finalizing",
+        "rollback_failed",
+    }
+)
+_CREDENTIAL_PLACEHOLDER = "resolve_from_panel_configuration"
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class RetainedRollback:
+    """Passive recovery provenance; never persists the panel login credential."""
+
+    record: ProvisioningRecord = field(repr=False)
+    state: str = "armed"
+    recovery_deployment_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.state not in _RETAINED_STATES or self.record.prior_snapshot.baseline is None:
+            raise _invalid()
+        if (
+            self.recovery_deployment_id is not None
+            and re.fullmatch(
+                r"[0-9a-f]{32}",
+                self.recovery_deployment_id,
+            )
+            is None
+        ):
+            raise _invalid()
+        object.__setattr__(
+            self,
+            "record",
+            replace(
+                self.record,
+                panel_request=replace(
+                    self.record.panel_request,
+                    root_password=_CREDENTIAL_PLACEHOLDER,
+                ),
+            ),
+        )
+
+    def __repr__(self) -> str:
+        return "RetainedRollback(<redacted>)"
+
+    def compensation_password(self, current: ProvisioningRecord | None) -> str | None:
+        """Use only the matching active onboarding journal's temporary authority."""
+        if current is None or self.record.operation not in {
+            ProvisioningOperation.INSTALL,
+            ProvisioningOperation.UPGRADE,
+        }:
+            return None
+        if current.operation is ProvisioningOperation.ONBOARDING_ROLLBACK:
+            if self.state not in {
+                "restore_requested",
+                "restored",
+                "rollback_failed",
+            } or current.phase not in {
+                ProvisioningPhase.ROLLBACK_PENDING,
+                ProvisioningPhase.ROLLED_BACK,
+            }:
+                return None
+        elif (
+            current.operation is not self.record.operation
+            or self.state != "restore_requested"
+            or current.phase in {ProvisioningPhase.COMMITTED, ProvisioningPhase.ROLLED_BACK}
+        ):
+            return None
+        provenance = replace(
+            current,
+            operation=self.record.operation,
+            phase=self.record.phase,
+            last_error=self.record.last_error,
+            panel_request=replace(current.panel_request, root_password=_CREDENTIAL_PLACEHOLDER),
+        )
+        if provenance != self.record:
+            return None
+        return current.panel_request.root_password
+
+    def _to_storage(self) -> dict[str, object]:
+        record = self.record._to_storage()
+        request = self.record.panel_request._to_storage()
+        del request["root_password"]
+        record["panel_request"] = request
+        return {
+            "record": record,
+            "state": self.state,
+            "recovery_deployment_id": self.recovery_deployment_id,
+        }
+
+    @classmethod
+    def _from_storage(cls, raw: object) -> RetainedRollback:
+        value = _exact_keys(raw, frozenset({"record", "state", "recovery_deployment_id"}))
+        record = dict(_exact_keys(value["record"], _RECORD_KEYS))
+        request = dict(
+            _exact_keys(record["panel_request"], _PANEL_REQUEST_KEYS - {"root_password"})
+        )
+        request["root_password"] = _CREDENTIAL_PLACEHOLDER
+        record["panel_request"] = request
+        return cls(
+            ProvisioningRecord._from_storage(record),
+            _string(value["state"]),
+            _optional_string(value["recovery_deployment_id"]),
+        )
+
+
 class ProvisioningJournal:
     """Serialize one provisioning transaction before every observable phase change."""
 
-    __slots__ = ("_coordinator", "_hass", "_store")
+    __slots__ = ("_coordinator", "_hass", "_store", "_retained_store")
 
     def __init__(self, hass: HomeAssistant) -> None:
         self._hass = hass
@@ -850,6 +973,7 @@ class ProvisioningJournal:
             atomic_writes=True,
             private=True,
         )
+        self._retained_store: Store | None = None
         coordinator = hass.data.setdefault(
             _JOURNAL_COORDINATOR_KEY,
             _JournalCoordinator(),
@@ -875,8 +999,160 @@ class ProvisioningJournal:
             await self._async_reload()
             if self._coordinator.record is not None:
                 raise ProvisioningJournalError("journal_transaction_in_progress")
+            if record.prior_snapshot.baseline is not None:
+                await self._async_arm(record)
             await self._async_save(record)
             return record
+
+    async def _async_retained_load(self) -> dict[str, RetainedRollback]:
+        failed = False
+        result: dict[str, RetainedRollback] = {}
+        try:
+            async with asyncio.timeout(_STORE_LOAD_TIMEOUT_SECONDS):
+                raw = await self._retained_storage().async_load()
+            if raw is None:
+                return result
+            value = _exact_keys(raw, frozenset({"records"}))["records"]
+            if not isinstance(value, dict) or len(value) > 256:
+                raise _invalid()
+            for key, item in value.items():
+                parsed = RetainedRollback._from_storage(item)
+                if key != str(parsed.record.transaction_id):
+                    raise _invalid()
+                result[key] = parsed
+        except Exception:
+            failed = True
+        if failed:
+            raise ProvisioningJournalError("journal_load_failed")
+        return result
+
+    async def _async_retained_save(self, records: dict[str, RetainedRollback]) -> None:
+        payload = {"records": {key: record._to_storage() for key, record in records.items()}}
+        outcome = await _async_settle_storage(
+            self._hass, self._retained_storage().async_save(payload)
+        )
+        verified = await _async_settle_storage(self._hass, self._retained_storage().async_load())
+        failed = (
+            outcome.error is not None or verified.error is not None or verified.result != payload
+        )
+        cancellation = outcome.cancellation or verified.cancellation
+        del outcome, verified, payload
+        if cancellation is not None:
+            raise cancellation from None
+        if failed:
+            raise ProvisioningJournalError("journal_save_failed")
+
+    def _retained_storage(self) -> Store:
+        if self._retained_store is None:
+            self._retained_store = Store(
+                self._hass, 1, JOURNAL_STORAGE_KEY + ".retained", atomic_writes=True, private=True
+            )
+        return self._retained_store
+
+    async def _async_arm(self, record: ProvisioningRecord) -> None:
+        records = await self._async_retained_load()
+        key = str(record.transaction_id)
+        proposed = RetainedRollback(record)
+        if key in records:
+            if records[key].record != proposed.record:
+                raise ProvisioningJournalError("journal_transaction_mismatch")
+            return
+        if any(
+            item.record.panel_request.fingerprint == record.panel_request.fingerprint
+            for item in records.values()
+        ):
+            raise ProvisioningJournalError("journal_transaction_in_progress")
+        records[key] = proposed
+        await self._async_retained_save(records)
+
+    async def async_arm(self, record: ProvisioningRecord) -> None:
+        async with self._coordinator.lock:
+            await self._async_arm(record)
+
+    async def async_retained(self, transaction_id: UUID) -> RetainedRollback | None:
+        async with self._coordinator.lock:
+            return (await self._async_retained_load()).get(str(_uuid4(transaction_id)))
+
+    async def async_retained_records(self) -> tuple[RetainedRollback, ...]:
+        async with self._coordinator.lock:
+            return tuple((await self._async_retained_load()).values())
+
+    async def _async_retained_state(
+        self,
+        transaction_id: UUID,
+        state: str,
+        *,
+        evidence: str | None = None,
+    ) -> None:
+        records = await self._async_retained_load()
+        key = str(_uuid4(transaction_id))
+        current = records.get(key)
+        if current is None:
+            raise ProvisioningJournalError("journal_transaction_missing")
+        allowed = {
+            "armed": {"soak", "restore_requested", "finalizing", "restored", "rollback_failed"},
+            "soak": {"restore_requested", "finalizing"},
+            "restore_requested": {"restored", "rollback_failed"},
+            "rollback_failed": {"restore_requested", "restored", "finalizing"},
+            "restored": {"restore_requested", "finalizing", "rollback_failed"},
+            "finalizing": set(),
+        }
+        if state != current.state and state not in allowed[current.state]:
+            raise ProvisioningJournalError("invalid_journal_transition")
+        records[key] = replace(
+            current, state=state, recovery_deployment_id=evidence or current.recovery_deployment_id
+        )
+        await self._async_retained_save(records)
+
+    async def async_retained_state(
+        self,
+        transaction_id: UUID,
+        state: str,
+        *,
+        evidence: str | None = None,
+    ) -> None:
+        async with self._coordinator.lock:
+            await self._async_retained_state(transaction_id, state, evidence=evidence)
+
+    async def async_request_restore(self, transaction_id: UUID) -> None:
+        await self.async_retained_state(transaction_id, "restore_requested")
+
+    async def async_begin_restore(self, transaction_id: UUID, root_password: str) -> None:
+        async with self._coordinator.lock:
+            retained = (await self._async_retained_load()).get(str(_uuid4(transaction_id)))
+            if retained is None or retained.state != "restore_requested":
+                raise ProvisioningJournalError("invalid_journal_transition")
+            await self._async_reload()
+            if (
+                self._coordinator.record is not None
+                and self._coordinator.record.transaction_id != transaction_id
+            ):
+                raise ProvisioningJournalError("journal_transaction_in_progress")
+            record = replace(
+                retained.record,
+                operation=(
+                    ProvisioningOperation.ONBOARDING_ROLLBACK
+                    if retained.compensation_password(self._coordinator.record) is not None
+                    else ProvisioningOperation.ROLLBACK
+                ),
+                phase=ProvisioningPhase.ROLLBACK_PENDING,
+                panel_request=replace(
+                    retained.record.panel_request, root_password=_secret_text(root_password)
+                ),
+            )
+            if self._coordinator.record != record:
+                await self._async_save(record)
+
+    async def async_remove_retained(self, transaction_id: UUID) -> None:
+        async with self._coordinator.lock:
+            records = await self._async_retained_load()
+            key = str(_uuid4(transaction_id))
+            if key not in records:
+                return
+            if records[key].state != "finalizing":
+                raise ProvisioningJournalError("invalid_journal_transition")
+            del records[key]
+            await self._async_retained_save(records)
 
     async def async_transition(
         self,
@@ -930,6 +1206,8 @@ class ProvisioningJournal:
         async with self._coordinator.lock:
             record = await self._async_current(transaction_id)
             if record.phase is ProvisioningPhase.PENDING_CONFIG_COMMIT:
+                if record.prior_snapshot.baseline is not None:
+                    await self._async_retained_state(transaction_id, "soak")
                 record = replace(record, phase=ProvisioningPhase.COMMITTED)
                 await self._async_save(record)
             elif record.phase is not ProvisioningPhase.COMMITTED:
@@ -967,6 +1245,27 @@ class ProvisioningJournal:
                 raise ProvisioningJournalError("invalid_journal_transition")
             await self._async_remove()
             return record
+
+    async def async_complete_cleanup(self, transaction_id: UUID) -> None:
+        """Clear an unactivated candidate after cleanup, without claiming MQTT health."""
+        async with self._coordinator.lock:
+            record = await self._async_current(transaction_id)
+            if record.phase is not ProvisioningPhase.STAGED:
+                raise ProvisioningJournalError("invalid_journal_transition")
+            await self._async_remove()
+
+    async def async_complete_absent_rollback(self, transaction_id: UUID) -> None:
+        """An exact first-install undo has no predecessor MQTT session to verify."""
+        async with self._coordinator.lock:
+            record = await self._async_current(transaction_id)
+            if (
+                record.prior_snapshot.layout is not StoredPanelLayout.ABSENT
+                or record.phase is not ProvisioningPhase.ROLLBACK_PENDING
+            ):
+                raise ProvisioningJournalError("invalid_journal_transition")
+            if record.prior_snapshot.baseline is not None:
+                await self._async_retained_state(transaction_id, "restored")
+            await self._async_remove()
 
     async def async_diagnostics(self) -> dict[str, int | str | None]:
         """Expose only transaction count and phase, never journal contents."""
