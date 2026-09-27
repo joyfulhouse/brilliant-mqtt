@@ -60,6 +60,13 @@ def _render(record: Record) -> dict[str, object]:
     return result.fields
 
 
+def test_identical_capture_preserves_revision() -> None:
+    record = reduce(Record(), Capture(_device())).record
+    revision = record.revision
+    record = reduce(record, Capture(_device())).record
+    assert record.revision == revision
+
+
 @pytest.mark.parametrize(
     ("capture", "expected_state", "expected_status"),
     [
@@ -252,6 +259,21 @@ def test_stale_native_acceptance_cannot_clear_newer_debt_epoch() -> None:
     assert record.native_debt
     record = reduce(
         record, PublishAccepted(record.revision, native=True, debt_epoch=record.native_debt_epoch)
+    ).record
+    assert not record.native_debt
+
+
+def test_identical_matching_captures_do_not_renew_native_debt() -> None:
+    record = _success(reduce(Record(), Capture(_device())).record)
+    matching = _device(on="1", era=1, complete=False)
+    record = reduce(record, Capture(matching)).record
+    debt_epoch = record.native_debt_epoch
+    assert record.native_debt
+
+    record = reduce(record, Capture(matching)).record
+    assert record.native_debt_epoch == debt_epoch
+    record = reduce(
+        record, PublishAccepted(record.revision, native=True, debt_epoch=debt_epoch)
     ).record
     assert not record.native_debt
 

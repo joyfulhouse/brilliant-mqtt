@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 
 import pytest
 
@@ -12,7 +13,8 @@ from brilliant_mqtt.bus import RpcBusAdapter
 from brilliant_mqtt.commands import VarSet
 from brilliant_mqtt.model import BrilliantDevice, Variable
 from brilliant_mqtt.mqttio import _InboundMessage, _TopicDispatcher
-from tests.fakes import FakeClock, FakeMqtt, FakeSleeper, _settle
+from brilliant_mqtt.retained_topics import RetainedTopicLedger
+from tests.fakes import FakeBus, FakeClock, FakeMqtt, FakeSleeper, _settle
 from tests.test_wired_feedback_adapter_capture import (
     DEVICE_ID,
     _Observer,
@@ -20,8 +22,10 @@ from tests.test_wired_feedback_adapter_capture import (
     _RawPeripheral,
 )
 from tests.test_wired_feedback_freshness import (
+    PANEL,
     PID,
     SET_TOPIC,
+    STATE_TOPIC,
     _BlockingPublishMqtt,
     _bridged,
     _dimmer,
@@ -329,6 +333,90 @@ async def test_interrupted_accepted_publish_must_not_hide_genuine_off(fail: bool
         await bridge.shutdown_wired_feedback()
 
 
+class _SlowStateMqtt(FakeMqtt):
+    def __init__(self) -> None:
+        super().__init__()
+        self.delay = 0.0
+        self.started = 0
+
+    async def publish(self, topic: str, payload: str, retain: bool = False, qos: int = 0) -> None:
+        if topic == STATE_TOPIC and self.delay:
+            self.started += 1
+            await asyncio.sleep(self.delay)
+        await super().publish(topic, payload, retain, qos)
+
+
+async def _poll_while_publish_pending(bridge: Bridge, stop: asyncio.Event) -> None:
+    while not stop.is_set():
+        await bridge.poll_once()
+        await asyncio.sleep(0.02)
+
+
+@pytest.mark.parametrize("owner", ["push", "command"])
+async def test_identical_hot_polls_do_not_livelock_slow_publish(owner: str) -> None:
+    mqtt = _SlowStateMqtt()
+    bus, _, bridge = await _bridged(_dimmer(power="10"), mqtt=mqtt)
+    truth = _dimmer(power="99") if owner == "push" else _dimmer(on="1", power="10")
+    bus.set_devices([truth])
+    mqtt.delay = 0.03
+    if owner == "push":
+        caller = asyncio.create_task(bus.emit(truth))
+    else:
+        caller = asyncio.create_task(mqtt.inject(SET_TOPIC, '{"state":"ON"}'))
+    stop = asyncio.Event()
+    poller: asyncio.Task[None] | None = None
+    try:
+        await asyncio.sleep(0.005)
+        poller = asyncio.create_task(_poll_while_publish_pending(bridge, stop))
+        await asyncio.sleep(0.25)
+        assert mqtt.started >= 1
+        assert _states(mqtt)
+        assert caller.done()
+    finally:
+        stop.set()
+        if poller is not None:
+            await poller
+        await asyncio.wait_for(caller, 2)
+        await bridge.shutdown_wired_feedback()
+
+
+async def test_identical_hot_polls_do_not_livelock_retained_ledger(tmp_path: Path) -> None:
+    bus = FakeBus([_dimmer(power="10")])
+    mqtt = _SlowStateMqtt()
+    ledger = RetainedTopicLedger(PANEL, tmp_path / "owned-topics.json")
+    await ledger.async_load()
+    bridge = Bridge(
+        bus,
+        mqtt,
+        PANEL,
+        owned_topics=ledger,
+        clock=FakeClock(),
+        wall_clock=FakeClock(),
+        sleep=FakeSleeper(),
+    )
+    await bridge.reconcile()
+    mqtt.published.clear()
+    truth = _dimmer(power="99")
+    bus.set_devices([truth])
+    mqtt.delay = 0.03
+    caller = asyncio.create_task(bus.emit(truth))
+    stop = asyncio.Event()
+    poller: asyncio.Task[None] | None = None
+    try:
+        await asyncio.sleep(0.005)
+        poller = asyncio.create_task(_poll_while_publish_pending(bridge, stop))
+        await asyncio.sleep(0.25)
+        assert mqtt.started >= 1
+        assert _states(mqtt)
+        assert caller.done()
+    finally:
+        stop.set()
+        if poller is not None:
+            await poller
+        await asyncio.wait_for(caller, 2)
+        await bridge.shutdown_wired_feedback()
+
+
 async def test_aux_echo_on_wired_light_remains_visible() -> None:
     device = _dimmer(on="1")
     device.variables["enable_motion_score"] = Variable("enable_motion_score", "0", True)
@@ -403,6 +491,42 @@ async def test_shutdown_during_reconcile_read_is_terminal() -> None:
     finally:
         bus.release.set()
         await asyncio.gather(task, return_exceptions=True)
+        await bridge.shutdown_wired_feedback()
+
+
+async def test_shutdown_mid_read_prevents_later_availability_publication() -> None:
+    bus = _PausedReconnectReadBus()
+    _, mqtt, bridge = await _bridged(_dimmer(), bus=bus)
+    bus.pause = True
+    reconcile = asyncio.create_task(bridge.reconcile())
+    try:
+        await asyncio.wait_for(bus.reading.wait(), 2)
+        await bridge.shutdown_wired_feedback()
+        mqtt.published.clear()
+        bus.release.set()
+        await asyncio.wait_for(reconcile, 2)
+        assert not mqtt.published
+    finally:
+        bus.release.set()
+        await asyncio.gather(reconcile, return_exceptions=True)
+        await bridge.shutdown_wired_feedback()
+
+
+async def test_cancelled_publish_caller_propagates_cancellation() -> None:
+    mqtt = _SlowStateMqtt()
+    bus, _, bridge = await _bridged(_dimmer(), mqtt=mqtt)
+    mqtt.delay = 0.05
+    caller = asyncio.create_task(bus.emit(_dimmer(power="50")))
+    try:
+        await asyncio.sleep(0.01)
+        caller.cancel()
+        result = await asyncio.gather(caller, return_exceptions=True)
+        await asyncio.sleep(0.1)
+        assert isinstance(result[0], asyncio.CancelledError)
+        assert caller.cancelled()
+        assert _states(mqtt)
+    finally:
+        await asyncio.gather(caller, return_exceptions=True)
         await bridge.shutdown_wired_feedback()
 
 

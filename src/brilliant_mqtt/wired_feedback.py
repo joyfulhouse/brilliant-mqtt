@@ -302,8 +302,9 @@ def _capture(record: Record, incoming: BrilliantDevice) -> Record:
         status = "observed" if not unresolved else "ambiguous" if ambiguous else "provisional"
         if not unresolved:
             projected.clear()
-            debt = True
-            new_obligation = True
+            if feedback.unresolved or prior_projected:
+                debt = True
+                new_obligation = True
         elif prior_projected and not projected:
             debt = True
             new_obligation = True
@@ -314,6 +315,22 @@ def _capture(record: Record, incoming: BrilliantDevice) -> Record:
             ambiguous=frozenset(ambiguous),
             status=status,
         )
+    material = (
+        previous is None
+        or previous.device_id != native.device_id
+        or previous.kind != native.kind
+        or previous.name != native.name
+        or previous.peripheral_type != native.peripheral_type
+        or previous.variables != native.variables
+        or eras != dict(record.native_eras)
+        or unknown != record.unknown
+        or feedback != record.feedback
+        or attempt != record.attempt
+        or deadline_at != record.deadline_at
+        or debt != record.native_debt
+        or new_obligation
+        or newer_source
+    )
     return replace(
         record,
         native=native,
@@ -327,7 +344,7 @@ def _capture(record: Record, incoming: BrilliantDevice) -> Record:
         deadline_wall=deadline_wall,
         native_debt=debt,
         native_debt_epoch=record.native_debt_epoch + int(new_obligation),
-        revision=record.revision + 1,
+        revision=record.revision + int(material),
     )
 
 

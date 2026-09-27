@@ -36,6 +36,8 @@ values, so a translation change cannot restore one of those values.
 
 The reducer in `wired_feedback.py` makes all wired feedback decisions. The
 bridge owns one timer and one serialized, latest-wins publisher per load. A
+repeated capture with unchanged native evidence leaves the revision unchanged
+and does not interrupt an in-flight publish. A
 native publication obligation survives a failed or overtaken publish and is
 cleared only after MQTT accepts native state. Reconnect retirement happens
 before the replacement read; an absent load cannot discard publication debt.
