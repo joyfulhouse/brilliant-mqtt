@@ -58,9 +58,16 @@ versioned voice payload remains at 0.1.1. Update through the per-panel bridge
   ([#171](https://github.com/joyfulhouse/brilliant-mqtt/pull/171);
   [#160](https://github.com/joyfulhouse/brilliant-mqtt/issues/160),
   [#161](https://github.com/joyfulhouse/brilliant-mqtt/issues/161))
-- **PLACEHOLDER — before tagging:** describe wired-feedback freshness after
-  [#174](https://github.com/joyfulhouse/brilliant-mqtt/pull/174) lands
-  ([#172](https://github.com/joyfulhouse/brilliant-mqtt/issues/172)).
+- Wired light and switch feedback no longer lets a delayed pre-command snapshot
+  overwrite the requested state (the ON -> OFF -> ON flicker). Native
+  observations are kept separate from a provisional request that expires after
+  a fixed 20-second window; contradictions that metadata cannot resolve are
+  published as `ambiguous` rather than suppressed, and the device's own state is
+  published once the window ends. Mesh behaviour is unchanged. New
+  `wired_write_status`, `wired_requested` and `wired_write_deadline` keys
+  appear while a write is pending.
+  ([#174](https://github.com/joyfulhouse/brilliant-mqtt/pull/174);
+  [#172](https://github.com/joyfulhouse/brilliant-mqtt/issues/172))
 
 ## [0.10.2] - 2026-09-10
 
