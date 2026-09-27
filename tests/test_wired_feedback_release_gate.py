@@ -182,6 +182,54 @@ class _ScopedReadAcrossReconnect(_QuietObserver):
         return snapshot
 
 
+class _ReadAfterIssue(_QuietObserver):
+    def __init__(self, mirror: _RawDevice) -> None:
+        super().__init__(mirror)
+        self.arm = False
+        self.blocked = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def get_device(self, device_id: str) -> _RawDevice:
+        if self.arm:
+            self.arm = False
+            self.blocked.set()
+            await self.release.wait()
+        return self.mirror
+
+    async def get_peripheral(self, device_id: str, peripheral_id: str) -> _RawPeripheral:
+        device = await self.get_device(device_id)
+        return device.peripherals[peripheral_id]
+
+
+@pytest.mark.parametrize("scope", ["all", "peripheral"])
+async def test_read_captured_after_issue_does_not_mask_genuine_off(scope: str) -> None:
+    observer = _ReadAfterIssue(_RawDevice({PID: _RawPeripheral("Lights", "0", 1000)}))
+    adapter, mqtt, bridge = await _adapter_bridge(observer)
+    read: asyncio.Task[list[BrilliantDevice] | BrilliantDevice | None] | None = None
+    try:
+        observer.arm = True
+        if scope == "all":
+            read = asyncio.create_task(adapter.get_all())
+        else:
+            read = asyncio.create_task(adapter.get_peripheral(DEVICE_ID, PID))
+        await asyncio.wait_for(observer.blocked.wait(), 2)
+        await mqtt.inject(SET_TOPIC, '{"state":"ON"}')
+        observer.mirror = _RawDevice({PID: _RawPeripheral("Lights", "0", 2000)})
+        observer.release.set()
+        result = await asyncio.wait_for(read, 2)
+        captures = result if isinstance(result, list) else [result] if result is not None else []
+        assert captures
+        await bridge.poll_once(captures)
+        assert _states(mqtt)[-1]["state"] == "OFF"
+        assert _states(mqtt)[-1]["wired_write_status"] == "ambiguous"
+    finally:
+        observer.release.set()
+        if read is not None:
+            await asyncio.gather(read, return_exceptions=True)
+        await bridge.shutdown_wired_feedback()
+        await adapter.shutdown()
+
+
 async def test_scoped_read_started_before_reconnect_keeps_old_generation() -> None:
     observer = _ScopedReadAcrossReconnect(_RawDevice({PID: _RawPeripheral("Lights", "1", 1000)}))
     adapter = RpcBusAdapter()
@@ -241,6 +289,44 @@ async def test_real_adapter_full_omission_after_write_is_unknown() -> None:
     finally:
         await bridge.shutdown_wired_feedback()
         await adapter.shutdown()
+
+
+class _AcceptedThenInterruptedMqtt(FakeMqtt):
+    def __init__(self, *, fail: bool) -> None:
+        super().__init__()
+        self.fail = fail
+        self.arm = False
+        self.accepted = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def publish(self, topic: str, payload: str, retain: bool = False, qos: int = 0) -> None:
+        await super().publish(topic, payload, retain, qos)
+        if self.arm and topic.endswith("/state"):
+            self.arm = False
+            self.accepted.set()
+            if self.fail:
+                raise RuntimeError("synthetic publish interruption")
+            await self.release.wait()
+
+
+@pytest.mark.parametrize("fail", [False, True])
+async def test_interrupted_accepted_publish_must_not_hide_genuine_off(fail: bool) -> None:
+    mqtt = _AcceptedThenInterruptedMqtt(fail=fail)
+    bus, _, bridge = await _bridged(_dimmer(on="0"), mqtt=mqtt)
+    mqtt.arm = True
+    first = asyncio.create_task(bus.emit(_dimmer(on="1")))
+    try:
+        await asyncio.wait_for(mqtt.accepted.wait(), 2)
+        if fail:
+            await asyncio.wait_for(first, 2)
+        await asyncio.wait_for(bus.emit(_dimmer(on="0")), 2)
+        await asyncio.wait_for(first, 2)
+        await bridge.poll_once()
+        assert _states(mqtt)[-1]["state"] == "OFF"
+    finally:
+        mqtt.release.set()
+        await asyncio.gather(first, return_exceptions=True)
+        await bridge.shutdown_wired_feedback()
 
 
 async def test_aux_echo_on_wired_light_remains_visible() -> None:

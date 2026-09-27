@@ -27,9 +27,10 @@ Push notifications are partial: an omitted field provides no information.
 Full `get_all` and `get_peripheral` reads are complete: an omitted field becomes
 unknown, including `on` (published as `state: null`) or dimming metadata.
 An explicit raw `None` also means unknown. Reconnect advances the local source
-generation before any await. Reads pin that generation and their field sequences
-before awaiting the observer, so a delayed result retains its capture boundary;
-captures from an older generation cannot mutate the current record. Rebinding
+generation before any await. Reads pin that generation before awaiting the
+observer, then stamp field sequences when the result is captured locally. A read
+that spans a write cannot prove its returned values predate that write; captures
+from an older generation cannot mutate the current record. Rebinding
 retires request feedback after the per-field fence has excluded known pre-write
 values, so a translation change cannot restore one of those values.
 

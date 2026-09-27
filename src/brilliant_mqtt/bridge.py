@@ -935,11 +935,16 @@ class Bridge:
             try:
                 await slot.publishing
             except asyncio.CancelledError:
+                # MQTT may have accepted the bytes before local cancellation.
+                self._last_state_fields.pop(peripheral_id, None)
+                self._last_state_payload.pop(peripheral_id, None)
                 if slot.record.closed or not self._wired_feedback_enabled:
                     raise
                 slot.dirty = True
                 continue
             except Exception as error:
+                self._last_state_fields.pop(peripheral_id, None)
+                self._last_state_payload.pop(peripheral_id, None)
                 if self._wired.get(peripheral_id) is slot:
                     slot.record = reduce_wired(
                         slot.record, PublishFailed(revision, rendered.native)

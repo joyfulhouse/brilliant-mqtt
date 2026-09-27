@@ -633,20 +633,18 @@ class RpcBusAdapter:
         names: Mapping[str, Any],
         *,
         complete: bool = False,
-        eras: Mapping[tuple[str, str, str], int] | None = None,
     ) -> CaptureProvenance:
-        known = self._field_eras if eras is None else eras
         fields = set(names)
         if complete:
             fields.update(
                 name
-                for owner, peripheral, name in known
+                for owner, peripheral, name in self._field_eras
                 if (owner, peripheral) == (device_id, peripheral_id)
             )
         return replace(
             boundary,
             field_eras=tuple(
-                (name, known.get((device_id, peripheral_id, name), 0)) for name in fields
+                (name, self._field_eras.get((device_id, peripheral_id, name), 0)) for name in fields
             ),
         )
 
@@ -1050,7 +1048,6 @@ class RpcBusAdapter:
         device_ids = (own_id, *self._extra_device_ids) if include_extras else (own_id,)
         for device_id in device_ids:
             boundary = self._next_capture_provenance()
-            eras = self._field_eras.copy()
             raw_device = await asyncio.wait_for(
                 obs.get_device(device_id),
                 timeout=_READ_DEADLINE_S,
@@ -1068,7 +1065,6 @@ class RpcBusAdapter:
                         peripheral_id,
                         dict(raw_peripheral.variables),
                         complete=True,
-                        eras=eras,
                     ),
                 )
                 for peripheral_id, raw_peripheral in dict(raw_device.peripherals).items()
@@ -1079,7 +1075,6 @@ class RpcBusAdapter:
         """Return one normalized peripheral via an on-demand scoped read."""
         obs, _ = self._require_started()
         boundary = self._next_capture_provenance()
-        eras = self._field_eras.copy()
         raw = await obs.get_peripheral(device_id, peripheral_id)
         if raw is None:
             return None
@@ -1091,7 +1086,6 @@ class RpcBusAdapter:
                 peripheral_id,
                 dict(raw.variables),
                 complete=True,
-                eras=eras,
             ),
         )
 
