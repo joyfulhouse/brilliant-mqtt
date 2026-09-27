@@ -7,31 +7,35 @@ frozen. Native variable timestamps are optional, are not guaranteed monotonic
 or unique, and redundant writes need not re-stamp a value. The bridge therefore
 does not order wired observations by their numeric timestamps.
 
-The bridge keeps two forms of state for a wired primary load:
+The bridge keeps one feedback record per wired primary load, with two forms of
+state:
 
 - Native per-variable observations retain their value and native timestamp.
 - A successful command owns a timestamp-less provisional projection for only
   the fields it requested. A newer request generation supersedes the older one.
 
-The adapter records a local source generation and capture sequence when it
-actually copies a push/read result. The same sequence is sampled when a native
-write is issued, after admission and the per-device lock. A capture positively
-known to precede that boundary cannot erase
-post-issue native evidence for the commanded field or restore a displaced
-projection. Unrelated fields from the same capture still apply. The issue
-boundary remains available after visible feedback clears so a late pre-issue
-capture cannot overwrite a later native observation. Adapter-local source
-generations identify captures taken before or after the issue's generation;
-native timestamps are never used for that comparison. Reconnect or session
-replacement retires the old projection and comparison state.
+The adapter stamps each captured field with its last issued write sequence.
+Actual writes advance that field's sequence after admission, under the
+per-device lock. A delayed capture with an older sequence is positively known
+to predate an intervening write to that field; it cannot erase later native
+evidence or restore a displaced projection. Other fields in the same capture
+still apply. An equal sequence is publishable, even if its value and timestamp
+match the pre-write baseline. These sequences establish only this local causal
+boundary; they are not an observation high-water mark.
 
-Capture sequence is compared only with the relevant write-issue boundary; it
-is not an observation high-water mark. A post-issue contradiction therefore
-remains publishable even when it is delivered after a later-captured record.
-All wired-primary state publications share per-peripheral revision ownership
-and serialization, so a blocked older payload cannot finish after the latest
-projection decision. Reconnect retirement happens before the replacement read,
-and session teardown cancels and joins wired feedback work before adapters close.
+Push notifications are partial: an omitted field provides no information.
+Full `get_all` and `get_peripheral` reads are complete: an omitted field becomes
+unknown, including `on` (published as `state: null`) or dimming metadata.
+An explicit raw `None` also means unknown. Reconnect advances the local source
+generation before any await; captures from an older generation cannot mutate
+the current record. Rebinding retires request feedback before new-owner or
+new-translation observations apply.
+
+The reducer in `wired_feedback.py` makes all wired feedback decisions. The
+bridge owns one timer and one serialized, latest-wins publisher per load. A
+native publication obligation survives a failed or overtaken publish and is
+cleared only after MQTT accepts native state. Reconnect retirement happens
+before the replacement read, and shutdown cancels and joins feedback work.
 
 Capture order is not physical chronology. In particular, these histories are
 indistinguishable after the fact: an OFF snapshot captured before an effective
@@ -63,9 +67,11 @@ latest native state after the projection expires without resolution.
 The fixed, non-renewing provisional interval is 20 seconds
 (`WIRED_PROVISIONAL_SECONDS`). This matches the approximately 20-second frozen
 mirror observed in the pilot and bounds how long requested values can be shown.
-Its timer runs outside the MQTT command lane. Expiry publishes the latest native
-observation as `unconfirmed`; it does not retry, reassert, or read back the
-command. A replacement waiting for admission inherits the previous request's
-remaining deadline for native fallback; waiting cannot extend that deadline.
+The window begins when the first successful RPC completes after the last
+accepted native publication; delayed success starts the window at that success
+time. Further successes cannot extend it. Its timer runs outside the MQTT
+command lane. Expiry publishes the latest native observation as `unconfirmed`;
+it does not retry, reassert, or read back the command. A replacement waiting
+for admission leaves the existing deadline in force.
 Mesh primary, mesh auxiliary, writer serialization, and admission semantics
 are unchanged.
