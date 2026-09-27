@@ -8,8 +8,9 @@ import json
 from brilliant_mqtt.bridge import Bridge
 from brilliant_mqtt.bus import RpcBusAdapter
 from brilliant_mqtt.commands import VarSet
+from brilliant_mqtt.model import BrilliantDevice, CaptureProvenance
 from brilliant_mqtt.mqttio import _InboundMessage, _TopicDispatcher
-from brilliant_mqtt.write_admission import WriteResult
+from brilliant_mqtt.write_admission import AdmissionTicket, WriteResult
 from tests.fakes import FakeClock, FakeMqtt, FakeSleeper, _settle
 
 PANEL = "office"
@@ -22,7 +23,7 @@ OTHER_STATE_TOPIC = f"brilliant/{PANEL}/{OTHER_PID}/state"
 
 
 class _RawVariable:
-    def __init__(self, value: str, timestamp: int) -> None:
+    def __init__(self, value: str | None, timestamp: int) -> None:
         self.value = value
         self.externally_settable = True
         self.timestamp = timestamp
@@ -150,6 +151,45 @@ async def test_real_adapter_fences_push_captured_before_issued_write() -> None:
     assert states[-1]["wired_write_status"] == "provisional"
 
     await bridge.shutdown_wired_feedback()
+    await adapter.shutdown()
+
+
+async def test_real_adapter_stamps_partial_raw_none_and_issued_field_era() -> None:
+    mirror = _RawDevice({PID: _RawPeripheral("Lights", "0", 1000)})
+    observer = _Observer(mirror)
+    adapter = RpcBusAdapter()
+    adapter._obs = observer
+    adapter._own_device_id = DEVICE_ID
+    observed: list[BrilliantDevice] = []
+
+    async def on_change(device: BrilliantDevice) -> None:
+        observed.append(device)
+
+    adapter.on_change(on_change)
+    before = (await adapter.get_all())[0]
+    ticket = AdmissionTicket()
+    issues: list[CaptureProvenance] = []
+    ticket.set_issue_callback(issues.append)
+    await adapter.set_variables(DEVICE_ID, PID, [VarSet("on", "1")], ticket=ticket)
+    raw = _RawPeripheral("Lights", "0", 1000)
+    raw.variables["on"] = _RawVariable(None, 1000)
+    adapter._dispatch_raw_device(_RawDevice({PID: raw}))
+    await asyncio.gather(*list(adapter._pending_tasks))
+
+    assert before.capture_complete
+    assert before.capture_provenance is not None
+    assert dict(before.capture_provenance.field_eras)["on"] == 0
+    assert len(observed) == 1
+    captured = observed[0]
+    assert not captured.capture_complete
+    assert captured.capture_present == frozenset({"on", "intensity"})
+    assert captured.capture_unknown == frozenset({"on"})
+    assert "on" not in captured.variables
+    assert captured.capture_provenance is not None
+    assert dict(captured.capture_provenance.field_eras)["on"] == 1
+    assert len(issues) == 1
+    assert issues[0].issued_values == (("on", "1"),)
+    assert dict(issues[0].field_eras) == {"on": 1}
     await adapter.shutdown()
 
 
