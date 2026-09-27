@@ -703,22 +703,23 @@ async def test_supersession_moves_between_disjoint_transport_and_lane_pending_se
     client = cast(_AiomqttClientInternals, adapter._client)
     transport = client._queue
     topic = "brilliant/synthetic-panel/light/set"
-    transport.put_nowait(_msg(topic, b"first"))
-    transport.put_nowait(_msg(topic, b"second"))
+    transport.put_nowait(_msg(topic, b'{"brightness":1}'))
+    transport.put_nowait(_msg(topic, b'{"brightness":2}'))
     assert recorder.snapshot()["superseded_before_dispatch"] == 1
 
     # The first command died in transport; only the second can reach the lane.
     lane = mqttio._LaneQueue(8, diagnostics=recorder)
     moved = transport.get_nowait()
     await lane.put(
-        mqttio._InboundMessage(str(moved.topic), "second", False, (), ()), latest_wins=True
+        mqttio._InboundMessage(str(moved.topic), '{"brightness":2}', False, (), ()),
+        latest_wins=True,
     )
     transport.task_done()
     assert transport.empty()
-    third = mqttio._InboundMessage(topic, "third", False, (), ())
+    third = mqttio._InboundMessage(topic, '{"brightness":3}', False, (), ())
     await lane.put(third, latest_wins=True)
     assert recorder.snapshot()["superseded_before_dispatch"] == 2
-    assert await lane.get() is third
+    assert await lane.get() == third
     lane.task_done()
     await lane.join()
     # Arrival behind an already-dispatched command replaces nothing.
@@ -744,11 +745,11 @@ async def test_adapter_dispatcher_injects_recorder_without_counting_lossless_com
     adapter.on_command(handle)
     dispatcher = adapter._get_topic_dispatcher()
     topic = "brilliant/synthetic-panel/light/set"
-    for payload in ("running", "superseded", "newest"):
+    for payload in ('{"brightness":1}', '{"brightness":2}', '{"brightness":3}'):
         await dispatcher.dispatch(
             mqttio._InboundMessage(topic, payload, False, (handle,), ()), latest_wins=True
         )
-        if payload == "running":
+        if payload == '{"brightness":1}':
             await entered.wait()
     for payload in ("lossless-one", "lossless-two"):
         await dispatcher.dispatch(
@@ -757,7 +758,7 @@ async def test_adapter_dispatcher_injects_recorder_without_counting_lossless_com
     assert recorder.snapshot()["superseded_before_dispatch"] == 1
     released.set()
     await dispatcher.shutdown()
-    assert seen == ["running", "newest", "lossless-one", "lossless-two"]
+    assert seen == ['{"brightness":1}', '{"brightness":3}', "lossless-one", "lossless-two"]
     assert recorder.snapshot()["superseded_before_dispatch"] == 1
     await adapter.disconnect()
 
@@ -766,9 +767,9 @@ async def test_adapter_dispatcher_injects_recorder_without_counting_lossless_com
 def test_transport_overload_counts_only_payloads_actually_replaced(oversized: bool) -> None:
     recorder = ResponseDiagnostics(clock=FakeClock())
     topic = "brilliant/synthetic-panel/light/set"
-    old = _msg(topic, b"a" * 40)
+    old = _msg(topic, b'{"brightness":1}')
     filler = _msg("brilliant/synthetic-panel/media/set_muted", b"b" * 40)
-    newest = _msg(topic, b"c" * 90)
+    newest = _msg(topic, b'{"brightness":12345678901234567890}')
     budget = mqttio._message_bytes(filler) + mqttio._message_bytes(newest) - 1
     queue = mqttio._BoundedTransportQueue(
         maxsize=8,
@@ -786,7 +787,7 @@ def test_transport_overload_counts_only_payloads_actually_replaced(oversized: bo
     with pytest.raises(asyncio.QueueFull):
         queue.put_nowait(newest)
     assert recorder.snapshot()["superseded_before_dispatch"] == 1
-    assert queue.get_nowait() is newest
+    assert queue.get_nowait().payload == newest.payload
 
 
 @pytest.mark.parametrize(

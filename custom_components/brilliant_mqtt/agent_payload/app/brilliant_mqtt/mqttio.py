@@ -12,11 +12,13 @@ Reconnect/backoff is intentionally NOT handled here — the runner
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import math
 import ssl
 from collections import deque
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import NoReturn
 
 import aiomqtt
@@ -103,10 +105,23 @@ class _LaneQueue:
             if latest_wins:
                 for index in range(len(self._pending) - 1, -1, -1):
                     pending = self._pending[index]
-                    if not _is_latest_wins_topic(pending.topic):
+                    if (
+                        not _is_latest_wins_topic(pending.topic)
+                        or _coalesce_payload(pending.topic, pending.payload, pending.payload)
+                        is None
+                    ):
                         break
                     if pending.topic == message.topic:
-                        self._pending[index] = message
+                        if (
+                            pending.retained != message.retained
+                            or pending.command_cbs != message.command_cbs
+                            or pending.message_cbs != message.message_cbs
+                        ):
+                            break
+                        payload = _coalesce_payload(message.topic, pending.payload, message.payload)
+                        if payload is None:
+                            break
+                        self._pending[index] = replace(message, payload=payload)
                         # Transport and lane queues own disjoint pending sets:
                         # moving a command removes it upstream, and a replaced
                         # command never advances, so it can be counted only once.
@@ -291,6 +306,48 @@ def _is_latest_wins_topic(topic: str) -> bool:
     return command.removeprefix("set_") in _NUMBER_AUX_VARS
 
 
+def _coalesce_payload(topic: str, before: str | bytes, after: str | bytes) -> str | None:
+    """Combine absolute setters only when no earlier field or effect is lost."""
+    try:
+        before = before.decode("utf-8") if isinstance(before, bytes) else before
+        after = after.decode("utf-8") if isinstance(after, bytes) else after
+    except UnicodeDecodeError:
+        return None
+    if not topic.endswith("/set"):
+        try:
+            if not all(math.isfinite(float(payload)) for payload in (before, after)):
+                return None
+        except (ValueError, OverflowError):
+            return None
+        return after
+    commands: list[dict[str, object]] = []
+    for payload in (before, after):
+        try:
+            value = json.loads(payload)
+        except (ValueError, RecursionError):
+            return None
+        if not isinstance(value, dict) or not value or value.keys() - {"state", "brightness"}:
+            return None
+        if "state" in value and value["state"] not in ("ON", "OFF"):
+            return None
+        if "brightness" in value:
+            brightness = value["brightness"]
+            if isinstance(brightness, bool) or not isinstance(brightness, (int, float)):
+                return None
+            try:
+                if not math.isfinite(brightness):
+                    return None
+            except OverflowError:
+                return None
+        commands.append(value)
+    # OFF ignores brightness in translation, so merging across it can change
+    # the intensity left on the device for its next ON command.
+    if any(command.get("state") == "OFF" for command in commands):
+        if commands[0] != commands[1]:
+            return None
+    return json.dumps(commands[0] | commands[1], separators=(",", ":"))
+
+
 def _command_lane_key(topic: str) -> str:
     """Group primary and auxiliary commands by their target peripheral."""
     parts = topic.split("/")
@@ -376,11 +433,26 @@ class _BoundedTransportQueue(asyncio.Queue[aiomqtt.Message]):
             for index in range(len(self._queue) - 1, -1, -1):
                 pending = self._queue[index]
                 pending_topic = str(pending.topic)
-                if _command_lane_key(pending_topic) == _command_lane_key(
-                    topic
-                ) and not _is_latest_wins_topic(pending_topic):
+                if _command_lane_key(pending_topic) == _command_lane_key(topic) and (
+                    not _is_latest_wins_topic(pending_topic)
+                    or _coalesce_payload(pending_topic, pending.payload, pending.payload) is None
+                ):
                     break
                 if str(pending.topic) == topic:
+                    if pending.retain != item.retain or pending.qos != item.qos:
+                        break
+                    payload = _coalesce_payload(topic, pending.payload, item.payload)
+                    if payload is None:
+                        break
+                    item = aiomqtt.Message(
+                        topic=item.topic,
+                        payload=payload.encode("utf-8"),
+                        qos=item.qos,
+                        retain=item.retain,
+                        mid=item.mid,
+                        properties=item.properties,
+                    )
+                    item_bytes = _message_bytes(item)
                     if item_bytes > self._max_bytes:
                         # A single latest-wins payload too big to EVER fit the
                         # budget on its own: refuse it and keep the pending twin,

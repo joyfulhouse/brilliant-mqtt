@@ -97,7 +97,9 @@ class BrokerHaMqtt(_FakeHaMqtt):
                     )
 
 
-@pytest.mark.enable_socket
+# Run after the HA socket-guard hook; the marker alone depends on plugin order.
+# The fixture restores socket creation and preserves HA's loopback-only connect guard.
+@pytest.mark.usefixtures("socket_enabled")
 async def test_post_success_rollback_with_measured_disposable_broker_reconnect(
     hass: HomeAssistant,
     tmp_path: Path,
