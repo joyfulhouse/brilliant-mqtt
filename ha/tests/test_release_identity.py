@@ -265,6 +265,22 @@ async def test_pre_ordinal_admission_applies_to_each_changed_component(payload_d
     assert audits[0]["components"] == ["bridge", "bus_watchdog", "wifi_watchdog"]
 
 
+async def test_ordinal_two_incumbent_uses_normal_ordering_for_release_0_11_1(
+    payload_dir: Path,
+) -> None:
+    (payload_dir / "VERSION").write_text("0.11.1")
+    (payload_dir / "RELEASE_ORDINAL").write_text("3\n")
+    shell = IdentityShell({**_identity(digest="5" * 64, ordinal=2), "version": "0.11.0"})
+    await shell.connect()
+    async with panel_ops.release_transaction(
+        shell, str(payload_dir), panel="guest-bath"
+    ) as admission:
+        assert admission.changes == {"bridge": True}
+    assert not any(
+        "auto-admit-" in path or "override-" in path for path, _, _ in shell.identity_uploads
+    )
+
+
 async def test_override_is_bound_consumed_recorded_and_not_inherited(payload_dir: Path) -> None:
     shell = IdentityShell(_identity())
     await shell.connect()
