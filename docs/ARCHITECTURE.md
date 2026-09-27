@@ -47,6 +47,7 @@ bidirectional control.
 | `motion_derive.py` | Score-derived motion for mesh loads: rewrites `movement_detected` from `motion_score` ≥ high-threshold with a hold window (the firmware latch never fires — poc-findings §8c). Applied by the bridge in every snapshot path. | unit |
 | `heartbeat.py` | Bus-liveness heartbeat: atomically stamps a tmpfs file after every successful `get_all()` so the independent `brilliant_bus_watchdog` package can detect a wedged bus session (see Data Flow). | unit |
 | `bridge.py` | Orchestrator: reconcile, change → state publish, command → bus, desired-state enforcement. | unit (fakes) |
+| `wired_feedback.py` | Pure reducer and renderer for wired-primary native observations, provisional requests, deadlines, and MQTT publication debt. | unit |
 | `mesh_leader.py` | Fleet-wide mesh leader election over MQTT (retained priority claim + heartbeat); gates the mesh bridge's publishes and writes. | unit |
 | `ha_control_protocol.py` | Versioned `brilliant/ha-control/v1` MQTT wire contract (shared verbatim with the HA integration): topic builders, canonical JSON encoding, strict payload validation. | unit |
 | `thrift_binary.py` | Bounded decoder for base64 Thrift `TBinaryProtocol` structs — no generated Thrift types, explicit read/growth budgets against untrusted input. | unit |
@@ -67,10 +68,17 @@ bidirectional control.
   (level-triggered).
 - **Command path:** HA publishes JSON to `brilliant/<panel>/<device>/set`; the
   bridge translates it (e.g. HA brightness 0–255 → device range) and calls
-  `request_set_variables_in_peripheral` on the bus, then optimistically echoes
-  the commanded state. The bus notification/poll confirms it. Mesh primaries
-  skip the echo: their state is held at `null` (HA `unknown`) until an
-  observation confirms or contradicts the write (issue #66).
+  `request_set_variables_in_peripheral` on the bus. Wired primaries publish a
+  bounded provisional projection while keeping native observations separate.
+  Bus captures carry per-field issue eras; pushes are partial and full reads
+  are complete. A missing `on` in a full read publishes unknown. The pure
+  reducer decides whether native values are observed, ambiguous, or
+  unconfirmed, and its native publication debt clears only on MQTT acceptance.
+  The 20 s window starts at successful RPC completion and cannot be extended
+  by replacements. See
+  [wired-write-feedback.md](reference/wired-write-feedback.md). Mesh primaries
+  retain their separate behavior: state is held at `null` (HA `unknown`) until
+  the existing mesh resolver settles the write (issue #66).
 - **Bus write path:** every write takes a per-bus-device `asyncio.Lock`
   (the panel's own CONTROL id, `ble_mesh`) so same-device writes serialize
   and a newer command can never actuate before an older one still in flight;
