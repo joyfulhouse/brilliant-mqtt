@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Panels running a strict pre-0.11.0 release with no ordinal can upgrade to an
+  ordinal-bearing release without a manual override. Admission is recorded for
+  audit and retains the existing canary rollback baseline.
+
 ## [0.11.0] - 2026-09-27
 
 The on-panel agent and Home Assistant integration both move to 0.11.0. The

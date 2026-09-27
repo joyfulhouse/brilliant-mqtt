@@ -72,7 +72,12 @@ from .const import (
     VOICE_SERVICE_NAME,
     WIFI_WATCHDOG_SERVICE_NAME,
 )
-from .release_identity import ReleaseIdentity, RollbackBaseline, admit_identity
+from .release_identity import (
+    ReleaseIdentity,
+    RollbackBaseline,
+    admit_identity,
+    is_pre_ordinal_upgrade,
+)
 from .setup_protocol import PreflightRequest
 from .shell import PanelProcess, PanelShell, RunResult
 
@@ -191,20 +196,25 @@ async def _read_release_identities(shell: PanelShell) -> dict[str, ReleaseIdenti
 
 
 async def _write_release_record(
-    shell: PanelShell, name: str, value: dict[str, object], *, exclusive: bool = False
+    shell: PanelShell,
+    name: str,
+    value: dict[str, object],
+    *,
+    exclusive: bool = False,
+    error_code: str = "release_identity_write_failed",
 ) -> None:
     temporary = f"{PANEL_VAR_DIR}/.release-{name}-{secrets.token_hex(16)}.tmp"
     await _provisioning_run(
         shell,
         f"mkdir -p {PANEL_VAR_DIR} # BRILLIANT_RELEASE_IDENTITY_PREPARE",
-        "release_identity_write_failed",
+        error_code,
     )
     await _provisioning_put_bytes(
         shell,
         json.dumps(value, sort_keys=True, separators=(",", ":")).encode(),
         temporary,
         0o600,
-        "release_identity_write_failed",
+        error_code,
     )
     command = _identity_command(
         await _identity_source(),
@@ -218,7 +228,7 @@ async def _write_release_record(
     await _provisioning_run(
         shell,
         command,
-        "release_override_used_or_write_failed" if exclusive else "release_identity_write_failed",
+        error_code,
     )
 
 
@@ -282,7 +292,30 @@ async def _admit_identities(
     if override is not None:
         # Atomic no-replace publication consumes the transaction even if subsequent
         # mutation fails. A retry needs a new explicit, freshly bound approval.
-        await _write_release_record(shell, "override-" + transaction, binding, exclusive=True)
+        await _write_release_record(
+            shell,
+            "override-" + transaction,
+            binding,
+            exclusive=True,
+            error_code="release_override_used_or_write_failed",
+        )
+    automatic = [
+        component
+        for component in selected
+        if is_pre_ordinal_upgrade(incumbent[component], candidate[component])
+    ]
+    if automatic and override is None:
+        await _write_release_record(
+            shell,
+            "auto-admit-" + transaction,
+            {
+                **binding,
+                "reason": "pre_ordinal_upgrade",
+                "components": automatic,
+            },
+            exclusive=True,
+            error_code="release_auto_admission_record_failed",
+        )
     return ReleaseAdmission(shell, candidate, incumbent, changes, transaction)
 
 

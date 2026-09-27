@@ -332,7 +332,10 @@ skips the rest of a fleet wave).
 
 Update, redeploy, repair, bridge installation, and selected watchdog writers share
 one release policy. Equal code digests keep the installed code and layout. Different
-code requires a strictly greater, known `release_ordinal` on both sides. Equal
+code requires a strictly greater, known `release_ordinal` on both sides, except for
+the first upgrade from a pre-ordinal release. An incumbent with unknown ordinal
+auto-admits only when its version is a strict `X.Y.Z` below 0.11.0 and the
+candidate has an ordinal and a strict `X.Y.Z` version of 0.11.0 or newer. Equal
 version strings do not establish identity, and digests are never ordered by age.
 Admission happens before the operation stages a CA or changes configuration.
 Same-code configuration repair preserves the live unit, or restores a missing
@@ -340,7 +343,11 @@ release-layout unit from `current`, without selecting the bundled legacy unit.
 
 Existing installations are enrolled by hashing their selected code trees. Their
 ordinal is initially **unknown**, even if their `VERSION` matches the bundle.
-They therefore require explicit approval for the first change to different code.
+An unparseable, missing, prerelease, or 0.11.0-or-newer incumbent version with
+unknown ordinal requires explicit approval for a change to different code.
+Automatic pre-ordinal admission writes a private metadata-only
+`auto-admit-<transaction>.json` record before deployment. It does not change
+baseline retention or the canary rollback process.
 On-panel records live under `/var/brilliant-mqtt/.release-identities/` (directory
 0700, records 0600), with one identity for each independently selectable bridge or
 watchdog. Records contain version, ordinal, digest, deployment ID, and layout;
@@ -358,8 +365,9 @@ newer. Normal multi-panel redeploy remains available without an override.
 Release maintainers assign and review `deploy/RELEASE_ORDINAL` alongside payload
 changes, increasing it for each new release. The build copies this integer
 verbatim beside `VERSION`, and the existing payload-release manifest hashes it.
-The initial assigned ordinal is 1; legacy unknown identities are never treated as
-0. The build does not derive an ordinal from time, version, Git, or a digest.
+The first ordinal-bearing release is 0.11.0; legacy unknown identities are never
+treated as ordinal 0. The build does not derive an ordinal from time, version,
+Git, or a digest.
 
 Two further services run existing Brilliant scenes and modes:
 
