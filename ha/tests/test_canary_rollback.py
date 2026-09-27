@@ -488,7 +488,7 @@ async def test_migration_inherits_shared_identity_admission(
         setup: UUID,
     ) -> PanelReleaseBundle:
         bundle = await harness.release(requested, fleet, transaction, setup)
-        return replace(bundle, local_payload_dir=str(payload), version="0.10.2")
+        return replace(bundle, local_payload_dir=str(payload), version="0.11.0")
 
     provisioner._release_provider = release
     before = await panel_ops.snapshot_panel(shell)
