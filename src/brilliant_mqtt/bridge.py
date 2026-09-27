@@ -140,8 +140,6 @@ class _WiredSlot:
     timer: asyncio.Task[None] | None = None
     timer_at: float | None = None
     publisher: asyncio.Task[None] | None = None
-    publishing: asyncio.Task[None] | None = None
-    publishing_revision: int | None = None
     dirty: bool = False
     force: bool = False
 
@@ -895,80 +893,88 @@ class Bridge:
         slot.dirty = True
         slot.force |= force
         if slot.publisher is not None and not slot.publisher.done():
-            if slot.publishing is not None and slot.publishing_revision != slot.record.revision:
-                slot.publishing.cancel()
             return
-        slot.publisher = asyncio.create_task(self._run_wired_publisher(peripheral_id, slot))
-        try:
-            await asyncio.shield(slot.publisher)
-        except asyncio.CancelledError:
-            if not slot.publisher.cancelled():
-                raise
-            if self._wired_feedback_enabled and not slot.record.closed:
-                slot.dirty = True
-                slot.publisher = None
+        first: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        slot.publisher = asyncio.create_task(self._run_wired_publisher(peripheral_id, slot, first))
 
-    async def _run_wired_publisher(self, peripheral_id: str, slot: _WiredSlot) -> None:
-        while slot.dirty and self._wired.get(peripheral_id) is slot:
-            if slot.record.closed or not self._wired_feedback_enabled:
-                return
-            slot.dirty = False
-            force = slot.force
-            slot.force = False
-            rendered = render_wired(slot.record)
-            if rendered is None or not rendered.fields:
-                continue
-            fields = rendered.fields
-            if (
-                not force
-                and not slot.record.native_debt
-                and self._last_state_fields.get(peripheral_id) == fields
-            ):
-                continue
-            payload = _encode_fields(fields)
-            revision = slot.record.revision
-            debt_epoch = slot.record.native_debt_epoch
-            slot.publishing_revision = revision
-            slot.publishing = asyncio.create_task(
-                self._async_publish_retained(state_topic(self._panel, peripheral_id), payload)
-            )
-            try:
-                await slot.publishing
-            except asyncio.CancelledError:
-                # MQTT may have accepted the bytes before local cancellation.
-                self._last_state_fields.pop(peripheral_id, None)
-                self._last_state_payload.pop(peripheral_id, None)
+        def settle_if_never_started(_task: asyncio.Task[None]) -> None:
+            if not first.done():
+                first.set_result(None)
+
+        slot.publisher.add_done_callback(settle_if_never_started)
+        await asyncio.shield(first)
+
+    async def _run_wired_publisher(
+        self, peripheral_id: str, slot: _WiredSlot, first: asyncio.Future[None]
+    ) -> None:
+        def complete_first() -> None:
+            if not first.done():
+                first.set_result(None)
+
+        try:
+            while slot.dirty and self._wired.get(peripheral_id) is slot:
                 if slot.record.closed or not self._wired_feedback_enabled:
-                    raise
-                slot.dirty = True
-                continue
-            except Exception as error:
-                self._last_state_fields.pop(peripheral_id, None)
-                self._last_state_payload.pop(peripheral_id, None)
-                if self._wired.get(peripheral_id) is slot:
-                    slot.record = reduce_wired(
-                        slot.record, PublishFailed(revision, rendered.native)
-                    ).record
-                logger.warning("WIRED_PUBLISH_FAILED %s", type(error).__name__)
-                if slot.dirty:
+                    return
+                slot.dirty = False
+                force = slot.force
+                slot.force = False
+                rendered = render_wired(slot.record)
+                if rendered is None or not rendered.fields:
+                    complete_first()
                     continue
-                return
-            finally:
-                slot.publishing = None
-                slot.publishing_revision = None
-            if self._wired.get(peripheral_id) is not slot or slot.record.closed:
-                return
-            transition = reduce_wired(
-                slot.record,
-                PublishAccepted(revision, rendered.native, debt_epoch=debt_epoch),
-            )
-            slot.record = transition.record
-            self._last_state_fields[peripheral_id] = fields
-            self._last_state_payload[peripheral_id] = payload
-            self._sync_wired_timer(peripheral_id, slot)
-            if transition.effects.publish or slot.record.revision != revision:
-                # Accepted old bytes still need a current retained publication.
-                slot.dirty = True
+                fields = rendered.fields
+                if (
+                    not force
+                    and not slot.record.native_debt
+                    and self._last_state_fields.get(peripheral_id) == fields
+                ):
+                    complete_first()
+                    continue
+                payload = _encode_fields(fields)
+                revision = slot.record.revision
+                debt_epoch = slot.record.native_debt_epoch
+                try:
+                    await self._async_publish_retained(
+                        state_topic(self._panel, peripheral_id), payload
+                    )
+                except asyncio.CancelledError:
+                    # MQTT may have accepted the bytes before local cancellation.
+                    self._last_state_fields.pop(peripheral_id, None)
+                    self._last_state_payload.pop(peripheral_id, None)
+                    if slot.record.closed or not self._wired_feedback_enabled:
+                        raise
+                    slot.dirty = True
+                    continue
+                except Exception as error:
+                    self._last_state_fields.pop(peripheral_id, None)
+                    self._last_state_payload.pop(peripheral_id, None)
+                    if self._wired.get(peripheral_id) is slot:
+                        slot.record = reduce_wired(
+                            slot.record, PublishFailed(revision, rendered.native)
+                        ).record
+                    logger.warning("WIRED_PUBLISH_FAILED %s", type(error).__name__)
+                    if slot.dirty:
+                        continue
+                    return
+                finally:
+                    complete_first()
+                if self._wired.get(peripheral_id) is not slot or slot.record.closed:
+                    return
+                transition = reduce_wired(
+                    slot.record,
+                    PublishAccepted(revision, rendered.native, debt_epoch=debt_epoch),
+                )
+                slot.record = transition.record
+                self._last_state_fields[peripheral_id] = fields
+                self._last_state_payload[peripheral_id] = payload
+                self._sync_wired_timer(peripheral_id, slot)
+                if transition.effects.publish or slot.record.revision != revision:
+                    # Accepted old bytes still need a current retained publication.
+                    slot.dirty = True
+        except Exception as error:
+            logger.warning("WIRED_PUBLISH_FAILED %s", type(error).__name__)
+        finally:
+            complete_first()
 
     async def shutdown_wired_feedback(self) -> None:
         """Terminally retire wired work and join its one timer/publisher per load."""

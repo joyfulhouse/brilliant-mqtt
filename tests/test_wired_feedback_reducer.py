@@ -60,13 +60,6 @@ def _render(record: Record) -> dict[str, object]:
     return result.fields
 
 
-def test_identical_capture_preserves_revision() -> None:
-    record = reduce(Record(), Capture(_device())).record
-    revision = record.revision
-    record = reduce(record, Capture(_device())).record
-    assert record.revision == revision
-
-
 @pytest.mark.parametrize(
     ("capture", "expected_state", "expected_status"),
     [

@@ -653,7 +653,7 @@ async def test_obsolete_command_completion_cannot_revive_older_projection() -> N
     await _shutdown_feedback(bridge)
 
 
-async def test_new_request_cancels_blocked_older_feedback_publish() -> None:
+async def test_new_request_follows_blocked_older_feedback_publish() -> None:
     mqtt = _BlockingPublishMqtt("/state")
     _bus, _mqtt, bridge = await _bridged(_dimmer(), mqtt=mqtt)
     mqtt.armed = True
@@ -665,7 +665,7 @@ async def test_new_request_cancels_blocked_older_feedback_publish() -> None:
     await older
 
     states = _states(mqtt)
-    assert [state["state"] for state in states] == ["OFF"]
+    assert [state["state"] for state in states] == ["ON", "OFF"]
     _assert_feedback(states[-1], "provisional", {"on": "0"}, 20.0)
     await _shutdown_feedback(bridge)
 
@@ -747,7 +747,7 @@ async def test_preissue_native_publish_rechecks_projection_after_await() -> None
     assert states[-1]["wired_write_status"] == "provisional"
 
 
-async def test_newer_plain_native_publish_revokes_blocked_older_one() -> None:
+async def test_newer_plain_native_publish_follows_blocked_older_one() -> None:
     mqtt = _BlockingPublishMqtt("/state")
     bus, _mqtt, bridge = await _bridged(_dimmer(), mqtt=mqtt)
     mqtt.armed = True
@@ -761,7 +761,7 @@ async def test_newer_plain_native_publish_revokes_blocked_older_one() -> None:
     await newer
 
     states = _states(mqtt)
-    assert [state["brightness"] for state in states] == [128]
+    assert [state["brightness"] for state in states] == [102, 128]
     await _shutdown_feedback(bridge)
 
 

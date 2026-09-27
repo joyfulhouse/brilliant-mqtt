@@ -84,6 +84,20 @@ async def test_shutdown_of_blocked_publisher_does_not_cancel_command_caller() ->
         await bridge.shutdown_wired_feedback()
 
 
+async def test_shutdown_before_publisher_starts_releases_caller() -> None:
+    _, _, bridge = await _bridged(_dimmer())
+    publisher = asyncio.create_task(bridge._publish_wired_slot(PID, force=True))
+    try:
+        await asyncio.sleep(0)
+        assert bridge._wired[PID].publisher is not None
+        await bridge.shutdown_wired_feedback()
+        await asyncio.wait_for(publisher, 2)
+        assert publisher.exception() is None
+    finally:
+        await asyncio.gather(publisher, return_exceptions=True)
+        await bridge.shutdown_wired_feedback()
+
+
 async def test_command_lane_survives_concurrent_wired_push() -> None:
     bus, mqtt, bridge = await _bridged(_dimmer(on="0"))
     dispatcher = _TopicDispatcher(
@@ -324,9 +338,27 @@ async def test_interrupted_accepted_publish_must_not_hide_genuine_off(fail: bool
         if fail:
             await asyncio.wait_for(first, 2)
         await asyncio.wait_for(bus.emit(_dimmer(on="0")), 2)
+        mqtt.release.set()
         await asyncio.wait_for(first, 2)
+        await _settle(10)
         await bridge.poll_once()
         assert _states(mqtt)[-1]["state"] == "OFF"
+    finally:
+        mqtt.release.set()
+        await asyncio.gather(first, return_exceptions=True)
+        await bridge.shutdown_wired_feedback()
+
+
+async def test_shutdown_clears_cache_after_uncertain_publish_acceptance() -> None:
+    mqtt = _AcceptedThenInterruptedMqtt(fail=False)
+    bus, _, bridge = await _bridged(_dimmer(on="0"), mqtt=mqtt)
+    mqtt.arm = True
+    first = asyncio.create_task(bus.emit(_dimmer(on="1")))
+    try:
+        await asyncio.wait_for(mqtt.accepted.wait(), 2)
+        await bridge.shutdown_wired_feedback()
+        assert PID not in bridge._last_state_fields
+        assert PID not in bridge._last_state_payload
     finally:
         mqtt.release.set()
         await asyncio.gather(first, return_exceptions=True)
@@ -338,12 +370,21 @@ class _SlowStateMqtt(FakeMqtt):
         super().__init__()
         self.delay = 0.0
         self.started = 0
+        self.in_flight = 0
+        self.max_in_flight = 0
 
     async def publish(self, topic: str, payload: str, retain: bool = False, qos: int = 0) -> None:
         if topic == STATE_TOPIC and self.delay:
             self.started += 1
-            await asyncio.sleep(self.delay)
-        await super().publish(topic, payload, retain, qos)
+            self.in_flight += 1
+            self.max_in_flight = max(self.max_in_flight, self.in_flight)
+            try:
+                await asyncio.sleep(self.delay)
+                await super().publish(topic, payload, retain, qos)
+            finally:
+                self.in_flight -= 1
+        else:
+            await super().publish(topic, payload, retain, qos)
 
 
 async def _poll_while_publish_pending(bridge: Bridge, stop: asyncio.Event) -> None:
@@ -414,6 +455,72 @@ async def test_identical_hot_polls_do_not_livelock_retained_ledger(tmp_path: Pat
         if poller is not None:
             await poller
         await asyncio.wait_for(caller, 2)
+        await bridge.shutdown_wired_feedback()
+
+
+@pytest.mark.parametrize("changing_power", [False, True])
+async def test_genuine_off_publishes_during_power_poll_stream(changing_power: bool) -> None:
+    mqtt = _SlowStateMqtt()
+    bus, _, bridge = await _bridged(_dimmer(on="1", power="10"), mqtt=mqtt)
+    mqtt.delay = 0.08
+    bus.set_devices([_dimmer(on="0", power="10")])
+    owner = asyncio.create_task(bus.emit(_dimmer(on="0", power="10")))
+    try:
+        for index in range(40):
+            await asyncio.sleep(0.01)
+            power = str(11 + index) if changing_power else "10"
+            bus.set_devices([_dimmer(on="0", power=power)])
+            await bridge.poll_once()
+        assert any(state["state"] == "OFF" for state in _states(mqtt))
+        assert owner.done()
+    finally:
+        await asyncio.wait_for(owner, 2)
+        await bridge.shutdown_wired_feedback()
+
+
+async def test_changing_power_stream_keeps_accepting_publications() -> None:
+    mqtt = _SlowStateMqtt()
+    bus, _, bridge = await _bridged(_dimmer(on="1", power="10"), mqtt=mqtt)
+    mqtt.delay = 0.08
+    bus.set_devices([_dimmer(on="0", power="10")])
+    owner = asyncio.create_task(bus.emit(_dimmer(on="0", power="10")))
+    try:
+        for index in range(60):
+            await asyncio.sleep(0.01)
+            bus.set_devices([_dimmer(on="0", power=str(11 + index))])
+            await bridge.poll_once()
+        accepted = _states(mqtt)
+        assert len(accepted) >= 3
+        assert all(state["state"] == "OFF" for state in accepted)
+        assert owner.done()
+        assert mqtt.max_in_flight == 1
+    finally:
+        await asyncio.wait_for(owner, 2)
+        await bridge.shutdown_wired_feedback()
+
+
+@pytest.mark.parametrize("owner_kind", ["push", "command"])
+@pytest.mark.parametrize("publish_delay", [0.025, 0.04])
+async def test_changing_power_poll_boundary_keeps_owner_live(
+    owner_kind: str, publish_delay: float
+) -> None:
+    mqtt = _SlowStateMqtt()
+    bus, _, bridge = await _bridged(_dimmer(power="10"), mqtt=mqtt)
+    mqtt.delay = publish_delay
+    if owner_kind == "push":
+        owner = asyncio.create_task(bus.emit(_dimmer(power="11")))
+    else:
+        owner = asyncio.create_task(mqtt.inject(SET_TOPIC, '{"state":"ON"}'))
+    try:
+        await asyncio.sleep(0.001)
+        for index in range(20):
+            bus.set_devices([_dimmer(power=str(20 + index))])
+            await bridge.poll_once()
+            await asyncio.sleep(0.02)
+        assert _states(mqtt)
+        assert owner.done()
+    finally:
+        await asyncio.wait_for(owner, 2)
         await bridge.shutdown_wired_feedback()
 
 

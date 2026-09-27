@@ -66,6 +66,7 @@ async def test_success_while_expiry_publish_waits_starts_window_at_success() -> 
         await sleeper.release_all()
         await asyncio.wait_for(mqtt.blocked.wait(), 2)
         await asyncio.wait_for(mqtt.inject(SET_TOPIC, '{"state":"ON","brightness":200}'), 2)
+        mqtt.release.set()
         await _settle(10)
 
         states = _states(mqtt)
