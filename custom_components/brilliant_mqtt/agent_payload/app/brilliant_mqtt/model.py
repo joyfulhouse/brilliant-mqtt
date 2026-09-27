@@ -89,6 +89,7 @@ class CaptureProvenance:
 
     source_generation: int
     sequence: int
+    field_eras: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass
@@ -102,6 +103,9 @@ class BrilliantDevice:
     peripheral_type: int = 0
     variables: dict[str, Variable] = field(default_factory=dict)
     capture_provenance: CaptureProvenance | None = None
+    capture_complete: bool = True
+    capture_present: frozenset[str] | None = None
+    capture_unknown: frozenset[str] = frozenset()
 
     # Deliberate asymmetry: is_on collapses an absent "on" variable to False (a load
     # without "on" is just off/uncontrollable), while motion_detected preserves None

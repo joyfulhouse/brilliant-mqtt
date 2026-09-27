@@ -347,8 +347,9 @@ def normalize_peripheral(
     peripheral_type = int(raw.peripheral_type)
     kind = kind_for_peripheral_type(peripheral_type)
 
+    raw_variables = dict(raw.variables)
     variables: dict[str, Variable] = {}
-    for var_name, raw_var in dict(raw.variables).items():
+    for var_name, raw_var in raw_variables.items():
         value = raw_var.value
         if value is None:
             # Skip None-valued entries (complex blobs / absent) — §4.
@@ -381,6 +382,10 @@ def normalize_peripheral(
         kind=kind,
         peripheral_type=peripheral_type,
         variables=variables,
+        capture_present=frozenset(raw_variables),
+        capture_unknown=frozenset(
+            name for name, variable in raw_variables.items() if variable.value is None
+        ),
     )
 
 
@@ -501,6 +506,7 @@ class RpcBusAdapter:
         # starts a new incomparable source generation.
         self._capture_generation = 0
         self._capture_sequence = 0
+        self._field_eras: dict[tuple[str, str, str], int] = {}
         # Multiple consumers (panel bridge + mesh publisher) may each register
         # a change callback; every change fans out to all of them. Each entry is
         # (callback, coalesce_pushes, want_device); want_device is a live
@@ -609,10 +615,25 @@ class RpcBusAdapter:
     def _advance_capture_generation(self) -> None:
         self._capture_generation += 1
         self._capture_sequence = 0
+        self._field_eras.clear()
 
     def _next_capture_provenance(self) -> CaptureProvenance:
         self._capture_sequence += 1
         return CaptureProvenance(self._capture_generation, self._capture_sequence)
+
+    def _field_capture(
+        self,
+        boundary: CaptureProvenance,
+        device_id: str,
+        peripheral_id: str,
+        names: Mapping[str, Any],
+    ) -> CaptureProvenance:
+        return replace(
+            boundary,
+            field_eras=tuple(
+                (name, self._field_eras.get((device_id, peripheral_id, name), 0)) for name in names
+            ),
+        )
 
     async def start(self) -> None:
         """Connect to the bus following the poc-findings §2 recipe.
@@ -801,7 +822,12 @@ class RpcBusAdapter:
             _PendingPeripheral(
                 peripheral_id,
                 _snapshot_peripheral(raw_peripheral),
-                capture_provenance,
+                self._field_capture(
+                    capture_provenance,
+                    device_id,
+                    peripheral_id,
+                    dict(raw_peripheral.variables),
+                ),
             )
             for peripheral_id, raw_peripheral in dict(peripherals).items()
         )
@@ -874,6 +900,7 @@ class RpcBusAdapter:
                                     pending_peripheral.snapshot,
                                 ),
                                 capture_provenance=pending_peripheral.capture_provenance,
+                                capture_complete=False,
                             )
                             pending_peripheral.normalized = device
                         await cb(device)
@@ -1019,7 +1046,12 @@ class RpcBusAdapter:
             devices.extend(
                 replace(
                     normalize_peripheral(device_id, peripheral_id, raw_peripheral),
-                    capture_provenance=capture_provenance,
+                    capture_provenance=self._field_capture(
+                        capture_provenance,
+                        device_id,
+                        peripheral_id,
+                        dict(raw_peripheral.variables),
+                    ),
                 )
                 for peripheral_id, raw_peripheral in dict(raw_device.peripherals).items()
             )
@@ -1033,7 +1065,9 @@ class RpcBusAdapter:
             return None
         return replace(
             normalize_peripheral(device_id, peripheral_id, raw),
-            capture_provenance=self._next_capture_provenance(),
+            capture_provenance=self._field_capture(
+                self._next_capture_provenance(), device_id, peripheral_id, dict(raw.variables)
+            ),
         )
 
     def on_change(
@@ -1277,7 +1311,18 @@ class RpcBusAdapter:
             try:
                 admission.issued = True
                 try:
-                    admission.ticket.mark_issued(self._next_capture_provenance())
+                    for name in admission.values:
+                        key = (admission.device_id, admission.peripheral_id, name)
+                        self._field_eras[key] = self._field_eras.get(key, 0) + 1
+                    boundary = self._next_capture_provenance()
+                    admission.ticket.mark_issued(
+                        self._field_capture(
+                            boundary,
+                            admission.device_id,
+                            admission.peripheral_id,
+                            admission.values,
+                        )
+                    )
                 except Exception:
                     logger.exception(
                         "set_variables(%s) issue callback failed; continuing",
