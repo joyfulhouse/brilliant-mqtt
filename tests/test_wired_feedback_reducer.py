@@ -240,6 +240,22 @@ def test_success_during_native_debt_waits_for_acceptance_without_renewing_old_wi
     assert timer_deadline(record) == 43.0
 
 
+def test_stale_native_acceptance_cannot_clear_newer_debt_epoch() -> None:
+    record = _success(reduce(Record(), Capture(_device())).record)
+    record = reduce(record, Expire(20.0)).record
+    old_revision = record.revision
+    old_epoch = record.native_debt_epoch
+    record = reduce(record, SourceGeneration(2)).record
+    assert record.native_debt_epoch > old_epoch
+
+    record = reduce(record, PublishAccepted(old_revision, native=True, debt_epoch=old_epoch)).record
+    assert record.native_debt
+    record = reduce(
+        record, PublishAccepted(record.revision, native=True, debt_epoch=record.native_debt_epoch)
+    ).record
+    assert not record.native_debt
+
+
 @pytest.mark.parametrize("outcome", ["failed", "cancelled"])
 def test_failed_or_cancelled_replacement_demands_native_acceptance(outcome: str) -> None:
     record = _success(reduce(Record(), Capture(_device())).record)

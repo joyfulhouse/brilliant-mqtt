@@ -24,6 +24,11 @@ class CommandSubscribeError(RuntimeError):
 class BusClient(Protocol):
     """Adapter for the Brilliant panel's internal message bus."""
 
+    @property
+    def capture_generation(self) -> int:
+        """Current source generation, advanced before reconnect callbacks or reads."""
+        ...
+
     async def start(self) -> None:
         """Connect to the bus and begin receiving updates."""
         ...

@@ -489,8 +489,8 @@ async def _run_session(
         if panel_bridge is not None:
             try:
                 await panel_bridge.shutdown_wired_feedback()
-            except Exception:
-                log.exception("wired feedback shutdown failed during cleanup")
+            except Exception as error:
+                log.error("WIRED_SHUTDOWN_FAILED %s", type(error).__name__)
         if scene_bridge is not None:
             try:
                 await scene_bridge.async_shutdown()

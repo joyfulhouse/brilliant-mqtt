@@ -66,6 +66,10 @@ class FakeBus:
         self._capture_sequence = 0
         self._field_eras: dict[tuple[str, str, str], int] = {}
 
+    @property
+    def capture_generation(self) -> int:
+        return self._capture_generation
+
     async def start(self) -> None:
         pass
 
@@ -79,13 +83,22 @@ class FakeBus:
                 return self._captured(device, complete=True)
         return None
 
-    def _next_provenance(self, device: BrilliantDevice | None = None) -> CaptureProvenance:
+    def _next_provenance(
+        self, device: BrilliantDevice | None = None, *, complete: bool = False
+    ) -> CaptureProvenance:
         self._capture_sequence += 1
         eras: tuple[tuple[str, int], ...] = ()
         if device is not None:
+            fields = set(device.capture_present or device.variables)
+            if complete:
+                fields.update(
+                    name
+                    for owner, peripheral, name in self._field_eras
+                    if (owner, peripheral) == (device.device_id, device.peripheral_id)
+                )
             eras = tuple(
                 (name, self._field_eras.get((device.device_id, device.peripheral_id, name), 0))
-                for name in device.capture_present or device.variables
+                for name in fields
             )
         return CaptureProvenance(self._capture_generation, self._capture_sequence, eras)
 
@@ -100,7 +113,9 @@ class FakeBus:
             capture_complete=complete,
             capture_present=device.capture_present or frozenset(device.variables),
         )
-        return replace(captured, capture_provenance=self._next_provenance(captured))
+        return replace(
+            captured, capture_provenance=self._next_provenance(captured, complete=complete)
+        )
 
     def on_change(
         self,
@@ -201,6 +216,7 @@ class FakeBus:
         assert self._reconnect_cbs, "on_reconnect was never registered"
         self._capture_generation += 1
         self._capture_sequence = 0
+        self._field_eras.clear()
         for reconnect_cb in list(self._reconnect_cbs):
             try:
                 await reconnect_cb()

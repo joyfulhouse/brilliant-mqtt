@@ -27,15 +27,19 @@ Push notifications are partial: an omitted field provides no information.
 Full `get_all` and `get_peripheral` reads are complete: an omitted field becomes
 unknown, including `on` (published as `state: null`) or dimming metadata.
 An explicit raw `None` also means unknown. Reconnect advances the local source
-generation before any await; captures from an older generation cannot mutate
-the current record. Rebinding retires request feedback before new-owner or
-new-translation observations apply.
+generation before any await. Reads pin that generation and their field sequences
+before awaiting the observer, so a delayed result retains its capture boundary;
+captures from an older generation cannot mutate the current record. Rebinding
+retires request feedback after the per-field fence has excluded known pre-write
+values, so a translation change cannot restore one of those values.
 
 The reducer in `wired_feedback.py` makes all wired feedback decisions. The
 bridge owns one timer and one serialized, latest-wins publisher per load. A
 native publication obligation survives a failed or overtaken publish and is
 cleared only after MQTT accepts native state. Reconnect retirement happens
-before the replacement read, and shutdown cancels and joins feedback work.
+before the replacement read; an absent load cannot discard publication debt.
+Shutdown cancels and joins feedback work and prevents in-flight reads from
+restarting it.
 
 Capture order is not physical chronology. In particular, these histories are
 indistinguishable after the fact: an OFF snapshot captured before an effective

@@ -261,15 +261,10 @@ def _capture(record: Record, incoming: BrilliantDevice) -> Record:
     native = replace(incoming, variables=variables)
     rebound = previous is not None and _binding(previous) != _binding(native)
     if rebound and previous is not None:
-        # Never carry old-owner or old-translation fields into a new binding.
-        variables = dict(incoming.variables)
-        if same_owner_kind and not incoming.capture_complete:
-            for name in ("intensity", "max_intensity_value"):
-                if name not in present and name in previous.variables:
-                    variables[name] = previous.variables[name]
-        native = replace(incoming, variables=variables)
-        eras = {name: era for name, era in eras.items() if name in present}
-        unknown = set(incoming.capture_unknown) | (set(previous.variables) - set(present))
+        # Keep the per-field fence result; raw fields rejected above stay rejected.
+        if not same_owner_kind:
+            eras = {name: era for name, era in eras.items() if name in present}
+            unknown = set(incoming.capture_unknown) | (set(previous.variables) - set(present))
 
     feedback = None if newer_source or rebound else record.feedback
     attempt = None if newer_source or rebound else record.attempt

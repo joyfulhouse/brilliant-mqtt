@@ -617,6 +617,10 @@ class RpcBusAdapter:
         self._capture_sequence = 0
         self._field_eras.clear()
 
+    @property
+    def capture_generation(self) -> int:
+        return self._capture_generation
+
     def _next_capture_provenance(self) -> CaptureProvenance:
         self._capture_sequence += 1
         return CaptureProvenance(self._capture_generation, self._capture_sequence)
@@ -627,11 +631,22 @@ class RpcBusAdapter:
         device_id: str,
         peripheral_id: str,
         names: Mapping[str, Any],
+        *,
+        complete: bool = False,
+        eras: Mapping[tuple[str, str, str], int] | None = None,
     ) -> CaptureProvenance:
+        known = self._field_eras if eras is None else eras
+        fields = set(names)
+        if complete:
+            fields.update(
+                name
+                for owner, peripheral, name in known
+                if (owner, peripheral) == (device_id, peripheral_id)
+            )
         return replace(
             boundary,
             field_eras=tuple(
-                (name, self._field_eras.get((device_id, peripheral_id, name), 0)) for name in names
+                (name, known.get((device_id, peripheral_id, name), 0)) for name in fields
             ),
         )
 
@@ -1034,6 +1049,8 @@ class RpcBusAdapter:
         devices: list[BrilliantDevice] = []
         device_ids = (own_id, *self._extra_device_ids) if include_extras else (own_id,)
         for device_id in device_ids:
+            boundary = self._next_capture_provenance()
+            eras = self._field_eras.copy()
             raw_device = await asyncio.wait_for(
                 obs.get_device(device_id),
                 timeout=_READ_DEADLINE_S,
@@ -1042,15 +1059,16 @@ class RpcBusAdapter:
                 label = "own device" if device_id == own_id else "extra device"
                 logger.warning("%s id=%s not returned by get_device()", label, device_id)
                 continue
-            capture_provenance = self._next_capture_provenance()
             devices.extend(
                 replace(
                     normalize_peripheral(device_id, peripheral_id, raw_peripheral),
                     capture_provenance=self._field_capture(
-                        capture_provenance,
+                        boundary,
                         device_id,
                         peripheral_id,
                         dict(raw_peripheral.variables),
+                        complete=True,
+                        eras=eras,
                     ),
                 )
                 for peripheral_id, raw_peripheral in dict(raw_device.peripherals).items()
@@ -1060,13 +1078,20 @@ class RpcBusAdapter:
     async def get_peripheral(self, device_id: str, peripheral_id: str) -> BrilliantDevice | None:
         """Return one normalized peripheral via an on-demand scoped read."""
         obs, _ = self._require_started()
+        boundary = self._next_capture_provenance()
+        eras = self._field_eras.copy()
         raw = await obs.get_peripheral(device_id, peripheral_id)
         if raw is None:
             return None
         return replace(
             normalize_peripheral(device_id, peripheral_id, raw),
             capture_provenance=self._field_capture(
-                self._next_capture_provenance(), device_id, peripheral_id, dict(raw.variables)
+                boundary,
+                device_id,
+                peripheral_id,
+                dict(raw.variables),
+                complete=True,
+                eras=eras,
             ),
         )
 

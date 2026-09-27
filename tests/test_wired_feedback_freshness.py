@@ -1089,7 +1089,7 @@ async def test_explicit_scale_rebinding_keeps_omitted_dimmer_capability() -> Non
 
 
 @pytest.mark.parametrize("binding", ["owner", "scale"])
-async def test_late_preissue_rebinding_keeps_new_native_off(binding: str) -> None:
+async def test_late_preissue_rebinding_preserves_field_fence(binding: str) -> None:
     bus, mqtt, bridge = await _bridged(_dimmer())
     rebound = _dimmer(on="0")
     if binding == "owner":
@@ -1105,8 +1105,10 @@ async def test_late_preissue_rebinding_keeps_new_native_off(binding: str) -> Non
 
     stored = bridge._devices[PID]
     state = _states(mqtt)[-1]
-    assert stored.variables["on"].value == "0"
-    assert state["state"] == "OFF"
+    # A new owner has independent fields; a same-owner scale change keeps the
+    # post-issue ON rather than reviving the older pre-issue OFF.
+    assert stored.variables["on"].value == ("0" if binding == "owner" else "1")
+    assert state["state"] == ("OFF" if binding == "owner" else "ON")
     assert state["wired_write_status"] == "unconfirmed"
     assert bridge._wired[PID].record.attempt is None
     assert bridge._wired[PID].record.feedback is None
@@ -1177,7 +1179,8 @@ async def test_soft_reconnect_retires_old_comparison_provenance() -> None:
 
     record = bridge._wired[PID].record
     assert record.source_generation == 2
-    assert set(dict(record.native_eras)) == {"intensity"}
+    assert dict(record.native_eras)["on"] == 0
+    assert "on" in record.unknown
     await _shutdown_feedback(bridge)
 
 
@@ -1239,7 +1242,8 @@ async def test_reconnect_without_device_retires_wired_state() -> None:
 
     await bus.fire_reconnect()
 
-    assert PID not in bridge._wired
+    assert bridge._wired[PID].record.feedback is None
+    assert not bridge._wired[PID].record.native_debt
     await bus.emit(_dimmer(on="0", on_timestamp=4000))
     assert _states(mqtt)[-1]["state"] == "OFF"
     assert "wired_write_status" not in _states(mqtt)[-1]
@@ -1266,7 +1270,8 @@ async def test_failed_reconnect_read_still_retires_wired_state() -> None:
 
     await bus.fire_reconnect()
 
-    assert PID not in bridge._wired
+    assert bridge._wired[PID].record.feedback is None
+    assert not bridge._wired[PID].record.native_debt
     await bus.emit(_dimmer(on="0", on_timestamp=4000))
     assert _states(mqtt)[-1]["state"] == "OFF"
     assert "wired_write_status" not in _states(mqtt)[-1]
