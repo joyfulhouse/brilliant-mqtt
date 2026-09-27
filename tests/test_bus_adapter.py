@@ -38,6 +38,7 @@ from brilliant_mqtt.write_admission import (
     command_admission,
 )
 from tests.fakes import (
+    FakeBus,
     FakeClock,
     FakeMqtt,
     FakeSleeper,
@@ -479,6 +480,7 @@ class TestInteractiveScheduling:
 
             if invalidate == "withdraw":
                 await bridge.withdraw()
+                await bridge.reconcile()
                 await update(replace(device))
                 bridge._register_command_topic("slider", replace(descriptor))
             elif invalidate in ("target", "kind", "dimming", "scale"):
@@ -526,6 +528,32 @@ class TestInteractiveScheduling:
             await dispatcher.shutdown()
             await adapter.shutdown()
             await asyncio.gather(blocker, return_exceptions=True)
+
+    async def test_partial_push_omission_keeps_dimming_until_full_capture(self) -> None:
+        device = BrilliantDevice(
+            device_id="shared",
+            peripheral_id="slider",
+            name="Synthetic light",
+            kind=DeviceKind.LIGHT,
+            variables={
+                "on": Variable("on", "0"),
+                "intensity": Variable("intensity", "100"),
+            },
+        )
+        bus = FakeBus([device])
+        bridge = Bridge(bus, FakeMqtt(), "test")
+        await bridge.reconcile()
+        generation = bridge._command_generation["slider"]
+        partial = replace(device, variables={"on": device.variables["on"]})
+
+        await bus.emit(partial)
+        assert bridge._devices["slider"].is_dimmable
+        assert bridge._command_generation["slider"] == generation
+
+        await bus.emit_full(partial)
+        assert not bridge._devices["slider"].is_dimmable
+        assert bridge._command_generation["slider"] == generation + 1
+        await bridge.shutdown_wired_feedback()
 
     @pytest.mark.parametrize("auxiliary", [False, True])
     async def test_withdrawn_route_rejects_active_replacement(self, auxiliary: bool) -> None:
@@ -1016,6 +1044,31 @@ def _gated_adapter(
     *, fail_with: Exception | None = None
 ) -> tuple[_GatedRpcObserver, RpcBusAdapter]:
     return _adapter_for(_GatedRpcObserver(fail_with=fail_with))
+
+
+async def test_issue_callback_failure_log_contains_only_event_and_class(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    observer, adapter = _gated_adapter()
+    observer.release.set()
+    ticket = AdmissionTicket()
+
+    def fail_issue(_provenance: object) -> None:
+        raise RuntimeError("private-payload-sentinel")
+
+    ticket.set_issue_callback(fail_issue)
+    try:
+        with caplog.at_level(logging.WARNING, logger="brilliant_mqtt.bus"):
+            await adapter.set_variables(
+                "private-owner-sentinel", "load", [VarSet("on", "1")], ticket=ticket
+            )
+        assert len(caplog.records) == 1
+        assert caplog.records[0].getMessage() == "WIRED_ISSUE_CALLBACK_FAILED RuntimeError"
+        assert caplog.records[0].exc_info is None
+        assert "private-payload-sentinel" not in caplog.text
+        assert "private-owner-sentinel" not in caplog.text
+    finally:
+        await adapter.shutdown()
 
 
 async def _detached_write(
