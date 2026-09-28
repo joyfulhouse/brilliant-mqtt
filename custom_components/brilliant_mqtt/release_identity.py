@@ -7,6 +7,14 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from types import MappingProxyType
 
+FIRST_ORDINAL_RELEASE = (0, 11, 0)
+_STRICT_RELEASE = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
+
+
+def _release_version(version: str) -> tuple[int, int, int] | None:
+    match = _STRICT_RELEASE.fullmatch(version)
+    return (int(match[1]), int(match[2]), int(match[3])) if match else None
+
 
 @dataclass(frozen=True, repr=False)
 class ReleaseIdentity:
@@ -106,8 +114,25 @@ class RollbackBaseline:
         )
 
 
+def is_pre_ordinal_upgrade(incumbent: ReleaseIdentity | None, candidate: ReleaseIdentity) -> bool:
+    """Recognize only releases before the first ordinal-bearing bundle."""
+    if incumbent is None:
+        return False
+    old_version = _release_version(incumbent.version)
+    new_version = _release_version(candidate.version)
+    return (
+        incumbent.digest != candidate.digest
+        and incumbent.release_ordinal is None
+        and old_version is not None
+        and old_version < FIRST_ORDINAL_RELEASE
+        and candidate.release_ordinal is not None
+        and new_version is not None
+        and new_version >= FIRST_ORDINAL_RELEASE
+    )
+
+
 def admit_identity(incumbent: ReleaseIdentity | None, candidate: ReleaseIdentity) -> bool:
-    """Return whether code changes; never infer release age from version/digest."""
+    """Return whether code changes; ordinals order known releases."""
     if incumbent is None:
         return True
     if incumbent.digest == candidate.digest:
@@ -117,5 +142,7 @@ def admit_identity(incumbent: ReleaseIdentity | None, candidate: ReleaseIdentity
         and candidate.release_ordinal is not None
         and candidate.release_ordinal > incumbent.release_ordinal
     ):
+        return True
+    if is_pre_ordinal_upgrade(incumbent, candidate):
         return True
     raise ValueError("release_identity_blocked")

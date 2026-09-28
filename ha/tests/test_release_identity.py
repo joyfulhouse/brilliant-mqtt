@@ -146,6 +146,141 @@ async def test_policy_orders_only_known_ordinals(
             admit_identity(old, new)
 
 
+async def test_pre_ordinal_release_policy_admits_only_strict_legacy_versions() -> None:
+    from custom_components.brilliant_mqtt.release_identity import ReleaseIdentity, admit_identity
+
+    candidate = ReleaseIdentity("0.11.0", 2, "4" * 64, None, "candidate")
+    legacy = ReleaseIdentity("0.10.2", None, "5" * 64, None, "legacy_fixed")
+    blocked = (
+        ("0.11.0", None, "0.11.0", 2),
+        ("unknown", None, "0.11.0", 2),
+        ("0.11.0-rc1", None, "0.11.0", 2),
+        ("0.10.2", None, "0.11.0", None),
+        ("0.11.0", 2, "0.11.1", 2),
+    )
+    for old_version, old_ordinal, new_version, new_ordinal in blocked:
+        old = ReleaseIdentity(old_version, old_ordinal, legacy.digest, None, "legacy_fixed")
+        new = ReleaseIdentity(new_version, new_ordinal, candidate.digest, None, "candidate")
+        with pytest.raises(ValueError, match="release_identity_blocked"):
+            admit_identity(old, new)
+    assert admit_identity(legacy, candidate)
+
+
+async def test_guest_bath_legacy_update_needs_no_override_notification(
+    hass: HomeAssistant, payload_dir: Path
+) -> None:
+    (payload_dir / "VERSION").write_text("0.11.0")
+    (payload_dir / "RELEASE_ORDINAL").write_text("2\n")
+    shell = IdentityShell(
+        {
+            **_identity(digest="5bab1bd0" + "0" * 56, ordinal=None),
+            "version": "0.10.2",
+            "layout": "legacy_fixed",
+        }
+    )
+    _entry, manager = _fleet_panel_manager(hass)
+    with (
+        patch.object(manager, "_connect_for_repair", AsyncMock(return_value=shell)),
+        patch(
+            "custom_components.brilliant_mqtt.manager.persistent_notification.async_create"
+        ) as notify,
+    ):
+        await shell.connect()
+        await manager.async_update_agent()
+        notify.assert_not_called()
+    identity = shell.release_identities["bridge"]
+    assert identity is not None
+    assert identity["version"] == "0.11.0"
+    assert identity["release_ordinal"] == 2
+    assert not any("override-" in path for path, _, _ in shell.identity_uploads)
+    audit = [
+        json.loads(data)
+        for path, data, mode in shell.identity_uploads
+        if "auto-admit-" in path and mode == 0o600
+    ]
+    assert len(audit) == 1
+    assert audit[0]["components"] == ["bridge"]
+    assert audit[0]["incumbent"]["bridge"]["version"] == "0.10.2"
+    assert audit[0]["candidate"]["bridge"]["release_ordinal"] == 2
+    await manager.async_shutdown()
+
+
+async def test_mixed_legacy_bridge_and_identical_watchdog_only_admits_bridge(
+    payload_dir: Path,
+) -> None:
+    (payload_dir / "VERSION").write_text("0.11.0")
+    (payload_dir / "RELEASE_ORDINAL").write_text("2\n")
+    candidate = await panel_ops.candidate_identities(str(payload_dir))
+    shell = IdentityShell(
+        {
+            **_identity(digest="5" * 64, ordinal=None),
+            "version": "0.10.2",
+            "layout": "legacy_fixed",
+        }
+    )
+    shell.release_identities["bus_watchdog"] = {
+        **candidate["bus_watchdog"].as_dict(),
+        "version": "0.10.2",
+        "release_ordinal": None,
+        "layout": "legacy_fixed",
+    }
+    await shell.connect()
+    async with panel_ops.release_transaction(
+        shell, str(payload_dir), panel="guest-bath", components=("bus_watchdog",)
+    ) as admission:
+        assert admission.changes == {"bridge": True, "bus_watchdog": False}
+    audit = [
+        json.loads(data) for path, data, _mode in shell.identity_uploads if "auto-admit-" in path
+    ]
+    assert len(audit) == 1
+    assert audit[0]["components"] == ["bridge"]
+
+
+async def test_pre_ordinal_admission_applies_to_each_changed_component(payload_dir: Path) -> None:
+    (payload_dir / "VERSION").write_text("0.11.0")
+    (payload_dir / "RELEASE_ORDINAL").write_text("2\n")
+    shell = IdentityShell(None)
+    for component in ("bridge", "bus_watchdog", "wifi_watchdog"):
+        shell.release_identities[component] = {
+            **_identity(digest="5" * 64, ordinal=None),
+            "version": "0.10.2",
+            "layout": "legacy_fixed",
+        }
+    await shell.connect()
+    async with panel_ops.release_transaction(
+        shell,
+        str(payload_dir),
+        panel="guest-bath",
+        components=("bus_watchdog", "wifi_watchdog"),
+    ) as admission:
+        assert admission.changes == {
+            "bridge": True,
+            "bus_watchdog": True,
+            "wifi_watchdog": True,
+        }
+    audits = [
+        json.loads(data) for path, data, _mode in shell.identity_uploads if "auto-admit-" in path
+    ]
+    assert len(audits) == 1
+    assert audits[0]["components"] == ["bridge", "bus_watchdog", "wifi_watchdog"]
+
+
+async def test_ordinal_two_incumbent_uses_normal_ordering_for_release_0_11_1(
+    payload_dir: Path,
+) -> None:
+    (payload_dir / "VERSION").write_text("0.11.1")
+    (payload_dir / "RELEASE_ORDINAL").write_text("3\n")
+    shell = IdentityShell({**_identity(digest="5" * 64, ordinal=2), "version": "0.11.0"})
+    await shell.connect()
+    async with panel_ops.release_transaction(
+        shell, str(payload_dir), panel="guest-bath"
+    ) as admission:
+        assert admission.changes == {"bridge": True}
+    assert not any(
+        "auto-admit-" in path or "override-" in path for path, _, _ in shell.identity_uploads
+    )
+
+
 async def test_override_is_bound_consumed_recorded_and_not_inherited(payload_dir: Path) -> None:
     shell = IdentityShell(_identity())
     await shell.connect()

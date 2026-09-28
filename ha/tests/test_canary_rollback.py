@@ -450,7 +450,7 @@ async def test_named_rollback_recovery_rejects_foreign_owner(
     assert await journal.async_load() == before
 
 
-@pytest.mark.parametrize("policy", ["blocked", "unchanged", "override"])
+@pytest.mark.parametrize("policy", ["blocked", "unchanged", "override", "auto"])
 async def test_migration_inherits_shared_identity_admission(
     hass: HomeAssistant,
     tmp_path: Path,
@@ -468,6 +468,9 @@ async def test_migration_inherits_shared_identity_admission(
     shell = RehearsalShell(tmp_path / "panel")
     code = shell.install()
     payload = panel_ops._identity_payload_dir()
+    if policy in {"blocked", "override"}:
+        (code / "VERSION").write_text("0.11.0\n")
+        (shell.panel / "VERSION").write_text("0.11.0\n")
     if policy == "unchanged":
         for tree in ("app", "vendor"):
             shutil.rmtree(code / tree)
@@ -488,11 +491,21 @@ async def test_migration_inherits_shared_identity_admission(
         setup: UUID,
     ) -> PanelReleaseBundle:
         bundle = await harness.release(requested, fleet, transaction, setup)
-        return replace(bundle, local_payload_dir=str(payload), version="0.11.0")
+        return replace(bundle, local_payload_dir=str(payload), version="0.11.1")
 
     provisioner._release_provider = release
     before = await panel_ops.snapshot_panel(shell)
-    if policy == "override":
+    if policy == "auto":
+        await provisioner.async_install(request, _fleet(), harness.progress)
+        installed = await panel_ops._read_release_identities(shell)
+        expected = (await panel_ops.candidate_identities(str(payload)))["bridge"]
+        assert installed["bridge"] is not None
+        assert installed["bridge"].digest == expected.digest
+        assert installed["bridge"].release_ordinal == expected.release_ordinal
+        assert await panel_ops.baseline_retained(shell)
+        assert list((shell.panel / ".release-identities").glob("auto-admit-*.json"))
+        assert not list((shell.panel / ".release-identities").glob("override-*.json"))
+    elif policy == "override":
         override: Mapping[str, object] | None = None
         with pytest.raises(panel_ops.ReleaseIdentityBlocked) as blocked:
             async with panel_ops.release_transaction(shell, str(payload), panel=request.slug):
@@ -530,7 +543,9 @@ async def test_staged_mutation_boundaries_cannot_bypass_identity(
     boundary: str,
 ) -> None:
     shell = RehearsalShell(tmp_path)
-    shell.install()
+    code = shell.install()
+    (code / "VERSION").write_text("0.11.0\n")
+    (shell.panel / "VERSION").write_text("0.11.0\n")
     payload = panel_ops._identity_payload_dir()
     transaction = uuid4()
     staged = panel_ops.StagedRelease(
