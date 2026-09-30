@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The manifest uses minimum-version specs for `asyncssh` and `paho-mqtt`, so
+  hassfest accepts them and the integration still installs on HA 2026.6.x.
 - A partial MQTT setter that supersedes a light or switch write still waiting
   for the device now merges per field, with the later value winning, rather than
   dropping the waiting write's other fields. Writes already issued to the
