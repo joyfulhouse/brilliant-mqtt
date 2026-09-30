@@ -65,6 +65,8 @@ class RehearsalShell(FakeShell):
             "    raise SystemExit(0 if state[index] else 3)\n"
             "if op == 'enable': state[0] = True\n"
             "if op == 'disable': state[0] = False\n"
+            # Like systemd, --now also starts or stops the unit.
+            "if op in ('enable', 'disable') and '--now' in args: state[1] = op == 'enable'\n"
             "if op in ('start', 'restart'): state[1] = True\n"
             "if op == 'stop': state[1] = False\n"
             "path.write_text(json.dumps(states))\n"

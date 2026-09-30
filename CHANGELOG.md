@@ -17,9 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Those paths need a baseline, which requires the bridge unit to be `active`. If
   a pre-0.11.0 panel's bridge is stopped or failed, repair no longer brings it
   back (as in 0.11.0; only 0.11.1 did) and update reports `baseline_correlation_unsupported`. Start
-  `brilliant-mqtt` on the panel and update, or run `brilliant_mqtt.uninstall` and
-  then update. Uninstall stops and removes the agent, so the bridge stays offline
-  until the update completes. See "Recovering a stopped pre-ordinal bridge" in
+  `brilliant-mqtt` on the panel and update. Otherwise turn off the panel's
+  watchdog component switches, run `brilliant_mqtt.uninstall`, update, then turn
+  the watchdogs back on. Uninstall stops and removes the agent, so the bridge
+  stays offline until the update completes. See "Recovering a stopped pre-ordinal bridge" in
   `docs/ha-integration.md`.
 - Automatic pre-ordinal admission now logs one INFO line per operation, and a
   failure to write its audit record is reported with an operator-safe detail

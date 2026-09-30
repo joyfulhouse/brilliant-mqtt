@@ -380,15 +380,23 @@ can no longer replace pre-ordinal code, so a pre-0.11.0 panel whose bridge is
    present, start `brilliant-mqtt` on the panel. Once
    `systemctl is-active brilliant-mqtt` prints `active`, run the Update entity or
    `brilliant_mqtt.redeploy` without an override.
-2. **Uninstall, then update.** If the bridge cannot start, run
-   `brilliant_mqtt.uninstall` for that panel. The panel must have no retained
-   baseline (`baseline_retained_finalize_first` otherwise). This stops and removes
-   the agent's unit, environment and `/var/brilliant-mqtt`, including the old
-   identity records. Then run the Update entity. The panel now has no agent
-   layout, so the canary takes an empty baseline and installs the current
-   release with its ordinal. Rollback of that update returns the panel to the
-   uninstalled state. The bridge is offline from the uninstall until the update
-   completes.
+2. **Remove the watchdogs, uninstall, then update.** If the bridge cannot start:
+   1. Turn off the panel's **Wi-Fi watchdog** and **Bus watchdog** component
+      switches, for whichever of them are on. Uninstall removes only the bridge,
+      and a watchdog unit left under `/etc/systemd/system` keeps the agent layout
+      installed, so the update would still stop with
+      `baseline_correlation_unsupported`.
+   2. Run `brilliant_mqtt.uninstall` for that panel. The panel must have no
+      retained baseline (`baseline_retained_finalize_first` otherwise). This stops
+      and removes the agent's unit, environment and `/var/brilliant-mqtt`,
+      including the old identity records.
+   3. Run the Update entity. The panel now has no agent layout, so the canary
+      takes an empty baseline and installs the current release with its ordinal.
+      Rollback of that update returns the panel to the uninstalled state.
+   4. Turn the watchdog switches back on. Each installs the current release.
+
+   The bridge is offline from the uninstall until the update completes, and the
+   watchdogs are off until they are turned back on.
 
 Neither path loosens the gate: every code replacement still runs through the
 canary.

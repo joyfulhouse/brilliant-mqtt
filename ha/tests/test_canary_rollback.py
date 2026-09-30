@@ -1401,11 +1401,13 @@ async def test_other_transaction_is_rejected_before_persisting_restore_intent(
     assert await journal.async_load() == other
 
 
+@pytest.mark.parametrize("watchdog", [None, "wifi_watchdog", "bus_watchdog"])
 async def test_stopped_pre_ordinal_bridge_recovers_only_through_canaried_update(
     hass: HomeAssistant,
     tmp_path: Path,
     payload_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
+    watchdog: str | None,
 ) -> None:
     """Documented #181 recovery: repair is blocked; uninstall + update is canaried."""
     from homeassistant.exceptions import HomeAssistantError
@@ -1419,11 +1421,22 @@ async def test_stopped_pre_ordinal_bridge_recovers_only_through_canaried_update(
     (payload_dir / "RELEASE_ORDINAL").write_text("2\n")
     shell = RehearsalShell(tmp_path / "panel")
     shell.install()
-    shell.state.write_text(json.dumps({"brilliant-mqtt": [True, False]}))
+    states: dict[str, list[bool]] = {"brilliant-mqtt": [True, False]}
+    selected: dict[str, bool] = {"bridge": True}
+    if watchdog is not None:
+        service = "brilliant-" + watchdog.replace("_", "-")
+        package = shell.panel / f"{watchdog}/brilliant_{watchdog}"
+        package.mkdir(parents=True)
+        (package / "run.py").write_text("old_watchdog = True\n")
+        (shell.panel / f"{watchdog}/VERSION").write_text("0.10.2\n")
+        (shell.units / f"{service}.service").write_text("old watchdog unit\n")
+        states[service] = [True, True]
+        selected[watchdog] = True
+    shell.state.write_text(json.dumps(states))
     shell._pinned = _record().panel_request.public_key
     _, manager = _fleet_panel_manager(
         hass,
-        panel_overrides={CONF_SSH_HOST_KEY: shell._pinned, CONF_COMPONENTS: {"bridge": True}},
+        panel_overrides={CONF_SSH_HOST_KEY: shell._pinned, CONF_COMPONENTS: selected},
     )
     await shell.connect()
     journal = ProvisioningJournal(hass)
@@ -1445,6 +1458,9 @@ async def test_stopped_pre_ordinal_bridge_recovers_only_through_canaried_update(
         assert manager.problem_reason and "release_identity_blocked" in manager.problem_reason
         legacy = (await panel_ops._read_release_identities(shell))["bridge"]
         assert legacy is not None and legacy.version == "0.10.2"
+        if watchdog is not None:
+            # A watchdog unit left in /etc keeps the layout installed; remove it first.
+            await manager.async_remove_component(watchdog)
         await manager.async_uninstall()
         await manager.async_update_agent()
         installed = (await panel_ops._read_release_identities(shell))["bridge"]
@@ -1452,6 +1468,11 @@ async def test_stopped_pre_ordinal_bridge_recovers_only_through_canaried_update(
         assert (installed.version, installed.release_ordinal) == ("0.11.0", 2)
         retained = await journal.async_retained_records()
         assert len(retained) == 1 and retained[0].state == "soak"
+        if watchdog is not None:
+            await manager.async_install_component(watchdog)
+            reinstalled = (await panel_ops._read_release_identities(shell))[watchdog]
+            assert reinstalled is not None
+            assert (reinstalled.version, reinstalled.release_ordinal) == ("0.11.0", 2)
     finally:
         await manager.async_shutdown()
 
