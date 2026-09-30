@@ -448,7 +448,6 @@ class SceneBridge:
             logger.exception("scene bridge state persistence failed")
             async with self._lock:
                 self._state_trusted = False
-                self._seed_captured = False
                 self._state_reason = "state_untrusted"
             return False
         async with self._lock:

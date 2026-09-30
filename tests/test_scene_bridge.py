@@ -1762,8 +1762,9 @@ async def test_corrupt_state_without_snapshot_suppresses_first_observed_record(
     await asyncio.sleep(0)
     assert _published(mqtt, scene_event_topic(_PANEL)) == []
     await bus.emit(_execution("all_off", 600))
-    # Delivery follows the threaded state write, which can outlast the bus
-    # callback's bounded drain (#112); wait for it rather than one loop turn.
+    # Delivery is asynchronous, so wait for publication rather than one loop
+    # turn. test_record_during_inflight_seed_write_is_not_suppressed covers the
+    # #112 seed-write race itself.
     await _wait_for_publish(mqtt, scene_event_topic(_PANEL))
     assert len(_published(mqtt, scene_event_topic(_PANEL))) == 1
     await bridge.async_shutdown()
@@ -1804,6 +1805,48 @@ async def test_record_during_inflight_seed_write_is_not_suppressed(
         assert [event["executed_at_ms"] for event in events] == [600]
     finally:
         release_seed_write.set()
+        await bridge.async_shutdown()
+
+
+async def test_record_after_failed_seed_write_is_delivered_once_persisted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #112: a failed seed write leaves the captured seed in memory, so the next
+    # record is new against it and must be emitted, then delivered only once a
+    # later write persists.
+    fail_next_write = True
+    persisted: list[int | None] = []
+    real_write = scene_state.atomic_write_state
+
+    def flaky_write(path: Path, state: scene_state.SceneState) -> None:
+        nonlocal fail_next_write
+        if fail_next_write:
+            fail_next_write = False
+            raise OSError("disk full")
+        real_write(path, state)
+        watermark = dict(state.watermarks).get((_PANEL, "all_off"))
+        persisted.append(None if watermark is None else watermark.executed_at_ms)
+
+    monkeypatch.setattr(scene_bridge_module, "atomic_write_state", flaky_write)
+    path = tmp_path / "state.json"
+    path.write_text("{not json")
+    bus = FakeBus([], scoped_devices=[_scene_catalog("all_off"), _mode_catalog("away")])
+    mqtt = FakeMqtt()
+    bridge = SceneBridge(bus, mqtt, _PANEL, path, FakeClockMs(_NOW_MS))
+    await bridge.async_start()
+    try:
+        await bus.emit(_execution("all_off", 500))
+        await asyncio.sleep(0.01)
+        assert persisted == []
+        assert _published(mqtt, scene_event_topic(_PANEL)) == []
+
+        await bus.emit(_execution("all_off", 600))
+        await _wait_for_publish(mqtt, scene_event_topic(_PANEL))
+        assert persisted and persisted[0] == 600
+        await asyncio.sleep(0.01)
+        events = [_payload(item) for item in _published(mqtt, scene_event_topic(_PANEL))]
+        assert [event["executed_at_ms"] for event in events] == [600]
+    finally:
         await bridge.async_shutdown()
 
 
