@@ -199,6 +199,15 @@ async def _wait_for_publish(mqtt: FakeMqtt, topic: str, count: int = 1) -> None:
     pytest.fail(f"timed out waiting for {count} publication(s) on {topic}")
 
 
+async def _wait_for_idle(bridge: SceneBridge) -> None:
+    """Wait until every tracked bridge task (callbacks, writes) has finished."""
+    for _ in range(1000):
+        if not bridge._tasks:
+            return
+        await asyncio.sleep(0.001)
+    pytest.fail("timed out waiting for scene bridge tasks to finish")
+
+
 async def _wait_for_bus_commands(bus: FakeBus, count: int) -> None:
     """Wait until at least ``count`` bus writes have landed.
 
@@ -1815,6 +1824,7 @@ async def test_record_after_failed_seed_write_is_delivered_once_persisted(
     # record is new against it and must be emitted, then delivered only once a
     # later write persists.
     fail_next_write = True
+    write_failed = threading.Event()
     persisted: list[int | None] = []
     real_write = scene_state.atomic_write_state
 
@@ -1822,6 +1832,7 @@ async def test_record_after_failed_seed_write_is_delivered_once_persisted(
         nonlocal fail_next_write
         if fail_next_write:
             fail_next_write = False
+            write_failed.set()
             raise OSError("disk full")
         real_write(path, state)
         watermark = dict(state.watermarks).get((_PANEL, "all_off"))
@@ -1836,7 +1847,9 @@ async def test_record_after_failed_seed_write_is_delivered_once_persisted(
     await bridge.async_start()
     try:
         await bus.emit(_execution("all_off", 500))
-        await asyncio.sleep(0.01)
+        # The failure must be fully handled before B is classified.
+        await _wait_for_idle(bridge)
+        assert write_failed.is_set()
         assert persisted == []
         assert _published(mqtt, scene_event_topic(_PANEL)) == []
 
@@ -1844,6 +1857,48 @@ async def test_record_after_failed_seed_write_is_delivered_once_persisted(
         await _wait_for_publish(mqtt, scene_event_topic(_PANEL))
         assert persisted and persisted[0] == 600
         await asyncio.sleep(0.01)
+        events = [_payload(item) for item in _published(mqtt, scene_event_topic(_PANEL))]
+        assert [event["executed_at_ms"] for event in events] == [600]
+    finally:
+        await bridge.async_shutdown()
+
+
+async def test_runtime_write_failure_after_persisted_seed_suppresses_next_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #112: the seed marker lives only until a persist succeeds, so a later
+    # runtime write failure makes the next record seed-only exactly as it does
+    # after a clean load.
+    fail_write_at: int | None = None
+    real_write = scene_state.atomic_write_state
+
+    def flaky_write(path: Path, state: scene_state.SceneState) -> None:
+        watermark = dict(state.watermarks).get((_PANEL, "all_off"))
+        if watermark is not None and watermark.executed_at_ms == fail_write_at:
+            raise OSError("disk full")
+        real_write(path, state)
+
+    monkeypatch.setattr(scene_bridge_module, "atomic_write_state", flaky_write)
+    path = tmp_path / "state.json"
+    path.write_text("{not json")
+    bus = FakeBus([], scoped_devices=[_scene_catalog("all_off"), _mode_catalog("away")])
+    mqtt = FakeMqtt()
+    bridge = SceneBridge(bus, mqtt, _PANEL, path, FakeClockMs(_NOW_MS))
+    await bridge.async_start()
+    try:
+        await bus.emit(_execution("all_off", 500))
+        await _wait_for_idle(bridge)
+        assert bridge._state_trusted is True
+
+        fail_write_at = 600
+        await bus.emit(_execution("all_off", 600))
+        await _wait_for_idle(bridge)
+        assert bridge._state_trusted is False
+        assert _published(mqtt, scene_event_topic(_PANEL)) == []
+
+        await bus.emit(_execution("all_off", 700))
+        await _wait_for_publish(mqtt, scene_event_topic(_PANEL))
+        await _wait_for_idle(bridge)
         events = [_payload(item) for item in _published(mqtt, scene_event_topic(_PANEL))]
         assert [event["executed_at_ms"] for event in events] == [600]
     finally:

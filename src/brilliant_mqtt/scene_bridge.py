@@ -455,6 +455,7 @@ class SceneBridge:
             if epoch != self._epoch or self._stopping:
                 return False
             self._state_trusted = True
+            self._seed_captured = False
             if self._state_reason == "state_untrusted":
                 self._state_reason = None
             return self._persisted_version >= version
