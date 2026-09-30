@@ -1,4 +1,4 @@
-"""The panel and HA runtimes declare one exact MQTT client stack."""
+"""The panel and HA runtimes declare one MQTT client stack (HA manifest: paho minimum)."""
 
 from __future__ import annotations
 
@@ -11,6 +11,8 @@ import tomli
 
 ROOT = Path(__file__).parents[1]
 MQTT_REQUIREMENTS = ["aiomqtt==2.5.1", "paho-mqtt==2.1.0"]
+# hassfest rejects exact pins of packages Home Assistant itself depends on.
+MANIFEST_MQTT_REQUIREMENTS = ["aiomqtt==2.5.1", "paho-mqtt>=2.1.0"]
 
 
 def _mqtt_requirements(requirements: list[str]) -> list[str]:
@@ -39,5 +41,5 @@ def test_every_runtime_declares_only_exact_mqtt_requirements() -> None:
     manifest_requirements = cast(list[str], manifest["requirements"])
 
     assert _mqtt_requirements(root_dependencies) == MQTT_REQUIREMENTS
-    assert _mqtt_requirements(manifest_requirements) == MQTT_REQUIREMENTS
+    assert _mqtt_requirements(manifest_requirements) == MANIFEST_MQTT_REQUIREMENTS
     assert _mqtt_requirements(ha_dependencies) == MQTT_REQUIREMENTS
