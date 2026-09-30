@@ -11,8 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - A stalled retained-ledger write now fails closed after 10 seconds, matching
   the MQTT acknowledgement bound. It no longer holds up state for loads the
-  panel already owns, and it no longer delays session shutdown. A late write
-  cannot race a later claim or corrupt the ledger file.
+  panel already owns, and it no longer delays session shutdown or process
+  exit. A late write cannot race a later write. Until it settles, publishes
+  fail closed; the next publish then rewrites the ledger from memory before
+  anything reaches the broker, so a late write cannot drop an owned topic.
   ([#176](https://github.com/joyfulhouse/brilliant-mqtt/issues/176))
 - A ledger failure during a wired light or switch state publish now reports
   the `retained_ledger` degraded status on the next session tick instead of

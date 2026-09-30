@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import json
+import logging
 import os
 import tempfile
 import threading
@@ -27,6 +28,8 @@ MAX_MANIFEST_BYTES = 256 * 1024
 # Bound on one durable ledger write, matching aiomqtt's default 10 s wait for a
 # broker acknowledgement so storage cannot stall publication longer than MQTT.
 PERSIST_DEADLINE_S = 10.0
+
+_LOGGER = logging.getLogger(__name__)
 
 _MANIFEST_KEYS = frozenset({"schema_version", "panel_slug", "topics"})
 
@@ -76,7 +79,10 @@ class _PathState:
     queued: dict[str, int] = field(default_factory=dict)
     # A write that outlived PERSIST_DEADLINE_S. Its thread cannot be stopped,
     # so no other write for this path may start until it finishes.
-    stalled_write: asyncio.Task[None] | None = None
+    stalled_write: asyncio.Future[None] | None = None
+    # Set when a write outlived its deadline: the file may no longer match
+    # ``topics``. Every publish re-persists ``topics`` until one succeeds.
+    disk_stale: bool = False
 
 
 _PATH_STATES: weakref.WeakValueDictionary[Path, _PathState] = weakref.WeakValueDictionary()
@@ -116,6 +122,10 @@ class RetainedTopicLedger:
             self._acknowledged_topics = frozenset()
             self._state.loaded = False
             self._state.topics = frozenset()
+            stalled = self._state.stalled_write
+            if stalled is not None and not stalled.done():
+                raise RetainedLedgerError("retained ledger persistence is still stalled")
+            self._state.disk_stale = False
             try:
                 raw = await asyncio.to_thread(self._path.read_bytes)
             except FileNotFoundError:
@@ -153,6 +163,7 @@ class RetainedTopicLedger:
         state = self._state
         if (
             state.claim_pending
+            and not state.disk_stale
             and topic in state.topics
             and topic in self._acknowledged_topics
             and not state.queued.get(topic)
@@ -178,7 +189,8 @@ class RetainedTopicLedger:
         self._require_loaded()
         _validate_topic(self._panel_slug, topic)
         enlarged = state.topics | {topic}
-        ownership_changed = enlarged != state.topics
+        # A stale file may not record topics this ledger still publishes to.
+        ownership_changed = enlarged != state.topics or state.disk_stale
         manifest_payload: str | None = None
         if ownership_changed:
             manifest_payload = _new_manifest(self._panel_slug, enlarged).to_payload()
@@ -233,7 +245,7 @@ class RetainedTopicLedger:
         state = self._state
         if state.stalled_write is not None and not state.stalled_write.done():
             raise RetainedLedgerError("retained ledger persistence is still stalled")
-        write = asyncio.create_task(asyncio.to_thread(_write_payload, self._path, payload))
+        write = _start_write(self._path, payload)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + PERSIST_DEADLINE_S
         cancellation: asyncio.CancelledError | None = None
@@ -250,10 +262,12 @@ class RetainedTopicLedger:
                     cancellation = error
         if not write.done():
             # Fail closed without committing the change. The late write still
-            # replaces the file atomically, and later writes wait for it. A late
-            # claim records a topic that was never published (an over-claim); a
-            # late clear drops a topic whose tombstone was already published.
+            # replaces the file atomically, and later writes wait for it. It may
+            # leave the file out of step with ``topics`` (a late clear drops a
+            # topic still held in memory), so mark the file stale: the next
+            # publish re-persists ``topics`` before anything reaches the broker.
             state.stalled_write = write
+            state.disk_stale = True
             write.add_done_callback(functools.partial(_settle_stalled_write, state))
             if cancellation is not None:
                 raise cancellation
@@ -267,6 +281,7 @@ class RetainedTopicLedger:
                 raise cancellation from error
             raise RetainedLedgerError("could not persist retained ledger") from error
         state.topics = topics
+        state.disk_stale = False
         if cancellation is not None:
             raise cancellation
 
@@ -275,13 +290,49 @@ class RetainedTopicLedger:
             raise RetainedLedgerError("retained ledger must be loaded before use")
 
 
-def _settle_stalled_write(state: _PathState, write: asyncio.Task[None]) -> None:
+def _start_write(path: Path, payload: str) -> asyncio.Future[None]:
+    """Run one durable write on a daemon thread and return its completion.
+
+    Not the default executor: ``asyncio.run`` joins that at exit (unbounded on
+    the panel's Python 3.10), so a stalled write would hold the process past
+    its fail-closed deadline. A daemon thread killed at exit leaves the target
+    whole, because only ``os.replace`` changes it; at worst a sibling
+    temporary file is left behind.
+    """
+    loop = asyncio.get_running_loop()
+    done: asyncio.Future[None] = loop.create_future()
+
+    def settle(error: BaseException | None) -> None:
+        if done.done():
+            return
+        if error is None:
+            done.set_result(None)
+        else:
+            done.set_exception(error)
+
+    def run() -> None:
+        error: BaseException | None = None
+        try:
+            _write_payload(path, payload)
+        except Exception as caught:
+            error = caught
+        try:
+            loop.call_soon_threadsafe(settle, error)
+        except RuntimeError:
+            pass  # The loop closed while the write stalled; nobody awaits it.
+
+    threading.Thread(target=run, name="retained-ledger-write", daemon=True).start()
+    return done
+
+
+def _settle_stalled_write(state: _PathState, write: asyncio.Future[None]) -> None:
     # This callback also keeps the path state alive until the write settles,
     # so a replacement ledger for the path still sees the stalled write.
     if state.stalled_write is write:
         state.stalled_write = None
-    if not write.cancelled():
-        write.exception()
+    error = None if write.cancelled() else write.exception()
+    if error is not None:
+        _LOGGER.warning("RETAINED_LEDGER_LATE_WRITE_FAILED %s", type(error).__name__)
 
 
 def _normalize_path(path: Path) -> Path:

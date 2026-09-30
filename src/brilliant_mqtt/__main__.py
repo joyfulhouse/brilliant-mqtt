@@ -331,16 +331,17 @@ async def _run_session(
         while True:
             await asyncio.sleep(tick)
 
+            # The wired feedback publisher runs detached and cannot propagate a
+            # ledger failure to its caller; fail closed here instead (#177).
+            # First, so an unrelated fault in this tick cannot discard it.
+            ledger_failure = owned_topics.consume_failure()
+            if ledger_failure is not None:
+                raise ledger_failure
+
             # The MQTT reader is intended to remain alive for the whole
             # session; either an exception or a plain return requires rebuild.
             if mqtt.consume_reader_failure():
                 raise MqttReaderDeadError("MQTT reader stopped — rebuilding session")
-
-            # The wired feedback publisher runs detached and cannot propagate a
-            # ledger failure to its caller; fail closed here instead (#177).
-            ledger_failure = owned_topics.consume_failure()
-            if ledger_failure is not None:
-                raise ledger_failure
 
             # An (uncancelled) closed-source write exceeded the bus adapter's
             # fixed hard cap without settling — a wedged transport, so rebuild
