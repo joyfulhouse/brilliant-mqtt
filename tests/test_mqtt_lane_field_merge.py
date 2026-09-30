@@ -3,6 +3,12 @@
 The queue layers already merge compatible partial setters (#170). These cover
 the active-admission fold: a newer command superseding a write that is admitted
 but not yet issued to the device. Deterministic fakes only; no live devices.
+
+Cases that discriminate the #159 fix (they fail without it): partial-after-full,
+same-field-latest-wins and state-only-after-merge. Contract-required regression
+guards that also pass on the pre-fix base, so a mutation run must not flag them
+as dead: full-after-partial, test_pending_off_is_not_merged_with_a_partial and
+test_fold_does_not_merge_across_lanes.
 """
 
 from __future__ import annotations

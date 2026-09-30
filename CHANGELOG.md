@@ -9,8 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- A partial MQTT setter that supersedes a light write still waiting for the
-  device now merges per field, with the later value winning, rather than
+- A partial MQTT setter that supersedes a light or switch write still waiting
+  for the device now merges per field, with the later value winning, rather than
   dropping the waiting write's other fields. Writes already issued to the
   device, and commands for other loads, are never merged.
   ([#159](https://github.com/joyfulhouse/brilliant-mqtt/issues/159))
