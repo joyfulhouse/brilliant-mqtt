@@ -282,9 +282,17 @@ async def test_override_cannot_waive_uncanaried_pre_ordinal_block(payload_dir: P
     with pytest.raises(panel_ops.ReleaseIdentityBlocked) as blocked:
         async with panel_ops.release_transaction(shell, str(payload_dir), panel="guest-bath"):
             pytest.fail("uncanaried pre-ordinal upgrade entered")
+    assert blocked.value.override == {}
+    # A correctly bound override (built directly, since the refusal carries none).
+    binding = panel_ops._identity_binding(
+        "guest-bath",
+        {"bridge": (await panel_ops._read_release_identities(shell))["bridge"]},
+        {"bridge": (await panel_ops.candidate_identities(str(payload_dir)))["bridge"]},
+        "a" * 32,
+    )
     with pytest.raises(panel_ops.ReleaseIdentityBlocked, match="without release_override"):
         async with panel_ops.release_transaction(
-            shell, str(payload_dir), panel="guest-bath", override=blocked.value.override
+            shell, str(payload_dir), panel="guest-bath", override=binding
         ):
             pytest.fail("override waived the uncanaried pre-ordinal block")
     assert not shell.identity_uploads

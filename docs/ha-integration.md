@@ -357,12 +357,19 @@ change baseline retention or the canary rollback process.
 
 #### Recovering a stopped pre-ordinal bridge
 
-The canaried update captures a rollback baseline first. For an installed panel,
-the capture requires `systemctl is-active brilliant-mqtt` to print exactly
-`active` and `/etc/brilliant-mqtt.env` to exist. Otherwise it stops with
-`baseline_correlation_unsupported` before any write. A panel with no agent layout
-at all is exempt. The requirement holds because rollback restarts the restored
-bridge with the retained environment and waits for a fresh MQTT session.
+The canaried update snapshots the panel and captures a rollback baseline before
+any write. The snapshot probe reads `systemctl is-active` for each core service:
+`active` counts as running, while `inactive`, `failed`, and `unknown` count as
+stopped. Any other state, such as the transitional `activating`, `deactivating`,
+or `reloading`, fails the snapshot probe itself (`snapshot_probe_failed`). The
+update then stops earlier, before any write, and reports only the generic "agent
+update failed during deployment". Retry once the unit has settled. For an
+installed panel, the baseline capture then requires the bridge to be running and
+`/etc/brilliant-mqtt.env` to exist. If the bridge is stopped or the file is
+missing, it stops with `baseline_correlation_unsupported` before any write. A
+panel with no agent layout at all is exempt from the baseline requirement. The
+requirement holds because rollback restarts the restored bridge with the retained
+environment and waits for a fresh MQTT session.
 
 Before 0.11.1, Repair would re-lay the unit and restart a stopped legacy bridge.
 Repair can no longer replace pre-ordinal code, so a pre-0.11.0 panel whose bridge

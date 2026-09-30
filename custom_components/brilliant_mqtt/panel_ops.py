@@ -107,7 +107,9 @@ class ReleaseIdentityBlocked(PanelOpError):
     def __init__(self, override: dict[str, object], *, pre_ordinal: bool = False) -> None:
         self.override = override
         if pre_ordinal:
-            # An override cannot waive this refusal; the canaried update needs none.
+            # An override cannot waive this refusal; the canaried update needs none,
+            # so carry no binding an operator could copy.
+            self.override = {}
             super().__init__(
                 "release_identity_blocked: installed code predates release ordinals and "
                 "only a canaried update may replace it. Update this panel's agent, or run "
