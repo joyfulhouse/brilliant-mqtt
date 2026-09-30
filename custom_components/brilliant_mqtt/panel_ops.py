@@ -104,8 +104,16 @@ class PanelOpError(RuntimeError):
 class ReleaseIdentityBlocked(PanelOpError):
     """An actionable, explicitly safe identity refusal with one-operation binding."""
 
-    def __init__(self, override: dict[str, object]) -> None:
+    def __init__(self, override: dict[str, object], *, pre_ordinal: bool = False) -> None:
         self.override = override
+        if pre_ordinal:
+            # An override cannot waive this refusal; the canaried update needs none.
+            super().__init__(
+                "release_identity_blocked: installed code predates release ordinals and "
+                "only a canaried update may replace it. Update this panel's agent, or run "
+                "brilliant_mqtt.redeploy for it, without release_override"
+            )
+            return
         super().__init__(
             "release_identity_blocked: installed code differs and release ordering is "
             "unknown or not increasing. Install a reviewed newer release, or explicitly "
@@ -309,13 +317,13 @@ async def _admit_identities(
         for component in selected
         if is_pre_ordinal_upgrade(incumbent[component], candidate[component])
     ]
+    if automatic and not allow_pre_ordinal_upgrade:
+        # Only callers that run the canary and retain a rollback baseline may replace
+        # a pre-ordinal incumbent. Every other writer fails closed, even with an override.
+        raise ReleaseIdentityBlocked(binding, pre_ordinal=True)
     changes: dict[str, bool] = {}
     for component in selected:
         try:
-            # Only callers that run the canary and retain a rollback baseline may
-            # auto-admit a pre-ordinal incumbent; every other writer fails closed.
-            if component in automatic and not allow_pre_ordinal_upgrade:
-                raise ValueError("release_identity_blocked")
             changes[component] = admit_identity(incumbent[component], candidate[component])
         except ValueError:
             if override is None:

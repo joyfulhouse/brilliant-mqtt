@@ -53,6 +53,18 @@ class IdentityShell(FakeShell):
         return await super().run(command)
 
 
+def _legacy_bridge_shell(payload_dir: Path) -> IdentityShell:
+    (payload_dir / "VERSION").write_text("0.11.0")
+    (payload_dir / "RELEASE_ORDINAL").write_text("2\n")
+    return IdentityShell(
+        {
+            **_identity(digest="5bab1bd0" + "0" * 56, ordinal=None),
+            "version": "0.10.2",
+            "layout": "legacy_fixed",
+        }
+    )
+
+
 @pytest.mark.parametrize("caller", ["update", "repair", "auto", "component", "registry", "refresh"])
 async def test_every_caller_refuses_before_ca_or_config_writes(
     hass: HomeAssistant, payload_dir: Path, caller: str
@@ -90,11 +102,18 @@ async def test_every_caller_refuses_before_ca_or_config_writes(
     await manager.async_shutdown()
 
 
+@pytest.mark.parametrize("incumbent", ["ordinal", "pre_ordinal"])
 @pytest.mark.parametrize("writer", ["deploy", "config", "wifi", "bus", "wifi_unit", "bus_unit"])
-async def test_shared_writers_cannot_bypass_admission(payload_dir: Path, writer: str) -> None:
+async def test_shared_writers_cannot_bypass_admission(
+    payload_dir: Path, writer: str, incumbent: str
+) -> None:
     # payload_dir already patches panel_ops._identity_payload_dir. A second monkeypatch
     # of it would outlive that patch and leak a stale mock into later tests.
-    shell = IdentityShell(_identity())
+    shell = (
+        _legacy_bridge_shell(payload_dir)
+        if incumbent == "pre_ordinal"
+        else IdentityShell(_identity())
+    )
     await shell.connect()
     with pytest.raises(panel_ops.PanelOpError, match="release_identity_blocked"):
         if writer == "deploy":
@@ -110,6 +129,7 @@ async def test_shared_writers_cannot_bypass_admission(payload_dir: Path, writer:
         else:
             await panel_ops.ensure_bus_watchdog_unit(shell, "legacy unit")
     assert not shell.uploads
+    assert not shell.identity_uploads
 
 
 async def test_same_bytes_update_preserves_selection_and_all_payload_writes(
@@ -204,18 +224,6 @@ async def test_guest_bath_legacy_update_needs_no_override_notification(
     await manager.async_shutdown()
 
 
-def _legacy_bridge_shell(payload_dir: Path) -> IdentityShell:
-    (payload_dir / "VERSION").write_text("0.11.0")
-    (payload_dir / "RELEASE_ORDINAL").write_text("2\n")
-    return IdentityShell(
-        {
-            **_identity(digest="5bab1bd0" + "0" * 56, ordinal=None),
-            "version": "0.10.2",
-            "layout": "legacy_fixed",
-        }
-    )
-
-
 @pytest.mark.parametrize("trigger", ["auto", "button", "service"])
 async def test_repair_never_auto_admits_pre_ordinal_upgrade(
     hass: HomeAssistant, payload_dir: Path, trigger: str
@@ -234,6 +242,9 @@ async def test_repair_never_auto_admits_pre_ordinal_upgrade(
         await shell.connect()
         await manager.async_repair(trigger=trigger)
     assert manager.problem_reason and "release_identity_blocked" in manager.problem_reason
+    # The hint points at the canaried update, never at an override it cannot use.
+    assert "without release_override" in manager.problem_reason
+    assert "release_override=" not in manager.problem_reason
     assert shell.release_identities["bridge"] == before
     assert not stage.await_count
     assert not shell.uploads
@@ -258,9 +269,26 @@ async def test_uncanaried_writers_never_auto_admit_pre_ordinal_upgrade(
                 await components._bridge_install(hass, shell, _bridge_data(tls_enabled=False))
         else:
             await manager._refresh_staged_copies()
+            assert manager.problem_reason
+            assert "release_identity_blocked" in manager.problem_reason
     assert not shell.uploads
     assert not shell.identity_uploads
     await manager.async_shutdown()
+
+
+async def test_override_cannot_waive_uncanaried_pre_ordinal_block(payload_dir: Path) -> None:
+    shell = _legacy_bridge_shell(payload_dir)
+    await shell.connect()
+    with pytest.raises(panel_ops.ReleaseIdentityBlocked) as blocked:
+        async with panel_ops.release_transaction(shell, str(payload_dir), panel="guest-bath"):
+            pytest.fail("uncanaried pre-ordinal upgrade entered")
+    with pytest.raises(panel_ops.ReleaseIdentityBlocked, match="without release_override"):
+        async with panel_ops.release_transaction(
+            shell, str(payload_dir), panel="guest-bath", override=blocked.value.override
+        ):
+            pytest.fail("override waived the uncanaried pre-ordinal block")
+    assert not shell.identity_uploads
+    assert not shell.uploads
 
 
 @pytest.mark.parametrize("watchdog_version", ["0.11.0", "unknown"])

@@ -1401,6 +1401,61 @@ async def test_other_transaction_is_rejected_before_persisting_restore_intent(
     assert await journal.async_load() == other
 
 
+async def test_stopped_pre_ordinal_bridge_recovers_only_through_canaried_update(
+    hass: HomeAssistant,
+    tmp_path: Path,
+    payload_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Documented #181 recovery: repair is blocked; uninstall + update is canaried."""
+    from homeassistant.exceptions import HomeAssistantError
+
+    from custom_components.brilliant_mqtt import fleet_manager
+    from custom_components.brilliant_mqtt.const import CONF_COMPONENTS, CONF_SSH_HOST_KEY
+    from tests.test_manager import _fleet_panel_manager
+    from tests.test_panel_provisioner import _FakeObserver, _health
+
+    (payload_dir / "VERSION").write_text("0.11.0")
+    (payload_dir / "RELEASE_ORDINAL").write_text("2\n")
+    shell = RehearsalShell(tmp_path / "panel")
+    shell.install()
+    shell.state.write_text(json.dumps({"brilliant-mqtt": [True, False]}))
+    shell._pinned = _record().panel_request.public_key
+    _, manager = _fleet_panel_manager(
+        hass,
+        panel_overrides={CONF_SSH_HOST_KEY: shell._pinned, CONF_COMPONENTS: {"bridge": True}},
+    )
+    await shell.connect()
+    journal = ProvisioningJournal(hass)
+    provisioner = _Harness().provisioner(manager._ssh_lock)
+    provisioner._journal = journal
+    provisioner._operations = panel_ops
+    provisioner._health_observer_factory = lambda _slug: _FakeObserver([], _health())
+    monkeypatch.setattr(fleet_manager, "_get_recovery_provisioner", lambda _hass: provisioner)
+    monkeypatch.setattr(manager, "_connect_for_repair", AsyncMock(return_value=shell))
+    monkeypatch.setattr(
+        manager, "_async_stage_broker_ca", AsyncMock(return_value="MQTT_TLS_ENABLED=0\n")
+    )
+    try:
+        with pytest.raises(HomeAssistantError) as raised:
+            await manager.async_update_agent()
+        assert raised.value.translation_placeholders
+        assert "baseline_correlation_unsupported" in raised.value.translation_placeholders["error"]
+        await manager.async_repair(trigger="button")
+        assert manager.problem_reason and "release_identity_blocked" in manager.problem_reason
+        legacy = (await panel_ops._read_release_identities(shell))["bridge"]
+        assert legacy is not None and legacy.version == "0.10.2"
+        await manager.async_uninstall()
+        await manager.async_update_agent()
+        installed = (await panel_ops._read_release_identities(shell))["bridge"]
+        assert installed is not None
+        assert (installed.version, installed.release_ordinal) == ("0.11.0", 2)
+        retained = await journal.async_retained_records()
+        assert len(retained) == 1 and retained[0].state == "soak"
+    finally:
+        await manager.async_shutdown()
+
+
 @pytest.mark.parametrize("selected_watchdog", [False, True])
 async def test_manager_update_cannot_reach_ca_without_durable_complete_baseline(
     hass: HomeAssistant,
