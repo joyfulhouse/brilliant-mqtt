@@ -882,13 +882,13 @@ class TestInteractiveScheduling:
             observer.release.set()
             await blocker
             await dispatcher.shutdown()
-            expected = [
-                {"on": "1"},
-                {"intensity": "40"} if barrier else {"on": "1", "intensity": "40"},
-            ]
+            # Without a barrier the partial merges per field into the pending
+            # write (#159); the button still orders the barrier case.
+            expected = [{"on": "1"}]
             if barrier:
-                expected.append({"reset": "1"})
-            expected.append({"intensity": "120"})
+                expected += [{"intensity": "40"}, {"reset": "1"}, {"intensity": "120"}]
+            else:
+                expected.append({"on": "1", "intensity": "120"})
             assert [values for _, _, values in observer.payloads] == expected
         finally:
             observer.release.set()

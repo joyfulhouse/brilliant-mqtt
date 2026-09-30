@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A partial MQTT setter that supersedes a light write still waiting for the
+  device now merges per field, with the later value winning, rather than
+  dropping the waiting write's other fields. Writes already issued to the
+  device, and commands for other loads, are never merged.
+  ([#159](https://github.com/joyfulhouse/brilliant-mqtt/issues/159))
+
 ## [0.11.1] - 2026-09-27
 
 The on-panel agent and Home Assistant integration both move to 0.11.1. The
