@@ -55,20 +55,29 @@ def test_missing_state_allows_reboot(tmp_path: Path, caplog: pytest.LogCaptureFi
     assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
 
 
+# Valid JSON that is not a list; {} and "" must be rejected by type, not by items.
+WRONG_TYPES = {
+    "wrong_type": json.dumps({"stamps": [1.0]}),
+    "wrong_type_empty_dict": "{}",
+    "wrong_type_empty_str": '""',
+    "wrong_type_number": "123",
+}
+
+
 def _bad_state(tmp_path: Path, state_kind: str) -> Path:
     state = tmp_path / "state"
     if state_kind == "unreadable":
         state.mkdir()  # present, but open() raises IsADirectoryError
     elif state_kind == "corrupt":
         state.write_text("not JSON", encoding="utf-8")
-    elif state_kind == "wrong_type":
-        state.write_text(json.dumps({"stamps": [1.0]}), encoding="utf-8")
+    elif state_kind in WRONG_TYPES:
+        state.write_text(WRONG_TYPES[state_kind], encoding="utf-8")
     else:  # wrong_shape: a list whose items are not timestamps
         state.write_text(json.dumps([["x"]]), encoding="utf-8")
     return state
 
 
-BAD_KINDS = ["unreadable", "corrupt", "wrong_type", "wrong_shape"]
+BAD_KINDS = ["unreadable", "corrupt", *WRONG_TYPES, "wrong_shape"]
 
 
 @pytest.mark.parametrize("state_kind", BAD_KINDS)
