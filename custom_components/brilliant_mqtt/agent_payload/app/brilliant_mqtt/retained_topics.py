@@ -8,6 +8,7 @@ the broker-side ownership manifest or the retained value is published.
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import os
 import tempfile
@@ -23,6 +24,9 @@ from brilliant_mqtt.protocols import MqttClient
 SCHEMA_VERSION = 1
 MAX_TOPICS = 4_096
 MAX_MANIFEST_BYTES = 256 * 1024
+# Bound on one durable ledger write, matching aiomqtt's default 10 s wait for a
+# broker acknowledgement so storage cannot stall publication longer than MQTT.
+PERSIST_DEADLINE_S = 10.0
 
 _MANIFEST_KEYS = frozenset({"schema_version", "panel_slug", "topics"})
 
@@ -65,6 +69,14 @@ class _PathState:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     topics: frozenset[str] = frozenset()
     loaded: bool = False
+    # True while a claim holds the lock only to wait for its durable write.
+    claim_pending: bool = False
+    # Callers waiting on the lock, per topic, so a later publish of the same
+    # topic never overtakes an earlier one through the pending-claim fast path.
+    queued: dict[str, int] = field(default_factory=dict)
+    # A write that outlived PERSIST_DEADLINE_S. Its thread cannot be stopped,
+    # so no other write for this path may start until it finishes.
+    stalled_write: asyncio.Task[None] | None = None
 
 
 _PATH_STATES: weakref.WeakValueDictionary[Path, _PathState] = weakref.WeakValueDictionary()
@@ -82,6 +94,9 @@ class RetainedTopicLedger:
         self._state = _path_state(self._path, panel_slug)
         self._loaded = False
         self._manifest_acknowledged = False
+        self._failure: RetainedLedgerError | None = None
+        # Topics in the last ownership manifest this instance had acknowledged.
+        self._acknowledged_topics: frozenset[str] = frozenset()
 
     @property
     def ownership_topic(self) -> str:
@@ -98,6 +113,7 @@ class RetainedTopicLedger:
         async with self._state.lock:
             self._loaded = False
             self._manifest_acknowledged = False
+            self._acknowledged_topics = frozenset()
             self._state.loaded = False
             self._state.topics = frozenset()
             try:
@@ -114,28 +130,76 @@ class RetainedTopicLedger:
             self._state.loaded = True
             self._loaded = True
 
+    def consume_failure(self) -> RetainedLedgerError | None:
+        """Return and clear the first publish failure since the last call.
+
+        Callers that must keep running after a failed publish (the wired
+        feedback publisher) cannot propagate it, so the session loop checks
+        this each tick and fails closed through its retained-ledger handler.
+        """
+        failure, self._failure = self._failure, None
+        return failure
+
     async def async_publish(self, mqtt: MqttClient, topic: str, payload: str) -> None:
         """Claim *topic*, acknowledge changed ownership, then publish its value."""
-        async with self._state.lock:
-            self._require_loaded()
-            _validate_topic(self._panel_slug, topic)
-            enlarged = self._state.topics | {topic}
-            ownership_changed = enlarged != self._state.topics
-            manifest_payload: str | None = None
-            if ownership_changed:
-                manifest_payload = _new_manifest(self._panel_slug, enlarged).to_payload()
-                self._manifest_acknowledged = False
-                await self._async_persist(manifest_payload, enlarged)
+        try:
+            await self._async_publish(mqtt, topic, payload)
+        except RetainedLedgerError as error:
+            if self._failure is None:
+                self._failure = error
+            raise
 
-            if not self._manifest_acknowledged:
-                if manifest_payload is None:
-                    manifest_payload = _new_manifest(
-                        self._panel_slug,
-                        self._state.topics,
-                    ).to_payload()
-                await mqtt.publish(self.ownership_topic, manifest_payload, retain=True, qos=1)
-                self._manifest_acknowledged = True
+    async def _async_publish(self, mqtt: MqttClient, topic: str, payload: str) -> None:
+        state = self._state
+        if (
+            state.claim_pending
+            and topic in state.topics
+            and topic in self._acknowledged_topics
+            and not state.queued.get(topic)
+        ):
+            # Another topic's claim holds the lock only while its write reaches
+            # disk. This topic is already durable and in a manifest this ledger
+            # acknowledged, so publishing it now cannot outrun its ownership
+            # record. An earlier caller queued for the same topic keeps order.
+            self._require_loaded()
             await mqtt.publish(topic, payload, retain=True, qos=0)
+            return
+        state.queued[topic] = state.queued.get(topic, 0) + 1
+        try:
+            async with state.lock:
+                await self._async_publish_locked(mqtt, topic, payload)
+        finally:
+            state.queued[topic] -= 1
+            if not state.queued[topic]:
+                del state.queued[topic]
+
+    async def _async_publish_locked(self, mqtt: MqttClient, topic: str, payload: str) -> None:
+        state = self._state
+        self._require_loaded()
+        _validate_topic(self._panel_slug, topic)
+        enlarged = state.topics | {topic}
+        ownership_changed = enlarged != state.topics
+        manifest_payload: str | None = None
+        if ownership_changed:
+            manifest_payload = _new_manifest(self._panel_slug, enlarged).to_payload()
+            self._manifest_acknowledged = False
+            state.claim_pending = True
+            try:
+                await self._async_persist(manifest_payload, enlarged)
+            finally:
+                state.claim_pending = False
+
+        if not self._manifest_acknowledged:
+            if manifest_payload is None:
+                manifest_payload = _new_manifest(
+                    self._panel_slug,
+                    state.topics,
+                ).to_payload()
+            acknowledged = state.topics
+            await mqtt.publish(self.ownership_topic, manifest_payload, retain=True, qos=1)
+            self._manifest_acknowledged = True
+            self._acknowledged_topics = acknowledged
+        await mqtt.publish(topic, payload, retain=True, qos=0)
 
     async def async_clear(self, mqtt: MqttClient, topic: str) -> None:
         """Clear one owned retained topic, then persist and publish its removal."""
@@ -166,29 +230,58 @@ class RetainedTopicLedger:
         self._manifest_acknowledged = True
 
     async def _async_persist(self, payload: str, topics: frozenset[str]) -> None:
+        state = self._state
+        if state.stalled_write is not None and not state.stalled_write.done():
+            raise RetainedLedgerError("retained ledger persistence is still stalled")
         write = asyncio.create_task(asyncio.to_thread(_write_payload, self._path, payload))
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + PERSIST_DEADLINE_S
         cancellation: asyncio.CancelledError | None = None
         while not write.done():
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
             try:
-                await asyncio.shield(write)
+                # asyncio.wait never cancels the write, so cancellation is
+                # deferred until the write settles or the deadline passes.
+                await asyncio.wait({write}, timeout=remaining)
             except asyncio.CancelledError as error:
                 if cancellation is None:
                     cancellation = error
-            except OSError:
-                break
+        if not write.done():
+            # Fail closed without committing the change. The late write still
+            # replaces the file atomically, and later writes wait for it. A late
+            # claim records a topic that was never published (an over-claim); a
+            # late clear drops a topic whose tombstone was already published.
+            state.stalled_write = write
+            write.add_done_callback(functools.partial(_settle_stalled_write, state))
+            if cancellation is not None:
+                raise cancellation
+            raise RetainedLedgerError(
+                f"retained ledger persistence exceeded {PERSIST_DEADLINE_S:g} s"
+            )
         try:
             write.result()
         except OSError as error:
             if cancellation is not None:
                 raise cancellation from error
             raise RetainedLedgerError("could not persist retained ledger") from error
-        self._state.topics = topics
+        state.topics = topics
         if cancellation is not None:
             raise cancellation
 
     def _require_loaded(self) -> None:
         if not self._loaded or not self._state.loaded:
             raise RetainedLedgerError("retained ledger must be loaded before use")
+
+
+def _settle_stalled_write(state: _PathState, write: asyncio.Task[None]) -> None:
+    # This callback also keeps the path state alive until the write settles,
+    # so a replacement ledger for the path still sees the stalled write.
+    if state.stalled_write is write:
+        state.stalled_write = None
+    if not write.cancelled():
+        write.exception()
 
 
 def _normalize_path(path: Path) -> Path:

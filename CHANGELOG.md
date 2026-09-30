@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A stalled retained-ledger write now fails closed after 10 seconds, matching
+  the MQTT acknowledgement bound. It no longer holds up state for loads the
+  panel already owns, and it no longer delays session shutdown. A late write
+  cannot race a later claim or corrupt the ledger file.
+  ([#176](https://github.com/joyfulhouse/brilliant-mqtt/issues/176))
+- A ledger failure during a wired light or switch state publish now reports
+  the `retained_ledger` degraded status on the next session tick instead of
+  after the next periodic resync.
+  ([#177](https://github.com/joyfulhouse/brilliant-mqtt/issues/177))
+
 ## [0.11.1] - 2026-09-27
 
 The on-panel agent and Home Assistant integration both move to 0.11.1. The
