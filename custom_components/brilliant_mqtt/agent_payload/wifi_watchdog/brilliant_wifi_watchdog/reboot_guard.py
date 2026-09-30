@@ -66,6 +66,8 @@ class RebootGuard:
 
     def can_reboot(self, now: float) -> bool:
         loaded = self._load()
+        if loaded is not None and any(t > now for t in loaded):
+            loaded = None  # a future stamp would block reboots forever
         if loaded is None:
             # Lost history must not authorize a reboot: fail closed for one
             # cooldown from the first bad read, then fall back to empty history.
@@ -90,7 +92,7 @@ class RebootGuard:
         return self.can_reboot(now)
 
     def record(self, now: float) -> None:
-        stamps = [t for t in self._load() or [] if now - t <= self._p.window]
+        stamps = [t for t in self._load() or [] if 0 <= now - t <= self._p.window]
         stamps.append(now)
         self._save(stamps)
 

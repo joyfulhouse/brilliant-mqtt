@@ -119,6 +119,22 @@ def test_malformed_stamps_fail_closed_then_recover(tmp_path: Path, raw: str) -> 
     assert guard.can_request(now + P.cooldown) is True  # never wedged
 
 
+NOW = 1_790_000_000.0
+
+
+@pytest.mark.parametrize("stamp", [1e18, NOW + 10 * P.window], ids=["1e18", "now+10w"])
+def test_future_stamp_fails_closed_then_recovers(tmp_path: Path, stamp: float) -> None:
+    state = tmp_path / "state"
+    state.write_text(json.dumps([stamp]), encoding="utf-8")
+    guard = RebootGuard(str(state), P)
+    assert guard.can_request(NOW) is False
+    after = NOW + P.cooldown
+    assert guard.can_request(after) is True  # never wedged by a future stamp
+    guard.record_request(after)  # prunes the future stamp
+    assert guard.can_request(after + 1.0) is False  # normal cooldown
+    assert guard.can_request(after + P.cooldown) is True
+
+
 def test_fail_closed_period_restarts_if_clock_steps_back(tmp_path: Path) -> None:
     guard = RebootGuard(str(_bad_state(tmp_path, "corrupt")), P)
     assert guard.can_request(1_000_000.0) is False
