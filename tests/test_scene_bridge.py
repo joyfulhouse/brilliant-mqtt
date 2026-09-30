@@ -1859,7 +1859,7 @@ async def test_record_after_failed_seed_write_is_delivered_once_persisted(
         await bus.emit(_execution("all_off", 600))
         await _wait_for_publish(mqtt, scene_event_topic(_PANEL))
         assert persisted and persisted[0] == 600
-        await asyncio.sleep(0.01)
+        await _wait_for_idle(bridge)
         events = [_payload(item) for item in _published(mqtt, scene_event_topic(_PANEL))]
         assert [event["executed_at_ms"] for event in events] == [600]
     finally:
