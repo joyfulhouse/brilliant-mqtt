@@ -99,7 +99,16 @@ def test_bad_state_recovers_after_fail_closed_period(tmp_path: Path, state_kind:
 
 
 @pytest.mark.parametrize(
-    "raw", ["[NaN]", "[true]", "[Infinity]", '["1e309"]', '["100"]', "[1" + "0" * 400 + "]"]
+    "raw",
+    [
+        "[NaN]",
+        "[true]",
+        "[Infinity]",
+        '["1e309"]',
+        '["100"]',
+        "[1" + "0" * 400 + "]",
+        pytest.param("[" * 100000, id="deep-nesting"),
+    ],
 )
 def test_malformed_stamps_fail_closed_then_recover(tmp_path: Path, raw: str) -> None:
     state = tmp_path / "state"

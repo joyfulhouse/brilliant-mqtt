@@ -47,7 +47,7 @@ class RebootGuard:
                 data = json.load(f)
         except FileNotFoundError:
             return []
-        except (OSError, ValueError):
+        except (OSError, ValueError, RecursionError):
             return None
         if not isinstance(data, list) or not all(_is_stamp(x) for x in data):
             return None
