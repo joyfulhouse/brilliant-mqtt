@@ -28,7 +28,7 @@ def test_root_installs_exact_mqtt_versions() -> None:
     assert version("paho-mqtt") == "2.1.0"
 
 
-def test_every_runtime_declares_only_exact_mqtt_requirements() -> None:
+def test_every_runtime_declares_one_mqtt_stack() -> None:
     root_project: dict[str, Any] = tomli.loads((ROOT / "pyproject.toml").read_text())
     ha_project: dict[str, Any] = tomli.loads((ROOT / "ha/pyproject.toml").read_text())
     manifest = cast(
