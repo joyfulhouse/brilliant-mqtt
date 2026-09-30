@@ -77,6 +77,10 @@ class _PathState:
     # Callers waiting on the lock, per topic, so a later publish of the same
     # topic never overtakes an earlier one through the pending-claim fast path.
     queued: dict[str, int] = field(default_factory=dict)
+    # Lock-free publishes still in flight, per topic: a count and a future
+    # resolved when it returns to zero. A clear waits on that future so no
+    # retained value can land after its tombstone.
+    in_flight: dict[str, tuple[int, asyncio.Future[None]]] = field(default_factory=dict)
     # A write that outlived PERSIST_DEADLINE_S. Its thread cannot be stopped,
     # so no other write for this path may start until it finishes.
     stalled_write: asyncio.Future[None] | None = None
@@ -173,7 +177,21 @@ class RetainedTopicLedger:
             # acknowledged, so publishing it now cannot outrun its ownership
             # record. An earlier caller queued for the same topic keeps order.
             self._require_loaded()
-            await mqtt.publish(topic, payload, retain=True, qos=0)
+            if topic in state.in_flight:
+                count, idle = state.in_flight[topic]
+            else:
+                count, idle = 0, asyncio.get_running_loop().create_future()
+            state.in_flight[topic] = (count + 1, idle)
+            try:
+                await mqtt.publish(topic, payload, retain=True, qos=0)
+            finally:
+                # Synchronous, so a cancelled publisher still releases a clear.
+                count, idle = state.in_flight[topic]
+                if count == 1:
+                    del state.in_flight[topic]
+                    idle.set_result(None)
+                else:
+                    state.in_flight[topic] = (count - 1, idle)
             return
         state.queued[topic] = state.queued.get(topic, 0) + 1
         try:
@@ -236,6 +254,10 @@ class RetainedTopicLedger:
         # A cleared topic must not reach the broker again through the lock-free
         # path until a manifest that owns it is acknowledged afresh.
         self._acknowledged_topics = self._acknowledged_topics - {topic}
+        # Holding the lock means no claim is pending, so no new lock-free
+        # publish can start; wait out those already in flight first.
+        while topic in self._state.in_flight:
+            await asyncio.shield(self._state.in_flight[topic][1])
         await mqtt.publish(topic, "", retain=True, qos=1)
         self._manifest_acknowledged = False
         smaller = self._state.topics - {topic}

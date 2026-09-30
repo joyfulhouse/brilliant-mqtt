@@ -1304,3 +1304,148 @@ async def test_first_ledger_failure_is_the_one_reported(
     assert first.value is not second.value
     assert ledger.consume_failure() is first.value
     assert ledger.consume_failure() is None
+
+
+class _SuspendedDeliveryMqtt(FakeMqtt):
+    """Suspend one matching publish before delivery until released."""
+
+    def __init__(self, topic: str, payload: str) -> None:
+        super().__init__()
+        self._match = (topic, payload)
+        self.suspended = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def publish(self, topic: str, payload: str, retain: bool = False, qos: int = 0) -> None:
+        if (topic, payload) == self._match and not self.suspended.is_set():
+            self.suspended.set()
+            await self.release.wait()
+        await super().publish(topic, payload, retain, qos)
+
+
+@pytest.mark.parametrize("clearer", ["same", "second"])
+async def test_clear_waits_for_an_in_flight_fast_path_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    clearer: str,
+) -> None:
+    """F176-O-1: a fast-path publish in flight cannot outlive a clear of its topic."""
+    path = tmp_path / "owned-topics.json"
+    owned = "brilliant/kitchen/light-1/state"
+    claimed = "brilliant/kitchen/light-2/state"
+    mqtt = _SuspendedDeliveryMqtt(owned, "OFF")
+    publisher = await _loaded_ledger(path)
+    await publisher.async_publish(mqtt, owned, "ON")
+    other = publisher if clearer == "same" else await _loaded_ledger(path)
+    writes = _HeldWrites(monkeypatch, hold=lambda payload: claimed in payload)
+    claim = asyncio.create_task(other.async_publish(mqtt, claimed, "ON"))
+    off: asyncio.Task[None] | None = None
+    clear: asyncio.Task[None] | None = None
+    try:
+        await asyncio.wait_for(writes.started.wait(), 5)
+        off = asyncio.create_task(publisher.async_publish(mqtt, owned, "OFF"))
+        await asyncio.wait_for(mqtt.suspended.wait(), 5)
+        await writes.drain()
+        await asyncio.wait_for(claim, 5)
+        clear = asyncio.create_task(other.async_clear(mqtt, owned))
+        for _ in range(20):
+            await asyncio.sleep(0)
+        mqtt.release.set()
+        await asyncio.wait_for(asyncio.gather(off, clear), 5)
+    finally:
+        mqtt.release.set()
+        await writes.drain()
+        await asyncio.gather(
+            claim, *(task for task in (off, clear) if task is not None), return_exceptions=True
+        )
+
+    deliveries = [payload for topic, payload, _retain in mqtt.published if topic == owned]
+    assert deliveries == ["ON", "OFF", ""]
+    assert owned not in publisher.topics
+    assert path.read_text(encoding="utf-8") == _manifest([claimed])
+
+
+async def test_cancelled_fast_path_publish_releases_a_waiting_clear(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F176-O-1: a clear waiting on an in-flight publish is not stranded by its cancellation."""
+    path = tmp_path / "owned-topics.json"
+    owned = "brilliant/kitchen/light-1/state"
+    claimed = "brilliant/kitchen/light-2/state"
+    mqtt = _SuspendedDeliveryMqtt(owned, "OFF")
+    ledger = await _loaded_ledger(path)
+    await ledger.async_publish(mqtt, owned, "ON")
+    writes = _HeldWrites(monkeypatch, hold=lambda payload: claimed in payload)
+    claim = asyncio.create_task(ledger.async_publish(mqtt, claimed, "ON"))
+    off = asyncio.create_task(ledger.async_publish(mqtt, owned, "OFF"))
+    clear: asyncio.Task[None] | None = None
+    try:
+        await asyncio.wait_for(writes.started.wait(), 5)
+        await asyncio.wait_for(mqtt.suspended.wait(), 5)
+        await writes.drain()
+        await asyncio.wait_for(claim, 5)
+        clear = asyncio.create_task(ledger.async_clear(mqtt, owned))
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert not clear.done()
+        off.cancel()
+        await asyncio.wait_for(clear, 5)
+    finally:
+        mqtt.release.set()
+        await writes.drain()
+        await asyncio.gather(
+            claim, off, *(() if clear is None else (clear,)), return_exceptions=True
+        )
+
+    assert off.cancelled()
+    assert ledger._state.in_flight == {}
+    assert [payload for topic, payload, _ in mqtt.published if topic == owned] == ["ON", ""]
+    assert path.read_text(encoding="utf-8") == _manifest([claimed])
+
+
+async def test_stale_ledger_blocks_the_fast_path_during_the_repair_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F176-A-1: while a repair write is held, no acknowledged topic takes the fast path.
+
+    The second ledger's topic was dropped from disk by the first ledger's
+    late clear, so publishing it before the repair lands would retain a
+    value the file does not own.
+    """
+    path = tmp_path / "owned-topics.json"
+    first = await _loaded_ledger(path)
+    mqtt = FakeMqtt()
+    removed = "brilliant/kitchen/light-1/state"
+    kept = "brilliant/kitchen/light-2/state"
+    await first.async_publish(mqtt, removed, "on")
+    await first.async_publish(mqtt, kept, "on")
+    second = await _loaded_ledger(path)
+    await second.async_publish(mqtt, removed, "on")
+    assert removed in second._acknowledged_topics
+
+    monkeypatch.setattr(retained_topics_module, "PERSIST_DEADLINE_S", 0.05)
+    stall = _HeldWrites(monkeypatch, hold=lambda payload: removed not in payload)
+    with pytest.raises(RetainedLedgerError, match="exceeded"):
+        await asyncio.wait_for(first.async_clear(mqtt, removed), 5)
+    await stall.drain()
+    await _settled(first)
+    assert path.read_text(encoding="utf-8") == _manifest([kept])
+    monkeypatch.setattr(retained_topics_module, "PERSIST_DEADLINE_S", 10.0)
+
+    repair = _HeldWrites(monkeypatch, hold=lambda _payload: True)
+    mqtt.published.clear()
+    repairing = asyncio.create_task(first.async_publish(mqtt, kept, "off"))
+    early = asyncio.create_task(second.async_publish(mqtt, removed, "again"))
+    try:
+        await asyncio.wait_for(repair.started.wait(), 5)
+        state = first._state
+        assert state.claim_pending
+        assert state.disk_stale
+        await asyncio.sleep(0.01)
+        assert mqtt.published == []
+    finally:
+        await repair.drain()
+        await asyncio.gather(repairing, early)
+    assert path.read_text(encoding="utf-8") == _manifest([removed, kept])
+    assert mqtt.published[-1] == (removed, "again", True)
