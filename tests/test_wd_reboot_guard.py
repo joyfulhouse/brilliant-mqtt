@@ -49,6 +49,7 @@ def test_persists_across_instances(tmp_path: Path) -> None:
 
 
 def test_missing_state_allows_reboot(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.ERROR, logger="brilliant_wifi_watchdog.reboot_guard")
     guard = RebootGuard(str(tmp_path / "absent.json"), P)
     assert guard.can_request(100.0) is True
     assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
@@ -95,6 +96,18 @@ def test_bad_state_recovers_after_fail_closed_period(tmp_path: Path, state_kind:
         guard.record_request(after)  # a reboot rewrites valid state
         assert guard.can_request(after + 1.0) is False  # normal cooldown
         assert guard.can_request(after + P.cooldown) is True
+
+
+@pytest.mark.parametrize(
+    "raw", ["[NaN]", "[true]", "[Infinity]", '["1e309"]', '["100"]', "[1" + "0" * 400 + "]"]
+)
+def test_malformed_stamps_fail_closed_then_recover(tmp_path: Path, raw: str) -> None:
+    state = tmp_path / "state"
+    state.write_text(raw, encoding="utf-8")
+    guard = RebootGuard(str(state), P)
+    now = 1_790_000_000.0  # realistic wall clock: small coerced stamps age out
+    assert guard.can_request(now) is False  # not trusted as history
+    assert guard.can_request(now + P.cooldown) is True  # never wedged
 
 
 def test_fail_closed_period_restarts_if_clock_steps_back(tmp_path: Path) -> None:

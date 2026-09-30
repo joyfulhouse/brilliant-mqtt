@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from dataclasses import dataclass
 
@@ -17,7 +18,23 @@ class GuardPolicy:
     window: float = 21600.0
 
 
+def _is_stamp(x: object) -> bool:
+    if not isinstance(x, (int, float)) or isinstance(x, bool):
+        return False
+    try:
+        return math.isfinite(x)
+    except OverflowError:  # a huge JSON integer
+        return False
+
+
 class RebootGuard:
+    """Persistent reboot cooldown + rolling cap.
+
+    Present-but-bad state blocks reboots for one cooldown. That window is held
+    in memory, so a watchdog restart re-arms it, and a restart loop faster than
+    one cooldown keeps reboots blocked (the deliberate fail-closed direction).
+    """
+
     def __init__(self, path: str, policy: GuardPolicy) -> None:
         self._path = path
         self._p = policy
@@ -28,13 +45,13 @@ class RebootGuard:
         try:
             with open(self._path, encoding="utf-8") as f:
                 data = json.load(f)
-            if not isinstance(data, list):
-                return None
-            return [float(x) for x in data]
         except FileNotFoundError:
             return []
-        except (OSError, ValueError, TypeError):
+        except (OSError, ValueError):
             return None
+        if not isinstance(data, list) or not all(_is_stamp(x) for x in data):
+            return None
+        return [float(x) for x in data]
 
     def _save(self, stamps: list[float]) -> None:
         tmp = f"{self._path}.tmp"

@@ -13,7 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reboot-guard state file as an empty history. It blocks reboots for one
   cooldown period, logs the lost history once at ERROR, then resumes under the
   normal cooldown and cap. A missing state file still counts as a fresh install
-  ([#140](https://github.com/joyfulhouse/brilliant-mqtt/issues/140)).
+  ([#140](https://github.com/joyfulhouse/brilliant-mqtt/issues/140)). The
+  fail-closed window is held in memory, so a watchdog restart re-arms it, and a
+  restart loop faster than one cooldown keeps reboots blocked; this is the
+  deliberate fail-closed direction.
 
 ## [0.11.1] - 2026-09-27
 
