@@ -91,12 +91,11 @@ async def test_every_caller_refuses_before_ca_or_config_writes(
 
 
 @pytest.mark.parametrize("writer", ["deploy", "config", "wifi", "bus", "wifi_unit", "bus_unit"])
-async def test_shared_writers_cannot_bypass_admission(
-    payload_dir: Path, writer: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
+async def test_shared_writers_cannot_bypass_admission(payload_dir: Path, writer: str) -> None:
+    # payload_dir already patches panel_ops._identity_payload_dir. A second monkeypatch
+    # of it would outlive that patch and leak a stale mock into later tests.
     shell = IdentityShell(_identity())
     await shell.connect()
-    monkeypatch.setattr(panel_ops, "_identity_payload_dir", lambda: payload_dir, raising=False)
     with pytest.raises(panel_ops.PanelOpError, match="release_identity_blocked"):
         if writer == "deploy":
             await panel_ops.deploy_payload(shell, str(payload_dir), "0.2.0")
@@ -205,6 +204,121 @@ async def test_guest_bath_legacy_update_needs_no_override_notification(
     await manager.async_shutdown()
 
 
+def _legacy_bridge_shell(payload_dir: Path) -> IdentityShell:
+    (payload_dir / "VERSION").write_text("0.11.0")
+    (payload_dir / "RELEASE_ORDINAL").write_text("2\n")
+    return IdentityShell(
+        {
+            **_identity(digest="5bab1bd0" + "0" * 56, ordinal=None),
+            "version": "0.10.2",
+            "layout": "legacy_fixed",
+        }
+    )
+
+
+@pytest.mark.parametrize("trigger", ["auto", "button", "service"])
+async def test_repair_never_auto_admits_pre_ordinal_upgrade(
+    hass: HomeAssistant, payload_dir: Path, trigger: str
+) -> None:
+    """Repair runs no canary and keeps no rollback baseline, so legacy code stays put."""
+    shell = _legacy_bridge_shell(payload_dir)
+    before = shell.release_identities["bridge"]
+    _entry, manager = _fleet_panel_manager(hass)
+    manager.availability = "offline"
+    stage = AsyncMock(return_value="MQTT_TLS_ENABLED=0\n")
+    with (
+        patch.object(manager, "_connect_for_repair", AsyncMock(return_value=shell)),
+        patch.object(manager, "_async_stage_broker_ca", stage),
+        patch.object(manager, "_auto_repair_still_warranted", return_value=True),
+    ):
+        await shell.connect()
+        await manager.async_repair(trigger=trigger)
+    assert manager.problem_reason and "release_identity_blocked" in manager.problem_reason
+    assert shell.release_identities["bridge"] == before
+    assert not stage.await_count
+    assert not shell.uploads
+    assert not shell.identity_uploads
+    assert not any("systemctl restart" in command for command in shell.commands)
+    await manager.async_shutdown()
+
+
+@pytest.mark.parametrize("caller", ["component", "registry", "refresh"])
+async def test_uncanaried_writers_never_auto_admit_pre_ordinal_upgrade(
+    hass: HomeAssistant, payload_dir: Path, caller: str
+) -> None:
+    shell = _legacy_bridge_shell(payload_dir)
+    _entry, manager = _fleet_panel_manager(hass)
+    with patch.object(manager, "_shell", return_value=shell):
+        await shell.connect()
+        if caller == "component":
+            with pytest.raises(panel_ops.PanelOpError, match="release_identity_blocked"):
+                await manager.async_install_component(COMPONENT_BRIDGE)
+        elif caller == "registry":
+            with pytest.raises(panel_ops.PanelOpError, match="release_identity_blocked"):
+                await components._bridge_install(hass, shell, _bridge_data(tls_enabled=False))
+        else:
+            await manager._refresh_staged_copies()
+    assert not shell.uploads
+    assert not shell.identity_uploads
+    await manager.async_shutdown()
+
+
+@pytest.mark.parametrize("watchdog_version", ["0.11.0", "unknown"])
+async def test_legacy_bridge_does_not_waive_block_for_unordered_watchdog(
+    payload_dir: Path, watchdog_version: str
+) -> None:
+    shell = _legacy_bridge_shell(payload_dir)
+    shell.release_identities["bus_watchdog"] = {
+        **_identity(digest="6" * 64, ordinal=None),
+        "version": watchdog_version,
+        "layout": "legacy_fixed",
+    }
+    await shell.connect()
+    with pytest.raises(panel_ops.ReleaseIdentityBlocked):
+        async with panel_ops.release_transaction(
+            shell,
+            str(payload_dir),
+            panel="guest-bath",
+            components=("bus_watchdog",),
+            allow_pre_ordinal_upgrade=True,
+        ):
+            pytest.fail("unordered watchdog admitted")
+    assert not shell.identity_uploads
+    assert not shell.uploads
+
+
+async def test_auto_admission_logs_versions_and_ordinals_without_digests(
+    payload_dir: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    shell = _legacy_bridge_shell(payload_dir)
+    candidate = await panel_ops.candidate_identities(str(payload_dir))
+    await shell.connect()
+    with caplog.at_level("INFO", logger=panel_ops.__name__):
+        async with panel_ops.release_transaction(
+            shell, str(payload_dir), panel="guest-bath", allow_pre_ordinal_upgrade=True
+        ):
+            pass
+    records = [record for record in caplog.records if "auto-admitted" in record.getMessage()]
+    assert len(records) == 1
+    assert records[0].levelname == "INFO"
+    message = records[0].getMessage()
+    assert message == (
+        "guest-bath: auto-admitted pre-ordinal release for "
+        "bridge 0.10.2 (ordinal unknown) -> 0.11.0 (ordinal 2)"
+    )
+    assert "5bab1bd0" not in caplog.text
+    assert candidate["bridge"].digest not in caplog.text
+
+
+def test_auto_admission_record_failure_is_an_operator_safe_detail() -> None:
+    from custom_components.brilliant_mqtt.manager import _safe_failure_summary
+
+    error = panel_ops.PanelOpError("release_auto_admission_record_failed: stderr secret")
+    summary = _safe_failure_summary("agent update failed during deployment", error)
+    assert "release_auto_admission_record_failed" in summary
+    assert "secret" not in summary
+
+
 async def test_mixed_legacy_bridge_and_identical_watchdog_only_admits_bridge(
     payload_dir: Path,
 ) -> None:
@@ -226,7 +340,11 @@ async def test_mixed_legacy_bridge_and_identical_watchdog_only_admits_bridge(
     }
     await shell.connect()
     async with panel_ops.release_transaction(
-        shell, str(payload_dir), panel="guest-bath", components=("bus_watchdog",)
+        shell,
+        str(payload_dir),
+        panel="guest-bath",
+        components=("bus_watchdog",),
+        allow_pre_ordinal_upgrade=True,
     ) as admission:
         assert admission.changes == {"bridge": True, "bus_watchdog": False}
     audit = [
@@ -252,6 +370,7 @@ async def test_pre_ordinal_admission_applies_to_each_changed_component(payload_d
         str(payload_dir),
         panel="guest-bath",
         components=("bus_watchdog", "wifi_watchdog"),
+        allow_pre_ordinal_upgrade=True,
     ) as admission:
         assert admission.changes == {
             "bridge": True,

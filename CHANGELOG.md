@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Background auto-repair, the Repair button, and the repair service no longer
+  auto-admit a pre-0.11.0 panel's code. Only the Update entity, `redeploy`, and
+  provisioning, which run the canary and retain a rollback baseline, perform the
+  first pre-ordinal upgrade (#181).
+- Automatic pre-ordinal admission now logs one INFO line per operation, and a
+  failure to write its audit record is reported with an operator-safe detail
+  (#182).
+
 ## [0.11.1] - 2026-09-27
 
 The on-panel agent and Home Assistant integration both move to 0.11.1. The

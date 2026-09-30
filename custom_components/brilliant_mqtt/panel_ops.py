@@ -14,6 +14,7 @@ import binascii
 import hashlib
 import io
 import json
+import logging
 import os
 import re
 import secrets
@@ -80,6 +81,8 @@ from .release_identity import (
 )
 from .setup_protocol import PreflightRequest
 from .shell import PanelProcess, PanelShell, RunResult
+
+_LOGGER = logging.getLogger(__name__)
 
 _STAGING_DIR = f"{PANEL_VAR_DIR}.staging"
 _STAGING_TARBALL = f"{_STAGING_DIR}.tar.gz"
@@ -232,6 +235,14 @@ async def _write_release_record(
     )
 
 
+def _release_label(identity: ReleaseIdentity | None) -> str:
+    """Version and ordinal only: audit logs never carry code digests."""
+    if identity is None:
+        return "none"
+    ordinal = "unknown" if identity.release_ordinal is None else identity.release_ordinal
+    return f"{identity.version} (ordinal {ordinal})"
+
+
 def _identity_binding(
     panel: str,
     incumbent: dict[str, ReleaseIdentity | None],
@@ -253,9 +264,19 @@ async def _admit_release(
     components: tuple[str, ...],
     override: Mapping[str, object] | None,
     transaction: str | None = None,
+    *,
+    allow_pre_ordinal_upgrade: bool = False,
 ) -> ReleaseAdmission:
     candidate = await candidate_identities(local_payload_dir)
-    return await _admit_identities(shell, candidate, panel, components, override, transaction)
+    return await _admit_identities(
+        shell,
+        candidate,
+        panel,
+        components,
+        override,
+        transaction,
+        allow_pre_ordinal_upgrade=allow_pre_ordinal_upgrade,
+    )
 
 
 async def _admit_identities(
@@ -265,6 +286,8 @@ async def _admit_identities(
     components: tuple[str, ...],
     override: Mapping[str, object] | None,
     transaction: str | None = None,
+    *,
+    allow_pre_ordinal_upgrade: bool = False,
 ) -> ReleaseAdmission:
     installed = await _read_release_identities(shell)
     selected = tuple(dict.fromkeys(("bridge", *components)))
@@ -281,9 +304,18 @@ async def _admit_identities(
     binding = _identity_binding(panel, incumbent, candidate, transaction)
     if override is not None and dict(override) != binding:
         raise PanelOpError("release_override_mismatch: inspect the current panel and retry")
+    automatic = [
+        component
+        for component in selected
+        if is_pre_ordinal_upgrade(incumbent[component], candidate[component])
+    ]
     changes: dict[str, bool] = {}
     for component in selected:
         try:
+            # Only callers that run the canary and retain a rollback baseline may
+            # auto-admit a pre-ordinal incumbent; every other writer fails closed.
+            if component in automatic and not allow_pre_ordinal_upgrade:
+                raise ValueError("release_identity_blocked")
             changes[component] = admit_identity(incumbent[component], candidate[component])
         except ValueError:
             if override is None:
@@ -299,11 +331,6 @@ async def _admit_identities(
             exclusive=True,
             error_code="release_override_used_or_write_failed",
         )
-    automatic = [
-        component
-        for component in selected
-        if is_pre_ordinal_upgrade(incumbent[component], candidate[component])
-    ]
     if automatic and override is None:
         await _write_release_record(
             shell,
@@ -315,6 +342,15 @@ async def _admit_identities(
             },
             exclusive=True,
             error_code="release_auto_admission_record_failed",
+        )
+        _LOGGER.info(
+            "%s: auto-admitted pre-ordinal release for %s",
+            panel,
+            ", ".join(
+                f"{component} {_release_label(incumbent[component])} -> "
+                f"{_release_label(candidate[component])}"
+                for component in automatic
+            ),
         )
     return ReleaseAdmission(shell, candidate, incumbent, changes, transaction)
 
@@ -328,8 +364,13 @@ async def release_transaction(
     components: tuple[str, ...] = (),
     override: Mapping[str, object] | None = None,
     transaction_id: UUID | None = None,
+    allow_pre_ordinal_upgrade: bool = False,
 ) -> AsyncIterator[ReleaseAdmission]:
-    """Admit every selected writer before CA/config writes; never retain an override."""
+    """Admit every selected writer before CA/config writes; never retain an override.
+
+    ``allow_pre_ordinal_upgrade`` is only for callers that run the canary and retain
+    a rollback baseline (update, provisioning); repair and install paths fail closed.
+    """
     if _RELEASE_ADMISSION.get() is not None:
         raise PanelOpError("release_transaction_nested")
     admission = await _admit_release(
@@ -339,6 +380,7 @@ async def release_transaction(
         components,
         override,
         transaction_id.hex if transaction_id is not None else None,
+        allow_pre_ordinal_upgrade=allow_pre_ordinal_upgrade,
     )
     token = _RELEASE_ADMISSION.set(admission)
     try:

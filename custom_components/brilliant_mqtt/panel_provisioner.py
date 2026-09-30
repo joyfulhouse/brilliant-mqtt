@@ -688,6 +688,7 @@ class PanelOperations(Protocol):
         components: tuple[str, ...] = (),
         override: Mapping[str, object] | None = None,
         transaction_id: UUID | None = None,
+        allow_pre_ordinal_upgrade: bool = False,
     ) -> AbstractAsyncContextManager[ReleaseAdmission]: ...
 
     async def capture_baseline(
@@ -1162,6 +1163,7 @@ class PanelProvisioner:
             components=request.selected_components,
             override=release_override,
             transaction_id=state.transaction_id,
+            allow_pre_ordinal_upgrade=True,
         ) as admission:
             if admission.noop:
                 raise PanelProvisioningError("release_unchanged")

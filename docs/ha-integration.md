@@ -335,7 +335,11 @@ one release policy. Equal code digests keep the installed code and layout. Diffe
 code requires a strictly greater, known `release_ordinal` on both sides, except for
 the first upgrade from a pre-ordinal release. An incumbent with unknown ordinal
 auto-admits only when its version is a strict `X.Y.Z` below 0.11.0 and the
-candidate has an ordinal and a strict `X.Y.Z` version of 0.11.0 or newer. Equal
+candidate has an ordinal and a strict `X.Y.Z` version of 0.11.0 or newer, and
+only on the Update entity, `redeploy`, and panel provisioning, which run the canary
+and retain a rollback baseline. Repair (automatic, button, or service), bridge
+installation, component installation, and post-OTA refresh never auto-admit; they
+report `release_identity_blocked` for a pre-ordinal panel until it is updated. Equal
 version strings do not establish identity, and digests are never ordered by age.
 Admission happens before the operation stages a CA or changes configuration.
 Same-code configuration repair preserves the live unit, or restores a missing
@@ -346,8 +350,9 @@ ordinal is initially **unknown**, even if their `VERSION` matches the bundle.
 An unparseable, missing, prerelease, or 0.11.0-or-newer incumbent version with
 unknown ordinal requires explicit approval for a change to different code.
 Automatic pre-ordinal admission writes a private metadata-only
-`auto-admit-<transaction>.json` record before deployment. It does not change
-baseline retention or the canary rollback process.
+`auto-admit-<transaction>.json` record before deployment and logs one INFO line
+with the panel, components, versions, and ordinals (never digests). It does not
+change baseline retention or the canary rollback process.
 On-panel records live under `/var/brilliant-mqtt/.release-identities/` (directory
 0700, records 0600), with one identity for each independently selectable bridge or
 watchdog. Records contain version, ordinal, digest, deployment ID, and layout;
