@@ -696,6 +696,19 @@ class _HeldWrites:
             await self.finished.wait()
 
 
+async def _settled(ledger: RetainedTopicLedger) -> None:
+    """Wait until a late write's completion has reached the event loop.
+
+    The thread finishing is not enough: its future settles through a later
+    call_soon_threadsafe, and only its done-callback forgets the stalled write.
+    """
+    stalled = ledger._state.stalled_write
+    if stalled is not None:
+        await asyncio.wait({stalled}, timeout=5)
+        await asyncio.sleep(0)  # Done-callbacks run one loop iteration later.
+    assert ledger._state.stalled_write is None
+
+
 def test_persist_deadline_matches_the_mqtt_acknowledgement_bound() -> None:
     assert retained_topics_module.PERSIST_DEADLINE_S == 10.0
 
@@ -740,7 +753,8 @@ async def test_stalled_claim_fails_closed_at_the_deadline_without_publishing(
 
     # The late write replaced the file atomically with the uncommitted claim.
     assert path.read_text(encoding="utf-8") == _manifest([existing, stalled])
-    await asyncio.sleep(0)
+    await _settled(ledger)
+    monkeypatch.setattr(retained_topics_module, "PERSIST_DEADLINE_S", 10.0)
     # The next publish re-persists memory before anything reaches the broker.
     await ledger.async_publish(mqtt, existing, "off")
     assert path.read_text(encoding="utf-8") == _manifest([existing])
@@ -906,7 +920,8 @@ async def test_stalled_clear_cannot_orphan_a_republished_topic(
 
     # The late clear has landed on disk without the topic.
     assert path.read_text(encoding="utf-8") == _manifest([kept])
-    await asyncio.sleep(0)
+    await _settled(ledger)
+    monkeypatch.setattr(retained_topics_module, "PERSIST_DEADLINE_S", 10.0)
     await ledger.async_publish(mqtt, removed, "again")
 
     assert (removed, "again", True) in mqtt.published
@@ -1003,7 +1018,7 @@ async def test_stale_ledger_topic_waits_for_the_repair_write(
     with pytest.raises(RetainedLedgerError, match="exceeded"):
         await asyncio.wait_for(ledger.async_clear(mqtt, removed), 2)
     await stall.drain()
-    await asyncio.sleep(0)
+    await _settled(ledger)
     assert path.read_text(encoding="utf-8") == _manifest([kept])
 
     monkeypatch.setattr(retained_topics_module, "PERSIST_DEADLINE_S", 10.0)
@@ -1055,3 +1070,27 @@ async def test_write_thread_start_failure_fails_closed(
     assert mqtt.published == []
     assert isinstance(ledger.consume_failure(), RetainedLedgerError)
     assert path.read_text(encoding="utf-8") == _manifest([existing])
+
+
+async def test_load_refuses_while_another_ledgers_write_is_stalled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F176-D-1: a second ledger for the path cannot load under a late write."""
+    path = tmp_path / "owned-topics.json"
+    first = await _loaded_ledger(path)
+    topic = "brilliant/kitchen/light-1/state"
+    monkeypatch.setattr(retained_topics_module, "PERSIST_DEADLINE_S", 0.05)
+    writes = _HeldWrites(monkeypatch, hold=lambda _payload: True)
+    second = RetainedTopicLedger(PANEL, path)
+    try:
+        with pytest.raises(RetainedLedgerError, match="exceeded"):
+            await asyncio.wait_for(first.async_publish(FakeMqtt(), topic, "on"), 2)
+        with pytest.raises(RetainedLedgerError, match="still stalled"):
+            await second.async_load()
+    finally:
+        await writes.drain()
+
+    await _settled(first)
+    await second.async_load()
+    assert second.topics == frozenset({topic})
