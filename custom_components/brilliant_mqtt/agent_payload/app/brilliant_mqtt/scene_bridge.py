@@ -176,6 +176,10 @@ class SceneBridge:
         self._results: OrderedDict[StateKey, _StoredResult] = OrderedDict()
         self._pending_records: dict[StateKey, _StoredPending] = {}
         self._state_trusted = True
+        # #112: set under the lock when an untrusted-state seed snapshot is
+        # captured, so the next record is classified against the in-memory
+        # seed rather than against whether the threaded seed write has landed.
+        self._seed_captured = False
         self._state_reason: str | None = None
         self._delivery_task: asyncio.Task[None] | None = None
         self._status: dict[str, tuple[bool, str | None]] = {}
@@ -241,6 +245,7 @@ class SceneBridge:
                     return
                 self._state_trusted = loaded.trusted
                 self._state_reason = loaded.reason
+                self._seed_captured = False
                 self._install_loaded_state(loaded.state)
                 self._state_version = 0
                 self._persisted_version = 0
@@ -443,6 +448,7 @@ class SceneBridge:
             logger.exception("scene bridge state persistence failed")
             async with self._lock:
                 self._state_trusted = False
+                self._seed_captured = False
                 self._state_reason = "state_untrusted"
             return False
         async with self._lock:
@@ -707,7 +713,7 @@ class SceneBridge:
         async with self._lock:
             if epoch != self._epoch or self._stopping:
                 return
-            seed_only = not self._state_trusted
+            seed_only = not self._state_trusted and not self._seed_captured
             self._scene_execution_healthy = not scene_malformed
             self._mode_execution_healthy = not mode_malformed
             changed = False
@@ -731,6 +737,8 @@ class SceneBridge:
                 (seed_only or not emit_events) and not scene_malformed and not mode_malformed
             ):
                 snapshot = self._capture_state()
+                if seed_only:
+                    self._seed_captured = True
         persisted = True
         if snapshot is not None:
             persisted = await self._async_persist_state(*snapshot, epoch)

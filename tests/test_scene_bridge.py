@@ -1762,9 +1762,49 @@ async def test_corrupt_state_without_snapshot_suppresses_first_observed_record(
     await asyncio.sleep(0)
     assert _published(mqtt, scene_event_topic(_PANEL)) == []
     await bus.emit(_execution("all_off", 600))
-    await asyncio.sleep(0)
+    # Delivery follows the threaded state write, which can outlast the bus
+    # callback's bounded drain (#112); wait for it rather than one loop turn.
+    await _wait_for_publish(mqtt, scene_event_topic(_PANEL))
     assert len(_published(mqtt, scene_event_topic(_PANEL))) == 1
     await bridge.async_shutdown()
+
+
+async def test_record_during_inflight_seed_write_is_not_suppressed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #112: trust is restored only when the seed write lands, and the bus
+    # callback stops waiting after _SHUTDOWN_DRAIN_SECONDS. A record that
+    # arrives while the seed write is still in the executor must not be
+    # classified as a second seed.
+    seed_write_started = threading.Event()
+    release_seed_write = threading.Event()
+    real_write = scene_state.atomic_write_state
+
+    def gated_write(path: Path, state: scene_state.SceneState) -> None:
+        watermark = dict(state.watermarks).get((_PANEL, "all_off"))
+        if watermark is not None and watermark.executed_at_ms == 500:
+            seed_write_started.set()
+            assert release_seed_write.wait(timeout=2)
+        real_write(path, state)
+
+    monkeypatch.setattr(scene_bridge_module, "atomic_write_state", gated_write)
+    path = tmp_path / "state.json"
+    path.write_text("{not json")
+    bus = FakeBus([], scoped_devices=[_scene_catalog("all_off"), _mode_catalog("away")])
+    mqtt = FakeMqtt()
+    bridge = SceneBridge(bus, mqtt, _PANEL, path, FakeClockMs(_NOW_MS))
+    await bridge.async_start()
+    try:
+        await bus.emit(_execution("all_off", 500))
+        assert seed_write_started.wait(timeout=1)
+        await bus.emit(_execution("all_off", 600))
+        release_seed_write.set()
+        await _wait_for_publish(mqtt, scene_event_topic(_PANEL))
+        events = [_payload(item) for item in _published(mqtt, scene_event_topic(_PANEL))]
+        assert [event["executed_at_ms"] for event in events] == [600]
+    finally:
+        release_seed_write.set()
+        await bridge.async_shutdown()
 
 
 async def test_persistence_failure_refuses_commands_and_degrades_status(

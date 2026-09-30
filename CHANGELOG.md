@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- After the scene state file is found corrupt, only the first scene or mode
+  record the agent observes is treated as history and suppressed. Previously a
+  second record that arrived while the first one was still being written to
+  disk was also suppressed, so a real scene execution could go unreported
+  (#112).
+
 ## [0.11.1] - 2026-09-27
 
 The on-panel agent and Home Assistant integration both move to 0.11.1. The
