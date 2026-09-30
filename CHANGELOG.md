@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The manifest uses minimum-version specs for `asyncssh` and `paho-mqtt`, so
+  hassfest accepts them and the integration still installs on HA 2026.6.x.
 - After the scene state file is found corrupt, only the first scene or mode
   record the agent observes is treated as history and suppressed. Previously a
   second record that arrived while the first one was still being written to
