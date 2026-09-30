@@ -321,7 +321,10 @@ def _start_write(path: Path, payload: str) -> asyncio.Future[None]:
         except RuntimeError:
             pass  # The loop closed while the write stalled; nobody awaits it.
 
-    threading.Thread(target=run, name="retained-ledger-write", daemon=True).start()
+    try:
+        threading.Thread(target=run, name="retained-ledger-write", daemon=True).start()
+    except RuntimeError as error:
+        raise RetainedLedgerError("could not start retained ledger write") from error
     return done
 
 

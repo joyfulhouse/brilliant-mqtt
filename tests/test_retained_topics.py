@@ -1020,3 +1020,38 @@ async def test_stale_ledger_topic_waits_for_the_repair_write(
         await asyncio.gather(repairing, early)
     assert path.read_text(encoding="utf-8") == _manifest([removed, kept])
     assert mqtt.published[-1] == (removed, "again", True)
+
+
+async def test_write_thread_start_failure_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F176-C-6: thread exhaustion reaches the retained_ledger fail-closed path."""
+    path = tmp_path / "owned-topics.json"
+    ledger = await _loaded_ledger(path)
+    mqtt = FakeMqtt()
+    existing = "brilliant/kitchen/light-1/state"
+    await ledger.async_publish(mqtt, existing, "on")
+    mqtt.published.clear()
+
+    real_start = threading.Thread.start
+
+    def refuse_start(self: threading.Thread) -> None:
+        # Only the ledger's writer; the event loop's own teardown still starts.
+        if self.name == "retained-ledger-write":
+            raise RuntimeError("can't start new thread")
+        real_start(self)
+
+    monkeypatch.setattr(threading.Thread, "start", refuse_start)
+
+    with pytest.raises(RetainedLedgerError, match="could not start"):
+        await ledger.async_publish(mqtt, "brilliant/kitchen/light-2/state", "on")
+
+    state = retained_topics_module._path_state(ledger._path, PANEL)
+    assert not state.claim_pending
+    assert state.stalled_write is None
+    assert not state.disk_stale
+    assert ledger.topics == frozenset({existing})
+    assert mqtt.published == []
+    assert isinstance(ledger.consume_failure(), RetainedLedgerError)
+    assert path.read_text(encoding="utf-8") == _manifest([existing])
