@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The manifest uses minimum-version specs for `asyncssh` and `paho-mqtt`, so
+  hassfest accepts them and the integration still installs on HA 2026.6.x.
 - The Wi-Fi watchdog no longer treats a corrupt, unreadable or wrong-type
   reboot-guard state file as an empty history. It blocks reboots for one
   cooldown period, logs the lost history once at ERROR, then resumes under the
