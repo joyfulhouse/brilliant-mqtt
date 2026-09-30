@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The Wi-Fi watchdog no longer treats a corrupt, unreadable or wrong-type
+  reboot-guard state file as an empty history. It blocks reboots for one
+  cooldown period, logs the lost history once at ERROR, then resumes under the
+  normal cooldown and cap. A missing state file still counts as a fresh install
+  ([#140](https://github.com/joyfulhouse/brilliant-mqtt/issues/140)).
+
 ## [0.11.1] - 2026-09-27
 
 The on-panel agent and Home Assistant integration both move to 0.11.1. The

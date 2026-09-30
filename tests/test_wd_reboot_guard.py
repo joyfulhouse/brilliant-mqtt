@@ -1,3 +1,5 @@
+import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -46,17 +48,57 @@ def test_persists_across_instances(tmp_path: Path) -> None:
     assert RebootGuard(path, P).can_reboot(1800.0) is False
 
 
-@pytest.mark.parametrize("state_kind", ["unreadable", "corrupt"])
-def test_decisions_tolerate_unreadable_or_corrupt_state(tmp_path: Path, state_kind: str) -> None:
+def test_missing_state_allows_reboot(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    guard = RebootGuard(str(tmp_path / "absent.json"), P)
+    assert guard.can_request(100.0) is True
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+def _bad_state(tmp_path: Path, state_kind: str) -> Path:
     state = tmp_path / "state"
     if state_kind == "unreadable":
-        state.mkdir()
-    else:
+        state.mkdir()  # present, but open() raises IsADirectoryError
+    elif state_kind == "corrupt":
         state.write_text("not JSON", encoding="utf-8")
-    guard = RebootGuard(str(state), P)
+    elif state_kind == "wrong_type":
+        state.write_text(json.dumps({"stamps": [1.0]}), encoding="utf-8")
+    else:  # wrong_shape: a list whose items are not timestamps
+        state.write_text(json.dumps([["x"]]), encoding="utf-8")
+    return state
 
-    try:
-        assert guard.can_reboot(100.0) is True
-        assert guard.can_request(100.0) is True
-    except OSError as exc:
-        pytest.fail(f"guard decision raised on {state_kind} state: {exc}")
+
+BAD_KINDS = ["unreadable", "corrupt", "wrong_type", "wrong_shape"]
+
+
+@pytest.mark.parametrize("state_kind", BAD_KINDS)
+def test_bad_state_fails_closed_for_one_cooldown(
+    tmp_path: Path, state_kind: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    guard = RebootGuard(str(_bad_state(tmp_path, state_kind)), P)
+    caplog.set_level(logging.ERROR, logger="brilliant_wifi_watchdog.reboot_guard")
+
+    assert guard.can_request(100.0) is False
+    assert guard.can_reboot(100.0 + P.cooldown - 1.0) is False
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1  # logged once, on first observation
+
+
+@pytest.mark.parametrize("state_kind", BAD_KINDS)
+def test_bad_state_recovers_after_fail_closed_period(tmp_path: Path, state_kind: str) -> None:
+    state = _bad_state(tmp_path, state_kind)
+    guard = RebootGuard(str(state), P)
+    assert guard.can_request(100.0) is False
+
+    after = 100.0 + P.cooldown
+    assert guard.can_request(after) is True  # bounded: never wedged
+    if state_kind != "unreadable":
+        guard.record_request(after)  # a reboot rewrites valid state
+        assert guard.can_request(after + 1.0) is False  # normal cooldown
+        assert guard.can_request(after + P.cooldown) is True
+
+
+def test_fail_closed_period_restarts_if_clock_steps_back(tmp_path: Path) -> None:
+    guard = RebootGuard(str(_bad_state(tmp_path, "corrupt")), P)
+    assert guard.can_request(1_000_000.0) is False
+    assert guard.can_request(100.0) is False
+    assert guard.can_request(100.0 + P.cooldown) is True

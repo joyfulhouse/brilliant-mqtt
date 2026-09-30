@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import dataclass
+
+_LOG = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -18,14 +21,20 @@ class RebootGuard:
     def __init__(self, path: str, policy: GuardPolicy) -> None:
         self._path = path
         self._p = policy
+        self._bad_since: float | None = None
 
-    def _load(self) -> list[float]:
+    def _load(self) -> list[float] | None:
+        """Return the stamp history: [] when missing, None when present but bad."""
         try:
             with open(self._path, encoding="utf-8") as f:
                 data = json.load(f)
-            return [float(x) for x in data] if isinstance(data, list) else []
-        except (OSError, ValueError, TypeError):
+            if not isinstance(data, list):
+                return None
+            return [float(x) for x in data]
+        except FileNotFoundError:
             return []
+        except (OSError, ValueError, TypeError):
+            return None
 
     def _save(self, stamps: list[float]) -> None:
         tmp = f"{self._path}.tmp"
@@ -39,14 +48,32 @@ class RebootGuard:
         return len(stamps) < self._p.cap
 
     def can_reboot(self, now: float) -> bool:
-        stamps = [t for t in self._load() if now - t <= self._p.window]
+        loaded = self._load()
+        if loaded is None:
+            # Lost history must not authorize a reboot: fail closed for one
+            # cooldown from the first bad read, then fall back to empty history.
+            if self._bad_since is None:
+                self._bad_since = now
+                _LOG.error(
+                    "reboot guard state %s is unreadable or invalid; blocking reboots for %.0fs",
+                    self._path,
+                    self._p.cooldown,
+                )
+            elif now < self._bad_since:
+                self._bad_since = now  # wall clock stepped back: stay bounded
+            if now - self._bad_since < self._p.cooldown:
+                return False
+            loaded = []
+        else:
+            self._bad_since = None
+        stamps = [t for t in loaded if now - t <= self._p.window]
         return self._history_allows(stamps, now)
 
     def can_request(self, now: float) -> bool:
         return self.can_reboot(now)
 
     def record(self, now: float) -> None:
-        stamps = [t for t in self._load() if now - t <= self._p.window]
+        stamps = [t for t in self._load() or [] if now - t <= self._p.window]
         stamps.append(now)
         self._save(stamps)
 
