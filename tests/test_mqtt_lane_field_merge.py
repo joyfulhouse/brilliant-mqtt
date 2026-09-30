@@ -90,6 +90,8 @@ async def _native_writes(
             {"on": "1", "intensity": "80"},
             id="same-field-latest-wins",
         ),
+        # The only case that pins rebinding the lane's active write to the
+        # merged payload; do not delete it as redundant.
         pytest.param(
             [{"state": "ON", "brightness": 40}, {"brightness": 60}, {"state": "ON"}],
             {"on": "1", "intensity": "60"},
@@ -105,6 +107,11 @@ async def test_fold_into_pending_write_merges_fields(
         [(TOPIC, payload) for payload in commands], back_to_back=back_to_back
     )
     assert writes == [("slider", expected)]
+
+
+async def test_pending_off_is_not_merged_with_a_partial() -> None:
+    writes = await _native_writes([(TOPIC, {"state": "OFF"}), (TOPIC, {"brightness": 60})])
+    assert writes == [("slider", {"on": "0"}), ("slider", {"intensity": "60"})]
 
 
 async def test_fold_does_not_merge_across_lanes() -> None:

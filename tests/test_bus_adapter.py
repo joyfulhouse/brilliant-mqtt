@@ -861,12 +861,14 @@ class TestInteractiveScheduling:
         )
         try:
             await _settle(10)
-            initial = '{"brightness":20}' if barrier else '{"state":"ON","brightness":20}'
+            # A pending OFF cannot merge with a brightness partial (#159), so
+            # without a barrier the partial must still survive as its own write.
+            initial = '{"brightness":20}' if barrier else '{"state":"OFF"}'
             await dispatcher.dispatch(
                 _InboundMessage(primary, initial, False, (), ()), latest_wins=True
             )
             await _settle(10)
-            replacement = '{"brightness":40}' if barrier else '{"state":"ON","brightness":40}'
+            replacement = '{"brightness":40}' if barrier else '{"state":"OFF"}'
             await dispatcher.dispatch(
                 _InboundMessage(primary, replacement, False, (), ()), latest_wins=True
             )
@@ -882,13 +884,13 @@ class TestInteractiveScheduling:
             observer.release.set()
             await blocker
             await dispatcher.shutdown()
-            # Without a barrier the partial merges per field into the pending
-            # write (#159); the button still orders the barrier case.
-            expected = [{"on": "1"}]
+            expected = [
+                {"on": "1"},
+                {"intensity": "40"} if barrier else {"on": "0"},
+            ]
             if barrier:
-                expected += [{"intensity": "40"}, {"reset": "1"}, {"intensity": "120"}]
-            else:
-                expected.append({"on": "1", "intensity": "120"})
+                expected.append({"reset": "1"})
+            expected.append({"intensity": "120"})
             assert [values for _, _, values in observer.payloads] == expected
         finally:
             observer.release.set()
