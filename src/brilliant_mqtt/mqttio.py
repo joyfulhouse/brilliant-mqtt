@@ -257,10 +257,11 @@ class _TopicDispatcher:
                 and admission.try_supersede is not None
             ):
                 # Fold the per-field merge (later value wins) so a partial
-                # command keeps the pending write's other fields (#159). Any
-                # merge involving OFF is the intended unsafe case (OFF ignores
-                # brightness): it folds the payload as-is, and the bus admits
-                # that only if it covers every pending field.
+                # command keeps the pending write's other fields (#159). A
+                # merge involving OFF is unsafe unless both payloads are
+                # identical (OFF ignores brightness); malformed payloads are
+                # likewise left unmerged. An unmerged payload folds as-is, and
+                # the bus admits it only if it covers every pending field.
                 merged = _coalesce_payload(message.topic, previous.payload, message.payload)
                 replacement = message if merged is None else replace(message, payload=merged)
                 try:
