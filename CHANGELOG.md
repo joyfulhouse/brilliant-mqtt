@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The manifest uses minimum-version specs for `asyncssh` and `paho-mqtt`, so
+  hassfest accepts them and the integration still installs on HA 2026.6.x.
 - A stalled retained-ledger write now fails closed after 10 seconds, matching
   the MQTT acknowledgement bound. Before that deadline, state for loads the
   panel already owns is no longer held up by another load's pending write.
