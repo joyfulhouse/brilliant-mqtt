@@ -201,7 +201,7 @@ async def _wait_for_publish(mqtt: FakeMqtt, topic: str, count: int = 1) -> None:
 
 async def _wait_for_idle(bridge: SceneBridge) -> None:
     """Wait until every tracked bridge task (callbacks, writes) has finished."""
-    for _ in range(1000):
+    for _ in range(5000):
         if not bridge._tasks:
             return
         await asyncio.sleep(0.001)
@@ -1768,14 +1768,16 @@ async def test_corrupt_state_without_snapshot_suppresses_first_observed_record(
     await bridge.async_start()
 
     await bus.emit(_execution("all_off", 500))
-    await asyncio.sleep(0)
+    await _wait_for_idle(bridge)
     assert _published(mqtt, scene_event_topic(_PANEL)) == []
     await bus.emit(_execution("all_off", 600))
     # Delivery is asynchronous, so wait for publication rather than one loop
     # turn. test_record_during_inflight_seed_write_is_not_suppressed covers the
     # #112 seed-write race itself.
     await _wait_for_publish(mqtt, scene_event_topic(_PANEL))
-    assert len(_published(mqtt, scene_event_topic(_PANEL))) == 1
+    await _wait_for_idle(bridge)
+    events = [_payload(item) for item in _published(mqtt, scene_event_topic(_PANEL))]
+    assert [event["executed_at_ms"] for event in events] == [600]
     await bridge.async_shutdown()
 
 
@@ -1810,6 +1812,7 @@ async def test_record_during_inflight_seed_write_is_not_suppressed(
         await bus.emit(_execution("all_off", 600))
         release_seed_write.set()
         await _wait_for_publish(mqtt, scene_event_topic(_PANEL))
+        await _wait_for_idle(bridge)
         events = [_payload(item) for item in _published(mqtt, scene_event_topic(_PANEL))]
         assert [event["executed_at_ms"] for event in events] == [600]
     finally:
@@ -1866,9 +1869,9 @@ async def test_record_after_failed_seed_write_is_delivered_once_persisted(
 async def test_runtime_write_failure_after_persisted_seed_suppresses_next_record(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # #112: the seed marker lives only until a persist succeeds, so a later
-    # runtime write failure makes the next record seed-only exactly as it does
-    # after a clean load.
+    # #112 regression guard (passes on base too): the seed marker lives only
+    # until a persist succeeds, so a later runtime write failure makes the next
+    # record seed-only exactly as it does after a clean load.
     fail_write_at: int | None = None
     real_write = scene_state.atomic_write_state
 
