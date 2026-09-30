@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- The integration manifest requires `asyncssh==2.24.0` and `paho-mqtt>=2.1.0`, matching
+- The integration manifest requires `asyncssh>=2.24.0` and `paho-mqtt>=2.1.0`, matching
   what current Home Assistant depends on so hassfest validates again.
 
 ## [0.11.1] - 2026-09-27
