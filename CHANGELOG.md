@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The manifest uses minimum-version specs for `asyncssh` and `paho-mqtt`, so
+  hassfest accepts them and the integration still installs on HA 2026.6.x.
 - Background auto-repair, the Repair button, and the repair service no longer
   auto-admit a pre-0.11.0 panel's code. Only the Update entity, `redeploy`, and
   provisioning, which run the canary and retain a rollback baseline, perform the
