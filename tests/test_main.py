@@ -2015,12 +2015,73 @@ def _second_panel_dimmer(on: str) -> BrilliantDevice:
     )
 
 
+class _LedgerClock:
+    """Fake monotonic clock for the retained ledger's persistence deadline.
+
+    Patches only the ledger module's ``asyncio`` reference, as
+    ``_install_session_loop_clock`` does for the session loop: ``loop.time()``
+    reads this clock and a timed ``asyncio.wait`` returns when the clock
+    passes its timeout. Everything else is the real asyncio.
+    """
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self._timers: list[tuple[float, asyncio.Future[None]]] = []
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        clock = self
+
+        class Loop:
+            def __init__(self, real: asyncio.AbstractEventLoop) -> None:
+                self._real = real
+
+            def time(self) -> float:
+                return clock.now
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._real, name)
+
+        async def wait(futures: set[asyncio.Future[None]], timeout: float | None = None) -> object:
+            if timeout is None:
+                return await asyncio.wait(futures)
+            timer: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+            entry = (clock.now + timeout, timer)
+            clock._timers.append(entry)
+            try:
+                return await asyncio.wait({*futures, timer}, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                timer.cancel()
+                if entry in clock._timers:
+                    clock._timers.remove(entry)
+
+        class Asyncio:
+            def __getattr__(self, name: str) -> Any:
+                return getattr(asyncio, name)
+
+            def get_running_loop(self) -> Loop:
+                return Loop(asyncio.get_running_loop())
+
+        proxy = Asyncio()
+        object.__setattr__(proxy, "wait", wait)
+        monkeypatch.setattr(retained_topics_mod, "asyncio", proxy)
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+        for until, timer in list(self._timers):
+            if until <= self.now and not timer.done():
+                timer.set_result(None)
+
+
 async def test_stalled_ledger_claim_does_not_block_owned_off_or_teardown(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """#176: hold persistence while adding a load, queue OFF, begin shutdown."""
-    deadline_s = 1.0
+    """#176: hold persistence while adding a load, queue OFF, begin shutdown.
+
+    The ledger runs on a fake clock: its persistence deadline passes only when
+    the test advances that clock, so ordering, not elapsed time under load,
+    decides every assertion.
+    """
     existing_state = "brilliant/office/gangbox_peripheral_0/state"
     added_state = "brilliant/office/gangbox_peripheral_1/state"
     ready = asyncio.Event()
@@ -2056,7 +2117,8 @@ async def test_stalled_ledger_claim_does_not_block_owned_off_or_teardown(
         return Bridge(*args, **kwargs, sleep=FakeSleeper(), wall_clock=FakeClock())
 
     monkeypatch.setattr(main_mod, "Bridge", make_bridge)
-    monkeypatch.setattr(retained_topics_mod, "PERSIST_DEADLINE_S", deadline_s)
+    clock = _LedgerClock()
+    clock.install(monkeypatch)
     loop = asyncio.get_running_loop()
     release = threading.Event()
     held = asyncio.Event()
@@ -2088,14 +2150,20 @@ async def test_stalled_ledger_claim_does_not_block_owned_off_or_teardown(
         added = asyncio.create_task(bus.emit(_second_panel_dimmer("1")))
         await asyncio.wait_for(held.wait(), 2)
         off = replace(_panel_dimmer(), variables={"on": Variable("on", "0")})
-        await asyncio.wait_for(bus.emit(off), 5)
+        await asyncio.wait_for(bus.emit(off), 30)
         # The OFF is not held by the stalled claim of the other load.
         assert not added.done()
         assert mqtt.events == ["state:OFF"]
 
+        # Shutdown begins; the claim defers cancellation until its deadline.
         session.cancel()
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert not added.done()
+        assert not session.done()
+        clock.advance(retained_topics_mod.PERSIST_DEADLINE_S)
         with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(session, 10)
+            await asyncio.wait_for(session, 30)
 
         # Teardown completed with the write still held in its thread.
         assert not release.is_set()

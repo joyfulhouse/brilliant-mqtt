@@ -233,6 +233,9 @@ class RetainedTopicLedger:
         if topic not in self._state.topics:
             raise RetainedLedgerError("refusing to clear a topic not owned by this ledger")
 
+        # A cleared topic must not reach the broker again through the lock-free
+        # path until a manifest that owns it is acknowledged afresh.
+        self._acknowledged_topics = self._acknowledged_topics - {topic}
         await mqtt.publish(topic, "", retain=True, qos=1)
         self._manifest_acknowledged = False
         smaller = self._state.topics - {topic}
