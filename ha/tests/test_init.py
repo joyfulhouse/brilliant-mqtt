@@ -67,7 +67,7 @@ async def test_integration_discoverable(hass: HomeAssistant) -> None:
     assert integration.integration_type == "hub"
     assert integration.name == "Brilliant MQTT Fleet Manager"
     assert "mqtt" in (integration.dependencies or [])
-    assert any(r.startswith("asyncssh==") for r in integration.requirements or [])
+    assert any(r.startswith("asyncssh>=") for r in integration.requirements or [])
 
 
 def test_config_flow_resolves_production_provisioner_from_package_root(
