@@ -140,3 +140,22 @@ def test_fail_closed_period_restarts_if_clock_steps_back(tmp_path: Path) -> None
     assert guard.can_request(1_000_000.0) is False
     assert guard.can_request(100.0) is False
     assert guard.can_request(100.0 + P.cooldown) is True
+
+
+def test_second_bad_episode_fails_closed_and_logs_again(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.ERROR, logger="brilliant_wifi_watchdog.reboot_guard")
+    state = _bad_state(tmp_path, "corrupt")
+    guard = RebootGuard(str(state), P)
+    t0 = 100.0
+    assert guard.can_request(t0) is False
+    assert len(caplog.records) == 1
+
+    state.write_text("[]", encoding="utf-8")  # valid state restored
+    healthy = t0 + P.cooldown
+    assert guard.can_request(healthy) is True
+
+    state.write_text("not JSON", encoding="utf-8")  # a second bad episode
+    assert guard.can_request(healthy + 1.0) is False
+    assert len(caplog.records) == 2
