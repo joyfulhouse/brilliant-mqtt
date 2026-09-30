@@ -310,7 +310,7 @@ async def test_legacy_bridge_does_not_waive_block_for_unordered_watchdog(
         "layout": "legacy_fixed",
     }
     await shell.connect()
-    with pytest.raises(panel_ops.ReleaseIdentityBlocked):
+    with pytest.raises(panel_ops.ReleaseIdentityBlocked) as blocked:
         async with panel_ops.release_transaction(
             shell,
             str(payload_dir),
@@ -319,6 +319,7 @@ async def test_legacy_bridge_does_not_waive_block_for_unordered_watchdog(
             allow_pre_ordinal_upgrade=True,
         ):
             pytest.fail("unordered watchdog admitted")
+    assert blocked.value.override
     assert not shell.identity_uploads
     assert not shell.uploads
 

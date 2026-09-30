@@ -371,10 +371,10 @@ panel with no agent layout at all is exempt from the baseline requirement. The
 requirement holds because rollback restarts the restored bridge with the retained
 environment and waits for a fresh MQTT session.
 
-Before 0.11.1, Repair would re-lay the unit and restart a stopped legacy bridge.
-Repair can no longer replace pre-ordinal code, so a pre-0.11.0 panel whose bridge
-is `inactive` or `failed`, or whose environment file is missing, needs one of
-these:
+In 0.11.1 only, Repair would auto-admit, re-lay the unit and restart a stopped
+legacy bridge; 0.11.0 already blocked it with `release_identity_blocked`. Repair
+can no longer replace pre-ordinal code, so a pre-0.11.0 panel whose bridge is
+`inactive` or `failed`, or whose environment file is missing, needs one of these:
 
 1. **Start the bridge, then update.** If the unit and environment file are still
    present, start `brilliant-mqtt` on the panel. Once

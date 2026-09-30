@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the blocked message now points at a plain update instead of an override.
   Those paths need a baseline, which requires the bridge unit to be `active`. If
   a pre-0.11.0 panel's bridge is stopped or failed, repair no longer brings it
-  back and update reports `baseline_correlation_unsupported`. Start
+  back (as in 0.11.0; only 0.11.1 did) and update reports `baseline_correlation_unsupported`. Start
   `brilliant-mqtt` on the panel and update, or run `brilliant_mqtt.uninstall` and
   then update. Uninstall stops and removes the agent, so the bridge stays offline
   until the update completes. See "Recovering a stopped pre-ordinal bridge" in
