@@ -14,6 +14,7 @@ import binascii
 import hashlib
 import io
 import json
+import logging
 import os
 import re
 import secrets
@@ -81,6 +82,8 @@ from .release_identity import (
 from .setup_protocol import PreflightRequest
 from .shell import PanelProcess, PanelShell, RunResult
 
+_LOGGER = logging.getLogger(__name__)
+
 _STAGING_DIR = f"{PANEL_VAR_DIR}.staging"
 _STAGING_TARBALL = f"{_STAGING_DIR}.tar.gz"
 _STAGED_UNIT = f"{PANEL_STAGED_DIR}/{SERVICE_NAME}.service"
@@ -101,8 +104,18 @@ class PanelOpError(RuntimeError):
 class ReleaseIdentityBlocked(PanelOpError):
     """An actionable, explicitly safe identity refusal with one-operation binding."""
 
-    def __init__(self, override: dict[str, object]) -> None:
+    def __init__(self, override: dict[str, object], *, pre_ordinal: bool = False) -> None:
         self.override = override
+        if pre_ordinal:
+            # An override cannot waive this refusal; the canaried update needs none,
+            # so carry no binding an operator could copy.
+            self.override = {}
+            super().__init__(
+                "release_identity_blocked: installed code predates release ordinals and "
+                "only a canaried update may replace it. Update this panel's agent, or run "
+                "brilliant_mqtt.redeploy for it, without release_override"
+            )
+            return
         super().__init__(
             "release_identity_blocked: installed code differs and release ordering is "
             "unknown or not increasing. Install a reviewed newer release, or explicitly "
@@ -232,6 +245,14 @@ async def _write_release_record(
     )
 
 
+def _release_label(identity: ReleaseIdentity | None) -> str:
+    """Version and ordinal only: audit logs never carry code digests."""
+    if identity is None:
+        return "none"
+    ordinal = "unknown" if identity.release_ordinal is None else identity.release_ordinal
+    return f"{identity.version} (ordinal {ordinal})"
+
+
 def _identity_binding(
     panel: str,
     incumbent: dict[str, ReleaseIdentity | None],
@@ -253,9 +274,19 @@ async def _admit_release(
     components: tuple[str, ...],
     override: Mapping[str, object] | None,
     transaction: str | None = None,
+    *,
+    allow_pre_ordinal_upgrade: bool = False,
 ) -> ReleaseAdmission:
     candidate = await candidate_identities(local_payload_dir)
-    return await _admit_identities(shell, candidate, panel, components, override, transaction)
+    return await _admit_identities(
+        shell,
+        candidate,
+        panel,
+        components,
+        override,
+        transaction,
+        allow_pre_ordinal_upgrade=allow_pre_ordinal_upgrade,
+    )
 
 
 async def _admit_identities(
@@ -265,6 +296,8 @@ async def _admit_identities(
     components: tuple[str, ...],
     override: Mapping[str, object] | None,
     transaction: str | None = None,
+    *,
+    allow_pre_ordinal_upgrade: bool = False,
 ) -> ReleaseAdmission:
     installed = await _read_release_identities(shell)
     selected = tuple(dict.fromkeys(("bridge", *components)))
@@ -281,6 +314,15 @@ async def _admit_identities(
     binding = _identity_binding(panel, incumbent, candidate, transaction)
     if override is not None and dict(override) != binding:
         raise PanelOpError("release_override_mismatch: inspect the current panel and retry")
+    automatic = [
+        component
+        for component in selected
+        if is_pre_ordinal_upgrade(incumbent[component], candidate[component])
+    ]
+    if automatic and not allow_pre_ordinal_upgrade:
+        # Only callers that run the canary and retain a rollback baseline may replace
+        # a pre-ordinal incumbent. Every other writer fails closed, even with an override.
+        raise ReleaseIdentityBlocked(binding, pre_ordinal=True)
     changes: dict[str, bool] = {}
     for component in selected:
         try:
@@ -299,11 +341,6 @@ async def _admit_identities(
             exclusive=True,
             error_code="release_override_used_or_write_failed",
         )
-    automatic = [
-        component
-        for component in selected
-        if is_pre_ordinal_upgrade(incumbent[component], candidate[component])
-    ]
     if automatic and override is None:
         await _write_release_record(
             shell,
@@ -315,6 +352,15 @@ async def _admit_identities(
             },
             exclusive=True,
             error_code="release_auto_admission_record_failed",
+        )
+        _LOGGER.info(
+            "%s: auto-admitted pre-ordinal release for %s",
+            panel,
+            ", ".join(
+                f"{component} {_release_label(incumbent[component])} -> "
+                f"{_release_label(candidate[component])}"
+                for component in automatic
+            ),
         )
     return ReleaseAdmission(shell, candidate, incumbent, changes, transaction)
 
@@ -328,8 +374,13 @@ async def release_transaction(
     components: tuple[str, ...] = (),
     override: Mapping[str, object] | None = None,
     transaction_id: UUID | None = None,
+    allow_pre_ordinal_upgrade: bool = False,
 ) -> AsyncIterator[ReleaseAdmission]:
-    """Admit every selected writer before CA/config writes; never retain an override."""
+    """Admit every selected writer before CA/config writes; never retain an override.
+
+    ``allow_pre_ordinal_upgrade`` is only for callers that run the canary and retain
+    a rollback baseline (update, provisioning); repair and install paths fail closed.
+    """
     if _RELEASE_ADMISSION.get() is not None:
         raise PanelOpError("release_transaction_nested")
     admission = await _admit_release(
@@ -339,6 +390,7 @@ async def release_transaction(
         components,
         override,
         transaction_id.hex if transaction_id is not None else None,
+        allow_pre_ordinal_upgrade=allow_pre_ordinal_upgrade,
     )
     token = _RELEASE_ADMISSION.set(admission)
     try:
