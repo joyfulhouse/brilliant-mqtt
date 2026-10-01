@@ -421,12 +421,12 @@ async def test_pre_ordinal_admission_applies_to_each_changed_component(payload_d
     assert audits[0]["components"] == ["bridge", "bus_watchdog", "wifi_watchdog"]
 
 
-async def test_ordinal_two_incumbent_uses_normal_ordering_for_release_0_11_1(
+async def test_ordinal_three_incumbent_uses_normal_ordering_for_release_0_11_2(
     payload_dir: Path,
 ) -> None:
-    (payload_dir / "VERSION").write_text("0.11.1")
-    (payload_dir / "RELEASE_ORDINAL").write_text("3\n")
-    shell = IdentityShell({**_identity(digest="5" * 64, ordinal=2), "version": "0.11.0"})
+    (payload_dir / "VERSION").write_text("0.11.2")
+    (payload_dir / "RELEASE_ORDINAL").write_text("4\n")
+    shell = IdentityShell({**_identity(digest="5" * 64, ordinal=3), "version": "0.11.1"})
     await shell.connect()
     async with panel_ops.release_transaction(
         shell, str(payload_dir), panel="guest-bath"
