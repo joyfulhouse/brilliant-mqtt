@@ -567,7 +567,8 @@ agent itself needs a code fix — deploy a new release via the update entity or
 
 <a id="retained-ledger"></a>
 **Retained-ledger fault.** If the agent cannot read or durably persist
-`/var/brilliant-mqtt/state/owned-topics.json`, it remains fail-closed and
+`/var/brilliant-mqtt/state/owned-topics.json` (including a write that stalls
+for more than 10 seconds), it remains fail-closed and
 publishes retained bridge metadata with `"degraded":"retained_ledger"` at QoS
 1. Home Assistant creates one needs-attention repair issue and suppresses the
 generic offline auto-repair loop so it cannot replace the useful storage
