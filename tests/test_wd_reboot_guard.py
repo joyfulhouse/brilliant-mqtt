@@ -241,3 +241,23 @@ def test_persistently_bad_state_authorizes_at_most_once_per_cooldown(
     assert len(caplog.records) == 2
     assert guard.can_request(rearmed + P.cooldown - 1.0) is False
     assert guard.can_request(rearmed + P.cooldown) is True
+
+
+@pytest.mark.parametrize(
+    "history",
+    [
+        [NOW + P.cooldown - 1.0],  # still inside the cooldown at expiry
+        [NOW - 2 * P.cooldown, NOW - P.cooldown - 1.0, NOW - 1.0],  # full cap in window
+    ],
+    ids=["cooldown", "cap"],
+)
+def test_repaired_history_still_governs_at_window_expiry(
+    tmp_path: Path, history: list[float]
+) -> None:
+    state = _bad_state(tmp_path, "corrupt")
+    guard = RebootGuard(str(state), P)
+    assert guard.can_request(NOW) is False
+
+    _write_history(state, history)  # repaired inside the window
+    assert guard.can_request(NOW + P.cooldown - 1.0) is False
+    assert guard.can_request(NOW + P.cooldown) is False  # normal guard resumes
