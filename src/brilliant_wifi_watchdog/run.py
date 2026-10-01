@@ -74,6 +74,7 @@ def handle(
     *,
     guard: _GuardLike,
     now: float,
+    state_path: str,
     reboot_eligible: bool = False,
     recovery_mod: Any = recovery,
 ) -> int | None:
@@ -103,7 +104,7 @@ def handle(
                 _LOG.error(
                     "reboot guard state write failed (%s: %s)",
                     type(exc).__name__,
-                    exc.filename2 or exc.filename,
+                    exc.filename2 or exc.filename or state_path,
                 )
                 if not guard.last_read_bad:
                     # The state read fine but cannot be written (full disk,
@@ -157,7 +158,7 @@ def _poll_once(cfg: Config, *, guard: _GuardLike, ladder: _LadderLike) -> None:
     eligible = guard.can_request(wall)
     action = ladder.observe(gateway_up=gateway_up, now=time.monotonic(), reboot_eligible=eligible)
     if action != Action.NONE:
-        handle(action, guard=guard, now=wall, reboot_eligible=eligible)
+        handle(action, guard=guard, now=wall, state_path=cfg.state_path, reboot_eligible=eligible)
 
 
 def main() -> None:  # pragma: no cover - thin loop
