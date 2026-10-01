@@ -12,6 +12,14 @@ physical actuation or native panel-slider responsiveness.
 
 ## Candidate scope and identity
 
+The current candidate is release
+[`v0.11.2`](https://github.com/joyfulhouse/brilliant-mqtt/releases/tag/v0.11.2)
+(release ordinal 4, voice payload 0.1.1). It supersedes 0.11.0 and 0.11.1, which
+lack the fixes below; do not qualify either of them. Select the candidate by
+its tag's commit, never by a branch name or version label alone, and still
+regenerate and verify the payload below: the tag identifies the candidate, it
+does not prove the installed bytes.
+
 Do not deploy the old `e4ae3176` documentation candidate or select a checkout by
 its branch name or `0.10.2` label. Several byte-distinct candidates used that
 version. Record the exact final commit, version, release ordinal, integration
@@ -26,6 +34,13 @@ The release must include these independently reviewed changes:
 | Identity admission and retained rollback | #168 / #165 / #166 | Require guarded updates and a complete named predecessor baseline throughout soak |
 | Partial command preservation | #170 / #159 | Include partial and overlapping fields in the final correctness tests |
 | Dead lane recovery and fold evidence | #160, #161 | Verify bounded worker recovery, independent lane progress and observable failed folds |
+| Uncanaried legacy upgrade blocked | #186 / #181, #182 | Only update/redeploy and provisioning may upgrade a pre-0.11.0 panel, each with the canary and a verified rollback baseline; repair, install and post-OTA refresh refuse it |
+| Pending-write field merge | #183 / #159 | A partial command that supersedes a queued write merges field by field; OFF and malformed commands never merge |
+| Retained-ledger persistence deadline | #187 / #176, #177 | A stalled ledger write fails closed within 10 seconds and a ledger failure surfaces on the next session tick |
+| Scene-bridge first-record race | #196 / #112 | After a corrupt state load, only the first record is a baseline; later records publish their events |
+| Fail-closed watchdog reboot guards | #192, #206 / #140, #193 | A corrupt or unreadable guard state blocks reboots for one cooldown instead of allowing them |
+| Unrecordable reboot handling | #207, #210 / #195, #209 | A guard-state write failure never crashes a watchdog; readable-but-unwritable state refuses the reboot until storage is fixed |
+| Integration manifest requirements | #190 / #185 | `asyncssh>=2.23.1` and `paho-mqtt>=2.1.0` keep the integration installable on HA 2026.6.x |
 
 PR links and passing checks are not proof that a candidate contains those
 changes. Inspect the final commit's ancestry and source, regenerate its payload,
@@ -302,7 +317,7 @@ path/hash manifests where appropriate.
 ```text
 Decision: GO / NO-GO / ABORTED / INCONCLUSIVE
 Timestamp and operator/reviewer:
-Candidate commit / version / ordinal:
+Candidate tag / commit / version / ordinal (expected: v0.11.2 / 4):
 Repository and loaded-HA manifest digests:
 Actual per-component panel layout / digests / versions:
 Installed unit and resource-limit verification:
