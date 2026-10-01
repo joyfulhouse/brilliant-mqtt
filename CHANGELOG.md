@@ -16,6 +16,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dropping the waiting write's other fields. Writes already issued to the
   device, and commands for other loads, are never merged.
   ([#159](https://github.com/joyfulhouse/brilliant-mqtt/issues/159))
+- A stalled retained-ledger write now fails closed after 10 seconds, matching
+  the MQTT acknowledgement bound. Before that deadline, state for loads the
+  panel already owns is no longer held up by another load's pending write.
+  After it, publishes fail closed until the late write settles; the next
+  publish then rewrites the ledger from memory before anything reaches the
+  broker, so a late write cannot drop an owned topic or race a later write.
+  Session shutdown and process exit are delayed by at most the deadline.
+  ([#176](https://github.com/joyfulhouse/brilliant-mqtt/issues/176))
+- A ledger failure during a wired light or switch state publish now reports
+  the `retained_ledger` degraded status on the next session tick instead of
+  after the next periodic resync.
+  ([#177](https://github.com/joyfulhouse/brilliant-mqtt/issues/177))
 - The Wi-Fi watchdog no longer treats a corrupt, unreadable or wrong-type
   reboot-guard state file as an empty history. It blocks reboots for one
   cooldown period, logs the lost history once at ERROR, then resumes under the
