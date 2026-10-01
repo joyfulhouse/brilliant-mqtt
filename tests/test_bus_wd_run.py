@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import errno
+import json
 import logging
+import os
 from types import SimpleNamespace
 from typing import Any, NoReturn
 
 import pytest
 
 from brilliant_bus_watchdog import bounded
+from brilliant_bus_watchdog.reboot_guard import GuardPolicy, RebootGuard
 from brilliant_bus_watchdog.run import (
     _service_active,
     _service_started_at,
@@ -14,6 +18,8 @@ from brilliant_bus_watchdog.run import (
     load_config,
     should_reboot,
 )
+
+STATE = "/var/brilliant-mqtt/bus-watchdog.state"
 
 
 @pytest.mark.parametrize(
@@ -50,13 +56,17 @@ def test_handle_reboots_when_guard_allows_record_before_reboot() -> None:
     calls: list[str] = []
 
     class G:
+        last_read_bad = False
+
         def can_reboot(self, now: float) -> bool:
             return True
 
         def record(self, now: float) -> None:
             calls.append("record")
 
-    handle(should=True, guard=G(), now=1.0, reboot_fn=lambda: calls.append("reboot"))
+    handle(
+        should=True, guard=G(), now=1.0, state_path=STATE, reboot_fn=lambda: calls.append("reboot")
+    )
     assert calls == ["record", "reboot"]
 
 
@@ -64,13 +74,17 @@ def test_handle_blocked_by_guard() -> None:
     calls: list[str] = []
 
     class G:
+        last_read_bad = False
+
         def can_reboot(self, now: float) -> bool:
             return False
 
         def record(self, now: float) -> None:
             calls.append("record")
 
-    handle(should=True, guard=G(), now=1.0, reboot_fn=lambda: calls.append("reboot"))
+    handle(
+        should=True, guard=G(), now=1.0, state_path=STATE, reboot_fn=lambda: calls.append("reboot")
+    )
     assert calls == []
 
 
@@ -78,6 +92,8 @@ def test_handle_noop_when_should_false() -> None:
     calls: list[str] = []
 
     class G:
+        last_read_bad = False
+
         def can_reboot(self, now: float) -> bool:
             calls.append("checked")
             return True
@@ -85,7 +101,9 @@ def test_handle_noop_when_should_false() -> None:
         def record(self, now: float) -> None:
             calls.append("record")
 
-    handle(should=False, guard=G(), now=1.0, reboot_fn=lambda: calls.append("reboot"))
+    handle(
+        should=False, guard=G(), now=1.0, state_path=STATE, reboot_fn=lambda: calls.append("reboot")
+    )
     assert calls == []
 
 
@@ -198,6 +216,139 @@ def test_empty_service_start_generation_disables_reboot_with_warning(
         and "reboot guard disabled" in record.getMessage()
         for record in caplog.records
     )
+
+
+def _write_failures(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [
+        r
+        for r in caplog.records
+        if r.levelno == logging.ERROR and "state write failed" in r.getMessage()
+    ]
+
+
+def test_bad_state_write_failure_reboots_but_rearms_after_restart(
+    tmp_path: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    state = tmp_path / "guard"
+    state.mkdir()
+    policy = GuardPolicy(cooldown=10.0, cap=3, window=60.0)
+    guard = RebootGuard(str(state), policy)
+    assert guard.can_reboot(0.0) is False
+    reboots: list[str] = []
+    with caplog.at_level(logging.ERROR, logger="brilliant_bus_watchdog"):
+        handle(
+            should=True,
+            guard=guard,
+            now=10.0,
+            state_path=str(state),
+            reboot_fn=lambda: reboots.append("reboot"),
+        )
+    assert reboots == ["reboot"]
+    assert "IsADirectoryError" in _write_failures(caplog)[0].getMessage()
+    assert str(state) in _write_failures(caplog)[0].getMessage()
+    fresh = RebootGuard(str(state), policy)
+    assert fresh.can_reboot(20.0) is False
+    assert fresh.can_reboot(30.0) is True
+
+
+@pytest.mark.parametrize("stale", [None, [100.0]], ids=["missing", "readable"])
+@pytest.mark.parametrize("err", [errno.EACCES, errno.ENOSPC], ids=["eacces", "enospc"])
+def test_readable_or_missing_state_write_failure_refuses_across_boots(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    stale: list[float] | None,
+    err: int,
+) -> None:
+    state = tmp_path / "guard"
+    if stale is not None:
+        state.write_text(json.dumps(stale), encoding="utf-8")
+
+    def fail_replace(src: str, dst: str) -> None:
+        if err == errno.ENOSPC:
+            raise OSError(err, os.strerror(err))
+        raise OSError(err, os.strerror(err), src, None, dst)
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+    reboots: list[str] = []
+    with caplog.at_level(logging.ERROR, logger="brilliant_bus_watchdog"):
+        for boot in range(4):
+            now = 1000.0 + boot * 20
+            guard = RebootGuard(str(state), GuardPolicy(cooldown=10.0))
+            handle(
+                should=True,
+                guard=guard,
+                now=now,
+                state_path=str(state),
+                reboot_fn=lambda: reboots.append("reboot"),
+            )
+    assert reboots == []
+    failures = _write_failures(caplog)
+    assert len(failures) == 4
+    assert all(str(state) in record.getMessage() for record in failures)
+    if err == errno.EACCES:
+        assert all(
+            record.getMessage().endswith(f"PermissionError: {state})") for record in failures
+        )
+    else:
+        assert all("OSError:" in record.getMessage() for record in failures)
+        assert all(record.getMessage().endswith(f"OSError: {state})") for record in failures)
+
+
+def test_last_read_bad_tracks_latest_authorizing_read(tmp_path: Any) -> None:
+    state = tmp_path / "guard"
+    state.write_text("invalid", encoding="utf-8")
+    guard = RebootGuard(str(state), GuardPolicy(cooldown=10.0))
+    assert guard.can_reboot(0.0) is False
+    assert guard.last_read_bad is True
+    state.write_text("[]", encoding="utf-8")
+    assert guard.can_reboot(1.0) is False
+    assert guard.last_read_bad is False
+
+
+def test_bad_state_window_is_named_when_reboot_is_blocked(
+    tmp_path: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    state = tmp_path / "guard"
+    state.write_text("invalid", encoding="utf-8")
+    guard = RebootGuard(str(state), GuardPolicy(cooldown=10.0))
+    assert guard.can_reboot(0.0) is False
+    with caplog.at_level(logging.ERROR, logger="brilliant_bus_watchdog"):
+        handle(should=True, guard=guard, now=1.0, state_path=str(state))
+    assert any("bad-state window" in record.getMessage() for record in caplog.records)
+
+
+def test_future_stamp_is_a_bad_authorizing_read(tmp_path: Any) -> None:
+    state = tmp_path / "guard"
+    state.write_text("[999999.0]", encoding="utf-8")
+    guard = RebootGuard(str(state), GuardPolicy(cooldown=10.0))
+    assert guard.can_reboot(1.0) is False
+    assert guard.last_read_bad is True
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+def test_real_read_only_directory_refuses_reboot(tmp_path: Any) -> None:
+    directory = tmp_path / "readonly"
+    directory.mkdir()
+    state = directory / "guard"
+    state.write_text("[]", encoding="utf-8")
+    directory.chmod(0o555)
+    try:
+        reboots: list[str] = []
+        for boot in range(3):
+            now = 10000.0 + boot * 20
+            guard = RebootGuard(str(state), GuardPolicy())
+            assert guard.can_reboot(now) is True
+            handle(
+                should=True,
+                guard=guard,
+                now=now,
+                state_path=str(state),
+                reboot_fn=lambda: reboots.append("reboot"),
+            )
+        assert reboots == []
+    finally:
+        directory.chmod(0o755)
 
 
 @pytest.mark.parametrize(

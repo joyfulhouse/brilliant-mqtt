@@ -32,6 +32,8 @@ _SERVICE_TIMEOUT = 5.0
 class _GuardLike(Protocol):
     def can_reboot(self, now: float) -> bool: ...
     def record(self, now: float) -> None: ...
+    @property
+    def last_read_bad(self) -> bool: ...
 
 
 @dataclass(frozen=True)
@@ -88,15 +90,36 @@ def should_reboot(
     )
 
 
-def handle(*, should: bool, guard: _GuardLike, now: float, reboot_fn: Any = _reboot) -> None:
+def handle(
+    *,
+    should: bool,
+    guard: _GuardLike,
+    now: float,
+    state_path: str,
+    reboot_fn: Any = _reboot,
+) -> None:
     if not should:
         return
     if guard.can_reboot(now):
         _LOG.error("bus session dead past threshold, network up, bridge active — rebooting")
-        guard.record(now)
+        try:
+            guard.record(now)
+        except OSError as exc:
+            _LOG.error(
+                "reboot guard state write failed (%s: %s)",
+                type(exc).__name__,
+                exc.filename2 or exc.filename or state_path,
+            )
+            if not guard.last_read_bad:
+                _LOG.error(
+                    "bus reboot refused because guard state could not be recorded; fix storage"
+                )
+                return
         reboot_fn()
     else:
-        _LOG.error("bus session dead but reboot guard blocked (cooldown/cap) — waiting")
+        _LOG.error(
+            "bus session dead but reboot guard blocked (cooldown/cap/bad-state window) — waiting"
+        )
 
 
 def _service_active(service: str, run: Any = None) -> bool:
@@ -182,7 +205,7 @@ def main() -> None:  # pragma: no cover - thin loop
             "none" if failure_age is None else f"{failure_age:.0f}s",
             should,
         )
-        handle(should=should, guard=guard, now=now)
+        handle(should=should, guard=guard, now=now, state_path=cfg.state_path)
         time.sleep(cfg.interval)
 
 

@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A bus panel whose reboot guard state cannot be written now refuses to
+  self-reboot until an operator fixes the storage, preventing an unrecorded
+  reboot from being authorized on every boot ([#209](https://github.com/joyfulhouse/brilliant-mqtt/issues/209)).
 - The Wi-Fi watchdog no longer crashes when it cannot record a reboot in its
   guard state file. If the state file was already unreadable (for example, a
   directory at that path), the watchdog logs the failure and still reboots,
