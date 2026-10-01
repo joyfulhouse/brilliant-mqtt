@@ -256,15 +256,29 @@ class _TopicDispatcher:
                 and previous.retained == message.retained
                 and admission.try_supersede is not None
             ):
+                # Fold the per-field merge (later value wins) so a partial
+                # command keeps the pending write's other fields (#159). A
+                # merge involving OFF is unsafe unless both payloads are
+                # identical (OFF ignores brightness); malformed payloads are
+                # likewise left unmerged. An unmerged payload folds as-is, and
+                # the bus admits it only if it covers every pending field.
+                merged = _coalesce_payload(message.topic, previous.payload, message.payload)
+                replacement = message if merged is None else replace(message, payload=merged)
                 try:
-                    folded = admission.try_supersede(message.payload)
+                    folded = admission.try_supersede(replacement.payload)
                 except Exception:
                     # Preserve the normal callback's error boundary: malformed
                     # input must not escape this optimization into the reader.
                     logger.warning("MQTT command fold hook failed; falling back to queued dispatch")
                     folded = False
                 if folded:
-                    self._folded[lane] = message
+                    # The merged payload is the base for any later fold. That
+                    # makes overwriting an unconsumed _folded[lane] below safe:
+                    # each later fold merges onto this rebound payload, and the
+                    # bus's try_supersede rejects any payload whose keys do not
+                    # cover the pending write's keys, so no field is dropped.
+                    self._active[lane] = (replacement, admission)
+                    self._folded[lane] = replacement
                     return
         accepted = await queue.put(message, latest_wins=latest_wins)
         if accepted:

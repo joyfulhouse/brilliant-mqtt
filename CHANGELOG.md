@@ -11,6 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The manifest uses minimum-version specs for `asyncssh` and `paho-mqtt`, so
   hassfest accepts them and the integration still installs on HA 2026.6.x.
+- A partial MQTT setter that supersedes a light or switch write still waiting
+  for the device now merges per field, with the later value winning, rather than
+  dropping the waiting write's other fields. Writes already issued to the
+  device, and commands for other loads, are never merged.
+  ([#159](https://github.com/joyfulhouse/brilliant-mqtt/issues/159))
 - The Wi-Fi watchdog no longer treats a corrupt, unreadable or wrong-type
   reboot-guard state file as an empty history. It blocks reboots for one
   cooldown period, logs the lost history once at ERROR, then resumes under the
