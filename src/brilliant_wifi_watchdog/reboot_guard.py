@@ -68,24 +68,24 @@ class RebootGuard:
         loaded = self._load()
         if loaded is not None and any(t > now for t in loaded):
             loaded = None  # a future stamp would block reboots forever
-        if loaded is None:
+        if loaded is None and self._bad_since is None:
+            self._bad_since = now
+            _LOG.error(
+                "reboot guard state %s is unreadable or invalid; blocking reboots for %.0fs",
+                self._path,
+                self._p.cooldown,
+            )
+        if self._bad_since is not None:
             # Lost history must not authorize a reboot: fail closed for one
-            # cooldown from the first bad read, then fall back to empty history.
-            if self._bad_since is None:
-                self._bad_since = now
-                _LOG.error(
-                    "reboot guard state %s is unreadable or invalid; blocking reboots for %.0fs",
-                    self._path,
-                    self._p.cooldown,
-                )
-            elif now < self._bad_since:
+            # cooldown from the first bad read, even if the file is repaired or
+            # removed meanwhile, then fall back to whatever history is readable.
+            if now < self._bad_since:
                 self._bad_since = now  # wall clock stepped back: stay bounded
             if now - self._bad_since < self._p.cooldown:
                 return False
-            loaded = []
-        else:
-            self._bad_since = None
-        stamps = [t for t in loaded if now - t <= self._p.window]
+            if loaded is not None:
+                self._bad_since = None
+        stamps = [t for t in loaded or [] if now - t <= self._p.window]
         return self._history_allows(stamps, now)
 
     def can_request(self, now: float) -> bool:

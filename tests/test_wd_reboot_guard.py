@@ -168,3 +168,58 @@ def test_second_bad_episode_fails_closed_and_logs_again(
     state.write_text("not JSON", encoding="utf-8")  # a second bad episode
     assert guard.can_request(healthy + 1.0) is False
     assert len(caplog.records) == 2
+
+
+def _write_history(state: Path, stamps: list[float]) -> None:
+    state.write_text(json.dumps(stamps), encoding="utf-8")
+
+
+@pytest.mark.parametrize("repair", ["empty", "valid_history", "deleted"])
+def test_repair_inside_fail_closed_window_stays_blocked(
+    tmp_path: Path, repair: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.ERROR, logger="brilliant_wifi_watchdog.reboot_guard")
+    state = _bad_state(tmp_path, "corrupt")
+    guard = RebootGuard(str(state), P)
+    assert guard.can_request(NOW) is False
+
+    if repair == "empty":
+        _write_history(state, [])
+    elif repair == "valid_history":
+        _write_history(state, [NOW - 2 * P.cooldown])  # alone, would allow a reboot
+    else:
+        state.unlink()
+    assert guard.can_request(NOW + 1.0) is False  # window holds despite the repair
+    assert guard.can_request(NOW + P.cooldown - 1.0) is False
+    assert guard.can_request(NOW + P.cooldown) is True  # then normal history applies
+    assert len(caplog.records) == 1
+
+
+def test_stamp_just_after_now_is_bad_state(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.ERROR, logger="brilliant_wifi_watchdog.reboot_guard")
+    state = tmp_path / "state"
+    _write_history(state, [NOW + 0.5])
+    assert RebootGuard(str(state), P).can_request(NOW) is False
+    assert len(caplog.records) == 1
+
+
+def test_stamp_exactly_now_is_valid_history(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.ERROR, logger="brilliant_wifi_watchdog.reboot_guard")
+    state = tmp_path / "state"
+    _write_history(state, [NOW])
+    guard = RebootGuard(str(state), P)
+    assert guard.can_request(NOW) is False  # normal cooldown, not lost history
+    assert guard.can_request(NOW + P.cooldown) is True
+    assert caplog.records == []
+
+
+def test_record_persists_only_the_rolling_window(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    recent = NOW - P.cooldown
+    _write_history(state, [NOW - P.window - 1.0, recent, NOW + 5.0])
+    RebootGuard(str(state), P).record(NOW)
+    assert json.loads(state.read_text(encoding="utf-8")) == [recent, NOW]
