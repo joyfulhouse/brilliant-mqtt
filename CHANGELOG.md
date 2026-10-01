@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.2] - 2026-10-01
+
+The on-panel agent and Home Assistant integration both move to 0.11.2. The
+bundled bridge and watchdog payload carries release ordinal 4; the separately
+versioned voice payload remains at 0.1.1. Qualify this release on a canary panel
+before updating the remaining panels.
+
 ### Fixed
 
 - A bus panel whose reboot guard state cannot be written now refuses to
@@ -1064,7 +1071,8 @@ panel redeploy is needed.
 - JoyfulHouse OSS docs standard: LICENSE (MIT), INSTALL.md, CHANGELOG.md,
   FUNDING.yml, CODEOWNERS, and the canonical `docs/` set.
 
-[Unreleased]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.11.1...HEAD
+[Unreleased]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.11.2...HEAD
+[0.11.2]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.11.1...v0.11.2
 [0.11.1]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.9.3...v0.10.0
