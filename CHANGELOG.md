@@ -11,6 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The manifest uses minimum-version specs for `asyncssh` and `paho-mqtt`, so
   hassfest accepts them and the integration still installs on HA 2026.6.x.
+- A partial MQTT setter that supersedes a light or switch write still waiting
+  for the device now merges per field, with the later value winning, rather than
+  dropping the waiting write's other fields. Writes already issued to the
+  device, and commands for other loads, are never merged.
+  ([#159](https://github.com/joyfulhouse/brilliant-mqtt/issues/159))
 - After the scene state file is found corrupt, only the first scene or mode
   record the agent observes is treated as history and suppressed. Previously a
   second record that arrived while the first one was still being written to
