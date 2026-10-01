@@ -79,9 +79,6 @@ class RebootGuard:
         stamps = [t for t in loaded or [] if 0 <= now - t <= self._p.window]
         return self._history_allows(stamps, now)
 
-    def can_request(self, now: float) -> bool:
-        return self.can_reboot(now)
-
     def record(self, now: float) -> None:
         stamps = [t for t in self._load() or [] if 0 <= now - t <= self._p.window]
         stamps.append(now)
