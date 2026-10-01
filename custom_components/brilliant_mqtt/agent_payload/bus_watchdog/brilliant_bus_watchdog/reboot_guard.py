@@ -34,6 +34,12 @@ class RebootGuard:
         self._path = path
         self._p = policy
         self._bad_since: float | None = None
+        self._last_read_bad = False
+
+    @property
+    def last_read_bad(self) -> bool:
+        """Whether the most recent can_reboot() read found the state bad."""
+        return self._last_read_bad
 
     def _load(self) -> list[float] | None:
         """Return [] when missing, None when present but unreadable or invalid."""
@@ -63,6 +69,7 @@ class RebootGuard:
         loaded = self._load()
         if loaded is not None and any(t > now for t in loaded):
             loaded = None
+        self._last_read_bad = loaded is None
         if loaded is None and self._bad_since is None:
             self._bad_since = now
             _LOG.error(

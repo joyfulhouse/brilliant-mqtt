@@ -510,15 +510,34 @@ async def test_sustained_bus_handshake_failure_still_uses_reboot_guard(
         GuardPolicy(cooldown=300.0, cap=2, window=21_600.0),
     )
     # First qualifying decision reboots and records the stamp.
-    handle(should=decision, guard=guard, now=1900.0, reboot_fn=lambda: reboots.append("reboot"))
+    state_path = str(tmp_path / "reboot-guard.json")
+    handle(
+        should=decision,
+        guard=guard,
+        now=1900.0,
+        state_path=state_path,
+        reboot_fn=lambda: reboots.append("reboot"),
+    )
     # 100s later — inside the 300s cooldown — the cap (2) would still allow a
     # reboot, so this suppression proves the cooldown is what gates it.
-    handle(should=decision, guard=guard, now=2000.0, reboot_fn=lambda: reboots.append("reboot"))
+    handle(
+        should=decision,
+        guard=guard,
+        now=2000.0,
+        state_path=state_path,
+        reboot_fn=lambda: reboots.append("reboot"),
+    )
     assert reboots == ["reboot"]
     # Once the cooldown elapses (400s > 300s) and the cap still has headroom, the
     # next decision reboots again — confirming the cooldown, not the cap, held
     # the second one back.
-    handle(should=decision, guard=guard, now=2300.0, reboot_fn=lambda: reboots.append("reboot"))
+    handle(
+        should=decision,
+        guard=guard,
+        now=2300.0,
+        state_path=state_path,
+        reboot_fn=lambda: reboots.append("reboot"),
+    )
     assert reboots == ["reboot", "reboot"]
 
 
