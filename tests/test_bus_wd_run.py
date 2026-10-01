@@ -286,6 +286,9 @@ def test_readable_or_missing_state_write_failure_refuses_across_boots(
     failures = _write_failures(caplog)
     assert len(failures) == 4
     assert all(str(state) in record.getMessage() for record in failures)
+    if err == errno.ENOSPC:
+        assert all("OSError:" in record.getMessage() for record in failures)
+        assert all(record.getMessage().endswith(f"OSError: {state})") for record in failures)
 
 
 def test_last_read_bad_tracks_latest_authorizing_read(tmp_path: Any) -> None:
