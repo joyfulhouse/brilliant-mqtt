@@ -22,6 +22,9 @@ class _GuardLike(Protocol):
 
     def record_request(self, now: float) -> None: ...
 
+    @property
+    def last_read_bad(self) -> bool: ...
+
 
 class _LadderLike(Protocol):
     def observe(self, *, gateway_up: bool | None, now: float, reboot_eligible: bool) -> Action: ...
@@ -94,7 +97,25 @@ def handle(
         # eligible; otherwise log the blocked path (never silent).
         if reboot_eligible:
             _LOG.error("gateway down ~360s: GPIO/SDIO reset + reboot")
-            guard.record_request(now)
+            try:
+                guard.record_request(now)
+            except OSError as exc:
+                _LOG.error(
+                    "reboot guard state write failed (%s: %s)",
+                    type(exc).__name__,
+                    exc.filename2 or exc.filename,
+                )
+                if not guard.last_read_bad:
+                    # The state read fine but cannot be written (full disk,
+                    # read-only fs): an unrecorded reboot would leave the next
+                    # boot's guard just as permissive, so reboot-loop. Refuse.
+                    _LOG.error(
+                        "gateway down ~360s: reboot refused because it cannot be "
+                        "recorded — fix the guard state storage"
+                    )
+                    return None
+                # The state was already unreadable, so the guard's fail-closed
+                # window (re-armed on every start) bounds this reboot.
             result: int = recovery_mod.gpio_reset_and_reboot()
             if result == 0:
                 _LOG.error("reboot requested")

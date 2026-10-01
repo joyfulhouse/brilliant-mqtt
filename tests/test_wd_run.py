@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import errno
+import json
 import logging
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,6 +17,8 @@ from brilliant_wifi_watchdog.reboot_guard import GuardPolicy, RebootGuard
 
 
 class FakeGuard:
+    last_read_bad = False
+
     def __init__(self, ok: bool) -> None:
         self.ok = ok
         self.recorded: list[float] = []
@@ -28,6 +33,8 @@ class FakeGuard:
 class FlappingGuard:
     """A guard whose reads flap; an independent second read could catch a different
     answer than the first, as a transient flash hiccup (OSError → []) can too."""
+
+    last_read_bad = False
 
     def __init__(self, answers: list[bool]) -> None:
         self.answers = list(answers)
@@ -411,3 +418,140 @@ def test_completed_gateway_success_resets_the_outage(
 
     reboot_times = [when for when, action in actions if action == Action.GPIO_RESET_REBOOT]
     assert reboot_times == [750.0]
+
+
+# ---------------------------------------------------------------------------
+# handle — the reboot cannot be recorded (issue #195)
+# ---------------------------------------------------------------------------
+
+
+def _write_failures(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [
+        r
+        for r in caplog.records
+        if r.levelno == logging.ERROR and "state write failed" in r.getMessage()
+    ]
+
+
+def test_unreadable_state_reboots_once_per_cooldown(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A directory at the state path can be neither read nor written. The guard's
+    fail-closed window already bounds reboots, so the failed write is logged and
+    the authorized reboot still happens instead of crashing the daemon."""
+    state = tmp_path / "guard"
+    state.mkdir()
+    policy = GuardPolicy()
+    guard, rec = RebootGuard(str(state), policy), FakeRecovery()
+    assert guard.can_request(0.0) is False  # first bad read arms the window
+    assert guard.can_request(policy.cooldown) is True
+    with caplog.at_level(logging.ERROR, logger="brilliant_wifi_watchdog"):
+        result = run.handle(
+            Action.GPIO_RESET_REBOOT,
+            guard=guard,
+            now=policy.cooldown,
+            recovery_mod=rec,
+            reboot_eligible=True,
+        )
+    assert result == 0 and rec.calls == ["reboot"]
+    failures = _write_failures(caplog)
+    assert len(failures) == 1
+    assert "IsADirectoryError" in failures[0].getMessage()
+    assert str(state) in failures[0].getMessage()
+
+    # The panel reboots and a fresh watchdog starts: the window re-arms, so the
+    # next reboot waits a full cooldown again.
+    after_boot = policy.cooldown + 420.0
+    fresh = RebootGuard(str(state), policy)
+    assert fresh.can_request(after_boot) is False
+    assert fresh.can_request(after_boot + policy.cooldown - 1.0) is False
+    assert fresh.can_request(after_boot + policy.cooldown) is True
+
+
+@pytest.mark.parametrize("stale", [None, [1000.0]], ids=["missing-state", "readable-state"])
+@pytest.mark.parametrize(
+    ("error_type", "code"),
+    [(PermissionError, errno.EACCES), (OSError, errno.ENOSPC)],
+    ids=["read-only", "disk-full"],
+)
+def test_unwritable_readable_state_refuses_reboot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    stale: list[float] | None,
+    error_type: type[OSError],
+    code: int,
+) -> None:
+    """State that reads fine but cannot be written would authorize a reboot on
+    every boot, because nothing is recorded. Refuse it, log it, and keep running."""
+    state = tmp_path / "guard"
+    if stale is not None:
+        state.write_text(json.dumps(stale), encoding="utf-8")
+
+    def fail_replace(src: str, dst: str) -> None:
+        raise error_type(code, os.strerror(code), src)
+
+    monkeypatch.setattr(os, "replace", fail_replace)  # the guard's atomic save
+    rec = FakeRecovery()
+    now = 30000.0
+    with caplog.at_level(logging.ERROR, logger="brilliant_wifi_watchdog"):
+        for _boot in range(4):  # a fresh watchdog per simulated boot
+            guard = RebootGuard(str(state), GuardPolicy())
+            assert guard.can_request(now) is True
+            result = run.handle(
+                Action.GPIO_RESET_REBOOT,
+                guard=guard,
+                now=now,
+                recovery_mod=rec,
+                reboot_eligible=True,
+            )
+            assert result is None
+            now += 420.0
+    assert rec.calls == []
+    failures = _write_failures(caplog)
+    assert len(failures) == 4
+    assert all(f"{state}.tmp" in r.getMessage() for r in failures)
+    assert sum("reboot refused" in r.getMessage() for r in caplog.records) == 4
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+def test_read_only_state_directory_refuses_reboot(tmp_path: Path) -> None:
+    """The same refusal against a real read-only directory, not a patched write."""
+    directory = tmp_path / "state"
+    directory.mkdir()
+    state = directory / "guard"
+    state.write_text("[1000.0]", encoding="utf-8")
+    directory.chmod(0o555)
+    try:
+        rec = FakeRecovery()
+        for boot in range(3):
+            now = 30000.0 + 420.0 * boot
+            guard = RebootGuard(str(state), GuardPolicy())
+            assert guard.can_request(now) is True
+            run.handle(
+                Action.GPIO_RESET_REBOOT,
+                guard=guard,
+                now=now,
+                recovery_mod=rec,
+                reboot_eligible=True,
+            )
+        assert rec.calls == []
+    finally:
+        directory.chmod(0o755)
+
+
+def test_writable_state_records_then_reboots(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The normal path is unchanged: the stamp is persisted and the reboot fires."""
+    state = tmp_path / "guard"
+    guard, rec = RebootGuard(str(state), GuardPolicy()), FakeRecovery()
+    assert guard.can_request(5.0) is True
+    assert guard.last_read_bad is False
+    with caplog.at_level(logging.ERROR, logger="brilliant_wifi_watchdog"):
+        result = run.handle(
+            Action.GPIO_RESET_REBOOT, guard=guard, now=5.0, recovery_mod=rec, reboot_eligible=True
+        )
+    assert result == 0 and rec.calls == ["reboot"]
+    assert json.loads(state.read_text(encoding="utf-8")) == [5.0]
+    assert _write_failures(caplog) == []
