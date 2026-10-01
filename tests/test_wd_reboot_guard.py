@@ -261,3 +261,16 @@ def test_repaired_history_still_governs_at_window_expiry(
     _write_history(state, history)  # repaired inside the window
     assert guard.can_request(NOW + P.cooldown - 1.0) is False
     assert guard.can_request(NOW + P.cooldown) is False  # normal guard resumes
+
+
+def test_last_read_bad_tracks_the_latest_read_not_the_window(tmp_path: Path) -> None:
+    """last_read_bad reports what the most recent read found, even while the
+    fail-closed window armed by an earlier bad read is still running."""
+    path = tmp_path / "s.json"
+    path.write_text("not json", encoding="utf-8")
+    g = RebootGuard(str(path), P)
+    assert g.can_request(100.0) is False
+    assert g.last_read_bad is True
+    path.write_text("[]", encoding="utf-8")
+    assert g.can_request(200.0) is False  # still inside the window
+    assert g.last_read_bad is False

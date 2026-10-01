@@ -27,6 +27,7 @@ from brilliant_wifi_watchdog.reboot_guard import GuardPolicy, RebootGuard
 
 T = Thresholds()  # defaults: soft 90s, restart 180s, reboot 360s
 P = GuardPolicy(cooldown=3600.0, cap=3, window=21600.0)
+STATE = "/var/brilliant-mqtt/wifi-watchdog.state"  # handle()'s log fallback only
 
 
 class FakeRecovery:
@@ -65,7 +66,14 @@ def _poll(
     eligible = guard.can_request(t)
     action = ladder.observe(gateway_up=gateway_up, now=t, reboot_eligible=eligible)
     if action != Action.NONE:
-        run.handle(action, guard=guard, now=t, recovery_mod=rec, reboot_eligible=eligible)
+        run.handle(
+            action,
+            guard=guard,
+            now=t,
+            state_path=STATE,
+            recovery_mod=rec,
+            reboot_eligible=eligible,
+        )
     return action, eligible
 
 
@@ -263,6 +271,7 @@ def test_failed_or_unconfirmed_reboot_retries_within_cap_and_after_window(
                     action,
                     guard=guard,
                     now=now,
+                    state_path=STATE,
                     reboot_eligible=eligible,
                     recovery_mod=Recovery,
                 )

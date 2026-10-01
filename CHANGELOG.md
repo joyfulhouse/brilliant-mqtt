@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The Wi-Fi watchdog no longer crashes when it cannot record a reboot in its
+  guard state file. If the state file was already unreadable (for example, a
+  directory at that path), the watchdog logs the failure and still reboots,
+  at most once per cooldown. If the state reads fine but cannot be written
+  (full disk, read-only filesystem, permission denied), the watchdog logs the
+  failure and refuses to reboot, because an unrecorded reboot would be
+  authorized again on every boot. A panel in that state will not reboot itself
+  to recover Wi-Fi until an operator fixes the storage.
+  ([#195](https://github.com/joyfulhouse/brilliant-mqtt/issues/195))
 - The manifest uses minimum-version specs for `asyncssh` and `paho-mqtt`, so
   hassfest accepts them and the integration still installs on HA 2026.6.x.
 - A partial MQTT setter that supersedes a light or switch write still waiting
