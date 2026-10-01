@@ -57,6 +57,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fail-closed window is held in memory, so a watchdog restart re-arms it, and a
   restart loop faster than one cooldown keeps reboots blocked; this is the
   deliberate fail-closed direction.
+- The bus watchdog now treats corrupt, unreadable, wrong-type, non-finite, or
+  future reboot-guard state as lost history and blocks reboots for one cooldown
+  before resuming the normal cooldown and rolling cap
+  ([#193](https://github.com/joyfulhouse/brilliant-mqtt/issues/193)).
 
 ## [0.11.1] - 2026-09-27
 
