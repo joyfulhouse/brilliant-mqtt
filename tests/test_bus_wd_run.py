@@ -267,7 +267,7 @@ def test_readable_or_missing_state_write_failure_refuses_across_boots(
     def fail_replace(src: str, dst: str) -> None:
         if err == errno.ENOSPC:
             raise OSError(err, os.strerror(err))
-        raise OSError(err, os.strerror(err), src)
+        raise OSError(err, os.strerror(err), src, None, dst)
 
     monkeypatch.setattr(os, "replace", fail_replace)
     reboots: list[str] = []
@@ -286,7 +286,11 @@ def test_readable_or_missing_state_write_failure_refuses_across_boots(
     failures = _write_failures(caplog)
     assert len(failures) == 4
     assert all(str(state) in record.getMessage() for record in failures)
-    if err == errno.ENOSPC:
+    if err == errno.EACCES:
+        assert all(
+            record.getMessage().endswith(f"PermissionError: {state})") for record in failures
+        )
+    else:
         assert all("OSError:" in record.getMessage() for record in failures)
         assert all(record.getMessage().endswith(f"OSError: {state})") for record in failures)
 
