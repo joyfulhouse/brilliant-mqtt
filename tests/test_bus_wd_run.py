@@ -302,6 +302,18 @@ def test_last_read_bad_tracks_latest_authorizing_read(tmp_path: Any) -> None:
     assert guard.last_read_bad is False
 
 
+def test_bad_state_window_is_named_when_reboot_is_blocked(
+    tmp_path: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    state = tmp_path / "guard"
+    state.write_text("invalid", encoding="utf-8")
+    guard = RebootGuard(str(state), GuardPolicy(cooldown=10.0))
+    assert guard.can_reboot(0.0) is False
+    with caplog.at_level(logging.ERROR, logger="brilliant_bus_watchdog"):
+        handle(should=True, guard=guard, now=1.0, state_path=str(state))
+    assert any("bad-state window" in record.getMessage() for record in caplog.records)
+
+
 def test_future_stamp_is_a_bad_authorizing_read(tmp_path: Any) -> None:
     state = tmp_path / "guard"
     state.write_text("[999999.0]", encoding="utf-8")
