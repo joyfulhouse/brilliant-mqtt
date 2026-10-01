@@ -44,6 +44,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Automatic pre-ordinal admission now logs one INFO line per operation, and a
   failure to write its audit record is reported with an operator-safe detail
   (#182).
+- After the scene state file is found corrupt, only the first scene or mode
+  record the agent observes is treated as history and suppressed. Previously a
+  second record that arrived while the first one was still being written to
+  disk was also suppressed, so a real scene execution could go unreported
+  (#112).
 - The Wi-Fi watchdog no longer treats a corrupt, unreadable or wrong-type
   reboot-guard state file as an empty history. It blocks reboots for one
   cooldown period, logs the lost history once at ERROR, then resumes under the
