@@ -673,3 +673,41 @@ async def test_shutdown_failure_log_is_metadata_only(
     with caplog.at_level(logging.ERROR):
         await _cancel_ready_session(harness, _hot_poll_settings())
     assert "PRIVATE_WIRED_SHUTDOWN_SENTINEL" not in caplog.text
+
+
+class _BlockThenFailStateMqtt(FakeMqtt):
+    def __init__(self) -> None:
+        super().__init__()
+        self.arm = False
+        self.blocked = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def publish(self, topic: str, payload: str, retain: bool = False, qos: int = 0) -> None:
+        if self.arm and topic == STATE_TOPIC:
+            self.arm = False
+            self.blocked.set()
+            await self.release.wait()
+            raise RuntimeError("synthetic publish failure")
+        await super().publish(topic, payload, retain, qos)
+
+
+async def test_failed_publish_retries_evidence_that_arrived_during_it() -> None:
+    """Mutant P8 (#177): new evidence during a failing publish must still publish."""
+    mqtt = _BlockThenFailStateMqtt()
+    bus, _, bridge = await _bridged(_dimmer(on="0"), mqtt=mqtt)
+    mqtt.arm = True
+    first = asyncio.create_task(bus.emit(_dimmer(on="1")))
+    try:
+        await asyncio.wait_for(mqtt.blocked.wait(), 2)
+        await asyncio.wait_for(bus.emit(_dimmer(on="1", power="42")), 2)
+        mqtt.release.set()
+        await asyncio.wait_for(first, 2)
+        publisher = bridge._wired[PID].publisher
+        assert publisher is not None
+        await asyncio.wait_for(publisher, 2)
+        states = _states(mqtt)
+        assert [(state["state"], state["power"]) for state in states] == [("ON", 4.2)]
+    finally:
+        mqtt.release.set()
+        await asyncio.gather(first, return_exceptions=True)
+        await bridge.shutdown_wired_feedback()

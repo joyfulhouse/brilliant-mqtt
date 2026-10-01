@@ -4,6 +4,9 @@ import asyncio
 import json
 import os
 import stat
+import subprocess
+import sys
+import textwrap
 import threading
 from collections.abc import Callable
 from pathlib import Path
@@ -377,16 +380,15 @@ async def test_cancellation_keeps_write_serialized_until_thread_finishes(
     first = "brilliant/kitchen/light-1/state"
     second = "brilliant/kitchen/light-2/state"
     expected_manifest = _manifest([first, second])
-    real_to_thread = asyncio.to_thread
     real_write = retained_topics_module._write_payload
     loop = asyncio.get_running_loop()
     release_first_write = threading.Event()
     first_thread_started = asyncio.Event()
     first_thread_finished = asyncio.Event()
-    second_write_submitted = asyncio.Event()
-    write_submissions = 0
+    submitted: list[str] = []
 
     def blocking_write(write_path: Path, payload: str) -> None:
+        submitted.append(payload)
         if payload == _manifest([first]):
             loop.call_soon_threadsafe(first_thread_started.set)
             release_first_write.wait()
@@ -397,21 +399,7 @@ async def test_cancellation_keeps_write_serialized_until_thread_finishes(
             return
         real_write(write_path, payload)
 
-    async def track_to_thread(
-        function: Callable[..., object],
-        /,
-        *args: object,
-        **kwargs: object,
-    ) -> object:
-        nonlocal write_submissions
-        if function is blocking_write:
-            write_submissions += 1
-            if write_submissions == 2:
-                second_write_submitted.set()
-        return await real_to_thread(function, *args, **kwargs)
-
     monkeypatch.setattr(retained_topics_module, "_write_payload", blocking_write)
-    monkeypatch.setattr(asyncio, "to_thread", track_to_thread)
 
     first_publish = asyncio.create_task(ledger.async_publish(mqtt, first, "one"))
     await first_thread_started.wait()
@@ -423,8 +411,8 @@ async def test_cancellation_keeps_write_serialized_until_thread_finishes(
     pending_after_repeat_cancel = not first_publish.done()
 
     second_publish = asyncio.create_task(ledger.async_publish(mqtt, second, "two"))
-    await asyncio.sleep(0)
-    second_submitted_before_release = second_write_submitted.is_set()
+    await asyncio.sleep(0.01)
+    second_submitted_before_release = len(submitted) > 1
     release_first_write.set()
     await first_thread_finished.wait()
     first_result, second_result = await asyncio.gather(
@@ -494,42 +482,13 @@ async def test_loaded_instances_for_normalized_path_publish_union(
     first = "brilliant/kitchen/light-1/state"
     second = "brilliant/kitchen/light-2/state"
     expected_manifest = _manifest([first, second])
-    real_to_thread = asyncio.to_thread
-    first_write_started = asyncio.Event()
-    release_first_write = asyncio.Event()
-    second_write_started = asyncio.Event()
-    write_count = 0
-
-    async def controlled_to_thread(
-        function: Callable[..., object],
-        /,
-        *args: object,
-        **kwargs: object,
-    ) -> object:
-        nonlocal write_count
-        if function is retained_topics_module._write_payload:
-            write_count += 1
-            if write_count == 1:
-                first_write_started.set()
-                await release_first_write.wait()
-            else:
-                second_write_started.set()
-            assert len(args) == 2
-            assert not kwargs
-            write_path, payload = args
-            assert isinstance(write_path, Path)
-            assert isinstance(payload, str)
-            retained_topics_module._write_payload(write_path, payload)
-            return None
-        return await real_to_thread(function, *args, **kwargs)
-
-    monkeypatch.setattr(asyncio, "to_thread", controlled_to_thread)
+    writes = _HeldWrites(monkeypatch, hold=lambda payload: payload == _manifest([first]))
     first_publish = asyncio.create_task(first_ledger.async_publish(mqtt, first, "one"))
-    await first_write_started.wait()
+    await writes.started.wait()
     second_publish = asyncio.create_task(second_ledger.async_publish(mqtt, second, "two"))
-    await asyncio.sleep(0)
-    second_started_before_release = second_write_started.is_set()
-    release_first_write.set()
+    await asyncio.sleep(0.01)
+    second_started_before_release = len(writes.submitted) > 1
+    await writes.drain()
     await asyncio.gather(first_publish, second_publish)
 
     assert not second_started_before_release
@@ -704,3 +663,789 @@ async def test_each_persistence_uses_a_private_sibling_temporary_file(
     assert replaced_sources[0] != replaced_sources[1]
     assert all(source.parent == path.parent for source in replaced_sources)
     assert all(not source.exists() for source in replaced_sources)
+
+
+class _HeldWrites:
+    """Hold matching ledger writes in their worker thread until released."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, *, hold: Callable[[str], bool]) -> None:
+        self._hold = hold
+        self._loop = asyncio.get_running_loop()
+        self.release = threading.Event()
+        self.started = asyncio.Event()
+        self.finished = asyncio.Event()
+        self.submitted: list[str] = []
+        self._real_write = retained_topics_module._write_payload
+        monkeypatch.setattr(retained_topics_module, "_write_payload", self._write)
+
+    def _write(self, path: Path, payload: str) -> None:
+        self.submitted.append(payload)
+        if not self._hold(payload):
+            self._real_write(path, payload)
+            return
+        self._loop.call_soon_threadsafe(self.started.set)
+        self.release.wait()
+        try:
+            self._real_write(path, payload)
+        finally:
+            self._loop.call_soon_threadsafe(self.finished.set)
+
+    async def drain(self) -> None:
+        self.release.set()
+        if self.started.is_set():
+            await self.finished.wait()
+
+
+async def _settled(ledger: RetainedTopicLedger) -> None:
+    """Wait until a late write's completion has reached the event loop.
+
+    The thread finishing is not enough: its future settles through a later
+    call_soon_threadsafe, and only its done-callback forgets the stalled write.
+    """
+    stalled = ledger._state.stalled_write
+    if stalled is not None:
+        await asyncio.wait({stalled}, timeout=5)
+        await asyncio.sleep(0)  # Done-callbacks run one loop iteration later.
+    assert ledger._state.stalled_write is None
+
+
+def test_persist_deadline_matches_the_mqtt_acknowledgement_bound() -> None:
+    assert retained_topics_module.PERSIST_DEADLINE_S == 10.0
+
+
+async def test_stalled_claim_fails_closed_at_the_deadline_without_publishing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "owned-topics.json"
+    ledger = await _loaded_ledger(path)
+    mqtt = FakeMqtt()
+    existing = "brilliant/kitchen/light-1/state"
+    stalled = "brilliant/kitchen/light-2/state"
+    later = "brilliant/kitchen/light-3/state"
+    await ledger.async_publish(mqtt, existing, "on")
+    mqtt.published.clear()
+    monkeypatch.setattr(retained_topics_module, "PERSIST_DEADLINE_S", 0.05)
+    writes = _HeldWrites(monkeypatch, hold=lambda payload: stalled in payload)
+    try:
+        with pytest.raises(RetainedLedgerError, match="exceeded"):
+            await asyncio.wait_for(ledger.async_publish(mqtt, stalled, "on"), 2)
+
+        assert not writes.release.is_set()
+        assert mqtt.published == []
+        assert ledger.topics == frozenset({existing})
+        assert isinstance(ledger.consume_failure(), RetainedLedgerError)
+        assert ledger.consume_failure() is None
+
+        # The late write still owns the file: a second claim must not race it.
+        with pytest.raises(RetainedLedgerError, match="still stalled"):
+            await ledger.async_publish(mqtt, later, "on")
+        assert len(writes.submitted) == 1
+        assert mqtt.published == []
+
+        # The file may no longer match memory, so even an owned topic fails
+        # closed until the late write settles.
+        with pytest.raises(RetainedLedgerError, match="still stalled"):
+            await ledger.async_publish(mqtt, existing, "off")
+        assert mqtt.published == []
+    finally:
+        await writes.drain()
+
+    # The late write replaced the file atomically with the uncommitted claim.
+    assert path.read_text(encoding="utf-8") == _manifest([existing, stalled])
+    await _settled(ledger)
+    monkeypatch.setattr(retained_topics_module, "PERSIST_DEADLINE_S", 10.0)
+    # The next publish re-persists memory before anything reaches the broker.
+    await ledger.async_publish(mqtt, existing, "off")
+    assert path.read_text(encoding="utf-8") == _manifest([existing])
+    assert mqtt.published == [
+        (ledger.ownership_topic, _manifest([existing]), True),
+        (existing, "off", True),
+    ]
+    await ledger.async_publish(mqtt, later, "on")
+    assert ledger.topics == frozenset({existing, later})
+    assert path.read_text(encoding="utf-8") == _manifest([existing, later])
+    assert [name for name in os.listdir(tmp_path) if name.endswith(".tmp")] == []
+
+
+async def test_cancellation_during_a_stalled_claim_is_bounded_by_the_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "owned-topics.json"
+    ledger = await _loaded_ledger(path)
+    mqtt = FakeMqtt()
+    monkeypatch.setattr(retained_topics_module, "PERSIST_DEADLINE_S", 0.05)
+    writes = _HeldWrites(monkeypatch, hold=lambda _payload: True)
+    publish = asyncio.create_task(ledger.async_publish(mqtt, "brilliant/kitchen/bridge", "{}"))
+    try:
+        await writes.started.wait()
+        publish.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(publish, 2)
+        assert not writes.release.is_set()
+        assert mqtt.published == []
+        assert ledger.topics == frozenset()
+    finally:
+        await writes.drain()
+        await asyncio.gather(publish, return_exceptions=True)
+
+
+async def test_owned_topic_publishes_while_another_claim_waits_for_disk(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "owned-topics.json"
+    ledger = await _loaded_ledger(path)
+    mqtt = FakeMqtt()
+    existing = "brilliant/kitchen/light-1/state"
+    claimed = "brilliant/kitchen/light-2/state"
+    await ledger.async_publish(mqtt, existing, "on")
+    mqtt.published.clear()
+    writes = _HeldWrites(monkeypatch, hold=lambda payload: claimed in payload)
+    claim = asyncio.create_task(ledger.async_publish(mqtt, claimed, "on"))
+    try:
+        await writes.started.wait()
+        await asyncio.wait_for(ledger.async_publish(mqtt, existing, "off"), 2)
+        assert mqtt.published == [(existing, "off", True)]
+    finally:
+        await writes.drain()
+        await claim
+    assert mqtt.published[-1] == (claimed, "on", True)
+
+
+async def test_owned_topic_still_waits_for_a_fresh_manifest_after_load(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "owned-topics.json"
+    existing = "brilliant/kitchen/light-1/state"
+    claimed = "brilliant/kitchen/light-2/state"
+    path.write_text(_manifest([existing]), encoding="utf-8")
+    ledger = await _loaded_ledger(path)
+    mqtt = FakeMqtt()
+    writes = _HeldWrites(monkeypatch, hold=lambda payload: claimed in payload)
+    claim = asyncio.create_task(ledger.async_publish(mqtt, claimed, "on"))
+    publish = asyncio.create_task(ledger.async_publish(mqtt, existing, "off"))
+    try:
+        await writes.started.wait()
+        await asyncio.sleep(0.01)
+        assert mqtt.published == []
+    finally:
+        await writes.drain()
+        await asyncio.gather(claim, publish)
+    assert mqtt.published[0][0] == ledger.ownership_topic
+
+
+async def test_owned_topic_does_not_overtake_its_own_queued_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "owned-topics.json"
+    ledger = await _loaded_ledger(path)
+    mqtt = FakeMqtt()
+    existing = "brilliant/kitchen/light-1/state"
+    claimed = "brilliant/kitchen/light-2/state"
+    await ledger.async_publish(mqtt, existing, "on")
+    mqtt.published.clear()
+    writes = _HeldWrites(monkeypatch, hold=lambda payload: claimed in payload)
+    lock = retained_topics_module._path_state(ledger._path, PANEL).lock
+    await lock.acquire()
+    claim = asyncio.create_task(ledger.async_publish(mqtt, claimed, "on"))
+    await asyncio.sleep(0)
+    older = asyncio.create_task(ledger.async_publish(mqtt, existing, "older"))
+    await asyncio.sleep(0)
+    lock.release()
+    newer: asyncio.Task[None] | None = None
+    try:
+        await writes.started.wait()
+        newer = asyncio.create_task(ledger.async_publish(mqtt, existing, "newer"))
+        await asyncio.sleep(0.01)
+    finally:
+        await writes.drain()
+        await asyncio.gather(claim, older, *(() if newer is None else (newer,)))
+    assert [payload for topic, payload, _ in mqtt.published if topic == existing] == [
+        "older",
+        "newer",
+    ]
+
+
+async def test_clear_is_not_overtaken_while_its_persistence_waits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "owned-topics.json"
+    ledger = await _loaded_ledger(path)
+    mqtt = FakeMqtt()
+    removed = "brilliant/kitchen/light-1/state"
+    await ledger.async_publish(mqtt, removed, "on")
+    await ledger.async_publish(mqtt, "brilliant/kitchen/light-2/state", "on")
+    mqtt.published.clear()
+    writes = _HeldWrites(monkeypatch, hold=lambda payload: removed not in payload)
+    clear = asyncio.create_task(ledger.async_clear(mqtt, removed))
+    republish = asyncio.create_task(ledger.async_publish(mqtt, removed, "late"))
+    try:
+        await writes.started.wait()
+        await asyncio.sleep(0.01)
+        assert mqtt.published == [(removed, "", True)]
+    finally:
+        await writes.drain()
+        await asyncio.gather(clear, republish)
+
+
+async def test_stalled_clear_cannot_orphan_a_republished_topic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F176-C-1: a late clear must not drop a topic the broker still retains."""
+    path = tmp_path / "owned-topics.json"
+    ledger = await _loaded_ledger(path)
+    mqtt = FakeMqtt()
+    removed = "brilliant/kitchen/light-1/state"
+    kept = "brilliant/kitchen/light-2/state"
+    await ledger.async_publish(mqtt, removed, "on")
+    await ledger.async_publish(mqtt, kept, "on")
+    monkeypatch.setattr(retained_topics_module, "PERSIST_DEADLINE_S", 0.05)
+    writes = _HeldWrites(monkeypatch, hold=lambda payload: removed not in payload)
+    try:
+        with pytest.raises(RetainedLedgerError, match="exceeded"):
+            await asyncio.wait_for(ledger.async_clear(mqtt, removed), 2)
+        assert removed in ledger.topics
+        mqtt.published.clear()
+        with pytest.raises(RetainedLedgerError, match="still stalled"):
+            await ledger.async_publish(mqtt, removed, "again")
+        assert mqtt.published == []
+    finally:
+        await writes.drain()
+
+    # The late clear has landed on disk without the topic.
+    assert path.read_text(encoding="utf-8") == _manifest([kept])
+    await _settled(ledger)
+    monkeypatch.setattr(retained_topics_module, "PERSIST_DEADLINE_S", 10.0)
+    await ledger.async_publish(mqtt, removed, "again")
+
+    assert (removed, "again", True) in mqtt.published
+    reloaded = await _loaded_ledger(path)
+    assert reloaded.topics == frozenset({removed, kept})
+
+
+async def test_late_write_failure_is_logged_without_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """F176-C-4: the late write's error is logged by class only."""
+    ledger = await _loaded_ledger(tmp_path / "owned-topics.json")
+    topic = "brilliant/kitchen/light-1/state"
+    monkeypatch.setattr(retained_topics_module, "PERSIST_DEADLINE_S", 0.05)
+    loop = asyncio.get_running_loop()
+    release = threading.Event()
+    failed = asyncio.Event()
+
+    def stalled_failing_write(path: Path, payload: str) -> NoReturn:
+        del path
+        release.wait()
+        loop.call_soon_threadsafe(failed.set)
+        raise OSError(f"disk failed writing {payload}")
+
+    monkeypatch.setattr(retained_topics_module, "_write_payload", stalled_failing_write)
+    with pytest.raises(RetainedLedgerError, match="exceeded"):
+        await ledger.async_publish(FakeMqtt(), topic, "on")
+    with caplog.at_level("WARNING", logger="brilliant_mqtt.retained_topics"):
+        release.set()
+        await failed.wait()
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+    assert caplog.messages == ["RETAINED_LEDGER_LATE_WRITE_FAILED OSError"]
+    assert all(record.exc_info is None for record in caplog.records)
+
+
+def test_ledger_writes_do_not_hold_interpreter_exit(tmp_path: Path) -> None:
+    """F176-C-2: a stalled ledger write must not block asyncio.run() or exit."""
+    script = tmp_path / "stall.py"
+    script.write_text(
+        textwrap.dedent(
+            f"""
+            import asyncio, threading
+            from pathlib import Path
+            from brilliant_mqtt import retained_topics as rt
+            from tests.fakes import FakeMqtt
+
+            rt.PERSIST_DEADLINE_S = 0.05
+            rt._write_payload = lambda path, payload: threading.Event().wait()
+
+            async def main():
+                ledger = rt.RetainedTopicLedger("kitchen", Path({str(tmp_path / "l.json")!r}))
+                await ledger.async_load()
+                try:
+                    await ledger.async_publish(FakeMqtt(), "brilliant/kitchen/bridge", "{{}}")
+                except rt.RetainedLedgerError:
+                    print("failed-closed")
+
+            asyncio.run(main())
+            """
+        ),
+        encoding="utf-8",
+    )
+    completed = subprocess.run(
+        [sys.executable, str(script)],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        cwd=Path(__file__).resolve().parents[1],
+        env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "failed-closed"
+
+
+async def test_stale_ledger_topic_waits_for_the_repair_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A topic a late clear dropped from disk waits for the re-persist."""
+    path = tmp_path / "owned-topics.json"
+    ledger = await _loaded_ledger(path)
+    mqtt = FakeMqtt()
+    removed = "brilliant/kitchen/light-1/state"
+    kept = "brilliant/kitchen/light-2/state"
+    await ledger.async_publish(mqtt, removed, "on")
+    await ledger.async_publish(mqtt, kept, "on")
+    monkeypatch.setattr(retained_topics_module, "PERSIST_DEADLINE_S", 0.05)
+    stall = _HeldWrites(monkeypatch, hold=lambda payload: removed not in payload)
+    with pytest.raises(RetainedLedgerError, match="exceeded"):
+        await asyncio.wait_for(ledger.async_clear(mqtt, removed), 2)
+    await stall.drain()
+    await _settled(ledger)
+    assert path.read_text(encoding="utf-8") == _manifest([kept])
+
+    monkeypatch.setattr(retained_topics_module, "PERSIST_DEADLINE_S", 10.0)
+    repair = _HeldWrites(monkeypatch, hold=lambda _payload: True)
+    mqtt.published.clear()
+    repairing = asyncio.create_task(ledger.async_publish(mqtt, kept, "off"))
+    early = asyncio.create_task(ledger.async_publish(mqtt, removed, "again"))
+    try:
+        await asyncio.wait_for(repair.started.wait(), 5)
+        await asyncio.sleep(0.01)
+        assert mqtt.published == []
+    finally:
+        await repair.drain()
+        await asyncio.gather(repairing, early)
+    assert path.read_text(encoding="utf-8") == _manifest([removed, kept])
+    assert mqtt.published[-1] == (removed, "again", True)
+
+
+async def test_write_thread_start_failure_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F176-C-6: thread exhaustion reaches the retained_ledger fail-closed path."""
+    path = tmp_path / "owned-topics.json"
+    ledger = await _loaded_ledger(path)
+    mqtt = FakeMqtt()
+    existing = "brilliant/kitchen/light-1/state"
+    await ledger.async_publish(mqtt, existing, "on")
+    mqtt.published.clear()
+
+    real_start = threading.Thread.start
+
+    def refuse_start(self: threading.Thread) -> None:
+        # Only the ledger's writer; the event loop's own teardown still starts.
+        if self.name == "retained-ledger-write":
+            raise RuntimeError("can't start new thread")
+        real_start(self)
+
+    monkeypatch.setattr(threading.Thread, "start", refuse_start)
+
+    with pytest.raises(RetainedLedgerError, match="could not start"):
+        await ledger.async_publish(mqtt, "brilliant/kitchen/light-2/state", "on")
+
+    state = retained_topics_module._path_state(ledger._path, PANEL)
+    assert not state.claim_pending
+    assert state.stalled_write is None
+    assert not state.disk_stale
+    assert ledger.topics == frozenset({existing})
+    assert mqtt.published == []
+    assert isinstance(ledger.consume_failure(), RetainedLedgerError)
+    assert path.read_text(encoding="utf-8") == _manifest([existing])
+
+
+async def test_load_refuses_while_another_ledgers_write_is_stalled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F176-D-1: a second ledger for the path cannot load under a late write."""
+    path = tmp_path / "owned-topics.json"
+    first = await _loaded_ledger(path)
+    topic = "brilliant/kitchen/light-1/state"
+    monkeypatch.setattr(retained_topics_module, "PERSIST_DEADLINE_S", 0.05)
+    writes = _HeldWrites(monkeypatch, hold=lambda _payload: True)
+    second = RetainedTopicLedger(PANEL, path)
+    try:
+        with pytest.raises(RetainedLedgerError, match="exceeded"):
+            await asyncio.wait_for(first.async_publish(FakeMqtt(), topic, "on"), 2)
+        with pytest.raises(RetainedLedgerError, match="still stalled"):
+            await second.async_load()
+    finally:
+        await writes.drain()
+
+    await _settled(first)
+    await second.async_load()
+    assert second.topics == frozenset({topic})
+
+
+async def test_recovered_ledger_returns_to_the_write_free_fast_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F176-E-1: once a repair write succeeds, owned publishes stop rewriting disk."""
+    ledger = await _loaded_ledger(tmp_path / "owned-topics.json")
+    mqtt = FakeMqtt()
+    existing = "brilliant/kitchen/light-1/state"
+    stalled = "brilliant/kitchen/light-2/state"
+    later = "brilliant/kitchen/light-3/state"
+    await ledger.async_publish(mqtt, existing, "on")
+    monkeypatch.setattr(retained_topics_module, "PERSIST_DEADLINE_S", 0.05)
+    stall = _HeldWrites(monkeypatch, hold=lambda payload: stalled in payload)
+    with pytest.raises(RetainedLedgerError, match="exceeded"):
+        await asyncio.wait_for(ledger.async_publish(mqtt, stalled, "on"), 5)
+    await stall.drain()
+    await _settled(ledger)
+    monkeypatch.setattr(retained_topics_module, "PERSIST_DEADLINE_S", 10.0)
+    await ledger.async_publish(mqtt, existing, "repair")
+
+    writes = _HeldWrites(monkeypatch, hold=lambda payload: later in payload)
+    await ledger.async_publish(mqtt, existing, "plain")
+    assert writes.submitted == []
+
+    claim = asyncio.create_task(ledger.async_publish(mqtt, later, "on"))
+    try:
+        await asyncio.wait_for(writes.started.wait(), 5)
+        mqtt.published.clear()
+        await asyncio.wait_for(ledger.async_publish(mqtt, existing, "fast"), 5)
+        assert mqtt.published == [(existing, "fast", True)]
+    finally:
+        await writes.drain()
+        await asyncio.gather(claim, return_exceptions=True)
+
+
+async def test_owned_topic_waits_for_a_fresh_manifest_after_repeat_load(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F176-E-2: reloading the same ledger forgets which manifest it acknowledged."""
+    ledger = await _loaded_ledger(tmp_path / "owned-topics.json")
+    mqtt = FakeMqtt()
+    existing = "brilliant/kitchen/light-1/state"
+    claimed = "brilliant/kitchen/light-2/state"
+    await ledger.async_publish(mqtt, existing, "on")
+    await ledger.async_load()
+    mqtt.published.clear()
+    writes = _HeldWrites(monkeypatch, hold=lambda payload: claimed in payload)
+    claim = asyncio.create_task(ledger.async_publish(mqtt, claimed, "on"))
+    publish = asyncio.create_task(ledger.async_publish(mqtt, existing, "off"))
+    try:
+        await asyncio.wait_for(writes.started.wait(), 5)
+        await asyncio.sleep(0.01)
+        assert mqtt.published == []
+    finally:
+        await writes.drain()
+        await asyncio.gather(claim, publish)
+    assert mqtt.published[0][0] == ledger.ownership_topic
+
+
+async def test_cleared_topic_cannot_take_the_fast_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F176-E-3: a clear withdraws the topic from this ledger's acknowledged set."""
+    ledger = await _loaded_ledger(tmp_path / "owned-topics.json")
+    mqtt = FakeMqtt()
+    removed = "brilliant/kitchen/light-1/state"
+    kept = "brilliant/kitchen/light-2/state"
+    claimed = "brilliant/kitchen/light-3/state"
+    await ledger.async_publish(mqtt, removed, "on")
+    await ledger.async_publish(mqtt, kept, "on")
+    await ledger.async_clear(mqtt, removed)
+    assert removed not in ledger._acknowledged_topics
+    mqtt.published.clear()
+    writes = _HeldWrites(monkeypatch, hold=lambda payload: claimed in payload)
+    claim = asyncio.create_task(ledger.async_publish(mqtt, claimed, "on"))
+    republish = asyncio.create_task(ledger.async_publish(mqtt, removed, "again"))
+    try:
+        await asyncio.wait_for(writes.started.wait(), 5)
+        await asyncio.sleep(0.01)
+        assert mqtt.published == []
+    finally:
+        await writes.drain()
+        await asyncio.gather(claim, republish)
+    assert (removed, "again", True) in mqtt.published
+
+    await ledger.async_clear_all(mqtt)
+    assert ledger._acknowledged_topics == frozenset()
+
+
+async def test_topic_cleared_by_another_ledger_cannot_take_the_fast_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F176-E-3: ownership is checked against the shared topics, not only this ledger."""
+    path = tmp_path / "owned-topics.json"
+    first = await _loaded_ledger(path)
+    mqtt = FakeMqtt()
+    shared = "brilliant/kitchen/light-1/state"
+    claimed = "brilliant/kitchen/light-2/state"
+    await first.async_publish(mqtt, shared, "on")
+    second = await _loaded_ledger(path)
+    await second.async_clear(mqtt, shared)
+    mqtt.published.clear()
+    writes = _HeldWrites(monkeypatch, hold=lambda payload: claimed in payload)
+    claim = asyncio.create_task(second.async_publish(mqtt, claimed, "on"))
+    stale = asyncio.create_task(first.async_publish(mqtt, shared, "again"))
+    try:
+        await asyncio.wait_for(writes.started.wait(), 5)
+        await asyncio.sleep(0.01)
+        assert mqtt.published == []
+    finally:
+        await writes.drain()
+        await asyncio.gather(claim, stale)
+    assert path.read_text(encoding="utf-8") == _manifest([shared, claimed])
+
+
+def test_late_write_after_its_loop_closed_is_swallowed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F176-E-4: a write settling after its loop closed must not raise in its thread."""
+    path = tmp_path / "owned-topics.json"
+    release = threading.Event()
+    real_write = retained_topics_module._write_payload
+
+    def held_write(write_path: Path, payload: str) -> None:
+        release.wait()
+        real_write(write_path, payload)
+
+    monkeypatch.setattr(retained_topics_module, "_write_payload", held_write)
+    monkeypatch.setattr(retained_topics_module, "PERSIST_DEADLINE_S", 0.05)
+    thread_errors: list[BaseException | None] = []
+    monkeypatch.setattr(threading, "excepthook", lambda args: thread_errors.append(args.exc_value))
+
+    async def stall() -> None:
+        ledger = await _loaded_ledger(path)
+        with pytest.raises(RetainedLedgerError, match="exceeded"):
+            await ledger.async_publish(FakeMqtt(), "brilliant/kitchen/bridge", "{}")
+
+    before = set(threading.enumerate())
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(stall())
+    finally:
+        loop.close()
+    writers = [
+        thread
+        for thread in threading.enumerate()
+        if thread.name == "retained-ledger-write" and thread not in before
+    ]
+    assert len(writers) == 1
+    release.set()
+    writers[0].join(5)
+
+    assert not writers[0].is_alive()
+    assert thread_errors == []
+    assert path.read_text(encoding="utf-8") == _manifest(["brilliant/kitchen/bridge"])
+
+
+async def test_reload_clears_the_stale_disk_mark(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F176-E-5: a reload trusts the file it just read; no repair write follows."""
+    ledger = await _loaded_ledger(tmp_path / "owned-topics.json")
+    mqtt = FakeMqtt()
+    existing = "brilliant/kitchen/light-1/state"
+    stalled = "brilliant/kitchen/light-2/state"
+    await ledger.async_publish(mqtt, existing, "on")
+    monkeypatch.setattr(retained_topics_module, "PERSIST_DEADLINE_S", 0.05)
+    stall = _HeldWrites(monkeypatch, hold=lambda payload: stalled in payload)
+    with pytest.raises(RetainedLedgerError, match="exceeded"):
+        await asyncio.wait_for(ledger.async_publish(mqtt, stalled, "on"), 5)
+    assert ledger._state.disk_stale
+    await stall.drain()
+    await _settled(ledger)
+    monkeypatch.setattr(retained_topics_module, "PERSIST_DEADLINE_S", 10.0)
+
+    await ledger.async_load()
+
+    assert not ledger._state.disk_stale
+    assert ledger.topics == frozenset({existing, stalled})
+    writes = _HeldWrites(monkeypatch, hold=lambda _payload: False)
+    await ledger.async_publish(mqtt, existing, "off")
+    assert writes.submitted == []
+
+
+async def test_first_ledger_failure_is_the_one_reported(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F176-E-5: later failures never replace the first latched one."""
+    ledger = await _loaded_ledger(tmp_path / "owned-topics.json")
+    monkeypatch.setattr(retained_topics_module, "PERSIST_DEADLINE_S", 0.05)
+    writes = _HeldWrites(monkeypatch, hold=lambda _payload: True)
+    try:
+        with pytest.raises(RetainedLedgerError, match="exceeded") as first:
+            await ledger.async_publish(FakeMqtt(), "brilliant/kitchen/light-1/state", "on")
+        with pytest.raises(RetainedLedgerError, match="still stalled") as second:
+            await ledger.async_publish(FakeMqtt(), "brilliant/kitchen/light-2/state", "on")
+    finally:
+        await writes.drain()
+
+    assert first.value is not second.value
+    assert ledger.consume_failure() is first.value
+    assert ledger.consume_failure() is None
+
+
+class _SuspendedDeliveryMqtt(FakeMqtt):
+    """Suspend one matching publish before delivery until released."""
+
+    def __init__(self, topic: str, payload: str) -> None:
+        super().__init__()
+        self._match = (topic, payload)
+        self.suspended = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def publish(self, topic: str, payload: str, retain: bool = False, qos: int = 0) -> None:
+        if (topic, payload) == self._match and not self.suspended.is_set():
+            self.suspended.set()
+            await self.release.wait()
+        await super().publish(topic, payload, retain, qos)
+
+
+@pytest.mark.parametrize("clearer", ["same", "second"])
+async def test_clear_waits_for_an_in_flight_fast_path_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    clearer: str,
+) -> None:
+    """F176-O-1: a fast-path publish in flight cannot outlive a clear of its topic."""
+    path = tmp_path / "owned-topics.json"
+    owned = "brilliant/kitchen/light-1/state"
+    claimed = "brilliant/kitchen/light-2/state"
+    mqtt = _SuspendedDeliveryMqtt(owned, "OFF")
+    publisher = await _loaded_ledger(path)
+    await publisher.async_publish(mqtt, owned, "ON")
+    other = publisher if clearer == "same" else await _loaded_ledger(path)
+    writes = _HeldWrites(monkeypatch, hold=lambda payload: claimed in payload)
+    claim = asyncio.create_task(other.async_publish(mqtt, claimed, "ON"))
+    off: asyncio.Task[None] | None = None
+    clear: asyncio.Task[None] | None = None
+    try:
+        await asyncio.wait_for(writes.started.wait(), 5)
+        off = asyncio.create_task(publisher.async_publish(mqtt, owned, "OFF"))
+        await asyncio.wait_for(mqtt.suspended.wait(), 5)
+        await writes.drain()
+        await asyncio.wait_for(claim, 5)
+        clear = asyncio.create_task(other.async_clear(mqtt, owned))
+        for _ in range(20):
+            await asyncio.sleep(0)
+        mqtt.release.set()
+        await asyncio.wait_for(asyncio.gather(off, clear), 5)
+    finally:
+        mqtt.release.set()
+        await writes.drain()
+        await asyncio.gather(
+            claim, *(task for task in (off, clear) if task is not None), return_exceptions=True
+        )
+
+    deliveries = [payload for topic, payload, _retain in mqtt.published if topic == owned]
+    assert deliveries == ["ON", "OFF", ""]
+    assert owned not in publisher.topics
+    assert path.read_text(encoding="utf-8") == _manifest([claimed])
+
+
+async def test_cancelled_fast_path_publish_releases_a_waiting_clear(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F176-O-1: a clear waiting on an in-flight publish is not stranded by its cancellation."""
+    path = tmp_path / "owned-topics.json"
+    owned = "brilliant/kitchen/light-1/state"
+    claimed = "brilliant/kitchen/light-2/state"
+    mqtt = _SuspendedDeliveryMqtt(owned, "OFF")
+    ledger = await _loaded_ledger(path)
+    await ledger.async_publish(mqtt, owned, "ON")
+    writes = _HeldWrites(monkeypatch, hold=lambda payload: claimed in payload)
+    claim = asyncio.create_task(ledger.async_publish(mqtt, claimed, "ON"))
+    off = asyncio.create_task(ledger.async_publish(mqtt, owned, "OFF"))
+    clear: asyncio.Task[None] | None = None
+    try:
+        await asyncio.wait_for(writes.started.wait(), 5)
+        await asyncio.wait_for(mqtt.suspended.wait(), 5)
+        await writes.drain()
+        await asyncio.wait_for(claim, 5)
+        clear = asyncio.create_task(ledger.async_clear(mqtt, owned))
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert not clear.done()
+        off.cancel()
+        await asyncio.wait_for(clear, 5)
+    finally:
+        mqtt.release.set()
+        await writes.drain()
+        await asyncio.gather(
+            claim, off, *(() if clear is None else (clear,)), return_exceptions=True
+        )
+
+    assert off.cancelled()
+    assert ledger._state.in_flight == {}
+    assert [payload for topic, payload, _ in mqtt.published if topic == owned] == ["ON", ""]
+    assert path.read_text(encoding="utf-8") == _manifest([claimed])
+
+
+async def test_stale_ledger_blocks_the_fast_path_during_the_repair_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F176-A-1: while a repair write is held, no acknowledged topic takes the fast path.
+
+    The second ledger's topic was dropped from disk by the first ledger's
+    late clear, so publishing it before the repair lands would retain a
+    value the file does not own.
+    """
+    path = tmp_path / "owned-topics.json"
+    first = await _loaded_ledger(path)
+    mqtt = FakeMqtt()
+    removed = "brilliant/kitchen/light-1/state"
+    kept = "brilliant/kitchen/light-2/state"
+    await first.async_publish(mqtt, removed, "on")
+    await first.async_publish(mqtt, kept, "on")
+    second = await _loaded_ledger(path)
+    await second.async_publish(mqtt, removed, "on")
+    assert removed in second._acknowledged_topics
+
+    monkeypatch.setattr(retained_topics_module, "PERSIST_DEADLINE_S", 0.05)
+    stall = _HeldWrites(monkeypatch, hold=lambda payload: removed not in payload)
+    with pytest.raises(RetainedLedgerError, match="exceeded"):
+        await asyncio.wait_for(first.async_clear(mqtt, removed), 5)
+    await stall.drain()
+    await _settled(first)
+    assert path.read_text(encoding="utf-8") == _manifest([kept])
+    monkeypatch.setattr(retained_topics_module, "PERSIST_DEADLINE_S", 10.0)
+
+    repair = _HeldWrites(monkeypatch, hold=lambda _payload: True)
+    mqtt.published.clear()
+    repairing = asyncio.create_task(first.async_publish(mqtt, kept, "off"))
+    early = asyncio.create_task(second.async_publish(mqtt, removed, "again"))
+    try:
+        await asyncio.wait_for(repair.started.wait(), 5)
+        state = first._state
+        assert state.claim_pending
+        assert state.disk_stale
+        await asyncio.sleep(0.01)
+        assert mqtt.published == []
+    finally:
+        await repair.drain()
+        await asyncio.gather(repairing, early)
+    assert path.read_text(encoding="utf-8") == _manifest([removed, kept])
+    assert mqtt.published[-1] == (removed, "again", True)
