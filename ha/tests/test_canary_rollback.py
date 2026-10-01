@@ -1401,6 +1401,82 @@ async def test_other_transaction_is_rejected_before_persisting_restore_intent(
     assert await journal.async_load() == other
 
 
+@pytest.mark.parametrize("watchdog", [None, "wifi_watchdog", "bus_watchdog"])
+async def test_stopped_pre_ordinal_bridge_recovers_only_through_canaried_update(
+    hass: HomeAssistant,
+    tmp_path: Path,
+    payload_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    watchdog: str | None,
+) -> None:
+    """Documented #181 recovery: repair is blocked; uninstall + update is canaried."""
+    from homeassistant.exceptions import HomeAssistantError
+
+    from custom_components.brilliant_mqtt import fleet_manager
+    from custom_components.brilliant_mqtt.const import CONF_COMPONENTS, CONF_SSH_HOST_KEY
+    from tests.test_manager import _fleet_panel_manager
+    from tests.test_panel_provisioner import _FakeObserver, _health
+
+    (payload_dir / "VERSION").write_text("0.11.0")
+    (payload_dir / "RELEASE_ORDINAL").write_text("2\n")
+    shell = RehearsalShell(tmp_path / "panel")
+    shell.install()
+    states: dict[str, list[bool]] = {"brilliant-mqtt": [True, False]}
+    selected: dict[str, bool] = {"bridge": True}
+    if watchdog is not None:
+        service = "brilliant-" + watchdog.replace("_", "-")
+        package = shell.panel / f"{watchdog}/brilliant_{watchdog}"
+        package.mkdir(parents=True)
+        (package / "run.py").write_text("old_watchdog = True\n")
+        (shell.panel / f"{watchdog}/VERSION").write_text("0.10.2\n")
+        (shell.units / f"{service}.service").write_text("old watchdog unit\n")
+        states[service] = [True, True]
+        selected[watchdog] = True
+    shell.state.write_text(json.dumps(states))
+    shell._pinned = _record().panel_request.public_key
+    _, manager = _fleet_panel_manager(
+        hass,
+        panel_overrides={CONF_SSH_HOST_KEY: shell._pinned, CONF_COMPONENTS: selected},
+    )
+    await shell.connect()
+    journal = ProvisioningJournal(hass)
+    provisioner = _Harness().provisioner(manager._ssh_lock)
+    provisioner._journal = journal
+    provisioner._operations = panel_ops
+    provisioner._health_observer_factory = lambda _slug: _FakeObserver([], _health())
+    monkeypatch.setattr(fleet_manager, "_get_recovery_provisioner", lambda _hass: provisioner)
+    monkeypatch.setattr(manager, "_connect_for_repair", AsyncMock(return_value=shell))
+    monkeypatch.setattr(
+        manager, "_async_stage_broker_ca", AsyncMock(return_value="MQTT_TLS_ENABLED=0\n")
+    )
+    try:
+        with pytest.raises(HomeAssistantError) as raised:
+            await manager.async_update_agent()
+        assert raised.value.translation_placeholders
+        assert "baseline_correlation_unsupported" in raised.value.translation_placeholders["error"]
+        await manager.async_repair(trigger="button")
+        assert manager.problem_reason and "release_identity_blocked" in manager.problem_reason
+        legacy = (await panel_ops._read_release_identities(shell))["bridge"]
+        assert legacy is not None and legacy.version == "0.10.2"
+        if watchdog is not None:
+            # A watchdog unit left in /etc keeps the layout installed; remove it first.
+            await manager.async_remove_component(watchdog)
+        await manager.async_uninstall()
+        await manager.async_update_agent()
+        installed = (await panel_ops._read_release_identities(shell))["bridge"]
+        assert installed is not None
+        assert (installed.version, installed.release_ordinal) == ("0.11.0", 2)
+        retained = await journal.async_retained_records()
+        assert len(retained) == 1 and retained[0].state == "soak"
+        if watchdog is not None:
+            await manager.async_install_component(watchdog)
+            reinstalled = (await panel_ops._read_release_identities(shell))[watchdog]
+            assert reinstalled is not None
+            assert (reinstalled.version, reinstalled.release_ordinal) == ("0.11.0", 2)
+    finally:
+        await manager.async_shutdown()
+
+
 @pytest.mark.parametrize("selected_watchdog", [False, True])
 async def test_manager_update_cannot_reach_ca_without_durable_complete_baseline(
     hass: HomeAssistant,

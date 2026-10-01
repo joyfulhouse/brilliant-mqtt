@@ -142,6 +142,9 @@ _SAFE_PANEL_OP_DETAILS = {
     "release_override_used_or_write_failed": (
         "release_override_used_or_write_failed: obtain a fresh override"
     ),
+    "release_auto_admission_record_failed": (
+        "release_auto_admission_record_failed: check panel storage and retry"
+    ),
 }
 _PANEL_OP_CODE_PREFIX_LIMIT = 64
 for _canary_code in (
@@ -1556,6 +1559,7 @@ class PanelManager:
                         panel=self.panel,
                         components=self._identity_components(),
                         override=release_override,
+                        allow_pre_ordinal_upgrade=True,
                     ) as admission:
                         if admission.noop:
                             return

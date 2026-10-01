@@ -335,7 +335,12 @@ one release policy. Equal code digests keep the installed code and layout. Diffe
 code requires a strictly greater, known `release_ordinal` on both sides, except for
 the first upgrade from a pre-ordinal release. An incumbent with unknown ordinal
 auto-admits only when its version is a strict `X.Y.Z` below 0.11.0 and the
-candidate has an ordinal and a strict `X.Y.Z` version of 0.11.0 or newer. Equal
+candidate has an ordinal and a strict `X.Y.Z` version of 0.11.0 or newer, and
+only on the Update entity, `redeploy`, and panel provisioning, which run the canary
+and retain a rollback baseline. Repair (automatic, button, or service), bridge
+installation, component installation, and post-OTA refresh never auto-admit; they
+report `release_identity_blocked` for a pre-ordinal panel until it is updated. A
+`release_override` cannot waive that refusal; update the panel without one. Equal
 version strings do not establish identity, and digests are never ordered by age.
 Admission happens before the operation stages a CA or changes configuration.
 Same-code configuration repair preserves the live unit, or restores a missing
@@ -346,8 +351,55 @@ ordinal is initially **unknown**, even if their `VERSION` matches the bundle.
 An unparseable, missing, prerelease, or 0.11.0-or-newer incumbent version with
 unknown ordinal requires explicit approval for a change to different code.
 Automatic pre-ordinal admission writes a private metadata-only
-`auto-admit-<transaction>.json` record before deployment. It does not change
-baseline retention or the canary rollback process.
+`auto-admit-<transaction>.json` record before deployment and logs one INFO line
+with the panel, components, versions, and ordinals (never digests). It does not
+change baseline retention or the canary rollback process.
+
+#### Recovering a stopped pre-ordinal bridge
+
+The canaried update snapshots the panel and captures a rollback baseline before
+any write. The snapshot probe reads `systemctl is-active` for each core service:
+`active` counts as running, while `inactive`, `failed`, and `unknown` count as
+stopped. Any other state, such as the transitional `activating`, `deactivating`,
+or `reloading`, fails the snapshot probe itself (`snapshot_probe_failed`). The
+update then stops earlier, before any write, and reports only the generic "agent
+update failed during deployment". Retry once the unit has settled. For an
+installed panel, the baseline capture then requires the bridge to be running and
+`/etc/brilliant-mqtt.env` to exist. If the bridge is stopped or the file is
+missing, it stops with `baseline_correlation_unsupported` before any write. A
+panel with no agent layout at all is exempt from the baseline requirement. The
+requirement holds because rollback restarts the restored bridge with the retained
+environment and waits for a fresh MQTT session.
+
+In 0.11.1 only, Repair would auto-admit, re-lay the unit and restart a stopped
+legacy bridge; 0.11.0 already blocked it with `release_identity_blocked`. Repair
+can no longer replace pre-ordinal code, so a pre-0.11.0 panel whose bridge is
+`inactive` or `failed`, or whose environment file is missing, needs one of these:
+
+1. **Start the bridge, then update.** If the unit and environment file are still
+   present, start `brilliant-mqtt` on the panel. Once
+   `systemctl is-active brilliant-mqtt` prints `active`, run the Update entity or
+   `brilliant_mqtt.redeploy` without an override.
+2. **Remove the watchdogs, uninstall, then update.** If the bridge cannot start:
+   1. Turn off the panel's **Wi-Fi watchdog** and **Bus watchdog** component
+      switches, for whichever of them are on. Uninstall removes only the bridge,
+      and a watchdog unit left under `/etc/systemd/system` keeps the agent layout
+      installed, so the update would still stop with
+      `baseline_correlation_unsupported`.
+   2. Run `brilliant_mqtt.uninstall` for that panel. The panel must have no
+      retained baseline (`baseline_retained_finalize_first` otherwise). This stops
+      and removes the agent's unit, environment and `/var/brilliant-mqtt`,
+      including the old identity records.
+   3. Run the Update entity. The panel now has no agent layout, so the canary
+      takes an empty baseline and installs the current release with its ordinal.
+      Rollback of that update returns the panel to the uninstalled state.
+   4. Turn the watchdog switches back on. Each installs the current release.
+
+   The bridge is offline from the uninstall until the update completes, and the
+   watchdogs are off until they are turned back on.
+
+Neither path loosens the gate: every code replacement still runs through the
+canary.
 On-panel records live under `/var/brilliant-mqtt/.release-identities/` (directory
 0700, records 0600), with one identity for each independently selectable bridge or
 watchdog. Records contain version, ordinal, digest, deployment ID, and layout;

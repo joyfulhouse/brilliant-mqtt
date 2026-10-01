@@ -694,6 +694,7 @@ class _FakeOperations:
         components: tuple[str, ...] = (),
         override: Mapping[str, object] | None = None,
         transaction_id: UUID | None = None,
+        allow_pre_ordinal_upgrade: bool = False,
     ) -> AsyncIterator[panel_ops.ReleaseAdmission]:
         yield panel_ops.ReleaseAdmission(shell, {}, {}, {"bridge": True}, "c" * 32)
 
