@@ -223,3 +223,21 @@ def test_record_persists_only_the_rolling_window(tmp_path: Path) -> None:
     _write_history(state, [NOW - P.window - 1.0, recent, NOW + 5.0])
     RebootGuard(str(state), P).record(NOW)
     assert json.loads(state.read_text(encoding="utf-8")) == [recent, NOW]
+
+
+def test_persistently_bad_state_authorizes_at_most_once_per_cooldown(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.ERROR, logger="brilliant_wifi_watchdog.reboot_guard")
+    guard = RebootGuard(str(_bad_state(tmp_path, "corrupt")), P)  # bad throughout
+
+    assert guard.can_request(NOW) is False
+    assert guard.can_request(NOW + P.cooldown - 1.0) is False
+    assert guard.can_request(NOW + P.cooldown) is True  # once, at expiry
+    assert len(caplog.records) == 1
+
+    rearmed = NOW + P.cooldown + 1.0
+    assert guard.can_request(rearmed) is False  # still bad: a fresh window
+    assert len(caplog.records) == 2
+    assert guard.can_request(rearmed + P.cooldown - 1.0) is False
+    assert guard.can_request(rearmed + P.cooldown) is True

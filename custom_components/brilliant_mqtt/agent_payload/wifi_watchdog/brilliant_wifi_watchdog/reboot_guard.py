@@ -79,12 +79,13 @@ class RebootGuard:
             # Lost history must not authorize a reboot: fail closed for one
             # cooldown from the first bad read, even if the file is repaired or
             # removed meanwhile, then fall back to whatever history is readable.
+            # Clearing at expiry re-arms the window if the file is still bad, so
+            # persistent bad state authorizes at most once per cooldown.
             if now < self._bad_since:
                 self._bad_since = now  # wall clock stepped back: stay bounded
             if now - self._bad_since < self._p.cooldown:
                 return False
-            if loaded is not None:
-                self._bad_since = None
+            self._bad_since = None
         stamps = [t for t in loaded or [] if now - t <= self._p.window]
         return self._history_allows(stamps, now)
 
