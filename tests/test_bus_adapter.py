@@ -861,12 +861,14 @@ class TestInteractiveScheduling:
         )
         try:
             await _settle(10)
-            initial = '{"brightness":20}' if barrier else '{"state":"ON","brightness":20}'
+            # A pending OFF cannot merge with a brightness partial (#159), so
+            # without a barrier the partial must still survive as its own write.
+            initial = '{"brightness":20}' if barrier else '{"state":"OFF"}'
             await dispatcher.dispatch(
                 _InboundMessage(primary, initial, False, (), ()), latest_wins=True
             )
             await _settle(10)
-            replacement = '{"brightness":40}' if barrier else '{"state":"ON","brightness":40}'
+            replacement = '{"brightness":40}' if barrier else '{"state":"OFF"}'
             await dispatcher.dispatch(
                 _InboundMessage(primary, replacement, False, (), ()), latest_wins=True
             )
@@ -884,7 +886,7 @@ class TestInteractiveScheduling:
             await dispatcher.shutdown()
             expected = [
                 {"on": "1"},
-                {"intensity": "40"} if barrier else {"on": "1", "intensity": "40"},
+                {"intensity": "40"} if barrier else {"on": "0"},
             ]
             if barrier:
                 expected.append({"reset": "1"})
