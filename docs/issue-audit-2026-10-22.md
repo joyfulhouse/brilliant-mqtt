@@ -56,7 +56,7 @@ rollback failure in #214 remains open as described below.
 
 ## Verification
 
-The complete agent gate passes: 2,802 tests passed and one skipped, with Ruff,
+The complete agent gate passes: 2,803 tests passed and one skipped, with Ruff,
 formatting, and strict mypy clean across 175 source files. The complete
 integration gate passes: 2,011 tests passed and six skipped, with lint,
 formatting, and strict mypy clean across 83 files. The tracked payload was rebuilt
@@ -68,6 +68,10 @@ cleanup, watchdog SIGTERM log markers, hostile state-file swaps, held filesystem
 writes and reads, overlapping temporary-file namespaces, and restored-baseline
 finalization across interruption and fresh authorization. These establish local
 software behavior; they do not replace the live qualification requirements.
+
+The first PR CI run exposed another immediate scene-delivery assertion after
+reconnect. A deterministic held-write variant reproduces it; the test now waits
+for observable delivery and task completion before its exact count assertion.
 
 Production panel credentials and access are not present in this checkout. No
 live panel deployment, network repair, physical actuation, or soak is claimed by

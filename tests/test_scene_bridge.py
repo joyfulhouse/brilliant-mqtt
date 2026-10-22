@@ -430,19 +430,47 @@ async def test_start_seeds_history_persists_privately_and_publishes_scoped_catal
     await bridge.async_shutdown()
 
 
+@pytest.mark.parametrize("hold_write", [False, True])
 async def test_later_scene_event_publishes_once_and_reconnect_restart_replay_is_suppressed(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hold_write: bool
 ) -> None:
     bridge, bus, mqtt, clock, path = await _started(tmp_path, execution=_execution("all_off", 100))
     later = _execution("all_off", 200)
+    loop = asyncio.get_running_loop()
+    write_started = asyncio.Event()
+    release_write = threading.Event()
+    real_write = scene_state.atomic_write_state
 
-    await bus.emit(later)
-    await bus.emit(later)
-    bus.set_devices([later])
-    await bus.fire_reconnect()
+    def held_write(target: Path, state: scene_state.SceneState) -> None:
+        loop.call_soon_threadsafe(write_started.set)
+        release_write.wait()
+        real_write(target, state)
 
-    events = _published(mqtt, scene_event_topic(_PANEL))
-    assert len(events) == 1
+    if hold_write:
+        monkeypatch.setattr(scene_bridge_module, "atomic_write_state", held_write)
+
+    try:
+        await bus.emit(later)
+        if hold_write:
+            await asyncio.wait_for(write_started.wait(), 5)
+        await bus.emit(later)
+        bus.set_devices([later])
+        await bus.fire_reconnect()
+        if hold_write:
+            assert _published(mqtt, scene_event_topic(_PANEL)) == []
+            # Release on the next loop turn to expose assertions that assume
+            # reconnect completion also means the durable event was delivered.
+            loop.call_soon(release_write.set)
+
+        await _wait_for_publish(mqtt, scene_event_topic(_PANEL))
+        await _wait_for_idle(bridge)
+        events = _published(mqtt, scene_event_topic(_PANEL))
+        assert len(events) == 1
+    finally:
+        release_write.set()
+        await _wait_for_idle(bridge)
+        await bridge.async_shutdown()
+
     assert events[0][2] is False
     assert _payload(events[0]) == {
         "deduplication_key": f"{_PANEL}:all_off:200",
@@ -454,7 +482,6 @@ async def test_later_scene_event_publishes_once_and_reconnect_restart_replay_is_
     }
     assert bus.scoped_reads.count(("configuration_virtual_device", "scene_configuration")) == 2
 
-    await bridge.async_shutdown()
     restarted_bus = FakeBus(
         [later], scoped_devices=[_scene_catalog("all_off"), _mode_catalog("away")]
     )
