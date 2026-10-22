@@ -129,8 +129,9 @@ settings = Settings(
 )
 try:
     asyncio.run(main_mod._run_session(settings, None, None))
-except ConnectionError as error:
-    assert str(error) == "broker refused"
+except main_mod.MqttConnectError as error:
+    assert isinstance(error.__cause__, ConnectionError)
+    assert str(error.__cause__) == "broker refused"
 else:
     raise AssertionError("broker failure was not reached")
 os.kill(os.getpid(), signal.SIGKILL)

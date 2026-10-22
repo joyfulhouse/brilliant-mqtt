@@ -192,7 +192,7 @@ def _payload(item: tuple[str, str, bool]) -> dict[str, object]:
 
 
 async def _wait_for_publish(mqtt: FakeMqtt, topic: str, count: int = 1) -> None:
-    for _ in range(200):
+    for _ in range(5000):
         if len(_published(mqtt, topic)) >= count:
             return
         await asyncio.sleep(0.001)
@@ -1237,9 +1237,17 @@ async def test_reconnect_malformed_execution_stays_degraded_after_valid_catalog(
     await bridge.async_shutdown()
 
 
+@pytest.mark.parametrize("write_delay", [0.0, 0.2])
 async def test_missing_execution_is_unavailable_and_reconnect_clears_stale_route(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, write_delay: float
 ) -> None:
+    real_write = scene_state.atomic_write_state
+
+    def delayed_write(path: Path, state: scene_state.SceneState) -> None:
+        threading.Event().wait(write_delay)
+        real_write(path, state)
+
+    monkeypatch.setattr(scene_bridge_module, "atomic_write_state", delayed_write)
     bridge, bus, mqtt, _, _ = await _started(tmp_path)
     bus.set_devices([])
 
@@ -1251,6 +1259,7 @@ async def test_missing_execution_is_unavailable_and_reconnect_clears_stale_route
     command_id = "22222222-2222-4222-8222-222222222222"
     await mqtt.inject(scene_command_topic(_PANEL), _command(command_id, "scene", "all_off"))
     assert bus.commands == []
+    await _wait_for_publish(mqtt, scene_result_topic(command_id))
     assert _payload(_published(mqtt, scene_result_topic(command_id))[-1])["error"] == (
         "execution_unavailable"
     )
@@ -2597,9 +2606,18 @@ async def test_scene_watermark_growth_is_bounded_during_live_execution(
     await bridge.async_shutdown()
 
 
+@pytest.mark.parametrize("write_delay", [0.0, 0.2])
 async def test_startup_merges_execution_change_after_snapshot_before_activation(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, write_delay: float
 ) -> None:
+    real_write = scene_state.atomic_write_state
+
+    def delayed_write(path: Path, state: scene_state.SceneState) -> None:
+        threading.Event().wait(write_delay)
+        real_write(path, state)
+
+    monkeypatch.setattr(scene_bridge_module, "atomic_write_state", delayed_write)
+
     class PausedCatalogBus(FakeBus):
         def __init__(self) -> None:
             super().__init__(
@@ -2622,12 +2640,13 @@ async def test_startup_merges_execution_change_after_snapshot_before_activation(
     path = tmp_path / "state.json"
     bridge = SceneBridge(bus, mqtt, _PANEL, path, FakeClockMs(_NOW_MS))
     start_task = asyncio.create_task(bridge.async_start())
-    await asyncio.wait_for(bus.catalog_started.wait(), timeout=0.1)
+    await asyncio.wait_for(bus.catalog_started.wait(), timeout=5)
 
     await bus.emit(_execution("all_off", 500))
     bus.release_catalog.set()
-    await asyncio.wait_for(start_task, timeout=0.1)
+    await asyncio.wait_for(start_task, timeout=5)
 
+    await _wait_for_publish(mqtt, scene_event_topic(_PANEL))
     events = _published(mqtt, scene_event_topic(_PANEL))
     assert len(events) == 1
     assert _payload(events[0])["executed_at_ms"] == 500
@@ -3453,3 +3472,102 @@ async def test_poll_recovers_mode_health_when_invalid_timestamp_becomes_valid(
     assert len(_published(mqtt, mode_event_topic(_PANEL))) == 1
     assert bridge._mode_execution_healthy is True
     await bridge.async_shutdown()
+
+
+@pytest.mark.parametrize("later", ["event", "result", "replay"])
+async def test_delivery_waits_for_its_own_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, later: str
+) -> None:
+    bridge, bus, mqtt, _, path = await _started(tmp_path)
+    command_id = "22222222-2222-4222-8222-222222222222"
+    result_topic = scene_result_topic(command_id)
+    command = _command(command_id, "scene", "unknown")
+    if later == "replay":
+        command = _command(command_id, "scene", "all_off")
+        bus.set_devices([])
+        await bus.fire_reconnect()
+        await mqtt.inject(scene_command_topic(_PANEL), command)
+        await _wait_for_publish(mqtt, result_topic)
+        await _wait_for_idle(bridge)
+    mqtt.published.clear()
+    real_write = scene_state.atomic_write_state
+    loop = asyncio.get_running_loop()
+    started = [asyncio.Event(), asyncio.Event()]
+    release = [threading.Event(), threading.Event()]
+    calls = 0
+
+    def held_write(target: Path, state: scene_state.SceneState) -> None:
+        nonlocal calls
+        index = calls - 1
+        calls += 1
+        # Let A reach the broker, then hold its delivered-marker write.
+        # B is captured while that older durable snapshot is still pending.
+        if 0 <= index < 2:
+            loop.call_soon_threadsafe(started[index].set)
+            release[index].wait()
+        real_write(target, state)
+
+    monkeypatch.setattr(scene_bridge_module, "atomic_write_state", held_write)
+    first = asyncio.create_task(bus.emit(_execution("all_off", 500)))
+    second: asyncio.Task[None] | None = None
+    try:
+        await asyncio.wait_for(started[0].wait(), 5)
+        if later == "event":
+            second = asyncio.create_task(bus.emit(_execution("all_off", 600)))
+        else:
+            second = asyncio.create_task(mqtt.inject(scene_command_topic(_PANEL), command))
+        # The callback drains only briefly; its capture is complete before release.
+        await asyncio.wait_for(second, 5)
+        release[0].set()
+        await asyncio.wait_for(started[1].wait(), 5)
+        await _wait_for_publish(mqtt, scene_event_topic(_PANEL))
+        for _ in range(10):
+            await asyncio.sleep(0)
+        async with bridge._lock:
+            assert bridge._next_delivery() is None
+        if later == "event":
+            assert [
+                _payload(item)["executed_at_ms"]
+                for item in _published(mqtt, scene_event_topic(_PANEL))
+            ] == [500]
+        else:
+            assert _published(mqtt, result_topic) == []
+        release[1].set()
+        await _wait_for_publish(
+            mqtt,
+            scene_event_topic(_PANEL) if later == "event" else result_topic,
+            count=2 if later == "event" else 1,
+        )
+        await _wait_for_idle(bridge)
+        assert path.exists()
+    finally:
+        for gate in release:
+            gate.set()
+        await asyncio.gather(first, *([] if second is None else [second]), return_exceptions=True)
+        await _wait_for_idle(bridge)
+        await bridge.async_shutdown()
+
+
+@pytest.mark.parametrize("fail", [False, True])
+async def test_old_epoch_persist_cannot_change_current_durability_or_trust(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail: bool
+) -> None:
+    bridge, _, _, _, _ = await _started(tmp_path)
+    persisted = bridge._persisted_version
+    trusted = bridge._state_trusted
+    reason = bridge._state_reason
+
+    async def old_write(state: scene_state.SceneState) -> None:
+        if fail:
+            raise OSError("old epoch write failed")
+
+    monkeypatch.setattr(bridge, "_async_write_state", old_write)
+    try:
+        assert not await bridge._async_persist_state(
+            777, scene_state.SceneState(), bridge._epoch - 1
+        )
+        assert bridge._persisted_version == persisted
+        assert bridge._state_trusted == trusted
+        assert bridge._state_reason == reason
+    finally:
+        await bridge.async_shutdown()

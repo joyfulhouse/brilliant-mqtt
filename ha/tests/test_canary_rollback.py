@@ -986,6 +986,32 @@ async def test_manual_update_arms_before_mutation_and_retains_soak(
     retained = await journal.async_retained(transaction)
     assert retained is not None and retained.state == "soak"
 
+    async with provisioner._lock:
+        with pytest.raises(PanelProvisioningError, match="baseline_retained_finalize_first"):
+            async with provisioner.async_managed_update(
+                shell,
+                record.panel_request,
+                record.fleet_profile,
+                record.staged_version,
+                subentry_id="fixture-owner",
+            ):
+                pytest.fail("retained baseline must block another update")
+    assert await journal.async_retained(transaction) == retained
+    provisioner._credential_resolver = AsyncMock(return_value="SECRET-password")
+    shell._pinned = record.panel_request.public_key
+    provisioner._shell_factory = lambda *_args: shell
+    await provisioner.async_finalize(transaction)
+    assert await journal.async_retained(transaction) is None
+    async with provisioner._lock:
+        async with provisioner.async_managed_update(
+            shell,
+            record.panel_request,
+            record.fleet_profile,
+            record.staged_version,
+            subentry_id="fixture-owner",
+        ):
+            pass
+
 
 @pytest.mark.parametrize("legacy", [False, True])
 @pytest.mark.parametrize("extra_component", [False, True])
@@ -1401,13 +1427,23 @@ async def test_other_transaction_is_rejected_before_persisting_restore_intent(
     assert await journal.async_load() == other
 
 
-@pytest.mark.parametrize("watchdog", [None, "wifi_watchdog", "bus_watchdog"])
+@pytest.mark.parametrize(
+    "watchdogs,already_off",
+    [
+        ((), False),
+        (("wifi_watchdog",), False),
+        (("bus_watchdog",), False),
+        (("wifi_watchdog", "bus_watchdog"), False),
+        (("wifi_watchdog", "bus_watchdog"), True),
+    ],
+)
 async def test_stopped_pre_ordinal_bridge_recovers_only_through_canaried_update(
     hass: HomeAssistant,
     tmp_path: Path,
     payload_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
-    watchdog: str | None,
+    watchdogs: tuple[str, ...],
+    already_off: bool,
 ) -> None:
     """Documented #181 recovery: repair is blocked; uninstall + update is canaried."""
     from homeassistant.exceptions import HomeAssistantError
@@ -1423,7 +1459,7 @@ async def test_stopped_pre_ordinal_bridge_recovers_only_through_canaried_update(
     shell.install()
     states: dict[str, list[bool]] = {"brilliant-mqtt": [True, False]}
     selected: dict[str, bool] = {"bridge": True}
-    if watchdog is not None:
+    for watchdog in watchdogs:
         service = "brilliant-" + watchdog.replace("_", "-")
         package = shell.panel / f"{watchdog}/brilliant_{watchdog}"
         package.mkdir(parents=True)
@@ -1431,7 +1467,7 @@ async def test_stopped_pre_ordinal_bridge_recovers_only_through_canaried_update(
         (shell.panel / f"{watchdog}/VERSION").write_text("0.10.2\n")
         (shell.units / f"{service}.service").write_text("old watchdog unit\n")
         states[service] = [True, True]
-        selected[watchdog] = True
+        selected[watchdog] = not already_off
     shell.state.write_text(json.dumps(states))
     shell._pinned = _record().panel_request.public_key
     _, manager = _fleet_panel_manager(
@@ -1458,9 +1494,13 @@ async def test_stopped_pre_ordinal_bridge_recovers_only_through_canaried_update(
         assert manager.problem_reason and "release_identity_blocked" in manager.problem_reason
         legacy = (await panel_ops._read_release_identities(shell))["bridge"]
         assert legacy is not None and legacy.version == "0.10.2"
-        if watchdog is not None:
-            # A watchdog unit left in /etc keeps the layout installed; remove it first.
+        for watchdog in watchdogs:
+            # Explicit turn-off retries removal even if HA already reports off.
             await manager.async_remove_component(watchdog)
+            assert not (
+                shell.units / ("brilliant-" + watchdog.replace("_", "-") + ".service")
+            ).exists()
+            assert manager.store.data[CONF_COMPONENTS][watchdog] is False
         await manager.async_uninstall()
         await manager.async_update_agent()
         installed = (await panel_ops._read_release_identities(shell))["bridge"]
@@ -1468,7 +1508,7 @@ async def test_stopped_pre_ordinal_bridge_recovers_only_through_canaried_update(
         assert (installed.version, installed.release_ordinal) == ("0.11.0", 2)
         retained = await journal.async_retained_records()
         assert len(retained) == 1 and retained[0].state == "soak"
-        if watchdog is not None:
+        for watchdog in watchdogs:
             await manager.async_install_component(watchdog)
             reinstalled = (await panel_ops._read_release_identities(shell))[watchdog]
             assert reinstalled is not None
@@ -1550,3 +1590,219 @@ async def test_manager_update_cannot_reach_ca_without_durable_complete_baseline(
             ).read_bytes()
     finally:
         await manager.async_shutdown()
+
+
+async def test_ownerless_finalization_marker_is_backward_compatible_and_requires_verified_restore(
+    hass: HomeAssistant, tmp_path: Path
+) -> None:
+    from custom_components.brilliant_mqtt.provisioning_journal import RetainedRollback
+
+    shell = RehearsalShell(tmp_path)
+    shell.install()
+    snapshot = await panel_ops.capture_baseline(shell, await panel_ops.snapshot_panel(shell))
+    record = replace(
+        _record(),
+        operation=ProvisioningOperation.INSTALL,
+        prior_snapshot=stored_snapshot_from_panel(snapshot),
+    )
+    old = RetainedRollback(record, "restored", "a" * 32)
+    assert RetainedRollback._from_storage(old._to_storage()) == old
+    journal = ProvisioningJournal(hass)
+    await journal.async_arm(record)
+    await journal.async_retained_state(record.transaction_id, "restored", evidence="a" * 32)
+    expected = await journal.async_retained(record.transaction_id)
+    assert expected is not None
+    marked = await journal.async_begin_ownerless_finalize(expected)
+    assert marked.finalization_origin == "ownerless_restored"
+    assert marked.state == "finalizing"
+    assert RetainedRollback._from_storage(marked._to_storage()) == marked
+    assert "root_password" not in json.dumps(marked._to_storage())
+    assert record.panel_request.root_password not in json.dumps(marked._to_storage())
+
+
+@pytest.mark.parametrize(
+    "state", ["armed", "soak", "restore_requested", "rollback_failed", "finalizing"]
+)
+async def test_ownerless_finalization_refuses_unverified_or_unmarked_state(
+    hass: HomeAssistant, tmp_path: Path, state: str
+) -> None:
+    from custom_components.brilliant_mqtt.provisioning_journal import (
+        ProvisioningJournalError,
+        RetainedRollback,
+    )
+
+    shell = RehearsalShell(tmp_path)
+    shell.install()
+    snapshot = await panel_ops.capture_baseline(shell, await panel_ops.snapshot_panel(shell))
+    record = replace(
+        _record(),
+        operation=ProvisioningOperation.INSTALL,
+        prior_snapshot=stored_snapshot_from_panel(snapshot),
+    )
+    journal = ProvisioningJournal(hass)
+    retained = RetainedRollback(record, state, "a" * 32)
+    await journal._async_retained_save({str(record.transaction_id): retained})
+    with pytest.raises(ProvisioningJournalError):
+        await journal.async_begin_ownerless_finalize(retained)
+    assert await journal.async_retained(record.transaction_id) == retained
+
+
+@pytest.mark.parametrize("absent", [False, True])
+async def test_ownerless_finalize_settles_cancel_and_requires_fresh_retry_after_failure(
+    hass: HomeAssistant, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, absent: bool
+) -> None:
+    from custom_components.brilliant_mqtt.provisioning_journal import RetainedRollback
+    from custom_components.brilliant_mqtt.shell import HostIdentity
+
+    shell = RehearsalShell(tmp_path)
+    if absent:
+        shell.state.write_text(json.dumps({"brilliant-mqtt": [False, False]}))
+    else:
+        shell.install()
+    snapshot = await panel_ops.capture_baseline(shell, await panel_ops.snapshot_panel(shell))
+    record = replace(
+        _record(),
+        operation=ProvisioningOperation.INSTALL,
+        prior_snapshot=stored_snapshot_from_panel(snapshot),
+    )
+    retained = RetainedRollback(record, "restored", None if absent else "a" * 32)
+    journal = ProvisioningJournal(hass)
+    await journal._async_retained_save({str(record.transaction_id): retained})
+    provisioner = _Harness().provisioner()
+    provisioner._journal, provisioner._operations = journal, panel_ops
+    provisioner._retained_owner_exists = AsyncMock(return_value=False)
+    identity = HostIdentity(record.panel_request.public_key, record.panel_request.fingerprint)
+    provisioner._identity_fetcher = AsyncMock(return_value=identity)
+    shell._pinned = identity.public_key
+    passwords: list[str] = []
+
+    def fresh_shell(_host: str, password: str, _key: str) -> PanelShell:
+        passwords.append(password)
+        return shell
+
+    provisioner._shell_factory = fresh_shell
+    provisioner._credential_resolver = AsyncMock(side_effect=AssertionError("must reauthenticate"))
+    original = panel_ops.finalize_baseline
+
+    async def interrupted(transport: PanelShell, state: panel_ops.PanelSnapshot) -> None:
+        await original(transport, state)
+        raise RuntimeError("SECRET interrupted finalization")
+
+    monkeypatch.setattr(panel_ops, "finalize_baseline", interrupted)
+    with pytest.raises(PanelProvisioningError, match="cleanup_failed"):
+        await provisioner.async_finalize_ownerless_restored(
+            retained, "moved-panel", "fresh-secret", identity
+        )
+    marked = await journal.async_retained(record.transaction_id)
+    assert marked is not None and marked.finalization_origin == "ownerless_restored"
+    assert "fresh-secret" not in json.dumps(marked._to_storage())
+    with pytest.raises(
+        PanelProvisioningError, match="ownerless_finalize_reauthentication_required"
+    ):
+        await provisioner.async_recover()
+    provisioner._credential_resolver.assert_not_awaited()
+
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def stalled(transport: PanelShell, state: panel_ops.PanelSnapshot) -> None:
+        entered.set()
+        await release.wait()
+        await original(transport, state)
+
+    monkeypatch.setattr(panel_ops, "finalize_baseline", stalled)
+    task = asyncio.create_task(
+        provisioner.async_finalize_ownerless_restored(
+            marked, "moved-panel", "fresh-secret-again", identity
+        )
+    )
+    await entered.wait()
+    try:
+        task.cancel()
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done() and provisioner._lock.locked()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+    assert not provisioner._lock.locked()
+    assert passwords == ["fresh-secret", "fresh-secret-again"]
+    assert await journal.async_retained(record.transaction_id) is None
+    assert await journal.async_load() is None
+    from tests.test_config_flow import _fleet_entry, _start_subentry_confirm
+
+    entry = _fleet_entry(hass)
+    retry = await _start_subentry_confirm(hass, entry, identity=identity)
+    assert retry["step_id"] == "panel_confirm"
+
+
+@pytest.mark.parametrize("mutation", ["active", "owner", "changed", "unverified", "update"])
+async def test_ownerless_finalize_admission_refuses_before_password(
+    hass: HomeAssistant, tmp_path: Path, mutation: str
+) -> None:
+    from custom_components.brilliant_mqtt.provisioning_journal import RetainedRollback
+    from custom_components.brilliant_mqtt.shell import HostIdentity
+
+    shell = RehearsalShell(tmp_path)
+    shell.install()
+    snapshot = await panel_ops.capture_baseline(shell, await panel_ops.snapshot_panel(shell))
+    record = replace(
+        _record(),
+        operation=ProvisioningOperation.INSTALL,
+        prior_snapshot=stored_snapshot_from_panel(snapshot),
+    )
+    assert RetainedRollback(record, "restored", "a" * 32).ownerless_finalization_allowed
+    retained = RetainedRollback(record, "restored", None if mutation == "unverified" else "a" * 32)
+    if mutation == "update":
+        retained = replace(retained, record=replace(record, operation=ProvisioningOperation.UPDATE))
+    journal = ProvisioningJournal(hass)
+    await journal._async_retained_save({str(record.transaction_id): retained})
+    if mutation == "active":
+        await journal.async_create(record)
+    expected = replace(retained, state="restored")
+    if mutation == "changed":
+        await journal.async_retained_state(record.transaction_id, "rollback_failed")
+    provisioner = _Harness().provisioner()
+    provisioner._journal = journal
+    provisioner._retained_owner_exists = AsyncMock(return_value=mutation == "owner")
+    provisioner._shell_factory = AsyncMock(side_effect=AssertionError("must not offer password"))
+    identity = HostIdentity(record.panel_request.public_key, record.panel_request.fingerprint)
+    with pytest.raises(PanelProvisioningError, match="ownerless_recovery_unavailable"):
+        await provisioner.async_finalize_ownerless_restored(
+            expected, record.panel_request.host, "fresh", identity
+        )
+    provisioner._shell_factory.assert_not_called()
+
+
+@pytest.mark.parametrize("bad", ["unknown_key", "bad_origin", "wrong_state", "wrong_operation"])
+def test_ownerless_marker_parser_refuses_invalid_authority(bad: str) -> None:
+    from custom_components.brilliant_mqtt.provisioning_journal import (
+        ProvisioningJournalError,
+        RetainedRollback,
+    )
+    from custom_components.brilliant_mqtt.release_identity import RollbackBaseline
+
+    record = _record()
+    record = replace(
+        record,
+        prior_snapshot=replace(
+            record.prior_snapshot, baseline=RollbackBaseline("c" * 32, "d" * 64, {})
+        ),
+    )
+    raw = RetainedRollback(record, "restored", "a" * 32)._to_storage()
+    raw["finalization_origin"] = "ownerless_restored"
+    raw["state"] = "finalizing"
+    if bad == "unknown_key":
+        raw["unexpected"] = True
+    elif bad == "bad_origin":
+        raw["finalization_origin"] = "soak"
+    elif bad == "wrong_state":
+        raw["state"] = "rollback_failed"
+    else:
+        inner = raw["record"]
+        assert isinstance(inner, dict)
+        inner["operation"] = "update"
+    with pytest.raises(ProvisioningJournalError):
+        RetainedRollback._from_storage(raw)

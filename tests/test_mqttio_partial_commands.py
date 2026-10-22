@@ -20,6 +20,16 @@ TOPIC = "brilliant/test/light/set"
             {"state": "ON", "brightness": 120},
         ),
         ({"brightness": 40}, {"state": "ON"}, {"brightness": 40, "state": "ON"}),
+        (
+            {"state": "ON", "brightness": 40, "transition": 2},
+            {"brightness": 120},
+            {"state": "ON", "brightness": 120},
+        ),
+        (
+            {"state": "ON"},
+            {"brightness": 120, "transition": 2},
+            {"state": "ON", "brightness": 120},
+        ),
         ({"state": "ON"}, {"brightness": 0}, {"state": "ON", "brightness": 0}),
     ],
 )
@@ -61,6 +71,9 @@ async def queued(layer: str, payloads: list[str]) -> list[str]:
     "payloads",
     [
         ['{"state":"OFF"}', '{"brightness":120}'],
+        ['{"state":"OFF","transition":2}', '{"brightness":120}'],
+        ['{"state":"ON","effect":"party"}', '{"brightness":120}'],
+        ['{"state":"ON","unknown":2}', '{"brightness":120}'],
         ['{"brightness":40}', '{"state":"OFF"}'],
         ['{"state":"ON","brightness":40}', '{"brightness":false}', '{"brightness":120}'],
         ['{"state":"ON"}', "not-json", '{"brightness":120}'],

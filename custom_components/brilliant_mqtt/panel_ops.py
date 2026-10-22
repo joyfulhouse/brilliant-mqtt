@@ -105,23 +105,19 @@ class ReleaseIdentityBlocked(PanelOpError):
     """An actionable, explicitly safe identity refusal with one-operation binding."""
 
     def __init__(self, override: dict[str, object], *, pre_ordinal: bool = False) -> None:
-        self.override = override
-        if pre_ordinal:
-            # An override cannot waive this refusal; the canaried update needs none,
-            # so carry no binding an operator could copy.
-            self.override = {}
-            super().__init__(
-                "release_identity_blocked: installed code predates release ordinals and "
-                "only a canaried update may replace it. Update this panel's agent, or run "
-                "brilliant_mqtt.redeploy for it, without release_override"
-            )
-            return
-        super().__init__(
-            "release_identity_blocked: installed code differs and release ordering is "
+        # A pre-ordinal refusal must never carry a binding an operator could copy.
+        self.override = {} if pre_ordinal else override
+        message = (
+            "release_identity_blocked: installed code predates release ordinals and "
+            "only a canaried update may replace it. Update this panel's agent, or run "
+            "brilliant_mqtt.redeploy for it, without release_override"
+            if pre_ordinal
+            else "release_identity_blocked: installed code differs and release ordering is "
             "unknown or not increasing. Install a reviewed newer release, or explicitly "
             "retry brilliant_mqtt.redeploy for this panel with release_override="
             + json.dumps(override, sort_keys=True, separators=(",", ":"))
         )
+        super().__init__(message)
 
     def __repr__(self) -> str:
         return "ReleaseIdentityBlocked(<redacted>)"
@@ -348,13 +344,15 @@ async def _admit_identities(
             {
                 **binding,
                 "reason": "pre_ordinal_upgrade",
+                "record_type": "admission",
+                "deployment_status": "not_recorded",
                 "components": automatic,
             },
             exclusive=True,
             error_code="release_auto_admission_record_failed",
         )
         _LOGGER.info(
-            "%s: auto-admitted pre-ordinal release for %s",
+            "%s: auto-admitted pre-ordinal release (admitted; deployment not yet verified) for %s",
             panel,
             ", ".join(
                 f"{component} {_release_label(incumbent[component])} -> "

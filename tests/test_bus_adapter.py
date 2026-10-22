@@ -1760,7 +1760,9 @@ class TestBoundedResourceShutdown:
                 await startup
             assert len(first_adapter._resource_close_tasks) == 1
 
-            with pytest.raises(RuntimeError, match="resource shutdown still pending"):
+            with pytest.raises(
+                bus_mod.BusStartFencedError, match="resource shutdown still pending"
+            ):
                 await retry_adapter.start()
             assert len(harness.observers) == 1
             assert len(harness.procs) == 1

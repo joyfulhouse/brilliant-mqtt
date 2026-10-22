@@ -22,7 +22,8 @@ from ..panel_inspection import (
     PanelFacts,
     async_inspect_panel,
 )
-from ..panel_provisioner import PanelProvisioner, ProvisioningProgress
+from ..panel_provisioner import PanelProvisioner, PanelProvisioningError, ProvisioningProgress
+from ..provisioning_journal import ProvisioningJournal, RetainedRollback
 from ..shell import (
     AsyncsshShell as FleetAsyncsshShell,
 )
@@ -50,6 +51,37 @@ class _WrongPanelError(Exception):
     fleet): pushing this entry's env there would overwrite that panel's identity and
     restart it. Carries the foreign panel slug found on the box.
     """
+
+
+async def async_ownerless_recovery_candidate(
+    hass: HomeAssistant, host: str, identity: HostIdentity
+) -> RetainedRollback | None:
+    """Select retained authority before the fresh password can reach a host."""
+    from ..fleet_manager import _async_retained_owner_exists
+
+    journal = ProvisioningJournal(hass)
+    matches = [
+        item
+        for item in await journal.async_retained_records()
+        if item.record.panel_request.host == host
+        or item.record.panel_request.fingerprint == identity.fingerprint
+        or item.record.panel_request.public_key == identity.public_key
+    ]
+    if not matches:
+        return None
+    if len(matches) != 1:
+        raise PanelProvisioningError("ownerless_recovery_unavailable")
+    retained = matches[0]
+    request = retained.record.panel_request
+    if request.public_key != identity.public_key or request.fingerprint != identity.fingerprint:
+        raise PanelProvisioningError("panel_identity_mismatch")
+    if (
+        not retained.ownerless_finalization_allowed
+        or await journal.async_load() is not None
+        or await _async_retained_owner_exists(hass, retained)
+    ):
+        raise PanelProvisioningError("ownerless_recovery_unavailable")
+    return retained
 
 
 @asynccontextmanager

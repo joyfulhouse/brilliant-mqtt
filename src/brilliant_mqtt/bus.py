@@ -42,6 +42,11 @@ from brilliant_mqtt.write_admission import (
     WriteResult,
 )
 
+
+class BusStartFencedError(RuntimeError):
+    """A prior resource close is unresolved, so allocating a new peer is unsafe."""
+
+
 logger = logging.getLogger(__name__)
 
 # Path to the panel's message-bus unix socket (poc-findings §2).
@@ -592,7 +597,7 @@ class RpcBusAdapter:
         """
         unresolved_closes = [task for task in self._resource_close_tasks if not task.done()]
         if unresolved_closes:
-            raise RuntimeError(
+            raise BusStartFencedError(
                 f"prior bus resource shutdown still pending ({len(unresolved_closes)} task(s))"
             )
         self._session += 1
@@ -1567,6 +1572,8 @@ class RpcBusAdapter:
                 sorted(task.get_name() for task in pending),
             )
         for task in done:
+            # Ordinary close failures are logged inside the task; only an
+            # in-resource CancelledError can escape here.
             task.result()
 
     async def shutdown(self) -> None:

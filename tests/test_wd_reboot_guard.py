@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 from pathlib import Path
 
 import pytest
@@ -138,17 +139,12 @@ def test_future_stamp_fails_closed_then_recovers(tmp_path: Path, stamp: float) -
     guard = RebootGuard(str(state), P)
     assert guard.can_request(NOW) is False
     after = NOW + P.cooldown
-    assert guard.can_request(after) is True  # never wedged by a future stamp
-    guard.record_request(after)  # prunes the future stamp
+    assert guard.can_request(after) is False  # retained history starts a normal cooldown
+    after += P.cooldown
+    assert guard.can_request(after) is True
+    guard.record_request(after)  # persists the clamped future stamp
     assert guard.can_request(after + 1.0) is False  # normal cooldown
     assert guard.can_request(after + P.cooldown) is True
-
-
-def test_fail_closed_period_restarts_if_clock_steps_back(tmp_path: Path) -> None:
-    guard = RebootGuard(str(_bad_state(tmp_path, "corrupt")), P)
-    assert guard.can_request(1_000_000.0) is False
-    assert guard.can_request(100.0) is False
-    assert guard.can_request(100.0 + P.cooldown) is True
 
 
 def test_second_bad_episode_fails_closed_and_logs_again(
@@ -222,7 +218,7 @@ def test_record_persists_only_the_rolling_window(tmp_path: Path) -> None:
     recent = NOW - P.cooldown
     _write_history(state, [NOW - P.window - 1.0, recent, NOW + 5.0])
     RebootGuard(str(state), P).record(NOW)
-    assert json.loads(state.read_text(encoding="utf-8")) == [recent, NOW]
+    assert json.loads(state.read_text(encoding="utf-8")) == [recent, NOW, NOW]
 
 
 def test_persistently_bad_state_authorizes_at_most_once_per_cooldown(
@@ -274,3 +270,190 @@ def test_last_read_bad_tracks_the_latest_read_not_the_window(tmp_path: Path) -> 
     path.write_text("[]", encoding="utf-8")
     assert g.can_request(200.0) is False  # still inside the window
     assert g.last_read_bad is False
+
+
+@pytest.mark.parametrize("kind", ["fifo", "oversized"])
+def test_unsafe_state_is_rejected_without_opening(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    state = tmp_path / "state"
+    if kind == "fifo":
+        os.mkfifo(state)
+    else:
+        state.write_bytes(b" " * (65536 + 1))
+
+    def forbidden_open(*args: object, **kwargs: object) -> None:
+        raise AssertionError("unsafe state must not be opened")
+
+    monkeypatch.setattr("brilliant_wifi_watchdog.reboot_guard.os.open", forbidden_open)
+    assert RebootGuard(str(state), P).can_reboot(NOW) is False
+
+
+def test_permission_error_is_bad_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    state = tmp_path / "state"
+    state.write_text("[]", encoding="utf-8")
+
+    def denied(*args: object, **kwargs: object) -> None:
+        raise PermissionError("denied")
+
+    monkeypatch.setattr("brilliant_wifi_watchdog.reboot_guard.os.open", denied)
+    assert RebootGuard(str(state), P).can_reboot(NOW) is False
+
+
+def test_exact_window_boundary_keeps_cap(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    _write_history(state, [NOW - P.window, NOW - 2 * P.cooldown, NOW - P.cooldown])
+    assert RebootGuard(str(state), P).can_reboot(NOW) is False
+
+
+def test_record_keeps_window_boundary_and_equal_now(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    _write_history(state, [NOW - P.window, NOW])
+    RebootGuard(str(state), P).record(NOW)
+    assert json.loads(state.read_text()) == [NOW - P.window, NOW, NOW]
+
+
+def test_wall_jump_does_not_expire_bad_state_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("brilliant_wifi_watchdog.reboot_guard.time.monotonic", lambda: 10.0)
+    guard = RebootGuard(str(_bad_state(tmp_path, "corrupt")), P)
+    assert guard.can_reboot(0.0) is False
+    assert guard.can_reboot(NOW) is False
+
+
+def test_backward_step_preserves_full_cap(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    tick = [0.0]
+    monkeypatch.setattr("brilliant_wifi_watchdog.reboot_guard.time.monotonic", lambda: tick[0])
+    state = tmp_path / "state"
+    _write_history(state, [NOW, NOW + P.cooldown, NOW + 2 * P.cooldown])
+    guard = RebootGuard(str(state), P)
+    assert guard.can_reboot(0.0) is False
+    tick[0] = P.cooldown
+    assert guard.can_reboot(P.cooldown) is False
+    tick[0] = 2 * P.cooldown
+    assert guard.can_reboot(2 * P.cooldown) is False
+    guard.record(2 * P.cooldown)
+    assert len(json.loads(state.read_text())) == 4
+
+
+@pytest.fixture(autouse=True)
+def simulated_monotonic(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Legacy histories use one simulated timeline for both clocks."""
+    if request.node.name.startswith(("test_wall_jump", "test_backward_step")):
+        return
+    original = RebootGuard.can_reboot
+
+    def at(self: RebootGuard, now: float) -> bool:
+        monkeypatch.setattr("brilliant_wifi_watchdog.reboot_guard.time.monotonic", lambda: now)
+        return original(self, now)
+
+    monkeypatch.setattr(RebootGuard, "can_reboot", at)
+
+
+def test_backward_step_new_history_rearms_and_preserves_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tick = [0.0]
+    monkeypatch.setattr("brilliant_wifi_watchdog.reboot_guard.time.monotonic", lambda: tick[0])
+    policy = GuardPolicy(cooldown=10, cap=3, window=60)
+    state = tmp_path / "state"
+    _write_history(state, [1000])
+    guard = RebootGuard(str(state), policy)
+    assert guard.can_reboot(0) is False
+    tick[0] = 10
+    assert guard.can_reboot(10) is False
+    _write_history(state, [100, 110, 120])
+    tick[0] = 100
+    assert guard.can_reboot(90) is False
+    tick[0] = 110
+    assert guard.can_reboot(90) is False
+    guard.record(90)
+    assert json.loads(state.read_text()) == [90, 90, 90, 90]
+
+
+def test_backward_step_second_correction_recovers_on_new_timeline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tick = [0.0]
+    monkeypatch.setattr("brilliant_wifi_watchdog.reboot_guard.time.monotonic", lambda: tick[0])
+    policy = GuardPolicy(cooldown=10, cap=3, window=60)
+    state = tmp_path / "state"
+    _write_history(state, [1000])
+    guard = RebootGuard(str(state), policy)
+    assert guard.can_reboot(100) is False
+    tick[0] = 10
+    assert guard.can_reboot(110) is False
+    tick[0] = 20
+    assert guard.can_reboot(0) is False
+    tick[0] = 30
+    assert guard.can_reboot(10) is False
+    tick[0] = 40
+    assert guard.can_reboot(20) is True
+
+
+def test_fifo_swap_between_stat_and_open_is_nonblocking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = tmp_path / "state"
+    state.write_text("[]", encoding="utf-8")
+    original_stat, original_open = os.stat, os.open
+    opened: list[int] = []
+
+    def swapped_stat(path: str) -> os.stat_result:
+        result = original_stat(path)
+        state.unlink()
+        os.mkfifo(state)
+        return result
+
+    def nonblocking_open(path: str, flags: int) -> int:
+        assert flags & os.O_NONBLOCK
+        fd = original_open(path, flags)
+        opened.append(fd)
+        return fd
+
+    def blocking_open(*args: object, **kwargs: object) -> None:
+        raise AssertionError("must use a nonblocking descriptor")
+
+    monkeypatch.setattr("builtins.open", blocking_open)
+    monkeypatch.setattr("brilliant_wifi_watchdog.reboot_guard.os.stat", swapped_stat)
+    monkeypatch.setattr("brilliant_wifi_watchdog.reboot_guard.os.open", nonblocking_open)
+    assert RebootGuard(str(state), P).can_reboot(NOW) is False
+
+    assert len(opened) == 1
+    with pytest.raises(OSError):
+        os.fstat(opened[0])
+
+
+@pytest.mark.parametrize("grow_after", ["stat", "fstat"])
+@pytest.mark.parametrize(
+    "content",
+    [b" " * 65537, ('"' + "\u00e9" * 40000 + '"').encode()],
+    ids=["ascii", "multibyte"],
+)
+def test_replaced_or_growing_state_has_byte_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, grow_after: str, content: bytes
+) -> None:
+    state = tmp_path / "state"
+    state.write_bytes(b"[]")
+    original_stat, original_fstat = os.stat, os.fstat
+
+    def growing_stat(path: str) -> os.stat_result:
+        result = original_stat(path)
+        if grow_after == "stat":
+            state.write_bytes(content)
+        return result
+
+    def growing_fstat(fd: int) -> os.stat_result:
+        result = original_fstat(fd)
+        if grow_after == "fstat":
+            state.write_bytes(content)
+        return result
+
+    def forbidden_parse(raw: bytes) -> None:
+        raise AssertionError("oversized bytes must not be parsed")
+
+    monkeypatch.setattr("brilliant_wifi_watchdog.reboot_guard.json.loads", forbidden_parse)
+    monkeypatch.setattr("brilliant_wifi_watchdog.reboot_guard.os.stat", growing_stat)
+    monkeypatch.setattr("brilliant_wifi_watchdog.reboot_guard.os.fstat", growing_fstat)
+    assert RebootGuard(str(state), P).can_reboot(NOW) is False

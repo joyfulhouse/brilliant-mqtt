@@ -5996,3 +5996,15 @@ async def test_management_retirement_hanging_close_is_bounded_and_not_finalized(
     assert entry.data[CONF_HA_MIRROR_TOKEN] == "mirror-secret"
     assert entry.data.get(DATA_HA_MIRROR_RETIRE_VERIFIED) is not True
     assert ir.async_get(hass).async_get_issue(DOMAIN, issue_id) is not None
+
+
+def test_snapshot_probe_summary_exposes_only_safe_retry_guidance() -> None:
+    from custom_components.brilliant_mqtt.manager import _safe_failure_summary
+    from custom_components.brilliant_mqtt.panel_ops import PanelOpError
+
+    summary = _safe_failure_summary(
+        "update failed", PanelOpError("snapshot_probe_failed: SECRET stderr and host")
+    )
+    assert "snapshot_probe_failed" in summary
+    assert "retry" in summary
+    assert "SECRET" not in summary

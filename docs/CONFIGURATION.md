@@ -74,6 +74,7 @@ the agent's own default remains authoritative.
 | Variable | Required | Default | Meaning |
 |---|---|---|---|
 | `RECONNECT_STORM_THRESHOLD` | no | `20` reconnects | Rebuild the bus session when the bus reconnects at least this many times within the window. Breaks a storm that the stale watchdog cannot detect (each reconnect resets its push clock). `0` disables. |
+| `BUS_FENCED_START_LIMIT` | no | `3` starts | Positive integer. Exit nonzero after this many consecutive bus starts fenced by unresolved resource shutdown, allowing systemd to restart the process. Successful or nonfenced bus starts reset the count; MQTT failures before bus startup preserve it. |
 | `RECONNECT_STORM_WINDOW_SECONDS` | no | `60` seconds | Sliding window for `RECONNECT_STORM_THRESHOLD` |
 
 ### BLE mesh
@@ -82,6 +83,13 @@ the agent's own default remains authoritative.
 |---|---|---|---|
 | `MESH_PRIORITY` | no | `0` (never publish) | Participate in BLE-mesh leader election with this priority. Lower number wins; ties broken by panel name. `0` means this panel never publishes the mesh namespace. Set to `1` or higher on every panel that should be a standby. |
 | `MESH_HEARTBEAT_SECONDS` | no | `10` seconds | How often the elected leader heartbeats its retained claim. A claim older than 3× this triggers a standby takeover. |
+
+Home Assistant groups each mesh peripheral's primary and auxiliary entities
+under its own device, named after that peripheral. Device identifiers depend
+on the peripheral identity, so changing the elected publishing panel preserves
+the grouping. Existing entity unique IDs and MQTT topics stay the same. An
+older, now-empty aggregate "Brilliant BLE Mesh" device may remain in Home
+Assistant's device registry; this change does not delete registry entries.
 
 ### Scene and mode bridge
 
@@ -505,3 +513,9 @@ for every validation error, see the
 No HA-side configuration is required: entities appear via MQTT Discovery as
 native MQTT entities (light/switch/sensor per device capability), and recover
 automatically across HA restarts from retained discovery + state.
+
+MQTT connection failures retry after 5, 10, 20, 40, then at most 60 seconds.
+The sequence resets only after the initial panel reconcile completes; other
+session failures retain their existing five-second delay, and retained-ledger
+failures retain their longer delay. Both independent watchdogs record a UTC
+`stopped by SIGTERM at ...` marker in their configured persistent logs.

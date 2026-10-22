@@ -15,9 +15,10 @@ import os
 import tempfile
 import threading
 import weakref
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import cast
+from typing import TypeVar, cast
 
 from brilliant_mqtt.ha_control_protocol import is_panel_slug
 from brilliant_mqtt.protocols import MqttClient
@@ -25,9 +26,11 @@ from brilliant_mqtt.protocols import MqttClient
 SCHEMA_VERSION = 1
 MAX_TOPICS = 4_096
 MAX_MANIFEST_BYTES = 256 * 1024
-# Bound on one durable ledger write, matching aiomqtt's default 10 s wait for a
+# Bound on one ledger filesystem operation, matching aiomqtt's 10 s wait for a
 # broker acknowledgement so storage cannot stall publication longer than MQTT.
 PERSIST_DEADLINE_S = 10.0
+
+_T = TypeVar("_T")
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -87,6 +90,8 @@ class _PathState:
     # Set when a write outlived its deadline: the file may no longer match
     # ``topics``. Every publish re-persists ``topics`` until one succeeds.
     disk_stale: bool = False
+    # Late reads also retain ownership, preventing worker accumulation on retry.
+    stalled_load: asyncio.Future[bytes | None] | None = None
 
 
 _PATH_STATES: weakref.WeakValueDictionary[Path, _PathState] = weakref.WeakValueDictionary()
@@ -126,21 +131,29 @@ class RetainedTopicLedger:
             self._acknowledged_topics = frozenset()
             self._state.loaded = False
             self._state.topics = frozenset()
-            stalled = self._state.stalled_write
-            if stalled is not None and not stalled.done():
-                raise RetainedLedgerError("retained ledger persistence is still stalled")
+            _raise_if_stalled(self._state)
             self._state.disk_stale = False
             try:
-                raw = await asyncio.to_thread(self._path.read_bytes)
-            except FileNotFoundError:
-                self._state.loaded = True
-                self._loaded = True
-                return
+                read = _start_io(functools.partial(_read_payload, self._path), "load")
+                try:
+                    await asyncio.wait({read}, timeout=PERSIST_DEADLINE_S)
+                except asyncio.CancelledError:
+                    self._state.stalled_load = read
+                    read.add_done_callback(functools.partial(_settle_stalled_load, self._state))
+                    raise
+                if not read.done():
+                    self._state.stalled_load = read
+                    read.add_done_callback(functools.partial(_settle_stalled_load, self._state))
+                    raise RetainedLedgerError(
+                        f"retained ledger load exceeded {PERSIST_DEADLINE_S:g} s"
+                    )
+                raw = read.result()
             except OSError as error:
                 raise RetainedLedgerError("could not read retained ledger") from error
 
-            manifest = _decode_manifest(raw, self._panel_slug)
-            self._state.topics = manifest.topics
+            if raw is not None:
+                manifest = _decode_manifest(raw, self._panel_slug)
+                self._state.topics = manifest.topics
             self._state.loaded = True
             self._loaded = True
 
@@ -268,8 +281,7 @@ class RetainedTopicLedger:
 
     async def _async_persist(self, payload: str, topics: frozenset[str]) -> None:
         state = self._state
-        if state.stalled_write is not None and not state.stalled_write.done():
-            raise RetainedLedgerError("retained ledger persistence is still stalled")
+        _raise_if_stalled(state)
         write = _start_write(self._path, payload)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + PERSIST_DEADLINE_S
@@ -315,42 +327,82 @@ class RetainedTopicLedger:
             raise RetainedLedgerError("retained ledger must be loaded before use")
 
 
+def _raise_if_stalled(state: _PathState) -> None:
+    if state.stalled_write is not None and not state.stalled_write.done():
+        raise RetainedLedgerError("retained ledger persistence is still stalled")
+    if state.stalled_load is not None and not state.stalled_load.done():
+        raise RetainedLedgerError("retained ledger load is still stalled")
+
+
+def _read_payload(path: Path) -> bytes | None:
+    # The path lock and stalled-operation guards exclude active local writes.
+    # Clean only this ledger's scratch siblings, never another ledger's files.
+    try:
+        siblings = list(path.parent.iterdir())
+    except FileNotFoundError:
+        return None
+    prefix = f".{path.name}."
+    for sibling in siblings:
+        if not sibling.name.startswith(prefix) or not sibling.name.endswith(".tmp"):
+            continue
+        token = sibling.name[len(prefix) : -len(".tmp")]
+        # mkstemp's random token contains no dots. Another ledger such as
+        # owned.json.backup has an extra dot before its own random token.
+        if not token or "." in token:
+            continue
+        try:
+            sibling.unlink()
+        except OSError as error:
+            _LOGGER.warning("RETAINED_LEDGER_TEMP_CLEANUP_FAILED %s", type(error).__name__)
+    try:
+        return path.read_bytes()
+    except FileNotFoundError:
+        return None
+
+
 def _start_write(path: Path, payload: str) -> asyncio.Future[None]:
-    """Run one durable write on a daemon thread and return its completion.
+    return _start_io(functools.partial(_write_payload, path, payload), "write")
 
-    Not the default executor: ``asyncio.run`` joins that at exit (unbounded on
-    the panel's Python 3.10), so a stalled write would hold the process past
-    its fail-closed deadline. A daemon thread killed at exit leaves the target
-    whole, because only ``os.replace`` changes it; at worst a sibling
-    temporary file is left behind.
-    """
+
+def _start_io(operation: Callable[[], _T], name: str) -> asyncio.Future[_T]:
+    """Run bounded filesystem work without joining a wedged worker at exit."""
     loop = asyncio.get_running_loop()
-    done: asyncio.Future[None] = loop.create_future()
+    done: asyncio.Future[_T] = loop.create_future()
 
-    def settle(error: BaseException | None) -> None:
+    def settle(result: _T | None, error: BaseException | None) -> None:
         if done.done():
             return
         if error is None:
-            done.set_result(None)
+            done.set_result(cast(_T, result))
         else:
             done.set_exception(error)
 
     def run() -> None:
+        result: _T | None = None
         error: BaseException | None = None
         try:
-            _write_payload(path, payload)
+            result = operation()
         except Exception as caught:
             error = caught
         try:
-            loop.call_soon_threadsafe(settle, error)
+            loop.call_soon_threadsafe(settle, result, error)
         except RuntimeError:
-            pass  # The loop closed while the write stalled; nobody awaits it.
+            pass  # The loop closed while the worker stalled.
 
     try:
-        threading.Thread(target=run, name="retained-ledger-write", daemon=True).start()
+        threading.Thread(target=run, name=f"retained-ledger-{name}", daemon=True).start()
     except RuntimeError as error:
-        raise RetainedLedgerError("could not start retained ledger write") from error
+        raise RetainedLedgerError(f"could not start retained ledger {name}") from error
     return done
+
+
+def _settle_stalled_load(state: _PathState, read: asyncio.Future[bytes | None]) -> None:
+    # Retain shared ownership across session reconstruction until work finishes.
+    if state.stalled_load is read:
+        state.stalled_load = None
+    error = None if read.cancelled() else read.exception()
+    if error is not None:
+        _LOGGER.warning("RETAINED_LEDGER_LATE_LOAD_FAILED %s", type(error).__name__)
 
 
 def _settle_stalled_write(state: _PathState, write: asyncio.Future[None]) -> None:

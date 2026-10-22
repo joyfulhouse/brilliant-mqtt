@@ -252,7 +252,7 @@ async def test_broker_outage_never_qualifies_as_a_bus_wedge(
     _install_session_fakes(monkeypatch, bus, mqtt)
 
     for _ in range(3):
-        with pytest.raises(ConnectionError, match="broker refused"):
+        with pytest.raises(main_mod.MqttConnectError, match="MQTT connection failed"):
             await main_mod._run_session(settings, None, None)
 
     failure_age = bus_failure_age(settings.bus_phase_file, now=time.monotonic())
@@ -297,7 +297,7 @@ async def test_stale_bus_phase_and_heartbeat_do_not_reboot_on_broker_outage(
     mqtt = _Mqtt(ConnectionError("broker refused"))
     _install_session_fakes(monkeypatch, bus, mqtt)
 
-    with pytest.raises(ConnectionError, match="broker refused"):
+    with pytest.raises(main_mod.MqttConnectError, match="MQTT connection failed"):
         await main_mod._run_session(settings, None, None)
 
     failure_age = bus_failure_age(settings.bus_phase_file, now=time.monotonic())
@@ -343,7 +343,7 @@ async def test_failed_pre_bus_restamp_does_not_reboot_on_broker_outage(
     mqtt = _Mqtt(ConnectionError("broker refused"))
     _install_session_fakes(monkeypatch, bus, mqtt)
 
-    with pytest.raises(ConnectionError, match="broker refused"):
+    with pytest.raises(main_mod.MqttConnectError, match="MQTT connection failed"):
         await main_mod._run_session(settings, None, None)
 
     failure_age = bus_failure_age(settings.bus_phase_file, now=time.monotonic())
@@ -387,7 +387,7 @@ async def test_failed_phase_write_and_unlink_do_not_reboot_on_broker_outage(
     _install_session_fakes(monkeypatch, bus, mqtt)
 
     with caplog.at_level(logging.WARNING, logger="brilliant_mqtt.heartbeat"):
-        with pytest.raises(ConnectionError, match="broker refused"):
+        with pytest.raises(main_mod.MqttConnectError, match="MQTT connection failed"):
             await main_mod._run_session(settings, None, None)
 
     failure_age = bus_failure_age(settings.bus_phase_file, now=1900.0)
@@ -561,7 +561,7 @@ async def test_broker_only_gap_breaks_prior_bus_failure_history(
             _Bus(),
             _Mqtt(ConnectionError("broker refused")),
         )
-        with pytest.raises(ConnectionError, match="broker refused"):
+        with pytest.raises(main_mod.MqttConnectError, match="MQTT connection failed"):
             await main_mod._run_session(settings, None, None)
 
     entered_start = asyncio.Event()
@@ -608,7 +608,7 @@ async def test_short_broker_blip_preserves_current_bus_failure_history(
         _Bus(),
         _Mqtt(ConnectionError("broker refused")),
     )
-    with pytest.raises(ConnectionError, match="broker refused"):
+    with pytest.raises(main_mod.MqttConnectError, match="MQTT connection failed"):
         await main_mod._run_session(settings, None, None)
 
     clock.advance(100.0)
@@ -822,7 +822,7 @@ async def test_broker_recovery_bus_start_window_does_not_reboot_healthy_panel(
     outage_bus = _Bus()
     outage_mqtt = _Mqtt(ConnectionError("broker refused"))
     _install_session_fakes(monkeypatch, outage_bus, outage_mqtt)
-    with pytest.raises(ConnectionError, match="broker refused"):
+    with pytest.raises(main_mod.MqttConnectError, match="MQTT connection failed"):
         await main_mod._run_session(settings, None, None)
     clock.advance(1900.0)
 
