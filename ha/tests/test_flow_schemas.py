@@ -983,7 +983,7 @@ def test_panel_credential_and_rebind_passwords_are_masked_without_suggestions() 
     fields = {field["name"]: field for field in serialized}
     encoded = json.dumps(serialized, sort_keys=True)
 
-    assert {str(marker) for marker in credentials.schema} == {CONF_ROOT_PASSWORD}
+    assert {str(marker) for marker in credentials.schema} == {CONF_ROOT_PASSWORD, CONF_HOST}
     assert {str(marker) for marker in rebind.schema} == {CONF_HOST, CONF_ROOT_PASSWORD}
     assert fields[CONF_ROOT_PASSWORD]["selector"]["text"]["type"] == "password"
     assert "suggested_value" not in fields[CONF_ROOT_PASSWORD].get("description", {})

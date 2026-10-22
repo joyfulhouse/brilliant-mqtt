@@ -812,6 +812,7 @@ async def test_supervisor_recorder_survives_rebuild_and_counts_typed_reason(
         desired_panel: DesiredState | None,
         desired_mesh: DesiredState | None,
         diagnostics: ResponseDiagnostics | None = None,
+        progress: main_mod._SessionProgress | None = None,
     ) -> None:
         # Cancel instead of raising an assertion in the retry loop if not wired.
         if diagnostics is None:

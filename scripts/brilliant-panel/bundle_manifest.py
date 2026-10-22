@@ -498,6 +498,18 @@ def installed_identities(
             else active_root / component / "VERSION"
         )
         version = version_path.read_text().strip() if version_path.exists() else "unknown"
+        if component != "bridge" and not selected_release and not version_path.exists():
+            bridge = output.get("bridge")
+            bridge_version = bridge.get("version") if bridge is not None else None
+            match = (
+                re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", bridge_version)
+                if bridge is not None
+                and isinstance(bridge_version, str)
+                and bridge.get("layout") == "legacy_fixed"
+                else None
+            )
+            if match is not None and tuple(int(part) for part in match.groups()) < (0, 11, 0):
+                version = match.group(0)
         if re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z._+-]{0,127}", version) is None:
             raise ManifestError("invalid installed version")
         identity: dict[str, object] = {

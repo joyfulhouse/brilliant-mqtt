@@ -568,7 +568,9 @@ class _TopicDispatcher:
                 self._active.pop(lane, None)
                 discarded = self._folded.pop(lane, None)
                 if discarded is not None:
-                    logger.debug("MQTT command lane discarded a folded replacement during cleanup")
+                    logger.warning(
+                        "MQTT command lane discarded a folded replacement during cleanup"
+                    )
                 queue.task_done()
 
 
@@ -605,7 +607,14 @@ def _coalesce_payload(topic: str, before: str | bytes, after: str | bytes) -> st
             value = json.loads(payload)
         except (ValueError, RecursionError):
             return None
-        if not isinstance(value, dict) or not value or value.keys() - {"state", "brightness"}:
+        if (
+            not isinstance(value, dict)
+            or not value
+            or value.keys() - {"state", "brightness", "transition"}
+        ):
+            return None
+        value.pop("transition", None)
+        if not value:
             return None
         if "state" in value and value["state"] not in ("ON", "OFF"):
             return None
@@ -878,6 +887,7 @@ class AioMqttAdapter:
         )
         self._client = aiomqtt.Client(
             hostname=settings.mqtt_host,
+            timeout=10.0,
             port=settings.mqtt_port,
             username=settings.mqtt_username,
             password=settings.mqtt_password,

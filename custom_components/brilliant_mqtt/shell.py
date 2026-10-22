@@ -10,7 +10,11 @@ from __future__ import annotations
 
 import asyncio
 import os
+import posixpath
+import stat
+from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
 from typing import Protocol, cast
 
 import asyncssh
@@ -21,16 +25,95 @@ _LOGIN_TIMEOUT = 15
 _OPERATION_TIMEOUT = 120
 
 
-def _list_local_tree(local_dir: str) -> list[str]:
-    """Pre-walk a local tree in an executor so the event loop never blocks.
+_UPLOAD_CHUNK_BYTES = 64 * 1024
+_MAX_UPLOAD_ENTRIES = 16384
+_MAX_UPLOAD_BYTES = 512 * 1024 * 1024
 
-    Returns the list so the call itself is observable; the real value is that
-    os.walk runs the blocking scandir/stat syscalls off-loop. Callers must pass
-    the result to asyncssh's recursive put on the loop immediately after, so
-    the tree cannot change between the walk and the upload in practice (staging
-    dirs are ours alone).
-    """
-    return [os.path.join(root, name) for root, _dirs, files in os.walk(local_dir) for name in files]
+
+@dataclass(frozen=True)
+class _LocalUpload:
+    path: str
+    relative: str
+    mode: int
+    directory: bool
+    size: int
+    identity: tuple[int, int, int, int]
+
+    @property
+    def name(self) -> str:
+        return os.path.basename(os.path.normpath(self.path))
+
+
+def _local_upload(path: str, relative: str) -> _LocalUpload:
+    info = os.stat(path, follow_symlinks=False)
+    if not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)):
+        raise ValueError("upload_source_not_regular")
+    return _LocalUpload(
+        path,
+        relative,
+        stat.S_IMODE(info.st_mode),
+        stat.S_ISDIR(info.st_mode),
+        info.st_size,
+        (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns),
+    )
+
+
+def _list_local_tree(local_dir: str) -> list[_LocalUpload]:
+    """Enumerate bounded regular payloads entirely in a worker thread."""
+    root = _local_upload(local_dir, "")
+    if not root.directory:
+        raise ValueError("upload_source_not_directory")
+    entries = [root]
+    pending = [root]
+    total = 0
+    while pending:
+        directory = pending.pop()
+        with os.scandir(directory.path) as children:
+            for child in children:
+                relative = posixpath.join(directory.relative, child.name)
+                entry = _local_upload(child.path, relative)
+                entries.append(entry)
+                if entry.directory:
+                    pending.append(entry)
+                else:
+                    total += entry.size
+                if len(entries) > _MAX_UPLOAD_ENTRIES or total > _MAX_UPLOAD_BYTES:
+                    raise ValueError("upload_source_too_large")
+    return entries
+
+
+def _read_local_chunk(entry: _LocalUpload, offset: int) -> bytes:
+    # Nonblocking open and descriptor verification reject a swapped FIFO/symlink.
+    descriptor = os.open(entry.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(descriptor)
+        identity = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+        if not stat.S_ISREG(info.st_mode) or identity != entry.identity:
+            raise ValueError("upload_source_changed")
+        data = os.pread(descriptor, min(_UPLOAD_CHUNK_BYTES, entry.size - offset), offset)
+        if not data and offset < entry.size:
+            raise ValueError("upload_source_changed")
+        return data
+    finally:
+        os.close(descriptor)
+
+
+async def _async_local_io[T](operation: Callable[[], T]) -> T:
+    """Drain worker I/O before allowing its caller to close the remote stream."""
+    task = asyncio.create_task(asyncio.to_thread(operation))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                break
+        if not task.cancelled():
+            task.exception()
+        raise
 
 
 _CLOSE_TIMEOUT = 15
@@ -574,18 +657,61 @@ class _ShellOperations:
                     await f.chmod(mode)  # converge pre-existing files; no-op on fresh creates
                     await f.write(data)
 
+    async def _async_upload_file(
+        self, sftp: asyncssh.SFTPClient, entry: _LocalUpload, remote_path: str, mode: int
+    ) -> None:
+        async with await sftp.open(remote_path, "wb", attrs=SFTPAttrs(permissions=mode)) as remote:
+            await remote.chmod(mode)
+            offset = 0
+            while offset < entry.size:
+                data = await _async_local_io(partial(_read_local_chunk, entry, offset))
+                await remote.write(data)
+                offset += len(data)
+
     async def put_dir(self, local_dir: str, remote_dir: str) -> None:
         conn = self._require_conn()
         async with asyncio.timeout(_OPERATION_TIMEOUT):
+            entries = await _async_local_io(partial(_list_local_tree, local_dir))
             async with await conn.start_sftp_client() as sftp:
-                await sftp.put(local_dir, remote_dir, recurse=True)
+                destination = (
+                    posixpath.join(remote_dir, entries[0].name)
+                    if await sftp.isdir(remote_dir)
+                    else remote_dir
+                )
+                for entry in entries:
+                    target = (
+                        posixpath.join(destination, entry.relative)
+                        if entry.relative
+                        else destination
+                    )
+                    if entry.directory:
+                        if not await sftp.isdir(target):
+                            await sftp.mkdir(target, attrs=SFTPAttrs(permissions=0o700))
+                    else:
+                        await self._async_upload_file(sftp, entry, target, entry.mode)
+                # Apply directory permissions after children, including read-only trees.
+                for entry in reversed(entries):
+                    if entry.directory:
+                        target = (
+                            posixpath.join(destination, entry.relative)
+                            if entry.relative
+                            else destination
+                        )
+                        await sftp.chmod(target, entry.mode)
 
     async def put_file(self, local_path: str, remote_path: str, mode: int) -> None:
         conn = self._require_conn()
         async with asyncio.timeout(_OPERATION_TIMEOUT):
+            entry = await _async_local_io(partial(_local_upload, local_path, ""))
+            if entry.directory or entry.size > _MAX_UPLOAD_BYTES:
+                raise ValueError("upload_source_not_regular")
             async with await conn.start_sftp_client() as sftp:
-                await sftp.put(local_path, remote_path)
-                await sftp.chmod(remote_path, mode)
+                destination = (
+                    posixpath.join(remote_path, entry.name)
+                    if await sftp.isdir(remote_path)
+                    else remote_path
+                )
+                await self._async_upload_file(sftp, entry, destination, mode)
 
 
 class AsyncsshShell(_ShellOperations):

@@ -83,6 +83,16 @@ async def _native_writes(
     ("commands", "expected"),
     [
         pytest.param(
+            [{"state": "ON", "brightness": 40, "transition": 2}, {"brightness": 60}],
+            {"on": "1", "intensity": "60"},
+            id="transition-before-partial",
+        ),
+        pytest.param(
+            [{"state": "ON", "brightness": 40}, {"brightness": 60, "transition": 2}],
+            {"on": "1", "intensity": "60"},
+            id="transition-after-full",
+        ),
+        pytest.param(
             [{"state": "ON", "brightness": 40}, {"brightness": 60}],
             {"on": "1", "intensity": "60"},
             id="partial-after-full",

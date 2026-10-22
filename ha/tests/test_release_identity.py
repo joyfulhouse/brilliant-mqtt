@@ -188,15 +188,7 @@ async def test_pre_ordinal_release_policy_admits_only_strict_legacy_versions() -
 async def test_guest_bath_legacy_update_needs_no_override_notification(
     hass: HomeAssistant, payload_dir: Path
 ) -> None:
-    (payload_dir / "VERSION").write_text("0.11.0")
-    (payload_dir / "RELEASE_ORDINAL").write_text("2\n")
-    shell = IdentityShell(
-        {
-            **_identity(digest="5bab1bd0" + "0" * 56, ordinal=None),
-            "version": "0.10.2",
-            "layout": "legacy_fixed",
-        }
-    )
+    shell = _legacy_bridge_shell(payload_dir)
     _entry, manager = _fleet_panel_manager(hass)
     with (
         patch.object(manager, "_connect_for_repair", AsyncMock(return_value=shell)),
@@ -219,6 +211,8 @@ async def test_guest_bath_legacy_update_needs_no_override_notification(
     ]
     assert len(audit) == 1
     assert audit[0]["components"] == ["bridge"]
+    assert audit[0]["record_type"] == "admission"
+    assert audit[0]["deployment_status"] == "not_recorded"
     assert audit[0]["incumbent"]["bridge"]["version"] == "0.10.2"
     assert audit[0]["candidate"]["bridge"]["release_ordinal"] == 2
     await manager.async_shutdown()
@@ -340,7 +334,7 @@ async def test_auto_admission_logs_versions_and_ordinals_without_digests(
     assert records[0].levelname == "INFO"
     message = records[0].getMessage()
     assert message == (
-        "guest-bath: auto-admitted pre-ordinal release for "
+        "guest-bath: auto-admitted pre-ordinal release (admitted; deployment not yet verified) for "
         "bridge 0.10.2 (ordinal unknown) -> 0.11.0 (ordinal 2)"
     )
     assert "5bab1bd0" not in caplog.text
@@ -359,16 +353,8 @@ def test_auto_admission_record_failure_is_an_operator_safe_detail() -> None:
 async def test_mixed_legacy_bridge_and_identical_watchdog_only_admits_bridge(
     payload_dir: Path,
 ) -> None:
-    (payload_dir / "VERSION").write_text("0.11.0")
-    (payload_dir / "RELEASE_ORDINAL").write_text("2\n")
+    shell = _legacy_bridge_shell(payload_dir)
     candidate = await panel_ops.candidate_identities(str(payload_dir))
-    shell = IdentityShell(
-        {
-            **_identity(digest="5" * 64, ordinal=None),
-            "version": "0.10.2",
-            "layout": "legacy_fixed",
-        }
-    )
     shell.release_identities["bus_watchdog"] = {
         **candidate["bus_watchdog"].as_dict(),
         "version": "0.10.2",
@@ -752,3 +738,88 @@ async def test_redeploy_override_service_requires_one_target_and_forwards_bindin
         office.async_update_agent.assert_not_awaited()
     kitchen.async_update_agent.assert_not_awaited()
     assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.parametrize("version", ["0.8.0", "0.9.0", "0.10.0"])
+@pytest.mark.parametrize("watchdog", ["wifi_watchdog", "bus_watchdog"])
+async def test_missing_legacy_watchdog_version_uses_same_panel_bridge(
+    tmp_path: Path, version: str, watchdog: str
+) -> None:
+    from custom_components.brilliant_mqtt.agent_payload import bundle_manifest
+
+    root = tmp_path / "panel"
+    (root / "app").mkdir(parents=True)
+    (root / "vendor").mkdir()
+    (root / "app/main.py").write_text("bridge")
+    (root / "VERSION").write_text(version)
+    package = root / watchdog / f"brilliant_{watchdog}"
+    package.mkdir(parents=True)
+    (package / "run.py").write_text("historical watchdog bytes")
+    record = bundle_manifest.installed_identities(root)[watchdog]
+    assert record is not None
+    assert record["version"] == version
+    assert record["release_ordinal"] is None
+    assert record["digest"] == bundle_manifest.code_digest(root, watchdog)
+
+
+@pytest.mark.parametrize("version", ["0.11.0", "0.11.1", "0.10.0rc1", "garbage", "unknown"])
+async def test_watchdog_version_fallback_rejects_nonlegacy_bridge(
+    tmp_path: Path, version: str
+) -> None:
+    from custom_components.brilliant_mqtt.agent_payload import bundle_manifest
+
+    root = tmp_path / "panel"
+    (root / "app").mkdir(parents=True)
+    (root / "vendor").mkdir()
+    (root / "app/main.py").write_text("bridge")
+    (root / "VERSION").write_text(version)
+    package = root / "wifi_watchdog/brilliant_wifi_watchdog"
+    package.mkdir(parents=True)
+    (package / "run.py").write_text("watchdog")
+    record = bundle_manifest.installed_identities(root)["wifi_watchdog"]
+    assert record is not None and record["version"] == "unknown"
+
+
+@pytest.mark.parametrize("bridge", [False, True])
+async def test_explicit_unknown_watchdog_version_never_inherits_bridge(
+    tmp_path: Path, bridge: bool
+) -> None:
+    from custom_components.brilliant_mqtt.agent_payload import bundle_manifest
+
+    root = tmp_path / "panel"
+    if bridge:
+        (root / "app").mkdir(parents=True)
+        (root / "vendor").mkdir()
+        (root / "app/main.py").write_text("bridge")
+        (root / "VERSION").write_text("0.10.0")
+    package = root / "wifi_watchdog/brilliant_wifi_watchdog"
+    package.mkdir(parents=True)
+    (package / "run.py").write_text("watchdog")
+    (package.parent / "VERSION").write_text("unknown")
+    record = bundle_manifest.installed_identities(root)["wifi_watchdog"]
+    assert record is not None and record["version"] == "unknown"
+
+
+@pytest.mark.parametrize("bridge_layout", ["absent", "release_link"])
+async def test_missing_watchdog_version_never_inherits_absent_or_release_bridge(
+    tmp_path: Path, bridge_layout: str
+) -> None:
+    from custom_components.brilliant_mqtt.agent_payload import bundle_manifest
+
+    root = tmp_path / "panel"
+    package = root / "wifi_watchdog/brilliant_wifi_watchdog"
+    package.mkdir(parents=True)
+    (package / "run.py").write_text("watchdog")
+    units = tmp_path / "units"
+    units.mkdir()
+    if bridge_layout == "release_link":
+        release = root / "releases/one"
+        (release / "app").mkdir(parents=True)
+        (release / "vendor").mkdir()
+        (release / "app/main.py").write_text("bridge")
+        (release / "VERSION").write_text("0.10.0")
+        (root / "current").symlink_to(release)
+        (units / "brilliant-mqtt.service").write_text("/var/brilliant-mqtt/current/app/main.py")
+        (units / "brilliant-wifi-watchdog.service").write_text("legacy watchdog unit")
+    record = bundle_manifest.installed_identities(root, units, tmp_path / "env")["wifi_watchdog"]
+    assert record is not None and record["version"] == "unknown"

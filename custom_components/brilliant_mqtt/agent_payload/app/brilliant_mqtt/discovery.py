@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 
-from brilliant_mqtt.mapping import EntityDescriptor
+from brilliant_mqtt.mapping import EntityDescriptor, _discovery_object_id
 
 # MQTT templates run on message receipt. expire_after also bounds silence;
 # the fixed UTC deadline makes retained replay self-checking after a crash.
@@ -100,16 +100,18 @@ def config_payload(e: EntityDescriptor, sw_version: str | None = None) -> str:
         # "mesh" is a RESERVED panel slug: the whole-home BLE mesh pseudo-panel.
         # Its namespace is publisher-agnostic — any panel may hold leadership
         # and publish it — so the HA device must not carry any panel's name.
-        device_name = "Brilliant BLE Mesh"
+        device_name = e.device_name or e.name
+        device_identifier = _discovery_object_id("mesh", e.peripheral_id)
         model = "BLE Mesh"
     else:
         # Display name only — identifiers/topics/unique_id keep the raw slug.
         panel_display = e.panel.replace("_", " ").replace("-", " ").title()
         device_name = f"Brilliant {panel_display}"
+        device_identifier = f"brilliant_panel_{e.panel}"
         model = "Control"
 
     device: dict[str, object] = {
-        "identifiers": [f"brilliant_panel_{e.panel}"],
+        "identifiers": [device_identifier],
         "manufacturer": "Brilliant",
         "model": model,
         "name": device_name,

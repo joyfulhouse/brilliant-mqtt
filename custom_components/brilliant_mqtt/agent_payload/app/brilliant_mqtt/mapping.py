@@ -646,6 +646,7 @@ class EntityDescriptor:
     min_value: float | None = None
     max_value: float | None = None
     step: float | None = None
+    device_name: str | None = None
 
 
 # HA rejects a discovery topic whose object_id node has characters outside
@@ -688,6 +689,7 @@ def _aux_descriptors(device: BrilliantDevice, panel: str) -> list[EntityDescript
                 name=f"{prefix}{spec.name}",
                 panel=panel,
                 peripheral_id=device.peripheral_id,
+                device_name=device.name,
                 device_class=spec.device_class,
                 unit=spec.unit,
                 value_key=spec.key,
@@ -724,6 +726,7 @@ def entities_for(device: BrilliantDevice, panel: str) -> list[EntityDescriptor]:
                 name=device.name,
                 panel=panel,
                 peripheral_id=device.peripheral_id,
+                device_name=device.name,
                 supports_brightness=device.is_dimmable,
             ),
             *_aux_descriptors(device, panel),
@@ -737,6 +740,7 @@ def entities_for(device: BrilliantDevice, panel: str) -> list[EntityDescriptor]:
                 name=device.name,
                 panel=panel,
                 peripheral_id=device.peripheral_id,
+                device_name=device.name,
             ),
             *_aux_descriptors(device, panel),
         ]
@@ -749,6 +753,7 @@ def entities_for(device: BrilliantDevice, panel: str) -> list[EntityDescriptor]:
                 name="Motion",
                 panel=panel,
                 peripheral_id=device.peripheral_id,
+                device_name=device.name,
                 device_class="motion",
                 value_key="motion",
             )
@@ -761,6 +766,7 @@ def entities_for(device: BrilliantDevice, panel: str) -> list[EntityDescriptor]:
                     name="Illuminance",
                     panel=panel,
                     peripheral_id=device.peripheral_id,
+                    device_name=device.name,
                     device_class="illuminance",
                     unit="lx",
                     value_key="lux",

@@ -624,13 +624,13 @@ def _mesh_light_descriptor() -> EntityDescriptor:
 def test_mesh_device_block_name_and_model() -> None:
     """The mesh namespace is publisher-agnostic: no panel's name on its device."""
     data = json.loads(config_payload(_mesh_light_descriptor()))
-    assert data["device"]["name"] == "Brilliant BLE Mesh"
+    assert data["device"]["name"] == "Office Desk Lights"
     assert data["device"]["model"] == "BLE Mesh"
 
 
 def test_mesh_device_block_identifiers_and_manufacturer_keep_pattern() -> None:
     data = json.loads(config_payload(_mesh_light_descriptor()))
-    assert data["device"]["identifiers"] == ["brilliant_panel_mesh"]
+    assert data["device"]["identifiers"] == [f"brilliant_mesh_{MESH_PID}"]
     assert data["device"]["manufacturer"] == "Brilliant"
 
 

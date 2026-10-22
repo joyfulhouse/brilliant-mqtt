@@ -130,6 +130,10 @@ _RETAINED_LEDGER_PROBLEM = (
     "check /var/brilliant-mqtt/state/owned-topics.json and panel storage"
 )
 _SAFE_PANEL_OP_DETAILS = {
+    "snapshot_probe_failed": (
+        "snapshot_probe_failed: wait for restarting panel services to settle, "
+        "check connectivity, and retry"
+    ),
     "mqtt_ca_promotion_failed": "mqtt_ca_promotion_failed",
     "mqtt_ca_verification_failed": "mqtt_ca_verification_failed",
     "mqtt_tls_downgrade_refused": "mqtt_tls_downgrade_refused",
@@ -163,6 +167,10 @@ for _canary_code in (
     "health_failed",
 ):
     _SAFE_PANEL_OP_DETAILS[_canary_code] = f"{_canary_code}: see docs/canary-rollback.md"
+_SAFE_PANEL_OP_DETAILS["baseline_retained_finalize_first"] = (
+    "baseline_retained_finalize_first: after canary sign-off, explicitly finalize the retained "
+    "baseline by transaction name before updating; see docs/canary-rollback.md"
+)
 
 
 class _HostKeyChanged(Exception):

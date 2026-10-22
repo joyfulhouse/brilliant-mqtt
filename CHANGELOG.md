@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Watchdog reboot guards reject unsafe state files and preserve their rolling
+  reboot limits across clock corrections. Wi-Fi storage refusals log once per
+  outage while continuing to retry the storage operation.
+- Scene events and results wait for their own state to persist before MQTT
+  delivery. Retained-ledger loading has a deadline, and orphan cleanup preserves
+  temporary files belonging to other ledgers.
+- Panel credential repair accepts a changed address and password together while
+  preserving the stored SSH identity. Updates explain when an earlier rollback
+  baseline needs explicit finalization, and snapshot probe failures include
+  safe retry guidance.
+- Onboarding can explicitly finalize a verified restored baseline that has no
+  Home Assistant owner, using fresh credentials and the retained SSH identity.
+  Interrupted cleanup requires fresh authorization on retry and never persists
+  the submitted password in retained rollback metadata.
+- Onboarding bounds operation-lock and recovery waits. Payload uploads perform
+  local filesystem work outside Home Assistant's event loop and settle an
+  in-flight read before cancellation closes the remote stream.
+- Legacy watchdogs without a VERSION file can inherit a verified same-panel
+  pre-0.11.0 bridge version. Admission audit records distinguish admission from
+  verified deployment; stopped legacy recovery covers both watchdog units.
+
+- MQTT connection failures use capped exponential retry delays. Repeated bus
+  starts fenced by unresolved cleanup eventually exit for a systemd restart;
+  `BUS_FENCED_START_LIMIT` configures the threshold (default three).
+- Both watchdogs record a persistent UTC shutdown marker on SIGTERM.
+- Ignored transition fields no longer prevent safe partial command merging, and
+  discarded folded commands produce a warning without exposing payloads.
+
+### Changed
+
+- BLE mesh peripherals appear as separate Home Assistant devices, with their
+  primary and auxiliary entities grouped together. Entity unique IDs and MQTT
+  topics remain stable across this change and mesh leader changes.
+
 ## [0.11.2] - 2026-10-01
 
 The on-panel agent and Home Assistant integration both move to 0.11.2. The

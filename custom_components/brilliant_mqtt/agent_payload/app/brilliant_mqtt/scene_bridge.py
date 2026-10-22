@@ -192,6 +192,10 @@ class SceneBridge:
         self._stopping = False
         self._epoch = 0
         self._operation_generation = 0
+        # A successful older snapshot must not authorize a newer outbox record.
+        # Loaded records start at zero because their contents are already durable.
+        self._event_versions: dict[str, int] = {}
+        self._result_versions: dict[StateKey, int] = {}
         self._state_version = 0
         self._persisted_version = 0
         self._abandoned_cleanup_tasks: set[asyncio.Task[None]] = set()
@@ -417,6 +421,8 @@ class SceneBridge:
         self._mode_watermarks = dict(state.mode_watermarks)
         self._events = dict(state.events)
         self._results = OrderedDict(state.results)
+        self._event_versions = dict.fromkeys(self._events, 0)
+        self._result_versions = dict.fromkeys(self._results, 0)
         self._pending_records = dict(state.pending)
         self._prune_delivered_results()
         if not self._has_global_capacity():
@@ -424,6 +430,8 @@ class SceneBridge:
 
     def _capture_state(self) -> tuple[int, SceneState]:
         self._state_version += 1
+        self._event_versions = {key: self._event_versions[key] for key in self._events}
+        self._result_versions = {key: self._result_versions[key] for key in self._results}
         state = SceneState(
             watermarks=tuple(sorted(self._watermarks.items())),
             mode_watermarks=tuple(sorted(self._mode_watermarks.items())),
@@ -447,13 +455,14 @@ class SceneBridge:
         except Exception:
             logger.exception("scene bridge state persistence failed")
             async with self._lock:
-                self._state_trusted = False
-                self._state_reason = "state_untrusted"
+                if epoch == self._epoch and not self._stopping:
+                    self._state_trusted = False
+                    self._state_reason = "state_untrusted"
             return False
         async with self._lock:
-            self._persisted_version = max(self._persisted_version, version)
             if epoch != self._epoch or self._stopping:
                 return False
+            self._persisted_version = max(self._persisted_version, version)
             self._state_trusted = True
             self._seed_captured = False
             if self._state_reason == "state_untrusted":
@@ -804,6 +813,7 @@ class SceneBridge:
             return False
         self._watermarks[key] = Watermark(execution.executed_at_ms, execution.payload_sha256)
         if publish_event:
+            self._event_versions[event_key] = self._state_version + 1
             self._events[event_key] = _StoredEvent(
                 scene_event_topic(self._panel), event_payload, False, self._clock_ms()
             )
@@ -874,6 +884,7 @@ class SceneBridge:
             return False
         self._mode_watermarks[self._panel] = current
         if publish_event:
+            self._event_versions[event_key] = self._state_version + 1
             self._events[event_key] = _StoredEvent(
                 mode_event_topic(self._panel), event_payload, False, self._clock_ms()
             )
@@ -943,6 +954,7 @@ class SceneBridge:
                 if cached is not None:
                     if not known or cached.fingerprint != fingerprint:
                         return False
+                    self._result_versions[cache_key] = self._state_version + 1
                     self._results[cache_key] = replace(
                         cached,
                         event_key=None if cached.delivered else cached.event_key,
@@ -1206,6 +1218,7 @@ class SceneBridge:
             body["error"] = error
         payload = encode_json(body)
         topic = scene_result_topic(command_id) if kind == "scene" else mode_result_topic(command_id)
+        self._result_versions[cache_key] = self._state_version + 1
         self._results[cache_key] = _StoredResult(
             kind=normalized_kind,
             command_id=command_id,
@@ -1347,10 +1360,10 @@ class SceneBridge:
     ) -> tuple[str, str | StateKey, str, str] | None:
         events = sorted(self._events.items(), key=lambda item: item[1].created_at_ms)
         for key, event in events:
-            if not event.delivered:
+            if not event.delivered and self._event_versions[key] <= self._persisted_version:
                 return ("event", key, event.topic, event.payload)
         for result_key, result in self._results.items():
-            if result.delivered:
+            if result.delivered or self._result_versions[result_key] > self._persisted_version:
                 continue
             if result.event_key is not None:
                 dependency_event = self._events.get(result.event_key)
