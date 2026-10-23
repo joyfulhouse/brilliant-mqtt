@@ -7,8 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.3] - 2026-10-23
+
+The on-panel agent and Home Assistant integration both move to 0.11.3. The
+bundled bridge and watchdog payload carries release ordinal 5; the separately
+versioned voice payload remains at 0.1.1. Qualify this release on a canary panel
+before updating the remaining panels.
+
 ### Fixed
 
+- The bus watchdog remembers an independently observed live writer releasing its
+  phase-marker lease, so stale failed-attempt evidence stays revoked after that
+  writer exits. Failed continuing bus-attempt writes retain their lease. This
+  reduces the read-only-filesystem residual in #143; entirely unsampled recovery
+  and watchdog-restart ambiguity still require a separate delivery contract.
 - Watchdog reboot guards reject unsafe state files and preserve their rolling
   reboot limits across clock corrections. Wi-Fi storage refusals log once per
   outage while continuing to retry the storage operation.
@@ -1107,7 +1119,8 @@ panel redeploy is needed.
 - JoyfulHouse OSS docs standard: LICENSE (MIT), INSTALL.md, CHANGELOG.md,
   FUNDING.yml, CODEOWNERS, and the canonical `docs/` set.
 
-[Unreleased]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.11.2...HEAD
+[Unreleased]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.11.3...HEAD
+[0.11.3]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.11.2...v0.11.3
 [0.11.2]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.11.1...v0.11.2
 [0.11.1]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.10.0...v0.11.0

@@ -47,7 +47,7 @@ rollback failure in #214 remains open as described below.
 | --- | --- |
 | #113 | A poison-frame quarantine changes QoS-1 replay, durability, and capacity policy. Define an explicit retained/quarantine contract before changing delivery; current payloads have no demonstrated permanent broker rejection. |
 | #142 | Conservative same-value mode confirmation is an accepted limitation pending request-relative evidence. Do not infer execution from a stale mirror. |
-| #143 | The read-only-filesystem reboot residual needs independently observable lease revocation. A failed marker write alone cannot prove it. |
+| #143 | The [sampled lease-revocation follow-up](issue-143-lease-revocation.md) fences independently observed releases for the same writer generation. Unsampled death and watchdog restart remain ambiguous; marker write failure alone still cannot prove revocation. |
 | #153 | The event-reflection proposal is delivered, but upstream implementation and qualification remain. The issue expressly requires more than a documentation merge. |
 | #155 | i350/aarch64 support needs native-library/runtime diagnostics and pilot qualification. Removing the architecture gate alone does not prove compatibility. |
 | #164 | Release readiness requires designated-panel deployment, rollback, resource, and soak evidence, beyond synthetic code tests. |
