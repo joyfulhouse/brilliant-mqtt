@@ -325,7 +325,14 @@ async def test_create_is_durable_before_it_returns(
     store.allow_save.set()
     assert await create_task == _record()
     assert store.events == [("save", "staged")]
-    assert await journal.async_diagnostics() == {"count": 1, "phase": "staged"}
+    assert await journal.async_diagnostics() == {
+        "count": 1,
+        "phase": "staged",
+        "name": str(_TRANSACTION_ID),
+        "panel": "office",
+        "operation": "install",
+        "last_error": None,
+    }
 
 
 async def test_restart_round_trip_preserves_recovery_data_but_redacts_surfaces(
@@ -372,8 +379,22 @@ async def test_restart_round_trip_preserves_recovery_data_but_redacts_surfaces(
 
     assert loaded == original
     assert loaded is not original
-    assert await restarted.async_diagnostics() == {"count": 1, "phase": "staged"}
-    assert set((await restarted.async_diagnostics()).keys()) == {"count", "phase"}
+    assert await restarted.async_diagnostics() == {
+        "count": 1,
+        "phase": "staged",
+        "name": str(_TRANSACTION_ID),
+        "panel": "office",
+        "operation": "install",
+        "last_error": None,
+    }
+    assert set((await restarted.async_diagnostics()).keys()) == {
+        "count",
+        "phase",
+        "name",
+        "panel",
+        "operation",
+        "last_error",
+    }
 
     redacted_surfaces = (
         repr(original),
@@ -1281,3 +1302,31 @@ def test_release_target_is_constrained_to_the_owned_exact_path_grammar(
         replace(_upgrade_snapshot(), active_release_target=target)
 
     assert raised.value.code == "invalid_provisioning_journal"
+
+
+async def test_active_diagnostics_identify_ownerless_transaction_and_safe_error(
+    hass: HomeAssistant, memory_store: _MemoryStore
+) -> None:
+    journal = _journal(hass, memory_store)
+    record = replace(_record(), last_error=StoredJournalError("recovery", "recovery_failed"))
+    await journal.async_create(record)
+    diagnostics = await journal.async_diagnostics()
+    assert diagnostics["name"] == str(record.transaction_id)
+    assert diagnostics["panel"] == record.panel_request.slug
+    assert diagnostics["operation"] == record.operation.value
+    assert diagnostics["last_error"] == {"stage": "recovery", "code": "recovery_failed"}
+    assert _ROOT_PASSWORD not in json.dumps(diagnostics)
+    assert "office.iot.example" not in json.dumps(diagnostics)
+
+
+async def test_diagnostics_do_not_publish_arbitrary_error_tokens(
+    hass: HomeAssistant, memory_store: _MemoryStore
+) -> None:
+    journal = _journal(hass, memory_store)
+    await journal.async_create(
+        replace(_record(), last_error=StoredJournalError("secret_stage", "secret_code"))
+    )
+    assert (await journal.async_diagnostics())["last_error"] == {
+        "stage": "unknown",
+        "code": "unknown",
+    }

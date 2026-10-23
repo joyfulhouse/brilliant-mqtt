@@ -1806,3 +1806,56 @@ def test_ownerless_marker_parser_refuses_invalid_authority(bad: str) -> None:
         inner["operation"] = "update"
     with pytest.raises(ProvisioningJournalError):
         RetainedRollback._from_storage(raw)
+
+
+async def test_ownerless_pending_connection_failure_diagnostics_preserve_armed_baseline(
+    hass: HomeAssistant, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from custom_components.brilliant_mqtt.panel_provisioner import (
+        TransactionLookup,
+        TransactionLookupState,
+    )
+
+    shell = RehearsalShell(tmp_path)
+    code = shell.install()
+    snapshot = await panel_ops.capture_baseline(shell, await panel_ops.snapshot_panel(shell))
+    record = replace(
+        _record(),
+        panel_request=replace(_record().panel_request, selected_components=("bridge",)),
+        prior_snapshot=stored_snapshot_from_panel(snapshot),
+    )
+    journal = ProvisioningJournal(hass)
+    await journal.async_create(record)
+    for phase in (
+        ProvisioningPhase.ACTIVATION_PENDING,
+        ProvisioningPhase.ACTIVATED,
+        ProvisioningPhase.VERIFYING,
+        ProvisioningPhase.PENDING_CONFIG_COMMIT,
+    ):
+        record = await journal.async_transition(record.transaction_id, phase)
+    shell._pinned = record.panel_request.public_key
+    harness = _Harness()
+    harness.lookup = TransactionLookup(TransactionLookupState.FLOW_ABORTED_OR_ABSENT)
+    provisioner = harness.provisioner()
+    provisioner._journal = journal
+    provisioner._operations = panel_ops
+    provisioner._shell_factory = lambda _host, _password, _key: shell
+    monkeypatch.setattr(shell, "connect", AsyncMock(side_effect=OSError("SECRET connection data")))
+    with pytest.raises(PanelProvisioningError, match="recovery_failed"):
+        await provisioner.async_recover()
+    restarted = ProvisioningJournal(hass)
+    remaining = await restarted.async_load()
+    assert remaining is not None
+    assert remaining.phase is ProvisioningPhase.PENDING_CONFIG_COMMIT
+    retained = await restarted.async_retained(record.transaction_id)
+    assert retained is not None and retained.state == "armed"
+    assert not retained.ownerless_finalization_allowed
+    from custom_components.brilliant_mqtt.diagnostics import _async_provisioning_diagnostics
+
+    diagnostics = await _async_provisioning_diagnostics(hass)
+    assert diagnostics["name"] == str(record.transaction_id)
+    assert diagnostics["panel"] == record.panel_request.slug
+    assert diagnostics["operation"] == record.operation.value
+    assert diagnostics["last_error"] is None
+    assert "SECRET" not in json.dumps(diagnostics)
+    assert (code / "vendor/original.py").read_text() == "original = True\n"

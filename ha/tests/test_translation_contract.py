@@ -7,8 +7,9 @@ from pathlib import Path
 from typing import Any, cast
 
 from custom_components.brilliant_mqtt import errors as operation_errors
-from custom_components.brilliant_mqtt import panel_inspection, panel_provisioner, shell
+from custom_components.brilliant_mqtt import panel_inspection, shell
 from custom_components.brilliant_mqtt.flow.schemas import BROKER_MENU_OPTIONS
+from custom_components.brilliant_mqtt.provisioning_journal import PROVISIONING_ERROR_CODES
 
 _REPOSITORY_ROOT = Path(__file__).parents[2]
 _STRINGS_PATH = _REPOSITORY_ROOT / "custom_components/brilliant_mqtt/strings.json"
@@ -36,7 +37,7 @@ def test_panel_subentry_translates_every_reachable_onboarding_error() -> None:
     required = (
         shell._IDENTITY_ERROR_CODES
         | panel_inspection._ERROR_CODES
-        | panel_provisioner._ERROR_CODES
+        | PROVISIONING_ERROR_CODES
         | operation_errors._ERROR_METADATA.keys()
     )
     missing = required - errors.keys()

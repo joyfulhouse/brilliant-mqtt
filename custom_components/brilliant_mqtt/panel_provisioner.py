@@ -63,6 +63,7 @@ from .panel_ops import (
     StagedRelease as StagedRelease,
 )
 from .provisioning_journal import (
+    PROVISIONING_ERROR_CODES,
     ProvisioningOperation,
     ProvisioningPhase,
     ProvisioningRecord,
@@ -89,43 +90,6 @@ _CORE_COMPONENTS = (
 )
 _PANEL_SLUG = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _VERSION = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._+-]{0,127}$")
-_ERROR_CODES = frozenset(
-    {
-        "duplicate_panel",
-        "activation_failed",
-        "cleanup_failed",
-        "commit_failed",
-        "health_failed",
-        "health_subscribe_failed",
-        "identity_failed",
-        "panel_identity_mismatch",
-        "ownerless_recovery_unavailable",
-        "ownerless_finalize_reauthentication_required",
-        "inspection_failed",
-        "invalid_panel_install_request",
-        "invalid_provisioning_dependency",
-        "journal_failed",
-        "panel_authentication_failed",
-        "preflight_failed",
-        "progress_failed",
-        "recovery_failed",
-        "release_prepare_failed",
-        "release_identity_blocked",
-        "release_unchanged",
-        "release_selection_conflict",
-        "rollback_failed",
-        "rollback_health_failed",
-        "rollback_deadline_exceeded",
-        "baseline_incomplete",
-        "baseline_retained_finalize_first",
-        "rollback_credentials_unavailable",
-        "snapshot_failed",
-        "snapshot_probe_failed",
-        "stage_failed",
-        "transaction_in_progress",
-        "unsupported_panel_toolchain",
-    }
-)
 _MAX_JSON_DEPTH = 64
 _MAX_JSON_NODES = 4096
 _PROGRESS_TIMEOUT_SECONDS = 5.0
@@ -229,7 +193,7 @@ class PanelProvisioningError(RuntimeError):
             isinstance(capability, str) and capability in PANEL_TOOLCHAIN_CAPABILITIES
         )
         if (
-            code not in _ERROR_CODES
+            code not in PROVISIONING_ERROR_CODES
             or (
                 detail is not None
                 and (
