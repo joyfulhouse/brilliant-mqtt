@@ -16,6 +16,11 @@ before updating the remaining panels.
 
 ### Fixed
 
+- The bus watchdog remembers an independently observed live writer releasing its
+  phase-marker lease, so stale failed-attempt evidence stays revoked after that
+  writer exits. Failed continuing bus-attempt writes retain their lease. This
+  reduces the read-only-filesystem residual in #143; entirely unsampled recovery
+  and watchdog-restart ambiguity still require a separate delivery contract.
 - Watchdog reboot guards reject unsafe state files and preserve their rolling
   reboot limits across clock corrections. Wi-Fi storage refusals log once per
   outage while continuing to retry the storage operation.
