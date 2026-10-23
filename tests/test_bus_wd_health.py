@@ -12,6 +12,7 @@ import pytest
 
 import brilliant_bus_watchdog.health as health_mod
 from brilliant_bus_watchdog.health import bus_failure_age, heartbeat_age
+from brilliant_bus_watchdog.phase_record import PhaseRecord
 from brilliant_bus_watchdog.run import _service_active, should_reboot
 from brilliant_mqtt import heartbeat
 from brilliant_mqtt.heartbeat import DEAD_WRITER_RETENTION_S, write_phase
@@ -513,3 +514,242 @@ def test_bus_failure_age_fails_closed_on_invalid_utf8(tmp_path: Path) -> None:
     phase.write_bytes(b"\xff\xfe bus")  # not decodable as UTF-8
 
     assert bus_failure_age(str(phase), now=100.0) is None
+
+
+def test_observed_live_release_remains_revoked_after_death(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    phase = tmp_path / "bus-phase"
+    write_phase(str(phase), "bus", monotonic_clock=lambda: 100.0)
+    observer = health_mod.BusFailureObserver()
+    assert bus_failure_age(str(phase), now=150.0, observer=observer) == 50.0
+    heartbeat._release_phase_lease(str(phase))
+    assert bus_failure_age(str(phase), now=200.0, observer=observer) is None
+    monkeypatch.setattr(health_mod, "process_generation", lambda pid: None)
+    monkeypatch.setattr(health_mod, "process_is_absent", lambda pid: True)
+    assert bus_failure_age(str(phase), now=250.0, observer=observer) is None
+
+
+def test_revoked_generation_requires_observed_fresh_lease_to_rearm(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    phase = tmp_path / "bus-phase"
+    observer = health_mod.BusFailureObserver()
+    write_phase(str(phase), "bus", monotonic_clock=lambda: 100.0)
+    assert bus_failure_age(str(phase), now=125.0, observer=observer) == 25.0
+    heartbeat._release_phase_lease(str(phase))
+    assert bus_failure_age(str(phase), now=150.0, observer=observer) is None
+    write_phase(str(phase), "bus", monotonic_clock=lambda: 200.0)
+    assert bus_failure_age(str(phase), now=210.0, observer=observer) == 110.0
+    heartbeat._release_phase_lease(str(phase))
+    monkeypatch.setattr(health_mod, "process_generation", lambda pid: None)
+    monkeypatch.setattr(health_mod, "process_is_absent", lambda pid: True)
+    assert bus_failure_age(str(phase), now=250.0, observer=observer) == 150.0
+
+
+def test_unobserved_release_is_indistinguishable_from_native_crash(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    phase = tmp_path / "bus-phase"
+    observer = health_mod.BusFailureObserver()
+    write_phase(str(phase), "bus", monotonic_clock=lambda: 100.0)
+    assert bus_failure_age(str(phase), now=150.0, observer=observer) == 50.0
+    heartbeat._release_phase_lease(str(phase))
+    monkeypatch.setattr(health_mod, "process_generation", lambda pid: None)
+    monkeypatch.setattr(health_mod, "process_is_absent", lambda pid: True)
+    assert bus_failure_age(str(phase), now=250.0, observer=observer) == 150.0
+
+
+def test_replacement_inode_does_not_prove_original_lease_release(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    phase = tmp_path / "bus-phase"
+    observer = health_mod.BusFailureObserver()
+    write_phase(str(phase), "bus", monotonic_clock=lambda: 100.0)
+    assert bus_failure_age(str(phase), now=150.0, observer=observer) == 50.0
+    replacement = tmp_path / "replacement"
+    replacement.write_text(phase.read_text())
+    replacement.replace(phase)
+    assert bus_failure_age(str(phase), now=200.0, observer=observer) is None
+    heartbeat._release_phase_lease(str(phase))
+    monkeypatch.setattr(health_mod, "process_generation", lambda pid: None)
+    monkeypatch.setattr(health_mod, "process_is_absent", lambda pid: True)
+    assert bus_failure_age(str(phase), now=250.0, observer=observer) == 150.0
+
+
+def test_first_unleased_observation_does_not_prove_a_lease_release(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    phase = tmp_path / "bus-phase"
+    observer = health_mod.BusFailureObserver()
+    write_phase(str(phase), "bus", monotonic_clock=lambda: 100.0)
+    heartbeat._release_phase_lease(str(phase))
+    assert bus_failure_age(str(phase), now=200.0, observer=observer) is None
+    monkeypatch.setattr(health_mod, "process_generation", lambda pid: None)
+    monkeypatch.setattr(health_mod, "process_is_absent", lambda pid: True)
+    assert bus_failure_age(str(phase), now=250.0, observer=observer) == 150.0
+
+
+@_requires_linux_proc
+@pytest.mark.parametrize("recovered", [False, True])
+def test_readonly_writer_release_sample_distinguishes_recovery_from_crashloop(
+    tmp_path: Path, recovered: bool
+) -> None:
+    phase = tmp_path / "bus-phase"
+    observer = health_mod.BusFailureObserver()
+    writer = """
+import sys
+from brilliant_mqtt import heartbeat
+path = sys.argv[1]
+recovered = sys.argv[2] == "True"
+for now in range(100, 1901, 300):
+    assert heartbeat.write_phase(path, "bus", monotonic_clock=lambda: float(now))
+print("leased", flush=True)
+input()
+def readonly(*args, **kwargs):
+    raise OSError("read-only filesystem")
+heartbeat._atomic_write = readonly
+heartbeat._rewrite_phase_lease = lambda path, text: False
+heartbeat.os.unlink = readonly
+assert not heartbeat.write_phase(
+    path, "bus", bus_read_succeeded=recovered, monotonic_clock=lambda: 1901.0
+)
+print("failed-write", flush=True)
+input()
+"""
+    with subprocess.Popen(
+        [sys.executable, "-c", writer, str(phase), str(recovered)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    ) as process:
+        assert process.stdin is not None
+        assert process.stdout is not None
+        try:
+            assert process.stdout.readline().strip() == "leased"
+            assert bus_failure_age(str(phase), now=1900.0, observer=observer) == 1800.0
+            original = phase.read_bytes()
+            process.stdin.write("recover\n")
+            process.stdin.flush()
+            assert process.stdout.readline().strip() == "failed-write"
+            assert phase.read_bytes() == original
+            age = bus_failure_age(str(phase), now=1901.0, observer=observer)
+            assert age == (None if recovered else 1801.0)
+            process.stdin.write("exit\n")
+            process.stdin.flush()
+            assert process.wait(timeout=10) == 0
+            age = bus_failure_age(str(phase), now=1902.0, observer=observer)
+            assert age == (None if recovered else 1802.0)
+            assert (
+                should_reboot(
+                    age=1802.0,
+                    stale_after=1800.0,
+                    bridge_active=True,
+                    gateway_up=True,
+                    bus_failure_age=age,
+                )
+                is not recovered
+            )
+            # A restarted observer has lost independent revocation evidence.
+            assert (
+                bus_failure_age(str(phase), now=1902.0, observer=health_mod.BusFailureObserver())
+                == 1802.0
+            )
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=10)
+
+
+@pytest.mark.parametrize("intermediate", ["missing", "malformed", "changed-dead-record"])
+def test_revocation_survives_gaps_and_unobserved_record_changes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, intermediate: str
+) -> None:
+    phase = tmp_path / "bus-phase"
+    observer = health_mod.BusFailureObserver()
+    write_phase(str(phase), "bus", monotonic_clock=lambda: 100.0)
+    assert bus_failure_age(str(phase), now=150.0, observer=observer) == 50.0
+    heartbeat._release_phase_lease(str(phase))
+    assert bus_failure_age(str(phase), now=200.0, observer=observer) is None
+    original = phase.read_text()
+    if intermediate == "missing":
+        phase.unlink()
+    elif intermediate == "malformed":
+        phase.write_text("broken")
+    else:
+        parts = original.split()
+        parts[6] = "210.0"
+        original = " ".join(parts)
+    if intermediate != "changed-dead-record":
+        assert bus_failure_age(str(phase), now=210.0, observer=observer) is None
+    phase.write_text(original)
+    monkeypatch.setattr(health_mod, "process_generation", lambda pid: None)
+    monkeypatch.setattr(health_mod, "process_is_absent", lambda pid: True)
+    assert bus_failure_age(str(phase), now=250.0, observer=observer) is None
+
+
+def test_writer_dying_after_unleased_read_cannot_prove_live_release(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    phase = tmp_path / "bus-phase"
+    observer = health_mod.BusFailureObserver()
+    write_phase(str(phase), "bus", monotonic_clock=lambda: 100.0)
+    assert bus_failure_age(str(phase), now=150.0, observer=observer) == 50.0
+    heartbeat._release_phase_lease(str(phase))
+    real_read = health_mod._read_phase_record_and_lease
+
+    def read_then_die(
+        path: str,
+    ) -> tuple[PhaseRecord | None, bool, tuple[int, int] | None]:
+        sample = real_read(path)
+        monkeypatch.setattr(health_mod, "process_generation", lambda pid: None)
+        monkeypatch.setattr(health_mod, "process_is_absent", lambda pid: True)
+        return sample
+
+    monkeypatch.setattr(health_mod, "_read_phase_record_and_lease", read_then_die)
+    assert bus_failure_age(str(phase), now=200.0, observer=observer) == 100.0
+
+
+@_requires_linux_proc
+def test_zombie_writer_cannot_be_mistaken_for_live_lease_revocation(tmp_path: Path) -> None:
+    phase = tmp_path / "bus-phase"
+    observer = health_mod.BusFailureObserver()
+    process = _start_phase_writer(phase, 100.0)
+    try:
+        assert bus_failure_age(str(phase), now=150.0, observer=observer) == 50.0
+        process.kill()
+        # Wait for death without reaping: /proc still exposes the old generation
+        # while the kernel has already released its flock.
+        os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOWAIT)
+        assert bus_failure_age(str(phase), now=200.0, observer=observer) is None
+        process.wait(timeout=10)
+        assert bus_failure_age(str(phase), now=250.0, observer=observer) == 150.0
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=10)
+        assert process.stdout is not None
+        process.stdout.close()
+
+
+@_requires_linux_proc
+def test_exiting_writer_generation_is_not_live_release_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from io import StringIO
+
+    from brilliant_bus_watchdog.phase_record import process_generation
+
+    stat = Path(f"/proc/{os.getpid()}/stat").read_text()
+    command_end = stat.rfind(")")
+    fields = stat[command_end + 1 :].split()
+    fields[0] = "R"
+    # Linux sets PF_EXITING before exit_files releases flock, before state Z.
+    fields[6] = str(int(fields[6]) | 0x00000004)
+    exiting_stat = stat[: command_end + 1] + " " + " ".join(fields)
+    monkeypatch.setattr(
+        "brilliant_bus_watchdog.phase_record.open",
+        lambda *args, **kwargs: StringIO(exiting_stat),
+        raising=False,
+    )
+    assert process_generation(os.getpid()) is None
