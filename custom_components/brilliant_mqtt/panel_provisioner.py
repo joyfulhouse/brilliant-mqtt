@@ -75,8 +75,9 @@ from .provisioning_journal import (
     StoredPanelRequest,
     StoredPanelSnapshot,
     StoredServiceSnapshot,
+    ownerless_journal_recovery_allowed,
 )
-from .shell import HostIdentity, PanelProcess, PanelShell
+from .shell import HostIdentity, PanelProcess, PanelShell, recovery_connect_failure_code
 
 type JsonScalar = None | bool | int | float | str
 type JsonValue = JsonScalar | list["JsonValue"] | Mapping[str, "JsonValue"]
@@ -996,8 +997,12 @@ class PanelProvisioner:
         subentry_id: str,
     ) -> AsyncIterator[UUID]:
         """Journal the existing manager's admitted update without reacquiring its lock."""
-        if not self._lock.locked() or await self._journal.async_load() is not None:
+        if not self._lock.locked():
             raise PanelProvisioningError("transaction_in_progress")
+        if await self._journal.async_load() is not None:
+            # The shared lock is held, so this journal is not in flight: it awaits
+            # recovery, which the operator can see and settle (docs/canary-rollback.md).
+            raise PanelProvisioningError("provisioning_recovery_required")
         if any(
             item.record.panel_request.fingerprint == request.fingerprint
             for item in await self._journal.async_retained_records()
@@ -1608,6 +1613,9 @@ class PanelProvisioner:
         self,
         record: ProvisioningRecord,
         progress: ProgressReporter,
+        *,
+        host: str | None = None,
+        password: str | None = None,
     ) -> None:
         if not isinstance(record, ProvisioningRecord):
             raise PanelProvisioningError("recovery_failed")
@@ -1640,31 +1648,61 @@ class PanelProvisioner:
                 await self._repair_reporter.async_clear_rollback_failure(record.transaction_id)
                 return
 
-        staged = self._staged_release_factory(
-            record.staged_version,
-            record.transaction_id,
-            record.panel_request.selected_components,
-        )
-        if not _matching_staged(
-            staged,
-            record.staged_version,
-            record.transaction_id,
-            record.panel_request.selected_components,
-        ):
-            raise PanelProvisioningError("recovery_failed")
-        snapshot = self._snapshot_from_stored(record.prior_snapshot)
-        shell = self._shell_factory(
-            record.panel_request.host,
-            record.panel_request.root_password,
-            record.panel_request.public_key,
-        )
+        request = record.panel_request
+        # The candidate identity comes only from what the journal durably recorded,
+        # never from the currently bundled payload (which may be a newer release).
+        try:
+            staged = self._staged_release_factory(
+                record.staged_version,
+                record.transaction_id,
+                request.selected_components,
+            )
+            if not _matching_staged(
+                staged,
+                record.staged_version,
+                record.transaction_id,
+                _canonical_components(request.selected_components),
+            ):
+                raise PanelProvisioningError("recovery_artifact_invalid")
+            snapshot = self._snapshot_from_stored(record.prior_snapshot)
+        except (PanelProvisioningError, PanelOpError, ValueError, TypeError):
+            await self._async_record_recovery_failure(record, "recovery_artifact_invalid")
+            raise PanelProvisioningError("recovery_artifact_invalid") from None
+        try:
+            shell = self._shell_factory(
+                host if host is not None else request.host,
+                password if password is not None else request.root_password,
+                request.public_key,
+            )
+        except Exception:
+            await self._async_record_recovery_failure(record, "panel_identity_mismatch")
+            raise PanelProvisioningError("panel_identity_mismatch") from None
         observer: _HealthObserver | None = None
         primary: PanelProvisioningError | None = None
         cancellation: asyncio.CancelledError | None = None
+        restore_started = False
+
+        async def rollback(original_code: str) -> None:
+            nonlocal restore_started
+            restore_started = True
+            await self._async_recovery_rollback(
+                record,
+                shell,
+                snapshot,
+                staged,
+                original_code=original_code,
+                password=password,
+            )
+
         try:
-            if shell.pinned_host_key() != record.panel_request.public_key:
-                raise PanelProvisioningError("recovery_failed")
-            await shell.connect()
+            if shell.pinned_host_key() != request.public_key:
+                raise PanelProvisioningError("panel_identity_mismatch")
+            try:
+                await shell.connect()
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                raise PanelProvisioningError(recovery_connect_failure_code(error)) from None
             if record.phase is ProvisioningPhase.STAGED:
                 await self._operations.cleanup_staged(shell, staged)
                 await self._journal.async_complete_cleanup(record.transaction_id)
@@ -1678,26 +1716,14 @@ class PanelProvisioner:
                 }
                 or record.operation is ProvisioningOperation.UPDATE
             ):
-                await self._async_recovery_rollback(
-                    record,
-                    shell,
-                    snapshot,
-                    staged,
-                    original_code="recovery_interrupted",
-                )
+                await rollback("recovery_interrupted")
             elif record.phase in {
                 ProvisioningPhase.ACTIVATED,
                 ProvisioningPhase.VERIFYING,
             }:
                 lookup = await self._transaction_lookup(record.transaction_id)
                 if lookup.state is TransactionLookupState.FLOW_ABORTED_OR_ABSENT:
-                    await self._async_recovery_rollback(
-                        record,
-                        shell,
-                        snapshot,
-                        staged,
-                        original_code="flow_aborted",
-                    )
+                    await rollback("flow_aborted")
                 else:
                     observer = self._health_observer_factory(record.panel_request.slug)
                     health_failed = False
@@ -1724,13 +1750,7 @@ class PanelProvisioner:
                     except Exception:
                         health_failed = True
                     if health_failed:
-                        await self._async_recovery_rollback(
-                            record,
-                            shell,
-                            snapshot,
-                            staged,
-                            original_code="health_failed",
-                        )
+                        await rollback("health_failed")
                     else:
                         if record.phase is ProvisioningPhase.ACTIVATED:
                             record = await self._journal.async_transition(
@@ -1739,13 +1759,7 @@ class PanelProvisioner:
                             )
                         lookup = await self._transaction_lookup(record.transaction_id)
                         if lookup.state is TransactionLookupState.FLOW_ABORTED_OR_ABSENT:
-                            await self._async_recovery_rollback(
-                                record,
-                                shell,
-                                snapshot,
-                                staged,
-                                original_code="flow_aborted",
-                            )
+                            await rollback("flow_aborted")
                         else:
                             await self._journal.async_transition(
                                 record.transaction_id,
@@ -1776,6 +1790,10 @@ class PanelProvisioner:
         if cancellation is not None:
             raise cancellation from None
         if primary is not None:
+            if not restore_started:
+                # Restore intent never became durable: record why, typed, so the
+                # operator sees an actionable code instead of last_error: null.
+                await self._async_record_recovery_failure(record, primary.code)
             raise primary from None
         if observer_outcome.cancellation is not None:
             raise observer_outcome.cancellation from None
@@ -1783,6 +1801,82 @@ class PanelProvisioner:
             raise shell_outcome.cancellation from None
         if observer_outcome.error is not None or shell_outcome.error is not None:
             raise PanelProvisioningError("recovery_failed")
+
+    async def _async_record_recovery_failure(self, record: ProvisioningRecord, code: str) -> None:
+        """Best-effort durable typed error; never changes phase, baseline or journal."""
+        if code not in PROVISIONING_ERROR_CODES:
+            code = "recovery_failed"
+        await _settle(
+            self._journal.async_record_error(
+                record.transaction_id, StoredJournalError(stage="recovery", code=code)
+            )
+        )
+
+    async def _async_assert_ownerless_journal(
+        self, expected: ProvisioningRecord
+    ) -> RetainedRollback:
+        current = await self._journal.async_load()
+        retained = (
+            await self._journal.async_retained(expected.transaction_id)
+            if isinstance(expected, ProvisioningRecord)
+            else None
+        )
+        if (
+            current is None
+            or current != expected
+            or not ownerless_journal_recovery_allowed(current, retained)
+            or retained is None
+            or self._retained_owner_exists is None
+            or await self._retained_owner_exists(retained)
+            or (await self._transaction_lookup(current.transaction_id)).state
+            is not TransactionLookupState.FLOW_ABORTED_OR_ABSENT
+        ):
+            raise PanelProvisioningError("ownerless_recovery_unavailable")
+        return retained
+
+    async def async_recover_ownerless_journal(
+        self,
+        expected: ProvisioningRecord,
+        host: str,
+        password: str,
+        identity: HostIdentity,
+    ) -> None:
+        """Roll back one interrupted, ownerless onboarding journal with fresh authority.
+
+        The operator's freshly entered address and password are used only after the
+        panel proves the journal's pinned SSH identity. The outcome is the existing
+        compensating rollback: a verified restore (or verified prior absence) or a
+        durable typed failure. Nothing is finalized, skipped or erased here.
+        """
+        async with self._async_install_lock():
+            await self._async_assert_ownerless_journal(expected)
+            request = expected.panel_request
+            proven = await self._identity_fetcher(host)
+            if (
+                identity.public_key != request.public_key
+                or identity.fingerprint != request.fingerprint
+                or proven != identity
+            ):
+                raise PanelProvisioningError("panel_identity_mismatch")
+            await self._async_assert_ownerless_journal(expected)
+
+            async def recover() -> None:
+                async with asyncio.timeout(RECOVERY_TIMEOUT_SECONDS):
+                    await self._async_recover_record(
+                        expected, _noop_progress, host=host, password=password
+                    )
+
+            outcome = await _settle(recover())
+            if outcome.cancellation is not None:
+                raise outcome.cancellation from None
+            if isinstance(outcome.error, TimeoutError):
+                raise PanelProvisioningError("rollback_deadline_exceeded") from None
+            if isinstance(outcome.error, PanelProvisioningError):
+                raise PanelProvisioningError(outcome.error.code) from None
+            if outcome.error is not None:
+                raise PanelProvisioningError("recovery_failed") from None
+            if await self._journal.async_load() is not None:
+                raise PanelProvisioningError("recovery_failed")
 
     async def _async_recovery_rollback(
         self,
@@ -1792,12 +1886,14 @@ class PanelProvisioner:
         staged: StagedRelease,
         *,
         original_code: str,
+        password: str | None = None,
     ) -> None:
         current = record
         if current.prior_snapshot.baseline is not None:
             await self._journal.async_retained_state(current.transaction_id, "restore_requested")
             await self._journal.async_begin_restore(
-                current.transaction_id, current.panel_request.root_password
+                current.transaction_id,
+                password if password is not None else current.panel_request.root_password,
             )
             current = await self._journal.async_record_error(
                 current.transaction_id, StoredJournalError(stage="recovery", code=original_code)
@@ -1893,7 +1989,7 @@ class PanelProvisioner:
         async with self._lock:
             current = await self._journal.async_load()
             if current is not None and current.transaction_id != transaction_id:
-                raise PanelProvisioningError("transaction_in_progress")
+                raise PanelProvisioningError("provisioning_recovery_required")
             retained = await self._journal.async_retained(transaction_id)
             if retained is None:
                 raise PanelProvisioningError("baseline_incomplete")
@@ -1906,7 +2002,7 @@ class PanelProvisioner:
         """Explicit intentional loss of the rollback guarantee, with durable intent."""
         async with self._lock:
             if await self._journal.async_load() is not None:
-                raise PanelProvisioningError("transaction_in_progress")
+                raise PanelProvisioningError("provisioning_recovery_required")
             retained = await self._journal.async_retained(transaction_id)
             if retained is None:
                 return
@@ -2043,6 +2139,14 @@ def _required_primary_code(
 
 def _is_uuid4(value: object) -> bool:
     return isinstance(value, UUID) and value.version == 4 and value.variant == RFC_4122
+
+
+def _canonical_components(selected_components: tuple[str, ...]) -> tuple[str, ...]:
+    """Order journal-recorded components exactly as the staged DTO normalizes them."""
+    chosen = set(selected_components)
+    if len(chosen) != len(selected_components) or not chosen <= set(_CORE_COMPONENTS):
+        return selected_components
+    return tuple(component for component in _CORE_COMPONENTS if component in chosen)
 
 
 def _matching_staged(

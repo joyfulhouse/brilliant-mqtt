@@ -2202,10 +2202,13 @@ async def test_recovery_rejects_unpinned_shell_before_password_authentication() 
     with pytest.raises(PanelProvisioningError) as raised:
         await harness.provisioner().async_recover(harness.progress)
 
-    assert raised.value.code == "recovery_failed"
+    assert raised.value.code == "panel_identity_mismatch"
     assert not any(event[0] == "shell_connect" for event in harness.events)
     assert not any(event[0] == "rollback" for event in harness.events)
     assert harness.journal.record is not None
+    assert harness.journal.record.last_error == StoredJournalError(
+        stage="recovery", code="panel_identity_mismatch"
+    )
     assert _exception_graph(raised.value) == [raised.value]
 
 

@@ -22,8 +22,18 @@ from ..panel_inspection import (
     PanelFacts,
     async_inspect_panel,
 )
-from ..panel_provisioner import PanelProvisioner, PanelProvisioningError, ProvisioningProgress
-from ..provisioning_journal import ProvisioningJournal, RetainedRollback
+from ..panel_provisioner import (
+    PanelProvisioner,
+    PanelProvisioningError,
+    ProvisioningProgress,
+    TransactionLookupState,
+)
+from ..provisioning_journal import (
+    ProvisioningJournal,
+    ProvisioningRecord,
+    RetainedRollback,
+    ownerless_journal_recovery_allowed,
+)
 from ..shell import (
     AsyncsshShell as FleetAsyncsshShell,
 )
@@ -82,6 +92,41 @@ async def async_ownerless_recovery_candidate(
     ):
         raise PanelProvisioningError("ownerless_recovery_unavailable")
     return retained
+
+
+async def async_ownerless_journal_candidate(
+    hass: HomeAssistant, host: str, identity: HostIdentity
+) -> ProvisioningRecord | None:
+    """Select an interrupted ownerless onboarding journal before any password is sent.
+
+    Returns None when no execution journal concerns this panel; the retained-baseline
+    candidate check (which refuses while any journal exists) then applies unchanged.
+    """
+    from ..fleet_manager import _async_retained_owner_exists, _async_transaction_lookup
+
+    journal = ProvisioningJournal(hass)
+    record = await journal.async_load()
+    if record is None:
+        return None
+    request = record.panel_request
+    if (
+        request.host != host
+        and request.fingerprint != identity.fingerprint
+        and request.public_key != identity.public_key
+    ):
+        return None
+    if request.public_key != identity.public_key or request.fingerprint != identity.fingerprint:
+        raise PanelProvisioningError("panel_identity_mismatch")
+    retained = await journal.async_retained(record.transaction_id)
+    if (
+        retained is None
+        or not ownerless_journal_recovery_allowed(record, retained)
+        or await _async_retained_owner_exists(hass, retained)
+        or (await _async_transaction_lookup(hass, record.transaction_id)).state
+        is not TransactionLookupState.FLOW_ABORTED_OR_ABSENT
+    ):
+        raise PanelProvisioningError("ownerless_recovery_unavailable")
+    return record
 
 
 @asynccontextmanager

@@ -33,7 +33,7 @@ from ..panel_provisioner import (
     ProvisioningProgress,
     ProvisioningProgressStage,
 )
-from ..provisioning_journal import RetainedRollback
+from ..provisioning_journal import PROVISIONING_ERROR_CODES, ProvisioningRecord, RetainedRollback
 from ..shell import HostIdentity, PanelIdentityError
 from . import gateway
 from .schemas import (
@@ -46,6 +46,7 @@ from .schemas import (
     panel_connect_form_source,
     panel_connect_schema,
     panel_finalize_retained_schema,
+    panel_recover_journal_schema,
 )
 from .support import (
     _CORE_COMPONENTS,
@@ -92,6 +93,7 @@ class _PanelOnboardingMixin:
     _release_override: Mapping[str, object] | None
     _identity_refusal: Mapping[str, object] | None
     _retained_finalize: RetainedRollback | None
+    _journal_recover: ProvisioningRecord | None
 
     def _init_panel_onboarding(self) -> None:
         self._panel_host = None
@@ -114,6 +116,7 @@ class _PanelOnboardingMixin:
         self._release_override = None
         self._identity_refusal = None
         self._retained_finalize = None
+        self._journal_recover = None
 
     def _onboarding_parent_entry(self) -> ConfigEntry[Any] | None:
         raise NotImplementedError
@@ -215,8 +218,9 @@ class _PanelOnboardingMixin:
     def _remove_panel_onboarding(self) -> None:
         """Schedule settlement when HA removes a marked flow before commit."""
         context = cast(dict[str, Any], cast(_FlowSurface, self).context)
-        if self._retained_finalize is not None:
+        if self._retained_finalize is not None or self._journal_recover is not None:
             self._retained_finalize = None
+            self._journal_recover = None
             self._panel_root_password = None
         if (
             context.pop(CONF_PROVISIONING_TRANSACTION_ID, None) is not None
@@ -240,11 +244,18 @@ class _PanelOnboardingMixin:
         self._panel_root_password = root_password
         self._panel_ssh_username = normalized[CONF_SSH_USERNAME]
         self._retained_finalize = None
+        self._journal_recover = None
         self._panel_facts = None
         try:
             identity = await gateway.async_fetch_host_identity(host)
-            retained = await gateway.async_ownerless_recovery_candidate(
-                cast(_FlowSurface, self).hass, host, identity
+            hass = cast(_FlowSurface, self).hass
+            # #214: an interrupted ownerless onboarding journal for this exact pinned
+            # identity is settled by compensating rollback before anything else.
+            journal_record = await gateway.async_ownerless_journal_candidate(hass, host, identity)
+            retained = (
+                None
+                if journal_record is not None
+                else await gateway.async_ownerless_recovery_candidate(hass, host, identity)
             )
             duplicate = _duplicate_panel(
                 self._onboarding_parent_entry(),
@@ -289,6 +300,7 @@ class _PanelOnboardingMixin:
 
         self._panel_identity = identity
         self._retained_finalize = retained
+        self._journal_recover = journal_record
         self._panel_facts = facts
         self._panel_failure = None
         return {}, None, None
@@ -311,6 +323,8 @@ class _PanelOnboardingMixin:
                     },
                 )
             if not errors and failure is None:
+                if self._journal_recover is not None:
+                    return await self.async_step_panel_recover_journal()
                 if self._retained_finalize is not None:
                     return await self.async_step_panel_finalize_retained()
                 return await self.async_step_panel_confirm()
@@ -325,6 +339,68 @@ class _PanelOnboardingMixin:
                 if failure is not None
                 else {"documentation_url": _PANEL_ONBOARDING_DOCUMENTATION_URL}
             ),
+        )
+
+    async def async_step_panel_recover_journal(
+        self, user_input: dict[str, Any] | None = None
+    ) -> _OnboardingResult:
+        """Roll back one interrupted ownerless onboarding with fresh pinned authority."""
+        flow = cast(_FlowSurface, self)
+        record = self._journal_recover
+        identity, host, password = self._panel_identity, self._panel_host, self._panel_root_password
+        if record is None or identity is None or host is None or password is None:
+            return flow.async_abort(reason="invalid_flow_state")
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            if user_input.get("confirm_recover") is not True:
+                errors["base"] = "confirmation_required"
+            else:
+                self._journal_recover = None
+                try:
+                    if self._onboarding_parent_entry() is None:
+                        return flow.async_abort(reason="invalid_parent")
+                    provisioner = gateway._get_panel_provisioner(
+                        flow.hass, expected_identity=identity
+                    )
+                    await provisioner.async_recover_ownerless_journal(
+                        record, host, password, identity
+                    )
+                    retained = await gateway.async_ownerless_recovery_candidate(
+                        flow.hass, host, identity
+                    )
+                except asyncio.CancelledError:
+                    self._panel_root_password = None
+                    raise
+                except PanelProvisioningError as error:
+                    self._panel_root_password = None
+                    self._panel_failure = _provisioning_failure(error)
+                    return await self.async_step_panel_connect()
+                except Exception:
+                    self._panel_root_password = None
+                    self._panel_failure = _panel_failure("recovery_failed", stage="recovery")
+                    return await self.async_step_panel_connect()
+                if retained is None:
+                    return await self.async_step_panel_confirm()
+                self._retained_finalize = retained
+                return await self.async_step_panel_finalize_retained()
+        return flow.async_show_form(
+            step_id="panel_recover_journal",
+            data_schema=panel_recover_journal_schema(),
+            errors=errors,
+            description_placeholders={
+                "transaction": str(record.transaction_id),
+                "panel": record.panel_request.slug,
+                "phase": record.phase.value,
+                "last_error": (
+                    "none"
+                    if record.last_error is None
+                    else record.last_error.code
+                    if record.last_error.code in PROVISIONING_ERROR_CODES
+                    else "unknown"
+                ),
+                "fingerprint": identity.fingerprint,
+                "host": host,
+            },
         )
 
     async def async_step_panel_finalize_retained(
