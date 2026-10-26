@@ -149,6 +149,11 @@ Before any Office update or redeploy, prove byte parity against the actual
 integration loaded by Home Assistant—not a nearby checkout or a matching
 version label.
 
+The [release qualification runbook](release-qualification.md) records which
+gates the current release has met, and how to verify installed identity,
+rehearse rollback and measure responsiveness on one panel. Keep each panel's
+retained rollback baseline until that qualification is signed off.
+
 The deterministic helper
 [`scripts/brilliant-panel/bundle_manifest.py`](../../scripts/brilliant-panel/bundle_manifest.py)
 emits exactly `<logical-path><TAB><sha256>`, rejects symlinks and special
