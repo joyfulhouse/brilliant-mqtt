@@ -26,6 +26,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
+from typing import Literal
 from uuid import RFC_4122, UUID, uuid4
 
 import asyncssh
@@ -123,6 +124,20 @@ class ReleaseIdentityBlocked(PanelOpError):
         return "ReleaseIdentityBlocked(<redacted>)"
 
 
+class ReleaseCodeChangeRefused(PanelOpError):
+    """A writer outside the canaried update path tried to change selected core code."""
+
+
+# Which core-code changes a release transaction may make:
+# - "admit": any admitted change (Update entity, redeploy, provisioning: canaried,
+#   with a rollback baseline captured first);
+# - "bootstrap": install code only where none is installed (repair, component
+#   enablement, post-OTA refresh); installed code is kept, never replaced;
+# - "frozen": no code writes at all, because the panel holds a retained rollback
+#   baseline (#220).
+CodePolicy = Literal["admit", "bootstrap", "frozen"]
+
+
 @dataclass(repr=False)
 class ReleaseAdmission:
     shell: PanelShell
@@ -133,6 +148,7 @@ class ReleaseAdmission:
     pending: set[str] = field(default_factory=set)
     owner: asyncio.Task[object] | None = field(default_factory=asyncio.current_task)
     active: bool = True
+    code_policy: CodePolicy = "admit"
 
     @property
     def noop(self) -> bool:
@@ -373,11 +389,14 @@ async def release_transaction(
     override: Mapping[str, object] | None = None,
     transaction_id: UUID | None = None,
     allow_pre_ordinal_upgrade: bool = False,
+    code_policy: CodePolicy = "admit",
 ) -> AsyncIterator[ReleaseAdmission]:
     """Admit every selected writer before CA/config writes; never retain an override.
 
     ``allow_pre_ordinal_upgrade`` is only for callers that run the canary and retain
     a rollback baseline (update, provisioning); repair and install paths fail closed.
+    ``code_policy`` bounds which code writes the shared writers accept (see
+    ``CodePolicy``); a non-admitting policy keeps the incumbent's code and unit.
     """
     if _RELEASE_ADMISSION.get() is not None:
         raise PanelOpError("release_transaction_nested")
@@ -390,6 +409,7 @@ async def release_transaction(
         transaction_id.hex if transaction_id is not None else None,
         allow_pre_ordinal_upgrade=allow_pre_ordinal_upgrade,
     )
+    admission.code_policy = code_policy
     token = _RELEASE_ADMISSION.set(admission)
     try:
         yield admission
@@ -460,6 +480,34 @@ def release_component_changed(component: str) -> bool:
         and admission.incumbent.get(component) is not None
         and admission.changes.get(component, False)
     )
+
+
+def _keeps_incumbent(admission: ReleaseAdmission, component: str) -> bool:
+    """True when the policy keeps installed code the candidate would replace."""
+    incumbent = admission.incumbent.get(component)
+    return (
+        admission.code_policy != "admit"
+        and incumbent is not None
+        and admission.changes.get(component, False)
+        and component not in admission.pending
+        and incumbent.digest != admission.candidate[component].digest
+    )
+
+
+def release_keeps_incumbent(component: str) -> bool:
+    """Whether the active transaction keeps *component*'s differing installed code."""
+    admission = _RELEASE_ADMISSION.get()
+    return admission is not None and _keeps_incumbent(admission, component)
+
+
+def _require_code_change_allowed(admission: ReleaseAdmission, component: str) -> None:
+    """Refuse a core-code write the transaction's policy does not permit."""
+    if admission.code_policy == "frozen":
+        raise ReleaseCodeChangeRefused("baseline_retained_finalize_first")
+    if admission.code_policy == "bootstrap" and admission.incumbent[component] is not None:
+        raise ReleaseCodeChangeRefused(
+            "release_update_required: update this panel through the canaried update"
+        )
 
 
 def _require_candidate_code(admission: ReleaseAdmission, component: str) -> None:
@@ -2428,7 +2476,9 @@ async def ensure_configs(shell: PanelShell, unit_content: str, env_content: str)
     updates, /etc may not. Env files carry the broker password → 0600 both places.
     """
     admission = await _guard_release(shell)
-    _require_candidate_code(admission, "bridge")
+    keep = _keeps_incumbent(admission, "bridge")
+    if not keep:
+        _require_candidate_code(admission, "bridge")
     incumbent = admission.incumbent["bridge"]
     if incumbent is not None and incumbent.deployment_id is not None:
         # Keep the selected release's provenance when legacy configuration rendering
@@ -2436,8 +2486,9 @@ async def ensure_configs(shell: PanelShell, unit_content: str, env_content: str)
         if ENV_DEPLOYMENT_ID not in parse_env(env_content):
             env_content += f"\n{ENV_DEPLOYMENT_ID}={incumbent.deployment_id}\n"
     await async_assert_no_mqtt_tls_downgrade(shell, env_content)
-    if not admission.changes["bridge"]:
-        await _ensure_preserved_unit(shell, admission, "bridge", unit_content)
+    if keep or not admission.changes["bridge"]:
+        # Kept installed code keeps its own unit: never the bundled candidate's.
+        await _ensure_preserved_unit(shell, admission, "bridge", None if keep else unit_content)
         for path in (PANEL_ENV_FILE, _STAGED_ENV):
             await _write_identity_config(shell, path, env_content.encode(), 0o600)
         await _refresh_admitted_correlation(shell, admission, env_content)
@@ -2494,7 +2545,7 @@ async def _ensure_preserved_unit(
     shell: PanelShell,
     admission: ReleaseAdmission,
     component: str,
-    fallback: str,
+    fallback: str | None,
 ) -> None:
     service, live, staged = {
         "bridge": (SERVICE_NAME, PANEL_UNIT_FILE, _STAGED_UNIT),
@@ -2523,7 +2574,11 @@ async def _ensure_preserved_unit(
                 raise PanelOpError("release_config_source_missing")
         else:
             selected = await _identity_file(shell, staged)
-            content = selected.content if selected.content is not None else fallback.encode()
+            content = selected.content
+            if content is None:
+                if fallback is None:
+                    raise PanelOpError("release_config_source_missing")
+                content = fallback.encode()
     await _revalidate_release(shell, admission)
     changed = await _write_identity_config(shell, live, content, 0o644)
     changed = await _write_identity_config(shell, staged, content, 0o644) or changed
@@ -2840,6 +2895,7 @@ async def deploy_payload(shell: PanelShell, local_payload_dir: str, version: str
     admission = await _guard_release(shell, local_payload_dir=local_payload_dir)
     if not admission.changes["bridge"]:
         return
+    _require_code_change_allowed(admission, "bridge")
     if version != admission.candidate["bridge"].version:
         raise PanelOpError("release_candidate_changed")
     loop = asyncio.get_running_loop()
@@ -3296,6 +3352,9 @@ async def ensure_wifi_watchdog_unit(shell: PanelShell, unit_content: str) -> Non
     EnvironmentFile=-/etc/brilliant-mqtt.env (optional, shared with the bridge).
     """
     admission = await _guard_release(shell, "wifi_watchdog")
+    if _keeps_incumbent(admission, "wifi_watchdog"):
+        await _ensure_preserved_unit(shell, admission, "wifi_watchdog", None)
+        return
     if not admission.changes["wifi_watchdog"]:
         await _ensure_preserved_unit(shell, admission, "wifi_watchdog", unit_content)
         return
@@ -3434,6 +3493,7 @@ async def _deploy_watchdog_tarball(
     admission = await _guard_release(shell, component, payload_dir)
     if not admission.changes[component]:
         return
+    _require_code_change_allowed(admission, component)
     if version != admission.candidate[component].version:
         raise PanelOpError("release_candidate_changed")
     loop = asyncio.get_running_loop()
@@ -3494,6 +3554,9 @@ async def ensure_bus_watchdog_unit(shell: PanelShell, unit_content: str) -> None
     EnvironmentFile=-/etc/brilliant-mqtt.env (optional, shared with the bridge).
     """
     admission = await _guard_release(shell, "bus_watchdog")
+    if _keeps_incumbent(admission, "bus_watchdog"):
+        await _ensure_preserved_unit(shell, admission, "bus_watchdog", None)
+        return
     if not admission.changes["bus_watchdog"]:
         await _ensure_preserved_unit(shell, admission, "bus_watchdog", unit_content)
         return

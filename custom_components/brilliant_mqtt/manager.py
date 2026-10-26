@@ -91,6 +91,7 @@ from .const import (
 from .entry_data import FleetConfig, LegacyPanelStore, PanelConfigStore
 from .mqtt_payload import decode_mqtt_payload
 from .panel_ops import PanelOpError
+from .provisioning_journal import ProvisioningJournal, ProvisioningJournalError
 from .shell import (
     AsyncsshShell as _StrictAsyncsshShell,
 )
@@ -149,6 +150,14 @@ _SAFE_PANEL_OP_DETAILS = {
     "release_auto_admission_record_failed": (
         "release_auto_admission_record_failed: check panel storage and retry"
     ),
+    "release_update_required": (
+        "release_update_required: repair and component enablement keep installed code; "
+        "update this panel with the Update entity or brilliant_mqtt.redeploy"
+    ),
+    "release_config_source_missing": (
+        "release_config_source_missing: the installed release's unit is missing; "
+        "update this panel with the Update entity or brilliant_mqtt.redeploy"
+    ),
 }
 _PANEL_OP_CODE_PREFIX_LIMIT = 64
 for _canary_code in (
@@ -169,7 +178,8 @@ for _canary_code in (
     _SAFE_PANEL_OP_DETAILS[_canary_code] = f"{_canary_code}: see docs/canary-rollback.md"
 _SAFE_PANEL_OP_DETAILS["baseline_retained_finalize_first"] = (
     "baseline_retained_finalize_first: after canary sign-off, explicitly finalize the retained "
-    "baseline by transaction name before updating; see docs/canary-rollback.md"
+    "baseline by transaction name (or roll back) before changing this panel's code; "
+    "see docs/canary-rollback.md"
 )
 
 
@@ -199,6 +209,43 @@ def _log_connect_failure(panel: str, error: OSError | asyncssh.Error) -> None:
         type(error).__name__,
         details,
     )
+
+
+def _pinned_fingerprint(shell: PanelShell) -> str | None:
+    key = shell.pinned_host_key()
+    if key is None:
+        return None
+    try:
+        return str(asyncssh.import_public_key(key).get_fingerprint("sha256"))
+    except (asyncssh.KeyImportError, ValueError):
+        return None
+
+
+async def async_core_code_policy(
+    hass: HomeAssistant, shell: PanelShell, panel: str | None
+) -> panel_ops.CodePolicy:
+    """Return the code policy for writers outside the canaried update path (#220).
+
+    A retained rollback baseline in any state, whether proven by the on-panel
+    marker or by an HA retained record for this panel (slug or pinned host-key
+    fingerprint), freezes the panel's selected core code until it is finalized or
+    rolled back. Otherwise these writers may only bootstrap missing code; replacing
+    installed code is left to the canaried update, which captures a baseline first.
+    """
+    if await panel_ops.baseline_retained(shell):
+        return "frozen"
+    fingerprint = _pinned_fingerprint(shell)
+    try:
+        records = await ProvisioningJournal(hass).async_retained_records()
+    except ProvisioningJournalError:
+        raise PanelOpError("baseline_read_failed") from None
+    for retained in records:
+        request = retained.record.panel_request
+        if (panel is not None and request.slug == panel) or (
+            fingerprint is not None and request.fingerprint == fingerprint
+        ):
+            return "frozen"
+    return "bootstrap"
 
 
 def _broker_assumed_available() -> bool:
@@ -1113,7 +1160,9 @@ class PanelManager:
                     (payload_dir / spec.service_filename).read_text
                 )
                 state = await spec.inspect(shell)
-                if (
+                # Outside the canaried update the transaction keeps differing installed
+                # watchdog code (#220): re-lay its own unit and service, never upgrade.
+                if not panel_ops.release_keeps_incumbent(spec.payload_subdir) and (
                     not state.payload_present
                     or state.version != version
                     or panel_ops.release_component_changed(spec.payload_subdir)
@@ -1132,6 +1181,8 @@ class PanelManager:
             except (OSError, asyncssh.Error, PanelOpError, tarfile.TarError) as err:
                 if isinstance(err, panel_ops.ReleaseIdentityBlocked):
                     raise
+                if isinstance(err, panel_ops.ReleaseCodeChangeRefused):
+                    return err  # a policy refusal: retrying cannot change it
                 error = err
                 continue
             return None
@@ -1340,26 +1391,33 @@ class PanelManager:
                     if trigger == "auto" and not self._auto_repair_still_warranted():
                         self._skip_stale_auto_repair()
                         return
+                    code_policy = await async_core_code_policy(self.hass, shell, self.panel)
                     async with panel_ops.release_transaction(
                         shell,
                         str(_payload_dir()),
                         panel=self.panel,
                         components=self._identity_components(),
-                    ) as admission:
+                        code_policy=code_policy,
+                    ):
                         if trigger == "auto" and not self._auto_repair_still_warranted():
                             self._skip_stale_auto_repair()
                             return
+                        if not state.payload_present and code_policy == "frozen":
+                            # A retained baseline freezes code; refuse before any write
+                            # rather than invent state the baseline does not describe.
+                            raise panel_ops.ReleaseCodeChangeRefused(
+                                "baseline_retained_finalize_first"
+                            )
                         env = await self._async_stage_broker_ca(shell)
                         # Bootstrap a code-less panel (never installed, or its /var code was
                         # lost): lay the agent payload down BEFORE enabling the unit, so the
                         # Repair button / auto-repair can install from scratch rather than
                         # enable a unit whose ExecStart points at code that isn't there. An
                         # already-installed panel (the common OTA-wiped-/etc case) keeps the
-                        # light path — rewrite config + enable, no re-upload.
-                        if not state.payload_present or (
-                            admission.incumbent["bridge"] is not None
-                            and admission.changes["bridge"]
-                        ):
+                        # light path — rewrite config + enable, no re-upload — and keeps its
+                        # installed code and unit even when the loaded bundle is newer:
+                        # upgrades go through the canaried update path only (#220).
+                        if not state.payload_present:
                             await panel_ops.async_assert_no_mqtt_tls_downgrade(shell, env)
                             await panel_ops.deploy_payload(
                                 shell, str(_payload_dir()), await self._payload_version()
@@ -1801,6 +1859,7 @@ class PanelManager:
             str(_payload_dir()),
             panel=self.panel,
             components=self._identity_components(),
+            code_policy=await async_core_code_policy(self.hass, shell, self.panel),
         ) as admission:
             if admission.noop:
                 return
@@ -2226,6 +2285,7 @@ class PanelManager:
                         str(_payload_dir()),
                         panel=self.panel,
                         components=self._identity_components(),
+                        code_policy=await async_core_code_policy(self.hass, shell, self.panel),
                     ) as admission:
                         if (
                             admission.incumbent["bridge"] is not None
