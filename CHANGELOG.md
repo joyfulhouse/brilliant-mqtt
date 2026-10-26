@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Agent updates from the Update entity or `redeploy` retry transient SSH connect
+  failures before any panel change. Retried failures are host or network
+  unreachable, refused or reset connections, connect timeouts, temporary DNS
+  failures and connections lost during connect. An update makes up to 5 attempts
+  with capped, jittered exponential backoff and schedules no retry past a
+  2-minute deadline. Progress stays at the pre-connect stage while it waits, and
+  each retry logs its attempt number and classified reason. Authentication,
+  host-key, key-exchange and admission failures fail immediately without retry.
+  When every attempt fails, the update reports the attempt count. The fleet SSH
+  lock is released during backoff, and the panel stays reserved against a
+  concurrent update or repair. Resuming after a connection loss during or after
+  remote mutation remains open in #219.
+
 ## [0.11.3] - 2026-10-23
 
 The on-panel agent and Home Assistant integration both move to 0.11.3. The
