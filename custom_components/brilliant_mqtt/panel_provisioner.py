@@ -1649,34 +1649,11 @@ class PanelProvisioner:
                 return
 
         request = record.panel_request
-        # The candidate identity comes only from what the journal durably recorded,
-        # never from the currently bundled payload (which may be a newer release).
-        try:
-            staged = self._staged_release_factory(
-                record.staged_version,
-                record.transaction_id,
-                request.selected_components,
-            )
-            if not _matching_staged(
-                staged,
-                record.staged_version,
-                record.transaction_id,
-                _canonical_components(request.selected_components),
-            ):
-                raise PanelProvisioningError("recovery_artifact_invalid")
-            snapshot = self._snapshot_from_stored(record.prior_snapshot)
-        except (PanelProvisioningError, PanelOpError, ValueError, TypeError):
-            await self._async_record_recovery_failure(record, "recovery_artifact_invalid")
-            raise PanelProvisioningError("recovery_artifact_invalid") from None
-        try:
-            shell = self._shell_factory(
-                host if host is not None else request.host,
-                password if password is not None else request.root_password,
-                request.public_key,
-            )
-        except Exception:
-            await self._async_record_recovery_failure(record, "panel_identity_mismatch")
-            raise PanelProvisioningError("panel_identity_mismatch") from None
+        # Failures caused by flow-supplied access are shown in that flow; they must
+        # not replace the background runner's diagnosis of the recorded access.
+        record_failures = host is None and password is None
+        staged, snapshot = await self._async_recovery_artifacts(record, record_failures)
+        shell = await self._async_recovery_shell(record, host, password, record_failures)
         observer: _HealthObserver | None = None
         primary: PanelProvisioningError | None = None
         cancellation: asyncio.CancelledError | None = None
@@ -1790,7 +1767,7 @@ class PanelProvisioner:
         if cancellation is not None:
             raise cancellation from None
         if primary is not None:
-            if not restore_started:
+            if not restore_started and record_failures:
                 # Restore intent never became durable: record why, typed, so the
                 # operator sees an actionable code instead of last_error: null.
                 await self._async_record_recovery_failure(record, primary.code)
@@ -1801,6 +1778,91 @@ class PanelProvisioner:
             raise shell_outcome.cancellation from None
         if observer_outcome.error is not None or shell_outcome.error is not None:
             raise PanelProvisioningError("recovery_failed")
+
+    async def _async_recovery_artifacts(
+        self, record: ProvisioningRecord, record_failures: bool
+    ) -> tuple[StagedRelease, PanelSnapshot]:
+        """Rebuild the candidate and snapshot only from what the journal recorded.
+
+        Never from the currently bundled payload, which may be a newer release.
+        """
+        request = record.panel_request
+        try:
+            staged = self._staged_release_factory(
+                record.staged_version,
+                record.transaction_id,
+                request.selected_components,
+            )
+            if not _matching_staged(
+                staged,
+                record.staged_version,
+                record.transaction_id,
+                _canonical_components(request.selected_components),
+            ):
+                raise PanelProvisioningError("recovery_artifact_invalid")
+            snapshot = self._snapshot_from_stored(record.prior_snapshot)
+        except (PanelProvisioningError, PanelOpError, ValueError, TypeError):
+            if record_failures:
+                await self._async_record_recovery_failure(record, "recovery_artifact_invalid")
+            raise PanelProvisioningError("recovery_artifact_invalid") from None
+        return staged, snapshot
+
+    async def _async_recovery_shell(
+        self,
+        record: ProvisioningRecord,
+        host: str | None,
+        password: str | None,
+        record_failures: bool,
+    ) -> PanelShell:
+        request = record.panel_request
+        try:
+            return self._shell_factory(
+                host if host is not None else request.host,
+                password if password is not None else request.root_password,
+                request.public_key,
+            )
+        except Exception as error:
+            code = recovery_connect_failure_code(error)
+            if record_failures:
+                await self._async_record_recovery_failure(record, code)
+            raise PanelProvisioningError(code) from None
+
+    async def _async_finish_verified_restore(
+        self, record: ProvisioningRecord, host: str, password: str
+    ) -> None:
+        """Complete a rollback that crashed after durable verified-restore evidence.
+
+        The panel already passed fresh restore verification, so it is not restored
+        again: only the transaction-owned candidate is pruned before the journal is
+        cleared, exactly as the interrupted rollback would have done.
+        """
+        staged, _snapshot = await self._async_recovery_artifacts(record, False)
+        shell = await self._async_recovery_shell(record, host, password, False)
+        primary: PanelProvisioningError | None = None
+        try:
+            if shell.pinned_host_key() != record.panel_request.public_key:
+                raise PanelProvisioningError("panel_identity_mismatch")
+            try:
+                await shell.connect()
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                raise PanelProvisioningError(recovery_connect_failure_code(error)) from None
+            await self._operations.cleanup_staged(shell, staged)
+            if record.prior_snapshot.layout is StoredPanelLayout.ABSENT:
+                await self._journal.async_complete_absent_rollback(record.transaction_id)
+            else:
+                await self._journal.async_complete_rollback(record.transaction_id, verified=True)
+            await self._repair_reporter.async_clear_rollback_failure(record.transaction_id)
+        except PanelProvisioningError as error:
+            primary = error
+        except Exception:
+            primary = PanelProvisioningError("cleanup_failed")
+        closed = await _settle_close(shell.close)
+        if closed.cancellation is not None:
+            raise closed.cancellation from None
+        if primary is not None:
+            raise primary from None
 
     async def _async_record_recovery_failure(self, record: ProvisioningRecord, code: str) -> None:
         """Best-effort durable typed error; never changes phase, baseline or journal."""
@@ -1823,7 +1885,7 @@ class PanelProvisioner:
         )
         if (
             current is None
-            or current != expected
+            or not _same_journal_transaction(current, expected)
             or not ownerless_journal_recovery_allowed(current, retained)
             or retained is None
             or self._retained_owner_exists is None
@@ -1858,13 +1920,22 @@ class PanelProvisioner:
                 or proven != identity
             ):
                 raise PanelProvisioningError("panel_identity_mismatch")
-            await self._async_assert_ownerless_journal(expected)
+            retained = await self._async_assert_ownerless_journal(expected)
+            current = await self._journal.async_load()
+            if current is None:
+                raise PanelProvisioningError("ownerless_recovery_unavailable")
 
             async def recover() -> None:
                 async with asyncio.timeout(RECOVERY_TIMEOUT_SECONDS):
-                    await self._async_recover_record(
-                        expected, _noop_progress, host=host, password=password
-                    )
+                    if (
+                        retained.state == "restored"
+                        and current.phase is ProvisioningPhase.ROLLBACK_PENDING
+                    ):
+                        await self._async_finish_verified_restore(current, host, password)
+                    else:
+                        await self._async_recover_record(
+                            current, _noop_progress, host=host, password=password
+                        )
 
             outcome = await _settle(recover())
             if outcome.cancellation is not None:
@@ -2139,6 +2210,31 @@ def _required_primary_code(
 
 def _is_uuid4(value: object) -> bool:
     return isinstance(value, UUID) and value.version == 4 and value.variant == RFC_4122
+
+
+def _same_journal_transaction(current: ProvisioningRecord, expected: ProvisioningRecord) -> bool:
+    """Compare the fields that define what the operator confirmed, not volatile ones.
+
+    A newly recorded ``last_error`` (or the recorded credential) changing between
+    selection and confirmation must not invalidate an otherwise identical journal.
+    """
+    if not isinstance(expected, ProvisioningRecord):
+        return False
+    mine, theirs = current.panel_request, expected.panel_request
+    return (
+        current.transaction_id == expected.transaction_id
+        and current.operation is expected.operation
+        and current.phase is expected.phase
+        and current.setup_id == expected.setup_id
+        and current.staged_version == expected.staged_version
+        and current.prior_snapshot == expected.prior_snapshot
+        and current.fleet_profile == expected.fleet_profile
+        and mine.host == theirs.host
+        and mine.public_key == theirs.public_key
+        and mine.fingerprint == theirs.fingerprint
+        and mine.slug == theirs.slug
+        and mine.selected_components == theirs.selected_components
+    )
 
 
 def _canonical_components(selected_components: tuple[str, ...]) -> tuple[str, ...]:

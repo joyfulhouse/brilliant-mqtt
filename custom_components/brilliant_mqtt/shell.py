@@ -173,8 +173,18 @@ class PanelProcessError(RuntimeError):
 
 
 def recovery_connect_failure_code(error: BaseException) -> str:
-    """Classify a pinned recovery connection failure without retaining its detail."""
-    if isinstance(error, (asyncssh.HostKeyNotVerifiable, PanelIdentityError)):
+    """Classify a pinned recovery connection failure without retaining its detail.
+
+    Only key/pin evidence is an identity failure. An unusable or unreachable address
+    (for example one reassigned by DHCP) is connection-level.
+    """
+    if isinstance(error, PanelIdentityError):
+        return (
+            "recovery_connection_failed"
+            if error.code in {"invalid_host", "invalid_port", "host_unreachable"}
+            else "panel_identity_mismatch"
+        )
+    if isinstance(error, asyncssh.HostKeyNotVerifiable):
         return "panel_identity_mismatch"
     if isinstance(error, asyncssh.PermissionDenied):
         return "panel_authentication_failed"

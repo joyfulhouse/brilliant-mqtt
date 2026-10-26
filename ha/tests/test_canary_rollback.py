@@ -31,7 +31,7 @@ from custom_components.brilliant_mqtt.provisioning_journal import (
     ProvisioningRecord,
     Store,
 )
-from custom_components.brilliant_mqtt.shell import HostIdentity, PanelShell
+from custom_components.brilliant_mqtt.shell import HostIdentity, PanelIdentityError, PanelShell
 from tests.canary_rehearsal import RehearsalShell
 from tests.test_panel_health import (
     AVAILABILITY,
@@ -1967,6 +1967,8 @@ async def test_recovery_after_integration_upgrade_uses_journal_recorded_candidat
         ("host_key", "panel_identity_mismatch"),
         ("pin", "panel_identity_mismatch"),
         ("artifact", "recovery_artifact_invalid"),
+        ("bad_address", "recovery_connection_failed"),
+        ("bad_pin", "panel_identity_mismatch"),
     ],
 )
 async def test_pre_restore_recovery_failure_is_typed_durable_and_never_erases(
@@ -1989,6 +1991,17 @@ async def test_pre_restore_recovery_failure_is_typed_durable_and_never_erases(
     provisioner = _routed_provisioner(hass, {}, calls, dead_error=errors.get(failure))
     if failure == "pin":
         provisioner._shell_factory = lambda _h, _p, _k: FakeShell(pinned="ssh-ed25519 OTHER")
+    if failure in {"bad_address", "bad_pin"}:
+        # Shell construction failures: an unusable address is connection-level,
+        # only a malformed pin is an identity failure.
+        construction = PanelIdentityError(
+            "invalid_host" if failure == "bad_address" else "host_key_malformed"
+        )
+
+        def refuse(_host: str, _password: str, _key: str) -> PanelShell:
+            raise construction
+
+        provisioner._shell_factory = refuse
     if failure == "artifact":
         provisioner._staged_release_factory = lambda version, transaction, _components: (
             panel_ops.StagedRelease(
@@ -2224,3 +2237,150 @@ async def test_stuck_journal_blocks_unrelated_panels_with_actionable_code_and_se
     assert await journal.async_retained(other.transaction_id) is None
     restored = await journal.async_retained(record.transaction_id)
     assert restored is not None and restored.state == "restored"
+
+
+class _ProcessLoss(BaseException):
+    """A crash: not an Exception, so no handler can settle it as a failed rollback."""
+
+
+async def test_crash_with_restore_intent_resumes_with_new_password_and_pin(
+    hass: HomeAssistant, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """HA dies right after durable restore intent; the runner resumes it on restart."""
+    shell, record = await _stuck_ownerless_install(hass, tmp_path)
+    stored = record.panel_request
+    calls: list[tuple[str, str]] = []
+    # The panel kept its address; only its root password changed.
+    provisioner = _routed_provisioner(hass, {(stored.host, _FRESH_PASSWORD): shell}, calls)
+    identity = _identity_for(record)
+    provisioner._identity_fetcher = AsyncMock(return_value=identity)
+    keys: list[str] = []
+    routed = provisioner._shell_factory
+
+    def pinned_factory(host: str, password: str, key: str) -> PanelShell:
+        keys.append(key)
+        return routed(host, password, key)
+
+    provisioner._shell_factory = pinned_factory
+    stuck = await ProvisioningJournal(hass).async_load()
+    assert stuck is not None
+
+    async def crash(*_args: object, **_kwargs: object) -> None:
+        raise _ProcessLoss
+
+    with monkeypatch.context() as fault:
+        fault.setattr(ProvisioningJournal, "async_record_error", crash)
+        with pytest.raises(PanelProvisioningError, match="recovery_failed"):
+            await provisioner.async_recover_ownerless_journal(
+                stuck, stored.host, _FRESH_PASSWORD, identity
+            )
+    restarted = ProvisioningJournal(hass)
+    interrupted = await restarted.async_load()
+    assert interrupted is not None
+    assert interrupted.operation is ProvisioningOperation.ONBOARDING_ROLLBACK
+    assert interrupted.phase is ProvisioningPhase.ROLLBACK_PENDING
+    retained = await restarted.async_retained(record.transaction_id)
+    assert retained is not None and retained.state == "restore_requested"
+    assert retained.compensation_password(interrupted) == _FRESH_PASSWORD
+    assert _FRESH_PASSWORD not in json.dumps(retained._to_storage())
+    calls.clear()
+    keys.clear()
+    provisioner._journal = restarted
+    await provisioner.async_recover()  # background runner after restart
+    assert calls == [(stored.host, _FRESH_PASSWORD)]
+    assert keys == [stored.public_key]
+    assert await restarted.async_load() is None
+    settled = await restarted.async_retained(record.transaction_id)
+    assert settled is not None and settled.state == "restored"
+
+
+async def test_crash_after_verified_restore_is_settled_by_fresh_flow_authority(
+    hass: HomeAssistant, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The verified-restored-but-uncleared crash window must not recreate #214."""
+    from custom_components.brilliant_mqtt.provisioning_journal import (
+        ownerless_journal_recovery_allowed,
+    )
+
+    shell, record = await _stuck_ownerless_install(hass, tmp_path)
+    calls: list[tuple[str, str]] = []
+    provisioner = _routed_provisioner(hass, {(_MOVED_HOST, _FRESH_PASSWORD): shell}, calls)
+    identity = _identity_for(record)
+    provisioner._identity_fetcher = AsyncMock(return_value=identity)
+    stuck = await ProvisioningJournal(hass).async_load()
+    assert stuck is not None
+
+    async def crash(self: ProvisioningJournal, transaction_id: Any) -> None:
+        # The verified evidence is durable; HA dies before the journal is removed.
+        await self.async_retained_state(transaction_id, "restored")
+        raise _ProcessLoss
+
+    with monkeypatch.context() as fault:
+        fault.setattr(ProvisioningJournal, "async_complete_absent_rollback", crash)
+        with pytest.raises(PanelProvisioningError, match="recovery_failed"):
+            await provisioner.async_recover_ownerless_journal(
+                stuck, _MOVED_HOST, _FRESH_PASSWORD, identity
+            )
+    restarted = ProvisioningJournal(hass)
+    provisioner._journal = restarted
+    pending = await restarted.async_load()
+    assert pending is not None and pending.phase is ProvisioningPhase.ROLLBACK_PENDING
+    retained = await restarted.async_retained(record.transaction_id)
+    assert retained is not None and retained.state == "restored"
+    assert ownerless_journal_recovery_allowed(pending, retained)
+    assert not ownerless_journal_recovery_allowed(
+        replace(pending, phase=ProvisioningPhase.PENDING_CONFIG_COMMIT), retained
+    )
+    # Background recovery keeps using the dead recorded address: typed, preserved.
+    with pytest.raises(PanelProvisioningError, match="recovery_connection_failed"):
+        await provisioner.async_recover()
+    assert await restarted.async_retained(record.transaction_id) == retained
+    resumed = await restarted.async_load()
+    assert resumed is not None
+    with monkeypatch.context() as guard:
+        guard.setattr(
+            panel_ops, "rollback_snapshot", AsyncMock(side_effect=AssertionError("re-restore"))
+        )
+        await provisioner.async_recover_ownerless_journal(
+            resumed, _MOVED_HOST, _FRESH_PASSWORD, identity
+        )
+    assert await restarted.async_load() is None
+    settled = await restarted.async_retained(record.transaction_id)
+    assert settled == retained and settled.ownerless_finalization_allowed
+    assert calls[-1] == (_MOVED_HOST, _FRESH_PASSWORD)
+    await provisioner.async_finalize_ownerless_restored(
+        settled, _MOVED_HOST, _FRESH_PASSWORD, identity
+    )
+    assert await restarted.async_retained(record.transaction_id) is None
+
+
+async def test_flow_attempt_tolerates_new_error_and_keeps_background_error(
+    hass: HomeAssistant, tmp_path: Path
+) -> None:
+    import asyncssh
+
+    from custom_components.brilliant_mqtt.provisioning_journal import StoredJournalError
+
+    shell, record = await _stuck_ownerless_install(hass, tmp_path)
+    calls: list[tuple[str, str]] = []
+    provisioner = _routed_provisioner(
+        hass,
+        {(_MOVED_HOST, _FRESH_PASSWORD): shell},
+        calls,
+        dead_error=asyncssh.PermissionDenied("SECRET wrong fresh password"),
+    )
+    identity = _identity_for(record)
+    provisioner._identity_fetcher = AsyncMock(return_value=identity)
+    journal = ProvisioningJournal(hass)
+    stale = await journal.async_load()
+    assert stale is not None
+    background = StoredJournalError(stage="recovery", code="recovery_connection_failed")
+    await journal.async_record_error(record.transaction_id, background)
+    # A mistyped fresh password is shown in the flow, not saved over the diagnosis.
+    with pytest.raises(PanelProvisioningError, match="panel_authentication_failed"):
+        await provisioner.async_recover_ownerless_journal(stale, _MOVED_HOST, "mistyped", identity)
+    current = await journal.async_load()
+    assert current is not None and current.last_error == background
+    # A selection made before a new error was recorded remains valid.
+    await provisioner.async_recover_ownerless_journal(stale, _MOVED_HOST, _FRESH_PASSWORD, identity)
+    assert await journal.async_load() is None

@@ -1064,6 +1064,7 @@ _OWNERLESS_JOURNAL_PHASES = frozenset(
         ProvisioningPhase.VERIFYING,
         ProvisioningPhase.PENDING_CONFIG_COMMIT,
         ProvisioningPhase.ROLLBACK_PENDING,
+        ProvisioningPhase.ROLLED_BACK,
     }
 )
 _OWNERLESS_JOURNAL_RETAINED_STATES = frozenset({"armed", "restore_requested", "rollback_failed"})
@@ -1077,18 +1078,32 @@ def ownerless_journal_recovery_allowed(
     Only an interrupted onboarding (install/upgrade, or its own compensation) whose
     rollback guarantee is still armed or unsettled qualifies. Commit, soak, explicit
     owner rollback, and managed updates never do; ownership is checked separately.
+    A rollback that crashed after durably recording a *verified* restore (and before
+    clearing its journal) also qualifies, so it can be completed without restoring
+    again.
     """
     if record is None or retained is None:
         return False
+    settled_state = (
+        retained.state in _OWNERLESS_JOURNAL_RETAINED_STATES
+        and record.phase is not ProvisioningPhase.ROLLED_BACK
+    ) or (
+        retained.state == "restored"
+        and record.phase in {ProvisioningPhase.ROLLBACK_PENDING, ProvisioningPhase.ROLLED_BACK}
+        and (
+            record.prior_snapshot.layout is StoredPanelLayout.ABSENT
+            or retained.recovery_deployment_id is not None
+        )
+    )
     return (
-        record.operation in _OWNERLESS_JOURNAL_OPERATIONS
+        settled_state
+        and record.operation in _OWNERLESS_JOURNAL_OPERATIONS
         and record.phase in _OWNERLESS_JOURNAL_PHASES
         and retained.record.transaction_id == record.transaction_id
         and retained.record.operation
         in {ProvisioningOperation.INSTALL, ProvisioningOperation.UPGRADE}
         and retained.record.panel_request.public_key == record.panel_request.public_key
         and retained.record.panel_request.fingerprint == record.panel_request.fingerprint
-        and retained.state in _OWNERLESS_JOURNAL_RETAINED_STATES
         and retained.finalization_origin is None
     )
 
