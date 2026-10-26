@@ -1141,8 +1141,14 @@ def panel_ssh_credentials_schema() -> vol.Schema:
     return vol.Schema(
         {
             vol.Required(CONF_ROOT_PASSWORD): _PASSWORD_SELECTOR,
+            vol.Optional(CONF_HOST): str,
         }
     )
+
+
+def panel_finalize_retained_schema() -> vol.Schema:
+    """Require an explicit choice before permanently removing retained recovery artifacts."""
+    return vol.Schema({vol.Required("confirm_finalize", default=False): bool})
 
 
 def _validated_panel_password(
@@ -1167,13 +1173,18 @@ def normalize_panel_ssh_credentials_input(
     """Validate one replacement SSH credential without redisplaying it."""
     errors = _unexpected_key_errors(
         user_input,
-        frozenset({CONF_ROOT_PASSWORD}),
+        frozenset({CONF_ROOT_PASSWORD, CONF_HOST}),
     )
     password = _validated_panel_password(user_input, errors)
+    host = (
+        normalize_panel_address_input({CONF_HOST: user_input[CONF_HOST]})
+        if CONF_HOST in user_input
+        else {}
+    )
     if errors:
         raise FlowInputError(errors)
     assert password is not None
-    return {CONF_ROOT_PASSWORD: password}
+    return {CONF_ROOT_PASSWORD: password, **host}
 
 
 def panel_rebind_schema(

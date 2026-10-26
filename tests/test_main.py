@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import threading
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from pathlib import Path
@@ -36,7 +35,7 @@ from brilliant_mqtt.model import BrilliantDevice, DeviceKind, Variable
 from brilliant_mqtt.protocols import CommandSubscribeError
 from brilliant_mqtt.retained_topics import RetainedLedgerError
 from brilliant_mqtt.write_admission import AdmissionTicket, WriteClass
-from tests.fakes import FakeBus, FakeClock, FakeMqtt, FakeSleeper, _panel_dimmer
+from tests.fakes import FakeBus, FakeClock, FakeMqtt, FakeSleeper, HeldWrites, _panel_dimmer
 
 HB = 10.0
 
@@ -277,6 +276,7 @@ class TestProcessLifetimeDesiredState:
             desired_panel: DesiredState | None = None,
             desired_mesh: DesiredState | None = None,
             diagnostics: object | None = None,
+            progress: main_mod._SessionProgress | None = None,
         ) -> None:
             del diagnostics
             nonlocal calls
@@ -312,6 +312,7 @@ class TestProcessLifetimeDesiredState:
             desired_panel: DesiredState | None = None,
             desired_mesh: DesiredState | None = None,
             diagnostics: object | None = None,
+            progress: main_mod._SessionProgress | None = None,
         ) -> None:
             del diagnostics
             seen.append(desired_panel)
@@ -348,6 +349,7 @@ class TestSupervisorBackoff:
             desired_panel: DesiredState | None,
             desired_mesh: DesiredState | None,
             diagnostics: object | None = None,
+            progress: main_mod._SessionProgress | None = None,
         ) -> None:
             del settings, desired_panel, desired_mesh, diagnostics
             nonlocal session_calls
@@ -378,6 +380,7 @@ class TestSupervisorBackoff:
             desired_panel: DesiredState | None,
             desired_mesh: DesiredState | None,
             diagnostics: object | None = None,
+            progress: main_mod._SessionProgress | None = None,
         ) -> None:
             del settings, desired_panel, desired_mesh, diagnostics
             raise RuntimeError("transient session failure")
@@ -416,6 +419,7 @@ class TestSupervisorBackoff:
             desired_panel: DesiredState | None,
             desired_mesh: DesiredState | None,
             diagnostics: object | None = None,
+            progress: main_mod._SessionProgress | None = None,
         ) -> None:
             del settings, desired_panel, desired_mesh, diagnostics
             nonlocal session_calls
@@ -2119,24 +2123,7 @@ async def test_stalled_ledger_claim_does_not_block_owned_off_or_teardown(
     monkeypatch.setattr(main_mod, "Bridge", make_bridge)
     clock = _LedgerClock()
     clock.install(monkeypatch)
-    loop = asyncio.get_running_loop()
-    release = threading.Event()
-    held = asyncio.Event()
-    finished = asyncio.Event()
-    real_write = retained_topics_mod._write_payload
-
-    def hold_added_load(path: Path, payload: str) -> None:
-        if added_state not in payload:
-            real_write(path, payload)
-            return
-        loop.call_soon_threadsafe(held.set)
-        release.wait()
-        try:
-            real_write(path, payload)
-        finally:
-            loop.call_soon_threadsafe(finished.set)
-
-    monkeypatch.setattr(retained_topics_mod, "_write_payload", hold_added_load)
+    writes = HeldWrites(monkeypatch, hold=lambda payload: added_state in payload)
     settings = _settings()
     object.__setattr__(settings, "retained_topics_file", str(tmp_path / "owned.json"))
     session = asyncio.create_task(main_mod._run_session(settings, None, None))
@@ -2148,7 +2135,7 @@ async def test_stalled_ledger_claim_does_not_block_owned_off_or_teardown(
         mqtt.events.clear()
 
         added = asyncio.create_task(bus.emit(_second_panel_dimmer("1")))
-        await asyncio.wait_for(held.wait(), 2)
+        await asyncio.wait_for(writes.started.wait(), 2)
         off = replace(_panel_dimmer(), variables={"on": Variable("on", "0")})
         await asyncio.wait_for(bus.emit(off), 30)
         # The OFF is not held by the stalled claim of the other load.
@@ -2166,7 +2153,7 @@ async def test_stalled_ledger_claim_does_not_block_owned_off_or_teardown(
             await asyncio.wait_for(session, 30)
 
         # Teardown completed with the write still held in its thread.
-        assert not release.is_set()
+        assert not writes.release.is_set()
         assert mqtt.events == ["state:OFF", "disconnect"]
         states = [
             json.loads(payload)["state"]
@@ -2176,9 +2163,7 @@ async def test_stalled_ledger_claim_does_not_block_owned_off_or_teardown(
         assert states == ["OFF"]
         assert all(topic != added_state for topic, _payload, _retain in mqtt.published)
     finally:
-        release.set()
-        if held.is_set():
-            await finished.wait()
+        await writes.drain()
         session.cancel()
         await asyncio.gather(session, return_exceptions=True)
         if added is not None:

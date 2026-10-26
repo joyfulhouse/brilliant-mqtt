@@ -53,6 +53,7 @@ from .panel_ops import (
     MAX_SNAPSHOT_FILE_BYTES,
     FileSnapshot,
     PanelLayout,
+    PanelOpError,
     PanelSnapshot,
     ReleaseAdmission,
     ReleaseIdentityBlocked,
@@ -62,6 +63,7 @@ from .panel_ops import (
     StagedRelease as StagedRelease,
 )
 from .provisioning_journal import (
+    PROVISIONING_ERROR_CODES,
     ProvisioningOperation,
     ProvisioningPhase,
     ProvisioningRecord,
@@ -88,42 +90,11 @@ _CORE_COMPONENTS = (
 )
 _PANEL_SLUG = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _VERSION = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._+-]{0,127}$")
-_ERROR_CODES = frozenset(
-    {
-        "duplicate_panel",
-        "activation_failed",
-        "cleanup_failed",
-        "commit_failed",
-        "health_failed",
-        "health_subscribe_failed",
-        "identity_failed",
-        "inspection_failed",
-        "invalid_panel_install_request",
-        "invalid_provisioning_dependency",
-        "journal_failed",
-        "panel_authentication_failed",
-        "preflight_failed",
-        "progress_failed",
-        "recovery_failed",
-        "release_prepare_failed",
-        "release_identity_blocked",
-        "release_unchanged",
-        "release_selection_conflict",
-        "rollback_failed",
-        "rollback_health_failed",
-        "rollback_deadline_exceeded",
-        "baseline_incomplete",
-        "rollback_credentials_unavailable",
-        "snapshot_failed",
-        "stage_failed",
-        "transaction_in_progress",
-        "unsupported_panel_toolchain",
-    }
-)
 _MAX_JSON_DEPTH = 64
 _MAX_JSON_NODES = 4096
 _PROGRESS_TIMEOUT_SECONDS = 5.0
 RECOVERY_TIMEOUT_SECONDS = 300.0
+INSTALL_LOCK_TIMEOUT_SECONDS = 30.0
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -222,7 +193,7 @@ class PanelProvisioningError(RuntimeError):
             isinstance(capability, str) and capability in PANEL_TOOLCHAIN_CAPABILITIES
         )
         if (
-            code not in _ERROR_CODES
+            code not in PROVISIONING_ERROR_CODES
             or (
                 detail is not None
                 and (
@@ -618,6 +589,9 @@ class ProvisionedPanel:
 
 
 class _Journal(Protocol):
+    async def async_begin_ownerless_finalize(
+        self, expected: RetainedRollback
+    ) -> RetainedRollback: ...
     async def async_retained_records(self) -> tuple[RetainedRollback, ...]: ...
     async def async_retained(self, transaction_id: UUID) -> RetainedRollback | None: ...
     async def async_retained_state(
@@ -838,6 +812,7 @@ class PanelProvisioner:
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         health_timeout: float = 90.0,
         credential_resolver: Callable[[StoredPanelRequest], Awaitable[str | None]] | None = None,
+        retained_owner_exists: Callable[[RetainedRollback], Awaitable[bool]] | None = None,
     ) -> None:
         self._lock = operation_lock
         self._journal = journal
@@ -858,6 +833,7 @@ class PanelProvisioner:
         self._id_factory = id_factory
         self._clock = clock
         self._credential_resolver = credential_resolver
+        self._retained_owner_exists = retained_owner_exists
         if (
             not isinstance(operation_lock, asyncio.Lock)
             or not isinstance(health_timeout, (int, float))
@@ -879,7 +855,7 @@ class PanelProvisioner:
         """Install and verify one inactive release, retaining the journal."""
         if not isinstance(request, PanelInstallRequest) or not isinstance(fleet, FleetConfig):
             raise PanelProvisioningError("invalid_panel_install_request")
-        async with self._lock:
+        async with self._async_install_lock():
             state = _InstallState()
             result: ProvisionedPanel | None = None
             primary: PanelProvisioningError | None = None
@@ -909,6 +885,13 @@ class PanelProvisioner:
                 )
             except PanelProvisioningError as error:
                 primary = error
+            except PanelOpError as error:
+                code = str(error).partition(":")[0]
+                primary = PanelProvisioningError(
+                    "snapshot_probe_failed"
+                    if state.failure_code == "snapshot_failed" and code == "snapshot_probe_failed"
+                    else state.failure_code
+                )
             except OperationError as error:
                 detail = (
                     ProvisioningFailureDetail.from_operation_error(error)
@@ -991,6 +974,18 @@ class PanelProvisioner:
             return result
 
     @asynccontextmanager
+    async def _async_install_lock(self) -> AsyncIterator[None]:
+        try:
+            async with asyncio.timeout(INSTALL_LOCK_TIMEOUT_SECONDS):
+                await self._lock.acquire()
+        except TimeoutError:
+            raise PanelProvisioningError("transaction_in_progress") from None
+        try:
+            yield
+        finally:
+            self._lock.release()
+
+    @asynccontextmanager
     async def async_managed_update(
         self,
         shell: PanelShell,
@@ -1007,7 +1002,7 @@ class PanelProvisioner:
             item.record.panel_request.fingerprint == request.fingerprint
             for item in await self._journal.async_retained_records()
         ):
-            raise PanelProvisioningError("transaction_in_progress")
+            raise PanelProvisioningError("baseline_retained_finalize_first")
         snapshot = await self._operations.snapshot_panel(shell)
         snapshot = await self._operations.capture_baseline(shell, snapshot)
         if snapshot.baseline is None:
@@ -1085,7 +1080,7 @@ class PanelProvisioner:
         if existing is not None:
             state.failure_code = "recovery_failed"
             state.failure_stage = "recovery"
-            recovery = await _settle(self._async_recover_record(existing, progress))
+            recovery = await _settle(self._async_recover_bounded(progress))
             if recovery.cancellation is not None:
                 raise recovery.cancellation
             if recovery.error is not None:
@@ -1597,6 +1592,8 @@ class PanelProvisioner:
         await _report(progress, ProvisioningProgressStage.RECOVERING)
         for retained in await self._journal.async_retained_records():
             if retained.state == "finalizing":
+                if retained.finalization_origin == "ownerless_restored":
+                    raise PanelProvisioningError("ownerless_finalize_reauthentication_required")
                 await self._async_finalize(retained)
             elif retained.state == "restore_requested":
                 password = retained.compensation_password(await self._journal.async_load())
@@ -1913,8 +1910,67 @@ class PanelProvisioner:
             retained = await self._journal.async_retained(transaction_id)
             if retained is None:
                 return
+            if retained.finalization_origin == "ownerless_restored":
+                raise PanelProvisioningError("ownerless_finalize_reauthentication_required")
             await self._journal.async_retained_state(transaction_id, "finalizing")
             await self._async_finalize(retained)
+
+    async def _async_assert_ownerless(self, expected: RetainedRollback) -> None:
+        current = await self._journal.async_retained(expected.record.transaction_id)
+        if (
+            await self._journal.async_load() is not None
+            or current != expected
+            or not expected.ownerless_finalization_allowed
+            or self._retained_owner_exists is None
+            or await self._retained_owner_exists(expected)
+        ):
+            raise PanelProvisioningError("ownerless_recovery_unavailable")
+
+    async def async_finalize_ownerless_restored(
+        self,
+        expected: RetainedRollback,
+        host: str,
+        password: str,
+        identity: HostIdentity,
+    ) -> None:
+        """Finalize one verified restore using only freshly authenticated flow authority."""
+        async with self._async_install_lock():
+            await self._async_assert_ownerless(expected)
+            request = expected.record.panel_request
+            proven = await self._identity_fetcher(host)
+            if (
+                identity.public_key != request.public_key
+                or identity.fingerprint != request.fingerprint
+                or proven != identity
+            ):
+                raise PanelProvisioningError("panel_identity_mismatch")
+            shell = self._shell_factory(host, password, request.public_key)
+            try:
+                if shell.pinned_host_key() != request.public_key:
+                    raise PanelProvisioningError("panel_identity_mismatch")
+                await shell.connect()
+                await self._async_assert_ownerless(expected)
+                marked = await self._journal.async_begin_ownerless_finalize(expected)
+                outcome = await _settle(self._async_finish_ownerless_finalize(shell, marked))
+                if outcome.cancellation is not None:
+                    raise outcome.cancellation from None
+                if outcome.error is not None:
+                    raise PanelProvisioningError("cleanup_failed") from None
+            finally:
+                closed = await _settle_close(shell.close)
+                if closed.cancellation is not None:
+                    raise closed.cancellation from None
+
+    async def _async_finish_ownerless_finalize(
+        self, shell: PanelShell, marked: RetainedRollback
+    ) -> None:
+        # A new owner or active journal must not inherit this flow's ephemeral password.
+        await self._async_assert_ownerless(marked)
+        await self._operations.finalize_baseline(
+            shell, self._snapshot_from_stored(marked.record.prior_snapshot)
+        )
+        await self._journal.async_remove_retained(marked.record.transaction_id)
+        await self._repair_reporter.async_clear_rollback_failure(marked.record.transaction_id)
 
     async def _async_finalize(self, retained: RetainedRollback) -> None:
         request = retained.record.panel_request

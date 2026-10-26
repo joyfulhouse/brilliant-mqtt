@@ -553,7 +553,8 @@ def test_future_stamp_state_reboots_once_per_cooldown_when_unwritable(
     policy = GuardPolicy()
     guard, rec = RebootGuard(str(state), policy), FakeRecovery()
     assert guard.can_request(0.0) is False  # the future stamp arms the window
-    assert guard.can_request(policy.cooldown) is True
+    assert guard.can_request(policy.cooldown) is False
+    assert guard.can_request(2 * policy.cooldown) is True
     with caplog.at_level(logging.ERROR, logger="brilliant_wifi_watchdog"):
         result = run.handle(
             Action.GPIO_RESET_REBOOT,
@@ -643,3 +644,72 @@ def test_writable_state_records_then_reboots(
     assert result == 0 and rec.calls == ["reboot"]
     assert json.loads(state.read_text(encoding="utf-8")) == [5.0]
     assert _write_failures(caplog) == []
+
+
+@pytest.fixture(autouse=True)
+def simulated_monotonic(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Legacy histories use one simulated timeline for both clocks."""
+    if request.node.name.startswith(("test_wall_jump", "test_backward_step")):
+        return
+    original = RebootGuard.can_reboot
+
+    def at(self: RebootGuard, now: float) -> bool:
+        monkeypatch.setattr("brilliant_wifi_watchdog.reboot_guard.time.monotonic", lambda: now)
+        return original(self, now)
+
+    monkeypatch.setattr(RebootGuard, "can_reboot", at)
+
+
+def test_storage_refusal_logs_once_and_keeps_retrying(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    state = tmp_path / "guard"
+    guard, rec = RebootGuard(str(state), GuardPolicy()), FakeRecovery()
+    log_state = run.RecoveryLogState()
+    original = guard.record_request
+    attempts = [0]
+
+    def unwritable(now: float) -> None:
+        attempts[0] += 1
+        if attempts[0] < 3:
+            raise PermissionError("read-only")
+        original(now)
+
+    monkeypatch.setattr(guard, "record_request", unwritable)
+    with caplog.at_level(logging.ERROR, logger="brilliant_wifi_watchdog"):
+        for now in (0.0, 30.0, 60.0):
+            run.handle(
+                Action.GPIO_RESET_REBOOT,
+                guard=guard,
+                now=now,
+                state_path=str(state),
+                reboot_eligible=True,
+                recovery_mod=rec,
+                log_state=log_state,
+            )
+    assert attempts[0] == 3
+    assert rec.calls == ["reboot"]
+    assert len(_write_failures(caplog)) == 1
+    assert len([r for r in caplog.records if "reboot refused" in r.getMessage()]) == 1
+
+
+@pytest.mark.parametrize(
+    "status, refused",
+    [
+        (probe.TcpProbe.OPEN, False),
+        (probe.TcpProbe.CLOSED, True),
+        (probe.TcpProbe.INCONCLUSIVE, True),
+    ],
+)
+def test_storage_refusal_notice_resets_only_on_gateway_recovery(
+    monkeypatch: pytest.MonkeyPatch, status: probe.TcpProbe, refused: bool
+) -> None:
+    monkeypatch.setattr(probe, "gateway_probe", lambda gateway: ("192.0.2.1", status))
+    log_state = run.RecoveryLogState(refused=True)
+    run._poll_once(
+        run.load_config({}),
+        guard=FakeGuard(True),
+        ladder=Ladder(Thresholds()),
+        log_state=log_state,
+    )
+    assert log_state.refused is refused

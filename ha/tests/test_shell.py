@@ -998,11 +998,34 @@ async def test_fake_shell_exposes_the_same_explicit_process_lifecycle() -> None:
     assert shell.commands == ["preflight"]
 
 
-class _FakeSFTP:
-    """Records recursive puts; stands in for asyncssh.SFTPClient."""
+class _UploadFile:
+    def __init__(self, owner: _FakeSFTP, path: str) -> None:
+        self.owner, self.path = owner, path
 
-    def __init__(self, connection: _SftpConnection) -> None:
-        self._connection = connection
+    async def __aenter__(self) -> _UploadFile:
+        return self
+
+    async def __aexit__(self, *exc: object) -> bool:
+        self.owner.closed.append(self.path)
+        return False
+
+    async def chmod(self, mode: int) -> None:
+        self.owner.modes[self.path] = mode
+
+    async def write(self, data: bytes) -> None:
+        assert asyncio.get_running_loop() is self.owner.loop
+        self.owner.files.setdefault(self.path, bytearray()).extend(data)
+        self.owner.chunks.append(len(data))
+
+
+class _FakeSFTP:
+    def __init__(self, existing: set[str] | None = None) -> None:
+        self.loop = asyncio.get_running_loop()
+        self.directories = existing or set()
+        self.files: dict[str, bytearray] = {}
+        self.modes: dict[str, int] = {}
+        self.chunks: list[int] = []
+        self.closed: list[str] = []
 
     async def __aenter__(self) -> _FakeSFTP:
         return self
@@ -1010,39 +1033,156 @@ class _FakeSFTP:
     async def __aexit__(self, *exc: object) -> bool:
         return False
 
-    async def put(self, local: str, remote: str, recurse: bool = False) -> None:
-        self._connection.sftp_puts.append((local, remote, recurse))
+    async def isdir(self, path: str) -> bool:
+        return path in self.directories
+
+    async def mkdir(self, path: str, attrs: object = None) -> None:
+        self.directories.add(path)
+
+    async def chmod(self, path: str, mode: int) -> None:
+        self.modes[path] = mode
+
+    async def open(self, path: str, mode: str, **kwargs: object) -> _UploadFile:
+        assert asyncio.get_running_loop() is self.loop
+        self.files[path] = bytearray()
+        return _UploadFile(self, path)
 
 
 class _SftpConnection(_FakeConnection):
-    """_FakeConnection extended with an SFTP client factory."""
-
-    def __init__(self, host_key: _FakeServerHostKey | None) -> None:
-        super().__init__(host_key)
-        self.sftp_puts: list[tuple[str, str, bool]] = []
+    def __init__(self, sftp: _FakeSFTP) -> None:
+        super().__init__(_FakeServerHostKey(b"ssh-ed25519 K\n"))
+        self.sftp = sftp
 
     async def start_sftp_client(self) -> _FakeSFTP:
-        return _FakeSFTP(self)
+        return self.sftp
 
 
-async def test_put_dir_walks_off_loop_then_uploads_recursively(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize("remote_exists", [False, True])
+async def test_put_dir_reads_local_files_off_loop_and_streams_on_owning_loop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, remote_exists: bool
 ) -> None:
-    """put_dir must not run the blocking local-tree walk inside the event loop.
+    import os
+    import threading
 
-    HA logged "Detected blocking call to scandir" for asyncssh's recursive put
-    during the 0.10.1 rollout; the walk now runs via _list_local_tree in an
-    executor, then one recursive put does the SFTP writes.
-    """
-    package = tmp_path / "pkg"
-    package.mkdir()
-    (package / "run.py").write_text("# x\n")
-    conn = _SftpConnection(_FakeServerHostKey(b"ssh-ed25519 K\n"))
-    _patch_connect(monkeypatch, conn)
+    package = tmp_path / "payload/pkg"
+    package.mkdir(parents=True)
+    data = b"payload" * 30000
+    source = package / "run.py"
+    source.write_bytes(data)
+    source.chmod(0o750)
+    (package / "empty").mkdir()
+    owner = threading.get_ident()
+    scandir, local_open, local_stat, local_read = os.scandir, os.open, os.stat, os.pread
+    observed: list[str] = []
+
+    def checked_scandir(path: str) -> Any:
+        if str(path).startswith(str(tmp_path)):
+            assert threading.get_ident() != owner
+            observed.append("scandir")
+        return scandir(path)
+
+    def checked_open(path: str, *args: Any, **kwargs: Any) -> int:
+        if str(path).startswith(str(tmp_path)):
+            assert threading.get_ident() != owner
+            observed.append("open")
+        return local_open(path, *args, **kwargs)
+
+    def checked_stat(path: str, *args: Any, **kwargs: Any) -> os.stat_result:
+        if str(path).startswith(str(tmp_path)):
+            assert threading.get_ident() != owner
+            observed.append("stat")
+        return local_stat(path, *args, **kwargs)
+
+    def checked_read(descriptor: int, size: int, offset: int) -> bytes:
+        assert threading.get_ident() != owner
+        observed.append("read")
+        return local_read(descriptor, size, offset)
+
+    monkeypatch.setattr(os, "scandir", checked_scandir)
+    monkeypatch.setattr(os, "open", checked_open)
+    monkeypatch.setattr(os, "stat", checked_stat)
+    monkeypatch.setattr(os, "pread", checked_read)
+    sftp = _FakeSFTP({"/remote/dir"} if remote_exists else None)
+    _patch_connect(monkeypatch, _SftpConnection(sftp))
     shell = AsyncsshShell("panel.local", "pw", _REAL_ED25519_PUB)
     await shell.connect()
+    await shell.put_dir(str(package.parent), "/remote/dir")
+    destination = "/remote/dir/payload" if remote_exists else "/remote/dir"
+    assert sftp.files[destination + "/pkg/run.py"] == data
+    assert sftp.modes[destination + "/pkg/run.py"] == 0o750
+    assert destination + "/pkg/empty" in sftp.directories
+    assert len(sftp.chunks) > 1 and max(sftp.chunks) <= 65536
+    assert {"scandir", "open", "stat", "read"} <= set(observed)
+    assert sftp.closed == [destination + "/pkg/run.py"]
 
-    await shell.put_dir(str(tmp_path), "/remote/dir")
 
-    assert conn.sftp_puts == [(str(tmp_path), "/remote/dir", True)]
-    assert shell_module._list_local_tree(str(tmp_path)) == [str(package / "run.py")]
+@pytest.mark.parametrize("deadline", [False, True])
+async def test_upload_settles_worker_read_before_remote_close_on_cancel(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, deadline: bool
+) -> None:
+    import threading
+
+    source = tmp_path / "payload"
+    source.mkdir()
+    (source / "data").write_bytes(b"payload")
+    entered, release = threading.Event(), threading.Event()
+    original = shell_module._read_local_chunk
+
+    def stalled(entry: shell_module._LocalUpload, offset: int) -> bytes:
+        entered.set()
+        assert release.wait(5)
+        return original(entry, offset)
+
+    monkeypatch.setattr(shell_module, "_read_local_chunk", stalled)
+    sftp = _FakeSFTP()
+    _patch_connect(monkeypatch, _SftpConnection(sftp))
+    shell = AsyncsshShell("panel.local", "pw", _REAL_ED25519_PUB)
+    await shell.connect()
+    if deadline:
+        monkeypatch.setattr(shell_module, "_OPERATION_TIMEOUT", 0.02)
+    task = asyncio.create_task(shell.put_dir(str(source), "/destination"))
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        if not deadline:
+            task.cancel()
+            task.cancel()
+        await asyncio.sleep(0.04)
+        assert not task.done()
+        assert sftp.closed == []
+        release.set()
+        with pytest.raises(TimeoutError if deadline else asyncio.CancelledError):
+            await task
+        assert sftp.closed == ["/destination/data"]
+        assert sftp.files["/destination/data"] == b""
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_put_file_streams_bytes_with_requested_mode(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "file"
+    source.write_bytes(b"complete file bytes")
+    sftp = _FakeSFTP({"/remote"})
+    _patch_connect(monkeypatch, _SftpConnection(sftp))
+    shell = AsyncsshShell("panel.local", "pw", _REAL_ED25519_PUB)
+    await shell.connect()
+    await shell.put_file(str(source), "/remote", 0o600)
+    assert sftp.files["/remote/file"] == b"complete file bytes"
+    assert sftp.modes["/remote/file"] == 0o600
+
+
+async def test_upload_rejects_symlink_without_remote_mutation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "payload"
+    source.mkdir()
+    (source / "link").symlink_to("/etc/passwd")
+    sftp = _FakeSFTP()
+    _patch_connect(monkeypatch, _SftpConnection(sftp))
+    shell = AsyncsshShell("panel.local", "pw", _REAL_ED25519_PUB)
+    await shell.connect()
+    with pytest.raises(ValueError, match="upload_source_not_regular"):
+        await shell.put_dir(str(source), "/destination")
+    assert not sftp.files and not sftp.directories

@@ -210,9 +210,17 @@ broker, command, or credential text.
 - **Check:** Compare the displayed address with the intended panel and confirm
   whether only its address or root password changed.
 - **Fix:** Use **Change address** for a network-address change or **Repair SSH
-  credentials** for a password change. Do not force an identity rebind.
+  credentials** for a password change. If both changed, supply the optional new
+  address in **Repair SSH credentials** to verify the pinned identity and save
+  both values together. Do not force an identity rebind.
 - **Retry:** Close the replacement flow and start the matching focused panel
   action. No identity, credential, or panel setting was changed.
+
+Provisioning waits at most 30 seconds for the shared operation lock. If it reports
+`transaction_in_progress`, inspect provisioning diagnostics, allow the current
+operation or recovery to finish, and retry. Waiting does not cancel the owner.
+Existing-journal recovery uses the same overall 300-second deadline as explicit
+recovery and preserves the journal if it cannot verify completion.
 
 ## Fleet and panel configuration
 
@@ -342,6 +350,10 @@ installation, component installation, and post-OTA refresh never auto-admit; the
 report `release_identity_blocked` for a pre-ordinal panel until it is updated. A
 `release_override` cannot waive that refusal; update the panel without one. Equal
 version strings do not establish identity, and digests are never ordered by age.
+When both ordinals are known, a strictly greater candidate ordinal is authoritative
+even if the version strings are equal or the incumbent version is a prerelease or
+unparseable. The strict version checks apply to unknown-ordinal admission; they do
+not override the reviewed ordering encoded by known ordinals.
 Admission happens before the operation stages a CA or changes configuration.
 Same-code configuration repair preserves the live unit, or restores a missing
 release-layout unit from `current`, without selecting the bundled legacy unit.
@@ -614,3 +626,23 @@ impostor.
 
 See also [ARCHITECTURE.md](ARCHITECTURE.md) and
 [reference/deployment.md](reference/deployment.md).
+
+Historical watchdog releases before 0.10.1 may lack their own `VERSION` marker.
+For a legacy fixed installation only, a missing watchdog marker inherits the same
+panel's installed bridge version when it is a strict stable release before
+0.11.0. An explicit `unknown` marker, standalone watchdog, or release-link layout
+does not receive this inference. The watchdog's own live bytes still determine
+its digest, and its ordinal remains unknown.
+
+An `auto-admit` audit record records admission only (`record_type: admission`,
+`deployment_status: not_recorded`). It does not establish whether deployment
+subsequently completed. Use the installed identity and health verification to
+confirm the deployed release.
+
+For a stopped pre-ordinal bridge, remove **both** watchdogs before uninstalling
+and running the canaried update, then restore the desired watchdog selections.
+A unit can remain on disk even when its Home Assistant switch reports off. In
+Developer tools > Actions, explicitly call `switch.turn_off` for that watchdog
+entity; repeated turn-off attempts still remove the remote unit. Resolve any
+reported removal failure before updating. Do not manually delete the provisioning
+journal or finalize an unverified rollback to bypass the baseline checks.

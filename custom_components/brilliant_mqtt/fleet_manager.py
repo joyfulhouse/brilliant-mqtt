@@ -88,6 +88,7 @@ from .provisioning_journal import (
     ProvisioningOperation,
     ProvisioningPhase,
     ProvisioningRecord,
+    RetainedRollback,
     StoredPanelRequest,
 )
 from .shell import (
@@ -646,6 +647,24 @@ async def _async_rollback_credential(
     return matches[0] if len(matches) == 1 else None
 
 
+async def _async_retained_owner_exists(hass: HomeAssistant, retained: RetainedRollback) -> bool:
+    """A changed pin does not erase a transaction's persisted ownership."""
+    request = retained.record.panel_request
+    if await _async_duplicate_fingerprint(hass, request.fingerprint):
+        return True
+    transaction = str(retained.record.transaction_id)
+    for entry in hass.config_entries.async_entries(DOMAIN):
+        for data in (entry.data, *(subentry.data for subentry in entry.subentries.values())):
+            if (
+                data.get(CONF_SSH_HOST_KEY) == request.public_key
+                or data.get(CONF_IDENTITY_FINGERPRINT) == request.fingerprint
+                or data.get(CONF_MANAGEMENT_ID) == request.fingerprint
+                or data.get(CONF_PROVISIONING_TRANSACTION_ID) == transaction
+            ):
+                return True
+    return False
+
+
 def _build_panel_provisioner(
     hass: HomeAssistant,
     identity_fetcher: Any,
@@ -671,6 +690,7 @@ def _build_panel_provisioner(
         broker_validator=validator,
         health_observer_factory=partial(PanelHealthObserver, hass),
         credential_resolver=partial(_async_rollback_credential, hass),
+        retained_owner_exists=partial(_async_retained_owner_exists, hass),
         transaction_lookup=partial(_async_transaction_lookup, hass),
         repair_reporter=_ProvisioningRepairReporter(hass),
     )

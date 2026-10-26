@@ -271,12 +271,14 @@
         },
         "repair_credentials": {
           "title": "Repair panel SSH credentials",
-          "description": "Replace the stored root password for this panel. Home Assistant verifies the existing pinned SSH identity before it offers the new password to the host.",
+          "description": "Replace the stored root password and, optionally, the address for this panel. Home Assistant verifies the existing pinned SSH identity at that address before it offers the new password. Both changes are stored together only after authentication succeeds.",
           "data": {
-            "root_password": "New panel root password"
+            "root_password": "New panel root password",
+            "host": "New panel IP address or hostname (optional)"
           },
           "data_description": {
-            "root_password": "The new password is stored only after authentication succeeds and is never shown again."
+            "root_password": "The new password is stored only after authentication succeeds and is never shown again.",
+            "host": "Leave unset to use the current address. Use this field when the address and root password changed together."
           }
         },
         "components": {
@@ -322,6 +324,13 @@
           "data_description": {
             "confirm": "Home Assistant rechecks the replacement identity immediately before saving. Leave this off to make no changes."
           }
+        },
+        "panel_finalize_retained": {
+          "title": "Finalize restored onboarding baseline",
+          "description": "This panel has a verified restored baseline from interrupted onboarding. Host: {host}. Pinned SSH fingerprint: {fingerprint}. Retained transaction: {transaction}. Finalization permanently removes this rollback guarantee. Confirm only after reviewing the restored panel. This does not install a release; panel setup continues after cleanup.",
+          "data": {
+            "confirm_finalize": "I confirm permanent removal of this restored rollback baseline"
+          }
         }
       },
       "progress": {
@@ -346,7 +355,7 @@
         "panel_identity_mismatch": "This address presents a different SSH identity than the one pinned for this panel. Check the address. If you intentionally replaced the physical panel, use Replace physical panel and review both fingerprints.",
         "rebind_identity_unchanged": "The proposed replacement presents the panel's current SSH identity. Use Change network address or Repair SSH credentials instead.",
         "rebind_identity_changed": "The replacement SSH identity changed after the confirmation screen opened. No settings were changed. Check the address and start Replace physical panel again.",
-        "confirmation_required": "Explicitly confirm the detected replacement identity to continue.",
+        "confirmation_required": "Explicitly confirm this action to continue.",
         "panel_authentication_failed": "The panel rejected the root password.",
         "firmware_unknown": "The panel firmware could not be identified.",
         "inspection_failed": "The panel could not be inspected safely.",
@@ -392,7 +401,7 @@
         "commit_failed": "The installed panel could not be committed to durable Home Assistant storage.",
         "rollback_failed": "Automatic rollback did not finish. Follow the provisioning recovery instructions before retrying.",
         "recovery_failed": "A prior provisioning transaction could not be recovered automatically.",
-        "transaction_in_progress": "Another panel provisioning transaction is still being recovered.",
+        "transaction_in_progress": "Another panel operation holds the shared lock or a provisioning transaction still needs recovery. Check diagnostics, allow recovery to finish, and retry.",
         "provisioning_failed": "Panel provisioning failed. Review the integration logs and recovery instructions before retrying.",
         "invalid_cadence": "Enter a whole number of seconds within the documented range.",
         "baseline_incomplete": "The complete rollback baseline is unavailable. Keep the installed release and follow docs/canary-rollback.md before retrying.",
@@ -401,7 +410,11 @@
         "rollback_health_failed": "Restored bytes did not pass fresh MQTT verification. Keep the baseline and journal, check panel and broker connectivity, then retry.",
         "release_identity_blocked": "Installed code differs and release ordering is unknown or not increasing. Review the exact release override before retrying.",
         "release_unchanged": "The selected installed code already matches. Code selection and layout are unchanged.",
-        "release_selection_conflict": "Some installed components already match. Update differing components individually to preserve their code selection."
+        "release_selection_conflict": "Some installed components already match. Update differing components individually to preserve their code selection.",
+        "baseline_retained_finalize_first": "This panel retains a canary rollback baseline. After sign-off, explicitly finalize that baseline using its transaction name before updating again. See docs/canary-rollback.md.",
+        "snapshot_probe_failed": "The panel service snapshot could not be read safely. Wait for restarting services to settle, check panel connectivity, and retry. No candidate was staged.",
+        "ownerless_recovery_unavailable": "This retained baseline is owned, still in use, or not verified restored. Preserve the journal and baseline. Finish recovery or use the owning panel's canary actions; do not delete private storage to retry.",
+        "ownerless_finalize_reauthentication_required": "Retained baseline cleanup requires fresh authentication. Start Add Brilliant panel again with the panel address and root password, verify its pinned identity, and explicitly confirm cleanup. Interrupted cleanup remains retained."
       },
       "abort": {
         "already_configured": "Panel `{panel_name}` is already configured.",

@@ -77,12 +77,19 @@ verified absence and does not claim a predecessor MQTT session.
 Keep the baseline, journal, and HA panel configuration. Do not delete private
 files to silence a repair issue, and do not finalize a failed recovery. Repairs
 surface stable failure codes; remote stderr and raw stored dictionaries are not
-operator output.
+operator output. Diagnostics identify the active journal's `name`, `panel`,
+`operation`, `phase`, and allowlisted `last_error` when present, independently of
+whether that panel has an HA owner. `last_error: null` means no error was saved,
+including failures before durable error recording; it does not mean recovery
+succeeded. `unknown` means a token was deliberately withheld. Older failures
+cannot be reconstructed from phase alone. Preserve the journal and baseline
+while obtaining redacted diagnostics and the HA repair/log code.
 
 | Code/state | Operator action |
 | --- | --- |
 | `baseline_capture_failed`, `baseline_verify_failed` | Candidate mutation is refused. Preserve the incumbent; investigate missing/drifting code, permissions, free space, or capture bounds before retrying. |
-| `transaction_in_progress` | Check diagnostics for an in-flight operation or retained baseline. Finish recovery, or intentionally finalize a successful canary before the next update. |
+| `transaction_in_progress` | Check diagnostics for an in-flight operation. Allow recovery to finish and retry. |
+| `baseline_retained_finalize_first` | A rollback baseline remains for this panel. Keep it through the agreed soak. After sign-off, explicitly run Finalize retained canary with its transaction name before another update; rejection leaves the baseline intact. |
 | `rollback_credentials_unavailable` | Restore the exact HA panel owner/configuration and its pinned host identity; then retry. Do not enable automatic host-key trust. |
 | `rollback_health_failed` | Bytes may already be restored. Check HA's broker connection and panel connectivity. Retained MQTT history cannot satisfy this check. Retry after resolving connectivity. |
 | `rollback_deadline_exceeded` | Treat recovery as unverified. The pending journal remains; remote restore processes are terminated and settled before reuse. Resolve connectivity/storage delays before retrying. |
@@ -159,3 +166,29 @@ The broker test uses `uv` to run pinned `amqtt==0.11.3` in a disposable Python 3
 environment, listens only on loopback at an OS-assigned port, and shuts down the
 process after the test. Sanitized measured recovery/reconnect durations are printed
 by the test. Those measurements are rehearsal evidence, not a production SLA.
+
+## Restored baseline without an HA panel owner
+
+An interrupted Add Brilliant panel operation can successfully restore its prior
+state before any panel subentry was created. Its verified `restored` baseline
+still protects that result. To intentionally remove that guarantee, start **Add
+Brilliant panel** and enter the panel's current address and root password.
+Home Assistant matches the retained address or SSH identity and compares both
+stored identity fields before offering the fresh password. A moved address works
+when it presents the same retained identity. A conflicting identity is refused.
+
+After authentication, an explicit confirmation names the transaction, host and
+fingerprint and explains the permanent loss. Cleanup proceeds only while no
+configuration entry owns the pin or transaction and no execution journal exists.
+It accepts verified restored onboarding baselines, including a verified
+first-install undo to absence. It never accepts armed, soaking, failed, or
+unverified recovery states. Successful cleanup continues normal panel setup;
+it does not automatically install a release.
+
+Fresh login credentials remain in the active flow only and are never written to
+retained metadata. If cleanup is interrupted after durable intent, its
+`ownerless_restored` finalization marker preserves that provenance. Background
+recovery does not reuse stored credentials to finish this operation. Start Add
+Brilliant panel again, authenticate freshly and confirm again. Unmarked older
+`finalizing` records are not accepted through this path because their original
+state cannot be proven; preserve those records for investigation.

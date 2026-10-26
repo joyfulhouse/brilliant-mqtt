@@ -11,13 +11,16 @@ from __future__ import annotations
 import logging
 import logging.handlers
 import os
+import signal
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from types import FrameType
 from typing import Any, Protocol
 
 from . import bounded, probe
-from .health import bus_failure_age, heartbeat_age
+from .health import BusFailureObserver, bus_failure_age, heartbeat_age
 from .reboot import reboot as _reboot
 from .reboot_guard import GuardPolicy, RebootGuard
 
@@ -169,44 +172,55 @@ def _configure_logging(path: str) -> None:
     _LOG.setLevel(logging.INFO)
 
 
+def _stop_by_sigterm(signum: int, frame: FrameType | None) -> None:
+    _LOG.info(
+        "stopped by SIGTERM at %s", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    )
+    raise SystemExit(0)
+
+
 def main() -> None:  # pragma: no cover - thin loop
     cfg = load_config(os.environ)
     _configure_logging(cfg.log_path)
-    guard = RebootGuard(cfg.state_path, cfg.policy)
-    started_at = time.time()
-    while True:
-        now = time.time()
-        age = heartbeat_age(cfg.heartbeat_path, now=now, started_at=started_at)
-        gw = cfg.gateway or probe.default_gateway()
-        gateway_up = probe.ping(gw) if gw else False
-        active = _service_active(cfg.bridge_service)
-        service_started_at = _service_started_at(cfg.bridge_service)
-        failure_age = (
-            bus_failure_age(
+    previous_handler = signal.signal(signal.SIGTERM, _stop_by_sigterm)
+    try:
+        guard = RebootGuard(cfg.state_path, cfg.policy)
+        failure_observer = BusFailureObserver()
+        started_at = time.time()
+        while True:
+            now = time.time()
+            age = heartbeat_age(cfg.heartbeat_path, now=now, started_at=started_at)
+            gw = cfg.gateway or probe.default_gateway()
+            gateway_up = probe.ping(gw) if gw else False
+            active = _service_active(cfg.bridge_service)
+            service_started_at = _service_started_at(cfg.bridge_service)
+            sampled_failure_age = bus_failure_age(
                 cfg.phase_path,
                 now=time.monotonic(),
                 service_started_at=service_started_at,
+                observer=failure_observer,
             )
-            if service_started_at is not None
-            else None
-        )
-        should = should_reboot(
-            age=age,
-            bridge_active=active,
-            gateway_up=gateway_up,
-            bus_failure_age=failure_age,
-            stale_after=cfg.stale_after,
-        )
-        _LOG.info(
-            "age=%.0fs bridge_active=%s gateway_up=%s bus_failure_age=%s should=%s",
-            age,
-            active,
-            gateway_up,
-            "none" if failure_age is None else f"{failure_age:.0f}s",
-            should,
-        )
-        handle(should=should, guard=guard, now=now, state_path=cfg.state_path)
-        time.sleep(cfg.interval)
+            failure_age = sampled_failure_age if service_started_at is not None else None
+            should = should_reboot(
+                age=age,
+                bridge_active=active,
+                gateway_up=gateway_up,
+                bus_failure_age=failure_age,
+                stale_after=cfg.stale_after,
+            )
+            _LOG.info(
+                "age=%.0fs bridge_active=%s gateway_up=%s bus_failure_age=%s should=%s",
+                age,
+                active,
+                gateway_up,
+                "none" if failure_age is None else f"{failure_age:.0f}s",
+                should,
+            )
+            handle(should=should, guard=guard, now=now, state_path=cfg.state_path)
+            time.sleep(cfg.interval)
+
+    finally:
+        signal.signal(signal.SIGTERM, previous_handler)
 
 
 if __name__ == "__main__":  # pragma: no cover

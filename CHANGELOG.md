@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.3] - 2026-10-23
+
+The on-panel agent and Home Assistant integration both move to 0.11.3. The
+bundled bridge and watchdog payload carries release ordinal 5; the separately
+versioned voice payload remains at 0.1.1. Qualify this release on a canary panel
+before updating the remaining panels.
+
+### Fixed
+
+- The bus watchdog remembers an independently observed live writer releasing its
+  phase-marker lease, so stale failed-attempt evidence stays revoked after that
+  writer exits. Failed continuing bus-attempt writes retain their lease. This
+  reduces the read-only-filesystem residual in #143; entirely unsampled recovery
+  and watchdog-restart ambiguity still require a separate delivery contract.
+- Watchdog reboot guards reject unsafe state files and preserve their rolling
+  reboot limits across clock corrections. Wi-Fi storage refusals log once per
+  outage while continuing to retry the storage operation.
+- Scene events and results wait for their own state to persist before MQTT
+  delivery. Retained-ledger loading has a deadline, and orphan cleanup preserves
+  temporary files belonging to other ledgers.
+- Panel credential repair accepts a changed address and password together while
+  preserving the stored SSH identity. Updates explain when an earlier rollback
+  baseline needs explicit finalization, and snapshot probe failures include
+  safe retry guidance.
+- Onboarding can explicitly finalize a verified restored baseline that has no
+  Home Assistant owner, using fresh credentials and the retained SSH identity.
+  Interrupted cleanup requires fresh authorization on retry and never persists
+  the submitted password in retained rollback metadata.
+- Onboarding bounds operation-lock and recovery waits. Payload uploads perform
+  local filesystem work outside Home Assistant's event loop and settle an
+  in-flight read before cancellation closes the remote stream.
+- Legacy watchdogs without a VERSION file can inherit a verified same-panel
+  pre-0.11.0 bridge version. Admission audit records distinguish admission from
+  verified deployment; stopped legacy recovery covers both watchdog units.
+
+- MQTT connection failures use capped exponential retry delays. Repeated bus
+  starts fenced by unresolved cleanup eventually exit for a systemd restart;
+  `BUS_FENCED_START_LIMIT` configures the threshold (default three).
+- Both watchdogs record a persistent UTC shutdown marker on SIGTERM.
+- Ignored transition fields no longer prevent safe partial command merging, and
+  discarded folded commands produce a warning without exposing payloads.
+
+### Changed
+
+- BLE mesh peripherals appear as separate Home Assistant devices, with their
+  primary and auxiliary entities grouped together. Entity unique IDs and MQTT
+  topics remain stable across this change and mesh leader changes.
+
 ## [0.11.2] - 2026-10-01
 
 The on-panel agent and Home Assistant integration both move to 0.11.2. The
@@ -1071,7 +1119,8 @@ panel redeploy is needed.
 - JoyfulHouse OSS docs standard: LICENSE (MIT), INSTALL.md, CHANGELOG.md,
   FUNDING.yml, CODEOWNERS, and the canonical `docs/` set.
 
-[Unreleased]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.11.2...HEAD
+[Unreleased]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.11.3...HEAD
+[0.11.3]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.11.2...v0.11.3
 [0.11.2]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.11.1...v0.11.2
 [0.11.1]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.10.0...v0.11.0

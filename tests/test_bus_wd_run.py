@@ -227,14 +227,17 @@ def _write_failures(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]
 
 
 def test_bad_state_write_failure_reboots_but_rearms_after_restart(
-    tmp_path: Any, caplog: pytest.LogCaptureFixture
+    tmp_path: Any, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    tick = [0.0]
+    monkeypatch.setattr("brilliant_bus_watchdog.reboot_guard.time.monotonic", lambda: tick[0])
     state = tmp_path / "guard"
     state.mkdir()
     policy = GuardPolicy(cooldown=10.0, cap=3, window=60.0)
     guard = RebootGuard(str(state), policy)
     assert guard.can_reboot(0.0) is False
     reboots: list[str] = []
+    tick[0] = 10.0
     with caplog.at_level(logging.ERROR, logger="brilliant_bus_watchdog"):
         handle(
             should=True,
@@ -248,6 +251,7 @@ def test_bad_state_write_failure_reboots_but_rearms_after_restart(
     assert str(state) in _write_failures(caplog)[0].getMessage()
     fresh = RebootGuard(str(state), policy)
     assert fresh.can_reboot(20.0) is False
+    tick[0] += 10.0
     assert fresh.can_reboot(30.0) is True
 
 

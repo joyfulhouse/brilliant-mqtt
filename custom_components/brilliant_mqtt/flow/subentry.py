@@ -379,9 +379,10 @@ class PanelSubentryFlow(ConfigSubentryFlow, _PanelOnboardingMixin):
                 errors = dict(error.errors)
             else:
                 password = normalized[CONF_ROOT_PASSWORD]
+                host = normalized.get(CONF_HOST, current.host)
                 failure = await self._async_verify_existing_panel(
                     current,
-                    host=current.host,
+                    host=host,
                     root_password=password,
                 )
                 if failure is None:
@@ -396,6 +397,7 @@ class PanelSubentryFlow(ConfigSubentryFlow, _PanelOnboardingMixin):
                         subentry,
                         data={
                             **subentry.data,
+                            CONF_HOST: host,
                             CONF_ROOT_PASSWORD: password,
                         },
                     )

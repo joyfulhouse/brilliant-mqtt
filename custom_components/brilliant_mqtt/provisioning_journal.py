@@ -127,6 +127,64 @@ _SNAPSHOT_KEYS = frozenset(
         "selected_components",
     }
 )
+PROVISIONING_ERROR_CODES = frozenset(
+    {
+        "duplicate_panel",
+        "activation_failed",
+        "cleanup_failed",
+        "commit_failed",
+        "health_failed",
+        "health_subscribe_failed",
+        "identity_failed",
+        "panel_identity_mismatch",
+        "ownerless_recovery_unavailable",
+        "ownerless_finalize_reauthentication_required",
+        "inspection_failed",
+        "invalid_panel_install_request",
+        "invalid_provisioning_dependency",
+        "journal_failed",
+        "panel_authentication_failed",
+        "preflight_failed",
+        "progress_failed",
+        "recovery_failed",
+        "release_prepare_failed",
+        "release_identity_blocked",
+        "release_unchanged",
+        "release_selection_conflict",
+        "rollback_failed",
+        "rollback_health_failed",
+        "rollback_deadline_exceeded",
+        "baseline_incomplete",
+        "baseline_retained_finalize_first",
+        "rollback_credentials_unavailable",
+        "snapshot_failed",
+        "snapshot_probe_failed",
+        "stage_failed",
+        "transaction_in_progress",
+        "unsupported_panel_toolchain",
+    }
+)
+
+_DIAGNOSTIC_ERROR_STAGES = frozenset(
+    {
+        "cleanup",
+        "progress",
+        "journal",
+        "recovery",
+        "identity",
+        "authentication",
+        "inspection",
+        "release",
+        "snapshot",
+        "stage",
+        "preflight",
+        "health",
+        "activation",
+        "rollback",
+    }
+)
+_DIAGNOSTIC_RECOVERY_CODES = frozenset({"recovery_interrupted", "flow_aborted"})
+
 _ERROR_KEYS = frozenset({"stage", "code"})
 _JOURNAL_ERROR_CODES = frozenset(
     {
@@ -870,9 +928,16 @@ class RetainedRollback:
     record: ProvisioningRecord = field(repr=False)
     state: str = "armed"
     recovery_deployment_id: str | None = None
+    finalization_origin: str | None = None
 
     def __post_init__(self) -> None:
         if self.state not in _RETAINED_STATES or self.record.prior_snapshot.baseline is None:
+            raise _invalid()
+        if self.finalization_origin is not None and (
+            self.finalization_origin != "ownerless_restored"
+            or self.state != "finalizing"
+            or not self.ownerless_finalization_allowed
+        ):
             raise _invalid()
         if (
             self.recovery_deployment_id is not None
@@ -897,6 +962,21 @@ class RetainedRollback:
 
     def __repr__(self) -> str:
         return "RetainedRollback(<redacted>)"
+
+    @property
+    def ownerless_finalization_allowed(self) -> bool:
+        return (
+            self.record.operation in {ProvisioningOperation.INSTALL, ProvisioningOperation.UPGRADE}
+            and (
+                self.state == "restored"
+                or self.state == "finalizing"
+                and self.finalization_origin == "ownerless_restored"
+            )
+            and (
+                self.record.prior_snapshot.layout is StoredPanelLayout.ABSENT
+                or self.recovery_deployment_id is not None
+            )
+        )
 
     def compensation_password(self, current: ProvisioningRecord | None) -> str | None:
         """Use only the matching active onboarding journal's temporary authority."""
@@ -937,15 +1017,21 @@ class RetainedRollback:
         request = self.record.panel_request._to_storage()
         del request["root_password"]
         record["panel_request"] = request
-        return {
+        payload: dict[str, object] = {
             "record": record,
             "state": self.state,
             "recovery_deployment_id": self.recovery_deployment_id,
         }
+        if self.finalization_origin is not None:
+            payload["finalization_origin"] = self.finalization_origin
+        return payload
 
     @classmethod
     def _from_storage(cls, raw: object) -> RetainedRollback:
-        value = _exact_keys(raw, frozenset({"record", "state", "recovery_deployment_id"}))
+        keys = frozenset({"record", "state", "recovery_deployment_id"})
+        if isinstance(raw, Mapping) and "finalization_origin" in raw:
+            keys |= {"finalization_origin"}
+        value = _exact_keys(raw, keys)
         record = dict(_exact_keys(value["record"], _RECORD_KEYS))
         request = dict(
             _exact_keys(record["panel_request"], _PANEL_REQUEST_KEYS - {"root_password"})
@@ -956,6 +1042,7 @@ class RetainedRollback:
             ProvisioningRecord._from_storage(record),
             _string(value["state"]),
             _optional_string(value["recovery_deployment_id"]),
+            _optional_string(value.get("finalization_origin")),
         )
 
 
@@ -1076,6 +1163,25 @@ class ProvisioningJournal:
     async def async_retained_records(self) -> tuple[RetainedRollback, ...]:
         async with self._coordinator.lock:
             return tuple((await self._async_retained_load()).values())
+
+    async def async_begin_ownerless_finalize(self, expected: RetainedRollback) -> RetainedRollback:
+        """Publish fresh operator intent only for this exact verified, ownerless restore."""
+        async with self._coordinator.lock:
+            await self._async_reload()
+            records = await self._async_retained_load()
+            key = str(expected.record.transaction_id)
+            current = records.get(key)
+            if (
+                self._coordinator.record is not None
+                or current is None
+                or current != expected
+                or not current.ownerless_finalization_allowed
+            ):
+                raise ProvisioningJournalError("invalid_journal_transition")
+            marked = replace(current, state="finalizing", finalization_origin="ownerless_restored")
+            records[key] = marked
+            await self._async_retained_save(records)
+            return marked
 
     async def _async_retained_state(
         self,
@@ -1267,15 +1373,35 @@ class ProvisioningJournal:
                 await self._async_retained_state(transaction_id, "restored")
             await self._async_remove()
 
-    async def async_diagnostics(self) -> dict[str, int | str | None]:
-        """Expose only transaction count and phase, never journal contents."""
+    async def async_diagnostics(self) -> dict[str, object]:
+        """Expose allowlisted transaction identity and errors, never recovery secrets."""
         if not self._coordinator.loaded:
             await self.async_load()
         record = self._coordinator.record
-        return {
+        output: dict[str, object] = {
             "count": 0 if record is None else 1,
             "phase": None if record is None else record.phase.value,
         }
+        if record is not None:
+            error = record.last_error
+            output.update(
+                {
+                    "name": str(record.transaction_id),
+                    "panel": record.panel_request.slug,
+                    "operation": record.operation.value,
+                    "last_error": None
+                    if error is None
+                    else {
+                        "stage": error.stage
+                        if error.stage in _DIAGNOSTIC_ERROR_STAGES
+                        else "unknown",
+                        "code": error.code
+                        if error.code in PROVISIONING_ERROR_CODES | _DIAGNOSTIC_RECOVERY_CODES
+                        else "unknown",
+                    },
+                }
+            )
+        return output
 
     async def _async_reload(self) -> None:
         """Refresh the shared committed view while holding the HA-wide lock."""

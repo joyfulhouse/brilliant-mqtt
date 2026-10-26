@@ -1317,7 +1317,8 @@ class TestM11MeshEndToEnd:
         assert len(configs) == 1
         data = json.loads(configs[0][1])
         assert data["availability"][0]["topic"] == "brilliant/mesh/availability"
-        assert data["device"]["name"] == "Brilliant BLE Mesh"
+        assert data["device"]["name"] == mesh_dimmer.name
+        assert data["device"]["identifiers"] == [f"brilliant_mesh_{MESH_PID}"]
         assert data["device"]["model"] == "BLE Mesh"
         assert data["state_topic"] == f"brilliant/mesh/{MESH_PID}/state"
         assert data["command_topic"] == f"brilliant/mesh/{MESH_PID}/set"

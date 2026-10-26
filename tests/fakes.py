@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import threading
 import types
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import replace
+from pathlib import Path
 from typing import Any, Protocol
 
 import aiomqtt
@@ -21,6 +23,7 @@ import pytest
 
 from brilliant_ha_mirror.mapping import HaEntity, PeripheralSpec, ServiceCall
 from brilliant_mqtt import mqttio
+from brilliant_mqtt import retained_topics as retained_topics_module
 from brilliant_mqtt.commands import VarSet
 from brilliant_mqtt.model import BrilliantDevice, CaptureProvenance, DeviceKind, Variable
 from brilliant_mqtt.write_admission import AdmissionTicket, WriteClass
@@ -759,3 +762,34 @@ def _msg(topic: str, payload: bytes = b"x") -> aiomqtt.Message:
         mid=0,
         properties=None,
     )
+
+
+class HeldWrites:
+    """Hold matching ledger writes in their worker thread until released."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, *, hold: Callable[[str], bool]) -> None:
+        self._hold = hold
+        self._loop = asyncio.get_running_loop()
+        self.release = threading.Event()
+        self.started = asyncio.Event()
+        self.finished = asyncio.Event()
+        self.submitted: list[str] = []
+        self._real_write = retained_topics_module._write_payload
+        monkeypatch.setattr(retained_topics_module, "_write_payload", self._write)
+
+    def _write(self, path: Path, payload: str) -> None:
+        self.submitted.append(payload)
+        if not self._hold(payload):
+            self._real_write(path, payload)
+            return
+        self._loop.call_soon_threadsafe(self.started.set)
+        self.release.wait()
+        try:
+            self._real_write(path, payload)
+        finally:
+            self._loop.call_soon_threadsafe(self.finished.set)
+
+    async def drain(self) -> None:
+        self.release.set()
+        if self.started.is_set():
+            await self.finished.wait()
