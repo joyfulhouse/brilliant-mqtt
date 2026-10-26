@@ -60,7 +60,11 @@ class FakeShell:
         pinned: str | None = "ssh-ed25519 FAKEKEY",
         run_errors: dict[str, Exception] | None = None,
         processes: dict[str, FakePanelProcess] | None = None,
+        reached_auth: bool = False,
     ) -> None:
+        # Whether a failed connect() had reached SSH authentication (the password
+        # may have been offered), which makes the failure non-retryable (#219).
+        self.reached_auth = reached_auth
         self.responses = dict(responses or {})
         self.connect_error = connect_error
         self.put_dir_error = put_dir_error
@@ -99,6 +103,9 @@ class FakeShell:
 
     def pinned_host_key(self) -> str | None:
         return self._pinned
+
+    def connect_reached_auth(self) -> bool:
+        return self.reached_auth
 
     async def connect(self) -> None:
         self.connect_count += 1

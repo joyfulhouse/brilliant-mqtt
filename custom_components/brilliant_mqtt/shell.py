@@ -383,6 +383,7 @@ class PanelShell(Protocol):
     async def put_dir(self, local_dir: str, remote_dir: str) -> None: ...
     async def put_file(self, local_path: str, remote_path: str, mode: int) -> None: ...
     def pinned_host_key(self) -> str | None: ...
+    def connect_reached_auth(self) -> bool: ...
 
 
 class PanelProcess(Protocol):
@@ -535,6 +536,16 @@ class _AsyncsshPanelProcess:
         return RunResult(exit_status=exit_status, stdout=stdout, stderr=stderr)
 
 
+class _AuthProgressClient(asyncssh.SSHClient):
+    """Records the moment asyncssh begins user authentication on a connect."""
+
+    def __init__(self, on_begin_auth: Callable[[], None]) -> None:
+        self._on_begin_auth = on_begin_auth
+
+    def begin_auth(self, username: str) -> None:
+        self._on_begin_auth()
+
+
 class _ShellOperations:
     """Connected AsyncSSH operations shared by fleet and legacy adapters."""
 
@@ -544,9 +555,26 @@ class _ShellOperations:
         self._pinned = pinned_host_key
         self._conn: asyncssh.SSHClientConnection | None = None
         self._children: set[_AsyncsshPanelProcess] = set()
+        self._reached_auth = False
 
     def pinned_host_key(self) -> str | None:
         return self._pinned
+
+    def connect_reached_auth(self) -> bool:
+        """Whether a connect reached SSH user authentication.
+
+        asyncssh calls ``SSHClient.begin_auth`` after key exchange and service
+        accept, immediately before it sends the first userauth request. While this
+        is False the password has never been offered on this shell, so a failed
+        connect is safe to retry without contributing to an auth lockout.
+        """
+        return self._reached_auth
+
+    def _client_factory(self) -> asyncssh.SSHClient:
+        return _AuthProgressClient(self._mark_reached_auth)
+
+    def _mark_reached_auth(self) -> None:
+        self._reached_auth = True
 
     async def close(self) -> None:
         conn = self._conn
@@ -748,6 +776,7 @@ class AsyncsshShell(_ShellOperations):
             kbdint_auth=False,
             connect_timeout=_CONNECT_TIMEOUT,
             login_timeout=_LOGIN_TIMEOUT,
+            client_factory=self._client_factory,
         )
 
 
@@ -782,6 +811,7 @@ class _LegacyAsyncsshShell(_ShellOperations):
             kbdint_auth=False,
             connect_timeout=_CONNECT_TIMEOUT,
             login_timeout=_LOGIN_TIMEOUT,
+            client_factory=self._client_factory,
         )
         if self._pinned is None:
             key = conn.get_server_host_key()

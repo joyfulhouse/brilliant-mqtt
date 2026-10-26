@@ -2309,8 +2309,9 @@ async def test_agent_update_step_failure_escalates_and_raises(
     ("connect_error", "expected_diagnostic", "reason"),
     [
         (
-            OSError(113, "No route to host"),
-            "OSError 113 No route to host",
+            # asyncio's real message: the address must never reach the log.
+            OSError(113, "Connect call failed ('192.168.1.10', 22)"),
+            "OSError 113 EHOSTUNREACH",
             "agent update could not connect to the panel after 5 attempts",
         ),
         (
@@ -2352,6 +2353,7 @@ async def test_agent_update_connect_failure_logs_diagnostics_without_changing_re
         record.levelno == logging.WARNING and record.getMessage() == expected_message
         for record in caplog.records
     )
+    assert "192.168.1.10" not in repr(caplog.messages)
 
 
 async def test_agent_update_failure_redacts_every_outward_surface(

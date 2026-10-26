@@ -130,17 +130,24 @@ _SHELL_CLOSE_TIMEOUT_SECONDS = 5.0
 # Bounded retry of the agent update's PRE-MUTATION SSH connect (#219). Transient
 # reachability faults (a stale neighbor entry on HA's VLAN leg, a panel Wi-Fi blip)
 # clear by waiting. Backoff before retry n is min(cap, base * 2**(n-1)) scaled by a
-# jitter factor in [0.5, 1.0]; no retry is scheduled whose backoff would end past the
-# overall deadline, measured from the first attempt. Each attempt is itself bounded
-# by the shell's connect timeout, so the worst case is the deadline plus one connect.
+# jitter factor in [0.5, 1.0]. The deadline starts when the FIRST attempt acquires
+# the fleet SSH lock, so time queued behind other panels' operations never consumes
+# the budget. After that: no retry is scheduled whose backoff would end past the
+# deadline, a retry's wait for the fleet lock is cut off at the deadline, and a retry
+# that gets the lock after the deadline does not connect. Total time after the first
+# lock acquisition is therefore at most the deadline plus one connect attempt (the
+# shell's connect timeout; two for an opt-in legacy re-pin, which is never retried).
 _CONNECT_RETRY_MAX_ATTEMPTS = 5
 _CONNECT_RETRY_BASE_DELAY_S = 5.0
 _CONNECT_RETRY_MAX_DELAY_S = 30.0
 _CONNECT_RETRY_DEADLINE_S = 120.0
 _CONNECT_RETRY_JITTER_MIN = 0.5
-# Pre-authentication network faults only. Authentication, host-key, key-exchange and
-# protocol failures are permanent: password-only root SSH must never be retried into
-# a lockout, and a changed host key must never be retried around.
+# Network faults only. Authentication, host-key, key-exchange and protocol failures
+# are permanent: password-only root SSH must never be retried into a lockout, and a
+# changed host key must never be retried around. These classes can still occur
+# AFTER asyncssh began user authentication (connect_timeout spans the handshake and
+# auth), so the retry loop additionally refuses any failure whose shell reports
+# connect_reached_auth(): only a connect that never offered the password repeats.
 _TRANSIENT_CONNECT_ERRNOS: dict[int, str] = {
     errno.EHOSTUNREACH: "host_unreachable",
     errno.EHOSTDOWN: "host_unreachable",
@@ -245,15 +252,29 @@ class _ConnectTrace:
     # Set once the opt-in unpinned re-pin connect starts: it offers the password to
     # a host presenting a NEW key, so a failure from that point is never retried.
     repin_started: bool = False
+    # Set when a failed connect had reached SSH user authentication, so the
+    # password may have been offered: never retried (lockout avoidance).
+    reached_auth: bool = False
 
 
 class _PanelConnectFailed(Exception):
-    """The update connect stage gave up; carries the last failure and attempt count."""
+    """The update connect stage gave up; carries the last failure and attempt count.
 
-    def __init__(self, error: OSError | asyncssh.Error, attempts: int) -> None:
-        super().__init__(type(error).__name__)
+    ``shutdown`` marks a stop caused by the entry unloading rather than by the
+    panel, which must not raise a panel Repair issue.
+    """
+
+    def __init__(
+        self,
+        error: OSError | asyncssh.Error | None,
+        attempts: int,
+        *,
+        shutdown: bool = False,
+    ) -> None:
+        super().__init__(type(error).__name__ if error is not None else "shutdown")
         self.error = error
         self.attempts = attempts
+        self.shutdown = shutdown
 
 
 def _safe_failure_summary(summary: str, error: BaseException | None = None) -> str:
@@ -270,8 +291,18 @@ def _safe_failure_summary(summary: str, error: BaseException | None = None) -> s
 
 
 def _log_connect_failure(panel: str, error: OSError | asyncssh.Error) -> None:
-    """Log the connect exception type and operator-safe diagnostic fields."""
-    details = f"{error.errno} {error.strerror}" if isinstance(error, OSError) else str(error)
+    """Log the connect exception type and operator-safe diagnostic fields.
+
+    An OSError logs its errno and symbolic name, never ``strerror``: asyncio's
+    connect failures read ``Connect call failed ('<address>', 22)``.
+    """
+    if isinstance(error, OSError):
+        code = error.errno
+        details = (
+            f"{code} {errno.errorcode.get(code, 'unknown')}" if code is not None else "no errno"
+        )
+    else:
+        details = str(error)
     _LOGGER.warning(
         "%s: panel connect failed: %s %s",
         panel,
@@ -639,6 +670,8 @@ class PanelManager:
             await self._async_close_shell(shell)
             raise
         except BaseException:
+            if trace is not None:
+                trace.reached_auth = shell.connect_reached_auth()
             await self._async_close_shell_or_raise(shell)
             raise
         return shell
@@ -661,31 +694,58 @@ class PanelManager:
 
         Raises ``_PanelConnectFailed`` (with the attempt count) for an exhausted,
         expired or permanent connect failure; ``_HostKeyChanged`` and identity errors
-        propagate unchanged on their first occurrence. Cancellation (HA shutdown,
-        entity removal) interrupts the backoff immediately; a latched shutdown stops
-        retrying at the next decision point.
+        propagate unchanged on their first occurrence. A failure is retried only when
+        it is a classified network fault, the shell never reached SSH user
+        authentication (the password was not offered), and it was not the opt-in
+        re-pin connect. Cancellation (HA shutdown, entity removal) interrupts the
+        backoff or a lock wait immediately; a latched shutdown is re-checked after
+        every lock acquisition and after every backoff and stops without connecting.
+        The deadline runs from the first lock acquisition (see the constants).
         """
-        deadline = _connect_retry_clock() + _CONNECT_RETRY_DEADLINE_S
+        deadline: float | None = None
         attempt = 0
+        failure: OSError | asyncssh.Error | None = None
         try:
             while True:
                 attempt += 1
                 trace = _ConnectTrace()
-                async with self._ssh_lock:
+                if deadline is None:
+                    await self._ssh_lock.acquire()
+                    deadline = _connect_retry_clock() + _CONNECT_RETRY_DEADLINE_S
+                else:
+                    remaining = deadline - _connect_retry_clock()
+                    if remaining <= 0:
+                        raise _PanelConnectFailed(failure, attempt - 1) from None
+                    try:
+                        async with asyncio.timeout(remaining):
+                            await self._ssh_lock.acquire()
+                    except TimeoutError:
+                        raise _PanelConnectFailed(failure, attempt - 1) from None
+                try:
+                    if self._shutting_down:
+                        raise _PanelConnectFailed(failure, attempt - 1, shutdown=True)
+                    if attempt > 1 and _connect_retry_clock() > deadline:
+                        raise _PanelConnectFailed(failure, attempt - 1)
                     try:
                         shell = await self._connect_for_repair(trace)
                     except (OSError, asyncssh.Error) as error:
-                        failure: OSError | asyncssh.Error = error
+                        failure = error
                     else:
                         self._set_update_connect_retry(None)
                         yield shell
                         return
+                finally:
+                    self._ssh_lock.release()
                 _log_connect_failure(self.panel, failure)
                 reason = (
-                    None if trace.repin_started else _classify_transient_connect_failure(failure)
+                    None
+                    if trace.repin_started or trace.reached_auth
+                    else _classify_transient_connect_failure(failure)
                 )
-                if reason is None or attempt >= _CONNECT_RETRY_MAX_ATTEMPTS or self._shutting_down:
+                if reason is None or attempt >= _CONNECT_RETRY_MAX_ATTEMPTS:
                     raise _PanelConnectFailed(failure, attempt) from None
+                if self._shutting_down:
+                    raise _PanelConnectFailed(failure, attempt, shutdown=True) from None
                 delay = _connect_retry_delay(attempt)
                 if _connect_retry_clock() + delay > deadline:
                     raise _PanelConnectFailed(failure, attempt) from None
@@ -707,7 +767,7 @@ class PanelManager:
                 )
                 await _connect_retry_sleep(delay)
                 if self._shutting_down:
-                    raise _PanelConnectFailed(failure, attempt) from None
+                    raise _PanelConnectFailed(failure, attempt, shutdown=True) from None
         finally:
             if self.update_connect_retry is not None:
                 self._set_update_connect_retry(None)
@@ -1707,6 +1767,14 @@ class PanelManager:
                         translation_domain=DOMAIN, translation_key="host_key_changed"
                     ) from None
                 except _PanelConnectFailed as failed:
+                    if failed.shutdown:
+                        # The entry is unloading/reloading — not a panel fault, so no
+                        # Repair issue; the service call still reports the stop.
+                        raise self._translated_failure(
+                            "update_failed",
+                            "agent update stopped before connecting because the "
+                            "integration is unloading",
+                        ) from None
                     summary = "agent update could not connect to the panel"
                     if failed.attempts > 1:
                         summary = f"{summary} after {failed.attempts} attempts"
