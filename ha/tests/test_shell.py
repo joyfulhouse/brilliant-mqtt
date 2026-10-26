@@ -764,6 +764,36 @@ async def test_first_contact_without_host_key_fails_closed(
     assert shell.pinned_host_key() is None
 
 
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_connect_reports_whether_authentication_began(
+    monkeypatch: pytest.MonkeyPatch, legacy: bool
+) -> None:
+    """A connect failure is retry-safe only while asyncssh never reached auth (#219)."""
+    calls: list[asyncssh.SSHClient] = []
+
+    async def failing_connect(host: str, **kwargs: object) -> _FakeConnection:
+        factory = kwargs["client_factory"]
+        assert callable(factory)
+        client = factory()
+        assert isinstance(client, asyncssh.SSHClient)
+        calls.append(client)
+        if len(calls) == 2:
+            client.begin_auth("root")  # asyncssh calls this right before userauth
+        raise TimeoutError
+
+    monkeypatch.setattr(asyncssh, "connect", failing_connect)
+    for expected in (False, True):
+        shell: AsyncsshShell | _LegacyAsyncsshShell = (
+            _LegacyAsyncsshShell("192.168.1.10", "pw", _REAL_ED25519_PUB)
+            if legacy
+            else AsyncsshShell("192.168.1.10", "pw", _REAL_ED25519_PUB)
+        )
+        assert shell.connect_reached_auth() is False
+        with pytest.raises(TimeoutError):
+            await shell.connect()
+        assert shell.connect_reached_auth() is expected
+
+
 async def test_double_connect_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     conn = _FakeConnection(_FakeServerHostKey(b"ssh-ed25519 K\n"))
     _patch_connect(monkeypatch, conn)
