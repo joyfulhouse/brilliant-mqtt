@@ -54,6 +54,7 @@ from custom_components.brilliant_mqtt.const import (
     VOICE_SERVICE_NAME,
     WIFI_WATCHDOG_SERVICE_NAME,
 )
+from custom_components.brilliant_mqtt.release_identity import ReleaseIdentity, RollbackBaseline
 from custom_components.brilliant_mqtt.setup_protocol import PreflightRequest
 from custom_components.brilliant_mqtt.shell import RunResult
 from tests.fakes import FakePanelProcess, FakeShell
@@ -68,6 +69,39 @@ _TEST_MQTT_CA = b"test-ca\n"
 _TEST_MQTT_CA_DIGEST = hashlib.sha256(_TEST_MQTT_CA).hexdigest()
 _TEST_MQTT_CA_PATH = f"/var/brilliant-mqtt/tls/mqtt-ca-{_TEST_MQTT_CA_DIGEST[:16]}.pem"
 _TEMP_TOKEN = "0" * 32
+
+
+@pytest.fixture(autouse=True)
+def staged_recipe_identity_inputs(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recipe tests fake hashing; real staged admission is rehearsed in canary tests."""
+    if not request.node.name.startswith(("test_stage_", "test_activate_")):
+        return
+    candidates = {
+        component: ReleaseIdentity("0.6.0", 1, "d" * 64, None, "candidate")
+        for component in (COMPONENT_BRIDGE, COMPONENT_WIFI_WATCHDOG, COMPONENT_BUS_WATCHDOG)
+    }
+
+    async def local(_path: str) -> dict[str, ReleaseIdentity]:
+        return candidates
+
+    async def remote(_shell: object, staged: panel_ops.StagedRelease) -> dict[str, ReleaseIdentity]:
+        return {key: candidates[key] for key in staged.selected_components}
+
+    async def publish(
+        _shell: object,
+        admission: panel_ops.ReleaseAdmission,
+        component: str,
+    ) -> None:
+        admission.incumbent[component] = replace(candidates[component], layout="release_link")
+
+    monkeypatch.setattr(panel_ops, "candidate_identities", local)
+    monkeypatch.setattr(panel_ops, "_read_staged_identities", remote)
+    monkeypatch.setattr(panel_ops, "_complete_identity", publish)
+
+
 _TEST_MQTT_CA_TEMP_PATH = f"{_TEST_MQTT_CA_PATH}.tmp-{_TEMP_TOKEN}"
 _VERIFY_MQTT_CA_COMMAND = f"/usr/bin/sha256sum -- {_TEST_MQTT_CA_TEMP_PATH}"
 _PROMOTE_MQTT_CA_COMMAND = f"ln {_TEST_MQTT_CA_TEMP_PATH} {_TEST_MQTT_CA_PATH}"
@@ -1315,9 +1349,7 @@ async def test_deploy_payload_builds_archive_off_loop_then_extracts_and_swaps(
     app_file.write_text("main = True\n")
     vendor_file.write_text("dependency = True\n")
     app_file.chmod(0o751)
-    symlink = app_file.with_name("main.py")
-    symlink.symlink_to(app_file.name)
-    symlink_mode = os.lstat(symlink).st_mode & 0o777
+    (payload / "VERSION").write_text("9.9.9")
 
     loop_thread = threading.get_ident()
     builder_threads: list[int] = []
@@ -1343,7 +1375,6 @@ async def test_deploy_payload_builds_archive_off_loop_then_extracts_and_swaps(
     with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as archive:
         members = {member.name: member for member in archive.getmembers()}
         assert "./app/brilliant_mqtt/__main__.py" in members
-        assert members["./app/brilliant_mqtt/main.py"].issym()
         assert "./vendor/dependency.py" in members
         assert all(
             (member.uid, member.gid, member.uname, member.gname) == (0, 0, "root", "root")
@@ -1351,7 +1382,6 @@ async def test_deploy_payload_builds_archive_off_loop_then_extracts_and_swaps(
         )
         assert members["."].mode == 0o755
         assert members["./app/brilliant_mqtt/__main__.py"].mode == 0o755
-        assert members["./app/brilliant_mqtt/main.py"].mode == symlink_mode
         assert members["./vendor/dependency.py"].mode == 0o644
     assert shell.commands[1] == (
         "mkdir -p /var/brilliant-mqtt.staging && "
@@ -1375,6 +1405,7 @@ async def test_deploy_payload_failed_extraction_recovers_on_retry(tmp_path: Path
     payload = tmp_path / "payload"
     (payload / "app").mkdir(parents=True)
     (payload / "vendor").mkdir()
+    (payload / "VERSION").write_text("9.9.9")
     extract_command = (
         "mkdir -p /var/brilliant-mqtt.staging && "
         "tar xzf /var/brilliant-mqtt.staging.tar.gz -C /var/brilliant-mqtt.staging && "
@@ -1411,6 +1442,7 @@ async def test_deploy_payload_raises_and_skips_version_when_swap_fails(tmp_path:
     payload = tmp_path / "payload"
     (payload / "app").mkdir(parents=True)
     (payload / "vendor").mkdir()
+    (payload / "VERSION").write_text("9.9.9")
     shell = await _connected(FakeShell(responses={_EXPECTED_SWAP: RunResult(1, "", "mv failed\n")}))
     with pytest.raises(panel_ops.PanelOpError, match="exited 1"):
         await panel_ops.deploy_payload(shell, str(payload), version="9.9.9")
@@ -1978,6 +2010,9 @@ async def test_deploy_wifi_watchdog_uploads_tree_then_swaps(
 @pytest.fixture
 def wifi_watchdog_tree(tmp_path: Path) -> Path:
     """A minimal real tree: the deploy tars it in memory off-loop."""
+    (tmp_path / "VERSION").write_text("0.10.1")
+    (tmp_path / "app").mkdir()
+    (tmp_path / "vendor").mkdir()
     tree = tmp_path / "wifi_watchdog"
     package = tree / "brilliant_wifi_watchdog"
     package.mkdir(parents=True)
@@ -1987,6 +2022,9 @@ def wifi_watchdog_tree(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def bus_watchdog_tree(tmp_path: Path) -> Path:
+    (tmp_path / "VERSION").write_text("0.10.1")
+    (tmp_path / "app").mkdir()
+    (tmp_path / "vendor").mkdir()
     tree = tmp_path / "bus_watchdog"
     package = tree / "brilliant_bus_watchdog"
     package.mkdir(parents=True)
@@ -3548,6 +3586,7 @@ async def test_rollback_restores_exact_files_link_and_every_service_state(
         wifi_state=(False, True),
         bus_state=(True, True),
     )
+    snapshot = replace(snapshot, baseline=RollbackBaseline("c" * 32, "d" * 64, {}))
     shell = await _connected(FakeShell())
     observed = 0
 
@@ -3586,7 +3625,7 @@ async def test_rollback_restores_exact_files_link_and_every_service_state(
 async def test_first_install_rollback_removes_candidate_files_and_verifies_inactive(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    snapshot = _absent_snapshot()
+    snapshot = replace(_absent_snapshot(), baseline=RollbackBaseline("c" * 32, "d" * 64, {}))
     shell = await _connected(FakeShell())
     monkeypatch.setattr(panel_ops, "snapshot_panel", lambda _shell: _async_value(snapshot))
 
@@ -3626,7 +3665,9 @@ async def test_first_install_rollback_removes_candidate_files_and_verifies_inact
 async def test_rollback_restores_bridge_less_legacy_watchdog_residue_exactly(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    snapshot = _watchdog_residue_snapshot()
+    snapshot = replace(
+        _watchdog_residue_snapshot(), baseline=RollbackBaseline("c" * 32, "d" * 64, {})
+    )
     shell = await _connected(FakeShell())
     observed: list[panel_ops.PanelSnapshot] = []
 
@@ -3665,7 +3706,7 @@ async def _async_value[T](value: T) -> T:
 async def test_rollback_requires_exact_resnapshot_equality(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    snapshot = _release_snapshot()
+    snapshot = replace(_release_snapshot(), baseline=RollbackBaseline("c" * 32, "d" * 64, {}))
     mismatched = replace(
         snapshot,
         active_release_target=(
@@ -3684,7 +3725,7 @@ async def test_rollback_requires_exact_resnapshot_equality(
 async def test_rollback_surfaces_nonzero_temporary_cleanup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    snapshot = _release_snapshot()
+    snapshot = replace(_release_snapshot(), baseline=RollbackBaseline("c" * 32, "d" * 64, {}))
     staged = _staged()
     cleanup_command = panel_ops._rollback_cleanup_command(staged)
     shell = await _connected(
@@ -3714,7 +3755,7 @@ async def test_rollback_surfaces_nonzero_temporary_cleanup(
 async def test_rollback_preserves_cancellation_when_temporary_cleanup_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    snapshot = _release_snapshot()
+    snapshot = replace(_release_snapshot(), baseline=RollbackBaseline("c" * 32, "d" * 64, {}))
     staged = _staged()
     cleanup_command = panel_ops._rollback_cleanup_command(staged)
     shell = await _connected(

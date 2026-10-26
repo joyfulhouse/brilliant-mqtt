@@ -295,10 +295,28 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
             await manager.async_repair(trigger="service")
 
     async def _redeploy(call: ServiceCall) -> None:
-        await _apply_to_all(call, lambda m: m.async_update_agent())
+        override = call.data.get("release_override")
+        if override is None:
+            await _apply_to_all(call, lambda m: m.async_update_agent())
+            return
+        managers = await _managers_for(call)
+        if len(managers) != 1 or not isinstance(override, dict):
+            raise HomeAssistantError("release_override requires exactly one targeted panel")
+        await managers[0].async_update_agent(release_override=override)
 
     async def _uninstall(call: ServiceCall) -> None:
         await _apply_to_all(call, lambda m: m.async_uninstall())
+
+    async def _canary(call: ServiceCall) -> None:
+        managers = await _managers_for(call)
+        if len(managers) != 1 or _TARGET_KEYS.isdisjoint(call.data):
+            raise HomeAssistantError(
+                "canary recovery requires exactly one explicitly targeted panel"
+            )
+        name = call.data.get("name")
+        if not isinstance(name, str):
+            raise HomeAssistantError("canary recovery requires the retained baseline name")
+        await managers[0].async_canary_operation(call.service.removeprefix("canary_"), name)
 
     async def _reboot(call: ServiceCall) -> None:
         collect = bool(call.data.get("collect_diagnostics", True))
@@ -328,6 +346,8 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
 
     hass.services.async_register(DOMAIN, "repair", _repair, schema=_SERVICE_SCHEMA)
     hass.services.async_register(DOMAIN, "redeploy", _redeploy, schema=_SERVICE_SCHEMA)
+    hass.services.async_register(DOMAIN, "canary_rollback", _canary, schema=_SERVICE_SCHEMA)
+    hass.services.async_register(DOMAIN, "canary_finalize", _canary, schema=_SERVICE_SCHEMA)
     hass.services.async_register(DOMAIN, "uninstall", _uninstall, schema=_SERVICE_SCHEMA)
     hass.services.async_register(DOMAIN, "reboot", _reboot, schema=_REBOOT_SCHEMA)
     hass.services.async_register(DOMAIN, "run_scene", _run_scene, schema=_RUN_SCENE_SCHEMA)

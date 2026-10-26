@@ -366,6 +366,8 @@ def write_phase(
         and last_failed_attempt is not None
         and now - last_failed_attempt < _MIN_WRITE_INTERVAL_S
     ):
+        _release_phase_lease(path)
+        _owned_phase_records.pop(path, None)
         return False
     if (
         phase == "bus"
@@ -440,6 +442,14 @@ def write_phase(
                 _last_attempt.pop(path, None)
                 return True
             _owned_phase_records.pop(path, None)
+            if phase == "bus" and not bus_read_succeeded and lease is not None:
+                # A failed bus attempt is still a failure. Keep its independent
+                # lease evidence even when every marker write is unavailable.
+                if previous is not None:
+                    _owned_phase_records[path] = previous
+                _last_attempt[path] = now
+                logger.warning("bus attempt marker write failed for %s; prior lease retained", path)
+                return False
             _release_phase_lease(path)
             _last_attempt[path] = now
             _invalidate_failed_write(path, write_error, repeated=repeated_failure)
@@ -470,6 +480,10 @@ def write_phase(
         return False
     except (OSError, UnicodeError) as error:
         _owned_phase_records.pop(path, None)
+        if phase == "bus" and not bus_read_succeeded and lease is not None:
+            _last_attempt[path] = now
+            logger.warning("bus attempt marker unavailable for %s; prior lease retained", path)
+            return False
         _release_phase_lease(path)
         _last_attempt[path] = now
         _invalidate_failed_write(path, error, repeated=repeated_failure)

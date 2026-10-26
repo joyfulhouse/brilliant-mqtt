@@ -114,6 +114,17 @@ class Settings:
     scene_bridge_enabled: bool = False
     scene_watermark_file: str = "/data/brilliant-mqtt/scene-watermarks.json"
 
+    # Exit the process after this many consecutive unresolved-close fences.
+    bus_fenced_start_limit: int = 3
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.bus_fenced_start_limit, bool)
+            or not isinstance(self.bus_fenced_start_limit, int)
+            or self.bus_fenced_start_limit < 1
+        ):
+            raise ValueError("BUS_FENCED_START_LIMIT must be a positive integer")
+
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
         """Construct Settings from environment variables.
@@ -130,6 +141,7 @@ class Settings:
                   RECONNECT_STORM_THRESHOLD (default 20: reconnects within the
                   window that trip a session rebuild; 0 disables),
                   RECONNECT_STORM_WINDOW_SECONDS (default 60),
+                  BUS_FENCED_START_LIMIT (default 3, positive integer),
                   MOTION_RECONCILE_ENABLED (default "1"; "0"/"false"/"off"/"no"
                   disable, "1"/"true"/"on"/"yes" enable, anything else raises),
                   MOTION_RECONCILE_MIN_INTERVAL_S (default 60.0, must be >= 0),
@@ -238,6 +250,7 @@ class Settings:
             mesh_heartbeat_seconds=mesh_heartbeat_seconds,
             reconnect_storm_threshold=reconnect_storm_threshold,
             reconnect_storm_window_seconds=reconnect_storm_window_seconds,
+            bus_fenced_start_limit=int(env.get("BUS_FENCED_START_LIMIT", "3")),
             motion_reconcile_enabled=motion_reconcile_enabled,
             motion_reconcile_min_interval_s=motion_reconcile_min_interval_s,
             motion_reconcile_max_writes_per_tick=motion_reconcile_max_writes_per_tick,

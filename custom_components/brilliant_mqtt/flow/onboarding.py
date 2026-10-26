@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import Mapping
 from types import MappingProxyType
@@ -32,6 +33,7 @@ from ..panel_provisioner import (
     ProvisioningProgress,
     ProvisioningProgressStage,
 )
+from ..provisioning_journal import RetainedRollback
 from ..shell import HostIdentity, PanelIdentityError
 from . import gateway
 from .schemas import (
@@ -43,6 +45,7 @@ from .schemas import (
     panel_confirm_schema,
     panel_connect_form_source,
     panel_connect_schema,
+    panel_finalize_retained_schema,
 )
 from .support import (
     _CORE_COMPONENTS,
@@ -86,6 +89,9 @@ class _PanelOnboardingMixin:
     _provision_fleet: FleetConfig | None
     _recovery_task: asyncio.Task[bool] | None
     _onboarding_committed: bool
+    _release_override: Mapping[str, object] | None
+    _identity_refusal: Mapping[str, object] | None
+    _retained_finalize: RetainedRollback | None
 
     def _init_panel_onboarding(self) -> None:
         self._panel_host = None
@@ -105,6 +111,9 @@ class _PanelOnboardingMixin:
         self._provision_fleet = None
         self._recovery_task = None
         self._onboarding_committed = False
+        self._release_override = None
+        self._identity_refusal = None
+        self._retained_finalize = None
 
     def _onboarding_parent_entry(self) -> ConfigEntry[Any] | None:
         raise NotImplementedError
@@ -206,6 +215,9 @@ class _PanelOnboardingMixin:
     def _remove_panel_onboarding(self) -> None:
         """Schedule settlement when HA removes a marked flow before commit."""
         context = cast(dict[str, Any], cast(_FlowSurface, self).context)
+        if self._retained_finalize is not None:
+            self._retained_finalize = None
+            self._panel_root_password = None
         if (
             context.pop(CONF_PROVISIONING_TRANSACTION_ID, None) is not None
             and not self._onboarding_committed
@@ -227,8 +239,13 @@ class _PanelOnboardingMixin:
         self._panel_host = host
         self._panel_root_password = root_password
         self._panel_ssh_username = normalized[CONF_SSH_USERNAME]
+        self._retained_finalize = None
+        self._panel_facts = None
         try:
             identity = await gateway.async_fetch_host_identity(host)
+            retained = await gateway.async_ownerless_recovery_candidate(
+                cast(_FlowSurface, self).hass, host, identity
+            )
             duplicate = _duplicate_panel(
                 self._onboarding_parent_entry(),
                 identity.fingerprint,
@@ -242,10 +259,12 @@ class _PanelOnboardingMixin:
                 identity,
             )
         except asyncio.CancelledError:
+            self._panel_root_password = None
             raise
         except asyncssh.HostKeyNotVerifiable:
             return {}, _panel_failure("host_key_changed", stage="panel_ssh"), None
         except asyncssh.PermissionDenied:
+            self._panel_root_password = None
             return (
                 {},
                 _panel_failure(
@@ -256,14 +275,20 @@ class _PanelOnboardingMixin:
             )
         except PanelIdentityError as error:
             return {}, _panel_failure(error.code, stage="panel_identity"), None
+        except PanelProvisioningError as error:
+            self._panel_root_password = None
+            return {}, _provisioning_failure(error), None
         except PanelCompatibilityError as error:
             return {}, _panel_failure(error.code, stage="panel_inspection"), None
         except (OSError, asyncssh.Error):
+            self._panel_root_password = None
             return {}, _panel_failure("cannot_connect", stage="panel_ssh"), None
         except Exception:
+            self._panel_root_password = None
             return {}, _panel_failure("inspection_failed", stage="panel_inspection"), None
 
         self._panel_identity = identity
+        self._retained_finalize = retained
         self._panel_facts = facts
         self._panel_failure = None
         return {}, None, None
@@ -286,6 +311,8 @@ class _PanelOnboardingMixin:
                     },
                 )
             if not errors and failure is None:
+                if self._retained_finalize is not None:
+                    return await self.async_step_panel_finalize_retained()
                 return await self.async_step_panel_confirm()
             self._panel_failure = failure
 
@@ -300,11 +327,64 @@ class _PanelOnboardingMixin:
             ),
         )
 
+    async def async_step_panel_finalize_retained(
+        self, user_input: dict[str, Any] | None = None
+    ) -> _OnboardingResult:
+        flow = cast(_FlowSurface, self)
+        retained = self._retained_finalize
+        identity, host, password = self._panel_identity, self._panel_host, self._panel_root_password
+        if retained is None or identity is None or host is None or password is None:
+            return flow.async_abort(reason="invalid_flow_state")
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            if user_input.get("confirm_finalize") is not True:
+                errors["base"] = "confirmation_required"
+            else:
+                try:
+                    if self._onboarding_parent_entry() is None:
+                        return flow.async_abort(reason="invalid_parent")
+                    provisioner = gateway._get_panel_provisioner(
+                        flow.hass, expected_identity=identity
+                    )
+                    await provisioner.async_finalize_ownerless_restored(
+                        retained, host, password, identity
+                    )
+                except asyncio.CancelledError:
+                    self._retained_finalize = None
+                    self._panel_root_password = None
+                    raise
+                except PanelProvisioningError as error:
+                    self._retained_finalize = None
+                    self._panel_root_password = None
+                    self._panel_failure = _provisioning_failure(error)
+                    return await self.async_step_panel_connect()
+                except Exception:
+                    self._retained_finalize = None
+                    self._panel_root_password = None
+                    self._panel_failure = _panel_failure(
+                        "ownerless_finalize_reauthentication_required", stage="recovery"
+                    )
+                    return await self.async_step_panel_connect()
+                self._retained_finalize = None
+                return await self.async_step_panel_confirm()
+        return flow.async_show_form(
+            step_id="panel_finalize_retained",
+            data_schema=panel_finalize_retained_schema(),
+            errors=errors,
+            description_placeholders={
+                "transaction": str(retained.record.transaction_id),
+                "fingerprint": identity.fingerprint,
+                "host": host,
+            },
+        )
+
     async def async_step_panel_confirm(
         self,
         user_input: dict[str, Any] | None = None,
     ) -> _OnboardingResult:
         flow = cast(_FlowSurface, self)
+        if self._panel_failure is not None and self._panel_failure.code == "release_unchanged":
+            return flow.async_abort(reason="release_unchanged")
         identity = self._panel_identity
         facts = self._panel_facts
         if identity is None or facts is None:
@@ -383,6 +463,10 @@ class _PanelOnboardingMixin:
                         )
                         self._provisioned = None
                         self._panel_failure = None
+                        override = user_input.get("release_override")
+                        self._release_override = (
+                            dict(override) if isinstance(override, dict) else None
+                        )
                         self._provision_task = flow.hass.async_create_task(
                             self._async_provision(),
                             "brilliant-mqtt-panel-provision",
@@ -393,10 +477,15 @@ class _PanelOnboardingMixin:
         suggested_name = self._panel_name or _suggested_panel_name(facts)
         return flow.async_show_form(
             step_id="panel_confirm",
-            data_schema=panel_confirm_schema(suggested_name),
+            data_schema=panel_confirm_schema(
+                suggested_name, allow_override=self._identity_refusal is not None
+            ),
             errors=errors or ({"base": failure.code} if failure is not None else {}),
             description_placeholders={
                 **_facts_placeholders(facts),
+                "release_override": json.dumps(dict(self._identity_refusal))
+                if self._identity_refusal
+                else "",
                 **(
                     failure.placeholders()
                     if failure is not None
@@ -440,6 +529,7 @@ class _PanelOnboardingMixin:
             request,
             fleet,
             self._async_report_provisioning_progress,
+            **({"release_override": self._release_override} if self._release_override else {}),
         )
         context = cast(dict[str, Any], cast(_FlowSurface, self).context)
         context[CONF_PROVISIONING_TRANSACTION_ID] = str(provisioned.transaction_id)
@@ -479,6 +569,8 @@ class _PanelOnboardingMixin:
         except asyncio.CancelledError:
             raise
         except PanelProvisioningError as error:
+            self._release_override = None
+            self._identity_refusal = error.release_override
             self._panel_failure = _provisioning_failure(error)
             cast(dict[str, Any], flow.context).pop(
                 CONF_PROVISIONING_TRANSACTION_ID,

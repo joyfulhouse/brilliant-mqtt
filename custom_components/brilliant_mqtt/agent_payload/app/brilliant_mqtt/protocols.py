@@ -24,12 +24,20 @@ class CommandSubscribeError(RuntimeError):
 class BusClient(Protocol):
     """Adapter for the Brilliant panel's internal message bus."""
 
+    @property
+    def capture_generation(self) -> int:
+        """Current source generation, advanced before reconnect callbacks or reads."""
+        ...
+
     async def start(self) -> None:
         """Connect to the bus and begin receiving updates."""
         ...
 
     async def get_all(self) -> list[BrilliantDevice]:
         """Return all peripherals already scoped to this panel.
+
+        Wired primary loads must carry capture_provenance stamped when the
+        adapter copies each native read result, before delivery to the bridge.
 
         Raises built-in ``TimeoutError`` or ``asyncio.TimeoutError`` when a
         scoped panel RPC misses its request deadline (the panel runs Python
@@ -38,7 +46,10 @@ class BusClient(Protocol):
         ...
 
     async def get_peripheral(self, device_id: str, peripheral_id: str) -> BrilliantDevice | None:
-        """Return one peripheral via a scoped on-demand read, if present."""
+        """Return one peripheral via a scoped on-demand read, if present.
+
+        Stamp wired primary capture_provenance when copying the read result.
+        """
         ...
 
     def on_change(
@@ -52,6 +63,8 @@ class BusClient(Protocol):
 
         Coalescing consumers receive the newest pending device snapshot;
         lossless consumers receive every pushed snapshot in arrival order.
+        Wired primary pushes must carry capture_provenance stamped when the
+        adapter copies the notification, before callback delivery.
 
         *want_device* is a live scope predicate keyed by the raw push's bus
         device id (``None`` = wants every device, the default). The adapter
@@ -115,6 +128,9 @@ class BusClient(Protocol):
         Returns a SMALL normalized receipt describing the transport's
         acknowledgement, or the explicit non-error Superseded outcome. A ticket
         lets the command lane adopt the replacement without admitting it twice.
+        For an issued wired write, call ticket.mark_issued with the current
+        capture provenance after admission and the per-device lock, immediately
+        before sending the native RPC. Omitting this disables the capture fence.
         """
         ...
 

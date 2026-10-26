@@ -210,9 +210,17 @@ broker, command, or credential text.
 - **Check:** Compare the displayed address with the intended panel and confirm
   whether only its address or root password changed.
 - **Fix:** Use **Change address** for a network-address change or **Repair SSH
-  credentials** for a password change. Do not force an identity rebind.
+  credentials** for a password change. If both changed, supply the optional new
+  address in **Repair SSH credentials** to verify the pinned identity and save
+  both values together. Do not force an identity rebind.
 - **Retry:** Close the replacement flow and start the matching focused panel
   action. No identity, credential, or panel setting was changed.
+
+Provisioning waits at most 30 seconds for the shared operation lock. If it reports
+`transaction_in_progress`, inspect provisioning diagnostics, allow the current
+operation or recovery to finish, and retry. Waiting does not cancel the owner.
+Existing-journal recovery uses the same overall 300-second deadline as explicit
+recovery and preserves the journal if it cannot verify completion.
 
 ## Fleet and panel configuration
 
@@ -321,12 +329,109 @@ fan out across every targeted panel:
 | Service | What it does |
 |---|---|
 | `brilliant_mqtt.repair` | Restore unit/env from known-good sources and start the agent (same as the repair button). Failures are escalated per panel, not raised. |
-| `brilliant_mqtt.redeploy` | Force-push the bundled agent payload and restart — the fleet-wide equivalent of the update entity's install. |
+| `brilliant_mqtt.redeploy` | Install the bundled agent payload when its release identity is admitted, then restart; identical code preserves the installed selection. |
 | `brilliant_mqtt.uninstall` | Stop, disable, and **remove** the agent from the panel (explicit only — never on entry removal). |
 
 `redeploy` and `uninstall` attempt **every** targeted panel and then raise one
 aggregated error naming any that failed (so a single bad panel never silently
 skips the rest of a fleet wave).
+
+### Release identity admission
+
+Update, redeploy, repair, bridge installation, and selected watchdog writers share
+one release policy. Equal code digests keep the installed code and layout. Different
+code requires a strictly greater, known `release_ordinal` on both sides, except for
+the first upgrade from a pre-ordinal release. An incumbent with unknown ordinal
+auto-admits only when its version is a strict `X.Y.Z` below 0.11.0 and the
+candidate has an ordinal and a strict `X.Y.Z` version of 0.11.0 or newer, and
+only on the Update entity, `redeploy`, and panel provisioning, which run the canary
+and retain a rollback baseline. Repair (automatic, button, or service), bridge
+installation, component installation, and post-OTA refresh never auto-admit; they
+report `release_identity_blocked` for a pre-ordinal panel until it is updated. A
+`release_override` cannot waive that refusal; update the panel without one. Equal
+version strings do not establish identity, and digests are never ordered by age.
+When both ordinals are known, a strictly greater candidate ordinal is authoritative
+even if the version strings are equal or the incumbent version is a prerelease or
+unparseable. The strict version checks apply to unknown-ordinal admission; they do
+not override the reviewed ordering encoded by known ordinals.
+Admission happens before the operation stages a CA or changes configuration.
+Same-code configuration repair preserves the live unit, or restores a missing
+release-layout unit from `current`, without selecting the bundled legacy unit.
+
+Existing installations are enrolled by hashing their selected code trees. Their
+ordinal is initially **unknown**, even if their `VERSION` matches the bundle.
+An unparseable, missing, prerelease, or 0.11.0-or-newer incumbent version with
+unknown ordinal requires explicit approval for a change to different code.
+Automatic pre-ordinal admission writes a private metadata-only
+`auto-admit-<transaction>.json` record before deployment and logs one INFO line
+with the panel, components, versions, and ordinals (never digests). It does not
+change baseline retention or the canary rollback process.
+
+#### Recovering a stopped pre-ordinal bridge
+
+The canaried update snapshots the panel and captures a rollback baseline before
+any write. The snapshot probe reads `systemctl is-active` for each core service:
+`active` counts as running, while `inactive`, `failed`, and `unknown` count as
+stopped. Any other state, such as the transitional `activating`, `deactivating`,
+or `reloading`, fails the snapshot probe itself (`snapshot_probe_failed`). The
+update then stops earlier, before any write, and reports only the generic "agent
+update failed during deployment". Retry once the unit has settled. For an
+installed panel, the baseline capture then requires the bridge to be running and
+`/etc/brilliant-mqtt.env` to exist. If the bridge is stopped or the file is
+missing, it stops with `baseline_correlation_unsupported` before any write. A
+panel with no agent layout at all is exempt from the baseline requirement. The
+requirement holds because rollback restarts the restored bridge with the retained
+environment and waits for a fresh MQTT session.
+
+In 0.11.1 only, Repair would auto-admit, re-lay the unit and restart a stopped
+legacy bridge; 0.11.0 already blocked it with `release_identity_blocked`. Repair
+can no longer replace pre-ordinal code, so a pre-0.11.0 panel whose bridge is
+`inactive` or `failed`, or whose environment file is missing, needs one of these:
+
+1. **Start the bridge, then update.** If the unit and environment file are still
+   present, start `brilliant-mqtt` on the panel. Once
+   `systemctl is-active brilliant-mqtt` prints `active`, run the Update entity or
+   `brilliant_mqtt.redeploy` without an override.
+2. **Remove the watchdogs, uninstall, then update.** If the bridge cannot start:
+   1. Turn off the panel's **Wi-Fi watchdog** and **Bus watchdog** component
+      switches, for whichever of them are on. Uninstall removes only the bridge,
+      and a watchdog unit left under `/etc/systemd/system` keeps the agent layout
+      installed, so the update would still stop with
+      `baseline_correlation_unsupported`.
+   2. Run `brilliant_mqtt.uninstall` for that panel. The panel must have no
+      retained baseline (`baseline_retained_finalize_first` otherwise). This stops
+      and removes the agent's unit, environment and `/var/brilliant-mqtt`,
+      including the old identity records.
+   3. Run the Update entity. The panel now has no agent layout, so the canary
+      takes an empty baseline and installs the current release with its ordinal.
+      Rollback of that update returns the panel to the uninstalled state.
+   4. Turn the watchdog switches back on. Each installs the current release.
+
+   The bridge is offline from the uninstall until the update completes, and the
+   watchdogs are off until they are turned back on.
+
+Neither path loosens the gate: every code replacement still runs through the
+canary.
+On-panel records live under `/var/brilliant-mqtt/.release-identities/` (directory
+0700, records 0600), with one identity for each independently selectable bridge or
+watchdog. Records contain version, ordinal, digest, deployment ID, and layout;
+they contain no broker or SSH credentials. These permissions are not encryption.
+
+A `release_identity_blocked` error includes a `release_override` object. Review
+the intended candidate, then call `brilliant_mqtt.redeploy` with **exactly one**
+panel target and that exact object in the `release_override` field. It binds the
+panel, incumbent digest/layout, candidate identities, and transaction. A changed
+identity requires a fresh object. Approval is durably recorded and consumed once,
+including when a later deployment step fails; automatic repair never inherits it.
+The override approves a particular replacement without asserting which code is
+newer. Normal multi-panel redeploy remains available without an override.
+
+Release maintainers assign and review `deploy/RELEASE_ORDINAL` alongside payload
+changes, increasing it for each new release. The build copies this integer
+verbatim beside `VERSION`, and the existing payload-release manifest hashes it.
+The first ordinal-bearing release is 0.11.0; legacy unknown identities are never
+treated as ordinal 0. The build does not derive an ordinal from time, version,
+Git, or a digest.
 
 Two further services run existing Brilliant scenes and modes:
 
@@ -474,7 +579,8 @@ agent itself needs a code fix — deploy a new release via the update entity or
 
 <a id="retained-ledger"></a>
 **Retained-ledger fault.** If the agent cannot read or durably persist
-`/var/brilliant-mqtt/state/owned-topics.json`, it remains fail-closed and
+`/var/brilliant-mqtt/state/owned-topics.json` (including a write that stalls
+for more than 10 seconds), it remains fail-closed and
 publishes retained bridge metadata with `"degraded":"retained_ledger"` at QoS
 1. Home Assistant creates one needs-attention repair issue and suppresses the
 generic offline auto-repair loop so it cannot replace the useful storage
@@ -520,3 +626,23 @@ impostor.
 
 See also [ARCHITECTURE.md](ARCHITECTURE.md) and
 [reference/deployment.md](reference/deployment.md).
+
+Historical watchdog releases before 0.10.1 may lack their own `VERSION` marker.
+For a legacy fixed installation only, a missing watchdog marker inherits the same
+panel's installed bridge version when it is a strict stable release before
+0.11.0. An explicit `unknown` marker, standalone watchdog, or release-link layout
+does not receive this inference. The watchdog's own live bytes still determine
+its digest, and its ordinal remains unknown.
+
+An `auto-admit` audit record records admission only (`record_type: admission`,
+`deployment_status: not_recorded`). It does not establish whether deployment
+subsequently completed. Use the installed identity and health verification to
+confirm the deployed release.
+
+For a stopped pre-ordinal bridge, remove **both** watchdogs before uninstalling
+and running the canaried update, then restore the desired watchdog selections.
+A unit can remain on disk even when its Home Assistant switch reports off. In
+Developer tools > Actions, explicitly call `switch.turn_off` for that watchdog
+entity; repeated turn-off attempts still remove the remote unit. Resolve any
+reported removal failure before updating. Do not manually delete the provisioning
+journal or finalize an unverified rollback to bypass the baseline checks.

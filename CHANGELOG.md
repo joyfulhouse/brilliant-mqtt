@@ -7,6 +7,203 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.3] - 2026-10-23
+
+The on-panel agent and Home Assistant integration both move to 0.11.3. The
+bundled bridge and watchdog payload carries release ordinal 5; the separately
+versioned voice payload remains at 0.1.1. Qualify this release on a canary panel
+before updating the remaining panels.
+
+### Fixed
+
+- The bus watchdog remembers an independently observed live writer releasing its
+  phase-marker lease, so stale failed-attempt evidence stays revoked after that
+  writer exits. Failed continuing bus-attempt writes retain their lease. This
+  reduces the read-only-filesystem residual in #143; entirely unsampled recovery
+  and watchdog-restart ambiguity still require a separate delivery contract.
+- Watchdog reboot guards reject unsafe state files and preserve their rolling
+  reboot limits across clock corrections. Wi-Fi storage refusals log once per
+  outage while continuing to retry the storage operation.
+- Scene events and results wait for their own state to persist before MQTT
+  delivery. Retained-ledger loading has a deadline, and orphan cleanup preserves
+  temporary files belonging to other ledgers.
+- Panel credential repair accepts a changed address and password together while
+  preserving the stored SSH identity. Updates explain when an earlier rollback
+  baseline needs explicit finalization, and snapshot probe failures include
+  safe retry guidance.
+- Onboarding can explicitly finalize a verified restored baseline that has no
+  Home Assistant owner, using fresh credentials and the retained SSH identity.
+  Interrupted cleanup requires fresh authorization on retry and never persists
+  the submitted password in retained rollback metadata.
+- Onboarding bounds operation-lock and recovery waits. Payload uploads perform
+  local filesystem work outside Home Assistant's event loop and settle an
+  in-flight read before cancellation closes the remote stream.
+- Legacy watchdogs without a VERSION file can inherit a verified same-panel
+  pre-0.11.0 bridge version. Admission audit records distinguish admission from
+  verified deployment; stopped legacy recovery covers both watchdog units.
+
+- MQTT connection failures use capped exponential retry delays. Repeated bus
+  starts fenced by unresolved cleanup eventually exit for a systemd restart;
+  `BUS_FENCED_START_LIMIT` configures the threshold (default three).
+- Both watchdogs record a persistent UTC shutdown marker on SIGTERM.
+- Ignored transition fields no longer prevent safe partial command merging, and
+  discarded folded commands produce a warning without exposing payloads.
+
+### Changed
+
+- BLE mesh peripherals appear as separate Home Assistant devices, with their
+  primary and auxiliary entities grouped together. Entity unique IDs and MQTT
+  topics remain stable across this change and mesh leader changes.
+
+## [0.11.2] - 2026-10-01
+
+The on-panel agent and Home Assistant integration both move to 0.11.2. The
+bundled bridge and watchdog payload carries release ordinal 4; the separately
+versioned voice payload remains at 0.1.1. Qualify this release on a canary panel
+before updating the remaining panels.
+
+### Fixed
+
+- A bus panel whose reboot guard state cannot be written now refuses to
+  self-reboot until an operator fixes the storage, preventing an unrecorded
+  reboot from being authorized on every boot ([#209](https://github.com/joyfulhouse/brilliant-mqtt/issues/209)).
+- The Wi-Fi watchdog no longer crashes when it cannot record a reboot in its
+  guard state file. If the state file was already unreadable (for example, a
+  directory at that path), the watchdog logs the failure and still reboots,
+  at most once per cooldown. If the state reads fine but cannot be written
+  (full disk, read-only filesystem, permission denied), the watchdog logs the
+  failure and refuses to reboot, because an unrecorded reboot would be
+  authorized again on every boot. A panel in that state will not reboot itself
+  to recover Wi-Fi until an operator fixes the storage.
+  ([#195](https://github.com/joyfulhouse/brilliant-mqtt/issues/195))
+- The manifest uses minimum-version specs for `asyncssh` and `paho-mqtt`, so
+  hassfest accepts them and the integration still installs on HA 2026.6.x.
+- A partial MQTT setter that supersedes a light or switch write still waiting
+  for the device now merges per field, with the later value winning, rather than
+  dropping the waiting write's other fields. Writes already issued to the
+  device, and commands for other loads, are never merged.
+  ([#159](https://github.com/joyfulhouse/brilliant-mqtt/issues/159))
+- A stalled retained-ledger write now fails closed after 10 seconds, matching
+  the MQTT acknowledgement bound. Before that deadline, state for loads the
+  panel already owns is no longer held up by another load's pending write.
+  After it, publishes fail closed until the late write settles; the next
+  publish then rewrites the ledger from memory before anything reaches the
+  broker, so a late write cannot drop an owned topic or race a later write.
+  Session shutdown and process exit are delayed by at most the deadline.
+  ([#176](https://github.com/joyfulhouse/brilliant-mqtt/issues/176))
+- A ledger failure during a wired light or switch state publish now reports
+  the `retained_ledger` degraded status on the next session tick instead of
+  after the next periodic resync.
+  ([#177](https://github.com/joyfulhouse/brilliant-mqtt/issues/177))
+- Background auto-repair, the Repair button, and the repair service no longer
+  auto-admit a pre-0.11.0 panel's code. Only the Update entity, `redeploy`, and
+  provisioning, which run the canary and retain a rollback baseline, perform the
+  first pre-ordinal upgrade (#181). A `release_override` cannot waive this, and
+  the blocked message now points at a plain update instead of an override.
+  Those paths need a baseline, which requires the bridge unit to be `active`. If
+  a pre-0.11.0 panel's bridge is stopped or failed, repair no longer brings it
+  back (as in 0.11.0; only 0.11.1 did) and update reports `baseline_correlation_unsupported`. Start
+  `brilliant-mqtt` on the panel and update. Otherwise turn off the panel's
+  watchdog component switches, run `brilliant_mqtt.uninstall`, update, then turn
+  the watchdogs back on. Uninstall stops and removes the agent, so the bridge
+  stays offline until the update completes. See "Recovering a stopped pre-ordinal bridge" in
+  `docs/ha-integration.md`.
+- Automatic pre-ordinal admission now logs one INFO line per operation, and a
+  failure to write its audit record is reported with an operator-safe detail
+  (#182).
+- After the scene state file is found corrupt, only the first scene or mode
+  record the agent observes is treated as history and suppressed. Previously a
+  second record that arrived while the first one was still being written to
+  disk was also suppressed, so a real scene execution could go unreported
+  (#112).
+- The Wi-Fi watchdog no longer treats a corrupt, unreadable or wrong-type
+  reboot-guard state file as an empty history. It blocks reboots for one
+  cooldown period, logs the lost history once at ERROR, then resumes under the
+  normal cooldown and cap. A missing state file still counts as a fresh install
+  ([#140](https://github.com/joyfulhouse/brilliant-mqtt/issues/140)). The
+  fail-closed window is held in memory, so a watchdog restart re-arms it, and a
+  restart loop faster than one cooldown keeps reboots blocked; this is the
+  deliberate fail-closed direction.
+- The bus watchdog now treats corrupt, unreadable, wrong-type, non-finite, or
+  future reboot-guard state as lost history and blocks reboots for one cooldown
+  before resuming the normal cooldown and rolling cap
+  ([#193](https://github.com/joyfulhouse/brilliant-mqtt/issues/193)).
+
+## [0.11.1] - 2026-09-27
+
+The on-panel agent and Home Assistant integration both move to 0.11.1. The
+bundled bridge and watchdog payload carries release ordinal 3; the separately
+versioned voice payload remains at 0.1.1. Qualify this release on a canary panel
+before updating the remaining panels.
+
+### Fixed
+
+- Panels running a strict pre-0.11.0 release with no ordinal can upgrade to an
+  ordinal-bearing release without a manual override. Admission is recorded for
+  audit and retains the existing canary rollback baseline.
+
+## [0.11.0] - 2026-09-27
+
+The on-panel agent and Home Assistant integration both move to 0.11.0. The
+bundled bridge and watchdog payload carries release ordinal 2; the separately
+versioned voice payload remains at 0.1.1. Update through the per-panel bridge
+**Update** entity after qualifying the release candidate on a canary panel.
+
+### Added
+
+- Panel response diagnostics distinguish command queue/native-write timing,
+  outcomes, ticket revocations, and reconnect degradation from basic online
+  status in bounded retained bridge metadata. The operational runbooks cover
+  Wi-Fi/broadcast response qualification and a diyHue reflection proposal;
+  the project documentation also gains a Built with Omnigent badge and footer.
+  ([#152](https://github.com/joyfulhouse/brilliant-mqtt/pull/152),
+  [#157](https://github.com/joyfulhouse/brilliant-mqtt/pull/157),
+  [#154](https://github.com/joyfulhouse/brilliant-mqtt/pull/154))
+- Mesh writes expose pending feedback separately from confirmed physical state;
+  cancelled publishes invalidate feedback caches.
+  ([#156](https://github.com/joyfulhouse/brilliant-mqtt/pull/156))
+- Canary updates retain a verified predecessor baseline through the soak period,
+  with explicit single-panel rollback/finalization and recovery after interrupted
+  operations. Release identity admission checks selected code digests and ordinal
+  before mutation; same-version but different code cannot silently overwrite an
+  incumbent, and legacy unknown-ordinal installations require a bound override.
+  ([#168](https://github.com/joyfulhouse/brilliant-mqtt/pull/168);
+  [#165](https://github.com/joyfulhouse/brilliant-mqtt/issues/165),
+  [#166](https://github.com/joyfulhouse/brilliant-mqtt/issues/166))
+
+### Changed
+
+- Interactive writes take priority over maintenance without breaking target
+  ordering; newer waiting intents supersede stale ones, while maintenance
+  retries back off after failures. Ticket recovery preserves the newest write
+  across a route change and contains benign write cancellation.
+  ([#158](https://github.com/joyfulhouse/brilliant-mqtt/pull/158),
+  [#163](https://github.com/joyfulhouse/brilliant-mqtt/pull/163))
+
+### Fixed
+
+- Compatible partial MQTT setters now merge before dispatch rather than losing
+  earlier fields; unsafe commands remain FIFO barriers.
+  ([#170](https://github.com/joyfulhouse/brilliant-mqtt/pull/170);
+  [#159](https://github.com/joyfulhouse/brilliant-mqtt/issues/159))
+- Failed or cancelled per-peripheral command workers no longer strand queued
+  commands or stall teardown. Bounded recovery, cooldown, and discard logging
+  make lane failures and active-fold fallback observable without exposing
+  command contents.
+  ([#171](https://github.com/joyfulhouse/brilliant-mqtt/pull/171);
+  [#160](https://github.com/joyfulhouse/brilliant-mqtt/issues/160),
+  [#161](https://github.com/joyfulhouse/brilliant-mqtt/issues/161))
+- Wired light and switch feedback no longer lets a delayed pre-command snapshot
+  overwrite the requested state (the ON -> OFF -> ON flicker). Native
+  observations are kept separate from a provisional request that expires after
+  a fixed 20-second window; contradictions that metadata cannot resolve are
+  published as `ambiguous` rather than suppressed, and the device's own state is
+  published once the window ends. Mesh behaviour is unchanged. New
+  `wired_write_status`, `wired_requested` and `wired_write_deadline` keys
+  appear while a write is pending.
+  ([#174](https://github.com/joyfulhouse/brilliant-mqtt/pull/174);
+  [#172](https://github.com/joyfulhouse/brilliant-mqtt/issues/172))
+
 ## [0.10.2] - 2026-09-10
 
 The on-panel agent and Home Assistant integration both move to 0.10.2. The
@@ -922,7 +1119,11 @@ panel redeploy is needed.
 - JoyfulHouse OSS docs standard: LICENSE (MIT), INSTALL.md, CHANGELOG.md,
   FUNDING.yml, CODEOWNERS, and the canonical `docs/` set.
 
-[Unreleased]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.11.3...HEAD
+[0.11.3]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.11.2...v0.11.3
+[0.11.2]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.11.1...v0.11.2
+[0.11.1]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.11.0...v0.11.1
+[0.11.0]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.9.3...v0.10.0
 [0.9.3]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.9.1...v0.9.2

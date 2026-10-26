@@ -755,7 +755,12 @@ class TestOptimisticEcho:
         topic = f"brilliant/{PANEL}/gangbox_peripheral_0/state"
         states = [p for p in mqtt.published if p[0] == topic]
         assert len(states) == 1
-        assert json.loads(states[0][1]) == {"state": "ON", "brightness": 255}
+        payload = json.loads(states[0][1])
+        assert payload["state"] == "ON"
+        assert payload["brightness"] == 255
+        assert payload["wired_write_status"] == "provisional"
+        assert payload["wired_requested"] == {"intensity": "1000", "on": "1"}
+        assert isinstance(payload["wired_write_deadline"], float)
         assert states[0][2] is True
 
     async def test_failed_aux_translate_no_publish(self, hardware: BrilliantDevice) -> None:
@@ -1312,7 +1317,8 @@ class TestM11MeshEndToEnd:
         assert len(configs) == 1
         data = json.loads(configs[0][1])
         assert data["availability"][0]["topic"] == "brilliant/mesh/availability"
-        assert data["device"]["name"] == "Brilliant BLE Mesh"
+        assert data["device"]["name"] == mesh_dimmer.name
+        assert data["device"]["identifiers"] == [f"brilliant_mesh_{MESH_PID}"]
         assert data["device"]["model"] == "BLE Mesh"
         assert data["state_topic"] == f"brilliant/mesh/{MESH_PID}/state"
         assert data["command_topic"] == f"brilliant/mesh/{MESH_PID}/set"

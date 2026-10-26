@@ -7,7 +7,7 @@ import json
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import replace
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, Mock, patch
 from uuid import UUID
@@ -110,7 +110,10 @@ from custom_components.brilliant_mqtt.panel_provisioner import (
     ProvisionedPanel,
     ProvisioningProgress,
 )
-from custom_components.brilliant_mqtt.provisioning_journal import ProvisioningJournal
+from custom_components.brilliant_mqtt.provisioning_journal import (
+    ProvisioningJournal,
+    RetainedRollback,
+)
 from custom_components.brilliant_mqtt.shell import HostIdentity, PanelIdentityError
 
 _PUBLIC_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKIykuTed7zNwJwn20eCelcKcHKJ9c/pGFfvulRWazuC"
@@ -293,14 +296,18 @@ class _FakeProvisioner:
         self.recover_started = asyncio.Event()
         self.install_calls: list[tuple[PanelInstallRequest, FleetConfig]] = []
         self.marked_transactions: list[UUID] = []
+        self.overrides: list[Mapping[str, object] | None] = []
 
     async def async_install(
         self,
         request: PanelInstallRequest,
         fleet: FleetConfig,
         progress: Callable[[ProvisioningProgress], Awaitable[None]],
+        *,
+        release_override: Mapping[str, object] | None = None,
     ) -> ProvisionedPanel:
         del progress
+        self.overrides.append(release_override)
         self.install_calls.append((request, fleet))
         if self.gate is not None:
             await self.gate.wait()
@@ -1363,6 +1370,7 @@ async def test_panel_confirm_shows_allowlisted_facts_and_only_name_is_editable(
     assert _schema_keys(result) == {CONF_NAME}
     assert _schema_defaults(result)[CONF_NAME] == "Office Panel"
     assert result["description_placeholders"] == {
+        "release_override": "",
         "fingerprint": _FINGERPRINT,
         "hostname": "office-panel",
         "model": "Brilliant Control Development Board",
@@ -1713,6 +1721,47 @@ async def test_first_panel_provision_failure_returns_to_confirm_without_secret_l
     entries = hass.config_entries.async_entries(DOMAIN)
     assert len(entries) == 1
     assert entries[0].subentries == {}
+
+
+@pytest.mark.parametrize("unchanged", [False, True])
+async def test_onboarding_identity_outcome_requires_explicit_override(
+    hass: HomeAssistant,
+    unchanged: bool,
+) -> None:
+    confirm = await _start_initial_confirm(hass)
+    binding = {"panel": "office", "transaction": "c" * 32, "incumbent": {}, "candidate": {}}
+    provisioner = _FakeProvisioner(
+        _identity(),
+        gate=asyncio.Event(),
+        error=PanelProvisioningError(
+            "release_unchanged" if unchanged else "release_identity_blocked",
+            release_override=None if unchanged else binding,
+        ),
+    )
+    with patch.object(flow_gateway, "_get_panel_provisioner", return_value=provisioner):
+        await hass.config_entries.subentries.async_configure(
+            confirm["flow_id"], {CONF_NAME: "Office"}
+        )
+        assert provisioner.gate is not None
+        provisioner.gate.set()
+        result = await _drain_progress(hass.config_entries.subentries, confirm["flow_id"])
+        if unchanged:
+            assert result["type"] is FlowResultType.ABORT
+            assert result["reason"] == "release_unchanged"
+            assert provisioner.marked_transactions == []
+        else:
+            assert "release_override" in _schema_keys(result)
+            assert json.loads(result["description_placeholders"]["release_override"]) == binding
+            assert provisioner.overrides == [None]
+            provisioner.error = None
+            provisioner.gate.clear()
+            await hass.config_entries.subentries.async_configure(
+                confirm["flow_id"],
+                {CONF_NAME: "Office", "release_override": binding},
+            )
+            provisioner.gate.set()
+            await _drain_progress(hass.config_entries.subentries, confirm["flow_id"])
+            assert provisioner.overrides == [None, binding]
 
 
 async def test_first_panel_mark_pending_failure_clears_flow_transaction(
@@ -5149,3 +5198,220 @@ async def test_legacy_reconfigure_advanced_clears_cadences_from_next_render(
     assert "RESYNC_SECONDS=" not in env
     assert CONF_HOT_POLL_SECONDS not in entry.data
     assert CONF_RESYNC_SECONDS not in entry.data
+
+
+async def test_panel_credential_repair_updates_address_and_password_atomically(
+    hass: HomeAssistant,
+) -> None:
+    panel = _subentry()
+    entry = _fleet_entry(hass, panel)
+    stored = entry.subentries[panel.subentry_id]
+    original = dict(stored.data)
+    identity = _identity()
+    form = await _start_panel_reconfigure_step(
+        hass,
+        entry,
+        stored,
+        "repair_credentials",
+    )
+    replacement_password = "SECRET-replacement-root-password"
+    inspect = AsyncMock(return_value=_facts(identity))
+
+    with (
+        patch.object(
+            flow_gateway,
+            "async_fetch_host_identity",
+            AsyncMock(return_value=identity),
+        ),
+        patch.object(flow_gateway, "_async_inspect_candidate", inspect),
+    ):
+        result = await hass.config_entries.subentries.async_configure(
+            form["flow_id"],
+            {CONF_HOST: "moved-office.iot.example", CONF_ROOT_PASSWORD: replacement_password},
+        )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+    inspect.assert_awaited_once_with(
+        hass,
+        "moved-office.iot.example",
+        replacement_password,
+        identity,
+    )
+    assert stored.data == {
+        **original,
+        CONF_HOST: "moved-office.iot.example",
+        CONF_ROOT_PASSWORD: replacement_password,
+    }
+    assert replacement_password not in repr(result)
+    assert original[CONF_ROOT_PASSWORD] not in repr(form)
+
+
+@pytest.mark.parametrize("failure", ["identity", "authentication", "parent_changed"])
+async def test_combined_credential_repair_preserves_configuration_on_failure(
+    hass: HomeAssistant,
+    failure: str,
+) -> None:
+    panel = _subentry()
+    entry = _fleet_entry(hass, panel)
+    stored = entry.subentries[panel.subentry_id]
+    original = dict(stored.data)
+    form = await _start_panel_reconfigure_step(hass, entry, stored, "repair_credentials")
+    identity = _identity()
+    expected = original
+
+    async def inspect(*_args: object) -> PanelFacts:
+        nonlocal expected
+        if failure == "authentication":
+            raise asyncssh.PermissionDenied("SECRET rejected password")
+        if failure == "parent_changed":
+            expected = {**original, CONF_NAME: "Concurrent rename"}
+            hass.config_entries.async_update_subentry(entry, stored, data=expected)
+        return _facts(identity)
+
+    with (
+        patch.object(
+            flow_gateway,
+            "async_fetch_host_identity",
+            AsyncMock(return_value=_identity(other=True) if failure == "identity" else identity),
+        ),
+        patch.object(
+            flow_gateway, "_async_inspect_candidate", AsyncMock(side_effect=inspect)
+        ) as probe,
+    ):
+        result = await hass.config_entries.subentries.async_configure(
+            form["flow_id"],
+            {CONF_HOST: "moved-office.iot.example", CONF_ROOT_PASSWORD: "SECRET-new-password"},
+        )
+    assert stored.data == expected
+    assert "SECRET-new-password" not in repr(result)
+    if failure == "parent_changed":
+        assert result["type"] is FlowResultType.ABORT
+        assert result["reason"] == "parent_changed"
+    else:
+        assert result["type"] is FlowResultType.FORM
+        assert result["errors"] == {
+            "base": "panel_identity_mismatch"
+            if failure == "identity"
+            else "panel_authentication_failed"
+        }
+    if failure == "identity":
+        probe.assert_not_awaited()
+
+
+async def _restored_ownerless_record(hass: HomeAssistant) -> RetainedRollback:
+    from custom_components.brilliant_mqtt.release_identity import RollbackBaseline
+    from tests.test_provisioning_journal import _record
+
+    record = _record()
+    record = replace(
+        record,
+        prior_snapshot=replace(
+            record.prior_snapshot, baseline=RollbackBaseline("c" * 32, "d" * 64, {})
+        ),
+    )
+    from custom_components.brilliant_mqtt.provisioning_journal import RetainedRollback
+
+    return RetainedRollback(record, "restored", "a" * 32)
+
+
+async def test_ownerless_restore_requires_explicit_finalize_confirmation(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    retained = await _restored_ownerless_record(hass)
+    monkeypatch.setattr(
+        ProvisioningJournal, "async_retained_records", AsyncMock(return_value=(retained,))
+    )
+    entry = _fleet_entry(hass)
+    result = await _start_subentry_confirm(hass, entry, identity=_identity())
+    assert result["step_id"] == "panel_finalize_retained"
+    assert str(retained.record.transaction_id) in repr(result["description_placeholders"])
+    assert _ROOT_PASSWORD not in repr(result)
+    provisioner = SimpleNamespace(async_finalize_ownerless_restored=AsyncMock())
+    with patch.object(flow_gateway, "_get_panel_provisioner", return_value=provisioner):
+        unchecked = await hass.config_entries.subentries.async_configure(
+            result["flow_id"], {"confirm_finalize": False}
+        )
+        assert unchecked["step_id"] == "panel_finalize_retained"
+        provisioner.async_finalize_ownerless_restored.assert_not_awaited()
+        confirmed = await hass.config_entries.subentries.async_configure(
+            result["flow_id"], {"confirm_finalize": True}
+        )
+    assert confirmed["step_id"] == "panel_confirm"
+    provisioner.async_finalize_ownerless_restored.assert_awaited_once()
+    assert _ROOT_PASSWORD not in repr(confirmed)
+
+
+async def test_ownerless_recovery_checks_retained_pin_before_fresh_password(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    retained = await _restored_ownerless_record(hass)
+    monkeypatch.setattr(
+        ProvisioningJournal, "async_retained_records", AsyncMock(return_value=(retained,))
+    )
+    entry = _fleet_entry(hass)
+    form = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, SUBENTRY_TYPE_PANEL), context={"source": "user"}
+    )
+    inspect = AsyncMock()
+    with (
+        patch.object(flow_gateway, "async_fetch_host_identity", return_value=_identity(other=True)),
+        patch.object(flow_gateway, "_async_inspect_candidate", inspect),
+    ):
+        result = await hass.config_entries.subentries.async_configure(
+            form["flow_id"],
+            {CONF_HOST: retained.record.panel_request.host, CONF_ROOT_PASSWORD: "fresh-secret"},
+        )
+    assert result["step_id"] == "panel_connect"
+    assert result["errors"] == {"base": "panel_identity_mismatch"}
+    inspect.assert_not_awaited()
+
+
+@pytest.mark.parametrize("conflict", ["active", "owner", "transaction_owner", "multiple", "failed"])
+async def test_ownerless_candidate_refusals_do_not_offer_password(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch, conflict: str
+) -> None:
+    from uuid import uuid4
+
+    from tests.test_provisioning_journal import _record
+
+    retained = await _restored_ownerless_record(hass)
+    assert retained.ownerless_finalization_allowed
+    matches: tuple[RetainedRollback, ...] = (retained,)
+    if conflict == "multiple":
+        matches += (replace(retained, record=replace(retained.record, transaction_id=uuid4())),)
+    if conflict == "failed":
+        matches = (replace(retained, state="rollback_failed"),)
+    monkeypatch.setattr(
+        ProvisioningJournal, "async_retained_records", AsyncMock(return_value=matches)
+    )
+    if conflict == "active":
+        monkeypatch.setattr(ProvisioningJournal, "async_load", AsyncMock(return_value=_record()))
+    if conflict == "owner":
+        entry = _fleet_entry(hass, _subentry())
+    elif conflict == "transaction_owner":
+        owner = _subentry(fingerprint=_OTHER_FINGERPRINT, public_key=_OTHER_PUBLIC_KEY)
+        entry = _fleet_entry(hass, owner)
+        stored = entry.subentries[owner.subentry_id]
+        hass.config_entries.async_update_subentry(
+            entry,
+            stored,
+            data={
+                **stored.data,
+                CONF_PROVISIONING_TRANSACTION_ID: str(retained.record.transaction_id),
+            },
+        )
+    else:
+        entry = _fleet_entry(hass)
+    form = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, SUBENTRY_TYPE_PANEL), context={"source": "user"}
+    )
+    inspect = AsyncMock()
+    with (
+        patch.object(flow_gateway, "async_fetch_host_identity", return_value=_identity()),
+        patch.object(flow_gateway, "_async_inspect_candidate", inspect),
+    ):
+        result = await hass.config_entries.subentries.async_configure(form["flow_id"], _PANEL_INPUT)
+    assert result["step_id"] == "panel_connect"
+    assert result["errors"] == {"base": "ownerless_recovery_unavailable"}
+    inspect.assert_not_awaited()

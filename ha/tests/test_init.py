@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import tomllib
+from pathlib import Path
 from typing import Any, cast
 from unittest.mock import AsyncMock, patch
 
@@ -59,6 +61,8 @@ from custom_components.brilliant_mqtt.manager import PanelManager
 from custom_components.brilliant_mqtt.panel_provisioner import PanelProvisioner
 from custom_components.brilliant_mqtt.shell import HostIdentity
 
+_HA_PYPROJECT = Path(__file__).parents[1] / "pyproject.toml"
+
 
 async def test_integration_discoverable(hass: HomeAssistant) -> None:
     """The HA loader resolves the integration and the manifest carries the contract."""
@@ -67,7 +71,10 @@ async def test_integration_discoverable(hass: HomeAssistant) -> None:
     assert integration.integration_type == "hub"
     assert integration.name == "Brilliant MQTT Fleet Manager"
     assert "mqtt" in (integration.dependencies or [])
-    assert any(r.startswith("asyncssh==") for r in integration.requirements or [])
+    dev_group = tomllib.loads(_HA_PYPROJECT.read_text())["dependency-groups"]["dev"]
+    pinned = next(r for r in dev_group if r.startswith("asyncssh=="))
+    floor = "asyncssh>=" + pinned.removeprefix("asyncssh==")
+    assert floor in (integration.requirements or [])
 
 
 def test_config_flow_resolves_production_provisioner_from_package_root(

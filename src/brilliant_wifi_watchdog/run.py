@@ -5,9 +5,12 @@ from __future__ import annotations
 import logging
 import logging.handlers
 import os
+import signal
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from types import FrameType
 from typing import Any, Protocol
 
 from . import probe, recovery
@@ -21,6 +24,9 @@ class _GuardLike(Protocol):
     def can_request(self, now: float) -> bool: ...
 
     def record_request(self, now: float) -> None: ...
+
+    @property
+    def last_read_bad(self) -> bool: ...
 
 
 class _LadderLike(Protocol):
@@ -66,13 +72,20 @@ def load_config(environ: Mapping[str, str]) -> Config:
     )
 
 
+@dataclass
+class RecoveryLogState:
+    refused: bool = False
+
+
 def handle(
     action: Action,
     *,
     guard: _GuardLike,
     now: float,
+    state_path: str,
     reboot_eligible: bool = False,
     recovery_mod: Any = recovery,
+    log_state: RecoveryLogState | None = None,
 ) -> int | None:
     if action == Action.SOFT_RECONNECT:
         _LOG.warning("gateway down ~90s: connman reconnect")
@@ -93,8 +106,31 @@ def handle(
         # decision. Defense in depth: never reboot unless that shared read said
         # eligible; otherwise log the blocked path (never silent).
         if reboot_eligible:
+            try:
+                guard.record_request(now)
+            except OSError as exc:
+                report = log_state is None or not log_state.refused
+                if report:
+                    _LOG.error(
+                        "reboot guard state write failed (%s: %s)",
+                        type(exc).__name__,
+                        exc.filename2 or exc.filename or state_path,
+                    )
+                if not guard.last_read_bad:
+                    # The state read fine but cannot be written (full disk,
+                    # read-only fs): an unrecorded reboot would leave the next
+                    # boot's guard just as permissive, so reboot-loop. Refuse.
+                    if report:
+                        _LOG.error(
+                            "gateway down ~360s: reboot refused because it cannot be "
+                            "recorded — fix the guard state storage"
+                        )
+                    if log_state is not None:
+                        log_state.refused = True
+                    return None
+                # The state was already unreadable, so the guard's fail-closed
+                # window (re-armed on every start) bounds this reboot.
             _LOG.error("gateway down ~360s: GPIO/SDIO reset + reboot")
-            guard.record_request(now)
             result: int = recovery_mod.gpio_reset_and_reboot()
             if result == 0:
                 _LOG.error("reboot requested")
@@ -113,7 +149,13 @@ def _configure_logging(path: str) -> None:
     _LOG.setLevel(logging.INFO)
 
 
-def _poll_once(cfg: Config, *, guard: _GuardLike, ladder: _LadderLike) -> None:
+def _poll_once(
+    cfg: Config,
+    *,
+    guard: _GuardLike,
+    ladder: _LadderLike,
+    log_state: RecoveryLogState | None = None,
+) -> None:
     """One watchdog cycle: probe, decide, dispatch.
 
     The recovery ladder's health signal is the gateway probe alone. A completed
@@ -126,6 +168,8 @@ def _poll_once(cfg: Config, *, guard: _GuardLike, ladder: _LadderLike) -> None:
         probe.TcpProbe.CLOSED: False,
         probe.TcpProbe.INCONCLUSIVE: None,
     }[gateway_state]
+    if gateway_up and log_state is not None:
+        log_state.refused = False
     if cfg.broker_host:
         broker = probe.tcp_open(cfg.broker_host, cfg.broker_port)
         _LOG.info("gateway=%s up=%s broker=%s", gw, gateway_up, broker.value)
@@ -136,17 +180,37 @@ def _poll_once(cfg: Config, *, guard: _GuardLike, ladder: _LadderLike) -> None:
     eligible = guard.can_request(wall)
     action = ladder.observe(gateway_up=gateway_up, now=time.monotonic(), reboot_eligible=eligible)
     if action != Action.NONE:
-        handle(action, guard=guard, now=wall, reboot_eligible=eligible)
+        handle(
+            action,
+            guard=guard,
+            now=wall,
+            state_path=cfg.state_path,
+            reboot_eligible=eligible,
+            log_state=log_state,
+        )
+
+
+def _stop_by_sigterm(signum: int, frame: FrameType | None) -> None:
+    _LOG.info(
+        "stopped by SIGTERM at %s", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    )
+    raise SystemExit(0)
 
 
 def main() -> None:  # pragma: no cover - thin loop
     cfg = load_config(os.environ)
     _configure_logging(cfg.log_path)
-    guard = RebootGuard(cfg.state_path, cfg.policy)
-    ladder = Ladder(cfg.thresholds)
-    while True:
-        _poll_once(cfg, guard=guard, ladder=ladder)
-        time.sleep(cfg.interval)
+    previous_handler = signal.signal(signal.SIGTERM, _stop_by_sigterm)
+    try:
+        guard = RebootGuard(cfg.state_path, cfg.policy)
+        ladder = Ladder(cfg.thresholds)
+        log_state = RecoveryLogState()
+        while True:
+            _poll_once(cfg, guard=guard, ladder=ladder, log_state=log_state)
+            time.sleep(cfg.interval)
+
+    finally:
+        signal.signal(signal.SIGTERM, previous_handler)
 
 
 if __name__ == "__main__":  # pragma: no cover

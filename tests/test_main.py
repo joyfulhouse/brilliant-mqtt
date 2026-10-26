@@ -12,14 +12,17 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
 import brilliant_mqtt.__main__ as main_mod
 from brilliant_mqtt import __version__
 from brilliant_mqtt import bus as bus_mod
+from brilliant_mqtt import retained_topics as retained_topics_mod
 from brilliant_mqtt.__main__ import _is_panel_device, _is_reconnect_storm, _make_desired
 from brilliant_mqtt.bridge import Bridge, HotPollReadTimeout
 from brilliant_mqtt.bus import RpcBusAdapter
@@ -32,7 +35,7 @@ from brilliant_mqtt.model import BrilliantDevice, DeviceKind, Variable
 from brilliant_mqtt.protocols import CommandSubscribeError
 from brilliant_mqtt.retained_topics import RetainedLedgerError
 from brilliant_mqtt.write_admission import AdmissionTicket, WriteClass
-from tests.fakes import FakeBus, FakeClock, FakeMqtt
+from tests.fakes import FakeBus, FakeClock, FakeMqtt, FakeSleeper, HeldWrites, _panel_dimmer
 
 HB = 10.0
 
@@ -74,16 +77,6 @@ def _mesh_dimmer() -> BrilliantDevice:
             "intensity": Variable("intensity", "600"),
             "dimmable": Variable("dimmable", "1"),
         },
-    )
-
-
-def _panel_dimmer() -> BrilliantDevice:
-    return BrilliantDevice(
-        device_id="device_001",
-        peripheral_id="gangbox_peripheral_0",
-        name="Lights",
-        kind=DeviceKind.LIGHT,
-        variables={"on": Variable("on", "0")},
     )
 
 
@@ -282,7 +275,10 @@ class TestProcessLifetimeDesiredState:
             settings: Settings,
             desired_panel: DesiredState | None = None,
             desired_mesh: DesiredState | None = None,
+            diagnostics: object | None = None,
+            progress: main_mod._SessionProgress | None = None,
         ) -> None:
+            del diagnostics
             nonlocal calls
             calls += 1
             seen.append(desired_panel)
@@ -315,7 +311,10 @@ class TestProcessLifetimeDesiredState:
             settings: Settings,
             desired_panel: DesiredState | None = None,
             desired_mesh: DesiredState | None = None,
+            diagnostics: object | None = None,
+            progress: main_mod._SessionProgress | None = None,
         ) -> None:
+            del diagnostics
             seen.append(desired_panel)
             seen.append(desired_mesh)
             raise asyncio.CancelledError
@@ -349,8 +348,10 @@ class TestSupervisorBackoff:
             settings: Settings,
             desired_panel: DesiredState | None,
             desired_mesh: DesiredState | None,
+            diagnostics: object | None = None,
+            progress: main_mod._SessionProgress | None = None,
         ) -> None:
-            del settings, desired_panel, desired_mesh
+            del settings, desired_panel, desired_mesh, diagnostics
             nonlocal session_calls
             session_calls += 1
             raise RetainedLedgerError("persistent ledger failure")
@@ -378,8 +379,10 @@ class TestSupervisorBackoff:
             settings: Settings,
             desired_panel: DesiredState | None,
             desired_mesh: DesiredState | None,
+            diagnostics: object | None = None,
+            progress: main_mod._SessionProgress | None = None,
         ) -> None:
-            del settings, desired_panel, desired_mesh
+            del settings, desired_panel, desired_mesh, diagnostics
             raise RuntimeError("transient session failure")
 
         async def cancel_on_sleep(delay: float) -> None:
@@ -415,8 +418,10 @@ class TestSupervisorBackoff:
             settings: Settings,
             desired_panel: DesiredState | None,
             desired_mesh: DesiredState | None,
+            diagnostics: object | None = None,
+            progress: main_mod._SessionProgress | None = None,
         ) -> None:
-            del settings, desired_panel, desired_mesh
+            del settings, desired_panel, desired_mesh, diagnostics
             nonlocal session_calls
             session_calls += 1
             raise main_mod.MqttTransportOverloadError("transport backlog exceeded")
@@ -641,6 +646,9 @@ class _SessionHarness:
                 if self._scope == "panel":
                     harness.ready.set()
 
+            async def reconcile_after_reconnect(self) -> None:
+                await self.reconcile()
+
             async def poll_once(self, devices: list[BrilliantDevice] | None = None) -> None:
                 harness.events.append(f"{self._scope}_poll")
                 harness.poll_snapshots[self._scope].append(devices)
@@ -654,6 +662,9 @@ class _SessionHarness:
                 return
 
             async def shutdown_mesh_feedback(self) -> None:
+                return
+
+            async def shutdown_wired_feedback(self) -> None:
                 return
 
         self.bridge_type = SessionBridge
@@ -702,13 +713,13 @@ class _SessionHarness:
                 harness.events.append("scene_poll")
                 harness.scene_poll_snapshots.append(devices)
 
-        def mqtt_factory(settings: Settings) -> _SessionMqtt:
-            del settings
+        def mqtt_factory(settings: Settings, **kwargs: object) -> _SessionMqtt:
+            del settings, kwargs
             self.events.append("mqtt_construct")
             return self.mqtt
 
-        def bus_factory(*, extra_device_ids: tuple[str, ...]) -> _SessionBus:
-            del extra_device_ids
+        def bus_factory(*, extra_device_ids: tuple[str, ...], **kwargs: object) -> _SessionBus:
+            del extra_device_ids, kwargs
             self.events.append("bus_construct")
             return self.bus
 
@@ -742,6 +753,55 @@ async def test_session_joins_mesh_feedback_before_adapters_close(
     monkeypatch.setattr(harness.bridge_type, "shutdown_mesh_feedback", tracked_shutdown)
     await _cancel_ready_session(harness, _hot_poll_settings(mesh=True))
     assert harness.events[-3:] == ["mesh_feedback_joined", "bus_shutdown", "mqtt_disconnect"]
+
+
+async def test_session_teardown_retires_wired_feedback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    ready = asyncio.Event()
+
+    class ReadyMqtt(FakeMqtt):
+        async def subscribe(self, topic: str) -> None:
+            await super().subscribe(topic)
+            if topic == "brilliant/office/gangbox_peripheral_0/set":
+                ready.set()
+
+    bus = FakeBus([_panel_dimmer()])
+    mqtt = ReadyMqtt()
+    sleeper = FakeSleeper()
+    bridges: list[Bridge] = []
+
+    def make_bridge(*args: Any, **kwargs: Any) -> Bridge:
+        bridge = Bridge(*args, **kwargs, sleep=sleeper, wall_clock=FakeClock())
+        bridges.append(bridge)
+        return bridge
+
+    monkeypatch.setattr(main_mod, "RpcBusAdapter", lambda **_kwargs: bus)
+    monkeypatch.setattr(main_mod, "AioMqttAdapter", lambda *_args, **_kwargs: mqtt)
+    monkeypatch.setattr(main_mod, "Bridge", make_bridge)
+    settings = _settings()
+    object.__setattr__(settings, "retained_topics_file", str(tmp_path / "owned.json"))
+
+    session = asyncio.create_task(main_mod._run_session(settings, None, None))
+    await ready.wait()
+    await mqtt.inject(
+        "brilliant/office/gangbox_peripheral_0/set",
+        '{"state":"ON","brightness":85}',
+    )
+    bridge = bridges[0]
+    deadlines = [slot.timer for slot in bridge._wired.values() if slot.timer is not None]
+
+    session.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await session
+    assert all(task.done() for task in deadlines)
+    mqtt.published.clear()
+    await sleeper.release_all()
+    await asyncio.gather(*deadlines, return_exceptions=True)
+
+    assert not bridge._wired
+    assert not mqtt.published
 
 
 def _hot_poll_settings(
@@ -1141,8 +1201,8 @@ def _real_bus_session(
 
     monkeypatch.setattr(adapter, "start", no_start)
 
-    def bus_factory(*, extra_device_ids: tuple[str, ...]) -> RpcBusAdapter:
-        del extra_device_ids
+    def bus_factory(*, extra_device_ids: tuple[str, ...], **kwargs: object) -> RpcBusAdapter:
+        del extra_device_ids, kwargs
         return adapter
 
     monkeypatch.setattr(main_mod, "RpcBusAdapter", bus_factory)
@@ -1949,3 +2009,233 @@ class TestRetainedLedgerDegradedDiagnostic:
 
         assert raised.value is ledger_error
         assert harness.events[-2:] == ["bus_shutdown", "mqtt_disconnect"]
+
+
+def _second_panel_dimmer(on: str) -> BrilliantDevice:
+    return replace(
+        _panel_dimmer(),
+        peripheral_id="gangbox_peripheral_1",
+        variables={"on": Variable("on", on)},
+    )
+
+
+class _LedgerClock:
+    """Fake monotonic clock for the retained ledger's persistence deadline.
+
+    Patches only the ledger module's ``asyncio`` reference, as
+    ``_install_session_loop_clock`` does for the session loop: ``loop.time()``
+    reads this clock and a timed ``asyncio.wait`` returns when the clock
+    passes its timeout. Everything else is the real asyncio.
+    """
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self._timers: list[tuple[float, asyncio.Future[None]]] = []
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        clock = self
+
+        class Loop:
+            def __init__(self, real: asyncio.AbstractEventLoop) -> None:
+                self._real = real
+
+            def time(self) -> float:
+                return clock.now
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._real, name)
+
+        async def wait(futures: set[asyncio.Future[None]], timeout: float | None = None) -> object:
+            if timeout is None:
+                return await asyncio.wait(futures)
+            timer: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+            entry = (clock.now + timeout, timer)
+            clock._timers.append(entry)
+            try:
+                return await asyncio.wait({*futures, timer}, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                timer.cancel()
+                if entry in clock._timers:
+                    clock._timers.remove(entry)
+
+        class Asyncio:
+            def __getattr__(self, name: str) -> Any:
+                return getattr(asyncio, name)
+
+            def get_running_loop(self) -> Loop:
+                return Loop(asyncio.get_running_loop())
+
+        proxy = Asyncio()
+        object.__setattr__(proxy, "wait", wait)
+        monkeypatch.setattr(retained_topics_mod, "asyncio", proxy)
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+        for until, timer in list(self._timers):
+            if until <= self.now and not timer.done():
+                timer.set_result(None)
+
+
+async def test_stalled_ledger_claim_does_not_block_owned_off_or_teardown(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """#176: hold persistence while adding a load, queue OFF, begin shutdown.
+
+    The ledger runs on a fake clock: its persistence deadline passes only when
+    the test advances that clock, so ordering, not elapsed time under load,
+    decides every assertion.
+    """
+    existing_state = "brilliant/office/gangbox_peripheral_0/state"
+    added_state = "brilliant/office/gangbox_peripheral_1/state"
+    ready = asyncio.Event()
+
+    class ReadyMqtt(FakeMqtt):
+        def __init__(self) -> None:
+            super().__init__()
+            self.events: list[str] = []
+
+        async def subscribe(self, topic: str) -> None:
+            await super().subscribe(topic)
+            if topic == "brilliant/office/gangbox_peripheral_0/set":
+                ready.set()
+
+        async def publish(
+            self, topic: str, payload: str, retain: bool = False, qos: int = 0
+        ) -> None:
+            await super().publish(topic, payload, retain, qos)
+            if topic == existing_state:
+                self.events.append(f"state:{json.loads(payload)['state']}")
+
+        async def disconnect(self) -> None:
+            await super().disconnect()
+            self.events.append("disconnect")
+
+    existing_on = replace(_panel_dimmer(), variables={"on": Variable("on", "1")})
+    bus = FakeBus([existing_on])
+    mqtt = ReadyMqtt()
+    monkeypatch.setattr(main_mod, "RpcBusAdapter", lambda **_kwargs: bus)
+    monkeypatch.setattr(main_mod, "AioMqttAdapter", lambda *_args, **_kwargs: mqtt)
+
+    def make_bridge(*args: Any, **kwargs: Any) -> Bridge:
+        return Bridge(*args, **kwargs, sleep=FakeSleeper(), wall_clock=FakeClock())
+
+    monkeypatch.setattr(main_mod, "Bridge", make_bridge)
+    clock = _LedgerClock()
+    clock.install(monkeypatch)
+    writes = HeldWrites(monkeypatch, hold=lambda payload: added_state in payload)
+    settings = _settings()
+    object.__setattr__(settings, "retained_topics_file", str(tmp_path / "owned.json"))
+    session = asyncio.create_task(main_mod._run_session(settings, None, None))
+    added: asyncio.Task[None] | None = None
+    try:
+        await asyncio.wait_for(ready.wait(), 2)
+        assert json.loads(mqtt.published[-1][1])["state"] == "ON"
+        mqtt.published.clear()
+        mqtt.events.clear()
+
+        added = asyncio.create_task(bus.emit(_second_panel_dimmer("1")))
+        await asyncio.wait_for(writes.started.wait(), 2)
+        off = replace(_panel_dimmer(), variables={"on": Variable("on", "0")})
+        await asyncio.wait_for(bus.emit(off), 30)
+        # The OFF is not held by the stalled claim of the other load.
+        assert not added.done()
+        assert mqtt.events == ["state:OFF"]
+
+        # Shutdown begins; the claim defers cancellation until its deadline.
+        session.cancel()
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert not added.done()
+        assert not session.done()
+        clock.advance(retained_topics_mod.PERSIST_DEADLINE_S)
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(session, 30)
+
+        # Teardown completed with the write still held in its thread.
+        assert not writes.release.is_set()
+        assert mqtt.events == ["state:OFF", "disconnect"]
+        states = [
+            json.loads(payload)["state"]
+            for topic, payload, _retain in mqtt.published
+            if topic == existing_state
+        ]
+        assert states == ["OFF"]
+        assert all(topic != added_state for topic, _payload, _retain in mqtt.published)
+    finally:
+        await writes.drain()
+        session.cancel()
+        await asyncio.gather(session, return_exceptions=True)
+        if added is not None:
+            await asyncio.gather(added, return_exceptions=True)
+
+
+async def test_wired_publish_ledger_failure_fails_closed_on_next_tick(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """#177: the detached wired publisher cannot hide a ledger failure."""
+    harness = _SessionHarness(monkeypatch, real_bridge=True)
+    settings = _hot_poll_settings(hot_poll_seconds=2.0)
+    object.__setattr__(settings, "retained_topics_file", str(tmp_path / "owned.json"))
+    added_state = "brilliant/office/gangbox_peripheral_1/state"
+    failed_writes: list[str] = []
+    real_write = retained_topics_mod._write_payload
+
+    def read_only_for_new_load(path: Path, payload: str) -> None:
+        if added_state in payload:
+            failed_writes.append(payload)
+            raise PermissionError("read-only ledger directory")
+        real_write(path, payload)
+
+    async def add_load_after_reconcile(sleep_number: int) -> None:
+        if sleep_number == 1:
+            monkeypatch.setattr(retained_topics_mod, "_write_payload", read_only_for_new_load)
+            harness.bus.snapshot = [*harness.bus.snapshot, _second_panel_dimmer("1")]
+
+    clock = _SessionLoopClock(cancel_on_sleep=4, on_sleep=add_load_after_reconcile)
+    _install_session_loop_clock(monkeypatch, clock)
+
+    with pytest.raises(RetainedLedgerError, match="persist"):
+        await main_mod._run_session(settings, None, None)
+
+    assert len(failed_writes) == 1
+    assert len(clock.sleeps) == 2
+    assert harness.mqtt.published[-1][0] == "brilliant/office/bridge"
+    assert json.loads(harness.mqtt.published[-1][1])["degraded"] == "retained_ledger"
+    assert all(topic != added_state for topic, *_rest in harness.mqtt.published)
+    assert harness.events[-2:] == ["bus_shutdown", "mqtt_disconnect"]
+
+
+async def test_latched_ledger_failure_outranks_other_faults_in_the_same_tick(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """F176-C-5: a reader death in the same tick cannot discard the ledger fault."""
+    harness = _SessionHarness(monkeypatch, real_bridge=True)
+    settings = _hot_poll_settings(hot_poll_seconds=2.0)
+    object.__setattr__(settings, "retained_topics_file", str(tmp_path / "owned.json"))
+    ledgers: list[retained_topics_mod.RetainedTopicLedger] = []
+    real_ledger = retained_topics_mod.RetainedTopicLedger
+
+    def track_ledger(panel_slug: str, path: Path) -> retained_topics_mod.RetainedTopicLedger:
+        ledger = real_ledger(panel_slug, path)
+        ledgers.append(ledger)
+        return ledger
+
+    monkeypatch.setattr(main_mod, "RetainedTopicLedger", track_ledger)
+    ledger_error = RetainedLedgerError("could not persist retained ledger")
+
+    async def fail_both_after_reconcile(sleep_number: int) -> None:
+        if sleep_number == 1:
+            ledgers[0]._failure = ledger_error
+            harness.mqtt.reader_failure_latched = True
+
+    clock = _SessionLoopClock(cancel_on_sleep=3, on_sleep=fail_both_after_reconcile)
+    _install_session_loop_clock(monkeypatch, clock)
+
+    with pytest.raises(RetainedLedgerError) as raised:
+        await main_mod._run_session(settings, None, None)
+
+    assert raised.value is ledger_error
+    assert json.loads(harness.mqtt.published[-1][1])["degraded"] == "retained_ledger"

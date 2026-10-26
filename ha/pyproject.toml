@@ -9,7 +9,7 @@ dependencies = []
 dev = [
     "pytest>=8",
     "pytest-homeassistant-custom-component==0.13.338", # pins HA core 2026.6.2
-    "asyncssh==2.23.1",                                # mirrors manifest.json requirements
+    "asyncssh==2.23.1",                                # manifest asyncssh floor; HA 2026.6.x cryptography pin blocks 2.24
     "aiomqtt==2.5.1",                                  # temporary device-principal client
     "paho-mqtt==2.1.0",                                # exact aiomqtt transport stack
     "ruff>=0.6",

@@ -21,12 +21,18 @@ import secrets
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Any, NamedTuple
 
 from brilliant_mqtt.commands import VarSet
-from brilliant_mqtt.model import BrilliantDevice, Variable, kind_for_peripheral_type
+from brilliant_mqtt.diagnostics import ResponseDiagnostics, WriteOutcome
+from brilliant_mqtt.model import (
+    BrilliantDevice,
+    CaptureProvenance,
+    Variable,
+    kind_for_peripheral_type,
+)
 from brilliant_mqtt.write_admission import (
     AdmissionTicket,
     Superseded,
@@ -35,6 +41,11 @@ from brilliant_mqtt.write_admission import (
     WriteClass,
     WriteResult,
 )
+
+
+class BusStartFencedError(RuntimeError):
+    """A prior resource close is unresolved, so allocating a new peer is unsafe."""
+
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +129,7 @@ class _WriteRecord:
     queued_at: float
     started_at: float | None = None
     detached: bool = False
+    settled: bool = False
 
 
 @dataclass(eq=False)
@@ -272,11 +284,17 @@ class _PendingPeripheral:
     peripheral id.
     """
 
-    __slots__ = ("peripheral_id", "snapshot", "normalized")
+    __slots__ = ("capture_provenance", "peripheral_id", "snapshot", "normalized")
 
-    def __init__(self, peripheral_id: str, snapshot: _PeripheralSnapshot) -> None:
+    def __init__(
+        self,
+        peripheral_id: str,
+        snapshot: _PeripheralSnapshot,
+        capture_provenance: CaptureProvenance,
+    ) -> None:
         self.peripheral_id = peripheral_id
         self.snapshot = snapshot
+        self.capture_provenance = capture_provenance
         self.normalized: BrilliantDevice | None = None
 
 
@@ -307,7 +325,11 @@ def _snapshot_peripheral(raw: Any) -> _PeripheralSnapshot:
     )
 
 
-def normalize_peripheral(device_id: str, peripheral_id: str, raw: Any) -> BrilliantDevice:
+def normalize_peripheral(
+    device_id: str,
+    peripheral_id: str,
+    raw: Any,
+) -> BrilliantDevice:
     """Translate a raw bus Peripheral into a normalized :class:`BrilliantDevice`.
 
     PURE function (no panel imports) so it is unit-testable off-panel. ``raw`` is
@@ -330,8 +352,9 @@ def normalize_peripheral(device_id: str, peripheral_id: str, raw: Any) -> Brilli
     peripheral_type = int(raw.peripheral_type)
     kind = kind_for_peripheral_type(peripheral_type)
 
+    raw_variables = dict(raw.variables)
     variables: dict[str, Variable] = {}
-    for var_name, raw_var in dict(raw.variables).items():
+    for var_name, raw_var in raw_variables.items():
         value = raw_var.value
         if value is None:
             # Skip None-valued entries (complex blobs / absent) — §4.
@@ -364,6 +387,10 @@ def normalize_peripheral(device_id: str, peripheral_id: str, raw: Any) -> Brilli
         kind=kind,
         peripheral_type=peripheral_type,
         variables=variables,
+        capture_present=frozenset(raw_variables),
+        capture_unknown=frozenset(
+            name for name, variable in raw_variables.items() if variable.value is None
+        ),
     )
 
 
@@ -451,7 +478,9 @@ class RpcBusAdapter:
         my_name: str = "brilliant_mqtt",
         extra_device_ids: tuple[str, ...] = (),
         clock: Callable[[], float] = time.monotonic,
+        diagnostics: ResponseDiagnostics | None = None,
     ) -> None:
+        self._diagnostics = diagnostics
         # A UNIQUE name per session (see _session_client_name): the bus peer key
         # is <owning_device_id>.<my_name>, so a constant name lets a half-bound
         # ghost registration lock the bridge out forever with NameInUseError.
@@ -477,6 +506,12 @@ class RpcBusAdapter:
         # outlived a prior session's bounded teardown can never touch a newer
         # session's bookkeeping (#88).
         self._session = 0
+        # Local ordering only: incremented exactly where raw observations are
+        # captured and where a native write is issued. A processor reconnect
+        # starts a new incomparable source generation.
+        self._capture_generation = 0
+        self._capture_sequence = 0
+        self._field_eras: dict[tuple[str, str, str], int] = {}
         # Multiple consumers (panel bridge + mesh publisher) may each register
         # a change callback; every change fans out to all of them. Each entry is
         # (callback, coalesce_pushes, want_device); want_device is a live
@@ -562,10 +597,11 @@ class RpcBusAdapter:
         """
         unresolved_closes = [task for task in self._resource_close_tasks if not task.done()]
         if unresolved_closes:
-            raise RuntimeError(
+            raise BusStartFencedError(
                 f"prior bus resource shutdown still pending ({len(unresolved_closes)} task(s))"
             )
         self._session += 1
+        self._advance_capture_generation()
         # Not ready until this start() commits: _require_started keeps gating on
         # _own_device_id, so owning _obs/_proc early (below) never opens a window
         # for a caller to use a half-started adapter.
@@ -580,6 +616,42 @@ class RpcBusAdapter:
         # prior failed attempt can never lock this one out (see _my_name_base).
         self._my_name = _session_client_name(self._my_name_base)
         return self._session
+
+    def _advance_capture_generation(self) -> None:
+        self._capture_generation += 1
+        self._capture_sequence = 0
+        self._field_eras.clear()
+
+    @property
+    def capture_generation(self) -> int:
+        return self._capture_generation
+
+    def _next_capture_provenance(self) -> CaptureProvenance:
+        self._capture_sequence += 1
+        return CaptureProvenance(self._capture_generation, self._capture_sequence)
+
+    def _field_capture(
+        self,
+        boundary: CaptureProvenance,
+        device_id: str,
+        peripheral_id: str,
+        names: Mapping[str, Any],
+        *,
+        complete: bool = False,
+    ) -> CaptureProvenance:
+        fields = set(names)
+        if complete:
+            fields.update(
+                name
+                for owner, peripheral, name in self._field_eras
+                if (owner, peripheral) == (device_id, peripheral_id)
+            )
+        return replace(
+            boundary,
+            field_eras=tuple(
+                (name, self._field_eras.get((device_id, peripheral_id, name), 0)) for name in fields
+            ),
+        )
 
     async def start(self) -> None:
         """Connect to the bus following the poc-findings §2 recipe.
@@ -763,8 +835,18 @@ class RpcBusAdapter:
         # BrilliantDevice so a push delivered to several callbacks (the panel
         # bridge AND the lossless scene bridge on the own device) is normalized
         # at most once total — like main, which shared one BrilliantDevice.
+        capture_provenance = self._next_capture_provenance()
         snapshot = tuple(
-            _PendingPeripheral(peripheral_id, _snapshot_peripheral(raw_peripheral))
+            _PendingPeripheral(
+                peripheral_id,
+                _snapshot_peripheral(raw_peripheral),
+                self._field_capture(
+                    capture_provenance,
+                    device_id,
+                    peripheral_id,
+                    dict(raw_peripheral.variables),
+                ),
+            )
             for peripheral_id, raw_peripheral in dict(peripherals).items()
         )
         for cb, coalesce_pushes in admitted:
@@ -829,10 +911,14 @@ class RpcBusAdapter:
                         # peripheral, reused across every consumer (issue #98).
                         device = pending_peripheral.normalized
                         if device is None:
-                            device = normalize_peripheral(
-                                device_id,
-                                pending_peripheral.peripheral_id,
-                                pending_peripheral.snapshot,
+                            device = replace(
+                                normalize_peripheral(
+                                    device_id,
+                                    pending_peripheral.peripheral_id,
+                                    pending_peripheral.snapshot,
+                                ),
+                                capture_provenance=pending_peripheral.capture_provenance,
+                                capture_complete=False,
                             )
                             pending_peripheral.normalized = device
                         await cb(device)
@@ -872,6 +958,10 @@ class RpcBusAdapter:
     def _note_reconnect(self) -> None:
         """Record that the processor reconnected (reconnect-rate clock)."""
         self._reconnect_times.append(self._clock())
+        # The library hook marshals onto the loop; the admission fence in
+        # _on_proc_reconnect has already passed, before asynchronous fan-out.
+        if self._diagnostics is not None:
+            self._diagnostics.note_bus_reconnect()
 
     def recent_reconnects(self, window_s: float) -> int:
         """Count processor reconnects within the last *window_s* seconds.
@@ -905,6 +995,7 @@ class RpcBusAdapter:
         if self._shutting_down or session != self._session:
             return
         logger.warning("bus processor reconnected; re-subscribing and re-reconciling")
+        self._advance_capture_generation()
         self._note_push()
         self._note_reconnect()
         self._spawn(self._after_reconnect(session))
@@ -961,6 +1052,7 @@ class RpcBusAdapter:
         devices: list[BrilliantDevice] = []
         device_ids = (own_id, *self._extra_device_ids) if include_extras else (own_id,)
         for device_id in device_ids:
+            boundary = self._next_capture_provenance()
             raw_device = await asyncio.wait_for(
                 obs.get_device(device_id),
                 timeout=_READ_DEADLINE_S,
@@ -970,7 +1062,16 @@ class RpcBusAdapter:
                 logger.warning("%s id=%s not returned by get_device()", label, device_id)
                 continue
             devices.extend(
-                normalize_peripheral(device_id, peripheral_id, raw_peripheral)
+                replace(
+                    normalize_peripheral(device_id, peripheral_id, raw_peripheral),
+                    capture_provenance=self._field_capture(
+                        boundary,
+                        device_id,
+                        peripheral_id,
+                        dict(raw_peripheral.variables),
+                        complete=True,
+                    ),
+                )
                 for peripheral_id, raw_peripheral in dict(raw_device.peripherals).items()
             )
         return devices
@@ -978,10 +1079,20 @@ class RpcBusAdapter:
     async def get_peripheral(self, device_id: str, peripheral_id: str) -> BrilliantDevice | None:
         """Return one normalized peripheral via an on-demand scoped read."""
         obs, _ = self._require_started()
+        boundary = self._next_capture_provenance()
         raw = await obs.get_peripheral(device_id, peripheral_id)
         if raw is None:
             return None
-        return normalize_peripheral(device_id, peripheral_id, raw)
+        return replace(
+            normalize_peripheral(device_id, peripheral_id, raw),
+            capture_provenance=self._field_capture(
+                boundary,
+                device_id,
+                peripheral_id,
+                dict(raw.variables),
+                complete=True,
+            ),
+        )
 
     def on_change(
         self,
@@ -1049,6 +1160,8 @@ class RpcBusAdapter:
         predecessor.set_result(Superseded())
         if not previous_acquired.done():
             previous_acquired.set_result(None)
+        if self._diagnostics is not None:
+            self._diagnostics.note_superseded()
         return True
 
     def _serve_next(self, device_id: str) -> None:
@@ -1148,18 +1261,8 @@ class RpcBusAdapter:
             # future finishes concurrently. wait preserves that cancellation
             # without cancelling the independently owned admission result.
             done, _ = await asyncio.wait({result}, timeout=_WRITE_DEADLINE_S)
-            if not done:
-                raise asyncio.TimeoutError
-            return result.result()
-        except asyncio.CancelledError:
-            if result is not admission.result:
-                # Cancellation of an already superseded caller cannot revoke
-                # the replacement's independently owned admission.
-                raise
-            if not admission.issued and admission.task is not None:
-                self._cancel_waiting(ticket)
-            raise
-        except asyncio.TimeoutError:
+            if done:
+                return result.result()
             admission.record.detached = True
             logger.warning(
                 "set_variables(%s) unresolved after %.0fs; detaching from the caller "
@@ -1168,6 +1271,14 @@ class RpcBusAdapter:
                 _WRITE_DEADLINE_S,
                 self._queue_wait(admission.record),
             )
+            raise asyncio.TimeoutError
+        except asyncio.CancelledError:
+            if result is not admission.result:
+                # Cancellation of an already superseded caller cannot revoke
+                # the replacement's independently owned admission.
+                raise
+            if not admission.issued and admission.task is not None:
+                self._cancel_waiting(ticket)
             raise
         finally:
             if not (
@@ -1180,7 +1291,7 @@ class RpcBusAdapter:
                 ticket._cancel_waiting = None
 
     def _finish_admission(self, admission: _WriteAdmission, task: asyncio.Task[str]) -> None:
-        self._settle_write(task)
+        self._settle_write(task, admission=admission)
         if not admission.acquired.done():
             admission.acquired.set_result(None)
         if not admission.result.done():
@@ -1223,6 +1334,24 @@ class RpcBusAdapter:
             cap = asyncio.get_running_loop().call_later(_WRITE_HARD_CAP_S, self._cap_write, record)
             try:
                 admission.issued = True
+                try:
+                    for name in admission.values:
+                        key = (admission.device_id, admission.peripheral_id, name)
+                        self._field_eras[key] = self._field_eras.get(key, 0) + 1
+                    boundary = self._next_capture_provenance()
+                    admission.ticket.mark_issued(
+                        replace(
+                            self._field_capture(
+                                boundary,
+                                admission.device_id,
+                                admission.peripheral_id,
+                                admission.values,
+                            ),
+                            issued_values=tuple(admission.values.items()),
+                        )
+                    )
+                except Exception as error:
+                    logger.warning("WIRED_ISSUE_CALLBACK_FAILED %s", type(error).__name__)
                 if admission.write_class is not WriteClass.MAINTENANCE:
                     for waiter in self._write_waiters.get(admission.device_id, []):
                         if waiter.write_class is WriteClass.MAINTENANCE:
@@ -1275,16 +1404,47 @@ class RpcBusAdapter:
             _WRITE_HARD_CAP_S,
         )
         self._write_timed_out = True
+        if self._diagnostics is not None:
+            self._diagnostics.note_hard_cap()
 
-    def _settle_write(self, task: asyncio.Task[str]) -> None:
+    def _settle_write(self, task: asyncio.Task[str], *, admission: _WriteAdmission) -> None:
         """Done-callback: drop the strong ref and mark any exception retrieved.
 
         A detached caller never awaits its task, so without this asyncio would
         log "Task exception was never retrieved" at garbage collection.
+        The diagnostics path reads ``self._clock()`` exactly once per settled write.
+        The ``record.settled`` latch rejects repeat callbacks and double-recording.
         """
         self._write_tasks.discard(task)
-        if not task.cancelled():
-            task.exception()
+        error = None if task.cancelled() else task.exception()
+        record = admission.record
+        if record.settled:
+            return
+        record.settled = True
+        if self._diagnostics is None:
+            return
+        # Every native task reaches this boundary, including pre-step cancellation.
+        # Its lock is released and the scheduler has not admitted the next write.
+        settled_at = self._clock()
+        queue_wait_s = rpc_s = None
+        if record.started_at is not None:
+            queue_wait_s = record.started_at - record.queued_at
+            rpc_s = settled_at - record.started_at
+        outcome: WriteOutcome
+        if task.cancelled():
+            outcome = "cancelled"
+            if admission.tombstoned and not admission.issued:
+                self._diagnostics.note_ticket_revoked_before_rpc()
+        # These are distinct classes on Python 3.10; subclasses are ordinary errors.
+        elif type(error) is TimeoutError:
+            outcome = "timeout_bus"
+        elif type(error) is asyncio.TimeoutError:
+            outcome = "timeout_async"
+        elif error is not None:
+            outcome = "detached_late_error" if record.detached else "error"
+        else:
+            outcome = "detached_late_ok" if record.detached else "ok"
+        self._diagnostics.note_write_settled(outcome, queue_wait_s, rpc_s)
 
     def _queue_wait(self, record: _WriteRecord) -> float:
         started = record.started_at if record.started_at is not None else self._clock()
@@ -1412,6 +1572,8 @@ class RpcBusAdapter:
                 sorted(task.get_name() for task in pending),
             )
         for task in done:
+            # Ordinary close failures are logged inside the task; only an
+            # in-resource CancelledError can escape here.
             task.result()
 
     async def shutdown(self) -> None:

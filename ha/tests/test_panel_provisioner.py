@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from types import MappingProxyType
@@ -62,6 +63,7 @@ from custom_components.brilliant_mqtt.provisioning_journal import (
     ProvisioningOperation,
     ProvisioningPhase,
     ProvisioningRecord,
+    RetainedRollback,
     StoredFileSnapshot,
     StoredFleetProfile,
     StoredJournalError,
@@ -70,6 +72,7 @@ from custom_components.brilliant_mqtt.provisioning_journal import (
     StoredPanelSnapshot,
     StoredServiceSnapshot,
 )
+from custom_components.brilliant_mqtt.release_identity import ReleaseIdentity, RollbackBaseline
 from custom_components.brilliant_mqtt.setup_protocol import PreflightRequest
 from custom_components.brilliant_mqtt.shell import HostIdentity, PanelShell
 from tests.fakes import FakePanelProcess, FakeShell
@@ -292,11 +295,11 @@ async def test_concrete_release_provider_uses_bundled_payload_and_broker_seam(
     )
 
     assert bundle.local_payload_dir.endswith("/custom_components/brilliant_mqtt/agent_payload")
-    assert bundle.version == "0.10.2"
+    assert bundle.version == "0.11.3"
     assert bundle.transaction_id == _TRANSACTION_ID
     assert bundle.mqtt_ca == _CA_BYTES
     assert bundle.mqtt_ca_path == (
-        f"/var/brilliant-mqtt/releases/0.10.2--{_TRANSACTION_ID.hex}/mqtt-ca.pem"
+        f"/var/brilliant-mqtt/releases/0.11.3--{_TRANSACTION_ID.hex}/mqtt-ca.pem"
     )
     parsed = panel_ops.parse_env(bundle.environment)
     assert parsed["BRILLIANT_PANEL"] == "office"
@@ -370,6 +373,7 @@ def _absent_snapshot() -> StoredPanelSnapshot:
         wifi_watchdog_service=missing_service,
         bus_watchdog_service=missing_service,
         selected_components=(),
+        baseline=RollbackBaseline("c" * 32, "d" * 64, {}),
     )
 
 
@@ -401,6 +405,13 @@ def _release_link_snapshot() -> StoredPanelSnapshot:
             COMPONENT_BRIDGE,
             COMPONENT_WIFI_WATCHDOG,
             COMPONENT_BUS_WATCHDOG,
+        ),
+        baseline=RollbackBaseline(
+            "c" * 32,
+            "d" * 64,
+            {
+                "bridge": ReleaseIdentity("0.6.0", None, "e" * 64, "b" * 32, "release_link"),
+            },
         ),
     )
 
@@ -512,6 +523,43 @@ class _FakeJournal:
     pending_commit_started: asyncio.Event = field(default_factory=asyncio.Event)
     complete_commit_started: asyncio.Event = field(default_factory=asyncio.Event)
     created_record: ProvisioningRecord | None = None
+
+    async def async_begin_ownerless_finalize(self, expected: RetainedRollback) -> RetainedRollback:
+        raise RuntimeError("ownerless_finalization_requires_real_journal")
+
+    async def async_retained_records(self) -> tuple[RetainedRollback, ...]:
+        return ()
+
+    async def async_retained(self, transaction_id: UUID) -> RetainedRollback | None:
+        return None
+
+    async def async_retained_state(
+        self,
+        transaction_id: UUID,
+        state: str,
+        *,
+        evidence: str | None = None,
+    ) -> None:
+        pass
+
+    async def async_begin_restore(self, transaction_id: UUID, root_password: str) -> None:
+        assert self.record is not None
+        self.record = replace(
+            self.record,
+            operation=ProvisioningOperation.ROLLBACK,
+            phase=ProvisioningPhase.ROLLBACK_PENDING,
+        )
+
+    async def async_remove_retained(self, transaction_id: UUID) -> None:
+        pass
+
+    async def async_complete_cleanup(self, transaction_id: UUID) -> None:
+        self.events.append(("journal_cleanup_complete",))
+        self.record = None
+
+    async def async_complete_absent_rollback(self, transaction_id: UUID) -> None:
+        self.events.append(("journal_absent_rollback_complete",))
+        self.record = None
 
     async def async_load(self) -> ProvisioningRecord | None:
         self.events.append(("journal_load",))
@@ -639,6 +687,41 @@ class _FakeOperations:
     rollback_started: asyncio.Event = field(default_factory=asyncio.Event)
     rolled_back_snapshot: panel_ops.PanelSnapshot | None = None
 
+    @asynccontextmanager
+    async def release_transaction(
+        self,
+        shell: PanelShell,
+        local_payload_dir: str,
+        *,
+        panel: str,
+        components: tuple[str, ...] = (),
+        override: Mapping[str, object] | None = None,
+        transaction_id: UUID | None = None,
+        allow_pre_ordinal_upgrade: bool = False,
+    ) -> AsyncIterator[panel_ops.ReleaseAdmission]:
+        yield panel_ops.ReleaseAdmission(shell, {}, {}, {"bridge": True}, "c" * 32)
+
+    async def capture_baseline(
+        self, shell: PanelShell, snapshot: panel_ops.PanelSnapshot
+    ) -> panel_ops.PanelSnapshot:
+        return snapshot
+
+    async def verify_baseline(self, shell: PanelShell, snapshot: panel_ops.PanelSnapshot) -> None:
+        pass
+
+    async def finalize_baseline(self, shell: PanelShell, snapshot: panel_ops.PanelSnapshot) -> None:
+        pass
+
+    async def restart_restored(
+        self,
+        shell: PanelShell,
+        snapshot: panel_ops.PanelSnapshot,
+        deployment_id: str,
+        *,
+        on_service_stopped: Callable[[], None],
+    ) -> None:
+        on_service_stopped()
+
     async def snapshot_panel(self, shell: PanelShell) -> panel_ops.PanelSnapshot:
         del shell
         self.events.append(("snapshot",))
@@ -750,6 +833,9 @@ class _FakeObserver:
         expected_version: str,
         expected_deployment_id: str,
     ) -> None:
+        self.evidence = replace(
+            self.evidence, agent_version=expected_version, deployment_id=expected_deployment_id
+        )
         self.events.append(
             (
                 "health_boundary",
@@ -909,8 +995,9 @@ class _Harness:
 
     def observer_factory(self, slug: str) -> _FakeObserver:
         assert slug == "office"
+        recovering = any(event[0] == "health_factory" for event in self.events)
         self.events.append(("health_factory", slug))
-        return self.observer
+        return _FakeObserver(self.events, _health()) if recovering else self.observer
 
     async def transaction_lookup(self, transaction_id: UUID) -> TransactionLookup:
         self.events.append(("transaction_lookup", transaction_id))
@@ -1027,8 +1114,8 @@ async def test_install_has_exact_durable_order_and_returns_canonical_panel_data(
         ("shell_connect",),
         ("inspect",),
         ("duplicate", _FINGERPRINT),
-        ("snapshot",),
         ("release", _TRANSACTION_ID, _SETUP_ID),
+        ("snapshot",),
         ("journal_create", ProvisioningPhase.STAGED.value),
         (
             "stage",
@@ -1468,7 +1555,7 @@ async def test_activation_failure_durably_rolls_back_and_clears_journal() -> Non
         StoredPanelLayout.ABSENT.value,
         _TRANSACTION_ID,
     ) in harness.events
-    assert ("journal_rollback_complete", True) in harness.events
+    assert ("journal_absent_rollback_complete",) in harness.events
     assert harness.events.index(rollback_pending) < next(
         index for index, event in enumerate(harness.events) if event[0] == "rollback"
     )
@@ -1975,7 +2062,7 @@ async def test_post_activation_rollback_prunes_candidate_before_journal_clear() 
     journal_clear = next(
         index
         for index, event in enumerate(harness.events)
-        if event[0] == "journal_rollback_complete"
+        if event[0] == "journal_absent_rollback_complete"
     )
     assert rollback < cleanup < journal_clear
     assert raised.value.code == "activation_failed"
@@ -2451,3 +2538,89 @@ async def test_install_never_starts_second_transaction_while_recovery_is_pending
 
     assert raised.value.code == "transaction_in_progress"
     assert not any(event[0] == "identity" for event in harness.events)
+
+
+async def test_install_bounds_wait_for_shared_lock_without_releasing_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from custom_components.brilliant_mqtt import panel_provisioner
+
+    monkeypatch.setattr(panel_provisioner, "INSTALL_LOCK_TIMEOUT_SECONDS", 0.001, raising=False)
+    harness = _Harness()
+    lock = asyncio.Lock()
+    async with lock:
+        with pytest.raises(PanelProvisioningError, match="transaction_in_progress"):
+            async with asyncio.timeout(1):
+                await harness.provisioner(lock).async_install(
+                    _request(), _fleet(), harness.progress
+                )
+        assert lock.locked()
+    assert harness.events == []
+
+
+async def test_install_existing_journal_recovery_has_deadline_and_settles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from custom_components.brilliant_mqtt import panel_provisioner
+
+    monkeypatch.setattr(panel_provisioner, "RECOVERY_TIMEOUT_SECONDS", 0.001)
+    harness = _Harness()
+    record = _record(ProvisioningPhase.PENDING_CONFIG_COMMIT)
+    harness.journal.record = record
+    provisioner = harness.provisioner()
+    settled = asyncio.Event()
+    release = asyncio.Event()
+
+    async def stalled(*_args: object) -> None:
+        try:
+            await release.wait()
+            raise RuntimeError("released test recovery")
+        finally:
+            settled.set()
+
+    monkeypatch.setattr(provisioner, "_async_recover_record", stalled)
+    task = asyncio.create_task(provisioner.async_install(_request(), _fleet(), harness.progress))
+    try:
+        await asyncio.sleep(0.02)
+        assert task.done(), "existing journal recovery must obey its deadline"
+        with pytest.raises(PanelProvisioningError, match="rollback_deadline_exceeded"):
+            await task
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+    assert settled.is_set()
+    assert harness.journal.record == record
+    assert not provisioner._lock.locked()
+    assert not any(event[0] == "identity" for event in harness.events)
+
+
+async def test_snapshot_probe_failure_is_safe_and_actionable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _Harness()
+
+    async def failed(_shell: PanelShell) -> panel_ops.PanelSnapshot:
+        raise panel_ops.PanelOpError("snapshot_probe_failed: SECRET remote output")
+
+    monkeypatch.setattr(harness.operations, "snapshot_panel", failed)
+    with pytest.raises(PanelProvisioningError) as raised:
+        await harness.provisioner().async_install(_request(), _fleet(), harness.progress)
+    assert raised.value.code == "snapshot_probe_failed"
+    assert "SECRET" not in str(raised.value)
+    assert harness.journal.record is None
+
+
+async def test_cancelling_install_waiter_preserves_shared_lock_owner() -> None:
+    harness = _Harness()
+    lock = asyncio.Lock()
+    async with lock:
+        task = asyncio.create_task(
+            harness.provisioner(lock).async_install(_request(), _fleet(), harness.progress)
+        )
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert lock.locked()
+        assert harness.events == []
+    assert not lock.locked()

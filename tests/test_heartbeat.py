@@ -445,3 +445,45 @@ def test_real_unwritable_phase_directory_does_not_leave_reboot_armed(tmp_path: P
         )
     finally:
         directory.chmod(0o700)
+
+
+@pytest.mark.parametrize("recovered", [False, True])
+def test_readonly_marker_failure_releases_only_recovered_bus_lease(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, recovered: bool
+) -> None:
+    phase = tmp_path / "bus-phase"
+    write_phase(str(phase), "bus", monotonic_clock=lambda: 100.0)
+    original = phase.read_text()
+
+    def readonly(*args: object, **kwargs: object) -> None:
+        raise OSError("read-only filesystem")
+
+    monkeypatch.setattr(heartbeat, "_atomic_write", readonly)
+    monkeypatch.setattr(heartbeat, "_rewrite_phase_lease", lambda path, text: False)
+    monkeypatch.setattr("brilliant_mqtt.heartbeat.os.unlink", readonly)
+    assert not write_phase(
+        str(phase), "bus", bus_read_succeeded=recovered, monotonic_clock=lambda: 200.0
+    )
+    assert phase.read_text() == original
+    assert (str(phase) in heartbeat._phase_leases) is not recovered
+
+
+def test_recovery_releases_retained_attempt_lease_even_when_rate_limited(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    phase = tmp_path / "bus-phase"
+    write_phase(str(phase), "bus", monotonic_clock=lambda: 100.0)
+
+    def readonly(*args: object, **kwargs: object) -> None:
+        raise OSError("read-only filesystem")
+
+    monkeypatch.setattr(heartbeat, "_atomic_write", readonly)
+    monkeypatch.setattr(heartbeat, "_rewrite_phase_lease", lambda path, text: False)
+    monkeypatch.setattr("brilliant_mqtt.heartbeat.os.unlink", readonly)
+    assert not write_phase(str(phase), "bus", monotonic_clock=lambda: 200.0)
+    assert str(phase) in heartbeat._phase_leases
+    assert not write_phase(
+        str(phase), "bus", bus_read_succeeded=True, monotonic_clock=lambda: 201.0
+    )
+    assert str(phase) not in heartbeat._phase_leases
+    assert str(phase) not in heartbeat._owned_phase_records

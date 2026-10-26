@@ -10,15 +10,19 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from pathlib import Path
+from typing import NoReturn
 
 from brilliant_mqtt import __version__
 from brilliant_mqtt.bridge import Bridge, HotPollReadTimeout, WriteThrottle
-from brilliant_mqtt.bus import RpcBusAdapter
+from brilliant_mqtt.bus import BusStartFencedError, RpcBusAdapter
 from brilliant_mqtt.config import Settings
 from brilliant_mqtt.desired_state import DesiredState
+from brilliant_mqtt.diagnostics import ResponseDiagnostics, SessionRebuildReason
 from brilliant_mqtt.discovery import meta_topic
 from brilliant_mqtt.heartbeat import MAX_SESSION_RETRY_BACKOFF_S, write_heartbeat, write_phase
 from brilliant_mqtt.mesh_leader import MeshLeader
@@ -54,6 +58,30 @@ def _clock_ms() -> int:
     return int(time.time() * 1_000)
 
 
+class MqttConnectError(RuntimeError):
+    """The MQTT connection attempt failed before session startup."""
+
+
+@dataclass
+class _SessionProgress:
+    connect_failures: int = 0
+    fenced_starts: int = 0
+
+    def reconciled(self) -> None:
+        self.connect_failures = 0
+
+    def bus_started(self) -> None:
+        # Also called for nonfenced start failures: the fence streak is broken.
+        self.fenced_starts = 0
+
+
+def _exit_fenced_process(count: int) -> NoReturn:
+    log.error("bus start fenced %d consecutive times; restarting process", count)
+    # asyncio.run() gathers cancelled tasks on exit. Resource-close stragglers
+    # can resist cancellation forever, so graceful unwinding cannot restart us.
+    os._exit(1)
+
+
 class MqttReaderDeadError(RuntimeError):
     """The MQTT receive loop stopped unexpectedly, so rebuild the session."""
 
@@ -80,6 +108,15 @@ class MqttTransportOverloadError(RuntimeError):
     session persistence. The excess is genuinely dropped, but observably, via a
     loud fail + reconnect, not silently. The detached reader task never surfaces
     this; only the session-loop accessor check does."""
+
+
+_REBUILD_REASONS: dict[type[Exception], SessionRebuildReason] = {
+    MqttReaderDeadError: "mqtt_reader_dead",
+    BusStaleError: "bus_stale",
+    BusWriteStuckError: "bus_write_stuck",
+    BusReconnectStormError: "bus_reconnect_storm",
+    MqttTransportOverloadError: "mqtt_transport_overload",
+}
 
 
 class _CoalescingCallback:
@@ -154,6 +191,8 @@ async def _run_session(
     settings: Settings,
     desired_panel: DesiredState | None,
     desired_mesh: DesiredState | None,
+    diagnostics: ResponseDiagnostics | None = None,
+    progress: _SessionProgress | None = None,
 ) -> None:
     """Run ONE bridge session: construct the adapters, serve forever, tear down.
 
@@ -167,8 +206,11 @@ async def _run_session(
     """
     write_phase(settings.bus_phase_file, "pre_bus")
     participating = settings.mesh_priority >= 1
-    mqtt = AioMqttAdapter(settings)
-    bus = RpcBusAdapter(extra_device_ids=(_MESH_DEVICE_ID,) if participating else ())
+    mqtt = AioMqttAdapter(settings, diagnostics=diagnostics)
+    bus = RpcBusAdapter(
+        extra_device_ids=(_MESH_DEVICE_ID,) if participating else (), diagnostics=diagnostics
+    )
+    panel_bridge: Bridge | None = None
     mesh_bridge: Bridge | None = None
     scene_bridge: SceneBridge | None = None
     mqtt_connected = False
@@ -221,6 +263,7 @@ async def _run_session(
             write_throttle=write_throttle,
             owned_topics=owned_topics,
             deployment_id=settings.deployment_id,
+            diagnostics=diagnostics,
         )
 
         if participating:
@@ -280,13 +323,16 @@ async def _run_session(
         async def _reconcile_after_bus_reconnect() -> None:
             # After a bus reconnect, pushes (and the observer's get_all mirror)
             # may have missed changes — re-reconcile to republish the truth.
-            await panel_bridge.reconcile()
+            await panel_bridge.reconcile_after_reconnect()
             if mesh_bridge is not None and leader.is_leader:
                 await mesh_bridge.reconcile()
 
         bus.on_reconnect(_CoalescingCallback(_reconcile_after_bus_reconnect))
 
-        await mqtt.connect()
+        try:
+            await mqtt.connect()
+        except Exception as error:
+            raise MqttConnectError("MQTT connection failed") from error
         mqtt_connected = True
         if participating:
             # Join the election before bus data flows; the FIRST mesh
@@ -302,8 +348,20 @@ async def _run_session(
         if not write_phase(settings.bus_phase_file, "bus"):
             log.error("bus phase marker unavailable; reboot guard disabled")
             phase_marker_failure_logged = True
-        await bus.start()
+        try:
+            await bus.start()
+        except BusStartFencedError:
+            raise
+        except Exception:
+            if progress is not None:
+                progress.bus_started()
+            raise
+        else:
+            if progress is not None:
+                progress.bus_started()
         await panel_bridge.reconcile()
+        if progress is not None:
+            progress.reconciled()
         if scene_bridge is not None:
             await scene_bridge.async_start()
 
@@ -315,6 +373,13 @@ async def _run_session(
         consecutive_resync_failures = 0
         while True:
             await asyncio.sleep(tick)
+
+            # The wired feedback publisher runs detached and cannot propagate a
+            # ledger failure to its caller; fail closed here instead (#177).
+            # First, so an unrelated fault in this tick cannot discard it.
+            ledger_failure = owned_topics.consume_failure()
+            if ledger_failure is not None:
+                raise ledger_failure
 
             # The MQTT reader is intended to remain alive for the whole
             # session; either an exception or a plain return requires rebuild.
@@ -471,6 +536,11 @@ async def _run_session(
                 await mesh_bridge.shutdown_mesh_feedback()
             except Exception:
                 log.exception("mesh feedback shutdown failed during cleanup")
+        if panel_bridge is not None:
+            try:
+                await panel_bridge.shutdown_wired_feedback()
+            except Exception as error:
+                log.error("WIRED_SHUTDOWN_FAILED %s", type(error).__name__)
         if scene_bridge is not None:
             try:
                 await scene_bridge.async_shutdown()
@@ -488,6 +558,9 @@ async def _run_session(
 
 async def run(settings: Settings) -> None:
     """Supervise the bridge forever: (re)connect, reconcile, periodically resync."""
+    # PROCESS-lifetime like DesiredState: rebuilds must not erase their own
+    # diagnostic history. All sessions share this recorder; no disk persistence.
+    diagnostics = ResponseDiagnostics()
     # Desired-state stores are PROCESS-lifetime, not session-lifetime: sessions
     # rebuild routinely (stale watchdog / storm breaker), and a rebuild must not
     # discard in-memory intent recorded while persistence was failing, nor
@@ -495,18 +568,33 @@ async def run(settings: Settings) -> None:
     # runs exactly once, here.
     desired_panel = _make_desired(settings, f"{settings.panel}-faceplate")
     desired_mesh = _make_desired(settings, "mesh") if settings.mesh_priority >= 1 else None
+    progress = _SessionProgress()
     while True:
+        delay = _BACKOFF_S
         try:
-            await _run_session(settings, desired_panel, desired_mesh)
+            await _run_session(settings, desired_panel, desired_mesh, diagnostics, progress)
         except asyncio.CancelledError:
             raise
+        except MqttConnectError:
+            progress.connect_failures += 1
+            delay = min(_BACKOFF_S * 2 ** min(progress.connect_failures - 1, 4), 60)
+            diagnostics.note_session_rebuild("other")
+            log.exception("MQTT connection failed; will reconnect after %ss", delay)
+        except BusStartFencedError:
+            progress.fenced_starts += 1
+            diagnostics.note_session_rebuild("other")
+            if progress.fenced_starts >= settings.bus_fenced_start_limit:
+                _exit_fenced_process(progress.fenced_starts)
+            log.exception("bus start fenced; will retry after backoff")
         except RetainedLedgerError:
+            diagnostics.note_session_rebuild("other")
             log.exception("retained ledger unavailable; will reconnect after extended backoff")
             await asyncio.sleep(_LEDGER_BACKOFF_S)
             continue
-        except Exception:
+        except Exception as error:
+            diagnostics.note_session_rebuild(_REBUILD_REASONS.get(type(error), "other"))
             log.exception("bridge session failed; will reconnect after backoff")
-        await asyncio.sleep(_BACKOFF_S)
+        await asyncio.sleep(delay)
 
 
 def main() -> None:

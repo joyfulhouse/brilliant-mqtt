@@ -8,6 +8,8 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import Enum
 
+from brilliant_mqtt.model import CaptureProvenance
+
 
 class WriteClass(Enum):
     INTERACTIVE_FIFO = "interactive_fifo"
@@ -44,11 +46,29 @@ class AdmissionTicket:
 
     _owner: object | None = field(default=None, init=False, repr=False)
     _cancel_waiting: Callable[[], None] | None = field(default=None, init=False, repr=False)
+    _issued_at: CaptureProvenance | None = field(default=None, init=False, repr=False)
+    _on_issued: Callable[[CaptureProvenance], None] | None = field(
+        default=None, init=False, repr=False
+    )
 
     def cancel_waiting(self) -> None:
         """Relinquish lane ownership; the adapter never cancels an issued RPC."""
         if self._cancel_waiting is not None:
             self._cancel_waiting()
+
+    def set_issue_callback(self, callback: Callable[[CaptureProvenance], None]) -> None:
+        """Observe the adapter's actual native-issue boundary for this ticket."""
+        self._on_issued = callback
+        if self._issued_at is not None:
+            callback(self._issued_at)
+
+    def mark_issued(self, provenance: CaptureProvenance) -> None:
+        """Record the issue boundary once; called only by a BusClient."""
+        if self._issued_at is not None:
+            return
+        self._issued_at = provenance
+        if self._on_issued is not None:
+            self._on_issued(provenance)
 
 
 @dataclass

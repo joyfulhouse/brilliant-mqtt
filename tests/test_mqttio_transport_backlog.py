@@ -22,7 +22,7 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import AsyncIterator
-from typing import Protocol, cast
+from typing import cast
 
 import aiomqtt
 import paho.mqtt.client as paho
@@ -31,6 +31,7 @@ import pytest
 from brilliant_mqtt import mqttio
 from brilliant_mqtt.config import Settings
 from brilliant_mqtt.mqttio import AioMqttAdapter
+from tests.fakes import _AiomqttClientInternals, _msg
 
 
 def _settings() -> Settings:
@@ -39,18 +40,6 @@ def _settings() -> Settings:
         mqtt_host="broker.invalid",
         mqtt_username="u",
         mqtt_password="p",
-    )
-
-
-def _msg(topic: str, payload: bytes = b"x") -> aiomqtt.Message:
-    """A production-shaped inbound message (paho hands aiomqtt bytes payloads)."""
-    return aiomqtt.Message(
-        topic=topic,
-        payload=payload,
-        qos=1,
-        retain=False,
-        mid=0,
-        properties=None,
     )
 
 
@@ -145,13 +134,13 @@ def test_latest_wins_topic_coalesces_at_admission_without_growing_backlog() -> N
     queue = _queue(latch, maxsize=3)
     assert mqttio._is_latest_wins_topic(_LIGHT)
 
-    queue.put_nowait(_msg(_LIGHT, b"ON"))
-    queue.put_nowait(_msg(_LIGHT, b"OFF"))
-    queue.put_nowait(_msg(_LIGHT, b"BRIGHT"))
+    queue.put_nowait(_msg(_LIGHT, b'{"brightness":40}'))
+    queue.put_nowait(_msg(_LIGHT, b'{"brightness":80}'))
+    queue.put_nowait(_msg(_LIGHT, b'{"brightness":120}'))
 
     assert queue.qsize() == 1
     latest = queue.get_nowait()
-    assert latest.payload == b"BRIGHT"  # latest wins
+    assert latest.payload == b'{"brightness":120}'  # latest wins
     assert queue.queued_bytes == 0
     assert latch.consume() is False  # coalescing never overloads
 
@@ -161,10 +150,10 @@ def test_latest_wins_coalescing_absorbs_a_flood_without_tripping_the_bound() -> 
     queue = _queue(latch, maxsize=8)
 
     for value in range(10_000):
-        queue.put_nowait(_msg(_LIGHT, str(value).encode()))
+        queue.put_nowait(_msg(_LIGHT, f'{{"brightness":{value}}}'.encode()))
 
     assert queue.qsize() == 1
-    assert queue.get_nowait().payload == b"9999"
+    assert queue.get_nowait().payload == b'{"brightness":9999}'
     assert latch.consume() is False
 
 
@@ -214,9 +203,11 @@ def test_latest_wins_replacement_over_cumulative_budget_keeps_newest() -> None:
     CUMULATIVE total over it keeps the NEWEST value (the point of latest-wins)
     and only then trips — a pre-rebuild drain applies the freshest command."""
     latch = mqttio._TransportOverloadLatch()
-    a_old = _msg(_LIGHT, b"x" * 40)
+    a_old = _msg(_LIGHT, b'{"brightness":1}')
     filler = _msg(_MUTE, b"y" * 40)  # non-coalescing: distinct queued work
-    a_new = _msg(_LIGHT, b"z" * 90)  # own cost fits budget; cumulative does not
+    a_new = _msg(
+        _LIGHT, b'{"brightness":12345678901234567890}'
+    )  # own cost fits budget; cumulative does not
     budget = mqttio._message_bytes(filler) + mqttio._message_bytes(a_new) - 1
     assert mqttio._message_bytes(a_new) <= budget  # the replacement fits on its own
     queue = mqttio._BoundedTransportQueue(maxsize=8, max_bytes=budget, overload=latch)
@@ -226,7 +217,7 @@ def test_latest_wins_replacement_over_cumulative_budget_keeps_newest() -> None:
     with pytest.raises(asyncio.QueueFull):
         queue.put_nowait(a_new)  # cumulative over budget -> trips, newest kept
 
-    assert queue.get_nowait().payload == b"z" * 90  # latest-wins: newest survives
+    assert queue.get_nowait().payload == a_new.payload  # latest-wins: newest survives
     assert latch.consume() is True
 
 
@@ -236,19 +227,19 @@ def test_latest_wins_oversized_replacement_refused_without_exceeding_budget() ->
     stays hard-capped at the budget — a message too big to ever fit cannot
     overshoot the memory bound by an arbitrary amount (#90)."""
     latch = mqttio._TransportOverloadLatch()
-    small = _msg(_LIGHT, b"a" * 40)
+    small = _msg(_LIGHT, b'{"brightness":1}')
     budget = mqttio._message_bytes(small) + 50
     queue = mqttio._BoundedTransportQueue(maxsize=8, max_bytes=budget, overload=latch)
 
     queue.put_nowait(small)
     baseline = queue.queued_bytes
-    huge = _msg(_LIGHT, b"z" * (budget * 4))  # own cost alone dwarfs the budget
+    huge = _msg(_LIGHT, b'{"brightness":' + b"1" * 300 + b"}")  # own cost alone dwarfs the budget
     with pytest.raises(asyncio.QueueFull):
         queue.put_nowait(huge)
 
     assert queue.queued_bytes <= budget  # hard cap held — no arbitrary overshoot
     assert queue.queued_bytes == baseline  # oversized item never stored
-    assert queue.get_nowait().payload == b"a" * 40  # pending twin kept
+    assert queue.get_nowait().payload == small.payload  # pending twin kept
     assert latch.consume() is True
 
 
@@ -287,16 +278,6 @@ def _paho_message(topic: str, payload: bytes) -> paho.MQTTMessage:
     message.payload = payload
     message.qos = 1
     return message
-
-
-class _AiomqttClientInternals(Protocol):
-    """The private aiomqtt.Client surface this seam test drives (client.py): the
-    incoming queue built via our ``queue_type`` hook, and the paho message
-    callback. Declared so the test type-checks with no suppression."""
-
-    _queue: mqttio._BoundedTransportQueue
-
-    def _on_message(self, client: object, userdata: object, message: paho.MQTTMessage) -> None: ...
 
 
 async def test_queuefull_is_swallowed_by_real_aiomqtt_on_message(

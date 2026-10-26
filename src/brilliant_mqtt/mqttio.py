@@ -12,16 +12,21 @@ Reconnect/backoff is intentionally NOT handled here — the runner
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import math
 import ssl
+import traceback
 from collections import deque
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import NoReturn
 
 import aiomqtt
 
 from brilliant_mqtt.config import Settings
+from brilliant_mqtt.diagnostics import ResponseDiagnostics
 from brilliant_mqtt.discovery import availability_topic
 from brilliant_mqtt.mapping import AUX_SPECS
 from brilliant_mqtt.protocols import CommandSubscribeError
@@ -59,6 +64,11 @@ _SHUTDOWN_DRAIN_DEADLINE_S = 5.0
 # Post-cancel settlement bound: workers SHOULD exit promptly on cancel, but a
 # callback that swallows CancelledError must not wedge disconnect (finding 4).
 _SHUTDOWN_WORKER_SETTLE_S = 1.0
+_LANE_RESTART_BASE_DELAY_S = 0.1
+_LANE_RESTART_MAX_DELAY_S = 0.5
+_LANE_RESTART_MAX_FAILURES = 5
+_LANE_REOPEN_COOLDOWN_S = 30.0
+_LANE_FAILURE_FRAME_LIMIT = 3
 _NUMBER_AUX_VARS = frozenset(
     spec.var for specs in AUX_SPECS.values() for spec in specs if spec.component == "number"
 )
@@ -81,36 +91,79 @@ class _InboundMessage:
     message_cbs: tuple[Callable[[str, str, bool], Awaitable[None]], ...]
 
 
+@dataclass(slots=True)
+class _ClosedLaneState:
+    reopen_at: float
+    rejected: int = 0
+
+
+def _worker_failure_metadata(error: BaseException | None) -> tuple[str, str]:
+    if error is None:
+        return "none", "none"
+    frames = traceback.extract_tb(error.__traceback__, limit=-_LANE_FAILURE_FRAME_LIMIT)
+    locations = ",".join(
+        f"{Path(frame.filename).name}:{frame.lineno}:{frame.name}" for frame in frames
+    )
+    return type(error).__qualname__, locations or "none"
+
+
 class _LaneQueue:
     """Bounded FIFO with filtered latest-wins replacement by exact topic."""
 
-    def __init__(self, maxsize: int) -> None:
+    def __init__(self, maxsize: int, *, diagnostics: ResponseDiagnostics | None = None) -> None:
         self._maxsize = maxsize
+        self._diagnostics = diagnostics
         self._pending: deque[_InboundMessage] = deque()
         self._condition = asyncio.Condition()
         self._unfinished_tasks = 0
         self._finished = asyncio.Event()
         self._finished.set()
+        self._accepting = True
 
     @property
     def unfinished_tasks(self) -> int:
         return self._unfinished_tasks
 
-    async def put(self, message: _InboundMessage, *, latest_wins: bool) -> None:
+    async def put(self, message: _InboundMessage, *, latest_wins: bool) -> bool:
         async with self._condition:
+            if not self._accepting:
+                return False
             if latest_wins:
                 for index in range(len(self._pending) - 1, -1, -1):
                     pending = self._pending[index]
-                    if not _is_latest_wins_topic(pending.topic):
+                    if (
+                        not _is_latest_wins_topic(pending.topic)
+                        or _coalesce_payload(pending.topic, pending.payload, pending.payload)
+                        is None
+                    ):
                         break
                     if pending.topic == message.topic:
-                        self._pending[index] = message
-                        return
-            await self._condition.wait_for(lambda: len(self._pending) < self._maxsize)
+                        if (
+                            pending.retained != message.retained
+                            or pending.command_cbs != message.command_cbs
+                            or pending.message_cbs != message.message_cbs
+                        ):
+                            break
+                        payload = _coalesce_payload(message.topic, pending.payload, message.payload)
+                        if payload is None:
+                            break
+                        self._pending[index] = replace(message, payload=payload)
+                        # Transport and lane queues own disjoint pending sets:
+                        # moving a command removes it upstream, and a replaced
+                        # command never advances, so it can be counted only once.
+                        if self._diagnostics is not None:
+                            self._diagnostics.note_superseded()
+                        return True
+            await self._condition.wait_for(
+                lambda: not self._accepting or len(self._pending) < self._maxsize
+            )
+            if not self._accepting:
+                return False
             self._pending.append(message)
             self._unfinished_tasks += 1
             self._finished.clear()
             self._condition.notify()
+            return True
 
     async def get(self) -> _InboundMessage:
         async with self._condition:
@@ -129,6 +182,16 @@ class _LaneQueue:
     async def join(self) -> None:
         await self._finished.wait()
 
+    async def discard_pending(self) -> int:
+        async with self._condition:
+            self._accepting = False
+            discarded = len(self._pending)
+            self._pending.clear()
+            for _ in range(discarded):
+                self.task_done()
+            self._condition.notify_all()
+            return discarded
+
 
 class _TopicDispatcher:
     """Serialize peripheral commands while retaining cross-lane concurrency."""
@@ -136,10 +199,18 @@ class _TopicDispatcher:
     def __init__(
         self,
         handler: Callable[[_InboundMessage], Awaitable[None]],
+        *,
+        diagnostics: ResponseDiagnostics | None = None,
+        restart_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self._handler = handler
+        self._diagnostics = diagnostics
+        self._restart_sleep = restart_sleep
         self._queues: dict[str, _LaneQueue] = {}
         self._workers: dict[str, asyncio.Task[None]] = {}
+        self._recoveries: dict[str, asyncio.Task[None]] = {}
+        self._worker_failures: dict[str, int] = {}
+        self._closed_lanes: dict[str, _ClosedLaneState] = {}
         self._active: dict[str, tuple[_InboundMessage, CommandAdmission]] = {}
         self._folded: dict[str, _InboundMessage] = {}
         self._closing = False
@@ -154,13 +225,27 @@ class _TopicDispatcher:
             return
         lane = _command_lane_key(message.topic)
         queue = self._queues.get(lane)
-        if queue is None:
-            queue = _LaneQueue(maxsize=_TOPIC_QUEUE_MAXSIZE)
+        closed = self._closed_lanes.get(lane)
+        if (
+            closed is not None
+            and asyncio.get_running_loop().time() >= closed.reopen_at
+            and lane not in self._workers
+            and lane not in self._recoveries
+        ):
+            self._closed_lanes.pop(lane, None)
+            self._worker_failures.pop(lane, None)
+            queue = _LaneQueue(maxsize=_TOPIC_QUEUE_MAXSIZE, diagnostics=self._diagnostics)
             self._queues[lane] = queue
-            self._workers[lane] = asyncio.create_task(
-                self._run_worker(lane, queue),
-                name="brilliant-mqtt-command-lane-worker",
+            self._start_worker(lane, queue)
+            logger.info(
+                "MQTT command lane reopened after recovery cooldown "
+                "(rejected commands while closed: %d)",
+                closed.rejected,
             )
+        if queue is None:
+            queue = _LaneQueue(maxsize=_TOPIC_QUEUE_MAXSIZE, diagnostics=self._diagnostics)
+            self._queues[lane] = queue
+            self._start_worker(lane, queue)
         active = self._active.get(lane)
         if latest_wins and active is not None and not queue._pending:
             previous, admission = active
@@ -171,16 +256,42 @@ class _TopicDispatcher:
                 and previous.retained == message.retained
                 and admission.try_supersede is not None
             ):
+                # Fold the per-field merge (later value wins) so a partial
+                # command keeps the pending write's other fields (#159). A
+                # merge involving OFF is unsafe unless both payloads are
+                # identical (OFF ignores brightness); malformed payloads are
+                # likewise left unmerged. An unmerged payload folds as-is, and
+                # the bus admits it only if it covers every pending field.
+                merged = _coalesce_payload(message.topic, previous.payload, message.payload)
+                replacement = message if merged is None else replace(message, payload=merged)
                 try:
-                    folded = admission.try_supersede(message.payload)
+                    folded = admission.try_supersede(replacement.payload)
                 except Exception:
                     # Preserve the normal callback's error boundary: malformed
                     # input must not escape this optimization into the reader.
+                    logger.warning("MQTT command fold hook failed; falling back to queued dispatch")
                     folded = False
                 if folded:
-                    self._folded[lane] = message
+                    # The merged payload is the base for any later fold. That
+                    # makes overwriting an unconsumed _folded[lane] below safe:
+                    # each later fold merges onto this rebound payload, and the
+                    # bus's try_supersede rejects any payload whose keys do not
+                    # cover the pending write's keys, so no field is dropped.
+                    self._active[lane] = (replacement, admission)
+                    self._folded[lane] = replacement
                     return
-        await queue.put(message, latest_wins=latest_wins)
+        accepted = await queue.put(message, latest_wins=latest_wins)
+        if accepted:
+            return
+        closed = self._closed_lanes.get(lane)
+        if closed is None:
+            return
+        closed.rejected += 1
+        if closed.rejected == 1:
+            logger.warning(
+                "MQTT command rejected during lane recovery cooldown; "
+                "further rejection logs suppressed"
+            )
 
     async def shutdown(self) -> None:
         """Drain accepted messages, then cancel and forget the idle workers."""
@@ -206,21 +317,50 @@ class _TopicDispatcher:
 
     async def _drain_and_cancel(self) -> None:
         try:
-            if self._queues:
+            drainable: list[_LaneQueue] = []
+            undrainable = 0
+            for lane, queue in self._queues.items():
+                worker = self._workers.get(lane)
+                if worker is not None and not worker.done():
+                    drainable.append(queue)
+                    continue
+                discarded = await self._close_lane(
+                    lane,
+                    queue,
+                    worker,
+                    cooldown=False,
+                )
+                if discarded is not None:
+                    undrainable += discarded
+            if undrainable:
+                suffix = "" if undrainable == 1 else "s"
+                logger.warning(
+                    "MQTT dispatcher discarded %d undrainable command%s during teardown",
+                    undrainable,
+                    suffix,
+                )
+            if drainable:
                 try:
                     await asyncio.wait_for(
-                        asyncio.gather(*(queue.join() for queue in self._queues.values())),
+                        asyncio.gather(*(queue.join() for queue in drainable)),
                         timeout=_SHUTDOWN_DRAIN_DEADLINE_S,
                     )
                 except asyncio.TimeoutError:
-                    undrained = sum(queue.unfinished_tasks for queue in self._queues.values())
+                    undrained = sum(queue.unfinished_tasks for queue in drainable)
                     logger.warning(
                         "MQTT dispatcher shutdown deadline expired; "
                         "%d undrained commands were abandoned",
                         undrained,
                     )
         finally:
+            recoveries = list(self._recoveries.values())
+            for recovery in recoveries:
+                recovery.cancel()
+            if recoveries:
+                await asyncio.gather(*recoveries, return_exceptions=True)
+            self._recoveries.clear()
             workers = list(self._workers.values())
+            self._workers.clear()
             for worker in workers:
                 worker.cancel()
             if workers:
@@ -238,8 +378,168 @@ class _TopicDispatcher:
                     for task in pending:
                         self._abandoned.add(task)
                         task.add_done_callback(self._abandoned.discard)
-            self._workers.clear()
+            for queue in self._queues.values():
+                await queue.discard_pending()
             self._queues.clear()
+            self._worker_failures.clear()
+            for closed in self._closed_lanes.values():
+                if closed.rejected:
+                    logger.warning(
+                        "MQTT command lane remained closed through teardown "
+                        "(rejected commands while closed: %d)",
+                        closed.rejected,
+                    )
+            self._closed_lanes.clear()
+
+    def _start_worker(self, lane: str, queue: _LaneQueue) -> None:
+        worker = asyncio.create_task(
+            self._run_worker(lane, queue),
+            name="brilliant-mqtt-command-lane-worker",
+        )
+        self._workers[lane] = worker
+        worker.add_done_callback(lambda completed: self._worker_done(lane, queue, completed))
+
+    def _worker_done(
+        self,
+        lane: str,
+        queue: _LaneQueue,
+        worker: asyncio.Task[None],
+    ) -> None:
+        error = None if worker.cancelled() else worker.exception()
+        if self._workers.get(lane) is not worker:
+            if error is not None:
+                failure_type, failure_frames = _worker_failure_metadata(error)
+                logger.error(
+                    "MQTT command lane worker failed during teardown or after replacement "
+                    "(type=%s; frames=%s)",
+                    failure_type,
+                    failure_frames,
+                )
+            return
+        if self._closing:
+            if error is not None:
+                failure_type, failure_frames = _worker_failure_metadata(error)
+                logger.error(
+                    "MQTT command lane worker failed during teardown (type=%s; frames=%s)",
+                    failure_type,
+                    failure_frames,
+                )
+            closure = asyncio.create_task(
+                self._close_completed_worker(lane, queue, worker, cooldown=False),
+                name="brilliant-mqtt-command-lane-closure",
+            )
+            self._recoveries[lane] = closure
+            return
+        if worker.cancelled():
+            closure = asyncio.create_task(
+                self._close_completed_worker(lane, queue, worker, cooldown=True),
+                name="brilliant-mqtt-command-lane-closure",
+            )
+            self._recoveries[lane] = closure
+            return
+        failure_type, failure_frames = _worker_failure_metadata(error)
+        failures = self._worker_failures.get(lane, 0) + 1
+        self._worker_failures[lane] = failures
+        delay = min(
+            _LANE_RESTART_BASE_DELAY_S * 2 ** (failures - 1),
+            _LANE_RESTART_MAX_DELAY_S,
+        )
+        logger.error(
+            "MQTT command lane worker died unexpectedly; recovery %d/%d in %.3fs "
+            "(%d admitted commands pending; type=%s; frames=%s)",
+            failures,
+            _LANE_RESTART_MAX_FAILURES,
+            delay,
+            queue.unfinished_tasks,
+            failure_type,
+            failure_frames,
+        )
+        recovery = asyncio.create_task(
+            self._recover_worker(lane, queue, worker, failures, delay),
+            name="brilliant-mqtt-command-lane-recovery",
+        )
+        self._recoveries[lane] = recovery
+
+    async def _close_lane(
+        self,
+        lane: str,
+        queue: _LaneQueue,
+        worker: asyncio.Task[None] | None,
+        *,
+        cooldown: bool,
+    ) -> int | None:
+        if self._queues.get(lane) is not queue or self._workers.get(lane) is not worker:
+            return None
+        self._workers.pop(lane, None)
+        if cooldown:
+            self._closed_lanes[lane] = _ClosedLaneState(
+                reopen_at=asyncio.get_running_loop().time() + _LANE_REOPEN_COOLDOWN_S
+            )
+        return await queue.discard_pending()
+
+    async def _close_completed_worker(
+        self,
+        lane: str,
+        queue: _LaneQueue,
+        worker: asyncio.Task[None],
+        *,
+        cooldown: bool,
+    ) -> None:
+        try:
+            if cooldown and self._closing:
+                return
+            discarded = await self._close_lane(lane, queue, worker, cooldown=cooldown)
+            if cooldown and discarded is not None:
+                logger.error(
+                    "MQTT command lane worker cancelled outside teardown; "
+                    "%d admitted commands discarded and lane closed for cooldown",
+                    discarded,
+                )
+            elif discarded:
+                logger.warning(
+                    "MQTT command lane discarded %d admitted commands during teardown",
+                    discarded,
+                )
+        finally:
+            closure = asyncio.current_task()
+            if self._recoveries.get(lane) is closure:
+                self._recoveries.pop(lane, None)
+
+    async def _recover_worker(
+        self,
+        lane: str,
+        queue: _LaneQueue,
+        dead_worker: asyncio.Task[None],
+        failures: int,
+        delay: float,
+    ) -> None:
+        try:
+            await self._restart_sleep(delay)
+            if self._closing or self._workers.get(lane) is not dead_worker:
+                return
+            if failures >= _LANE_RESTART_MAX_FAILURES:
+                discarded = await self._close_lane(
+                    lane,
+                    queue,
+                    dead_worker,
+                    cooldown=True,
+                )
+                if discarded is None:
+                    return
+                logger.error(
+                    "MQTT command lane recovery exhausted after %d consecutive worker deaths; "
+                    "%d admitted commands discarded and future commands rejected during cooldown "
+                    "(%.0fs)",
+                    failures,
+                    discarded,
+                    _LANE_REOPEN_COOLDOWN_S,
+                )
+                return
+            self._start_worker(lane, queue)
+        finally:
+            recovery = asyncio.current_task()
+            if self._recoveries.get(lane) is recovery:
+                self._recoveries.pop(lane, None)
 
     async def _run_worker(self, lane: str, queue: _LaneQueue) -> None:
         while True:
@@ -250,6 +550,7 @@ class _TopicDispatcher:
                 while True:
                     self._active[lane] = (message, admission)
                     await self._handler(message)
+                    self._worker_failures.pop(lane, None)
                     replacement = self._folded.pop(lane, None)
                     if replacement is None:
                         break
@@ -258,13 +559,18 @@ class _TopicDispatcher:
                 # A bus admission can end independently of this worker. Actual
                 # Task.cancel() still propagates as ordinary CancelledError.
                 logger.debug("MQTT command write cancelled; continuing lane")
+                self._worker_failures.pop(lane, None)
             finally:
                 # A folded replacement can still belong to the lane before
                 # its callback adopts it. Do not orphan it on cancellation.
                 admission.ticket.cancel_waiting()
                 command_admission.reset(token)
                 self._active.pop(lane, None)
-                self._folded.pop(lane, None)
+                discarded = self._folded.pop(lane, None)
+                if discarded is not None:
+                    logger.warning(
+                        "MQTT command lane discarded a folded replacement during cleanup"
+                    )
                 queue.task_done()
 
 
@@ -279,6 +585,55 @@ def _is_latest_wins_topic(topic: str) -> bool:
     if not command.startswith("set_"):
         return False
     return command.removeprefix("set_") in _NUMBER_AUX_VARS
+
+
+def _coalesce_payload(topic: str, before: str | bytes, after: str | bytes) -> str | None:
+    """Combine absolute setters only when no earlier field or effect is lost."""
+    try:
+        before = before.decode("utf-8") if isinstance(before, bytes) else before
+        after = after.decode("utf-8") if isinstance(after, bytes) else after
+    except UnicodeDecodeError:
+        return None
+    if not topic.endswith("/set"):
+        try:
+            if not all(math.isfinite(float(payload)) for payload in (before, after)):
+                return None
+        except (ValueError, OverflowError):
+            return None
+        return after
+    commands: list[dict[str, object]] = []
+    for payload in (before, after):
+        try:
+            value = json.loads(payload)
+        except (ValueError, RecursionError):
+            return None
+        if (
+            not isinstance(value, dict)
+            or not value
+            or value.keys() - {"state", "brightness", "transition"}
+        ):
+            return None
+        value.pop("transition", None)
+        if not value:
+            return None
+        if "state" in value and value["state"] not in ("ON", "OFF"):
+            return None
+        if "brightness" in value:
+            brightness = value["brightness"]
+            if isinstance(brightness, bool) or not isinstance(brightness, (int, float)):
+                return None
+            try:
+                if not math.isfinite(brightness):
+                    return None
+            except OverflowError:
+                return None
+        commands.append(value)
+    # OFF ignores brightness in translation, so merging across it can change
+    # the intensity left on the device for its next ON command.
+    if any(command.get("state") == "OFF" for command in commands):
+        if commands[0] != commands[1]:
+            return None
+    return json.dumps(commands[0] | commands[1], separators=(",", ":"))
 
 
 def _command_lane_key(topic: str) -> str:
@@ -347,8 +702,10 @@ class _BoundedTransportQueue(asyncio.Queue[aiomqtt.Message]):
         *,
         max_bytes: int,
         overload: _TransportOverloadLatch,
+        diagnostics: ResponseDiagnostics | None = None,
     ) -> None:
         super().__init__(maxsize)
+        self._diagnostics = diagnostics
         self._max_bytes = max_bytes
         self._overload = overload
         self._queued_bytes = 0
@@ -364,11 +721,26 @@ class _BoundedTransportQueue(asyncio.Queue[aiomqtt.Message]):
             for index in range(len(self._queue) - 1, -1, -1):
                 pending = self._queue[index]
                 pending_topic = str(pending.topic)
-                if _command_lane_key(pending_topic) == _command_lane_key(
-                    topic
-                ) and not _is_latest_wins_topic(pending_topic):
+                if _command_lane_key(pending_topic) == _command_lane_key(topic) and (
+                    not _is_latest_wins_topic(pending_topic)
+                    or _coalesce_payload(pending_topic, pending.payload, pending.payload) is None
+                ):
                     break
                 if str(pending.topic) == topic:
+                    if pending.retain != item.retain or pending.qos != item.qos:
+                        break
+                    payload = _coalesce_payload(topic, pending.payload, item.payload)
+                    if payload is None:
+                        break
+                    item = aiomqtt.Message(
+                        topic=item.topic,
+                        payload=payload.encode("utf-8"),
+                        qos=item.qos,
+                        retain=item.retain,
+                        mid=item.mid,
+                        properties=item.properties,
+                    )
+                    item_bytes = _message_bytes(item)
                     if item_bytes > self._max_bytes:
                         # A single latest-wins payload too big to EVER fit the
                         # budget on its own: refuse it and keep the pending twin,
@@ -390,6 +762,8 @@ class _BoundedTransportQueue(asyncio.Queue[aiomqtt.Message]):
                     # _TRANSPORT_QUEUE_MAX_BYTES comment.
                     self._queued_bytes += item_bytes - _message_bytes(pending)
                     self._queue[index] = item
+                    if self._diagnostics is not None:
+                        self._diagnostics.note_superseded()
                     if self._queued_bytes > self._max_bytes:
                         self._trip("payload-byte")
                     return
@@ -417,6 +791,7 @@ class _BoundedTransportQueue(asyncio.Queue[aiomqtt.Message]):
 
 def _transport_queue_type(
     overload: _TransportOverloadLatch,
+    diagnostics: ResponseDiagnostics | None = None,
 ) -> type[asyncio.Queue[aiomqtt.Message]]:
     """Bind one adapter's overload latch into aiomqtt's ``queue_type`` hook.
 
@@ -430,6 +805,7 @@ def _transport_queue_type(
                 maxsize,
                 max_bytes=_TRANSPORT_QUEUE_MAX_BYTES,
                 overload=overload,
+                diagnostics=diagnostics,
             )
 
     return _AdapterTransportQueue
@@ -468,8 +844,10 @@ class AioMqttAdapter:
         publish_availability: bool = True,
         checked_disconnect: bool = False,
         redacted_logging: bool = False,
+        diagnostics: ResponseDiagnostics | None = None,
     ) -> None:
         self._settings = settings
+        self._diagnostics = diagnostics
         # Multiple consumers (panel bridge + mesh publisher) each register a
         # command callback on this one shared connection — fan out to all.
         self._command_cbs: list[Callable[[str, str], Awaitable[None]]] = []
@@ -480,7 +858,7 @@ class AioMqttAdapter:
         # Tripped by the bounded transport queue (below) when a count/byte bound
         # is exceeded; drained by the runner via consume_transport_overload().
         self._transport_overload = _TransportOverloadLatch()
-        self._topic_dispatcher = _TopicDispatcher(self._dispatch_inbound)
+        self._topic_dispatcher = _TopicDispatcher(self._dispatch_inbound, diagnostics=diagnostics)
         self._reader_task: asyncio.Task[None] | None = None
         self._reader_failure_consumed = False
         self._avail_topic = availability_topic(settings.panel)
@@ -509,6 +887,7 @@ class AioMqttAdapter:
         )
         self._client = aiomqtt.Client(
             hostname=settings.mqtt_host,
+            timeout=10.0,
             port=settings.mqtt_port,
             username=settings.mqtt_username,
             password=settings.mqtt_password,
@@ -516,7 +895,7 @@ class AioMqttAdapter:
             # Bound the inbound transport backlog upstream of the command lanes
             # (#90): a custom queue enforcing a count AND payload-byte budget,
             # observably tripping on overload instead of aiomqtt's silent drop.
-            queue_type=_transport_queue_type(self._transport_overload),
+            queue_type=_transport_queue_type(self._transport_overload, diagnostics),
             max_queued_incoming_messages=_TRANSPORT_QUEUE_MAXSIZE,
             will=will,
             tls_context=build_tls_context(settings),
@@ -618,9 +997,9 @@ class AioMqttAdapter:
                     logger.debug("temporary MQTT message received (%d bytes)", len(payload))
                 else:
                     logger.debug("mqtt message on %s (%d bytes)", topic, len(payload))
-                # Accepted lossless-FIFO trade-off: a saturated lane
-                # backpressures this one broker reader, delaying every later
-                # topic so bounded lossless pending commands are never dropped.
+                # A healthy saturated lane backpressures this broker reader to
+                # preserve its bounded FIFO. Exhausted recovery closes only the
+                # failed lane's queue and wakes this await.
                 await dispatcher.dispatch(
                     _InboundMessage(
                         topic=topic,
@@ -638,7 +1017,9 @@ class AioMqttAdapter:
         """Return the dispatcher, lazily covering off-panel object doubles."""
         dispatcher = getattr(self, "_topic_dispatcher", None)
         if dispatcher is None:
-            dispatcher = _TopicDispatcher(self._dispatch_inbound)
+            dispatcher = _TopicDispatcher(
+                self._dispatch_inbound, diagnostics=getattr(self, "_diagnostics", None)
+            )
             self._topic_dispatcher = dispatcher
         return dispatcher
 

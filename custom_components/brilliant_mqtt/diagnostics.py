@@ -202,10 +202,23 @@ def _scene_panel_slug(
 
 async def _async_provisioning_diagnostics(
     hass: HomeAssistant,
-) -> dict[str, int | str | None]:
-    """Return only count/phase, degrading safely when private storage is unreadable."""
+) -> dict[str, object]:
+    """Expose recovery names/state without including private baseline contents."""
     try:
-        return await ProvisioningJournal(hass).async_diagnostics()
+        journal = ProvisioningJournal(hass)
+        output: dict[str, object] = dict(await journal.async_diagnostics())
+        retained = await journal.async_retained_records()
+        if retained:
+            output["retained"] = [
+                {
+                    "name": str(item.record.transaction_id),
+                    "panel": item.record.panel_request.slug,
+                    "state": item.state,
+                    "recovery_deployment_id": item.recovery_deployment_id,
+                }
+                for item in retained
+            ]
+        return output
     except Exception:
         return {"count": None, "phase": None}
 

@@ -148,6 +148,7 @@ def test_payload_and_real_panel_release_manifests_match_every_static_file(
     assert len(paths) > 75
     assert {
         "app/brilliant_mqtt/bridge.py",
+        "app/brilliant_mqtt/wired_feedback.py",
         "bus_watchdog/brilliant_bus_watchdog/run.py",
         "ha_mirror/brilliant_ha_mirror/mirror.py",
         "hue_ca/brilliant_hue_ca/coordinator.py",

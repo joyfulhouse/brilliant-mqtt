@@ -9,11 +9,23 @@ runs deterministically without real sleeps.
 from __future__ import annotations
 
 import asyncio
+import sys
+import threading
+import types
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import replace
+from pathlib import Path
+from typing import Any, Protocol
+
+import aiomqtt
+import paho.mqtt.client as paho
+import pytest
 
 from brilliant_ha_mirror.mapping import HaEntity, PeripheralSpec, ServiceCall
+from brilliant_mqtt import mqttio
+from brilliant_mqtt import retained_topics as retained_topics_module
 from brilliant_mqtt.commands import VarSet
-from brilliant_mqtt.model import BrilliantDevice
+from brilliant_mqtt.model import BrilliantDevice, CaptureProvenance, DeviceKind, Variable
 from brilliant_mqtt.write_admission import AdmissionTicket, WriteClass
 
 
@@ -53,19 +65,60 @@ class FakeBus:
         self.set_variables_error: Exception | None = None
         # Returned by set_variables as the normalized transport-ack receipt.
         self.set_variables_receipt: str = "FakeSetVariablesResponse()"
+        self._capture_generation = 1
+        self._capture_sequence = 0
+        self._field_eras: dict[tuple[str, str, str], int] = {}
+
+    @property
+    def capture_generation(self) -> int:
+        return self._capture_generation
 
     async def start(self) -> None:
         pass
 
     async def get_all(self) -> list[BrilliantDevice]:
-        return list(self._devices)
+        return [self._captured(device, complete=True) for device in self._devices]
 
     async def get_peripheral(self, device_id: str, peripheral_id: str) -> BrilliantDevice | None:
         self.scoped_reads.append((device_id, peripheral_id))
         for device in self._devices + self._scoped_devices:
             if device.device_id == device_id and device.peripheral_id == peripheral_id:
-                return device
+                return self._captured(device, complete=True)
         return None
+
+    def _next_provenance(
+        self, device: BrilliantDevice | None = None, *, complete: bool = False
+    ) -> CaptureProvenance:
+        self._capture_sequence += 1
+        eras: tuple[tuple[str, int], ...] = ()
+        if device is not None:
+            fields = set(device.capture_present or device.variables)
+            if complete:
+                fields.update(
+                    name
+                    for owner, peripheral, name in self._field_eras
+                    if (owner, peripheral) == (device.device_id, device.peripheral_id)
+                )
+            eras = tuple(
+                (name, self._field_eras.get((device.device_id, device.peripheral_id, name), 0))
+                for name in fields
+            )
+        return CaptureProvenance(self._capture_generation, self._capture_sequence, eras)
+
+    def _captured(self, device: BrilliantDevice, *, complete: bool) -> BrilliantDevice:
+        if device.device_id == "ble_mesh" or device.kind not in (
+            DeviceKind.LIGHT,
+            DeviceKind.SWITCH,
+        ):
+            return device
+        captured = replace(
+            device,
+            capture_complete=complete,
+            capture_present=device.capture_present or frozenset(device.variables),
+        )
+        return replace(
+            captured, capture_provenance=self._next_provenance(captured, complete=complete)
+        )
 
     def on_change(
         self,
@@ -105,10 +158,34 @@ class FakeBus:
         write_class: WriteClass = WriteClass.INTERACTIVE_FIFO,
         ticket: AdmissionTicket | None = None,
     ) -> str:
+        self._mark_issued(device_id, peripheral_id, sets, ticket)
         if self.set_variables_error is not None:
             raise self.set_variables_error
         self.commands.append((device_id, peripheral_id, list(sets)))
         return self.set_variables_receipt
+
+    def _mark_issued(
+        self,
+        device_id: str,
+        peripheral_id: str,
+        sets: list[VarSet],
+        ticket: AdmissionTicket | None,
+    ) -> None:
+        for item in sets:
+            key = (device_id, peripheral_id, item.name)
+            self._field_eras[key] = self._field_eras.get(key, 0) + 1
+        device = BrilliantDevice(
+            device_id,
+            peripheral_id,
+            "",
+            DeviceKind.LIGHT,
+            variables={item.name: Variable(item.name, item.value) for item in sets},
+        )
+        boundary = self._next_provenance(device)
+        if ticket is not None:
+            ticket.mark_issued(
+                replace(boundary, issued_values=tuple((item.name, item.value) for item in sets))
+            )
 
     async def shutdown(self) -> None:
         pass
@@ -121,9 +198,17 @@ class FakeBus:
         the adapter would drop the push before normalization.
         """
         assert self._change_cbs, "on_change was never registered"
+        if device.capture_provenance is None:
+            device = self._captured(device, complete=False)
         for cb, want in zip(list(self._change_cbs), list(self.change_callback_wants), strict=True):
             if want is None or want(device.device_id):
                 await cb(device)
+
+    async def emit_full(self, device: BrilliantDevice) -> None:
+        """Deliver a complete pushed snapshot for full-read semantics tests."""
+        if device.capture_provenance is None:
+            device = self._captured(device, complete=True)
+        await self.emit(device)
 
     def set_devices(self, devices: list[BrilliantDevice]) -> None:
         """Test helper: replace what subsequent get_all() calls return."""
@@ -132,6 +217,9 @@ class FakeBus:
     async def fire_reconnect(self) -> None:
         """Test helper: invoke the registered on_reconnect callback."""
         assert self._reconnect_cbs, "on_reconnect was never registered"
+        self._capture_generation += 1
+        self._capture_sequence = 0
+        self._field_eras.clear()
         for reconnect_cb in list(self._reconnect_cbs):
             try:
                 await reconnect_cb()
@@ -356,3 +444,352 @@ class FakePeripheralHost:
     async def fire_command(self, name: str, var: str, value: str) -> None:
         """Test helper: invoke the command callback registered for *name*."""
         await self.commands[name](var, value)
+
+
+# -- Shared cross-module harness helpers -------------------------------------------
+# Single definition point for helpers used by more than one test module
+# (repo convention: shared test harness lives here, not in sibling test
+# modules — see tests/test_diagnostics.py).
+
+
+class _RawVariable:
+    """Duck-typed stand-in for a bus Variable (normalize_peripheral contract)."""
+
+    def __init__(self, value: str) -> None:
+        self.value = value
+        self.externally_settable = True
+
+
+class _RawPeripheral:
+    """Duck-typed stand-in for a bus Peripheral."""
+
+    def __init__(self, value: str = "1", variable_name: str = "on") -> None:
+        self.name = "Mesh Switch"
+        self.peripheral_type = 1
+        self.variables = {variable_name: _RawVariable(value)}
+
+
+class _RawDevice:
+    """Duck-typed stand-in for a bus Device push; ``id`` is optional so the
+    fallback path (no id on the raw struct) is exercisable, and ``peripherals``
+    may be None to exercise the housekeeping-notification guard."""
+
+    def __init__(
+        self, device_id: str | None, peripherals: dict[str, _RawPeripheral] | None
+    ) -> None:
+        if device_id is not None:
+            self.id = device_id
+        self.peripherals = peripherals
+
+
+class _GatedRpcObserver:
+    """Observer whose writes block until ``release`` is set.
+
+    Tracks write concurrency (the per-device lock contract), cancellation
+    (the detach contract) and whether reads got through while a write was
+    blocked (reads must never queue behind a stalled write).
+    """
+
+    def __init__(self, *, fail_with: Exception | None = None) -> None:
+        self.release = asyncio.Event()
+        self.in_flight = 0
+        self.max_in_flight = 0
+        self.write_cancelled = False
+        self.writes: list[tuple[str, str]] = []
+        self.reads: list[str] = []
+        self.shutdowns = 0
+        self._fail_with = fail_with
+
+    async def get_device(self, device_id: str) -> _RawDevice:
+        self.reads.append(device_id)
+        return _RawDevice(device_id, {f"{device_id}-peripheral": _RawPeripheral()})
+
+    async def request_set_variables_in_peripheral(
+        self,
+        peripheral_id: str,
+        values: dict[str, str],
+        *,
+        device_id: str,
+    ) -> str:
+        del values
+        self.writes.append((device_id, peripheral_id))
+        self.in_flight += 1
+        self.max_in_flight = max(self.max_in_flight, self.in_flight)
+        try:
+            await self._block()
+        finally:
+            self.in_flight -= 1
+        if self._fail_with is not None:
+            raise self._fail_with
+        return "ok"
+
+    async def _block(self) -> None:
+        """The blocking core of a write; subclasses vary the cancellation reaction."""
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.write_cancelled = True
+            raise
+
+    async def shutdown(self) -> None:
+        self.shutdowns += 1
+
+
+class _StartHarness:
+    """Fakes the panel libraries into ``sys.modules`` so ``RpcBusAdapter.start()``
+    runs off-panel, and records every processor/observer it constructs.
+
+    #88: start() must own the observer/processor before starting them and unwind
+    a partial startup on any failure. ``fail_at`` injects a failure at a chosen
+    stage; the recorded ``procs``/``observers`` then prove the constructed
+    resources were shut down (``live_*`` empty) rather than stranded.
+    """
+
+    def __init__(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        fail_at: str | tuple[str, str] | None = None,
+        block_proc_start: bool = False,
+        gated_writes: bool = False,
+        obs_shutdown_raises: BaseException | None = None,
+        hang_obs_shutdown: bool = False,
+        hang_proc_shutdown: bool = False,
+    ) -> None:
+        self.fail_at = fail_at
+        self.block_proc_start = block_proc_start
+        self.gated_writes = gated_writes
+        # When set, the observer's shutdown() raises this (e.g. CancelledError)
+        # to prove _close_bus_resources still closes the processor afterwards.
+        self.obs_shutdown_raises = obs_shutdown_raises
+        self.hang_obs_shutdown = hang_obs_shutdown
+        self.hang_proc_shutdown = hang_proc_shutdown
+        self.procs: list[Any] = []
+        self.observers: list[Any] = []
+        self.subscribed: list[str] = []
+        self.obs_shutdown_started = asyncio.Event()
+        self.proc_shutdown_started = asyncio.Event()
+        self.shutdown_release = asyncio.Event()
+        # Gated-write bookkeeping (gated_writes=True): every set-variables RPC
+        # blocks on write_release, recording the device order it actually
+        # started on and the peak concurrency, so a test can prove same-device
+        # writes serialize (max_writes_in_flight stays 1) across a restart.
+        self.write_release = asyncio.Event()
+        self.writes_in_flight = 0
+        self.max_writes_in_flight = 0
+        self.write_starts: list[str] = []
+        self._proc_start_gate = asyncio.Event()
+        self._install(monkeypatch)
+
+    @property
+    def live_procs(self) -> list[Any]:
+        return [p for p in self.procs if not p.shut_down]
+
+    @property
+    def live_observers(self) -> list[Any]:
+        return [o for o in self.observers if not o.shut_down]
+
+    def _install(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        harness = self
+
+        class _FakeObserverBase:
+            def __init__(self, loop: Any) -> None:
+                self.loop = loop
+                self.started = False
+                self.shut_down = False
+                harness.observers.append(self)
+
+            async def start(self, proc: Any, _extra: Any) -> None:
+                if harness.fail_at == "obs_start":
+                    raise RuntimeError("obs start boom")
+                self.started = True
+
+            def get_owning_device_id(self) -> str:
+                return "own-device"
+
+            async def subscribe(self, request: Any) -> None:
+                device_id = str(request.device_id)
+                harness.subscribed.append(device_id)
+                if harness.fail_at == "own_sub" and device_id == "own-device":
+                    raise RuntimeError("own subscribe boom")
+                if harness.fail_at == ("extra_sub", device_id):
+                    raise RuntimeError(f"extra subscribe boom: {device_id}")
+
+            async def request_set_variables_in_peripheral(
+                self, peripheral_id: str, values: dict[str, str], *, device_id: str
+            ) -> str:
+                del peripheral_id, values
+                if not harness.gated_writes:
+                    return "ok"
+                harness.write_starts.append(device_id)
+                harness.writes_in_flight += 1
+                harness.max_writes_in_flight = max(
+                    harness.max_writes_in_flight, harness.writes_in_flight
+                )
+                try:
+                    try:
+                        await harness.write_release.wait()
+                    except asyncio.CancelledError:
+                        # Wedged closed-source write: swallow the teardown cancel
+                        # and keep holding the device lock until finally released
+                        # (models the #73 detached-straggler case).
+                        await harness.write_release.wait()
+                finally:
+                    harness.writes_in_flight -= 1
+                return "ok"
+
+            async def shutdown(self) -> None:
+                harness.obs_shutdown_started.set()
+                if harness.obs_shutdown_raises is not None:
+                    raise harness.obs_shutdown_raises
+                if harness.hang_obs_shutdown:
+                    try:
+                        await harness.shutdown_release.wait()
+                    except asyncio.CancelledError:
+                        await harness.shutdown_release.wait()
+                self.shut_down = True
+
+        class _FakeProc:
+            def __init__(
+                self,
+                *,
+                socket_path: str,
+                my_name: str,
+                handler: Any,
+                client_class: Any,
+                loop: Any,
+            ) -> None:
+                del socket_path, handler, client_class, loop
+                if harness.fail_at == "proc_construct":
+                    raise RuntimeError("proc construct boom")
+                self.my_name = my_name
+                self.started = False
+                self.shut_down = False
+                self.reconnect_cbs: list[Any] = []
+                harness.procs.append(self)
+
+            async def start(self) -> None:
+                if harness.fail_at == "proc_start":
+                    raise RuntimeError("proc start boom")
+                if harness.block_proc_start:
+                    await harness._proc_start_gate.wait()
+                self.started = True
+
+            def is_connected(self) -> bool:
+                return harness.fail_at != "handshake"
+
+            def add_reconnect_callback(self, cb: Any) -> None:
+                self.reconnect_cbs.append(cb)
+
+            async def shutdown(self) -> None:
+                harness.proc_shutdown_started.set()
+                if harness.hang_proc_shutdown:
+                    try:
+                        await harness.shutdown_release.wait()
+                    except asyncio.CancelledError:
+                        await harness.shutdown_release.wait()
+                self.shut_down = True
+
+        class _FakeSubscriptionRequest:
+            def __init__(self, device_id: str) -> None:
+                self.device_id = device_id
+
+        class _FakePeripheralServer:
+            def __init__(self, observer: Any) -> None:
+                self.observer = observer
+
+        class _FakeMessageBusClient:
+            pass
+
+        def mod(name: str, **attrs: Any) -> types.ModuleType:
+            module = types.ModuleType(name)
+            for key, value in attrs.items():
+                setattr(module, key, value)
+            monkeypatch.setitem(sys.modules, name, module)
+            if "." in name:
+                parent_name, child = name.rsplit(".", 1)
+                setattr(sys.modules[parent_name], child, module)
+            return module
+
+        mod("lib")
+        mod("lib.protocol")
+        mod(
+            "lib.protocol.message_bus_peer_service",
+            PeripheralServer=_FakePeripheralServer,
+            MessageBusClient=_FakeMessageBusClient,
+        )
+        mod("lib.protocol.processor", SinglePeerProcessor=_FakeProc)
+        mod("lib.message_bus_api")
+        mod("lib.message_bus_api.observer_interface", RPCObserver=_FakeObserverBase)
+        mod("thrift_types")
+        mod("thrift_types.message_bus")
+        mod("thrift_types.message_bus.ttypes", SubscriptionRequest=_FakeSubscriptionRequest)
+
+
+def _panel_dimmer() -> BrilliantDevice:
+    return BrilliantDevice(
+        device_id="device_001",
+        peripheral_id="gangbox_peripheral_0",
+        name="Lights",
+        kind=DeviceKind.LIGHT,
+        variables={"on": Variable("on", "0")},
+    )
+
+
+class _AiomqttClientInternals(Protocol):
+    """The private aiomqtt.Client surface this seam test drives (client.py): the
+    incoming queue built via our ``queue_type`` hook, and the paho message
+    callback. Declared so the test type-checks with no suppression."""
+
+    _queue: mqttio._BoundedTransportQueue
+
+    def _on_message(self, client: object, userdata: object, message: paho.MQTTMessage) -> None: ...
+
+
+async def _settle(n: int = 3) -> None:
+    """Yield a few loop iterations so freshly created tasks reach their awaits."""
+    for _ in range(n):
+        await asyncio.sleep(0)
+
+
+def _msg(topic: str, payload: bytes = b"x") -> aiomqtt.Message:
+    """A production-shaped inbound message (paho hands aiomqtt bytes payloads)."""
+    return aiomqtt.Message(
+        topic=topic,
+        payload=payload,
+        qos=1,
+        retain=False,
+        mid=0,
+        properties=None,
+    )
+
+
+class HeldWrites:
+    """Hold matching ledger writes in their worker thread until released."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, *, hold: Callable[[str], bool]) -> None:
+        self._hold = hold
+        self._loop = asyncio.get_running_loop()
+        self.release = threading.Event()
+        self.started = asyncio.Event()
+        self.finished = asyncio.Event()
+        self.submitted: list[str] = []
+        self._real_write = retained_topics_module._write_payload
+        monkeypatch.setattr(retained_topics_module, "_write_payload", self._write)
+
+    def _write(self, path: Path, payload: str) -> None:
+        self.submitted.append(payload)
+        if not self._hold(payload):
+            self._real_write(path, payload)
+            return
+        self._loop.call_soon_threadsafe(self.started.set)
+        self.release.wait()
+        try:
+            self._real_write(path, payload)
+        finally:
+            self._loop.call_soon_threadsafe(self.finished.set)
+
+    async def drain(self) -> None:
+        self.release.set()
+        if self.started.is_set():
+            await self.finished.wait()
