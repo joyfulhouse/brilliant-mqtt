@@ -298,7 +298,7 @@ Assistant control** option is on (production default: off):
 |---|---|
 | `update.brilliant_<panel>_bridge` | Agent **update** entity. Installed version comes from the panel's retained bridge-meta (`agent_version`); latest from the bundled payload's `VERSION`. Installing pushes the bundled payload, converges every **selected** companion component on the same release (the Wi-Fi/bus watchdog code is redeployed and restarted when its `VERSION` marker is missing or differs; units are re-laid), then restarts the agent. |
 | `binary_sensor.brilliant_<panel>_bridge_health` | Bridge **health** (device class `problem`). `on` = needs attention (offline past grace with auto-repair off, a repair step failed, or a repair ran but the bridge stayed offline). Attributes: `reason`, `availability`. |
-| `button.brilliant_<panel>_repair_bridge` | **Manual repair** — restores the unit/env and starts the agent (installs agent code first if missing), bypassing the auto-repair cooldown. |
+| `button.brilliant_<panel>_repair_bridge` | **Manual repair** — restores the unit/env and starts the agent (installs agent code first if missing), bypassing the auto-repair cooldown. It never replaces installed code; see [Repair never changes installed code](#repair-never-changes-installed-code). |
 | `button.brilliant_<panel>_reboot_panel` | **Reboot panel** (device class `restart`) — captures a secret-safe diagnostics summary over SSH, then reboots the panel. Typed service-journal categories and probe metrics are saved before volatile logs disappear; raw log text is never persisted. |
 | `switch.brilliant_<panel>_voice_satellite` | **Voice satellite** — enable installs and starts the satellite; disable uninstalls it. |
 | `select.brilliant_<panel>_wake_word` | **Wake word** — choose `okay_nabu` (default), `hey_jarvis`, or `hey_mycroft`; changing it restarts the satellite. |
@@ -358,6 +358,30 @@ Admission happens before the operation stages a CA or changes configuration.
 Same-code configuration repair preserves the live unit, or restores a missing
 release-layout unit from `current`, without selecting the bundled legacy unit.
 
+#### Repair never changes installed code
+
+Only the canaried paths (the Update entity, `brilliant_mqtt.redeploy`, and panel
+provisioning) replace installed bridge or watchdog code; they capture a rollback
+baseline first. Repair (automatic, button, or service), post-OTA refresh, and
+component enablement install code only where none is installed, and keep
+installed code even when the loaded bundle carries a newer release. For a panel
+whose installed release is older than the bundle, repair restores that release's
+own unit from `current` (or its staged copy in a legacy layout), rewrites the
+environment, and starts the services. Watchdogs are handled the same way. If the
+installed release's unit cannot be found, repair reports
+`release_config_source_missing`. Enabling a watchdog whose installed code differs
+from the bundle reports `release_update_required`. Update the panel to change its
+code. Loading a new integration release therefore never rolls the new code out
+to panels that go offline or receive firmware updates.
+
+While a panel has a retained rollback baseline in any state, including `soak`
+and `restored`, these paths do not install code either. Repair of a panel with
+no agent code and enabling a missing watchdog are refused with
+`baseline_retained_finalize_first`. Non-code repair of the installed release
+still runs. A baseline counts as retained when the panel holds the on-panel
+marker or Home Assistant holds a retained record for that panel's slug or pinned
+host key. Finalize the baseline after canary sign-off, or roll back, first.
+
 Existing installations are enrolled by hashing their selected code trees. Their
 ordinal is initially **unknown**, even if their `VERSION` matches the bundle.
 An unparseable, missing, prerelease, or 0.11.0-or-newer incumbent version with
@@ -405,10 +429,12 @@ can no longer replace pre-ordinal code, so a pre-0.11.0 panel whose bridge is
    3. Run the Update entity. The panel now has no agent layout, so the canary
       takes an empty baseline and installs the current release with its ordinal.
       Rollback of that update returns the panel to the uninstalled state.
-   4. Turn the watchdog switches back on. Each installs the current release.
+   4. After the canary soak, finalize the retained baseline. While it is retained,
+      turning a watchdog on is refused with `baseline_retained_finalize_first`.
+   5. Turn the watchdog switches back on. Each installs the current release.
 
    The bridge is offline from the uninstall until the update completes, and the
-   watchdogs are off until they are turned back on.
+   watchdogs are off until the baseline is finalized and they are turned back on.
 
 Neither path loosens the gate: every code replacement still runs through the
 canary.
@@ -557,8 +583,9 @@ For the full guide (requirements, troubleshooting, advanced config) see
 ## The OTA repair state machine
 
 **Summary:** going offline arms a grace timer → if still offline when it
-expires and auto-repair is on (cooldown elapsed) → SSH in, (re)install missing
-agent code, rewrite unit + env from known-good sources, `enable --now` the
+expires and auto-repair is on (cooldown elapsed) → SSH in, install missing
+agent code (never replacing installed code), rewrite unit + env from known-good
+sources, `enable --now` the
 service → wait for LWT to flip back online → `repair_succeeded` or
 `repair_failed` + `needs_attention`.
 
