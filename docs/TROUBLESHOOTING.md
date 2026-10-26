@@ -44,6 +44,47 @@ Reset to `LOG_LEVEL=INFO` when done.
 - If the agent is up but entities stay unavailable, the broker may have dropped
   the retained `online` publish — restart the unit to re-reconcile.
 
+### Update fails with "could not connect to the panel"
+
+An Update-entity install (or `redeploy`) retries a transient SSH connect failure
+before it changes anything on the panel: host or network unreachable, connection
+refused or reset, connect timeout, a temporary DNS failure, or an SSH connection
+lost during connect. A failure is retried only if the connection never reached
+SSH authentication, so the password was never sent on that attempt. A timeout or
+dropped connection after authentication began is not retried.
+
+The update makes up to 5 attempts with capped, jittered exponential backoff (at
+most 5, 10, 20 and 30 seconds). The 2-minute retry budget starts when the first
+attempt gets the integration's SSH slot, so waiting behind other panels' updates
+does not use it up. No retry starts after the budget ends, and a retry that cannot
+get the SSH slot in time gives up. The retries therefore end within about 2
+minutes plus one connect timeout of the first attempt. While it waits, the
+progress bar stays at 10% and each retry is logged at warning level, for example
+`office: agent update connect attempt 1/5 failed (host_unreachable); retrying in 4.2 s`.
+Connect-failure logs name the errno (for example `OSError 113 EHOSTUNREACH`),
+not the panel address.
+
+Other panels can use SSH during the backoff. A second update or repair of the
+same panel is refused until this one finishes. Other operations on the same panel
+(uninstall, reboot, component changes, refreshing staged copies) are not blocked
+during the backoff. If Home Assistant unloads or reloads the integration while an
+update is waiting, the update stops without connecting and does not raise a
+Repair issue.
+
+Authentication failures, host-key changes, key-exchange or protocol errors, and
+release-admission refusals are not retried. Panels use password-only root SSH,
+so a retried bad password could lock the panel out. When every attempt fails,
+the update reports `agent update could not connect to the panel after N
+attempts`. Check that the panel is powered and on the network, then retry. If
+MQTT shows the panel online but SSH from Home Assistant is unreachable, suspect a
+stale neighbor (ARP) entry on the Home Assistant host's route to the panel.
+Traffic from the panel toward Home Assistant usually clears it.
+
+Only the connect is retried. A connection lost after admission, baseline
+capture, transfer or activation has started is not retried automatically; the
+existing journal and rollback recovery applies (see
+[canary-rollback.md](canary-rollback.md)).
+
 ### Commands from HA don't drive the load
 
 1. Check the startup log line `reconcile: N devices -> M entities, K command

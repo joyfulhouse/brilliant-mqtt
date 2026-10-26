@@ -60,7 +60,11 @@ class FakeShell:
         pinned: str | None = "ssh-ed25519 FAKEKEY",
         run_errors: dict[str, Exception] | None = None,
         processes: dict[str, FakePanelProcess] | None = None,
+        reached_auth: bool = False,
     ) -> None:
+        # Whether a failed connect() had reached SSH authentication (the password
+        # may have been offered), which makes the failure non-retryable (#219).
+        self.reached_auth = reached_auth
         self.responses = dict(responses or {})
         self.connect_error = connect_error
         self.put_dir_error = put_dir_error
@@ -96,9 +100,14 @@ class FakeShell:
         }
         self._pending_identities: dict[str, dict[str, object]] = {}
         self._identity_audits: set[str] = set()
+        # Models the on-panel retained rollback baseline marker (complete.json).
+        self.baseline_retained = False
 
     def pinned_host_key(self) -> str | None:
         return self._pinned
+
+    def connect_reached_auth(self) -> bool:
+        return self.reached_auth
 
     async def connect(self) -> None:
         self.connect_count += 1
@@ -128,7 +137,7 @@ class FakeShell:
     async def run(self, command: str) -> RunResult:
         self._require_connected()
         if "BRILLIANT_BASELINE_RETAINED" in command:
-            return RunResult(0, "0", "")
+            return RunResult(0, "1" if self.baseline_retained else "0", "")
         if "BRILLIANT_BASELINE_ACTION" in command:
             return _OK
         if "BRILLIANT_RELEASE_IDENTITY_PREPARE" in command:
@@ -161,7 +170,7 @@ class FakeShell:
     async def start(self, command: str) -> PanelProcess:
         self._require_connected()
         if "BRILLIANT_BASELINE_RETAINED" in command:
-            return FakePanelProcess(RunResult(0, "0", ""))
+            return FakePanelProcess(RunResult(0, "1" if self.baseline_retained else "0", ""))
         if "BRILLIANT_BASELINE_ACTION" in command:
             return FakePanelProcess()
         self.commands.append(command)
