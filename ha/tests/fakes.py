@@ -96,6 +96,8 @@ class FakeShell:
         }
         self._pending_identities: dict[str, dict[str, object]] = {}
         self._identity_audits: set[str] = set()
+        # Models the on-panel retained rollback baseline marker (complete.json).
+        self.baseline_retained = False
 
     def pinned_host_key(self) -> str | None:
         return self._pinned
@@ -128,7 +130,7 @@ class FakeShell:
     async def run(self, command: str) -> RunResult:
         self._require_connected()
         if "BRILLIANT_BASELINE_RETAINED" in command:
-            return RunResult(0, "0", "")
+            return RunResult(0, "1" if self.baseline_retained else "0", "")
         if "BRILLIANT_BASELINE_ACTION" in command:
             return _OK
         if "BRILLIANT_RELEASE_IDENTITY_PREPARE" in command:
@@ -161,7 +163,7 @@ class FakeShell:
     async def start(self, command: str) -> PanelProcess:
         self._require_connected()
         if "BRILLIANT_BASELINE_RETAINED" in command:
-            return FakePanelProcess(RunResult(0, "0", ""))
+            return FakePanelProcess(RunResult(0, "1" if self.baseline_retained else "0", ""))
         if "BRILLIANT_BASELINE_ACTION" in command:
             return FakePanelProcess()
         self.commands.append(command)

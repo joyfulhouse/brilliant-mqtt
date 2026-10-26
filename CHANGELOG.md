@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Repair no longer upgrades a panel's code or bypasses a retained rollback
+  baseline. Automatic repair, the Repair button, the `brilliant_mqtt.repair`
+  action (including against the fleet entity), post-OTA refresh, and watchdog
+  enablement used to replace installed bridge or watchdog code with a newer
+  loaded release without capturing a baseline. That included a panel rolled
+  back to its predecessor during a canary rehearsal. These paths now install
+  code only where none is installed, and otherwise keep the installed release's
+  own code and unit while still restoring configuration and services. Upgrades
+  go only through the canaried Update entity or `brilliant_mqtt.redeploy`, so
+  loading a new integration release no longer rolls it out to panels that go
+  offline. While a panel holds a retained baseline in any state, these paths
+  install no code at all and report `baseline_retained_finalize_first` where code
+  would be needed. Enabling a watchdog whose installed code differs from the
+  bundle reports `release_update_required`. In the stopped pre-ordinal bridge
+  recovery, turn the watchdogs back on only after finalizing the baseline.
+  ([#220](https://github.com/joyfulhouse/brilliant-mqtt/issues/220))
+
 ## [0.11.3] - 2026-10-23
 
 The on-panel agent and Home Assistant integration both move to 0.11.3. The

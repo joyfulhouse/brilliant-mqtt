@@ -94,7 +94,10 @@ async def _bridge_install(hass: HomeAssistant, shell: PanelShell, data: Mapping[
     unit = await hass.async_add_executor_job((payload_dir / "brilliant-mqtt.service").read_text)
     version = (await hass.async_add_executor_job((payload_dir / "VERSION").read_text)).strip()
     async with panel_ops.release_transaction(
-        shell, str(payload_dir), panel=data[CONF_PANEL]
+        shell,
+        str(payload_dir),
+        panel=data[CONF_PANEL],
+        code_policy=await _mgr.async_core_code_policy(hass, shell, data[CONF_PANEL]),
     ) as admission:
         if admission.noop:
             return
@@ -153,13 +156,23 @@ async def _install_watchdog(
     deploy: Callable[[PanelShell, str, str], Awaitable[None]],
     ensure_unit: Callable[[PanelShell, str], Awaitable[None]],
     enable: Callable[[PanelShell], Awaitable[None]],
+    panel: str | None,
 ) -> None:
-    """Deploy and enable one watchdog from the bundled payload (stamped with its version)."""
+    """Deploy and enable one watchdog from the bundled payload (stamped with its version).
+
+    Enablement only bootstraps absent code: it never replaces installed code with
+    the bundled release, and installs nothing while a rollback baseline is
+    retained (#220). Upgrades go through the canaried update path.
+    """
     payload_dir = _mgr._payload_dir()
     unit = await hass.async_add_executor_job((payload_dir / service_filename).read_text)
     version = (await hass.async_add_executor_job((payload_dir / "VERSION").read_text)).strip()
     async with panel_ops.release_transaction(
-        shell, str(payload_dir), panel="connected-panel", components=(payload_subdir,)
+        shell,
+        str(payload_dir),
+        panel="connected-panel",
+        components=(payload_subdir,),
+        code_policy=await _mgr.async_core_code_policy(hass, shell, panel),
     ) as admission:
         if admission.noop:
             return
@@ -177,6 +190,7 @@ async def _wd_install(hass: HomeAssistant, shell: PanelShell, data: Mapping[str,
         deploy=panel_ops.deploy_wifi_watchdog,
         ensure_unit=panel_ops.ensure_wifi_watchdog_unit,
         enable=panel_ops.enable_wifi_watchdog,
+        panel=data.get(CONF_PANEL),
     )
 
 
@@ -193,6 +207,7 @@ async def _bus_install(hass: HomeAssistant, shell: PanelShell, data: Mapping[str
         deploy=panel_ops.deploy_bus_watchdog,
         ensure_unit=panel_ops.ensure_bus_watchdog_unit,
         enable=panel_ops.enable_bus_watchdog,
+        panel=data.get(CONF_PANEL),
     )
 
 

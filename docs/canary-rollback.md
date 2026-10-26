@@ -30,7 +30,12 @@ publishes are needed for these operations.
 4. A completed update retains `soak` even though the execution journal is cleared.
    Leave it retained for the full canary observation period. There is no automatic
    expiry or background reaper. Legacy HA mirror retirement and Hue CA changes are
-   deferred while the core baseline is retained.
+   deferred while the core baseline is retained. Repair (automatic, button, or
+   `brilliant_mqtt.repair`), post-OTA refresh and component enablement never change
+   the panel's bridge or watchdog code while any baseline for it is retained, in
+   any state including `restored`. They still restore the installed release's
+   units, configuration and services, and refuse with
+   `baseline_retained_finalize_first` when code would be needed.
 
 ## Roll back now
 
@@ -89,7 +94,8 @@ while obtaining redacted diagnostics and the HA repair/log code.
 | --- | --- |
 | `baseline_capture_failed`, `baseline_verify_failed` | Candidate mutation is refused. Preserve the incumbent; investigate missing/drifting code, permissions, free space, or capture bounds before retrying. |
 | `transaction_in_progress` | Check diagnostics for an in-flight operation. Allow recovery to finish and retry. |
-| `baseline_retained_finalize_first` | A rollback baseline remains for this panel. Keep it through the agreed soak. After sign-off, explicitly run Finalize retained canary with its transaction name before another update; rejection leaves the baseline intact. |
+| `baseline_retained_finalize_first` | A rollback baseline remains for this panel. Keep it through the agreed soak. After sign-off, explicitly run Finalize retained canary with its transaction name before another update, or roll back; rejection leaves the baseline intact. Repair, post-OTA refresh and component enablement report the same code instead of installing or replacing bridge or watchdog code while the baseline is retained. |
+| `release_update_required` | Repair, post-OTA refresh and component enablement keep installed code and only install code that is missing. Change it with the canaried Update entity or `brilliant_mqtt.redeploy`. |
 | `rollback_credentials_unavailable` | Restore the exact HA panel owner/configuration and its pinned host identity; then retry. Do not enable automatic host-key trust. |
 | `rollback_health_failed` | Bytes may already be restored. Check HA's broker connection and panel connectivity. Retained MQTT history cannot satisfy this check. Retry after resolving connectivity. |
 | `rollback_deadline_exceeded` | Treat recovery as unverified. The pending journal remains; remote restore processes are terminated and settled before reuse. Resolve connectivity/storage delays before retrying. |

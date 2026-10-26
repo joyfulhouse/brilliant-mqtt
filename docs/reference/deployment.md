@@ -102,11 +102,14 @@ over WebSockets are unsupported by the panel transport.
   to `/var/brilliant-mqtt/wifi_watchdog/VERSION` and
   `/var/brilliant-mqtt/bus_watchdog/VERSION` (same value as
   `/var/brilliant-mqtt/VERSION`), written only after the code swap succeeds.
-  Every repair, post-OTA refresh and Update-entity install compares that
-  marker to the bundled payload and redeploys + restarts the watchdog when it
-  is missing (pre-0.10.1 install) or differs — so the bridge and the
-  bus-watchdog cannot drift apart across releases. Hand-installed layouts can
-  write the marker themselves to opt out of the one-time redeploy.
+  Every Update-entity install compares that marker to the bundled payload and
+  redeploys + restarts the watchdog when it is missing (pre-0.10.1 install) or
+  differs — so the bridge and the bus-watchdog cannot drift apart across
+  releases. Repair and post-OTA refresh only install missing code; they never
+  replace a watchdog whose installed code differs from the bundle (run the
+  Update entity), and install nothing while a rollback baseline is retained.
+  Hand-installed layouts can write the marker themselves to opt out of the
+  one-time redeploy.
 - **Bus-watchdog phase-file coupling.** The bridge stamps the bus-phase marker
   (`BUS_PHASE_FILE`, default `/run/brilliant-mqtt/bus-phase`) that the
   bus-watchdog reads to gate reboots (see

@@ -150,13 +150,17 @@ rehearsal temporarily returns that panel to its predecessor release.
 
 1. Confirm the panel's current identity as above, and record its retained
    baseline name and `soak` state from diagnostics in private evidence.
-2. **Turn off automatic repair on that panel** for the whole rehearsal. Repair
-   admits a newer release ordinal and does not check for a retained baseline,
-   so it can upgrade the rolled-back panel again without capturing a new
-   baseline. For the same reason, do not press the panel's **Repair** button,
-   run the `brilliant_mqtt.repair` action against that panel or the fleet entity
-   (which selects every panel), or turn on a watchdog component there until
-   step 6.
+2. Expect repair to leave the rolled-back code alone. While the panel has a
+   retained baseline in any state, automatic repair, the **Repair** button, the
+   `brilliant_mqtt.repair` action (including against the fleet entity, which
+   selects every panel), post-OTA refresh and watchdog enablement never install
+   or replace its bridge or watchdog code. They may still restore the installed
+   release's units, configuration and services. Where code would be needed they
+   refuse with `baseline_retained_finalize_first`. Repair never upgrades installed
+   code without a baseline either. Automatic repair can still restart services
+   during the rehearsal, so turning it off on that panel until step 6 keeps
+   timing and health evidence attributable to the rollback. Record whether you
+   did.
 3. Run the single-target `brilliant_mqtt.canary_rollback` action with the
    recorded name. Allow up to 300 seconds overall, including the 90-second
    MQTT verification window. Record the measured duration.
@@ -170,7 +174,7 @@ rehearsal temporarily returns that panel to its predecessor release.
    panel again through the supported single-panel update, which captures a new
    predecessor baseline.
 6. Verify the panel's identity matches the current release again, then restore
-   its automatic-repair setting.
+   its automatic-repair setting if you changed it.
 
 The disposable filesystem and loopback-broker tests in `ha/tests` exercise the
 same recipes, including interrupted mutation and restart recovery. They do not

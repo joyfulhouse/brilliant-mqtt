@@ -1509,6 +1509,15 @@ async def test_stopped_pre_ordinal_bridge_recovers_only_through_canaried_update(
         retained = await journal.async_retained_records()
         assert len(retained) == 1 and retained[0].state == "soak"
         for watchdog in watchdogs:
+            # The soak baseline freezes core code (#220): finalize before enabling.
+            with pytest.raises(panel_ops.PanelOpError, match="baseline_retained_finalize_first"):
+                await manager.async_install_component(watchdog)
+            assert (await panel_ops._read_release_identities(shell))[watchdog] is None
+        provisioner._credential_resolver = AsyncMock(return_value="SECRET-password")
+        provisioner._shell_factory = lambda *_args: shell
+        await provisioner.async_finalize(retained[0].record.transaction_id)
+        await shell.connect()
+        for watchdog in watchdogs:
             await manager.async_install_component(watchdog)
             reinstalled = (await panel_ops._read_release_identities(shell))[watchdog]
             assert reinstalled is not None
