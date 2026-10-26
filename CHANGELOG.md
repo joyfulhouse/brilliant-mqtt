@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- An interrupted Add Brilliant panel operation that never created a panel entry
+  can be settled again (#214). If its recorded address or password no longer
+  works, start Add Brilliant panel with the panel's current address and root
+  password. After the pinned SSH identity matches, an explicit confirmation rolls
+  the panel back to its recorded prior state. The existing verified-restored
+  finalization then follows. Recovery uses the candidate recorded in the
+  journal, not the currently bundled release. Fresh credentials are never
+  written to retained metadata, and failed or unverified recovery is never
+  finalized or erased.
+- Recovery failures before restore intent now record a typed `last_error`
+  (`recovery_connection_failed`, `panel_authentication_failed`,
+  `panel_identity_mismatch`, `recovery_artifact_invalid`) shown in diagnostics
+  and the repair, instead of an untyped `recovery_failed` with
+  `last_error: null`.
+- Other panels' updates and canary actions blocked by an unrecovered journal
+  report `provisioning_recovery_required`, with guidance, instead of
+  `transaction_in_progress`. Operations remain serialized.
+
 ## [0.11.3] - 2026-10-23
 
 The on-panel agent and Home Assistant integration both move to 0.11.3. The

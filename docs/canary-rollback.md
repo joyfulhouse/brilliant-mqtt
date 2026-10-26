@@ -79,16 +79,23 @@ files to silence a repair issue, and do not finalize a failed recovery. Repairs
 surface stable failure codes; remote stderr and raw stored dictionaries are not
 operator output. Diagnostics identify the active journal's `name`, `panel`,
 `operation`, `phase`, and allowlisted `last_error` when present, independently of
-whether that panel has an HA owner. `last_error: null` means no error was saved,
-including failures before durable error recording; it does not mean recovery
-succeeded. `unknown` means a token was deliberately withheld. Older failures
-cannot be reconstructed from phase alone. Preserve the journal and baseline
+whether that panel has an HA owner. `last_error: null` means no error was saved;
+it does not mean recovery succeeded. Releases after 0.11.3 save every recovery
+failure before durable restore intent with stage `recovery` and one of the codes
+below, so a stuck journal carries a reason after its next attempt. `unknown`
+means a token was deliberately withheld. Older failures cannot be reconstructed
+from phase alone. Preserve the journal and baseline
 while obtaining redacted diagnostics and the HA repair/log code.
 
 | Code/state | Operator action |
 | --- | --- |
 | `baseline_capture_failed`, `baseline_verify_failed` | Candidate mutation is refused. Preserve the incumbent; investigate missing/drifting code, permissions, free space, or capture bounds before retrying. |
-| `transaction_in_progress` | Check diagnostics for an in-flight operation. Allow recovery to finish and retry. |
+| `transaction_in_progress` | Another operation holds the shared panel lock. Allow it to finish and retry. |
+| `provisioning_recovery_required` | Another panel's interrupted provisioning journal must be recovered first. Diagnostics name it (`provisioning.name`, `panel`, `phase`, `last_error`). Resolve that journal's own code below; for an onboarding that never created an HA panel, see [Interrupted onboarding without an HA panel owner](#interrupted-onboarding-without-an-ha-panel-owner). Operations stay serialized; nothing is skipped. |
+| `recovery_connection_failed` | Recovery could not reach the panel at the journal's recorded address. Bring the panel online. If its address or root password changed and it has no HA panel entry, settle it with Add Brilliant panel (below); otherwise repair the owning panel's address/credentials. |
+| `panel_authentication_failed` (stage `recovery`) | The recorded root password was rejected. Same remedy as above, with the current password. |
+| `panel_identity_mismatch` (stage `recovery`) | The host no longer proves the journal's pinned SSH identity. Do not trust a new key automatically; confirm the physical panel and address before any further action. |
+| `recovery_artifact_invalid` | The journal's recorded candidate or snapshot cannot be reconstructed. Preserve everything and send redacted diagnostics to the maintainer. |
 | `baseline_retained_finalize_first` | A rollback baseline remains for this panel. Keep it through the agreed soak. After sign-off, explicitly run Finalize retained canary with its transaction name before another update; rejection leaves the baseline intact. |
 | `rollback_credentials_unavailable` | Restore the exact HA panel owner/configuration and its pinned host identity; then retry. Do not enable automatic host-key trust. |
 | `rollback_health_failed` | Bytes may already be restored. Check HA's broker connection and panel connectivity. Retained MQTT history cannot satisfy this check. Retry after resolving connectivity. |
@@ -192,3 +199,49 @@ recovery does not reuse stored credentials to finish this operation. Start Add
 Brilliant panel again, authenticate freshly and confirm again. Unmarked older
 `finalizing` records are not accepted through this path because their original
 state cannot be proven; preserve those records for investigation.
+
+## Interrupted onboarding without an HA panel owner
+
+If Add Brilliant panel is interrupted after activation but before Home Assistant
+created the panel entry, the execution journal stays at an onboarding phase such
+as `pending_config_commit` with an `armed` baseline. Automatic recovery rolls it
+back using the address and root password recorded at the time. When that
+recorded access no longer works (for example the panel's DHCP address or root
+password changed), recovery fails with a typed code (`recovery_connection_failed`,
+`panel_authentication_failed`) on every restart, and the journal blocks other
+panels' updates and canary actions with `provisioning_recovery_required`.
+
+Settle it with fresh authority, not by deleting storage:
+
+1. Download diagnostics. Note `provisioning.name`, `panel`, `phase` and
+   `last_error`, and confirm the retained baseline for that name is `armed`,
+   `restore_requested` or `rollback_failed`.
+2. Start **Add Brilliant panel** and enter the panel's *current* address and
+   root password. Home Assistant first fetches the host key and requires it to
+   match both the journal's pinned key and fingerprint before the password is
+   used. A different identity is refused with `panel_identity_mismatch`.
+3. The **Roll back interrupted panel onboarding** step names the transaction,
+   panel, host, fingerprint, phase and last error. Confirm it. Home Assistant
+   restores the panel's recorded prior state from the journal (for a first
+   install, the agent is removed and the panel returns to verified absence). The
+   candidate identity comes only from the journal; the currently bundled release
+   is not used, so upgrading the integration in between is safe.
+4. On success the journal is cleared, the baseline is `restored`, and the flow
+   continues with the existing explicit **Finalize restored onboarding baseline**
+   confirmation (above), then normal panel setup.
+
+This path is offered only while no HA configuration entry owns the pin or
+transaction, no flow owns the transaction, and the journal is an install or
+upgrade (or its own compensation) whose baseline is not soaking, restored or
+finalizing. Committed, soaking, managed-update and owner-requested rollback
+journals are never eligible. Nothing is finalized, skipped or erased unless
+restoration is verified. A failure leaves the journal and baseline in place with
+a typed `last_error`; fix the cause and repeat.
+
+The fresh password replaces the recorded one only inside the private execution
+journal, so a Home Assistant restart during the rollback can resume it; it is
+never written to retained baseline metadata and is cleared with the journal. If
+Home Assistant restarts mid-rollback, the background runner retries with the
+journal's recorded address. If that address is still unreachable, repeat steps
+2-3. The baseline then reads `restore_requested` or `rollback_failed`, which this
+path accepts.
