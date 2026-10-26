@@ -12,15 +12,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Agent updates from the Update entity or `redeploy` retry transient SSH connect
   failures before any panel change. Retried failures are host or network
   unreachable, refused or reset connections, connect timeouts, temporary DNS
-  failures and connections lost during connect. An update makes up to 5 attempts
-  with capped, jittered exponential backoff and schedules no retry past a
-  2-minute deadline. Progress stays at the pre-connect stage while it waits, and
-  each retry logs its attempt number and classified reason. Authentication,
-  host-key, key-exchange and admission failures fail immediately without retry.
-  When every attempt fails, the update reports the attempt count. The fleet SSH
-  lock is released during backoff, and the panel stays reserved against a
-  concurrent update or repair. Resuming after a connection loss during or after
-  remote mutation remains open in #219.
+  failures and connections lost during connect. A failure is retried only if SSH
+  authentication never began, so the password is never sent twice. An update
+  makes up to 5 attempts with capped, jittered exponential backoff. The 2-minute
+  retry budget starts once the first attempt holds the fleet SSH lock, and later
+  lock waits are cut off at that deadline. Progress stays at the pre-connect
+  stage while it waits, and each retry logs its attempt number and classified
+  reason. Authentication, host-key, key-exchange and admission failures fail
+  immediately without retry. When every attempt fails, the update reports the
+  attempt count. The fleet SSH lock is released during backoff, and the panel
+  stays reserved against a concurrent update or repair. An unload or reload
+  during the wait stops the update without connecting or raising a Repair issue.
+  Resuming after a connection loss during or after remote mutation remains open
+  in #219.
+- Panel connect-failure logs record the errno and its symbolic name instead of
+  the OS error text, which for a failed TCP connect includes the panel address.
 
 ## [0.11.3] - 2026-10-23
 
