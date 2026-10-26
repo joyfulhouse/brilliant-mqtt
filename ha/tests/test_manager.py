@@ -2306,12 +2306,17 @@ async def test_agent_update_step_failure_escalates_and_raises(
 
 
 @pytest.mark.parametrize(
-    ("connect_error", "expected_diagnostic"),
+    ("connect_error", "expected_diagnostic", "reason"),
     [
-        (OSError(113, "No route to host"), "OSError 113 No route to host"),
+        (
+            OSError(113, "No route to host"),
+            "OSError 113 No route to host",
+            "agent update could not connect to the panel after 5 attempts",
+        ),
         (
             asyncssh.KeyExchangeFailed("key exchange failed"),
             "KeyExchangeFailed key exchange failed",
+            "agent update could not connect to the panel",
         ),
     ],
 )
@@ -2321,6 +2326,7 @@ async def test_agent_update_connect_failure_logs_diagnostics_without_changing_re
     caplog: pytest.LogCaptureFixture,
     connect_error: OSError | asyncssh.Error,
     expected_diagnostic: str,
+    reason: str,
 ) -> None:
     """Connect failures retain the fixed Repair while logging their safe type details."""
     from homeassistant.helpers import issue_registry as ir
@@ -2336,7 +2342,6 @@ async def test_agent_update_connect_failure_logs_diagnostics_without_changing_re
     ):
         await manager.async_update_agent()
 
-    reason = "agent update could not connect to the panel"
     issue = ir.async_get(hass).async_get_issue(DOMAIN, manager._issue_id)
     assert issue is not None
     assert manager.problem_reason == reason

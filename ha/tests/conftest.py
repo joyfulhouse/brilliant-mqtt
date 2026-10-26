@@ -58,6 +58,17 @@ def canary_rehearsal_umask(request: pytest.FixtureRequest) -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
+def instant_update_connect_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Update connect retries (#219) never wait the production backoff in tests."""
+    from custom_components.brilliant_mqtt import manager
+
+    async def no_wait(_delay: float) -> None:
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(manager, "_connect_retry_sleep", no_wait)
+
+
+@pytest.fixture(autouse=True)
 def isolated_manager_canary_dependency(
     request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
 ) -> None:

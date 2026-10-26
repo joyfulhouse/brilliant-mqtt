@@ -11,13 +11,16 @@ fires panel_updated and re-stages the OTA-proof config copies.
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import logging
+import random
 import re
+import socket
 import tarfile
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -124,6 +127,64 @@ _BUS_LIB_DRIFT_SIGNATURE = re.compile(
 _UNREACHABLE_RECHECK_SECONDS = 300.0
 _LEGACY_RETIRE_TIMEOUT_SECONDS = 30.0
 _SHELL_CLOSE_TIMEOUT_SECONDS = 5.0
+# Bounded retry of the agent update's PRE-MUTATION SSH connect (#219). Transient
+# reachability faults (a stale neighbor entry on HA's VLAN leg, a panel Wi-Fi blip)
+# clear by waiting. Backoff before retry n is min(cap, base * 2**(n-1)) scaled by a
+# jitter factor in [0.5, 1.0]; no retry is scheduled whose backoff would end past the
+# overall deadline, measured from the first attempt. Each attempt is itself bounded
+# by the shell's connect timeout, so the worst case is the deadline plus one connect.
+_CONNECT_RETRY_MAX_ATTEMPTS = 5
+_CONNECT_RETRY_BASE_DELAY_S = 5.0
+_CONNECT_RETRY_MAX_DELAY_S = 30.0
+_CONNECT_RETRY_DEADLINE_S = 120.0
+_CONNECT_RETRY_JITTER_MIN = 0.5
+# Pre-authentication network faults only. Authentication, host-key, key-exchange and
+# protocol failures are permanent: password-only root SSH must never be retried into
+# a lockout, and a changed host key must never be retried around.
+_TRANSIENT_CONNECT_ERRNOS: dict[int, str] = {
+    errno.EHOSTUNREACH: "host_unreachable",
+    errno.EHOSTDOWN: "host_unreachable",
+    errno.ENETUNREACH: "network_unreachable",
+    errno.ENETDOWN: "network_unreachable",
+    errno.ECONNREFUSED: "connection_refused",
+    errno.ECONNRESET: "connection_reset",
+    errno.ECONNABORTED: "connection_reset",
+    errno.ETIMEDOUT: "timeout",
+}
+
+
+def _connect_retry_jitter() -> float:
+    """Return the backoff scale factor (indirected so tests can pin it)."""
+    return random.uniform(_CONNECT_RETRY_JITTER_MIN, 1.0)
+
+
+# Indirected so tests drive the retry loop without real waits.
+_connect_retry_clock: Callable[[], float] = time.monotonic
+_connect_retry_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
+
+
+def _classify_transient_connect_failure(error: BaseException) -> str | None:
+    """Return a fixed retry reason for a transient connect failure, else None."""
+    if isinstance(error, socket.gaierror):
+        return "dns_temporary_failure" if error.errno == socket.EAI_AGAIN else None
+    if isinstance(error, TimeoutError):
+        return "timeout"
+    if isinstance(error, OSError):
+        return _TRANSIENT_CONNECT_ERRNOS.get(error.errno) if error.errno is not None else None
+    if isinstance(error, asyncssh.ConnectionLost):
+        return "connection_lost"
+    return None
+
+
+def _connect_retry_delay(failed_attempt: int) -> float:
+    """Capped exponential backoff with jitter after *failed_attempt* (1-based)."""
+    ceiling = min(
+        _CONNECT_RETRY_MAX_DELAY_S,
+        _CONNECT_RETRY_BASE_DELAY_S * 2.0 ** (failed_attempt - 1),
+    )
+    return round(ceiling * _connect_retry_jitter(), 1)
+
+
 _RETAINED_LEDGER_DEGRADED = "retained_ledger"
 _RETAINED_LEDGER_PROBLEM = (
     "agent retained-topic ownership ledger is unreadable or unwritable; "
@@ -175,6 +236,24 @@ _SAFE_PANEL_OP_DETAILS["baseline_retained_finalize_first"] = (
 
 class _HostKeyChanged(Exception):
     """Pinned SSH host key no longer matches and auto-re-pin is disabled."""
+
+
+@dataclass
+class _ConnectTrace:
+    """What one _connect_for_repair call did, for retry classification."""
+
+    # Set once the opt-in unpinned re-pin connect starts: it offers the password to
+    # a host presenting a NEW key, so a failure from that point is never retried.
+    repin_started: bool = False
+
+
+class _PanelConnectFailed(Exception):
+    """The update connect stage gave up; carries the last failure and attempt count."""
+
+    def __init__(self, error: OSError | asyncssh.Error, attempts: int) -> None:
+        super().__init__(type(error).__name__)
+        self.error = error
+        self.attempts = attempts
 
 
 def _safe_failure_summary(summary: str, error: BaseException | None = None) -> str:
@@ -354,6 +433,9 @@ class PanelManager:
         self._recovery_generation = 0
         self._last_repair_mono: float | None = None
         self._repairing = False
+        # Visible state of a pending update connect retry (#219): attempt, budget,
+        # classified reason and backoff. None when no retry is waiting.
+        self.update_connect_retry: dict[str, Any] | None = None
         self._abandoned_close_tasks: set[asyncio.Task[None]] = set()
         # Set true by async_shutdown. A repair already awaiting inside the ssh_lock
         # resumes AFTER shutdown's one-shot cancel; this flag stops it re-arming a
@@ -509,7 +591,7 @@ class PanelManager:
         if not await self._async_close_shell(shell):
             raise OSError("panel SSH session could not be closed") from None
 
-    async def _connect_for_repair(self) -> PanelShell:
+    async def _connect_for_repair(self, trace: _ConnectTrace | None = None) -> PanelShell:
         """Connect for a management op, honoring the host-key trust policy.
 
         Pinned connect (verify-before-auth) normally. On a rotated host key
@@ -532,6 +614,8 @@ class PanelManager:
                 OPT_TRUST_HOST_KEY_CHANGES, DEFAULT_TRUST_HOST_KEY_CHANGES
             ):
                 raise _HostKeyChanged from None
+            if trace is not None:
+                trace.repin_started = True
             repinned = self._shell_unpinned()
             try:
                 await repinned.connect()  # unpinned: captures the new key (offers the password)
@@ -558,6 +642,75 @@ class PanelManager:
             await self._async_close_shell_or_raise(shell)
             raise
         return shell
+
+    def _set_update_connect_retry(self, state: dict[str, Any] | None) -> None:
+        self.update_connect_retry = state
+        self._notify()
+
+    @asynccontextmanager
+    async def _async_locked_update_connect(self) -> AsyncIterator[PanelShell]:
+        """Yield a connected shell under the fleet SSH lock, retrying transient faults.
+
+        Only the pre-mutation connect is retried (#219): nothing on the panel has been
+        touched yet, so a repeat cannot duplicate admission, baseline capture or any
+        later stage. The caller must already own this panel's ``_repairing`` mutex,
+        which stays held across the backoff so no other update or repair of THIS
+        panel is admitted. The fleet-wide ``_ssh_lock`` is released while waiting so
+        other panels are not stalled by an unreachable one; it is held, uninterrupted,
+        from the successful connect through the whole update body.
+
+        Raises ``_PanelConnectFailed`` (with the attempt count) for an exhausted,
+        expired or permanent connect failure; ``_HostKeyChanged`` and identity errors
+        propagate unchanged on their first occurrence. Cancellation (HA shutdown,
+        entity removal) interrupts the backoff immediately; a latched shutdown stops
+        retrying at the next decision point.
+        """
+        deadline = _connect_retry_clock() + _CONNECT_RETRY_DEADLINE_S
+        attempt = 0
+        try:
+            while True:
+                attempt += 1
+                trace = _ConnectTrace()
+                async with self._ssh_lock:
+                    try:
+                        shell = await self._connect_for_repair(trace)
+                    except (OSError, asyncssh.Error) as error:
+                        failure: OSError | asyncssh.Error = error
+                    else:
+                        self._set_update_connect_retry(None)
+                        yield shell
+                        return
+                _log_connect_failure(self.panel, failure)
+                reason = (
+                    None if trace.repin_started else _classify_transient_connect_failure(failure)
+                )
+                if reason is None or attempt >= _CONNECT_RETRY_MAX_ATTEMPTS or self._shutting_down:
+                    raise _PanelConnectFailed(failure, attempt) from None
+                delay = _connect_retry_delay(attempt)
+                if _connect_retry_clock() + delay > deadline:
+                    raise _PanelConnectFailed(failure, attempt) from None
+                _LOGGER.warning(
+                    "%s: agent update connect attempt %d/%d failed (%s); retrying in %.1f s",
+                    self.panel,
+                    attempt,
+                    _CONNECT_RETRY_MAX_ATTEMPTS,
+                    reason,
+                    delay,
+                )
+                self._set_update_connect_retry(
+                    {
+                        "attempt": attempt,
+                        "max_attempts": _CONNECT_RETRY_MAX_ATTEMPTS,
+                        "reason": reason,
+                        "retry_in_seconds": delay,
+                    }
+                )
+                await _connect_retry_sleep(delay)
+                if self._shutting_down:
+                    raise _PanelConnectFailed(failure, attempt) from None
+        finally:
+            if self.update_connect_retry is not None:
+                self._set_update_connect_retry(None)
 
     async def async_setup(self) -> None:
         self._shutting_down = False
@@ -1539,9 +1692,12 @@ class PanelManager:
                 )
                 self._escalate(summary)
                 raise self._translated_failure("update_failed", summary) from None
-            async with self._ssh_lock:
+            # The stack owns the fleet SSH lock from the successful connect onward; a
+            # transient connect failure is retried before anything is mutated, with
+            # progress held at the pre-connect stage while waiting.
+            async with AsyncExitStack() as connected:
                 try:
-                    shell = await self._connect_for_repair()
+                    shell = await connected.enter_async_context(self._async_locked_update_connect())
                 except _HostKeyChanged:
                     # A rotated host key with auto-re-pin OFF: never offer the password to
                     # the new-key host. Service-call context → escalate AND raise so HA
@@ -1550,12 +1706,11 @@ class PanelManager:
                     raise HomeAssistantError(
                         translation_domain=DOMAIN, translation_key="host_key_changed"
                     ) from None
-                except (OSError, asyncssh.Error) as err:
-                    _log_connect_failure(self.panel, err)
-                    summary = _safe_failure_summary(
-                        "agent update could not connect to the panel",
-                        err,
-                    )
+                except _PanelConnectFailed as failed:
+                    summary = "agent update could not connect to the panel"
+                    if failed.attempts > 1:
+                        summary = f"{summary} after {failed.attempts} attempts"
+                    summary = _safe_failure_summary(summary, failed.error)
                     self._escalate(summary)
                     raise self._translated_failure("update_failed", summary) from None
                 _p(25)
