@@ -215,7 +215,8 @@ Settle it with fresh authority, not by deleting storage:
 
 1. Download diagnostics. Note `provisioning.name`, `panel`, `phase` and
    `last_error`, and confirm the retained baseline for that name is `armed`,
-   `restore_requested` or `rollback_failed`.
+   `restore_requested` or `rollback_failed` (or `restored` while the journal is
+   still `rollback_pending`; see below).
 2. Start **Add Brilliant panel** and enter the panel's *current* address and
    root password. Home Assistant first fetches the host key and requires it to
    match both the journal's pinned key and fingerprint before the password is
@@ -232,8 +233,8 @@ Settle it with fresh authority, not by deleting storage:
 
 This path is offered only while no HA configuration entry owns the pin or
 transaction, no flow owns the transaction, and the journal is an install or
-upgrade (or its own compensation) whose baseline is not soaking, restored or
-finalizing. Committed, soaking, managed-update and owner-requested rollback
+upgrade (or its own compensation) whose baseline is not soaking or finalizing,
+and not `restored` before rollback began. Committed, soaking, managed-update and owner-requested rollback
 journals are never eligible. Nothing is finalized, skipped or erased unless
 restoration is verified. A failure leaves the journal and baseline in place with
 a typed `last_error`; fix the cause and repeat.
@@ -245,3 +246,17 @@ Home Assistant restarts mid-rollback, the background runner retries with the
 journal's recorded address. If that address is still unreachable, repeat steps
 2-3. The baseline then reads `restore_requested` or `rollback_failed`, which this
 path accepts.
+
+If Home Assistant stopped after the restore was verified but before the journal
+was cleared, the baseline reads `restored` (with its recovery deployment ID,
+or a first-install undo to absence) while the journal is still
+`rollback_pending`. The same Add Brilliant panel steps settle it. The panel is
+not restored again. Home Assistant authenticates freshly against the pinned
+identity, prunes the transaction-owned candidate and clears the journal, then
+offers the explicit finalization.
+
+Failures caused by the address or password entered in the flow are shown in the
+flow only. They do not replace the `last_error` saved by background recovery. A
+shell that cannot be built for an invalid or reassigned address reports
+`recovery_connection_failed`; only key or pin evidence reports
+`panel_identity_mismatch`.
