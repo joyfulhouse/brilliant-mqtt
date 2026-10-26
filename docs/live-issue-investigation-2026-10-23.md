@@ -5,6 +5,21 @@ checks. It does not qualify a release, repair a network, or authorize fleet
 rollout. Private identities, topology, credentials, logs, and packet transcripts
 are excluded. All eight residual issues remain open.
 
+> **Later outcome (2026-10-26).** The deployment blocker below was resolved by
+> preparing a distinct release identity: version `0.11.3`, release ordinal `5`,
+> at reviewed commit `e790bdd45e571307bfb52227ee38736c5e4664cd` (#218, which
+> includes #215, #217 and the reviewed #143 lease-revocation change). It was
+> published as tag `v0.11.3`, installed in Home Assistant through HACS, and
+> deployed first to the designated pilot through the supported single-panel
+> update. That update was normally admitted from ordinal 4 to ordinal 5 and
+> retained the predecessor baseline. The pilot soaked for more than 48 hours with
+> matching bridge and bus-watchdog digests, unchanged service processes and no
+> automatic restarts. All panels have since been updated and report `0.11.3`.
+> One update first failed while connecting from Home Assistant to the panel;
+> bounded retry/resume is tracked in #219. Rollback rehearsal and responsiveness
+> measurements remain outstanding, and the issue dispositions below are
+> unchanged. The rest of this document is the original dated record.
+
 ## Repository and candidate state
 
 - PR #215 remains open and mergeable at
