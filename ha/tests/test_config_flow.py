@@ -7,6 +7,7 @@ import json
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, Mock, patch
@@ -5415,3 +5416,119 @@ async def test_ownerless_candidate_refusals_do_not_offer_password(
     assert result["step_id"] == "panel_connect"
     assert result["errors"] == {"base": "ownerless_recovery_unavailable"}
     inspect.assert_not_awaited()
+
+
+async def _stuck_ownerless_journal(
+    hass: HomeAssistant, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Any:
+    """#214: an interrupted install journal at pending_config_commit with no owner."""
+    from homeassistant.helpers import json as json_util
+
+    from custom_components.brilliant_mqtt.provisioning_journal import ProvisioningPhase, Store
+
+    hass.config.config_dir = str(tmp_path / "ha-config")
+
+    async def write(store: Store, data: dict[str, object]) -> None:
+        def persist() -> None:
+            Path(store.path).parent.mkdir(parents=True, exist_ok=True)
+            json_util.save_json(store.path, data, private=True, atomic_writes=True)
+
+        await hass.async_add_executor_job(persist)
+
+    monkeypatch.setattr(Store, "_async_write_data", write)
+    retained = await _restored_ownerless_record(hass)
+    journal = ProvisioningJournal(hass)
+    record = await journal.async_create(retained.record)
+    for phase in (
+        ProvisioningPhase.ACTIVATION_PENDING,
+        ProvisioningPhase.ACTIVATED,
+        ProvisioningPhase.VERIFYING,
+        ProvisioningPhase.PENDING_CONFIG_COMMIT,
+    ):
+        record = await journal.async_transition(record.transaction_id, phase)
+    return record
+
+
+@pytest.mark.parametrize("outcome", ["restored", "failed"])
+async def test_ownerless_stuck_install_journal_recovers_with_fresh_flow_authority(
+    hass: HomeAssistant, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    record = await _stuck_ownerless_journal(hass, tmp_path, monkeypatch)
+    entry = _fleet_entry(hass)
+    result = await _start_subentry_confirm(hass, entry, identity=_identity())
+    assert result["step_id"] == "panel_recover_journal"
+    placeholders = repr(result["description_placeholders"])
+    assert str(record.transaction_id) in placeholders
+    assert record.panel_request.slug in placeholders
+    assert _ROOT_PASSWORD not in repr(result)
+    restored = await _restored_ownerless_record(hass)
+
+    async def recover(expected: object, host: str, password: str, identity: object) -> None:
+        assert expected == record
+        assert (host, password, identity) == (_PANEL_INPUT[CONF_HOST], _ROOT_PASSWORD, _identity())
+        if outcome == "failed":
+            raise PanelProvisioningError("recovery_connection_failed")
+        monkeypatch.setattr(ProvisioningJournal, "async_load", AsyncMock(return_value=None))
+        monkeypatch.setattr(
+            ProvisioningJournal, "async_retained_records", AsyncMock(return_value=(restored,))
+        )
+
+    provisioner = SimpleNamespace(async_recover_ownerless_journal=AsyncMock(side_effect=recover))
+    with patch.object(flow_gateway, "_get_panel_provisioner", return_value=provisioner):
+        unchecked = await hass.config_entries.subentries.async_configure(
+            result["flow_id"], {"confirm_recover": False}
+        )
+        assert unchecked["step_id"] == "panel_recover_journal"
+        assert unchecked["errors"] == {"base": "confirmation_required"}
+        provisioner.async_recover_ownerless_journal.assert_not_awaited()
+        confirmed = await hass.config_entries.subentries.async_configure(
+            result["flow_id"], {"confirm_recover": True}
+        )
+    provisioner.async_recover_ownerless_journal.assert_awaited_once()
+    assert _ROOT_PASSWORD not in repr(confirmed)
+    if outcome == "failed":
+        assert confirmed["step_id"] == "panel_connect"
+        assert confirmed["errors"] == {"base": "recovery_connection_failed"}
+    else:
+        # Only the existing explicit, verified-restored finalization follows.
+        assert confirmed["step_id"] == "panel_finalize_retained"
+        assert str(record.transaction_id) in repr(confirmed["description_placeholders"])
+
+
+@pytest.mark.parametrize("conflict", ["identity", "owner", "flow_pending"])
+async def test_ownerless_stuck_journal_refusals_do_not_offer_password(
+    hass: HomeAssistant, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, conflict: str
+) -> None:
+    record = await _stuck_ownerless_journal(hass, tmp_path, monkeypatch)
+    if conflict == "owner":
+        entry = _fleet_entry(hass, _subentry())
+    else:
+        entry = _fleet_entry(hass)
+    form = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, SUBENTRY_TYPE_PANEL), context={"source": "user"}
+    )
+    if conflict == "flow_pending":
+        other = await hass.config_entries.subentries.async_init(
+            (entry.entry_id, SUBENTRY_TYPE_PANEL), context={"source": "user"}
+        )
+        handler = hass.config_entries.subentries._progress[other["flow_id"]]
+        context = cast(dict[str, Any], handler.context)
+        context[CONF_PROVISIONING_TRANSACTION_ID] = str(record.transaction_id)
+    inspect = AsyncMock()
+    with (
+        patch.object(
+            flow_gateway,
+            "async_fetch_host_identity",
+            return_value=_identity(other=conflict == "identity"),
+        ),
+        patch.object(flow_gateway, "_async_inspect_candidate", inspect),
+    ):
+        result = await hass.config_entries.subentries.async_configure(form["flow_id"], _PANEL_INPUT)
+    assert result["step_id"] == "panel_connect"
+    assert result["errors"] == {
+        "base": "panel_identity_mismatch"
+        if conflict == "identity"
+        else "ownerless_recovery_unavailable"
+    }
+    inspect.assert_not_awaited()
+    assert await ProvisioningJournal(hass).async_load() == record

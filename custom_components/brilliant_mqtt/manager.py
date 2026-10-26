@@ -238,6 +238,7 @@ for _canary_code in (
     "baseline_read_failed",
     "baseline_retained_finalize_first",
     "transaction_in_progress",
+    "provisioning_recovery_required",
     "rollback_failed",
     "rollback_health_failed",
     "rollback_deadline_exceeded",
@@ -248,6 +249,10 @@ _SAFE_PANEL_OP_DETAILS["baseline_retained_finalize_first"] = (
     "baseline_retained_finalize_first: after canary sign-off, explicitly finalize the retained "
     "baseline by transaction name (or roll back) before changing this panel's code; "
     "see docs/canary-rollback.md"
+)
+_SAFE_PANEL_OP_DETAILS["provisioning_recovery_required"] = (
+    "provisioning_recovery_required: another panel's interrupted provisioning transaction "
+    "must be recovered first; check diagnostics and see docs/canary-rollback.md"
 )
 
 

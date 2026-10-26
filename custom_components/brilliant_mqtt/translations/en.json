@@ -325,6 +325,13 @@
             "confirm": "Home Assistant rechecks the replacement identity immediately before saving. Leave this off to make no changes."
           }
         },
+        "panel_recover_journal": {
+          "title": "Roll back interrupted panel onboarding",
+          "description": "An interrupted Add Brilliant panel operation for this panel never created a Home Assistant panel entry, and its automatic recovery has not finished. Panel: {panel}. Host: {host}. Pinned SSH fingerprint: {fingerprint}. Transaction: {transaction}. Journal phase: {phase}. Last recovery error: {last_error}. Confirming uses the address and root password you just entered, after the panel proved the pinned identity, to restore the panel's recorded prior state (for a first install, the agent is removed). Nothing is finalized or deleted unless restoration is verified. A verified restore then asks separately before its baseline is finalized.",
+          "data": {
+            "confirm_recover": "I confirm rolling back this interrupted onboarding"
+          }
+        },
         "panel_finalize_retained": {
           "title": "Finalize restored onboarding baseline",
           "description": "This panel has a verified restored baseline from interrupted onboarding. Host: {host}. Pinned SSH fingerprint: {fingerprint}. Retained transaction: {transaction}. Finalization permanently removes this rollback guarantee. Confirm only after reviewing the restored panel. This does not install a release; panel setup continues after cleanup.",
@@ -401,6 +408,9 @@
         "commit_failed": "The installed panel could not be committed to durable Home Assistant storage.",
         "rollback_failed": "Automatic rollback did not finish. Follow the provisioning recovery instructions before retrying.",
         "recovery_failed": "A prior provisioning transaction could not be recovered automatically.",
+        "recovery_connection_failed": "Recovery could not reach the panel at its recorded address. Keep the journal and baseline. Check the panel is online; if its address or root password changed, start Add Brilliant panel with the current address and password to roll back the interrupted onboarding. See docs/canary-rollback.md.",
+        "recovery_artifact_invalid": "The recorded recovery state could not be reconstructed safely. Keep the journal and baseline and attach redacted diagnostics for the maintainer; do not delete private storage. See docs/canary-rollback.md.",
+        "provisioning_recovery_required": "Another panel's interrupted provisioning transaction must be recovered first. Download diagnostics (provisioning name, panel, last_error) and follow docs/canary-rollback.md, then retry.",
         "transaction_in_progress": "Another panel operation holds the shared lock or a provisioning transaction still needs recovery. Check diagnostics, allow recovery to finish, and retry.",
         "provisioning_failed": "Panel provisioning failed. Review the integration logs and recovery instructions before retrying.",
         "invalid_cadence": "Enter a whole number of seconds within the documented range.",

@@ -1151,6 +1151,11 @@ def panel_finalize_retained_schema() -> vol.Schema:
     return vol.Schema({vol.Required("confirm_finalize", default=False): bool})
 
 
+def panel_recover_journal_schema() -> vol.Schema:
+    """Require an explicit choice before rolling back an interrupted onboarding."""
+    return vol.Schema({vol.Required("confirm_recover", default=False): bool})
+
+
 def _validated_panel_password(
     user_input: Mapping[str, object],
     errors: dict[str, str],
