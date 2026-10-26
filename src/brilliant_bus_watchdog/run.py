@@ -20,7 +20,7 @@ from types import FrameType
 from typing import Any, Protocol
 
 from . import bounded, probe
-from .health import bus_failure_age, heartbeat_age
+from .health import BusFailureObserver, bus_failure_age, heartbeat_age
 from .reboot import reboot as _reboot
 from .reboot_guard import GuardPolicy, RebootGuard
 
@@ -185,6 +185,7 @@ def main() -> None:  # pragma: no cover - thin loop
     previous_handler = signal.signal(signal.SIGTERM, _stop_by_sigterm)
     try:
         guard = RebootGuard(cfg.state_path, cfg.policy)
+        failure_observer = BusFailureObserver()
         started_at = time.time()
         while True:
             now = time.time()
@@ -193,15 +194,13 @@ def main() -> None:  # pragma: no cover - thin loop
             gateway_up = probe.ping(gw) if gw else False
             active = _service_active(cfg.bridge_service)
             service_started_at = _service_started_at(cfg.bridge_service)
-            failure_age = (
-                bus_failure_age(
-                    cfg.phase_path,
-                    now=time.monotonic(),
-                    service_started_at=service_started_at,
-                )
-                if service_started_at is not None
-                else None
+            sampled_failure_age = bus_failure_age(
+                cfg.phase_path,
+                now=time.monotonic(),
+                service_started_at=service_started_at,
+                observer=failure_observer,
             )
+            failure_age = sampled_failure_age if service_started_at is not None else None
             should = should_reboot(
                 age=age,
                 bridge_active=active,

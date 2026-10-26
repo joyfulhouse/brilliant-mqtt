@@ -77,7 +77,13 @@ verified absence and does not claim a predecessor MQTT session.
 Keep the baseline, journal, and HA panel configuration. Do not delete private
 files to silence a repair issue, and do not finalize a failed recovery. Repairs
 surface stable failure codes; remote stderr and raw stored dictionaries are not
-operator output.
+operator output. Diagnostics identify the active journal's `name`, `panel`,
+`operation`, `phase`, and allowlisted `last_error` when present, independently of
+whether that panel has an HA owner. `last_error: null` means no error was saved,
+including failures before durable error recording; it does not mean recovery
+succeeded. `unknown` means a token was deliberately withheld. Older failures
+cannot be reconstructed from phase alone. Preserve the journal and baseline
+while obtaining redacted diagnostics and the HA repair/log code.
 
 | Code/state | Operator action |
 | --- | --- |

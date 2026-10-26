@@ -95,7 +95,7 @@ def current_boot_id() -> str | None:
 
 
 def process_generation(pid: int) -> str | None:
-    """Return Linux's per-process start tick, which disambiguates PID reuse."""
+    """Return a non-dead process's start tick, which disambiguates PID reuse."""
     try:
         with open(f"/proc/{pid}/stat", encoding="utf-8") as stream:
             stat = stream.read()
@@ -105,7 +105,15 @@ def process_generation(pid: int) -> str | None:
     if command_end < 0:
         return None
     fields_after_command = stat[command_end + 1 :].split()
-    if len(fields_after_command) <= 19:
+    if len(fields_after_command) <= 19 or fields_after_command[0] in ("Z", "X", "x"):
+        return None
+    try:
+        flags = int(fields_after_command[6])
+    except ValueError:
+        return None
+    # Linux sets PF_EXITING before closing files (and releasing flock), while
+    # the task can still report state R. That interval is not a live release.
+    if flags & 0x00000004:
         return None
     start_tick = fields_after_command[19]
     return start_tick if start_tick.isdecimal() else None

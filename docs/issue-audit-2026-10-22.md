@@ -47,7 +47,7 @@ rollback failure in #214 remains open as described below.
 | --- | --- |
 | #113 | A poison-frame quarantine changes QoS-1 replay, durability, and capacity policy. Define an explicit retained/quarantine contract before changing delivery; current payloads have no demonstrated permanent broker rejection. |
 | #142 | Conservative same-value mode confirmation is an accepted limitation pending request-relative evidence. Do not infer execution from a stale mirror. |
-| #143 | The read-only-filesystem reboot residual needs independently observable lease revocation. A failed marker write alone cannot prove it. |
+| #143 | The [sampled lease-revocation follow-up](issue-143-lease-revocation.md) fences independently observed releases for the same writer generation. Unsampled death and watchdog restart remain ambiguous; marker write failure alone still cannot prove revocation. |
 | #153 | The event-reflection proposal is delivered, but upstream implementation and qualification remain. The issue expressly requires more than a documentation merge. |
 | #155 | i350/aarch64 support needs native-library/runtime diagnostics and pilot qualification. Removing the architecture gate alone does not prove compatibility. |
 | #164 | Release readiness requires designated-panel deployment, rollback, resource, and soak evidence, beyond synthetic code tests. |
@@ -76,3 +76,44 @@ for observable delivery and task completion before its exact count assertion.
 Production panel credentials and access are not present in this checkout. No
 live panel deployment, network repair, physical actuation, or soak is claimed by
 this audit.
+
+## #214 follow-up: October 22 reporter diagnostics
+
+The reporter's 18:45 UTC comment and redacted attachment were reviewed after
+PR #215. The attachment shows one active `pending_config_commit` transaction,
+an affected panel's `armed` retained baseline with no recovery deployment ID,
+and only the other panel in the fleet. The dismissed repair is not evidence of
+storage cleanup. The original diagnostics do not identify the active transaction
+or export its stored error; they cannot prove which panel owns that journal.
+
+For an orphaned onboarding transaction, `pending_config_commit` first checks
+ownership and then reconstructs recovery artifacts and connects with the stored
+SSH pin. Only afterward does rollback request `restore_requested`. **If the active
+journal belongs to the affected baseline**, the surviving `armed` state narrows
+the investigation to a failure before durable restore intent (including failure
+to persist intent), or an attempt that did not reach that boundary. The attachment
+does not establish that association or an SSH, storage, lookup, or panel-side root
+cause. A running agent and retained MQTT entities do not establish commit
+or restoration. No raw private storage or panel logs were obtained.
+
+A reproduced observability defect is fixed separately: diagnostics omitted the
+active transaction identity and any already stored error. Diagnostics now identify
+its `name`, `panel`, `operation`, and allowlisted `last_error.stage`/
+`last_error.code`. Unknown stored tokens are exported as `unknown`; passwords,
+addresses, keys, snapshots, and remote exception text are not included in these
+new fields. Error capture is unchanged: a failure before an error is durably
+recorded can still show `last_error: null`. Previously absent errors cannot be
+reconstructed retroactively.
+
+Regression tests reproduce missing active identity/error evidence and exercise a
+real stored pending journal with an armed filesystem baseline. A connection
+failure leaves that baseline armed and its uncaptured error null; diagnostics do
+not authorize rollback or ownerless finalization. This follow-up performs no new
+recovery writes and changes no recovery timeout or mutation policy.
+
+The original #214 failure remains unproven. Preserve the execution journal and
+both retained baselines. Obtain updated diagnostics and the existing HA-side
+repair/log code, with secrets redacted, before selecting a recovery action.
+An armed ownerless baseline is ineligible for the restored-only finalization
+path. Existing release admission remains mandatory. This follow-up makes no
+production access, deployment, recovery, or soak claim.
