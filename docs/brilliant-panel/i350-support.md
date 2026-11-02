@@ -45,13 +45,13 @@ followed by `key=value` lines:
 | `panel_python_present`, `panel_python_version` | The firmware Python at `/data/switch-embedded/env/bin/python3` |
 | `release_tag` | The firmware `release_tag` from `/etc/release_info.json` |
 | `site_packages_dir` | The firmware site-packages directory, or `missing` |
-| `bus_library_import` | Whether `RPCObserver` imports (`ok`, `failed: …`, `failed: timed out`). The library is imported only, never connected, and import is bounded at 20 s. |
-| `bus_library_so_count`, `bus_library_elf_class`, `bus_library_elf_machine`, `bus_library_elf_arch` | How many native `.so` files the bus library has and its ELF class/machine (`2`/`183` = AArch64, `1`/`40` = 32-bit ARM) |
+| `bus_library_import` | Whether `RPCObserver` imports (`ok`, `failed: …`, `failed: timed out`). The library is imported only (isolated `python3 -I -B`), never connected. The import is bounded at 20 s unless `timeout_mode=unbounded`. |
+| `bus_library_so_count`, `bus_library_elf_sample`, `bus_library_elf_class`, `bus_library_elf_machine`, `bus_library_elf_arch` | How many native `.so` files are under the bus library's `lib/` package (`unknown` without `find`), and the ELF class/machine of one sampled `.so` (`2`/`183` = AArch64, `1`/`40` = 32-bit ARM). The sample is the first `lib/message_bus_api/*.so`, else the first `.so` under `lib/`; its path is reported relative to site-packages. Without `od` the ELF fields are `unknown`. |
 | `bus_socket_present` | Whether `/var/run/brilliant/server_socket` exists |
 | `message_bus_enabled`, `message_bus_active` | `systemctl is-enabled` / `is-active message_bus.service` |
-| `var_mount_*`, `data_mount_*`, `var_free_kib`, `data_free_kib` | Filesystem type and options of the effective `/var` and `/data` mounts, and the free space on each |
+| `var_mount_*`, `data_mount_*`, `var_free_kib`, `data_free_kib` | Filesystem type and options of the mount entries for `/var` and `/data` (the last entry for each path in `/proc/mounts`), and the free space on each |
 | `wlan0_present`, `iw_present`, `connmanctl_present` | Wi-Fi interface and tool presence. The tools are looked up only, never run. |
-| `mmc_drivers`, `imx_sdhci_driver_present` | The SD/MMC host drivers bound on the panel, and whether the i.MX driver that the watchdog reset targets is present |
+| `mmc_drivers`, `imx_sdhci_driver_present` | The SD/MMC host drivers registered on the panel, and whether the i.MX driver that the watchdog reset targets is present |
 | `mem_total_kib`, `cpu_count` | Memory and CPU count |
 | `hue_site_packages_present`, `hue_peripherals_ini_present`, `hue_ca_bundle_present` | Whether the Hue CA recovery paths exist (presence only) |
 
@@ -71,7 +71,7 @@ order, on a designated i350 pilot panel:
 
 1. **Diagnostic passes.** The diagnostic reports `bus_library_import=ok`, an
    AArch64 bus library, a present bus socket, an enabled and active
-   `message_bus.service`, a writable `/var` with enough free space, and a
+   `message_bus.service`, an rw mount reported for `/var` with enough free space, and a
    `release_tag` that matches the integration's firmware pattern
    (`_FIRMWARE_VERSION` in `custom_components/brilliant_mqtt/panel_inspection.py`,
    currently `^v[0-9]+(?:\.[0-9]+){3}$`).

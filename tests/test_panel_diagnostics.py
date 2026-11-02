@@ -13,6 +13,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import venv
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -22,7 +23,22 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "brilliant-panel" / "panel_diagnostics.sh"
 HEADER = "# brilliant-mqtt panel diagnostics (read-only) v1"
 
-_HOST_TOOLS = ("awk", "cut", "df", "find", "head", "od", "sed", "sort", "tail", "tr", "true", "wc")
+_HOST_TOOLS = (
+    "awk",
+    "cut",
+    "dd",
+    "df",
+    "find",
+    "head",
+    "od",
+    "sed",
+    "sort",
+    "tail",
+    "tr",
+    "true",
+    "wc",
+)
+_HOST_PY_DIR = f"python{sys.version_info.major}.{sys.version_info.minor}"
 _SP310 = "data/switch-embedded/env/lib/python3.10/site-packages"
 _SECRET = "SECRET-DO-NOT-LEAK-7f3a"
 _IMPORT = "from lib.message_bus_api.observer_interface import RPCObserver"
@@ -41,6 +57,7 @@ class Panel:
     import_rc: int = 1
     release_info: str | None = '{"release_tag": "v26.07.15.1", "other": "x"}'
     elf: tuple[int, int] | None = (2, 183)
+    bus_api_elf: tuple[int, int] | None = (2, 183)
     socket: bool = True
     mounts: str = (
         "/dev/mmcblk0p4 /var ext4 rw,relatime 0 0\n/dev/mmcblk0p3 /data ext4 ro,relatime 0 0\n"
@@ -51,6 +68,8 @@ class Panel:
     timeout: str | None = "gnu"  # gnu | busybox | busybox_old | broken | None
     expire_rc: int | None = None
     extra_files: dict[str, str] = field(default_factory=dict)
+    missing_tools: tuple[str, ...] = ()
+    head_without_c: bool = False
 
 
 def _write(path: Path, content: str, mode: int = 0o644) -> None:
@@ -83,6 +102,17 @@ def _fake_timeout(style: str, expire_rc: int | None) -> str:
     )
 
 
+def _elf_header(elf_class: int, machine: int) -> bytes:
+    return (
+        b"\x7fELF"
+        + bytes([elf_class, 1, 1])
+        + bytes(9)
+        + (3).to_bytes(2, "little")
+        + machine.to_bytes(2, "little")
+        + bytes(44)
+    )
+
+
 def _build(tmp_path: Path, panel: Panel) -> tuple[Path, Path, dict[str, str]]:
     root = tmp_path / "root"
     fakebin = tmp_path / "fakebin"
@@ -91,8 +121,19 @@ def _build(tmp_path: Path, panel: Panel) -> tuple[Path, Path, dict[str, str]]:
         directory.mkdir()
 
     for tool in _HOST_TOOLS:
+        if tool in panel.missing_tools:
+            continue
         found = shutil.which(tool, path="/usr/bin:/bin")
         assert found is not None, tool
+        if tool == "head" and panel.head_without_c:
+            # Old busybox: no `head -c`.
+            _write(
+                fakebin / "head",
+                '#!/bin/sh\ncase " $* " in *" -c "*) echo "head: bad option" >&2; exit 1 ;; esac\n'
+                f'exec {shlex.quote(found)} "$@"\n',
+                0o755,
+            )
+            continue
         (fakebin / tool).symlink_to(found)
 
     _write(
@@ -117,7 +158,14 @@ def _build(tmp_path: Path, panel: Panel) -> tuple[Path, Path, dict[str, str]]:
     if panel.timeout is not None:
         _write(fakebin / "timeout", _fake_timeout(panel.timeout, panel.expire_rc), 0o755)
 
-    sp = root / f"data/switch-embedded/env/lib/{panel.py_dir}/site-packages"
+    env_dir = root / "data/switch-embedded/env"
+    if panel.python:
+        # A real venv, so the script's isolated (-I) import must find the bus
+        # library through the panel venv's own site-packages, not PYTHONPATH.
+        venv.EnvBuilder(symlinks=True, with_pip=False).create(env_dir)
+        if panel.py_dir != _HOST_PY_DIR or not panel.site_packages:
+            shutil.rmtree(env_dir / "lib" / _HOST_PY_DIR)
+    sp = env_dir / "lib" / panel.py_dir / "site-packages"
     if panel.site_packages:
         pkg = sp / "lib" / "message_bus_api"
         _write(sp / "lib" / "__init__.py", "")
@@ -126,16 +174,10 @@ def _build(tmp_path: Path, panel: Panel) -> tuple[Path, Path, dict[str, str]]:
             "class RPCObserver:\n    pass\n" if panel.import_ok else "raise ImportError('boom')\n"
         )
         _write(pkg / "observer_interface.py", body)
+        if panel.bus_api_elf is not None:
+            (pkg / "observer_native.cpython-310.so").write_bytes(_elf_header(*panel.bus_api_elf))
         if panel.elf is not None:
-            elf_class, machine = panel.elf
-            header = (
-                b"\x7fELF"
-                + bytes([elf_class, 1, 1])
-                + bytes(9)
-                + (3).to_bytes(2, "little")
-                + machine.to_bytes(2, "little")
-                + bytes(44)
-            )
+            header = _elf_header(*panel.elf)
             for name in ("processor.cpython-310.so", "observer_core.cpython-310.so"):
                 target = sp / "lib" / "protocol" / name
                 target.parent.mkdir(parents=True, exist_ok=True)
@@ -149,9 +191,11 @@ def _build(tmp_path: Path, panel: Panel) -> tuple[Path, Path, dict[str, str]]:
             f'case "$*" in *RPCObserver*) [ {int(panel.import_ok or panel.import_rc == 1)} = 1 ] '
             f"|| {{ echo 'Traceback (most recent call last):' >&2; "
             f"echo 'ImportError: boom' >&2; exit {panel.import_rc}; }} ;; esac\n"
-            f'PYTHONPATH={shlex.quote(str(sp))} exec {shlex.quote(sys.executable)} "$@"\n'
+            f'echo "$PYTHONDONTWRITEBYTECODE $*" >> {shlex.quote(str(logs / "python.log"))}\n'
+            f'exec {shlex.quote(str(env_dir / "bin" / _HOST_PY_DIR))} "$@"\n'
         )
-        _write(root / "data/switch-embedded/env/bin/python3", wrapper, 0o755)
+        (env_dir / "bin" / "python3").unlink()
+        _write(env_dir / "bin" / "python3", wrapper, 0o755)
 
     if panel.release_info is not None:
         _write(root / "etc/release_info.json", panel.release_info)
@@ -247,7 +291,8 @@ def test_full_i350_style_report(tmp_path: Path) -> None:
         "release_tag": "v26.07.15.1",
         "site_packages_dir": "/" + _SP310,
         "bus_library_import": "ok",
-        "bus_library_so_count": "2",
+        "bus_library_so_count": "3",
+        "bus_library_elf_sample": "lib/message_bus_api/observer_native.cpython-310.so",
         "bus_library_elf_class": "2",
         "bus_library_elf_machine": "183",
         "bus_library_elf_arch": "aarch64",
@@ -277,6 +322,13 @@ def test_full_i350_style_report(tmp_path: Path) -> None:
     assert not (logs / "connmanctl.log").exists()
 
 
+def test_bus_import_is_isolated_and_uses_the_panel_venv(tmp_path: Path) -> None:
+    values, _root, logs = _run(tmp_path)
+    assert values["bus_library_import"] == "ok"
+    calls = (logs / "python.log").read_text().splitlines()
+    assert f"1 -I -B -c {_IMPORT}" in calls
+
+
 def test_import_failure_reports_last_error_line(tmp_path: Path) -> None:
     values, _root, _logs = _run(tmp_path, Panel(import_ok=False))
     assert values["bus_library_import"] == "failed: exit 1: ImportError: boom"
@@ -293,11 +345,77 @@ def test_release_info_without_tag_is_unknown(tmp_path: Path) -> None:
 
 
 def test_armv7_elf_is_reported_as_arm32(tmp_path: Path) -> None:
-    values, _root, _logs = _run(tmp_path, Panel(machine="armv7l", elf=(1, 40)))
+    values, _root, _logs = _run(tmp_path, Panel(machine="armv7l", elf=(1, 40), bus_api_elf=(1, 40)))
     assert values["machine"] == "armv7l"
     assert values["bus_library_elf_class"] == "1"
     assert values["bus_library_elf_machine"] == "40"
     assert values["bus_library_elf_arch"] == "arm32"
+
+
+def test_elf_sample_prefers_message_bus_api(tmp_path: Path) -> None:
+    values, _root, _logs = _run(tmp_path, Panel(elf=(2, 183), bus_api_elf=(1, 40)))
+    assert values["bus_library_elf_sample"] == "lib/message_bus_api/observer_native.cpython-310.so"
+    assert values["bus_library_elf_arch"] == "arm32"
+
+
+def test_elf_sample_falls_back_to_lib(tmp_path: Path) -> None:
+    values, _root, _logs = _run(tmp_path, Panel(bus_api_elf=None))
+    assert values["bus_library_elf_sample"] == "lib/protocol/observer_core.cpython-310.so"
+    assert values["bus_library_so_count"] == "2"
+    assert values["bus_library_elf_arch"] == "aarch64"
+
+
+def test_non_elf_sample_is_not_elf(tmp_path: Path) -> None:
+    panel = Panel(
+        bus_api_elf=None,
+        elf=None,
+        extra_files={f"{_SP310}/lib/protocol/fake.cpython-310.so": "not an elf file\n"},
+    )
+    values, _root, _logs = _run(tmp_path, panel)
+    assert values["bus_library_elf_arch"] == "not_elf"
+    assert values["bus_library_elf_class"] == "unknown"
+
+
+def test_missing_od_reports_unknown_not_not_elf(tmp_path: Path) -> None:
+    values, _root, _logs = _run(tmp_path, Panel(missing_tools=("od",)))
+    assert values["bus_library_elf_sample"] == "lib/message_bus_api/observer_native.cpython-310.so"
+    assert values["bus_library_elf_class"] == "unknown"
+    assert values["bus_library_elf_machine"] == "unknown"
+    assert values["bus_library_elf_arch"] == "unknown"
+
+
+def test_missing_find_reports_unknown_count(tmp_path: Path) -> None:
+    values, _root, _logs = _run(tmp_path, Panel(missing_tools=("find",)))
+    assert values["bus_library_so_count"] == "unknown"
+    # The preferred sample needs no find.
+    assert values["bus_library_elf_sample"] == "lib/message_bus_api/observer_native.cpython-310.so"
+    assert values["bus_library_elf_arch"] == "aarch64"
+
+
+def test_missing_find_without_bus_api_so_is_unknown(tmp_path: Path) -> None:
+    values, _root, _logs = _run(tmp_path, Panel(missing_tools=("find",), bus_api_elf=None))
+    assert values["bus_library_so_count"] == "unknown"
+    assert values["bus_library_elf_sample"] == "unknown"
+    assert values["bus_library_elf_arch"] == "unknown"
+
+
+_PADDED_TAG = '{"pad": "' + "x" * 5000 + '", "release_tag": "v26.07.15.1"}'
+_TAG_THEN_PADDING = '{"release_tag": "v26.07.15.1", "pad": "' + "x" * 5000 + '"}'
+
+
+@pytest.mark.parametrize("head_without_c", (False, True), ids=("head_c", "dd_fallback"))
+@pytest.mark.parametrize(
+    ("release_info", "expected"),
+    ((_PADDED_TAG, "unknown"), (_TAG_THEN_PADDING, "v26.07.15.1")),
+    ids=("tag_beyond_4096", "tag_within_4096"),
+)
+def test_release_info_is_read_bounded(
+    tmp_path: Path, head_without_c: bool, release_info: str, expected: str
+) -> None:
+    values, _root, _logs = _run(
+        tmp_path, Panel(release_info=release_info, head_without_c=head_without_c)
+    )
+    assert values["release_tag"] == expected
 
 
 def test_no_socket(tmp_path: Path) -> None:
@@ -315,8 +433,9 @@ def test_no_panel_python(tmp_path: Path) -> None:
 def test_python311_layout(tmp_path: Path) -> None:
     values, _root, _logs = _run(tmp_path, Panel(py_dir="python3.11"))
     assert values["site_packages_dir"] == "/data/switch-embedded/env/lib/python3.11/site-packages"
-    assert values["bus_library_import"] == "ok"
-    assert values["bus_library_so_count"] == "2"
+    # The panel interpreter's venv only searches its own python3.X directory.
+    assert values["bus_library_import"].startswith("failed: exit 1: ModuleNotFoundError")
+    assert values["bus_library_so_count"] == "3"
     # The Hue CA paths are hardcoded to python3.10 by src/brilliant_hue_ca.
     assert values["hue_site_packages_present"] == "0"
 
@@ -325,6 +444,7 @@ def test_missing_site_packages(tmp_path: Path) -> None:
     values, _root, _logs = _run(tmp_path, Panel(site_packages=False, import_ok=False))
     assert values["site_packages_dir"] == "missing"
     assert values["bus_library_so_count"] == "0"
+    assert values["bus_library_elf_sample"] == "none"
     assert values["bus_library_elf_class"] == "none"
     assert values["bus_library_elf_machine"] == "none"
     assert values["bus_library_elf_arch"] == "none"

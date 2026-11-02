@@ -52,7 +52,7 @@ def _read_alias() -> str | None:
 
 
 def imx_wifi_reset_supported() -> bool:
-    """True only where Brilliant's i.MX6 usdhc driver is bound (the reset's target)."""
+    """True only where Brilliant's i.MX6 usdhc driver is registered (the reset's target)."""
     return os.path.isdir(_IMX_SDHCI_DRIVER_DIR)
 
 

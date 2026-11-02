@@ -97,8 +97,15 @@ else
     kv panel_python_version missing
 fi
 
+# read_head FILE -- the first 4096 bytes of FILE (dd where `head -c` is missing).
+if head -c 1 </dev/null >/dev/null 2>&1; then
+    read_head() { head -c 4096 "$1" </dev/null 2>/dev/null; }
+else
+    read_head() { dd if="$1" bs=4096 count=1 </dev/null 2>/dev/null; }
+fi
+
 if [ -r "$R/etc/release_info.json" ]; then
-    tag=$(tr '\n' ' ' <"$R/etc/release_info.json" 2>/dev/null |
+    tag=$(read_head "$R/etc/release_info.json" | tr '\n' ' ' |
         sed -n 's/.*"release_tag"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | first_line)
     kv release_tag "$(or_unknown "$tag")"
 else
@@ -114,13 +121,14 @@ for candidate in "$R"/data/switch-embedded/env/lib/python3.*/site-packages; do
     fi
 done
 if [ -n "$SP" ]; then
-    kv site_packages_dir "${SP#"$R"}"
+    kv site_packages_dir "$(printf '%s\n' "${SP#"$R"}" | first_line)"
 else
     kv site_packages_dir missing
 fi
 
 if [ -x "$PANEL_PYTHON" ]; then
-    import_err=$(bounded 20 "$PANEL_PYTHON" -B -c \
+    # -I: ignore PYTHON* env, user site and the cwd; -B: write no bytecode.
+    import_err=$(bounded 20 "$PANEL_PYTHON" -I -B -c \
         'from lib.message_bus_api.observer_interface import RPCObserver' \
         </dev/null 2>&1 >/dev/null)
     import_rc=$?
@@ -136,18 +144,38 @@ else
     kv bus_library_import "skipped: panel python missing"
 fi
 
+# Sample one native module: prefer the bus API package itself, else any
+# .so under lib/. Report its path relative to site-packages.
 so_count=0
+elf_sample=none
 elf_class=none
 elf_machine=none
 elf_arch=none
 if [ -n "$SP" ] && [ -d "$SP/lib" ]; then
-    so_count=$(find "$SP/lib" -type f -name '*.so' </dev/null 2>/dev/null | wc -l | tr -cd '0-9')
-    first_so=$(find "$SP/lib" -type f -name '*.so' </dev/null 2>/dev/null | sort | head -n 1)
-    if [ -n "$first_so" ]; then
-        magic=$(od -An -t x1 -N 4 "$first_so" </dev/null 2>/dev/null | tr -cd '0-9a-f')
+    have_find=0
+    if command -v find >/dev/null 2>&1; then have_find=1; fi
+    if [ "$have_find" = 1 ]; then
+        so_count=$(find "$SP/lib" -type f -name '*.so' </dev/null 2>/dev/null | wc -l |
+            tr -cd '0-9')
+    else
+        so_count=unknown
+    fi
+    sample=
+    for f in "$SP"/lib/message_bus_api/*.so; do
+        if [ -f "$f" ]; then
+            sample=$f
+            break
+        fi
+    done
+    if [ -z "$sample" ] && [ "$have_find" = 1 ]; then
+        sample=$(find "$SP/lib" -type f -name '*.so' </dev/null 2>/dev/null | sort | head -n 1)
+    fi
+    if [ -n "$sample" ]; then
+        elf_sample=$(printf '%s\n' "${sample#"$SP"/}" | first_line)
+        magic=$(od -An -t x1 -N 4 "$sample" </dev/null 2>/dev/null | tr -cd '0-9a-f')
         if [ "$magic" = 7f454c46 ]; then
-            elf_class=$(od -An -t u1 -j 4 -N 1 "$first_so" </dev/null 2>/dev/null | tr -cd '0-9')
-            elf_machine=$(od -An -t u1 -j 18 -N 2 "$first_so" </dev/null 2>/dev/null |
+            elf_class=$(od -An -t u1 -j 4 -N 1 "$sample" </dev/null 2>/dev/null | tr -cd '0-9')
+            elf_machine=$(od -An -t u1 -j 18 -N 2 "$sample" </dev/null 2>/dev/null |
                 awk '{ print $1 + 256 * $2 }')
             case "$elf_class/$elf_machine" in
                 2/183) elf_arch=aarch64 ;;
@@ -157,11 +185,18 @@ if [ -n "$SP" ] && [ -d "$SP/lib" ]; then
         else
             elf_class=unknown
             elf_machine=unknown
-            elf_arch=not_elf
+            # Only a magic we actually read proves "not ELF"; no od means unknown.
+            if [ -n "$magic" ]; then elf_arch=not_elf; else elf_arch=unknown; fi
         fi
+    elif [ "$have_find" = 0 ]; then
+        elf_sample=unknown
+        elf_class=unknown
+        elf_machine=unknown
+        elf_arch=unknown
     fi
 fi
 kv bus_library_so_count "$(or_unknown "$so_count")"
+kv bus_library_elf_sample "$(or_unknown "$elf_sample")"
 kv bus_library_elf_class "$(or_unknown "$elf_class")"
 kv bus_library_elf_machine "$(or_unknown "$elf_machine")"
 kv bus_library_elf_arch "$elf_arch"
