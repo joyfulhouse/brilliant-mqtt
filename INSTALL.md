@@ -142,6 +142,16 @@ from your secret store — **never from git**), and the systemd unit. If you
 publish BLE mesh loads, give exactly one panel `MESH_PRIORITY=1` and one or
 two standbys higher numbers — see [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
 
+A manual install uses the legacy fixed layout (code directly under
+`/var/brilliant-mqtt/`, no `current` link) and takes no snapshot, so it leaves
+no rollback baseline. To check that its code matches a release, use the
+read-only component identity comparison in
+[Legacy fixed layout](docs/reference/release-qualification.md#legacy-fixed-layout);
+a manual install shows its ordinal as `unknown` until the integration enrolls
+it. If you later add the panel to Home Assistant and its code is identical to
+the bundled release, onboarding aborts with `release_unchanged` and does not
+convert the panel.
+
 ### Where it lands on the panel
 
 | Path | Purpose |
