@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tarfile
 import threading
+from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from pathlib import Path
 from uuid import UUID
@@ -56,7 +57,7 @@ from custom_components.brilliant_mqtt.const import (
 )
 from custom_components.brilliant_mqtt.release_identity import ReleaseIdentity, RollbackBaseline
 from custom_components.brilliant_mqtt.setup_protocol import PreflightRequest
-from custom_components.brilliant_mqtt.shell import RunResult
+from custom_components.brilliant_mqtt.shell import PanelProcess, PanelShell, RunResult
 from tests.fakes import FakePanelProcess, FakeShell
 
 _FULL_INSPECT = RunResult(
@@ -4055,3 +4056,145 @@ async def test_restart_candidate_verifies_link_and_restarts_only_bridge() -> Non
     joined = "\n".join(shell.commands)
     assert WIFI_WATCHDOG_SERVICE_NAME not in joined
     assert BUS_WATCHDOG_SERVICE_NAME not in joined
+
+
+# --- #226: a refused capture re-snapshot finalizes its own baseline ------------
+
+_CAPTURED = {"identifier": "c" * 32, "digest": "d" * 64, "identities": {}}
+
+
+class _CaptureShell(FakeShell):
+    async def start(self, command: str) -> PanelProcess:
+        if "BRILLIANT_BASELINE_CAPTURE" in command:
+            self.commands.append("<capture>")
+            return FakePanelProcess(RunResult(0, json.dumps(_CAPTURED), ""))
+        return await super().start(command)
+
+
+async def _capture_with(
+    monkeypatch: pytest.MonkeyPatch,
+    resnapshot: Callable[[PanelShell], Awaitable[panel_ops.PanelSnapshot]],
+    finalize: Callable[[], Awaitable[None]],
+) -> tuple[_CaptureShell, list[tuple[str, object]]]:
+    calls: list[tuple[str, object]] = []
+
+    async def baseline_action(
+        _shell: PanelShell, snapshot: panel_ops.PanelSnapshot, action: str
+    ) -> None:
+        calls.append((action, snapshot.baseline))
+        await finalize()
+
+    monkeypatch.setattr(panel_ops, "snapshot_panel", resnapshot)
+    monkeypatch.setattr(panel_ops, "_baseline_action", baseline_action)
+    return await _connected(_CaptureShell()), calls
+
+
+async def _no_finalize_problem() -> None:
+    return None
+
+
+@pytest.mark.parametrize(
+    ("observed", "code"),
+    [
+        (panel_ops.PanelOpError("service_crash_looping"), "service_crash_looping"),
+        (panel_ops.PanelOpError("snapshot_probe_failed"), "snapshot_probe_failed"),
+        (None, "baseline_changed"),
+    ],
+)
+async def test_capture_finalizes_baseline_before_reraising(
+    monkeypatch: pytest.MonkeyPatch, observed: Exception | None, code: str
+) -> None:
+    async def resnapshot(_shell: PanelShell) -> panel_ops.PanelSnapshot:
+        if observed is not None:
+            raise observed
+        return _release_snapshot(bridge_state=(True, False))
+
+    shell, calls = await _capture_with(monkeypatch, resnapshot, _no_finalize_problem)
+
+    with pytest.raises(panel_ops.PanelOpError) as raised:
+        await panel_ops.capture_baseline(shell, _release_snapshot())
+
+    assert str(raised.value) == code
+    assert [action for action, _ in calls] == ["finalize"]
+    assert calls[0][1] == RollbackBaseline.from_dict(_CAPTURED)
+
+
+async def test_capture_reports_interrupted_when_finalize_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def resnapshot(_shell: PanelShell) -> panel_ops.PanelSnapshot:
+        raise panel_ops.PanelOpError("service_crash_looping")
+
+    async def failing() -> None:
+        raise panel_ops.PanelOpError("baseline_finalize_failed")
+
+    shell, _ = await _capture_with(monkeypatch, resnapshot, failing)
+
+    with pytest.raises(panel_ops.PanelOpError, match="^baseline_capture_interrupted$"):
+        await panel_ops.capture_baseline(shell, _release_snapshot())
+
+
+async def test_capture_bounds_a_hung_finalize(monkeypatch: pytest.MonkeyPatch) -> None:
+    cancelled = asyncio.Event()
+
+    async def resnapshot(_shell: PanelShell) -> panel_ops.PanelSnapshot:
+        raise panel_ops.PanelOpError("service_crash_looping")
+
+    async def hung() -> None:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    monkeypatch.setattr(panel_ops, "_BASELINE_FINALIZE_SECONDS", 0.01)
+    shell, _ = await _capture_with(monkeypatch, resnapshot, hung)
+
+    with pytest.raises(panel_ops.PanelOpError, match="^baseline_capture_interrupted$"):
+        await panel_ops.capture_baseline(shell, _release_snapshot())
+    assert cancelled.is_set()
+
+
+async def test_capture_cancellation_waits_for_finalize_and_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def resnapshot(_shell: PanelShell) -> panel_ops.PanelSnapshot:
+        raise panel_ops.PanelOpError("service_crash_looping")
+
+    async def slow() -> None:
+        entered.set()
+        await release.wait()
+
+    shell, calls = await _capture_with(monkeypatch, resnapshot, slow)
+    task = asyncio.create_task(panel_ops.capture_baseline(shell, _release_snapshot()))
+    await entered.wait()
+    task.cancel()
+    await asyncio.sleep(0.01)
+    assert not task.done(), "an outer cancellation must wait for the settled finalize"
+    release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert [action for action, _ in calls] == ["finalize"]
+
+
+async def test_capture_cancelled_resnapshot_still_finalizes_and_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered = asyncio.Event()
+
+    async def resnapshot(_shell: PanelShell) -> panel_ops.PanelSnapshot:
+        entered.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    shell, calls = await _capture_with(monkeypatch, resnapshot, _no_finalize_problem)
+    task = asyncio.create_task(panel_ops.capture_baseline(shell, _release_snapshot()))
+    await entered.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert [action for action, _ in calls] == ["finalize"]
