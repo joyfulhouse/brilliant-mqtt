@@ -1,5 +1,75 @@
 # Proposal to diyHue: measure before adding event-driven HA state reflection
 
+## Status update: upstream candidate merged (2026-10)
+
+The upstream diyHue project merged an opt-in implementation of this proposal on
+2026-10-23: [diyhue/diyHue#1147](https://github.com/diyhue/diyHue/pull/1147)
+(merge commit `e7a1890`), "Home Assistant: add opt-in event reflection review
+candidate". A follow-up, [diyhue/diyHue#1155](https://github.com/diyhue/diyHue/pull/1155)
+(merge commit `673b0e2`), makes the HA WebSocket client wait for `auth_ok` before
+it sends commands. Upstream documents the feature as off by default, in
+`docs/homeassistant-event-reflection.md`. This section records what the merged
+code changes and what is still open. The original proposal below is kept
+unchanged as the review record.
+
+### Who owns each part of the path
+
+| Path | Owner and behavior |
+|---|---|
+| Panel → diyHue → HA (command) | diyHue forwards the command to HA immediately. It is not polled. |
+| HA → diyHue cached state, **default mode** | HA events update an intermediate dict. The lights that diyHue serves to Hue clients are refreshed by `stateFetch.syncWithLights`: a sequential refresh of every light, a 10 s sleep, then up to 300 one-second waits. Recent Hue API activity (any API user seen in the last 2 s) cuts the wait short. |
+| HA → diyHue cached state, **event mode** | `homeAssistantEventReflection: true` in diyHue's Home Assistant config. It requires HTTPS to HA (`homeAssistantUseHttps: true`, verified TLS) and an HA token that upstream asks to be a separate one. HA events are reduced directly into the served cache, and a full `get_states` read every 60 s repairs it permanently. `syncWithLights` skips HA-backed lights in this mode. |
+| diyHue → panel (display) | The panel firmware polls diyHue on its own cadence, *P*. Nothing in this repo or upstream can change *P*. |
+
+brilliant-mqtt owns none of the reflection path. Its only Hue code is the CA
+recovery oneshot, [src/brilliant_hue_ca/](../../src/brilliant_hue_ca/), which
+keeps the panels' Hue trust in place across firmware OTAs.
+
+### Proposal requirements vs. the upstream implementation
+
+| Proposal requirement | Upstream (#1147) |
+|---|---|
+| Ordering and concurrency (event and read application serialized; stale sessions fenced) | **Implemented** |
+| A full baseline on every reconnect, before commands are allowed | **Implemented** |
+| `unavailable` ≠ off (last-known state kept, `reachable: false`) | **Implemented** |
+| A bounded, permanent repair poll (full read every 60 s) | **Implemented** |
+| Separate authentication boundary (verified TLS required; plaintext rejected) | **Implemented** |
+| Removed entities | **Partial.** A removed or excluded entity becomes an unreachable, command-blocked Hue object. It is not deleted or recreated. |
+| Inventory, mapping and capability reconciliation | **Not implemented.** Only existing mappings are covered. |
+| Whole-frame byte bounds | **Not implemented.** `get_states` still returns HA's whole inventory, and the frame parser is not bounded. |
+| Live credential rotation / revocation | **Not implemented** (unqualified upstream). |
+| Same-cut parity between the event cache and a full read | **Inconclusive.** HA's `get_states` has no global revision, so no read can prove a source-wide cut. |
+
+### Evidence so far
+
+- **Upstream synthetic replay.** The PR runs its real reducer through burst,
+  drop, reorder, delayed-snapshot, reconnect and removal scenarios. It is
+  fixture-only: no live HA, panel or light.
+- **Live event-mode measurement** (#153 comment, 2026-10-26/27). A passive
+  observer in the diyHue pod polled the Hue v1 API every 0.25 s after each
+  natural HA change on a mapped light. 136/136 changes were reflected; delay from
+  HA event to the Hue API was median 0.13 s, p95 0.26 s, max 0.93 s, at 0.25 s
+  resolution. There is **no like-for-like legacy baseline**, so this is an
+  absolute figure for event mode, not a before/after ratio.
+- **Benchmark B (panel display) has not been run.** The measurement stops at
+  diyHue's Hue API.
+
+### Remaining work, in order
+
+1. Run a legacy (default-mode) Benchmark A on the same lights. Both benchmarks
+   are defined [below](#two-separate-benchmarks-to-define-and-run-upstream).
+2. Measure the panel poll cadence *P*, then run Benchmark B with event mode on
+   and off.
+3. Decide whether to run event mode in production, given the gaps above. A newly
+   added light must first go through the existing mapping/discovery path,
+   because event mode does not create mappings.
+4. Gaps in the implementation belong upstream, not in brilliant-mqtt.
+
+Issue #153 stays open until steps 1–3 are recorded.
+
+## Original proposal (review record)
+
+
 Refs #153. Addressed to the maintainers of the owning upstream project,
 [github.com/diyhue/diyHue](https://github.com/diyhue/diyHue).
 

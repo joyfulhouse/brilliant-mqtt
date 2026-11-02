@@ -167,7 +167,13 @@ A firmware OTA wipes **both** `/data` (the CA bundle) and `/etc/systemd/system/`
   be inferred from these intervals. See the
   [measure-first event-reflection proposal](diyhue-event-reflection-proposal.md)
   for conditional predictions, the shorter-poll comparator, and separate upstream
-  qualification. No physical slider latency fix is claimed. Brightness is approximate
+  qualification. Upstream diyHue now has an **opt-in event-reflection mode**
+  (`homeAssistantEventReflection: true`, HTTPS to HA required; diyHue#1147). It
+  reflects HA events straight into the served cache, with a 60 s full-read repair.
+  The default mode is unchanged. Its gaps, the live measurement, and the remaining
+  benchmarks are in the
+  [status update](diyhue-event-reflection-proposal.md#status-update-upstream-candidate-merged-2026-10).
+  No physical slider latency fix is claimed. Brightness is approximate
   (intensity 0–1000 ↔ HA 0–255, localtuya calibration slop); on/off is exact.
 
 ## Operational runbook
