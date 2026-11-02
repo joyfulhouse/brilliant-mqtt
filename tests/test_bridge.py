@@ -2394,6 +2394,48 @@ class TestMeshWriteTimeout:
         await sleeper.release_all()
         assert len(_mesh_states(mqtt)) == 1
 
+    @pytest.mark.parametrize("revocation", ["withdraw", "supersede"])
+    async def test_rearm_publish_stays_cancellable(self, revocation: str) -> None:
+        """The settle task stays the registered handle through its re-arm
+        publish, so supersession or withdrawal cancels it mid-publish and no
+        orphaned resolver is started afterwards."""
+        bus = FakeBus([_mesh_dimmer_at("1")])
+        mqtt = _BlockingStatePublishMqtt()
+        bridge, _clock, sleeper = _mesh_bridge_parts(bus, mqtt)
+        await bridge.reconcile()
+        bus.set_variables_error = asyncio.TimeoutError()
+        await mqtt.inject(MESH_SET_TOPIC, json.dumps({"state": "OFF"}))
+        bus.set_variables_error = None
+        await asyncio.sleep(0)
+        bridge._wall_clock = lambda: 1010.0
+        mqtt.published.clear()
+        mqtt.block_next_state_publish = True
+
+        (ticket,) = bus.detached_tickets
+        ticket.mark_settled("'late ok'")
+        settle = bridge._mesh.confirm_tasks_view[MESH_PID]
+        await asyncio.wait_for(mqtt.publish_started.wait(), 1)
+        assert bridge._mesh.confirm_tasks_view[MESH_PID] is settle
+
+        if revocation == "withdraw":
+            await bridge.withdraw()
+        else:
+            await mqtt.inject(MESH_SET_TOPIC, json.dumps({"state": "ON"}))
+        mqtt.release_publish.set()
+        await _turns()
+
+        assert settle.cancelled()
+        assert sleeper.requested == [80.0] if revocation == "withdraw" else [80.0, 80.0]
+        # The re-armed OFF window never reached the wire.
+        assert not any(
+            json.loads(p[1]).get("mesh_requested") == {"on": "0"} for p in _mesh_states(mqtt)
+        )
+        if revocation == "supersede":
+            assert bridge._mesh.pending_view[MESH_PID].targets == {"on": "1"}
+        else:
+            assert bridge._mesh.confirm_tasks_view == {}
+        await bridge.withdraw()
+
     async def test_late_acceptance_then_matching_value_confirms(self) -> None:
         bus, mqtt, bridge, clock, sleeper = await self._timed_out_off(asyncio.TimeoutError())
         await bus.emit(_mesh_dimmer_at("0"))  # a pre-acceptance match does not count

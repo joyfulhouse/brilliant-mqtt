@@ -369,12 +369,25 @@ class MeshPending:
                 peripheral_id,
                 outcome,
             )
-            # Replaces this task's own registry entry with the new resolver.
-            self._start_window(peripheral_id, rearmed)
+            # Publish the re-armed window while THIS task is still the
+            # registered handle, so supersession or withdrawal cancels it
+            # mid-publish; only then hand the registry over to the resolver.
+            self._pending[peripheral_id] = rearmed
+            self.set_feedback(peripheral_id, rearmed)
             try:
                 await self._republish(peripheral_id, False)
             except Exception:
                 logger.warning("mesh re-arm publish failed for %s", peripheral_id, exc_info=True)
+            if self._confirm_tasks.get(peripheral_id) is not asyncio.current_task():
+                # Only drop() takes a settle task's registry entry, and it
+                # cancels the task. A cancellation landing mid-publish arrives
+                # with the publication's revocation and is swallowed there
+                # (py3.10 cannot tell them apart), so restore it here.
+                raise asyncio.CancelledError
+            if not self._owns_pending(peripheral_id, rearmed):
+                self.release_confirm_task(peripheral_id)
+                return
+            self._start_resolver(peripheral_id, rearmed)
             return
         del self._pending[peripheral_id]
         logger.warning(
@@ -501,6 +514,9 @@ class MeshPending:
     def _start_window(self, peripheral_id: str, pending: PendingMeshWrite) -> None:
         self._pending[peripheral_id] = pending
         self.set_feedback(peripheral_id, pending)
+        self._start_resolver(peripheral_id, pending)
+
+    def _start_resolver(self, peripheral_id: str, pending: PendingMeshWrite) -> None:
         self._confirm_tasks[peripheral_id] = asyncio.create_task(
             self.resolve(peripheral_id, pending),
             name=f"brilliant-mqtt-mesh-confirm-{peripheral_id}",
