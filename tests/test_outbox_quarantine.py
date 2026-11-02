@@ -94,7 +94,32 @@ def test_failure_history_is_bounded() -> None:
     suspect = state.get(_EVENT)
     assert suspect is not None
     assert len(suspect.failures) == oq.FAILURE_HISTORY_LIMIT
+    # The bound keeps the FIRST failure (the span anchor) plus the newest ones.
+    assert suspect.failures[0].session == "s0"
     assert suspect.failures[-1].session == f"s{oq.FAILURE_HISTORY_LIMIT + 4}"
+
+
+@pytest.mark.parametrize("period_ms", [5_000, 7_000, 8_000])
+def test_session_rebuild_cadence_quarantines_once_span_reaches_a_minute(period_ms: int) -> None:
+    # Real rebuild cadence: one attributable failure per session every few
+    # seconds. The bounded history must not shrink the span below 60 s.
+    state = oq.QuarantineState()
+    index = 0
+    while True:
+        at_ms = index * period_ms
+        state = _fail(state, f"s{index}", at_ms)
+        suspect = state.get(_EVENT)
+        assert suspect is not None
+        if at_ms < oq.QUARANTINE_SPAN_MS:
+            assert suspect.quarantined_at_ms is None
+        else:
+            assert index + 1 >= oq.QUARANTINE_FAILURES
+            assert suspect.quarantined_at_ms == at_ms
+            break
+        index += 1
+    assert len(suspect.failures) <= oq.FAILURE_HISTORY_LIMIT
+    # The persisted bounded history round-trips and stays quarantined.
+    assert oq.parse_sidecar(oq.sidecar_payload(state)) == state
 
 
 def test_quarantined_record_is_not_modified_by_later_failures() -> None:

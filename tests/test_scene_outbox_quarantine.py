@@ -431,3 +431,39 @@ async def test_bridge_without_session_signals_never_attributes(tmp_path: Path) -
     await asyncio.sleep(0.02)
     await bridge.async_shutdown()
     assert not harness.sidecar.exists()
+
+
+async def _failure_recorded_now(harness: _Harness) -> None:
+    def recorded() -> bool:
+        suspect = harness.suspect()
+        return suspect is not None and suspect.failures[-1].at_ms == harness.clock.now_ms
+
+    await _until(recorded, "failure at the current time")
+
+
+async def test_wedge_at_five_second_rebuild_cadence_is_quarantined(tmp_path: Path) -> None:
+    # The real wedge rebuilds the session roughly every 5 s. With a bounded
+    # failure history the record must still quarantine once a minute elapses.
+    harness = _Harness(tmp_path)
+    index = 0
+    while True:
+        bridge, _, mqtt = await harness.session(
+            execution_scene=_POISON_SCENE if index == 0 else None
+        )
+        await _offered(mqtt)
+        await _failure_recorded_now(harness)
+        await bridge.async_shutdown()
+        suspect = harness.suspect()
+        assert suspect is not None
+        if index * 5_000 >= oq.QUARANTINE_SPAN_MS:
+            assert suspect.quarantined_at_ms == _NOW_MS + index * 5_000
+            break
+        assert suspect.quarantined_at_ms is None
+        index += 1
+        await harness.clock.advance_ms(5_000)
+
+    bridge, _, mqtt = await harness.session()
+    await asyncio.sleep(0.05)
+    assert mqtt.poison_offers == 0
+    assert _last_status(mqtt, "scene")["reason"] == "outbox_quarantine"
+    await bridge.async_shutdown()

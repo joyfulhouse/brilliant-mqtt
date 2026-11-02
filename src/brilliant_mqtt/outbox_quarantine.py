@@ -148,8 +148,14 @@ def record_attributed_failure(
         failures = existing.failures
     else:
         failures = ()
-    failures = (*failures, AttributedFailure(session, at_ms))[-FAILURE_HISTORY_LIMIT:]
-    suspect = SuspectRecord(sha256, failures, at_ms if _qualifies(failures) else None)
+    failures = (*failures, AttributedFailure(session, at_ms))
+    # Evaluate on the full history, then bound it while always keeping the
+    # FIRST failure: it anchors the 60 s span, so truncation can never shrink
+    # the span below the real elapsed time at a fast session-rebuild cadence.
+    quarantined_at_ms = at_ms if _qualifies(failures) else None
+    if len(failures) > FAILURE_HISTORY_LIMIT:
+        failures = (failures[0], *failures[-(FAILURE_HISTORY_LIMIT - 1) :])
+    suspect = SuspectRecord(sha256, failures, quarantined_at_ms)
     updated = _with_suspect(state, record, suspect)
     if updated.blocked is not None and updated.blocked.record == record:
         updated = replace(updated, blocked=None)
