@@ -230,7 +230,9 @@ runtime hook or logging change was installed.
 The deployed broker reports Mosquitto `2.1.2`. Its inspected configuration has no
 explicit `max_packet_size`, `message_size_limit`, or `include_dir` directives.
 This does not prove that every frame is accepted; no supported frame was shown
-to be permanently rejected, and no poison frame was published.
+to be permanently rejected, and no poison frame was published. The #113
+reproduction analysis and the implemented quarantine are in the
+[outbox quarantine contract](issue-113-outbox-quarantine-contract.md).
 
 Static review confirms that the watchdog's 300-second dead-writer retention
 does not carry independent cross-sample lease-revocation history. A failed marker
@@ -246,7 +248,7 @@ that architecture.
 
 | Issue | Evidence still required |
 | --- | --- |
-| #113 | Reproducible permanent rejection of a supported frame, followed by an explicit durability, ordering, capacity, replay, and recovery contract before quarantine changes |
+| #113 | The contract and code are implemented, with a fake-broker wedge reproduction; see the [outbox quarantine contract](issue-113-outbox-quarantine-contract.md). Live qualification still needs a loopback broker with an operator `max_packet_size`, because the deployed defaults cannot produce the wedge |
 | #142 | Request-relative execution/no-op evidence; a matching stale mirror remains insufficient |
 | #143 | Independent watchdog-verifiable lease revocation across recovered-but-unrecorded writer death; no production read-only-filesystem fault injection |
 | #153 | Qualified upstream event-driven reflection and separate event-to-cache versus physical/display measurements |

@@ -278,6 +278,48 @@ a `— rebooting` line names the trigger. Reboots are rate-limited
 `bus-watchdog.log` plus `journalctl -u brilliant-mqtt` and open an issue. Full
 settings in [CONFIGURATION.md → Bus-health watchdog](CONFIGURATION.md#bus-health-watchdog).
 
+### Scene outbox quarantined (`outbox_quarantine` / `outbox_blocked`)
+
+**Symptom:** Scene and mode entities go unavailable, and the retained
+`brilliant/ha-control/v1/status/scene/<panel>` (and `.../mode/<panel>`) status
+shows `"available": false` with reason `outbox_quarantine` or
+`outbox_blocked`. The panel itself stays online and lights keep working.
+
+**Why:** The broker closed the MQTT connection every time one scene/mode
+outbox frame was sent. That usually means an operator `max_packet_size` that
+the frame exceeds. After 3 such disconnects in 3 different sessions spanning at
+least a minute, the agent quarantines that record and halts the scene outbox,
+so nothing is sent past it. `outbox_blocked` means the connection dropped right
+after sending the record, before the session had any acknowledged QoS-1
+publish, so nothing could be attributed. Check the broker first. The bridge
+meta `diag.outbox` object names the record (key, kind, size and sha256, never
+the payload). The full contract is in
+[issue-113-outbox-quarantine-contract.md](issue-113-outbox-quarantine-contract.md).
+
+**Fix the broker first** (remove or raise `max_packet_size`). Then release or
+discard the record on the panel. The tool refuses to run while the agent is
+running:
+
+```bash
+ssh -o NumberOfPasswordPrompts=1 root@<panel>
+systemctl stop brilliant-mqtt
+set -a; . /etc/brilliant-mqtt.env; set +a
+# Fleet release layout; legacy installs use /var/brilliant-mqtt/app:/var/brilliant-mqtt/vendor
+export PYTHONPATH=/var/brilliant-mqtt/current/app:/var/brilliant-mqtt/current/vendor
+/data/switch-embedded/env/bin/python3 -m brilliant_mqtt.outbox_admin list
+# Either retry the record once the broker accepts it ...
+/data/switch-embedded/env/bin/python3 -m brilliant_mqtt.outbox_admin release <key> <sha256>
+# ... or drop it for good (an event also drops its dependent command results).
+/data/switch-embedded/env/bin/python3 -m brilliant_mqtt.outbox_admin discard <key> <sha256>
+systemctl start brilliant-mqtt
+```
+
+`<key>` and `<sha256>` come from the `list` output, and the hash must match.
+Every action is appended to `scene-watermarks.json.outbox-audit.log` next to the
+state file. A discard is refused if that audit entry cannot be written. If the
+tool reports an unrecognised phase marker after an agent rollback, remove
+`/run/brilliant-mqtt/bus-phase` with the agent stopped and run it again.
+
 ### Bridge broken after a panel firmware update
 
 Firmware OTA replaces `/data/switch-embedded` — including the closed-source bus
