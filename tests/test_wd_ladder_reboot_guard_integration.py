@@ -259,6 +259,7 @@ def test_failed_or_unconfirmed_reboot_retries_within_cap_and_after_window(
                 write=lambda path, value: writes.append((path, value)),
                 read_alias=lambda: "fake.mmc",
                 sleep=lambda _: None,
+                reset_supported=lambda: True,
             )
 
     for now in range(0, 25001, 30):

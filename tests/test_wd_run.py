@@ -132,6 +132,23 @@ def test_reboot_runs_and_records_when_allowed() -> None:
     assert order == ["record", "reboot"]
 
 
+def test_reboot_escalation_log_names_imx6_only_reset(caplog: pytest.LogCaptureFixture) -> None:
+    """Issue #155: the escalation line must not imply the GPIO reset runs everywhere."""
+    g, rec = FakeGuard(True), FakeRecovery()
+    with caplog.at_level(logging.ERROR, logger="brilliant_wifi_watchdog"):
+        run.handle(
+            Action.GPIO_RESET_REBOOT,
+            guard=g,
+            state_path=STATE,
+            now=5.0,
+            recovery_mod=rec,
+            reboot_eligible=True,
+        )
+    messages = [r.getMessage() for r in caplog.records]
+    assert "gateway down ~360s: Wi-Fi reset (i.MX6 only) + reboot" in messages
+    assert not any("GPIO/SDIO reset + reboot" in m for m in messages)
+
+
 # ---------------------------------------------------------------------------
 # handle — other action dispatches (full branch coverage)
 # ---------------------------------------------------------------------------
