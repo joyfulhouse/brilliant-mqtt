@@ -954,8 +954,19 @@ class AioMqttAdapter:
         retains strict ordering.
         """
         dispatcher = self._get_topic_dispatcher()
+        broker_dropped = False
         try:
-            async for message in self._client.messages:
+            messages = self._client.messages.__aiter__()
+            while True:
+                try:
+                    message = await messages.__anext__()
+                except StopAsyncIteration:
+                    break
+                except aiomqtt.MqttError:
+                    # Only the iterator raising MqttError is a broker drop
+                    # (#113); a local dispatch/lane failure below is not.
+                    broker_dropped = True
+                    raise
                 command_cbs = tuple(self._command_cbs)
                 message_cbs = tuple(self._message_cbs)
                 payload_decode_error_cbs = list(self._payload_decode_error_cbs)
@@ -1022,7 +1033,7 @@ class AioMqttAdapter:
             # so this is the earliest observation of an unexpected session loss.
             # Fire before the (possibly slow) dispatcher drain so the drop is
             # timed against the in-flight publish, not against teardown.
-            if not self._closing and not self._closed:
+            if broker_dropped and not self._closing and not self._closed:
                 self._fire_connection_lost()
             await dispatcher.shutdown()
 
