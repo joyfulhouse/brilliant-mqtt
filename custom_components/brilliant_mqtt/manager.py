@@ -440,6 +440,7 @@ def async_delete_panel_issues(hass: HomeAssistant, management_id: str) -> None:
         f"needs_attention_{management_id}",
         f"voice_missing_{management_id}",
         f"ha_mirror_retired_{management_id}",
+        f"interrupted_update_{management_id}",
         *(
             f"component_state_unverified_{management_id}_{component.id}"
             for component in REGISTRY.values()

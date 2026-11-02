@@ -60,20 +60,24 @@ class AgentUpdate(BrilliantPanelEntity, UpdateEntity):
         meta = self._manager.meta
         return meta.get("agent_version") if meta else None
 
-    async def async_install(self, version: str | None, backup: bool, **kwargs: Any) -> None:
-        # Render a determinate progress bar through the deploy stages (needs the
-        # PROGRESS feature, above); async_update_agent re-raises on failure so HA
-        # surfaces it.
-        def _progress(pct: int) -> None:
-            self._attr_update_percentage = pct
-            self.async_write_ha_state()
+    @property
+    def in_progress(self) -> bool:
+        # The manager owns progress, so an update started anywhere (this entity, the
+        # redeploy service or an interrupted-update Retry) renders here.
+        return self._manager.update_progress is not None
 
-        self._attr_in_progress = True
-        self._attr_update_percentage = 0
-        self.async_write_ha_state()
-        try:
-            await self._manager.async_update_agent(progress=_progress)
-        finally:
-            self._attr_in_progress = False
-            self._attr_update_percentage = None
-            self.async_write_ha_state()
+    @property
+    def update_percentage(self) -> int | None:
+        return self._manager.update_progress
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        # The allowlisted update block (retry state, typed last error, interrupted
+        # update). Its ``expired`` flag is evaluated when the state is written, so it
+        # only refreshes when the state is otherwise written.
+        return {"update": self._manager.update_diagnostics()}
+
+    async def async_install(self, version: str | None, backup: bool, **kwargs: Any) -> None:
+        # async_update_agent re-raises on failure so HA surfaces it; progress is
+        # published through the manager's state signal.
+        await self._manager.async_update_agent()

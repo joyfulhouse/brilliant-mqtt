@@ -9,12 +9,20 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from homeassistant.components.repairs import repairs_flow_manager
+from homeassistant.components.repairs.issue_handler import async_process_repairs_platforms
 from homeassistant.core import HomeAssistant
+from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.storage import Store
+from homeassistant.helpers.translation import async_get_translations
+from homeassistant.setup import async_setup_component
+from pytest_homeassistant_custom_component.common import MockConfigEntry
+from pytest_homeassistant_custom_component.typing import MqttMockHAClient
 
 from custom_components.brilliant_mqtt import update_state
 from custom_components.brilliant_mqtt.const import DOMAIN
+from custom_components.brilliant_mqtt.diagnostics import async_get_config_entry_diagnostics
 from custom_components.brilliant_mqtt.provisioning_journal import ProvisioningJournal
 from custom_components.brilliant_mqtt.update_intent import (
     InterruptedUpdates,
@@ -25,8 +33,11 @@ from custom_components.brilliant_mqtt.update_intent import (
     compute_update_target,
     pinned_fingerprint,
     request_concerns_panel,
+    update_intent_store,
 )
+from tests.test_init import ENTRY_DATA
 from tests.test_provisioning_journal import _FINGERPRINT, _PUBLIC_KEY, _record
+from tests.update_harness import Shells, Spies
 
 _TARGET = UpdateTarget("0.2.0", 1, "a" * 64, "b" * 64)
 _OTHER_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBsF8pQ8C3EWxF7bGrXWvqJXV1fbNHo6p5FC0gIjJbqv"
@@ -419,3 +430,210 @@ def test_retry_state_and_last_error_allowlists() -> None:
     assert update_state.safe_last_error({**error, "code": "free text"}) is None
     assert update_state.safe_last_error({**error, "stage": "elsewhere"}) is None
     assert update_state.safe_last_error({**error, "attempts": -1}) is None
+
+
+# --- Through a real entry, HA's repairs flow manager and the Update entity --------
+
+_UPDATE_ENTITY = "update.brilliant_office_bridge"
+
+
+async def _surface_through_reload(hass: HomeAssistant) -> tuple[MockConfigEntry, str]:
+    """Set up a real entry, record an in-window update, reload (an HA restart)."""
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    manager = entry.runtime_data.panels[entry.entry_id]
+    target = await manager.async_update_target()
+    assert target is not None
+    await update_intent_store(hass).async_set(
+        manager.management_id,
+        _intent(
+            target_version=target.version,
+            target_ordinal=target.ordinal,
+            target_digest=target.digest,
+            target_set_digest=target.set_digest,
+            stage="admission",
+            attempts=2,
+        ),
+    )
+    assert await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done()
+    issue_id = f"interrupted_update_{manager.management_id}"
+    assert ir.async_get(hass).async_get_issue(DOMAIN, issue_id) is not None
+    return entry, issue_id
+
+
+async def _open_menu(hass: HomeAssistant, issue_id: str) -> dict[str, Any]:
+    assert await async_setup_component(hass, "repairs", {})
+    await async_process_repairs_platforms(hass)
+    flows = repairs_flow_manager(hass)
+    assert flows is not None
+    result = await flows.async_init(DOMAIN, data={"issue_id": issue_id})
+    assert result["type"] is FlowResultType.MENU
+    assert result["menu_options"] == ["retry", "dismiss"]
+    translations = await async_get_translations(hass, "en", "issues", [DOMAIN])
+    prefix = f"component.{DOMAIN}.issues.interrupted_update.fix_flow.step.init"
+    assert translations[f"{prefix}.menu_options.retry"]
+    assert translations[f"{prefix}.menu_options.dismiss"]
+    assert "{target_version}" in translations[f"{prefix}.description"]
+    return dict(result)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_repairs_flow_dismiss_through_real_entry_setup(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    payload_dir: Path,
+    shells: Shells,
+    spies: Spies,
+) -> None:
+    entry, issue_id = await _surface_through_reload(hass)
+    menu = await _open_menu(hass, issue_id)
+    flows = repairs_flow_manager(hass)
+    assert flows is not None
+
+    result = await flows.async_configure(menu["flow_id"], {"next_step_id": "dismiss"})
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert ir.async_get(hass).async_get_issue(DOMAIN, issue_id) is None
+    assert await update_intent_store(hass).async_get(entry.entry_id) is None
+    assert spies.admissions == 0
+    assert shells.created == []
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_repairs_flow_retry_runs_exactly_one_update_with_entity_progress(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    payload_dir: Path,
+    shells: Shells,
+    spies: Spies,
+) -> None:
+    entry, issue_id = await _surface_through_reload(hass)
+    menu = await _open_menu(hass, issue_id)
+    flows = repairs_flow_manager(hass)
+    assert flows is not None
+    held = asyncio.Event()
+    release = asyncio.Event()
+
+    async def hold(_shell: object) -> None:
+        held.set()
+        await release.wait()
+
+    spies.on_baseline = hold
+
+    result = await flows.async_configure(menu["flow_id"], {"next_step_id": "retry"})
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert ir.async_get(hass).async_get_issue(DOMAIN, issue_id) is None
+    await held.wait()
+    await asyncio.sleep(0)
+    state = hass.states.get(_UPDATE_ENTITY)
+    assert state is not None
+    assert state.attributes["in_progress"] is True
+    assert state.attributes["update_percentage"] == 25
+    release.set()
+    await hass.async_block_till_done()
+    state = hass.states.get(_UPDATE_ENTITY)
+    assert state is not None
+    assert state.attributes["in_progress"] is False
+    assert state.attributes["update_percentage"] is None
+    assert spies.admissions == 1
+    assert spies.baselines == 1  # exactly one update and one transaction
+    assert await update_intent_store(hass).async_get(entry.entry_id) is None
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_repairs_flow_without_a_loaded_owner_aborts(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    payload_dir: Path,
+    shells: Shells,
+    spies: Spies,
+) -> None:
+    entry, issue_id = await _surface_through_reload(hass)
+    menu = await _open_menu(hass, issue_id)
+    flows = repairs_flow_manager(hass)
+    assert flows is not None
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+    result = await flows.async_configure(menu["flow_id"], {"next_step_id": "retry"})
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "interrupted_update_unavailable"
+    assert spies.admissions == 0
+
+
+@pytest.mark.allow_lingering_timers
+async def test_repairs_flow_dismiss_failure_aborts_and_keeps_the_issue(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    payload_dir: Path,
+    shells: Shells,
+    spies: Spies,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entry, issue_id = await _surface_through_reload(hass)
+    menu = await _open_menu(hass, issue_id)
+    flows = repairs_flow_manager(hass)
+    assert flows is not None
+
+    async def failing_save(_self: Store[Any], _data: object) -> None:
+        raise RuntimeError("serialization failed")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(Store, "async_save", failing_save)
+        result = await flows.async_configure(menu["flow_id"], {"next_step_id": "dismiss"})
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "interrupted_update_clear_failed"
+    assert ir.async_get(hass).async_get_issue(DOMAIN, issue_id) is not None
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_entity_attributes_and_diagnostics_carry_the_allowlisted_block(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    payload_dir: Path,
+    shells: Shells,
+    spies: Spies,
+) -> None:
+    entry, _issue_id = await _surface_through_reload(hass)
+    state = hass.states.get(_UPDATE_ENTITY)
+    assert state is not None
+    block = state.attributes["update"]
+    assert block["in_progress"] is False
+    assert block["interrupted"]["stage"] == "admission"
+    assert block["interrupted"]["attempts"] == 2
+    diagnostics = await async_get_config_entry_diagnostics(hass, entry)
+    assert diagnostics["panels"][entry.entry_id]["update"] == block
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+def test_update_diagnostics_allowlist_accepts_and_rejects() -> None:
+    good: dict[str, object] = {
+        "in_progress": True,
+        "progress": 25,
+        "retry": {
+            "stage": "admission",
+            "attempt": 1,
+            "max_attempts": 5,
+            "reason": "connection_lost",
+            "retry_in_seconds": 5.0,
+            "next_attempt_at": "2026-10-23T12:00:05+00:00",
+        },
+        "last_error": {"stage": "connect", "code": "connect_failed", "attempts": 5},
+        "interrupted": None,
+    }
+    assert update_state.safe_update_diagnostics(good) == good
+    assert update_state.safe_update_diagnostics({**good, "host": "10.0.0.5"}) is None
+    assert update_state.safe_update_diagnostics({**good, "progress": 101}) is None
+    assert update_state.safe_update_diagnostics({**good, "in_progress": 1}) is None
+    leaky = update_state.safe_update_diagnostics(
+        {**good, "last_error": {"stage": "connect", "code": "10.0.0.5 refused", "attempts": 1}}
+    )
+    assert leaky is not None and leaky["last_error"] is None

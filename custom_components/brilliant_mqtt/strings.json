@@ -772,6 +772,28 @@
     "ha_mirror_retired": {
       "title": "Legacy Brilliant HA mirror disabled",
       "description": "Panel `{panel}` still has legacy HA mirror state. {reason}. The integration will keep retrying safe removal during panel management; legacy credentials are retained until absence is verified."
+    },
+    "interrupted_update": {
+      "title": "Brilliant panel `{panel}` agent update was interrupted",
+      "fix_flow": {
+        "step": {
+          "init": {
+            "title": "Interrupted agent update",
+            "description": "Home Assistant stopped while panel `{panel}` was updating its agent to {target_version}. The update was in its {stage} stage after {attempts} attempt(s), before any rollback baseline was captured, so nothing was changed on the panel. It is not resumed automatically. Retry starts a fresh update (with a fresh retry budget) and shows its progress on the panel's Update entity; Dismiss forgets the interrupted update.",
+            "menu_options": {
+              "retry": "Retry the agent update",
+              "dismiss": "Dismiss"
+            }
+          }
+        },
+        "abort": {
+          "interrupted_update_target_changed": "The bundled release changed since the update was interrupted. Dismiss this issue and start the update again from the Update entity.",
+          "interrupted_update_recovery_owned": "A provisioning journal or retained baseline concerns this panel, so recovery owns it. The interrupted update was dropped; check diagnostics and follow docs/canary-rollback.md.",
+          "already_in_progress": "A repair or update is already running for this panel. Wait for it to finish, then retry.",
+          "interrupted_update_unavailable": "No loaded panel runtime owns this issue. Reload the integration and retry.",
+          "interrupted_update_clear_failed": "The interrupted update could not be forgotten. Check the Home Assistant logs and retry."
+        }
+      }
     }
   }
 }

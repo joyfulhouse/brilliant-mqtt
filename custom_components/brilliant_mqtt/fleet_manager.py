@@ -97,6 +97,7 @@ from .shell import (
     PanelIdentityError,
     async_verify_host_identity,
 )
+from .update_intent import async_forget_update_intent
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -1538,6 +1539,7 @@ class FleetManager:
                 async_delete_panel_issues(self.hass, manager.management_id)
             except BaseException as error:
                 failures.append(error)
+            await async_forget_update_intent(self.hass, manager.management_id)
         if not failures:
             return
         for failure in failures[1:]:

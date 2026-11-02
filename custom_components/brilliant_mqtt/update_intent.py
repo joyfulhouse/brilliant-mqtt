@@ -271,6 +271,14 @@ def update_intent_store(hass: HomeAssistant) -> UpdateIntentStore:
     return store
 
 
+async def async_forget_update_intent(hass: HomeAssistant, management_id: str) -> None:
+    """Forget a removed panel's window record; never blocks removal."""
+    try:
+        await update_intent_store(hass).async_clear(management_id)
+    except Exception as error:
+        _LOGGER.warning("Update intent cleanup failed (%s)", type(error).__name__)
+
+
 def pinned_fingerprint(key: object) -> str | None:
     """SHA-256 fingerprint of a pinned public key; None when missing or unparseable."""
     if not isinstance(key, str) or not key:
