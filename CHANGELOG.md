@@ -18,6 +18,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   supported**: the integration keeps refusing them with
   `unsupported_architecture`. See `docs/brilliant-panel/i350-support.md` for the
   qualification gates (#155).
+- `bundle_manifest.py` has two identity modes for comparing a panel with a
+  release without the `panel-release` leg, which needs the release-link layout
+  (#164). `payload-identities` prints the version, release ordinal and code
+  digest of each selected payload component. `component-identities` prints the
+  same for the installed components, plus their layout, or `missing`.
+  `component-identities` is strictly read-only: it never creates or updates
+  the panel's identity records, so it is safe to run over SSH on a production
+  panel. An ordinal that no existing record proves is shown as `unknown`.
 
 ### Fixed
 
@@ -58,6 +66,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Enabling the voice satellite on a panel that is not armv7l now fails with a
   clear "armv7l-only" error before anything on the panel is changed, instead of
   installing a payload that cannot run there (#155).
+
+### Documentation
+
+- The release qualification runbook describes both upgrade paths for a legacy
+  fixed-layout panel: the Update entity and `brilliant_mqtt.redeploy`, which
+  keep the fixed layout with a journaled rollback baseline and are qualified,
+  and onboarding's conversion to the `current`/`releases` layout, which is not
+  yet qualified. It replaces the inline identity collector with the new modes
+  (#164).
+- The runbook records the live rollback rehearsal of 2026-10-26 from the legacy
+  fixed layout (105 s, predecessor digests restored exactly) as met. The
+  responsiveness measurement remains outstanding and is recorded as FAIL /
+  confounded by a native peer-forwarding fault.
 
 ## [0.11.4] - 2026-10-26
 

@@ -31,6 +31,8 @@ CORE_TREES = {
     "wifi_watchdog": ("wifi_watchdog/brilliant_wifi_watchdog",),
     "bus_watchdog": ("bus_watchdog/brilliant_bus_watchdog",),
 }
+_VERSION_PATTERN = re.compile(r"[0-9A-Za-z][0-9A-Za-z._+-]{0,127}")
+_IDENTITY_LAYOUTS = ("payload-identities", "component-identities")
 
 
 class ManifestError(RuntimeError):
@@ -374,7 +376,10 @@ def release_ordinal(root: Path) -> int | None:
     if not path.exists():
         return None
     _hash_required_path(path, "RELEASE_ORDINAL")
-    value = path.read_text(encoding="ascii").strip()
+    try:
+        value = path.read_text(encoding="ascii").strip()
+    except UnicodeDecodeError:
+        raise ManifestError("invalid release_ordinal") from None
     if re.fullmatch(r"[1-9][0-9]{0,15}", value) is None:
         raise ManifestError("invalid release_ordinal")
     return int(value)
@@ -409,7 +414,9 @@ def private_record(
     directory = root / ".release-identities"
     if not directory.exists() and value is None:
         return None
-    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if value is not None:
+        # Only a publish may create the store; reads never write.
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     directory_fd, _ = _open_directory_path(directory, "identity store")
     try:
         if stat.S_IMODE(os.fstat(directory_fd).st_mode) != 0o700:
@@ -457,8 +464,14 @@ def installed_identities(
     root: Path,
     unit_root: Path = Path("/etc/systemd/system"),
     env_path: Path = Path("/etc/brilliant-mqtt.env"),
+    *,
+    persist: bool = True,
 ) -> dict[str, dict[str, object] | None]:
-    """Hash the live selection and enroll legacy installs without claiming age."""
+    """Hash the live selection and enroll legacy installs without claiming age.
+
+    ``persist=False`` is the strictly read-only view used for qualification over
+    SSH: existing records are consulted but nothing is created, updated or made.
+    """
     selector = _panel_release_selector(root) if os.path.lexists(root / "current") else None
     output: dict[str, dict[str, object] | None] = {}
     deployment_id = None
@@ -510,7 +523,7 @@ def installed_identities(
             )
             if match is not None and tuple(int(part) for part in match.groups()) < (0, 11, 0):
                 version = match.group(0)
-        if re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z._+-]{0,127}", version) is None:
+        if _VERSION_PATTERN.fullmatch(version) is None:
             raise ManifestError("invalid installed version")
         identity: dict[str, object] = {
             "version": version,
@@ -524,7 +537,7 @@ def installed_identities(
             previous.get(key) == identity[key] for key in ("digest", "layout")
         ):
             identity["release_ordinal"] = previous.get("release_ordinal")
-        if previous != identity:
+        if persist and previous != identity:
             private_record(root, component, identity)
         output[component] = identity
     if selector is not None:
@@ -1011,13 +1024,105 @@ def _panel_release_manifest(
     return manifest
 
 
+def _candidate_version(root: Path) -> str:
+    try:
+        _hash_required_path(root / "VERSION", "VERSION")
+        version = (root / "VERSION").read_text(encoding="ascii").strip()
+    except (OSError, UnicodeDecodeError, ManifestError):
+        raise ManifestError("invalid candidate version") from None
+    if _VERSION_PATTERN.fullmatch(version) is None:
+        raise ManifestError("invalid candidate version")
+    return version
+
+
+def _payload_identities(root: Path, components: list[str]) -> list[str]:
+    ordinal = release_ordinal(root)
+    if ordinal is None:
+        raise ManifestError("payload release_ordinal is missing")
+    version = _candidate_version(root)
+    lines = []
+    for component in components:
+        digest = code_digest(root, component)
+        if digest is None:
+            raise ManifestError(f"payload component {component!r} is missing")
+        lines.append(f"{component}\t{version}\t{ordinal}\t{digest}")
+    return lines
+
+
+def _component_identities(
+    root: Path,
+    components: list[str],
+    overrides: dict[str, Path],
+) -> list[str]:
+    if not os.path.isdir(root):
+        raise ManifestError("installed root is unavailable")
+    try:
+        identities = installed_identities(root, persist=False, **overrides)
+    except (OSError, ValueError, RecursionError) as error:
+        # ValueError covers undecodable files and corrupt JSON identity records.
+        raise ManifestError(f"installed identity unreadable ({type(error).__name__})") from None
+    lines = []
+    for component in components:
+        identity = identities[component]
+        if identity is None:
+            lines.append(f"{component}\tmissing")
+            continue
+        ordinal = identity["release_ordinal"]
+        shown = str(ordinal) if type(ordinal) is int and ordinal > 0 else "unknown"
+        lines.append(
+            f"{component}\t{identity['version']}\t{shown}\t{identity['digest']}"
+            f"\t{identity['layout']}"
+        )
+    return lines
+
+
+def _identity_lines(
+    layout: str,
+    root: Path,
+    components: list[str] | None,
+    unit_root: Path | None,
+    env_path: Path | None,
+) -> list[str]:
+    if layout == "payload-identities" and (unit_root is not None or env_path is not None):
+        raise ManifestError("--unit-root and --env are valid only for component-identities")
+    if not components:
+        raise ManifestError(f"--component is required for {layout}")
+    seen: set[str] = set()
+    for component in components:
+        if component in seen:
+            raise ManifestError(f"duplicate --component {component!r}")
+        if component not in CORE_TREES:
+            raise ManifestError(f"unknown component {component!r}")
+        seen.add(component)
+    if layout == "payload-identities":
+        return _payload_identities(root, components)
+    overrides: dict[str, Path] = {}
+    if unit_root is not None:
+        overrides["unit_root"] = unit_root
+    if env_path is not None:
+        overrides["env_path"] = env_path
+    return _component_identities(root, components, overrides)
+
+
 def build_manifest(
     layout: str,
     root: Path,
     unit: Path | None = None,
     wifi_unit: Path | None = None,
     bus_unit: Path | None = None,
+    *,
+    components: list[str] | None = None,
+    unit_root: Path | None = None,
+    env_path: Path | None = None,
 ) -> list[str]:
+    if layout in _IDENTITY_LAYOUTS:
+        if any(value is not None for value in (unit, wifi_unit, bus_unit)):
+            raise ManifestError("unit arguments are valid only for panel-release")
+        return _identity_lines(layout, root, components, unit_root, env_path)
+    if any(value is not None for value in (components, unit_root, env_path)):
+        raise ManifestError(
+            "--component, --unit-root, and --env are valid only for identity layouts"
+        )
     if layout == "integration":
         if any(value is not None for value in (unit, wifi_unit, bus_unit)):
             raise ManifestError("unit arguments are valid only for panel-release")
@@ -1039,16 +1144,34 @@ def build_manifest(
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description=("Emit <logical-path><TAB><sha256> without file contents or host metadata.")
+        prog="bundle-manifest",
+        description=("Emit <logical-path><TAB><sha256> without file contents or host metadata."),
     )
     parser.add_argument(
         "layout",
-        choices=("integration", "payload-release", "panel-release"),
+        choices=("integration", "payload-release", "panel-release", *_IDENTITY_LAYOUTS),
     )
     parser.add_argument("root", type=Path)
     parser.add_argument("--unit", type=Path)
     parser.add_argument("--wifi-unit", type=Path)
     parser.add_argument("--bus-unit", type=Path)
+    parser.add_argument(
+        "--component",
+        action="append",
+        dest="components",
+        help="identity layouts: a core component to report (repeatable, ordered)",
+    )
+    parser.add_argument(
+        "--unit-root",
+        type=Path,
+        help="component-identities: systemd unit directory override",
+    )
+    parser.add_argument(
+        "--env",
+        type=Path,
+        dest="env_path",
+        help="component-identities: installed environment file override",
+    )
     return parser
 
 
@@ -1061,6 +1184,9 @@ def main(argv: list[str] | None = None) -> int:
             arguments.unit,
             arguments.wifi_unit,
             arguments.bus_unit,
+            components=arguments.components,
+            unit_root=arguments.unit_root,
+            env_path=arguments.env_path,
         )
     except ManifestError as error:
         print(f"bundle-manifest: {error}", file=sys.stderr)
