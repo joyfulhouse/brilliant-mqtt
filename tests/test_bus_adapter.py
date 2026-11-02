@@ -677,7 +677,7 @@ class TestInteractiveScheduling:
             await harness.drain()
             assert harness.observer.max_in_flight == {"ble_mesh": 1}
             assert not harness.adapter._write_admissions
-            assert not bridge._pending_mesh
+            assert not bridge._mesh.pending_view
         finally:
             await harness.drain()
             await dispatcher.shutdown()
@@ -789,7 +789,7 @@ class TestInteractiveScheduling:
             ]
             assert observer.max_in_flight == 1
             if device_id == "ble_mesh" and not auxiliary:
-                assert bridge._pending_mesh["slider"].targets == {"intensity": "120"}
+                assert bridge._mesh.pending_view["slider"].targets == {"intensity": "120"}
                 assert sleeper.requested == [80.0]
         finally:
             observer.release.set()
