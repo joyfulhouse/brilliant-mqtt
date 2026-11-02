@@ -68,9 +68,10 @@ bridge arms normal pending feedback with a placeholder receipt. The admission
 ticket that carried the write later reports the RPC's outcome (issue #225):
 
 - **Still running:** the mirror still carries the pre-write value, so a
-  differing observation proves nothing and is ignored. Feedback stays
-  `pending`. If the window expires with no fresh matching observation, it
-  closes `unconfirmed`.
+  differing observation proves nothing and is ignored. A matching
+  observation does not count toward confirmation either, because it comes
+  before any acceptance. Feedback stays `pending`, and unless a late
+  acceptance re-arms the window, it closes `unconfirmed` at expiry.
 - **Late failure:** publishes `failed` with the observed state immediately,
   as an immediate rejection does.
 - **Late acceptance:** re-arms a full 80 second window with a new

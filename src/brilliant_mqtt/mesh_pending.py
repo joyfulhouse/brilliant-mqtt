@@ -276,7 +276,7 @@ class MeshPending:
         nothing and is ignored. A MATCHING value is deliberately NOT
         confirmation (the mirror can carry the accepted-but-undelivered value
         for ~75s); it only refreshes the observation clock the confirm
-        deadline checks.
+        deadline checks — and not even that while the RPC is unresolved.
         """
         peripheral_id = device.peripheral_id
         pending = self._pending.get(peripheral_id)
@@ -310,7 +310,9 @@ class MeshPending:
                     pending.receipt,
                 )
                 return
-        if fully_matched:
+        # A match seen while the RPC is unresolved predates any acceptance:
+        # it must not let the resolver confirm at expiry (#225).
+        if fully_matched and not pending.rpc_unresolved:
             pending.last_observed_at = self._clock()
 
     def on_rpc_settled(

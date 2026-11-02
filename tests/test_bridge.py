@@ -2593,7 +2593,10 @@ class TestMeshWriteTimeout:
         assert mqtt.published == []
 
     async def test_matching_observation_holds_null_until_confirm_window(self) -> None:
-        bus, mqtt, bridge, clock, sleeper = await self._timed_out_off(asyncio.TimeoutError())
+        """A settled (fast native) timeout confirms on a fresh match at expiry."""
+        bus, mqtt, bridge, clock, sleeper = await self._timed_out_off(
+            TimeoutError("No response received!")
+        )
         mqtt.published.clear()
 
         clock.advance(75.0)
@@ -2604,6 +2607,24 @@ class TestMeshWriteTimeout:
         await sleeper.release_all()
 
         assert [json.loads(p[1]) for p in _mesh_states(mqtt)] == [_mesh_feedback_payload("OFF")]
+
+    async def test_unresolved_match_cannot_confirm_at_expiry(self) -> None:
+        """While the RPC is unresolved a match is pre-acceptance evidence: it
+        does not refresh the observation clock, so the window ends
+        `unconfirmed` unless a late acceptance re-arms it."""
+        bus, mqtt, bridge, clock, sleeper = await self._timed_out_off(asyncio.TimeoutError())
+        mqtt.published.clear()
+
+        clock.advance(75.0)
+        await bus.emit(_mesh_dimmer_at("0"))
+        assert bridge._mesh.pending_view[MESH_PID].last_observed_at is None
+        clock.advance(5.0)
+        await sleeper.release_all()
+
+        assert [json.loads(p[1]) for p in _mesh_states(mqtt)] == [
+            _mesh_feedback_payload(None, "unconfirmed")
+        ]
+        await bridge.withdraw()
 
     async def test_aux_fields_stay_live_while_timed_out_write_pends(self) -> None:
         bus, mqtt, bridge, _clock, _sleeper = _mesh_bridge([_mesh_motion_dimmer_at("1")])
