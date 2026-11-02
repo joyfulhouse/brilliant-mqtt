@@ -40,10 +40,10 @@ publishes the observed primary value and returns feedback to `idle`.
 **Idle means no tracked confirmation, never successful completion.**
 
 A contradicting observation publishes `contradicted` with the observed primary
-state. A bounded write rejection publishes `failed` with the last observation.
-A caller timeout leaves the RPC unresolved and arms normal pending feedback;
-the detached RPC receipt cannot confirm, fail, or re-arm that record. With no
-fresh matching observation at expiry, a terminal `unconfirmed` document keeps
+state. The exception is a write whose native RPC is still running past the
+caller deadline (see below): its differing observations are ignored. A bounded
+write rejection publishes `failed` with the last observation. With no fresh
+matching observation at expiry, a terminal `unconfirmed` document keeps
 primary `state` null and retains ordinary auxiliary readings. The next bus
 observation resumes normal observed state and idle feedback.
 
@@ -59,6 +59,32 @@ that a pre-crash request completed. Withdrawal and session teardown revoke
 and join feedback publications; an ex-leader sends no terminal clear or shared
 mesh offline message. The separate pre-existing confirmation-timer teardown
 sweep remains a follow-up.
+
+## Writes that outlive the caller deadline
+
+A write still running at the bus adapter's 5 second caller deadline is
+unresolved, not failed. The native RPC keeps running detached, and the
+bridge arms normal pending feedback with a placeholder receipt. The admission
+ticket that carried the write later reports the RPC's outcome (issue #225):
+
+- **Still running:** the mirror still carries the pre-write value, so a
+  differing observation proves nothing and is ignored. Feedback stays
+  `pending`. If the window expires with no fresh matching observation, it
+  closes `unconfirmed`.
+- **Late failure:** publishes `failed` with the observed state immediately,
+  as an immediate rejection does.
+- **Late acceptance:** re-arms a full 80 second window with a new
+  `mesh_write_deadline`. Observations made before the acceptance do not
+  count toward confirmation. After this, a contradicting observation
+  publishes `contradicted` as usual.
+- **Late timeout or cancellation:** reveals nothing about actuation. The
+  original deadline stays, and contradiction handling resumes.
+- **Native timeout before the deadline:** the panel library's own "No
+  response received!" has already settled. Pending feedback is armed and a
+  contradicting observation publishes `contradicted` on the next poll.
+
+A late outcome for a write that was superseded by a newer command, or that
+belongs to a withdrawn session, is ignored.
 
 ## Home Assistant diagnostic
 

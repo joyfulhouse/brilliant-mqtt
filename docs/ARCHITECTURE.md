@@ -47,6 +47,7 @@ bidirectional control.
 | `motion_derive.py` | Score-derived motion for mesh loads: rewrites `movement_detected` from `motion_score` ≥ high-threshold with a hold window (the firmware latch never fires — poc-findings §8c). Applied by the bridge in every snapshot path. | unit |
 | `heartbeat.py` | Bus-liveness heartbeat: atomically stamps a tmpfs file after every successful `get_all()` so the independent `brilliant_bus_watchdog` package can detect a wedged bus session (see Data Flow). | unit |
 | `bridge.py` | Orchestrator: reconcile, change → state publish, command → bus, desired-state enforcement. | unit (fakes) |
+| `mesh_pending.py` | Mesh primary write state machine: pending records, confirm/settle timers, write generations and feedback records; confirms by observation and applies a detached RPC's late outcome (#46/#225). No bus or MQTT imports. | unit |
 | `wired_feedback.py` | Pure reducer and renderer for wired-primary native observations, provisional requests, deadlines, and MQTT publication debt. | unit |
 | `mesh_leader.py` | Fleet-wide mesh leader election over MQTT (retained priority claim + heartbeat); gates the mesh bridge's publishes and writes. | unit |
 | `ha_control_protocol.py` | Versioned `brilliant/ha-control/v1` MQTT wire contract (shared verbatim with the HA integration): topic builders, canonical JSON encoding, strict payload validation. | unit |
@@ -88,9 +89,15 @@ bidirectional control.
   the deadline the caller gets `TimeoutError` but the closed-source RPC is
   **not cancelled**: it runs on detached, keeps its device lock until it
   settles, and logs its late completion or exception with the total latency
-  and receipt. A mesh primary that times out this way arms the normal
-  pending record (placeholder receipt), so HA shows `unknown` until an
-  observation settles it — the last snapshot is never republished as truth.
+  and receipt. Every admitted write reports its native outcome on its
+  admission ticket (`mark_settled`), including detached, cancelled and
+  never-issued writes. A mesh primary that times out this way arms the normal
+  pending record (placeholder receipt), so HA shows `unknown`; the last
+  snapshot is never republished as truth. While that RPC is still running the
+  mirror carries the pre-write value, so differing observations are ignored
+  until the ticket reports the late outcome (issue #225): a late failure
+  publishes `failed`, a late acceptance re-arms a full 80 s confirm window, and
+  a late timeout or cancellation resumes normal contradiction handling.
   Only a write still unresolved at the fixed 15 s hard cap latches the
   write-timeout flag, and the coordinator rebuilds the session on its next
   tick; a single 5 s timeout no longer triggers a rebuild. No retry,
