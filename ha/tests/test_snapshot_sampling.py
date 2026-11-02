@@ -9,8 +9,10 @@ import shlex
 import subprocess
 import sys
 import time
+from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -113,7 +115,7 @@ def test_shared_state_vocabulary_is_defined_once() -> None:
         {"window_seconds": 16.0, "interval_seconds": 0.5, "maximum_rounds": 32},
     ],
 )
-def test_sampling_rejects_unsafe_bounds(changes: dict[str, float]) -> None:
+def test_sampling_rejects_unsafe_bounds(changes: dict[str, Any]) -> None:
     with pytest.raises(ValueError, match="invalid_snapshot_sampling"):
         replace(_sampling(), **changes)
 
@@ -179,8 +181,8 @@ raise SystemExit(plan.get('exit', 0))
 def _run_sampler(
     tmp_path: Path,
     sampling: SnapshotSampling,
-    plan: dict[str, object],
-) -> tuple[subprocess.CompletedProcess[str], dict[str, object]]:
+    plan: Mapping[str, object],
+) -> tuple[subprocess.CompletedProcess[str], dict[str, Any]]:
     plan_path = tmp_path / "plan.json"
     plan_path.write_text(json.dumps(plan))
     control = tmp_path / "systemctl"
