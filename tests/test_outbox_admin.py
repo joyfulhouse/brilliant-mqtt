@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import io
 import json
-import os
-from dataclasses import replace
+import subprocess
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -18,7 +19,6 @@ from brilliant_mqtt.ha_control_protocol import (
     scene_event_topic,
     scene_result_topic,
 )
-from brilliant_mqtt.heartbeat import PhaseRecord, current_boot_id, process_generation
 from brilliant_mqtt.scene_state import load_state
 from tests.test_scene_bridge import _PANEL, _command, _execution, _published, _wait_for_bus_commands
 from tests.test_scene_outbox_quarantine import (
@@ -78,9 +78,35 @@ def _env(harness: _Harness, tmp_path: Path) -> dict[str, str]:
     }
 
 
-def _run(harness: _Harness, tmp_path: Path, *argv: str) -> tuple[int, str]:
+def _stopped(unit: str) -> str:
+    assert unit == "brilliant-mqtt"
+    return "inactive\n"
+
+
+def _proc(tmp_path: Path, *processes: tuple[int, bytes]) -> Path:
+    root = tmp_path / "proc"
+    root.mkdir(exist_ok=True)
+    for pid, cmdline in processes:
+        (root / str(pid)).mkdir()
+        (root / str(pid) / "cmdline").write_bytes(cmdline)
+    return root
+
+
+def _run(
+    harness: _Harness,
+    tmp_path: Path,
+    *argv: str,
+    systemctl: Callable[[str], str] = _stopped,
+    proc_root: Path | None = None,
+) -> tuple[int, str]:
     out = io.StringIO()
-    status = outbox_admin.main(list(argv), env=_env(harness, tmp_path), out=out)
+    status = outbox_admin.main(
+        list(argv),
+        env=_env(harness, tmp_path),
+        out=out,
+        systemctl=systemctl,
+        proc_root=_proc(tmp_path) if proc_root is None else proc_root,
+    )
     return status, out.getvalue()
 
 
@@ -132,33 +158,95 @@ async def test_hash_mismatch_is_refused_without_change(tmp_path: Path) -> None:
     assert not outbox_admin.audit_log_path(harness.path).exists()
 
 
-async def test_running_agent_is_refused_and_stale_marker_is_not(tmp_path: Path) -> None:
+_AGENT_CMDLINE = b"/data/switch-embedded/env/bin/python3\x00-m\x00brilliant_mqtt\x00"
+
+
+async def test_empty_or_missing_marker_with_agent_stopped_is_allowed(tmp_path: Path) -> None:
     harness = await _quarantined_with_dependent(tmp_path)
     event_key, event_sha = _event_key(harness)
     marker = tmp_path / "run" / "bus-phase"
     marker.parent.mkdir()
-    boot_id = current_boot_id()
-    generation = process_generation(os.getpid())
-    assert boot_id is not None and generation is not None
-    live = PhaseRecord("pre_bus", os.getpid(), generation, boot_id, None, None, None)
-    marker.write_text(live.encode())
+    marker.write_text("")
+    proc_root = _proc(
+        tmp_path,
+        # Unrelated processes and the admin tool itself are not the agent.
+        (400, b"/usr/bin/python3\x00-m\x00brilliant_mqtt.outbox_admin\x00list\x00"),
+        (401, b"/usr/sbin/sshd\x00-D\x00"),
+    )
+    assert outbox_admin.running_agent(str(marker), systemctl=_stopped, proc_root=proc_root) is None
+    marker.unlink()
+    assert outbox_admin.running_agent(str(marker), systemctl=_stopped, proc_root=proc_root) is None
+    marker.write_text("")
+
+    status, _ = _run(harness, tmp_path, "release", event_key, event_sha, proc_root=proc_root)
+
+    assert status == 0
+    assert harness.quarantine() == oq.QuarantineState()
+
+
+def test_failed_unit_counts_as_stopped(tmp_path: Path) -> None:
+    proc_root = _proc(tmp_path)
+    assert (
+        outbox_admin.running_agent("", systemctl=lambda unit: "failed\n", proc_root=proc_root)
+        is None
+    )
+
+
+async def test_live_agent_process_is_refused_even_without_a_marker(tmp_path: Path) -> None:
+    harness = await _quarantined_with_dependent(tmp_path)
+    event_key, event_sha = _event_key(harness)
+    proc_root = _proc(tmp_path, (321, _AGENT_CMDLINE))
     sidecar_before = harness.sidecar.read_bytes()
 
     for action in ("release", "discard"):
-        status, _ = _run(harness, tmp_path, action, event_key, event_sha)
+        status, _ = _run(harness, tmp_path, action, event_key, event_sha, proc_root=proc_root)
         assert status == 1
     assert harness.sidecar.read_bytes() == sidecar_before
-    reason = outbox_admin.running_agent(str(marker))
-    assert reason is not None and f"pid {os.getpid()}" in reason
-    assert outbox_admin.running_agent("") is not None
+    reason = outbox_admin.running_agent("", systemctl=_stopped, proc_root=proc_root)
+    assert reason is not None and "pid 321" in reason
+    # The tool's own pid is never counted.
+    own = outbox_admin.running_agent("", systemctl=_stopped, proc_root=proc_root, own_pid=321)
+    assert own is None
 
-    # A marker from an earlier boot proves nothing is running now.
-    marker.write_text(replace(live, boot_id="old-boot").encode())
-    assert outbox_admin.running_agent(str(marker)) is None
-    marker.write_text("garbage")
-    assert outbox_admin.running_agent(str(marker)) is not None
-    marker.unlink()
-    assert outbox_admin.running_agent(str(marker)) is None
+
+@pytest.mark.parametrize("unit_state", ["active\n", "activating\n", "deactivating\n", ""])
+async def test_systemd_not_stopped_is_refused(tmp_path: Path, unit_state: str) -> None:
+    harness = await _quarantined_with_dependent(tmp_path)
+    event_key, event_sha = _event_key(harness)
+
+    status, _ = _run(
+        harness, tmp_path, "discard", event_key, event_sha, systemctl=lambda unit: unit_state
+    )
+
+    assert status == 1
+    assert harness.suspect() is not None
+
+
+async def test_systemctl_error_is_refused(tmp_path: Path) -> None:
+    harness = await _quarantined_with_dependent(tmp_path)
+    event_key, event_sha = _event_key(harness)
+
+    def broken(unit: str) -> str:
+        raise FileNotFoundError("systemctl")
+
+    def hung(unit: str) -> str:
+        raise subprocess.TimeoutExpired(["systemctl"], 10)
+
+    for systemctl in (broken, hung):
+        status, _ = _run(harness, tmp_path, "release", event_key, event_sha, systemctl=systemctl)
+        assert status == 1
+    assert harness.suspect() is not None
+
+
+def test_held_phase_lease_adds_a_refusal(tmp_path: Path) -> None:
+    marker = tmp_path / "bus-phase"
+    marker.write_text("anything")
+    proc_root = _proc(tmp_path)
+    with open(marker) as holder:
+        fcntl.flock(holder.fileno(), fcntl.LOCK_EX)
+        reason = outbox_admin.running_agent(str(marker), systemctl=_stopped, proc_root=proc_root)
+        assert reason is not None and "lease" in reason
+    assert outbox_admin.running_agent(str(marker), systemctl=_stopped, proc_root=proc_root) is None
 
 
 async def test_release_clears_quarantine_and_the_outbox_resumes_in_order(

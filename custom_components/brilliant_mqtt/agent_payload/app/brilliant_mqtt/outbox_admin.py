@@ -22,7 +22,9 @@ logged.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import os
+import subprocess
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -32,12 +34,6 @@ from typing import TextIO
 
 from brilliant_mqtt.config import Settings
 from brilliant_mqtt.ha_control_protocol import encode_json
-from brilliant_mqtt.heartbeat import (
-    PhaseRecord,
-    current_boot_id,
-    process_generation,
-    process_is_absent,
-)
 from brilliant_mqtt.outbox_quarantine import (
     QuarantineState,
     clear_record,
@@ -53,6 +49,7 @@ from brilliant_mqtt.outbox_quarantine import (
 from brilliant_mqtt.scene_state import SceneState, atomic_write_state, load_state
 
 AUDIT_LOG_LIMIT_BYTES = 256 * 1024
+AGENT_UNIT = "brilliant-mqtt"
 
 
 class AdminRefusal(Exception):
@@ -64,32 +61,96 @@ def audit_log_path(state_path: Path) -> Path:
     return state_path.with_name(f"{state_path.name}.outbox-audit.log")
 
 
-def running_agent(phase_file: str) -> str | None:
+def systemctl_is_active(unit: str) -> str:
+    """Return ``systemctl is-active <unit>`` output; raise when it cannot run."""
+    completed = subprocess.run(
+        ["systemctl", "is-active", unit],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    return completed.stdout
+
+
+def _runs_agent(argv: Sequence[str]) -> bool:
+    """True when *argv* runs the agent module itself (``-m brilliant_mqtt``)."""
+    for index, argument in enumerate(argv):
+        if argument == "-mbrilliant_mqtt":
+            return True
+        if argument == "-m" and index + 1 < len(argv):
+            return argv[index + 1] == "brilliant_mqtt"
+    return False
+
+
+def _agent_pids(proc_root: Path, own_pid: int) -> list[int]:
+    pids: list[int] = []
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        return pids
+    for entry in entries:
+        if not entry.name.isdecimal() or int(entry.name) == own_pid:
+            continue
+        try:
+            raw = (entry / "cmdline").read_bytes()
+        except OSError:
+            continue  # exited meanwhile or unreadable: not evidence of the agent
+        argv = [part.decode("utf-8", "replace") for part in raw.split(b"\x00") if part]
+        if _runs_agent(argv):
+            pids.append(int(entry.name))
+    return sorted(pids)
+
+
+def _phase_lease_held(phase_file: str) -> bool:
+    """True only if a live writer holds the agent's exclusive phase lease."""
+    if not phase_file:
+        return False
+    try:
+        descriptor = os.open(phase_file, os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    except OSError:
+        return False
+    else:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(descriptor)
+
+
+def running_agent(
+    phase_file: str,
+    *,
+    systemctl: Callable[[str], str] = systemctl_is_active,
+    proc_root: Path = Path("/proc"),
+    own_pid: int | None = None,
+) -> str | None:
     """Return why the agent may be running (refuse), or None when it is stopped.
 
-    Uses the agent's existing bus-phase marker: every session stamps it with
-    the agent's pid, process start tick and boot id. A marker from an earlier
-    boot, a dead pid, or a reused pid proves the agent is not running.
+    Read-only evidence only. The agent counts as stopped only when systemd
+    reports the unit ``inactive`` or ``failed`` AND no live process runs
+    ``-m brilliant_mqtt``. The bus-phase marker can only add a reason to
+    refuse (its exclusive lease is held); a missing, empty or unrecognised
+    marker never proves anything either way.
     """
-    if not phase_file:
-        return "BUS_PHASE_FILE is disabled, so a running agent cannot be ruled out"
     try:
-        text = Path(phase_file).read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return None
-    except (OSError, UnicodeError):
-        return f"cannot read the agent phase marker {phase_file}"
-    record = PhaseRecord.parse(text)
-    if record is None:
-        return f"the agent phase marker {phase_file} is not recognised"
-    if record.boot_id != current_boot_id():
-        return None
-    if process_is_absent(record.pid):
-        return None
-    generation = process_generation(record.pid)
-    if generation is not None and generation != record.process_generation:
-        return None
-    return f"the agent (pid {record.pid}) is running; stop it first (systemctl stop)"
+        unit_state = systemctl(AGENT_UNIT).strip()
+    except (OSError, subprocess.SubprocessError) as error:
+        return f"cannot query systemd for {AGENT_UNIT} ({type(error).__name__})"
+    if unit_state not in ("inactive", "failed"):
+        shown = unit_state or "unknown"
+        return f"systemd reports {AGENT_UNIT} as {shown!r}; run systemctl stop {AGENT_UNIT}"
+    pids = _agent_pids(proc_root, os.getpid() if own_pid is None else own_pid)
+    if pids:
+        return f"an agent process is still running (pid {pids[0]}); stop it first"
+    if _phase_lease_held(phase_file):
+        return f"the agent phase lease on {phase_file} is held; stop the agent first"
+    return None
 
 
 def _undelivered(state: SceneState) -> dict[str, tuple[str, str]]:
@@ -139,7 +200,16 @@ def append_audit(path: Path, entry: Mapping[str, object]) -> None:
 
 
 class _Admin:
-    def __init__(self, settings: Settings, out: TextIO, clock: Callable[[], float]) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        out: TextIO,
+        clock: Callable[[], float],
+        systemctl: Callable[[str], str],
+        proc_root: Path,
+    ) -> None:
+        self._systemctl = systemctl
+        self._proc_root = proc_root
         self._state_path = Path(settings.scene_watermark_file)
         self._sidecar = sidecar_path(self._state_path)
         self._audit = audit_log_path(self._state_path)
@@ -177,7 +247,9 @@ class _Admin:
             print(f"warning: audit log write failed ({type(error).__name__})", file=sys.stderr)
 
     def _target(self, record: str, sha256: str) -> tuple[SceneState, QuarantineState, str, str]:
-        reason = running_agent(self._phase_file)
+        reason = running_agent(
+            self._phase_file, systemctl=self._systemctl, proc_root=self._proc_root
+        )
         if reason is not None:
             raise AdminRefusal(reason)
         try:
@@ -302,6 +374,8 @@ def main(
     env: Mapping[str, str] | None = None,
     out: TextIO | None = None,
     clock: Callable[[], float] = time.time,
+    systemctl: Callable[[str], str] = systemctl_is_active,
+    proc_root: Path = Path("/proc"),
 ) -> int:
     """Run one admin command; return the process exit status."""
     arguments = _parser().parse_args(argv)
@@ -311,7 +385,7 @@ def main(
     except (KeyError, ValueError) as error:
         print(f"error: agent environment incomplete ({error})", file=sys.stderr)
         return 1
-    admin = _Admin(settings, stream, clock)
+    admin = _Admin(settings, stream, clock, systemctl, proc_root)
     try:
         if arguments.command == "list":
             admin.list_records()

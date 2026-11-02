@@ -187,10 +187,15 @@ The on-panel CLI is `python3 -m brilliant_mqtt.outbox_admin`. Usage is in
 [TROUBLESHOOTING → Scene outbox quarantined](TROUBLESHOOTING.md#scene-outbox-quarantined-outbox_quarantine--outbox_blocked).
 
 - It reads the same environment and paths as the bridge (`Settings.from_env`).
-- It refuses to run while the agent is running. It uses the agent's existing
-  bus-phase marker (pid, process start tick and boot id). A marker from an
-  earlier boot, a dead pid, or a reused pid means the agent is stopped. An
-  unrecognised marker or a disabled `BUS_PHASE_FILE` is refused.
+- `release` and `discard` refuse to run while the agent may be running. They
+  use read-only checks only. The agent counts as stopped only when
+  `systemctl is-active brilliant-mqtt` prints `inactive` or `failed` and no
+  process in `/proc` runs `-m brilliant_mqtt` (the tool itself excluded). Any
+  other `systemctl` output, or an error running it, is a refusal. The bus-phase
+  marker can only add a refusal, when another process holds its exclusive
+  lease. A missing, empty or unrecognised marker never proves the agent is
+  stopped and never causes a refusal on its own, because the agent itself can
+  unlink or rewrite the marker while it runs.
 - `list` prints key, kind, size, sha256, status and failure count for every
   undelivered record.
 - `release <key> <sha256>` clears the evidence so the record is retried.

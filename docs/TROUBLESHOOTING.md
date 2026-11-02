@@ -316,9 +316,11 @@ systemctl start brilliant-mqtt
 
 `<key>` and `<sha256>` come from the `list` output, and the hash must match.
 Every action is appended to `scene-watermarks.json.outbox-audit.log` next to the
-state file. A discard is refused if that audit entry cannot be written. If the
-tool reports an unrecognised phase marker after an agent rollback, remove
-`/run/brilliant-mqtt/bus-phase` with the agent stopped and run it again.
+state file. A discard is refused if that audit entry cannot be written. The
+tool treats the agent as stopped only when `systemctl is-active brilliant-mqtt`
+prints `inactive` or `failed` and no process runs `-m brilliant_mqtt`. If it
+still refuses, check `systemctl status brilliant-mqtt` and
+`pgrep -af 'brilliant_mqtt'`, and stop whatever is still running.
 
 ### Bridge broken after a panel firmware update
 
