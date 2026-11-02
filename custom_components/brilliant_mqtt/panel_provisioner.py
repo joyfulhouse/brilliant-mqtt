@@ -783,8 +783,29 @@ class _Settlement:
     cancellation: asyncio.CancelledError | None
 
 
+# How often a rollback reconnect backoff re-checks for an HA stop.
+_STOP_POLL_SECONDS = 0.5
+
+
+async def _sleep_unless_stopping(delay: float, stopping: Callable[[], bool]) -> bool:
+    """Back off for *delay*, returning False as soon as *stopping* reports a stop.
+
+    The predicate is polled every _STOP_POLL_SECONDS, so an HA shutdown is never
+    held for a whole backoff.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + delay
+    while True:
+        if stopping():
+            return False
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return True
+        await asyncio.sleep(min(_STOP_POLL_SECONDS, remaining))
+
+
 # Indirected so tests drive the rollback reconnect backoff without real waits.
-_reconnect_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
+_reconnect_backoff: Callable[[float, Callable[[], bool]], Awaitable[bool]] = _sleep_unless_stopping
 
 
 def _not_stopping() -> bool:
@@ -1088,6 +1109,10 @@ class PanelProvisioner:
                     outcome = await _settle(
                         self._async_rollback_over_fresh_session(current, snapshot, staged, stopping)
                     )
+                    # The rollback itself recorded any failure and kept the intent; a
+                    # caller cancellation stays a cancellation.
+                    if outcome.cancellation is not None:
+                        raise outcome.cancellation from None
                     if isinstance(outcome.error, PanelProvisioningError):
                         raise PanelProvisioningError(outcome.error.code) from None
                 else:
@@ -2148,7 +2173,10 @@ class PanelProvisioner:
                             ) from None
                         if attempt >= connect_retry.MAX_ATTEMPTS:
                             raise PanelProvisioningError("rollback_failed") from None
-                        await _reconnect_sleep(connect_retry.backoff_delay(attempt))
+                        if not await _reconnect_backoff(
+                            connect_retry.backoff_delay(attempt), stopping
+                        ):
+                            raise PanelProvisioningError("recovery_interrupted") from None
                         continue
                     return shell
         except TimeoutError:

@@ -311,3 +311,72 @@ async def test_stop_interrupts_the_reconnect_and_says_so(
     reason = issue.translation_placeholders["reason"]
     assert "Home Assistant was stopping" in reason
     assert "unreachable" not in reason
+
+
+async def test_caller_cancellation_stays_a_cancellation_and_keeps_the_intent(
+    hass: HomeAssistant, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cancelled update is not turned into a PanelProvisioningError (#219)."""
+    rig = _rig(hass, tmp_path, monkeypatch)
+    gate = asyncio.Event()
+    reconnect = _ClosingShell(connect_error=asyncssh.PermissionDenied("bad"), connect_gate=gate)
+    rig.scripted.append(reconnect)
+    update = asyncio.create_task(rig.update_and_lose())
+    await reconnect.connect_entered.wait()
+
+    update.cancel()
+    gate.set()
+    # update_and_lose captures whatever the managed update raised.
+    raised = await update
+
+    assert isinstance(raised, asyncio.CancelledError)
+    await _assert_intent_kept(rig, hass, "panel_authentication_failed")
+
+
+async def test_stop_during_reconnect_backoff_ends_it_promptly(
+    hass: HomeAssistant,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reconnect_sleeps: list[float],
+) -> None:
+    rig = _rig(hass, tmp_path, monkeypatch)
+    rig.scripted.extend(_ClosingShell(connect_error=_UNREACHABLE) for _ in range(3))
+    stopped = False
+
+    def stopping() -> bool:
+        return stopped
+
+    def first_failure(_delay: float) -> None:
+        nonlocal stopped
+        stopped = True
+
+    original = panel_provisioner._reconnect_backoff
+
+    async def stop_then_wait(delay: float, check: Callable[[], bool]) -> bool:
+        first_failure(delay)
+        return await original(delay, check)
+
+    monkeypatch.setattr(panel_provisioner, "_reconnect_backoff", stop_then_wait)
+
+    raised = await rig.update_and_lose(stopping=stopping)
+
+    assert isinstance(raised, PanelProvisioningError)
+    assert raised.code == "recovery_interrupted"
+    assert len(rig.fresh) == 1
+    await _assert_intent_kept(rig, hass, "recovery_interrupted")
+
+
+async def test_backoff_polls_for_a_stop_instead_of_sleeping_it_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(panel_provisioner, "_STOP_POLL_SECONDS", 0.01)
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    stop_at = started + 0.05
+
+    completed = await panel_provisioner._sleep_unless_stopping(30.0, lambda: loop.time() >= stop_at)
+
+    assert completed is False
+    assert loop.time() - started < 1.0
+    assert await panel_provisioner._sleep_unless_stopping(0.02, lambda: False) is True
+    assert await panel_provisioner._sleep_unless_stopping(30.0, lambda: True) is False

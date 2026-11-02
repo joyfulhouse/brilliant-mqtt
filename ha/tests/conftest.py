@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import shutil
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -81,7 +81,11 @@ def instant_update_connect_retry(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(manager, "_connect_retry_sleep", no_wait)
     from custom_components.brilliant_mqtt import panel_provisioner
 
-    monkeypatch.setattr(panel_provisioner, "_reconnect_sleep", no_wait)
+    async def no_backoff(_delay: float, stopping: Callable[[], bool]) -> bool:
+        await asyncio.sleep(0)
+        return not stopping()
+
+    monkeypatch.setattr(panel_provisioner, "_reconnect_backoff", no_backoff)
 
 
 @pytest.fixture
@@ -119,11 +123,12 @@ def reconnect_sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
 
     delays: list[float] = []
 
-    async def record(delay: float) -> None:
+    async def record(delay: float, stopping: Callable[[], bool]) -> bool:
         delays.append(delay)
         await asyncio.sleep(0)
+        return not stopping()
 
-    monkeypatch.setattr(panel_provisioner, "_reconnect_sleep", record)
+    monkeypatch.setattr(panel_provisioner, "_reconnect_backoff", record)
     monkeypatch.setattr(connect_retry, "jitter", lambda: 1.0)
     return delays
 
