@@ -11,11 +11,14 @@ observed light response are different measurements. Record each separately. A
 bus acknowledgement or a retained MQTT `online` message does not establish
 physical actuation or native panel-slider responsiveness.
 
-## Current release: 0.11.3
+## Current release: 0.11.3 agent, 0.11.4 integration
 
 [`v0.11.3`](https://github.com/joyfulhouse/brilliant-mqtt/releases/tag/v0.11.3)
-(release ordinal 5, voice payload 0.1.1) is the latest stable release and is
-installed on every panel. Its contents are in the [changelog](../../CHANGELOG.md).
+(release ordinal 5, voice payload 0.1.1) is the agent release installed on
+every panel. Its contents are in the [changelog](../../CHANGELOG.md).
+[`v0.11.4`](https://github.com/joyfulhouse/brilliant-mqtt/releases/tag/v0.11.4)
+is a Home Assistant integration release only: it bundles the same 0.11.3 agent
+payload with release ordinal 5, so it neither changes nor updates panels.
 Earlier versions of this runbook targeted 0.11.2 and listed gates to satisfy
 before publication. Publication and rollout have already happened, so those
 gates now record what was met rather than control a decision:
@@ -26,8 +29,8 @@ gates now record what was met rather than control a decision:
 | Distinct release identity | Met: version 0.11.3 with ordinal 5, admitted normally over ordinal 4 |
 | Installed parity | Met: the published HACS zip and the loaded integration matched the reviewed manifests; pilot component digests matched |
 | Final-candidate soak | Met: more than one day on one pilot with matching digests, unchanged service processes and no automatic restarts |
-| Rollback rehearsal | **Outstanding**: retained baselines exist, but no live rollback has been exercised |
-| Responsiveness | **Outstanding**: no sequential, burst or partial-command measurements |
+| Rollback rehearsal | Met: live on the designated pilot on 2026-10-26, from the legacy fixed layout. `canary_rollback` took 105 s (limit 300 s) and restored the predecessor's component digests exactly; the panel then returned to 0.11.3 through finalize and the supported update |
+| Responsiveness | **Outstanding**: the 2026-10-26 run on a mesh load is recorded as **FAIL / confounded**, because native peer forwarding was failing (`NoConnectionError`) during it. Repeat it on the mesh load and on a like-for-like panel-local load once the peers are restored |
 | Fleet completion | Met: every panel reports 0.11.3 and fresh health; one update needed retries after connection failures (#219) |
 | Baseline finalization | **Outstanding**: every panel still retains its predecessor baseline |
 
@@ -44,103 +47,129 @@ still runs the release. For the Home Assistant integration, run the
 against the loaded integration. On a release-link panel layout, also run its
 `panel-release` leg. That command requires `current` to select one direct child
 of `releases`; its failure on a legacy layout must not be suppressed or relabeled
-as a pass.
+as a pass. Panels on the [legacy fixed layout](#legacy-fixed-layout) use the
+[component identity comparison](#comparing-component-identities) instead.
 
-Panels updated through the supported single-panel update keep their legacy fixed
-layout. For those, record that the release-link leg does not apply and compare
-the complete selected component code digests instead. Separately check each
-component's installed unit, version, resource limits and running process. A
-match for only `bus.py`, `mqttio.py` or `VERSION` does not substitute for
-complete component parity.
+### Legacy fixed layout
 
-### Collecting component identities
+A panel on the legacy fixed layout keeps its code in `/var/brilliant-mqtt/app`,
+`vendor`, `wifi_watchdog` and `bus_watchdog`, with no `current` link. Manual
+installs and panels updated through the supported single-panel update are in
+this state. Two integration paths can upgrade such a panel, and they are
+qualified differently.
 
-Run the following from the qualified candidate checkout. The SSH aliases must
-already have verified host-key pins, as in the deployment reference. Set
-`selected_components` to the panel's actual core selection (Wi-Fi watchdog only
+**(a) Update entity and `brilliant_mqtt.redeploy`: qualified.** The supported
+single-panel update and the redeploy action keep the fixed layout. Before they
+change code they capture a journaled predecessor baseline under
+`/var/brilliant-mqtt/.rollback/<id>/`, which `brilliant_mqtt.canary_rollback`
+restores (see the [rollback runbook](../canary-rollback.md)). This is the path
+the 2026-10-26 rollback rehearsal exercised.
+
+**(b) Onboarding conversion: unqualified.** Adding a panel through onboarding
+runs `PanelProvisioner.async_install`, the journaled conversion from the fixed
+layout to `current`/`releases`. The flow reaches it from `_async_provision`
+(`custom_components/brilliant_mqtt/flow/onboarding.py:604`). It runs only if
+all of the following hold:
+
+- The panel is not already configured. Onboarding looks up the panel's SSH
+  identity with `_duplicate_panel` (`flow/onboarding.py:260`) and aborts with
+  `already_configured` (`flow/onboarding.py:319`). The provisioner repeats the
+  check as `duplicate_panel` (`panel_provisioner.py:1129`).
+- The installed code differs from the bundle. Otherwise release admission is a
+  no-op and the install stops with `release_unchanged`
+  (`panel_provisioner.py:1168-1169`), which the flow shows as an abort
+  (`flow/onboarding.py:462-463`).
+- Every selected component changes. Otherwise it stops with
+  `release_selection_conflict` (`panel_provisioner.py:1170-1171`).
+
+When it runs, it snapshots the panel and journals the operation as `UPGRADE`
+for any snapshot that is not `ABSENT` (`panel_provisioner.py:1219-1223`),
+stages the release with `stage_release` (`panel_provisioner.py:1266`), and
+activation repoints `current` at the staged release (`activate_staged`,
+`panel_provisioner.py:1338`; the link swap is `panel_ops.py:1706-1709`). Rolling
+back a converted legacy panel restores the saved fixed-layout files and removes
+`current` (`panel_ops.py:1906`). Off-panel coverage is partial: the tests in
+`ha/tests` exercise parts of this sequence with fakes, not a complete
+legacy-to-release conversion and rollback on a real tree, and it has not been
+rehearsed on a panel. Use path (a) for qualified upgrades of legacy panels.
+
+Never hand-create a `current` link to make a legacy panel pass the
+`panel-release` leg. A link the integration did not stage is not a release,
+and it changes which code the services run.
+
+### Which checkout to use
+
+Run the integration and payload parity legs from a checkout of the
+[`v0.11.4`](https://github.com/joyfulhouse/brilliant-mqtt/releases/tag/v0.11.4)
+tag, because they must match the loaded integration byte for byte. The
+`payload-identities` and `component-identities` modes of
+`scripts/brilliant-panel/bundle_manifest.py` are newer than that tag. Run them
+from a checkout that contains them, and point `payload-identities` at the
+v0.11.4 payload. This is valid because an identity covers only the core code
+trees, `VERSION` and `RELEASE_ORDINAL`, none of which a newer helper changes.
+
+### Comparing component identities
+
+Set `components` to the panel's actual core selection (Wi-Fi watchdog only
 where it is installed); do not omit a failing component to obtain a passing
-comparison. The example checks all three core services.
-
-First run the repository and loaded-HA **integration and payload** manifest
-commands and their two comparisons from the deployment reference. Those legs
-apply to both layouts. Omit only its release-link-specific panel command and
-panel comparison for an explicitly retained legacy layout. Then collect the
-service-selected component identities with the same trusted helper used by
-`panel_ops._read_release_identities`:
+comparison. The example checks all three core services. The SSH alias must
+already have a verified host-key pin, as in the deployment reference.
 
 ```bash
 set -euo pipefail
 legacy_evidence=artifacts/canary/legacy-parity
+manifest_helper=scripts/brilliant-panel/bundle_manifest.py
+# The v0.11.4 payload, for example from `git worktree add ../brilliant-mqtt-v0.11.4 v0.11.4`.
+release_payload=../brilliant-mqtt-v0.11.4/custom_components/brilliant_mqtt/agent_payload
+components="--component bridge --component wifi_watchdog --component bus_watchdog"
 mkdir -p "$legacy_evidence"
-uv run python - "$legacy_evidence" <<'PY'
-import json
-import runpy
-import sys
-from pathlib import Path
 
-out = Path(sys.argv[1])
-helper = Path("scripts/brilliant-panel/bundle_manifest.py")
-api = runpy.run_path(str(helper), run_name="canary_identity")
-payload = Path("custom_components/brilliant_mqtt/agent_payload")
-selected_components = ("bridge", "wifi_watchdog", "bus_watchdog")
-candidate_ordinal = api["release_ordinal"](payload)
-assert type(candidate_ordinal) is int and candidate_ordinal > 0, "candidate ordinal required"
-expected = {
-    component: {
-        "digest": api["code_digest"](payload, component),
-        "version": (payload / "VERSION").read_text().strip(),
-        "release_ordinal": candidate_ordinal,
-    }
-    for component in selected_components
-}
-assert all(item["digest"] is not None for item in expected.values())
-(out / "expected.json").write_text(json.dumps(expected, sort_keys=True))
-# Match the existing integration's helper-loading convention. This source comes
-# from the qualified local checkout, never from an unverified panel helper.
-source = helper.read_text().rsplit('if __name__ == "__main__":', 1)[0]
-source += '\nidentities = installed_identities(Path("/var/brilliant-mqtt"))\n'
-source += f'selected = {selected_components!r}\n'
-source += '''print(json.dumps({
-    name: ({key: identities[name][key]
-            for key in ("digest", "version", "release_ordinal", "layout")}
-           if identities[name] is not None else None)
-    for name in selected
-}, sort_keys=True))
-'''
-(out / "collect-identities.py").write_text(source)
-PY
+uv run python "$manifest_helper" payload-identities "$release_payload" $components \
+  > "$legacy_evidence/expected.tsv"
 
-# This can enroll/update private identity records; it does not update code.
-ssh office-qualified '/data/switch-embedded/env/bin/python3 -' \
-  < "$legacy_evidence/collect-identities.py" \
-  > "$legacy_evidence/installed.json"
+ssh -o NumberOfPasswordPrompts=1 office-qualified \
+  "/data/switch-embedded/env/bin/python3 - component-identities /var/brilliant-mqtt $components" \
+  < "$manifest_helper" \
+  > "$legacy_evidence/installed.tsv"
 
-uv run python - "$legacy_evidence" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-root = Path(sys.argv[1])
-expected = json.loads((root / "expected.json").read_text())
-installed = json.loads((root / "installed.json").read_text())
-assert installed.keys() == expected.keys(), "component selection differs"
-for component, wanted in expected.items():
-    actual = installed[component]
-    assert actual is not None, f"missing component: {component}"
-    assert actual["layout"] in ("legacy_fixed", "release_link")
-    assert all(actual[key] == value for key, value in wanted.items()), component
-print("Selected component identity, version and ordinal match")
-PY
+cut -f1-4 "$legacy_evidence/installed.tsv" > "$legacy_evidence/installed-identity.tsv"
+diff -u "$legacy_evidence/expected.tsv" "$legacy_evidence/installed-identity.tsv" \
+  > "$legacy_evidence/identity.diff" || {
+    echo "STOP: installed component identity differs" >&2
+    exit 1
+  }
 ```
 
-Keep the layout report as evidence, and repeat collection and comparison at the
-end of each qualification window from the same qualified checkout. Never treat a null/unknown ordinal
-as equal to the candidate ordinal. If the compare fails, stop qualification and
-investigate the guarded deployment instead of editing the identity record.
-These component digests cover code, not the complete installed unit or mutable
-configuration: retain the provisioner's verified unit/configuration evidence and
-check the actual systemd process and resource limits separately. The collector
-prints no environment contents, credentials, deployment ID or private hostname.
+`payload-identities` prints the component, version, ordinal and digest for each
+selected component, separated by tabs. It fails if the payload has no
+`RELEASE_ORDINAL` or lacks a selected component. `component-identities` prints
+the same four fields followed by the layout (`legacy_fixed` or
+`release_link`), or the component followed by `missing`, in the order of the
+`--component` arguments. `cut -f1-4` drops the layout so the two files compare
+directly; keep `installed.tsv` as the layout evidence.
+
+### Read-only collection and manual installs
+
+`component-identities` is strictly read-only. It consults the panel's existing
+private identity records but never creates or updates them and never creates a
+directory, so it is safe to run over SSH on a production panel. It prints an
+ordinal only when an existing record proves it for exactly the installed code;
+otherwise it prints `unknown`, which never equals a candidate ordinal. A legacy
+or manual install whose ordinal the integration never enrolled therefore shows
+`unknown` even when its code digests match. That is expected, and it is not a
+pass: record it, and let the supported update or redeploy enroll the identity.
+Do not edit identity records by hand.
+
+Repeat collection and comparison at the end of each qualification window. If
+the comparison fails, stop qualification and investigate the guarded
+deployment instead of editing the identity record. These component digests
+cover code, not the complete installed unit or mutable configuration: retain
+the provisioner's verified unit and configuration evidence, and check each
+component's installed unit, version, resource limits and running process
+separately. A match for only `bus.py`, `mqttio.py` or `VERSION` does not
+substitute for complete component parity. Both modes print no file contents,
+environment values, credentials, deployment ID or paths, and report an
+unreadable installed file only by its error type.
 
 ## Rollback rehearsal
 
