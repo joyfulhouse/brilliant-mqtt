@@ -10,8 +10,10 @@ from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
 from typing import cast
+from uuid import uuid4
 
 from brilliant_mqtt.commands import VarSet
+from brilliant_mqtt.diagnostics import OutboxDetails, ResponseDiagnostics
 from brilliant_mqtt.ha_control_protocol import (
     COMMAND_TTL_MS,
     MAPPING_VERSION,
@@ -34,7 +36,23 @@ from brilliant_mqtt.ha_control_protocol import (
     validate_scene_command_context,
 )
 from brilliant_mqtt.model import BrilliantDevice
-from brilliant_mqtt.protocols import BusClient, MqttClient
+from brilliant_mqtt.outbox_quarantine import (
+    ATTRIBUTION_WINDOW_MS,
+    QuarantineState,
+    SuspectRecord,
+    clear_record,
+    event_record_key,
+    load_sidecar,
+    mark_blocked,
+    parse_record_key,
+    payload_sha256,
+    record_attributed_failure,
+    result_record_key,
+    retain_live,
+    sidecar_path,
+    write_sidecar,
+)
+from brilliant_mqtt.protocols import BusClient, MqttClient, MqttSessionSignals
 from brilliant_mqtt.scene_codec import (
     ModeExecution,
     SceneExecution,
@@ -83,6 +101,18 @@ Watermark = StateWatermark
 _StoredEvent = StateEvent
 _StoredResult = StateResult
 _StoredPending = StatePending
+
+
+@dataclass(frozen=True, slots=True)
+class _Inflight:
+    """The outbox record currently handed to the broker, awaiting its PUBACK (#113)."""
+
+    record: str
+    sha256: str
+    sent_at_ms: int
+    # True when an earlier QoS-1 publish in this MQTT session was acknowledged.
+    healthy: bool
+    epoch: int
 
 
 @dataclass(slots=True)
@@ -137,11 +167,23 @@ class SceneBridge:
         watermark_path: str | Path,
         clock_ms: Callable[[], int],
         want_device: Callable[[str], bool] | None = None,
+        *,
+        session_signals: MqttSessionSignals | None = None,
+        diagnostics: ResponseDiagnostics | None = None,
     ) -> None:
         self._bus = bus
         self._mqtt = mqtt
         self._panel = panel
         self._watermark_path = Path(watermark_path)
+        # #113 poison-frame quarantine. Without session signals no failure is
+        # ever attributed, so delivery behaves exactly as before #113.
+        self._session_signals = session_signals
+        self._diagnostics = diagnostics
+        self._sidecar_path = sidecar_path(self._watermark_path)
+        self._quarantine = QuarantineState()
+        self._quarantine_lock = asyncio.Lock()
+        self._session_id = ""
+        self._inflight: _Inflight | None = None
         self._clock_ms = clock_ms
         # Bus scope pre-filter keyed by device id (issue #98): the execution
         # peripheral lives on the panel's own device, so a push for a device
@@ -209,6 +251,8 @@ class SceneBridge:
         )
         self._bus.on_reconnect(self._reconnect_callback)
         self._mqtt.on_message(self._mqtt_message_callback)
+        if self._session_signals is not None:
+            self._session_signals.on_connection_lost(self._connection_lost_callback)
         self._callbacks_registered = True
 
     async def async_start(self) -> None:
@@ -244,6 +288,7 @@ class SceneBridge:
         subscribed: list[str] = []
         try:
             loaded = await self._async_load_state()
+            quarantine = await self._async_load_sidecar()
             async with self._lock:
                 if epoch != self._epoch or self._stopping:
                     return
@@ -254,6 +299,19 @@ class SceneBridge:
                 self._state_version = 0
                 self._persisted_version = 0
                 self._restore_pending_maps()
+                # Each start is a distinct MQTT session for #113 attribution.
+                self._quarantine = quarantine
+                self._session_id = uuid4().hex
+                self._inflight = None
+                halted = self._quarantined_record()
+                self._note_outbox_diagnostics()
+            if halted is not None:
+                logger.error(
+                    "scene outbox halted: record %s (sha256 %s) is quarantined after "
+                    "repeated broker disconnects; see TROUBLESHOOTING outbox quarantine",
+                    halted[0],
+                    halted[1].sha256,
+                )
             for topic in (scene_command_topic(self._panel), mode_command_topic(self._panel)):
                 await self._mqtt.subscribe(topic)
                 subscribed.append(topic)
@@ -415,6 +473,32 @@ class SceneBridge:
 
         await self._track_task(run())
         return loaded[0]
+
+    async def _async_load_sidecar(self) -> QuarantineState:
+        loop = asyncio.get_running_loop()
+        loaded: list[QuarantineState] = []
+
+        async def run() -> None:
+            loaded.append(
+                await loop.run_in_executor(state_executor(), load_sidecar, self._sidecar_path)
+            )
+
+        await self._track_task(run())
+        return loaded[0]
+
+    async def _async_write_sidecar(self, state: QuarantineState) -> bool:
+        loop = asyncio.get_running_loop()
+        write = loop.run_in_executor(state_executor(), write_sidecar, self._sidecar_path, state)
+        try:
+            # Shielded like the state write: a teardown that cancels the waiter
+            # must not abandon evidence that is already on its way to disk.
+            await asyncio.shield(write)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("outbox quarantine sidecar write failed; evidence not recorded")
+            return False
+        return True
 
     def _install_loaded_state(self, state: SceneState) -> None:
         self._watermarks = dict(state.watermarks)
@@ -1310,9 +1394,15 @@ class SceneBridge:
         while self._started and not self._stopping and epoch == self._epoch:
             async with self._lock:
                 item = self._next_delivery()
-            if item is None:
-                return
-            item_type, key, topic, payload = item
+                if item is None:
+                    return
+                item_type, key, topic, payload = item
+                record = (
+                    event_record_key(cast(str, key))
+                    if item_type == "event"
+                    else result_record_key(*cast(StateKey, key))
+                )
+                inflight = self._begin_inflight(record, payload)
             try:
                 # QoS 1 so publish() blocks until the broker PUBACKs before we
                 # commit delivered=True below. On disconnect/timeout aiomqtt
@@ -1326,8 +1416,11 @@ class SceneBridge:
             except asyncio.CancelledError:
                 raise
             except Exception:
+                self._end_inflight(inflight)
                 await self._sleep(_RESULT_RETRY_SECONDS)
                 continue
+            finally:
+                self._end_inflight(inflight)
             snapshot: tuple[int, SceneState] | None = None
             async with self._lock:
                 if self._stopping or epoch != self._epoch:
@@ -1352,12 +1445,199 @@ class SceneBridge:
                 continue
             if not await self._async_persist_state(*snapshot, epoch):
                 return
+            # A successful delivery of this key resets its #113 evidence.
+            await self._async_clear_quarantine_evidence(record)
             await self._async_health_status("scene")
             await self._async_health_status("mode")
+
+    def _begin_inflight(self, record: str, payload: str) -> _Inflight | None:
+        """Mark *record* as handed to the broker; the caller holds the lock."""
+        if self._session_signals is None:
+            return None
+        inflight = _Inflight(
+            record=record,
+            sha256=payload_sha256(payload),
+            sent_at_ms=self._clock_ms(),
+            healthy=self._session_signals.acknowledged_qos1_publishes() > 0,
+            epoch=self._epoch,
+        )
+        self._inflight = inflight
+        return inflight
+
+    def _end_inflight(self, inflight: _Inflight | None) -> None:
+        if inflight is not None and self._inflight is inflight:
+            self._inflight = None
+
+    def _connection_lost_callback(self) -> None:
+        """Attribute an unexpected session drop to the in-flight head record (#113).
+
+        Only observed broker behaviour counts: the record was sent and the
+        connection dropped within ATTRIBUTION_WINDOW_MS of sending it. Whether
+        an earlier QoS-1 publish in this session was acknowledged decides
+        between counting a failure and merely reporting the outbox as blocked.
+        """
+        inflight = self._inflight
+        if inflight is None or self._stopping or inflight.epoch != self._epoch:
+            return
+        lost_at_ms = self._clock_ms()
+        if lost_at_ms - inflight.sent_at_ms > ATTRIBUTION_WINDOW_MS:
+            return
+        self._inflight = None
+        self._track_task(self._async_note_drop(inflight, lost_at_ms))
+
+    async def _async_note_drop(self, inflight: _Inflight, lost_at_ms: int) -> None:
+        async with self._quarantine_lock:
+            async with self._lock:
+                live = self._live_records()
+                if live.get(inflight.record) != inflight.sha256:
+                    return
+                current = self._quarantine
+                if inflight.healthy:
+                    updated = record_attributed_failure(
+                        current, inflight.record, inflight.sha256, self._session_id, lost_at_ms
+                    )
+                else:
+                    updated = mark_blocked(current, inflight.record, inflight.sha256, lost_at_ms)
+                updated = retain_live(updated, live)
+            if updated == current:
+                return
+            # Persist BEFORE the record is skipped: an unpersisted quarantine
+            # never halts delivery, so a failed write keeps retrying instead.
+            if not await self._async_write_sidecar(updated):
+                return
+            async with self._lock:
+                self._quarantine = updated
+                self._note_outbox_diagnostics()
+        elapsed_ms = lost_at_ms - inflight.sent_at_ms
+        suspect = updated.get(inflight.record)
+        if not inflight.healthy:
+            logger.warning(
+                "MQTT session dropped %d ms after sending outbox record %s with no QoS-1 "
+                "acknowledgement earlier in the session; not counted (outbox_blocked)",
+                elapsed_ms,
+                inflight.record,
+            )
+        elif suspect is not None and suspect.quarantined_at_ms is not None:
+            logger.error(
+                "outbox record %s (sha256 %s) quarantined after %d attributable broker "
+                "disconnects; outbox halted until operator release or discard",
+                inflight.record,
+                inflight.sha256,
+                len(suspect.failures),
+            )
+        elif suspect is not None:
+            logger.warning(
+                "MQTT session dropped %d ms after sending outbox record %s "
+                "(attributable failure %d)",
+                elapsed_ms,
+                inflight.record,
+                len(suspect.failures),
+            )
+        await self._async_health_status("scene")
+        await self._async_health_status("mode")
+
+    async def _async_clear_quarantine_evidence(self, record: str) -> None:
+        async with self._quarantine_lock:
+            async with self._lock:
+                current = self._quarantine
+                if current.get(record) is None and current.blocked is None:
+                    return
+                updated = retain_live(clear_record(current, record), self._live_records())
+            if updated == current or not await self._async_write_sidecar(updated):
+                return
+            async with self._lock:
+                self._quarantine = updated
+                self._note_outbox_diagnostics()
+
+    def _live_records(self) -> dict[str, str]:
+        """Map every undelivered outbox record key to its payload hash."""
+        live = {
+            event_record_key(key): payload_sha256(event.payload)
+            for key, event in self._events.items()
+            if not event.delivered
+        }
+        for (kind, command_id), result in self._results.items():
+            if not result.delivered:
+                live[result_record_key(kind, command_id)] = payload_sha256(result.payload)
+        return live
+
+    def _live_payload(self, record: str, sha256: str) -> str | None:
+        """Return the undelivered payload for *record* if its hash still matches."""
+        try:
+            _, native = parse_record_key(record)
+        except ValueError:
+            return None
+        payload: str | None = None
+        if isinstance(native, str):
+            event = self._events.get(native)
+            if event is not None and not event.delivered:
+                payload = event.payload
+        else:
+            result = self._results.get(native)
+            if result is not None and not result.delivered:
+                payload = result.payload
+        if payload is None or payload_sha256(payload) != sha256:
+            return None
+        return payload
+
+    def _quarantined_record(self) -> tuple[str, SuspectRecord] | None:
+        """Return the persisted, still-live quarantined record, if any."""
+        for record, suspect in self._quarantine.suspects:
+            if suspect.quarantined_at_ms is None:
+                continue
+            if self._live_payload(record, suspect.sha256) is not None:
+                return record, suspect
+        return None
+
+    def _outbox_reason(self) -> str | None:
+        if self._quarantined_record() is not None:
+            return "outbox_quarantine"
+        blocked = self._quarantine.blocked
+        if blocked is not None and self._live_payload(blocked.record, blocked.sha256) is not None:
+            return "outbox_blocked"
+        return None
+
+    def _note_outbox_diagnostics(self) -> None:
+        """Report #113 details (never payload contents) through the bridge diag meta."""
+        if self._diagnostics is None:
+            return
+        candidates: list[tuple[str, str, str, SuspectRecord | None]] = []
+        quarantined = self._quarantined_record()
+        if quarantined is not None:
+            held_key, held = quarantined
+            candidates.append(("quarantined", held_key, held.sha256, held))
+        candidates.extend(
+            ("suspect", key, evidence.sha256, evidence)
+            for key, evidence in self._quarantine.suspects
+        )
+        blocked = self._quarantine.blocked
+        if blocked is not None:
+            candidates.append(("blocked", blocked.record, blocked.sha256, None))
+        details: OutboxDetails | None = None
+        for state, record, sha256, suspect in candidates:
+            payload = self._live_payload(record, sha256)
+            if payload is None:
+                continue
+            details = {
+                "state": state,
+                "key": record,
+                "kind": parse_record_key(record)[0],
+                "payload_bytes": len(payload.encode("utf-8")),
+                "payload_sha256": sha256,
+                "failure_count": 0 if suspect is None else len(suspect.failures),
+                "quarantined_at_ms": None if suspect is None else suspect.quarantined_at_ms,
+            }
+            break
+        self._diagnostics.note_outbox(details)
 
     def _next_delivery(
         self,
     ) -> tuple[str, str | StateKey, str, str] | None:
+        if self._quarantined_record() is not None:
+            # O1: a quarantined record halts the whole outbox. It is never
+            # re-offered, and nothing is sent past it: no later event, no
+            # result (so no result can ever overtake its event).
+            return None
         events = sorted(self._events.items(), key=lambda item: item[1].created_at_ms)
         for key, event in events:
             if not event.delivered and self._event_versions[key] <= self._persisted_version:
@@ -1446,9 +1726,18 @@ class SceneBridge:
                 available = self._scene_catalog_healthy and self._scene_execution_healthy
             else:
                 available = self._mode_catalog_healthy and self._mode_execution_healthy
-            if not self._state_trusted or self._state_reason is not None:
+            outbox_reason = self._outbox_reason()
+            if not self._state_trusted:
                 available = False
                 reason: str | None = self._state_reason or "state_untrusted"
+            elif outbox_reason is not None:
+                # #113: a halted or blocked outbox is the root cause, even after
+                # the held records have since filled it to state_capacity.
+                available = False
+                reason = outbox_reason
+            elif self._state_reason is not None:
+                available = False
+                reason = self._state_reason
             elif not self._execution_available:
                 available = False
                 reason = "execution_unavailable"
