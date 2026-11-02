@@ -1054,9 +1054,12 @@ def _component_identities(
     components: list[str],
     overrides: dict[str, Path],
 ) -> list[str]:
+    if not os.path.isdir(root):
+        raise ManifestError("installed root is unavailable")
     try:
         identities = installed_identities(root, persist=False, **overrides)
-    except (OSError, UnicodeDecodeError) as error:
+    except (OSError, ValueError, RecursionError) as error:
+        # ValueError covers undecodable files and corrupt JSON identity records.
         raise ManifestError(f"installed identity unreadable ({type(error).__name__})") from None
     lines = []
     for component in components:
@@ -1141,7 +1144,8 @@ def build_manifest(
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description=("Emit <logical-path><TAB><sha256> without file contents or host metadata.")
+        prog="bundle-manifest",
+        description=("Emit <logical-path><TAB><sha256> without file contents or host metadata."),
     )
     parser.add_argument(
         "layout",

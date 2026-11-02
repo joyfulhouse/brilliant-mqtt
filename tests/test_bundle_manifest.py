@@ -822,6 +822,74 @@ def test_ordinal_provable_only_by_an_uncreated_record_stays_unknown(tmp_path: Pa
     assert not (panel / ".release-identities").exists()
 
 
+@pytest.mark.parametrize(
+    ("record", "error"),
+    [(b"{bad", "JSONDecodeError"), (b"[" * 16000, "RecursionError")],
+    ids=["malformed", "deeply_nested"],
+)
+def test_corrupt_identity_record_is_a_stable_content_free_error(
+    tmp_path: Path, record: bytes, error: str
+) -> None:
+    payload = _make_payload(tmp_path)
+    panel, units, env = _make_legacy_panel(tmp_path, payload)
+    _enroll(_load_helper(), panel, units, env, 5)
+    (panel / ".release-identities/bridge.json").write_bytes(record)
+
+    result = _identity_run(panel, units, env, "bridge")
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert result.stderr == f"bundle-manifest: installed identity unreadable ({error})\n"
+    assert "Traceback" not in result.stderr
+    assert str(panel) not in result.stderr
+
+
+def test_component_identities_reject_an_unavailable_root(tmp_path: Path) -> None:
+    result = _run("component-identities", tmp_path / "absent", "--component", "bridge")
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert result.stderr == "bundle-manifest: installed root is unavailable\n"
+
+
+def test_usage_errors_name_the_helper() -> None:
+    result = _run("not-a-layout", "/")
+
+    assert result.returncode == 2
+    assert result.stderr.startswith("usage: bundle-manifest ")
+    assert "bundle-manifest: error: argument layout: invalid choice" in result.stderr
+
+
+def test_helper_runs_from_stdin_in_isolated_mode(tmp_path: Path) -> None:
+    payload = _make_payload(tmp_path)
+    panel, units, env = _make_legacy_panel(tmp_path, payload)
+    expected = _identity_run(panel, units, env, "bridge")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-B",
+            "-I",
+            "-",
+            "component-identities",
+            str(panel),
+            "--component",
+            "bridge",
+            "--unit-root",
+            str(units),
+            "--env",
+            str(env),
+        ],
+        input=_SCRIPT.read_text(encoding="utf-8"),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == expected.stdout
+
+
 def test_read_only_installed_identities_skip_every_write(tmp_path: Path) -> None:
     payload = _make_payload(tmp_path)
     panel, units, env = _make_legacy_panel(tmp_path, payload)
