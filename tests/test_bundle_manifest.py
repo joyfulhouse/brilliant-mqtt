@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import os
 import shutil
+import stat
 import subprocess
 import sys
 from collections.abc import Callable
@@ -434,3 +435,403 @@ def test_directory_replaced_by_symlink_during_hashing_is_rejected(
         build_manifest("integration", root)
 
     assert raced
+
+
+# --- #164: read-only release identity comparison modes ---------------------------
+
+_COMPONENTS = ("bridge", "wifi_watchdog", "bus_watchdog")
+_CODE_FILES = {
+    "app/brilliant_mqtt/bridge.py": "bridge code",
+    "vendor/dependency.py": "vendored code",
+    "wifi_watchdog/brilliant_wifi_watchdog/run.py": "wifi code",
+    "bus_watchdog/brilliant_bus_watchdog/run.py": "bus code",
+}
+
+
+def _component_arguments(*components: str) -> list[str]:
+    arguments: list[str] = []
+    for component in components:
+        arguments += ["--component", component]
+    return arguments
+
+
+def _make_payload(tmp_path: Path, *, version: str = "0.11.3", ordinal: str = "5") -> Path:
+    payload = tmp_path / "payload"
+    for name, content in _CODE_FILES.items():
+        _write(payload / name, content)
+    _write(payload / "VERSION", version + "\n")
+    _write(payload / "RELEASE_ORDINAL", ordinal + "\n")
+    return payload
+
+
+def _make_legacy_panel(tmp_path: Path, payload: Path) -> tuple[Path, Path, Path]:
+    """Mirror the fixed layout: code trees at the root, per-watchdog VERSION stamps."""
+    panel = tmp_path / "panel"
+    for tree in ("app", "vendor", "wifi_watchdog", "bus_watchdog"):
+        shutil.copytree(payload / tree, panel / tree)
+    version = (payload / "VERSION").read_text(encoding="ascii")
+    _write(panel / "VERSION", version)
+    _write(panel / "wifi_watchdog/VERSION", version)
+    _write(panel / "bus_watchdog/VERSION", version)
+    units = tmp_path / "units"
+    units.mkdir()
+    return panel, units, tmp_path / "absent.env"
+
+
+def _identity_run(
+    panel: Path, units: Path, env: Path, *components: str
+) -> subprocess.CompletedProcess[str]:
+    return _run(
+        "component-identities",
+        panel,
+        *_component_arguments(*components),
+        "--unit-root",
+        units,
+        "--env",
+        env,
+    )
+
+
+def _enroll(helper: ModuleType, panel: Path, units: Path, env: Path, ordinal: object) -> None:
+    """The integration's default (persisting) path, then its ordinal enrolment."""
+    for component, record in helper.installed_identities(panel, units, env).items():
+        assert record is not None
+        helper.private_record(panel, component, {**record, "release_ordinal": ordinal})
+
+
+def _snapshot(root: Path) -> dict[str, tuple[int, int, int, bytes | None]]:
+    observed: dict[str, tuple[int, int, int, bytes | None]] = {}
+    for directory, names, files in os.walk(root):
+        for name in [".", *names, *files]:
+            path = Path(directory) / name
+            metadata = path.lstat()
+            content = path.read_bytes() if stat.S_ISREG(metadata.st_mode) else None
+            observed[str(path.relative_to(root))] = (
+                metadata.st_mode,
+                metadata.st_mtime_ns,
+                metadata.st_size,
+                content,
+            )
+    return observed
+
+
+def test_payload_identities_print_selected_components_in_order(tmp_path: Path) -> None:
+    payload = _make_payload(tmp_path)
+    helper = _load_helper()
+
+    result = _run("payload-identities", payload, *_component_arguments("bus_watchdog", "bridge"))
+
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+    assert result.stdout.splitlines() == [
+        f"bus_watchdog\t0.11.3\t5\t{helper.code_digest(payload, 'bus_watchdog')}",
+        f"bridge\t0.11.3\t5\t{helper.code_digest(payload, 'bridge')}",
+    ]
+
+
+def test_payload_identities_of_the_real_bundled_payload() -> None:
+    helper = _load_helper()
+    version = (_PAYLOAD / "VERSION").read_text(encoding="ascii").strip()
+    ordinal = int((_PAYLOAD / "RELEASE_ORDINAL").read_text(encoding="ascii"))
+
+    result = _run("payload-identities", _PAYLOAD, *_component_arguments(*_COMPONENTS))
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        f"{component}\t{version}\t{ordinal}\t{helper.code_digest(_PAYLOAD, component)}"
+        for component in _COMPONENTS
+    ]
+
+
+def test_payload_identities_require_a_release_ordinal(tmp_path: Path) -> None:
+    payload = _make_payload(tmp_path)
+    (payload / "RELEASE_ORDINAL").unlink()
+
+    result = _run("payload-identities", payload, "--component", "bridge")
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert result.stderr == "bundle-manifest: payload release_ordinal is missing\n"
+
+
+def test_payload_identities_require_each_selected_component(tmp_path: Path) -> None:
+    payload = _make_payload(tmp_path)
+    shutil.rmtree(payload / "bus_watchdog")
+
+    result = _run("payload-identities", payload, *_component_arguments("bridge", "bus_watchdog"))
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert result.stderr == "bundle-manifest: payload component 'bus_watchdog' is missing\n"
+
+
+def test_non_ascii_release_ordinal_is_a_stable_error(tmp_path: Path) -> None:
+    payload = _make_payload(tmp_path)
+    (payload / "RELEASE_ORDINAL").write_bytes("５\n".encode())
+
+    result = _run("payload-identities", payload, "--component", "bridge")
+
+    assert result.returncode == 2
+    assert result.stderr == "bundle-manifest: invalid release_ordinal\n"
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        (
+            ("payload-identities", "{root}", "--component", "bridge", "--component", "bridge"),
+            "duplicate --component 'bridge'",
+        ),
+        (
+            ("component-identities", "{root}", "--component", "nope"),
+            "unknown component 'nope'",
+        ),
+        (("payload-identities", "{root}"), "--component is required for payload-identities"),
+        (
+            ("component-identities", "{root}"),
+            "--component is required for component-identities",
+        ),
+        (
+            ("integration", "{root}", "--component", "bridge"),
+            "--component, --unit-root, and --env are valid only for identity layouts",
+        ),
+        (
+            ("payload-release", "{root}", "--unit-root", "{root}"),
+            "--component, --unit-root, and --env are valid only for identity layouts",
+        ),
+        (
+            ("panel-release", "{root}", "--env", "{root}"),
+            "--component, --unit-root, and --env are valid only for identity layouts",
+        ),
+        (
+            ("payload-identities", "{root}", "--component", "bridge", "--unit-root", "{root}"),
+            "--unit-root and --env are valid only for component-identities",
+        ),
+        (
+            ("payload-identities", "{root}", "--component", "bridge", "--env", "{root}"),
+            "--unit-root and --env are valid only for component-identities",
+        ),
+        (
+            ("payload-identities", "{root}", "--component", "bridge", "--unit", "{root}"),
+            "unit arguments are valid only for panel-release",
+        ),
+        (
+            ("component-identities", "{root}", "--component", "bridge", "--wifi-unit", "{root}"),
+            "unit arguments are valid only for panel-release",
+        ),
+        (
+            ("component-identities", "{root}", "--component", "bridge", "--bus-unit", "{root}"),
+            "unit arguments are valid only for panel-release",
+        ),
+    ],
+)
+def test_identity_argument_validation(
+    tmp_path: Path, arguments: tuple[str, ...], message: str
+) -> None:
+    result = _run(*(argument.format(root=tmp_path) for argument in arguments))
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert result.stderr == f"bundle-manifest: {message}\n"
+
+
+def test_legacy_panel_matches_payload_once_its_ordinal_is_enrolled(tmp_path: Path) -> None:
+    payload = _make_payload(tmp_path)
+    panel, units, env = _make_legacy_panel(tmp_path, payload)
+    helper = _load_helper()
+    candidate = _run("payload-identities", payload, *_component_arguments(*_COMPONENTS))
+    assert candidate.returncode == 0, candidate.stderr
+
+    before = _identity_run(panel, units, env, *_COMPONENTS)
+
+    assert before.returncode == 0, before.stderr
+    assert before.stdout.splitlines() == [
+        f"{component}\t0.11.3\tunknown\t{helper.code_digest(payload, component)}\tlegacy_fixed"
+        for component in _COMPONENTS
+    ]
+    _enroll(helper, panel, units, env, 5)
+    after = _identity_run(panel, units, env, *_COMPONENTS)
+    assert after.returncode == 0, after.stderr
+    assert [line.rsplit("\t", 1) for line in after.stdout.splitlines()] == [
+        [line, "legacy_fixed"] for line in candidate.stdout.splitlines()
+    ]
+
+
+@pytest.mark.parametrize("ordinal", [0, -1, True, "5", 5.0, None])
+def test_non_positive_or_non_int_ordinals_print_unknown(tmp_path: Path, ordinal: object) -> None:
+    payload = _make_payload(tmp_path)
+    panel, units, env = _make_legacy_panel(tmp_path, payload)
+    _enroll(_load_helper(), panel, units, env, ordinal)
+
+    result = _identity_run(panel, units, env, "bridge")
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split("\t")[2] == "unknown"
+
+
+def test_drifted_legacy_code_shows_a_different_digest_and_no_ordinal(tmp_path: Path) -> None:
+    payload = _make_payload(tmp_path)
+    panel, units, env = _make_legacy_panel(tmp_path, payload)
+    helper = _load_helper()
+    _enroll(helper, panel, units, env, 5)
+    _write(panel / "app/brilliant_mqtt/bridge.py", "hand-edited code")
+
+    result = _identity_run(panel, units, env, "bridge", "bus_watchdog")
+
+    assert result.returncode == 0, result.stderr
+    bridge, bus = (line.split("\t") for line in result.stdout.splitlines())
+    assert bridge[2] == "unknown"
+    assert bridge[3] == helper.code_digest(panel, "bridge")
+    assert bridge[3] != helper.code_digest(payload, "bridge")
+    assert bus[2:4] == ["5", helper.code_digest(payload, "bus_watchdog")]
+
+
+def test_missing_installed_component_prints_missing(tmp_path: Path) -> None:
+    payload = _make_payload(tmp_path)
+    panel, units, env = _make_legacy_panel(tmp_path, payload)
+    shutil.rmtree(panel / "bus_watchdog")
+
+    result = _identity_run(panel, units, env, "bus_watchdog", "bridge")
+
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert lines[0] == "bus_watchdog\tmissing"
+    assert lines[1].startswith("bridge\t0.11.3\tunknown\t")
+
+
+def test_release_link_layout_is_detected(tmp_path: Path) -> None:
+    payload = _make_payload(tmp_path)
+    panel = tmp_path / "panel"
+    release = panel / "releases" / _RELEASE_NAME
+    shutil.copytree(payload, release)
+    (panel / "current").symlink_to(release)
+    shutil.copyfile(payload / "VERSION", panel / "VERSION")
+    units = tmp_path / "units"
+    units.mkdir()
+    helper = _load_helper()
+
+    result = _identity_run(panel, units, tmp_path / "absent.env", *_COMPONENTS)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        f"{component}\t0.11.3\tunknown\t{helper.code_digest(payload, component)}\trelease_link"
+        for component in _COMPONENTS
+    ]
+
+
+def test_unit_root_and_env_are_forwarded_only_when_given(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    helper = _load_helper()
+    calls: list[tuple[Path, dict[str, object]]] = []
+
+    def recording(root: Path, **overrides: object) -> dict[str, object]:
+        calls.append((root, overrides))
+        return {component: None for component in _COMPONENTS}
+
+    monkeypatch.setattr(helper, "installed_identities", recording)
+    base = ["component-identities", str(tmp_path), "--component", "bridge"]
+
+    assert helper.main(base) == 0
+    assert helper.main([*base, "--unit-root", str(tmp_path / "units")]) == 0
+    assert helper.main([*base, "--env", "e"]) == 0
+
+    assert calls == [
+        (tmp_path, {"persist": False}),
+        (tmp_path, {"persist": False, "unit_root": tmp_path / "units"}),
+        (tmp_path, {"persist": False, "env_path": Path("e")}),
+    ]
+    assert capsys.readouterr().out == "bridge\tmissing\n" * 3
+
+
+@pytest.mark.parametrize("defect", ["missing", "non_ascii", "symlink", "directory", "invalid"])
+def test_candidate_version_must_be_one_valid_regular_file(tmp_path: Path, defect: str) -> None:
+    payload = _make_payload(tmp_path)
+    version = payload / "VERSION"
+    version.unlink()
+    if defect == "non_ascii":
+        version.write_bytes("0.11.３\n".encode())
+    elif defect == "symlink":
+        _write(tmp_path / "elsewhere", "0.11.3\n")
+        version.symlink_to(tmp_path / "elsewhere")
+    elif defect == "directory":
+        version.mkdir()
+    elif defect == "invalid":
+        version.write_text("not a version\n", encoding="ascii")
+
+    result = _run("payload-identities", payload, "--component", "bridge")
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert result.stderr == "bundle-manifest: invalid candidate version\n"
+
+
+@pytest.mark.parametrize(
+    ("defect", "error"),
+    [("directory", "IsADirectoryError"), ("non_utf8", "UnicodeDecodeError")],
+)
+def test_unreadable_installed_version_is_a_content_free_error(
+    tmp_path: Path, defect: str, error: str
+) -> None:
+    payload = _make_payload(tmp_path)
+    panel, units, env = _make_legacy_panel(tmp_path, payload)
+    (panel / "VERSION").unlink()
+    if defect == "directory":
+        (panel / "VERSION").mkdir()
+    else:
+        (panel / "VERSION").write_bytes(b"\xff\xfe-SECRET")
+
+    result = _identity_run(panel, units, env, "bridge")
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert result.stderr == f"bundle-manifest: installed identity unreadable ({error})\n"
+    assert str(panel) not in result.stderr
+    assert "SECRET" not in result.stderr
+
+
+@pytest.mark.parametrize("enrolled", [False, True])
+def test_component_identities_never_write_to_the_panel_tree(tmp_path: Path, enrolled: bool) -> None:
+    payload = _make_payload(tmp_path)
+    panel, units, env = _make_legacy_panel(tmp_path, payload)
+    if enrolled:
+        _enroll(_load_helper(), panel, units, env, 5)
+        # A stale record which the persisting path would rewrite.
+        _write(panel / "app/brilliant_mqtt/bridge.py", "drifted code")
+    before = _snapshot(tmp_path)
+
+    result = _identity_run(panel, units, env, *_COMPONENTS)
+
+    assert result.returncode == 0, result.stderr
+    assert _snapshot(tmp_path) == before
+    assert (panel / ".release-identities").exists() is enrolled
+
+
+def test_ordinal_provable_only_by_an_uncreated_record_stays_unknown(tmp_path: Path) -> None:
+    payload = _make_payload(tmp_path)
+    panel, units, env = _make_legacy_panel(tmp_path, payload)
+
+    first = _identity_run(panel, units, env, "bridge")
+    second = _identity_run(panel, units, env, "bridge")
+
+    assert first.returncode == second.returncode == 0
+    assert first.stdout == second.stdout
+    assert first.stdout.split("\t")[2] == "unknown"
+    assert not (panel / ".release-identities").exists()
+
+
+def test_read_only_installed_identities_skip_every_write(tmp_path: Path) -> None:
+    payload = _make_payload(tmp_path)
+    panel, units, env = _make_legacy_panel(tmp_path, payload)
+    helper = _load_helper()
+
+    read_only = helper.installed_identities(panel, units, env, persist=False)
+
+    assert not (panel / ".release-identities").exists()
+    persisted = helper.installed_identities(panel, units, env)
+    assert persisted == read_only
+    record = panel / ".release-identities/bridge.json"
+    assert record.stat().st_mode & 0o777 == 0o600
+    assert helper.private_record(panel, "bridge") == persisted["bridge"]
