@@ -202,6 +202,26 @@ broker, command, or credential text.
 - **Retry:** Start **Add Brilliant panel** again only after recovery is clear
   and the prior release is healthy.
 
+<a id="service_crash_looping"></a>
+#### `service_crash_looping`
+
+- **Cause:** The panel already has the agent installed, and its bridge (or a
+  Wi-Fi or bus watchdog) kept restarting during the pre-change service check
+  (crash-looping). No safe rollback baseline can be taken for a bridge that
+  cannot stay up, so the integration stopped before changing anything. No
+  agent code, unit or configuration was changed, and no baseline is kept.
+- **Check:** On the panel, `journalctl -u brilliant-mqtt -n 50` (or the
+  watchdog's unit). Likely causes are missing or changed broker credentials, or
+  a broker the panel cannot reach.
+- **Fix:** Fix the old bridge so it stays up, or uninstall the agent and re-add
+  the panel. Turn off the Wi-Fi and Bus watchdog switches before
+  `brilliant_mqtt.uninstall`; a panel without a Home Assistant entry uses the
+  [manual agent uninstall](TROUBLESHOOTING.md#manual-agent-uninstall-panel-without-a-home-assistant-entry).
+  See [TROUBLESHOOTING.md](TROUBLESHOOTING.md#add-or-update-fails-with-service_crash_looping).
+- **Retry:** If it was a one-off restart and the service now stays up, simply
+  retry. If the release needed an explicit override, that override was
+  consumed and a retry needs a fresh approval.
+
 <a id="rebind_identity_unchanged"></a>
 #### `rebind_identity_unchanged`
 
@@ -394,12 +414,22 @@ change baseline retention or the canary rollback process.
 #### Recovering a stopped pre-ordinal bridge
 
 The canaried update snapshots the panel and captures a rollback baseline before
-any write. The snapshot probe reads `systemctl is-active` for each core service:
-`active` counts as running, while `inactive`, `failed`, and `unknown` count as
-stopped. Any other state, such as the transitional `activating`, `deactivating`,
-or `reloading`, fails the snapshot probe itself (`snapshot_probe_failed`). The
-update then stops earlier, before any write, and reports only the generic "agent
-update failed during deployment". Retry once the unit has settled. For an
+any write. The snapshot probe samples `ActiveState`, `SubState` and `NRestarts`
+for the three core services with one batched `systemctl show` every 0.5 seconds.
+While any core service runs it watches for about 13.5 seconds, longer than the
+shipped restart delays (5 seconds for the bridge, 10 seconds for the watchdogs),
+so every restart in that window is seen. It stops after about a second once two
+consecutive rounds show every service stopped, and it is hard-bounded at 40
+seconds and 32 rounds. Each install or update on an existing panel takes two
+snapshots, about 27 seconds. A service whose last sample is `active` or
+`reloading` counts as running; `inactive` or `failed` counts as stopped. A unit
+that showed `auto-restart` (or whose restart counter rose by two or more) is
+crash-looping: on an installed panel the update stops with
+`service_crash_looping` before any write (see
+[`service_crash_looping`](#service_crash_looping)). A last sample that is still
+transitional (`activating`, `deactivating`) or `unknown`, or any malformed or
+slow reading, fails the probe itself (`snapshot_probe_failed`). Retry once the
+unit has settled. For an
 installed panel, the baseline capture then requires the bridge to be running and
 `/etc/brilliant-mqtt.env` to exist. If the bridge is stopped or the file is
 missing, it stops with `baseline_correlation_unsupported` before any write. A
