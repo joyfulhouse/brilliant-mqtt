@@ -780,7 +780,7 @@
         "step": {
           "init": {
             "title": "Interrupted agent update",
-            "description": "Home Assistant stopped while panel `{panel}` was updating its agent to {target_version}. The update was in its {stage} stage after {attempts} attempt(s), before any rollback baseline was captured, so nothing was changed on the panel. It is not resumed automatically. Retry starts a fresh update (with a fresh retry budget) and shows its progress on the panel's Update entity; Dismiss forgets the interrupted update.",
+            "description": "Home Assistant stopped while panel `{panel}` was updating its agent to {target_version}. The update was in its {stage} stage after {attempts} attempt(s), before any rollback baseline was captured, so no agent code was changed. It is not resumed automatically. Retry starts a fresh update (with a fresh retry budget) and shows its progress on the panel's Update entity; Dismiss forgets the interrupted update.",
             "menu_options": {
               "retry": "Retry the agent update",
               "dismiss": "Dismiss"

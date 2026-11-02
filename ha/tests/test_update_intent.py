@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -637,3 +638,16 @@ def test_update_diagnostics_allowlist_accepts_and_rejects() -> None:
         {**good, "last_error": {"stage": "connect", "code": "10.0.0.5 refused", "attempts": 1}}
     )
     assert leaky is not None and leaky["last_error"] is None
+
+
+def test_interrupted_repair_copy_and_unrecorded_update_block() -> None:
+    """The Repair says no agent code changed; the attribute block is not recorded."""
+    from custom_components.brilliant_mqtt.update import AgentUpdate
+
+    root = Path(__file__).resolve().parents[2] / "custom_components/brilliant_mqtt"
+    for name in ("strings.json", "translations/en.json"):
+        flow = json.loads((root / name).read_text())["issues"]["interrupted_update"]["fix_flow"]
+        description = flow["step"]["init"]["description"]
+        assert "no agent code was changed" in description
+        assert "nothing was changed on the panel" not in description
+    assert "update" in AgentUpdate._unrecorded_attributes

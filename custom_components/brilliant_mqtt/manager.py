@@ -2085,7 +2085,7 @@ class PanelManager:
                     raise _UpdateFailed(
                         "admission",
                         "admission_connection_lost",
-                        _after_attempts(_ADMISSION_LOST_SUMMARY, budget.attempts),
+                        _ADMISSION_LOST_SUMMARY,
                     )
                 if current != target:
                     raise _UpdateFailed(
@@ -2099,7 +2099,7 @@ class PanelManager:
                     raise _UpdateFailed(
                         "admission",
                         "admission_connection_lost",
-                        _after_attempts(_ADMISSION_LOST_SUMMARY, budget.attempts),
+                        _ADMISSION_LOST_SUMMARY,
                     )
                 await self._async_update_backoff(budget, "admission", "connection_lost")
             except _PanelConnectFailed as failed:
@@ -2217,7 +2217,7 @@ class PanelManager:
                     raise _UpdateFailed(
                         stage,
                         "admission_connection_lost",
-                        _after_attempts(_ADMISSION_LOST_SUMMARY, budget.attempts),
+                        _ADMISSION_LOST_SUMMARY,
                     ) from None
                 if stage == "baseline" and lost:
                     if await self.async_journal_owns_panel():

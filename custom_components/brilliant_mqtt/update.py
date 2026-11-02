@@ -49,6 +49,9 @@ class AgentUpdate(BrilliantPanelEntity, UpdateEntity):
     _attr_supported_features = UpdateEntityFeature.INSTALL | UpdateEntityFeature.PROGRESS
     _attr_translation_key = "bridge"
     _attr_title = "brilliant-mqtt agent"
+    # The allowlisted update block changes on every retry/progress write; keep it out
+    # of the recorder (HA's per-entity _unrecorded_attributes mechanism).
+    _unrecorded_attributes = frozenset({"update"})
 
     def __init__(self, manager: PanelManager, latest: str) -> None:
         super().__init__(manager)

@@ -909,7 +909,7 @@ async def test_lost_admission_with_a_journal_present_is_not_resumed(
         await manager.async_update_agent()
 
     assert shells.connects == [1]
-    assert raised.value.translation_placeholders == {"error": f"{_ADMISSION_LOST} after 1 attempt"}
+    assert raised.value.translation_placeholders == {"error": _ADMISSION_LOST}
 
 
 @pytest.mark.parametrize(
