@@ -46,6 +46,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A failed add or update no longer strands its rollback baseline. When anything
+  fails after the baseline is captured and verified but before the provisioning
+  journal exists (a failed verification, an unusable stored snapshot or staged
+  release, a journal write failure, or a cancellation), the integration now
+  removes that unjournaled `.rollback/<id>/` archive and its release pin itself,
+  bounded to 2 minutes and under the fleet lock, and reports the original
+  error. Previously the leftover baseline blocked the next release_link capture
+  and `brilliant_mqtt.uninstall` until it was removed by hand. A baseline that a
+  retained record or the active journal names is never removed (an unreadable
+  journal counts as an owner). If the session was lost, or the removal failed or
+  timed out, nothing reconnects and the error is `baseline_capture_interrupted`;
+  the manual steps in docs/canary-rollback.md now apply only then.
+
 - A bridge that recovers its local bus but cannot record that success in the
   phase marker no longer leaves a stale failed-attempt record behind. If
   atomic replacement, in-place rewrite and unlink all fail, the bridge empties

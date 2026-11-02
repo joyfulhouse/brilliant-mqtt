@@ -247,6 +247,11 @@ Connects and resumed admissions share one budget: 5 attempts within 2 minutes.
   nothing by hand. Otherwise it reports `baseline_capture_interrupted`: a
   completed capture may remain on the panel; follow
   [Interrupted baseline capture](canary-rollback.md#interrupted-baseline-capture).
+  Any other failure between baseline capture and the journal (verification, a
+  journal write, a cancellation) removes the unjournaled baseline automatically
+  and reports the original error; `baseline_capture_interrupted` then appears
+  only if that removal failed, timed out, or could not prove the baseline is
+  unowned.
   The recovery wording also appears when a journal or retained record matched
   this panel only by host (for example a DHCP address reused by another panel).
   If diagnostics show no journal and no retained record that actually names this

@@ -95,7 +95,7 @@ while obtaining redacted diagnostics and the HA repair/log code.
 | Code/state | Operator action |
 | --- | --- |
 | `baseline_capture_failed`, `baseline_verify_failed` | Candidate mutation is refused. Preserve the incumbent; investigate missing/drifting code, permissions, free space, or capture bounds before retrying. |
-| `baseline_capture_interrupted` | A rollback baseline that no HA journal owns may remain on the panel: an update lost its session during capture, or a failed capture could not remove its just-published baseline. Nothing is resumed and `canary_finalize` cannot settle it; while it remains, uninstall and repair/component code writes refuse with `baseline_retained_finalize_first`. Follow [Interrupted baseline capture](#interrupted-baseline-capture). |
+| `baseline_capture_interrupted` | A rollback baseline that no HA journal owns may remain on the panel: the session was lost during capture or before the journal existed, or the automatic removal of an unjournaled baseline failed, timed out, or could not prove that no record owns it. Nothing is resumed and `canary_finalize` cannot settle it; while it remains, uninstall and repair/component code writes refuse with `baseline_retained_finalize_first`. Follow [Interrupted baseline capture](#interrupted-baseline-capture). |
 | `transaction_in_progress` | Another operation holds the shared panel lock. Allow it to finish and retry. |
 | `provisioning_recovery_required` | Another panel's interrupted provisioning journal must be recovered first. Diagnostics name it (`provisioning.name`, `panel`, `phase`, `last_error`). Resolve that journal's own code below; for an onboarding that never created an HA panel, see [Interrupted onboarding without an HA panel owner](#interrupted-onboarding-without-an-ha-panel-owner). Operations stay serialized; nothing is skipped. |
 | `recovery_connection_failed` | Recovery could not reach the panel at the journal's recorded address. Bring the panel online. If its address or root password changed and it has no HA panel entry, settle it with Add Brilliant panel (below); otherwise repair the owning panel's address/credentials. |
@@ -212,13 +212,26 @@ state cannot be proven; preserve those records for investigation.
 ## Interrupted baseline capture
 
 `baseline_capture_interrupted` means a rollback baseline that no Home Assistant
-journal owns may remain on the panel. It arises in two ways:
+journal owns may remain on the panel.
 
-- an update lost its SSH session while the baseline was being captured, before
-  any journal existed (the capture may still have completed on the panel); or
-- a capture published its baseline, the re-check that follows failed (for
-  example `service_crash_looping`), and the automatic removal of that baseline
-  failed too.
+Normally there is nothing to do by hand. Whenever an add or update fails after
+its baseline was captured but before its journal exists (a failed verification,
+an unusable stored snapshot or staged release, a failed journal write, a
+refused incumbent health rehearsal, or a cancellation), the integration removes
+that baseline itself, bounded to 2 minutes, and reports the original failure.
+It never removes a baseline that a retained record or the active journal names,
+and it treats an unreadable journal as an owner.
+
+The manual steps below are only for when that automatic cleanup could not run.
+`baseline_capture_interrupted` arises when:
+
+- the SSH session was lost while the baseline was being captured or before the
+  journal existed (the capture may still have completed on the panel; the
+  integration never reconnects to clean up);
+- the automatic removal failed or timed out (a removal that hangs past 2 minutes
+  is terminated and its SSH session closed); or
+- the journal could not be read, so the integration could not prove that no
+  record owns the baseline.
 
 The baseline never authorised a change, but Home Assistant holds no record of
 it, so `canary_finalize` cannot settle it. While it remains,

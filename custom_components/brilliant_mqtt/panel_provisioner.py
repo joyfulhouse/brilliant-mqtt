@@ -50,6 +50,7 @@ from .panel_inspection import (
     PanelFacts,
 )
 from .panel_ops import (
+    CLEANUP_FINALIZE_SECONDS,
     MAX_MQTT_CA_BYTES,
     MAX_SNAPSHOT_FILE_BYTES,
     FileSnapshot,
@@ -779,6 +780,13 @@ class _InstallState:
     failure_stage: str = "provisioning"
 
 
+@dataclass(slots=True)
+class _BaselineGuard:
+    """Whether a Home Assistant record that could own the baseline was attempted."""
+
+    create_attempted: bool = False
+
+
 # How often a rollback reconnect backoff re-checks for an HA stop.
 _STOP_POLL_SECONDS = 0.5
 
@@ -1022,6 +1030,71 @@ class PanelProvisioner:
             self._lock.release()
 
     @asynccontextmanager
+    async def _unjournaled_baseline_guard(
+        self, shell: PanelShell, snapshot: PanelSnapshot, transaction_id: UUID
+    ) -> AsyncIterator[_BaselineGuard]:
+        """Retire a published baseline if this region fails before a record owns it.
+
+        Wraps the region after ``capture_baseline`` and before the journal exists,
+        under the fleet lock. On any failure (including cancellation) the baseline
+        is finalized, bounded, unless a retained record or the active journal names
+        this transaction once its creation was attempted. An unreadable journal
+        counts as owned. A cancellation always wins; otherwise the original error is
+        re-raised unchanged after a successful finalize. A lost session is never
+        reconnected: like a failed or timed-out finalize it raises
+        ``baseline_capture_interrupted`` (an unowned baseline may remain).
+        """
+        guard = _BaselineGuard()
+        try:
+            yield guard
+        except (Exception, asyncio.CancelledError) as error:
+            await self._async_retire_unjournaled(shell, snapshot, transaction_id, guard, error)
+            raise
+
+    async def _async_retire_unjournaled(
+        self,
+        shell: PanelShell,
+        snapshot: PanelSnapshot,
+        transaction_id: UUID,
+        guard: _BaselineGuard,
+        error: BaseException,
+    ) -> None:
+        """Return to re-raise *error*; raise to replace it (see the guard)."""
+        cancellation = error if isinstance(error, asyncio.CancelledError) else None
+        # Its own code already says the session was lost and a baseline may remain.
+        keeps_code = (
+            isinstance(error, PanelProvisioningError)
+            and error.code == "incumbent_rehearsal_interrupted"
+        )
+        unowned_cleanup_possible = not shell.transport_lost()
+        if guard.create_attempted:
+            ownership = await settle(self._async_baseline_owned(transaction_id))
+            cancellation = cancellation or ownership.cancellation
+            if ownership.error is None and ownership.result is True:
+                if cancellation is not None:
+                    raise cancellation from None
+                return  # a durable record owns the baseline; its recovery settles it
+            unowned_cleanup_possible = unowned_cleanup_possible and ownership.error is None
+        finalized = False
+        if unowned_cleanup_possible:
+            outcome = await settle(
+                self._operations.finalize_baseline(shell, snapshot),
+                bound_seconds=CLEANUP_FINALIZE_SECONDS,
+            )
+            cancellation = cancellation or outcome.cancellation
+            finalized = outcome.error is None
+        if cancellation is not None:
+            raise cancellation from None
+        if not finalized and not keeps_code:
+            raise PanelProvisioningError("baseline_capture_interrupted") from None
+
+    async def _async_baseline_owned(self, transaction_id: UUID) -> bool:
+        if await self._journal.async_retained(transaction_id) is not None:
+            return True
+        current = await self._journal.async_load()
+        return current is not None and current.transaction_id == transaction_id
+
+    @asynccontextmanager
     async def async_managed_update(
         self,
         shell: PanelShell,
@@ -1056,27 +1129,29 @@ class PanelProvisioner:
         snapshot = await self._operations.capture_baseline(shell, snapshot)
         if snapshot.baseline is None:
             raise PanelProvisioningError("baseline_incomplete")
-        await self._operations.verify_baseline(shell, snapshot)
         transaction = uuid4()
-        request = replace(
-            request,
-            selected_components=self._staged_release_factory(
-                version, transaction, request.selected_components
-            ).selected_components,
-        )
-        record = ProvisioningRecord(
-            transaction,
-            ProvisioningOperation.UPDATE,
-            ProvisioningPhase.STAGED,
-            uuid4(),
-            request,
-            fleet,
-            version,
-            self._snapshot_to_stored(snapshot),
-            self._clock(),
-            None,
-        )
-        await self._journal.async_create(record)
+        async with self._unjournaled_baseline_guard(shell, snapshot, transaction) as guard:
+            await self._operations.verify_baseline(shell, snapshot)
+            request = replace(
+                request,
+                selected_components=self._staged_release_factory(
+                    version, transaction, request.selected_components
+                ).selected_components,
+            )
+            record = ProvisioningRecord(
+                transaction,
+                ProvisioningOperation.UPDATE,
+                ProvisioningPhase.STAGED,
+                uuid4(),
+                request,
+                fleet,
+                version,
+                self._snapshot_to_stored(snapshot),
+                self._clock(),
+                None,
+            )
+            guard.create_attempted = True
+            await self._journal.async_create(record)
         record = await self._journal.async_transition(
             transaction, ProvisioningPhase.ACTIVATION_PENDING
         )
@@ -1250,8 +1325,32 @@ class PanelProvisioner:
         state.snapshot = await self._operations.capture_baseline(state.shell, state.snapshot)
         if state.snapshot.baseline is None:
             raise PanelProvisioningError("snapshot_failed")
-        await self._operations.verify_baseline(state.shell, state.snapshot)
-        state.stored_snapshot = self._snapshot_to_stored(state.snapshot)
+        async with self._unjournaled_baseline_guard(
+            state.shell, state.snapshot, state.transaction_id
+        ) as guard:
+            await self._async_prepare_journal(
+                request, fleet, state, identity, bundle, state.snapshot, guard
+            )
+        return await self._async_install_journaled(
+            request, fleet, progress, state, identity, facts, bundle
+        )
+
+    async def _async_prepare_journal(
+        self,
+        request: PanelInstallRequest,
+        fleet: FleetConfig,
+        state: _InstallState,
+        identity: HostIdentity,
+        bundle: PanelReleaseBundle,
+        snapshot: PanelSnapshot,
+        guard: _BaselineGuard,
+    ) -> None:
+        """Verify the baseline and create the journal that owns it (install path)."""
+        assert state.shell is not None
+        assert state.transaction_id is not None
+        assert state.setup_id is not None
+        await self._operations.verify_baseline(state.shell, snapshot)
+        state.stored_snapshot = self._snapshot_to_stored(snapshot)
         if not isinstance(state.stored_snapshot, StoredPanelSnapshot):
             raise PanelProvisioningError("snapshot_failed")
 
@@ -1299,6 +1398,7 @@ class PanelProvisioner:
             started_at=self._clock(),
             last_error=None,
         )
+        guard.create_attempted = True
         create_outcome = await settle(self._journal.async_create(record))
         if create_outcome.error is not None:
             if create_outcome.cancellation is not None:
@@ -1308,6 +1408,20 @@ class PanelProvisioner:
         if create_outcome.cancellation is not None:
             raise create_outcome.cancellation from None
 
+    async def _async_install_journaled(
+        self,
+        request: PanelInstallRequest,
+        fleet: FleetConfig,
+        progress: ProgressReporter,
+        state: _InstallState,
+        identity: HostIdentity,
+        facts: PanelFacts,
+        bundle: PanelReleaseBundle,
+    ) -> ProvisionedPanel:
+        assert state.shell is not None
+        assert state.transaction_id is not None
+        assert state.setup_id is not None
+        assert state.staged is not None
         state.failure_code = "progress_failed"
         state.failure_stage = "progress"
         await _report(
