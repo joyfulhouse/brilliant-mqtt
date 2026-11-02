@@ -13,6 +13,11 @@ from tests.fakes import FakeShell
 
 _DOC = Path(__file__).resolve().parents[2] / "docs" / "TROUBLESHOOTING.md"
 _IDENTIFIER = "0123456789abcdef0123456789abcdef"
+_GUARD_TEST = "if ls /var/brilliant-mqtt/.rollback/*/complete.json >/dev/null 2>&1; then"
+# Step 2 repeats step 1's guard as its only extra line, so pasting it alone is safe.
+_STEP_TWO_GUARD = (
+    f'{_GUARD_TEST} echo "STOP: retained rollback baseline present; do not uninstall"; exit 1; fi'
+)
 
 
 def _block(marker: str) -> str:
@@ -43,7 +48,9 @@ async def test_documented_commands_equal_the_integration_commands_in_order() -> 
     await panel_ops.uninstall_bus_watchdog(shell)
     await panel_ops.uninstall(shell)
 
-    assert _uninstall_lines() == shell.commands
+    first, *rest = _uninstall_lines()
+    assert first == _STEP_TWO_GUARD
+    assert rest == shell.commands
     assert shell.commands.count("systemctl daemon-reload") == 3
 
 
@@ -56,6 +63,7 @@ def test_guard_comes_first_and_mutates_nothing() -> None:
     assert re.search(r"\brm\b", guard) is None
     assert "systemctl" not in guard
     assert "exit 1" in guard
+    assert guard.splitlines()[0] == _GUARD_TEST
 
 
 def test_blocks_never_touch_the_firmware_tree() -> None:
@@ -109,6 +117,8 @@ async def test_guard_is_at_least_as_strict_as_the_integration(
     assert integration_refuses == refuses
     assert guard_refuses == refuses
     assert guard_refuses or not integration_refuses
+    step_two = await shell.run(_STEP_TWO_GUARD)
+    assert (step_two.exit_status != 0) == refuses
     if guard_refuses:
         assert result.stdout.startswith("STOP:")
         assert result.exit_status == 1

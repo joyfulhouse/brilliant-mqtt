@@ -439,10 +439,12 @@ echo "OK: no retained rollback baseline"
 <!-- manual-agent-uninstall-guard:end -->
 
 **Step 2: remove the watchdogs, then the bridge.** Run this only after step 1
-printed `OK`:
+printed `OK`. Its first line repeats the step 1 check, so it stops (and ends
+the session) instead of deleting a retained baseline:
 
 <!-- manual-agent-uninstall:start -->
 ```bash
+if ls /var/brilliant-mqtt/.rollback/*/complete.json >/dev/null 2>&1; then echo "STOP: retained rollback baseline present; do not uninstall"; exit 1; fi
 systemctl disable --now brilliant-wifi-watchdog 2>/dev/null || true
 rm -f /etc/systemd/system/brilliant-wifi-watchdog.service
 rm -rf /var/brilliant-mqtt/wifi_watchdog /var/brilliant-mqtt/wifi_watchdog.staging
