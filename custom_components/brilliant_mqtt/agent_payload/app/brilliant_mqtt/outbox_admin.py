@@ -14,9 +14,10 @@ the paths match the bridge configuration::
 removes the record from the outbox (an event takes its dependent command
 results with it). Both require the exact payload SHA-256 printed by ``list``,
 refuse while the agent is running, and are recorded in an append-only,
-size-capped audit log next to the state file. A discard is refused unless its
-audit entry is durably written first. Payload contents are never printed or
-logged.
+size-capped audit log next to the state file (three rotated generations).
+Each is refused unless its audit entry is durably written first, as one
+whole line. ``list`` is read-only and not audited. Payload contents are never
+printed or logged.
 """
 
 from __future__ import annotations
@@ -49,6 +50,7 @@ from brilliant_mqtt.outbox_quarantine import (
 from brilliant_mqtt.scene_state import SceneState, atomic_write_state, load_state
 
 AUDIT_LOG_LIMIT_BYTES = 256 * 1024
+AUDIT_LOG_GENERATIONS = 3
 AGENT_UNIT = "brilliant-mqtt"
 
 
@@ -181,19 +183,27 @@ def _status(record: str, sha256: str, quarantine: QuarantineState) -> tuple[str,
 
 
 def append_audit(path: Path, entry: Mapping[str, object]) -> None:
-    """Durably append one JSON line; rotate once to ``.1`` at the size cap."""
+    """Durably append one JSON line as a single write; rotate at the size cap.
+
+    The live log rotates through ``.1`` .. ``.{AUDIT_LOG_GENERATIONS}``; the
+    oldest generation is dropped. A short write raises OSError instead of
+    completing the line with a second write, so callers refuse the action.
+    """
     line = (encode_json(entry) + "\n").encode("utf-8")
     try:
         size = path.stat().st_size
     except FileNotFoundError:
         size = 0
     if size and size + len(line) > AUDIT_LOG_LIMIT_BYTES:
+        for generation in range(AUDIT_LOG_GENERATIONS - 1, 0, -1):
+            older = path.with_name(f"{path.name}.{generation}")
+            if older.exists():
+                os.replace(older, path.with_name(f"{path.name}.{generation + 1}"))
         os.replace(path, path.with_name(f"{path.name}.1"))
     descriptor = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
     try:
-        written = 0
-        while written < len(line):
-            written += os.write(descriptor, line[written:])
+        if os.write(descriptor, line) != len(line):
+            raise OSError("short audit log write")
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
@@ -277,7 +287,6 @@ class _Admin:
                 f"{status}\t{failures}",
                 file=self._out,
             )
-        self._audit_best_effort(self._entry("list", records=len(records)))
 
     def release(self, record: str, sha256: str) -> None:
         state, quarantine, record_type, payload = self._target(record, sha256)
@@ -296,7 +305,15 @@ class _Admin:
             )
         )
         released = retain_live(clear_record(quarantine, record), _live(_undelivered(state)))
-        write_sidecar(self._sidecar, released)
+        try:
+            write_sidecar(self._sidecar, released)
+        except OSError as error:
+            self._audit_best_effort(self._entry("release_done", key=record, outcome="failed"))
+            raise AdminRefusal(
+                f"could not write the quarantine sidecar ({type(error).__name__}); "
+                f"{record} is still quarantined"
+            ) from None
+        self._audit_best_effort(self._entry("release_done", key=record, outcome="ok"))
         print(f"released {record}", file=self._out)
 
     def discard(self, record: str, sha256: str) -> None:
@@ -337,7 +354,15 @@ class _Admin:
             events=tuple(sorted(events.items())),
             results=tuple((key, results[key]) for key, _ in state.results if key in results),
         )
-        atomic_write_state(self._state_path, discarded)
+        try:
+            atomic_write_state(self._state_path, discarded)
+        except OSError as error:
+            self._audit_best_effort(
+                self._entry("discard_done", key=record, dependents=dependents, outcome="failed")
+            )
+            raise AdminRefusal(
+                f"could not write the outbox state ({type(error).__name__}); nothing discarded"
+            ) from None
         cleaned = clear_record(quarantine, record)
         for dependent in dependents:
             cleaned = clear_record(cleaned, dependent)
@@ -346,7 +371,9 @@ class _Admin:
         except OSError:
             # The record is gone; stale evidence for a missing record is ignored.
             print("warning: quarantine sidecar not updated", file=sys.stderr)
-        self._audit_best_effort(self._entry("discard_done", key=record, dependents=dependents))
+        self._audit_best_effort(
+            self._entry("discard_done", key=record, dependents=dependents, outcome="ok")
+        )
         suffix = f" and {len(dependents)} dependent result(s)" if dependents else ""
         print(f"discarded {record}{suffix}", file=self._out)
 

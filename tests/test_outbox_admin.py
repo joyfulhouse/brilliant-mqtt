@@ -6,6 +6,7 @@ import asyncio
 import fcntl
 import io
 import json
+import os
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
@@ -140,7 +141,8 @@ async def test_list_shows_key_kind_size_hash_and_status_without_payloads(
     assert rows[_RESULT_KEY][1] == "result"
     assert rows[_RESULT_KEY][4] == "pending"
     assert event_payload not in output
-    assert _audit(harness)[-1]["action"] == "list"
+    # list is read-only and is not audited.
+    assert not outbox_admin.audit_log_path(harness.path).exists()
 
 
 async def test_hash_mismatch_is_refused_without_change(tmp_path: Path) -> None:
@@ -260,11 +262,13 @@ async def test_release_clears_quarantine_and_the_outbox_resumes_in_order(
     assert status == 0
     assert output == f"released {event_key}\n"
     assert harness.quarantine() == oq.QuarantineState()
-    entry = _audit(harness)[-1]
-    assert entry["action"] == "release"
+    entries = _audit(harness)
+    assert [item["action"] for item in entries] == ["release", "release_done"]
+    entry = entries[0]
     assert entry["key"] == event_key
     assert entry["payload_sha256"] == event_sha
     assert entry["failure_count"] == 3
+    assert entries[1]["outcome"] == "ok"
     # Released records are retried: the event, then its gated result.
     bridge, _, mqtt = await harness.session("accept")
     await _until(lambda: bool(_published(mqtt, scene_result_topic(_COMMAND_ID))), "result")
@@ -329,16 +333,75 @@ def test_audit_log_is_append_only_and_size_capped(
 ) -> None:
     monkeypatch.setattr(outbox_admin, "AUDIT_LOG_LIMIT_BYTES", 200)
     path = tmp_path / "audit.log"
-    for index in range(10):
-        outbox_admin.append_audit(path, {"action": "list", "index": index})
-    rotated = path.with_name("audit.log.1")
-    assert path.stat().st_size <= 200
-    assert rotated.stat().st_size <= 200
-    lines = [json.loads(line) for line in rotated.read_text().splitlines()]
-    lines += [json.loads(line) for line in path.read_text().splitlines()]
+    for index in range(40):
+        outbox_admin.append_audit(path, {"action": "release", "index": index})
+    generations = [path.with_name(f"audit.log.{n}") for n in (3, 2, 1)] + [path]
+    assert not path.with_name("audit.log.4").exists()
+    lines: list[dict[str, object]] = []
+    for generation in generations:
+        assert generation.stat().st_size <= 200
+        lines += [json.loads(line) for line in generation.read_text().splitlines()]
     indexes = [line["index"] for line in lines]
-    assert indexes == sorted(indexes) and indexes[-1] == 9
+    # Three rotated generations plus the live log, contiguous and in order.
+    assert indexes == list(range(indexes[0], 40))
+    assert indexes[0] > 0
     assert oct(path.stat().st_mode & 0o777) == "0o600"
+
+
+def test_audit_line_is_one_write_and_a_short_write_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "audit.log"
+    writes: list[int] = []
+    real_write = os.write
+
+    def counting_write(descriptor: int, data: bytes) -> int:
+        writes.append(len(data))
+        return real_write(descriptor, data)
+
+    monkeypatch.setattr(outbox_admin.os, "write", counting_write)
+    outbox_admin.append_audit(path, {"action": "release", "key": "k"})
+    assert len(writes) == 1 and writes[0] == len(path.read_bytes())
+
+    def short_write(descriptor: int, data: bytes) -> int:
+        return real_write(descriptor, data[:3])
+
+    monkeypatch.setattr(outbox_admin.os, "write", short_write)
+    with pytest.raises(OSError):
+        outbox_admin.append_audit(path, {"action": "discard", "key": "k"})
+
+
+async def test_release_is_refused_when_the_audit_write_fails(tmp_path: Path) -> None:
+    harness = await _quarantined_with_dependent(tmp_path)
+    event_key, event_sha = _event_key(harness)
+    outbox_admin.audit_log_path(harness.path).mkdir()
+    sidecar_before = harness.sidecar.read_bytes()
+
+    status, _ = _run(harness, tmp_path, "release", event_key, event_sha)
+
+    assert status == 1
+    assert harness.sidecar.read_bytes() == sidecar_before
+
+
+async def test_release_sidecar_write_failure_is_reported_cleanly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    harness = await _quarantined_with_dependent(tmp_path)
+    event_key, event_sha = _event_key(harness)
+
+    def failing_write(path: Path, state: oq.QuarantineState) -> None:
+        raise OSError("read-only filesystem")
+
+    monkeypatch.setattr(outbox_admin, "write_sidecar", failing_write)
+
+    status, _ = _run(harness, tmp_path, "release", event_key, event_sha)
+
+    assert status == 1
+    assert "Traceback" not in capsys.readouterr().err
+    entries = _audit(harness)
+    assert [item["action"] for item in entries] == ["release", "release_done"]
+    assert entries[1]["outcome"] == "failed"
+    assert harness.suspect() is not None
 
 
 def test_incomplete_environment_is_an_error(tmp_path: Path) -> None:

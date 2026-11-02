@@ -202,9 +202,13 @@ The on-panel CLI is `python3 -m brilliant_mqtt.outbox_admin`. Usage is in
 - `discard <key> <sha256>` removes a quarantined record. Discarding an event
   also discards the command results that depend on it.
 - The hash must match the current payload.
-- Every action is appended to `<state file>.outbox-audit.log`, rotated once to
-  `.1` at 256 KiB. `release` and `discard` are refused if their audit entry
-  cannot be written first.
+- Every `release` and `discard` is appended to `<state file>.outbox-audit.log`
+  as one whole JSON line written in a single write. The log rotates at 256 KiB
+  and keeps three older generations (`.1` to `.3`). Either action is refused if
+  its audit entry cannot be written first, and its outcome is recorded
+  afterwards as `release_done` or `discard_done`. A failed sidecar or state
+  write is reported as an error, not a traceback. `list` is read-only and is
+  not audited.
 
 ## Rejected approaches
 
