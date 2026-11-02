@@ -77,13 +77,30 @@ def systemctl_is_active(unit: str) -> str:
     return completed.stdout
 
 
+_AGENT_MODULES = frozenset({"brilliant_mqtt", "brilliant_mqtt.__main__"})
+
+
 def _runs_agent(argv: Sequence[str]) -> bool:
-    """True when *argv* runs the agent module itself (``-m brilliant_mqtt``)."""
+    """True when *argv* runs the agent module itself (``-m brilliant_mqtt``).
+
+    Every ``-m`` is considered, including short-flag bundles ending in ``m``
+    (``-Om brilliant_mqtt``) and the attached form (``-mbrilliant_mqtt``). A
+    false positive only refuses, which is the safe direction.
+    """
     for index, argument in enumerate(argv):
-        if argument == "-mbrilliant_mqtt":
+        if not argument.startswith("-") or argument.startswith("--"):
+            continue
+        flags = argument[1:]
+        position = flags.find("m")
+        if position < 0:
+            continue
+        attached = flags[position + 1 :]
+        if attached:
+            module: str | None = attached
+        else:
+            module = argv[index + 1] if index + 1 < len(argv) else None
+        if module in _AGENT_MODULES:
             return True
-        if argument == "-m" and index + 1 < len(argv):
-            return argv[index + 1] == "brilliant_mqtt"
     return False
 
 
@@ -92,7 +109,8 @@ def _agent_pids(proc_root: Path, own_pid: int) -> list[int]:
     try:
         entries = list(proc_root.iterdir())
     except OSError:
-        return pids
+        # Fail closed: an unscannable /proc cannot rule out a running agent.
+        raise AdminRefusal("cannot scan /proc to rule out a running agent") from None
     for entry in entries:
         if not entry.name.isdecimal() or int(entry.name) == own_pid:
             continue
@@ -111,7 +129,10 @@ def _phase_lease_held(phase_file: str) -> bool:
     if not phase_file:
         return False
     try:
-        descriptor = os.open(phase_file, os.O_RDONLY)
+        # Non-blocking and no symlink follow: a FIFO or symlink planted at the
+        # marker path can neither hang nor redirect this probe. Open errors are
+        # simply "no lease evidence"; systemd and /proc still govern.
+        descriptor = os.open(phase_file, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
     except OSError:
         return False
     try:
@@ -197,18 +218,33 @@ def append_audit(path: Path, entry: Mapping[str, object]) -> None:
     except FileNotFoundError:
         size = 0
     if size and size + len(line) > AUDIT_LOG_LIMIT_BYTES:
-        for generation in range(AUDIT_LOG_GENERATIONS - 1, 0, -1):
-            older = path.with_name(f"{path.name}.{generation}")
-            if older.exists():
-                os.replace(older, path.with_name(f"{path.name}.{generation + 1}"))
-        os.replace(path, path.with_name(f"{path.name}.1"))
+        _rotate(path)
     descriptor = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
     try:
+        before = os.fstat(descriptor).st_size
         if _os_write(descriptor, line) != len(line):
+            # Never leave a torn line: cut back to the pre-write size, refuse.
+            os.ftruncate(descriptor, before)
+            os.fsync(descriptor)
             raise OSError("short audit log write")
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _rotate(path: Path) -> None:
+    """Move the live log to ``.1``, shifting only as far as the first free slot.
+
+    Shifting stops at the lowest missing generation, so a retry after a
+    failure midway (for example after ``.1`` moved to ``.2``) fills that gap
+    instead of shifting again and dropping one more generation. Only when all
+    generations exist is the oldest one overwritten.
+    """
+    slots = [path.with_name(f"{path.name}.{n}") for n in range(1, AUDIT_LOG_GENERATIONS + 1)]
+    free = next((index for index, slot in enumerate(slots) if not slot.exists()), len(slots) - 1)
+    for index in range(free, 0, -1):
+        os.replace(slots[index - 1], slots[index])
+    os.replace(path, slots[0])
 
 
 class _Admin:

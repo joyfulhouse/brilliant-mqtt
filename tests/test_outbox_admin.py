@@ -367,9 +367,84 @@ def test_audit_line_is_one_write_and_a_short_write_refuses(
     def short_write(descriptor: int, data: bytes) -> int:
         return real_write(descriptor, data[:3])
 
+    before = path.read_bytes()
     monkeypatch.setattr(outbox_admin, "_os_write", short_write)
     with pytest.raises(OSError):
         outbox_admin.append_audit(path, {"action": "discard", "key": "k"})
+    # The torn partial line is truncated away; earlier lines are intact.
+    assert path.read_bytes() == before
+
+
+def test_rotation_retry_after_a_midway_failure_keeps_every_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(outbox_admin, "AUDIT_LOG_LIMIT_BYTES", 120)
+    path = tmp_path / "audit.log"
+    generations = {n: path.with_name(f"audit.log.{n}") for n in (1, 2, 3)}
+    for n, generation in generations.items():
+        generation.write_text(f'{{"generation":{n}}}\n')
+    path.write_text('{"generation":0}\n' + "x" * 110 + "\n")
+    live = path.read_bytes()
+    real_replace = os.replace
+    failed: list[bool] = []
+
+    def replace_failing_on_live(src: str | Path, dst: str | Path) -> None:
+        if Path(src) == path and not failed:
+            failed.append(True)
+            raise OSError("disk hiccup")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", replace_failing_on_live)
+    with pytest.raises(OSError):
+        outbox_admin.append_audit(path, {"action": "release", "index": 1})
+    # Failed after .2->.3 and .1->.2 shifted; .1 is now the free slot.
+    assert not generations[1].exists()
+    assert generations[2].read_text() == '{"generation":1}\n'
+    assert generations[3].read_text() == '{"generation":2}\n'
+
+    outbox_admin.append_audit(path, {"action": "release", "index": 2})
+
+    # The retry fills the gap instead of shifting (and dropping) again.
+    assert generations[1].read_bytes() == live
+    assert generations[2].read_text() == '{"generation":1}\n'
+    assert generations[3].read_text() == '{"generation":2}\n'
+    assert json.loads(path.read_text())["index"] == 2
+
+
+def test_unreadable_proc_refuses(tmp_path: Path) -> None:
+    with pytest.raises(outbox_admin.AdminRefusal, match="cannot scan /proc"):
+        outbox_admin.running_agent("", systemctl=_stopped, proc_root=tmp_path / "missing-proc")
+
+
+@pytest.mark.parametrize(
+    ("argv", "matches"),
+    [
+        (["python3", "-m", "brilliant_mqtt"], True),
+        (["python3", "-mbrilliant_mqtt"], True),
+        (["python3", "-m", "brilliant_mqtt.__main__"], True),
+        (["python3", "-Om", "brilliant_mqtt"], True),
+        (["python3", "-Ombrilliant_mqtt"], True),
+        (["python3", "-u", "-Esm", "brilliant_mqtt"], True),
+        (["python3", "-m", "other", "-m", "brilliant_mqtt"], True),
+        (["python3", "-m", "brilliant_mqtt.outbox_admin", "list"], False),
+        (["python3", "-Om", "brilliant_mqtt.outbox_admin"], False),
+        (["python3", "-m", "brilliant_mqtt_tools"], False),
+        (["python3", "brilliant_mqtt"], False),
+        (["/usr/sbin/sshd", "-D"], False),
+    ],
+)
+def test_agent_argv_matching(argv: list[str], matches: bool) -> None:
+    assert outbox_admin._runs_agent(argv) is matches
+
+
+def test_fifo_marker_cannot_block_the_lease_probe(tmp_path: Path) -> None:
+    marker = tmp_path / "bus-phase"
+    os.mkfifo(marker)
+    proc_root = _proc(tmp_path)
+    assert outbox_admin.running_agent(str(marker), systemctl=_stopped, proc_root=proc_root) is None
+    link = tmp_path / "link"
+    link.symlink_to(marker)
+    assert outbox_admin.running_agent(str(link), systemctl=_stopped, proc_root=proc_root) is None
 
 
 async def test_release_is_refused_when_the_audit_write_fails(tmp_path: Path) -> None:
