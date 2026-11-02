@@ -1,0 +1,421 @@
+"""Interrupted agent updates: durable window record, restore and Repair menu (#219)."""
+
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+import pytest
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import issue_registry as ir
+from homeassistant.helpers.storage import Store
+
+from custom_components.brilliant_mqtt import update_state
+from custom_components.brilliant_mqtt.const import DOMAIN
+from custom_components.brilliant_mqtt.provisioning_journal import ProvisioningJournal
+from custom_components.brilliant_mqtt.update_intent import (
+    InterruptedUpdates,
+    UpdateIntent,
+    UpdateIntentStore,
+    UpdateTarget,
+    async_journal_concerns_panel,
+    compute_update_target,
+    pinned_fingerprint,
+    request_concerns_panel,
+)
+from tests.test_provisioning_journal import _FINGERPRINT, _PUBLIC_KEY, _record
+
+_TARGET = UpdateTarget("0.2.0", 1, "a" * 64, "b" * 64)
+_OTHER_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBsF8pQ8C3EWxF7bGrXWvqJXV1fbNHo6p5FC0gIjJbqv"
+
+
+def _intent(**changes: Any) -> UpdateIntent:
+    base = UpdateIntent(
+        panel="office",
+        target_version="0.2.0",
+        target_ordinal=1,
+        target_digest="a" * 64,
+        target_set_digest="b" * 64,
+        stage="connect",
+        attempts=1,
+        max_attempts=5,
+        started_at=datetime(2026, 10, 23, 12, 0, tzinfo=UTC),
+        deadline=datetime(2026, 10, 23, 12, 2, tzinfo=UTC),
+    )
+    return replace(base, **changes)
+
+
+@dataclass
+class _Panel:
+    """A minimal UpdatePanel: records retries and notifications."""
+
+    hass: HomeAssistant
+    panel: str = "office"
+    management_id: str = "mgmt-office"
+    target: UpdateTarget | None = _TARGET
+    journal_owns: bool = False
+    running: bool = False
+    updates: int = 0
+    notified: int = 0
+    gate: asyncio.Event | None = None
+    events: list[str] = field(default_factory=list)
+
+    @property
+    def interrupted_issue_id(self) -> str:
+        return f"interrupted_update_{self.management_id}"
+
+    @property
+    def update_running(self) -> bool:
+        return self.running
+
+    async def async_update_target(self) -> UpdateTarget | None:
+        return self.target
+
+    async def async_journal_owns_panel(self) -> bool:
+        return self.journal_owns
+
+    def notify_update_state(self) -> None:
+        self.notified += 1
+
+    async def async_update_agent(self) -> None:
+        self.running = True
+        self.updates += 1
+        try:
+            if self.gate is not None:
+                await self.gate.wait()
+        finally:
+            self.running = False
+
+
+def _issue(hass: HomeAssistant, panel: _Panel) -> ir.IssueEntry | None:
+    return ir.async_get(hass).async_get_issue(DOMAIN, panel.interrupted_issue_id)
+
+
+async def _surfaced(hass: HomeAssistant, panel: _Panel) -> InterruptedUpdates:
+    store = UpdateIntentStore(hass)
+    await store.async_set(panel.management_id, _intent())
+    interrupted = InterruptedUpdates(panel, store)
+    await interrupted.async_restore()
+    assert interrupted.surfaced is not None
+    return interrupted
+
+
+def test_intent_round_trips_and_rejects_anything_not_exact() -> None:
+    intent = _intent()
+    assert UpdateIntent.from_dict(intent.as_dict()) == intent
+    for broken in (
+        {**intent.as_dict(), "extra": 1},
+        {key: value for key, value in intent.as_dict().items() if key != "deadline"},
+        {**intent.as_dict(), "stage": "baseline"},
+        {**intent.as_dict(), "attempts": True},
+        {**intent.as_dict(), "started_at": "2026-10-23T12:00:00"},
+        {**intent.as_dict(), "target_digest": "A" * 64},
+        {**intent.as_dict(), "panel": "Office Panel"},
+        "not a mapping",
+    ):
+        assert UpdateIntent.from_dict(broken) is None
+
+
+async def test_compute_update_target_hashes_every_selected_component(payload_dir: Path) -> None:
+    bridge_only = await compute_update_target(str(payload_dir), ())
+    with_watchdog = await compute_update_target(str(payload_dir), ("wifi_watchdog",))
+
+    assert bridge_only is not None and with_watchdog is not None
+    assert bridge_only.version == "0.2.0"
+    assert bridge_only.ordinal == 1
+    assert (bridge_only.version, bridge_only.digest) == (
+        with_watchdog.version,
+        with_watchdog.digest,
+    )
+    assert bridge_only.set_digest != with_watchdog.set_digest
+    (payload_dir / "wifi_watchdog/brilliant_wifi_watchdog/run.py").write_text("# changed\n")
+    changed = await compute_update_target(str(payload_dir), ("wifi_watchdog",))
+    assert changed is not None and changed.set_digest != with_watchdog.set_digest
+    assert await compute_update_target(str(payload_dir / "missing"), ()) is None
+
+
+def test_request_concern_matches_identity_slug_or_host_and_fails_closed() -> None:
+    request = _record().panel_request
+    assert pinned_fingerprint(_PUBLIC_KEY) == _FINGERPRINT
+    assert pinned_fingerprint("not a key") is None
+    assert pinned_fingerprint(None) is None
+
+    def concerns(**changes: object) -> bool:
+        values: dict[str, object] = {
+            "slug": "kitchen",
+            "host": "kitchen.iot.example",
+            "pinned_key": _OTHER_KEY,
+        }
+        values.update(changes)
+        return request_concerns_panel(
+            request,
+            slug=str(values["slug"]),
+            host=str(values["host"]),
+            pinned_key=values["pinned_key"],
+        )
+
+    assert concerns() is False
+    assert concerns(pinned_key=_PUBLIC_KEY) is True
+    assert concerns(slug="office") is True
+    assert concerns(host="office.iot.example") is True
+    assert concerns(pinned_key="garbage") is True
+    assert concerns(pinned_key=None) is True
+
+
+async def test_journal_concern_checks_active_journal_retained_and_unreadable(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert (
+        await async_journal_concerns_panel(hass, slug="office", host="h", pinned_key=_OTHER_KEY)
+        is False
+    )
+
+    async def load_record(_self: ProvisioningJournal) -> object:
+        return _record()
+
+    monkeypatch.setattr(ProvisioningJournal, "async_load", load_record)
+    assert (
+        await async_journal_concerns_panel(hass, slug="office", host="h", pinned_key=_OTHER_KEY)
+        is True
+    )
+    assert (
+        await async_journal_concerns_panel(hass, slug="kitchen", host="h", pinned_key=_OTHER_KEY)
+        is False
+    )
+
+    async def unreadable(_self: ProvisioningJournal) -> object:
+        raise ValueError("journal_unreadable")
+
+    monkeypatch.setattr(ProvisioningJournal, "async_load", unreadable)
+    assert (
+        await async_journal_concerns_panel(hass, slug="kitchen", host="h", pinned_key=_OTHER_KEY)
+        is True
+    )
+
+
+async def test_store_saves_before_swapping_the_cache(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = UpdateIntentStore(hass)
+    await store.async_set("p", _intent())
+
+    async def failing_save(_self: Store[Any], _data: object) -> None:
+        raise RuntimeError("serialization failed")
+
+    monkeypatch.setattr(Store, "async_save", failing_save)
+    with pytest.raises(RuntimeError):
+        await store.async_set("p", _intent(attempts=3))
+    with pytest.raises(RuntimeError):
+        await store.async_clear("p")
+    assert await store.async_get("p") == _intent()
+
+
+async def test_store_survives_reload_and_forgets_cleared_records(hass: HomeAssistant) -> None:
+    await UpdateIntentStore(hass).async_set("p", _intent())
+    reloaded = UpdateIntentStore(hass)
+    assert await reloaded.async_get("p") == _intent()
+    await reloaded.async_clear("p")
+    assert await UpdateIntentStore(hass).async_get("p") is None
+
+
+async def test_window_save_failure_keeps_the_surfaced_record_and_issue(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    panel = _Panel(hass)
+    interrupted = await _surfaced(hass, panel)
+
+    async def failing_save(_self: Store[Any], _data: object) -> None:
+        raise RuntimeError("serialization failed")
+
+    monkeypatch.setattr(Store, "async_save", failing_save)
+    with pytest.raises(RuntimeError):
+        await interrupted.async_begin_window("connect", 0, 5, datetime.now(UTC))
+    assert interrupted.surfaced is not None
+    assert _issue(hass, panel) is not None
+
+
+async def test_window_cancelled_before_save_keeps_the_old_record_and_issue(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    panel = _Panel(hass)
+    interrupted = await _surfaced(hass, panel)
+    entered = asyncio.Event()
+
+    async def hanging_save(_self: Store[Any], _data: object) -> None:
+        entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(Store, "async_save", hanging_save)
+    task = asyncio.create_task(interrupted.async_begin_window("connect", 0, 5, datetime.now(UTC)))
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert interrupted.surfaced == _intent()
+    assert _issue(hass, panel) is not None
+    monkeypatch.undo()
+    assert await interrupted._store.async_get(panel.management_id) == _intent()
+
+
+async def test_window_without_a_target_overwrites_nothing(hass: HomeAssistant) -> None:
+    panel = _Panel(hass)
+    interrupted = await _surfaced(hass, panel)
+    panel.target = None
+
+    assert await interrupted.async_begin_window("connect", 0, 5, datetime.now(UTC)) is False
+    assert await interrupted._store.async_get(panel.management_id) == _intent()
+    assert _issue(hass, panel) is not None
+
+
+async def test_window_lifecycle_replaces_then_clears(hass: HomeAssistant) -> None:
+    panel = _Panel(hass)
+    interrupted = await _surfaced(hass, panel)
+    deadline = datetime.now(UTC) + timedelta(minutes=2)
+
+    assert await interrupted.async_begin_window("admission", 2, 5, deadline) is True
+    stored = await interrupted._store.async_get(panel.management_id)
+    assert stored is not None and (stored.stage, stored.attempts) == ("admission", 2)
+    assert stored.target_set_digest == _TARGET.set_digest
+    assert interrupted.surfaced is None
+    assert _issue(hass, panel) is None
+
+    await interrupted.async_end_window()
+    assert await interrupted._store.async_get(panel.management_id) is None
+
+
+async def test_restore_surfaces_without_connecting_and_flags_expiry(hass: HomeAssistant) -> None:
+    panel = _Panel(hass)
+    interrupted = await _surfaced(hass, panel)
+
+    issue = _issue(hass, panel)
+    assert issue is not None and issue.is_fixable
+    assert issue.translation_key == "interrupted_update"
+    diagnostics = interrupted.diagnostics()
+    assert diagnostics is not None and diagnostics["expired"] is True
+    assert update_state.safe_interrupted(diagnostics) == diagnostics
+    future = _intent(deadline=datetime.now(UTC) + timedelta(hours=1))
+    interrupted.surfaced = future
+    refreshed = interrupted.diagnostics()
+    assert refreshed is not None and refreshed["expired"] is False
+    assert panel.updates == 0
+
+
+async def test_restore_lets_a_journal_win(hass: HomeAssistant) -> None:
+    panel = _Panel(hass, journal_owns=True)
+    store = UpdateIntentStore(hass)
+    await store.async_set(panel.management_id, _intent())
+    interrupted = InterruptedUpdates(panel, store)
+
+    await interrupted.async_restore()
+
+    assert interrupted.surfaced is None
+    assert _issue(hass, panel) is None
+    assert await store.async_get(panel.management_id) is None
+
+
+async def test_restore_never_fails_setup(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    panel = _Panel(hass)
+    store = UpdateIntentStore(hass)
+
+    async def broken(_self: UpdateIntentStore, _key: str) -> None:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(UpdateIntentStore, "async_get", broken)
+    await InterruptedUpdates(panel, store).async_restore()
+    assert _issue(hass, panel) is None
+
+
+async def test_retry_starts_one_fresh_update_and_refuses_a_second(hass: HomeAssistant) -> None:
+    panel = _Panel(hass, gate=asyncio.Event())
+    interrupted = await _surfaced(hass, panel)
+
+    assert await interrupted.async_retry() is None
+    assert panel.running is True  # eager start: running before any await
+    assert await interrupted.async_retry() == "already_in_progress"
+    assert interrupted.surfaced is not None
+    assert _issue(hass, panel) is not None
+    assert panel.gate is not None
+    panel.gate.set()
+    await hass.async_block_till_done()
+    assert panel.updates == 1
+
+
+@pytest.mark.parametrize(
+    "target",
+    [None, replace(_TARGET, digest="c" * 64), replace(_TARGET, set_digest="d" * 64)],
+)
+async def test_retry_refuses_a_changed_target(
+    hass: HomeAssistant, target: UpdateTarget | None
+) -> None:
+    panel = _Panel(hass)
+    interrupted = await _surfaced(hass, panel)
+    panel.target = target
+
+    assert await interrupted.async_retry() == "interrupted_update_target_changed"
+    assert panel.updates == 0
+
+
+async def test_retry_defers_to_journal_recovery_and_drops_the_record(
+    hass: HomeAssistant,
+) -> None:
+    panel = _Panel(hass)
+    interrupted = await _surfaced(hass, panel)
+    panel.journal_owns = True
+
+    assert await interrupted.async_retry() == "interrupted_update_recovery_owned"
+    assert panel.updates == 0
+    assert interrupted.surfaced is None
+    assert await interrupted._store.async_get(panel.management_id) is None
+
+
+async def test_dismiss_clears_and_a_failed_clear_raises(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    panel = _Panel(hass)
+    interrupted = await _surfaced(hass, panel)
+
+    async def failing_save(_self: Store[Any], _data: object) -> None:
+        raise RuntimeError("serialization failed")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(Store, "async_save", failing_save)
+        with pytest.raises(RuntimeError):
+            await interrupted.async_dismiss()
+    assert interrupted.surfaced is not None
+    await interrupted.async_dismiss()
+    assert interrupted.surfaced is None
+    assert await interrupted._store.async_get(panel.management_id) is None
+
+
+def test_retry_state_and_last_error_allowlists() -> None:
+    state: dict[str, object] = {
+        "stage": "connect",
+        "attempt": 1,
+        "max_attempts": 5,
+        "reason": "host_unreachable",
+        "retry_in_seconds": 5.0,
+        "next_attempt_at": "2026-10-23T12:00:05+00:00",
+    }
+    assert update_state.safe_retry_state(state) == state
+    assert update_state.safe_retry_state({**state, "retry_in_seconds": None}) is not None
+    for broken in (
+        {**state, "stage": "baseline"},
+        {**state, "reason": "No route to host 10.0.0.5"},
+        {**state, "attempt": True},
+        {**state, "attempt": 6},
+        {**state, "next_attempt_at": "2026-10-23T12:00:05"},
+        {**state, "retry_in_seconds": "5"},
+        {key: value for key, value in state.items() if key != "next_attempt_at"},
+        {**state, "extra": 1},
+    ):
+        assert update_state.safe_retry_state(broken) is None
+    error = {"stage": "admission", "code": "admission_connection_lost", "attempts": 2}
+    assert update_state.safe_last_error(error) == error
+    assert update_state.safe_last_error({**error, "code": "free text"}) is None
+    assert update_state.safe_last_error({**error, "stage": "elsewhere"}) is None
+    assert update_state.safe_last_error({**error, "attempts": -1}) is None
