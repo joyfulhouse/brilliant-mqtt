@@ -2847,6 +2847,207 @@ async def test_snapshot_panel_redacts_non_symlink_or_probe_failure() -> None:
     assert all("SECRET" not in str(error) for error in graph)
 
 
+_CRASH_LOOP_SAMPLES = ["activating|auto-restart|4", "active|running|5"]
+
+
+@pytest.mark.parametrize(
+    ("layout", "target"),
+    [("release_link", _PRIOR_RELEASE), ("legacy_fixed", None)],
+)
+@pytest.mark.parametrize("component", _CORE_COMPONENTS)
+async def test_snapshot_panel_refuses_crash_looping_unit_before_any_file_probe(
+    layout: str, target: str | None, component: str
+) -> None:
+    shell = await _connected(
+        FakeShell(
+            responses=_snapshot_responses(
+                layout=layout, target=target, samples={component: _CRASH_LOOP_SAMPLES}
+            )
+        )
+    )
+
+    with pytest.raises(panel_ops.PanelOpError) as raised:
+        await panel_ops.snapshot_panel(shell)
+
+    assert str(raised.value) == "service_crash_looping"
+    assert shell.commands == [panel_ops.SNAPSHOT_LAYOUT_COMMAND]
+    assert shell.uploads == []
+
+
+async def test_snapshot_panel_refuses_restart_counter_crash_loop() -> None:
+    shell = await _connected(
+        FakeShell(
+            responses=_snapshot_responses(
+                samples={COMPONENT_BRIDGE: ["active|running|3", "active|running|5"]}
+            )
+        )
+    )
+
+    with pytest.raises(panel_ops.PanelOpError, match="^service_crash_looping$"):
+        await panel_ops.snapshot_panel(shell)
+
+
+async def test_snapshot_panel_crash_evidence_on_absent_layout_is_not_active() -> None:
+    shell = await _connected(
+        FakeShell(
+            responses=_snapshot_responses(
+                layout="absent",
+                target=None,
+                env=None,
+                version=None,
+                bridge_unit=None,
+                wifi_unit=None,
+                bus_unit=None,
+                bridge_state=(False, False),
+                wifi_state=(False, False),
+                bus_state=(False, False),
+                samples={COMPONENT_BRIDGE: _CRASH_LOOP_SAMPLES},
+            )
+        )
+    )
+
+    snapshot = await panel_ops.snapshot_panel(shell)
+
+    assert snapshot == _absent_snapshot()
+    assert snapshot.bridge_service.active is False
+
+
+async def test_snapshot_panel_maps_reloading_to_running() -> None:
+    shell = await _connected(
+        FakeShell(
+            responses=_snapshot_responses(
+                samples={COMPONENT_BRIDGE: ["active|running|0", "reloading|reload|0"]}
+            )
+        )
+    )
+
+    assert await panel_ops.snapshot_panel(shell) == _release_snapshot()
+
+
+@pytest.mark.parametrize("state", ["activating|start|0", "deactivating|stop|0", "unknown||0"])
+async def test_snapshot_panel_refuses_unsettled_final_state(state: str) -> None:
+    shell = await _connected(
+        FakeShell(
+            responses=_snapshot_responses(
+                samples={COMPONENT_WIFI_WATCHDOG: ["active|running|0", state]}
+            )
+        )
+    )
+
+    with pytest.raises(panel_ops.PanelOpError, match="^snapshot_probe_failed$"):
+        await panel_ops.snapshot_panel(shell)
+    assert shell.commands == [panel_ops.SNAPSHOT_LAYOUT_COMMAND]
+
+
+def _layout_payload(**changes: object) -> RunResult:
+    value: dict[str, object] = {
+        "active_release_target": _PRIOR_RELEASE,
+        "enabled": dict.fromkeys(_CORE_COMPONENTS, True),
+        "layout": "release_link",
+        "samples": {component: ["active|running|0"] * 2 for component in _CORE_COMPONENTS},
+    }
+    value.update(changes)
+    return RunResult(0, json.dumps({k: v for k, v in value.items() if v is not _DROP}), "")
+
+
+_DROP = object()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _layout_payload(samples=_DROP),
+        _layout_payload(enabled=_DROP),
+        _layout_payload(services={}),
+        _layout_payload(enabled={COMPONENT_BRIDGE: True}),
+        _layout_payload(enabled=dict.fromkeys(_CORE_COMPONENTS, "yes")),
+        _layout_payload(samples={COMPONENT_BRIDGE: ["active|running|0"]}),
+        _layout_payload(
+            samples={
+                COMPONENT_BRIDGE: ["active|running|0"],
+                COMPONENT_WIFI_WATCHDOG: ["active|running|0"] * 2,
+                COMPONENT_BUS_WATCHDOG: ["active|running|0"] * 2,
+            }
+        ),
+        _layout_payload(
+            samples={component: ["active|running|0|x"] for component in _CORE_COMPONENTS}
+        ),
+        _layout_payload(samples={component: [] for component in _CORE_COMPONENTS}),
+        _layout_payload(
+            samples={component: ["active|running|0"] * 33 for component in _CORE_COMPONENTS}
+        ),
+        _layout_payload(layout="partial"),
+    ],
+)
+async def test_snapshot_panel_rejects_malformed_sample_payloads(payload: RunResult) -> None:
+    responses = _snapshot_responses()
+    responses[panel_ops.SNAPSHOT_LAYOUT_COMMAND] = payload
+    shell = await _connected(FakeShell(responses=responses))
+
+    with pytest.raises(panel_ops.PanelOpError, match="^snapshot_payload_invalid$"):
+        await panel_ops.snapshot_panel(shell)
+    assert shell.commands == [panel_ops.SNAPSHOT_LAYOUT_COMMAND]
+
+
+_STOP_FAKE = """#!/bin/sh
+state_file="{state}"
+state="$(cat "$state_file")"
+echo "$*" >> "{log}"
+case "$1" in
+  is-active)
+    if [ "$2" = "--quiet" ]; then
+      case "$state" in active|reloading) exit 0 ;; *) exit 3 ;; esac
+    fi
+    printf '%s\\n' "$state"
+    case "$state" in active|reloading) exit 0 ;; *) exit 3 ;; esac ;;
+  stop)
+    printf '%s' "{after_stop}" > "$state_file" ;;
+esac
+"""
+
+
+def _run_stop_command(tmp_path: Path, state: str, after_stop: str) -> tuple[int, list[str]]:
+    state_file = tmp_path / "state"
+    state_file.write_text(state)
+    log = tmp_path / "log"
+    log.write_text("")
+    stub = tmp_path / "systemctl"
+    stub.write_text(_STOP_FAKE.format(state=state_file, log=log, after_stop=after_stop))
+    stub.chmod(0o755)
+    result = subprocess.run(
+        ["/bin/sh", "-c", panel_ops._stop_service_command(SERVICE_NAME)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}"},
+    )
+    return result.returncode, log.read_text().splitlines()
+
+
+@pytest.mark.parametrize("state", ["active", "reloading", "activating", "deactivating", ""])
+def test_stop_service_command_stops_every_unsettled_state(tmp_path: Path, state: str) -> None:
+    status, calls = _run_stop_command(tmp_path, state, "inactive")
+
+    assert status == 0
+    assert f"stop {SERVICE_NAME}" in calls
+
+
+@pytest.mark.parametrize("state", ["inactive", "failed", "unknown"])
+def test_stop_service_command_leaves_settled_units_alone(tmp_path: Path, state: str) -> None:
+    status, calls = _run_stop_command(tmp_path, state, "inactive")
+
+    assert status == 0
+    assert f"stop {SERVICE_NAME}" not in calls
+
+
+@pytest.mark.parametrize("after_stop", ["activating", "active", "deactivating"])
+def test_stop_service_command_keeps_strict_settled_check(tmp_path: Path, after_stop: str) -> None:
+    status, calls = _run_stop_command(tmp_path, "activating", after_stop)
+
+    assert status == 47
+    assert f"stop {SERVICE_NAME}" in calls
+
+
 async def test_snapshot_panel_rejects_oversized_or_malformed_file_payload() -> None:
     responses = _snapshot_responses()
     responses[panel_ops.SNAPSHOT_FILE_COMMANDS["environment"]] = RunResult(
