@@ -2,20 +2,28 @@
 
 from __future__ import annotations
 
+import errno
 import fcntl
+import io
 import logging
 import os
 import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
+from brilliant_bus_watchdog import health as health_mod
 from brilliant_bus_watchdog import phase_record
-from brilliant_bus_watchdog.health import bus_failure_age
+from brilliant_bus_watchdog.health import BusFailureObserver, bus_failure_age
 from brilliant_bus_watchdog.run import should_reboot
 from brilliant_mqtt import heartbeat
 from brilliant_mqtt.heartbeat import DEAD_WRITER_RETENTION_S, write_heartbeat, write_phase
 from tests.fakes import FakeClock
+
+if TYPE_CHECKING:
+    from _typeshed import ReadableBuffer
 
 
 def test_writer_and_watchdog_phase_contract_constants_match() -> None:
@@ -464,7 +472,8 @@ def test_readonly_marker_failure_releases_only_recovered_bus_lease(
     assert not write_phase(
         str(phase), "bus", bus_read_succeeded=recovered, monotonic_clock=lambda: 200.0
     )
-    assert phase.read_text() == original
+    # A recovered writer revokes the stale attempt through its lease descriptor.
+    assert phase.read_text() == ("" if recovered else original)
     assert (str(phase) in heartbeat._phase_leases) is not recovered
 
 
@@ -487,3 +496,290 @@ def test_recovery_releases_retained_attempt_lease_even_when_rate_limited(
     )
     assert str(phase) not in heartbeat._phase_leases
     assert str(phase) not in heartbeat._owned_phase_records
+
+
+def _deny_path_writes(monkeypatch: pytest.MonkeyPatch, *, rewrite: bool = False) -> None:
+    """Make atomic replacement and unlink fail; optionally the in-place rewrite."""
+
+    def readonly(*args: object, **kwargs: object) -> None:
+        raise OSError(errno.EROFS, "read-only filesystem")
+
+    monkeypatch.setattr(heartbeat, "_atomic_write", readonly)
+    monkeypatch.setattr("brilliant_mqtt.heartbeat.os.unlink", readonly)
+    if rewrite:
+        monkeypatch.setattr(heartbeat, "_rewrite_phase_lease", lambda path, text: False)
+
+
+def _simulate_writer_death(monkeypatch: pytest.MonkeyPatch, path: Path) -> None:
+    heartbeat._release_phase_lease(str(path))
+    monkeypatch.setattr(health_mod, "process_generation", lambda pid: None)
+    monkeypatch.setattr(health_mod, "process_is_absent", lambda pid: True)
+
+
+def _live_writer_failure_age(path: Path, now: float) -> float | None:
+    return bus_failure_age(str(path), now=now, observer=BusFailureObserver())
+
+
+def test_unrecordable_recovery_is_not_dead_writer_evidence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    phase = tmp_path / "bus-phase"
+    assert write_phase(str(phase), "bus", monotonic_clock=lambda: 100.0)
+    assert _live_writer_failure_age(phase, 150.0) == 50.0
+    _deny_path_writes(monkeypatch, rewrite=True)
+
+    assert not write_phase(
+        str(phase), "bus", bus_read_succeeded=True, monotonic_clock=lambda: 200.0
+    )
+    _simulate_writer_death(monkeypatch, phase)
+
+    assert phase.read_bytes() == b""
+    assert bus_failure_age(str(phase), now=250.0, observer=BusFailureObserver()) is None
+
+
+def test_unrecordable_pre_bus_transition_is_not_dead_writer_evidence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    phase = tmp_path / "bus-phase"
+    assert write_phase(str(phase), "bus", monotonic_clock=lambda: 100.0)
+    _deny_path_writes(monkeypatch, rewrite=True)
+
+    assert not write_phase(str(phase), "pre_bus", monotonic_clock=lambda: 200.0)
+    _simulate_writer_death(monkeypatch, phase)
+
+    assert phase.read_bytes() == b""
+    assert bus_failure_age(str(phase), now=250.0, observer=BusFailureObserver()) is None
+
+
+def test_unrecordable_failed_attempt_keeps_its_evidence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    phase = tmp_path / "bus-phase"
+    assert write_phase(str(phase), "bus", monotonic_clock=lambda: 100.0)
+    original = phase.read_bytes()
+    _deny_path_writes(monkeypatch, rewrite=True)
+    truncations: list[int] = []
+    real_ftruncate = os.ftruncate
+
+    def _recording_ftruncate(fd: int, length: int) -> None:
+        truncations.append(fd)
+        real_ftruncate(fd, length)
+
+    monkeypatch.setattr("brilliant_mqtt.heartbeat.os.ftruncate", _recording_ftruncate)
+
+    assert not write_phase(str(phase), "bus", monotonic_clock=lambda: 200.0)
+    assert _live_writer_failure_age(phase, 200.0) == 100.0
+    _simulate_writer_death(monkeypatch, phase)
+
+    assert truncations == []
+    assert phase.read_bytes() == original
+    assert bus_failure_age(str(phase), now=250.0, observer=BusFailureObserver()) == 150.0
+
+
+def test_refused_revocation_truncate_stays_best_effort(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    phase = tmp_path / "bus-phase"
+    assert write_phase(str(phase), "bus", monotonic_clock=lambda: 100.0)
+    original = phase.read_bytes()
+    _deny_path_writes(monkeypatch, rewrite=True)
+
+    def _refused(fd: int, length: int) -> None:
+        raise OSError(errno.EPERM, "append-only inode")
+
+    monkeypatch.setattr("brilliant_mqtt.heartbeat.os.ftruncate", _refused)
+    with caplog.at_level(logging.WARNING, logger="brilliant_mqtt.heartbeat"):
+        assert not write_phase(
+            str(phase), "bus", bus_read_succeeded=True, monotonic_clock=lambda: 200.0
+        )
+
+    assert str(phase) not in heartbeat._phase_leases
+    assert phase.read_bytes() == original
+    refusals = [r for r in caplog.records if "revocation refused" in r.getMessage()]
+    assert [r.levelno for r in refusals] == [logging.WARNING]
+
+
+class _ShortWriteThenFailFileIO(io.FileIO):
+    """A lease stream whose writes, once armed, are short and then fail."""
+
+    def __init__(self, file: str, mode: str) -> None:
+        super().__init__(file, mode)
+        self.armed = False
+        self._short_written = False
+
+    def write(self, b: ReadableBuffer, /) -> int:
+        if not self.armed:
+            return super().write(b)
+        if self._short_written:
+            raise OSError(errno.EIO, "Input/output error")
+        self._short_written = True
+        half = len(memoryview(b).cast("B")) // 2
+        return super().write(b"X" * half)
+
+
+class _CloseFailsFileIO(io.FileIO):
+    """A lease stream that closes its descriptor but reports a close error."""
+
+    def __init__(self, file: str, mode: str) -> None:
+        super().__init__(file, mode)
+        self.close_attempts = 0
+
+    def close(self) -> None:
+        already_closed = self.closed
+        super().close()
+        if not already_closed:
+            self.close_attempts += 1
+            raise OSError(errno.EIO, "close failed")
+
+
+def _install_lease_stream(
+    monkeypatch: pytest.MonkeyPatch,
+    path: Path,
+    factory: Callable[[str, str], io.FileIO],
+) -> list[io.FileIO]:
+    """Open the marker's lease stream through *factory*; returns created streams."""
+    created: list[io.FileIO] = []
+    real_open = open
+
+    def _open(file: str, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+        if str(file) == str(path) and mode == "r+b":
+            assert kwargs.get("buffering", args[0] if args else None) == 0
+            stream = factory(str(file), mode)
+            created.append(stream)
+            return stream
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr("brilliant_mqtt.heartbeat.open", _open, raising=False)
+    return created
+
+
+def test_revocation_empties_marker_after_partly_failed_rewrite(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    phase = tmp_path / "bus-phase"
+    streams = _install_lease_stream(monkeypatch, phase, _ShortWriteThenFailFileIO)
+    assert write_phase(str(phase), "bus", monotonic_clock=lambda: 100.0)
+    [stream] = streams
+    assert isinstance(stream, _ShortWriteThenFailFileIO)
+    original = phase.read_bytes()
+    _deny_path_writes(monkeypatch)
+    rewrites: list[bool] = []
+    real_rewrite = heartbeat._rewrite_phase_lease
+
+    def _observed_rewrite(path: str, text: str) -> bool:
+        rewritten = real_rewrite(path, text)
+        rewrites.append(rewritten)
+        # The failed attempt left a mixed new-prefix/old-tail record behind.
+        assert phase.read_bytes() != original
+        assert phase.read_bytes().startswith(b"X")
+        return rewritten
+
+    def _no_dup(fd: int) -> int:
+        raise OSError(errno.EMFILE, "Too many open files")
+
+    monkeypatch.setattr(heartbeat, "_rewrite_phase_lease", _observed_rewrite)
+    monkeypatch.setattr("brilliant_mqtt.heartbeat.os.dup", _no_dup)
+    stream.armed = True
+
+    assert not write_phase(
+        str(phase), "bus", bus_read_succeeded=True, monotonic_clock=lambda: 200.0
+    )
+
+    # The owned in-place update and the post-replacement fallback both failed.
+    assert rewrites == [False, False]
+    assert phase.read_bytes() == b""
+    assert stream.closed
+
+
+def test_lease_stream_never_buffers(tmp_path: Path) -> None:
+    phase = tmp_path / "bus-phase"
+    assert write_phase(str(phase), "bus", monotonic_clock=lambda: 100.0)
+    stream = heartbeat._phase_leases[str(phase)].stream
+
+    assert type(stream) is io.FileIO
+    assert heartbeat._rewrite_phase_lease(str(phase), "rewritten")
+    # No flush: an unbuffered stream has already handed every byte to the kernel.
+    assert phase.read_bytes() == b"rewritten"
+
+
+def test_unencodable_rewrite_returns_false_and_leaves_marker_unchanged(tmp_path: Path) -> None:
+    phase = tmp_path / "bus-phase"
+    assert write_phase(str(phase), "bus", monotonic_clock=lambda: 100.0)
+    original = phase.read_bytes()
+
+    assert not heartbeat._rewrite_phase_lease(str(phase), "unencodable \udcff")
+    assert phase.read_bytes() == original
+
+
+def test_lease_is_held_while_revocation_truncates(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    phase = tmp_path / "bus-phase"
+    assert write_phase(str(phase), "bus", monotonic_clock=lambda: 100.0)
+    _deny_path_writes(monkeypatch, rewrite=True)
+    lease_held: list[bool] = []
+    real_ftruncate = os.ftruncate
+
+    def _probing_ftruncate(fd: int, length: int) -> None:
+        with open(phase, "rb") as probe:
+            try:
+                fcntl.flock(probe.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError:
+                lease_held.append(True)
+            else:
+                lease_held.append(False)
+        real_ftruncate(fd, length)
+
+    monkeypatch.setattr("brilliant_mqtt.heartbeat.os.ftruncate", _probing_ftruncate)
+
+    assert not write_phase(
+        str(phase), "bus", bus_read_succeeded=True, monotonic_clock=lambda: 200.0
+    )
+    assert lease_held == [True]
+    assert phase.read_bytes() == b""
+
+
+def test_lease_close_error_is_swallowed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    phase = tmp_path / "bus-phase"
+    streams = _install_lease_stream(monkeypatch, phase, _CloseFailsFileIO)
+    assert write_phase(str(phase), "bus", monotonic_clock=lambda: 100.0)
+    [stream] = streams
+    assert isinstance(stream, _CloseFailsFileIO)
+
+    assert write_phase(str(phase), "pre_bus", monotonic_clock=lambda: 200.0)
+
+    assert stream.close_attempts == 1
+    assert stream.closed
+    assert str(phase) not in heartbeat._phase_leases
+    record = heartbeat.read_phase_record(str(phase))
+    assert record is not None
+    assert record.phase == "pre_bus"
+
+
+def test_unexpected_error_during_recovery_revokes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    phase = tmp_path / "bus-phase"
+    assert write_phase(str(phase), "bus", monotonic_clock=lambda: 100.0)
+    _deny_path_writes(monkeypatch)
+    monkeypatch.setattr(heartbeat, "current_boot_id", lambda: None)
+
+    assert not write_phase(
+        str(phase), "bus", bus_read_succeeded=True, monotonic_clock=lambda: 200.0
+    )
+    _simulate_writer_death(monkeypatch, phase)
+
+    assert phase.read_bytes() == b""
+    assert bus_failure_age(str(phase), now=250.0, observer=BusFailureObserver()) is None
+
+
+def test_revoking_an_already_closed_lease_is_a_noop(tmp_path: Path) -> None:
+    phase = tmp_path / "bus-phase"
+    assert write_phase(str(phase), "bus", monotonic_clock=lambda: 100.0)
+    original = phase.read_bytes()
+    heartbeat._phase_leases[str(phase)].stream.close()
+
+    heartbeat._release_phase_lease(str(phase), revoke=True)
+
+    assert str(phase) not in heartbeat._phase_leases
+    assert phase.read_bytes() == original
