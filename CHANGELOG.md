@@ -19,7 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is sent past it, so the panel stays online. The evidence is persisted in a
   sidecar next to the outbox state file, which older agents ignore, and a
   successful delivery clears it. Scene and mode status report
-  `outbox_quarantine`, or `outbox_blocked` when a drop could not be attributed.
+  `outbox_quarantine`, or the transient `outbox_blocked` when a drop could not
+  be attributed. Either way scene and mode entities are unavailable and Home
+  Assistant refuses scene and mode commands, while device state, discovery and
+  device commands keep working.
   The bridge meta `diag.outbox` object names the record by key, kind, size and
   SHA-256, never by contents. With the agent stopped, run
   `python3 -m brilliant_mqtt.outbox_admin` on the panel to list, release or

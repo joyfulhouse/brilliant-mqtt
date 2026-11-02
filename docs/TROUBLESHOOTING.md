@@ -283,7 +283,9 @@ settings in [CONFIGURATION.md → Bus-health watchdog](CONFIGURATION.md#bus-heal
 **Symptom:** Scene and mode entities go unavailable, and the retained
 `brilliant/ha-control/v1/status/scene/<panel>` (and `.../mode/<panel>`) status
 shows `"available": false` with reason `outbox_quarantine` or
-`outbox_blocked`. The panel itself stays online and lights keep working.
+`outbox_blocked`. Home Assistant refuses scene and mode commands while the
+transport is reported offline. The panel itself stays online, and device
+state, discovery and device commands keep working.
 
 **Why:** The broker closed the MQTT connection every time one scene/mode
 outbox frame was sent. That usually means an operator `max_packet_size` that
@@ -291,7 +293,9 @@ the frame exceeds. After 3 such disconnects in 3 different sessions spanning at
 least a minute, the agent quarantines that record and halts the scene outbox,
 so nothing is sent past it. `outbox_blocked` means the connection dropped right
 after sending the record, before the session had any acknowledged QoS-1
-publish, so nothing could be attributed. Check the broker first. The bridge
+publish, so nothing could be attributed. It is transient and practically
+unreachable, because every session normally publishes a QoS-1 message first,
+and it clears as soon as the record is delivered. Check the broker first. The bridge
 meta `diag.outbox` object names the record (key, kind, size and sha256, never
 the payload). The full contract is in
 [issue-113-outbox-quarantine-contract.md](issue-113-outbox-quarantine-contract.md).

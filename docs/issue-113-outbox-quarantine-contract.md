@@ -154,8 +154,12 @@ clears its evidence.
 - No result is ever released ahead of its event.
 - The quarantined record is not offered to the broker, so the disconnect churn
   stops and Home Assistant keeps the panel available.
-- State, discovery and commands keep working. Outbox records created meanwhile
-  are stored and held.
+- Device state, discovery and device commands keep working.
+- Scene and mode entities go unavailable, and Home Assistant refuses scene and
+  mode commands ("transport is offline"), because their results could not be
+  delivered past the halt. This matches the existing `state_capacity`
+  behaviour. Scene and mode outbox records created by panel-side activations
+  meanwhile are stored and held.
 
 ### 4. Capacity
 
@@ -171,6 +175,14 @@ clears its evidence.
   reason `outbox_quarantine` or `outbox_blocked`. The payload format and keys
   are unchanged. These reasons take precedence over `state_capacity`, because a
   full outbox is a consequence of the halt; an untrusted state file still wins.
+- Either reason makes the scene and mode entities unavailable, and Home
+  Assistant refuses scene and mode commands while it is reported. Device state,
+  discovery and device commands are unaffected.
+- `outbox_blocked` is transient and practically unreachable. It needs a drop
+  within 2 s of sending the head record in a session with no acknowledged
+  QoS-1 publish, but every production session publishes the QoS-1 ownership
+  manifest before the scene bridge starts. It clears as soon as that record is
+  delivered, and it never quarantines anything.
 - The companion integration needed no code change. It validates the exact
   status keys and accepts any non-empty reason string for an unavailable
   transport. A test pins this.
