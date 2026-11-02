@@ -11,7 +11,13 @@ import pytest
 from brilliant_mqtt import bus as bus_mod
 from brilliant_mqtt.bus import RpcBusAdapter
 from brilliant_mqtt.commands import VarSet
-from brilliant_mqtt.write_admission import AdmissionTicket, Superseded, WriteClass, WriteResult
+from brilliant_mqtt.write_admission import (
+    AdmissionTicket,
+    Superseded,
+    WriteCancelled,
+    WriteClass,
+    WriteResult,
+)
 from tests.fakes import FakeClock
 
 
@@ -712,3 +718,56 @@ def test_clear_settle_callback_stops_delivery() -> None:
 
     assert seen == []
     assert ticket.settled
+
+
+async def test_cancel_waiting_before_issue_settles_write_cancelled(harness: _Harness) -> None:
+    await harness.queue("blocker", {"on": "1"})
+    ticket = AdmissionTicket()
+    seen: list[object] = []
+    ticket.set_settle_callback(seen.append)
+    caller = await harness.queue("light", {"on": "0"}, ticket=ticket)
+
+    ticket.cancel_waiting()
+    await _settle()
+
+    assert len(seen) == 1 and isinstance(seen[0], WriteCancelled)
+    assert harness.observer.calls == [("ble_mesh", "blocker", {"on": "1"})]
+    await asyncio.gather(caller, return_exceptions=True)
+
+
+async def test_fast_success_settles_before_set_variables_returns(harness: _Harness) -> None:
+    harness.observer.release_all = True
+    ticket = AdmissionTicket()
+
+    receipt = await harness.adapter.set_variables(
+        "ble_mesh", "light", [VarSet("on", "1")], ticket=ticket
+    )
+
+    assert receipt == "'ok'"
+    assert ticket.settled  # already, in the caller: no detach is inferred
+
+
+async def test_superseded_shared_ticket_settles_once_with_replacement_receipt(
+    harness: _Harness,
+) -> None:
+    await harness.queue("blocker", {"on": "1"})
+    ticket = AdmissionTicket()
+    seen: list[object] = []
+    ticket.set_settle_callback(seen.append)
+    original = await harness.queue(
+        "light", {"on": "0"}, write_class=WriteClass.INTERACTIVE_LATEST, ticket=ticket
+    )
+    assert harness.adapter.try_supersede(ticket, [VarSet("on", "1")])
+    assert isinstance(await original, Superseded)
+    assert seen == []  # supersession is not the native outcome
+    replacement = await harness.queue(
+        "light", {"on": "1"}, write_class=WriteClass.INTERACTIVE_LATEST, ticket=ticket
+    )
+    harness.observer.receipt = "replacement"
+
+    await harness.drain()
+    await _settle()
+
+    assert await replacement == "'replacement'"
+    assert seen == ["'replacement'"]
+    assert harness.observer.calls[-1] == ("ble_mesh", "light", {"on": "1"})

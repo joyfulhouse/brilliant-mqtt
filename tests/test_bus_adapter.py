@@ -33,6 +33,7 @@ from brilliant_mqtt.mqttio import _InboundMessage, _TopicDispatcher
 from brilliant_mqtt.write_admission import (
     AdmissionTicket,
     Superseded,
+    WriteCancelled,
     WriteClass,
     WriteResult,
     command_admission,
@@ -1181,6 +1182,22 @@ class TestDetachedWrites:
 
         assert seen == [error]
         await adapter.shutdown()
+
+    async def test_shutdown_of_detached_write_settles_write_cancelled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(bus_mod, "_WRITE_DEADLINE_S", 0.01)
+        _observer, adapter = _gated_adapter()
+        ticket = AdmissionTicket()
+        with pytest.raises(asyncio.TimeoutError):
+            await adapter.set_variables("ble_mesh", "p", [VarSet("on", "0")], ticket=ticket)
+        seen: list[object] = []
+        ticket.set_settle_callback(seen.append)
+
+        await adapter.shutdown()  # cancels the still-running detached RPC
+        await _settle()
+
+        assert len(seen) == 1 and isinstance(seen[0], WriteCancelled)
 
     async def test_failing_settle_callback_is_contained(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
