@@ -26,13 +26,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A crash loop that starts while the rollback baseline is captured is caught
   by the capture's re-snapshot, and that just-published baseline is finalized
   (removed) before the error is reported. If that removal fails, the error is
-  `baseline_capture_interrupted` and a baseline may remain on the panel.
+  `baseline_capture_interrupted` and a baseline may remain on the panel; see
+  docs/canary-rollback.md → Interrupted baseline capture.
 - Stopping a core service no longer fails with exit 47 when the unit is in
   `activating` (auto-restart): the stop step now stops every unsettled state
   before its strict settled check.
 - Each install or update on an existing panel now takes about 27 seconds longer
   (two sampled snapshots), which makes `transaction_in_progress` more likely
   when panels are added back to back.
+- Rollback verification is about 14 seconds slower, because its snapshot now
+  samples the restored services for the same window.
 
 ## [0.11.4] - 2026-10-26
 

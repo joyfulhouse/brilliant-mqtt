@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -124,3 +125,84 @@ async def test_guard_is_at_least_as_strict_as_the_integration(
         assert result.exit_status == 1
     else:
         assert result.stdout == "OK: no retained rollback baseline\n"
+
+
+_CANARY_DOC = Path(__file__).resolve().parents[2] / "docs" / "canary-rollback.md"
+_OTHER = "fedcba9876543210fedcba9876543210"
+
+
+def _cleanup_block() -> str:
+    text = _CANARY_DOC.read_text()
+    match = re.search(
+        r"<!-- interrupted-baseline-cleanup:start -->\n( *)```bash\n(?P<body>.*?)\1```\n"
+        r" *<!-- interrupted-baseline-cleanup:end -->",
+        text,
+        re.DOTALL,
+    )
+    assert match is not None
+    return textwrap.dedent(match["body"])
+
+
+def test_interrupted_capture_has_a_documented_way_out() -> None:
+    text = _CANARY_DOC.read_text()
+    assert "\n## Interrupted baseline capture\n" in text
+    assert re.search(r"^\| `baseline_capture_interrupted` \|", text, re.MULTILINE)
+    section = text.split("\n## Interrupted baseline capture\n", 1)[1].split("\n## ", 1)[0]
+    assert "-o NumberOfPasswordPrompts=1" in section
+    assert "/data/switch-embedded" not in section
+
+
+async def _run_cleanup(shell: RehearsalShell, identifier: str) -> int:
+    script = _cleanup_block().replace("ID=<id>", f"ID={identifier}")
+    return (await shell.run(script)).exit_status
+
+
+@pytest.mark.parametrize("release", [False, True], ids=["legacy", "release_link"])
+async def test_cleanup_mirrors_finalize_and_touches_only_this_baseline(
+    tmp_path: Path, release: bool
+) -> None:
+    shell = RehearsalShell(tmp_path)
+    shell.install(release=release)
+    rollback = shell.panel / ".rollback"
+    for name in (
+        _IDENTIFIER,
+        f".{_IDENTIFIER}.tmp",
+        f".{_IDENTIFIER}.finalizing",
+        _OTHER,
+        f".{_OTHER}.tmp",
+    ):
+        (rollback / name).mkdir(parents=True)
+        (rollback / name / "complete.json").write_text("{}")
+    pin = shell.panel / "current" / ".rollback-retained"
+    if release:
+        pin.write_text(_IDENTIFIER)
+
+    assert await _run_cleanup(shell, _IDENTIFIER) == 0
+
+    assert sorted(path.name for path in rollback.iterdir()) == [f".{_OTHER}.tmp", _OTHER]
+    assert not pin.exists()
+    assert (shell.panel / "VERSION").exists()
+
+
+async def test_cleanup_keeps_a_pin_naming_another_baseline(tmp_path: Path) -> None:
+    shell = RehearsalShell(tmp_path)
+    shell.install(release=True)
+    (shell.panel / ".rollback" / _IDENTIFIER).mkdir(parents=True)
+    pin = shell.panel / "current" / ".rollback-retained"
+    pin.write_text(_OTHER)
+
+    assert await _run_cleanup(shell, _IDENTIFIER) == 0
+
+    assert pin.read_text() == _OTHER
+    assert not (shell.panel / ".rollback" / _IDENTIFIER).exists()
+
+
+@pytest.mark.parametrize("identifier", ["", "..", "*", "ABCDEF0123456789ABCDEF0123456789"])
+async def test_cleanup_refuses_an_invalid_identifier(tmp_path: Path, identifier: str) -> None:
+    shell = RehearsalShell(tmp_path)
+    shell.install()
+    (shell.panel / ".rollback" / _OTHER).mkdir(parents=True)
+
+    assert await _run_cleanup(shell, identifier) != 0
+
+    assert (shell.panel / ".rollback" / _OTHER).exists()
