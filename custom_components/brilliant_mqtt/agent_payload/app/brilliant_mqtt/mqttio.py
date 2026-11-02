@@ -835,6 +835,13 @@ class AioMqttAdapter:
 
     _checked_disconnect = False
     _redacted_logging = False
+    # Class-level defaults so partially constructed adapters (tests build some
+    # with object.__new__) still behave: #113 session signals start empty.
+    _closing = False
+    _closed = False
+    _acknowledged_qos1 = 0
+    _connection_lost_fired = False
+    _connection_lost_cbs: tuple[Callable[[], None], ...] = ()
 
     def __init__(
         self,
@@ -861,10 +868,6 @@ class AioMqttAdapter:
         self._topic_dispatcher = _TopicDispatcher(self._dispatch_inbound, diagnostics=diagnostics)
         self._reader_task: asyncio.Task[None] | None = None
         self._reader_failure_consumed = False
-        # #113 session signals: QoS>=1 PUBACK count and drop observers.
-        self._acknowledged_qos1 = 0
-        self._connection_lost_cbs: list[Callable[[], None]] = []
-        self._connection_lost_fired = False
         self._avail_topic = availability_topic(settings.panel)
         # A distinct broker ClientID is REQUIRED for any second connection on the
         # same panel: two clients sharing an id force the broker to disconnect the
@@ -1027,7 +1030,7 @@ class AioMqttAdapter:
         if self._connection_lost_fired:
             return
         self._connection_lost_fired = True
-        for callback in tuple(self._connection_lost_cbs):
+        for callback in self._connection_lost_cbs:
             try:
                 callback()
             except Exception:
@@ -1237,7 +1240,7 @@ class AioMqttAdapter:
 
     def on_connection_lost(self, cb: Callable[[], None]) -> None:
         """Register a callback fired once when the broker link drops unexpectedly."""
-        self._connection_lost_cbs.append(cb)
+        self._connection_lost_cbs = (*self._connection_lost_cbs, cb)
 
     def on_command(self, cb: Callable[[str, str], Awaitable[None]]) -> None:
         self._command_cbs.append(cb)
