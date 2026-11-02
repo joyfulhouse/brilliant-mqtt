@@ -65,6 +65,12 @@ class FakeBus:
         self.set_variables_error: Exception | None = None
         # Returned by set_variables as the normalized transport-ack receipt.
         self.set_variables_receipt: str = "FakeSetVariablesResponse()"
+        # Tickets of writes that hit the caller deadline (#225). Only an
+        # ``asyncio.TimeoutError`` models that detach: the ticket stays
+        # UNSETTLED so a test can deliver the late outcome via mark_settled.
+        # Every other outcome -- a builtin TimeoutError (the panel lib's fast
+        # "No response received!") included -- settles the ticket at once.
+        self.detached_tickets: list[AdmissionTicket] = []
         self._capture_generation = 1
         self._capture_sequence = 0
         self._field_eras: dict[tuple[str, str, str], int] = {}
@@ -159,9 +165,18 @@ class FakeBus:
         ticket: AdmissionTicket | None = None,
     ) -> str:
         self._mark_issued(device_id, peripheral_id, sets, ticket)
-        if self.set_variables_error is not None:
-            raise self.set_variables_error
+        error = self.set_variables_error
+        if error is not None:
+            # py3.10: the builtin TimeoutError is NOT an asyncio.TimeoutError.
+            if isinstance(error, asyncio.TimeoutError):
+                if ticket is not None:
+                    self.detached_tickets.append(ticket)
+            elif ticket is not None:
+                ticket.mark_settled(error)
+            raise error
         self.commands.append((device_id, peripheral_id, list(sets)))
+        if ticket is not None:
+            ticket.mark_settled(self.set_variables_receipt)
         return self.set_variables_receipt
 
     def _mark_issued(

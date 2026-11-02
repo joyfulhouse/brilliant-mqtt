@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import Enum
 
 from brilliant_mqtt.model import CaptureProvenance
+
+logger = logging.getLogger(__name__)
 
 
 class WriteClass(Enum):
@@ -23,6 +26,10 @@ class Superseded:
 
 
 WriteResult = str | Superseded
+
+# The native write's final outcome: its normalized receipt, or the exception it
+# ended with (``WriteCancelled`` for cancelled, tombstoned or never-issued work).
+SettleOutcome = str | BaseException
 
 
 class TicketAdoptionError(ValueError):
@@ -50,6 +57,11 @@ class AdmissionTicket:
     _on_issued: Callable[[CaptureProvenance], None] | None = field(
         default=None, init=False, repr=False
     )
+    # One-element tuple once settled, so a falsy receipt still reads as settled.
+    _settlement: tuple[SettleOutcome] | None = field(default=None, init=False, repr=False)
+    _on_settled: Callable[[SettleOutcome], None] | None = field(
+        default=None, init=False, repr=False
+    )
 
     def cancel_waiting(self) -> None:
         """Relinquish lane ownership; the adapter never cancels an issued RPC."""
@@ -69,6 +81,39 @@ class AdmissionTicket:
         self._issued_at = provenance
         if self._on_issued is not None:
             self._on_issued(provenance)
+
+    @property
+    def settled(self) -> bool:
+        """True once the BusClient reported this ticket's native outcome."""
+        return self._settlement is not None
+
+    def set_settle_callback(self, callback: Callable[[SettleOutcome], None]) -> None:
+        """Observe the native write's outcome, even one landing after the caller deadline.
+
+        An already-settled ticket replays its outcome immediately; a failing
+        replay is contained and logged by exception class only.
+        """
+        self._on_settled = callback
+        if self._settlement is not None:
+            try:
+                callback(self._settlement[0])
+            except Exception as error:
+                logger.warning("WRITE_SETTLE_CALLBACK_FAILED %s", type(error).__name__)
+
+    def clear_settle_callback(self) -> None:
+        """Stop delivering this ticket's outcome (an abandoned, reused ticket)."""
+        self._on_settled = None
+
+    def mark_settled(self, outcome: SettleOutcome) -> None:
+        """Record the native outcome once; called only by a BusClient.
+
+        Callback failures propagate to the BusClient, which contains them.
+        """
+        if self._settlement is not None:
+            return
+        self._settlement = (outcome,)
+        if self._on_settled is not None:
+            self._on_settled(outcome)
 
 
 @dataclass

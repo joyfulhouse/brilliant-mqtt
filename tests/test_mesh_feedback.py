@@ -254,7 +254,7 @@ async def test_shutdown_fences_sleeping_resolver_without_sweeping_it() -> None:
     _bus, mqtt, bridge, clock, sleeper = _mesh_bridge([_mesh_dimmer_at("1")])
     await bridge.reconcile()
     await mqtt.inject(MESH_SET_TOPIC, '{"state":"OFF"}')
-    resolver = bridge._mesh_confirm_tasks[MESH_PID]
+    resolver = bridge._mesh.confirm_tasks_view[MESH_PID]
     await bridge.shutdown_mesh_feedback()
     assert not resolver.done()  # pre-existing timer sweep remains out of scope
     mqtt.published.clear()
@@ -304,9 +304,9 @@ async def test_contradiction_revokes_blocked_publish_with_same_generation() -> N
     mqtt.block_next_state_publish = True
     command = asyncio.create_task(mqtt.inject(MESH_SET_TOPIC, '{"state":"OFF"}'))
     await asyncio.wait_for(mqtt.publish_started.wait(), 1)
-    generation = bridge._mesh_write_generation[MESH_PID]
+    generation = bridge._mesh.generation(MESH_PID)
     await bus.emit(_mesh_dimmer_at("1"))
-    assert bridge._mesh_write_generation[MESH_PID] == generation
+    assert bridge._mesh.generation(MESH_PID) == generation
     mqtt.release_publish.set()
     await command
     assert [json.loads(p[1]) for p in _mesh_states(mqtt)] == [
@@ -362,7 +362,7 @@ async def test_terminal_publish_repairs_cancelled_pending_already_at_broker(conf
             await asyncio.wait_for(mqtt.pending_recorded.wait(), 1)
         assert bridge._last_state_fields[MESH_PID] == expected
         published = len(_mesh_states(mqtt))
-        resolver = bridge._mesh_confirm_tasks[MESH_PID]
+        resolver = bridge._mesh.confirm_tasks_view[MESH_PID]
         clock.advance(5.0)
         await sleeper.release_all()
         await resolver
@@ -381,9 +381,12 @@ async def test_terminal_publish_repairs_cancelled_pending_already_at_broker(conf
 
 @pytest.mark.parametrize("late_error", [False, True], ids=["late_receipt", "late_error"])
 @pytest.mark.parametrize("revoke", [False, True], ids=["pending", "withdrawn"])
-async def test_detached_rpc_outcome_cannot_settle_or_rearm_feedback(
+async def test_detached_rpc_late_outcome_settles_only_its_own_pending(
     monkeypatch: pytest.MonkeyPatch, late_error: bool, revoke: bool
 ) -> None:
+    """#225 against the REAL adapter: a detached RPC's late receipt re-arms a
+    full window and a late rejection publishes ``failed``; once withdrawn,
+    neither can settle, re-arm or publish anything."""
     # Zero expires deterministically AFTER the real adapter acquires its lock.
     # The fake observer stays blocked on an Event; no native service is used.
     monkeypatch.setattr(bus_mod, "_WRITE_DEADLINE_S", 0.0)
@@ -398,24 +401,41 @@ async def test_detached_rpc_outcome_cannot_settle_or_rearm_feedback(
         assert json.loads(_mesh_states(mqtt)[-1][1]) == _mesh_feedback_payload(
             None, "pending", {"on": "0"}, 1080.0
         )
-        record = bridge._pending_mesh[MESH_PID]
+        record = bridge._mesh.pending_view[MESH_PID]
+        assert record.rpc_unresolved
         (rpc,) = adapter._write_tasks
         assert not rpc.done()
         if revoke:
             await bridge.withdraw()
         mqtt.published.clear()
+        bridge._wall_clock = lambda: 1010.0
         observer.release.set()
         if late_error:
             with pytest.raises(RuntimeError, match="synthetic late rejection"):
                 await rpc
         else:
             assert await rpc == "'ok'"
-        assert mqtt.published == []
-        assert sleeper.requested == [80.0]
+        for _ in range(8):  # the adapter's done-callback, then the settle task
+            await asyncio.sleep(0)
         if revoke:
-            assert MESH_PID not in bridge._pending_mesh
+            assert mqtt.published == []
+            assert sleeper.requested == [80.0]
+            assert MESH_PID not in bridge._mesh.pending_view
+        elif late_error:
+            assert [json.loads(p[1]) for p in _mesh_states(mqtt)] == [
+                _mesh_feedback_payload("ON", "failed")
+            ]
+            assert MESH_PID not in bridge._mesh.pending_view
+            assert sleeper.requested == [80.0]
         else:
-            assert bridge._pending_mesh[MESH_PID] is record
+            assert [json.loads(p[1]) for p in _mesh_states(mqtt)] == [
+                _mesh_feedback_payload(None, "pending", {"on": "0"}, 1090.0)
+            ]
+            rearmed = bridge._mesh.pending_view[MESH_PID]
+            assert rearmed is not record
+            assert rearmed.receipt == "'ok'"
+            assert not rearmed.rpc_unresolved
+            assert sleeper.requested == [80.0, 80.0]
     finally:
         await bridge.withdraw()
         await adapter.shutdown()

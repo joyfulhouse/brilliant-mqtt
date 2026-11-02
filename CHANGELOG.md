@@ -27,6 +27,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   counts. This matters only for non-default setups: the marker defaults to
   tmpfs under `/run`, which no shipped unit makes read-only.
   ([#143](https://github.com/joyfulhouse/brilliant-mqtt/issues/143))
+- A mesh light or switch write that takes longer than the 5 second bus
+  deadline no longer publishes the old state as truth (#225). Previously the
+  next poll treated the mirror's pre-write value as a contradiction, and the
+  bridge never learned the write's late outcome. A late acceptance then had
+  no 80 second confirm hold, which reopened the false-state window from #46.
+  While the native write is still running, differing observations are now
+  ignored. A late failure publishes `failed` with the observed state. A late
+  acceptance starts a full 80 second confirm window. A late timeout or
+  cancellation resumes normal contradiction handling. A fast native "No
+  response received!" timeout is still contradicted on the next poll. The
+  peer churn that makes these writes slow is native firmware behaviour and
+  is not changed here.
 
 ## [0.11.4] - 2026-10-26
 
