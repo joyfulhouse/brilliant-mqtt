@@ -203,6 +203,16 @@ _SAFE_PANEL_OP_DETAILS = {
         "snapshot_probe_failed: wait for restarting panel services to settle, "
         "check connectivity, and retry"
     ),
+    "service_crash_looping": (
+        "service_crash_looping: the installed bridge or a watchdog kept restarting, so no "
+        "safe rollback baseline was taken and nothing was changed; fix it so it stays up "
+        "(check broker credentials and reachability) or uninstall and re-add; "
+        "see docs/TROUBLESHOOTING.md"
+    ),
+    "baseline_capture_interrupted": (
+        "baseline_capture_interrupted: a rollback baseline may remain on the panel; "
+        "see docs/canary-rollback.md"
+    ),
     "mqtt_ca_promotion_failed": "mqtt_ca_promotion_failed",
     "mqtt_ca_verification_failed": "mqtt_ca_verification_failed",
     "mqtt_tls_downgrade_refused": "mqtt_tls_downgrade_refused",

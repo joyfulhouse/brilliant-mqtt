@@ -95,6 +95,7 @@ while obtaining redacted diagnostics and the HA repair/log code.
 | Code/state | Operator action |
 | --- | --- |
 | `baseline_capture_failed`, `baseline_verify_failed` | Candidate mutation is refused. Preserve the incumbent; investigate missing/drifting code, permissions, free space, or capture bounds before retrying. |
+| `baseline_capture_interrupted` | A capture's re-check failed after the baseline was published, and removing that never-used baseline also failed, so it may remain on the panel with no HA record (`canary_finalize` cannot settle it). Retry the add or update once connectivity is back; otherwise follow [Interrupted baseline capture](#interrupted-baseline-capture). |
 | `transaction_in_progress` | Another operation holds the shared panel lock. Allow it to finish and retry. |
 | `provisioning_recovery_required` | Another panel's interrupted provisioning journal must be recovered first. Diagnostics name it (`provisioning.name`, `panel`, `phase`, `last_error`). Resolve that journal's own code below; for an onboarding that never created an HA panel, see [Interrupted onboarding without an HA panel owner](#interrupted-onboarding-without-an-ha-panel-owner). Operations stay serialized; nothing is skipped. |
 | `recovery_connection_failed` | Recovery could not reach the panel at the journal's recorded address. Bring the panel online. If its address or root password changed and it has no HA panel entry, settle it with Add Brilliant panel (below); otherwise repair the owning panel's address/credentials. |
@@ -205,6 +206,54 @@ recovery does not reuse stored credentials to finish this operation. Start Add
 Brilliant panel again, authenticate freshly and confirm again. Unmarked older
 `finalizing` records are not accepted through this path because their original
 state cannot be proven; preserve those records for investigation.
+
+## Interrupted baseline capture
+
+`baseline_capture_interrupted` means a capture published its baseline, the
+re-check that follows failed (for example `service_crash_looping`), and the
+automatic removal of that baseline failed too. The baseline never authorised a
+change, but Home Assistant holds no record of it, so `canary_finalize` cannot
+settle it, and `brilliant_mqtt.uninstall` refuses with
+`baseline_retained_finalize_first` while it remains.
+
+First, retry the add or update once connectivity is back. If the leftover
+baseline still blocks the panel, remove it by hand with exactly the steps the
+integration's finalize performs:
+
+1. Wait at least 2 minutes, which covers the capture's own 120-second bound.
+2. In Home Assistant diagnostics, confirm this panel has **no** execution
+   journal and **no** retained baseline. This check is the guard: it is what
+   makes every baseline on the panel an orphan. Make sure no update or repair
+   of this panel runs between this step and step 4.
+3. Inspect, read-only:
+
+   ```bash
+   ssh -o NumberOfPasswordPrompts=1 root@<panel-address>
+   ls -la /var/brilliant-mqtt/.rollback/
+   cat /var/brilliant-mqtt/current/.rollback-retained   # release_link layout only
+   ```
+
+   The orphan is the 32-hex-character directory `<id>` (possibly with a
+   `.<id>.tmp` or `.<id>.finalizing` sibling). The on-panel `<id>` cannot be
+   matched against the transaction names in diagnostics.
+4. Remove that baseline. Set `ID` to the `<id>` from step 3. The block refuses
+   (and ends the session) unless `ID` is exactly 32 lowercase hex characters.
+   It removes the active release's pin only if it is a regular file naming this
+   `<id>`, then `.rollback/<id>` and its `.tmp` / `.finalizing` siblings, and
+   nothing else under `.rollback/`:
+
+   <!-- interrupted-baseline-cleanup:start -->
+   ```bash
+   ID=<id>
+   echo "$ID" | grep -Eqx '[0-9a-f]{32}' || { echo "STOP: invalid baseline id"; exit 1; }
+   PIN=/var/brilliant-mqtt/current/.rollback-retained
+   if [ -L /var/brilliant-mqtt/current ] && [ -f "$PIN" ] && [ ! -L "$PIN" ] && [ "$(cat "$PIN")" = "$ID" ]; then rm -f -- "$PIN"; fi
+   rm -rf -- "/var/brilliant-mqtt/.rollback/$ID" "/var/brilliant-mqtt/.rollback/.$ID.tmp" "/var/brilliant-mqtt/.rollback/.$ID.finalizing"
+   ```
+   <!-- interrupted-baseline-cleanup:end -->
+
+5. Check the bridge with `systemctl is-active brilliant-mqtt`, and run
+   `systemctl start brilliant-mqtt` if it is not `active`.
 
 ## Interrupted onboarding without an HA panel owner
 
