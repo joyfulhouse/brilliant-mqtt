@@ -131,6 +131,13 @@ class BusClient(Protocol):
         For an issued wired write, call ticket.mark_issued with the current
         capture provenance after admission and the per-device lock, immediately
         before sending the native RPC. Omitting this disables the capture fence.
+
+        Call ticket.mark_settled for EVERY admitted write once its native work
+        ends, even after the caller returned or hit its deadline: the receipt,
+        the native exception, or WriteCancelled for cancelled, tombstoned and
+        never-issued work. A write still running at the caller deadline raises
+        asyncio.TimeoutError with the ticket unsettled; the bridge relies on
+        that to learn the detached RPC's late outcome (#225).
         """
         ...
 
