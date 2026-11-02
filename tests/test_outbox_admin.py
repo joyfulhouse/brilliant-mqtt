@@ -10,6 +10,7 @@ import os
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -341,7 +342,7 @@ def test_audit_log_is_append_only_and_size_capped(
     for generation in generations:
         assert generation.stat().st_size <= 200
         lines += [json.loads(line) for line in generation.read_text().splitlines()]
-    indexes = [line["index"] for line in lines]
+    indexes = [cast(int, line["index"]) for line in lines]
     # Three rotated generations plus the live log, contiguous and in order.
     assert indexes == list(range(indexes[0], 40))
     assert indexes[0] > 0
@@ -359,14 +360,14 @@ def test_audit_line_is_one_write_and_a_short_write_refuses(
         writes.append(len(data))
         return real_write(descriptor, data)
 
-    monkeypatch.setattr(outbox_admin.os, "write", counting_write)
+    monkeypatch.setattr(outbox_admin, "_os_write", counting_write)
     outbox_admin.append_audit(path, {"action": "release", "key": "k"})
     assert len(writes) == 1 and writes[0] == len(path.read_bytes())
 
     def short_write(descriptor: int, data: bytes) -> int:
         return real_write(descriptor, data[:3])
 
-    monkeypatch.setattr(outbox_admin.os, "write", short_write)
+    monkeypatch.setattr(outbox_admin, "_os_write", short_write)
     with pytest.raises(OSError):
         outbox_admin.append_audit(path, {"action": "discard", "key": "k"})
 

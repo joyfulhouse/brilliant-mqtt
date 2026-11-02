@@ -51,6 +51,8 @@ from brilliant_mqtt.scene_state import SceneState, atomic_write_state, load_stat
 
 AUDIT_LOG_LIMIT_BYTES = 256 * 1024
 AUDIT_LOG_GENERATIONS = 3
+# One indirection so tests can model a short write without patching os globally.
+_os_write: Callable[[int, bytes], int] = os.write
 AGENT_UNIT = "brilliant-mqtt"
 
 
@@ -202,7 +204,7 @@ def append_audit(path: Path, entry: Mapping[str, object]) -> None:
         os.replace(path, path.with_name(f"{path.name}.1"))
     descriptor = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
     try:
-        if os.write(descriptor, line) != len(line):
+        if _os_write(descriptor, line) != len(line):
             raise OSError("short audit log write")
         os.fsync(descriptor)
     finally:
