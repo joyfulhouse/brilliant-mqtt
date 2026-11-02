@@ -482,6 +482,7 @@ def test_recovery_releases_retained_attempt_lease_even_when_rate_limited(
 ) -> None:
     phase = tmp_path / "bus-phase"
     write_phase(str(phase), "bus", monotonic_clock=lambda: 100.0)
+    original = phase.read_bytes()
 
     def readonly(*args: object, **kwargs: object) -> None:
         raise OSError("read-only filesystem")
@@ -491,11 +492,17 @@ def test_recovery_releases_retained_attempt_lease_even_when_rate_limited(
     monkeypatch.setattr("brilliant_mqtt.heartbeat.os.unlink", readonly)
     assert not write_phase(str(phase), "bus", monotonic_clock=lambda: 200.0)
     assert str(phase) in heartbeat._phase_leases
+    assert phase.read_bytes() == original
     assert not write_phase(
         str(phase), "bus", bus_read_succeeded=True, monotonic_clock=lambda: 201.0
     )
     assert str(phase) not in heartbeat._phase_leases
     assert str(phase) not in heartbeat._owned_phase_records
+    # The rate-limited recovery attempts no write but still revokes the stale
+    # attempt through the retained lease.
+    assert phase.read_bytes() == b""
+    _simulate_writer_death(monkeypatch, phase)
+    assert bus_failure_age(str(phase), now=250.0, observer=BusFailureObserver()) is None
 
 
 def _deny_path_writes(monkeypatch: pytest.MonkeyPatch, *, rewrite: bool = False) -> None:
@@ -674,11 +681,7 @@ def test_revocation_empties_marker_after_partly_failed_rewrite(
         assert phase.read_bytes().startswith(b"X")
         return rewritten
 
-    def _no_dup(fd: int) -> int:
-        raise OSError(errno.EMFILE, "Too many open files")
-
     monkeypatch.setattr(heartbeat, "_rewrite_phase_lease", _observed_rewrite)
-    monkeypatch.setattr("brilliant_mqtt.heartbeat.os.dup", _no_dup)
     stream.armed = True
 
     assert not write_phase(

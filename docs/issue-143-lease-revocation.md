@@ -74,10 +74,12 @@ current.
 ## Revocation through the lease descriptor
 
 A writer leaving bus attribution (a successful read, or a `pre_bus` broker-only
-retry) first tries every path-based write: atomic replacement, in-place
-rewrite, and unlink. Only if all of them fail does it call `ftruncate(fd, 0)` on
-the leased descriptor, while still holding the exclusive `flock`, and then
-release the lease. The watchdog therefore never sees the stale attempt
+retry) truncates its marker only once path-based writes (atomic replacement,
+in-place rewrite, and unlink) have failed. Normally it tries all of them in
+that call. Within the retry interval after a failed write, a rate-limited
+recovery does not retry them. Either way it calls `ftruncate(fd, 0)` on the
+leased descriptor while still holding the exclusive `flock`, and then
+releases the lease. The watchdog therefore never sees the stale attempt
 unleased: it sees either the leased record or an empty marker, which parses as
 no evidence. This holds after writer death and across watchdog restarts, so it
 does not depend on sampling.
@@ -90,10 +92,16 @@ Revocation runs on these paths:
   fail and the unlink also fails.
 - The outer `OSError`/`UnicodeError` path for an unexpected error mid-update,
   again only if the unlink fails.
-- The `BlockingIOError` path.
+- The `BlockingIOError` path. This one is defensive and effectively
+  unreachable, since every `BlockingIOError` source inside the update is
+  already handled further in.
 
 A failed bus attempt never truncates, so genuine #133 crash-loop evidence is
-unchanged whenever marker writes succeed, and still retained when they fail.
+unchanged whenever marker writes succeed. When they fail, it is retained until
+this process leaves bus attribution. With fully broken storage, a later
+`pre_bus` in the same process truncates its own earlier failed-attempt record.
+That is the safe direction: the process is alive and has moved on, so the
+record no longer describes a crash.
 If the kernel refuses the truncate, the writer logs one warning and keeps the
 earlier best-effort behaviour: it releases the lease with the stale bytes in
 place.

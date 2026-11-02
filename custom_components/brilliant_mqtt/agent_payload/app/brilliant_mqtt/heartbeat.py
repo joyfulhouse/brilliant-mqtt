@@ -326,7 +326,7 @@ def _invalidate_failed_write(
         logger.log(
             error_level,
             "bus phase write failed for %s and marker invalidation failed: %s; "
-            "a held live-writer lease revokes the stale marker before release",
+            "stale marker remains unless a held lease revokes it",
             path,
             invalidation_error,
             exc_info=(type(write_error), write_error, write_error.__traceback__),
@@ -538,6 +538,8 @@ def write_phase(
         _last_attempt.pop(path, None)
         return True
     except BlockingIOError:
+        # Defensive and effectively unreachable: every BlockingIOError source
+        # inside the try is already handled further in.
         _release_phase_lease(path, revoke=leaving)
         return False
     except (OSError, UnicodeError) as error:
