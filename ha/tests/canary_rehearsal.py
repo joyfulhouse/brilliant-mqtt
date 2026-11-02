@@ -82,8 +82,9 @@ class RehearsalShell(FakeShell):
             .replace(panel_ops._PANEL_ATOMIC_MOVER, "/usr/bin/mv")
         )
 
-    async def run(self, command: str) -> RunResult:
-        process = await self.start(command)
+    # Overrides FakeShell's transport bodies, so drop_on/drop_after apply here too.
+    async def _do_run(self, command: str) -> RunResult:
+        process = await self._do_start(command)
         try:
             return await process.wait()
         except BaseException:
@@ -91,7 +92,7 @@ class RehearsalShell(FakeShell):
             await process.wait()
             raise
 
-    async def start(self, command: str) -> RehearsalProcess:
+    async def _do_start(self, command: str) -> RehearsalProcess:
         self.commands.append(command)
         env = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}")
         process = await asyncio.create_subprocess_exec(
@@ -105,12 +106,12 @@ class RehearsalShell(FakeShell):
         )
         return RehearsalProcess(process, self.panel)
 
-    async def put_bytes(self, data: bytes, remote_path: str, mode: int) -> None:
+    async def _do_put_bytes(self, data: bytes, remote_path: str, mode: int) -> None:
         path = Path(self.translate(remote_path))
         await asyncio.to_thread(path.write_bytes, data)
         await asyncio.to_thread(path.chmod, mode)
 
-    async def put_dir(self, local_dir: str, remote_dir: str) -> None:
+    async def _do_put_dir(self, local_dir: str, remote_dir: str) -> None:
         def copy() -> None:
             destination = Path(self.translate(remote_dir))
             shutil.copytree(local_dir, destination)

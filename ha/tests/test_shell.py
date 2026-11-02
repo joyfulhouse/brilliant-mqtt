@@ -1216,3 +1216,79 @@ async def test_upload_rejects_symlink_without_remote_mutation(
     with pytest.raises(ValueError, match="upload_source_not_regular"):
         await shell.put_dir(str(source), "/destination")
     assert not sftp.files and not sftp.directories
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_connect_enables_ssh_keepalive(monkeypatch: pytest.MonkeyPatch, legacy: bool) -> None:
+    """A silently dead link is detected within interval * count, not by a TCP timeout."""
+    captured = _patch_connect(
+        monkeypatch, _FakeConnection(_FakeServerHostKey(_REAL_ED25519_PUB.encode()))
+    )
+    shell: AsyncsshShell | _LegacyAsyncsshShell = (
+        _LegacyAsyncsshShell("192.168.1.10", "pw", _REAL_ED25519_PUB)
+        if legacy
+        else AsyncsshShell("192.168.1.10", "pw", _REAL_ED25519_PUB)
+    )
+
+    await shell.connect()
+
+    assert captured["keepalive_interval"] == 15
+    assert captured["keepalive_count_max"] == 3
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_transport_lost_only_on_an_abnormal_disconnect(
+    monkeypatch: pytest.MonkeyPatch, legacy: bool
+) -> None:
+    """Only a connection_lost carrying an exception marks the session lost (#219)."""
+    clients: list[asyncssh.SSHClient] = []
+
+    async def fake_connect(host: str, **kwargs: object) -> _FakeConnection:
+        factory = kwargs["client_factory"]
+        assert callable(factory)
+        client = factory()
+        assert isinstance(client, asyncssh.SSHClient)
+        clients.append(client)
+        return _FakeConnection(_FakeServerHostKey(_REAL_ED25519_PUB.encode()))
+
+    monkeypatch.setattr(asyncssh, "connect", fake_connect)
+    for exc, expected in (
+        (None, False),
+        (asyncssh.ConnectionLost("lost"), True),
+        (OSError(113, "No route to host"), True),
+    ):
+        shell: AsyncsshShell | _LegacyAsyncsshShell = (
+            _LegacyAsyncsshShell("192.168.1.10", "pw", _REAL_ED25519_PUB)
+            if legacy
+            else AsyncsshShell("192.168.1.10", "pw", _REAL_ED25519_PUB)
+        )
+        await shell.connect()
+        assert shell.transport_lost() is False
+        clients[-1].connection_lost(exc)
+        assert shell.transport_lost() is expected
+
+
+async def test_fake_shell_drop_on_fails_before_the_command_runs() -> None:
+    shell = FakeShell(drop_on="BRILLIANT_RELEASE_IDENTITY_READ")
+    await shell.connect()
+
+    with pytest.raises(asyncssh.ConnectionLost):
+        await shell.run("echo BRILLIANT_RELEASE_IDENTITY_READ")
+
+    assert shell.transport_lost() is True
+    assert shell.identity_commands == []
+    with pytest.raises(asyncssh.ConnectionLost):
+        await shell.run("true")
+
+
+async def test_fake_shell_drop_after_completes_remotely_then_drops() -> None:
+    shell = FakeShell(drop_after="restart")
+    await shell.connect()
+    await shell.run("prepare")
+    assert shell.transport_lost() is False
+
+    with pytest.raises(asyncssh.ConnectionLost):
+        await shell.run("systemctl restart brilliant-mqtt")
+
+    assert shell.commands == ["prepare", "systemctl restart brilliant-mqtt"]
+    assert shell.transport_lost() is True
