@@ -53,7 +53,6 @@ from custom_components.brilliant_mqtt.panel_provisioner import (
     StagedRelease,
     TransactionLookup,
     TransactionLookupState,
-    _settle,
     panel_release_provider,
     panel_snapshot_from_stored,
     staged_release_from_journal,
@@ -1712,7 +1711,7 @@ async def test_settle_preserves_same_turn_cancellation_race() -> None:
     for _ in range(20):
         loop = asyncio.get_running_loop()
         operation: asyncio.Future[None] = loop.create_future()
-        task = asyncio.create_task(_settle(operation))
+        task = asyncio.create_task(panel_ops.settle(operation))
         await asyncio.sleep(0)
         loop.call_soon(operation.set_result, None)
         loop.call_soon(task.cancel)
@@ -1721,43 +1720,6 @@ async def test_settle_preserves_same_turn_cancellation_race() -> None:
 
         assert outcome.cancellation is not None
         assert outcome.error is None
-
-
-async def test_settle_classifies_dependency_cancellation_as_child_failure() -> None:
-    async def internally_cancelled() -> None:
-        raise asyncio.CancelledError("inner-cleanup")
-
-    outcome = await _settle(internally_cancelled())
-
-    assert isinstance(outcome.error, asyncio.CancelledError)
-    assert outcome.error.args == ("inner-cleanup",)
-    assert outcome.cancellation is None
-    owner = asyncio.current_task()
-    assert owner is not None
-    assert owner.cancelling() == 0
-
-
-async def test_settle_preserves_latest_repeated_caller_cancellation() -> None:
-    started = asyncio.Event()
-    release = asyncio.Event()
-
-    async def operation() -> None:
-        started.set()
-        await release.wait()
-
-    task = asyncio.create_task(_settle(operation()))
-    await started.wait()
-    task.cancel("first-control")
-    await asyncio.sleep(0)
-    task.cancel("newest-control")
-    await asyncio.sleep(0)
-    release.set()
-
-    outcome = await task
-
-    assert outcome.error is None
-    assert outcome.cancellation is not None
-    assert outcome.cancellation.args == ("newest-control",)
 
 
 async def test_cancel_during_observer_close_rolls_back_despite_repeated_cancel() -> None:

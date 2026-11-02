@@ -899,6 +899,71 @@ class StagedRelease:
         )
 
 
+# Bound for one settled cleanup that retires an unowned rollback baseline.
+CLEANUP_FINALIZE_SECONDS = 120.0
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class Settlement[T]:
+    """How one shielded operation settled; never retains raw remote detail itself.
+
+    ``error`` is the operation's own failure (a bound expiry is a TimeoutError);
+    ``cancellation`` is a cancellation of the awaiting owner, reported separately
+    so the caller can re-raise it after the operation has settled.
+    """
+
+    error: BaseException | None
+    cancellation: asyncio.CancelledError | None
+    result: T | None = None
+
+
+async def settle[T](
+    operation: Awaitable[T],
+    *,
+    bound_seconds: float | None = None,
+) -> Settlement[T]:
+    """Run *operation* to settlement despite owner cancellation.
+
+    An owner cancellation waits for the operation to settle and is then reported,
+    never swallowed; repeated owner cancellations report the latest. A
+    cancellation raised by the operation itself is its failure, not the owner's.
+    Past ``bound_seconds`` the operation is cancelled (for a remote panel command
+    that terminates the child and fences the shell, see ``_provisioning_run``)
+    and settles as failed.
+    """
+    task: asyncio.Future[T] = asyncio.ensure_future(
+        operation if bound_seconds is None else asyncio.wait_for(operation, bound_seconds)
+    )
+    owner = asyncio.current_task()
+    observed_cancellations = owner.cancelling() if owner is not None else 0
+    cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as error:
+            current_cancellations = owner.cancelling() if owner is not None else 0
+            if current_cancellations > observed_cancellations:
+                cancellation = error
+                observed_cancellations = current_cancellations
+            if task.done():
+                break
+        except BaseException:
+            break
+    try:
+        result = task.result()
+    except BaseException as error:
+        return Settlement(error=error, cancellation=cancellation)
+    return Settlement(error=None, cancellation=cancellation, result=result)
+
+
+def _settled_exit_ok(settlement: Settlement[RunResult]) -> bool:
+    return (
+        settlement.error is None
+        and settlement.result is not None
+        and settlement.result.exit_status == 0
+    )
+
+
 async def _provisioning_run(
     shell: PanelShell,
     command: str,
@@ -1479,45 +1544,16 @@ async def capture_baseline(
         return captured
     # The published archive/pin never authorised a mutation, so retire it now
     # instead of leaving a stranded baseline that blocks this panel.
-    finalized, cancellation = await _settled_finalize(shell, captured)
+    finalized = await settle(
+        _baseline_action(shell, captured, "finalize"), bound_seconds=CLEANUP_FINALIZE_SECONDS
+    )
     if isinstance(failure, asyncio.CancelledError):
         raise failure
-    if cancellation is not None:
-        raise cancellation
-    if not finalized:
+    if finalized.cancellation is not None:
+        raise finalized.cancellation
+    if finalized.error is not None:
         raise PanelOpError("baseline_capture_interrupted") from None
     raise failure
-
-
-_BASELINE_FINALIZE_SECONDS = 120.0
-
-
-async def _settled_finalize(
-    shell: PanelShell, snapshot: PanelSnapshot
-) -> tuple[bool, asyncio.CancelledError | None]:
-    """Finalize a just-published baseline, shielded and bounded.
-
-    An outer cancellation waits for the finalize to settle and is returned, never
-    swallowed. Past the bound the finalize is cancelled, which terminates the
-    remote process and fences the shell (see ``_provisioning_run``).
-    """
-    task = asyncio.create_task(
-        asyncio.wait_for(
-            _baseline_action(shell, snapshot, "finalize"),
-            _BASELINE_FINALIZE_SECONDS,
-        )
-    )
-    cancellation: asyncio.CancelledError | None = None
-    while not task.done():
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError as error:
-            if not task.done():
-                cancellation = error
-        except Exception:
-            pass
-    finalized = not task.cancelled() and task.exception() is None
-    return finalized, cancellation
 
 
 async def _baseline_action(shell: PanelShell, snapshot: PanelSnapshot, action: str) -> None:
@@ -1743,35 +1779,6 @@ def _stage_promote_command(staged: StagedRelease) -> str:
     )
 
 
-async def _settled_cleanup_run(shell: PanelShell, command: str) -> bool:
-    """Run cleanup to settlement and report failure without losing cancellation."""
-    cleanup_task = asyncio.create_task(shell.run(command))
-    owner = asyncio.current_task()
-    observed_cancellations = owner.cancelling() if owner is not None else 0
-    cancellation: asyncio.CancelledError | None = None
-    while not cleanup_task.done():
-        try:
-            await asyncio.shield(cleanup_task)
-        except asyncio.CancelledError as error:
-            current_cancellations = owner.cancelling() if owner is not None else 0
-            if current_cancellations > observed_cancellations:
-                cancellation = error
-                observed_cancellations = current_cancellations
-            if cleanup_task.done():
-                break
-        except Exception:
-            break
-    succeeded = False
-    try:
-        succeeded = cleanup_task.result().exit_status == 0
-    except BaseException:
-        pass
-    command = "<redacted>"
-    if cancellation is not None:
-        raise cancellation from None
-    return succeeded
-
-
 async def stage_release(
     shell: PanelShell,
     local_payload_dir: str,
@@ -1904,11 +1911,10 @@ async def stage_release(
     mqtt_ca = None
     mqtt_ca_digest = None
     if failure is not None:
-        cleanup_succeeded = await _settled_cleanup_run(
-            shell,
-            _cleanup_staged_command(staged),
-        )
-        if not cleanup_succeeded:
+        cleanup = await settle(shell.run(_cleanup_staged_command(staged)))
+        if cleanup.cancellation is not None:
+            raise cleanup.cancellation from None
+        if not _settled_exit_ok(cleanup):
             if not isinstance(failure, Exception):
                 raise failure from None
             raise PanelOpError("staged_cleanup_failed")
@@ -2374,11 +2380,10 @@ async def rollback_snapshot(
     except BaseException as error:
         failure = error
 
-    cleanup_succeeded = await _settled_cleanup_run(
-        shell,
-        _rollback_cleanup_command(staged),
-    )
-    if not cleanup_succeeded:
+    cleanup = await settle(shell.run(_rollback_cleanup_command(staged)))
+    if cleanup.cancellation is not None:
+        raise cleanup.cancellation from None
+    if not _settled_exit_ok(cleanup):
         if failure is not None and not isinstance(failure, Exception):
             raise failure from None
         raise PanelOpError("rollback_cleanup_failed")

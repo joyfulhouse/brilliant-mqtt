@@ -59,6 +59,8 @@ from .panel_ops import (
     ReleaseAdmission,
     ReleaseIdentityBlocked,
     ServiceSnapshot,
+    Settlement,
+    settle,
 )
 from .panel_ops import (
     StagedRelease as StagedRelease,
@@ -777,12 +779,6 @@ class _InstallState:
     failure_stage: str = "provisioning"
 
 
-@dataclass(frozen=True, slots=True, repr=False)
-class _Settlement:
-    error: BaseException | None
-    cancellation: asyncio.CancelledError | None
-
-
 # How often a rollback reconnect backoff re-checks for an HA stop.
 _STOP_POLL_SECONDS = 0.5
 
@@ -959,7 +955,7 @@ class PanelProvisioner:
                     if cancellation is not None
                     else _required_primary_code(primary)
                 )
-                compensation = await _settle(self._async_compensate(state, original_code, progress))
+                compensation = await settle(self._async_compensate(state, original_code, progress))
                 await self._async_report_compensation_failure(
                     state,
                     original_code,
@@ -986,12 +982,12 @@ class PanelProvisioner:
                 state.failure_stage = "cleanup"
                 original_code = "operation_cancelled"
                 if result is None:
-                    compensation = _Settlement(
+                    compensation = Settlement(
                         error=PanelProvisioningError("rollback_failed"),
                         cancellation=None,
                     )
                 else:
-                    compensation = await _settle(
+                    compensation = await settle(
                         self._async_reopen_compensate_and_close(
                             state,
                             request,
@@ -1106,7 +1102,7 @@ class PanelProvisioner:
                     version, transaction, request.selected_components
                 )
                 if shell.transport_lost():
-                    outcome = await _settle(
+                    outcome = await settle(
                         self._async_rollback_over_fresh_session(current, snapshot, staged, stopping)
                     )
                     # The rollback itself recorded any failure and kept the intent; a
@@ -1116,7 +1112,7 @@ class PanelProvisioner:
                     if isinstance(outcome.error, PanelProvisioningError):
                         raise PanelProvisioningError(outcome.error.code) from None
                 else:
-                    outcome = await _settle(
+                    outcome = await settle(
                         self._async_recovery_rollback(
                             current, shell, snapshot, staged, original_code="health_failed"
                         )
@@ -1144,7 +1140,7 @@ class PanelProvisioner:
         if existing is not None:
             state.failure_code = "recovery_failed"
             state.failure_stage = "recovery"
-            recovery = await _settle(self._async_recover_bounded(progress))
+            recovery = await settle(self._async_recover_bounded(progress))
             if recovery.cancellation is not None:
                 raise recovery.cancellation
             if recovery.error is not None:
@@ -1303,7 +1299,7 @@ class PanelProvisioner:
             started_at=self._clock(),
             last_error=None,
         )
-        create_outcome = await _settle(self._journal.async_create(record))
+        create_outcome = await settle(self._journal.async_create(record))
         if create_outcome.error is not None:
             if create_outcome.cancellation is not None:
                 raise create_outcome.cancellation from None
@@ -1496,7 +1492,7 @@ class PanelProvisioner:
             return
 
         if state.journal_phase is ProvisioningPhase.STAGED:
-            await _settle(
+            await settle(
                 self._journal.async_record_error(
                     state.transaction_id,
                     StoredJournalError(
@@ -1542,7 +1538,7 @@ class PanelProvisioner:
         self,
         state: _InstallState,
         original_code: str,
-        compensation: _Settlement,
+        compensation: Settlement[None],
     ) -> None:
         if (
             compensation.error is None
@@ -1562,7 +1558,7 @@ class PanelProvisioner:
             if state.journal_phase is ProvisioningPhase.STAGED
             else "rollback_failed"
         )
-        await _settle(
+        await settle(
             self._repair_reporter.async_report_rollback_failure(
                 state.transaction_id,
                 original_code=original_code,
@@ -1598,7 +1594,7 @@ class PanelProvisioner:
                     ProvisioningPhase.PENDING_CONFIG_COMMIT,
                 )
 
-            outcome = await _settle(mark_pending())
+            outcome = await settle(mark_pending())
             if outcome.cancellation is not None:
                 raise outcome.cancellation from None
             if outcome.error is not None:
@@ -1622,7 +1618,7 @@ class PanelProvisioner:
                 )
                 await self._repair_reporter.async_clear_rollback_failure(transaction_id)
 
-            outcome = await _settle(complete_commit())
+            outcome = await settle(complete_commit())
             if outcome.cancellation is not None:
                 raise outcome.cancellation from None
             if outcome.error is not None:
@@ -1634,7 +1630,7 @@ class PanelProvisioner:
     ) -> None:
         """Settle the one durable transaction before accepting new work."""
         async with self._lock:
-            outcome = await _settle(self._async_recover_bounded(progress))
+            outcome = await settle(self._async_recover_bounded(progress))
             if outcome.cancellation is not None:
                 raise outcome.cancellation from None
             if outcome.error is not None:
@@ -1927,7 +1923,7 @@ class PanelProvisioner:
         """Best-effort durable typed error; never changes phase, baseline or journal."""
         if code not in PROVISIONING_ERROR_CODES:
             code = "recovery_failed"
-        await _settle(
+        await settle(
             self._journal.async_record_error(
                 record.transaction_id, StoredJournalError(stage="recovery", code=code)
             )
@@ -1996,7 +1992,7 @@ class PanelProvisioner:
                             current, _noop_progress, host=host, password=password
                         )
 
-            outcome = await _settle(recover())
+            outcome = await settle(recover())
             if outcome.cancellation is not None:
                 raise outcome.cancellation from None
             if isinstance(outcome.error, TimeoutError):
@@ -2081,7 +2077,7 @@ class PanelProvisioner:
             await self._journal.async_record_error(
                 current.transaction_id, StoredJournalError(stage="rollback", code=failure_code)
             )
-            await _settle(
+            await settle(
                 self._repair_reporter.async_report_rollback_failure(
                     current.transaction_id,
                     original_code=original_code,
@@ -2186,12 +2182,12 @@ class PanelProvisioner:
         """Keep the durable intent; record the typed failure and raise a Repair."""
         if code not in PROVISIONING_ERROR_CODES:
             code = "rollback_failed"
-        await _settle(
+        await settle(
             self._journal.async_record_error(
                 record.transaction_id, StoredJournalError(stage="recovery", code=code)
             )
         )
-        await _settle(
+        await settle(
             self._repair_reporter.async_report_rollback_failure(
                 record.transaction_id,
                 original_code="connection_lost",
@@ -2312,7 +2308,7 @@ class PanelProvisioner:
                 await shell.connect()
                 await self._async_assert_ownerless(expected)
                 marked = await self._journal.async_begin_ownerless_finalize(expected)
-                outcome = await _settle(self._async_finish_ownerless_finalize(shell, marked))
+                outcome = await settle(self._async_finish_ownerless_finalize(shell, marked))
                 if outcome.cancellation is not None:
                     raise outcome.cancellation from None
                 if outcome.error is not None:
@@ -2355,43 +2351,17 @@ class PanelProvisioner:
         return candidate
 
 
-async def _settle(operation: Awaitable[Any]) -> _Settlement:
-    """Settle cleanup despite caller cancellation and retain no raw detail."""
-    task = asyncio.ensure_future(operation)
-    owner = asyncio.current_task()
-    observed_cancellations = owner.cancelling() if owner is not None else 0
-    cancellation: asyncio.CancelledError | None = None
-    while not task.done():
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError as error:
-            current_cancellations = owner.cancelling() if owner is not None else 0
-            if current_cancellations > observed_cancellations:
-                cancellation = error
-                observed_cancellations = current_cancellations
-            if task.done():
-                break
-        except BaseException:
-            break
-    failure: BaseException | None = None
-    try:
-        task.result()
-    except BaseException as error:
-        failure = error
-    return _Settlement(error=failure, cancellation=cancellation)
-
-
 async def _settle_close(
-    operation: Callable[[], Awaitable[Any]] | None,
-) -> _Settlement:
+    operation: Callable[[], Awaitable[object]] | None,
+) -> Settlement[object]:
     if operation is None:
-        return _Settlement(error=None, cancellation=None)
+        return Settlement(error=None, cancellation=None)
     try:
-        return await _settle(operation())
+        return await settle(operation())
     except asyncio.CancelledError as error:
-        return _Settlement(error=None, cancellation=error)
+        return Settlement(error=None, cancellation=error)
     except BaseException as error:
-        return _Settlement(error=error, cancellation=None)
+        return Settlement(error=error, cancellation=None)
 
 
 def _required_primary_code(
