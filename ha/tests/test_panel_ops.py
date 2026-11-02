@@ -1591,11 +1591,16 @@ _EXPECTED_VOICE_SWAP = " && ".join(
 )
 
 
+_VOICE_ARCH_CHECK = '[ "$(uname -m)" = armv7l ]'
+
+
 async def test_deploy_voice_payload_uploads_tarball_then_swaps() -> None:
     shell = await _connected(FakeShell())
     await panel_ops.deploy_voice_payload(shell, "/local/voice.tar.gz", version="0.1.0")
-    # 1. Staging clear runs first.
-    assert shell.commands[0] == (
+    # 0. The armv7l-only payload is refused on any other architecture first.
+    assert shell.commands[0] == _VOICE_ARCH_CHECK
+    # 1. Staging clear runs next.
+    assert shell.commands[1] == (
         "rm -rf /var/brilliant-voice.staging /var/brilliant-voice.staging.tar.gz"
     )
     # 2. Tarball uploaded via put_file (not put_dir).
@@ -1606,6 +1611,16 @@ async def test_deploy_voice_payload_uploads_tarball_then_swaps() -> None:
     assert _EXPECTED_VOICE_SWAP in shell.commands
     # 4. VERSION file written.
     assert (PANEL_VOICE_VERSION_FILE, b"0.1.0", 0o644) in shell.uploads
+
+
+async def test_deploy_voice_payload_refuses_non_armv7l_before_touching_panel() -> None:
+    """Issue #155: the voice satellite payload ships armv7l native code only."""
+    shell = await _connected(FakeShell(responses={_VOICE_ARCH_CHECK: RunResult(1, "", "")}))
+    with pytest.raises(panel_ops.PanelOpError, match="armv7l-only"):
+        await panel_ops.deploy_voice_payload(shell, "/local/voice.tar.gz", version="0.1.0")
+    assert shell.commands == [_VOICE_ARCH_CHECK]
+    assert shell.file_uploads == []
+    assert shell.uploads == []
 
 
 async def test_deploy_voice_payload_skips_version_when_swap_fails() -> None:
