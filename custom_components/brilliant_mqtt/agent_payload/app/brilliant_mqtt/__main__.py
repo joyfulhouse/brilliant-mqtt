@@ -315,6 +315,10 @@ async def _run_session(
                 # instead of normalized and then dropped by the peripheral-id
                 # filter. Admits the own device (never under-admits an execution).
                 want_device=_is_panel_device,
+                # #113: the session's own QoS-1 acknowledgements and drop
+                # signal attribute a poison frame; details go to diag meta.
+                session_signals=mqtt,
+                diagnostics=diagnostics,
             )
             if settings.scene_bridge_enabled
             else None
