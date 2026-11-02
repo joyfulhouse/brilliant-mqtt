@@ -1143,6 +1143,72 @@ class TestDetachedWrites:
         # The task's exception was retrieved (no "never retrieved" at GC).
         assert task.exception() is not None
 
+    async def test_late_completion_reaches_the_settle_callback(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#225: the detached write's late receipt reaches its ticket's callback."""
+        monkeypatch.setattr(bus_mod, "_WRITE_DEADLINE_S", 0.01)
+        observer, adapter = _gated_adapter()
+        ticket = AdmissionTicket()
+        with pytest.raises(asyncio.TimeoutError):
+            await adapter.set_variables("ble_mesh", "p", [VarSet("on", "0")], ticket=ticket)
+        assert not ticket.settled
+        seen: list[object] = []
+        ticket.set_settle_callback(seen.append)
+
+        observer.release.set()
+        await asyncio.gather(*adapter._write_tasks)
+        await _settle()
+
+        assert seen == ["'ok'"]
+        await adapter.shutdown()
+
+    async def test_late_failure_reaches_the_settle_callback(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(bus_mod, "_WRITE_DEADLINE_S", 0.01)
+        error = RuntimeError("late boom")
+        observer, adapter = _gated_adapter(fail_with=error)
+        ticket = AdmissionTicket()
+        with pytest.raises(asyncio.TimeoutError):
+            await adapter.set_variables("ble_mesh", "p", [VarSet("on", "0")], ticket=ticket)
+        seen: list[object] = []
+        ticket.set_settle_callback(seen.append)
+
+        observer.release.set()
+        await asyncio.gather(*adapter._write_tasks, return_exceptions=True)
+        await _settle()
+
+        assert seen == [error]
+        await adapter.shutdown()
+
+    async def test_failing_settle_callback_is_contained(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setattr(bus_mod, "_WRITE_DEADLINE_S", 0.01)
+        observer, adapter = _gated_adapter()
+        ticket = AdmissionTicket()
+        with pytest.raises(asyncio.TimeoutError):
+            await adapter.set_variables("ble_mesh", "p", [VarSet("on", "0")], ticket=ticket)
+
+        def fail(_outcome: object) -> None:
+            raise RuntimeError("private-payload-sentinel")
+
+        ticket.set_settle_callback(fail)
+        with caplog.at_level(logging.WARNING, logger="brilliant_mqtt.bus"):
+            observer.release.set()
+            await asyncio.gather(*adapter._write_tasks)
+            await _settle()
+
+        failures = [r for r in caplog.records if r.getMessage().startswith("WRITE_SETTLE")]
+        assert [r.getMessage() for r in failures] == ["WRITE_SETTLE_CALLBACK_FAILED RuntimeError"]
+        assert failures[0].exc_info is None
+        assert "private-payload-sentinel" not in caplog.text
+        # The lane still moved on: the next write is admitted and served.
+        observer.release.set()
+        assert await adapter.set_variables("ble_mesh", "p", [VarSet("on", "1")]) == "'ok'"
+        await adapter.shutdown()
+
     async def test_hard_cap_latches_once_for_several_capped_writes(
         self,
         monkeypatch: pytest.MonkeyPatch,

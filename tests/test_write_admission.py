@@ -656,3 +656,59 @@ async def test_literal_status_strings_remain_successful_receipts(
     await harness.drain()
     assert await caller == repr(receipt)
     assert not isinstance(caller.result(), Superseded)
+
+
+# ---------------------------------------------------------------------------
+# Issue #225: the ticket reports the native write's (possibly late) outcome
+# ---------------------------------------------------------------------------
+
+
+def test_mark_settled_keeps_only_the_first_outcome() -> None:
+    ticket = AdmissionTicket()
+    seen: list[object] = []
+    ticket.set_settle_callback(seen.append)
+    assert not ticket.settled
+
+    ticket.mark_settled("first")
+    ticket.mark_settled(RuntimeError("second"))
+
+    assert ticket.settled
+    assert seen == ["first"]
+
+
+def test_settle_callback_replays_immediately_on_settled_ticket() -> None:
+    ticket = AdmissionTicket()
+    error = RuntimeError("late")
+    ticket.mark_settled(error)
+    seen: list[object] = []
+
+    ticket.set_settle_callback(seen.append)
+
+    assert seen == [error]
+
+
+def test_settle_callback_replay_failure_is_contained(caplog: pytest.LogCaptureFixture) -> None:
+    ticket = AdmissionTicket()
+    ticket.mark_settled("ok")
+
+    def fail(_outcome: object) -> None:
+        raise RuntimeError("private-payload-sentinel")
+
+    with caplog.at_level(logging.WARNING):
+        ticket.set_settle_callback(fail)
+
+    assert [r.getMessage() for r in caplog.records] == ["WRITE_SETTLE_CALLBACK_FAILED RuntimeError"]
+    assert caplog.records[0].exc_info is None
+    assert "private-payload-sentinel" not in caplog.text
+
+
+def test_clear_settle_callback_stops_delivery() -> None:
+    ticket = AdmissionTicket()
+    seen: list[object] = []
+    ticket.set_settle_callback(seen.append)
+
+    ticket.clear_settle_callback()
+    ticket.mark_settled("ok")
+
+    assert seen == []
+    assert ticket.settled
