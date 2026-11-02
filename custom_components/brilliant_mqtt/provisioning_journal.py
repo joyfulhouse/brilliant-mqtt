@@ -162,6 +162,8 @@ PROVISIONING_ERROR_CODES = frozenset(
         "rollback_credentials_unavailable",
         "snapshot_failed",
         "snapshot_probe_failed",
+        "service_crash_looping",
+        "baseline_capture_interrupted",
         "stage_failed",
         "transaction_in_progress",
         "unsupported_panel_toolchain",

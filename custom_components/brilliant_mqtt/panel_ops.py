@@ -15,12 +15,13 @@ import hashlib
 import io
 import json
 import logging
+import math
 import os
 import re
 import secrets
 import stat
 import tarfile
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
@@ -555,12 +556,160 @@ _MANAGED_MQTT_CA_PATH = re.compile(
 MAX_SNAPSHOT_FILE_BYTES = 16 * 1024
 MAX_SNAPSHOT_WIRE_BYTES = 24 * 1024
 MAX_MQTT_CA_BYTES = 256 * 1024
-_MAX_LAYOUT_WIRE_BYTES = 4096
+_MAX_LAYOUT_WIRE_BYTES = 16 * 1024
 _MAX_VERSION_BYTES = 128
 _PANEL_PYTHON = "/data/switch-embedded/env/bin/python3"
 _PANEL_ATOMIC_MOVER = "/usr/bin/mv.coreutils"
 _PANEL_SHA256SUM = "/usr/bin/sha256sum"
 _PanelPreflightLauncher = Callable[[str], Awaitable[PanelProcess]]
+
+
+# systemd ActiveState vocabulary, defined once and interpolated into the
+# on-panel sampler and _stop_service_command so every reader agrees.
+_RUNNING_ACTIVE_STATES = frozenset({"active", "reloading"})
+_STOPPED_ACTIVE_STATES = frozenset({"inactive", "failed"})
+_TRANSITIONAL_ACTIVE_STATES = frozenset({"activating", "deactivating"})
+_KNOWN_ACTIVE_STATES = (
+    _RUNNING_ACTIVE_STATES
+    | _STOPPED_ACTIVE_STATES
+    | _TRANSITIONAL_ACTIVE_STATES
+    | frozenset({"unknown"})
+)
+_SETTLED_FOR_STOP_STATES = frozenset({"inactive", "failed", "unknown"})
+# A Restart= unit waiting out RestartSec between crashes.
+_CRASH_LOOP_SUB_STATES = frozenset({"auto-restart", "auto-restart-queued"})
+_SUB_STATE_PATTERN = "[a-z0-9-]{0,32}"
+_RESTARTS_PATTERN = "[0-9]{1,12}"
+# "ActiveState|SubState|NRestarts"; an empty NRestarts means unknown.
+_SAMPLE_PATTERN = re.compile(
+    rf"(?P<active>{'|'.join(sorted(_KNOWN_ACTIVE_STATES))})"
+    rf"\|(?P<sub>{_SUB_STATE_PATTERN})"
+    rf"\|(?P<restarts>{_RESTARTS_PATTERN})?"
+)
+_MAX_SAMPLE_ROUNDS = 32
+# A slow systemctl must not let a round gap exceed the bridge's 5 s RestartSec,
+# or a whole auto-restart wait could fall between two samples.
+_MAX_SAMPLE_GAP_SECONDS = 4.0
+
+
+@dataclass(frozen=True, slots=True)
+class SnapshotSampling:
+    """Bounds for the on-panel service-state sampler behind ``snapshot_panel``.
+
+    The sampler watches the three core units for ``window_seconds`` (measured
+    from the first sample round, after the enabled-state reads) so a crash loop
+    shows its ``auto-restart`` wait, stopping early after two consecutive
+    all-stopped rounds once ``minimum_samples`` were taken. ``interval_seconds``
+    may be 0: test sampling uses it with a zero window and the round cap.
+    """
+
+    window_seconds: float
+    minimum_samples: int
+    interval_seconds: float
+    deadline_seconds: float
+    call_timeout_seconds: float
+    maximum_rounds: int
+
+    def __post_init__(self) -> None:
+        floats = (
+            self.window_seconds,
+            self.interval_seconds,
+            self.deadline_seconds,
+            self.call_timeout_seconds,
+        )
+        if (
+            any(
+                type(value) is bool or not isinstance(value, int | float) or math.isnan(value)
+                for value in floats
+            )
+            or type(self.minimum_samples) is not int
+            or type(self.maximum_rounds) is not int
+            or self.minimum_samples < 1
+            or self.maximum_rounds > _MAX_SAMPLE_ROUNDS
+            or self.minimum_samples > self.maximum_rounds
+            or self.interval_seconds < 0
+            or self.window_seconds < 0
+            or self.call_timeout_seconds <= 0
+            or not self.deadline_seconds >= self.window_seconds + self.call_timeout_seconds
+            or (
+                self.interval_seconds > 0
+                and self.window_seconds / self.interval_seconds + 1 > self.maximum_rounds
+            )
+        ):
+            raise ValueError("invalid_snapshot_sampling")
+
+
+SNAPSHOT_SAMPLING = SnapshotSampling(
+    window_seconds=13.5,
+    minimum_samples=2,
+    interval_seconds=0.5,
+    deadline_seconds=40,
+    call_timeout_seconds=3,
+    maximum_rounds=_MAX_SAMPLE_ROUNDS,
+)
+
+
+class ServiceActivity(StrEnum):
+    """Classified run state of one core unit across the snapshot window."""
+
+    RUNNING = "running"
+    STOPPED = "stopped"
+    CRASH_LOOPING = "crash_looping"
+
+
+@dataclass(frozen=True, slots=True)
+class ServiceSample:
+    """One strict ``systemctl show`` reading of a core unit."""
+
+    active_state: str
+    sub_state: str
+    restarts: int | None
+
+    @classmethod
+    def parse(cls, raw: object) -> ServiceSample | None:
+        if type(raw) is not str:
+            return None
+        match = _SAMPLE_PATTERN.fullmatch(raw)
+        if match is None:
+            return None
+        restarts = match["restarts"]
+        return cls(match["active"], match["sub"], None if restarts is None else int(restarts))
+
+
+def _crash_looping(samples: Sequence[ServiceSample]) -> bool:
+    if any(sample.sub_state in _CRASH_LOOP_SUB_STATES for sample in samples):
+        return True
+    restarts = [sample.restarts for sample in samples]
+    first, last = restarts[0], restarts[-1]
+    return (
+        all(value is not None for value in restarts)
+        and first is not None
+        and last is not None
+        and last - first >= 2
+    )
+
+
+def classify_service_samples(samples: Sequence[ServiceSample]) -> ServiceActivity:
+    """Classify one unit's sampled states; refuse an unsettled final state.
+
+    A unit is CRASH_LOOPING when any sample shows an ``auto-restart`` SubState,
+    or when every sample reported NRestarts and it rose by at least 2. With the
+    shipped RestartSec (5 s for the bridge, 10 s for the watchdogs) every real
+    restart inside the window shows an ``auto-restart`` sample, so the NRestarts
+    rule is only a backstop; a mixed sequence such as 3, None, 9 (one unknown
+    reading) does not trigger it and classifies by the last sample, e.g. running.
+    Otherwise the LAST sample decides: running -> RUNNING, stopped -> STOPPED,
+    and a transitional or ``unknown`` state raises ``snapshot_probe_failed``.
+    """
+    if not samples:
+        raise PanelOpError("snapshot_payload_invalid")
+    if _crash_looping(samples):
+        return ServiceActivity.CRASH_LOOPING
+    if samples[-1].active_state in _RUNNING_ACTIVE_STATES:
+        return ServiceActivity.RUNNING
+    if samples[-1].active_state in _STOPPED_ACTIVE_STATES:
+        return ServiceActivity.STOPPED
+    raise PanelOpError("snapshot_probe_failed")
 
 
 class PanelLayout(StrEnum):
@@ -834,7 +983,14 @@ async def _provisioning_put_bytes(
         raise PanelOpError(error_code)
 
 
-def _layout_probe_command() -> str:
+def _layout_probe_command(sampling: SnapshotSampling = SNAPSHOT_SAMPLING) -> str:
+    """Return the on-panel layout probe plus bounded service-state sampler.
+
+    The heredoc runs on the panel's Python 3.10. Each round is ONE batched
+    ``systemctl show`` for the three core units; any malformed reading, failed or
+    timed-out call, missed deadline, or round gap over 4 s exits 45 so
+    ``snapshot_panel`` fails closed with ``snapshot_probe_failed``.
+    """
     legacy_paths = (
         PANEL_ENV_FILE,
         PANEL_VERSION_FILE,
@@ -862,7 +1018,20 @@ def _layout_probe_command() -> str:
     )
     return (
         f"{_PANEL_PYTHON} - <<'BRILLIANT_MQTT_SNAPSHOT'\n"
-        "import json, os, subprocess\n"
+        "import json, os, re, subprocess, time\n"
+        "started = time.monotonic()\n"
+        f"deadline = started + {float(sampling.deadline_seconds)!r}\n"
+        f"window = {float(sampling.window_seconds)!r}\n"
+        f"interval = {float(sampling.interval_seconds)!r}\n"
+        f"call_timeout = {float(sampling.call_timeout_seconds)!r}\n"
+        f"minimum_rounds = {sampling.minimum_samples!r}\n"
+        f"maximum_rounds = {sampling.maximum_rounds!r}\n"
+        f"maximum_gap = {_MAX_SAMPLE_GAP_SECONDS!r}\n"
+        f"known_states = {tuple(sorted(_KNOWN_ACTIVE_STATES))!r}\n"
+        f"stopped_states = {tuple(sorted(_STOPPED_ACTIVE_STATES))!r}\n"
+        f"sub_state_pattern = re.compile({_SUB_STATE_PATTERN!r})\n"
+        f"restarts_pattern = re.compile({_RESTARTS_PATTERN!r})\n"
+        "properties = ('ActiveState', 'SubState', 'NRestarts')\n"
         f"current = {PANEL_CURRENT_LINK!r}\n"
         f"legacy_paths = {legacy_paths!r}\n"
         f"services = {services!r}\n"
@@ -884,38 +1053,91 @@ def _layout_probe_command() -> str:
         "    legacy = any(os.path.lexists(path) for path in legacy_paths)\n"
         "    layout = 'legacy_fixed' if legacy else 'absent'\n"
         "    target = None\n"
-        "def state(service_name, operation, truthy, falsey):\n"
-        "    result = subprocess.run(\n"
-        "        ['systemctl', operation, service_name],\n"
-        "        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,\n"
-        "        check=False, text=True,\n"
-        "    )\n"
-        "    value = result.stdout.strip()\n"
-        # Older systemd can leave stdout empty for is-enabled on an absent unit,
-        # so default that case to "not-found". is-active always prints a usable
-        # state; leaving it empty makes SystemExit(45) fail the probe closed.
-        "    if not value and operation == 'is-enabled':\n"
-        "        value = 'not-found'\n"
-        "    if value in truthy:\n"
-        "        return True\n"
-        "    if value in falsey:\n"
-        "        return False\n"
-        "    raise SystemExit(45)\n"
-        "states = {}\n"
+        "def systemctl(*arguments):\n"
+        "    try:\n"
+        "        return subprocess.run(\n"
+        "            ('systemctl',) + arguments,\n"
+        "            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,\n"
+        "            check=False, text=True, timeout=call_timeout,\n"
+        "        )\n"
+        "    except subprocess.TimeoutExpired:\n"
+        "        raise SystemExit(45)\n"
+        "enabled = {}\n"
         "for component_id, service_name in services:\n"
-        "    enabled = state(\n"
-        "        service_name, 'is-enabled',\n"
-        "        {'alias', 'enabled', 'enabled-runtime', 'linked', 'linked-runtime'},\n"
-        "        {'disabled', 'generated', 'indirect', 'masked', 'not-found',\n"
-        "         'static', 'transient'},\n"
-        "    )\n"
-        "    active = state(\n"
-        "        service_name, 'is-active', {'active'},\n"
-        "        {'failed', 'inactive', 'unknown'},\n"
-        "    )\n"
-        "    states[component_id] = {'active': active, 'enabled': enabled}\n"
+        "    value = systemctl('is-enabled', service_name).stdout.strip()\n"
+        # Older systemd can leave stdout empty for is-enabled on an absent unit,
+        # so default that case to "not-found".
+        "    if not value:\n"
+        "        value = 'not-found'\n"
+        "    if value in ('alias', 'enabled', 'enabled-runtime', 'linked',\n"
+        "                 'linked-runtime'):\n"
+        "        enabled[component_id] = True\n"
+        "    elif value in ('disabled', 'generated', 'indirect', 'masked', 'not-found',\n"
+        "                   'static', 'transient'):\n"
+        "        enabled[component_id] = False\n"
+        "    else:\n"
+        "        raise SystemExit(45)\n"
+        "names = tuple(service_name for _, service_name in services)\n"
+        "def sample_round():\n"
+        "    result = systemctl('show', '-p', 'ActiveState', '-p', 'SubState',\n"
+        "                       '-p', 'NRestarts', *names)\n"
+        "    output = result.stdout\n"
+        "    if result.returncode != 0 or not output.endswith('\\n'):\n"
+        "        raise SystemExit(45)\n"
+        "    blocks = output[:-1].split('\\n\\n')\n"
+        "    if len(blocks) != len(names):\n"
+        "        raise SystemExit(45)\n"
+        "    readings = []\n"
+        "    for block in blocks:\n"
+        "        values = {}\n"
+        "        for line in block.split('\\n'):\n"
+        "            key, separator, value = line.partition('=')\n"
+        "            if not separator or key not in properties or key in values:\n"
+        "                raise SystemExit(45)\n"
+        "            values[key] = value\n"
+        "        if len(values) != len(properties):\n"
+        "            raise SystemExit(45)\n"
+        "        if values['ActiveState'] not in known_states:\n"
+        "            raise SystemExit(45)\n"
+        "        if sub_state_pattern.fullmatch(values['SubState']) is None:\n"
+        "            raise SystemExit(45)\n"
+        "        restarts = values['NRestarts']\n"
+        "        if restarts_pattern.fullmatch(restarts) is None:\n"
+        "            restarts = ''\n"
+        "        readings.append((values['ActiveState'], values['SubState'], restarts))\n"
+        "    return readings\n"
+        "samples = {component_id: [] for component_id, _ in services}\n"
+        "rounds = 0\n"
+        "quiet_rounds = 0\n"
+        "previous_round = None\n"
+        # The window starts here, after the enabled reads, so slow is-enabled
+        # calls cannot shrink it; the deadline still counts from script start.
+        "sampling_started = time.monotonic()\n"
+        "while True:\n"
+        "    round_started = time.monotonic()\n"
+        "    if round_started >= deadline:\n"
+        "        raise SystemExit(45)\n"
+        "    if previous_round is not None and round_started - previous_round > maximum_gap:\n"
+        "        raise SystemExit(45)\n"
+        "    previous_round = round_started\n"
+        "    readings = sample_round()\n"
+        "    rounds += 1\n"
+        "    for (component_id, _), reading in zip(services, readings):\n"
+        "        samples[component_id].append('|'.join(reading))\n"
+        "    if all(reading[0] in stopped_states for reading in readings):\n"
+        "        quiet_rounds += 1\n"
+        "    else:\n"
+        "        quiet_rounds = 0\n"
+        "    if rounds >= maximum_rounds:\n"
+        "        break\n"
+        "    if rounds >= minimum_rounds and (\n"
+        "        quiet_rounds >= 2 or time.monotonic() - sampling_started >= window\n"
+        "    ):\n"
+        "        break\n"
+        "    time.sleep(interval)\n"
         "print(json.dumps(\n"
-        "    {'active_release_target': target, 'layout': layout, 'services': states},\n"
+        "    {'active_release_target': target, 'enabled': enabled, 'layout': layout,\n"
+        "     'samples': samples},\n"
         "    sort_keys=True, separators=(',', ':'),\n"
         "))\n"
         "BRILLIANT_MQTT_SNAPSHOT"
@@ -964,6 +1186,8 @@ def _file_probe_command(path: str, maximum_bytes: int) -> str:
     )
 
 
+# Tests install a fast sampler by monkeypatching this global (ha/tests/conftest.py),
+# so snapshot_panel must read it through the module global at call time.
 SNAPSHOT_LAYOUT_COMMAND = _layout_probe_command()
 SNAPSHOT_FILE_COMMANDS = {
     "environment": _file_probe_command(PANEL_ENV_FILE, MAX_SNAPSHOT_FILE_BYTES),
@@ -1019,21 +1243,35 @@ def _json_object(
     return value
 
 
-def _parse_service_states(raw: object) -> dict[str, tuple[bool, bool]] | None:
+def _parse_service_enabled(raw: object) -> dict[str, bool] | None:
     if type(raw) is not dict or frozenset(raw) != frozenset(_CORE_COMPONENT_ORDER):
         return None
-    states: dict[str, tuple[bool, bool]] = {}
+    enabled: dict[str, bool] = {}
     for component_id in _CORE_COMPONENT_ORDER:
         value = raw.get(component_id)
-        if (
-            type(value) is not dict
-            or frozenset(value) != frozenset({"active", "enabled"})
-            or type(value.get("enabled")) is not bool
-            or type(value.get("active")) is not bool
-        ):
+        if type(value) is not bool:
             return None
-        states[component_id] = (value["enabled"], value["active"])
-    return states
+        enabled[component_id] = value
+    return enabled
+
+
+def _parse_service_samples(raw: object) -> dict[str, tuple[ServiceSample, ...]] | None:
+    """Strictly parse the sampler's per-component rounds (1-32, equal length)."""
+    if type(raw) is not dict or frozenset(raw) != frozenset(_CORE_COMPONENT_ORDER):
+        return None
+    parsed: dict[str, tuple[ServiceSample, ...]] = {}
+    for component_id in _CORE_COMPONENT_ORDER:
+        values = raw.get(component_id)
+        if type(values) is not list or not 1 <= len(values) <= _MAX_SAMPLE_ROUNDS:
+            return None
+        samples = tuple(ServiceSample.parse(value) for value in values)
+        complete = tuple(sample for sample in samples if sample is not None)
+        if len(complete) != len(samples):
+            return None
+        parsed[component_id] = complete
+    if len({len(samples) for samples in parsed.values()}) != 1:
+        return None
+    return parsed
 
 
 def _parse_file_snapshot(raw: str, maximum_bytes: int) -> FileSnapshot | None:
@@ -1067,7 +1305,15 @@ def _parse_file_snapshot(raw: str, maximum_bytes: int) -> FileSnapshot | None:
 
 
 async def snapshot_panel(shell: PanelShell) -> PanelSnapshot:
-    """Capture bounded, exact rollback state for the three fleet-owned services."""
+    """Capture bounded, exact rollback state for the three fleet-owned services.
+
+    Each core unit is sampled over a bounded window (see ``SnapshotSampling``).
+    On an installed layout (anything but ABSENT) a crash-looping unit raises
+    ``service_crash_looping`` before any file probe: no safe rollback baseline
+    exists for a bridge that cannot stay up, and accepting it would leave a later
+    rollback waiting forever for its health. On an ABSENT layout (no agent files)
+    crash evidence only records the unit as not active.
+    """
     layout_result = await _provisioning_run(
         shell,
         SNAPSHOT_LAYOUT_COMMAND,
@@ -1075,12 +1321,13 @@ async def snapshot_panel(shell: PanelShell) -> PanelSnapshot:
     )
     layout_value = _json_object(
         layout_result.stdout,
-        frozenset({"active_release_target", "layout", "services"}),
+        frozenset({"active_release_target", "enabled", "layout", "samples"}),
         _MAX_LAYOUT_WIRE_BYTES,
     )
     if layout_value is None:
         raise PanelOpError("snapshot_payload_invalid")
-    states = _parse_service_states(layout_value["services"])
+    enabled = _parse_service_enabled(layout_value["enabled"])
+    samples = _parse_service_samples(layout_value["samples"])
     raw_layout = layout_value["layout"]
     if not isinstance(raw_layout, str):
         layout = None
@@ -1090,8 +1337,29 @@ async def snapshot_panel(shell: PanelShell) -> PanelSnapshot:
         except ValueError:
             layout = None
     target = layout_value["active_release_target"]
-    if layout is None or states is None or (target is not None and not isinstance(target, str)):
+    if (
+        layout is None
+        or enabled is None
+        or samples is None
+        or (target is not None and not isinstance(target, str))
+    ):
         raise PanelOpError("snapshot_payload_invalid")
+    # Crash evidence outranks an unsettled final state on any other unit.
+    if layout is not PanelLayout.ABSENT and any(
+        _crash_looping(samples[component_id]) for component_id in _CORE_COMPONENT_ORDER
+    ):
+        raise PanelOpError("service_crash_looping")
+    activities = {
+        component_id: classify_service_samples(samples[component_id])
+        for component_id in _CORE_COMPONENT_ORDER
+    }
+    states = {
+        component_id: (
+            enabled[component_id],
+            activities[component_id] is ServiceActivity.RUNNING,
+        )
+        for component_id in _CORE_COMPONENT_ORDER
+    }
 
     parsed_files: dict[str, FileSnapshot] = {}
     for key, command in SNAPSHOT_FILE_COMMANDS.items():
@@ -1188,10 +1456,57 @@ async def capture_baseline(
         baseline = RollbackBaseline.from_dict(json.loads(result.stdout))
     except (ValueError, TypeError):
         raise PanelOpError("baseline_capture_invalid") from None
-    observed = await snapshot_panel(shell)
-    if observed != snapshot:
-        raise PanelOpError("baseline_changed")
-    return replace(snapshot, baseline=baseline)
+    captured = replace(snapshot, baseline=baseline)
+    failure: Exception | asyncio.CancelledError | None = None
+    try:
+        observed = await snapshot_panel(shell)
+        if observed != snapshot:
+            raise PanelOpError("baseline_changed")
+    except (Exception, asyncio.CancelledError) as error:
+        failure = error
+    if failure is None:
+        return captured
+    # The published archive/pin never authorised a mutation, so retire it now
+    # instead of leaving a stranded baseline that blocks this panel.
+    finalized, cancellation = await _settled_finalize(shell, captured)
+    if isinstance(failure, asyncio.CancelledError):
+        raise failure
+    if cancellation is not None:
+        raise cancellation
+    if not finalized:
+        raise PanelOpError("baseline_capture_interrupted") from None
+    raise failure
+
+
+_BASELINE_FINALIZE_SECONDS = 120.0
+
+
+async def _settled_finalize(
+    shell: PanelShell, snapshot: PanelSnapshot
+) -> tuple[bool, asyncio.CancelledError | None]:
+    """Finalize a just-published baseline, shielded and bounded.
+
+    An outer cancellation waits for the finalize to settle and is returned, never
+    swallowed. Past the bound the finalize is cancelled, which terminates the
+    remote process and fences the shell (see ``_provisioning_run``).
+    """
+    task = asyncio.create_task(
+        asyncio.wait_for(
+            _baseline_action(shell, snapshot, "finalize"),
+            _BASELINE_FINALIZE_SECONDS,
+        )
+    )
+    cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as error:
+            if not task.done():
+                cancellation = error
+        except Exception:
+            pass
+    finalized = not task.cancelled() and task.exception() is None
+    return finalized, cancellation
 
 
 async def _baseline_action(shell: PanelShell, snapshot: PanelSnapshot, action: str) -> None:
@@ -1635,11 +1950,15 @@ def _activation_prepare_command(staged: StagedRelease) -> str:
 
 
 def _stop_service_command(service_name: str) -> str:
+    # Stop every unsettled state, including a crash-looping unit's `activating`
+    # (auto-restart), which `is-active --quiet` reports as not running.
+    settled = "|".join(sorted(_SETTLED_FOR_STOP_STATES))
+    capture = f'state="$(systemctl is-active {service_name} 2>/dev/null || true)"; '
     return (
-        f"if systemctl is-active --quiet {service_name}; then "
-        f"systemctl stop {service_name}; fi; "
-        f'state="$(systemctl is-active {service_name} 2>/dev/null || true)"; '
-        'case "$state" in inactive|failed|unknown) ;; *) exit 47 ;; esac'
+        f"{capture}"
+        f'case "$state" in {settled}) ;; *) systemctl stop {service_name} ;; esac; '
+        f"{capture}"
+        f'case "$state" in {settled}) ;; *) exit 47 ;; esac'
     )
 
 

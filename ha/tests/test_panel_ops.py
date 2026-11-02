@@ -2376,24 +2376,22 @@ def _snapshot_responses(
     bridge_state: tuple[bool, bool] = (True, True),
     wifi_state: tuple[bool, bool] = (True, True),
     bus_state: tuple[bool, bool] = (True, True),
+    samples: dict[str, list[str]] | None = None,
 ) -> dict[str, RunResult]:
+    def steady(active: bool) -> list[str]:
+        return ["active|running|0", "active|running|0"] if active else ["inactive|dead|0"] * 2
+
+    states = {
+        COMPONENT_BRIDGE: bridge_state,
+        COMPONENT_WIFI_WATCHDOG: wifi_state,
+        COMPONENT_BUS_WATCHDOG: bus_state,
+    }
     layout_value = {
         "active_release_target": target,
+        "enabled": {component: state[0] for component, state in states.items()},
         "layout": layout,
-        "services": {
-            COMPONENT_BRIDGE: {
-                "active": bridge_state[1],
-                "enabled": bridge_state[0],
-            },
-            COMPONENT_WIFI_WATCHDOG: {
-                "active": wifi_state[1],
-                "enabled": wifi_state[0],
-            },
-            COMPONENT_BUS_WATCHDOG: {
-                "active": bus_state[1],
-                "enabled": bus_state[0],
-            },
-        },
+        "samples": {component: steady(state[1]) for component, state in states.items()}
+        | (samples or {}),
     }
     return {
         panel_ops.SNAPSHOT_LAYOUT_COMMAND: RunResult(
@@ -2630,7 +2628,8 @@ def test_snapshot_layout_probe_accepts_is_enabled_without_stdout(tmp_path: Path)
         '  echo "Failed to get unit file state for $2: No such file or directory" >&2\n'
         "  exit 1\n"
         "fi\n"
-        "printf 'inactive\\n'\n"
+        "block='ActiveState=inactive\\nSubState=dead\\nNRestarts=0\\n'\n"
+        'printf "$block\\n$block\\n$block"\n'
     )
     stub.chmod(0o755)
     command = panel_ops.SNAPSHOT_LAYOUT_COMMAND.replace(
@@ -2647,15 +2646,16 @@ def test_snapshot_layout_probe_accepts_is_enabled_without_stdout(tmp_path: Path)
     )
 
     assert result.returncode == 0, result.stderr
-    services = json.loads(result.stdout)["services"]
-    assert services
-    assert all(state == {"active": False, "enabled": False} for state in services.values())
+    value = json.loads(result.stdout)
+    assert value["enabled"] == dict.fromkeys(value["samples"], False)
+    assert len(value["samples"]) == 3
+    assert all(samples == ["inactive|dead|0"] * 2 for samples in value["samples"].values())
 
 
 def test_snapshot_layout_probe_fails_closed_without_is_active_stdout(
     tmp_path: Path,
 ) -> None:
-    """An empty is-active result must abort the layout snapshot."""
+    """A failed batched systemctl show must abort the layout snapshot."""
     stub = tmp_path / "systemctl"
     stub.write_text(
         "#!/bin/sh\n"
@@ -3457,9 +3457,7 @@ async def test_activate_staged_switches_current_and_converges_only_core_services
         WIFI_WATCHDOG_SERVICE_NAME,
         BUS_WATCHDOG_SERVICE_NAME,
     ):
-        assert any(
-            f"systemctl is-active --quiet {service}" in command for command in shell.commands
-        )
+        assert panel_ops._stop_service_command(service) in shell.commands
     assert f"systemctl enable {SERVICE_NAME}" in shell.commands
     assert f"systemctl start {SERVICE_NAME}" in shell.commands
     assert f"systemctl enable {BUS_WATCHDOG_SERVICE_NAME}" in shell.commands
@@ -3542,7 +3540,7 @@ async def test_activate_disables_deselected_unit_before_removing_its_file() -> N
     ("selector", "expected_code"),
     [
         ("cp --", "activation_prepare_failed"),
-        ("is-active --quiet", "activation_stop_failed"),
+        (panel_ops._stop_service_command(SERVICE_NAME), "activation_stop_failed"),
         (
             "/usr/bin/mv.coreutils --force --no-target-directory",
             "activation_commit_failed",
@@ -3561,7 +3559,9 @@ async def test_activate_staged_cut_points_are_fixed_and_redacted(
         _staged(),
         on_services_stopped=_noop_boundary,
     )
-    failed_command = next(command for command in probe.commands if selector in command)
+    failed_command = next(
+        command for command in probe.commands if command == selector or selector in command
+    )
     shell = await _connected(
         FakeShell(responses={failed_command: RunResult(1, "", "SECRET remote command detail")})
     )

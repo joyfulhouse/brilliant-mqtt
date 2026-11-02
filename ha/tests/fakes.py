@@ -9,9 +9,21 @@ import json
 import re
 import tarfile
 
+from custom_components.brilliant_mqtt.panel_ops import SnapshotSampling
 from custom_components.brilliant_mqtt.shell import PanelProcess, RunResult
 
 _OK = RunResult(0, "", "")
+
+# Two immediate rounds: the shortest sampling that still exercises the strict
+# multi-round parser. conftest installs it for every test (interval 0 is allowed).
+TEST_SNAPSHOT_SAMPLING = SnapshotSampling(
+    window_seconds=0,
+    minimum_samples=2,
+    interval_seconds=0,
+    deadline_seconds=30,
+    call_timeout_seconds=3,
+    maximum_rounds=2,
+)
 
 
 class FakePanelProcess:
