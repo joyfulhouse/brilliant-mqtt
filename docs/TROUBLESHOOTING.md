@@ -69,7 +69,8 @@ same panel is refused until this one finishes. Other operations on the same pane
 (uninstall, reboot, component changes, refreshing staged copies) are not blocked
 during the backoff. If Home Assistant unloads or reloads the integration while an
 update is waiting, the update stops without connecting and does not raise a
-Repair issue.
+panel Repair issue; after a restart it is surfaced as described in
+[Update interrupted by a Home Assistant restart](#update-interrupted-by-a-home-assistant-restart).
 
 Authentication failures, host-key changes, key-exchange or protocol errors, and
 release-admission refusals are not retried. Panels use password-only root SSH,
@@ -80,10 +81,88 @@ MQTT shows the panel online but SSH from Home Assistant is unreachable, suspect 
 stale neighbor (ARP) entry on the Home Assistant host's route to the panel.
 Traffic from the panel toward Home Assistant usually clears it.
 
-Only the connect is retried. A connection lost after admission, baseline
-capture, transfer or activation has started is not retried automatically; the
-existing journal and rollback recovery applies (see
-[canary-rollback.md](canary-rollback.md)).
+If MQTT shows the panel online, also check Home Assistant's MQTT integration:
+online MQTT says nothing about SSH reachability from Home Assistant.
+
+#### Retry state
+
+While an update waits to retry, its state is logged at warning level and shown
+in diagnostics (`panels.<id>.update.retry`) and on the Update entity's `update`
+attribute:
+
+| Field | Meaning |
+|---|---|
+| `stage` | `connect` (connecting) or `admission` (the session was lost during release admission) |
+| `attempt` / `max_attempts` | attempts used so far of the update's single budget (5) |
+| `reason` | classified fault, for example `host_unreachable`, `timeout`, `connection_lost` |
+| `retry_in_seconds` | backoff before the next attempt |
+| `next_attempt_at` | wall-clock time (UTC, ISO 8601) of the next attempt |
+
+After a failed update, `update.last_error` holds its typed final error
+(`stage`, `code`, `attempts`), for example `admission` /
+`admission_connection_lost` / `5`. A queued attempt never shows as completed
+work: a resumed admission resets the progress bar to 10%.
+
+#### Lost connection during an update
+
+Connects and resumed admissions share one budget: 5 attempts within 2 minutes.
+
+- **During release admission**: the update reconnects and admits again, without
+  re-pinning a host key and only for exactly the same release. It is resumed
+  only when no release override was used and no provisioning journal exists. A
+  changed bundled release stops it with `release_candidate_changed`. When the
+  budget runs out the update reports `agent update lost the panel connection
+  during release admission after N attempts`.
+- **With a release override**: the update is not resumed and reports
+  `release_override_used_or_write_failed`. The single-use override may already be
+  consumed on the panel. Obtain a fresh override from `redeploy`; do not reuse
+  the old one.
+- **During baseline capture**: nothing is resumed. If a provisioning journal or
+  retained baseline concerns the panel, the update reports
+  `provisioning_recovery_required`: recovery settles the journal, so remove
+  nothing by hand. Otherwise it reports `baseline_capture_interrupted`: a
+  completed capture may remain on the panel; follow
+  [Interrupted baseline capture](canary-rollback.md#interrupted-baseline-capture).
+  The recovery wording also appears when a journal or retained record matched
+  this panel only by host (for example a DHCP address reused by another panel).
+  If diagnostics show no journal and no retained record that actually names this
+  panel (by `panel`), treat the capture as unjournaled and use Interrupted
+  baseline capture.
+- **After the transaction began** (deployment, activation, health check): the
+  journal's verified rollback runs over a fresh SSH session pinned to the
+  journaled host key. Activation is never repeated. If the panel cannot be
+  reached, the restore intent stays in the journal for automatic recovery, the
+  journal records a typed `last_error`, and a Repair names `connection_lost`.
+  See [canary-rollback.md](canary-rollback.md#if-recovery-fails).
+
+Residual window: a command already sent on the lost session is not fenced. If
+it lands on the panel after the rollback verified the restore, nothing detects
+it. Before updating that panel again, confirm its installed agent version (the
+Update entity or diagnostics `meta.agent_version`).
+
+### Update interrupted by a Home Assistant restart
+
+If Home Assistant stops while an update is connecting or in release admission
+(before any rollback baseline is captured), the update is recorded. After the
+restart a fixable Repair issue, **Agent update was interrupted**, names the
+panel, target version, stage and attempts. Setup never connects to the panel
+for it, and it is never resumed automatically. If a provisioning journal or
+retained baseline concerns the panel, the journal wins and no issue is shown.
+
+Open the issue and choose:
+
+- **Retry**: starts a fresh update with a fresh retry budget. Its progress shows
+  on the panel's Update entity. Retry is refused if the bundled release changed
+  (dismiss and update again), if a provisioning journal now concerns the panel
+  (the record is dropped; recovery owns the panel), or while another update or
+  repair of the panel runs (the issue stays; retry later).
+- **Dismiss**: forgets the interrupted update.
+
+The issue's `expired` flag (diagnostics `update.interrupted.expired`) means the
+interrupted update's retry deadline has passed; on the entity it refreshes only
+when the entity state is otherwise written. Home Assistant's storage helper does
+not report disk write errors, so a failed write of this record cannot be
+detected.
 
 ### Commands from HA don't drive the load
 

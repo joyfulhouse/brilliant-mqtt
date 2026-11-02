@@ -107,6 +107,63 @@ while obtaining redacted diagnostics and the HA repair/log code.
 | `rollback_health_failed` | Bytes may already be restored. Check HA's broker connection and panel connectivity. Retained MQTT history cannot satisfy this check. Retry after resolving connectivity. |
 | `rollback_deadline_exceeded` | Treat recovery as unverified. The pending journal remains; remote restore processes are terminated and settled before reuse. Resolve connectivity/storage delays before retrying. |
 | `rollback_failed` / `rollback_failed` state | Preserve artifacts and the actionable repair code for the maintainer. A missing or changed pinned release is not silently replaced with bundled code. |
+| `connection_lost` (Repair reason) | The update's SSH session was lost after its transaction began. The restore intent is durable (journal `rollback_pending`, baseline `restore_requested`) and its rollback ran, or will run, over a fresh session pinned to the journaled host key; activation is never repeated. The second code in the Repair says why the fresh session failed (`recovery_connection_failed`, `panel_authentication_failed`, `panel_identity_mismatch`, or `rollback_failed` when every attempt was unreachable). Bring the panel back; automatic recovery settles the journal on the next start. |
+| `recovery_interrupted` | Home Assistant was stopping while the rollback reconnected; the panel was not shown unreachable. The intent is kept and recovery resumes on the next start. |
+| `baseline_capture_interrupted` | An update lost its session during baseline capture, before any journal existed. Nothing is resumed. Follow [Interrupted baseline capture](#interrupted-baseline-capture). |
+
+## Interrupted baseline capture
+
+An update that lost its SSH session while capturing the baseline reports
+`baseline_capture_interrupted`. No journal was created, so Home Assistant has
+no record of the capture, but the capture may have completed on the panel. A
+leftover baseline is harmless until the next update, which refuses with
+`baseline_already_retained` (release-link layouts) while its pin remains. This
+is the one case that needs a manual settle over SSH; it mirrors exactly what
+`finalize` does on the panel (`baseline_action` in
+`scripts/brilliant-panel/bundle_manifest.py`).
+
+1. Wait at least 2 minutes after the failure. The capture runs under a
+   120-second alarm, so after that no capture process can still be writing.
+2. Download diagnostics and confirm there is **no** execution journal
+   (`provisioning.count` is 0) and **no** `provisioning.retained` entry. This
+   check is the guard: if either exists, stop and follow the recovery for that
+   journal or baseline instead. Make sure no update or repair of this panel runs
+   between this step and step 4.
+3. Inspect, read-only:
+
+   ```sh
+   ssh -o NumberOfPasswordPrompts=1 root@<panel> \
+     'ls -la /var/brilliant-mqtt/.rollback/; cat /var/brilliant-mqtt/current/.rollback-retained'
+   ```
+
+   Each capture is a directory `.rollback/<id>` (a 32-hex-character name),
+   possibly with an unpublished `.rollback/.<id>.tmp`. The on-panel `<id>` is
+   not the diagnostics transaction name and cannot be matched to it; with no
+   journal and no retained record, a `<id>` from this update is the only one
+   expected.
+4. Remove only that capture. On release-link layouts (where
+   `/var/brilliant-mqtt/current` is a symlink), first remove the active
+   release's pin, and only if its content equals `<id>`:
+
+   ```sh
+   ssh -o NumberOfPasswordPrompts=1 root@<panel> '
+     id=<id>; pin=/var/brilliant-mqtt/current/.rollback-retained
+     if [ -L /var/brilliant-mqtt/current ] && [ "$(cat "$pin" 2>/dev/null)" = "$id" ]; then
+       rm -f "$pin"
+     fi
+     rm -rf "/var/brilliant-mqtt/.rollback/$id" "/var/brilliant-mqtt/.rollback/.$id.tmp"
+     sync'
+   ```
+
+   Do not remove anything else under `.rollback/`.
+5. Check the bridge and start it if it is down:
+
+   ```sh
+   ssh -o NumberOfPasswordPrompts=1 root@<panel> \
+     'systemctl is-active brilliant-mqtt || systemctl start brilliant-mqtt'
+   ```
+
+Then run the update again.
 
 ## Finalize only after sign-off
 
