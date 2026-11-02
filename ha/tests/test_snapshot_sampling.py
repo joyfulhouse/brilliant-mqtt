@@ -112,6 +112,10 @@ def test_shared_state_vocabulary_is_defined_once() -> None:
         {"interval_seconds": math.nan},
         {"deadline_seconds": math.nan},
         {"call_timeout_seconds": math.nan},
+        {"window_seconds": math.inf},
+        {"interval_seconds": math.inf},
+        {"deadline_seconds": math.inf},
+        {"call_timeout_seconds": math.inf, "deadline_seconds": math.inf},
         {"window_seconds": 16.0, "interval_seconds": 0.5, "maximum_rounds": 32},
     ],
 )
@@ -303,8 +307,9 @@ def test_properties_are_accepted_in_any_order(tmp_path: Path) -> None:
     assert json.loads(result.stdout)["samples"][COMPONENT_BRIDGE] == [_RUNNING, _RUNNING]
 
 
-def test_unparseable_restart_counter_is_reported_unknown(tmp_path: Path) -> None:
-    plan = {"rounds": _steady("active|running|[not set]")}
+@pytest.mark.parametrize("restarts", ["[not set]", ""])
+def test_unset_restart_counter_is_reported_unknown(tmp_path: Path, restarts: str) -> None:
+    plan = {"rounds": _steady(f"active|running|{restarts}")}
 
     result, _ = _run_sampler(tmp_path, _sampling(maximum=2), plan)
 
@@ -332,6 +337,8 @@ _BLOCK = "ActiveState=active\nSubState=running\nNRestarts=0\n"
         "\n".join([_BLOCK, _BLOCK, _BLOCK.replace("=active", "=bogus")]),
         "\n".join([_BLOCK, _BLOCK, _BLOCK.replace("=running", "=Running State")]),
         "\n".join([_BLOCK, _BLOCK, _BLOCK]).removesuffix("\n"),
+        "\n".join([_BLOCK, _BLOCK, _BLOCK.replace("NRestarts=0", "NRestarts=many")]),
+        "\n".join([_BLOCK, _BLOCK, _BLOCK.replace("NRestarts=0", "NRestarts=-1")]),
     ],
     ids=[
         "empty",
@@ -346,6 +353,8 @@ _BLOCK = "ActiveState=active\nSubState=running\nNRestarts=0\n"
         "unknown_active_state",
         "invalid_sub_state",
         "no_trailing_newline",
+        "garbage_restarts",
+        "negative_restarts",
     ],
 )
 def test_malformed_show_output_fails_closed(tmp_path: Path, raw: str) -> None:
@@ -403,7 +412,18 @@ def test_slow_enabled_reads_do_not_shrink_the_window(tmp_path: Path) -> None:
     # The enabled reads alone took 1.5 s (> window), yet a full window was sampled.
     assert times[0] - started >= 1.5
     assert observed["count"] >= 4
-    assert times[-1] - times[0] >= 0.5
+    assert sampling.window_seconds - 0.3 <= times[-1] - times[0] < sampling.window_seconds + 0.5
+
+
+def test_slow_final_reading_over_four_seconds_fails_closed(tmp_path: Path) -> None:
+    # A single-round sampling has no later round start to catch the slow reading.
+    sampling = _sampling(call_timeout=6.0, minimum=1, maximum=1)
+    plan = {"rounds": _steady(_RUNNING), "show_delays": [4.2]}
+
+    result, observed = _run_sampler(tmp_path, sampling, plan)
+
+    assert result.returncode == 45
+    assert observed["count"] == 1
 
 
 def test_round_gap_over_four_seconds_fails_closed(tmp_path: Path) -> None:
@@ -469,6 +489,7 @@ def _valid_samples() -> dict[str, object]:
     "mutate",
     [
         lambda value: [],
+        lambda value: {component: [_RUNNING] for component in _COMPONENTS},
         lambda value: {**value, "extra": [_RUNNING, _RUNNING]},
         lambda value: {k: v for k, v in value.items() if k != COMPONENT_BRIDGE},
         lambda value: {**value, COMPONENT_BRIDGE: []},
@@ -488,6 +509,14 @@ def _valid_samples() -> dict[str, object]:
 def test_parser_rejects_malformed_sample_shapes(mutate: object) -> None:
     assert callable(mutate)
     assert panel_ops._parse_service_samples(mutate(_valid_samples())) is None
+
+
+def test_test_sampling_output_still_parses() -> None:
+    from tests.fakes import TEST_SNAPSHOT_SAMPLING
+
+    assert TEST_SNAPSHOT_SAMPLING.minimum_samples >= panel_ops.SNAPSHOT_SAMPLING.minimum_samples
+    rounds = [_RUNNING] * TEST_SNAPSHOT_SAMPLING.maximum_rounds
+    assert panel_ops._parse_service_samples(dict.fromkeys(_COMPONENTS, rounds)) is not None
 
 
 def test_parser_accepts_strict_rounds() -> None:

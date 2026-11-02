@@ -619,7 +619,9 @@ class SnapshotSampling:
         )
         if (
             any(
-                type(value) is bool or not isinstance(value, int | float) or math.isnan(value)
+                type(value) is bool
+                or not isinstance(value, int | float)
+                or not math.isfinite(value)
                 for value in floats
             )
             or type(self.minimum_samples) is not int
@@ -1102,8 +1104,11 @@ def _layout_probe_command(sampling: SnapshotSampling = SNAPSHOT_SAMPLING) -> str
         "        if sub_state_pattern.fullmatch(values['SubState']) is None:\n"
         "            raise SystemExit(45)\n"
         "        restarts = values['NRestarts']\n"
-        "        if restarts_pattern.fullmatch(restarts) is None:\n"
+        # systemd prints an unset counter as `[not set]` (or nothing): unknown.
+        "        if restarts in ('', '[not set]'):\n"
         "            restarts = ''\n"
+        "        elif restarts_pattern.fullmatch(restarts) is None:\n"
+        "            raise SystemExit(45)\n"
         "        readings.append((values['ActiveState'], values['SubState'], restarts))\n"
         "    return readings\n"
         "samples = {component_id: [] for component_id, _ in services}\n"
@@ -1121,6 +1126,9 @@ def _layout_probe_command(sampling: SnapshotSampling = SNAPSHOT_SAMPLING) -> str
         "        raise SystemExit(45)\n"
         "    previous_round = round_started\n"
         "    readings = sample_round()\n"
+        # Bound the reading itself too, not only the gap between round starts.
+        "    if time.monotonic() - previous_round > maximum_gap:\n"
+        "        raise SystemExit(45)\n"
         "    rounds += 1\n"
         "    for (component_id, _), reading in zip(services, readings):\n"
         "        samples[component_id].append('|'.join(reading))\n"
@@ -1256,13 +1264,16 @@ def _parse_service_enabled(raw: object) -> dict[str, bool] | None:
 
 
 def _parse_service_samples(raw: object) -> dict[str, tuple[ServiceSample, ...]] | None:
-    """Strictly parse the sampler's per-component rounds (1-32, equal length)."""
+    """Strictly parse the sampler's per-component rounds (2-32, equal length)."""
     if type(raw) is not dict or frozenset(raw) != frozenset(_CORE_COMPONENT_ORDER):
         return None
     parsed: dict[str, tuple[ServiceSample, ...]] = {}
     for component_id in _CORE_COMPONENT_ORDER:
         values = raw.get(component_id)
-        if type(values) is not list or not 1 <= len(values) <= _MAX_SAMPLE_ROUNDS:
+        if (
+            type(values) is not list
+            or not SNAPSHOT_SAMPLING.minimum_samples <= len(values) <= _MAX_SAMPLE_ROUNDS
+        ):
             return None
         samples = tuple(ServiceSample.parse(value) for value in values)
         complete = tuple(sample for sample in samples if sample is not None)

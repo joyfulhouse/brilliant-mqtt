@@ -418,7 +418,8 @@ any write. The snapshot probe samples `ActiveState`, `SubState` and `NRestarts`
 for the three core services with one batched `systemctl show` every 0.5 seconds.
 While any core service runs it watches for about 13.5 seconds, longer than the
 shipped restart delays (5 seconds for the bridge, 10 seconds for the watchdogs),
-so every restart in that window is seen. It stops after about a second once two
+so a restart in that window normally shows up as an `auto-restart` sample
+(a reading slower than 4 seconds fails the probe instead). It stops after about a second once two
 consecutive rounds show every service stopped, and it is hard-bounded at 40
 seconds and 32 rounds. Each install or update on an existing panel takes two
 snapshots, about 27 seconds. A service whose last sample is `active` or
