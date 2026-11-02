@@ -128,7 +128,7 @@ uv run python "$manifest_helper" payload-identities "$release_payload" $componen
   > "$legacy_evidence/expected.tsv"
 
 ssh -o NumberOfPasswordPrompts=1 office-qualified \
-  "/data/switch-embedded/env/bin/python3 - component-identities /var/brilliant-mqtt $components" \
+  "/data/switch-embedded/env/bin/python3 -B -I - component-identities /var/brilliant-mqtt $components" \
   < "$manifest_helper" \
   > "$legacy_evidence/installed.tsv"
 
@@ -154,11 +154,24 @@ directly; keep `installed.tsv` as the layout evidence.
 private identity records but never creates or updates them and never creates a
 directory, so it is safe to run over SSH on a production panel. It prints an
 ordinal only when an existing record proves it for exactly the installed code;
-otherwise it prints `unknown`, which never equals a candidate ordinal. A legacy
-or manual install whose ordinal the integration never enrolled therefore shows
-`unknown` even when its code digests match. That is expected, and it is not a
-pass: record it, and let the supported update or redeploy enroll the identity.
-Do not edit identity records by hand.
+otherwise it prints `unknown`, which never equals a candidate ordinal. The
+remote command uses `-B -I` so the panel interpreter writes no bytecode and
+ignores environment variables, the user site directory and the current
+directory; the helper still runs from standard input with its arguments.
+
+The integration publishes an ordinal only after an install that changes code:
+it hashes the newly selected bytes and then records the candidate's ordinal.
+When the installed digest already equals the candidate, release admission is a
+no-op, so the Update entity and `brilliant_mqtt.redeploy` return without
+writing anything and onboarding aborts with `release_unchanged`. A legacy or
+manual install whose code already equals the current release therefore stays
+`unknown` until the next supported update that changes its code. Rerunning
+update or redeploy does not enroll it.
+
+In that case the `diff` above stops on the ordinal column alone. Record the
+result as **code matches, ordinal unproven**, not as a pass, and keep the
+version and digest columns as the evidence. Do not edit identity records by
+hand to make the ordinals match.
 
 Repeat collection and comparison at the end of each qualification window. If
 the comparison fails, stop qualification and investigate the guarded
