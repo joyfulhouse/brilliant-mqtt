@@ -32,6 +32,27 @@ Reset to `LOG_LEVEL=INFO` when done.
    VLAN can reach the broker on port 1883.
 3. Check the agent is running: `systemctl status brilliant-mqtt` on the panel.
 
+### "This panel architecture is not supported"
+
+Setup stopped with `unsupported_architecture`. brilliant-mqtt is qualified only
+on armv7l (i.MX6) Brilliant Controls. Newer i350 panels report `aarch64` and are
+**not supported yet**. This is deliberate. Do not patch the check out: nobody
+has verified that the bridge, its watchdogs or the voice satellite work on that
+hardware.
+
+If you have an i350 and want to help qualify it, run the read-only diagnostic
+from a checkout of this repo and attach the output to
+[issue #155](https://github.com/joyfulhouse/brilliant-mqtt/issues/155) after
+reviewing it:
+
+```bash
+ssh -o NumberOfPasswordPrompts=1 root@<panel-ip> 'sh -s' \
+  < scripts/brilliant-panel/panel_diagnostics.sh > i350-diagnostics.txt
+```
+
+See [brilliant-panel/i350-support.md](brilliant-panel/i350-support.md) for what
+the diagnostic collects, what is architecture-bound, and the qualification gates.
+
 ---
 
 ## Connectivity

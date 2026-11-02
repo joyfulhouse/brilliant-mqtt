@@ -24,6 +24,7 @@ The central finding is that the panel is not a collection of isolated integratio
 | [Cloud and local boundaries](cloud-boundaries.md) | What remains local, what depends on Brilliant or partner clouds, and replacement strategies |
 | [Home Assistant support matrix](home-assistant-support-matrix.md) | Implemented, partially implemented, missing, inappropriate, and recommended capabilities |
 | [Home Assistant control and scene bridge](home-assistant-integration.md) | Authoritative ownership model, configuration, MQTT contract, HA surfaces, safety, diagnostics, and migration |
+| [i350 / aarch64 panels](i350-support.md) | Why newer aarch64 panels are not supported yet, what is architecture-bound, the read-only diagnostic, and the qualification gates |
 | [Validation runbook](validation-runbook.md) | Safe static, read-only, telemetry, and write-validation procedures |
 | [Broadcast, ARP, and established MQTT qualification](runbooks/broadcast-arp-vs-mqtt-diagnostics.md) | Agent-first elimination, bounded same-segment comparison, independent delivery/neighbor verdicts, and separately qualified recovery |
 | [Wi-Fi and native response qualification](runbooks/wifi-response-qualification.md) | Separate RF, binding, queue/RPC, and displayed-state measurements; controlled changes and physical-slider qualification boundaries |
