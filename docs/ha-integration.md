@@ -222,6 +222,33 @@ broker, command, or credential text.
   retry. If the release needed an explicit override, that override was
   consumed and a retry needs a fresh approval.
 
+<a id="incumbent_unhealthy"></a>
+#### `incumbent_unhealthy`, `incumbent_unhealthy_unverified`, `incumbent_rehearsal_failed`, `incumbent_rehearsal_interrupted`, `incumbent_health_unobservable`
+
+- **Cause:** The panel already has the agent installed. Before replacing it,
+  the integration restarts the installed bridge once under a fresh deployment
+  ID and waits up to the health timeout (90 s by default) for MQTT health
+  evidence with that ID (the
+  [incumbent health rehearsal](canary-rollback.md#incumbent-health-rehearsal)).
+  A bridge that is `active` but cannot reach MQTT could never be rolled back
+  to, so the add stops: nothing is installed and the just-captured baseline is
+  removed. Only the bridge's deployment ID changed.
+- **Check / Fix:** `incumbent_unhealthy`: the bridge is running without a
+  health proof; fix its broker credentials or reachability
+  (`journalctl -u brilliant-mqtt -n 50`) and check Home Assistant's own MQTT
+  integration, or uninstall then re-add. `incumbent_unhealthy_unverified`:
+  check `systemctl is-active brilliant-mqtt` and start it.
+  `incumbent_rehearsal_failed`: the bridge was not restarted and is running;
+  check panel storage/systemd. `incumbent_rehearsal_interrupted`: the session
+  dropped and nothing reconnects; systemd completes an issued restart on its
+  own; check the bridge is up and follow
+  [Interrupted baseline capture](canary-rollback.md#interrupted-baseline-capture).
+  `incumbent_health_unobservable`: Home Assistant's MQTT observer failed and the
+  bridge was never touched; check the MQTT integration.
+- **Retry:** After the fix, simply retry. Each attempt on an installed panel
+  restarts its bridge once (entities briefly unavailable). Fresh installs skip
+  the rehearsal.
+
 <a id="rebind_identity_unchanged"></a>
 #### `rebind_identity_unchanged`
 

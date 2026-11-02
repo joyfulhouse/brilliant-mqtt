@@ -178,6 +178,18 @@ _BASELINE_LOST_SUMMARY = (
     "agent update lost the panel connection during baseline capture "
     f"({_BASELINE_CAPTURE_INTERRUPTED_DETAIL})"
 )
+# The incumbent health rehearsal's session loss: never reconnected; the restart,
+# if already issued, is a queued systemd job that completes on its own.
+_REHEARSAL_INTERRUPTED_DETAIL = (
+    "incumbent_rehearsal_interrupted: if the restart was already issued, systemd "
+    "completes it on its own; check `systemctl is-active brilliant-mqtt` and start it "
+    "if it's down. A rollback baseline that no Home Assistant journal owns may remain; "
+    "see docs/canary-rollback.md 'Interrupted baseline capture'"
+)
+_REHEARSAL_LOST_SUMMARY = (
+    "agent update lost the panel connection during the incumbent health rehearsal "
+    f"({_REHEARSAL_INTERRUPTED_DETAIL})"
+)
 _BASELINE_RECOVERY_SUMMARY = (
     "agent update lost the panel connection during baseline capture "
     "(provisioning_recovery_required: the journal is settled by recovery; "
@@ -210,6 +222,26 @@ _SAFE_PANEL_OP_DETAILS = {
         "see docs/TROUBLESHOOTING.md"
     ),
     "baseline_capture_interrupted": _BASELINE_CAPTURE_INTERRUPTED_DETAIL,
+    "incumbent_unhealthy": (
+        "incumbent_unhealthy: the installed bridge restarted but did not prove healthy on "
+        "MQTT, so nothing was installed; fix the old bridge's MQTT (credentials or broker; "
+        "also check Home Assistant's MQTT integration), or uninstall then re-add; "
+        "see docs/canary-rollback.md"
+    ),
+    "incumbent_unhealthy_unverified": (
+        "incumbent_unhealthy_unverified: the installed bridge is not verified running; "
+        "check `systemctl is-active brilliant-mqtt` and start it; see docs/canary-rollback.md"
+    ),
+    "incumbent_rehearsal_failed": (
+        "incumbent_rehearsal_failed: the installed bridge could not be restarted for its "
+        "health rehearsal and is still running; check panel storage/systemd and retry"
+    ),
+    "incumbent_rehearsal_interrupted": _REHEARSAL_INTERRUPTED_DETAIL,
+    "incumbent_health_unobservable": (
+        "incumbent_health_unobservable: Home Assistant could not observe the panel's MQTT "
+        "health, so the installed bridge was never touched; check Home Assistant's MQTT "
+        "integration and retry"
+    ),
     "mqtt_ca_promotion_failed": "mqtt_ca_promotion_failed",
     "mqtt_ca_verification_failed": "mqtt_ca_verification_failed",
     "mqtt_tls_downgrade_refused": "mqtt_tls_downgrade_refused",
@@ -362,6 +394,13 @@ def _safe_failure_summary(summary: str, error: BaseException | None = None) -> s
         if safe_code := _SAFE_PANEL_OP_DETAILS.get(code):
             return f"{summary} ({safe_code})"
     return summary
+
+
+def _panel_op_code(error: BaseException) -> str | None:
+    """The bounded stable code of a panel-operation error, else None."""
+    if isinstance(error, PanelOpError):
+        return str(error)[:_PANEL_OP_CODE_PREFIX_LIMIT].partition(":")[0]
+    return None
 
 
 def _update_error_code(stage: str, error: BaseException) -> str:
@@ -2220,6 +2259,10 @@ class PanelManager:
                         _ADMISSION_LOST_SUMMARY,
                     ) from None
                 if stage == "baseline" and lost:
+                    if _panel_op_code(err) == "incumbent_rehearsal_interrupted":
+                        raise _UpdateFailed(
+                            stage, "incumbent_rehearsal_interrupted", _REHEARSAL_LOST_SUMMARY
+                        ) from None
                     if await self.async_journal_owns_panel():
                         raise _UpdateFailed(
                             stage, "provisioning_recovery_required", _BASELINE_RECOVERY_SUMMARY

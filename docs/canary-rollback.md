@@ -37,6 +37,75 @@ publishes are needed for these operations.
    units, configuration and services, and refuse with
    `baseline_retained_finalize_first` when code would be needed.
 
+## Incumbent health rehearsal
+
+A rollback is only as good as the bridge it returns to. An installed bridge can
+stay `active` while it cannot reach MQTT (for example with bad broker
+credentials it keeps retrying in-process), so it passes the pre-change snapshot.
+If the new release then failed, the rollback's fresh-MQTT health proof could
+never succeed, and the journal would sit in `rollback_pending`, blocking all
+fleet work.
+
+So on a panel that already has the agent (fresh installs skip this), every add
+and update rehearses the rollback's last step first. After the baseline is
+captured and verified, under the fleet lock, and before anything is staged or
+journaled:
+
+1. Home Assistant subscribes to the panel's MQTT health topics.
+2. It generates a new deployment ID. It is kept only in memory and is never read
+   back from the panel.
+3. It atomically rewrites `/etc/brilliant-mqtt.env` with that ID while the
+   bridge keeps running (the bridge reads its environment only at start), then
+   issues ONE `systemctl restart --no-block brilliant-mqtt`. systemd (PID 1)
+   runs the queued restart itself, so a dropped SSH session cannot leave the
+   bridge stopped. If the restart command itself fails on a live session, a
+   best-effort `systemctl start brilliant-mqtt` follows.
+4. It waits up to the health timeout (90 s by default) for fresh availability,
+   metadata, state and discovery carrying the new ID. Metadata with any other ID
+   is ignored, so the old process cannot satisfy the proof.
+
+On success the release admission is re-bound to the rotated deployment ID (the
+admission recorded the incumbent's identities, which include that shared ID),
+only when every other identity field is unchanged; anything else fails with
+`release_identity_changed`. The add or update then continues as before.
+
+The rehearsal changes only the deployment-correlation line of the live env file.
+The journaled snapshot and the baseline keep the pre-rehearsal bytes, so a later
+rollback restores them exactly (then re-correlates with its own new ID), and
+`verify_baseline` is unaffected.
+
+**Costs.** On a panel that already has the agent, each add or update restarts
+the incumbent bridge once (its entities are briefly unavailable) and waits up to
+the health timeout. With the two ~13.5 s service-state samples, budget one
+bridge restart + ~27 s of sampling + up to 90 s of rehearsal per add or update.
+
+Every refusal removes the unjournaled baseline (see
+[Interrupted baseline capture](#interrupted-baseline-capture)) and installs
+nothing:
+
+| Code | Meaning | Operator action |
+| --- | --- | --- |
+| `incumbent_unhealthy` | The bridge was restarted and is verified running, but no health evidence with the new ID arrived. | Fix the old bridge's MQTT connection: broker credentials in `/etc/brilliant-mqtt.env` or broker reachability (`journalctl -u brilliant-mqtt -n 50`). Also check Home Assistant's own MQTT integration: a broker drop on the Home Assistant side during the wait looks the same. Or uninstall, then re-add the panel. |
+| `incumbent_unhealthy_unverified` | The bridge's state could not be verified as running after the rehearsal. | Check `systemctl is-active brilliant-mqtt` on the panel and start it (`systemctl start brilliant-mqtt`) if it is down; then fix its MQTT connection and retry. |
+| `incumbent_rehearsal_failed` | Writing the env file or the restart command failed, so the bridge was not restarted; it is verified running. | Check panel storage (`df /etc /var`) and systemd, then retry. |
+| `incumbent_rehearsal_interrupted` | The SSH session was lost during the rehearsal. Nothing reconnects. | If the restart was already issued, systemd completes it on its own: check `systemctl is-active brilliant-mqtt` and start it if it's down. The baseline could not be removed; follow [Interrupted baseline capture](#interrupted-baseline-capture) before retrying. |
+| `incumbent_health_unobservable` | Home Assistant could not subscribe to the panel's MQTT health. The bridge was never touched. | Check Home Assistant's MQTT integration and retry. |
+
+The two ways out of an unhealthy incumbent are the same as for
+`service_crash_looping`: **fix the old bridge** so it reaches MQTT again, then
+retry; or **uninstall the agent, then re-add the panel** (turn off both watchdog
+switches first; a panel without a Home Assistant entry uses the manual uninstall
+in [TROUBLESHOOTING.md](TROUBLESHOOTING.md#manual-agent-uninstall-panel-without-a-home-assistant-entry)).
+
+Limitation: a health-wait failure cannot tell "the bridge never reconnected"
+from "Home Assistant's own MQTT connection dropped mid-wait"; both are reported
+as `incumbent_unhealthy`. Check Home Assistant's MQTT integration before
+blaming the panel.
+
+Pre-release check: confirm once on the pilot panel that `systemctl restart
+--no-block brilliant-mqtt` completes (the bridge comes back `active`) when the
+SSH session drops right after the command is issued.
+
 ## Roll back now
 
 1. Confirm the affected panel and baseline UUID from diagnostics. Keep its current

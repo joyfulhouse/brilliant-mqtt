@@ -973,7 +973,7 @@ async def _provisioning_run(
     failed = False
     result: RunResult | None = None
     try:
-        if error_code.startswith(("baseline_", "rollback_")):
+        if error_code.startswith(("baseline_", "rollback_", "rehearsal_")):
             process = await shell.start(command)
             settlement = asyncio.create_task(process.wait())
             try:
@@ -1602,6 +1602,28 @@ async def restart_restored(
     if re.fullmatch(r"[0-9a-f]{32}", deployment_id) is None:
         raise PanelOpError("baseline_invalid")
     await _provisioning_run(shell, _stop_service_command(SERVICE_NAME), "rollback_service_failed")
+    await _write_correlated_env(
+        shell, snapshot, deployment_id, error_code="rollback_restore_failed"
+    )
+    on_service_stopped()
+    await _provisioning_run(shell, f"systemctl start {SERVICE_NAME}", "rollback_service_failed")
+
+
+async def _write_correlated_env(
+    shell: PanelShell,
+    snapshot: PanelSnapshot,
+    deployment_id: str,
+    *,
+    error_code: str,
+) -> None:
+    """Atomically replace the live env with *snapshot*'s bytes and a new deployment id.
+
+    Every other byte and the mode come from the snapshot. The bridge reads its
+    environment only at start (``EnvironmentFile=``), so a running bridge is
+    unaffected until restarted. If the upload or the move fails, exactly this
+    write's temporary file is removed (settled, bounded) before the original
+    error is re-raised.
+    """
     content = snapshot.environment_file.content
     if content is None or not snapshot.bridge_service.active:
         raise PanelOpError("baseline_correlation_unsupported")
@@ -1616,11 +1638,142 @@ async def restart_restored(
     staged = StagedRelease(
         "recovery", transaction, f"{PANEL_RELEASES_DIR}/recovery--{transaction.hex}", ("bridge",)
     )
-    await _restore_file(
-        shell, PANEL_ENV_FILE, FileSnapshot(content, snapshot.environment_file.mode), staged
+    try:
+        await _restore_file(
+            shell,
+            PANEL_ENV_FILE,
+            FileSnapshot(content, snapshot.environment_file.mode),
+            staged,
+            error_code=error_code,
+        )
+    except (Exception, asyncio.CancelledError) as failure:
+        temporary = _rollback_temp_path(PANEL_ENV_FILE, staged)
+        cleanup = await settle(
+            _provisioning_run(shell, f"rm -f -- {temporary}", error_code),
+            bound_seconds=CLEANUP_FINALIZE_SECONDS,
+        )
+        if cleanup.cancellation is not None and not isinstance(failure, asyncio.CancelledError):
+            raise cleanup.cancellation from None
+        raise
+
+
+async def rehearse_restart(
+    shell: PanelShell,
+    snapshot: PanelSnapshot,
+    deployment_id: str,
+    *,
+    before_restart: Callable[[], None],
+) -> None:
+    """Restart the incumbent bridge once under a fresh deployment id (health rehearsal).
+
+    The env file is rewritten atomically while the bridge KEEPS RUNNING (it reads
+    env only at start), then *before_restart* opens the health boundary, then ONE
+    ``systemctl restart --no-block`` queues the restart: systemd (PID 1) runs the
+    job, so a dropped SSH session cannot leave the bridge stopped.
+
+    Fails with ``rehearsal_env_write_failed`` or ``rehearsal_boundary_failed``
+    (nothing restarted), or ``rehearsal_restart_failed`` (the command failed).
+    """
+    if re.fullmatch(r"[0-9a-f]{32}", deployment_id) is None or not callable(before_restart):
+        raise PanelOpError("rehearsal_invalid")
+    await _write_correlated_env(
+        shell, snapshot, deployment_id, error_code="rehearsal_env_write_failed"
     )
-    on_service_stopped()
-    await _provisioning_run(shell, f"systemctl start {SERVICE_NAME}", "rollback_service_failed")
+    try:
+        before_restart()
+    except Exception:
+        raise PanelOpError("rehearsal_boundary_failed") from None
+    await _provisioning_run(
+        shell, f"systemctl restart --no-block {SERVICE_NAME}", "rehearsal_restart_failed"
+    )
+
+
+async def start_bridge(shell: PanelShell) -> None:
+    """Best-effort start of the bridge after a failed rehearsal restart command."""
+    await _provisioning_run(shell, f"systemctl start {SERVICE_NAME}", "rehearsal_start_failed")
+
+
+async def bridge_running(shell: PanelShell) -> bool:
+    """Whether systemd reports the bridge active (``systemctl is-active --quiet``)."""
+    result = await _provisioning_run(
+        shell,
+        f"if systemctl is-active --quiet {SERVICE_NAME}; then echo active; else echo inactive; fi",
+        "rehearsal_probe_failed",
+    )
+    state = result.stdout.strip()
+    if state not in {"active", "inactive"}:
+        raise PanelOpError("rehearsal_probe_failed")
+    return state == "active"
+
+
+def rehearsal_rebinding(
+    recorded: Mapping[str, ReleaseIdentity | None],
+    observed: Mapping[str, ReleaseIdentity | None],
+    deployment_id: str,
+) -> dict[str, ReleaseIdentity | None] | None:
+    """The admitted incumbents after a healthy rehearsal, or None to refuse.
+
+    Accepts only a pure rotation of the shared deployment id: the same components
+    (an absent incumbent stays absent), each identical to its recorded identity
+    except ``deployment_id``; every recorded id equal to the bridge's recorded id
+    (or all unset); and every new id exactly the rehearsal's generated id.
+    """
+    bridge = recorded.get(COMPONENT_BRIDGE)
+    if bridge is None:
+        return None
+    recorded_ids = {identity.deployment_id for identity in recorded.values() if identity}
+    if recorded_ids != {bridge.deployment_id}:
+        return None
+    rebound: dict[str, ReleaseIdentity | None] = {}
+    for component, identity in recorded.items():
+        current = observed.get(component)
+        if identity is None or current is None:
+            if identity is not None or current is not None:
+                return None
+            rebound[component] = None
+            continue
+        if (
+            current.deployment_id != deployment_id
+            or replace(current, deployment_id=identity.deployment_id) != identity
+        ):
+            return None
+        rebound[component] = current
+    return rebound
+
+
+async def rebind_rehearsed_deployment(shell: PanelShell, deployment_id: str) -> None:
+    """Re-bind the active admission to the incumbent's rehearsal-rotated deployment id.
+
+    Release admission recorded the incumbent identities, which carry the env's
+    shared ``BRILLIANT_DEPLOYMENT_ID``; a healthy rehearsal rotated it, which
+    would otherwise fail every later write with ``release_identity_changed``.
+    Acts only inside the ACTIVE admission owned by this shell and task; with no
+    admission it is a no-op that reads nothing. Anything but an exact rotation
+    (see ``rehearsal_rebinding``) raises ``release_identity_changed``.
+    """
+    admission = _RELEASE_ADMISSION.get()
+    if admission is None:
+        return
+    if (
+        not admission.active
+        or admission.shell is not shell
+        or admission.owner is not asyncio.current_task()
+    ):
+        raise PanelOpError("release_transaction_mismatch")
+    if re.fullmatch(r"[0-9a-f]{32}", deployment_id) is None:
+        raise PanelOpError("release_identity_changed: inspect the current panel and retry")
+    observed = await _read_release_identities(shell)
+    rebound = rehearsal_rebinding(admission.incumbent, observed, deployment_id)
+    if rebound is None:
+        raise PanelOpError("release_identity_changed: inspect the current panel and retry")
+    bridge = admission.incumbent[COMPONENT_BRIDGE]
+    previous = bridge.deployment_id if bridge is not None else None
+    admission.incumbent.update(rebound)
+    _LOGGER.info(
+        "release admission re-bound to the rehearsed incumbent: deployment id %s -> %s",
+        previous or "unset",
+        deployment_id,
+    )
 
 
 def _staged_temp_path(staged: StagedRelease) -> str:
@@ -2188,18 +2341,20 @@ async def _restore_file(
     path: str,
     snapshot: FileSnapshot,
     staged: StagedRelease,
+    *,
+    error_code: str = "rollback_restore_failed",
 ) -> None:
     temporary = _rollback_temp_path(path, staged)
     await _provisioning_run(
         shell,
         f"rm -f -- {temporary}",
-        "rollback_restore_failed",
+        error_code,
     )
     if snapshot.content is None:
         await _provisioning_run(
             shell,
             f"rm -f -- {path}",
-            "rollback_restore_failed",
+            error_code,
         )
         return
     assert snapshot.mode is not None
@@ -2208,7 +2363,7 @@ async def _restore_file(
         snapshot.content,
         temporary,
         snapshot.mode,
-        "rollback_restore_failed",
+        error_code,
     )
     await _provisioning_run(
         shell,
@@ -2218,7 +2373,7 @@ async def _restore_file(
             f"{_PANEL_ATOMIC_MOVER} --force --no-target-directory -- "
             f"{temporary} {path}"
         ),
-        "rollback_restore_failed",
+        error_code,
     )
 
 

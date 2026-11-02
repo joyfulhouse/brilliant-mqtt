@@ -692,6 +692,17 @@ class PanelOperations(Protocol):
         on_service_stopped: Callable[[], None],
     ) -> None: ...
     async def snapshot_panel(self, shell: PanelShell) -> PanelSnapshot: ...
+    async def rehearse_restart(
+        self,
+        shell: PanelShell,
+        snapshot: PanelSnapshot,
+        deployment_id: str,
+        *,
+        before_restart: Callable[[], None],
+    ) -> None: ...
+    async def start_bridge(self, shell: PanelShell) -> None: ...
+    async def bridge_running(self, shell: PanelShell) -> bool: ...
+    async def rebind_rehearsed_deployment(self, shell: PanelShell, deployment_id: str) -> None: ...
 
     async def stage_release(
         self,
@@ -778,6 +789,47 @@ class _InstallState:
     journal_phase: ProvisioningPhase | None = None
     failure_code: str = "invalid_provisioning_dependency"
     failure_stage: str = "provisioning"
+
+
+class _RehearsalOutcome(StrEnum):
+    """How one incumbent health rehearsal ended (before mapping to a code)."""
+
+    HEALTHY = "healthy"
+    PROOF_FAILED = "proof_failed"
+    RESTART_FAILED = "restart_failed"
+    UNOBSERVABLE = "unobservable"
+    CANCELLED = "cancelled"
+
+
+def rehearsal_failure_code(
+    outcome: _RehearsalOutcome, *, transport_lost: bool, bridge_running: bool
+) -> str | None:
+    """The refusal code for a rehearsal outcome; None when nothing is refused.
+
+    A cancellation is re-raised rather than coded. An HA-side observer failure
+    never touched the bridge. A lost session is never reconnected, even after a
+    healthy proof: the install or update cannot continue on it. Otherwise the
+    code says whether the bridge is verified running: an unhealthy but running
+    incumbent, a rehearsal that never restarted it, or one whose state could not
+    be verified.
+    """
+    if outcome is _RehearsalOutcome.CANCELLED:
+        return None
+    if outcome is _RehearsalOutcome.UNOBSERVABLE:
+        return "incumbent_health_unobservable"
+    if transport_lost:
+        return "incumbent_rehearsal_interrupted"
+    if outcome is _RehearsalOutcome.HEALTHY:
+        return None
+    if not bridge_running:
+        return "incumbent_unhealthy_unverified"
+    if outcome is _RehearsalOutcome.RESTART_FAILED:
+        return "incumbent_rehearsal_failed"
+    return "incumbent_unhealthy"
+
+
+# The rehearsal waits at most this long for the restarted incumbent's evidence.
+REHEARSAL_HEALTH_SECONDS = 90.0
 
 
 @dataclass(slots=True)
@@ -1088,6 +1140,127 @@ class PanelProvisioner:
         if not finalized and not keeps_code:
             raise PanelProvisioningError("baseline_capture_interrupted") from None
 
+    async def _async_rehearse_incumbent(
+        self, shell: PanelShell, snapshot: PanelSnapshot, slug: str
+    ) -> None:
+        """Prove the installed bridge can come back healthy before replacing it.
+
+        Installed layouts only. Restarts the incumbent ONCE under a fresh,
+        memory-only deployment id and waits for its MQTT health evidence, so a
+        bridge that stays ``active`` but cannot reach MQTT is refused here, where
+        its baseline is still unjournaled (the caller's guard removes it), instead
+        of after the candidate fails with a rollback that can never be proven.
+        On success the release admission is re-bound to the rotated id.
+        """
+        if snapshot.layout is PanelLayout.ABSENT:
+            return
+        baseline = snapshot.baseline
+        if baseline is None or COMPONENT_BRIDGE not in baseline.identities:
+            raise PanelProvisioningError("baseline_incomplete")
+        version = baseline.identities[COMPONENT_BRIDGE].version
+        deployment_id = uuid4().hex
+        outcome, cancellation = await self._async_run_rehearsal(
+            shell, snapshot, slug, version, deployment_id
+        )
+        if cancellation is not None:
+            raise cancellation from None
+        if outcome is _RehearsalOutcome.HEALTHY and not shell.transport_lost():
+            await self._operations.rebind_rehearsed_deployment(shell, deployment_id)
+            return
+        running = False
+        if (
+            outcome
+            not in {
+                _RehearsalOutcome.UNOBSERVABLE,
+                _RehearsalOutcome.HEALTHY,
+            }
+            and not shell.transport_lost()
+        ):
+            probe = await settle(
+                self._operations.bridge_running(shell), bound_seconds=CLEANUP_FINALIZE_SECONDS
+            )
+            if probe.cancellation is not None:
+                raise probe.cancellation from None
+            running = probe.error is None and probe.result is True
+        code = rehearsal_failure_code(
+            outcome, transport_lost=shell.transport_lost(), bridge_running=running
+        )
+        raise PanelProvisioningError(code or "invalid_provisioning_dependency")
+
+    async def _async_run_rehearsal(
+        self,
+        shell: PanelShell,
+        snapshot: PanelSnapshot,
+        slug: str,
+        version: str,
+        deployment_id: str,
+    ) -> tuple[_RehearsalOutcome, asyncio.CancelledError | None]:
+        observer: _HealthObserver | None = None
+        outcome = _RehearsalOutcome.UNOBSERVABLE
+        cancellation: asyncio.CancelledError | None = None
+        try:
+            observer = self._health_observer_factory(slug)
+            await observer.async_subscribe()
+        except asyncio.CancelledError as error:
+            outcome, cancellation = _RehearsalOutcome.CANCELLED, error
+        except Exception:
+            outcome = _RehearsalOutcome.UNOBSERVABLE
+        else:
+            try:
+                outcome = await self._async_rehearse_observed(
+                    observer, shell, snapshot, slug, version, deployment_id
+                )
+            except asyncio.CancelledError as error:
+                outcome, cancellation = _RehearsalOutcome.CANCELLED, error
+        closed = await _settle_close(observer.async_close if observer is not None else None)
+        if cancellation is None and closed.cancellation is not None:
+            outcome, cancellation = _RehearsalOutcome.CANCELLED, closed.cancellation
+        return outcome, cancellation
+
+    async def _async_rehearse_observed(
+        self,
+        observer: _HealthObserver,
+        shell: PanelShell,
+        snapshot: PanelSnapshot,
+        slug: str,
+        version: str,
+        deployment_id: str,
+    ) -> _RehearsalOutcome:
+        def before_restart() -> None:
+            # Metadata carrying any other id is ignored, so the still-running old
+            # process cannot satisfy the proof opened here.
+            observer.mark_activation_started(version, deployment_id)
+
+        try:
+            await self._operations.rehearse_restart(
+                shell, snapshot, deployment_id, before_restart=before_restart
+            )
+        except Exception as error:
+            code = str(error).partition(":")[0] if isinstance(error, PanelOpError) else ""
+            if code == "rehearsal_boundary_failed":
+                return _RehearsalOutcome.UNOBSERVABLE
+            if code == "rehearsal_restart_failed" and not shell.transport_lost():
+                started = await settle(
+                    self._operations.start_bridge(shell), bound_seconds=CLEANUP_FINALIZE_SECONDS
+                )
+                if started.cancellation is not None:
+                    raise started.cancellation from None
+            return _RehearsalOutcome.RESTART_FAILED
+        try:
+            evidence = await observer.async_wait(
+                version, min(self._health_timeout, REHEARSAL_HEALTH_SECONDS)
+            )
+        except Exception:
+            # Also HA's own MQTT dropping mid-wait: the observer cannot tell.
+            return _RehearsalOutcome.PROOF_FAILED
+        if (
+            evidence.deployment_id != deployment_id
+            or evidence.agent_version != version
+            or evidence.panel != slug
+        ):
+            return _RehearsalOutcome.PROOF_FAILED
+        return _RehearsalOutcome.HEALTHY
+
     async def _async_baseline_owned(self, transaction_id: UUID) -> bool:
         if await self._journal.async_retained(transaction_id) is not None:
             return True
@@ -1132,6 +1305,7 @@ class PanelProvisioner:
         transaction = uuid4()
         async with self._unjournaled_baseline_guard(shell, snapshot, transaction) as guard:
             await self._operations.verify_baseline(shell, snapshot)
+            await self._async_rehearse_incumbent(shell, snapshot, request.slug)
             request = replace(
                 request,
                 selected_components=self._staged_release_factory(
@@ -1350,6 +1524,7 @@ class PanelProvisioner:
         assert state.transaction_id is not None
         assert state.setup_id is not None
         await self._operations.verify_baseline(state.shell, snapshot)
+        await self._async_rehearse_incumbent(state.shell, snapshot, request.slug)
         state.stored_snapshot = self._snapshot_to_stored(snapshot)
         if not isinstance(state.stored_snapshot, StoredPanelSnapshot):
             raise PanelProvisioningError("snapshot_failed")

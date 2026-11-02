@@ -709,7 +709,44 @@ class _FakeOperations:
         pass
 
     async def finalize_baseline(self, shell: PanelShell, snapshot: panel_ops.PanelSnapshot) -> None:
-        pass
+        self.events.append(("finalize_baseline",))
+        if "finalize" in self.fail_at:
+            raise panel_ops.PanelOpError("baseline_finalize_failed")
+
+    async def rehearse_restart(
+        self,
+        shell: PanelShell,
+        snapshot: panel_ops.PanelSnapshot,
+        deployment_id: str,
+        *,
+        before_restart: Callable[[], None],
+    ) -> None:
+        self.events.append(("rehearse_env", deployment_id))
+        if "rehearse_env" in self.fail_at:
+            raise panel_ops.PanelOpError("rehearsal_env_write_failed")
+        try:
+            before_restart()
+        except Exception:
+            raise panel_ops.PanelOpError("rehearsal_boundary_failed") from None
+        self.events.append(("rehearse_restart",))
+        if "rehearse_restart" in self.fail_at:
+            raise panel_ops.PanelOpError("rehearsal_restart_failed")
+
+    async def start_bridge(self, shell: PanelShell) -> None:
+        self.events.append(("start_bridge",))
+        if "start_bridge" in self.fail_at:
+            raise panel_ops.PanelOpError("rehearsal_start_failed")
+
+    async def bridge_running(self, shell: PanelShell) -> bool:
+        self.events.append(("bridge_running",))
+        if "bridge_probe" in self.fail_at:
+            raise panel_ops.PanelOpError("rehearsal_probe_failed")
+        return "bridge_stopped" not in self.fail_at
+
+    async def rebind_rehearsed_deployment(self, shell: PanelShell, deployment_id: str) -> None:
+        self.events.append(("rebind", deployment_id))
+        if "rebind" in self.fail_at:
+            raise panel_ops.PanelOpError("release_identity_changed")
 
     async def restart_restored(
         self,

@@ -55,6 +55,41 @@ the diagnostic collects, what is architecture-bound, and the qualification gates
 
 ---
 
+### Add or update fails with `incumbent_unhealthy` (or another `incumbent_*` code)
+
+**Cause:** the panel already has the agent installed and its bridge is
+`active`, but when the integration restarted it once under a fresh deployment
+ID (the [incumbent health rehearsal](canary-rollback.md#incumbent-health-rehearsal))
+it did not publish MQTT health evidence with that ID within the health timeout
+(90 s by default). A rollback to such a bridge could never be proven, so the add
+or update stops before staging anything: no agent code, unit or other
+configuration was changed (only the deployment ID line of
+`/etc/brilliant-mqtt.env`), and the just-captured baseline is removed.
+
+**Costs:** every add or update on a panel that already has the agent restarts
+its bridge once (entities are briefly unavailable) and waits up to the health
+timeout.
+
+**Likely causes:** changed or missing broker credentials in
+`/etc/brilliant-mqtt.env`, or a broker the panel cannot reach
+(`journalctl -u brilliant-mqtt -n 50`). The health wait cannot tell this apart
+from Home Assistant's own MQTT connection dropping mid-wait, so also check Home
+Assistant's MQTT integration.
+
+**Ways out:** fix the old bridge's MQTT connection and retry, or uninstall the
+agent and re-add the panel (same steps as for `service_crash_looping` below).
+The other codes: `incumbent_unhealthy_unverified` — check
+`systemctl is-active brilliant-mqtt` and start it; `incumbent_rehearsal_failed`
+— the bridge was not restarted and is running, check panel storage and systemd,
+then retry; `incumbent_rehearsal_interrupted` — the SSH session dropped and
+nothing reconnects: if the restart was already issued, systemd completes it on
+its own, so check `systemctl is-active brilliant-mqtt` and start it if it's
+down, then follow
+[Interrupted baseline capture](canary-rollback.md#interrupted-baseline-capture);
+`incumbent_health_unobservable` — Home Assistant could not subscribe to the
+panel's health topics and the bridge was never touched; check the MQTT
+integration.
+
 ### Add or update fails with `service_crash_looping`
 
 **Cause:** the panel already has the agent installed (for example from an
