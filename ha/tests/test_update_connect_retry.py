@@ -21,8 +21,8 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import issue_registry as ir
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
+from custom_components.brilliant_mqtt import connect_retry, panel_ops
 from custom_components.brilliant_mqtt import manager as manager_module
-from custom_components.brilliant_mqtt import panel_ops
 from custom_components.brilliant_mqtt.const import (
     CONF_HOST,
     DOMAIN,
@@ -82,7 +82,7 @@ def clock(monkeypatch: pytest.MonkeyPatch) -> _Clock:
     fake = _Clock()
     monkeypatch.setattr(manager_module, "_connect_retry_clock", fake.monotonic)
     monkeypatch.setattr(manager_module, "_connect_retry_sleep", fake.sleep)
-    monkeypatch.setattr(manager_module, "_connect_retry_jitter", lambda: 1.0)
+    monkeypatch.setattr(connect_retry, "jitter", lambda: 1.0)
     return fake
 
 
@@ -663,3 +663,17 @@ async def test_backoff_releases_fleet_lock_but_admits_no_concurrent_panel_writer
     assert spies.admissions == 1
     assert spies.baselines == 1
     await manager.async_shutdown()
+
+
+def test_backoff_delay_is_capped_and_jittered(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The shared policy: capped exponential backoff scaled by the one jitter seam."""
+    assert [connect_retry.backoff_delay(n, 1.0) for n in range(1, 6)] == [
+        5.0,
+        10.0,
+        20.0,
+        30.0,
+        30.0,
+    ]
+    assert connect_retry.backoff_delay(2, 0.5) == 5.0
+    monkeypatch.setattr(connect_retry, "jitter", lambda: 0.5)
+    assert manager_module._connect_retry_delay(1) == 2.5

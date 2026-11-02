@@ -14,9 +14,7 @@ import asyncio
 import errno
 import json
 import logging
-import random
 import re
-import socket
 import tarfile
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
@@ -36,7 +34,7 @@ from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.event import async_call_later
 
-from . import panel_ops
+from . import connect_retry, panel_ops
 from .broker import PanelBrokerReleaseSettings
 from .const import (
     AVAILABILITY_OFFLINE,
@@ -128,69 +126,24 @@ _BUS_LIB_DRIFT_SIGNATURE = re.compile(
 _UNREACHABLE_RECHECK_SECONDS = 300.0
 _LEGACY_RETIRE_TIMEOUT_SECONDS = 30.0
 _SHELL_CLOSE_TIMEOUT_SECONDS = 5.0
-# Bounded retry of the agent update's PRE-MUTATION SSH connect (#219). Transient
-# reachability faults (a stale neighbor entry on HA's VLAN leg, a panel Wi-Fi blip)
-# clear by waiting. Backoff before retry n is min(cap, base * 2**(n-1)) scaled by a
-# jitter factor in [0.5, 1.0]. The deadline starts when the FIRST attempt acquires
-# the fleet SSH lock, so time queued behind other panels' operations never consumes
-# the budget. After that: no retry is scheduled whose backoff would end past the
-# deadline, a retry's wait for the fleet lock is cut off at the deadline, and a retry
-# that gets the lock after the deadline does not connect. Total time after the first
-# lock acquisition is therefore at most the deadline plus one connect attempt (the
-# shell's connect timeout; two for an opt-in legacy re-pin, which is never retried).
-_CONNECT_RETRY_MAX_ATTEMPTS = 5
-_CONNECT_RETRY_BASE_DELAY_S = 5.0
-_CONNECT_RETRY_MAX_DELAY_S = 30.0
-_CONNECT_RETRY_DEADLINE_S = 120.0
-_CONNECT_RETRY_JITTER_MIN = 0.5
-# Network faults only. Authentication, host-key, key-exchange and protocol failures
-# are permanent: password-only root SSH must never be retried into a lockout, and a
-# changed host key must never be retried around. These classes can still occur
-# AFTER asyncssh began user authentication (connect_timeout spans the handshake and
-# auth), so the retry loop additionally refuses any failure whose shell reports
-# connect_reached_auth(): only a connect that never offered the password repeats.
-_TRANSIENT_CONNECT_ERRNOS: dict[int, str] = {
-    errno.EHOSTUNREACH: "host_unreachable",
-    errno.EHOSTDOWN: "host_unreachable",
-    errno.ENETUNREACH: "network_unreachable",
-    errno.ENETDOWN: "network_unreachable",
-    errno.ECONNREFUSED: "connection_refused",
-    errno.ECONNRESET: "connection_reset",
-    errno.ECONNABORTED: "connection_reset",
-    errno.ETIMEDOUT: "timeout",
-}
-
-
-def _connect_retry_jitter() -> float:
-    """Return the backoff scale factor (indirected so tests can pin it)."""
-    return random.uniform(_CONNECT_RETRY_JITTER_MIN, 1.0)
-
+# Bounded retry of the agent update's PRE-MUTATION SSH connect (#219); the policy
+# (classification, backoff, jitter) lives in connect_retry. The deadline starts when
+# the FIRST attempt acquires the fleet SSH lock, so time queued behind other panels'
+# operations never consumes the budget. After that: no retry is scheduled whose
+# backoff would end past the deadline, a retry's wait for the fleet lock is cut off
+# at the deadline, and a retry that gets the lock after the deadline does not
+# connect. Total time after the first lock acquisition is therefore at most the
+# deadline plus one attempt (the shell's connect timeout; two for an opt-in legacy
+# re-pin, which is never retried).
+_CONNECT_RETRY_MAX_ATTEMPTS = connect_retry.MAX_ATTEMPTS
+_CONNECT_RETRY_BASE_DELAY_S = connect_retry.BASE_DELAY_S
+_CONNECT_RETRY_DEADLINE_S = connect_retry.DEADLINE_S
+_classify_transient_connect_failure = connect_retry.classify_transient_connect_failure
+_connect_retry_delay = connect_retry.backoff_delay
 
 # Indirected so tests drive the retry loop without real waits.
 _connect_retry_clock: Callable[[], float] = time.monotonic
 _connect_retry_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
-
-
-def _classify_transient_connect_failure(error: BaseException) -> str | None:
-    """Return a fixed retry reason for a transient connect failure, else None."""
-    if isinstance(error, socket.gaierror):
-        return "dns_temporary_failure" if error.errno == socket.EAI_AGAIN else None
-    if isinstance(error, TimeoutError):
-        return "timeout"
-    if isinstance(error, OSError):
-        return _TRANSIENT_CONNECT_ERRNOS.get(error.errno) if error.errno is not None else None
-    if isinstance(error, asyncssh.ConnectionLost):
-        return "connection_lost"
-    return None
-
-
-def _connect_retry_delay(failed_attempt: int) -> float:
-    """Capped exponential backoff with jitter after *failed_attempt* (1-based)."""
-    ceiling = min(
-        _CONNECT_RETRY_MAX_DELAY_S,
-        _CONNECT_RETRY_BASE_DELAY_S * 2.0 ** (failed_attempt - 1),
-    )
-    return round(ceiling * _connect_retry_jitter(), 1)
 
 
 _RETAINED_LEDGER_DEGRADED = "retained_ledger"
