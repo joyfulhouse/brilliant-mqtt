@@ -61,7 +61,8 @@ class FakeShell:
 
     Both apply to ``run()`` and ``start()`` (matched against the command) and to
     ``put_bytes()``, ``put_dir()`` and ``put_file()`` (matched against the remote
-    path). The drop raises ``asyncssh.ConnectionLost`` and sets
+    path). For ``start()``, ``drop_after`` lets the remote child run to completion
+    before the session drops. The drop raises ``asyncssh.ConnectionLost`` and sets
     ``transport_lost()``; every later operation on the shell raises the same.
     ``connect()`` and ``close()`` are never affected.
     """
@@ -182,6 +183,8 @@ class FakeShell:
     async def start(self, command: str) -> PanelProcess:
         self._before(command)
         process = await self._do_start(command)
+        if self.drop_after is not None and self.drop_after in command:
+            await process.wait()  # the remote child runs to completion first
         self._after(command)
         return process
 
