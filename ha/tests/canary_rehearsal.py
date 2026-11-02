@@ -8,7 +8,9 @@ import os
 import shutil
 import signal
 import sys
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from custom_components.brilliant_mqtt import panel_ops
 from custom_components.brilliant_mqtt.shell import RunResult
@@ -55,14 +57,37 @@ class RehearsalShell(FakeShell):
             "states = json.loads(path.read_text())\n"
             "op, *args = sys.argv[1:]\n"
             "if op == 'daemon-reload': raise SystemExit(0)\n"
+            # Queued samples are consumed one per `show`; a crash-looping unit that
+            # is started sits in auto-restart (is-active: activating) until stopped.
+            "queued = states.setdefault('__samples__', {})\n"
+            "crashing = states.setdefault('__crash__', [])\n"
+            "def reading(name):\n"
+            "    state = states.setdefault(name, [False, False])\n"
+            "    if queued.get(name):\n"
+            "        return queued[name].pop(0).split('|')\n"
+            "    if state[1] and name in crashing:\n"
+            "        return ['activating', 'auto-restart', '7']\n"
+            "    return ['active', 'running', '0'] if state[1] else ['inactive', 'dead', '0']\n"
+            "if op == 'show':\n"
+            "    names = [arg for arg in args if not arg.startswith('-') and arg not in "
+            "('ActiveState', 'SubState', 'NRestarts')]\n"
+            "    blocks = []\n"
+            "    for unit in names:\n"
+            "        active, sub, restarts = reading(unit.removesuffix('.service'))\n"
+            "        blocks.append(f'ActiveState={active}\\nSubState={sub}\\n"
+            "NRestarts={restarts}\\n')\n"
+            "    sys.stdout.write('\\n'.join(blocks))\n"
+            "    path.write_text(json.dumps(states))\n"
+            "    raise SystemExit(0)\n"
             "name = args[-1].removesuffix('.service')\n"
             "state = states.setdefault(name, [False, False])\n"
             "if op in ('is-enabled', 'is-active'):\n"
             "    index = int(op == 'is-active')\n"
+            "    running = state[1] and name not in crashing\n"
             "    if '--quiet' not in args:\n"
             "        print(('enabled' if state[0] else 'disabled') if index == 0 "
-            "else ('active' if state[1] else 'inactive'))\n"
-            "    raise SystemExit(0 if state[index] else 3)\n"
+            "else ('active' if running else 'activating' if state[1] else 'inactive'))\n"
+            "    raise SystemExit(0 if (state[0] if index == 0 else running) else 3)\n"
             "if op == 'enable': state[0] = True\n"
             "if op == 'disable': state[0] = False\n"
             # Like systemd, --now also starts or stops the unit.
@@ -72,6 +97,32 @@ class RehearsalShell(FakeShell):
             "path.write_text(json.dumps(states))\n"
         )
         control.chmod(0o700)
+
+    def _update_state(self, change: Callable[[dict[str, Any]], None]) -> None:
+        states = json.loads(self.state.read_text())
+        change(states)
+        self.state.write_text(json.dumps(states))
+
+    def queue_samples(self, service: str, *samples: str) -> None:
+        """Queue exact `Active|Sub|NRestarts` readings for the next `show` calls."""
+
+        def change(states: dict[str, Any]) -> None:
+            states.setdefault("__samples__", {}).setdefault(service, []).extend(samples)
+
+        self._update_state(change)
+
+    def crash_loop(self, service: str, *, crashing: bool = True) -> None:
+        """Make a started unit sit in auto-restart (crash loop) until stopped."""
+
+        def change(states: dict[str, Any]) -> None:
+            names = set(states.setdefault("__crash__", []))
+            if crashing:
+                names.add(service)
+            else:
+                names.discard(service)
+            states["__crash__"] = sorted(names)
+
+        self._update_state(change)
 
     def translate(self, value: str) -> str:
         return (

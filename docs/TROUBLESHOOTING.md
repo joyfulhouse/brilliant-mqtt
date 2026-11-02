@@ -34,6 +34,49 @@ Reset to `LOG_LEVEL=INFO` when done.
 
 ---
 
+### Add or update fails with `service_crash_looping`
+
+**Cause:** the panel already has the agent installed (for example from an
+earlier Home Assistant entry), and its bridge, Wi-Fi watchdog or bus watchdog
+kept restarting during the pre-change service check. The fleet units run with
+`Restart=always`, so a unit that exits at startup shows `activating
+(auto-restart)` between attempts. The integration samples each core service for
+about 13.5 seconds before any change; one restart in that window is enough. A
+crash-looping bridge can never pass the fresh-MQTT health check that a rollback
+waits for, so no safe rollback baseline can be taken. The add or update stops
+there: no agent code, unit or configuration was changed, and no baseline is
+kept. A crash loop that starts while the baseline is being captured is caught by
+the second check, and that just-captured baseline is removed again.
+
+**Costs:** the panel keeps running the old, broken bridge until you fix it. If
+the release needed an explicit `release_override`, that override was consumed
+and a retry needs a fresh approval. An automatic pre-ordinal admission was also
+recorded before the check.
+
+**Likely causes:** missing or changed broker credentials in
+`/etc/brilliant-mqtt.env`, or a broker the panel cannot reach. Check with
+`journalctl -u brilliant-mqtt -n 50` (or `-u brilliant-wifi-watchdog` /
+`-u brilliant-bus-watchdog`) on the panel.
+
+**Ways out:**
+
+1. **Fix the old bridge so it stays up**, for example by restoring its broker
+   credentials or broker reachability. When `systemctl status brilliant-mqtt`
+   shows `active (running)` and stays that way, retry. If it was a one-off
+   restart and the service now stays up, simply retry.
+2. **Uninstall the agent, then re-add the panel.**
+   - If the panel still has a Home Assistant entry, turn off both the **Wi-Fi
+     watchdog** and **Bus watchdog** switches first, then run
+     `brilliant_mqtt.uninstall`. `brilliant_mqtt.uninstall` removes only the
+     bridge. A watchdog unit left under `/etc/systemd/system` keeps the layout
+     `legacy_fixed`, and with the bridge's code gone that watchdog crash-loops
+     too, so the next add still fails with `service_crash_looping`. This is the
+     same warning as in
+     [ha-integration.md → Recovering a stopped pre-ordinal bridge](ha-integration.md#recovering-a-stopped-pre-ordinal-bridge).
+   - If the panel has no Home Assistant entry (the usual case for a failed
+     re-add), use the
+     [manual agent uninstall](#manual-agent-uninstall-panel-without-a-home-assistant-entry).
+
 ## Connectivity
 
 ### Entities show as unavailable / panel `offline`
@@ -435,6 +478,70 @@ Discovery topics are retained — they must be explicitly cleared. Publish an
 **empty retained payload** to each
 `homeassistant/<component>/<unique_id>/config` topic, then stop the unit.
 HA removes the entities on the next restart or after the discovery timeout.
+
+### Manual agent uninstall (panel without a Home Assistant entry)
+
+Use this only when the panel has no Home Assistant entry, so the watchdog
+switches and `brilliant_mqtt.uninstall` are unavailable. It runs the same
+commands the integration runs when you turn off the Wi-Fi and Bus watchdog
+switches and then call `brilliant_mqtt.uninstall`, in that order. It never
+touches the firmware tree.
+
+**Prerequisite:** confirm that Home Assistant shows no pending provisioning
+recovery, rollback, Repair issue, or interrupted-onboarding journal for this
+panel. Settle any of those first, as described in
+[canary-rollback.md → Interrupted onboarding without an HA panel owner](canary-rollback.md#interrupted-onboarding-without-an-ha-panel-owner).
+The manual uninstall deletes `/var/brilliant-mqtt`, which would destroy the
+rollback baseline such a recovery still needs.
+
+Connect to the panel (the password is only offered once):
+
+```bash
+ssh -o NumberOfPasswordPrompts=1 root@<panel-address>
+```
+
+**Step 1: check for a retained rollback baseline.** Paste and run this block
+**on its own** and read its output before going further. If it prints `STOP`,
+its `exit` ends the SSH session: do not uninstall, and settle the baseline from
+Home Assistant first (see [canary-rollback.md](canary-rollback.md)). This guard
+is at least as strict as the integration's own check, which refuses to
+uninstall with `baseline_retained_finalize_first`.
+
+<!-- manual-agent-uninstall-guard:start -->
+```bash
+if ls /var/brilliant-mqtt/.rollback/*/complete.json >/dev/null 2>&1; then
+  echo "STOP: retained rollback baseline present; do not uninstall"
+  exit 1
+fi
+echo "OK: no retained rollback baseline"
+```
+<!-- manual-agent-uninstall-guard:end -->
+
+**Step 2: remove the watchdogs, then the bridge.** Run this only after step 1
+printed `OK`. Its first line repeats the step 1 check, so it stops (and ends
+the session) instead of deleting a retained baseline:
+
+<!-- manual-agent-uninstall:start -->
+```bash
+if ls /var/brilliant-mqtt/.rollback/*/complete.json >/dev/null 2>&1; then echo "STOP: retained rollback baseline present; do not uninstall"; exit 1; fi
+systemctl disable --now brilliant-wifi-watchdog 2>/dev/null || true
+rm -f /etc/systemd/system/brilliant-wifi-watchdog.service
+rm -rf /var/brilliant-mqtt/wifi_watchdog /var/brilliant-mqtt/wifi_watchdog.staging
+rm -f /var/brilliant-mqtt/wifi-watchdog.log /var/brilliant-mqtt/wifi-watchdog.state
+systemctl daemon-reload
+systemctl disable --now brilliant-bus-watchdog 2>/dev/null || true
+rm -f /etc/systemd/system/brilliant-bus-watchdog.service
+rm -rf /var/brilliant-mqtt/bus_watchdog /var/brilliant-mqtt/bus_watchdog.staging
+rm -f /var/brilliant-mqtt/bus-watchdog.log /var/brilliant-mqtt/bus-watchdog.state
+systemctl daemon-reload
+systemctl disable --now brilliant-mqtt 2>/dev/null || true
+rm -f /etc/systemd/system/brilliant-mqtt.service /etc/brilliant-mqtt.env
+rm -rf /var/brilliant-mqtt /var/brilliant-mqtt.staging /var/brilliant-mqtt.staging.tar.gz
+systemctl daemon-reload
+```
+<!-- manual-agent-uninstall:end -->
+
+The panel now has no agent layout. Add it again with **Add Brilliant panel**.
 
 ---
 

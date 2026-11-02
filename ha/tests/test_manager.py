@@ -6015,3 +6015,20 @@ def test_snapshot_probe_summary_exposes_only_safe_retry_guidance() -> None:
     assert "snapshot_probe_failed" in summary
     assert "retry" in summary
     assert "SECRET" not in summary
+
+
+@pytest.mark.parametrize(
+    ("code", "guidance"),
+    [
+        ("service_crash_looping", "uninstall"),
+        ("baseline_capture_interrupted", "docs/canary-rollback.md"),
+    ],
+)
+def test_crash_loop_summaries_expose_only_safe_guidance(code: str, guidance: str) -> None:
+    from custom_components.brilliant_mqtt.manager import _safe_failure_summary
+    from custom_components.brilliant_mqtt.panel_ops import PanelOpError
+
+    summary = _safe_failure_summary("update failed", PanelOpError(f"{code}: SECRET stderr"))
+    assert code in summary
+    assert guidance in summary
+    assert "SECRET" not in summary

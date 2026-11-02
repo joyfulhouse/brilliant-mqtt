@@ -1007,3 +1007,27 @@ async def test_resume_refuses_a_changed_release_candidate(
         "code": "release_candidate_changed",
         "attempts": 1,
     }
+
+
+def test_both_baseline_capture_interrupted_triggers_share_one_text() -> None:
+    """A lost capture session and an unremovable failed capture read the same (#219/#226)."""
+    import json
+
+    detail = manager_module._BASELINE_CAPTURE_INTERRUPTED_DETAIL
+    lost = manager_module._BASELINE_LOST_SUMMARY
+    unremovable = manager_module._safe_failure_summary(
+        "agent update failed during deployment",
+        panel_ops.PanelOpError("baseline_capture_interrupted"),
+    )
+    assert detail in lost
+    assert detail in unremovable
+    assert "no Home Assistant journal owns" in detail
+    assert "'Interrupted baseline capture'" in detail
+    root = Path(__file__).resolve().parents[2] / "custom_components/brilliant_mqtt"
+    for name in ("strings.json", "translations/en.json"):
+        text = (root / name).read_text()
+        assert text.count('"baseline_capture_interrupted":') == 1
+        errors = json.loads(text)["config_subentries"]["panel"]["error"]
+        copy = errors["baseline_capture_interrupted"]
+        assert "Keep the journal" not in copy
+        assert "Interrupted baseline capture" in copy

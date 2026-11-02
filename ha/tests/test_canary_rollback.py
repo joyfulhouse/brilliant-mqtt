@@ -2455,3 +2455,105 @@ async def test_lost_session_after_a_completed_remote_capture_is_never_resumed(
     assert await journal.async_retained_records() == ()
     # The completed capture stays on the panel for the documented manual settle.
     assert any((shell.panel / ".rollback").iterdir())
+
+
+# --- #226: crash-looping core units --------------------------------------------
+
+
+def _rollback_entries(shell: RehearsalShell) -> list[Path]:
+    parent = shell.panel / ".rollback"
+    return sorted(parent.iterdir()) if parent.exists() else []
+
+
+def _release_pins(shell: RehearsalShell) -> list[Path]:
+    return list(shell.panel.glob("releases/*/.rollback-retained"))
+
+
+@pytest.mark.parametrize("release", [False, True], ids=["legacy", "release_link"])
+async def test_transient_activating_flip_still_matches_capture_resnapshot(
+    tmp_path: Path, release: bool
+) -> None:
+    shell = RehearsalShell(tmp_path)
+    shell.install(release=release)
+    snapshot = await panel_ops.snapshot_panel(shell)
+    shell.queue_samples("brilliant-mqtt", "activating|start|0", "active|running|0")
+
+    captured = await panel_ops.capture_baseline(shell, snapshot)
+
+    assert captured.baseline is not None
+    assert replace(captured, baseline=None) == snapshot
+
+
+@pytest.mark.parametrize("release", [False, True], ids=["legacy", "release_link"])
+async def test_stuck_crash_loop_is_refused_before_any_baseline(
+    tmp_path: Path, release: bool
+) -> None:
+    shell = RehearsalShell(tmp_path)
+    shell.install(release=release)
+    shell.crash_loop("brilliant-mqtt")
+
+    with pytest.raises(panel_ops.PanelOpError, match="^service_crash_looping$"):
+        await panel_ops.snapshot_panel(shell)
+
+    assert _rollback_entries(shell) == []
+    assert _release_pins(shell) == []
+
+
+@pytest.mark.parametrize("release", [False, True], ids=["legacy", "release_link"])
+async def test_crash_loop_starting_during_capture_is_refused_and_baseline_removed(
+    tmp_path: Path, release: bool
+) -> None:
+    shell = RehearsalShell(tmp_path)
+    shell.install(release=release)
+    snapshot = await panel_ops.snapshot_panel(shell)
+    shell.crash_loop("brilliant-mqtt")
+
+    with pytest.raises(panel_ops.PanelOpError, match="^service_crash_looping$"):
+        await panel_ops.capture_baseline(shell, snapshot)
+
+    assert _rollback_entries(shell) == []
+    assert _release_pins(shell) == []
+    assert not await panel_ops.baseline_retained(shell)
+
+
+async def test_failed_finalize_after_refused_capture_is_typed_interrupted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shell = RehearsalShell(tmp_path)
+    shell.install(release=True)
+    snapshot = await panel_ops.snapshot_panel(shell)
+    shell.crash_loop("brilliant-mqtt")
+    start = shell.start
+
+    async def failing_finalize(command: str) -> Any:
+        if "BRILLIANT_BASELINE_ACTION" in command and "'finalize'" in command:
+            return await start("exit 1")
+        return await start(command)
+
+    monkeypatch.setattr(shell, "start", failing_finalize)
+
+    with pytest.raises(panel_ops.PanelOpError, match="^baseline_capture_interrupted$"):
+        await panel_ops.capture_baseline(shell, snapshot)
+
+    assert await panel_ops.baseline_retained(shell)
+
+
+async def test_rollback_verification_refuses_crash_looping_restored_bridge(
+    tmp_path: Path,
+) -> None:
+    shell = RehearsalShell(tmp_path)
+    shell.install()
+    baseline = await panel_ops.capture_baseline(shell, await panel_ops.snapshot_panel(shell))
+    transaction = uuid4()
+    staged = panel_ops.StagedRelease(
+        "0.10.3",
+        transaction,
+        f"/var/brilliant-mqtt/releases/0.10.3--{transaction.hex}",
+        ("bridge",),
+    )
+    shell.crash_loop("brilliant-mqtt")
+
+    with pytest.raises(panel_ops.PanelOpError, match="^rollback_verification_failed$"):
+        await panel_ops.rollback_snapshot(shell, baseline, staged)
+
+    assert await panel_ops.baseline_retained(shell)

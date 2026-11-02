@@ -95,6 +95,7 @@ while obtaining redacted diagnostics and the HA repair/log code.
 | Code/state | Operator action |
 | --- | --- |
 | `baseline_capture_failed`, `baseline_verify_failed` | Candidate mutation is refused. Preserve the incumbent; investigate missing/drifting code, permissions, free space, or capture bounds before retrying. |
+| `baseline_capture_interrupted` | A rollback baseline that no HA journal owns may remain on the panel: an update lost its session during capture, or a failed capture could not remove its just-published baseline. Nothing is resumed and `canary_finalize` cannot settle it; while it remains, uninstall and repair/component code writes refuse with `baseline_retained_finalize_first`. Follow [Interrupted baseline capture](#interrupted-baseline-capture). |
 | `transaction_in_progress` | Another operation holds the shared panel lock. Allow it to finish and retry. |
 | `provisioning_recovery_required` | Another panel's interrupted provisioning journal must be recovered first. Diagnostics name it (`provisioning.name`, `panel`, `phase`, `last_error`). Resolve that journal's own code below; for an onboarding that never created an HA panel, see [Interrupted onboarding without an HA panel owner](#interrupted-onboarding-without-an-ha-panel-owner). Operations stay serialized; nothing is skipped. |
 | `recovery_connection_failed` | Recovery could not reach the panel at the journal's recorded address. Bring the panel online. If its address or root password changed and it has no HA panel entry, settle it with Add Brilliant panel (below); otherwise repair the owning panel's address/credentials. |
@@ -109,61 +110,6 @@ while obtaining redacted diagnostics and the HA repair/log code.
 | `rollback_failed` / `rollback_failed` state | Preserve artifacts and the actionable repair code for the maintainer. A missing or changed pinned release is not silently replaced with bundled code. |
 | `connection_lost` (Repair reason) | The update's SSH session was lost after its transaction began. The restore intent is durable (journal `rollback_pending`, baseline `restore_requested`) and its rollback ran, or will run, over a fresh session pinned to the journaled host key; activation is never repeated. The second code in the Repair says why the fresh session failed (`recovery_connection_failed`, `panel_authentication_failed`, `panel_identity_mismatch`, or `rollback_failed` when every attempt was unreachable). Bring the panel back; automatic recovery settles the journal on the next start. |
 | `recovery_interrupted` | Home Assistant was stopping while the rollback reconnected; the panel was not shown unreachable. The intent is kept and recovery resumes on the next start. |
-| `baseline_capture_interrupted` | An update lost its session during baseline capture, before any journal existed. Nothing is resumed. Follow [Interrupted baseline capture](#interrupted-baseline-capture). |
-
-## Interrupted baseline capture
-
-An update that lost its SSH session while capturing the baseline reports
-`baseline_capture_interrupted`. No journal was created, so Home Assistant has
-no record of the capture, but the capture may have completed on the panel. A
-leftover baseline is harmless until the next update, which refuses with
-`baseline_already_retained` (release-link layouts) while its pin remains. This
-is the one case that needs a manual settle over SSH; it mirrors exactly what
-`finalize` does on the panel (`baseline_action` in
-`scripts/brilliant-panel/bundle_manifest.py`).
-
-1. Wait at least 2 minutes after the failure. The capture runs under a
-   120-second alarm, so after that no capture process can still be writing.
-2. Download diagnostics and confirm there is **no** execution journal
-   (`provisioning.count` is 0) and **no** `provisioning.retained` entry. This
-   check is the guard: if either exists, stop and follow the recovery for that
-   journal or baseline instead. Make sure no update or repair of this panel runs
-   between this step and step 4.
-3. Inspect, read-only:
-
-   ```sh
-   ssh -o NumberOfPasswordPrompts=1 root@<panel> \
-     'ls -la /var/brilliant-mqtt/.rollback/; cat /var/brilliant-mqtt/current/.rollback-retained'
-   ```
-
-   Each capture is a directory `.rollback/<id>` (a 32-hex-character name),
-   possibly with an unpublished `.rollback/.<id>.tmp`. The on-panel `<id>` is
-   not the diagnostics transaction name and cannot be matched to it; with no
-   journal and no retained record, a `<id>` from this update is the only one
-   expected.
-4. Remove only that capture. On release-link layouts (where
-   `/var/brilliant-mqtt/current` is a symlink), first remove the active
-   release's pin, and only if its content equals `<id>`:
-
-   ```sh
-   ssh -o NumberOfPasswordPrompts=1 root@<panel> '
-     id=<id>; pin=/var/brilliant-mqtt/current/.rollback-retained
-     if [ -L /var/brilliant-mqtt/current ] && [ "$(cat "$pin" 2>/dev/null)" = "$id" ]; then
-       rm -f "$pin"
-     fi
-     rm -rf "/var/brilliant-mqtt/.rollback/$id" "/var/brilliant-mqtt/.rollback/.$id.tmp"
-     sync'
-   ```
-
-   Do not remove anything else under `.rollback/`.
-5. Check the bridge and start it if it is down:
-
-   ```sh
-   ssh -o NumberOfPasswordPrompts=1 root@<panel> \
-     'systemctl is-active brilliant-mqtt || systemctl start brilliant-mqtt'
-   ```
-
-Then run the update again.
 
 ## Finalize only after sign-off
 
@@ -262,6 +208,72 @@ recovery does not reuse stored credentials to finish this operation. Start Add
 Brilliant panel again, authenticate freshly and confirm again. Unmarked older
 `finalizing` records are not accepted through this path because their original
 state cannot be proven; preserve those records for investigation.
+
+## Interrupted baseline capture
+
+`baseline_capture_interrupted` means a rollback baseline that no Home Assistant
+journal owns may remain on the panel. It arises in two ways:
+
+- an update lost its SSH session while the baseline was being captured, before
+  any journal existed (the capture may still have completed on the panel); or
+- a capture published its baseline, the re-check that follows failed (for
+  example `service_crash_looping`), and the automatic removal of that baseline
+  failed too.
+
+The baseline never authorised a change, but Home Assistant holds no record of
+it, so `canary_finalize` cannot settle it. While it remains,
+`brilliant_mqtt.uninstall` and repair or component code writes refuse with
+`baseline_retained_finalize_first`. Retrying blindly does not clear it: on a
+release_link layout the next capture refuses with `baseline_already_retained`
+because the leftover pin names a published baseline, and on a flat (legacy)
+layout it captures a second baseline beside the first, leaving another orphan.
+So inspect first, and remove it by hand with exactly the steps the
+integration's finalize performs:
+
+1. Wait at least 2 minutes after the failure. The capture runs under a
+   120-second alarm, so after that no capture process can still be writing.
+2. Download diagnostics and confirm there is **no** execution journal
+   (`provisioning.count` is 0) and **no** `provisioning.retained` entry at all.
+   This check is the guard: it is what makes every baseline on the panel an
+   orphan. If either exists, stop and follow the recovery for that journal or
+   baseline instead. Make sure no update or repair of this panel runs between
+   this step and step 4.
+3. Inspect, read-only:
+
+   ```bash
+   ssh -o NumberOfPasswordPrompts=1 root@<panel-address> \
+     'ls -la /var/brilliant-mqtt/.rollback/; cat /var/brilliant-mqtt/current/.rollback-retained'
+   ```
+
+   A published baseline is a 32-hex-character directory `<id>` (possibly with a
+   `.<id>.tmp` or `.<id>.finalizing` sibling); the `cat` prints the active
+   release's pin on release_link layouts and fails harmlessly on flat ones. The
+   on-panel `<id>` cannot be matched against the transaction names in
+   diagnostics. If there is **no** `<id>` directory, no baseline was published:
+   retry the add or update (a release_link capture reconciles an unpublished
+   pin itself) and stop here. Otherwise continue.
+4. Remove that baseline. In an SSH session
+   (`ssh -o NumberOfPasswordPrompts=1 root@<panel-address>`), set `ID` to the
+   `<id>` from step 3 and paste the block. It refuses (and ends the session)
+   unless `ID` is exactly 32 lowercase hex characters. It removes the active
+   release's pin only if it is a regular file naming this `<id>`, then
+   `.rollback/<id>` and its `.tmp` / `.finalizing` siblings, and nothing else
+   under `.rollback/`:
+
+   <!-- interrupted-baseline-cleanup:start -->
+   ```bash
+   ID=<id>
+   echo "$ID" | grep -Eqx '[0-9a-f]{32}' || { echo "STOP: invalid baseline id"; exit 1; }
+   PIN=/var/brilliant-mqtt/current/.rollback-retained
+   if [ -L /var/brilliant-mqtt/current ] && [ -f "$PIN" ] && [ ! -L "$PIN" ] && [ "$(cat "$PIN")" = "$ID" ]; then rm -f -- "$PIN"; fi
+   rm -rf -- "/var/brilliant-mqtt/.rollback/$ID" "/var/brilliant-mqtt/.rollback/.$ID.tmp" "/var/brilliant-mqtt/.rollback/.$ID.finalizing"
+   sync
+   ```
+   <!-- interrupted-baseline-cleanup:end -->
+
+5. Check the bridge with `systemctl is-active brilliant-mqtt`, and run
+   `systemctl start brilliant-mqtt` if it is not `active`. Then run the update
+   again.
 
 ## Interrupted onboarding without an HA panel owner
 

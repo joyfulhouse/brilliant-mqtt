@@ -168,10 +168,15 @@ _ADMISSION_OVERRIDE_LOST_SUMMARY = (
     "(release_override_used_or_write_failed: the single-use release override may already "
     "be consumed; obtain a fresh override)"
 )
+# One operator text for baseline_capture_interrupted, whichever way it arose (a
+# session lost during capture, or a failed capture whose baseline removal failed).
+_BASELINE_CAPTURE_INTERRUPTED_DETAIL = (
+    "baseline_capture_interrupted: a rollback baseline that no Home Assistant journal "
+    "owns may remain on the panel; see docs/canary-rollback.md 'Interrupted baseline capture'"
+)
 _BASELINE_LOST_SUMMARY = (
     "agent update lost the panel connection during baseline capture "
-    "(baseline_capture_interrupted: a rollback baseline may remain on the panel; see "
-    "docs/canary-rollback.md 'Interrupted baseline capture')"
+    f"({_BASELINE_CAPTURE_INTERRUPTED_DETAIL})"
 )
 _BASELINE_RECOVERY_SUMMARY = (
     "agent update lost the panel connection during baseline capture "
@@ -198,6 +203,13 @@ _SAFE_PANEL_OP_DETAILS = {
         "snapshot_probe_failed: wait for restarting panel services to settle, "
         "check connectivity, and retry"
     ),
+    "service_crash_looping": (
+        "service_crash_looping: the installed bridge or a watchdog kept restarting, so no "
+        "safe rollback baseline was taken and nothing was changed; fix it so it stays up "
+        "(check broker credentials and reachability) or uninstall and re-add; "
+        "see docs/TROUBLESHOOTING.md"
+    ),
+    "baseline_capture_interrupted": _BASELINE_CAPTURE_INTERRUPTED_DETAIL,
     "mqtt_ca_promotion_failed": "mqtt_ca_promotion_failed",
     "mqtt_ca_verification_failed": "mqtt_ca_verification_failed",
     "mqtt_tls_downgrade_refused": "mqtt_tls_downgrade_refused",

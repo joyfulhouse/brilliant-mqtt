@@ -92,6 +92,11 @@ _CORE_COMPONENTS = (
 )
 _PANEL_SLUG = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _VERSION = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._+-]{0,127}$")
+# Snapshot-stage panel-op codes surfaced as-is because each tells the operator
+# what to do; any other snapshot-stage failure stays the generic snapshot_failed.
+_ACTIONABLE_SNAPSHOT_CODES = frozenset(
+    {"snapshot_probe_failed", "service_crash_looping", "baseline_capture_interrupted"}
+)
 _MAX_JSON_DEPTH = 64
 _MAX_JSON_NODES = 4096
 _PROGRESS_TIMEOUT_SECONDS = 5.0
@@ -901,8 +906,9 @@ class PanelProvisioner:
             except PanelOpError as error:
                 code = str(error).partition(":")[0]
                 primary = PanelProvisioningError(
-                    "snapshot_probe_failed"
-                    if state.failure_code == "snapshot_failed" and code == "snapshot_probe_failed"
+                    code
+                    if state.failure_code == "snapshot_failed"
+                    and code in _ACTIONABLE_SNAPSHOT_CODES
                     else state.failure_code
                 )
             except OperationError as error:
