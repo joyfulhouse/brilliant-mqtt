@@ -753,3 +753,56 @@ def test_exiting_writer_generation_is_not_live_release_evidence(
         raising=False,
     )
     assert process_generation(os.getpid()) is None
+
+
+def _report_marker_storage_read_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    real_statvfs = os.statvfs
+
+    def _read_only_statvfs(path: str) -> os.statvfs_result:
+        fields = list(real_statvfs(path))
+        fields[8] |= os.ST_RDONLY
+        return os.statvfs_result(fields)
+
+    monkeypatch.setattr("brilliant_bus_watchdog.health.os.statvfs", _read_only_statvfs)
+
+
+@_requires_linux_proc
+def test_dead_writer_attempt_on_read_only_marker_storage_is_not_evidence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    phase = tmp_path / "bus-phase"
+    _write_phase_in_short_lived_process(phase, "bus", 100.0)
+    assert bus_failure_age(str(phase), now=150.0) == 50.0
+    assert bus_failure_age(str(phase), now=150.0, observer=health_mod.BusFailureObserver()) == 50.0
+
+    _report_marker_storage_read_only(monkeypatch)
+
+    assert bus_failure_age(str(phase), now=150.0) is None
+    assert bus_failure_age(str(phase), now=150.0, observer=health_mod.BusFailureObserver()) is None
+
+
+@_requires_linux_proc
+def test_unknown_marker_storage_writability_rejects_dead_writer_evidence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    phase = tmp_path / "bus-phase"
+    _write_phase_in_short_lived_process(phase, "bus", 100.0)
+    assert bus_failure_age(str(phase), now=150.0) == 50.0
+
+    def _failing_statvfs(path: str) -> os.statvfs_result:
+        raise OSError(5, "Input/output error", path)
+
+    monkeypatch.setattr("brilliant_bus_watchdog.health.os.statvfs", _failing_statvfs)
+
+    assert bus_failure_age(str(phase), now=150.0) is None
+
+
+def test_live_leased_writer_on_read_only_marker_storage_still_counts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    phase = tmp_path / "bus-phase"
+    write_phase(str(phase), "bus", monotonic_clock=lambda: 100.0)
+    _report_marker_storage_read_only(monkeypatch)
+
+    assert bus_failure_age(str(phase), now=150.0) == 50.0
+    assert bus_failure_age(str(phase), now=150.0, observer=health_mod.BusFailureObserver()) == 50.0
