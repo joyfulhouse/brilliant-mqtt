@@ -140,7 +140,8 @@ where **Motion Score Reporting** is off the sensor simply stays `off`.
 An optional standalone daemon (`brilliant_wifi_watchdog`) that recovers a
 panel's Wi-Fi when the gateway goes unreachable — escalating from a soft
 `connman` reconnect, to a `connman`/`wpa_supplicant` service restart, to a
-GPIO/SDIO Wi-Fi chip reset + reboot (guarded against reboot-looping).
+GPIO/SDIO Wi-Fi chip reset + reboot (guarded against reboot-looping). The
+chip reset is i.MX6 only; logged when skipped (the reboot still runs).
 Installed separately from the bridge, via the HA integration's **Wi-Fi
 watchdog** switch (see [ha-integration.md → Entities](ha-integration.md#entities))
 or manually from
@@ -154,7 +155,7 @@ separate env file.
 | `WIFI_WATCHDOG_GATEWAY` | no | _(auto)_ | Gateway IP to probe. Blank auto-detects the default gateway from the routing table every cycle. |
 | `WIFI_WATCHDOG_SOFT_AFTER` | no | `90` seconds | Gateway unreachable this long triggers a soft `connman` reconnect (rung 1). |
 | `WIFI_WATCHDOG_RESTART_AFTER` | no | `180` seconds | Escalates to restarting the `connman` + `wpa_supplicant` services (rung 2). |
-| `WIFI_WATCHDOG_REBOOT_AFTER` | no | `360` seconds | Escalates to a GPIO/SDIO Wi-Fi chip reset + `systemctl reboot` (rung 3), subject to the reboot guard below. |
+| `WIFI_WATCHDOG_REBOOT_AFTER` | no | `360` seconds | Escalates to a GPIO/SDIO Wi-Fi chip reset (i.MX6 only; logged when skipped) + `systemctl reboot` (rung 3), subject to the reboot guard below. |
 | `WIFI_WATCHDOG_REBOOT_COOLDOWN` | no | `3600` seconds (1 h) | Minimum gap between guard-permitted reboots. |
 | `WIFI_WATCHDOG_REBOOT_CAP` | no | `3` reboots | Maximum reboots allowed inside the rolling window; the guard blocks further ones (logs only) past this. |
 | `WIFI_WATCHDOG_REBOOT_WINDOW` | no | `21600` seconds (6 h) | Rolling window the reboot cap is measured over. |
