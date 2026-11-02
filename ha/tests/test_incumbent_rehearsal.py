@@ -143,7 +143,9 @@ def test_rehearsal_codes_are_allowlisted_and_translated() -> None:
         ("incumbent_rehearsal_failed", "storage/systemd"),
         ("incumbent_rehearsal_interrupted", "systemd completes it on its own"),
         ("incumbent_rehearsal_interrupted", "Interrupted baseline capture"),
-        ("incumbent_health_unobservable", "never touched"),
+        ("incumbent_health_unobservable", "was not restarted"),
+        ("incumbent_health_unobservable", "only its deployment-ID line may have changed"),
+        ("incumbent_rehearsal_failed", "only its deployment-ID line may have changed"),
     ],
 )
 def test_rehearsal_summaries_expose_only_safe_guidance(code: str, guidance: str) -> None:
@@ -1268,3 +1270,107 @@ async def test_update_rebind_refusal_is_typed_and_stage_accurate(
     assert await journal.async_load() is None
     assert not _baseline_left(shell)
     assert _running(shell)
+
+
+def test_operator_text_never_overstates_what_was_left_untouched() -> None:
+    root = Path(__file__).parents[2] / "custom_components/brilliant_mqtt"
+    errors = json.loads((root / "strings.json").read_text())["config_subentries"]["panel"]["error"]
+    for code in ("incumbent_health_unobservable", "incumbent_rehearsal_failed"):
+        for text in (
+            errors[code],
+            manager_module._SAFE_PANEL_OP_DETAILS[code],
+        ):
+            assert "never touched" not in text
+            assert "nothing changed" not in text.casefold()
+            assert "deployment-ID line may have changed" in text
+
+
+# --- stranded temporary env files carry broker credentials --------------------
+
+_STALE = "brilliant-mqtt.env.rollback-" + "0" * 32 + ".tmp"
+
+
+def _strand(shell: RehearsalShell) -> tuple[Path, Path, Path, Path]:
+    etc = shell.root / "etc"
+    stale = etc / _STALE
+    stale.write_text("MQTT_PASSWORD=stranded\n")
+    target = etc / "keep-target"
+    target.write_text("not ours\n")
+    link = etc / ("brilliant-mqtt.env.rollback-" + "1" * 32 + ".tmp")
+    link.symlink_to(target)
+    other = etc / "brilliant-mqtt.env.rollback-notours.tmp"
+    other.write_text("not the exact pattern\n")
+    return stale, link, other, target
+
+
+@_LAYOUTS
+async def test_rehearsal_sweeps_stranded_env_temporaries_only(
+    tmp_path: Path, release: bool
+) -> None:
+    shell = await _panel(tmp_path, release=release)
+    stale, link, other, target = _strand(shell)
+    _, provisioner = _canary(shell, SimulatedBridge(shell))
+
+    await _update(provisioner, shell)
+
+    assert not stale.exists()
+    assert link.is_symlink(), "a symlink is never followed or removed"
+    assert other.exists() and target.exists()
+
+
+async def test_restore_sweeps_stranded_env_temporaries(tmp_path: Path) -> None:
+    shell = await _panel(tmp_path, release=True)
+    baseline = await panel_ops.capture_baseline(shell, await panel_ops.snapshot_panel(shell))
+    stale, link, other, _target = _strand(shell)
+
+    await panel_ops.restart_restored(shell, baseline, "c" * 32, on_service_stopped=lambda: None)
+
+    assert not stale.exists()
+    assert link.is_symlink() and other.exists()
+    assert _deployment_id(shell) == "c" * 32
+
+
+async def test_restart_restored_removes_its_temporary_when_the_move_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shell = await _panel(tmp_path, release=True)
+    baseline = await panel_ops.capture_baseline(shell, await panel_ops.snapshot_panel(shell))
+    _replace_command(
+        monkeypatch, shell, "--force --no-target-directory -- /etc/brilliant", "exit 1"
+    )
+
+    with pytest.raises(panel_ops.PanelOpError, match="^rollback_restore_failed$"):
+        await panel_ops.restart_restored(shell, baseline, "c" * 32, on_service_stopped=lambda: None)
+
+    assert _env_temporaries(shell) == []
+    assert _deployment_id(shell) == "b" * 32
+
+
+# --- a lost session ends the health wait early --------------------------------
+
+
+async def test_lost_session_stops_the_health_wait_early(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _Harness()
+    _installed(harness)
+    waiting = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def wait(expected_version: str, bound_seconds: float = 90.0) -> PanelHealthEvidence:
+        waiting.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(harness.observer, "async_wait", wait)
+    task = asyncio.create_task(_update(harness.provisioner(), harness.shell))
+    await waiting.wait()
+    harness.shell.lost = True
+
+    async with asyncio.timeout(5):
+        with pytest.raises(PanelProvisioningError, match="^incumbent_rehearsal_interrupted$"):
+            await task
+    assert cancelled.is_set()

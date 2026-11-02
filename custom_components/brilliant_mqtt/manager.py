@@ -239,14 +239,15 @@ _SAFE_PANEL_OP_DETAILS = {
         "'Interrupted baseline capture'"
     ),
     "incumbent_rehearsal_failed": (
-        "incumbent_rehearsal_failed: the installed bridge could not be restarted for its "
-        "health rehearsal and is still running; check panel storage/systemd and retry"
+        "incumbent_rehearsal_failed: the installed bridge was not restarted for its "
+        "health rehearsal (only its deployment-ID line may have changed) and is still "
+        "running; check panel storage/systemd and retry"
     ),
     "incumbent_rehearsal_interrupted": _REHEARSAL_INTERRUPTED_DETAIL,
     "incumbent_health_unobservable": (
         "incumbent_health_unobservable: Home Assistant could not observe the panel's MQTT "
-        "health, so the installed bridge was never touched; check Home Assistant's MQTT "
-        "integration and retry"
+        "health, so the installed bridge was not restarted (only its deployment-ID line "
+        "may have changed); check Home Assistant's MQTT integration and retry"
     ),
     "mqtt_ca_promotion_failed": "mqtt_ca_promotion_failed",
     "mqtt_ca_verification_failed": "mqtt_ca_verification_failed",

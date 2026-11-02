@@ -87,7 +87,8 @@ its own, so check `systemctl is-active brilliant-mqtt` and start it if it's
 down, then follow
 [Interrupted baseline capture](canary-rollback.md#interrupted-baseline-capture);
 `incumbent_health_unobservable` — Home Assistant could not subscribe to the
-panel's health topics and the bridge was never touched; check the MQTT
+panel's health topics; the bridge was not restarted (only its deployment-ID
+line may have changed); check the MQTT
 integration.
 
 ### Add or update fails with `service_crash_looping`

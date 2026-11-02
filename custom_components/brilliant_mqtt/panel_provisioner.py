@@ -874,6 +874,27 @@ def _not_stopping() -> bool:
     return False
 
 
+async def _wait_unless_lost(
+    observer: _HealthObserver, shell: PanelShell, version: str, bound_seconds: float
+) -> PanelHealthEvidence | None:
+    """Wait for health evidence; None as soon as the SSH session is seen lost.
+
+    A lost session makes the outcome interrupted whatever the proof says, so the
+    wait is cancelled instead of running out its whole bound.
+    """
+    waiting = asyncio.ensure_future(observer.async_wait(version, bound_seconds))
+    try:
+        while not waiting.done():
+            if shell.transport_lost():
+                return None
+            await asyncio.wait({waiting}, timeout=_STOP_POLL_SECONDS)
+        return waiting.result()
+    finally:
+        if not waiting.done():
+            waiting.cancel()
+            await asyncio.gather(waiting, return_exceptions=True)
+
+
 async def _noop_progress(update: ProvisioningProgress) -> None:
     del update
 
@@ -1264,12 +1285,14 @@ class PanelProvisioner:
                 await self._async_start_bridge(shell)
             return _RehearsalOutcome.RESTART_FAILED
         try:
-            evidence = await observer.async_wait(
-                version, min(self._health_timeout, REHEARSAL_HEALTH_SECONDS)
+            evidence = await _wait_unless_lost(
+                observer, shell, version, min(self._health_timeout, REHEARSAL_HEALTH_SECONDS)
             )
         except Exception:
             # Also HA's own MQTT dropping mid-wait: the observer cannot tell.
             return _RehearsalOutcome.PROOF_FAILED
+        if evidence is None:
+            return _RehearsalOutcome.PROOF_FAILED  # the session was lost mid-wait
         if (
             evidence.deployment_id != deployment_id
             or evidence.agent_version != version

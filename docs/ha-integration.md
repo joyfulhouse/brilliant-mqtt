@@ -244,7 +244,8 @@ broker, command, or credential text.
   own; check the bridge is up and follow
   [Interrupted baseline capture](canary-rollback.md#interrupted-baseline-capture).
   `incumbent_health_unobservable`: Home Assistant's MQTT observer failed and the
-  bridge was never touched; check the MQTT integration.
+  bridge was not restarted (only its deployment-ID line may have changed); check
+  the MQTT integration.
 - **Retry:** After the fix, simply retry. Each attempt on an installed panel
   restarts its bridge once (entities briefly unavailable). Fresh installs skip
   the rehearsal.

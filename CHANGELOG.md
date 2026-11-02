@@ -65,7 +65,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retry), `incumbent_rehearsal_interrupted` (session lost, never reconnected:
   systemd completes an issued restart on its own; check the bridge is up) and
   `incumbent_health_unobservable` (Home Assistant's MQTT observer failed; the
-  bridge was never touched). The restart is one queued `systemctl restart
+  bridge was not restarted; only its deployment-ID line may have changed). If
+  the proof fails and the restarted bridge is down, one bounded best-effort
+  `systemctl reset-failed; systemctl start` runs before the code is chosen, and
+  a bridge-state code is never replaced by `baseline_capture_interrupted`. Stale
+  `/etc/brilliant-mqtt.env.rollback-*.tmp` files (they hold broker credentials)
+  left by a lost session are swept before every env write. The restart is
+  one queued `systemctl restart
   --no-block`, run by systemd itself, so a dropped SSH session cannot leave the
   bridge stopped. Fresh installs (no agent on the panel) skip the rehearsal.
   Costs: on a panel that already has the agent, every add or update now

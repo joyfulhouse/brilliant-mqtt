@@ -2340,6 +2340,21 @@ def _rollback_temp_path(path: str, staged: StagedRelease) -> str:
     return f"{path}.rollback-{staged.transaction_id.hex}.tmp"
 
 
+def _stranded_env_sweep_command() -> str:
+    """Remove stale env temporaries a lost session left behind (they hold credentials).
+
+    Only regular files (never symlinks) whose name is exactly
+    ``brilliant-mqtt.env.rollback-<32 lowercase hex>.tmp`` beside the env file.
+    """
+    pattern = "brilliant-mqtt.env.rollback-" + "[0-9a-f]" * 32 + ".tmp"
+    return (
+        f"for f in {PANEL_ENV_FILE}.rollback-*.tmp; do "
+        f'case "${{f##*/}}" in {pattern}) '
+        'if [ -f "$f" ] && [ ! -L "$f" ]; then rm -f -- "$f" || exit 1; fi ;; '
+        "esac; done"
+    )
+
+
 async def _restore_file(
     shell: PanelShell,
     path: str,
@@ -2349,6 +2364,8 @@ async def _restore_file(
     error_code: str = "rollback_restore_failed",
 ) -> None:
     temporary = _rollback_temp_path(path, staged)
+    if path == PANEL_ENV_FILE:
+        await _provisioning_run(shell, _stranded_env_sweep_command(), error_code)
     await _provisioning_run(
         shell,
         f"rm -f -- {temporary}",
