@@ -230,7 +230,9 @@ _SAFE_PANEL_OP_DETAILS = {
     ),
     "incumbent_unhealthy_unverified": (
         "incumbent_unhealthy_unverified: the installed bridge is not verified running; "
-        "check `systemctl is-active brilliant-mqtt` and start it; see docs/canary-rollback.md"
+        "check `systemctl is-active brilliant-mqtt` and start it. A rollback baseline that "
+        "no Home Assistant journal owns may remain; see docs/canary-rollback.md "
+        "'Interrupted baseline capture'"
     ),
     "incumbent_rehearsal_failed": (
         "incumbent_rehearsal_failed: the installed bridge could not be restarted for its "

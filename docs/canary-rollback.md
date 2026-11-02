@@ -86,7 +86,7 @@ nothing:
 | Code | Meaning | Operator action |
 | --- | --- | --- |
 | `incumbent_unhealthy` | The bridge was restarted and is verified running, but no health evidence with the new ID arrived. | Fix the old bridge's MQTT connection: broker credentials in `/etc/brilliant-mqtt.env` or broker reachability (`journalctl -u brilliant-mqtt -n 50`). Also check Home Assistant's own MQTT integration: a broker drop on the Home Assistant side during the wait looks the same. Or uninstall, then re-add the panel. |
-| `incumbent_unhealthy_unverified` | The bridge's state could not be verified as running after the rehearsal. | Check `systemctl is-active brilliant-mqtt` on the panel and start it (`systemctl start brilliant-mqtt`) if it is down; then fix its MQTT connection and retry. |
+| `incumbent_unhealthy_unverified` | The bridge's state could not be verified as running after the rehearsal (including after a best-effort restart of a restarted bridge that came up down). | Check `systemctl is-active brilliant-mqtt` on the panel and start it (`systemctl start brilliant-mqtt`) if it is down; then fix its MQTT connection and retry. If the baseline could not be removed this code is kept (it is not replaced by `baseline_capture_interrupted`), so also follow [Interrupted baseline capture](#interrupted-baseline-capture). |
 | `incumbent_rehearsal_failed` | Writing the env file or the restart command failed, so the bridge was not restarted; it is verified running. | Check panel storage (`df /etc /var`) and systemd, then retry. |
 | `incumbent_rehearsal_interrupted` | The SSH session was lost during the rehearsal. Nothing reconnects. | If the restart was already issued, systemd completes it on its own: check `systemctl is-active brilliant-mqtt` and start it if it's down. The baseline could not be removed; follow [Interrupted baseline capture](#interrupted-baseline-capture) before retrying. |
 | `incumbent_health_unobservable` | Home Assistant could not subscribe to the panel's MQTT health. The bridge was never touched. | Check Home Assistant's MQTT integration and retry. |
@@ -96,6 +96,19 @@ The two ways out of an unhealthy incumbent are the same as for
 retry; or **uninstall the agent, then re-add the panel** (turn off both watchdog
 switches first; a panel without a Home Assistant entry uses the manual uninstall
 in [TROUBLESHOOTING.md](TROUBLESHOOTING.md#manual-agent-uninstall-panel-without-a-home-assistant-entry)).
+
+If the restarted bridge is not running when the proof fails, the integration
+makes one best-effort, bounded `systemctl reset-failed brilliant-mqtt; systemctl
+start brilliant-mqtt` and probes again; the second probe picks the code.
+
+Every probe, start and baseline removal is bounded to 2 minutes. A command that
+hangs past its bound is terminated and its SSH session is closed ("fenced"). A
+fenced session is closed but was not lost, so the integration does not report
+`incumbent_rehearsal_interrupted`: every later command on it fails, the bridge
+counts as not verified running (`incumbent_unhealthy_unverified`), and the
+baseline removal fails. A bridge-state code (`incumbent_unhealthy_unverified`,
+`incumbent_rehearsal_interrupted`) is then kept; any other refusal becomes
+`baseline_capture_interrupted`.
 
 Limitation: a health-wait failure cannot tell "the bridge never reconnected"
 from "Home Assistant's own MQTT connection dropped mid-wait"; both are reported

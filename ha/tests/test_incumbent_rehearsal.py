@@ -930,7 +930,7 @@ async def test_canary_failed_restart_command_gets_a_best_effort_start(
     async def patched(command: str) -> PanelProcess:
         if command == _RESTART:
             return await start("systemctl stop brilliant-mqtt; exit 1")
-        if command == "systemctl start brilliant-mqtt":
+        if command == _START:
             starts.append(command)
             return await start(command if start_works else "exit 1")
         return await start(command)
@@ -1119,3 +1119,116 @@ async def test_canary_rollback_after_a_healthy_rehearsal_restores_the_prior_env(
     assert recovery not in {"b" * 32, bridge.marks[0][1]}
     assert restored.replace(recovery, "b" * 32) == original
     assert _running(shell)
+
+
+# --- review fixes: bridge-state codes survive a fenced shell; restart a downed bridge ---
+
+_PROBE = "if systemctl is-active --quiet brilliant-mqtt; then"
+_START = "systemctl reset-failed brilliant-mqtt; systemctl start brilliant-mqtt"
+
+
+def _fenced_panel(
+    monkeypatch: pytest.MonkeyPatch, shell: RehearsalShell, replacements: dict[str, str]
+) -> list[str]:
+    """Model a real shell: once closed (fenced) every command fails; replace some."""
+    start = shell.start
+    seen: list[str] = []
+
+    async def patched(command: str) -> PanelProcess:
+        if not shell.connected:
+            raise RuntimeError("shell closed")
+        for needle, replacement in replacements.items():
+            if needle in command:
+                seen.append(needle)
+                return await start(replacement)
+        return await start(command)
+
+    monkeypatch.setattr(shell, "start", patched)
+    return seen
+
+
+def _interrupted_guidance(code: str) -> None:
+    root = Path(__file__).parents[2] / "custom_components/brilliant_mqtt"
+    text = json.loads((root / "strings.json").read_text())["config_subentries"]["panel"]["error"][
+        code
+    ]
+    assert "Interrupted baseline capture" in text
+    assert "systemctl is-active brilliant-mqtt" in text
+    summary = manager_module._safe_failure_summary(
+        "agent update failed", panel_ops.PanelOpError(code)
+    )
+    assert "Interrupted baseline capture" in summary
+    assert "systemctl is-active brilliant-mqtt" in summary
+
+
+@_LAYOUTS
+async def test_probe_bound_expiry_keeps_the_bridge_state_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, release: bool
+) -> None:
+    from custom_components.brilliant_mqtt import panel_provisioner
+
+    shell = await _panel(tmp_path, release=release)
+    _, provisioner = _canary(shell, SimulatedBridge(shell, mqtt_ok=False))
+    monkeypatch.setattr(panel_provisioner, "CLEANUP_FINALIZE_SECONDS", 0.3)
+    seen = _fenced_panel(monkeypatch, shell, {_PROBE: "sleep 30"})
+
+    with pytest.raises(PanelProvisioningError, match="^incumbent_unhealthy_unverified$"):
+        await _update(provisioner, shell)
+
+    assert seen == [_PROBE]
+    assert shell.connected is False and not shell.transport_lost()
+    assert _baseline_left(shell), "the fenced shell could not remove the baseline"
+    assert _running(shell)
+    _interrupted_guidance("incumbent_unhealthy_unverified")
+
+
+@_LAYOUTS
+async def test_start_bound_expiry_keeps_the_bridge_state_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, release: bool
+) -> None:
+    from custom_components.brilliant_mqtt import panel_provisioner
+
+    shell = await _panel(tmp_path, release=release)
+    _, provisioner = _canary(shell, SimulatedBridge(shell))
+    monkeypatch.setattr(panel_provisioner, "CLEANUP_FINALIZE_SECONDS", 0.3)
+    seen = _fenced_panel(
+        monkeypatch,
+        shell,
+        {_RESTART: "systemctl stop brilliant-mqtt; exit 1", _START: "sleep 30"},
+    )
+
+    with pytest.raises(PanelProvisioningError, match="^incumbent_unhealthy_unverified$"):
+        await _update(provisioner, shell)
+
+    assert seen == [_RESTART, _START]
+    assert shell.connected is False and not shell.transport_lost()
+    assert _baseline_left(shell)
+    assert not _running(shell), "the operator must be told to start it"
+
+
+@_LAYOUTS
+async def test_restarted_bridge_that_comes_up_inactive_is_started_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, release: bool
+) -> None:
+    shell = await _panel(tmp_path, release=release)
+    _, provisioner = _canary(shell, SimulatedBridge(shell))
+    seen = _fenced_panel(
+        monkeypatch, shell, {_RESTART: f"{_RESTART}; systemctl stop brilliant-mqtt"}
+    )
+    start = shell.start
+    starts: list[str] = []
+
+    async def counted(command: str) -> PanelProcess:
+        if command == _START:
+            starts.append(command)
+        return await start(command)
+
+    monkeypatch.setattr(shell, "start", counted)
+
+    with pytest.raises(PanelProvisioningError, match="^incumbent_unhealthy$"):
+        await _update(provisioner, shell)
+
+    assert seen == [_RESTART]
+    assert starts == [_START]
+    assert _running(shell)
+    assert not _baseline_left(shell)

@@ -1689,8 +1689,12 @@ async def rehearse_restart(
 
 
 async def start_bridge(shell: PanelShell) -> None:
-    """Best-effort start of the bridge after a failed rehearsal restart command."""
-    await _provisioning_run(shell, f"systemctl start {SERVICE_NAME}", "rehearsal_start_failed")
+    """Best-effort start of a rehearsal bridge that is down (clears a failed state)."""
+    await _provisioning_run(
+        shell,
+        f"systemctl reset-failed {SERVICE_NAME}; systemctl start {SERVICE_NAME}",
+        "rehearsal_start_failed",
+    )
 
 
 async def bridge_running(shell: PanelShell) -> bool:

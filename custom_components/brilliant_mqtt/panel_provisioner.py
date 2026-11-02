@@ -828,6 +828,12 @@ def rehearsal_failure_code(
     return "incumbent_unhealthy"
 
 
+# Refusals whose operator action is about the bridge's own state: never replaced
+# by baseline_capture_interrupted when the baseline cannot be removed.
+_BRIDGE_STATE_CODES = frozenset(
+    {"incumbent_unhealthy_unverified", "incumbent_rehearsal_interrupted"}
+)
+
 # The rehearsal waits at most this long for the restarted incumbent's evidence.
 REHEARSAL_HEALTH_SECONDS = 90.0
 
@@ -1094,7 +1100,15 @@ class PanelProvisioner:
         counts as owned. A cancellation always wins; otherwise the original error is
         re-raised unchanged after a successful finalize. A lost session is never
         reconnected: like a failed or timed-out finalize it raises
-        ``baseline_capture_interrupted`` (an unowned baseline may remain).
+        ``baseline_capture_interrupted`` (an unowned baseline may remain), except
+        that a bridge-state code (``_BRIDGE_STATE_CODES``) is kept, so the operator
+        is still told to check and start the bridge; its text also says a baseline
+        may remain.
+
+        A settle bound that expired earlier in the region (a hung probe, start or
+        finalize) fences the shell by closing it: the shell is then closed but NOT
+        lost (``transport_lost()`` stays False), so this finalize is attempted and
+        fails, and the code follows the failed-finalize rule above.
         """
         guard = _BaselineGuard()
         try:
@@ -1113,11 +1127,9 @@ class PanelProvisioner:
     ) -> None:
         """Return to re-raise *error*; raise to replace it (see the guard)."""
         cancellation = error if isinstance(error, asyncio.CancelledError) else None
-        # Its own code already says the session was lost and a baseline may remain.
-        keeps_code = (
-            isinstance(error, PanelProvisioningError)
-            and error.code == "incumbent_rehearsal_interrupted"
-        )
+        # These codes already say a baseline may remain, and must keep telling the
+        # operator to check (and start) the bridge.
+        keeps_code = isinstance(error, PanelProvisioningError) and error.code in _BRIDGE_STATE_CODES
         unowned_cleanup_possible = not shell.transport_lost()
         if guard.create_attempted:
             ownership = await settle(self._async_baseline_owned(transaction_id))
@@ -1176,12 +1188,17 @@ class PanelProvisioner:
             }
             and not shell.transport_lost()
         ):
-            probe = await settle(
-                self._operations.bridge_running(shell), bound_seconds=CLEANUP_FINALIZE_SECONDS
-            )
-            if probe.cancellation is not None:
-                raise probe.cancellation from None
-            running = probe.error is None and probe.result is True
+            running = await self._async_probe_bridge(shell)
+            if (
+                not running
+                and outcome is _RehearsalOutcome.PROOF_FAILED
+                and not shell.transport_lost()
+            ):
+                # The restarted bridge is down: never leave it so. Best effort,
+                # then the re-probe decides the code.
+                await self._async_start_bridge(shell)
+                if not shell.transport_lost():
+                    running = await self._async_probe_bridge(shell)
         code = rehearsal_failure_code(
             outcome, transport_lost=shell.transport_lost(), bridge_running=running
         )
@@ -1240,11 +1257,7 @@ class PanelProvisioner:
             if code == "rehearsal_boundary_failed":
                 return _RehearsalOutcome.UNOBSERVABLE
             if code == "rehearsal_restart_failed" and not shell.transport_lost():
-                started = await settle(
-                    self._operations.start_bridge(shell), bound_seconds=CLEANUP_FINALIZE_SECONDS
-                )
-                if started.cancellation is not None:
-                    raise started.cancellation from None
+                await self._async_start_bridge(shell)
             return _RehearsalOutcome.RESTART_FAILED
         try:
             evidence = await observer.async_wait(
@@ -1260,6 +1273,27 @@ class PanelProvisioner:
         ):
             return _RehearsalOutcome.PROOF_FAILED
         return _RehearsalOutcome.HEALTHY
+
+    async def _async_probe_bridge(self, shell: PanelShell) -> bool:
+        """Whether the bridge is verified running; any failure counts as not.
+
+        Past its bound the probe fences the shell (closed, not lost): every later
+        command fails, so the bridge stays unverified.
+        """
+        probe = await settle(
+            self._operations.bridge_running(shell), bound_seconds=CLEANUP_FINALIZE_SECONDS
+        )
+        if probe.cancellation is not None:
+            raise probe.cancellation from None
+        return probe.error is None and probe.result is True
+
+    async def _async_start_bridge(self, shell: PanelShell) -> None:
+        """Best-effort, bounded start; its result is judged only by a re-probe."""
+        started = await settle(
+            self._operations.start_bridge(shell), bound_seconds=CLEANUP_FINALIZE_SECONDS
+        )
+        if started.cancellation is not None:
+            raise started.cancellation from None
 
     async def _async_baseline_owned(self, transaction_id: UUID) -> bool:
         if await self._journal.async_retained(transaction_id) is not None:
