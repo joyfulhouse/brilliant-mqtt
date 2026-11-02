@@ -1177,7 +1177,11 @@ class PanelProvisioner:
         if cancellation is not None:
             raise cancellation from None
         if outcome is _RehearsalOutcome.HEALTHY and not shell.transport_lost():
-            await self._operations.rebind_rehearsed_deployment(shell, deployment_id)
+            try:
+                await self._operations.rebind_rehearsed_deployment(shell, deployment_id)
+            except PanelOpError:
+                # Typed on both routes; the caller's guard still retires the baseline.
+                raise PanelProvisioningError("release_identity_changed") from None
             return
         running = False
         if (

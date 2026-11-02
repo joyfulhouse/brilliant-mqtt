@@ -66,8 +66,9 @@ journaled:
 
 On success the release admission is re-bound to the rotated deployment ID (the
 admission recorded the incumbent's identities, which include that shared ID),
-only when every other identity field is unchanged; anything else fails with
-`release_identity_changed`. The add or update then continues as before.
+only when every other identity field is unchanged; anything else is refused
+with `release_identity_changed` (typed on both add and update; the baseline is
+removed and nothing is installed: inspect the panel and retry). The add or update then continues as before.
 
 The rehearsal changes only the deployment-correlation line of the live env file.
 The journaled snapshot and the baseline keep the pre-rehearsal bytes, so a later

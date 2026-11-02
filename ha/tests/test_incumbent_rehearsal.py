@@ -123,7 +123,7 @@ def test_rehearsal_codes_are_allowlisted_and_translated() -> None:
     root = Path(__file__).parents[2] / "custom_components/brilliant_mqtt"
     strings = json.loads((root / "strings.json").read_text())
     english = json.loads((root / "translations/en.json").read_text())
-    for code in REHEARSAL_CODES:
+    for code in (*REHEARSAL_CODES, "release_identity_changed"):
         assert code in PROVISIONING_ERROR_CODES
         assert code in UPDATE_ERROR_CODES
         assert code in manager_module._SAFE_PANEL_OP_DETAILS
@@ -444,10 +444,7 @@ async def test_rebind_refusal_retires_the_baseline(route: str) -> None:
     _installed(harness)
     harness.operations.fail_at.add("rebind")
 
-    expected: type[Exception] = (
-        PanelProvisioningError if route == "install" else (panel_ops.PanelOpError)
-    )
-    with pytest.raises(expected):
+    with pytest.raises(PanelProvisioningError, match="^release_identity_changed$"):
         await _route(route, harness)
 
     names = _names(harness)
@@ -1232,3 +1229,42 @@ async def test_restarted_bridge_that_comes_up_inactive_is_started_again(
     assert starts == [_START]
     assert _running(shell)
     assert not _baseline_left(shell)
+
+
+async def test_update_rebind_refusal_is_typed_and_stage_accurate(
+    hass: HomeAssistant,
+    tmp_path: Path,
+    payload_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from homeassistant.exceptions import HomeAssistantError
+
+    shell = RehearsalShell(tmp_path / "panel")
+    shell.install()
+    bridge = SimulatedBridge(shell)
+    journal, manager = await _manager_update(
+        hass, tmp_path, payload_dir, monkeypatch, shell, bridge
+    )
+
+    async def refused(_shell: PanelShell, _deployment_id: str) -> None:
+        raise panel_ops.PanelOpError("release_identity_changed: SECRET detail")
+
+    monkeypatch.setattr(panel_ops, "rebind_rehearsed_deployment", refused)
+    try:
+        with pytest.raises(HomeAssistantError) as raised:
+            await manager.async_update_agent()
+    finally:
+        await manager.async_shutdown()
+
+    error = (raised.value.translation_placeholders or {})["error"]
+    assert "release_identity_changed" in error
+    assert "during deployment" not in error
+    assert "SECRET" not in error
+    assert manager.update_last_error == {
+        "stage": "baseline",
+        "code": "release_identity_changed",
+        "attempts": 1,
+    }
+    assert await journal.async_load() is None
+    assert not _baseline_left(shell)
+    assert _running(shell)

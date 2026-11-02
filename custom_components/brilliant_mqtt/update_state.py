@@ -39,6 +39,7 @@ UPDATE_ERROR_CODES = frozenset(
         "incumbent_rehearsal_failed",
         "incumbent_rehearsal_interrupted",
         "incumbent_health_unobservable",
+        "release_identity_changed",
         "provisioning_recovery_required",
         "deployment_failed",
         "baseline_capture_failed",

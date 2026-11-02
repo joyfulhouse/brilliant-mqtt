@@ -190,6 +190,10 @@ _REHEARSAL_LOST_SUMMARY = (
     "agent update lost the panel connection during the incumbent health rehearsal "
     f"({_REHEARSAL_INTERRUPTED_DETAIL})"
 )
+# Baseline capture and the incumbent health rehearsal run before any deployment.
+_BASELINE_FAILED_SUMMARY = (
+    "agent update failed before deployment (baseline capture or incumbent health rehearsal)"
+)
 _BASELINE_RECOVERY_SUMMARY = (
     "agent update lost the panel connection during baseline capture "
     "(provisioning_recovery_required: the journal is settled by recovery; "
@@ -2275,7 +2279,12 @@ class PanelManager:
                 raise _UpdateFailed(
                     stage,
                     _update_error_code(stage, err),
-                    _safe_failure_summary("agent update failed during deployment", err),
+                    _safe_failure_summary(
+                        _BASELINE_FAILED_SUMMARY
+                        if stage == "baseline"
+                        else "agent update failed during deployment",
+                        err,
+                    ),
                 ) from None
             finally:
                 close_ok = await self._async_close_shell(shell)
