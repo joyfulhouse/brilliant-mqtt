@@ -121,6 +121,12 @@ class _Mqtt:
     def on_message(self, callback: Callable[[str, str, bool], Awaitable[None]]) -> None:
         del callback
 
+    def acknowledged_qos1_publishes(self) -> int:
+        return 0
+
+    def on_connection_lost(self, callback: Callable[[], None]) -> None:
+        del callback
+
     async def subscribe(self, topic: str) -> None:
         del topic
         self.subscribe_calls += 1

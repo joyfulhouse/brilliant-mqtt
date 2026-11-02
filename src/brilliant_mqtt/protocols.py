@@ -177,3 +177,24 @@ class MqttClient(Protocol):
         leader election must stop consuming the mesh command topics.
         """
         ...
+
+
+class MqttSessionSignals(Protocol):
+    """Observed per-connection broker behaviour (#113 poison-frame attribution).
+
+    One MQTT adapter is one broker session. These signals let the scene outbox
+    tell a frame-specific broker disconnect apart from ordinary link loss
+    without any pre-checks: an acknowledged QoS-1 publish proves the session
+    was healthy, and the connection-lost callback times the drop.
+    """
+
+    def acknowledged_qos1_publishes(self) -> int:
+        """Return how many QoS>=1 publishes the broker acknowledged on this session."""
+        ...
+
+    def on_connection_lost(self, cb: Callable[[], None]) -> None:
+        """Register a synchronous callback fired once when the session drops unexpectedly.
+
+        Never fired for a disconnect this adapter initiated itself.
+        """
+        ...

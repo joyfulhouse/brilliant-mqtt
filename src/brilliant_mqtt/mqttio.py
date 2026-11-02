@@ -835,6 +835,13 @@ class AioMqttAdapter:
 
     _checked_disconnect = False
     _redacted_logging = False
+    # Class-level defaults so partially constructed adapters (tests build some
+    # with object.__new__) still behave: #113 session signals start empty.
+    _closing = False
+    _closed = False
+    _acknowledged_qos1 = 0
+    _connection_lost_fired = False
+    _connection_lost_cbs: tuple[Callable[[], None], ...] = ()
 
     def __init__(
         self,
@@ -947,8 +954,19 @@ class AioMqttAdapter:
         retains strict ordering.
         """
         dispatcher = self._get_topic_dispatcher()
+        broker_dropped = False
         try:
-            async for message in self._client.messages:
+            messages = self._client.messages.__aiter__()
+            while True:
+                try:
+                    message = await messages.__anext__()
+                except StopAsyncIteration:
+                    break
+                except aiomqtt.MqttError:
+                    # Only the iterator raising MqttError is a broker drop
+                    # (#113); a local dispatch/lane failure below is not.
+                    broker_dropped = True
+                    raise
                 command_cbs = tuple(self._command_cbs)
                 message_cbs = tuple(self._message_cbs)
                 payload_decode_error_cbs = list(self._payload_decode_error_cbs)
@@ -1011,7 +1029,23 @@ class AioMqttAdapter:
                     latest_wins=_is_latest_wins_topic(topic),
                 )
         finally:
+            # aiomqtt's message iterator raises as soon as the broker link drops,
+            # so this is the earliest observation of an unexpected session loss.
+            # Fire before the (possibly slow) dispatcher drain so the drop is
+            # timed against the in-flight publish, not against teardown.
+            if broker_dropped and not self._closing and not self._closed:
+                self._fire_connection_lost()
             await dispatcher.shutdown()
+
+    def _fire_connection_lost(self) -> None:
+        if self._connection_lost_fired:
+            return
+        self._connection_lost_fired = True
+        for callback in self._connection_lost_cbs:
+            try:
+                callback()
+            except Exception:
+                logger.exception("connection-lost callback failed; continuing")
 
     def _get_topic_dispatcher(self) -> _TopicDispatcher:
         """Return the dispatcher, lazily covering off-panel object doubles."""
@@ -1206,6 +1240,18 @@ class AioMqttAdapter:
         if qos not in (0, 1, 2):
             raise ValueError("qos must be between 0 and 2")
         await self._client.publish(topic, payload=payload, retain=retain, qos=qos)
+        if qos >= 1:
+            # aiomqtt returns from a QoS>=1 publish only after the broker's
+            # acknowledgement, so this counts proof that the session is healthy.
+            self._acknowledged_qos1 += 1
+
+    def acknowledged_qos1_publishes(self) -> int:
+        """Return how many QoS>=1 publishes the broker acknowledged on this session."""
+        return self._acknowledged_qos1
+
+    def on_connection_lost(self, cb: Callable[[], None]) -> None:
+        """Register a callback fired once when the broker link drops unexpectedly."""
+        self._connection_lost_cbs = (*self._connection_lost_cbs, cb)
 
     def on_command(self, cb: Callable[[str, str], Awaitable[None]]) -> None:
         self._command_cbs.append(cb)

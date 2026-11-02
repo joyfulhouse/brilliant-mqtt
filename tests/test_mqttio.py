@@ -506,3 +506,139 @@ async def test_failed_raw_exit_is_terminal_and_cleanup_remains_exactly_once(
 
     assert client.enter_attempts == 1
     assert client.exit_attempts == 1
+
+
+class _PublishClient:
+    def __init__(self) -> None:
+        self.fail = False
+
+    async def publish(self, topic: str, **kwargs: object) -> None:
+        del topic, kwargs
+        if self.fail:
+            raise aiomqtt.MqttError("no PUBACK")
+
+
+async def test_only_acknowledged_qos1_publishes_count_as_session_health(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #113: a returned QoS>=1 publish is broker-acknowledged proof the session
+    # is healthy; QoS 0 and failed publishes prove nothing.
+    client = _PublishClient()
+    monkeypatch.setattr(aiomqtt, "Client", lambda **kwargs: client)
+    adapter = mqttio.AioMqttAdapter(_settings(tls_enabled=False))
+    assert adapter.acknowledged_qos1_publishes() == 0
+
+    await adapter.publish("t", "p", qos=0)
+    assert adapter.acknowledged_qos1_publishes() == 0
+    await adapter.publish("t", "p", qos=1)
+    assert adapter.acknowledged_qos1_publishes() == 1
+    client.fail = True
+    with pytest.raises(aiomqtt.MqttError):
+        await adapter.publish("t", "p", qos=1)
+    assert adapter.acknowledged_qos1_publishes() == 1
+
+
+class _DroppingMessages:
+    def __init__(self) -> None:
+        self.drop = asyncio.Event()
+
+    def __aiter__(self) -> _DroppingMessages:
+        return self
+
+    async def __anext__(self) -> object:
+        await self.drop.wait()
+        raise aiomqtt.MqttError("Disconnected during message iteration")
+
+
+async def test_unexpected_reader_end_fires_connection_lost_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = SimpleNamespace(messages=_DroppingMessages())
+    monkeypatch.setattr(aiomqtt, "Client", lambda **kwargs: client)
+    adapter = mqttio.AioMqttAdapter(_settings(tls_enabled=False))
+    fired: list[str] = []
+    adapter.on_connection_lost(lambda: fired.append("first"))
+
+    def failing_callback() -> None:
+        fired.append("failing")
+        raise RuntimeError("observer bug")
+
+    adapter.on_connection_lost(failing_callback)
+    adapter.on_connection_lost(lambda: fired.append("last"))
+    reader = asyncio.create_task(adapter._read_loop())
+    await asyncio.sleep(0)
+    assert fired == []
+
+    client.messages.drop.set()
+    with pytest.raises(aiomqtt.MqttError):
+        await reader
+
+    assert fired == ["first", "failing", "last"]
+    adapter._fire_connection_lost()
+    assert fired == ["first", "failing", "last"]
+
+
+async def test_adapter_initiated_teardown_is_not_a_connection_loss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = SimpleNamespace(messages=_NeverMessages())
+    monkeypatch.setattr(aiomqtt, "Client", lambda **kwargs: client)
+    adapter = mqttio.AioMqttAdapter(_settings(tls_enabled=False))
+    fired: list[str] = []
+    adapter.on_connection_lost(lambda: fired.append("lost"))
+    reader = asyncio.create_task(adapter._read_loop())
+    await asyncio.sleep(0)
+
+    adapter._closing = True
+    reader.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await reader
+
+    assert fired == []
+
+
+class _OneMessage:
+    def __init__(self) -> None:
+        self.sent = False
+
+    def __aiter__(self) -> _OneMessage:
+        return self
+
+    async def __anext__(self) -> object:
+        if self.sent:
+            raise StopAsyncIteration
+        self.sent = True
+        return SimpleNamespace(topic="brilliant/office/x/set", payload=b"ON", retain=False)
+
+
+async def test_reader_return_or_dispatch_failure_is_not_a_connection_loss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #113: only a broker drop (the iterator raising MqttError) is a lost
+    # connection; a local dispatch failure or an iterator end is not.
+    client = SimpleNamespace(messages=_OneMessage())
+    monkeypatch.setattr(aiomqtt, "Client", lambda **kwargs: client)
+    adapter = mqttio.AioMqttAdapter(_settings(tls_enabled=False))
+    fired: list[str] = []
+    adapter.on_connection_lost(lambda: fired.append("lost"))
+
+    async def message_cb(topic: str, payload: str, retained: bool) -> None:
+        del topic, payload, retained
+
+    adapter.on_message(message_cb)
+
+    async def failing_dispatch(message: object, *, latest_wins: bool) -> None:
+        del message, latest_wins
+        raise RuntimeError("lane bug")
+
+    dispatcher = adapter._get_topic_dispatcher()
+    monkeypatch.setattr(dispatcher, "dispatch", failing_dispatch)
+    with pytest.raises(RuntimeError, match="lane bug"):
+        await adapter._read_loop()
+    assert fired == []
+
+    # The iterator simply ending (no MqttError) is not a broker drop either.
+    client.messages = _OneMessage()
+    client.messages.sent = True
+    await adapter._read_loop()
+    assert fired == []

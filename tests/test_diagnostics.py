@@ -939,3 +939,30 @@ async def test_meta_diag_is_additive_panel_only_and_preserves_command_and_entity
     mesh = Bridge(FakeBus([]), mesh_mqtt, "mesh", diagnostics=recorder)
     await mesh.reconcile()
     assert all(not topic.endswith("/bridge") for topic, _, _ in mesh_mqtt.published)
+
+
+def test_outbox_details_appear_only_in_meta_while_reported_and_are_copied() -> None:
+    # #113: quarantine details ride the diag meta; absent when there are none.
+    recorder = ResponseDiagnostics(clock=lambda: 0.0)
+    assert recorder.meta() == recorder.snapshot()
+    details: dict[str, int | str | None] = {
+        "state": "quarantined",
+        "key": "event:scene:office:x:1",
+        "kind": "event",
+        "payload_bytes": 320,
+        "payload_sha256": "a" * 64,
+        "failure_count": 3,
+        "quarantined_at_ms": 5,
+    }
+    expected = dict(details)
+    recorder.note_outbox(details)
+    details["failure_count"] = 99
+    meta = recorder.meta()
+    assert meta["outbox"] == expected
+    assert "outbox" not in recorder.snapshot()
+    outbox = meta["outbox"]
+    assert isinstance(outbox, dict)
+    outbox["key"] = "mutated"
+    assert recorder.meta()["outbox"] == expected
+    recorder.note_outbox(None)
+    assert recorder.meta() == recorder.snapshot()

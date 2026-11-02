@@ -229,7 +229,15 @@ def atomic_write_state(path: Path, state: SceneState) -> None:
     encoded = encode_json(state_payload(validated)).encode("utf-8")
     if len(encoded) > MAX_STATE_BYTES:
         raise OSError("state snapshot exceeds byte limit")
+    atomic_write_private_file(path, encoded)
 
+
+def atomic_write_private_file(path: Path, encoded: bytes) -> None:
+    """Durably replace one 0600 file in a 0700 directory (tmp, fsync, rename).
+
+    Shared by the scene state file and its outbox quarantine sidecar (#113) so
+    both follow the identical crash-safe replacement protocol.
+    """
     descriptor = -1
     temporary = ""
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)

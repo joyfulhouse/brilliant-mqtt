@@ -481,6 +481,55 @@ a `— rebooting` line names the trigger. Reboots are rate-limited
 `bus-watchdog.log` plus `journalctl -u brilliant-mqtt` and open an issue. Full
 settings in [CONFIGURATION.md → Bus-health watchdog](CONFIGURATION.md#bus-health-watchdog).
 
+### Scene outbox quarantined (`outbox_quarantine` / `outbox_blocked`)
+
+**Symptom:** Scene and mode entities go unavailable, and the retained
+`brilliant/ha-control/v1/status/scene/<panel>` (and `.../mode/<panel>`) status
+shows `"available": false` with reason `outbox_quarantine` or
+`outbox_blocked`. Home Assistant refuses scene and mode commands while the
+transport is reported offline. The panel itself stays online, and device
+state, discovery and device commands keep working.
+
+**Why:** The broker closed the MQTT connection every time one scene/mode
+outbox frame was sent. That usually means an operator `max_packet_size` that
+the frame exceeds. After 3 such disconnects in 3 different sessions spanning at
+least a minute, the agent quarantines that record and halts the scene outbox,
+so nothing is sent past it. `outbox_blocked` means the connection dropped right
+after sending the record, before the session had any acknowledged QoS-1
+publish, so nothing could be attributed. It is transient and practically
+unreachable, because every session normally publishes a QoS-1 message first,
+and it clears as soon as the record is delivered. Check the broker first. The bridge
+meta `diag.outbox` object names the record (key, kind, size and sha256, never
+the payload). The full contract is in
+[issue-113-outbox-quarantine-contract.md](issue-113-outbox-quarantine-contract.md).
+
+**Fix the broker first** (remove or raise `max_packet_size`). Then release or
+discard the record on the panel. The tool refuses to run while the agent is
+running:
+
+```bash
+ssh -o NumberOfPasswordPrompts=1 root@<panel>
+systemctl stop brilliant-mqtt
+set -a; . /etc/brilliant-mqtt.env; set +a
+# Fleet release layout; legacy installs use /var/brilliant-mqtt/app:/var/brilliant-mqtt/vendor
+export PYTHONPATH=/var/brilliant-mqtt/current/app:/var/brilliant-mqtt/current/vendor
+/data/switch-embedded/env/bin/python3 -m brilliant_mqtt.outbox_admin list
+# Either retry the record once the broker accepts it ...
+/data/switch-embedded/env/bin/python3 -m brilliant_mqtt.outbox_admin release <key> <sha256>
+# ... or drop it for good (an event also drops its dependent command results).
+/data/switch-embedded/env/bin/python3 -m brilliant_mqtt.outbox_admin discard <key> <sha256>
+systemctl start brilliant-mqtt
+```
+
+`<key>` and `<sha256>` come from the `list` output, and the hash must match.
+Every release and discard is appended to `scene-watermarks.json.outbox-audit.log`
+next to the state file, and either is refused if that audit entry cannot be
+written. The
+tool treats the agent as stopped only when `systemctl is-active brilliant-mqtt`
+prints `inactive` or `failed` and no process runs `-m brilliant_mqtt`. If it
+still refuses, check `systemctl status brilliant-mqtt` and
+`pgrep -af 'brilliant_mqtt'`, and stop whatever is still running.
+
 ### Bridge broken after a panel firmware update
 
 Firmware OTA replaces `/data/switch-embedded` — including the closed-source bus
