@@ -6,41 +6,31 @@ import asyncio
 import errno
 import logging
 import socket
-from collections.abc import AsyncIterator, Callable, Iterator
-from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
-from unittest.mock import patch
-from uuid import UUID
 
 import asyncssh
 import pytest
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import issue_registry as ir
-from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.brilliant_mqtt import connect_retry, panel_ops
+from custom_components.brilliant_mqtt import connect_retry
 from custom_components.brilliant_mqtt import manager as manager_module
 from custom_components.brilliant_mqtt.const import (
     CONF_HOST,
     DOMAIN,
     OPT_TRUST_HOST_KEY_CHANGES,
 )
-from custom_components.brilliant_mqtt.entry_data import LegacyPanelStore
-from custom_components.brilliant_mqtt.fleet_manager import legacy_fleet_config
 from custom_components.brilliant_mqtt.manager import (
     _CONNECT_RETRY_BASE_DELAY_S,
     _CONNECT_RETRY_DEADLINE_S,
     _CONNECT_RETRY_MAX_ATTEMPTS,
-    PanelManager,
     _classify_transient_connect_failure,
     _HostKeyChanged,
 )
-from custom_components.brilliant_mqtt.shell import PanelShell
 from tests.fakes import FakeShell
 from tests.test_init import ENTRY_DATA
+from tests.update_harness import Clock, Shells, Spies, update_manager
 
 _PANEL_ADDRESS = str(ENTRY_DATA[CONF_HOST])
 # asyncio's real message for a failed TCP connect carries the panel address.
@@ -52,117 +42,6 @@ _POST_AUTH_FAILURES = [
     asyncssh.ConnectionLost("lost"),
     ConnectionResetError(errno.ECONNRESET, "Connection reset by peer"),
 ]
-
-
-@dataclass
-class _Clock:
-    """Deterministic monotonic clock + backoff sleep for the retry loop."""
-
-    now: float = 1000.0
-    sleeps: list[float] = field(default_factory=list)
-    gate: asyncio.Event | None = None
-    entered: asyncio.Event = field(default_factory=asyncio.Event)
-    on_sleep: Callable[[float], None] | None = None
-
-    def monotonic(self) -> float:
-        return self.now
-
-    async def sleep(self, delay: float) -> None:
-        self.sleeps.append(delay)
-        if self.on_sleep is not None:
-            self.on_sleep(delay)
-        self.entered.set()
-        if self.gate is not None:
-            await self.gate.wait()
-        self.now += delay
-
-
-@pytest.fixture
-def clock(monkeypatch: pytest.MonkeyPatch) -> _Clock:
-    fake = _Clock()
-    monkeypatch.setattr(manager_module, "_connect_retry_clock", fake.monotonic)
-    monkeypatch.setattr(manager_module, "_connect_retry_sleep", fake.sleep)
-    monkeypatch.setattr(connect_retry, "jitter", lambda: 1.0)
-    return fake
-
-
-@dataclass
-class _Spies:
-    admissions: int = 0
-    baselines: int = 0
-
-
-@pytest.fixture
-def spies(monkeypatch: pytest.MonkeyPatch) -> _Spies:
-    """Count release admissions and baseline captures (the first mutation stages)."""
-    counts = _Spies()
-    real_transaction = panel_ops.release_transaction
-
-    @asynccontextmanager
-    async def counted_transaction(*args: Any, **kwargs: Any) -> AsyncIterator[Any]:
-        counts.admissions += 1
-        async with real_transaction(*args, **kwargs) as admission:
-            yield admission
-
-    @asynccontextmanager
-    async def counted_baseline(
-        manager: PanelManager, shell: PanelShell, version: str
-    ) -> AsyncIterator[UUID]:
-        counts.baselines += 1
-        yield UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
-
-    monkeypatch.setattr(panel_ops, "release_transaction", counted_transaction)
-    monkeypatch.setattr(PanelManager, "_async_canary_update", counted_baseline)
-    return counts
-
-
-def _manager(
-    hass: HomeAssistant,
-    *,
-    lock: asyncio.Lock | None = None,
-    options: dict[str, Any] | None = None,
-) -> PanelManager:
-    entry = MockConfigEntry(
-        domain=DOMAIN, unique_id="office", data=ENTRY_DATA, options=options or {}
-    )
-    entry.add_to_hass(hass)
-    return PanelManager(
-        hass,
-        LegacyPanelStore(hass, entry),
-        legacy_fleet_config(entry),
-        lock or asyncio.Lock(),
-    )
-
-
-@dataclass
-class _Shells:
-    """Each connect attempt constructs the next scripted shell (default: healthy)."""
-
-    scripted: list[FakeShell] = field(default_factory=list)
-    created: list[FakeShell] = field(default_factory=list)
-
-    def __call__(self, *_args: object) -> FakeShell:
-        shell = self.scripted.pop(0) if self.scripted else FakeShell()
-        self.created.append(shell)
-        return shell
-
-    @property
-    def connects(self) -> list[int]:
-        return [shell.connect_count for shell in self.created]
-
-    @property
-    def mutated(self) -> bool:
-        return any(
-            shell.uploads or shell.dir_uploads or shell.file_uploads or shell.commands
-            for shell in self.created
-        )
-
-
-@pytest.fixture
-def shells() -> Iterator[_Shells]:
-    factory = _Shells()
-    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", side_effect=factory):
-        yield factory
 
 
 @pytest.mark.parametrize(
@@ -194,13 +73,13 @@ def test_connect_failure_classification(error: BaseException, reason: str | None
 async def test_transient_connect_failure_then_success_updates_once(
     hass: HomeAssistant,
     payload_dir: Path,
-    clock: _Clock,
-    spies: _Spies,
-    shells: _Shells,
+    clock: Clock,
+    spies: Spies,
+    shells: Shells,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     shells.scripted.extend([FakeShell(connect_error=_UNREACHABLE), FakeShell()])
-    manager = _manager(hass)
+    manager = update_manager(hass)
     progress: list[int] = []
     retry_states: list[object] = []
     clock.on_sleep = lambda _delay: retry_states.append(
@@ -245,14 +124,14 @@ async def test_transient_connect_failure_then_success_updates_once(
 async def test_exhausted_connect_retries_fail_typed_without_mutation(
     hass: HomeAssistant,
     payload_dir: Path,
-    clock: _Clock,
-    spies: _Spies,
-    shells: _Shells,
+    clock: Clock,
+    spies: Spies,
+    shells: Shells,
 ) -> None:
     shells.scripted.extend(
         FakeShell(connect_error=_UNREACHABLE) for _ in range(_CONNECT_RETRY_MAX_ATTEMPTS + 2)
     )
-    manager = _manager(hass)
+    manager = update_manager(hass)
 
     with pytest.raises(HomeAssistantError) as raised:
         await manager.async_update_agent()
@@ -285,14 +164,14 @@ async def test_exhausted_connect_retries_fail_typed_without_mutation(
 async def test_permanent_connect_failure_is_not_retried(
     hass: HomeAssistant,
     payload_dir: Path,
-    clock: _Clock,
-    spies: _Spies,
-    shells: _Shells,
+    clock: Clock,
+    spies: Spies,
+    shells: Shells,
     error: Exception,
 ) -> None:
     """Never retry authentication (password-only root SSH: avoid lockout)."""
     shells.scripted.append(FakeShell(connect_error=error))
-    manager = _manager(hass)
+    manager = update_manager(hass)
 
     with pytest.raises(HomeAssistantError) as raised:
         await manager.async_update_agent()
@@ -306,12 +185,12 @@ async def test_permanent_connect_failure_is_not_retried(
 async def test_host_key_mismatch_is_not_retried(
     hass: HomeAssistant,
     payload_dir: Path,
-    clock: _Clock,
-    spies: _Spies,
-    shells: _Shells,
+    clock: Clock,
+    spies: Spies,
+    shells: Shells,
 ) -> None:
     shells.scripted.append(FakeShell(connect_error=asyncssh.HostKeyNotVerifiable("changed")))
-    manager = _manager(hass)
+    manager = update_manager(hass)
 
     with pytest.raises(HomeAssistantError) as raised:
         await manager.async_update_agent()
@@ -325,9 +204,9 @@ async def test_host_key_mismatch_is_not_retried(
 async def test_transient_failure_during_opt_in_repin_is_not_retried(
     hass: HomeAssistant,
     payload_dir: Path,
-    clock: _Clock,
-    spies: _Spies,
-    shells: _Shells,
+    clock: Clock,
+    spies: Spies,
+    shells: Shells,
 ) -> None:
     """The unpinned re-pin connect offers the password to a new key: never repeat it."""
     shells.scripted.extend(
@@ -336,7 +215,7 @@ async def test_transient_failure_during_opt_in_repin_is_not_retried(
             FakeShell(connect_error=_UNREACHABLE, pinned=None),
         ]
     )
-    manager = _manager(hass, options={OPT_TRUST_HOST_KEY_CHANGES: True})
+    manager = update_manager(hass, options={OPT_TRUST_HOST_KEY_CHANGES: True})
 
     with pytest.raises(HomeAssistantError) as raised:
         await manager.async_update_agent()
@@ -349,9 +228,9 @@ async def test_transient_failure_during_opt_in_repin_is_not_retried(
 async def test_transient_then_permanent_failure_stops_and_counts_attempts(
     hass: HomeAssistant,
     payload_dir: Path,
-    clock: _Clock,
-    spies: _Spies,
-    shells: _Shells,
+    clock: Clock,
+    spies: Spies,
+    shells: Shells,
 ) -> None:
     shells.scripted.extend(
         [
@@ -359,7 +238,7 @@ async def test_transient_then_permanent_failure_stops_and_counts_attempts(
             FakeShell(connect_error=asyncssh.PermissionDenied("bad password")),
         ]
     )
-    manager = _manager(hass)
+    manager = update_manager(hass)
 
     with pytest.raises(HomeAssistantError) as raised:
         await manager.async_update_agent()
@@ -374,7 +253,7 @@ async def test_transient_then_permanent_failure_stops_and_counts_attempts(
 class _SlowFailingShell(FakeShell):
     """A connect that burns *cost* seconds of the fake clock before failing."""
 
-    def __init__(self, clock: _Clock, cost: float) -> None:
+    def __init__(self, clock: Clock, cost: float) -> None:
         super().__init__(connect_error=_UNREACHABLE)
         self._clock = clock
         self._cost = cost
@@ -387,15 +266,15 @@ class _SlowFailingShell(FakeShell):
 async def test_overall_deadline_bounds_retries(
     hass: HomeAssistant,
     payload_dir: Path,
-    clock: _Clock,
-    spies: _Spies,
-    shells: _Shells,
+    clock: Clock,
+    spies: Spies,
+    shells: Shells,
 ) -> None:
     """Slow failing connects exhaust the deadline before the attempt budget."""
     shells.scripted.extend(
         _SlowFailingShell(clock, 40.0) for _ in range(_CONNECT_RETRY_MAX_ATTEMPTS)
     )
-    manager = _manager(hass)
+    manager = update_manager(hass)
     start = clock.now
 
     with pytest.raises(HomeAssistantError) as raised:
@@ -414,15 +293,15 @@ async def test_overall_deadline_bounds_retries(
 async def test_retry_is_not_scheduled_past_the_deadline(
     hass: HomeAssistant,
     payload_dir: Path,
-    clock: _Clock,
-    spies: _Spies,
-    shells: _Shells,
+    clock: Clock,
+    spies: Spies,
+    shells: Shells,
 ) -> None:
     """A backoff that would end after the deadline is not slept at all."""
     shells.scripted.extend(
         [_SlowFailingShell(clock, 100.0), _SlowFailingShell(clock, 10.0), FakeShell()]
     )
-    manager = _manager(hass)
+    manager = update_manager(hass)
 
     with pytest.raises(HomeAssistantError):
         await manager.async_update_agent()
@@ -435,14 +314,14 @@ async def test_retry_is_not_scheduled_past_the_deadline(
 async def test_cancellation_during_backoff_stops_promptly(
     hass: HomeAssistant,
     payload_dir: Path,
-    clock: _Clock,
-    spies: _Spies,
-    shells: _Shells,
+    clock: Clock,
+    spies: Spies,
+    shells: Shells,
 ) -> None:
     lock = asyncio.Lock()
     clock.gate = asyncio.Event()
     shells.scripted.append(FakeShell(connect_error=_UNREACHABLE))
-    manager = _manager(hass, lock=lock)
+    manager = update_manager(hass, lock=lock)
 
     update = asyncio.create_task(manager.async_update_agent())
     await clock.entered.wait()
@@ -462,13 +341,13 @@ async def test_cancellation_during_backoff_stops_promptly(
 async def test_shutdown_during_backoff_stops_without_another_attempt(
     hass: HomeAssistant,
     payload_dir: Path,
-    clock: _Clock,
-    spies: _Spies,
-    shells: _Shells,
+    clock: Clock,
+    spies: Spies,
+    shells: Shells,
 ) -> None:
     clock.gate = asyncio.Event()
     shells.scripted.append(FakeShell(connect_error=_UNREACHABLE))
-    manager = _manager(hass)
+    manager = update_manager(hass)
 
     update = asyncio.create_task(manager.async_update_agent())
     await clock.entered.wait()
@@ -488,14 +367,14 @@ async def test_shutdown_during_backoff_stops_without_another_attempt(
 async def test_shutdown_while_waiting_for_the_lock_never_connects(
     hass: HomeAssistant,
     payload_dir: Path,
-    clock: _Clock,
-    spies: _Spies,
-    shells: _Shells,
+    clock: Clock,
+    spies: Spies,
+    shells: Shells,
 ) -> None:
     """Shutdown latched while the update queued behind another panel stops it."""
     lock = asyncio.Lock()
     await lock.acquire()
-    manager = _manager(hass, lock=lock)
+    manager = update_manager(hass, lock=lock)
 
     update = asyncio.create_task(manager.async_update_agent())
     await asyncio.sleep(0)
@@ -513,15 +392,15 @@ async def test_shutdown_while_waiting_for_the_lock_never_connects(
 async def test_deadline_starts_after_the_first_lock_acquisition(
     hass: HomeAssistant,
     payload_dir: Path,
-    clock: _Clock,
-    spies: _Spies,
-    shells: _Shells,
+    clock: Clock,
+    spies: Spies,
+    shells: Shells,
 ) -> None:
     """Queueing behind other panels' updates does not consume the retry budget."""
     lock = asyncio.Lock()
     await lock.acquire()
     shells.scripted.extend([FakeShell(connect_error=_UNREACHABLE), FakeShell()])
-    manager = _manager(hass, lock=lock)
+    manager = update_manager(hass, lock=lock)
 
     update = asyncio.create_task(manager.async_update_agent())
     await asyncio.sleep(0)
@@ -538,15 +417,15 @@ async def test_deadline_starts_after_the_first_lock_acquisition(
 async def test_retry_lock_wait_past_the_deadline_gives_up_without_connecting(
     hass: HomeAssistant,
     payload_dir: Path,
-    clock: _Clock,
-    spies: _Spies,
-    shells: _Shells,
+    clock: Clock,
+    spies: Spies,
+    shells: Shells,
 ) -> None:
     """A retry that only gets the lock after the deadline does not connect."""
     lock = asyncio.Lock()
     clock.gate = asyncio.Event()
     shells.scripted.extend([FakeShell(connect_error=_UNREACHABLE), FakeShell()])
-    manager = _manager(hass, lock=lock)
+    manager = update_manager(hass, lock=lock)
 
     update = asyncio.create_task(manager.async_update_agent())
     await clock.entered.wait()
@@ -566,9 +445,9 @@ async def test_retry_lock_wait_past_the_deadline_gives_up_without_connecting(
 async def test_retry_lock_wait_is_bounded_by_the_deadline(
     hass: HomeAssistant,
     payload_dir: Path,
-    clock: _Clock,
-    spies: _Spies,
-    shells: _Shells,
+    clock: Clock,
+    spies: Spies,
+    shells: Shells,
 ) -> None:
     """A lock held indefinitely by another panel cannot stretch the retry budget."""
     lock = asyncio.Lock()
@@ -579,7 +458,7 @@ async def test_retry_lock_wait_is_bounded_by_the_deadline(
 
     clock.on_sleep = leave_50_ms
     shells.scripted.append(FakeShell(connect_error=_UNREACHABLE))
-    manager = _manager(hass, lock=lock)
+    manager = update_manager(hass, lock=lock)
 
     update = asyncio.create_task(manager.async_update_agent())
     await clock.entered.wait()
@@ -597,14 +476,14 @@ async def test_retry_lock_wait_is_bounded_by_the_deadline(
 async def test_failure_after_authentication_began_is_not_retried(
     hass: HomeAssistant,
     payload_dir: Path,
-    clock: _Clock,
-    spies: _Spies,
-    shells: _Shells,
+    clock: Clock,
+    spies: Spies,
+    shells: Shells,
     error: Exception,
 ) -> None:
     """Once asyncssh began userauth the password may have been offered: no retry."""
     shells.scripted.append(FakeShell(connect_error=error, reached_auth=True))
-    manager = _manager(hass)
+    manager = update_manager(hass)
 
     with pytest.raises(HomeAssistantError) as raised:
         await manager.async_update_agent()
@@ -618,13 +497,13 @@ async def test_failure_after_authentication_began_is_not_retried(
 async def test_failure_before_authentication_is_retried(
     hass: HomeAssistant,
     payload_dir: Path,
-    clock: _Clock,
-    spies: _Spies,
-    shells: _Shells,
+    clock: Clock,
+    spies: Spies,
+    shells: Shells,
     error: Exception,
 ) -> None:
     shells.scripted.extend([FakeShell(connect_error=error), FakeShell()])
-    manager = _manager(hass)
+    manager = update_manager(hass)
 
     await manager.async_update_agent()
 
@@ -636,15 +515,15 @@ async def test_failure_before_authentication_is_retried(
 async def test_backoff_releases_fleet_lock_but_admits_no_concurrent_panel_writer(
     hass: HomeAssistant,
     payload_dir: Path,
-    clock: _Clock,
-    spies: _Spies,
-    shells: _Shells,
+    clock: Clock,
+    spies: Spies,
+    shells: Shells,
 ) -> None:
     """Other panels may use the fleet SSH lock during backoff; this panel stays owned."""
     lock = asyncio.Lock()
     clock.gate = asyncio.Event()
     shells.scripted.extend([FakeShell(connect_error=_UNREACHABLE), FakeShell()])
-    manager = _manager(hass, lock=lock)
+    manager = update_manager(hass, lock=lock)
 
     update = asyncio.create_task(manager.async_update_agent())
     await clock.entered.wait()

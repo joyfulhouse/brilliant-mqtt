@@ -38,6 +38,7 @@ from custom_components.brilliant_mqtt.const import (
 from custom_components.brilliant_mqtt.entry_data import LegacyPanelStore
 from custom_components.brilliant_mqtt.fleet_manager import legacy_fleet_config
 from custom_components.brilliant_mqtt.manager import PanelManager
+from tests import update_harness
 from tests.fakes import FakeShell
 from tests.test_init import ENTRY_DATA
 
@@ -66,6 +67,53 @@ def instant_update_connect_retry(monkeypatch: pytest.MonkeyPatch) -> None:
         await asyncio.sleep(0)
 
     monkeypatch.setattr(manager, "_connect_retry_sleep", no_wait)
+    from custom_components.brilliant_mqtt import panel_provisioner
+
+    monkeypatch.setattr(panel_provisioner, "_reconnect_sleep", no_wait)
+
+
+@pytest.fixture
+def clock(monkeypatch: pytest.MonkeyPatch) -> update_harness.Clock:
+    """Deterministic update retry clock/sleep with jitter pinned to 1.0."""
+    return update_harness.install_clock(monkeypatch)
+
+
+@pytest.fixture
+def spies(monkeypatch: pytest.MonkeyPatch) -> update_harness.Spies:
+    """Count update admissions and (stubbed) baseline captures."""
+    return update_harness.install_spies(monkeypatch)
+
+
+@pytest.fixture
+def shells() -> Iterator[update_harness.Shells]:
+    """Route every legacy-manager connect through a scripted shell factory."""
+    factory = update_harness.Shells()
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", side_effect=factory):
+        yield factory
+
+
+@pytest.fixture
+def durable_journal_store(
+    hass: HomeAssistant, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Persist the provisioning journal to a temporary config dir."""
+    update_harness.install_durable_store(hass, tmp_path / "ha-config", monkeypatch)
+
+
+@pytest.fixture
+def reconnect_sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Record the managed-update rollback reconnect backoff (jitter pinned to 1.0)."""
+    from custom_components.brilliant_mqtt import connect_retry, panel_provisioner
+
+    delays: list[float] = []
+
+    async def record(delay: float) -> None:
+        delays.append(delay)
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(panel_provisioner, "_reconnect_sleep", record)
+    monkeypatch.setattr(connect_retry, "jitter", lambda: 1.0)
+    return delays
 
 
 @pytest.fixture(autouse=True)
