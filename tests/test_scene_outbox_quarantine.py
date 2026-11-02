@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -76,6 +77,9 @@ class _Harness:
         self.path = tmp_path / "private" / "scene-watermarks.json"
         self.sidecar = oq.sidecar_path(self.path)
         self.clock = FakeClockMs(_NOW_MS)
+        # Monotonic seconds for the attribution window; independent of the wall
+        # clock so tests can step either one alone.
+        self.monotonic_s = 1_000.0
         self.diagnostics = ResponseDiagnostics()
 
     async def session(
@@ -105,6 +109,7 @@ class _Harness:
             self.clock,
             session_signals=mqtt,
             diagnostics=self.diagnostics,
+            monotonic=lambda: self.monotonic_s,
         )
         await bridge.async_start()
         if execution_scene is not None:
@@ -302,12 +307,28 @@ async def test_drop_long_after_sending_is_not_attributed(tmp_path: Path) -> None
     harness = _Harness(tmp_path)
     bridge, _, mqtt = await harness.session("hold", execution_scene=_POISON_SCENE)
     await _until(lambda: mqtt.poison_offers == 1, "held offer")
-    await harness.clock.advance_ms(oq.ATTRIBUTION_WINDOW_MS + 1)
+    harness.monotonic_s += (oq.ATTRIBUTION_WINDOW_MS + 1) / 1_000
     mqtt.drop_connection()
     await asyncio.sleep(0.05)
     await bridge.async_shutdown()
     assert harness.quarantine() == oq.QuarantineState()
     assert not harness.sidecar.exists()
+
+
+async def test_attribution_window_ignores_wall_clock_steps(tmp_path: Path) -> None:
+    # An NTP step between send and drop must neither hide nor fake a prompt
+    # drop: the 2 s window is monotonic, while at_ms stays wall-clock.
+    harness = _Harness(tmp_path)
+    bridge, _, mqtt = await harness.session("hold", execution_scene=_POISON_SCENE)
+    await _until(lambda: mqtt.poison_offers == 1, "held offer")
+    await harness.clock.advance_ms(600_000)
+    harness.monotonic_s += 0.5
+    mqtt.drop_connection()
+    await _failures_reach(harness, 1)
+    await bridge.async_shutdown()
+    suspect = harness.suspect()
+    assert suspect is not None
+    assert suspect.failures[0].at_ms == _NOW_MS + 600_000
 
 
 async def test_successful_delivery_resets_the_counter(tmp_path: Path) -> None:
@@ -467,3 +488,24 @@ async def test_wedge_at_five_second_rebuild_cadence_is_quarantined(tmp_path: Pat
     assert mqtt.poison_offers == 0
     assert _last_status(mqtt, "scene")["reason"] == "outbox_quarantine"
     await bridge.async_shutdown()
+
+
+async def test_shutdown_right_after_a_drop_waits_for_the_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #113: the session teardown that follows a drop must not cancel the
+    # evidence write; shutdown waits for it (bounded) before returning.
+    harness = _Harness(tmp_path)
+    real_write = oq.write_sidecar
+
+    def slow_write(path: Path, state: oq.QuarantineState) -> None:
+        time.sleep(0.2)
+        real_write(path, state)
+
+    monkeypatch.setattr(scene_bridge_module, "write_sidecar", slow_write)
+    bridge, _, mqtt = await harness.session("hold", execution_scene=_POISON_SCENE)
+    await _until(lambda: mqtt.poison_offers == 1, "held offer")
+    mqtt.drop_connection()
+    await bridge.async_shutdown()
+
+    assert _failures(harness) == 1

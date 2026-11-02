@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, replace
@@ -94,6 +95,7 @@ _MODE_WATERMARK_LIMIT = MODE_WATERMARK_LIMIT
 _RESULT_EXPIRY_MS = 10 * 60 * 1_000
 _RESULT_RETRY_SECONDS = 1.0
 _SHUTDOWN_DRAIN_SECONDS = 0.05
+_DROP_EVIDENCE_DRAIN_SECONDS = 2.0
 _UNSUBSCRIBE_TIMEOUT_SECONDS = 0.05
 _TIMEOUT_SECONDS = COMMAND_TTL_MS / 1_000
 
@@ -109,7 +111,8 @@ class _Inflight:
 
     record: str
     sha256: str
-    sent_at_ms: int
+    # Monotonic send time: the attribution window must not move with NTP steps.
+    sent_monotonic: float
     # True when an earlier QoS-1 publish in this MQTT session was acknowledged.
     healthy: bool
     epoch: int
@@ -170,6 +173,7 @@ class SceneBridge:
         *,
         session_signals: MqttSessionSignals | None = None,
         diagnostics: ResponseDiagnostics | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._bus = bus
         self._mqtt = mqtt
@@ -184,6 +188,10 @@ class SceneBridge:
         self._quarantine_lock = asyncio.Lock()
         self._session_id = ""
         self._inflight: _Inflight | None = None
+        self._monotonic = monotonic
+        # Drop-evidence writers: awaited (bounded) by shutdown, never cancelled
+        # first, so a teardown right after a drop does not lose the evidence.
+        self._drop_tasks: set[asyncio.Task[None]] = set()
         self._clock_ms = clock_ms
         # Bus scope pre-filter keyed by device id (issue #98): the execution
         # peripheral lives on the panel's own device, so a push for a device
@@ -382,6 +390,13 @@ class SceneBridge:
         tasks = list(self._tasks)
         for task in tasks:
             task.cancel()
+        drop_tasks = set(self._drop_tasks)
+        if drop_tasks:
+            # #113: let drop evidence reach disk instead of cancelling it.
+            # Bounded; the sidecar write itself is shielded in the executor.
+            _, unfinished = await asyncio.wait(drop_tasks, timeout=_DROP_EVIDENCE_DRAIN_SECONDS)
+            for task in unfinished:
+                task.cancel()
         if tasks:
             await asyncio.wait(tasks, timeout=_SHUTDOWN_DRAIN_SECONDS)
         topics = list(self._subscribed_topics)
@@ -1457,7 +1472,7 @@ class SceneBridge:
         inflight = _Inflight(
             record=record,
             sha256=payload_sha256(payload),
-            sent_at_ms=self._clock_ms(),
+            sent_monotonic=self._monotonic(),
             healthy=self._session_signals.acknowledged_qos1_publishes() > 0,
             epoch=self._epoch,
         )
@@ -1479,13 +1494,16 @@ class SceneBridge:
         inflight = self._inflight
         if inflight is None or self._stopping or inflight.epoch != self._epoch:
             return
-        lost_at_ms = self._clock_ms()
-        if lost_at_ms - inflight.sent_at_ms > ATTRIBUTION_WINDOW_MS:
+        elapsed_ms = round((self._monotonic() - inflight.sent_monotonic) * 1_000)
+        if elapsed_ms > ATTRIBUTION_WINDOW_MS:
             return
         self._inflight = None
-        self._track_task(self._async_note_drop(inflight, lost_at_ms))
+        # Wall-clock only for the persisted time (the 60 s span across sessions).
+        task = asyncio.create_task(self._async_note_drop(inflight, self._clock_ms(), elapsed_ms))
+        self._drop_tasks.add(task)
+        task.add_done_callback(self._drop_tasks.discard)
 
-    async def _async_note_drop(self, inflight: _Inflight, lost_at_ms: int) -> None:
+    async def _async_note_drop(self, inflight: _Inflight, lost_at_ms: int, elapsed_ms: int) -> None:
         async with self._quarantine_lock:
             async with self._lock:
                 live = self._live_records()
@@ -1508,7 +1526,6 @@ class SceneBridge:
             async with self._lock:
                 self._quarantine = updated
                 self._note_outbox_diagnostics()
-        elapsed_ms = lost_at_ms - inflight.sent_at_ms
         suspect = updated.get(inflight.record)
         if not inflight.healthy:
             logger.warning(
@@ -1533,6 +1550,8 @@ class SceneBridge:
                 inflight.record,
                 len(suspect.failures),
             )
+        if self._stopping or inflight.epoch != self._epoch:
+            return  # evidence is on disk; never publish from a torn-down session
         await self._async_health_status("scene")
         await self._async_health_status("mode")
 
