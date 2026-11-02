@@ -861,6 +861,10 @@ class AioMqttAdapter:
         self._topic_dispatcher = _TopicDispatcher(self._dispatch_inbound, diagnostics=diagnostics)
         self._reader_task: asyncio.Task[None] | None = None
         self._reader_failure_consumed = False
+        # #113 session signals: QoS>=1 PUBACK count and drop observers.
+        self._acknowledged_qos1 = 0
+        self._connection_lost_cbs: list[Callable[[], None]] = []
+        self._connection_lost_fired = False
         self._avail_topic = availability_topic(settings.panel)
         # A distinct broker ClientID is REQUIRED for any second connection on the
         # same panel: two clients sharing an id force the broker to disconnect the
@@ -1011,7 +1015,23 @@ class AioMqttAdapter:
                     latest_wins=_is_latest_wins_topic(topic),
                 )
         finally:
+            # aiomqtt's message iterator raises as soon as the broker link drops,
+            # so this is the earliest observation of an unexpected session loss.
+            # Fire before the (possibly slow) dispatcher drain so the drop is
+            # timed against the in-flight publish, not against teardown.
+            if not self._closing and not self._closed:
+                self._fire_connection_lost()
             await dispatcher.shutdown()
+
+    def _fire_connection_lost(self) -> None:
+        if self._connection_lost_fired:
+            return
+        self._connection_lost_fired = True
+        for callback in tuple(self._connection_lost_cbs):
+            try:
+                callback()
+            except Exception:
+                logger.exception("connection-lost callback failed; continuing")
 
     def _get_topic_dispatcher(self) -> _TopicDispatcher:
         """Return the dispatcher, lazily covering off-panel object doubles."""
@@ -1206,6 +1226,18 @@ class AioMqttAdapter:
         if qos not in (0, 1, 2):
             raise ValueError("qos must be between 0 and 2")
         await self._client.publish(topic, payload=payload, retain=retain, qos=qos)
+        if qos >= 1:
+            # aiomqtt returns from a QoS>=1 publish only after the broker's
+            # acknowledgement, so this counts proof that the session is healthy.
+            self._acknowledged_qos1 += 1
+
+    def acknowledged_qos1_publishes(self) -> int:
+        """Return how many QoS>=1 publishes the broker acknowledged on this session."""
+        return self._acknowledged_qos1
+
+    def on_connection_lost(self, cb: Callable[[], None]) -> None:
+        """Register a callback fired once when the broker link drops unexpectedly."""
+        self._connection_lost_cbs.append(cb)
 
     def on_command(self, cb: Callable[[str, str], Awaitable[None]]) -> None:
         self._command_cbs.append(cb)

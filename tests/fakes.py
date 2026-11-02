@@ -324,6 +324,10 @@ class FakeMqtt:
         self.connect_count = 0
         self.disconnect_count = 0
         self.reader_failure_latched = False
+        # #113 session signals (MqttSessionSignals).
+        self.acknowledged_qos1 = 0
+        self._connection_lost_cbs: list[Callable[[], None]] = []
+        self.connection_lost = False
 
     async def connect(self) -> None:
         self.connect_count += 1
@@ -343,6 +347,22 @@ class FakeMqtt:
     async def publish(self, topic: str, payload: str, retain: bool = False, qos: int = 0) -> None:
         self.published.append((topic, payload, retain))
         self.published_qos.append(qos)
+        if qos >= 1:
+            self.acknowledged_qos1 += 1
+
+    def acknowledged_qos1_publishes(self) -> int:
+        return self.acknowledged_qos1
+
+    def on_connection_lost(self, cb: Callable[[], None]) -> None:
+        self._connection_lost_cbs.append(cb)
+
+    def drop_connection(self) -> None:
+        """Test helper: the broker closes this session (fires callbacks once)."""
+        if self.connection_lost:
+            return
+        self.connection_lost = True
+        for callback in list(self._connection_lost_cbs):
+            callback()
 
     def on_command(self, cb: Callable[[str, str], Awaitable[None]]) -> None:
         self._command_cbs.append(cb)
