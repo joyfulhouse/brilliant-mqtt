@@ -60,6 +60,7 @@ from custom_components.brilliant_mqtt.ha_control_protocol import (
 from custom_components.brilliant_mqtt.manager import PanelManager
 from custom_components.brilliant_mqtt.panel_provisioner import PanelProvisioner
 from custom_components.brilliant_mqtt.shell import HostIdentity
+from custom_components.brilliant_mqtt.update_intent import UpdateIntent, update_intent_store
 
 _HA_PYPROJECT = Path(__file__).parents[1] / "pyproject.toml"
 
@@ -129,6 +130,7 @@ async def test_ha_remove_delegates_recovery_after_registry_owner_is_deleted(
         data=ENTRY_DATA,
     )
     entry.add_to_hass(hass)
+    await update_intent_store(hass).async_set(entry.entry_id, _sample_intent())
     observed: list[str] = []
 
     async def recover_removed(
@@ -157,10 +159,12 @@ async def test_ha_remove_delegates_recovery_after_registry_owner_is_deleted(
         f"needs_attention_{entry.entry_id}",
         f"voice_missing_{entry.entry_id}",
         f"ha_mirror_retired_{entry.entry_id}",
+        f"interrupted_update_{entry.entry_id}",
         f"broker_unavailable_{entry.entry_id}",
         f"runtime_setup_failed_{entry.entry_id}",
         f"fleet_storage_{entry.entry_id}",
     } | _component_issue_ids({entry.entry_id})
+    assert await update_intent_store(hass).async_get(entry.entry_id) is None
 
 
 async def test_fleet_remove_deletes_component_issues_for_each_management_id(
@@ -186,6 +190,8 @@ async def test_fleet_remove_deletes_component_issues_for_each_management_id(
         ),
     )
     entry.add_to_hass(hass)
+    for management_id in (office_management_id, kitchen_management_id):
+        await update_intent_store(hass).async_set(management_id, _sample_intent())
 
     with (
         patch(
@@ -203,10 +209,13 @@ async def test_fleet_remove_deletes_component_issues_for_each_management_id(
         *(f"needs_attention_{management_id}" for management_id in management_ids),
         *(f"voice_missing_{management_id}" for management_id in management_ids),
         *(f"ha_mirror_retired_{management_id}" for management_id in management_ids),
+        *(f"interrupted_update_{management_id}" for management_id in management_ids),
         f"broker_unavailable_{entry.entry_id}",
         f"runtime_setup_failed_{entry.entry_id}",
         f"fleet_storage_{entry.entry_id}",
     } | _component_issue_ids(management_ids)
+    for management_id in management_ids:
+        assert await update_intent_store(hass).async_get(management_id) is None
 
 
 def _entry_manager(entry: MockConfigEntry) -> PanelManager:
@@ -704,3 +713,10 @@ async def test_migrate_v3_marks_only_current_entry_and_preserves_runtime(
     assert dict(sibling.options) == sibling_options
     assert update_entry.call_count == 1
     assert update_entry.call_args.args[0] is current
+
+
+def _sample_intent() -> UpdateIntent:
+    """One valid interrupted-update record (see test_update_intent)."""
+    from tests.test_update_intent import _intent
+
+    return _intent()

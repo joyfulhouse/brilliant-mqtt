@@ -71,6 +71,7 @@ from .fleet_manager import (
     get_panel_provisioner as get_panel_provisioner,
 )
 from .manager import PanelManager, async_delete_panel_issues
+from .update_intent import async_forget_update_intent
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -433,6 +434,7 @@ async def async_remove_entry(hass: HomeAssistant, entry: BrilliantMqttConfigEntr
     } or {entry.entry_id}
     for management_id in management_ids:
         async_delete_panel_issues(hass, management_id)
+        await async_forget_update_intent(hass, management_id)
     ir.async_delete_issue(hass, DOMAIN, f"broker_unavailable_{entry.entry_id}")
     ir.async_delete_issue(hass, DOMAIN, f"runtime_setup_failed_{entry.entry_id}")
     ir.async_delete_issue(hass, DOMAIN, f"fleet_storage_{entry.entry_id}")

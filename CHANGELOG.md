@@ -26,6 +26,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `component-identities` is strictly read-only: it never creates or updates
   the panel's identity records, so it is safe to run over SSH on a production
   panel. An ordinal that no existing record proves is shown as `unknown`.
+- Agent updates now show their retry state. While an update waits to retry, its
+  stage (`connect` or `admission`), attempt, attempt budget, classified reason,
+  backoff and next attempt time are logged and shown in diagnostics (per panel,
+  under `update`) and on the Update entity's `update` attribute, together with
+  the typed final error (`stage`, `code`, `attempts`) of the last failed update.
+  Every value is allowlisted; no address or exception text is exported. The
+  Update entity's progress bar follows any update of the panel, including one
+  started by `redeploy` or a Repair.
+  ([#219](https://github.com/joyfulhouse/brilliant-mqtt/issues/219))
+- An update interrupted by a Home Assistant restart before baseline capture is
+  surfaced as a fixable Repair issue (**Agent update was interrupted**) instead
+  of being lost. It is never resumed automatically and setup never connects to
+  the panel for it. The Repair offers **Retry** (a fresh update with a fresh
+  retry budget, refused if the bundled release changed, a provisioning journal
+  concerns the panel, or an update is already running) and **Dismiss**. A
+  provisioning journal or retained baseline for the panel always takes
+  precedence. ([#219](https://github.com/joyfulhouse/brilliant-mqtt/issues/219))
 
 ### Fixed
 
@@ -93,6 +110,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when panels are added back to back.
 - Rollback verification is about 14 seconds slower, because its snapshot now
   samples the restored services for the same window.
+- An update that loses its SSH session during release admission now resumes
+  with a new connection, within the same 5-attempt, 2-minute budget as the
+  connect retries. It resumes only without a release override and with no
+  provisioning journal, never re-pins a host key, and must admit exactly the
+  same release (otherwise `release_candidate_changed`). Nothing is resumed once
+  baseline capture has begun. A session lost during capture stops with
+  guidance: `provisioning_recovery_required` when a journal or retained baseline
+  concerns the panel, otherwise `baseline_capture_interrupted` (see
+  [canary-rollback.md](docs/canary-rollback.md#interrupted-baseline-capture)).
+  An admission lost after a release override was used reports
+  `release_override_used_or_write_failed`: obtain a fresh override.
+  ([#219](https://github.com/joyfulhouse/brilliant-mqtt/issues/219))
+- A session lost after the update transaction began is rolled back over a fresh
+  SSH session pinned to the journaled host key, instead of failing on the dead
+  one. Only network faults that never reached SSH authentication are retried
+  (up to 5 attempts within 2 minutes). Activation is never repeated. Every
+  failure keeps the restore intent in the journal for automatic recovery,
+  records a typed `last_error` (`recovery_connection_failed`,
+  `panel_identity_mismatch`, `panel_authentication_failed`, `rollback_failed`,
+  or `recovery_interrupted` when Home Assistant was stopping) and raises a
+  Repair naming `connection_lost`. SSH sessions now send keepalives, so a
+  silently dead link is detected within about 45 seconds.
+  ([#219](https://github.com/joyfulhouse/brilliant-mqtt/issues/219))
 
 ### Documentation
 
@@ -106,6 +146,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fixed layout (105 s, predecessor digests restored exactly) as met. The
   responsiveness measurement remains outstanding and is recorded as FAIL /
   confounded by a native peer-forwarding fault.
+
+### Known limitations
+
+- A remote command issued on a lost session is not fenced. If it lands on the
+  panel after the rollback verified the restore, it goes undetected. Confirm the
+  installed agent version before updating that panel again.
+- Home Assistant's storage helper swallows write errors, so a disk failure while
+  recording or clearing the interrupted-update record cannot be detected.
+- Retry from the interrupted-update Repair starts with a fresh retry budget; the
+  attempts of the interrupted update are not carried over.
 
 ## [0.11.4] - 2026-10-26
 

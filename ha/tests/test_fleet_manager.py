@@ -98,6 +98,7 @@ from custom_components.brilliant_mqtt.provisioning_journal import (
     StoredServiceSnapshot,
 )
 from custom_components.brilliant_mqtt.shell import HostIdentity, PanelIdentityError
+from custom_components.brilliant_mqtt.update_intent import UpdateIntent, update_intent_store
 
 _OFFICE_PUBLIC_KEY = (
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKIykuTed7zNwJwn20eCelcKcHKJ9c/pGFfvulRWazuC"
@@ -127,6 +128,7 @@ def _panel_owned_issue_ids(management_id: str) -> set[str]:
         f"needs_attention_{management_id}",
         f"voice_missing_{management_id}",
         f"ha_mirror_retired_{management_id}",
+        f"interrupted_update_{management_id}",
         *(
             f"component_state_unverified_{management_id}_{component.id}"
             for component in REGISTRY.values()
@@ -4724,6 +4726,10 @@ async def test_failed_post_commit_cleanup_schedules_identical_control_retry(
                     "reason": "test",
                 },
             )
+        office_management_id = fleet.panels["panel-office"].management_id
+        intents = update_intent_store(hass)
+        await intents.async_set(kitchen_manager.management_id, _sample_intent())
+        await intents.async_set(office_management_id, _sample_intent())
         assert fleet._update_unsub is not None
         fleet._update_unsub()
         fleet._update_unsub = None
@@ -4756,6 +4762,9 @@ async def test_failed_post_commit_cleanup_schedules_identical_control_retry(
                 registry.async_get_issue(DOMAIN, issue_id) is None for issue_id in kitchen_issue_ids
             )
             assert registry.async_get_issue(DOMAIN, office_issue_id) is not None
+            # The removed panel's update window record is forgotten; others stay.
+            assert await intents.async_get(kitchen_manager.management_id) is None
+            assert await intents.async_get(office_management_id) is not None
 
             await fleet._async_reconcile()
 
@@ -5724,3 +5733,10 @@ async def test_broker_status_none_to_true_does_not_reassess(hass: HomeAssistant)
         fleet._async_broker_status(False)  # a real outage (True→False)
         fleet._async_broker_status(True)  # down→up transition → reassess
         panel.async_broker_reconnected.assert_called_once_with()
+
+
+def _sample_intent() -> UpdateIntent:
+    """One valid interrupted-update record (see test_update_intent)."""
+    from tests.test_update_intent import _intent
+
+    return _intent()
