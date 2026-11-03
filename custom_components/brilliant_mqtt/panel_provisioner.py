@@ -1200,9 +1200,14 @@ class PanelProvisioner:
         if outcome is _RehearsalOutcome.HEALTHY and not shell.transport_lost():
             try:
                 await self._operations.rebind_rehearsed_deployment(shell, deployment_id)
-            except PanelOpError:
+            except PanelOpError as error:
                 # Typed on both routes; the caller's guard still retires the baseline.
-                raise PanelProvisioningError("release_identity_changed") from None
+                # Only a real identity change is reported as one: a failed read keeps
+                # its own code, and any other refusal stays as the original error.
+                code = str(error).partition(":")[0]
+                if code in {"release_identity_changed", "release_identity_read_failed"}:
+                    raise PanelProvisioningError(code) from None
+                raise
             return
         running = False
         if (

@@ -680,6 +680,7 @@ class _FakeOperations:
     events: list[tuple[object, ...]]
     snapshot: panel_ops.PanelSnapshot
     fail_at: set[str] = field(default_factory=set)
+    rebind_error: str = "release_identity_changed"
     block_activation: asyncio.Event | None = None
     block_rollback: asyncio.Event | None = None
     activation_started: asyncio.Event = field(default_factory=asyncio.Event)
@@ -746,7 +747,7 @@ class _FakeOperations:
     async def rebind_rehearsed_deployment(self, shell: PanelShell, deployment_id: str) -> None:
         self.events.append(("rebind", deployment_id))
         if "rebind" in self.fail_at:
-            raise panel_ops.PanelOpError("release_identity_changed")
+            raise panel_ops.PanelOpError(self.rebind_error)
 
     async def restart_restored(
         self,

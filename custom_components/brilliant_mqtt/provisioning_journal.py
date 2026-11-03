@@ -172,6 +172,7 @@ PROVISIONING_ERROR_CODES = frozenset(
         "incumbent_rehearsal_interrupted",
         "incumbent_health_unobservable",
         "release_identity_changed",
+        "release_identity_read_failed",
         "stage_failed",
         "transaction_in_progress",
         "unsupported_panel_toolchain",

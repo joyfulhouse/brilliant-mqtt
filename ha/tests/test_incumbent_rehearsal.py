@@ -123,7 +123,7 @@ def test_rehearsal_codes_are_allowlisted_and_translated() -> None:
     root = Path(__file__).parents[2] / "custom_components/brilliant_mqtt"
     strings = json.loads((root / "strings.json").read_text())
     english = json.loads((root / "translations/en.json").read_text())
-    for code in (*REHEARSAL_CODES, "release_identity_changed"):
+    for code in (*REHEARSAL_CODES, "release_identity_changed", "release_identity_read_failed"):
         assert code in PROVISIONING_ERROR_CODES
         assert code in UPDATE_ERROR_CODES
         assert code in manager_module._SAFE_PANEL_OP_DETAILS
@@ -447,6 +447,21 @@ async def test_rebind_refusal_retires_the_baseline(route: str) -> None:
     harness.operations.fail_at.add("rebind")
 
     with pytest.raises(PanelProvisioningError, match="^release_identity_changed$"):
+        await _route(route, harness)
+
+    names = _names(harness)
+    assert names.index("rebind") < names.index("finalize_baseline")
+    assert "journal_create" not in names
+
+
+@pytest.mark.parametrize("route", ["install", "update"])
+async def test_rebind_read_failure_is_not_reported_as_an_identity_change(route: str) -> None:
+    harness = _Harness()
+    _installed(harness)
+    harness.operations.fail_at.add("rebind")
+    harness.operations.rebind_error = "release_identity_read_failed"
+
+    with pytest.raises(PanelProvisioningError, match="^release_identity_read_failed$"):
         await _route(route, harness)
 
     names = _names(harness)
