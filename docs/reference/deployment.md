@@ -235,6 +235,14 @@ A missing `current` selector or required installed unit, any command failure,
 any rejected or changing filesystem entry, or any non-empty diff is a stop
 condition.
 
+A panel on the legacy fixed layout has no `current` selector, so the
+`panel-release` leg does not apply to it. Run the integration and payload legs
+as above, then follow
+[Legacy fixed layout](release-qualification.md#legacy-fixed-layout) and its
+read-only [component identity comparison](release-qualification.md#comparing-component-identities)
+instead of the `panel-release` command. Never create a `current` link by hand
+to make that leg pass.
+
 Store only the path/hash manifests and their path/hash-only diff below
 gitignored `artifacts/brilliant-panel/pilots/office-bundle-parity/`. Do not
 capture file contents, environment files, CA material, credentials, logs,
