@@ -1372,6 +1372,24 @@ async def test_rehearsal_sweeps_stranded_env_temporaries_only(
     assert other.exists() and target.exists()
 
 
+@_LAYOUTS
+async def test_failed_sweep_aborts_the_env_write_and_never_restarts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, release: bool
+) -> None:
+    shell = await _panel(tmp_path, release=release)
+    before = _env(shell)
+    _, provisioner = _canary(shell, SimulatedBridge(shell))
+    _replace_command(monkeypatch, shell, "brilliant-mqtt.env.rollback-*.tmp; do", "exit 1")
+
+    with pytest.raises(PanelProvisioningError, match="^incumbent_rehearsal_failed$"):
+        await _update(provisioner, shell)
+
+    assert _env(shell) == before, "nothing written after a failed sweep"
+    assert _restarts(shell) == 0
+    assert _running(shell)
+    assert _env_temporaries(shell) == []
+
+
 async def test_restore_sweeps_stranded_env_temporaries(tmp_path: Path) -> None:
     shell = await _panel(tmp_path, release=True)
     baseline = await panel_ops.capture_baseline(shell, await panel_ops.snapshot_panel(shell))

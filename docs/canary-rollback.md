@@ -62,7 +62,8 @@ journaled:
    issues ONE `systemctl restart --no-block brilliant-mqtt`. systemd (PID 1)
    runs the queued restart itself, so a dropped SSH session cannot leave the
    bridge stopped. If the restart command itself fails on a live session, a
-   best-effort `systemctl start brilliant-mqtt` follows.
+   best-effort `systemctl reset-failed brilliant-mqtt; systemctl start
+   brilliant-mqtt` follows.
 4. It waits up to the health timeout (90 s by default) for fresh availability,
    metadata, state and discovery carrying the new ID. The wait ends early once
    the SSH session is seen lost. Metadata with any other ID

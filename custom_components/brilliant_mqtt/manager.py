@@ -239,9 +239,10 @@ _SAFE_PANEL_OP_DETAILS = {
         "'Interrupted baseline capture'"
     ),
     "incumbent_rehearsal_failed": (
-        "incumbent_rehearsal_failed: the installed bridge was not restarted for its "
-        "health rehearsal (only its deployment-ID line may have changed) and is still "
-        "running; check panel storage/systemd and retry"
+        "incumbent_rehearsal_failed: the health-rehearsal restart of the installed bridge "
+        "could not be issued (if systemd already queued it, it completes on its own; only "
+        "its deployment-ID line may have changed) and the bridge is verified running; "
+        "check panel storage/systemd and retry"
     ),
     "incumbent_rehearsal_interrupted": _REHEARSAL_INTERRUPTED_DETAIL,
     "incumbent_health_unobservable": (
