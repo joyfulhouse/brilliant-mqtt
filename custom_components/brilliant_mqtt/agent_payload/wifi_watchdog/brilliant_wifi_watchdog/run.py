@@ -130,7 +130,7 @@ def handle(
                     return None
                 # The state was already unreadable, so the guard's fail-closed
                 # window (re-armed on every start) bounds this reboot.
-            _LOG.error("gateway down ~360s: GPIO/SDIO reset + reboot")
+            _LOG.error("gateway down ~360s: Wi-Fi reset (i.MX6 only) + reboot")
             result: int = recovery_mod.gpio_reset_and_reboot()
             if result == 0:
                 _LOG.error("reboot requested")

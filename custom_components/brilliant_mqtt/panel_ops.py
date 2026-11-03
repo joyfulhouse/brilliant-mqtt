@@ -3048,6 +3048,9 @@ def render_voice_env(
     )
 
 
+_VOICE_ARCH_CHECK = '[ "$(uname -m)" = armv7l ]'
+
+
 async def deploy_voice_payload(shell: PanelShell, local_tarball_path: str, version: str) -> None:
     """Upload the voice payload tarball and swap the extracted tree into place.
 
@@ -3055,7 +3058,16 @@ async def deploy_voice_payload(shell: PanelShell, local_tarball_path: str, versi
     dir is brilliant-voice/, stripped on extract). Stage+swap so a failed transfer
     or extract never half-replaces a working install; the current tree is moved aside
     (not rm) so a mid-swap mv failure stays recoverable.
+
+    The payload bundles armv7l native code, so any other architecture is refused
+    before anything on the panel is touched (issue #155).
     """
+    arch_check = await shell.run(_VOICE_ARCH_CHECK)
+    if arch_check.exit_status != 0:
+        raise PanelOpError(
+            "voice satellite payload is armv7l-only; this panel's architecture is "
+            "not supported (see docs/brilliant-panel/i350-support.md)"
+        )
     await shell.run(f"rm -rf {_VOICE_STAGING_DIR} {_VOICE_STAGING_TARBALL}")
     await shell.put_file(local_tarball_path, _VOICE_STAGING_TARBALL, 0o644)
     await _checked(shell, _voice_swap_command())

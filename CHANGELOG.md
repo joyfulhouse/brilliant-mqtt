@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A read-only panel diagnostic,
+  `scripts/brilliant-panel/panel_diagnostics.sh`, reports the architecture,
+  firmware, Python, message-bus library (import and ELF machine), storage,
+  Wi-Fi hardware and Hue CA path facts that are needed before another panel
+  architecture can be qualified. It writes nothing, never connects to the bus
+  and reads no secrets. Brilliant i350 (aarch64) panels are still **not
+  supported**: the integration keeps refusing them with
+  `unsupported_architecture`. See `docs/brilliant-panel/i350-support.md` for the
+  qualification gates (#155).
+
+### Fixed
+
+- The Wi-Fi watchdog's last-resort GPIO/usdhc Wi-Fi reset is i.MX6-specific.
+  It now runs only where the `sdhci-esdhc-imx` driver is present. Elsewhere the
+  reset is skipped and logged as a warning, and the guarded reboot still runs
+  (#155).
+- Enabling the voice satellite on a panel that is not armv7l now fails with a
+  clear "armv7l-only" error before anything on the panel is changed, instead of
+  installing a payload that cannot run there (#155).
+
 ## [0.11.4] - 2026-10-26
 
 This is a Home Assistant integration release only. The bundled on-panel agent
