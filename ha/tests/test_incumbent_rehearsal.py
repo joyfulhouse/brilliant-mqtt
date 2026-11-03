@@ -1088,6 +1088,45 @@ async def test_lost_session_during_the_rehearsal_records_its_own_last_error(
     assert await journal.async_load() is None
 
 
+async def test_session_lost_after_an_unverified_bridge_keeps_the_bridge_warning(
+    hass: HomeAssistant,
+    tmp_path: Path,
+    payload_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A loss after the rehearsal chose ``unverified`` must not hide "start the bridge"."""
+    from homeassistant.exceptions import HomeAssistantError
+
+    shell = RehearsalShell(tmp_path / "panel")
+    shell.install()
+    bridge = SimulatedBridge(shell)
+    _, manager = await _manager_update(hass, tmp_path, payload_dir, monkeypatch, shell, bridge)
+
+    @asynccontextmanager
+    async def unverified_then_lost(_shell: PanelShell, _version: str) -> AsyncIterator[UUID]:
+        monkeypatch.setattr(shell, "transport_lost", lambda: True)
+        raise panel_ops.PanelOpError("incumbent_unhealthy_unverified: SECRET")
+        yield UUID(int=0)  # pragma: no cover - never reached
+
+    monkeypatch.setattr(manager, "_async_canary_update", unverified_then_lost)
+    try:
+        with pytest.raises(HomeAssistantError) as raised:
+            await manager.async_update_agent()
+    finally:
+        await manager.async_shutdown()
+
+    error = (raised.value.translation_placeholders or {})["error"]
+    assert "systemctl is-active brilliant-mqtt" in error
+    assert "Interrupted baseline capture" in error
+    assert "SECRET" not in error
+    assert manager.update_last_error == {
+        "stage": "baseline",
+        "code": "incumbent_unhealthy_unverified",
+        "attempts": 1,
+    }
+    assert manager._connect_for_repair.await_count == 1, "never reconnected"
+
+
 @_LAYOUTS
 async def test_canary_rollback_after_a_healthy_rehearsal_restores_the_prior_env(
     tmp_path: Path, release: bool

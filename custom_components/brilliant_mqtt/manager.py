@@ -2270,6 +2270,14 @@ class PanelManager:
                         raise _UpdateFailed(
                             stage, "incumbent_rehearsal_interrupted", _REHEARSAL_LOST_SUMMARY
                         ) from None
+                    if _panel_op_code(err) == "incumbent_unhealthy_unverified":
+                        # Lost after the rehearsal already found the bridge not running:
+                        # keep "check and start the bridge" over the baseline-lost text.
+                        raise _UpdateFailed(
+                            stage,
+                            "incumbent_unhealthy_unverified",
+                            _safe_failure_summary(_BASELINE_FAILED_SUMMARY, err),
+                        ) from None
                     if await self.async_journal_owns_panel():
                         raise _UpdateFailed(
                             stage, "provisioning_recovery_required", _BASELINE_RECOVERY_SUMMARY
