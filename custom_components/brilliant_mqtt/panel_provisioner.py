@@ -50,6 +50,7 @@ from .panel_inspection import (
     PanelFacts,
 )
 from .panel_ops import (
+    CLEANUP_FINALIZE_SECONDS,
     MAX_MQTT_CA_BYTES,
     MAX_SNAPSHOT_FILE_BYTES,
     FileSnapshot,
@@ -59,6 +60,8 @@ from .panel_ops import (
     ReleaseAdmission,
     ReleaseIdentityBlocked,
     ServiceSnapshot,
+    Settlement,
+    settle,
 )
 from .panel_ops import (
     StagedRelease as StagedRelease,
@@ -689,6 +692,17 @@ class PanelOperations(Protocol):
         on_service_stopped: Callable[[], None],
     ) -> None: ...
     async def snapshot_panel(self, shell: PanelShell) -> PanelSnapshot: ...
+    async def rehearse_restart(
+        self,
+        shell: PanelShell,
+        snapshot: PanelSnapshot,
+        deployment_id: str,
+        *,
+        before_restart: Callable[[], None],
+    ) -> None: ...
+    async def start_bridge(self, shell: PanelShell) -> None: ...
+    async def bridge_running(self, shell: PanelShell) -> bool: ...
+    async def rebind_rehearsed_deployment(self, shell: PanelShell, deployment_id: str) -> None: ...
 
     async def stage_release(
         self,
@@ -777,10 +791,58 @@ class _InstallState:
     failure_stage: str = "provisioning"
 
 
-@dataclass(frozen=True, slots=True, repr=False)
-class _Settlement:
-    error: BaseException | None
-    cancellation: asyncio.CancelledError | None
+class _RehearsalOutcome(StrEnum):
+    """How one incumbent health rehearsal ended (before mapping to a code)."""
+
+    HEALTHY = "healthy"
+    PROOF_FAILED = "proof_failed"
+    RESTART_FAILED = "restart_failed"
+    UNOBSERVABLE = "unobservable"
+    CANCELLED = "cancelled"
+
+
+def rehearsal_failure_code(
+    outcome: _RehearsalOutcome, *, transport_lost: bool, bridge_running: bool
+) -> str | None:
+    """The refusal code for a rehearsal outcome; None when nothing is refused.
+
+    A cancellation is re-raised rather than coded. An HA-side observer failure
+    never touched the bridge. A lost session is never reconnected, even after a
+    healthy proof: the install or update cannot continue on it. Otherwise the
+    code says whether the bridge is verified running: an unhealthy but running
+    incumbent, a rehearsal that never restarted it, or one whose state could not
+    be verified.
+    """
+    if outcome is _RehearsalOutcome.CANCELLED:
+        return None
+    if outcome is _RehearsalOutcome.UNOBSERVABLE:
+        return "incumbent_health_unobservable"
+    if transport_lost:
+        return "incumbent_rehearsal_interrupted"
+    if outcome is _RehearsalOutcome.HEALTHY:
+        return None
+    if not bridge_running:
+        return "incumbent_unhealthy_unverified"
+    if outcome is _RehearsalOutcome.RESTART_FAILED:
+        return "incumbent_rehearsal_failed"
+    return "incumbent_unhealthy"
+
+
+# Refusals whose operator action is about the bridge's own state: never replaced
+# by baseline_capture_interrupted when the baseline cannot be removed.
+_BRIDGE_STATE_CODES = frozenset(
+    {"incumbent_unhealthy_unverified", "incumbent_rehearsal_interrupted"}
+)
+
+# The rehearsal waits at most this long for the restarted incumbent's evidence.
+REHEARSAL_HEALTH_SECONDS = 90.0
+
+
+@dataclass(slots=True)
+class _BaselineGuard:
+    """Whether a Home Assistant record that could own the baseline was attempted."""
+
+    create_attempted: bool = False
 
 
 # How often a rollback reconnect backoff re-checks for an HA stop.
@@ -810,6 +872,27 @@ _reconnect_backoff: Callable[[float, Callable[[], bool]], Awaitable[bool]] = _sl
 
 def _not_stopping() -> bool:
     return False
+
+
+async def _wait_unless_lost(
+    observer: _HealthObserver, shell: PanelShell, version: str, bound_seconds: float
+) -> PanelHealthEvidence | None:
+    """Wait for health evidence; None as soon as the SSH session is seen lost.
+
+    A lost session makes the outcome interrupted whatever the proof says, so the
+    wait is cancelled instead of running out its whole bound.
+    """
+    waiting = asyncio.ensure_future(observer.async_wait(version, bound_seconds))
+    try:
+        while not waiting.done():
+            if shell.transport_lost():
+                return None
+            await asyncio.wait({waiting}, timeout=_STOP_POLL_SECONDS)
+        return waiting.result()
+    finally:
+        if not waiting.done():
+            waiting.cancel()
+            await asyncio.gather(waiting, return_exceptions=True)
 
 
 async def _noop_progress(update: ProvisioningProgress) -> None:
@@ -959,7 +1042,7 @@ class PanelProvisioner:
                     if cancellation is not None
                     else _required_primary_code(primary)
                 )
-                compensation = await _settle(self._async_compensate(state, original_code, progress))
+                compensation = await settle(self._async_compensate(state, original_code, progress))
                 await self._async_report_compensation_failure(
                     state,
                     original_code,
@@ -986,12 +1069,12 @@ class PanelProvisioner:
                 state.failure_stage = "cleanup"
                 original_code = "operation_cancelled"
                 if result is None:
-                    compensation = _Settlement(
+                    compensation = Settlement(
                         error=PanelProvisioningError("rollback_failed"),
                         cancellation=None,
                     )
                 else:
-                    compensation = await _settle(
+                    compensation = await settle(
                         self._async_reopen_compensate_and_close(
                             state,
                             request,
@@ -1024,6 +1107,231 @@ class PanelProvisioner:
             yield
         finally:
             self._lock.release()
+
+    @asynccontextmanager
+    async def _unjournaled_baseline_guard(
+        self, shell: PanelShell, snapshot: PanelSnapshot, transaction_id: UUID
+    ) -> AsyncIterator[_BaselineGuard]:
+        """Retire a published baseline if this region fails before a record owns it.
+
+        Wraps the region after ``capture_baseline`` and before the journal exists,
+        under the fleet lock. On any failure (including cancellation) the baseline
+        is finalized, bounded, unless a retained record or the active journal names
+        this transaction once its creation was attempted. An unreadable journal
+        counts as owned. A cancellation always wins; otherwise the original error is
+        re-raised unchanged after a successful finalize. A lost session is never
+        reconnected: like a failed or timed-out finalize it raises
+        ``baseline_capture_interrupted`` (an unowned baseline may remain), except
+        that a bridge-state code (``_BRIDGE_STATE_CODES``) is kept, so the operator
+        is still told to check and start the bridge; its text also says a baseline
+        may remain.
+
+        A settle bound that expired earlier in the region (a hung probe, start or
+        finalize) fences the shell by closing it: the shell is then closed but NOT
+        lost (``transport_lost()`` stays False), so this finalize is attempted and
+        fails, and the code follows the failed-finalize rule above.
+        """
+        guard = _BaselineGuard()
+        try:
+            yield guard
+        except (Exception, asyncio.CancelledError) as error:
+            await self._async_retire_unjournaled(shell, snapshot, transaction_id, guard, error)
+            raise
+
+    async def _async_retire_unjournaled(
+        self,
+        shell: PanelShell,
+        snapshot: PanelSnapshot,
+        transaction_id: UUID,
+        guard: _BaselineGuard,
+        error: BaseException,
+    ) -> None:
+        """Return to re-raise *error*; raise to replace it (see the guard)."""
+        cancellation = error if isinstance(error, asyncio.CancelledError) else None
+        # These codes already say a baseline may remain, and must keep telling the
+        # operator to check (and start) the bridge.
+        keeps_code = isinstance(error, PanelProvisioningError) and error.code in _BRIDGE_STATE_CODES
+        unowned_cleanup_possible = not shell.transport_lost()
+        if guard.create_attempted:
+            ownership = await settle(self._async_baseline_owned(transaction_id))
+            cancellation = cancellation or ownership.cancellation
+            if ownership.error is None and ownership.result is True:
+                if cancellation is not None:
+                    raise cancellation from None
+                return  # a durable record owns the baseline; its recovery settles it
+            unowned_cleanup_possible = unowned_cleanup_possible and ownership.error is None
+        finalized = False
+        if unowned_cleanup_possible:
+            outcome = await settle(
+                self._operations.finalize_baseline(shell, snapshot),
+                bound_seconds=CLEANUP_FINALIZE_SECONDS,
+            )
+            cancellation = cancellation or outcome.cancellation
+            finalized = outcome.error is None
+        if cancellation is not None:
+            raise cancellation from None
+        if not finalized and not keeps_code:
+            raise PanelProvisioningError("baseline_capture_interrupted") from None
+
+    async def _async_rehearse_incumbent(
+        self, shell: PanelShell, snapshot: PanelSnapshot, slug: str
+    ) -> None:
+        """Prove the installed bridge can come back healthy before replacing it.
+
+        Installed layouts only. Restarts the incumbent ONCE under a fresh,
+        memory-only deployment id and waits for its MQTT health evidence, so a
+        bridge that stays ``active`` but cannot reach MQTT is refused here, where
+        its baseline is still unjournaled (the caller's guard removes it), instead
+        of after the candidate fails with a rollback that can never be proven.
+        On success the release admission is re-bound to the rotated id.
+        """
+        if snapshot.layout is PanelLayout.ABSENT:
+            return
+        baseline = snapshot.baseline
+        if baseline is None or COMPONENT_BRIDGE not in baseline.identities:
+            raise PanelProvisioningError("baseline_incomplete")
+        version = baseline.identities[COMPONENT_BRIDGE].version
+        deployment_id = uuid4().hex
+        outcome, cancellation = await self._async_run_rehearsal(
+            shell, snapshot, slug, version, deployment_id
+        )
+        if cancellation is not None:
+            raise cancellation from None
+        if outcome is _RehearsalOutcome.HEALTHY and not shell.transport_lost():
+            try:
+                await self._operations.rebind_rehearsed_deployment(shell, deployment_id)
+            except PanelOpError as error:
+                # Typed on both routes; the caller's guard still retires the baseline.
+                # Only a real identity change is reported as one: a failed read keeps
+                # its own code, and any other refusal stays as the original error.
+                code = str(error).partition(":")[0]
+                if code in {"release_identity_changed", "release_identity_read_failed"}:
+                    raise PanelProvisioningError(code) from None
+                raise
+            return
+        running = False
+        if (
+            outcome
+            not in {
+                _RehearsalOutcome.UNOBSERVABLE,
+                _RehearsalOutcome.HEALTHY,
+            }
+            and not shell.transport_lost()
+        ):
+            running = await self._async_probe_bridge(shell)
+            if (
+                not running
+                and outcome is _RehearsalOutcome.PROOF_FAILED
+                and not shell.transport_lost()
+            ):
+                # The restarted bridge is down: never leave it so. Best effort,
+                # then the re-probe decides the code.
+                await self._async_start_bridge(shell)
+                if not shell.transport_lost():
+                    running = await self._async_probe_bridge(shell)
+        code = rehearsal_failure_code(
+            outcome, transport_lost=shell.transport_lost(), bridge_running=running
+        )
+        raise PanelProvisioningError(code or "invalid_provisioning_dependency")
+
+    async def _async_run_rehearsal(
+        self,
+        shell: PanelShell,
+        snapshot: PanelSnapshot,
+        slug: str,
+        version: str,
+        deployment_id: str,
+    ) -> tuple[_RehearsalOutcome, asyncio.CancelledError | None]:
+        observer: _HealthObserver | None = None
+        outcome = _RehearsalOutcome.UNOBSERVABLE
+        cancellation: asyncio.CancelledError | None = None
+        try:
+            observer = self._health_observer_factory(slug)
+            await observer.async_subscribe()
+        except asyncio.CancelledError as error:
+            outcome, cancellation = _RehearsalOutcome.CANCELLED, error
+        except Exception:
+            outcome = _RehearsalOutcome.UNOBSERVABLE
+        else:
+            try:
+                outcome = await self._async_rehearse_observed(
+                    observer, shell, snapshot, slug, version, deployment_id
+                )
+            except asyncio.CancelledError as error:
+                outcome, cancellation = _RehearsalOutcome.CANCELLED, error
+        closed = await _settle_close(observer.async_close if observer is not None else None)
+        if cancellation is None and closed.cancellation is not None:
+            outcome, cancellation = _RehearsalOutcome.CANCELLED, closed.cancellation
+        return outcome, cancellation
+
+    async def _async_rehearse_observed(
+        self,
+        observer: _HealthObserver,
+        shell: PanelShell,
+        snapshot: PanelSnapshot,
+        slug: str,
+        version: str,
+        deployment_id: str,
+    ) -> _RehearsalOutcome:
+        def before_restart() -> None:
+            # Metadata carrying any other id is ignored, so the still-running old
+            # process cannot satisfy the proof opened here.
+            observer.mark_activation_started(version, deployment_id)
+
+        try:
+            await self._operations.rehearse_restart(
+                shell, snapshot, deployment_id, before_restart=before_restart
+            )
+        except Exception as error:
+            code = str(error).partition(":")[0] if isinstance(error, PanelOpError) else ""
+            if code == "rehearsal_boundary_failed":
+                return _RehearsalOutcome.UNOBSERVABLE
+            if code == "rehearsal_restart_failed" and not shell.transport_lost():
+                await self._async_start_bridge(shell)
+            return _RehearsalOutcome.RESTART_FAILED
+        try:
+            evidence = await _wait_unless_lost(
+                observer, shell, version, min(self._health_timeout, REHEARSAL_HEALTH_SECONDS)
+            )
+        except Exception:
+            # Also HA's own MQTT dropping mid-wait: the observer cannot tell.
+            return _RehearsalOutcome.PROOF_FAILED
+        if evidence is None:
+            return _RehearsalOutcome.PROOF_FAILED  # the session was lost mid-wait
+        if (
+            evidence.deployment_id != deployment_id
+            or evidence.agent_version != version
+            or evidence.panel != slug
+        ):
+            return _RehearsalOutcome.PROOF_FAILED
+        return _RehearsalOutcome.HEALTHY
+
+    async def _async_probe_bridge(self, shell: PanelShell) -> bool:
+        """Whether the bridge is verified running; any failure counts as not.
+
+        Past its bound the probe fences the shell (closed, not lost): every later
+        command fails, so the bridge stays unverified.
+        """
+        probe = await settle(
+            self._operations.bridge_running(shell), bound_seconds=CLEANUP_FINALIZE_SECONDS
+        )
+        if probe.cancellation is not None:
+            raise probe.cancellation from None
+        return probe.error is None and probe.result is True
+
+    async def _async_start_bridge(self, shell: PanelShell) -> None:
+        """Best-effort, bounded start; its result is judged only by a re-probe."""
+        started = await settle(
+            self._operations.start_bridge(shell), bound_seconds=CLEANUP_FINALIZE_SECONDS
+        )
+        if started.cancellation is not None:
+            raise started.cancellation from None
+
+    async def _async_baseline_owned(self, transaction_id: UUID) -> bool:
+        if await self._journal.async_retained(transaction_id) is not None:
+            return True
+        current = await self._journal.async_load()
+        return current is not None and current.transaction_id == transaction_id
 
     @asynccontextmanager
     async def async_managed_update(
@@ -1060,27 +1368,30 @@ class PanelProvisioner:
         snapshot = await self._operations.capture_baseline(shell, snapshot)
         if snapshot.baseline is None:
             raise PanelProvisioningError("baseline_incomplete")
-        await self._operations.verify_baseline(shell, snapshot)
         transaction = uuid4()
-        request = replace(
-            request,
-            selected_components=self._staged_release_factory(
-                version, transaction, request.selected_components
-            ).selected_components,
-        )
-        record = ProvisioningRecord(
-            transaction,
-            ProvisioningOperation.UPDATE,
-            ProvisioningPhase.STAGED,
-            uuid4(),
-            request,
-            fleet,
-            version,
-            self._snapshot_to_stored(snapshot),
-            self._clock(),
-            None,
-        )
-        await self._journal.async_create(record)
+        async with self._unjournaled_baseline_guard(shell, snapshot, transaction) as guard:
+            await self._operations.verify_baseline(shell, snapshot)
+            await self._async_rehearse_incumbent(shell, snapshot, request.slug)
+            request = replace(
+                request,
+                selected_components=self._staged_release_factory(
+                    version, transaction, request.selected_components
+                ).selected_components,
+            )
+            record = ProvisioningRecord(
+                transaction,
+                ProvisioningOperation.UPDATE,
+                ProvisioningPhase.STAGED,
+                uuid4(),
+                request,
+                fleet,
+                version,
+                self._snapshot_to_stored(snapshot),
+                self._clock(),
+                None,
+            )
+            guard.create_attempted = True
+            await self._journal.async_create(record)
         record = await self._journal.async_transition(
             transaction, ProvisioningPhase.ACTIVATION_PENDING
         )
@@ -1106,7 +1417,7 @@ class PanelProvisioner:
                     version, transaction, request.selected_components
                 )
                 if shell.transport_lost():
-                    outcome = await _settle(
+                    outcome = await settle(
                         self._async_rollback_over_fresh_session(current, snapshot, staged, stopping)
                     )
                     # The rollback itself recorded any failure and kept the intent; a
@@ -1116,7 +1427,7 @@ class PanelProvisioner:
                     if isinstance(outcome.error, PanelProvisioningError):
                         raise PanelProvisioningError(outcome.error.code) from None
                 else:
-                    outcome = await _settle(
+                    outcome = await settle(
                         self._async_recovery_rollback(
                             current, shell, snapshot, staged, original_code="health_failed"
                         )
@@ -1144,7 +1455,7 @@ class PanelProvisioner:
         if existing is not None:
             state.failure_code = "recovery_failed"
             state.failure_stage = "recovery"
-            recovery = await _settle(self._async_recover_bounded(progress))
+            recovery = await settle(self._async_recover_bounded(progress))
             if recovery.cancellation is not None:
                 raise recovery.cancellation
             if recovery.error is not None:
@@ -1254,8 +1565,33 @@ class PanelProvisioner:
         state.snapshot = await self._operations.capture_baseline(state.shell, state.snapshot)
         if state.snapshot.baseline is None:
             raise PanelProvisioningError("snapshot_failed")
-        await self._operations.verify_baseline(state.shell, state.snapshot)
-        state.stored_snapshot = self._snapshot_to_stored(state.snapshot)
+        async with self._unjournaled_baseline_guard(
+            state.shell, state.snapshot, state.transaction_id
+        ) as guard:
+            await self._async_prepare_journal(
+                request, fleet, state, identity, bundle, state.snapshot, guard
+            )
+        return await self._async_install_journaled(
+            request, fleet, progress, state, identity, facts, bundle
+        )
+
+    async def _async_prepare_journal(
+        self,
+        request: PanelInstallRequest,
+        fleet: FleetConfig,
+        state: _InstallState,
+        identity: HostIdentity,
+        bundle: PanelReleaseBundle,
+        snapshot: PanelSnapshot,
+        guard: _BaselineGuard,
+    ) -> None:
+        """Verify the baseline and create the journal that owns it (install path)."""
+        assert state.shell is not None
+        assert state.transaction_id is not None
+        assert state.setup_id is not None
+        await self._operations.verify_baseline(state.shell, snapshot)
+        await self._async_rehearse_incumbent(state.shell, snapshot, request.slug)
+        state.stored_snapshot = self._snapshot_to_stored(snapshot)
         if not isinstance(state.stored_snapshot, StoredPanelSnapshot):
             raise PanelProvisioningError("snapshot_failed")
 
@@ -1303,7 +1639,8 @@ class PanelProvisioner:
             started_at=self._clock(),
             last_error=None,
         )
-        create_outcome = await _settle(self._journal.async_create(record))
+        guard.create_attempted = True
+        create_outcome = await settle(self._journal.async_create(record))
         if create_outcome.error is not None:
             if create_outcome.cancellation is not None:
                 raise create_outcome.cancellation from None
@@ -1312,6 +1649,20 @@ class PanelProvisioner:
         if create_outcome.cancellation is not None:
             raise create_outcome.cancellation from None
 
+    async def _async_install_journaled(
+        self,
+        request: PanelInstallRequest,
+        fleet: FleetConfig,
+        progress: ProgressReporter,
+        state: _InstallState,
+        identity: HostIdentity,
+        facts: PanelFacts,
+        bundle: PanelReleaseBundle,
+    ) -> ProvisionedPanel:
+        assert state.shell is not None
+        assert state.transaction_id is not None
+        assert state.setup_id is not None
+        assert state.staged is not None
         state.failure_code = "progress_failed"
         state.failure_stage = "progress"
         await _report(
@@ -1496,7 +1847,7 @@ class PanelProvisioner:
             return
 
         if state.journal_phase is ProvisioningPhase.STAGED:
-            await _settle(
+            await settle(
                 self._journal.async_record_error(
                     state.transaction_id,
                     StoredJournalError(
@@ -1542,7 +1893,7 @@ class PanelProvisioner:
         self,
         state: _InstallState,
         original_code: str,
-        compensation: _Settlement,
+        compensation: Settlement[None],
     ) -> None:
         if (
             compensation.error is None
@@ -1562,7 +1913,7 @@ class PanelProvisioner:
             if state.journal_phase is ProvisioningPhase.STAGED
             else "rollback_failed"
         )
-        await _settle(
+        await settle(
             self._repair_reporter.async_report_rollback_failure(
                 state.transaction_id,
                 original_code=original_code,
@@ -1598,7 +1949,7 @@ class PanelProvisioner:
                     ProvisioningPhase.PENDING_CONFIG_COMMIT,
                 )
 
-            outcome = await _settle(mark_pending())
+            outcome = await settle(mark_pending())
             if outcome.cancellation is not None:
                 raise outcome.cancellation from None
             if outcome.error is not None:
@@ -1622,7 +1973,7 @@ class PanelProvisioner:
                 )
                 await self._repair_reporter.async_clear_rollback_failure(transaction_id)
 
-            outcome = await _settle(complete_commit())
+            outcome = await settle(complete_commit())
             if outcome.cancellation is not None:
                 raise outcome.cancellation from None
             if outcome.error is not None:
@@ -1634,7 +1985,7 @@ class PanelProvisioner:
     ) -> None:
         """Settle the one durable transaction before accepting new work."""
         async with self._lock:
-            outcome = await _settle(self._async_recover_bounded(progress))
+            outcome = await settle(self._async_recover_bounded(progress))
             if outcome.cancellation is not None:
                 raise outcome.cancellation from None
             if outcome.error is not None:
@@ -1927,7 +2278,7 @@ class PanelProvisioner:
         """Best-effort durable typed error; never changes phase, baseline or journal."""
         if code not in PROVISIONING_ERROR_CODES:
             code = "recovery_failed"
-        await _settle(
+        await settle(
             self._journal.async_record_error(
                 record.transaction_id, StoredJournalError(stage="recovery", code=code)
             )
@@ -1996,7 +2347,7 @@ class PanelProvisioner:
                             current, _noop_progress, host=host, password=password
                         )
 
-            outcome = await _settle(recover())
+            outcome = await settle(recover())
             if outcome.cancellation is not None:
                 raise outcome.cancellation from None
             if isinstance(outcome.error, TimeoutError):
@@ -2081,7 +2432,7 @@ class PanelProvisioner:
             await self._journal.async_record_error(
                 current.transaction_id, StoredJournalError(stage="rollback", code=failure_code)
             )
-            await _settle(
+            await settle(
                 self._repair_reporter.async_report_rollback_failure(
                     current.transaction_id,
                     original_code=original_code,
@@ -2186,12 +2537,12 @@ class PanelProvisioner:
         """Keep the durable intent; record the typed failure and raise a Repair."""
         if code not in PROVISIONING_ERROR_CODES:
             code = "rollback_failed"
-        await _settle(
+        await settle(
             self._journal.async_record_error(
                 record.transaction_id, StoredJournalError(stage="recovery", code=code)
             )
         )
-        await _settle(
+        await settle(
             self._repair_reporter.async_report_rollback_failure(
                 record.transaction_id,
                 original_code="connection_lost",
@@ -2312,7 +2663,7 @@ class PanelProvisioner:
                 await shell.connect()
                 await self._async_assert_ownerless(expected)
                 marked = await self._journal.async_begin_ownerless_finalize(expected)
-                outcome = await _settle(self._async_finish_ownerless_finalize(shell, marked))
+                outcome = await settle(self._async_finish_ownerless_finalize(shell, marked))
                 if outcome.cancellation is not None:
                     raise outcome.cancellation from None
                 if outcome.error is not None:
@@ -2355,43 +2706,17 @@ class PanelProvisioner:
         return candidate
 
 
-async def _settle(operation: Awaitable[Any]) -> _Settlement:
-    """Settle cleanup despite caller cancellation and retain no raw detail."""
-    task = asyncio.ensure_future(operation)
-    owner = asyncio.current_task()
-    observed_cancellations = owner.cancelling() if owner is not None else 0
-    cancellation: asyncio.CancelledError | None = None
-    while not task.done():
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError as error:
-            current_cancellations = owner.cancelling() if owner is not None else 0
-            if current_cancellations > observed_cancellations:
-                cancellation = error
-                observed_cancellations = current_cancellations
-            if task.done():
-                break
-        except BaseException:
-            break
-    failure: BaseException | None = None
-    try:
-        task.result()
-    except BaseException as error:
-        failure = error
-    return _Settlement(error=failure, cancellation=cancellation)
-
-
 async def _settle_close(
-    operation: Callable[[], Awaitable[Any]] | None,
-) -> _Settlement:
+    operation: Callable[[], Awaitable[object]] | None,
+) -> Settlement[object]:
     if operation is None:
-        return _Settlement(error=None, cancellation=None)
+        return Settlement(error=None, cancellation=None)
     try:
-        return await _settle(operation())
+        return await settle(operation())
     except asyncio.CancelledError as error:
-        return _Settlement(error=None, cancellation=error)
+        return Settlement(error=None, cancellation=error)
     except BaseException as error:
-        return _Settlement(error=error, cancellation=None)
+        return Settlement(error=error, cancellation=None)
 
 
 def _required_primary_code(

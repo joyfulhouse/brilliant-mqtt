@@ -44,7 +44,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provisioning journal or retained baseline for the panel always takes
   precedence. ([#219](https://github.com/joyfulhouse/brilliant-mqtt/issues/219))
 
+- **Incumbent health rehearsal.** Before an add or update replaces an
+  installed agent, the integration now proves that the installed bridge can come
+  back healthy: after the rollback baseline is captured and verified, and before
+  anything is staged or journaled, it restarts the incumbent bridge ONCE under a
+  fresh deployment ID and waits up to the health timeout (90 s by default) for
+  MQTT health evidence carrying that ID. A bridge can stay `active` while it
+  cannot reach MQTT (for example bad credentials with in-process reconnect
+  backoff); such an incumbent used to pass the snapshot, and if the new release
+  then failed, its rollback health proof could never succeed and
+  `rollback_pending` blocked all fleet work. Such an incumbent is now refused
+  up front, its unjournaled baseline is removed, and nothing is installed. New
+  codes (each with its operator action in docs/canary-rollback.md):
+  `incumbent_unhealthy` (restarted and running, but no health proof: fix the
+  old bridge's MQTT credentials or broker, or uninstall then re-add),
+  `incumbent_unhealthy_unverified` (not verified running: check
+  `systemctl is-active brilliant-mqtt` and start it),
+  `incumbent_rehearsal_failed` (the env write or restart command failed, the
+  bridge was not restarted and is running: check panel storage/systemd and
+  retry), `incumbent_rehearsal_interrupted` (session lost, never reconnected:
+  systemd completes an issued restart on its own; check the bridge is up) and
+  `incumbent_health_unobservable` (Home Assistant's MQTT observer failed; the
+  bridge was not restarted; only its deployment-ID line may have changed). If
+  the proof fails and the restarted bridge is down, one bounded best-effort
+  `systemctl reset-failed; systemctl start` runs before the code is chosen, and
+  a bridge-state code is never replaced by `baseline_capture_interrupted`. Stale
+  `/etc/brilliant-mqtt.env.rollback-*.tmp` files (they hold broker credentials)
+  left by a lost session are swept before every env write. The restart is
+  one queued `systemctl restart
+  --no-block`, run by systemd itself, so a dropped SSH session cannot leave the
+  bridge stopped. Fresh installs (no agent on the panel) skip the rehearsal.
+  Costs: on a panel that already has the agent, every add or update now
+  restarts the incumbent bridge once (its entities are briefly unavailable) and
+  waits up to the health timeout. For fleet planning, budget one bridge
+  restart + ~27 s of snapshot sampling + up to 90 s of rehearsal per
+  install/update on an existing panel. A refused rehearsal leaves the
+  incumbent's env file with the rehearsal's deployment ID (its only change); a
+  later rollback restores the pre-rehearsal env bytes from the baseline.
+  Pre-release check: confirm once on the pilot panel that `systemctl restart
+  --no-block brilliant-mqtt` completes when the SSH session drops right after
+  it is issued.
+
 ### Fixed
+
+- A failed add or update no longer strands its rollback baseline. When anything
+  fails after the baseline is captured and verified but before the provisioning
+  journal exists (a failed verification, an unusable stored snapshot or staged
+  release, a journal write failure, or a cancellation), the integration now
+  removes that unjournaled `.rollback/<id>/` archive and its release pin itself,
+  bounded to 2 minutes and under the fleet lock, and reports the original
+  error. Previously the leftover baseline blocked the next release_link capture
+  and `brilliant_mqtt.uninstall` until it was removed by hand. A baseline that a
+  retained record or the active journal names is never removed (an unreadable
+  journal counts as an owner). If the session was lost, or the removal failed or
+  timed out, nothing reconnects and the error is `baseline_capture_interrupted`
+  (or `incumbent_rehearsal_interrupted` when the session dropped during the
+  incumbent health rehearsal); the manual steps in docs/canary-rollback.md now
+  apply only then.
 
 - A bridge that recovers its local bus but cannot record that success in the
   phase marker no longer leaves a stale failed-attempt record behind. If

@@ -37,6 +37,94 @@ publishes are needed for these operations.
    units, configuration and services, and refuse with
    `baseline_retained_finalize_first` when code would be needed.
 
+## Incumbent health rehearsal
+
+A rollback is only as good as the bridge it returns to. An installed bridge can
+stay `active` while it cannot reach MQTT (for example with bad broker
+credentials it keeps retrying in-process), so it passes the pre-change snapshot.
+If the new release then failed, the rollback's fresh-MQTT health proof could
+never succeed, and the journal would sit in `rollback_pending`, blocking all
+fleet work.
+
+So on a panel that already has the agent (fresh installs skip this), every add
+and update rehearses the rollback's last step first. After the baseline is
+captured and verified, under the fleet lock, and before anything is staged or
+journaled:
+
+1. Home Assistant subscribes to the panel's MQTT health topics.
+2. It generates a new deployment ID. It is kept only in memory and is never read
+   back from the panel.
+3. It atomically rewrites `/etc/brilliant-mqtt.env` with that ID while the
+   bridge keeps running (the bridge reads its environment only at start). Any
+   stale `/etc/brilliant-mqtt.env.rollback-<32 hex>.tmp` left by an earlier lost
+   session (it holds broker credentials) is removed first: regular files with
+   exactly that name only, never symlinks; every restore write does the same. It
+   issues ONE `systemctl restart --no-block brilliant-mqtt`. systemd (PID 1)
+   runs the queued restart itself, so a dropped SSH session cannot leave the
+   bridge stopped. If the restart command itself fails on a live session, a
+   best-effort `systemctl reset-failed brilliant-mqtt; systemctl start
+   brilliant-mqtt` follows.
+4. It waits up to the health timeout (90 s by default) for fresh availability,
+   metadata, state and discovery carrying the new ID. The wait ends early once
+   the SSH session is seen lost. Metadata with any other ID
+   is ignored, so the old process cannot satisfy the proof.
+
+On success the release admission is re-bound to the rotated deployment ID (the
+admission recorded the incumbent's identities, which include that shared ID),
+only when every other identity field is unchanged; anything else is refused
+with `release_identity_changed` (typed on both add and update; the baseline is
+removed and nothing is installed: inspect the panel and retry). The add or update then continues as before.
+
+The rehearsal changes only the deployment-correlation line of the live env file.
+The journaled snapshot and the baseline keep the pre-rehearsal bytes, so a later
+rollback restores them exactly (then re-correlates with its own new ID), and
+`verify_baseline` is unaffected.
+
+**Costs.** On a panel that already has the agent, each add or update restarts
+the incumbent bridge once (its entities are briefly unavailable) and waits up to
+the health timeout. With the two ~13.5 s service-state samples, budget one
+bridge restart + ~27 s of sampling + up to 90 s of rehearsal per add or update.
+
+Every refusal removes the unjournaled baseline (see
+[Interrupted baseline capture](#interrupted-baseline-capture)) and installs
+nothing:
+
+| Code | Meaning | Operator action |
+| --- | --- | --- |
+| `incumbent_unhealthy` | The bridge was restarted and is verified running, but no health evidence with the new ID arrived. | Fix the old bridge's MQTT connection: broker credentials in `/etc/brilliant-mqtt.env` or broker reachability (`journalctl -u brilliant-mqtt -n 50`). Also check Home Assistant's own MQTT integration: a broker drop on the Home Assistant side during the wait looks the same. Or uninstall, then re-add the panel. |
+| `incumbent_unhealthy_unverified` | The bridge's state could not be verified as running after the rehearsal (including after a best-effort restart of a restarted bridge that came up down). | Check `systemctl is-active brilliant-mqtt` on the panel and start it (`systemctl start brilliant-mqtt`) if it is down; then fix its MQTT connection and retry. If the baseline could not be removed this code is kept (it is not replaced by `baseline_capture_interrupted`), so also follow [Interrupted baseline capture](#interrupted-baseline-capture). |
+| `incumbent_rehearsal_failed` | Writing the env file or the restart command failed. The bridge was not restarted; only its deployment-ID line may have changed (the move may have landed). It is verified running. | Check panel storage (`df /etc /var`) and systemd, then retry. |
+| `incumbent_rehearsal_interrupted` | The SSH session was lost during the rehearsal. Nothing reconnects. | If the restart was already issued, systemd completes it on its own: check `systemctl is-active brilliant-mqtt` and start it if it's down. The baseline could not be removed; follow [Interrupted baseline capture](#interrupted-baseline-capture) before retrying. |
+| `incumbent_health_unobservable` | Home Assistant could not subscribe to (or open) the panel's MQTT health observation. The bridge was not restarted; only its deployment-ID line may have changed. | Check Home Assistant's MQTT integration and retry. |
+
+The two ways out of an unhealthy incumbent are the same as for
+`service_crash_looping`: **fix the old bridge** so it reaches MQTT again, then
+retry; or **uninstall the agent, then re-add the panel** (turn off both watchdog
+switches first; a panel without a Home Assistant entry uses the manual uninstall
+in [TROUBLESHOOTING.md](TROUBLESHOOTING.md#manual-agent-uninstall-panel-without-a-home-assistant-entry)).
+
+If the restarted bridge is not running when the proof fails, the integration
+makes one best-effort, bounded `systemctl reset-failed brilliant-mqtt; systemctl
+start brilliant-mqtt` and probes again; the second probe picks the code.
+
+Every probe, start and baseline removal is bounded to 2 minutes. A command that
+hangs past its bound is terminated and its SSH session is closed ("fenced"). A
+fenced session is closed but was not lost, so the integration does not report
+`incumbent_rehearsal_interrupted`: every later command on it fails, the bridge
+counts as not verified running (`incumbent_unhealthy_unverified`), and the
+baseline removal fails. A bridge-state code (`incumbent_unhealthy_unverified`,
+`incumbent_rehearsal_interrupted`) is then kept; any other refusal becomes
+`baseline_capture_interrupted`.
+
+Limitation: a health-wait failure cannot tell "the bridge never reconnected"
+from "Home Assistant's own MQTT connection dropped mid-wait"; both are reported
+as `incumbent_unhealthy`. Check Home Assistant's MQTT integration before
+blaming the panel.
+
+Pre-release check: confirm once on the pilot panel that `systemctl restart
+--no-block brilliant-mqtt` completes (the bridge comes back `active`) when the
+SSH session drops right after the command is issued.
+
 ## Roll back now
 
 1. Confirm the affected panel and baseline UUID from diagnostics. Keep its current
@@ -95,7 +183,7 @@ while obtaining redacted diagnostics and the HA repair/log code.
 | Code/state | Operator action |
 | --- | --- |
 | `baseline_capture_failed`, `baseline_verify_failed` | Candidate mutation is refused. Preserve the incumbent; investigate missing/drifting code, permissions, free space, or capture bounds before retrying. |
-| `baseline_capture_interrupted` | A rollback baseline that no HA journal owns may remain on the panel: an update lost its session during capture, or a failed capture could not remove its just-published baseline. Nothing is resumed and `canary_finalize` cannot settle it; while it remains, uninstall and repair/component code writes refuse with `baseline_retained_finalize_first`. Follow [Interrupted baseline capture](#interrupted-baseline-capture). |
+| `baseline_capture_interrupted` | A rollback baseline that no HA journal owns may remain on the panel: the session was lost during capture or before the journal existed, or the automatic removal of an unjournaled baseline failed, timed out, or could not prove that no record owns it. Nothing is resumed and `canary_finalize` cannot settle it; while it remains, uninstall and repair/component code writes refuse with `baseline_retained_finalize_first`. Follow [Interrupted baseline capture](#interrupted-baseline-capture). |
 | `transaction_in_progress` | Another operation holds the shared panel lock. Allow it to finish and retry. |
 | `provisioning_recovery_required` | Another panel's interrupted provisioning journal must be recovered first. Diagnostics name it (`provisioning.name`, `panel`, `phase`, `last_error`). Resolve that journal's own code below; for an onboarding that never created an HA panel, see [Interrupted onboarding without an HA panel owner](#interrupted-onboarding-without-an-ha-panel-owner). Operations stay serialized; nothing is skipped. |
 | `recovery_connection_failed` | Recovery could not reach the panel at the journal's recorded address. Bring the panel online. If its address or root password changed and it has no HA panel entry, settle it with Add Brilliant panel (below); otherwise repair the owning panel's address/credentials. |
@@ -212,13 +300,26 @@ state cannot be proven; preserve those records for investigation.
 ## Interrupted baseline capture
 
 `baseline_capture_interrupted` means a rollback baseline that no Home Assistant
-journal owns may remain on the panel. It arises in two ways:
+journal owns may remain on the panel.
 
-- an update lost its SSH session while the baseline was being captured, before
-  any journal existed (the capture may still have completed on the panel); or
-- a capture published its baseline, the re-check that follows failed (for
-  example `service_crash_looping`), and the automatic removal of that baseline
-  failed too.
+Normally there is nothing to do by hand. Whenever an add or update fails after
+its baseline was captured but before its journal exists (a failed verification,
+an unusable stored snapshot or staged release, a failed journal write, a
+refused incumbent health rehearsal, or a cancellation), the integration removes
+that baseline itself, bounded to 2 minutes, and reports the original failure.
+It never removes a baseline that a retained record or the active journal names,
+and it treats an unreadable journal as an owner.
+
+The manual steps below are only for when that automatic cleanup could not run.
+`baseline_capture_interrupted` arises when:
+
+- the SSH session was lost while the baseline was being captured or before the
+  journal existed (the capture may still have completed on the panel; the
+  integration never reconnects to clean up);
+- the automatic removal failed or timed out (a removal that hangs past 2 minutes
+  is terminated and its SSH session closed); or
+- the journal could not be read, so the integration could not prove that no
+  record owns the baseline.
 
 The baseline never authorised a change, but Home Assistant holds no record of
 it, so `canary_finalize` cannot settle it. While it remains,

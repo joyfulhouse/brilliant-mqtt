@@ -899,6 +899,71 @@ class StagedRelease:
         )
 
 
+# Bound for one settled cleanup that retires an unowned rollback baseline.
+CLEANUP_FINALIZE_SECONDS = 120.0
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class Settlement[T]:
+    """How one shielded operation settled; never retains raw remote detail itself.
+
+    ``error`` is the operation's own failure (a bound expiry is a TimeoutError);
+    ``cancellation`` is a cancellation of the awaiting owner, reported separately
+    so the caller can re-raise it after the operation has settled.
+    """
+
+    error: BaseException | None
+    cancellation: asyncio.CancelledError | None
+    result: T | None = None
+
+
+async def settle[T](
+    operation: Awaitable[T],
+    *,
+    bound_seconds: float | None = None,
+) -> Settlement[T]:
+    """Run *operation* to settlement despite owner cancellation.
+
+    An owner cancellation waits for the operation to settle and is then reported,
+    never swallowed; repeated owner cancellations report the latest. A
+    cancellation raised by the operation itself is its failure, not the owner's.
+    Past ``bound_seconds`` the operation is cancelled (for a remote panel command
+    that terminates the child and fences the shell, see ``_provisioning_run``)
+    and settles as failed.
+    """
+    task: asyncio.Future[T] = asyncio.ensure_future(
+        operation if bound_seconds is None else asyncio.wait_for(operation, bound_seconds)
+    )
+    owner = asyncio.current_task()
+    observed_cancellations = owner.cancelling() if owner is not None else 0
+    cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as error:
+            current_cancellations = owner.cancelling() if owner is not None else 0
+            if current_cancellations > observed_cancellations:
+                cancellation = error
+                observed_cancellations = current_cancellations
+            if task.done():
+                break
+        except BaseException:
+            break
+    try:
+        result = task.result()
+    except BaseException as error:
+        return Settlement(error=error, cancellation=cancellation)
+    return Settlement(error=None, cancellation=cancellation, result=result)
+
+
+def _settled_exit_ok(settlement: Settlement[RunResult]) -> bool:
+    return (
+        settlement.error is None
+        and settlement.result is not None
+        and settlement.result.exit_status == 0
+    )
+
+
 async def _provisioning_run(
     shell: PanelShell,
     command: str,
@@ -908,7 +973,7 @@ async def _provisioning_run(
     failed = False
     result: RunResult | None = None
     try:
-        if error_code.startswith(("baseline_", "rollback_")):
+        if error_code.startswith(("baseline_", "rollback_", "rehearsal_")):
             process = await shell.start(command)
             settlement = asyncio.create_task(process.wait())
             try:
@@ -1479,45 +1544,16 @@ async def capture_baseline(
         return captured
     # The published archive/pin never authorised a mutation, so retire it now
     # instead of leaving a stranded baseline that blocks this panel.
-    finalized, cancellation = await _settled_finalize(shell, captured)
+    finalized = await settle(
+        _baseline_action(shell, captured, "finalize"), bound_seconds=CLEANUP_FINALIZE_SECONDS
+    )
     if isinstance(failure, asyncio.CancelledError):
         raise failure
-    if cancellation is not None:
-        raise cancellation
-    if not finalized:
+    if finalized.cancellation is not None:
+        raise finalized.cancellation
+    if finalized.error is not None:
         raise PanelOpError("baseline_capture_interrupted") from None
     raise failure
-
-
-_BASELINE_FINALIZE_SECONDS = 120.0
-
-
-async def _settled_finalize(
-    shell: PanelShell, snapshot: PanelSnapshot
-) -> tuple[bool, asyncio.CancelledError | None]:
-    """Finalize a just-published baseline, shielded and bounded.
-
-    An outer cancellation waits for the finalize to settle and is returned, never
-    swallowed. Past the bound the finalize is cancelled, which terminates the
-    remote process and fences the shell (see ``_provisioning_run``).
-    """
-    task = asyncio.create_task(
-        asyncio.wait_for(
-            _baseline_action(shell, snapshot, "finalize"),
-            _BASELINE_FINALIZE_SECONDS,
-        )
-    )
-    cancellation: asyncio.CancelledError | None = None
-    while not task.done():
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError as error:
-            if not task.done():
-                cancellation = error
-        except Exception:
-            pass
-    finalized = not task.cancelled() and task.exception() is None
-    return finalized, cancellation
 
 
 async def _baseline_action(shell: PanelShell, snapshot: PanelSnapshot, action: str) -> None:
@@ -1566,6 +1602,28 @@ async def restart_restored(
     if re.fullmatch(r"[0-9a-f]{32}", deployment_id) is None:
         raise PanelOpError("baseline_invalid")
     await _provisioning_run(shell, _stop_service_command(SERVICE_NAME), "rollback_service_failed")
+    await _write_correlated_env(
+        shell, snapshot, deployment_id, error_code="rollback_restore_failed"
+    )
+    on_service_stopped()
+    await _provisioning_run(shell, f"systemctl start {SERVICE_NAME}", "rollback_service_failed")
+
+
+async def _write_correlated_env(
+    shell: PanelShell,
+    snapshot: PanelSnapshot,
+    deployment_id: str,
+    *,
+    error_code: str,
+) -> None:
+    """Atomically replace the live env with *snapshot*'s bytes and a new deployment id.
+
+    Every other byte and the mode come from the snapshot. The bridge reads its
+    environment only at start (``EnvironmentFile=``), so a running bridge is
+    unaffected until restarted. If the upload or the move fails, exactly this
+    write's temporary file is removed (settled, bounded) before the original
+    error is re-raised.
+    """
     content = snapshot.environment_file.content
     if content is None or not snapshot.bridge_service.active:
         raise PanelOpError("baseline_correlation_unsupported")
@@ -1580,11 +1638,146 @@ async def restart_restored(
     staged = StagedRelease(
         "recovery", transaction, f"{PANEL_RELEASES_DIR}/recovery--{transaction.hex}", ("bridge",)
     )
-    await _restore_file(
-        shell, PANEL_ENV_FILE, FileSnapshot(content, snapshot.environment_file.mode), staged
+    try:
+        await _restore_file(
+            shell,
+            PANEL_ENV_FILE,
+            FileSnapshot(content, snapshot.environment_file.mode),
+            staged,
+            error_code=error_code,
+        )
+    except (Exception, asyncio.CancelledError) as failure:
+        temporary = _rollback_temp_path(PANEL_ENV_FILE, staged)
+        cleanup = await settle(
+            _provisioning_run(shell, f"rm -f -- {temporary}", error_code),
+            bound_seconds=CLEANUP_FINALIZE_SECONDS,
+        )
+        if cleanup.cancellation is not None and not isinstance(failure, asyncio.CancelledError):
+            raise cleanup.cancellation from None
+        raise
+
+
+async def rehearse_restart(
+    shell: PanelShell,
+    snapshot: PanelSnapshot,
+    deployment_id: str,
+    *,
+    before_restart: Callable[[], None],
+) -> None:
+    """Restart the incumbent bridge once under a fresh deployment id (health rehearsal).
+
+    The env file is rewritten atomically while the bridge KEEPS RUNNING (it reads
+    env only at start), then *before_restart* opens the health boundary, then ONE
+    ``systemctl restart --no-block`` queues the restart: systemd (PID 1) runs the
+    job, so a dropped SSH session cannot leave the bridge stopped.
+
+    Fails with ``rehearsal_env_write_failed`` or ``rehearsal_boundary_failed``
+    (nothing restarted), or ``rehearsal_restart_failed`` (the command failed).
+    """
+    if re.fullmatch(r"[0-9a-f]{32}", deployment_id) is None or not callable(before_restart):
+        raise PanelOpError("rehearsal_invalid")
+    await _write_correlated_env(
+        shell, snapshot, deployment_id, error_code="rehearsal_env_write_failed"
     )
-    on_service_stopped()
-    await _provisioning_run(shell, f"systemctl start {SERVICE_NAME}", "rollback_service_failed")
+    try:
+        before_restart()
+    except Exception:
+        raise PanelOpError("rehearsal_boundary_failed") from None
+    await _provisioning_run(
+        shell, f"systemctl restart --no-block {SERVICE_NAME}", "rehearsal_restart_failed"
+    )
+
+
+async def start_bridge(shell: PanelShell) -> None:
+    """Best-effort start of a rehearsal bridge that is down (clears a failed state)."""
+    await _provisioning_run(
+        shell,
+        f"systemctl reset-failed {SERVICE_NAME}; systemctl start {SERVICE_NAME}",
+        "rehearsal_start_failed",
+    )
+
+
+async def bridge_running(shell: PanelShell) -> bool:
+    """Whether systemd reports the bridge active (``systemctl is-active --quiet``)."""
+    result = await _provisioning_run(
+        shell,
+        f"if systemctl is-active --quiet {SERVICE_NAME}; then echo active; else echo inactive; fi",
+        "rehearsal_probe_failed",
+    )
+    state = result.stdout.strip()
+    if state not in {"active", "inactive"}:
+        raise PanelOpError("rehearsal_probe_failed")
+    return state == "active"
+
+
+def rehearsal_rebinding(
+    recorded: Mapping[str, ReleaseIdentity | None],
+    observed: Mapping[str, ReleaseIdentity | None],
+    deployment_id: str,
+) -> dict[str, ReleaseIdentity | None] | None:
+    """The admitted incumbents after a healthy rehearsal, or None to refuse.
+
+    Accepts only a pure rotation of the shared deployment id: the same components
+    (an absent incumbent stays absent), each identical to its recorded identity
+    except ``deployment_id``; every recorded id equal to the bridge's recorded id
+    (or all unset); and every new id exactly the rehearsal's generated id.
+    """
+    bridge = recorded.get(COMPONENT_BRIDGE)
+    if bridge is None:
+        return None
+    recorded_ids = {identity.deployment_id for identity in recorded.values() if identity}
+    if recorded_ids != {bridge.deployment_id}:
+        return None
+    rebound: dict[str, ReleaseIdentity | None] = {}
+    for component, identity in recorded.items():
+        current = observed.get(component)
+        if identity is None or current is None:
+            if identity is not None or current is not None:
+                return None
+            rebound[component] = None
+            continue
+        if (
+            current.deployment_id != deployment_id
+            or replace(current, deployment_id=identity.deployment_id) != identity
+        ):
+            return None
+        rebound[component] = current
+    return rebound
+
+
+async def rebind_rehearsed_deployment(shell: PanelShell, deployment_id: str) -> None:
+    """Re-bind the active admission to the incumbent's rehearsal-rotated deployment id.
+
+    Release admission recorded the incumbent identities, which carry the env's
+    shared ``BRILLIANT_DEPLOYMENT_ID``; a healthy rehearsal rotated it, which
+    would otherwise fail every later write with ``release_identity_changed``.
+    Acts only inside the ACTIVE admission owned by this shell and task; with no
+    admission it is a no-op that reads nothing. Anything but an exact rotation
+    (see ``rehearsal_rebinding``) raises ``release_identity_changed``.
+    """
+    admission = _RELEASE_ADMISSION.get()
+    if admission is None:
+        return
+    if (
+        not admission.active
+        or admission.shell is not shell
+        or admission.owner is not asyncio.current_task()
+    ):
+        raise PanelOpError("release_transaction_mismatch")
+    if re.fullmatch(r"[0-9a-f]{32}", deployment_id) is None:
+        raise PanelOpError("release_identity_changed: inspect the current panel and retry")
+    observed = await _read_release_identities(shell)
+    rebound = rehearsal_rebinding(admission.incumbent, observed, deployment_id)
+    if rebound is None:
+        raise PanelOpError("release_identity_changed: inspect the current panel and retry")
+    bridge = admission.incumbent[COMPONENT_BRIDGE]
+    previous = bridge.deployment_id if bridge is not None else None
+    admission.incumbent.update(rebound)
+    _LOGGER.info(
+        "release admission re-bound to the rehearsed incumbent: deployment id %s -> %s",
+        previous or "unset",
+        deployment_id,
+    )
 
 
 def _staged_temp_path(staged: StagedRelease) -> str:
@@ -1743,35 +1936,6 @@ def _stage_promote_command(staged: StagedRelease) -> str:
     )
 
 
-async def _settled_cleanup_run(shell: PanelShell, command: str) -> bool:
-    """Run cleanup to settlement and report failure without losing cancellation."""
-    cleanup_task = asyncio.create_task(shell.run(command))
-    owner = asyncio.current_task()
-    observed_cancellations = owner.cancelling() if owner is not None else 0
-    cancellation: asyncio.CancelledError | None = None
-    while not cleanup_task.done():
-        try:
-            await asyncio.shield(cleanup_task)
-        except asyncio.CancelledError as error:
-            current_cancellations = owner.cancelling() if owner is not None else 0
-            if current_cancellations > observed_cancellations:
-                cancellation = error
-                observed_cancellations = current_cancellations
-            if cleanup_task.done():
-                break
-        except Exception:
-            break
-    succeeded = False
-    try:
-        succeeded = cleanup_task.result().exit_status == 0
-    except BaseException:
-        pass
-    command = "<redacted>"
-    if cancellation is not None:
-        raise cancellation from None
-    return succeeded
-
-
 async def stage_release(
     shell: PanelShell,
     local_payload_dir: str,
@@ -1904,11 +2068,10 @@ async def stage_release(
     mqtt_ca = None
     mqtt_ca_digest = None
     if failure is not None:
-        cleanup_succeeded = await _settled_cleanup_run(
-            shell,
-            _cleanup_staged_command(staged),
-        )
-        if not cleanup_succeeded:
+        cleanup = await settle(shell.run(_cleanup_staged_command(staged)))
+        if cleanup.cancellation is not None:
+            raise cleanup.cancellation from None
+        if not _settled_exit_ok(cleanup):
             if not isinstance(failure, Exception):
                 raise failure from None
             raise PanelOpError("staged_cleanup_failed")
@@ -2177,23 +2340,42 @@ def _rollback_temp_path(path: str, staged: StagedRelease) -> str:
     return f"{path}.rollback-{staged.transaction_id.hex}.tmp"
 
 
+def _stranded_env_sweep_command() -> str:
+    """Remove stale env temporaries a lost session left behind (they hold credentials).
+
+    Only regular files (never symlinks) whose name is exactly
+    ``brilliant-mqtt.env.rollback-<32 lowercase hex>.tmp`` beside the env file.
+    """
+    pattern = "brilliant-mqtt.env.rollback-" + "[0-9a-f]" * 32 + ".tmp"
+    return (
+        f"for f in {PANEL_ENV_FILE}.rollback-*.tmp; do "
+        f'case "${{f##*/}}" in {pattern}) '
+        'if [ -f "$f" ] && [ ! -L "$f" ]; then rm -f -- "$f" || exit 1; fi ;; '
+        "esac; done"
+    )
+
+
 async def _restore_file(
     shell: PanelShell,
     path: str,
     snapshot: FileSnapshot,
     staged: StagedRelease,
+    *,
+    error_code: str = "rollback_restore_failed",
 ) -> None:
     temporary = _rollback_temp_path(path, staged)
+    if path == PANEL_ENV_FILE:
+        await _provisioning_run(shell, _stranded_env_sweep_command(), error_code)
     await _provisioning_run(
         shell,
         f"rm -f -- {temporary}",
-        "rollback_restore_failed",
+        error_code,
     )
     if snapshot.content is None:
         await _provisioning_run(
             shell,
             f"rm -f -- {path}",
-            "rollback_restore_failed",
+            error_code,
         )
         return
     assert snapshot.mode is not None
@@ -2202,7 +2384,7 @@ async def _restore_file(
         snapshot.content,
         temporary,
         snapshot.mode,
-        "rollback_restore_failed",
+        error_code,
     )
     await _provisioning_run(
         shell,
@@ -2212,7 +2394,7 @@ async def _restore_file(
             f"{_PANEL_ATOMIC_MOVER} --force --no-target-directory -- "
             f"{temporary} {path}"
         ),
-        "rollback_restore_failed",
+        error_code,
     )
 
 
@@ -2374,11 +2556,10 @@ async def rollback_snapshot(
     except BaseException as error:
         failure = error
 
-    cleanup_succeeded = await _settled_cleanup_run(
-        shell,
-        _rollback_cleanup_command(staged),
-    )
-    if not cleanup_succeeded:
+    cleanup = await settle(shell.run(_rollback_cleanup_command(staged)))
+    if cleanup.cancellation is not None:
+        raise cleanup.cancellation from None
+    if not _settled_exit_ok(cleanup):
         if failure is not None and not isinstance(failure, Exception):
             raise failure from None
         raise PanelOpError("rollback_cleanup_failed")
