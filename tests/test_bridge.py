@@ -19,13 +19,20 @@ from pathlib import Path
 import pytest
 
 from brilliant_mqtt import __version__
-from brilliant_mqtt.bridge import Bridge, _state_payload
+from brilliant_mqtt.bridge import Bridge, _CommandSupersession, _state_payload
 from brilliant_mqtt.commands import VarSet
 from brilliant_mqtt.mapping import payload_fields
 from brilliant_mqtt.model import BrilliantDevice, DeviceKind, Variable
 from brilliant_mqtt.protocols import CommandSubscribeError
 from brilliant_mqtt.retained_topics import RetainedTopicLedger
-from brilliant_mqtt.write_admission import AdmissionTicket, WriteClass
+from brilliant_mqtt.write_admission import (
+    AdmissionTicket,
+    CommandAdmission,
+    TicketAdoptionError,
+    WriteCancelled,
+    WriteClass,
+    command_admission,
+)
 from tests.fakes import FakeBus, FakeClock, FakeMqtt, FakeSleeper
 
 PANEL = "office"
@@ -1679,6 +1686,35 @@ class _StallableBus(FakeBus):
         )
 
 
+class _StaleTicketBus(FakeBus):
+    """FakeBus rejecting adoption of one reused ticket (the #149 re-issue path)."""
+
+    def __init__(self, devices: list[BrilliantDevice], stale: AdmissionTicket) -> None:
+        super().__init__(devices)
+        self.stale = stale
+
+    async def set_variables(
+        self,
+        device_id: str,
+        peripheral_id: str,
+        sets: list[VarSet],
+        *,
+        write_class: WriteClass = WriteClass.INTERACTIVE_FIFO,
+        ticket: AdmissionTicket | None = None,
+    ) -> str:
+        if ticket is self.stale:
+            raise TicketAdoptionError("admission ticket does not match this write")
+        return await super().set_variables(
+            device_id, peripheral_id, sets, write_class=write_class, ticket=ticket
+        )
+
+
+async def _turns(count: int = 6) -> None:
+    """Let settle callbacks' tasks and their publishes run."""
+    for _ in range(count):
+        await asyncio.sleep(0)
+
+
 class _BlockingUnsubscribeMqtt(FakeMqtt):
     """FakeMqtt whose unsubscribe blocks — models withdraw's broker handoff."""
 
@@ -2216,14 +2252,14 @@ class TestMeshConfirmedWrites:
         await bridge.reconcile()
         await mqtt.inject(MESH_SET_TOPIC, json.dumps({"state": "OFF"}))
         await asyncio.sleep(0)
-        assert MESH_PID in bridge._mesh_confirm_tasks  # armed while pending
+        assert MESH_PID in bridge._mesh.confirm_tasks_view  # armed while pending
 
         clock.advance(75.0)
         await bus.emit(_mesh_dimmer_at("0"))
         clock.advance(5.0)
         await sleeper.release_all()  # the confirm completes
 
-        assert bridge._mesh_confirm_tasks == {}
+        assert bridge._mesh.confirm_tasks_view == {}
 
 
 class TestMeshWriteTimeout:
@@ -2273,11 +2309,34 @@ class TestMeshWriteTimeout:
         assert sleeper.requested == [80.0]
         await bridge.withdraw()
 
-    async def test_contradicting_observation_drops_the_pending(
+    async def test_pre_acceptance_contradiction_is_ignored(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
+        """#225 supersedes #72's one-poll contradiction for an UNRESOLVED RPC:
+        the mirror still carries the PRE-write value, so a differing
+        observation proves nothing until the native write settles."""
         bus, mqtt, bridge, _clock, sleeper = await self._timed_out_off(asyncio.TimeoutError())
         mqtt.published.clear()
+
+        with caplog.at_level(logging.WARNING, logger="brilliant_mqtt.bridge"):
+            await bus.emit(_mesh_dimmer_at("1"))  # the pre-write value
+
+        assert _mesh_states(mqtt) == []  # still pending: old state never published as truth
+        assert bridge._mesh.pending_view[MESH_PID].rpc_unresolved
+        assert not any("contradicted" in r.getMessage() for r in caplog.records)
+        assert sleeper.requested == [80.0]
+        await bridge.withdraw()
+
+    async def test_fast_native_timeout_is_contradicted_within_one_poll(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The panel lib's own "No response received!" (builtin TimeoutError)
+        has already SETTLED: the #72 contradict-within-one-poll rule applies."""
+        bus, mqtt, bridge, _clock, sleeper = await self._timed_out_off(
+            TimeoutError("No response received!")
+        )
+        mqtt.published.clear()
+        assert not bridge._mesh.pending_view[MESH_PID].rpc_unresolved
 
         with caplog.at_level(logging.WARNING, logger="brilliant_mqtt.bridge"):
             await bus.emit(_mesh_dimmer_at("1"))  # still ON: the OFF never actuated
@@ -2290,8 +2349,254 @@ class TestMeshWriteTimeout:
         await sleeper.release_all()  # the dropped timer must not fire
         assert len(_mesh_states(mqtt)) == 1
 
-    async def test_matching_observation_holds_null_until_confirm_window(self) -> None:
+    async def test_late_failure_publishes_failed_with_observed_state(self) -> None:
+        bus, mqtt, bridge, _clock, sleeper = await self._timed_out_off(asyncio.TimeoutError())
+        await bus.emit(_mesh_dimmer_at("1"))  # ignored while unresolved
+        mqtt.published.clear()
+
+        (ticket,) = bus.detached_tickets
+        ticket.mark_settled(RuntimeError("late rejection"))
+        await _turns()
+
+        assert [json.loads(p[1]) for p in _mesh_states(mqtt)] == [
+            _mesh_feedback_payload("ON", "failed")
+        ]
+        assert MESH_PID not in bridge._mesh.pending_view
+        assert bridge._mesh.confirm_tasks_view == {}
+        await sleeper.release_all()  # the dropped resolver must not fire
+        assert len(_mesh_states(mqtt)) == 1
+        await bridge.withdraw()
+
+    async def test_late_acceptance_rearms_then_is_contradicted(self) -> None:
+        bus, mqtt, bridge, _clock, sleeper = await self._timed_out_off(asyncio.TimeoutError())
+        mqtt.published.clear()
+        bridge._wall_clock = lambda: 1010.0
+
+        (ticket,) = bus.detached_tickets
+        ticket.mark_settled("'late ok'")
+        await _turns()
+
+        # A FULL fresh 80 s window from the acceptance (#46's revert tail).
+        assert [json.loads(p[1]) for p in _mesh_states(mqtt)] == [
+            _mesh_feedback_payload(None, "pending", {"on": "0"}, 1090.0)
+        ]
+        assert sleeper.requested == [80.0, 80.0]
+        record = bridge._mesh.pending_view[MESH_PID]
+        assert not record.rpc_unresolved
+        assert record.receipt == "'late ok'"
+        assert record.last_observed_at is None
+
+        mqtt.published.clear()
+        await bus.emit(_mesh_dimmer_at("1"))  # contradicts once accepted
+        assert [json.loads(p[1]) for p in _mesh_states(mqtt)] == [
+            _mesh_feedback_payload("ON", "contradicted")
+        ]
+        await sleeper.release_all()
+        assert len(_mesh_states(mqtt)) == 1
+
+    @pytest.mark.parametrize("revocation", ["withdraw", "supersede"])
+    async def test_rearm_publish_stays_cancellable(self, revocation: str) -> None:
+        """The settle task stays the registered handle through its re-arm
+        publish, so supersession or withdrawal cancels it mid-publish and no
+        orphaned resolver is started afterwards."""
+        bus = FakeBus([_mesh_dimmer_at("1")])
+        mqtt = _BlockingStatePublishMqtt()
+        bridge, _clock, sleeper = _mesh_bridge_parts(bus, mqtt)
+        await bridge.reconcile()
+        bus.set_variables_error = asyncio.TimeoutError()
+        await mqtt.inject(MESH_SET_TOPIC, json.dumps({"state": "OFF"}))
+        bus.set_variables_error = None
+        await asyncio.sleep(0)
+        bridge._wall_clock = lambda: 1010.0
+        mqtt.published.clear()
+        mqtt.block_next_state_publish = True
+
+        (ticket,) = bus.detached_tickets
+        ticket.mark_settled("'late ok'")
+        settle = bridge._mesh.confirm_tasks_view[MESH_PID]
+        await asyncio.wait_for(mqtt.publish_started.wait(), 1)
+        assert bridge._mesh.confirm_tasks_view[MESH_PID] is settle
+
+        if revocation == "withdraw":
+            await bridge.withdraw()
+        else:
+            await mqtt.inject(MESH_SET_TOPIC, json.dumps({"state": "ON"}))
+        mqtt.release_publish.set()
+        await _turns()
+
+        assert settle.cancelled()
+        assert sleeper.requested == [80.0] if revocation == "withdraw" else [80.0, 80.0]
+        # The re-armed OFF window never reached the wire.
+        assert not any(
+            json.loads(p[1]).get("mesh_requested") == {"on": "0"} for p in _mesh_states(mqtt)
+        )
+        if revocation == "supersede":
+            assert bridge._mesh.pending_view[MESH_PID].targets == {"on": "1"}
+        else:
+            assert bridge._mesh.confirm_tasks_view == {}
+        await bridge.withdraw()
+
+    async def test_late_acceptance_then_matching_value_confirms(self) -> None:
         bus, mqtt, bridge, clock, sleeper = await self._timed_out_off(asyncio.TimeoutError())
+        await bus.emit(_mesh_dimmer_at("0"))  # a pre-acceptance match does not count
+        (ticket,) = bus.detached_tickets
+        clock.advance(3.0)
+        ticket.mark_settled("'late ok'")
+        await _turns()
+        mqtt.published.clear()
+
+        clock.advance(75.0)
+        await bus.emit(_mesh_dimmer_at("0"))
+        assert _mesh_states(mqtt) == []
+        clock.advance(5.0)
+        await sleeper.release_all()
+
+        assert [json.loads(p[1]) for p in _mesh_states(mqtt)] == [_mesh_feedback_payload("OFF")]
+        assert bridge._mesh.pending_view == {}
+        assert bridge._mesh.confirm_tasks_view == {}
+
+    @pytest.mark.parametrize(
+        "outcome",
+        [
+            asyncio.TimeoutError(),
+            TimeoutError("No response received!"),
+            asyncio.CancelledError(),
+            WriteCancelled(),
+        ],
+        ids=["asyncio_timeout", "builtin_timeout", "cancelled", "write_cancelled"],
+    )
+    async def test_late_timeout_or_cancellation_resumes_contradiction(
+        self, outcome: BaseException
+    ) -> None:
+        bus, mqtt, bridge, _clock, sleeper = await self._timed_out_off(asyncio.TimeoutError())
+        mqtt.published.clear()
+        bridge._wall_clock = lambda: 1010.0
+        record = bridge._mesh.pending_view[MESH_PID]
+
+        (ticket,) = bus.detached_tickets
+        ticket.mark_settled(outcome)
+        await _turns()
+
+        # Nothing learned: no re-arm, the original deadline stands.
+        assert _mesh_states(mqtt) == []
+        assert sleeper.requested == [80.0]
+        assert bridge._mesh.pending_view[MESH_PID] is record
+        assert not record.rpc_unresolved
+        assert record.deadline == 1080.0
+
+        await bus.emit(_mesh_dimmer_at("1"))
+        assert [json.loads(p[1]) for p in _mesh_states(mqtt)] == [
+            _mesh_feedback_payload("ON", "contradicted")
+        ]
+        await bridge.withdraw()
+
+    @pytest.mark.parametrize("late", ["accepted", "failed"])
+    async def test_superseded_write_late_outcome_is_ignored(self, late: str) -> None:
+        bus, mqtt, bridge, _clock, sleeper = await self._timed_out_off(asyncio.TimeoutError())
+        (stale,) = bus.detached_tickets
+        await mqtt.inject(MESH_SET_TOPIC, json.dumps({"state": "ON"}))
+        await asyncio.sleep(0)
+        newest = bridge._mesh.pending_view[MESH_PID]
+        mqtt.published.clear()
+
+        stale.mark_settled("'late ok'" if late == "accepted" else RuntimeError("late"))
+        await _turns()
+
+        assert _mesh_states(mqtt) == []
+        assert bridge._mesh.pending_view[MESH_PID] is newest
+        assert newest.targets == {"on": "1"}
+        assert sleeper.requested == [80.0, 80.0]  # no third window
+        await bridge.withdraw()
+
+    @pytest.mark.parametrize("stale_first", [True, False], ids=["before", "after"])
+    async def test_abandoned_reused_ticket_never_settles_the_reissue(
+        self, stale_first: bool
+    ) -> None:
+        """#149 re-issue path: the reused ticket's adoption is rejected and the
+        newest value goes out on a FRESH ticket. Only that fresh ticket's
+        outcome may settle the pending, whenever the stale one lands."""
+        stale = AdmissionTicket()
+        bus = _StaleTicketBus([_mesh_dimmer_at("1")], stale)
+        mqtt = FakeMqtt()
+        bridge, _clock, sleeper = _mesh_bridge_parts(bus, mqtt)
+        await bridge.reconcile()
+        if stale_first:
+            stale.mark_settled("'stale ok'")
+        bus.set_variables_error = asyncio.TimeoutError()
+        generation = bridge._command_generation.setdefault(MESH_PID, 0)
+        token = command_admission.set(
+            CommandAdmission(
+                ticket=stale, try_supersede=_CommandSupersession(generation, lambda _p: False)
+            )
+        )
+        try:
+            await mqtt.inject(MESH_SET_TOPIC, json.dumps({"state": "OFF"}))
+        finally:
+            command_admission.reset(token)
+        bus.set_variables_error = None
+        if not stale_first:
+            stale.mark_settled("'stale ok'")
+        await _turns()
+
+        (fresh,) = bus.detached_tickets
+        assert fresh is not stale
+        record = bridge._mesh.pending_view[MESH_PID]
+        assert record.rpc_unresolved
+        assert sleeper.requested == [80.0]
+        mqtt.published.clear()
+        await bus.emit(_mesh_dimmer_at("1"))
+        assert _mesh_states(mqtt) == []  # still unresolved: ignored
+
+        fresh.mark_settled(RuntimeError("late rejection"))
+        await _turns()
+        assert [json.loads(p[1]) for p in _mesh_states(mqtt)] == [
+            _mesh_feedback_payload("ON", "failed")
+        ]
+        await bridge.withdraw()
+
+    async def test_unresolved_write_without_observations_closes_unconfirmed(self) -> None:
+        _bus, mqtt, bridge, clock, sleeper = await self._timed_out_off(asyncio.TimeoutError())
+        mqtt.published.clear()
+
+        clock.advance(80.0)
+        await sleeper.release_all()
+
+        assert [json.loads(p[1]) for p in _mesh_states(mqtt)] == [
+            _mesh_feedback_payload(None, "unconfirmed")
+        ]
+        assert bridge._mesh.confirm_tasks_view == {}
+        await bridge.withdraw()
+
+    async def test_settle_task_losing_ownership_clears_its_registry_entry(self) -> None:
+        bus, mqtt, bridge, _clock, _sleeper = await self._timed_out_off(asyncio.TimeoutError())
+        mqtt.published.clear()
+
+        (ticket,) = bus.detached_tickets
+        ticket.mark_settled("'late ok'")
+        assert MESH_PID in bridge._mesh.confirm_tasks_view  # the settle task
+        await bridge.shutdown_mesh_feedback()  # ownership lost before it runs
+        await _turns()
+
+        assert bridge._mesh.confirm_tasks_view == {}
+        assert mqtt.published == []
+
+    async def test_resolver_losing_ownership_releases_its_entry(self) -> None:
+        _bus, mqtt, bridge, clock, sleeper = await self._timed_out_off(asyncio.TimeoutError())
+        mqtt.published.clear()
+        assert MESH_PID in bridge._mesh.confirm_tasks_view
+
+        await bridge.shutdown_mesh_feedback()
+        clock.advance(80.0)
+        await sleeper.release_all()
+
+        assert bridge._mesh.confirm_tasks_view == {}
+        assert mqtt.published == []
+
+    async def test_matching_observation_holds_null_until_confirm_window(self) -> None:
+        """A settled (fast native) timeout confirms on a fresh match at expiry."""
+        bus, mqtt, bridge, clock, sleeper = await self._timed_out_off(
+            TimeoutError("No response received!")
+        )
         mqtt.published.clear()
 
         clock.advance(75.0)
@@ -2302,6 +2607,24 @@ class TestMeshWriteTimeout:
         await sleeper.release_all()
 
         assert [json.loads(p[1]) for p in _mesh_states(mqtt)] == [_mesh_feedback_payload("OFF")]
+
+    async def test_unresolved_match_cannot_confirm_at_expiry(self) -> None:
+        """While the RPC is unresolved a match is pre-acceptance evidence: it
+        does not refresh the observation clock, so the window ends
+        `unconfirmed` unless a late acceptance re-arms it."""
+        bus, mqtt, bridge, clock, sleeper = await self._timed_out_off(asyncio.TimeoutError())
+        mqtt.published.clear()
+
+        clock.advance(75.0)
+        await bus.emit(_mesh_dimmer_at("0"))
+        assert bridge._mesh.pending_view[MESH_PID].last_observed_at is None
+        clock.advance(5.0)
+        await sleeper.release_all()
+
+        assert [json.loads(p[1]) for p in _mesh_states(mqtt)] == [
+            _mesh_feedback_payload(None, "unconfirmed")
+        ]
+        await bridge.withdraw()
 
     async def test_aux_fields_stay_live_while_timed_out_write_pends(self) -> None:
         bus, mqtt, bridge, _clock, _sleeper = _mesh_bridge([_mesh_motion_dimmer_at("1")])

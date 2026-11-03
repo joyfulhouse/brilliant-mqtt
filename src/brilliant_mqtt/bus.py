@@ -35,6 +35,7 @@ from brilliant_mqtt.model import (
 )
 from brilliant_mqtt.write_admission import (
     AdmissionTicket,
+    SettleOutcome,
     Superseded,
     TicketAdoptionError,
     WriteCancelled,
@@ -1310,6 +1311,21 @@ class RpcBusAdapter:
         if self._write_serving.get(admission.device_id) is admission:
             del self._write_serving[admission.device_id]
         self._serve_next(admission.device_id)
+        # Report the native outcome for EVERY admitted write (#225): detached,
+        # cancelled, tombstoned and never-issued work included. Deliberately
+        # after the lane moved on and the result future settled, so a callback
+        # can neither stall the lane nor observe an unsettled result.
+        outcome: SettleOutcome
+        if task.cancelled():
+            outcome = WriteCancelled()
+        elif (task_error := task.exception()) is not None:
+            outcome = task_error
+        else:
+            outcome = task.result()
+        try:
+            admission.ticket.mark_settled(outcome)
+        except Exception as error:
+            logger.warning("WRITE_SETTLE_CALLBACK_FAILED %s", type(error).__name__)
 
     async def _run_write(self, obs: Any, admission: _WriteAdmission) -> str:
         """Keep native task ownership independent of waiter/ticket membership."""
