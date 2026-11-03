@@ -450,7 +450,7 @@ class Bridge:
             if sw_version is not None:
                 meta["panel_firmware"] = sw_version
             if self._diagnostics is not None:
-                meta["diag"] = self._diagnostics.snapshot()
+                meta["diag"] = self._diagnostics.meta()
             await self._async_publish_retained(
                 meta_topic(self._panel),
                 json.dumps(meta, sort_keys=True),

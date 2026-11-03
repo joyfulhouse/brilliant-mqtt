@@ -30,6 +30,9 @@ SessionRebuildReason = Literal[
     "mqtt_transport_overload",
     "other",
 ]
+# #113 outbox quarantine details: key, record kind, payload size and hash,
+# failure count and quarantine time. Never the payload contents.
+OutboxDetails = dict[str, int | str | None]
 Snapshot = dict[str, int | float | None | dict[str, int]]
 
 
@@ -66,6 +69,7 @@ class ResponseDiagnostics:
         self._rpc_s_count = 0
         self._queue_wait_recent: deque[float] = deque(maxlen=64)
         self._rpc_recent: deque[float] = deque(maxlen=64)
+        self._outbox: OutboxDetails | None = None
 
     def note_superseded(self) -> None:
         self._superseded += 1
@@ -96,6 +100,10 @@ class ResponseDiagnostics:
     def note_hard_cap(self) -> None:
         self._hard_cap_total += 1
 
+    def note_outbox(self, details: OutboxDetails | None) -> None:
+        """Replace the current outbox quarantine details (None clears them)."""
+        self._outbox = None if details is None else dict(details)
+
     def snapshot(self) -> Snapshot:
         """Copy every mutable container before a publisher can yield the loop."""
         rebuilds: dict[str, int] = {
@@ -118,3 +126,14 @@ class ResponseDiagnostics:
             "queue_wait_s_recent_max": max(self._queue_wait_recent, default=None),
             "rpc_s_recent_max": max(self._rpc_recent, default=None),
         }
+
+    def meta(self) -> dict[str, object]:
+        """Return the bridge-meta ``diag`` object: the snapshot plus #113 details.
+
+        ``outbox`` is present only while the scene outbox has quarantine
+        evidence to report, so the ordinary diag shape is unchanged.
+        """
+        diag: dict[str, object] = dict(self.snapshot())
+        if self._outbox is not None:
+            diag["outbox"] = dict(self._outbox)
+        return diag

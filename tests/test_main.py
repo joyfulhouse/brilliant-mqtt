@@ -625,6 +625,8 @@ class _SessionHarness:
         self.scene_watermark_path: object | None = None
         self.scene_clock_ms: Callable[[], int] | None = None
         self.scene_want_device: Callable[[str], bool] | None = None
+        self.scene_session_signals: object = None
+        self.scene_diagnostics: object = None
 
         harness = self
 
@@ -689,8 +691,13 @@ class _SessionHarness:
                 watermark_path: str | Path,
                 clock_ms: Callable[[], int],
                 want_device: Callable[[str], bool] | None = None,
+                *,
+                session_signals: object = None,
+                diagnostics: object = None,
             ) -> None:
                 harness.events.append("scene_bridge_construct")
+                harness.scene_session_signals = session_signals
+                harness.scene_diagnostics = diagnostics
                 harness.scene_instances.append(self)
                 harness.scene_bus = bus
                 harness.scene_mqtt = mqtt
@@ -1867,6 +1874,8 @@ class TestSceneBridgeSessionWiring:
         assert harness.scene_want_device is not None
         assert harness.scene_want_device("ble_mesh") is False
         assert harness.scene_want_device("device_001") is True
+        # #113: poison-frame attribution reads this session's MQTT signals.
+        assert harness.scene_session_signals is harness.mqtt
 
         order = harness.events.index
         assert order("panel_bridge_construct") < order("mqtt_connect")

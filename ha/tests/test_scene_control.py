@@ -890,6 +890,48 @@ async def test_future_status_timestamps_cannot_poison_ordering(
 
 
 @pytest.mark.allow_lingering_timers
+@pytest.mark.parametrize("reason", ["outbox_quarantine", "outbox_blocked"])
+async def test_outbox_status_reasons_mark_transport_unavailable(
+    hass: HomeAssistant, mqtt_mock: MqttMockHAClient, reason: str
+) -> None:
+    # #113: the agent reports a halted (quarantined) or blocked outbox in the
+    # existing status format; the reason string is accepted as-is.
+    now_ms = 1_700_000_000_000
+    runtime = SceneControl(hass)
+    with patch.object(scene_control_module, "_timestamp_ms", return_value=now_ms):
+        await runtime.async_start({"office"}, default_panel="office", actions={})
+        for transport in ("scene", "mode"):
+            async_fire_mqtt_message(
+                hass,
+                f"brilliant/ha-control/v1/status/{transport}/office",
+                encode_json(
+                    {
+                        "schema_version": SCHEMA_VERSION,
+                        "mapping_version": MAPPING_VERSION,
+                        "transport": transport,
+                        "panel": "office",
+                        "available": False,
+                        "reason": reason,
+                        "timestamp_ms": now_ms - 1,
+                    }
+                ),
+                retain=True,
+            )
+        await hass.async_block_till_done()
+        assert runtime.transport_status("scene", "office") is False
+        assert runtime.transport_status("mode", "office") is False
+
+        async_fire_mqtt_message(
+            hass,
+            "brilliant/ha-control/v1/status/scene/office",
+            _scene_status(now_ms),
+        )
+        await hass.async_block_till_done()
+        assert runtime.transport_status("scene", "office") is True
+        await runtime.async_stop()
+
+
+@pytest.mark.allow_lingering_timers
 async def test_future_event_timestamps_cannot_poison_ordering_or_deduplication(
     hass: HomeAssistant, mqtt_mock: MqttMockHAClient
 ) -> None:

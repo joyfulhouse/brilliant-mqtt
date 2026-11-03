@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- One scene or mode outbox frame that the broker always disconnects on (for
+  example, one over an operator `max_packet_size`) no longer wedges the outbox
+  and tears the MQTT session down every few seconds. A disconnect counts
+  against the in-flight record only if it comes within 2 seconds of sending it,
+  in a session where an earlier QoS-1 publish was acknowledged. After 3 such
+  disconnects in different sessions spanning at least a minute, the record is
+  quarantined. The outbox then halts: the record is no longer sent and nothing
+  is sent past it, so the panel stays online. The evidence is persisted in a
+  sidecar next to the outbox state file, which older agents ignore, and a
+  successful delivery clears it. Scene and mode status report
+  `outbox_quarantine`, or the transient `outbox_blocked` when a drop could not
+  be attributed. Either way scene and mode entities are unavailable and Home
+  Assistant refuses scene and mode commands, while device state, discovery and
+  device commands keep working.
+  The bridge meta `diag.outbox` object names the record by key, kind, size and
+  SHA-256, never by contents. With the agent stopped, run
+  `python3 -m brilliant_mqtt.outbox_admin` on the panel to list, release or
+  discard the record. Release and discard require the payload hash and are
+  written to an audit log first. The deployed broker defaults cannot produce
+  this wedge. See
+  [the #113 contract](docs/issue-113-outbox-quarantine-contract.md).
+  ([#113](https://github.com/joyfulhouse/brilliant-mqtt/issues/113))
+
 ## [0.11.4] - 2026-10-26
 
 This is a Home Assistant integration release only. The bundled on-panel agent
