@@ -1204,9 +1204,9 @@ class PanelProvisioner:
                 # Typed on both routes; the caller's guard still retires the baseline.
                 # Only a real identity change is reported as one: a failed read keeps
                 # its own code, and any other refusal stays as the original error.
-                code = str(error).partition(":")[0]
-                if code in {"release_identity_changed", "release_identity_read_failed"}:
-                    raise PanelProvisioningError(code) from None
+                rebind_code = str(error).partition(":")[0]
+                if rebind_code in {"release_identity_changed", "release_identity_read_failed"}:
+                    raise PanelProvisioningError(rebind_code) from None
                 raise
             return
         running = False
