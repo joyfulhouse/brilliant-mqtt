@@ -104,7 +104,7 @@ def denied(*args, **kwargs):
     raise PermissionError("read-only phase directory")
 real_open = builtins.open
 def denied_update(file, mode="r", *args, **kwargs):
-    if str(file) == path and mode == "r+":
+    if str(file) == path and mode == "r+b":
         raise PermissionError("read-only phase marker")
     return real_open(file, mode, *args, **kwargs)
 def write_phase(path, phase, *, bus_read_succeeded=False):
@@ -591,9 +591,10 @@ def test_first_unleased_observation_does_not_prove_a_lease_release(
 
 
 @_requires_linux_proc
+@pytest.mark.parametrize("truncate_refused", [False, True])
 @pytest.mark.parametrize("recovered", [False, True])
 def test_readonly_writer_release_sample_distinguishes_recovery_from_crashloop(
-    tmp_path: Path, recovered: bool
+    tmp_path: Path, recovered: bool, truncate_refused: bool
 ) -> None:
     phase = tmp_path / "bus-phase"
     observer = health_mod.BusFailureObserver()
@@ -602,6 +603,7 @@ import sys
 from brilliant_mqtt import heartbeat
 path = sys.argv[1]
 recovered = sys.argv[2] == "True"
+truncate_refused = sys.argv[3] == "True"
 for now in range(100, 1901, 300):
     assert heartbeat.write_phase(path, "bus", monotonic_clock=lambda: float(now))
 print("leased", flush=True)
@@ -611,6 +613,8 @@ def readonly(*args, **kwargs):
 heartbeat._atomic_write = readonly
 heartbeat._rewrite_phase_lease = lambda path, text: False
 heartbeat.os.unlink = readonly
+if truncate_refused:
+    heartbeat.os.ftruncate = readonly
 assert not heartbeat.write_phase(
     path, "bus", bus_read_succeeded=recovered, monotonic_clock=lambda: 1901.0
 )
@@ -618,7 +622,7 @@ print("failed-write", flush=True)
 input()
 """
     with subprocess.Popen(
-        [sys.executable, "-c", writer, str(phase), str(recovered)],
+        [sys.executable, "-c", writer, str(phase), str(recovered), str(truncate_refused)],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         text=True,
@@ -632,7 +636,10 @@ input()
             process.stdin.write("recover\n")
             process.stdin.flush()
             assert process.stdout.readline().strip() == "failed-write"
-            assert phase.read_bytes() == original
+            # A recovered writer revokes through its lease descriptor unless the
+            # kernel refuses ftruncate on that inode.
+            revoked = recovered and not truncate_refused
+            assert phase.read_bytes() == (b"" if revoked else original)
             age = bus_failure_age(str(phase), now=1901.0, observer=observer)
             assert age == (None if recovered else 1801.0)
             process.stdin.write("exit\n")
@@ -650,11 +657,11 @@ input()
                 )
                 is not recovered
             )
-            # A restarted observer has lost independent revocation evidence.
-            assert (
-                bus_failure_age(str(phase), now=1902.0, observer=health_mod.BusFailureObserver())
-                == 1802.0
-            )
+            # A restarted observer has lost in-memory revocation evidence; only
+            # an emptied marker still rejects the recovered writer's attempt.
+            assert bus_failure_age(
+                str(phase), now=1902.0, observer=health_mod.BusFailureObserver()
+            ) == (None if revoked else 1802.0)
         finally:
             if process.poll() is None:
                 process.kill()
@@ -753,3 +760,56 @@ def test_exiting_writer_generation_is_not_live_release_evidence(
         raising=False,
     )
     assert process_generation(os.getpid()) is None
+
+
+def _report_marker_storage_read_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    real_statvfs = os.statvfs
+
+    def _read_only_statvfs(path: str) -> os.statvfs_result:
+        fields = list(real_statvfs(path))
+        fields[8] |= os.ST_RDONLY
+        return os.statvfs_result(fields)
+
+    monkeypatch.setattr("brilliant_bus_watchdog.health.os.statvfs", _read_only_statvfs)
+
+
+@_requires_linux_proc
+def test_dead_writer_attempt_on_read_only_marker_storage_is_not_evidence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    phase = tmp_path / "bus-phase"
+    _write_phase_in_short_lived_process(phase, "bus", 100.0)
+    assert bus_failure_age(str(phase), now=150.0) == 50.0
+    assert bus_failure_age(str(phase), now=150.0, observer=health_mod.BusFailureObserver()) == 50.0
+
+    _report_marker_storage_read_only(monkeypatch)
+
+    assert bus_failure_age(str(phase), now=150.0) is None
+    assert bus_failure_age(str(phase), now=150.0, observer=health_mod.BusFailureObserver()) is None
+
+
+@_requires_linux_proc
+def test_unknown_marker_storage_writability_rejects_dead_writer_evidence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    phase = tmp_path / "bus-phase"
+    _write_phase_in_short_lived_process(phase, "bus", 100.0)
+    assert bus_failure_age(str(phase), now=150.0) == 50.0
+
+    def _failing_statvfs(path: str) -> os.statvfs_result:
+        raise OSError(5, "Input/output error", path)
+
+    monkeypatch.setattr("brilliant_bus_watchdog.health.os.statvfs", _failing_statvfs)
+
+    assert bus_failure_age(str(phase), now=150.0) is None
+
+
+def test_live_leased_writer_on_read_only_marker_storage_still_counts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    phase = tmp_path / "bus-phase"
+    write_phase(str(phase), "bus", monotonic_clock=lambda: 100.0)
+    _report_marker_storage_read_only(monkeypatch)
+
+    assert bus_failure_age(str(phase), now=150.0) == 50.0
+    assert bus_failure_age(str(phase), now=150.0, observer=health_mod.BusFailureObserver()) == 50.0

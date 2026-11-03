@@ -43,6 +43,20 @@ def _read_phase_record_and_lease(
         return None, False, None
 
 
+def _marker_storage_writable(path: str) -> bool:
+    """Whether the filesystem holding *path* currently accepts writes.
+
+    A writer on read-only marker storage cannot record a recovered bus, so its
+    stale attempt is not dead-writer evidence. False also covers "unknown"
+    (``statvfs`` failed): that is a deliberate fail-safe toward no reboot.
+    """
+    try:
+        flags = os.statvfs(path).f_flag
+    except OSError:
+        return False
+    return not flags & os.ST_RDONLY
+
+
 def bus_failure_age(
     path: str,
     *,
@@ -93,6 +107,9 @@ def bus_failure_age(
         leased
         or record.bus_read_succeeded
         or sampled_at > record.bus_updated_at + DEAD_WRITER_RETENTION_S
+        # Last on purpose: it only adds rejections, and statvfs runs only
+        # after the marker was opened and parsed.
+        or not _marker_storage_writable(path)
     ):
         return None
     return sampled_at - record.failure_started_at

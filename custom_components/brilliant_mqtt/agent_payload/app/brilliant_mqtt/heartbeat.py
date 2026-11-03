@@ -8,13 +8,14 @@ far longer. tmpfs remains the default, so there is no flash wear.
 from __future__ import annotations
 
 import fcntl
+import io
 import logging
 import math
 import os
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from typing import Literal, TextIO
+from typing import Literal
 
 logger = logging.getLogger(__name__)
 
@@ -131,7 +132,10 @@ class PhaseRecord:
 
 @dataclass(slots=True)
 class _PhaseLease:
-    stream: TextIO
+    # Unbuffered binary on purpose: with no userspace buffer, no stale bytes
+    # can be flushed into the inode after a revocation truncate (or by a later
+    # close). A buffered stream was shown to rewrite the stale attempt.
+    stream: io.FileIO
     last_success_write: float | None
 
 
@@ -184,14 +188,53 @@ def read_phase_record(path: str) -> PhaseRecord | None:
         return None
 
 
-def _release_phase_lease(path: str) -> None:
+def _truncate_phase_marker(path: str, fd: int) -> bool:
+    """Empty the leased marker inode through its descriptor.
+
+    Called while the exclusive lease is still held, so the watchdog never
+    sees the stale attempt unleased. A refusal keeps the old best-effort
+    behaviour: the lease is still released with the stale bytes in place.
+    """
+    try:
+        os.ftruncate(fd, 0)
+    except OSError as error:
+        logger.warning(
+            "bus phase marker revocation refused for %s: %s; stale marker remains "
+            "but its live-writer lease is released",
+            path,
+            error,
+        )
+        return False
+    return True
+
+
+def _release_phase_lease(path: str, *, revoke: bool = False) -> None:
+    """Drop the marker lease; with *revoke*, empty the leased inode first.
+
+    Revocation only runs on leave-attribution paths (a successful read or a
+    ``pre_bus`` transition) once path-based writes (atomic replace, in-place
+    rewrite, unlink) failed or, when rate limited after such a failure, were
+    not retried. A failed bus attempt never revokes: its marker is genuine
+    #133 crash-loop evidence.
+    """
     lease = _phase_leases.pop(path, None)
-    if lease is not None:
+    if lease is None:
+        return
+    if revoke:
+        try:
+            fd = lease.stream.fileno()
+        except ValueError:
+            logger.debug("bus phase lease for %s already closed; nothing to revoke", path)
+        else:
+            _truncate_phase_marker(path, fd)
+    try:
         lease.stream.close()
+    except OSError:
+        logger.debug("closing bus phase lease for %s failed", path, exc_info=True)
 
 
 def _acquire_phase_lease(path: str, last_success_write: float | None) -> None:
-    stream = open(path, "r+", encoding="utf-8")
+    stream = open(path, "r+b", buffering=0)
     try:
         for attempt in range(_PHASE_LEASE_ATTEMPTS):
             try:
@@ -213,10 +256,20 @@ def _rewrite_phase_lease(path: str, text: str) -> bool:
     if lease is None:
         return False
     try:
-        lease.stream.seek(0)
-        lease.stream.write(text)
-        lease.stream.truncate()
-        lease.stream.flush()
+        # Encode before any I/O: an unencodable record must change nothing.
+        remaining = memoryview(text.encode("utf-8"))
+        stream = lease.stream
+        stream.seek(0)
+        # If a short write is followed by an error, the retained failed-attempt
+        # path can be left with a mixed new-prefix/old-tail record. Such a
+        # record almost never parses, and leave-attribution paths truncate it
+        # afterwards through the lease descriptor.
+        while remaining:
+            written = stream.write(remaining)
+            if not written:
+                return False
+            remaining = remaining[written:]
+        stream.truncate()
     except (OSError, UnicodeError, ValueError):
         return False
     return True
@@ -256,7 +309,8 @@ def _invalidate_failed_write(
     write_error: BaseException,
     *,
     repeated: bool = False,
-) -> None:
+) -> bool:
+    """Unlink the marker after a failed write; False when it may still remain."""
     warning_level = logging.DEBUG if repeated else logging.WARNING
     error_level = logging.DEBUG if repeated else logging.ERROR
     try:
@@ -272,11 +326,12 @@ def _invalidate_failed_write(
         logger.log(
             error_level,
             "bus phase write failed for %s and marker invalidation failed: %s; "
-            "stale marker remains but its live-writer lease was released",
+            "stale marker remains unless a held lease revokes it",
             path,
             invalidation_error,
             exc_info=(type(write_error), write_error, write_error.__traceback__),
         )
+        return False
     else:
         logger.log(
             warning_level,
@@ -284,6 +339,7 @@ def _invalidate_failed_write(
             path,
             exc_info=(type(write_error), write_error, write_error.__traceback__),
         )
+    return True
 
 
 def _atomic_write(path: str, text: str) -> None:
@@ -360,13 +416,19 @@ def write_phase(
         _last_attempt.pop(path, None)
     last_failed_attempt = _last_attempt.get(path)
     repeated_failure = last_failed_attempt is not None
+    # Successful reads and pre_bus transitions leave bus attribution; only
+    # they may revoke a stale marker. A failed bus attempt never truncates.
+    leaving = phase == "pre_bus" or bus_read_succeeded
     if (
         phase == "bus"
         and bus_read_succeeded
         and last_failed_attempt is not None
         and now - last_failed_attempt < _MIN_WRITE_INTERVAL_S
     ):
-        _release_phase_lease(path)
+        # Rate limited: this call attempts no write. Marker writes already
+        # failed within the interval, so revoke the retained attempt lease's
+        # stale record through its descriptor instead of retrying the path.
+        _release_phase_lease(path, revoke=True)
         _owned_phase_records.pop(path, None)
         return False
     if (
@@ -450,9 +512,9 @@ def write_phase(
                 _last_attempt[path] = now
                 logger.warning("bus attempt marker write failed for %s; prior lease retained", path)
                 return False
-            _release_phase_lease(path)
             _last_attempt[path] = now
-            _invalidate_failed_write(path, write_error, repeated=repeated_failure)
+            invalidated = _invalidate_failed_write(path, write_error, repeated=repeated_failure)
+            _release_phase_lease(path, revoke=leaving and not invalidated)
             return False
         _owned_phase_records[path] = written_record
         _release_phase_lease(path)
@@ -476,7 +538,9 @@ def write_phase(
         _last_attempt.pop(path, None)
         return True
     except BlockingIOError:
-        _release_phase_lease(path)
+        # Defensive and effectively unreachable: every BlockingIOError source
+        # inside the try is already handled further in.
+        _release_phase_lease(path, revoke=leaving)
         return False
     except (OSError, UnicodeError) as error:
         _owned_phase_records.pop(path, None)
@@ -484,7 +548,7 @@ def write_phase(
             _last_attempt[path] = now
             logger.warning("bus attempt marker unavailable for %s; prior lease retained", path)
             return False
-        _release_phase_lease(path)
         _last_attempt[path] = now
-        _invalidate_failed_write(path, error, repeated=repeated_failure)
+        invalidated = _invalidate_failed_write(path, error, repeated=repeated_failure)
+        _release_phase_lease(path, revoke=leaving and not invalidated)
         return False
