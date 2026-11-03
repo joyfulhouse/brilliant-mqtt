@@ -642,9 +642,10 @@ async def test_live_admission_failure_is_not_retried(
     assert spies.baselines == 0
     error = (raised.value.translation_placeholders or {})["error"]
     assert error.startswith("agent update failed during deployment")
+    # A failed identity read keeps its own allowlisted code, not "admission_failed".
     assert manager.update_last_error == {
         "stage": "admission",
-        "code": "admission_failed",
+        "code": "release_identity_read_failed",
         "attempts": 1,
     }
 

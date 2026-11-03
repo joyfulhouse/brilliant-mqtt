@@ -3493,7 +3493,7 @@ async def test_stage_release_repeated_cancellation_settles_cleanup_task() -> Non
     assert shell.cleanup_finished.is_set()
 
 
-async def test_settled_cleanup_preserves_same_turn_cancellation() -> None:
+async def test_settle_reports_same_turn_owner_cancellation_after_settling() -> None:
     loop = asyncio.get_running_loop()
     completion: asyncio.Future[RunResult] = loop.create_future()
 
@@ -3504,19 +3504,21 @@ async def test_settled_cleanup_preserves_same_turn_cancellation() -> None:
             return await completion
 
     shell = await _connected(SameTurnCleanupShell())
-    task = asyncio.create_task(panel_ops._settled_cleanup_run(shell, "cleanup"))
+    task = asyncio.create_task(panel_ops.settle(shell.run("cleanup")))
     await asyncio.sleep(0)
     await asyncio.sleep(0)
 
     loop.call_soon(completion.set_result, RunResult(0, "", ""))
     loop.call_soon(task.cancel, "same-turn-cancellation")
 
-    with pytest.raises(asyncio.CancelledError) as raised:
-        await task
-    assert raised.value.args == ("same-turn-cancellation",)
+    outcome = await task
+    assert outcome.cancellation is not None
+    assert outcome.cancellation.args == ("same-turn-cancellation",)
+    assert outcome.error is None
+    assert outcome.result == RunResult(0, "", "")
 
 
-async def test_settled_cleanup_treats_child_cancellation_as_cleanup_failure() -> None:
+async def test_settle_classifies_operation_cancellation_as_its_failure() -> None:
     class InternallyCancelledCleanupShell(FakeShell):
         async def run(self, command: str) -> RunResult:
             self._require_connected()
@@ -3525,10 +3527,18 @@ async def test_settled_cleanup_treats_child_cancellation_as_cleanup_failure() ->
 
     shell = await _connected(InternallyCancelledCleanupShell())
 
-    assert await panel_ops._settled_cleanup_run(shell, "cleanup") is False
+    outcome = await panel_ops.settle(shell.run("cleanup"))
+
+    assert isinstance(outcome.error, asyncio.CancelledError)
+    assert outcome.error.args == ("child-cancelled",)
+    assert outcome.cancellation is None
+    assert outcome.result is None
+    owner = asyncio.current_task()
+    assert owner is not None
+    assert owner.cancelling() == 0
 
 
-async def test_settled_cleanup_preserves_latest_repeated_caller_cancellation() -> None:
+async def test_settle_reports_latest_repeated_owner_cancellation() -> None:
     cleanup_started = asyncio.Event()
     cleanup_release = asyncio.Event()
 
@@ -3541,18 +3551,96 @@ async def test_settled_cleanup_preserves_latest_repeated_caller_cancellation() -
             return RunResult(0, "", "")
 
     shell = await _connected(BlockingCleanupShell())
-    task = asyncio.create_task(panel_ops._settled_cleanup_run(shell, "cleanup"))
+    task = asyncio.create_task(panel_ops.settle(shell.run("cleanup")))
     await cleanup_started.wait()
 
     task.cancel("first-cancellation")
     await asyncio.sleep(0)
     task.cancel("latest-cancellation")
     await asyncio.sleep(0)
+    assert not task.done(), "an owner cancellation must wait for the operation to settle"
     cleanup_release.set()
 
-    with pytest.raises(asyncio.CancelledError) as raised:
-        await task
-    assert raised.value.args == ("latest-cancellation",)
+    outcome = await task
+    assert outcome.cancellation is not None
+    assert outcome.cancellation.args == ("latest-cancellation",)
+    assert outcome.error is None
+
+
+async def test_settle_returns_the_operation_result() -> None:
+    async def operation() -> str:
+        return "settled"
+
+    outcome = await panel_ops.settle(operation())
+
+    assert outcome.result == "settled"
+    assert outcome.error is None
+    assert outcome.cancellation is None
+
+
+async def test_settle_reports_the_operation_error_without_raising() -> None:
+    failure = panel_ops.PanelOpError("baseline_finalize_failed")
+
+    async def operation() -> None:
+        raise failure
+
+    outcome = await panel_ops.settle(operation())
+
+    assert outcome.error is failure
+    assert outcome.cancellation is None
+    assert outcome.result is None
+
+
+async def test_settle_bound_cancels_the_operation_and_counts_as_failed() -> None:
+    cancelled = asyncio.Event()
+
+    async def hung() -> None:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    outcome = await panel_ops.settle(hung(), bound_seconds=0.01)
+
+    assert cancelled.is_set()
+    assert isinstance(outcome.error, TimeoutError)
+    assert outcome.cancellation is None
+
+
+async def test_settle_bound_expiry_terminates_the_remote_child_and_fences_the_shell() -> None:
+    process = FakePanelProcess(settled=False)
+    shell = await _connected(FakeShell(processes={"hung-finalize": process}))
+
+    async def hung_finalize() -> None:
+        await panel_ops._provisioning_run(shell, "hung-finalize", "baseline_finalize_failed")
+
+    outcome = await panel_ops.settle(hung_finalize(), bound_seconds=0.01)
+
+    assert isinstance(outcome.error, TimeoutError)
+    assert process.terminate_count == 1
+    assert shell.connected is False
+
+
+async def test_settle_waits_for_a_bounded_operation_under_owner_cancellation() -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow() -> str:
+        entered.set()
+        await release.wait()
+        return "done"
+
+    task = asyncio.create_task(panel_ops.settle(slow(), bound_seconds=30))
+    await entered.wait()
+    task.cancel("owner")
+    await asyncio.sleep(0.01)
+    assert not task.done()
+    release.set()
+
+    outcome = await task
+    assert outcome.result == "done"
+    assert outcome.cancellation is not None
+    assert outcome.cancellation.args == ("owner",)
 
 
 async def test_stage_release_surfaces_nonzero_cleanup_without_raw_details() -> None:
@@ -4161,7 +4249,7 @@ async def test_capture_bounds_a_hung_finalize(monkeypatch: pytest.MonkeyPatch) -
         finally:
             cancelled.set()
 
-    monkeypatch.setattr(panel_ops, "_BASELINE_FINALIZE_SECONDS", 0.01)
+    monkeypatch.setattr(panel_ops, "CLEANUP_FINALIZE_SECONDS", 0.01)
     shell, _ = await _capture_with(monkeypatch, resnapshot, hung)
 
     with pytest.raises(panel_ops.PanelOpError, match="^baseline_capture_interrupted$"):

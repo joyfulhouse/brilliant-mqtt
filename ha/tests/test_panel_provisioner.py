@@ -53,7 +53,6 @@ from custom_components.brilliant_mqtt.panel_provisioner import (
     StagedRelease,
     TransactionLookup,
     TransactionLookupState,
-    _settle,
     panel_release_provider,
     panel_snapshot_from_stored,
     staged_release_from_journal,
@@ -681,6 +680,7 @@ class _FakeOperations:
     events: list[tuple[object, ...]]
     snapshot: panel_ops.PanelSnapshot
     fail_at: set[str] = field(default_factory=set)
+    rebind_error: str = "release_identity_changed"
     block_activation: asyncio.Event | None = None
     block_rollback: asyncio.Event | None = None
     activation_started: asyncio.Event = field(default_factory=asyncio.Event)
@@ -710,7 +710,44 @@ class _FakeOperations:
         pass
 
     async def finalize_baseline(self, shell: PanelShell, snapshot: panel_ops.PanelSnapshot) -> None:
-        pass
+        self.events.append(("finalize_baseline",))
+        if "finalize" in self.fail_at:
+            raise panel_ops.PanelOpError("baseline_finalize_failed")
+
+    async def rehearse_restart(
+        self,
+        shell: PanelShell,
+        snapshot: panel_ops.PanelSnapshot,
+        deployment_id: str,
+        *,
+        before_restart: Callable[[], None],
+    ) -> None:
+        self.events.append(("rehearse_env", deployment_id))
+        if "rehearse_env" in self.fail_at:
+            raise panel_ops.PanelOpError("rehearsal_env_write_failed")
+        try:
+            before_restart()
+        except Exception:
+            raise panel_ops.PanelOpError("rehearsal_boundary_failed") from None
+        self.events.append(("rehearse_restart",))
+        if "rehearse_restart" in self.fail_at:
+            raise panel_ops.PanelOpError("rehearsal_restart_failed")
+
+    async def start_bridge(self, shell: PanelShell) -> None:
+        self.events.append(("start_bridge",))
+        if "start_bridge" in self.fail_at:
+            raise panel_ops.PanelOpError("rehearsal_start_failed")
+
+    async def bridge_running(self, shell: PanelShell) -> bool:
+        self.events.append(("bridge_running",))
+        if "bridge_probe" in self.fail_at:
+            raise panel_ops.PanelOpError("rehearsal_probe_failed")
+        return "bridge_stopped" not in self.fail_at
+
+    async def rebind_rehearsed_deployment(self, shell: PanelShell, deployment_id: str) -> None:
+        self.events.append(("rebind", deployment_id))
+        if "rebind" in self.fail_at:
+            raise panel_ops.PanelOpError(self.rebind_error)
 
     async def restart_restored(
         self,
@@ -1712,7 +1749,7 @@ async def test_settle_preserves_same_turn_cancellation_race() -> None:
     for _ in range(20):
         loop = asyncio.get_running_loop()
         operation: asyncio.Future[None] = loop.create_future()
-        task = asyncio.create_task(_settle(operation))
+        task = asyncio.create_task(panel_ops.settle(operation))
         await asyncio.sleep(0)
         loop.call_soon(operation.set_result, None)
         loop.call_soon(task.cancel)
@@ -1721,43 +1758,6 @@ async def test_settle_preserves_same_turn_cancellation_race() -> None:
 
         assert outcome.cancellation is not None
         assert outcome.error is None
-
-
-async def test_settle_classifies_dependency_cancellation_as_child_failure() -> None:
-    async def internally_cancelled() -> None:
-        raise asyncio.CancelledError("inner-cleanup")
-
-    outcome = await _settle(internally_cancelled())
-
-    assert isinstance(outcome.error, asyncio.CancelledError)
-    assert outcome.error.args == ("inner-cleanup",)
-    assert outcome.cancellation is None
-    owner = asyncio.current_task()
-    assert owner is not None
-    assert owner.cancelling() == 0
-
-
-async def test_settle_preserves_latest_repeated_caller_cancellation() -> None:
-    started = asyncio.Event()
-    release = asyncio.Event()
-
-    async def operation() -> None:
-        started.set()
-        await release.wait()
-
-    task = asyncio.create_task(_settle(operation()))
-    await started.wait()
-    task.cancel("first-control")
-    await asyncio.sleep(0)
-    task.cancel("newest-control")
-    await asyncio.sleep(0)
-    release.set()
-
-    outcome = await task
-
-    assert outcome.error is None
-    assert outcome.cancellation is not None
-    assert outcome.cancellation.args == ("newest-control",)
 
 
 async def test_cancel_during_observer_close_rolls_back_despite_repeated_cancel() -> None:
