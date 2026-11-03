@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A previously installed panel whose old bridge was crash-looping can be
+  diagnosed instead of failing with `snapshot_probe_failed` (#226). The fleet
+  units restart automatically, so a crashing bridge or watchdog shows
+  `activating (auto-restart)`, which the pre-change snapshot rejected outright.
+  The snapshot now samples each core service over a bounded window and refuses
+  a crash-looping unit on an installed panel with the new
+  `service_crash_looping` error, before any file probe, baseline or write: no
+  agent code, unit or configuration is changed. If the release needed an
+  explicit override or a pre-ordinal auto-admission, that admission record is
+  written first; an override is consumed and a retry needs a fresh approval.
+  The error text and docs/TROUBLESHOOTING.md explain the ways out: fix the old
+  bridge so it stays up, or uninstall and re-add (turning off both watchdog
+  switches first, or using the new guarded manual uninstall for a panel without
+  a Home Assistant entry).
+- A crash loop that starts while the rollback baseline is captured is caught
+  by the capture's re-snapshot, and that just-published baseline is finalized
+  (removed) before the error is reported. If that removal fails, the error is
+  `baseline_capture_interrupted` and a baseline may remain on the panel; see
+  docs/canary-rollback.md → Interrupted baseline capture.
+- Stopping a core service no longer fails with exit 47 when the unit is in
+  `activating` (auto-restart): the stop step now stops every unsettled state
+  before its strict settled check.
+- Each install or update on an existing panel now takes about 27 seconds longer
+  (two sampled snapshots), which makes `transaction_in_progress` more likely
+  when panels are added back to back.
+- Rollback verification is about 14 seconds slower, because its snapshot now
+  samples the restored services for the same window.
+
 ## [0.11.4] - 2026-10-26
 
 This is a Home Assistant integration release only. The bundled on-panel agent

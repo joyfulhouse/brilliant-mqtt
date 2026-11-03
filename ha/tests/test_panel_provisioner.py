@@ -2597,18 +2597,27 @@ async def test_install_existing_journal_recovery_has_deadline_and_settles(
     assert not any(event[0] == "identity" for event in harness.events)
 
 
+@pytest.mark.parametrize(
+    ("raised_code", "expected"),
+    [
+        ("snapshot_probe_failed", "snapshot_probe_failed"),
+        ("service_crash_looping", "service_crash_looping"),
+        ("baseline_capture_interrupted", "baseline_capture_interrupted"),
+        ("snapshot_payload_invalid", "snapshot_failed"),
+    ],
+)
 async def test_snapshot_probe_failure_is_safe_and_actionable(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, raised_code: str, expected: str
 ) -> None:
     harness = _Harness()
 
     async def failed(_shell: PanelShell) -> panel_ops.PanelSnapshot:
-        raise panel_ops.PanelOpError("snapshot_probe_failed: SECRET remote output")
+        raise panel_ops.PanelOpError(f"{raised_code}: SECRET remote output")
 
     monkeypatch.setattr(harness.operations, "snapshot_panel", failed)
     with pytest.raises(PanelProvisioningError) as raised:
         await harness.provisioner().async_install(_request(), _fleet(), harness.progress)
-    assert raised.value.code == "snapshot_probe_failed"
+    assert raised.value.code == expected
     assert "SECRET" not in str(raised.value)
     assert harness.journal.record is None
 
