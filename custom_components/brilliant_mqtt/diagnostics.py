@@ -56,6 +56,7 @@ from .const import (
 from .entry_data import EntryDataError, PanelConfig
 from .ha_control import HaControlPlane
 from .provisioning_journal import ProvisioningJournal
+from .update_state import safe_update_diagnostics
 
 _TO_REDACT = {
     CONF_ROOT_PASSWORD,
@@ -277,6 +278,7 @@ async def async_get_config_entry_diagnostics(
             "meta": _meta_diagnostics(panel.meta),
             "problem": panel.problem,
             "problem_reason": _problem_reason_diagnostics(panel.problem_reason),
+            "update": safe_update_diagnostics(panel.update_diagnostics()),
         }
         for panel_id, panel in panels.items()
     }

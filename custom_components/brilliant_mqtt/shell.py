@@ -22,6 +22,10 @@ from asyncssh import SFTPAttrs
 
 _CONNECT_TIMEOUT = 15
 _LOGIN_TIMEOUT = 15
+# SSH keepalive (#219): a silently dead link fails within about 45 s instead of
+# hanging until the operation timeout, so the update can classify it as lost.
+_KEEPALIVE_INTERVAL = 15
+_KEEPALIVE_COUNT_MAX = 3
 _OPERATION_TIMEOUT = 120
 
 
@@ -403,6 +407,7 @@ class PanelShell(Protocol):
     async def put_file(self, local_path: str, remote_path: str, mode: int) -> None: ...
     def pinned_host_key(self) -> str | None: ...
     def connect_reached_auth(self) -> bool: ...
+    def transport_lost(self) -> bool: ...
 
 
 class PanelProcess(Protocol):
@@ -556,13 +561,22 @@ class _AsyncsshPanelProcess:
 
 
 class _AuthProgressClient(asyncssh.SSHClient):
-    """Records the moment asyncssh begins user authentication on a connect."""
+    """Records auth progress and an abnormal transport loss on one connection."""
 
-    def __init__(self, on_begin_auth: Callable[[], None]) -> None:
+    def __init__(
+        self, on_begin_auth: Callable[[], None], on_transport_lost: Callable[[], None]
+    ) -> None:
         self._on_begin_auth = on_begin_auth
+        self._on_transport_lost = on_transport_lost
 
     def begin_auth(self, username: str) -> None:
         self._on_begin_auth()
+
+    def connection_lost(self, exc: Exception | None) -> None:
+        # asyncssh passes None for an orderly close (ours or the peer's) and an
+        # exception for a dropped link, keepalive timeout or protocol failure.
+        if exc is not None:
+            self._on_transport_lost()
 
 
 class _ShellOperations:
@@ -575,6 +589,7 @@ class _ShellOperations:
         self._conn: asyncssh.SSHClientConnection | None = None
         self._children: set[_AsyncsshPanelProcess] = set()
         self._reached_auth = False
+        self._transport_lost = False
 
     def pinned_host_key(self) -> str | None:
         return self._pinned
@@ -589,11 +604,24 @@ class _ShellOperations:
         """
         return self._reached_auth
 
+    def transport_lost(self) -> bool:
+        """Whether the connected session ended abnormally (#219).
+
+        Set only when asyncssh reports ``connection_lost`` WITH an exception: a
+        dropped link, a keepalive timeout or a protocol failure. An orderly close
+        or abort by either side leaves it False. Once True, a command whose result
+        never arrived may still have completed on the panel.
+        """
+        return self._transport_lost
+
     def _client_factory(self) -> asyncssh.SSHClient:
-        return _AuthProgressClient(self._mark_reached_auth)
+        return _AuthProgressClient(self._mark_reached_auth, self._mark_transport_lost)
 
     def _mark_reached_auth(self) -> None:
         self._reached_auth = True
+
+    def _mark_transport_lost(self) -> None:
+        self._transport_lost = True
 
     async def close(self) -> None:
         conn = self._conn
@@ -795,6 +823,8 @@ class AsyncsshShell(_ShellOperations):
             kbdint_auth=False,
             connect_timeout=_CONNECT_TIMEOUT,
             login_timeout=_LOGIN_TIMEOUT,
+            keepalive_interval=_KEEPALIVE_INTERVAL,
+            keepalive_count_max=_KEEPALIVE_COUNT_MAX,
             client_factory=self._client_factory,
         )
 
@@ -830,6 +860,8 @@ class _LegacyAsyncsshShell(_ShellOperations):
             kbdint_auth=False,
             connect_timeout=_CONNECT_TIMEOUT,
             login_timeout=_LOGIN_TIMEOUT,
+            keepalive_interval=_KEEPALIVE_INTERVAL,
+            keepalive_count_max=_KEEPALIVE_COUNT_MAX,
             client_factory=self._client_factory,
         )
         if self._pinned is None:

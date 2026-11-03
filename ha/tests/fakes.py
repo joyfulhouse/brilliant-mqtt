@@ -9,6 +9,8 @@ import json
 import re
 import tarfile
 
+import asyncssh
+
 from custom_components.brilliant_mqtt.panel_ops import SnapshotSampling
 from custom_components.brilliant_mqtt.shell import PanelProcess, RunResult
 
@@ -60,7 +62,22 @@ class FakePanelProcess:
 
 
 class FakeShell:
-    """Satisfies the PanelShell Protocol. Unscripted commands return success."""
+    """Satisfies the PanelShell Protocol. Unscripted commands return success.
+
+    Session-loss injection (#219), matched by substring:
+
+    * ``drop_on``: the session drops BEFORE the matching operation reaches the
+      panel. Nothing of that operation runs remotely.
+    * ``drop_after``: the matching operation completes on the panel (its effect
+      and its record are kept), then the session drops before the result arrives.
+
+    Both apply to ``run()`` and ``start()`` (matched against the command) and to
+    ``put_bytes()``, ``put_dir()`` and ``put_file()`` (matched against the remote
+    path). For ``start()``, ``drop_after`` lets the remote child run to completion
+    before the session drops. The drop raises ``asyncssh.ConnectionLost`` and sets
+    ``transport_lost()``; every later operation on the shell raises the same.
+    ``connect()`` and ``close()`` are never affected.
+    """
 
     def __init__(
         self,
@@ -73,7 +90,12 @@ class FakeShell:
         run_errors: dict[str, Exception] | None = None,
         processes: dict[str, FakePanelProcess] | None = None,
         reached_auth: bool = False,
+        drop_on: str | None = None,
+        drop_after: str | None = None,
     ) -> None:
+        self.drop_on = drop_on
+        self.drop_after = drop_after
+        self.lost = False
         # Whether a failed connect() had reached SSH authentication (the password
         # may have been offered), which makes the failure non-retryable (#219).
         self.reached_auth = reached_auth
@@ -121,6 +143,24 @@ class FakeShell:
     def connect_reached_auth(self) -> bool:
         return self.reached_auth
 
+    def transport_lost(self) -> bool:
+        return self.lost
+
+    def _drop(self) -> asyncssh.ConnectionLost:
+        self.lost = True
+        self.connected = False
+        return asyncssh.ConnectionLost("injected session drop")
+
+    def _before(self, target: str) -> None:
+        if self.lost:
+            raise asyncssh.ConnectionLost("session already lost")
+        if self.drop_on is not None and self.drop_on in target:
+            raise self._drop()
+
+    def _after(self, target: str) -> None:
+        if self.drop_after is not None and self.drop_after in target:
+            raise self._drop()
+
     async def connect(self) -> None:
         self.connect_count += 1
         self.connect_entered.set()
@@ -147,6 +187,35 @@ class FakeShell:
             raise RuntimeError("not connected — call connect() first")
 
     async def run(self, command: str) -> RunResult:
+        self._before(command)
+        result = await self._do_run(command)
+        self._after(command)
+        return result
+
+    async def start(self, command: str) -> PanelProcess:
+        self._before(command)
+        process = await self._do_start(command)
+        if self.drop_after is not None and self.drop_after in command:
+            await process.wait()  # the remote child runs to completion first
+        self._after(command)
+        return process
+
+    async def put_bytes(self, data: bytes, remote_path: str, mode: int) -> None:
+        self._before(remote_path)
+        await self._do_put_bytes(data, remote_path, mode)
+        self._after(remote_path)
+
+    async def put_dir(self, local_dir: str, remote_dir: str) -> None:
+        self._before(remote_dir)
+        await self._do_put_dir(local_dir, remote_dir)
+        self._after(remote_dir)
+
+    async def put_file(self, local_path: str, remote_path: str, mode: int) -> None:
+        self._before(remote_path)
+        await self._do_put_file(local_path, remote_path, mode)
+        self._after(remote_path)
+
+    async def _do_run(self, command: str) -> RunResult:
         self._require_connected()
         if "BRILLIANT_BASELINE_RETAINED" in command:
             return RunResult(0, "1" if self.baseline_retained else "0", "")
@@ -179,7 +248,7 @@ class FakeShell:
             raise self.run_errors[command]
         return self.responses.get(command, _OK)
 
-    async def start(self, command: str) -> PanelProcess:
+    async def _do_start(self, command: str) -> PanelProcess:
         self._require_connected()
         if "BRILLIANT_BASELINE_RETAINED" in command:
             return FakePanelProcess(RunResult(0, "1" if self.baseline_retained else "0", ""))
@@ -190,7 +259,7 @@ class FakeShell:
         self.started_processes.append(process)
         return process
 
-    async def put_bytes(self, data: bytes, remote_path: str, mode: int) -> None:
+    async def _do_put_bytes(self, data: bytes, remote_path: str, mode: int) -> None:
         self._require_connected()
         if self.put_bytes_error is not None:
             raise self.put_bytes_error
@@ -262,7 +331,7 @@ class FakeShell:
             if remote_path == f"/etc/systemd/system/{service}.service":
                 self.release_identities[component] = identity
 
-    async def put_dir(self, local_dir: str, remote_dir: str) -> None:
+    async def _do_put_dir(self, local_dir: str, remote_dir: str) -> None:
         self._require_connected()
         if self.put_dir_error is not None:
             # Models a mid-transfer SFTP failure; recorded only on success so
@@ -270,6 +339,6 @@ class FakeShell:
             raise self.put_dir_error
         self.dir_uploads.append((local_dir, remote_dir))
 
-    async def put_file(self, local_path: str, remote_path: str, mode: int) -> None:
+    async def _do_put_file(self, local_path: str, remote_path: str, mode: int) -> None:
         self._require_connected()
         self.file_uploads.append((local_path, remote_path, mode))

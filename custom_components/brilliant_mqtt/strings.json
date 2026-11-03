@@ -409,6 +409,9 @@
         "rollback_failed": "Automatic rollback did not finish. Follow the provisioning recovery instructions before retrying.",
         "recovery_failed": "A prior provisioning transaction could not be recovered automatically.",
         "recovery_connection_failed": "Recovery could not reach the panel at its recorded address. Keep the journal and baseline. Check the panel is online; if its address or root password changed, start Add Brilliant panel with the current address and password to roll back the interrupted onboarding. See docs/canary-rollback.md.",
+        "connection_lost": "The panel connection was lost during the operation. Its rollback intent is kept and recovery reconnects to the recorded panel; check the panel is online, then let recovery finish. See docs/canary-rollback.md.",
+        "recovery_interrupted": "Recovery was interrupted because Home Assistant was stopping. The rollback intent is kept and recovery resumes on the next start; do not delete private storage. See docs/canary-rollback.md.",
+        "baseline_capture_interrupted": "Baseline capture was interrupted (the panel connection was lost, or a failed capture could not remove its just-published baseline). A rollback baseline that no Home Assistant journal owns may remain on the panel; there is no journal to keep. Follow 'Interrupted baseline capture' in docs/canary-rollback.md before retrying.",
         "recovery_artifact_invalid": "The recorded recovery state could not be reconstructed safely. Keep the journal and baseline and attach redacted diagnostics for the maintainer; do not delete private storage. See docs/canary-rollback.md.",
         "provisioning_recovery_required": "Another panel's interrupted provisioning transaction must be recovered first. Download diagnostics (provisioning name, panel, last_error) and follow docs/canary-rollback.md, then retry.",
         "transaction_in_progress": "Another panel operation holds the shared lock or a provisioning transaction still needs recovery. Check diagnostics, allow recovery to finish, and retry.",
@@ -424,7 +427,6 @@
         "baseline_retained_finalize_first": "This panel retains a canary rollback baseline. After sign-off, explicitly finalize that baseline using its transaction name before updating again. See docs/canary-rollback.md.",
         "snapshot_probe_failed": "The panel service snapshot could not be read safely. Wait for restarting services to settle, check panel connectivity, and retry. No candidate was staged.",
         "service_crash_looping": "The earlier bridge (or a watchdog) kept restarting during the check (crash-looping), so no safe rollback baseline can be taken. No agent code, unit or configuration was changed. Likely causes: missing or changed broker credentials, or an unreachable broker. Fix the old bridge so it stays up, or uninstall the agent and re-add the panel (turn off the Wi-Fi and Bus watchdog switches first; a panel without a Home Assistant entry uses the manual uninstall in docs/TROUBLESHOOTING.md). If it was a one-off restart and the service now stays up, simply retry. If the release needed an explicit override, that override was consumed and a retry needs a fresh approval.",
-        "baseline_capture_interrupted": "Baseline capture was interrupted and a rollback baseline may remain on the panel. Keep the journal and follow docs/canary-rollback.md before retrying.",
         "ownerless_recovery_unavailable": "This retained baseline is owned, still in use, or not verified restored. Preserve the journal and baseline. Finish recovery or use the owning panel's canary actions; do not delete private storage to retry.",
         "ownerless_finalize_reauthentication_required": "Retained baseline cleanup requires fresh authentication. Start Add Brilliant panel again with the panel address and root password, verify its pinned identity, and explicitly confirm cleanup. Interrupted cleanup remains retained."
       },
@@ -771,6 +773,28 @@
     "ha_mirror_retired": {
       "title": "Legacy Brilliant HA mirror disabled",
       "description": "Panel `{panel}` still has legacy HA mirror state. {reason}. The integration will keep retrying safe removal during panel management; legacy credentials are retained until absence is verified."
+    },
+    "interrupted_update": {
+      "title": "Brilliant panel `{panel}` agent update was interrupted",
+      "fix_flow": {
+        "step": {
+          "init": {
+            "title": "Interrupted agent update",
+            "description": "Home Assistant stopped while panel `{panel}` was updating its agent to {target_version}. The update was in its {stage} stage after {attempts} attempt(s), before any rollback baseline was captured, so no agent code was changed. It is not resumed automatically. Retry starts a fresh update (with a fresh retry budget) and shows its progress on the panel's Update entity; Dismiss forgets the interrupted update.",
+            "menu_options": {
+              "retry": "Retry the agent update",
+              "dismiss": "Dismiss"
+            }
+          }
+        },
+        "abort": {
+          "interrupted_update_target_changed": "The bundled release changed since the update was interrupted. Dismiss this issue and start the update again from the Update entity.",
+          "interrupted_update_recovery_owned": "A provisioning journal or retained baseline concerns this panel, so recovery owns it. The interrupted update was dropped; check diagnostics and follow docs/canary-rollback.md.",
+          "already_in_progress": "A repair or update is already running for this panel. Wait for it to finish, then retry.",
+          "interrupted_update_unavailable": "No loaded panel runtime owns this issue. Reload the integration and retry.",
+          "interrupted_update_clear_failed": "The interrupted update could not be forgotten. Check the Home Assistant logs and retry."
+        }
+      }
     }
   }
 }

@@ -97,6 +97,7 @@ from .shell import (
     PanelIdentityError,
     async_verify_host_identity,
 )
+from .update_intent import async_forget_update_intent
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -115,6 +116,12 @@ _PENDING_SCENE_OWNER_PREFIX = "pending-provisioning:"
 _PROVISIONING_REPAIR_REASON = (
     "Automatic provisioning rollback did not finish. Retry panel onboarding or "
     "follow the provisioning recovery instructions."
+)
+# The rollback reconnect stopped because Home Assistant was stopping or unloading
+# (#219): the panel was not shown unreachable, and recovery resumes on next start.
+_PROVISIONING_STOPPED_REASON = (
+    "Automatic provisioning rollback was interrupted because Home Assistant was "
+    "stopping. The restore intent is kept and recovery resumes on the next start."
 )
 _CONFIG_ENTRIES_STORAGE_FILE = ".storage/core.config_entries"
 _CONFIG_ENTRY_PERSISTENCE_TIMEOUT_SECONDS = 5.0
@@ -224,7 +231,11 @@ class _ProvisioningRepairReporter:
             translation_placeholders={
                 "panel": "Brilliant MQTT provisioning",
                 "reason": (
-                    _PROVISIONING_REPAIR_REASON
+                    (
+                        _PROVISIONING_STOPPED_REASON
+                        if rollback_code == "recovery_interrupted"
+                        else _PROVISIONING_REPAIR_REASON
+                    )
                     + " "
                     + safe_code(original_code)
                     + "; "
@@ -1528,6 +1539,7 @@ class FleetManager:
                 async_delete_panel_issues(self.hass, manager.management_id)
             except BaseException as error:
                 failures.append(error)
+            await async_forget_update_intent(self.hass, manager.management_id)
         if not failures:
             return
         for failure in failures[1:]:

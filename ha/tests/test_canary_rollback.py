@@ -2395,6 +2395,68 @@ async def test_flow_attempt_tolerates_new_error_and_keeps_background_error(
     assert await journal.async_load() is None
 
 
+@pytest.mark.parametrize("release", [False, True], ids=["legacy", "release_link"])
+async def test_lost_session_after_a_completed_remote_capture_is_never_resumed(
+    hass: HomeAssistant,
+    tmp_path: Path,
+    payload_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    release: bool,
+) -> None:
+    """The REAL capture completes on the panel, then the session drops (#219).
+
+    Nothing is resumed or retried: there is no journal yet, so the update stops
+    with the unjournaled-capture guidance and the on-panel baseline is left alone.
+    """
+    from homeassistant.exceptions import HomeAssistantError
+
+    from custom_components.brilliant_mqtt import fleet_manager
+    from custom_components.brilliant_mqtt.const import CONF_SSH_HOST_KEY
+    from tests.test_manager import _fleet_panel_manager
+
+    shell = RehearsalShell(tmp_path / "panel")
+    shell.install(release=release)
+    shell._pinned = _record().panel_request.public_key
+    _, manager = _fleet_panel_manager(hass, panel_overrides={CONF_SSH_HOST_KEY: shell._pinned})
+    await shell.connect()
+    with pytest.raises(panel_ops.ReleaseIdentityBlocked) as blocked:
+        async with panel_ops.release_transaction(shell, str(payload_dir), panel="office"):
+            pytest.fail("legacy ordinal must require explicit approval")
+    journal = ProvisioningJournal(hass)
+    provisioner = _Harness().provisioner(manager._ssh_lock)
+    provisioner._journal = journal
+    provisioner._operations = panel_ops
+    monkeypatch.setattr(fleet_manager, "_get_recovery_provisioner", lambda _hass: provisioner)
+    connect = AsyncMock(return_value=shell)
+    monkeypatch.setattr(manager, "_connect_for_repair", connect)
+    captures = 0
+    original_capture = panel_ops.capture_baseline
+
+    async def counted_capture(*args: Any, **kwargs: Any) -> panel_ops.PanelSnapshot:
+        nonlocal captures
+        captures += 1
+        return await original_capture(*args, **kwargs)
+
+    monkeypatch.setattr(panel_ops, "capture_baseline", counted_capture)
+    shell.drop_after = "BRILLIANT_BASELINE_CAPTURE"
+    try:
+        with pytest.raises(HomeAssistantError) as raised:
+            await manager.async_update_agent(release_override=blocked.value.override)
+    finally:
+        await manager.async_shutdown()
+
+    assert shell.transport_lost() is True
+    assert connect.await_count == 1
+    assert captures == 1
+    assert manager.update_retry is None
+    error = (raised.value.translation_placeholders or {})["error"]
+    assert "baseline_capture_interrupted" in error
+    assert await journal.async_load() is None
+    assert await journal.async_retained_records() == ()
+    # The completed capture stays on the panel for the documented manual settle.
+    assert any((shell.panel / ".rollback").iterdir())
+
+
 # --- #226: crash-looping core units --------------------------------------------
 
 
