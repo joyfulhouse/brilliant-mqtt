@@ -3534,6 +3534,34 @@ async def test_set_voice_enabled_true_always_deploys(
     assert entry.data[CONF_COMPONENTS][COMPONENT_VOICE] is True
 
 
+async def test_voice_upload_timeout_preserves_flag_and_stops_deployment(
+    hass: HomeAssistant,
+) -> None:
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="office",
+        data={**ENTRY_DATA, CONF_COMPONENTS: {COMPONENT_VOICE: False}},
+    )
+    entry.add_to_hass(hass)
+    shell = _make_voice_shell(payload_present=False)
+
+    with (
+        patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell),
+        patch(_COMPONENTS_FETCH_PATCH, return_value=_FAKE_TARBALL),
+        patch(
+            "custom_components.brilliant_mqtt.components.panel_ops.deploy_voice_payload",
+            new=AsyncMock(side_effect=TimeoutError),
+        ),
+    ):
+        manager = _legacy_manager(hass, entry)
+        with pytest.raises(HomeAssistantError):
+            await manager.async_set_voice_enabled(True)
+
+    assert entry.data[CONF_COMPONENTS][COMPONENT_VOICE] is False
+    assert not any("tar" in command for command in shell.commands)
+    assert "systemctl enable --now brilliant-voice" not in shell.commands
+
+
 async def test_set_voice_enabled_false_uninstalls(
     hass: HomeAssistant,
     payload_dir: Path,

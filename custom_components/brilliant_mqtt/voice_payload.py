@@ -23,7 +23,7 @@ from .const import DOMAIN, VOICE_PAYLOAD_VERSION, voice_asset_url
 
 _LOGGER = logging.getLogger(__name__)
 
-_DOWNLOAD_TIMEOUT = aiohttp.ClientTimeout(total=300)  # 57 MB over a home uplink
+_DOWNLOAD_TIMEOUT = aiohttp.ClientTimeout(total=300)  # ~67 MiB over a home uplink
 
 
 class VoicePayloadError(HomeAssistantError):
