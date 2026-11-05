@@ -724,7 +724,7 @@ class _ShellOperations:
 
     async def put_dir(self, local_dir: str, remote_dir: str) -> None:
         conn = self._require_conn()
-        async with asyncio.timeout(_OPERATION_TIMEOUT):
+        async with asyncio.timeout(_OPERATION_TIMEOUT) as idle_timeout:
             entries = await _async_local_io(partial(_list_local_tree, local_dir))
             async with await conn.start_sftp_client() as sftp:
                 destination = (
@@ -742,7 +742,9 @@ class _ShellOperations:
                         if not await sftp.isdir(target):
                             await sftp.mkdir(target, attrs=SFTPAttrs(permissions=0o700))
                     else:
-                        await self._async_upload_file(sftp, entry, target, entry.mode)
+                        await self._async_upload_file(
+                            sftp, entry, target, entry.mode, idle_timeout=idle_timeout
+                        )
                 # Apply directory permissions after children, including read-only trees.
                 for entry in reversed(entries):
                     if entry.directory:

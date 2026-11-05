@@ -3543,22 +3543,25 @@ async def test_voice_upload_timeout_preserves_flag_and_stops_deployment(
         data={**ENTRY_DATA, CONF_COMPONENTS: {COMPONENT_VOICE: False}},
     )
     entry.add_to_hass(hass)
-    shell = _make_voice_shell(payload_present=False)
+
+    class TimeoutOnVoiceFileUpload(FakeShell):
+        async def put_file(self, local_path: str, remote_path: str, mode: int) -> None:
+            del local_path, remote_path, mode
+            raise TimeoutError
+
+    shell = TimeoutOnVoiceFileUpload(responses=_make_voice_shell(payload_present=False).responses)
 
     with (
         patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell),
         patch(_COMPONENTS_FETCH_PATCH, return_value=_FAKE_TARBALL),
-        patch(
-            "custom_components.brilliant_mqtt.components.panel_ops.deploy_voice_payload",
-            new=AsyncMock(side_effect=TimeoutError),
-        ),
     ):
         manager = _legacy_manager(hass, entry)
         with pytest.raises(HomeAssistantError):
             await manager.async_set_voice_enabled(True)
 
     assert entry.data[CONF_COMPONENTS][COMPONENT_VOICE] is False
-    assert not any("tar" in command for command in shell.commands)
+    assert not any("tar xzf" in command for command in shell.commands)
+    assert shell.file_uploads == []
     assert "systemctl enable --now brilliant-voice" not in shell.commands
 
 
