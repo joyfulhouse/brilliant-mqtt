@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from types import TracebackType
 from typing import Any, Protocol, get_type_hints
 
 import asyncssh
@@ -37,6 +38,34 @@ _HOST_KEY_ALGORITHMS = ("ssh-ed25519", "rsa-sha2-512", "rsa-sha2-256")
 _ED25519_HOST_KEY_ALGORITHMS = ("ssh-ed25519",)
 _RSA_HOST_KEY_ALGORITHMS = ("rsa-sha2-512", "rsa-sha2-256")
 _RSA_FIRST_HOST_KEY_ALGORITHMS = (*_RSA_HOST_KEY_ALGORITHMS, "ssh-ed25519")
+
+
+class _ManualTimeout:
+    def __init__(self) -> None:
+        self.task: asyncio.Task[object] | None = None
+        self.fired = False
+
+    async def __aenter__(self) -> _ManualTimeout:
+        self.task = asyncio.current_task()
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> bool:
+        if self.fired and exc_type is asyncio.CancelledError:
+            raise TimeoutError
+        return False
+
+    def reschedule(self, _when: float | None) -> None:
+        pass
+
+    def fire(self) -> None:
+        self.fired = True
+        assert self.task is not None
+        self.task.cancel()
 
 
 def test_known_hosts_line_pins_host_to_key() -> None:
@@ -1078,6 +1107,17 @@ class _FakeSFTP:
         return _UploadFile(self, path)
 
 
+class _StalledCloseSFTP(_FakeSFTP):
+    def __init__(self) -> None:
+        super().__init__({"/remote"})
+        self.closing = asyncio.Event()
+
+    async def __aexit__(self, *exc: object) -> bool:
+        self.closing.set()
+        await asyncio.Future()
+        return False
+
+
 class _SftpConnection(_FakeConnection):
     def __init__(self, sftp: _FakeSFTP) -> None:
         super().__init__(_FakeServerHostKey(b"ssh-ed25519 K\n"))
@@ -1201,6 +1241,128 @@ async def test_put_file_streams_bytes_with_requested_mode(
     await shell.put_file(str(source), "/remote", 0o600)
     assert sftp.files["/remote/file"] == b"complete file bytes"
     assert sftp.modes["/remote/file"] == 0o600
+
+
+async def test_put_file_renews_timeout_after_successful_chunk_writes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "file"
+    source.write_bytes(b"x" * (shell_module._UPLOAD_CHUNK_BYTES * 3))
+    sftp = _FakeSFTP({"/remote"})
+    _patch_connect(monkeypatch, _SftpConnection(sftp))
+    shell = AsyncsshShell("panel.local", "pw", _REAL_ED25519_PUB)
+    await shell.connect()
+
+    original_timeout = asyncio.timeout
+    renewals: list[float] = []
+    fake_clock = [0.0]
+    fake_deadline = [0.0]
+
+    class TrackingTimeout:
+        def __init__(self, delay: float) -> None:
+            self.delay = delay
+            self.timeout = original_timeout(delay)
+
+        async def __aenter__(self) -> TrackingTimeout:
+            await self.timeout.__aenter__()
+            fake_deadline[0] = fake_clock[0] + self.delay
+            return self
+
+        async def __aexit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc: BaseException | None,
+            traceback: TracebackType | None,
+        ) -> None:
+            await self.timeout.__aexit__(exc_type, exc, traceback)
+
+        def reschedule(self, when: float | None) -> None:
+            renewals.append(when or 0)
+            fake_deadline[0] = fake_clock[0] + shell_module._OPERATION_TIMEOUT
+            self.timeout.reschedule(when)
+
+    original_write = _UploadFile.write
+
+    async def slow_but_progressing_write(upload: _UploadFile, data: bytes) -> None:
+        assert fake_clock[0] < fake_deadline[0]
+        await original_write(upload, data)
+        fake_clock[0] += shell_module._OPERATION_TIMEOUT + 1
+
+    monkeypatch.setattr(_UploadFile, "write", slow_but_progressing_write)
+    monkeypatch.setattr(asyncio, "timeout", TrackingTimeout)
+    await shell.put_file(str(source), "/remote", 0o600)
+
+    assert len(renewals) == 3
+    assert len(sftp.files["/remote/file"]) == shell_module._UPLOAD_CHUNK_BYTES * 3
+
+
+async def test_put_file_stalled_write_times_out(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "file"
+    source.write_bytes(b"payload")
+    sftp = _FakeSFTP({"/remote"})
+    _patch_connect(monkeypatch, _SftpConnection(sftp))
+    shell = AsyncsshShell("panel.local", "pw", _REAL_ED25519_PUB)
+    await shell.connect()
+    entered = asyncio.Event()
+
+    async def stalled_write(_upload: _UploadFile, _data: bytes) -> None:
+        entered.set()
+        await asyncio.Future()
+
+    timeout = _ManualTimeout()
+    monkeypatch.setattr(_UploadFile, "write", stalled_write)
+    monkeypatch.setattr(asyncio, "timeout", lambda _delay: timeout)
+    task = asyncio.create_task(shell.put_file(str(source), "/remote", 0o600))
+    await entered.wait()
+    timeout.fire()
+    with pytest.raises(TimeoutError):
+        await task
+
+
+async def test_put_file_stalled_sftp_setup_times_out(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "file"
+    source.write_bytes(b"payload")
+    connection = _SftpConnection(_FakeSFTP({"/remote"}))
+    _patch_connect(monkeypatch, connection)
+    shell = AsyncsshShell("panel.local", "pw", _REAL_ED25519_PUB)
+    await shell.connect()
+    entered = asyncio.Event()
+
+    async def stalled_start() -> _FakeSFTP:
+        entered.set()
+        await asyncio.Future()
+        return connection.sftp
+
+    timeout = _ManualTimeout()
+    monkeypatch.setattr(connection, "start_sftp_client", stalled_start)
+    monkeypatch.setattr(asyncio, "timeout", lambda _delay: timeout)
+    task = asyncio.create_task(shell.put_file(str(source), "/remote", 0o600))
+    await entered.wait()
+    timeout.fire()
+    with pytest.raises(TimeoutError):
+        await task
+
+
+async def test_put_file_stalled_sftp_close_times_out(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "file"
+    source.write_bytes(b"payload")
+    sftp = _StalledCloseSFTP()
+    _patch_connect(monkeypatch, _SftpConnection(sftp))
+    shell = AsyncsshShell("panel.local", "pw", _REAL_ED25519_PUB)
+    await shell.connect()
+    timeout = _ManualTimeout()
+    monkeypatch.setattr(asyncio, "timeout", lambda _delay: timeout)
+    task = asyncio.create_task(shell.put_file(str(source), "/remote", 0o600))
+    await sftp.closing.wait()
+    timeout.fire()
+    with pytest.raises(TimeoutError):
+        await task
 
 
 async def test_upload_rejects_symlink_without_remote_mutation(
