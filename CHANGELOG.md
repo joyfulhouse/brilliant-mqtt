@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.5] - 2026-11-05
+
+This is a Home Assistant integration release only. The bundled on-panel agent
+stays at 0.11.3 with release ordinal 5, so panels already on 0.11.3 need no
+update and their Update entities stay current. Installing it does not touch
+panels or their retained rollback baselines.
+
+### Fixed
+
+- Voice satellite installs no longer time out on slow panels. The SFTP upload
+  deadline is now a 120-second idle/stall limit renewed after each written
+  chunk instead of a fixed 120-second total. ([#238](https://github.com/joyfulhouse/brilliant-mqtt/issues/238), [#240](https://github.com/joyfulhouse/brilliant-mqtt/pull/240))
+
 ## [0.11.4] - 2026-10-26
 
 This is a Home Assistant integration release only. The bundled on-panel agent
@@ -1180,7 +1193,8 @@ panel redeploy is needed.
 - JoyfulHouse OSS docs standard: LICENSE (MIT), INSTALL.md, CHANGELOG.md,
   FUNDING.yml, CODEOWNERS, and the canonical `docs/` set.
 
-[Unreleased]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.11.4...HEAD
+[Unreleased]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.11.5...HEAD
+[0.11.5]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.11.4...v0.11.5
 [0.11.4]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.11.3...v0.11.4
 [0.11.3]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.11.2...v0.11.3
 [0.11.2]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.11.1...v0.11.2
