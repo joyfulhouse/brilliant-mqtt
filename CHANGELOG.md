@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A failed journal or retained save now logs the exception class, redacted
+  message, and traceback, and keeps that redacted cause on `journal_failed`.
+  Diagnostics include the same redacted `storage_error`. Passwords, host
+  addresses, SSH keys, and fingerprints are removed before logging.
 - A failed provisioning-journal save no longer leaves an armed, ownerless
   rollback baseline. The journal payload is checked for an exact JSON
   round-trip before that baseline is written, and a disk failure after the

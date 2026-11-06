@@ -409,6 +409,7 @@ def test_broker_fallback_failure_links_to_mqtt_guide(
             f"install/mqtt-broker.md#{documentation_slug}"
         ),
         "stage": "broker_validation",
+        "storage_detail": "",
     }
 
 
@@ -1683,6 +1684,44 @@ async def test_first_panel_progress_cannot_double_submit_and_creates_subentry(
     assert len(entries[0].subentries) == 1
 
 
+async def test_journal_failure_shows_redacted_storage_reason(
+    hass: HomeAssistant,
+) -> None:
+    confirm = await _start_initial_confirm(hass)
+    reason = "OSError: disk-[redacted]"
+    provisioner = _FakeProvisioner(
+        _identity(),
+        error=PanelProvisioningError("journal_failed", storage_reason=reason),
+        gate=asyncio.Event(),
+    )
+
+    with patch.object(
+        flow_gateway,
+        "_get_panel_provisioner",
+        return_value=provisioner,
+    ):
+        result = cast(
+            dict[str, Any],
+            await hass.config_entries.subentries.async_configure(
+                confirm["flow_id"],
+                {CONF_NAME: "Office"},
+            ),
+        )
+        assert result["type"] is FlowResultType.SHOW_PROGRESS
+        assert provisioner.gate is not None
+        provisioner.gate.set()
+        result = await _drain_progress(
+            hass.config_entries.subentries,
+            confirm["flow_id"],
+        )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "panel_confirm"
+    assert result["errors"] == {"base": "journal_failed"}
+    assert result["description_placeholders"]["storage_detail"] == f" Storage reported: {reason}"
+    assert _ROOT_PASSWORD not in repr(result)
+
+
 async def test_first_panel_provision_failure_returns_to_confirm_without_secret_leak(
     hass: HomeAssistant,
 ) -> None:
@@ -1717,6 +1756,7 @@ async def test_first_panel_provision_failure_returns_to_confirm_without_secret_l
     assert result["step_id"] == "panel_confirm"
     assert result["errors"] == {"base": "stage_failed"}
     assert result["description_placeholders"]["documentation_slug"] == ("panel-stage-failed")
+    assert result["description_placeholders"]["storage_detail"] == ""
     assert _ROOT_PASSWORD not in repr(result)
     assert _BROKER_PASSWORD not in repr(result)
     entries = hass.config_entries.async_entries(DOMAIN)

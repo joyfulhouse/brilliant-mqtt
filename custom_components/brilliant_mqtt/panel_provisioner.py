@@ -64,6 +64,7 @@ from .panel_ops import (
 )
 from .provisioning_journal import (
     PROVISIONING_ERROR_CODES,
+    ProvisioningJournalError,
     ProvisioningOperation,
     ProvisioningPhase,
     ProvisioningRecord,
@@ -179,7 +180,14 @@ class ProvisioningFailureDetail:
 class PanelProvisioningError(RuntimeError):
     """One allowlisted orchestration failure without raw dependency context."""
 
-    __slots__ = ("capability", "cleanup_code", "code", "detail", "release_override")
+    __slots__ = (
+        "capability",
+        "cleanup_code",
+        "code",
+        "detail",
+        "release_override",
+        "storage_reason",
+    )
 
     def __init__(
         self,
@@ -189,6 +197,7 @@ class PanelProvisioningError(RuntimeError):
         cleanup_code: str | None = None,
         capability: str | None = None,
         release_override: Mapping[str, object] | None = None,
+        storage_reason: str | None = None,
     ) -> None:
         valid_toolchain_capability = (
             isinstance(capability, str) and capability in PANEL_TOOLCHAIN_CAPABILITIES
@@ -212,6 +221,7 @@ class PanelProvisioningError(RuntimeError):
         self.detail = detail
         self.cleanup_code = cleanup_code
         self.capability = capability
+        self.storage_reason = storage_reason if isinstance(storage_reason, str) else None
         super().__init__(code)
         self.__suppress_context__ = True
 
@@ -221,6 +231,8 @@ class PanelProvisioningError(RuntimeError):
             fields.append(f"capability={self.capability!r}")
         if self.cleanup_code is not None:
             fields.append(f"cleanup_code={self.cleanup_code!r}")
+        if self.storage_reason is not None:
+            fields.append(f"storage_reason={self.storage_reason!r}")
         return f"PanelProvisioningError({', '.join(fields)})"
 
 
@@ -1260,7 +1272,20 @@ class PanelProvisioner:
         if create_outcome.error is not None:
             if create_outcome.cancellation is not None:
                 raise create_outcome.cancellation from None
-            raise PanelProvisioningError("journal_failed")
+            reason = (
+                create_outcome.error.reason
+                if isinstance(create_outcome.error, ProvisioningJournalError)
+                else None
+            )
+            cause = (
+                create_outcome.error.__cause__
+                if isinstance(create_outcome.error, ProvisioningJournalError)
+                else None
+            )
+            failure = PanelProvisioningError("journal_failed", storage_reason=reason)
+            if isinstance(cause, BaseException):
+                raise failure from cause
+            raise failure
         state.journal_phase = ProvisioningPhase.STAGED
         if create_outcome.cancellation is not None:
             raise create_outcome.cancellation from None

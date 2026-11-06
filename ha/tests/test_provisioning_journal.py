@@ -25,6 +25,7 @@ from custom_components.brilliant_mqtt.provisioning_journal import (
     ProvisioningOperation,
     ProvisioningPhase,
     ProvisioningRecord,
+    StorageFailure,
     StoredFileSnapshot,
     StoredFleetProfile,
     StoredJournalError,
@@ -790,7 +791,9 @@ async def test_store_normal_return_without_durable_save_fails_closed(
 
     assert raised.value.code == "journal_save_failed"
     assert raised.value.__context__ is None
-    assert raised.value.__cause__ is None
+    assert isinstance(raised.value.__cause__, StorageFailure)
+    assert raised.value.reason is not None
+    assert "read-back" in raised.value.reason
 
 
 async def test_cancelled_save_settles_and_verifies_before_releasing_lock(
@@ -902,9 +905,14 @@ async def test_store_failures_do_not_retain_secret_exception_objects(
     hass: HomeAssistant,
     memory_store: _MemoryStore,
     boundary: str,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     journal = _journal(hass, memory_store)
-    secret_error = OSError(f"{boundary}-{_ROOT_PASSWORD}")
+    caplog.set_level("ERROR")
+    secret_error = OSError(
+        f"{boundary}-{_ROOT_PASSWORD} at {_record().panel_request.host} "
+        f"{_FINGERPRINT} {_PUBLIC_KEY}"
+    )
     if boundary == "load":
         memory_store.load_error = secret_error
         operation = journal.async_load()
@@ -919,9 +927,24 @@ async def test_store_failures_do_not_retain_secret_exception_objects(
 
     assert raised.value.code == expected_code
     assert raised.value.__context__ is None
-    assert raised.value.__cause__ is None
     assert _ROOT_PASSWORD not in str(raised.value)
     assert _ROOT_PASSWORD not in repr(raised.value)
+    if boundary == "load":
+        assert raised.value.__cause__ is None
+    else:
+        assert isinstance(raised.value.__cause__, OSError)
+        assert raised.value.reason is not None
+        assert "OSError" in raised.value.reason
+        for secret in (_ROOT_PASSWORD, "office.iot.example", _FINGERPRINT, _PUBLIC_KEY):
+            assert secret not in raised.value.reason
+            assert secret not in str(raised.value.__cause__)
+            assert secret not in repr(raised.value.__cause__)
+            assert secret not in caplog.text
+        assert "Traceback" in caplog.text
+        assert "Provisioning journal storage failed (OSError)" in caplog.text
+        diagnostics = await journal.async_diagnostics()
+        assert diagnostics["storage_error"] == raised.value.reason
+        assert _ROOT_PASSWORD not in json.dumps(diagnostics)
 
 
 async def test_unexpected_parser_failure_does_not_retain_secret_exception_object(
@@ -1389,6 +1412,45 @@ async def test_create_with_baseline_persists_journal_and_armed_retained(
     assert _ROOT_PASSWORD not in json.dumps(retained._to_storage())
 
 
+async def test_journal_payload_differs_from_retained_only_by_the_root_password(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The active journal is the retained record plus the panel root password.
+
+    Both writes use the same Store path. A content failure that hits only the
+    journal has to be that password; a normal password persists in both files.
+    """
+    _install_real_store(hass, monkeypatch, tmp_path)
+    journal = ProvisioningJournal(hass)
+    record = replace(
+        _baselined_record(),
+        panel_request=replace(
+            _baselined_record().panel_request,
+            root_password="p@ss/word \u00e9",
+        ),
+    )
+
+    await journal.async_create(record)
+
+    def read_storage(name: str) -> dict[str, Any]:
+        loaded = json.loads(Path(hass.config.path(".storage", name)).read_text(encoding="utf-8"))
+        assert isinstance(loaded, dict)
+        return loaded
+
+    journal_file = await hass.async_add_executor_job(read_storage, JOURNAL_STORAGE_KEY)
+    retained_file = await hass.async_add_executor_job(
+        read_storage, JOURNAL_STORAGE_KEY + ".retained"
+    )
+    stored = journal_file["data"]["record"]
+    retained_record = next(iter(retained_file["data"]["records"].values()))["record"]
+    assert stored["panel_request"]["root_password"] == "p@ss/word \u00e9"
+    without_password = copy.deepcopy(stored)
+    del without_password["panel_request"]["root_password"]
+    assert without_password == retained_record
+
+
 async def test_journal_save_failure_after_arm_leaves_no_ownerless_baseline(
     hass: HomeAssistant,
     monkeypatch: pytest.MonkeyPatch,
@@ -1413,7 +1475,9 @@ async def test_journal_save_failure_after_arm_leaves_no_ownerless_baseline(
 
     assert raised.value.code == "journal_save_failed"
     assert raised.value.__context__ is None
-    assert raised.value.__cause__ is None
+    assert isinstance(raised.value.__cause__, OSError)
+    assert raised.value.reason is not None
+    assert _ROOT_PASSWORD not in str(raised.value.__cause__)
     assert _ROOT_PASSWORD not in str(raised.value)
     assert await journal.async_load() is None
     assert await journal.async_retained_records() == ()
