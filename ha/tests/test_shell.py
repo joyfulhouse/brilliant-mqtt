@@ -40,34 +40,6 @@ _RSA_HOST_KEY_ALGORITHMS = ("rsa-sha2-512", "rsa-sha2-256")
 _RSA_FIRST_HOST_KEY_ALGORITHMS = (*_RSA_HOST_KEY_ALGORITHMS, "ssh-ed25519")
 
 
-class _ManualTimeout:
-    def __init__(self) -> None:
-        self.task: asyncio.Task[object] | None = None
-        self.fired = False
-
-    async def __aenter__(self) -> _ManualTimeout:
-        self.task = asyncio.current_task()
-        return self
-
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        traceback: TracebackType | None,
-    ) -> bool:
-        if self.fired and exc_type is asyncio.CancelledError:
-            raise TimeoutError
-        return False
-
-    def reschedule(self, _when: float | None) -> None:
-        pass
-
-    def fire(self) -> None:
-        self.fired = True
-        assert self.task is not None
-        self.task.cancel()
-
-
 def test_known_hosts_line_pins_host_to_key() -> None:
     line = known_hosts_line("192.168.1.10", _REAL_ED25519_PUB)
     assert line == f"192.168.1.10 {_REAL_ED25519_PUB}\n"
@@ -1186,6 +1158,56 @@ async def test_put_dir_reads_local_files_off_loop_and_streams_on_owning_loop(
     assert sftp.closed == [destination + "/pkg/run.py"]
 
 
+async def test_put_dir_renews_timeout_after_successful_writes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "payload"
+    source.mkdir()
+    (source / "first").write_bytes(b"x" * (shell_module._UPLOAD_CHUNK_BYTES * 2))
+    (source / "second").write_bytes(b"y")
+    sftp = _FakeSFTP()
+    _patch_connect(monkeypatch, _SftpConnection(sftp))
+    shell = AsyncsshShell("panel.local", "pw", _REAL_ED25519_PUB)
+    await shell.connect()
+
+    original_timeout = asyncio.timeout
+    renewals: list[float | None] = []
+
+    class TrackingTimeout:
+        def __init__(self, delay: float) -> None:
+            self.timeout = original_timeout(delay)
+
+        async def __aenter__(self) -> TrackingTimeout:
+            await self.timeout.__aenter__()
+            return self
+
+        async def __aexit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc: BaseException | None,
+            traceback: TracebackType | None,
+        ) -> None:
+            await self.timeout.__aexit__(exc_type, exc, traceback)
+
+        def reschedule(self, when: float | None) -> None:
+            renewals.append(when)
+            self.timeout.reschedule(when)
+
+    monkeypatch.setattr(asyncio, "timeout", TrackingTimeout)
+    await shell.put_dir(str(source), "/destination")
+
+    loop = asyncio.get_running_loop()
+    assert len(renewals) == 3
+    assert all(when is not None for when in renewals)
+    assert all(
+        abs(when - (loop.time() + shell_module._OPERATION_TIMEOUT)) < 0.1
+        for when in renewals
+        if when is not None
+    )
+    assert len(sftp.files["/destination/first"]) == shell_module._UPLOAD_CHUNK_BYTES * 2
+    assert sftp.files["/destination/second"] == b"y"
+
+
 @pytest.mark.parametrize("deadline", [False, True])
 async def test_upload_settles_worker_read_before_remote_close_on_cancel(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, deadline: bool
@@ -1311,12 +1333,12 @@ async def test_put_file_stalled_write_times_out(
         entered.set()
         await asyncio.Future()
 
-    timeout = _ManualTimeout()
+    monkeypatch.setattr(shell_module, "_OPERATION_TIMEOUT", 0.02)
     monkeypatch.setattr(_UploadFile, "write", stalled_write)
-    monkeypatch.setattr(asyncio, "timeout", lambda _delay: timeout)
     task = asyncio.create_task(shell.put_file(str(source), "/remote", 0o600))
-    await entered.wait()
-    timeout.fire()
+    await asyncio.wait_for(entered.wait(), timeout=0.2)
+    done, _pending = await asyncio.wait({task}, timeout=0.2)
+    assert task in done, "put_file did not enforce its operation deadline"
     with pytest.raises(TimeoutError):
         await task
 
@@ -1337,12 +1359,12 @@ async def test_put_file_stalled_sftp_setup_times_out(
         await asyncio.Future()
         return connection.sftp
 
-    timeout = _ManualTimeout()
+    monkeypatch.setattr(shell_module, "_OPERATION_TIMEOUT", 0.02)
     monkeypatch.setattr(connection, "start_sftp_client", stalled_start)
-    monkeypatch.setattr(asyncio, "timeout", lambda _delay: timeout)
     task = asyncio.create_task(shell.put_file(str(source), "/remote", 0o600))
-    await entered.wait()
-    timeout.fire()
+    await asyncio.wait_for(entered.wait(), timeout=0.2)
+    done, _pending = await asyncio.wait({task}, timeout=0.2)
+    assert task in done, "put_file setup did not enforce its operation deadline"
     with pytest.raises(TimeoutError):
         await task
 
@@ -1356,11 +1378,11 @@ async def test_put_file_stalled_sftp_close_times_out(
     _patch_connect(monkeypatch, _SftpConnection(sftp))
     shell = AsyncsshShell("panel.local", "pw", _REAL_ED25519_PUB)
     await shell.connect()
-    timeout = _ManualTimeout()
-    monkeypatch.setattr(asyncio, "timeout", lambda _delay: timeout)
+    monkeypatch.setattr(shell_module, "_OPERATION_TIMEOUT", 0.02)
     task = asyncio.create_task(shell.put_file(str(source), "/remote", 0o600))
-    await sftp.closing.wait()
-    timeout.fire()
+    await asyncio.wait_for(sftp.closing.wait(), timeout=0.2)
+    done, _pending = await asyncio.wait({task}, timeout=0.2)
+    assert task in done, "put_file close did not enforce its operation deadline"
     with pytest.raises(TimeoutError):
         await task
 
