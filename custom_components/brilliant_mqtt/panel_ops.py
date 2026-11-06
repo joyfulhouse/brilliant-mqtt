@@ -101,6 +101,20 @@ _HA_MIRROR_STAGED_ENV = f"{PANEL_HA_MIRROR_STAGED_DIR}/{HA_MIRROR_SERVICE_NAME}.
 class PanelOpError(RuntimeError):
     """A panel shell command exited non-zero."""
 
+    exit_status: int | None
+    stderr: str
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        exit_status: int | None = None,
+        stderr: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.exit_status = exit_status
+        self.stderr = stderr
+
 
 class ReleaseIdentityBlocked(PanelOpError):
     """An actionable, explicitly safe identity refusal with one-operation binding."""
@@ -789,9 +803,11 @@ async def _provisioning_run(
     except Exception:
         failed = True
     if failed or result is None or result.exit_status != 0:
+        exit_status = None if result is None else result.exit_status
+        stderr = "" if result is None else result.stderr
         command = "<redacted>"
         result = None
-        raise PanelOpError(error_code)
+        raise PanelOpError(error_code, exit_status=exit_status, stderr=stderr)
     return result
 
 
@@ -1213,6 +1229,57 @@ async def verify_baseline(shell: PanelShell, snapshot: PanelSnapshot) -> None:
 
 async def finalize_baseline(shell: PanelShell, snapshot: PanelSnapshot) -> None:
     await _baseline_action(shell, snapshot, "finalize")
+
+
+def candidate_release_absent_command(target: str, temporary: str) -> str:
+    """Panel probe: 1 if either candidate path exists, including a dangling symlink.
+
+    The heredoc body runs on the panel interpreter. Older controls are not
+    guaranteed a recent pathlib, so this matches the layout probe: ``os.path.lexists``,
+    with no f-strings or walrus operators in the panel script. The f-string here
+    is evaluated on Home Assistant before the script is sent.
+    """
+    if "\n" in target or "\n" in temporary or "\x00" in target or "\x00" in temporary:
+        raise PanelOpError("baseline_invalid")
+    return (
+        f"{_PANEL_PYTHON} - <<'BRILLIANT_CANDIDATE_ABSENT'\n"
+        "import os\n"
+        f"paths = ({target!r}, {temporary!r})\n"
+        "print(int(any(os.path.lexists(path) for path in paths)))\n"
+        "BRILLIANT_CANDIDATE_ABSENT"
+    )
+
+
+async def prove_unactivated_capture(
+    shell: PanelShell,
+    snapshot: PanelSnapshot,
+    *,
+    version: str,
+    transaction_id: UUID,
+) -> None:
+    """Prove a pre-activation capture still matches the panel and no candidate exists.
+
+    ``check_restored`` compares the live owned tree with the capture. The
+    transaction release directory must also be absent: staging has not run, so
+    discarding the archive cannot hide a candidate.
+    """
+    if (
+        snapshot.baseline is None
+        or _VERSION.fullmatch(version) is None
+        or not _valid_uuid4(transaction_id)
+    ):
+        raise PanelOpError("baseline_invalid")
+    await verify_baseline(shell, snapshot)
+    await _baseline_action(shell, snapshot, "check_restored")
+    target = f"{PANEL_RELEASES_DIR}/{version}--{transaction_id.hex}"
+    temporary = f"{PANEL_RELEASES_DIR}/.{version}--{transaction_id.hex}.tmp"
+    result = await _provisioning_run(
+        shell,
+        candidate_release_absent_command(target, temporary),
+        "baseline_read_failed",
+    )
+    if result.stdout.strip() != "0":
+        raise PanelOpError("baseline_candidate_present")
 
 
 async def baseline_retained(shell: PanelShell) -> bool:

@@ -274,7 +274,7 @@ class _FakeProvisioner:
         self,
         identity: HostIdentity,
         *,
-        error: PanelProvisioningError | None = None,
+        error: BaseException | None = None,
         gate: asyncio.Event | None = None,
         mark_error: Exception | None = None,
         mark_gate: asyncio.Event | None = None,
@@ -409,6 +409,7 @@ def test_broker_fallback_failure_links_to_mqtt_guide(
             f"install/mqtt-broker.md#{documentation_slug}"
         ),
         "stage": "broker_validation",
+        "storage_detail": "",
     }
 
 
@@ -1683,6 +1684,86 @@ async def test_first_panel_progress_cannot_double_submit_and_creates_subentry(
     assert len(entries[0].subentries) == 1
 
 
+async def test_unactivated_discard_logs_unexpected_errors_without_secrets(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    retained = replace(
+        await _restored_ownerless_record(hass),
+        state="armed",
+        recovery_deployment_id=None,
+    )
+    monkeypatch.setattr(
+        ProvisioningJournal, "async_retained_records", AsyncMock(return_value=(retained,))
+    )
+    entry = _fleet_entry(hass)
+    result = await _start_subentry_confirm(hass, entry, identity=_identity())
+    assert result["step_id"] == "panel_discard_unactivated"
+    caplog.set_level("WARNING")
+    provisioner = SimpleNamespace(
+        async_discard_unactivated_ownerless_baseline=AsyncMock(
+            side_effect=RuntimeError(f"discard crashed {_ROOT_PASSWORD}")
+        )
+    )
+
+    with patch.object(flow_gateway, "_get_panel_provisioner", return_value=provisioner):
+        failed = await hass.config_entries.subentries.async_configure(
+            result["flow_id"],
+            {"confirm_discard": True},
+        )
+
+    assert failed["type"] is FlowResultType.FORM
+    assert failed["step_id"] == "panel_connect"
+    assert failed["errors"] == {"base": "unactivated_baseline_not_proven"}
+    placeholders = failed["description_placeholders"]
+    assert isinstance(placeholders, Mapping)
+    detail = placeholders["storage_detail"]
+    assert "RuntimeError" in detail
+    assert _ROOT_PASSWORD not in detail
+    assert _ROOT_PASSWORD not in caplog.text
+    assert "Traceback" in caplog.text
+    assert "Unactivated baseline discard failed unexpectedly" in caplog.text
+
+
+async def test_journal_failure_shows_redacted_storage_reason(
+    hass: HomeAssistant,
+) -> None:
+    confirm = await _start_initial_confirm(hass)
+    reason = "OSError: disk-[redacted]"
+    provisioner = _FakeProvisioner(
+        _identity(),
+        error=PanelProvisioningError("journal_failed", storage_reason=reason),
+        gate=asyncio.Event(),
+    )
+
+    with patch.object(
+        flow_gateway,
+        "_get_panel_provisioner",
+        return_value=provisioner,
+    ):
+        result = cast(
+            dict[str, Any],
+            await hass.config_entries.subentries.async_configure(
+                confirm["flow_id"],
+                {CONF_NAME: "Office"},
+            ),
+        )
+        assert result["type"] is FlowResultType.SHOW_PROGRESS
+        assert provisioner.gate is not None
+        provisioner.gate.set()
+        result = await _drain_progress(
+            hass.config_entries.subentries,
+            confirm["flow_id"],
+        )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "panel_confirm"
+    assert result["errors"] == {"base": "journal_failed"}
+    assert result["description_placeholders"]["storage_detail"] == f" Storage reported: {reason}"
+    assert _ROOT_PASSWORD not in repr(result)
+
+
 async def test_first_panel_provision_failure_returns_to_confirm_without_secret_leak(
     hass: HomeAssistant,
 ) -> None:
@@ -1717,6 +1798,7 @@ async def test_first_panel_provision_failure_returns_to_confirm_without_secret_l
     assert result["step_id"] == "panel_confirm"
     assert result["errors"] == {"base": "stage_failed"}
     assert result["description_placeholders"]["documentation_slug"] == ("panel-stage-failed")
+    assert result["description_placeholders"]["storage_detail"] == ""
     assert _ROOT_PASSWORD not in repr(result)
     assert _BROKER_PASSWORD not in repr(result)
     entries = hass.config_entries.async_entries(DOMAIN)
@@ -5341,6 +5423,37 @@ async def test_ownerless_restore_requires_explicit_finalize_confirmation(
     assert confirmed["step_id"] == "panel_confirm"
     provisioner.async_finalize_ownerless_restored.assert_awaited_once()
     assert _ROOT_PASSWORD not in repr(confirmed)
+
+
+async def test_unactivated_armed_baseline_requires_explicit_discard(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    retained = replace(
+        await _restored_ownerless_record(hass),
+        state="armed",
+        recovery_deployment_id=None,
+    )
+    assert retained.ownerless_unactivated_discard_allowed
+    monkeypatch.setattr(
+        ProvisioningJournal, "async_retained_records", AsyncMock(return_value=(retained,))
+    )
+    entry = _fleet_entry(hass)
+    result = await _start_subentry_confirm(hass, entry, identity=_identity())
+    assert result["step_id"] == "panel_discard_unactivated"
+    assert str(retained.record.transaction_id) in repr(result["description_placeholders"])
+    assert _ROOT_PASSWORD not in repr(result)
+    provisioner = SimpleNamespace(async_discard_unactivated_ownerless_baseline=AsyncMock())
+    with patch.object(flow_gateway, "_get_panel_provisioner", return_value=provisioner):
+        unchecked = await hass.config_entries.subentries.async_configure(
+            result["flow_id"], {"confirm_discard": False}
+        )
+        assert unchecked["step_id"] == "panel_discard_unactivated"
+        provisioner.async_discard_unactivated_ownerless_baseline.assert_not_awaited()
+        confirmed = await hass.config_entries.subentries.async_configure(
+            result["flow_id"], {"confirm_discard": True}
+        )
+    assert confirmed["step_id"] == "panel_confirm"
+    provisioner.async_discard_unactivated_ownerless_baseline.assert_awaited_once()
 
 
 async def test_ownerless_recovery_checks_retained_pin_before_fresh_password(

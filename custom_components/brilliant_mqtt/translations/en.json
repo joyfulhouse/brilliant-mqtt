@@ -338,6 +338,13 @@
           "data": {
             "confirm_finalize": "I confirm permanent removal of this restored rollback baseline"
           }
+        },
+        "panel_discard_unactivated": {
+          "title": "Remove unactivated onboarding baseline",
+          "description": "Add Brilliant panel armed a rollback baseline for {panel} and then could not save the provisioning journal, so no panel entry was created and no candidate was staged. Host: {host}. Pinned SSH fingerprint: {fingerprint}. Transaction: {transaction}. Confirming checks that the panel still matches that capture and that this transaction's release directory is absent, then deletes only that capture and the Home Assistant baseline. It does not install a release. If the check fails, both records stay in place.",
+          "data": {
+            "confirm_discard": "I confirm removal of this unactivated rollback baseline"
+          }
         }
       },
       "progress": {
@@ -403,7 +410,8 @@
         "activation_failed": "The staged release could not be activated.",
         "health_subscribe_failed": "Home Assistant could not subscribe for panel health confirmation.",
         "health_failed": "The new panel release did not pass its health check and was rolled back.",
-        "journal_failed": "Home Assistant could not persist the provisioning safety journal.",
+        "journal_failed": "Home Assistant could not persist the provisioning safety journal.{storage_detail}",
+        "unactivated_baseline_not_proven": "Home Assistant did not remove the armed baseline because the panel no longer matches the capture, or a candidate release is present. Leave the baseline in place and attach redacted diagnostics. See docs/canary-rollback.md.{storage_detail}",
         "progress_failed": "Home Assistant could not update provisioning progress safely.",
         "commit_failed": "The installed panel could not be committed to durable Home Assistant storage.",
         "rollback_failed": "Automatic rollback did not finish. Follow the provisioning recovery instructions before retrying.",

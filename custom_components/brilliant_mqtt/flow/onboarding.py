@@ -33,7 +33,12 @@ from ..panel_provisioner import (
     ProvisioningProgress,
     ProvisioningProgressStage,
 )
-from ..provisioning_journal import PROVISIONING_ERROR_CODES, ProvisioningRecord, RetainedRollback
+from ..provisioning_journal import (
+    PROVISIONING_ERROR_CODES,
+    ProvisioningRecord,
+    RetainedRollback,
+    _redact_text,
+)
 from ..shell import HostIdentity, PanelIdentityError
 from . import gateway
 from .schemas import (
@@ -45,6 +50,7 @@ from .schemas import (
     panel_confirm_schema,
     panel_connect_form_source,
     panel_connect_schema,
+    panel_discard_unactivated_schema,
     panel_finalize_retained_schema,
     panel_recover_journal_schema,
 )
@@ -93,6 +99,7 @@ class _PanelOnboardingMixin:
     _release_override: Mapping[str, object] | None
     _identity_refusal: Mapping[str, object] | None
     _retained_finalize: RetainedRollback | None
+    _unactivated_discard: RetainedRollback | None
     _journal_recover: ProvisioningRecord | None
 
     def _init_panel_onboarding(self) -> None:
@@ -116,6 +123,7 @@ class _PanelOnboardingMixin:
         self._release_override = None
         self._identity_refusal = None
         self._retained_finalize = None
+        self._unactivated_discard = None
         self._journal_recover = None
 
     def _onboarding_parent_entry(self) -> ConfigEntry[Any] | None:
@@ -218,8 +226,13 @@ class _PanelOnboardingMixin:
     def _remove_panel_onboarding(self) -> None:
         """Schedule settlement when HA removes a marked flow before commit."""
         context = cast(dict[str, Any], cast(_FlowSurface, self).context)
-        if self._retained_finalize is not None or self._journal_recover is not None:
+        if (
+            self._retained_finalize is not None
+            or self._journal_recover is not None
+            or self._unactivated_discard is not None
+        ):
             self._retained_finalize = None
+            self._unactivated_discard = None
             self._journal_recover = None
             self._panel_root_password = None
         if (
@@ -244,6 +257,7 @@ class _PanelOnboardingMixin:
         self._panel_root_password = root_password
         self._panel_ssh_username = normalized[CONF_SSH_USERNAME]
         self._retained_finalize = None
+        self._unactivated_discard = None
         self._journal_recover = None
         self._panel_facts = None
         try:
@@ -252,9 +266,14 @@ class _PanelOnboardingMixin:
             # #214: an interrupted ownerless onboarding journal for this exact pinned
             # identity is settled by compensating rollback before anything else.
             journal_record = await gateway.async_ownerless_journal_candidate(hass, host, identity)
-            retained = (
+            unactivated = (
                 None
                 if journal_record is not None
+                else await gateway.async_ownerless_unactivated_candidate(hass, host, identity)
+            )
+            retained = (
+                None
+                if journal_record is not None or unactivated is not None
                 else await gateway.async_ownerless_recovery_candidate(hass, host, identity)
             )
             duplicate = _duplicate_panel(
@@ -300,6 +319,7 @@ class _PanelOnboardingMixin:
 
         self._panel_identity = identity
         self._retained_finalize = retained
+        self._unactivated_discard = unactivated
         self._journal_recover = journal_record
         self._panel_facts = facts
         self._panel_failure = None
@@ -325,6 +345,8 @@ class _PanelOnboardingMixin:
             if not errors and failure is None:
                 if self._journal_recover is not None:
                     return await self.async_step_panel_recover_journal()
+                if self._unactivated_discard is not None:
+                    return await self.async_step_panel_discard_unactivated()
                 if self._retained_finalize is not None:
                     return await self.async_step_panel_finalize_retained()
                 return await self.async_step_panel_confirm()
@@ -339,6 +361,82 @@ class _PanelOnboardingMixin:
                 if failure is not None
                 else {"documentation_url": _PANEL_ONBOARDING_DOCUMENTATION_URL}
             ),
+        )
+
+    async def async_step_panel_discard_unactivated(
+        self, user_input: dict[str, Any] | None = None
+    ) -> _OnboardingResult:
+        """Drop an armed baseline that never received an execution journal."""
+        flow = cast(_FlowSurface, self)
+        retained = self._unactivated_discard
+        identity, host, password = self._panel_identity, self._panel_host, self._panel_root_password
+        if retained is None or identity is None or host is None or password is None:
+            return flow.async_abort(reason="invalid_flow_state")
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            if user_input.get("confirm_discard") is not True:
+                errors["base"] = "confirmation_required"
+            else:
+                self._unactivated_discard = None
+                try:
+                    if self._onboarding_parent_entry() is None:
+                        return flow.async_abort(reason="invalid_parent")
+                    provisioner = gateway._get_panel_provisioner(
+                        flow.hass, expected_identity=identity
+                    )
+                    await provisioner.async_discard_unactivated_ownerless_baseline(
+                        retained, host, password, identity
+                    )
+                except asyncio.CancelledError:
+                    self._panel_root_password = None
+                    raise
+                except PanelProvisioningError as error:
+                    self._panel_root_password = None
+                    self._panel_failure = _provisioning_failure(error)
+                    return await self.async_step_panel_connect()
+                except Exception as error:
+                    secrets = (
+                        password,
+                        host,
+                        identity.public_key,
+                        identity.fingerprint,
+                        retained.record.panel_request.root_password,
+                        retained.record.panel_request.host,
+                        retained.record.panel_request.public_key,
+                        retained.record.panel_request.fingerprint,
+                    )
+                    reason = _redact_text(
+                        f"{type(error).__name__}: {error}",
+                        tuple(item for item in secrets if item),
+                    )
+                    reason = " ".join(
+                        "".join(char if char.isprintable() else " " for char in reason).split()
+                    )[:180]
+                    redacted = RuntimeError(reason or type(error).__name__)
+                    redacted.__traceback__ = error.__traceback__
+                    _LOGGER.warning(
+                        "Unactivated baseline discard failed unexpectedly: %s",
+                        redacted,
+                        exc_info=(type(redacted), redacted, redacted.__traceback__),
+                    )
+                    self._panel_root_password = None
+                    self._panel_failure = _panel_failure(
+                        "unactivated_baseline_not_proven",
+                        stage="recovery",
+                        storage_reason=reason or type(error).__name__,
+                    )
+                    return await self.async_step_panel_connect()
+                return await self.async_step_panel_confirm()
+        return flow.async_show_form(
+            step_id="panel_discard_unactivated",
+            data_schema=panel_discard_unactivated_schema(),
+            errors=errors,
+            description_placeholders={
+                "transaction": str(retained.record.transaction_id),
+                "panel": retained.record.panel_request.slug,
+                "host": retained.record.panel_request.host,
+                "fingerprint": retained.record.panel_request.fingerprint,
+            },
         )
 
     async def async_step_panel_recover_journal(
