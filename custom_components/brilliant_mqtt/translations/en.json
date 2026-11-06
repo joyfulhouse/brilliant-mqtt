@@ -411,7 +411,7 @@
         "health_subscribe_failed": "Home Assistant could not subscribe for panel health confirmation.",
         "health_failed": "The new panel release did not pass its health check and was rolled back.",
         "journal_failed": "Home Assistant could not persist the provisioning safety journal.{storage_detail}",
-        "unactivated_baseline_not_proven": "Home Assistant did not remove the armed baseline because the panel no longer matches the capture, or a candidate release is present. Leave the baseline in place and attach redacted diagnostics. See docs/canary-rollback.md.",
+        "unactivated_baseline_not_proven": "Home Assistant did not remove the armed baseline because the panel no longer matches the capture, or a candidate release is present. Leave the baseline in place and attach redacted diagnostics. See docs/canary-rollback.md.{storage_detail}",
         "progress_failed": "Home Assistant could not update provisioning progress safely.",
         "commit_failed": "The installed panel could not be committed to durable Home Assistant storage.",
         "rollback_failed": "Automatic rollback did not finish. Follow the provisioning recovery instructions before retrying.",

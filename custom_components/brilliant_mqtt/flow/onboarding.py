@@ -33,7 +33,12 @@ from ..panel_provisioner import (
     ProvisioningProgress,
     ProvisioningProgressStage,
 )
-from ..provisioning_journal import PROVISIONING_ERROR_CODES, ProvisioningRecord, RetainedRollback
+from ..provisioning_journal import (
+    PROVISIONING_ERROR_CODES,
+    ProvisioningRecord,
+    RetainedRollback,
+    _redact_text,
+)
 from ..shell import HostIdentity, PanelIdentityError
 from . import gateway
 from .schemas import (
@@ -389,10 +394,36 @@ class _PanelOnboardingMixin:
                     self._panel_root_password = None
                     self._panel_failure = _provisioning_failure(error)
                     return await self.async_step_panel_connect()
-                except Exception:
+                except Exception as error:
+                    secrets = (
+                        password,
+                        host,
+                        identity.public_key,
+                        identity.fingerprint,
+                        retained.record.panel_request.root_password,
+                        retained.record.panel_request.host,
+                        retained.record.panel_request.public_key,
+                        retained.record.panel_request.fingerprint,
+                    )
+                    reason = _redact_text(
+                        f"{type(error).__name__}: {error}",
+                        tuple(item for item in secrets if item),
+                    )
+                    reason = " ".join(
+                        "".join(char if char.isprintable() else " " for char in reason).split()
+                    )[:180]
+                    redacted = RuntimeError(reason or type(error).__name__)
+                    redacted.__traceback__ = error.__traceback__
+                    _LOGGER.warning(
+                        "Unactivated baseline discard failed unexpectedly: %s",
+                        redacted,
+                        exc_info=(type(redacted), redacted, redacted.__traceback__),
+                    )
                     self._panel_root_password = None
                     self._panel_failure = _panel_failure(
-                        "unactivated_baseline_not_proven", stage="recovery"
+                        "unactivated_baseline_not_proven",
+                        stage="recovery",
+                        storage_reason=reason or type(error).__name__,
                     )
                     return await self.async_step_panel_connect()
                 return await self.async_step_panel_confirm()

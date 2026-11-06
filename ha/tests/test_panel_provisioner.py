@@ -2735,12 +2735,14 @@ async def test_discard_refuses_when_panel_no_longer_matches_the_capture(
     hass: HomeAssistant,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     from unittest.mock import AsyncMock
 
     from tests.test_provisioning_journal import _install_real_store
 
     _install_real_store(hass, monkeypatch, tmp_path)
+    caplog.set_level("WARNING")
     journal = ProvisioningJournal(hass)
     record = _record(ProvisioningPhase.STAGED)
     await journal.async_create(record)
@@ -2796,6 +2798,126 @@ async def test_discard_refuses_when_panel_no_longer_matches_the_capture(
 
     assert raised.value.code == "unactivated_baseline_not_proven"
     assert events == []
+    assert raised.value.storage_reason is not None
+    assert raised.value.storage_reason.startswith("snapshot mismatch:")
+    assert "layout" in raised.value.storage_reason
+    assert "SECRET" not in raised.value.storage_reason
+    assert "MQTT_PASSWORD" not in raised.value.storage_reason
+    assert "snapshot mismatch" in caplog.text
+    assert "SECRET" not in caplog.text
+    still = await journal.async_retained(record.transaction_id)
+    assert still is not None and still.state == "armed"
+
+
+def test_unactivated_probe_reasons_name_each_stage_without_secrets() -> None:
+    from custom_components.brilliant_mqtt.panel_provisioner import _probe_failure_reason
+
+    password = "SECRET-root-password"
+    secrets = (password,)
+    read_failed = panel_ops.PanelOpError(
+        "baseline_read_failed",
+        exit_status=1,
+        stderr=f"AttributeError: lexists {password}",
+    )
+    read_reason = _probe_failure_reason(read_failed, secrets)
+    assert read_reason.startswith("panel command failed: exit 1:")
+    assert "lexists" in read_reason
+    assert password not in read_reason
+
+    restored = panel_ops.PanelOpError(
+        "baseline_check_restored_failed",
+        exit_status=2,
+        stderr="ManifestError: baseline_restore_mismatch",
+    )
+    restored_reason = _probe_failure_reason(restored, secrets)
+    assert restored_reason == "check_restored failed: baseline_restore_mismatch"
+
+    verify = panel_ops.PanelOpError("baseline_verify_failed", stderr="baseline_digest_mismatch")
+    assert _probe_failure_reason(verify, ()).startswith("verify_baseline failed:")
+    assert "baseline_digest_mismatch" in _probe_failure_reason(verify, ())
+
+    present = panel_ops.PanelOpError("baseline_candidate_present")
+    assert _probe_failure_reason(present, ()) == "candidate release directory present"
+
+
+async def test_discard_logs_panel_command_failure_without_secrets(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from tests.test_provisioning_journal import _install_real_store
+
+    _install_real_store(hass, monkeypatch, tmp_path)
+    caplog.set_level("WARNING")
+    journal = ProvisioningJournal(hass)
+    record = _record(ProvisioningPhase.STAGED)
+    await journal.async_create(record)
+    await journal.async_complete_cleanup(record.transaction_id)
+    retained = await journal.async_retained(record.transaction_id)
+    assert retained is not None
+    password = record.panel_request.root_password
+
+    class _Ops:
+        async def snapshot_panel(self, _shell: PanelShell) -> panel_ops.PanelSnapshot:
+            return panel_snapshot_from_stored(record.prior_snapshot)
+
+        async def prove_unactivated_capture(self, *_args: object, **_kwargs: object) -> None:
+            raise panel_ops.PanelOpError(
+                "baseline_read_failed",
+                exit_status=1,
+                stderr=(
+                    "AttributeError: 'PosixPath' object has no attribute 'lexists' " + password
+                ),
+            )
+
+        async def finalize_baseline(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+    class _Reporter:
+        async def async_report_rollback_failure(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+        async def async_clear_rollback_failure(self, _transaction_id: UUID) -> None:
+            return None
+
+    provisioner = PanelProvisioner(
+        operation_lock=asyncio.Lock(),
+        journal=journal,
+        identity_fetcher=AsyncMock(return_value=HostIdentity(_PUBLIC_KEY, _FINGERPRINT)),
+        shell_factory=lambda *_args: FakeShell(pinned=_PUBLIC_KEY),
+        inspector=AsyncMock(),
+        duplicate_fingerprint=AsyncMock(return_value=False),
+        operations=cast(Any, _Ops()),
+        snapshot_to_stored=stored_snapshot_from_panel,
+        snapshot_from_stored=panel_snapshot_from_stored,
+        staged_release_factory=staged_release_from_journal,
+        release_provider=AsyncMock(),
+        preflight_launcher_factory=lambda *_args: _unused_preflight,
+        broker_validator=AsyncMock(),
+        health_observer_factory=lambda _slug: AsyncMock(),
+        transaction_lookup=AsyncMock(),
+        repair_reporter=_Reporter(),
+        retained_owner_exists=AsyncMock(return_value=False),
+    )
+
+    with pytest.raises(PanelProvisioningError) as raised:
+        await provisioner.async_discard_unactivated_ownerless_baseline(
+            retained,
+            record.panel_request.host,
+            password,
+            HostIdentity(_PUBLIC_KEY, _FINGERPRINT),
+        )
+
+    assert raised.value.code == "unactivated_baseline_not_proven"
+    assert raised.value.storage_reason is not None
+    assert raised.value.storage_reason.startswith("panel command failed: exit 1:")
+    assert "lexists" in raised.value.storage_reason
+    assert password not in raised.value.storage_reason
+    assert password not in caplog.text
+    assert "panel command failed: exit 1" in caplog.text
     still = await journal.async_retained(record.transaction_id)
     assert still is not None and still.state == "armed"
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
@@ -76,9 +77,89 @@ from .provisioning_journal import (
     StoredPanelRequest,
     StoredPanelSnapshot,
     StoredServiceSnapshot,
+    _redact_text,
     ownerless_journal_recovery_allowed,
 )
 from .shell import HostIdentity, PanelProcess, PanelShell, recovery_connect_failure_code
+
+_LOGGER = logging.getLogger(__name__)
+_PROOF_REASON_LIMIT = 180
+_BASELINE_KIND = re.compile(r"baseline_[a-z0-9_]+")
+
+
+def _proof_reason(text: str) -> str:
+    cleaned = "".join(char if char.isprintable() else " " for char in text)
+    cleaned = " ".join(cleaned.split())
+    return cleaned[:_PROOF_REASON_LIMIT] or "unactivated baseline not proven"
+
+
+def _proof_secrets(record: ProvisioningRecord) -> tuple[str, ...]:
+    request = record.panel_request
+    return tuple(
+        item
+        for item in (
+            request.root_password,
+            request.host,
+            request.public_key,
+            request.fingerprint,
+            record.fleet_profile.host,
+        )
+        if item
+    )
+
+
+def _snapshot_differences(
+    observed: StoredPanelSnapshot,
+    expected: StoredPanelSnapshot,
+) -> tuple[str, ...]:
+    """Name differing sections without copying file bytes or credentials."""
+    names: list[str] = []
+    if observed.layout != expected.layout:
+        names.append("layout")
+    if observed.active_release_target != expected.active_release_target:
+        names.append("active_release_target")
+    if observed.selected_components != expected.selected_components:
+        names.append("selected_components")
+    for field_name in ("environment_file", "version_file"):
+        left = getattr(observed, field_name)
+        right = getattr(expected, field_name)
+        if left.content != right.content:
+            names.append(f"{field_name}.content")
+        if left.mode != right.mode:
+            names.append(f"{field_name}.mode")
+    for field_name in ("bridge_service", "wifi_watchdog_service", "bus_watchdog_service"):
+        left = getattr(observed, field_name)
+        right = getattr(expected, field_name)
+        if left.unit_file.content != right.unit_file.content:
+            names.append(f"{field_name}.unit")
+        if left.unit_file.mode != right.unit_file.mode:
+            names.append(f"{field_name}.mode")
+        if left.enabled != right.enabled or left.active != right.active:
+            names.append(f"{field_name}.state")
+    if not names:
+        names.append("unknown")
+    return tuple(names)
+
+
+def _probe_failure_reason(error: PanelOpError, secrets: tuple[str, ...]) -> str:
+    code = str(error).split(":", 1)[0]
+    stderr = _redact_text(error.stderr, secrets)
+    matched = _BASELINE_KIND.search(stderr)
+    kind = matched.group(0) if matched is not None else ""
+    if code == "baseline_verify_failed":
+        text = "verify_baseline failed" + (f": {kind}" if kind and kind != code else "")
+    elif code == "baseline_check_restored_failed":
+        text = "check_restored failed: " + (kind or code)
+    elif code == "baseline_candidate_present":
+        text = "candidate release directory present"
+    elif code == "baseline_read_failed":
+        status = "unknown" if error.exit_status is None else str(error.exit_status)
+        detail = _proof_reason(stderr) if stderr.strip() else "no stderr"
+        text = f"panel command failed: exit {status}: {detail}"
+    else:
+        text = f"panel proof failed: {code}"
+    return _proof_reason(_redact_text(text, secrets))
+
 
 type JsonScalar = None | bool | int | float | str
 type JsonValue = JsonScalar | list["JsonValue"] | Mapping[str, "JsonValue"]
@@ -2142,15 +2223,26 @@ class PanelProvisioner:
             raise PanelProvisioningError("ownerless_recovery_unavailable")
 
     async def _async_prove_unactivated_panel(
-        self, shell: PanelShell, retained: RetainedRollback
+        self,
+        shell: PanelShell,
+        retained: RetainedRollback,
+        *,
+        password: str,
     ) -> None:
         record = retained.record
+        secrets = _proof_secrets(record) + (password,)
         try:
             live = await self._operations.snapshot_panel(shell)
             observed = replace(self._snapshot_to_stored(live), baseline=None)
             expected = replace(record.prior_snapshot, baseline=None)
             if observed != expected:
-                raise PanelProvisioningError("unactivated_baseline_not_proven")
+                reason = _proof_reason(
+                    "snapshot mismatch: " + (", ".join(_snapshot_differences(observed, expected)))
+                )
+                _LOGGER.warning("Unactivated baseline proof failed: %s", reason)
+                raise PanelProvisioningError(
+                    "unactivated_baseline_not_proven", storage_reason=reason
+                )
             await self._operations.prove_unactivated_capture(
                 shell,
                 self._snapshot_from_stored(record.prior_snapshot),
@@ -2159,8 +2251,18 @@ class PanelProvisioner:
             )
         except PanelProvisioningError:
             raise
-        except (PanelOpError, ValueError, TypeError):
-            raise PanelProvisioningError("unactivated_baseline_not_proven") from None
+        except PanelOpError as error:
+            reason = _probe_failure_reason(error, secrets)
+            _LOGGER.warning("Unactivated baseline proof failed: %s", reason)
+            raise PanelProvisioningError(
+                "unactivated_baseline_not_proven", storage_reason=reason
+            ) from None
+        except (ValueError, TypeError) as error:
+            reason = _proof_reason(f"snapshot unreadable: {type(error).__name__}")
+            _LOGGER.warning("Unactivated baseline proof failed: %s", reason)
+            raise PanelProvisioningError(
+                "unactivated_baseline_not_proven", storage_reason=reason
+            ) from None
 
     async def async_discard_unactivated_ownerless_baseline(
         self,
@@ -2197,7 +2299,7 @@ class PanelProvisioner:
                 if current is None:
                     raise PanelProvisioningError("ownerless_recovery_unavailable")
                 if current.state == "armed":
-                    await self._async_prove_unactivated_panel(shell, current)
+                    await self._async_prove_unactivated_panel(shell, current, password=password)
                     current = await self._journal.async_begin_ownerless_unactivated_discard(
                         expected
                     )

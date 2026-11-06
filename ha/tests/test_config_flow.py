@@ -274,7 +274,7 @@ class _FakeProvisioner:
         self,
         identity: HostIdentity,
         *,
-        error: PanelProvisioningError | None = None,
+        error: BaseException | None = None,
         gate: asyncio.Event | None = None,
         mark_error: Exception | None = None,
         mark_gate: asyncio.Event | None = None,
@@ -1682,6 +1682,48 @@ async def test_first_panel_progress_cannot_double_submit_and_creates_subentry(
     assert entries[0].data[CONF_NEXT_MESH_PRIORITY] == 1
     assert entries[0].data[CONF_SCENE_PANEL] == "__unassigned__"
     assert len(entries[0].subentries) == 1
+
+
+async def test_unactivated_discard_logs_unexpected_errors_without_secrets(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    retained = replace(
+        await _restored_ownerless_record(hass),
+        state="armed",
+        recovery_deployment_id=None,
+    )
+    monkeypatch.setattr(
+        ProvisioningJournal, "async_retained_records", AsyncMock(return_value=(retained,))
+    )
+    entry = _fleet_entry(hass)
+    result = await _start_subentry_confirm(hass, entry, identity=_identity())
+    assert result["step_id"] == "panel_discard_unactivated"
+    caplog.set_level("WARNING")
+    provisioner = SimpleNamespace(
+        async_discard_unactivated_ownerless_baseline=AsyncMock(
+            side_effect=RuntimeError(f"discard crashed {_ROOT_PASSWORD}")
+        )
+    )
+
+    with patch.object(flow_gateway, "_get_panel_provisioner", return_value=provisioner):
+        failed = await hass.config_entries.subentries.async_configure(
+            result["flow_id"],
+            {"confirm_discard": True},
+        )
+
+    assert failed["type"] is FlowResultType.FORM
+    assert failed["step_id"] == "panel_connect"
+    assert failed["errors"] == {"base": "unactivated_baseline_not_proven"}
+    placeholders = failed["description_placeholders"]
+    assert isinstance(placeholders, Mapping)
+    detail = placeholders["storage_detail"]
+    assert "RuntimeError" in detail
+    assert _ROOT_PASSWORD not in detail
+    assert _ROOT_PASSWORD not in caplog.text
+    assert "Traceback" in caplog.text
+    assert "Unactivated baseline discard failed unexpectedly" in caplog.text
 
 
 async def test_journal_failure_shows_redacted_storage_reason(

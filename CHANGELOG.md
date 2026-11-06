@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Removing an unactivated onboarding baseline now checks candidate release
+  paths with `os.path.lexists`, which older panel Pythons provide. A failed
+  proof logs the stage (snapshot section, verify, check_restored kind,
+  candidate present, or command exit and redacted stderr) and shows that
+  short reason on the form.
 - A failed journal or retained save now logs the exception class, redacted
   message, and traceback, and keeps that redacted cause on `journal_failed`.
   Diagnostics include the same redacted `storage_error`. Passwords, host
