@@ -1215,6 +1215,42 @@ async def finalize_baseline(shell: PanelShell, snapshot: PanelSnapshot) -> None:
     await _baseline_action(shell, snapshot, "finalize")
 
 
+async def prove_unactivated_capture(
+    shell: PanelShell,
+    snapshot: PanelSnapshot,
+    *,
+    version: str,
+    transaction_id: UUID,
+) -> None:
+    """Prove a pre-activation capture still matches the panel and no candidate exists.
+
+    ``check_restored`` compares the live owned tree with the capture. The
+    transaction release directory must also be absent: staging has not run, so
+    discarding the archive cannot hide a candidate.
+    """
+    if (
+        snapshot.baseline is None
+        or _VERSION.fullmatch(version) is None
+        or not _valid_uuid4(transaction_id)
+    ):
+        raise PanelOpError("baseline_invalid")
+    await verify_baseline(shell, snapshot)
+    await _baseline_action(shell, snapshot, "check_restored")
+    target = f"{PANEL_RELEASES_DIR}/{version}--{transaction_id.hex}"
+    temporary = f"{PANEL_RELEASES_DIR}/.{version}--{transaction_id.hex}.tmp"
+    result = await _provisioning_run(
+        shell,
+        f"{_PANEL_PYTHON} - <<'BRILLIANT_CANDIDATE_ABSENT'\n"
+        "from pathlib import Path\n"
+        f"paths = (Path({target!r}), Path({temporary!r}))\n"
+        "print(int(any(path.lexists() for path in paths)))\n"
+        "BRILLIANT_CANDIDATE_ABSENT",
+        "baseline_read_failed",
+    )
+    if result.stdout.strip() != "0":
+        raise PanelOpError("baseline_candidate_present")
+
+
 async def baseline_retained(shell: PanelShell) -> bool:
     result = await _provisioning_run(
         shell,

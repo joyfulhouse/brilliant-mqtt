@@ -593,6 +593,10 @@ class _Journal(Protocol):
     async def async_begin_ownerless_finalize(
         self, expected: RetainedRollback
     ) -> RetainedRollback: ...
+
+    async def async_begin_ownerless_unactivated_discard(
+        self, expected: RetainedRollback
+    ) -> RetainedRollback: ...
     async def async_retained_records(self) -> tuple[RetainedRollback, ...]: ...
     async def async_retained(self, transaction_id: UUID) -> RetainedRollback | None: ...
     async def async_retained_state(
@@ -671,6 +675,14 @@ class PanelOperations(Protocol):
     ) -> PanelSnapshot: ...
     async def verify_baseline(self, shell: PanelShell, snapshot: PanelSnapshot) -> None: ...
     async def finalize_baseline(self, shell: PanelShell, snapshot: PanelSnapshot) -> None: ...
+    async def prove_unactivated_capture(
+        self,
+        shell: PanelShell,
+        snapshot: PanelSnapshot,
+        *,
+        version: str,
+        transaction_id: UUID,
+    ) -> None: ...
     async def restart_restored(
         self,
         shell: PanelShell,
@@ -2092,6 +2104,91 @@ class PanelProvisioner:
             or await self._retained_owner_exists(expected)
         ):
             raise PanelProvisioningError("ownerless_recovery_unavailable")
+
+    async def _async_assert_unactivated_ownerless(self, expected: RetainedRollback) -> None:
+        current = await self._journal.async_retained(expected.record.transaction_id)
+        if (
+            await self._journal.async_load() is not None
+            or current != expected
+            or not expected.ownerless_unactivated_discard_allowed
+            or self._retained_owner_exists is None
+            or await self._retained_owner_exists(expected)
+        ):
+            raise PanelProvisioningError("ownerless_recovery_unavailable")
+
+    async def _async_prove_unactivated_panel(
+        self, shell: PanelShell, retained: RetainedRollback
+    ) -> None:
+        record = retained.record
+        try:
+            live = await self._operations.snapshot_panel(shell)
+            observed = replace(self._snapshot_to_stored(live), baseline=None)
+            expected = replace(record.prior_snapshot, baseline=None)
+            if observed != expected:
+                raise PanelProvisioningError("unactivated_baseline_not_proven")
+            await self._operations.prove_unactivated_capture(
+                shell,
+                self._snapshot_from_stored(record.prior_snapshot),
+                version=record.staged_version,
+                transaction_id=record.transaction_id,
+            )
+        except PanelProvisioningError:
+            raise
+        except (PanelOpError, ValueError, TypeError):
+            raise PanelProvisioningError("unactivated_baseline_not_proven") from None
+
+    async def async_discard_unactivated_ownerless_baseline(
+        self,
+        expected: RetainedRollback,
+        host: str,
+        password: str,
+        identity: HostIdentity,
+    ) -> None:
+        """Remove one armed pre-activation baseline after the panel proves it is unchanged.
+
+        Onboarding armed this baseline and then failed before the execution journal
+        existed, so no candidate was staged. Cleanup is allowed only when a fresh
+        read still matches that capture and the transaction's release directory is
+        absent. A retry after the discard marker is durable skips the proof: the
+        archive removal is idempotent.
+        """
+        async with self._async_install_lock():
+            await self._async_assert_unactivated_ownerless(expected)
+            request = expected.record.panel_request
+            proven = await self._identity_fetcher(host)
+            if (
+                identity.public_key != request.public_key
+                or identity.fingerprint != request.fingerprint
+                or proven != identity
+            ):
+                raise PanelProvisioningError("panel_identity_mismatch")
+            shell = self._shell_factory(host, password, request.public_key)
+            try:
+                if shell.pinned_host_key() != request.public_key:
+                    raise PanelProvisioningError("panel_identity_mismatch")
+                await shell.connect()
+                await self._async_assert_unactivated_ownerless(expected)
+                current = await self._journal.async_retained(expected.record.transaction_id)
+                if current is None:
+                    raise PanelProvisioningError("ownerless_recovery_unavailable")
+                if current.state == "armed":
+                    await self._async_prove_unactivated_panel(shell, current)
+                    current = await self._journal.async_begin_ownerless_unactivated_discard(
+                        expected
+                    )
+                elif current.finalization_origin != "ownerless_unactivated":
+                    raise PanelProvisioningError("ownerless_recovery_unavailable")
+                await self._operations.finalize_baseline(
+                    shell, self._snapshot_from_stored(current.record.prior_snapshot)
+                )
+                await self._journal.async_remove_retained(current.record.transaction_id)
+                await self._repair_reporter.async_clear_rollback_failure(
+                    current.record.transaction_id
+                )
+            finally:
+                closed = await _settle_close(shell.close)
+                if closed.cancellation is not None:
+                    raise closed.cancellation from None
 
     async def async_finalize_ownerless_restored(
         self,

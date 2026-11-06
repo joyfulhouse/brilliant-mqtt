@@ -5343,6 +5343,37 @@ async def test_ownerless_restore_requires_explicit_finalize_confirmation(
     assert _ROOT_PASSWORD not in repr(confirmed)
 
 
+async def test_unactivated_armed_baseline_requires_explicit_discard(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    retained = replace(
+        await _restored_ownerless_record(hass),
+        state="armed",
+        recovery_deployment_id=None,
+    )
+    assert retained.ownerless_unactivated_discard_allowed
+    monkeypatch.setattr(
+        ProvisioningJournal, "async_retained_records", AsyncMock(return_value=(retained,))
+    )
+    entry = _fleet_entry(hass)
+    result = await _start_subentry_confirm(hass, entry, identity=_identity())
+    assert result["step_id"] == "panel_discard_unactivated"
+    assert str(retained.record.transaction_id) in repr(result["description_placeholders"])
+    assert _ROOT_PASSWORD not in repr(result)
+    provisioner = SimpleNamespace(async_discard_unactivated_ownerless_baseline=AsyncMock())
+    with patch.object(flow_gateway, "_get_panel_provisioner", return_value=provisioner):
+        unchecked = await hass.config_entries.subentries.async_configure(
+            result["flow_id"], {"confirm_discard": False}
+        )
+        assert unchecked["step_id"] == "panel_discard_unactivated"
+        provisioner.async_discard_unactivated_ownerless_baseline.assert_not_awaited()
+        confirmed = await hass.config_entries.subentries.async_configure(
+            result["flow_id"], {"confirm_discard": True}
+        )
+    assert confirmed["step_id"] == "panel_confirm"
+    provisioner.async_discard_unactivated_ownerless_baseline.assert_awaited_once()
+
+
 async def test_ownerless_recovery_checks_retained_pin_before_fresh_password(
     hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
 ) -> None:
