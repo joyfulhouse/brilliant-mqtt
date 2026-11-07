@@ -116,6 +116,9 @@ class Settings:
 
     # Exit the process after this many consecutive unresolved-close fences.
     bus_fenced_start_limit: int = 3
+    # Enable panel camera snapshot & TV Ambilight entities on this panel.
+    ambilight_enabled: bool = False
+    ambilight_interval_s: float = 1.0
 
     def __post_init__(self) -> None:
         if (
@@ -231,6 +234,10 @@ class Settings:
         scene_watermark_file = env.get(
             "SCENE_WATERMARK_FILE", "/data/brilliant-mqtt/scene-watermarks.json"
         )
+        ambilight_enabled = _env_bool(env, "AMBILIGHT_ENABLED", "0")
+        ambilight_interval_s = float(env.get("AMBILIGHT_INTERVAL_S", "1.0"))
+        if ambilight_interval_s <= 0:
+            raise ValueError("AMBILIGHT_INTERVAL_S must be > 0")
 
         return cls(
             panel=panel,
@@ -262,4 +269,6 @@ class Settings:
             bus_phase_file=bus_phase_file,
             scene_bridge_enabled=scene_bridge_enabled,
             scene_watermark_file=scene_watermark_file,
+            ambilight_enabled=ambilight_enabled,
+            ambilight_interval_s=ambilight_interval_s,
         )

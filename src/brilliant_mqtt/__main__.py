@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import NoReturn
 
 from brilliant_mqtt import __version__
+from brilliant_mqtt.ambilight import AmbilightController, GStreamerCameraAdapter
 from brilliant_mqtt.bridge import Bridge, HotPollReadTimeout, WriteThrottle
 from brilliant_mqtt.bus import BusStartFencedError, RpcBusAdapter
 from brilliant_mqtt.config import Settings
@@ -213,6 +214,7 @@ async def _run_session(
     panel_bridge: Bridge | None = None
     mesh_bridge: Bridge | None = None
     scene_bridge: SceneBridge | None = None
+    ambilight_controller: AmbilightController | None = None
     mqtt_connected = False
     phase_marker_failure_logged = False
     try:
@@ -364,6 +366,27 @@ async def _run_session(
             progress.reconciled()
         if scene_bridge is not None:
             await scene_bridge.async_start()
+
+        if settings.ambilight_enabled:
+            try:
+                amb_state_path = (
+                    Path(settings.motion_desired_state_dir) / "ambilight.json"
+                    if settings.motion_desired_state_dir
+                    else None
+                )
+                ambilight_controller = AmbilightController(
+                    mqtt=mqtt,
+                    panel=settings.panel,
+                    camera=GStreamerCameraAdapter(),
+                    state_path=amb_state_path,
+                    default_enabled=False,
+                    default_interval_s=settings.ambilight_interval_s,
+                    owned_topics=owned_topics,
+                )
+                await ambilight_controller.start()
+            except Exception:
+                log.exception("ambilight controller startup failed; continuing without it")
+                ambilight_controller = None
 
         tick = settings.hot_poll_seconds if settings.hot_poll_seconds > 0 else _IDLE_TICK_S
         next_resync = time.monotonic() + settings.resync_seconds
@@ -541,6 +564,11 @@ async def _run_session(
                 await panel_bridge.shutdown_wired_feedback()
             except Exception as error:
                 log.error("WIRED_SHUTDOWN_FAILED %s", type(error).__name__)
+        if ambilight_controller is not None:
+            try:
+                await ambilight_controller.shutdown()
+            except Exception:
+                log.exception("ambilight controller shutdown failed during cleanup")
         if scene_bridge is not None:
             try:
                 await scene_bridge.async_shutdown()
