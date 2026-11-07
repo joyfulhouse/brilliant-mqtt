@@ -19,7 +19,11 @@ from typing import NoReturn
 
 from brilliant_mqtt import __version__
 from brilliant_mqtt.bridge import Bridge, HotPollReadTimeout, WriteThrottle
-from brilliant_mqtt.bus import BusStartFencedError, RpcBusAdapter
+from brilliant_mqtt.bus import (
+    BusStartFencedError,
+    HostedVirtualPeripheralAdapter,
+    RpcBusAdapter,
+)
 from brilliant_mqtt.config import Settings
 from brilliant_mqtt.desired_state import DesiredState
 from brilliant_mqtt.diagnostics import ResponseDiagnostics, SessionRebuildReason
@@ -31,6 +35,10 @@ from brilliant_mqtt.mqttio import AioMqttAdapter
 from brilliant_mqtt.protocols import BusClient, CommandSubscribeError
 from brilliant_mqtt.retained_topics import RetainedLedgerError, RetainedTopicLedger
 from brilliant_mqtt.scene_bridge import SceneBridge
+from brilliant_mqtt.virtual_sliders import (
+    VirtualSliderController,
+    parse_virtual_slider_specs,
+)
 
 log = logging.getLogger(__name__)
 
@@ -213,6 +221,7 @@ async def _run_session(
     panel_bridge: Bridge | None = None
     mesh_bridge: Bridge | None = None
     scene_bridge: SceneBridge | None = None
+    virtual_slider_controller: VirtualSliderController | None = None
     mqtt_connected = False
     phase_marker_failure_logged = False
     try:
@@ -293,12 +302,18 @@ async def _run_session(
                 write_throttle=write_throttle,
                 owned_topics=None,
             )
+
+            async def _on_mesh_acquire() -> None:
+                await mesh_bridge.reconcile()
+                if virtual_slider_controller is not None:
+                    await virtual_slider_controller.on_mesh_leadership_acquired()
+
             leader = MeshLeader(
                 mqtt,
                 settings.panel,
                 settings.mesh_priority,
                 settings.mesh_heartbeat_seconds,
-                on_acquire=mesh_bridge.reconcile,
+                on_acquire=_on_mesh_acquire,
                 on_lose=mesh_bridge.withdraw,
             )
 
@@ -364,6 +379,37 @@ async def _run_session(
             progress.reconciled()
         if scene_bridge is not None:
             await scene_bridge.async_start()
+
+        if settings.virtual_sliders_json.strip():
+            try:
+                own_dev = bus.own_device_id or ""
+                vs_specs = parse_virtual_slider_specs(settings.virtual_sliders_json, own_dev)
+                if vs_specs:
+                    vs_state_path = (
+                        Path(settings.motion_desired_state_dir) / "virtual-sliders.json"
+                        if settings.motion_desired_state_dir
+                        else None
+                    )
+                    virtual_slider_controller = VirtualSliderController(
+                        bus=bus,
+                        mqtt=mqtt,
+                        panel=settings.panel,
+                        own_device_id=own_dev,
+                        specs=vs_specs,
+                        host_factory=lambda vspec, on_ext: HostedVirtualPeripheralAdapter(
+                            vspec, on_ext
+                        ),
+                        state_path=vs_state_path,
+                        owned_topics=owned_topics,
+                        want_device=_is_panel_device,
+                        is_mesh_leader=(
+                            (lambda: leader.is_leader) if leader is not None else (lambda: False)
+                        ),
+                    )
+                    await virtual_slider_controller.start()
+            except Exception:
+                log.exception("virtual slider controller startup failed; continuing without it")
+                virtual_slider_controller = None
 
         tick = settings.hot_poll_seconds if settings.hot_poll_seconds > 0 else _IDLE_TICK_S
         next_resync = time.monotonic() + settings.resync_seconds
@@ -541,6 +587,11 @@ async def _run_session(
                 await panel_bridge.shutdown_wired_feedback()
             except Exception as error:
                 log.error("WIRED_SHUTDOWN_FAILED %s", type(error).__name__)
+        if virtual_slider_controller is not None:
+            try:
+                await virtual_slider_controller.shutdown()
+            except Exception:
+                log.exception("virtual slider controller shutdown failed during cleanup")
         if scene_bridge is not None:
             try:
                 await scene_bridge.async_shutdown()
