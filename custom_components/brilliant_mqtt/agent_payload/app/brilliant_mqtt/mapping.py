@@ -798,7 +798,31 @@ def _render_aux(var: Variable, value_kind: str, invert: bool) -> object | None:
     return None
 
 
-def payload_fields(device: BrilliantDevice) -> dict[str, object]:
+# The Brilliant mobile app hardcodes motion_low_threshold = 20 across all
+# sensitivity presets (20/99, 20/85, 20/70). Because the switch PIR sensor's
+# idle thermal noise floor is ~35-50, any switch with motion_low_threshold <= 20
+# cannot clear its hardware movement_detected latch once tripped.
+UNCALIBRATED_LOW_THRESHOLD_MAX = 20
+
+
+def has_calibrated_motion_thresholds(device: BrilliantDevice) -> bool:
+    """Return True when *device* carries calibrated PIR thresholds above the factory floor."""
+    low_var = device.variables.get("motion_low_threshold")
+    high_var = device.variables.get("motion_high_threshold")
+    if low_var is None or high_var is None:
+        return False
+    low = low_var.as_int()
+    high = high_var.as_int()
+    return (
+        low is not None and high is not None and UNCALIBRATED_LOW_THRESHOLD_MAX < low <= high <= 255
+    )
+
+
+def payload_fields(
+    device: BrilliantDevice,
+    *,
+    native_motion_passthrough: bool = False,
+) -> dict[str, object]:
     """Return the shared JSON state payload fields for *device*.
 
     THE single source for state payloads (the bridge serialises the result).
@@ -847,10 +871,19 @@ def payload_fields(device: BrilliantDevice) -> dict[str, object]:
         # (stale subsystem). Only the VALUE is forced — the payload key is still
         # emitted, so descriptor/payload-key lockstep is preserved. (gate_var is
         # validated bool-only in AuxSpec.__post_init__.)
+        # When opt-in native_motion_passthrough is active AND the device has
+        # confirmed calibrated thresholds (motion_low_threshold > 20), allow
+        # hardware movement_detected through while enable_motion_score is "0".
         if spec.gate_var is not None:
             gate = device.variables.get(spec.gate_var)
             if gate is None or not gate.as_bool():
-                rendered = False
+                if not (
+                    native_motion_passthrough
+                    and spec.var == "movement_detected"
+                    and gate is not None
+                    and has_calibrated_motion_thresholds(device)
+                ):
+                    rendered = False
         data[spec.key] = rendered
 
     return data

@@ -19,6 +19,7 @@ import time
 from collections.abc import Callable
 from dataclasses import replace
 
+from brilliant_mqtt.mapping import has_calibrated_motion_thresholds
 from brilliant_mqtt.model import BrilliantDevice, Variable
 
 _MOTION_VAR = "movement_detected"
@@ -35,9 +36,16 @@ class MotionDeriver:
     one instance can safely serve both Bridge scopes in a process.
     """
 
-    def __init__(self, hold_s: float, clock: Callable[[], float] = time.monotonic) -> None:
+    def __init__(
+        self,
+        hold_s: float,
+        clock: Callable[[], float] = time.monotonic,
+        *,
+        native_passthrough: bool = False,
+    ) -> None:
         self._hold_s = hold_s
         self._clock = clock
+        self._native_passthrough = native_passthrough
         # peripheral_id -> monotonic time of the last score >= threshold.
         self._last_hot: dict[str, float] = {}
 
@@ -55,9 +63,14 @@ class MotionDeriver:
 
         pid = device.peripheral_id
         if not vars_[_ENABLE_VAR].as_bool():
-            # Scoring off: no live data. Drop the hold so a later re-enable
-            # starts cold instead of resurrecting a stale window.
+            # Scoring off: drop any score-derived hold window so a later
+            # re-enable starts cold. When opt-in native_passthrough is active
+            # and the switch reports calibrated thresholds (motion_low_threshold > 20),
+            # pass through the switch MCU's native edge-triggered movement_detected;
+            # otherwise force "0" so uncalibrated switches never publish a stuck latch.
             self._last_hot.pop(pid, None)
+            if self._native_passthrough and has_calibrated_motion_thresholds(device):
+                return device
             return self._with_motion(device, motion, "0")
 
         score = vars_[_SCORE_VAR].as_int()
