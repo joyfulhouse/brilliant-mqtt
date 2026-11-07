@@ -81,6 +81,39 @@ def meta_topic(panel: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def device_block(
+    panel: str,
+    sw_version: str | None = None,
+    *,
+    device_name: str | None = None,
+    peripheral_id: str | None = None,
+) -> dict[str, object]:
+    """Return the canonical HA MQTT Discovery ``device`` block for *panel*."""
+    if panel == "mesh":
+        # "mesh" is a RESERVED panel slug: the whole-home BLE mesh pseudo-panel.
+        # Its namespace is publisher-agnostic — any panel may hold leadership
+        # and publish it — so the HA device must not carry any panel's name.
+        resolved_name = device_name or "BLE Mesh"
+        device_identifier = _discovery_object_id("mesh", peripheral_id or "mesh")
+        model = "BLE Mesh"
+    else:
+        # Display name only — identifiers/topics/unique_id keep the raw slug.
+        panel_display = panel.replace("_", " ").replace("-", " ").title()
+        resolved_name = f"Brilliant {panel_display}"
+        device_identifier = f"brilliant_panel_{panel}"
+        model = "Control"
+
+    device: dict[str, object] = {
+        "identifiers": [device_identifier],
+        "manufacturer": "Brilliant",
+        "model": model,
+        "name": resolved_name,
+    }
+    if sw_version is not None:
+        device["sw_version"] = sw_version
+    return device
+
+
 def config_payload(e: EntityDescriptor, sw_version: str | None = None) -> str:
     """Return a sorted-keys JSON string for HA MQTT Discovery.
 
@@ -96,28 +129,12 @@ def config_payload(e: EntityDescriptor, sw_version: str | None = None) -> str:
     _avail_topic = availability_topic(e.panel)
     _cmd_topic = command_topic(e.panel, e.peripheral_id)
 
-    if e.panel == "mesh":
-        # "mesh" is a RESERVED panel slug: the whole-home BLE mesh pseudo-panel.
-        # Its namespace is publisher-agnostic — any panel may hold leadership
-        # and publish it — so the HA device must not carry any panel's name.
-        device_name = e.device_name or e.name
-        device_identifier = _discovery_object_id("mesh", e.peripheral_id)
-        model = "BLE Mesh"
-    else:
-        # Display name only — identifiers/topics/unique_id keep the raw slug.
-        panel_display = e.panel.replace("_", " ").replace("-", " ").title()
-        device_name = f"Brilliant {panel_display}"
-        device_identifier = f"brilliant_panel_{e.panel}"
-        model = "Control"
-
-    device: dict[str, object] = {
-        "identifiers": [device_identifier],
-        "manufacturer": "Brilliant",
-        "model": model,
-        "name": device_name,
-    }
-    if sw_version is not None:
-        device["sw_version"] = sw_version
+    device = device_block(
+        e.panel,
+        sw_version=sw_version,
+        device_name=e.device_name or e.name,
+        peripheral_id=e.peripheral_id,
+    )
 
     payload: dict[str, object] = {
         "availability": [{"topic": _avail_topic}],
