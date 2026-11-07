@@ -93,6 +93,14 @@ class DesiredState:
         """Desired vars for a peripheral (copy; empty if none)."""
         return dict(self._state.get(peripheral_id, {}))
 
+    def seed_default(self, peripheral_id: str, var: str, value: str) -> bool:
+        """Seed a default desired value only if (peripheral_id, var) has no entry yet."""
+        existing = self._state.get(peripheral_id)
+        if existing is not None and var in existing:
+            return False
+        self.record(peripheral_id, var, value)
+        return True
+
     def load(self) -> None:
         """Load from disk; a missing or unreadable file yields empty state.
 

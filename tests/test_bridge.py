@@ -2425,3 +2425,57 @@ class TestReconcileSubscribeDedupe:
             await bridge.reconcile()
 
         assert raised.value is failure
+
+
+class TestNativeMotionPassthroughBridge:
+    async def test_native_passthrough_seeds_score_off_and_calibrated_thresholds(
+        self, tmp_path: Path, mesh_load_with_motion: BrilliantDevice
+    ) -> None:
+        from brilliant_mqtt.desired_state import DesiredState
+
+        ds = DesiredState(tmp_path / "desired.json")
+        bus = FakeBus([mesh_load_with_motion])
+        mqtt = FakeMqtt()
+        bridge = Bridge(
+            bus,
+            mqtt,
+            MESH_PANEL,
+            include=_is_mesh,
+            desired=ds,
+            motion_native_passthrough=True,
+            motion_default_high_threshold=65,
+            motion_default_low_threshold=65,
+        )
+        await bridge.reconcile()
+
+        assert ds.wanted(MESH_PID) == {
+            "enable_motion_score": "0",
+            "motion_high_threshold": "65",
+            "motion_low_threshold": "65",
+        }
+
+    async def test_native_passthrough_state_payload_exposes_motion_when_calibrated(
+        self, mesh_load_with_motion: BrilliantDevice
+    ) -> None:
+        mesh_load_with_motion.variables["motion_high_threshold"] = Variable(
+            "motion_high_threshold", "65"
+        )
+        mesh_load_with_motion.variables["motion_low_threshold"] = Variable(
+            "motion_low_threshold", "65"
+        )
+        bus = FakeBus([mesh_load_with_motion])
+        mqtt = FakeMqtt()
+        bridge = Bridge(
+            bus,
+            mqtt,
+            MESH_PANEL,
+            include=_is_mesh,
+            motion_native_passthrough=True,
+        )
+        await bridge.reconcile()
+
+        states = [p for p in mqtt.published if p[0] == f"brilliant/{MESH_PANEL}/{MESH_PID}/state"]
+        assert len(states) == 1
+        payload = json.loads(states[0][1])
+        assert payload["motion"] is True
+        assert payload["enable_motion_score"] is False

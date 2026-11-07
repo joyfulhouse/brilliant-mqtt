@@ -287,3 +287,11 @@ def test_record_survives_unwritable_path(tmp_path: Path) -> None:
     ds = DesiredState(blocker / "d.json")
     ds.record("pid1", "enable_motion_score", "1")  # must not raise
     assert ds.wanted("pid1") == {"enable_motion_score": "1"}
+
+
+def test_seed_default_only_writes_when_missing(tmp_path: Path) -> None:
+    ds = DesiredState(tmp_path / "d.json")
+    assert ds.seed_default("pid1", "motion_low_threshold", "65") is True
+    assert ds.wanted("pid1") == {"motion_low_threshold": "65"}
+    assert ds.seed_default("pid1", "motion_low_threshold", "80") is False
+    assert ds.wanted("pid1") == {"motion_low_threshold": "65"}

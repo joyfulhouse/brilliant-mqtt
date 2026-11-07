@@ -149,3 +149,37 @@ def test_hold_zero_pulses_on_spike_tick() -> None:
     d = MotionDeriver(0.0, clock=FakeClock())
     out = d.apply(_scoring(score="200"))
     assert out.variables["movement_detected"].value == "1"
+
+
+def test_native_passthrough_requires_opt_in_and_calibrated_thresholds() -> None:
+    clock = FakeClock()
+    d = MotionDeriver(60.0, clock=clock, native_passthrough=True)
+
+    # Uncalibrated switch (low=20) with scoring off still forces "0":
+    uncal = _mesh_light(
+        movement_detected="1",
+        motion_score="0",
+        enable_motion_score="0",
+        motion_high_threshold="70",
+        motion_low_threshold="20",
+    )
+    assert d.apply(uncal).variables["movement_detected"].value == "0"
+
+    # Calibrated switch (low=55, high=90) with scoring off passes native latch through:
+    cal_on = _mesh_light(
+        movement_detected="1",
+        motion_score="0",
+        enable_motion_score="0",
+        motion_high_threshold="90",
+        motion_low_threshold="55",
+    )
+    assert d.apply(cal_on).variables["movement_detected"].value == "1"
+
+    cal_off = _mesh_light(
+        movement_detected="0",
+        motion_score="0",
+        enable_motion_score="0",
+        motion_high_threshold="90",
+        motion_low_threshold="55",
+    )
+    assert d.apply(cal_off).variables["movement_detected"].value == "0"
