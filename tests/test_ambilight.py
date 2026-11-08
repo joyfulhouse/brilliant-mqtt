@@ -14,10 +14,14 @@ from brilliant_mqtt.ambilight import (
     AmbilightCrop,
     CameraCaptureProtocol,
     GStreamerCameraAdapter,
+    build_52_panel_coords,
+    build_depth_glow_boxes,
     build_gstreamer_i420_args,
     build_gstreamer_jpeg_args,
+    encode_nanoleaf_v2_packet,
     extract_ambilight_sample_from_i420,
     is_privacy_shutter_closed,
+    sample_box_fast,
 )
 from brilliant_mqtt.retained_topics import RetainedTopicLedger
 from tests.fakes import FakeMqtt
@@ -229,3 +233,30 @@ class TestAmbilightController:
         mqtt.published.clear()
         await ctrl.shutdown()
         assert ("brilliant/living_room/ambilight/snapshot", "", True) in mqtt.published
+
+
+class TestMultiZoneRPMLightHelpers:
+    def test_52_panel_coords_and_nanoleaf_v2_packet(self) -> None:
+        coords = build_52_panel_coords()
+        assert len(coords) == 52
+        boxes = build_depth_glow_boxes(320, 184)
+        assert len(boxes) == 52
+
+        frame = _make_solid_i420_frame(320, 184, y=22, u=120, v=165)
+        y_size = 320 * 184
+        uv_size = 160 * 92
+        mv = memoryview(frame)
+        _pid, ey_idx, euv_idx, _iy_idx, _iuv_idx = boxes[0]
+        r, g, b = sample_box_fast(
+            mv[:y_size],
+            mv[y_size : y_size + uv_size],
+            mv[y_size + uv_size : y_size + 2 * uv_size],
+            ey_idx,
+            euv_idx,
+        )
+        assert r > g > 0
+        assert b > 0
+
+        pkt = encode_nanoleaf_v2_packet([(r, g, b)] * 52, transition_ds=1)
+        assert len(pkt) == 2 + 52 * 8
+

@@ -21,6 +21,7 @@ import contextlib
 import json
 import logging
 import os
+import struct
 import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -791,3 +792,247 @@ class AmbilightController:
             self._state_topic(),
             json.dumps(payload, sort_keys=True),
         )
+
+
+# ---------------------------------------------------------------------------
+# Multi-Zone Perceptual RPMLight Streamer Engine (52-Zone Perimeter + Sky)
+# Standalone upstream package: https://github.com/rpmccormick/rpmlight
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ZoneFrameResult:
+    """Computed 52-zone RGB output, transition time, scene-cut flag, and overhead sky."""
+
+    zones_rgb: list[tuple[int, int, int]]
+    nl_transition_ds: int
+    is_scene_cut: bool
+    up_rgb: list[int]
+    up_bri: int
+    down_rgb: list[int]
+    down_bri: int
+
+
+def build_52_panel_coords() -> list[tuple[int, int, int]]:
+    """Build the 52-zone clockwise perimeter coordinate ring (starting bottom-center)."""
+    coords: list[tuple[int, int, int]] = []
+    pid = 0
+    for x in range(400, -1, -50):
+        coords.append((pid, x, 0))
+        pid += 1
+    for y in range(50, 451, 50):
+        coords.append((pid, 0, y))
+        pid += 1
+    for x in range(50, 851, 50):
+        coords.append((pid, x, 450))
+        pid += 1
+    for y in range(400, -1, -50):
+        coords.append((pid, 850, y))
+        pid += 1
+    for x in range(800, 449, -50):
+        coords.append((pid, x, 0))
+        pid += 1
+    return coords
+
+
+def _precompute_box_indices(
+    width: int, x0: int, y0: int, x1: int, y1: int, step: int = 4
+) -> tuple[list[int], list[int]]:
+    uv_stride = width // 2
+    y_indices: list[int] = []
+    uv_indices: list[int] = []
+    for py in range(y0, y1, step):
+        y_row = py * width
+        uv_row = (py >> 1) * uv_stride
+        for px in range(x0, x1, step):
+            y_indices.append(y_row + px)
+            uv_indices.append(uv_row + (px >> 1))
+    return y_indices, uv_indices
+
+
+def build_depth_glow_boxes(
+    width: int = 320,
+    height: int = 184,
+) -> list[tuple[int, list[int], list[int], list[int], list[int]]]:
+    """Precompute a tight Outer Edge Strip + a 54x44 Deep Inner Strip per zone."""
+    ex_min, ex_max, ey_min, ey_max, ew, eh = 3, 315, 2, 170, 16, 14
+    espan_x = (ex_max - ex_min) - ew
+    espan_y = (ey_max - ey_min) - eh
+
+    ix_min, ix_max, iy_min, iy_max, iw, ih = 18, 302, 18, 154, 54, 44
+    ispan_x = (ix_max - ix_min) - iw
+    ispan_y = (iy_max - iy_min) - ih
+
+    precomputed: list[tuple[int, list[int], list[int], list[int], list[int]]] = []
+    for pid, nx, ny in build_52_panel_coords():
+        u = nx / 850.0
+        v = 1.0 - (ny / 450.0)
+
+        ex0 = round(ex_min + u * espan_x)
+        ey0 = round(ey_min + v * espan_y)
+        cur_eh = eh
+        if ex0 >= 265 and ey0 >= 142:
+            ey0 = 138
+        elif ey0 >= 152:
+            ey0 = 162
+            cur_eh = 8
+        ey_idx, euv_idx = _precompute_box_indices(
+            width, ex0, ey0, min(width, ex0 + ew), min(height, ey0 + cur_eh), step=3
+        )
+
+        ix0 = round(ix_min + u * ispan_x)
+        iy0 = round(iy_min + v * ispan_y)
+        cur_ih = ih
+        if ey0 >= 152:
+            iy0 = 88
+            cur_ih = 46
+        iy_idx, iuv_idx = _precompute_box_indices(
+            width, ix0, iy0, min(width, ix0 + iw), min(height, iy0 + cur_ih), step=8
+        )
+
+        precomputed.append((pid, ey_idx, euv_idx, iy_idx, iuv_idx))
+    return precomputed
+
+
+def sample_box_fast(
+    y_plane: bytes | memoryview,
+    u_plane: bytes | memoryview,
+    v_plane: bytes | memoryview,
+    y_indices: list[int],
+    uv_indices: list[int],
+    chroma_magnet: bool = True,
+    ignore_bright_matte: bool = False,
+) -> tuple[int, int, int]:
+    """Extract perceptual RGB from an I420 sampling box with Bayer fringe suppression."""
+    y_acc = 0
+    u_acc = 0
+    v_acc = 0
+    w_acc = 0
+    luma_sum = 0
+    count = len(y_indices)
+
+    for idx in range(count):
+        yv = y_plane[y_indices[idx]]
+        uv_i = uv_indices[idx]
+        u = u_plane[uv_i] - 128
+        v = v_plane[uv_i] - 128
+
+        if yv >= 85 and -8 <= u <= 24 and -24 <= v <= 4 and (u * u + v * v) < 750:
+            u = int(u * 0.25)
+            v = int(v * 0.25)
+        elif 10 <= yv < 34 and u >= 2 and v <= -2:
+            u = int(u * 1.55)
+            v = int(v * 1.35)
+        uv_sq = u * u + v * v
+
+        vr = (v * 380) >> 8
+        ub = (u * 320) >> 8
+        chroma_lift = max(0, vr, ub)
+        peak_ch = yv + chroma_lift
+        luma_sum += peak_ch
+
+        luma_f = peak_ch - 8
+        if luma_f <= 0:
+            w = 1
+        else:
+            luma_f = min(72, luma_f)
+            if not chroma_magnet:
+                w = 2 + (luma_f >> 2)
+            else:
+                if yv > 130 and uv_sq < 650:
+                    md = 64 - (((yv - 130) * (650 - uv_sq)) >> 8)
+                    min_md = 4 if ignore_bright_matte else 16
+                    matte_damp = max(min_md, md)
+                else:
+                    matte_damp = 64
+                uv_eff = min(550, uv_sq)
+                chroma_f = max(0, uv_eff - 110)
+                w = 4 + ((((luma_f >> 2) + ((chroma_f * luma_f) >> 9)) * matte_damp) >> 6)
+
+        y_acc += yv * w
+        u_acc += u * w
+        v_acc += v * w
+        w_acc += w
+
+    if count == 0 or w_acc <= 0:
+        return (0, 0, 0)
+
+    mean_luma = luma_sum / count
+    ym = y_acc // w_acc
+    um = u_acc // w_acc
+    vm = v_acc // w_acc
+    uvm_sq = um * um + vm * vm
+
+    if ym >= 75:
+        taper_limit = 220.0 if (um > 0 and vm <= 4) else 160.0
+    else:
+        taper_limit = 14.0
+    if uvm_sq < taper_limit:
+        c_taper = (uvm_sq / taper_limit) ** 1.2
+        um = round(um * c_taper)
+        vm = round(vm * c_taper)
+
+    win_peak = ym + max(0, (vm * 380) >> 8, (um * 320) >> 8)
+    if mean_luma < 20.0 and uvm_sq < 25:
+        win_peak = min(win_peak, int(mean_luma * 1.75))
+
+    pw = min(0.65, max(0.0, (mean_luma - 9.0) / 18.0) * 0.65)
+    eff_luma = (1.0 - pw) * mean_luma + pw * float(win_peak)
+    if eff_luma < 7.8:
+        return (0, 0, 0)
+
+    if eff_luma < 14.0:
+        chroma_scale = max(0.35, (eff_luma - 7.8) / 6.2)
+        um = round(um * chroma_scale)
+        vm = round(vm * chroma_scale)
+
+    c = max(3, ym - 6)
+    r = max(0, min(255, (298 * c + 409 * vm + 128) >> 8))
+    g = max(0, min(255, (298 * c - 100 * um - 208 * vm + 128) >> 8))
+    b = max(0, min(255, (298 * c + 516 * um + 128) >> 8))
+
+    if r >= 125 and g >= 38 and b >= 26 and r > g * 1.25 and b <= g * 1.35:
+        b = min(255, max(b, round(g * 1.18)))
+
+    h, s, val = colorsys.rgb_to_hsv(r / 255.0, g / 255.0, b / 255.0)
+    if s > 0.14:
+        if h < 0.08 or h > 0.88:
+            sat_boost = 1.05 if s < 0.72 else 1.20
+        else:
+            sat_boost = 1.32
+        s = min(1.0, 0.14 + (s - 0.14) * sat_boost)
+        if ym < 48:
+            max_s = 0.58 + 0.42 * min(1.0, max(0.0, (ym - 10.0) / 38.0))
+            s = min(s, max_s)
+    else:
+        s = s * 0.25
+
+    luma_drive = max(0.0, (eff_luma - 9.5) / 120.0)
+    if eff_luma < 28.0:
+        v_out = ((max(0.0, eff_luma - 9.5) / 18.5) ** 1.10) * 0.30
+    else:
+        v_drive = max(luma_drive, max(0.0, (val - 0.05) / 0.72))
+        v_out = min(1.0, 0.30 + 0.70 * (max(0.0, (v_drive - 0.15) / 0.85) ** 0.72))
+    if s > 0.22 and 0.50 <= h <= 0.72:
+        v_out *= 0.54
+
+    rf2, gf2, bf2 = colorsys.hsv_to_rgb(h, s, min(1.0, v_out))
+    r_gain = 242.0 - 12.0 * min(1.0, s / 0.20)
+    g_gain = 240.0 + 5.0 * min(1.0, s / 0.20)
+    b_gain = 236.0 + 19.0 * min(1.0, s / 0.20)
+    return (
+        max(0, min(255, round(rf2 * r_gain))),
+        max(0, min(255, round(gf2 * g_gain))),
+        max(0, min(255, round(bf2 * b_gain))),
+    )
+
+
+def encode_nanoleaf_v2_packet(
+    zones_rgb: list[tuple[int, int, int]], transition_ds: int = 1
+) -> bytes:
+    """Encode a 52-zone Nanoleaf External Control v2 UDP packet (port 60222)."""
+    parts = [struct.pack(">H", len(zones_rgb))]
+    for i, (r, g, b) in enumerate(zones_rgb):
+        parts.append(struct.pack(">HBBBBH", i, r, g, b, 0, transition_ds))
+    return b"".join(parts)
+
