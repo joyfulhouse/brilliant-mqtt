@@ -1149,6 +1149,11 @@ def panel_ssh_credentials_schema() -> vol.Schema:
     )
 
 
+def broker_abort_idle_panel_flow_schema() -> vol.Schema:
+    """Require an explicit choice before aborting an idle Add panel flow."""
+    return vol.Schema({vol.Required("confirm_abort_idle_panel_flow", default=False): bool})
+
+
 def panel_finalize_retained_schema() -> vol.Schema:
     """Require an explicit choice before permanently removing retained recovery artifacts."""
     return vol.Schema({vol.Required("confirm_finalize", default=False): bool})

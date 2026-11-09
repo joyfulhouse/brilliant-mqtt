@@ -585,6 +585,16 @@
       "mesh_priorities": {
         "title": "Mesh priority rollout required",
         "description": "Mesh priority changes alter on-panel agent configuration and are available only through a journaled rollout. Direct mutation is intentionally blocked."
+      },
+      "broker_abort_idle_panel_flow": {
+        "title": "Abort idle Add panel flow",
+        "description": "An Add Brilliant panel flow for this fleet is still open, but it has not started provisioning. Closing the dialog does not remove it, so broker changes stay blocked. Abort that idle flow and save this broker change? A flow that has started provisioning is left alone. [Open troubleshooting]({documentation_url})",
+        "data": {
+          "confirm_abort_idle_panel_flow": "Abort the idle Add panel flow"
+        },
+        "data_description": {
+          "confirm_abort_idle_panel_flow": "Required before the idle Add panel flow is aborted and the broker change is saved."
+        }
       }
     },
     "progress": {
@@ -625,7 +635,7 @@
       "mesh_priority_change_requires_agent_rollout": "Changing mesh priorities requires a journaled on-panel agent rollout. Nothing was changed. Check the advanced rollout documentation.",
       "broker_change_blocked_by_active_journal": "A panel provisioning journal is still open. Nothing was changed. Finish or recover Add Brilliant panel, then retry the broker update.",
       "broker_change_blocked_by_journal_read_error": "Home Assistant could not read the panel provisioning journal. Nothing was changed. Check storage health, then retry the broker update.",
-      "broker_change_blocked_by_add_panel_flow": "An Add panel flow is still in progress. Nothing was changed. Finish or close Add Brilliant panel, then retry the broker update."
+      "broker_change_blocked_by_add_panel_flow": "An Add panel flow has started provisioning or is not verifiably idle. Nothing was changed. Finish that flow, then retry the broker update. Do not change the broker while provisioning is in progress."
     }
   },
   "services": {

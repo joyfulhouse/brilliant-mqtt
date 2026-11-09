@@ -92,6 +92,7 @@ def test_fleet_options_translate_every_reachable_surface() -> None:
         "broker_profile",
         "broker_validation",
         "broker_commit",
+        "broker_abort_idle_panel_flow",
         "ha_control",
         "scenes",
         "fleet_defaults",

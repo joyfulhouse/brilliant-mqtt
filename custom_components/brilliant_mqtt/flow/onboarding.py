@@ -5,14 +5,16 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from datetime import datetime
 from types import MappingProxyType
 from typing import Any, cast
 
 import asyncssh
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.data_entry_flow import FlowResultType, UnknownFlow
 from homeassistant.helpers import issue_registry as ir
+from homeassistant.helpers.event import async_call_later
 
 from ..const import (
     CONF_HOST,
@@ -58,6 +60,7 @@ from .support import (
     _CORE_COMPONENTS,
     _PANEL_ONBOARDING_DOCUMENTATION_URL,
     _PROVISIONING_STAGE_ORDER,
+    PROVISIONING_STARTED_CONTEXT,
     _duplicate_panel,
     _DuplicatePanel,
     _facts_placeholders,
@@ -74,6 +77,7 @@ from .support import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+PANEL_ADD_IDLE_TIMEOUT_SECONDS = 15 * 60
 
 
 class _PanelOnboardingMixin:
@@ -125,6 +129,45 @@ class _PanelOnboardingMixin:
         self._retained_finalize = None
         self._unactivated_discard = None
         self._journal_recover = None
+        self._idle_unsub: Callable[[], None] | None = None
+
+    def _provisioning_started(self) -> bool:
+        context = cast(_FlowSurface, self).context
+        return (
+            CONF_PROVISIONING_TRANSACTION_ID in context
+            or context.get(PROVISIONING_STARTED_CONTEXT) is True
+        )
+
+    def _cancel_idle_timeout(self) -> None:
+        unsub = self._idle_unsub
+        self._idle_unsub = None
+        if unsub is not None:
+            unsub()
+
+    def _arm_preprovision_idle_timeout(self) -> None:
+        """Abort this Add panel flow if naming or confirm stays idle."""
+        self._cancel_idle_timeout()
+        if self._provisioning_started():
+            return
+        flow = cast(_FlowSurface, self)
+        flow_id = getattr(self, "flow_id", None)
+        if not isinstance(flow_id, str) or not flow_id:
+            return
+
+        def _expire(_now: datetime) -> None:
+            self._idle_unsub = None
+            if self._provisioning_started():
+                return
+            try:
+                flow.hass.config_entries.subentries.async_abort(flow_id)
+            except UnknownFlow:
+                return
+
+        self._idle_unsub = async_call_later(
+            flow.hass,
+            PANEL_ADD_IDLE_TIMEOUT_SECONDS,
+            _expire,
+        )
 
     def _onboarding_parent_entry(self) -> ConfigEntry[Any] | None:
         raise NotImplementedError
@@ -225,7 +268,16 @@ class _PanelOnboardingMixin:
 
     def _remove_panel_onboarding(self) -> None:
         """Schedule settlement when HA removes a marked flow before commit."""
+        self._cancel_idle_timeout()
         context = cast(dict[str, Any], cast(_FlowSurface, self).context)
+        task = self._provision_task
+        if (
+            context.pop(PROVISIONING_STARTED_CONTEXT, None) is True
+            and CONF_PROVISIONING_TRANSACTION_ID not in context
+            and task is not None
+            and not task.done()
+        ):
+            task.cancel()
         if (
             self._retained_finalize is not None
             or self._journal_recover is not None
@@ -352,6 +404,7 @@ class _PanelOnboardingMixin:
                 return await self.async_step_panel_confirm()
             self._panel_failure = failure
 
+        self._arm_preprovision_idle_timeout()
         return flow.async_show_form(
             step_id="panel_connect",
             data_schema=panel_connect_schema(self._panel_source),
@@ -427,6 +480,7 @@ class _PanelOnboardingMixin:
                     )
                     return await self.async_step_panel_connect()
                 return await self.async_step_panel_confirm()
+        self._arm_preprovision_idle_timeout()
         return flow.async_show_form(
             step_id="panel_discard_unactivated",
             data_schema=panel_discard_unactivated_schema(),
@@ -481,6 +535,7 @@ class _PanelOnboardingMixin:
                     return await self.async_step_panel_confirm()
                 self._retained_finalize = retained
                 return await self.async_step_panel_finalize_retained()
+        self._arm_preprovision_idle_timeout()
         return flow.async_show_form(
             step_id="panel_recover_journal",
             data_schema=panel_recover_journal_schema(),
@@ -541,6 +596,7 @@ class _PanelOnboardingMixin:
                     return await self.async_step_panel_connect()
                 self._retained_finalize = None
                 return await self.async_step_panel_confirm()
+        self._arm_preprovision_idle_timeout()
         return flow.async_show_form(
             step_id="panel_finalize_retained",
             data_schema=panel_finalize_retained_schema(),
@@ -641,6 +697,8 @@ class _PanelOnboardingMixin:
                         self._release_override = (
                             dict(override) if isinstance(override, dict) else None
                         )
+                        self._cancel_idle_timeout()
+                        cast(dict[str, Any], flow.context)[PROVISIONING_STARTED_CONTEXT] = True
                         self._provision_task = flow.hass.async_create_task(
                             self._async_provision(),
                             "brilliant-mqtt-panel-provision",
@@ -649,6 +707,7 @@ class _PanelOnboardingMixin:
 
         failure = self._panel_failure
         suggested_name = self._panel_name or _suggested_panel_name(facts)
+        self._arm_preprovision_idle_timeout()
         return flow.async_show_form(
             step_id="panel_confirm",
             data_schema=panel_confirm_schema(
@@ -746,19 +805,17 @@ class _PanelOnboardingMixin:
             self._release_override = None
             self._identity_refusal = error.release_override
             self._panel_failure = _provisioning_failure(error)
-            cast(dict[str, Any], flow.context).pop(
-                CONF_PROVISIONING_TRANSACTION_ID,
-                None,
-            )
+            context = cast(dict[str, Any], flow.context)
+            context.pop(CONF_PROVISIONING_TRANSACTION_ID, None)
+            context.pop(PROVISIONING_STARTED_CONTEXT, None)
         except Exception:
             self._panel_failure = _panel_failure(
                 "provisioning_failed",
                 stage="provisioning",
             )
-            cast(dict[str, Any], flow.context).pop(
-                CONF_PROVISIONING_TRANSACTION_ID,
-                None,
-            )
+            context = cast(dict[str, Any], flow.context)
+            context.pop(CONF_PROVISIONING_TRANSACTION_ID, None)
+            context.pop(PROVISIONING_STARTED_CONTEXT, None)
         finally:
             self._provision_task = None
 
