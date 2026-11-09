@@ -15,6 +15,7 @@ from brilliant_mqtt.ambilight import (
     CameraCaptureProtocol,
     GStreamerCameraAdapter,
     build_52_panel_coords,
+    build_auto_crop_depth_boxes,
     build_depth_glow_boxes,
     build_gstreamer_i420_args,
     build_gstreamer_jpeg_args,
@@ -254,9 +255,27 @@ class TestMultiZoneRPMLightHelpers:
             ey_idx,
             euv_idx,
         )
-        assert r > g > 0
+        assert r >= g > 0
         assert b > 0
 
         pkt = encode_nanoleaf_v2_packet([(r, g, b)] * 52, transition_ds=1)
         assert len(pkt) == 2 + 52 * 8
+
+        auto_boxes = build_auto_crop_depth_boxes(320, 176)
+        assert len(auto_boxes) == 52
+        for _pid, edge_steps, _iy, _iuv in auto_boxes:
+            assert len(edge_steps) == 3
+
+        # Brown/tan/wood protection (ym=34, u=116, v=144 stays warm golden-tan, not blood-red)
+        frame_brown = _make_solid_i420_frame(320, 184, y=34, u=116, v=144)
+        mv_b = memoryview(frame_brown)
+        r_b, g_b, b_b = sample_box_fast(
+            mv_b[:y_size],
+            mv_b[y_size : y_size + uv_size],
+            mv_b[y_size + uv_size : y_size + 2 * uv_size],
+            ey_idx,
+            euv_idx,
+        )
+        assert g_b >= int(r_b * 0.55)
+        assert b_b > 0
 
