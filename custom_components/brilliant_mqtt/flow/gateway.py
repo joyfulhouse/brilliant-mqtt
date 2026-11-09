@@ -265,16 +265,22 @@ async def _async_verify_staged_progress(
         raise ValueError("invalid_provisioning_progress")
 
 
-async def _async_provisioning_journal_clear(hass: HomeAssistant) -> bool:
-    """Fail closed unless durable provisioning state is readable and empty."""
+async def _async_provisioning_journal_status(hass: HomeAssistant) -> str:
+    """Return ``clear``, ``active``, or ``unreadable`` for the provisioning journal."""
     from ..provisioning_journal import ProvisioningJournal
 
     try:
-        return await ProvisioningJournal(hass).async_load() is None
+        record = await ProvisioningJournal(hass).async_load()
     except asyncio.CancelledError:
         raise
     except Exception:
-        return False
+        return "unreadable"
+    return "clear" if record is None else "active"
+
+
+async def _async_provisioning_journal_clear(hass: HomeAssistant) -> bool:
+    """Fail closed unless durable provisioning state is readable and empty."""
+    return await _async_provisioning_journal_status(hass) == "clear"
 
 
 async def _async_close_inspection_shell(shell: PanelShell) -> None:
