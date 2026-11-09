@@ -2604,7 +2604,7 @@ def test_panel_connect_report_names_the_failure_kind(
     error = broker_validation._panel_report_error(report)
     assert error.code == "broker_connect_failed"
     assert error.connect_cause == cause
-    assert "password" not in error.redacted_dict()["connect_cause"]
+    assert "password" not in error.connect_cause
 
 
 @pytest.mark.usefixtures("enable_custom_integrations")

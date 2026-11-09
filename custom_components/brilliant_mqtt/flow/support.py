@@ -97,14 +97,16 @@ class _FlowFailure:
     connect_cause: str = ""
 
     def placeholders(self) -> dict[str, str]:
-        return {
+        values = {
             "documentation_slug": self.documentation_slug,
             "documentation_url": _documentation_url(self.documentation_slug),
             "stage": self.stage,
             "storage_detail": self.storage_detail,
-            "broker_endpoint": self.broker_endpoint or "the configured broker",
-            "connect_cause": connect_cause_text(self.connect_cause),
         }
+        if self.code in {"broker_connect_failed", "broker_timeout"}:
+            values["broker_endpoint"] = self.broker_endpoint or "the configured broker"
+            values["connect_cause"] = connect_cause_text(self.connect_cause)
+        return values
 
 
 @dataclass(frozen=True, slots=True)

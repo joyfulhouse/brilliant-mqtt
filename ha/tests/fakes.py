@@ -136,6 +136,8 @@ class FakeShell:
 
     async def run(self, command: str) -> RunResult:
         self._require_connected()
+        if "BRILLIANT_BROKER_REACH" in command:
+            return RunResult(0, "ok\n", "")
         if "BRILLIANT_BASELINE_RETAINED" in command:
             return RunResult(0, "1" if self.baseline_retained else "0", "")
         if "BRILLIANT_BASELINE_ACTION" in command:

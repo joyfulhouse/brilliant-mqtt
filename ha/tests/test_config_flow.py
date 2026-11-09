@@ -161,8 +161,7 @@ def _close_leftover_subentry_flows(hass: HomeAssistant) -> Iterator[None]:
     yield
     from homeassistant.data_entry_flow import UnknownFlow
 
-    progress = list(hass.config_entries.subentries.async_progress(include_uninitialized=True))
-    for item in progress:
+    for item in list(hass.config_entries.subentries.async_progress(include_uninitialized=True)):
         flow_id = item.get("flow_id")
         if not isinstance(flow_id, str):
             continue
@@ -817,7 +816,9 @@ async def test_setup_and_options_reject_addon_internal_broker_host(
     assert rejected["type"] is FlowResultType.FORM
     assert rejected["step_id"] == "broker"
     assert rejected["errors"] == {CONF_MQTT_HOST: "broker_host_not_panel_reachable"}
-    description = rejected["description_placeholders"]["documentation_url"]
+    placeholders = rejected["description_placeholders"]
+    assert placeholders is not None
+    description = placeholders["documentation_url"]
     assert isinstance(description, str) and description
 
     entry = _fleet_entry(hass)
