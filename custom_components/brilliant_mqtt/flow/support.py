@@ -159,12 +159,42 @@ class _FlowSurface(Protocol):
     def async_update_progress(self, progress: float) -> None: ...
 
 
+PROVISIONING_STARTED_CONTEXT = "brilliant_mqtt_provisioning_started"
+_PRE_PROVISION_STEPS = frozenset(
+    {
+        "user",
+        "panel_connect",
+        "panel_confirm",
+        "panel_discard_unactivated",
+        "panel_finalize_retained",
+        "panel_recover_journal",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _PanelAddFlowState:
+    """One same-fleet Add panel flow that can still block a broker edit."""
+
+    flow_id: str
+    step_id: str | None
+    provisioning_started: bool
+
+    @property
+    def verifiably_idle(self) -> bool:
+        """True only before provisioning starts and while the step cannot stage a release."""
+        if self.provisioning_started:
+            return False
+        return self.step_id is None or self.step_id in _PRE_PROVISION_STEPS
+
+
 @callback
-def _same_entry_panel_add_flow_active(
+def _same_entry_panel_add_flows(
     hass: HomeAssistant,
     entry_id: str,
-) -> bool:
-    """Return whether an Add panel flow can still start provisioning for this fleet."""
+) -> tuple[_PanelAddFlowState, ...]:
+    """Return Add panel flows for this fleet, including dialogs the user closed."""
+    flows: list[_PanelAddFlowState] = []
     for progress in hass.config_entries.subentries.async_progress(
         include_uninitialized=True,
     ):
@@ -174,9 +204,32 @@ def _same_entry_panel_add_flow_active(
         ):
             continue
         context = progress.get("context")
-        if not isinstance(context, Mapping) or context.get("source") != "reconfigure":
-            return True
-    return False
+        if not isinstance(context, Mapping) or context.get("source") == "reconfigure":
+            continue
+        flow_id = progress.get("flow_id")
+        if not isinstance(flow_id, str) or not flow_id:
+            continue
+        step_id = progress.get("step_id")
+        flows.append(
+            _PanelAddFlowState(
+                flow_id=flow_id,
+                step_id=step_id if isinstance(step_id, str) else None,
+                provisioning_started=(
+                    CONF_PROVISIONING_TRANSACTION_ID in context
+                    or context.get(PROVISIONING_STARTED_CONTEXT) is True
+                ),
+            )
+        )
+    return tuple(flows)
+
+
+@callback
+def _same_entry_panel_add_flow_active(
+    hass: HomeAssistant,
+    entry_id: str,
+) -> bool:
+    """Return whether an Add panel flow can still start provisioning for this fleet."""
+    return bool(_same_entry_panel_add_flows(hass, entry_id))
 
 
 def _fleet_storage_issue_id(entry_id: str) -> str:
