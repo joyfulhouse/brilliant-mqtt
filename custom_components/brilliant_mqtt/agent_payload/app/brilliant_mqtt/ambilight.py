@@ -91,6 +91,128 @@ class AmbilightCrop:
 
         return AmbilightCrop(top=top, bottom=bottom, left=left, right=right)
 
+    def with_sub_bbox_norm(
+        self,
+        bbox_norm: tuple[float, float, float, float],
+        *,
+        safety_inset_norm: float = 0.015,
+    ) -> AmbilightCrop:
+        """Return a tightened 8px-aligned crop from a normalized ``(x0, y0, x1, y1)`` sub-box."""
+        base = self.normalized()
+        x0, y0, x1, y1 = bbox_norm
+        x0_c = max(0.0, min(0.85, float(x0) + safety_inset_norm))
+        y0_c = max(0.0, min(0.85, float(y0) + safety_inset_norm))
+        x1_c = max(x0_c + 0.10, min(1.0, float(x1) - safety_inset_norm))
+        y1_c = max(y0_c + 0.10, min(1.0, float(y1) - safety_inset_norm))
+
+        new_left = base.left + round(x0_c * base.width)
+        new_right = base.right + round((1.0 - x1_c) * base.width)
+        new_top = base.top + round(y0_c * base.height)
+        new_bottom = base.bottom + round((1.0 - y1_c) * base.height)
+        return AmbilightCrop(
+            top=new_top,
+            bottom=new_bottom,
+            left=new_left,
+            right=new_right,
+        ).normalized()
+
+
+@dataclass(frozen=True)
+class TPUSceneCue:
+    """Optional low-rate scene cue from TPUaaS (``ssd_coco``) or Gemini Vision."""
+
+    scene_class: str = "auto"
+    wing_weights: dict[str, float] | None = None
+    active_content_bbox_norm: tuple[float, float, float, float] | None = None
+    recommended_bbox_norm: tuple[float, float, float, float] | None = None
+    viewers_in_room: int = 0
+    latency_ms: float = 0.0
+
+
+def infer_scene_cue(payload: dict[str, Any]) -> TPUSceneCue:
+    """Parse a :class:`TPUSceneCue` from a ``/v1/projects/ambiled`` JSON payload."""
+    cue = payload.get("scene_cue") if isinstance(payload.get("scene_cue"), dict) else {}
+    dets = payload.get("detections") if isinstance(payload.get("detections"), list) else []
+
+    scene_class = str(cue.get("scene_class", payload.get("scene_class", "auto")))
+    if scene_class not in ("drama", "music_video", "auto"):
+        person_count = sum(
+            1 for d in dets if isinstance(d, dict) and d.get("label") == "person"
+        )
+        scene_class = "drama" if person_count == 1 else ("music_video" if person_count >= 2 else "auto")
+
+    ww_raw = cue.get("wing_weights")
+    if isinstance(ww_raw, dict):
+        wing_weights = {
+            "west": max(0.5, min(1.5, float(ww_raw.get("west", 1.0)))),
+            "east": max(0.5, min(1.5, float(ww_raw.get("east", 1.0)))),
+            "far_left": max(0.5, min(1.5, float(ww_raw.get("far_left", 1.0)))),
+        }
+    else:
+        wing_weights = {"west": 1.0, "east": 1.0, "far_left": 1.0}
+
+    def _parse_bbox(raw: Any) -> tuple[float, float, float, float] | None:
+        if isinstance(raw, (list, tuple)) and len(raw) == 4:
+            try:
+                x0, y0, x1, y1 = (float(v) for v in raw)
+                if 0.0 <= x0 < x1 <= 1.0 and 0.0 <= y0 < y1 <= 1.0:
+                    return (x0, y0, x1, y1)
+            except (TypeError, ValueError):
+                pass
+        return None
+
+    active_bbox = _parse_bbox(cue.get("active_content_bbox_norm"))
+    rec_bbox = _parse_bbox(payload.get("recommended_bbox_norm")) or active_bbox
+    return TPUSceneCue(
+        scene_class=scene_class,
+        wing_weights=wing_weights,
+        active_content_bbox_norm=active_bbox,
+        recommended_bbox_norm=rec_bbox,
+        viewers_in_room=int(payload.get("viewers_in_room", 0) or 0),
+        latency_ms=float(payload.get("latency_ms", 0.0) or 0.0),
+    )
+
+
+def estimate_i420_active_bbox_norm(
+    frame: bytes,
+    width: int = 320,
+    height: int = 176,
+    *,
+    luma_threshold: int = 26,
+) -> tuple[float, float, float, float]:
+    """Estimate active normalized ``(x0, y0, x1, y1)`` TV area from an ``I420`` frame."""
+    y_size = width * height
+    if len(frame) < y_size or width <= 0 or height <= 0:
+        return (0.0, 0.0, 1.0, 1.0)
+    y_plane = frame[:y_size]
+
+    active_rows: list[int] = []
+    for r in range(height):
+        row = y_plane[r * width : (r + 1) * width : 4]
+        if row:
+            s_row = sorted(row)
+            p92 = s_row[min(len(s_row) - 1, int(len(s_row) * 0.92))]
+            if p92 >= luma_threshold:
+                active_rows.append(r)
+
+    active_cols: list[int] = []
+    for c in range(0, width, 2):
+        col = [y_plane[r * width + c] for r in range(0, height, 4)]
+        if col:
+            s_col = sorted(col)
+            p92 = s_col[min(len(s_col) - 1, int(len(s_col) * 0.92))]
+            if p92 >= luma_threshold:
+                active_cols.append(c)
+
+    if not active_rows or not active_cols:
+        return (0.0, 0.0, 1.0, 1.0)
+
+    x0 = max(0.0, min(0.45, active_cols[0] / float(width)))
+    x1 = min(1.0, max(0.55, (active_cols[-1] + 2) / float(width)))
+    y0 = max(0.0, min(0.45, active_rows[0] / float(height)))
+    y1 = min(1.0, max(0.55, (active_rows[-1] + 1) / float(height)))
+    return (round(x0, 4), round(y0, 4), round(x1, 4), round(y1, 4))
+
 
 @dataclass(frozen=True)
 class AmbilightSample:
@@ -394,6 +516,9 @@ class AmbilightController:
         default_enabled: bool = False,
         default_interval_s: float = 1.0,
         default_crop: AmbilightCrop | None = None,
+        default_auto_crop_enabled: bool = False,
+        tpu_url: str | None = None,
+        gemini_api_key: str | None = None,
         owned_topics: RetainedTopicLedger | None = None,
         sleep: Callable[[float], Any] = asyncio.sleep,
     ) -> None:
@@ -407,6 +532,17 @@ class AmbilightController:
         self._enabled = default_enabled
         self._interval_s = max(0.25, min(10.0, default_interval_s))
         self._crop = (default_crop or AmbilightCrop()).normalized()
+        self._saved_crop = self._crop
+        self._auto_crop_enabled = default_auto_crop_enabled
+        self._tpu_url = (
+            tpu_url if tpu_url is not None else os.environ.get("RPMLIGHT_TPU_URL", "")
+        ).strip().rstrip("/")
+        self._gemini_api_key = (
+            gemini_api_key
+            if gemini_api_key is not None
+            else os.environ.get("RPMLIGHT_GEMINI_API_KEY", "")
+        ).strip()
+        self._last_scene_cue = TPUSceneCue()
         self._last_sample: AmbilightSample | None = None
         self._poll_task: asyncio.Task[None] | None = None
         self._last_persisted_snapshot: dict[str, Any] | None = None
@@ -420,6 +556,31 @@ class AmbilightController:
     @property
     def crop(self) -> AmbilightCrop:
         return self._crop
+
+    @property
+    def saved_crop(self) -> AmbilightCrop:
+        """Preserved manual/hardcoded crop margins used when reverting Auto-Crop."""
+        return self._saved_crop
+
+    @property
+    def auto_crop_enabled(self) -> bool:
+        return self._auto_crop_enabled
+
+    @property
+    def tpu_url(self) -> str:
+        return self._tpu_url
+
+    @property
+    def tpu_configured(self) -> bool:
+        return bool(self._tpu_url)
+
+    @property
+    def gemini_configured(self) -> bool:
+        return bool(self._gemini_api_key)
+
+    @property
+    def last_scene_cue(self) -> TPUSceneCue:
+        return self._last_scene_cue
 
     @property
     def interval_s(self) -> float:
@@ -446,6 +607,8 @@ class AmbilightController:
         self._last_persisted_snapshot = data
         if isinstance(data.get("enabled"), bool):
             self._enabled = bool(data["enabled"])
+        if isinstance(data.get("auto_crop_enabled"), bool):
+            self._auto_crop_enabled = bool(data["auto_crop_enabled"])
         if isinstance(data.get("interval_s"), (int, float)):
             self._interval_s = max(0.25, min(10.0, float(data["interval_s"])))
         crop_data = data.get("crop")
@@ -456,16 +619,31 @@ class AmbilightController:
                 left=int(crop_data.get("left", self._crop.left)),
                 right=int(crop_data.get("right", self._crop.right)),
             ).normalized()
+        saved_data = data.get("saved_crop")
+        if isinstance(saved_data, dict):
+            self._saved_crop = AmbilightCrop(
+                top=int(saved_data.get("top", self._saved_crop.top)),
+                bottom=int(saved_data.get("bottom", self._saved_crop.bottom)),
+                left=int(saved_data.get("left", self._saved_crop.left)),
+                right=int(saved_data.get("right", self._saved_crop.right)),
+            ).normalized()
 
     def _build_persisted_snapshot(self) -> dict[str, Any]:
         return {
             "enabled": self._enabled,
+            "auto_crop_enabled": self._auto_crop_enabled,
             "interval_s": self._interval_s,
             "crop": {
                 "top": self._crop.top,
                 "bottom": self._crop.bottom,
                 "left": self._crop.left,
                 "right": self._crop.right,
+            },
+            "saved_crop": {
+                "top": self._saved_crop.top,
+                "bottom": self._saved_crop.bottom,
+                "left": self._saved_crop.left,
+                "right": self._saved_crop.right,
             },
         }
 
@@ -566,6 +744,42 @@ class AmbilightController:
         await self._mqtt.publish(self._snapshot_topic(), "", retain=True)
 
     # ------------------------------------------------------------------
+    # Optional Auto-Crop & Saved Hardcoded Crop Revert
+    # ------------------------------------------------------------------
+
+    def revert_crop(self) -> AmbilightCrop:
+        """Disable Auto-Crop and restore the saved manual/hardcoded crop margins."""
+        self._auto_crop_enabled = False
+        self._crop = self._saved_crop.normalized()
+        self._save_state_if_changed()
+        return self._crop
+
+    def apply_auto_crop_bbox(
+        self,
+        bbox_norm: tuple[float, float, float, float],
+        *,
+        safety_inset_norm: float = 0.015,
+    ) -> AmbilightCrop:
+        """Apply a normalized ``(x0, y0, x1, y1)`` sub-bbox relative to ``saved_crop``."""
+        if not self._auto_crop_enabled:
+            return self._crop
+        self._crop = self._saved_crop.with_sub_bbox_norm(
+            bbox_norm, safety_inset_norm=safety_inset_norm
+        )
+        self._save_state_if_changed()
+        return self._crop
+
+    async def auto_calibrate_crop(self) -> AmbilightCrop | None:
+        """Capture an ``I420`` frame from ``saved_crop`` and auto-fit active TV bounds."""
+        base = self._saved_crop.normalized()
+        frame = await self._camera.capture_i420_frame(base)
+        if frame is None:
+            return None
+        bbox = estimate_i420_active_bbox_norm(frame, base.width, base.height)
+        self._auto_crop_enabled = True
+        return self.apply_auto_crop_bbox(bbox)
+
+    # ------------------------------------------------------------------
     # MQTT Command Handling
     # ------------------------------------------------------------------
 
@@ -586,6 +800,15 @@ class AmbilightController:
             await self._publish_state()
         elif cmd == "snapshot":
             await self.trigger_snapshot()
+        elif cmd == "auto_crop":
+            if val.upper() in ("OFF", "0", "FALSE"):
+                self.revert_crop()
+            else:
+                await self.auto_calibrate_crop()
+            await self._publish_state()
+        elif cmd == "revert_crop":
+            self.revert_crop()
+            await self._publish_state()
         elif cmd == "interval":
             try:
                 self._interval_s = max(0.25, min(10.0, float(val)))
@@ -600,6 +823,8 @@ class AmbilightController:
                 return
             field_name = cmd[5:]
             self._crop = replace(self._crop, **{field_name: px}).normalized()
+            self._saved_crop = self._crop
+            self._auto_crop_enabled = False
             self._save_state_if_changed()
             await self._publish_state()
 
@@ -629,6 +854,8 @@ class AmbilightController:
         for suffix in (
             "enabled",
             "snapshot",
+            "auto_crop",
+            "revert_crop",
             "interval",
             "crop_top",
             "crop_bottom",
@@ -767,9 +994,13 @@ class AmbilightController:
 
     async def _publish_state(self) -> None:
         c = self._crop.normalized()
+        saved = self._saved_crop.normalized()
         s = self._last_sample or AmbilightSample(r=0, g=0, b=0, brightness=1, hex_color="#000000")
         payload = {
             "enabled": self._enabled,
+            "auto_crop_enabled": self._auto_crop_enabled,
+            "tpu_configured": bool(self._tpu_url),
+            "gemini_configured": bool(self._gemini_api_key),
             "interval_s": self._interval_s,
             "crop": {
                 "top": c.top,
@@ -778,6 +1009,12 @@ class AmbilightController:
                 "right": c.right,
                 "width": c.width,
                 "height": c.height,
+            },
+            "saved_crop": {
+                "top": saved.top,
+                "bottom": saved.bottom,
+                "left": saved.left,
+                "right": saved.right,
             },
             "color": {
                 "r": s.r,

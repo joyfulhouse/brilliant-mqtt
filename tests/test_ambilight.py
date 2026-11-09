@@ -20,7 +20,9 @@ from brilliant_mqtt.ambilight import (
     build_gstreamer_i420_args,
     build_gstreamer_jpeg_args,
     encode_nanoleaf_v2_packet,
+    estimate_i420_active_bbox_norm,
     extract_ambilight_sample_from_i420,
+    infer_scene_cue,
     is_privacy_shutter_closed,
     sample_box_fast,
 )
@@ -278,4 +280,56 @@ class TestMultiZoneRPMLightHelpers:
         )
         assert g_b >= int(r_b * 0.55)
         assert b_b > 0
+
+    async def test_optional_tpu_gemini_and_auto_crop_revert(self) -> None:
+        mqtt = FakeMqtt()
+        cam = FakeCameraAdapter(y=120, u=90, v=210)
+        hardcoded = AmbilightCrop(top=328, bottom=216, left=608, right=352)
+        ctrl = AmbilightController(
+            mqtt=mqtt,
+            panel="living_room",
+            camera=cam,
+            default_crop=hardcoded,
+        )
+        # Optional by default
+        assert ctrl.tpu_url == ""
+        assert ctrl.tpu_configured is False
+        assert ctrl.gemini_configured is False
+        assert ctrl.auto_crop_enabled is False
+        assert ctrl.saved_crop == hardcoded
+        assert ctrl.crop == hardcoded
+
+        # Enable auto-crop via sub-bbox and verify saved_crop is preserved for revert
+        ctrl._auto_crop_enabled = True
+        tightened = ctrl.apply_auto_crop_bbox((0.125, 0.125, 0.875, 0.875))
+        assert tightened.left > hardcoded.left
+        assert tightened.top > hardcoded.top
+        assert ctrl.saved_crop == hardcoded
+
+        reverted = ctrl.revert_crop()
+        assert reverted == hardcoded
+        assert ctrl.crop == hardcoded
+        assert ctrl.auto_crop_enabled is False
+
+        # Test infer_scene_cue and estimate_i420_active_bbox_norm
+        cue = infer_scene_cue(
+            {
+                "scene_cue": {
+                    "scene_class": "music_video",
+                    "wing_weights": {"west": 1.3, "east": 0.8, "far_left": 1.2},
+                    "active_content_bbox_norm": [0.1, 0.1, 0.9, 0.9],
+                },
+                "viewers_in_room": 2,
+                "latency_ms": 6.2,
+            }
+        )
+        assert cue.scene_class == "music_video"
+        assert cue.wing_weights == {"west": 1.3, "east": 0.8, "far_left": 1.2}
+        assert cue.active_content_bbox_norm == (0.1, 0.1, 0.9, 0.9)
+
+        bbox = estimate_i420_active_bbox_norm(
+            _make_solid_i420_frame(320, 176, y=100, u=128, v=128), 320, 176
+        )
+        assert bbox == (0.0, 0.0, 1.0, 1.0)
+
 
