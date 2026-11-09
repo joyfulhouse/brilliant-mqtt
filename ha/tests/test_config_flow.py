@@ -786,6 +786,39 @@ async def test_user_menu_offers_recommended_and_existing_brokers_equally(
     assert tuple(cast(Iterable[str], result["menu_options"])) == BROKER_MENU_OPTIONS
 
 
+async def test_setup_and_options_reject_addon_internal_broker_host(
+    hass: HomeAssistant,
+) -> None:
+    """Panels cannot resolve Home Assistant's internal add-on DNS name."""
+    setup = await _start_broker_form(hass, BrokerKind.EXISTING_BROKER)
+    rejected = await hass.config_entries.flow.async_configure(
+        setup["flow_id"],
+        {**_BROKER_INPUT, CONF_MQTT_HOST: "core-mosquitto"},
+    )
+
+    assert rejected["type"] is FlowResultType.FORM
+    assert rejected["step_id"] == "broker"
+    assert rejected["errors"] == {CONF_MQTT_HOST: "broker_host_not_panel_reachable"}
+    description = rejected["description_placeholders"]["documentation_url"]
+    assert isinstance(description, str) and description
+
+    entry = _fleet_entry(hass)
+    options = await _start_fleet_broker_options(hass, entry)
+    options_rejected = await hass.config_entries.options.async_configure(
+        options["flow_id"],
+        {
+            **_BROKER_INPUT,
+            CONF_MQTT_HOST: "127.0.0.1",
+            CONF_MQTT_PASSWORD: SECRET_UNCHANGED,
+        },
+    )
+
+    assert options_rejected["type"] is FlowResultType.FORM
+    assert options_rejected["step_id"] == "broker_profile"
+    assert options_rejected["errors"] == {CONF_MQTT_HOST: "broker_host_not_panel_reachable"}
+    assert entry.data[CONF_MQTT_HOST] == "mqtt.iot.example"
+
+
 async def test_official_broker_prefills_editable_local_host_and_port(
     hass: HomeAssistant,
 ) -> None:

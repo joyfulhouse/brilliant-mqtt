@@ -135,6 +135,7 @@ def test_fleet_options_translate_every_reachable_failure() -> None:
     required_errors = set(operation_errors._ERROR_METADATA) | {
         "invalid_value",
         "broker_validation_failed",
+        "broker_host_not_panel_reachable",
     }
     required_aborts = {
         "invalid_parent",

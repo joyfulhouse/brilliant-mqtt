@@ -27,7 +27,7 @@
           "mqtt_password": "Broker password"
         },
         "data_description": {
-          "mqtt_host": "Address reachable by both Home Assistant and every Brilliant panel.",
+          "mqtt_host": "LAN IP address or hostname that every Brilliant panel can resolve. Do not use Home Assistant add-on names such as core-mosquitto, names ending in .local.hass.io, localhost, or a0d7b954- names.",
           "mqtt_port": "Usually 1883 without TLS or 8883 with TLS.",
           "mqtt_username": "Broker account used by the Brilliant fleet.",
           "mqtt_password": "Broker password. It is stored securely and is never shown again."
@@ -191,7 +191,8 @@
       "cannot_install_voice": "The bridge agent installed, but installing the voice satellite failed (its payload may not be downloadable yet, or the panel rejected it). Untick \"Enable voice satellite\" to finish without it, or try again.",
       "wrong_panel": "That host already runs a different Brilliant panel's agent. Check the IP — applying here would overwrite and restart the wrong panel.",
       "host_key_changed": "The panel's SSH host key changed. For a fleet panel, verify the physical replacement and use Replace physical panel for an explicit identity rebind. For a legacy entry, remove and re-add the verified panel to re-pin it. If the change is unexpected, do not continue; check the address and network for impersonation.",
-      "invalid_cadence": "Enter a whole number of seconds within the documented range."
+      "invalid_cadence": "Enter a whole number of seconds within the documented range.",
+      "broker_host_not_panel_reachable": "Panels on the LAN cannot use this broker host. Home Assistant add-on names such as core-mosquitto, names ending in .local.hass.io, a0d7b954- names, localhost, and similar single-label add-on slugs work only inside Home Assistant. Enter the Home Assistant host's LAN IP address or a hostname the panels can resolve, then retry."
     },
     "abort": {
       "already_configured": "A Brilliant MQTT fleet is already configured.",
@@ -503,7 +504,7 @@
           "mqtt_password": "Broker password"
         },
         "data_description": {
-          "mqtt_host": "Address reachable by Home Assistant and every Brilliant panel.",
+          "mqtt_host": "LAN IP address or hostname that every Brilliant panel can resolve. Do not use Home Assistant add-on names such as core-mosquitto, names ending in .local.hass.io, localhost, or a0d7b954- names.",
           "mqtt_port": "Usually 1883 without TLS or 8883 with TLS.",
           "mqtt_username": "Dedicated MQTT account used by the Brilliant fleet.",
           "mqtt_password": "Leave the masked value unchanged to keep the stored password, or enter a replacement password."
@@ -610,7 +611,8 @@
       "discovery_write_timeout": "The MQTT discovery validation write timed out. Check broker routing, listener health, and ACL behavior, then retry.",
       "retained_message_invalid": "The broker did not preserve the validation message correctly. Check that retained messages are enabled and not rewritten, then retry.",
       "retained_message_timeout": "Retained-message validation timed out. Check broker persistence, routing, and ACL behavior, then retry.",
-      "cleanup_failed": "MQTT validation cleanup could not be confirmed. Check broker availability and ACLs before retrying."
+      "cleanup_failed": "MQTT validation cleanup could not be confirmed. Check broker availability and ACLs before retrying.",
+      "broker_host_not_panel_reachable": "Panels on the LAN cannot use this broker host. Home Assistant add-on names such as core-mosquitto, names ending in .local.hass.io, a0d7b954- names, localhost, and similar single-label add-on slugs work only inside Home Assistant. Enter the Home Assistant host's LAN IP address or a hostname the panels can resolve, then retry."
     },
     "abort": {
       "invalid_parent": "The Brilliant MQTT fleet is unavailable or no longer valid. Reload the integration and open its settings again.",

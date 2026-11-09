@@ -23,6 +23,7 @@ from homeassistant.helpers.selector import (
 )
 
 from ..broker import BrokerKind
+from ..broker_host import panel_unreachable_broker_host_reason
 from ..components import optional
 from ..const import (
     CONF_BROKER_KIND,
@@ -376,6 +377,8 @@ def normalize_broker_input(
     raw_host = user_input.get(CONF_MQTT_HOST)
     if not _valid_text(raw_host, maximum_bytes=_MAX_BROKER_HOST_BYTES):
         errors[CONF_MQTT_HOST] = "invalid_value"
+    elif isinstance(raw_host, str) and panel_unreachable_broker_host_reason(raw_host) is not None:
+        errors[CONF_MQTT_HOST] = "broker_host_not_panel_reachable"
     raw_username = user_input.get(CONF_MQTT_USERNAME)
     if not _valid_text(raw_username, maximum_bytes=_MAX_MQTT_USERNAME_BYTES):
         errors[CONF_MQTT_USERNAME] = "invalid_value"
