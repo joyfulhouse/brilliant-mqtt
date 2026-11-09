@@ -169,7 +169,7 @@
       "unsupported_discovery_prefix": "The configured MQTT discovery prefix is unsupported. Restore a valid Home Assistant discovery prefix and retry.",
       "invalid_broker_profile": "The broker settings are invalid.",
       "broker_validation_failed": "MQTT validation failed unexpectedly. Verify the broker connection and credentials, then retry.",
-      "broker_connect_failed": "Could not connect to the MQTT broker. Verify host, port, routing, and firewall rules.",
+      "broker_connect_failed": "Could not connect to the MQTT broker at {broker_endpoint} ({connect_cause}). Panels need the Home Assistant host's LAN IP or a hostname they can resolve. Check DNS, routing, and firewall rules, then retry.",
       "broker_tls_verification_failed": "The MQTT broker certificate could not be verified. Check the broker certificate and optional public CA chain.",
       "broker_timeout": "The MQTT broker did not respond in time.",
       "broker_authentication_failed": "The MQTT broker rejected these credentials.",
@@ -393,7 +393,7 @@
         "unsupported_discovery_prefix": "The Home Assistant MQTT discovery prefix is unsupported. Restore the `homeassistant` discovery prefix and retry. The panel installation was rolled back.",
         "invalid_broker_profile": "The fleet broker settings are invalid.",
         "panel_settings_invalid": "The staged panel MQTT settings are invalid. Review the fleet broker and TLS settings, then retry. The panel installation was rolled back.",
-        "broker_connect_failed": "The panel could not connect to the MQTT broker.",
+        "broker_connect_failed": "The panel could not connect to the MQTT broker at {broker_endpoint} ({connect_cause}). Use the Home Assistant host's LAN IP or a hostname the panel can resolve, then retry.",
         "broker_tls_verification_failed": "The panel could not verify the MQTT broker certificate.",
         "broker_timeout": "The MQTT broker did not respond to the panel in time.",
         "broker_authentication_failed": "The MQTT broker rejected the panel credentials.",
@@ -594,7 +594,7 @@
       "invalid_value": "Enter a valid value in the documented format.",
       "invalid_broker_profile": "The MQTT broker profile is invalid. Review every required field and the MQTT broker setup guide, then retry.",
       "broker_validation_failed": "MQTT validation failed unexpectedly. Check the broker connection, credentials, and Home Assistant MQTT status, then retry.",
-      "broker_connect_failed": "Home Assistant could not connect to the MQTT broker. Check the host, port, routing, DNS, and firewall rules, then retry.",
+      "broker_connect_failed": "Home Assistant could not connect to the MQTT broker at {broker_endpoint} ({connect_cause}). Check the host, port, DNS, routing, and firewall rules, then retry.",
       "panel_settings_invalid": "The staged panel MQTT settings are invalid. Review the broker host, TLS, and fleet settings before retrying.",
       "broker_tls_verification_failed": "The MQTT broker certificate could not be verified. Check its hostname, validity, trust chain, and optional public CA certificate before retrying.",
       "broker_timeout": "The MQTT broker did not respond in time. Check broker availability and network routing, then retry.",
@@ -619,11 +619,13 @@
       "invalid_flow_state": "The settings flow lost its validated state. Open Brilliant MQTT settings and retry.",
       "parent_changed": "Fleet settings changed while this form was open. Nothing was saved; open the relevant settings page again.",
       "broker_change_requires_guided_flow": "Installed panels still depend on the current MQTT transport. Nothing was changed. Open the MQTT broker rollout guide before moving the fleet to a different host, port, credentials, or TLS profile.",
-      "broker_change_blocked_by_panel_onboarding": "A panel onboarding or recovery transaction is active or could not be read safely. Nothing was changed. Finish or recover Add Brilliant panel, then retry the broker update.",
       "reconfigure_successful": "The Brilliant MQTT fleet settings were updated successfully.",
       "ha_control_change_requires_agent_rollout": "Changing whether Home Assistant control is enabled also changes on-panel agent configuration. Nothing was changed. Check the guided agent rollout documentation.",
       "no_panels_configured": "Add at least one Brilliant panel before choosing a default scene panel.",
-      "mesh_priority_change_requires_agent_rollout": "Changing mesh priorities requires a journaled on-panel agent rollout. Nothing was changed. Check the advanced rollout documentation."
+      "mesh_priority_change_requires_agent_rollout": "Changing mesh priorities requires a journaled on-panel agent rollout. Nothing was changed. Check the advanced rollout documentation.",
+      "broker_change_blocked_by_active_journal": "A panel provisioning journal is still open. Nothing was changed. Finish or recover Add Brilliant panel, then retry the broker update.",
+      "broker_change_blocked_by_journal_read_error": "Home Assistant could not read the panel provisioning journal. Nothing was changed. Check storage health, then retry the broker update.",
+      "broker_change_blocked_by_add_panel_flow": "An Add panel flow is still in progress. Nothing was changed. Finish or close Add Brilliant panel, then retry the broker update."
     }
   },
   "services": {

@@ -44,7 +44,7 @@ from ..const import (
     FLEET_UNIQUE_ID,
     SUBENTRY_TYPE_PANEL,
 )
-from ..errors import OperationError
+from ..errors import OperationError, connect_cause_text
 from ..panel_inspection import PanelFacts
 from ..panel_provisioner import (
     PanelInstallRequest,
@@ -93,6 +93,8 @@ class _FlowFailure:
     documentation_slug: str
     stage: str
     storage_detail: str = ""
+    broker_endpoint: str = ""
+    connect_cause: str = ""
 
     def placeholders(self) -> dict[str, str]:
         return {
@@ -100,6 +102,8 @@ class _FlowFailure:
             "documentation_url": _documentation_url(self.documentation_slug),
             "stage": self.stage,
             "storage_detail": self.storage_detail,
+            "broker_endpoint": self.broker_endpoint or "the configured broker",
+            "connect_cause": connect_cause_text(self.connect_cause),
         }
 
 
@@ -206,6 +210,8 @@ def _operation_failure(error: OperationError) -> _FlowFailure:
         code=error.code,
         documentation_slug=error.documentation_slug,
         stage=error.stage.value,
+        broker_endpoint=error.broker_endpoint,
+        connect_cause=error.connect_cause,
     )
 
 
@@ -233,6 +239,8 @@ def _provisioning_failure(error: PanelProvisioningError) -> _FlowFailure:
             code=error.detail.code,
             documentation_slug=error.detail.documentation_slug,
             stage=error.detail.stage.value,
+            broker_endpoint=error.detail.broker_endpoint,
+            connect_cause=error.detail.connect_cause,
         )
     return _panel_failure(
         error.code,

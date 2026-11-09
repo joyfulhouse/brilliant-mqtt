@@ -30,8 +30,12 @@ _OPERATION_ERROR_FIELDS = frozenset(
         "documentation_slug",
         "redacted_detail",
         "cleanup_error",
+        "broker_endpoint",
+        "connect_cause",
     }
 )
+_CONNECT_CAUSES = frozenset({"", "dns", "connection_refused", "timeout", "connect"})
+_BROKER_CONNECT_CODES = frozenset({"broker_connect_failed", "broker_timeout"})
 
 
 class OperationStage(StrEnum):
@@ -200,6 +204,8 @@ class OperationError(Exception):
     documentation_slug: str
     redacted_detail: str
     cleanup_error: OperationError | None = None
+    broker_endpoint: str = ""
+    connect_cause: str = ""
 
     def __setattr__(self, name: str, value: object) -> None:
         """Freeze logical fields while allowing BaseException runtime state."""
@@ -236,6 +242,7 @@ class OperationError(Exception):
             raise ValueError("invalid_operation_error_metadata")
         if self.cleanup_error is not None and not isinstance(self.cleanup_error, OperationError):
             raise TypeError("cleanup_error must be an OperationError")
+        _validate_connect_context(self.broker_endpoint, self.connect_cause)
         Exception.__init__(self, self.code)
         object.__setattr__(self, "__suppress_context__", True)
 
@@ -266,6 +273,19 @@ class OperationError(Exception):
         """Return an immutable copy carrying a separately redacted cleanup error."""
         return replace(self, cleanup_error=cleanup_error)
 
+    def with_connect_context(
+        self,
+        *,
+        broker_endpoint: str | None = None,
+        connect_cause: str | None = None,
+    ) -> OperationError:
+        """Attach a redacted endpoint and an allowlisted connect cause."""
+        return replace(
+            self,
+            broker_endpoint=(self.broker_endpoint if broker_endpoint is None else broker_endpoint),
+            connect_cause=self.connect_cause if connect_cause is None else connect_cause,
+        )
+
     def redacted_dict(self) -> dict[str, object]:
         """Return the complete public diagnostic representation."""
         return {
@@ -275,6 +295,8 @@ class OperationError(Exception):
             "summary_key": self.summary_key,
             "documentation_slug": self.documentation_slug,
             "redacted_detail": self.redacted_detail,
+            "broker_endpoint": self.broker_endpoint,
+            "connect_cause": self.connect_cause,
             "cleanup_error": (
                 self.cleanup_error.redacted_dict() if self.cleanup_error is not None else None
             ),
@@ -316,7 +338,7 @@ def from_exception(stage: OperationStage, error: BaseException) -> OperationErro
     ):
         return OperationError.for_code(stage, "invalid_broker_profile")
     if isinstance(error, TimeoutError):
-        return OperationError.for_code(stage, "broker_timeout")
+        return _with_detected_cause(OperationError.for_code(stage, "broker_timeout"), error)
     if isinstance(error, MqttConnectError):
         reason_code = _mqtt_reason_code(error)
         if reason_code in {4, 5, 134, 135, 138, 140}:
@@ -326,11 +348,84 @@ def from_exception(stage: OperationStage, error: BaseException) -> OperationErro
         return OperationError.for_code(stage, "broker_unavailable")
     if isinstance(error, MqttError):
         if stage is OperationStage.FLEET_AUTH:
-            return OperationError.for_code(stage, "broker_connect_failed")
+            return _with_detected_cause(
+                OperationError.for_code(stage, "broker_connect_failed"),
+                error,
+            )
         return OperationError.for_code(stage, "operation_failed")
     if isinstance(error, (socket.gaierror, ConnectionError, OSError)):
-        return OperationError.for_code(stage, "broker_connect_failed")
+        return _with_detected_cause(
+            OperationError.for_code(stage, "broker_connect_failed"),
+            error,
+        )
     return OperationError.for_code(stage, "operation_failed")
+
+
+def connect_cause_text(cause: str) -> str:
+    """User-facing phrase for an allowlisted connect cause."""
+    return {
+        "dns": "DNS resolution failed",
+        "connection_refused": "connection refused",
+        "timeout": "timed out",
+        "connect": "the connection failed",
+    }.get(cause, "the connection failed")
+
+
+def _with_detected_cause(error: OperationError, source: BaseException) -> OperationError:
+    if error.code not in _BROKER_CONNECT_CODES:
+        return error
+    cause = _connect_cause(source)
+    if error.code == "broker_timeout" and cause == "connect":
+        cause = "timeout"
+    return error.with_connect_context(connect_cause=cause)
+
+
+def _connect_cause(error: BaseException) -> str:
+    """Prefer DNS, then refusal, then timeout, without retaining exception text."""
+    pending = [error]
+    seen: set[int] = set()
+    saw_refused = False
+    saw_timeout = False
+    while pending and len(seen) < _MAX_EXCEPTION_CHAIN_NODES:
+        current = pending.pop()
+        identity = id(current)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        if isinstance(current, socket.gaierror):
+            return "dns"
+        if isinstance(current, ConnectionRefusedError):
+            saw_refused = True
+        elif isinstance(current, TimeoutError):
+            saw_timeout = True
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None and not current.__suppress_context__:
+            pending.append(current.__context__)
+    if saw_refused:
+        return "connection_refused"
+    if saw_timeout:
+        return "timeout"
+    return "connect"
+
+
+def _validate_connect_context(endpoint: str, cause: str) -> None:
+    if not isinstance(endpoint, str) or not isinstance(cause, str) or cause not in _CONNECT_CAUSES:
+        raise ValueError("invalid_operation_error_metadata")
+    if endpoint == "":
+        return
+    if (
+        len(endpoint) > 300
+        or any(ord(char) < 33 or ord(char) == 127 for char in endpoint)
+        or any(char in endpoint for char in "@/\\")
+    ):
+        raise ValueError("invalid_operation_error_metadata")
+    host, separator, port_text = endpoint.rpartition(":")
+    if separator != ":" or not host or not port_text.isdigit():
+        raise ValueError("invalid_operation_error_metadata")
+    port = int(port_text)
+    if not 1 <= port <= 65535:
+        raise ValueError("invalid_operation_error_metadata")
 
 
 def _validate_stage(stage: object) -> None:

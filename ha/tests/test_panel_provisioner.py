@@ -1394,6 +1394,9 @@ async def test_unreachable_broker_fails_before_baseline_or_journal() -> None:
     assert raised.value.code == "preflight_failed"
     assert raised.value.detail is not None
     assert raised.value.detail.code == "broker_connect_failed"
+    assert raised.value.detail.connect_cause == "dns"
+    assert raised.value.detail.broker_endpoint == "mqtt.iot.example:8883"
+    assert "SECRET" not in raised.value.detail.broker_endpoint
     assert harness.journal.record is None
     assert harness.journal.retained == {}
     assert ("broker_reachability", "mqtt.iot.example", 8883) in harness.events

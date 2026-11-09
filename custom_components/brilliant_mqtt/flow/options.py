@@ -302,7 +302,7 @@ class BrilliantMqttFleetOptionsFlow(OptionsFlow):
                         reason="broker_change_requires_guided_flow",
                     )
 
-                journal_clear = await gateway._async_provisioning_journal_clear(self.hass)
+                journal_status = await gateway._async_provisioning_journal_status(self.hass)
 
                 # The journal read yields to HA. Re-resolve every storage invariant
                 # and the active-flow registry afterward, then update synchronously
@@ -320,12 +320,20 @@ class BrilliantMqttFleetOptionsFlow(OptionsFlow):
                     return self.async_abort(
                         reason="broker_change_requires_guided_flow",
                     )
-                if not journal_clear or _same_entry_panel_add_flow_active(
+                if journal_status == "unreadable":
+                    return self.async_abort(
+                        reason="broker_change_blocked_by_journal_read_error",
+                    )
+                if journal_status == "active":
+                    return self.async_abort(
+                        reason="broker_change_blocked_by_active_journal",
+                    )
+                if _same_entry_panel_add_flow_active(
                     self.hass,
                     entry.entry_id,
                 ):
                     return self.async_abort(
-                        reason="broker_change_blocked_by_panel_onboarding",
+                        reason="broker_change_blocked_by_add_panel_flow",
                     )
                 self._update_broker_entry(entry)
         elif candidate != current:

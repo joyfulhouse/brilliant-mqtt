@@ -2582,6 +2582,31 @@ async def test_panel_preflight_maps_only_explicit_evidence(
     assert _direct_exception_chain(raised.value) == [raised.value]
 
 
+@pytest.mark.parametrize(
+    ("report_code", "detail", "cause"),
+    [
+        ("mqtt_dns", "MQTT name resolution failed", "dns"),
+        ("mqtt_refused", "MQTT connection refused", "connection_refused"),
+        ("mqtt_connect", "MQTT connection failed", "connect"),
+    ],
+)
+def test_panel_connect_report_names_the_failure_kind(
+    report_code: str,
+    detail: str,
+    cause: str,
+) -> None:
+    report = _failed_panel_report(
+        SETUP_ID,
+        PreflightStage.FLEET_AUTH,
+        report_code,
+        detail,
+    )
+    error = broker_validation._panel_report_error(report)
+    assert error.code == "broker_connect_failed"
+    assert error.connect_cause == cause
+    assert "password" not in error.redacted_dict()["connect_cause"]
+
+
 @pytest.mark.usefixtures("enable_custom_integrations")
 async def test_panel_preflight_report_preserves_primary_and_attaches_missing_cleanup(
     hass: HomeAssistant,

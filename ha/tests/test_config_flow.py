@@ -2954,7 +2954,7 @@ async def test_empty_fleet_broker_update_rejects_active_pre_journal_add_flow(
         result = await hass.config_entries.options.async_configure(options_flow_id)
 
     assert result["type"] is FlowResultType.ABORT
-    assert result["reason"] == "broker_change_blocked_by_panel_onboarding"
+    assert result["reason"] == "broker_change_blocked_by_add_panel_flow"
     assert entry.data == original_data
     load_journal.assert_awaited_once()
 
@@ -2974,7 +2974,7 @@ async def test_empty_fleet_broker_update_rejects_journal_without_subentry(
         result = await hass.config_entries.options.async_configure(options_flow_id)
 
     assert result["type"] is FlowResultType.ABORT
-    assert result["reason"] == "broker_change_blocked_by_panel_onboarding"
+    assert result["reason"] == "broker_change_blocked_by_active_journal"
     assert entry.data == original_data
     assert not entry.subentries
 
@@ -2994,7 +2994,7 @@ async def test_empty_fleet_broker_update_fails_closed_when_journal_is_unreadable
         result = await hass.config_entries.options.async_configure(options_flow_id)
 
     assert result["type"] is FlowResultType.ABORT
-    assert result["reason"] == "broker_change_blocked_by_panel_onboarding"
+    assert result["reason"] == "broker_change_blocked_by_journal_read_error"
     assert entry.data == original_data
 
 
@@ -3031,7 +3031,7 @@ async def test_empty_fleet_broker_update_rechecks_add_flow_after_journal_read(
             result = await asyncio.wait_for(commit_task, timeout=1)
 
     assert result["type"] is FlowResultType.ABORT
-    assert result["reason"] == "broker_change_blocked_by_panel_onboarding"
+    assert result["reason"] == "broker_change_blocked_by_add_panel_flow"
     assert entry.data == original_data
 
 

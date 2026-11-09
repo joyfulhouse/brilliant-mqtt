@@ -20,6 +20,7 @@ from homeassistant.const import CONF_NAME
 from homeassistant.core import HomeAssistant
 
 from .broker import BrokerProfile
+from .broker_host import format_broker_endpoint
 from .broker_validation import BrokerValidationResult
 from .const import (
     COMPONENT_BRIDGE,
@@ -201,6 +202,8 @@ class ProvisioningFailureDetail:
     redacted_detail: str
     cleanup_stage: OperationStage | None = None
     cleanup_code: str | None = None
+    broker_endpoint: str = ""
+    connect_cause: str = ""
 
     def __post_init__(self) -> None:
         valid = False
@@ -216,6 +219,10 @@ class ProvisioningFailureDetail:
                 valid = valid and self.cleanup_stage is None and self.cleanup_code is None
             else:
                 OperationError.for_code(self.cleanup_stage, self.cleanup_code)
+            OperationError.for_code(self.stage, self.code).with_connect_context(
+                broker_endpoint=self.broker_endpoint,
+                connect_cause=self.connect_cause,
+            )
         except (TypeError, ValueError):
             valid = False
         if not valid:
@@ -236,6 +243,8 @@ class ProvisioningFailureDetail:
             redacted_detail=error.redacted_detail,
             cleanup_stage=cleanup.stage if cleanup is not None else None,
             cleanup_code=cleanup.code if cleanup is not None else None,
+            broker_endpoint=error.broker_endpoint,
+            connect_cause=error.connect_cause,
         )
 
     def redacted_dict(self) -> dict[str, object]:
@@ -247,6 +256,8 @@ class ProvisioningFailureDetail:
             "summary_key": self.summary_key,
             "documentation_slug": self.documentation_slug,
             "redacted_detail": self.redacted_detail,
+            "broker_endpoint": self.broker_endpoint,
+            "connect_cause": self.connect_cause,
             "cleanup_error": (
                 None
                 if self.cleanup_stage is None
@@ -1627,7 +1638,10 @@ class PanelProvisioner:
         if cause not in _BROKER_REACHABILITY_CAUSES:
             cause = "connect"
         code = "broker_timeout" if cause == "timeout" else "broker_connect_failed"
-        raise OperationError.for_code(OperationStage.FLEET_AUTH, code)
+        raise OperationError.for_code(OperationStage.FLEET_AUTH, code).with_connect_context(
+            broker_endpoint=format_broker_endpoint(fleet.broker.host, fleet.broker.port),
+            connect_cause=cause,
+        )
 
     async def _async_try_discard_unactivated_baseline(self, state: _InstallState) -> bool:
         """Drop an armed pre-activation baseline after a broker preflight failure.
