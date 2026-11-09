@@ -2658,6 +2658,30 @@ def test_candidate_release_absent_probe_executes_for_present_and_absent(tmp_path
     assert dangling.stdout.strip() == "1"
 
 
+def _run_reachability(host: str, port: int) -> subprocess.CompletedProcess[str]:
+    command = panel_ops.broker_reachability_command(host, port, timeout_seconds=0.2)
+    command = command.replace(panel_ops._PANEL_PYTHON, shlex.quote(sys.executable))
+    return subprocess.run(
+        ["/bin/sh", "-c", command],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+
+def test_broker_reachability_script_distinguishes_dns_and_refusal() -> None:
+    unresolved = _run_reachability("core-mosquitto.invalid", 1883)
+    assert unresolved.returncode == 0, unresolved.stderr
+    assert panel_ops.interpret_broker_reachability(unresolved.stdout) == "dns"
+
+    refused = _run_reachability("127.0.0.1", 1)
+    assert refused.returncode == 0, refused.stderr
+    assert panel_ops.interpret_broker_reachability(refused.stdout) == "connection_refused"
+    assert "SECRET" not in unresolved.stdout
+    assert panel_ops.interpret_broker_reachability("not-a-cause\n") == "connect"
+
+
 def test_snapshot_layout_probe_accepts_is_enabled_without_stdout(tmp_path: Path) -> None:
     """The layout probe must not abort when a core unit is absent on systemd 250.
 

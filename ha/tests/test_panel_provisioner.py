@@ -525,6 +525,8 @@ class _FakeJournal:
     pending_commit_started: asyncio.Event = field(default_factory=asyncio.Event)
     complete_commit_started: asyncio.Event = field(default_factory=asyncio.Event)
     created_record: ProvisioningRecord | None = None
+    track_retained: bool = False
+    retained: dict[UUID, RetainedRollback] = field(default_factory=dict)
 
     async def async_begin_ownerless_finalize(self, expected: RetainedRollback) -> RetainedRollback:
         raise RuntimeError("ownerless_finalization_requires_real_journal")
@@ -532,13 +534,30 @@ class _FakeJournal:
     async def async_begin_ownerless_unactivated_discard(
         self, expected: RetainedRollback
     ) -> RetainedRollback:
-        raise RuntimeError("ownerless_unactivated_discard_requires_real_journal")
+        if self.record is not None:
+            raise RuntimeError("ownerless_unactivated_discard_requires_real_journal")
+        current = self.retained.get(expected.record.transaction_id)
+        if (
+            current is None
+            or current != expected
+            or current.state != "armed"
+            or not current.ownerless_unactivated_discard_allowed
+        ):
+            raise RuntimeError("ownerless_unactivated_discard_requires_real_journal")
+        marked = replace(
+            current,
+            state="finalizing",
+            finalization_origin="ownerless_unactivated",
+        )
+        self.retained[expected.record.transaction_id] = marked
+        self.events.append(("journal_unactivated_discard",))
+        return marked
 
     async def async_retained_records(self) -> tuple[RetainedRollback, ...]:
-        return ()
+        return tuple(self.retained.values())
 
     async def async_retained(self, transaction_id: UUID) -> RetainedRollback | None:
-        return None
+        return self.retained.get(transaction_id)
 
     async def async_retained_state(
         self,
@@ -558,7 +577,11 @@ class _FakeJournal:
         )
 
     async def async_remove_retained(self, transaction_id: UUID) -> None:
-        pass
+        current = self.retained.get(transaction_id)
+        if current is None or current.state != "finalizing":
+            return
+        del self.retained[transaction_id]
+        self.events.append(("journal_remove_retained",))
 
     async def async_complete_cleanup(self, transaction_id: UUID) -> None:
         self.events.append(("journal_cleanup_complete",))
@@ -579,6 +602,8 @@ class _FakeJournal:
         assert self.record is None
         self.created_record = record
         self.record = record
+        if self.track_retained and record.prior_snapshot.baseline is not None:
+            self.retained[record.transaction_id] = RetainedRollback(record)
         if self.block_after_create:
             self.create_committed.set()
             await self.allow_create.wait()
@@ -693,6 +718,7 @@ class _FakeOperations:
     activation_started: asyncio.Event = field(default_factory=asyncio.Event)
     rollback_started: asyncio.Event = field(default_factory=asyncio.Event)
     rolled_back_snapshot: panel_ops.PanelSnapshot | None = None
+    reachability: str = "ok"
 
     @asynccontextmanager
     async def release_transaction(
@@ -717,7 +743,20 @@ class _FakeOperations:
         pass
 
     async def finalize_baseline(self, shell: PanelShell, snapshot: panel_ops.PanelSnapshot) -> None:
-        pass
+        del shell, snapshot
+        self.events.append(("finalize_baseline",))
+
+    async def probe_broker_reachability(
+        self,
+        shell: PanelShell,
+        host: str,
+        port: int,
+    ) -> str:
+        del shell
+        self.events.append(("broker_reachability", host, port))
+        if "broker_reachability" in self.fail_at:
+            raise panel_ops.PanelOpError("broker_reachability_failed")
+        return self.reachability
 
     async def prove_unactivated_capture(
         self,
@@ -1338,6 +1377,79 @@ async def test_pre_activation_failure_cleans_only_inactive_candidate() -> None:
     assert harness.journal.record is None
     assert "SECRET" not in repr(raised.value)
     assert _exception_graph(raised.value) == [raised.value]
+
+
+async def test_unreachable_broker_fails_before_baseline_or_journal() -> None:
+    harness = _Harness()
+    harness.journal.track_retained = True
+    harness.operations.reachability = "dns"
+
+    with pytest.raises(PanelProvisioningError) as raised:
+        await harness.provisioner().async_install(
+            _request(),
+            _fleet(),
+            harness.progress,
+        )
+
+    assert raised.value.code == "preflight_failed"
+    assert raised.value.detail is not None
+    assert raised.value.detail.code == "broker_connect_failed"
+    assert harness.journal.record is None
+    assert harness.journal.retained == {}
+    assert ("broker_reachability", "mqtt.iot.example", 8883) in harness.events
+    assert not any(
+        event[0] in {"snapshot", "journal_create", "stage", "preflight"} for event in harness.events
+    )
+    assert "SECRET" not in repr(raised.value)
+
+
+async def test_broker_preflight_failure_discards_unactivated_baseline() -> None:
+    harness = _Harness()
+    harness.journal.track_retained = True
+    harness.preflight_error = OperationError.for_code(
+        OperationStage.FLEET_AUTH,
+        "broker_connect_failed",
+    )
+
+    with pytest.raises(PanelProvisioningError) as raised:
+        await harness.provisioner().async_install(
+            _request(),
+            _fleet(),
+            harness.progress,
+        )
+
+    assert raised.value.code == "preflight_failed"
+    assert raised.value.detail is not None
+    assert raised.value.detail.code == "broker_connect_failed"
+    assert harness.journal.record is None
+    assert harness.journal.retained == {}
+    assert ("finalize_baseline",) in harness.events
+    assert ("journal_unactivated_discard",) in harness.events
+    assert ("journal_remove_retained",) in harness.events
+    assert not any(event[0] == "rollback" for event in harness.events)
+
+
+async def test_non_broker_preflight_failure_keeps_armed_baseline() -> None:
+    harness = _Harness()
+    harness.journal.track_retained = True
+    harness.preflight_error = OperationError.for_code(
+        OperationStage.PANEL_TO_HA,
+        "panel_to_ha_timeout",
+    )
+
+    with pytest.raises(PanelProvisioningError) as raised:
+        await harness.provisioner().async_install(
+            _request(),
+            _fleet(),
+            harness.progress,
+        )
+
+    assert raised.value.detail is not None
+    assert raised.value.detail.code == "panel_to_ha_timeout"
+    assert harness.journal.record is None
+    retained = next(iter(harness.journal.retained.values()))
+    assert retained.state == "armed"
+    assert not any(event[0] == "finalize_baseline" for event in harness.events)
 
 
 async def test_custom_ca_stage_failure_cleans_transaction_owned_release() -> None:

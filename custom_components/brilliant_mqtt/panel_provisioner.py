@@ -178,6 +178,15 @@ _MAX_JSON_NODES = 4096
 _PROGRESS_TIMEOUT_SECONDS = 5.0
 RECOVERY_TIMEOUT_SECONDS = 300.0
 INSTALL_LOCK_TIMEOUT_SECONDS = 30.0
+_BROKER_PREFLIGHT_DISCARD_CODES = frozenset(
+    {
+        "broker_connect_failed",
+        "broker_timeout",
+        "broker_unavailable",
+        "broker_connection_rejected",
+    }
+)
+_BROKER_REACHABILITY_CAUSES = frozenset({"ok", "dns", "connection_refused", "timeout", "connect"})
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -826,6 +835,13 @@ class PanelOperations(Protocol):
         staged: StagedRelease,
     ) -> None: ...
 
+    async def probe_broker_reachability(
+        self,
+        shell: PanelShell,
+        host: str,
+        port: int,
+    ) -> str: ...
+
 
 class _HealthObserver(Protocol):
     async def async_subscribe(self) -> None: ...
@@ -871,6 +887,7 @@ class _InstallState:
     journal_phase: ProvisioningPhase | None = None
     failure_code: str = "invalid_provisioning_dependency"
     failure_stage: str = "provisioning"
+    discard_unactivated_baseline: bool = False
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -999,6 +1016,12 @@ class PanelProvisioner:
                     else state.failure_code
                 )
             except OperationError as error:
+                if (
+                    state.failure_code == "preflight_failed"
+                    and state.journal_phase is not None
+                    and error.code in _BROKER_PREFLIGHT_DISCARD_CODES
+                ):
+                    state.discard_unactivated_baseline = True
                 detail = (
                     ProvisioningFailureDetail.from_operation_error(error)
                     if state.failure_code == "preflight_failed"
@@ -1291,6 +1314,7 @@ class PanelProvisioner:
         assert state.shell is not None
         assert state.transaction_id is not None
         assert state.setup_id is not None
+        await self._async_require_panel_broker_reachability(state, fleet)
         state.failure_code = "progress_failed"
         state.failure_stage = "progress"
         await _report(progress, ProvisioningProgressStage.SNAPSHOTTING)
@@ -1565,9 +1589,82 @@ class PanelProvisioner:
                 )
             )
         await self._operations.cleanup_staged(state.shell, state.staged)
+        if (
+            state.journal_phase is ProvisioningPhase.STAGED
+            and state.discard_unactivated_baseline
+            and await self._async_try_discard_unactivated_baseline(state)
+        ):
+            return
         if state.journal_phase is ProvisioningPhase.STAGED:
             await self._journal.async_complete_cleanup(state.transaction_id)
             state.journal_phase = None
+
+    async def _async_require_panel_broker_reachability(
+        self,
+        state: _InstallState,
+        fleet: FleetConfig,
+    ) -> None:
+        """Fail before a baseline exists when the panel cannot open the broker.
+
+        The full MQTT preflight has to run the staged candidate, and that candidate
+        is journaled first so a crash can be recovered. A read-only DNS/TCP probe
+        does not mutate the panel, so it runs before the baseline is captured.
+        """
+        assert state.shell is not None
+        state.failure_code = "preflight_failed"
+        state.failure_stage = "preflight"
+        cause = "connect"
+        try:
+            cause = await self._operations.probe_broker_reachability(
+                state.shell,
+                fleet.broker.host,
+                fleet.broker.port,
+            )
+        except PanelOpError:
+            cause = "connect"
+        if cause == "ok":
+            return
+        if cause not in _BROKER_REACHABILITY_CAUSES:
+            cause = "connect"
+        code = "broker_timeout" if cause == "timeout" else "broker_connect_failed"
+        raise OperationError.for_code(OperationStage.FLEET_AUTH, code)
+
+    async def _async_try_discard_unactivated_baseline(self, state: _InstallState) -> bool:
+        """Drop an armed pre-activation baseline after a broker preflight failure.
+
+        Proof matches the ownerless unactivated discard: the live panel still
+        matches the capture and the candidate directory is gone. A failed proof
+        leaves the armed baseline in place.
+        """
+        if (
+            state.shell is None
+            or state.snapshot is None
+            or state.staged is None
+            or state.transaction_id is None
+        ):
+            return False
+        try:
+            await self._operations.prove_unactivated_capture(
+                state.shell,
+                state.snapshot,
+                version=state.staged.version,
+                transaction_id=state.transaction_id,
+            )
+        except (PanelOpError, PanelProvisioningError, ValueError, TypeError):
+            return False
+        await self._journal.async_complete_cleanup(state.transaction_id)
+        state.journal_phase = None
+        retained = await self._journal.async_retained(state.transaction_id)
+        if retained is None or not retained.ownerless_unactivated_discard_allowed:
+            return True
+        current = await self._journal.async_begin_ownerless_unactivated_discard(retained)
+        await self._operations.finalize_baseline(
+            state.shell,
+            self._snapshot_from_stored(current.record.prior_snapshot),
+        )
+        await self._journal.async_remove_retained(current.record.transaction_id)
+        await self._repair_reporter.async_clear_rollback_failure(current.record.transaction_id)
+        return True
 
     async def _async_reopen_compensate_and_close(
         self,
