@@ -28,7 +28,12 @@ from brilliant_mqtt.discovery import (
     meta_topic,
     state_topic,
 )
-from brilliant_mqtt.mapping import EntityDescriptor, entities_for, payload_fields
+from brilliant_mqtt.mapping import (
+    EntityDescriptor,
+    entities_for,
+    has_calibrated_motion_thresholds,
+    payload_fields,
+)
 from brilliant_mqtt.model import BrilliantDevice, CaptureProvenance, DeviceKind, Variable
 from brilliant_mqtt.motion_derive import MotionDeriver
 from brilliant_mqtt.protocols import BusClient, MqttClient
@@ -680,33 +685,27 @@ class Bridge:
         if self._feedback_alive(lifecycle):
             await self._enforce_desired(devices)
 
-    def _seed_motion_defaults(self, device: BrilliantDevice) -> None:
-        """Seed optional default motion thresholds and native-passthrough scoring state."""
-        if self._desired is None:
-            return
-        pid = device.peripheral_id
+    def _motion_default_wants(self, device: BrilliantDevice) -> dict[str, str]:
+        """Config-driven motion defaults for *device*, overlaid under recorded intent.
+
+        Never persisted: they are configuration, not user intent, so unsetting
+        the env vars stops asserting them. Scoring is only turned off on a switch
+        whose observed thresholds are already calibrated — an uncalibrated switch
+        with scoring off would have its motion gated off for good.
+        """
+        defaults: dict[str, str] = {}
+        variables = device.variables
+        if self._motion_default_high_threshold is not None and "motion_high_threshold" in variables:
+            defaults["motion_high_threshold"] = str(self._motion_default_high_threshold)
+        if self._motion_default_low_threshold is not None and "motion_low_threshold" in variables:
+            defaults["motion_low_threshold"] = str(self._motion_default_low_threshold)
         if (
-            self._motion_default_high_threshold is not None
-            and "motion_high_threshold" in device.variables
+            self._motion_native_passthrough
+            and "enable_motion_score" in variables
+            and has_calibrated_motion_thresholds(device)
         ):
-            self._desired.seed_default(
-                pid,
-                "motion_high_threshold",
-                str(self._motion_default_high_threshold),
-            )
-        if (
-            self._motion_default_low_threshold is not None
-            and "motion_low_threshold" in device.variables
-        ):
-            self._desired.seed_default(
-                pid,
-                "motion_low_threshold",
-                str(self._motion_default_low_threshold),
-            )
-        if self._motion_native_passthrough and "enable_motion_score" in device.variables:
-            # Native passthrough uses calibrated NVM thresholds with continuous
-            # score streaming disabled (enable_motion_score == "0").
-            self._desired.seed_default(pid, "enable_motion_score", "0")
+            defaults["enable_motion_score"] = "0"
+        return defaults
 
     async def _enforce_desired(self, devices: list[BrilliantDevice]) -> None:
         """Re-assert drifted reconciled vars (firmware reverts the enable flags).
@@ -726,8 +725,10 @@ class Bridge:
                 return
             if not self._included(device):
                 continue
-            self._seed_motion_defaults(device)
-            wanted = self._desired.wanted(device.peripheral_id)
+            wanted = {
+                **self._motion_default_wants(device),
+                **self._desired.wanted(device.peripheral_id),
+            }
             if not wanted:
                 continue
             drifted: list[VarSet] = []
