@@ -14,20 +14,16 @@ from brilliant_mqtt.ambilight import (
     AmbilightCrop,
     CameraCaptureProtocol,
     GStreamerCameraAdapter,
-    build_52_panel_coords,
-    build_auto_crop_depth_boxes,
-    build_depth_glow_boxes,
     build_gstreamer_i420_args,
     build_gstreamer_jpeg_args,
-    encode_nanoleaf_v2_packet,
     estimate_i420_active_bbox_norm,
     extract_ambilight_sample_from_i420,
-    infer_scene_cue,
     is_privacy_shutter_closed,
-    sample_box_fast,
 )
+from brilliant_mqtt.bridge import Bridge
+from brilliant_mqtt.model import BrilliantDevice, DeviceKind, Variable
 from brilliant_mqtt.retained_topics import RetainedTopicLedger
-from tests.fakes import FakeMqtt
+from tests.fakes import FakeBus, FakeMqtt
 
 
 def _make_solid_i420_frame(width: int, height: int, y: int, u: int, v: int) -> bytes:
@@ -102,33 +98,73 @@ class TestI420ColorExtractor:
             extract_ambilight_sample_from_i420(b"short", 64, 64)
 
 
-class TestPrivacyShutterAndSubprocessCancellation:
-    async def test_privacy_shutter_closed_refuses_capture(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+class TestFailClosedPrivacyGateAndSubprocessCancellation:
+    async def test_privacy_gate_fails_closed_for_missing_unknown_and_active_privacy(
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        gpio = tmp_path / "gpio5_value"
-        gpio.write_text("0\n", encoding="utf-8")
-        assert is_privacy_shutter_closed(gpio) is True
+        # Missing, empty, unknown, or "1" (privacy on) all fail closed (shutter closed = True)
+        assert is_privacy_shutter_closed(None) is True
+        assert is_privacy_shutter_closed("") is True
+        assert is_privacy_shutter_closed("unknown") is True
+        assert is_privacy_shutter_closed("1") is True
+        assert is_privacy_shutter_closed(privacy_off=lambda: False) is True
+
+        # Only explicit "0" (privacy off) or privacy_off() -> True opens the gate
+        assert is_privacy_shutter_closed("0") is False
+        assert is_privacy_shutter_closed(privacy_off=lambda: True) is False
 
         spawn_called = False
 
         async def _fail_if_spawned(*args: Any, **kwargs: Any) -> Any:
             nonlocal spawn_called
             spawn_called = True
-            raise AssertionError("subprocess must not spawn when privacy shutter is closed")
+            raise AssertionError("subprocess must not spawn unless privacy_off is True")
 
         monkeypatch.setattr(asyncio, "create_subprocess_exec", _fail_if_spawned)
-        adapter = GStreamerCameraAdapter(privacy_gpio_path=gpio)
-        assert await adapter.capture_jpeg_snapshot(AmbilightCrop()) is None
-        assert await adapter.capture_i420_frame(AmbilightCrop()) is None
+        # Default adapter with no privacy_off callback fails closed
+        adapter_default = GStreamerCameraAdapter()
+        assert await adapter_default.capture_jpeg_snapshot(AmbilightCrop()) is None
+        assert await adapter_default.capture_i420_frame(AmbilightCrop()) is None
         assert spawn_called is False
 
-        # Open privacy shutter ("1")
-        gpio.write_text("1\n", encoding="utf-8")
-        assert is_privacy_shutter_closed(gpio) is False
+        # Bridge.is_privacy_off() fails closed until HARDWARE reports privacy_toggle == "0"
+        bus = FakeBus([])
+        mqtt = FakeMqtt()
+        bridge = Bridge(bus, mqtt, "living_room")
+        assert bridge.is_privacy_off() is False
+
+        hw_unknown = BrilliantDevice(
+            device_id="panel_1",
+            peripheral_id="hardware",
+            name="Hardware",
+            kind=DeviceKind.HARDWARE,
+            variables={},
+        )
+        bridge._remember_device(hw_unknown)
+        assert bridge.is_privacy_off() is False
+
+        hw_on = BrilliantDevice(
+            device_id="panel_1",
+            peripheral_id="hardware",
+            name="Hardware",
+            kind=DeviceKind.HARDWARE,
+            variables={"privacy_toggle": Variable("privacy_toggle", "1", False)},
+        )
+        bridge._remember_device(hw_on)
+        assert bridge.is_privacy_off() is False
+
+        hw_off = BrilliantDevice(
+            device_id="panel_1",
+            peripheral_id="hardware",
+            name="Hardware",
+            kind=DeviceKind.HARDWARE,
+            variables={"privacy_toggle": Variable("privacy_toggle", "0", False)},
+        )
+        bridge._remember_device(hw_off)
+        assert bridge.is_privacy_off() is True
 
     async def test_cancelled_capture_kills_and_reaps_gst_subprocess(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         killed = False
         reaped = False
@@ -159,7 +195,7 @@ class TestPrivacyShutterAndSubprocessCancellation:
         adapter = GStreamerCameraAdapter(
             device="test_device",
             timeout_s=10.0,
-            privacy_gpio_path=tmp_path / "absent_gpio",
+            privacy_off=lambda: True,
         )
         task = asyncio.create_task(adapter.capture_i420_frame(AmbilightCrop()))
         await asyncio.wait_for(started.wait(), timeout=1.0)
@@ -188,10 +224,10 @@ class TestAmbilightController:
             state_path=state_file,
             default_enabled=False,
             owned_topics=ledger,
+            privacy_off=lambda: True,
         )
         await ctrl.start()
 
-        # Verify 4-part state topic is claimed in RetainedTopicLedger and device model is "Control"
         assert "brilliant/living_room/ambilight/state" in ledger.topics
         sw_pub = next(
             p
@@ -207,7 +243,7 @@ class TestAmbilightController:
         await ctrl.on_mqtt_command("brilliant/living_room/ambilight/set_snapshot", "PRESS")
         snaps = [p for p in mqtt.published if p[0] == "brilliant/living_room/ambilight/snapshot"]
         assert len(snaps) == 1
-        assert snaps[0][2] is False  # retain=False!
+        assert snaps[0][2] is False
 
         # Update crop via dataclasses.replace path
         await ctrl.on_mqtt_command("brilliant/living_room/ambilight/set_crop_top", "240")
@@ -221,7 +257,7 @@ class TestAmbilightController:
         assert sample is not None
         color_pubs = [p for p in mqtt.published if p[0] == "brilliant/living_room/ambilight/color"]
         assert len(color_pubs) == 1
-        assert color_pubs[0][2] is False  # retain=False!
+        assert color_pubs[0][2] is False
 
         # Enable then disable -> clears snapshot topic with retained empty tombstone
         await ctrl.on_mqtt_command("brilliant/living_room/ambilight/set_enabled", "ON")
@@ -237,51 +273,7 @@ class TestAmbilightController:
         await ctrl.shutdown()
         assert ("brilliant/living_room/ambilight/snapshot", "", True) in mqtt.published
 
-
-class TestMultiZoneRPMLightHelpers:
-    def test_52_panel_coords_and_nanoleaf_v2_packet(self) -> None:
-        coords = build_52_panel_coords()
-        assert len(coords) == 52
-        boxes = build_depth_glow_boxes(320, 184)
-        assert len(boxes) == 52
-
-        frame = _make_solid_i420_frame(320, 184, y=22, u=120, v=165)
-        y_size = 320 * 184
-        uv_size = 160 * 92
-        mv = memoryview(frame)
-        _pid, ey_idx, euv_idx, _iy_idx, _iuv_idx = boxes[0]
-        r, g, b = sample_box_fast(
-            mv[:y_size],
-            mv[y_size : y_size + uv_size],
-            mv[y_size + uv_size : y_size + 2 * uv_size],
-            ey_idx,
-            euv_idx,
-        )
-        assert r >= g > 0
-        assert b > 0
-
-        pkt = encode_nanoleaf_v2_packet([(r, g, b)] * 52, transition_ds=1)
-        assert len(pkt) == 2 + 52 * 8
-
-        auto_boxes = build_auto_crop_depth_boxes(320, 176)
-        assert len(auto_boxes) == 52
-        for _pid, edge_steps, _iy, _iuv in auto_boxes:
-            assert len(edge_steps) == 3
-
-        # Brown/tan/wood protection (ym=34, u=116, v=144 stays warm golden-tan, not blood-red)
-        frame_brown = _make_solid_i420_frame(320, 184, y=34, u=116, v=144)
-        mv_b = memoryview(frame_brown)
-        r_b, g_b, b_b = sample_box_fast(
-            mv_b[:y_size],
-            mv_b[y_size : y_size + uv_size],
-            mv_b[y_size + uv_size : y_size + 2 * uv_size],
-            ey_idx,
-            euv_idx,
-        )
-        assert g_b >= int(r_b * 0.55)
-        assert b_b > 0
-
-    async def test_optional_tpu_gemini_and_auto_crop_revert(self) -> None:
+    async def test_auto_crop_and_saved_crop_revert(self) -> None:
         mqtt = FakeMqtt()
         cam = FakeCameraAdapter(y=120, u=90, v=210)
         hardcoded = AmbilightCrop(top=328, bottom=216, left=608, right=352)
@@ -290,16 +282,12 @@ class TestMultiZoneRPMLightHelpers:
             panel="living_room",
             camera=cam,
             default_crop=hardcoded,
+            privacy_off=lambda: True,
         )
-        # Optional by default
-        assert ctrl.tpu_url == ""
-        assert ctrl.tpu_configured is False
-        assert ctrl.gemini_configured is False
         assert ctrl.auto_crop_enabled is False
         assert ctrl.saved_crop == hardcoded
         assert ctrl.crop == hardcoded
 
-        # Enable auto-crop via sub-bbox and verify saved_crop is preserved for revert
         ctrl._auto_crop_enabled = True
         tightened = ctrl.apply_auto_crop_bbox((0.125, 0.125, 0.875, 0.875))
         assert tightened.left > hardcoded.left
@@ -311,25 +299,7 @@ class TestMultiZoneRPMLightHelpers:
         assert ctrl.crop == hardcoded
         assert ctrl.auto_crop_enabled is False
 
-        # Test infer_scene_cue and estimate_i420_active_bbox_norm
-        cue = infer_scene_cue(
-            {
-                "scene_cue": {
-                    "scene_class": "music_video",
-                    "wing_weights": {"west": 1.3, "east": 0.8, "far_left": 1.2},
-                    "active_content_bbox_norm": [0.1, 0.1, 0.9, 0.9],
-                },
-                "viewers_in_room": 2,
-                "latency_ms": 6.2,
-            }
-        )
-        assert cue.scene_class == "music_video"
-        assert cue.wing_weights == {"west": 1.3, "east": 0.8, "far_left": 1.2}
-        assert cue.active_content_bbox_norm == (0.1, 0.1, 0.9, 0.9)
-
         bbox = estimate_i420_active_bbox_norm(
             _make_solid_i420_frame(320, 176, y=100, u=128, v=128), 320, 176
         )
         assert bbox == (0.0, 0.0, 1.0, 1.0)
-
-

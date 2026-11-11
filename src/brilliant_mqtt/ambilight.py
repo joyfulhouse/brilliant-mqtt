@@ -8,9 +8,9 @@ Uses the Brilliant panel's NXP i.MX6 camera pipeline (``imxv4l2src`` ->
    Assistant.
 2. **Real-Time Dominant RGB / Brightness Extraction** from raw ``I420`` (YUV420p)
    cropped frames in pure Python stdlib without external imaging dependencies.
-3. **Hardware Privacy Switch Enforcement:** Checks the physical faceplate privacy
-   shutter GPIO (``/sys/class/gpio/gpio5/value``) before every capture and
-   refuses capture whenever the privacy shutter is closed (``"0"``).
+3. **Fail-Closed Privacy Gate:** Checks the live-verified bus ``privacy_toggle``
+   variable before every capture and refuses capture unless privacy mode is
+   positively reported off (``"0"``).
 """
 
 from __future__ import annotations
@@ -21,7 +21,6 @@ import contextlib
 import json
 import logging
 import os
-import struct
 import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -38,26 +37,27 @@ logger = logging.getLogger(__name__)
 SENSOR_WIDTH = 1280
 SENSOR_HEIGHT = 720
 MIN_CROP_SPAN = 32
-DEFAULT_PRIVACY_GPIO_PATH = "/sys/class/gpio/gpio5/value"
 
 
 def is_privacy_shutter_closed(
-    gpio_path: str | Path = DEFAULT_PRIVACY_GPIO_PATH,
+    privacy_toggle: str | None = None,
+    *,
+    privacy_off: Callable[[], bool] | None = None,
 ) -> bool:
-    """Return ``True`` if the panel's hardware privacy switch is closed (``0``).
+    """Return ``True`` unless the panel's bus ``privacy_toggle`` positively reads ``"0"``.
 
-    On the Brilliant Control faceplate, ``/sys/class/gpio/gpio5/value`` reads
-    ``"0"`` when the physical privacy slider covers/disables the camera and
-    ``"1"`` when the shutter is open. If the GPIO file is absent (e.g. off-panel
-    unit tests), returns ``False``.
+    Fails closed: when ``privacy_toggle`` is ``None``, empty, ``"unknown"``, or
+    ``"1"`` (privacy mode active / shutter closed), returns ``True`` so camera
+    capture is blocked.
     """
-    path = Path(gpio_path)
-    try:
-        if not path.exists():
-            return False
-        return path.read_text(encoding="utf-8").strip() == "0"
-    except OSError:
-        return False
+    if privacy_off is not None:
+        try:
+            return not bool(privacy_off())
+        except Exception:
+            return True
+    if privacy_toggle is None:
+        return True
+    return privacy_toggle.strip() != "0"
 
 
 @dataclass(frozen=True)
@@ -115,62 +115,6 @@ class AmbilightCrop:
             left=new_left,
             right=new_right,
         ).normalized()
-
-
-@dataclass(frozen=True)
-class TPUSceneCue:
-    """Optional low-rate scene cue from TPUaaS (``ssd_coco``) or Gemini Vision."""
-
-    scene_class: str = "auto"
-    wing_weights: dict[str, float] | None = None
-    active_content_bbox_norm: tuple[float, float, float, float] | None = None
-    recommended_bbox_norm: tuple[float, float, float, float] | None = None
-    viewers_in_room: int = 0
-    latency_ms: float = 0.0
-
-
-def infer_scene_cue(payload: dict[str, Any]) -> TPUSceneCue:
-    """Parse a :class:`TPUSceneCue` from a ``/v1/projects/ambiled`` JSON payload."""
-    cue = payload.get("scene_cue") if isinstance(payload.get("scene_cue"), dict) else {}
-    dets = payload.get("detections") if isinstance(payload.get("detections"), list) else []
-
-    scene_class = str(cue.get("scene_class", payload.get("scene_class", "auto")))
-    if scene_class not in ("drama", "music_video", "auto"):
-        person_count = sum(
-            1 for d in dets if isinstance(d, dict) and d.get("label") == "person"
-        )
-        scene_class = "drama" if person_count == 1 else ("music_video" if person_count >= 2 else "auto")
-
-    ww_raw = cue.get("wing_weights")
-    if isinstance(ww_raw, dict):
-        wing_weights = {
-            "west": max(0.5, min(1.5, float(ww_raw.get("west", 1.0)))),
-            "east": max(0.5, min(1.5, float(ww_raw.get("east", 1.0)))),
-            "far_left": max(0.5, min(1.5, float(ww_raw.get("far_left", 1.0)))),
-        }
-    else:
-        wing_weights = {"west": 1.0, "east": 1.0, "far_left": 1.0}
-
-    def _parse_bbox(raw: Any) -> tuple[float, float, float, float] | None:
-        if isinstance(raw, (list, tuple)) and len(raw) == 4:
-            try:
-                x0, y0, x1, y1 = (float(v) for v in raw)
-                if 0.0 <= x0 < x1 <= 1.0 and 0.0 <= y0 < y1 <= 1.0:
-                    return (x0, y0, x1, y1)
-            except (TypeError, ValueError):
-                pass
-        return None
-
-    active_bbox = _parse_bbox(cue.get("active_content_bbox_norm"))
-    rec_bbox = _parse_bbox(payload.get("recommended_bbox_norm")) or active_bbox
-    return TPUSceneCue(
-        scene_class=scene_class,
-        wing_weights=wing_weights,
-        active_content_bbox_norm=active_bbox,
-        recommended_bbox_norm=rec_bbox,
-        viewers_in_room=int(payload.get("viewers_in_room", 0) or 0),
-        latency_ms=float(payload.get("latency_ms", 0.0) or 0.0),
-    )
 
 
 def estimate_i420_active_bbox_norm(
@@ -433,19 +377,17 @@ class GStreamerCameraAdapter(CameraCaptureProtocol):
         self,
         device: str = "/dev/video0",
         timeout_s: float = 4.0,
-        privacy_gpio_path: str | Path = DEFAULT_PRIVACY_GPIO_PATH,
+        *,
+        privacy_off: Callable[[], bool] | None = None,
     ) -> None:
         self._device = device
         self._timeout_s = timeout_s
-        self._privacy_gpio_path = Path(privacy_gpio_path)
+        self._privacy_off = privacy_off
         self._lock = asyncio.Lock()
 
     async def _run_gst_capture(self, args: list[str], out_path: Path) -> bytes | None:
-        if is_privacy_shutter_closed(self._privacy_gpio_path):
-            logger.info(
-                "Camera capture skipped: hardware privacy switch is closed (%s=0)",
-                self._privacy_gpio_path,
-            )
+        if is_privacy_shutter_closed(privacy_off=self._privacy_off):
+            logger.info("Camera capture skipped: bus privacy_toggle is not positively off")
             _cleanup_capture_output(out_path)
             return None
         if not _device_exists_on_panel(self._device):
@@ -517,9 +459,8 @@ class AmbilightController:
         default_interval_s: float = 1.0,
         default_crop: AmbilightCrop | None = None,
         default_auto_crop_enabled: bool = False,
-        tpu_url: str | None = None,
-        gemini_api_key: str | None = None,
         owned_topics: RetainedTopicLedger | None = None,
+        privacy_off: Callable[[], bool] | None = None,
         sleep: Callable[[float], Any] = asyncio.sleep,
     ) -> None:
         self._mqtt = mqtt
@@ -527,6 +468,7 @@ class AmbilightController:
         self._camera = camera
         self._state_path = state_path
         self._owned_topics = owned_topics
+        self._privacy_off = privacy_off
         self._sleep = sleep
 
         self._enabled = default_enabled
@@ -534,15 +476,6 @@ class AmbilightController:
         self._crop = (default_crop or AmbilightCrop()).normalized()
         self._saved_crop = self._crop
         self._auto_crop_enabled = default_auto_crop_enabled
-        self._tpu_url = (
-            tpu_url if tpu_url is not None else os.environ.get("RPMLIGHT_TPU_URL", "")
-        ).strip().rstrip("/")
-        self._gemini_api_key = (
-            gemini_api_key
-            if gemini_api_key is not None
-            else os.environ.get("RPMLIGHT_GEMINI_API_KEY", "")
-        ).strip()
-        self._last_scene_cue = TPUSceneCue()
         self._last_sample: AmbilightSample | None = None
         self._poll_task: asyncio.Task[None] | None = None
         self._last_persisted_snapshot: dict[str, Any] | None = None
@@ -565,22 +498,6 @@ class AmbilightController:
     @property
     def auto_crop_enabled(self) -> bool:
         return self._auto_crop_enabled
-
-    @property
-    def tpu_url(self) -> str:
-        return self._tpu_url
-
-    @property
-    def tpu_configured(self) -> bool:
-        return bool(self._tpu_url)
-
-    @property
-    def gemini_configured(self) -> bool:
-        return bool(self._gemini_api_key)
-
-    @property
-    def last_scene_cue(self) -> TPUSceneCue:
-        return self._last_scene_cue
 
     @property
     def interval_s(self) -> float:
@@ -698,8 +615,15 @@ class AmbilightController:
             except asyncio.CancelledError:
                 return
 
+    def _is_blocked_by_privacy(self) -> bool:
+        if self._privacy_off is None:
+            return False
+        return is_privacy_shutter_closed(privacy_off=self._privacy_off)
+
     async def sample_once(self) -> AmbilightSample | None:
         """Capture one cropped I420 frame, compute dominant color, and publish state."""
+        if self._is_blocked_by_privacy():
+            return None
         c = self._crop.normalized()
         frame = await self._camera.capture_i420_frame(c)
         if frame is None:
@@ -731,6 +655,8 @@ class AmbilightController:
 
     async def trigger_snapshot(self) -> bool:
         """Capture a cropped JPEG snapshot and publish it to MQTT with ``retain=False``."""
+        if self._is_blocked_by_privacy():
+            return False
         c = self._crop.normalized()
         jpeg = await self._camera.capture_jpeg_snapshot(c)
         if jpeg is None:
@@ -771,6 +697,8 @@ class AmbilightController:
 
     async def auto_calibrate_crop(self) -> AmbilightCrop | None:
         """Capture an ``I420`` frame from ``saved_crop`` and auto-fit active TV bounds."""
+        if self._is_blocked_by_privacy():
+            return None
         base = self._saved_crop.normalized()
         frame = await self._camera.capture_i420_frame(base)
         if frame is None:
@@ -999,8 +927,6 @@ class AmbilightController:
         payload = {
             "enabled": self._enabled,
             "auto_crop_enabled": self._auto_crop_enabled,
-            "tpu_configured": bool(self._tpu_url),
-            "gemini_configured": bool(self._gemini_api_key),
             "interval_s": self._interval_s,
             "crop": {
                 "top": c.top,
@@ -1029,315 +955,3 @@ class AmbilightController:
             self._state_topic(),
             json.dumps(payload, sort_keys=True),
         )
-
-
-# ---------------------------------------------------------------------------
-# Multi-Zone Perceptual RPMLight Streamer Engine (52-Zone Perimeter + Sky)
-# Standalone upstream package: https://github.com/rpmccormick/rpmlight
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class ZoneFrameResult:
-    """Computed 52-zone RGB output, transition time, scene-cut flag, and overhead sky."""
-
-    zones_rgb: list[tuple[int, int, int]]
-    nl_transition_ds: int
-    is_scene_cut: bool
-    up_rgb: list[int]
-    up_bri: int
-    down_rgb: list[int]
-    down_bri: int
-
-
-def build_52_panel_coords() -> list[tuple[int, int, int]]:
-    """Build the 52-zone clockwise perimeter coordinate ring (starting bottom-center)."""
-    coords: list[tuple[int, int, int]] = []
-    pid = 0
-    for x in range(400, -1, -50):
-        coords.append((pid, x, 0))
-        pid += 1
-    for y in range(50, 451, 50):
-        coords.append((pid, 0, y))
-        pid += 1
-    for x in range(50, 851, 50):
-        coords.append((pid, x, 450))
-        pid += 1
-    for y in range(400, -1, -50):
-        coords.append((pid, 850, y))
-        pid += 1
-    for x in range(800, 449, -50):
-        coords.append((pid, x, 0))
-        pid += 1
-    return coords
-
-
-def _precompute_box_indices(
-    width: int, x0: int, y0: int, x1: int, y1: int, step: int = 4
-) -> tuple[list[int], list[int]]:
-    uv_stride = width // 2
-    y_indices: list[int] = []
-    uv_indices: list[int] = []
-    for py in range(y0, y1, step):
-        y_row = py * width
-        uv_row = (py >> 1) * uv_stride
-        for px in range(x0, x1, step):
-            y_indices.append(y_row + px)
-            uv_indices.append(uv_row + (px >> 1))
-    return y_indices, uv_indices
-
-
-def build_depth_glow_boxes(
-    width: int = 320,
-    height: int = 184,
-) -> list[tuple[int, list[int], list[int], list[int], list[int]]]:
-    """Precompute a tight Outer Edge Strip + a 54x44 Deep Inner Strip per zone."""
-    ex_min, ex_max, ey_min, ey_max, ew, eh = 3, 315, 2, 170, 16, 14
-    espan_x = (ex_max - ex_min) - ew
-    espan_y = (ey_max - ey_min) - eh
-
-    ix_min, ix_max, iy_min, iy_max, iw, ih = 18, 302, 18, 154, 54, 44
-    ispan_x = (ix_max - ix_min) - iw
-    ispan_y = (iy_max - iy_min) - ih
-
-    precomputed: list[tuple[int, list[int], list[int], list[int], list[int]]] = []
-    for pid, nx, ny in build_52_panel_coords():
-        u = nx / 850.0
-        v = 1.0 - (ny / 450.0)
-
-        ex0 = round(ex_min + u * espan_x)
-        ey0 = round(ey_min + v * espan_y)
-        cur_eh = eh
-        if ex0 >= 265 and ey0 >= 142:
-            ey0 = 138
-        elif ey0 >= 152:
-            # Lift bottom edge off y=165..170 bezel reflection to y=155..164
-            ey0 = 155
-            cur_eh = 9
-        ey_idx, euv_idx = _precompute_box_indices(
-            width, ex0, ey0, min(width, ex0 + ew), min(height, ey0 + cur_eh), step=3
-        )
-
-        ix0 = round(ix_min + u * ispan_x)
-        iy0 = round(iy_min + v * ispan_y)
-        cur_ih = ih
-        if ey0 >= 152:
-            iy0 = 88
-            cur_ih = 46
-        iy_idx, iuv_idx = _precompute_box_indices(
-            width, ix0, iy0, min(width, ix0 + iw), min(height, iy0 + cur_ih), step=8
-        )
-
-        precomputed.append((pid, ey_idx, euv_idx, iy_idx, iuv_idx))
-    return precomputed
-
-
-def build_auto_crop_depth_boxes(
-    width: int = 320,
-    height: int = 176,
-) -> list[tuple[int, list[tuple[list[int], list[int]]], list[int], list[int]]]:
-    """Precompute 3-Step Orthogonal Auto-Blackness Deletion Edge Strips + Deep Inner Strip."""
-    ex_min, ex_max, ey_min, ey_max, ew, eh = 3, 315, 2, 170, 16, 14
-    espan_x = (ex_max - ex_min) - ew
-    espan_y = (ey_max - ey_min) - eh
-
-    ix_min, ix_max, iy_min, iy_max, iw, ih = 18, 302, 18, 154, 54, 44
-    ispan_x = (ix_max - ix_min) - iw
-    ispan_y = (iy_max - iy_min) - ih
-
-    precomputed: list[tuple[int, list[tuple[list[int], list[int]]], list[int], list[int]]] = []
-    for pid, nx, ny in build_52_panel_coords():
-        u = nx / 850.0
-        v = 1.0 - (ny / 450.0)
-
-        ex0 = round(ex_min + u * espan_x)
-        ey0 = round(ey_min + v * espan_y)
-
-        edge_steps: list[tuple[list[int], list[int]]] = []
-        if ny == 0:
-            if ex0 >= 265:
-                step_rects = [(ex0, 138, ew, 12), (ex0, 126, ew, 14), (ex0, 114, ew, 14)]
-            else:
-                step_rects = [(ex0, 155, ew, 9), (ex0, 140, ew, 12), (ex0, 124, ew, 14)]
-        elif ny == 450:
-            step_rects = [(ex0, 2, ew, 14), (ex0, 16, ew, 14), (ex0, 30, ew, 14)]
-        elif nx == 0:
-            step_rects = [(3, ey0, ew, eh), (22, ey0, ew, eh), (42, ey0, ew, eh)]
-        else:
-            step_rects = [(ex0, ey0, ew, eh), (ex0 - 19, ey0, ew, eh), (ex0 - 39, ey0, ew, eh)]
-
-        for sx0, sy0, sw, sh in step_rects:
-            sx0_c = max(0, min(width - sw, sx0))
-            sy0_c = max(0, min(height - sh, sy0))
-            edge_steps.append(
-                _precompute_box_indices(width, sx0_c, sy0_c, sx0_c + sw, sy0_c + sh, step=3)
-            )
-
-        ix0 = round(ix_min + u * ispan_x)
-        iy0 = round(iy_min + v * ispan_y)
-        cur_ih = ih
-        if ny == 0:
-            iy0 = 88
-            cur_ih = 46
-        iy_idx, iuv_idx = _precompute_box_indices(
-            width, ix0, iy0, min(width, ix0 + iw), min(height, iy0 + cur_ih), step=8
-        )
-        precomputed.append((pid, edge_steps, iy_idx, iuv_idx))
-    return precomputed
-
-
-def sample_box_fast(
-    y_plane: bytes | memoryview,
-    u_plane: bytes | memoryview,
-    v_plane: bytes | memoryview,
-    y_indices: list[int],
-    uv_indices: list[int],
-    chroma_magnet: bool = True,
-    ignore_bright_matte: bool = False,
-) -> tuple[int, int, int]:
-    """Extract perceptual RGB from an I420 box with symmetric Bayer cancellation & brown protection."""
-    y_acc = 0
-    u_acc = 0
-    v_acc = 0
-    w_acc = 0
-    luma_sum = 0
-    count = len(y_indices)
-
-    for idx in range(count):
-        yv = y_plane[y_indices[idx]]
-        uv_i = uv_indices[idx]
-        u = u_plane[uv_i] - 128
-        v = v_plane[uv_i] - 128
-
-        if yv >= 85 and -8 <= u <= 24 and -24 <= v <= 4 and (u * u + v * v) < 750:
-            u = int(u * 0.25)
-            v = int(v * 0.25)
-        elif 10 <= yv < 34 and u >= 2 and v <= -2:
-            u = int(u * 1.55)
-            v = int(v * 1.35)
-        uv_sq = u * u + v * v
-
-        # Symmetric per-pixel luma weighting: never bias weight by +v before averaging,
-        # so +v (red) and -v (cyan/green) Bayer fringes along letterbox bars cancel to zero!
-        luma_sum += yv
-        luma_f = yv - 8
-        if luma_f <= 0:
-            w = 1
-        else:
-            luma_f = min(72, luma_f)
-            if not chroma_magnet:
-                w = 2 + (luma_f >> 2)
-            else:
-                if yv > 130 and uv_sq < 650:
-                    md = 64 - (((yv - 130) * (650 - uv_sq)) >> 8)
-                    min_md = 4 if ignore_bright_matte else 16
-                    matte_damp = max(min_md, md)
-                else:
-                    matte_damp = 64
-                uv_eff = min(550, uv_sq)
-                chroma_f = max(0, uv_eff - 135)
-                w = 4 + ((((luma_f >> 2) + ((chroma_f * luma_f) >> 9)) * matte_damp) >> 6)
-
-        y_acc += yv * w
-        u_acc += u * w
-        v_acc += v * w
-        w_acc += w
-
-    if count == 0 or w_acc <= 0:
-        return (0, 0, 0)
-
-    mean_luma = luma_sum / count
-    ym = y_acc // w_acc
-    um = u_acc // w_acc
-    vm = v_acc // w_acc
-
-    if ym < 38 and vm > 0 and vm < 18 and um >= -12:
-        vm = int(vm * 0.35)
-        um = int(um * 0.50)
-
-    uvm_sq = um * um + vm * vm
-
-    if ym >= 75:
-        taper_limit = 220.0 if (um > 0 and vm <= 4) else 160.0
-    else:
-        taper_limit = 24.0
-    if uvm_sq < taper_limit:
-        c_taper = (uvm_sq / taper_limit) ** 1.2
-        um = round(um * c_taper)
-        vm = round(vm * c_taper)
-
-    v_lift = ((vm * 300) >> 8) if vm >= 20 else 0
-    u_lift = ((um * 320) >> 8) if um >= 12 else 0
-    win_peak = ym + max(0, v_lift, u_lift)
-    if mean_luma < 20.0 and uvm_sq < 25:
-        win_peak = min(win_peak, int(mean_luma * 1.75))
-
-    pw = min(0.65, max(0.0, (mean_luma - 9.0) / 18.0) * 0.65)
-    eff_luma = (1.0 - pw) * mean_luma + pw * float(win_peak)
-    if eff_luma < 8.5:
-        return (0, 0, 0)
-
-    if eff_luma < 16.0:
-        chroma_scale = max(0.30, (eff_luma - 8.5) / 7.5)
-        um = round(um * chroma_scale)
-        vm = round(vm * chroma_scale)
-
-    c = max(3, ym - 6)
-    is_vivid_red = ym >= 48 and vm >= 24 and um >= -5
-    if vm > 0 and not is_vivid_red:
-        r = max(0, min(255, (298 * c + 340 * vm + 128) >> 8))
-        g = max(0, min(255, (298 * c - 100 * um - 150 * vm + 128) >> 8))
-    else:
-        r = max(0, min(255, (298 * c + 409 * vm + 128) >> 8))
-        g = max(0, min(255, (298 * c - 100 * um - 208 * vm + 128) >> 8))
-    b = max(0, min(255, (298 * c + 516 * um + 128) >> 8))
-
-    if r > g and vm > 0 and not is_vivid_red:
-        g = max(g, round(r * 0.72))
-        b = max(b, round(r * 0.42))
-
-    if r >= 125 and g >= 38 and b >= 26 and r > g * 1.25 and b <= g * 1.35:
-        b = min(255, max(b, round(g * 1.18)))
-
-    h, s, val = colorsys.rgb_to_hsv(r / 255.0, g / 255.0, b / 255.0)
-    if s > 0.14:
-        if h < 0.09 or h > 0.88:
-            sat_boost = 0.85 if s < 0.68 else 1.12
-        else:
-            sat_boost = 1.32
-        s = min(1.0, 0.14 + (s - 0.14) * sat_boost)
-        if ym < 52:
-            max_s = 0.50 + 0.50 * min(1.0, max(0.0, (ym - 12.0) / 40.0))
-            s = min(s, max_s)
-    else:
-        s = s * 0.25
-
-    luma_drive = max(0.0, (eff_luma - 9.5) / 120.0)
-    if eff_luma < 28.0:
-        v_out = ((max(0.0, eff_luma - 9.5) / 18.5) ** 1.10) * 0.30
-    else:
-        v_drive = max(luma_drive, max(0.0, (val - 0.05) / 0.72))
-        v_out = min(1.0, 0.30 + 0.70 * (max(0.0, (v_drive - 0.15) / 0.85) ** 0.72))
-    if s > 0.22 and 0.50 <= h <= 0.72:
-        v_out *= 0.54
-
-    rf2, gf2, bf2 = colorsys.hsv_to_rgb(h, s, min(1.0, v_out))
-    r_gain = 232.0 - 8.0 * min(1.0, s / 0.20)
-    g_gain = 242.0 + 6.0 * min(1.0, s / 0.20)
-    b_gain = 238.0 + 17.0 * min(1.0, s / 0.20)
-    return (
-        max(0, min(255, round(rf2 * r_gain))),
-        max(0, min(255, round(gf2 * g_gain))),
-        max(0, min(255, round(bf2 * b_gain))),
-    )
-
-
-def encode_nanoleaf_v2_packet(
-    zones_rgb: list[tuple[int, int, int]], transition_ds: int = 1
-) -> bytes:
-    """Encode a 52-zone Nanoleaf External Control v2 UDP packet (port 60222)."""
-    parts = [struct.pack(">H", len(zones_rgb))]
-    for i, (r, g, b) in enumerate(zones_rgb):
-        parts.append(struct.pack(">HBBBBH", i, r, g, b, 0, transition_ds))
-    return b"".join(parts)
-

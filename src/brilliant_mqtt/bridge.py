@@ -357,6 +357,14 @@ class Bridge:
             )
         self._devices[device.peripheral_id] = device
 
+    def is_privacy_off(self) -> bool:
+        """True only when HARDWARE positively reports privacy_toggle == '0'."""
+        for device in self._devices.values():
+            if device.kind is DeviceKind.HARDWARE:
+                var = device.variables.get("privacy_toggle")
+                return var is not None and var.value.strip() == "0"
+        return False
+
     @staticmethod
     def _is_wired_primary(device: BrilliantDevice) -> bool:
         return device.device_id != _MESH_DEVICE_ID and device.kind in (
