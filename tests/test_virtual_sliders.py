@@ -31,6 +31,7 @@ from brilliant_mqtt.virtual_sliders import (
 )
 from brilliant_mqtt.write_admission import AdmissionTicket, WriteClass
 from tests.fakes import FakeBus, FakeMqtt
+from tools.brilliant_vc.slider_binding import decode_slider_config as vc_decode_slider_config
 
 PANEL_DEV_ID = "019c7b7d-36df-4fe9-a49e-48e05136f5a4"
 
@@ -90,22 +91,40 @@ class _ConfigurableFakeBus(FakeBus):
         return res
 
 
-class TestSliderConfigProtobuf:
-    def test_encode_decode_roundtrip_panel_load(self) -> None:
-        b64 = encode_slider_config(PANEL_DEV_ID, "vs_dimmer_living_left")
+class TestSliderConfigThrift:
+    def test_encode_decode_roundtrip_panel_load_and_vc_crosscheck(self) -> None:
+        b64 = encode_slider_config(
+            PANEL_DEV_ID,
+            "vs_dimmer_living_left",
+            slider_index=2,
+            double_tap_scene_id="scene-double-123",
+        )
         assert b64 != ""
         decoded = decode_slider_config_target(b64)
         assert decoded == (PANEL_DEV_ID, "vs_dimmer_living_left")
+
+        # Cross-check against tools/brilliant_vc/slider_binding.py TBinaryProtocol decoder
+        vc_binding = vc_decode_slider_config(b64)
+        assert vc_binding.slider_index == 2
+        assert vc_binding.device_id == PANEL_DEV_ID
+        assert vc_binding.peripheral_id == "vs_dimmer_living_left"
+        assert vc_binding.action == 0
 
     def test_encode_decode_roundtrip_ble_mesh_load(self) -> None:
         b64 = encode_slider_config("ble_mesh", "018691f172bc00060153fd53c15b8c3d")
         decoded = decode_slider_config_target(b64)
         assert decoded == ("ble_mesh", "018691f172bc00060153fd53c15b8c3d")
+        vc_binding = vc_decode_slider_config(b64)
+        assert vc_binding.slider_index == 0
+        assert vc_binding.device_id == "ble_mesh"
+        assert vc_binding.peripheral_id == "018691f172bc00060153fd53c15b8c3d"
 
-    def test_empty_returns_empty_and_none(self) -> None:
+    def test_empty_or_malformed_returns_empty_and_none(self) -> None:
         assert encode_slider_config("", "") == ""
         assert decode_slider_config_target("") is None
         assert decode_slider_config_target("not-valid-base64!!!") is None
+        # Protobuf-formatted bytes must be rejected by the Thrift decoder
+        assert decode_slider_config_target("CgYKAWEKAmI=") is None
 
 
 class TestVirtualSliderSpec:
@@ -447,6 +466,42 @@ class TestVirtualSliderController:
             "passthrough",
         )
         assert ctrl.state_for("living_left").mode is SliderMode.VIRTUAL
+        await ctrl.shutdown()
+
+    async def test_refuses_to_overwrite_slider_config_when_unparseable_and_unbacked_up(
+        self, tmp_path: Path
+    ) -> None:
+        """Fail closed: if original_slider_config is not backed up and the current
+        bus value cannot be decoded as valid Thrift CapTouchSliderConfig, do not overwrite."""
+        faceplate = BrilliantDevice(
+            device_id=PANEL_DEV_ID,
+            peripheral_id="faceplate_peripheral",
+            name="Faceplate",
+            kind=DeviceKind.UNKNOWN,
+            variables={"slider_config:0": Variable("slider_config:0", "CgYKAWEKAmI=")},
+        )
+        bus = _ConfigurableFakeBus([faceplate])
+        mqtt = FakeMqtt()
+        spec = VirtualSliderSpec.for_panel_slider(
+            slider_id="living_left",
+            name="Living Room Left",
+            panel_device_id=PANEL_DEV_ID,
+            slider_index=0,
+            load_peripheral_id="gangbox_peripheral_0",
+        )
+        ctrl = VirtualSliderController(
+            bus=bus,
+            mqtt=mqtt,
+            panel="living_room",
+            own_device_id=PANEL_DEV_ID,
+            specs=[spec],
+            host_factory=lambda vspec, cb: FakeVirtualPeripheralHost(vspec, cb),
+            state_path=tmp_path / "vs_state.json",
+        )
+        await ctrl.start()
+        # Must NOT have issued any set_variables call when slider_config:0 is not valid Thrift
+        assert bus.commands == []
+        assert ctrl.state_for("living_left").original_slider_config is None
         await ctrl.shutdown()
 
     async def test_mesh_leader_gating_and_orphaned_slider_restore(self, tmp_path: Path) -> None:

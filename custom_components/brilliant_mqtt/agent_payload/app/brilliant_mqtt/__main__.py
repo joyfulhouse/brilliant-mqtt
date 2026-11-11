@@ -220,6 +220,7 @@ async def _run_session(
     )
     panel_bridge: Bridge | None = None
     mesh_bridge: Bridge | None = None
+    leader: MeshLeader | None = None
     scene_bridge: SceneBridge | None = None
     virtual_slider_controller: VirtualSliderController | None = None
     mqtt_connected = False
@@ -292,9 +293,9 @@ async def _run_session(
                 # consults this SAME live closure as want_device (issue #98), so
                 # the first push after leader.tick() flips is_leader is admitted
                 # and normalized — no stale cached leadership snapshot.
-                return device_id == _MESH_DEVICE_ID and leader.is_leader
+                return device_id == _MESH_DEVICE_ID and leader is not None and leader.is_leader
 
-            mesh_bridge = Bridge(
+            mesh_bridge_instance = Bridge(
                 bus,
                 mqtt,
                 "mesh",
@@ -311,9 +312,10 @@ async def _run_session(
                 motion_default_high_threshold=settings.motion_default_high_threshold,
                 motion_default_low_threshold=settings.motion_default_low_threshold,
             )
+            mesh_bridge = mesh_bridge_instance
 
             async def _on_mesh_acquire() -> None:
-                await mesh_bridge.reconcile()
+                await mesh_bridge_instance.reconcile()
                 if virtual_slider_controller is not None:
                     await virtual_slider_controller.on_mesh_leadership_acquired()
 
@@ -323,7 +325,7 @@ async def _run_session(
                 settings.mesh_priority,
                 settings.mesh_heartbeat_seconds,
                 on_acquire=_on_mesh_acquire,
-                on_lose=mesh_bridge.withdraw,
+                on_lose=mesh_bridge_instance.withdraw,
             )
 
         scene_bridge = (
@@ -348,7 +350,7 @@ async def _run_session(
             # After a bus reconnect, pushes (and the observer's get_all mirror)
             # may have missed changes — re-reconcile to republish the truth.
             await panel_bridge.reconcile_after_reconnect()
-            if mesh_bridge is not None and leader.is_leader:
+            if mesh_bridge is not None and leader is not None and leader.is_leader:
                 await mesh_bridge.reconcile()
 
         bus.on_reconnect(_CoalescingCallback(_reconcile_after_bus_reconnect))
@@ -358,7 +360,7 @@ async def _run_session(
         except Exception as error:
             raise MqttConnectError("MQTT connection failed") from error
         mqtt_connected = True
-        if participating:
+        if participating and leader is not None:
             # Join the election before bus data flows; the FIRST mesh
             # reconcile is acquisition's job (on_acquire), not startup's.
             await leader.start()
@@ -411,9 +413,7 @@ async def _run_session(
                         state_path=vs_state_path,
                         owned_topics=owned_topics,
                         want_device=_is_panel_device,
-                        is_mesh_leader=(
-                            (lambda: leader.is_leader) if leader is not None else (lambda: False)
-                        ),
+                        is_mesh_leader=lambda: leader is not None and leader.is_leader,
                     )
                     await virtual_slider_controller.start()
             except Exception:
@@ -478,7 +478,7 @@ async def _run_session(
                     f"{settings.reconnect_storm_window_seconds:.0f}s — rebuilding session"
                 )
 
-            if participating:
+            if participating and leader is not None:
                 await leader.tick()
 
             # Hot poll: bounds state staleness at the poll cadence; the
@@ -489,7 +489,7 @@ async def _run_session(
                 try:
                     try:
                         devices = await bus.get_all(
-                            include_extras=participating and leader.is_leader
+                            include_extras=participating and leader is not None and leader.is_leader
                         )
                     except (TimeoutError, asyncio.TimeoutError) as error:
                         # Type only the shared scoped read. Neither bridge sees
@@ -497,7 +497,7 @@ async def _run_session(
                         raise HotPollReadTimeout("hot poll bus read timed out") from error
                     _beat()
                     await panel_bridge.poll_once(devices)
-                    if mesh_bridge is not None and leader.is_leader:
+                    if mesh_bridge is not None and leader is not None and leader.is_leader:
                         await mesh_bridge.poll_once(devices)
                     if scene_bridge is not None:
                         await scene_bridge.poll_executions(devices)
@@ -527,7 +527,7 @@ async def _run_session(
             if hot_poll_retry_at is None and time.monotonic() >= next_resync:
                 try:
                     await panel_bridge.reconcile()
-                    if mesh_bridge is not None and leader.is_leader:
+                    if mesh_bridge is not None and leader is not None and leader.is_leader:
                         await mesh_bridge.reconcile()
                 except (TimeoutError, asyncio.TimeoutError):
                     if consecutive_resync_failures >= 1:

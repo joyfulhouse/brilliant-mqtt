@@ -10,10 +10,10 @@ Architecture
 ------------
 - **Virtual Dimmer Hosting (0-255 + 5-Step + Swipe Gestures):**
   For each configured slider in ``VIRTUAL`` mode, the daemon hosts a local
-  virtual peripheral (``vs_dimmer_<slider_id>``, ``peripheral_type=1``) on the
+  virtual peripheral (``vs_dimmer_<slider_id>``, ``peripheral_type=27``) on the
   panel's Thrift bus and binds the physical slider's ``CapTouchSliderConfig``
-  protobuf to it. Before overwriting any ``CapTouchSliderConfig``, the daemon
-  reads and persists the original protobuf payload so switching to
+  Thrift struct to it. Before overwriting any ``CapTouchSliderConfig``, the daemon
+  reads and persists the original Thrift payload so switching to
   ``PASSTHROUGH`` (or removing a slider from ``VIRTUAL_SLIDERS_JSON``) restores
   the exact original hardware binding.
 - **Multi-Tap Classification (Single / Double / Triple / Quadruple / Quintuple):**
@@ -32,8 +32,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import json
 import logging
+import struct
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -56,7 +58,7 @@ from brilliant_mqtt.write_admission import Superseded
 
 logger = logging.getLogger(__name__)
 
-VIRTUAL_DIMMER_PERIPHERAL_TYPE = 1  # GANGBOX_DIMMER
+VIRTUAL_DIMMER_PERIPHERAL_TYPE = 27  # PeripheralType.LIGHT
 
 SliderEventType = Literal[
     "single_tap",
@@ -136,113 +138,193 @@ def brightness_to_raw(brightness: int, min_raw: int = 100, max_raw: int = 1000) 
 
 
 # ---------------------------------------------------------------------------
-# Pure Protobuf Encoder / Decoder for CapTouchSliderConfig
+# Pure Thrift TBinaryProtocol Encoder / Decoder for CapTouchSliderConfig
 # ---------------------------------------------------------------------------
 
+_T_STOP = 0
+_T_BOOL = 2
+_T_BYTE = 3
+_T_DOUBLE = 4
+_T_I16 = 6
+_T_I32 = 8
+_T_I64 = 10
+_T_STRING = 11
+_T_STRUCT = 12
+_T_MAP = 13
+_T_SET = 14
+_T_LIST = 15
 
-def _encode_varint(value: int) -> bytes:
-    """Encode a non-negative integer as a protobuf base-128 varint."""
-    if value < 0:
-        raise ValueError(f"varint must be non-negative, got {value}")
-    out = bytearray()
-    while value > 0x7F:
-        out.append((value & 0x7F) | 0x80)
-        value >>= 7
-    out.append(value & 0x7F)
-    return bytes(out)
+_MAX_SLIDER_INDEX = 255
+_MAX_IDENTIFIER_BYTES = 1024
+_MAX_ENCODED_BYTES = 64 * 1024
 
 
-def _encode_length_delimited(field_number: int, payload: bytes) -> bytes:
-    """Encode a length-delimited (wire type 2) protobuf field."""
-    tag = (field_number << 3) | 2
-    return _encode_varint(tag) + _encode_varint(len(payload)) + payload
+def encode_slider_config(
+    device_id: str,
+    peripheral_id: str,
+    *,
+    slider_index: int = 0,
+    double_tap_scene_id: str = "",
+) -> str:
+    """Build a base64-encoded Thrift ``TBinaryProtocol`` ``CapTouchSliderConfig`` string.
 
-
-def encode_slider_config(device_id: str, peripheral_id: str) -> str:
-    """Build a base64-encoded ``CapTouchSliderConfig`` protobuf string.
-
-    Wire layout verified against ``peripherals/faceplate/slider_config.proto``:
-    - ``ControlledLoad`` message:
-      * field 1 (string): ``device_id``
-      * field 2 (string): ``peripheral_id``
-    - ``CapTouchSliderConfig`` message:
-      * field 1 (repeated ``ControlledLoad``): ``controlled_loads``
+    Wire layout verified against the panel's ``CapTouchSliderConfig`` Thrift struct
+    and ``tools/brilliant_vc/slider_binding.py``:
+    - field 1 (``i32``): ``slider_index`` (0..255)
+    - field 2 (``string``): primary target ``device_id``
+    - field 3 (``string``): primary target ``peripheral_id``
+    - field 5 (``string``, optional): ``double_tap_scene_id``
+    - field 6 (``i32``): ``action`` = 0 (``LIGHTS``)
+    - field 7 (``struct`` -> field 1 ``list<struct>`` of length 1): ``devices``
     """
     if not device_id and not peripheral_id:
         return ""
-    load_msg = _encode_length_delimited(1, device_id.encode("utf-8")) + _encode_length_delimited(
-        2, peripheral_id.encode("utf-8")
-    )
-    outer_msg = _encode_length_delimited(1, load_msg)
-    return base64.b64encode(outer_msg).decode("ascii")
+    if not device_id or not peripheral_id:
+        raise ValueError("device_id and peripheral_id must both be non-empty")
+    if not 0 <= slider_index <= _MAX_SLIDER_INDEX:
+        raise ValueError(f"slider_index must be 0..{_MAX_SLIDER_INDEX}, got {slider_index}")
 
-
-def _read_varint(buf: bytes, pos: int) -> tuple[int, int]:
-    """Read a protobuf varint starting at *pos*, returning ``(value, next_pos)``."""
-    result = 0
-    shift = 0
-    while pos < len(buf):
-        b = buf[pos]
-        pos += 1
-        result |= (b & 0x7F) << shift
-        if not (b & 0x80):
-            return result, pos
-        shift += 7
-    raise ValueError("truncated varint in protobuf")
+    dev_bytes = device_id.encode("utf-8")
+    per_bytes = peripheral_id.encode("utf-8")
+    buf = bytearray()
+    # Field 1 (i32): slider_index
+    buf += b"\x08\x00\x01" + slider_index.to_bytes(4, "big", signed=True)
+    # Field 2 (string): primary target device_id
+    buf += b"\x0b\x00\x02" + len(dev_bytes).to_bytes(4, "big") + dev_bytes
+    # Field 3 (string): primary target peripheral_id
+    buf += b"\x0b\x00\x03" + len(per_bytes).to_bytes(4, "big") + per_bytes
+    # Field 5 (string, optional): double_tap_scene_id
+    if double_tap_scene_id:
+        dt_bytes = double_tap_scene_id.encode("utf-8")
+        buf += b"\x0b\x00\x05" + len(dt_bytes).to_bytes(4, "big") + dt_bytes
+    # Field 6 (i32): action = 0 (LIGHTS)
+    buf += b"\x08\x00\x06\x00\x00\x00\x00"
+    # Field 7 (struct -> field 1 list<struct> of length 1): devices = [(device_id, peripheral_id)]
+    buf += b"\x0c\x00\x07\x0f\x00\x01\x0c\x00\x00\x00\x01"
+    buf += b"\x0b\x00\x01" + len(dev_bytes).to_bytes(4, "big") + dev_bytes
+    buf += b"\x0b\x00\x02" + len(per_bytes).to_bytes(4, "big") + per_bytes
+    # Stop bytes for inner struct, outer struct, and root CapTouchSliderConfig
+    buf += b"\x00\x00\x00"
+    return base64.b64encode(bytes(buf)).decode("ascii")
 
 
 def decode_slider_config_target(payload_b64: str) -> tuple[str, str] | None:
-    """Decode the first ``(device_id, peripheral_id)`` from a base64 ``CapTouchSliderConfig``.
+    """Decode ``(device_id, peripheral_id)`` from a base64 Thrift ``CapTouchSliderConfig``.
 
-    Returns ``None`` if the payload is empty or cannot be parsed.
+    Returns ``None`` if the payload is empty, malformed, or lacks required target fields.
     """
-    if not payload_b64:
+    if not isinstance(payload_b64, str) or not payload_b64 or len(payload_b64) > _MAX_ENCODED_BYTES:
         return None
     try:
         raw = base64.b64decode(payload_b64, validate=True)
-    except Exception:
+    except (binascii.Error, ValueError):
         return None
-    if not raw:
+    if not raw or len(raw) > _MAX_ENCODED_BYTES:
         return None
+
+    offset = 0
+
+    def _take(n: int) -> bytes:
+        nonlocal offset
+        if n < 0 or offset + n > len(raw):
+            raise ValueError("truncated slider_config")
+        chunk = raw[offset : offset + n]
+        offset += n
+        return chunk
+
+    def _read_i32() -> int:
+        return int(struct.unpack(">i", _take(4))[0])
+
+    def _read_identifier() -> str:
+        length = _read_i32()
+        if not 0 < length <= _MAX_IDENTIFIER_BYTES:
+            raise ValueError("invalid identifier length")
+        val = _take(length).decode("utf-8")
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in val):
+            raise ValueError("control character in identifier")
+        return val
+
+    def _read_count() -> int:
+        count = _read_i32()
+        if not 0 <= count <= 4096:
+            raise ValueError("invalid collection count")
+        return count
+
+    def _skip(ftype: int, depth: int = 0) -> None:
+        if depth > 16:
+            raise ValueError("nesting too deep")
+        if ftype in (_T_BOOL, _T_BYTE):
+            _take(1)
+        elif ftype == _T_I16:
+            _take(2)
+        elif ftype == _T_I32:
+            _take(4)
+        elif ftype in (_T_DOUBLE, _T_I64):
+            _take(8)
+        elif ftype == _T_STRING:
+            _take(_read_count())
+        elif ftype == _T_STRUCT:
+            while True:
+                nested_type = int(struct.unpack(">b", _take(1))[0])
+                if nested_type == _T_STOP:
+                    break
+                _take(2)
+                _skip(nested_type, depth + 1)
+        elif ftype == _T_MAP:
+            ktype = int(struct.unpack(">b", _take(1))[0])
+            vtype = int(struct.unpack(">b", _take(1))[0])
+            for _ in range(_read_count()):
+                _skip(ktype, depth + 1)
+                _skip(vtype, depth + 1)
+        elif ftype in (_T_SET, _T_LIST):
+            etype = int(struct.unpack(">b", _take(1))[0])
+            for _ in range(_read_count()):
+                _skip(etype, depth + 1)
+        else:
+            raise ValueError(f"unknown Thrift field type {ftype}")
+
     try:
-        pos = 0
-        while pos < len(raw):
-            tag, pos = _read_varint(raw, pos)
-            field_num = tag >> 3
-            wire_type = tag & 0x07
-            if wire_type == 2:
-                length, pos = _read_varint(raw, pos)
-                sub = raw[pos : pos + length]
-                pos += length
-                if field_num == 1:
-                    dev_id = ""
-                    periph_id = ""
-                    spos = 0
-                    while spos < len(sub):
-                        stag, spos = _read_varint(sub, spos)
-                        sfield = stag >> 3
-                        swire = stag & 0x07
-                        if swire == 2:
-                            slen, spos = _read_varint(sub, spos)
-                            sval = sub[spos : spos + slen].decode("utf-8", errors="replace")
-                            spos += slen
-                            if sfield == 1:
-                                dev_id = sval
-                            elif sfield == 2:
-                                periph_id = sval
-                        elif swire == 0:
-                            _, spos = _read_varint(sub, spos)
-                        else:
-                            break
-                    if dev_id or periph_id:
-                        return (dev_id, periph_id)
-            elif wire_type == 0:
-                _, pos = _read_varint(raw, pos)
-            else:
+        seen_fields: set[int] = set()
+        slider_index: int | None = None
+        device_id: str | None = None
+        peripheral_id: str | None = None
+
+        while True:
+            field_type = int(struct.unpack(">b", _take(1))[0])
+            if field_type == _T_STOP:
+                break
+            field_id = int(struct.unpack(">h", _take(2))[0])
+            if field_id in seen_fields:
                 return None
+            seen_fields.add(field_id)
+            if field_id == 1:
+                if field_type != _T_I32:
+                    return None
+                slider_index = _read_i32()
+            elif field_id == 2:
+                if field_type != _T_STRING:
+                    return None
+                device_id = _read_identifier()
+            elif field_id == 3:
+                if field_type != _T_STRING:
+                    return None
+                peripheral_id = _read_identifier()
+            elif field_id == 6:
+                if field_type != _T_I32:
+                    return None
+                _read_i32()
+            else:
+                _skip(field_type, 0)
+
+        if offset != len(raw):
+            return None
+        if slider_index is None or device_id is None or peripheral_id is None:
+            return None
+        if not 0 <= slider_index <= _MAX_SLIDER_INDEX:
+            return None
+        return (device_id, peripheral_id)
     except Exception:
         return None
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -259,6 +341,7 @@ class VirtualSliderSpec:
     config_device_id: str
     config_peripheral_id: str
     config_var_name: str
+    slider_index: int = 0
     load_device_id: str = ""
     load_peripheral_id: str = ""
     min_raw: int = 100
@@ -278,14 +361,24 @@ class VirtualSliderSpec:
 
     def virtual_slider_config_b64(self, host_device_id: str) -> str:
         """Return base64 ``CapTouchSliderConfig`` pointing at the virtual peripheral."""
-        return encode_slider_config(host_device_id, self.virtual_peripheral_id)
+        return encode_slider_config(
+            host_device_id,
+            self.virtual_peripheral_id,
+            slider_index=self.slider_index,
+            double_tap_scene_id=self.scene_double_tap,
+        )
 
     def passthrough_slider_config_b64(self, default_device_id: str = "") -> str:
         """Return base64 ``CapTouchSliderConfig`` pointing at the fallback load."""
         if not self.load_peripheral_id:
             return ""
         dev_id = self.load_device_id or default_device_id
-        return encode_slider_config(dev_id, self.load_peripheral_id)
+        return encode_slider_config(
+            dev_id,
+            self.load_peripheral_id,
+            slider_index=self.slider_index,
+            double_tap_scene_id=self.scene_double_tap,
+        )
 
     def raw_to_brightness(self, raw: int) -> int:
         """Convert raw Brilliant intensity to HA brightness (1-255)."""
@@ -365,6 +458,7 @@ class VirtualSliderSpec:
             config_device_id=panel_device_id,
             config_peripheral_id="faceplate_peripheral",
             config_var_name=f"slider_config:{slider_index}",
+            slider_index=slider_index,
             load_device_id=load_device_id or (panel_device_id if load_peripheral_id else ""),
             load_peripheral_id=load_peripheral_id,
             min_raw=min_raw,
@@ -810,6 +904,7 @@ class VirtualSliderController:
         if current_dev is not None and spec.config_var_name in current_dev.variables:
             current_b64 = current_dev.variables[spec.config_var_name].value
 
+        decoded: tuple[str, str] | None = None
         if current_b64:
             decoded = decode_slider_config_target(current_b64)
             if decoded is not None:
@@ -822,6 +917,22 @@ class VirtualSliderController:
                     self._save_state_if_changed()
 
         if mode is SliderMode.VIRTUAL:
+            if not st.original_slider_config:
+                if decoded is not None and spec.load_peripheral_id:
+                    st.original_slider_config = spec.passthrough_slider_config_b64(
+                        self._own_device_id
+                    )
+                    self._save_state_if_changed()
+                else:
+                    logger.warning(
+                        "Refusing to overwrite %s on %s/%s for slider %s in virtual mode: "
+                        "no original_slider_config backup and bus value could not be decoded",
+                        spec.config_var_name,
+                        spec.config_device_id,
+                        spec.config_peripheral_id,
+                        spec.slider_id,
+                    )
+                    return False
             target_b64 = spec.virtual_slider_config_b64(self._own_device_id)
         else:
             if st.original_slider_config:
