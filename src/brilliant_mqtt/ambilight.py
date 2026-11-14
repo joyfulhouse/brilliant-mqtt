@@ -16,6 +16,7 @@ Uses the Brilliant panel's NXP i.MX6 camera pipeline (``imxv4l2src`` ->
 from __future__ import annotations
 
 import asyncio
+import base64
 import colorsys
 import contextlib
 import json
@@ -397,6 +398,11 @@ class GStreamerCameraAdapter(CameraCaptureProtocol):
 
         async with self._lock:
             try:
+                if is_privacy_shutter_closed(privacy_off=self._privacy_off):
+                    logger.info(
+                        "Camera capture skipped: bus privacy_toggle turned on before launch"
+                    )
+                    return None
                 proc = await asyncio.create_subprocess_exec(
                     *args,
                     stdout=asyncio.subprocess.DEVNULL,
@@ -417,6 +423,11 @@ class GStreamerCameraAdapter(CameraCaptureProtocol):
                 if proc.returncode != 0:
                     err_txt = (stderr or b"").decode("utf-8", errors="replace").strip()
                     logger.warning("gst-launch-1.0 exited with %s: %s", proc.returncode, err_txt)
+                    return None
+                if is_privacy_shutter_closed(privacy_off=self._privacy_off):
+                    logger.info(
+                        "Camera capture dropped: bus privacy_toggle turned on during capture"
+                    )
                     return None
                 return _read_capture_output(out_path)
             except Exception:
@@ -616,8 +627,6 @@ class AmbilightController:
                 return
 
     def _is_blocked_by_privacy(self) -> bool:
-        if self._privacy_off is None:
-            return False
         return is_privacy_shutter_closed(privacy_off=self._privacy_off)
 
     async def sample_once(self) -> AmbilightSample | None:
@@ -626,7 +635,7 @@ class AmbilightController:
             return None
         c = self._crop.normalized()
         frame = await self._camera.capture_i420_frame(c)
-        if frame is None:
+        if frame is None or self._is_blocked_by_privacy():
             return None
         try:
             sample = extract_ambilight_sample_from_i420(frame, c.width, c.height)
@@ -654,14 +663,14 @@ class AmbilightController:
         return sample
 
     async def trigger_snapshot(self) -> bool:
-        """Capture a cropped JPEG snapshot and publish it to MQTT with ``retain=False``."""
+        """Capture a cropped JPEG snapshot and publish it as base64 with ``retain=False``."""
         if self._is_blocked_by_privacy():
             return False
         c = self._crop.normalized()
         jpeg = await self._camera.capture_jpeg_snapshot(c)
-        if jpeg is None:
+        if jpeg is None or self._is_blocked_by_privacy():
             return False
-        payload_str = jpeg.decode("latin1")
+        payload_str = base64.b64encode(jpeg).decode("ascii")
         await self._mqtt.publish(self._snapshot_topic(), payload_str, retain=False)
         return True
 
@@ -701,7 +710,7 @@ class AmbilightController:
             return None
         base = self._saved_crop.normalized()
         frame = await self._camera.capture_i420_frame(base)
-        if frame is None:
+        if frame is None or self._is_blocked_by_privacy():
             return None
         bbox = estimate_i420_active_bbox_norm(frame, base.width, base.height)
         self._auto_crop_enabled = True
@@ -841,6 +850,7 @@ class AmbilightController:
             "availability": [{"topic": avail}],
             "device": dev_block,
             "icon": "mdi:crop-free",
+            "image_encoding": "b64",
             "name": "TV Ambilight Crop Preview",
             "topic": self._snapshot_topic(),
             "unique_id": cam_uid,

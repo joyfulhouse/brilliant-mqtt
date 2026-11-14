@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 from pathlib import Path
 from typing import Any
@@ -206,6 +207,75 @@ class TestFailClosedPrivacyGateAndSubprocessCancellation:
         assert killed is True
         assert reaped is True
 
+    async def test_check_then_lock_privacy_race_and_mid_capture_privacy_drop(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        privacy_is_off = True
+        spawn_count = 0
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+
+        class _GateProc:
+            def __init__(self, out_file: Path) -> None:
+                self.returncode: int | None = None
+                self._out_file = out_file
+
+            def kill(self) -> None:
+                self.returncode = -9
+                release_first.set()
+
+            async def communicate(self) -> tuple[bytes, bytes]:
+                first_started.set()
+                await release_first.wait()
+                self._out_file.write_bytes(b"\xff\xd8\xff\xe0JPEG\xff\xd9")
+                self.returncode = 0
+                return (b"", b"")
+
+        async def _fake_exec(*args: Any, **kwargs: Any) -> _GateProc:
+            nonlocal spawn_count
+            spawn_count += 1
+            loc_arg = next(a for a in args if str(a).startswith("location="))
+            out_path = Path(str(loc_arg).split("=", 1)[1])
+            return _GateProc(out_path)
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+        adapter = GStreamerCameraAdapter(
+            device="test_device",
+            timeout_s=5.0,
+            privacy_off=lambda: privacy_is_off,
+        )
+
+        # Start capture 1 (holds lock) and queue capture 2 (waits on lock after initial check)
+        t1 = asyncio.create_task(adapter.capture_jpeg_snapshot(AmbilightCrop()))
+        await asyncio.wait_for(first_started.wait(), timeout=1.0)
+        t2 = asyncio.create_task(adapter.capture_jpeg_snapshot(AmbilightCrop()))
+        await asyncio.sleep(0)
+
+        # Privacy mode turns ON while t1 is capturing and t2 is queued on the lock
+        privacy_is_off = False
+        release_first.set()
+
+        res1, res2 = await asyncio.gather(t1, t2)
+        # t1 frame is dropped because privacy turned on during capture;
+        # t2 never launches a subprocess because privacy is re-checked inside the lock.
+        assert res1 is None
+        assert res2 is None
+        assert spawn_count == 1
+
+    async def test_controller_fails_closed_when_no_privacy_callback_wired(self) -> None:
+        mqtt = FakeMqtt()
+        cam = FakeCameraAdapter()
+        ctrl = AmbilightController(
+            mqtt=mqtt,
+            panel="living_room",
+            camera=cam,
+            privacy_off=None,
+        )
+        assert await ctrl.sample_once() is None
+        assert await ctrl.trigger_snapshot() is False
+        assert await ctrl.auto_calibrate_crop() is None
+        assert cam.last_crop is None
+
 
 class TestAmbilightController:
     async def test_discovery_ledger_snapshot_non_retained_and_tombstone_on_disable(
@@ -238,12 +308,21 @@ class TestAmbilightController:
         assert sw_cfg["device"]["model"] == "Control"
         assert sw_cfg["state_topic"] == "brilliant/living_room/ambilight/state"
 
-        # Trigger snapshot -> published with retain=False!
+        cam_pub = next(
+            p
+            for p in mqtt.published
+            if p[0] == "homeassistant/camera/brilliant_living_room_ambilight_camera/config"
+        )
+        cam_cfg = json.loads(cam_pub[1])
+        assert cam_cfg["image_encoding"] == "b64"
+
+        # Trigger snapshot -> published with retain=False and lossless base64 encoding!
         mqtt.published.clear()
         await ctrl.on_mqtt_command("brilliant/living_room/ambilight/set_snapshot", "PRESS")
         snaps = [p for p in mqtt.published if p[0] == "brilliant/living_room/ambilight/snapshot"]
         assert len(snaps) == 1
         assert snaps[0][2] is False
+        assert base64.b64decode(snaps[0][1].encode("utf-8")) == cam.jpeg_bytes
 
         # Update crop via dataclasses.replace path
         await ctrl.on_mqtt_command("brilliant/living_room/ambilight/set_crop_top", "240")
