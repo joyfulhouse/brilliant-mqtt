@@ -19,7 +19,11 @@ from typing import NoReturn
 
 from brilliant_mqtt import __version__
 from brilliant_mqtt.bridge import Bridge, HotPollReadTimeout, WriteThrottle
-from brilliant_mqtt.bus import BusStartFencedError, RpcBusAdapter
+from brilliant_mqtt.bus import (
+    BusStartFencedError,
+    HostedVirtualPeripheralAdapter,
+    RpcBusAdapter,
+)
 from brilliant_mqtt.config import Settings
 from brilliant_mqtt.desired_state import DesiredState
 from brilliant_mqtt.diagnostics import ResponseDiagnostics, SessionRebuildReason
@@ -31,6 +35,11 @@ from brilliant_mqtt.mqttio import AioMqttAdapter
 from brilliant_mqtt.protocols import BusClient, CommandSubscribeError
 from brilliant_mqtt.retained_topics import RetainedLedgerError, RetainedTopicLedger
 from brilliant_mqtt.scene_bridge import SceneBridge
+from brilliant_mqtt.virtual_sliders import (
+    VirtualSliderController,
+    has_persisted_slider_backups,
+    parse_virtual_slider_specs,
+)
 
 log = logging.getLogger(__name__)
 
@@ -212,7 +221,9 @@ async def _run_session(
     )
     panel_bridge: Bridge | None = None
     mesh_bridge: Bridge | None = None
+    leader: MeshLeader | None = None
     scene_bridge: SceneBridge | None = None
+    virtual_slider_controller: VirtualSliderController | None = None
     mqtt_connected = False
     phase_marker_failure_logged = False
     try:
@@ -283,9 +294,9 @@ async def _run_session(
                 # consults this SAME live closure as want_device (issue #98), so
                 # the first push after leader.tick() flips is_leader is admitted
                 # and normalized — no stale cached leadership snapshot.
-                return device_id == _MESH_DEVICE_ID and leader.is_leader
+                return device_id == _MESH_DEVICE_ID and leader is not None and leader.is_leader
 
-            mesh_bridge = Bridge(
+            mesh_bridge_instance = Bridge(
                 bus,
                 mqtt,
                 "mesh",
@@ -302,13 +313,20 @@ async def _run_session(
                 motion_default_high_threshold=settings.motion_default_high_threshold,
                 motion_default_low_threshold=settings.motion_default_low_threshold,
             )
+            mesh_bridge = mesh_bridge_instance
+
+            async def _on_mesh_acquire() -> None:
+                await mesh_bridge_instance.reconcile()
+                if virtual_slider_controller is not None:
+                    await virtual_slider_controller.on_mesh_leadership_acquired()
+
             leader = MeshLeader(
                 mqtt,
                 settings.panel,
                 settings.mesh_priority,
                 settings.mesh_heartbeat_seconds,
-                on_acquire=mesh_bridge.reconcile,
-                on_lose=mesh_bridge.withdraw,
+                on_acquire=_on_mesh_acquire,
+                on_lose=mesh_bridge_instance.withdraw,
             )
 
         scene_bridge = (
@@ -333,7 +351,7 @@ async def _run_session(
             # After a bus reconnect, pushes (and the observer's get_all mirror)
             # may have missed changes — re-reconcile to republish the truth.
             await panel_bridge.reconcile_after_reconnect()
-            if mesh_bridge is not None and leader.is_leader:
+            if mesh_bridge is not None and leader is not None and leader.is_leader:
                 await mesh_bridge.reconcile()
 
         bus.on_reconnect(_CoalescingCallback(_reconcile_after_bus_reconnect))
@@ -343,7 +361,7 @@ async def _run_session(
         except Exception as error:
             raise MqttConnectError("MQTT connection failed") from error
         mqtt_connected = True
-        if participating:
+        if participating and leader is not None:
             # Join the election before bus data flows; the FIRST mesh
             # reconcile is acquisition's job (on_acquire), not startup's.
             await leader.start()
@@ -373,6 +391,38 @@ async def _run_session(
             progress.reconciled()
         if scene_bridge is not None:
             await scene_bridge.async_start()
+
+        vs_state_path = (
+            Path(settings.motion_desired_state_dir) / "virtual-sliders.json"
+            if settings.motion_desired_state_dir
+            else None
+        )
+        raw_vs_json = settings.virtual_sliders_json.strip()
+        if raw_vs_json or has_persisted_slider_backups(vs_state_path):
+            try:
+                own_dev = bus.own_device_id or ""
+                vs_specs = parse_virtual_slider_specs(raw_vs_json, own_dev) if raw_vs_json else []
+                if vs_specs or has_persisted_slider_backups(vs_state_path):
+                    virtual_slider_controller = VirtualSliderController(
+                        bus=bus,
+                        mqtt=mqtt,
+                        panel=settings.panel,
+                        own_device_id=own_dev,
+                        specs=vs_specs,
+                        host_factory=lambda vspec, on_ext: HostedVirtualPeripheralAdapter(
+                            vspec, on_ext
+                        ),
+                        state_path=vs_state_path,
+                        owned_topics=owned_topics,
+                        want_device=_is_panel_device,
+                        is_mesh_leader=lambda: leader is not None and leader.is_leader,
+                    )
+                    await virtual_slider_controller.start()
+            except Exception:
+                log.exception("virtual slider controller startup failed; continuing without it")
+                if virtual_slider_controller is not None:
+                    await virtual_slider_controller.shutdown()
+                virtual_slider_controller = None
 
         tick = settings.hot_poll_seconds if settings.hot_poll_seconds > 0 else _IDLE_TICK_S
         next_resync = time.monotonic() + settings.resync_seconds
@@ -432,7 +482,7 @@ async def _run_session(
                     f"{settings.reconnect_storm_window_seconds:.0f}s — rebuilding session"
                 )
 
-            if participating:
+            if participating and leader is not None:
                 await leader.tick()
 
             # Hot poll: bounds state staleness at the poll cadence; the
@@ -443,7 +493,7 @@ async def _run_session(
                 try:
                     try:
                         devices = await bus.get_all(
-                            include_extras=participating and leader.is_leader
+                            include_extras=participating and leader is not None and leader.is_leader
                         )
                     except (TimeoutError, asyncio.TimeoutError) as error:
                         # Type only the shared scoped read. Neither bridge sees
@@ -451,7 +501,7 @@ async def _run_session(
                         raise HotPollReadTimeout("hot poll bus read timed out") from error
                     _beat()
                     await panel_bridge.poll_once(devices)
-                    if mesh_bridge is not None and leader.is_leader:
+                    if mesh_bridge is not None and leader is not None and leader.is_leader:
                         await mesh_bridge.poll_once(devices)
                     if scene_bridge is not None:
                         await scene_bridge.poll_executions(devices)
@@ -481,7 +531,7 @@ async def _run_session(
             if hot_poll_retry_at is None and time.monotonic() >= next_resync:
                 try:
                     await panel_bridge.reconcile()
-                    if mesh_bridge is not None and leader.is_leader:
+                    if mesh_bridge is not None and leader is not None and leader.is_leader:
                         await mesh_bridge.reconcile()
                 except (TimeoutError, asyncio.TimeoutError):
                     if consecutive_resync_failures >= 1:
@@ -550,6 +600,11 @@ async def _run_session(
                 await panel_bridge.shutdown_wired_feedback()
             except Exception as error:
                 log.error("WIRED_SHUTDOWN_FAILED %s", type(error).__name__)
+        if virtual_slider_controller is not None:
+            try:
+                await virtual_slider_controller.shutdown()
+            except Exception:
+                log.exception("virtual slider controller shutdown failed during cleanup")
         if scene_bridge is not None:
             try:
                 await scene_bridge.async_shutdown()

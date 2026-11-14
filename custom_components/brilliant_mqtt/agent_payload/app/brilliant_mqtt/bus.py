@@ -33,6 +33,10 @@ from brilliant_mqtt.model import (
     Variable,
     kind_for_peripheral_type,
 )
+from brilliant_mqtt.protocols import (
+    VirtualPeripheralHostProtocol,
+    VirtualPeripheralSpec,
+)
 from brilliant_mqtt.write_admission import (
     AdmissionTicket,
     Superseded,
@@ -625,6 +629,11 @@ class RpcBusAdapter:
     @property
     def capture_generation(self) -> int:
         return self._capture_generation
+
+    @property
+    def own_device_id(self) -> str | None:
+        """Return the local panel's bus device_id once start() has committed."""
+        return self._own_device_id
 
     def _next_capture_provenance(self) -> CaptureProvenance:
         self._capture_sequence += 1
@@ -1593,3 +1602,162 @@ class RpcBusAdapter:
         self._pending_pushes.clear()
         self._push_tasks.clear()
         await self._close_bus_resources()
+
+
+async def _await_if_coroutine(result: Any) -> None:
+    """Await a borrowed firmware method's result when it is a coroutine."""
+    if hasattr(result, "__await__"):
+        await result
+
+
+class HostedVirtualPeripheralAdapter(VirtualPeripheralHostProtocol):
+    """Concrete :class:`VirtualPeripheralHostProtocol` backed by ``PeripheralHost``.
+
+    All firmware imports (``lib.*`` / ``peripherals.*``) are deferred to runtime
+    methods so this module imports cleanly on any machine without panel libraries,
+    matching :mod:`brilliant_ha_mirror.hosting`.
+    """
+
+    def __init__(
+        self,
+        spec: VirtualPeripheralSpec,
+        on_external_set: Callable[[str, Any], Awaitable[None]],
+        loop: asyncio.AbstractEventLoop | None = None,
+    ) -> None:
+        self._spec = spec
+        self._on_external_set = on_external_set
+        self._loop = loop
+        self._host: Any = None
+        self._instance: Any = None
+
+    def _build_peripheral_class(self) -> Any:
+        from peripherals.lib.peripheral_service.peripheral import (
+            Peripheral,
+            VariableSpec,
+        )
+
+        spec = self._spec
+        on_ext = self._on_external_set
+        adapter = self
+
+        def _make_push(var_name: str) -> Callable[[Any], Awaitable[bool]]:
+            async def _push(val: Any) -> bool:
+                await on_ext(var_name, val)
+                return True
+
+            return _push
+
+        def _build_variables() -> dict[str, Any]:
+            specs: dict[str, Any] = {}
+            for k, default_val in spec.initial_variables.items():
+                is_settable = k in spec.settable_variables
+                vtype = int if isinstance(default_val, int) else str
+                specs[k] = VariableSpec(
+                    vtype,
+                    is_settable,
+                    default_value=default_val,
+                    push_func=_make_push(k) if is_settable else None,
+                )
+            return specs
+
+        class _DynamicVirtualPeripheral(Peripheral):
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                super().__init__(*args, **kwargs)
+                adapter._instance = self
+
+            @property
+            def name(self) -> str:
+                return spec.peripheral_id
+
+            @property
+            def peripheral_type(self) -> int:
+                return spec.peripheral_type
+
+            def _my_variables(self) -> dict[str, Any]:
+                return _build_variables()
+
+        return _DynamicVirtualPeripheral
+
+    async def start(self) -> None:
+        if self._host is not None:
+            return
+        from lib.startables.startable import HostedStartableSpec
+        from peripherals.lib.peripheral_service.peripheral_host import (
+            PeripheralConfig,
+            PeripheralHost,
+        )
+
+        try:
+            import gflags
+
+            flags = gflags.FLAGS
+            try:
+                _ = flags.message_bus_server_socket_path
+            except gflags.UnparsedFlagAccessError:
+                flags([""])
+            flags.message_bus_server_socket_path = _SOCKET_PATH
+        except ImportError:
+            pass
+
+        loop = self._loop or asyncio.get_running_loop()
+        p_cls = self._build_peripheral_class()
+        startable_id = self._spec.peripheral_id
+        config = PeripheralConfig(startable_id, p_cls)
+        host = PeripheralHost(
+            loop=loop,
+            startable_id=startable_id,
+            startables_to_host=[HostedStartableSpec(startable_id, config, {})],
+            parallel_registration_limit=1,
+            raise_errors_for_lost_user_configured_data=False,
+            message_bus_address_override=None,
+        )
+        try:
+            await host.start()
+        except BaseException:
+            self._instance = None
+            raise
+        self._host = host
+
+    async def set_variable(self, name: str, value: Any) -> None:
+        instance = self._instance
+        if instance is None:
+            return
+        try:
+            from peripherals.lib.peripheral_service.peripheral import Peripheral
+
+            update = Peripheral.__dict__.get("_set_value_internal")
+            if update is not None:
+                await _await_if_coroutine(update(instance, name, value, notify=True))
+                return
+        except ImportError:
+            pass
+        if hasattr(instance, "set_value"):
+            await _await_if_coroutine(instance.set_value(name, value))
+
+    async def shutdown(self) -> None:
+        host = self._host
+        self._host = None
+        if host is None:
+            self._instance = None
+            return
+        try:
+            from peripherals.lib.peripheral_service.conditional_peripheral_host import (
+                ConditionalPeripheralHost,
+            )
+
+            delete_impl = ConditionalPeripheralHost.__dict__.get("delete_peripheral")
+            if delete_impl is not None:
+                await _await_if_coroutine(
+                    delete_impl(host, self._spec.peripheral_id, int(time.time() * 1000))
+                )
+        except ImportError:
+            pass
+        except Exception:
+            logger.exception(
+                "failed to delete hosted virtual peripheral %s during shutdown",
+                self._spec.peripheral_id,
+            )
+        finally:
+            self._instance = None
+            if hasattr(host, "shutdown"):
+                await _await_if_coroutine(host.shutdown())

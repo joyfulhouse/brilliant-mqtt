@@ -1452,6 +1452,7 @@ async def test_deploy_payload_raises_and_skips_version_when_swap_fails(tmp_path:
 async def test_uninstall_sequence_and_paths() -> None:
     shell = await _connected(FakeShell())
     await panel_ops.uninstall(shell)
+    assert shell.virtual_sliders_restored is True
     assert shell.commands == [
         "systemctl disable --now brilliant-mqtt 2>/dev/null || true",
         "rm -f /etc/systemd/system/brilliant-mqtt.service /etc/brilliant-mqtt.env",

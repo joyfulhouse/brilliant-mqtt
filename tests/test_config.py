@@ -635,3 +635,29 @@ class TestSettings:
 
         with pytest.raises(ValueError, match="MOTION_DEFAULT_LOW_THRESHOLD"):
             Settings.from_env()
+
+
+def test_virtual_sliders_json_valid() -> None:
+    s = Settings.from_env(
+        {
+            "BRILLIANT_PANEL": "office",
+            "MQTT_HOST": "10.0.0.1",
+            "MQTT_USERNAME": "u",
+            "MQTT_PASSWORD": "p",
+            "VIRTUAL_SLIDERS_JSON": '[{"slider_id": "hb", "name": "HB", "switch_id": "abc"}]',
+        }
+    )
+    assert "hb" in s.virtual_sliders_json
+
+
+def test_virtual_sliders_json_invalid_raises() -> None:
+    with pytest.raises(ValueError, match="Invalid VIRTUAL_SLIDERS_JSON"):
+        Settings.from_env(
+            {
+                "BRILLIANT_PANEL": "office",
+                "MQTT_HOST": "10.0.0.1",
+                "MQTT_USERNAME": "u",
+                "MQTT_PASSWORD": "p",
+                "VIRTUAL_SLIDERS_JSON": "{not-a-list}",
+            }
+        )

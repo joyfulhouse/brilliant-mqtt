@@ -2962,6 +2962,25 @@ def _swap_command() -> str:
     )
 
 
+async def _restore_virtual_sliders_on_uninstall(shell: PanelShell) -> None:
+    """Best-effort restore of persisted virtual slider bindings before removing PANEL_VAR_DIR."""
+    await shell.run(
+        f"{_PANEL_PYTHON} - <<'BRILLIANT_RESTORE_VIRTUAL_SLIDERS' 2>/dev/null || true\n"
+        "import asyncio, sys\n"
+        "from pathlib import Path\n"
+        f"var_dir = Path({PANEL_VAR_DIR!r})\n"
+        "state_path = var_dir / 'state' / 'virtual-sliders.json'\n"
+        "if state_path.is_file():\n"
+        "    for sub in ('current/app', 'app', 'current/vendor', 'vendor'):\n"
+        "        p = var_dir / sub\n"
+        "        if p.is_dir():\n"
+        "            sys.path.insert(0, str(p))\n"
+        "    from brilliant_mqtt.virtual_sliders import restore_all_persisted_slider_bindings\n"
+        "    asyncio.run(restore_all_persisted_slider_bindings(state_path))\n"
+        "BRILLIANT_RESTORE_VIRTUAL_SLIDERS"
+    )
+
+
 async def uninstall(shell: PanelShell) -> None:
     """Stop + disable + remove everything the integration owns on the panel.
 
@@ -2972,6 +2991,7 @@ async def uninstall(shell: PanelShell) -> None:
     if await baseline_retained(shell):
         raise PanelOpError("baseline_retained_finalize_first")
     await shell.run(f"systemctl disable --now {SERVICE_NAME} 2>/dev/null || true")
+    await _restore_virtual_sliders_on_uninstall(shell)
     await _checked(shell, f"rm -f {PANEL_UNIT_FILE} {PANEL_ENV_FILE}")
     await _checked(shell, f"rm -rf {PANEL_VAR_DIR} {_STAGING_DIR} {_STAGING_TARBALL}")
     await _checked(shell, "systemctl daemon-reload")

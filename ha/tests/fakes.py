@@ -102,6 +102,7 @@ class FakeShell:
         self._identity_audits: set[str] = set()
         # Models the on-panel retained rollback baseline marker (complete.json).
         self.baseline_retained = False
+        self.virtual_sliders_restored = False
 
     def pinned_host_key(self) -> str | None:
         return self._pinned
@@ -138,6 +139,9 @@ class FakeShell:
         self._require_connected()
         if "BRILLIANT_BASELINE_RETAINED" in command:
             return RunResult(0, "1" if self.baseline_retained else "0", "")
+        if "BRILLIANT_RESTORE_VIRTUAL_SLIDERS" in command:
+            self.virtual_sliders_restored = True
+            return self.responses.get(command, _OK)
         if "BRILLIANT_BASELINE_ACTION" in command:
             return _OK
         if "BRILLIANT_RELEASE_IDENTITY_PREPARE" in command:
