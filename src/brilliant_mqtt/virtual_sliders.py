@@ -350,7 +350,7 @@ class VirtualSliderSpec:
     step_delta_threshold: int = 40
     swipe_delta_threshold: int = 150
     tap_window_s: float = 0.45
-    settle_window_s: float = 0.85
+    settle_window_s: float = 0.0
     default_mode: SliderMode = SliderMode.VIRTUAL
     scene_single_tap: str = ""
     scene_double_tap: str = ""
@@ -406,7 +406,7 @@ class VirtualSliderSpec:
         step_delta_threshold: int = 40,
         swipe_delta_threshold: int = 150,
         tap_window_s: float = 0.45,
-        settle_window_s: float = 0.85,
+        settle_window_s: float = 0.0,
     ) -> VirtualSliderSpec:
         """Build a :class:`VirtualSliderSpec` for a BLE mesh switch (``switch_config:<id>``)."""
         cfg_periph = (
@@ -451,7 +451,7 @@ class VirtualSliderSpec:
         step_delta_threshold: int = 40,
         swipe_delta_threshold: int = 150,
         tap_window_s: float = 0.45,
-        settle_window_s: float = 0.85,
+        settle_window_s: float = 0.0,
     ) -> VirtualSliderSpec:
         """Build a :class:`VirtualSliderSpec` for a wired panel faceplate slider."""
         if slider_index < 0 or slider_index > 3:
@@ -516,11 +516,13 @@ class _SliderClassifier:
         state: VirtualSliderState,
         on_classified: Callable[[SliderEventType | None], Awaitable[None]],
         clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self._spec = spec
         self._state = state
         self._on_classified = on_classified
         self._clock = clock
+        self._sleep = sleep
 
         self._tap_count = 0
         self._tap_timer: asyncio.Task[None] | None = None
@@ -534,9 +536,15 @@ class _SliderClassifier:
         if self._tap_timer is not None and not self._tap_timer.done():
             self._tap_timer.cancel()
         self._tap_timer = None
+        self.cancel_intensity()
+
+    def cancel_intensity(self, new_raw: int | None = None) -> None:
+        """Cancel any pending intensity settle timer and optionally update baseline."""
         if self._intensity_timer is not None and not self._intensity_timer.done():
             self._intensity_timer.cancel()
         self._intensity_timer = None
+        if new_raw is not None:
+            self._baseline_raw = new_raw
 
     async def handle_virtual_var_set(self, var_name: str, value: Any) -> None:
         """Handle an external set on the hosted virtual peripheral (``on`` or ``intensity``)."""
@@ -576,7 +584,7 @@ class _SliderClassifier:
 
     async def _finalize_tap(self) -> None:
         try:
-            await asyncio.sleep(self._spec.tap_window_s)
+            await self._sleep(self._spec.tap_window_s)
         except asyncio.CancelledError:
             return
         count = self._tap_count
@@ -610,23 +618,26 @@ class _SliderClassifier:
         self._state.step = step
 
         if self._spec.settle_window_s <= 0:
-            await self._emit_locked_intensity()
+            await self._emit_locked_intensity(raw_val, brightness, step)
             return
 
         if self._intensity_timer is not None and not self._intensity_timer.done():
             self._intensity_timer.cancel()
-        self._intensity_timer = asyncio.create_task(self._finalize_intensity())
+        self._intensity_timer = asyncio.create_task(
+            self._finalize_intensity(raw_val, brightness, step)
+        )
 
-    async def _finalize_intensity(self) -> None:
+    async def _finalize_intensity(self, raw_val: int, brightness: int, step: int) -> None:
         try:
-            await asyncio.sleep(self._spec.settle_window_s)
+            await self._sleep(self._spec.settle_window_s)
         except asyncio.CancelledError:
             return
-        await self._emit_locked_intensity()
+        await self._emit_locked_intensity(raw_val, brightness, step)
 
-    async def _emit_locked_intensity(self) -> None:
-        raw_val = self._state.raw_intensity
-        step = self._state.step
+    async def _emit_locked_intensity(self, raw_val: int, brightness: int, step: int) -> None:
+        self._state.raw_intensity = raw_val
+        self._state.brightness = brightness
+        self._state.step = step
         delta = raw_val - self._baseline_raw
 
         event: SliderEventType = "brightness_change"
@@ -665,6 +676,7 @@ class VirtualSliderController:
         host_factory: VirtualHostFactory,
         state_path: Path | None = None,
         clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         *,
         owned_topics: RetainedTopicLedger | None = None,
         want_device: Callable[[str], bool] | None = None,
@@ -678,6 +690,7 @@ class VirtualSliderController:
         self._host_factory = host_factory
         self._state_path = state_path
         self._clock = clock
+        self._sleep = sleep
         self._owned_topics = owned_topics
         self._want_device = want_device
         self._is_mesh_leader = is_mesh_leader
@@ -785,17 +798,19 @@ class VirtualSliderController:
             }
         return data
 
-    def _save_state_if_changed(self) -> None:
+    def _save_state_if_changed(self) -> bool:
         if self._state_path is None:
-            return
+            return True
         snapshot = self._build_persisted_snapshot()
         if snapshot == self._last_persisted_snapshot:
-            return
+            return True
         try:
             atomic_write_json(self._state_path, snapshot)
             self._last_persisted_snapshot = snapshot
+            return True
         except Exception as exc:
             logger.warning("Failed to save virtual slider state to %s: %s", self._state_path, exc)
+            return False
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -828,65 +843,92 @@ class VirtualSliderController:
             except Exception:
                 logger.exception("Failed to restore orphaned slider binding for %s", sid)
                 continue
-            if not isinstance(result, Superseded):
-                self._orphaned_bindings.pop(sid, None)
-                logger.info(
-                    "Restored original slider_config for removed virtual slider %s on %s/%s",
+            if isinstance(result, Superseded):
+                continue
+            try:
+                verify_dev = await self._bus.get_peripheral(
+                    orphan.config_device_id, orphan.config_peripheral_id
+                )
+            except Exception:
+                verify_dev = None
+            if (
+                verify_dev is None
+                or orphan.config_var_name not in verify_dev.variables
+                or verify_dev.variables[orphan.config_var_name].value
+                != orphan.original_slider_config
+            ):
+                logger.warning(
+                    "Orphaned slider_config restore read-back verification failed for %s on %s/%s; "
+                    "retaining backup for retry",
                     sid,
                     orphan.config_device_id,
                     orphan.config_peripheral_id,
                 )
+                continue
+            self._orphaned_bindings.pop(sid, None)
+            logger.info(
+                "Restored original slider_config for removed virtual slider %s on %s/%s",
+                sid,
+                orphan.config_device_id,
+                orphan.config_peripheral_id,
+            )
         self._save_state_if_changed()
 
     async def start(self) -> None:
         """Host virtual peripherals, seed scene watermark, bind sliders, and publish discovery."""
-        self._register_callbacks()
-        await self._seed_execution_timestamp()
-        await self._restore_orphaned_bindings()
+        try:
+            if self._specs:
+                self._register_callbacks()
+                await self._seed_execution_timestamp()
+            await self._restore_orphaned_bindings()
 
-        for sid, spec in self._specs.items():
-            st = self._states[sid]
+            for sid, spec in self._specs.items():
+                st = self._states[sid]
 
-            async def _on_classified(event: SliderEventType | None, _sid: str = sid) -> None:
+                async def _on_classified(event: SliderEventType | None, _sid: str = sid) -> None:
+                    self._save_state_if_changed()
+                    await self._publish_state(_sid, event=event)
+
+                classifier = _SliderClassifier(
+                    spec=spec,
+                    state=st,
+                    on_classified=_on_classified,
+                    clock=self._clock,
+                    sleep=self._sleep,
+                )
+                self._classifiers[sid] = classifier
+
+                vspec = VirtualPeripheralSpec(
+                    peripheral_id=spec.virtual_peripheral_id,
+                    display_name=spec.name,
+                    peripheral_type=VIRTUAL_DIMMER_PERIPHERAL_TYPE,
+                    initial_variables={
+                        "on": 1 if st.is_on else 0,
+                        "dimmable": 1,
+                        "intensity": st.raw_intensity,
+                        "max_intensity_value": spec.max_raw,
+                    },
+                    settable_variables=frozenset({"on", "intensity"}),
+                )
+
+                async def _on_ext_set(
+                    var_name: str, val: Any, _clf: _SliderClassifier = classifier
+                ) -> None:
+                    await _clf.handle_virtual_var_set(var_name, val)
+
+                host = self._host_factory(vspec, _on_ext_set)
+                await host.start()
+                self._hosts[sid] = host
+
+                await self._apply_slider_binding(spec, st.mode)
                 self._save_state_if_changed()
-                await self._publish_state(_sid, event=event)
 
-            classifier = _SliderClassifier(
-                spec=spec,
-                state=st,
-                on_classified=_on_classified,
-                clock=self._clock,
-            )
-            self._classifiers[sid] = classifier
-
-            vspec = VirtualPeripheralSpec(
-                peripheral_id=spec.virtual_peripheral_id,
-                display_name=spec.name,
-                peripheral_type=VIRTUAL_DIMMER_PERIPHERAL_TYPE,
-                initial_variables={
-                    "on": 1 if st.is_on else 0,
-                    "intensity": st.raw_intensity,
-                    "min_intensity_value": spec.min_raw,
-                    "max_intensity_value": spec.max_raw,
-                },
-                settable_variables=frozenset({"on", "intensity"}),
-            )
-
-            async def _on_ext_set(
-                var_name: str, val: Any, _clf: _SliderClassifier = classifier
-            ) -> None:
-                await _clf.handle_virtual_var_set(var_name, val)
-
-            host = self._host_factory(vspec, _on_ext_set)
-            await host.start()
-            self._hosts[sid] = host
-
-            await self._apply_slider_binding(spec, st.mode)
-            self._save_state_if_changed()
-
-            await self._publish_discovery(spec)
-            await self._subscribe_commands(spec)
-            await self._publish_state(sid, event=None)
+                await self._publish_discovery(spec)
+                await self._subscribe_commands(spec)
+                await self._publish_state(sid, event=None)
+        except Exception:
+            await self.shutdown()
+            raise
 
     async def on_mesh_leadership_acquired(self) -> None:
         """Apply deferred ``ble_mesh`` slider bindings once mesh leadership is won."""
@@ -935,6 +977,7 @@ class VirtualSliderController:
         if current_dev is not None and spec.config_var_name in current_dev.variables:
             current_b64 = current_dev.variables[spec.config_var_name].value
 
+        prev_backup = st.original_slider_config
         decoded: tuple[str, str] | None = None
         if current_b64:
             decoded = decode_slider_config_target(current_b64)
@@ -945,25 +988,41 @@ class VirtualSliderController:
                     spec.virtual_peripheral_id,
                 ) and curr_periph_id != "":
                     st.original_slider_config = current_b64
-                    self._save_state_if_changed()
+                    if not self._save_state_if_changed():
+                        st.original_slider_config = prev_backup
+                        logger.error(
+                            "Refusing to overwrite %s on %s/%s for slider %s: "
+                            "failed to persist original_slider_config backup to %s",
+                            spec.config_var_name,
+                            spec.config_device_id,
+                            spec.config_peripheral_id,
+                            spec.slider_id,
+                            self._state_path,
+                        )
+                        return False
 
         if mode is SliderMode.VIRTUAL:
             if not st.original_slider_config:
-                if decoded is not None and spec.load_peripheral_id:
-                    st.original_slider_config = spec.passthrough_slider_config_b64(
-                        self._own_device_id
-                    )
-                    self._save_state_if_changed()
-                else:
-                    logger.warning(
-                        "Refusing to overwrite %s on %s/%s for slider %s in virtual mode: "
-                        "no original_slider_config backup and bus value could not be decoded",
-                        spec.config_var_name,
-                        spec.config_device_id,
-                        spec.config_peripheral_id,
-                        spec.slider_id,
-                    )
-                    return False
+                logger.warning(
+                    "Refusing to overwrite %s on %s/%s for slider %s in virtual mode: "
+                    "no original_slider_config backup and bus value could not be backed up",
+                    spec.config_var_name,
+                    spec.config_device_id,
+                    spec.config_peripheral_id,
+                    spec.slider_id,
+                )
+                return False
+            if not self._save_state_if_changed():
+                logger.error(
+                    "Refusing to overwrite %s on %s/%s for slider %s: "
+                    "failed to persist original_slider_config backup to %s",
+                    spec.config_var_name,
+                    spec.config_device_id,
+                    spec.config_peripheral_id,
+                    spec.slider_id,
+                    self._state_path,
+                )
+                return False
             target_b64 = spec.virtual_slider_config_b64(self._own_device_id)
         else:
             if st.original_slider_config:
@@ -1013,16 +1072,18 @@ class VirtualSliderController:
         except Exception:
             verify_dev = None
 
-        if verify_dev is not None and spec.config_var_name in verify_dev.variables:
-            observed_b64 = verify_dev.variables[spec.config_var_name].value
-            if observed_b64 != target_b64:
-                logger.warning(
-                    "slider_config read-back verification mismatch on %s/%s for slider %s",
-                    spec.config_device_id,
-                    spec.config_peripheral_id,
-                    spec.slider_id,
-                )
-                return False
+        if (
+            verify_dev is None
+            or spec.config_var_name not in verify_dev.variables
+            or verify_dev.variables[spec.config_var_name].value != target_b64
+        ):
+            logger.warning(
+                "slider_config read-back verification failed on %s/%s for slider %s",
+                spec.config_device_id,
+                spec.config_peripheral_id,
+                spec.slider_id,
+            )
+            return False
 
         logger.info(
             "Bound slider %s (%s/%s %s) -> mode=%s",
@@ -1123,6 +1184,9 @@ class VirtualSliderController:
             1,
             min(spec.num_steps, round((brightness / 255.0) * spec.num_steps)),
         )
+        clf = self._classifiers.get(slider_id)
+        if clf is not None:
+            clf.cancel_intensity(new_raw=st.raw_intensity)
         host = self._hosts.get(slider_id)
         if host is not None:
             await host.set_variable("on", 1 if is_on else 0)
@@ -1377,3 +1441,122 @@ def parse_virtual_slider_specs(raw_json: str, own_device_id: str = "") -> list[V
                 )
             )
     return specs
+
+
+def _read_persisted_state_dict(state_path: Path | None) -> dict[str, Any] | None:
+    if state_path is None or not state_path.exists():
+        return None
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def has_persisted_slider_backups(state_path: Path | None) -> bool:
+    """Return True if *state_path* exists and contains at least one backed-up slider binding."""
+    data = _read_persisted_state_dict(state_path)
+    if data is None:
+        return False
+    for entry in data.values():
+        if not isinstance(entry, dict):
+            continue
+        orig_cfg = entry.get("original_slider_config")
+        if (
+            isinstance(orig_cfg, str)
+            and orig_cfg
+            and entry.get("config_device_id")
+            and entry.get("config_peripheral_id")
+            and entry.get("config_var_name")
+        ):
+            return True
+    return False
+
+
+async def restore_all_persisted_slider_bindings(
+    state_path: Path,
+    *,
+    bus: BusClient | None = None,
+    is_mesh_leader: Callable[[], bool] = lambda: True,
+) -> bool:
+    """Restore all persisted ``original_slider_config`` entries in *state_path* to the bus.
+
+    Used during integration uninstall or when all virtual sliders are removed.
+    """
+    if not has_persisted_slider_backups(state_path):
+        return True
+
+    own_bus = False
+    if bus is None:
+        from brilliant_mqtt.bus import RpcBusAdapter
+
+        adapter = RpcBusAdapter()
+        await adapter.start()
+        bus = adapter
+        own_bus = True
+
+    try:
+        data = _read_persisted_state_dict(state_path)
+        if data is None:
+            return False
+
+        all_restored = True
+        changed = False
+        for sid, entry in list(data.items()):
+            if not isinstance(entry, dict):
+                continue
+            orig_cfg = entry.get("original_slider_config")
+            cfg_dev = str(entry.get("config_device_id", ""))
+            cfg_periph = str(entry.get("config_peripheral_id", ""))
+            cfg_var = str(entry.get("config_var_name", ""))
+            if (
+                not isinstance(orig_cfg, str)
+                or not orig_cfg
+                or not (cfg_dev and cfg_periph and cfg_var)
+            ):
+                continue
+            if cfg_dev == "ble_mesh" and not is_mesh_leader():
+                all_restored = False
+                continue
+            try:
+                result = await bus.set_variables(
+                    cfg_dev,
+                    cfg_periph,
+                    [VarSet(cfg_var, orig_cfg)],
+                )
+            except Exception:
+                logger.exception("Failed to restore slider binding for %s", sid)
+                all_restored = False
+                continue
+            if isinstance(result, Superseded):
+                all_restored = False
+                continue
+            try:
+                verify_dev = await bus.get_peripheral(cfg_dev, cfg_periph)
+            except Exception:
+                verify_dev = None
+            if (
+                verify_dev is None
+                or cfg_var not in verify_dev.variables
+                or verify_dev.variables[cfg_var].value != orig_cfg
+            ):
+                logger.warning(
+                    "Slider binding restore read-back verification failed for %s on %s/%s",
+                    sid,
+                    cfg_dev,
+                    cfg_periph,
+                )
+                all_restored = False
+                continue
+            data.pop(sid, None)
+            changed = True
+
+        if changed:
+            try:
+                atomic_write_json(state_path, data)
+            except Exception:
+                logger.warning("Failed to update %s after slider restore", state_path)
+        return all_restored
+    finally:
+        if own_bus:
+            await bus.shutdown()

@@ -37,6 +37,7 @@ from brilliant_mqtt.retained_topics import RetainedLedgerError, RetainedTopicLed
 from brilliant_mqtt.scene_bridge import SceneBridge
 from brilliant_mqtt.virtual_sliders import (
     VirtualSliderController,
+    has_persisted_slider_backups,
     parse_virtual_slider_specs,
 )
 
@@ -391,16 +392,17 @@ async def _run_session(
         if scene_bridge is not None:
             await scene_bridge.async_start()
 
-        if settings.virtual_sliders_json.strip():
+        vs_state_path = (
+            Path(settings.motion_desired_state_dir) / "virtual-sliders.json"
+            if settings.motion_desired_state_dir
+            else None
+        )
+        raw_vs_json = settings.virtual_sliders_json.strip()
+        if raw_vs_json or has_persisted_slider_backups(vs_state_path):
             try:
                 own_dev = bus.own_device_id or ""
-                vs_specs = parse_virtual_slider_specs(settings.virtual_sliders_json, own_dev)
-                if vs_specs:
-                    vs_state_path = (
-                        Path(settings.motion_desired_state_dir) / "virtual-sliders.json"
-                        if settings.motion_desired_state_dir
-                        else None
-                    )
+                vs_specs = parse_virtual_slider_specs(raw_vs_json, own_dev) if raw_vs_json else []
+                if vs_specs or has_persisted_slider_backups(vs_state_path):
                     virtual_slider_controller = VirtualSliderController(
                         bus=bus,
                         mqtt=mqtt,
@@ -418,6 +420,8 @@ async def _run_session(
                     await virtual_slider_controller.start()
             except Exception:
                 log.exception("virtual slider controller startup failed; continuing without it")
+                if virtual_slider_controller is not None:
+                    await virtual_slider_controller.shutdown()
                 virtual_slider_controller = None
 
         tick = settings.hot_poll_seconds if settings.hot_poll_seconds > 0 else _IDLE_TICK_S

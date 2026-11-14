@@ -1640,9 +1640,10 @@ class HostedVirtualPeripheralAdapter(VirtualPeripheralHostProtocol):
         on_ext = self._on_external_set
         adapter = self
 
-        def _make_push(var_name: str) -> Callable[[Any], Awaitable[None]]:
-            async def _push(val: Any) -> None:
+        def _make_push(var_name: str) -> Callable[[Any], Awaitable[bool]]:
+            async def _push(val: Any) -> bool:
                 await on_ext(var_name, val)
+                return True
 
             return _push
 
@@ -1685,6 +1686,18 @@ class HostedVirtualPeripheralAdapter(VirtualPeripheralHostProtocol):
             PeripheralConfig,
             PeripheralHost,
         )
+
+        try:
+            import gflags
+
+            flags = gflags.FLAGS
+            try:
+                _ = flags.message_bus_server_socket_path
+            except gflags.UnparsedFlagAccessError:
+                flags([""])
+            flags.message_bus_server_socket_path = _SOCKET_PATH
+        except ImportError:
+            pass
 
         loop = self._loop or asyncio.get_running_loop()
         p_cls = self._build_peripheral_class()

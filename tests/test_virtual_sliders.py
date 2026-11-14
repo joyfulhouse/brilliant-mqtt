@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import sys
 import types
@@ -11,6 +10,7 @@ from typing import Any
 
 import pytest
 
+from brilliant_mqtt import virtual_sliders as virtual_sliders_module
 from brilliant_mqtt.bus import HostedVirtualPeripheralAdapter
 from brilliant_mqtt.commands import VarSet
 from brilliant_mqtt.model import BrilliantDevice, DeviceKind, Variable
@@ -26,14 +26,29 @@ from brilliant_mqtt.virtual_sliders import (
     brightness_to_raw,
     decode_slider_config_target,
     encode_slider_config,
+    has_persisted_slider_backups,
     parse_virtual_slider_specs,
     raw_to_brightness,
+    restore_all_persisted_slider_bindings,
 )
 from brilliant_mqtt.write_admission import AdmissionTicket, WriteClass
-from tests.fakes import FakeBus, FakeMqtt
+from tests.fakes import FakeBus, FakeClock, FakeMqtt, FakeSleeper, _settle
 from tools.brilliant_vc.slider_binding import decode_slider_config as vc_decode_slider_config
 
 PANEL_DEV_ID = "019c7b7d-36df-4fe9-a49e-48e05136f5a4"
+
+# Real hardware-captured CapTouchSliderConfig TBinaryProtocol payloads from a physical
+# Brilliant 2-slider panel (device_config_peripheral type=19, slider_config:0 & slider_config:1):
+REAL_PANEL_SLIDER_CONFIG_0_B64 = (
+    "CAABAAAAAAsAAgAAAApodWVfYnJpZGdlCwADAAAAGTAwMTc4OEZGRkUyQ0E0ODJfZ3JvdXBf"
+    "ODMIAAYAAAAADAAHDwABDAAAAAELAAEAAAAKaHVlX2JyaWRnZQsAAgAAABkwMDE3ODhGRkZF"
+    "MkNBNDgyX2dyb3VwXzgzAAAA"
+)
+REAL_PANEL_SLIDER_CONFIG_1_B64 = (
+    "CAABAAAAAQsAAgAAAApodWVfYnJpZGdlCwADAAAAGTAwMTc4OEZGRkUyQ0E0ODJfZ3JvdXBf"
+    "OTIIAAYAAAAADAAHDwABDAAAAAELAAEAAAAKaHVlX2JyaWRnZQsAAgAAABkwMDE3ODhGRkZF"
+    "MkNBNDgyX2dyb3VwXzkyAAAA"
+)
 
 
 class FakeVirtualPeripheralHost(VirtualPeripheralHostProtocol):
@@ -125,6 +140,39 @@ class TestSliderConfigThrift:
         assert decode_slider_config_target("not-valid-base64!!!") is None
         # Protobuf-formatted bytes must be rejected by the Thrift decoder
         assert decode_slider_config_target("CgYKAWEKAmI=") is None
+
+    def test_real_hardware_captured_slider_configs_decode_and_roundtrip_exact(self) -> None:
+        assert decode_slider_config_target(REAL_PANEL_SLIDER_CONFIG_0_B64) == (
+            "hue_bridge",
+            "001788FFFE2CA482_group_83",
+        )
+        assert decode_slider_config_target(REAL_PANEL_SLIDER_CONFIG_1_B64) == (
+            "hue_bridge",
+            "001788FFFE2CA482_group_92",
+        )
+        vc0 = vc_decode_slider_config(REAL_PANEL_SLIDER_CONFIG_0_B64)
+        assert (vc0.slider_index, vc0.device_id, vc0.peripheral_id, vc0.action) == (
+            0,
+            "hue_bridge",
+            "001788FFFE2CA482_group_83",
+            0,
+        )
+        vc1 = vc_decode_slider_config(REAL_PANEL_SLIDER_CONFIG_1_B64)
+        assert (vc1.slider_index, vc1.device_id, vc1.peripheral_id, vc1.action) == (
+            1,
+            "hue_bridge",
+            "001788FFFE2CA482_group_92",
+            0,
+        )
+        # Re-encoding produces the exact byte-for-byte base64 payload captured from hardware
+        assert (
+            encode_slider_config("hue_bridge", "001788FFFE2CA482_group_83", slider_index=0)
+            == REAL_PANEL_SLIDER_CONFIG_0_B64
+        )
+        assert (
+            encode_slider_config("hue_bridge", "001788FFFE2CA482_group_92", slider_index=1)
+            == REAL_PANEL_SLIDER_CONFIG_1_B64
+        )
 
 
 class TestVirtualSliderSpec:
@@ -600,6 +648,8 @@ class TestVirtualSliderController:
             tap_window_s=0.05,
             settle_window_s=0.05,
         )
+        clock = FakeClock()
+        sleeper = FakeSleeper()
         ctrl = VirtualSliderController(
             bus=bus,
             mqtt=mqtt,
@@ -608,6 +658,8 @@ class TestVirtualSliderController:
             specs=[spec],
             host_factory=make_host,
             state_path=tmp_path / "vs_state.json",
+            clock=clock,
+            sleep=sleeper,
         )
         await ctrl.start()
         mqtt.published.clear()
@@ -627,7 +679,7 @@ class TestVirtualSliderController:
                 },
             )
         )
-        await asyncio.sleep(0.08)
+        await sleeper.release_all()
         assert [p for p in mqtt.published if p[0].endswith("/event")] == []
 
         # Triple tap: double_tap (ts=1000) + single_tap (ts=1150)
@@ -657,7 +709,7 @@ class TestVirtualSliderController:
                 },
             )
         )
-        await asyncio.sleep(0.08)
+        await sleeper.release_all()
 
         ev_pubs = [
             p
@@ -680,7 +732,7 @@ class TestVirtualSliderController:
             for p in mqtt.published
             if p[0] == "brilliant/living_room/virtual_slider/half_bath/event"
         ] == []
-        await asyncio.sleep(0.08)
+        await sleeper.release_all()
         ev_pubs = [
             p
             for p in mqtt.published
@@ -691,3 +743,268 @@ class TestVirtualSliderController:
         assert ev_data["event_type"] == "swipe_down"
         assert ev_data["step"] == 1
         await ctrl.shutdown()
+
+    async def test_backup_write_failure_refuses_to_overwrite_bus_slider_config(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If atomic_write_json raises (e.g. disk full), _apply_slider_binding must not
+        overwrite slider_config on the bus without a durable backup."""
+        faceplate = BrilliantDevice(
+            device_id=PANEL_DEV_ID,
+            peripheral_id="faceplate_peripheral",
+            name="Faceplate",
+            kind=DeviceKind.UNKNOWN,
+            variables={
+                "slider_config:0": Variable("slider_config:0", REAL_PANEL_SLIDER_CONFIG_0_B64)
+            },
+        )
+        bus = _ConfigurableFakeBus([faceplate])
+        mqtt = FakeMqtt()
+        spec = VirtualSliderSpec.for_panel_slider(
+            slider_id="living_left",
+            name="Living Room Left",
+            panel_device_id=PANEL_DEV_ID,
+            slider_index=0,
+        )
+
+        def fail_write(_path: Path, _data: Any) -> None:
+            raise OSError("No space left on device")
+
+        monkeypatch.setattr(virtual_sliders_module, "atomic_write_json", fail_write)
+
+        ctrl = VirtualSliderController(
+            bus=bus,
+            mqtt=mqtt,
+            panel="living_room",
+            own_device_id=PANEL_DEV_ID,
+            specs=[spec],
+            host_factory=lambda vspec, cb: FakeVirtualPeripheralHost(vspec, cb),
+            state_path=tmp_path / "vs_state.json",
+        )
+        await ctrl.start()
+        assert bus.commands == []
+        assert ctrl.state_for("living_left").original_slider_config is None
+        assert faceplate.variables["slider_config:0"].value == REAL_PANEL_SLIDER_CONFIG_0_B64
+        await ctrl.shutdown()
+
+    async def test_unbound_slider_never_synthesizes_original_slider_config(
+        self, tmp_path: Path
+    ) -> None:
+        """An unbound slider (slider_config == '') must not have a synthesized fallback
+        stored as original_slider_config."""
+        faceplate = BrilliantDevice(
+            device_id=PANEL_DEV_ID,
+            peripheral_id="faceplate_peripheral",
+            name="Faceplate",
+            kind=DeviceKind.UNKNOWN,
+            variables={"slider_config:0": Variable("slider_config:0", "")},
+        )
+        bus = _ConfigurableFakeBus([faceplate])
+        mqtt = FakeMqtt()
+        spec = VirtualSliderSpec.for_panel_slider(
+            slider_id="living_left",
+            name="Living Room Left",
+            panel_device_id=PANEL_DEV_ID,
+            slider_index=0,
+            load_peripheral_id="gangbox_peripheral_0",
+        )
+        ctrl = VirtualSliderController(
+            bus=bus,
+            mqtt=mqtt,
+            panel="living_room",
+            own_device_id=PANEL_DEV_ID,
+            specs=[spec],
+            host_factory=lambda vspec, cb: FakeVirtualPeripheralHost(vspec, cb),
+            state_path=tmp_path / "vs_state.json",
+        )
+        await ctrl.start()
+        assert bus.commands == []
+        assert ctrl.state_for("living_left").original_slider_config is None
+        await ctrl.shutdown()
+
+    async def test_turning_feature_off_and_uninstall_restore_persisted_bindings(
+        self, tmp_path: Path
+    ) -> None:
+        """Clearing VIRTUAL_SLIDERS_JSON (specs=[]) or running uninstall restore must
+        restore persisted backups and verify read-back before removing them."""
+        faceplate = BrilliantDevice(
+            device_id=PANEL_DEV_ID,
+            peripheral_id="faceplate_peripheral",
+            name="Faceplate",
+            kind=DeviceKind.UNKNOWN,
+            variables={
+                "slider_config:0": Variable("slider_config:0", REAL_PANEL_SLIDER_CONFIG_0_B64),
+                "slider_config:1": Variable("slider_config:1", REAL_PANEL_SLIDER_CONFIG_1_B64),
+            },
+        )
+        bus = _ConfigurableFakeBus([faceplate])
+        mqtt = FakeMqtt()
+        state_file = tmp_path / "virtual-sliders.json"
+        specs = [
+            VirtualSliderSpec.for_panel_slider(
+                slider_id="left",
+                name="Left",
+                panel_device_id=PANEL_DEV_ID,
+                slider_index=0,
+            ),
+            VirtualSliderSpec.for_panel_slider(
+                slider_id="right",
+                name="Right",
+                panel_device_id=PANEL_DEV_ID,
+                slider_index=1,
+            ),
+        ]
+        ctrl = VirtualSliderController(
+            bus=bus,
+            mqtt=mqtt,
+            panel="living_room",
+            own_device_id=PANEL_DEV_ID,
+            specs=specs,
+            host_factory=lambda vspec, cb: FakeVirtualPeripheralHost(vspec, cb),
+            state_path=state_file,
+        )
+        await ctrl.start()
+        assert has_persisted_slider_backups(state_file) is True
+        assert faceplate.variables["slider_config:0"].value != REAL_PANEL_SLIDER_CONFIG_0_B64
+        assert faceplate.variables["slider_config:1"].value != REAL_PANEL_SLIDER_CONFIG_1_B64
+        await ctrl.shutdown()
+
+        # If read-back verification fails on orphan restore, backup must be retained!
+        bus.reflect_writes = False
+        ctrl_fail = VirtualSliderController(
+            bus=bus,
+            mqtt=mqtt,
+            panel="living_room",
+            own_device_id=PANEL_DEV_ID,
+            specs=[],
+            host_factory=lambda vspec, cb: FakeVirtualPeripheralHost(vspec, cb),
+            state_path=state_file,
+        )
+        await ctrl_fail.start()
+        assert has_persisted_slider_backups(state_file) is True
+        await ctrl_fail.shutdown()
+
+        # Now allow writes to reflect and run uninstall restore helper
+        bus.reflect_writes = True
+        restored = await restore_all_persisted_slider_bindings(state_file, bus=bus)
+        assert restored is True
+        assert faceplate.variables["slider_config:0"].value == REAL_PANEL_SLIDER_CONFIG_0_B64
+        assert faceplate.variables["slider_config:1"].value == REAL_PANEL_SLIDER_CONFIG_1_B64
+        assert has_persisted_slider_backups(state_file) is False
+
+    async def test_ha_command_during_settle_window_cancels_timer_without_bogus_gesture_event(
+        self, tmp_path: Path
+    ) -> None:
+        """An inbound HA brightness command arriving during a touch settle window must
+        cancel the pending settle timer and not emit a bogus gesture event."""
+        faceplate = BrilliantDevice(
+            device_id=PANEL_DEV_ID,
+            peripheral_id="faceplate_peripheral",
+            name="Faceplate",
+            kind=DeviceKind.UNKNOWN,
+            variables={
+                "slider_config:0": Variable("slider_config:0", REAL_PANEL_SLIDER_CONFIG_0_B64)
+            },
+        )
+        bus = _ConfigurableFakeBus([faceplate])
+        mqtt = FakeMqtt()
+        hosts: dict[str, FakeVirtualPeripheralHost] = {}
+
+        def make_host(vspec: VirtualPeripheralSpec, cb: Any) -> VirtualPeripheralHostProtocol:
+            h = FakeVirtualPeripheralHost(vspec, cb)
+            hosts[vspec.peripheral_id] = h
+            return h
+
+        spec = VirtualSliderSpec.for_panel_slider(
+            slider_id="living_left",
+            name="Living Room Left",
+            panel_device_id=PANEL_DEV_ID,
+            slider_index=0,
+            settle_window_s=0.85,
+        )
+        clock = FakeClock()
+        sleeper = FakeSleeper()
+        ctrl = VirtualSliderController(
+            bus=bus,
+            mqtt=mqtt,
+            panel="living_room",
+            own_device_id=PANEL_DEV_ID,
+            specs=[spec],
+            host_factory=make_host,
+            state_path=tmp_path / "vs_state.json",
+            clock=clock,
+            sleep=sleeper,
+        )
+        await ctrl.start()
+        mqtt.published.clear()
+
+        # Start a touch update that arms the 0.85s settle timer
+        host = hosts["vs_dimmer_living_left"]
+        await host.simulate_bus_write("intensity", 900)
+        await _settle()
+        assert len(sleeper.requested) == 1
+
+        # Before the settle timer fires, an HA command sets brightness to 10
+        await ctrl.on_mqtt_command(
+            "brilliant/living_room/virtual_slider/living_left/set_brightness",
+            "10",
+        )
+        await sleeper.release_all()
+
+        # No gesture event should have been emitted, and brightness must remain 10!
+        ev_pubs = [
+            p
+            for p in mqtt.published
+            if p[0] == "brilliant/living_room/virtual_slider/living_left/event"
+        ]
+        assert ev_pubs == []
+        assert ctrl.state_for("living_left").brightness == 10
+        await ctrl.shutdown()
+
+    async def test_partial_startup_failure_shuts_down_already_started_hosts(
+        self, tmp_path: Path
+    ) -> None:
+        """If starting a later slider fails, already-started PeripheralHosts must be shut down."""
+        bus = _ConfigurableFakeBus([])
+        mqtt = FakeMqtt()
+        created_hosts: list[FakeVirtualPeripheralHost] = []
+
+        def make_host(vspec: VirtualPeripheralSpec, cb: Any) -> VirtualPeripheralHostProtocol:
+            h = FakeVirtualPeripheralHost(vspec, cb)
+            if len(created_hosts) == 1:
+
+                async def fail_start() -> None:
+                    raise RuntimeError("second host failed to start")
+
+                h.start = fail_start  # type: ignore[method-assign]
+            created_hosts.append(h)
+            return h
+
+        specs = [
+            VirtualSliderSpec.for_panel_slider(
+                slider_id="s0",
+                name="S0",
+                panel_device_id=PANEL_DEV_ID,
+                slider_index=0,
+            ),
+            VirtualSliderSpec.for_panel_slider(
+                slider_id="s1",
+                name="S1",
+                panel_device_id=PANEL_DEV_ID,
+                slider_index=1,
+            ),
+        ]
+        ctrl = VirtualSliderController(
+            bus=bus,
+            mqtt=mqtt,
+            panel="living_room",
+            own_device_id=PANEL_DEV_ID,
+            specs=specs,
+            host_factory=make_host,
+            state_path=tmp_path / "vs_state.json",
+        )
+        with pytest.raises(RuntimeError, match="second host failed to start"):
+            await ctrl.start()
+        assert len(created_hosts) == 2
+        assert created_hosts[0].started is True
+        assert created_hosts[0].stopped is True
