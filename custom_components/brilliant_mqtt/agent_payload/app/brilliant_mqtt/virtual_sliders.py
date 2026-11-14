@@ -350,6 +350,7 @@ class VirtualSliderSpec:
     step_delta_threshold: int = 40
     swipe_delta_threshold: int = 150
     tap_window_s: float = 0.45
+    settle_window_s: float = 0.85
     default_mode: SliderMode = SliderMode.VIRTUAL
     scene_single_tap: str = ""
     scene_double_tap: str = ""
@@ -405,6 +406,7 @@ class VirtualSliderSpec:
         step_delta_threshold: int = 40,
         swipe_delta_threshold: int = 150,
         tap_window_s: float = 0.45,
+        settle_window_s: float = 0.85,
     ) -> VirtualSliderSpec:
         """Build a :class:`VirtualSliderSpec` for a BLE mesh switch (``switch_config:<id>``)."""
         cfg_periph = (
@@ -424,6 +426,7 @@ class VirtualSliderSpec:
             step_delta_threshold=step_delta_threshold,
             swipe_delta_threshold=swipe_delta_threshold,
             tap_window_s=tap_window_s,
+            settle_window_s=settle_window_s,
             default_mode=default_mode,
             scene_single_tap=scene_single_tap,
             scene_double_tap=scene_double_tap,
@@ -448,6 +451,7 @@ class VirtualSliderSpec:
         step_delta_threshold: int = 40,
         swipe_delta_threshold: int = 150,
         tap_window_s: float = 0.45,
+        settle_window_s: float = 0.85,
     ) -> VirtualSliderSpec:
         """Build a :class:`VirtualSliderSpec` for a wired panel faceplate slider."""
         if slider_index < 0 or slider_index > 3:
@@ -467,6 +471,7 @@ class VirtualSliderSpec:
             step_delta_threshold=step_delta_threshold,
             swipe_delta_threshold=swipe_delta_threshold,
             tap_window_s=tap_window_s,
+            settle_window_s=settle_window_s,
             default_mode=default_mode,
             scene_single_tap=scene_single_tap,
             scene_double_tap=scene_double_tap,
@@ -519,15 +524,19 @@ class _SliderClassifier:
 
         self._tap_count = 0
         self._tap_timer: asyncio.Task[None] | None = None
+        self._intensity_timer: asyncio.Task[None] | None = None
         self._last_Tap_ts: float = 0.0
         self._last_intensity_ts: float = 0.0
         self._baseline_raw: int = state.raw_intensity
 
     def cancel(self) -> None:
-        """Cancel any pending tap-window timer."""
+        """Cancel any pending tap-window or intensity settle timer."""
         if self._tap_timer is not None and not self._tap_timer.done():
             self._tap_timer.cancel()
         self._tap_timer = None
+        if self._intensity_timer is not None and not self._intensity_timer.done():
+            self._intensity_timer.cancel()
+        self._intensity_timer = None
 
     async def handle_virtual_var_set(self, var_name: str, value: Any) -> None:
         """Handle an external set on the hosted virtual peripheral (``on`` or ``intensity``)."""
@@ -580,11 +589,13 @@ class _SliderClassifier:
         await self._on_classified(ev)
 
     async def _process_intensity(self, raw_val: int, now: float) -> None:
-        if now - self._last_intensity_ts > 0.35:
+        reset_gap = max(0.35, self._spec.settle_window_s * 1.5)
+        if (
+            self._intensity_timer is None or self._intensity_timer.done()
+        ) and now - self._last_intensity_ts > reset_gap:
             self._baseline_raw = self._state.raw_intensity
         self._last_intensity_ts = now
 
-        delta = raw_val - self._baseline_raw
         self._state.raw_intensity = raw_val
         brightness = self._spec.raw_to_brightness(raw_val)
         self._state.brightness = brightness
@@ -597,6 +608,26 @@ class _SliderClassifier:
             ),
         )
         self._state.step = step
+
+        if self._spec.settle_window_s <= 0:
+            await self._emit_locked_intensity()
+            return
+
+        if self._intensity_timer is not None and not self._intensity_timer.done():
+            self._intensity_timer.cancel()
+        self._intensity_timer = asyncio.create_task(self._finalize_intensity())
+
+    async def _finalize_intensity(self) -> None:
+        try:
+            await asyncio.sleep(self._spec.settle_window_s)
+        except asyncio.CancelledError:
+            return
+        await self._emit_locked_intensity()
+
+    async def _emit_locked_intensity(self) -> None:
+        raw_val = self._state.raw_intensity
+        step = self._state.step
+        delta = raw_val - self._baseline_raw
 
         event: SliderEventType = "brightness_change"
         if abs(delta) >= self._spec.swipe_delta_threshold:
@@ -1297,6 +1328,8 @@ def parse_virtual_slider_specs(raw_json: str, own_device_id: str = "") -> list[V
         opt_kwargs: dict[str, Any] = {k: int(item[k]) for k in _INT_OPT_KEYS if k in item}
         if "tap_window_s" in item:
             opt_kwargs["tap_window_s"] = float(item["tap_window_s"])
+        if "settle_window_s" in item:
+            opt_kwargs["settle_window_s"] = float(item["settle_window_s"])
 
         if "switch_id" in item:
             specs.append(

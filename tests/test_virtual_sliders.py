@@ -598,6 +598,7 @@ class TestVirtualSliderController:
             scene_single_tap="scene-1tap",
             scene_double_tap="scene-2tap",
             tap_window_s=0.05,
+            settle_window_s=0.05,
         )
         ctrl = VirtualSliderController(
             bus=bus,
@@ -666,10 +667,20 @@ class TestVirtualSliderController:
         assert len(ev_pubs) == 1
         assert json.loads(ev_pubs[0][1])["event_type"] == "triple_tap"
 
-        # Simulate swipe down on virtual peripheral
+        # Simulate multi-tick finger drag down on virtual peripheral (540 -> 480 -> 540 -> 280):
+        # Must pause and wait for settle_window_s before locking in a single event!
         mqtt.published.clear()
         host = hosts["vs_dimmer_half_bath"]
+        await host.simulate_bus_write("intensity", 540)
+        await host.simulate_bus_write("intensity", 480)
+        await host.simulate_bus_write("intensity", 540)
         await host.simulate_bus_write("intensity", 280)
+        assert [
+            p
+            for p in mqtt.published
+            if p[0] == "brilliant/living_room/virtual_slider/half_bath/event"
+        ] == []
+        await asyncio.sleep(0.08)
         ev_pubs = [
             p
             for p in mqtt.published
