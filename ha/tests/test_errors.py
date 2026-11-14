@@ -179,6 +179,12 @@ def test_exception_mapping_uses_stable_allowlisted_metadata(
     assert mapped.summary_key
     assert mapped.documentation_slug
     assert mapped.redacted_detail
+    if isinstance(error, socket.gaierror):
+        assert mapped.connect_cause == "dns"
+    elif isinstance(error, ConnectionRefusedError):
+        assert mapped.connect_cause == "connection_refused"
+    elif isinstance(error, TimeoutError):
+        assert mapped.connect_cause == "timeout"
     _assert_secret_free(mapped)
 
 

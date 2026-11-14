@@ -45,6 +45,8 @@ _PREFLIGHT_FAILURE_KEYS = frozenset(
 _PREFLIGHT_ERROR_DETAILS = {
     "settings_invalid": "Panel configuration invalid",
     "mqtt_connect": "MQTT connection failed",
+    "mqtt_dns": "MQTT name resolution failed",
+    "mqtt_refused": "MQTT connection refused",
     "mqtt_subscribe": "MQTT subscription failed",
     "mqtt_publish": "MQTT publish failed",
     "mqtt_timeout": "MQTT stage timed out",

@@ -145,6 +145,16 @@ Common problems — entities missing, sensors lagging, motion not firing,
 broker/ACL issues — are covered in
 **[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)**.
 
+Panels must reach the MQTT broker with a LAN IP address or a hostname they
+can resolve. Do not use Home Assistant add-on names such as `core-mosquitto`,
+`*.local.hass.io`, `localhost`, or `a0d7b954-…`. `broker_connect_failed`
+names the `host:port` the panel tried and, when detectable, whether that was
+DNS, connection refused, or a timeout. A closed Add panel dialog can still
+block a later broker change until you abort the idle flow from broker
+settings, it expires, or you finish a flow that already started provisioning.
+Details and recovery steps:
+**[docs/install/mqtt-broker.md](docs/install/mqtt-broker.md#broker-host-for-panels)**.
+
 ## Development
 
 ```bash

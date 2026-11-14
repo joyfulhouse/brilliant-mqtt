@@ -2616,6 +2616,72 @@ def test_toolchain_accepts_is_enabled_without_stdout() -> None:
     assert subprocess.run(["sh", "-c", script], check=False).returncode == 0
 
 
+def test_candidate_release_absent_probe_executes_for_present_and_absent(tmp_path: Path) -> None:
+    """Run the generated panel script with a real interpreter.
+
+    pathlib.Path has no lexists(); a probe that calls it exits non-zero on the
+    panel and the absence check can never succeed.
+    """
+    target = tmp_path / "0.11.6--aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    temporary = tmp_path / ".0.11.6--aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.tmp"
+
+    def run() -> subprocess.CompletedProcess[str]:
+        command = panel_ops.candidate_release_absent_command(str(target), str(temporary))
+        command = command.replace(panel_ops._PANEL_PYTHON, shlex.quote(sys.executable))
+        return subprocess.run(
+            ["/bin/sh", "-c", command],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+
+    absent = run()
+    assert absent.returncode == 0, absent.stderr
+    assert absent.stdout.strip() == "0"
+
+    target.mkdir()
+    directory = run()
+    assert directory.returncode == 0, directory.stderr
+    assert directory.stdout.strip() == "1"
+    target.rmdir()
+
+    target.write_text("candidate\n", encoding="utf-8")
+    present_file = run()
+    assert present_file.returncode == 0, present_file.stderr
+    assert present_file.stdout.strip() == "1"
+    target.unlink()
+
+    target.symlink_to(tmp_path / "missing-target")
+    dangling = run()
+    assert dangling.returncode == 0, dangling.stderr
+    assert dangling.stdout.strip() == "1"
+
+
+def _run_reachability(host: str, port: int) -> subprocess.CompletedProcess[str]:
+    command = panel_ops.broker_reachability_command(host, port, timeout_seconds=0.2)
+    command = command.replace(panel_ops._PANEL_PYTHON, shlex.quote(sys.executable))
+    return subprocess.run(
+        ["/bin/sh", "-c", command],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+
+def test_broker_reachability_script_distinguishes_dns_and_refusal() -> None:
+    unresolved = _run_reachability("core-mosquitto.invalid", 1883)
+    assert unresolved.returncode == 0, unresolved.stderr
+    assert panel_ops.interpret_broker_reachability(unresolved.stdout) == "dns"
+
+    refused = _run_reachability("127.0.0.1", 1)
+    assert refused.returncode == 0, refused.stderr
+    assert panel_ops.interpret_broker_reachability(refused.stdout) == "connection_refused"
+    assert "SECRET" not in unresolved.stdout
+    assert panel_ops.interpret_broker_reachability("not-a-cause\n") == "connect"
+
+
 def test_snapshot_layout_probe_accepts_is_enabled_without_stdout(tmp_path: Path) -> None:
     """The layout probe must not abort when a core unit is absent on systemd 250.
 

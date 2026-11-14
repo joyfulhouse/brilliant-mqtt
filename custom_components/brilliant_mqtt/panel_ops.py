@@ -101,6 +101,20 @@ _HA_MIRROR_STAGED_ENV = f"{PANEL_HA_MIRROR_STAGED_DIR}/{HA_MIRROR_SERVICE_NAME}.
 class PanelOpError(RuntimeError):
     """A panel shell command exited non-zero."""
 
+    exit_status: int | None
+    stderr: str
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        exit_status: int | None = None,
+        stderr: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.exit_status = exit_status
+        self.stderr = stderr
+
 
 class ReleaseIdentityBlocked(PanelOpError):
     """An actionable, explicitly safe identity refusal with one-operation binding."""
@@ -789,9 +803,11 @@ async def _provisioning_run(
     except Exception:
         failed = True
     if failed or result is None or result.exit_status != 0:
+        exit_status = None if result is None else result.exit_status
+        stderr = "" if result is None else result.stderr
         command = "<redacted>"
         result = None
-        raise PanelOpError(error_code)
+        raise PanelOpError(error_code, exit_status=exit_status, stderr=stderr)
     return result
 
 
@@ -1213,6 +1229,131 @@ async def verify_baseline(shell: PanelShell, snapshot: PanelSnapshot) -> None:
 
 async def finalize_baseline(shell: PanelShell, snapshot: PanelSnapshot) -> None:
     await _baseline_action(shell, snapshot, "finalize")
+
+
+def candidate_release_absent_command(target: str, temporary: str) -> str:
+    """Panel probe: 1 if either candidate path exists, including a dangling symlink.
+
+    The heredoc body runs on the panel interpreter. Older controls are not
+    guaranteed a recent pathlib, so this matches the layout probe: ``os.path.lexists``,
+    with no f-strings or walrus operators in the panel script. The f-string here
+    is evaluated on Home Assistant before the script is sent.
+    """
+    if "\n" in target or "\n" in temporary or "\x00" in target or "\x00" in temporary:
+        raise PanelOpError("baseline_invalid")
+    return (
+        f"{_PANEL_PYTHON} - <<'BRILLIANT_CANDIDATE_ABSENT'\n"
+        "import os\n"
+        f"paths = ({target!r}, {temporary!r})\n"
+        "print(int(any(os.path.lexists(path) for path in paths)))\n"
+        "BRILLIANT_CANDIDATE_ABSENT"
+    )
+
+
+async def prove_unactivated_capture(
+    shell: PanelShell,
+    snapshot: PanelSnapshot,
+    *,
+    version: str,
+    transaction_id: UUID,
+) -> None:
+    """Prove a pre-activation capture still matches the panel and no candidate exists.
+
+    ``check_restored`` compares the live owned tree with the capture. The
+    transaction release directory must also be absent: staging has not run, so
+    discarding the archive cannot hide a candidate.
+    """
+    if (
+        snapshot.baseline is None
+        or _VERSION.fullmatch(version) is None
+        or not _valid_uuid4(transaction_id)
+    ):
+        raise PanelOpError("baseline_invalid")
+    await verify_baseline(shell, snapshot)
+    await _baseline_action(shell, snapshot, "check_restored")
+    target = f"{PANEL_RELEASES_DIR}/{version}--{transaction_id.hex}"
+    temporary = f"{PANEL_RELEASES_DIR}/.{version}--{transaction_id.hex}.tmp"
+    result = await _provisioning_run(
+        shell,
+        candidate_release_absent_command(target, temporary),
+        "baseline_read_failed",
+    )
+    if result.stdout.strip() != "0":
+        raise PanelOpError("baseline_candidate_present")
+
+
+_BROKER_REACHABILITY = frozenset({"ok", "dns", "connection_refused", "timeout", "connect"})
+
+
+def broker_reachability_command(host: str, port: int, *, timeout_seconds: float = 5.0) -> str:
+    """Build a read-only panel probe for broker DNS and TCP reachability."""
+    if (
+        not isinstance(host, str)
+        or not host
+        or len(host) > 253
+        or any(ord(char) < 33 or ord(char) == 127 for char in host)
+        or type(port) is not int
+        or not 1 <= port <= 65535
+        or type(timeout_seconds) is not float
+        or not 0.1 <= timeout_seconds <= 30.0
+    ):
+        raise PanelOpError("broker_reachability_invalid")
+    return (
+        f"{_PANEL_PYTHON} - <<'BRILLIANT_BROKER_REACH'\n"
+        "import socket\n"
+        f"host = {host!r}\n"
+        f"port = {port!r}\n"
+        f"timeout = {timeout_seconds!r}\n"
+        "def classify():\n"
+        "    try:\n"
+        "        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)\n"
+        "    except socket.gaierror:\n"
+        "        return 'dns'\n"
+        "    if not infos:\n"
+        "        return 'dns'\n"
+        "    saw_refused = False\n"
+        "    saw_timeout = False\n"
+        "    for info in infos:\n"
+        "        try:\n"
+        "            sock = socket.create_connection(info[4], timeout)\n"
+        "        except ConnectionRefusedError:\n"
+        "            saw_refused = True\n"
+        "            continue\n"
+        "        except TimeoutError:\n"
+        "            saw_timeout = True\n"
+        "            continue\n"
+        "        except OSError:\n"
+        "            continue\n"
+        "        else:\n"
+        "            sock.close()\n"
+        "            return 'ok'\n"
+        "    if saw_refused:\n"
+        "        return 'connection_refused'\n"
+        "    if saw_timeout:\n"
+        "        return 'timeout'\n"
+        "    return 'connect'\n"
+        "print(classify())\n"
+        "BRILLIANT_BROKER_REACH"
+    )
+
+
+def interpret_broker_reachability(stdout: str) -> str:
+    """Map one probe line to an allowlisted cause. Unexpected output fails closed."""
+    token = stdout.strip()
+    if token not in _BROKER_REACHABILITY:
+        return "connect"
+    return token
+
+
+async def probe_broker_reachability(
+    shell: PanelShell,
+    host: str,
+    port: int,
+) -> str:
+    """Resolve and TCP-connect to the broker from the panel. Read-only."""
+    command = broker_reachability_command(host, port)
+    result = await _provisioning_run(shell, command, "broker_reachability_failed")
+    return interpret_broker_reachability(result.stdout)
 
 
 async def baseline_retained(shell: PanelShell) -> bool:

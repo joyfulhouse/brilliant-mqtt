@@ -237,8 +237,8 @@ profile may be revalidated. Once panels exist, a changed broker endpoint, TLS
 profile, or credential is deliberately deferred to a guided multi-panel
 operation. The integration refuses the edit instead of leaving a mixed-broker
 fleet. Broker edits also fail closed while an Add panel flow, provisioning
-journal, or recovery transaction is active; see
-[`broker_change_blocked_by_panel_onboarding`](install/mqtt-broker.md#broker_change_blocked_by_panel_onboarding).
+journal, or unreadable journal is active; see
+[broker host and blocked broker changes](install/mqtt-broker.md#broker-host-for-panels).
 
 Each panel subentry has focused day-two actions:
 

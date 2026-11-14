@@ -34,6 +34,22 @@ Reset to `LOG_LEVEL=INFO` when done.
 
 ---
 
+## Broker host and Add panel
+
+Use the Home Assistant host's LAN IP, or a hostname the panel can resolve.
+Add-on names such as `core-mosquitto`, `*.local.hass.io`, `localhost`, and
+`a0d7b954-…` work for Home Assistant and fail on the panel.
+
+| Error | What to do |
+|---|---|
+| `broker_host_not_panel_reachable` | Replace the host with a LAN IP or LAN-resolvable hostname before continuing. |
+| `broker_connect_failed` | Read the `host:port` and the cause (DNS, connection refused, or a generic connect failure). Correct the host and retry. A failure before activation does not leave an armed rollback baseline. |
+| `broker_change_blocked_by_active_journal` | Finish or recover Add panel. Do not delete the journal by hand. |
+| `broker_change_blocked_by_journal_read_error` | Repair Home Assistant storage, reload the integration, then retry. |
+| `broker_change_blocked_by_add_panel_flow` | If provisioning has not started, confirm the broker form's prompt to abort the idle Add panel flow. If provisioning has started, let it finish. An idle naming or confirm step expires after 15 minutes. Restarting Home Assistant also clears a stuck flow. |
+
+Full steps: [install/mqtt-broker.md](install/mqtt-broker.md#broker-host-for-panels).
+
 ## Connectivity
 
 ### Entities show as unavailable / panel `offline`

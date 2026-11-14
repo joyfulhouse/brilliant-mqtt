@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -98,6 +98,7 @@ from custom_components.brilliant_mqtt.flow.schemas import (
     BROKER_MENU_OPTIONS,
     SECRET_UNCHANGED,
 )
+from custom_components.brilliant_mqtt.flow.support import PROVISIONING_STARTED_CONTEXT
 from custom_components.brilliant_mqtt.manager import PanelManager
 from custom_components.brilliant_mqtt.panel_health import PanelHealthEvidence
 from custom_components.brilliant_mqtt.panel_inspection import (
@@ -152,6 +153,22 @@ _PANEL_INPUT = {
     CONF_HOST: "office.iot.example",
     CONF_ROOT_PASSWORD: _ROOT_PASSWORD,
 }
+
+
+@pytest.fixture(autouse=True)
+def _close_leftover_subentry_flows(hass: HomeAssistant) -> Iterator[None]:
+    """Drop Add panel flows so idle-timeout timers do not outlive a test."""
+    yield
+    from homeassistant.data_entry_flow import UnknownFlow
+
+    for item in list(hass.config_entries.subentries.async_progress(include_uninitialized=True)):
+        flow_id = item.get("flow_id")
+        if not isinstance(flow_id, str):
+            continue
+        try:
+            hass.config_entries.subentries.async_abort(flow_id)
+        except UnknownFlow:
+            continue
 
 
 @pytest.fixture(autouse=True)
@@ -274,7 +291,7 @@ class _FakeProvisioner:
         self,
         identity: HostIdentity,
         *,
-        error: PanelProvisioningError | None = None,
+        error: BaseException | None = None,
         gate: asyncio.Event | None = None,
         mark_error: Exception | None = None,
         mark_gate: asyncio.Event | None = None,
@@ -409,6 +426,7 @@ def test_broker_fallback_failure_links_to_mqtt_guide(
             f"install/mqtt-broker.md#{documentation_slug}"
         ),
         "stage": "broker_validation",
+        "storage_detail": "",
     }
 
 
@@ -783,6 +801,41 @@ async def test_user_menu_offers_recommended_and_existing_brokers_equally(
     assert result["type"] is FlowResultType.MENU
     assert result["step_id"] == "user"
     assert tuple(cast(Iterable[str], result["menu_options"])) == BROKER_MENU_OPTIONS
+
+
+async def test_setup_and_options_reject_addon_internal_broker_host(
+    hass: HomeAssistant,
+) -> None:
+    """Panels cannot resolve Home Assistant's internal add-on DNS name."""
+    setup = await _start_broker_form(hass, BrokerKind.EXISTING_BROKER)
+    rejected = await hass.config_entries.flow.async_configure(
+        setup["flow_id"],
+        {**_BROKER_INPUT, CONF_MQTT_HOST: "core-mosquitto"},
+    )
+
+    assert rejected["type"] is FlowResultType.FORM
+    assert rejected["step_id"] == "broker"
+    assert rejected["errors"] == {CONF_MQTT_HOST: "broker_host_not_panel_reachable"}
+    placeholders = rejected["description_placeholders"]
+    assert placeholders is not None
+    description = placeholders["documentation_url"]
+    assert isinstance(description, str) and description
+
+    entry = _fleet_entry(hass)
+    options = await _start_fleet_broker_options(hass, entry)
+    options_rejected = await hass.config_entries.options.async_configure(
+        options["flow_id"],
+        {
+            **_BROKER_INPUT,
+            CONF_MQTT_HOST: "127.0.0.1",
+            CONF_MQTT_PASSWORD: SECRET_UNCHANGED,
+        },
+    )
+
+    assert options_rejected["type"] is FlowResultType.FORM
+    assert options_rejected["step_id"] == "broker_profile"
+    assert options_rejected["errors"] == {CONF_MQTT_HOST: "broker_host_not_panel_reachable"}
+    assert entry.data[CONF_MQTT_HOST] == "mqtt.iot.example"
 
 
 async def test_official_broker_prefills_editable_local_host_and_port(
@@ -1683,6 +1736,86 @@ async def test_first_panel_progress_cannot_double_submit_and_creates_subentry(
     assert len(entries[0].subentries) == 1
 
 
+async def test_unactivated_discard_logs_unexpected_errors_without_secrets(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    retained = replace(
+        await _restored_ownerless_record(hass),
+        state="armed",
+        recovery_deployment_id=None,
+    )
+    monkeypatch.setattr(
+        ProvisioningJournal, "async_retained_records", AsyncMock(return_value=(retained,))
+    )
+    entry = _fleet_entry(hass)
+    result = await _start_subentry_confirm(hass, entry, identity=_identity())
+    assert result["step_id"] == "panel_discard_unactivated"
+    caplog.set_level("WARNING")
+    provisioner = SimpleNamespace(
+        async_discard_unactivated_ownerless_baseline=AsyncMock(
+            side_effect=RuntimeError(f"discard crashed {_ROOT_PASSWORD}")
+        )
+    )
+
+    with patch.object(flow_gateway, "_get_panel_provisioner", return_value=provisioner):
+        failed = await hass.config_entries.subentries.async_configure(
+            result["flow_id"],
+            {"confirm_discard": True},
+        )
+
+    assert failed["type"] is FlowResultType.FORM
+    assert failed["step_id"] == "panel_connect"
+    assert failed["errors"] == {"base": "unactivated_baseline_not_proven"}
+    placeholders = failed["description_placeholders"]
+    assert isinstance(placeholders, Mapping)
+    detail = placeholders["storage_detail"]
+    assert "RuntimeError" in detail
+    assert _ROOT_PASSWORD not in detail
+    assert _ROOT_PASSWORD not in caplog.text
+    assert "Traceback" in caplog.text
+    assert "Unactivated baseline discard failed unexpectedly" in caplog.text
+
+
+async def test_journal_failure_shows_redacted_storage_reason(
+    hass: HomeAssistant,
+) -> None:
+    confirm = await _start_initial_confirm(hass)
+    reason = "OSError: disk-[redacted]"
+    provisioner = _FakeProvisioner(
+        _identity(),
+        error=PanelProvisioningError("journal_failed", storage_reason=reason),
+        gate=asyncio.Event(),
+    )
+
+    with patch.object(
+        flow_gateway,
+        "_get_panel_provisioner",
+        return_value=provisioner,
+    ):
+        result = cast(
+            dict[str, Any],
+            await hass.config_entries.subentries.async_configure(
+                confirm["flow_id"],
+                {CONF_NAME: "Office"},
+            ),
+        )
+        assert result["type"] is FlowResultType.SHOW_PROGRESS
+        assert provisioner.gate is not None
+        provisioner.gate.set()
+        result = await _drain_progress(
+            hass.config_entries.subentries,
+            confirm["flow_id"],
+        )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "panel_confirm"
+    assert result["errors"] == {"base": "journal_failed"}
+    assert result["description_placeholders"]["storage_detail"] == f" Storage reported: {reason}"
+    assert _ROOT_PASSWORD not in repr(result)
+
+
 async def test_first_panel_provision_failure_returns_to_confirm_without_secret_leak(
     hass: HomeAssistant,
 ) -> None:
@@ -1717,6 +1850,7 @@ async def test_first_panel_provision_failure_returns_to_confirm_without_secret_l
     assert result["step_id"] == "panel_confirm"
     assert result["errors"] == {"base": "stage_failed"}
     assert result["description_placeholders"]["documentation_slug"] == ("panel-stage-failed")
+    assert result["description_placeholders"]["storage_detail"] == ""
     assert _ROOT_PASSWORD not in repr(result)
     assert _BROKER_PASSWORD not in repr(result)
     entries = hass.config_entries.async_entries(DOMAIN)
@@ -2838,10 +2972,18 @@ async def test_empty_fleet_broker_update_rejects_active_pre_journal_add_flow(
     ) as load_journal:
         result = await hass.config_entries.options.async_configure(options_flow_id)
 
-    assert result["type"] is FlowResultType.ABORT
-    assert result["reason"] == "broker_change_blocked_by_panel_onboarding"
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "broker_abort_idle_panel_flow"
     assert entry.data == original_data
     load_journal.assert_awaited_once()
+    declined = await hass.config_entries.options.async_configure(
+        options_flow_id,
+        {"confirm_abort_idle_panel_flow": False},
+    )
+    assert declined["type"] is FlowResultType.ABORT
+    assert declined["reason"] == "broker_change_blocked_by_add_panel_flow"
+    assert entry.data == original_data
+    assert hass.config_entries.subentries.async_progress(include_uninitialized=True)
 
 
 async def test_empty_fleet_broker_update_rejects_journal_without_subentry(
@@ -2859,7 +3001,7 @@ async def test_empty_fleet_broker_update_rejects_journal_without_subentry(
         result = await hass.config_entries.options.async_configure(options_flow_id)
 
     assert result["type"] is FlowResultType.ABORT
-    assert result["reason"] == "broker_change_blocked_by_panel_onboarding"
+    assert result["reason"] == "broker_change_blocked_by_active_journal"
     assert entry.data == original_data
     assert not entry.subentries
 
@@ -2879,7 +3021,7 @@ async def test_empty_fleet_broker_update_fails_closed_when_journal_is_unreadable
         result = await hass.config_entries.options.async_configure(options_flow_id)
 
     assert result["type"] is FlowResultType.ABORT
-    assert result["reason"] == "broker_change_blocked_by_panel_onboarding"
+    assert result["reason"] == "broker_change_blocked_by_journal_read_error"
     assert entry.data == original_data
 
 
@@ -2915,9 +3057,78 @@ async def test_empty_fleet_broker_update_rechecks_add_flow_after_journal_read(
             finish_journal_read.set()
             result = await asyncio.wait_for(commit_task, timeout=1)
 
-    assert result["type"] is FlowResultType.ABORT
-    assert result["reason"] == "broker_change_blocked_by_panel_onboarding"
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "broker_abort_idle_panel_flow"
     assert entry.data == original_data
+
+
+async def test_idle_add_panel_flow_can_be_aborted_before_broker_update(
+    hass: HomeAssistant,
+) -> None:
+    entry = _fleet_entry(hass)
+    options_flow_id = await _prepare_fleet_broker_commit(hass, entry)
+    add_flow = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, SUBENTRY_TYPE_PANEL),
+        context={"source": "user"},
+    )
+    assert add_flow["step_id"] == "panel_connect"
+    with patch.object(ProvisioningJournal, "async_load", AsyncMock(return_value=None)):
+        offered = await hass.config_entries.options.async_configure(options_flow_id)
+        assert offered["step_id"] == "broker_abort_idle_panel_flow"
+        result = await hass.config_entries.options.async_configure(
+            options_flow_id,
+            {"confirm_abort_idle_panel_flow": True},
+        )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+    assert entry.data[CONF_MQTT_HOST] == "replacement-broker.iot.example"
+    assert not hass.config_entries.subentries.async_progress(include_uninitialized=True)
+
+
+async def test_started_add_panel_flow_cannot_be_aborted_for_broker_update(
+    hass: HomeAssistant,
+) -> None:
+    entry = _fleet_entry(hass)
+    original_data = dict(entry.data)
+    options_flow_id = await _prepare_fleet_broker_commit(hass, entry)
+    add_flow = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, SUBENTRY_TYPE_PANEL),
+        context={"source": "user"},
+    )
+    handler = hass.config_entries.subentries._progress[add_flow["flow_id"]]
+    cast(dict[str, Any], handler.context)[PROVISIONING_STARTED_CONTEXT] = True
+    with patch.object(ProvisioningJournal, "async_load", AsyncMock(return_value=None)):
+        result = await hass.config_entries.options.async_configure(options_flow_id)
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "broker_change_blocked_by_add_panel_flow"
+    assert entry.data == original_data
+    assert hass.config_entries.subentries.async_progress(include_uninitialized=True)
+
+
+async def test_idle_add_panel_flow_expires_before_provisioning(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from datetime import timedelta
+
+    from homeassistant.util import dt as dt_util
+    from pytest_homeassistant_custom_component.common import async_fire_time_changed
+
+    monkeypatch.setattr(
+        "custom_components.brilliant_mqtt.flow.onboarding.PANEL_ADD_IDLE_TIMEOUT_SECONDS",
+        30,
+    )
+    entry = _fleet_entry(hass)
+    add_flow = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, SUBENTRY_TYPE_PANEL),
+        context={"source": "user"},
+    )
+    assert add_flow["step_id"] == "panel_connect"
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=31))
+    await hass.async_block_till_done()
+    assert not hass.config_entries.subentries.async_progress(include_uninitialized=True)
 
 
 async def test_empty_fleet_broker_update_rechecks_snapshot_after_journal_read(
@@ -5341,6 +5552,37 @@ async def test_ownerless_restore_requires_explicit_finalize_confirmation(
     assert confirmed["step_id"] == "panel_confirm"
     provisioner.async_finalize_ownerless_restored.assert_awaited_once()
     assert _ROOT_PASSWORD not in repr(confirmed)
+
+
+async def test_unactivated_armed_baseline_requires_explicit_discard(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    retained = replace(
+        await _restored_ownerless_record(hass),
+        state="armed",
+        recovery_deployment_id=None,
+    )
+    assert retained.ownerless_unactivated_discard_allowed
+    monkeypatch.setattr(
+        ProvisioningJournal, "async_retained_records", AsyncMock(return_value=(retained,))
+    )
+    entry = _fleet_entry(hass)
+    result = await _start_subentry_confirm(hass, entry, identity=_identity())
+    assert result["step_id"] == "panel_discard_unactivated"
+    assert str(retained.record.transaction_id) in repr(result["description_placeholders"])
+    assert _ROOT_PASSWORD not in repr(result)
+    provisioner = SimpleNamespace(async_discard_unactivated_ownerless_baseline=AsyncMock())
+    with patch.object(flow_gateway, "_get_panel_provisioner", return_value=provisioner):
+        unchecked = await hass.config_entries.subentries.async_configure(
+            result["flow_id"], {"confirm_discard": False}
+        )
+        assert unchecked["step_id"] == "panel_discard_unactivated"
+        provisioner.async_discard_unactivated_ownerless_baseline.assert_not_awaited()
+        confirmed = await hass.config_entries.subentries.async_configure(
+            result["flow_id"], {"confirm_discard": True}
+        )
+    assert confirmed["step_id"] == "panel_confirm"
+    provisioner.async_discard_unactivated_ownerless_baseline.assert_awaited_once()
 
 
 async def test_ownerless_recovery_checks_retained_pin_before_fresh_password(

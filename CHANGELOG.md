@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Removing an unactivated onboarding baseline now checks candidate release
+  paths with `os.path.lexists`, which older panel Pythons provide. A failed
+  proof logs the stage (snapshot section, verify, check_restored kind,
+  candidate present, or command exit and redacted stderr) and shows that
+  short reason on the form.
+- A failed journal or retained save now logs the exception class, redacted
+  message, and traceback, and keeps that redacted cause on `journal_failed`.
+  Diagnostics include the same redacted `storage_error`. Passwords, host
+  addresses, SSH keys, and fingerprints are removed before logging.
+- A failed provisioning-journal save no longer leaves an armed, ownerless
+  rollback baseline. The journal payload is checked for an exact JSON
+  round-trip before that baseline is written, and a disk failure after the
+  arm removes the baseline again when the journal did not become durable.
+  Add Brilliant panel can clear an already stranded `armed` / `staged`
+  baseline that has no execution journal and no panel subentry, after the
+  panel still matches the capture and no candidate release directory exists.
+
 ## [0.11.6] - 2026-11-05
 
 This is a Home Assistant integration release only. The bundled on-panel agent

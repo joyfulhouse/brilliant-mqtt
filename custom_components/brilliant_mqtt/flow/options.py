@@ -15,6 +15,7 @@ from homeassistant.config_entries import (
     UnknownEntry,
 )
 from homeassistant.core import callback
+from homeassistant.data_entry_flow import UnknownFlow
 
 from .. import _fleet_lock
 from ..broker import BrokerKind, BrokerProfile
@@ -49,6 +50,7 @@ from .schemas import (
     BROKER_MENU_OPTIONS,
     SECRET_UNCHANGED,
     FlowInputError,
+    broker_abort_idle_panel_flow_schema,
     broker_form_source,
     broker_schema,
     fleet_control_schema,
@@ -66,7 +68,7 @@ from .support import (
     _operation_failure,
     _panel_failure,
     _panel_subentries,
-    _same_entry_panel_add_flow_active,
+    _same_entry_panel_add_flows,
 )
 
 
@@ -84,6 +86,7 @@ class BrilliantMqttFleetOptionsFlow(OptionsFlow):
         self._control_expected: dict[str, object] | None = None
         self._scenes_expected: tuple[object, ...] | None = None
         self._defaults_expected: dict[str, Any] | None = None
+        self._abort_idle_panel_flows = False
 
     def _exact_registered_entry(self) -> ConfigEntry[Any] | None:
         """Resolve the still-registered singleton owner for every commit boundary."""
@@ -302,7 +305,7 @@ class BrilliantMqttFleetOptionsFlow(OptionsFlow):
                         reason="broker_change_requires_guided_flow",
                     )
 
-                journal_clear = await gateway._async_provisioning_journal_clear(self.hass)
+                journal_status = await gateway._async_provisioning_journal_status(self.hass)
 
                 # The journal read yields to HA. Re-resolve every storage invariant
                 # and the active-flow registry afterward, then update synchronously
@@ -320,19 +323,87 @@ class BrilliantMqttFleetOptionsFlow(OptionsFlow):
                     return self.async_abort(
                         reason="broker_change_requires_guided_flow",
                     )
-                if not journal_clear or _same_entry_panel_add_flow_active(
-                    self.hass,
-                    entry.entry_id,
-                ):
+                if journal_status == "unreadable":
                     return self.async_abort(
-                        reason="broker_change_blocked_by_panel_onboarding",
+                        reason="broker_change_blocked_by_journal_read_error",
                     )
+                if journal_status == "active":
+                    return self.async_abort(
+                        reason="broker_change_blocked_by_active_journal",
+                    )
+                flows = _same_entry_panel_add_flows(self.hass, entry.entry_id)
+                if any(not flow.verifiably_idle for flow in flows):
+                    return self.async_abort(
+                        reason="broker_change_blocked_by_add_panel_flow",
+                    )
+                if flows and not self._abort_idle_panel_flows:
+                    return self._show_idle_panel_flow_form()
+                if flows:
+                    for flow in flows:
+                        if not flow.verifiably_idle:
+                            return self.async_abort(
+                                reason="broker_change_blocked_by_add_panel_flow",
+                            )
+                        try:
+                            self.hass.config_entries.subentries.async_abort(flow.flow_id)
+                        except UnknownFlow:
+                            continue
+                    self._abort_idle_panel_flows = False
+                    journal_status = await gateway._async_provisioning_journal_status(self.hass)
+                    entry = self._exact_registered_entry()
+                    if entry is None:
+                        return self.async_abort(reason="invalid_parent")
+                    try:
+                        current = FleetConfig.from_entry(entry).broker
+                    except EntryDataError:
+                        return self.async_abort(reason="invalid_parent")
+                    if current != expected:
+                        return self.async_abort(reason="parent_changed")
+                    if entry.subentries:
+                        return self.async_abort(
+                            reason="broker_change_requires_guided_flow",
+                        )
+                    if journal_status == "unreadable":
+                        return self.async_abort(
+                            reason="broker_change_blocked_by_journal_read_error",
+                        )
+                    if journal_status == "active":
+                        return self.async_abort(
+                            reason="broker_change_blocked_by_active_journal",
+                        )
+                    if _same_entry_panel_add_flows(self.hass, entry.entry_id):
+                        return self.async_abort(
+                            reason="broker_change_blocked_by_add_panel_flow",
+                        )
                 self._update_broker_entry(entry)
         elif candidate != current:
             # BrokerKind is persisted guidance only and has no runtime transport
             # effect, so it cannot orphan an active or recoverable installation.
             self._update_broker_entry(entry)
         return self.async_abort(reason="reconfigure_successful")
+
+    async def async_step_broker_abort_idle_panel_flow(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Abort a verifiably idle Add panel flow, then retry the broker commit."""
+        if self._broker_profile is None or self._broker_expected_profile is None:
+            return self.async_abort(reason="invalid_flow_state")
+        if user_input is None:
+            return self._show_idle_panel_flow_form()
+        if user_input.get("confirm_abort_idle_panel_flow") is not True:
+            return self.async_abort(reason="broker_change_blocked_by_add_panel_flow")
+        self._abort_idle_panel_flows = True
+        return await self.async_step_broker_commit()
+
+    def _show_idle_panel_flow_form(self) -> ConfigFlowResult:
+        return self.async_show_form(
+            step_id="broker_abort_idle_panel_flow",
+            data_schema=broker_abort_idle_panel_flow_schema(),
+            description_placeholders={
+                "documentation_url": f"{_MQTT_DOCUMENTATION_URL}#broker-host-for-panels",
+            },
+        )
 
     @callback
     def _update_broker_entry(self, entry: ConfigEntry[Any]) -> None:

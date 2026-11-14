@@ -280,6 +280,27 @@ def test_new_broker_schema_never_serializes_a_supplied_password() -> None:
     assert SECRET_UNCHANGED not in encoded
 
 
+@pytest.mark.parametrize(
+    "host",
+    [
+        "core-mosquitto",
+        "homeassistant.local.hass.io",
+        "127.0.0.1",
+        "localhost",
+        "a0d7b954-mosquitto",
+        "my-broker",
+    ],
+)
+def test_normalize_broker_input_rejects_hosts_panels_cannot_reach(host: str) -> None:
+    with pytest.raises(FlowInputError) as raised:
+        normalize_broker_input(
+            BrokerKind.EXISTING_BROKER,
+            _valid_broker_input(**{CONF_MQTT_HOST: host}),
+        )
+
+    assert dict(raised.value.errors) == {CONF_MQTT_HOST: "broker_host_not_panel_reachable"}
+
+
 def test_normalize_broker_input_flattens_shared_advanced_values() -> None:
     ca = "-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----"
     normalized = normalize_broker_input(

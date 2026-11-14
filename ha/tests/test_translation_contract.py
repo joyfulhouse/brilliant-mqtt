@@ -92,6 +92,7 @@ def test_fleet_options_translate_every_reachable_surface() -> None:
         "broker_profile",
         "broker_validation",
         "broker_commit",
+        "broker_abort_idle_panel_flow",
         "ha_control",
         "scenes",
         "fleet_defaults",
@@ -135,12 +136,15 @@ def test_fleet_options_translate_every_reachable_failure() -> None:
     required_errors = set(operation_errors._ERROR_METADATA) | {
         "invalid_value",
         "broker_validation_failed",
+        "broker_host_not_panel_reachable",
     }
     required_aborts = {
         "invalid_parent",
         "invalid_flow_state",
         "parent_changed",
-        "broker_change_blocked_by_panel_onboarding",
+        "broker_change_blocked_by_active_journal",
+        "broker_change_blocked_by_journal_read_error",
+        "broker_change_blocked_by_add_panel_flow",
         "broker_change_requires_guided_flow",
         "reconfigure_successful",
         "ha_control_change_requires_agent_rollout",

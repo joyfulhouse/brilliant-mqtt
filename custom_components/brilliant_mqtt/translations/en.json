@@ -27,7 +27,7 @@
           "mqtt_password": "Broker password"
         },
         "data_description": {
-          "mqtt_host": "Address reachable by both Home Assistant and every Brilliant panel.",
+          "mqtt_host": "LAN IP address or hostname that every Brilliant panel can resolve. Do not use Home Assistant add-on names such as core-mosquitto, names ending in .local.hass.io, localhost, or a0d7b954- names.",
           "mqtt_port": "Usually 1883 without TLS or 8883 with TLS.",
           "mqtt_username": "Broker account used by the Brilliant fleet.",
           "mqtt_password": "Broker password. It is stored securely and is never shown again."
@@ -169,7 +169,7 @@
       "unsupported_discovery_prefix": "The configured MQTT discovery prefix is unsupported. Restore a valid Home Assistant discovery prefix and retry.",
       "invalid_broker_profile": "The broker settings are invalid.",
       "broker_validation_failed": "MQTT validation failed unexpectedly. Verify the broker connection and credentials, then retry.",
-      "broker_connect_failed": "Could not connect to the MQTT broker. Verify host, port, routing, and firewall rules.",
+      "broker_connect_failed": "Could not connect to the MQTT broker at {broker_endpoint} ({connect_cause}). Panels need the Home Assistant host's LAN IP or a hostname they can resolve. Check DNS, routing, and firewall rules, then retry.",
       "broker_tls_verification_failed": "The MQTT broker certificate could not be verified. Check the broker certificate and optional public CA chain.",
       "broker_timeout": "The MQTT broker did not respond in time.",
       "broker_authentication_failed": "The MQTT broker rejected these credentials.",
@@ -191,7 +191,8 @@
       "cannot_install_voice": "The bridge agent installed, but installing the voice satellite failed (its payload may not be downloadable yet, or the panel rejected it). Untick \"Enable voice satellite\" to finish without it, or try again.",
       "wrong_panel": "That host already runs a different Brilliant panel's agent. Check the IP — applying here would overwrite and restart the wrong panel.",
       "host_key_changed": "The panel's SSH host key changed. For a fleet panel, verify the physical replacement and use Replace physical panel for an explicit identity rebind. For a legacy entry, remove and re-add the verified panel to re-pin it. If the change is unexpected, do not continue; check the address and network for impersonation.",
-      "invalid_cadence": "Enter a whole number of seconds within the documented range."
+      "invalid_cadence": "Enter a whole number of seconds within the documented range.",
+      "broker_host_not_panel_reachable": "Panels on the LAN cannot use this broker host. Home Assistant add-on names such as core-mosquitto, names ending in .local.hass.io, a0d7b954- names, localhost, and similar single-label add-on slugs work only inside Home Assistant. Enter the Home Assistant host's LAN IP address or a hostname the panels can resolve, then retry."
     },
     "abort": {
       "already_configured": "A Brilliant MQTT fleet is already configured.",
@@ -338,6 +339,13 @@
           "data": {
             "confirm_finalize": "I confirm permanent removal of this restored rollback baseline"
           }
+        },
+        "panel_discard_unactivated": {
+          "title": "Remove unactivated onboarding baseline",
+          "description": "Add Brilliant panel armed a rollback baseline for {panel} and then could not save the provisioning journal, so no panel entry was created and no candidate was staged. Host: {host}. Pinned SSH fingerprint: {fingerprint}. Transaction: {transaction}. Confirming checks that the panel still matches that capture and that this transaction's release directory is absent, then deletes only that capture and the Home Assistant baseline. It does not install a release. If the check fails, both records stay in place.",
+          "data": {
+            "confirm_discard": "I confirm removal of this unactivated rollback baseline"
+          }
         }
       },
       "progress": {
@@ -385,7 +393,7 @@
         "unsupported_discovery_prefix": "The Home Assistant MQTT discovery prefix is unsupported. Restore the `homeassistant` discovery prefix and retry. The panel installation was rolled back.",
         "invalid_broker_profile": "The fleet broker settings are invalid.",
         "panel_settings_invalid": "The staged panel MQTT settings are invalid. Review the fleet broker and TLS settings, then retry. The panel installation was rolled back.",
-        "broker_connect_failed": "The panel could not connect to the MQTT broker.",
+        "broker_connect_failed": "The panel could not connect to the MQTT broker at {broker_endpoint} ({connect_cause}). Use the Home Assistant host's LAN IP or a hostname the panel can resolve, then retry.",
         "broker_tls_verification_failed": "The panel could not verify the MQTT broker certificate.",
         "broker_timeout": "The MQTT broker did not respond to the panel in time.",
         "broker_authentication_failed": "The MQTT broker rejected the panel credentials.",
@@ -403,7 +411,8 @@
         "activation_failed": "The staged release could not be activated.",
         "health_subscribe_failed": "Home Assistant could not subscribe for panel health confirmation.",
         "health_failed": "The new panel release did not pass its health check and was rolled back.",
-        "journal_failed": "Home Assistant could not persist the provisioning safety journal.",
+        "journal_failed": "Home Assistant could not persist the provisioning safety journal.{storage_detail}",
+        "unactivated_baseline_not_proven": "Home Assistant did not remove the armed baseline because the panel no longer matches the capture, or a candidate release is present. Leave the baseline in place and attach redacted diagnostics. See docs/canary-rollback.md.{storage_detail}",
         "progress_failed": "Home Assistant could not update provisioning progress safely.",
         "commit_failed": "The installed panel could not be committed to durable Home Assistant storage.",
         "rollback_failed": "Automatic rollback did not finish. Follow the provisioning recovery instructions before retrying.",
@@ -495,7 +504,7 @@
           "mqtt_password": "Broker password"
         },
         "data_description": {
-          "mqtt_host": "Address reachable by Home Assistant and every Brilliant panel.",
+          "mqtt_host": "LAN IP address or hostname that every Brilliant panel can resolve. Do not use Home Assistant add-on names such as core-mosquitto, names ending in .local.hass.io, localhost, or a0d7b954- names.",
           "mqtt_port": "Usually 1883 without TLS or 8883 with TLS.",
           "mqtt_username": "Dedicated MQTT account used by the Brilliant fleet.",
           "mqtt_password": "Leave the masked value unchanged to keep the stored password, or enter a replacement password."
@@ -576,6 +585,16 @@
       "mesh_priorities": {
         "title": "Mesh priority rollout required",
         "description": "Mesh priority changes alter on-panel agent configuration and are available only through a journaled rollout. Direct mutation is intentionally blocked."
+      },
+      "broker_abort_idle_panel_flow": {
+        "title": "Abort idle Add panel flow",
+        "description": "An Add Brilliant panel flow for this fleet is still open, but it has not started provisioning. Closing the dialog does not remove it, so broker changes stay blocked. Abort that idle flow and save this broker change? A flow that has started provisioning is left alone. [Open troubleshooting]({documentation_url})",
+        "data": {
+          "confirm_abort_idle_panel_flow": "Abort the idle Add panel flow"
+        },
+        "data_description": {
+          "confirm_abort_idle_panel_flow": "Required before the idle Add panel flow is aborted and the broker change is saved."
+        }
       }
     },
     "progress": {
@@ -585,7 +604,7 @@
       "invalid_value": "Enter a valid value in the documented format.",
       "invalid_broker_profile": "The MQTT broker profile is invalid. Review every required field and the MQTT broker setup guide, then retry.",
       "broker_validation_failed": "MQTT validation failed unexpectedly. Check the broker connection, credentials, and Home Assistant MQTT status, then retry.",
-      "broker_connect_failed": "Home Assistant could not connect to the MQTT broker. Check the host, port, routing, DNS, and firewall rules, then retry.",
+      "broker_connect_failed": "Home Assistant could not connect to the MQTT broker at {broker_endpoint} ({connect_cause}). Check the host, port, DNS, routing, and firewall rules, then retry.",
       "panel_settings_invalid": "The staged panel MQTT settings are invalid. Review the broker host, TLS, and fleet settings before retrying.",
       "broker_tls_verification_failed": "The MQTT broker certificate could not be verified. Check its hostname, validity, trust chain, and optional public CA certificate before retrying.",
       "broker_timeout": "The MQTT broker did not respond in time. Check broker availability and network routing, then retry.",
@@ -602,18 +621,21 @@
       "discovery_write_timeout": "The MQTT discovery validation write timed out. Check broker routing, listener health, and ACL behavior, then retry.",
       "retained_message_invalid": "The broker did not preserve the validation message correctly. Check that retained messages are enabled and not rewritten, then retry.",
       "retained_message_timeout": "Retained-message validation timed out. Check broker persistence, routing, and ACL behavior, then retry.",
-      "cleanup_failed": "MQTT validation cleanup could not be confirmed. Check broker availability and ACLs before retrying."
+      "cleanup_failed": "MQTT validation cleanup could not be confirmed. Check broker availability and ACLs before retrying.",
+      "broker_host_not_panel_reachable": "Panels on the LAN cannot use this broker host. Home Assistant add-on names such as core-mosquitto, names ending in .local.hass.io, a0d7b954- names, localhost, and similar single-label add-on slugs work only inside Home Assistant. Enter the Home Assistant host's LAN IP address or a hostname the panels can resolve, then retry."
     },
     "abort": {
       "invalid_parent": "The Brilliant MQTT fleet is unavailable or no longer valid. Reload the integration and open its settings again.",
       "invalid_flow_state": "The settings flow lost its validated state. Open Brilliant MQTT settings and retry.",
       "parent_changed": "Fleet settings changed while this form was open. Nothing was saved; open the relevant settings page again.",
       "broker_change_requires_guided_flow": "Installed panels still depend on the current MQTT transport. Nothing was changed. Open the MQTT broker rollout guide before moving the fleet to a different host, port, credentials, or TLS profile.",
-      "broker_change_blocked_by_panel_onboarding": "A panel onboarding or recovery transaction is active or could not be read safely. Nothing was changed. Finish or recover Add Brilliant panel, then retry the broker update.",
       "reconfigure_successful": "The Brilliant MQTT fleet settings were updated successfully.",
       "ha_control_change_requires_agent_rollout": "Changing whether Home Assistant control is enabled also changes on-panel agent configuration. Nothing was changed. Check the guided agent rollout documentation.",
       "no_panels_configured": "Add at least one Brilliant panel before choosing a default scene panel.",
-      "mesh_priority_change_requires_agent_rollout": "Changing mesh priorities requires a journaled on-panel agent rollout. Nothing was changed. Check the advanced rollout documentation."
+      "mesh_priority_change_requires_agent_rollout": "Changing mesh priorities requires a journaled on-panel agent rollout. Nothing was changed. Check the advanced rollout documentation.",
+      "broker_change_blocked_by_active_journal": "A panel provisioning journal is still open. Nothing was changed. Finish or recover Add Brilliant panel, then retry the broker update.",
+      "broker_change_blocked_by_journal_read_error": "Home Assistant could not read the panel provisioning journal. Nothing was changed. Check storage health, then retry the broker update.",
+      "broker_change_blocked_by_add_panel_flow": "An Add panel flow has started provisioning or is not verifiably idle. Nothing was changed. Finish that flow, then retry the broker update. Do not change the broker while provisioning is in progress."
     }
   },
   "services": {
