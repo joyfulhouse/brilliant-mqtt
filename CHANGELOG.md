@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `brilliant_mqtt.migrate_to_fleet` action: consolidates legacy per-panel
+  entries into the singleton fleet entry with one panel subentry each, so a
+  legacy install can add new panels. It runs only when an operator calls it,
+  dry run is the default, and the response is secret-free. Panels are never
+  contacted. Every slug, mesh priority, entity ID, entity unique ID, and MQTT
+  device association is preserved. Conflicts block the whole plan and are
+  reported by field, code, and entry title, never silently fixed. Duplicate
+  positive mesh priorities are one example. A private journal makes the
+  migration restart-safe: before the commit point it reverses exactly; after
+  it, startup recovery finishes removing the sibling entries. See
+  [docs/ha-integration.md](docs/ha-integration.md#legacy_fleet_migration).
+- Repair issues: `legacy_migration_available` while legacy entries remain, and
+  `migration_recovery_failed` if an interrupted migration cannot be settled.
+
+### Fixed
+
+- A managed (canary) update journal now resolves its owner on a fleet panel
+  whose management ID is not its fingerprint (every migrated panel keeps its
+  legacy entry ID so entity unique IDs never change). Install handoffs still
+  require the fingerprint.
+
 ## [0.11.6] - 2026-11-05
 
 This is a Home Assistant integration release only. The bundled on-panel agent

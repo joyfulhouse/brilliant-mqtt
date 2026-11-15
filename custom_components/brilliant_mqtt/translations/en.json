@@ -670,6 +670,16 @@
           "description": "Stable mode ID from the selected panel's current catalog."
         }
       }
+    },
+    "migrate_to_fleet": {
+      "name": "Migrate legacy panels to the fleet",
+      "description": "Consolidate every legacy per-panel Brilliant entry into one fleet entry with one panel subentry each, preserving every entity, device, and MQTT identity. Panels are never contacted. Dry run (the default) only reports the plan or its conflicts.",
+      "fields": {
+        "dry_run": {
+          "name": "Dry run",
+          "description": "Only report the migration plan or the conflicts that block it; change nothing. Turn off to migrate."
+        }
+      }
     }
   },
   "entity": {
@@ -769,6 +779,14 @@
     "ha_mirror_retired": {
       "title": "Legacy Brilliant HA mirror disabled",
       "description": "Panel `{panel}` still has legacy HA mirror state. {reason}. The integration will keep retrying safe removal during panel management; legacy credentials are retained until absence is verified."
+    },
+    "legacy_migration_available": {
+      "title": "Brilliant legacy panels can be consolidated",
+      "description": "{count} legacy per-panel Brilliant entries can be consolidated into one fleet entry, which is required to add new panels. Run the `brilliant_mqtt.migrate_to_fleet` action with dry run enabled to review the plan and any conflicts, resolve them in each panel's Reconfigure dialog, then run it again with dry run disabled."
+    },
+    "migration_recovery_failed": {
+      "title": "Brilliant fleet migration needs attention",
+      "description": "An interrupted Brilliant legacy-to-fleet migration could not be settled automatically (`{code}`). The original configuration is kept in the private migration journal. Restart Home Assistant to retry recovery, or run the `brilliant_mqtt.migrate_to_fleet` action with dry run disabled to resume it."
     }
   }
 }

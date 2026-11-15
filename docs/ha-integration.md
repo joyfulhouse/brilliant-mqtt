@@ -288,6 +288,92 @@ panel over SSH.
   onboarding/recovery issue remains. The blocked attempt changed no identity,
   credential, or panel setting.
 
+<a id="legacy_fleet_migration"></a>
+## Migrating legacy panel entries into the fleet
+
+Installs that predate the fleet keep one config entry per panel. New panels can
+only be added through the singleton fleet entry, and fleet creation aborts with
+`legacy_migration_required` while any legacy entry exists. The
+`brilliant_mqtt.migrate_to_fleet` action consolidates every legacy entry into
+one fleet entry with one panel subentry each. While legacy entries remain, a
+**Brilliant legacy panels can be consolidated** repair issue points here.
+
+Migration is operator-triggered and config/registry-only. It **never contacts a
+panel**: no SSH, reinstall, restart, or env rewrite. Everything that identifies
+a panel stays byte-for-byte identical: the MQTT slug, the mesh priority, every
+entity ID and entity unique ID (each panel's `management_id` is its old entry
+ID), the MQTT-discovery device and its `mqtt` association, and disabled/hidden
+entity flags. The panel's host, root password, pinned SSH host key, components,
+cadences, Voice and Hue CA overrides move into its subentry. The broker profile
+and Home Assistant control/scene settings move to the fleet once.
+
+1. **Dry run** (the default changes nothing):
+
+   ```yaml
+   action: brilliant_mqtt.migrate_to_fleet
+   data:
+     dry_run: true
+   ```
+
+   Call it with a response, for example from **Developer tools → Actions**. An
+   `eligible` response lists the anchor entry (the smallest entry ID, which
+   becomes the fleet entry), each panel's planned subentry ID, fingerprint, and
+   mesh priority, and the fleet defaults. A `conflicts` response lists every
+   blocker with its field, code, and affected entry titles. Responses never
+   contain passwords, usernames, CA bodies, or host keys.
+2. Resolve every conflict (below), then dry-run again until it is `eligible`.
+3. **Migrate** with `dry_run: false`. A `migrated` response names the fleet
+   entry and the removed sibling entry IDs. Running it again returns
+   `already_migrated`.
+
+Repair timing defaults (`auto_repair`, `offline_grace_minutes`,
+`repair_cooldown_minutes`) become fleet defaults using the most common value.
+A panel whose old value differed keeps it as a per-panel override.
+`trust_host_key_changes` has no fleet equivalent. Runtime caches such as
+`last_firmware` and `ha_mirror_retire_verified` are not carried.
+
+### Migration conflict codes
+
+| Code | Meaning | Fix |
+|---|---|---|
+| `duplicate_mesh_priority` | Two panels share a positive mesh priority (`detail` is the value). The fleet requires unique positive priorities; `0` may repeat. | Open **Reconfigure → Advanced (mesh priority)** on all but one listed panel and choose an unused priority. That also pushes the priority to the panel. |
+| `global_mismatch` | A fleet-wide value differs between entries: a broker field (`mqtt_host`, `mqtt_port`, `mqtt_username`, `mqtt_password`, `mqtt_tls_enabled`, `mqtt_tls_ca`, `broker_kind`) or `ha_control_enabled`, `ha_control_label`, `room_overrides`, `ha_control_domains`, `max_mirrored_entities`, `scene_panel`, or `scene_actions`. The listed entries are the ones that differ from the majority. | Reconfigure the listed entries (**MQTT broker** or **Home Assistant control and scenes**) to the shared value. |
+| `trust_host_key_changes_enabled` | The legacy auto-repin option is on. Fleet panels never auto-repin. | Turn **Trust host-key changes** off in that entry's options. |
+| `missing_host_key` / `invalid_host_key` | No pinned SSH host key, or one the fleet cannot accept (only canonical `ssh-ed25519`/`ssh-rsa` lines). | Run one successful repair so the legacy entry pins the panel's key on first connect. |
+| `duplicate_fingerprint` / `duplicate_slug` | Two entries pin the same panel identity or use the same MQTT slug. | Remove the stale duplicate entry. |
+| `unknown_scene_panel` | The shared default scene panel is not one of the migrating panels. | Set **Default scene panel** to an existing slug. |
+| `invalid_panel_slug` | The slug is `mesh` or not a valid fleet slug (lowercase, up to 64 characters). | Remove that entry, migrate the others, then add the panel again through the fleet. |
+| `ha_mirror_retirement_pending` | Legacy HA-mirror state is still present, so its verified removal has not finished. | Let the retirement repair succeed first (see the `ha_mirror_retired` issue). |
+| `invalid_value` / `unsupported_legacy_field` / `unsupported_ssh_username` / `provisioning_marker_present` / `entry_disabled` / `unsupported_entry_version` / `fleet_entry_present` | The entry holds data the fleet cannot represent losslessly, or it is disabled. A fleet entry cannot be merged with legacy entries. | Correct or remove the listed entry. Re-enable disabled entries first. |
+
+The action also reports runtime blockers it checks itself:
+`provisioning_in_progress`, `retained_canary_present` (finalize or roll back the
+retained canary first), `config_flow_in_progress` (close open
+Reconfigure/options dialogs), `entry_not_recoverable` (restart Home Assistant),
+`foreign_registry_entity`, `mqtt_unavailable`, and `panel_operation_in_progress`
+(a repair or update holds the panel-operation lock for more than two minutes).
+
+### Interruption and recovery
+
+The migration is journaled in private Home Assistant storage
+(`.storage/brilliant_mqtt.migration`). It unloads every legacy runtime, converts
+the anchor, adds the subentries, retargets the integration's entity and device
+registry entries, then sets up and verifies the fleet runtime. It records the
+commit point only after the fleet entry is confirmed on disk, and removes the
+other legacy entries one at a time only after that point.
+
+- A failure before the commit point restores the exact original entries and
+  registry associations, reloads them, and returns `reverted` with a stable
+  error code.
+- If Home Assistant stops mid-migration, startup recovery runs before any
+  Brilliant entry loads. It reverses an uncommitted migration, or finishes
+  removing siblings after the commit point.
+- If recovery itself fails, the journal is kept and a **Brilliant fleet
+  migration needs attention** repair issue shows the code. Restart Home
+  Assistant, or run the action again with `dry_run: false` to resume. The
+  journal holds credentials and is deleted as soon as the migration completes
+  or is reversed.
+
 ## Entities
 
 Each panel's device gains nine management entities (three diagnostic, six
