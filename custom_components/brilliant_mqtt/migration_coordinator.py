@@ -88,6 +88,7 @@ DATA_QUIET_LOCK = "migration_quiet_lock"
 ISSUE_MIGRATION_AVAILABLE = "legacy_migration_available"
 ISSUE_MIGRATION_RECOVERY_FAILED = "migration_recovery_failed"
 ISSUE_MIGRATION_REVERTED_NOT_LOADED = "migration_reverted_not_loaded"
+ISSUE_QUIET_STATE_UNWRITABLE = "migration_quiet_state_unwritable"
 _DOCS_URL = "https://github.com/joyfulhouse/brilliant-mqtt/blob/main/docs/ha-integration.md"
 _PANEL_OPERATION_WAIT_SECONDS = 120.0
 # Values compared in constant time when proving an entry is unchanged.
@@ -189,11 +190,27 @@ def quiet_lock(hass: HomeAssistant) -> asyncio.Lock:
     return lock
 
 
+@callback
+def async_report_quiet_state_unwritable(hass: HomeAssistant) -> None:
+    """Make prolonged quiet-restoration (deferred HA-mirror audits) visible."""
+    ir.async_create_issue(
+        hass,
+        DOMAIN,
+        ISSUE_QUIET_STATE_UNWRITABLE,
+        is_fixable=False,
+        is_persistent=False,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key=ISSUE_QUIET_STATE_UNWRITABLE,
+        learn_more_url=_DOCS_URL,
+    )
+
+
 async def async_load_quiet_obligations(hass: HomeAssistant) -> None:
     """Re-establish durable quiet-restoration markers at startup (fail closed)."""
     outstanding = await QuietRestorations(hass).async_load()
     fence = migration_fence(hass)
     if outstanding is None:
+        async_report_quiet_state_unwritable(hass)
         fence.quiet.update(entry.entry_id for entry in hass.config_entries.async_entries(DOMAIN))
         return
     fence.quiet.update(outstanding)
@@ -223,7 +240,9 @@ async def async_quiet_setup_succeeded(hass: HomeAssistant, entry_id: str) -> Non
         except MigrationJournalError as error:
             # Kept durable: the next setup is quiet again, never a panel contact.
             _LOGGER.warning("Quiet-restoration obligation not retired (%s)", error.code)
+            async_report_quiet_state_unwritable(hass)
             return
+    ir.async_delete_issue(hass, DOMAIN, ISSUE_QUIET_STATE_UNWRITABLE)
     fence.quiet.discard(entry_id)
 
 
@@ -1129,6 +1148,10 @@ class MigrationCoordinator:
             if record.phase is not MigrationPhase.REVERSING:
                 record = record.advanced(MigrationPhase.REVERSING, last_error=error)
             record = await self._try_save(record)
+        # Each restored entry's next successful setup must be quiet (no panel
+        # contact). The obligation is made durable FIRST, before any entry or
+        # registry is touched; if it cannot be, recovery stays unresolved.
+        await self._async_require_quiet_obligation(self._restorable(record))
         await self._async_quiesce(
             entry_id
             for entry_id in record.candidates
@@ -1154,19 +1177,8 @@ class MigrationCoordinator:
             )
         if not self._reverted_target_reached(record):
             raise MigrationError("reverse_incomplete")
-        # Each restored entry's next successful setup is quiet (no panel contact).
-        # The obligation is made durable before ``complete`` (and before anything
-        # can set the entries up); if it cannot be, the journal stays reversible
-        # so the next startup re-establishes it.
-        restored = frozenset(
-            entry_id
-            for entry_id in record.candidates
-            if self.hass.config_entries.async_get_entry(entry_id) is not None
-        )
-        self._fence.quiet.update(restored)
-        durable_quiet = await self._async_add_quiet_obligation(restored)
         await self._point("complete")
-        if record.phase is not MigrationPhase.COMPLETE and durable_quiet:
+        if record.phase is not MigrationPhase.COMPLETE:
             await self._try_save(record.advanced(MigrationPhase.COMPLETE, outcome=OUTCOME_REVERTED))
         self._fence.deactivate()
         ir.async_delete_issue(self.hass, DOMAIN, ISSUE_MIGRATION_RECOVERY_FAILED)
@@ -1274,16 +1286,25 @@ class MigrationCoordinator:
                     return False
         return True
 
-    async def _async_add_quiet_obligation(self, entry_ids: frozenset[str]) -> bool:
+    def _restorable(self, record: MigrationRecord) -> frozenset[str]:
+        return frozenset(
+            entry_id
+            for entry_id in record.candidates
+            if self.hass.config_entries.async_get_entry(entry_id) is not None
+        )
+
+    async def _async_require_quiet_obligation(self, entry_ids: frozenset[str]) -> None:
+        """Durably record that ``entry_ids`` must set up quietly, or fail closed."""
         async with quiet_lock(self.hass):
             store = QuietRestorations(self.hass)
             current = await store.async_load()
             try:
                 await store.async_store((current or frozenset()) | entry_ids)
-            except MigrationJournalError as error:
-                _LOGGER.warning("Quiet-restoration obligation not durable (%s)", error.code)
-                return False
-        return True
+            except MigrationJournalError:
+                async_report_quiet_state_unwritable(self.hass)
+                raise MigrationError("quiet_marker_unproven") from None
+        ir.async_delete_issue(self.hass, DOMAIN, ISSUE_QUIET_STATE_UNWRITABLE)
+        self._fence.quiet.update(entry_ids)
 
     # --------------------------------------------------------------- recovery
 
@@ -1302,7 +1323,12 @@ class MigrationCoordinator:
                 )
                 if reached:
                     # The state Home Assistant just loaded from disk is the
-                    # target, so the terminal state is durable: forget it.
+                    # target, so the terminal state is durable: forget it. A
+                    # reversal's restored entries must first be durably quiet
+                    # again (a prior obligation may already have been consumed by
+                    # a setup whose stores never reached disk).
+                    if not migrated:
+                        await self._async_require_quiet_obligation(self._restorable(record))
                     await self._async_try_remove_journal()
                     self._fence.deactivate()
                     return {"status": "confirmed", "outcome": record.outcome}

@@ -406,9 +406,12 @@ While a migration runs or awaits recovery:
   is stored durably (`.storage/brilliant_mqtt.migration_quiet`) before anything
   can set them up, and each entry leaves it only after a quiet setup succeeds.
   The one-time legacy HA-mirror retirement audit is skipped until then and runs
-  again at the next ordinary restart. Stored data is not changed. An unreadable
-  obligation file fails closed: every Brilliant entry starts quietly until it is
-  rewritten.
+  again at the next ordinary restart. Stored data is not changed. Recovery
+  writes this obligation before it restores anything, and before it confirms
+  a finished reversal. If the write fails, recovery stays unresolved (fence up,
+  journal kept). An unreadable or unwritable obligation file fails closed:
+  every Brilliant entry starts quietly. A **Brilliant restored panels stay in
+  quiet mode** issue keeps the deferral visible.
 - An unreadable or corrupt journal fails closed. Nothing starts until the file
   is repaired or removed.
 - Home Assistant 2026.10 gave every device a single owning config entry. It

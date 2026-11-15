@@ -794,6 +794,10 @@
     "migration_reverted_not_loaded": {
       "title": "Brilliant legacy panels restored but not running",
       "description": "A Brilliant legacy-to-fleet migration was reversed and the original configuration restored, but {count} legacy panel entries did not start again. Check the MQTT connection and each entry's state, then reload them or restart Home Assistant."
+    },
+    "migration_quiet_state_unwritable": {
+      "title": "Brilliant restored panels stay in quiet mode",
+      "description": "Home Assistant cannot read or update `.storage/brilliant_mqtt.migration_quiet`, which records Brilliant legacy entries restored by a migration that must start without contacting their panel. Until it can, those entries keep starting quietly and their one-time legacy HA-mirror retirement audit stays deferred. Check the storage directory's permissions and free space, then restart Home Assistant."
     }
   }
 }

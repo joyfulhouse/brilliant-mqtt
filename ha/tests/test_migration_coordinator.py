@@ -159,6 +159,10 @@ async def _flush_disk(hass: HomeAssistant) -> None:
     await device_registry._store.async_save(device_registry._data_to_save())
 
 
+# Faults target the journal file only (not the quiet-obligation file).
+_JOURNAL_FILE = "/brilliant_mqtt.migration"
+
+
 class JournalFaults:
     """Make the journal's own file writes or reads fail on demand."""
 
@@ -174,12 +178,12 @@ def journal_faults() -> Iterator[JournalFaults]:
     read = migration_journal._read_file
 
     def failing_write(path: str, content: str) -> None:
-        if faults.write_fails:
+        if faults.write_fails and path.endswith(_JOURNAL_FILE):
             raise OSError("injected journal write failure")
         write(path, content)
 
     def failing_read(path: str) -> object:
-        if faults.read_fails:
+        if faults.read_fails and path.endswith(_JOURNAL_FILE):
             raise MigrationJournalError("journal_unreadable")
         return read(path)
 
@@ -1939,7 +1943,7 @@ def decode_faults() -> Iterator[DecodeFaults]:
 
     def fake_open(path: str, *args: Any, **kwargs: Any) -> Any:
         handle = real_open(path, *args, **kwargs)
-        if "migration" in str(path) and "r" in str(kwargs.get("mode", "r")):
+        if str(path).endswith(_JOURNAL_FILE) and "r" in str(kwargs.get("mode", "r")):
             return Handle(handle)
         return handle
 
@@ -2168,3 +2172,179 @@ async def test_production_split_devices_move_only_the_management_twin(
         }
     await _assert_migrated(hass, before, hass_storage, office_cadences=False)
     await _unload_all(hass)
+
+
+# ------------------------------------------------- round 4: replayed reversal / cancel
+
+
+async def _consumed_reversal_over_converted_disk(
+    hass: HomeAssistant,
+) -> tuple[State, str]:
+    """Reversal done and its quiet setups consumed, while the lazy stores on disk
+    still hold the converted state; returns (originals, the complete journal)."""
+    before = _state(hass)
+
+    async def checkpoint(name: str) -> None:
+        if name == "verify_fleet":
+            await _flush_disk(hass)  # The converted state reached disk...
+            raise InjectedFailure  # ...then the migration reverses in memory.
+
+    assert (await _run(hass, dry_run=False, checkpoint=checkpoint))["status"] == "reverted"
+    await hass.async_block_till_done()
+    record = await _journal(hass)
+    assert record is not None and record.outcome == "reverted"
+    assert not migration_fence(hass).quiet  # Quiet setups succeeded and were consumed.
+    return before, _read_journal_text(hass)
+
+
+@pytest.fixture
+def quiet_write_failures() -> Iterator[list[bool]]:
+    from custom_components.brilliant_mqtt.migration_journal import QuietRestorations
+
+    failing = [False]
+    original = QuietRestorations.async_store
+
+    async def store(self: QuietRestorations, entry_ids: frozenset[str]) -> None:
+        if failing[0]:
+            raise MigrationJournalError("quiet_marker_unproven")
+        await original(self, entry_ids)
+
+    with patch.object(QuietRestorations, "async_store", store):
+        yield failing
+
+
+async def test_replayed_reversal_establishes_quiet_obligation_before_restoring(
+    hass: HomeAssistant,
+    legacy_fleet: list[MockConfigEntry],
+    hass_storage: dict[str, Any],
+    no_panel_contact: AsyncMock,
+    quiet_write_failures: list[bool],
+) -> None:
+    del legacy_fleet
+    before, _journal_text = await _consumed_reversal_over_converted_disk(hass)
+    audits = no_panel_contact.await_count
+
+    # Restart: the reversal is replayed, but the obligation cannot be written.
+    quiet_write_failures[0] = True
+    await _restart_from_disk(hass, hass_storage, copy.deepcopy(hass_storage))
+    assert _fleet_managers(hass) == []
+    assert migration_fence(hass).active is True
+    assert _journal_exists(hass)
+    issues = ir.async_get(hass)
+    assert issues.async_get_issue(DOMAIN, "migration_quiet_state_unwritable") is not None
+    # The restored stores reach disk, then HA crashes before any quiet setup.
+    await _flush_disk(hass)
+    quiet_write_failures[0] = False
+
+    await _restart_from_disk(hass, hass_storage, copy.deepcopy(hass_storage))
+    assert no_panel_contact.await_count == audits
+    assert ir.async_get(hass).async_get_issue(DOMAIN, "migration_quiet_state_unwritable") is None
+    await _settle(hass, hass_storage)
+    _check_originals(hass, before)
+    assert _disk_state(hass_storage) == before
+
+
+@pytest.mark.parametrize(
+    "new_stores",
+    [
+        frozenset(combo)
+        for size in range(len(_STORES) + 1)
+        for combo in itertools.combinations(_STORES, size)
+    ],
+    ids=lambda stores: "+".join(sorted(key.split(".")[1] for key in stores)) or "none",
+)
+async def test_complete_reversal_with_unwritable_quiet_state_never_confirms(
+    hass: HomeAssistant,
+    legacy_fleet: list[MockConfigEntry],
+    hass_storage: dict[str, Any],
+    no_panel_contact: AsyncMock,
+    quiet_write_failures: list[bool],
+    new_stores: frozenset[str],
+) -> None:
+    del legacy_fleet
+    old_disk = copy.deepcopy(hass_storage)
+    before, journal_text = await _consumed_reversal_over_converted_disk(hass)
+    converted = copy.deepcopy(hass_storage)
+    mixed = copy.deepcopy(old_disk)
+    for key in new_stores:
+        mixed[key] = copy.deepcopy(converted[key])
+    audits = no_panel_contact.await_count
+
+    quiet_write_failures[0] = True
+    await _restart_from_disk(hass, hass_storage, mixed)
+    assert _fleet_managers(hass) == []
+    assert migration_fence(hass).active is True
+    assert _read_journal_text(hass) == journal_text  # No confirmation shortcut.
+    assert ir.async_get(hass).async_get_issue(DOMAIN, ISSUE_MIGRATION_RECOVERY_FAILED)
+
+    quiet_write_failures[0] = False
+    await _restart_from_disk(hass, hass_storage, mixed)
+    assert no_panel_contact.await_count == audits
+    await _settle(hass, hass_storage)
+    _check_originals(hass, before)
+
+
+async def test_quiet_finalization_cancelled_keeps_obligation_and_one_manager(
+    hass: HomeAssistant,
+    legacy_fleet: list[MockConfigEntry],
+    hass_storage: dict[str, Any],
+    no_panel_contact: AsyncMock,
+) -> None:
+    """Retiring the obligation can never orphan a manager or lose the obligation."""
+    from custom_components.brilliant_mqtt.migration_journal import QuietRestorations
+
+    del legacy_fleet, hass_storage
+    await _unload_all(hass)
+    await QuietRestorations(hass).async_store(frozenset({OFFICE_ID}))
+    migration_fence(hass).quiet.add(OFFICE_ID)
+    audits = no_panel_contact.await_count
+    started = asyncio.Event()
+    blocked_tasks: list[asyncio.Task[Any]] = []
+    created: list[FleetManager] = []
+    original_store = QuietRestorations.async_store
+    original_setup = FleetManager.async_setup
+
+    async def blocked(self: QuietRestorations, entry_ids: frozenset[str]) -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        blocked_tasks.append(task)
+        started.set()
+        await asyncio.Event().wait()
+
+    async def tracked_setup(self: FleetManager) -> None:
+        created.append(self)
+        await original_setup(self)
+
+    def live() -> list[FleetManager]:
+        return [m for m in created if m.panels and not m._shutting_down]
+
+    with (
+        patch.object(QuietRestorations, "async_store", blocked),
+        patch.object(FleetManager, "async_setup", tracked_setup),
+    ):
+        setup = asyncio.ensure_future(hass.config_entries.async_setup(OFFICE_ID))
+        await started.wait()
+        for task in blocked_tasks:
+            task.cancel()  # Real cancellation of whatever runs the finalization.
+        await asyncio.gather(*blocked_tasks, return_exceptions=True)
+        await asyncio.gather(setup, return_exceptions=True)
+        await hass.async_block_till_done()
+
+        office = hass.config_entries.async_get_known_entry(OFFICE_ID)
+        # Either the setup completed (one live manager) or it was fully cleaned up.
+        if office.state is ConfigEntryState.LOADED:
+            assert live() == [office.runtime_data]
+        else:
+            assert live() == []
+        assert await QuietRestorations(hass).async_load() == frozenset({OFFICE_ID})
+        assert migration_fence(hass).is_quiet(OFFICE_ID)
+
+        with patch.object(QuietRestorations, "async_store", original_store):
+            if office.state is not ConfigEntryState.NOT_LOADED:
+                await hass.config_entries.async_unload(OFFICE_ID)
+            assert await hass.config_entries.async_setup(OFFICE_ID)
+            await hass.async_block_till_done()
+        assert live() == [office.runtime_data]
+    assert set(office.runtime_data.panels) == {OFFICE_ID}
+    assert no_panel_contact.await_count == audits
+    assert await QuietRestorations(hass).async_load() == frozenset()

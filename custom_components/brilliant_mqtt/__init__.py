@@ -435,8 +435,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: BrilliantMqttConfigEntry
             )
         raise
     # A migration-restoration setup stays quiet across failed attempts, HA's
-    # automatic retries, and restarts; only a successful setup retires it.
-    await async_quiet_setup_succeeded(hass, entry.entry_id)
+    # automatic retries, and restarts; only a successful setup retires it. The
+    # retirement runs after setup has returned, so neither its I/O nor a
+    # cancellation can fail this setup or orphan the manager; if it never runs,
+    # the obligation simply stays and the next setup is quiet again.
+    if fence.is_quiet(entry.entry_id):
+        hass.async_create_task(
+            async_quiet_setup_succeeded(hass, entry.entry_id),
+            f"brilliant-mqtt-quiet-retire-{entry.entry_id}",
+            eager_start=False,
+        )
     async_clear_reverted_issue(hass, entry.entry_id)
     return True
 
