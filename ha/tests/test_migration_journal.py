@@ -275,3 +275,32 @@ async def test_writes_are_refused_while_home_assistant_stops(hass: HomeAssistant
             await MigrationJournal(hass).async_save(_record())
     finally:
         hass.set_state(CoreState.running)
+
+
+async def test_quiet_obligations_are_durable_proven_and_fail_closed(hass: HomeAssistant) -> None:
+    from custom_components.brilliant_mqtt.migration_journal import QuietRestorations
+
+    store = QuietRestorations(hass)
+    assert await store.async_load() == frozenset()
+    await store.async_store(frozenset({"a", "b"}))
+    assert await QuietRestorations(hass).async_load() == frozenset({"a", "b"})
+    await store.async_store(frozenset())
+    assert await store.async_load() == frozenset()
+
+    path = Path(hass.config.path(".storage", "brilliant_mqtt.migration_quiet"))
+    for content in ("{", '{"key": "brilliant_mqtt.migration_quiet", "data": {"entry_ids": [1]}}'):
+        _write(path, content)
+        assert await QuietRestorations(hass).async_load() is None
+
+
+async def test_journal_decode_errors_are_unreadable_not_crashes(hass: HomeAssistant) -> None:
+    path = Path(MigrationJournal(hass).path)
+    await hass.async_add_executor_job(_write_bytes, path, b"\xff\xfe\x00garbage")
+
+    with pytest.raises(MigrationJournalError, match="journal_unreadable"):
+        await MigrationJournal(hass).async_load()
+
+
+def _write_bytes(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)

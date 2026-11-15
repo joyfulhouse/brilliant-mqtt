@@ -402,14 +402,32 @@ While a migration runs or awaits recovery:
   stays up. Restart Home Assistant, or run the action again with
   `dry_run: false` to resume. A dry run never changes the fence or any issue.
 - Restored legacy entries start without contacting their panel, including on
-  Home Assistant's automatic setup retries. The one-time legacy HA-mirror
-  retirement audit is skipped until such a setup succeeds; it runs again at the
-  next ordinary restart. Stored data is not changed.
+  Home Assistant's automatic setup retries and after a restart. The obligation
+  is stored durably (`.storage/brilliant_mqtt.migration_quiet`) before anything
+  can set them up, and each entry leaves it only after a quiet setup succeeds.
+  The one-time legacy HA-mirror retirement audit is skipped until then and runs
+  again at the next ordinary restart. Stored data is not changed. An unreadable
+  obligation file fails closed: every Brilliant entry starts quietly until it is
+  rewritten.
 - An unreadable or corrupt journal fails closed. Nothing starts until the file
   is repaired or removed.
-- Home Assistant 2026.10 gave every device a single owning config entry. The
-  migration handles both registry models: it moves each legacy panel's device
-  to the fleet panel. A separate MQTT device is untouched.
+- Home Assistant 2026.10 gave every device a single owning config entry. It
+  split each shared panel device into two twins with the same identifier
+  (`mqtt`, `brilliant_panel_<slug>`): one owned by the MQTT entry (MQTT
+  entities), one owned by the legacy entry (management entities). Both recorded
+  the legacy entry as `composite_primary_config_entry`. The migration supports
+  both registry models.
+  - The management twin moves to the fleet panel's subentry. Its ID, entities,
+    and customizations are unchanged. HA had already cleared its
+    `has_composite_identifiers` when the management entities re-registered.
+  - The MQTT twin keeps its owner, its entities, and its
+    `has_composite_identifiers`.
+  - When a sibling legacy entry is removed, HA clears
+    `composite_primary_config_entry` on both of that panel's twins. The anchor
+    panel's twins keep pointing at the anchor, which is now the fleet entry.
+  - Home Assistant 2026.10+ refuses to move a device that has child devices.
+    The migration reports `device_has_child_devices` as a blocker before
+    changing anything.
 
 ## Entities
 

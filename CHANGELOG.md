@@ -25,9 +25,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   written stores or private storage APIs. A setup fence and blocked
   reconfigure/options flows keep legacy and fleet runtimes from ever starting
   side by side, or being edited, while a migration is unresolved. Every planned
-  panel's runtime must start before the commit. Both the pre-2026.10 shared
-  device registry and the 2026.10+ single-owner device registry are supported.
-  See
+  panel's runtime must start before the commit. Restored legacy entries start
+  without contacting their panel until a quiet setup succeeds, even across
+  crashes and restarts, via a durable obligation file. Both the pre-2026.10
+  shared device registry and the 2026.10+ split (single-owner) device registry
+  are supported. A management device with child devices is reported as a
+  blocker. See
   [docs/ha-integration.md](docs/ha-integration.md#legacy_fleet_migration).
 - Repair issues: `legacy_migration_available` while legacy entries remain,
   `migration_recovery_failed` if an interrupted migration cannot be settled, and

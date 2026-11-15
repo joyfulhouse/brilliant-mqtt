@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import itertools
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from datetime import datetime, timedelta
@@ -1851,3 +1852,319 @@ async def test_leftover_reversible_journal_never_undoes_a_later_anchor_edit(
     expected = copy.deepcopy(before)
     expected["entries"][ANCHOR_ID]["options"]["auto_repair"] = False
     await _assert_originals(hass, expected, hass_storage)
+
+
+# --------------------------------------------------------- round 3: quiet obligation
+
+
+async def test_quiet_restoration_survives_crash_after_reversal_completes(
+    hass: HomeAssistant,
+    legacy_fleet: list[MockConfigEntry],
+    hass_storage: dict[str, Any],
+    no_panel_contact: AsyncMock,
+) -> None:
+    """Crash after the reverted ``complete`` lands, then again before the quiet setup."""
+    del legacy_fleet
+    before = _state(hass)
+    audits = no_panel_contact.await_count
+
+    async def checkpoint(name: str) -> None:
+        if name == "verify_fleet":
+            raise InjectedFailure
+        if name == "after_save:complete":
+            raise SimulatedCrash
+
+    with pytest.raises(SimulatedCrash):
+        await _run(hass, dry_run=False, checkpoint=checkpoint)
+    record = await _journal(hass)
+    assert record is not None and record.outcome == "reverted"
+    await _flush_disk(hass)  # The originals reached disk before the crash.
+
+    # Restart 1: target already present -> journal confirmed, but Office's quiet
+    # setup fails (broker down) and HA crashes before any retry.
+    original_setup = FleetManager.async_setup
+
+    async def office_down(self: FleetManager) -> None:
+        if self.entry.entry_id == OFFICE_ID:
+            raise ConfigEntryNotReady("broker down")
+        await original_setup(self)
+
+    with patch.object(FleetManager, "async_setup", office_down):
+        await _restart_from_disk(hass, hass_storage, copy.deepcopy(hass_storage))
+    assert not _journal_exists(hass)
+    assert no_panel_contact.await_count == audits
+
+    # Restart 2: the outstanding obligation is still durable; Office starts quietly.
+    await _clean_restart(hass, hass_storage)
+    assert hass.config_entries.async_get_known_entry(OFFICE_ID).state is ConfigEntryState.LOADED
+    assert no_panel_contact.await_count == audits
+    _check_originals(hass, before)
+
+    # The obligation is consumed: an ordinary restart audits again as before.
+    await _clean_restart(hass, hass_storage)
+    assert no_panel_contact.await_count == audits + 1
+
+
+# --------------------------------------------------------- round 3: decode failures
+
+
+class DecodeFaults:
+    """Make the journal's real ``_read_file`` hit UnicodeDecodeError on read()."""
+
+    def __init__(self) -> None:
+        self.remaining = 0
+        self.persistent = False
+
+
+@pytest.fixture
+def decode_faults() -> Iterator[DecodeFaults]:
+    faults = DecodeFaults()
+    real_open = open
+
+    class Handle:
+        def __init__(self, handle: Any) -> None:
+            self._handle = handle
+
+        def __enter__(self) -> Handle:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            self._handle.close()
+
+        def read(self) -> str:
+            if faults.persistent or faults.remaining > 0:
+                faults.remaining = max(0, faults.remaining - 1)
+                raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+            return str(self._handle.read())
+
+    def fake_open(path: str, *args: Any, **kwargs: Any) -> Any:
+        handle = real_open(path, *args, **kwargs)
+        if "migration" in str(path) and "r" in str(kwargs.get("mode", "r")):
+            return Handle(handle)
+        return handle
+
+    with patch.object(migration_journal, "open", fake_open, create=True):
+        yield faults
+
+
+_ALL_SAVE_PHASES = (
+    "planned",
+    "quiesced",
+    "anchor_converted",
+    "registries_retargeted",
+    "fleet_verified",
+    "siblings_removing",
+    "complete",
+)
+
+
+@pytest.mark.parametrize("phase", _ALL_SAVE_PHASES)
+async def test_transient_decode_failure_on_verify_read_is_settled_by_reread(
+    hass: HomeAssistant,
+    legacy_fleet: list[MockConfigEntry],
+    hass_storage: dict[str, Any],
+    decode_faults: DecodeFaults,
+    phase: str,
+) -> None:
+    """One decode failure: the re-read proves the write landed; migration continues."""
+    del legacy_fleet
+    before = _state(hass)
+
+    async def checkpoint(name: str) -> None:
+        if name == f"before_save:{phase}":
+            decode_faults.remaining = 1
+
+    outcome = await _run(hass, dry_run=False, checkpoint=checkpoint)
+    await hass.async_block_till_done()
+
+    assert outcome["status"] == "migrated", outcome
+    await _assert_migrated(hass, before, hass_storage)
+
+
+@pytest.mark.parametrize("phase", _ALL_SAVE_PHASES)
+async def test_persistent_decode_failure_never_overwrites_a_commit(
+    hass: HomeAssistant,
+    legacy_fleet: list[MockConfigEntry],
+    hass_storage: dict[str, Any],
+    decode_faults: DecodeFaults,
+    phase: str,
+) -> None:
+    del legacy_fleet
+    before = _state(hass)
+
+    async def checkpoint(name: str) -> None:
+        if name == f"before_save:{phase}":
+            decode_faults.persistent = True
+
+    outcome = await _run(hass, dry_run=False, checkpoint=checkpoint)
+    await hass.async_block_till_done()
+    decode_faults.persistent = False
+
+    record = await _journal(hass)
+    if phase in _PRECOMMIT_PHASES:
+        assert outcome["status"] == "reverted", outcome
+        assert record is None or not record.outcome == "migrated"
+        await _restart_from_disk(hass, hass_storage, copy.deepcopy(hass_storage))
+        await _assert_originals(hass, before, hass_storage)
+        return
+    if phase == "fleet_verified":
+        assert outcome["status"] == "ambiguous", outcome
+        assert record is not None and record.phase is MigrationPhase.FLEET_VERIFIED
+        assert migration_fence(hass).active is True
+    else:
+        assert outcome["status"] == "migrated", outcome
+        assert record is not None and record.phase in {
+            MigrationPhase.SIBLINGS_REMOVING,
+            MigrationPhase.COMPLETE,
+        }
+    await _restart_from_disk(hass, hass_storage, copy.deepcopy(hass_storage))
+    await _assert_migrated(hass, before, hass_storage)
+
+
+async def test_management_device_with_child_devices_is_a_dry_run_blocker(
+    hass: HomeAssistant,
+    legacy_fleet: list[MockConfigEntry],
+) -> None:
+    """HA 2026.10+ cannot move a parent device; report it before any mutation."""
+    del legacy_fleet
+    registry = dr.async_get(hass)
+    office_device = next(iter(dr.async_entries_for_config_entry(registry, OFFICE_ID)))
+
+    def children(_registry: dr.DeviceRegistry, device_id: str) -> list[object]:
+        return [object()] if device_id == office_device.id else []
+
+    with patch.object(dr, "async_entries_for_parent_device", children, create=True):
+        outcome = await _run(hass, dry_run=True)
+
+    assert outcome["status"] == "conflicts"
+    assert outcome["conflicts"] == [
+        {
+            "code": "device_has_child_devices",
+            "field": "device_registry",
+            "entries": [{"entry_id": OFFICE_ID, "title": "Brilliant office"}],
+        }
+    ]
+
+
+_STORES = ("core.config_entries", "core.entity_registry", "core.device_registry")
+
+
+@pytest.mark.parametrize("journal_phase", ("registries_retargeted", "fleet_verified"))
+@pytest.mark.parametrize(
+    "new_stores",
+    [
+        frozenset(combo)
+        for size in range(len(_STORES) + 1)
+        for combo in itertools.combinations(_STORES, size)
+    ],
+    ids=lambda stores: "+".join(sorted(key.split(".")[1] for key in stores)) or "none",
+)
+async def test_mixed_persistence_at_startup_converges_on_the_journal(
+    hass: HomeAssistant,
+    legacy_fleet: list[MockConfigEntry],
+    hass_storage: dict[str, Any],
+    journal_phase: str,
+    new_stores: frozenset[str],
+) -> None:
+    """Config entries and both registries each independently old or new on disk."""
+    del legacy_fleet
+    before = _state(hass)
+    old_disk = copy.deepcopy(hass_storage)
+    with pytest.raises(SimulatedCrash):
+        await _run(
+            hass, dry_run=False, checkpoint=_inject(f"after_save:{journal_phase}", SimulatedCrash())
+        )
+    await _flush_disk(hass)
+    new_disk = copy.deepcopy(hass_storage)
+    mixed = copy.deepcopy(old_disk)
+    for key in new_stores:
+        mixed[key] = copy.deepcopy(new_disk[key])
+
+    await _restart_from_disk(hass, hass_storage, mixed)
+
+    if journal_phase == "fleet_verified":
+        await _assert_migrated(hass, before, hass_storage)
+    else:
+        await _assert_originals(hass, before, hass_storage)
+
+
+@pytest.mark.skipif(
+    not SINGLE_OWNER_DEVICES, reason="split (single-owner) device registry is HA 2026.10+"
+)
+async def test_production_split_devices_move_only_the_management_twin(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    payload_dir: Path,
+    hass_storage: dict[str, Any],
+) -> None:
+    """A real HA 2026.6 disk (shared devices) migrated by HA to split twins.
+
+    Production shape after HA's own device-registry migration: per panel two
+    devices with identifiers [["mqtt", "brilliant_panel_<slug>"]], one owned by
+    the MQTT entry (MQTT entities), one by the legacy entry (management
+    entities), both with composite_primary_config_entry = legacy entry ID.
+    """
+    del mqtt_mock, payload_dir
+    mqtt_id = hass.config_entries.async_entries("mqtt")[0].entry_id
+    fixture = Path(__file__).with_name("fixtures") / "legacy_fleet_ha_2026_6_disk.json"
+    disk = {
+        **copy.deepcopy(hass_storage),
+        **json.loads(await hass.async_add_executor_job(fixture.read_text)),
+    }
+    disk = json.loads(json.dumps(disk).replace("MQTT_ENTRY_ID", mqtt_id))
+    await _restart_from_disk(hass, hass_storage, disk)
+    registry = dr.async_get(hass)
+    entities = er.async_get(hass)
+
+    def twins(slug: str) -> tuple[dr.DeviceEntry, dr.DeviceEntry]:
+        matching = [
+            device
+            for device in _all_devices(registry)
+            if device.identifiers == {("mqtt", f"brilliant_panel_{slug}")}
+        ]
+        assert len(matching) == 2
+        mqtt_twin = next(d for d in matching if getattr(d, "config_entry_id", None) == mqtt_id)
+        management = next(d for d in matching if d is not mqtt_twin)
+        return mqtt_twin, management
+
+    shape: dict[str, tuple[str, str]] = {}
+    for entry_id, slug in PANELS.items():
+        mqtt_twin, management = twins(slug)
+        assert getattr(management, "config_entry_id", None) == entry_id
+        assert getattr(mqtt_twin, "config_subentry_id", "x") is None
+        for device in (mqtt_twin, management):
+            assert getattr(device, "composite_primary_config_entry", None) == entry_id
+        assert getattr(mqtt_twin, "has_composite_identifiers", None) is True
+        # Management-entity setup re-registers the device and clears the flag.
+        assert getattr(management, "has_composite_identifiers", None) is False
+        owned = er.async_entries_for_device(entities, management.id, True)
+        assert len(owned) >= 9 and {e.config_entry_id for e in owned} == {entry_id}
+        assert {e.config_entry_id for e in er.async_entries_for_device(entities, mqtt_twin.id)} == {
+            mqtt_id
+        }
+        shape[entry_id] = (mqtt_twin.id, management.id)
+    before = _state(hass)
+
+    outcome = await _run(hass, dry_run=False)
+    await hass.async_block_till_done()
+
+    assert outcome["status"] == "migrated"
+    for entry_id, slug in PANELS.items():
+        mqtt_twin, management = twins(slug)
+        assert (mqtt_twin.id, management.id) == shape[entry_id]
+        assert getattr(management, "config_entry_id", None) == ANCHOR_ID
+        assert getattr(management, "config_subentry_id", None) == planned_subentry_id(entry_id)
+        assert getattr(mqtt_twin, "config_entry_id", None) == mqtt_id
+        assert getattr(mqtt_twin, "config_subentry_id", "x") is None
+        assert getattr(mqtt_twin, "has_composite_identifiers", None) is True
+        assert getattr(management, "has_composite_identifiers", None) is False
+        # Removing a sibling entry clears the twins' reference to it; the anchor's
+        # twins keep pointing at the anchor (now the fleet entry).
+        expected_primary = ANCHOR_ID if entry_id == ANCHOR_ID else None
+        for device in (mqtt_twin, management):
+            assert getattr(device, "composite_primary_config_entry", "x") == expected_primary
+        assert {e.config_entry_id for e in er.async_entries_for_device(entities, mqtt_twin.id)} == {
+            mqtt_id
+        }
+    await _assert_migrated(hass, before, hass_storage, office_cadences=False)
+    await _unload_all(hass)

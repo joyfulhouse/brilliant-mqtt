@@ -75,6 +75,8 @@ from .migration_coordinator import (
     ISSUE_MIGRATION_AVAILABLE,
     MigrationCoordinator,
     async_clear_reverted_issue,
+    async_load_quiet_obligations,
+    async_quiet_setup_succeeded,
     async_report_recovery_failure,
     async_update_migration_issue,
     migration_fence,
@@ -393,6 +395,9 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     except Exception as error:
         _LOGGER.error("Legacy fleet migration recovery failed (%s)", type(error).__name__)
         async_report_recovery_failure(hass, "recovery_crashed")
+    # Restored entries whose quiet setup never succeeded stay quiet across
+    # restarts; an unreadable obligation file fails closed (all quiet).
+    await async_load_quiet_obligations(hass)
     async_update_migration_issue(hass)
     return True
 
@@ -429,9 +434,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: BrilliantMqttConfigEntry
                 type(cleanup_error).__name__,
             )
         raise
-    # A migration-restoration setup stays quiet across failed attempts (and HA's
-    # automatic retries); only a successful setup consumes the marker.
-    fence.quiet.discard(entry.entry_id)
+    # A migration-restoration setup stays quiet across failed attempts, HA's
+    # automatic retries, and restarts; only a successful setup retires it.
+    await async_quiet_setup_succeeded(hass, entry.entry_id)
     async_clear_reverted_issue(hass, entry.entry_id)
     return True
 

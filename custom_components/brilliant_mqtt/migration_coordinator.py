@@ -74,6 +74,7 @@ from .migration_journal import (
     MigrationJournalError,
     MigrationPhase,
     MigrationRecord,
+    QuietRestorations,
     SubentryPlan,
 )
 from .provisioning_journal import ProvisioningJournal
@@ -83,6 +84,7 @@ _LOGGER = logging.getLogger(__name__)
 DATA_MIGRATION_LOCK = "migration_lock"
 DATA_MIGRATION_REMOVING = "migration_removing"
 DATA_MIGRATION_FENCE = "migration_fence"
+DATA_QUIET_LOCK = "migration_quiet_lock"
 ISSUE_MIGRATION_AVAILABLE = "legacy_migration_available"
 ISSUE_MIGRATION_RECOVERY_FAILED = "migration_recovery_failed"
 ISSUE_MIGRATION_REVERTED_NOT_LOADED = "migration_reverted_not_loaded"
@@ -178,6 +180,51 @@ def migration_fence(hass: HomeAssistant) -> MigrationFence:
         fence = MigrationFence()
         domain_data[DATA_MIGRATION_FENCE] = fence
     return fence
+
+
+def quiet_lock(hass: HomeAssistant) -> asyncio.Lock:
+    """Serialize read-modify-write of the durable quiet-restoration set."""
+    domain_data: dict[str, Any] = hass.data.setdefault(DOMAIN, {})
+    lock: asyncio.Lock = domain_data.setdefault(DATA_QUIET_LOCK, asyncio.Lock())
+    return lock
+
+
+async def async_load_quiet_obligations(hass: HomeAssistant) -> None:
+    """Re-establish durable quiet-restoration markers at startup (fail closed)."""
+    outstanding = await QuietRestorations(hass).async_load()
+    fence = migration_fence(hass)
+    if outstanding is None:
+        fence.quiet.update(entry.entry_id for entry in hass.config_entries.async_entries(DOMAIN))
+        return
+    fence.quiet.update(outstanding)
+
+
+async def async_quiet_setup_succeeded(hass: HomeAssistant, entry_id: str) -> None:
+    """Retire one entry's quiet obligation after its quiet setup succeeded."""
+    fence = migration_fence(hass)
+    if entry_id not in fence.quiet:
+        return
+    async with quiet_lock(hass):
+        store = QuietRestorations(hass)
+        current = await store.async_load()
+        remaining = (
+            current
+            if current is not None
+            else frozenset(entry.entry_id for entry in hass.config_entries.async_entries(DOMAIN))
+        )
+        try:
+            await store.async_store(
+                frozenset(
+                    item
+                    for item in remaining
+                    if item != entry_id and hass.config_entries.async_get_entry(item) is not None
+                )
+            )
+        except MigrationJournalError as error:
+            # Kept durable: the next setup is quiet again, never a panel contact.
+            _LOGGER.warning("Quiet-restoration obligation not retired (%s)", error.code)
+            return
+    fence.quiet.discard(entry_id)
 
 
 def migration_lock(hass: HomeAssistant) -> asyncio.Lock:
@@ -338,38 +385,47 @@ class MigrationCoordinator:
             await self._checkpoint(name)
 
     async def _save(self, record: MigrationRecord) -> MigrationRecord:
-        """Persist and prove one record; settle what is on disk if that fails."""
+        """Persist and prove one record; settle what is on disk if that fails.
+
+        Any failure after an attempted write enters persisted-phase settlement:
+        a re-read that finds the attempted record makes the write a success.
+        """
         await self._point(f"before_save:{record.phase.value}")
         try:
             await self._journal.async_save(record)
-        except MigrationJournalError:
-            await self._async_settle_unproven(record)
-            raise
+        except Exception as error:
+            if not await self._async_settle_unproven(record):
+                if isinstance(error, MigrationJournalError):
+                    raise
+                raise MigrationJournalError("journal_unproven") from None
         self._durable = record
         await self._point(f"after_save:{record.phase.value}")
         return record
 
-    async def _async_settle_unproven(self, attempted: MigrationRecord) -> None:
-        """Establish the persisted phase after a write whose outcome is unknown."""
+    async def _async_settle_unproven(self, attempted: MigrationRecord) -> bool:
+        """Establish the persisted phase after a write whose outcome is unknown.
+
+        Returns True only when the attempted record is positively on disk.
+        """
         previous = self._durable
         try:
             on_disk = await self._journal.async_load()
-        except MigrationJournalError:
+        except Exception:
             on_disk = None
             readable = False
         else:
             readable = True
         if readable and on_disk == attempted:
-            self._durable = attempted
-            return
+            return True
         if readable and on_disk == previous:
-            return
+            return False
         # Unknown: either the previous or the attempted record may be on disk.
         # Only a write that straddles the commit point is truly ambiguous.
         if _committed(previous) != _committed(attempted):
             self._ambiguous = True
         elif _committed(attempted):
             self._durable = attempted
+        return False
 
     async def _try_save(self, record: MigrationRecord) -> MigrationRecord:
         """Best-effort progress write; recovery re-applies idempotently anyway."""
@@ -487,6 +543,22 @@ class MigrationCoordinator:
 
         if self._entry_flows_in_progress({entry.entry_id for entry in entries}):
             blockers.append(_blocker("config_flow_in_progress", "flow"))
+
+        # HA 2026.10+ refuses to move a device that has child devices (they would
+        # need a cascading move), which a migration must not discover mid-way.
+        children_of = getattr(dr, "async_entries_for_parent_device", None)
+        if callable(children_of):
+            dev_reg = dr.async_get(self.hass)
+            parents = [
+                entry
+                for entry in entries
+                if any(
+                    children_of(dev_reg, device.id)
+                    for device in dr.async_entries_for_config_entry(dev_reg, entry.entry_id)
+                )
+            ]
+            if parents:
+                blockers.append(_blocker("device_has_child_devices", "device_registry", parents))
 
         registry = er.async_get(self.hass)
         foreign = [
@@ -1083,9 +1155,18 @@ class MigrationCoordinator:
         if not self._reverted_target_reached(record):
             raise MigrationError("reverse_incomplete")
         # Each restored entry's next successful setup is quiet (no panel contact).
-        self._fence.quiet.update(record.candidates)
+        # The obligation is made durable before ``complete`` (and before anything
+        # can set the entries up); if it cannot be, the journal stays reversible
+        # so the next startup re-establishes it.
+        restored = frozenset(
+            entry_id
+            for entry_id in record.candidates
+            if self.hass.config_entries.async_get_entry(entry_id) is not None
+        )
+        self._fence.quiet.update(restored)
+        durable_quiet = await self._async_add_quiet_obligation(restored)
         await self._point("complete")
-        if record.phase is not MigrationPhase.COMPLETE:
+        if record.phase is not MigrationPhase.COMPLETE and durable_quiet:
             await self._try_save(record.advanced(MigrationPhase.COMPLETE, outcome=OUTCOME_REVERTED))
         self._fence.deactivate()
         ir.async_delete_issue(self.hass, DOMAIN, ISSUE_MIGRATION_RECOVERY_FAILED)
@@ -1191,6 +1272,17 @@ class MigrationCoordinator:
                     and not set(subentries) <= set(links.get(owner, set()))
                 ):
                     return False
+        return True
+
+    async def _async_add_quiet_obligation(self, entry_ids: frozenset[str]) -> bool:
+        async with quiet_lock(self.hass):
+            store = QuietRestorations(self.hass)
+            current = await store.async_load()
+            try:
+                await store.async_store((current or frozenset()) | entry_ids)
+            except MigrationJournalError as error:
+                _LOGGER.warning("Quiet-restoration obligation not durable (%s)", error.code)
+                return False
         return True
 
     # --------------------------------------------------------------- recovery

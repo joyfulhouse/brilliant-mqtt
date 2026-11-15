@@ -362,11 +362,12 @@ def _read_file(path: str) -> object:
             text = handle.read()
     except FileNotFoundError:
         return _ABSENT
-    except OSError:
+    except Exception:
+        # OSError, UnicodeDecodeError, or anything else while reading: unknown.
         raise MigrationJournalError("journal_unreadable") from None
     try:
         return json.loads(text)
-    except ValueError:
+    except Exception:
         raise MigrationJournalError("journal_unreadable") from None
 
 
@@ -440,7 +441,8 @@ class MigrationJournal:
             raise MigrationJournalError("journal_write_failed") from None
         try:
             stored = await self.async_load()
-        except MigrationJournalError:
+        except Exception:
+            # Any verification failure leaves the write's outcome unknown.
             raise MigrationJournalError("journal_unproven") from None
         if stored != record:
             raise MigrationJournalError("journal_unproven")
@@ -450,7 +452,67 @@ class MigrationJournal:
         try:
             await self._hass.async_add_executor_job(_remove_file, self._path)
             raw = await self._async_read()
-        except (OSError, MigrationJournalError):
+        except Exception:
             raise MigrationJournalError("journal_unproven") from None
         if raw is not _ABSENT:
             raise MigrationJournalError("journal_unproven")
+
+
+QUIET_STORAGE_KEY = "brilliant_mqtt.migration_quiet"
+
+
+class QuietRestorations:
+    """Durable set of restored entries whose next successful setup must be quiet.
+
+    A reversal records the restored legacy entries here before anything can set
+    them up, independently of the journal: the journal may be confirmed and
+    deleted while a restored entry has still not completed a quiet setup (for
+    example after a crash or a failed setup). An entry leaves the set only once
+    such a setup succeeds. An unreadable file fails closed: every Brilliant entry
+    is treated as quiet until the set is rewritten.
+    """
+
+    __slots__ = ("_hass", "_path")
+
+    def __init__(self, hass: HomeAssistant) -> None:
+        self._hass = hass
+        self._path = hass.config.path(STORAGE_DIR, QUIET_STORAGE_KEY)
+
+    async def async_load(self) -> frozenset[str] | None:
+        """Return the outstanding entry IDs, or None when the file is unreadable."""
+        try:
+            raw = await self._hass.async_add_executor_job(_read_file, self._path)
+        except MigrationJournalError:
+            return None
+        if raw is _ABSENT:
+            return frozenset()
+        data = raw.get("data") if isinstance(raw, Mapping) else None
+        entry_ids = data.get("entry_ids") if isinstance(data, Mapping) else None
+        if (
+            not isinstance(raw, Mapping)
+            or raw.get("key") != QUIET_STORAGE_KEY
+            or not isinstance(entry_ids, list)
+            or not all(isinstance(item, str) and item for item in entry_ids)
+        ):
+            return None
+        return frozenset(entry_ids)
+
+    async def async_store(self, entry_ids: frozenset[str]) -> None:
+        """Persist exactly ``entry_ids`` (removing the file when empty) and prove it."""
+        try:
+            if entry_ids:
+                envelope = {
+                    "version": 1,
+                    "minor_version": 1,
+                    "key": QUIET_STORAGE_KEY,
+                    "data": {"entry_ids": sorted(entry_ids)},
+                }
+                await self._hass.async_add_executor_job(
+                    _write_file, self._path, json.dumps(envelope, sort_keys=True)
+                )
+            else:
+                await self._hass.async_add_executor_job(_remove_file, self._path)
+        except Exception:
+            raise MigrationJournalError("quiet_marker_unproven") from None
+        if await self.async_load() != entry_ids:
+            raise MigrationJournalError("quiet_marker_unproven")
