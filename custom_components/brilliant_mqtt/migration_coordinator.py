@@ -6,26 +6,31 @@ setup, quiesces the legacy runtimes, plans with the pure :mod:`.migration`
 planner from the exact snapshots it journals, converts the deterministic anchor
 (smallest entry ID) into the singleton fleet entry, adds one journaled panel
 subentry per legacy entry, retargets the integration-owned entity/device
-registry associations, sets up and verifies the fleet runtime, proves config
-entries + both registries on disk, persists the ``fleet_verified`` commit
-point, and only then removes the sibling entries.
+registry associations, sets up and verifies the fleet runtime, persists the
+``fleet_verified`` commit point, and only then removes the sibling entries.
 
-Every journal write and every terminal state is proven on disk (see
-:mod:`.migration_persistence`). Before the commit point any failure reverses to
-the exact original entries and registry associations; at/after it, recovery
-only finishes sibling removal. While a journal is unresolved, the setup fence
-keeps mixed fleet/legacy generations from ever starting. Migration never
-contacts, reinstalls, restarts, or rewrites a panel.
+The journal (an atomically written file, every write re-read and compared) is
+the single source of truth; nothing relies on Home Assistant's lazily written
+config-entry or registry stores. Every startup idempotently re-applies the
+journaled target to config entries and registries (forward once committed,
+otherwise the original associations) and records ``complete``. A ``complete``
+journal is kept, with the fence lowered, until a later startup observes the
+loaded state already at the target; only then is it deleted. A crash before
+Home Assistant's final write is therefore always repaired from the journal.
+While a non-complete journal is unresolved, the setup fence keeps mixed
+fleet/legacy generations from ever starting. Migration never contacts,
+reinstalls, restarts, or rewrites a panel.
 """
 
 from __future__ import annotations
 
 import asyncio
 import copy
+import inspect
 import logging
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from types import MappingProxyType
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 from homeassistant.components import mqtt
@@ -71,12 +76,6 @@ from .migration_journal import (
     MigrationRecord,
     SubentryPlan,
 )
-from .migration_persistence import (
-    PersistenceUnprovenError,
-    async_persist_config_entries,
-    async_persist_device_registry,
-    async_persist_entity_registry,
-)
 from .provisioning_journal import ProvisioningJournal
 
 _LOGGER = logging.getLogger(__name__)
@@ -105,6 +104,42 @@ class MigrationError(Exception):
         self.code = code
 
 
+class MigrationDriftError(MigrationError):
+    """A candidate changed after it was journaled and before anything was converted."""
+
+    def __init__(self) -> None:
+        super().__init__("entry_changed_during_migration")
+
+
+def _committed(record: MigrationRecord | None) -> bool:
+    return record is not None and (
+        record.phase in COMMITTED_PHASES or record.outcome == OUTCOME_MIGRATED
+    )
+
+
+@callback
+def async_clear_reverted_issue(hass: HomeAssistant, starting_entry_id: str) -> None:
+    """Drop the restored-but-not-running issue once every Brilliant entry runs.
+
+    Called at the end of a successful ``async_setup_entry``, before HA marks that
+    entry loaded, so the entry being started counts as running.
+    """
+    if all(
+        entry.entry_id == starting_entry_id
+        or entry.state is ConfigEntryState.LOADED
+        or entry.disabled_by is not None
+        for entry in hass.config_entries.async_entries(DOMAIN)
+    ):
+        ir.async_delete_issue(hass, DOMAIN, ISSUE_MIGRATION_REVERTED_NOT_LOADED)
+
+
+def migration_blocks_entry_writes(hass: HomeAssistant) -> bool:
+    """Whether config/options flows must refuse to write Brilliant entries now."""
+    domain_data = hass.data.get(DOMAIN)
+    fence = domain_data.get(DATA_MIGRATION_FENCE) if isinstance(domain_data, dict) else None
+    return isinstance(fence, MigrationFence) and fence.active
+
+
 class MigrationFence:
     """Keep Brilliant entries from starting while a migration is unresolved.
 
@@ -130,11 +165,9 @@ class MigrationFence:
     def blocks(self, entry_id: str) -> bool:
         return self.active and entry_id not in self.allowed
 
-    def consume_quiet(self, entry_id: str) -> bool:
-        if entry_id in self.quiet:
-            self.quiet.discard(entry_id)
-            return True
-        return False
+    def is_quiet(self, entry_id: str) -> bool:
+        """Peek; the marker is cleared only after a successful setup."""
+        return entry_id in self.quiet
 
 
 def migration_fence(hass: HomeAssistant) -> MigrationFence:
@@ -168,6 +201,37 @@ def migration_removing(hass: HomeAssistant) -> set[str]:
 
 def _is_fleet(entry: ConfigEntry[Any]) -> bool:
     return entry.data.get(CONF_ENTRY_KIND) == ENTRY_KIND_FLEET
+
+
+# Home Assistant 2026.10 changed the device registry: a device now belongs to
+# exactly one config entry and subentry (a shared device was split per entry),
+# ``config_entries_subentries`` is a deprecated shim, and devices move with
+# ``new_config_entry_id``/``new_config_subentry_id``. Releases up to 2026.9
+# share one device across entries and link it with add/remove. Support both.
+SINGLE_OWNER_DEVICES = (
+    "new_config_entry_id" in inspect.signature(dr.DeviceRegistry.async_update_device).parameters
+)
+
+
+def device_links(device: dr.DeviceEntry) -> dict[str, set[str | None]]:
+    """Return a device's config entry -> subentries ownership without deprecated reads."""
+    if SINGLE_OWNER_DEVICES and not getattr(device, "is_composite_device", False):
+        owner = getattr(device, "config_entry_id", None)
+        if not isinstance(owner, str):
+            return {}
+        subentry = getattr(device, "config_subentry_id", None)
+        return {owner: {subentry if isinstance(subentry, str) else None}}
+    links = device.config_entries_subentries
+    return {owner: set(subentries) for owner, subentries in links.items()}
+
+
+def _move_device(
+    dev_reg: dr.DeviceRegistry, device_id: str, entry_id: str, subentry_id: str | None
+) -> None:
+    """Move a single-owner device to one config entry and subentry."""
+    update: Callable[..., dr.DeviceEntry | None] = cast(Any, dev_reg).async_update_device
+    if update(device_id, new_config_entry_id=entry_id, new_config_subentry_id=subentry_id) is None:
+        raise MigrationError("registry_device_missing")
 
 
 @callback
@@ -208,7 +272,7 @@ def async_report_recovery_failure(hass: HomeAssistant, code: str) -> None:
 
 
 def _error_code(error: BaseException) -> str:
-    if isinstance(error, (MigrationError, MigrationJournalError, PersistenceUnprovenError)):
+    if isinstance(error, (MigrationError, MigrationJournalError)):
         return error.code
     if isinstance(error, EntryDataError):
         return str(error)
@@ -221,10 +285,6 @@ def _blocker(code: str, field: str, entries: Sequence[ConfigEntry[Any]] = ()) ->
         "field": field,
         "entries": [{"entry_id": entry.entry_id, "title": entry.title} for entry in entries],
     }
-
-
-def _text(value: object) -> str | None:
-    return None if value is None else str(value)
 
 
 def _data_matches(live: Mapping[str, Any], snapshot: Mapping[str, Any]) -> bool:
@@ -268,6 +328,9 @@ class MigrationCoordinator:
         self._fence = migration_fence(hass)
         # The latest record proven on disk; exception handling keys off it.
         self._durable: MigrationRecord | None = None
+        # Set when a write's outcome could not be established on either side of
+        # the commit point: nothing may reverse or finish until it is re-read.
+        self._ambiguous = False
 
     async def _point(self, name: str) -> None:
         """Failure-injection seam between every journal save and mutation."""
@@ -275,18 +338,55 @@ class MigrationCoordinator:
             await self._checkpoint(name)
 
     async def _save(self, record: MigrationRecord) -> MigrationRecord:
+        """Persist and prove one record; settle what is on disk if that fails."""
         await self._point(f"before_save:{record.phase.value}")
-        await self._journal.async_save(record)
+        try:
+            await self._journal.async_save(record)
+        except MigrationJournalError:
+            await self._async_settle_unproven(record)
+            raise
         self._durable = record
         await self._point(f"after_save:{record.phase.value}")
         return record
 
-    async def _async_remove_journal(self) -> None:
+    async def _async_settle_unproven(self, attempted: MigrationRecord) -> None:
+        """Establish the persisted phase after a write whose outcome is unknown."""
+        previous = self._durable
+        try:
+            on_disk = await self._journal.async_load()
+        except MigrationJournalError:
+            on_disk = None
+            readable = False
+        else:
+            readable = True
+        if readable and on_disk == attempted:
+            self._durable = attempted
+            return
+        if readable and on_disk == previous:
+            return
+        # Unknown: either the previous or the attempted record may be on disk.
+        # Only a write that straddles the commit point is truly ambiguous.
+        if _committed(previous) != _committed(attempted):
+            self._ambiguous = True
+        elif _committed(attempted):
+            self._durable = attempted
+
+    async def _try_save(self, record: MigrationRecord) -> MigrationRecord:
+        """Best-effort progress write; recovery re-applies idempotently anyway."""
+        try:
+            return await self._save(record)
+        except MigrationJournalError as error:
+            _LOGGER.warning("Migration progress could not be journaled (%s)", error.code)
+            return record
+
+    async def _async_try_remove_journal(self) -> None:
         await self._point("remove_journal")
-        await self._journal.async_remove()
+        try:
+            await self._journal.async_remove()
+        except MigrationJournalError as error:
+            _LOGGER.warning("Migration journal could not be removed (%s)", error.code)
+            return
         self._durable = None
-        self._fence.deactivate()
-        ir.async_delete_issue(self.hass, DOMAIN, ISSUE_MIGRATION_RECOVERY_FAILED)
 
     # ------------------------------------------------------------------ public
 
@@ -296,10 +396,11 @@ class MigrationCoordinator:
             try:
                 pending = await self._journal.async_load()
             except MigrationJournalError as error:
-                self._fence.activate()
-                async_report_recovery_failure(self.hass, error.code)
+                if not dry_run:
+                    self._fence.activate()
+                    async_report_recovery_failure(self.hass, error.code)
                 return {"status": "recovery_failed", "dry_run": dry_run, "error": error.code}
-            if pending is not None:
+            if pending is not None and pending.phase is not MigrationPhase.COMPLETE:
                 if dry_run:
                     return {
                         "status": "recovery_pending",
@@ -349,7 +450,7 @@ class MigrationCoordinator:
                 ssh_lock.release()
 
     async def async_recover(self) -> dict[str, Any] | None:
-        """Startup recovery: settle a journaled migration before entries load.
+        """Startup recovery: settle or confirm a journaled migration before entries load.
 
         The fence is raised first and stays raised unless recovery resolves the
         journal, so a failed recovery can never start mixed generations.
@@ -452,7 +553,7 @@ class MigrationCoordinator:
                     device_id=device.id,
                     associations={
                         owner: tuple(sorted(subentries, key=lambda item: item or ""))
-                        for owner, subentries in sorted(device.config_entries_subentries.items())
+                        for owner, subentries in sorted(device_links(device).items())
                     },
                 )
         return MigrationRecord(
@@ -496,7 +597,7 @@ class MigrationCoordinator:
                 or not _data_matches(entry.data, original.data)
                 or not _data_matches(entry.options, original.options)
             ):
-                raise MigrationError("entry_changed_during_migration")
+                raise MigrationDriftError
 
     async def _async_quiesce(self, entry_ids: Iterable[str]) -> None:
         """Unload every listed runtime (also cancels a fenced setup retry)."""
@@ -516,6 +617,7 @@ class MigrationCoordinator:
         """Fence, quiesce, re-plan from the journaled snapshots, then migrate."""
         self._fence.activate()
         self._durable = None
+        self._ambiguous = False
         candidate_ids = [entry.entry_id for entry in self.hass.config_entries.async_entries(DOMAIN)]
         try:
             await self._async_quiesce(candidate_ids)
@@ -545,19 +647,31 @@ class MigrationCoordinator:
         """Settle a failure from the latest durable phase, never a stale local one."""
         code = _error_code(error)
         durable = self._durable
-        if durable is None:
-            # The planned record never reached disk, so nothing was mutated.
-            _LOGGER.warning("Legacy fleet migration did not start (%s)", code)
-            return await self._async_reload(record.candidates, error=code)
-        if durable.phase in COMMITTED_PHASES or durable.outcome == OUTCOME_MIGRATED:
-            # Past the commit point: never reverse; finish sibling removal.
+        if self._ambiguous:
+            # The commit write may or may not be on disk: keep the journal and the
+            # fleet, keep the siblings fenced, and let a re-read decide.
+            self._fence.allowed.add(record.anchor_entry_id)
+            async_report_recovery_failure(self.hass, "commit_unproven")
+            return {"status": "ambiguous", "dry_run": False, "error": code}
+        if _committed(durable):
+            assert durable is not None
             _LOGGER.warning("Legacy fleet migration interrupted after commit (%s)", code)
             try:
                 return await self._async_complete_migration(durable)
             except Exception as finish_error:
                 finish_code = _error_code(finish_error)
+                self._fence.allowed.add(durable.anchor_entry_id)
                 async_report_recovery_failure(self.hass, finish_code)
                 return {"status": "incomplete", "dry_run": False, "error": finish_code}
+        if durable is None or isinstance(error, MigrationDriftError):
+            # Nothing was converted: drop any journal and restart the current,
+            # intact legacy set as it is now (an edit made meanwhile is kept).
+            _LOGGER.warning("Legacy fleet migration aborted before conversion (%s)", code)
+            await self._async_try_remove_journal()
+            outcome = await self._async_reload(record.candidates, error=code)
+            if isinstance(error, MigrationDriftError) and outcome["status"] == "reverted":
+                outcome["status"] = "aborted"
+            return outcome
         _LOGGER.warning("Legacy fleet migration failed before commit (%s); reversing", code)
         try:
             await self._async_reverse(durable, code)
@@ -573,27 +687,28 @@ class MigrationCoordinator:
         return await self._async_reload(record.candidates, error=code)
 
     async def _async_reload(self, entry_ids: Iterable[str], *, error: str | None) -> dict[str, Any]:
-        """Lift the fence and quietly restart the originals; report what loaded."""
+        """Lift the fence and quietly restart the originals; report what loaded.
+
+        Each restarted entry keeps its quiet marker until a setup succeeds, so a
+        failed attempt's automatic retry is quiet too.
+        """
         ids = list(entry_ids)
         self._fence.deactivate()
         not_loaded: list[str] = []
         for entry_id in ids:
             entry = self.hass.config_entries.async_get_entry(entry_id)
             if entry is None:
-                not_loaded.append(entry_id)
                 continue
             if entry.state is not ConfigEntryState.LOADED:
+                self._fence.quiet.add(entry_id)
                 try:
                     if entry.state is not ConfigEntryState.NOT_LOADED:
                         await self.hass.config_entries.async_unload(entry_id)
-                    self._fence.quiet.add(entry_id)
                     await self.hass.config_entries.async_setup(entry_id)
                 except Exception as setup_error:
                     _LOGGER.warning(
                         "Restored legacy entry did not set up (%s)", type(setup_error).__name__
                     )
-                finally:
-                    self._fence.quiet.discard(entry_id)
             if entry.state is not ConfigEntryState.LOADED:
                 not_loaded.append(entry_id)
         if error is None:
@@ -664,22 +779,16 @@ class MigrationCoordinator:
             raise MigrationError("fleet_setup_failed")
         await self._point("verify_fleet")
         self._verify_fleet(record)
-        await self._async_prove(record)
         await self._save(record.advanced(MigrationPhase.FLEET_VERIFIED))
         # The committed fleet may now reload; legacy siblings stay fenced.
         self._fence.allowed.add(anchor.entry_id)
 
-    async def _async_complete_migration(self, record: MigrationRecord) -> dict[str, Any]:
-        """Remove siblings after the commit point, prove it on disk, then finish."""
-        self._fence.allowed.add(record.anchor_entry_id)
-        if record.phase is MigrationPhase.FLEET_VERIFIED:
-            record = await self._save(record.advanced(MigrationPhase.SIBLINGS_REMOVING))
+    async def _async_remove_remaining_siblings(self, record: MigrationRecord) -> MigrationRecord:
         removing = migration_removing(self.hass)
         for entry_id in record.siblings:
             if self.hass.config_entries.async_get_entry(entry_id) is not None:
                 # Idempotent: a registry write that did not reach disk before a
-                # crash must never let HA's removal cleanup delete an entity. Past
-                # the commit point a vanished entity is no reason to stop.
+                # crash must never let HA's removal cleanup delete an entity.
                 self._retarget_registries(record, strict=False)
                 await self._point(f"remove:{entry_id}")
                 removing.add(entry_id)
@@ -688,84 +797,77 @@ class MigrationCoordinator:
                 finally:
                     removing.discard(entry_id)
             if record.phase is MigrationPhase.SIBLINGS_REMOVING and entry_id not in record.removed:
-                record = await self._save(
+                record = await self._try_save(
                     record.advanced(
                         MigrationPhase.SIBLINGS_REMOVING,
                         removed=(*record.removed, entry_id),
                     )
                 )
-        anchor = self._anchor(record)
-        if not _is_fleet(anchor) or set(anchor.subentries) != set(
-            record.subentry_by_entry.values()
-        ):
+        return record
+
+    async def _async_complete_migration(self, record: MigrationRecord) -> dict[str, Any]:
+        """Remove siblings after the commit point, then record ``complete``.
+
+        The ``complete`` journal is kept (fence lowered) until a later startup
+        confirms the loaded state, because the removals may not be on disk yet.
+        """
+        self._fence.allowed.add(record.anchor_entry_id)
+        if record.phase is MigrationPhase.FLEET_VERIFIED:
+            record = await self._try_save(record.advanced(MigrationPhase.SIBLINGS_REMOVING))
+        record = await self._async_remove_remaining_siblings(record)
+        if not self._migrated_target_reached(record):
             raise MigrationError("fleet_runtime_mismatch")
-        await self._point("prove_migrated")
-        await self._async_prove(record)
+        await self._point("complete")
         if record.phase is not MigrationPhase.COMPLETE:
-            record = await self._save(
-                record.advanced(MigrationPhase.COMPLETE, outcome=OUTCOME_MIGRATED)
+            target = (
+                record
+                if record.phase is MigrationPhase.SIBLINGS_REMOVING
+                else record.advanced(MigrationPhase.SIBLINGS_REMOVING)
             )
-        await self._async_remove_journal()
+            await self._try_save(target.advanced(MigrationPhase.COMPLETE, outcome=OUTCOME_MIGRATED))
+        self._fence.deactivate()
+        ir.async_delete_issue(self.hass, DOMAIN, ISSUE_MIGRATION_RECOVERY_FAILED)
+        ir.async_delete_issue(self.hass, DOMAIN, ISSUE_MIGRATION_REVERTED_NOT_LOADED)
         async_update_migration_issue(self.hass)
         _LOGGER.info(
             "Consolidated %d legacy Brilliant entries into one fleet", len(record.candidates)
         )
         return self._migrated_outcome(record)
 
-    async def _async_prove(self, record: MigrationRecord) -> None:
-        """Flush config entries and both registries, then prove disk == memory."""
-        await self._point("prove")
-        disk_entries = await async_persist_config_entries(self.hass)
-        disk_entities = await async_persist_entity_registry(self.hass)
-        disk_devices = await async_persist_device_registry(self.hass)
-        for entry_id in record.candidates:
-            entry = self.hass.config_entries.async_get_entry(entry_id)
-            stored = disk_entries.get(entry_id)
-            if entry is None:
-                if stored is not None:
-                    raise PersistenceUnprovenError()
-            elif stored is None or dict(stored) != dict(
-                fleet_manager._canonical_entry_storage(entry)
-            ):
-                raise PersistenceUnprovenError()
+    def _migrated_target_reached(self, record: MigrationRecord) -> bool:
+        """Whether no migration-loss artifact remains for a committed migration."""
+        anchor = self.hass.config_entries.async_get_entry(record.anchor_entry_id)
+        if anchor is None:
+            return True  # The fleet was deliberately removed after completion.
+        if not _is_fleet(anchor):
+            return False
+        if any(self.hass.config_entries.async_get_entry(item) for item in record.siblings):
+            return False
+        planned = record.subentry_by_entry
+        present = set(anchor.subentries)
         ent_reg = er.async_get(self.hass)
         for association in record.entities:
-            live = ent_reg.async_get(association.entity_id)
-            disk = disk_entities.get(association.entity_id)
-            if live is None:
-                if disk is not None and disk.get("unique_id") == association.unique_id:
-                    raise PersistenceUnprovenError()
-                continue
-            if disk is None or (
-                disk.get("unique_id"),
-                disk.get("config_entry_id"),
-                disk.get("config_subentry_id"),
-                disk.get("disabled_by"),
-                disk.get("hidden_by"),
-            ) != (
-                live.unique_id,
-                live.config_entry_id,
-                live.config_subentry_id,
-                _text(live.disabled_by),
-                _text(live.hidden_by),
+            current = ent_reg.async_get(association.entity_id)
+            target = planned[association.config_entry_id]
+            if (
+                current is not None
+                and current.unique_id == association.unique_id
+                and target in present
+                and (current.config_entry_id, current.config_subentry_id)
+                != (record.anchor_entry_id, target)
             ):
-                raise PersistenceUnprovenError()
+                return False
         dev_reg = dr.async_get(self.hass)
         for device_association in record.devices:
             device = dev_reg.async_get(device_association.device_id)
-            stored_device = disk_devices.get(device_association.device_id)
             if device is None:
-                if stored_device is not None:
-                    raise PersistenceUnprovenError()
                 continue
-            raw = stored_device.get("config_entries_subentries") if stored_device else None
-            if not isinstance(raw, Mapping) or {
-                str(owner): set(subentries) for owner, subentries in raw.items()
-            } != {
-                owner: set(subentries)
-                for owner, subentries in device.config_entries_subentries.items()
-            }:
-                raise PersistenceUnprovenError()
+            links = device_links(device)
+            if None in links.get(record.anchor_entry_id, set()) or any(
+                owner in links for owner in record.siblings
+            ):
+                return False
+        return True
 
     def _anchor(self, record: MigrationRecord) -> ConfigEntry[Any]:
         anchor = self.hass.config_entries.async_get_entry(record.anchor_entry_id)
@@ -774,42 +876,44 @@ class MigrationCoordinator:
         return anchor
 
     def _apply_conversion(self, record: MigrationRecord) -> None:
-        """Make the anchor the journaled fleet entry and add every planned subentry."""
+        """Make the anchor the journaled fleet entry with every planned subentry.
+
+        Idempotent: a fleet anchor is left alone. Its subentries were written in the
+        same step as the conversion, so a missing one was removed deliberately.
+        """
         anchor = self._anchor(record)
-        if not _is_fleet(anchor):
-            if anchor.subentries:
-                raise MigrationError("anchor_has_subentries")
-            self.hass.config_entries.async_update_entry(
-                anchor,
-                data=dict(record.fleet_data),
-                options=dict(record.fleet_options),
-                title=record.fleet_title,
-                unique_id=record.fleet_unique_id,
-                version=CONFIG_ENTRY_VERSION,
-            )
-        elif anchor.unique_id != record.fleet_unique_id:
-            raise MigrationError("anchor_drift")
+        if _is_fleet(anchor):
+            if anchor.unique_id != record.fleet_unique_id:
+                raise MigrationError("anchor_drift")
+            return
+        if anchor.subentries:
+            raise MigrationError("anchor_has_subentries")
+        self.hass.config_entries.async_update_entry(
+            anchor,
+            data=copy.deepcopy(dict(record.fleet_data)),
+            options=copy.deepcopy(dict(record.fleet_options)),
+            title=record.fleet_title,
+            unique_id=record.fleet_unique_id,
+            version=CONFIG_ENTRY_VERSION,
+        )
         for plan in record.subentries:
-            existing = anchor.subentries.get(plan.subentry_id)
-            if existing is None:
-                self.hass.config_entries.async_add_subentry(
-                    anchor,
-                    ConfigSubentry(
-                        data=MappingProxyType(dict(plan.data)),
-                        subentry_id=plan.subentry_id,
-                        subentry_type=SUBENTRY_TYPE_PANEL,
-                        title=plan.title,
-                        unique_id=plan.unique_id,
-                    ),
-                )
-            elif existing.unique_id != plan.unique_id or dict(existing.data) != dict(plan.data):
-                raise MigrationError("subentry_drift")
+            self.hass.config_entries.async_add_subentry(
+                anchor,
+                ConfigSubentry(
+                    data=MappingProxyType(copy.deepcopy(dict(plan.data))),
+                    subentry_id=plan.subentry_id,
+                    subentry_type=SUBENTRY_TYPE_PANEL,
+                    title=plan.title,
+                    unique_id=plan.unique_id,
+                ),
+            )
 
     def _retarget_registries(self, record: MigrationRecord, *, strict: bool) -> None:
         """Point integration entities/devices at the anchor + planned subentry."""
         anchor_id = record.anchor_entry_id
         planned = record.subentry_by_entry
         candidates = set(record.candidates)
+        present = set(self._anchor(record).subentries)
         ent_reg = er.async_get(self.hass)
         for association in record.entities:
             current = ent_reg.async_get(association.entity_id)
@@ -818,6 +922,10 @@ class MigrationCoordinator:
                     raise MigrationError("registry_entity_missing")
                 continue
             target = planned[association.config_entry_id]
+            if target not in present:
+                if strict:
+                    raise MigrationError("fleet_runtime_mismatch")
+                continue
             if current.config_entry_id != anchor_id or current.config_subentry_id != target:
                 ent_reg.async_update_entity(
                     association.entity_id,
@@ -834,9 +942,14 @@ class MigrationCoordinator:
                 if strict:
                     raise MigrationError("registry_device_missing")
                 continue
+            owners = [owner for owner in owners if planned[owner] in present]
+            if SINGLE_OWNER_DEVICES:
+                if owners and device_links(device) != {anchor_id: {planned[owners[0]]}}:
+                    _move_device(dev_reg, device_id, anchor_id, planned[owners[0]])
+                continue
             for owner in owners:
                 target = planned[owner]
-                current_targets = device.config_entries_subentries.get(anchor_id, set())
+                current_targets = device_links(device).get(anchor_id, set())
                 if target not in current_targets:
                     updated = dev_reg.async_update_device(
                         device_id,
@@ -848,7 +961,7 @@ class MigrationCoordinator:
                     device = updated
             for owner in owners:
                 if owner == anchor_id:
-                    if None in device.config_entries_subentries.get(anchor_id, set()):
+                    if None in device_links(device).get(anchor_id, set()):
                         updated = dev_reg.async_update_device(
                             device_id,
                             remove_config_entry_id=anchor_id,
@@ -857,7 +970,7 @@ class MigrationCoordinator:
                         if updated is None:
                             raise MigrationError("registry_device_missing")
                         device = updated
-                elif owner in device.config_entries:
+                elif owner in device_links(device):
                     updated = dev_reg.async_update_device(
                         device_id,
                         remove_config_entry_id=owner,
@@ -915,7 +1028,7 @@ class MigrationCoordinator:
             expected_targets = {
                 planned[owner] for owner in device_association.associations if owner in candidates
             }
-            links = device.config_entries_subentries
+            links = device_links(device)
             if not expected_targets <= links.get(record.anchor_entry_id, set()):
                 raise MigrationError("registry_mismatch")
             if None in links.get(record.anchor_entry_id, set()) or any(
@@ -928,43 +1041,54 @@ class MigrationCoordinator:
 
     # ---------------------------------------------------------------- reverse
 
+    def _anchor_converted(self, record: MigrationRecord) -> bool:
+        anchor = self.hass.config_entries.async_get_entry(record.anchor_entry_id)
+        planned = set(record.subentry_by_entry.values())
+        return anchor is not None and (_is_fleet(anchor) or bool(planned & set(anchor.subentries)))
+
     async def _async_reverse(self, record: MigrationRecord, error: str) -> None:
-        """Restore the exact original entries and registry associations, proven on disk."""
+        """Remove every migration artifact and record ``complete`` (reverted).
+
+        Drift-tolerant: only the anchor is restored from its snapshot, and only
+        when it was actually converted; every other candidate is left exactly as
+        it is now, so an edit made during the transaction is never undone.
+        """
         if record.phase is not MigrationPhase.COMPLETE:
             if record.phase is not MigrationPhase.REVERSING:
                 record = record.advanced(MigrationPhase.REVERSING, last_error=error)
-            try:
-                record = await self._save(record)
-            except MigrationJournalError:
-                # The durable journal is still in a reversible phase, so recovery
-                # would reverse too; restoring memory now is always safe.
-                _LOGGER.warning("Migration reversal could not be journaled; restoring anyway")
-        await self._async_quiesce(record.candidates)
+            record = await self._try_save(record)
+        await self._async_quiesce(
+            entry_id
+            for entry_id in record.candidates
+            if self.hass.config_entries.async_get_entry(entry_id) is not None
+        )
         await self._point("reverse_registries")
         self._restore_registries(record)
         await self._point("reverse_anchor")
-        anchor = self._anchor(record)
-        for plan in record.subentries:
-            if plan.subentry_id in anchor.subentries:
-                self.hass.config_entries.async_remove_subentry(anchor, plan.subentry_id)
-        original = record.entry(record.anchor_entry_id)
-        self.hass.config_entries.async_update_entry(
-            anchor,
-            data=copy.deepcopy(dict(original.data)),
-            options=copy.deepcopy(dict(original.options)),
-            title=original.title,
-            unique_id=original.unique_id,
-            version=original.version,
-            minor_version=original.minor_version,
-        )
-        self._verify_reversed(record)
-        await self._point("prove_reverted")
-        await self._async_prove(record)
-        if record.phase is not MigrationPhase.COMPLETE:
-            await self._save(record.advanced(MigrationPhase.COMPLETE, outcome=OUTCOME_REVERTED))
-        # Each restored entry's next setup is quiet: it must not contact a panel.
+        if self._anchor_converted(record):
+            anchor = self._anchor(record)
+            for plan in record.subentries:
+                if plan.subentry_id in anchor.subentries:
+                    self.hass.config_entries.async_remove_subentry(anchor, plan.subentry_id)
+            original = record.entry(record.anchor_entry_id)
+            self.hass.config_entries.async_update_entry(
+                anchor,
+                data=copy.deepcopy(dict(original.data)),
+                options=copy.deepcopy(dict(original.options)),
+                title=original.title,
+                unique_id=original.unique_id,
+                version=original.version,
+                minor_version=original.minor_version,
+            )
+        if not self._reverted_target_reached(record):
+            raise MigrationError("reverse_incomplete")
+        # Each restored entry's next successful setup is quiet (no panel contact).
         self._fence.quiet.update(record.candidates)
-        await self._async_remove_journal()
+        await self._point("complete")
+        if record.phase is not MigrationPhase.COMPLETE:
+            await self._try_save(record.advanced(MigrationPhase.COMPLETE, outcome=OUTCOME_REVERTED))
+        self._fence.deactivate()
+        ir.async_delete_issue(self.hass, DOMAIN, ISSUE_MIGRATION_RECOVERY_FAILED)
 
     def _restore_registries(self, record: MigrationRecord) -> None:
         anchor_id = record.anchor_entry_id
@@ -973,7 +1097,10 @@ class MigrationCoordinator:
         ent_reg = er.async_get(self.hass)
         for association in record.entities:
             current = ent_reg.async_get(association.entity_id)
-            if current is None:
+            if (
+                current is None
+                or self.hass.config_entries.async_get_entry(association.config_entry_id) is None
+            ):
                 continue
             if (
                 current.config_entry_id != association.config_entry_id
@@ -989,11 +1116,26 @@ class MigrationCoordinator:
             device = dev_reg.async_get(device_association.device_id)
             if device is None:
                 continue
+            if SINGLE_OWNER_DEVICES:
+                originals = [
+                    (owner, subentries)
+                    for owner, subentries in device_association.associations.items()
+                    if owner in candidates
+                    and self.hass.config_entries.async_get_entry(owner) is not None
+                ]
+                if originals and device_links(device) != {originals[0][0]: set(originals[0][1])}:
+                    _move_device(
+                        dev_reg, device.id, originals[0][0], next(iter(originals[0][1]), None)
+                    )
+                continue
             for owner, subentries in device_association.associations.items():
-                if owner not in candidates:
+                if (
+                    owner not in candidates
+                    or self.hass.config_entries.async_get_entry(owner) is None
+                ):
                     continue
                 for subentry_id in subentries:
-                    if subentry_id not in device.config_entries_subentries.get(owner, set()):
+                    if subentry_id not in device_links(device).get(owner, set()):
                         updated = dev_reg.async_update_device(
                             device.id,
                             add_config_entry_id=owner,
@@ -1003,7 +1145,7 @@ class MigrationCoordinator:
                             raise MigrationError("registry_device_missing")
                         device = updated
             for subentry_id in sorted(
-                planned_ids & set(device.config_entries_subentries.get(anchor_id, set())),
+                planned_ids & set(device_links(device).get(anchor_id, set())),
                 key=lambda item: item or "",
             ):
                 updated = dev_reg.async_update_device(
@@ -1015,60 +1157,79 @@ class MigrationCoordinator:
                     raise MigrationError("registry_device_missing")
                 device = updated
 
-    def _verify_reversed(self, record: MigrationRecord) -> None:
-        for original in record.entries:
-            entry = self.hass.config_entries.async_get_entry(original.entry_id)
-            if (
-                entry is None
-                or entry.title != original.title
-                or entry.unique_id != original.unique_id
-                or entry.version != original.version
-                or dict(entry.data) != dict(original.data)
-                or dict(entry.options) != dict(original.options)
-                or entry.subentries
-            ):
-                raise MigrationError("reverse_incomplete")
+    def _reverted_target_reached(self, record: MigrationRecord) -> bool:
+        """Whether no migration artifact remains for a reversed migration."""
+        if self._anchor_converted(record):
+            return False
+        planned = set(record.subentry_by_entry.values())
+        candidates = set(record.candidates)
         ent_reg = er.async_get(self.hass)
         for association in record.entities:
             current = ent_reg.async_get(association.entity_id)
-            if (
-                current is None
-                or current.unique_id != association.unique_id
-                or current.config_entry_id != association.config_entry_id
-                or current.config_subentry_id != association.config_subentry_id
+            if current is None or current.unique_id != association.unique_id:
+                continue
+            if current.config_subentry_id in planned or (
+                current.config_entry_id in candidates
+                and (current.config_entry_id, current.config_subentry_id)
+                != (association.config_entry_id, association.config_subentry_id)
+                and self.hass.config_entries.async_get_entry(association.config_entry_id)
+                is not None
             ):
-                raise MigrationError("reverse_incomplete")
+                return False
         dev_reg = dr.async_get(self.hass)
-        candidates = set(record.candidates)
         for device_association in record.devices:
             device = dev_reg.async_get(device_association.device_id)
             if device is None:
-                raise MigrationError("reverse_incomplete")
-            restored = {
-                owner: set(subentries)
-                for owner, subentries in device.config_entries_subentries.items()
-                if owner in candidates
-            }
-            expected = {
-                owner: set(subentries)
-                for owner, subentries in device_association.associations.items()
-                if owner in candidates
-            }
-            if restored != expected:
-                raise MigrationError("reverse_incomplete")
+                continue
+            links = device_links(device)
+            if planned & set(links.get(record.anchor_entry_id, set())):
+                return False
+            for owner, subentries in device_association.associations.items():
+                if (
+                    owner in candidates
+                    and self.hass.config_entries.async_get_entry(owner) is not None
+                    and not set(subentries) <= set(links.get(owner, set()))
+                ):
+                    return False
+        return True
 
     # --------------------------------------------------------------- recovery
 
     async def _async_recover_locked(self, record: MigrationRecord, *, live: bool) -> dict[str, Any]:
+        """Re-apply the journaled target; confirm a ``complete`` journal on startup."""
         self._fence.activate()
         self._durable = record
+        self._ambiguous = False
         try:
-            if record.phase in COMMITTED_PHASES or record.outcome == OUTCOME_MIGRATED:
+            if record.phase is MigrationPhase.COMPLETE:
+                migrated = record.outcome == OUTCOME_MIGRATED
+                reached = (
+                    self._migrated_target_reached(record)
+                    if migrated
+                    else self._reverted_target_reached(record)
+                )
+                if reached:
+                    # The state Home Assistant just loaded from disk is the
+                    # target, so the terminal state is durable: forget it.
+                    await self._async_try_remove_journal()
+                    self._fence.deactivate()
+                    return {"status": "confirmed", "outcome": record.outcome}
+                if migrated:
+                    self._apply_conversion(record)
+                    self._retarget_registries(record, strict=False)
+                    await self._async_remove_remaining_siblings(record)
+                    if not self._migrated_target_reached(record):
+                        raise MigrationError("fleet_runtime_mismatch")
+                    self._fence.deactivate()
+                else:
+                    await self._async_reverse(record, record.last_error or "interrupted")
+                return {"status": "reapplied", "outcome": record.outcome}
+            if _committed(record):
                 self._apply_conversion(record)
                 self._retarget_registries(record, strict=False)
                 outcome = await self._async_complete_migration(record)
-                anchor = self._anchor(record)
-                if live and anchor.state is not ConfigEntryState.LOADED:
+                anchor = self.hass.config_entries.async_get_entry(record.anchor_entry_id)
+                if live and anchor is not None and anchor.state is not ConfigEntryState.LOADED:
                     await self._async_quiesce([anchor.entry_id])
                     await self.hass.config_entries.async_setup(anchor.entry_id)
                 return {**outcome, "recovered": True}
@@ -1083,6 +1244,6 @@ class MigrationCoordinator:
             code = _error_code(error)
             _LOGGER.error("Legacy fleet migration recovery failed (%s)", code)
             async_report_recovery_failure(self.hass, code)
-            if record.phase in COMMITTED_PHASES or record.outcome == OUTCOME_MIGRATED:
+            if _committed(record):
                 self._fence.allowed.add(record.anchor_entry_id)
             return {"status": "recovery_failed", "error": code}

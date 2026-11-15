@@ -18,11 +18,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reported by field, code, and entry title, never silently fixed. Duplicate
   positive mesh priorities are one example. A private journal makes the
   migration restart-safe: before the commit point it reverses exactly; after
-  it, startup recovery finishes removing the sibling entries. Every journal
-  step and every commit/terminal state is proven on disk, including config
-  entries and both registries. A setup fence keeps legacy and fleet runtimes
-  from ever starting side by side while a migration is unresolved. Every
-  planned panel's runtime must start before the commit. See
+  it, startup recovery finishes removing the sibling entries. The journal is
+  the single source of truth: an atomically written file whose every write is
+  re-read. Startup re-applies its target until a later startup confirms that
+  the loaded state matches, so nothing relies on Home Assistant's lazily
+  written stores or private storage APIs. A setup fence and blocked
+  reconfigure/options flows keep legacy and fleet runtimes from ever starting
+  side by side, or being edited, while a migration is unresolved. Every planned
+  panel's runtime must start before the commit. Both the pre-2026.10 shared
+  device registry and the 2026.10+ single-owner device registry are supported.
+  See
   [docs/ha-integration.md](docs/ha-integration.md#legacy_fleet_migration).
 - Repair issues: `legacy_migration_available` while legacy entries remain,
   `migration_recovery_failed` if an interrupted migration cannot be settled, and

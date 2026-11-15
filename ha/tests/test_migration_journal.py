@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+import stat
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -141,34 +144,75 @@ def test_malformed_storage_fails_closed(mutate: Any) -> None:
         MigrationRecord.from_storage(raw)
 
 
-async def test_journal_persists_privately_and_removes(
+def _write(path: Path, text: str) -> None:
+    """Sync file helpers (kept out of async tests for ruff's ASYNC240 rule)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def _file_facts(path: Path) -> tuple[bool, str | None, int | None, list[Path]]:
+    if not path.exists():
+        return False, None, None, []
+    return (
+        True,
+        path.read_text(encoding="utf-8"),
+        stat.S_IMODE(path.stat().st_mode),
+        list(path.parent.glob("*.corrupt*")),
+    )
+
+
+async def test_journal_is_a_private_atomic_file_that_is_proven_and_removed(
     hass: HomeAssistant, hass_storage: dict[str, Any]
 ) -> None:
+    """Real filesystem: not Home Assistant's (mocked) Store loader."""
     journal = MigrationJournal(hass)
+    path = Path(journal.path)
+    assert path.parent == Path(hass.config.path(".storage"))
     assert await journal.async_load() is None
 
     await journal.async_save(_record())
-    assert hass_storage[MIGRATION_STORAGE_KEY]["data"]["phase"] == "planned"
+    assert MIGRATION_STORAGE_KEY not in hass_storage
+    exists, text, mode, _corrupt = _file_facts(path)
+    assert exists and text is not None
+    raw = json.loads(text)
+    assert raw["key"] == MIGRATION_STORAGE_KEY and raw["data"]["phase"] == "planned"
+    assert mode == 0o600
     assert await MigrationJournal(hass).async_load() == _record()
 
     await journal.async_remove()
-    assert MIGRATION_STORAGE_KEY not in hass_storage
+    assert _file_facts(path)[0] is False
     assert await journal.async_load() is None
 
 
-async def test_corrupt_store_raises_redacted_error(
-    hass: HomeAssistant, hass_storage: dict[str, Any]
+@pytest.mark.parametrize(
+    "content",
+    ["", "{", '{"version": 1, "key": "brilliant_mqtt.migration", "data": ', "\x00\xff"],
+)
+async def test_corrupt_file_is_unreadable_never_absent_and_never_renamed(
+    hass: HomeAssistant, content: str
 ) -> None:
-    hass_storage[MIGRATION_STORAGE_KEY] = {
-        "version": 1,
-        "minor_version": 1,
-        "key": MIGRATION_STORAGE_KEY,
-        "data": {"schema_version": 1, "mqtt_password": SECRET},
-    }
+    path = Path(MigrationJournal(hass).path)
+    _write(path, content)
 
-    with pytest.raises(MigrationJournalError) as raised:
+    with pytest.raises(MigrationJournalError, match="journal_unreadable"):
         await MigrationJournal(hass).async_load()
-    assert SECRET not in str(raised.value)
+    exists, text, _mode, corrupt = _file_facts(path)
+    assert exists and text == content
+    assert corrupt == []
+
+
+async def test_wrong_envelope_or_record_is_corrupt_and_redacted(hass: HomeAssistant) -> None:
+    path = Path(MigrationJournal(hass).path)
+    for envelope in (
+        {"version": 2, "key": MIGRATION_STORAGE_KEY, "data": {}},
+        {"version": 1, "key": "other", "data": {}},
+        {"version": 1, "key": MIGRATION_STORAGE_KEY, "data": {"mqtt_password": SECRET}},
+    ):
+        _write(path, json.dumps(envelope))
+        with pytest.raises(MigrationJournalError) as raised:
+            await MigrationJournal(hass).async_load()
+        assert raised.value.code == "journal_corrupt"
+        assert SECRET not in str(raised.value)
 
 
 def test_complete_requires_a_terminal_outcome() -> None:
@@ -183,32 +227,43 @@ def test_complete_requires_a_terminal_outcome() -> None:
         MigrationRecord.from_storage(bogus)
 
 
-async def test_unproven_write_is_a_failure_not_a_log_line(
-    hass: HomeAssistant, hass_storage: dict[str, Any]
-) -> None:
-    """Store.async_save swallows WriteError; the journal must not."""
+async def test_failed_write_keeps_the_previous_record(hass: HomeAssistant) -> None:
     from unittest.mock import patch
 
-    from homeassistant.helpers import storage
-    from homeassistant.util.file import WriteError
+    from custom_components.brilliant_mqtt import migration_journal
 
     journal = MigrationJournal(hass)
     await journal.async_save(_record())
-    original = storage.Store._async_write_data
 
-    async def failing(store: storage.Store[Any], data: dict[str, Any]) -> None:
-        if store.key == MIGRATION_STORAGE_KEY:
-            raise WriteError("disk full")
-        await original(store, data)
+    def failing(path: str, content: str) -> None:
+        raise OSError("disk full")
 
     with (
-        patch.object(storage.Store, "_async_write_data", failing),
-        pytest.raises(MigrationJournalError, match="journal_unproven"),
+        patch.object(migration_journal, "_write_file", failing),
+        pytest.raises(MigrationJournalError, match="journal_write_failed"),
     ):
         await journal.async_save(_record().advanced(MigrationPhase.QUIESCED))
-    # The last proven phase is still what is on disk.
     stored = await MigrationJournal(hass).async_load()
     assert stored is not None and stored.phase is MigrationPhase.PLANNED
+
+
+async def test_landed_write_with_failed_verify_read_is_unproven(hass: HomeAssistant) -> None:
+    from unittest.mock import patch
+
+    from custom_components.brilliant_mqtt import migration_journal
+
+    journal = MigrationJournal(hass)
+
+    def unreadable(path: str) -> object:
+        raise MigrationJournalError("journal_unreadable")
+
+    with (
+        patch.object(migration_journal, "_read_file", unreadable),
+        pytest.raises(MigrationJournalError, match="journal_unproven"),
+    ):
+        await journal.async_save(_record())
+    # The write itself landed; a later read establishes it.
+    assert await journal.async_load() == _record()
 
 
 async def test_writes_are_refused_while_home_assistant_stops(hass: HomeAssistant) -> None:
@@ -216,7 +271,7 @@ async def test_writes_are_refused_while_home_assistant_stops(hass: HomeAssistant
 
     hass.set_state(CoreState.stopping)
     try:
-        with pytest.raises(MigrationJournalError, match="journal_unproven"):
+        with pytest.raises(MigrationJournalError, match="home_assistant_stopping"):
             await MigrationJournal(hass).async_save(_record())
     finally:
         hass.set_state(CoreState.running)

@@ -11,19 +11,16 @@ committed success or a verified reversal.
 from __future__ import annotations
 
 import copy
+import json
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Any
 
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers.storage import Store
-
-from .migration_persistence import (
-    PersistenceUnprovenError,
-    async_load_fresh,
-    require_writable,
-)
+from homeassistant.core import CoreState, HomeAssistant
+from homeassistant.helpers.storage import STORAGE_DIR
+from homeassistant.util.file import write_utf8_file_atomic
 
 MIGRATION_STORAGE_VERSION = 1
 MIGRATION_STORAGE_KEY = "brilliant_mqtt.migration"
@@ -349,53 +346,111 @@ def _mapping(value: object) -> dict[str, Any]:
     return copy.deepcopy(dict(value))
 
 
-class MigrationJournal:
-    """Persist exactly one migration record in private HA storage.
+_NOT_WRITABLE = frozenset({CoreState.stopping, CoreState.final_write, CoreState.stopped})
+_ABSENT = object()
 
-    Every write is proven by re-reading the file: ``Store.async_save`` swallows
-    write errors and defers while Home Assistant is stopping.
+
+def _read_file(path: str) -> object:
+    """Return the decoded envelope, ``_ABSENT`` when missing; never rename a corrupt file.
+
+    Home Assistant's ``Store.async_load`` treats malformed JSON as "no data" after
+    renaming the file aside, which would make a corrupt journal look absent and
+    drop the setup fence. The journal therefore reads its own file.
+    """
+    try:
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+    except FileNotFoundError:
+        return _ABSENT
+    except OSError:
+        raise MigrationJournalError("journal_unreadable") from None
+    try:
+        return json.loads(text)
+    except ValueError:
+        raise MigrationJournalError("journal_unreadable") from None
+
+
+def _write_file(path: str, content: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    write_utf8_file_atomic(path, content, private=True)
+
+
+def _remove_file(path: str) -> None:
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        return
+
+
+class MigrationJournal:
+    """Persist exactly one migration record as a private, atomically written file.
+
+    The journal is the migration's source of truth, so every write is proven by
+    re-reading the file directly and a missing file is distinguished from a
+    corrupt one (``journal_unreadable``). Writes are refused while Home
+    Assistant stops, because nothing after them could be relied upon.
     """
 
-    __slots__ = ("_hass", "_store")
+    __slots__ = ("_hass", "_path")
 
     def __init__(self, hass: HomeAssistant) -> None:
         self._hass = hass
-        self._store: Store[dict[str, Any]] = Store(
-            hass,
-            MIGRATION_STORAGE_VERSION,
-            MIGRATION_STORAGE_KEY,
-            atomic_writes=True,
-            private=True,
-        )
+        self._path = hass.config.path(STORAGE_DIR, MIGRATION_STORAGE_KEY)
+
+    @property
+    def path(self) -> str:
+        """Return the journal file path."""
+        return self._path
+
+    async def _async_read(self) -> object:
+        return await self._hass.async_add_executor_job(_read_file, self._path)
 
     async def async_load(self) -> MigrationRecord | None:
-        """Return the durable record (read from disk), or None when none is pending."""
-        try:
-            raw = await async_load_fresh(self._hass, self._store)
-        except PersistenceUnprovenError:
-            raise MigrationJournalError("journal_unreadable") from None
-        if raw is None:
+        """Return the durable record read from disk, or None when none exists."""
+        raw = await self._async_read()
+        if raw is _ABSENT:
             return None
-        return MigrationRecord.from_storage(raw)
+        if (
+            not isinstance(raw, Mapping)
+            or raw.get("key") != MIGRATION_STORAGE_KEY
+            or raw.get("version") != MIGRATION_STORAGE_VERSION
+        ):
+            raise MigrationJournalError("journal_corrupt")
+        return MigrationRecord.from_storage(raw.get("data"))
 
     async def async_save(self, record: MigrationRecord) -> None:
-        """Write one record and prove the exact transaction and phase are on disk."""
-        expected = record.to_storage()
+        """Write one record and prove the exact transaction and phase are on disk.
+
+        ``journal_write_failed`` means the atomic write itself failed (the previous
+        file is intact); ``journal_unproven`` means the outcome is unknown.
+        """
+        if self._hass.state in _NOT_WRITABLE:
+            raise MigrationJournalError("home_assistant_stopping")
+        envelope = {
+            "version": MIGRATION_STORAGE_VERSION,
+            "minor_version": 1,
+            "key": MIGRATION_STORAGE_KEY,
+            "data": record.to_storage(),
+        }
         try:
-            require_writable(self._hass)
-            await self._store.async_save(expected)
-            stored = await async_load_fresh(self._hass, self._store)
-        except PersistenceUnprovenError:
+            await self._hass.async_add_executor_job(
+                _write_file, self._path, json.dumps(envelope, sort_keys=True)
+            )
+        except Exception:
+            raise MigrationJournalError("journal_write_failed") from None
+        try:
+            stored = await self.async_load()
+        except MigrationJournalError:
             raise MigrationJournalError("journal_unproven") from None
-        if stored != expected:
+        if stored != record:
             raise MigrationJournalError("journal_unproven")
 
     async def async_remove(self) -> None:
         """Delete the record (and its credentials) and prove it is gone."""
         try:
-            await self._store.async_remove()
-            stored = await async_load_fresh(self._hass, self._store)
-        except (OSError, PersistenceUnprovenError):
+            await self._hass.async_add_executor_job(_remove_file, self._path)
+            raw = await self._async_read()
+        except (OSError, MigrationJournalError):
             raise MigrationJournalError("journal_unproven") from None
-        if stored is not None:
+        if raw is not _ABSENT:
             raise MigrationJournalError("journal_unproven")

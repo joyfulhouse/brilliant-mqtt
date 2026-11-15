@@ -74,6 +74,7 @@ from .manager import PanelManager, async_delete_panel_issues
 from .migration_coordinator import (
     ISSUE_MIGRATION_AVAILABLE,
     MigrationCoordinator,
+    async_clear_reverted_issue,
     async_report_recovery_failure,
     async_update_migration_issue,
     migration_fence,
@@ -409,7 +410,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: BrilliantMqttConfigEntry
     manager = FleetManager(
         hass,
         entry,
-        defer_setup_panel_contact=fence.consume_quiet(entry.entry_id),
+        defer_setup_panel_contact=fence.is_quiet(entry.entry_id),
     )
     entry.runtime_data = manager
     from .ha_control import get_control_plane
@@ -428,6 +429,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: BrilliantMqttConfigEntry
                 type(cleanup_error).__name__,
             )
         raise
+    # A migration-restoration setup stays quiet across failed attempts (and HA's
+    # automatic retries); only a successful setup consumes the marker.
+    fence.quiet.discard(entry.entry_id)
+    async_clear_reverted_issue(hass, entry.entry_id)
     return True
 
 

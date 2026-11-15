@@ -44,6 +44,7 @@ from ..const import (
 )
 from ..entry_data import EntryDataError, FleetConfig, PanelConfig
 from ..errors import OperationError
+from ..migration_coordinator import migration_blocks_entry_writes
 from . import gateway
 from .schemas import (
     BROKER_MENU_OPTIONS,
@@ -119,6 +120,8 @@ class BrilliantMqttFleetOptionsFlow(OptionsFlow):
         user_input: dict[str, Any] | None = None,
     ) -> ConfigFlowResult:
         del user_input
+        if migration_blocks_entry_writes(self.hass):
+            return self.async_abort(reason="migration_in_progress")
         if self._exact_registered_entry() is None:
             return self.async_abort(reason="invalid_parent")
         return self.async_show_menu(
@@ -565,6 +568,9 @@ class BrilliantMqttOptionsFlow(OptionsFlow):
     """Per-panel behavior knobs; read live by the manager (no reload needed)."""
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        if migration_blocks_entry_writes(self.hass):
+            # A legacy-to-fleet migration owns this entry right now.
+            return self.async_abort(reason="migration_in_progress")
         if user_input is not None:
             return self.async_create_entry(data=user_input)
         opts = self.config_entry.options

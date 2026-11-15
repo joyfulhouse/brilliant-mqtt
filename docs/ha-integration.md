@@ -355,46 +355,61 @@ Reconfigure/options dialogs), `entry_not_recoverable` (restart Home Assistant),
 
 ### Interruption and recovery
 
-The migration is journaled in private Home Assistant storage
-(`.storage/brilliant_mqtt.migration`). It first waits for any running panel
-repair or update, raises a setup fence, and unloads every legacy runtime. It then
-plans from those exact unloaded entries, so an edit made while it waited is
-migrated rather than lost. Next it converts the anchor, adds the subentries,
-retargets the integration's entity and device registry entries, and sets up the
-fleet runtime. It requires every planned panel's runtime to start. Only then
-does it record the commit point, and only after that does it remove the other
-legacy entries one at a time.
+The migration first waits for any running panel repair or update. It then
+raises a setup fence and unloads every legacy runtime, and plans from those
+exact unloaded entries, so an edit made while it waited is migrated rather than
+lost. Next it converts the anchor, adds the subentries, moves the integration's
+entity and device registry entries, and sets up the fleet runtime. It requires
+every planned panel's runtime to start. Only then does it record the commit
+point, and only after that does it remove the other legacy entries one at a
+time.
 
-Home Assistant saves storage lazily and logs (rather than raises) a failed
-write, so every journal step is re-read from disk. Before the commit point and
-before finishing, the migration forces `core.config_entries`,
-`core.entity_registry`, and `core.device_registry` to disk and proves they match.
-Nothing is committed while Home Assistant is stopping.
+The journal is a private, atomically written file
+(`.storage/brilliant_mqtt.migration`) and is the single source of truth. Every
+journal write is re-read from the file and compared, and a corrupt journal is
+never mistaken for a missing one. Home Assistant writes config entries and the
+registries lazily, so the migration does not trust them. At every startup until
+it is confirmed, recovery re-applies the journaled target idempotently: forward
+once committed, otherwise removal of every migration artifact. A finished
+migration keeps a `complete` journal, with the fence lowered, until a later
+startup loads exactly that state from disk. Only then is the journal, with its
+credentials, deleted.
 
-While a migration runs or awaits recovery, the fence keeps every Brilliant entry
-from starting (a reload or setup retry returns "not ready"). Only the anchor
-being verified, or the committed fleet, may start, so legacy and fleet runtimes
-never run side by side.
+While a migration runs or awaits recovery:
+
+- The fence keeps every Brilliant entry from starting (a reload or setup retry
+  returns "not ready"). Only the anchor being verified, or the committed fleet,
+  may start, so legacy and fleet runtimes never run side by side.
+- Reconfigure, options, and panel flows abort with `migration_in_progress`.
+- An entry edited anyway before the anchor is converted aborts the migration
+  (`aborted`, `entry_changed_during_migration`). The legacy set restarts with
+  the edit kept.
+- Reversal only removes migration artifacts. It restores the anchor from its
+  snapshot only if the anchor was converted, so an edit to any other entry
+  survives.
 
 | Result | Meaning |
 |---|---|
-| `migrated` | One fleet entry; siblings removed; proven on disk. |
-| `reverted` | A failure before the commit point restored the exact originals (proven on disk) and every legacy entry is running again. `error` holds the stable code. |
-| `reverted_config_only` | The originals are restored on disk, but the listed entries did not start. A **Brilliant legacy panels restored but not running** issue appears. Check MQTT and reload them. |
+| `migrated` | One fleet entry; siblings removed. |
+| `reverted` | A failure before the commit point removed every migration artifact and every legacy entry is running again. `error` holds the stable code. |
+| `reverted_config_only` | The configuration is restored, but the listed entries did not start. A **Brilliant legacy panels restored but not running** issue appears; it clears once they start (including by Home Assistant's own retry). |
+| `aborted` | An entry changed before anything was converted; nothing was migrated. |
+| `ambiguous` | The commit write could not be read back. The journal and the fleet are kept, the siblings stay fenced, and the next start (or the action) re-reads the journal and finishes. Nothing is reversed. |
 | `incomplete` | The fleet is committed, but sibling removal did not finish. The fleet keeps running, the remaining siblings stay fenced, and the next start (or the action) finishes the removal. |
 | `recovery_failed` | The journal could not be settled. Every uncommitted entry stays fenced, and a **Brilliant fleet migration needs attention** issue shows the code. |
 
-- If Home Assistant stops mid-migration, startup recovery runs before any
-  Brilliant entry loads. It reverses an uncommitted migration, or finishes
-  removing siblings after the commit point. If recovery fails, the fence stays
-  up. Restart Home Assistant, or run the action again with `dry_run: false` to
-  resume.
-- Restored legacy entries start without contacting their panel. The one-time
-  legacy HA-mirror retirement audit is skipped for that setup and runs again at
-  the next ordinary restart. Stored data is not changed.
-- The journal holds credentials and is deleted (and proven gone) as soon as the
-  migration completes or is reversed. A corrupt journal fails closed: nothing
-  starts until it is repaired or removed.
+- Startup recovery runs before any Brilliant entry loads. If it fails, the fence
+  stays up. Restart Home Assistant, or run the action again with
+  `dry_run: false` to resume. A dry run never changes the fence or any issue.
+- Restored legacy entries start without contacting their panel, including on
+  Home Assistant's automatic setup retries. The one-time legacy HA-mirror
+  retirement audit is skipped until such a setup succeeds; it runs again at the
+  next ordinary restart. Stored data is not changed.
+- An unreadable or corrupt journal fails closed. Nothing starts until the file
+  is repaired or removed.
+- Home Assistant 2026.10 gave every device a single owning config entry. The
+  migration handles both registry models: it moves each legacy panel's device
+  to the fleet panel. A separate MQTT device is untouched.
 
 ## Entities
 
