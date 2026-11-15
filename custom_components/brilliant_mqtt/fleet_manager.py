@@ -275,9 +275,17 @@ def _matches_record_identity(
     *,
     managed_update: bool = False,
 ) -> bool:
-    """Match every journaled panel owner field without exposing credential values."""
+    """Match every journaled panel owner field without exposing credential values.
+
+    A freshly onboarded panel's management ID is its fingerprint, so an install
+    handoff requires that exact value. A managed update targets an existing owner
+    whose management ID may be a consolidated legacy entry ID (kept so entity
+    unique IDs never change); its identity is already bound by the fingerprint,
+    pinned key, and subentry unique ID, so only a non-empty ID is required.
+    """
     request = record.panel_request
     data = subentry.data
+    management_id = data.get(CONF_MANAGEMENT_ID)
     return (
         subentry.unique_id == request.fingerprint
         and data.get(CONF_IDENTITY_FINGERPRINT) == request.fingerprint
@@ -286,7 +294,11 @@ def _matches_record_identity(
         and data.get(CONF_SSH_USERNAME) == request.ssh_username
         and data.get(CONF_ROOT_PASSWORD) == request.root_password
         and data.get(CONF_PANEL) == request.slug
-        and data.get(CONF_MANAGEMENT_ID) == request.fingerprint
+        and (
+            isinstance(management_id, str) and bool(management_id)
+            if managed_update
+            else management_id == request.fingerprint
+        )
         and (_managed_components(data) if managed_update else _enabled_components(data))
         == frozenset(request.selected_components)
     )
