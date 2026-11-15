@@ -19,9 +19,17 @@ from typing import Any
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
 
+from .migration_persistence import (
+    PersistenceUnprovenError,
+    async_load_fresh,
+    require_writable,
+)
+
 MIGRATION_STORAGE_VERSION = 1
 MIGRATION_STORAGE_KEY = "brilliant_mqtt.migration"
 MIGRATION_SCHEMA_VERSION = 1
+OUTCOME_MIGRATED = "migrated"
+OUTCOME_REVERTED = "reverted"
 
 
 class MigrationPhase(StrEnum):
@@ -138,6 +146,9 @@ class MigrationRecord:
     devices: tuple[DeviceAssociation, ...]
     removed: tuple[str, ...] = ()
     last_error: str | None = None
+    # Terminal intent recorded with ``complete`` so a crash during finalization
+    # (before the journal is deleted) reconciles in the same direction.
+    outcome: str | None = None
 
     def __repr__(self) -> str:
         return (
@@ -227,6 +238,7 @@ class MigrationRecord:
             ],
             "removed": list(self.removed),
             "last_error": self.last_error,
+            "outcome": self.outcome,
         }
 
     @classmethod
@@ -292,6 +304,7 @@ class MigrationRecord:
                 ),
                 removed=tuple(_string(item) for item in raw["removed"]),
                 last_error=_optional_string(raw["last_error"]),
+                outcome=_optional_string(raw["outcome"]),
             )
         except MigrationJournalError:
             raise
@@ -301,6 +314,8 @@ class MigrationRecord:
             record.anchor_entry_id not in record.candidates
             or {item.entry_id for item in record.entries} != set(record.candidates)
             or {item.entry_id for item in record.subentries} != set(record.candidates)
+            or record.outcome not in {None, OUTCOME_MIGRATED, OUTCOME_REVERTED}
+            or (record.phase is MigrationPhase.COMPLETE) != (record.outcome is not None)
         ):
             raise MigrationJournalError("journal_corrupt")
         return record
@@ -335,11 +350,16 @@ def _mapping(value: object) -> dict[str, Any]:
 
 
 class MigrationJournal:
-    """Persist exactly one migration record in private HA storage."""
+    """Persist exactly one migration record in private HA storage.
 
-    __slots__ = ("_store",)
+    Every write is proven by re-reading the file: ``Store.async_save`` swallows
+    write errors and defers while Home Assistant is stopping.
+    """
+
+    __slots__ = ("_hass", "_store")
 
     def __init__(self, hass: HomeAssistant) -> None:
+        self._hass = hass
         self._store: Store[dict[str, Any]] = Store(
             hass,
             MIGRATION_STORAGE_VERSION,
@@ -349,19 +369,33 @@ class MigrationJournal:
         )
 
     async def async_load(self) -> MigrationRecord | None:
-        """Return the durable record, or None when no migration is pending."""
+        """Return the durable record (read from disk), or None when none is pending."""
         try:
-            raw = await self._store.async_load()
-        except Exception:
+            raw = await async_load_fresh(self._hass, self._store)
+        except PersistenceUnprovenError:
             raise MigrationJournalError("journal_unreadable") from None
         if raw is None:
             return None
         return MigrationRecord.from_storage(raw)
 
     async def async_save(self, record: MigrationRecord) -> None:
-        """Durably write one record before the phase it describes is acted on."""
-        await self._store.async_save(record.to_storage())
+        """Write one record and prove the exact transaction and phase are on disk."""
+        expected = record.to_storage()
+        try:
+            require_writable(self._hass)
+            await self._store.async_save(expected)
+            stored = await async_load_fresh(self._hass, self._store)
+        except PersistenceUnprovenError:
+            raise MigrationJournalError("journal_unproven") from None
+        if stored != expected:
+            raise MigrationJournalError("journal_unproven")
 
     async def async_remove(self) -> None:
-        """Delete the record (and its credentials) after success or reversal."""
-        await self._store.async_remove()
+        """Delete the record (and its credentials) and prove it is gone."""
+        try:
+            await self._store.async_remove()
+            stored = await async_load_fresh(self._hass, self._store)
+        except (OSError, PersistenceUnprovenError):
+            raise MigrationJournalError("journal_unproven") from None
+        if stored is not None:
+            raise MigrationJournalError("journal_unproven")

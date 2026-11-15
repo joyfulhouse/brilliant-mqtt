@@ -527,6 +527,9 @@ class PanelManager:
         self._last_firmware: Any = (
             store.data.get(DATA_LAST_FIRMWARE) if isinstance(store, LegacyPanelStore) else None
         )
+        # Set by FleetManager for one migration-restoration setup: skip setup work
+        # that would contact the panel (the legacy HA-mirror retirement audit).
+        self.defer_setup_panel_contact = False
 
     @property
     def management_id(self) -> str:
@@ -835,8 +838,10 @@ class PanelManager:
             self._unsubs.append(
                 await mqtt.async_subscribe(self.hass, meta_topic(self.panel), self._on_meta)
             )
-            if isinstance(self.store, LegacyPanelStore) and self._legacy_retirement_evidence(
-                include_verified_history=True
+            if (
+                not self.defer_setup_panel_contact
+                and isinstance(self.store, LegacyPanelStore)
+                and self._legacy_retirement_evidence(include_verified_history=True)
             ):
                 await self.async_retire_legacy_ha_mirror(force_history_audit=True)
         except BaseException:

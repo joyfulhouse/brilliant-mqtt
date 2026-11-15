@@ -1,23 +1,29 @@
 """Operator-triggered, recoverable legacy-to-fleet consolidation.
 
-The coordinator is the only cross-entry writer. Under one domain migration lock
-it plans with the pure :mod:`.migration` planner, journals the complete
-pre-change snapshot, quiesces every legacy runtime, converts the deterministic
-anchor (smallest entry ID) into the singleton fleet entry, adds one journaled
-panel subentry per legacy entry, retargets the integration-owned entity/device
-registry associations, sets up and verifies the fleet runtime, persists the
-``fleet_verified`` commit point, and only then removes the sibling entries.
+The coordinator is the only cross-entry writer. Under the domain migration lock
+and the shared panel-operation (SSH) lock it fences every Brilliant entry's
+setup, quiesces the legacy runtimes, plans with the pure :mod:`.migration`
+planner from the exact snapshots it journals, converts the deterministic anchor
+(smallest entry ID) into the singleton fleet entry, adds one journaled panel
+subentry per legacy entry, retargets the integration-owned entity/device
+registry associations, sets up and verifies the fleet runtime, proves config
+entries + both registries on disk, persists the ``fleet_verified`` commit
+point, and only then removes the sibling entries.
 
-Before the commit point any failure reverses to the exact original entries and
-registry associations. At/after it, recovery only finishes sibling removal.
-Migration never contacts, reinstalls, restarts, or rewrites a panel.
+Every journal write and every terminal state is proven on disk (see
+:mod:`.migration_persistence`). Before the commit point any failure reverses to
+the exact original entries and registry associations; at/after it, recovery
+only finishes sibling removal. While a journal is unresolved, the setup fence
+keeps mixed fleet/legacy generations from ever starting. Migration never
+contacts, reinstalls, restarts, or rewrites a panel.
 """
 
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from types import MappingProxyType
 from typing import Any
 from uuid import uuid4
@@ -32,6 +38,11 @@ from homeassistant.helpers import issue_registry as ir
 from . import fleet_manager
 from .const import (
     CONF_ENTRY_KIND,
+    CONF_HUE_CA_CERT,
+    CONF_MQTT_PASSWORD,
+    CONF_MQTT_TLS_CA,
+    CONF_MQTT_USERNAME,
+    CONF_ROOT_PASSWORD,
     CONFIG_ENTRY_VERSION,
     DOMAIN,
     ENTRY_KIND_FLEET,
@@ -45,9 +56,12 @@ from .migration import (
     MigrationConflictReport,
     MigrationPlan,
     plan_migration,
+    secret_equal,
 )
 from .migration_journal import (
     COMMITTED_PHASES,
+    OUTCOME_MIGRATED,
+    OUTCOME_REVERTED,
     DeviceAssociation,
     EntityAssociation,
     EntrySnapshot,
@@ -57,19 +71,30 @@ from .migration_journal import (
     MigrationRecord,
     SubentryPlan,
 )
+from .migration_persistence import (
+    PersistenceUnprovenError,
+    async_persist_config_entries,
+    async_persist_device_registry,
+    async_persist_entity_registry,
+)
 from .provisioning_journal import ProvisioningJournal
 
 _LOGGER = logging.getLogger(__name__)
 
 DATA_MIGRATION_LOCK = "migration_lock"
 DATA_MIGRATION_REMOVING = "migration_removing"
+DATA_MIGRATION_FENCE = "migration_fence"
 ISSUE_MIGRATION_AVAILABLE = "legacy_migration_available"
 ISSUE_MIGRATION_RECOVERY_FAILED = "migration_recovery_failed"
+ISSUE_MIGRATION_REVERTED_NOT_LOADED = "migration_reverted_not_loaded"
 _DOCS_URL = "https://github.com/joyfulhouse/brilliant-mqtt/blob/main/docs/ha-integration.md"
 _PANEL_OPERATION_WAIT_SECONDS = 120.0
+# Values compared in constant time when proving an entry is unchanged.
+_SECRET_DATA_KEYS = frozenset(
+    {CONF_ROOT_PASSWORD, CONF_MQTT_PASSWORD, CONF_MQTT_USERNAME, CONF_MQTT_TLS_CA, CONF_HUE_CA_CERT}
+)
 
 type Checkpoint = Callable[[str], Awaitable[None]]
-type PersistenceWaiter = Callable[[HomeAssistant, ConfigEntry[Any]], Awaitable[None]]
 
 
 class MigrationError(Exception):
@@ -78,6 +103,48 @@ class MigrationError(Exception):
     def __init__(self, code: str) -> None:
         super().__init__(code)
         self.code = code
+
+
+class MigrationFence:
+    """Keep Brilliant entries from starting while a migration is unresolved.
+
+    ``async_setup_entry`` consults it: while active, only explicitly allowed
+    entries (the anchor being verified, or the committed fleet) may set up, so a
+    scheduled reload/setup-retry can never start a legacy sibling next to the
+    converted fleet. ``quiet`` holds entries whose next setup is a migration
+    restoration that must not contact the panel.
+    """
+
+    def __init__(self) -> None:
+        self.active = False
+        self.allowed: set[str] = set()
+        self.quiet: set[str] = set()
+
+    def activate(self) -> None:
+        self.active = True
+
+    def deactivate(self) -> None:
+        self.active = False
+        self.allowed.clear()
+
+    def blocks(self, entry_id: str) -> bool:
+        return self.active and entry_id not in self.allowed
+
+    def consume_quiet(self, entry_id: str) -> bool:
+        if entry_id in self.quiet:
+            self.quiet.discard(entry_id)
+            return True
+        return False
+
+
+def migration_fence(hass: HomeAssistant) -> MigrationFence:
+    """Return the domain-wide setup fence."""
+    domain_data: dict[str, Any] = hass.data.setdefault(DOMAIN, {})
+    fence = domain_data.get(DATA_MIGRATION_FENCE)
+    if not isinstance(fence, MigrationFence):
+        fence = MigrationFence()
+        domain_data[DATA_MIGRATION_FENCE] = fence
+    return fence
 
 
 def migration_lock(hass: HomeAssistant) -> asyncio.Lock:
@@ -125,7 +192,8 @@ def async_update_migration_issue(hass: HomeAssistant) -> None:
 
 
 @callback
-def _async_report_recovery_failure(hass: HomeAssistant, code: str) -> None:
+def async_report_recovery_failure(hass: HomeAssistant, code: str) -> None:
+    """Keep one redacted issue while a migration journal is unresolved."""
     ir.async_create_issue(
         hass,
         DOMAIN,
@@ -140,7 +208,7 @@ def _async_report_recovery_failure(hass: HomeAssistant, code: str) -> None:
 
 
 def _error_code(error: BaseException) -> str:
-    if isinstance(error, (MigrationError, MigrationJournalError)):
+    if isinstance(error, (MigrationError, MigrationJournalError, PersistenceUnprovenError)):
         return error.code
     if isinstance(error, EntryDataError):
         return str(error)
@@ -155,20 +223,51 @@ def _blocker(code: str, field: str, entries: Sequence[ConfigEntry[Any]] = ()) ->
     }
 
 
+def _text(value: object) -> str | None:
+    return None if value is None else str(value)
+
+
+def _data_matches(live: Mapping[str, Any], snapshot: Mapping[str, Any]) -> bool:
+    """Deep-compare entry data, credentials in constant time."""
+    if set(live) != set(snapshot):
+        return False
+    for key, value in snapshot.items():
+        if key in _SECRET_DATA_KEYS and (isinstance(value, str) or value is None):
+            if not secret_equal(live[key], value):
+                return False
+        elif live[key] != value:
+            return False
+    return True
+
+
+def _conflict_summary(
+    result: MigrationPlan | MigrationConflictReport,
+    blockers: Sequence[dict[str, Any]],
+    candidate_count: int,
+    *,
+    dry_run: bool,
+) -> dict[str, Any]:
+    summary: dict[str, Any] = (
+        result.summary()
+        if isinstance(result, MigrationConflictReport)
+        else {"status": "conflicts", "candidate_count": candidate_count, "conflicts": []}
+    )
+    summary["status"] = "conflicts"
+    summary["conflicts"] = [*summary["conflicts"], *blockers]
+    summary["dry_run"] = dry_run
+    return summary
+
+
 class MigrationCoordinator:
     """Run or recover one legacy-to-fleet migration."""
 
-    def __init__(
-        self,
-        hass: HomeAssistant,
-        *,
-        checkpoint: Checkpoint | None = None,
-        persistence_waiter: PersistenceWaiter | None = None,
-    ) -> None:
+    def __init__(self, hass: HomeAssistant, *, checkpoint: Checkpoint | None = None) -> None:
         self.hass = hass
         self._journal = MigrationJournal(hass)
         self._checkpoint = checkpoint
-        self._persistence_waiter = persistence_waiter
+        self._fence = migration_fence(hass)
+        # The latest record proven on disk; exception handling keys off it.
+        self._durable: MigrationRecord | None = None
 
     async def _point(self, name: str) -> None:
         """Failure-injection seam between every journal save and mutation."""
@@ -178,12 +277,16 @@ class MigrationCoordinator:
     async def _save(self, record: MigrationRecord) -> MigrationRecord:
         await self._point(f"before_save:{record.phase.value}")
         await self._journal.async_save(record)
+        self._durable = record
         await self._point(f"after_save:{record.phase.value}")
         return record
 
-    async def _async_wait_persisted(self, entry: ConfigEntry[Any]) -> None:
-        waiter = self._persistence_waiter or fleet_manager.async_wait_config_entry_persisted
-        await waiter(self.hass, entry)
+    async def _async_remove_journal(self) -> None:
+        await self._point("remove_journal")
+        await self._journal.async_remove()
+        self._durable = None
+        self._fence.deactivate()
+        ir.async_delete_issue(self.hass, DOMAIN, ISSUE_MIGRATION_RECOVERY_FAILED)
 
     # ------------------------------------------------------------------ public
 
@@ -193,6 +296,8 @@ class MigrationCoordinator:
             try:
                 pending = await self._journal.async_load()
             except MigrationJournalError as error:
+                self._fence.activate()
+                async_report_recovery_failure(self.hass, error.code)
                 return {"status": "recovery_failed", "dry_run": dry_run, "error": error.code}
             if pending is not None:
                 if dry_run:
@@ -214,38 +319,50 @@ class MigrationCoordinator:
                     "fleet_entry_id": fleets[0].entry_id,
                 }
 
+            # Fail fast on an ineligible fleet; the binding plan is recomputed
+            # below from the exact quiesced snapshots that get journaled.
             result = plan_migration([LegacySnapshot.from_entry(entry) for entry in entries])
             blockers = await self._async_blockers(entries)
             if isinstance(result, MigrationConflictReport) or blockers:
-                summary: dict[str, Any] = (
-                    result.summary()
-                    if isinstance(result, MigrationConflictReport)
-                    else {"status": "conflicts", "candidate_count": len(entries), "conflicts": []}
-                )
-                summary["status"] = "conflicts"
-                summary["conflicts"] = [*summary["conflicts"], *blockers]
-                summary["dry_run"] = dry_run
-                return summary
+                return _conflict_summary(result, blockers, len(entries), dry_run=dry_run)
             if dry_run:
                 return {**result.summary(), "dry_run": True}
             if not await mqtt.async_wait_for_mqtt_client(self.hass):
-                return {
-                    "status": "conflicts",
-                    "dry_run": False,
-                    "candidate_count": len(entries),
-                    "conflicts": [_blocker("mqtt_unavailable", "mqtt")],
-                }
-            return await self._async_execute(result)
+                return _conflict_summary(
+                    result, [_blocker("mqtt_unavailable", "mqtt")], len(entries), dry_run=False
+                )
+
+            ssh_lock = fleet_manager._shared_ssh_lock(self.hass)
+            try:
+                async with asyncio.timeout(_PANEL_OPERATION_WAIT_SECONDS):
+                    await ssh_lock.acquire()
+            except TimeoutError:
+                return _conflict_summary(
+                    result,
+                    [_blocker("panel_operation_in_progress", "ssh")],
+                    len(entries),
+                    dry_run=False,
+                )
+            try:
+                return await self._async_execute()
+            finally:
+                ssh_lock.release()
 
     async def async_recover(self) -> dict[str, Any] | None:
-        """Startup recovery: settle a journaled migration before entries load."""
+        """Startup recovery: settle a journaled migration before entries load.
+
+        The fence is raised first and stays raised unless recovery resolves the
+        journal, so a failed recovery can never start mixed generations.
+        """
         async with migration_lock(self.hass):
+            self._fence.activate()
             try:
                 record = await self._journal.async_load()
             except MigrationJournalError as error:
-                _async_report_recovery_failure(self.hass, error.code)
+                async_report_recovery_failure(self.hass, error.code)
                 return {"status": "recovery_failed", "error": error.code}
             if record is None:
+                self._fence.deactivate()
                 return None
             return await self._async_recover_locked(record, live=False)
 
@@ -298,21 +415,23 @@ class MigrationCoordinator:
                 return True
         return False
 
-    def _build_record(self, plan: MigrationPlan) -> MigrationRecord:
-        entries: list[EntrySnapshot] = []
-        for entry_id in plan.candidate_ids:
-            entry = self.hass.config_entries.async_get_known_entry(entry_id)
-            entries.append(
-                EntrySnapshot(
-                    entry_id=entry.entry_id,
-                    title=entry.title,
-                    unique_id=entry.unique_id,
-                    version=entry.version,
-                    minor_version=entry.minor_version,
-                    data=dict(entry.data),
-                    options=dict(entry.options),
-                )
+    def _build_record(
+        self, plan: MigrationPlan, snapshots: Sequence[LegacySnapshot]
+    ) -> MigrationRecord:
+        """Journal exactly the snapshots the plan was computed from."""
+        by_id = {snapshot.entry_id: snapshot for snapshot in snapshots}
+        entries = [
+            EntrySnapshot(
+                entry_id=entry_id,
+                title=by_id[entry_id].title,
+                unique_id=by_id[entry_id].unique_id,
+                version=by_id[entry_id].version,
+                minor_version=by_id[entry_id].minor_version,
+                data=copy.deepcopy(dict(by_id[entry_id].data)),
+                options=copy.deepcopy(dict(by_id[entry_id].options)),
             )
+            for entry_id in plan.candidate_ids
+        ]
         ent_reg = er.async_get(self.hass)
         dev_reg = dr.async_get(self.hass)
         entities: list[EntityAssociation] = []
@@ -363,58 +482,142 @@ class MigrationCoordinator:
 
     # ---------------------------------------------------------------- forward
 
-    async def _async_execute(self, plan: MigrationPlan) -> dict[str, Any]:
-        # Wait for any in-flight panel SSH operation so no legacy runtime can write
-        # its entry after the snapshot. Fleet setup never takes this lock.
-        ssh_lock = fleet_manager._shared_ssh_lock(self.hass)
-        try:
-            async with asyncio.timeout(_PANEL_OPERATION_WAIT_SECONDS):
-                await ssh_lock.acquire()
-        except TimeoutError:
-            return {
-                "status": "conflicts",
-                "dry_run": False,
-                "candidate_count": len(plan.candidate_ids),
-                "conflicts": [_blocker("panel_operation_in_progress", "ssh")],
-            }
-        failure: Exception | None = None
-        try:
-            record = self._build_record(plan)
-            try:
-                record = await self._async_forward(await self._save(record))
-            except Exception as error:
-                failure = error
-                _LOGGER.warning(
-                    "Legacy fleet migration failed before commit (%s); reversing",
-                    _error_code(error),
-                )
-                try:
-                    await self._async_reverse(record, _error_code(error))
-                except Exception as reverse_error:
-                    code = _error_code(reverse_error)
-                    _async_report_recovery_failure(self.hass, code)
-                    return {
-                        "status": "recovery_failed",
-                        "dry_run": False,
-                        "error": _error_code(error),
-                        "recovery_error": code,
-                    }
-        finally:
-            ssh_lock.release()
+    def _snapshot_record(self, record: MigrationRecord) -> None:
+        """Fail closed if any candidate changed since it was journaled."""
+        for original in record.entries:
+            entry = self.hass.config_entries.async_get_entry(original.entry_id)
+            if (
+                entry is None
+                or entry.title != original.title
+                or entry.unique_id != original.unique_id
+                or entry.version != original.version
+                or entry.minor_version != original.minor_version
+                or entry.subentries
+                or not _data_matches(entry.data, original.data)
+                or not _data_matches(entry.options, original.options)
+            ):
+                raise MigrationError("entry_changed_during_migration")
 
-        if failure is not None:
-            # Legacy setup may itself SSH (HA-mirror retirement audit), so the
-            # originals reload only after the panel-operation lock is released.
-            await self._async_reload_originals(record)
-            return {"status": "reverted", "dry_run": False, "error": _error_code(failure)}
+    async def _async_quiesce(self, entry_ids: Iterable[str]) -> None:
+        """Unload every listed runtime (also cancels a fenced setup retry)."""
+        for entry_id in entry_ids:
+            await self._point(f"unload:{entry_id}")
+            entry = self.hass.config_entries.async_get_entry(entry_id)
+            if entry is None:
+                raise MigrationError("candidate_missing")
+            if entry.state is ConfigEntryState.NOT_LOADED:
+                continue
+            if not entry.state.recoverable or not (
+                await self.hass.config_entries.async_unload(entry_id)
+            ):
+                raise MigrationError("unload_failed")
+
+    async def _async_execute(self) -> dict[str, Any]:
+        """Fence, quiesce, re-plan from the journaled snapshots, then migrate."""
+        self._fence.activate()
+        self._durable = None
+        candidate_ids = [entry.entry_id for entry in self.hass.config_entries.async_entries(DOMAIN)]
         try:
-            await self._async_remove_siblings(record)
+            await self._async_quiesce(candidate_ids)
         except Exception as error:
-            code = _error_code(error)
-            _LOGGER.warning("Legacy sibling removal did not finish (%s)", code)
-            _async_report_recovery_failure(self.hass, code)
-            return {"status": "incomplete", "dry_run": False, "error": code}
-        return self._migrated_outcome(record)
+            return await self._async_reload(candidate_ids, error=_error_code(error))
+
+        entries = self.hass.config_entries.async_entries(DOMAIN)
+        snapshots = [LegacySnapshot.from_entry(entry) for entry in entries]
+        result = plan_migration(snapshots)
+        blockers = await self._async_blockers(entries)
+        if isinstance(result, MigrationConflictReport) or blockers:
+            await self._async_reload(candidate_ids, error=None)
+            return _conflict_summary(result, blockers, len(entries), dry_run=False)
+
+        record = self._build_record(result, snapshots)
+        try:
+            await self._async_forward(record)
+            durable = self._durable
+            assert durable is not None
+            return await self._async_complete_migration(durable)
+        except Exception as error:
+            return await self._async_handle_failure(record, error)
+
+    async def _async_handle_failure(
+        self, record: MigrationRecord, error: Exception
+    ) -> dict[str, Any]:
+        """Settle a failure from the latest durable phase, never a stale local one."""
+        code = _error_code(error)
+        durable = self._durable
+        if durable is None:
+            # The planned record never reached disk, so nothing was mutated.
+            _LOGGER.warning("Legacy fleet migration did not start (%s)", code)
+            return await self._async_reload(record.candidates, error=code)
+        if durable.phase in COMMITTED_PHASES or durable.outcome == OUTCOME_MIGRATED:
+            # Past the commit point: never reverse; finish sibling removal.
+            _LOGGER.warning("Legacy fleet migration interrupted after commit (%s)", code)
+            try:
+                return await self._async_complete_migration(durable)
+            except Exception as finish_error:
+                finish_code = _error_code(finish_error)
+                async_report_recovery_failure(self.hass, finish_code)
+                return {"status": "incomplete", "dry_run": False, "error": finish_code}
+        _LOGGER.warning("Legacy fleet migration failed before commit (%s); reversing", code)
+        try:
+            await self._async_reverse(durable, code)
+        except Exception as reverse_error:
+            reverse_code = _error_code(reverse_error)
+            async_report_recovery_failure(self.hass, reverse_code)
+            return {
+                "status": "recovery_failed",
+                "dry_run": False,
+                "error": code,
+                "recovery_error": reverse_code,
+            }
+        return await self._async_reload(record.candidates, error=code)
+
+    async def _async_reload(self, entry_ids: Iterable[str], *, error: str | None) -> dict[str, Any]:
+        """Lift the fence and quietly restart the originals; report what loaded."""
+        ids = list(entry_ids)
+        self._fence.deactivate()
+        not_loaded: list[str] = []
+        for entry_id in ids:
+            entry = self.hass.config_entries.async_get_entry(entry_id)
+            if entry is None:
+                not_loaded.append(entry_id)
+                continue
+            if entry.state is not ConfigEntryState.LOADED:
+                try:
+                    if entry.state is not ConfigEntryState.NOT_LOADED:
+                        await self.hass.config_entries.async_unload(entry_id)
+                    self._fence.quiet.add(entry_id)
+                    await self.hass.config_entries.async_setup(entry_id)
+                except Exception as setup_error:
+                    _LOGGER.warning(
+                        "Restored legacy entry did not set up (%s)", type(setup_error).__name__
+                    )
+                finally:
+                    self._fence.quiet.discard(entry_id)
+            if entry.state is not ConfigEntryState.LOADED:
+                not_loaded.append(entry_id)
+        if error is None:
+            return {"status": "not_started", "dry_run": False}
+        if not_loaded:
+            ir.async_create_issue(
+                self.hass,
+                DOMAIN,
+                ISSUE_MIGRATION_REVERTED_NOT_LOADED,
+                is_fixable=False,
+                is_persistent=False,
+                severity=ir.IssueSeverity.WARNING,
+                translation_key=ISSUE_MIGRATION_REVERTED_NOT_LOADED,
+                translation_placeholders={"count": str(len(not_loaded))},
+                learn_more_url=_DOCS_URL,
+            )
+            return {
+                "status": "reverted_config_only",
+                "dry_run": False,
+                "error": error,
+                "not_loaded_entry_ids": not_loaded,
+            }
+        ir.async_delete_issue(self.hass, DOMAIN, ISSUE_MIGRATION_REVERTED_NOT_LOADED)
+        return {"status": "reverted", "dry_run": False, "error": error}
 
     def _migrated_outcome(self, record: MigrationRecord) -> dict[str, Any]:
         return {
@@ -434,20 +637,14 @@ class MigrationCoordinator:
             "removed_entry_ids": list(record.siblings),
         }
 
-    async def _async_forward(self, record: MigrationRecord) -> MigrationRecord:
-        """Advance planned → fleet_verified; every step is idempotent."""
-        for entry_id in record.candidates:
-            await self._point(f"unload:{entry_id}")
-            entry = self.hass.config_entries.async_get_entry(entry_id)
-            if entry is None:
-                raise MigrationError("candidate_missing")
-            if entry.state is not ConfigEntryState.NOT_LOADED and not (
-                await self.hass.config_entries.async_unload(entry_id)
-            ):
-                raise MigrationError("unload_failed")
+    async def _async_forward(self, record: MigrationRecord) -> None:
+        """Advance planned -> fleet_verified; every step is idempotent."""
+        record = await self._save(record)
+        await self._async_quiesce(record.candidates)
         record = await self._save(record.advanced(MigrationPhase.QUIESCED))
 
         await self._point("convert_anchor")
+        self._snapshot_record(record)
         self._apply_conversion(record)
         record = await self._save(record.advanced(MigrationPhase.ANCHOR_CONVERTED))
 
@@ -457,15 +654,118 @@ class MigrationCoordinator:
 
         await self._point("setup_fleet")
         anchor = self._anchor(record)
-        if not await self.hass.config_entries.async_setup(anchor.entry_id):
+        await self._async_quiesce([anchor.entry_id])
+        self._fence.allowed.add(anchor.entry_id)
+        try:
+            set_up = await self.hass.config_entries.async_setup(anchor.entry_id)
+        finally:
+            self._fence.allowed.discard(anchor.entry_id)
+        if not set_up:
             raise MigrationError("fleet_setup_failed")
         await self._point("verify_fleet")
         self._verify_fleet(record)
-        try:
-            await self._async_wait_persisted(anchor)
-        except Exception:
-            raise MigrationError("config_entry_storage_unavailable") from None
-        return await self._save(record.advanced(MigrationPhase.FLEET_VERIFIED))
+        await self._async_prove(record)
+        await self._save(record.advanced(MigrationPhase.FLEET_VERIFIED))
+        # The committed fleet may now reload; legacy siblings stay fenced.
+        self._fence.allowed.add(anchor.entry_id)
+
+    async def _async_complete_migration(self, record: MigrationRecord) -> dict[str, Any]:
+        """Remove siblings after the commit point, prove it on disk, then finish."""
+        self._fence.allowed.add(record.anchor_entry_id)
+        if record.phase is MigrationPhase.FLEET_VERIFIED:
+            record = await self._save(record.advanced(MigrationPhase.SIBLINGS_REMOVING))
+        removing = migration_removing(self.hass)
+        for entry_id in record.siblings:
+            if self.hass.config_entries.async_get_entry(entry_id) is not None:
+                # Idempotent: a registry write that did not reach disk before a
+                # crash must never let HA's removal cleanup delete an entity. Past
+                # the commit point a vanished entity is no reason to stop.
+                self._retarget_registries(record, strict=False)
+                await self._point(f"remove:{entry_id}")
+                removing.add(entry_id)
+                try:
+                    await self.hass.config_entries.async_remove(entry_id)
+                finally:
+                    removing.discard(entry_id)
+            if record.phase is MigrationPhase.SIBLINGS_REMOVING and entry_id not in record.removed:
+                record = await self._save(
+                    record.advanced(
+                        MigrationPhase.SIBLINGS_REMOVING,
+                        removed=(*record.removed, entry_id),
+                    )
+                )
+        anchor = self._anchor(record)
+        if not _is_fleet(anchor) or set(anchor.subentries) != set(
+            record.subentry_by_entry.values()
+        ):
+            raise MigrationError("fleet_runtime_mismatch")
+        await self._point("prove_migrated")
+        await self._async_prove(record)
+        if record.phase is not MigrationPhase.COMPLETE:
+            record = await self._save(
+                record.advanced(MigrationPhase.COMPLETE, outcome=OUTCOME_MIGRATED)
+            )
+        await self._async_remove_journal()
+        async_update_migration_issue(self.hass)
+        _LOGGER.info(
+            "Consolidated %d legacy Brilliant entries into one fleet", len(record.candidates)
+        )
+        return self._migrated_outcome(record)
+
+    async def _async_prove(self, record: MigrationRecord) -> None:
+        """Flush config entries and both registries, then prove disk == memory."""
+        await self._point("prove")
+        disk_entries = await async_persist_config_entries(self.hass)
+        disk_entities = await async_persist_entity_registry(self.hass)
+        disk_devices = await async_persist_device_registry(self.hass)
+        for entry_id in record.candidates:
+            entry = self.hass.config_entries.async_get_entry(entry_id)
+            stored = disk_entries.get(entry_id)
+            if entry is None:
+                if stored is not None:
+                    raise PersistenceUnprovenError()
+            elif stored is None or dict(stored) != dict(
+                fleet_manager._canonical_entry_storage(entry)
+            ):
+                raise PersistenceUnprovenError()
+        ent_reg = er.async_get(self.hass)
+        for association in record.entities:
+            live = ent_reg.async_get(association.entity_id)
+            disk = disk_entities.get(association.entity_id)
+            if live is None:
+                if disk is not None and disk.get("unique_id") == association.unique_id:
+                    raise PersistenceUnprovenError()
+                continue
+            if disk is None or (
+                disk.get("unique_id"),
+                disk.get("config_entry_id"),
+                disk.get("config_subentry_id"),
+                disk.get("disabled_by"),
+                disk.get("hidden_by"),
+            ) != (
+                live.unique_id,
+                live.config_entry_id,
+                live.config_subentry_id,
+                _text(live.disabled_by),
+                _text(live.hidden_by),
+            ):
+                raise PersistenceUnprovenError()
+        dev_reg = dr.async_get(self.hass)
+        for device_association in record.devices:
+            device = dev_reg.async_get(device_association.device_id)
+            stored_device = disk_devices.get(device_association.device_id)
+            if device is None:
+                if stored_device is not None:
+                    raise PersistenceUnprovenError()
+                continue
+            raw = stored_device.get("config_entries_subentries") if stored_device else None
+            if not isinstance(raw, Mapping) or {
+                str(owner): set(subentries) for owner, subentries in raw.items()
+            } != {
+                owner: set(subentries)
+                for owner, subentries in device.config_entries_subentries.items()
+            }:
+                raise PersistenceUnprovenError()
 
     def _anchor(self, record: MigrationRecord) -> ConfigEntry[Any]:
         anchor = self.hass.config_entries.async_get_entry(record.anchor_entry_id)
@@ -581,6 +881,10 @@ class MigrationCoordinator:
         expected = {plan.subentry_id: plan for plan in record.subentries}
         if set(runtime.panels) != set(expected) or set(anchor.subentries) != set(expected):
             raise MigrationError("fleet_runtime_mismatch")
+        if runtime.runtime_owned_panel_ids != frozenset(expected):
+            # FleetManager inserts every manager before starting it and tolerates
+            # individual start failures; only a started runtime owns its panel.
+            raise MigrationError("fleet_runtime_mismatch")
         for subentry_id, manager in runtime.panels.items():
             plan = expected[subentry_id]
             if (
@@ -622,53 +926,20 @@ class MigrationCoordinator:
                 if owner not in candidates and set(links.get(owner, set())) != set(subentries):
                     raise MigrationError("registry_mismatch")
 
-    async def _async_remove_siblings(self, record: MigrationRecord) -> None:
-        """Remove each sibling only after the commit point, journaling progress."""
-        if record.phase is MigrationPhase.FLEET_VERIFIED:
-            record = await self._save(record.advanced(MigrationPhase.SIBLINGS_REMOVING))
-        removing = migration_removing(self.hass)
-        for entry_id in record.siblings:
-            if self.hass.config_entries.async_get_entry(entry_id) is not None:
-                # Idempotent: a registry write that did not reach disk before a
-                # crash must never let HA's removal cleanup delete an entity. Past
-                # the commit point a vanished entity is no reason to stop.
-                self._retarget_registries(record, strict=False)
-                await self._point(f"remove:{entry_id}")
-                removing.add(entry_id)
-                try:
-                    await self.hass.config_entries.async_remove(entry_id)
-                finally:
-                    removing.discard(entry_id)
-            if entry_id not in record.removed:
-                record = await self._save(
-                    record.advanced(
-                        MigrationPhase.SIBLINGS_REMOVING,
-                        removed=(*record.removed, entry_id),
-                    )
-                )
-        record = await self._save(record.advanced(MigrationPhase.COMPLETE))
-        await self._journal.async_remove()
-        ir.async_delete_issue(self.hass, DOMAIN, ISSUE_MIGRATION_RECOVERY_FAILED)
-        async_update_migration_issue(self.hass)
-        _LOGGER.info(
-            "Consolidated %d legacy Brilliant entries into one fleet", len(record.candidates)
-        )
-
     # ---------------------------------------------------------------- reverse
 
     async def _async_reverse(self, record: MigrationRecord, error: str) -> None:
-        """Restore the exact original entries and registry associations."""
-        if record.phase is not MigrationPhase.REVERSING:
-            record = await self._save(record.advanced(MigrationPhase.REVERSING, last_error=error))
-        for entry_id in record.candidates:
-            entry = self.hass.config_entries.async_get_entry(entry_id)
-            if entry is None:
-                raise MigrationError("candidate_missing")
-            if entry.state is not ConfigEntryState.NOT_LOADED:
-                if not entry.state.recoverable or not (
-                    await self.hass.config_entries.async_unload(entry_id)
-                ):
-                    raise MigrationError("unload_failed")
+        """Restore the exact original entries and registry associations, proven on disk."""
+        if record.phase is not MigrationPhase.COMPLETE:
+            if record.phase is not MigrationPhase.REVERSING:
+                record = record.advanced(MigrationPhase.REVERSING, last_error=error)
+            try:
+                record = await self._save(record)
+            except MigrationJournalError:
+                # The durable journal is still in a reversible phase, so recovery
+                # would reverse too; restoring memory now is always safe.
+                _LOGGER.warning("Migration reversal could not be journaled; restoring anyway")
+        await self._async_quiesce(record.candidates)
         await self._point("reverse_registries")
         self._restore_registries(record)
         await self._point("reverse_anchor")
@@ -679,17 +950,21 @@ class MigrationCoordinator:
         original = record.entry(record.anchor_entry_id)
         self.hass.config_entries.async_update_entry(
             anchor,
-            data=dict(original.data),
-            options=dict(original.options),
+            data=copy.deepcopy(dict(original.data)),
+            options=copy.deepcopy(dict(original.options)),
             title=original.title,
             unique_id=original.unique_id,
             version=original.version,
             minor_version=original.minor_version,
         )
         self._verify_reversed(record)
-        await self._save(record.advanced(MigrationPhase.COMPLETE))
-        await self._journal.async_remove()
-        ir.async_delete_issue(self.hass, DOMAIN, ISSUE_MIGRATION_RECOVERY_FAILED)
+        await self._point("prove_reverted")
+        await self._async_prove(record)
+        if record.phase is not MigrationPhase.COMPLETE:
+            await self._save(record.advanced(MigrationPhase.COMPLETE, outcome=OUTCOME_REVERTED))
+        # Each restored entry's next setup is quiet: it must not contact a panel.
+        self._fence.quiet.update(record.candidates)
+        await self._async_remove_journal()
 
     def _restore_registries(self, record: MigrationRecord) -> None:
         anchor_id = record.anchor_entry_id
@@ -782,42 +1057,32 @@ class MigrationCoordinator:
             if restored != expected:
                 raise MigrationError("reverse_incomplete")
 
-    async def _async_reload_originals(self, record: MigrationRecord) -> None:
-        for entry_id in record.candidates:
-            entry = self.hass.config_entries.async_get_entry(entry_id)
-            if entry is None or entry.state is not ConfigEntryState.NOT_LOADED:
-                continue
-            try:
-                await self.hass.config_entries.async_setup(entry_id)
-            except Exception as error:
-                _LOGGER.warning("Restored legacy entry did not set up (%s)", type(error).__name__)
-
     # --------------------------------------------------------------- recovery
 
     async def _async_recover_locked(self, record: MigrationRecord, *, live: bool) -> dict[str, Any]:
+        self._fence.activate()
+        self._durable = record
         try:
-            if record.phase is MigrationPhase.COMPLETE:
-                await self._journal.async_remove()
-                return {"status": "recovered", "phase": record.phase.value}
-            if record.phase in COMMITTED_PHASES:
-                self._finish_conversion(record)
-                await self._async_remove_siblings(record)
-                if live:
-                    anchor = self._anchor(record)
-                    if anchor.state is ConfigEntryState.NOT_LOADED:
-                        await self.hass.config_entries.async_setup(anchor.entry_id)
-                return {**self._migrated_outcome(record), "recovered": True}
+            if record.phase in COMMITTED_PHASES or record.outcome == OUTCOME_MIGRATED:
+                self._apply_conversion(record)
+                self._retarget_registries(record, strict=False)
+                outcome = await self._async_complete_migration(record)
+                anchor = self._anchor(record)
+                if live and anchor.state is not ConfigEntryState.LOADED:
+                    await self._async_quiesce([anchor.entry_id])
+                    await self.hass.config_entries.async_setup(anchor.entry_id)
+                return {**outcome, "recovered": True}
             await self._async_reverse(record, record.last_error or "interrupted")
             if live:
-                await self._async_reload_originals(record)
+                reloaded = await self._async_reload(
+                    record.candidates, error=record.last_error or "interrupted"
+                )
+                return {**reloaded, "recovered": True}
             return {"status": "reverted", "recovered": True, "error": record.last_error}
         except Exception as error:
             code = _error_code(error)
             _LOGGER.error("Legacy fleet migration recovery failed (%s)", code)
-            _async_report_recovery_failure(self.hass, code)
+            async_report_recovery_failure(self.hass, code)
+            if record.phase in COMMITTED_PHASES or record.outcome == OUTCOME_MIGRATED:
+                self._fence.allowed.add(record.anchor_entry_id)
             return {"status": "recovery_failed", "error": code}
-
-    def _finish_conversion(self, record: MigrationRecord) -> None:
-        """Past the commit point, converge config + registries on the journaled fleet."""
-        self._apply_conversion(record)
-        self._retarget_registries(record, strict=False)

@@ -221,6 +221,7 @@ class LegacySnapshot:
     disabled: bool
     data: Mapping[str, Any] = field(repr=False)
     options: Mapping[str, Any] = field(repr=False)
+    minor_version: int = 1
 
     @classmethod
     def from_entry(cls, entry: ConfigEntry[Any]) -> LegacySnapshot:
@@ -233,6 +234,7 @@ class LegacySnapshot:
             disabled=entry.disabled_by is not None,
             data=MappingProxyType(copy.deepcopy(dict(entry.data))),
             options=MappingProxyType(copy.deepcopy(dict(entry.options))),
+            minor_version=entry.minor_version,
         )
 
 
@@ -426,7 +428,8 @@ def _valid_ca(value: str) -> bool:
     return True
 
 
-def _secret_equal(left: object, right: object) -> bool:
+def secret_equal(left: object, right: object) -> bool:
+    """Compare two optional credential strings in constant time."""
     if left is None or right is None:
         return left is right
     if not isinstance(left, str) or not isinstance(right, str):
@@ -453,7 +456,7 @@ def _group(values: Sequence[_Global]) -> list[list[_Global]]:
         for group in groups:
             reference = group[0]
             equal = (
-                _secret_equal(reference.value, item.value)
+                secret_equal(reference.value, item.value)
                 if item.secret
                 else reference.value == item.value
             )

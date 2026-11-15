@@ -74,7 +74,9 @@ from .manager import PanelManager, async_delete_panel_issues
 from .migration_coordinator import (
     ISSUE_MIGRATION_AVAILABLE,
     MigrationCoordinator,
+    async_report_recovery_failure,
     async_update_migration_issue,
+    migration_fence,
     migration_removing,
 )
 
@@ -380,20 +382,35 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     # Settle an interrupted migration before HA sets up this domain's entries:
     # reverse to the exact originals before the commit point, or finish sibling
     # removal after it. Config/registry work only; never contacts a panel.
+    # The fence is raised for the whole recovery and stays raised unless the
+    # journal is resolved, so a failed (or crashed) recovery can never let both
+    # the converted fleet and unremoved legacy siblings start.
+    fence = migration_fence(hass)
+    fence.activate()
     try:
         await MigrationCoordinator(hass).async_recover()
     except Exception as error:
         _LOGGER.error("Legacy fleet migration recovery failed (%s)", type(error).__name__)
+        async_report_recovery_failure(hass, "recovery_crashed")
     async_update_migration_issue(hass)
     return True
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: BrilliantMqttConfigEntry) -> bool:
+    fence = migration_fence(hass)
+    if fence.blocks(entry.entry_id):
+        # A legacy-to-fleet migration is running or awaiting recovery; starting
+        # this entry could run a legacy panel next to the converted fleet.
+        raise ConfigEntryNotReady("A Brilliant legacy fleet migration is unresolved")
     # Every panel surface (retained state/LWT subscriptions, command publishes) rides
     # HA's mqtt integration, so don't set up "green" against a broker that isn't up yet.
     if not await mqtt.async_wait_for_mqtt_client(hass):
         raise ConfigEntryNotReady("MQTT integration is not available")
-    manager = FleetManager(hass, entry)
+    manager = FleetManager(
+        hass,
+        entry,
+        defer_setup_panel_contact=fence.consume_quiet(entry.entry_id),
+    )
     entry.runtime_data = manager
     from .ha_control import get_control_plane
 

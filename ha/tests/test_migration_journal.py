@@ -169,3 +169,54 @@ async def test_corrupt_store_raises_redacted_error(
     with pytest.raises(MigrationJournalError) as raised:
         await MigrationJournal(hass).async_load()
     assert SECRET not in str(raised.value)
+
+
+def test_complete_requires_a_terminal_outcome() -> None:
+    done = _record(MigrationPhase.REVERSING).advanced(MigrationPhase.COMPLETE, outcome="reverted")
+    assert MigrationRecord.from_storage(done.to_storage()) == done
+
+    missing = _record(MigrationPhase.REVERSING).advanced(MigrationPhase.COMPLETE).to_storage()
+    with pytest.raises(MigrationJournalError, match="journal_corrupt"):
+        MigrationRecord.from_storage(missing)
+    bogus = done.to_storage() | {"outcome": "sideways"}
+    with pytest.raises(MigrationJournalError, match="journal_corrupt"):
+        MigrationRecord.from_storage(bogus)
+
+
+async def test_unproven_write_is_a_failure_not_a_log_line(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    """Store.async_save swallows WriteError; the journal must not."""
+    from unittest.mock import patch
+
+    from homeassistant.helpers import storage
+    from homeassistant.util.file import WriteError
+
+    journal = MigrationJournal(hass)
+    await journal.async_save(_record())
+    original = storage.Store._async_write_data
+
+    async def failing(store: storage.Store[Any], data: dict[str, Any]) -> None:
+        if store.key == MIGRATION_STORAGE_KEY:
+            raise WriteError("disk full")
+        await original(store, data)
+
+    with (
+        patch.object(storage.Store, "_async_write_data", failing),
+        pytest.raises(MigrationJournalError, match="journal_unproven"),
+    ):
+        await journal.async_save(_record().advanced(MigrationPhase.QUIESCED))
+    # The last proven phase is still what is on disk.
+    stored = await MigrationJournal(hass).async_load()
+    assert stored is not None and stored.phase is MigrationPhase.PLANNED
+
+
+async def test_writes_are_refused_while_home_assistant_stops(hass: HomeAssistant) -> None:
+    from homeassistant.core import CoreState
+
+    hass.set_state(CoreState.stopping)
+    try:
+        with pytest.raises(MigrationJournalError, match="journal_unproven"):
+            await MigrationJournal(hass).async_save(_record())
+    finally:
+        hass.set_state(CoreState.running)

@@ -18,17 +18,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reported by field, code, and entry title, never silently fixed. Duplicate
   positive mesh priorities are one example. A private journal makes the
   migration restart-safe: before the commit point it reverses exactly; after
-  it, startup recovery finishes removing the sibling entries. See
+  it, startup recovery finishes removing the sibling entries. Every journal
+  step and every commit/terminal state is proven on disk, including config
+  entries and both registries. A setup fence keeps legacy and fleet runtimes
+  from ever starting side by side while a migration is unresolved. Every
+  planned panel's runtime must start before the commit. See
   [docs/ha-integration.md](docs/ha-integration.md#legacy_fleet_migration).
-- Repair issues: `legacy_migration_available` while legacy entries remain, and
-  `migration_recovery_failed` if an interrupted migration cannot be settled.
+- Repair issues: `legacy_migration_available` while legacy entries remain,
+  `migration_recovery_failed` if an interrupted migration cannot be settled, and
+  `migration_reverted_not_loaded` if restored legacy entries did not start.
 
 ### Fixed
 
 - A managed (canary) update journal now resolves its owner on a fleet panel
-  whose management ID is not its fingerprint (every migrated panel keeps its
-  legacy entry ID so entity unique IDs never change). Install handoffs still
-  require the fingerprint.
+  whose management ID is its legacy entry ID (kept so entity unique IDs never
+  change). It is accepted only when the subentry ID is exactly the one the
+  migration derived from that ID. Install handoffs still require the
+  fingerprint.
 
 ## [0.11.6] - 2026-11-05
 
