@@ -2348,3 +2348,168 @@ async def test_quiet_finalization_cancelled_keeps_obligation_and_one_manager(
     assert set(office.runtime_data.panels) == {OFFICE_ID}
     assert no_panel_contact.await_count == audits
     assert await QuietRestorations(hass).async_load() == frozenset()
+
+
+# ------------------------------------------------------- round 5: resume + retirement
+
+
+async def test_rerunning_the_action_resumes_an_unresolved_completed_reversal(
+    hass: HomeAssistant,
+    legacy_fleet: list[MockConfigEntry],
+    hass_storage: dict[str, Any],
+    no_panel_contact: AsyncMock,
+    quiet_write_failures: list[bool],
+) -> None:
+    """Converted state on disk + complete/reverted journal + failed obligation write
+    at startup: once storage is repaired, the action (no restart) resumes it."""
+    del legacy_fleet
+    before, _journal_text = await _consumed_reversal_over_converted_disk(hass)
+    audits = no_panel_contact.await_count
+    quiet_write_failures[0] = True
+    await _restart_from_disk(hass, hass_storage, copy.deepcopy(hass_storage))
+    assert _fleet_managers(hass) == []
+    assert migration_fence(hass).active is True
+    assert (await _run(hass, dry_run=True))["status"] == "recovery_pending"
+    assert migration_fence(hass).active is True
+
+    quiet_write_failures[0] = False
+    outcome = await hass.services.async_call(
+        DOMAIN, "migrate_to_fleet", {"dry_run": False}, blocking=True, return_response=True
+    )
+    await hass.async_block_till_done()
+
+    assert outcome is not None
+    assert outcome["status"] == "reverted" and outcome["recovered"] is True
+    assert outcome["outcome"] == "reverted"
+    assert migration_fence(hass).active is False
+    assert no_panel_contact.await_count == audits
+    await _assert_originals(hass, before, hass_storage)
+
+
+class _Retirement:
+    """Hold the quiet-obligation retirement until released."""
+
+    def __init__(self) -> None:
+        from custom_components.brilliant_mqtt.migration_journal import QuietRestorations
+
+        self.release = asyncio.Event()
+        self.started = asyncio.Event()
+        original = QuietRestorations.async_store
+
+        # A plain function, so it binds to the QuietRestorations instance.
+        async def store(quiet: QuietRestorations, entry_ids: frozenset[str]) -> None:
+            self.started.set()
+            await self.release.wait()
+            await original(quiet, entry_ids)
+
+        self.store = store
+
+
+@pytest.fixture
+def tracked_managers() -> Iterator[list[FleetManager]]:
+    created: list[FleetManager] = []
+    original_setup = FleetManager.async_setup
+
+    async def tracked_setup(self: FleetManager) -> None:
+        created.append(self)
+        await original_setup(self)
+
+    with patch.object(FleetManager, "async_setup", tracked_setup):
+        yield created
+
+
+def _live(created: list[FleetManager], entry_id: str) -> list[FleetManager]:
+    return [
+        m for m in created if m.entry.entry_id == entry_id and m.panels and not m._shutting_down
+    ]
+
+
+async def _quiet_office(hass: HomeAssistant) -> None:
+    from custom_components.brilliant_mqtt.migration_journal import QuietRestorations
+
+    await _unload_all(hass)
+    await QuietRestorations(hass).async_store(frozenset({OFFICE_ID}))
+    migration_fence(hass).quiet.add(OFFICE_ID)
+
+
+async def test_delayed_retirement_across_a_reload_leaves_one_manager(
+    hass: HomeAssistant,
+    legacy_fleet: list[MockConfigEntry],
+    no_panel_contact: AsyncMock,
+    tracked_managers: list[FleetManager],
+) -> None:
+    from custom_components.brilliant_mqtt.migration_journal import QuietRestorations
+
+    del legacy_fleet
+    await _quiet_office(hass)
+    audits = no_panel_contact.await_count
+    held = _Retirement()
+    with patch.object(QuietRestorations, "async_store", held.store):
+        assert await hass.config_entries.async_setup(OFFICE_ID)
+        await held.started.wait()
+        first = _live(tracked_managers, OFFICE_ID)
+        assert len(first) == 1
+        assert await hass.config_entries.async_reload(OFFICE_ID)
+        held.release.set()
+        await hass.async_block_till_done()
+
+    live = _live(tracked_managers, OFFICE_ID)
+    assert len(live) == 1 and live[0] is not first[0]
+    assert first[0]._shutting_down
+    assert await QuietRestorations(hass).async_load() == frozenset()
+    assert no_panel_contact.await_count == audits
+
+
+async def test_delayed_retirement_after_entry_removal_resurrects_nothing(
+    hass: HomeAssistant,
+    legacy_fleet: list[MockConfigEntry],
+    no_panel_contact: AsyncMock,
+    tracked_managers: list[FleetManager],
+) -> None:
+    from custom_components.brilliant_mqtt.migration_journal import QuietRestorations
+
+    del legacy_fleet
+    await _quiet_office(hass)
+    audits = no_panel_contact.await_count
+    held = _Retirement()
+    with (
+        patch.object(QuietRestorations, "async_store", held.store),
+        patch("custom_components.brilliant_mqtt.async_recover_removed_entry"),
+    ):
+        assert await hass.config_entries.async_setup(OFFICE_ID)
+        await held.started.wait()
+        await hass.config_entries.async_remove(OFFICE_ID)
+        held.release.set()
+        await hass.async_block_till_done()
+
+    assert hass.config_entries.async_get_entry(OFFICE_ID) is None
+    assert _live(tracked_managers, OFFICE_ID) == []
+    assert await QuietRestorations(hass).async_load() == frozenset()
+    assert not migration_fence(hass).is_quiet(OFFICE_ID)
+    assert no_panel_contact.await_count == audits
+
+
+async def test_platform_setup_failure_cleans_up_and_keeps_the_obligation(
+    hass: HomeAssistant,
+    legacy_fleet: list[MockConfigEntry],
+    no_panel_contact: AsyncMock,
+    tracked_managers: list[FleetManager],
+) -> None:
+    from custom_components.brilliant_mqtt.migration_journal import QuietRestorations
+
+    del legacy_fleet
+    await _quiet_office(hass)
+    audits = no_panel_contact.await_count
+
+    with patch.object(
+        hass.config_entries,
+        "async_forward_entry_setups",
+        side_effect=RuntimeError("platform setup failed"),
+    ):
+        assert not await hass.config_entries.async_setup(OFFICE_ID)
+        await hass.async_block_till_done()
+
+    assert _live(tracked_managers, OFFICE_ID) == []
+    assert await QuietRestorations(hass).async_load() == frozenset({OFFICE_ID})
+    assert migration_fence(hass).is_quiet(OFFICE_ID)
+    assert no_panel_contact.await_count == audits

@@ -475,7 +475,12 @@ class MigrationCoordinator:
                     self._fence.activate()
                     async_report_recovery_failure(self.hass, error.code)
                 return {"status": "recovery_failed", "dry_run": dry_run, "error": error.code}
-            if pending is not None and pending.phase is not MigrationPhase.COMPLETE:
+            # A ``complete`` journal is normally just awaiting confirmation at the
+            # next startup, but while the fence is up its recovery is unresolved:
+            # rerunning the action must resume it, not start a new migration.
+            if pending is not None and (
+                pending.phase is not MigrationPhase.COMPLETE or self._fence.active
+            ):
                 if dry_run:
                     return {
                         "status": "recovery_pending",
@@ -1331,17 +1336,31 @@ class MigrationCoordinator:
                         await self._async_require_quiet_obligation(self._restorable(record))
                     await self._async_try_remove_journal()
                     self._fence.deactivate()
-                    return {"status": "confirmed", "outcome": record.outcome}
-                if migrated:
+                    status = "confirmed"
+                elif migrated:
                     self._apply_conversion(record)
                     self._retarget_registries(record, strict=False)
                     await self._async_remove_remaining_siblings(record)
                     if not self._migrated_target_reached(record):
                         raise MigrationError("fleet_runtime_mismatch")
                     self._fence.deactivate()
+                    status = "reapplied"
                 else:
                     await self._async_reverse(record, record.last_error or "interrupted")
-                return {"status": "reapplied", "outcome": record.outcome}
+                    status = "reapplied"
+                if not live:
+                    return {"status": status, "outcome": record.outcome}
+                # Resumed from the action: start what the fence was holding back.
+                if migrated:
+                    anchor = self.hass.config_entries.async_get_entry(record.anchor_entry_id)
+                    if anchor is not None and anchor.state is not ConfigEntryState.LOADED:
+                        await self._async_quiesce([anchor.entry_id])
+                        await self.hass.config_entries.async_setup(anchor.entry_id)
+                    return {"status": status, "outcome": record.outcome, "recovered": True}
+                reloaded = await self._async_reload(
+                    self._restorable(record), error=record.last_error or "interrupted"
+                )
+                return {**reloaded, "outcome": record.outcome, "recovered": True}
             if _committed(record):
                 self._apply_conversion(record)
                 self._retarget_registries(record, strict=False)

@@ -399,8 +399,13 @@ While a migration runs or awaits recovery:
 | `recovery_failed` | The journal could not be settled. Every uncommitted entry stays fenced, and a **Brilliant fleet migration needs attention** issue shows the code. |
 
 - Startup recovery runs before any Brilliant entry loads. If it fails, the fence
-  stays up. Restart Home Assistant, or run the action again with
-  `dry_run: false` to resume. A dry run never changes the fence or any issue.
+  stays up. Fix the cause shown in the repair issue (for example storage
+  permissions or free space), then run the action again with `dry_run: false`.
+  That resumes the same recovery, including confirming a finished
+  (`complete`) migration or reversal, and starts the fenced entries. Restarting
+  Home Assistant does the same. A restart is only required for an unreadable
+  or corrupt journal, which must be repaired or removed first. A dry run never
+  changes the fence or any issue.
 - Restored legacy entries start without contacting their panel, including on
   Home Assistant's automatic setup retries and after a restart. The obligation
   is stored durably (`.storage/brilliant_mqtt.migration_quiet`) before anything
@@ -408,8 +413,10 @@ While a migration runs or awaits recovery:
   The one-time legacy HA-mirror retirement audit is skipped until then and runs
   again at the next ordinary restart. Stored data is not changed. Recovery
   writes this obligation before it restores anything, and before it confirms
-  a finished reversal. If the write fails, recovery stays unresolved (fence up,
-  journal kept). An unreadable or unwritable obligation file fails closed:
+  a finished reversal. If the write fails, recovery stays unresolved: the
+  fence stays up and no entry or registry is changed. A completed reversal's
+  journal is left exactly as it was; a fresh reversal may first have recorded
+  `reversing`. An unreadable or unwritable obligation file fails closed:
   every Brilliant entry starts quietly. A **Brilliant restored panels stay in
   quiet mode** issue keeps the deferral visible.
 - An unreadable or corrupt journal fails closed. Nothing starts until the file
