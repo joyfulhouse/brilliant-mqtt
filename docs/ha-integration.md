@@ -288,6 +288,157 @@ panel over SSH.
   onboarding/recovery issue remains. The blocked attempt changed no identity,
   credential, or panel setting.
 
+<a id="legacy_fleet_migration"></a>
+## Migrating legacy panel entries into the fleet
+
+Installs that predate the fleet keep one config entry per panel. New panels can
+only be added through the singleton fleet entry, and fleet creation aborts with
+`legacy_migration_required` while any legacy entry exists. The
+`brilliant_mqtt.migrate_to_fleet` action consolidates every legacy entry into
+one fleet entry with one panel subentry each. While legacy entries remain, a
+**Brilliant legacy panels can be consolidated** repair issue points here.
+
+Migration is operator-triggered and config/registry-only. It **never contacts a
+panel**: no SSH, reinstall, restart, or env rewrite. Everything that identifies
+a panel stays byte-for-byte identical: the MQTT slug, the mesh priority, every
+entity ID and entity unique ID (each panel's `management_id` is its old entry
+ID), the MQTT-discovery device and its `mqtt` association, and disabled/hidden
+entity flags. The panel's host, root password, pinned SSH host key, components,
+cadences, Voice and Hue CA overrides move into its subentry. The broker profile
+and Home Assistant control/scene settings move to the fleet once.
+
+1. **Dry run** (the default changes nothing):
+
+   ```yaml
+   action: brilliant_mqtt.migrate_to_fleet
+   data:
+     dry_run: true
+   ```
+
+   Call it with a response, for example from **Developer tools → Actions**. An
+   `eligible` response lists the anchor entry (the smallest entry ID, which
+   becomes the fleet entry), each panel's planned subentry ID, fingerprint, and
+   mesh priority, and the fleet defaults. A `conflicts` response lists every
+   blocker with its field, code, and affected entry titles. Responses never
+   contain passwords, usernames, CA bodies, or host keys.
+2. Resolve every conflict (below), then dry-run again until it is `eligible`.
+3. **Migrate** with `dry_run: false`. A `migrated` response names the fleet
+   entry and the removed sibling entry IDs. Running it again returns
+   `already_migrated`.
+
+Repair timing defaults (`auto_repair`, `offline_grace_minutes`,
+`repair_cooldown_minutes`) become fleet defaults using the most common value.
+A panel whose old value differed keeps it as a per-panel override.
+`trust_host_key_changes` has no fleet equivalent. Runtime caches such as
+`last_firmware` and `ha_mirror_retire_verified` are not carried.
+
+### Migration conflict codes
+
+| Code | Meaning | Fix |
+|---|---|---|
+| `duplicate_mesh_priority` | Two panels share a positive mesh priority (`detail` is the value). The fleet requires unique positive priorities; `0` may repeat. | Open **Reconfigure → Advanced (mesh priority)** on all but one listed panel and choose an unused priority. That also pushes the priority to the panel. |
+| `global_mismatch` | A fleet-wide value differs between entries: a broker field (`mqtt_host`, `mqtt_port`, `mqtt_username`, `mqtt_password`, `mqtt_tls_enabled`, `mqtt_tls_ca`, `broker_kind`) or `ha_control_enabled`, `ha_control_label`, `room_overrides`, `ha_control_domains`, `max_mirrored_entities`, `scene_panel`, or `scene_actions`. The listed entries are the ones that differ from the majority. | Reconfigure the listed entries (**MQTT broker** or **Home Assistant control and scenes**) to the shared value. |
+| `trust_host_key_changes_enabled` | The legacy auto-repin option is on. Fleet panels never auto-repin. | Turn **Trust host-key changes** off in that entry's options. |
+| `missing_host_key` / `invalid_host_key` | No pinned SSH host key, or one the fleet cannot accept (only canonical `ssh-ed25519`/`ssh-rsa` lines). | Run one successful repair so the legacy entry pins the panel's key on first connect. |
+| `duplicate_fingerprint` / `duplicate_slug` | Two entries pin the same panel identity or use the same MQTT slug. | Remove the stale duplicate entry. |
+| `unknown_scene_panel` | The shared default scene panel is not one of the migrating panels. | Set **Default scene panel** to an existing slug. |
+| `invalid_panel_slug` | The slug is `mesh` or not a valid fleet slug (lowercase, up to 64 characters). | Remove that entry, migrate the others, then add the panel again through the fleet. |
+| `ha_mirror_retirement_pending` | Legacy HA-mirror state is still present, so its verified removal has not finished. | Let the retirement repair succeed first (see the `ha_mirror_retired` issue). |
+| `invalid_value` / `unsupported_legacy_field` / `unsupported_ssh_username` / `provisioning_marker_present` / `entry_disabled` / `unsupported_entry_version` / `fleet_entry_present` | The entry holds data the fleet cannot represent losslessly, or it is disabled. A fleet entry cannot be merged with legacy entries. | Correct or remove the listed entry. Re-enable disabled entries first. |
+
+The action also reports runtime blockers it checks itself:
+`provisioning_in_progress`, `retained_canary_present` (finalize or roll back the
+retained canary first), `config_flow_in_progress` (close open
+Reconfigure/options dialogs), `entry_not_recoverable` (restart Home Assistant),
+`foreign_registry_entity`, `mqtt_unavailable`, and `panel_operation_in_progress`
+(a repair or update holds the panel-operation lock for more than two minutes).
+
+### Interruption and recovery
+
+The migration first waits for any running panel repair or update. It then
+raises a setup fence and unloads every legacy runtime, and plans from those
+exact unloaded entries, so an edit made while it waited is migrated rather than
+lost. Next it converts the anchor, adds the subentries, moves the integration's
+entity and device registry entries, and sets up the fleet runtime. It requires
+every planned panel's runtime to start. Only then does it record the commit
+point, and only after that does it remove the other legacy entries one at a
+time.
+
+The journal is a private, atomically written file
+(`.storage/brilliant_mqtt.migration`) and is the single source of truth. Every
+journal write is re-read from the file and compared, and a corrupt journal is
+never mistaken for a missing one. Home Assistant writes config entries and the
+registries lazily, so the migration does not trust them. At every startup until
+it is confirmed, recovery re-applies the journaled target idempotently: forward
+once committed, otherwise removal of every migration artifact. A finished
+migration keeps a `complete` journal, with the fence lowered, until a later
+startup loads exactly that state from disk. Only then is the journal, with its
+credentials, deleted.
+
+While a migration runs or awaits recovery:
+
+- The fence keeps every Brilliant entry from starting (a reload or setup retry
+  returns "not ready"). Only the anchor being verified, or the committed fleet,
+  may start, so legacy and fleet runtimes never run side by side.
+- Reconfigure, options, and panel flows abort with `migration_in_progress`.
+- An entry edited anyway before the anchor is converted aborts the migration
+  (`aborted`, `entry_changed_during_migration`). The legacy set restarts with
+  the edit kept.
+- Reversal only removes migration artifacts. It restores the anchor from its
+  snapshot only if the anchor was converted, so an edit to any other entry
+  survives.
+
+| Result | Meaning |
+|---|---|
+| `migrated` | One fleet entry; siblings removed. |
+| `reverted` | A failure before the commit point removed every migration artifact and every legacy entry is running again. `error` holds the stable code. |
+| `reverted_config_only` | The configuration is restored, but the listed entries did not start. A **Brilliant legacy panels restored but not running** issue appears; it clears once they start (including by Home Assistant's own retry). |
+| `aborted` | An entry changed before anything was converted; nothing was migrated. |
+| `ambiguous` | The commit write could not be read back. The journal and the fleet are kept, the siblings stay fenced, and the next start (or the action) re-reads the journal and finishes. Nothing is reversed. |
+| `incomplete` | The fleet is committed, but sibling removal did not finish. The fleet keeps running, the remaining siblings stay fenced, and the next start (or the action) finishes the removal. |
+| `recovery_failed` | The journal could not be settled. Every uncommitted entry stays fenced, and a **Brilliant fleet migration needs attention** issue shows the code. |
+
+- Startup recovery runs before any Brilliant entry loads. If it fails, the fence
+  stays up. Fix the cause shown in the repair issue (for example storage
+  permissions or free space), then run the action again with `dry_run: false`.
+  That resumes the same recovery, including confirming a finished
+  (`complete`) migration or reversal, and starts the fenced entries. Restarting
+  Home Assistant does the same. A restart is only required for an unreadable
+  or corrupt journal, which must be repaired or removed first. A dry run never
+  changes the fence or any issue.
+- Restored legacy entries start without contacting their panel, including on
+  Home Assistant's automatic setup retries and after a restart. The obligation
+  is stored durably (`.storage/brilliant_mqtt.migration_quiet`) before anything
+  can set them up, and each entry leaves it only after a quiet setup succeeds.
+  The one-time legacy HA-mirror retirement audit is skipped until then and runs
+  again at the next ordinary restart. Stored data is not changed. Recovery
+  writes this obligation before it restores anything, and before it confirms
+  a finished reversal. If the write fails, recovery stays unresolved: the
+  fence stays up and no entry or registry is changed. A completed reversal's
+  journal is left exactly as it was; a fresh reversal may first have recorded
+  `reversing`. An unreadable or unwritable obligation file fails closed:
+  every Brilliant entry starts quietly. A **Brilliant restored panels stay in
+  quiet mode** issue keeps the deferral visible.
+- An unreadable or corrupt journal fails closed. Nothing starts until the file
+  is repaired or removed.
+- Home Assistant 2026.10 gave every device a single owning config entry. It
+  split each shared panel device into two twins with the same identifier
+  (`mqtt`, `brilliant_panel_<slug>`): one owned by the MQTT entry (MQTT
+  entities), one owned by the legacy entry (management entities). Both recorded
+  the legacy entry as `composite_primary_config_entry`. The migration supports
+  both registry models.
+  - The management twin moves to the fleet panel's subentry. Its ID, entities,
+    and customizations are unchanged. HA had already cleared its
+    `has_composite_identifiers` when the management entities re-registered.
+  - The MQTT twin keeps its owner, its entities, and its
+    `has_composite_identifiers`.
+  - When a sibling legacy entry is removed, HA clears
+    `composite_primary_config_entry` on both of that panel's twins. The anchor
+    panel's twins keep pointing at the anchor, which is now the fleet entry.
+  - Home Assistant 2026.10+ refuses to move a device that has child devices.
+    The migration reports `device_has_child_devices` as a blocker before
+    changing anything.
+
 ## Entities
 
 Each panel's device gains nine management entities (three diagnostic, six

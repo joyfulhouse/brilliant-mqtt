@@ -17,7 +17,7 @@ from homeassistant.const import (
     ATTR_FLOOR_ID,
     ATTR_LABEL_ID,
 )
-from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.core import HomeAssistant, ServiceCall, ServiceResponse, SupportsResponse
 from homeassistant.exceptions import ConfigEntryNotReady, HomeAssistantError
 from homeassistant.helpers import (
     config_validation as cv,
@@ -71,6 +71,17 @@ from .fleet_manager import (
     get_panel_provisioner as get_panel_provisioner,
 )
 from .manager import PanelManager, async_delete_panel_issues
+from .migration_coordinator import (
+    ISSUE_MIGRATION_AVAILABLE,
+    MigrationCoordinator,
+    async_clear_reverted_issue,
+    async_load_quiet_obligations,
+    async_quiet_setup_succeeded,
+    async_report_recovery_failure,
+    async_update_migration_issue,
+    migration_fence,
+    migration_removing,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -123,6 +134,13 @@ _REBOOT_SCHEMA = vol.Schema(
         ),
     },
     extra=vol.ALLOW_EXTRA,
+)
+
+# Operator-triggered legacy-to-fleet consolidation. Dry run (the default) only
+# reports the plan or its conflicts; it never mutates anything.
+_MIGRATE_SCHEMA = vol.Schema(
+    {vol.Optional("dry_run", default=True): cv.boolean},
+    extra=vol.PREVENT_EXTRA,
 )
 
 _TARGET_KEYS = frozenset(
@@ -351,16 +369,54 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     hass.services.async_register(DOMAIN, "uninstall", _uninstall, schema=_SERVICE_SCHEMA)
     hass.services.async_register(DOMAIN, "reboot", _reboot, schema=_REBOOT_SCHEMA)
     hass.services.async_register(DOMAIN, "run_scene", _run_scene, schema=_RUN_SCENE_SCHEMA)
+
+    async def _migrate_to_fleet(call: ServiceCall) -> ServiceResponse:
+        return await MigrationCoordinator(hass).async_run(dry_run=bool(call.data["dry_run"]))
+
     hass.services.async_register(DOMAIN, "set_mode", _set_mode, schema=_SET_MODE_SCHEMA)
+    hass.services.async_register(
+        DOMAIN,
+        "migrate_to_fleet",
+        _migrate_to_fleet,
+        schema=_MIGRATE_SCHEMA,
+        supports_response=SupportsResponse.OPTIONAL,
+    )
+
+    # Settle an interrupted migration before HA sets up this domain's entries:
+    # reverse to the exact originals before the commit point, or finish sibling
+    # removal after it. Config/registry work only; never contacts a panel.
+    # The fence is raised for the whole recovery and stays raised unless the
+    # journal is resolved, so a failed (or crashed) recovery can never let both
+    # the converted fleet and unremoved legacy siblings start.
+    fence = migration_fence(hass)
+    fence.activate()
+    try:
+        await MigrationCoordinator(hass).async_recover()
+    except Exception as error:
+        _LOGGER.error("Legacy fleet migration recovery failed (%s)", type(error).__name__)
+        async_report_recovery_failure(hass, "recovery_crashed")
+    # Restored entries whose quiet setup never succeeded stay quiet across
+    # restarts; an unreadable obligation file fails closed (all quiet).
+    await async_load_quiet_obligations(hass)
+    async_update_migration_issue(hass)
     return True
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: BrilliantMqttConfigEntry) -> bool:
+    fence = migration_fence(hass)
+    if fence.blocks(entry.entry_id):
+        # A legacy-to-fleet migration is running or awaiting recovery; starting
+        # this entry could run a legacy panel next to the converted fleet.
+        raise ConfigEntryNotReady("A Brilliant legacy fleet migration is unresolved")
     # Every panel surface (retained state/LWT subscriptions, command publishes) rides
     # HA's mqtt integration, so don't set up "green" against a broker that isn't up yet.
     if not await mqtt.async_wait_for_mqtt_client(hass):
         raise ConfigEntryNotReady("MQTT integration is not available")
-    manager = FleetManager(hass, entry)
+    manager = FleetManager(
+        hass,
+        entry,
+        defer_setup_panel_contact=fence.is_quiet(entry.entry_id),
+    )
     entry.runtime_data = manager
     from .ha_control import get_control_plane
 
@@ -378,6 +434,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: BrilliantMqttConfigEntry
                 type(cleanup_error).__name__,
             )
         raise
+    # A migration-restoration setup stays quiet across failed attempts, HA's
+    # automatic retries, and restarts; only a successful setup retires it. The
+    # retirement runs after setup has returned, so neither its I/O nor a
+    # cancellation can fail this setup or orphan the manager; if it never runs,
+    # the obligation simply stays and the next setup is quiet again.
+    if fence.is_quiet(entry.entry_id):
+        hass.async_create_task(
+            async_quiet_setup_succeeded(hass, entry.entry_id),
+            f"brilliant-mqtt-quiet-retire-{entry.entry_id}",
+            eager_start=False,
+        )
+    async_clear_reverted_issue(hass, entry.entry_id)
     return True
 
 
@@ -426,6 +494,15 @@ async def async_unload_entry(hass: HomeAssistant, entry: BrilliantMqttConfigEntr
 
 async def async_remove_entry(hass: HomeAssistant, entry: BrilliantMqttConfigEntry) -> None:
     """Delete owned issues, then settle any exact uncommitted panel handoff."""
+    if entry.entry_id in migration_removing(hass):
+        # A legacy sibling consolidated into the fleet: its panel keeps the same
+        # management ID, so the panel-owned issues now belong to the fleet runtime.
+        # Only entry-keyed issues die with it, and no provisioning recovery runs.
+        for issue_id in ("broker_unavailable", "runtime_setup_failed", "fleet_storage"):
+            ir.async_delete_issue(hass, DOMAIN, f"{issue_id}_{entry.entry_id}")
+        return
+    if ir.async_get(hass).async_get_issue(DOMAIN, ISSUE_MIGRATION_AVAILABLE) is not None:
+        async_update_migration_issue(hass)
     management_ids = {
         str(subentry.data[CONF_MANAGEMENT_ID])
         for subentry in entry.subentries.values()

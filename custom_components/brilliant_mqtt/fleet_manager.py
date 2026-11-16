@@ -71,6 +71,7 @@ from .entry_data import (
     _panel_agent_cadences,
 )
 from .manager import PanelManager, async_delete_panel_issues
+from .migration import planned_subentry_id
 from .panel_health import PanelHealthObserver
 from .panel_inspection import async_inspect_panel
 from .panel_provisioner import (
@@ -275,9 +276,17 @@ def _matches_record_identity(
     *,
     managed_update: bool = False,
 ) -> bool:
-    """Match every journaled panel owner field without exposing credential values."""
+    """Match every journaled panel owner field without exposing credential values.
+
+    A freshly onboarded panel's management ID is its fingerprint, so an install
+    handoff requires that exact value. A managed update may also target a panel
+    consolidated from a legacy entry, whose management ID stays that entry ID (so
+    entity unique IDs never change); it is accepted only when the subentry ID is
+    exactly the one the migration derived from that management ID.
+    """
     request = record.panel_request
     data = subentry.data
+    management_id = data.get(CONF_MANAGEMENT_ID)
     return (
         subentry.unique_id == request.fingerprint
         and data.get(CONF_IDENTITY_FINGERPRINT) == request.fingerprint
@@ -286,7 +295,14 @@ def _matches_record_identity(
         and data.get(CONF_SSH_USERNAME) == request.ssh_username
         and data.get(CONF_ROOT_PASSWORD) == request.root_password
         and data.get(CONF_PANEL) == request.slug
-        and data.get(CONF_MANAGEMENT_ID) == request.fingerprint
+        and (
+            management_id == request.fingerprint
+            or (
+                managed_update
+                and isinstance(management_id, str)
+                and subentry.subentry_id == planned_subentry_id(management_id)
+            )
+        )
         and (_managed_components(data) if managed_update else _enabled_components(data))
         == frozenset(request.selected_components)
     )
@@ -1011,9 +1027,18 @@ async def _async_settle_cleanup(operation: Coroutine[Any, Any, None]) -> None:
 class FleetManager:
     """Own all panel managers below one fleet or one legacy compatibility entry."""
 
-    def __init__(self, hass: HomeAssistant, entry: ConfigEntry[Any]) -> None:
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        entry: ConfigEntry[Any],
+        *,
+        defer_setup_panel_contact: bool = False,
+    ) -> None:
         self.hass = hass
         self.entry = entry
+        # One-shot: a migration-restoration setup must not SSH any panel (the
+        # legacy HA-mirror retirement audit runs again on the next ordinary setup).
+        self._defer_setup_panel_contact = defer_setup_panel_contact
         self._ssh_lock = _shared_ssh_lock(hass)
         self._lifecycle_lock = asyncio.Lock()
         self._panels: dict[str, PanelManager] = {}
@@ -1037,6 +1062,11 @@ class FleetManager:
     def panels(self) -> Mapping[str, PanelManager]:
         """Return a live, read-only view keyed by subentry or legacy entry ID."""
         return self._panels_view
+
+    @property
+    def runtime_owned_panel_ids(self) -> frozenset[str]:
+        """Return panels whose runtime started successfully and is owned here."""
+        return frozenset(self._runtime_owned_panel_ids)
 
     @property
     def fleet(self) -> FleetConfig:
@@ -1654,6 +1684,10 @@ class FleetManager:
                 if config is not None
             }
             self._panels.update(managers)
+            if self._defer_setup_panel_contact:
+                for manager in managers.values():
+                    manager.defer_setup_panel_contact = True
+                self._defer_setup_panel_contact = False
             try:
                 successful_starts = 0
                 for panel_id, manager in managers.items():

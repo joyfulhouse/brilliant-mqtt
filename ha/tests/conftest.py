@@ -143,6 +143,17 @@ def repin_shells() -> Iterator[RepinShells]:
         yield factory
 
 
+@pytest.fixture
+def hass_config_dir(hass_tmp_config_dir: str) -> str:
+    """Give every test its own config dir.
+
+    The legacy-fleet migration journal is a real file under ``.storage`` (it must
+    distinguish a corrupt journal from a missing one), so a shared config dir
+    would leak journals between tests and parallel workers.
+    """
+    return hass_tmp_config_dir
+
+
 @pytest.fixture(autouse=True)
 def auto_enable_custom_integrations(enable_custom_integrations: None) -> None:
     """Let the HA test harness load custom_components/ from this directory."""

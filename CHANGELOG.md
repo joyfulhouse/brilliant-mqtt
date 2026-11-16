@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `brilliant_mqtt.migrate_to_fleet` action: consolidates legacy per-panel
+  entries into the singleton fleet entry with one panel subentry each, so a
+  legacy install can add new panels. It runs only when an operator calls it,
+  dry run is the default, and the response is secret-free. Panels are never
+  contacted. Every slug, mesh priority, entity ID, entity unique ID, and MQTT
+  device association is preserved. Conflicts block the whole plan and are
+  reported by field, code, and entry title, never silently fixed. Duplicate
+  positive mesh priorities are one example. A private journal makes the
+  migration restart-safe: before the commit point it reverses exactly; after
+  it, startup recovery finishes removing the sibling entries. The journal is
+  the single source of truth: an atomically written file whose every write is
+  re-read. Startup re-applies its target until a later startup confirms that
+  the loaded state matches, so nothing relies on Home Assistant's lazily
+  written stores or private storage APIs. A setup fence and blocked
+  reconfigure/options flows keep legacy and fleet runtimes from ever starting
+  side by side, or being edited, while a migration is unresolved. Every planned
+  panel's runtime must start before the commit. Restored legacy entries start
+  without contacting their panel until a quiet setup succeeds, even across
+  crashes and restarts, via a durable obligation file. Both the pre-2026.10
+  shared device registry and the 2026.10+ split (single-owner) device registry
+  are supported. A management device with child devices is reported as a
+  blocker. See
+  [docs/ha-integration.md](docs/ha-integration.md#legacy_fleet_migration).
+- Repair issues: `legacy_migration_available` while legacy entries remain,
+  `migration_recovery_failed` if an interrupted migration cannot be settled, and
+  `migration_reverted_not_loaded` if restored legacy entries did not start.
+
+### Fixed
+
+- A managed (canary) update journal now resolves its owner on a fleet panel
+  whose management ID is its legacy entry ID (kept so entity unique IDs never
+  change). It is accepted only when the subentry ID is exactly the one the
+  migration derived from that ID. Install handoffs still require the
+  fingerprint.
+
 ## [0.11.6] - 2026-11-05
 
 This is a Home Assistant integration release only. The bundled on-panel agent

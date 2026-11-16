@@ -37,6 +37,7 @@ from ..const import (
     SUBENTRY_TYPE_PANEL,
 )
 from ..entry_data import EntryDataError, FleetConfig, PanelConfig
+from ..migration_coordinator import migration_blocks_entry_writes
 from ..panel_inspection import PanelCompatibilityError, PanelFacts
 from ..panel_provisioner import PanelProvisioningError, ProvisionedPanel
 from ..shell import HostIdentity, PanelIdentityError
@@ -167,6 +168,8 @@ class PanelSubentryFlow(ConfigSubentryFlow, _PanelOnboardingMixin):
         user_input: dict[str, Any] | None = None,
     ) -> SubentryFlowResult:
         """Collect only panel address/password for an exact fleet parent."""
+        if migration_blocks_entry_writes(self.hass):
+            return self.async_abort(reason="migration_in_progress")
         if self._onboarding_parent_entry() is None:
             return self.async_abort(reason="invalid_parent")
         return cast(
@@ -180,6 +183,8 @@ class PanelSubentryFlow(ConfigSubentryFlow, _PanelOnboardingMixin):
     ) -> SubentryFlowResult:
         """Expose focused day-two actions for one exact panel subentry."""
         del user_input
+        if migration_blocks_entry_writes(self.hass):
+            return self.async_abort(reason="migration_in_progress")
         if self._reconfigure_target() is None:
             return self.async_abort(reason="invalid_parent")
         return self.async_show_menu(
