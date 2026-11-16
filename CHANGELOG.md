@@ -7,8 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-11-16
+
+This release updates both the Home Assistant integration and the bundled
+on-panel agent. The agent moves to 0.11.4 with release ordinal 6 because it now
+carries the motion passthrough change below. Panels on 0.11.3 will offer an
+update through their Update entities. Install it deliberately, pilot panel
+first; installing the integration alone does not touch panels.
+
 ### Added
 
+- Opt-in native BLE mesh motion passthrough on the agent
+  (`MOTION_NATIVE_PASSTHROUGH`). Switches whose motion thresholds are
+  calibrated above the factory floor publish the hardware `movement_detected`
+  value with motion scoring off. Optional `MOTION_DEFAULT_HIGH_THRESHOLD` /
+  `MOTION_DEFAULT_LOW_THRESHOLD` are applied at enforcement time and never
+  persisted. Default behaviour is unchanged.
+  ([#250](https://github.com/joyfulhouse/brilliant-mqtt/pull/250))
 - `brilliant_mqtt.migrate_to_fleet` action: consolidates legacy per-panel
   entries into the singleton fleet entry with one panel subentry each, so a
   legacy install can add new panels. It runs only when an operator calls it,
@@ -1246,7 +1261,8 @@ panel redeploy is needed.
 - JoyfulHouse OSS docs standard: LICENSE (MIT), INSTALL.md, CHANGELOG.md,
   FUNDING.yml, CODEOWNERS, and the canonical `docs/` set.
 
-[Unreleased]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.11.6...HEAD
+[Unreleased]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.11.6...v0.12.0
 [0.11.6]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.11.5...v0.11.6
 [0.11.5]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.11.4...v0.11.5
 [0.11.4]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.11.3...v0.11.4
