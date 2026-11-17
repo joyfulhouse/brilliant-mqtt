@@ -500,9 +500,72 @@ def test_state_decoder_rejects_boolean_protocol_versions() -> None:
         decode_state_payload(json.dumps(value), stable_id=STABLE_ID)
 
 
-def test_available_state_requires_authoritative_brightness() -> None:
+def test_available_on_state_requires_authoritative_brightness() -> None:
     with pytest.raises(PilotGuardError, match="authoritative brightness"):
         decode_state_payload(_state(brightness=None), stable_id=STABLE_ID)
+
+
+def _ha_off_state(*, sequence: int = 7, generated_at_ms: int = NOW_MS) -> str:
+    """An off light as HA publishes it: brightness is omitted, not zero.
+
+    HA reports ``brightness: None`` for an off light and the control-plane
+    manifest only forwards integer brightness, so the retained state carries
+    no ``brightness`` key at all (ha_control_manifest._supported_attributes).
+    """
+
+    value = cast(dict[str, object], json.loads(_state(sequence=sequence, state="off")))
+    value["generated_at_ms"] = generated_at_ms
+    value["attributes"] = {"supported_features": 32}
+    return json.dumps(value, separators=(",", ":"), sort_keys=True)
+
+
+def test_available_off_state_without_brightness_is_authoritative_off() -> None:
+    state = decode_state_payload(_ha_off_state(), stable_id=STABLE_ID)
+
+    assert state.available is True
+    assert state.on == 0
+    assert state.intensity is None
+
+
+def test_off_state_with_brightness_still_validates_its_range() -> None:
+    assert decode_state_payload(_state(state="off", brightness=0), stable_id=STABLE_ID).on == 0
+    with pytest.raises(PilotGuardError, match="brightness"):
+        decode_state_payload(_state(state="off", brightness=256), stable_id=STABLE_ID)
+
+
+async def test_initial_off_authority_without_brightness_admits_commands() -> None:
+    controller, publisher, sink = _controller()
+
+    assert await controller.handle_state_message(
+        state_topic(STABLE_ID), _ha_off_state(), retained=True
+    )
+    await controller.wait_for_state(0.01)
+
+    assert controller.authority_available is True
+    assert sink.updates == [{"on": 0}]
+    assert await controller.handle_panel_push("on", 0) is False
+    assert await controller.handle_panel_push("intensity", 500) is True
+    decoded = cast(dict[str, object], json.loads(publisher.publications[-1][1]))
+    assert decoded["kind"] == "set_brightness"
+    assert decoded["value"] == 128
+
+
+async def test_turn_off_echo_without_brightness_confirms_the_command() -> None:
+    controller, publisher, sink = _controller()
+    await controller.handle_state_message(state_topic(STABLE_ID), _state(), retained=True)
+    assert await controller.handle_panel_push("on", 0) is True
+
+    await controller.handle_state_message(
+        state_topic(STABLE_ID),
+        _ha_off_state(sequence=8, generated_at_ms=NOW_MS + 1),
+        retained=False,
+    )
+
+    assert controller.authority_available is True
+    assert controller.pending_command_age_ms(now_ms=NOW_MS) is None
+    assert sink.updates[-1] == {"on": 0}
+    assert await controller.handle_panel_push("on", 1) is True
+    assert json.loads(publisher.publications[-1][1])["kind"] == "turn_on"
 
 
 def test_build_command_payload_maps_on_off_and_brightness() -> None:
@@ -646,7 +709,7 @@ async def test_intensity_is_not_a_noop_while_authoritative_light_is_off() -> Non
     controller, publisher, _ = _controller()
     await controller.handle_state_message(
         state_topic(STABLE_ID),
-        _state(state="off", brightness=128),
+        _ha_off_state(),
         retained=True,
     )
 
@@ -815,7 +878,7 @@ async def test_unrelated_advancing_state_does_not_settle_in_flight_command() -> 
 
     await controller.handle_state_message(
         state_topic(STABLE_ID),
-        _state(sequence=9, generated_at_ms=NOW_MS + 2, state="off", brightness=129),
+        _ha_off_state(sequence=9, generated_at_ms=NOW_MS + 2),
         retained=False,
     )
     assert len(publisher.publications) == 2
@@ -832,7 +895,7 @@ async def test_same_coordinate_conflicting_state_is_rejected_even_after_fence() 
     with pytest.raises(PilotGuardError, match="conflicts"):
         await controller.handle_state_message(
             state_topic(STABLE_ID),
-            _state(state="off", brightness=128),
+            _ha_off_state(),
             retained=True,
         )
 
@@ -852,10 +915,10 @@ async def test_accepted_result_is_not_authority_and_waits_for_state_echo() -> No
 
     await controller.handle_state_message(
         state_topic(STABLE_ID),
-        _state(sequence=8, generated_at_ms=NOW_MS + 1, state="off", brightness=128),
+        _ha_off_state(sequence=8, generated_at_ms=NOW_MS + 1),
         retained=True,
     )
-    assert sink.updates[-1] == {"on": 0, "intensity": 502}
+    assert sink.updates[-1] == {"on": 0}
 
 
 async def test_canonical_v1_result_without_optional_diagnostics_is_accepted() -> None:

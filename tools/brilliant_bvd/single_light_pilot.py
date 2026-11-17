@@ -504,8 +504,12 @@ def decode_state_payload(payload: str, *, stable_id: str) -> DecodedState:
     if not isinstance(attributes, dict):
         raise PilotGuardError("state attributes must be an object")
     brightness = attributes.get("brightness") if available else None
-    if available and brightness is None:
-        raise PilotGuardError("available pilot light state must contain authoritative brightness")
+    # HA omits brightness for an off light (it is None in HA and the manifest
+    # forwards only integer brightness), so "off" alone is authoritative: the
+    # native light is reflected as on=0 and keeps its last intensity.  An on
+    # light must still carry the brightness the slider will display.
+    if available and state == "on" and brightness is None:
+        raise PilotGuardError("available on light state must contain authoritative brightness")
     intensity = None if brightness is None else brightness_to_intensity(brightness)
     return DecodedState(
         sequence=sequence,
