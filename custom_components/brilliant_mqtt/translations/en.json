@@ -779,7 +779,7 @@
       "message": "Hue CA recovery operation failed: {error}"
     },
     "hue_ca_cert_missing": {
-      "message": "Hue CA recovery cannot be enabled on panel `{panel}`: no diyHue CA certificate is configured. Set the fleet default in the Brilliant MQTT integration's settings (Configure > diyHue CA certificate), or a per-panel certificate in the panel's Reconfigure > Edit feature overrides & advanced settings, then enable it again."
+      "message": "Hue CA recovery cannot be enabled on panel `{panel}`: no valid diyHue CA certificate (a public PEM X.509 chain) is configured. Set the fleet default in the Brilliant MQTT integration's settings (Configure > diyHue CA certificate), or a per-panel certificate in the panel's Reconfigure > Edit feature overrides & advanced settings, then enable it again."
     },
     "ha_mirror_failed": {
       "message": "HA mirror operation failed: {error}"

@@ -67,6 +67,7 @@ from custom_components.brilliant_mqtt.entry_data import (
     PanelConfigStore,
     effective_hue_ca_cert,
 )
+from tests.cert_fixtures import ca_pem, private_key_pem, truncated_ca_pem
 
 
 def _fleet_data(**overrides: object) -> dict[str, Any]:
@@ -625,7 +626,7 @@ async def test_legacy_store_exposes_version_three_shape_unchanged(
     assert await task == "done"
 
 
-_HUE_CA = "-----BEGIN CERTIFICATE-----\nFLEET-HUE-CA\n-----END CERTIFICATE-----\n"
+_HUE_CA = ca_pem("fleet-hue")
 
 
 def test_fleet_hue_ca_default_is_optional_and_kept_out_of_repr() -> None:
@@ -643,12 +644,36 @@ def test_fleet_hue_ca_default_is_optional_and_kept_out_of_repr() -> None:
 
     assert absent.hue_ca_cert == ""
     assert present.hue_ca_cert == _HUE_CA
-    assert "FLEET-HUE-CA" not in repr(present)
+    assert _HUE_CA not in repr(present)
 
 
-@pytest.mark.parametrize("value", ["", "   \n", None, 1, ["pem"]])
-def test_fleet_hue_ca_default_rejects_blank_or_non_string(value: object) -> None:
-    """A stored fleet Hue CA is either absent or a non-blank string."""
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "   \n",
+        None,
+        1,
+        ["pem"],
+        "-----BEGIN CERTIFICATE-----\nnot a certificate\n-----END CERTIFICATE-----",
+        private_key_pem("fleet-hue"),
+        ca_pem("fleet-hue") + private_key_pem("fleet-hue"),
+        truncated_ca_pem("fleet-hue"),
+    ],
+    ids=[
+        "empty",
+        "blank",
+        "none",
+        "int",
+        "list",
+        "framing-only",
+        "private-key",
+        "certificate-plus-private-key",
+        "truncated",
+    ],
+)
+def test_fleet_hue_ca_default_rejects_anything_but_a_public_chain(value: object) -> None:
+    """A stored fleet Hue CA is either absent or a parseable public X.509 chain."""
     with pytest.raises(EntryDataError, match="invalid_fleet_entry_data"):
         FleetConfig.from_entry(
             MockConfigEntry(

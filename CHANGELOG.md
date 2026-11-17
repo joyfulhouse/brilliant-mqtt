@@ -30,6 +30,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every legacy panel has the same valid one. Panels added afterwards inherit it.
   Per-panel copies are kept, and the migration never chooses between differing
   certificates.
+- Hue CA changes and Hue CA installs no longer race. Saving the fleet diyHue CA
+  certificate now waits for any in-progress panel component operation, then
+  re-reads the fleet and every panel before deciding. Hue CA installs and the
+  post-OTA re-install take the certificate from the stored fleet and panel
+  settings while holding the same lock. They no longer read a runtime copy that
+  might not yet reflect a just-saved change. The certificate a panel receives
+  therefore always matches the stored configuration.
+- CA certificates are now checked as real X.509 certificates, not just PEM
+  framing. Every block must be strict base64 of one parseable certificate. The
+  same check covers the broker CA, the fleet and per-panel diyHue CA fields,
+  the stored fleet diyHue CA, and migration. Placeholder text, invalid base64,
+  non-certificate or truncated data, and any private key are rejected.
 
 ## [0.12.1] - 2026-11-17
 

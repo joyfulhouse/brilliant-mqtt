@@ -71,6 +71,7 @@ from custom_components.brilliant_mqtt.flow.schemas import (
     panel_confirm_schema,
     panel_connect_schema,
 )
+from tests.cert_fixtures import ca_pem
 
 
 def _schema_serializer() -> Callable[..., Any]:
@@ -219,7 +220,7 @@ def test_advanced_schema_accepts_strict_tls_and_a_multiline_public_ca() -> None:
         schema(
             {
                 CONF_MQTT_TLS_ENABLED: True,
-                CONF_MQTT_TLS_CA: "-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----",
+                CONF_MQTT_TLS_CA: ca_pem("broker-ca"),
             }
         )[CONF_MQTT_TLS_ENABLED]
         is True
@@ -247,7 +248,7 @@ def test_reconfigure_sentinel_only_appears_in_masked_password_field() -> None:
 
 
 def test_nested_advanced_retry_uses_the_same_outer_and_inner_defaults() -> None:
-    ca = "-----BEGIN CERTIFICATE-----\nPUBLIC-CA\n-----END CERTIFICATE-----"
+    ca = ca_pem("broker-ca")
     source = _valid_broker_input(
         **{
             ADVANCED_SECTION: {
@@ -295,7 +296,7 @@ def test_new_broker_schema_never_serializes_a_supplied_password() -> None:
 
 
 def test_normalize_broker_input_flattens_shared_advanced_values() -> None:
-    ca = "-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----"
+    ca = ca_pem("broker-ca")
     normalized = normalize_broker_input(
         BrokerKind.OFFICIAL_MOSQUITTO,
         _valid_broker_input(
@@ -339,10 +340,9 @@ def test_blank_custom_ca_is_not_persisted() -> None:
 
 def test_custom_ca_accepts_a_public_chain_with_crlf_and_blank_separator() -> None:
     ca = (
-        "-----BEGIN CERTIFICATE-----\r\nPUBLIC-ONE\r\n"
-        "-----END CERTIFICATE-----\r\n\r\n"
-        "-----BEGIN CERTIFICATE-----\r\nPUBLIC-TWO\r\n"
-        "-----END CERTIFICATE-----"
+        ca_pem("broker-root").replace("\n", "\r\n")
+        + "\r\n"
+        + ca_pem("broker-intermediate").strip().replace("\n", "\r\n")
     )
 
     normalized = normalize_broker_input(
@@ -1040,7 +1040,7 @@ def test_panel_rebind_never_accepts_user_asserted_identity(
 
 
 def test_panel_feature_overrides_are_typed_and_allowlisted() -> None:
-    certificate = "-----BEGIN CERTIFICATE-----\nPUBLIC-CA\n-----END CERTIFICATE-----"
+    certificate = ca_pem("panel-hue")
     schema = flow_schemas.panel_feature_overrides_schema(
         {
             CONF_VOICE_WAKE_WORD: "hey_jarvis",

@@ -20,7 +20,6 @@ import hmac
 import json
 import math
 import re
-import ssl
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -31,6 +30,7 @@ from homeassistant.config_entries import ConfigEntry, ConfigSubentryDataWithId
 from homeassistant.const import CONF_NAME
 
 from .broker import BrokerKind
+from .certificates import is_public_certificate_chain
 from .const import (
     COMPONENT_BRIDGE,
     COMPONENT_HA_MIRROR,
@@ -413,22 +413,6 @@ def _normalize_pem(value: str) -> str:
     return value.replace("\r\n", "\n").replace("\r", "\n").strip() + "\n"
 
 
-def _valid_ca(value: str) -> bool:
-    """Accept only a public certificate chain that OpenSSL can parse in memory."""
-    if (
-        "-----BEGIN CERTIFICATE-----" not in value
-        or "-----END CERTIFICATE-----" not in value
-        or "PRIVATE KEY-----" in value.upper()
-    ):
-        return False
-    try:
-        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        context.load_verify_locations(cadata=value)
-    except (ssl.SSLError, ValueError, TypeError):
-        return False
-    return True
-
-
 def secret_equal(left: object, right: object) -> bool:
     """Compare two optional credential strings in constant time."""
     if left is None or right is None:
@@ -719,7 +703,7 @@ def _broker_globals(
                 not isinstance(raw_ca, str)
                 or not raw_ca.strip()
                 or not tls_enabled
-                or not _valid_ca(_normalize_pem(raw_ca))
+                or not is_public_certificate_chain(_normalize_pem(raw_ca))
             ):
                 invalid.append(CONF_MQTT_TLS_CA)
             else:
@@ -817,9 +801,8 @@ def _unanimous_hue_ca(drafts: Sequence[_PanelDraft]) -> str | None:
     if len(values) != 1:
         return None
     (value,) = values
-    if not isinstance(value, str) or not value.strip() or not _valid_ca(_normalize_pem(value)):
-        return None
-    return value
+    # Validate the exact stored text: the strict fleet entry parser checks the same.
+    return value if isinstance(value, str) and is_public_certificate_chain(value) else None
 
 
 def _next_mesh_priority(priorities: Iterable[int]) -> int:

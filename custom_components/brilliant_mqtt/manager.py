@@ -38,6 +38,7 @@ from homeassistant.helpers.event import async_call_later
 
 from . import panel_ops
 from .broker import PanelBrokerReleaseSettings
+from .certificates import is_public_certificate_chain
 from .const import (
     AVAILABILITY_OFFLINE,
     AVAILABILITY_ONLINE,
@@ -48,6 +49,7 @@ from .const import (
     COMPONENT_VOICE,
     COMPONENT_WIFI_WATCHDOG,
     CONF_COMPONENTS,
+    CONF_FEATURE_OVERRIDES,
     CONF_HA_MIRROR_LEADER_PRIORITY,
     CONF_HA_MIRROR_TOKEN,
     CONF_HA_MIRROR_WS_URL,
@@ -92,7 +94,9 @@ from .const import (
     panel_device_name,
 )
 from .entry_data import (
+    EntryDataError,
     FleetConfig,
+    FleetPanelStore,
     LegacyPanelStore,
     PanelConfigStore,
     effective_hue_ca_cert,
@@ -920,12 +924,31 @@ class PanelManager:
             return self.store.data.get(key, default)
         return self.store.options.get(key, default)
 
-    def _hue_ca_cert(self) -> str:
-        """Return the effective diyHue CA: the panel override, else the fleet default."""
-        return effective_hue_ca_cert(
-            {CONF_HUE_CA_CERT: self._panel_override(CONF_HUE_CA_CERT, "")},
-            self.fleet.hue_ca_cert,
-        )
+    def _stored_hue_ca_cert(self) -> str:
+        """Resolve the effective diyHue CA from the authoritative stored config.
+
+        Callers hold the fleet-wide SSH lock, which the fleet and panel CA edit flows
+        also take, so the value cannot change between this read and the panel write.
+        The runtime ``self.fleet`` snapshot is deliberately not used: an asynchronous
+        reconcile refreshes it and may still be pending after a fleet CA edit. A
+        panel's non-blank override wins over the fleet default. Returns "" unless the
+        result is a valid public X.509 chain.
+        """
+        store = self.store
+        if isinstance(store, FleetPanelStore):
+            subentry = store.entry.subentries.get(store.subentry_id)
+            overrides = subentry.data.get(CONF_FEATURE_OVERRIDES) if subentry else None
+            try:
+                fleet_default = FleetConfig.from_entry(store.entry).hue_ca_cert
+            except EntryDataError:
+                return ""
+            if not isinstance(overrides, Mapping):
+                return ""
+        else:
+            overrides = {CONF_HUE_CA_CERT: self._panel_override(CONF_HUE_CA_CERT, "")}
+            fleet_default = self.fleet.hue_ca_cert
+        candidate = effective_hue_ca_cert(overrides, fleet_default)
+        return candidate if is_public_certificate_chain(candidate) else ""
 
     def _fire(self, event_type: str, data: dict[str, Any] | None = None) -> None:
         self.hass.bus.async_fire(
@@ -1489,7 +1512,7 @@ class PanelManager:
             )
             state = await panel_ops.inspect_hue_ca(shell)
             if not state.payload_present:
-                ca_pem = self._hue_ca_cert().strip()
+                ca_pem = self._stored_hue_ca_cert().strip()
                 if not ca_pem:
                     _LOGGER.warning(
                         "%s: hue-ca code is missing and no CA certificate is "
@@ -2126,7 +2149,14 @@ class PanelManager:
             )
             data[CONF_VOICE_HA_HOST] = self._panel_override(CONF_VOICE_HA_HOST, "")
         elif component_id == COMPONENT_HUE_CA:
-            data[CONF_HUE_CA_CERT] = self._hue_ca_cert()
+            ca_pem = self._stored_hue_ca_cert()
+            if not ca_pem:
+                raise HomeAssistantError(
+                    translation_domain=DOMAIN,
+                    translation_key="hue_ca_cert_missing",
+                    translation_placeholders={"panel": self.panel},
+                )
+            data[CONF_HUE_CA_CERT] = ca_pem
         return data
 
     async def _async_component_mutation(self, component_id: str, *, enabled: bool) -> None:
@@ -2134,14 +2164,20 @@ class PanelManager:
         from .components import REGISTRY  # lazy: components imports manager
 
         component = REGISTRY[component_id]
-        stored_components = self.store.data.get(CONF_COMPONENTS, {})
-        stored_enabled = stored_components.get(component_id)
-        previous_enabled = stored_enabled if isinstance(stored_enabled, bool) else not enabled
         remote_succeeded = False
         close_ok = False
         failure: BaseException | None = None
 
+        # The fleet-wide SSH lock is also held by the fleet and panel flows that edit
+        # the Hue CA, so the prior state, the install inputs, the remote operation and
+        # the persisted selection below form one serialized unit.
         async with self._ssh_lock:
+            stored_components = self.store.data.get(CONF_COMPONENTS, {})
+            stored_enabled = stored_components.get(component_id)
+            previous_enabled = stored_enabled if isinstance(stored_enabled, bool) else not enabled
+            # Resolved before any panel contact; a missing Hue CA raises the
+            # translated hue_ca_cert_missing error with nothing changed.
+            install_data = self._component_install_data(component_id) if enabled else {}
             shell: PanelShell | None = None
             try:
                 shell = await self._connect_for_repair()
@@ -2149,11 +2185,7 @@ class PanelManager:
                     if enabled and component_id == COMPONENT_BRIDGE:
                         await self._async_install_bridge(shell)
                     elif enabled:
-                        await component.install(
-                            self.hass,
-                            shell,
-                            self._component_install_data(component_id),
-                        )
+                        await component.install(self.hass, shell, install_data)
                     else:
                         await component.remove(shell)
                     remote_succeeded = True
@@ -2273,14 +2305,6 @@ class PanelManager:
         component = REGISTRY[component_id]
         if component.deprecated:
             raise PanelOpError("component_deprecated") from None
-        if component_id == COMPONENT_HUE_CA and not self._hue_ca_cert().strip():
-            # Fail before any SSH contact with a specific, actionable error rather
-            # than the generic component failure _hue_ca_install would produce.
-            raise HomeAssistantError(
-                translation_domain=DOMAIN,
-                translation_key="hue_ca_cert_missing",
-                translation_placeholders={"panel": self.panel},
-            )
         await self._async_settle_component_mutation(component_id, enabled=True)
 
     async def async_remove_component(self, component_id: str) -> None:

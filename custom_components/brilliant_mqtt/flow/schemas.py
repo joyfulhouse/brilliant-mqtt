@@ -23,6 +23,7 @@ from homeassistant.helpers.selector import (
 )
 
 from ..broker import BrokerKind
+from ..certificates import is_public_certificate_chain as _is_public_certificate_chain
 from ..components import optional
 from ..const import (
     CONF_BROKER_KIND,
@@ -63,7 +64,6 @@ from ..const import (
     OPT_REPAIR_COOLDOWN_MINUTES,
     VOICE_WAKE_WORDS,
 )
-from ..panel_ops import MAX_MQTT_CA_BYTES
 
 ADVANCED_SECTION = "advanced"
 DEFAULT_SSH_USERNAME = "root"
@@ -96,8 +96,6 @@ _PANEL_HOST_FORBIDDEN = frozenset(",*?![]|#@\\")
 _SLUG_NON_ALPHANUMERIC = re.compile(r"[^a-z0-9]+")
 _SERVICE_PATTERN = re.compile(r"[a-z0-9_]+")
 _TARGET_KEYS = frozenset({"entity_id", "device_id", "area_id"})
-_CERTIFICATE_BEGIN = "-----BEGIN CERTIFICATE-----"
-_CERTIFICATE_END = "-----END CERTIFICATE-----"
 
 _PASSWORD_SELECTOR = TextSelector(TextSelectorConfig(type=TextSelectorType.PASSWORD))
 _PUBLIC_CA_SELECTOR = TextSelector(TextSelectorConfig(multiline=True))
@@ -185,46 +183,6 @@ def _advanced_values(source: Mapping[str, object] | None) -> Mapping[str, object
     values = _source_values(source)
     nested = values.get(ADVANCED_SECTION)
     return nested if isinstance(nested, Mapping) else values
-
-
-def _is_public_certificate_chain(value: str) -> bool:
-    encoded_length = _encoded_length(value)
-    if (
-        encoded_length is None
-        or encoded_length > MAX_MQTT_CA_BYTES
-        or "PRIVATE KEY" in value.upper()
-        or any(
-            unicodedata.category(character) == "Cc" and character not in "\r\n"
-            for character in value
-        )
-    ):
-        return False
-
-    lines = value.strip(" \r\n").splitlines()
-    if not lines:
-        return False
-    expecting_begin = True
-    body_lines = 0
-    certificate_count = 0
-    for line in lines:
-        if expecting_begin:
-            if not line.strip():
-                continue
-            if line != _CERTIFICATE_BEGIN:
-                return False
-            expecting_begin = False
-            body_lines = 0
-            continue
-        if line == _CERTIFICATE_END:
-            if body_lines == 0:
-                return False
-            expecting_begin = True
-            certificate_count += 1
-            continue
-        if not line or line.isspace() or line == _CERTIFICATE_BEGIN or line.startswith("-----END "):
-            return False
-        body_lines += 1
-    return expecting_begin and certificate_count > 0
 
 
 def _advanced_defaults(

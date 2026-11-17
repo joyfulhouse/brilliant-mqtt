@@ -84,6 +84,7 @@ from custom_components.brilliant_mqtt.shell import (
     RunResult,
     _LegacyAsyncsshShell,
 )
+from tests.cert_fixtures import ca_pem
 from tests.conftest import REPIN_NEW_KEY, RepinShells
 from tests.fakes import FakeShell
 from tests.test_init import ENTRY_DATA
@@ -4994,7 +4995,7 @@ async def test_refresh_staged_copies_skips_bus_watchdog_when_not_selected(
 # wiped by the OTA the hook exists to recover from — the units must be re-laid).
 # ---------------------------------------------------------------------------
 
-_HUE_CA_CERT_PEM = "-----BEGIN CERTIFICATE-----\nFAKE\n-----END CERTIFICATE-----\n"
+_HUE_CA_CERT_PEM = ca_pem("legacy-hue")
 
 
 def _write_hue_ca_units(payload_dir: Path) -> None:
@@ -6053,8 +6054,8 @@ def test_snapshot_probe_summary_exposes_only_safe_retry_guidance() -> None:
 # flow start with empty feature overrides and must inherit the fleet's Hue CA.
 # ---------------------------------------------------------------------------
 
-_FLEET_HUE_CA = "-----BEGIN CERTIFICATE-----\nFLEET-HUE-CA\n-----END CERTIFICATE-----\n"
-_PANEL_HUE_CA = "-----BEGIN CERTIFICATE-----\nPANEL-HUE-CA\n-----END CERTIFICATE-----\n"
+_FLEET_HUE_CA = ca_pem("fleet-hue")
+_PANEL_HUE_CA = ca_pem("panel-hue")
 
 
 async def test_new_fleet_panel_enables_hue_ca_with_the_fleet_default_ca(
@@ -6125,7 +6126,7 @@ def test_fleet_hue_ca_default_change_propagates_to_live_managers(
         hass,
         fleet_overrides={CONF_HUE_CA_CERT: _FLEET_HUE_CA},
     )
-    rotated = "-----BEGIN CERTIFICATE-----\nROTATED-HUE-CA\n-----END CERTIFICATE-----\n"
+    rotated = ca_pem("rotated-hue")
     hass.config_entries.async_update_entry(
         entry,
         data={**entry.data, CONF_HUE_CA_CERT: rotated},

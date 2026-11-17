@@ -577,32 +577,53 @@ class BrilliantMqttFleetOptionsFlow(OptionsFlow):
             except FlowInputError as error:
                 errors = dict(error.errors)
             else:
-                topology = cast(tuple[tuple[str, PanelConfig], ...], snapshot[1])
-                # Mirror the per-panel Overrides guard: an enabled hook whose
-                # effective CA would change must be disabled and re-enabled so the
-                # panel's injected CA never silently diverges from the stored one.
-                if any(
-                    panel.components.get(COMPONENT_HUE_CA) is True
-                    and effective_hue_ca_cert(panel.feature_overrides, fleet.hue_ca_cert)
-                    != effective_hue_ca_cert(panel.feature_overrides, candidate)
-                    for _panel_id, panel in topology
-                ):
-                    return self.async_abort(
-                        reason="fleet_hue_ca_change_requires_agent_rollout",
-                    )
-                updated = dict(entry.data)
-                if candidate:
-                    updated[CONF_HUE_CA_CERT] = candidate
-                else:
-                    updated.pop(CONF_HUE_CA_CERT, None)
-                if updated != entry.data:
-                    self.hass.config_entries.async_update_entry(entry, data=updated)
-                return self.async_abort(reason="reconfigure_successful")
+                # The fleet-wide SSH lock serializes this with every component
+                # install/removal (which persists its enabled flag before releasing
+                # it), so the guard below sees settled panel state and no hue-ca
+                # install can read the CA between the check and the update.
+                async with _fleet_lock(self.hass):
+                    return self._commit_fleet_hue_ca(candidate)
         return self.async_show_form(
             step_id="hue_ca",
             data_schema=fleet_hue_ca_schema(entry.data),
             errors=errors,
         )
+
+    def _commit_fleet_hue_ca(self, candidate: str) -> ConfigFlowResult:
+        """Re-read everything under the shared lock, guard, then update atomically."""
+        entry = self._exact_registered_entry()
+        if entry is None:
+            return self.async_abort(reason="invalid_parent")
+        try:
+            fleet = FleetConfig.from_entry(entry)
+        except EntryDataError:
+            return self.async_abort(reason="invalid_parent")
+        snapshot = self._hue_ca_snapshot(entry)
+        if snapshot is None:
+            return self.async_abort(reason="invalid_parent")
+        if snapshot != self._hue_ca_expected:
+            return self.async_abort(reason="parent_changed")
+        topology = cast(tuple[tuple[str, PanelConfig], ...], snapshot[1])
+        # Mirror the per-panel Overrides guard: an enabled hook whose effective CA
+        # would change must be disabled and re-enabled so the panel's injected CA
+        # never silently diverges from the stored one.
+        if any(
+            panel.components.get(COMPONENT_HUE_CA) is True
+            and effective_hue_ca_cert(panel.feature_overrides, fleet.hue_ca_cert)
+            != effective_hue_ca_cert(panel.feature_overrides, candidate)
+            for _panel_id, panel in topology
+        ):
+            return self.async_abort(
+                reason="fleet_hue_ca_change_requires_agent_rollout",
+            )
+        updated = dict(entry.data)
+        if candidate:
+            updated[CONF_HUE_CA_CERT] = candidate
+        else:
+            updated.pop(CONF_HUE_CA_CERT, None)
+        if updated != entry.data:
+            self.hass.config_entries.async_update_entry(entry, data=updated)
+        return self.async_abort(reason="reconfigure_successful")
 
     async def async_step_advanced(
         self,

@@ -15,6 +15,7 @@ from homeassistant.const import CONF_NAME
 from homeassistant.core import HomeAssistant
 
 from .broker import BrokerProfile
+from .certificates import is_public_certificate_chain
 from .const import (
     CONF_BROKER_KIND,
     CONF_COMPONENTS,
@@ -245,11 +246,11 @@ def _resilience_values(
 
 
 def _optional_fleet_hue_ca(data: Mapping[str, Any]) -> str:
-    """Parse the optional fleet Hue CA default: absent, or one non-blank string."""
+    """Parse the optional fleet Hue CA default: absent, or one public X.509 chain."""
     if CONF_HUE_CA_CERT not in data:
         return ""
     value = data[CONF_HUE_CA_CERT]
-    if not isinstance(value, str) or not value.strip():
+    if not isinstance(value, str) or not is_public_certificate_chain(value):
         raise _invalid("invalid_fleet_entry_data")
     return value
 

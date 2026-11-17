@@ -61,6 +61,7 @@ from custom_components.brilliant_mqtt.provisioning_journal import (
     ProvisioningJournal,
     ProvisioningJournalError,
 )
+from tests import cert_fixtures
 from tests.fakes import FakeShell
 from tests.test_init import ENTRY_DATA
 
@@ -77,10 +78,8 @@ async def test_fleet_diagnostics_are_keyed_by_runtime_id_and_never_export_secret
     ca_pem = (
         "-----BEGIN CERTIFICATE-----\ndiagnostics-ca-body-must-not-leak\n-----END CERTIFICATE-----"
     )
-    hue_ca_pem = (
-        "-----BEGIN CERTIFICATE-----\ndiagnostics-hue-ca-body-must-not-leak\n"
-        "-----END CERTIFICATE-----"
-    )
+    hue_ca_pem = cert_fixtures.ca_pem("diagnostics-hue")
+    hue_ca_body = hue_ca_pem.splitlines()[1]
     environment = "MQTT_PASSWORD=diagnostics-env-body-must-not-leak\n"
     unknown_component = "diagnostics_unknown_component_must_not_leak"
     identities = {
@@ -243,7 +242,7 @@ async def test_fleet_diagnostics_are_keyed_by_runtime_id_and_never_export_secret
         ca_pem,
         "diagnostics-ca-body-must-not-leak",
         hue_ca_pem,
-        "diagnostics-hue-ca-body-must-not-leak",
+        hue_ca_body,
         environment,
         "diagnostics-env-body-must-not-leak",
         "diagnostics-office-root-password",
