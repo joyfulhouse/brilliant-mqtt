@@ -326,10 +326,13 @@ read -r -a PANEL_IPS <<<"$BVD_CANDIDATE_PANEL_IPS"
 read -r -a APPROVED_IPS <<<"$BVD_APPROVED_OWNER_PANEL_IPS"
 test "${#APPROVED_IPS[@]}" -gt 0
 # Office is excluded by default (known WiFi problem). A leading `!` would not
-# trip errexit, so refuse explicitly.
+# trip errexit, so refuse explicitly. Status 1 is the only "absent" answer;
+# a grep error (status >1) must stop the script, not read as absence.
 if printf '%s\n' "${APPROVED_IPS[@]}" | grep -Fx '10.100.0.10' >/dev/null; then
   echo 'Office is not an approved pilot host' >&2
   exit 1
+else
+  test "$?" -eq 1
 fi
 for IP in "${APPROVED_IPS[@]}"; do
   printf '%s\n' "${PANEL_IPS[@]}" | grep -Fx "$IP" >/dev/null
@@ -370,6 +373,8 @@ for PANEL in "${PANEL_IPS[@]}"; do
       "$CONFIGURATION_OWNER"
     OWNER_COUNT=$((OWNER_COUNT + 1))
     CURRENT_OWNER_IP=$PANEL
+  else
+    test "$?" -eq 1  # jq -e: 1 = false; any other status is an error
   fi
 done
 
@@ -389,6 +394,8 @@ printf '%s\n' "$APPROVED_OWNER_DEVICE_IDS" >"$OWNER_EVIDENCE/approved-owner-devi
 CURRENT_OWNER_APPROVED=false
 if printf '%s\n' "${APPROVED_IPS[@]}" | grep -Fx "$CURRENT_OWNER_IP" >/dev/null; then
   CURRENT_OWNER_APPROVED=true
+else
+  test "$?" -eq 1
 fi
 printf 'current_owner_reachable=true\ncurrent_owner_ip=%s\ncurrent_owner_approved=%s\n' \
   "$CURRENT_OWNER_IP" "$CURRENT_OWNER_APPROVED"
@@ -506,13 +513,22 @@ ostree admin status | \
   PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$RELEASE/app" \
   /data/switch-embedded/env/bin/python3 -m tools.brilliant_bvd.firmware_gate \
   --embedded-version "$(cat /data/switch-embedded/.version)"
-systemctl is-active message_bus switch_ui_app brilliant-mqtt
+# One unit per call: `systemctl is-active a b c` succeeds if ANY unit is active.
+for UNIT in message_bus switch_ui_app brilliant-mqtt; do
+  test "$(systemctl is-active "$UNIT")" = active
+done
+# An empty answer means systemctl itself failed; it is not proof of absence.
 MIRROR_STATE=$(systemctl is-active brilliant-ha-mirror 2>/dev/null || true)
 case "$MIRROR_STATE" in
-  inactive|unknown|'') ;;
+  inactive|unknown) ;;
   *) exit 1 ;;
 esac
-if pgrep -f '[b]rilliant[_-]ha[_-]mirror' >/dev/null; then exit 1; fi
+# pgrep: 0 = running (refuse), 1 = absent, >1 = error (refuse).
+if pgrep -f '[b]rilliant[_-]ha[_-]mirror' >/dev/null; then
+  exit 1
+else
+  test "$?" -eq 1
+fi
 systemctl show message_bus -p MainPID -p ActiveEnterTimestampMonotonic
 # uwsgi rewrites the vassal title into one string ending in
 # "--ini brilliant_virtual_device_peripherals.ini --include .../process-default.ini".
@@ -573,9 +589,14 @@ Require the manifest entry to contain exactly the fixed stable/entity IDs,
 publication to be retained and available with a nonnegative sequence. An `on`
 state must carry `attributes.brightness` 0–255. An `off` state normally
 **omits** brightness (HA reports none for an off light and the manifest only
-forwards integer brightness); the pilot accepts it as authoritative off
-(native `on=0`, last native intensity kept). If an off state does carry
-brightness it must still be 0–255. Apply refuses to register until both retained authorities
+forwards integer brightness); the pilot accepts it as authoritative off and
+reflects only native `on=0`, leaving native `intensity` untouched. That
+retained value is not HA-confirmed: on first admission of an off light it is
+the schema default `500`, and after optimistic native updates it need not
+equal any brightness HA confirmed. How the native slider UI and the BVD
+device-group/request-dispatcher path interpret `on=0` with a stale intensity
+is a live validation item for Phase 3. If an off state does carry brightness
+it must still be 0–255. Apply refuses to register until both retained authorities
 arrive. Any later manifest mismatch/removal, state unavailability, MQTT stream
 loss, or sequence/epoch conflict fences commands and aborts into cleanup. The
 HA executor rejects commands absent from its committed manifest
@@ -929,13 +950,22 @@ ostree admin status | \
   PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$RELEASE/app" \
   /data/switch-embedded/env/bin/python3 -m tools.brilliant_bvd.firmware_gate \
   --embedded-version "$(cat /data/switch-embedded/.version)"
-systemctl is-active message_bus switch_ui_app brilliant-mqtt
+# One unit per call: `systemctl is-active a b c` succeeds if ANY unit is active.
+for UNIT in message_bus switch_ui_app brilliant-mqtt; do
+  test "$(systemctl is-active "$UNIT")" = active
+done
+# An empty answer means systemctl itself failed; it is not proof of absence.
 MIRROR_STATE=$(systemctl is-active brilliant-ha-mirror 2>/dev/null || true)
 case "$MIRROR_STATE" in
-  inactive|unknown|'') ;;
+  inactive|unknown) ;;
   *) exit 1 ;;
 esac
-if pgrep -f '[b]rilliant[_-]ha[_-]mirror' >/dev/null; then exit 1; fi
+# pgrep: 0 = running (refuse), 1 = absent, >1 = error (refuse).
+if pgrep -f '[b]rilliant[_-]ha[_-]mirror' >/dev/null; then
+  exit 1
+else
+  test "$?" -eq 1
+fi
 ```
 
 The retired mirror remaining inactive/absent is a hard postflight gate, not a
@@ -976,7 +1006,11 @@ for PANEL in "${PANEL_IPS[@]}"; do
   RUN="/var/brilliant-bvd-pilot/runs/$RUN_ID"
   sshpass -e ssh root@"$PANEL" "
     set -euo pipefail
-    if pgrep -f '[t]ools.brilliant_bvd.live' >/dev/null; then exit 1; fi
+    if pgrep -f '[t]ools.brilliant_bvd.live' >/dev/null; then
+      exit 1
+    else
+      test \"\$?\" -eq 1
+    fi
     test \"\$(cat '$RELEASE/COMMIT')\" = '$REVIEWED_COMMIT'
     if test -e /run/brilliant-bvd-pilot/single-light.lock; then
       flock -n /run/brilliant-bvd-pilot/single-light.lock true
