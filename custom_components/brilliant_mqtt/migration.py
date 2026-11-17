@@ -295,6 +295,7 @@ class MigrationPlan:
                 "mqtt_port": self.fleet_data[CONF_MQTT_PORT],
                 "mqtt_tls_enabled": self.fleet_data[CONF_MQTT_TLS_ENABLED],
                 "has_custom_ca": CONF_MQTT_TLS_CA in self.fleet_data,
+                "has_hue_ca_default": CONF_HUE_CA_CERT in self.fleet_data,
                 "ha_control_enabled": self.fleet_data[CONF_HA_CONTROL_ENABLED],
                 "scene_panel": by_subentry[str(self.fleet_data[CONF_SCENE_PANEL])],
                 "scene_panel_subentry_id": self.fleet_data[CONF_SCENE_PANEL],
@@ -804,6 +805,23 @@ def _choose(
     return chosen
 
 
+def _unanimous_hue_ca(drafts: Sequence[_PanelDraft]) -> str | None:
+    """Return the diyHue CA every panel shares when it is one valid public chain.
+
+    The fleet default is what panels added later inherit, so it is promoted only
+    when unanimous: a panel with no CA or a different one means there is no single
+    fleet CA, and picking among differing values would be arbitrary. Per-panel
+    overrides are kept either way, so no migrated panel's effective CA changes.
+    """
+    values = {draft.data[CONF_FEATURE_OVERRIDES].get(CONF_HUE_CA_CERT) for draft in drafts}
+    if len(values) != 1:
+        return None
+    (value,) = values
+    if not isinstance(value, str) or not value.strip() or not _valid_ca(_normalize_pem(value)):
+        return None
+    return value
+
+
 def _next_mesh_priority(priorities: Iterable[int]) -> int:
     """Match FleetManager's reconciled allocator: the smallest unused positive."""
     used = {priority for priority in priorities if priority > 0}
@@ -999,6 +1017,8 @@ def plan_migration(
     }
     if broker[CONF_MQTT_TLS_CA] is not None:
         fleet_data[CONF_MQTT_TLS_CA] = broker[CONF_MQTT_TLS_CA]
+    if (hue_ca := _unanimous_hue_ca(drafts)) is not None:
+        fleet_data[CONF_HUE_CA_CERT] = hue_ca
 
     candidate_ids = tuple(snapshot.entry_id for snapshot in legacy)
     anchor = candidate_ids[0]

@@ -28,6 +28,7 @@ from custom_components.brilliant_mqtt.const import (
     CONF_HA_CONTROL_LABEL,
     CONF_HOST,
     CONF_HOT_POLL_SECONDS,
+    CONF_HUE_CA_CERT,
     CONF_IDENTITY_FINGERPRINT,
     CONF_MANAGEMENT_ID,
     CONF_MAX_MIRRORED_ENTITIES,
@@ -64,6 +65,7 @@ from custom_components.brilliant_mqtt.entry_data import (
     LegacyPanelStore,
     PanelConfig,
     PanelConfigStore,
+    effective_hue_ca_cert,
 )
 
 
@@ -621,3 +623,58 @@ async def test_legacy_store_exposes_version_three_shape_unchanged(
     assert task in entry._background_tasks
     release.set()
     assert await task == "done"
+
+
+_HUE_CA = "-----BEGIN CERTIFICATE-----\nFLEET-HUE-CA\n-----END CERTIFICATE-----\n"
+
+
+def test_fleet_hue_ca_default_is_optional_and_kept_out_of_repr() -> None:
+    """The fleet Hue CA default is optional fleet data and never shown in repr."""
+    absent = FleetConfig.from_entry(
+        MockConfigEntry(domain=DOMAIN, version=CONFIG_ENTRY_VERSION, data=_fleet_data())
+    )
+    present = FleetConfig.from_entry(
+        MockConfigEntry(
+            domain=DOMAIN,
+            version=CONFIG_ENTRY_VERSION,
+            data=_fleet_data(**{CONF_HUE_CA_CERT: _HUE_CA}),
+        )
+    )
+
+    assert absent.hue_ca_cert == ""
+    assert present.hue_ca_cert == _HUE_CA
+    assert "FLEET-HUE-CA" not in repr(present)
+
+
+@pytest.mark.parametrize("value", ["", "   \n", None, 1, ["pem"]])
+def test_fleet_hue_ca_default_rejects_blank_or_non_string(value: object) -> None:
+    """A stored fleet Hue CA is either absent or a non-blank string."""
+    with pytest.raises(EntryDataError, match="invalid_fleet_entry_data"):
+        FleetConfig.from_entry(
+            MockConfigEntry(
+                domain=DOMAIN,
+                version=CONFIG_ENTRY_VERSION,
+                data=_fleet_data(**{CONF_HUE_CA_CERT: value}),
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "fleet_default", "expected"),
+    [
+        ({}, _HUE_CA, _HUE_CA),
+        ({CONF_HUE_CA_CERT: ""}, _HUE_CA, _HUE_CA),
+        ({CONF_HUE_CA_CERT: "  \n"}, _HUE_CA, _HUE_CA),
+        ({CONF_HUE_CA_CERT: "panel-pem"}, _HUE_CA, "panel-pem"),
+        ({CONF_HUE_CA_CERT: "panel-pem"}, "", "panel-pem"),
+        ({CONF_HUE_CA_CERT: 7}, _HUE_CA, _HUE_CA),
+        ({}, "", ""),
+    ],
+)
+def test_effective_hue_ca_prefers_explicit_panel_override_then_fleet_default(
+    overrides: dict[str, object],
+    fleet_default: str,
+    expected: str,
+) -> None:
+    """A non-blank panel override wins; a blank/absent one inherits the fleet CA."""
+    assert effective_hue_ca_cert(overrides, fleet_default) == expected

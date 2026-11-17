@@ -1307,6 +1307,25 @@ def _panel_cadence_schema_fields(source: Mapping[str, object]) -> dict[Any, Any]
     return fields
 
 
+def fleet_hue_ca_schema(source: Mapping[str, object] | None = None) -> vol.Schema:
+    """Build the fleet-wide diyHue CA default form (blank means no default)."""
+    raw = _source_values(source).get(CONF_HUE_CA_CERT)
+    default = raw if isinstance(raw, str) and _is_public_certificate_chain(raw) else ""
+    return vol.Schema({vol.Optional(CONF_HUE_CA_CERT, default=default): _PUBLIC_CA_SELECTOR})
+
+
+def normalize_fleet_hue_ca_input(user_input: Mapping[str, object]) -> str:
+    """Validate the fleet diyHue CA default; return "" when it is being cleared."""
+    errors = _unexpected_key_errors(user_input, frozenset({CONF_HUE_CA_CERT}))
+    raw = user_input.get(CONF_HUE_CA_CERT, "")
+    if not isinstance(raw, str) or (raw.strip() and not _is_public_certificate_chain(raw)):
+        errors[CONF_HUE_CA_CERT] = "invalid_value"
+    if errors:
+        raise FlowInputError(errors)
+    assert isinstance(raw, str)
+    return raw if raw.strip() else ""
+
+
 def normalize_panel_feature_overrides_input(
     user_input: Mapping[str, object],
 ) -> dict[str, object]:

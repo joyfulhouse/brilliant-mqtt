@@ -91,7 +91,12 @@ from .const import (
     meta_topic,
     panel_device_name,
 )
-from .entry_data import FleetConfig, LegacyPanelStore, PanelConfigStore
+from .entry_data import (
+    FleetConfig,
+    LegacyPanelStore,
+    PanelConfigStore,
+    effective_hue_ca_cert,
+)
 from .mqtt_payload import decode_mqtt_payload
 from .panel_ops import PanelOpError
 from .provisioning_journal import ProvisioningJournal, ProvisioningJournalError
@@ -915,6 +920,13 @@ class PanelManager:
             return self.store.data.get(key, default)
         return self.store.options.get(key, default)
 
+    def _hue_ca_cert(self) -> str:
+        """Return the effective diyHue CA: the panel override, else the fleet default."""
+        return effective_hue_ca_cert(
+            {CONF_HUE_CA_CERT: self._panel_override(CONF_HUE_CA_CERT, "")},
+            self.fleet.hue_ca_cert,
+        )
+
     def _fire(self, event_type: str, data: dict[str, Any] | None = None) -> None:
         self.hass.bus.async_fire(
             EVENT_TYPE,
@@ -1477,7 +1489,7 @@ class PanelManager:
             )
             state = await panel_ops.inspect_hue_ca(shell)
             if not state.payload_present:
-                ca_pem = str(self._panel_override(CONF_HUE_CA_CERT, "")).strip()
+                ca_pem = self._hue_ca_cert().strip()
                 if not ca_pem:
                     _LOGGER.warning(
                         "%s: hue-ca code is missing and no CA certificate is "
@@ -2114,7 +2126,7 @@ class PanelManager:
             )
             data[CONF_VOICE_HA_HOST] = self._panel_override(CONF_VOICE_HA_HOST, "")
         elif component_id == COMPONENT_HUE_CA:
-            data[CONF_HUE_CA_CERT] = self._panel_override(CONF_HUE_CA_CERT, "")
+            data[CONF_HUE_CA_CERT] = self._hue_ca_cert()
         return data
 
     async def _async_component_mutation(self, component_id: str, *, enabled: bool) -> None:
@@ -2261,6 +2273,14 @@ class PanelManager:
         component = REGISTRY[component_id]
         if component.deprecated:
             raise PanelOpError("component_deprecated") from None
+        if component_id == COMPONENT_HUE_CA and not self._hue_ca_cert().strip():
+            # Fail before any SSH contact with a specific, actionable error rather
+            # than the generic component failure _hue_ca_install would produce.
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="hue_ca_cert_missing",
+                translation_placeholders={"panel": self.panel},
+            )
         await self._async_settle_component_mutation(component_id, enabled=True)
 
     async def async_remove_component(self, component_id: str) -> None:
