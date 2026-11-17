@@ -84,10 +84,13 @@ reboot:
 run_scene:
   name: Run Brilliant scene
   description: Run a scene on an attached Brilliant panel and wait for execution confirmation.
+  target:
+    entity:
+      integration: brilliant_mqtt
   fields:
     panel:
       name: Panel
-      description: Attached panel slug. Omit it to use the configured scene panel.
+      description: Attached panel slug. Optional with a target, which must then name the same single panel; omit both to use the configured scene panel.
       required: false
       selector:
         text:
@@ -100,10 +103,13 @@ run_scene:
 set_mode:
   name: Set Brilliant mode
   description: Set a mode on an attached Brilliant panel and wait for execution confirmation.
+  target:
+    entity:
+      integration: brilliant_mqtt
   fields:
     panel:
       name: Panel
-      description: Attached panel slug. Omit it to use the configured scene panel.
+      description: Attached panel slug. Optional with a target, which must then name the same single panel; omit both to use the configured scene panel.
       required: false
       selector:
         text:

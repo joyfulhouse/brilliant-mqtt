@@ -41,3 +41,32 @@ jobs:
       - run: uv run --project ha ruff format --check --config ha/pyproject.toml custom_components/brilliant_mqtt ha/tests
       - run: uv run --project ha mypy --strict --config-file ha/pyproject.toml custom_components/brilliant_mqtt ha/tests
       - run: uv run --project ha pytest -c ha/pyproject.toml ha/tests
+
+  ha-integration-ha-2026-10:
+    # Forward-compat leg: the same integration suite against HA 2026.10.4 (the
+    # single-owner "device split" registry, probatio flow schemas). It runs next to,
+    # never instead of, the pinned ha-integration job above, whose check name branch
+    # protection requires. The repo pin + lock stay on HA 2026.6.2 (the hacs.json
+    # minimum); this leg resolves a throwaway copy of ha/pyproject.toml with the
+    # newer harness. Tests only: 2026.10's probatio-typed flow APIs don't accept
+    # the integration's voluptuous schemas under mypy yet (runtime is fine).
+    runs-on: ubuntu-latest
+    env:
+      HA_HARNESS: pytest-homeassistant-custom-component==0.13.375 # pins HA core 2026.10.4
+      HA_VERSION: 2026.10.4
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v7
+      - run: uv python install 3.14
+      - name: Resolve the HA ${{ env.HA_VERSION }} harness in a throwaway project
+        run: |
+          project="$RUNNER_TEMP/ha-$HA_VERSION"
+          mkdir -p "$project"
+          sed -E 's/"pytest-homeassistant-custom-component==[^"]+"/"'"$HA_HARNESS"'"/' \
+            ha/pyproject.toml > "$project/pyproject.toml"
+          grep -q "\"$HA_HARNESS\"" "$project/pyproject.toml"
+          uv sync --project "$project"
+          uv run --project "$project" python -c \
+            "import sys; from homeassistant.const import __version__ as v; sys.exit(v != '$HA_VERSION' and f'got HA {v}')"
+          echo "HA_PROJECT=$project" >> "$GITHUB_ENV"
+      - run: uv run --project "$HA_PROJECT" pytest -c ha/pyproject.toml ha/tests

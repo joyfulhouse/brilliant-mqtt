@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
+import importlib
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any, cast
 
 import pytest
 import voluptuous as vol
-import voluptuous_serialize
 from homeassistant.const import CONF_NAME
 from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers import data_entry_flow as flow_helpers
 
 from custom_components.brilliant_mqtt.broker import BrokerKind
 from custom_components.brilliant_mqtt.const import (
@@ -72,10 +73,23 @@ from custom_components.brilliant_mqtt.flow.schemas import (
 )
 
 
+def _schema_serializer() -> Callable[..., Any]:
+    """The serializer HA's flow views use to send a form schema to the frontend.
+
+    HA 2026.10 replaced voluptuous_serialize with probatio (and stopped installing
+    voluptuous_serialize); earlier releases import voluptuous_serialize there.
+    Resolve whichever this HA's flow helper module ships, so the contract is
+    checked against the real frontend serialization on every supported release.
+    """
+    if (probatio := getattr(flow_helpers, "probatio", None)) is not None:
+        return cast(Callable[..., Any], probatio.to_field_list)
+    return cast(Callable[..., Any], importlib.import_module("voluptuous_serialize").convert)
+
+
 def _serialized(schema: vol.Schema) -> list[dict[str, Any]]:
     return cast(
         list[dict[str, Any]],
-        voluptuous_serialize.convert(schema, custom_serializer=cv.custom_serializer),
+        _schema_serializer()(schema, custom_serializer=cv.custom_serializer),
     )
 
 
