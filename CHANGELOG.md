@@ -39,9 +39,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   therefore always matches the stored configuration.
 - CA certificates are now checked as real X.509 certificates, not just PEM
   framing. Every block must be strict base64 of one parseable certificate. The
-  same check covers the broker CA, the fleet and per-panel diyHue CA fields,
-  the stored fleet diyHue CA, and migration. Placeholder text, invalid base64,
-  non-certificate or truncated data, and any private key are rejected.
+  same check covers the broker CA form and the stored broker CA, the fleet and
+  per-panel diyHue CA fields, the stored fleet diyHue CA, and migration.
+  Placeholder text, invalid base64, non-certificate or truncated data, and any
+  private key are rejected. Real certificate chains stored by earlier releases
+  still load, and a fleet without a custom broker CA is unaffected.
 
 ## [0.12.1] - 2026-11-17
 

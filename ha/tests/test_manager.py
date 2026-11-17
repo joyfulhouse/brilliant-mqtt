@@ -895,12 +895,12 @@ async def test_fleet_custom_ca_is_staged_and_exact_returned_path_is_rendered(
     operation: str,
 ) -> None:
     """Fleet repair/install never exports broker secrets or guesses the CA path."""
-    ca_pem = "-----BEGIN CERTIFICATE-----\nZmFrZS1wdWJsaWMtY2E=\n-----END CERTIFICATE-----"
+    broker_ca = ca_pem("fleet-broker-ca")
     entry, manager = _fleet_panel_manager(
         hass,
         fleet_overrides={
             CONF_MQTT_TLS_ENABLED: True,
-            CONF_MQTT_TLS_CA: ca_pem,
+            CONF_MQTT_TLS_CA: broker_ca,
         },
     )
     shell = FakeShell()
@@ -930,7 +930,7 @@ async def test_fleet_custom_ca_is_staged_and_exact_returned_path_is_rendered(
         else:
             await manager.async_install_component(COMPONENT_BRIDGE)
 
-    stage.assert_awaited_once_with(shell, ca_pem.encode())
+    stage.assert_awaited_once_with(shell, broker_ca.encode())
     assert render.call_count == 1
     environments = [
         content.decode()
@@ -952,10 +952,10 @@ async def test_recovered_auto_repair_stages_no_ca_before_the_skip(
     """#95 finding 1: the pre-mutation recheck must precede _async_stage_broker_ca (which
     stages the CA file on the panel — a remote write). A panel that recovers during connect
     must have NO CA staged and NO unit enabled: the skip lands before the first remote write."""
-    ca_pem = "-----BEGIN CERTIFICATE-----\nZmFrZS1wdWJsaWMtY2E=\n-----END CERTIFICATE-----"
+    broker_ca = ca_pem("fleet-broker-ca")
     _entry, manager = _fleet_panel_manager(
         hass,
-        fleet_overrides={CONF_MQTT_TLS_ENABLED: True, CONF_MQTT_TLS_CA: ca_pem},
+        fleet_overrides={CONF_MQTT_TLS_ENABLED: True, CONF_MQTT_TLS_CA: broker_ca},
     )
     manager.availability = "offline"
     installed = RunResult(
