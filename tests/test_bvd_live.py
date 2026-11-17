@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import os
 import signal
 import time
 from collections.abc import Awaitable, Callable, Mapping
@@ -610,6 +611,70 @@ def test_stock_host_identity_requires_exactly_one_matching_process(tmp_path: Pat
     _fake_process(tmp_path, "102", _REAL_BVD_VASSAL_CMDLINE, "800")
 
     assert _stock_host_identity(tmp_path) == ""
+
+
+def _real_vassal(root: Path, pid: str, ticks: str = "700") -> None:
+    _fake_process(root, pid, _REAL_BVD_VASSAL_CMDLINE, ticks)
+
+
+def _deny_readlink_for(monkeypatch: pytest.MonkeyPatch, denied: Path, error: OSError) -> None:
+    real_readlink = os.readlink
+
+    def readlink(path: str | os.PathLike[str]) -> str:
+        if Path(path) == denied:
+            raise error
+        return real_readlink(path)
+
+    monkeypatch.setattr("os.readlink", readlink)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [PermissionError("denied"), FileNotFoundError("gone")],
+    ids=["exe-permission-denied", "exe-vanished"],
+)
+def test_unverifiable_matching_candidate_refuses_instead_of_picking_another(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: OSError
+) -> None:
+    _real_vassal(tmp_path, "101", "700")
+    _real_vassal(tmp_path, "102", "800")
+    _deny_readlink_for(monkeypatch, tmp_path / "102" / "exe", error)
+
+    assert _stock_host_identity(tmp_path) == ""
+
+
+@pytest.mark.parametrize("stat_text", [None, "102 (uwsgi) S 1\n"], ids=["vanished", "truncated"])
+def test_matching_candidate_with_unreadable_stat_refuses(
+    tmp_path: Path, stat_text: str | None
+) -> None:
+    _real_vassal(tmp_path, "101", "700")
+    _real_vassal(tmp_path, "102", "800")
+    stat_path = tmp_path / "102" / "stat"
+    if stat_text is None:
+        stat_path.unlink()
+    else:
+        stat_path.write_text(stat_text, encoding="ascii")
+
+    assert _stock_host_identity(tmp_path) == ""
+
+
+def test_non_matching_process_inspection_errors_do_not_hide_a_lone_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Decision: only a process whose cmdline is a stock form is a candidate.
+
+    A process whose cmdline cannot be read (it exited, or is otherwise not
+    inspectable) or is not a stock form is not a candidate, so its exe/stat
+    are never consulted and its errors cannot block a lone verified host.
+    """
+
+    _real_vassal(tmp_path, "101", "700")
+    (tmp_path / "200").mkdir()  # exited before its cmdline could be read
+    _fake_process(tmp_path, "201", _REAL_MESSAGE_BUS_CMDLINE)
+    _deny_readlink_for(monkeypatch, tmp_path / "201" / "exe", PermissionError("denied"))
+    (tmp_path / "201" / "stat").unlink()
+
+    assert _stock_host_identity(tmp_path) == "101:700"
 
 
 async def test_shutdown_components_are_sequential_and_continue_after_error() -> None:

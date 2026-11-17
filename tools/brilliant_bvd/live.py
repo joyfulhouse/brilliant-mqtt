@@ -187,17 +187,16 @@ _STOCK_BVD_VASSAL_ARGV: tuple[bytes, ...] = (
 _STOCK_BVD_VASSAL_TITLE = b" ".join(_STOCK_BVD_VASSAL_ARGV) + b" "
 
 
-def _is_stock_bvd_vassal(cmdline: bytes, executable: str) -> bool:
-    """Match only the exact stock BVD uwsgi vassal.
+def _is_stock_bvd_cmdline(cmdline: bytes) -> bool:
+    """Match only an exact stock BVD uwsgi vassal cmdline.
 
-    The executable must be the firmware's uwsgi by full path (``/proc/<pid>/exe``,
-    not a basename), and the cmdline must be either the exact genuine argv
-    vector (NUL boundaries preserved) or the exact captured rewritten title.
-    Look-alike paths, extra or conflicting ``--ini`` options, and BVD text
-    embedded inside another argument's value never match.
+    The cmdline must be either the exact genuine argv vector (NUL boundaries
+    preserved) or the exact captured rewritten title.  Look-alike paths, extra
+    or conflicting ``--ini`` options, and BVD text embedded inside another
+    argument's value never match.
     """
 
-    if executable != _STOCK_UWSGI_EXECUTABLE or not cmdline.endswith(b"\0"):
+    if not cmdline.endswith(b"\0"):
         return False
     argv = tuple(cmdline[:-1].split(b"\0"))
     if len(argv) == 1:
@@ -206,7 +205,16 @@ def _is_stock_bvd_vassal(cmdline: bytes, executable: str) -> bool:
 
 
 def _stock_host_identity(proc_root: Path = Path("/proc")) -> str:
-    """Return PID:start-ticks for the one stock BVD vassal, else empty."""
+    """Return PID:start-ticks for the one verified stock BVD vassal, else empty.
+
+    A process is a *candidate* only when its cmdline is an exact stock form.
+    Processes whose cmdline is unreadable (they exited) or not a stock form are
+    never candidates, so their inspection errors cannot block detection.  Once
+    a cmdline matches, the candidate must be verified: its ``exe`` must be the
+    firmware uwsgi by full path, and its ``stat`` must yield a start time.  If
+    a candidate cannot be verified (permission error, disappearance, malformed
+    stat) the whole scan refuses rather than choosing another candidate.
+    """
 
     matches: list[str] = []
     try:
@@ -218,14 +226,21 @@ def _stock_host_identity(proc_root: Path = Path("/proc")) -> str:
             continue
         try:
             cmdline = (entry / "cmdline").read_bytes()
-            if not _is_stock_bvd_vassal(cmdline, os.readlink(entry / "exe")):
+        except OSError:
+            continue
+        if not _is_stock_bvd_cmdline(cmdline):
+            continue
+        try:
+            if os.readlink(entry / "exe") != _STOCK_UWSGI_EXECUTABLE:
                 continue
             process_stat = (entry / "stat").read_text(encoding="ascii")
             close_parenthesis = process_stat.rfind(")")
             fields_after_name = process_stat[close_parenthesis + 2 :].split()
             start_ticks = fields_after_name[19]
         except (IndexError, OSError, UnicodeError):
-            continue
+            return ""
+        if close_parenthesis < 0 or not start_ticks.isdigit():
+            return ""
         matches.append(f"{entry.name}:{start_ticks}")
     return matches[0] if len(matches) == 1 else ""
 
