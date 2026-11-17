@@ -29,7 +29,6 @@ from brilliant_mqtt.ha_control_protocol import manifest_topic, stable_id, state_
 from tools.brilliant_bvd.single_light_pilot import (
     BVD_CONFIGURATION_PERIPHERAL_ID,
     BVD_DEVICE_ID,
-    OFFICE_DEVICE_ID,
     TARGET_ENTITY_ID,
     BvdBus,
     BvdTopology,
@@ -1432,6 +1431,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--mqtt-port", type=int, default=1883)
     parser.add_argument("--mqtt-username")
     parser.add_argument("--mqtt-password-file", type=Path)
+    parser.add_argument(
+        "--approved-owner-device-id",
+        action="append",
+        metavar="DEVICE_ID",
+        help=(
+            "operator-approved panel device ID that may host the pilot as the current "
+            "natural BVD owner (repeat once per approved healthy panel)"
+        ),
+    )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--apply", action="store_true")
     mode.add_argument("--cleanup-only", action="store_true")
@@ -1452,6 +1460,32 @@ def _parser() -> argparse.ArgumentParser:
         help="assert the required non-writing health observer is armed and recording",
     )
     return parser
+
+
+async def _dry_run(
+    config: PilotConfig, bus: BvdBus, *, now_ms: int | None = None
+) -> dict[str, object]:
+    """Run the read-only admission once through a fresh peer and always close it."""
+
+    await bus.start()
+    try:
+        topology = await bus.snapshot()
+        validate_preflight(
+            config,
+            topology,
+            now_ms=time.time_ns() // 1_000_000 if now_ms is None else now_ms,
+        )
+        if config.room_assignment_id not in await bus.room_ids():
+            raise PilotGuardError("requested room is absent from the scoped room catalog")
+    finally:
+        await bus.shutdown()
+    return {
+        "event": "DRY_RUN_OK",
+        "bvd_owner": topology.configuration_owner,
+        "owner_approved": True,
+        "peripheral_id": peripheral_id_for_entity(TARGET_ENTITY_ID),
+        "lease_release": "not_applicable",
+    }
 
 
 async def _async_cli(args: argparse.Namespace) -> int:
@@ -1489,36 +1523,21 @@ async def _async_cli(args: argparse.Namespace) -> int:
 
     if not args.room_assignment_id:
         raise PilotGuardError("--room-assignment-id is required outside cleanup-only")
+    if not args.approved_owner_device_id:
+        raise PilotGuardError(
+            "--approved-owner-device-id is required outside cleanup-only and owner-status"
+        )
     config = PilotConfig(
         room_assignment_id=args.room_assignment_id,
         display_name=args.display_name,
         active_runtime_s=args.active_runtime_s,
+        approved_owner_device_ids=frozenset(args.approved_owner_device_id),
     )
     if not args.apply:
-        bus = NativeBvdBus()
-        await bus.start()
-        try:
-            topology = await bus.snapshot()
-            validate_preflight(config, topology, now_ms=time.time_ns() // 1_000_000)
-            if config.room_assignment_id not in await bus.room_ids():
-                raise PilotGuardError("requested room is absent from the scoped room catalog")
-        finally:
-            await bus.shutdown()
-        print(
-            json.dumps(
-                {
-                    "event": "DRY_RUN_OK",
-                    "office_device_id": OFFICE_DEVICE_ID,
-                    "bvd_owner": topology.configuration_owner,
-                    "peripheral_id": peripheral_id_for_entity(TARGET_ENTITY_ID),
-                    "lease_release": "not_applicable",
-                },
-                sort_keys=True,
-            )
-        )
+        print(json.dumps(await _dry_run(config, NativeBvdBus()), sort_keys=True))
         return 0
     if os.geteuid() != 0:
-        raise PilotGuardError("live apply must run as root on Office")
+        raise PilotGuardError("live apply must run as root on the approved current BVD owner")
     if not args.cross_owner_cleanup_staged:
         raise PilotGuardError(
             "live apply is NO-GO until exact cleanup-only is staged on every possible BVD owner"

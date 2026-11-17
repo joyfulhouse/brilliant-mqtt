@@ -24,6 +24,8 @@ from tools.brilliant_bvd.live import (
     LiveVirtualLightHost,
     NativeBvdBus,
     NativeScopedProbe,
+    _async_cli,
+    _dry_run,
     _parser,
     _read_private_password,
     _shutdown_components,
@@ -37,7 +39,6 @@ from tools.brilliant_bvd.single_light_pilot import (
     BVD_DEVICE_ID,
     EXPECTED_BVD_PERIPHERAL_TYPES,
     EXPECTED_PROCESS_CONFIGS,
-    OFFICE_DEVICE_ID,
     TARGET_ENTITY_ID,
     BvdTopology,
     CleanupReport,
@@ -51,6 +52,10 @@ from tools.brilliant_bvd.single_light_pilot import (
 )
 
 NOW_MS = 1_800_000_000_000
+# Synthetic 32-hex panel device IDs; real IDs stay in private operator records.
+OWNER_DEVICE_ID = "0a0a" + "0" * 24 + "a0a0"
+UNAPPROVED_DEVICE_ID = "0c0c" + "0" * 24 + "c0c0"
+APPROVED_OWNERS = frozenset({OWNER_DEVICE_ID})
 
 
 def test_live_runner_converts_terminal_hangup_to_bounded_cleanup() -> None:
@@ -65,7 +70,7 @@ def _raw_bvd() -> object:
     peripherals: dict[str, object] = {}
     for peripheral_id, peripheral_type in EXPECTED_BVD_PERIPHERAL_TYPES.items():
         variables = (
-            {"relay_device": _variable(OFFICE_DEVICE_ID)}
+            {"relay_device": _variable(OWNER_DEVICE_ID)}
             if peripheral_id == "remote_bridge"
             else {"configuration_peripheral_id": _variable(BVD_CONFIGURATION_PERIPHERAL_ID)}
         )
@@ -93,7 +98,7 @@ class _BusHarness:
         self.events: list[str] = []
         self.deletions: list[tuple[str, str, int]] = []
         self.configuration_reads = 0
-        self.owners = [OFFICE_DEVICE_ID] if owners is None else owners
+        self.owners = [OWNER_DEVICE_ID] if owners is None else owners
         self.pilot_present = pilot_present
         self.fail_device_read = fail_device_read
         self.reconnect_on_subscribe = reconnect_on_subscribe
@@ -112,7 +117,7 @@ class _BusHarness:
                 harness.events.append("observer-start")
 
             def get_owning_device_id(self) -> str:
-                return OFFICE_DEVICE_ID
+                return OWNER_DEVICE_ID
 
             async def get_peripheral(self, device_id: str, peripheral_id: str) -> object:
                 if (
@@ -198,7 +203,7 @@ async def test_native_bus_starts_processor_before_observer_and_reads_only_bvd() 
     await bus.start()
     topology = await bus.snapshot()
     validate_preflight(
-        PilotConfig("backyard-room:1", "Backyard Pilot", 120),
+        PilotConfig("backyard-room:1", "Backyard Pilot", 120, APPROVED_OWNERS),
         topology,
         now_ms=NOW_MS,
     )
@@ -214,7 +219,7 @@ async def test_native_bus_starts_processor_before_observer_and_reads_only_bvd() 
 
 
 async def test_native_bus_rejects_owner_change_during_double_read() -> None:
-    harness = _BusHarness(owners=[OFFICE_DEVICE_ID, "another-panel"])
+    harness = _BusHarness(owners=[OWNER_DEVICE_ID, "another-panel"])
     bus = NativeBvdBus(
         bindings_factory=lambda: harness.bindings,
         stock_identity=lambda: "123:456789",
@@ -296,8 +301,8 @@ async def test_owner_status_does_not_depend_on_bvd_topology() -> None:
         bindings_factory=lambda: harness.bindings
     )
 
-    assert panel_device_id == OFFICE_DEVICE_ID
-    assert configuration_owner == OFFICE_DEVICE_ID
+    assert panel_device_id == OWNER_DEVICE_ID
+    assert configuration_owner == OWNER_DEVICE_ID
     assert harness.configuration_reads == 2
 
 
@@ -394,7 +399,7 @@ async def test_live_host_targets_bvd_and_only_commands_on_or_intensity(
         loop=asyncio.get_running_loop(),
         bindings_factory=lambda: harness.bindings,
     )
-    config = PilotConfig("backyard-room:1", "Backyard Pilot", 120)
+    config = PilotConfig("backyard-room:1", "Backyard Pilot", 120, APPROVED_OWNERS)
     variables = build_light_variables(config, room_assignment_type=_RoomAssignment)
 
     async def on_command(variable: str, value: object) -> bool:
@@ -586,7 +591,7 @@ async def test_native_bus_shutdown_retains_handles_until_a_real_retry() -> None:
     bus = NativeBvdBus(bindings_factory=lambda: _BusHarness().bindings)
     bus._observer = observer
     bus._processor = processor
-    bus._owning_device_id = OFFICE_DEVICE_ID
+    bus._owning_device_id = OWNER_DEVICE_ID
 
     with pytest.raises(PilotGuardError, match="native bus peer shutdown failed"):
         await bus.shutdown()
@@ -707,6 +712,76 @@ def test_cli_exposes_read_only_owner_status_and_all_apply_assertions() -> None:
     assert "lock_path" not in vars(apply)
 
 
+def test_cli_takes_a_repeatable_approved_owner_allowlist() -> None:
+    args = _parser().parse_args(
+        [
+            "--room-assignment-id",
+            "backyard-room:1",
+            "--approved-owner-device-id",
+            OWNER_DEVICE_ID,
+            "--approved-owner-device-id",
+            UNAPPROVED_DEVICE_ID,
+        ]
+    )
+
+    assert args.approved_owner_device_id == [OWNER_DEVICE_ID, UNAPPROVED_DEVICE_ID]
+
+
+async def test_cli_dry_run_refuses_without_an_approved_owner_allowlist() -> None:
+    args = _parser().parse_args(["--room-assignment-id", "backyard-room:1"])
+
+    with pytest.raises(PilotGuardError, match="--approved-owner-device-id"):
+        await _async_cli(args)
+
+
+class _RoomCatalogBus(NativeBvdBus):
+    """The real read-only bus with the panel-only Rooms decoder stubbed out."""
+
+    async def room_ids(self) -> frozenset[str]:
+        self._require_started()
+        return frozenset({"backyard-room:1"})
+
+
+async def test_dry_run_reports_the_approved_current_owner_without_a_fixed_panel() -> None:
+    harness = _BusHarness()
+    bus = _RoomCatalogBus(
+        bindings_factory=lambda: harness.bindings,
+        stock_identity=lambda: "1457:123807679",
+    )
+    config = PilotConfig("backyard-room:1", "Backyard Pilot", 120, APPROVED_OWNERS)
+
+    result = await _dry_run(config, bus, now_ms=NOW_MS)
+
+    assert result == {
+        "event": "DRY_RUN_OK",
+        "bvd_owner": OWNER_DEVICE_ID,
+        "owner_approved": True,
+        "peripheral_id": peripheral_id_for_entity(TARGET_ENTITY_ID),
+        "lease_release": "not_applicable",
+    }
+    assert "processor-shutdown" in harness.events
+
+
+async def test_dry_run_refuses_an_unapproved_current_owner() -> None:
+    harness = _BusHarness()
+    bus = _RoomCatalogBus(
+        bindings_factory=lambda: harness.bindings,
+        stock_identity=lambda: "1457:123807679",
+    )
+    config = PilotConfig(
+        "backyard-room:1", "Backyard Pilot", 120, frozenset({UNAPPROVED_DEVICE_ID})
+    )
+
+    with pytest.raises(PilotGuardError, match="approved owner allowlist"):
+        await _dry_run(config, bus, now_ms=NOW_MS)
+    assert "processor-shutdown" in harness.events
+
+
+def test_live_module_names_no_fixed_panel() -> None:
+    module_source = Path(inspect.getfile(NativeBvdBus)).read_text(encoding="utf-8")
+    assert "office" not in module_source.lower()
+
+
 def _live_manifest() -> str:
     entity_stable_id = stable_id(TARGET_ENTITY_ID)
     return json.dumps(
@@ -770,7 +845,7 @@ class _LiveState:
                 peripheral_type,
                 1,
                 (
-                    {"relay_device": OFFICE_DEVICE_ID}
+                    {"relay_device": OWNER_DEVICE_ID}
                     if peripheral_id == "remote_bridge"
                     else {"configuration_peripheral_id": BVD_CONFIGURATION_PERIPHERAL_ID}
                 ),
@@ -787,8 +862,8 @@ class _LiveState:
                 )
             )
         return BvdTopology(
-            owning_device_id=OFFICE_DEVICE_ID,
-            configuration_owner=OFFICE_DEVICE_ID,
+            owning_device_id=OWNER_DEVICE_ID,
+            configuration_owner=OWNER_DEVICE_ID,
             owner_timestamp_ms=self.owner_timestamp_ms,
             bvd_device_type=3,
             stock_host_running=True,
@@ -1002,7 +1077,7 @@ class _LiveHarness:
 
 
 def _short_live_config(runtime_s: float = 0.05) -> PilotConfig:
-    config = PilotConfig("room:1", "Backyard Pilot", 60)
+    config = PilotConfig("room:1", "Backyard Pilot", 60, APPROVED_OWNERS)
     object.__setattr__(config, "active_runtime_s", runtime_s)
     return config
 

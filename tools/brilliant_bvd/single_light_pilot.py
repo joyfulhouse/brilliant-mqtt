@@ -2,7 +2,9 @@
 
 The module is deliberately importable off-panel.  Its bus Protocol is
 read-only: this pilot never bids for, refreshes, clears, or restores the
-``brilliant_virtual_device`` owner variable.
+``brilliant_virtual_device`` owner variable.  It is not pinned to a panel: it
+runs only on whichever panel is *currently* the naturally elected BVD owner,
+and only when that panel is in the operator-approved owner allowlist.
 """
 
 from __future__ import annotations
@@ -26,7 +28,6 @@ from brilliant_mqtt.ha_control_protocol import (
     state_topic,
 )
 
-OFFICE_DEVICE_ID = "017ff60733f100038e04fa0fbab29096"
 BVD_DEVICE_ID = "brilliant_virtual_device"
 BVD_CONFIGURATION_PERIPHERAL_ID = "brilliant_virtual_device_configuration"
 TARGET_ENTITY_ID = "light.backyard_light_group"
@@ -35,6 +36,7 @@ _ONLINE_STATUS = 1
 _MAX_OWNER_AGE_MS = 30_000
 _MAX_FUTURE_SKEW_MS = 5_000
 _LINK_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
+_PANEL_DEVICE_ID = re.compile(r"[0-9a-f]{32}")
 
 EXPECTED_BVD_PERIPHERAL_TYPES: dict[str, int] = {
     "device_groups_configuration": 92,
@@ -66,6 +68,7 @@ class PilotConfig:
     room_assignment_id: str
     display_name: str
     active_runtime_s: int
+    approved_owner_device_ids: frozenset[str]
 
     def __post_init__(self) -> None:
         if _LINK_ID.fullmatch(self.room_assignment_id) is None:
@@ -76,6 +79,18 @@ class PilotConfig:
             raise PilotGuardError("display name must contain 1 to 80 printable characters")
         if type(self.active_runtime_s) is not int or not 60 <= self.active_runtime_s <= 120:
             raise PilotGuardError("active runtime must be an integer from 60 to 120 seconds")
+        approved: object = self.approved_owner_device_ids
+        if (
+            not isinstance(approved, frozenset)
+            or not approved
+            or not all(
+                isinstance(device_id, str) and _PANEL_DEVICE_ID.fullmatch(device_id) is not None
+                for device_id in approved
+            )
+        ):
+            raise PilotGuardError(
+                "approved owner allowlist must be a non-empty set of 32-hex panel device IDs"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -221,12 +236,13 @@ def peripheral_id_for_entity(entity_id: str) -> str:
 
 
 def validate_preflight(config: PilotConfig, topology: BvdTopology, *, now_ms: int) -> None:
-    """Require fresh natural ownership and the intact stock BVD host."""
+    """Require fresh natural ownership by an approved panel and the intact stock host."""
 
-    del config  # Construction already validates every configurable value.
     if type(now_ms) is not int:
         raise PilotGuardError("current time must be an integer")
     _validate_stock_topology(topology, phase="preflight")
+    if topology.configuration_owner not in config.approved_owner_device_ids:
+        raise PilotGuardError("current BVD owner is not in the approved owner allowlist")
     if type(topology.owner_timestamp_ms) is not int:
         raise PilotGuardError("BVD owner timestamp must be an integer")
     owner_age_ms = now_ms - topology.owner_timestamp_ms
@@ -237,10 +253,9 @@ def validate_preflight(config: PilotConfig, topology: BvdTopology, *, now_ms: in
 
 
 def _validate_stock_topology(topology: BvdTopology, *, phase: str) -> None:
-    if topology.owning_device_id != OFFICE_DEVICE_ID:
-        raise PilotGuardError("pilot must run on the exact Office panel")
-    if topology.configuration_owner != OFFICE_DEVICE_ID:
-        raise PilotGuardError("Office must already be the naturally elected owner")
+    owner = topology.configuration_owner
+    if not owner or topology.owning_device_id != owner:
+        raise PilotGuardError("pilot must run on the current naturally elected BVD owner")
     if topology.bvd_device_type != 3:
         raise PilotGuardError("BVD must be DeviceType 3")
     if not topology.stock_host_running or not topology.stock_host_identity:
@@ -269,8 +284,8 @@ def _validate_stock_topology(topology: BvdTopology, *, phase: str) -> None:
         if fact.status != _ONLINE_STATUS:
             raise PilotGuardError(f"BVD peripheral {peripheral_id} is not ONLINE")
         if peripheral_id == "remote_bridge":
-            if fact.variables.get("relay_device") != OFFICE_DEVICE_ID:
-                raise PilotGuardError("BVD remote_bridge relay is not Office")
+            if fact.variables.get("relay_device") != owner:
+                raise PilotGuardError("BVD remote_bridge relay is not the current owner")
         elif fact.variables.get("configuration_peripheral_id") != BVD_CONFIGURATION_PERIPHERAL_ID:
             raise PilotGuardError(
                 f"BVD peripheral {peripheral_id} has the wrong configuration link"
@@ -287,6 +302,11 @@ def _validate_stock_topology(topology: BvdTopology, *, phase: str) -> None:
 def _validate_runtime_continuity(
     baseline: BvdTopology, observed: BvdTopology, *, phase: str
 ) -> None:
+    if (observed.owning_device_id, observed.configuration_owner) != (
+        baseline.owning_device_id,
+        baseline.configuration_owner,
+    ):
+        raise PilotGuardError("BVD owner changed during the pilot")
     _validate_stock_topology(observed, phase=phase)
     if observed.stock_host_identity != baseline.stock_host_identity:
         raise PilotGuardError("stock BVD host identity changed during the pilot")

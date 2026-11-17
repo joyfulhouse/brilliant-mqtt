@@ -18,12 +18,12 @@ from brilliant_mqtt.ha_control_protocol import (
     stable_id,
     state_topic,
 )
+from tools.brilliant_bvd import single_light_pilot
 from tools.brilliant_bvd.single_light_pilot import (
     BVD_CONFIGURATION_PERIPHERAL_ID,
     BVD_DEVICE_ID,
     EXPECTED_BVD_PERIPHERAL_TYPES,
     EXPECTED_PROCESS_CONFIGS,
-    OFFICE_DEVICE_ID,
     TARGET_ENTITY_ID,
     BvdBus,
     BvdTopology,
@@ -51,6 +51,11 @@ from tools.brilliant_bvd.single_light_pilot import (
 
 NOW_MS = 1_800_000_000_000
 STABLE_ID = stable_id(TARGET_ENTITY_ID)
+# Synthetic 32-hex panel device IDs; real IDs stay in private operator records.
+OWNER_DEVICE_ID = "0a0a" + "0" * 24 + "a0a0"
+APPROVED_PEER_ID = "0b0b" + "0" * 24 + "b0b0"
+UNAPPROVED_DEVICE_ID = "0c0c" + "0" * 24 + "c0c0"
+APPROVED_OWNERS = frozenset({OWNER_DEVICE_ID, APPROVED_PEER_ID})
 
 
 def _fact(
@@ -75,12 +80,15 @@ def _fact(
 
 def _topology(
     *,
-    owner: str = OFFICE_DEVICE_ID,
+    panel: str = OWNER_DEVICE_ID,
+    owner: str | None = None,
     owner_timestamp_ms: int = NOW_MS - 1_000,
-    relay_device: str = OFFICE_DEVICE_ID,
+    relay_device: str | None = None,
     stock_host_running: bool = True,
     facts: tuple[PeripheralFact, ...] | None = None,
 ) -> BvdTopology:
+    owner = panel if owner is None else owner
+    relay_device = panel if relay_device is None else relay_device
     if facts is None:
         facts = tuple(
             _fact(
@@ -93,7 +101,7 @@ def _topology(
             for peripheral_id in EXPECTED_BVD_PERIPHERAL_TYPES
         )
     return BvdTopology(
-        owning_device_id=OFFICE_DEVICE_ID,
+        owning_device_id=panel,
         configuration_owner=owner,
         owner_timestamp_ms=owner_timestamp_ms,
         bvd_device_type=3,
@@ -109,17 +117,19 @@ def _config(**overrides: object) -> PilotConfig:
         "room_assignment_id": "backyard-room:1700000000000",
         "display_name": "HA Backyard Light Group Pilot",
         "active_runtime_s": 120,
+        "approved_owner_device_ids": APPROVED_OWNERS,
     }
     values.update(overrides)
     return PilotConfig(
         room_assignment_id=cast(str, values["room_assignment_id"]),
         display_name=cast(str, values["display_name"]),
         active_runtime_s=cast(int, values["active_runtime_s"]),
+        approved_owner_device_ids=cast(frozenset[str], values["approved_owner_device_ids"]),
     )
 
 
-def test_pilot_is_pinned_to_office_bvd_and_one_ha_entity() -> None:
-    assert OFFICE_DEVICE_ID == "017ff60733f100038e04fa0fbab29096"
+def test_pilot_is_pinned_to_one_ha_entity_but_no_fixed_panel() -> None:
+    assert not hasattr(single_light_pilot, "OFFICE_DEVICE_ID")
     assert BVD_DEVICE_ID == "brilliant_virtual_device"
     assert BVD_CONFIGURATION_PERIPHERAL_ID == "brilliant_virtual_device_configuration"
     assert TARGET_ENTITY_ID == "light.backyard_light_group"
@@ -127,6 +137,7 @@ def test_pilot_is_pinned_to_office_bvd_and_one_ha_entity() -> None:
         "room_assignment_id",
         "display_name",
         "active_runtime_s",
+        "approved_owner_device_ids",
     }
 
 
@@ -146,6 +157,14 @@ def test_stable_peripheral_id_is_derived_from_ha_control_stable_id() -> None:
         ({"active_runtime_s": 59}, "active runtime"),
         ({"active_runtime_s": 121}, "active runtime"),
         ({"active_runtime_s": True}, "active runtime"),
+        ({"approved_owner_device_ids": frozenset()}, "approved owner allowlist"),
+        ({"approved_owner_device_ids": [OWNER_DEVICE_ID]}, "approved owner allowlist"),
+        ({"approved_owner_device_ids": frozenset({"office"})}, "approved owner allowlist"),
+        (
+            {"approved_owner_device_ids": frozenset({OWNER_DEVICE_ID.upper()})},
+            "approved owner allowlist",
+        ),
+        ({"approved_owner_device_ids": frozenset({1})}, "approved owner allowlist"),
     ],
 )
 def test_config_rejects_unbounded_or_unsafe_values(
@@ -159,11 +178,28 @@ def test_preflight_accepts_fresh_natural_owner_and_exact_stock_host() -> None:
     validate_preflight(_config(), _topology(), now_ms=NOW_MS)
 
 
+def test_preflight_accepts_whichever_approved_panel_is_the_current_owner() -> None:
+    validate_preflight(_config(), _topology(panel=APPROVED_PEER_ID), now_ms=NOW_MS)
+
+
+def test_preflight_refuses_a_current_owner_outside_the_allowlist() -> None:
+    with pytest.raises(PilotGuardError, match="approved owner allowlist"):
+        validate_preflight(_config(), _topology(panel=UNAPPROVED_DEVICE_ID), now_ms=NOW_MS)
+    with pytest.raises(PilotGuardError, match="approved owner allowlist"):
+        validate_preflight(
+            _config(approved_owner_device_ids=frozenset({APPROVED_PEER_ID})),
+            _topology(),
+            now_ms=NOW_MS,
+        )
+
+
 @pytest.mark.parametrize(
     ("topology", "message"),
     [
-        (_topology(owner="another-panel"), "naturally elected owner"),
-        (_topology(relay_device="another-panel"), "relay"),
+        (_topology(owner=APPROVED_PEER_ID), "naturally elected BVD owner"),
+        (_topology(owner=UNAPPROVED_DEVICE_ID), "naturally elected BVD owner"),
+        (_topology(panel=""), "naturally elected BVD owner"),
+        (_topology(relay_device=APPROVED_PEER_ID), "relay is not the current owner"),
         (_topology(owner_timestamp_ms=NOW_MS - 30_001), "fresh"),
         (_topology(owner_timestamp_ms=NOW_MS + 5_001), "future"),
         (_topology(stock_host_running=False), "stock BVD host"),
@@ -193,7 +229,7 @@ def test_preflight_rejects_missing_extra_offline_or_wrong_type_peripheral() -> N
             configuration_id=(
                 None if item.peripheral_id == "remote_bridge" else BVD_CONFIGURATION_PERIPHERAL_ID
             ),
-            relay_device=(OFFICE_DEVICE_ID if item.peripheral_id == "remote_bridge" else None),
+            relay_device=(OWNER_DEVICE_ID if item.peripheral_id == "remote_bridge" else None),
         )
         for item in exact
     ]
@@ -294,6 +330,29 @@ def test_active_and_postflight_have_distinct_exact_topologies() -> None:
         validate_active_topology(baseline, baseline)
     with pytest.raises(PilotGuardError, match="postflight peripheral set"):
         validate_postflight(baseline, active)
+
+
+def test_owner_handoff_between_approved_panels_aborts_active_and_postflight() -> None:
+    baseline = _topology()
+    pilot = PeripheralFact(
+        peripheral_id_for_entity(TARGET_ENTITY_ID),
+        27,
+        1,
+        {"configuration_peripheral_id": BVD_CONFIGURATION_PERIPHERAL_ID},
+    )
+    moved = _topology(panel=APPROVED_PEER_ID, owner_timestamp_ms=NOW_MS + 1)
+    moved_active = _topology(
+        panel=APPROVED_PEER_ID,
+        owner_timestamp_ms=NOW_MS + 1,
+        facts=(*moved.peripherals, pilot),
+    )
+
+    with pytest.raises(PilotGuardError, match="owner changed during the pilot"):
+        validate_active_topology(baseline, moved_active)
+    with pytest.raises(PilotGuardError, match="owner changed during the pilot"):
+        validate_postflight(baseline, moved)
+    with pytest.raises(PilotGuardError, match="owner changed during the pilot"):
+        validate_postflight(baseline, _topology(owner=APPROVED_PEER_ID))
 
 
 def _manifest() -> str:
