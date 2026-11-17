@@ -65,6 +65,7 @@ from custom_components.brilliant_mqtt.migration_journal import (
     MigrationPhase,
     MigrationRecord,
 )
+from tests.cert_fixtures import ca_pem
 from tests.test_migration import (
     FLEET_PASSWORD,
     FLEET_USERNAME,
@@ -1701,7 +1702,7 @@ async def test_fourteen_panel_production_fleet_migrates_after_fixing_mesh_duplic
     no_panel_contact: AsyncMock,
 ) -> None:
     del mqtt_mock, payload_dir
-    hue_ca = "-----BEGIN CERTIFICATE-----\nMIIBdiyHue\n-----END CERTIFICATE-----\n"
+    hue_ca = ca_pem("coordinator-hue")
     panels: dict[str, str] = {}
     entries: list[MockConfigEntry] = []
     for index, slug in enumerate(_PRODUCTION_SLUGS):

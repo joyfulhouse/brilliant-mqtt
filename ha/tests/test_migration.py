@@ -27,6 +27,7 @@ from custom_components.brilliant_mqtt.const import (
     CONF_HA_CONTROL_DOMAINS,
     CONF_HA_CONTROL_ENABLED,
     CONF_HA_CONTROL_LABEL,
+    CONF_HUE_CA_CERT,
     CONF_MAX_MIRRORED_ENTITIES,
     CONF_MQTT_TLS_CA,
     CONF_MQTT_TLS_ENABLED,
@@ -780,3 +781,51 @@ def test_planner_is_pure_and_synchronous() -> None:
         "read_text",
         "write_text",
     }
+
+
+def test_shared_hue_ca_becomes_the_fleet_default_and_panels_keep_overrides() -> None:
+    """Every legacy panel sharing one Hue CA seeds the fleet default for new panels."""
+    hue_ca = ca_pem("hue")
+    snapshots = fixture()
+    for item in list(snapshots):
+        replace_data(snapshots, item.entry_id, **{CONF_HUE_CA_CERT: hue_ca})
+
+    plan = eligible(snapshots)
+
+    assert plan.fleet_data[CONF_HUE_CA_CERT] == hue_ca
+    assert plan.summary()["fleet"]["has_hue_ca_default"] is True
+    for panel in plan.panels:
+        assert panel.data[CONF_FEATURE_OVERRIDES][CONF_HUE_CA_CERT] == hue_ca
+    assert FleetConfig.from_entry(plan_entry(plan)).hue_ca_cert == hue_ca
+
+
+@pytest.mark.parametrize(
+    "variant",
+    ["differing", "partial", "blank", "private_key", "unparsable"],
+)
+def test_hue_ca_fleet_default_is_never_chosen_arbitrarily(variant: str) -> None:
+    """Only one unanimous, valid public CA is promoted; otherwise no fleet default."""
+    shared = ca_pem("hue")
+    values = {
+        "differing": (shared, shared, ca_pem("other-hue")),
+        "partial": (shared, shared, None),
+        "blank": ("", "", ""),
+        "private_key": ("-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----\n",) * 3,
+        "unparsable": ("-----BEGIN CERTIFICATE-----\nx\n-----END CERTIFICATE-----\n",) * 3,
+    }[variant]
+    snapshots = fixture()
+    for item, value in zip(list(snapshots), values, strict=True):
+        if value is not None:
+            replace_data(snapshots, item.entry_id, **{CONF_HUE_CA_CERT: value})
+
+    plan = eligible(snapshots)
+
+    assert CONF_HUE_CA_CERT not in plan.fleet_data
+    assert plan.summary()["fleet"]["has_hue_ca_default"] is False
+    by_entry = {panel.entry_id: panel for panel in plan.panels}
+    for item, value in zip(snapshots, values, strict=True):
+        overrides = by_entry[item.entry_id].data[CONF_FEATURE_OVERRIDES]
+        if value is None:
+            assert CONF_HUE_CA_CERT not in overrides
+        else:
+            assert overrides[CONF_HUE_CA_CERT] == value

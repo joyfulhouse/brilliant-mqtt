@@ -20,7 +20,6 @@ import hmac
 import json
 import math
 import re
-import ssl
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -31,6 +30,7 @@ from homeassistant.config_entries import ConfigEntry, ConfigSubentryDataWithId
 from homeassistant.const import CONF_NAME
 
 from .broker import BrokerKind
+from .certificates import canonical_hue_ca_certificate, is_public_certificate_chain
 from .const import (
     COMPONENT_BRIDGE,
     COMPONENT_HA_MIRROR,
@@ -295,6 +295,7 @@ class MigrationPlan:
                 "mqtt_port": self.fleet_data[CONF_MQTT_PORT],
                 "mqtt_tls_enabled": self.fleet_data[CONF_MQTT_TLS_ENABLED],
                 "has_custom_ca": CONF_MQTT_TLS_CA in self.fleet_data,
+                "has_hue_ca_default": CONF_HUE_CA_CERT in self.fleet_data,
                 "ha_control_enabled": self.fleet_data[CONF_HA_CONTROL_ENABLED],
                 "scene_panel": by_subentry[str(self.fleet_data[CONF_SCENE_PANEL])],
                 "scene_panel_subentry_id": self.fleet_data[CONF_SCENE_PANEL],
@@ -410,22 +411,6 @@ def _canonical_json(value: Any) -> str:
 def _normalize_pem(value: str) -> str:
     """Normalize CA line endings to LF with exactly one trailing newline."""
     return value.replace("\r\n", "\n").replace("\r", "\n").strip() + "\n"
-
-
-def _valid_ca(value: str) -> bool:
-    """Accept only a public certificate chain that OpenSSL can parse in memory."""
-    if (
-        "-----BEGIN CERTIFICATE-----" not in value
-        or "-----END CERTIFICATE-----" not in value
-        or "PRIVATE KEY-----" in value.upper()
-    ):
-        return False
-    try:
-        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        context.load_verify_locations(cadata=value)
-    except (ssl.SSLError, ValueError, TypeError):
-        return False
-    return True
 
 
 def secret_equal(left: object, right: object) -> bool:
@@ -718,7 +703,7 @@ def _broker_globals(
                 not isinstance(raw_ca, str)
                 or not raw_ca.strip()
                 or not tls_enabled
-                or not _valid_ca(_normalize_pem(raw_ca))
+                or not is_public_certificate_chain(_normalize_pem(raw_ca))
             ):
                 invalid.append(CONF_MQTT_TLS_CA)
             else:
@@ -802,6 +787,22 @@ def _choose(
             collector.add(CONFLICT_GLOBAL_MISMATCH, key, deviants)
         chosen[key] = value
     return chosen
+
+
+def _unanimous_hue_ca(drafts: Sequence[_PanelDraft]) -> str | None:
+    """Return the diyHue CA every panel shares when it is one valid public chain.
+
+    The fleet default is what panels added later inherit, so it is promoted only
+    when unanimous: a panel with no CA or a different one means there is no single
+    fleet CA, and picking among differing values would be arbitrary. Per-panel
+    overrides are kept either way, so no migrated panel's effective CA changes.
+    """
+    values = {draft.data[CONF_FEATURE_OVERRIDES].get(CONF_HUE_CA_CERT) for draft in drafts}
+    if len(values) != 1:
+        return None
+    (value,) = values
+    # Exactly one strictly valid certificate, promoted in canonical form.
+    return canonical_hue_ca_certificate(value)
 
 
 def _next_mesh_priority(priorities: Iterable[int]) -> int:
@@ -999,6 +1000,8 @@ def plan_migration(
     }
     if broker[CONF_MQTT_TLS_CA] is not None:
         fleet_data[CONF_MQTT_TLS_CA] = broker[CONF_MQTT_TLS_CA]
+    if (hue_ca := _unanimous_hue_ca(drafts)) is not None:
+        fleet_data[CONF_HUE_CA_CERT] = hue_ca
 
     candidate_ids = tuple(snapshot.entry_id for snapshot in legacy)
     anchor = candidate_ids[0]

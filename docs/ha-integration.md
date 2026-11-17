@@ -229,7 +229,9 @@ Open **Configure** on the fleet entry for focused, single-owner settings:
 - broker and fleet credential;
 - Home Assistant control;
 - scenes and the default scene panel;
-- fleet repair defaults; and
+- fleet repair defaults;
+- the fleet **diyHue CA certificate**, inherited by every panel (including
+  panels added later) that has no Hue CA override of its own; and
 - mesh priorities under **Advanced**.
 
 An empty fleet may accept a validated broker-profile change, and an unchanged
@@ -305,7 +307,9 @@ entity ID and entity unique ID (each panel's `management_id` is its old entry
 ID), the MQTT-discovery device and its `mqtt` association, and disabled/hidden
 entity flags. The panel's host, root password, pinned SSH host key, components,
 cadences, Voice and Hue CA overrides move into its subentry. The broker profile
-and Home Assistant control/scene settings move to the fleet once.
+and Home Assistant control/scene settings move to the fleet once. When every
+legacy panel has the same valid Hue CA certificate, it also becomes the fleet
+diyHue CA certificate, so panels added later inherit it.
 
 1. **Dry run** (the default changes nothing):
 
@@ -455,7 +459,7 @@ Assistant control** option is on (production default: off):
 | `select.brilliant_<panel>_wake_word` | **Wake word** — choose `okay_nabu` (default), `hey_jarvis`, or `hey_mycroft`; changing it restarts the satellite. |
 | `switch.brilliant_<panel>_wi_fi_watchdog` | **Wi-Fi watchdog** — enable installs and starts the on-panel Wi-Fi watchdog daemon (auto-recovers lost Wi-Fi: reconnect → restart networking → reboot as a last resort, see [CONFIGURATION.md → Wi-Fi watchdog](CONFIGURATION.md#wi-fi-watchdog)); disable uninstalls it. |
 | `switch.brilliant_<panel>_bus_watchdog` | **Bus watchdog** — enable installs and starts the on-panel bus-health watchdog daemon (reboots the panel if the Brilliant message bus stays wedged 30+ minutes, gated on the bridge being active and the network being up, see [CONFIGURATION.md → Bus-health watchdog](CONFIGURATION.md#bus-health-watchdog)); disable uninstalls it. |
-| `switch.brilliant_<panel>_hue_ca_recovery` | **Hue CA recovery** — enable installs and starts the on-panel diyHue CA recovery oneshot+timer (re-appends your diyHue bridge's CA to the panel's pinned Hue trust bundle after every OTA, see [CONFIGURATION.md → Hue CA recovery](CONFIGURATION.md#hue-ca-recovery)); requires the diyHue CA certificate to be set through **Panel overrides** first — enabling with none configured fails closed. Disable uninstalls it. |
+| `switch.brilliant_<panel>_hue_ca_recovery` | **Hue CA recovery** — enable installs and starts the on-panel diyHue CA recovery oneshot+timer (re-appends your diyHue bridge's CA to the panel's pinned Hue trust bundle after every OTA, see [CONFIGURATION.md → Hue CA recovery](CONFIGURATION.md#hue-ca-recovery)); requires a diyHue CA certificate: the fleet's **diyHue CA certificate** (Configure on the fleet entry) or a per-panel one in **Panel overrides**, which wins. Enabling with neither configured fails closed with `hue_ca_cert_missing` before contacting the panel. Disable uninstalls it. |
 | `select.brilliant_<panel>_scene` | **Scene** — the panel's Brilliant scenes, populated from its accepted MQTT catalog. Changing it only updates the HA-local selection; it publishes no command. Created only when the fleet's **Enable Home Assistant control** option is on. |
 | `button.brilliant_<panel>_run_selected_scene` | **Run selected scene** — runs the selected scene with blocking execution confirmation. Available only while the scene transport, catalog, and a selection exist. Created only when the fleet's **Enable Home Assistant control** option is on. |
 

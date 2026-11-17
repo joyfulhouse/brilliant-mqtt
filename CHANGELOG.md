@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.2] - 2026-11-17
+
+This is a Home Assistant integration release only. The bundled on-panel agent
+stays at 0.11.4 with release ordinal 6, so panels need no update.
+
+### Fixed
+
+- Panels added through the fleet Add panel flow can now enable Hue CA
+  recovery. They start with no per-panel feature overrides, so they had no
+  diyHue CA certificate. Turning on Hue CA recovery then failed with the generic
+  "Hue CA recovery operation failed: panel component operation failed" until an
+  operator set a per-panel certificate. The fleet now has one optional diyHue CA
+  certificate (Configure > diyHue CA certificate). It is validated as a public
+  PEM chain and inherited by every panel without its own non-blank override.
+  Rotating the fleet CA is therefore one change. Explicit per-panel overrides
+  still win. While Hue CA recovery is enabled on a panel that inherits the fleet
+  certificate, changing that certificate is refused until recovery is turned off,
+  as already happens for per-panel overrides. The per-panel Overrides guard now
+  compares the effective certificate, so clearing an override that matches the
+  fleet default is allowed. Diagnostics report the fleet certificate as redacted,
+  as they do for the broker CA.
+- Enabling Hue CA recovery with no certificate available, either per panel or
+  for the fleet, now fails before contacting the panel. The new
+  `hue_ca_cert_missing` error says where to set one.
+- The legacy-to-fleet migration now sets the fleet diyHue CA certificate when
+  every legacy panel has the same valid one. Panels added afterwards inherit it.
+  Per-panel copies are kept, and the migration never chooses between differing
+  certificates.
+- Hue CA changes and Hue CA installs no longer race. Saving the fleet diyHue CA
+  certificate now waits for any in-progress panel component operation, then
+  re-reads the fleet and every panel before deciding. Hue CA installs and the
+  post-OTA re-install take the certificate from the stored fleet and panel
+  settings while holding the same lock. They no longer read a runtime copy that
+  might not yet reflect a just-saved change. The certificate a panel receives
+  therefore always matches the stored configuration.
+- CA certificates are now checked as real X.509 certificates, not just PEM
+  framing. Every block must be strict base64 of one parseable certificate. The
+  same check covers the broker CA form and the stored broker CA, the fleet and
+  per-panel diyHue CA fields, the stored fleet diyHue CA, and migration.
+  Placeholder text, invalid base64, non-certificate or truncated data, and any
+  private key are rejected. Real certificate chains stored by earlier releases
+  still load, and a fleet without a custom broker CA is unaffected.
+- Certificate checks no longer silently drop whitespace. The input must be pure
+  ASCII, with `\n` or `\r\n` line endings, and only empty lines around
+  blocks. Non-breaking or zero-width spaces, Unicode line separators,
+  indentation, trailing spaces and lone carriage returns are rejected. Before,
+  such text was saved and uploaded, and the panel's Hue CA tool then failed on
+  every run. A diyHue CA must now be exactly one certificate, because the panel
+  tool matches a single certificate. It is saved and deployed in canonical PEM:
+  LF line endings, re-encoded 64-column base64.
+
 ## [0.12.1] - 2026-11-17
 
 This is a Home Assistant integration release only. The bundled on-panel agent
@@ -1296,7 +1347,8 @@ panel redeploy is needed.
 - JoyfulHouse OSS docs standard: LICENSE (MIT), INSTALL.md, CHANGELOG.md,
   FUNDING.yml, CODEOWNERS, and the canonical `docs/` set.
 
-[Unreleased]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.12.1...HEAD
+[Unreleased]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.12.2...HEAD
+[0.12.2]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.12.1...v0.12.2
 [0.12.1]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.11.6...v0.12.0
 [0.11.6]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.11.5...v0.11.6

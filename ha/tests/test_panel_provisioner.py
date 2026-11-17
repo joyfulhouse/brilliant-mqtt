@@ -75,6 +75,7 @@ from custom_components.brilliant_mqtt.provisioning_journal import (
 from custom_components.brilliant_mqtt.release_identity import ReleaseIdentity, RollbackBaseline
 from custom_components.brilliant_mqtt.setup_protocol import PreflightRequest
 from custom_components.brilliant_mqtt.shell import HostIdentity, PanelShell
+from tests.cert_fixtures import ca_pem
 from tests.fakes import FakePanelProcess, FakeShell
 
 _PUBLIC_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKIykuTed7zNwJwn20eCelcKcHKJ9c/pGFfvulRWazuC"
@@ -84,7 +85,7 @@ _OTHER_TRANSACTION_ID = UUID("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
 _SETUP_ID = UUID("87654321-4321-4cba-8fed-ba0987654321")
 _STARTED_AT = datetime(2026, 7, 27, 18, 30, tzinfo=UTC)
 _VERSION = "0.7.0"
-_CA_BYTES = b"-----BEGIN CERTIFICATE-----\nPUBLIC-CA\n-----END CERTIFICATE-----"
+_CA_BYTES = ca_pem("provisioner-broker-ca").encode()
 _RELEASE_CA_PATH = f"/var/brilliant-mqtt/releases/{_VERSION}--{_TRANSACTION_ID.hex}/mqtt-ca.pem"
 
 
@@ -339,11 +340,7 @@ def _fleet(*, custom_ca: bool = False) -> FleetConfig:
             tls_enabled=True,
             _username_value="SECRET-mqtt-user",
             _password_value="SECRET-mqtt-password",
-            _ca_pem_value=(
-                "-----BEGIN CERTIFICATE-----\nPUBLIC-CA\n-----END CERTIFICATE-----"
-                if custom_ca
-                else None
-            ),
+            _ca_pem_value=_CA_BYTES.decode() if custom_ca else None,
         ),
         next_mesh_priority=3,
         ha_control_enabled=False,
