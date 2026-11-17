@@ -30,7 +30,7 @@ from homeassistant.config_entries import ConfigEntry, ConfigSubentryDataWithId
 from homeassistant.const import CONF_NAME
 
 from .broker import BrokerKind
-from .certificates import is_public_certificate_chain
+from .certificates import canonical_hue_ca_certificate, is_public_certificate_chain
 from .const import (
     COMPONENT_BRIDGE,
     COMPONENT_HA_MIRROR,
@@ -801,8 +801,8 @@ def _unanimous_hue_ca(drafts: Sequence[_PanelDraft]) -> str | None:
     if len(values) != 1:
         return None
     (value,) = values
-    # Validate the exact stored text: the strict fleet entry parser checks the same.
-    return value if isinstance(value, str) and is_public_certificate_chain(value) else None
+    # Exactly one strictly valid certificate, promoted in canonical form.
+    return canonical_hue_ca_certificate(value)
 
 
 def _next_mesh_priority(priorities: Iterable[int]) -> int:

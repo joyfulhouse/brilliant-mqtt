@@ -119,7 +119,13 @@ from custom_components.brilliant_mqtt.provisioning_journal import (
     RetainedRollback,
 )
 from custom_components.brilliant_mqtt.shell import HostIdentity, PanelIdentityError, RunResult
-from tests.cert_fixtures import ca_pem, pem_block, private_key_pem, truncated_ca_pem
+from tests.cert_fixtures import (
+    ca_pem,
+    pem_block,
+    private_key_pem,
+    truncated_ca_pem,
+    unicode_whitespace_variants,
+)
 from tests.fakes import FakeShell
 
 _PUBLIC_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKIykuTed7zNwJwn20eCelcKcHKJ9c/pGFfvulRWazuC"
@@ -5727,6 +5733,11 @@ async def test_active_inheriting_panel_blocks_override_that_changes_effective_ca
             ca_pem("fleet-hue") + private_key_pem("fleet-hue"),
             id="certificate-plus-private-key",
         ),
+        pytest.param(ca_pem("fleet-hue") + ca_pem("fleet-hue-intermediate"), id="chain"),
+        *(
+            pytest.param(value, id=variant)
+            for variant, value in unicode_whitespace_variants("fleet-hue").items()
+        ),
     ],
 )
 async def test_fleet_hue_ca_form_rejects_non_x509_material(
@@ -5916,3 +5927,47 @@ async def test_hue_ca_ota_relay_uses_the_stored_fleet_ca_before_reconcile(
         assert await manager._relay_hue_ca(shell) is None
 
     assert _uploaded_hue_ca(shell) == _ROTATED_HUE_CA.strip().encode()
+
+
+async def test_fleet_hue_ca_form_persists_the_canonical_pem(hass: HomeAssistant) -> None:
+    """A CRLF paste is stored (and later deployed) as canonical LF PEM."""
+    entry = _fleet_entry(hass, _subentry())
+    form = await _start_fleet_options_step(hass, entry, "hue_ca")
+
+    result = await hass.config_entries.options.async_configure(
+        form["flow_id"],
+        {CONF_HUE_CA_CERT: "\r\n" + _FLEET_HUE_CA.replace("\n", "\r\n")},
+    )
+
+    assert result["reason"] == "reconfigure_successful"
+    assert entry.data[CONF_HUE_CA_CERT] == _FLEET_HUE_CA
+
+
+@pytest.mark.parametrize(
+    "value",
+    list(unicode_whitespace_variants("panel-hue").values()),
+    ids=list(unicode_whitespace_variants("panel-hue")),
+)
+async def test_panel_hue_ca_override_rejects_unicode_whitespace(
+    hass: HomeAssistant,
+    value: str,
+) -> None:
+    """The per-panel override form applies the same strict, single-cert contract."""
+    panel = _subentry()
+    entry = _fleet_entry(hass, panel)
+    stored = entry.subentries[panel.subentry_id]
+    original = dict(stored.data)
+    form = await _start_panel_reconfigure_step(hass, entry, stored, "overrides")
+
+    result = await hass.config_entries.subentries.async_configure(
+        form["flow_id"],
+        {
+            CONF_VOICE_WAKE_WORD: DEFAULT_VOICE_WAKE_WORD,
+            CONF_VOICE_HA_HOST: "",
+            CONF_HUE_CA_CERT: value,
+        },
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {CONF_HUE_CA_CERT: "invalid_value"}
+    assert dict(entry.subentries[panel.subentry_id].data) == original

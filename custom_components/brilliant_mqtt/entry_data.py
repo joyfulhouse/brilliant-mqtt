@@ -15,7 +15,7 @@ from homeassistant.const import CONF_NAME
 from homeassistant.core import HomeAssistant
 
 from .broker import BrokerProfile
-from .certificates import is_public_certificate_chain
+from .certificates import canonical_hue_ca_certificate, is_hue_ca_certificate
 from .const import (
     CONF_BROKER_KIND,
     CONF_COMPONENTS,
@@ -246,11 +246,11 @@ def _resilience_values(
 
 
 def _optional_fleet_hue_ca(data: Mapping[str, Any]) -> str:
-    """Parse the optional fleet Hue CA default: absent, or one public X.509 chain."""
+    """Parse the optional fleet Hue CA default: absent, or one public certificate."""
     if CONF_HUE_CA_CERT not in data:
         return ""
     value = data[CONF_HUE_CA_CERT]
-    if not isinstance(value, str) or not is_public_certificate_chain(value):
+    if not isinstance(value, str) or not is_hue_ca_certificate(value):
         raise _invalid("invalid_fleet_entry_data")
     return value
 
@@ -261,12 +261,13 @@ def effective_hue_ca_cert(overrides: Mapping[str, Any], fleet_default: str) -> s
     Panels added through the fleet Add-panel flow start with no overrides, so they
     inherit the fleet default; an explicit per-panel certificate still wins. A blank
     override (the Overrides form stores "" when the field is cleared) means "not
-    set" and inherits too. Returns "" when neither is configured.
+    set" and inherits too. Returns "" when neither is configured. A valid result is
+    returned in canonical PEM form (what is persisted and deployed), so guards that
+    compare effective CAs ignore line-ending/wrapping differences.
     """
     override = overrides.get(CONF_HUE_CA_CERT)
-    if isinstance(override, str) and override.strip():
-        return override
-    return fleet_default
+    chosen = override if isinstance(override, str) and override.strip() else fleet_default
+    return canonical_hue_ca_certificate(chosen) or chosen
 
 
 @dataclass(frozen=True, slots=True)

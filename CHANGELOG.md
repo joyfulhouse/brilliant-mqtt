@@ -44,6 +44,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Placeholder text, invalid base64, non-certificate or truncated data, and any
   private key are rejected. Real certificate chains stored by earlier releases
   still load, and a fleet without a custom broker CA is unaffected.
+- Certificate checks no longer silently drop whitespace. The input must be pure
+  ASCII, with `\n` or `\r\n` line endings, and only empty lines around
+  blocks. Non-breaking or zero-width spaces, Unicode line separators,
+  indentation, trailing spaces and lone carriage returns are rejected. Before,
+  such text was saved and uploaded, and the panel's Hue CA tool then failed on
+  every run. A diyHue CA must now be exactly one certificate, because the panel
+  tool matches a single certificate. It is saved and deployed in canonical PEM:
+  LF line endings, re-encoded 64-column base64.
 
 ## [0.12.1] - 2026-11-17
 

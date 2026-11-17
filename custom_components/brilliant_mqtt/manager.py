@@ -38,7 +38,7 @@ from homeassistant.helpers.event import async_call_later
 
 from . import panel_ops
 from .broker import PanelBrokerReleaseSettings
-from .certificates import is_public_certificate_chain
+from .certificates import canonical_hue_ca_certificate
 from .const import (
     AVAILABILITY_OFFLINE,
     AVAILABILITY_ONLINE,
@@ -931,8 +931,9 @@ class PanelManager:
         also take, so the value cannot change between this read and the panel write.
         The runtime ``self.fleet`` snapshot is deliberately not used: an asynchronous
         reconcile refreshes it and may still be pending after a fleet CA edit. A
-        panel's non-blank override wins over the fleet default. Returns "" unless the
-        result is a valid public X.509 chain.
+        panel's non-blank override wins over the fleet default. Returns the canonical
+        PEM (pure ASCII, LF, re-encoded from DER — what the panel's hue-ca tool parses)
+        of exactly one valid certificate, or "" when none is configured.
         """
         store = self.store
         if isinstance(store, FleetPanelStore):
@@ -948,7 +949,7 @@ class PanelManager:
             overrides = {CONF_HUE_CA_CERT: self._panel_override(CONF_HUE_CA_CERT, "")}
             fleet_default = self.fleet.hue_ca_cert
         candidate = effective_hue_ca_cert(overrides, fleet_default)
-        return candidate if is_public_certificate_chain(candidate) else ""
+        return canonical_hue_ca_certificate(candidate) or ""
 
     def _fire(self, event_type: str, data: dict[str, Any] | None = None) -> None:
         self.hass.bus.async_fire(

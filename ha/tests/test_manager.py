@@ -6202,3 +6202,25 @@ async def test_hue_ca_relay_redeploys_with_the_fleet_default_ca(
         0o644,
     ) in shell.uploads
     assert "systemctl enable --now brilliant-hue-ca.timer" in shell.commands
+
+
+async def test_hue_ca_install_uploads_the_canonical_pem(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """A valid but non-canonical stored CA reaches the panel as canonical ASCII PEM."""
+    _write_hue_ca_units(payload_dir)
+    _entry, manager = _fleet_panel_manager(
+        hass,
+        feature_overrides={CONF_HUE_CA_CERT: "\r\n" + _PANEL_HUE_CA.replace("\n", "\r\n")},
+    )
+    shell = FakeShell()
+
+    with patch.object(manager, "_shell", return_value=shell):
+        await manager.async_install_component(COMPONENT_HUE_CA)
+
+    assert (
+        PANEL_HUE_CA_CERT_FILE,
+        _PANEL_HUE_CA.strip().encode("ascii"),
+        0o644,
+    ) in shell.uploads

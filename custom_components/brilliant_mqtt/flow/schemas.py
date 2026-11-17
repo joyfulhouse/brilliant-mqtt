@@ -23,6 +23,7 @@ from homeassistant.helpers.selector import (
 )
 
 from ..broker import BrokerKind
+from ..certificates import canonical_hue_ca_certificate, is_hue_ca_certificate
 from ..certificates import is_public_certificate_chain as _is_public_certificate_chain
 from ..components import optional
 from ..const import (
@@ -1226,7 +1227,7 @@ def panel_feature_overrides_schema(
     hue_ca_default = (
         raw_hue_ca
         if isinstance(raw_hue_ca, str)
-        and (not raw_hue_ca.strip() or _is_public_certificate_chain(raw_hue_ca))
+        and (not raw_hue_ca.strip() or is_hue_ca_certificate(raw_hue_ca))
         else ""
     )
     fields: dict[Any, Any] = {
@@ -1268,20 +1269,28 @@ def _panel_cadence_schema_fields(source: Mapping[str, object]) -> dict[Any, Any]
 def fleet_hue_ca_schema(source: Mapping[str, object] | None = None) -> vol.Schema:
     """Build the fleet-wide diyHue CA default form (blank means no default)."""
     raw = _source_values(source).get(CONF_HUE_CA_CERT)
-    default = raw if isinstance(raw, str) and _is_public_certificate_chain(raw) else ""
+    default = raw if isinstance(raw, str) and is_hue_ca_certificate(raw) else ""
     return vol.Schema({vol.Optional(CONF_HUE_CA_CERT, default=default): _PUBLIC_CA_SELECTOR})
 
 
 def normalize_fleet_hue_ca_input(user_input: Mapping[str, object]) -> str:
-    """Validate the fleet diyHue CA default; return "" when it is being cleared."""
+    """Validate the fleet diyHue CA default; return its canonical PEM, or "" to clear.
+
+    Only an empty submission (or one made of line breaks alone) clears it; any other
+    text must be exactly one strictly valid certificate and is stored canonically.
+    """
     errors = _unexpected_key_errors(user_input, frozenset({CONF_HUE_CA_CERT}))
     raw = user_input.get(CONF_HUE_CA_CERT, "")
-    if not isinstance(raw, str) or (raw.strip() and not _is_public_certificate_chain(raw)):
+    canonical: str | None = ""
+    if not isinstance(raw, str):
         errors[CONF_HUE_CA_CERT] = "invalid_value"
-    if errors:
+    elif raw.strip("\r\n"):
+        canonical = canonical_hue_ca_certificate(raw)
+        if canonical is None:
+            errors[CONF_HUE_CA_CERT] = "invalid_value"
+    if errors or canonical is None:
         raise FlowInputError(errors)
-    assert isinstance(raw, str)
-    return raw if raw.strip() else ""
+    return canonical
 
 
 def normalize_panel_feature_overrides_input(
@@ -1321,11 +1330,14 @@ def normalize_panel_feature_overrides_input(
     raw_hue_ca = user_input.get(CONF_HUE_CA_CERT, "")
     if not isinstance(raw_hue_ca, str):
         errors[CONF_HUE_CA_CERT] = "invalid_value"
-    elif raw_hue_ca.strip():
-        if not _is_public_certificate_chain(raw_hue_ca):
+    elif raw_hue_ca.strip("\r\n"):
+        # Exactly one strictly valid certificate, stored in the canonical form the
+        # panel tool consumes; nothing is silently stripped from accepted text.
+        canonical_hue_ca = canonical_hue_ca_certificate(raw_hue_ca)
+        if canonical_hue_ca is None:
             errors[CONF_HUE_CA_CERT] = "invalid_value"
         else:
-            normalized[CONF_HUE_CA_CERT] = raw_hue_ca
+            normalized[CONF_HUE_CA_CERT] = canonical_hue_ca
     else:
         normalized[CONF_HUE_CA_CERT] = ""
 

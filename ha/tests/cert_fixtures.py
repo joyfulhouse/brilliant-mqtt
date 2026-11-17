@@ -64,3 +64,19 @@ def truncated_ca_pem(name: str) -> str:
         serialization.Encoding.DER
     )
     return pem_block(der[: len(der) // 2])
+
+
+def unicode_whitespace_variants(name: str) -> dict[str, str]:
+    """Otherwise-valid PEM text smuggling non-ASCII whitespace (must be rejected)."""
+    pem = ca_pem(name)
+    other = ca_pem(f"{name}-second")
+    return {
+        "nbsp-indent": pem.replace("\n", "\n ", 1),
+        "u2028-line-separator": pem.replace("\n", " "),
+        "u2029-paragraph-separator": pem.replace("\n", " "),
+        "unicode-only-line-between-blocks": pem + "　\n" + other,
+        "zero-width-space": pem.replace("\n", "\n​", 1),
+        "ascii-space-indent": pem.replace("\n", "\n ", 1),
+        "lone-cr-line-endings": pem.replace("\n", "\r"),
+        "trailing-space-on-line": pem.replace("\n", " \n", 1),
+    }

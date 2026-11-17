@@ -67,7 +67,12 @@ from custom_components.brilliant_mqtt.entry_data import (
     PanelConfigStore,
     effective_hue_ca_cert,
 )
-from tests.cert_fixtures import ca_pem, private_key_pem, truncated_ca_pem
+from tests.cert_fixtures import (
+    ca_pem,
+    private_key_pem,
+    truncated_ca_pem,
+    unicode_whitespace_variants,
+)
 
 
 def _fleet_data(**overrides: object) -> dict[str, Any]:
@@ -659,6 +664,8 @@ def test_fleet_hue_ca_default_is_optional_and_kept_out_of_repr() -> None:
         private_key_pem("fleet-hue"),
         ca_pem("fleet-hue") + private_key_pem("fleet-hue"),
         truncated_ca_pem("fleet-hue"),
+        ca_pem("fleet-hue") + ca_pem("fleet-hue-intermediate"),
+        *unicode_whitespace_variants("fleet-hue").values(),
     ],
     ids=[
         "empty",
@@ -670,6 +677,8 @@ def test_fleet_hue_ca_default_is_optional_and_kept_out_of_repr() -> None:
         "private-key",
         "certificate-plus-private-key",
         "truncated",
+        "chain-not-single-certificate",
+        *unicode_whitespace_variants("fleet-hue"),
     ],
 )
 def test_fleet_hue_ca_default_rejects_anything_but_a_public_chain(value: object) -> None:
