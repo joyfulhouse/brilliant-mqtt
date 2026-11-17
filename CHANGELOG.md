@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-11-17
+
+This is a Home Assistant integration release only. The bundled on-panel agent
+stays at 0.11.4 with release ordinal 6, so panels need no update.
+
 ### Fixed
 
 - Home Assistant 2026.10+ compatibility with the single-owner device registry
@@ -1291,7 +1296,8 @@ panel redeploy is needed.
 - JoyfulHouse OSS docs standard: LICENSE (MIT), INSTALL.md, CHANGELOG.md,
   FUNDING.yml, CODEOWNERS, and the canonical `docs/` set.
 
-[Unreleased]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.12.1...HEAD
+[0.12.1]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.11.6...v0.12.0
 [0.11.6]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.11.5...v0.11.6
 [0.11.5]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.11.4...v0.11.5
