@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Panels added through the fleet Add panel flow can now enable Hue CA
+  recovery. They start with no per-panel feature overrides, so they had no
+  diyHue CA certificate. Turning on Hue CA recovery then failed with the generic
+  "Hue CA recovery operation failed: panel component operation failed" until an
+  operator set a per-panel certificate. The fleet now has one optional diyHue CA
+  certificate (Configure > diyHue CA certificate). It is validated as a public
+  PEM chain and inherited by every panel without its own non-blank override.
+  Rotating the fleet CA is therefore one change. Explicit per-panel overrides
+  still win. While Hue CA recovery is enabled on a panel that inherits the fleet
+  certificate, changing that certificate is refused until recovery is turned off,
+  as already happens for per-panel overrides. The per-panel Overrides guard now
+  compares the effective certificate, so clearing an override that matches the
+  fleet default is allowed. Diagnostics report the fleet certificate as redacted,
+  as they do for the broker CA.
+- Enabling Hue CA recovery with no certificate available, either per panel or
+  for the fleet, now fails before contacting the panel. The new
+  `hue_ca_cert_missing` error says where to set one.
+- The legacy-to-fleet migration now sets the fleet diyHue CA certificate when
+  every legacy panel has the same valid one. Panels added afterwards inherit it.
+  Per-panel copies are kept, and the migration never chooses between differing
+  certificates.
+
 ## [0.12.1] - 2026-11-17
 
 This is a Home Assistant integration release only. The bundled on-panel agent
