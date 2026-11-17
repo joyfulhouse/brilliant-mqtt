@@ -299,7 +299,7 @@
           "data_description": {
             "voice_wake_word": "Wake word used on the next Voice satellite install. If Voice is active, use the panel's Wake word selector instead.",
             "voice_ha_host": "Optional hostname=IP mapping for a panel that cannot resolve the Home Assistant hostname. Disable Voice before changing this active value; leave blank to use panel DNS.",
-            "hue_ca_cert": "Optional public PEM certificate chain for diyHue CA recovery. Leave blank to inherit the fleet diyHue CA certificate (Brilliant MQTT settings > diyHue CA certificate). Disable Hue CA recovery before changing its active certificate. Never paste a private key.",
+            "hue_ca_cert": "Optional single public PEM X.509 certificate (the diyHue CA) for diyHue CA recovery. Leave blank to inherit the fleet diyHue CA certificate (Brilliant MQTT settings > diyHue CA certificate). Disable Hue CA recovery before changing its active certificate. Never paste a private key.",
             "hot_poll_seconds": "Optional agent state-poll cadence from 0 to 60 seconds. Use 0 to disable polling; leave blank to use the agent default.",
             "resync_seconds": "Optional full discovery and state resync cadence from 60 to 86400 seconds. Leave blank to use the agent default."
           }
@@ -576,7 +576,7 @@
           "hue_ca_cert": "diyHue CA certificate (PEM)"
         },
         "data_description": {
-          "hue_ca_cert": "Public PEM certificate chain of the diyHue bridge CA. Leave blank to remove the fleet default. Never paste a private key."
+          "hue_ca_cert": "A single public PEM X.509 certificate: the diyHue bridge CA. Leave blank to remove the fleet default. Never paste a private key."
         }
       },
       "advanced": {
@@ -779,7 +779,7 @@
       "message": "Hue CA recovery operation failed: {error}"
     },
     "hue_ca_cert_missing": {
-      "message": "Hue CA recovery cannot be enabled on panel `{panel}`: no valid diyHue CA certificate (a public PEM X.509 chain) is configured. Set the fleet default in the Brilliant MQTT integration's settings (Configure > diyHue CA certificate), or a per-panel certificate in the panel's Reconfigure > Edit feature overrides & advanced settings, then enable it again."
+      "message": "Hue CA recovery cannot be enabled on panel `{panel}`: no valid diyHue CA certificate (a single public PEM X.509 certificate) is configured. Set the fleet default in the Brilliant MQTT integration's settings (Configure > diyHue CA certificate), or a per-panel certificate in the panel's Reconfigure > Edit feature overrides & advanced settings, then enable it again."
     },
     "ha_mirror_failed": {
       "message": "HA mirror operation failed: {error}"
