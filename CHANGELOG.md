@@ -22,6 +22,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `DeviceEntry.config_entries_subentries`, which logged a warning on every
   device-targeted call. HA 2026.6–2026.9 behaviour is unchanged, and CI now
   also runs the integration suite against HA 2026.10.4.
+- A panel is selected through its MQTT-discovery identifier only when the
+  targeted device is owned solely by the MQTT integration. On HA 2026.10+ a
+  device from any other integration that reuses a panel's identifier selects
+  nothing, including through an area; before, it could run destructive actions
+  such as `uninstall` on that panel. A device naming several panels is rejected
+  instead of fanned out.
+- Targeting one of a panel's MQTT-discovery entities (for example its light)
+  now selects that panel through the entity's device, on every supported HA
+  release. Before, such a target silently did nothing, and canary recovery and
+  single-panel `redeploy` overrides rejected it.
+- `run_scene` and `set_mode` accept an entity, device, or area target that
+  resolves to exactly one panel, using the same validation. A `panel` slug
+  given together with a target must name the same panel. Without a target,
+  the slug or the configured scene panel applies as before.
 
 ## [0.12.0] - 2026-11-16
 

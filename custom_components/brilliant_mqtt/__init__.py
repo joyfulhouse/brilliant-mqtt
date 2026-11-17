@@ -17,7 +17,13 @@ from homeassistant.const import (
     ATTR_FLOOR_ID,
     ATTR_LABEL_ID,
 )
-from homeassistant.core import HomeAssistant, ServiceCall, ServiceResponse, SupportsResponse
+from homeassistant.core import (
+    HomeAssistant,
+    ServiceCall,
+    ServiceResponse,
+    SupportsResponse,
+    callback,
+)
 from homeassistant.exceptions import ConfigEntryNotReady, HomeAssistantError
 from homeassistant.helpers import (
     config_validation as cv,
@@ -106,8 +112,16 @@ _SERVICE_SCHEMA = vol.Schema(
     extra=vol.ALLOW_EXTRA,
 )
 
+# Scene/mode commands address ONE panel: by HA target (entity/device/area, resolved
+# like the management services), by `panel` slug, or by the configured default.
+_TARGET_FIELDS: dict[vol.Marker, Any] = {
+    vol.Optional(key): vol.Any(None, str, [str])
+    for key in (ATTR_ENTITY_ID, ATTR_DEVICE_ID, ATTR_AREA_ID, ATTR_FLOOR_ID, ATTR_LABEL_ID)
+}
+
 _RUN_SCENE_SCHEMA = vol.Schema(
     {
+        **_TARGET_FIELDS,
         vol.Optional("panel"): cv.string,
         vol.Required("scene_id"): cv.string,
     },
@@ -116,6 +130,7 @@ _RUN_SCENE_SCHEMA = vol.Schema(
 
 _SET_MODE_SCHEMA = vol.Schema(
     {
+        **_TARGET_FIELDS,
         vol.Optional("panel"): cv.string,
         vol.Required("mode_id"): cv.string,
     },
@@ -224,82 +239,111 @@ async def _async_cleanup_entry(hass: HomeAssistant, entry: BrilliantMqttConfigEn
         raise
 
 
+type _PanelKey = tuple[str, str]
+
+
+@callback
+def _resolve_target_managers(hass: HomeAssistant, call: ServiceCall) -> list[PanelManager]:
+    """Resolve a call's HA target to panel managers, each at most once.
+
+    No target key at all means every loaded panel; an explicit target that matches
+    nothing means none. Brilliant registry ownership (entry + panel subentry) is
+    authoritative. A panel's MQTT-discovery records - its device (the MQTT-owned
+    twin on HA 2026.10+, where a device has one owner) and that device's entities -
+    select the panel through its ("mqtt", "brilliant_panel_<slug>") identifier,
+    but only when the device is owned solely by the MQTT integration: any other
+    owner reusing the identifier selects nothing, and a device naming several
+    panels is rejected rather than fanned out.
+    """
+    loaded: dict[str, BrilliantMqttConfigEntry] = {}
+    for candidate in hass.config_entries.async_entries(DOMAIN):
+        if candidate.state is ConfigEntryState.LOADED and isinstance(
+            candidate.runtime_data, FleetManager
+        ):
+            loaded[candidate.entry_id] = cast(BrilliantMqttConfigEntry, candidate)
+
+    selected: dict[_PanelKey, PanelManager] = {}
+
+    def _add_owner(entry_id: str, subentry_ids: set[str | None]) -> None:
+        if (entry := loaded.get(entry_id)) is None:
+            return
+        panels = entry.runtime_data.panels
+        if None in subentry_ids:
+            # Owned without a panel subentry: the whole entry (fleet-wide record).
+            selected.update(((entry_id, panel_id), m) for panel_id, m in panels.items())
+            return
+        for subentry_id in subentry_ids:
+            if subentry_id is not None and (manager := panels.get(subentry_id)) is not None:
+                selected[(entry_id, subentry_id)] = manager
+
+    if _TARGET_KEYS.isdisjoint(call.data):
+        for entry_id in loaded:
+            _add_owner(entry_id, {None})
+        return list(selected.values())
+    selection = target_helpers.TargetSelection(call.data)
+    if not selection.has_any_target:
+        return []
+
+    by_identifier: dict[tuple[str, str], dict[_PanelKey, PanelManager]] = {}
+    for entry_id, entry in loaded.items():
+        for panel_id, manager in entry.runtime_data.panels.items():
+            by_identifier.setdefault(panel_device_identifier(manager.panel), {})[
+                (entry_id, panel_id)
+            ] = manager
+
+    device_registry = dr.async_get(hass)
+
+    def _add_device(device_id: str) -> None:
+        if (device := device_registry.async_get(device_id)) is None:
+            return
+        owners = device_links(device)
+        brilliant_owned = False
+        for entry_id, subentry_ids in owners.items():
+            owner = hass.config_entries.async_get_entry(entry_id)
+            if owner is not None and owner.domain == DOMAIN:
+                brilliant_owned = True
+                _add_owner(entry_id, subentry_ids)
+        if brilliant_owned or not owners:
+            return
+        if not all(
+            (owner := hass.config_entries.async_get_entry(entry_id)) is not None
+            and owner.domain == mqtt.DOMAIN
+            for entry_id in owners
+        ):
+            return  # another integration reusing a panel identifier
+        matches: dict[_PanelKey, PanelManager] = {}
+        for identifier in device.identifiers:
+            matches.update(by_identifier.get(identifier, {}))
+        if len(matches) > 1:
+            raise HomeAssistantError(
+                f"Device {device_id} is ambiguous: it names {len(matches)} Brilliant panels"
+            )
+        selected.update(matches)
+
+    referenced = target_helpers.async_extract_referenced_entity_ids(
+        hass, selection, primary_entities_only=False
+    )
+    entity_registry = er.async_get(hass)
+    for entity_id in referenced.referenced | referenced.indirectly_referenced:
+        if (entity := entity_registry.async_get(entity_id)) is None:
+            continue
+        if entity.config_entry_id in loaded:
+            _add_owner(entity.config_entry_id, {entity.config_subentry_id})
+        elif entity_id in referenced.referenced and entity.device_id is not None:
+            # An explicitly targeted foreign entity (e.g. the panel's MQTT light)
+            # stands for its device; HA does not reference that device itself.
+            _add_device(entity.device_id)
+    for device_id in referenced.referenced_devices:
+        _add_device(device_id)
+    return list(selected.values())
+
+
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Register domain services once (entries come and go; services persist)."""
 
     async def _managers_for(call: ServiceCall) -> list[PanelManager]:
-        """Resolve fleet subentries without collapsing them to their parent entry."""
-        selection = target_helpers.TargetSelection(call.data)
-        loaded: dict[str, BrilliantMqttConfigEntry] = {}
-        for candidate in hass.config_entries.async_entries(DOMAIN):
-            if candidate.state is ConfigEntryState.LOADED and isinstance(
-                candidate.runtime_data, FleetManager
-            ):
-                loaded[candidate.entry_id] = cast(BrilliantMqttConfigEntry, candidate)
-
-        selected_managers: dict[tuple[str, str], PanelManager] = {}
-
-        def _add_entry(
-            entry_id: str,
-            subentry_ids: set[str | None] | None,
-        ) -> None:
-            entry = loaded.get(entry_id)
-            if entry is None:
-                return
-            runtime = entry.runtime_data
-            if subentry_ids is None or None in subentry_ids:
-                for panel_id, manager in runtime.panels.items():
-                    selected_managers[(entry_id, panel_id)] = manager
-                return
-            for subentry_id in subentry_ids:
-                if subentry_id is None:
-                    continue
-                selected = runtime.panels.get(subentry_id)
-                if selected is not None:
-                    selected_managers[(entry_id, subentry_id)] = selected
-
-        has_explicit_target = not _TARGET_KEYS.isdisjoint(call.data)
-        if not has_explicit_target:
-            for entry_id in loaded:
-                _add_entry(entry_id, None)
-            return list(selected_managers.values())
-        if not selection.has_any_target:
-            return []
-
-        referenced = target_helpers.async_extract_referenced_entity_ids(
-            hass,
-            selection,
-            primary_entities_only=False,
-        )
-        entity_registry = er.async_get(hass)
-        for entity_id in referenced.referenced | referenced.indirectly_referenced:
-            if (
-                entity_entry := entity_registry.async_get(entity_id)
-            ) is not None and entity_entry.config_entry_id is not None:
-                _add_entry(
-                    entity_entry.config_entry_id,
-                    {entity_entry.config_subentry_id},
-                )
-
-        # A panel's device records all carry its MQTT-discovery identifier: one
-        # shared device on HA <= 2026.9, and on 2026.10+ (single-owner devices) a
-        # twin owned by the MQTT entry next to the management twin owned by ours.
-        # Match the identifier so either record selects its panel, in addition to
-        # the record's own config entry/subentry ownership (fleet-wide devices).
-        panels_by_identifier: dict[tuple[str, str], dict[tuple[str, str], PanelManager]] = {}
-        for entry_id, entry in loaded.items():
-            for panel_id, manager in entry.runtime_data.panels.items():
-                identifier = panel_device_identifier(manager.panel)
-                panels_by_identifier.setdefault(identifier, {})[(entry_id, panel_id)] = manager
-        device_registry = dr.async_get(hass)
-        for device_id in referenced.referenced_devices:
-            if (device_entry := device_registry.async_get(device_id)) is None:
-                continue
-            for entry_id, subentry_ids in device_links(device_entry).items():
-                _add_entry(entry_id, subentry_ids)
-            for identifier in device_entry.identifiers:
-                selected_managers.update(panels_by_identifier.get(identifier, {}))
-        return list(selected_managers.values())
+        """Resolve the call's HA target to panel managers (see _resolve_target_managers)."""
+        return _resolve_target_managers(hass, call)
 
     async def _apply_to_all(
         call: ServiceCall, op: Callable[[PanelManager], Awaitable[None]]
@@ -358,22 +402,34 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
             lambda m: m.async_reboot(collect_diagnostics=collect, journal_lines=lines),
         )
 
+    def _scene_panel(call: ServiceCall) -> str | None:
+        """The one panel a scene/mode call addresses; None means the configured default."""
+        slug = call.data.get("panel")
+        slug = slug if isinstance(slug, str) else None
+        if _TARGET_KEYS.isdisjoint(call.data):
+            return slug
+        managers = _resolve_target_managers(hass, call)
+        if len(managers) != 1:
+            raise HomeAssistantError(
+                f"{call.service} requires exactly one targeted panel, got {len(managers)}"
+            )
+        target = managers[0].panel
+        if slug is not None and slug != target:
+            raise HomeAssistantError(f"panel '{slug}' does not match the targeted panel '{target}'")
+        return target
+
     async def _run_scene(call: ServiceCall) -> None:
         from .ha_control import get_control_plane
 
-        panel = call.data.get("panel")
         await get_control_plane(hass).scene_control.async_run_scene(
-            panel if isinstance(panel, str) else None,
-            str(call.data["scene_id"]),
+            _scene_panel(call), str(call.data["scene_id"])
         )
 
     async def _set_mode(call: ServiceCall) -> None:
         from .ha_control import get_control_plane
 
-        panel = call.data.get("panel")
         await get_control_plane(hass).scene_control.async_set_mode(
-            panel if isinstance(panel, str) else None,
-            str(call.data["mode_id"]),
+            _scene_panel(call), str(call.data["mode_id"])
         )
 
     hass.services.async_register(DOMAIN, "repair", _repair, schema=_SERVICE_SCHEMA)

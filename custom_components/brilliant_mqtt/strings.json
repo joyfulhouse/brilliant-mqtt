@@ -652,7 +652,7 @@
       "fields": {
         "panel": {
           "name": "Panel",
-          "description": "Attached panel slug. Omit it to use the configured scene panel."
+          "description": "Attached panel slug. Optional with a target, which must then name the same single panel; omit both to use the configured scene panel."
         },
         "scene_id": {
           "name": "Scene ID",
@@ -666,7 +666,7 @@
       "fields": {
         "panel": {
           "name": "Panel",
-          "description": "Attached panel slug. Omit it to use the configured scene panel."
+          "description": "Attached panel slug. Optional with a target, which must then name the same single panel; omit both to use the configured scene panel."
         },
         "mode_id": {
           "name": "Mode ID",

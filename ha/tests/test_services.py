@@ -16,6 +16,7 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import area_registry as ar
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
+from homeassistant.util.yaml import load_yaml_dict
 from pytest_homeassistant_custom_component.common import MockConfigEntry, async_fire_mqtt_message
 from pytest_homeassistant_custom_component.typing import MqttMockHAClient
 
@@ -850,13 +851,17 @@ def test_scene_service_descriptions_and_translations_are_complete() -> None:
         (root / "custom_components/brilliant_mqtt/translations/en.json").read_text()
     )
 
+    definitions = load_yaml_dict(str(root / "custom_components/brilliant_mqtt/services.yaml"))
     for service, field in (("run_scene", "scene_id"), ("set_mode", "mode_id")):
         assert f"{service}:" in services
         assert "panel:" in services
         assert f"{field}:" in services
+        # Targetable like the panel-management services (resolved to ONE panel).
+        assert definitions[service]["target"] == {"entity": {"integration": DOMAIN}}
         for document in (strings, translations):
             assert document["services"][service]["name"]
-            assert document["services"][service]["fields"]["panel"]["description"]
+            panel_copy = document["services"][service]["fields"]["panel"]["description"]
+            assert "target" in panel_copy
             assert document["services"][service]["fields"][field]["description"]
 
     for document in (strings, translations):
