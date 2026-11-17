@@ -464,10 +464,39 @@ _REAL_EMPEROR_CMDLINE = (
 _REAL_MESSAGE_BUS_CMDLINE = _REAL_UWSGI + _REAL_FORK + b" --ini message_bus.ini" + _REAL_DEFAULT
 
 
-def _fake_process(root: Path, pid: str, cmdline: bytes, ticks: str = "700") -> None:
+_REAL_BVD_INI = b"brilliant_virtual_device_peripherals.ini"
+_REAL_FORK_SOCKET = b"fork_server_socket=/var/run/brilliant/fork_server.socket"
+_REAL_DEFAULT_INI = b"/data/switch-embedded//lib/process_management/process-default.ini"
+# The same vassal as a genuine NUL-separated argv vector (before uwsgi
+# rewrites its title).
+_BVD_VASSAL_ARGV = (
+    b"\0".join(
+        (
+            _REAL_UWSGI,
+            b"--set",
+            _REAL_FORK_SOCKET,
+            b"--ini",
+            _REAL_BVD_INI,
+            b"--include",
+            _REAL_DEFAULT_INI,
+        )
+    )
+    + b"\0"
+)
+
+
+def _fake_process(
+    root: Path,
+    pid: str,
+    cmdline: bytes,
+    ticks: str = "700",
+    *,
+    exe: str = _REAL_UWSGI.decode(),
+) -> None:
     process = root / pid
     process.mkdir()
     (process / "cmdline").write_bytes(cmdline)
+    (process / "exe").symlink_to(exe)
     suffix = "S " + " ".join(["0"] * 18 + [ticks])
     (process / "stat").write_text(f"{pid} (uwsgi) {suffix}\n", encoding="ascii")
 
@@ -476,6 +505,7 @@ def test_stock_host_identity_matches_the_real_rewritten_uwsgi_title(tmp_path: Pa
     vassal = tmp_path / "1457"
     vassal.mkdir()
     (vassal / "cmdline").write_bytes(_REAL_BVD_VASSAL_CMDLINE)
+    (vassal / "exe").symlink_to(_REAL_UWSGI.decode())
     (vassal / "stat").write_text(_REAL_BVD_VASSAL_STAT, encoding="ascii")
     _fake_process(tmp_path, "496", _REAL_EMPEROR_CMDLINE)
     _fake_process(tmp_path, "509", _REAL_MESSAGE_BUS_CMDLINE)
@@ -484,37 +514,93 @@ def test_stock_host_identity_matches_the_real_rewritten_uwsgi_title(tmp_path: Pa
         "4627",
         b"sh\0-c\0pgrep -f brilliant_virtual_device_peripherals; uwsgi"
         b" --ini brilliant_virtual_device_peripherals.ini\0",
+        exe="/bin/sh",
     )
-    _fake_process(tmp_path, "4630", b"pgrep\0-af\0brilliant_virtual_device_peripherals\0")
+    _fake_process(
+        tmp_path,
+        "4630",
+        b"pgrep\0-af\0brilliant_virtual_device_peripherals\0",
+        exe="/usr/bin/pgrep",
+    )
     (tmp_path / "self").mkdir()
 
     assert _stock_host_identity(tmp_path) == "1457:123807679"
 
 
-def test_stock_host_identity_accepts_an_unrewritten_argv_vector(tmp_path: Path) -> None:
-    _fake_process(
-        tmp_path,
-        "101",
-        _REAL_UWSGI + b"\0--ini\0brilliant_virtual_device_peripherals.ini\0",
-    )
+def test_stock_host_identity_accepts_the_same_vassal_as_a_genuine_argv(tmp_path: Path) -> None:
+    _fake_process(tmp_path, "101", _BVD_VASSAL_ARGV)
 
     assert _stock_host_identity(tmp_path) == "101:700"
 
 
+def _argv(*arguments: bytes) -> bytes:
+    return b"\0".join(arguments) + b"\0"
+
+
 @pytest.mark.parametrize(
-    "cmdline",
+    ("cmdline", "exe"),
     [
-        _REAL_BVD_VASSAL_CMDLINE.replace(
-            b"brilliant_virtual_device_peripherals.ini",
-            b"brilliant_virtual_device_peripherals_extra.ini",
+        # Review negatives: look-alike executable path (title and argv forms).
+        (b"/tmp/uwsgi --ini brilliant_virtual_device_peripherals.ini\0", "/tmp/uwsgi"),
+        (_argv(b"/tmp/uwsgi", b"--ini", _REAL_BVD_INI), "/tmp/uwsgi"),
+        # Review negative: the real message_bus vassal whose --set VALUE embeds
+        # the BVD ini text must not match across argument boundaries.
+        (
+            _argv(
+                _REAL_UWSGI,
+                b"--set",
+                b"comment=see --ini brilliant_virtual_device_peripherals.ini",
+                b"--ini",
+                b"message_bus.ini",
+                b"--include",
+                _REAL_DEFAULT_INI,
+            ),
+            _REAL_UWSGI.decode(),
         ),
-        _REAL_BVD_VASSAL_CMDLINE.replace(b"/uwsgi ", b"/python3 "),
-        _REAL_BVD_VASSAL_CMDLINE.replace(b"--ini ", b"--include "),
-        b"",
+        (
+            _REAL_MESSAGE_BUS_CMDLINE.replace(
+                b" --ini message_bus.ini",
+                b" --set comment=see --ini brilliant_virtual_device_peripherals.ini"
+                b" --ini message_bus.ini",
+            )
+            + b"\0",
+            _REAL_UWSGI.decode(),
+        ),
+        # Review negative: a command loading BOTH the BVD ini and another ini.
+        (
+            _REAL_BVD_VASSAL_CMDLINE.replace(b" \0", b" --ini message_bus.ini \0"),
+            _REAL_UWSGI.decode(),
+        ),
+        (_BVD_VASSAL_ARGV + _argv(b"--ini", b"message_bus.ini"), _REAL_UWSGI.decode()),
+        # A forged title on a different executable.
+        (_REAL_BVD_VASSAL_CMDLINE, "/tmp/uwsgi"),
+        (_REAL_BVD_VASSAL_CMDLINE, "/data/switch-embedded/env/bin/uwsgi (deleted)"),
+        # Earlier near misses.
+        (
+            _REAL_BVD_VASSAL_CMDLINE.replace(_REAL_BVD_INI, b"brilliant_virtual_device_x.ini"),
+            _REAL_UWSGI.decode(),
+        ),
+        (_REAL_BVD_VASSAL_CMDLINE.replace(b"--ini ", b"--include "), _REAL_UWSGI.decode()),
+        (_REAL_BVD_VASSAL_CMDLINE.replace(b"/bin/uwsgi ", b"/bin/uwsgi  "), _REAL_UWSGI.decode()),
+        (b"", _REAL_UWSGI.decode()),
+    ],
+    ids=[
+        "tmp-uwsgi-title",
+        "tmp-uwsgi-argv",
+        "ini-inside-set-value-argv",
+        "ini-inside-set-value-title",
+        "two-inis-title",
+        "two-inis-argv",
+        "forged-title-other-exe",
+        "deleted-exe",
+        "other-ini",
+        "ini-as-include",
+        "extra-space",
+        "empty",
     ],
 )
-def test_stock_host_identity_rejects_near_misses(tmp_path: Path, cmdline: bytes) -> None:
-    _fake_process(tmp_path, "101", cmdline)
+def test_stock_host_identity_rejects_look_alikes(tmp_path: Path, cmdline: bytes, exe: str) -> None:
+    _fake_process(tmp_path, "101", cmdline, exe=exe)
 
     assert _stock_host_identity(tmp_path) == ""
 

@@ -171,25 +171,38 @@ def _variable_value(raw: object) -> str:
     return value
 
 
-_STOCK_BVD_VASSAL_INI = b"brilliant_virtual_device_peripherals.ini"
+_STOCK_UWSGI_EXECUTABLE = "/data/switch-embedded/env/bin/uwsgi"
+# The exact stock BVD vassal argv observed on v26.10.21.1 (firmware-gated).
+_STOCK_BVD_VASSAL_ARGV: tuple[bytes, ...] = (
+    _STOCK_UWSGI_EXECUTABLE.encode(),
+    b"--set",
+    b"fork_server_socket=/var/run/brilliant/fork_server.socket",
+    b"--ini",
+    b"brilliant_virtual_device_peripherals.ini",
+    b"--include",
+    b"/data/switch-embedded//lib/process_management/process-default.ini",
+)
+# uwsgi rewrites its process title into this one space-joined argument (the
+# captured cmdline ends with a trailing space before the terminating NUL).
+_STOCK_BVD_VASSAL_TITLE = b" ".join(_STOCK_BVD_VASSAL_ARGV) + b" "
 
 
-def _is_stock_bvd_vassal(cmdline: bytes) -> bool:
-    """Match the stock BVD uwsgi vassal by its real /proc cmdline.
+def _is_stock_bvd_vassal(cmdline: bytes, executable: str) -> bool:
+    """Match only the exact stock BVD uwsgi vassal.
 
-    uwsgi rewrites its process title, so on panels ``cmdline`` is one
-    space-joined string (``/data/switch-embedded/env/bin/uwsgi --set ...
-    --ini brilliant_virtual_device_peripherals.ini --include ...``) rather
-    than a NUL-separated argv vector.  Tokenize both forms identically.
+    The executable must be the firmware's uwsgi by full path (``/proc/<pid>/exe``,
+    not a basename), and the cmdline must be either the exact genuine argv
+    vector (NUL boundaries preserved) or the exact captured rewritten title.
+    Look-alike paths, extra or conflicting ``--ini`` options, and BVD text
+    embedded inside another argument's value never match.
     """
 
-    tokens = cmdline.replace(b"\0", b" ").split()
-    if not tokens or Path(os.fsdecode(tokens[0])).name != "uwsgi":
+    if executable != _STOCK_UWSGI_EXECUTABLE or not cmdline.endswith(b"\0"):
         return False
-    return any(
-        tokens[index] == b"--ini" and tokens[index + 1] == _STOCK_BVD_VASSAL_INI
-        for index in range(1, len(tokens) - 1)
-    )
+    argv = tuple(cmdline[:-1].split(b"\0"))
+    if len(argv) == 1:
+        return argv[0] == _STOCK_BVD_VASSAL_TITLE
+    return argv == _STOCK_BVD_VASSAL_ARGV
 
 
 def _stock_host_identity(proc_root: Path = Path("/proc")) -> str:
@@ -204,7 +217,8 @@ def _stock_host_identity(proc_root: Path = Path("/proc")) -> str:
         if not entry.name.isdigit():
             continue
         try:
-            if not _is_stock_bvd_vassal((entry / "cmdline").read_bytes()):
+            cmdline = (entry / "cmdline").read_bytes()
+            if not _is_stock_bvd_vassal(cmdline, os.readlink(entry / "exe")):
                 continue
             process_stat = (entry / "stat").read_text(encoding="ascii")
             close_parenthesis = process_stat.rfind(")")
