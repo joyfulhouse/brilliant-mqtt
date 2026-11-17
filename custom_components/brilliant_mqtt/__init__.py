@@ -62,6 +62,7 @@ from .const import (
     MAX_REBOOT_JOURNAL_LINES,
     MIN_REBOOT_JOURNAL_LINES,
     PLATFORMS,
+    panel_device_identifier,
 )
 from .fleet_manager import (
     FleetManager,
@@ -79,6 +80,7 @@ from .migration_coordinator import (
     async_quiet_setup_succeeded,
     async_report_recovery_failure,
     async_update_migration_issue,
+    device_links,
     migration_fence,
     migration_removing,
 )
@@ -279,12 +281,24 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
                     {entity_entry.config_subentry_id},
                 )
 
+        # A panel's device records all carry its MQTT-discovery identifier: one
+        # shared device on HA <= 2026.9, and on 2026.10+ (single-owner devices) a
+        # twin owned by the MQTT entry next to the management twin owned by ours.
+        # Match the identifier so either record selects its panel, in addition to
+        # the record's own config entry/subentry ownership (fleet-wide devices).
+        panels_by_identifier: dict[tuple[str, str], dict[tuple[str, str], PanelManager]] = {}
+        for entry_id, entry in loaded.items():
+            for panel_id, manager in entry.runtime_data.panels.items():
+                identifier = panel_device_identifier(manager.panel)
+                panels_by_identifier.setdefault(identifier, {})[(entry_id, panel_id)] = manager
         device_registry = dr.async_get(hass)
         for device_id in referenced.referenced_devices:
             if (device_entry := device_registry.async_get(device_id)) is None:
                 continue
-            for entry_id, subentry_ids in device_entry.config_entries_subentries.items():
-                _add_entry(entry_id, set(subentry_ids))
+            for entry_id, subentry_ids in device_links(device_entry).items():
+                _add_entry(entry_id, subentry_ids)
+            for identifier in device_entry.identifiers:
+                selected_managers.update(panels_by_identifier.get(identifier, {}))
         return list(selected_managers.values())
 
     async def _apply_to_all(

@@ -30,7 +30,7 @@ import inspect
 import logging
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from types import MappingProxyType
-from typing import Any, cast
+from typing import Any, Protocol, cast
 from uuid import uuid4
 
 from homeassistant.components import mqtt
@@ -279,7 +279,14 @@ SINGLE_OWNER_DEVICES = (
 )
 
 
-def device_links(device: dr.DeviceEntry) -> dict[str, set[str | None]]:
+class _DeviceRecord(Protocol):
+    """A device registry record: a DeviceEntry, or on 2026.10+ also a ChildDeviceEntry."""
+
+    @property
+    def config_entries_subentries(self) -> dict[str, set[str | None]]: ...
+
+
+def device_links(device: _DeviceRecord) -> dict[str, set[str | None]]:
     """Return a device's config entry -> subentries ownership without deprecated reads."""
     if SINGLE_OWNER_DEVICES and not getattr(device, "is_composite_device", False):
         owner = getattr(device, "config_entry_id", None)

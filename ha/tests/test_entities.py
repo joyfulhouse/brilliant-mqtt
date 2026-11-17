@@ -13,11 +13,12 @@ import pytest
 from homeassistant.core import HomeAssistant, State
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
+from homeassistant.setup import async_setup_component
 from pytest_homeassistant_custom_component.common import (
     MockConfigEntry,
     async_fire_mqtt_message,
 )
-from pytest_homeassistant_custom_component.typing import MqttMockHAClient
+from pytest_homeassistant_custom_component.typing import MqttMockHAClient, WebSocketGenerator
 
 from custom_components.brilliant_mqtt import (
     binary_sensor as binary_sensor_platform,
@@ -44,6 +45,7 @@ from custom_components.brilliant_mqtt.const import (
     DEFAULT_VOICE_WAKE_WORD,
     DOMAIN,
     VOICE_WAKE_WORDS,
+    panel_device_identifier,
 )
 from custom_components.brilliant_mqtt.ha_control_protocol import (
     MAPPING_VERSION,
@@ -52,7 +54,12 @@ from custom_components.brilliant_mqtt.ha_control_protocol import (
     scene_result_topic,
 )
 from custom_components.brilliant_mqtt.manager import PanelManager
+from custom_components.brilliant_mqtt.migration_coordinator import (
+    SINGLE_OWNER_DEVICES,
+    device_links,
+)
 from tests.fakes import FakeShell
+from tests.registry_helpers import panel_device, panel_devices
 from tests.test_init import ENTRY_DATA
 
 HEALTH = "binary_sensor.brilliant_office_bridge_health"
@@ -299,26 +306,43 @@ async def test_entities_exist_and_reflect_manager_state(
     assert await hass.config_entries.async_unload(entry.entry_id)
 
 
+def _mqtt_discovery_device(hass: HomeAssistant, slug: str = "office") -> dr.DeviceEntry:
+    """Register the device the agent's MQTT discovery creates for a panel."""
+    mqtt_entry = hass.config_entries.async_entries("mqtt")[0]
+    return dr.async_get(hass).async_get_or_create(
+        config_entry_id=mqtt_entry.entry_id,
+        identifiers={panel_device_identifier(slug)},
+        name="Brilliant Office",
+    )
+
+
+def _management_device_id(hass: HomeAssistant, entity_id: str) -> str:
+    entity = er.async_get(hass).async_get(entity_id)
+    assert entity is not None and entity.device_id is not None
+    return entity.device_id
+
+
+@pytest.mark.skipif(SINGLE_OWNER_DEVICES, reason="shared-device registry is HA <= 2026.9")
 @pytest.mark.allow_lingering_timers
 async def test_entities_attach_to_the_mqtt_discovery_device(
     hass: HomeAssistant, mqtt_mock: MqttMockHAClient, fake_shell: FakeShell, payload_dir: Path
 ) -> None:
     # Simulate the device MQTT discovery already created for this panel.
     mqtt_entry = hass.config_entries.async_entries("mqtt")[0]
-    registry = dr.async_get(hass)
-    existing = registry.async_get_or_create(
-        config_entry_id=mqtt_entry.entry_id,
-        identifiers={("mqtt", "brilliant_panel_office")},
-        name="Brilliant Office",
-    )
+    existing = _mqtt_discovery_device(hass)
     entry = await _setup(hass)
-    merged = registry.async_get_device(identifiers={("mqtt", "brilliant_panel_office")})
-    assert merged is not None
-    assert merged.id == existing.id  # ONE device page: MQTT entities + management entities
+    # ONE device page: MQTT entities + management entities.
+    assert [device.id for device in panel_devices(hass, "office")] == [existing.id]
+    assert _management_device_id(hass, HEALTH) == existing.id
+    assert set(device_links(panel_device(hass, "office", entry.entry_id))) == {
+        mqtt_entry.entry_id,
+        entry.entry_id,
+    }
 
     assert await hass.config_entries.async_unload(entry.entry_id)
 
 
+@pytest.mark.skipif(SINGLE_OWNER_DEVICES, reason="shared-device registry is HA <= 2026.9")
 @pytest.mark.allow_lingering_timers
 async def test_entities_attach_when_discovery_arrives_after_entry(
     hass: HomeAssistant, mqtt_mock: MqttMockHAClient, fake_shell: FakeShell, payload_dir: Path
@@ -329,21 +353,64 @@ async def test_entities_attach_when_discovery_arrives_after_entry(
     discovery device sharing it — not split into two cards.
     """
     entry = await _setup(hass)
-    registry = dr.async_get(hass)
-    ours = registry.async_get_device(identifiers={("mqtt", "brilliant_panel_office")})
-    assert ours is not None  # our entity created the device under the mqtt identifier
+    ours = panel_device(hass, "office", entry.entry_id)
 
     # Now MQTT discovery for the panel arrives and claims the same identifier.
     mqtt_entry = hass.config_entries.async_entries("mqtt")[0]
-    discovered = registry.async_get_or_create(
-        config_entry_id=mqtt_entry.entry_id,
-        identifiers={("mqtt", "brilliant_panel_office")},
-        name="Brilliant Office",
-    )
+    discovered = _mqtt_discovery_device(hass)
     assert discovered.id == ours.id  # merged onto the same device, not a second one
     # And the device now carries BOTH config entries (ours + mqtt) on one page.
-    assert mqtt_entry.entry_id in discovered.config_entries
-    assert entry.entry_id in discovered.config_entries
+    assert set(device_links(discovered)) == {mqtt_entry.entry_id, entry.entry_id}
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.skipif(not SINGLE_OWNER_DEVICES, reason="single-owner devices are HA 2026.10+")
+@pytest.mark.parametrize("discovery_first", [True, False], ids=["discovery-first", "entry-first"])
+@pytest.mark.allow_lingering_timers
+async def test_entities_form_a_linked_twin_of_the_mqtt_discovery_device(
+    hass: HomeAssistant,
+    hass_ws_client: WebSocketGenerator,
+    mqtt_mock: MqttMockHAClient,
+    fake_shell: FakeShell,
+    payload_dir: Path,
+    caplog: pytest.LogCaptureFixture,
+    discovery_first: bool,
+) -> None:
+    """HA 2026.10+: a device has one owner, so management entities get a linked twin.
+
+    The twin is owned by our entry alone, the discovery device stays the MQTT entry's,
+    and HA's device page links the two through the shared panel identifier - in
+    either registration order, without any registry deprecation report.
+    """
+    assert await async_setup_component(hass, "config", {})
+    mqtt_entry = hass.config_entries.async_entries("mqtt")[0]
+    if discovery_first:
+        discovered = _mqtt_discovery_device(hass)
+        entry = await _setup(hass)
+    else:
+        entry = await _setup(hass)
+        discovered = _mqtt_discovery_device(hass)
+
+    ours = panel_device(hass, "office", entry.entry_id)
+    assert ours.id != discovered.id
+    assert device_links(ours) == {entry.entry_id: {None}}
+    assert device_links(panel_device(hass, "office", mqtt_entry.entry_id)) == {
+        mqtt_entry.entry_id: {None}
+    }
+    assert {device.id for device in panel_devices(hass, "office")} == {ours.id, discovered.id}
+    for entity_id in (HEALTH, REPAIR, REBOOT, UPDATE):
+        assert _management_device_id(hass, entity_id) == ours.id
+    assert ours.name == "Brilliant Office"
+
+    client = await hass_ws_client(hass)
+    await client.send_json_auto_id(
+        {"type": "config/device_registry/list_linked_devices", "device_id": discovered.id}
+    )
+    response = await client.receive_json()
+    assert response["success"], response
+    assert response["result"] == {"linked_devices": [ours.id]}
+    assert "deprecated" not in caplog.text
 
     assert await hass.config_entries.async_unload(entry.entry_id)
 
@@ -512,25 +579,23 @@ async def test_wake_word_select_option_calls_manager(
 async def test_voice_entities_attach_to_panel_device(
     hass: HomeAssistant, mqtt_mock: MqttMockHAClient, fake_shell: FakeShell, payload_dir: Path
 ) -> None:
-    """Voice switch and wake-word select attach to the panel's MQTT-discovery device."""
-    mqtt_entry = hass.config_entries.async_entries("mqtt")[0]
-    registry = dr.async_get(hass)
-    existing = registry.async_get_or_create(
-        config_entry_id=mqtt_entry.entry_id,
-        identifiers={("mqtt", "brilliant_panel_office")},
-        name="Brilliant Office",
-    )
-    await _setup(hass)
+    """Voice switch and wake-word select attach to the panel's management device.
 
-    # Both voice entities must be on the same merged device page.
+    That is the MQTT-discovery device itself on HA <= 2026.9, and its linked
+    single-owner twin on 2026.10+.
+    """
+    existing = _mqtt_discovery_device(hass)
+    entry = await _setup(hass)
+
     switch_state = hass.states.get(VOICE_SWITCH)
     select_state = hass.states.get(WAKE_WORD_SELECT)
     assert switch_state is not None
     assert select_state is not None
 
-    merged = registry.async_get_device(identifiers={("mqtt", "brilliant_panel_office")})
-    assert merged is not None
-    assert merged.id == existing.id
+    ours = panel_device(hass, "office", entry.entry_id)
+    assert _management_device_id(hass, VOICE_SWITCH) == ours.id
+    assert _management_device_id(hass, WAKE_WORD_SELECT) == ours.id
+    assert (ours.id == existing.id) is not SINGLE_OWNER_DEVICES
 
 
 @pytest.mark.allow_lingering_timers

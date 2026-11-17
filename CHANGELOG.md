@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Home Assistant 2026.10+ compatibility with the single-owner device registry
+  ("device split"). HA now keeps each panel's MQTT-discovery device and the
+  management entities' device as two linked records that share the
+  `("mqtt", "brilliant_panel_<slug>")` identifier. Panel actions (`repair`,
+  `redeploy`, `uninstall`, `reboot`, `canary_rollback`, `canary_finalize`)
+  targeting a panel device, or an area holding it, now resolve the panel from
+  either record. A pre-split device ID kept in an old automation still works.
+  Before this fix, targeting the MQTT-discovery record silently did nothing, and
+  canary recovery rejected it. Each panel runs once even when several of its records
+  are targeted. Target resolution also no longer reads the deprecated
+  `DeviceEntry.config_entries_subentries`, which logged a warning on every
+  device-targeted call. HA 2026.6–2026.9 behaviour is unchanged, and CI now
+  also runs the integration suite against HA 2026.10.4.
+
 ## [0.12.0] - 2026-11-16
 
 This release updates both the Home Assistant integration and the bundled
