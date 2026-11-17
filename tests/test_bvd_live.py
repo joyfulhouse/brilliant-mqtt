@@ -435,27 +435,90 @@ def test_live_module_has_no_direct_message_bus_api_import() -> None:
     assert "lib.message_bus_api" not in module_source
 
 
-def test_stock_host_identity_requires_exactly_one_matching_process(tmp_path: Path) -> None:
-    for pid, command, ticks in (
-        (
-            "101",
-            b"/usr/bin/uwsgi\0--ini\0"
-            b"/var/run/brilliant/startable_configs/brilliant_virtual_device_peripherals\0",
-            "700",
-        ),
-        (
-            "102",
-            b"pgrep\0-af\0brilliant_virtual_device_peripherals\0",
-            "800",
-        ),
-    ):
-        process = tmp_path / pid
-        process.mkdir()
-        (process / "cmdline").write_bytes(command)
-        suffix = "S " + " ".join(["0"] * 18 + [ticks])
-        (process / "stat").write_text(f"{pid} (process name) {suffix}\n", encoding="ascii")
+# Verbatim read-only captures from a v26.10.21.1 panel that was the natural BVD
+# owner.  uwsgi rewrites its process title, so /proc/<pid>/cmdline is ONE
+# space-joined argument (with a trailing space) rather than an argv vector.
+_REAL_UWSGI = b"/data/switch-embedded/env/bin/uwsgi"
+_REAL_FORK = b" --set fork_server_socket=/var/run/brilliant/fork_server.socket"
+_REAL_DEFAULT = b" --include /data/switch-embedded//lib/process_management/process-default.ini"
+_REAL_BVD_VASSAL_CMDLINE = (
+    _REAL_UWSGI + _REAL_FORK + b" --ini brilliant_virtual_device_peripherals.ini" + _REAL_DEFAULT
+) + b" \0"
+_REAL_BVD_VASSAL_STAT = (
+    "1457 (uwsgi) S 496 496 496 0 -1 4194624 14627 0 48 0 1877 109 0 0 11 -9 5 0 "
+    "123807679 114556928 13928 4294967295 5177344 5952108 2129243296 0 0 0 0 16781313 "
+    "17538 0 0 0 17 1 0 0 0 0 0 6021480 6069244 22118400 2129243575 2129243767 "
+    "2129243767 2129244120 0\n"
+)
+_REAL_EMPEROR_CMDLINE = (
+    _REAL_UWSGI
+    + _REAL_FORK
+    + b" --ini emperor.ini --emperor /var/run/brilliant/processes --emperor-throttle 100"
+    + b" --emperor-stats /var/run/brilliant/uwsgi_stats_socket --chmod-socket=777\0"
+)
+_REAL_MESSAGE_BUS_CMDLINE = _REAL_UWSGI + _REAL_FORK + b" --ini message_bus.ini" + _REAL_DEFAULT
+
+
+def _fake_process(root: Path, pid: str, cmdline: bytes, ticks: str = "700") -> None:
+    process = root / pid
+    process.mkdir()
+    (process / "cmdline").write_bytes(cmdline)
+    suffix = "S " + " ".join(["0"] * 18 + [ticks])
+    (process / "stat").write_text(f"{pid} (uwsgi) {suffix}\n", encoding="ascii")
+
+
+def test_stock_host_identity_matches_the_real_rewritten_uwsgi_title(tmp_path: Path) -> None:
+    vassal = tmp_path / "1457"
+    vassal.mkdir()
+    (vassal / "cmdline").write_bytes(_REAL_BVD_VASSAL_CMDLINE)
+    (vassal / "stat").write_text(_REAL_BVD_VASSAL_STAT, encoding="ascii")
+    _fake_process(tmp_path, "496", _REAL_EMPEROR_CMDLINE)
+    _fake_process(tmp_path, "509", _REAL_MESSAGE_BUS_CMDLINE)
+    _fake_process(
+        tmp_path,
+        "4627",
+        b"sh\0-c\0pgrep -f brilliant_virtual_device_peripherals; uwsgi"
+        b" --ini brilliant_virtual_device_peripherals.ini\0",
+    )
+    _fake_process(tmp_path, "4630", b"pgrep\0-af\0brilliant_virtual_device_peripherals\0")
+    (tmp_path / "self").mkdir()
+
+    assert _stock_host_identity(tmp_path) == "1457:123807679"
+
+
+def test_stock_host_identity_accepts_an_unrewritten_argv_vector(tmp_path: Path) -> None:
+    _fake_process(
+        tmp_path,
+        "101",
+        _REAL_UWSGI + b"\0--ini\0brilliant_virtual_device_peripherals.ini\0",
+    )
 
     assert _stock_host_identity(tmp_path) == "101:700"
+
+
+@pytest.mark.parametrize(
+    "cmdline",
+    [
+        _REAL_BVD_VASSAL_CMDLINE.replace(
+            b"brilliant_virtual_device_peripherals.ini",
+            b"brilliant_virtual_device_peripherals_extra.ini",
+        ),
+        _REAL_BVD_VASSAL_CMDLINE.replace(b"/uwsgi ", b"/python3 "),
+        _REAL_BVD_VASSAL_CMDLINE.replace(b"--ini ", b"--include "),
+        b"",
+    ],
+)
+def test_stock_host_identity_rejects_near_misses(tmp_path: Path, cmdline: bytes) -> None:
+    _fake_process(tmp_path, "101", cmdline)
+
+    assert _stock_host_identity(tmp_path) == ""
+
+
+def test_stock_host_identity_requires_exactly_one_matching_process(tmp_path: Path) -> None:
+    _fake_process(tmp_path, "101", _REAL_BVD_VASSAL_CMDLINE, "700")
+    _fake_process(tmp_path, "102", _REAL_BVD_VASSAL_CMDLINE, "800")
+
+    assert _stock_host_identity(tmp_path) == ""
 
 
 async def test_shutdown_components_are_sequential_and_continue_after_error() -> None:
