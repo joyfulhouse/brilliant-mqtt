@@ -32,6 +32,7 @@ from uuid import RFC_4122, UUID, uuid4
 import asyncssh
 
 from .agent_payload import bundle_manifest
+from .certificates import MAX_CERTIFICATE_CHAIN_BYTES
 from .const import (
     BUS_WATCHDOG_SERVICE_NAME,
     COMPONENT_BRIDGE,
@@ -568,7 +569,7 @@ _MANAGED_MQTT_CA_PATH = re.compile(
 )
 MAX_SNAPSHOT_FILE_BYTES = 16 * 1024
 MAX_SNAPSHOT_WIRE_BYTES = 24 * 1024
-MAX_MQTT_CA_BYTES = 256 * 1024
+MAX_MQTT_CA_BYTES = MAX_CERTIFICATE_CHAIN_BYTES
 _MAX_LAYOUT_WIRE_BYTES = 4096
 _MAX_VERSION_BYTES = 128
 _PANEL_PYTHON = "/data/switch-embedded/env/bin/python3"

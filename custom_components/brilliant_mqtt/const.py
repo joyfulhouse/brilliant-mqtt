@@ -142,6 +142,16 @@ def panel_device_name(slug: str) -> str:
     return f"Brilliant {display}"
 
 
+def panel_device_identifier(slug: str) -> tuple[str, str]:
+    """Device-registry identifier of a panel, as the agent's MQTT discovery publishes it.
+
+    The management entities claim the same identifier, so on HA <= 2026.9 they share
+    the discovery device and on 2026.10+ (single-owner devices) they form a linked
+    twin of it. Service targets resolve a panel from either record through it.
+    """
+    return ("mqtt", f"brilliant_panel_{slug}")
+
+
 def availability_topic(panel: str) -> str:
     """LWT availability topic published by the on-panel agent."""
     return f"brilliant/{panel}/availability"

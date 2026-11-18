@@ -232,7 +232,10 @@ async def _run_session(
         # hold state is keyed by peripheral_id and the two scopes never
         # overlap, so sharing is safe and keeps construction symmetric.
         deriver = (
-            MotionDeriver(settings.motion_derived_hold_s)
+            MotionDeriver(
+                settings.motion_derived_hold_s,
+                native_passthrough=settings.motion_native_passthrough,
+            )
             if settings.motion_derived_enabled
             else None
         )
@@ -264,6 +267,9 @@ async def _run_session(
             owned_topics=owned_topics,
             deployment_id=settings.deployment_id,
             diagnostics=diagnostics,
+            motion_native_passthrough=settings.motion_native_passthrough,
+            motion_default_high_threshold=settings.motion_default_high_threshold,
+            motion_default_low_threshold=settings.motion_default_low_threshold,
         )
 
         if participating:
@@ -292,6 +298,9 @@ async def _run_session(
                 reconcile_min_write_spacing_s=settings.motion_reconcile_min_write_spacing_s,
                 write_throttle=write_throttle,
                 owned_topics=None,
+                motion_native_passthrough=settings.motion_native_passthrough,
+                motion_default_high_threshold=settings.motion_default_high_threshold,
+                motion_default_low_threshold=settings.motion_default_low_threshold,
             )
             leader = MeshLeader(
                 mqtt,

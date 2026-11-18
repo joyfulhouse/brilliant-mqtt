@@ -83,6 +83,7 @@ def test_fleet_options_translate_every_reachable_surface() -> None:
             "offline_grace_minutes",
             "repair_cooldown_minutes",
         },
+        "hue_ca": {"hue_ca_cert"},
     }
     required_steps = {
         "init",
@@ -96,6 +97,7 @@ def test_fleet_options_translate_every_reachable_surface() -> None:
         "ha_control",
         "scenes",
         "fleet_defaults",
+        "hue_ca",
         "advanced",
         "mesh_priorities",
     }
@@ -108,6 +110,7 @@ def test_fleet_options_translate_every_reachable_surface() -> None:
         "ha_control",
         "scenes",
         "fleet_defaults",
+        "hue_ca",
         "advanced",
     }
     assert set(steps["broker"]["menu_options"]) == set(BROKER_MENU_OPTIONS)
@@ -148,6 +151,7 @@ def test_fleet_options_translate_every_reachable_failure() -> None:
         "broker_change_requires_guided_flow",
         "reconfigure_successful",
         "ha_control_change_requires_agent_rollout",
+        "fleet_hue_ca_change_requires_agent_rollout",
         "no_panels_configured",
         "mesh_priority_change_requires_agent_rollout",
     }
@@ -324,3 +328,14 @@ def test_fleet_broker_copy_keeps_external_brokers_first_class() -> None:
 def test_english_catalog_is_byte_identical_to_source_strings() -> None:
     """English cannot silently drift from the source translation catalog."""
     assert _EN_PATH.read_bytes() == _STRINGS_PATH.read_bytes()
+
+
+def test_missing_hue_ca_error_says_where_to_set_the_certificate() -> None:
+    """Enabling Hue CA recovery without a CA names both places to configure one."""
+    message = _strings()["exceptions"]["hue_ca_cert_missing"]["message"]
+
+    assert "{panel}" in message
+    folded = message.casefold()
+    assert "fleet" in folded
+    assert "diyhue ca certificate" in folded
+    assert "reconfigure" in folded

@@ -30,6 +30,7 @@ from .const import (
     CONF_HA_MIRROR_LABEL,
     CONF_HA_MIRROR_TOKEN,
     CONF_HOST,
+    CONF_HUE_CA_CERT,
     CONF_IDENTITY_FINGERPRINT,
     CONF_MAX_MIRRORED_ENTITIES,
     CONF_MESH_PRIORITY,
@@ -62,6 +63,8 @@ _TO_REDACT = {
     CONF_MQTT_USERNAME,
     CONF_MQTT_PASSWORD,
     CONF_MQTT_TLS_CA,
+    # Public trust material like the broker CA: reported as present, never by value.
+    CONF_HUE_CA_CERT,
     CONF_HA_MIRROR_TOKEN,
 }
 _SAFE_ENTRY_KEYS = {

@@ -21,11 +21,12 @@ from homeassistant.config_entries import SOURCE_IGNORE, ConfigSubentry
 from homeassistant.const import CONF_NAME
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.selector import TextSelector, TextSelectorType
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.brilliant_mqtt import _fleet_lock, config_flow
+from custom_components.brilliant_mqtt import _fleet_lock, config_flow, panel_ops
 from custom_components.brilliant_mqtt.broker import BrokerKind, BrokerProfile
 from custom_components.brilliant_mqtt.components import REGISTRY
 from custom_components.brilliant_mqtt.const import (
@@ -81,6 +82,7 @@ from custom_components.brilliant_mqtt.const import (
     OPT_AUTO_REPAIR,
     OPT_OFFLINE_GRACE_MINUTES,
     OPT_REPAIR_COOLDOWN_MINUTES,
+    PANEL_HUE_CA_CERT_FILE,
     SUBENTRY_TYPE_PANEL,
 )
 from custom_components.brilliant_mqtt.entry_data import (
@@ -88,6 +90,7 @@ from custom_components.brilliant_mqtt.entry_data import (
     FleetConfig,
     FleetPanelStore,
     PanelConfig,
+    effective_hue_ca_cert,
 )
 from custom_components.brilliant_mqtt.errors import OperationError, OperationStage
 from custom_components.brilliant_mqtt.fleet_manager import FleetManager
@@ -116,7 +119,15 @@ from custom_components.brilliant_mqtt.provisioning_journal import (
     ProvisioningJournal,
     RetainedRollback,
 )
-from custom_components.brilliant_mqtt.shell import HostIdentity, PanelIdentityError
+from custom_components.brilliant_mqtt.shell import HostIdentity, PanelIdentityError, RunResult
+from tests.cert_fixtures import (
+    ca_pem,
+    pem_block,
+    private_key_pem,
+    truncated_ca_pem,
+    unicode_whitespace_variants,
+)
+from tests.fakes import FakeShell
 
 _PUBLIC_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKIykuTed7zNwJwn20eCelcKcHKJ9c/pGFfvulRWazuC"
 _FINGERPRINT = "SHA256:JfCon51dCgE/yWGkyroh3Ne+ONLMm6QmHMQnEoPSLx0"
@@ -132,7 +143,7 @@ _TRANSACTION_ID = UUID("12345678-1234-4abc-8def-1234567890ab")
 _SETUP_ID = UUID("87654321-4321-4cba-8fed-ba0987654321")
 _BROKER_PASSWORD = "SECRET-mqtt-password"
 _ROOT_PASSWORD = "SECRET-root-password"
-_CA_PEM = "-----BEGIN CERTIFICATE-----\nPUBLIC-CA\n-----END CERTIFICATE-----"
+_CA_PEM = ca_pem("public-ca")
 
 _BROKER_INPUT: dict[str, object] = {
     CONF_MQTT_HOST: "mqtt.iot.example",
@@ -2624,6 +2635,7 @@ async def test_fleet_options_menu_is_owner_scoped_and_uses_native_add_panel_acti
         "ha_control",
         "scenes",
         "fleet_defaults",
+        "hue_ca",
         "advanced",
     )
     assert "add_panel" not in result["menu_options"]
@@ -3799,7 +3811,7 @@ async def test_panel_feature_overrides_are_allowlisted_and_preserve_resilience(
         stored,
         "overrides",
     )
-    certificate = "-----BEGIN CERTIFICATE-----\nPUBLIC-CA\n-----END CERTIFICATE-----"
+    certificate = ca_pem("public-ca")
 
     result = await hass.config_entries.subentries.async_configure(
         form["flow_id"],
@@ -5774,3 +5786,430 @@ async def test_ownerless_stuck_journal_refusals_do_not_offer_password(
     }
     inspect.assert_not_awaited()
     assert await ProvisioningJournal(hass).async_load() == record
+
+
+_FLEET_HUE_CA = ca_pem("fleet-hue")
+_ROTATED_HUE_CA = ca_pem("rotated-hue")
+
+
+def _set_panel_hue_ca(
+    hass: HomeAssistant,
+    entry: MockConfigEntry,
+    panel: ConfigSubentry,
+    *,
+    enabled: bool,
+    override: str | None,
+) -> ConfigSubentry:
+    stored = entry.subentries[panel.subentry_id]
+    hass.config_entries.async_update_subentry(
+        entry,
+        stored,
+        data={
+            **stored.data,
+            CONF_COMPONENTS: {**stored.data[CONF_COMPONENTS], COMPONENT_HUE_CA: enabled},
+            CONF_FEATURE_OVERRIDES: ({} if override is None else {CONF_HUE_CA_CERT: override}),
+        },
+    )
+    updated: ConfigSubentry = entry.subentries[panel.subentry_id]
+    return updated
+
+
+async def test_fleet_hue_ca_default_is_validated_and_saved_on_the_fleet(
+    hass: HomeAssistant,
+) -> None:
+    """The fleet Hue CA default accepts only a public chain and never touches panels."""
+    panel = _subentry()
+    entry = _fleet_entry(hass, panel)
+    original_panel = entry.subentries[panel.subentry_id].as_dict()
+    form = await _start_fleet_options_step(hass, entry, "hue_ca")
+
+    assert form["type"] is FlowResultType.FORM
+    assert form["step_id"] == "hue_ca"
+    rejected = await hass.config_entries.options.async_configure(
+        form["flow_id"],
+        {CONF_HUE_CA_CERT: "-----BEGIN PRIVATE KEY-----\nSECRET\n-----END PRIVATE KEY-----"},
+    )
+    assert rejected["type"] is FlowResultType.FORM
+    assert rejected["errors"] == {CONF_HUE_CA_CERT: "invalid_value"}
+    assert CONF_HUE_CA_CERT not in entry.data
+
+    result = await hass.config_entries.options.async_configure(
+        rejected["flow_id"],
+        {CONF_HUE_CA_CERT: _FLEET_HUE_CA},
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+    assert entry.data[CONF_HUE_CA_CERT] == _FLEET_HUE_CA
+    assert entry.subentries[panel.subentry_id].as_dict() == original_panel
+
+
+async def test_fleet_hue_ca_default_clears_to_absent(hass: HomeAssistant) -> None:
+    """A blank submission removes the fleet default rather than storing ""."""
+    entry = _fleet_entry(hass, _subentry())
+    hass.config_entries.async_update_entry(
+        entry, data={**entry.data, CONF_HUE_CA_CERT: _FLEET_HUE_CA}
+    )
+    form = await _start_fleet_options_step(hass, entry, "hue_ca")
+
+    result = await hass.config_entries.options.async_configure(
+        form["flow_id"],
+        {CONF_HUE_CA_CERT: ""},
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+    assert CONF_HUE_CA_CERT not in entry.data
+
+
+async def test_fleet_hue_ca_change_blocked_while_an_inheriting_panel_is_active(
+    hass: HomeAssistant,
+) -> None:
+    """Changing the CA an enabled hook actually uses needs disable/re-enable."""
+    panel = _subentry()
+    entry = _fleet_entry(hass, panel)
+    hass.config_entries.async_update_entry(
+        entry, data={**entry.data, CONF_HUE_CA_CERT: _FLEET_HUE_CA}
+    )
+    _set_panel_hue_ca(hass, entry, panel, enabled=True, override="")
+    original = dict(entry.data)
+    form = await _start_fleet_options_step(hass, entry, "hue_ca")
+
+    result = await hass.config_entries.options.async_configure(
+        form["flow_id"],
+        {CONF_HUE_CA_CERT: _ROTATED_HUE_CA},
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "fleet_hue_ca_change_requires_agent_rollout"
+    assert dict(entry.data) == original
+
+
+async def test_fleet_hue_ca_change_allowed_when_active_panels_keep_overrides(
+    hass: HomeAssistant,
+) -> None:
+    """Active panels with their own explicit CA are unaffected by the default."""
+    panel = _subentry()
+    entry = _fleet_entry(hass, panel)
+    _set_panel_hue_ca(hass, entry, panel, enabled=True, override=_CA_PEM)
+    form = await _start_fleet_options_step(hass, entry, "hue_ca")
+
+    result = await hass.config_entries.options.async_configure(
+        form["flow_id"],
+        {CONF_HUE_CA_CERT: _FLEET_HUE_CA},
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+    assert entry.data[CONF_HUE_CA_CERT] == _FLEET_HUE_CA
+
+
+async def test_active_hue_override_cleared_to_matching_fleet_default_is_allowed(
+    hass: HomeAssistant,
+) -> None:
+    """The overrides guard compares the effective CA, not the raw override."""
+    panel = _subentry()
+    entry = _fleet_entry(hass, panel)
+    hass.config_entries.async_update_entry(
+        entry, data={**entry.data, CONF_HUE_CA_CERT: _FLEET_HUE_CA}
+    )
+    stored = _set_panel_hue_ca(hass, entry, panel, enabled=True, override=_FLEET_HUE_CA)
+    form = await _start_panel_reconfigure_step(hass, entry, stored, "overrides")
+
+    result = await hass.config_entries.subentries.async_configure(
+        form["flow_id"],
+        {
+            CONF_VOICE_WAKE_WORD: DEFAULT_VOICE_WAKE_WORD,
+            CONF_VOICE_HA_HOST: "",
+            CONF_HUE_CA_CERT: "",
+        },
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+    overrides = entry.subentries[panel.subentry_id].data[CONF_FEATURE_OVERRIDES]
+    assert overrides[CONF_HUE_CA_CERT] == ""
+
+
+async def test_active_inheriting_panel_blocks_override_that_changes_effective_ca(
+    hass: HomeAssistant,
+) -> None:
+    """Setting a different override on an active inheriting panel is still guarded."""
+    panel = _subentry()
+    entry = _fleet_entry(hass, panel)
+    hass.config_entries.async_update_entry(
+        entry, data={**entry.data, CONF_HUE_CA_CERT: _FLEET_HUE_CA}
+    )
+    stored = _set_panel_hue_ca(hass, entry, panel, enabled=True, override=None)
+    original = dict(stored.data)
+    form = await _start_panel_reconfigure_step(hass, entry, stored, "overrides")
+
+    result = await hass.config_entries.subentries.async_configure(
+        form["flow_id"],
+        {
+            CONF_VOICE_WAKE_WORD: DEFAULT_VOICE_WAKE_WORD,
+            CONF_VOICE_HA_HOST: "",
+            CONF_HUE_CA_CERT: _CA_PEM,
+        },
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "feature_override_change_requires_agent_rollout"
+    assert dict(entry.subentries[panel.subentry_id].data) == original
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(
+            "-----BEGIN CERTIFICATE-----\nnot a certificate\n-----END CERTIFICATE-----",
+            id="framing-only",
+        ),
+        pytest.param(
+            "-----BEGIN CERTIFICATE-----\n@@@@####\n-----END CERTIFICATE-----\n",
+            id="invalid-base64",
+        ),
+        pytest.param(pem_block(b"not X.509 at all"), id="base64-non-x509"),
+        pytest.param(truncated_ca_pem("fleet-hue"), id="truncated"),
+        pytest.param(
+            ca_pem("fleet-hue") + private_key_pem("fleet-hue"),
+            id="certificate-plus-private-key",
+        ),
+        pytest.param(ca_pem("fleet-hue") + ca_pem("fleet-hue-intermediate"), id="chain"),
+        *(
+            pytest.param(value, id=variant)
+            for variant, value in unicode_whitespace_variants("fleet-hue").items()
+        ),
+    ],
+)
+async def test_fleet_hue_ca_form_rejects_non_x509_material(
+    hass: HomeAssistant,
+    value: str,
+) -> None:
+    """The fleet form decodes and parses every block, not just PEM framing."""
+    entry = _fleet_entry(hass, _subentry())
+    form = await _start_fleet_options_step(hass, entry, "hue_ca")
+
+    result = await hass.config_entries.options.async_configure(
+        form["flow_id"],
+        {CONF_HUE_CA_CERT: value},
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {CONF_HUE_CA_CERT: "invalid_value"}
+    assert CONF_HUE_CA_CERT not in entry.data
+
+
+# --------------------------------------------------------------------------
+# Hue CA concurrency: the stored fleet CA and the CA a panel actually receives
+# must agree once every operation has settled.
+# --------------------------------------------------------------------------
+
+
+class _PausingCaShell(FakeShell):
+    """Pause right after the Hue CA PEM lands on the panel."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.ca_uploaded = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def put_bytes(self, data: bytes, remote_path: str, mode: int) -> None:
+        await super().put_bytes(data, remote_path, mode)
+        if remote_path == PANEL_HUE_CA_CERT_FILE:
+            self.ca_uploaded.set()
+            await self.release.wait()
+
+
+def _uploaded_hue_ca(shell: FakeShell) -> bytes:
+    uploads = [data for path, data, _mode in shell.uploads if path == PANEL_HUE_CA_CERT_FILE]
+    assert len(uploads) == 1
+    return uploads[0]
+
+
+def _stored_effective_hue_ca(entry: MockConfigEntry, subentry_id: str) -> str:
+    """The CA the authoritative stored config says the panel uses."""
+    overrides = entry.subentries[subentry_id].data[CONF_FEATURE_OVERRIDES]
+    return effective_hue_ca_cert(overrides, str(entry.data.get(CONF_HUE_CA_CERT, "")))
+
+
+def _write_hue_units(payload_dir: Path) -> None:
+    (payload_dir / "brilliant-hue-ca.service").write_text("[Unit]\nDescription=hue-ca\n")
+    (payload_dir / "brilliant-hue-ca.timer").write_text("[Unit]\nDescription=hue-ca timer\n")
+
+
+def _fleet_hue_manager(
+    hass: HomeAssistant,
+    entry: MockConfigEntry,
+    panel: ConfigSubentry,
+) -> PanelManager:
+    """A panel runtime sharing the fleet-wide SSH/flow lock, as FleetManager wires it."""
+    store = FleetPanelStore(hass, entry, entry.subentries[panel.subentry_id])
+    return PanelManager(hass, store, FleetConfig.from_entry(entry), _fleet_lock(hass))
+
+
+async def test_fleet_hue_ca_change_waits_for_an_in_flight_hue_ca_enable(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """A fleet CA edit racing an enable cannot leave the panel on the old CA."""
+    _write_hue_units(payload_dir)
+    panel = _subentry()
+    entry = _fleet_entry(hass, panel)
+    hass.config_entries.async_update_entry(
+        entry, data={**entry.data, CONF_HUE_CA_CERT: _FLEET_HUE_CA}
+    )
+    manager = _fleet_hue_manager(hass, entry, panel)
+    form = await _start_fleet_options_step(hass, entry, "hue_ca")
+    shell = _PausingCaShell()
+
+    with patch.object(manager, "_shell", return_value=shell):
+        enable = asyncio.create_task(manager.async_install_component(COMPONENT_HUE_CA))
+        await asyncio.wait_for(shell.ca_uploaded.wait(), timeout=1)
+        edit = asyncio.create_task(
+            hass.config_entries.options.async_configure(
+                form["flow_id"],
+                {CONF_HUE_CA_CERT: _ROTATED_HUE_CA},
+            )
+        )
+        await asyncio.sleep(0)
+        shell.release.set()
+        await asyncio.wait_for(enable, timeout=1)
+        result = await asyncio.wait_for(edit, timeout=1)
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] in {
+        "parent_changed",
+        "fleet_hue_ca_change_requires_agent_rollout",
+    }
+    assert entry.subentries[panel.subentry_id].data[CONF_COMPONENTS][COMPONENT_HUE_CA] is True
+    assert (
+        _uploaded_hue_ca(shell).decode()
+        == _stored_effective_hue_ca(entry, panel.subentry_id).strip()
+    )
+
+
+async def test_hue_ca_enable_uses_the_stored_fleet_ca_before_runtime_reconcile(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """An enable right after a fleet CA change installs the stored, not cached, CA."""
+    _write_hue_units(payload_dir)
+    panel = _subentry()
+    entry = _fleet_entry(hass, panel)
+    hass.config_entries.async_update_entry(
+        entry, data={**entry.data, CONF_HUE_CA_CERT: _FLEET_HUE_CA}
+    )
+    # The runtime snapshot still holds the previous CA: reconciliation is pending.
+    manager = _fleet_hue_manager(hass, entry, panel)
+    form = await _start_fleet_options_step(hass, entry, "hue_ca")
+    changed = await hass.config_entries.options.async_configure(
+        form["flow_id"],
+        {CONF_HUE_CA_CERT: _ROTATED_HUE_CA},
+    )
+    assert changed["reason"] == "reconfigure_successful"
+    assert manager.fleet.hue_ca_cert == _FLEET_HUE_CA
+    shell = FakeShell()
+
+    with patch.object(manager, "_shell", return_value=shell):
+        await manager.async_install_component(COMPONENT_HUE_CA)
+
+    assert _uploaded_hue_ca(shell) == _ROTATED_HUE_CA.strip().encode()
+    assert (
+        _uploaded_hue_ca(shell).decode()
+        == _stored_effective_hue_ca(entry, panel.subentry_id).strip()
+    )
+
+
+async def test_hue_ca_enable_fails_when_the_stored_fleet_ca_was_cleared(
+    hass: HomeAssistant,
+) -> None:
+    """A cached CA never masks a fleet default that storage no longer has."""
+    panel = _subentry()
+    entry = _fleet_entry(hass, panel)
+    hass.config_entries.async_update_entry(
+        entry, data={**entry.data, CONF_HUE_CA_CERT: _FLEET_HUE_CA}
+    )
+    manager = _fleet_hue_manager(hass, entry, panel)
+    hass.config_entries.async_update_entry(
+        entry,
+        data={key: value for key, value in entry.data.items() if key != CONF_HUE_CA_CERT},
+    )
+    shell = FakeShell()
+
+    with (
+        patch.object(manager, "_shell", return_value=shell),
+        pytest.raises(HomeAssistantError) as raised,
+    ):
+        await manager.async_install_component(COMPONENT_HUE_CA)
+
+    assert raised.value.translation_key == "hue_ca_cert_missing"
+    assert shell.connect_count == 0
+
+
+async def test_hue_ca_ota_relay_uses_the_stored_fleet_ca_before_reconcile(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """A post-OTA redeploy writes the stored effective CA, not a stale snapshot."""
+    _write_hue_units(payload_dir)
+    panel = _subentry()
+    entry = _fleet_entry(hass, panel)
+    hass.config_entries.async_update_entry(
+        entry, data={**entry.data, CONF_HUE_CA_CERT: _FLEET_HUE_CA}
+    )
+    manager = _fleet_hue_manager(hass, entry, panel)
+    hass.config_entries.async_update_entry(
+        entry, data={**entry.data, CONF_HUE_CA_CERT: _ROTATED_HUE_CA}
+    )
+    shell = FakeShell(responses={panel_ops.HUE_CA_INSPECT_COMMAND: RunResult(0, "payload=0\n", "")})
+    await shell.connect()
+
+    async with _fleet_lock(hass):
+        assert await manager._relay_hue_ca(shell) is None
+
+    assert _uploaded_hue_ca(shell) == _ROTATED_HUE_CA.strip().encode()
+
+
+async def test_fleet_hue_ca_form_persists_the_canonical_pem(hass: HomeAssistant) -> None:
+    """A CRLF paste is stored (and later deployed) as canonical LF PEM."""
+    entry = _fleet_entry(hass, _subentry())
+    form = await _start_fleet_options_step(hass, entry, "hue_ca")
+
+    result = await hass.config_entries.options.async_configure(
+        form["flow_id"],
+        {CONF_HUE_CA_CERT: "\r\n" + _FLEET_HUE_CA.replace("\n", "\r\n")},
+    )
+
+    assert result["reason"] == "reconfigure_successful"
+    assert entry.data[CONF_HUE_CA_CERT] == _FLEET_HUE_CA
+
+
+@pytest.mark.parametrize(
+    "value",
+    list(unicode_whitespace_variants("panel-hue").values()),
+    ids=list(unicode_whitespace_variants("panel-hue")),
+)
+async def test_panel_hue_ca_override_rejects_unicode_whitespace(
+    hass: HomeAssistant,
+    value: str,
+) -> None:
+    """The per-panel override form applies the same strict, single-cert contract."""
+    panel = _subentry()
+    entry = _fleet_entry(hass, panel)
+    stored = entry.subentries[panel.subentry_id]
+    original = dict(stored.data)
+    form = await _start_panel_reconfigure_step(hass, entry, stored, "overrides")
+
+    result = await hass.config_entries.subentries.async_configure(
+        form["flow_id"],
+        {
+            CONF_VOICE_WAKE_WORD: DEFAULT_VOICE_WAKE_WORD,
+            CONF_VOICE_HA_HOST: "",
+            CONF_HUE_CA_CERT: value,
+        },
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {CONF_HUE_CA_CERT: "invalid_value"}
+    assert dict(entry.subentries[panel.subentry_id].data) == original

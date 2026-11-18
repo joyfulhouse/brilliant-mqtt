@@ -18,12 +18,12 @@ from brilliant_mqtt.ha_control_protocol import (
     stable_id,
     state_topic,
 )
+from tools.brilliant_bvd import single_light_pilot
 from tools.brilliant_bvd.single_light_pilot import (
     BVD_CONFIGURATION_PERIPHERAL_ID,
     BVD_DEVICE_ID,
     EXPECTED_BVD_PERIPHERAL_TYPES,
     EXPECTED_PROCESS_CONFIGS,
-    OFFICE_DEVICE_ID,
     TARGET_ENTITY_ID,
     BvdBus,
     BvdTopology,
@@ -51,6 +51,11 @@ from tools.brilliant_bvd.single_light_pilot import (
 
 NOW_MS = 1_800_000_000_000
 STABLE_ID = stable_id(TARGET_ENTITY_ID)
+# Synthetic 32-hex panel device IDs; real IDs stay in private operator records.
+OWNER_DEVICE_ID = "0a0a" + "0" * 24 + "a0a0"
+APPROVED_PEER_ID = "0b0b" + "0" * 24 + "b0b0"
+UNAPPROVED_DEVICE_ID = "0c0c" + "0" * 24 + "c0c0"
+APPROVED_OWNERS = frozenset({OWNER_DEVICE_ID, APPROVED_PEER_ID})
 
 
 def _fact(
@@ -75,12 +80,15 @@ def _fact(
 
 def _topology(
     *,
-    owner: str = OFFICE_DEVICE_ID,
+    panel: str = OWNER_DEVICE_ID,
+    owner: str | None = None,
     owner_timestamp_ms: int = NOW_MS - 1_000,
-    relay_device: str = OFFICE_DEVICE_ID,
+    relay_device: str | None = None,
     stock_host_running: bool = True,
     facts: tuple[PeripheralFact, ...] | None = None,
 ) -> BvdTopology:
+    owner = panel if owner is None else owner
+    relay_device = panel if relay_device is None else relay_device
     if facts is None:
         facts = tuple(
             _fact(
@@ -93,7 +101,7 @@ def _topology(
             for peripheral_id in EXPECTED_BVD_PERIPHERAL_TYPES
         )
     return BvdTopology(
-        owning_device_id=OFFICE_DEVICE_ID,
+        owning_device_id=panel,
         configuration_owner=owner,
         owner_timestamp_ms=owner_timestamp_ms,
         bvd_device_type=3,
@@ -109,17 +117,19 @@ def _config(**overrides: object) -> PilotConfig:
         "room_assignment_id": "backyard-room:1700000000000",
         "display_name": "HA Backyard Light Group Pilot",
         "active_runtime_s": 120,
+        "approved_owner_device_ids": APPROVED_OWNERS,
     }
     values.update(overrides)
     return PilotConfig(
         room_assignment_id=cast(str, values["room_assignment_id"]),
         display_name=cast(str, values["display_name"]),
         active_runtime_s=cast(int, values["active_runtime_s"]),
+        approved_owner_device_ids=cast(frozenset[str], values["approved_owner_device_ids"]),
     )
 
 
-def test_pilot_is_pinned_to_office_bvd_and_one_ha_entity() -> None:
-    assert OFFICE_DEVICE_ID == "017ff60733f100038e04fa0fbab29096"
+def test_pilot_is_pinned_to_one_ha_entity_but_no_fixed_panel() -> None:
+    assert not hasattr(single_light_pilot, "OFFICE_DEVICE_ID")
     assert BVD_DEVICE_ID == "brilliant_virtual_device"
     assert BVD_CONFIGURATION_PERIPHERAL_ID == "brilliant_virtual_device_configuration"
     assert TARGET_ENTITY_ID == "light.backyard_light_group"
@@ -127,6 +137,7 @@ def test_pilot_is_pinned_to_office_bvd_and_one_ha_entity() -> None:
         "room_assignment_id",
         "display_name",
         "active_runtime_s",
+        "approved_owner_device_ids",
     }
 
 
@@ -146,6 +157,14 @@ def test_stable_peripheral_id_is_derived_from_ha_control_stable_id() -> None:
         ({"active_runtime_s": 59}, "active runtime"),
         ({"active_runtime_s": 121}, "active runtime"),
         ({"active_runtime_s": True}, "active runtime"),
+        ({"approved_owner_device_ids": frozenset()}, "approved owner allowlist"),
+        ({"approved_owner_device_ids": [OWNER_DEVICE_ID]}, "approved owner allowlist"),
+        ({"approved_owner_device_ids": frozenset({"office"})}, "approved owner allowlist"),
+        (
+            {"approved_owner_device_ids": frozenset({OWNER_DEVICE_ID.upper()})},
+            "approved owner allowlist",
+        ),
+        ({"approved_owner_device_ids": frozenset({1})}, "approved owner allowlist"),
     ],
 )
 def test_config_rejects_unbounded_or_unsafe_values(
@@ -159,11 +178,28 @@ def test_preflight_accepts_fresh_natural_owner_and_exact_stock_host() -> None:
     validate_preflight(_config(), _topology(), now_ms=NOW_MS)
 
 
+def test_preflight_accepts_whichever_approved_panel_is_the_current_owner() -> None:
+    validate_preflight(_config(), _topology(panel=APPROVED_PEER_ID), now_ms=NOW_MS)
+
+
+def test_preflight_refuses_a_current_owner_outside_the_allowlist() -> None:
+    with pytest.raises(PilotGuardError, match="approved owner allowlist"):
+        validate_preflight(_config(), _topology(panel=UNAPPROVED_DEVICE_ID), now_ms=NOW_MS)
+    with pytest.raises(PilotGuardError, match="approved owner allowlist"):
+        validate_preflight(
+            _config(approved_owner_device_ids=frozenset({APPROVED_PEER_ID})),
+            _topology(),
+            now_ms=NOW_MS,
+        )
+
+
 @pytest.mark.parametrize(
     ("topology", "message"),
     [
-        (_topology(owner="another-panel"), "naturally elected owner"),
-        (_topology(relay_device="another-panel"), "relay"),
+        (_topology(owner=APPROVED_PEER_ID), "naturally elected BVD owner"),
+        (_topology(owner=UNAPPROVED_DEVICE_ID), "naturally elected BVD owner"),
+        (_topology(panel=""), "naturally elected BVD owner"),
+        (_topology(relay_device=APPROVED_PEER_ID), "relay is not the current owner"),
         (_topology(owner_timestamp_ms=NOW_MS - 30_001), "fresh"),
         (_topology(owner_timestamp_ms=NOW_MS + 5_001), "future"),
         (_topology(stock_host_running=False), "stock BVD host"),
@@ -193,7 +229,7 @@ def test_preflight_rejects_missing_extra_offline_or_wrong_type_peripheral() -> N
             configuration_id=(
                 None if item.peripheral_id == "remote_bridge" else BVD_CONFIGURATION_PERIPHERAL_ID
             ),
-            relay_device=(OFFICE_DEVICE_ID if item.peripheral_id == "remote_bridge" else None),
+            relay_device=(OWNER_DEVICE_ID if item.peripheral_id == "remote_bridge" else None),
         )
         for item in exact
     ]
@@ -294,6 +330,29 @@ def test_active_and_postflight_have_distinct_exact_topologies() -> None:
         validate_active_topology(baseline, baseline)
     with pytest.raises(PilotGuardError, match="postflight peripheral set"):
         validate_postflight(baseline, active)
+
+
+def test_owner_handoff_between_approved_panels_aborts_active_and_postflight() -> None:
+    baseline = _topology()
+    pilot = PeripheralFact(
+        peripheral_id_for_entity(TARGET_ENTITY_ID),
+        27,
+        1,
+        {"configuration_peripheral_id": BVD_CONFIGURATION_PERIPHERAL_ID},
+    )
+    moved = _topology(panel=APPROVED_PEER_ID, owner_timestamp_ms=NOW_MS + 1)
+    moved_active = _topology(
+        panel=APPROVED_PEER_ID,
+        owner_timestamp_ms=NOW_MS + 1,
+        facts=(*moved.peripherals, pilot),
+    )
+
+    with pytest.raises(PilotGuardError, match="owner changed during the pilot"):
+        validate_active_topology(baseline, moved_active)
+    with pytest.raises(PilotGuardError, match="owner changed during the pilot"):
+        validate_postflight(baseline, moved)
+    with pytest.raises(PilotGuardError, match="owner changed during the pilot"):
+        validate_postflight(baseline, _topology(owner=APPROVED_PEER_ID))
 
 
 def _manifest() -> str:
@@ -500,9 +559,72 @@ def test_state_decoder_rejects_boolean_protocol_versions() -> None:
         decode_state_payload(json.dumps(value), stable_id=STABLE_ID)
 
 
-def test_available_state_requires_authoritative_brightness() -> None:
+def test_available_on_state_requires_authoritative_brightness() -> None:
     with pytest.raises(PilotGuardError, match="authoritative brightness"):
         decode_state_payload(_state(brightness=None), stable_id=STABLE_ID)
+
+
+def _ha_off_state(*, sequence: int = 7, generated_at_ms: int = NOW_MS) -> str:
+    """An off light as HA publishes it: brightness is omitted, not zero.
+
+    HA reports ``brightness: None`` for an off light and the control-plane
+    manifest only forwards integer brightness, so the retained state carries
+    no ``brightness`` key at all (ha_control_manifest._supported_attributes).
+    """
+
+    value = cast(dict[str, object], json.loads(_state(sequence=sequence, state="off")))
+    value["generated_at_ms"] = generated_at_ms
+    value["attributes"] = {"supported_features": 32}
+    return json.dumps(value, separators=(",", ":"), sort_keys=True)
+
+
+def test_available_off_state_without_brightness_is_authoritative_off() -> None:
+    state = decode_state_payload(_ha_off_state(), stable_id=STABLE_ID)
+
+    assert state.available is True
+    assert state.on == 0
+    assert state.intensity is None
+
+
+def test_off_state_with_brightness_still_validates_its_range() -> None:
+    assert decode_state_payload(_state(state="off", brightness=0), stable_id=STABLE_ID).on == 0
+    with pytest.raises(PilotGuardError, match="brightness"):
+        decode_state_payload(_state(state="off", brightness=256), stable_id=STABLE_ID)
+
+
+async def test_initial_off_authority_without_brightness_admits_commands() -> None:
+    controller, publisher, sink = _controller()
+
+    assert await controller.handle_state_message(
+        state_topic(STABLE_ID), _ha_off_state(), retained=True
+    )
+    await controller.wait_for_state(0.01)
+
+    assert controller.authority_available is True
+    assert sink.updates == [{"on": 0}]
+    assert await controller.handle_panel_push("on", 0) is False
+    assert await controller.handle_panel_push("intensity", 500) is True
+    decoded = cast(dict[str, object], json.loads(publisher.publications[-1][1]))
+    assert decoded["kind"] == "set_brightness"
+    assert decoded["value"] == 128
+
+
+async def test_turn_off_echo_without_brightness_confirms_the_command() -> None:
+    controller, publisher, sink = _controller()
+    await controller.handle_state_message(state_topic(STABLE_ID), _state(), retained=True)
+    assert await controller.handle_panel_push("on", 0) is True
+
+    await controller.handle_state_message(
+        state_topic(STABLE_ID),
+        _ha_off_state(sequence=8, generated_at_ms=NOW_MS + 1),
+        retained=False,
+    )
+
+    assert controller.authority_available is True
+    assert controller.pending_command_age_ms(now_ms=NOW_MS) is None
+    assert sink.updates[-1] == {"on": 0}
+    assert await controller.handle_panel_push("on", 1) is True
+    assert json.loads(publisher.publications[-1][1])["kind"] == "turn_on"
 
 
 def test_build_command_payload_maps_on_off_and_brightness() -> None:
@@ -646,7 +768,7 @@ async def test_intensity_is_not_a_noop_while_authoritative_light_is_off() -> Non
     controller, publisher, _ = _controller()
     await controller.handle_state_message(
         state_topic(STABLE_ID),
-        _state(state="off", brightness=128),
+        _ha_off_state(),
         retained=True,
     )
 
@@ -815,7 +937,7 @@ async def test_unrelated_advancing_state_does_not_settle_in_flight_command() -> 
 
     await controller.handle_state_message(
         state_topic(STABLE_ID),
-        _state(sequence=9, generated_at_ms=NOW_MS + 2, state="off", brightness=129),
+        _ha_off_state(sequence=9, generated_at_ms=NOW_MS + 2),
         retained=False,
     )
     assert len(publisher.publications) == 2
@@ -832,7 +954,7 @@ async def test_same_coordinate_conflicting_state_is_rejected_even_after_fence() 
     with pytest.raises(PilotGuardError, match="conflicts"):
         await controller.handle_state_message(
             state_topic(STABLE_ID),
-            _state(state="off", brightness=128),
+            _ha_off_state(),
             retained=True,
         )
 
@@ -852,10 +974,10 @@ async def test_accepted_result_is_not_authority_and_waits_for_state_echo() -> No
 
     await controller.handle_state_message(
         state_topic(STABLE_ID),
-        _state(sequence=8, generated_at_ms=NOW_MS + 1, state="off", brightness=128),
+        _ha_off_state(sequence=8, generated_at_ms=NOW_MS + 1),
         retained=True,
     )
-    assert sink.updates[-1] == {"on": 0, "intensity": 502}
+    assert sink.updates[-1] == {"on": 0}
 
 
 async def test_canonical_v1_result_without_optional_diagnostics_is_accepted() -> None:

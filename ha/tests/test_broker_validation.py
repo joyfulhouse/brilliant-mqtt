@@ -43,6 +43,9 @@ from custom_components.brilliant_mqtt.setup_protocol import (
     SetupTopics,
 )
 from custom_components.brilliant_mqtt.shell import RunResult
+from tests.cert_fixtures import ca_pem
+
+_SECRET_CA = ca_pem("secret-ca-material")
 
 SETUP_ID = UUID("c0a80101-7c5e-4aca-8e21-0123456789ab")
 OTHER_SETUP_ID = UUID("d0a80101-7c5e-4aca-8e21-0123456789ab")
@@ -1957,7 +1960,7 @@ async def test_primary_and_cleanup_errors_expose_only_allowlisted_diagnostics(
         "SECRET-HOST.example.test",
         "SECRET-USERNAME",
         "SECRET-PASSWORD",
-        "SECRET-CA-MATERIAL",
+        _SECRET_CA.splitlines()[1],
         "SECRET-NONCE",
         "SECRET-RAW-DISCOVERY-ERROR",
         "SECRET-RAW-CLEANUP-ERROR",
@@ -1970,9 +1973,7 @@ async def test_primary_and_cleanup_errors_expose_only_allowlisted_diagnostics(
         tls_enabled=True,
         _username_value="SECRET-USERNAME",
         _password_value="SECRET-PASSWORD",
-        _ca_pem_value=(
-            "-----BEGIN CERTIFICATE-----\nSECRET-CA-MATERIAL\n-----END CERTIFICATE-----"
-        ),
+        _ca_pem_value=_SECRET_CA,
     )
     monkeypatch.setattr(
         "custom_components.brilliant_mqtt.broker_validation.secrets.token_urlsafe",
