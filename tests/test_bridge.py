@@ -658,10 +658,21 @@ class TestM10AuxCommands:
         bridge = Bridge(bus, mqtt, PANEL)
         await bridge.reconcile()
 
-        # screen_brightness max is 10 → 150 clamps to 10.
+        # screen_brightness max is 15 → 150 clamps to 15.
         await mqtt.inject(f"brilliant/{PANEL}/hardware_peripheral/set_screen_brightness", "150")
         assert bus.commands == [
-            ("device_hw", "hardware_peripheral", [VarSet("screen_brightness", "10")])
+            ("device_hw", "hardware_peripheral", [VarSet("screen_brightness", "15")])
+        ]
+
+    async def test_number_upper_range(self, hardware: BrilliantDevice) -> None:
+        bus = FakeBus([hardware])
+        mqtt = FakeMqtt()
+        bridge = Bridge(bus, mqtt, PANEL)
+        await bridge.reconcile()
+
+        await mqtt.inject(f"brilliant/{PANEL}/hardware_peripheral/set_screen_brightness", "15")
+        assert bus.commands == [
+            ("device_hw", "hardware_peripheral", [VarSet("screen_brightness", "15")])
         ]
 
     async def test_button_inject(self, ui_device: BrilliantDevice) -> None:
