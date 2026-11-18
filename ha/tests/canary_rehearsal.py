@@ -83,6 +83,9 @@ class RehearsalShell(FakeShell):
         )
 
     async def run(self, command: str) -> RunResult:
+        if "BRILLIANT_BROKER_REACH" in command:
+            self.commands.append(command)
+            return RunResult(0, "ok\n", "")
         process = await self.start(command)
         try:
             return await process.wait()

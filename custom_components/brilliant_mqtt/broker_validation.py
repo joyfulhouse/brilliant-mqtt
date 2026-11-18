@@ -27,6 +27,7 @@ from homeassistant.config_entries import SOURCE_IGNORE, ConfigEntryState
 from homeassistant.core import HomeAssistant
 
 from .broker import BrokerProfile, DeviceMqttClient, DeviceMqttMessage
+from .broker_host import format_broker_endpoint
 from .errors import OperationError, OperationStage, from_exception
 from .setup_protocol import (
     MAX_PREFLIGHT_REPORT_BYTES,
@@ -244,6 +245,7 @@ class BrokerValidator:
         if cleanup_control is not None:
             raise cleanup_control
         if isinstance(primary, OperationError):
+            primary = _annotate_broker_endpoint(primary, profile)
             if cleanup_failure:
                 raise primary.with_cleanup_error(_cleanup_error()) from None
             raise primary from None
@@ -301,6 +303,7 @@ class BrokerValidator:
         primary: BaseException | None = None
         settlement_failed = False
         settlement_control: BaseException | None = None
+        broker_endpoint = format_broker_endpoint(profile.host, profile.port)
         del profile
 
         try:
@@ -433,6 +436,10 @@ class BrokerValidator:
         if cleanup_control is not None:
             raise cleanup_control
         if mapped_primary is not None:
+            if mapped_primary.code in {"broker_connect_failed", "broker_timeout"}:
+                mapped_primary = mapped_primary.with_connect_context(
+                    broker_endpoint=broker_endpoint
+                )
             if settlement_failed or cleanup_failed:
                 mapped_primary = mapped_primary.with_cleanup_error(_cleanup_error())
             raise mapped_primary from None
@@ -1086,7 +1093,11 @@ def _panel_report_error(report: PreflightReport) -> OperationError:
         and report.error_code == "mqtt_authorization"
     ):
         code = "fleet_auth_failed"
-    elif report.failed_stage is PreflightStage.FLEET_AUTH and report.error_code == "mqtt_connect":
+    elif report.failed_stage is PreflightStage.FLEET_AUTH and report.error_code in {
+        "mqtt_connect",
+        "mqtt_dns",
+        "mqtt_refused",
+    }:
         code = "broker_connect_failed"
     elif (
         report.failed_stage is PreflightStage.FLEET_AUTH and report.error_code == "settings_invalid"
@@ -1094,6 +1105,14 @@ def _panel_report_error(report: PreflightReport) -> OperationError:
         code = "panel_settings_invalid"
 
     error = OperationError.for_code(stage, code)
+    cause = {
+        "mqtt_dns": "dns",
+        "mqtt_refused": "connection_refused",
+        "mqtt_timeout": "timeout",
+        "mqtt_connect": "connect",
+    }.get(report.error_code or "")
+    if cause is not None and error.code in {"broker_connect_failed", "broker_timeout"}:
+        error = error.with_connect_context(connect_cause=cause)
     if (
         report.failed_stage is not PreflightStage.CLEANUP
         and PreflightStage.CLEANUP not in report.completed_stages
@@ -1145,6 +1164,22 @@ async def _async_exit(
     context: AbstractAsyncContextManager[DeviceMqttClient],
 ) -> None:
     await context.__aexit__(None, None, None)
+
+
+def _annotate_broker_endpoint(error: OperationError, profile: BrokerProfile) -> OperationError:
+    """Record the broker the client tried without copying credentials."""
+    if error.code not in {
+        "broker_connect_failed",
+        "broker_timeout",
+        "broker_unavailable",
+        "broker_connection_rejected",
+    }:
+        return error
+    cause = error.connect_cause or ("timeout" if error.code == "broker_timeout" else "connect")
+    return error.with_connect_context(
+        broker_endpoint=format_broker_endpoint(profile.host, profile.port),
+        connect_cause=cause,
+    )
 
 
 def _cleanup_error() -> OperationError:

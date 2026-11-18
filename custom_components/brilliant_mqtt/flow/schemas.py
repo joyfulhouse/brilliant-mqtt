@@ -23,6 +23,7 @@ from homeassistant.helpers.selector import (
 )
 
 from ..broker import BrokerKind
+from ..broker_host import panel_unreachable_broker_host_reason
 from ..certificates import canonical_hue_ca_certificate, is_hue_ca_certificate
 from ..certificates import is_public_certificate_chain as _is_public_certificate_chain
 from ..components import optional
@@ -335,6 +336,8 @@ def normalize_broker_input(
     raw_host = user_input.get(CONF_MQTT_HOST)
     if not _valid_text(raw_host, maximum_bytes=_MAX_BROKER_HOST_BYTES):
         errors[CONF_MQTT_HOST] = "invalid_value"
+    elif isinstance(raw_host, str) and panel_unreachable_broker_host_reason(raw_host) is not None:
+        errors[CONF_MQTT_HOST] = "broker_host_not_panel_reachable"
     raw_username = user_input.get(CONF_MQTT_USERNAME)
     if not _valid_text(raw_username, maximum_bytes=_MAX_MQTT_USERNAME_BYTES):
         errors[CONF_MQTT_USERNAME] = "invalid_value"
@@ -1105,9 +1108,19 @@ def panel_ssh_credentials_schema() -> vol.Schema:
     )
 
 
+def broker_abort_idle_panel_flow_schema() -> vol.Schema:
+    """Require an explicit choice before aborting an idle Add panel flow."""
+    return vol.Schema({vol.Required("confirm_abort_idle_panel_flow", default=False): bool})
+
+
 def panel_finalize_retained_schema() -> vol.Schema:
     """Require an explicit choice before permanently removing retained recovery artifacts."""
     return vol.Schema({vol.Required("confirm_finalize", default=False): bool})
+
+
+def panel_discard_unactivated_schema() -> vol.Schema:
+    """Require an explicit choice before dropping an unactivated armed baseline."""
+    return vol.Schema({vol.Required("confirm_discard", default=False): bool})
 
 
 def panel_recover_journal_schema() -> vol.Schema:

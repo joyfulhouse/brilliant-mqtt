@@ -110,23 +110,77 @@ reuse Home Assistant's MQTT principal or its hidden generated credential.
 An empty fleet may accept a validated credential change. Once panels exist, a
 changed broker endpoint, TLS profile, or credential is deliberately deferred
 to a guided multi-panel operation; the integration refuses the edit rather
-than creating a mixed-broker fleet. Even on an empty fleet, an active Add panel
-flow, provisioning journal, recovery, or unreadable journal blocks a broker
-change so recoverable panel state cannot be orphaned. Finish or recover that
+than creating a mixed-broker fleet. Even on an empty fleet, a provisioning
+journal, an unreadable journal, or an Add panel flow blocks a broker change
+so recoverable panel state cannot be orphaned. Finish or recover that
 operation before retrying. Never put broker passwords in git or documentation.
 
+<a id="broker-host-for-panels"></a>
 <a id="broker_change_blocked_by_panel_onboarding"></a>
-### `broker_change_blocked_by_panel_onboarding`
+## Broker host for panels
 
-- **Cause:** A panel onboarding/recovery flow or its durable provisioning
-  journal is active, or Home Assistant could not prove that journal is empty.
-- **Check:** Finish or cancel the visible **Add Brilliant panel** flow, then
-  inspect any Brilliant MQTT fleet repair issue and Home Assistant storage
-  health.
-- **Fix:** Let the existing transaction commit or complete its verified
-  rollback. Repair unreadable Home Assistant storage before any broker edit.
-- **Retry:** Reopen the fleet's MQTT broker settings after no panel operation or
-  recovery issue remains. The blocked attempt changed no broker setting.
+Home Assistant can connect to an add-on broker by its internal name while a
+Brilliant panel on the LAN cannot. Use the Home Assistant host's LAN IP
+address, or a hostname that the panel's DNS can resolve. Do not enter:
+
+- `core-mosquitto` or other single-label `core-*` add-on names
+- names ending in `.local.hass.io`
+- `localhost` or any `127.x` / `::1` loopback address
+- `a0d7b954-*` add-on hostnames, or other hyphenated single-label add-on slugs
+
+Setup and options reject those hosts with `broker_host_not_panel_reachable`
+before a panel is changed. The broker host field describes the same rule.
+
+<a id="broker_connect_failed"></a>
+### `broker_connect_failed`
+
+- **Cause:** The panel, or Home Assistant during broker validation, could not
+  open a TCP connection. The message includes the `host:port` that was tried
+  and, when detectable, whether that was DNS resolution, connection refused,
+  or a generic connection failure. A timeout is reported as `broker_timeout`.
+- **Check:** Compare the host with a LAN address the panel can resolve. A
+  successful Home Assistant connection does not prove the panel can use the
+  same name.
+- **Fix:** Enter the LAN IP or a LAN-resolvable hostname, then retry. A
+  reachability failure before activation does not leave an armed rollback
+  baseline. If a later preflight still fails before activation, the integration
+  discards an unactivated baseline only after proving the panel is unchanged.
+- **Retry:** Correct the host and run Add panel again.
+
+<a id="broker_change_blocked_by_active_journal"></a>
+### `broker_change_blocked_by_active_journal`
+
+- **Cause:** A provisioning journal is still stored. Nothing was changed.
+- **Check:** Finish or recover Add Brilliant panel. Diagnostics show the
+  journal phase and last error.
+- **Fix:** Let the transaction commit or complete its verified rollback. Do
+  not delete the journal by hand.
+- **Retry:** Open the broker settings again after the journal is empty.
+
+<a id="broker_change_blocked_by_journal_read_error"></a>
+### `broker_change_blocked_by_journal_read_error`
+
+- **Cause:** Home Assistant could not read the provisioning journal, so the
+  integration cannot prove it is empty. Nothing was changed.
+- **Check:** Home Assistant storage health and any Brilliant MQTT repair issue.
+- **Fix:** Restore storage, then reload the integration. Do not change the
+  broker until the journal can be read.
+- **Retry:** Open the broker settings again after the journal loads.
+
+<a id="broker_change_blocked_by_add_panel_flow"></a>
+### `broker_change_blocked_by_add_panel_flow`
+
+- **Cause:** An Add panel flow is still registered. If it has not started
+  provisioning, broker settings offer to abort that idle flow and continue.
+  A flow that has started provisioning is not aborted. Closing the dialog does
+  not remove the flow; an idle naming or confirm step expires after 15 minutes.
+- **Check:** Look for an open Add Brilliant panel dialog. If the dialog is
+  gone but the error remains, the backend flow is still registered.
+- **Fix:** Finish the flow, confirm the idle-flow prompt in broker settings,
+  or wait for the idle timeout. Do not abort a flow that is already staging
+  or activating a panel. A core restart also clears a stuck flow.
+- **Retry:** Save the broker change after no provisioning flow remains. The
+  blocked attempt changed no broker setting.
 
 <a id="mqtt-broker-acl"></a>
 ## Broker ACL

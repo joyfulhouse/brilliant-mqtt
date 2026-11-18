@@ -1747,6 +1747,7 @@ async def test_ownerless_finalize_settles_cancel_and_requires_fresh_retry_after_
     entry = _fleet_entry(hass)
     retry = await _start_subentry_confirm(hass, entry, identity=identity)
     assert retry["step_id"] == "panel_confirm"
+    hass.config_entries.subentries.async_abort(retry["flow_id"])
 
 
 @pytest.mark.parametrize("mutation", ["active", "owner", "changed", "unverified", "update"])
