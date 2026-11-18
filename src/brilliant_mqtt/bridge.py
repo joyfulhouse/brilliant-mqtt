@@ -28,7 +28,12 @@ from brilliant_mqtt.discovery import (
     meta_topic,
     state_topic,
 )
-from brilliant_mqtt.mapping import EntityDescriptor, entities_for, payload_fields
+from brilliant_mqtt.mapping import (
+    EntityDescriptor,
+    entities_for,
+    has_calibrated_motion_thresholds,
+    payload_fields,
+)
 from brilliant_mqtt.model import BrilliantDevice, CaptureProvenance, DeviceKind, Variable
 from brilliant_mqtt.motion_derive import MotionDeriver
 from brilliant_mqtt.protocols import BusClient, MqttClient
@@ -217,12 +222,18 @@ class Bridge:
         owned_topics: RetainedTopicLedger | None = None,
         deployment_id: str | None = None,
         diagnostics: ResponseDiagnostics | None = None,
+        motion_native_passthrough: bool = False,
+        motion_default_high_threshold: int | None = None,
+        motion_default_low_threshold: int | None = None,
     ) -> None:
         self._bus = bus
         self._mqtt = mqtt
         self._panel = panel
         self._deployment_id = deployment_id
         self._diagnostics = diagnostics
+        self._motion_native_passthrough = motion_native_passthrough
+        self._motion_default_high_threshold = motion_default_high_threshold
+        self._motion_default_low_threshold = motion_default_low_threshold
         # Scope filter keyed by bus DEVICE ID; None means everything (the
         # single-bridge default). The mesh milestone runs TWO Bridge instances
         # on the SAME bus in one process — the panel bridge excludes "ble_mesh",
@@ -319,6 +330,12 @@ class Bridge:
     def _derived(self, device: BrilliantDevice) -> BrilliantDevice:
         """Apply score-derived motion to *device* (identity when disabled)."""
         return device if self._deriver is None else self._deriver.apply(device)
+
+    def _payload_fields(self, device: BrilliantDevice) -> dict[str, object]:
+        """Render payload fields with this bridge's motion passthrough configuration."""
+        if self._motion_native_passthrough:
+            return payload_fields(device, native_motion_passthrough=True)
+        return payload_fields(device)
 
     @staticmethod
     def _same_binding(previous: BrilliantDevice, device: BrilliantDevice) -> bool:
@@ -508,7 +525,7 @@ class Bridge:
             # the device contributes any payload fields. Forced: reconcile is
             # the level-triggered repair pass, so it republishes even when the
             # payload is unchanged (and re-primes the diff cache).
-            fields = payload_fields(device)
+            fields = self._payload_fields(device)
             if fields:
                 await self._publish_state(device, fields, force=True)
                 if not self._feedback_alive(lifecycle):
@@ -660,13 +677,35 @@ class Bridge:
             observed = self._derived(device)
             device = self._remember_native_observation(observed)
             self._observe_mesh_pending(device)
-            fields = payload_fields(device)
+            fields = self._payload_fields(device)
             if fields:
                 await self._publish_state(device, fields, force=False)
                 if not self._feedback_alive(lifecycle):
                     return
         if self._feedback_alive(lifecycle):
             await self._enforce_desired(devices)
+
+    def _motion_default_wants(self, device: BrilliantDevice) -> dict[str, str]:
+        """Config-driven motion defaults for *device*, overlaid under recorded intent.
+
+        Never persisted: they are configuration, not user intent, so unsetting
+        the env vars stops asserting them. Scoring is only turned off on a switch
+        whose observed thresholds are already calibrated — an uncalibrated switch
+        with scoring off would have its motion gated off for good.
+        """
+        defaults: dict[str, str] = {}
+        variables = device.variables
+        if self._motion_default_high_threshold is not None and "motion_high_threshold" in variables:
+            defaults["motion_high_threshold"] = str(self._motion_default_high_threshold)
+        if self._motion_default_low_threshold is not None and "motion_low_threshold" in variables:
+            defaults["motion_low_threshold"] = str(self._motion_default_low_threshold)
+        if (
+            self._motion_native_passthrough
+            and "enable_motion_score" in variables
+            and has_calibrated_motion_thresholds(device)
+        ):
+            defaults["enable_motion_score"] = "0"
+        return defaults
 
     async def _enforce_desired(self, devices: list[BrilliantDevice]) -> None:
         """Re-assert drifted reconciled vars (firmware reverts the enable flags).
@@ -686,7 +725,10 @@ class Bridge:
                 return
             if not self._included(device):
                 continue
-            wanted = self._desired.wanted(device.peripheral_id)
+            wanted = {
+                **self._motion_default_wants(device),
+                **self._desired.wanted(device.peripheral_id),
+            }
             if not wanted:
                 continue
             drifted: list[VarSet] = []
@@ -1070,7 +1112,7 @@ class Bridge:
         device = self._remember_native_observation(observed)
         self._observe_mesh_pending(device)
 
-        fields = payload_fields(device)
+        fields = self._payload_fields(device)
         if fields:
             await self._publish_state(device, fields, force=False)
 
@@ -1549,7 +1591,7 @@ class Bridge:
         device = self._devices.get(peripheral_id)
         if device is None:
             return
-        fields = payload_fields(device)
+        fields = self._payload_fields(device)
         if fields:
             await self._publish_state(device, fields, force=force)
 
@@ -1624,6 +1666,6 @@ class Bridge:
         updated = replace(device, variables=new_vars)
         self._remember_device(updated)
 
-        fields = payload_fields(updated)
+        fields = self._payload_fields(updated)
         if fields:
             await self._publish_state(updated, fields, force=False)

@@ -197,7 +197,8 @@
       "already_configured": "A Brilliant MQTT fleet is already configured.",
       "legacy_migration_required": "Legacy Brilliant panel entries already exist. Migrate or remove them before creating the singleton fleet.",
       "invalid_flow_state": "The setup state changed unexpectedly. Start Brilliant MQTT setup again.",
-      "reconfigure_not_supported": "Fleet broker settings are managed through the fleet onboarding workflow; legacy panel reconfiguration is not available for this entry."
+      "reconfigure_not_supported": "Fleet broker settings are managed through the fleet onboarding workflow; legacy panel reconfiguration is not available for this entry.",
+      "migration_in_progress": "A Brilliant legacy-to-fleet migration is running or awaiting recovery. Try again once it has finished (see the Brilliant MQTT repair issues)."
     }
   },
   "config_subentries": {
@@ -298,7 +299,7 @@
           "data_description": {
             "voice_wake_word": "Wake word used on the next Voice satellite install. If Voice is active, use the panel's Wake word selector instead.",
             "voice_ha_host": "Optional hostname=IP mapping for a panel that cannot resolve the Home Assistant hostname. Disable Voice before changing this active value; leave blank to use panel DNS.",
-            "hue_ca_cert": "Optional public PEM certificate chain for diyHue CA recovery. Disable Hue CA recovery before changing its active certificate. Never paste a private key.",
+            "hue_ca_cert": "Optional single public PEM X.509 certificate (the diyHue CA) for diyHue CA recovery. Leave blank to inherit the fleet diyHue CA certificate (Brilliant MQTT settings > diyHue CA certificate). Disable Hue CA recovery before changing its active certificate. Never paste a private key.",
             "hot_poll_seconds": "Optional agent state-poll cadence from 0 to 60 seconds. Use 0 to disable polling; leave blank to use the agent default.",
             "resync_seconds": "Optional full discovery and state resync cadence from 60 to 86400 seconds. Leave blank to use the agent default."
           }
@@ -451,7 +452,8 @@
         "rebind_identity_changed": "The replacement SSH identity changed after confirmation. Nothing was accepted. Verify the address and start Replace physical panel again to review the current fingerprint.",
         "cannot_connect": "The replacement stopped answering during the final SSH identity check. Nothing was accepted. Verify its address, network access, and SSH service, then restart Replace physical panel.",
         "rebind_failed": "The replacement panel could not be bound safely. Nothing was accepted unless Home Assistant shows a fleet storage repair issue; resolve any such issue before retrying.",
-        "release_unchanged": "The selected installed code already matches. No staging, configuration or code selection changes were made."
+        "release_unchanged": "The selected installed code already matches. No staging, configuration or code selection changes were made.",
+        "migration_in_progress": "A Brilliant legacy-to-fleet migration is running or awaiting recovery. Try again once it has finished (see the Brilliant MQTT repair issues)."
       }
     }
   },
@@ -465,6 +467,7 @@
           "ha_control": "Home Assistant control",
           "scenes": "Scenes and modes",
           "fleet_defaults": "Fleet repair defaults",
+          "hue_ca": "diyHue CA certificate",
           "advanced": "Advanced"
         },
         "data": {
@@ -574,6 +577,16 @@
           "repair_cooldown_minutes": "Wait from 5 through 1440 minutes between automatic repair attempts."
         }
       },
+      "hue_ca": {
+        "title": "Fleet diyHue CA certificate",
+        "description": "Set the diyHue CA certificate inherited by every panel without its own per-panel override, including panels added later. Hue CA recovery uses it when enabled. A panel's explicit override (panel Reconfigure > Edit feature overrides & advanced settings) still wins. To rotate a certificate that an enabled panel inherits, disable Hue CA recovery on that panel first, change it here, then enable it again.",
+        "data": {
+          "hue_ca_cert": "diyHue CA certificate (PEM)"
+        },
+        "data_description": {
+          "hue_ca_cert": "A single public PEM X.509 certificate: the diyHue bridge CA. Leave blank to remove the fleet default. Never paste a private key."
+        }
+      },
       "advanced": {
         "title": "Advanced fleet operations",
         "description": "These operations can affect panel-wide behavior and require extra safety checks.",
@@ -620,8 +633,10 @@
       "broker_change_blocked_by_panel_onboarding": "A panel onboarding or recovery transaction is active or could not be read safely. Nothing was changed. Finish or recover Add Brilliant panel, then retry the broker update.",
       "reconfigure_successful": "The Brilliant MQTT fleet settings were updated successfully.",
       "ha_control_change_requires_agent_rollout": "Changing whether Home Assistant control is enabled also changes on-panel agent configuration. Nothing was changed. Check the guided agent rollout documentation.",
+      "fleet_hue_ca_change_requires_agent_rollout": "A panel with Hue CA recovery enabled uses the fleet diyHue CA certificate. Nothing was changed. Disable Hue CA recovery on the affected panels, change the fleet certificate, then enable it again.",
       "no_panels_configured": "Add at least one Brilliant panel before choosing a default scene panel.",
-      "mesh_priority_change_requires_agent_rollout": "Changing mesh priorities requires a journaled on-panel agent rollout. Nothing was changed. Check the advanced rollout documentation."
+      "mesh_priority_change_requires_agent_rollout": "Changing mesh priorities requires a journaled on-panel agent rollout. Nothing was changed. Check the advanced rollout documentation.",
+      "migration_in_progress": "A Brilliant legacy-to-fleet migration is running or awaiting recovery. Try again once it has finished (see the Brilliant MQTT repair issues)."
     }
   },
   "services": {
@@ -657,7 +672,7 @@
       "fields": {
         "panel": {
           "name": "Panel",
-          "description": "Attached panel slug. Omit it to use the configured scene panel."
+          "description": "Attached panel slug. Optional with a target, which must then name the same single panel; omit both to use the configured scene panel."
         },
         "scene_id": {
           "name": "Scene ID",
@@ -671,11 +686,21 @@
       "fields": {
         "panel": {
           "name": "Panel",
-          "description": "Attached panel slug. Omit it to use the configured scene panel."
+          "description": "Attached panel slug. Optional with a target, which must then name the same single panel; omit both to use the configured scene panel."
         },
         "mode_id": {
           "name": "Mode ID",
           "description": "Stable mode ID from the selected panel's current catalog."
+        }
+      }
+    },
+    "migrate_to_fleet": {
+      "name": "Migrate legacy panels to the fleet",
+      "description": "Consolidate every legacy per-panel Brilliant entry into one fleet entry with one panel subentry each, preserving every entity, device, and MQTT identity. Panels are never contacted. Dry run (the default) only reports the plan or its conflicts.",
+      "fields": {
+        "dry_run": {
+          "name": "Dry run",
+          "description": "Only report the migration plan or the conflicts that block it; change nothing. Turn off to migrate."
         }
       }
     }
@@ -761,6 +786,9 @@
     "hue_ca_failed": {
       "message": "Hue CA recovery operation failed: {error}"
     },
+    "hue_ca_cert_missing": {
+      "message": "Hue CA recovery cannot be enabled on panel `{panel}`: no valid diyHue CA certificate (a single public PEM X.509 certificate) is configured. Set the fleet default in the Brilliant MQTT integration's settings (Configure > diyHue CA certificate), or a per-panel certificate in the panel's Reconfigure > Edit feature overrides & advanced settings, then enable it again."
+    },
     "ha_mirror_failed": {
       "message": "HA mirror operation failed: {error}"
     }
@@ -777,6 +805,22 @@
     "ha_mirror_retired": {
       "title": "Legacy Brilliant HA mirror disabled",
       "description": "Panel `{panel}` still has legacy HA mirror state. {reason}. The integration will keep retrying safe removal during panel management; legacy credentials are retained until absence is verified."
+    },
+    "legacy_migration_available": {
+      "title": "Brilliant legacy panels can be consolidated",
+      "description": "{count} legacy per-panel Brilliant entries can be consolidated into one fleet entry, which is required to add new panels. Run the `brilliant_mqtt.migrate_to_fleet` action with dry run enabled to review the plan and any conflicts, resolve them in each panel's Reconfigure dialog, then run it again with dry run disabled."
+    },
+    "migration_recovery_failed": {
+      "title": "Brilliant fleet migration needs attention",
+      "description": "An interrupted Brilliant legacy-to-fleet migration could not be settled automatically (`{code}`). Brilliant entries stay stopped so legacy and fleet panels never run side by side, and the original configuration is kept in the private migration journal. Restart Home Assistant to retry recovery, or run the `brilliant_mqtt.migrate_to_fleet` action with dry run disabled to resume it."
+    },
+    "migration_reverted_not_loaded": {
+      "title": "Brilliant legacy panels restored but not running",
+      "description": "A Brilliant legacy-to-fleet migration was reversed and the original configuration restored, but {count} legacy panel entries did not start again. Check the MQTT connection and each entry's state, then reload them or restart Home Assistant."
+    },
+    "migration_quiet_state_unwritable": {
+      "title": "Brilliant restored panels stay in quiet mode",
+      "description": "Home Assistant cannot read or update `.storage/brilliant_mqtt.migration_quiet`, which records Brilliant legacy entries restored by a migration that must start without contacting their panel. Until it can, those entries keep starting quietly and their one-time legacy HA-mirror retirement audit stays deferred. Check the storage directory's permissions and free space, then restart Home Assistant."
     }
   }
 }

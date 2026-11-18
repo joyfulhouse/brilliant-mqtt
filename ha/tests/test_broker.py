@@ -25,12 +25,25 @@ from custom_components.brilliant_mqtt.broker import (
     DeviceMqttMessage,
 )
 from custom_components.brilliant_mqtt.errors import OperationError, OperationStage
+from tests.cert_fixtures import ca_pem, pem_block, private_key_pem, truncated_ca_pem
 
 PASSWORD = " password-secret "
 USERNAME = " username-secret "
-CA_PEM = """-----BEGIN CERTIFICATE-----
-CA-PEM-SECRET
------END CERTIFICATE-----"""
+CA_PEM = ca_pem("broker-ca")
+# A real certificate chain persisted by an earlier release (committed bytes, not
+# regenerated), so stored broker CAs from before the strict validator keep loading.
+_PREVIOUSLY_STORED_CA = """-----BEGIN CERTIFICATE-----
+MIIBfTCCASOgAwIBAgIUdPxf3XpyWhlomBsnOw4v6PnRbEwwCgYIKoZIzj0EAwIw
+FDESMBAGA1UEAwwJY2EtYS10ZXN0MB4XDTI2MDcxODIzMDQyMFoXDTM2MDcxNTIz
+MDQyMFowFDESMBAGA1UEAwwJY2EtYS10ZXN0MFkwEwYHKoZIzj0CAQYIKoZIzj0D
+AQcDQgAELbHkjdm57Utb7nuP+u68qOg+5DtLm3J3BkkLthx4TSYFkD02O8STczCH
+/eykkJrKVd90Zn4NlnnwPHh1TqXBKaNTMFEwHQYDVR0OBBYEFHI1jyb/yVM80rJa
+pCrwjLltX/JzMB8GA1UdIwQYMBaAFHI1jyb/yVM80rJapCrwjLltX/JzMA8GA1Ud
+EwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDSAAwRQIhALuIYO82yKVgMuFSWB70ALJE
+UZ0KQhgbgLS5gw+Rh6xeAiBu0CzhNXZ6QO4blinurR+/lGd5m1qRG/RuKanWrWOo
+Jw==
+-----END CERTIFICATE-----
+"""
 
 
 def _private_key_pem(secret: str) -> str:
@@ -442,7 +455,7 @@ def test_profile_equality_includes_all_hidden_connection_material() -> None:
     second_ca = BrokerProfile.from_mapping(
         _profile_data(
             mqtt_tls_enabled=True,
-            mqtt_tls_ca=CA_PEM.replace("CA-PEM-SECRET", "DIFFERENT-CA-SECRET"),
+            mqtt_tls_ca=ca_pem("different-broker-ca"),
         )
     )
 
@@ -575,6 +588,16 @@ def test_sensitive_values_reject_ordinary_mutation_and_serialization() -> None:
         _profile_data(
             mqtt_tls_enabled=True,
             mqtt_tls_ca=_private_key_pem("private-secret"),
+        ),
+        *(
+            _profile_data(mqtt_tls_enabled=True, mqtt_tls_ca=value)
+            for value in (
+                "-----BEGIN CERTIFICATE-----\nCA-PEM-SECRET\n-----END CERTIFICATE-----",
+                "-----BEGIN CERTIFICATE-----\n@@@@####\n-----END CERTIFICATE-----\n",
+                pem_block(b"not X.509 at all"),
+                truncated_ca_pem("broker-ca"),
+                CA_PEM + private_key_pem("broker-ca"),
+            )
         ),
     ],
 )
@@ -1231,3 +1254,56 @@ def test_invalid_client_id_maps_to_stable_profile_error(client_id: object) -> No
     assert caught.value.__context__ is None
     assert caught.value.__cause__ is None
     assert _exception_chain(caught.value) == [caught.value]
+
+
+@pytest.mark.parametrize(
+    "stored_ca",
+    [
+        pytest.param(_PREVIOUSLY_STORED_CA, id="previously-stored-single"),
+        pytest.param(_PREVIOUSLY_STORED_CA + CA_PEM, id="previously-stored-chain"),
+        pytest.param(
+            (_PREVIOUSLY_STORED_CA + "\n" + CA_PEM).replace("\n", "\r\n"),
+            id="previously-stored-crlf-chain",
+        ),
+    ],
+)
+def test_previously_stored_real_ca_chains_still_load(stored_ca: str) -> None:
+    """Real CA chains persisted before strict X.509 validation keep parsing."""
+    profile = BrokerProfile.from_mapping(
+        _profile_data(mqtt_tls_enabled=True, mqtt_tls_ca=stored_ca)
+    )
+
+    assert profile.has_custom_ca is True
+    assert profile == _direct_profile(tls_enabled=True, _ca_pem_value=stored_ca)
+
+
+@pytest.mark.parametrize("tls_enabled", [False, True])
+def test_absent_ca_keeps_parsing_for_plain_and_system_trust_tls(tls_enabled: bool) -> None:
+    """No stored CA (TLS off, or TLS with system trust) is unchanged."""
+    for data in (
+        _profile_data(mqtt_tls_enabled=tls_enabled),
+        _profile_data(mqtt_tls_enabled=tls_enabled, mqtt_tls_ca=None),
+    ):
+        assert BrokerProfile.from_mapping(data).has_custom_ca is False
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(
+            "-----BEGIN CERTIFICATE-----\nCA-PEM-SECRET\n-----END CERTIFICATE-----",
+            id="framing-only",
+        ),
+        pytest.param(
+            "-----BEGIN CERTIFICATE-----\n@@@@####\n-----END CERTIFICATE-----\n",
+            id="invalid-base64",
+        ),
+        pytest.param(pem_block(b"not X.509 at all"), id="base64-non-x509"),
+        pytest.param(truncated_ca_pem("broker-ca"), id="truncated"),
+        pytest.param(CA_PEM + private_key_pem("broker-ca"), id="certificate-plus-private-key"),
+    ],
+)
+def test_direct_profile_rejects_non_x509_ca_material(value: str) -> None:
+    """The constructor enforces the same shared X.509 contract as stored data."""
+    with pytest.raises(ValueError, match="invalid_broker_profile"):
+        _direct_profile(tls_enabled=True, _ca_pem_value=value)
