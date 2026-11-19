@@ -635,6 +635,11 @@ class RpcBusAdapter:
         """Return the local panel's bus device_id once start() has committed."""
         return self._own_device_id
 
+    @property
+    def capture_sequence(self) -> int:
+        """Latest allocated boundary, including undelivered pushes and empty reads."""
+        return self._capture_sequence
+
     def _next_capture_provenance(self) -> CaptureProvenance:
         self._capture_sequence += 1
         return CaptureProvenance(self._capture_generation, self._capture_sequence)

@@ -30,6 +30,11 @@ class BusClient(Protocol):
         """Current source generation, advanced before reconnect callbacks or reads."""
         ...
 
+    @property
+    def capture_sequence(self) -> int:
+        """Latest source boundary, including captures still awaiting delivery."""
+        ...
+
     async def start(self) -> None:
         """Connect to the bus and begin receiving updates."""
         ...
