@@ -681,6 +681,50 @@ async def _async_retained_owner_exists(hass: HomeAssistant, retained: RetainedRo
     return False
 
 
+async def _async_authorize_recorded_recovery(
+    hass: HomeAssistant,
+    record: ProvisioningRecord,
+    *,
+    expected_entry: ConfigEntry[Any] | None = None,
+) -> None:
+    """Prove current operation authority before using recorded panel credentials."""
+    try:
+        if record.operation is ProvisioningOperation.UPDATE:
+            owner, _panel_id = _managed_update_owner(hass, record)
+            if expected_entry is not None and owner is not expected_entry:
+                raise EntryDataError("provisioning_ownership_mismatch")
+        elif record.operation in {ProvisioningOperation.INSTALL, ProvisioningOperation.UPGRADE}:
+            entries = hass.config_entries.async_entries(DOMAIN)
+            if len(entries) != 1:
+                raise EntryDataError("provisioning_ownership_mismatch")
+            owner = entries[0]
+            if (
+                expected_entry is not None and owner is not expected_entry
+            ) or not _is_exact_fleet_envelope_owner(owner, record):
+                raise EntryDataError("provisioning_ownership_mismatch")
+            candidate = _owned_subentry(owner, record)
+            if candidate is not None and record.phase not in {
+                ProvisioningPhase.PENDING_CONFIG_COMMIT,
+                ProvisioningPhase.COMMITTED,
+            }:
+                raise EntryDataError("provisioning_ownership_mismatch")
+        elif record.operation is ProvisioningOperation.ROLLBACK:
+            password = await _async_rollback_credential(hass, record.panel_request)
+            if password is None or password != record.panel_request.root_password:
+                raise PanelProvisioningError("rollback_credentials_unavailable")
+        elif record.operation is ProvisioningOperation.ONBOARDING_ROLLBACK:
+            try:
+                retained = await ProvisioningJournal(hass).async_retained(record.transaction_id)
+            except Exception:
+                raise PanelProvisioningError("rollback_credentials_unavailable") from None
+            if retained is None or retained.compensation_password(record) is None:
+                raise PanelProvisioningError("rollback_credentials_unavailable")
+        else:
+            raise EntryDataError("provisioning_ownership_mismatch")
+    except EntryDataError:
+        raise PanelProvisioningError("provisioning_recovery_required") from None
+
+
 def _build_panel_provisioner(
     hass: HomeAssistant,
     identity_fetcher: Any,
@@ -706,6 +750,7 @@ def _build_panel_provisioner(
         broker_validator=validator,
         health_observer_factory=partial(PanelHealthObserver, hass),
         credential_resolver=partial(_async_rollback_credential, hass),
+        recovery_authorizer=partial(_async_authorize_recorded_recovery, hass),
         retained_owner_exists=partial(_async_retained_owner_exists, hass),
         transaction_lookup=partial(_async_transaction_lookup, hass),
         repair_reporter=_ProvisioningRepairReporter(hass),
@@ -1205,31 +1250,7 @@ class FleetManager:
 
     async def _async_authorize_background_recovery(self, record: ProvisioningRecord) -> None:
         """Repeat mutable config ownership checks while recovery holds the operation lock."""
-        if record.operation is ProvisioningOperation.UPDATE:
-            owner, _panel_id = _managed_update_owner(self.hass, record)
-            if owner is not self.entry:
-                raise EntryDataError("provisioning_ownership_mismatch")
-        elif record.operation in {ProvisioningOperation.INSTALL, ProvisioningOperation.UPGRADE}:
-            if _has_other_domain_entry(self.hass, self.entry) or not _is_exact_fleet_envelope_owner(
-                self.entry, record
-            ):
-                raise EntryDataError("provisioning_ownership_mismatch")
-            candidate = _owned_subentry(self.entry, record)
-            if candidate is not None and record.phase not in {
-                ProvisioningPhase.PENDING_CONFIG_COMMIT,
-                ProvisioningPhase.COMMITTED,
-            }:
-                raise EntryDataError("provisioning_ownership_mismatch")
-        elif record.operation is ProvisioningOperation.ROLLBACK:
-            password = await _async_rollback_credential(self.hass, record.panel_request)
-            if password is None or password != record.panel_request.root_password:
-                raise EntryDataError("rollback_credentials_unavailable")
-        elif record.operation is ProvisioningOperation.ONBOARDING_ROLLBACK:
-            retained = await ProvisioningJournal(self.hass).async_retained(record.transaction_id)
-            if retained is None or retained.compensation_password(record) is None:
-                raise EntryDataError("rollback_credentials_unavailable")
-        else:
-            raise EntryDataError("provisioning_ownership_mismatch")
+        await _async_authorize_recorded_recovery(self.hass, record, expected_entry=self.entry)
 
     def _async_schedule_background_recovery(
         self,

@@ -1031,6 +1031,9 @@ class _Harness:
     def id_factory(self) -> UUID:
         return next(self.ids)
 
+    async def authorize_recovery(self, record: ProvisioningRecord) -> None:
+        self.events.append(("authorize_recovery", record.transaction_id))
+
     def provisioner(
         self,
         operation_lock: asyncio.Lock | None = None,
@@ -1052,6 +1055,7 @@ class _Harness:
             health_observer_factory=self.observer_factory,
             transaction_lookup=self.transaction_lookup,
             repair_reporter=self.repair_reporter,
+            recovery_authorizer=self.authorize_recovery,
             id_factory=self.id_factory,
             clock=lambda: _STARTED_AT,
             health_timeout=45.0,

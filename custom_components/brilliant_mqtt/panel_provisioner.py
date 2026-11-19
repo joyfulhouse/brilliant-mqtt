@@ -918,6 +918,7 @@ class PanelProvisioner:
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         health_timeout: float = 90.0,
         credential_resolver: Callable[[StoredPanelRequest], Awaitable[str | None]] | None = None,
+        recovery_authorizer: Callable[[ProvisioningRecord], Awaitable[None]] | None = None,
         retained_owner_exists: Callable[[RetainedRollback], Awaitable[bool]] | None = None,
     ) -> None:
         self._lock = operation_lock
@@ -939,6 +940,7 @@ class PanelProvisioner:
         self._id_factory = id_factory
         self._clock = clock
         self._credential_resolver = credential_resolver
+        self._recovery_authorizer = recovery_authorizer
         self._retained_owner_exists = retained_owner_exists
         if (
             not isinstance(operation_lock, asyncio.Lock)
@@ -1791,6 +1793,10 @@ class PanelProvisioner:
     ) -> None:
         if not isinstance(record, ProvisioningRecord):
             raise PanelProvisioningError("recovery_failed")
+        if host is None and password is None:
+            if self._recovery_authorizer is None:
+                raise PanelProvisioningError("provisioning_recovery_required")
+            await self._recovery_authorizer(record)
         if record.phase is ProvisioningPhase.ROLLED_BACK:
             retained = await self._journal.async_retained(record.transaction_id)
             verified = (

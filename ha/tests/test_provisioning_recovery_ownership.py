@@ -25,6 +25,7 @@ from tests.fakes import FakeShell
 from tests.test_fleet_manager import (
     _OTHER_FINGERPRINT,
     _OTHER_PUBLIC_KEY,
+    _empty_fleet_entry,
     _panel,
     _pending_record,
     _provisioning_entry,
@@ -234,6 +235,8 @@ async def test_queued_explicit_rollback_revalidates_its_current_authority(
     dispatch = AsyncMock()
     monkeypatch.setattr(provisioner, "_async_recover_record", dispatch)
     monkeypatch.setattr(fm, "_get_recovery_provisioner", lambda _hass: provisioner)
+    report = AsyncMock()
+    monkeypatch.setattr(fm._ProvisioningRepairReporter, "async_report_rollback_failure", report)
     fleet = fm.FleetManager(hass, entry)
     monkeypatch.setattr(fleet, "_async_schedule_reload_once", Mock())
     async with provisioner._lock:
@@ -255,6 +258,158 @@ async def test_queued_explicit_rollback_revalidates_its_current_authority(
         dispatch.assert_awaited_once()
         assert dispatch.await_args is not None
         assert dispatch.await_args.args[0] == rollback
+        report.assert_not_awaited()
     else:
         dispatch.assert_not_awaited()
+        report.assert_awaited_once_with(
+            rollback.transaction_id,
+            original_code="restart_recovery",
+            rollback_code="rollback_credentials_unavailable",
+        )
     assert await journal.async_load() == rollback
+
+
+@pytest.mark.parametrize("operation", tuple(ProvisioningOperation))
+@pytest.mark.parametrize("caller", ("install", "recover"))
+async def test_production_generic_recovery_requires_current_operation_authority(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    operation: ProvisioningOperation,
+    caller: str,
+) -> None:
+    _install_real_store(hass, monkeypatch, tmp_path)
+    journal = ProvisioningJournal(hass)
+    first = _record(ProvisioningPhase.STAGED)
+    await journal.async_create(first)
+    await journal.async_complete_cleanup(first.transaction_id)
+    retained = await journal.async_retained(first.transaction_id)
+    assert retained is not None
+    marked = await journal.async_begin_ownerless_unactivated_discard(retained)
+    entry = _provisioning_entry(
+        _panel("kitchen", "SHA256:kitchen", subentry_id="panel-kitchen"),
+        scene_owner="panel-kitchen",
+    )
+    entry.add_to_hass(hass)
+    second = replace(
+        first,
+        transaction_id=uuid4(),
+        setup_id=uuid4(),
+        operation=(
+            ProvisioningOperation.INSTALL
+            if operation
+            in {ProvisioningOperation.ROLLBACK, ProvisioningOperation.ONBOARDING_ROLLBACK}
+            else operation
+        ),
+        panel_request=replace(
+            first.panel_request,
+            host="stale-kitchen.example.com",
+            slug="kitchen",
+            public_key=_OTHER_PUBLIC_KEY,
+            fingerprint=_OTHER_FINGERPRINT,
+        ),
+    )
+    await journal.async_create(second)
+    if operation in {ProvisioningOperation.ROLLBACK, ProvisioningOperation.ONBOARDING_ROLLBACK}:
+        if operation is ProvisioningOperation.ROLLBACK:
+            await journal.async_complete_cleanup(second.transaction_id)
+        await journal.async_request_restore(second.transaction_id)
+        await journal.async_begin_restore(second.transaction_id, second.panel_request.root_password)
+        if operation is ProvisioningOperation.ONBOARDING_ROLLBACK:
+            await journal._async_retained_save({str(first.transaction_id): marked})
+    current = await journal.async_load()
+    assert current is not None
+    assert current.operation is operation
+    identity = AsyncMock()
+    provisioner = fm._build_panel_provisioner(hass, identity)
+    shell = Mock(side_effect=AssertionError("unauthorized shell construction"))
+    artifacts = AsyncMock(return_value=(Mock(), Mock()))
+    monkeypatch.setattr(provisioner, "_shell_factory", shell)
+    monkeypatch.setattr(provisioner, "_async_recovery_artifacts", artifacts)
+    code = (
+        "rollback_credentials_unavailable"
+        if operation in {ProvisioningOperation.ROLLBACK, ProvisioningOperation.ONBOARDING_ROLLBACK}
+        else "provisioning_recovery_required"
+    )
+    with pytest.raises(PanelProvisioningError, match=code):
+        if caller == "install":
+            await provisioner.async_install(_request(), _fleet(), AsyncMock())
+        else:
+            await provisioner.async_recover()
+    identity.assert_not_awaited()
+    artifacts.assert_not_awaited()
+    shell.assert_not_called()
+    assert await journal.async_load() == current
+    assert await journal.async_retained(first.transaction_id) == marked
+
+
+@pytest.mark.parametrize("scoped", (False, True))
+async def test_recovery_without_central_authorizer_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, scoped: bool
+) -> None:
+    harness = _Harness()
+    record = _record(ProvisioningPhase.STAGED)
+    harness.journal.record = record
+    provisioner = harness.provisioner()
+    monkeypatch.setattr(provisioner, "_recovery_authorizer", None)
+    with pytest.raises(PanelProvisioningError, match="provisioning_recovery_required"):
+        await provisioner.async_recover(
+            expected_record=record if scoped else None,
+            authorize=AsyncMock() if scoped else None,
+        )
+    assert harness.journal.record == record
+    assert not any(event[0] in {"shell_connect", "cleanup_staged"} for event in harness.events)
+
+
+@pytest.mark.parametrize("operation", tuple(ProvisioningOperation))
+async def test_production_authorizer_accepts_current_operation_authority(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    operation: ProvisioningOperation,
+) -> None:
+    _install_real_store(hass, monkeypatch, tmp_path)
+    journal = ProvisioningJournal(hass)
+    record = replace(
+        _record(ProvisioningPhase.STAGED), fleet_profile=_pending_record().fleet_profile
+    )
+    if operation in {ProvisioningOperation.INSTALL, ProvisioningOperation.UPGRADE}:
+        entry = _empty_fleet_entry()
+        entry.add_to_hass(hass)
+        record = replace(record, operation=operation)
+    elif operation is not ProvisioningOperation.ONBOARDING_ROLLBACK:
+        entry = _provisioning_entry(
+            _panel(
+                "kitchen",
+                "SHA256:kitchen",
+                subentry_id="panel-kitchen",
+                management_id=_OTHER_FINGERPRINT,
+            ),
+            scene_owner="panel-kitchen",
+        )
+        entry.add_to_hass(hass)
+        record = replace(
+            record,
+            operation=ProvisioningOperation.UPDATE,
+            panel_request=replace(
+                record.panel_request,
+                host="kitchen.example.com",
+                slug="kitchen",
+                public_key=_OTHER_PUBLIC_KEY,
+                fingerprint=_OTHER_FINGERPRINT,
+                root_password="kitchen-secret",
+                selected_components=("bridge", "bus_watchdog", "wifi_watchdog"),
+            ),
+        )
+    await journal.async_create(record)
+    if operation in {ProvisioningOperation.ROLLBACK, ProvisioningOperation.ONBOARDING_ROLLBACK}:
+        if operation is ProvisioningOperation.ROLLBACK:
+            await journal.async_complete_cleanup(record.transaction_id)
+        await journal.async_request_restore(record.transaction_id)
+        await journal.async_begin_restore(record.transaction_id, record.panel_request.root_password)
+    current = await journal.async_load()
+    assert current is not None and current.operation is operation
+    provisioner = fm._build_panel_provisioner(hass, AsyncMock())
+    assert provisioner._recovery_authorizer is not None
+    await provisioner._recovery_authorizer(current)
+    assert await journal.async_load() == current
