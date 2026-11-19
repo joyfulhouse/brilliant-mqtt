@@ -406,3 +406,101 @@ async def test_real_bus_ambiguous_push_never_authorizes_between_callbacks(
     finally:
         await controller.shutdown()
         await bridge.shutdown_wired_feedback()
+
+
+@pytest.mark.parametrize("inventory", ["missing", "ambiguous", "privacy_on", "unknown"])
+@pytest.mark.parametrize("check_before_delivery", [False, True])
+async def test_real_bus_captured_denial_revokes_before_any_hardware_callback(
+    inventory: str,
+    check_before_delivery: bool,
+) -> None:
+    from brilliant_mqtt.bus import RpcBusAdapter
+    from tests.fakes import _RawDevice, _RawPeripheral
+
+    def raw_hardware(value: str) -> _RawPeripheral:
+        peripheral = _RawPeripheral(value, "privacy_toggle")
+        peripheral.peripheral_type = 22
+        return peripheral
+
+    valid = _RawDevice("panel_1", {"hardware": raw_hardware("0")})
+    first = _RawPeripheral("1")
+    first.peripheral_type = 27
+    peripherals = {"first": first}
+    if inventory == "ambiguous":
+        peripherals.update(hardware_a=raw_hardware("0"), hardware_b=raw_hardware("1"))
+    elif inventory != "missing":
+        peripherals["hardware"] = raw_hardware("1" if inventory == "privacy_on" else "unknown")
+    denied = _RawDevice("panel_1", peripherals)
+
+    class Observer:
+        current = valid
+
+        async def get_device(self, device_id: str) -> _RawDevice:
+            return self.current
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class HeldMqtt(FakeMqtt):
+        async def publish(
+            self,
+            topic: str,
+            payload: str,
+            retain: bool = False,
+            qos: int = 0,
+        ) -> None:
+            if topic == "brilliant/living_room/first/state":
+                entered.set()
+                await release.wait()
+            await super().publish(topic, payload, retain=retain, qos=qos)
+
+    observer = Observer()
+    adapter = RpcBusAdapter()
+    adapter._obs = observer
+    adapter._own_device_id = "panel_1"
+    mqtt = HeldMqtt()
+    bridge = Bridge(adapter, mqtt, "living_room")
+    camera = HeldCamera()
+    controller = AmbilightController(mqtt, "living_room", camera, privacy_off=bridge.is_privacy_off)
+    await bridge.reconcile()
+    assert bridge.is_privacy_off()
+    # An unrelated device's missing HARDWARE must never revoke this panel's grant.
+    adapter._dispatch_raw_device(_RawDevice("ble_mesh", {"other": first}))
+    await asyncio.gather(*adapter._pending_tasks)
+    assert bridge.is_privacy_off()
+    flight = asyncio.create_task(controller.trigger_snapshot())
+    await asyncio.wait_for(camera.started.wait(), 1)
+    try:
+        adapter._dispatch_raw_device(denied)
+        if check_before_delivery:
+            assert not bridge.is_privacy_off()
+        await asyncio.wait_for(entered.wait(), 1)
+        # First non-HARDWARE callback is blocked on MQTT; no HARDWARE callback ran.
+        assert not bridge.is_privacy_off()
+        camera.release.set()
+        assert not await flight
+        assert not await controller.trigger_snapshot()
+        assert camera.calls == 1
+        release.set()
+        await asyncio.gather(*adapter._pending_tasks)
+        assert not bridge.is_privacy_off()
+        # Older already captured off evidence cannot cross the new source denial.
+        await bridge._on_change(replace(hardware(), capture_provenance=CaptureProvenance(0, 1)))
+        assert not bridge.is_privacy_off()
+        adapter._dispatch_raw_device(valid)
+        await asyncio.gather(*adapter._pending_tasks)
+        assert bridge.is_privacy_off()
+        assert await controller.trigger_snapshot()
+        assert camera.calls == 2
+        adapter._advance_capture_generation()
+        assert not bridge.is_privacy_off()
+        await bridge.poll_once()
+        assert bridge.is_privacy_off()
+        adapter._shutting_down = True
+        assert not bridge.is_privacy_off()
+    finally:
+        release.set()
+        await asyncio.gather(*adapter._pending_tasks, return_exceptions=True)
+        await controller.shutdown()
+        await asyncio.gather(flight, return_exceptions=True)
+        await bridge.shutdown_wired_feedback()

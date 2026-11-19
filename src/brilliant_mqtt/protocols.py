@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from brilliant_mqtt.commands import VarSet
-from brilliant_mqtt.model import BrilliantDevice
+from brilliant_mqtt.model import BrilliantDevice, CaptureProvenance
 from brilliant_mqtt.write_admission import AdmissionTicket, WriteClass, WriteResult
 
 
@@ -33,6 +33,11 @@ class BusClient(Protocol):
     @property
     def capture_sequence(self) -> int:
         """Latest source boundary, including captures still awaiting delivery."""
+        ...
+
+    @property
+    def privacy_revocation(self) -> CaptureProvenance | None:
+        """Own-panel denial captured synchronously, before asynchronous delivery."""
         ...
 
     async def start(self) -> None:
