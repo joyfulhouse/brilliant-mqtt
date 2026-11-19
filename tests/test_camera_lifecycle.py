@@ -337,3 +337,72 @@ async def test_real_bus_empty_read_fences_push_waiting_for_delivery() -> None:
         release.set()
         await asyncio.gather(*adapter._pending_tasks, return_exceptions=True)
         await bridge.shutdown_wired_feedback()
+
+
+@pytest.mark.parametrize("values", [("0", "1"), ("1", "0"), ("0", "0")])
+@pytest.mark.parametrize("previously_allowed", [False, True])
+async def test_real_bus_ambiguous_push_never_authorizes_between_callbacks(
+    values: tuple[str, str],
+    previously_allowed: bool,
+) -> None:
+    from brilliant_mqtt.bus import RpcBusAdapter
+    from tests.fakes import _RawDevice, _RawPeripheral
+
+    def raw_hardware(value: str) -> _RawPeripheral:
+        peripheral = _RawPeripheral(value, "privacy_toggle")
+        peripheral.peripheral_type = 22
+        return peripheral
+
+    unambiguous = _RawDevice("panel_1", {"hardware": raw_hardware("0")})
+    ambiguous = _RawDevice(
+        "panel_1",
+        {
+            "hardware_a": raw_hardware(values[0]),
+            "hardware_b": raw_hardware(values[1]),
+        },
+    )
+
+    class Observer:
+        current = unambiguous if previously_allowed else ambiguous
+
+        async def get_device(self, device_id: str) -> _RawDevice:
+            return self.current
+
+    observer = Observer()
+    adapter = RpcBusAdapter()
+    adapter._obs = observer
+    adapter._own_device_id = "panel_1"
+    mqtt = FakeMqtt()
+    bridge = Bridge(adapter, mqtt, "living_room")
+    await bridge.reconcile()
+    assert bridge.is_privacy_off() is previously_allowed
+    callback, coalesce, want = adapter._change_cbs[0]
+    decisions: list[bool] = []
+    camera = HeldCamera()
+    camera.release.set()
+    controller = AmbilightController(mqtt, "living_room", camera, privacy_off=bridge.is_privacy_off)
+
+    async def observe_each_callback(device: BrilliantDevice) -> None:
+        await callback(device)
+        decisions.append(bridge.is_privacy_off())
+        # Exercise the admission window after each per-peripheral MQTT await.
+        await controller.trigger_snapshot()
+
+    adapter._change_cbs[0] = (observe_each_callback, coalesce, want)
+    try:
+        adapter._dispatch_raw_device(ambiguous)
+        await asyncio.gather(*adapter._pending_tasks)
+        assert decisions == [False, False]
+        assert camera.calls == 0
+        assert not bridge.is_privacy_off()
+        # Fresh unambiguous notification still restores permission without a poll.
+        adapter._dispatch_raw_device(unambiguous)
+        await asyncio.gather(*adapter._pending_tasks)
+        assert decisions == [False, False, True]
+        assert camera.calls == 1
+        observer.current = unambiguous
+        await bridge.poll_once()
+        assert bridge.is_privacy_off()
+    finally:
+        await controller.shutdown()
+        await bridge.shutdown_wired_feedback()

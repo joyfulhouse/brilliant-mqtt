@@ -404,6 +404,9 @@ class Bridge:
             if provenance.sequence <= self._privacy_invalid_through:
                 return
             self._privacy_sequence = provenance.sequence
+        if device.capture_hardware_count is not None and device.capture_hardware_count != 1:
+            self._invalidate_privacy([device])
+            return
         var = device.variables.get("privacy_toggle")
         self._privacy_off = (
             var is not None
