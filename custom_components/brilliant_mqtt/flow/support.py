@@ -92,12 +92,14 @@ class _FlowFailure:
     code: str
     documentation_slug: str
     stage: str
+    storage_detail: str = ""
 
     def placeholders(self) -> dict[str, str]:
         return {
             "documentation_slug": self.documentation_slug,
             "documentation_url": _documentation_url(self.documentation_slug),
             "stage": self.stage,
+            "storage_detail": self.storage_detail,
         }
 
 
@@ -207,7 +209,13 @@ def _operation_failure(error: OperationError) -> _FlowFailure:
     )
 
 
-def _panel_failure(code: str, *, stage: str = "panel") -> _FlowFailure:
+def _panel_failure(
+    code: str,
+    *,
+    stage: str = "panel",
+    storage_reason: str | None = None,
+) -> _FlowFailure:
+    detail = f" Storage reported: {storage_reason}" if storage_reason else ""
     return _FlowFailure(
         code=code,
         documentation_slug=_FAILURE_DOCUMENTATION_SLUGS.get(
@@ -215,6 +223,7 @@ def _panel_failure(code: str, *, stage: str = "panel") -> _FlowFailure:
             f"panel-{code.replace('_', '-')}",
         ),
         stage=stage,
+        storage_detail=detail,
     )
 
 
@@ -225,7 +234,11 @@ def _provisioning_failure(error: PanelProvisioningError) -> _FlowFailure:
             documentation_slug=error.detail.documentation_slug,
             stage=error.detail.stage.value,
         )
-    return _panel_failure(error.code, stage="provisioning")
+    return _panel_failure(
+        error.code,
+        stage="provisioning",
+        storage_reason=error.storage_reason,
+    )
 
 
 def _panel_subentries(entry: ConfigEntry[Any] | None) -> tuple[ConfigSubentry, ...]:

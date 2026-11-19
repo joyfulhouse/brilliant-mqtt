@@ -194,9 +194,16 @@ After authentication, an explicit confirmation names the transaction, host and
 fingerprint and explains the permanent loss. Cleanup proceeds only while no
 configuration entry owns the pin or transaction and no execution journal exists.
 It accepts verified restored onboarding baselines, including a verified
-first-install undo to absence. It never accepts armed, soaking, failed, or
-unverified recovery states. Successful cleanup continues normal panel setup;
-it does not automatically install a release.
+first-install undo to absence. It also accepts one narrower case: an `armed`
+onboarding baseline whose phase is still `staged`, whose recovery deployment
+id is empty, and which has no execution journal and no panel subentry. That
+is the residue of a journal save that failed before candidate staging.
+Confirming it re-reads the panel, requires the live owned files to match the
+capture, requires `check_restored` to succeed, and requires this transaction's
+release directory to be absent. Only then does it delete the capture and the
+Home Assistant baseline. It still refuses armed baselines that have left
+`staged`, soaking, failed, or unverified recovery states. Successful cleanup
+continues normal panel setup; it does not automatically install a release.
 
 Fresh login credentials remain in the active flow only and are never written to
 retained metadata. If cleanup is interrupted after durable intent, its
