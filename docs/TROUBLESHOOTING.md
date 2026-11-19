@@ -44,6 +44,66 @@ Reset to `LOG_LEVEL=INFO` when done.
 - If the agent is up but entities stay unavailable, the broker may have dropped
   the retained `online` publish — restart the unit to re-reconcile.
 
+### One panel times out connecting to the broker while others connect
+
+**Symptom.** The panel journal (`journalctl -u brilliant-mqtt`) keeps repeating
+`MQTT connection failed; will reconnect after Ns`. Other panels connect normally.
+During an attempt the TCP connection is `SYN_SENT` on the panel and `SYN_RECV`
+on the broker. The broker received the SYN, but its SYN-ACK never reaches the
+panel.
+
+**This is not the agent.** It is a network fault. The agent already limits each
+connect attempt to 10 s (aiomqtt `timeout=10.0` in `src/brilliant_mqtt/mqttio.py`).
+It then retries with a backoff of 5, 10, 20 and 40 s, capped at 60 s
+(`run()` in `src/brilliant_mqtt/__main__.py`). Restarting or redeploying the
+agent won't help, because the next attempt takes the same network path.
+
+**Known cause ([#173](https://github.com/joyfulhouse/brilliant-mqtt/issues/173)).**
+One access point stopped delivering broadcast and multicast frames to its
+wireless clients, while unicast kept working. Hosts on the panels' VLAN, such as
+the broker host and Home Assistant, learn a panel's MAC address with a broadcast
+ARP request. Those requests never reached the panels, so the hosts' neighbour
+entries stayed `INCOMPLETE` or `FAILED` and the SYN-ACK never left the host. A
+soft restart of the affected AP restored delivery. Two details can mislead you:
+
+- A capture inside the broker's network namespace can still show SYN-ACKs being
+  sent. That does not prove they left the host's physical interface: without a
+  resolved neighbour entry they are never transmitted.
+- Panels that happened to send their own traffic to the host looked healthy. The
+  panel's ARP request teaches the host its MAC, so the host never needs the
+  broadcast path. A "healthy" panel on the same AP can be affected too.
+
+**Read-only checks on the broker host.** Replace the placeholders with your
+values:
+
+```sh
+ip neigh show <panel-ip>              # INCOMPLETE / FAILED = MAC never learned
+ip route get <panel-ip>               # direct on the VLAN interface, or via a gateway?
+ss -tn state syn-recv '( sport = :1883 or sport = :8883 )'
+timeout 15 tcpdump -ni <vlan-iface> -c 200 'arp and host <panel-ip>'
+```
+
+Run the same checks against a healthy panel on the same VLAN and the same AP. If
+the host sends ARP requests for the failing panel and gets no replies, while the
+healthy panel answers, suspect group-addressed frame delivery on the AP rather
+than the panel or the broker.
+
+**Rule out the other causes:**
+
+- **Firewall / conntrack:** check that no rule or full conntrack table drops the
+  broker's reply for that panel only.
+- **Asymmetric route:** `ip route get <panel-ip>` should send the reply back on
+  the same path the SYN arrived on.
+- **MTU:** an MTU problem usually breaks the connection after the handshake (for
+  example during the TLS or MQTT CONNECT exchange), not during the handshake.
+
+**Do not** flush neighbour tables, add permanent neighbour entries, or restart
+panels while you diagnose. Each can make the symptom disappear temporarily and
+hide the fault.
+
+For the full qualification procedure see
+[broadcast-arp-vs-mqtt-diagnostics.md](brilliant-panel/runbooks/broadcast-arp-vs-mqtt-diagnostics.md).
+
 ### Update fails with "could not connect to the panel"
 
 An Update-entity install (or `redeploy`) retries a transient SSH connect failure
