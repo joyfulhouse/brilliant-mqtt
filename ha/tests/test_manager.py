@@ -84,6 +84,7 @@ from custom_components.brilliant_mqtt.shell import (
     RunResult,
     _LegacyAsyncsshShell,
 )
+from tests.cert_fixtures import ca_pem
 from tests.conftest import REPIN_NEW_KEY, RepinShells
 from tests.fakes import FakeShell
 from tests.test_init import ENTRY_DATA
@@ -894,12 +895,12 @@ async def test_fleet_custom_ca_is_staged_and_exact_returned_path_is_rendered(
     operation: str,
 ) -> None:
     """Fleet repair/install never exports broker secrets or guesses the CA path."""
-    ca_pem = "-----BEGIN CERTIFICATE-----\nZmFrZS1wdWJsaWMtY2E=\n-----END CERTIFICATE-----"
+    broker_ca = ca_pem("fleet-broker-ca")
     entry, manager = _fleet_panel_manager(
         hass,
         fleet_overrides={
             CONF_MQTT_TLS_ENABLED: True,
-            CONF_MQTT_TLS_CA: ca_pem,
+            CONF_MQTT_TLS_CA: broker_ca,
         },
     )
     shell = FakeShell()
@@ -929,7 +930,7 @@ async def test_fleet_custom_ca_is_staged_and_exact_returned_path_is_rendered(
         else:
             await manager.async_install_component(COMPONENT_BRIDGE)
 
-    stage.assert_awaited_once_with(shell, ca_pem.encode())
+    stage.assert_awaited_once_with(shell, broker_ca.encode())
     assert render.call_count == 1
     environments = [
         content.decode()
@@ -951,10 +952,10 @@ async def test_recovered_auto_repair_stages_no_ca_before_the_skip(
     """#95 finding 1: the pre-mutation recheck must precede _async_stage_broker_ca (which
     stages the CA file on the panel — a remote write). A panel that recovers during connect
     must have NO CA staged and NO unit enabled: the skip lands before the first remote write."""
-    ca_pem = "-----BEGIN CERTIFICATE-----\nZmFrZS1wdWJsaWMtY2E=\n-----END CERTIFICATE-----"
+    broker_ca = ca_pem("fleet-broker-ca")
     _entry, manager = _fleet_panel_manager(
         hass,
-        fleet_overrides={CONF_MQTT_TLS_ENABLED: True, CONF_MQTT_TLS_CA: ca_pem},
+        fleet_overrides={CONF_MQTT_TLS_ENABLED: True, CONF_MQTT_TLS_CA: broker_ca},
     )
     manager.availability = "offline"
     installed = RunResult(
@@ -3534,6 +3535,37 @@ async def test_set_voice_enabled_true_always_deploys(
     assert entry.data[CONF_COMPONENTS][COMPONENT_VOICE] is True
 
 
+async def test_voice_upload_timeout_preserves_flag_and_stops_deployment(
+    hass: HomeAssistant,
+) -> None:
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="office",
+        data={**ENTRY_DATA, CONF_COMPONENTS: {COMPONENT_VOICE: False}},
+    )
+    entry.add_to_hass(hass)
+
+    class TimeoutOnVoiceFileUpload(FakeShell):
+        async def put_file(self, local_path: str, remote_path: str, mode: int) -> None:
+            del local_path, remote_path, mode
+            raise TimeoutError
+
+    shell = TimeoutOnVoiceFileUpload(responses=_make_voice_shell(payload_present=False).responses)
+
+    with (
+        patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell),
+        patch(_COMPONENTS_FETCH_PATCH, return_value=_FAKE_TARBALL),
+    ):
+        manager = _legacy_manager(hass, entry)
+        with pytest.raises(HomeAssistantError):
+            await manager.async_set_voice_enabled(True)
+
+    assert entry.data[CONF_COMPONENTS][COMPONENT_VOICE] is False
+    assert not any("tar xzf" in command for command in shell.commands)
+    assert shell.file_uploads == []
+    assert "systemctl enable --now brilliant-voice" not in shell.commands
+
+
 async def test_set_voice_enabled_false_uninstalls(
     hass: HomeAssistant,
     payload_dir: Path,
@@ -4963,7 +4995,7 @@ async def test_refresh_staged_copies_skips_bus_watchdog_when_not_selected(
 # wiped by the OTA the hook exists to recover from — the units must be re-laid).
 # ---------------------------------------------------------------------------
 
-_HUE_CA_CERT_PEM = "-----BEGIN CERTIFICATE-----\nFAKE\n-----END CERTIFICATE-----\n"
+_HUE_CA_CERT_PEM = ca_pem("legacy-hue")
 
 
 def _write_hue_ca_units(payload_dir: Path) -> None:
@@ -6015,3 +6047,180 @@ def test_snapshot_probe_summary_exposes_only_safe_retry_guidance() -> None:
     assert "snapshot_probe_failed" in summary
     assert "retry" in summary
     assert "SECRET" not in summary
+
+
+# ---------------------------------------------------------------------------
+# Fleet Hue CA default (homelab-kuvu): panels added through the fleet Add-panel
+# flow start with empty feature overrides and must inherit the fleet's Hue CA.
+# ---------------------------------------------------------------------------
+
+_FLEET_HUE_CA = ca_pem("fleet-hue")
+_PANEL_HUE_CA = ca_pem("panel-hue")
+
+
+async def test_new_fleet_panel_enables_hue_ca_with_the_fleet_default_ca(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """A freshly added panel (empty overrides) installs hue-ca with the fleet CA."""
+    _write_hue_ca_units(payload_dir)
+    entry, manager = _fleet_panel_manager(
+        hass,
+        feature_overrides={},
+        fleet_overrides={CONF_HUE_CA_CERT: _FLEET_HUE_CA},
+    )
+    shell = FakeShell()
+
+    with patch.object(manager, "_shell", return_value=shell):
+        await manager.async_install_component(COMPONENT_HUE_CA)
+
+    assert (
+        PANEL_HUE_CA_CERT_FILE,
+        _FLEET_HUE_CA.strip().encode(),
+        0o644,
+    ) in shell.uploads
+    assert "systemctl enable --now brilliant-hue-ca.timer" in shell.commands
+    stored = entry.subentries["panel-office"].data
+    assert stored[CONF_COMPONENTS][COMPONENT_HUE_CA] is True
+    # The fleet default is resolved at use time, never copied into the panel.
+    assert CONF_HUE_CA_CERT not in stored[CONF_FEATURE_OVERRIDES]
+
+
+@pytest.mark.parametrize("blank_override", [None, "", "  \n"])
+def test_hue_ca_install_data_inherits_fleet_default_when_override_blank(
+    hass: HomeAssistant,
+    blank_override: str | None,
+) -> None:
+    """An absent or blank panel override inherits the fleet Hue CA default."""
+    overrides = {} if blank_override is None else {CONF_HUE_CA_CERT: blank_override}
+    _entry, manager = _fleet_panel_manager(
+        hass,
+        feature_overrides=overrides,
+        fleet_overrides={CONF_HUE_CA_CERT: _FLEET_HUE_CA},
+    )
+
+    assert manager._component_install_data(COMPONENT_HUE_CA) == {
+        CONF_PANEL: "office",
+        CONF_HUE_CA_CERT: _FLEET_HUE_CA,
+    }
+
+
+def test_explicit_panel_hue_ca_override_beats_the_fleet_default(
+    hass: HomeAssistant,
+) -> None:
+    """Existing panels with an explicit Hue CA override keep using it."""
+    _entry, manager = _fleet_panel_manager(
+        hass,
+        feature_overrides={CONF_HUE_CA_CERT: _PANEL_HUE_CA},
+        fleet_overrides={CONF_HUE_CA_CERT: _FLEET_HUE_CA},
+    )
+
+    assert manager._component_install_data(COMPONENT_HUE_CA)[CONF_HUE_CA_CERT] == _PANEL_HUE_CA
+
+
+def test_fleet_hue_ca_default_change_propagates_to_live_managers(
+    hass: HomeAssistant,
+) -> None:
+    """A rotated fleet default reaches inheriting panels with no per-panel edit."""
+    entry, manager = _fleet_panel_manager(
+        hass,
+        fleet_overrides={CONF_HUE_CA_CERT: _FLEET_HUE_CA},
+    )
+    rotated = ca_pem("rotated-hue")
+    hass.config_entries.async_update_entry(
+        entry,
+        data={**entry.data, CONF_HUE_CA_CERT: rotated},
+    )
+
+    manager.update_config(manager.store, FleetConfig.from_entry(entry))
+
+    assert manager._component_install_data(COMPONENT_HUE_CA)[CONF_HUE_CA_CERT] == rotated
+
+
+async def test_enabling_hue_ca_without_any_ca_fails_with_specific_error(
+    hass: HomeAssistant,
+) -> None:
+    """No override and no fleet default: a translated, actionable error, no SSH."""
+    from homeassistant.helpers import issue_registry as ir
+
+    entry, manager = _fleet_panel_manager(hass, feature_overrides={})
+    shell = FakeShell()
+
+    with (
+        patch.object(manager, "_shell", return_value=shell),
+        pytest.raises(HomeAssistantError) as raised,
+    ):
+        await manager.async_install_component(COMPONENT_HUE_CA)
+
+    assert raised.value.translation_domain == DOMAIN
+    assert raised.value.translation_key == "hue_ca_cert_missing"
+    assert raised.value.translation_placeholders == {"panel": "office"}
+    assert shell.connect_count == 0
+    assert COMPONENT_HUE_CA not in entry.subentries["panel-office"].data[CONF_COMPONENTS]
+    assert (
+        ir.async_get(hass).async_get_issue(DOMAIN, manager._component_issue_id(COMPONENT_HUE_CA))
+        is None
+    )
+
+
+async def test_hue_ca_switch_surfaces_missing_ca_error_not_generic_failure(
+    hass: HomeAssistant,
+) -> None:
+    """The Hue CA switch reports where to set the CA instead of a generic failure."""
+    from custom_components.brilliant_mqtt.switch import HueCaSwitch
+
+    _entry, manager = _fleet_panel_manager(hass, feature_overrides={})
+
+    with (
+        patch.object(manager, "_shell", return_value=FakeShell()),
+        pytest.raises(HomeAssistantError) as raised,
+    ):
+        await HueCaSwitch(manager).async_turn_on()
+
+    assert raised.value.translation_key == "hue_ca_cert_missing"
+
+
+async def test_hue_ca_relay_redeploys_with_the_fleet_default_ca(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """A post-OTA relay of a code-less hue-ca hook uses the inherited fleet CA."""
+    _write_hue_ca_units(payload_dir)
+    _entry, manager = _fleet_panel_manager(
+        hass,
+        feature_overrides={},
+        fleet_overrides={CONF_HUE_CA_CERT: _FLEET_HUE_CA},
+    )
+    shell = FakeShell(responses={panel_ops.HUE_CA_INSPECT_COMMAND: RunResult(0, "payload=0\n", "")})
+    await shell.connect()
+
+    assert await manager._relay_hue_ca(shell) is None
+
+    assert (
+        PANEL_HUE_CA_CERT_FILE,
+        _FLEET_HUE_CA.strip().encode(),
+        0o644,
+    ) in shell.uploads
+    assert "systemctl enable --now brilliant-hue-ca.timer" in shell.commands
+
+
+async def test_hue_ca_install_uploads_the_canonical_pem(
+    hass: HomeAssistant,
+    payload_dir: Path,
+) -> None:
+    """A valid but non-canonical stored CA reaches the panel as canonical ASCII PEM."""
+    _write_hue_ca_units(payload_dir)
+    _entry, manager = _fleet_panel_manager(
+        hass,
+        feature_overrides={CONF_HUE_CA_CERT: "\r\n" + _PANEL_HUE_CA.replace("\n", "\r\n")},
+    )
+    shell = FakeShell()
+
+    with patch.object(manager, "_shell", return_value=shell):
+        await manager.async_install_component(COMPONENT_HUE_CA)
+
+    assert (
+        PANEL_HUE_CA_CERT_FILE,
+        _PANEL_HUE_CA.strip().encode("ascii"),
+        0o644,
+    ) in shell.uploads

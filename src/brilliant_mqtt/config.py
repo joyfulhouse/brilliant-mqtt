@@ -113,6 +113,12 @@ class Settings:
     # rollout validation is complete; its replay/outbox state must persist.
     scene_bridge_enabled: bool = False
     scene_watermark_file: str = "/data/brilliant-mqtt/scene-watermarks.json"
+    # Opt-in native BLE mesh motion passthrough: when True, switches with
+    # calibrated NVM thresholds (motion_low_threshold > 20) report native
+    # edge-triggered movement_detected transitions with enable_motion_score="0".
+    motion_native_passthrough: bool = False
+    motion_default_high_threshold: int | None = None
+    motion_default_low_threshold: int | None = None
 
     # Exit the process after this many consecutive unresolved-close fences.
     bus_fenced_start_limit: int = 3
@@ -231,6 +237,32 @@ class Settings:
         scene_watermark_file = env.get(
             "SCENE_WATERMARK_FILE", "/data/brilliant-mqtt/scene-watermarks.json"
         )
+        motion_native_passthrough = _env_bool(env, "MOTION_NATIVE_PASSTHROUGH", "0")
+        raw_high_thresh = env.get("MOTION_DEFAULT_HIGH_THRESHOLD", "").strip()
+        motion_default_high_threshold: int | None = None
+        if raw_high_thresh:
+            motion_default_high_threshold = int(raw_high_thresh)
+            if not 0 <= motion_default_high_threshold <= 255:
+                raise ValueError("MOTION_DEFAULT_HIGH_THRESHOLD must be in 0..255")
+        raw_low_thresh = env.get("MOTION_DEFAULT_LOW_THRESHOLD", "").strip()
+        motion_default_low_threshold: int | None = None
+        if raw_low_thresh:
+            motion_default_low_threshold = int(raw_low_thresh)
+            if not 0 <= motion_default_low_threshold <= 255:
+                raise ValueError("MOTION_DEFAULT_LOW_THRESHOLD must be in 0..255")
+            if motion_native_passthrough and motion_default_low_threshold <= 20:
+                raise ValueError(
+                    "MOTION_DEFAULT_LOW_THRESHOLD must be > 20 "
+                    "when MOTION_NATIVE_PASSTHROUGH is enabled"
+                )
+        if (
+            motion_default_low_threshold is not None
+            and motion_default_high_threshold is not None
+            and motion_default_low_threshold > motion_default_high_threshold
+        ):
+            raise ValueError(
+                "MOTION_DEFAULT_LOW_THRESHOLD must be <= MOTION_DEFAULT_HIGH_THRESHOLD"
+            )
 
         return cls(
             panel=panel,
@@ -262,4 +294,7 @@ class Settings:
             bus_phase_file=bus_phase_file,
             scene_bridge_enabled=scene_bridge_enabled,
             scene_watermark_file=scene_watermark_file,
+            motion_native_passthrough=motion_native_passthrough,
+            motion_default_high_threshold=motion_default_high_threshold,
+            motion_default_low_threshold=motion_default_low_threshold,
         )

@@ -606,3 +606,32 @@ class TestSettings:
         monkeypatch.setenv("SCENE_WATERMARK_FILE", "/var/lib/brilliant/scene-state.json")
 
         assert Settings.from_env().scene_watermark_file == ("/var/lib/brilliant/scene-state.json")
+
+    def test_motion_native_passthrough_and_thresholds(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("BRILLIANT_PANEL", "office")
+        monkeypatch.setenv("MQTT_HOST", "10.0.0.1")
+        monkeypatch.setenv("MQTT_USERNAME", "brilliant")
+        monkeypatch.setenv("MQTT_PASSWORD", "s3cr3t")
+        monkeypatch.setenv("MOTION_NATIVE_PASSTHROUGH", "1")
+        monkeypatch.setenv("MOTION_DEFAULT_LOW_THRESHOLD", "55")
+        monkeypatch.setenv("MOTION_DEFAULT_HIGH_THRESHOLD", "90")
+
+        s = Settings.from_env()
+        assert s.motion_native_passthrough is True
+        assert s.motion_default_low_threshold == 55
+        assert s.motion_default_high_threshold == 90
+
+    def test_motion_native_passthrough_rejects_uncalibrated_low_threshold(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("BRILLIANT_PANEL", "office")
+        monkeypatch.setenv("MQTT_HOST", "10.0.0.1")
+        monkeypatch.setenv("MQTT_USERNAME", "brilliant")
+        monkeypatch.setenv("MQTT_PASSWORD", "s3cr3t")
+        monkeypatch.setenv("MOTION_NATIVE_PASSTHROUGH", "1")
+        monkeypatch.setenv("MOTION_DEFAULT_LOW_THRESHOLD", "20")
+
+        with pytest.raises(ValueError, match="MOTION_DEFAULT_LOW_THRESHOLD"):
+            Settings.from_env()
