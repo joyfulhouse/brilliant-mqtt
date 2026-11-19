@@ -1737,14 +1737,17 @@ async def test_unactivated_discard_logs_unexpected_errors_without_secrets(
     assert "Unactivated baseline discard failed unexpectedly" in caplog.text
 
 
-async def test_journal_failure_shows_redacted_storage_reason(
+@pytest.mark.parametrize("code", ("journal_failed", "baseline_retained_finalize_first"))
+async def test_journal_failure_routes_retry_through_retained_recovery(
     hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    code: str,
 ) -> None:
     confirm = await _start_initial_confirm(hass)
     reason = "OSError: disk-[redacted]"
     provisioner = _FakeProvisioner(
         _identity(),
-        error=PanelProvisioningError("journal_failed", storage_reason=reason),
+        error=PanelProvisioningError(code, storage_reason=reason),
         gate=asyncio.Event(),
     )
 
@@ -1769,10 +1772,25 @@ async def test_journal_failure_shows_redacted_storage_reason(
         )
 
     assert result["type"] is FlowResultType.FORM
-    assert result["step_id"] == "panel_confirm"
-    assert result["errors"] == {"base": "journal_failed"}
+    assert result["step_id"] == "panel_connect"
+    assert result["errors"] == {"base": code}
     assert result["description_placeholders"]["storage_detail"] == f" Storage reported: {reason}"
     assert _ROOT_PASSWORD not in repr(result)
+    retained = replace(
+        await _restored_ownerless_record(hass), state="armed", recovery_deployment_id=None
+    )
+    monkeypatch.setattr(
+        ProvisioningJournal, "async_retained_records", AsyncMock(return_value=(retained,))
+    )
+    with (
+        patch.object(flow_gateway, "async_fetch_host_identity", return_value=_identity()),
+        patch.object(flow_gateway, "_async_inspect_candidate", return_value=_facts(_identity())),
+    ):
+        retry = await hass.config_entries.subentries.async_configure(
+            result["flow_id"], _PANEL_INPUT
+        )
+    assert retry["step_id"] == "panel_discard_unactivated"
+    assert len(provisioner.install_calls) == 1
 
 
 async def test_first_panel_provision_failure_returns_to_confirm_without_secret_leak(

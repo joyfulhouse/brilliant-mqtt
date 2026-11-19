@@ -738,11 +738,15 @@ class _PanelOnboardingMixin:
                 progress_task=task,
             )
 
+        next_step = "panel_confirm"
         try:
             self._provisioned = task.result()
         except asyncio.CancelledError:
             raise
         except PanelProvisioningError as error:
+            if error.code in {"journal_failed", "baseline_retained_finalize_first"}:
+                # Reconnecting re-runs retained/journal lookup before another capture.
+                next_step = "panel_connect"
             self._release_override = None
             self._identity_refusal = error.release_override
             self._panel_failure = _provisioning_failure(error)
@@ -763,7 +767,7 @@ class _PanelOnboardingMixin:
             self._provision_task = None
 
         if self._provisioned is None:
-            return flow.async_show_progress_done(next_step_id="panel_confirm")
+            return flow.async_show_progress_done(next_step_id=next_step)
         return flow.async_show_progress_done(next_step_id="panel_create")
 
     async def async_step_panel_create(
