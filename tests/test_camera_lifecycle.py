@@ -196,7 +196,8 @@ async def test_shutdown_settles_camera_work_and_rejects_new_commands(
         work = controller.trigger_snapshot()
     else:
         work = controller.on_mqtt_command(
-            f"brilliant/living_room/ambilight/set_{operation}", "PRESS"
+            f"brilliant/living_room/ambilight/set_{operation}",
+            "ON" if operation == "auto_crop" else "PRESS",
         )
     task = asyncio.create_task(work)
     await asyncio.wait_for(camera.started.wait(), 1)

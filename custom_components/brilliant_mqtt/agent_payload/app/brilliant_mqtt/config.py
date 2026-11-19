@@ -9,6 +9,7 @@ No panel imports, no MQTT library imports: pure stdlib only.
 
 from __future__ import annotations
 
+import math
 import os
 import re
 from collections.abc import Mapping
@@ -277,8 +278,8 @@ class Settings:
                 raise ValueError(f"Invalid VIRTUAL_SLIDERS_JSON: {error}") from error
         ambilight_enabled = _env_bool(env, "AMBILIGHT_ENABLED", "0")
         ambilight_interval_s = float(env.get("AMBILIGHT_INTERVAL_S", "1.0"))
-        if ambilight_interval_s <= 0:
-            raise ValueError("AMBILIGHT_INTERVAL_S must be > 0")
+        if not math.isfinite(ambilight_interval_s) or not 0.25 <= ambilight_interval_s <= 10:
+            raise ValueError("AMBILIGHT_INTERVAL_S must be finite and in 0.25..10 seconds")
 
         return cls(
             panel=panel,
