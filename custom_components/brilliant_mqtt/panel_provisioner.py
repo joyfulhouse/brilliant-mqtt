@@ -918,6 +918,7 @@ class PanelProvisioner:
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         health_timeout: float = 90.0,
         credential_resolver: Callable[[StoredPanelRequest], Awaitable[str | None]] | None = None,
+        recovery_authorizer: Callable[[ProvisioningRecord], Awaitable[None]] | None = None,
         retained_owner_exists: Callable[[RetainedRollback], Awaitable[bool]] | None = None,
     ) -> None:
         self._lock = operation_lock
@@ -939,6 +940,7 @@ class PanelProvisioner:
         self._id_factory = id_factory
         self._clock = clock
         self._credential_resolver = credential_resolver
+        self._recovery_authorizer = recovery_authorizer
         self._retained_owner_exists = retained_owner_exists
         if (
             not isinstance(operation_lock, asyncio.Lock)
@@ -1232,6 +1234,14 @@ class PanelProvisioner:
             raise PanelProvisioningError("inspection_failed")
         if await self._duplicate_fingerprint(identity.fingerprint):
             raise PanelProvisioningError("duplicate_panel")
+        # A retry must discover the first capture before publishing another one.
+        state.failure_code = "journal_failed"
+        state.failure_stage = "journal"
+        if any(
+            item.record.panel_request.fingerprint == identity.fingerprint
+            for item in await self._journal.async_retained_records()
+        ):
+            raise PanelProvisioningError("baseline_retained_finalize_first")
 
         state.transaction_id = self._next_id()
         state.setup_id = self._next_id()
@@ -1690,10 +1700,17 @@ class PanelProvisioner:
     async def async_recover(
         self,
         progress: ProgressReporter = _noop_progress,
+        *,
+        expected_record: ProvisioningRecord | None = None,
+        authorize: Callable[[ProvisioningRecord], Awaitable[None]] | None = None,
     ) -> None:
         """Settle the one durable transaction before accepting new work."""
         async with self._lock:
-            outcome = await _settle(self._async_recover_bounded(progress))
+            outcome = await _settle(
+                self._async_recover_bounded(
+                    progress, expected_record=expected_record, authorize=authorize
+                )
+            )
             if outcome.cancellation is not None:
                 raise outcome.cancellation from None
             if outcome.error is not None:
@@ -1701,22 +1718,59 @@ class PanelProvisioner:
                     raise PanelProvisioningError(outcome.error.code)
                 raise PanelProvisioningError("recovery_failed")
 
-    async def _async_recover_bounded(self, progress: ProgressReporter) -> None:
+    async def _async_recover_bounded(
+        self,
+        progress: ProgressReporter,
+        *,
+        expected_record: ProvisioningRecord | None = None,
+        authorize: Callable[[ProvisioningRecord], Awaitable[None]] | None = None,
+    ) -> None:
         try:
             async with asyncio.timeout(RECOVERY_TIMEOUT_SECONDS):
-                await self._async_recover_current(progress)
+                if expected_record is None:
+                    await self._async_recover_current(progress)
+                else:
+                    await self._async_recover_expected(expected_record, progress, authorize)
         except TimeoutError:
             raise PanelProvisioningError("rollback_deadline_exceeded") from None
+
+    async def _async_recover_expected(
+        self,
+        expected: ProvisioningRecord,
+        progress: ProgressReporter,
+        authorize: Callable[[ProvisioningRecord], Awaitable[None]] | None,
+    ) -> None:
+        """Revalidate a queued worker's exact transaction under the operation lock."""
+        current = await self._journal.async_load()
+        if current is not None:
+            if current != expected:
+                return
+            if authorize is not None:
+                await authorize(current)
+            await self._async_recover_record(current, progress)
+            return
+        retained = await self._journal.async_retained(expected.transaction_id)
+        if retained is None or retained.record != expected or retained.state != "finalizing":
+            return
+        if retained.finalization_origin is not None:
+            raise PanelProvisioningError("ownerless_finalize_reauthentication_required")
+        # Retained rows omit the password; finalization resolves fresh credentials
+        # from their current pinned owner instead of using active-journal authority.
+        await self._async_finalize(retained)
 
     async def _async_recover_current(
         self,
         progress: ProgressReporter,
     ) -> None:
         await _report(progress, ProvisioningProgressStage.RECOVERING)
+        ownerless_pending = False
         for retained in await self._journal.async_retained_records():
             if retained.state == "finalizing":
-                if retained.finalization_origin == "ownerless_restored":
-                    raise PanelProvisioningError("ownerless_finalize_reauthentication_required")
+                if retained.finalization_origin in {"ownerless_restored", "ownerless_unactivated"}:
+                    # These markers need fresh flow authority. They must not
+                    # consume credentials or obstruct another panel's journal.
+                    ownerless_pending = True
+                    continue
                 await self._async_finalize(retained)
             elif retained.state == "restore_requested":
                 password = retained.compensation_password(await self._journal.async_load())
@@ -1726,6 +1780,8 @@ class PanelProvisioner:
         record = await self._journal.async_load()
         if record is not None:
             await self._async_recover_record(record, progress)
+        elif ownerless_pending:
+            raise PanelProvisioningError("ownerless_finalize_reauthentication_required")
 
     async def _async_recover_record(
         self,
@@ -1737,6 +1793,10 @@ class PanelProvisioner:
     ) -> None:
         if not isinstance(record, ProvisioningRecord):
             raise PanelProvisioningError("recovery_failed")
+        if host is None and password is None:
+            if self._recovery_authorizer is None:
+                raise PanelProvisioningError("provisioning_recovery_required")
+            await self._recovery_authorizer(record)
         if record.phase is ProvisioningPhase.ROLLED_BACK:
             retained = await self._journal.async_retained(record.transaction_id)
             verified = (

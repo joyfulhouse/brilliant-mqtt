@@ -1451,7 +1451,7 @@ async def test_journal_payload_differs_from_retained_only_by_the_root_password(
     assert without_password == retained_record
 
 
-async def test_journal_save_failure_after_arm_leaves_no_ownerless_baseline(
+async def test_journal_save_failure_after_arm_preserves_recoverable_baseline(
     hass: HomeAssistant,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1480,7 +1480,63 @@ async def test_journal_save_failure_after_arm_leaves_no_ownerless_baseline(
     assert _ROOT_PASSWORD not in str(raised.value.__cause__)
     assert _ROOT_PASSWORD not in str(raised.value)
     assert await journal.async_load() is None
-    assert await journal.async_retained_records() == ()
+    restarted = ProvisioningJournal(hass)
+    retained = await restarted.async_retained(_TRANSACTION_ID)
+    assert retained is not None
+    assert retained.state == "armed"
+    assert retained.ownerless_unactivated_discard_allowed
+
+
+@pytest.mark.parametrize("store_key", (JOURNAL_STORAGE_KEY, JOURNAL_STORAGE_KEY + ".retained"))
+@pytest.mark.parametrize("fault", ("write_error", "cancel", "read_error", "read_mismatch"))
+async def test_late_storage_failure_preserves_landed_recovery_owner(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    store_key: str,
+    fault: str,
+) -> None:
+    _install_real_store(hass, monkeypatch, tmp_path)
+    journal = ProvisioningJournal(hass)
+    original_write = DurableProvisioningStore._async_write_data
+    original_load = DurableProvisioningStore.async_load
+    landed = False
+
+    async def write(store: DurableProvisioningStore, data: dict[str, object]) -> None:
+        nonlocal landed
+        await original_write(store, data)
+        if store.key == store_key:
+            landed = True
+            if fault == "write_error":
+                raise OSError("late write failure")
+            if fault == "cancel":
+                raise asyncio.CancelledError
+
+    async def load(store: DurableProvisioningStore) -> dict[str, Any] | None:
+        if store.key == store_key and landed:
+            if fault == "read_error":
+                raise OSError("read-back unavailable")
+            if fault == "read_mismatch":
+                return None
+        return await original_load(store)
+
+    monkeypatch.setattr(DurableProvisioningStore, "_async_write_data", write)
+    monkeypatch.setattr(DurableProvisioningStore, "async_load", load)
+    expected = asyncio.CancelledError if fault == "cancel" else ProvisioningJournalError
+    with pytest.raises(expected):
+        await journal.async_create(_baselined_record())
+
+    monkeypatch.setattr(DurableProvisioningStore, "_async_write_data", original_write)
+    monkeypatch.setattr(DurableProvisioningStore, "async_load", original_load)
+    restarted = ProvisioningJournal(hass)
+    retained = await restarted.async_retained(_TRANSACTION_ID)
+    assert retained is not None and retained.state == "armed"
+    assert retained.record.prior_snapshot == _baselined_record().prior_snapshot
+    if store_key == JOURNAL_STORAGE_KEY:
+        assert await restarted.async_load() == _baselined_record()
+    else:
+        assert await restarted.async_load() is None
+        assert retained.ownerless_unactivated_discard_allowed
 
 
 async def test_unroundtrippable_journal_never_writes_an_armed_baseline(

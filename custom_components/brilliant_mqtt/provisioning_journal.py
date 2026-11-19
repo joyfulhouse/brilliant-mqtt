@@ -1319,28 +1319,17 @@ class ProvisioningJournal:
             if self._coordinator.record is not None:
                 raise ProvisioningJournalError("journal_transaction_in_progress")
             # Prove the active journal can round-trip before any retained arm.
-            # A later disk failure still rolls that arm back.
             _require_storage_round_trip(
                 {"record": record._to_storage()},
                 self._coordinator,
                 _storage_secrets(record),
                 store="journal",
             )
-            armed_here = False
             if record.prior_snapshot.baseline is not None:
-                armed_here = await self._async_arm(record)
-            error: BaseException | None = None
-            try:
-                await self._async_save(record)
-            except BaseException as caught:
-                error = caught
-            if error is not None and armed_here and self._coordinator.record is None:
-                try:
-                    await self._async_rollback_unproven_arm(record)
-                except BaseException:
-                    _LOGGER.debug("provisioning arm rollback failed after journal_save_failed")
-            if error is not None:
-                raise error
+                await self._async_arm(record)
+            # A panel capture already exists. Keep its durable owner even if
+            # the journal save fails; only verified panel retirement may drop it.
+            await self._async_save(record)
             return record
 
     async def _async_retained_load(self) -> dict[str, RetainedRollback]:
@@ -1398,60 +1387,24 @@ class ProvisioningJournal:
             )
         return self._retained_store
 
-    async def _async_arm(self, record: ProvisioningRecord) -> bool:
-        """Persist a new armed baseline. Return whether this call inserted it."""
+    async def _async_arm(self, record: ProvisioningRecord) -> None:
+        """Persist a new armed baseline without retiring an existing capture."""
         records = await self._async_retained_load()
         key = str(record.transaction_id)
         proposed = RetainedRollback(record)
         if key in records:
             if records[key].record != proposed.record:
                 raise ProvisioningJournalError("journal_transaction_mismatch")
-            return False
+            return
         if any(
             item.record.panel_request.fingerprint == record.panel_request.fingerprint
             for item in records.values()
         ):
             raise ProvisioningJournalError("journal_transaction_in_progress")
         records[key] = proposed
-        try:
-            await self._async_retained_save(records, secrets=_storage_secrets(record))
-        except BaseException:
-            try:
-                await self._async_drop_exact_armed(record)
-            except BaseException:
-                _LOGGER.debug("provisioning arm cleanup failed after retained save error")
-            raise
-        return True
-
-    async def _async_rollback_unproven_arm(self, record: ProvisioningRecord) -> None:
-        """Drop an arm created for a journal save that did not become durable.
-
-        If the journal file itself landed but did not verify, remove it first.
-        Keep the baseline when that journal file cannot be cleared: the pair is
-        then the existing interrupted-onboarding recovery, not an ownerless arm.
-        """
-        if self._coordinator.record is not None:
-            return
-        await self._async_remove()
-        if self._coordinator.record is not None:
-            return
-        await self._async_drop_exact_armed(record)
-
-    async def _async_drop_exact_armed(self, record: ProvisioningRecord) -> None:
-        records = await self._async_retained_load()
-        key = str(record.transaction_id)
-        current = records.get(key)
-        proposed = RetainedRollback(record)
-        if (
-            current is None
-            or current != proposed
-            or current.state != "armed"
-            or current.recovery_deployment_id is not None
-            or current.finalization_origin is not None
-        ):
-            return
-        del records[key]
-        await self._async_retained_save(records)
+        # Failure or cancellation can arrive after the row reached disk. Never
+        # compensate by deleting the only HA owner of the on-panel baseline.
+        await self._async_retained_save(records, secrets=_storage_secrets(record))
 
     async def async_arm(self, record: ProvisioningRecord) -> None:
         async with self._coordinator.lock:
