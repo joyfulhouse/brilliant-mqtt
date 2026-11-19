@@ -2964,21 +2964,23 @@ def _swap_command() -> str:
 
 
 async def _restore_virtual_sliders_on_uninstall(shell: PanelShell) -> None:
-    """Best-effort restore of persisted virtual slider bindings before removing PANEL_VAR_DIR."""
-    await shell.run(
-        f"{_PANEL_PYTHON} - <<'BRILLIANT_RESTORE_VIRTUAL_SLIDERS' 2>/dev/null || true\n"
+    """Require verified restoration before removing backups and retry code."""
+    await _checked(
+        shell,
+        f"{_PANEL_PYTHON} - <<'BRILLIANT_RESTORE_VIRTUAL_SLIDERS'\n"
         "import asyncio, sys\n"
         "from pathlib import Path\n"
         f"var_dir = Path({PANEL_VAR_DIR!r})\n"
         "state_path = var_dir / 'state' / 'virtual-sliders.json'\n"
-        "if state_path.is_file():\n"
+        "if state_path.exists():\n"
         "    for sub in ('current/app', 'app', 'current/vendor', 'vendor'):\n"
         "        p = var_dir / sub\n"
         "        if p.is_dir():\n"
         "            sys.path.insert(0, str(p))\n"
         "    from brilliant_mqtt.virtual_sliders import restore_all_persisted_slider_bindings\n"
-        "    asyncio.run(restore_all_persisted_slider_bindings(state_path))\n"
-        "BRILLIANT_RESTORE_VIRTUAL_SLIDERS"
+        "    if not asyncio.run(restore_all_persisted_slider_bindings(state_path)):\n"
+        "        sys.exit('Virtual slider restoration incomplete; retry uninstall')\n"
+        "BRILLIANT_RESTORE_VIRTUAL_SLIDERS",
     )
 
 

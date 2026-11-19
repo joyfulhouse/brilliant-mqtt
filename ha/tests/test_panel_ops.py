@@ -3855,3 +3855,61 @@ async def test_restart_candidate_verifies_link_and_restarts_only_bridge() -> Non
     joined = "\n".join(shell.commands)
     assert WIFI_WATCHDOG_SERVICE_NAME not in joined
     assert BUS_WATCHDOG_SERVICE_NAME not in joined
+
+
+@pytest.mark.parametrize("exit_status", [1, 127])
+async def test_uninstall_preserves_payload_and_backups_on_restore_failure(exit_status: int) -> None:
+    class RestoreFailureShell(FakeShell):
+        async def run(self, command: str) -> RunResult:
+            if "BRILLIANT_RESTORE_VIRTUAL_SLIDERS" in command:
+                return RunResult(exit_status, "", "restoration failed")
+            return await super().run(command)
+
+    shell = await _connected(RestoreFailureShell())
+    with pytest.raises(panel_ops.PanelOpError, match=f"exited {exit_status}"):
+        await panel_ops.uninstall(shell)
+    assert not any(command.startswith("rm ") for command in shell.commands)
+
+
+@pytest.mark.parametrize("outcome", ["success", "incomplete", "import_failure", "bus_failure"])
+async def test_uninstall_restore_script_propagates_result_and_runtime_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    # Execute the actual remote Python body with a tiny importable restoration stub.
+    var_dir = tmp_path / "panel"
+    state = var_dir / "state" / "virtual-sliders.json"
+    state.parent.mkdir(parents=True)
+    state.write_text("{}")
+    package = var_dir / "app" / "brilliant_mqtt"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("")
+    if outcome != "import_failure":
+        operation = (
+            "raise RuntimeError('bus startup failed')"
+            if outcome == "bus_failure"
+            else f"return {outcome == 'success'!r}"
+        )
+        (package / "virtual_sliders.py").write_text(
+            f"async def restore_all_persisted_slider_bindings(path):\n    {operation}\n"
+        )
+    monkeypatch.setattr(panel_ops, "PANEL_VAR_DIR", str(var_dir))
+
+    class ExecuteShell(FakeShell):
+        async def run(self, command: str) -> RunResult:
+            body = command.split("\n", 1)[1].rsplit("\n", 1)[0]
+            result = await asyncio.to_thread(
+                subprocess.run,
+                [sys.executable, "-I", "-c", body],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            return RunResult(result.returncode, result.stdout, result.stderr)
+
+    shell = ExecuteShell()
+    if outcome == "success":
+        await panel_ops._restore_virtual_sliders_on_uninstall(shell)
+    else:
+        with pytest.raises(panel_ops.PanelOpError, match="exited 1"):
+            await panel_ops._restore_virtual_sliders_on_uninstall(shell)
+    assert state.exists()

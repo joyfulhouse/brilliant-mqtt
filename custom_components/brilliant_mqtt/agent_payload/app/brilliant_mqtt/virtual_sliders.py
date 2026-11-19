@@ -748,18 +748,33 @@ class VirtualSliderController:
                 continue
             orig_cfg = entry.get("original_slider_config")
             orig_str = str(orig_cfg) if isinstance(orig_cfg, str) and orig_cfg else None
-            if sid not in self._states:
-                cfg_dev = str(entry.get("config_device_id", ""))
-                cfg_periph = str(entry.get("config_peripheral_id", ""))
-                cfg_var = str(entry.get("config_var_name", ""))
+            cfg_dev = str(entry.get("config_device_id", ""))
+            cfg_periph = str(entry.get("config_peripheral_id", ""))
+            cfg_var = str(entry.get("config_var_name", ""))
+            spec = self._specs.get(sid)
+            retargeted = spec is not None and (cfg_dev, cfg_periph, cfg_var) != (
+                spec.config_device_id,
+                spec.config_peripheral_id,
+                spec.config_var_name,
+            )
+            if sid not in self._states or retargeted:
                 if orig_str and cfg_dev and cfg_periph and cfg_var:
-                    self._orphaned_bindings[str(sid)] = OrphanedSliderBinding(
+                    # A logical ID can move; keep the old physical backup in its own row.
+                    orphan_id = str(sid)
+                    while (
+                        orphan_id in self._states
+                        or orphan_id in self._orphaned_bindings
+                        or (orphan_id in data and orphan_id != sid)
+                    ):
+                        orphan_id = "orphan:" + orphan_id
+                    self._orphaned_bindings[orphan_id] = OrphanedSliderBinding(
                         config_device_id=cfg_dev,
                         config_peripheral_id=cfg_periph,
                         config_var_name=cfg_var,
                         original_slider_config=orig_str,
                     )
-                continue
+                if sid not in self._states:
+                    continue
             st = self._states[sid]
             spec = self._specs[sid]
             mode_str = entry.get("mode")
@@ -772,7 +787,7 @@ class VirtualSliderController:
                 st.step = max(1, min(spec.num_steps, int(entry["step"])))
             if isinstance(entry.get("is_on"), bool):
                 st.is_on = bool(entry["is_on"])
-            if orig_str is not None:
+            if orig_str is not None and not retargeted:
                 st.original_slider_config = orig_str
 
     def _build_persisted_snapshot(self) -> dict[str, Any]:
@@ -958,6 +973,12 @@ class VirtualSliderController:
 
     async def _apply_slider_binding(self, spec: VirtualSliderSpec, mode: SliderMode) -> bool:
         """Write ``CapTouchSliderConfig`` to the target peripheral after backing up original."""
+        if any(
+            (orphan.config_device_id, orphan.config_peripheral_id, orphan.config_var_name)
+            == (spec.config_device_id, spec.config_peripheral_id, spec.config_var_name)
+            for orphan in self._orphaned_bindings.values()
+        ):
+            return False
         if spec.config_device_id == "ble_mesh" and not self._is_mesh_leader():
             logger.debug(
                 "Deferring ble_mesh slider_config binding for %s until mesh leader",
@@ -1483,7 +1504,12 @@ async def restore_all_persisted_slider_bindings(
 
     Used during integration uninstall or when all virtual sliders are removed.
     """
-    if not has_persisted_slider_backups(state_path):
+    if not await asyncio.to_thread(state_path.exists):
+        return True
+    data = _read_persisted_state_dict(state_path)
+    if data is None:
+        return False
+    if not data:
         return True
 
     own_bus = False
@@ -1496,10 +1522,6 @@ async def restore_all_persisted_slider_bindings(
         own_bus = True
 
     try:
-        data = _read_persisted_state_dict(state_path)
-        if data is None:
-            return False
-
         all_restored = True
         changed = False
         for sid, entry in list(data.items()):
@@ -1509,11 +1531,14 @@ async def restore_all_persisted_slider_bindings(
             cfg_dev = str(entry.get("config_device_id", ""))
             cfg_periph = str(entry.get("config_peripheral_id", ""))
             cfg_var = str(entry.get("config_var_name", ""))
+            if orig_cfg is None:
+                continue
             if (
                 not isinstance(orig_cfg, str)
                 or not orig_cfg
                 or not (cfg_dev and cfg_periph and cfg_var)
             ):
+                all_restored = False
                 continue
             if cfg_dev == "ble_mesh" and not is_mesh_leader():
                 all_restored = False

@@ -1008,3 +1008,76 @@ class TestVirtualSliderController:
         assert len(created_hosts) == 2
         assert created_hosts[0].started is True
         assert created_hosts[0].stopped is True
+
+
+@pytest.mark.parametrize("restore_succeeds", [True, False])
+async def test_retarget_preserves_exact_old_target_until_verified_restore(
+    tmp_path: Path, restore_succeeds: bool
+) -> None:
+    originals = [REAL_PANEL_SLIDER_CONFIG_0_B64, REAL_PANEL_SLIDER_CONFIG_1_B64]
+    faceplate = BrilliantDevice(
+        device_id=PANEL_DEV_ID,
+        peripheral_id="faceplate_peripheral",
+        name="Faceplate",
+        kind=DeviceKind.UNKNOWN,
+        variables={
+            f"slider_config:{i}": Variable(f"slider_config:{i}", v) for i, v in enumerate(originals)
+        },
+    )
+    bus = _ConfigurableFakeBus([faceplate])
+    state_file = tmp_path / "virtual-sliders.json"
+
+    async def start(index: int) -> VirtualSliderController:
+        ctrl = VirtualSliderController(
+            bus=bus,
+            mqtt=FakeMqtt(),
+            panel="test",
+            own_device_id=PANEL_DEV_ID,
+            specs=[
+                VirtualSliderSpec.for_panel_slider(
+                    slider_id="same",
+                    name="Same",
+                    panel_device_id=PANEL_DEV_ID,
+                    slider_index=index,
+                )
+            ],
+            host_factory=FakeVirtualPeripheralHost,
+            state_path=state_file,
+        )
+        await ctrl.start()
+        return ctrl
+
+    ctrl = await start(0)
+    await ctrl.shutdown()
+    bus.reflect_writes = restore_succeeds
+    ctrl = await start(1)
+    await ctrl.shutdown()
+    saved = json.loads(state_file.read_text())
+    assert saved["same"]["original_slider_config"] == originals[1]
+    if restore_succeeds:
+        assert faceplate.variables["slider_config:0"].value == originals[0]
+        assert len(saved) == 1
+    else:
+        old_rows = [row for row in saved.values() if row["config_var_name"] == "slider_config:0"]
+        assert len(old_rows) == 1
+        assert old_rows[0]["original_slider_config"] == originals[0]
+        # Reload while restoration still fails: neither backup may be overwritten.
+        ctrl = await start(1)
+        await ctrl.shutdown()
+        assert json.loads(state_file.read_text()) == saved
+    bus.reflect_writes = True
+    assert await restore_all_persisted_slider_bindings(state_file, bus=bus)
+    for i, original in enumerate(originals):
+        assert faceplate.variables[f"slider_config:{i}"].value == original
+
+
+@pytest.mark.parametrize(
+    "contents", ["broken json", "[]", '{"same": {"original_slider_config": "exact"}}']
+)
+async def test_uninstall_restore_rejects_unreadable_or_incomplete_backups(
+    tmp_path: Path, contents: str
+) -> None:
+    state_file = tmp_path / "virtual-sliders.json"
+    state_file.write_text(contents)
+    assert not await restore_all_persisted_slider_bindings(state_file, bus=_ConfigurableFakeBus([]))
+    assert state_file.read_text() == contents
