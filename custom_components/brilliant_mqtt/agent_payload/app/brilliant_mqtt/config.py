@@ -125,6 +125,9 @@ class Settings:
     bus_fenced_start_limit: int = 3
     # JSON list of VirtualSliderSpec definitions (empty disables virtual sliders).
     virtual_sliders_json: str = ""
+    # Enable panel camera snapshot & TV Ambilight entities on this panel.
+    ambilight_enabled: bool = False
+    ambilight_interval_s: float = 1.0
 
     def __post_init__(self) -> None:
         if (
@@ -272,6 +275,10 @@ class Settings:
                 parse_virtual_slider_specs(virtual_sliders_json)
             except Exception as error:
                 raise ValueError(f"Invalid VIRTUAL_SLIDERS_JSON: {error}") from error
+        ambilight_enabled = _env_bool(env, "AMBILIGHT_ENABLED", "0")
+        ambilight_interval_s = float(env.get("AMBILIGHT_INTERVAL_S", "1.0"))
+        if ambilight_interval_s <= 0:
+            raise ValueError("AMBILIGHT_INTERVAL_S must be > 0")
 
         return cls(
             panel=panel,
@@ -307,4 +314,6 @@ class Settings:
             motion_default_high_threshold=motion_default_high_threshold,
             motion_default_low_threshold=motion_default_low_threshold,
             virtual_sliders_json=virtual_sliders_json,
+            ambilight_enabled=ambilight_enabled,
+            ambilight_interval_s=ambilight_interval_s,
         )

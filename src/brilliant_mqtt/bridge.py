@@ -278,6 +278,10 @@ class Bridge:
 
         # peripheral_id → most recent BrilliantDevice snapshot.
         self._devices: dict[str, BrilliantDevice] = {}
+        # Camera permission must not inherit discovery's intentionally unpruned cache.
+        self._privacy_off = False
+        self._privacy_source_generation = getattr(bus, "capture_generation", 0)
+        self._privacy_sequence = -1
         # command topic → (peripheral_id, descriptor). descriptor is None for the
         # PRIMARY JSON light/switch topic; an EntityDescriptor for each aux topic.
         self._by_cmd_topic: dict[str, tuple[str, EntityDescriptor | None]] = {}
@@ -356,6 +360,51 @@ class Bridge:
                 self._command_generation.get(device.peripheral_id, 0) + 1
             )
         self._devices[device.peripheral_id] = device
+
+    def is_privacy_off(self) -> bool:
+        """Require explicit privacy-off evidence from the current bus generation."""
+        self._sync_privacy_generation()
+        return self._wired_feedback_enabled and self._privacy_off
+
+    def _sync_privacy_generation(self) -> None:
+        generation = getattr(self._bus, "capture_generation", 0)
+        if generation != self._privacy_source_generation:
+            self._privacy_off = False
+            self._privacy_sequence = -1
+            self._privacy_source_generation = generation
+
+    def _observe_privacy(self, device: BrilliantDevice) -> None:
+        if device.kind is not DeviceKind.HARDWARE:
+            return
+        self._sync_privacy_generation()
+        provenance = device.capture_provenance
+        if provenance is not None:
+            if provenance.source_generation != self._privacy_source_generation:
+                return
+            if provenance.sequence < self._privacy_sequence:
+                return
+            self._privacy_sequence = provenance.sequence
+        var = device.variables.get("privacy_toggle")
+        self._privacy_off = (
+            var is not None
+            and var.value.strip() == "0"
+            and "privacy_toggle" not in device.capture_unknown
+            and (device.capture_present is None or "privacy_toggle" in device.capture_present)
+        )
+
+    def _observe_privacy_snapshot(self, devices: list[BrilliantDevice]) -> None:
+        self._sync_privacy_generation()
+        hardware = [d for d in devices if self._included(d) and d.kind is DeviceKind.HARDWARE]
+        if len(hardware) != 1:
+            self._privacy_off = False
+            return
+        provenance = hardware[0].capture_provenance
+        if provenance is not None and (
+            provenance.source_generation != self._privacy_source_generation
+        ):
+            self._privacy_off = False
+            return
+        self._observe_privacy(hardware[0])
 
     @staticmethod
     def _is_wired_primary(device: BrilliantDevice) -> bool:
@@ -439,6 +488,7 @@ class Bridge:
             return
         self._beat()
         self._mesh_feedback_enabled = True
+        self._observe_privacy_snapshot(devices)
 
         # A broker await may admit a command or native push. Apply this captured
         # wired batch before those awaits so it cannot later overwrite their state.
@@ -554,6 +604,7 @@ class Bridge:
 
     async def reconcile_after_reconnect(self) -> None:
         """Retire session-local wired evidence before reading a new bus generation."""
+        self._privacy_off = False
         if not self._wired_feedback_enabled:
             return
         lifecycle = self._wired_lifecycle
@@ -667,6 +718,7 @@ class Bridge:
             self._beat()
         if not self._feedback_alive(lifecycle):
             return
+        self._observe_privacy_snapshot(devices)
         for device in devices:
             # Same scope filter as reconcile: the shared get_all returns every
             # bus device, including the other bridge's.
@@ -1020,6 +1072,7 @@ class Bridge:
 
     async def shutdown_wired_feedback(self) -> None:
         """Terminally retire wired work and join its one timer/publisher per load."""
+        self._privacy_off = False
         self._wired_feedback_enabled = False
         self._wired_lifecycle += 1
         slots = list(self._wired.values())
@@ -1098,6 +1151,8 @@ class Bridge:
         # bridge — an out-of-scope device must not even be snapshotted.
         if not self._included(device):
             return
+        if self._wired_feedback_enabled:
+            self._observe_privacy(device)
         if self._is_wired_primary(device) and not self._wired_feedback_enabled:
             return
 

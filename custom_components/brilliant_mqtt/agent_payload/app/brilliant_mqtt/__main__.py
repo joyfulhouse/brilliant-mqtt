@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import NoReturn
 
 from brilliant_mqtt import __version__
+from brilliant_mqtt.ambilight import AmbilightController, GStreamerCameraAdapter
 from brilliant_mqtt.bridge import Bridge, HotPollReadTimeout, WriteThrottle
 from brilliant_mqtt.bus import (
     BusStartFencedError,
@@ -224,6 +225,7 @@ async def _run_session(
     leader: MeshLeader | None = None
     scene_bridge: SceneBridge | None = None
     virtual_slider_controller: VirtualSliderController | None = None
+    ambilight_controller: AmbilightController | None = None
     mqtt_connected = False
     phase_marker_failure_logged = False
     try:
@@ -423,6 +425,27 @@ async def _run_session(
                 if virtual_slider_controller is not None:
                     await virtual_slider_controller.shutdown()
                 virtual_slider_controller = None
+        if settings.ambilight_enabled:
+            try:
+                amb_state_path = (
+                    Path(settings.motion_desired_state_dir) / "ambilight.json"
+                    if settings.motion_desired_state_dir
+                    else None
+                )
+                ambilight_controller = AmbilightController(
+                    mqtt=mqtt,
+                    panel=settings.panel,
+                    camera=GStreamerCameraAdapter(privacy_off=panel_bridge.is_privacy_off),
+                    state_path=amb_state_path,
+                    default_enabled=False,
+                    default_interval_s=settings.ambilight_interval_s,
+                    owned_topics=owned_topics,
+                    privacy_off=panel_bridge.is_privacy_off,
+                )
+                await ambilight_controller.start()
+            except Exception:
+                log.exception("ambilight controller startup failed; continuing without it")
+                ambilight_controller = None
 
         tick = settings.hot_poll_seconds if settings.hot_poll_seconds > 0 else _IDLE_TICK_S
         next_resync = time.monotonic() + settings.resync_seconds
@@ -605,6 +628,11 @@ async def _run_session(
                 await virtual_slider_controller.shutdown()
             except Exception:
                 log.exception("virtual slider controller shutdown failed during cleanup")
+        if ambilight_controller is not None:
+            try:
+                await ambilight_controller.shutdown()
+            except Exception:
+                log.exception("ambilight controller shutdown failed during cleanup")
         if scene_bridge is not None:
             try:
                 await scene_bridge.async_shutdown()

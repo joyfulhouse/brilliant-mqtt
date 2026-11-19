@@ -661,3 +661,31 @@ def test_virtual_sliders_json_invalid_raises() -> None:
                 "VIRTUAL_SLIDERS_JSON": "{not-a-list}",
             }
         )
+
+
+def test_ambilight_config_env() -> None:
+    s = Settings.from_env(
+        {
+            "BRILLIANT_PANEL": "office",
+            "MQTT_HOST": "10.0.0.1",
+            "MQTT_USERNAME": "u",
+            "MQTT_PASSWORD": "p",
+            "AMBILIGHT_ENABLED": "1",
+            "AMBILIGHT_INTERVAL_S": "1.5",
+        }
+    )
+    assert s.ambilight_enabled is True
+    assert s.ambilight_interval_s == 1.5
+
+
+def test_ambilight_invalid_interval_raises() -> None:
+    with pytest.raises(ValueError, match="AMBILIGHT_INTERVAL_S"):
+        Settings.from_env(
+            {
+                "BRILLIANT_PANEL": "office",
+                "MQTT_HOST": "10.0.0.1",
+                "MQTT_USERNAME": "u",
+                "MQTT_PASSWORD": "p",
+                "AMBILIGHT_INTERVAL_S": "0",
+            }
+        )
