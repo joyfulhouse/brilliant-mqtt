@@ -8,7 +8,7 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity import Entity
 
-from .const import DOMAIN, panel_device_name
+from .const import DOMAIN, panel_device_identifier, panel_device_name
 from .manager import PanelManager
 
 
@@ -30,10 +30,14 @@ class BrilliantPanelEntity(Entity):
 
     device_info deliberately claims the SAME registry identifier the agent's MQTT
     discovery payload creates — ("mqtt", "brilliant_panel_<slug>") — so management
-    entities land on the panel's existing device page. (If a future HA release
-    rejects cross-domain identifier claims, fall back to identifiers
-    {(DOMAIN, slug)} + via_device pointing at the mqtt identifier, and update
-    test_entities_attach_to_the_mqtt_discovery_device accordingly.)
+    entities group with the panel's discovery device. On HA <= 2026.9 that is one
+    shared device page. HA 2026.10+ gives every device a single owning config
+    entry/subentry, so the same identifier yields a twin owned by this entry (and
+    the panel's subentry) that the device page shows as a linked device. Don't
+    switch to {(DOMAIN, slug)}: that breaks the link, and the via_device fallback
+    is deprecated. Child devices can't help either, because a child must share its
+    parent's config entry. Services resolve a panel from either twin by this
+    identifier (see _managers_for in __init__.py).
     """
 
     _attr_should_poll = False
@@ -42,7 +46,7 @@ class BrilliantPanelEntity(Entity):
     def __init__(self, manager: PanelManager) -> None:
         self._manager = manager
         self._attr_device_info = DeviceInfo(
-            identifiers={("mqtt", f"brilliant_panel_{manager.panel}")},
+            identifiers={panel_device_identifier(manager.panel)},
             name=panel_device_name(manager.panel),
             manufacturer="Brilliant",
         )

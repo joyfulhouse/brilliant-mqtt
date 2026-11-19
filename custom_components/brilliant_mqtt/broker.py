@@ -15,6 +15,7 @@ from typing import Any, Never, Protocol, Self, SupportsIndex
 
 import aiomqtt
 
+from .certificates import is_public_certificate_chain
 from .errors import OperationError, OperationStage, from_exception
 
 
@@ -187,13 +188,10 @@ class BrokerProfile(_BrokerSecrets):
             raise ValueError("invalid_broker_profile")
         if not isinstance(_password_value, str) or not _password_value:
             raise ValueError("invalid_broker_profile")
+        # An absent CA (None) means TLS off or system trust; a present one must be
+        # a parseable public X.509 chain under the same contract as flows/migration.
         if _ca_pem_value is not None and (
-            not isinstance(_ca_pem_value, str)
-            or not _ca_pem_value.strip()
-            or not self.tls_enabled
-            or "-----BEGIN CERTIFICATE-----" not in _ca_pem_value
-            or "-----END CERTIFICATE-----" not in _ca_pem_value
-            or "PRIVATE KEY-----" in _ca_pem_value.upper()
+            not self.tls_enabled or not is_public_certificate_chain(_ca_pem_value)
         ):
             raise ValueError("invalid_broker_profile")
 
@@ -250,14 +248,7 @@ class BrokerProfile(_BrokerSecrets):
 
             raw_ca_pem = data.get("mqtt_tls_ca")
             if raw_ca_pem is not None:
-                if (
-                    not isinstance(raw_ca_pem, str)
-                    or not raw_ca_pem.strip()
-                    or not tls_enabled
-                    or "-----BEGIN CERTIFICATE-----" not in raw_ca_pem
-                    or "-----END CERTIFICATE-----" not in raw_ca_pem
-                    or "PRIVATE KEY-----" in raw_ca_pem.upper()
-                ):
+                if not tls_enabled or not is_public_certificate_chain(raw_ca_pem):
                     raise ValueError
 
             profile = cls(
