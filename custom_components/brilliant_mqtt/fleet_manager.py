@@ -431,7 +431,7 @@ def _committed_owner_matches(entry: ConfigEntry[Any], candidate: ConfigSubentry 
     return (
         candidate is not None
         and candidate.data.get(CONF_PROVISIONING_TRANSACTION_ID) is None
-        and entry.data.get(CONF_SCENE_PANEL) == candidate.subentry_id
+        and entry.data.get(CONF_SCENE_PANEL) in entry.subentries
     )
 
 
@@ -971,6 +971,9 @@ async def _async_recover_removed_entry(
         await _get_recovery_provisioner(
             hass, removed_entry=entry, expected_record=record
         ).async_recover(expected_record=record)
+        remaining = await journal.async_load()
+        if remaining is not None and remaining.transaction_id == record.transaction_id:
+            return
         ir.async_delete_issue(
             hass,
             DOMAIN,

@@ -736,7 +736,9 @@ async def test_cancel_during_startup_committed_clear_clears_resolved_repair(
     assert ir.async_get(hass).async_get_issue(DOMAIN, issue_id) is None
 
 
-@pytest.mark.parametrize("corruption", ("marker_present", "wrong_scene_owner"))
+@pytest.mark.parametrize(
+    "corruption", ("marker_present", "dangling_scene_owner", "pending_scene_owner")
+)
 async def test_committed_handoff_corruption_fails_closed_with_repair(
     hass: HomeAssistant,
     corruption: str,
@@ -753,13 +755,19 @@ async def test_committed_handoff_corruption_fails_closed_with_repair(
         office,
         *(
             (_panel("kitchen", "SHA256:kitchen", subentry_id="panel-kitchen"),)
-            if corruption == "wrong_scene_owner"
+            if corruption == "dangling_scene_owner"
             else ()
         ),
     )
     entry = _provisioning_entry(
         *panels,
-        scene_owner=("panel-kitchen" if corruption == "wrong_scene_owner" else "panel-office"),
+        scene_owner=(
+            "missing-panel"
+            if corruption == "dangling_scene_owner"
+            else pending_scene_owner(_TRANSACTION_ID)
+            if corruption == "pending_scene_owner"
+            else "panel-office"
+        ),
     )
     entry.add_to_hass(hass)
     journal = Mock(
@@ -1827,6 +1835,14 @@ async def test_active_flow_context_prevents_pre_storage_rollback(
     assert lookup.subentry_id is None
 
 
+def _successful_removed_recovery(journal: Mock) -> AsyncMock:
+    async def recover(*, expected_record: ProvisioningRecord) -> None:
+        assert journal.async_load.return_value == expected_record
+        journal.async_load.return_value = None
+
+    return AsyncMock(side_effect=recover)
+
+
 async def test_actual_ha_remove_recovers_exact_removed_sole_owner(
     hass: HomeAssistant,
 ) -> None:
@@ -1837,7 +1853,8 @@ async def test_actual_ha_remove_recovers_exact_removed_sole_owner(
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record()),
     )
-    recover = AsyncMock()
+    expected_record = journal.async_load.return_value
+    recover = _successful_removed_recovery(journal)
     issue_id = _create_provisioning_repair(hass)
 
     with (
@@ -1853,10 +1870,8 @@ async def test_actual_ha_remove_recovers_exact_removed_sole_owner(
         await hass.config_entries.async_remove(entry.entry_id)
 
     assert hass.config_entries.async_get_entry(entry.entry_id) is None
-    get_recovery.assert_called_once_with(
-        hass, removed_entry=entry, expected_record=journal.async_load.return_value
-    )
-    recover.assert_awaited_once_with(expected_record=journal.async_load.return_value)
+    get_recovery.assert_called_once_with(hass, removed_entry=entry, expected_record=expected_record)
+    recover.assert_awaited_once_with(expected_record=expected_record)
     assert ir.async_get(hass).async_get_issue(DOMAIN, issue_id) is None
 
 
@@ -1879,7 +1894,8 @@ async def test_actual_ha_remove_recovers_exact_empty_fleet_before_subentry(
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record(phase=phase)),
     )
-    recover = AsyncMock()
+    expected_record = journal.async_load.return_value
+    recover = _successful_removed_recovery(journal)
 
     with (
         patch(
@@ -1902,7 +1918,7 @@ async def test_actual_ha_remove_recovers_exact_empty_fleet_before_subentry(
         await hass.config_entries.async_remove(entry.entry_id)
 
     assert hass.config_entries.async_get_entry(entry.entry_id) is None
-    recover.assert_awaited_once_with(expected_record=journal.async_load.return_value)
+    recover.assert_awaited_once_with(expected_record=expected_record)
 
 
 @pytest.mark.parametrize(
@@ -1936,7 +1952,8 @@ async def test_actual_ha_remove_recovers_pre_subentry_panel_from_nonempty_single
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record(phase=phase)),
     )
-    recover = AsyncMock()
+    expected_record = journal.async_load.return_value
+    recover = _successful_removed_recovery(journal)
     issue_id = _create_provisioning_repair(hass)
 
     with (
@@ -1960,7 +1977,7 @@ async def test_actual_ha_remove_recovers_pre_subentry_panel_from_nonempty_single
         await hass.config_entries.async_remove(entry.entry_id)
 
     assert hass.config_entries.async_get_entry(entry.entry_id) is None
-    recover.assert_awaited_once_with(expected_record=journal.async_load.return_value)
+    recover.assert_awaited_once_with(expected_record=expected_record)
     assert ir.async_get(hass).async_get_issue(DOMAIN, issue_id) is None
 
 
@@ -2152,7 +2169,8 @@ async def test_actual_ha_remove_aborts_owned_flow_and_settles_pending_journal(
         }
     ]
     abort = Mock()
-    recover = AsyncMock()
+    expected_record = journal.async_load.return_value
+    recover = _successful_removed_recovery(journal)
 
     with (
         patch(
@@ -2177,7 +2195,7 @@ async def test_actual_ha_remove_aborts_owned_flow_and_settles_pending_journal(
         await hass.config_entries.async_remove(entry.entry_id)
 
     abort.assert_called_once_with("owned-panel-flow")
-    recover.assert_awaited_once_with(expected_record=journal.async_load.return_value)
+    recover.assert_awaited_once_with(expected_record=expected_record)
 
 
 async def test_actual_ha_remove_does_not_abort_unrelated_active_flow(
@@ -2207,7 +2225,8 @@ async def test_actual_ha_remove_does_not_abort_unrelated_active_flow(
         },
     ]
     abort = Mock()
-    recover = AsyncMock()
+    expected_record = journal.async_load.return_value
+    recover = _successful_removed_recovery(journal)
 
     with (
         patch(
@@ -2232,7 +2251,7 @@ async def test_actual_ha_remove_does_not_abort_unrelated_active_flow(
         await hass.config_entries.async_remove(entry.entry_id)
 
     abort.assert_not_called()
-    recover.assert_awaited_once_with(expected_record=journal.async_load.return_value)
+    recover.assert_awaited_once_with(expected_record=expected_record)
 
 
 async def test_removed_empty_fleet_with_legacy_competitor_preserves_journal(
