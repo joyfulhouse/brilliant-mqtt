@@ -31,11 +31,8 @@ Architecture
 from __future__ import annotations
 
 import asyncio
-import base64
-import binascii
 import json
 import logging
-import struct
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -54,6 +51,12 @@ from brilliant_mqtt.protocols import (
     VirtualPeripheralSpec,
 )
 from brilliant_mqtt.retained_topics import RetainedTopicLedger
+from brilliant_mqtt.slider_config import (
+    decode_slider_config_target as decode_slider_config_target,
+)
+from brilliant_mqtt.slider_config import (
+    encode_slider_config as encode_slider_config,
+)
 from brilliant_mqtt.write_admission import Superseded
 
 logger = logging.getLogger(__name__)
@@ -135,196 +138,6 @@ def brightness_to_raw(brightness: int, min_raw: int = 100, max_raw: int = 1000) 
     clamped = max(1, min(255, brightness))
     raw = round(((clamped - 1) / 254) * span) + min_raw
     return max(min_raw, min(max_raw, raw))
-
-
-# ---------------------------------------------------------------------------
-# Pure Thrift TBinaryProtocol Encoder / Decoder for CapTouchSliderConfig
-# ---------------------------------------------------------------------------
-
-_T_STOP = 0
-_T_BOOL = 2
-_T_BYTE = 3
-_T_DOUBLE = 4
-_T_I16 = 6
-_T_I32 = 8
-_T_I64 = 10
-_T_STRING = 11
-_T_STRUCT = 12
-_T_MAP = 13
-_T_SET = 14
-_T_LIST = 15
-
-_MAX_SLIDER_INDEX = 255
-_MAX_IDENTIFIER_BYTES = 1024
-_MAX_ENCODED_BYTES = 64 * 1024
-
-
-def encode_slider_config(
-    device_id: str,
-    peripheral_id: str,
-    *,
-    slider_index: int = 0,
-    double_tap_scene_id: str = "",
-) -> str:
-    """Build a base64-encoded Thrift ``TBinaryProtocol`` ``CapTouchSliderConfig`` string.
-
-    Wire layout verified against the panel's ``CapTouchSliderConfig`` Thrift struct
-    and ``tools/brilliant_vc/slider_binding.py``:
-    - field 1 (``i32``): ``slider_index`` (0..255)
-    - field 2 (``string``): primary target ``device_id``
-    - field 3 (``string``): primary target ``peripheral_id``
-    - field 5 (``string``, optional): ``double_tap_scene_id``
-    - field 6 (``i32``): ``action`` = 0 (``LIGHTS``)
-    - field 7 (``struct`` -> field 1 ``list<struct>`` of length 1): ``devices``
-    """
-    if not device_id and not peripheral_id:
-        return ""
-    if not device_id or not peripheral_id:
-        raise ValueError("device_id and peripheral_id must both be non-empty")
-    if not 0 <= slider_index <= _MAX_SLIDER_INDEX:
-        raise ValueError(f"slider_index must be 0..{_MAX_SLIDER_INDEX}, got {slider_index}")
-
-    dev_bytes = device_id.encode("utf-8")
-    per_bytes = peripheral_id.encode("utf-8")
-    buf = bytearray()
-    # Field 1 (i32): slider_index
-    buf += b"\x08\x00\x01" + slider_index.to_bytes(4, "big", signed=True)
-    # Field 2 (string): primary target device_id
-    buf += b"\x0b\x00\x02" + len(dev_bytes).to_bytes(4, "big") + dev_bytes
-    # Field 3 (string): primary target peripheral_id
-    buf += b"\x0b\x00\x03" + len(per_bytes).to_bytes(4, "big") + per_bytes
-    # Field 5 (string, optional): double_tap_scene_id
-    if double_tap_scene_id:
-        dt_bytes = double_tap_scene_id.encode("utf-8")
-        buf += b"\x0b\x00\x05" + len(dt_bytes).to_bytes(4, "big") + dt_bytes
-    # Field 6 (i32): action = 0 (LIGHTS)
-    buf += b"\x08\x00\x06\x00\x00\x00\x00"
-    # Field 7 (struct -> field 1 list<struct> of length 1): devices = [(device_id, peripheral_id)]
-    buf += b"\x0c\x00\x07\x0f\x00\x01\x0c\x00\x00\x00\x01"
-    buf += b"\x0b\x00\x01" + len(dev_bytes).to_bytes(4, "big") + dev_bytes
-    buf += b"\x0b\x00\x02" + len(per_bytes).to_bytes(4, "big") + per_bytes
-    # Stop bytes for inner struct, outer struct, and root CapTouchSliderConfig
-    buf += b"\x00\x00\x00"
-    return base64.b64encode(bytes(buf)).decode("ascii")
-
-
-def decode_slider_config_target(payload_b64: str) -> tuple[str, str] | None:
-    """Decode ``(device_id, peripheral_id)`` from a base64 Thrift ``CapTouchSliderConfig``.
-
-    Returns ``None`` if the payload is empty, malformed, or lacks required target fields.
-    """
-    if not isinstance(payload_b64, str) or not payload_b64 or len(payload_b64) > _MAX_ENCODED_BYTES:
-        return None
-    try:
-        raw = base64.b64decode(payload_b64, validate=True)
-    except (binascii.Error, ValueError):
-        return None
-    if not raw or len(raw) > _MAX_ENCODED_BYTES:
-        return None
-
-    offset = 0
-
-    def _take(n: int) -> bytes:
-        nonlocal offset
-        if n < 0 or offset + n > len(raw):
-            raise ValueError("truncated slider_config")
-        chunk = raw[offset : offset + n]
-        offset += n
-        return chunk
-
-    def _read_i32() -> int:
-        return int(struct.unpack(">i", _take(4))[0])
-
-    def _read_identifier() -> str:
-        length = _read_i32()
-        if not 0 < length <= _MAX_IDENTIFIER_BYTES:
-            raise ValueError("invalid identifier length")
-        val = _take(length).decode("utf-8")
-        if any(ord(ch) < 32 or ord(ch) == 127 for ch in val):
-            raise ValueError("control character in identifier")
-        return val
-
-    def _read_count() -> int:
-        count = _read_i32()
-        if not 0 <= count <= 4096:
-            raise ValueError("invalid collection count")
-        return count
-
-    def _skip(ftype: int, depth: int = 0) -> None:
-        if depth > 16:
-            raise ValueError("nesting too deep")
-        if ftype in (_T_BOOL, _T_BYTE):
-            _take(1)
-        elif ftype == _T_I16:
-            _take(2)
-        elif ftype == _T_I32:
-            _take(4)
-        elif ftype in (_T_DOUBLE, _T_I64):
-            _take(8)
-        elif ftype == _T_STRING:
-            _take(_read_count())
-        elif ftype == _T_STRUCT:
-            while True:
-                nested_type = int(struct.unpack(">b", _take(1))[0])
-                if nested_type == _T_STOP:
-                    break
-                _take(2)
-                _skip(nested_type, depth + 1)
-        elif ftype == _T_MAP:
-            ktype = int(struct.unpack(">b", _take(1))[0])
-            vtype = int(struct.unpack(">b", _take(1))[0])
-            for _ in range(_read_count()):
-                _skip(ktype, depth + 1)
-                _skip(vtype, depth + 1)
-        elif ftype in (_T_SET, _T_LIST):
-            etype = int(struct.unpack(">b", _take(1))[0])
-            for _ in range(_read_count()):
-                _skip(etype, depth + 1)
-        else:
-            raise ValueError(f"unknown Thrift field type {ftype}")
-
-    try:
-        seen_fields: set[int] = set()
-        slider_index: int | None = None
-        device_id: str | None = None
-        peripheral_id: str | None = None
-
-        while True:
-            field_type = int(struct.unpack(">b", _take(1))[0])
-            if field_type == _T_STOP:
-                break
-            field_id = int(struct.unpack(">h", _take(2))[0])
-            if field_id in seen_fields:
-                return None
-            seen_fields.add(field_id)
-            if field_id == 1:
-                if field_type != _T_I32:
-                    return None
-                slider_index = _read_i32()
-            elif field_id == 2:
-                if field_type != _T_STRING:
-                    return None
-                device_id = _read_identifier()
-            elif field_id == 3:
-                if field_type != _T_STRING:
-                    return None
-                peripheral_id = _read_identifier()
-            elif field_id == 6:
-                if field_type != _T_I32:
-                    return None
-                _read_i32()
-            else:
-                _skip(field_type, 0)
-
-        if offset != len(raw):
-            return None
-        if slider_index is None or device_id is None or peripheral_id is None:
-            return None
-        if not 0 <= slider_index <= _MAX_SLIDER_INDEX:
-            return None
-        return (device_id, peripheral_id)
-    except Exception:
-        return None
 
 
 # ---------------------------------------------------------------------------
@@ -490,6 +303,7 @@ class VirtualSliderState:
     last_event: SliderEventType | None = None
     event_seq: int = 0
     original_slider_config: str | None = None
+    binding_ready: bool = False
 
 
 @dataclass(frozen=True)
@@ -500,6 +314,7 @@ class OrphanedSliderBinding:
     config_peripheral_id: str
     config_var_name: str
     original_slider_config: str
+    slider_id: str | None
 
 
 # ---------------------------------------------------------------------------
@@ -663,6 +478,12 @@ VirtualHostFactory = Callable[
 ]
 
 
+def _validate_spec_ownership(specs: list[VirtualSliderSpec]) -> None:
+    targets = {(s.config_device_id, s.config_peripheral_id, s.config_var_name) for s in specs}
+    if len(targets) != len(specs) or len({s.slider_id for s in specs}) != len(specs):
+        raise ValueError("Virtual sliders must have unique IDs and physical targets")
+
+
 class VirtualSliderController:
     """Manages virtual peripherals, slider bindings, gesture classification, and MQTT entities."""
 
@@ -686,6 +507,7 @@ class VirtualSliderController:
         self._mqtt = mqtt
         self._panel = panel
         self._own_device_id = own_device_id
+        _validate_spec_ownership(specs)
         self._specs: dict[str, VirtualSliderSpec] = {s.slider_id: s for s in specs}
         self._host_factory = host_factory
         self._state_path = state_path
@@ -738,28 +560,48 @@ class VirtualSliderController:
         try:
             data = json.loads(self._state_path.read_text(encoding="utf-8"))
         except Exception as exc:
-            logger.warning("Failed to load virtual slider state from %s: %s", self._state_path, exc)
-            return
-        if not isinstance(data, dict):
-            return
+            raise ValueError("Cannot safely load virtual slider recovery state") from exc
+        if not _valid_persisted_state(data):
+            raise ValueError("Invalid virtual slider recovery state; preserve it for recovery")
         self._last_persisted_snapshot = data
         for sid, entry in data.items():
             if not isinstance(entry, dict):
                 continue
             orig_cfg = entry.get("original_slider_config")
             orig_str = str(orig_cfg) if isinstance(orig_cfg, str) and orig_cfg else None
-            if sid not in self._states:
-                cfg_dev = str(entry.get("config_device_id", ""))
-                cfg_periph = str(entry.get("config_peripheral_id", ""))
-                cfg_var = str(entry.get("config_var_name", ""))
+            cfg_dev = str(entry.get("config_device_id", ""))
+            cfg_periph = str(entry.get("config_peripheral_id", ""))
+            cfg_var = str(entry.get("config_var_name", ""))
+            spec = self._specs.get(sid)
+            recovery_only = entry.get("orphaned") is True or "mode" not in entry
+            retargeted = spec is not None and (cfg_dev, cfg_periph, cfg_var) != (
+                spec.config_device_id,
+                spec.config_peripheral_id,
+                spec.config_var_name,
+            )
+            if recovery_only or sid not in self._states or retargeted:
                 if orig_str and cfg_dev and cfg_periph and cfg_var:
-                    self._orphaned_bindings[str(sid)] = OrphanedSliderBinding(
+                    # A logical ID can move; keep the old physical backup in its own row.
+                    orphan_id = str(sid)
+                    while (
+                        orphan_id in self._states
+                        or orphan_id in self._orphaned_bindings
+                        or (orphan_id in data and orphan_id != sid)
+                    ):
+                        orphan_id = "orphan:" + orphan_id
+                    self._orphaned_bindings[orphan_id] = OrphanedSliderBinding(
                         config_device_id=cfg_dev,
                         config_peripheral_id=cfg_periph,
                         config_var_name=cfg_var,
                         original_slider_config=orig_str,
+                        slider_id=(
+                            entry.get("slider_id")
+                            if entry.get("orphaned") is True
+                            else (None if recovery_only else sid)
+                        ),
                     )
-                continue
+                if recovery_only or sid not in self._states:
+                    continue
             st = self._states[sid]
             spec = self._specs[sid]
             mode_str = entry.get("mode")
@@ -772,7 +614,7 @@ class VirtualSliderController:
                 st.step = max(1, min(spec.num_steps, int(entry["step"])))
             if isinstance(entry.get("is_on"), bool):
                 st.is_on = bool(entry["is_on"])
-            if orig_str is not None:
+            if orig_str is not None and not retargeted:
                 st.original_slider_config = orig_str
 
     def _build_persisted_snapshot(self) -> dict[str, Any]:
@@ -791,6 +633,8 @@ class VirtualSliderController:
             }
         for sid, orphan in self._orphaned_bindings.items():
             data[sid] = {
+                "orphaned": True,
+                "slider_id": orphan.slider_id,
                 "original_slider_config": orphan.original_slider_config,
                 "config_device_id": orphan.config_device_id,
                 "config_peripheral_id": orphan.config_peripheral_id,
@@ -800,7 +644,7 @@ class VirtualSliderController:
 
     def _save_state_if_changed(self) -> bool:
         if self._state_path is None:
-            return True
+            return False
         snapshot = self._build_persisted_snapshot()
         if snapshot == self._last_persisted_snapshot:
             return True
@@ -920,7 +764,7 @@ class VirtualSliderController:
                 await host.start()
                 self._hosts[sid] = host
 
-                await self._apply_slider_binding(spec, st.mode)
+                st.binding_ready = await self._apply_slider_binding(spec, st.mode)
                 self._save_state_if_changed()
 
                 await self._publish_discovery(spec)
@@ -934,10 +778,11 @@ class VirtualSliderController:
         """Apply deferred ``ble_mesh`` slider bindings once mesh leadership is won."""
         await self._restore_orphaned_bindings()
         for sid, spec in self._specs.items():
-            if spec.config_device_id != "ble_mesh":
-                continue
             st = self._states[sid]
-            await self._apply_slider_binding(spec, st.mode)
+            if spec.config_device_id != "ble_mesh" and st.binding_ready:
+                continue
+            st.binding_ready = await self._apply_slider_binding(spec, st.mode)
+            await self._publish_state(sid)
         self._save_state_if_changed()
 
     async def shutdown(self) -> None:
@@ -958,6 +803,16 @@ class VirtualSliderController:
 
     async def _apply_slider_binding(self, spec: VirtualSliderSpec, mode: SliderMode) -> bool:
         """Write ``CapTouchSliderConfig`` to the target peripheral after backing up original."""
+        st = self._states[spec.slider_id]
+        if any(
+            orphan.slider_id == spec.slider_id
+            or (orphan.slider_id is None and st.original_slider_config is None)
+            or (orphan.config_device_id, orphan.config_peripheral_id, orphan.config_var_name)
+            == (spec.config_device_id, spec.config_peripheral_id, spec.config_var_name)
+            for orphan in self._orphaned_bindings.values()
+        ):
+            logger.warning("Deferring slider binding until pending originals are restored")
+            return False
         if spec.config_device_id == "ble_mesh" and not self._is_mesh_leader():
             logger.debug(
                 "Deferring ble_mesh slider_config binding for %s until mesh leader",
@@ -965,7 +820,6 @@ class VirtualSliderController:
             )
             return False
 
-        st = self._states[spec.slider_id]
         current_b64: str | None = None
         try:
             current_dev = await self._bus.get_peripheral(
@@ -1027,12 +881,10 @@ class VirtualSliderController:
         else:
             if st.original_slider_config:
                 target_b64 = st.original_slider_config
-            elif spec.load_peripheral_id:
-                target_b64 = spec.passthrough_slider_config_b64(self._own_device_id)
             else:
                 logger.warning(
                     "Cannot switch virtual slider %s to passthrough: no original_slider_config "
-                    "captured and no load_peripheral_id configured",
+                    "captured",
                     spec.slider_id,
                 )
                 return False
@@ -1141,7 +993,10 @@ class VirtualSliderController:
         st = self._states[slider_id]
         spec = self._specs[slider_id]
         if not await self._apply_slider_binding(spec, new_mode):
+            st.binding_ready = False
+            await self._publish_state(slider_id)
             return
+        st.binding_ready = True
         st.mode = new_mode
         self._save_state_if_changed()
         await self._publish_state(slider_id, event=None)
@@ -1233,6 +1088,13 @@ class VirtualSliderController:
         sid = spec.slider_id
         avail = availability_topic(self._panel)
         st_topic = self._state_topic(sid)
+        availability = [
+            {"topic": avail},
+            {
+                "topic": st_topic,
+                "value_template": "{{ 'online' if value_json.binding_ready else 'offline' }}",
+            },
+        ]
         ev_topic = self._event_topic(sid)
         dev_block = device_block(self._panel)
         uid_base = f"brilliant_{self._panel}_vs_{sid}"
@@ -1240,7 +1102,8 @@ class VirtualSliderController:
         # 1. Select entity: Mode (virtual vs passthrough)
         select_uid = f"{uid_base}_mode"
         select_cfg = {
-            "availability": [{"topic": avail}],
+            "availability": availability,
+            "availability_mode": "all",
             "command_topic": self._mode_cmd_topic(sid),
             "device": dev_block,
             "entity_category": "config",
@@ -1259,7 +1122,8 @@ class VirtualSliderController:
         # 2. Number entity: Virtual Brightness (1-255)
         number_uid = f"{uid_base}_brightness"
         number_cfg = {
-            "availability": [{"topic": avail}],
+            "availability": availability,
+            "availability_mode": "all",
             "command_topic": self._brightness_cmd_topic(sid),
             "device": dev_block,
             "icon": "mdi:brightness-6",
@@ -1280,7 +1144,8 @@ class VirtualSliderController:
         # 3. Light entity: Virtual Dimmer Light (JSON schema)
         light_uid = f"{uid_base}_light"
         light_cfg = {
-            "availability": [{"topic": avail}],
+            "availability": availability,
+            "availability_mode": "all",
             "brightness": True,
             "command_topic": self._light_cmd_topic(sid),
             "device": dev_block,
@@ -1298,7 +1163,8 @@ class VirtualSliderController:
         # 4. Sensor entity: Step (1..num_steps)
         step_uid = f"{uid_base}_step"
         step_cfg = {
-            "availability": [{"topic": avail}],
+            "availability": availability,
+            "availability_mode": "all",
             "device": dev_block,
             "icon": "mdi:stairs",
             "name": f"{spec.name} Slider Step",
@@ -1314,7 +1180,8 @@ class VirtualSliderController:
         # 5. Event entity: Multi-Tap & Gesture Events
         event_uid = f"{uid_base}_event"
         event_cfg = {
-            "availability": [{"topic": avail}],
+            "availability": availability,
+            "availability_mode": "all",
             "device": dev_block,
             "event_types": list(ALL_SLIDER_EVENT_TYPES),
             "icon": "mdi:gesture-tap-button",
@@ -1335,6 +1202,7 @@ class VirtualSliderController:
             "raw_intensity": st.raw_intensity,
             "step": st.step,
             "mode": st.mode.value,
+            "binding_ready": st.binding_ready,
             "last_event": st.last_event,
             "event_seq": st.event_seq,
         }
@@ -1440,6 +1308,7 @@ def parse_virtual_slider_specs(raw_json: str, own_device_id: str = "") -> list[V
                     **opt_kwargs,
                 )
             )
+    _validate_spec_ownership(specs)
     return specs
 
 
@@ -1451,6 +1320,46 @@ def _read_persisted_state_dict(state_path: Path | None) -> dict[str, Any] | None
     except Exception:
         return None
     return data if isinstance(data, dict) else None
+
+
+def _valid_persisted_state(data: Any) -> bool:
+    """Validate every recovery row before anything can replace or retire it."""
+    valid_rows = isinstance(data, dict) and all(
+        isinstance(entry, dict)
+        and "original_slider_config" in entry
+        and (
+            entry["original_slider_config"] is not None
+            or (
+                entry.get("orphaned") is not True
+                and entry.get("mode") in (SliderMode.VIRTUAL.value, SliderMode.PASSTHROUGH.value)
+            )
+        )
+        and (
+            entry.get("orphaned") is not True
+            or entry.get("slider_id") is None
+            or (isinstance(entry.get("slider_id"), str) and bool(entry["slider_id"]))
+        )
+        and (
+            entry["original_slider_config"] is None
+            or (
+                isinstance(entry["original_slider_config"], str)
+                and decode_slider_config_target(entry["original_slider_config"]) is not None
+            )
+        )
+        and all(
+            isinstance(entry.get(key), str) and entry[key]
+            for key in ("config_device_id", "config_peripheral_id", "config_var_name")
+        )
+        for entry in data.values()
+    )
+    if not valid_rows:
+        return False
+    targets = {
+        (row["config_device_id"], row["config_peripheral_id"], row["config_var_name"])
+        for row in data.values()
+        if row["original_slider_config"] is not None
+    }
+    return len(targets) == sum(row["original_slider_config"] is not None for row in data.values())
 
 
 def has_persisted_slider_backups(state_path: Path | None) -> bool:
@@ -1483,7 +1392,13 @@ async def restore_all_persisted_slider_bindings(
 
     Used during integration uninstall or when all virtual sliders are removed.
     """
-    if not has_persisted_slider_backups(state_path):
+    if not await asyncio.to_thread(state_path.exists):
+        return True
+    data = _read_persisted_state_dict(state_path)
+    if not _valid_persisted_state(data):
+        return False
+    assert data is not None
+    if not any(entry["original_slider_config"] is not None for entry in data.values()):
         return True
 
     own_bus = False
@@ -1496,10 +1411,6 @@ async def restore_all_persisted_slider_bindings(
         own_bus = True
 
     try:
-        data = _read_persisted_state_dict(state_path)
-        if data is None:
-            return False
-
         all_restored = True
         changed = False
         for sid, entry in list(data.items()):
@@ -1509,11 +1420,14 @@ async def restore_all_persisted_slider_bindings(
             cfg_dev = str(entry.get("config_device_id", ""))
             cfg_periph = str(entry.get("config_peripheral_id", ""))
             cfg_var = str(entry.get("config_var_name", ""))
+            if orig_cfg is None:
+                continue
             if (
                 not isinstance(orig_cfg, str)
                 or not orig_cfg
                 or not (cfg_dev and cfg_periph and cfg_var)
             ):
+                all_restored = False
                 continue
             if cfg_dev == "ble_mesh" and not is_mesh_leader():
                 all_restored = False
