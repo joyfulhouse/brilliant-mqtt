@@ -77,6 +77,10 @@ class FakeBus:
     def capture_sequence(self) -> int:
         return self._capture_sequence
 
+    @property
+    def privacy_revocation(self) -> CaptureProvenance | None:
+        return None
+
     async def start(self) -> None:
         pass
 

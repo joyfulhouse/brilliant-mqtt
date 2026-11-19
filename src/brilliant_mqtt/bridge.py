@@ -374,6 +374,11 @@ class Bridge:
             self._privacy_sequence = -1
             self._privacy_invalid_through = -1
             self._privacy_source_generation = generation
+        revoked = self._bus.privacy_revocation
+        if revoked is not None and revoked.source_generation == generation:
+            self._privacy_invalid_through = max(self._privacy_invalid_through, revoked.sequence)
+            if self._privacy_sequence <= revoked.sequence:
+                self._privacy_off = False
 
     def _invalidate_privacy(self, devices: list[BrilliantDevice] | None = None) -> None:
         self._sync_privacy_generation()
