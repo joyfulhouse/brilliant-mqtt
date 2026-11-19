@@ -37,7 +37,7 @@ keeps the panels' Hue trust in place across firmware OTAs.
 | Removed entities | **Partial.** A removed or excluded entity becomes an unreachable, command-blocked Hue object. It is not deleted or recreated. |
 | Inventory, mapping and capability reconciliation | **Not implemented.** Only existing mappings are covered. |
 | Whole-frame byte bounds | **Not implemented.** `get_states` still returns HA's whole inventory, and the frame parser is not bounded. |
-| Live credential rotation / revocation | **Not implemented** (unqualified upstream). |
+| Live credential rotation / revocation | **Operational rotation/revocation unqualified.** Configured outbound token/host/port/CA-path changes replace the session and fence old callbacks/results; the replacement requires authentication and a fresh baseline ([upstream contract](https://github.com/diyhue/diyHue/blob/673b0e2386e128fd53578f7aadc07cf6fa0f8bfe/docs/homeassistant-event-reflection.md)). |
 | Same-cut parity between the event cache and a full read | **Inconclusive.** HA's `get_states` has no global revision, so no read can prove a source-wide cut. |
 
 ### Evidence so far
@@ -45,11 +45,14 @@ keeps the panels' Hue trust in place across firmware OTAs.
 - **Upstream synthetic replay.** The PR runs its real reducer through burst,
   drop, reorder, delayed-snapshot, reconnect and removal scenarios. It is
   fixture-only: no live HA, panel or light.
-- **Live event-mode measurement** (#153 comment, 2026-10-26/27). A passive
-  observer in the diyHue pod polled the Hue v1 API every 0.25 s after each
-  natural HA change on a mapped light. 136/136 changes were reflected; delay from
-  HA event to the Hue API was median 0.13 s, p95 0.26 s, max 0.93 s, at 0.25 s
-  resolution. There is **no like-for-like legacy baseline**, so this is an
+- **Live event-mode measurement** ([#153 comment](https://github.com/joyfulhouse/brilliant-mqtt/issues/153#issuecomment-6432242990),
+  2026-10-26/27). A passive observer in the diyHue pod polled the Hue v1 API
+  every 0.25 s after each
+  natural HA change on a mapped light. The 187 HA events were coalesced into
+  136 distinct samples across 7 of 10 mapped lights; 136/136 coalesced samples
+  were reflected. Delay from HA event to the Hue API was median 0.13 s,
+  p95 0.26 s, max 0.93 s, at 0.25 s resolution. There is **no like-for-like
+  legacy baseline**, so this is an
   absolute figure for event mode, not a before/after ratio.
 - **Benchmark B (panel display) has not been run.** The measurement stops at
   diyHue's Hue API.
