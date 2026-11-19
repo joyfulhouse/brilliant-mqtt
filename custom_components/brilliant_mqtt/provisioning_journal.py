@@ -1280,6 +1280,24 @@ def ownerless_journal_recovery_allowed(
     )
 
 
+def _same_verified_panel(
+    request: StoredPanelRequest,
+    *,
+    slug: str,
+    public_key: str,
+    fingerprint: str,
+) -> bool:
+    return (
+        request.slug == slug
+        and request.public_key == public_key
+        and request.fingerprint == fingerprint
+    )
+
+
+def _record_at_host(record: ProvisioningRecord, host: str) -> ProvisioningRecord:
+    return replace(record, panel_request=replace(record.panel_request, host=host))
+
+
 class ProvisioningJournal:
     """Serialize one provisioning transaction before every observable phase change."""
 
@@ -1407,6 +1425,66 @@ class ProvisioningJournal:
         # Failure or cancellation can arrive after the row reached disk. Never
         # compensate by deleting the only HA owner of the on-panel baseline.
         await self._async_retained_save(records, secrets=_storage_secrets(record))
+
+    async def async_adopt_verified_host(
+        self,
+        *,
+        slug: str,
+        public_key: str,
+        fingerprint: str,
+        host: str,
+    ) -> None:
+        """Point this panel's records at a host whose SSH pin was just verified.
+
+        Ownership is the slug plus the pinned public key and fingerprint. A
+        record for any other panel is left unchanged, including one that only
+        shares the previous address.
+        """
+        async with self._coordinator.lock:
+            await self._async_reload()
+            changed = 0
+            active = self._coordinator.record
+            if (
+                active is not None
+                and _same_verified_panel(
+                    active.panel_request,
+                    slug=slug,
+                    public_key=public_key,
+                    fingerprint=fingerprint,
+                )
+                and active.panel_request.host != host
+            ):
+                await self._async_save(_record_at_host(active, host))
+                changed += 1
+            records = await self._async_retained_load()
+            retained_changed = False
+            for key, retained in records.items():
+                request = retained.record.panel_request
+                if (
+                    not _same_verified_panel(
+                        request,
+                        slug=slug,
+                        public_key=public_key,
+                        fingerprint=fingerprint,
+                    )
+                    or request.host == host
+                ):
+                    continue
+                records[key] = replace(
+                    retained,
+                    record=_record_at_host(retained.record, host),
+                )
+                retained_changed = True
+                changed += 1
+            if retained_changed:
+                await self._async_retained_save(records)
+            if changed:
+                _LOGGER.info(
+                    "Retargeted %s provisioning record(s) for panel %s "
+                    "after a verified address change",
+                    changed,
+                    slug,
+                )
 
     async def async_arm(self, record: ProvisioningRecord) -> None:
         async with self._coordinator.lock:

@@ -107,6 +107,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Add Brilliant panel can clear an already stranded `armed` / `staged`
   baseline that has no execution journal and no panel subentry, after the
   panel still matches the capture and no candidate release directory exists.
+- A verified panel address change, and a later canary finalize or rollback,
+  keep retained baselines and the active provisioning record on the new host
+  when the slug and pinned SSH identity still match. A different slug or SSH
+  identity is still refused. `baseline_owner_mismatch` is shown and logged
+  instead of the generic `canary_operation_failed`.
 
 ## [0.12.2] - 2026-11-17
 
