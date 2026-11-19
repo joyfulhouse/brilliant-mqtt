@@ -52,11 +52,15 @@ During an attempt the TCP connection is `SYN_SENT` on the panel and `SYN_RECV`
 on the broker. The broker received the SYN, but its SYN-ACK never reaches the
 panel.
 
-**This is not the agent.** It is a network fault. The agent already limits each
+**The handshake is failing below MQTT.** Inspect runtime Wi-Fi configuration and
+the network path before restarting. The service makes a best-effort attempt to
+disable Wi-Fi power-save on each start (`deploy/brilliant-mqtt.service`), so a
+restart can change inbound delivery if that setting previously failed. Read the
+current power-save state first using the full qualification runbook linked below;
+do not change it during the diagnostic baseline. The agent already limits each
 connect attempt to 10 s (aiomqtt `timeout=10.0` in `src/brilliant_mqtt/mqttio.py`).
 It then retries with a backoff of 5, 10, 20 and 40 s, capped at 60 s
-(`run()` in `src/brilliant_mqtt/__main__.py`). Restarting or redeploying the
-agent won't help, because the next attempt takes the same network path.
+(`run()` in `src/brilliant_mqtt/__main__.py`).
 
 **Known cause ([#173](https://github.com/joyfulhouse/brilliant-mqtt/issues/173)).**
 One access point stopped delivering broadcast and multicast frames to its
@@ -85,8 +89,11 @@ timeout 15 tcpdump -ni <vlan-iface> -c 200 'arp and host <panel-ip>'
 
 Run the same checks against a healthy panel on the same VLAN and the same AP. If
 the host sends ARP requests for the failing panel and gets no replies, while the
-healthy panel answers, suspect group-addressed frame delivery on the AP rather
-than the panel or the broker.
+healthy panel answers, group-addressed frame delivery on the AP is one possible
+cause. Broker-only evidence cannot distinguish request loss, panel nonresponse,
+or reply loss. Correlate panel and, where needed, AP captures with the broker
+capture before attributing the fault to AP delivery or taking AP recovery action;
+follow the full qualification runbook linked below.
 
 **Rule out the other causes:**
 
