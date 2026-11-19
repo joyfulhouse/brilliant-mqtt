@@ -13,6 +13,7 @@ import pytest
 from brilliant_mqtt import virtual_sliders as virtual_sliders_module
 from brilliant_mqtt.bus import HostedVirtualPeripheralAdapter
 from brilliant_mqtt.commands import VarSet
+from brilliant_mqtt.desired_state import atomic_write_json
 from brilliant_mqtt.model import BrilliantDevice, DeviceKind, Variable
 from brilliant_mqtt.protocols import (
     VirtualPeripheralHostProtocol,
@@ -1008,3 +1009,441 @@ class TestVirtualSliderController:
         assert len(created_hosts) == 2
         assert created_hosts[0].started is True
         assert created_hosts[0].stopped is True
+
+
+@pytest.mark.parametrize("restore_succeeds", [True, False])
+async def test_retarget_preserves_exact_old_target_until_verified_restore(
+    tmp_path: Path, restore_succeeds: bool
+) -> None:
+    originals = [REAL_PANEL_SLIDER_CONFIG_0_B64, REAL_PANEL_SLIDER_CONFIG_1_B64]
+    faceplate = BrilliantDevice(
+        device_id=PANEL_DEV_ID,
+        peripheral_id="faceplate_peripheral",
+        name="Faceplate",
+        kind=DeviceKind.UNKNOWN,
+        variables={
+            f"slider_config:{i}": Variable(f"slider_config:{i}", v) for i, v in enumerate(originals)
+        },
+    )
+    bus = _ConfigurableFakeBus([faceplate])
+    state_file = tmp_path / "virtual-sliders.json"
+
+    async def start(index: int) -> VirtualSliderController:
+        ctrl = VirtualSliderController(
+            bus=bus,
+            mqtt=FakeMqtt(),
+            panel="test",
+            own_device_id=PANEL_DEV_ID,
+            specs=[
+                VirtualSliderSpec.for_panel_slider(
+                    slider_id="same",
+                    name="Same",
+                    panel_device_id=PANEL_DEV_ID,
+                    slider_index=index,
+                )
+            ],
+            host_factory=FakeVirtualPeripheralHost,
+            state_path=state_file,
+        )
+        await ctrl.start()
+        return ctrl
+
+    ctrl = await start(0)
+    await ctrl.shutdown()
+    bus.reflect_writes = restore_succeeds
+    ctrl = await start(1)
+    await ctrl.shutdown()
+    saved = json.loads(state_file.read_text())
+    if restore_succeeds:
+        assert saved["same"]["original_slider_config"] == originals[1]
+        assert faceplate.variables["slider_config:0"].value == originals[0]
+        assert len(saved) == 1
+    else:
+        assert saved["same"]["original_slider_config"] is None
+        assert faceplate.variables["slider_config:1"].value == originals[1]
+        old_rows = [row for row in saved.values() if row["config_var_name"] == "slider_config:0"]
+        assert len(old_rows) == 1
+        assert old_rows[0]["original_slider_config"] == originals[0]
+        # Reload while restoration still fails: neither backup may be overwritten.
+        ctrl = await start(1)
+        await ctrl.shutdown()
+        assert json.loads(state_file.read_text()) == saved
+    bus.reflect_writes = True
+    assert await restore_all_persisted_slider_bindings(state_file, bus=bus)
+    for i, original in enumerate(originals):
+        assert faceplate.variables[f"slider_config:{i}"].value == original
+
+
+@pytest.mark.parametrize(
+    "contents", ["broken json", "[]", '{"same": {"original_slider_config": "exact"}}']
+)
+async def test_uninstall_restore_rejects_unreadable_or_incomplete_backups(
+    tmp_path: Path, contents: str
+) -> None:
+    state_file = tmp_path / "virtual-sliders.json"
+    state_file.write_text(contents)
+    assert not await restore_all_persisted_slider_bindings(state_file, bus=_ConfigurableFakeBus([]))
+    assert state_file.read_text() == contents
+
+
+class _RecoveryRig:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.face = BrilliantDevice(
+            device_id=PANEL_DEV_ID,
+            peripheral_id="faceplate_peripheral",
+            name="face",
+            kind=DeviceKind.UNKNOWN,
+            variables={
+                "slider_config:0": Variable("slider_config:0", REAL_PANEL_SLIDER_CONFIG_0_B64),
+                "slider_config:1": Variable("slider_config:1", REAL_PANEL_SLIDER_CONFIG_1_B64),
+            },
+        )
+        self.bus = _ConfigurableFakeBus([self.face])
+        self.mqtt = FakeMqtt()
+
+    def controller(self, *pairs: tuple[str, int]) -> VirtualSliderController:
+        specs = parse_virtual_slider_specs(
+            json.dumps(
+                [
+                    {"slider_id": sid, "slider_index": index, "load_peripheral_id": "fallback"}
+                    for sid, index in pairs
+                ]
+            ),
+            PANEL_DEV_ID,
+        )
+        return VirtualSliderController(
+            self.bus, self.mqtt, "test", PANEL_DEV_ID, specs, FakeVirtualPeripheralHost, self.path
+        )
+
+    async def run(self, *pairs: tuple[str, int]) -> VirtualSliderController:
+        ctrl = self.controller(*pairs)
+        await ctrl.start()
+        await ctrl.shutdown()
+        return ctrl
+
+
+async def test_retarget_passthrough_read_failure_cannot_synthesize_original(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig = _RecoveryRig(tmp_path / "state.json")
+    ctrl = await rig.run(("A", 0))
+    await ctrl._handle_mode_command("A", "passthrough")
+    read = rig.bus.get_peripheral
+    reads = 0
+
+    async def fail_destination(device_id: str, peripheral_id: str) -> BrilliantDevice | None:
+        nonlocal reads
+        if peripheral_id == "faceplate_peripheral":
+            reads += 1
+            if reads == 2:
+                raise OSError("destination unavailable")
+        return await read(device_id, peripheral_id)
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(rig.bus, "get_peripheral", fail_destination)
+        ctrl = await rig.run(("A", 1))
+    assert rig.face.variables["slider_config:1"].value == REAL_PANEL_SLIDER_CONFIG_1_B64
+    assert not ctrl.state_for("A").binding_ready
+    assert json.loads(rig.path.read_text())["A"]["original_slider_config"] is None
+    await rig.run(("A", 1))
+    assert await restore_all_persisted_slider_bindings(rig.path, bus=rig.bus)
+    assert rig.face.variables["slider_config:1"].value == REAL_PANEL_SLIDER_CONFIG_1_B64
+
+
+async def test_duplicate_target_rejected_before_ledger_or_physical_mutation(tmp_path: Path) -> None:
+    rig = _RecoveryRig(tmp_path / "state.json")
+    await rig.run(("A", 0), ("B", 1))
+    saved = rig.path.read_text()
+    commands = list(rig.bus.commands)
+    with pytest.raises(ValueError, match="unique"):
+        rig.controller(("A", 1), ("B", 1))
+    duplicate = VirtualSliderSpec.for_panel_slider("A", "A", PANEL_DEV_ID, slider_index=1)
+    with pytest.raises(ValueError, match="unique"):
+        VirtualSliderController(
+            rig.bus,
+            rig.mqtt,
+            "test",
+            PANEL_DEV_ID,
+            [duplicate, duplicate],
+            FakeVirtualPeripheralHost,
+            rig.path,
+        )
+    assert rig.path.read_text() == saved
+    assert rig.bus.commands == commands
+    data = json.loads(saved)
+    data["A"]["config_var_name"] = data["B"]["config_var_name"]
+    rig.path.write_text(json.dumps(data))
+    conflicted = rig.path.read_text()
+    assert not await restore_all_persisted_slider_bindings(rig.path, bus=rig.bus)
+    with pytest.raises(ValueError, match="Invalid"):
+        rig.controller(("A", 1))
+    assert rig.path.read_text() == conflicted
+    assert rig.bus.commands == commands
+
+
+async def test_transient_load_error_preserves_prior_exact_backup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig = _RecoveryRig(tmp_path / "state.json")
+    await rig.run(("A", 0))
+    saved = rig.path.read_text()
+    commands = list(rig.bus.commands)
+    read = Path.read_text
+
+    def fail_read(path: Path, *args: Any, **kwargs: Any) -> str:
+        if path == rig.path:
+            raise OSError("transient EIO")
+        return read(path, *args, **kwargs)
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(Path, "read_text", fail_read)
+        with pytest.raises(ValueError, match="safely load"):
+            rig.controller(("A", 1))
+    assert rig.path.read_text() == saved
+    assert rig.bus.commands == commands
+    await rig.run(("A", 1))
+    assert await restore_all_persisted_slider_bindings(rig.path, bus=rig.bus)
+
+
+@pytest.mark.parametrize(
+    "bad_row",
+    [
+        REAL_PANEL_SLIDER_CONFIG_0_B64,
+        {"config_var_name": "slider_config:0"},
+        {"original_slider_config": REAL_PANEL_SLIDER_CONFIG_0_B64, "config_device_id": "panel"},
+        {
+            "original_slider_config": None,
+            "config_device_id": 7,
+            "config_peripheral_id": "faceplate_peripheral",
+            "config_var_name": "slider_config:0",
+        },
+    ],
+)
+async def test_invalid_ledger_cannot_be_replaced_or_declared_restored(
+    tmp_path: Path, bad_row: Any
+) -> None:
+    rig = _RecoveryRig(tmp_path / "state.json")
+    rig.path.write_text(json.dumps({"A": bad_row}))
+    saved = rig.path.read_text()
+    with pytest.raises(ValueError, match="Invalid"):
+        rig.controller(("A", 1))
+    assert not await restore_all_persisted_slider_bindings(rig.path, bus=rig.bus)
+    assert rig.path.read_text() == saved
+    assert not rig.bus.commands
+
+
+@pytest.mark.parametrize("fault", ["write", "superseded", "cancel", "readback", "disk"])
+async def test_unresolved_retarget_defers_live_new_target_and_survives_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    import asyncio
+
+    from brilliant_mqtt.write_admission import Superseded
+
+    rig = _RecoveryRig(tmp_path / "state.json")
+    await rig.run(("A", 0))
+    ctrl = rig.controller(("A", 1))
+    write = rig.bus.set_variables
+    atomic = atomic_write_json
+
+    async def fail_old_target(device_id: str, peripheral_id: str, sets: list[VarSet]) -> Any:
+        if sets[0].name == "slider_config:0":
+            if fault == "write":
+                raise OSError("old target offline")
+            if fault == "superseded":
+                return Superseded()
+            if fault == "cancel":
+                raise asyncio.CancelledError()
+            if fault == "readback":
+                return None
+        return await write(device_id, peripheral_id, sets)
+
+    def fail_disk(path: Path, data: Any) -> None:
+        if fault == "disk":
+            raise OSError("disk full")
+        atomic(path, data)
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(rig.bus, "set_variables", fail_old_target)
+        patcher.setattr(virtual_sliders_module, "atomic_write_json", fail_disk)
+        if fault == "cancel":
+            with pytest.raises(asyncio.CancelledError):
+                await ctrl.start()
+        else:
+            await ctrl.start()
+        await ctrl.shutdown()
+    assert REAL_PANEL_SLIDER_CONFIG_0_B64 in rig.path.read_text()
+    assert rig.face.variables["slider_config:1"].value == REAL_PANEL_SLIDER_CONFIG_1_B64
+    assert not ctrl.state_for("A").binding_ready
+    if fault not in ("cancel",):
+        messages = [
+            json.loads(payload)
+            for topic, payload, _ in rig.mqtt.published
+            if topic == "brilliant/test/virtual_slider_A/state"
+        ]
+        assert messages[-1]["binding_ready"] is False
+        discovery = [
+            json.loads(payload)
+            for topic, payload, _ in rig.mqtt.published
+            if topic.startswith("homeassistant/")
+        ]
+        assert all(row["availability_mode"] == "all" for row in discovery)
+    await rig.run(("A", 1))
+    assert await restore_all_persisted_slider_bindings(rig.path, bus=rig.bus)
+    assert rig.face.variables["slider_config:0"].value == REAL_PANEL_SLIDER_CONFIG_0_B64
+    assert rig.face.variables["slider_config:1"].value == REAL_PANEL_SLIDER_CONFIG_1_B64
+
+
+async def test_explicit_null_valid_rows_need_no_bus(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from brilliant_mqtt.bus import RpcBusAdapter
+
+    rig = _RecoveryRig(tmp_path / "state.json")
+    rig.path.write_text(
+        json.dumps(
+            {
+                "A": {
+                    "mode": "virtual",
+                    "original_slider_config": None,
+                    "config_device_id": PANEL_DEV_ID,
+                    "config_peripheral_id": "faceplate_peripheral",
+                    "config_var_name": "slider_config:0",
+                }
+            }
+        )
+    )
+
+    async def unexpected_start(self: Any) -> None:
+        raise AssertionError("no bus needed for a valid ledger with no originals")
+
+    monkeypatch.setattr(RpcBusAdapter, "start", unexpected_start)
+    assert await restore_all_persisted_slider_bindings(rig.path)
+
+
+async def test_returning_to_pending_old_target_keeps_one_recoverable_owner(tmp_path: Path) -> None:
+    rig = _RecoveryRig(tmp_path / "state.json")
+    ctrl = await rig.run(("A", 0))
+    await ctrl._handle_mode_command("A", "passthrough")
+    # Leave a virtual old endpoint with a persisted passthrough desire.
+    rig.face.variables["slider_config:0"] = Variable(
+        "slider_config:0", encode_slider_config(PANEL_DEV_ID, "vs_dimmer_A")
+    )
+    rig.bus.reflect_writes = False
+    await rig.run(("A", 1))
+    await rig.run(("A", 0))
+    await rig.run(("A", 0))
+    data = json.loads(rig.path.read_text())
+    assert len(data) == 2
+    assert data["A"]["mode"] == "passthrough"
+    assert data["A"]["original_slider_config"] is None
+    assert data["orphan:A"]["original_slider_config"] == REAL_PANEL_SLIDER_CONFIG_0_B64
+    rig.bus.reflect_writes = True
+    assert await restore_all_persisted_slider_bindings(rig.path, bus=rig.bus)
+    assert rig.face.variables["slider_config:0"].value == REAL_PANEL_SLIDER_CONFIG_0_B64
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_recovery_row_cannot_be_adopted_by_a_future_logical_id(
+    tmp_path: Path, legacy: bool
+) -> None:
+    rig = _RecoveryRig(tmp_path / "state.json")
+    await rig.run(("A", 0))
+    rig.bus.reflect_writes = False
+    await rig.run(("A", 1))
+    data = json.loads(rig.path.read_text())
+    assert data["orphan:A"]["orphaned"] is True
+    if legacy:
+        del data["orphan:A"]["orphaned"]
+        del data["orphan:A"]["slider_id"]
+        rig.path.write_text(json.dumps(data))
+    rig.bus.reflect_writes = True
+    await rig.run(("A", 1), ("orphan:A", 0))
+    assert REAL_PANEL_SLIDER_CONFIG_0_B64 in rig.path.read_text()
+    assert await restore_all_persisted_slider_bindings(rig.path, bus=rig.bus)
+    assert rig.face.variables["slider_config:0"].value == REAL_PANEL_SLIDER_CONFIG_0_B64
+    assert rig.face.variables["slider_config:1"].value == REAL_PANEL_SLIDER_CONFIG_1_B64
+
+
+async def test_unrelated_recovery_cannot_block_healthy_slider_passthrough(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig = _RecoveryRig(tmp_path / "state.json")
+    await rig.run(("A", 0), ("B", 1))
+    write = rig.bus.set_variables
+
+    async def fail_only_old(device_id: str, peripheral_id: str, sets: list[VarSet]) -> Any:
+        if sets[0].name == "slider_config:0":
+            raise OSError("only old A offline")
+        return await write(device_id, peripheral_id, sets)
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(rig.bus, "set_variables", fail_only_old)
+        ctrl = await rig.run(("B", 1))
+        assert ctrl.state_for("B").binding_ready
+        await ctrl._handle_mode_command("B", "passthrough")
+    assert ctrl.state_for("B").mode == SliderMode.PASSTHROUGH
+    assert ctrl.state_for("B").binding_ready
+    assert rig.face.variables["slider_config:1"].value == REAL_PANEL_SLIDER_CONFIG_1_B64
+    assert REAL_PANEL_SLIDER_CONFIG_0_B64 in rig.path.read_text()
+
+
+async def test_truncated_original_cannot_be_written_or_retired(tmp_path: Path) -> None:
+    rig = _RecoveryRig(tmp_path / "state.json")
+    await rig.run(("A", 0))
+    data = json.loads(rig.path.read_text())
+    data["A"]["original_slider_config"] = REAL_PANEL_SLIDER_CONFIG_0_B64[:-12]
+    rig.path.write_text(json.dumps(data))
+    saved = rig.path.read_text()
+    commands = list(rig.bus.commands)
+    with pytest.raises(ValueError, match="Invalid"):
+        rig.controller(("A", 1))
+    assert not await restore_all_persisted_slider_bindings(rig.path, bus=rig.bus)
+    assert rig.path.read_text() == saved
+    assert rig.bus.commands == commands
+
+
+@pytest.mark.parametrize("mode", [SliderMode.VIRTUAL, SliderMode.PASSTHROUGH])
+async def test_missing_durable_state_path_cannot_admit_a_physical_binding(
+    tmp_path: Path, mode: SliderMode
+) -> None:
+    rig = _RecoveryRig(tmp_path / "unused")
+    spec = VirtualSliderSpec.for_panel_slider(
+        "A",
+        "A",
+        PANEL_DEV_ID,
+        slider_index=0,
+        default_mode=mode,
+    )
+    ctrl = VirtualSliderController(
+        rig.bus,
+        rig.mqtt,
+        "test",
+        PANEL_DEV_ID,
+        [spec],
+        FakeVirtualPeripheralHost,
+        state_path=None,
+    )
+    await ctrl.start()
+    assert not rig.bus.commands
+    assert rig.face.variables["slider_config:0"].value == REAL_PANEL_SLIDER_CONFIG_0_B64
+    assert not ctrl.state_for("A").binding_ready
+    await ctrl.shutdown()
+
+
+async def test_typed_recovery_row_requires_a_valid_original(tmp_path: Path) -> None:
+    rig = _RecoveryRig(tmp_path / "state.json")
+    await rig.run(("A", 0))
+    rig.bus.reflect_writes = False
+    await rig.run(("A", 1))
+    data = json.loads(rig.path.read_text())
+    data["orphan:A"]["original_slider_config"] = None
+    rig.path.write_text(json.dumps(data))
+    saved = rig.path.read_text()
+    commands = list(rig.bus.commands)
+    assert not await restore_all_persisted_slider_bindings(rig.path, bus=rig.bus)
+    with pytest.raises(ValueError, match="Invalid"):
+        rig.controller(("A", 1))
+    assert rig.path.read_text() == saved
+    assert rig.bus.commands == commands
