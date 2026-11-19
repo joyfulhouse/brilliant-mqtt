@@ -1853,8 +1853,10 @@ async def test_actual_ha_remove_recovers_exact_removed_sole_owner(
         await hass.config_entries.async_remove(entry.entry_id)
 
     assert hass.config_entries.async_get_entry(entry.entry_id) is None
-    get_recovery.assert_called_once_with(hass)
-    recover.assert_awaited_once_with()
+    get_recovery.assert_called_once_with(
+        hass, removed_entry=entry, expected_record=journal.async_load.return_value
+    )
+    recover.assert_awaited_once_with(expected_record=journal.async_load.return_value)
     assert ir.async_get(hass).async_get_issue(DOMAIN, issue_id) is None
 
 
@@ -1900,7 +1902,7 @@ async def test_actual_ha_remove_recovers_exact_empty_fleet_before_subentry(
         await hass.config_entries.async_remove(entry.entry_id)
 
     assert hass.config_entries.async_get_entry(entry.entry_id) is None
-    recover.assert_awaited_once_with()
+    recover.assert_awaited_once_with(expected_record=journal.async_load.return_value)
 
 
 @pytest.mark.parametrize(
@@ -1958,7 +1960,7 @@ async def test_actual_ha_remove_recovers_pre_subentry_panel_from_nonempty_single
         await hass.config_entries.async_remove(entry.entry_id)
 
     assert hass.config_entries.async_get_entry(entry.entry_id) is None
-    recover.assert_awaited_once_with()
+    recover.assert_awaited_once_with(expected_record=journal.async_load.return_value)
     assert ir.async_get(hass).async_get_issue(DOMAIN, issue_id) is None
 
 
@@ -2175,7 +2177,7 @@ async def test_actual_ha_remove_aborts_owned_flow_and_settles_pending_journal(
         await hass.config_entries.async_remove(entry.entry_id)
 
     abort.assert_called_once_with("owned-panel-flow")
-    recover.assert_awaited_once_with()
+    recover.assert_awaited_once_with(expected_record=journal.async_load.return_value)
 
 
 async def test_actual_ha_remove_does_not_abort_unrelated_active_flow(
@@ -2230,7 +2232,7 @@ async def test_actual_ha_remove_does_not_abort_unrelated_active_flow(
         await hass.config_entries.async_remove(entry.entry_id)
 
     abort.assert_not_called()
-    recover.assert_awaited_once_with()
+    recover.assert_awaited_once_with(expected_record=journal.async_load.return_value)
 
 
 async def test_removed_empty_fleet_with_legacy_competitor_preserves_journal(
@@ -2356,7 +2358,8 @@ async def test_actual_ha_remove_drains_recovery_before_propagating_cancellation(
     release = asyncio.Event()
     finished = asyncio.Event()
 
-    async def recover() -> None:
+    async def recover(*, expected_record: ProvisioningRecord) -> None:
+        assert expected_record == _pending_record()
         entered.set()
         await release.wait()
         finished.set()

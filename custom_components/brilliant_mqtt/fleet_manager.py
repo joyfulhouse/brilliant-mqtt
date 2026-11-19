@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from collections.abc import Coroutine, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Coroutine, Iterable, Mapping
 from dataclasses import dataclass
 from functools import partial
 from types import MappingProxyType
@@ -426,6 +426,15 @@ def _owned_subentry(
     return None
 
 
+def _committed_owner_matches(entry: ConfigEntry[Any], candidate: ConfigSubentry | None) -> bool:
+    """Committed cleanup requires the normalized, exact config subentry owner."""
+    return (
+        candidate is not None
+        and candidate.data.get(CONF_PROVISIONING_TRANSACTION_ID) is None
+        and entry.data.get(CONF_SCENE_PANEL) == candidate.subentry_id
+    )
+
+
 class ConfigEntryPersistenceError(RuntimeError):
     """One fixed, redacted failure for an unproven config-entry disk boundary."""
 
@@ -703,6 +712,10 @@ async def _async_authorize_recorded_recovery(
             ) or not _is_exact_fleet_envelope_owner(owner, record):
                 raise EntryDataError("provisioning_ownership_mismatch")
             candidate = _owned_subentry(owner, record)
+            if record.phase is ProvisioningPhase.COMMITTED and not _committed_owner_matches(
+                owner, candidate
+            ):
+                raise EntryDataError("provisioning_ownership_mismatch")
             if candidate is not None and record.phase not in {
                 ProvisioningPhase.PENDING_CONFIG_COMMIT,
                 ProvisioningPhase.COMMITTED,
@@ -728,6 +741,8 @@ async def _async_authorize_recorded_recovery(
 def _build_panel_provisioner(
     hass: HomeAssistant,
     identity_fetcher: Any,
+    *,
+    recovery_authorizer: Callable[[ProvisioningRecord], Awaitable[None]] | None = None,
 ) -> PanelProvisioner:
     """Wire one provisioner to HA-wide locks and production adapters."""
     validator = BrokerValidator(
@@ -750,7 +765,8 @@ def _build_panel_provisioner(
         broker_validator=validator,
         health_observer_factory=partial(PanelHealthObserver, hass),
         credential_resolver=partial(_async_rollback_credential, hass),
-        recovery_authorizer=partial(_async_authorize_recorded_recovery, hass),
+        recovery_authorizer=recovery_authorizer
+        or partial(_async_authorize_recorded_recovery, hass),
         retained_owner_exists=partial(_async_retained_owner_exists, hass),
         transaction_lookup=partial(_async_transaction_lookup, hass),
         repair_reporter=_ProvisioningRepairReporter(hass),
@@ -771,14 +787,63 @@ def get_panel_provisioner(
     )
 
 
-def _get_recovery_provisioner(hass: HomeAssistant) -> PanelProvisioner:
+async def _async_authorize_removed_recovery(
+    hass: HomeAssistant,
+    removed_entry: ConfigEntry[Any],
+    expected: ProvisioningRecord,
+    current: ProvisioningRecord,
+) -> None:
+    """Limit a removal hook's authority to its exact journal and retired owner."""
+    if (
+        current != expected
+        or hass.config_entries.async_get_entry(removed_entry.entry_id) is not None
+        or hass.config_entries.async_entries(DOMAIN)
+    ):
+        raise PanelProvisioningError("provisioning_recovery_required")
+    if current.operation not in {ProvisioningOperation.INSTALL, ProvisioningOperation.UPGRADE}:
+        await _async_authorize_recorded_recovery(hass, current)
+        return
+    try:
+        candidate = _owned_subentry(removed_entry, current)
+        if (
+            not _is_exact_fleet_envelope_owner(removed_entry, current)
+            or current.phase is ProvisioningPhase.COMMITTED
+            and not _committed_owner_matches(removed_entry, candidate)
+            or candidate is not None
+            and current.phase
+            not in {
+                ProvisioningPhase.PENDING_CONFIG_COMMIT,
+                ProvisioningPhase.COMMITTED,
+            }
+        ):
+            raise EntryDataError("provisioning_ownership_mismatch")
+    except EntryDataError:
+        raise PanelProvisioningError("provisioning_recovery_required") from None
+
+
+def _get_recovery_provisioner(
+    hass: HomeAssistant,
+    *,
+    removed_entry: ConfigEntry[Any] | None = None,
+    expected_record: ProvisioningRecord | None = None,
+) -> PanelProvisioner:
     """Build recovery-only orchestration; fresh installation stays unavailable."""
 
     async def recovery_only_identity_fetcher(host: str) -> HostIdentity:
         del host
         raise RuntimeError("recovery_only_provisioner")
 
-    return _build_panel_provisioner(hass, recovery_only_identity_fetcher)
+    if removed_entry is None and expected_record is None:
+        return _build_panel_provisioner(hass, recovery_only_identity_fetcher)
+    if removed_entry is None or expected_record is None:
+        raise ValueError("removed_recovery_authority_incomplete")
+    return _build_panel_provisioner(
+        hass,
+        recovery_only_identity_fetcher,
+        recovery_authorizer=partial(
+            _async_authorize_removed_recovery, hass, removed_entry, expected_record
+        ),
+    )
 
 
 @callback
@@ -903,7 +968,9 @@ async def _async_recover_removed_entry(
             )
             return
         _async_abort_owned_panel_flows(hass, entry, record.transaction_id)
-        await _get_recovery_provisioner(hass).async_recover()
+        await _get_recovery_provisioner(
+            hass, removed_entry=entry, expected_record=record
+        ).async_recover(expected_record=record)
         ir.async_delete_issue(
             hass,
             DOMAIN,
@@ -1358,10 +1425,7 @@ class FleetManager:
                 )
                 raise EntryDataError("provisioning_ownership_mismatch")
             if record.phase is ProvisioningPhase.COMMITTED:
-                if (
-                    candidate.data.get(CONF_PROVISIONING_TRANSACTION_ID) is not None
-                    or self.entry.data.get(CONF_SCENE_PANEL) != candidate.subentry_id
-                ):
+                if not _committed_owner_matches(self.entry, candidate):
                     await _ProvisioningRepairReporter(self.hass).async_report_rollback_failure(
                         record.transaction_id,
                         original_code="restart_recovery",
