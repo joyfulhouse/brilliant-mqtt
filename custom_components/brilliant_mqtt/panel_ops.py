@@ -3030,15 +3030,45 @@ def _swap_command() -> str:
     )
 
 
+def _slider_state_directory(environment: str) -> str | None:
+    """Read the supported systemd value forms; refuse ambiguous escape/continuation syntax."""
+    directory = None
+    for line in environment.splitlines():
+        key, separator, raw = line.strip().partition("=")
+        if not separator or key.strip() != "MOTION_DESIRED_STATE_DIR":
+            continue
+        raw = raw.strip()
+        if raw.startswith("'") and re.fullmatch(r"'[^']*'", raw):
+            directory = raw[1:-1]
+        elif raw.startswith('"') and re.fullmatch(r'"(?:[^"\\]|\\["\\])*"', raw):
+            directory = _env_unquote(raw)
+        elif not any(character in raw for character in "'\"\\"):
+            directory = raw
+        else:
+            raise PanelOpError("slider_recovery_environment_unsupported")
+    return directory
+
+
 async def _restore_virtual_sliders_on_uninstall(shell: PanelShell) -> None:
     """Require verified restoration before removing backups and retry code."""
     environment = await _checked(
         shell, f"if [ -e {PANEL_ENV_FILE} ]; then cat {PANEL_ENV_FILE}; fi"
     )
-    configured_dir = parse_env(environment.stdout).get("MOTION_DESIRED_STATE_DIR")
+    configured_dir = _slider_state_directory(environment.stdout)
+    if configured_dir and not configured_dir.startswith("/"):
+        working = await _checked(
+            shell, f"systemctl show --property=WorkingDirectory --value {SERVICE_NAME}"
+        )
+        working_dir = working.stdout.strip() or "/"
+        if not working_dir.startswith("/") or "\n" in working_dir:
+            raise PanelOpError("slider_recovery_working_directory_unknown")
+        configured_dir = f"{working_dir.rstrip('/')}/{configured_dir}"
     state_paths = [f"{PANEL_VAR_DIR}/state/virtual-sliders.json"]
     if configured_dir:
         state_paths.append(f"{configured_dir.rstrip('/')}/virtual-sliders.json")
+    codec_source = await asyncio.to_thread(
+        (Path(__file__).parent / "agent_payload/app/brilliant_mqtt/slider_config.py").read_text
+    )
     await _checked(
         shell,
         f"{_PANEL_PYTHON} - <<'BRILLIANT_RESTORE_VIRTUAL_SLIDERS'\n"
@@ -3046,6 +3076,9 @@ async def _restore_virtual_sliders_on_uninstall(shell: PanelShell) -> None:
         "from pathlib import Path\n"
         f"var_dir = Path({PANEL_VAR_DIR!r})\n"
         f"state_paths = list(dict.fromkeys({state_paths!r}))\n"
+        "codec = {}\n"
+        f"exec({codec_source!r}, codec)\n"
+        "owners = {}\n"
         "def backups(path):\n"
         "    data = json.loads(path.read_text())\n"
         "    if not isinstance(data, dict):\n"
@@ -3056,9 +3089,18 @@ async def _restore_virtual_sliders_on_uninstall(shell: PanelShell) -> None:
         "        original = row['original_slider_config']\n"
         "        if original is not None and (not isinstance(original, str) or not original):\n"
         "            raise ValueError('Invalid original slider backup')\n"
+        "        if (original is not None and\n"
+        "                codec['decode_slider_config_target'](original) is None):\n"
+        "            raise ValueError('Malformed original slider configuration')\n"
         "        if not all(isinstance(row.get(k), str) and row[k] for k in\n"
         "                   ('config_device_id', 'config_peripheral_id', 'config_var_name')):\n"
         "            raise ValueError('Incomplete slider recovery coordinates')\n"
+        "        if original is not None:\n"
+        "            target = tuple(row[k] for k in\n"
+        "                ('config_device_id', 'config_peripheral_id', 'config_var_name'))\n"
+        "            if target in owners and owners[target] != original:\n"
+        "                raise ValueError('Conflicting slider originals across recovery files')\n"
+        "            owners[target] = original\n"
         "    targets = {(r['config_device_id'], r['config_peripheral_id'],\n"
         "                r['config_var_name']) for r in data.values()\n"
         "                if r['original_slider_config'] is not None}\n"
@@ -3066,7 +3108,7 @@ async def _restore_virtual_sliders_on_uninstall(shell: PanelShell) -> None:
         "                           for r in data.values()):\n"
         "        raise ValueError('Conflicting slider recovery coordinates')\n"
         "    return any(row['original_slider_config'] is not None for row in data.values())\n"
-        "paths = [Path(p) for p in state_paths if Path(p).exists()]\n"
+        "paths = list({Path(p).resolve(): None for p in state_paths if Path(p).exists()})\n"
         "pending = [p for p in paths if backups(p)]\n"
         "if pending:\n"
         "    root = var_dir / 'current' if (var_dir / 'current').exists() else var_dir\n"

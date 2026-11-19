@@ -1341,3 +1341,63 @@ async def test_returning_to_pending_old_target_keeps_one_recoverable_owner(tmp_p
     rig.bus.reflect_writes = True
     assert await restore_all_persisted_slider_bindings(rig.path, bus=rig.bus)
     assert rig.face.variables["slider_config:0"].value == REAL_PANEL_SLIDER_CONFIG_0_B64
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_recovery_row_cannot_be_adopted_by_a_future_logical_id(
+    tmp_path: Path, legacy: bool
+) -> None:
+    rig = _RecoveryRig(tmp_path / "state.json")
+    await rig.run(("A", 0))
+    rig.bus.reflect_writes = False
+    await rig.run(("A", 1))
+    data = json.loads(rig.path.read_text())
+    assert data["orphan:A"]["orphaned"] is True
+    if legacy:
+        del data["orphan:A"]["orphaned"]
+        del data["orphan:A"]["slider_id"]
+        rig.path.write_text(json.dumps(data))
+    rig.bus.reflect_writes = True
+    await rig.run(("A", 1), ("orphan:A", 0))
+    assert REAL_PANEL_SLIDER_CONFIG_0_B64 in rig.path.read_text()
+    assert await restore_all_persisted_slider_bindings(rig.path, bus=rig.bus)
+    assert rig.face.variables["slider_config:0"].value == REAL_PANEL_SLIDER_CONFIG_0_B64
+    assert rig.face.variables["slider_config:1"].value == REAL_PANEL_SLIDER_CONFIG_1_B64
+
+
+async def test_unrelated_recovery_cannot_block_healthy_slider_passthrough(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig = _RecoveryRig(tmp_path / "state.json")
+    await rig.run(("A", 0), ("B", 1))
+    write = rig.bus.set_variables
+
+    async def fail_only_old(device_id: str, peripheral_id: str, sets: list[VarSet]) -> Any:
+        if sets[0].name == "slider_config:0":
+            raise OSError("only old A offline")
+        return await write(device_id, peripheral_id, sets)
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(rig.bus, "set_variables", fail_only_old)
+        ctrl = await rig.run(("B", 1))
+        assert ctrl.state_for("B").binding_ready
+        await ctrl._handle_mode_command("B", "passthrough")
+    assert ctrl.state_for("B").mode == SliderMode.PASSTHROUGH
+    assert ctrl.state_for("B").binding_ready
+    assert rig.face.variables["slider_config:1"].value == REAL_PANEL_SLIDER_CONFIG_1_B64
+    assert REAL_PANEL_SLIDER_CONFIG_0_B64 in rig.path.read_text()
+
+
+async def test_truncated_original_cannot_be_written_or_retired(tmp_path: Path) -> None:
+    rig = _RecoveryRig(tmp_path / "state.json")
+    await rig.run(("A", 0))
+    data = json.loads(rig.path.read_text())
+    data["A"]["original_slider_config"] = REAL_PANEL_SLIDER_CONFIG_0_B64[:-12]
+    rig.path.write_text(json.dumps(data))
+    saved = rig.path.read_text()
+    commands = list(rig.bus.commands)
+    with pytest.raises(ValueError, match="Invalid"):
+        rig.controller(("A", 1))
+    assert not await restore_all_persisted_slider_bindings(rig.path, bus=rig.bus)
+    assert rig.path.read_text() == saved
+    assert rig.bus.commands == commands
