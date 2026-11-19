@@ -3181,6 +3181,8 @@ async def _quiesce_bridge_for_uninstall(shell: PanelShell) -> None:
     ):
         raise PanelOpError("slider_recovery_writer_state_unknown")
     absent = state["LoadState"] == "not-found" and state["ActiveState"] == "inactive"
+    if absent and (stopped.exit_status not in {0, 1} or result.exit_status not in {0, 1}):
+        raise PanelOpError("slider_recovery_writer_state_unknown")
     if not absent and (stopped.exit_status != 0 or result.exit_status != 0):
         raise PanelOpError("slider_recovery_stop_failed")
     if not absent and state.keys() != properties:

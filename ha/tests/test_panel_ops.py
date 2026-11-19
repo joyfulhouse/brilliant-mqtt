@@ -4290,6 +4290,10 @@ async def test_uninstall_restore_accepts_confirmed_absence_of_payload_and_state(
         "absent_nonzero_query",
         "stop_unknown_exit",
         "absent_unknown_query",
+        "absent_killed_query",
+        "absent_transport_query",
+        "absent_killed_stop",
+        "absent_transport_stop",
         "stopped",
     ],
 )
@@ -4312,16 +4316,26 @@ async def test_uninstall_requires_positive_writer_quiescence_before_any_restore(
             status = "LoadState=not-found\nActiveState=inactive\n"
     elif case == "unknown":
         status = ""
+    abnormal = {
+        "absent_killed_query": 137,
+        "absent_transport_query": 255,
+        "absent_killed_stop": 137,
+        "absent_transport_stop": 255,
+    }
     responses = {
         stop: RunResult(
-            -1
+            abnormal[case]
+            if case in abnormal and case.endswith("_stop")
+            else -1
             if case == "stop_unknown_exit"
             else (1 if case.startswith(("stop_failed", "absent")) else 0),
             "",
             "",
         ),
         panel_ops._UNINSTALL_BRIDGE_STATE_COMMAND: RunResult(
-            1
+            abnormal[case]
+            if case in abnormal and case.endswith("_query")
+            else 1
             if case in ("query_failed", "absent_nonzero_query")
             else (-1 if case in ("query_unknown_exit", "absent_unknown_query") else 0),
             status,
