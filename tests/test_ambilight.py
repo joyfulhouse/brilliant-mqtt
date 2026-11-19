@@ -141,7 +141,7 @@ class TestFailClosedPrivacyGateAndSubprocessCancellation:
             kind=DeviceKind.HARDWARE,
             variables={},
         )
-        bridge._remember_device(hw_unknown)
+        await bridge._on_change(hw_unknown)
         assert bridge.is_privacy_off() is False
 
         hw_on = BrilliantDevice(
@@ -151,7 +151,7 @@ class TestFailClosedPrivacyGateAndSubprocessCancellation:
             kind=DeviceKind.HARDWARE,
             variables={"privacy_toggle": Variable("privacy_toggle", "1", False)},
         )
-        bridge._remember_device(hw_on)
+        await bridge._on_change(hw_on)
         assert bridge.is_privacy_off() is False
 
         hw_off = BrilliantDevice(
@@ -161,7 +161,7 @@ class TestFailClosedPrivacyGateAndSubprocessCancellation:
             kind=DeviceKind.HARDWARE,
             variables={"privacy_toggle": Variable("privacy_toggle", "0", False)},
         )
-        bridge._remember_device(hw_off)
+        await bridge._on_change(hw_off)
         assert bridge.is_privacy_off() is True
 
     async def test_cancelled_capture_kills_and_reaps_gst_subprocess(

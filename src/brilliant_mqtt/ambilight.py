@@ -23,15 +23,17 @@ import json
 import logging
 import os
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeVar
 
 from brilliant_mqtt.desired_state import atomic_write_json
 from brilliant_mqtt.discovery import availability_topic, device_block, state_topic
 from brilliant_mqtt.protocols import MqttClient
 from brilliant_mqtt.retained_topics import RetainedTopicLedger
+
+_T = TypeVar("_T")
 
 logger = logging.getLogger(__name__)
 
@@ -489,6 +491,8 @@ class AmbilightController:
         self._auto_crop_enabled = default_auto_crop_enabled
         self._last_sample: AmbilightSample | None = None
         self._poll_task: asyncio.Task[None] | None = None
+        self._closed = False
+        self._camera_tasks: set[asyncio.Task[Any]] = set()
         self._last_persisted_snapshot: dict[str, Any] | None = None
 
         self._load_state()
@@ -593,6 +597,8 @@ class AmbilightController:
 
     async def start(self) -> None:
         """Publish MQTT discovery, subscribe command topics, and start polling if enabled."""
+        if self._closed:
+            return
         self._mqtt.on_command(self.on_mqtt_command)
         await self._publish_discovery()
         await self._subscribe_commands()
@@ -600,17 +606,21 @@ class AmbilightController:
         self._sync_poll_task()
 
     async def shutdown(self) -> None:
-        """Stop background polling and clear any retained snapshot on the broker."""
-        if self._poll_task is not None and not self._poll_task.done():
-            self._poll_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._poll_task
+        """Close admission, settle camera work, then clear the broker snapshot."""
+        self._closed = True
+        tasks = set(self._camera_tasks)
+        if self._poll_task is not None:
+            tasks.add(self._poll_task)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         self._poll_task = None
         with contextlib.suppress(Exception):
             await self._clear_snapshot_topic()
 
     def _sync_poll_task(self) -> None:
-        if self._enabled:
+        if self._enabled and not self._closed:
             if self._poll_task is None or self._poll_task.done():
                 self._poll_task = asyncio.create_task(self._poll_loop())
         else:
@@ -619,18 +629,39 @@ class AmbilightController:
             self._poll_task = None
 
     async def _poll_loop(self) -> None:
-        while self._enabled:
+        while self._enabled and not self._closed:
             await self.sample_once()
+            if self._closed:
+                return
             try:
                 await self._sleep(self._interval_s)
             except asyncio.CancelledError:
                 return
 
     def _is_blocked_by_privacy(self) -> bool:
-        return is_privacy_shutter_closed(privacy_off=self._privacy_off)
+        return self._closed or is_privacy_shutter_closed(privacy_off=self._privacy_off)
+
+    async def _run_camera_work(
+        self, operation: Callable[[], Coroutine[Any, Any, _T]], stopped_result: _T
+    ) -> _T:
+        if self._closed:
+            return stopped_result
+        task = asyncio.create_task(operation())
+        self._camera_tasks.add(task)
+        try:
+            return await task
+        except asyncio.CancelledError:
+            if self._closed:
+                return stopped_result
+            raise
+        finally:
+            self._camera_tasks.discard(task)
 
     async def sample_once(self) -> AmbilightSample | None:
         """Capture one cropped I420 frame, compute dominant color, and publish state."""
+        return await self._run_camera_work(self._sample_once, None)
+
+    async def _sample_once(self) -> AmbilightSample | None:
         if self._is_blocked_by_privacy():
             return None
         c = self._crop.normalized()
@@ -644,6 +675,8 @@ class AmbilightController:
             return None
         self._last_sample = sample
         await self._publish_state()
+        if self._closed:
+            return None
         await self._mqtt.publish(
             self._color_topic(),
             json.dumps(
@@ -664,6 +697,9 @@ class AmbilightController:
 
     async def trigger_snapshot(self) -> bool:
         """Capture a cropped JPEG snapshot and publish it as base64 with ``retain=False``."""
+        return await self._run_camera_work(self._trigger_snapshot, False)
+
+    async def _trigger_snapshot(self) -> bool:
         if self._is_blocked_by_privacy():
             return False
         c = self._crop.normalized()
@@ -706,6 +742,9 @@ class AmbilightController:
 
     async def auto_calibrate_crop(self) -> AmbilightCrop | None:
         """Capture an ``I420`` frame from ``saved_crop`` and auto-fit active TV bounds."""
+        return await self._run_camera_work(self._auto_calibrate_crop, None)
+
+    async def _auto_calibrate_crop(self) -> AmbilightCrop | None:
         if self._is_blocked_by_privacy():
             return None
         base = self._saved_crop.normalized()
@@ -721,6 +760,8 @@ class AmbilightController:
     # ------------------------------------------------------------------
 
     async def on_mqtt_command(self, topic: str, payload: str) -> None:
+        if self._closed:
+            return
         prefix = f"brilliant/{self._panel}/ambilight/set_"
         if not topic.startswith(prefix):
             return
@@ -742,6 +783,8 @@ class AmbilightController:
                 self.revert_crop()
             else:
                 await self.auto_calibrate_crop()
+            if self._closed:
+                return
             await self._publish_state()
         elif cmd == "revert_crop":
             self.revert_crop()
