@@ -3068,8 +3068,10 @@ async def _restore_virtual_sliders_on_uninstall(shell: PanelShell) -> None:
             raise PanelOpError("slider_recovery_working_directory_unknown")
         configured_dir = f"{working_dir.rstrip('/')}/{configured_dir}"
     state_paths = [f"{PANEL_VAR_DIR}/state/virtual-sliders.json"]
+    configured_paths: list[str] = []
     if configured_dir:
-        state_paths.append(f"{configured_dir.rstrip('/')}/virtual-sliders.json")
+        configured_paths.append(f"{configured_dir.rstrip('/')}/virtual-sliders.json")
+        state_paths.extend(configured_paths)
     codec_source = await asyncio.to_thread(
         (Path(__file__).parent / "agent_payload/app/brilliant_mqtt/slider_config.py").read_text
     )
@@ -3080,11 +3082,16 @@ async def _restore_virtual_sliders_on_uninstall(shell: PanelShell) -> None:
         "from pathlib import Path\n"
         f"var_dir = Path({PANEL_VAR_DIR!r})\n"
         f"state_paths = list(dict.fromkeys({state_paths!r}))\n"
+        f"explicit_paths = set({configured_paths!r})\n"
+        "owned_roots = []\n"
         "def scan_failed(error):\n"
         "    raise error\n"
         f"for scan_root in (var_dir, Path({_STAGING_DIR!r})):\n"
+        "    if scan_root.is_symlink():\n"
+        "        raise ValueError('Unverified recovery scan root symlink')\n"
         "    if not scan_root.exists():\n"
         "        continue\n"
+        "    owned_roots.append(scan_root.resolve(strict=True))\n"
         "    for root, directories, files in os.walk(scan_root, onerror=scan_failed):\n"
         "        if 'virtual-sliders.json' in files:\n"
         "            state_paths.append(str(Path(root) / 'virtual-sliders.json'))\n"
@@ -3123,7 +3130,19 @@ async def _restore_virtual_sliders_on_uninstall(shell: PanelShell) -> None:
         "                           for r in data.values()):\n"
         "        raise ValueError('Conflicting slider recovery coordinates')\n"
         "    return any(row['original_slider_config'] is not None for row in data.values())\n"
-        "paths = list({Path(p).resolve(): None for p in state_paths if Path(p).exists()})\n"
+        "paths = []\n"
+        "explicit_targets = {Path(name).resolve(strict=True) for name in explicit_paths\n"
+        "                    if Path(name).exists() or Path(name).is_symlink()}\n"
+        "for name in state_paths:\n"
+        "    path = Path(name)\n"
+        "    if not path.exists() and not path.is_symlink():\n"
+        "        continue\n"
+        "    resolved = path.resolve(strict=True)\n"
+        "    if resolved not in explicit_targets and not any(\n"
+        "            resolved.is_relative_to(root) for root in owned_roots):\n"
+        "        raise ValueError('Discovered recovery file escapes owned removal roots')\n"
+        "    if resolved not in paths:\n"
+        "        paths.append(resolved)\n"
         "pending = [p for p in paths if backups(p)]\n"
         "if pending:\n"
         "    root = var_dir / 'current' if (var_dir / 'current').exists() else var_dir\n"
@@ -3141,16 +3160,41 @@ async def _restore_virtual_sliders_on_uninstall(shell: PanelShell) -> None:
     )
 
 
+_UNINSTALL_BRIDGE_STATE_COMMAND = (
+    f"systemctl show {SERVICE_NAME} --property=LoadState --property=ActiveState "
+    "--property=MainPID --property=ControlPID"
+)
+
+
+async def _quiesce_bridge_for_uninstall(shell: PanelShell) -> None:
+    stopped = await shell.run(f"systemctl disable --now {SERVICE_NAME}")
+    result = await _checked(shell, _UNINSTALL_BRIDGE_STATE_COMMAND)
+    pairs = [line.partition("=") for line in result.stdout.splitlines() if line.strip()]
+    state = {key: value.strip() for key, separator, value in pairs if separator}
+    if len(pairs) != 4 or set(state) != {"LoadState", "ActiveState", "MainPID", "ControlPID"}:
+        raise PanelOpError("slider_recovery_writer_state_unknown")
+    absent = state["LoadState"] == "not-found" and state["ActiveState"] == "inactive"
+    if not absent and stopped.exit_status != 0:
+        raise PanelOpError("slider_recovery_stop_failed")
+    if (
+        state["LoadState"] not in {"loaded", "masked", "not-found"}
+        or state["ActiveState"] != "inactive"
+        or state["MainPID"] != "0"
+        or state["ControlPID"] != "0"
+        or (state["LoadState"] == "not-found" and not absent)
+    ):
+        raise PanelOpError("slider_recovery_writer_not_quiescent")
+
+
 async def uninstall(shell: PanelShell) -> None:
     """Stop + disable + remove everything the integration owns on the panel.
 
-    The disable step is best-effort (`|| true`) — the unit may already be gone —
-    but the removals and the reload must actually succeed or we'd leave orphaned
-    files behind a "removed" config entry.
+    Restoration requires a successfully stopped writer or positively confirmed
+    absent unit. Every removal and the reload must also succeed.
     """
     if await baseline_retained(shell):
         raise PanelOpError("baseline_retained_finalize_first")
-    await shell.run(f"systemctl disable --now {SERVICE_NAME} 2>/dev/null || true")
+    await _quiesce_bridge_for_uninstall(shell)
     await _restore_virtual_sliders_on_uninstall(shell)
     await _checked(shell, f"rm -f {PANEL_UNIT_FILE} {PANEL_ENV_FILE}")
     await _checked(shell, f"rm -rf {PANEL_VAR_DIR} {_STAGING_DIR} {_STAGING_TARBALL}")
