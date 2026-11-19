@@ -1323,14 +1323,21 @@ async def test_explicit_null_valid_rows_need_no_bus(
 
 async def test_returning_to_pending_old_target_keeps_one_recoverable_owner(tmp_path: Path) -> None:
     rig = _RecoveryRig(tmp_path / "state.json")
-    await rig.run(("A", 0))
+    ctrl = await rig.run(("A", 0))
+    await ctrl._handle_mode_command("A", "passthrough")
+    # Leave a virtual old endpoint with a persisted passthrough desire.
+    rig.face.variables["slider_config:0"] = Variable(
+        "slider_config:0", encode_slider_config(PANEL_DEV_ID, "vs_dimmer_A")
+    )
     rig.bus.reflect_writes = False
     await rig.run(("A", 1))
     await rig.run(("A", 0))
     await rig.run(("A", 0))
     data = json.loads(rig.path.read_text())
-    assert len(data) == 1
-    assert next(iter(data.values()))["original_slider_config"] == REAL_PANEL_SLIDER_CONFIG_0_B64
+    assert len(data) == 2
+    assert data["A"]["mode"] == "passthrough"
+    assert data["A"]["original_slider_config"] is None
+    assert data["orphan:A"]["original_slider_config"] == REAL_PANEL_SLIDER_CONFIG_0_B64
     rig.bus.reflect_writes = True
     assert await restore_all_persisted_slider_bindings(rig.path, bus=rig.bus)
     assert rig.face.variables["slider_config:0"].value == REAL_PANEL_SLIDER_CONFIG_0_B64

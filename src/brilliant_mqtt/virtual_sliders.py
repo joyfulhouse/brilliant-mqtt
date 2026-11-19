@@ -801,12 +801,6 @@ class VirtualSliderController:
         data: dict[str, Any] = {}
         for sid, st in self._states.items():
             spec = self._specs[sid]
-            if any(
-                (orphan.config_device_id, orphan.config_peripheral_id, orphan.config_var_name)
-                == (spec.config_device_id, spec.config_peripheral_id, spec.config_var_name)
-                for orphan in self._orphaned_bindings.values()
-            ):
-                continue
             data[sid] = {
                 "mode": st.mode.value,
                 "brightness": st.brightness,
@@ -1522,8 +1516,9 @@ def _valid_persisted_state(data: Any) -> bool:
     targets = {
         (row["config_device_id"], row["config_peripheral_id"], row["config_var_name"])
         for row in data.values()
+        if row["original_slider_config"] is not None
     }
-    return len(targets) == len(data)
+    return len(targets) == sum(row["original_slider_config"] is not None for row in data.values())
 
 
 def has_persisted_slider_backups(state_path: Path | None) -> bool:
