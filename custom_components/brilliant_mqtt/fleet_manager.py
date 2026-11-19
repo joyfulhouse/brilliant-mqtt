@@ -1165,7 +1165,10 @@ class FleetManager:
         """Settle one orphan journal without holding healthy panel runtime offline."""
         reporter = _ProvisioningRepairReporter(self.hass)
         try:
-            await _get_recovery_provisioner(self.hass).async_recover()
+            await _get_recovery_provisioner(self.hass).async_recover(
+                expected_record=record,
+                authorize=self._async_authorize_background_recovery,
+            )
             remaining = await ProvisioningJournal(self.hass).async_load()
         except asyncio.CancelledError:
             raise
@@ -1199,6 +1202,24 @@ class FleetManager:
             _provisioning_repair_issue_id(record.transaction_id),
         )
         self._async_schedule_reload_once()
+
+    async def _async_authorize_background_recovery(self, record: ProvisioningRecord) -> None:
+        """Repeat mutable config ownership checks while recovery holds the operation lock."""
+        if record.operation is ProvisioningOperation.UPDATE:
+            owner, _panel_id = _managed_update_owner(self.hass, record)
+            if owner is not self.entry:
+                raise EntryDataError("provisioning_ownership_mismatch")
+        elif record.operation in {ProvisioningOperation.INSTALL, ProvisioningOperation.UPGRADE}:
+            if _has_other_domain_entry(self.hass, self.entry) or not _is_exact_fleet_envelope_owner(
+                self.entry, record
+            ):
+                raise EntryDataError("provisioning_ownership_mismatch")
+            candidate = _owned_subentry(self.entry, record)
+            if candidate is not None and record.phase not in {
+                ProvisioningPhase.PENDING_CONFIG_COMMIT,
+                ProvisioningPhase.COMMITTED,
+            }:
+                raise EntryDataError("provisioning_ownership_mismatch")
 
     def _async_schedule_background_recovery(
         self,
@@ -1237,7 +1258,11 @@ class FleetManager:
                         raise EntryDataError("rollback_credentials_unavailable")
                     await journal.async_begin_restore(retained.record.transaction_id, password)
                     record = await journal.async_load()
-                elif retained.state == "finalizing":
+                elif (
+                    retained.state == "finalizing"
+                    and retained.finalization_origin is None
+                    and record is None
+                ):
                     self._async_schedule_background_recovery(retained.record)
         except asyncio.CancelledError:
             raise

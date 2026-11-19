@@ -1427,7 +1427,9 @@ async def test_startup_without_stored_owner_invokes_recorded_recovery_before_set
     ):
         await fleet.async_setup()
 
-    recover.assert_awaited_once_with()
+    recover.assert_awaited_once_with(
+        expected_record=_pending_record(), authorize=fleet._async_authorize_background_recovery
+    )
     journal.async_complete_commit.assert_not_awaited()
     assert set(fleet.panels) == {"panel-kitchen"}
 
@@ -1452,7 +1454,9 @@ async def test_unreachable_stale_recovery_does_not_hold_healthy_runtime_offline(
     recover_started = asyncio.Event()
     release_recovery = asyncio.Event()
 
-    async def blocked_recovery() -> None:
+    async def blocked_recovery(**kwargs: object) -> None:
+        assert kwargs["expected_record"] == _pending_record(phase=ProvisioningPhase.ACTIVATED)
+        assert kwargs["authorize"] == fleet._async_authorize_background_recovery
         recover_started.set()
         await release_recovery.wait()
         raise OSError("unreachable stale panel")
@@ -1511,7 +1515,9 @@ async def test_finished_background_recovery_is_retried_after_entry_update(
     )
     attempts = 0
 
-    async def recover() -> None:
+    async def recover(**kwargs: object) -> None:
+        assert kwargs["expected_record"] == _pending_record(phase=ProvisioningPhase.ACTIVATED)
+        assert kwargs["authorize"] == fleet._async_authorize_background_recovery
         nonlocal attempts
         attempts += 1
         if attempts == 1:
@@ -1724,7 +1730,10 @@ async def test_hard_restart_empty_fleet_schedules_orphan_recovery(
         assert fleet._recovery_task is not None  # noqa: SLF001
         await fleet._recovery_task  # noqa: SLF001
 
-    recover.assert_awaited_once_with()
+    recover.assert_awaited_once_with(
+        expected_record=_pending_record(phase=phase),
+        authorize=fleet._async_authorize_background_recovery,
+    )
     assert fleet.panels == {}
     assert fleet.fleet.scene_panel == "__unassigned__"
     with patch.object(PanelManager, "async_shutdown", _noop_shutdown):

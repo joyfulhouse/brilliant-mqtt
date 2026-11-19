@@ -1233,6 +1233,8 @@ class PanelProvisioner:
         if await self._duplicate_fingerprint(identity.fingerprint):
             raise PanelProvisioningError("duplicate_panel")
         # A retry must discover the first capture before publishing another one.
+        state.failure_code = "journal_failed"
+        state.failure_stage = "journal"
         if any(
             item.record.panel_request.fingerprint == identity.fingerprint
             for item in await self._journal.async_retained_records()
@@ -1696,10 +1698,17 @@ class PanelProvisioner:
     async def async_recover(
         self,
         progress: ProgressReporter = _noop_progress,
+        *,
+        expected_record: ProvisioningRecord | None = None,
+        authorize: Callable[[ProvisioningRecord], Awaitable[None]] | None = None,
     ) -> None:
         """Settle the one durable transaction before accepting new work."""
         async with self._lock:
-            outcome = await _settle(self._async_recover_bounded(progress))
+            outcome = await _settle(
+                self._async_recover_bounded(
+                    progress, expected_record=expected_record, authorize=authorize
+                )
+            )
             if outcome.cancellation is not None:
                 raise outcome.cancellation from None
             if outcome.error is not None:
@@ -1707,12 +1716,45 @@ class PanelProvisioner:
                     raise PanelProvisioningError(outcome.error.code)
                 raise PanelProvisioningError("recovery_failed")
 
-    async def _async_recover_bounded(self, progress: ProgressReporter) -> None:
+    async def _async_recover_bounded(
+        self,
+        progress: ProgressReporter,
+        *,
+        expected_record: ProvisioningRecord | None = None,
+        authorize: Callable[[ProvisioningRecord], Awaitable[None]] | None = None,
+    ) -> None:
         try:
             async with asyncio.timeout(RECOVERY_TIMEOUT_SECONDS):
-                await self._async_recover_current(progress)
+                if expected_record is None:
+                    await self._async_recover_current(progress)
+                else:
+                    await self._async_recover_expected(expected_record, progress, authorize)
         except TimeoutError:
             raise PanelProvisioningError("rollback_deadline_exceeded") from None
+
+    async def _async_recover_expected(
+        self,
+        expected: ProvisioningRecord,
+        progress: ProgressReporter,
+        authorize: Callable[[ProvisioningRecord], Awaitable[None]] | None,
+    ) -> None:
+        """Revalidate a queued worker's exact transaction under the operation lock."""
+        current = await self._journal.async_load()
+        if current is not None:
+            if current != expected:
+                return
+            if authorize is not None:
+                await authorize(current)
+            await self._async_recover_record(current, progress)
+            return
+        retained = await self._journal.async_retained(expected.transaction_id)
+        if retained is None or retained.record != expected or retained.state != "finalizing":
+            return
+        if retained.finalization_origin is not None:
+            raise PanelProvisioningError("ownerless_finalize_reauthentication_required")
+        # Retained rows omit the password; finalization resolves fresh credentials
+        # from their current pinned owner instead of using active-journal authority.
+        await self._async_finalize(retained)
 
     async def _async_recover_current(
         self,
