@@ -582,6 +582,7 @@ class AmbilightController:
         self._last_sample: AmbilightSample | None = None
         self._last_sample_epoch: PrivacyEpoch | None = None
         self._published_topics: set[str] = set()
+        self._state_publish_lock = asyncio.Lock()
         self._poll_task: asyncio.Task[None] | None = None
         self._closed = False
         self._camera_tasks: set[asyncio.Task[Any]] = set()
@@ -776,30 +777,32 @@ class AmbilightController:
         except ValueError as exc:
             logger.warning("Ambilight frame extraction failed: %s", exc)
             return None
-        await self._publish_state(sample, epoch)
-        if self._is_blocked_by_privacy(epoch):
-            return None
-        await self._mqtt.publish(
-            self._color_topic(),
-            json.dumps(
-                {
-                    "r": sample.r,
-                    "g": sample.g,
-                    "b": sample.b,
-                    "rgb_color": [sample.r, sample.g, sample.b],
-                    "brightness": sample.brightness,
-                    "hex_color": sample.hex_color,
-                    "state": "ON" if sample.brightness > 1 else "OFF",
-                },
-                sort_keys=True,
-            ),
-            retain=False,
-        )
-        if self._is_blocked_by_privacy(epoch):
-            return None
-        self._last_sample = sample
-        self._last_sample_epoch = epoch
-        return sample
+        # Keep settings publications behind the sample until its cache is committed.
+        async with self._state_publish_lock:
+            await self._publish_state_unlocked(sample, epoch)
+            if self._is_blocked_by_privacy(epoch):
+                return None
+            await self._mqtt.publish(
+                self._color_topic(),
+                json.dumps(
+                    {
+                        "r": sample.r,
+                        "g": sample.g,
+                        "b": sample.b,
+                        "rgb_color": [sample.r, sample.g, sample.b],
+                        "brightness": sample.brightness,
+                        "hex_color": sample.hex_color,
+                        "state": "ON" if sample.brightness > 1 else "OFF",
+                    },
+                    sort_keys=True,
+                ),
+                retain=False,
+            )
+            if self._is_blocked_by_privacy(epoch):
+                return None
+            self._last_sample = sample
+            self._last_sample_epoch = epoch
+            return sample
 
     async def trigger_snapshot(self) -> bool:
         """Capture a cropped JPEG snapshot and publish it as base64 with ``retain=False``."""
@@ -1097,6 +1100,12 @@ class AmbilightController:
         )
 
     async def _publish_state(
+        self, sample: AmbilightSample | None = None, epoch: PrivacyEpoch | None = None
+    ) -> None:
+        async with self._state_publish_lock:
+            await self._publish_state_unlocked(sample, epoch)
+
+    async def _publish_state_unlocked(
         self, sample: AmbilightSample | None = None, epoch: PrivacyEpoch | None = None
     ) -> None:
         if self._closed:

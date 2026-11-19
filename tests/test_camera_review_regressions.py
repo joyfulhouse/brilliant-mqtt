@@ -378,3 +378,59 @@ async def test_failed_retirement_preserves_primary_start_error(tmp_path: Path) -
         await controller.start()
     assert raised.value is original
     assert controller._closed
+
+
+@pytest.mark.parametrize("revoke_and_regrant", [False, True])
+async def test_poll_color_and_concurrent_settings_finish_in_agreement(
+    tmp_path: Path, revoke_and_regrant: bool
+) -> None:
+    entered, release, sleeping = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    epoch = (1, -1, 0)
+
+    class HeldColorMqtt(FakeMqtt):
+        async def publish(
+            self, topic: str, payload: str, retain: bool = False, qos: int = 0
+        ) -> None:
+            if topic.endswith("/color"):
+                entered.set()
+                await release.wait()
+            await super().publish(topic, payload, retain=retain, qos=qos)
+
+    async def sleep(delay: float) -> None:
+        sleeping.set()
+        await asyncio.Future[None]()
+
+    ledger = RetainedTopicLedger("office", tmp_path / "ledger.json")
+    await ledger.async_load()
+    mqtt, camera = HeldColorMqtt(), HeldCamera()
+    camera.release.set()
+    controller = AmbilightController(
+        mqtt,
+        "office",
+        camera,
+        owned_topics=ledger,
+        default_enabled=True,
+        privacy_off=lambda: True,
+        privacy_epoch=lambda: epoch,
+        sleep=sleep,
+    )
+    await controller.start()
+    await asyncio.wait_for(entered.wait(), 1)
+    command = asyncio.create_task(
+        controller.on_mqtt_command("brilliant/office/ambilight/set_interval", "2")
+    )
+    await asyncio.sleep(0)
+    if revoke_and_regrant:
+        epoch = (1, 10, 0)
+    release.set()
+    await asyncio.wait_for(command, 1)
+    await asyncio.wait_for(sleeping.wait(), 1)
+    states = [json.loads(p) for t, p, _ in mqtt.published if t.endswith("/ambilight/state")]
+    assert states[-1]["interval_s"] == 2.0
+    if revoke_and_regrant:
+        assert controller.last_sample is None
+        assert states[-1]["color"]["rgb_color"] == [0, 0, 0]
+    else:
+        assert controller.last_sample is not None
+        assert states[-1]["color"]["hex_color"] == controller.last_sample.hex_color
+    await controller.shutdown()
