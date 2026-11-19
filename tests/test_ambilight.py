@@ -197,6 +197,7 @@ class TestFailClosedPrivacyGateAndSubprocessCancellation:
             device="test_device",
             timeout_s=10.0,
             privacy_off=lambda: True,
+            privacy_epoch=lambda: (0, 0, 0),
         )
         task = asyncio.create_task(adapter.capture_i420_frame(AmbilightCrop()))
         await asyncio.wait_for(started.wait(), timeout=1.0)
@@ -243,6 +244,7 @@ class TestFailClosedPrivacyGateAndSubprocessCancellation:
             device="test_device",
             timeout_s=5.0,
             privacy_off=lambda: privacy_is_off,
+            privacy_epoch=lambda: (0, 0, 0),
         )
 
         # Start capture 1 (holds lock) and queue capture 2 (waits on lock after initial check)
@@ -295,6 +297,7 @@ class TestAmbilightController:
             default_enabled=False,
             owned_topics=ledger,
             privacy_off=lambda: True,
+            privacy_epoch=lambda: (0, 0, 0),
         )
         await ctrl.start()
 
@@ -362,6 +365,7 @@ class TestAmbilightController:
             camera=cam,
             default_crop=hardcoded,
             privacy_off=lambda: True,
+            privacy_epoch=lambda: (0, 0, 0),
         )
         assert ctrl.auto_crop_enabled is False
         assert ctrl.saved_crop == hardcoded

@@ -367,6 +367,15 @@ class Bridge:
         self._sync_privacy_generation()
         return self._wired_feedback_enabled and self._privacy_off
 
+    def camera_privacy_epoch(self) -> tuple[int, int, int]:
+        """Identity for work that must not span a denial or source replacement."""
+        self._sync_privacy_generation()
+        return (
+            self._privacy_source_generation,
+            self._privacy_invalid_through,
+            self._wired_lifecycle,
+        )
+
     def _sync_privacy_generation(self) -> None:
         generation = getattr(self._bus, "capture_generation", 0)
         if generation != self._privacy_source_generation:
