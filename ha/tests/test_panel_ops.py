@@ -4152,3 +4152,113 @@ async def test_uninstall_resolves_effective_paths_and_validates_all_originals_be
             await panel_ops._restore_virtual_sliders_on_uninstall(ExecuteShell())
         assert state.read_text() == before
         assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "old_relative",
+        "old_invalid",
+        "old_absolute",
+        "multiline_single",
+        "multiline_double",
+        "null_orphan",
+        "staging",
+    ],
+)
+async def test_uninstall_accounts_for_displaced_ledgers_and_ambiguous_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    var_dir = tmp_path / "panel"
+    old = var_dir / "releases" / "old" / "app"
+    active = var_dir / "releases" / "new" / "app"
+    package = active / "brilliant_mqtt"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("")
+    (var_dir / "current").symlink_to(active.parent, target_is_directory=True)
+    marker = tmp_path / "restored-path"
+    (package / "virtual_sliders.py").write_text(
+        "from pathlib import Path\n"
+        "async def restore_all_persisted_slider_bindings(path):\n"
+        f"    Path({str(marker)!r}).write_text(str(path))\n"
+        "    path.write_text('{}')\n    return True\n"
+    )
+    if case == "staging":
+        directory = tmp_path / "staging" / "state"
+        monkeypatch.setattr(panel_ops, "_STAGING_DIR", str(tmp_path / "staging"))
+    elif case == "old_absolute":
+        directory = var_dir / "previous absolute"
+    elif case.startswith("old_"):
+        directory = old / "relative"
+    else:
+        directory = var_dir / "custom"
+    directory.mkdir(parents=True)
+    state = directory / "virtual-sliders.json"
+    row: dict[str, object] = {
+        "original_slider_config": _SLIDER_ORIGINAL_B64,
+        "config_device_id": "panel",
+        "config_peripheral_id": "faceplate_peripheral",
+        "config_var_name": "slider_config:0",
+    }
+    if case == "null_orphan":
+        row.update(orphaned=True, slider_id="A", original_slider_config=None)
+    state.write_text("invalid" if case == "old_invalid" else json.dumps({"A": row}))
+    env = (
+        "MOTION_DESIRED_STATE_DIR=relative\n"
+        if case.startswith("old_") or case == "staging"
+        else f"MOTION_DESIRED_STATE_DIR='{directory}'\n"
+    )
+    if case.startswith("multiline_"):
+        quote = "'" if case == "multiline_single" else '"'
+        env += f"OPERATOR_NOTES={quote}notes:\nMOTION_DESIRED_STATE_DIR=/unused/example\n{quote}\n"
+    monkeypatch.setattr(panel_ops, "PANEL_VAR_DIR", str(var_dir))
+
+    class ExecuteShell(FakeShell):
+        async def run(self, command: str) -> RunResult:
+            if command.startswith("systemctl show"):
+                return RunResult(0, str(var_dir / "current" / "app"), "")
+            if "BRILLIANT_RESTORE_VIRTUAL_SLIDERS" not in command:
+                return RunResult(0, env, "")
+            body = command.split("\n", 1)[1].rsplit("\n", 1)[0]
+            result = await asyncio.to_thread(
+                subprocess.run,
+                [sys.executable, "-I", "-c", body],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            return RunResult(result.returncode, result.stdout, result.stderr)
+
+    saved = state.read_text()
+    if case in ("old_relative", "old_absolute", "staging"):
+        await panel_ops._restore_virtual_sliders_on_uninstall(ExecuteShell())
+        assert state.read_text() == "{}"
+        assert marker.read_text() == str(state)
+    else:
+        with pytest.raises(panel_ops.PanelOpError):
+            await panel_ops._restore_virtual_sliders_on_uninstall(ExecuteShell())
+        assert state.read_text() == saved
+        assert not marker.exists()
+
+
+async def test_uninstall_restore_accepts_confirmed_absence_of_payload_and_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(panel_ops, "PANEL_VAR_DIR", str(tmp_path / "absent"))
+    monkeypatch.setattr(panel_ops, "_STAGING_DIR", str(tmp_path / "absent-staging"))
+
+    class ExecuteShell(FakeShell):
+        async def run(self, command: str) -> RunResult:
+            if "BRILLIANT_RESTORE_VIRTUAL_SLIDERS" not in command:
+                return RunResult(0, "", "")
+            body = command.split("\n", 1)[1].rsplit("\n", 1)[0]
+            result = await asyncio.to_thread(
+                subprocess.run,
+                [sys.executable, "-I", "-c", body],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            return RunResult(result.returncode, result.stdout, result.stderr)
+
+    await panel_ops._restore_virtual_sliders_on_uninstall(ExecuteShell())

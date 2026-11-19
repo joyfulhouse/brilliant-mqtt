@@ -1305,6 +1305,7 @@ async def test_explicit_null_valid_rows_need_no_bus(
         json.dumps(
             {
                 "A": {
+                    "mode": "virtual",
                     "original_slider_config": None,
                     "config_device_id": PANEL_DEV_ID,
                     "config_peripheral_id": "faceplate_peripheral",
@@ -1429,3 +1430,20 @@ async def test_missing_durable_state_path_cannot_admit_a_physical_binding(
     assert rig.face.variables["slider_config:0"].value == REAL_PANEL_SLIDER_CONFIG_0_B64
     assert not ctrl.state_for("A").binding_ready
     await ctrl.shutdown()
+
+
+async def test_typed_recovery_row_requires_a_valid_original(tmp_path: Path) -> None:
+    rig = _RecoveryRig(tmp_path / "state.json")
+    await rig.run(("A", 0))
+    rig.bus.reflect_writes = False
+    await rig.run(("A", 1))
+    data = json.loads(rig.path.read_text())
+    data["orphan:A"]["original_slider_config"] = None
+    rig.path.write_text(json.dumps(data))
+    saved = rig.path.read_text()
+    commands = list(rig.bus.commands)
+    assert not await restore_all_persisted_slider_bindings(rig.path, bus=rig.bus)
+    with pytest.raises(ValueError, match="Invalid"):
+        rig.controller(("A", 1))
+    assert rig.path.read_text() == saved
+    assert rig.bus.commands == commands

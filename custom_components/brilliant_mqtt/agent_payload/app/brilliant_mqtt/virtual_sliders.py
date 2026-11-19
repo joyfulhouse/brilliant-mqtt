@@ -1328,6 +1328,13 @@ def _valid_persisted_state(data: Any) -> bool:
         isinstance(entry, dict)
         and "original_slider_config" in entry
         and (
+            entry["original_slider_config"] is not None
+            or (
+                entry.get("orphaned") is not True
+                and entry.get("mode") in (SliderMode.VIRTUAL.value, SliderMode.PASSTHROUGH.value)
+            )
+        )
+        and (
             entry.get("orphaned") is not True
             or entry.get("slider_id") is None
             or (isinstance(entry.get("slider_id"), str) and bool(entry["slider_id"]))

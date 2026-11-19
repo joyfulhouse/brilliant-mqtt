@@ -3034,18 +3034,22 @@ def _slider_state_directory(environment: str) -> str | None:
     """Read the supported systemd value forms; refuse ambiguous escape/continuation syntax."""
     directory = None
     for line in environment.splitlines():
+        if not line.strip() or line.lstrip().startswith(("#", ";")):
+            continue
         key, separator, raw = line.strip().partition("=")
-        if not separator or key.strip() != "MOTION_DESIRED_STATE_DIR":
+        if not separator:
             continue
         raw = raw.strip()
         if raw.startswith("'") and re.fullmatch(r"'[^']*'", raw):
-            directory = raw[1:-1]
+            value = raw[1:-1]
         elif raw.startswith('"') and re.fullmatch(r'"(?:[^"\\]|\\["\\])*"', raw):
-            directory = _env_unquote(raw)
+            value = _env_unquote(raw)
         elif not any(character in raw for character in "'\"\\"):
-            directory = raw
+            value = raw
         else:
             raise PanelOpError("slider_recovery_environment_unsupported")
+        if key.strip() == "MOTION_DESIRED_STATE_DIR":
+            directory = value
     return directory
 
 
@@ -3072,10 +3076,18 @@ async def _restore_virtual_sliders_on_uninstall(shell: PanelShell) -> None:
     await _checked(
         shell,
         f"{_PANEL_PYTHON} - <<'BRILLIANT_RESTORE_VIRTUAL_SLIDERS'\n"
-        "import asyncio, json, sys\n"
+        "import asyncio, json, os, sys\n"
         "from pathlib import Path\n"
         f"var_dir = Path({PANEL_VAR_DIR!r})\n"
         f"state_paths = list(dict.fromkeys({state_paths!r}))\n"
+        "def scan_failed(error):\n"
+        "    raise error\n"
+        f"for scan_root in (var_dir, Path({_STAGING_DIR!r})):\n"
+        "    if not scan_root.exists():\n"
+        "        continue\n"
+        "    for root, directories, files in os.walk(scan_root, onerror=scan_failed):\n"
+        "        if 'virtual-sliders.json' in files:\n"
+        "            state_paths.append(str(Path(root) / 'virtual-sliders.json'))\n"
         "codec = {}\n"
         f"exec({codec_source!r}, codec)\n"
         "owners = {}\n"
@@ -3087,6 +3099,9 @@ async def _restore_virtual_sliders_on_uninstall(shell: PanelShell) -> None:
         "        if not isinstance(row, dict) or 'original_slider_config' not in row:\n"
         "            raise ValueError('Invalid slider recovery row')\n"
         "        original = row['original_slider_config']\n"
+        "        if original is None and (row.get('orphaned') is True or\n"
+        "                row.get('mode') not in ('virtual', 'passthrough')):\n"
+        "            raise ValueError('Recovery row has no original slider configuration')\n"
         "        if original is not None and (not isinstance(original, str) or not original):\n"
         "            raise ValueError('Invalid original slider backup')\n"
         "        if (original is not None and\n"
